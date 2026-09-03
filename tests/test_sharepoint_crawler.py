@@ -43,6 +43,63 @@ DRIVE_DELTA = f"{GRAPH}/drives/b!drive1/root/delta"
 # --------------------------------------------------------------------------
 
 
+_FACTORY_HOST_PREFIXES = ("app.", "connectors.", "src.", "services.", "cli.")
+
+
+@pytest.fixture(autouse=True)
+def _no_repo_factory_captured_by_a_late_import(monkeypatch):
+    """Fail, AT THE TEST THAT CAUSED IT, the one cross-test leak this
+    module's patching style can produce.
+
+    ``_run`` / ``_install_runs_repo`` swap a ``src.repositories`` factory
+    (``source_connections_repo``, ``extraction_runs_repo``, …) by string
+    path, and ``monkeypatch`` restores THAT attribute — but a module that is
+    imported for the first time while the swap is active and binds the
+    factory at import time (``from src.repositories import
+    source_connections_repo``, as ``app/api/admin_sharepoint.py`` and
+    ``app/api/collections.py`` do) keeps the fake for the rest of the
+    process. Nothing restores it, the fake only knows this test's
+    ``conn1``, and every later test on the same xdist worker that goes
+    through that module answers ``404 connection_not_found`` — 52 failures
+    across ``tests/test_admin_sharepoint.py`` and
+    ``tests/test_admin_extraction.py`` when this file happened to run
+    first on a worker, none otherwise. (The instance: ``crawler.
+    _enqueue_streamed_facts_pass`` lazily importing ``app.api.
+    admin_sharepoint`` from inside a crawl.)
+
+    Requesting ``monkeypatch`` orders this teardown BEFORE its undo, so
+    "factories still swapped at teardown" is exactly the set a late import
+    could have captured; only when that set is non-empty does it scan the
+    imported first-party modules, so the cost is nil for tests that never
+    swap one. A test in this module must therefore never swap a factory on
+    an ``app.*`` module directly — swap it on ``src.repositories``, which
+    is what every helper here does.
+    """
+    import src.repositories as repos
+
+    real = {name: obj for name, obj in vars(repos).items() if name.endswith("_repo") and callable(obj)}
+    yield
+    swapped = {name for name, obj in real.items() if getattr(repos, name, obj) is not obj}
+    if not swapped:
+        return
+    captured: List[str] = []
+    for mod_name, mod in list(sys.modules.items()):
+        if mod is repos or mod is None or not mod_name.startswith(_FACTORY_HOST_PREFIXES):
+            continue
+        namespace = getattr(mod, "__dict__", None)
+        if not namespace:
+            continue
+        for name in swapped & namespace.keys():
+            if namespace[name] is not real[name]:
+                captured.append(f"{mod_name}.{name}")
+    assert not captured, (
+        f"a src.repositories factory swapped by this test was captured by a module imported "
+        f"during it and would leak into every later test on this worker: {sorted(captured)} — "
+        "the production code that imported that module lazily from inside the code under "
+        "test must import from a lower layer instead (see facts_extraction_readiness)"
+    )
+
+
 class FakeIngestor:
     """Stands in for ``crawler._Ingestor`` — records what would be written.
 
@@ -7051,3 +7108,28 @@ def test_the_converted_size_cap_is_reachable_by_the_converter():
         f"max_converted_mb={_DEFAULT_MAX_CONVERTED_MB} would refuse an ordinary "
         f"single-byte document at the character cap ({single_byte_bytes} bytes)"
     )
+
+
+def test_the_crawl_never_imports_the_admin_api():
+    """A connector must not import ``app.api.admin_sharepoint`` — not even
+    lazily inside a function.
+
+    Beyond the layering (the API sits above the connector), that module
+    binds ``source_connections_repo`` at import time, so the first import
+    of it from inside a crawl freezes whatever factory is installed at that
+    moment into the API for the rest of the process. That is how
+    ``_enqueue_streamed_facts_pass`` leaked this file's fake connections
+    repo into ``tests/test_admin_sharepoint.py`` / ``tests/
+    test_admin_extraction.py`` (52 order-dependent failures). What the
+    crawl needs from that module — the facts readiness gate and the job's
+    idempotency key — lives in ``connectors.sharepoint.facts_extraction``.
+    """
+    import inspect
+    import re
+
+    offending = [
+        line.strip()
+        for line in inspect.getsource(crawler).splitlines()
+        if re.match(r"\s*(from|import)\s+app\.api\.admin_sharepoint\b", line)
+    ]
+    assert offending == [], offending

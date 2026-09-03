@@ -4479,29 +4479,17 @@ def _facts_extraction_readiness() -> Tuple[bool, Optional[Dict[str, str]]]:
     reads the same verdict through ``app/web/router.py``'s pipeline cell and
     renders that key as its disabled reason, so the UI and the 409 can never
     disagree about what an admin has to flip.
-    """
-    from connectors.sharepoint.facts_extraction import facts_extraction_enabled, facts_surface_enabled
 
-    if not facts_extraction_enabled():
-        return False, {
-            "error": "facts_extraction_disabled",
-            "switch": "extraction.facts.enabled",
-            "message": (
-                "extraction.facts.enabled is off — turn it on in /admin/server-config "
-                "before running a facts-extraction pass (it is the cost gate: this stage "
-                "spends model tokens per document)."
-            ),
-        }
-    if not facts_surface_enabled():
-        return False, {
-            "error": "facts_extraction_disabled",
-            "switch": "facts.enabled",
-            "message": (
-                "facts.enabled is off — turn it on before running a facts-extraction pass "
-                "(writing claims into a surface nothing can read is never useful)."
-            ),
-        }
-    return True, None
+    Delegates to ``connectors.sharepoint.facts_extraction.
+    facts_extraction_readiness`` — the single source of truth, shared with
+    the crawl's streamed passes (``crawler._enqueue_streamed_facts_pass``),
+    which cannot import it from this API module without an upward layering
+    dependency (same arrangement as :func:`_facts_extraction_idempotency_key`).
+    This wrapper stays for every existing caller of this name.
+    """
+    from connectors.sharepoint.facts_extraction import facts_extraction_readiness
+
+    return facts_extraction_readiness()
 
 
 @router.post("/connections/{connection_id}/facts-extract", status_code=202)

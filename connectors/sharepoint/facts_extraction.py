@@ -465,6 +465,53 @@ def facts_surface_enabled() -> bool:
     return bool(feature_enabled("facts", "enabled", env_var="AGNES_FACTS_ENABLED", default=False))
 
 
+def facts_extraction_readiness() -> Tuple[bool, Optional[Dict[str, str]]]:
+    """Whether a standalone facts-extraction run can be enqueued right now
+    — ``(True, None)``, or ``(False, refusal)`` where ``refusal`` names the
+    switch that is off (``switch``) next to ``error``/``message``.
+
+    The single source of truth for BOTH triggers of the
+    ``sharepoint-facts-extraction`` job: the manual one
+    (``app/api/admin_sharepoint.py::_facts_extraction_readiness``, which
+    delegates here and turns a refusal into ``409 facts_extraction_disabled``)
+    and the crawl's own streamed passes
+    (``connectors.sharepoint.crawler._enqueue_streamed_facts_pass``). Both
+    check it BEFORE enqueueing, so neither ever hands the worker a job that
+    can only fail once claimed. The source card's pipeline cell
+    (``app/web/router.py``) renders the same ``switch`` as its disabled
+    reason, so the UI and the 409 can never disagree about what an admin
+    has to flip.
+
+    Lives here, not in the API module, for the same reason as
+    :func:`facts_extraction_idempotency_key`: the crawler needs it and a
+    connector must not import an ``app.api`` module — that is an upward
+    layering dependency, and one with teeth: the API module binds
+    ``source_connections_repo`` at import time, so importing it lazily from
+    inside a crawl bound whatever factory was installed at that moment
+    for the rest of the process.
+    """
+    if not facts_extraction_enabled():
+        return False, {
+            "error": "facts_extraction_disabled",
+            "switch": "extraction.facts.enabled",
+            "message": (
+                "extraction.facts.enabled is off — turn it on in /admin/server-config "
+                "before running a facts-extraction pass (it is the cost gate: this stage "
+                "spends model tokens per document)."
+            ),
+        }
+    if not facts_surface_enabled():
+        return False, {
+            "error": "facts_extraction_disabled",
+            "switch": "facts.enabled",
+            "message": (
+                "facts.enabled is off — turn it on before running a facts-extraction pass "
+                "(writing claims into a surface nothing can read is never useful)."
+            ),
+        }
+    return True, None
+
+
 def _standalone_timeout_seconds() -> float:
     """``extraction.facts.run_timeout_s`` — see
     :data:`DEFAULT_STANDALONE_TIMEOUT_S`. 0 (or negative, or unparseable)

@@ -5355,8 +5355,9 @@ def _enqueue_streamed_facts_pass(connection_id: str) -> None:
     """Enqueue one standalone ``sharepoint-facts-extraction`` job for this
     connection — the SAME job kind, enqueue call and idempotency key
     ``POST …/connections/{id}/facts-extract`` uses
-    (``app.api.admin_sharepoint._facts_extraction_idempotency_key``), so a
-    pass this streams and a manual trigger (or another streamed pass
+    (``connectors.sharepoint.facts_extraction.facts_extraction_idempotency_key``,
+    which the API's ``_facts_extraction_idempotency_key`` delegates to), so
+    a pass this streams and a manual trigger (or another streamed pass
     already queued/running) can never both be in flight for the same
     connection at once — ``enqueue()``'s own idempotency dedup collapses
     onto whichever is already there.
@@ -5367,18 +5368,26 @@ def _enqueue_streamed_facts_pass(connection_id: str) -> None:
     logged at debug, never a warning. Also skips (debug) when the two
     facts-extraction switches (``extraction.facts.enabled``,
     ``facts.enabled``) are not both on — the same gate the manual trigger
-    checks BEFORE enqueueing (``_facts_extraction_readiness``), so this
-    never hands the worker a job that can only fail once claimed. Never
-    raises: called from deep inside the crawl's own page loop, and a
-    hiccup scheduling a bonus pass must not fail a crawl that is still
-    ingesting real documents.
+    checks BEFORE enqueueing (``facts_extraction_readiness``, the API's
+    ``_facts_extraction_readiness`` delegates to it too), so this never
+    hands the worker a job that can only fail once claimed. Never raises:
+    called from deep inside the crawl's own page loop, and a hiccup
+    scheduling a bonus pass must not fail a crawl that is still ingesting
+    real documents.
+
+    Both helpers are imported from the connector-level module, never from
+    ``app.api.admin_sharepoint``: that API module binds
+    ``source_connections_repo`` at import time, so importing it lazily
+    from inside a crawl froze whatever factory was installed at that
+    moment into it for the rest of the process (a test's fake, in the
+    cross-test leak this fixed).
     """
-    from app.api.admin_sharepoint import _facts_extraction_idempotency_key, _facts_extraction_readiness
     from app.worker.registry import job_max_attempts
+    from connectors.sharepoint.facts_extraction import facts_extraction_idempotency_key, facts_extraction_readiness
     from src.repositories import jobs_repo
 
     try:
-        usable, _error = _facts_extraction_readiness()
+        usable, _error = facts_extraction_readiness()
         if not usable:
             logger.debug(
                 "sharepoint crawl: connection %s — extraction.facts.stream_every is set but facts extraction "
@@ -5389,7 +5398,7 @@ def _enqueue_streamed_facts_pass(connection_id: str) -> None:
         job = jobs_repo().enqueue(
             _FACTS_EXTRACTION_JOB_KIND,
             {"connection_id": connection_id},
-            idempotency_key=_facts_extraction_idempotency_key(connection_id),
+            idempotency_key=facts_extraction_idempotency_key(connection_id),
             max_attempts=job_max_attempts(_FACTS_EXTRACTION_JOB_KIND),
         )
     except Exception as exc:  # noqa: BLE001 — a bonus pass must never fail the crawl
