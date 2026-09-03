@@ -528,3 +528,85 @@ def test_plugins_are_absent_when_the_caller_was_granted_none():
         )
 
     assert not [h for h in hits if h["type"] == "plugin"]
+
+
+# ---------------------------------------------------------------------------
+# #2151: an explicit chunk_hits lets the caller pre-resolve (and, on
+# failure, degrade) the chunk leg itself instead of unified_search fetching
+# it internally — app.api.knowledge_search needs this to catch a chunk
+# engine failure without losing the other legs.
+# ---------------------------------------------------------------------------
+
+
+def test_chunk_hits_override_skips_internal_chunk_search():
+    from src.search.unified import unified_search
+
+    def _boom(*_a, **_kw):
+        raise AssertionError("_chunk_search must not run when chunk_hits is given")
+
+    with (
+        patch("src.search.unified._chunk_search", _boom),
+        patch("src.search.unified._knowledge_search", lambda q, **kw: []),
+        patch("src.search.unified._glossary_search", lambda q, limit=10: []),
+    ):
+        hits = unified_search(
+            "invoices",
+            corpus_ids=["c1"],
+            user_groups=None,
+            granted_domains=None,
+            tables=[],
+            chunk_hits=[
+                {
+                    "chunk_id": "ch1",
+                    "corpus_id": "c1",
+                    "file_id": "f1",
+                    "filename": "billing.md",
+                    "ordinal": 0,
+                    "section_path": None,
+                    "text": "invoices are monthly",
+                    "score": 0.9,
+                    "confidence": "high",
+                }
+            ],
+            k=10,
+        )
+    assert [h for h in hits if h["type"] == "chunk"]
+
+
+def test_chunk_hits_empty_list_means_no_chunk_results_not_default_fetch():
+    """An explicit empty list (the degraded-leg case) must not fall back to
+    fetching internally — `is not None`, not truthiness, is the switch."""
+    from src.search.unified import unified_search
+
+    def _boom(*_a, **_kw):
+        raise AssertionError("_chunk_search must not run when chunk_hits=[] is given")
+
+    with (
+        patch("src.search.unified._chunk_search", _boom),
+        patch("src.search.unified._knowledge_search", lambda q, **kw: []),
+        patch("src.search.unified._glossary_search", lambda q, limit=10: []),
+    ):
+        hits = unified_search(
+            "invoices",
+            corpus_ids=["c1"],
+            user_groups=None,
+            granted_domains=None,
+            tables=[],
+            chunk_hits=[],
+            k=10,
+        )
+    assert not [h for h in hits if h["type"] == "chunk"]
+
+
+def test_chunk_hits_none_preserves_default_internal_fetch():
+    """Every existing caller (this file's other ~20 cases) omits
+    chunk_hits — the default must be unchanged."""
+    from src.search.unified import unified_search
+
+    with (
+        patch("src.search.unified._chunk_search", _fake_chunks),
+        patch("src.search.unified._knowledge_search", lambda q, **kw: []),
+        patch("src.search.unified._glossary_search", lambda q, limit=10: []),
+    ):
+        hits = unified_search("invoices", corpus_ids=["c1"], user_groups=None, granted_domains=None, tables=[], k=10)
+    assert [h for h in hits if h["type"] == "chunk"]

@@ -240,6 +240,23 @@ See [`STORE_GUARDRAILS.md`](STORE_GUARDRAILS.md) for the pipeline these tune.
 | Skill-lint duplicate candidate count | `guardrails.lint_duplicate_top_n` | `5` | `get_lint_duplicate_top_n()` |
 | Skill-lint audit min interval (hours) | `guardrails.lint_audit_min_interval_hours` | `144` | `get_lint_audit_min_interval_hours()` |
 
+### Collections search
+
+See `src/ingest/retrieval.py`'s module docstring for the hybrid
+lexical+vector ranking this bounds.
+
+| Knob | `instance.yaml` path | Default | Resolver |
+|------|----------------------|---------|----------|
+| Max chunks ranked per `GET /api/collections/search` (or the `/api/knowledge/search` chunk leg) request | `collections.search_max_chunks` | `25000` | `get_collections_search_max_chunks()` |
+
+Above the cap, the search runs over a SQL-side lexical prefilter + `LIMIT`
+instead of every chunk in the caller's accessible collections, and the
+response carries `truncated: true`; a query with no usable (non-stopword)
+term to prefilter on is refused with a `422 search_query_too_broad` rather
+than silently ranking an arbitrary `LIMIT`-sized slice. At or under the cap,
+behavior is unchanged. `0` has no "unlimited" meaning here (unlike the
+retention knobs below) — a non-positive value clamps to `1`.
+
 ### Audit trail
 
 See [`observability.md`](observability.md) for the full audit/activity-trail

@@ -2309,6 +2309,18 @@ value falls back to `oldest` rather than erroring. Every ordering carries an
 `id ASC` tie-break, because files uploaded in one batch share a `created_at`
 and without it a page boundary would repeat or skip rows.
 
+**`GET /api/collections/search`** ranks chunks with a server-side cap
+(`collections.search_max_chunks`, default 25000) on how many chunks of the
+caller's accessible collections a single request may rank — the point
+`scripts/bench_retrieval.py` measured at ~371 MB peak RSS. At/under the cap,
+behavior is unchanged. Over it, the server prefilters candidates by the
+query's own terms before ranking and the response carries `truncated: true`
+plus `truncated_cap`; a query with no usable (non-stopword) term to narrow
+by, over the cap, is refused with a typed `422 search_query_too_broad`
+rather than ranking an arbitrary slice of the corpus. A search-backend
+outage (a database-side memory or operational failure) answers a typed
+`503 search_unavailable` instead of an anonymous server error.
+
 **Editing a collection** (`PATCH /api/collections/{collection_id}`) changes
 its `name`, `slug` and `description` — the files inside are untouched. The
 gate is **owner-or-admin**, not every grant-holder: a group grant conveys
@@ -2771,6 +2783,11 @@ metered server-side.
   table catalog cards; typed results (`chunk | knowledge | table`) with
   citations, RBAC fail-closed per source. Params: `q` (required), `k` (1–50,
   default 10). Triple-surface: `agnes search` + MCP tool `knowledge_search`.
+  The chunk leg is bounded server-side (`collections.search_max_chunks`,
+  see `/api/collections` above); a chunk-engine failure or an over-broad
+  query on an oversized corpus degrades that ONE leg to empty (`degraded:
+  {"chunk": "search_unavailable"}` + `degraded_note`) rather than failing
+  the whole combined search — the other legs keep answering.
 - /api/knowledge/artifacts/{corpus_id}/download — streams the per-collection
   `knowledge.duckdb` artifact (chunks + embeddings) built by the K3 local
   packaging pass; listed in the sync manifest's `knowledge_artifacts` array
