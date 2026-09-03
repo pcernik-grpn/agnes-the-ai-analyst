@@ -807,7 +807,7 @@ CATALOG: dict[str, AuditEvent] = {
     "chat.session_file.save_artefact": AuditEvent(
         "chat.session_file.save_artefact",
         "mutation",
-        "A chat session's engine-side file was saved as a permanent chat artefact.",
+        "A chat session's engine-side file was saved as a permanent chat artifact.",
     ),
     "chat.upload": AuditEvent(
         "chat.upload", "mutation", "A file was uploaded to chat and registered as a workspace table."
@@ -1003,13 +1003,13 @@ CATALOG: dict[str, AuditEvent] = {
         "slack.event_received", "system", "A Slack Events API callback was received and dispatched."
     ),
     "stack.artefact_remove": AuditEvent(
-        "stack.artefact_remove", "mutation", "A knowledge artefact was removed from a caller's stack."
+        "stack.artefact_remove", "mutation", "A knowledge artifact was removed from a caller's stack."
     ),
     "stack.unsubscribe": AuditEvent(
         "stack.unsubscribe", "mutation", "A caller unsubscribed from a resource in their stack."
     ),
     "stack.artefact_add": AuditEvent(
-        "stack.artefact_add", "mutation", "A knowledge artefact was added to a caller's stack."
+        "stack.artefact_add", "mutation", "A knowledge artifact was added to a caller's stack."
     ),
     "stack.subscribe": AuditEvent(
         "stack.subscribe", "mutation", "A caller subscribed to a resource (e.g. a data package) in their stack."

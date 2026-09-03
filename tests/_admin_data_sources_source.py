@@ -21,15 +21,18 @@ from __future__ import annotations
 
 from pathlib import Path
 
-_ROOT = Path(__file__).resolve().parents[1]
+from tests import _ds_page_source
 
-#: The template, followed by the four extracted static files, in load order.
-ADMIN_DATA_SOURCES_SOURCE_FILES: tuple[Path, ...] = (
-    _ROOT / "app" / "web" / "templates" / "admin_data_sources.html",
-    _ROOT / "app" / "web" / "static" / "js" / "admin" / "data_sources_page.js",
-    _ROOT / "app" / "web" / "static" / "js" / "admin" / "data_sources_sharepoint_wizard.js",
-    _ROOT / "app" / "web" / "static" / "js" / "admin" / "data_sources_extraction_observability.js",
-    _ROOT / "app" / "web" / "static" / "js" / "admin" / "data_sources_anon_preview.js",
+#: The template, the partial it includes, then every classic script it loads,
+#: in load order. One list, owned by ``tests/_ds_page_source.py`` — this
+#: module is the older spelling of the same helper and stays only so its
+#: callers need no edit.
+ADMIN_DATA_SOURCES_SOURCE_FILES: tuple[Path, ...] = tuple(
+    p
+    for p in (_ds_page_source.TEMPLATE, *_ds_page_source._INCLUDED, *_ds_page_source._LOADED)
+    # `_LOADED` may name a script the page does not load YET (a planned
+    # split); `page_source()` skips it the same way.
+    if p.exists()
 )
 
 
@@ -38,21 +41,23 @@ def read_admin_data_sources_source() -> str:
     in load order. Use this wherever a test used to do
     ``Path(...).read_text()`` on ``admin_data_sources.html`` alone to find a
     JS function or a markup fragment — a fragment that moved into one of the
-    static files is still found, at the same relative ordering."""
-    return "\n".join(p.read_text(encoding="utf-8") for p in ADMIN_DATA_SOURCES_SOURCE_FILES)
+    static files is still found, at the same relative ordering. Same bytes as
+    ``_ds_page_source.page_source()``."""
+    return _ds_page_source.page_source()
 
 
 def fetch_admin_data_sources_page(seeded_app) -> str:
     """``GET /admin/data-sources`` (a REAL round trip through the app —
-    exercises auth same as before) with the extracted static JS appended, so
+    exercises auth same as before) with the loaded static JS appended, so
     a test that string-searches the "page" for a JS fragment still finds it
     regardless of which physical file it now lives in (perf follow-up,
-    2026-09-03). Reads the static files from disk rather than issuing four
-    more HTTP requests — same bytes the server would serve, since nothing
-    about ``StaticFiles`` transforms file content in flight."""
+    2026-09-03). Reads the static files from disk rather than issuing more
+    HTTP requests — same bytes the server would serve, since nothing about
+    ``StaticFiles`` transforms file content in flight. The included partial
+    is NOT appended: the response already carries it rendered."""
     resp = seeded_app["client"].get(
         "/admin/data-sources",
         headers={"Authorization": f"Bearer {seeded_app['admin_token']}"},
     )
-    static_js = "\n".join(p.read_text(encoding="utf-8") for p in ADMIN_DATA_SOURCES_SOURCE_FILES[1:])
+    static_js = "\n".join(p.read_text(encoding="utf-8") for p in _ds_page_source._LOADED if p.exists())
     return resp.text + "\n" + static_js

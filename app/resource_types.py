@@ -632,7 +632,7 @@ def _corpus_file_blocks() -> list[Block]:
     owner share one file without sharing the whole folder), so its grants need
     to be visible and correctable here.
 
-    EVERY live collection's files are listed, including the one-file artefacts
+    EVERY live collection's files are listed, including the one-file artifacts
     a chat file-drop creates. Those used to be skipped, on the reasoning that a
     lone file IS its collection and listing it twice would invite
     contradictory grants — but the two grants are OR'd, never contradictory
@@ -908,7 +908,7 @@ def _collection_blocks() -> list[Block]:
                     "grant_count": grant_counts.get(r["id"], 0),
                     # WHOSE collection this is. Every collection on the
                     # instance is listed here — including the one-file
-                    # artefacts a chat file-drop creates, which are private to
+                    # artifacts a chat file-drop creates, which are private to
                     # their uploader — and an admin reading an inventory of
                     # private uploads has to be able to tell them apart from
                     # their own. Without this the page showed a flat list of

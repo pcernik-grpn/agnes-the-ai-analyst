@@ -3,7 +3,7 @@
 Every file format (images, documents, anything else) shares ONE top-level
 "Files" section, with multi-file collections nested inside it as folders:
 
-  - a single-file artefact IS its file — a loose row, draggable into a folder;
+  - a single-file artifact IS its file — a loose row, draggable into a folder;
   - a multi-file collection is a folder row: a drop target that expands to its
     files, each of which has its own detail page AND its own sharing;
   - non-file kinds (skills, data packages, memory, …) stay separate top-level
@@ -267,7 +267,7 @@ def test_group_header_carries_label_count_and_hint(seeded_app):
     assert 'aria-expanded="true"' in head
     assert "fbar-group__caret" in head
     assert "lib-sec-icon" in head  # the per-type glyph
-    assert ">Artefacts<" in head
+    assert ">Artifacts<" in head
     assert "data-sec-count" in head
     assert "Files you upload and the outputs your agent generates." in head
 
@@ -512,13 +512,13 @@ def test_file_rows_show_their_format_where_the_description_was(seeded_app):
         return m.group(1).strip() if m else ""
 
     loose = re.search(r'<tr class="lib-row lib-row--file"(?:(?!</tr>).)*?Format Solo.*?</tr>', text, re.S)
-    assert loose, "the single-file artefact must render as a loose file row"
+    assert loose, "the single-file artifact must render as a loose file row"
     assert _desc(loose.group(0)) == "MD"
     # The retired boilerplate is gone from the row entirely.
     assert "A private file — searchable by your agents." not in loose.group(0)
 
     folder_row = re.search(r'<tr class="lib-row lib-row--folder"(?:(?!</tr>).)*?Format Folder.*?</tr>', text, re.S)
-    assert folder_row, "a 2-file artefact must render as a folder row"
+    assert folder_row, "a 2-file artifact must render as a folder row"
     assert _desc(folder_row.group(0)) == "2 files"
 
     # Children: titled by filename, second line = their own format. Fetched
@@ -1033,7 +1033,7 @@ def test_per_file_sharing_is_owner_scoped(seeded_app):
 
 
 def test_move_puts_a_loose_file_into_a_folder_and_tidies_the_husk(seeded_app):
-    """Dragging a single-file artefact into a folder must not strand an empty
+    """Dragging a single-file artifact into a folder must not strand an empty
     collection in the listing — a loose file IS its collection."""
     tok = seeded_app["admin_token"]
     solo = _collection(seeded_app, "Lonely File", tok)

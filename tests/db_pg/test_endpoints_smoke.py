@@ -2796,7 +2796,7 @@ KNOWN_UNTESTED = {
     # Agent builder (rail-layout WIP surface) — rendering covered by
     # tests/test_ui_layout_theme.py::TestRailOptIn.
     "GET /agents",
-    # Personal artefacts page (rail-layout IA) — rendering covered by
+    # Personal artifacts page (rail-layout IA) — rendering covered by
     # tests/test_ui_layout_theme.py::TestRailOptIn.
     "GET /artefacts",
     # Knowledge-search chat landing (#896) — rendering covered by
@@ -3176,10 +3176,10 @@ KNOWN_UNTESTED = {
     "DELETE /api/chat/sessions/{chat_id}/permanent",
     # Session-workspace file delivery (#1611) — owner-scoped reads over the
     # caller's own session dir plus the save-to-Library bridge. No new repo
-    # methods/migration (ownership rides chat_repo.get_session, the artefact
+    # methods/migration (ownership rides chat_repo.get_session, the artifact
     # path reuses create_single_file_artefact — both already parity-proven);
     # behaviour (ownership 404s, traversal/symlink containment, download
-    # headers, artefact creation) covered in tests/test_chat_session_files.py.
+    # headers, artifact creation) covered in tests/test_chat_session_files.py.
     # The preview pair joins them on the same grounds: `…/preview` reads the
     # caller's own session file and describes it, `…/raw` streams the closed
     # image/PDF allowlist inline for the modal to draw — same ownership and
@@ -3328,7 +3328,7 @@ KNOWN_UNTESTED = {
     # component in page mode. No PG-specific behaviour of its own; the
     # package writes it performs are the /api/admin/data-packages routes.
     "GET /admin/data-packages/new",
-    # Add artefacts to My Stack — covered by tests/test_web_stack_artefacts.py
+    # Add artifacts to My Stack — covered by tests/test_web_stack_artefacts.py
     # (DuckDB) + tests/test_cli_api_parity.py (add/remove parity); no
     # dedicated PG smoke class yet, same convention as the stack rows above.
     "DELETE /api/stack/artefacts/{corpus_id}",

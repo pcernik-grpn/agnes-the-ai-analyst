@@ -9,6 +9,8 @@ Covers:
 
 from __future__ import annotations
 
+from tests import _ds_page_source
+
 import pytest
 from cryptography.fernet import Fernet
 
@@ -272,11 +274,7 @@ class TestWizardRegisterPayloadContract:
 
     @staticmethod
     def _template_text():
-        # Perf follow-up (2026-09-03): most of this page's JS moved into
-        # extracted static files, see tests/_admin_data_sources_source.py.
-        from tests._admin_data_sources_source import read_admin_data_sources_source
-
-        return read_admin_data_sources_source()
+        return _ds_page_source.page_source()
 
     def test_register_payload_uses_bare_table_name(self):
         tpl = self._template_text()
@@ -745,7 +743,7 @@ class TestSemanticLayerCellNoTokenAction:
         import tempfile
         from pathlib import Path
 
-        tpl = read_admin_data_sources_source()
+        tpl = _ds_page_source.page_source()
         fn = self._extract_function(tpl, "function _pipelineStripHtml(row) {")
         pipeline = {
             "tables": {"count": 5},
@@ -918,11 +916,7 @@ class TestKeboolaImportAsManagedConnection:
 
     @staticmethod
     def _template_text() -> str:
-        # Perf follow-up (2026-09-03): most of this page's JS moved into
-        # extracted static files, see tests/_admin_data_sources_source.py.
-        from tests._admin_data_sources_source import read_admin_data_sources_source
-
-        return read_admin_data_sources_source()
+        return _ds_page_source.page_source()
 
     def test_button_only_renders_for_the_keboola_derived_card(self):
         tpl = self._template_text()
@@ -997,7 +991,7 @@ class TestImportKeboolaConnectionBehavior:
         import tempfile
         from pathlib import Path
 
-        tpl = read_admin_data_sources_source()
+        tpl = _ds_page_source.page_source()
         fn = self._extract_function(tpl, "async function importKeboolaConnection(id) {")
 
         script = f"""
@@ -1181,11 +1175,7 @@ class TestKeboolaBulkPickerRenameSuggestion:
 
     @staticmethod
     def _template_text() -> str:
-        # Perf follow-up (2026-09-03): most of this page's JS moved into
-        # extracted static files, see tests/_admin_data_sources_source.py.
-        from tests._admin_data_sources_source import read_admin_data_sources_source
-
-        return read_admin_data_sources_source()
+        return _ds_page_source.page_source()
 
     def test_picker_renders_an_editable_input_only_for_names_that_would_fail(self):
         tpl = self._template_text()
@@ -1341,11 +1331,7 @@ class TestSnowflakeWizardCredentialNames:
     from `GET /api/admin/server-config`."""
 
     def _template(self):
-        # Perf follow-up (2026-09-03): most of this page's JS moved into
-        # extracted static files, see tests/_admin_data_sources_source.py.
-        from tests._admin_data_sources_source import read_admin_data_sources_source
-
-        return read_admin_data_sources_source()
+        return _ds_page_source.page_source()
 
     def test_the_save_writes_the_connection_row_not_the_yaml_overlay(self):
         src = self._template()
@@ -1418,11 +1404,7 @@ class TestDatabricksWizardCredentialAndRestartNotice:
     boundary to import."""
 
     def _template(self):
-        # Perf follow-up (2026-09-03): most of this page's JS moved into
-        # extracted static files, see tests/_admin_data_sources_source.py.
-        from tests._admin_data_sources_source import read_admin_data_sources_source
-
-        return read_admin_data_sources_source()
+        return _ds_page_source.page_source()
 
     def test_the_credential_badge_row_is_styled_like_its_siblings(self):
         """`.ds-dbxcred` was on the div and in no stylesheet rule, so the badge
@@ -1963,7 +1945,7 @@ class TestSharePointSourceCardRendering:
         import tempfile
         from pathlib import Path
 
-        tpl = read_admin_data_sources_source()
+        tpl = _ds_page_source.page_source()
         fns = "\n".join(
             self._extract_function(tpl, sig)
             for sig in (
@@ -2547,7 +2529,7 @@ class TestSourceTypeAwareActionsMenu:
         import tempfile
         from pathlib import Path
 
-        tpl = read_admin_data_sources_source()
+        tpl = _ds_page_source.page_source()
         fns = "\n".join(
             self._extract_function(tpl, sig) for sig in ("function _esc(s) {", "function _sourceMenuItems(row) {")
         )
@@ -2634,7 +2616,7 @@ class TestManageScopesButtonOnTheCard:
         import tempfile
         from pathlib import Path
 
-        tpl = read_admin_data_sources_source()
+        tpl = _ds_page_source.page_source()
         fn = self._extract_function(tpl, "function _connectionCardHtml(row) {")
         script = f"""
 function _esc(s) {{ return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;"); }}
@@ -2695,7 +2677,7 @@ class TestOpenSpWizardForConnection:
         import tempfile
         from pathlib import Path
 
-        tpl = read_admin_data_sources_source()
+        tpl = _ds_page_source.page_source()
         fns = "\n".join(
             self._extract_function(tpl, sig)
             for sig in (
@@ -2795,7 +2777,7 @@ class TestOpenSpWizardPreselectsSingleExistingConnection:
         import tempfile
         from pathlib import Path
 
-        tpl = read_admin_data_sources_source()
+        tpl = _ds_page_source.page_source()
         fns = "\n".join(
             self._extract_function(tpl, sig)
             for sig in ("function spEsc(s) {", "function spApi(url, opts) {", "function openSpWizard() {")
@@ -2877,7 +2859,7 @@ class TestSharePointWizardShareBadgeRendering:
         import tempfile
         from pathlib import Path
 
-        tpl = read_admin_data_sources_source()
+        tpl = _ds_page_source.page_source()
         fns = "\n".join(
             self._extract_function(tpl, sig) for sig in ("function spEsc(s) {", "function spRenderShare(items) {")
         )
@@ -3094,7 +3076,7 @@ class TestSourceCardSubtitleIdentity:
         import tempfile
         from pathlib import Path
 
-        tpl = read_admin_data_sources_source()
+        tpl = _ds_page_source.page_source()
         fns = "\n".join(
             self._extract_function(tpl, sig)
             for sig in (
@@ -3502,7 +3484,7 @@ class El {
         import tempfile
         from pathlib import Path
 
-        tpl = read_admin_data_sources_source()
+        tpl = _ds_page_source.page_source()
         fns = "\n".join(
             self._extract_function(tpl, sig)
             for sig in (

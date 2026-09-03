@@ -155,7 +155,7 @@ admin creates via the Library/API is then granted to `Everyone` at creation.
 The grant is an ordinary `resource_grants` row — visible in `/admin/access`
 and revocable per collection in the Share dialog. Scope is deliberately
 narrow: non-admin uploads stay private, and chat file drops (which create
-private one-file artefacts through a separate path) are never auto-shared.
+private one-file artifacts through a separate path) are never auto-shared.
 
 ---
 

@@ -27,6 +27,8 @@ What these pin:
 
 from __future__ import annotations
 
+from tests import _ds_page_source
+
 import re
 import uuid
 from pathlib import Path
@@ -35,7 +37,6 @@ import pytest
 
 from tests._admin_data_sources_source import (
     fetch_admin_data_sources_page,
-    read_admin_data_sources_source,
 )
 
 _ROOT = Path(__file__).resolve().parents[1]
@@ -369,7 +370,7 @@ class TestNextStepHtml:
         import subprocess
         import tempfile
 
-        tpl = read_admin_data_sources_source()
+        tpl = _ds_page_source.page_source()
         fns = "\n".join(
             self._extract_function(tpl, sig) for sig in ("function _esc(s) {", "function _nextStepHtml(row) {")
         )

@@ -23,6 +23,8 @@ Rules this file exists to hold:
 
 from __future__ import annotations
 
+from tests import _ds_page_source
+
 import json
 import subprocess
 import tempfile
@@ -30,12 +32,11 @@ from pathlib import Path
 
 import pytest
 
-from tests._admin_data_sources_source import read_admin_data_sources_source
 
 # Kept for any future caller that needs the template path itself — content
-# reads go through `read_admin_data_sources_source()` (perf follow-up,
+# reads go through `_ds_page_source.page_source()` (perf follow-up,
 # 2026-09-03: most of this page's JS moved into extracted static files, see
-# tests/_admin_data_sources_source.py).
+# tests/_ds_page_source.py).
 TEMPLATE = Path(__file__).resolve().parents[1] / "app" / "web" / "templates" / "admin_data_sources.html"
 
 
@@ -104,7 +105,7 @@ const document = { getElementById: (id) => _elements[id] };
 
 
 def _run_js(body: str, *, state: dict | None = None, signatures=_SIGNATURES, preamble: str = "") -> dict:
-    tpl = read_admin_data_sources_source()
+    tpl = _ds_page_source.page_source()
     fns = "\n".join(_extract_block(tpl, sig) for sig in signatures)
     script = f"""
 const EXT_MAX_FAILURES = 3;
