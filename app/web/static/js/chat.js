@@ -9,6 +9,7 @@ import {
 } from "./chat_onboarding.js";
 import { initChatDashboard, updateDashboardSuggestions } from "./chat_dashboard.js";
 import { applyInlineIcons, iconEl } from "./chat_icons.js";
+import { chatErrorCopy, chatErrorTone, requestErrorCopy, requestErrorTone, SAY } from "./chat_errors.js";
 
 const $ = (id) => document.getElementById(id);
 
@@ -297,10 +298,22 @@ function setStatus(text, kind = "info") {
  *  reader scrolls back through — a turn that stopped early must say so where
  *  the reader is looking. */
 function renderSystemNote(text, tone) {
-  const note = document.createElement("div");
-  note.className = `cloud-chat-system-note is-${tone === "error" ? "error" : "warn"}`;
+  const kind = tone === "error" ? "error" : "warn";
+  // window.agnesNotice (app.js) builds the shared .notice — one icon+message
+  // layout for the transcript, the upload dialogs and every toast. The
+  // `cloud-chat-system-note` class rides along so chat.css keeps its column
+  // sizing hook (and so the guards that name it stay valid).
+  const note = window.agnesNotice
+    ? window.agnesNotice(text, kind, { placement: "inline", extraClass: "cloud-chat-system-note" })
+    : (() => {
+        // app.js absent (a page that loads chat.js alone) — a plain line
+        // still says what happened rather than nothing.
+        const n = document.createElement("div");
+        n.className = `cloud-chat-system-note is-${kind}`;
+        n.textContent = text;
+        return n;
+      })();
   note.setAttribute("role", "status");
-  note.textContent = text;
   _endToolGroup();
   $("chat-messages").appendChild(note);
   maybeScrollToBottom();
@@ -312,13 +325,20 @@ function renderSystemNote(text, tone) {
 function showToast(text, kind = "ok", { durationMs = 2400 } = {}) {
   const stack = $("chat-toasts");
   if (!stack) return;
-  const toast = document.createElement("div");
-  toast.className = `cloud-chat-toast is-${kind}`;
+  // Same shared .notice as the transcript and the dialogs; `cloud-chat-toast`
+  // stays for chat.css's stack positioning and leave animation.
+  const toast = window.agnesNotice
+    ? window.agnesNotice(text, kind, { placement: "floating", extraClass: "cloud-chat-toast" })
+    : (() => {
+        const t = document.createElement("div");
+        t.className = `cloud-chat-toast is-${kind}`;
+        t.textContent = text;
+        return t;
+      })();
   // No per-toast role="status" — the parent #chat-toasts already
   // carries aria-live="polite" which announces any appended child.
   // Stacking both was belt-and-suspenders that caused some screen
   // readers to double-announce.
-  toast.textContent = text;
   const dismiss = () => {
     toast.classList.add("is-leaving");
     setTimeout(() => toast.remove(), 160);
@@ -1248,11 +1268,11 @@ function wireCopyTranscript() {
           try {
             text = await md;
           } catch (_) {
-            showToast("Couldn't read this conversation", "error");
+            showToast("Couldn't read this conversation", "warn");
             return;
           }
           const ok = await copyTextToClipboard(text);
-          showToast(ok ? "Transcript copied" : "Couldn't copy to clipboard", ok ? "ok" : "error");
+          showToast(ok ? "Transcript copied" : "Couldn't copy to clipboard", ok ? "ok" : "warn");
           return;
         }
       }
@@ -1261,9 +1281,9 @@ function wireCopyTranscript() {
       // that got a real click but loses the gesture on stricter browsers.
       const md = await fetchTranscriptMarkdown(chatId, title);
       const ok = await copyTextToClipboard(md);
-      showToast(ok ? "Transcript copied" : "Couldn't copy to clipboard", ok ? "ok" : "error");
+      showToast(ok ? "Transcript copied" : "Couldn't copy to clipboard", ok ? "ok" : "warn");
     } catch (_) {
-      showToast("Couldn't read this conversation", "error");
+      showToast("Couldn't read this conversation", "warn");
     } finally {
       btn.disabled = false;
     }
@@ -1359,7 +1379,29 @@ async function api(path, init = {}) {
     credentials: "same-origin",
     ...init,
   });
-  if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+  if (!r.ok) {
+    // Carry the server's own error code, not just the status line. Every
+    // caller renders `err.message`, and `"429 Too Many Requests"` cannot tell
+    // Agnes's per-user conversation cap apart from an upstream model quota —
+    // two different situations with two different things for the reader to
+    // do. The body already says which (`detail.kind` / `detail.code`), and
+    // discarding it here is what forced every 429 into one wrong sentence.
+    let code = "";
+    try {
+      const body = await r.json();
+      const d = body && body.detail;
+      if (d && typeof d === "object") code = String(d.kind || d.code || "");
+      else if (typeof d === "string") code = d;
+    } catch (_) { /* empty or non-JSON error body — the status is all we have */ }
+    // `message` keeps its exact previous text — a dozen callers interpolate
+    // it into a toast, and appending the code there would reword all of them.
+    // The code rides alongside, for the callers that can say something better
+    // with it.
+    const err = new Error(`${r.status} ${r.statusText}`);
+    err.status = r.status;
+    err.code = code;
+    throw err;
+  }
   // 204 No Content (and any empty 2xx) — DELETE /sessions/{id} returns
   // this. Calling .json() on an empty body throws "unexpected end of
   // data", which is what surfaced as `Could not delete: JSON.parse: …`.
@@ -1630,7 +1672,7 @@ async function setSessionPinned(chatId, pinned) {
       body: JSON.stringify({ pinned }),
     });
   } catch (err) {
-    showToast(`Could not ${pinned ? "pin" : "unpin"}: ${err.message}`, "error");
+    showToast(`Could not ${pinned ? "pin" : "unpin"}: ${err.message}`, requestErrorTone(err.status, err.code || err.message));
     return;
   }
   await loadSidebar();
@@ -1662,7 +1704,7 @@ async function renameSessionPrompt(s) {
       body: JSON.stringify({ title }),
     });
   } catch (err) {
-    showToast(`Could not rename: ${err.message}`, "error");
+    showToast(`Could not rename: ${err.message}`, requestErrorTone(err.status, err.code || err.message));
     return;
   }
   applySessionRename({ chat_id: s.id, title });
@@ -1695,7 +1737,7 @@ async function deleteSession(chatId) {
   try {
     await api(`/api/chat/sessions/${chatId}`, { method: "DELETE" });
   } catch (err) {
-    showToast(`Could not delete: ${err.message}`, "error");
+    showToast(`Could not delete: ${err.message}`, requestErrorTone(err.status, err.code || err.message));
     return;
   }
   await loadSidebar();
@@ -2105,7 +2147,7 @@ function _renderAgentSelectMenu(filter) {
       newChat(a.slug || undefined).catch((err) => {
         console.error("chat: could not start a session as agent", err);
         if (window.appToast) {
-          window.appToast({ kind: "error", msg: _agentStartMessage(err) });
+          window.appToast({ kind: requestErrorTone(err.status, err.code || err.message), msg: _agentStartMessage(err) });
         }
       });
     };
@@ -2232,11 +2274,18 @@ async function _refreshAgents() {
  *
  * The generic "Could not start a chat with that agent" blamed the agent for
  * the one failure that is really about the reader's own open conversations:
- * the per-user concurrency cap answers 429, and the fix is theirs to make. */
+ * the per-user concurrency cap answers 429, and the fix is theirs to make.
+ *
+ * Which 429 it is now comes from the server's own code (`api()` carries it),
+ * not from spotting "429" in the status line: an upstream model quota answers
+ * 429 too, and telling someone to delete their conversations does nothing
+ * about a rate limit two systems away. */
 function _agentStartMessage(err) {
+  const code = String((err && err.code) || "");
   const msg = String((err && err.message) || "");
-  if (msg.includes("429")) {
-    return "Too many conversations open. Close one from the sidebar, then try again.";
+  if (code === "concurrency_cap") return SAY.conversationCap;
+  if (code || msg.includes("429")) {
+    return chatErrorCopy(msg, code);
   }
   return "Could not start a chat with that agent.";
 }
@@ -2663,64 +2712,6 @@ async function openSession(chatId, wsUrlOverride, { restoring = false } = {}) {
   };
 }
 
-// Plain-language copy for a failed turn. Chat pasted `frame.kind` +
-// `frame.message` straight into the stream, so the product's core action
-// failed with "Something went wrong: engine_error — engine turn failed:
-// 503: kai_integration_not_configured" — no cause a non-technical reader can
-// act on, no next step, and a second truncated copy in a toast.
-//
-// The same error families already have written copy in
-// components/builder_preview.js (`errorCopy`), which the preview surface has
-// been using all along. This is that mapping, worded for chat: same families,
-// same order, so the two surfaces cannot describe one failure differently.
-function chatErrorCopy(raw, kind) {
-  const msg = String(raw == null ? "" : raw).trim();
-  const k = String(kind == null ? "" : kind).trim();
-  const both = `${k} ${msg}`;
-  if (/not_configured|no_provider|provider_unavailable|integration/i.test(both)) {
-    return "Agnes needs a chat engine to answer, and none is configured on this " +
-      "instance yet. An admin sets that up — your message was not lost.";
-  }
-  if (/concurrency_cap/i.test(both)) {
-    return "Too many conversations are running right now. Try again in a moment.";
-  }
-  // Agnes's OWN sender limits (enforce_sender_limits in app/chat/manager.py),
-  // delivered to the sender's own sockets only (so "you" is the reader),
-  // matched on the frame's kind before the agent-budget family below: they
-  // are not engine errors, so the fallback's "The engine reported:" would
-  // send the reader — and whoever they ask — to the wrong place. The
-  // per-conversation one is a budget of tokens billed across every turn,
-  // not a context limit, so the copy must not suggest the answer was too
-  // long or that the conversation should have been compacted (TCRD-291).
-  if (/max_session_tokens/i.test(both)) {
-    return "This conversation has reached its token budget, so it can't take another turn. " +
-      "Start a new conversation to keep going. An admin can raise the per-conversation budget.";
-  }
-  if (/daily_budget/i.test(both)) {
-    // Keyed on the SENDER (enforce_sender_limits sums the sender's own day),
-    // so it is "your" cap, not the instance's.
-    return "You've reached your daily spend cap on this instance. Try again tomorrow, or ask an admin to raise it.";
-  }
-  if (/rate_limit/i.test(both)) {
-    return "You're sending messages faster than this instance allows. Wait a few minutes and try again.";
-  }
-  if (/budget|429/i.test(both)) {
-    return "This instance has used its message budget for the month. An admin can raise it.";
-  }
-  if (/runner_not_ready|did not become ready/i.test(both)) {
-    return "The chat engine did not start in time. The first conversation after a restart " +
-      "is the slow one, so trying again usually works — if it keeps failing, ask an admin " +
-      "to check the chat engine.";
-  }
-  if (/timeout|timed out/i.test(both)) {
-    return "That took too long and was stopped. Try a narrower question, or ask again.";
-  }
-  // Unrecognised: say plainly that it failed and keep the detail visible
-  // rather than inventing a cause we do not know.
-  return msg
-    ? `Agnes could not finish that answer. The engine reported: ${msg}`
-    : "Agnes could not finish that answer. Try again, or ask an admin to check the chat engine.";
-}
 
 function handleFrame(frame) {
   // Track last-seen seq per session (wave-2F task 2/3 — see
@@ -2889,7 +2880,7 @@ function handleFrame(frame) {
       break;
     case "error":
       _flushStreamingTail();
-      renderSystemNote(chatErrorCopy(frame.message, frame.kind), "error");
+      renderSystemNote(chatErrorCopy(frame.message, frame.kind), chatErrorTone(frame.message, frame.kind));
       // The status line keeps the raw pair: it is the one place a developer
       // or an admin reading over a shoulder can still see `frame.kind`, and
       // it is not the sentence the user is being asked to act on.
@@ -3150,7 +3141,7 @@ function attachMessageActions(article, copyText) {
       setTimeout(() => copy.classList.remove("is-copied"), 1400);
       showToast("Message copied", "ok");
     } else {
-      showToast("Couldn't copy to clipboard", "error");
+      showToast("Couldn't copy to clipboard", "warn");
     }
   };
   wrap.appendChild(copy);
@@ -3543,7 +3534,7 @@ function enhanceCodeBlocks(root) {
         setTimeout(() => btn.classList.remove("is-copied"), 1400);
         showToast("Code copied", "ok");
       } else {
-        showToast("Couldn't copy code", "error");
+        showToast("Couldn't copy code", "warn");
       }
     };
     pre.appendChild(btn);
@@ -6431,8 +6422,12 @@ if (typeof ResizeObserver === "function") {
 // fresh conversation IN PLACE, so preventDefault() stops the anchor from
 // also navigating (a no-op for the topnav <button>). On every other page
 // chat.js isn't loaded, so that same rail anchor just navigates to /chat.
-$("new-chat")?.addEventListener("click", async (e) => {
-  e.preventDefault();
+/** Start a fresh conversation from a user gesture, recovering visibly if the
+ *  session cannot be created. Shared by the +New chat control and the `n`
+ *  shortcut — the shortcut used to call `newChat()` bare, so a refused create
+ *  (rate limit, chat disabled, engine down) became an unhandled rejection and
+ *  the keypress did nothing at all, with nothing said. */
+async function startNewChatFromGesture() {
   hideCapabilities();
   try {
     await newChat();
@@ -6450,8 +6445,13 @@ $("new-chat")?.addEventListener("click", async (e) => {
     _endToolGroup();
     showCapabilities();
     setThreadTitle(null);
-    setStatus(`Could not start chat: ${err.message}`, "error");
+    setStatus(chatErrorCopy(err.message, err.code || "session_create_failed"), "error");
   }
+}
+
+$("new-chat")?.addEventListener("click", (e) => {
+  e.preventDefault();
+  startNewChatFromGesture();
 });
 
 $("chat-form").onsubmit = async (e) => {
@@ -6703,8 +6703,7 @@ document.addEventListener("keydown", (e) => {
   if (_targetIsTypeable(e.target)) return;
   if (e.key === "n" || e.key === "N") {
     e.preventDefault();
-    hideCapabilities();
-    newChat();
+    startNewChatFromGesture();
   } else if (e.key === "/") {
     // Slash focuses the composer — matches Twitter/Discord muscle
     // memory for "start typing". Pre-existing Cmd+K still opens
@@ -7263,17 +7262,10 @@ const ChatAttachments = (() => {
         let msg = "Upload failed.";
         if (res.status === 413) msg = "Too large — max 20 MB per attachment.";
         else if (res.status === 415) msg = "That file type can't be attached to a chat.";
-        else {
-          try {
-            const j = await res.json();
-            if (j && j.detail) msg = String(j.detail);
-          } catch (_) {
-            /* non-JSON body — keep the generic message */
-          }
-        }
+        else msg = await requestErrorCopy(res, msg);
         item.status = "error";
         item.error = msg;
-        showToast(`${item.uploadName}: ${msg}`, "error", { durationMs: 6000 });
+        showToast(`${item.uploadName}: ${msg}`, requestErrorTone(res.status, msg), { durationMs: 6000 });
       }
     } catch (err) {
       item.status = "error";
@@ -7289,11 +7281,11 @@ const ChatAttachments = (() => {
   function add(file, now = new Date()) {
     if (!file) return false;
     if (_items.length >= MAX_ITEMS) {
-      showToast(`Up to ${MAX_ITEMS} attachments per message.`, "error");
+      showToast(`Up to ${MAX_ITEMS} attachments per message.`, "warn");
       return false;
     }
     if (file.size > MAX_BYTES) {
-      showToast(`${file.name || "That file"} is over the 20 MB attachment limit.`, "error", {
+      showToast(`${file.name || "That file"} is over the 20 MB attachment limit.`, "warn", {
         durationMs: 6000,
       });
       return false;
@@ -7622,9 +7614,31 @@ const ChatAttachments = (() => {
     if (filenameEl) { filenameEl.textContent = ""; filenameEl.hidden = true; }
   }
 
-  function showDialogError(errorEl, msg) {
+  /** The tone for a response, read from the same body `requestErrorCopy`
+   *  reads. Cloned, because a Response body can only be consumed once and
+   *  both of them want it. */
+  async function _responseTone(res) {
+    let code = "";
+    try {
+      const body = await res.clone().json();
+      const d = body && body.detail;
+      if (d && typeof d === "object") code = String(d.kind || d.code || "");
+      else if (typeof d === "string") code = d;
+    } catch (_) { /* empty or non-JSON error body */ }
+    return requestErrorTone(res.status, code);
+  }
+
+  function showDialogError(errorEl, msg, tone = "warn") {
     if (!errorEl) return;
-    errorEl.textContent = msg;
+    // The slot used to be the tinted box itself (textContent straight in).
+    // It now HOSTS the shared .notice, so a dialog says things the same way
+    // the transcript and the toasts do.
+    errorEl.textContent = "";
+    if (window.agnesNotice) {
+      errorEl.appendChild(window.agnesNotice(msg, tone, { placement: "inline" }));
+    } else {
+      errorEl.textContent = msg;
+    }
     errorEl.hidden = false;
   }
 
@@ -7681,7 +7695,7 @@ const ChatAttachments = (() => {
   wireDropZone(dataDropEl, dataFileInput, (file) => {
     const MAX = 20 * 1024 * 1024;
     if (file.size > MAX) {
-      showDialogError(dataErrorEl, "File is too large — max 20 MB per upload.");
+      showDialogError(dataErrorEl, "File is too large — max 20 MB per upload.", "warn");
       return;
     }
     clearDialogError(dataErrorEl);
@@ -7727,12 +7741,9 @@ const ChatAttachments = (() => {
           } else if (res.status === 415) {
             msg = "File type not allowed for data uploads. Use CSV, Parquet, or Excel.";
           } else {
-            try {
-              const j = await res.json();
-              msg = (j && j.detail) ? String(j.detail) : msg;
-            } catch (_) {}
+            msg = await requestErrorCopy(res.clone(), msg);
           }
-          showDialogError(dataErrorEl, msg);
+          showDialogError(dataErrorEl, msg, await _responseTone(res));
         }
       } catch (err) {
         showDialogError(dataErrorEl, "Upload failed: " + String(err));
@@ -7806,11 +7817,11 @@ const ChatAttachments = (() => {
   wireDropZone(storeDropEl, storeFileInput, (file) => {
     const MAX = 50 * 1024 * 1024;
     if (file.size > MAX) {
-      showDialogError(storeErrorEl, "File too large — max 50 MB for store submissions.");
+      showDialogError(storeErrorEl, "File too large — max 50 MB for store submissions.", "warn");
       return;
     }
     if (!/\.(zip|skill)$/i.test(file.name)) {
-      showDialogError(storeErrorEl, "Only .zip or .skill files are accepted for store submissions.");
+      showDialogError(storeErrorEl, "Only .zip or .skill files are accepted for store submissions.", "warn");
       return;
     }
     clearDialogError(storeErrorEl);
@@ -7923,21 +7934,26 @@ const ChatAttachments = (() => {
           if (res.status === 409) {
             msg = "A Store entity with this name already exists under your account.";
           } else {
+            // The two review verdicts have their own sentences; everything
+            // else — including a 429 — goes through the shared mapper rather
+            // than printing `d.code` (a bare token) or `String(d)` (which is
+            // "[object Object]" for every structured refusal).
+            const peek = res.clone();
+            let verdict = "";
             try {
-              const j = await res.json();
+              const j = await peek.json();
               const d = j && j.detail;
-              if (d && typeof d === "object") {
-                msg = d.code === "validation_failed"
-                  ? "Bundle did not pass review. Fix the issues and upload again."
-                  : d.code === "security_blocked"
-                  ? "Upload blocked: security review found risky patterns."
-                  : d.code || msg;
-              } else if (d) {
-                msg = String(d);
-              }
+              if (d && typeof d === "object") verdict = String(d.code || "");
             } catch (_) {}
+            if (verdict === "validation_failed") {
+              msg = "Bundle did not pass review. Fix the issues and upload again.";
+            } else if (verdict === "security_blocked") {
+              msg = "Upload blocked: security review found risky patterns.";
+            } else {
+              msg = await requestErrorCopy(res.clone(), msg);
+            }
           }
-          showDialogError(storeErrorEl, msg);
+          showDialogError(storeErrorEl, msg, await _responseTone(res));
         }
       } catch (err) {
         showDialogError(storeErrorEl, "Upload failed: " + String(err));
@@ -7981,7 +7997,7 @@ const ChatAttachments = (() => {
   wireDropZone(mediaDropEl, mediaFileInput, (file) => {
     const MAX = 20 * 1024 * 1024;
     if (file.size > MAX) {
-      showDialogError(mediaErrorEl, "File too large — max 20 MB per chat upload.");
+      showDialogError(mediaErrorEl, "File too large — max 20 MB per chat upload.", "warn");
       return;
     }
     clearDialogError(mediaErrorEl);
@@ -8018,12 +8034,9 @@ const ChatAttachments = (() => {
           } else if (res.status === 415) {
             msg = "File type not allowed. Accepted: images (PNG, JPEG, WebP, SVG, GIF), PDF, plain text, Markdown.";
           } else {
-            try {
-              const j = await res.json();
-              msg = (j && j.detail) ? String(j.detail) : msg;
-            } catch (_) {}
+            msg = await requestErrorCopy(res.clone(), msg);
           }
-          showDialogError(mediaErrorEl, msg);
+          showDialogError(mediaErrorEl, msg, await _responseTone(res));
         }
       } catch (err) {
         showDialogError(mediaErrorEl, "Upload failed: " + String(err));
@@ -8364,7 +8377,7 @@ const ChatAttachments = (() => {
   if (filesBtn) {
     filesBtn.addEventListener("click", () => {
       if (!currentChatId) {
-        showToast("Open a conversation first", "error");
+        showToast("Open a conversation first", "info");
         return;
       }
       if (drawerOpen()) { closeFilesDrawer(); return; }
@@ -8679,7 +8692,7 @@ const ChatAttachments = (() => {
     newChat(_agentSlug).catch((err) => {
       console.error("chat: could not start a session as agent", err);
       if (window.appToast) {
-        window.appToast({ kind: "error", msg: _agentStartMessage(err) });
+        window.appToast({ kind: requestErrorTone(err.status, err.code || err.message), msg: _agentStartMessage(err) });
       }
       // Put the page back. The dashboard was hidden one line up in anticipation
       // of a conversation that never opened, and nothing else was going to
