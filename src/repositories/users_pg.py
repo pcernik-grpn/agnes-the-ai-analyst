@@ -340,3 +340,57 @@ class UsersPgRepository:
                 sa.text("DELETE FROM users WHERE id = :user_id"),
                 {"user_id": user_id},
             )
+
+    # -----------------------------------------------------------------
+    # Service accounts (issue #1534) — PG-only (A3 ratchet, `kind` column,
+    # migrations/versions/0096_users_kind.py). No DuckDB implementation
+    # exists; the DuckDB sibling raises RequiresPostgresBackend instead of a
+    # documented no-op, since "create an identity flagged with a column that
+    # does not exist" has no sensible do-nothing answer.
+    # -----------------------------------------------------------------
+
+    def create_service_account(self, id: str, email: str, name: str) -> None:
+        """Create a `kind='service'` row. Never a password holder — a
+        service account authenticates only via a PAT minted for it
+        (`POST /api/admin/service-accounts/{id}/tokens`), never a login
+        flow."""
+        now = datetime.now(timezone.utc)
+        with self._engine.begin() as conn:
+            conn.execute(
+                sa.text(
+                    """INSERT INTO users (id, email, name, password_hash, kind, created_at, updated_at)
+                       VALUES (:id, :email, :name, NULL, 'service', :created_at, :updated_at)"""
+                ),
+                {"id": id, "email": email, "name": name, "created_at": now, "updated_at": now},
+            )
+
+    def list_service_accounts(self) -> List[Dict[str, Any]]:
+        """Every `kind='service'` row, newest first, with a per-account PAT
+        summary (count, most recent `last_used_at`, soonest `expires_at`
+        among non-revoked tokens) — what an operator needs to see what
+        breaks before deactivating one. A single query rather than an N+1 of
+        `access_token_repo().list_for_user()` per row: this repo owns the
+        `users` side of the join and `personal_access_tokens` is a plain
+        table on the same engine, so there is no cross-backend concern here
+        the way there would be calling through the (frozen, dual-backend)
+        access-token repo from inside a PG-only method.
+
+        `soonest_expiry` is NULL when every live token is "no expiry"
+        (`expires_at IS NULL`) OR the account holds no live tokens — an
+        operator reading NULL as "check the token list" is the safe
+        ambiguity, never a false "nothing expires soon"."""
+        sql = """
+            SELECT
+                u.id, u.email, u.name, u.active, u.created_at, u.deactivated_at,
+                COUNT(t.id) FILTER (WHERE t.revoked_at IS NULL) AS token_count,
+                MAX(t.last_used_at) AS last_used_at,
+                MIN(t.expires_at) FILTER (WHERE t.revoked_at IS NULL) AS soonest_expiry
+            FROM users u
+            LEFT JOIN personal_access_tokens t ON t.user_id = u.id
+            WHERE u.kind = 'service'
+            GROUP BY u.id, u.email, u.name, u.active, u.created_at, u.deactivated_at
+            ORDER BY u.created_at DESC NULLS LAST, u.email
+        """
+        with self._engine.connect() as conn:
+            rows = conn.execute(sa.text(sql)).mappings().all()
+        return [dict(r) for r in rows]
