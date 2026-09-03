@@ -1252,6 +1252,11 @@ READ_POSTURE: dict[str, str] = {
     "GET /library": "exempt:ui_support",
     "GET /library/{slug}": "exempt:ui_support",
     "GET /library/{slug}/f/{file_id}": "exempt:ui_support",
+    # An HTML FRAGMENT of the collection page's own file rows, fetched by the
+    # Library's live search (#2141). Same posture as the two pages above and
+    # for the same reason — it renders rows the caller can already read on
+    # `GET /library/{slug}`, and it is gated on that same collection access.
+    "GET /library/{slug}/matching-files": "exempt:ui_support",
     "GET /login": "exempt:ui_support",
     "GET /login/email": "exempt:ui_support",
     "GET /login/password": "exempt:ui_support",
