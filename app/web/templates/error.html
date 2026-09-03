@@ -62,18 +62,54 @@
             <code>{{ request_id }}</code>
         </p>
         {% endif %}
-        {# `admin_elevation_paused` is a DISTINCT detail precisely so a client
-           can offer the way out (app/auth/access.py says so at the raise site).
-           Without this branch the caller reads a machine string and has to
-           already know the control lives on /me/profile. #}
-        {% if message and 'admin_elevation_paused' in message %}
+        {# A live read-only view-as OUTRANKS the elevation branch below, and
+           has to: the mode suppresses admin authority by making
+           `elevation_paused` answer True for the narrowed subject, so every
+           admin page refused during a view-as arrives here carrying
+           `admin_elevation_paused` — and told the admin they had paused admin
+           mode, which they had not, then offered "Re-enable admin mode" as the
+           fix. That action is a dead end twice over: the toggle lives on a
+           page that renders as the TARGET while the mode is on, and flipping
+           it is a POST the read-only guard refuses. The one true way out is
+           the exit control in the banner at the top of this very page, so the
+           copy names it rather than offering a second button that would need
+           its own CSRF token to work. #}
+        {# `view_as_self` — the entry route refusing to open a view of the
+           caller themselves. The lens does not offer the button on the
+           caller's own row any more, so reaching this needs a stale page or a
+           hand-made POST; it still earns a sentence rather than a bare token,
+           and a link back to the lens instead of "Go home". #}
+        {% set _va_err = view_as_state() %}
+        {% if message and 'view_as_self' in message %}
+        <p class="error-message">
+            There is no view of yourself to open — a view-as carries another
+            person's access, and yours is what you already have. Pick someone
+            else in the person lens.
+        </p>
+        {% elif _va_err %}
+        <p class="error-message">
+            Admin pages are unavailable while you are viewing as
+            {{ _va_err.target_email }} — this mode carries their access and
+            never yours, so it cannot reach an admin surface. Use
+            <strong>Exit view-as</strong> at the top of this page to come back
+            to where you started.
+        </p>
+        {% elif message and 'admin_elevation_paused' in message %}
         <p class="error-message">
             You paused admin mode for this browser, so admin pages refuse.
             Re-enable it to continue — your access itself is unchanged.
         </p>
         {% endif %}
         <div class="error-actions">
-            {% if message and 'admin_elevation_paused' in message %}
+            {% if message and 'view_as_self' in message %}
+            {{ ds.button('Back to the person lens', variant='primary',
+                         href='/admin/access?lens=simulate') }}
+            {% elif _va_err %}
+            {# Somewhere the mode CAN go, plus the exit above. Deliberately not
+               "Go home": the dashboard is the admin's, and this identity may
+               not have one. #}
+            {{ ds.button('Go to their Library', variant='primary', href='/library') }}
+            {% elif message and 'admin_elevation_paused' in message %}
             {{ ds.button('Re-enable admin mode', variant='primary',
                          href='/me/profile#admin-mode') }}
             {{ ds.button('Go home', variant='secondary',

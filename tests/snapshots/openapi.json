@@ -1413,6 +1413,11 @@
             "title": "Next",
             "type": "string"
           },
+          "return_to": {
+            "default": "",
+            "title": "Return To",
+            "type": "string"
+          },
           "user_id": {
             "default": "",
             "title": "User Id",
@@ -1427,11 +1432,6 @@
           "csrf_token": {
             "default": "",
             "title": "Csrf Token",
-            "type": "string"
-          },
-          "next": {
-            "default": "",
-            "title": "Next",
             "type": "string"
           }
         },
