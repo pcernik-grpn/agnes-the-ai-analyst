@@ -629,8 +629,7 @@ def test_partial_masks_transpile_to_both_remote_engines():
 # true for tiers as well.
 
 _NULLIFY_WITH_GROUPS_SQL = (
-    "CASE WHEN list_contains($user_groups, 'Finance') THEN \"amount_eur\" "
-    'ELSE CAST(NULL AS DOUBLE) END AS "amount_eur"'
+    'CASE WHEN list_contains($user_groups, \'Finance\') THEN "amount_eur" ELSE CAST(NULL AS DOUBLE) END AS "amount_eur"'
 )
 
 _LAST4_WITH_GROUPS_SQL = (
@@ -645,7 +644,7 @@ _TIERED_SQL = (
     "WHEN list_contains($user_groups, 'Finance') OR list_contains($user_groups, 'Support') "
     'THEN CASE WHEN "national_id" IS NULL THEN NULL '
     "WHEN LENGTH(\"national_id\") <= 4 THEN '****' "
-    'ELSE CONCAT(\'****\', SUBSTRING("national_id", -4)) END '
+    "ELSE CONCAT('****', SUBSTRING(\"national_id\", -4)) END "
     'ELSE CAST(NULL AS VARCHAR) END AS "national_id"'
 )
 
