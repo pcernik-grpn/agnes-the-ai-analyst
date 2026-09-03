@@ -458,3 +458,159 @@ class TestAnAssumptionSaysWhereItCameFromAndWhy:
         fence = re.search(r"```sources\n(.*?)```", PROVENANCE_RAILS, re.DOTALL)
         assert fence and "| origin:" in fence.group(1) and "| why:" in fence.group(1)
         assert "origin not stated" in PROVENANCE_RAILS
+
+
+class TestADocumentIsProvenanceNotAnAssumption:
+    """A `document:` claim, and the misfiling it exists to stop.
+
+    The block's vocabulary was SQL-shaped — `table:` and `metric:` — while a
+    fact-graph answer rests on neither. Asked for the closest precedent to a
+    prospect, an agent reading the document graph had exactly one legal slot
+    left for "this came from `Acme_Week_2_Deliverable.pdf`", and used it: five
+    `assumption:` lines carrying filenames and engagement ids, every one of
+    them badged "origin not stated" because no origin in the vocabulary means
+    "a source document". The last line said so outright — `assumption: No SQL
+    tables queried, this answer is sourced entirely from the document fact
+    graph` — which is a model reporting a schema mismatch, rendered as a
+    caveat about method.
+
+    Meanwhile the row above it read "Sources — none declared", truthfully by
+    its own definition (provenance is judged on tables and metrics) and
+    absurdly to anyone looking at the five named PDFs underneath.
+
+    So `document:` is a first-class claim: it lands in the provenance row, it
+    is checked against the turn's tool calls like the other two, and it takes
+    the citations back out of the assumptions row — which shrinks to the
+    method caveats TCRD-289 built it for.
+    """
+
+    FACT_CALLS = [
+        {"tool": "Bash", "args": {"command": "agnes facts claims engagement:acme-rapid-roadmap"}},
+        {
+            "tool": "Bash",
+            "args": {
+                "command": "agnes facts search engagement acme",
+                "output": "Acme_Rapid_Roadmap_Week_2_Deliverable.pdf",
+            },
+        },
+    ]
+
+    def test_a_document_is_parsed_as_its_own_kind(self):
+        (c,) = parse_claims("document: Acme_Discovery_Synthesis.docx")
+        assert (c.kind, c.ref) == ("document", "Acme_Discovery_Synthesis.docx")
+
+    def test_a_document_the_turn_read_is_verified(self):
+        """Same contract as `table:`: the turn's tool calls are the record of
+        what was actually read, and a fact tool naming the file is that."""
+        v = verdict(_answer("document: Acme_Rapid_Roadmap_Week_2_Deliverable.pdf"), self.FACT_CALLS)
+        assert v.claims[0].verified is True
+
+    def test_a_document_nothing_opened_is_reported_unverified(self):
+        """The point of the whole feature, on the new kind: a plausible
+        filename nothing ran on is exactly what a fabricated citation looks
+        like, and the reader is told."""
+        v = verdict(_answer("document: Never_Read_This.pdf"), self.FACT_CALLS)
+        assert [c.ref for c in v.unverified] == ["Never_Read_This.pdf"]
+
+    def test_a_fact_graph_subject_id_verifies_as_a_document(self):
+        """`agnes facts claims` is addressed by subject id, so that id — not a
+        filename — is often the most precise thing the answer can cite."""
+        v = verdict(_answer("document: engagement:acme-rapid-roadmap"), self.FACT_CALLS)
+        assert v.claims[0].verified is True
+
+    def test_a_path_or_extension_does_not_cost_a_correct_citation(self):
+        """The crude matcher errs toward accepting on purpose (see
+        `_tool_call_haystack`). A citation that names the same document with a
+        directory in front of it, or with the extension the tool output
+        omitted, must not read as unverified over punctuation — the same
+        latitude `metric:` already gets for `family/name`."""
+        calls = [{"args": {"command": "read Acme_Discovery_Synthesis"}}]
+        for ref in (
+            "collections/acme/Acme_Discovery_Synthesis.docx",
+            "Acme_Discovery_Synthesis.docx",
+            "Acme_Discovery_Synthesis",
+        ):
+            v = verdict(_answer(f"document: {ref}"), calls)
+            assert v.claims[0].verified is True, ref
+
+    def test_a_document_reaches_the_wire_in_the_reference_shape(self):
+        """Three keys, like a table or a metric — `origin`/`why` are the
+        assumption line's alone, and a document is something the answer READ,
+        never something it decided."""
+        v = verdict(_answer("document: a.pdf"), self.FACT_CALLS)
+        assert set(v.to_dict()["claims"][0]) == {"kind", "ref", "verified"}
+
+    def test_a_document_line_is_not_split_on_pipes(self):
+        (c,) = parse_claims("document: Q3 | Q4 review.pdf")
+        assert c.ref == "Q3 | Q4 review.pdf"
+        assert c.origin is None
+
+    def test_an_answer_citing_documents_has_declared_a_source(self):
+        """The bug as the reader met it: five cited PDFs above the words
+        "none declared". A document is provenance, so it counts."""
+        from app.chat.sources import VERIFIABLE_KINDS
+
+        assert "document" in VERIFIABLE_KINDS
+        v = verdict(_answer("document: a.pdf\ndocument: b.docx"), self.FACT_CALLS)
+        assert [c.kind for c in v.claims] == ["document", "document"]
+        assert not any(c.kind == "assumption" for c in v.claims)
+
+    def test_every_prompt_carrier_offers_the_document_kind(self):
+        """The parser's vocabulary and the text that teaches it are one
+        contract with three carriers (the bundled workspace CLAUDE.md, the
+        server-rendered template, and the persona rail). A kind the model is
+        never told about is a kind it will keep smuggling into `assumption:`,
+        which is the defect this fixes — so pin all three."""
+        import pathlib
+
+        from app.chat.agent_profile import PROVENANCE_RAILS
+
+        root = pathlib.Path(__file__).resolve().parents[1]
+        carriers = {
+            "workspace CLAUDE.md": (root / "app" / "initial_workspace_default" / "CLAUDE.md").read_text(
+                encoding="utf-8"
+            ),
+            "server template": (root / "config" / "claude_md_template.txt").read_text(encoding="utf-8"),
+            "persona rail": PROVENANCE_RAILS,
+        }
+        for name, text in carriers.items():
+            section = text[text.index("Say where every number came from") :]
+            assert "`document:`" in section, f"{name} does not offer the document kind"
+            fence = section[section.index("```sources") :]
+            fence = fence[: fence.index("```", 3)]
+            assert "document:" in fence, f"{name}'s example does not show a document line"
+            assert "assumption" in section.lower()
+
+    def test_a_derived_needle_can_never_be_short_enough_to_match_anything(self):
+        """The peeling above is latitude, not a rubber stamp.
+
+        Two degenerate refs turned the check into one, found by probing rather
+        than by review: `document: docs/` peels to a basename of `""`, and
+        `"" in haystack` is true of every haystack ever built — so a
+        trailing slash verified against tool calls that touched nothing.
+        `document: a.pdf` peels to the stem `"a"`, which appears in
+        essentially any serialized tool call, so it verified the same way.
+
+        Both are the one direction this module must not err in. A false
+        "unverified" leaves a careful answer looking sloppy; a false
+        "verified" is the badge lying about the only thing it exists to
+        assert. So a DERIVED needle below `_MIN_DERIVED_NEEDLE` is dropped —
+        the ref itself is always still matched in full, at any length.
+        """
+        calls = [{"args": {"command": "agnes catalog --json"}}]
+        for ref in ("docs/", "a.pdf", "a/", "x.y", "/"):
+            v = verdict(_answer(f"document: {ref}"), calls)
+            assert v.claims[0].verified is False, f"{ref!r} matched a tool call that never touched it"
+
+    def test_the_full_ref_is_matched_at_any_length(self):
+        """The floor applies only to what peeling INVENTS. A short document
+        genuinely named in a tool call still verifies on its own name."""
+        v = verdict(_answer("document: a.pdf"), [{"args": {"command": "read a.pdf"}}])
+        assert v.claims[0].verified is True
+
+    def test_peeling_still_works_for_a_real_filename(self):
+        """The regression guard for the fix: the latitude the peel exists for
+        must survive the floor that stops it lying."""
+        calls = [{"args": {"command": "read Acme_Discovery_Synthesis"}}]
+        for ref in ("collections/acme/Acme_Discovery_Synthesis.docx", "Acme_Discovery_Synthesis.docx"):
+            assert verdict(_answer(f"document: {ref}"), calls).claims[0].verified is True, ref

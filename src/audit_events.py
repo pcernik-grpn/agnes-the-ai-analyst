@@ -420,6 +420,9 @@ CATALOG: dict[str, AuditEvent] = {
     "facts.search": AuditEvent("facts.search", "read", "The fact graph was searched by type/attribute filters."),
     "facts.neighbors": AuditEvent("facts.neighbors", "read", "The fact graph was traversed from one subject."),
     "facts.claims": AuditEvent("facts.claims", "read", "A fact/edge subject's readable evidence was read."),
+    "facts.edges": AuditEvent(
+        "facts.edges", "read", "The fact graph's edges of one relationship type were listed with both endpoints."
+    ),
     "facts.ingest": AuditEvent("facts.ingest", "mutation", "A fact-graph producer batch was ingested."),
     # Task 6 (F2d — messaging surfaces: Telegram, Slack inbound, chat lifecycle)
     "telegram.bind": AuditEvent("telegram.bind", "auth", "A Telegram account was linked to an Agnes user."),

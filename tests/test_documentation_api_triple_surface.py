@@ -285,6 +285,7 @@ _COHORT: dict[str, tuple[str, str]] = {
     # tools (`fact_search`/`fact_neighbors`/`fact_claims`) now land together.
     "/api/facts/search": ("facts search", "fact_search"),
     "/api/facts/neighbors": ("facts neighbors", "fact_neighbors"),
+    "/api/facts/edges": ("facts edges", "fact_edges"),
     "/api/facts/{subject_id}/claims": ("facts claims", "fact_claims"),
 }
 

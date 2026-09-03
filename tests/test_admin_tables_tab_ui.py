@@ -152,7 +152,10 @@ def test_admin_tables_uses_the_shared_table_not_a_private_one(seeded_app):
     c = seeded_app["client"]
     token = seeded_app["admin_token"]
     html = c.get("/admin/tables", headers=_auth(token)).text
-    assert '<table class="data-table" id="adminTablesFlat">' in html
+    # `data-table` first, then the pinned-actions opt-in: the row's verbs are
+    # the last column, so they are what a cut table takes first, and this
+    # table is nine columns wide (#1956-follow-up).
+    assert '<table class="data-table data-table--pinned-actions" id="adminTablesFlat">' in html
     # The name may still appear in a comment recording why the private table
     # was retired (history, not a live rule) — what must be gone is every
     # SELECTOR and every element that would use one.

@@ -2428,6 +2428,31 @@ repository directly — facts have no local scope, so every result is labeled
 `[server]` on the CLI's stderr, a deliberate deviation from the `--scope
 auto|local|server` convention (spec §12).
 
+**Relationship-shaped read** (TCRD-295) — `POST /api/facts/edges`
+`{edge_type, src_type?, dst_type?, src_id?, dst_id?, limit≤100,
+extend_edge_type?, extend_from: "src"|"dst", include_claims≤3}` lists every
+visible edge of ONE type with both endpoints as full subjects, optionally
+following a second type one hop from each edge's `extend_from` endpoint —
+"which X relate to which Y" in one request instead of one `neighbors` call
+per root. Same gate as `neighbors`, all in SQL before `LIMIT`: the edge needs
+its own readable claim (or a `revealed` correction), BOTH endpoints must be
+independently visible, and `truncated.result`/`truncated.extension` are the
+caller's own shortfall, never a grant signal; an unknown type and an
+unreadable one both answer with an empty page. Response `{"nodes": [...],
+"edges": [{id, src, dst, type, attrs, claims?}], "truncated": {result,
+extension, claims}}`. `include_claims=k` (also on `search` and `neighbors`)
+attaches the k newest readable claims inline per subject/edge — computed
+after audience-variant dedup with `claims`'s revealed/opaque-document rules,
+quotes capped at 400 characters (`quote_truncated`), under a per-response
+budget (`truncated.claims` / `claims_truncated`). `GET /api/facts/{id}/claims`
+now takes `?limit=` (default 25, max 200), returns claims newest first and a
+`limit_applied` flag computed from the caller's own readable set. CLI:
+`agnes facts edges <edge_type> [--src-type] [--dst-type] [--src] [--dst]
+[--extend <type>] [--extend-from src|dst] [--claims K] [--limit N]`,
+`agnes facts neighbors --claims K`, `agnes facts claims --limit N`. MCP:
+`fact_edges`, plus `include_claims` on `fact_search`/`fact_neighbors` and
+`limit` on `fact_claims`.
+
 **Write surface** (build order step 4) — scheduler token or admin PAT, no
 CLI/MCP by design (a pipeline contract, not an analyst command). `ingest`
 is the §7.2 protocol: batch caps (≤500 documents, ≤5000 claims/request,

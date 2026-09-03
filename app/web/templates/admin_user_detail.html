@@ -196,7 +196,12 @@
      `.data-table` is left-aligned and neutral by design; these are the
      per-cell decorations this page's four tables need. */
   /* A wide table scrolls inside its own card — it must never widen the page.
-     Same wrapper /me/activity puts around its session table. */
+     `data-table-wrap` rides alongside for what this page-local class cannot
+     have on its own: the visible scrollbar (macOS paints the overlay one
+     only while you are already scrolling) and the `is-cue-*` edge marking
+     that says a column is cut where the reader is looking, rather than only
+     through a scrollbar under the last row. The `overflow-x` here is now
+     redundant with it and kept as the local statement of intent. */
   .ud-tablewrap { overflow-x: auto; }
   /* `.data-table` left-aligns every cell by design; a column of controls (or
      of a single number) opts out per-cell. Both `th` and `td` are named, and
@@ -384,8 +389,8 @@
       </summary>
       <div class="dsec-body">
         <div class="dsec-empty" id="memberships-loading">Loading memberships…</div>
-        <div class="ud-tablewrap" id="memberships-wrap" hidden>
-          <table class="data-table" id="memberships-table">
+        <div class="ud-tablewrap data-table-wrap" id="memberships-wrap" hidden>
+          <table class="data-table data-table--pinned-actions" id="memberships-table">
             <thead>
               <tr>
                 <th>Group</th>
@@ -472,8 +477,8 @@
       </summary>
       <div class="dsec-body">
         <div class="dsec-empty" id="ud-tokens-loading">Loading…</div>
-        <div class="ud-tablewrap" id="ud-tokens-wrap" hidden>
-          <table class="data-table" id="ud-tokens-table">
+        <div class="ud-tablewrap data-table-wrap" id="ud-tokens-wrap" hidden>
+          <table class="data-table data-table--pinned-actions" id="ud-tokens-table">
             <thead>
               <tr>
                 <th>Name</th>
@@ -515,8 +520,8 @@
       </summary>
       <div class="dsec-body">
         <div class="dsec-empty" id="ud-sessions-loading">Loading…</div>
-        <div class="ud-tablewrap" id="ud-sessions-wrap" hidden>
-          <table class="data-table" id="ud-sessions-table">
+        <div class="ud-tablewrap data-table-wrap" id="ud-sessions-wrap" hidden>
+          <table class="data-table data-table--pinned-actions" id="ud-sessions-table">
             <thead>
               <tr>
                 <th>Started</th>
@@ -558,7 +563,7 @@
       </summary>
       <div class="dsec-body">
         <div class="dsec-empty" id="ud-activity-loading">Loading…</div>
-        <div class="ud-tablewrap" id="ud-activity-wrap" hidden>
+        <div class="ud-tablewrap data-table-wrap" id="ud-activity-wrap" hidden>
           <table class="data-table" id="ud-activity-table">
             <thead>
               <tr>
@@ -944,7 +949,7 @@ async function loadEffectiveAccess() {
     return;
   }
 
-  let html = `<div class="ud-tablewrap"><table class="data-table">
+  let html = `<div class="ud-tablewrap data-table-wrap"><table class="data-table">
     <thead><tr>
       <th>Type</th><th>Resource</th><th>Granted via</th>
     </tr></thead><tbody>`;
