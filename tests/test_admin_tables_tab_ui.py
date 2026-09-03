@@ -19,6 +19,7 @@ The file name keeps `_tab_ui` for git history continuity.
 """
 
 import pathlib
+from tests.helpers.access_page import access_js
 
 
 def _auth(token):
@@ -357,7 +358,10 @@ def test_group_list_forwards_the_table_deep_link(seeded_app):
     c = seeded_app["client"]
     token = seeded_app["admin_token"]
     r = c.get("/admin/access", headers={"Authorization": f"Bearer {token}"})
-    body = r.text
+    # The page's script is a static module now, so the strings these
+    # assertions are about are served from `admin_access.js` rather than
+    # inlined in the response. Both halves, as before the extraction.
+    body = f"{r.text}\n{access_js()}"
     assert '"resource"' in body, "the workspace must read ?resource= on load"
     assert "#table:" in body, "the retired hash must still be rewritten"
     assert 'id="ax-pick"' in body, "the pick-a-group banner must be present"
@@ -383,8 +387,11 @@ def test_group_detail_applies_the_table_deep_link(seeded_app):
     assert hop.headers["location"] == f"/admin/access?group={gid}"
 
     r = c.get(f"/admin/access?group={gid}&resource=table:t1", headers=auth)
-    body = r.text
     assert r.status_code == 200
+    # The page's script is a static module now, so the strings these
+    # assertions are about are served from `admin_access.js` rather than
+    # inlined in the response. Both halves, as before the extraction.
+    body = f"{r.text}\n{access_js()}"
     # Both deep-link params are read, and the grant matrix lives here.
     assert '"group"' in body and '"resource"' in body
     assert "/api/admin/access-overview" in body

@@ -20,6 +20,7 @@ import re
 import pytest
 
 from app.web import vocabulary
+from tests.helpers.access_page import access_js, access_page_source
 
 
 def _auth(token: str) -> dict:
@@ -28,9 +29,17 @@ def _auth(token: str) -> dict:
 
 @pytest.fixture
 def page(seeded_app):
+    """What a browser ends up with: the rendered page AND the module it loads.
+
+    The script is a static asset now, so the response body alone no longer
+    contains the words these tests are about. Fetching the page is still the
+    part that matters — it proves the route renders and that the vocabulary
+    reached the boot blob — and the module is appended because that is where
+    the same browser reads the rest of them from.
+    """
     r = seeded_app["client"].get("/admin/access", headers=_auth(seeded_app["admin_token"]))
     assert r.status_code == 200, r.text
-    return r.text
+    return f"{r.text}\n{access_js()}"
 
 
 class TestTheTierSaysWhatItDoes:
@@ -114,12 +123,10 @@ class TestNoSurfaceKeepsTheOldWordsInSource:
     all.
     """
 
-    TEMPLATE = "app/web/templates/admin_access.html"
 
     def _source(self) -> str:
-        from pathlib import Path
 
-        return Path(self.TEMPLATE).read_text(encoding="utf-8")
+        return access_page_source()
 
     @pytest.mark.parametrize("retired", ["In stack · Automatic", "Not in stack yet · Optional"])
     def test_retired_chip_labels_are_gone(self, retired):
@@ -216,12 +223,10 @@ class TestRowsAndTheirHandlerAgree:
     just had no effect.
     """
 
-    TEMPLATE = "app/web/templates/admin_access.html"
 
     def _source(self) -> str:
-        from pathlib import Path
 
-        return Path(self.TEMPLATE).read_text(encoding="utf-8")
+        return access_page_source()
 
     def test_the_row_handler_is_not_tag_specific(self):
         src = self._source()
@@ -268,12 +273,10 @@ class TestActingOnARowDoesNotCloseIt:
     looking at it.
     """
 
-    TEMPLATE = "app/web/templates/admin_access.html"
 
     def _source(self) -> str:
-        from pathlib import Path
 
-        return Path(self.TEMPLATE).read_text(encoding="utf-8")
+        return access_page_source()
 
     def test_open_bundles_are_remembered(self):
         src = self._source()
@@ -312,12 +315,10 @@ class TestAnEveryoneAudienceIsNotARoster:
     the only available signal.
     """
 
-    TEMPLATE = "app/web/templates/admin_access.html"
 
     def _source(self) -> str:
-        from pathlib import Path
 
-        return Path(self.TEMPLATE).read_text(encoding="utf-8")
+        return access_page_source()
 
     def test_both_renderers_branch_on_the_server_s_answer(self):
         src = self._source()
@@ -389,12 +390,10 @@ class TestTheGrantListSplitsOnWhatCanBeActedOn:
     admin most often comes here to check under "not yours".
     """
 
-    TEMPLATE = "app/web/templates/admin_access.html"
 
     def _source(self) -> str:
-        from pathlib import Path
 
-        return Path(self.TEMPLATE).read_text(encoding="utf-8")
+        return access_page_source()
 
     def test_the_two_sections_are_named_for_the_action(self):
         src = self._source()
@@ -447,12 +446,10 @@ class TestGivingSomethingToEveryoneIsAnExplicitChoice:
     that key.
     """
 
-    TEMPLATE = "app/web/templates/admin_access.html"
 
     def _source(self) -> str:
-        from pathlib import Path
 
-        return Path(self.TEMPLATE).read_text(encoding="utf-8")
+        return access_page_source()
 
     def test_the_scope_is_offered_and_the_carrier_is_not(self):
         src = self._source()
@@ -537,12 +534,10 @@ class TestEveryoneIsNotInTheGroupList:
     with the first.
     """
 
-    TEMPLATE = "app/web/templates/admin_access.html"
 
     def _source(self) -> str:
-        from pathlib import Path
 
-        return Path(self.TEMPLATE).read_text(encoding="utf-8")
+        return access_page_source()
 
     def test_the_carrier_is_filtered_out_of_the_list(self):
         src = self._source()
@@ -598,12 +593,10 @@ class TestThePickerAsksAboutTheTierInsteadOfDeciding:
     act is what this effort keeps removing.
     """
 
-    TEMPLATE = "app/web/templates/admin_access.html"
 
     def _source(self) -> str:
-        from pathlib import Path
 
-        return Path(self.TEMPLATE).read_text(encoding="utf-8")
+        return access_page_source()
 
     def test_the_footer_carries_the_question(self):
         src = self._source()
@@ -674,12 +667,10 @@ class TestTheAddControlsAreButtons:
     nothing left to align to, so riding the table's columns bought nothing.
     """
 
-    TEMPLATE = "app/web/templates/admin_access.html"
 
     def _source(self) -> str:
-        from pathlib import Path
 
-        return Path(self.TEMPLATE).read_text(encoding="utf-8")
+        return access_page_source()
 
     def test_no_add_rule_sets_a_full_width(self):
         """The regression is textual and it has happened twice."""
@@ -739,12 +730,10 @@ class TestATierControlIsDrawnOnlyWhereItCanAct:
     offered as a one-button control.
     """
 
-    TEMPLATE = "app/web/templates/admin_access.html"
 
     def _source(self) -> str:
-        from pathlib import Path
 
-        return Path(self.TEMPLATE).read_text(encoding="utf-8")
+        return access_page_source()
 
     def _control_cell(self) -> str:
         src = self._source()
@@ -794,12 +783,10 @@ class TestTheNameColumnHasAFloor:
     reach column yields first now, and its text wraps rather than truncates.
     """
 
-    TEMPLATE = "app/web/templates/admin_access.html"
 
     def _source(self) -> str:
-        from pathlib import Path
 
-        return Path(self.TEMPLATE).read_text(encoding="utf-8")
+        return access_page_source()
 
     def test_the_by_resource_name_track_has_a_minimum(self):
         src = self._source()
@@ -820,12 +807,10 @@ class TestThePersonTabSaysWhatKindOfTabItIs:
     tidier model — so the strip says what makes it a different kind.
     """
 
-    TEMPLATE = "app/web/templates/admin_access.html"
 
     def _source(self) -> str:
-        from pathlib import Path
 
-        return Path(self.TEMPLATE).read_text(encoding="utf-8")
+        return access_page_source()
 
     def test_the_person_tab_is_still_a_tab(self):
         """It stays in the strip, with the same role and pane wiring."""
@@ -849,12 +834,10 @@ class TestTheAdminGroupNamesTheModeItsGrantsDependOn:
     the tier is chosen; not a banner.
     """
 
-    TEMPLATE = "app/web/templates/admin_access.html"
 
     def _source(self) -> str:
-        from pathlib import Path
 
-        return Path(self.TEMPLATE).read_text(encoding="utf-8")
+        return access_page_source()
 
     def test_the_access_sub_line_is_addressable(self):
         assert 'id="ax-access-sub"' in self._source()
@@ -892,12 +875,10 @@ class TestInheritedRowsCollapseToOneLine:
     Everyone audience where they can actually be acted on.
     """
 
-    TEMPLATE = "app/web/templates/admin_access.html"
 
     def _source(self) -> str:
-        from pathlib import Path
 
-        return Path(self.TEMPLATE).read_text(encoding="utf-8")
+        return access_page_source()
 
     def _grant_list(self) -> str:
         src = self._source()
@@ -943,12 +924,10 @@ class TestReachIsTheServersNumber:
     never blanks, and it does not get the last word.
     """
 
-    TEMPLATE = "app/web/templates/admin_access.html"
 
     def _source(self) -> str:
-        from pathlib import Path
 
-        return Path(self.TEMPLATE).read_text(encoding="utf-8")
+        return access_page_source()
 
     def _picker_footer(self) -> str:
         src = self._source()
@@ -986,12 +965,10 @@ class TestTheRosterNoLongerShipsToTheBrowser:
     longer grows with headcount.
     """
 
-    TEMPLATE = "app/web/templates/admin_access.html"
 
     def _source(self) -> str:
-        from pathlib import Path
 
-        return Path(self.TEMPLATE).read_text(encoding="utf-8")
+        return access_page_source()
 
     def test_nothing_matches_against_a_local_roster_any_more(self):
         src = self._source()
@@ -1043,12 +1020,10 @@ class TestAnMcpSourceRowStatesItsSecondCondition:
     visible server with nothing usable in it.
     """
 
-    TEMPLATE = "app/web/templates/admin_access.html"
 
     def _source(self) -> str:
-        from pathlib import Path
 
-        return Path(self.TEMPLATE).read_text(encoding="utf-8")
+        return access_page_source()
 
     def test_the_row_reads_the_servers_count_and_links_to_where_tools_are_set(self):
         src = self._source()
@@ -1078,12 +1053,10 @@ class TestTheLocalCopyKnowsWhenItIsStale:
     returning to the tab refetches a copy old enough to matter.
     """
 
-    TEMPLATE = "app/web/templates/admin_access.html"
 
     def _source(self) -> str:
-        from pathlib import Path
 
-        return Path(self.TEMPLATE).read_text(encoding="utf-8")
+        return access_page_source()
 
     def test_there_is_one_way_to_refresh_the_model(self):
         src = self._source()
@@ -1132,12 +1105,10 @@ class TestRemovingAMemoryDomainGrantIsNotCalledRevoke:
     restrict, or leave this page, is a permission-model question deferred.
     """
 
-    TEMPLATE = "app/web/templates/admin_access.html"
 
     def _source(self) -> str:
-        from pathlib import Path
 
-        return Path(self.TEMPLATE).read_text(encoding="utf-8")
+        return access_page_source()
 
     def test_the_act_is_named_for_what_it_does(self):
         src = self._source()
@@ -1184,12 +1155,10 @@ class TestAStoreEntityIsATieredKind:
     why this one exists.
     """
 
-    TEMPLATE = "app/web/templates/admin_access.html"
 
     def _source(self) -> str:
-        from pathlib import Path
 
-        return Path(self.TEMPLATE).read_text(encoding="utf-8")
+        return access_page_source()
 
     def test_store_entity_is_in_the_tiered_set(self):
         src = self._source()
@@ -1215,12 +1184,10 @@ class TestASharedRowNamesTheSharer:
     the same batch reader the collection projection already uses for owners.
     """
 
-    TEMPLATE = "app/web/templates/admin_access.html"
 
     def _source(self) -> str:
-        from pathlib import Path
 
-        return Path(self.TEMPLATE).read_text(encoding="utf-8")
+        return access_page_source()
 
     def test_the_page_prefers_the_resolved_name(self):
         src = self._source()
@@ -1245,12 +1212,10 @@ class TestAnOwnerSharedRowSaysWhoAndGoesSomewhereReal:
     once, or not at all when they are the same person.
     """
 
-    TEMPLATE = "app/web/templates/admin_access.html"
 
     def _source(self) -> str:
-        from pathlib import Path
 
-        return Path(self.TEMPLATE).read_text(encoding="utf-8")
+        return access_page_source()
 
     def test_an_agents_link_lands_on_its_owners_shares(self):
         """Two destinations failed the owner's look — the owner's builder
@@ -1296,12 +1261,10 @@ class TestSharingBesideAnEveryoneGrantSaysWhatItWouldDo:
     would change nothing, and nothing is offered.
     """
 
-    TEMPLATE = "app/web/templates/admin_access.html"
 
     def _source(self) -> str:
-        from pathlib import Path
 
-        return Path(self.TEMPLATE).read_text(encoding="utf-8")
+        return access_page_source()
 
     def test_untiered_kinds_offer_nothing_beside_an_everyone_grant(self):
         src = self._source()

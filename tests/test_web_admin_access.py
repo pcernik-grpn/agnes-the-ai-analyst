@@ -22,6 +22,7 @@ What matters, and so what is pinned here:
 from __future__ import annotations
 
 import re
+from tests.helpers.access_page import with_module
 
 
 def _auth(token: str) -> dict:
@@ -65,7 +66,7 @@ class TestAccessPage:
         (or its own table) is how the group tab and this view would start
         disagreeing about who can use what."""
         c = seeded_app["client"]
-        body = c.get("/admin/access", headers=_auth(seeded_app["admin_token"])).text
+        body = with_module(c.get("/admin/access", headers=_auth(seeded_app["admin_token"])).text)
         assert "/api/admin/access-overview" in body
         assert "/api/admin/grants" in body
 
@@ -116,7 +117,7 @@ class TestAccessPage:
         only the word.
         """
         c = seeded_app["client"]
-        body = c.get("/admin/access", headers=_auth(seeded_app["admin_token"])).text
+        body = with_module(c.get("/admin/access", headers=_auth(seeded_app["admin_token"])).text)
         assert ">Automatic<" in body and ">Optional<" in body
         assert '"available"' in body and '"required"' in body
         assert ">Available<" not in body
@@ -126,7 +127,7 @@ class TestAccessPage:
         already exposes, not recomputed in the page — recomputing it is how a
         debugging view starts disagreeing with enforcement."""
         c = seeded_app["client"]
-        body = c.get("/admin/access", headers=_auth(seeded_app["admin_token"])).text
+        body = with_module(c.get("/admin/access", headers=_auth(seeded_app["admin_token"])).text)
         assert "effective-access" in body
         assert "memberships" in body
 
@@ -135,7 +136,7 @@ class TestAccessPage:
         short-circuits every check). A page about access that does not say so
         invites an admin to conclude their grants are what let them in."""
         c = seeded_app["client"]
-        body = c.get("/admin/access", headers=_auth(seeded_app["admin_token"])).text
+        body = with_module(c.get("/admin/access", headers=_auth(seeded_app["admin_token"])).text)
         assert "Admins can always reach everything" in body
 
 
@@ -213,7 +214,7 @@ class TestAccessIsInTheNav:
 
     def test_the_page_renders_the_nav_row_as_active(self, seeded_app):
         c = seeded_app["client"]
-        body = c.get("/admin/access", headers=_auth(seeded_app["admin_token"])).text
+        body = with_module(c.get("/admin/access", headers=_auth(seeded_app["admin_token"])).text)
         nav = body.split('<aside class="admin-nav"', 1)[1].split("</aside>", 1)[0]
         # The sidebar's active row is the Access DESTINATION, and only it — no
         # item row anywhere else in the column is lit.
@@ -269,7 +270,7 @@ class TestMembersInContext:
 
     def _body(self, seeded_app) -> str:
         c = seeded_app["client"]
-        return c.get("/admin/access", headers=_auth(seeded_app["admin_token"])).text
+        return with_module(c.get("/admin/access", headers=_auth(seeded_app["admin_token"])).text)
 
     def test_the_members_pane_exists_above_the_grants(self, seeded_app):
         body = self._body(seeded_app)
@@ -345,7 +346,7 @@ class TestTheGroupItself:
 
     def _body(self, seeded_app) -> str:
         c = seeded_app["client"]
-        return c.get("/admin/access", headers=_auth(seeded_app["admin_token"])).text
+        return with_module(c.get("/admin/access", headers=_auth(seeded_app["admin_token"])).text)
 
     def test_identity_lives_in_the_pane_header(self, seeded_app):
         """Name, upstream address, origin pill, description, created date —

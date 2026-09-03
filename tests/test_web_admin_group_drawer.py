@@ -23,6 +23,7 @@ What these tests pin:
 from __future__ import annotations
 
 from pathlib import Path
+from tests.helpers.access_page import with_module
 
 STATIC = Path("app/web/static")
 
@@ -44,7 +45,7 @@ class TestOneSharedComponent:
 
     def test_access_page_loads_the_drawer(self, seeded_app):
         c = seeded_app["client"]
-        body = c.get("/admin/access", headers=_auth(seeded_app["admin_token"])).text
+        body = with_module(c.get("/admin/access", headers=_auth(seeded_app["admin_token"])).text)
         assert "css/drawer.css" in body
         assert "css/group_drawer.css" in body
         assert "js/components/group_drawer.js" in body
@@ -53,7 +54,7 @@ class TestOneSharedComponent:
         """Not merely bypassed — removed. A dormant second dialog on the page
         is one stray `openModal("group-modal")` away from coming back."""
         c = seeded_app["client"]
-        body = c.get("/admin/access", headers=_auth(seeded_app["admin_token"])).text
+        body = with_module(c.get("/admin/access", headers=_auth(seeded_app["admin_token"])).text)
         assert 'id="group-modal"' not in body
         assert 'id="group-save-btn"' not in body
         # Deleting a group is a genuine one-decision dialog and stays — as the
@@ -68,7 +69,7 @@ class TestAccessCanCreateInPlace:
 
     def test_group_list_carries_a_create_control(self, seeded_app):
         c = seeded_app["client"]
-        body = c.get("/admin/access", headers=_auth(seeded_app["admin_token"])).text
+        body = with_module(c.get("/admin/access", headers=_auth(seeded_app["admin_token"])).text)
         # The control is the list's own first row now, not a toolbar button
         # with an id: `#ax-groups` is rewritten on every repaint, so it is
         # addressed by attribute and bound by delegation.
@@ -79,7 +80,7 @@ class TestAccessCanCreateInPlace:
         """A link to /admin/groups loses the selection and the scroll — the
         whole reason this page is a workspace."""
         c = seeded_app["client"]
-        body = c.get("/admin/access", headers=_auth(seeded_app["admin_token"])).text
+        body = with_module(c.get("/admin/access", headers=_auth(seeded_app["admin_token"])).text)
         assert "AgnesGroupDrawer.open" in body
         assert '<a href="/admin/access">Create one' not in body
 
