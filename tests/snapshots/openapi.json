@@ -3712,6 +3712,24 @@
         "title": "CreateScheduleRequest",
         "type": "object"
       },
+      "CreateServiceAccountRequest": {
+        "properties": {
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "slug": {
+            "title": "Slug",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "slug"
+        ],
+        "title": "CreateServiceAccountRequest",
+        "type": "object"
+      },
       "CreateSessionBody": {
         "properties": {
           "agent_slug": {
@@ -7916,6 +7934,11 @@
             ],
             "title": "Input Schema"
           },
+          "mutating": {
+            "default": false,
+            "title": "Mutating",
+            "type": "boolean"
+          },
           "source_id": {
             "title": "Source Id",
             "type": "string"
@@ -10297,6 +10320,83 @@
           }
         },
         "title": "ServerConfigUpdateRequest",
+        "type": "object"
+      },
+      "ServiceAccountResponse": {
+        "properties": {
+          "active": {
+            "title": "Active",
+            "type": "boolean"
+          },
+          "created_at": {
+            "title": "Created At",
+            "type": "string"
+          },
+          "deactivated_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Deactivated At"
+          },
+          "email": {
+            "title": "Email",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "last_used_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Used At"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "soonest_expiry": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Soonest Expiry"
+          },
+          "token_count": {
+            "default": 0,
+            "title": "Token Count",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "email",
+          "active",
+          "created_at"
+        ],
+        "title": "ServiceAccountResponse",
         "type": "object"
       },
       "SessionFileEntry": {
@@ -12943,6 +13043,20 @@
           }
         },
         "title": "UpdateScheduleRequest",
+        "type": "object"
+      },
+      "UpdateServiceAccountRequest": {
+        "description": "Activation is a state change on the resource (`{\"active\": bool}`),\nnot a verb segment \u2014 tests/test_api_design_rules.py, same rework the\nshare-request lifecycle went through.",
+        "properties": {
+          "active": {
+            "title": "Active",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "active"
+        ],
+        "title": "UpdateServiceAccountRequest",
         "type": "object"
       },
       "UpdateTableRequest": {
@@ -31493,6 +31607,280 @@
         ]
       }
     },
+    "/api/admin/service-accounts": {
+      "get": {
+        "description": "Every service account with a per-account PAT summary (count,\n`last_used_at`, soonest `expires_at`) \u2014 what an operator needs to see\nwhat breaks before deactivating one.",
+        "operationId": "list_service_accounts_api_admin_service_accounts_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ServiceAccountResponse"
+                  },
+                  "title": "Response List Service Accounts Api Admin Service Accounts Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Service Accounts",
+        "tags": [
+          "service-accounts"
+        ]
+      },
+      "post": {
+        "description": "Create a headless identity: `kind='service'`, `active=true`, a\nsynthetic `<slug>@service.local` address, NEVER in the Admin group (its\nown guard lives in `user_group_members(_pg).add_member`, not here).",
+        "operationId": "create_service_account_api_admin_service_accounts_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateServiceAccountRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceAccountResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Service Account",
+        "tags": [
+          "service-accounts"
+        ]
+      }
+    },
+    "/api/admin/service-accounts/{service_account_id}": {
+      "patch": {
+        "description": "Flip `users.active` \u2014 the SAME primitive\n`POST /api/users/{id}/deactivate` uses. `pat_resolver`'s existing\n`active` check then kills every one of the account's PATs with zero new\ncode; re-activation clears `deactivated_at`/`deactivated_by`.",
+        "operationId": "update_service_account_api_admin_service_accounts__service_account_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "service_account_id",
+            "required": true,
+            "schema": {
+              "title": "Service Account Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateServiceAccountRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceAccountResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Service Account",
+        "tags": [
+          "service-accounts"
+        ]
+      }
+    },
+    "/api/admin/service-accounts/{service_account_id}/tokens": {
+      "post": {
+        "description": "Mint a PAT FOR the service account.\n\nCRITICAL GATE: admin AND session-token-only (mirrors `POST /auth/tokens`\n\u2014 a PAT-authenticated admin gets a typed 403 here too via\n`require_session_token`, preserving the #1292 boundary: durable\ncredentials are only ever minted from an interactive session). Reuses\nthe exact PAT pipeline `POST /auth/tokens` uses (`app.api.tokens.mint_pat`)\n\u2014 the minted row's `user_id` is the SERVICE ACCOUNT's id, `typ` stays\n`\"pat\"` (nothing here needs a new token kind: pat_resolver's whole\nvalidity chain \u2014 revoked/expired/hash-mismatch/active-check \u2014 already\ntreats any `users` row as a first-class PAT holder regardless of `kind`).",
+        "operationId": "mint_service_account_token_api_admin_service_accounts__service_account_id__tokens_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "service_account_id",
+            "required": true,
+            "schema": {
+              "title": "Service Account Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateTokenRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateTokenResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Mint Service Account Token",
+        "tags": [
+          "service-accounts"
+        ]
+      }
+    },
     "/api/admin/sessions/facets": {
       "get": {
         "operationId": "facets_api_admin_sessions_facets_get",
@@ -33925,7 +34313,7 @@
     },
     "/api/admin/sharepoint/connections/{connection_id}/splits": {
       "post": {
-        "description": "Apply a site split (see :func:`split_plan` above for the read-only\npreview this computes identically before creating anything): creates\n``body.n`` sibling connections, each named ``\"<source name> \u2014 part\ni/n\"`` (:func:`connectors.sharepoint.site_split.format_group_name`),\nwired to the same credential material as the source\n(:func:`_cloned_base_config`, the same helper ``POST \u2026/clone`` uses) and\ngiven its own slice of the source's top-level folders as confirmed\nscopes \u2014 the same scope-row shape and collection-minting call\n(:func:`_create_scope_collection`) ``POST \u2026/scopes/bulk`` uses, so a\nsplit clone looks identical to one built by hand through clone +\nbulk-add.\n\n``body.min_modified``, when given, is written onto EACH clone's\n``config.extraction.crawl.min_modified`` \u2014 the crawl does not read that\nkey yet (no admin-facing date filter has shipped for the crawl itself at\nthe time this endpoint was written), so today it is inert bookkeeping\nthat a near-term crawl change will start honoring under the same key,\nnot a promise this endpoint enforces itself. ``body.transport`` /\n``body.retry_mode`` are written onto ``config.extraction.facts`` \u2014 the\nexact keys ``PATCH \u2026/extraction/facts-config`` writes \u2014 so a split can\nhand every clone the same per-connection retry/transport policy in one\ncall instead of ``n`` follow-up PATCHes.\n\n**Idempotency**: refuses with ``409 split_exists`` BEFORE creating\nanything if a connection named like any of this split's target names\nalready exists (the exact names :func:`split_plan` would have shown) \u2014\na repeat ``POST`` never creates a second, name-colliding batch.\n\n``body.start=True`` enqueues each clone's ``corpus-extraction`` job\nimmediately after it is created, in creation order \u2014 the same job\n``POST \u2026/{id}/extract`` enqueues, skipped silently (never a 409/500 that\nwould make a split appear to have failed) when extraction readiness\n(``sharepoint.enabled`` / the ``extraction`` extra) is not currently\nsatisfied; the clones themselves are still created either way.\n\nReturns ``{\"connections\": [{id, name, folders: [{name, documents}],\ndocuments}]}`` \u2014 one entry per created clone, in the same order as\n``split_plan``'s own ``groups``.",
+        "description": "Apply a site split (see :func:`split_plan` above for the read-only\npreview this computes identically before creating anything): creates\n``body.n`` sibling connections, each named ``\"<source name> \u2014 part\ni/n\"`` (:func:`connectors.sharepoint.site_split.format_group_name`),\nwired to the same credential material as the source\n(:func:`_cloned_base_config`, the same helper ``POST \u2026/clone`` uses) and\ngiven its own slice of the source's top-level folders as confirmed\nscopes \u2014 the same scope-row shape and collection-minting call\n(:func:`_create_scope_collection`) ``POST \u2026/scopes/bulk`` uses, so a\nsplit clone looks identical to one built by hand through clone +\nbulk-add.\n``body.min_modified`` is written onto each clone's\n``config.extraction.crawl.min_modified`` \u2014 the exact key\n``PATCH \u2026/extraction/crawl-config`` writes and the crawl reads\n(``resolve_min_modified``), so every part crawls with the same age\nfilter from its first run. ``body.transport`` /\n``body.retry_mode`` are written onto ``config.extraction.facts`` \u2014 the\nexact keys ``PATCH \u2026/extraction/facts-config`` writes \u2014 so a split can\nhand every clone the same per-connection retry/transport policy in one\ncall instead of ``n`` follow-up PATCHes.\n\n**Idempotency**: refuses with ``409 split_exists`` BEFORE creating\nanything if a connection named like any of this split's target names\nalready exists (the exact names :func:`split_plan` would have shown) \u2014\na repeat ``POST`` never creates a second, name-colliding batch.\n\n``body.start=True`` enqueues each clone's ``corpus-extraction`` job\nimmediately after it is created, in creation order \u2014 the same job\n``POST \u2026/{id}/extract`` enqueues, skipped silently (never a 409/500 that\nwould make a split appear to have failed) when extraction readiness\n(``sharepoint.enabled`` / the ``extraction`` extra) is not currently\nsatisfied; the clones themselves are still created either way.\n\nReturns ``{\"connections\": [{id, name, folders: [{name, documents}],\ndocuments}]}`` \u2014 one entry per created clone, in the same order as\n``split_plan``'s own ``groups``.",
         "operationId": "apply_split_api_admin_sharepoint_connections__connection_id__splits_post",
         "parameters": [
           {
@@ -41693,7 +42081,7 @@
     },
     "/api/collections/search": {
       "get": {
-        "description": "Hybrid search across the caller's accessible collections.\n\nFail-closed: only the caller's granted collections are searched; an\noptional ``corpus_id`` narrows to one (ignored if not accessible). Declared\nbefore ``/{collection_id}`` so ``search`` isn't captured as a collection id.\n\nThe response carries ``retrieval`` (``hybrid | lexical_only``) so clients\ncan tell semantic-scored results from the lexical-only degradation that\nkicks in when the embeddings extra is not installed (#898).\n\nAn empty result also carries ``searched_collections`` and a ``hint``.\nNothing in a bare ``[]`` separates \"you cannot see any collection\" from\n\"your words are not in the text\", and an agent handed that ambiguity\npicks the scarier reading: observed live, a chat agent searched six\nways, found nothing, and told the owner of the file \"I don't have\naccess to your files or collections\" \u2014 which then became the\nconversation's permanent title. The count is what makes the difference\ncheckable, and the hint names the three engine behaviours that make a\nreasonable query miss (see ``src.ingest.retrieval``).",
+        "description": "Hybrid search across the caller's accessible collections.\n\nFail-closed: only the caller's granted collections are searched; an\noptional ``corpus_id`` narrows to one (ignored if not accessible). Declared\nbefore ``/{collection_id}`` so ``search`` isn't captured as a collection id.\n\nThe response carries ``retrieval`` (``hybrid | lexical_only``) so clients\ncan tell semantic-scored results from the lexical-only degradation that\nkicks in when the embeddings extra is not installed (#898).\n\nAn empty result also carries ``searched_collections`` and a ``hint``.\nNothing in a bare ``[]`` separates \"you cannot see any collection\" from\n\"your words are not in the text\", and an agent handed that ambiguity\npicks the scarier reading: observed live, a chat agent searched six\nways, found nothing, and told the owner of the file \"I don't have\naccess to your files or collections\" \u2014 which then became the\nconversation's permanent title. The count is what makes the difference\ncheckable, and the hint names the three engine behaviours that make a\nreasonable query miss (see ``src.ingest.retrieval``).\n\nVery large corpora are bounded server-side: candidate selection runs in\nSQL under ``min(knowledge.retrieval.max_candidate_chunks,\ncollections.search_max_chunks)`` (P0 OOM fix 2026-09 \u00d7 #2151 \u2014 see\n``src.ingest.retrieval``'s \"Scale bounds\"). When that bound is hit the\nresponse carries ``truncated: true`` (plus ``truncated_cap`` and a\n``truncated_note``) and the additive ``candidates_capped: true`` \u2014\nthe same event under both names \u2014 instead of ranking every accessible\nchunk; narrow with ``corpus_id`` or a more specific query to search the\nexcluded rest. A query with no usable term to narrow BY that still hits\nthe bound is refused with a typed ``422 search_query_too_broad`` rather\nthan ranking an arbitrary slice. A search backend outage answers a\ntyped ``503 search_unavailable`` instead of an anonymous server error.",
         "operationId": "search_collections_api_collections_search_get",
         "parameters": [
           {
@@ -45843,7 +46231,7 @@
     },
     "/api/knowledge/search": {
       "get": {
-        "description": "One query across documents, the knowledge base, and the table catalog.\n\nResults are typed (``chunk | knowledge | table | metric | glossary | plugin``); table hits carry a\npivot hint (query via SQL) instead of rows. Everything is filtered to the\ncaller's grants, fail-closed per source.\n\n``retrieval`` (``hybrid | lexical_only``) labels the chunk engine's mode:\n``lexical_only`` means the embeddings extra is absent and document chunks\nwere ranked without semantic scoring (#898). Knowledge and table hits are\nlexical by design and unaffected.\n\nAn empty result carries ``searched_collections``, ``searched_tables`` and a\n``hint``, for the same reason ``/api/collections/search`` does: a bare\n``[]`` cannot be told apart from \"you may see nothing\", and an agent handed\nthat ambiguity picks the scarier reading and reports an access problem the\ncaller does not have. This is the *combined* leg, so the counts are what\nmake the difference checkable \u2014 an all-empty fan-out is a grant question,\nanything reachable is a wording one. The glossary is excluded from that\njudgement on purpose: it has no RBAC, so it runs for everyone and its\npresence would make every caller look like they had access.",
+        "description": "One query across documents, the knowledge base, and the table catalog.\n\nResults are typed (``chunk | knowledge | table | metric | glossary | plugin``); table hits carry a\npivot hint (query via SQL) instead of rows. Everything is filtered to the\ncaller's grants, fail-closed per source.\n\n``retrieval`` (``hybrid | lexical_only``) labels the chunk engine's mode:\n``lexical_only`` means the embeddings extra is absent and document chunks\nwere ranked without semantic scoring (#898). Knowledge and table hits are\nlexical by design and unaffected.\n\nAn empty result carries ``searched_collections``, ``searched_tables`` and a\n``hint``, for the same reason ``/api/collections/search`` does: a bare\n``[]`` cannot be told apart from \"you may see nothing\", and an agent handed\nthat ambiguity picks the scarier reading and reports an access problem the\ncaller does not have. This is the *combined* leg, so the counts are what\nmake the difference checkable \u2014 an all-empty fan-out is a grant question,\nanything reachable is a wording one. The glossary is excluded from that\njudgement on purpose: it has no RBAC, so it runs for everyone and its\npresence would make every caller look like they had access.\n\nThe chunk leg is bounded the same way ``/api/collections/search`` is\n(``min(knowledge.retrieval.max_candidate_chunks, collections.\nsearch_max_chunks)``; a hit bound surfaces as the additive\n``candidates_capped: true``), but a failure or an over-broad query\nthere (#2151) degrades that ONE leg to empty rather than failing this\ncombined endpoint outright: the response then carries ``degraded:\n{\"chunk\": \"search_unavailable\"}`` and a ``degraded_note``, while\nknowledge/table/metric/glossary hits still answer normally.",
         "operationId": "knowledge_search_api_knowledge_search_get",
         "parameters": [
           {

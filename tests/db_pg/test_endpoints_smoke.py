@@ -376,6 +376,41 @@ class TestUsersSmoke:
 
 
 # ---------------------------------------------------------------------------
+# Service accounts (issue #1534) — PG-only (A3 ratchet).
+# ---------------------------------------------------------------------------
+
+
+class TestServiceAccountsSmoke:
+    COVERED_ROUTES = {
+        "POST /api/admin/service-accounts",
+        "GET /api/admin/service-accounts",
+        "POST /api/admin/service-accounts/{service_account_id}/tokens",
+        "PATCH /api/admin/service-accounts/{service_account_id}",
+    }
+
+    def test_create_and_list(self, seeded_app_both):
+        r = seeded_app_both["client"].post(
+            "/api/admin/service-accounts",
+            json={"name": "Smoke Bot", "slug": "smoke-bot"},
+            headers=_admin_headers(seeded_app_both),
+        )
+        assert r.status_code in (201, 501)
+
+        r2 = seeded_app_both["client"].get("/api/admin/service-accounts", headers=_admin_headers(seeded_app_both))
+        assert r2.status_code in (200, 501)
+
+    def test_mint_and_lifecycle_update_are_reachable(self, seeded_app_both):
+        """Path-param routes: 404 (no such account) on Postgres, 501
+        (RequiresPostgresBackend) on DuckDB — never a raw 500 either way."""
+        client = seeded_app_both["client"]
+        headers = _admin_headers(seeded_app_both)
+        r = client.post("/api/admin/service-accounts/does-not-exist/tokens", json={"name": "x"}, headers=headers)
+        assert r.status_code in (404, 501), r.status_code
+        r = client.patch("/api/admin/service-accounts/does-not-exist", json={"active": False}, headers=headers)
+        assert r.status_code in (404, 501), r.status_code
+
+
+# ---------------------------------------------------------------------------
 # RBAC (groups + grants + access-overview)
 # ---------------------------------------------------------------------------
 

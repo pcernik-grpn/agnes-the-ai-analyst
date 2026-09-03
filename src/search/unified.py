@@ -233,6 +233,7 @@ def unified_search(
     tables: List[Dict[str, Any]],
     metrics: Optional[List[Dict[str, Any]]] = None,
     plugins: Optional[List[Dict[str, Any]]] = None,
+    chunk_hits: Optional[List[Dict[str, Any]]] = None,
     k: int = 10,
 ) -> List[Dict[str, Any]]:
     """Fan the query out over all sources and return one ranked list.
@@ -247,7 +248,23 @@ def unified_search(
     (``src.ingest.retrieval.search``) hit its configured limit, meaning some
     matching chunks may have been left out. Additive — every existing caller
     that only iterates/indexes/compares the return value is unaffected; see
-    ``src.ingest.retrieval.SearchResults``, which this reuses.
+    ``src.ingest.retrieval.SearchResults``, which this reuses. When the
+    caller supplies ``chunk_hits`` (below), the flag is read off THAT list
+    instead — pass a ``SearchResults`` to propagate it, a plain list reads
+    as not capped.
+
+    ``chunk_hits`` (#2151) lets a caller pre-resolve the Collections leg
+    itself instead of this function calling ``src.ingest.retrieval.search``
+    (via ``_chunk_search``) internally — ``app.api.knowledge_search`` does,
+    so it can catch a chunk-engine failure (a huge corpus's search timing
+    out or exhausting memory) and degrade that ONE leg to an empty list
+    without losing the other legs' results, the same way a caught
+    exception anywhere else in this function would otherwise take the
+    WHOLE combined search down with it. ``None`` (the default) preserves
+    the original behavior exactly: every existing caller (this module's own
+    tests) fetches chunks here, keyed on ``corpus_ids``. An explicit ``[]``
+    (the degraded case) means "no chunk results", not "fetch normally" —
+    checked via ``is not None``, not truthiness.
     """
     if not (query or "").strip():
         return []
@@ -265,15 +282,18 @@ def unified_search(
     # Deduped by document before anything else looks at the bucket: the cap
     # below and `_minmax` both reason about "how many slots this bucket takes",
     # and six passages of one file are one document's worth of answer, not six.
-    _raw_chunk_hits = _chunk_search(corpus_ids, query, k=k) if corpus_ids else []
+    if chunk_hits is not None:
+        _raw_chunk_hits: List[Dict[str, Any]] = chunk_hits
+    else:
+        _raw_chunk_hits = _chunk_search(corpus_ids, query, k=k) if corpus_ids else []
     candidates_capped = bool(getattr(_raw_chunk_hits, "capped", False))
-    chunk_hits = [dict(h, type="chunk") for h in _raw_chunk_hits]
+    resolved_chunk_hits = [dict(h, type="chunk") for h in _raw_chunk_hits]
     # Cap the NAME-matched hits inside the bucket, rather than only capping a
     # bucket that is entirely name hits: since the fallback keeps body hits
     # and merely rescales them, an all-filename bucket is now rare and an
     # all-or-nothing test would almost never fire. Body hits are untouched.
     # (Devin Review on #1267.)
-    buckets.append(chunk_hits)
+    buckets.append(resolved_chunk_hits)
 
     knowledge_hits: List[Dict[str, Any]] = []
     # None = privileged viewer (no filter); [] = zero grants → fail-closed.

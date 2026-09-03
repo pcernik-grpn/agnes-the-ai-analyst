@@ -39,6 +39,7 @@ import asyncio
 import base64
 import logging
 import os
+import random
 import uuid
 from typing import Any, Dict, Optional
 from urllib.parse import unquote, urlsplit
@@ -236,6 +237,62 @@ _ANTHROPIC_BASE_URL = "https://api.anthropic.com"
 # though isolation/auth are correct). Use a generous read timeout while keeping
 # connect/write/pool bounded so a dead upstream still fails fast.
 _ANTHROPIC_TIMEOUT = httpx.Timeout(connect=15.0, read=600.0, write=60.0, pool=15.0)
+
+# Upstream statuses worth one more attempt before the caller sees a failure.
+# ONLY 429: the provider rejected the request without processing it (a Vertex
+# per-minute token/request quota is the common one), so replaying it is safe
+# and usually succeeds within seconds. Agnes's OWN 429 — the per-agent
+# ``budget_exhausted`` refusal — is raised as an HTTPException far above this
+# point and deliberately carries no Retry-After so nothing auto-retries it; it
+# never reaches this forward, and must not be added here.
+_RETRYABLE_UPSTREAM_STATUSES = (429,)
+# Two retries = three attempts total. Bounded low on purpose: a chat turn is
+# interactive, and a quota that is still exhausted after ~3s of waiting is a
+# capacity problem the operator needs to see, not one to hide behind a longer
+# stall.
+_MAX_UPSTREAM_RETRIES = 2
+# Honour the provider's own Retry-After, but never stall an interactive turn
+# for longer than this — a 60s Retry-After is a signal to give up and say so,
+# not to freeze the UI for a minute.
+_RETRY_AFTER_CAP_SEC = 10.0
+_RETRY_BASE_DELAY_SEC = 0.5
+
+# Response headers worth forwarding back to the in-sandbox SDK. The SDK's own
+# retry logic reads Retry-After; without it, it backs off blind. The
+# anthropic-ratelimit-* family is what a client uses to pace itself before
+# hitting the wall at all. Everything else stays dropped — forwarding
+# content-length/content-encoding from a response we may have re-read would
+# corrupt the body, so this is an allowlist, never a copy-all.
+_FORWARDED_RESPONSE_HEADER_PREFIXES = ("anthropic-ratelimit-",)
+_FORWARDED_RESPONSE_HEADERS = ("retry-after",)
+
+
+def _passthrough_response_headers(resp: httpx.Response) -> Dict[str, str]:
+    """Rate-limit headers from ``resp`` that the caller should see verbatim."""
+    out: Dict[str, str] = {}
+    for key, value in resp.headers.items():
+        lowered = key.lower()
+        if lowered in _FORWARDED_RESPONSE_HEADERS or lowered.startswith(_FORWARDED_RESPONSE_HEADER_PREFIXES):
+            out[key] = value
+    return out
+
+
+def _retry_after_seconds(resp: httpx.Response, attempt: int) -> float:
+    """How long to wait before retrying ``resp``.
+
+    Prefers the provider's own ``Retry-After`` (delta-seconds form, which is
+    what Vertex and the Anthropic API both send), clamped to
+    ``_RETRY_AFTER_CAP_SEC``. Falls back to exponential backoff with jitter so
+    several sandboxes hitting the same quota ceiling don't retry in lockstep.
+    """
+    raw = resp.headers.get("retry-after", "")
+    try:
+        wait = float(raw)
+    except (TypeError, ValueError):
+        wait = -1.0
+    if wait < 0:
+        wait = _RETRY_BASE_DELAY_SEC * (2**attempt)
+    return min(max(wait, 0.0), _RETRY_AFTER_CAP_SEC) + random.uniform(0, 0.25)
 
 
 def _add_anthropic_beta(headers: Dict[str, str], beta: str) -> None:
@@ -468,6 +525,11 @@ def _to_response(resp: httpx.Response, extra_headers: Optional[Dict[str, str]] =
         status_code=resp.status_code,
         media_type=resp.headers.get("content-type"),
     )
+    # Retry-After / anthropic-ratelimit-* first, so an Agnes-issued header of
+    # the same name (budget_headers) still wins — the per-agent budget refusal
+    # deliberately controls its own Retry-After semantics.
+    for key, value in _passthrough_response_headers(resp).items():
+        response.headers[key] = value
     for key, value in (extra_headers or {}).items():
         response.headers[key] = value
     return response
@@ -1100,23 +1162,51 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
     # at once. No ``async with``: the client must outlive this handler for
     # the streaming case; the pass-through iterator's ``finally`` closes it.
     client = httpx.AsyncClient(timeout=_ANTHROPIC_TIMEOUT)
-    try:
-        upstream_req = client.build_request(
-            request.method,
-            # `outbound_path` — either the SAME canonical value the policy /
-            # budget / dispatcher gates classified on above, or (vertex mode)
-            # a path rebuilt from that value's parsed+validated groups — so
-            # the guard and the real destination can never disagree
-            # (dot-segments already refused, slashes already collapsed).
-            f"{upstream_base}{outbound_path}",
-            content=outbound_body,
-            headers=headers,
-            params=request.query_params,
+    # Retry loop for upstream rate limiting. A provider 429 (a Vertex
+    # per-minute token/request quota is the usual one) means the request was
+    # refused WITHOUT being processed, so replaying it is safe and normally
+    # succeeds within a second or two. Without this, one quota blip became a
+    # user-visible "Something went wrong" in the middle of a conversation —
+    # the request is rebuilt each attempt because a sent httpx request is not
+    # reusable, and the previous response is closed before the retry so the
+    # connection returns to the pool.
+    attempt = 0
+    while True:
+        try:
+            upstream_req = client.build_request(
+                request.method,
+                # `outbound_path` — either the SAME canonical value the policy /
+                # budget / dispatcher gates classified on above, or (vertex mode)
+                # a path rebuilt from that value's parsed+validated groups — so
+                # the guard and the real destination can never disagree
+                # (dot-segments already refused, slashes already collapsed).
+                f"{upstream_base}{outbound_path}",
+                content=outbound_body,
+                headers=headers,
+                params=request.query_params,
+            )
+            resp = await client.send(upstream_req, stream=True)
+        except BaseException:
+            await client.aclose()
+            raise
+        if resp.status_code not in _RETRYABLE_UPSTREAM_STATUSES or attempt >= _MAX_UPSTREAM_RETRIES:
+            break
+        delay = _retry_after_seconds(resp, attempt)
+        await resp.aclose()
+        attempt += 1
+        logger.info(
+            "broker: upstream %s on %s — retry %s/%s in %.2fs",
+            resp.status_code,
+            outbound_path,
+            attempt,
+            _MAX_UPSTREAM_RETRIES,
+            delay,
         )
-        resp = await client.send(upstream_req, stream=True)
-    except BaseException:
-        await client.aclose()
-        raise
+        try:
+            await asyncio.sleep(delay)
+        except BaseException:
+            await client.aclose()
+            raise
     # A 401 in vertex mode means the cached Google token was revoked before
     # its declared expiry — drop it so the next request re-resolves.
     if vertex_mode and resp.status_code == 401:
@@ -1210,6 +1300,7 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
             _passthrough(),
             status_code=resp.status_code,
             media_type=ctype,
+            headers=_passthrough_response_headers(resp) or None,
         )
 
     # Non-stream responses (JSON endpoints such as count_tokens, upstream
@@ -1261,9 +1352,12 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
 
 
 # LLM-credential failure statuses worth an operator signal: auth (invalid /
-# expired / unfunded-permission key) and 400 (candidate "credit balance too
-# low"). Other 4xx/5xx are the agent's own request errors, not a credential fault.
-_LLM_DIAG_STATUSES = (400, 401, 403)
+# expired / unfunded-permission key), 400 (candidate "credit balance too low"),
+# and 429 — a rate limit that SURVIVED ``_MAX_UPSTREAM_RETRIES`` is no longer a
+# blip, it is sustained quota exhaustion, and without a signal here the only
+# person who learns about it is whoever's chat happens to be open at the time.
+# Other 4xx/5xx are the agent's own request errors, not a credential fault.
+_LLM_DIAG_STATUSES = (400, 401, 403, 429)
 
 
 def _anthropic_error_message(resp: httpx.Response) -> str:

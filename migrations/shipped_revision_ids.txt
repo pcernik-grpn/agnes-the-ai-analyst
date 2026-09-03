@@ -32,8 +32,8 @@
 # id that has already shipped, even if it never reached production; if two
 # branches collide on the same number, keep both authors' original ids and
 # rebase the down_revision (a merge revision if both are heads), as later
-# entries below (0045/0049/0051/0057/0059/0085/0086/0087/0088/0094 each have
-# more than one id sharing a numeric prefix) already do.
+# entries below (0045/0049/0051/0057/0059/0085/0086/0087/0088/0094/0096 each
+# have more than one id sharing a numeric prefix) already do.
 #
 # Comment lines (like this one) and blank lines are ignored. One revision id
 # per line otherwise. Order is chain order (oldest first) for readability
@@ -147,3 +147,5 @@
 0099_ingest_runs_edges_skipped
 0100_facts_created_at
 0101_corpus_chunks_fts_index
+0096_users_kind
+0102_merge_users_kind_fts

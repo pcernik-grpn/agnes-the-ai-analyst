@@ -1279,6 +1279,24 @@ data_apps:
   deploy_checks: warn          # warn | block | off
 
 
+# --- Collections search (hybrid lexical+vector chunk search) ---
+# Plain instance data (an int, not a bool/select toggle), read directly via
+# get_value — see docs/CONFIGURATION.md's "Collections search" section.
+collections:
+  # Server-side cap (#2151) on how many chunks a single GET
+  # /api/collections/search (or the /api/knowledge/search chunk leg)
+  # request may rank. Composes with `knowledge.retrieval.max_candidate_chunks`
+  # below: candidate selection always runs in SQL under
+  # `min(max_candidate_chunks, search_max_chunks)` — the P0 candidate cap
+  # first, this as a second ceiling — and when that bound is hit the
+  # response carries `truncated: true` (+ `candidates_capped: true`). With
+  # the defaults (5000 / 25000) this one never binds. 25000 is the point
+  # scripts/bench_retrieval.py measured at ~371MB peak RSS per query,
+  # comfortably under the API container's default 4g mem_limit even with
+  # a few concurrent searches. 0 has no "unlimited" meaning here.
+  search_max_chunks: 25000
+
+
 # --- Fact graph over Collections (optional) ---
 # `facts.enabled` / `facts.visibility_mode` are switches — set them via the
 # settings panel or AGNES_FACTS_ENABLED / AGNES_FACTS_VISIBILITY_MODE (see
@@ -1301,8 +1319,10 @@ facts:
 # collection, which OOM-killed the process on a large corpus (P0, 2026-09).
 # Candidate SELECTION runs in SQL (Postgres full-text search, ranked) under
 # this LIMIT; the response carries `candidates_capped: true` when the cap
-# was actually hit. Not a switch — plain instance data, read directly via
-# get_value, same pattern as `facts.single_valued_edges` above.
+# was actually hit. `collections.search_max_chunks` above is a second
+# ceiling on the same candidate set (the SQL LIMIT is the smaller of the
+# two). Not a switch — plain instance data, read directly via get_value,
+# same pattern as `facts.single_valued_edges` above.
 knowledge:
   retrieval:
     # max_candidate_chunks: 5000

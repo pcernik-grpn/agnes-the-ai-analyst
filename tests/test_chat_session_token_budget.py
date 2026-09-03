@@ -187,11 +187,17 @@ def _node() -> str:
     return node
 
 
-def _chat_error_copy_fn() -> str:
-    chat = CHAT_JS.read_text(encoding="utf-8")
-    decl = re.search(r"function chatErrorCopy\(raw, kind\) \{.*?\n\}\n", chat, re.DOTALL)
-    assert decl, "chatErrorCopy moved — re-point this guard"
-    return decl.group(0)
+# Absolute: the node import below needs a file URI, and CHAT_JS above is
+# relative (it is only ever read via read_text from the repo root).
+CHAT_ERRORS_JS = Path(__file__).resolve().parents[1] / "app" / "web" / "static" / "js" / "chat_errors.js"
+
+
+def _chat_error_copy_script() -> str:
+    """Import the shipped copy module rather than slicing the function out of
+    chat.js — it moved to `chat_errors.js` so the transcript, the upload
+    dialogs and the /_debug/error-surfaces preview share one definition."""
+    assert CHAT_ERRORS_JS.exists(), "chat_errors.js moved — re-point this guard"
+    return f"import {{ chatErrorCopy }} from {json.dumps(CHAT_ERRORS_JS.as_uri())};\n"
 
 
 def test_the_web_client_never_attributes_agnes_sender_limits_to_the_engine():
@@ -210,11 +216,10 @@ def test_the_web_client_never_attributes_agnes_sender_limits_to_the_engine():
         ["budget_exhausted", "429"],
     ]
     script = (
-        _chat_error_copy_fn()
-        + "\n"
+        _chat_error_copy_script()
         + f"process.stdout.write(JSON.stringify({json.dumps(cases)}.map(([k, m]) => chatErrorCopy(m, k))));\n"
     )
-    out = subprocess.run([node, "-e", script], capture_output=True, text=True)
+    out = subprocess.run([node, "--input-type=module", "-e", script], capture_output=True, text=True)
     assert out.returncode == 0, f"node failed:\n{out.stderr}"
     session, daily, rate, engine, agent = json.loads(out.stdout)
     for copy in (session, daily, rate):
