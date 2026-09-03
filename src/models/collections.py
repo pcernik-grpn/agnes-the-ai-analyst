@@ -103,6 +103,10 @@ class CorpusFile(Base):
 
 class CorpusChunk(Base):
     __tablename__ = "corpus_chunks"
+    # Every ingest deletes and re-reads a file's chunks by ``file_id``; without
+    # this index those were sequential scans over millions of rows (live
+    # finding, 2026-09 — migration ``0098_corpus_chunks_file_id_index``).
+    __table_args__ = (sa.Index("idx_corpus_chunks_file_id", "file_id"),)
 
     id: Mapped[str] = mapped_column(String, primary_key=True)
     corpus_id: Mapped[str] = mapped_column(String, nullable=False)

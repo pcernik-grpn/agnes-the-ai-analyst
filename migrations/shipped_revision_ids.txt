@@ -143,3 +143,4 @@
 0095_memory_detection_runs
 0096_sharepoint_connection_state
 0097_facts_llm_cache
+0098_corpus_chunks_file_id_index
