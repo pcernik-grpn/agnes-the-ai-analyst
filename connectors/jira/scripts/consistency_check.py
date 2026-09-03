@@ -583,7 +583,7 @@ class JiraConsistencyChecker:
         missing_in_parquet = discrepancies["missing_in_parquet"]
 
         # If the Parquet scan never ran, every issue trivially "missing in
-        # Parquet" is an artefact of not having looked, not a measurement.
+        # Parquet" is an artifact of not having looked, not a measurement.
         # Drop it rather than report it: left in, it drives a corpus-sized
         # number into `missing_in_parquet`, logs "exceeds threshold, manual
         # review required" about a gap nobody observed, and scores the alert

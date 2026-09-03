@@ -61,7 +61,9 @@ who receives it:
 - `/admin/store` — store moderation: approve or reject published items. Hidden
   by default (`features.store_moderation_enabled`); redirects home when off.
 - `/admin/store/submissions` — community submissions queue.
-- `/admin/store/lint` — lint results for store content.
+- `/admin/store/lint` — advisory quality findings on published skills (body
+  size, weak trigger phrasing, likely duplicates). Never blocks publication.
+  No sidebar row — reached from the Submissions queue's toolbar.
 - `/admin/corporate-memory` — corporate-memory domains and their content.
 
 Four pages in this section are **hidden by default** — they redirect home and
@@ -86,10 +88,14 @@ anyone to one without checking `/admin/server-config` first. Each is one flag
 
 - `/admin/server-config` — server configuration switches (feature flags,
   caps, providers).
-- `/admin/database` — app-state database backend status.
-- `/admin/initial-workspace` — the template every chat/analyst workspace is
-  initialized from.
-- `/admin/prompts` — the agent and workspace prompt overrides.
+- `/admin/database` — app-state database backend status and the
+  DuckDB↔Postgres migration controls. No sidebar row: reached from the command
+  palette (`g d`) or from the DuckDB-only notices that link it in context.
+- `/admin/prompts` — the managed prompts (install, workspace CLAUDE.md,
+  facts extraction) AND, on its "Template repository" tab
+  (`/admin/prompts?tab=repo`), the Git repo every chat/analyst workspace is
+  initialized from. One page: a prompt can bind to a file in that repo, so
+  the repo and the prompts that read it are the same job.
 - `/admin/datasource-credentials` — instance secrets for data sources.
 - `/admin/mcp-sources` — external MCP servers offered to users, and
   per-tool grants. "+ Add MCP source" walks the connection, reads the server's
