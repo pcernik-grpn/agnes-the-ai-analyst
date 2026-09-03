@@ -11,6 +11,7 @@
 # stdout clean without hiding warnings from any other package.
 import warnings as _warnings
 from src.repositories import (
+    PoliciedRowDistributionError,
     RequiresPostgresBackend,
     memory_domains_repo,
     user_group_members_repo,
@@ -3382,6 +3383,24 @@ def create_app() -> FastAPI:
                 "detail": str(exc),
                 "error": "requires_postgres_backend",
                 "feature": exc.feature,
+            },
+        )
+
+    @app.exception_handler(PoliciedRowDistributionError)
+    async def _policied_row_distribution_handler(request, exc: PoliciedRowDistributionError):
+        """A repository-level upsert would have left a table that carries an
+        access policy distributable (``docs/table-access-policies.md`` ->
+        "Scope: only tables that never leave the server"). Every HTTP path
+        that can reach ``table_registry.register()`` — the admin register /
+        edit endpoints, a connector's auto-discovery, an ingest re-register —
+        gets the SAME typed 422 the admin endpoints raise for the equivalent
+        API-level violation, never an unhandled 500."""
+        return JSONResponse(
+            status_code=422,
+            content={
+                "detail": str(exc),
+                "error": "access_policy_requires_undistributed",
+                "table_id": exc.table_id,
             },
         )
 
