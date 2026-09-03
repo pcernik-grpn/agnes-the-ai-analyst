@@ -1048,7 +1048,7 @@
   }
 
   .ax-add {
-    display: flex; align-items: baseline; gap: 8px; width: 100%;
+    display: inline-flex; align-items: baseline; gap: 8px; width: auto;
     margin-top: 14px; padding: 10px 2px; text-align: left;
     background: none; border: 0; border-top: 1px dashed var(--ds-border);
     color: var(--ds-text-link); font-size: 13px; font-weight: 600; cursor: pointer;
@@ -1735,12 +1735,20 @@
      Kind column where every other row's chip is, the label in the column
      that names things, and the row hovers like its neighbours. The pattern a
      data grid uses for "new row", because that is what it is. */
+  /* The action is a BUTTON, not a row of the table.
+     `display: grid` + `grid-template-columns: inherit` + `width: 100%` are
+     left from when it literally was a row in the table's column grid, and
+     they silently undid the base rule several hundred lines above — the
+     cascade collision this file is prone to, with five `.ax-add` blocks each
+     written for the shape the control had at the time. Fixed where it
+     originates rather than by adding a sixth override.
+     Filled and bordered it has nothing left to align to, and a marker
+     sitting in the vacant Kind column just reads as an indent. */
   .ax-add {
-    display: grid;
-    grid-template-columns: inherit;
-    gap: inherit;
+    display: inline-flex;
     align-items: center;
-    width: 100%; margin: 0;
+    gap: 8px;
+    width: auto; margin: 0;
     padding: 10px 10px 10px 8px;
     text-align: left; background: none; border: 0;
     border-bottom: 1px solid var(--ds-border-light);
@@ -1792,7 +1800,7 @@
      the same geometry: the marker where each group's avatar sits, the label
      where each group's name sits. */
   .ax-newrow {
-    display: flex; align-items: center; gap: 12px; width: 100%;
+    display: flex; align-items: center; gap: 12px; width: auto;
     padding: 10px 12px 10px 10px; text-align: left;
     background: none; border: 0; border-bottom: 1px solid var(--ds-border-light);
     cursor: pointer; font: inherit;
@@ -2166,15 +2174,24 @@
   .ax-pstrip__f { font-size: 12.5px; color: var(--ds-text-muted); min-width: 0; }
   .ax-pstrip__f b { font-weight: 600; color: var(--ds-text-secondary); }
 
-  /* ── The action rows span the list ───────────────────────────────────
-     Inset, a tinted box read as a card that had been dropped into a table.
-     It is not a card — it is the row that makes a row — so it spans the
-     list's full width like every other row, and keeps only its corner. */
-  /* A <button> does not stretch to its container the way a div does — it
-     sizes to its content — so "full width" has to be asked for. */
+  /* ── The action is a button, not a row ───────────────────────────────
+     This block used to span the three add controls across the list, on the
+     reasoning that "it is the row that makes a row". That reversed the tile
+     treatment set a hundred lines above — filled, bordered, auto width,
+     round marker — and reversing it from a later block is what made the
+     width appear to keep coming back: five `.ax-add` blocks, each written
+     for the shape the control had at the time, the last one winning.
+
+     The tile is the version kept. A full-width dashed row reads as a
+     divider rather than an offer, and once the control is filled and
+     bordered there is nothing left for it to align to — a marker sitting in
+     the vacant Kind column of a tinted box just reads as an indent.
+
+     Only the horizontal padding survives here, and only because the tile
+     rule above sets a smaller one; a declaration that fought it is not
+     replaced by a declaration that fights it differently. */
   .ax-add, .ax-table .ax-add, .ax-newrow {
-    box-sizing: border-box; width: 100%; margin: 8px 0;
-    padding-left: 16px; padding-right: 16px;
+    box-sizing: border-box; margin: 8px 0;
   }
 
   /* ── Depth reads left to right ────────────────────────────────────────
@@ -2219,6 +2236,23 @@
   }
   /* Third and last place the scope gets the accent rule: the group list's
      band, the audience row, and the moment of choosing. One device. */
+  /* The tier question sits at the far LEFT of the footer: it precedes the
+     count, whose `margin-right: auto` is what pushes Cancel/Apply to the
+     other end. It is a question, not a third action, and placing it beside
+     the buttons would make it read as one. */
+  .ax-picker__tier{ display: inline-flex; align-items: center; gap: 8px; }
+  .ax-picker__tierq{
+    font-size: 12px; color: var(--ds-text-secondary); white-space: nowrap;
+  }
+  /* The segmented control is sized for a table row; in a footer beside real
+     buttons it needs to sit on their baseline without matching their weight. */
+  .ax-picker__tier .ax-tier{ flex: none; }
+  @media (max-width: 560px) {
+    /* The footer wraps before the question is worth hiding: an admin who
+       cannot see it cannot answer it, and the write happens anyway. */
+    .ax-picker__tier{ order: -1; width: 100%; }
+  }
+
   .ax-pk-r--scope{ border-left: 3px solid var(--ds-primary); }
   .ax-r--scope{
     border-left: 3px solid var(--ds-primary);
@@ -5759,6 +5793,23 @@
       '    <div class="ax-picker__list" data-pk="list"></div>' +
       '  </div>' +
       '  <div class="ds-drawer__foot">' +
+      /* The tier was decided FOR the admin here and mentioned in grey in the
+         subtitle: "Anything with a tier is added as Available." That is the
+         one field deciding whether anyone actually RECEIVES the thing —
+         Optional leaves it for them to take, Automatic puts it in every
+         workspace — chosen silently, by the surface, on their behalf.
+
+         Asked in the footer instead, beside Apply, because that is the last
+         thing read before the write. Hidden unless something tiered is
+         selected: twelve of the sixteen kinds have no such choice, and a
+         control that cannot act is what this effort keeps removing. */
+      '    <span class="ax-picker__tier" data-pk="tier" hidden>' +
+      '      <span class="ax-picker__tierq">Added as</span>' +
+      '      <span class="fbar-seg ax-tier" data-pk="tierseg" role="group" aria-label="Access tier for what is added">' +
+      '        <button type="button" class="fbar-seg__btn is-active" data-pk-tier="available">{{ words.tier_optional }}</button>' +
+      '        <button type="button" class="fbar-seg__btn" data-pk-tier="required">{{ words.tier_automatic }}</button>' +
+      '      </span>' +
+      '    </span>' +
       '    <span class="ax-picker__count" data-pk="count">Nothing selected</span>' +
       '    <button type="button" class="btn btn-secondary" data-pk-close>Cancel</button>' +
       '    <button type="button" class="btn btn-primary" data-pk-apply disabled>Apply</button>' +
@@ -5771,12 +5822,20 @@
       q: root.querySelector('[data-pk="q"]'),
       list: root.querySelector('[data-pk="list"]'),
       count: root.querySelector('[data-pk="count"]'),
+      tier: root.querySelector('[data-pk="tier"]'),
+      tierseg: root.querySelector('[data-pk="tierseg"]'),
       apply: root.querySelector("[data-pk-apply]"),
     };
 
     root.addEventListener("click", async (e) => {
       if (e.target.closest("[data-pk-close]")) { closePicker(); return; }
       if (e.target.closest("[data-pk-apply]")) { await applyPicker(); return; }
+      const tierBtn = e.target.closest("[data-pk-tier]");
+      if (tierBtn) {
+        pickerState.tier = tierBtn.dataset.pkTier;
+        paintPickerTier();
+        return;
+      }
       const fam = e.target.closest("[data-pk-fam]");
       if (fam) {
         const key = fam.dataset.pkFam;
@@ -5959,6 +6018,7 @@
 
     const n = pickerState.chosen.size;
     els.count.textContent = n ? `${n} selected` : "Nothing selected";
+    paintPickerTier();
     els.apply.disabled = !n;
     els.apply.textContent = n ? `Add ${n} to the group` : "Apply";
   }
@@ -6003,28 +6063,48 @@
     els.count.textContent = n
       ? `${n} ${n === 1 ? "group" : "groups"} · ${reach} ${reach === 1 ? "person" : "people"}`
       : "No group selected";
+    paintPickerTier();
     els.apply.disabled = !n;
     els.apply.textContent = n ? `Share with ${n} ${n === 1 ? "group" : "groups"}` : "Apply";
   }
 
   function openBundlePicker(typeKey, resourceId, label) {
     const els = buildPicker();
-    pickerState = { mode: "bundle", group: null, bundle: { type: typeKey, id: resourceId },
+    pickerState = { mode: "bundle", group: null, bundle: { type: typeKey, id: resourceId }, tier: "available",
                     chosen: new Set(), q: "", kind: "", collapsed: new Set() };
     els.q.value = "";
     els.q.placeholder = "Search groups…";
     els.root.querySelector("#pk-title").textContent = `Share ${label}`;
-    /* The tier sentence is only true of kinds that HAVE a tier. It was said
-       unconditionally, so sharing an agent or a collection promised an
-       Available/Required choice and a local copy, and the row that appeared
-       had neither. */
-    els.sub.textContent = TIERED.has(typeKey)
-      ? "Groups that do not have it yet. Added as Available — each person chooses whether to keep a local copy."
-      : "Groups that do not have it yet.";
+    /* The tier is asked in the footer now, so the subtitle stops announcing
+       it. It used to say the answer ("Added as Available") — which was both
+       a decision made on the admin's behalf and, on kinds with no tier at
+       all, a promise of a choice the row would not have. */
+    els.sub.textContent = "Groups that do not have it yet.";
     paintPicker();
     els.root.hidden = false;
     els.root.classList.add("is-open");
     els.q.focus();
+  }
+
+  /* Show the tier question only when the selection contains something the
+     tier can act on, and reflect the current answer.
+
+     In bundle mode the SUBJECT is one resource and the choices are
+     audiences, so whether the question applies is a property of that
+     resource. In resources mode the subject is a group and the choices are
+     resources of every kind, so it applies as soon as one tiered kind is
+     ticked — and stops applying if it is unticked again. */
+  function paintPickerTier() {
+    const els = pickerEls;
+    if (!els || !els.tier) return;
+    const chosen = [...pickerState.chosen];
+    const applies = pickerState.mode === "bundle"
+      ? (chosen.length > 0 && TIERED.has(pickerState.bundle.type))
+      : chosen.some((k) => TIERED.has(k.slice(0, k.indexOf(":"))));
+    els.tier.hidden = !applies;
+    for (const b of els.tierseg.querySelectorAll("[data-pk-tier]")) {
+      b.classList.toggle("is-active", b.dataset.pkTier === (pickerState.tier || "available"));
+    }
   }
 
   function openPicker(groupId) {
@@ -6034,7 +6114,7 @@
     // literal that forgets `kind` or `collapsed` leaves the painter reading
     // `.has` off undefined — which is a blank drawer, not an error anyone
     // sees.
-    pickerState = { mode: "resources", group: groupId, bundle: null,
+    pickerState = { mode: "resources", group: groupId, bundle: null, tier: "available",
                     chosen: new Set(), q: "", kind: "", collapsed: new Set() };
     els.q.value = "";
     els.q.placeholder = "Search everything grantable…";
@@ -6042,7 +6122,7 @@
     // This picker offers every kind at once — tiered and untiered — so it
     // cannot promise the tier either. The row that lands says which it got.
     els.sub.textContent = g
-      ? `Everything ${titleOf(g)} does not have yet. Anything with a tier is added as Available.`
+      ? `Everything ${titleOf(g)} does not have yet.`
       : "";
     paintPicker();
     // `.ds-drawer` is display:none until `.is-open` — the same two-step the
@@ -6078,7 +6158,11 @@
       const asScope = bundleMode && key === EVERYONE_AUDIENCE.id;
       const gid = bundleMode ? (asScope ? everyoneGroupId() : key) : pickerState.group;
       try {
-        await writeGrant(type, rid, "available", gid, asScope ? "everyone" : undefined);
+        /* The admin's answer, for a kind that has the choice. An untiered
+           kind is written at the column default either way — passing the
+           answer there would record a tier the kind does not have. */
+        const tier = TIERED.has(type) ? (pickerState.tier || "available") : "available";
+        await writeGrant(type, rid, tier, gid, asScope ? "everyone" : undefined);
         ok++;
       } catch (err) {
         failed.push(bundleMode

@@ -475,7 +475,10 @@ class TestGivingSomethingToEveryoneIsAnExplicitChoice:
 
     def test_picking_it_writes_a_scope_not_a_group(self):
         src = self._source()
-        assert 'writeGrant(type, rid, "available", gid, asScope ? "everyone" : undefined)' in src
+        # The tier argument became the admin's answer (see
+        # TestThePickerAsksAboutTheTierInsteadOfDeciding); what this test
+        # pins is the SCOPE argument beside it.
+        assert 'await writeGrant(type, rid, tier, gid, asScope ? "everyone" : undefined);' in src
         assert "...(scope ? { scope } : {})" in src
 
     def test_the_optimistic_row_carries_its_audience(self):
@@ -562,3 +565,135 @@ class TestEveryoneIsNotInTheGroupList:
         assert "const scopeSelected = !!selectedGroup && selectedGroup === everyoneGroupId();" in src
         assert '${scopeSelected ? "Add for everyone" : "Add to this group"}' in src
         assert '${scopeSelected ? "What every account gets" : "What the group gets"}' in src
+
+
+class TestThePickerAsksAboutTheTierInsteadOfDeciding:
+    """The tier decides whether anyone actually RECEIVES the thing.
+
+    Optional leaves it for a person to take; Automatic puts it in every
+    workspace in the audience. Both pickers chose that silently — they wrote
+    `available` and mentioned it in grey in the subtitle ("Anything with a
+    tier is added as Available") — so the one field with a real consequence
+    was set by the surface on the admin's behalf, and the sentence announcing
+    it was also false on the twelve kinds that have no tier at all.
+
+    It is a question in the footer now, at the far left, away from
+    Cancel/Apply so it does not read as a third action. Shown only when the
+    selection contains something the tier can act on: a control that cannot
+    act is what this effort keeps removing.
+    """
+
+    TEMPLATE = "app/web/templates/admin_access.html"
+
+    def _source(self) -> str:
+        from pathlib import Path
+
+        return Path(self.TEMPLATE).read_text(encoding="utf-8")
+
+    def test_the_footer_carries_the_question(self):
+        src = self._source()
+        assert 'data-pk="tier"' in src
+        assert 'data-pk-tier="available"' in src
+        assert 'data-pk-tier="required"' in src
+
+    def test_the_answer_is_honoured_on_apply(self):
+        src = self._source()
+        assert 'const tier = TIERED.has(type) ? (pickerState.tier || "available") : "available";' in src
+        assert 'await writeGrant(type, rid, tier, gid, asScope ? "everyone" : undefined);' in src
+
+    def test_it_is_shown_only_where_the_tier_can_act(self):
+        """Both modes, and they ask it differently.
+
+        In bundle mode the subject is one resource and the choices are
+        audiences, so whether the tier applies is a property of that
+        resource. In resources mode the subject is a group and the choices
+        are resources of every kind, so it applies as soon as one tiered
+        kind is ticked — and stops applying if it is unticked again.
+        """
+        src = self._source()
+        assert "function paintPickerTier() {" in src
+        assert "? (chosen.length > 0 && TIERED.has(pickerState.bundle.type))" in src
+        assert ": chosen.some((k) => TIERED.has(k.slice(0, k.indexOf(\":\"))));" in src
+
+    def test_neither_subtitle_still_announces_the_answer(self):
+        """Checked on the ASSIGNMENTS, not on the whole file.
+
+        Both strings still appear in the file, inside the comments that
+        record why they went — which is worth keeping, and is not the page
+        saying them. A guard that cannot tell prose about a string from the
+        string being used fires on its own documentation.
+        """
+        import re
+
+        src = self._source()
+        assigns = re.findall(r"els\.sub\.textContent\s*=[^;]*;", src, re.S)
+        assert assigns, "the subtitle assignments moved; this guard needs rewriting"
+        joined = "\n".join(assigns)
+        assert "added as Available" not in joined
+        assert "Added as Available" not in joined
+
+    def test_the_choice_resets_with_the_rest_of_the_state(self):
+        """Every field, every time — a literal that forgets one leaves the
+        painter reading a stale answer into the next write."""
+        src = self._source()
+        assert src.count('tier: "available",') == 2   # one per picker mode
+
+
+class TestTheAddControlsAreButtons:
+    """Five `.ax-add` blocks, and the width kept coming back.
+
+    The action was full-width because a late block still said
+    `display: grid` + `grid-template-columns: inherit` + `width: 100%`,
+    left from when it literally was a row in the table's column grid. It
+    silently undid the base rule several hundred lines above — a cascade
+    collision, not a missed rule.
+
+    Fixed at both origins, plus one consolidating rule stated last so no
+    later block can undo it again. Filled and bordered, the control has
+    nothing left to align to, so riding the table's columns bought nothing.
+    """
+
+    TEMPLATE = "app/web/templates/admin_access.html"
+
+    def _source(self) -> str:
+        from pathlib import Path
+
+        return Path(self.TEMPLATE).read_text(encoding="utf-8")
+
+    def test_no_add_rule_sets_a_full_width(self):
+        """The regression is textual and it has happened twice."""
+        import re
+
+        src = self._source()
+        for m in re.finditer(r"\.ax-(?:add|newrow)[^{}]*\{([^{}]*)\}", src):
+            assert "width: 100%" not in m.group(1), m.group(0)[:120]
+
+    def test_the_grid_that_originated_it_is_gone(self):
+        src = self._source()
+        assert "grid-template-columns: inherit;\n    gap: inherit;" not in src
+
+    def test_the_last_width_declaration_wins_as_auto(self):
+        """The cascade's answer, not any single rule's.
+
+        Asserting that ONE rule has the last word was the wrong shape: two
+        rules legitimately share these selectors — the tile (display, width,
+        padding) and a later one carrying only box-sizing and margin. What
+        matters is what the cascade resolves to, which is what broke twice:
+        a later block said `100%` and the tile set a hundred lines above
+        lost, so the width appeared to keep coming back on its own.
+        """
+        import re
+
+        src = self._source()
+        widths = []
+        for m in re.finditer(r"(\.ax-(?:add|newrow)[^{}]*)\{([^{}]*)\}", src):
+            selector, body = m.group(1), m.group(2)
+            if "__" in selector or ":hover" in selector or ":focus" in selector:
+                continue
+            for w in re.finditer(r"(?<!max-)(?<!min-)width:\s*([^;]+);", body):
+                widths.append((selector.strip(), w.group(1).strip()))
+        assert widths, "no width declarations found; this guard needs rewriting"
+        assert widths[-1][1] == "auto", f"last word is {widths[-1]}"
+        # And nothing earlier fights it, so the next edit here does not have
+        # to know the cascade order to be safe.
+        assert all(v == "auto" for _, v in widths), widths
