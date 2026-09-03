@@ -142,3 +142,64 @@ def test_list_agents_also_reports_policied_tables_in_scope(agent_with_policied_t
     rows = r.json()["data"]
     row = next(x for x in rows if x["id"] == agent_with_policied_table["agent_id"])
     assert row["policied_tables_in_scope"] == ["tbl_orders"]
+
+
+@pytest.fixture
+def grantee_and_admin(agent_with_policied_table):
+    """A READ-only grantee of the shared agent (a `ResourceType.AGENT` grant
+    through a group) plus an admin — the two non-owner caller classes
+    `GET /api/v1/agents*` admits."""
+    from src.db import SYSTEM_ADMIN_GROUP, get_system_db
+    from src.repositories.resource_grants import ResourceGrantsRepository
+    from src.repositories.user_group_members import UserGroupMembersRepository
+    from src.repositories.user_groups import UserGroupsRepository
+    from src.repositories.users import UserRepository
+
+    conn = get_system_db()
+    try:
+        UserRepository(conn).create(id="grantee_disc1", email="grantee_disc1@example.com", name="Grantee")
+        UserRepository(conn).create(id="admin_disc1", email="admin_disc1@example.com", name="Admin")
+        admin_gid = conn.execute("SELECT id FROM user_groups WHERE name = ?", [SYSTEM_ADMIN_GROUP]).fetchone()[0]
+        UserGroupMembersRepository(conn).add_member("admin_disc1", admin_gid, source="system_seed")
+        shared = UserGroupsRepository(conn).create(name="disclosure-shared-agent", created_by="owner1")
+        UserGroupMembersRepository(conn).add_member("grantee_disc1", shared["id"], source="admin", added_by="owner1")
+        ResourceGrantsRepository(conn).create(
+            shared["id"], "agent", agent_with_policied_table["agent_id"], assigned_by="owner1"
+        )
+    finally:
+        conn.close()
+    return {
+        **agent_with_policied_table,
+        "grantee_token": create_access_token("grantee_disc1", "grantee_disc1@example.com"),
+        "admin_token": create_access_token("admin_disc1", "admin_disc1@example.com"),
+    }
+
+
+def test_grantee_reads_the_agent_but_never_the_owners_policy_diagnosis(grantee_and_admin):
+    """The owner's `rows_visible` / `reason` on a policied table is
+    owner-private: a grantee may hold no grant on that table at all, and
+    their own runs bind their own identity anyway. They still see the
+    agent (200), just an empty disclosure — on the single read AND the
+    listing `agnes agent show` resolves a slug through."""
+    c = grantee_and_admin["client"]
+    hdr = _auth(grantee_and_admin["grantee_token"])
+    r = c.get(f"/api/v1/agents/{grantee_and_admin['agent_id']}", headers=hdr)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["policied_tables"] == []
+    assert body["policied_tables_in_scope"] == []
+    assert "rows_visible" not in r.text
+    listed = c.get("/api/v1/agents", headers=hdr)
+    assert listed.status_code == 200, listed.text
+    rows = [a for a in listed.json()["data"] if a["id"] == grantee_and_admin["agent_id"]]
+    assert rows and rows[0]["policied_tables_in_scope"] == []
+
+
+def test_admin_still_sees_the_owners_policy_diagnosis(grantee_and_admin):
+    c = grantee_and_admin["client"]
+    r = c.get(
+        f"/api/v1/agents/{grantee_and_admin['agent_id']}",
+        headers=_auth(grantee_and_admin["admin_token"]),
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["policied_tables_in_scope"] == ["tbl_orders"]

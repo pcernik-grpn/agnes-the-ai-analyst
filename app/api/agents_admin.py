@@ -295,7 +295,17 @@ def _serialize(
     # Design doc §12 disclosure — computed from the HYDRATED `knowledge`
     # above (not the raw JSON column), so a governance-scoped agent whose
     # declaration only lives in `agent_scope` rows is covered too.
-    policied = _policied_tables_disclosure(knowledge, row.get("owner_user_id"))
+    #
+    # Surfaced to the OWNER (and an admin) only. `GET /api/v1/agents*` also
+    # admits a READ-only grantee (`_load_agent`'s auth matrix), and this
+    # block carries the owner's live `rows_visible` / `reason` / `note` on
+    # tables the grantee may hold no grant on at all — owner-private, the
+    # same way the memory notebook is (see `list_memories`). A grantee's
+    # own runs bind the grantee's identity, so the owner's slice is of no
+    # operational use to them either; they get an empty list, never a 404.
+    owner_id_for_disclosure = row.get("owner_user_id")
+    disclose = uid is not None and (uid == owner_id_for_disclosure or is_user_admin(uid))
+    policied = _policied_tables_disclosure(knowledge, owner_id_for_disclosure) if disclose else []
     out["policied_tables"] = policied
     out["policied_tables_in_scope"] = [t["table_id"] for t in policied]
     if uid is not None:
