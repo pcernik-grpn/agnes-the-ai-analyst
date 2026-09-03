@@ -2967,6 +2967,14 @@ async def trigger_extraction(
     and nothing in this endpoint ever writes an option's value anywhere an
     admin could re-read it as the new default.
 
+    When ``retry_failed`` is set, the response also carries ``queued_count``
+    — the size of this connection's persisted ``failed_items`` backlog at
+    the moment this call reads it, before the job is enqueued — mirroring
+    :func:`retry_empty_extraction`'s ``queued_count``: the source card's
+    "Retry failed (N)" button reads the SAME number off the status poll,
+    and the toast after clicking it should say the same thing the button
+    already promised, not a different count read moments later.
+
     404 on an unknown/non-sharepoint connection BEFORE any other work.
     Then refuses cleanly (never a job that fails 30 minutes later in a
     worker) when the feature isn't usable: ``409 extraction_disabled``
@@ -2992,6 +3000,7 @@ async def trigger_extraction(
     from src.repositories import jobs_repo
 
     payload: Dict[str, Any] = {"connection_id": connection_id}
+    queued_count: Optional[int] = None
     if options is not None:
         # Only the keys the admin actually set ride in the payload — an
         # absent key means "the configured value", and the handler/crawler
@@ -3006,6 +3015,10 @@ async def trigger_extraction(
             payload["force_reprocess"] = True
         if options.retry_failed:
             payload["retry_failed"] = True
+            from connectors.sharepoint.crawler import load_state
+
+            state = load_state(connection_id)
+            queued_count = len(state.get("failed_items") or {})
 
     job = jobs_repo().enqueue(
         "corpus-extraction",
@@ -3021,7 +3034,10 @@ async def trigger_extraction(
 
     _record_extraction_dispatch(row, job["id"])
     logger.info("sharepoint connection %s: extraction job %s enqueued (manual trigger)", connection_id, job["id"])
-    return {"job_id": job["id"], "status": job["status"]}
+    result: Dict[str, Any] = {"job_id": job["id"], "status": job["status"]}
+    if queued_count is not None:
+        result["queued_count"] = queued_count
+    return result
 
 
 @router.post("/connections/{connection_id}/extraction/retry-empty", status_code=202)

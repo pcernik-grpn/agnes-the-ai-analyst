@@ -93,6 +93,44 @@ def test_delete_on_an_absent_row_is_a_silent_no_op(pg_engine, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# backlog_counts — cheap size-only read for the Retry buttons' N
+# ---------------------------------------------------------------------------
+
+
+def test_backlog_counts_on_a_never_seen_connection_is_zero(pg_engine, monkeypatch):
+    repo = _make_repo(pg_engine, monkeypatch)
+    assert repo.backlog_counts("conn-new", "crawl") == {"failed_items_count": 0, "empty_items_count": 0}
+
+
+def test_backlog_counts_reflects_the_stored_backlogs(pg_engine, monkeypatch):
+    repo = _make_repo(pg_engine, monkeypatch)
+    repo.put(
+        "conn-a",
+        "crawl",
+        {
+            "failed_items": {"graph:1": {"item": {}}, "graph:2": {"item": {}}, "graph:3": {"item": {}}},
+            "empty_items": {"graph:4": {"item": {}}},
+        },
+    )
+    assert repo.backlog_counts("conn-a", "crawl") == {"failed_items_count": 3, "empty_items_count": 1}
+
+
+def test_backlog_counts_a_row_missing_one_of_the_two_keys_reads_that_one_as_zero(pg_engine, monkeypatch):
+    repo = _make_repo(pg_engine, monkeypatch)
+    repo.put("conn-a", "crawl", {"delta_links": {}, "ctags": {}})
+    assert repo.backlog_counts("conn-a", "crawl") == {"failed_items_count": 0, "empty_items_count": 0}
+
+
+def test_backlog_counts_is_scoped_to_the_requested_kind(pg_engine, monkeypatch):
+    """A connection's `facts` row must never leak into the `crawl` backlog
+    count — the two kinds are independent rows for a reason."""
+    repo = _make_repo(pg_engine, monkeypatch)
+    repo.put("conn-a", "crawl", {"failed_items": {"graph:1": {}}})
+    repo.put("conn-a", "facts", {"failed_items": {"graph:1": {}, "graph:2": {}}})
+    assert repo.backlog_counts("conn-a", "crawl") == {"failed_items_count": 1, "empty_items_count": 0}
+
+
+# ---------------------------------------------------------------------------
 # import_if_absent — the one-time legacy-file import primitive
 # ---------------------------------------------------------------------------
 
