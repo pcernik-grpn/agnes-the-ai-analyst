@@ -1716,6 +1716,24 @@ summary.cloud-chat-tool-head::-webkit-details-marker { display: none; }
   color: var(--ds-text-muted);
   font-variant-numeric: tabular-nums;
 }
+/* The human decision that gated this call, kept on the row after the
+   approval card is retired (and restored on reload from the persisted
+   part). Same outcome palette as the approval card's own badge. */
+.cloud-chat-tool-approval {
+  flex: 0 0 auto;
+  font-size: var(--text-xs);
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--ds-accent-success-line);
+  background: var(--ds-accent-success-bg);
+  color: var(--ds-accent-success-ink);
+  white-space: nowrap;
+}
+.cloud-chat-tool-approval.is-deny {
+  border-color: var(--ds-accent-danger-line);
+  background: var(--ds-accent-danger-bg);
+  color: var(--ds-accent-danger-ink);
+}
 .cloud-chat-tool-chevron {
   flex: 0 0 auto;
   color: var(--ds-text-muted);
@@ -4538,6 +4556,21 @@ html[data-ui-layout="rail"] .cloud-chat-shell.has-thread .cloud-chat-main::after
   background: var(--ds-code-bg);
   color: var(--ds-code-ink);
   overflow-x: auto;
+}
+/* The args preview is one <code> inside the dark <pre>. The inline-code
+   chip rule (light background, 1px border, 1px 4px padding) that every
+   bare `code` inherits turned each JSON line into a light chip on the dark
+   block; `pre.code-block-wrap code` resets it for tool-arg blocks, and the
+   approval block needs the same reset (issue #2161). */
+.cloud-chat-approval-cmd code {
+  display: block;
+  background: transparent;
+  color: inherit;
+  padding: 0;
+  border: none;
+  border-radius: 0;
+  font-size: inherit;
+  white-space: pre;
 }
 
 .cloud-chat-approval-actions {

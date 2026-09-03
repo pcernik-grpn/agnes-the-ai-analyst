@@ -3275,6 +3275,7 @@ function renderMessage(m) {
             state: part.state,
             result: Object.prototype.hasOwnProperty.call(part, "result") ? part.result : undefined,
             isError: part.is_error === true,
+            approval: typeof part.approval === "string" ? part.approval : undefined,
           }),
         );
       }
@@ -4521,6 +4522,9 @@ function resolveApprovalCard(frame) {
   if (inflightCard) {
     const meta = inflightCard.querySelector(".cloud-chat-tool-meta");
     if (meta) meta.textContent = "running…";
+    // The decision outlives the card: the tool line carries it from here on
+    // (and on reload, from the persisted part — same note, same copy).
+    if (frame.decision !== "cancelled") _stampToolCardApproval(inflightCard, frame.decision);
   }
   const el = frame.request_id
     ? document.querySelector(`[data-approval-id="${CSS.escape(frame.request_id)}"]`)
@@ -4807,7 +4811,43 @@ function resolveQuestionCard(frame) {
  *  above the answer (#1974). The diagnosis is now on the HEADER instead, in
  *  place of the args summary: the reader gets the error without a click, and
  *  the raw payload stays behind the same one expander as every other card. */
-function _buildToolCard({ tool, args, status, state, result, isError }) {
+/** Human copy for a tool row's recorded approval decision (the `approval`
+ *  a tool_call frame / persisted part carries once a human answered the
+ *  card that gated it — manager.py::_record_approval_on_tool_call). */
+const _TOOL_APPROVAL_LABELS = {
+  allow: "approved by you",
+  allow_session: "approved by you for this session",
+  deny: "denied by you",
+  timeout: "approval timed out",
+  unattended: "denied — nobody could answer",
+};
+
+/** Stamp (or replace) the approval note on a tool step's header line. The
+ *  step keeps the outcome AFTER the approval card above it is retired, so a
+ *  reader — live or on reload — can still see which calls a human let
+ *  through (issue #2161). */
+function _stampToolCardApproval(wrap, decision) {
+  if (!wrap || !decision) return;
+  const label = _TOOL_APPROVAL_LABELS[decision];
+  if (!label) return;
+  const head = wrap.querySelector(".cloud-chat-tool-head");
+  if (!head) return;
+  let note = head.querySelector(".cloud-chat-tool-approval");
+  if (!note) {
+    note = document.createElement("span");
+    // Before the timing meta / chevron, so the line still reads
+    // name · outcome · timing.
+    const anchor = head.querySelector(".cloud-chat-tool-meta") || head.querySelector(".cloud-chat-tool-chevron");
+    if (anchor) head.insertBefore(note, anchor);
+    else head.appendChild(note);
+  }
+  const allowed = decision === "allow" || decision === "allow_session";
+  note.className = "cloud-chat-tool-approval " + (allowed ? "is-allow" : "is-deny");
+  note.textContent = label;
+  wrap.dataset.approval = decision;
+}
+
+function _buildToolCard({ tool, args, status, state, result, isError, approval }) {
   const wrap = document.createElement("details");
   // One status vocabulary for both paths: a replayed part's `state` maps onto
   // the same is-done / is-error classes a live result produces, so the card
@@ -4893,6 +4933,9 @@ function _buildToolCard({ tool, args, status, state, result, isError }) {
   head.appendChild(chevron);
 
   wrap.appendChild(head);
+  // A replayed (or mid-turn re-delivered) call a human gated keeps its
+  // decision on the line — the approval card itself is not persisted.
+  if (approval) _stampToolCardApproval(wrap, approval);
 
   // Args — visible the moment the card is expanded. The card header is the
   // one click now; the old nested args toggle inside a collapsed card was two
@@ -5128,7 +5171,14 @@ function renderToolCallStart(frame) {
   // belongs below it — seal the streaming bubble first (#1504: the
   // transcript keeps the frame order, text → card → text).
   _sealStreamingSegment();
-  const wrap = _buildToolCard({ tool: frame.tool, args: frame.args, status: "running" });
+  const wrap = _buildToolCard({
+    tool: frame.tool,
+    args: frame.args,
+    status: "running",
+    // A mid-turn reconnect replays the buffered call; if a human already
+    // answered its approval card, the manager stamped the decision on it.
+    approval: typeof frame.approval === "string" ? frame.approval : undefined,
+  });
   wrap.dataset.startedAt = String(performance.now());
   _appendToolCard(wrap);
   inFlightToolCalls.set(_toolCallId(frame), wrap);

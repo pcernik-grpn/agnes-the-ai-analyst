@@ -669,10 +669,26 @@ Requirements and semantics:
   new conversation.
 - **Tool approvals round-trip.** The engine raises approval-requiring tool
   calls as events; they render as the normal web approval card, and the
-  decision is delivered to the engine's approval endpoint. `allow_session`
-  collapses to a plain allow (the engine has no per-session grant), and
-  `chat.approvals_enabled: false` auto-denies each request instantly — the
-  same kill-switch semantics as the native gate.
+  decision is delivered to the engine's approval endpoint. Which calls ask is
+  the engine's rule: its sandbox auto-approves an MCP tool whose `tools/list`
+  entry carries `annotations.readOnlyHint: true` and asks for everything
+  else. Foundation tools get the hint from `@tool(read_only=…)`; passthrough
+  tools (admin-registered MCP sources) get it from `tool_registry.mutating` —
+  a read-only row runs unasked, a mutating one asks — so an admin who wants a
+  passthrough tool gated marks it mutating (which also puts it behind the
+  `allow_mutating` grant). The card's reason line says exactly that ("not
+  marked read-only"), so a reader can tell a search from a write.
+  `allow_session` is honoured by the provider, not the engine (whose
+  endpoint knows only allow/deny per call): the handle remembers the approved
+  call — tool **and** arguments, the same key the native gate uses — for the
+  life of the live session on this gateway and answers the engine's next
+  request for that identical call itself, with no card; a pause/resume or a
+  respawn starts over. The decision (allowed, denied, timed out) is also
+  recorded on the tool line it gated and persisted with the message, so a
+  reloaded transcript still shows which calls a human let through — the
+  approval card itself is never persisted. `chat.approvals_enabled: false`
+  auto-denies each request instantly — the same kill-switch semantics as the
+  native gate.
 - **Pause/resume is bookkeeping only.** There is no Agnes-side sandbox to
   snapshot; a paused session simply drops its engine connection and a resume
   re-attaches by chat id — the transcript and agent state live in the engine.
