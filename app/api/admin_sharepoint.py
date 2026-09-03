@@ -143,11 +143,12 @@ minting a duplicate.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import re
 import secrets
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple
 from urllib.parse import unquote, urlsplit
 from uuid import uuid4
@@ -170,11 +171,14 @@ from connectors.sharepoint.graph_client import (
     list_drives,
     list_item_children,
     list_root_children,
+    list_root_children_with_url,
     list_sites,
     probe_unique_permissions,
+    search_document_count,
     search_folders,
 )
 from connectors.sharepoint.settings import SharePointSettingsError, resolve_sharepoint_settings
+from connectors.sharepoint.site_split import format_group_name, pack_folders_into_groups
 from src.repositories import (
     connection_secrets_repo,
     corpus_file_events_repo,
@@ -381,6 +385,32 @@ class ConsolidateCollectionsBody(BaseModel):
     dry_run: bool = True
 
 
+class SplitApplyBody(BaseModel):
+    """``POST …/splits`` — how many sibling connections to create and, for
+    each, the per-connection extraction knobs a split usually wants set from
+    the start (see :func:`apply_split`). ``n`` is capped at
+    :data:`_SPLIT_MAX_N` — this endpoint fans out ``n`` Graph Search calls
+    per top-level folder plus ``n`` connection creates; nothing here needs
+    more than a few dozen even on a genuinely huge site."""
+
+    n: int = Field(..., ge=1, le=50)
+    #: Same admin-supplied ``YYYY-MM-DD`` filter as :class:`SplitPlanQuery`
+    #: below — passed straight through onto each created connection's
+    #: ``config.extraction.crawl.min_modified`` (see :func:`apply_split`'s
+    #: docstring for why that key, not a new one, and why the crawl does not
+    #: honor it yet).
+    min_modified: Optional[str] = None
+    transport: Optional[Literal["sync", "batch"]] = None
+    retry_mode: Optional[str] = None
+    #: Enqueue each clone's ``corpus-extraction`` job immediately after
+    #: creating it (the same job ``POST …/{id}/extract`` enqueues), in
+    #: creation order — no stagger, since the jobs queue itself already
+    #: serializes worker pickup. Default ``False``: an admin who wants to
+    #: review the split before it starts crawling gets exactly the clones,
+    #: nothing running yet.
+    start: bool = False
+
+
 #: Config keys :func:`clone_connection` does NOT carry over into a clone —
 #: deliberately a SMALLER set than :data:`SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS`
 #: (which governs a DIFFERENT concern: what the generic connection editor
@@ -395,6 +425,42 @@ class ConsolidateCollectionsBody(BaseModel):
 #: resolves the site AT ALL (``/sites`` enumeration 403s), and the other two
 #: are inert bookkeeping until the clone has scopes/subscriptions of its own.
 _CLONE_EXCLUDED_CONFIG_KEYS = ("scopes", "extraction")
+
+#: Upper bound on ``SplitApplyBody.n`` / the ``split-plan`` preview's ``n``
+#: query param — see :class:`SplitApplyBody`'s own docstring for why.
+_SPLIT_MAX_N = 50
+
+
+def _validate_min_modified(value: Optional[str]) -> None:
+    """An admin-supplied ``min_modified`` filter (``GET …/split-plan?
+    min_modified=`` and ``SplitApplyBody.min_modified``) is the exact shape
+    :func:`connectors.sharepoint.graph_client.search_document_count` splices
+    into its KQL ``LastModifiedTime>=`` clause unescaped, so this is a
+    structural gate, not cosmetic validation (same "never build a request
+    from an unchecked value" rule as :func:`_validate_graph_id`) — and the
+    SAME check ``PATCH …/extraction/crawl-config`` runs on the identical
+    ``config.extraction.crawl.min_modified`` value
+    (``app/api/admin_extraction.py``), so a caller sees one validation rule
+    for this key regardless of which endpoint sets it: ``date.fromisoformat``
+    (catches a structurally YYYY-MM-DD-shaped but calendar-invalid date, e.g.
+    month 13, that a bare regex would let through), ``400
+    invalid_min_modified`` on failure.
+    """
+    if value is None:
+        return
+    try:
+        date.fromisoformat(value)
+    except ValueError:
+        raise HTTPException(status_code=400, detail={"error": "invalid_min_modified"}) from None
+
+
+def _cloned_base_config(row: Dict[str, Any]) -> Dict[str, Any]:
+    """The base config for a sibling connection wired to the same credential
+    material as ``row`` — shared by :func:`clone_connection` and the
+    site-split apply endpoint (:func:`apply_split`), which creates its own
+    clones the same way but writes ``scopes``/``extraction`` itself
+    (see :data:`_CLONE_EXCLUDED_CONFIG_KEYS`)."""
+    return {k: v for k, v in (row.get("config") or {}).items() if k not in _CLONE_EXCLUDED_CONFIG_KEYS}
 
 
 # ---------------------------------------------------------------------------
@@ -565,6 +631,31 @@ async def _annotate_unique_permissions(token: str, drive_id: str, items: List[Di
 def _scopes(row: Dict[str, Any]) -> List[Dict[str, Any]]:
     scopes = (row.get("config") or {}).get("scopes")
     return list(scopes) if isinstance(scopes, list) else []
+
+
+def _inferred_drive_id(row: Dict[str, Any], drive_id: Optional[str]) -> str:
+    """Same fallback :func:`bulk_add_scopes` uses: an explicit ``drive_id``
+    wins, else reuse the first existing scope's — the site-split planner
+    reads an already-connected site's drive root, so a connection with at
+    least one confirmed scope is the expected starting point. ``400
+    drive_id_required`` (never a 500 from a Graph call with no drive to
+    address) when neither is available."""
+    if drive_id:
+        _validate_graph_id(drive_id, "drive_id")
+        return drive_id
+    inferred = next((s.get("drive_id") for s in _scopes(row) if s.get("drive_id")), None)
+    if not inferred:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "drive_id_required",
+                "message": (
+                    "drive_id was not supplied and this connection has no existing scope to infer "
+                    "one from — pass drive_id explicitly (GET …/tree finds one)."
+                ),
+            },
+        )
+    return inferred
 
 
 def _manual_sites(row: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -2005,7 +2096,7 @@ async def clone_connection(
     if repo.get_by_name(body.name) is not None:
         raise HTTPException(status_code=409, detail="connection_name_exists")
 
-    cloned_config = {k: v for k, v in (row.get("config") or {}).items() if k not in _CLONE_EXCLUDED_CONFIG_KEYS}
+    cloned_config = _cloned_base_config(row)
 
     new_id = str(uuid4())
     repo.create(
@@ -2232,6 +2323,308 @@ async def consolidate_collections(
         "scopes_repointed": repointed,
         **summary,
     }
+
+
+#: How many :func:`connectors.sharepoint.graph_client.search_document_count`
+#: calls the split planner keeps in flight at once — a genuinely large site
+#: can have dozens of top-level folders, and Graph Search has no batch form
+#: (unlike :func:`probe_unique_permissions`'s ``/$batch``), so this is the
+#: only throttle standing between "click preview" and Graph rate-limiting
+#: this admin. Chosen the same way :data:`_MAX_PERMISSION_PROBE_ITEMS` was:
+#: comfortably under Graph's per-app throttle for a one-click admin action,
+#: not tuned against a measured workload.
+_SPLIT_COUNT_CONCURRENCY = 8
+
+
+def _public_folder(folder: Dict[str, Any]) -> Dict[str, Any]:
+    """A folder's shape in an HTTP response — never its Graph item ``id``,
+    which :func:`_compute_split_plan`'s internal folder dicts also carry
+    (needed by :func:`apply_split` to mint scopes without a second Graph
+    round trip) but which no external contract in this module's docstring
+    promises."""
+    return {"name": folder["name"], "documents": folder["documents"]}
+
+
+async def _compute_split_plan(
+    row: Dict[str, Any], *, n: int, min_modified: Optional[str], drive_id: Optional[str]
+) -> Dict[str, Any]:
+    """Live Graph read + greedy pack — the shared computation behind
+    ``GET …/split-plan`` (a read-only preview) and ``POST …/splits`` (which
+    computes the IDENTICAL plan immediately before creating clones from it,
+    so what an admin previewed is exactly what gets applied — no separate
+    "confirm" step re-derives a possibly-different plan from data that may
+    have shifted between the two calls).
+
+    Returns an INTERNAL-shaped dict (folder dicts carry ``id``, needed by
+    :func:`apply_split` to mint scopes) — callers project down to the public
+    response shape via :func:`_public_folder` before returning to an HTTP
+    caller. Never persists anything.
+
+    ``404``/``409``/``502`` etc. are raised as :class:`HTTPException` from
+    here (drive-id inference, Graph errors) — both callers propagate them
+    unchanged.
+    """
+    resolved_drive_id = _inferred_drive_id(row, drive_id)
+    token = await _resolved_token(row)
+    try:
+        children = await list_root_children_with_url(token, resolved_drive_id)
+    except SharePointGraphError as exc:
+        raise HTTPException(status_code=502, detail={"error": "sharepoint_graph_error", "message": str(exc)}) from exc
+
+    folder_items = [c for c in children if c.get("is_folder")]
+    loose_root_files = [c["name"] for c in children if not c.get("is_folder")]
+
+    semaphore = asyncio.Semaphore(_SPLIT_COUNT_CONCURRENCY)
+
+    async def _counted(item: Dict[str, Any]) -> Dict[str, Any]:
+        async with semaphore:
+            # search_document_count() never raises — a folder whose count
+            # could not be read still gets assigned a group, at documents=0
+            # (module docstring of connectors.sharepoint.site_split).
+            documents = await search_document_count(token, item.get("web_url") or "", min_modified=min_modified)
+        return {"id": item["id"], "name": item["name"], "documents": documents}
+
+    folders = list(await asyncio.gather(*[_counted(item) for item in folder_items])) if folder_items else []
+
+    groups_raw = pack_folders_into_groups(folders, n)
+    source_name = row.get("name") or row["id"]
+    groups = [
+        {"name": format_group_name(source_name, index, n), "folders": g["folders"], "documents": g["documents"]}
+        for index, g in enumerate(groups_raw, start=1)
+    ]
+    total_documents = sum(f["documents"] for f in folders)
+
+    return {
+        "drive_id": resolved_drive_id,
+        "folders": folders,
+        "loose_root_files": loose_root_files,
+        "groups": groups,
+        "total_documents": total_documents,
+    }
+
+
+@router.get("/connections/{connection_id}/split-plan")
+async def split_plan(
+    connection_id: str,
+    n: int = Query(..., ge=1, le=_SPLIT_MAX_N),
+    min_modified: Optional[str] = None,
+    drive_id: Optional[str] = None,
+    _user: dict = Depends(require_admin),
+):
+    """Read-only preview of splitting this connection's site into ``n``
+    sibling connections (see the module docstring's "split a large site"
+    entry) — greedy-packs the drive root's top-level folders into ``n``
+    groups of roughly equal document count, WITHOUT creating anything.
+
+    ``drive_id`` is optional — same inference as ``POST …/scopes/bulk``:
+    reused from this connection's first existing scope when omitted, ``400
+    drive_id_required`` when neither is available (a split only makes sense
+    on a connection that already resolves a drive). ``min_modified``
+    (``YYYY-MM-DD``, ``400 invalid_min_modified`` otherwise) narrows each
+    folder's document count to files modified on/after that date, via the
+    same Graph Search filter :func:`connectors.sharepoint.graph_client.
+    search_document_count` builds.
+
+    Drive-root items that are FILES, not folders, are reported under
+    ``loose_root_files`` — they are in no folder, so a folder-based split
+    (this one, and the manual ``clone`` + ``scopes/bulk`` workflow it
+    automates) can never cover them; an admin sees exactly what would be
+    left behind rather than discovering it after the fact.
+
+    Response: ``{drive_id, folders: [{name, documents}], loose_root_files:
+    [names], groups: [{name, folders: [{name, documents}], documents}],
+    total_documents}`` — ``groups[].name`` is the EXACT name ``POST …/splits``
+    will give the corresponding clone (:func:`connectors.sharepoint.
+    site_split.format_group_name`), so an admin previewing this can see
+    ahead of time what will collide with ``409 split_exists`` on a repeat
+    apply.
+
+    ``404`` for an unknown/non-SharePoint connection id. A Graph failure
+    while listing the root (not a per-folder count failure — those degrade
+    to ``documents: 0``, never fail the whole preview) is a typed ``502
+    sharepoint_graph_error``.
+    """
+    row = _sharepoint_connection_or_404(connection_id)
+    _validate_min_modified(min_modified)
+
+    plan = await _compute_split_plan(row, n=n, min_modified=min_modified, drive_id=drive_id)
+
+    return {
+        "drive_id": plan["drive_id"],
+        "folders": [_public_folder(f) for f in plan["folders"]],
+        "loose_root_files": plan["loose_root_files"],
+        "groups": [
+            {"name": g["name"], "folders": [_public_folder(f) for f in g["folders"]], "documents": g["documents"]}
+            for g in plan["groups"]
+        ],
+        "total_documents": plan["total_documents"],
+    }
+
+
+@router.post("/connections/{connection_id}/splits", status_code=201)
+async def apply_split(
+    connection_id: str,
+    body: SplitApplyBody,
+    user: dict = Depends(require_admin),
+):
+    """Apply a site split (see :func:`split_plan` above for the read-only
+    preview this computes identically before creating anything): creates
+    ``body.n`` sibling connections, each named ``"<source name> — part
+    i/n"`` (:func:`connectors.sharepoint.site_split.format_group_name`),
+    wired to the same credential material as the source
+    (:func:`_cloned_base_config`, the same helper ``POST …/clone`` uses) and
+    given its own slice of the source's top-level folders as confirmed
+    scopes — the same scope-row shape and collection-minting call
+    (:func:`_create_scope_collection`) ``POST …/scopes/bulk`` uses, so a
+    split clone looks identical to one built by hand through clone +
+    bulk-add.
+
+    ``body.min_modified``, when given, is written onto EACH clone's
+    ``config.extraction.crawl.min_modified`` — the crawl does not read that
+    key yet (no admin-facing date filter has shipped for the crawl itself at
+    the time this endpoint was written), so today it is inert bookkeeping
+    that a near-term crawl change will start honoring under the same key,
+    not a promise this endpoint enforces itself. ``body.transport`` /
+    ``body.retry_mode`` are written onto ``config.extraction.facts`` — the
+    exact keys ``PATCH …/extraction/facts-config`` writes — so a split can
+    hand every clone the same per-connection retry/transport policy in one
+    call instead of ``n`` follow-up PATCHes.
+
+    **Idempotency**: refuses with ``409 split_exists`` BEFORE creating
+    anything if a connection named like any of this split's target names
+    already exists (the exact names :func:`split_plan` would have shown) —
+    a repeat ``POST`` never creates a second, name-colliding batch.
+
+    ``body.start=True`` enqueues each clone's ``corpus-extraction`` job
+    immediately after it is created, in creation order — the same job
+    ``POST …/{id}/extract`` enqueues, skipped silently (never a 409/500 that
+    would make a split appear to have failed) when extraction readiness
+    (``sharepoint.enabled`` / the ``extraction`` extra) is not currently
+    satisfied; the clones themselves are still created either way.
+
+    Returns ``{"connections": [{id, name, folders: [{name, documents}],
+    documents}]}`` — one entry per created clone, in the same order as
+    ``split_plan``'s own ``groups``.
+    """
+    row = _sharepoint_connection_or_404(connection_id)
+    _validate_min_modified(body.min_modified)
+
+    if body.retry_mode is not None:
+        from connectors.sharepoint.facts_extraction import _VALID_RETRY_MODES
+
+        if body.retry_mode not in _VALID_RETRY_MODES:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "invalid_retry_mode",
+                    "message": f"retry_mode must be one of {sorted(_VALID_RETRY_MODES)}",
+                },
+            )
+
+    source_name = row.get("name") or connection_id
+    target_names = [format_group_name(source_name, index, body.n) for index in range(1, body.n + 1)]
+
+    repo = source_connections_repo()
+    if any(repo.get_by_name(name) is not None for name in target_names):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "split_exists",
+                "message": "connections named like this split already exist — drop them first, or this is a repeat apply",
+            },
+        )
+
+    plan = await _compute_split_plan(row, n=body.n, min_modified=body.min_modified, drive_id=None)
+    base_config = _cloned_base_config(row)
+
+    extraction_cfg: Dict[str, Any] = {}
+    if body.min_modified:
+        extraction_cfg["crawl"] = {"min_modified": body.min_modified}
+    facts_cfg: Dict[str, Any] = {}
+    if body.retry_mode is not None:
+        facts_cfg["retry_mode"] = body.retry_mode
+    if body.transport is not None:
+        facts_cfg["transport"] = body.transport
+    if facts_cfg:
+        extraction_cfg["facts"] = facts_cfg
+
+    created: List[Dict[str, Any]] = []
+    for name, group in zip(target_names, plan["groups"]):
+        scope_rows = []
+        for folder in group["folders"]:
+            collection_id = _create_scope_collection(
+                connection_name=name,
+                display_path=folder["name"],
+                source_scope_id=folder["id"],
+                created_by=user.get("id"),
+            )
+            scope_rows.append(
+                {
+                    "source_scope_id": folder["id"],
+                    "display_path": folder["name"],
+                    "anonymize": False,
+                    "collection_id": collection_id,
+                    "access_mode": "manual",
+                    "drive_id": plan["drive_id"],
+                    "include_excluded_subtrees": False,
+                }
+            )
+
+        new_config: Dict[str, Any] = {**base_config, "scopes": scope_rows}
+        if extraction_cfg:
+            new_config["extraction"] = dict(extraction_cfg)
+
+        new_id = str(uuid4())
+        repo.create(
+            id=new_id,
+            name=name,
+            source_type="sharepoint",
+            config=new_config,
+            token_env=row.get("token_env"),
+            is_default=False,
+            created_by=user.get("id"),
+        )
+        created.append(
+            {
+                "id": new_id,
+                "name": name,
+                "folders": [_public_folder(f) for f in group["folders"]],
+                "documents": group["documents"],
+            }
+        )
+
+    if body.start:
+        usable, _readiness_error = _extraction_readiness()
+        if usable:
+            from src.repositories import jobs_repo
+
+            for entry in created:
+                new_row = repo.get(entry["id"])
+                if new_row is None:
+                    continue
+                job = jobs_repo().enqueue(
+                    "corpus-extraction",
+                    {"connection_id": entry["id"]},
+                    idempotency_key=_extraction_idempotency_key(entry["id"]),
+                )
+                _record_extraction_dispatch(new_row, job["id"])
+
+    log_safe(
+        user_id=user.get("id"),
+        action="sharepoint_connection.split_apply",
+        resource=f"source_connection:{connection_id}",
+        params={
+            "n": body.n,
+            "min_modified": body.min_modified,
+            "transport": body.transport,
+            "retry_mode": body.retry_mode,
+            "start": body.start,
+            "created_ids": [c["id"] for c in created],
+        },
+        result="success",
+    )
+
+    return {"connections": created}
 
 
 @router.get("/connections/{connection_id}/certificate")

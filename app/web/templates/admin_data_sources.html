@@ -268,6 +268,21 @@
     font-size: 12px; font-family: var(--font-mono, ui-monospace, monospace);
   }
   .ds-rotate-row textarea:focus { outline: 2px solid var(--ds-primary, var(--ds-primary)); outline-offset: -1px; }
+  /* "Split this site" panel's number/date/select inputs — not free-text
+     tokens, so no monospace and no flex:1 stretch (the generic `input`
+     rule above assumes both). */
+  .ds-rotate-row input[type="number"], .ds-rotate-row input[type="date"], .ds-rotate-row select {
+    flex: 0 0 auto; padding: 7px 10px; font-family: inherit; font-size: 12px;
+    border-radius: 8px; border: 1px solid var(--ds-border);
+    background: var(--ds-surface); color: var(--ds-text-primary);
+  }
+  .ds-sp-split-result { flex-basis: 100%; display: flex; flex-wrap: wrap; gap: 8px; margin-top: 4px; }
+  .ds-sp-split-table { border-collapse: collapse; font-size: 12.5px; }
+  .ds-sp-split-table th, .ds-sp-split-table td {
+    padding: 4px 10px; text-align: left; border-bottom: 1px solid var(--ds-border);
+  }
+  .ds-sp-split-table th { color: var(--ds-text-muted); font-weight: 600; }
+  .ds-sp-split-table td { color: var(--ds-text-primary); }
 
   /* SharePoint card: "Scope collections" — clickable rows into the connect
      wizard, bound to this connection (spec follow-up, TCRD-240/241: "make

@@ -730,6 +730,12 @@ CATALOG: dict[str, AuditEvent] = {
         "target, re-pointing every scope and moving the source collections' files/chunks/claims "
         "and resource grants onto it.",
     ),
+    "sharepoint_connection.split_apply": AuditEvent(
+        "sharepoint_connection.split_apply",
+        "mutation",
+        "An admin split a SharePoint connection's site into several sibling connections, each with its own "
+        "slice of the top-level folders.",
+    ),
     "source_connection.chat_tools_disable": AuditEvent(
         "source_connection.chat_tools_disable",
         "mutation",
@@ -1093,6 +1099,11 @@ CATALOG: dict[str, AuditEvent] = {
     ),
     "sharepoint_connection.tree_search": AuditEvent(
         "sharepoint_connection.tree_search", "read", "An admin searched a SharePoint connection's folder tree."
+    ),
+    "sharepoint_connection.split_plan_read": AuditEvent(
+        "sharepoint_connection.split_plan_read",
+        "read",
+        "An admin previewed how a SharePoint connection's site would split into several sibling connections.",
     ),
     "source_connection.tables_discover": AuditEvent(
         "source_connection.tables_discover",

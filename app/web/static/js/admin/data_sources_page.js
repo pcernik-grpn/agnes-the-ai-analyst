@@ -854,6 +854,33 @@ function _sharepointFactsHtml(row) {
     <button type="button" class="btn btn-secondary" onclick="toggleSpCertRow('${row.id}')">Cancel</button>
   </div>
   <div class="ds-src__fact">
+    <span class="ds-src__fact-k" title="For a site too large for one connection to crawl in reasonable time: divide its top-level folders across several sibling connections, each with its own crawl, running in parallel.">Split this site</span>
+    <span class="ds-src__fact-v">Divide the drive root's folders into several parallel crawl connections.</span>
+    <span class="ds-src__fact-a"><button type="button" class="btn btn-secondary" onclick="toggleSpSplitRow('${row.id}')">Split&hellip;</button></span>
+  </div>
+  <div class="ds-rotate-row" id="ds-sp-split-row-${row.id}">
+    <label class="field-hint" for="ds-sp-split-n-${row.id}">Number of parts</label>
+    <input type="number" id="ds-sp-split-n-${row.id}" min="1" max="50" step="1" value="4" style="max-width:7rem;">
+    <label class="field-hint" for="ds-sp-split-min-modified-${row.id}">Only count/crawl documents modified on/after (optional)</label>
+    <input type="date" id="ds-sp-split-min-modified-${row.id}" style="max-width:11rem;">
+    <label class="field-hint" for="ds-sp-split-transport-${row.id}">Facts transport for every part (optional)</label>
+    <select id="ds-sp-split-transport-${row.id}" style="max-width:9rem;">
+      <option value="">unchanged</option>
+      <option value="sync">sync</option>
+      <option value="batch">batch</option>
+    </select>
+    <label class="field-hint" for="ds-sp-split-retry-${row.id}">Retry mode for every part (optional)</label>
+    <select id="ds-sp-split-retry-${row.id}" style="max-width:9rem;">
+      <option value="">unchanged</option>
+      <option value="off">off</option>
+      <option value="on_gate_fail">on_gate_fail</option>
+      <option value="always">always</option>
+    </select>
+    <button type="button" class="btn btn-primary" onclick="previewSpSplit('${row.id}')">Preview split</button>
+    <button type="button" class="btn btn-secondary" onclick="toggleSpSplitRow('${row.id}')">Cancel</button>
+    <div class="ds-sp-split-result" id="ds-sp-split-result-${row.id}"></div>
+  </div>
+  <div class="ds-src__fact">
     <span class="ds-src__fact-k" title="An ungranted collection is invisible to everyone — fail closed.">Sharing</span>
     <span class="ds-src__fact-v ${identityTone}">${identityText}</span>
   </div>
@@ -1910,6 +1937,121 @@ async function saveSpCertificate(id) {
       showToast(msg, false);
     }
   } catch (_) {
+    showToast("Request failed.", false);
+  }
+}
+
+/* "Split this site" — the product-shaped front end for
+   GET/POST .../split-plan and .../splits (app/api/admin_sharepoint.py):
+   preview a greedy-packed folder split, then create the sibling
+   connections from it. The panel row's own "show" toggle mirrors
+   toggleSpCertRow above; unlike that one, closing it also clears any
+   preview result so reopening it never shows a stale plan next to fresh
+   inputs. */
+function toggleSpSplitRow(id) {
+  const row = document.getElementById(`ds-sp-split-row-${id}`);
+  setSourceOpen(id, true);
+  if (row.classList.contains("show")) {
+    row.classList.remove("show");
+    const resultEl = document.getElementById(`ds-sp-split-result-${id}`);
+    if (resultEl) resultEl.innerHTML = "";
+  } else {
+    row.classList.add("show");
+    document.getElementById(`ds-sp-split-n-${id}`).focus();
+  }
+}
+
+function _spSplitN(id) {
+  const el = document.getElementById(`ds-sp-split-n-${id}`);
+  const n = Number(el.value);
+  return Number.isInteger(n) && n >= 1 && n <= 50 ? n : null;
+}
+
+async function previewSpSplit(id) {
+  const resultEl = document.getElementById(`ds-sp-split-result-${id}`);
+  const n = _spSplitN(id);
+  if (!n) {
+    showToast("Number of parts must be a whole number between 1 and 50.", false);
+    return;
+  }
+  const minModified = document.getElementById(`ds-sp-split-min-modified-${id}`).value || "";
+  resultEl.innerHTML = `<p class="field-hint">Computing plan — reads the drive root and counts each folder's documents live, this can take a few seconds…</p>`;
+  const params = new URLSearchParams({ n: String(n) });
+  if (minModified) params.set("min_modified", minModified);
+  try {
+    const r = await fetch(
+      `/api/admin/sharepoint/connections/${encodeURIComponent(id)}/split-plan?${params.toString()}`,
+      { credentials: "include" }
+    );
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      resultEl.innerHTML = `<p class="ds-conn-test-result show fail">✗ ${_esc(detailMessage(body, "failed to compute the split plan"))}</p>`;
+      return;
+    }
+    _renderSpSplitPlan(id, body);
+  } catch (e) {
+    resultEl.innerHTML = `<p class="ds-conn-test-result show fail">✗ Request failed</p>`;
+  }
+}
+
+function _renderSpSplitPlan(id, plan) {
+  const resultEl = document.getElementById(`ds-sp-split-result-${id}`);
+  const groups = plan.groups || [];
+  const rows = groups.map((g) => `
+    <tr><td>${_esc(g.name)}</td><td>${(g.folders || []).length}</td><td>${g.documents || 0}</td></tr>
+  `).join("");
+  const loose = plan.loose_root_files || [];
+  const shown = loose.slice(0, 10).map(_esc).join(", ");
+  const looseHtml = loose.length
+    ? `<p class="field-hint" style="flex-basis:100%;">⚠ ${loose.length} file${loose.length === 1 ? "" : "s"} sit directly at the drive root and will NOT be covered by any part: ${shown}${loose.length > 10 ? ", …" : ""}</p>`
+    : "";
+  resultEl.innerHTML = `
+    <table class="ds-sp-split-table" style="flex-basis:100%;width:100%;">
+      <thead><tr><th>Part</th><th>Folders</th><th>Documents</th></tr></thead>
+      <tbody>${rows || `<tr><td colspan="3">No folders found at the drive root.</td></tr>`}</tbody>
+    </table>
+    <p class="field-hint" style="flex-basis:100%;">Total documents across all folders: ${plan.total_documents || 0}</p>
+    ${looseHtml}
+    <label class="field-hint" style="flex-basis:100%;display:flex;align-items:center;gap:6px;">
+      <input type="checkbox" id="ds-sp-split-start-${id}">
+      Start each part's crawl immediately after creating it
+    </label>
+    ${groups.length ? `<button type="button" class="btn btn-primary" onclick="applySpSplit('${id}')">Create ${groups.length} connection${groups.length === 1 ? "" : "s"}</button>` : ""}
+  `;
+}
+
+async function applySpSplit(id) {
+  const resultEl = document.getElementById(`ds-sp-split-result-${id}`);
+  const n = _spSplitN(id);
+  if (!n) return;
+  const minModified = document.getElementById(`ds-sp-split-min-modified-${id}`).value || null;
+  const transport = document.getElementById(`ds-sp-split-transport-${id}`).value || null;
+  const retryMode = document.getElementById(`ds-sp-split-retry-${id}`).value || null;
+  const startEl = document.getElementById(`ds-sp-split-start-${id}`);
+  const start = !!(startEl && startEl.checked);
+  const payload = { n, start };
+  if (minModified) payload.min_modified = minModified;
+  if (transport) payload.transport = transport;
+  if (retryMode) payload.retry_mode = retryMode;
+  resultEl.insertAdjacentHTML("beforeend", `<p class="field-hint" style="flex-basis:100%;">Creating connections…</p>`);
+  try {
+    const r = await fetch(`/api/admin/sharepoint/connections/${encodeURIComponent(id)}/splits`, {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      showToast(detailMessage(body, "failed to create the split"), false);
+      return;
+    }
+    const created = body.connections || [];
+    showToast(`Created ${created.length} connection${created.length === 1 ? "" : "s"}.`, true);
+    toggleSpSplitRow(id);
+    await refreshSourcePipelines();
+    await loadConnections();
+  } catch (e) {
     showToast("Request failed.", false);
   }
 }
@@ -4540,6 +4682,7 @@ function _sourceMenuItems(row) {
     <button type="button" class="apg-menu__item" role="menuitem" data-role="test" onclick="closeSourceMenu(); testSpConn('${id}')">Test connection</button>
     <button type="button" class="apg-menu__item" role="menuitem" onclick="closeSourceMenu(); runSpExtraction('${id}')">Run extraction now</button>
     <button type="button" class="apg-menu__item" role="menuitem" onclick="closeSourceMenu(); runSpFactsExtraction('${id}')">Extract facts now</button>
+    <button type="button" class="apg-menu__item" role="menuitem" onclick="closeSourceMenu(); toggleSpSplitRow('${id}')">Split this site…</button>
     <div class="apg-menu__sep"></div>
     <button type="button" class="apg-menu__item" role="menuitem" onclick="closeSourceMenu(); consolidateSpCollections('${id}')">Consolidate collections…</button>
     <button type="button" class="apg-menu__item" role="menuitem" onclick="closeSourceMenu(); toggleSpCertRow('${id}')">Update certificate…</button>

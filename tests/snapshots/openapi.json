@@ -10805,6 +10805,64 @@
         "title": "SourceRequest",
         "type": "object"
       },
+      "SplitApplyBody": {
+        "description": "``POST \u2026/splits`` \u2014 how many sibling connections to create and, for\neach, the per-connection extraction knobs a split usually wants set from\nthe start (see :func:`apply_split`). ``n`` is capped at\n:data:`_SPLIT_MAX_N` \u2014 this endpoint fans out ``n`` Graph Search calls\nper top-level folder plus ``n`` connection creates; nothing here needs\nmore than a few dozen even on a genuinely huge site.",
+        "properties": {
+          "min_modified": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Min Modified"
+          },
+          "n": {
+            "maximum": 50.0,
+            "minimum": 1.0,
+            "title": "N",
+            "type": "integer"
+          },
+          "retry_mode": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Retry Mode"
+          },
+          "start": {
+            "default": false,
+            "title": "Start",
+            "type": "boolean"
+          },
+          "transport": {
+            "anyOf": [
+              {
+                "enum": [
+                  "sync",
+                  "batch"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Transport"
+          }
+        },
+        "required": [
+          "n"
+        ],
+        "title": "SplitApplyBody",
+        "type": "object"
+      },
       "SsoConfigBody": {
         "properties": {
           "allowed_email_domains": {
@@ -33754,6 +33812,185 @@
           }
         },
         "summary": "Bulk Add Scopes",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/api/admin/sharepoint/connections/{connection_id}/split-plan": {
+      "get": {
+        "description": "Read-only preview of splitting this connection's site into ``n``\nsibling connections (see the module docstring's \"split a large site\"\nentry) \u2014 greedy-packs the drive root's top-level folders into ``n``\ngroups of roughly equal document count, WITHOUT creating anything.\n\n``drive_id`` is optional \u2014 same inference as ``POST \u2026/scopes/bulk``:\nreused from this connection's first existing scope when omitted, ``400\ndrive_id_required`` when neither is available (a split only makes sense\non a connection that already resolves a drive). ``min_modified``\n(``YYYY-MM-DD``, ``400 invalid_min_modified`` otherwise) narrows each\nfolder's document count to files modified on/after that date, via the\nsame Graph Search filter :func:`connectors.sharepoint.graph_client.\nsearch_document_count` builds.\n\nDrive-root items that are FILES, not folders, are reported under\n``loose_root_files`` \u2014 they are in no folder, so a folder-based split\n(this one, and the manual ``clone`` + ``scopes/bulk`` workflow it\nautomates) can never cover them; an admin sees exactly what would be\nleft behind rather than discovering it after the fact.\n\nResponse: ``{drive_id, folders: [{name, documents}], loose_root_files:\n[names], groups: [{name, folders: [{name, documents}], documents}],\ntotal_documents}`` \u2014 ``groups[].name`` is the EXACT name ``POST \u2026/splits``\nwill give the corresponding clone (:func:`connectors.sharepoint.\nsite_split.format_group_name`), so an admin previewing this can see\nahead of time what will collide with ``409 split_exists`` on a repeat\napply.\n\n``404`` for an unknown/non-SharePoint connection id. A Graph failure\nwhile listing the root (not a per-folder count failure \u2014 those degrade\nto ``documents: 0``, never fail the whole preview) is a typed ``502\nsharepoint_graph_error``.",
+        "operationId": "split_plan_api_admin_sharepoint_connections__connection_id__split_plan_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "title": "Connection Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "n",
+            "required": true,
+            "schema": {
+              "maximum": 50,
+              "minimum": 1,
+              "title": "N",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "min_modified",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Min Modified"
+            }
+          },
+          {
+            "in": "query",
+            "name": "drive_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Drive Id"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Split Plan",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/api/admin/sharepoint/connections/{connection_id}/splits": {
+      "post": {
+        "description": "Apply a site split (see :func:`split_plan` above for the read-only\npreview this computes identically before creating anything): creates\n``body.n`` sibling connections, each named ``\"<source name> \u2014 part\ni/n\"`` (:func:`connectors.sharepoint.site_split.format_group_name`),\nwired to the same credential material as the source\n(:func:`_cloned_base_config`, the same helper ``POST \u2026/clone`` uses) and\ngiven its own slice of the source's top-level folders as confirmed\nscopes \u2014 the same scope-row shape and collection-minting call\n(:func:`_create_scope_collection`) ``POST \u2026/scopes/bulk`` uses, so a\nsplit clone looks identical to one built by hand through clone +\nbulk-add.\n\n``body.min_modified``, when given, is written onto EACH clone's\n``config.extraction.crawl.min_modified`` \u2014 the crawl does not read that\nkey yet (no admin-facing date filter has shipped for the crawl itself at\nthe time this endpoint was written), so today it is inert bookkeeping\nthat a near-term crawl change will start honoring under the same key,\nnot a promise this endpoint enforces itself. ``body.transport`` /\n``body.retry_mode`` are written onto ``config.extraction.facts`` \u2014 the\nexact keys ``PATCH \u2026/extraction/facts-config`` writes \u2014 so a split can\nhand every clone the same per-connection retry/transport policy in one\ncall instead of ``n`` follow-up PATCHes.\n\n**Idempotency**: refuses with ``409 split_exists`` BEFORE creating\nanything if a connection named like any of this split's target names\nalready exists (the exact names :func:`split_plan` would have shown) \u2014\na repeat ``POST`` never creates a second, name-colliding batch.\n\n``body.start=True`` enqueues each clone's ``corpus-extraction`` job\nimmediately after it is created, in creation order \u2014 the same job\n``POST \u2026/{id}/extract`` enqueues, skipped silently (never a 409/500 that\nwould make a split appear to have failed) when extraction readiness\n(``sharepoint.enabled`` / the ``extraction`` extra) is not currently\nsatisfied; the clones themselves are still created either way.\n\nReturns ``{\"connections\": [{id, name, folders: [{name, documents}],\ndocuments}]}`` \u2014 one entry per created clone, in the same order as\n``split_plan``'s own ``groups``.",
+        "operationId": "apply_split_api_admin_sharepoint_connections__connection_id__splits_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "title": "Connection Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SplitApplyBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Apply Split",
         "tags": [
           "admin"
         ]

@@ -3698,3 +3698,45 @@ global.fetch = async (url, opts) => {{
         assert "/admin/access?lens=simulate" in (out["nextWritten"] or "")
         # And the marker is cleared, so the NEXT mutation still gets a fresh read.
         assert out["inFlightCleared"] is True
+
+
+class TestSharePointSplitControl:
+    """The "Split this site" control on the SharePoint connection card (see
+    `app.api.admin_sharepoint` split-plan/splits) — the page's JS renders it
+    directly into the HTML response, so a plain markup assertion is enough;
+    the endpoints themselves are covered by tests/test_admin_sharepoint.py."""
+
+    def test_the_page_ships_the_split_control_and_its_handlers(self, seeded_app, monkeypatch):
+        from cryptography.fernet import Fernet
+
+        from app.secrets_vault import _reset_ephemeral_key_for_tests
+
+        monkeypatch.setenv("AGNES_VAULT_KEY", Fernet.generate_key().decode())
+        _reset_ephemeral_key_for_tests()
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        c.cookies.set("access_token", token)
+        try:
+            resp = c.get("/admin/data-sources", headers={"Accept": "text/html"})
+        finally:
+            c.cookies.clear()
+            _reset_ephemeral_key_for_tests()
+        assert resp.status_code == 200, resp.text
+        body = resp.text
+
+        # The card is drawn by the page's externalized script (#2146 moved
+        # the inline JS out), so the page must load that script and the
+        # script must carry the control; the panel's own styles stay inline.
+        assert "js/admin/data_sources_page.js" in body
+        assert ".ds-sp-split-table" in body
+        from pathlib import Path
+
+        script = Path("app/web/static/js/admin/data_sources_page.js").read_text(encoding="utf-8")
+        # The menu item and card control that open the panel.
+        assert "Split this site" in script
+        assert "toggleSpSplitRow" in script
+        # The preview/apply calls, hitting the exact endpoints this feature adds.
+        assert "previewSpSplit" in script
+        assert "applySpSplit" in script
+        assert "/split-plan?" in script
+        assert "/splits`" in script

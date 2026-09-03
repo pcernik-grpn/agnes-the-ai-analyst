@@ -3429,6 +3429,19 @@ KNOWN_UNTESTED = {
     # warning are all covered by
     # tests/test_admin_sharepoint.py; not duplicated in this PG smoke sweep.
     "GET /api/admin/sharepoint/connections/{connection_id}/tree",
+    # Site-split planner (preview + apply) — greedy-packs a connection's
+    # drive-root folders into N groups (live Graph root-children listing +
+    # per-folder Graph Search document counts, both mocked via
+    # httpx.MockTransport) and, on apply, creates N sibling connections with
+    # their own scopes. Same "no new schema surface" reasoning as clone/
+    # scopes-bulk right above (all state lives in existing
+    # `source_connections.config` / `file_corpora` / `resource_grants`
+    # rows) — auth matrix, packing balance, idempotent 409, and the
+    # `start` enqueue are all covered by
+    # tests/test_admin_sharepoint.py::TestSplitPlan /
+    # tests/test_admin_sharepoint.py::TestSplitApply; not duplicated here.
+    "GET /api/admin/sharepoint/connections/{connection_id}/split-plan",
+    "POST /api/admin/sharepoint/connections/{connection_id}/splits",
     # Bounded BFS folder search (TCRD-240) over the same live tree — never
     # Graph's own `/search`. Same "no new schema surface" reasoning as the
     # sibling `/tree` route above; auth matrix, query-length/mode/glob

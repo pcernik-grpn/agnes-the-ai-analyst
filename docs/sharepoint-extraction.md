@@ -131,6 +131,38 @@ spot-check shows pseudonyms, not names.
   container on large decks, two held it under 4 GiB), and the worker reads
   it at the start of each run, so a save applies to the next run with no
   restart.
+     however many connections the crawl needs to parallelize over.
+- `extraction.crawl.min_modified` — a per-connection age filter for a
+  backfill run: crawl only files modified on/after a cutoff date instead of
+  re-walking a whole multi-year corpus. `PATCH …/extraction/crawl-config`
+  (`agnes admin sharepoint crawl-config <connection_id> --min-modified
+  YYYY-MM-DD` / `--clear`) sets or clears it; an item with no modified
+  timestamp is always kept.
+- **Or let Agnes do the split for you.** `GET /api/admin/sharepoint
+  /connections/{id}/split-plan?n=<n>[&min_modified=YYYY-MM-DD][&drive_id=<id>]`
+  (`agnes admin sharepoint split-plan <connection_id> --n <n> [--min-modified
+  YYYY-MM-DD] [--json]`) previews a greedy-packed split of the drive root's
+  top-level folders into `n` groups of roughly equal document count (a live
+  Graph Search count per folder — never a delta walk, which throttles under
+  repetition and biases its own first pages), and reports any file sitting
+  directly at the drive root (`loose_root_files`) that a folder-based split
+  — this one, and the manual clone + `scopes/bulk` recipe above — can never
+  cover. A folder whose count could not be read is still assigned to a
+  group, at `documents: 0`, never dropped from the plan. The SharePoint
+  connection card's own **Split this site…** control (Actions menu, or the
+  same-named button on the card body) previews and applies this from the
+  browser. `POST …/splits` (`agnes admin sharepoint split <connection_id>
+  --n <n> [--min-modified YYYY-MM-DD] [--transport sync|batch] [--retry-mode
+  off|on_gate_fail|always] [--start]`) then creates all `n` clones AND their
+  scopes in one call — the same `clone` + `scopes/bulk` primitives above,
+  run automatically — named `"<source name> — part i/n"`; `409 split_exists`
+  if a split under those names already exists, so a repeat call never
+  double-creates. `--min-modified` lands on each clone's own
+  `config.extraction.crawl.min_modified` above; `--transport`/`--retry-mode`
+  land on each clone's `config.extraction.facts`, the same keys
+  `facts-config` writes. `--start` enqueues each clone's crawl immediately
+  after creating it, in creation order, skipped silently (never a failed
+  apply) when extraction readiness is not currently satisfied.
 - Webhooks for near-real-time updates: mint the secret
   (`POST …/webhook`), then `POST …/subscriptions/ensure` — Agnes owns the
   Graph subscription lifecycle including renewals
