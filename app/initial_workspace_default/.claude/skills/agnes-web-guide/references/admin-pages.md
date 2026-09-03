@@ -87,9 +87,11 @@ anyone to one without checking `/admin/server-config` first. Each is one flag
 - `/admin/server-config` — server configuration switches (feature flags,
   caps, providers).
 - `/admin/database` — app-state database backend status.
-- `/admin/initial-workspace` — the template every chat/analyst workspace is
-  initialized from.
-- `/admin/prompts` — the agent and workspace prompt overrides.
+- `/admin/prompts` — the managed prompts (install, workspace CLAUDE.md,
+  facts extraction) AND, on its "Template repository" tab
+  (`/admin/prompts?tab=repo`), the Git repo every chat/analyst workspace is
+  initialized from. One page: a prompt can bind to a file in that repo, so
+  the repo and the prompts that read it are the same job.
 - `/admin/datasource-credentials` — instance secrets for data sources.
 - `/admin/mcp-sources` — external MCP servers offered to users, and
   per-tool grants. "+ Add MCP source" walks the connection, reads the server's

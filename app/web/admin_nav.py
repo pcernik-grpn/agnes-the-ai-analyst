@@ -449,17 +449,25 @@ ADMIN_NAV_SECTIONS: list[dict] = [
                 "gloss": "Move app state between DuckDB and Postgres",
                 "match": ["/admin/database"],
             },
-            {
-                "label": "Initial workspace",
-                "href": "/admin/initial-workspace",
-                "gloss": "Git repo seeding analyst workspaces",
-                "match": ["/admin/initial-workspace"],
-            },
+            # ONE row for what were two: the managed prompts and the template
+            # repo they bind to. They were never independent — the Prompts page
+            # had to ask `initial_workspace.is_configured()` before it could
+            # offer git mode at all, and each page carried a "go do that part
+            # over there" link at the other (Initial workspace's provenance
+            # table sent you to Prompts to change a binding; Prompts' git pane
+            # sent you to register a repo). Two pages for one job, with a
+            # round trip in the middle. `/admin/initial-workspace` 308s onto
+            # this page's repo tab, so the old row's bookmarks still land.
             {
                 "label": "Prompts",
                 "href": "/admin/prompts",
-                "gloss": "The install prompt and workspace CLAUDE.md",
-                "match": ["/admin/prompts", "/admin/agent-prompt", "/admin/workspace-prompt"],
+                "gloss": "Managed prompts and the repo they bind to",
+                "match": [
+                    "/admin/prompts",
+                    "/admin/agent-prompt",
+                    "/admin/workspace-prompt",
+                    "/admin/initial-workspace",
+                ],
             },
             {
                 "label": "Instance secrets",

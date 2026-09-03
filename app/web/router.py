@@ -10888,11 +10888,23 @@ async def admin_initial_workspace_page(
     request: Request,
     user: dict = Depends(require_admin),
 ):
-    """Admin page for the Initial Workspace Template repo (register / sync /
-    delete + per-file prompt provenance). Relocated from /admin/server-config
-    (#622 Slice 3 PR-B)."""
-    ctx = _build_context(request, user=user)
-    return templates.TemplateResponse(request, "admin_initial_workspace.html", ctx)
+    """Merged into /admin/prompts as its "Template repository" tab.
+
+    The repo and the prompts that bind to it were one job split across two
+    pages: this page's provenance table sent you to /admin/prompts to change a
+    binding, and that page could not offer git mode at all until this one had
+    registered a repo. 308 keeps every bookmark and in-page link alive — same
+    treatment /admin/agent-prompt and /admin/workspace-prompt got when #622
+    folded them into the same page.
+
+    KEEPS ``require_admin`` even though it only redirects — the two sibling
+    redirects below carry no gate, and a merge is the wrong moment to copy
+    that: this route answered 403 to a non-admin yesterday, and a refactor
+    that quietly turns a 403 into a 308 has changed who the endpoint answers,
+    not where it points. The target is admin-gated too, so the gate here is
+    belt-and-braces rather than the only check.
+    """
+    return RedirectResponse(url="/admin/prompts?tab=repo", status_code=308)
 
 
 # ── Inbound MCP source admin (RFC keboola/agnes-the-ai-analyst#461) ──
@@ -11374,10 +11386,24 @@ async def admin_prompts_page(
     editor mode, and a repo-path bind field for git mode. All dynamic state is
     fetched client-side from /api/admin/prompts/{kind}; the route only needs to
     know whether an IWT repo is registered so the git toggle can be disabled
-    when there's nothing to bind to."""
+    when there's nothing to bind to.
+
+    ``tab`` picks which of the two panes renders — the prompt cards, or the
+    Initial Workspace Template repo that used to be /admin/initial-workspace.
+    Resolved here rather than in the browser so each tab is a real URL and
+    only the active pane's markup and script reach the page (see the template's
+    `block page` comment). Anything other than ``repo`` is the prompt cards,
+    so a stale or hand-typed ``?tab=`` lands on the default rather than an
+    empty page.
+    """
     from src.initial_workspace import is_configured
 
-    ctx = _build_context(request, user=user, iwt_configured=is_configured())
+    ctx = _build_context(
+        request,
+        user=user,
+        iwt_configured=is_configured(),
+        tab="repo" if request.query_params.get("tab") == "repo" else "prompts",
+    )
     return templates.TemplateResponse(request, "admin_prompts.html", ctx)
 
 
