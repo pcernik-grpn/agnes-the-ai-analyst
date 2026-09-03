@@ -31,15 +31,37 @@ The spec shape (all keys optional except ``table``)::
       "row_rules": [{"column": str, "op": ROW_OP, "value": Any}],
       "row_combine": "and" | "or",
       "column_masks": {col: MASK | {"choice": MASK, "group": str} |
-                              {"choice": MASK, "groups": [str, ...]}},
+                              {"choice": MASK, "groups": [str, ...]} |
+                              {"choice": "tiered",
+                               "tiers": [{"groups": [str, ...],
+                                          "reveal": "show" | MASK}, ...],
+                               "default": MASK}},
     }
 
 ``ROW_OP`` is one of ``in_caller_groups`` (row's column is one of the caller's
 live groups), ``eq_caller_email`` / ``eq_caller_id`` (self-owned rows), ``eq``
 / ``in`` (literal match). ``MASK`` is ``show`` | ``hide`` | ``nullify`` |
 ``hash`` | ``unmask`` | ``last4`` | ``email_partial`` (``unmask`` needs a
-``group`` or ``groups`` list; ``last4`` and ``email_partial`` are text-only and
-carry no group allowlist of their own).
+``group`` or ``groups`` list; ``last4`` and ``email_partial`` are text-only).
+
+A ``groups`` list is a **modifier on any value-producing mask**, not a mask of
+its own: the listed groups see the column verbatim, everyone else gets that
+mask (``unmask`` is the same shape with a constant fallback, kept as its own
+spelling). An empty or absent list degrades to the plain mask -- never to
+"everyone sees it". ``hide`` cannot take one (a column cannot be conditionally
+absent from a fixed projection) and neither can ``show`` (it would compile to
+the opposite of what it reads like); both are refused.
+
+``tiered`` generalizes that into an ORDERED chain -- one ``CASE``, first
+matching tier wins, ``default`` for everyone else -- so "who sees what" for a
+caller in several groups is decided by the admin's order rather than by which
+rule the compiler emitted last. The design note worth keeping: the fallback
+machinery started as a constant (``_masked_fallback``) and is now any mask
+builder (``_mask_value_expr``); that one generalization is what makes both the
+modifier and the tier chain fall out, with no new SQL construct beyond the
+``CASE`` + ``list_contains($user_groups, ...)`` the validator already allows.
+Every branch of a chain keeps the column's own type (text-only masks stay
+refused on non-text columns), so tiers preserve the type invariant in (4).
 
 ``columns`` is the table's real column list from a DESCRIBE; each entry may be
 a column name string, a ``(name, type)`` tuple, or a ``{"name": ..., "type": ...}``
@@ -245,6 +267,87 @@ _TEXT_ONLY_MASKS = {
 }
 
 
+def _mask_value_expr(choice: str, q: str, col_type: str, col: str, *, kind: str = "mask") -> str:
+    """The bare expression (no ``AS`` alias) a value-producing mask compiles to.
+
+    This is the generalization wave 2 needed: ``unmask``'s ELSE branch used to be
+    a CONSTANT (``_masked_fallback``), so "who sees the real value" and "what
+    everyone else sees" were welded together. Routing every mask through one
+    builder makes the ELSE branch just another mask, which is what lets a
+    ``groups`` modifier sit on any mask and lets a tier chain nest them.
+
+    ``show`` and ``hide`` are deliberately absent: ``show`` is the column itself,
+    ``hide`` is an absence rather than a value, and ``unmask`` is ``show`` plus
+    its own allowlist -- i.e. the modifier, not a value a tier can reveal.
+    """
+    if choice == "nullify":
+        return f"CAST(NULL AS {col_type})"
+    if choice == "hash":
+        return f"md5({q})"
+    if choice in _TEXT_ONLY_MASKS:
+        if not _is_text_type(col_type):
+            raise ValueError(
+                f"mask {choice!r} applies to text columns only; column {col!r} is {col_type} "
+                "-- use 'nullify', 'hash' or 'hide' for a non-text column"
+            )
+        return _TEXT_ONLY_MASKS[choice](q)
+    raise ValueError(f"unknown {kind}: {choice!r}")
+
+
+def _tiered_expr(raw: Any, q: str, col_type: str, col: str) -> str:
+    """Compile ``{"choice": "tiered", "tiers": [...], "default": <mask>}`` into
+    ONE ordered ``CASE`` chain -- first matching tier wins.
+
+    Ordering is the whole point: independent per-group rules leave "what does a
+    caller in two groups see" to whichever rule the compiler happened to emit
+    last, while a chain answers it the way the admin wrote it, top-down.
+
+    Every refusal below is a spec that compiles to something other than what it
+    reads like: a tier with no groups matches nobody (or, if its condition were
+    normalized to TRUE, everybody), a ``show`` default makes the whole chain a
+    no-op for the callers it is supposed to restrict, and a ``hide`` default
+    would make the output schema depend on the caller. Normalizing any of them
+    silently is how a policy ends up wider than its author believes.
+    """
+    tiers = raw.get("tiers") if isinstance(raw, dict) else None
+    if not isinstance(tiers, (list, tuple)) or not tiers:
+        raise ValueError(
+            f"tiered mask on column {col!r} needs at least one tier; every tier names the groups it "
+            "applies to and what those groups reveal -- the verbatim column, or a mask"
+        )
+
+    default = str((raw.get("default") if isinstance(raw, dict) else None) or "")
+    if default in ("", "show", "hide"):
+        raise ValueError(
+            f"tiered mask on column {col!r} needs a default mask that produces a masked value "
+            "('nullify', 'hash', 'last4', 'email_partial'): a 'show' default makes the whole "
+            "chain a no-op, and a 'hide' default cannot be conditional in a fixed projection"
+        )
+    default_expr = _mask_value_expr(default, q, col_type, col, kind="tiered default mask")
+
+    branches: list[str] = []
+    for tier in tiers:
+        if not isinstance(tier, dict):
+            raise ValueError(f"tiered mask on column {col!r}: every tier must be an object, got {tier!r}")
+        groups = _unmask_groups(tier)
+        if not groups:
+            raise ValueError(
+                f"tiered mask on column {col!r}: every tier needs at least one group "
+                "-- a tier with an empty group list matches nobody and can only be a mistake"
+            )
+        reveal = str(tier.get("reveal") or "")
+        if reveal in ("hide", "unmask"):
+            raise ValueError(
+                f"tiered mask on column {col!r}: {reveal!r} is not a tier reveal -- use 'show' for the "
+                "verbatim column (the tier's own groups already scope who reaches it) or a mask that "
+                "produces a value"
+            )
+        value = q if reveal == "show" else _mask_value_expr(reveal, q, col_type, col, kind="tier reveal")
+        branches.append(f"WHEN {_unmask_condition(groups)} THEN {value}")
+
+    return "CASE " + " ".join(branches) + f" ELSE {default_expr} END"
+
+
 def _predicate(rule: dict) -> str:
     col = quote_ident(rule["column"])
     op = rule.get("op")
@@ -284,34 +387,45 @@ def compile_policy(spec: dict, columns: Sequence[Any]) -> CompiledPolicy:
         choice = _mask_choice(raw)
         q = quote_ident(col)
         col_type = col_type_by_name.get(col, "VARCHAR") or "VARCHAR"
+        # `groups` is a MODIFIER on any value-producing mask: the listed groups
+        # see the column verbatim, everyone else gets the mask. An empty or
+        # absent list degrades to the plain mask -- never to "everyone sees it".
+        groups = _unmask_groups(raw)
         if choice == "show":
+            if groups:
+                raise ValueError(
+                    f"mask 'show' on column {col!r} cannot carry a group allowlist: it would compile to "
+                    "'everyone sees the value', the opposite of what it reads like -- use "
+                    "{'choice': 'unmask', 'groups': [...]} to reveal it to those groups only"
+                )
             continue
         excluded.append(col)
         if choice == "hide":
+            if groups:
+                # A column cannot be conditionally absent: the projection is fixed
+                # at save time, so the output SCHEMA would otherwise depend on the
+                # caller (and every DESCRIBE-based surface downstream with it).
+                raise ValueError(
+                    f"mask 'hide' on column {col!r} cannot be scoped to groups -- a column is either in the "
+                    "fixed projection or absent from it for everyone; use 'unmask', or a tiered mask whose "
+                    "default masks the value"
+                )
             # Hidden columns are omitted from the fixed projection entirely.
             continue
-        if choice == "nullify":
-            # Cast keeps the column type unchanged for the caller.
-            expr = f"CAST(NULL AS {col_type}) AS {q}"
-            derived.append(col)
-        elif choice == "hash":
-            expr = f"md5({q}) AS {q}"
-            derived.append(col)
-        elif choice == "unmask":
-            groups = _unmask_groups(raw)
+        if choice == "unmask":
+            # `unmask` is `show` scoped to groups: the constant-fallback special
+            # case of the modifier below, kept as its own spelling for the specs
+            # already saved with it.
             fallback = _masked_fallback(col_type)
             expr = f"CASE WHEN {_unmask_condition(groups)} THEN {q} ELSE {fallback} END AS {q}"
-            derived.append(col)
-        elif choice in _TEXT_ONLY_MASKS:
-            if not _is_text_type(col_type):
-                raise ValueError(
-                    f"mask {choice!r} applies to text columns only; column {col!r} is {col_type} "
-                    "-- use 'nullify', 'hash' or 'hide' for a non-text column"
-                )
-            expr = f"{_TEXT_ONLY_MASKS[choice](q)} AS {q}"
-            derived.append(col)
+        elif choice == "tiered":
+            expr = f"{_tiered_expr(raw, q, col_type, col)} AS {q}"
         else:
-            raise ValueError(f"unknown mask: {choice!r}")
+            value = _mask_value_expr(choice, q, col_type, col)
+            if groups:
+                value = f"CASE WHEN {_unmask_condition(groups)} THEN {q} ELSE {value} END"
+            expr = f"{value} AS {q}"
+        derived.append(col)
         masked_exprs[col] = expr
 
     projections = []

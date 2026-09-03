@@ -550,3 +550,61 @@ class TestPolicyBuilderCompile:
         detail = resp.json()["detail"]
         assert detail.startswith("policy_compile_invalid_spec:"), resp.text
         assert "amount_eur" in detail, resp.text
+
+    def test_compile_endpoint_builds_a_tiered_mask_chain(self, policy_builder_table):
+        """A multi-tier spec is compiled server-side into ONE ordered CASE
+        chain -- the endpoint stays a pure generator, so the stored artifact
+        is still SQL, never the tier structure."""
+        c = policy_builder_table["client"]
+        token = policy_builder_table["admin_token"]
+
+        resp = c.post(
+            "/api/admin/registry/policy_builder_invoices/policy/compile",
+            json={
+                "row_rules": [],
+                "column_masks": {
+                    "national_id": {
+                        "choice": "tiered",
+                        "tiers": [
+                            {"groups": ["Compliance"], "reveal": "show"},
+                            {"groups": ["Finance"], "reveal": "last4"},
+                        ],
+                        "default": "nullify",
+                    }
+                },
+            },
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200, resp.text
+        sql = resp.json()["sql"]
+        assert "SELECT *" not in sql
+        # One output column for the masked column, in tier order.
+        assert sql.count('AS "national_id"') == 1
+        assert sql.index("'Compliance'") < sql.index("'Finance'")
+        assert "list_contains($user_groups, 'Compliance')" in sql
+        assert "CAST(NULL AS VARCHAR) END" in sql
+
+    def test_compile_endpoint_rejects_a_tiered_spec_that_masks_nothing(self, policy_builder_table):
+        """A tier chain whose default is ``show`` reveals the column to
+        everyone the tiers do not name -- a no-op policy that reads like a
+        restriction. ``compile_policy`` refuses it; the endpoint must surface
+        that as a 4xx the builder can render, never a 500."""
+        c = policy_builder_table["client"]
+        token = policy_builder_table["admin_token"]
+
+        resp = c.post(
+            "/api/admin/registry/policy_builder_invoices/policy/compile",
+            json={
+                "row_rules": [],
+                "column_masks": {
+                    "national_id": {
+                        "choice": "tiered",
+                        "tiers": [{"groups": ["Compliance"], "reveal": "show"}],
+                        "default": "show",
+                    }
+                },
+            },
+            headers=_auth(token),
+        )
+        assert resp.status_code == 422, resp.text
+        assert "default" in resp.json()["detail"]
