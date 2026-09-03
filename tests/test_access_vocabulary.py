@@ -1252,12 +1252,17 @@ class TestAnOwnerSharedRowSaysWhoAndGoesSomewhereReal:
 
         return Path(self.TEMPLATE).read_text(encoding="utf-8")
 
-    def test_an_agents_link_goes_to_its_owner(self):
+    def test_an_agent_row_offers_no_link_that_leads_nowhere_relevant(self):
+        """Two destinations were tried and both failed the owner's look: the
+        owner's builder (shows an admin nothing) and the owner's People page
+        (shows nothing about what they share). Until a page answers "what is
+        this agent and who has it", the row names the owner and links nowhere
+        — a link that leads somewhere irrelevant is the defect, not a fix."""
         src = self._source()
-        assert "agent: (id, item) => (item && item.owner_user_id)" in src
-        assert "? `/admin/users/${encodeURIComponent(item.owner_user_id)}`" in src
-        assert 'const ownLabel = t.type_key === "agent" ? "owner ↗" : "where it lives ↗";' in src
-        assert 'hrefLabel: ownLabel' in src
+        entity = src[src.index("const ENTITY_PAGE = {"): src.index("};", src.index("const ENTITY_PAGE = {"))]
+        assert "agent:" not in entity.replace("// ", "")   # no agent destination
+        assert "Deliberately absent." in entity
+        assert 'const ownLabel = "where it lives ↗";' in src
 
     def test_the_sharer_leads_the_row(self):
         src = self._source()
@@ -1265,9 +1270,21 @@ class TestAnOwnerSharedRowSaysWhoAndGoesSomewhereReal:
         j = src.index("if (i.description) bits.push(esc(String(i.description).slice(0, 120)));", i - 400)
         assert i < j, "the sharer must be pushed before the description"
 
+    def test_shared_by_is_the_owners_act_and_granted_by_is_anyone_elses(self):
+        """An admin granting Ada's agent to a group is not a share — Ada was
+        not in the loop — so that row says who granted it AND whose it is.
+        The first cut said "Shared by <admin>" for every owner-shared kind,
+        crediting the owner with a decision they did not make."""
+        src = self._source()
+        assert "if (owned && who && sharerIsOwner) {" in src
+        assert "Shared by <b>${esc(who)}</b>" in src
+        assert "} else if (owned && who) {" in src
+        assert "Granted by <b>${esc(who)}</b>" in src
+        assert "owned by ${esc(i.owner_email)}" in src[src.index("Granted by <b>"):][:200]
+
     def test_sharer_and_owner_are_compared_by_id(self):
         src = self._source()
         assert "grant.assigned_by === i.owner_user_id" in src
-        assert 'itemProvenance(i, { ownerNamed: sharerIsOwner })' in src
+        assert 'itemProvenance(i, { ownerNamed: !!(owned && who) })' in src
         assert "if (i.owner_email && !(opts && opts.ownerNamed))" in src
         assert 'split("@")[0]' not in src[src.index("const sharerIsOwner"): src.index("const sharerIsOwner") + 600]

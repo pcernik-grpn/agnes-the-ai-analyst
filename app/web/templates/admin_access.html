@@ -3871,9 +3871,11 @@
       // on nothing — a dead end labelled "where it lives". There is no admin
       // page for an agent; the agent lives with its owner, so the row's link
       // goes to the owner on /admin/users when the owner is known.
-      agent: (id, item) => (item && item.owner_user_id)
-        ? `/admin/users/${encodeURIComponent(item.owner_user_id)}`
-        : `/agents?agent=${encodeURIComponent(id)}`,
+      // Deliberately absent. /agents?agent=<id> is the owner's builder and
+      // shows an admin nothing; /admin/users/<owner> shows nothing about
+      // what that person shares. Until a page exists that answers "what is
+      // this agent and who has it", the row names the owner and offers no
+      // link that would lead somewhere irrelevant.
       // Carries the group out with it. The person lens already round-trips
       // (`?from=simulate&user=`) so a package page opened from an audit says
       // whose audit and offers the way back; the group lens did not, so the
@@ -3906,7 +3908,7 @@
       // What the link is FOR, by kind. "where it lives" was right for a
       // collection (its Library page) and wrong for an agent, whose only
       // reachable home for an admin is its owner.
-      const ownLabel = t.type_key === "agent" ? "owner ↗" : "where it lives ↗";
+      const ownLabel = "where it lives ↗";
       // An inherited row is NOT this group's to change: the tier control and
       // Revoke both act on the Everyone grant, so offering them here would
       // let an admin quietly alter a company-wide grant while looking at one
@@ -3944,9 +3946,20 @@
             // Sharer and owner are the same person when the grant's author IS
             // the item's owner — compared by id, not by guessing from names.
             const sharerIsOwner = owned && who && !!i.owner_user_id && grant.assigned_by === i.owner_user_id;
-            if (owned && who) bits.push(`<span class="ax-r__shared">Shared by <b>${esc(who)}</b></span>`);
+            /* Two different acts, two different sentences. The OWNER sharing
+               their own item is "Shared by Ada". An admin granting Ada's item
+               to a group is not a share — Ada was not in the loop — so that
+               row says who granted it AND whose it is. The first cut said
+               "Shared by <admin>" whenever the kind was owner-shared, which
+               credited the owner with a decision they did not make. */
+            if (owned && who && sharerIsOwner) {
+              bits.push(`<span class="ax-r__shared">Shared by <b>${esc(who)}</b></span>`);
+            } else if (owned && who) {
+              bits.push(`<span class="ax-r__shared">Granted by <b>${esc(who)}</b>${
+                i.owner_email ? ` · owned by ${esc(i.owner_email)}` : ""}</span>`);
+            }
             if (i.description) bits.push(esc(String(i.description).slice(0, 120)));
-            const prov = itemProvenance(i, { ownerNamed: sharerIsOwner });
+            const prov = itemProvenance(i, { ownerNamed: !!(owned && who) });
             if (prov) bits.push(prov);
             /* An MCP source grant is necessary but not sufficient — it is
                ANDed with per-tool grants set on the source's own page. The
