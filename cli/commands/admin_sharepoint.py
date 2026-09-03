@@ -1,7 +1,7 @@
 """`agnes admin sharepoint` — admin/ops triggers and status for SharePoint
 connector maintenance, plus the split-a-large-site management pair below.
 
-Nine surfaces:
+Eleven surfaces:
 
   - ``extract`` — the manual crawl trigger with its per-run options
     (``--concurrency``, ``--timeout-s``, ``--resync``, ``--force-reprocess``,
@@ -55,6 +55,18 @@ Nine surfaces:
     multi-year corpus. CLI counterpart to
     ``PATCH /api/admin/sharepoint/connections/{connection_id}/extraction/
     crawl-config``.
+  - ``scope set-mode`` — flip ``access_mode`` (manual/mirrored) on many of a
+    connection's EXISTING scopes in one call (``--scope`` repeatable or
+    ``--all``) — the fast path for turning ACL mirroring on across a site
+    split across hundreds of bulk-added scopes. CLI counterpart to
+    ``PATCH /api/admin/sharepoint/connections/{connection_id}/scopes/bulk``.
+  - ``acl map-site-group`` — map (or ``--unmap``) ONE SharePoint site group
+    (Owners/Members/Visitors, or custom — not enumerable through the
+    app-only Graph surface this connector uses) to one or more Agnes
+    groups, read-modify-write against the connection's current map so a
+    second mapping never clobbers the first. CLI counterpart to
+    ``PATCH /api/admin/sharepoint/connections/{connection_id}/
+    acl-site-group-map``.
 
 The ACL-sync / subtree-sweep TRIGGERS stay admin-web-UI-only, an
 established precedent (see CONTRIBUTING.md's "admin/scheduler maintenance
@@ -90,9 +102,11 @@ admin_sharepoint_app = typer.Typer(help="Admin: SharePoint connector maintenance
 scope_app = typer.Typer(help="SharePoint connect wizard scope management")
 connection_app = typer.Typer(help="SharePoint connection management")
 collections_app = typer.Typer(help="SharePoint per-scope collection management")
+acl_app = typer.Typer(help="SharePoint ACL-mirroring configuration")
 admin_sharepoint_app.add_typer(scope_app, name="scope")
 admin_sharepoint_app.add_typer(connection_app, name="connection")
 admin_sharepoint_app.add_typer(collections_app, name="collections")
+admin_sharepoint_app.add_typer(acl_app, name="acl")
 
 # `runs` renders a nine-column table (connection through error). A default,
 # terminal-detected width truncates every cell to a few characters when
@@ -1007,3 +1021,115 @@ def crawl_config(
         return
     resolved = body.get("min_modified") or {}
     typer.echo(f"min_modified: {resolved.get('value')} (source: {resolved.get('source')})")
+
+
+@scope_app.command("set-mode")
+def scope_set_mode(
+    connection_id: str = typer.Argument(..., help="SharePoint source_connections id"),
+    scope: List[str] = typer.Option(
+        [], "--scope", help="A source_scope_id to switch — repeatable. Mutually exclusive with --all."
+    ),
+    all_scopes: bool = typer.Option(
+        False, "--all", help="Switch every scope on this connection — mutually exclusive with --scope."
+    ),
+    mode: str = typer.Option(..., "--mode", help="manual or mirrored"),
+    as_json: bool = typer.Option(False, "--json"),
+):
+    """Flip ``access_mode`` (manual/mirrored) on many of this connection's
+    EXISTING scopes in one call — the fast path for turning ACL mirroring
+    on (or off) across a site split across hundreds of bulk-added scopes,
+    without a per-scope ``POST …/scopes`` round trip. CLI counterpart to
+    ``PATCH /api/admin/sharepoint/connections/{connection_id}/scopes/bulk``.
+
+    Never all-or-nothing: every targeted scope is switched or reported
+    failed independently (``--json`` for the full ``updated``/``failed``
+    breakdown) — switching TO ``mirrored`` a scope with no ``drive_id`` set
+    (confirmed before it existed) fails with ``missing_drive_id`` rather
+    than aborting the batch.
+    """
+    if scope and all_scopes:
+        typer.echo("Error: --scope and --all are mutually exclusive", err=True)
+        raise typer.Exit(1)
+    if not scope and not all_scopes:
+        typer.echo("Error: pass --scope (repeatable) or --all", err=True)
+        raise typer.Exit(1)
+    if mode not in ("manual", "mirrored"):
+        typer.echo("Error: --mode must be manual or mirrored", err=True)
+        raise typer.Exit(1)
+
+    body: dict = {"access_mode": mode}
+    if all_scopes:
+        body["all"] = True
+    else:
+        body["source_scope_ids"] = list(scope)
+
+    resp = api_patch(f"/api/admin/sharepoint/connections/{connection_id}/scopes/bulk", json=body)
+    if resp.status_code != 200:
+        _fail(resp)
+    result = resp.json()
+    if as_json:
+        typer.echo(json.dumps(result, indent=2))
+        return
+    typer.echo(f"Updated {len(result['updated'])} scope(s) to {mode}, failed {len(result['failed'])}")
+    for entry in result["failed"]:
+        typer.echo(f"  failed: {entry['source_scope_id']} ({entry['reason']})")
+
+
+@acl_app.command("map-site-group")
+def acl_map_site_group(
+    connection_id: str = typer.Argument(..., help="SharePoint source_connections id"),
+    site_group: str = typer.Option(
+        ..., "--site-group", help='Exact SharePoint site group displayName (e.g. "Members", "Owners")'
+    ),
+    group: List[str] = typer.Option(
+        [], "--group", help="Agnes user_groups id to grant this site group's members — repeatable"
+    ),
+    unmap: bool = typer.Option(
+        False, "--unmap", help="Remove this site group's mapping entirely — mutually exclusive with --group."
+    ),
+    as_json: bool = typer.Option(False, "--json"),
+):
+    """Map (or unmap) ONE SharePoint site group to one or more Agnes groups
+    in this connection's ACL-mirroring site-group map.
+
+    SharePoint site groups (Owners/Members/Visitors, or a custom one) are
+    not enumerable through the app-only Graph surface the connector uses,
+    so ACL mirroring cannot resolve them the way it resolves a direct user
+    or an Entra security group — a scope granting one classifies
+    ``unhonored: site_group`` and grants nobody until it is mapped here.
+
+    The underlying API (``PATCH …/acl-site-group-map``) replaces the WHOLE
+    map in one call; this command reads the connection's current map first
+    and only changes the ONE ``--site-group`` entry, so mapping a second
+    site group later never clobbers the first.
+    """
+    if group and unmap:
+        typer.echo("Error: --group and --unmap are mutually exclusive", err=True)
+        raise typer.Exit(1)
+    if not group and not unmap:
+        typer.echo("Error: pass --group (repeatable) or --unmap", err=True)
+        raise typer.Exit(1)
+
+    current = api_get(f"/api/admin/sharepoint/connections/{connection_id}")
+    if current.status_code != 200:
+        _fail(current)
+    mapping = dict((current.json().get("config") or {}).get("acl_site_group_map") or {})
+    if unmap:
+        mapping.pop(site_group, None)
+    else:
+        mapping[site_group] = list(group)
+
+    resp = api_patch(
+        f"/api/admin/sharepoint/connections/{connection_id}/acl-site-group-map",
+        json={"mapping": mapping},
+    )
+    if resp.status_code != 200:
+        _fail(resp)
+    result = resp.json()
+    if as_json:
+        typer.echo(json.dumps(result, indent=2))
+        return
+    if unmap:
+        typer.echo(f"Unmapped site group {site_group!r}.")
+    else:
+        typer.echo(f"Mapped site group {site_group!r} -> {', '.join(group)}")

@@ -78,6 +78,11 @@ def _audit(
 _SYNC_MANAGED_SENTINELS: dict = {
     "system:google-sync": ("google_managed_readonly", "Google Workspace", "admin.google.com"),
     "system:sharepoint-acl-sync": ("sharepoint_managed_readonly", "SharePoint ACL sync", "the source system"),
+    "system:microsoft-sync": (
+        "microsoft_managed_readonly",
+        "Microsoft Entra ID group sync",
+        "the Entra admin center",
+    ),
 }
 
 
@@ -93,7 +98,10 @@ def _sync_managed_reason(g: dict) -> Optional[tuple]:
        — auto-created/reconciled by that writer (Google: the OAuth
        callback for a prefix-matching Workspace group, ``name`` is the
        full Workspace email; SharePoint: ``entra:<oid>``/``sp-direct:
-       <scope>`` groups the ``sharepoint-acl-sync`` job creates).
+       <scope>`` groups the ``sharepoint-acl-sync`` job creates; Microsoft:
+       ``entra:<oid>`` groups the login-time Entra group sync creates — the
+       SAME naming as SharePoint's, since both key the same Entra group
+       identically, see ``src.entra_identity.entra_group_name``).
     2. Google only: ``is_system=TRUE`` AND the group's name matches the
        env-configured admin/everyone Workspace email — the OAuth callback
        routes memberships from those Workspace groups into the seeded

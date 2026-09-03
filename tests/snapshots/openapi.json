@@ -1,6 +1,23 @@
 {
   "components": {
     "schemas": {
+      "AclSiteGroupMapBody": {
+        "description": "``PATCH \u2026/acl-site-group-map`` \u2014 the whole SharePoint SITE GROUP \u2192\nAgnes group(s) mapping for this connection (see\n:func:`set_acl_site_group_map`). Replaces\n``config.acl_site_group_map`` wholesale (not a merge) \u2014 the admin\ncontrol this backs (module docstring's \"Site group mapping\") always\nsubmits the complete map, same \"PUT the whole resource\" contract as\n``ConfirmScopeBody.group_ids``' per-collection sibling. Keys are the\nSharePoint site group's exact ``displayName`` (as classification sees\nit \u2014 ``connectors.sharepoint.acl_sync.classify_permissions``'\n``site_group_map`` parameter); values are one or more existing Agnes\n``user_groups.id``.",
+        "properties": {
+          "mapping": {
+            "additionalProperties": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "title": "Mapping",
+            "type": "object"
+          }
+        },
+        "title": "AclSiteGroupMapBody",
+        "type": "object"
+      },
       "AddGrantRequest": {
         "properties": {
           "allow_mutating": {
@@ -1557,6 +1574,15 @@
       "BulkScopeBody": {
         "description": "One shot: turn a list of admin-typed folder paths into confirmed\nscopes, without the wizard's own click-through-the-tree flow (see\n:func:`bulk_add_scopes`). ``drive_id`` is optional \u2014 omit it to reuse\nthe drive of an existing scope on this SAME connection; a brand-new\nconnection with no scopes yet (the split-a-big-site workflow's typical\nstarting point, see :func:`clone_connection`) must supply it.\n\nA large site is routinely split across MANY bulk-add calls (one per\nconnection, spec's split-a-big-site workflow) \u2014 by default each call\nstill mints its OWN collection per path, forking the site across as\nmany collections as there are confirmed scopes. ``collection_id`` (an\nexisting, live collection) or ``collection`` (mint one new, named\ncollection) overrides that default: every scope THIS call creates\nroutes to the one shared target instead. Mutually exclusive\n(``400 both_collection_id_and_collection``); an unknown/soft-deleted\n``collection_id`` is ``404 collection_not_found``. Paths already\npresent on the connection are still reported ``skipped`` and keep\nwhatever collection they already own \u2014 the shared target only ever\napplies to scopes THIS call newly creates.",
         "properties": {
+          "access_mode": {
+            "default": "manual",
+            "enum": [
+              "manual",
+              "mirrored"
+            ],
+            "title": "Access Mode",
+            "type": "string"
+          },
           "collection": {
             "anyOf": [
               {
@@ -1617,6 +1643,43 @@
           "name"
         ],
         "title": "BulkScopeCollectionSpec",
+        "type": "object"
+      },
+      "BulkScopeModeBody": {
+        "description": "``PATCH \u2026/scopes/bulk`` \u2014 flip ``access_mode`` on many of this\nconnection's EXISTING scopes in one call (see :func:`set_scopes_mode`).\nExactly one of ``source_scope_ids`` (a specific list) or ``all: true``\n(every scope on the connection) selects the target set \u2014 ``400\nboth_source_scope_ids_and_all`` / ``400 source_scope_ids_or_all_required``\notherwise.",
+        "properties": {
+          "access_mode": {
+            "enum": [
+              "manual",
+              "mirrored"
+            ],
+            "title": "Access Mode",
+            "type": "string"
+          },
+          "all": {
+            "default": false,
+            "title": "All",
+            "type": "boolean"
+          },
+          "source_scope_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Scope Ids"
+          }
+        },
+        "required": [
+          "access_mode"
+        ],
+        "title": "BulkScopeModeBody",
         "type": "object"
       },
       "BulkUpdateRequest": {
@@ -32229,6 +32292,79 @@
         ]
       }
     },
+    "/api/admin/sharepoint/connections/{connection_id}/acl-site-group-map": {
+      "patch": {
+        "description": "Replace this connection's whole SharePoint site-group -> Agnes-group\nmapping (2026-09 fix \u2014 see\n``connectors.sharepoint.acl_sync.classify_permissions``'\n``site_group_map`` parameter).\n\nSharePoint site groups (Owners/Members/Visitors, or a custom one) are\nNOT enumerable through the app-only Graph surface this connector uses,\nso ACL mirroring cannot resolve them to Agnes accounts the way it\nresolves a direct user or an Entra security group \u2014 they classify\n``unhonored:site_group`` and grant nobody UNLESS an admin explicitly\nmaps the site group's exact ``displayName`` to one or more EXISTING\nAgnes groups here. A mapped site group's OWN membership is never read\nfrom Graph \u2014 every principal already in ``mapping``'s Agnes group(s) is\ngranted directly, same as any other ordinary grant; keeping that\ngroup's membership in sync with the real SharePoint site group stays\nthe admin's job (an Entra-security-group site membership is the\nhonored-without-mapping path, above).\n\nEvery group id in ``mapping`` must already exist (``400\ninvalid_group_id``, naming the unknown ids). Wholesale replace, not a\nmerge \u2014 pass the complete map every time; an admin removing the last\nmapping for a site group passes ``{}`` for that key or omits it\nentirely (both mean \"unmapped\").",
+        "operationId": "set_acl_site_group_map_api_admin_sharepoint_connections__connection_id__acl_site_group_map_patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "title": "Connection Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AclSiteGroupMapBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Set Acl Site Group Map",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
     "/api/admin/sharepoint/connections/{connection_id}/acl-sync": {
       "post": {
         "description": "Admin-triggered one-off run of the ``sharepoint-acl-sync`` job for\nthis connection (spec \u00a75.1's \"sync now\" action; 2026-08-30 plan, Task\n5) \u2014 enqueues ``connectors.sharepoint.acl_sync.run_acl_sync`` (via\n``app/worker/kinds.py::_run_sharepoint_acl_sync``) with\n``{\"connection_id\": connection_id}``, the SAME mechanics as\n:func:`trigger_extraction`.\n\n404 on an unknown/non-sharepoint connection BEFORE any other work. The\nrouter-level ``sharepoint.enabled`` gate (``_require_sharepoint_enabled``\nabove) already refuses the whole surface with ``409 feature_disabled``\nwhen the connector is off, so there is no separate per-route check here.\n\nDeduped on a STABLE per-connection idempotency key\n(:func:`_acl_sync_idempotency_key`) \u2014 a second trigger while one is\nalready queued/running for this connection gets ``409\nacl_sync_already_running`` instead of a second job.",
@@ -32561,7 +32697,7 @@
     },
     "/api/admin/sharepoint/connections/{connection_id}/collections/consolidate": {
       "post": {
-        "description": "Fold this connection's own per-scope collections into ONE target.\n\nA site split across many bulk-added scopes (:func:`bulk_add_scopes`,\nbefore it grew the shared-collection option) ends up with one\n``file_corpora`` collection PER scope \u2014 impossible to share, select in\nchat, or reason about as a whole. This is the after-the-fact fix: pick\n(or mint) a target, and every OTHER collection this connection's scopes\ncurrently route to is folded into it.\n\n``target_collection_id`` XOR ``target`` is required (``400\nboth_target_collection_id_and_target`` / ``400\ntarget_required``); an unknown/soft-deleted ``target_collection_id`` is\n``404 collection_not_found``. ``target_collection_id`` may name ANY\nlive collection \u2014 not necessarily one of this connection's own (the\nsame cross-connection sharing bulk-add's ``collection_id`` option\nallows).\n\n``dry_run`` (default ``True``) only lists the collections that WOULD be\nfolded and their file counts \u2014 nothing is touched, and a NAMED\n``target`` is not even minted yet (the response's ``target.id`` is\n``null`` in that case \u2014 a preview must never create data). Set\n``dry_run: false`` to actually perform the merge:\n\n* every row carrying a ``corpus_id`` for a source collection\n  (``corpus_files``, ``corpus_chunks``, ``corpus_file_sources``,\n  ``corpus_file_events``, ``claims``, ``fact_alias_sources``) is\n  re-pointed to the target, in ONE transaction\n  (:class:`src.repositories.sharepoint_collection_consolidation_pg.\n  SharePointCollectionConsolidationPgRepository`);\n* every one of THIS connection's scopes that routed to a source now\n  routes to the target;\n* the source collections' ``resource_grants`` are unioned onto the\n  target (a group already granted there keeps its existing grant);\n* the emptied source collections are soft-deleted.\n\nRefused with ``409 collection_referenced_by_other_connection`` (nothing\ntouched) when a source collection is still routed to by a DIFFERENT\nconnection's own scope \u2014 the same collection may be intentionally\nshared cross-connection (bulk-add's ``collection_id`` option), and this\nendpoint only ever folds away collections that belong to THIS\nconnection alone. ``409 consolidation_conflict`` (nothing touched, see\n:class:`~src.repositories.sharepoint_collection_consolidation_pg.\nConsolidationConflict`) when the merge would collide on\n``corpus_files.path`` or ``corpus_file_sources.source_stable_id``.\n\nNot included: ACL-mirroring permission ZONES (``config.acl_zones``) can\ncarry their own, separate per-zone collection id\n(``connectors.sharepoint.acl_sync``) \u2014 this endpoint never touches\nthose, only scope-level collections. A zone routed to a now-consolidated\ncollection needs the ``sharepoint-acl-sync``/``sharepoint-subtree-sweep``\njobs' own reconciliation to catch up.",
+        "description": "Fold this connection's own per-scope collections into ONE target.\n\nA site split across many bulk-added scopes (:func:`bulk_add_scopes`,\nbefore it grew the shared-collection option) ends up with one\n``file_corpora`` collection PER scope \u2014 impossible to share, select in\nchat, or reason about as a whole. This is the after-the-fact fix: pick\n(or mint) a target, and every OTHER collection this connection's scopes\ncurrently route to is folded into it.\n\n``target_collection_id`` XOR ``target`` is required (``400\nboth_target_collection_id_and_target`` / ``400\ntarget_required``); an unknown/soft-deleted ``target_collection_id`` is\n``404 collection_not_found``. ``target_collection_id`` may name ANY\nlive collection \u2014 not necessarily one of this connection's own (the\nsame cross-connection sharing bulk-add's ``collection_id`` option\nallows).\n\n``dry_run`` (default ``True``) only lists the collections that WOULD be\nfolded and their file counts \u2014 nothing is touched, and a NAMED\n``target`` is not even minted yet (the response's ``target.id`` is\n``null`` in that case \u2014 a preview must never create data). Set\n``dry_run: false`` to actually perform the merge:\n\n* every row carrying a ``corpus_id`` for a source collection\n  (``corpus_files``, ``corpus_chunks``, ``corpus_file_sources``,\n  ``corpus_file_events``, ``claims``, ``fact_alias_sources``) is\n  re-pointed to the target, in ONE transaction\n  (:class:`src.repositories.sharepoint_collection_consolidation_pg.\n  SharePointCollectionConsolidationPgRepository`);\n* every one of THIS connection's scopes that routed to a source now\n  routes to the target;\n* the source collections' ``resource_grants`` are unioned onto the\n  target (a group already granted there keeps its existing grant);\n* the emptied source collections are soft-deleted.\n\nRefused with ``409 collection_referenced_by_other_connection`` (nothing\ntouched) when a source collection is still routed to by a DIFFERENT\nconnection's own scope \u2014 the same collection may be intentionally\nshared cross-connection (bulk-add's ``collection_id`` option), and this\nendpoint only ever folds away collections that belong to THIS\nconnection alone. ``409 consolidation_conflict`` (nothing touched, see\n:class:`~src.repositories.sharepoint_collection_consolidation_pg.\nConsolidationConflict`) when the merge would collide on\n``corpus_files.path`` or ``corpus_file_sources.source_stable_id``.\n\nNot included: ACL-mirroring permission ZONES (``config.acl_zones``) can\ncarry their own, separate per-zone collection id\n(``connectors.sharepoint.acl_sync``) \u2014 this endpoint never touches\nthose, only scope-level collections. A zone routed to a now-consolidated\ncollection needs the ``sharepoint-acl-sync``/``sharepoint-subtree-sweep``\njobs' own reconciliation to catch up.\n\n``409 mirrored_scope_in_sources`` (nothing touched) when any SOURCE\ncollection is routed to by an ``access_mode='mirrored'`` scope\n(2026-09 fix): consolidation unions every source collection's grants\nonto the target (see above), which would turn a secure-folder's\nsentinel-owned ``entra:<oid>`` grant into a whole-site grant the moment\nit lands on a collection shared with other, differently-scoped folders\n\u2014 until there is an audience-zone design that can express \"this\nprincipal only for this sub-scope\" on a SHARED collection, folding a\nmirrored scope's collection away is refused outright rather than\nsilently widening its access. Surfaced in the dry-run response too\n(``mirrored_sources``) so an admin sees the blocker before attempting\nthe real merge, same posture as the ``blocking`` (foreign-connection)\nlist above.",
         "operationId": "consolidate_collections_api_admin_sharepoint_connections__connection_id__collections_consolidate_post",
         "parameters": [
           {
@@ -33745,8 +33881,79 @@
       }
     },
     "/api/admin/sharepoint/connections/{connection_id}/scopes/bulk": {
+      "patch": {
+        "description": "Flip ``access_mode`` on many of this connection's EXISTING scopes in\none call \u2014 the fast path for turning ACL mirroring on (or off) across a\nsite split across hundreds of bulk-added scopes, without a\n``POST \u2026/scopes`` round trip per scope (2026-09 fix).\n\nSelection: ``source_scope_ids`` (a specific list) XOR ``all: true``\n(every scope on the connection) \u2014 ``400 both_source_scope_ids_and_all``\n/ ``400 source_scope_ids_or_all_required`` otherwise. An id in\n``source_scope_ids`` that does not match any of this connection's\nscopes is reported ``{\"source_scope_id\", \"reason\": \"not_found\"}`` in\n``failed``, never a whole-request error.\n\nSwitching TO ``mirrored`` requires the scope to already carry a\n``drive_id`` (set at confirm time) \u2014 a scope confirmed before\n``drive_id`` existed, or a manual scope that never set one, is reported\n``{\"source_scope_id\", \"reason\": \"missing_drive_id\"}`` and left\nuntouched, same fail-closed posture as :func:`confirm_scope`'s own\n``400 missing_drive_id`` (batched here instead of aborting the whole\ncall). Switching mirrored -> manual deletes the sync's own\nsentinel-owned grants for that scope's collection (spec \u00a72.5, same as\n:func:`confirm_scope`) and converts nothing \u2014 the admin re-grants\nmanually.\n\nNever all-or-nothing: every targeted scope is updated or reported\nfailed independently \u2014 ``{\"updated\": [source_scope_id, ...], \"failed\":\n[{\"source_scope_id\", \"reason\"}, ...]}``.",
+        "operationId": "set_scopes_mode_api_admin_sharepoint_connections__connection_id__scopes_bulk_patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "title": "Connection Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BulkScopeModeBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Set Scopes Mode",
+        "tags": [
+          "admin"
+        ]
+      },
       "post": {
-        "description": "Confirm many site/library/folder paths as scopes in one call \u2014 the\nfast path for splitting one large SharePoint site across several\nconnections (each with its own crawl and facts jobs, so they run in\nparallel): resolve each admin-typed ``paths`` entry to a Graph drive\nitem (:func:`connectors.sharepoint.graph_client.get_item_by_path`) and\nwrite a scope row for it, same shape :func:`confirm_scope` writes\n(``access_mode=\"manual\"``, ``include_excluded_subtrees=False`` \u2014 the\nsame defaults a single manual confirm gets; #2032 made these round-trip\nthrough list/confirm and this endpoint honours the same contract) \u2014\nminus the wizard's own group-grant step (``group_ids``), which stays a\nseparate, deliberate action on each created scope.\n\nNever all-or-nothing: every path is resolved and reported independently\nin the response, ``{\"created\": [...], \"skipped\": [...], \"failed\":\n[{\"path\", \"reason\"}]}`` \u2014\n\n* **created** \u2014 a fresh scope, collection minted (or re-adopted from a\n  matching untick tombstone, same as :func:`confirm_scope`) \u2014 UNLESS\n  ``body.collection_id``/``body.collection`` names a shared target, in\n  which case every scope this call creates routes there instead (no\n  per-path mint, no tombstone re-adoption); each entry is `{\"path\",\n  **scope}` (the same projection ``GET \u2026/scopes`` returns).\n* **skipped** \u2014 the path resolved to a ``source_scope_id`` ALREADY\n  present among this connection's scopes (the idempotency key\n  :func:`confirm_scope` itself uses) \u2014 ``{\"path\", \"source_scope_id\",\n  \"reason\": \"already_present\"}``.\n* **failed** \u2014 Graph could not resolve the path: ``{\"path\", \"reason\"}``\n  with ``reason`` one of ``\"not_found\"`` (404) or ``\"forbidden\"``\n  (403) \u2014 the same routine-permissions-fact classification\n  :func:`connectors.sharepoint.graph_client.search_folders` already\n  uses, never surfaced as a whole-request failure.\n\nAny OTHER Graph failure (401/429/5xx, a network fault) is not a\nper-path fact \u2014 it means the whole call is broken, same rule\n:func:`connectors.sharepoint.graph_client.search_folders` documents \u2014\nand aborts the remaining, unprocessed paths with a typed ``502\nsharepoint_graph_error``; whatever was already resolved and created\nbefore that point is still persisted (already-report paths are not\nrolled back by a later path's outage).\n\n``drive_id`` is required unless this connection already has at least\none scope with one set (reused from the first match) \u2014 a brand-new\nconnection with zero scopes (:func:`clone_connection`'s own starting\npoint) must supply it explicitly (``400 drive_id_required``\notherwise); a malformed one is a typed ``422`` (see\n:func:`_validate_graph_id`), same as ``POST \u2026/scopes``'s own\n``drive_id``.\n\n``collection_id``/``collection`` (mutually exclusive \u2014 ``400\nboth_collection_id_and_collection``) route every scope THIS call\ncreates to ONE shared collection instead of minting one per path \u2014 the\nfix for a large site otherwise forking across as many collections as\nthere are confirmed scopes across the split's several connections.\n``collection_id`` must name an existing, live collection\n(``404 collection_not_found`` otherwise); ``collection`` mints a new\none, by name. A path already ``skipped`` (already present) keeps\nwhatever collection it already owns \u2014 the shared target never moves an\nexisting scope.",
+        "description": "Confirm many site/library/folder paths as scopes in one call \u2014 the\nfast path for splitting one large SharePoint site across several\nconnections (each with its own crawl and facts jobs, so they run in\nparallel): resolve each admin-typed ``paths`` entry to a Graph drive\nitem (:func:`connectors.sharepoint.graph_client.get_item_by_path`) and\nwrite a scope row for it, same shape :func:`confirm_scope` writes\n(``access_mode=body.access_mode`` \u2014 ``\"manual\"`` unless the caller\npasses ``\"mirrored\"`` (2026-09 fix; every scope this call creates gets\nthe SAME mode, never a per-path choice) \u2014 and\n``include_excluded_subtrees=False``, the same default a single manual\nconfirm gets; #2032 made these round-trip through list/confirm and this\nendpoint honours the same contract) \u2014 minus the wizard's own\ngroup-grant step (``group_ids``), which stays a separate, deliberate\naction on each created scope. ``drive_id`` is always resolved before\nany scope is created (see below), so ``access_mode=\"mirrored\"`` never\nhits the ``400 missing_drive_id`` a single :func:`confirm_scope` call\ncan.\n\nNever all-or-nothing: every path is resolved and reported independently\nin the response, ``{\"created\": [...], \"skipped\": [...], \"failed\":\n[{\"path\", \"reason\"}]}`` \u2014\n\n* **created** \u2014 a fresh scope, collection minted (or re-adopted from a\n  matching untick tombstone, same as :func:`confirm_scope`) \u2014 UNLESS\n  ``body.collection_id``/``body.collection`` names a shared target, in\n  which case every scope this call creates routes there instead (no\n  per-path mint, no tombstone re-adoption); each entry is `{\"path\",\n  **scope}` (the same projection ``GET \u2026/scopes`` returns).\n* **skipped** \u2014 the path resolved to a ``source_scope_id`` ALREADY\n  present among this connection's scopes (the idempotency key\n  :func:`confirm_scope` itself uses) \u2014 ``{\"path\", \"source_scope_id\",\n  \"reason\": \"already_present\"}``.\n* **failed** \u2014 Graph could not resolve the path: ``{\"path\", \"reason\"}``\n  with ``reason`` one of ``\"not_found\"`` (404) or ``\"forbidden\"``\n  (403) \u2014 the same routine-permissions-fact classification\n  :func:`connectors.sharepoint.graph_client.search_folders` already\n  uses, never surfaced as a whole-request failure.\n\nAny OTHER Graph failure (401/429/5xx, a network fault) is not a\nper-path fact \u2014 it means the whole call is broken, same rule\n:func:`connectors.sharepoint.graph_client.search_folders` documents \u2014\nand aborts the remaining, unprocessed paths with a typed ``502\nsharepoint_graph_error``; whatever was already resolved and created\nbefore that point is still persisted (already-report paths are not\nrolled back by a later path's outage).\n\n``drive_id`` is required unless this connection already has at least\none scope with one set (reused from the first match) \u2014 a brand-new\nconnection with zero scopes (:func:`clone_connection`'s own starting\npoint) must supply it explicitly (``400 drive_id_required``\notherwise); a malformed one is a typed ``422`` (see\n:func:`_validate_graph_id`), same as ``POST \u2026/scopes``'s own\n``drive_id``.\n\n``collection_id``/``collection`` (mutually exclusive \u2014 ``400\nboth_collection_id_and_collection``) route every scope THIS call\ncreates to ONE shared collection instead of minting one per path \u2014 the\nfix for a large site otherwise forking across as many collections as\nthere are confirmed scopes across the split's several connections.\n``collection_id`` must name an existing, live collection\n(``404 collection_not_found`` otherwise); ``collection`` mints a new\none, by name. A path already ``skipped`` (already present) keeps\nwhatever collection it already owns \u2014 the shared target never moves an\nexisting scope.",
         "operationId": "bulk_add_scopes_api_admin_sharepoint_connections__connection_id__scopes_bulk_post",
         "parameters": [
           {
@@ -33925,7 +34132,7 @@
     },
     "/api/admin/sharepoint/connections/{connection_id}/splits": {
       "post": {
-        "description": "Apply a site split (see :func:`split_plan` above for the read-only\npreview this computes identically before creating anything): creates\n``body.n`` sibling connections, each named ``\"<source name> \u2014 part\ni/n\"`` (:func:`connectors.sharepoint.site_split.format_group_name`),\nwired to the same credential material as the source\n(:func:`_cloned_base_config`, the same helper ``POST \u2026/clone`` uses) and\ngiven its own slice of the source's top-level folders as confirmed\nscopes \u2014 the same scope-row shape and collection-minting call\n(:func:`_create_scope_collection`) ``POST \u2026/scopes/bulk`` uses, so a\nsplit clone looks identical to one built by hand through clone +\nbulk-add.\n\n``body.min_modified``, when given, is written onto EACH clone's\n``config.extraction.crawl.min_modified`` \u2014 the crawl does not read that\nkey yet (no admin-facing date filter has shipped for the crawl itself at\nthe time this endpoint was written), so today it is inert bookkeeping\nthat a near-term crawl change will start honoring under the same key,\nnot a promise this endpoint enforces itself. ``body.transport`` /\n``body.retry_mode`` are written onto ``config.extraction.facts`` \u2014 the\nexact keys ``PATCH \u2026/extraction/facts-config`` writes \u2014 so a split can\nhand every clone the same per-connection retry/transport policy in one\ncall instead of ``n`` follow-up PATCHes.\n\n**Idempotency**: refuses with ``409 split_exists`` BEFORE creating\nanything if a connection named like any of this split's target names\nalready exists (the exact names :func:`split_plan` would have shown) \u2014\na repeat ``POST`` never creates a second, name-colliding batch.\n\n``body.start=True`` enqueues each clone's ``corpus-extraction`` job\nimmediately after it is created, in creation order \u2014 the same job\n``POST \u2026/{id}/extract`` enqueues, skipped silently (never a 409/500 that\nwould make a split appear to have failed) when extraction readiness\n(``sharepoint.enabled`` / the ``extraction`` extra) is not currently\nsatisfied; the clones themselves are still created either way.\n\nReturns ``{\"connections\": [{id, name, folders: [{name, documents}],\ndocuments}]}`` \u2014 one entry per created clone, in the same order as\n``split_plan``'s own ``groups``.",
+        "description": "Apply a site split (see :func:`split_plan` above for the read-only\npreview this computes identically before creating anything): creates\n``body.n`` sibling connections, each named ``\"<source name> \u2014 part\ni/n\"`` (:func:`connectors.sharepoint.site_split.format_group_name`),\nwired to the same credential material as the source\n(:func:`_cloned_base_config`, the same helper ``POST \u2026/clone`` uses) and\ngiven its own slice of the source's top-level folders as confirmed\nscopes \u2014 the same scope-row shape and collection-minting call\n(:func:`_create_scope_collection`) ``POST \u2026/scopes/bulk`` uses, so a\nsplit clone looks identical to one built by hand through clone +\nbulk-add.\n``body.min_modified`` is written onto each clone's\n``config.extraction.crawl.min_modified`` \u2014 the exact key\n``PATCH \u2026/extraction/crawl-config`` writes and the crawl reads\n(``resolve_min_modified``), so every part crawls with the same age\nfilter from its first run. ``body.transport`` /\n``body.retry_mode`` are written onto ``config.extraction.facts`` \u2014 the\nexact keys ``PATCH \u2026/extraction/facts-config`` writes \u2014 so a split can\nhand every clone the same per-connection retry/transport policy in one\ncall instead of ``n`` follow-up PATCHes.\n\n**Idempotency**: refuses with ``409 split_exists`` BEFORE creating\nanything if a connection named like any of this split's target names\nalready exists (the exact names :func:`split_plan` would have shown) \u2014\na repeat ``POST`` never creates a second, name-colliding batch.\n\n``body.start=True`` enqueues each clone's ``corpus-extraction`` job\nimmediately after it is created, in creation order \u2014 the same job\n``POST \u2026/{id}/extract`` enqueues, skipped silently (never a 409/500 that\nwould make a split appear to have failed) when extraction readiness\n(``sharepoint.enabled`` / the ``extraction`` extra) is not currently\nsatisfied; the clones themselves are still created either way.\n\nReturns ``{\"connections\": [{id, name, folders: [{name, documents}],\ndocuments}]}`` \u2014 one entry per created clone, in the same order as\n``split_plan``'s own ``groups``.",
         "operationId": "apply_split_api_admin_sharepoint_connections__connection_id__splits_post",
         "parameters": [
           {

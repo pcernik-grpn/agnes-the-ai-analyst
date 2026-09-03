@@ -1757,6 +1757,78 @@ async function consolidateSpCollections(id) {
   }
 }
 
+/* "Map site group (ACL)…" — maps ONE SharePoint site group (Owners/
+   Members/Visitors, or a custom one) to one or more Agnes user_groups ids
+   in this connection's `config.acl_site_group_map`. SharePoint site groups
+   are not enumerable through the app-only Graph surface this connector
+   uses (`connectors/sharepoint/acl_sync.py::classify_permissions`), so a
+   scope granting one classifies `unhonored: site_group` and grants nobody
+   until it is mapped here — an admin picks the site group's exact
+   displayName and one or more existing Agnes group ids; that group's own
+   members are then granted directly, same as any other ordinary grant.
+
+   `PATCH .../acl-site-group-map` replaces the WHOLE map in one call, so
+   this reads the connection's CURRENT map first (`GET .../connections`
+   already loaded via `loadConnections()` — `row.config` carries it) and
+   only changes the one entry being edited, mirroring the CLI's own
+   read-modify-write (`agnes admin sharepoint acl map-site-group`). Leaving
+   the group-ids prompt blank unmaps that site group entirely. */
+async function mapSpSiteGroup(id) {
+  const siteGroup = window.prompt(
+    "Map a SharePoint site group to Agnes group(s) for ACL mirroring.\n\n" +
+      'Site group name (exact, e.g. "Members", "Owners"):',
+  );
+  if (!siteGroup || !siteGroup.trim()) return;
+  const name = siteGroup.trim();
+
+  const row = (_connections || []).find((r) => r.id === id) || {};
+  const currentMap = (row.config && row.config.acl_site_group_map) || {};
+  const currentIds = (currentMap[name] || []).join(", ");
+  const groupsRaw = window.prompt(
+    `Agnes group id(s) for site group "${name}" (comma-separated).\n` +
+      "Leave blank to remove this mapping:",
+    currentIds,
+  );
+  if (groupsRaw === null) return; // cancelled
+  const groupIds = groupsRaw
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  const mapping = { ...currentMap };
+  if (groupIds.length) {
+    mapping[name] = groupIds;
+  } else {
+    delete mapping[name];
+  }
+
+  const resultEl = document.getElementById(`ds-test-${id}`);
+  try {
+    const r = await fetch(`/api/admin/sharepoint/connections/${encodeURIComponent(id)}/acl-site-group-map`, {
+      method: "PATCH",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mapping }),
+    });
+    const body = await r.json().catch(() => ({}));
+    if (r.ok) {
+      const msg = groupIds.length
+        ? `✓ Mapped "${name}" → ${groupIds.join(", ")}.`
+        : `✓ Unmapped "${name}".`;
+      if (resultEl) { resultEl.className = "ds-conn-test-result show ok"; resultEl.textContent = msg; }
+      showToast("Site group ACL mapping saved.", true);
+      await loadConnections();
+    } else {
+      const msg = detailMessage(body, "failed to save site group mapping");
+      if (resultEl) { resultEl.className = "ds-conn-test-result show fail"; resultEl.textContent = "✗ " + msg; }
+      showToast(msg, false);
+    }
+  } catch (e) {
+    if (resultEl) { resultEl.className = "ds-conn-test-result show fail"; resultEl.textContent = "✗ Request failed"; }
+    showToast("Request failed.", false);
+  }
+}
+
 /* Saves the "Facts policy" control (`_extRenderFactsPolicy` above) via
    `PATCH .../extraction/facts-config`
    (`app/api/admin_extraction.py::patch_extraction_facts_config`). All four
@@ -4685,6 +4757,7 @@ function _sourceMenuItems(row) {
     <button type="button" class="apg-menu__item" role="menuitem" onclick="closeSourceMenu(); toggleSpSplitRow('${id}')">Split this site…</button>
     <div class="apg-menu__sep"></div>
     <button type="button" class="apg-menu__item" role="menuitem" onclick="closeSourceMenu(); consolidateSpCollections('${id}')">Consolidate collections…</button>
+    <button type="button" class="apg-menu__item" role="menuitem" onclick="closeSourceMenu(); mapSpSiteGroup('${id}')">Map site group (ACL)…</button>
     <button type="button" class="apg-menu__item" role="menuitem" onclick="closeSourceMenu(); toggleSpCertRow('${id}')">Update certificate…</button>
     <div class="apg-menu__sep"></div>
     <button type="button" class="apg-menu__item apg-menu__item--danger" role="menuitem" onclick="closeSourceMenu(); deleteConn('${id}')">Delete source</button>`;

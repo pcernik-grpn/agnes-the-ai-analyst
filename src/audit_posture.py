@@ -187,6 +187,18 @@ POSTURE: dict[str, str] = {
     # declared here as a cross-check on the handler's own log_safe call, not
     # a fallback-emitted action.
     "POST /api/admin/sharepoint/connections/{connection_id}/scopes/bulk": "sharepoint_connection.scope_bulk_add",
+    # Flips access_mode on many EXISTING scopes in one call (2026-09 fix) —
+    # handler writes its own row (log_safe) with the access_mode/requested/
+    # updated/failed counts, same posture as scope_bulk_add right above.
+    "PATCH /api/admin/sharepoint/connections/{connection_id}/scopes/bulk": (
+        "sharepoint_connection.scope_bulk_mode_set"
+    ),
+    # Replaces the whole SharePoint site-group -> Agnes-group ACL mirroring
+    # map (2026-09 fix) — handler writes its own row (log_safe) with the
+    # mapped group ids, same posture as the other admin_sharepoint writers.
+    "PATCH /api/admin/sharepoint/connections/{connection_id}/acl-site-group-map": (
+        "sharepoint_connection.acl_site_group_map_set"
+    ),
     "POST /api/admin/sharepoint/connections/{connection_id}/clone": "sharepoint_connection.clone",
     # Collection consolidation writes its own row EVERY call, dry-run
     # included (`params.dry_run` distinguishes a preview from the real

@@ -278,11 +278,56 @@ No DB migration, no startup hook, no second wiring step in `access-overview` —
 Members are added to groups by four sources, distinguished by the `source` column:
 
 - **`google_sync`** — written by the OAuth callback on every login. The previous Google-sync set is wholesale replaced (DELETE + INSERT) so a removed Workspace membership disappears immediately.
-- **`microsoft_sync`** — same DELETE + INSERT mechanism, driven by Microsoft Graph `GET /me/memberOf` instead of the Workspace Admin SDK. Config-gated and off by default; see [`auth-microsoft-oauth.md`](auth-microsoft-oauth.md#entra-group-sync-off-by-default).
+- **`microsoft_sync`** — same DELETE + INSERT mechanism, driven by Microsoft Graph `GET /me/transitiveMemberOf/microsoft.graph.group` instead of the Workspace Admin SDK. Groups are keyed `entra:<object-id>` — the SAME key the SharePoint ACL mirror uses for the same Entra group (`src.entra_identity.entra_group_name`) — and read-only through `/admin/access` (`409 microsoft_managed_readonly`). Config-gated and off by default; see [`auth-microsoft-oauth.md`](auth-microsoft-oauth.md#entra-group-sync-off-by-default).
 - **`admin`** — written by admin actions in the UI (`/admin/groups/{id}` → Members), CLI (`agnes admin group add-member …`), or REST (`POST /api/admin/groups/{id}/members`). Survives either sync. Admin can only delete admin-source rows.
 - **`system_seed`** — written at deploy time (the `SEED_ADMIN_EMAIL` → Admin-group binding) **and** at every new-user creation (the Everyone auto-grant, issue #748 — every creation path: OAuth first sign-in (any provider), `POST /auth/bootstrap`, admin `POST /api/users`, marketplace import stubs — unless `AGNES_GROUP_EVERYONE_EMAIL` maps Everyone to a Workspace group instead, in which case Everyone comes exclusively from `google_sync`). The Everyone grant fires once, at creation time, and is never re-asserted afterward — an admin who later removes a user from Everyone stays removed on their next login/boot.
 
 Removing a user from a group via the admin path (UI/CLI/REST) only deletes admin-source rows. To revoke a synced membership, the operator must change the upstream directory group instead (Workspace or Entra ID) — Agnes will pick up the change on the user's next login.
+
+---
+
+## SharePoint ACL mirroring
+
+A `sharepoint` connection's mirrored scopes (`access_mode='mirrored'`, spec
+2026-08-28-sharepoint-acl-mirroring-design.md) grant a collection's
+`resource_grants` from the source's own Graph `permission` list — the same
+primitive every other grant uses, written and reconciled by the
+`sharepoint-acl-sync` job (`connectors/sharepoint/acl_sync.py`, sentinel
+`created_by='system:sharepoint-acl-sync'`, groups keyed `entra:<oid>` /
+`sp-direct:<scope>`). `classify_permissions` decides, per Graph grantee,
+whether it is **honored** (mirrored into an Agnes group) or **unhonored**
+(counted, never granted — fail-closed):
+
+| Grantee | Honored? | Notes |
+|---|---|---|
+| Entra security/M365 group | yes | Transitive membership (`transitiveMembers`), keyed `entra:<object-id>` — the SAME key the Microsoft login-time group sync uses for the same group (`src.entra_identity.entra_group_name`), so the two writers converge on one row. |
+| Direct user role assignment | yes | Resolvable `email`/`mail`/`userPrincipalName`, matched case-insensitively. |
+| `siteUser` | yes, if resolvable | `email`/`mail`, or the claims `loginName`'s trailing segment (`i:0#.f\|membership\|user@example.com`) when they're absent. A Windows-claims login name (`i:0#.w\|domain\user`) has no email and stays unhonored (`kind: "site_user_no_email"`). |
+| SharePoint site group (Owners/Members/Visitors, custom) | only if mapped | Not enumerable through the app-only Graph surface the connector uses. `config.acl_site_group_map` (`{"<displayName>": [agnes_group_id, ...]}`) grants the mapped Agnes group(s) directly — their OWN membership is never read from Graph, so keeping it in sync with the real site group stays the admin's job. `PATCH …/connections/{id}/acl-site-group-map` (`agnes admin sharepoint acl map-site-group <id> --site-group "<name>" --group <agnes_group_id> [--unmap]`, read-modify-write so mapping a second site group never clobbers the first), or the source card's **Map site group (ACL)…** action. An unmapped one is `kind: "site_group"` in the run's `unhonored` list. |
+| Sharing link ("specific people" / "people in your org"), anonymous link, external/guest (`#EXT#`), application principal, email-less user | no | Always fail-closed, no mapping mechanism. |
+
+**Roles are not read.** Every honored principal gets read access
+regardless of the Graph role (`read`/`write`/`owner`) the permission
+carries — Agnes is a read-only consumer of SharePoint content, so there is
+no write/owner distinction to mirror.
+
+A collection shared by more than one mirrored scope or permission zone
+(a bulk-add `collection_id` target, or a post-consolidation merge) is
+reconciled ONCE per sync run against the UNION of every scope/zone that
+routes to it — never per-scope, which would let one scope's own reconcile
+pass delete another's grant. `POST …/collections/consolidate` refuses
+(`409 mirrored_scope_in_sources`) to fold away a mirrored scope's own
+collection, since consolidation unions grants onto the target and that
+would silently turn a secure-folder's grant into a whole-site one.
+
+`PATCH …/connections/{id}/scopes/bulk` (`agnes admin sharepoint scope
+set-mode <id> --all|--scope <source_scope_id> --mode manual|mirrored`)
+flips `access_mode` on many already-confirmed scopes in one call — the fast
+path for turning mirroring on across a large site split into hundreds of
+bulk-added scopes; switching a scope to `manual` deletes the sync's own
+sentinel-owned grants for its collection.
+
+Full connector setup: [`sharepoint-extraction.md`](sharepoint-extraction.md).
 
 ---
 
@@ -300,7 +345,7 @@ Accounts and access are two sections:
 A group is one object with two sides — an audience, and a bundle of what that audience can use — so it has one editor. `/admin/access` is a two-pane workspace:
 
 - **Left** — every group, with its origin (system / custom / Google-synced), member count and grant count. Search matches name, description and Workspace address. `+ New group` opens the create drawer and selects the result here.
-- **Right** — the selected group. Its header carries the name, the Workspace address it is really stored under, the origin pill, the description, the created date, and **Rename** / **Delete** (hidden for system and Google-synced rows, which the API refuses to change).
+- **Right** — the selected group. Its header carries the name, the Workspace address it is really stored under, the origin pill, the description, the created date, and **Rename** / **Delete** (hidden for system rows and any sync-managed row — Google, Microsoft, or SharePoint ACL mirroring — which the API refuses to change, each with its own `409 …_managed_readonly` code).
   - **Who it reaches** — a member count stated as its consequence, avatars, and one search box that both adds someone and answers "is Maria in this group?". **Show all N** expands the full roster with each member's source (`added by admin` / `synced from Google` / `system-managed`) and a Remove button on admin-added rows only.
   - **What it can use** — the grant matrix, by resource type, with a filter matching name, `resource_id`, block, category and description. Backed by `/api/admin/access-overview` + `/api/admin/grants`.
 

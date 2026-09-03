@@ -2573,6 +2573,7 @@ console.log(_sourceMenuItems({json.dumps(row)}));
         "Test connection",
         "Run extraction now",
         "Consolidate collections…",
+        "Map site group (ACL)…",
         "Update certificate…",
         "Delete source",
     ]
@@ -2598,6 +2599,7 @@ console.log(_sourceMenuItems({json.dumps(row)}));
         assert "openSpWizardForConnection('sp-conn-1')" in html
         assert "toggleSpCertRow('sp-conn-1')" in html
         assert "consolidateSpCollections('sp-conn-1')" in html
+        assert "mapSpSiteGroup('sp-conn-1')" in html
 
     def test_keboola_menu_is_unchanged_by_the_sharepoint_branch(self):
         html = self._run(
@@ -2616,6 +2618,109 @@ console.log(_sourceMenuItems({json.dumps(row)}));
         assert "Manage scopes…" not in html
         assert "Update certificate…" not in html
         assert "testConn('kbc-conn-1')" in html
+
+
+class TestMapSpSiteGroup:
+    """`mapSpSiteGroup(id)` (2026-09 fix) — maps ONE SharePoint site group
+    to Agnes group(s) in `config.acl_site_group_map`, read-modify-write
+    against the connection's CURRENT map (never a blind overwrite of the
+    whole thing, since the underlying `PATCH …/acl-site-group-map`
+    replaces wholesale)."""
+
+    _extract_function = staticmethod(TestSharePointSourceCardRendering._extract_function)
+
+    def _run(self, *, current_map: dict, prompts: list, ok: bool = True, resp_body: dict | None = None) -> dict:
+        import json
+        import subprocess
+        import tempfile
+        from pathlib import Path
+
+        tpl = read_admin_data_sources_source()
+        fns = "\n".join(
+            self._extract_function(tpl, sig)
+            for sig in (
+                "function detailMessage(body, fallback) {",
+                "async function mapSpSiteGroup(id) {",
+            )
+        )
+        script = f"""
+{fns}
+
+let _connections = [{{"id": "c1", "source_type": "sharepoint", "config": {{"acl_site_group_map": {json.dumps(current_map)}}}}}];
+const prompts = {json.dumps(prompts)};
+let promptCalls = [];
+global.window = {{ prompt: (msg, dflt) => {{ promptCalls.push([msg, dflt]); const v = prompts.shift(); return v === undefined ? null : v; }} }};
+let toasts = [];
+function showToast(msg, ok) {{ toasts.push([msg, ok]); }}
+let loadCalls = 0;
+async function loadConnections() {{ loadCalls++; }}
+global.document = {{ getElementById: () => null }};
+
+let fetched = null;
+global.fetch = async (url, opts) => {{
+  fetched = {{ url, opts }};
+  return {{ ok: {str(ok).lower()}, status: {200 if ok else 400}, json: async () => ({json.dumps(resp_body or {})}) }};
+}};
+
+(async () => {{
+  await mapSpSiteGroup("c1");
+  console.log(JSON.stringify({{
+    fetchedUrl: fetched && fetched.url,
+    method: fetched && fetched.opts && fetched.opts.method,
+    body: fetched && fetched.opts && fetched.opts.body ? JSON.parse(fetched.opts.body) : null,
+    promptCallCount: promptCalls.length,
+    secondPromptDefault: promptCalls.length > 1 ? promptCalls[1][1] : null,
+    loadCalls,
+    toasts,
+  }}));
+}})();
+"""
+        with tempfile.NamedTemporaryFile("w", suffix=".mjs", delete=False) as f:
+            f.write(script)
+            path = f.name
+        try:
+            proc = subprocess.run(["node", path], capture_output=True, text=True)
+        finally:
+            Path(path).unlink(missing_ok=True)
+        if proc.returncode == 127:
+            pytest.skip("node unavailable")
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        return json.loads(proc.stdout)
+
+    def test_maps_a_new_site_group_preserving_the_others(self):
+        out = self._run(current_map={"Owners": ["grp-owners"]}, prompts=["Members", "grp-members, grp-extra"])
+        assert out["fetchedUrl"] == "/api/admin/sharepoint/connections/c1/acl-site-group-map"
+        assert out["method"] == "PATCH"
+        assert out["body"] == {"mapping": {"Owners": ["grp-owners"], "Members": ["grp-members", "grp-extra"]}}
+        assert out["loadCalls"] == 1
+
+    def test_blank_group_ids_unmaps_the_entry(self):
+        out = self._run(current_map={"Owners": ["grp-owners"], "Members": ["grp-members"]}, prompts=["Members", ""])
+        assert out["body"] == {"mapping": {"Owners": ["grp-owners"]}}
+
+    def test_second_prompt_defaults_to_the_current_mapping(self):
+        out = self._run(current_map={"Members": ["grp-a", "grp-b"]}, prompts=["Members", "grp-a, grp-b"])
+        assert out["secondPromptDefault"] == "grp-a, grp-b"
+
+    def test_cancelling_the_site_group_prompt_makes_no_request(self):
+        out = self._run(current_map={}, prompts=[None])
+        assert out["fetchedUrl"] is None
+        assert out["promptCallCount"] == 1
+
+    def test_cancelling_the_group_ids_prompt_makes_no_request(self):
+        out = self._run(current_map={}, prompts=["Members", None])
+        assert out["fetchedUrl"] is None
+
+    def test_server_error_shows_a_toast_and_does_not_reload(self):
+        out = self._run(
+            current_map={},
+            prompts=["Members", "grp-a"],
+            ok=False,
+            resp_body={"detail": {"error": "invalid_group_id", "message": "unknown group"}},
+        )
+        assert out["loadCalls"] == 0
+        assert any("unknown group" in t[0] for t in out["toasts"])
+        assert all(t[1] is not True for t in out["toasts"])
 
 
 class TestManageScopesButtonOnTheCard:

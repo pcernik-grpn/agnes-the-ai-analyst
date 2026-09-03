@@ -354,6 +354,43 @@ class BulkScopeBody(BaseModel):
     drive_id: Optional[str] = None
     collection_id: Optional[str] = None
     collection: Optional[BulkScopeCollectionSpec] = None
+    # SharePoint ACL mirroring (2026-09 fix): every scope THIS call creates
+    # gets this access_mode — same ``manual``/``mirrored`` vocabulary as
+    # :attr:`ConfirmScopeBody.access_mode`. Defaults to ``manual`` (the
+    # pre-fix, only-ever-possible behavior). ``drive_id`` is ALWAYS resolved
+    # before any scope is created (explicit or inferred from an existing
+    # scope), so a ``mirrored`` bulk-add never hits the
+    # ``400 missing_drive_id`` a single :func:`confirm_scope` call can.
+    access_mode: Literal["manual", "mirrored"] = "manual"
+
+
+class BulkScopeModeBody(BaseModel):
+    """``PATCH …/scopes/bulk`` — flip ``access_mode`` on many of this
+    connection's EXISTING scopes in one call (see :func:`set_scopes_mode`).
+    Exactly one of ``source_scope_ids`` (a specific list) or ``all: true``
+    (every scope on the connection) selects the target set — ``400
+    both_source_scope_ids_and_all`` / ``400 source_scope_ids_or_all_required``
+    otherwise."""
+
+    source_scope_ids: Optional[List[str]] = None
+    all: bool = False
+    access_mode: Literal["manual", "mirrored"]
+
+
+class AclSiteGroupMapBody(BaseModel):
+    """``PATCH …/acl-site-group-map`` — the whole SharePoint SITE GROUP →
+    Agnes group(s) mapping for this connection (see
+    :func:`set_acl_site_group_map`). Replaces
+    ``config.acl_site_group_map`` wholesale (not a merge) — the admin
+    control this backs (module docstring's "Site group mapping") always
+    submits the complete map, same "PUT the whole resource" contract as
+    ``ConfirmScopeBody.group_ids``' per-collection sibling. Keys are the
+    SharePoint site group's exact ``displayName`` (as classification sees
+    it — ``connectors.sharepoint.acl_sync.classify_permissions``'
+    ``site_group_map`` parameter); values are one or more existing Agnes
+    ``user_groups.id``."""
+
+    mapping: Dict[str, List[str]] = Field(default_factory=dict)
 
 
 class CloneConnectionBody(BaseModel):
@@ -504,12 +541,16 @@ def _cloned_base_config(row: Dict[str, Any]) -> Dict[str, Any]:
 #: (:func:`add_manual_site` / :func:`remove_manual_site`) — without this the
 #: wizard forgot every one of them the moment the connection was next edited
 #: through the generic form, forcing a re-paste of the same URL.
+#: ``acl_site_group_map`` (2026-09 fix) is the sixth: the SharePoint site
+#: group -> Agnes group(s) mapping :func:`set_acl_site_group_map` writes —
+#: an admin control on the connection card, not the generic editor's form.
 SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS = (
     "scopes",
     "extraction",
     "webhook_secret",
     "retired_scope_collections",
     "manual_sites",
+    "acl_site_group_map",
 )
 
 
@@ -1855,11 +1896,17 @@ async def bulk_add_scopes(
     parallel): resolve each admin-typed ``paths`` entry to a Graph drive
     item (:func:`connectors.sharepoint.graph_client.get_item_by_path`) and
     write a scope row for it, same shape :func:`confirm_scope` writes
-    (``access_mode="manual"``, ``include_excluded_subtrees=False`` — the
-    same defaults a single manual confirm gets; #2032 made these round-trip
-    through list/confirm and this endpoint honours the same contract) —
-    minus the wizard's own group-grant step (``group_ids``), which stays a
-    separate, deliberate action on each created scope.
+    (``access_mode=body.access_mode`` — ``"manual"`` unless the caller
+    passes ``"mirrored"`` (2026-09 fix; every scope this call creates gets
+    the SAME mode, never a per-path choice) — and
+    ``include_excluded_subtrees=False``, the same default a single manual
+    confirm gets; #2032 made these round-trip through list/confirm and this
+    endpoint honours the same contract) — minus the wizard's own
+    group-grant step (``group_ids``), which stays a separate, deliberate
+    action on each created scope. ``drive_id`` is always resolved before
+    any scope is created (see below), so ``access_mode="mirrored"`` never
+    hits the ``400 missing_drive_id`` a single :func:`confirm_scope` call
+    can.
 
     Never all-or-nothing: every path is resolved and reported independently
     in the response, ``{"created": [...], "skipped": [...], "failed":
@@ -2018,7 +2065,7 @@ async def bulk_add_scopes(
                 "display_path": path,
                 "anonymize": False,
                 "collection_id": collection_id,
-                "access_mode": "manual",
+                "access_mode": body.access_mode,
                 "drive_id": drive_id,
                 "include_excluded_subtrees": False,
             }
@@ -2038,11 +2085,180 @@ async def bulk_add_scopes(
         user_id=user.get("id"),
         action="sharepoint_connection.scope_bulk_add",
         resource=f"source_connection:{connection_id}",
-        params={"requested": len(paths), "created": len(created), "skipped": len(skipped), "failed": len(failed)},
+        params={
+            "requested": len(paths),
+            "created": len(created),
+            "skipped": len(skipped),
+            "failed": len(failed),
+            "access_mode": body.access_mode,
+        },
         result="success",
     )
 
     return {"created": created, "skipped": skipped, "failed": failed}
+
+
+@router.patch("/connections/{connection_id}/scopes/bulk")
+async def set_scopes_mode(
+    connection_id: str,
+    body: BulkScopeModeBody,
+    user: dict = Depends(require_admin),
+):
+    """Flip ``access_mode`` on many of this connection's EXISTING scopes in
+    one call — the fast path for turning ACL mirroring on (or off) across a
+    site split across hundreds of bulk-added scopes, without a
+    ``POST …/scopes`` round trip per scope (2026-09 fix).
+
+    Selection: ``source_scope_ids`` (a specific list) XOR ``all: true``
+    (every scope on the connection) — ``400 both_source_scope_ids_and_all``
+    / ``400 source_scope_ids_or_all_required`` otherwise. An id in
+    ``source_scope_ids`` that does not match any of this connection's
+    scopes is reported ``{"source_scope_id", "reason": "not_found"}`` in
+    ``failed``, never a whole-request error.
+
+    Switching TO ``mirrored`` requires the scope to already carry a
+    ``drive_id`` (set at confirm time) — a scope confirmed before
+    ``drive_id`` existed, or a manual scope that never set one, is reported
+    ``{"source_scope_id", "reason": "missing_drive_id"}`` and left
+    untouched, same fail-closed posture as :func:`confirm_scope`'s own
+    ``400 missing_drive_id`` (batched here instead of aborting the whole
+    call). Switching mirrored -> manual deletes the sync's own
+    sentinel-owned grants for that scope's collection (spec §2.5, same as
+    :func:`confirm_scope`) and converts nothing — the admin re-grants
+    manually.
+
+    Never all-or-nothing: every targeted scope is updated or reported
+    failed independently — ``{"updated": [source_scope_id, ...], "failed":
+    [{"source_scope_id", "reason"}, ...]}``.
+    """
+    row = _sharepoint_connection_or_404(connection_id)
+
+    if body.source_scope_ids and body.all:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "both_source_scope_ids_and_all",
+                "message": "source_scope_ids and all are mutually exclusive — pass exactly one.",
+            },
+        )
+    if not body.source_scope_ids and not body.all:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "source_scope_ids_or_all_required",
+                "message": "pass source_scope_ids (a list) or all: true.",
+            },
+        )
+
+    scopes = _scopes(row)
+    target_ids = (
+        [s.get("source_scope_id") for s in scopes if s.get("source_scope_id")]
+        if body.all
+        else list(body.source_scope_ids or [])
+    )
+    by_id = {s.get("source_scope_id"): s for s in scopes}
+    grants = resource_grants_repo()
+
+    updated: List[str] = []
+    failed: List[Dict[str, str]] = []
+    for source_scope_id in target_ids:
+        scope = by_id.get(source_scope_id)
+        if scope is None:
+            failed.append({"source_scope_id": source_scope_id, "reason": "not_found"})
+            continue
+        if body.access_mode == "mirrored" and not scope.get("drive_id"):
+            failed.append({"source_scope_id": source_scope_id, "reason": "missing_drive_id"})
+            continue
+
+        previous_access_mode = scope.get("access_mode") or "manual"
+        scope["access_mode"] = body.access_mode
+        updated.append(source_scope_id)
+
+        if previous_access_mode == "mirrored" and body.access_mode == "manual":
+            collection_id = scope.get("collection_id")
+            if collection_id:
+                for grant in grants.list_all(resource_type=ResourceType.COLLECTION.value):
+                    if (
+                        grant.get("resource_id") == collection_id
+                        and (grant.get("assigned_by") or "") == ACL_SYNC_SENTINEL
+                    ):
+                        grants.delete(grant["id"])
+
+    if updated:
+        # See SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS's docstring above if you
+        # are adding a new key here rather than editing this one.
+        new_config = {**(row.get("config") or {}), "scopes": scopes}
+        source_connections_repo().update(connection_id, config=new_config)
+
+    log_safe(
+        user_id=user.get("id"),
+        action="sharepoint_connection.scope_bulk_mode_set",
+        resource=f"source_connection:{connection_id}",
+        params={
+            "access_mode": body.access_mode,
+            "requested": len(target_ids),
+            "updated": len(updated),
+            "failed": len(failed),
+        },
+        result="success",
+    )
+
+    return {"updated": updated, "failed": failed}
+
+
+@router.patch("/connections/{connection_id}/acl-site-group-map")
+async def set_acl_site_group_map(
+    connection_id: str,
+    body: AclSiteGroupMapBody,
+    user: dict = Depends(require_admin),
+):
+    """Replace this connection's whole SharePoint site-group -> Agnes-group
+    mapping (2026-09 fix — see
+    ``connectors.sharepoint.acl_sync.classify_permissions``'
+    ``site_group_map`` parameter).
+
+    SharePoint site groups (Owners/Members/Visitors, or a custom one) are
+    NOT enumerable through the app-only Graph surface this connector uses,
+    so ACL mirroring cannot resolve them to Agnes accounts the way it
+    resolves a direct user or an Entra security group — they classify
+    ``unhonored:site_group`` and grant nobody UNLESS an admin explicitly
+    maps the site group's exact ``displayName`` to one or more EXISTING
+    Agnes groups here. A mapped site group's OWN membership is never read
+    from Graph — every principal already in ``mapping``'s Agnes group(s) is
+    granted directly, same as any other ordinary grant; keeping that
+    group's membership in sync with the real SharePoint site group stays
+    the admin's job (an Entra-security-group site membership is the
+    honored-without-mapping path, above).
+
+    Every group id in ``mapping`` must already exist (``400
+    invalid_group_id``, naming the unknown ids). Wholesale replace, not a
+    merge — pass the complete map every time; an admin removing the last
+    mapping for a site group passes ``{}`` for that key or omits it
+    entirely (both mean "unmapped").
+    """
+    row = _sharepoint_connection_or_404(connection_id)
+
+    all_group_ids = sorted({gid for ids in body.mapping.values() for gid in ids})
+    if all_group_ids:
+        groups_repo = user_groups_repo()
+        unknown = [gid for gid in all_group_ids if groups_repo.get(gid) is None]
+        if unknown:
+            raise HTTPException(status_code=400, detail={"error": "invalid_group_id", "group_ids": unknown})
+
+    # See SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS's docstring above if you are
+    # adding a new key here rather than editing this one.
+    new_config = {**(row.get("config") or {}), "acl_site_group_map": body.mapping}
+    source_connections_repo().update(connection_id, config=new_config)
+
+    log_safe(
+        user_id=user.get("id"),
+        action="sharepoint_connection.acl_site_group_map_set",
+        resource=f"source_connection:{connection_id}",
+        params={"site_groups": len(body.mapping), "group_ids": all_group_ids},
+        result="success",
+    )
+
+    return {"acl_site_group_map": body.mapping}
 
 
 @router.post("/connections/{connection_id}/clone", status_code=201)
@@ -2198,6 +2414,20 @@ async def consolidate_collections(
     those, only scope-level collections. A zone routed to a now-consolidated
     collection needs the ``sharepoint-acl-sync``/``sharepoint-subtree-sweep``
     jobs' own reconciliation to catch up.
+
+    ``409 mirrored_scope_in_sources`` (nothing touched) when any SOURCE
+    collection is routed to by an ``access_mode='mirrored'`` scope
+    (2026-09 fix): consolidation unions every source collection's grants
+    onto the target (see above), which would turn a secure-folder's
+    sentinel-owned ``entra:<oid>`` grant into a whole-site grant the moment
+    it lands on a collection shared with other, differently-scoped folders
+    — until there is an audience-zone design that can express "this
+    principal only for this sub-scope" on a SHARED collection, folding a
+    mirrored scope's collection away is refused outright rather than
+    silently widening its access. Surfaced in the dry-run response too
+    (``mirrored_sources``) so an admin sees the blocker before attempting
+    the real merge, same posture as the ``blocking`` (foreign-connection)
+    list above.
     """
     row = _sharepoint_connection_or_404(connection_id)
 
@@ -2254,6 +2484,11 @@ async def consolidate_collections(
         for cid in prospective_sources
         if (foreign_id := _foreign_connection_referencing(cid, this_connection_id=connection_id)) is not None
     ]
+    mirrored_sources = [
+        {"collection_id": s["collection_id"], "source_scope_id": s.get("source_scope_id")}
+        for s in _scopes(row)
+        if s.get("collection_id") in prospective_sources and s.get("access_mode") == "mirrored"
+    ]
 
     if body.dry_run:
         log_safe(
@@ -2268,12 +2503,19 @@ async def consolidate_collections(
             "target": target_ref,
             "sources": sources_out,
             "blocking": blocking,
+            "mirrored_sources": mirrored_sources,
         }
 
     if blocking:
         raise HTTPException(
             status_code=409,
             detail={"error": "collection_referenced_by_other_connection", "blocking": blocking},
+        )
+
+    if mirrored_sources:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "mirrored_scope_in_sources", "mirrored_sources": mirrored_sources},
         )
 
     # Committing for real: mint the named target NOW (never during a dry

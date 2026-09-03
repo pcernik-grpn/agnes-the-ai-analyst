@@ -54,8 +54,23 @@ libraries / folders). Per scope, two decisions that matter later:
 
 - **anonymize** — this scope's documents are pseudonymized BEFORE anything
   is stored, fail-closed ([`anonymization.md`](anonymization.md)).
-- **access mode** — mirrored ACLs vs. open ([`RBAC.md`](RBAC.md) and the
-  permission-zone notes in [`architecture.md`](architecture.md)).
+- **access mode** — mirrored ACLs vs. open ([`RBAC.md`](RBAC.md) → "SharePoint
+  ACL mirroring" for exactly what a mirrored scope honors, and the
+  permission-zone notes in [`architecture.md`](architecture.md)). Mirroring
+  honors WHO has access, never WHAT they may do with it: Agnes is a
+  read-only consumer of SharePoint content, so a Graph role (`read`/`write`/
+  `owner`) is never read — every honored principal simply gets read access.
+  Flip `access_mode` on many already-confirmed scopes at once with
+  `agnes admin sharepoint scope set-mode <id> --all|--scope <source_scope_id>
+  --mode manual|mirrored` — the fast path for turning mirroring on across a
+  large site split into hundreds of bulk-added scopes.
+- **site groups** (Owners/Members/Visitors, or a custom one) are not
+  enumerable through the app-only Graph surface the connector uses, so a
+  mirrored scope granting one honors nobody by default — map it to one or
+  more existing Agnes groups with `agnes admin sharepoint acl
+  map-site-group <id> --site-group "<name>" --group <agnes_group_id>` (or the
+  source card's **Map site group (ACL)…** action), see
+  [`RBAC.md`](RBAC.md) → "SharePoint ACL mirroring".
 
 ## 3. Sanity-check the anonymization on YOUR documents
 

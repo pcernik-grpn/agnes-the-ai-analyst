@@ -336,3 +336,100 @@ class TestConsolidateCollectionsRoute:
         assert r.status_code == 409, r.text
         assert r.json()["detail"]["error"] == "consolidation_conflict"
         assert r.json()["detail"]["kind"] == "corpus_files.path"
+
+
+def _mirrored_scope(*, source_scope_id: str, collection_id: str, display_path: str) -> dict:
+    return {
+        **_scope(source_scope_id=source_scope_id, collection_id=collection_id, display_path=display_path),
+        "access_mode": "mirrored",
+    }
+
+
+class TestConsolidateRefusesMirroredSources:
+    """2026-09 fix: consolidation unions every source collection's grants
+    onto the target, which would silently widen a secure-folder's
+    sentinel-owned grant into a whole-site grant — refused outright until
+    an audience-zone design exists."""
+
+    def test_real_merge_refuses_when_a_source_scope_is_mirrored(self, tmp_path, monkeypatch, pg_engine):
+        client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+        conn_id = _create_connection(client, token, name="consolidate-mirrored")
+        _seed_collection(pg_engine, "col_a", "Scope A")
+        _seed_collection(pg_engine, "col_secure", "Secure Folder")
+        _set_scopes(
+            conn_id,
+            [
+                _scope(source_scope_id="s-a", collection_id="col_a", display_path="A"),
+                _mirrored_scope(source_scope_id="s-secure", collection_id="col_secure", display_path="Secure"),
+            ],
+        )
+
+        r = client.post(
+            f"{BASE}/{conn_id}/collections/consolidate",
+            json={"target": {"name": "One Big Site (mirrored)"}, "dry_run": False},
+            headers=_auth(token),
+        )
+        assert r.status_code == 409, r.text
+        body = r.json()["detail"]
+        assert body["error"] == "mirrored_scope_in_sources"
+        assert body["mirrored_sources"] == [{"collection_id": "col_secure", "source_scope_id": "s-secure"}]
+
+        # Nothing moved, nothing minted.
+        with pg_engine.connect() as conn:
+            deleted_at = conn.execute(sa.text("SELECT deleted_at FROM file_corpora WHERE id = 'col_secure'")).scalar()
+        assert deleted_at is None
+
+        from src.repositories import file_corpora_repo
+
+        assert file_corpora_repo().list(search="One Big Site (mirrored)") == []
+
+    def test_dry_run_surfaces_mirrored_sources_without_refusing(self, tmp_path, monkeypatch, pg_engine):
+        client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+        conn_id = _create_connection(client, token, name="consolidate-mirrored-dry")
+        _seed_collection(pg_engine, "col_a", "Scope A")
+        _seed_collection(pg_engine, "col_secure", "Secure Folder")
+        _set_scopes(
+            conn_id,
+            [
+                _scope(source_scope_id="s-a", collection_id="col_a", display_path="A"),
+                _mirrored_scope(source_scope_id="s-secure", collection_id="col_secure", display_path="Secure"),
+            ],
+        )
+
+        r = client.post(
+            f"{BASE}/{conn_id}/collections/consolidate",
+            json={"target": {"name": "Dry Run Mirrored"}},
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["dry_run"] is True
+        assert body["mirrored_sources"] == [{"collection_id": "col_secure", "source_scope_id": "s-secure"}]
+
+    def test_target_itself_being_mirrored_is_not_refused(self, tmp_path, monkeypatch, pg_engine):
+        """Only SOURCE collections are checked — folding an ordinary manual
+        scope's collection INTO a target that happens to be mirrored is a
+        different (currently unguarded) shape this fix does not touch."""
+        client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+        conn_id = _create_connection(client, token, name="consolidate-mirrored-target")
+        _seed_collection(pg_engine, "col_a", "Scope A")
+        _seed_collection(pg_engine, "col_mirrored_target", "Mirrored Target")
+        _set_scopes(
+            conn_id,
+            [
+                _scope(source_scope_id="s-a", collection_id="col_a", display_path="A"),
+                _mirrored_scope(source_scope_id="s-target", collection_id="col_mirrored_target", display_path="Target"),
+            ],
+        )
+
+        r = client.post(
+            f"{BASE}/{conn_id}/collections/consolidate",
+            json={"target_collection_id": "col_mirrored_target", "dry_run": False},
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["scopes_repointed"] == 1
+
+        with pg_engine.connect() as conn:
+            deleted_at = conn.execute(sa.text("SELECT deleted_at FROM file_corpora WHERE id = 'col_a'")).scalar()
+        assert deleted_at is not None

@@ -1068,3 +1068,261 @@ class TestRetryEmpty:
         with patch("cli.commands.admin_sharepoint.api_post", return_value=_resp(404, {"detail": "not found"})):
             result = runner.invoke(app, ["admin", "sharepoint", "retry-empty", "does-not-exist"])
         assert result.exit_code == 1
+
+
+class TestScopeSetMode:
+    """`agnes admin sharepoint scope set-mode` — CLI counterpart to
+    `PATCH /api/admin/sharepoint/connections/{connection_id}/scopes/bulk`."""
+
+    def test_all_flag_sends_all_true(self):
+        body = {"updated": ["s1", "s2"], "failed": []}
+        with patch("cli.commands.admin_sharepoint.api_patch", return_value=_resp(200, body)) as mock_patch:
+            result = runner.invoke(
+                app, ["admin", "sharepoint", "scope", "set-mode", "conn1", "--all", "--mode", "mirrored"]
+            )
+        assert result.exit_code == 0, result.output
+        assert "Updated 2 scope(s) to mirrored, failed 0" in result.output
+        args, kwargs = mock_patch.call_args
+        assert args[0] == "/api/admin/sharepoint/connections/conn1/scopes/bulk"
+        assert kwargs["json"] == {"access_mode": "mirrored", "all": True}
+
+    def test_repeated_scope_flags_send_source_scope_ids(self):
+        body = {"updated": ["s1"], "failed": []}
+        with patch("cli.commands.admin_sharepoint.api_patch", return_value=_resp(200, body)) as mock_patch:
+            result = runner.invoke(
+                app,
+                [
+                    "admin",
+                    "sharepoint",
+                    "scope",
+                    "set-mode",
+                    "conn1",
+                    "--scope",
+                    "s1",
+                    "--scope",
+                    "s2",
+                    "--mode",
+                    "manual",
+                ],
+            )
+        assert result.exit_code == 0, result.output
+        _, kwargs = mock_patch.call_args
+        assert kwargs["json"] == {"access_mode": "manual", "source_scope_ids": ["s1", "s2"]}
+
+    def test_both_scope_and_all_is_a_usage_error(self):
+        result = runner.invoke(
+            app,
+            ["admin", "sharepoint", "scope", "set-mode", "conn1", "--scope", "s1", "--all", "--mode", "manual"],
+        )
+        assert result.exit_code == 1
+        assert "mutually exclusive" in result.output
+
+    def test_neither_scope_nor_all_is_a_usage_error(self):
+        result = runner.invoke(app, ["admin", "sharepoint", "scope", "set-mode", "conn1", "--mode", "manual"])
+        assert result.exit_code == 1
+        assert "--scope" in result.output and "--all" in result.output
+
+    def test_invalid_mode_is_a_usage_error(self):
+        result = runner.invoke(
+            app, ["admin", "sharepoint", "scope", "set-mode", "conn1", "--all", "--mode", "sometimes"]
+        )
+        assert result.exit_code == 1
+        assert "manual or mirrored" in result.output
+
+    def test_json_output(self):
+        body = {"updated": ["s1"], "failed": [{"source_scope_id": "s2", "reason": "missing_drive_id"}]}
+        with patch("cli.commands.admin_sharepoint.api_patch", return_value=_resp(200, body)):
+            result = runner.invoke(
+                app, ["admin", "sharepoint", "scope", "set-mode", "conn1", "--all", "--mode", "mirrored", "--json"]
+            )
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.output) == body
+
+    def test_failed_entries_are_printed(self):
+        body = {"updated": [], "failed": [{"source_scope_id": "s1", "reason": "missing_drive_id"}]}
+        with patch("cli.commands.admin_sharepoint.api_patch", return_value=_resp(200, body)):
+            result = runner.invoke(
+                app, ["admin", "sharepoint", "scope", "set-mode", "conn1", "--all", "--mode", "mirrored"]
+            )
+        assert result.exit_code == 0, result.output
+        assert "s1" in result.output and "missing_drive_id" in result.output
+
+    def test_a_400_is_reported(self):
+        detail = {"error": "both_source_scope_ids_and_all", "message": "pick one"}
+        with patch("cli.commands.admin_sharepoint.api_patch", return_value=_resp(400, {"detail": detail})):
+            result = runner.invoke(
+                app, ["admin", "sharepoint", "scope", "set-mode", "conn1", "--all", "--mode", "manual"]
+            )
+        assert result.exit_code == 1
+        assert "pick one" in result.output
+
+
+class TestAclMapSiteGroup:
+    """`agnes admin sharepoint acl map-site-group` — CLI counterpart to
+    `PATCH /api/admin/sharepoint/connections/{connection_id}/acl-site-group-map`.
+    Read-modify-write: reads the connection's current map via `api_get`
+    before PATCHing the merged whole."""
+
+    def test_maps_a_site_group_preserving_other_entries(self):
+        current = {"config": {"acl_site_group_map": {"Owners": ["grp-owners"]}}}
+        result_body = {"acl_site_group_map": {"Owners": ["grp-owners"], "Members": ["grp-members"]}}
+        with (
+            patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(200, current)),
+            patch("cli.commands.admin_sharepoint.api_patch", return_value=_resp(200, result_body)) as mock_patch,
+        ):
+            result = runner.invoke(
+                app,
+                [
+                    "admin",
+                    "sharepoint",
+                    "acl",
+                    "map-site-group",
+                    "conn1",
+                    "--site-group",
+                    "Members",
+                    "--group",
+                    "grp-members",
+                ],
+            )
+        assert result.exit_code == 0, result.output
+        assert "Members" in result.output and "grp-members" in result.output
+        args, kwargs = mock_patch.call_args
+        assert args[0] == "/api/admin/sharepoint/connections/conn1/acl-site-group-map"
+        assert kwargs["json"] == {"mapping": {"Owners": ["grp-owners"], "Members": ["grp-members"]}}
+
+    def test_multiple_groups_repeatable(self):
+        current = {"config": {}}
+        with (
+            patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(200, current)),
+            patch("cli.commands.admin_sharepoint.api_patch", return_value=_resp(200, {})) as mock_patch,
+        ):
+            result = runner.invoke(
+                app,
+                [
+                    "admin",
+                    "sharepoint",
+                    "acl",
+                    "map-site-group",
+                    "conn1",
+                    "--site-group",
+                    "Members",
+                    "--group",
+                    "grp-a",
+                    "--group",
+                    "grp-b",
+                ],
+            )
+        assert result.exit_code == 0, result.output
+        _, kwargs = mock_patch.call_args
+        assert kwargs["json"] == {"mapping": {"Members": ["grp-a", "grp-b"]}}
+
+    def test_unmap_removes_the_entry(self):
+        current = {"config": {"acl_site_group_map": {"Owners": ["grp-owners"], "Members": ["grp-members"]}}}
+        with (
+            patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(200, current)),
+            patch("cli.commands.admin_sharepoint.api_patch", return_value=_resp(200, {})) as mock_patch,
+        ):
+            result = runner.invoke(
+                app,
+                ["admin", "sharepoint", "acl", "map-site-group", "conn1", "--site-group", "Members", "--unmap"],
+            )
+        assert result.exit_code == 0, result.output
+        assert "Unmapped" in result.output
+        _, kwargs = mock_patch.call_args
+        assert kwargs["json"] == {"mapping": {"Owners": ["grp-owners"]}}
+
+    def test_group_and_unmap_together_is_a_usage_error(self):
+        result = runner.invoke(
+            app,
+            [
+                "admin",
+                "sharepoint",
+                "acl",
+                "map-site-group",
+                "conn1",
+                "--site-group",
+                "Members",
+                "--group",
+                "grp-a",
+                "--unmap",
+            ],
+        )
+        assert result.exit_code == 1
+        assert "mutually exclusive" in result.output
+
+    def test_neither_group_nor_unmap_is_a_usage_error(self):
+        result = runner.invoke(
+            app, ["admin", "sharepoint", "acl", "map-site-group", "conn1", "--site-group", "Members"]
+        )
+        assert result.exit_code == 1
+        assert "--group" in result.output and "--unmap" in result.output
+
+    def test_json_output(self):
+        current = {"config": {}}
+        result_body = {"acl_site_group_map": {"Members": ["grp-a"]}}
+        with (
+            patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(200, current)),
+            patch("cli.commands.admin_sharepoint.api_patch", return_value=_resp(200, result_body)),
+        ):
+            result = runner.invoke(
+                app,
+                [
+                    "admin",
+                    "sharepoint",
+                    "acl",
+                    "map-site-group",
+                    "conn1",
+                    "--site-group",
+                    "Members",
+                    "--group",
+                    "grp-a",
+                    "--json",
+                ],
+            )
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.output) == result_body
+
+    def test_a_400_from_the_patch_is_reported(self):
+        current = {"config": {}}
+        detail = {"error": "invalid_group_id", "group_ids": ["ghost"]}
+        with (
+            patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(200, current)),
+            patch("cli.commands.admin_sharepoint.api_patch", return_value=_resp(400, {"detail": detail})),
+        ):
+            result = runner.invoke(
+                app,
+                [
+                    "admin",
+                    "sharepoint",
+                    "acl",
+                    "map-site-group",
+                    "conn1",
+                    "--site-group",
+                    "Members",
+                    "--group",
+                    "ghost",
+                ],
+            )
+        assert result.exit_code == 1
+        assert "invalid_group_id" in result.output
+
+    def test_a_404_from_the_get_is_reported(self):
+        with patch(
+            "cli.commands.admin_sharepoint.api_get", return_value=_resp(404, {"detail": "connection_not_found"})
+        ):
+            result = runner.invoke(
+                app,
+                [
+                    "admin",
+                    "sharepoint",
+                    "acl",
+                    "map-site-group",
+                    "does-not-exist",
+                    "--site-group",
+                    "Members",
+                    "--group",
+                    "grp-a",
+                ],
+            )
+        assert result.exit_code == 1
+        assert "connection_not_found" in result.output
