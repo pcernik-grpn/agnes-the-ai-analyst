@@ -599,6 +599,43 @@ function nextNightlySync() {
   if (next <= now) next.setUTCDate(next.getUTCDate() + 1);
   return window.AgnesTime.formatDateTime(next.toISOString()) || next.toISOString();
 }
+// The sync schedule, read once for every surface that states it. Two modals
+// ask different questions of the same facts — Details answers "why does this
+// look stale", Edit answers "can I change how this is fetched" — and #1956
+// item 15 anchors its complaint on Edit ("Marketplaces > Edit covers
+// name/URL/branch/pin/curator/token, but the sync cadence is neither shown
+// nor configurable"). Composing the sentence is each surface's own business;
+// the two DISCRIMINATORS are shared, because those are what would drift:
+//
+//   * is_builtin — a bundled marketplace never enters either sync path.
+//     `sync_marketplace` opens with `if spec.get("is_builtin"): raise
+//     MarketplaceNotSyncable`, and the row renders no "Sync now" for it, so
+//     promising it a nightly run describes something the server refuses.
+//   * last_error — `last_synced_at` is stamped on FAILURE too: both error
+//     branches in `src/marketplace.py` call `update_sync_status(...,
+//     synced_at=now, error=str(e))`. The timestamp alone therefore means
+//     "last ATTEMPTED", and calling it "Last synced" tells an admin a failed
+//     refresh worked. last_error is what separates the two — set on failure,
+//     cleared when a commit_sha arrives clean.
+//
+// `status` and `next` come back already escaped, for innerHTML; `cadence` is
+// a literal, for a field value.
+function syncScheduleFacts(m) {
+  if (m && m.is_builtin) {
+    return { syncable: false, cadence: "None — bundled content", next: null, status: "" };
+  }
+  const status = !m || !m.last_synced_at
+    ? "Never synced yet."
+    : m.last_error
+    ? `Last attempt ${esc(fmtDate(m.last_synced_at))} failed: ${esc(m.last_error)}.`
+    : `Last synced ${esc(fmtDate(m.last_synced_at))}.`;
+  return {
+    syncable: true,
+    cadence: "Daily at 03:00 UTC",
+    next: esc(nextNightlySync()),
+    status: status,
+  };
+}
 // v87: full 40-char SHA pins render short like a commit hash; tag names
 // render in full since they're already short and human-readable.
 function shortRef(r) { return /^[0-9a-f]{40}$/i.test(r || "") ? r.slice(0, 7) : r; }
@@ -802,35 +839,16 @@ async function openDetails(id, name) {
   const sub = document.getElementById("details-sub");
   sub.innerHTML = `<code>${esc(id)}</code>${m && m.url ? ` · <span class="mp-url" title="${esc(m.url)}">${esc(m.url)}</span>` : ""}`;
   // One instance-wide schedule, stated as such — there is no per-marketplace
-  // cadence to imply by putting a different number on each row.
-  //
-  // Two branches, both mirroring the row cell above rather than inventing a
-  // second vocabulary for the same facts:
-  //
-  //   * A BUNDLED marketplace never enters either sync path —
-  //     `sync_marketplace` opens with `if spec.get("is_builtin"): raise
-  //     MarketplaceNotSyncable`. Promising it a nightly run and pointing at a
-  //     "Sync now" the row does not offer describes something the server
-  //     refuses.
-  //   * `last_synced_at` is stamped on FAILURE too: both error branches in
-  //     `src/marketplace.py` call `update_sync_status(..., synced_at=now,
-  //     error=str(e))`. So the timestamp alone means "last attempted", and
-  //     calling it "Last synced" tells an admin a failed refresh worked.
-  //     `last_error` is the discriminator — set on failure, cleared when a
-  //     commit_sha arrives clean.
+  // cadence to imply by putting a different number on each row. The branching
+  // (bundled? failed attempt?) lives in syncScheduleFacts, shared with the
+  // Edit modal so the two surfaces cannot drift apart; the wording below is
+  // this surface's own.
   const syncEl = document.getElementById("details-sync");
-  if (m && m.is_builtin) {
-    syncEl.innerHTML = `<b>Sync</b> — none. Bundled content ships with Agnes and is re-seeded on boot; there is no git remote to pull from.`;
-  } else {
-    const when = !m || !m.last_synced_at
-      ? ". Never synced yet."
-      : m.last_error
-      ? `. Last attempt ${esc(fmtDate(m.last_synced_at))} failed: ${esc(m.last_error)}.`
-      : `. Last synced ${esc(fmtDate(m.last_synced_at))}.`;
-    syncEl.innerHTML = `<b>Sync</b> — every night at 03:00 UTC (next: ${esc(nextNightlySync())})`
-      + when
-      + ` Use <b>Sync now</b> on the marketplace row to pull immediately.`;
-  }
+  const facts = syncScheduleFacts(m);
+  syncEl.innerHTML = facts.syncable
+    ? `<b>Sync</b> — every night at 03:00 UTC (next: ${facts.next}). ${facts.status}`
+      + ` Use <b>Sync now</b> on the marketplace row to pull immediately.`
+    : `<b>Sync</b> — none. Bundled content ships with Agnes and is re-seeded on boot; there is no git remote to pull from.`;
 
   const body = document.getElementById("details-body");
   body.innerHTML = `<div class="empty">Loading plugins…</div>`;

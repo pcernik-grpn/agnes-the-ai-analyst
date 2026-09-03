@@ -445,40 +445,51 @@ def test_admin_table_shows_no_sync_state_for_builtin_rows():
     )
 
 
-def test_details_panel_branches_on_is_builtin_before_promising_a_schedule():
-    """The details panel is the sibling surface of the table row above, and it
-    must not describe a sync the server refuses. `sync_marketplace` opens with
-    `if spec.get("is_builtin"): raise MarketplaceNotSyncable`, so a bundled
-    marketplace enters neither sync path — promising it a nightly run, and
-    pointing at a `Sync now` the row does not render for it, describes
+def _sync_schedule_helper() -> str:
+    """The body of `syncScheduleFacts`, the single place both the Details and
+    the Edit modal read the sync facts from."""
+    template = Path("app/web/templates/admin_marketplaces.html").read_text(encoding="utf-8")
+    return template.split("function syncScheduleFacts(m)")[1].split("\n}")[0]
+
+
+def test_sync_facts_branch_on_is_builtin_before_promising_a_schedule():
+    """Neither modal may describe a sync the server refuses. `sync_marketplace`
+    opens with `if spec.get("is_builtin"): raise MarketplaceNotSyncable`, so a
+    bundled marketplace enters neither sync path — promising it a nightly run,
+    and pointing at a `Sync now` the row does not render for it, describes
     something that cannot happen.
 
+    The branch moved out of openDetails into the shared helper when the Edit
+    modal grew the same field (#1956 item 15); pinning it here rather than in
+    one caller is the point — a second surface must not be able to state the
+    schedule without going through this decision.
+
     Source inspection, like its row-cell sibling above: this pins that the
-    branch EXISTS and reaches the schedule sentence, not what the rendered
-    string looks like."""
-    template = Path("app/web/templates/admin_marketplaces.html").read_text(encoding="utf-8")
-    details_js = template.split('const syncEl = document.getElementById("details-sync")')[1]
-    branch = details_js.split("syncEl.innerHTML")[0]
-    assert "is_builtin" in branch, (
-        "openDetails must branch on m.is_builtin before it states the nightly "
-        "schedule — a bundled marketplace never enters the sync path"
+    branch EXISTS, not what the rendered string looks like."""
+    helper = _sync_schedule_helper()
+    assert "is_builtin" in helper, (
+        "syncScheduleFacts must branch on m.is_builtin before it reports a "
+        "cadence — a bundled marketplace never enters the sync path"
+    )
+    assert "syncable" in helper, (
+        "the bundled branch must be reported to callers as a flag they have "
+        "to consult, not left for each surface to re-derive"
     )
 
 
-def test_details_panel_calls_a_failed_attempt_an_attempt():
+def test_sync_facts_call_a_failed_attempt_an_attempt():
     """`last_synced_at` is stamped on FAILURE as well as success: both error
     branches in `src/marketplace.py` call `update_sync_status(..., synced_at=
     now, error=str(e))`. So the timestamp alone means "last attempted", and
     labelling it "Last synced" tells an admin a failed refresh worked.
     `last_error` is what separates the two — set on failure, cleared when a
     commit_sha arrives clean — and the table row already reads it."""
-    template = Path("app/web/templates/admin_marketplaces.html").read_text(encoding="utf-8")
-    details_js = template.split('const syncEl = document.getElementById("details-sync")')[1].split("const body")[0]
-    assert "last_error" in details_js, (
-        "openDetails must consult m.last_error before calling the timestamp "
-        "'Last synced' — it is stamped on failed attempts too"
+    helper = _sync_schedule_helper()
+    assert "last_error" in helper, (
+        "syncScheduleFacts must consult m.last_error before calling the "
+        "timestamp 'Last synced' — it is stamped on failed attempts too"
     )
-    assert "Last synced" in details_js and "Last attempt" in details_js, (
+    assert "Last synced" in helper and "Last attempt" in helper, (
         "both wordings must exist: a success says 'Last synced', a failure "
         "says 'Last attempt ... failed'"
     )
