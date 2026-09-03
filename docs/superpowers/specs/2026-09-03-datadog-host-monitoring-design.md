@@ -121,7 +121,7 @@ managed databases outside the VM.
 | `directory` | four instances tagged `agnes_probe:<state_applier\|auto_upgrade\|backup\|watchdog>` | heartbeat ages, newest backup age, watchdog markers. The backup instance is recursive with `pattern: '*/STATUS'`, because the daily backup writes dated SUBDIRECTORIES: a flat walk finds no file at all, and a bare `STATUS` matches nothing either — the check fnmatches the full path and the path relative to `directory`, never the basename |
 | `http_check` | `agnes_readyz` (200), `agnes_health_body` (`content_match` on `"status": "ok"`), `agnes_acme_http` (port-80 redirect) | app readiness, health body, ACME HTTP-01 reachability. The templates take a ready-made `base_url` / `acme_hosts` / `hosts` rather than `domain` + `tls_mode`: the "does this VM terminate TLS" policy stays in HCL and the templates stay dumb renderers |
 | `tls` | one instance per public hostname (domain + alias) | certificate expiry, incl. the alias whose ACME account has no contact e-mail |
-| `postgres` | Autodiscovery on `postgres` images, `dbm: false` | `postgres.can_connect`, connections vs `max_connections`, database size, XID wraparound |
+| `postgres` | Autodiscovery on `postgres` images, `dbm: false`, instance tags carry `env:` + the VM's tag list (trap #15 below) | `postgres.can_connect`, connections vs `max_connections`, database size, XID wraparound |
 
 ## Consumer-side catalogue (customer-agnostic module `datadog-monitors`)
 
@@ -162,6 +162,17 @@ as `container.memory.oom_events`; service-check monitors take `notify_no_data`, 
 `postgres.can_connect` (not `postgresql.can_connect`); synthetics `retry.interval` is in
 milliseconds, max 5000.
 
+The three pg rows carry one extra rule (trap #15 below): their `S` scope only
+matches once the module renders `env` into the check's instance tags — i.e. on
+a VM created or recreated from a module version AFTER `infra-v1.31.0`. On
+`infra-v1.31.0` itself the pg series carry no `env` (or any other host tag) at
+all; the interim scope is `compose_project:agnes AND compose_service:<svc>`,
+correct while the org holds a single Agnes deployment and colliding the day a
+second one joins — every deployment's compose project is `agnes`, from
+`/opt/agnes`. And on pg series, group by `compose_service`, never by `host`:
+their `host` is the side-car's container IP, unstable across recreates and
+identical between deployments.
+
 Dashboard groups: status (monitor summary + check-status tiles), host, disks, containers,
 Postgres side-cars, edge (HTTP response time, TLS days left), ops jobs and watchdog.
 
@@ -187,7 +198,7 @@ Postgres side-cars, edge (HTTP response time, TLS days left), ops jobs and watch
 
 ## Implementation notes (2026-09-03)
 
-Four things the implementation settled differently from the design above, each
+Six things the implementation settled differently from the design above, each
 verified rather than assumed:
 
 - **No `setfacl`, and nothing else touches a shared directory's mode either.**
@@ -229,3 +240,31 @@ The template renderer the new tests use (`tests/_tf_template.py`) reproduces
 startup script, including the `~}` trim rule — it eats the following spaces and
 tabs plus at most one newline, not the whole whitespace run. That is what lets
 those tests assert on what actually boots rather than on template source text.
+
+## Live-deployment findings (2026-09-03)
+
+From the first real deployment (agent 7.82.3, postgres check 23.10.0), verified
+against the live org rather than assumed:
+
+- **Trap #15 — the postgres check attributes its series to the DB host it
+  resolves, not to the agent host.** Under Autodiscovery that resolved host is
+  the side-car's container IP: every `postgresql.*` metric and
+  `postgres.can_connect` lands under `host:<container-ip>` (`datadog-agent
+  check postgres` prints it as `resolved_hostname`), a phantom host nothing
+  else reports for. Host-level tags — the agent's `env:` key and its `tags:`
+  list — join a HOST at query time, so they never reach a phantom-IP host, and
+  every `S`-scoped pg row in the catalogue above was permanent no-data; only
+  the Autodiscovery container tags (`compose_service`, `compose_project`)
+  survived. The fix renders `env:<project-id>` plus the VM's own tag list into
+  the check's INSTANCE tags — Terraform-side, from the same `datadog_tags`
+  local `datadog.yaml` uses, while the on-host role script keeps substituting
+  only the password — because instance tags ride on every series and service
+  check the instance emits, regardless of hostname attribution. Rejected:
+  `reported_hostname: $(hostname -f)` would fold the series onto the agent
+  host (host tags then apply), but it silently mints ANOTHER phantom host on
+  any divergence from the agent's canonical hostname, folds both side-cars'
+  `host` dimension into one, and its value exists only at boot time where no
+  plan-time test can pin it. Residue to keep in mind: the pg series' `host`
+  stays the container IP, so `compose_service` is the side-car identity and
+  `env` the deployment identity — never `host` (see the catalogue's scoping
+  note).
