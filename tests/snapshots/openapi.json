@@ -63672,6 +63672,83 @@
         ]
       }
     },
+    "/library/facets/{facet}": {
+      "get": {
+        "description": "\"Search facets\" typeahead for one entity facet (client / industry /\noffering / document type) \u2014 the way to reach a value past the index's\nown top-`_LIBRARY_ENTITY_FACET_LIMIT` menu (round 3 of the 2026-09-03\nincident) without ever inlining the full vocabulary. Bounded, ranked by\ndocument count exactly like the menu itself, through the SAME\n`facet_top_values_for_collections` query.\n\nRBAC: the same boundary `/library` itself uses \u2014 every value returned is\nscoped to collections `accessible_collection_ids` says this caller can\nsee (`None` for an admin, meaning no filter), never the whole graph.\nAn unknown `facet` name is a 404: the four legal keys come from\n`_entity_facet_spec()`, the same source the index's own menu columns do,\nso this route can never offer a category the page does not have.\n\nPlain ``def``, not ``async def`` \u2014 purely blocking `facts_pg` /\n`accessible_collection_ids` DB work, zero ``await``s (Tier-1\nconvention, `tests/test_event_loop_offload_guard.py`).",
+        "operationId": "library_facet_search_library_facets__facet__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "facet",
+            "required": true,
+            "schema": {
+              "title": "Facet",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "q",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Q",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Library Facet Search",
+        "tags": [
+          "web"
+        ]
+      }
+    },
     "/library/{slug}": {
       "get": {
         "description": "Collection detail \u2014 files + per-file processing status + search box.",

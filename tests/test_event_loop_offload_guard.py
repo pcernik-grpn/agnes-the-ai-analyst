@@ -65,7 +65,7 @@ from app.marketplace_server.router import (
     marketplace_zip,
 )
 from app.resource_types import ResourceType
-from app.web.router import admin_data_sources_page, library_folder_peek_rows
+from app.web.router import admin_data_sources_page, library_facet_search, library_folder_peek_rows
 
 
 def test_get_current_user_is_not_a_coroutine_function():
@@ -149,6 +149,9 @@ _OFFLOADED_API_HANDLERS = [
     # on first expand — zero awaits, purely blocking corpus_files/collection
     # reads (Devin Review on #2173).
     library_folder_peek_rows,
+    # /library index round 3: the "search facets" typeahead — zero awaits,
+    # purely blocking facts_pg/accessible_collection_ids DB work.
+    library_facet_search,
 ]
 
 

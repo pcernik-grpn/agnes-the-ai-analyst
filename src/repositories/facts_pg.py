@@ -2853,6 +2853,151 @@ class FactsPgRepository:
                 out.setdefault(r["corpus_id"], {}).setdefault(r["type"], []).append(r["label"])
         return out
 
+    def facet_top_values_for_collections(
+        self,
+        corpus_ids: Optional[List[str]],
+        *,
+        types: List[str],
+        limit_per_type: int = 25,
+        q: Optional[str] = None,
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """``{type: [{fact_id, label, document_count}, ...]}``, top
+        ``limit_per_type`` per type by document count — the Library's entity
+        FACET MENU vocabulary (spec §13.2), bounded IN SQL rather than
+        computed-then-sliced in Python.
+
+        Round 3 of the 2026-09-03 incident: :meth:`facet_values` (the
+        API's own facet-vocabulary endpoint) runs a full, unbounded query
+        over the caller's ENTIRE visible graph — the exact-visibility CTE,
+        no LIMIT — and applies ``limit_per_type`` only after every row has
+        already been fetched into Python. On a live instance (397
+        collections, 345k facts) the Library index built its facet menu by
+        tallying this same unbounded shape off every RENDERED row's own
+        per-collection facet list (``facet_values_for_collections``, which
+        has the identical "no cap" property), and the two together cost
+        18 MB of HTML AND — the second live datum — a slow (4.6s TTFB)
+        response even for a caller whose OWN visible set was small: the
+        candidate scan itself, not the output size, was the expensive part.
+
+        Two deliberate departures from the exact per-caller CTE, both
+        already precedented by :meth:`approximate_counts_for_collections`
+        (same incident, admin fact-count half):
+
+        * Scoped by ``corpus_ids`` alone (``None`` = no filter, the
+          admin/"see everything" case) — an indexed ``claims.corpus_id``
+          scan, never the ``NOT EXISTS`` correction check or the
+          audience-tiering join `_visible_facts_for_corpus_cte` pays for
+          every candidate row regardless of which ones survive. The RBAC
+          boundary is `corpus_ids` itself: every caller of this method
+          passes a set already vetted by ownership/grant checks (or `None`
+          only when the caller IS unrestricted), so narrowing further here
+          would be redundant, not safer.
+        * A `wrong`/`restricted` correction is not excluded (the "approximate"
+          trade the sibling method already makes) — a small, typically-empty
+          set relative to a facet menu, and this is a MENU of filter
+          OPTIONS, not a disclosure of specific evidence.
+
+        ``q`` (used by the typeahead route, `GET /library/facets/{facet}`)
+        narrows to labels matching it, ranked the same way (by document
+        count) rather than alphabetically — the most useful few matches
+        first. `statement_timeout` is set for this call alone.
+        """
+        if not types:
+            return {}
+        params: Dict[str, Any] = {"types": list(types), "limit_per_type": limit_per_type}
+        corpus_filter = ""
+        if corpus_ids is not None:
+            corpus_filter = "c.corpus_id = ANY(:corpus_ids) AND "
+            params["corpus_ids"] = list(corpus_ids)
+        q_norm = (q or "").strip()
+        label_where = ""
+        if q_norm:
+            label_where = "WHERE label ILIKE :q"
+            params["q"] = f"%{q_norm}%"
+        sql = sa.text(
+            f"""
+            WITH scoped_claims AS (
+                SELECT DISTINCT c.fact_id, c.corpus_id, c.corpus_file_id
+                FROM claims c
+                WHERE {corpus_filter}c.fact_id IS NOT NULL
+            ),
+            counted AS (
+                SELECT f.type AS type, sc.fact_id AS fact_id, COUNT(DISTINCT sc.corpus_file_id) AS n
+                FROM scoped_claims sc
+                JOIN facts f ON f.id = sc.fact_id
+                WHERE f.type = ANY(:types)
+                GROUP BY f.type, sc.fact_id
+            ),
+            aliased AS (
+                SELECT fact_id, MIN(natural_key) AS label
+                FROM fact_aliases
+                WHERE fact_id IN (SELECT fact_id FROM counted)
+                GROUP BY fact_id
+            ),
+            labeled AS (
+                SELECT counted.type, counted.fact_id,
+                       COALESCE(aliased.label, counted.fact_id) AS label, counted.n
+                FROM counted
+                LEFT JOIN aliased ON aliased.fact_id = counted.fact_id
+            ),
+            filtered AS (
+                SELECT * FROM labeled {label_where}
+            ),
+            ranked AS (
+                SELECT *, ROW_NUMBER() OVER (PARTITION BY type ORDER BY n DESC, fact_id) AS rn
+                FROM filtered
+            )
+            SELECT type, fact_id, label, n
+            FROM ranked
+            WHERE rn <= :limit_per_type
+            ORDER BY type, n DESC, fact_id
+            """
+        )
+        out: Dict[str, List[Dict[str, Any]]] = {t: [] for t in types}
+        with self._engine.begin() as conn:
+            conn.execute(sa.text(f"SET LOCAL statement_timeout = {_STATEMENT_TIMEOUT_MS}"))
+            for r in conn.execute(sql, params).mappings():
+                out.setdefault(r["type"], []).append(
+                    {"fact_id": r["fact_id"], "label": r["label"], "document_count": int(r["n"])}
+                )
+        return out
+
+    def facet_membership_for_collections(
+        self, corpus_ids: List[str], fact_ids: List[str]
+    ) -> Dict[str, Dict[str, List[str]]]:
+        """``{corpus_id: {type: [label, ...]}}`` restricted to the given
+        ``fact_ids`` — the per-ROW counterpart to
+        :meth:`facet_top_values_for_collections`: a row only needs to
+        declare membership in a value the (already bounded) facet MENU can
+        actually offer, so this is called with exactly that method's own
+        output ids rather than the caller's full graph. Both `corpus_ids`
+        and `fact_ids` are expected small (a rendered page of collections, a
+        `limit_per_type`-bounded value list), so this is a plain indexed
+        join with no ranking, no window function and no per-caller CTE.
+        """
+        if not corpus_ids or not fact_ids:
+            return {}
+        sql = sa.text(
+            """
+            SELECT DISTINCT c.corpus_id AS corpus_id, f.type AS type,
+                   COALESCE(a.label, f.id) AS label
+            FROM claims c
+            JOIN facts f ON f.id = c.fact_id
+            LEFT JOIN (
+                SELECT fact_id, MIN(natural_key) AS label
+                FROM fact_aliases
+                WHERE fact_id = ANY(:fact_ids)
+                GROUP BY fact_id
+            ) a ON a.fact_id = f.id
+            WHERE c.corpus_id = ANY(:corpus_ids) AND c.fact_id = ANY(:fact_ids)
+            """
+        )
+        out: Dict[str, Dict[str, List[str]]] = {}
+        with self._engine.connect() as conn:
+            for r in conn.execute(sql, {"corpus_ids": list(corpus_ids), "fact_ids": list(fact_ids)}).mappings():
+                out.setdefault(r["corpus_id"], {}).setdefault(r["type"], []).append(r["label"])
+        return out
+
     def count_visible_facts_for_collection(self, caller, corpus_id: str) -> int:
         """Caller-scoped count of facts evidenced by ``corpus_id`` — the
         Library collection card's "M facts" number (spec §13.2 "Library").

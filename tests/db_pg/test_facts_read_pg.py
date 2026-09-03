@@ -2759,9 +2759,7 @@ def test_edge_type_map_drops_an_edge_into_a_withheld_endpoint(pg_env, repo):
         (withheld, "owned_by", "Acme is owned by Summit Partners."),
     ):
         edge_id = repo.create_edge(src=src, type=edge_type, dst=dst)
-        repo.add_claim(
-            edge_id=edge_id, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote=quote
-        )
+        repo.add_claim(edge_id=edge_id, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote=quote)
 
     caller = _dict_user("uploader1")
     assert repo.count_visible_edges_by_type(caller) == {"in_industry": 1, "owned_by": 1}
@@ -2807,3 +2805,90 @@ def test_a_revealed_endpoint_keeps_its_edge_in_the_map(pg_env, repo):
         )
 
     assert repo.count_visible_edges_by_type(_dict_user("uploader1")) == {"owned_by": 1}
+
+
+# ---------------------------------------------------------------------------
+# facet_top_values_for_collections / facet_membership_for_collections —
+# round 3 of the 2026-09-03 Library incident. `facet_values`/
+# `facet_values_for_collections` above are exact and per-caller but carry no
+# cap of their own; these two are the Library index's OWN bounded pair — top
+# N by document count, ranked and LIMITed entirely in SQL (never fetch-then-
+# slice in Python), scoped by a pre-vetted `corpus_ids` list rather than the
+# per-caller visibility CTE.
+# ---------------------------------------------------------------------------
+
+
+def test_facet_top_values_ranks_by_document_count_and_is_bounded_in_sql(pg_env, repo):
+    _seed_collection(collection_id=CORPUS_A, created_by="uploader1")
+    for i, n_docs in enumerate([5, 3, 1, 4, 2]):
+        fact_id = repo.create_fact(type="client")
+        repo.add_alias(fact_id=fact_id, type="client", natural_key=f"client-{i}")
+        for d in range(n_docs):
+            file_id = f"cf_{i}_{d}"
+            _seed_corpus_file(corpus_id=CORPUS_A, file_id=file_id, sha256=f"sha_{i}_{d}")
+            repo.add_claim(
+                fact_id=fact_id,
+                corpus_file_id=file_id,
+                corpus_id=CORPUS_A,
+                file_sha256=f"sha_{i}_{d}",
+                quote=f"client-{i} appears in {file_id}.",
+            )
+
+    out = repo.facet_top_values_for_collections([CORPUS_A], types=["client"], limit_per_type=3)
+    assert [v["label"] for v in out["client"]] == ["client-0", "client-3", "client-1"]
+    assert [v["document_count"] for v in out["client"]] == [5, 4, 3]
+
+
+def test_facet_top_values_none_corpus_ids_means_no_filter(pg_env, repo):
+    _seed_collection(collection_id=CORPUS_A, created_by="uploader1")
+    _seed_collection(collection_id=CORPUS_B, created_by="uploader1")
+    _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_a1", sha256="sha_a1")
+    _seed_corpus_file(corpus_id=CORPUS_B, file_id="cf_b1", sha256="sha_b1")
+    _seed_client(repo, corpus_id=CORPUS_A, file_id="cf_a1", sha="sha_a1", natural_key="Parts Authority")
+    _seed_client(repo, corpus_id=CORPUS_B, file_id="cf_b1", sha="sha_b1", natural_key="N.B. Handy")
+
+    scoped = repo.facet_top_values_for_collections([CORPUS_A], types=["client"], limit_per_type=10)
+    assert {v["label"] for v in scoped["client"]} == {"Parts Authority"}
+
+    unscoped = repo.facet_top_values_for_collections(None, types=["client"], limit_per_type=10)
+    assert {v["label"] for v in unscoped["client"]} == {"Parts Authority", "N.B. Handy"}
+
+
+def test_facet_top_values_q_narrows_to_matching_labels(pg_env, repo):
+    _seed_collection(collection_id=CORPUS_A, created_by="uploader1")
+    _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_a1", sha256="sha_a1")
+    _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_a2", sha256="sha_a2")
+    _seed_client(repo, corpus_id=CORPUS_A, file_id="cf_a1", sha="sha_a1", natural_key="Parts Authority")
+    _seed_client(repo, corpus_id=CORPUS_A, file_id="cf_a2", sha="sha_a2", natural_key="N.B. Handy")
+
+    out = repo.facet_top_values_for_collections([CORPUS_A], types=["client"], limit_per_type=10, q="parts")
+    assert [v["label"] for v in out["client"]] == ["Parts Authority"]
+
+
+def test_facet_top_values_empty_corpus_ids_list_is_empty_not_unscoped(pg_env, repo):
+    """An explicit empty list is a real "nothing visible" answer, distinct
+    from `None` ("no filter" — admin/unrestricted)."""
+    _seed_collection(collection_id=CORPUS_A, created_by="uploader1")
+    _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_a1", sha256="sha_a1")
+    _seed_client(repo, corpus_id=CORPUS_A, file_id="cf_a1", sha="sha_a1", natural_key="Parts Authority")
+
+    out = repo.facet_top_values_for_collections([], types=["client"], limit_per_type=10)
+    assert out["client"] == []
+
+
+def test_facet_membership_is_scoped_to_the_given_fact_ids_only(pg_env, repo):
+    """The per-row counterpart: a row only carries membership in a value
+    it's asked about — never every fact it happens to evidence."""
+    _seed_collection(collection_id=CORPUS_A, created_by="uploader1")
+    _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_a1", sha256="sha_a1")
+    _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_a2", sha256="sha_a2")
+    fact_a = _seed_client(repo, corpus_id=CORPUS_A, file_id="cf_a1", sha="sha_a1", natural_key="Parts Authority")
+    _seed_client(repo, corpus_id=CORPUS_A, file_id="cf_a2", sha="sha_a2", natural_key="N.B. Handy")
+
+    out = repo.facet_membership_for_collections([CORPUS_A], [fact_a])
+    assert out == {CORPUS_A: {"client": ["Parts Authority"]}}
+
+
+def test_facet_membership_empty_inputs_are_empty(pg_env, repo):
+    assert repo.facet_membership_for_collections([], ["fact_1"]) == {}
+    assert repo.facet_membership_for_collections(["col_a"], []) == {}

@@ -2363,6 +2363,11 @@
          ('format', 'File format', library_formats),
          ('requirement', 'Access', library_requirements),
        ] %}
+      {# Which categories have a "search facets" box past their own top-N —
+         exactly the entity facets, the ones round 3 of the 2026-09-03
+         incident bounded server-side (`_LIBRARY_ENTITY_FACET_LIMIT`). Every
+         other category already lists everything it could ever offer. #}
+      {% set _searchable_facet_keys = library_entity_cats | map(attribute=0) | list %}
       {% set _has_facets = library_available_count or (_cats | map(attribute=2) | select | list | length) > 0 %}
       <div class="fbar-filter">
         {% if not _has_facets %}
@@ -2418,6 +2423,21 @@
               </span>
             </button>
             <div class="fbar-cat__pop" hidden>
+              {% if facet_key in _searchable_facet_keys %}
+              {# Past the server's own top-N (`_LIBRARY_ENTITY_FACET_LIMIT`,
+                 round 3 of the 2026-09-03 incident): a value this collection
+                 of facts is about but that did not make the menu's own
+                 by-count cut. `data-facet-search` fetches
+                 `GET /library/facets/{{ facet_key }}` and APPENDS matching
+                 options here — never replaces the ones already rendered, so
+                 a value the reader already checked stays checked and stays
+                 on screen once the search box empties again. #}
+              <div class="fbar-menu__search">
+                <input type="search" class="fbar-menu__search-input" data-facet-search="{{ facet_key }}"
+                       placeholder="Search {{ cat_label | lower }}…"
+                       aria-label="Search {{ cat_label }} values">
+              </div>
+              {% endif %}
               {% for key, label, n in options %}
               <label class="fbar-menu__opt"><input type="checkbox" data-facet="{{ facet_key }}" value="{{ key }}"><span class="fbar-menu__opt-text">{{ label }}</span><span class="fbar-menu__opt-n">{{ n }}</span></label>
               {% endfor %}
@@ -3720,6 +3740,65 @@
     // `display:none` outranks `hidden` and would keep the table hidden after a
     // switch back to it.
     delete document.documentElement.dataset.libView;
+
+    // ── "Search facets" typeahead (round 3 of the 2026-09-03 incident) ────
+    //    Each entity-facet category's popover offers only its own top-N
+    //    values (`_LIBRARY_ENTITY_FACET_LIMIT`, server-side); this box is
+    //    the way past that cut. Debounced fetch to `GET /library/facets/
+    //    {facet}?q=`, results APPENDED (never replacing what is already
+    //    there — a checked option must never disappear out from under the
+    //    reader), and a newly-added checkbox is wired through the SAME
+    //    `toolbar.setFacet` the engine exposes for exactly this ("a page
+    //    can offer a second route to a facet value beside the Filter menu
+    //    itself" — filter_toolbar.js's own words on that hook).
+    let facetSearchTimer = null;
+    document.querySelectorAll('[data-facet-search]').forEach(input => {
+      const facetKey = input.dataset.facetSearch;
+      const pop = input.closest('.fbar-cat__pop');
+      if (!pop) return;
+      const existingValues = () => new Set(
+        Array.prototype.map.call(pop.querySelectorAll('input[data-facet]'), i => i.value));
+      input.addEventListener('input', () => {
+        clearTimeout(facetSearchTimer);
+        const q = input.value.trim();
+        // A blank box is the server-rendered top-N alone — nothing to add,
+        // and nothing already added is removed (an unchecked, search-added
+        // option is a rare enough leftover that clearing the box is not
+        // asked to also tidy it up).
+        if (!q) return;
+        facetSearchTimer = setTimeout(async () => {
+          let payload;
+          try {
+            const resp = await fetch(
+              '/library/facets/' + encodeURIComponent(facetKey) + '?q=' + encodeURIComponent(q),
+              { credentials: 'same-origin' });
+            if (!resp.ok) return;
+            payload = await resp.json();
+          } catch (_) {
+            return;
+          }
+          if (input.value.trim() !== q) return;   // superseded mid-flight
+          const have = existingValues();
+          (payload.values || []).forEach(v => {
+            if (have.has(v.value)) return;
+            const label = document.createElement('label');
+            label.className = 'fbar-menu__opt';
+            label.innerHTML =
+              '<input type="checkbox" data-facet="' + facetKey + '">' +
+              '<span class="fbar-menu__opt-text"></span><span class="fbar-menu__opt-n"></span>';
+            const checkbox = label.querySelector('input');
+            checkbox.value = v.value;
+            label.querySelector('.fbar-menu__opt-text').textContent = v.label;
+            label.querySelector('.fbar-menu__opt-n').textContent = String(v.count);
+            checkbox.addEventListener('change', () => {
+              toolbar.setFacet(facetKey, checkbox.value, checkbox.checked);
+            });
+            pop.appendChild(label);
+            have.add(v.value);
+          });
+        }, 200);
+      });
+    });
 
   }
 

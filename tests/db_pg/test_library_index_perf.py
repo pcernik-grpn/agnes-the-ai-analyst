@@ -37,6 +37,7 @@ from pathlib import Path
 
 import sqlalchemy as sa
 
+from app.web.router import _LIBRARY_ENTITY_FACET_LIMIT, _LIBRARY_FACET_SEARCH_MAX
 from tests.db_pg._parity_sweep_util import build_seeded_client
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -286,3 +287,284 @@ def test_library_index_admin_fact_counts_use_the_flat_aggregate(tmp_path, monkey
     resp = client.get("/library", headers={"Authorization": f"Bearer {admin_token}"})
     assert resp.status_code == 200, resp.text
     assert calls == {"approx": 1, "exact": 0}
+
+
+# ---------------------------------------------------------------------------
+# Round 3 (incident follow-up, same day): the entity-facet FILTER MENU.
+#
+# Rounds 1-2 bounded a collection's own files and the collection CARDS
+# themselves. Deployed live, `/library` was still 8-13s / 18 MB for an
+# admin: `facet_values_for_collections` (src/repositories/facts_pg.py,
+# used from app/web/router.py's `library_page`) has no cap of its own — it
+# is the per-ROW entity-facet source, and the Library then tallies EVERY
+# row's own unbounded value list into the Filter menu (`_present_multi` in
+# router.py, over `library_entity_cats`). On a live instance (397
+# collections, 345k facts) that produced 57 812 `.fbar-menu__opt` filter
+# options — 1.3 MB of `data-client` alone — AND, the second live datum, a
+# slow (4.6s TTFB) response even for a caller whose OWN visible set was
+# small: the unbounded CANDIDATE SCAN (no corpus_id filter, a per-caller
+# visibility CTE with a correlated `NOT EXISTS` against `corrections`), not
+# the eventual output size, was the expensive part.
+#
+# The fix: `facet_top_values_for_collections` (top N per type by document
+# count, ranked and LIMITed entirely in SQL via a window function, scoped
+# by `corpus_id = ANY(:corpus_ids)` — an indexed scan, never the exact
+# per-caller CTE) plus `facet_membership_for_collections` (which of those
+# already-bounded values does THIS page's row carry — so a row's own
+# `data-{facet}` attribute is bounded by construction, not a second cap).
+# `GET /library/facets/{facet}` is the typeahead past the menu's own cap.
+# ---------------------------------------------------------------------------
+
+FACET_TYPES = ["client", "industry", "service_offering", "doc_type"]
+FACET_KEYS = {"client": "client", "industry": "industry", "service_offering": "offering", "doc_type": "doctype"}
+N_FACET_COLLECTIONS = 400
+N_FACET_VALUES = 60_000
+#: How many of the 400 collections belong to a NON-admin caller — the
+#: "small visible set, big graph" half of the incident's second datum.
+N_ANALYST_COLLECTIONS = 5
+
+
+def _seed_facet_graph(pg_engine) -> None:
+    """400 collections (the first `N_ANALYST_COLLECTIONS` owned by a non-
+    admin analyst, the rest by admin1), one file each, and 60 000 distinct
+    facts (15 000 per entity-facet type) — the production report's own
+    shape (397 collections, 345k facts) scaled down to something a test
+    seeds and queries in seconds while exercising the identical unbounded-
+    candidate-scan risk: 60k rows is enough that a query lacking the
+    corpus_id filter (or lacking the SQL-side LIMIT) is measurably, not just
+    theoretically, slower."""
+    collections = []
+    files = []
+    for i in range(N_FACET_COLLECTIONS):
+        owner = "analyst1" if i < N_ANALYST_COLLECTIONS else "admin1"
+        collections.append(
+            {
+                "id": f"col_facet_{i}",
+                "slug": f"facet-collection-{i}",
+                "name": f"Facet Collection {i:04d}",
+                "description": "Seeded for the round-3 facet-menu perf fixture.",
+                "created_by": owner,
+                "origin": "uploaded",
+            }
+        )
+        # TWO files per collection, deliberately — one is what claims
+        # reference, the other exists only so `file_count != 1`: a
+        # single-file collection is a different, already-bounded O(1)
+        # per-collection lookup (the "this card IS the file" case, rounds
+        # 1-2), and mixing that path into a facet-focused fixture would
+        # inflate the statement count with a cost this test is not about.
+        files.append(
+            {
+                "id": f"cf_facet_{i}",
+                "corpus_id": f"col_facet_{i}",
+                "filename": f"document-{i:04d}.pdf",
+                "sha256": f"sha_cf_{i}",
+                "file_type": "pdf",
+                "size_bytes": 4096,
+                "storage_path": None,
+                "parent_file_id": None,
+                "path": None,
+            }
+        )
+        files.append(
+            {
+                "id": f"cf_facet_{i}_b",
+                "corpus_id": f"col_facet_{i}",
+                "filename": f"document-{i:04d}-appendix.pdf",
+                "sha256": f"sha_cf_{i}_b",
+                "file_type": "pdf",
+                "size_bytes": 2048,
+                "storage_path": None,
+                "parent_file_id": None,
+                "path": None,
+            }
+        )
+    facts, aliases, claims = [], [], []
+    for i in range(N_FACET_VALUES):
+        fact_type = FACET_TYPES[i % len(FACET_TYPES)]
+        # Round-robins every collection, ANALYST ones included, so the small
+        # non-admin caller's own visible set genuinely has facet data too —
+        # not a degenerate all-admin fixture that happens to make the small
+        # case trivially fast regardless of query shape.
+        col_idx = i % N_FACET_COLLECTIONS
+        fact_id = f"fact_{i}"
+        facts.append({"id": fact_id, "type": fact_type})
+        aliases.append({"fact_id": fact_id, "type": fact_type, "natural_key": f"{fact_type}-value-{i:06d}"})
+        claims.append(
+            {
+                "id": f"claim_{i}",
+                "fact_id": fact_id,
+                "corpus_file_id": f"cf_facet_{col_idx}",
+                "corpus_id": f"col_facet_{col_idx}",
+                "file_sha256": f"sha_cf_{col_idx}",
+                "quote": f"evidence for {fact_type} value {i}",
+                "quote_hash": f"qh_{i}",
+            }
+        )
+    with pg_engine.begin() as conn:
+        conn.execute(
+            sa.text(
+                "INSERT INTO file_corpora (id, slug, name, description, created_by, origin) "
+                "VALUES (:id, :slug, :name, :description, :created_by, :origin)"
+            ),
+            collections,
+        )
+        conn.execute(
+            sa.text(
+                "INSERT INTO corpus_files "
+                "(id, corpus_id, filename, sha256, file_type, size_bytes, storage_path, parent_file_id, path) "
+                "VALUES (:id, :corpus_id, :filename, :sha256, :file_type, :size_bytes, "
+                "        :storage_path, :parent_file_id, :path)"
+            ),
+            files,
+        )
+        conn.execute(sa.text("INSERT INTO facts (id, type) VALUES (:id, :type)"), facts)
+        conn.execute(
+            sa.text("INSERT INTO fact_aliases (fact_id, type, natural_key) VALUES (:fact_id, :type, :natural_key)"),
+            aliases,
+        )
+        conn.execute(
+            sa.text(
+                "INSERT INTO claims (id, fact_id, corpus_file_id, corpus_id, file_sha256, quote, quote_hash) "
+                "VALUES (:id, :fact_id, :corpus_file_id, :corpus_id, :file_sha256, :quote, :quote_hash)"
+            ),
+            claims,
+        )
+
+
+def _facet_option_counts(body: str) -> dict:
+    """``{facet_key: n}`` — how many `.fbar-menu__opt` rows the rendered
+    page carries per entity facet, read off each option's own
+    ``data-facet="..."`` attribute."""
+    import re
+
+    counts: dict = {}
+    for key in FACET_KEYS.values():
+        counts[key] = len(re.findall(r'data-facet="' + key + r'"', body))
+    return counts
+
+
+def test_library_index_facet_menu_is_bounded_and_html_stays_small(tmp_path, monkeypatch, pg_engine):
+    monkeypatch.setenv("AGNES_FACTS_ENABLED", "true")
+    client, admin_token = build_seeded_client("pg", tmp_path, monkeypatch, pg_engine)
+    _seed_facet_graph(pg_engine)
+
+    resp = client.get("/library", headers={"Authorization": f"Bearer {admin_token}"})
+    assert resp.status_code == 200, resp.text
+    body = resp.text
+    nbytes = len(body.encode("utf-8"))
+
+    # Live incident: 18 MB for this shape (397 collections, 345k facts) under
+    # the unbounded menu. Bounded now regardless of the 60k distinct values
+    # seeded here.
+    assert nbytes < 1_000_000, f"/library HTML is {nbytes} bytes ({nbytes / 1024:.0f} KB) — expected well under 1 MB"
+
+    counts = _facet_option_counts(body)
+    for key, n in counts.items():
+        assert n <= _LIBRARY_ENTITY_FACET_LIMIT, (
+            f"facet '{key}' rendered {n} options, expected <= {_LIBRARY_ENTITY_FACET_LIMIT}"
+        )
+    # The menu is not simply empty — real, bounded vocabulary made it through.
+    assert sum(counts.values()) > 0
+
+
+def test_library_index_facet_query_statement_count_is_bounded(tmp_path, monkeypatch, pg_engine):
+    monkeypatch.setenv("AGNES_FACTS_ENABLED", "true")
+    client, admin_token = build_seeded_client("pg", tmp_path, monkeypatch, pg_engine)
+    _seed_facet_graph(pg_engine)
+
+    import src.db_pg as db_pg
+
+    statements: list = []
+
+    def _capture(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    engine = db_pg.get_engine()
+    sa.event.listen(engine, "before_cursor_execute", _capture)
+    try:
+        resp = client.get("/library", headers={"Authorization": f"Bearer {admin_token}"})
+    finally:
+        sa.event.remove(engine, "before_cursor_execute", _capture)
+    assert resp.status_code == 200, resp.text
+
+    facet_statements = [s for s in statements if "scoped_claims" in s or "facet_membership" in s.lower()]
+    # facet_top_values_for_collections (menu) + facet_membership_for_collections
+    # (row attributes) — exactly two, never one per facet type and never one
+    # per rendered row.
+    assert len(facet_statements) <= 2, f"expected <= 2 facet statements, found {len(facet_statements)}"
+    assert len(statements) < 100, f"GET /library issued {len(statements)} statements — expected a bounded number"
+
+
+def test_library_index_renders_fast_for_a_large_admin_and_a_small_user(tmp_path, monkeypatch, pg_engine):
+    """Server render time, not just byte size: the second live datum showed
+    a SMALL visible set was still slow (4.6s TTFB) because the candidate
+    scan itself — not the eventual output — was unbounded. Both a
+    400-collection admin and a 5-collection non-admin user must render in
+    under a second on the identical (60k-fact) graph."""
+    from app.auth.jwt import create_access_token
+
+    monkeypatch.setenv("AGNES_FACTS_ENABLED", "true")
+    client, admin_token = build_seeded_client("pg", tmp_path, monkeypatch, pg_engine)
+    _seed_facet_graph(pg_engine)
+    analyst_token = create_access_token("analyst1", "analyst@test.com")
+
+    t0 = time.monotonic()
+    resp_admin = client.get("/library", headers={"Authorization": f"Bearer {admin_token}"})
+    elapsed_admin = time.monotonic() - t0
+    assert resp_admin.status_code == 200, resp_admin.text
+    assert elapsed_admin < 1.0, f"admin (400 collections) GET /library took {elapsed_admin:.2f}s — expected < 1s"
+
+    t0 = time.monotonic()
+    resp_analyst = client.get("/library", headers={"Authorization": f"Bearer {analyst_token}"})
+    elapsed_analyst = time.monotonic() - t0
+    assert resp_analyst.status_code == 200, resp_analyst.text
+    assert elapsed_analyst < 1.0, (
+        f"analyst (5 collections, {N_FACET_VALUES}-fact graph) GET /library took {elapsed_analyst:.2f}s — expected < 1s"
+    )
+
+
+def test_library_facets_typeahead_is_bounded_and_rbac_scoped(tmp_path, monkeypatch, pg_engine):
+    from app.auth.jwt import create_access_token
+
+    monkeypatch.setenv("AGNES_FACTS_ENABLED", "true")
+    client, admin_token = build_seeded_client("pg", tmp_path, monkeypatch, pg_engine)
+    _seed_facet_graph(pg_engine)
+    analyst_token = create_access_token("analyst1", "analyst@test.com")
+
+    # Admin sees the whole graph — a limit=50 request returns at most 50,
+    # never the full 15 000 client-type values.
+    resp = client.get("/library/facets/client?limit=50", headers={"Authorization": f"Bearer {admin_token}"})
+    assert resp.status_code == 200, resp.text
+    values = resp.json()["values"]
+    assert 0 < len(values) <= 50
+
+    # `q` narrows to matching labels only. i=1000 -> FACET_TYPES[1000 % 4] ==
+    # "client" (index 0), so this label really was seeded as a client value.
+    resp_q = client.get(
+        "/library/facets/client?q=client-value-001000", headers={"Authorization": f"Bearer {admin_token}"}
+    )
+    assert resp_q.status_code == 200, resp_q.text
+    q_values = resp_q.json()["values"]
+    assert q_values
+    assert all("001000" in v["label"] for v in q_values)
+
+    # A pathological limit is clamped, not honored verbatim.
+    resp_big = client.get("/library/facets/client?limit=999999", headers={"Authorization": f"Bearer {admin_token}"})
+    assert resp_big.status_code == 200, resp_big.text
+    assert len(resp_big.json()["values"]) <= _LIBRARY_FACET_SEARCH_MAX
+
+    # Unknown facet key — 404, not a silent empty list (a caller-typo should
+    # be visible, not read as "no matches").
+    resp_404 = client.get("/library/facets/not-a-real-facet", headers={"Authorization": f"Bearer {admin_token}"})
+    assert resp_404.status_code == 404
+
+    # RBAC: the analyst owns only N_ANALYST_COLLECTIONS of the 400 — their
+    # own facet search must never surface a value evidenced ONLY by a
+    # collection they cannot see. With 1/80th of the collections, the
+    # analyst's own client-type vocabulary is a small, real subset — not
+    # empty, and never the admin-scale count above.
+    resp_analyst = client.get("/library/facets/client?limit=200", headers={"Authorization": f"Bearer {analyst_token}"})
+    assert resp_analyst.status_code == 200, resp_analyst.text
+    analyst_values = resp_analyst.json()["values"]
+    assert 0 < len(analyst_values) < len(values) or len(analyst_values) <= 200

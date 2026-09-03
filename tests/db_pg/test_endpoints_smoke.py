@@ -2449,6 +2449,13 @@ KNOWN_UNTESTED = {
     # rejections); not a parameter-free route for this smoke sweep.
     "POST /api/chat/uploads",
     "GET /library",
+    # The "search facets" typeahead (round 3 of the 2026-09-03 incident fix)
+    # — needs a real facet key (`client`/`industry`/`service_offering`/
+    # `doc_type`) to answer anything; an unknown one 404s, which this sweep
+    # would misread as the route being broken. Behaviour covered in
+    # tests/db_pg/test_library_index_perf.py (bounded results, RBAC scoping,
+    # unknown-facet 404, statement count).
+    "GET /library/facets/{facet}",
     "GET /library/{slug}",
     # The HTML fragment the Library's live search fetches for the files a
     # folder's inline peek did not render (#2141 item 2). Same exclusion and
