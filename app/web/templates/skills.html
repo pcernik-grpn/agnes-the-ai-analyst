@@ -1393,6 +1393,20 @@
     document.body.classList.toggle('ag-building', !!type);
 
 
+    if (!type) {
+      /* `?edit=<id that is gone>`: openEdit failed before a type was ever
+         chosen, and the type picker that used to catch this state is gone
+         (bare /skills redirects to the Library now). Without this the render
+         falls through to `cfg()` on a null type and paints nothing at all,
+         which is exactly the "your click did nothing" the alerts host exists
+         to prevent. */
+      view.innerHTML = '<div class="sk-bgrid sk-bgrid--solo"><div>' +
+        noReviewHtml() +
+        '<div id="sk-alerts">' + alertsHtml() + '</div>' +
+        '<p class="ag-note"><a href="/library">Back to the Library</a></p>' +
+      '</div></div>';
+      return;
+    }
     var c = cfg(), ns = nameState();
     /* See BuilderShell.keepCfgScroll — a full rebuild would otherwise send
        the configuration column back to the top on every re-render. */

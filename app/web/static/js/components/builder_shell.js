@@ -378,8 +378,9 @@
   function engineNotice(engine) {
     if (engine !== 'stub') return '';
     return (
-      '<div class="ag-note ag-note--warn">Scripted stand-in — no AI credential is configured here, ' +
-      'so the replies are canned. The panel and Save work normally.</div>'
+      '<div class="ag-note ag-note--warn">Scripted stand-in — no AI credential is configured (or ' +
+      '<code>AGNES_BUILDER_STUB</code> is set), so the replies are canned. The panel and Save ' +
+      'work normally.</div>'
     );
   }
 
