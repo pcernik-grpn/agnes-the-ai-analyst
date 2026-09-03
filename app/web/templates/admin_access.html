@@ -5587,13 +5587,25 @@
         </summary>
         <div class="ax-gs__body">
           ${(() => {
+            /* When Everyone already has this, every group already has it.
+               "7 other groups could have it" was false, and a group grant
+               beside an everyone grant does exactly one thing: it WINS for
+               that group and can carry a different tier (a direct grant beats
+               the inherited one — see grantsFor). So on a tiered kind the
+               offer is that, named; on an untiered kind a group grant would
+               change nothing, and nothing is offered. */
+            const evGrant = r.held.find((g) => g.audience === "everyone");
+            const tieredKind = TIERED.has(r.t.type_key);
+            if (evGrant && !tieredKind) return "";
+            const evTier = evGrant ? ((evGrant.requirement || "available") === "required" ? "{{ words.tier_automatic }}" : "{{ words.tier_optional }}") : "";
+            const otherTier = evTier === "{{ words.tier_automatic }}" ? "{{ words.tier_optional }}" : "{{ words.tier_automatic }}";
             const share = `
               <button type="button" class="ax-add ax-add--bb" data-share-bundle
                       data-btype="${esc(r.t.type_key)}" data-brid="${esc(r.i.resource_id)}"
                       data-blabel="${esc(itemName(r.i))}">
                 <span class="ax-add__plus" aria-hidden="true">+</span>
                 <span class="ax-add__body">
-                  <span class="ax-add__label">${nobody ? "Share it with a group" : "Share with another group"}</span>
+                  <span class="ax-add__label">${evGrant ? "Set a different tier for a group" : nobody ? "Share it with a group" : "Share with another group"}</span>
                   <span class="ax-add__hint">${(() => {
                     /* This hint used to be the hard-coded sentence "every
                        group in the list below already has it" on EVERY
@@ -5601,6 +5613,7 @@
                        which then opened a picker with four groups in it. It
                        is only true when every group really does have it, so
                        it is only said then. */
+                    if (evGrant) return `everyone already has it as ${evTier} — a group can get it as ${otherTier} instead`;
                     if (nobody) return "authored, then never handed to anyone";
                     const left = (overview.groups || []).length - r.held.length;
                     return left > 0

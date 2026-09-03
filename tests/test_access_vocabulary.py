@@ -1285,3 +1285,34 @@ class TestAnOwnerSharedRowSaysWhoAndGoesSomewhereReal:
         assert 'itemProvenance(i, { ownerNamed: !!(owned && who) })' in src
         assert "if (i.owner_email && !(opts && opts.ownerNamed))" in src
         assert 'split("@")[0]' not in src[src.index("const sharerIsOwner"): src.index("const sharerIsOwner") + 600]
+
+
+class TestSharingBesideAnEveryoneGrantSaysWhatItWouldDo:
+    """Audit U8. A resource Everyone already had still offered "Share with
+    another group · 7 other groups could have it" — false, since every group
+    already had it. A group grant beside an everyone grant does exactly one
+    thing: it wins for that group and can carry a different tier. So on a
+    tiered kind that is the offer, named; on an untiered kind a group grant
+    would change nothing, and nothing is offered.
+    """
+
+    TEMPLATE = "app/web/templates/admin_access.html"
+
+    def _source(self) -> str:
+        from pathlib import Path
+
+        return Path(self.TEMPLATE).read_text(encoding="utf-8")
+
+    def test_untiered_kinds_offer_nothing_beside_an_everyone_grant(self):
+        src = self._source()
+        assert 'const evGrant = r.held.find((g) => g.audience === "everyone");' in src
+        assert 'if (evGrant && !tieredKind) return "";' in src
+
+    def test_tiered_kinds_offer_a_different_tier_and_say_so(self):
+        src = self._source()
+        assert '${evGrant ? "Set a different tier for a group" : nobody ? "Share it with a group" : "Share with another group"}' in src
+        assert "if (evGrant) return `everyone already has it as ${evTier} — a group can get it as ${otherTier} instead`;" in src
+
+    def test_the_old_copy_survives_where_no_everyone_grant_exists(self):
+        src = self._source()
+        assert '? `${left} other ${left === 1 ? "group" : "groups"} could have it`' in src
