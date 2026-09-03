@@ -132,8 +132,8 @@ Names follow `<env> - Agnes - <signal>`; scope `S` = `env:<project-id>`.
 | host_down | important | `"datadog.agent.up".over("S").by("host").last(2).count_by_status()`, `notify_no_data`, `no_data_timeframe 10` |
 | synthetic_health | important | `datadog_synthetics_test` GET `https://<domain>/api/health`, `statusCode is 200` + `body validatesJSONPath $.status is ok`, 2 locations, `min_location_failed = 2`, `retry {2, 5000 ms}`, `min_failure_duration 300` |
 | docker_daemon_down | important | `"docker.service_up".over("S").by("host").last(3).count_by_status()` |
-| pg_unreachable (per side-car) | important | `"postgres.can_connect".over("S","compose_service:<svc>").by("host").last(3).count_by_status()` |
-| pg_xid_wraparound | important | `max(last_30m):max:postgresql.percent_towards_wraparound{S} by {host,compose_service,db} > 70` (warn 50) |
+| pg_unreachable (per side-car) | important | `"postgres.can_connect".over("S","compose_service:<svc>").by("compose_service").last(3).count_by_status()` |
+| pg_xid_wraparound | important | `max(last_30m):max:postgresql.percent_towards_wraparound{S} by {compose_service,db} > 70` (warn 50) |
 | watchdog_signature | important | `min(last_10m):min:system.disk.directory.file.modified_sec_ago{S,agnes_probe:watchdog} by {host,filename} < 900` |
 | containers_below_expected | important | `max(last_10m):max:docker.containers.running.total{S} by {host} < <expected>` |
 | container_oom_killed | important | `max(last_15m):diff(max:container.memory.oom_events{S} by {host,compose_service}) > 0` |
@@ -141,7 +141,7 @@ Names follow `<env> - Agnes - <signal>`; scope `S` = `env:<project-id>`.
 | tls_cert_expiring | important | `min(last_1h):min:tls.days_left{S} by {host,tls_target} < 10` (warn 21) |
 | edge_readyz_failed | important | `"http.can_connect".over("S","instance:agnes_readyz").by("host").last(3).count_by_status()` |
 | db_backup_failed | important | `"systemd.unit.substate".over("S","unit:agnes-db-backup.service").by("host","unit").last(1).count_by_status()` |
-| pg_connections | info | `avg(last_10m):max:postgresql.percent_usage_connections{S} by {host,compose_service} > 0.85` (warn 0.70) |
+| pg_connections | info | `avg(last_10m):max:postgresql.percent_usage_connections{S} by {compose_service} > 0.85` (warn 0.70) |
 | container_restart_loop | info | `max(last_30m):max:container.uptime{S} by {host,compose_service} < 600` |
 | inodes_exhausted | info | `avg(last_15m):avg:system.fs.inodes.in_use{S AND (device:/ OR device:/data)} by {host,device} > 0.9` |
 | memory_low | info | `avg(last_10m):avg:system.mem.pct_usable{S} by {host} < 0.10` (warn 0.15) |
