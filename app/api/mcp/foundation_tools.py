@@ -422,6 +422,31 @@ def _facts_caller(headers_fn: Callable[[], dict[str, str]]) -> Any:
     return caller
 
 
+#: The fact-graph query tools — every one of them 404s (``facts_disabled``)
+#: while the ``facts`` feature switch is off, so ``tools/list`` must not offer
+#: them then: each tool's own description tells the agent to reach for it
+#: FIRST on who/what questions, and an instance with the switch off saw the
+#: first tool call of a turn fail with ``404: facts_disabled`` (issue #2161).
+FACT_TOOL_NAMES: frozenset[str] = frozenset(
+    {"fact_search", "fact_type_map", "fact_facets", "fact_neighbors", "fact_claims", "fact_edges"}
+)
+
+
+def feature_hidden_tool_names() -> frozenset[str]:
+    """Foundation tools ``tools/list`` must hide on THIS instance right now.
+
+    Evaluated per listing, not at registration — the switches live in the
+    ``/admin/server-config`` overlay and can flip without a restart. Hidden
+    only, never unregistered: a call to a hidden tool still runs its own
+    gate (``require_facts_enabled``), so the two cannot disagree.
+    """
+    from app.instance_config import feature_enabled
+
+    if feature_enabled("facts", "enabled", env_var="AGNES_FACTS_ENABLED", default=False):
+        return frozenset()
+    return FACT_TOOL_NAMES
+
+
 def register_foundation_tools(
     mcp: FastMCP,
     *,

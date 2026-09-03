@@ -7709,6 +7709,11 @@
             ],
             "title": "Input Schema"
           },
+          "mutating": {
+            "default": false,
+            "title": "Mutating",
+            "type": "boolean"
+          },
           "source_id": {
             "title": "Source Id",
             "type": "string"

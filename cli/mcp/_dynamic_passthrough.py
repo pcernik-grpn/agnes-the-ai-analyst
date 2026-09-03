@@ -20,12 +20,13 @@ non-identifier prop names fall back to ``**kwargs`` for that tool.
 """
 from __future__ import annotations
 
-import json
 import keyword
 import logging
 import re
 import sys
 from typing import Any, Callable, Dict, List, Optional
+
+from mcp.types import ToolAnnotations
 
 from cli.v2_client import V2ClientError, api_get_json, api_post_json
 
@@ -36,6 +37,18 @@ _PY_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 def _safe_ident(name: str) -> bool:
     return bool(_PY_IDENT_RE.match(name)) and not keyword.iskeyword(name)
+
+
+def passthrough_annotations(mutating: Any) -> ToolAnnotations:
+    """``tool_registry.mutating`` → MCP behaviour hints.
+
+    A copy of ``app.api.mcp.tools_generator.passthrough_annotations`` — this
+    module runs on the analyst's laptop and must not import the server side
+    (duckdb, the repositories). ``tests/test_mcp_cli_dynamic_passthrough.py``
+    pins the two to the same verdicts.
+    """
+    is_mutating = bool(mutating)
+    return ToolAnnotations(readOnlyHint=not is_mutating, destructiveHint=is_mutating)
 
 
 def _make_rest_passthrough_callable(
@@ -141,7 +154,17 @@ def register_passthrough_tools(mcp_instance) -> List[str]:
         # surface is a fresh process so we can be stricter here.
         client_exposed = f"{tool.get('source_name', 'src')}.{exposed_name}"
         try:
-            mcp_instance.add_tool(fn, name=client_exposed, description=description)
+            mcp_instance.add_tool(
+                fn,
+                name=client_exposed,
+                description=description,
+                # Same readOnlyHint the server transports derive from the
+                # row's `mutating` flag (issue #2161) — a client that
+                # auto-approves reads needs it here too, and a server that
+                # predates the `mutating` field in this listing yields a
+                # tool that asks, never one that runs unasked.
+                annotations=passthrough_annotations(tool.get("mutating", True)),
+            )
         except Exception as exc:
             logger.warning("could not register passthrough tool %s: %s", client_exposed, exc)
             continue

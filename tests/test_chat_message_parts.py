@@ -188,3 +188,23 @@ def test_content_projection_matches_the_producers_join():
     parts = build_message_parts(_interleaved_turn())
     assert parts_to_content(parts) == "Let me check the server.\n\nHealthy. Now the counts:\n\nCZ leads."
     assert parts_to_content(None) == ""
+
+
+def test_a_recorded_approval_decision_rides_the_tool_part():
+    """The manager stamps a resolved approval onto the buffered call it gated
+    (`_record_approval_on_tool_call`); the part keeps it so a reloaded tool
+    row can still say "approved by you" — approval cards themselves are never
+    persisted (issue #2161)."""
+    parts = build_message_parts(
+        [
+            _stamped(
+                {"type": "tool_call", "tool_use_id": "c1", "tool": "crm_search", "args": {"q": "x"}, "approval": "allow_session"},
+                1,
+            ),
+            _stamped({"type": "tool_result", "tool_use_id": "c1", "result": "hit", "is_error": False}, 2),
+            _stamped({"type": "tool_call", "tool_use_id": "c2", "tool": "catalog", "args": {}}, 3),
+        ]
+    )
+    assert parts[0]["approval"] == "allow_session"
+    assert parts[0]["state"] == STATE_OUTPUT_AVAILABLE, "the result still folds onto the same entry"
+    assert "approval" not in parts[1], "a call nobody gated carries no decision"
