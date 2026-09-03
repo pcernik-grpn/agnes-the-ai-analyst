@@ -463,6 +463,53 @@ async def get_item_web_url(access_token: str, drive_id: str, item_id: Optional[s
     return str(web_url) if web_url else None
 
 
+async def get_root_web_url(access_token: str, drive_id: str) -> Optional[str]:
+    """This drive's OWN ``webUrl`` — the shard planner's site-total signal
+    (2026-09-03 auto-parallel-crawl design §4.1 point 2): a single
+    :func:`search_document_count` scoped to the drive root, before ever
+    listing a folder, is what lets the planner take the inline (no-shard)
+    path for a drive that turns out to be small without an extra round trip.
+
+    Best-effort: any failure (403 on this app registration, a malformed
+    body) returns ``None`` rather than raising — the caller treats a missing
+    ``webUrl`` the same way :func:`search_document_count` treats an empty
+    ``web_url`` string, i.e. the search falls back to the next signal.
+    """
+    try:
+        body = await _graph_get(access_token, f"/drives/{drive_id}/root", params={"$select": "webUrl"})
+    except SharePointGraphError:
+        return None
+    web_url = body.get("webUrl")
+    return str(web_url) if web_url else None
+
+
+async def list_item_children_with_url(access_token: str, drive_id: str, item_id: str) -> List[Dict[str, Any]]:
+    """Children of an arbitrary folder, carrying each item's ``webUrl`` —
+    the shard planner's "fold a folder still over target one level deeper"
+    step (2026-09-03 auto-parallel-crawl design §4.1 point 3): the same
+    ``webUrl`` :func:`list_root_children_with_url` exposes for a top-level
+    folder, generalized past the drive root the same way
+    :func:`list_item_children` generalizes :func:`list_root_children`.
+
+    Pages the full ``@odata.nextLink`` chain, same as every other listing
+    helper in this module.
+    """
+    rows = await _graph_get_all_pages(
+        access_token,
+        f"/drives/{drive_id}/items/{item_id}/children",
+        params={"$select": "id,name,folder,file,webUrl", "$top": "200"},
+    )
+    return [
+        {
+            "id": item["id"],
+            "name": item.get("name") or item["id"],
+            "is_folder": "folder" in item,
+            "web_url": item.get("webUrl"),
+        }
+        for item in rows
+    ]
+
+
 async def search_document_count(
     access_token: str,
     web_url: str,

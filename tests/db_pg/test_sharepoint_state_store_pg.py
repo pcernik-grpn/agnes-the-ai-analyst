@@ -196,3 +196,111 @@ def test_facts_extraction_save_state_then_load_state_round_trips_through_postgre
     facts_extraction.save_state("conn-a", {"version": 1, "docs": {"doc1": {"status": "done"}}})
     state = facts_extraction.load_state("conn-a")
     assert state["docs"] == {"doc1": {"status": "done"}}
+
+
+# ---------------------------------------------------------------------------
+# Per-delta-unit shard rows (2026-09-03 auto-parallel-crawl design §4.2,
+# migration 0103_crawl_shards) — `kind = "crawl:<state_key>"`.
+# ---------------------------------------------------------------------------
+
+
+def test_a_shard_kind_round_trips_through_the_relaxed_check_constraint(pg_env):
+    from connectors.sharepoint import state_store
+
+    state_store.put("crawl:b!drive1", "conn-a", {"delta_links": {"b!drive1": "u"}, "ctags": {"g:1": "c"}})
+    assert state_store.get("crawl:b!drive1", "conn-a") == {
+        "delta_links": {"b!drive1": "u"},
+        "ctags": {"g:1": "c"},
+    }
+
+
+def test_shard_kinds_never_collide_with_each_other_or_the_connection_row(pg_env):
+    from connectors.sharepoint import state_store
+
+    state_store.put("crawl", "conn-a", {"delta_links": {"legacy": "1"}})
+    state_store.put("crawl:b!drive1", "conn-a", {"delta_links": {"b!drive1": "1"}})
+    state_store.put("crawl:b!drive1:folder1", "conn-a", {"delta_links": {"b!drive1:folder1": "1"}})
+
+    assert state_store.get("crawl", "conn-a") == {"delta_links": {"legacy": "1"}}
+    assert state_store.get("crawl:b!drive1", "conn-a") == {"delta_links": {"b!drive1": "1"}}
+    assert state_store.get("crawl:b!drive1:folder1", "conn-a") == {"delta_links": {"b!drive1:folder1": "1"}}
+
+
+def test_list_kinds_finds_every_shard_row_and_nothing_else(pg_env):
+    from connectors.sharepoint import state_store
+
+    state_store.put("crawl", "conn-a", {})
+    state_store.put("facts", "conn-a", {})
+    state_store.put("crawl:b!drive1", "conn-a", {})
+    state_store.put("crawl:b!drive2:folder1", "conn-a", {})
+    state_store.put("crawl:b!drive1", "conn-b", {})  # a different connection — never listed
+
+    assert set(state_store.list_kinds("conn-a", "crawl:")) == {"crawl:b!drive1", "crawl:b!drive2:folder1"}
+
+
+def test_list_kinds_with_no_shard_rows_is_empty(pg_env):
+    from connectors.sharepoint import state_store
+
+    state_store.put("crawl", "conn-a", {})
+    assert state_store.list_kinds("conn-a", "crawl:") == []
+
+
+def test_an_invalid_kind_is_still_refused_by_the_relaxed_check_constraint(pg_env):
+    """The relaxation is narrowly `crawl:%` — a totally unrelated kind must
+    still be refused, same as before migration 0103."""
+    import sqlalchemy as sa
+
+    from src.repositories import sharepoint_state_repo
+
+    try:
+        sharepoint_state_repo().put("conn-a", "bogus", {})
+    except sa.exc.IntegrityError:
+        pass
+    else:
+        raise AssertionError("expected the CHECK constraint to still refuse an unrelated kind")
+
+
+def test_crawler_state_round_trips_through_a_shard_key(pg_env):
+    from connectors.sharepoint import crawler
+
+    crawler.save_state("conn-a", {"delta_links": {"b!drive1": "u"}, "ctags": {"g:1": "c"}}, shard_key="b!drive1")
+    shard_state = crawler.load_state("conn-a", shard_key="b!drive1")
+    assert shard_state["delta_links"] == {"b!drive1": "u"}
+    assert shard_state["ctags"] == {"g:1": "c"}
+
+    # The connection-level row is untouched by the shard write.
+    connection_state = crawler.load_state("conn-a")
+    assert connection_state["delta_links"] == {}
+
+
+def test_apply_resync_clears_every_shard_rows_delta_links_and_failed_items_but_keeps_ctags(pg_env):
+    from connectors.sharepoint import crawler
+
+    crawler.save_state(
+        "conn-a",
+        {"delta_links": {"legacy": "1"}, "ctags": {"g:legacy": "c"}, "failed_items": {"g:legacy": {}}},
+    )
+    crawler.save_state(
+        "conn-a",
+        {"delta_links": {"b!drive1": "u1"}, "ctags": {"g:1": "c1"}, "failed_items": {"g:1": {}}},
+        shard_key="b!drive1",
+    )
+    crawler.save_state(
+        "conn-a",
+        {"delta_links": {"b!drive2:f1": "u2"}, "ctags": {"g:2": "c2"}, "failed_items": {"g:2": {}}},
+        shard_key="b!drive2:f1",
+    )
+
+    crawler._apply_resync("conn-a")
+
+    connection_state = crawler.load_state("conn-a")
+    assert connection_state["delta_links"] == {}
+    assert connection_state["failed_items"] == {}
+    assert connection_state["ctags"] == {"g:legacy": "c"}
+
+    for shard_key in ("b!drive1", "b!drive2:f1"):
+        shard_state = crawler.load_state("conn-a", shard_key=shard_key)
+        assert shard_state["delta_links"] == {}
+        assert shard_state["failed_items"] == {}
+    assert crawler.load_state("conn-a", shard_key="b!drive1")["ctags"] == {"g:1": "c1"}
+    assert crawler.load_state("conn-a", shard_key="b!drive2:f1")["ctags"] == {"g:2": "c2"}

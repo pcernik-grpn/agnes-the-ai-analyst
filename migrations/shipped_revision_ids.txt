@@ -149,3 +149,4 @@
 0101_corpus_chunks_fts_index
 0096_users_kind
 0102_merge_users_kind_fts
+0103_crawl_shards

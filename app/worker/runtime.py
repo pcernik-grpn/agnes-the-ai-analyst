@@ -415,14 +415,17 @@ def _notify_agent_response_webhooks(job: dict, status: str) -> None:
 #: Job kinds that open an ``extraction_runs`` row (``connectors.sharepoint.
 #: crawler._RunRecorder``) — mirrors ``app/worker/kinds.py::
 #: _INJECT_JOB_ID_KINDS``, which is what makes that row's ``job_id``
-#: resolvable back to a claimed job in the first place. Only
-#: ``corpus-extraction`` qualifies today: the standalone
-#: ``sharepoint-facts-extraction`` job never opens a row of its own (it
-#: reads already-indexed documents under a self-releasing advisory lock,
-#: ``connectors.sharepoint.state_store.facts_pass_lock`` — a killed worker
-#: leaves nothing "running" behind for that kind to close), so a lookup for
-#: it would only ever cost a wasted query.
-_EXTRACTION_RUN_OWNING_KINDS = frozenset({"corpus-extraction"})
+#: resolvable back to a claimed job in the first place. ``corpus-extraction``
+#: (the inline crawl OR the planner — either way it opens a row: the inline
+#: crawl its own, the planner the PARENT) and ``corpus-extraction-shard``
+#: (2026-09-03 auto-parallel-crawl design §4.3 — each child opens its own
+#: row) both qualify. The standalone ``sharepoint-facts-extraction`` job
+#: never opens a row of its own (it reads already-indexed documents under a
+#: self-releasing advisory lock, ``connectors.sharepoint.state_store.
+#: facts_pass_lock`` — a killed worker leaves nothing "running" behind for
+#: that kind to close), so a lookup for it would only ever cost a wasted
+#: query.
+_EXTRACTION_RUN_OWNING_KINDS = frozenset({"corpus-extraction", "corpus-extraction-shard"})
 
 
 def _finalize_extraction_run_for_job(job_id: str, kind: str, error: str) -> None:
@@ -458,6 +461,42 @@ def _finalize_extraction_run_for_job(job_id: str, kind: str, error: str) -> None
     if closed:
         logger.info(
             "worker: job %s (kind=%s) exhausted — closed extraction_runs row %s as failed", job_id, kind, closed
+        )
+        if kind == "corpus-extraction-shard":
+            _bump_parent_after_shard_job_exhausted(closed)
+
+
+def _bump_parent_after_shard_job_exhausted(shard_run_id: str) -> None:
+    """A ``corpus-extraction-shard`` job just exhausted its reclaim budget
+    and its own ``extraction_runs`` row was closed ``failed`` by
+    :func:`_finalize_extraction_run_for_job` above — the PARENT run still
+    needs to hear about it (2026-09-03 auto-parallel-crawl design §4.3:
+    "a dead child's job fails through the existing reclaim budget and
+    ``fail_for_job`` closes its row; the parent then finalizes as ``failed``
+    on the last live child, naming the shard").
+
+    Reuses ``connectors.sharepoint.crawler._finish_shard_and_maybe_finalize``
+    — the SAME bump-and-maybe-finalize a live child calls on its own normal
+    exit — so an exhausted-reclaim death and a clean shard failure roll up
+    into the parent identically. Best-effort and raise-free, same posture
+    as the caller above: a coordination hiccup here must never turn an
+    already-committed job finalize into a worker crash.
+    """
+    try:
+        from src.repositories import extraction_runs_repo, source_connections_repo
+
+        row = extraction_runs_repo().get(shard_run_id)
+        if not row or not row.get("parent_run_id"):
+            return
+        connection = source_connections_repo().get(row["connection_id"])
+        if not connection:
+            return
+        from connectors.sharepoint.crawler import _finish_shard_and_maybe_finalize
+
+        _finish_shard_and_maybe_finalize(connection, str(row["parent_run_id"]))
+    except Exception:
+        logger.debug(
+            "worker: could not roll exhausted shard run %s into its parent (non-fatal)", shard_run_id, exc_info=True
         )
 
 

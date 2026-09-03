@@ -1372,6 +1372,32 @@ def _run_corpus_extraction(payload: dict) -> dict:
     return run_builtin_crawl(payload)
 
 
+def _run_corpus_extraction_shard(payload: dict) -> dict:
+    """``corpus-extraction-shard`` (2026-09-03 auto-parallel-crawl design
+    §4.3) — one shard child's own crawl, enqueued by a ``corpus-extraction``
+    run that decided to plan rather than crawl inline
+    (``connectors.sharepoint.crawler._plan_or_run_inline``).
+
+    A thin delegate, exactly like ``_run_corpus_extraction`` above: the
+    shard's own targets, its per-delta-unit state rows, its own
+    ``extraction_runs`` row, and the finalize-on-last-child coordination all
+    live in ``connectors.sharepoint.crawler.run_shard_crawl``. This handler
+    owns exactly the same one thing ``_run_corpus_extraction`` does: the
+    ``sharepoint.enabled`` gate.
+
+    ``payload``: ``connection_id``, ``parent_run_id``, ``shard_index``,
+    ``shard`` — see ``run_shard_crawl``'s own docstring for the full shape.
+    """
+    from app.instance_config import feature_enabled
+
+    if not feature_enabled("sharepoint", "enabled", env_var="AGNES_SHAREPOINT_ENABLED", default=False):
+        raise RuntimeError("corpus-extraction-shard: sharepoint.enabled is false — refusing to run")
+
+    from connectors.sharepoint.crawler import run_shard_crawl
+
+    return run_shard_crawl(payload)
+
+
 def _run_sharepoint_acl_sync(payload: dict) -> dict:
     """Thin delegate to ``connectors.sharepoint.acl_sync.run_acl_sync`` — the
     sync body (read → classify → resolve → diff → write, per-connection
@@ -1459,10 +1485,12 @@ def _run_sharepoint_facts_extraction(payload: dict) -> dict:
 
 #: Kinds whose payload gets this claimed job's own ``id`` merged in before
 #: the handler runs — see :func:`_payload_for_handler`. A plain set, not a
-#: per-kind flag on ``JobKind``: only ``corpus-extraction`` has anywhere to
-#: put it today (``extraction_runs.job_id``), and a second consumer can add
+#: per-kind flag on ``JobKind``: ``corpus-extraction`` and
+#: ``corpus-extraction-shard`` (2026-09-03 auto-parallel-crawl design §4.3)
+#: are the only two with anywhere to put it (``extraction_runs.job_id``,
+#: on the run each one opens for itself), and a third consumer can add
 #: itself here without a registry shape change.
-_INJECT_JOB_ID_KINDS = frozenset({"corpus-extraction"})
+_INJECT_JOB_ID_KINDS = frozenset({"corpus-extraction", "corpus-extraction-shard"})
 
 
 def _payload_for_handler(job: dict) -> dict:
@@ -1725,6 +1753,23 @@ def register_all_kinds() -> None:
             # No automatic retry: a failed run (bad credentials, a crawl
             # error, an exhausted throttle budget) needs an operator to look
             # at it, not an unattended re-run a few minutes later.
+            retry_in_seconds=None,
+        )
+    )
+    register_kind(
+        JobKind(
+            name="corpus-extraction-shard",
+            handler=_run_corpus_extraction_shard,
+            # Same lane as corpus-extraction — a shard child IS a crawl,
+            # just over a narrower set of targets.
+            lane=EXTRACTION_LANE,
+            # Same lease shape as corpus-extraction above.
+            lease_seconds=_DEFAULT_EXTRACTION_LEASE_S,
+            # No automatic retry — same rationale as corpus-extraction: a
+            # failed shard needs an operator to look at it, not an
+            # unattended re-run. (Re-running just this shard is still
+            # possible via `POST …/extract` with `shards: [index]` —
+            # app/api/admin_sharepoint.py, Task 5.)
             retry_in_seconds=None,
         )
     )

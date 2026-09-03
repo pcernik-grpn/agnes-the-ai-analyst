@@ -1401,6 +1401,88 @@ def test_maybe_continue_facts_extraction_is_a_noop_for_other_kinds(monkeypatch):
 
     runtime_mod._maybe_continue_facts_extraction({"id": "job-1", "kind": "data-refresh"}, {"interrupted": True})
 
+
+# corpus-extraction-shard also owns a row (2026-09-03 auto-parallel-crawl
+# design §4.3) — an exhausted shard job's own row closes the SAME way, and
+# the PARENT must hear about it (design: "a dead child's job fails through
+# the existing reclaim budget and fail_for_job closes its row; the parent
+# then finalizes as failed on the last live child").
+# ---------------------------------------------------------------------------
+
+
+def test_finalize_extraction_run_for_job_also_rolls_a_shard_into_its_parent(monkeypatch):
+    from app.worker import runtime as runtime_mod
+
+    calls = _patch_extraction_runs_repo(monkeypatch)
+    bumped: list[str] = []
+    monkeypatch.setattr(runtime_mod, "_bump_parent_after_shard_job_exhausted", lambda run_id: bumped.append(run_id))
+
+    runtime_mod._finalize_extraction_run_for_job("job-1", "corpus-extraction-shard", "boom")
+
+    assert calls == [("job-1", "boom")]
+    assert bumped == ["er_fake"]
+
+
+def test_finalize_extraction_run_for_job_never_bumps_for_the_plain_kind(monkeypatch):
+    """The PARENT (planner) run's own job is `corpus-extraction`, not the
+    shard kind — its exhaustion must never try to roll itself into
+    "its parent" (it has none)."""
+    from app.worker import runtime as runtime_mod
+
+    _patch_extraction_runs_repo(monkeypatch)
+    bumped: list[str] = []
+    monkeypatch.setattr(runtime_mod, "_bump_parent_after_shard_job_exhausted", lambda run_id: bumped.append(run_id))
+
+    runtime_mod._finalize_extraction_run_for_job("job-1", "corpus-extraction", "boom")
+
+    assert bumped == []
+
+
+def test_bump_parent_after_shard_job_exhausted_rolls_the_shard_into_its_parent(monkeypatch):
+    from app.worker import runtime as runtime_mod
+
+    class FakeExtractionRunsRepo:
+        def get(self, run_id):
+            return {"id": run_id, "connection_id": "conn-1", "parent_run_id": "er_parent"}
+
+    class FakeSourceConnectionsRepo:
+        def get(self, connection_id):
+            return {"id": connection_id, "source_type": "sharepoint"}
+
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr("src.repositories.extraction_runs_repo", lambda: FakeExtractionRunsRepo())
+    monkeypatch.setattr("src.repositories.source_connections_repo", lambda: FakeSourceConnectionsRepo())
+    monkeypatch.setattr(
+        "connectors.sharepoint.crawler._finish_shard_and_maybe_finalize",
+        lambda connection, parent_run_id: calls.append((connection["id"], parent_run_id)),
+    )
+
+    runtime_mod._bump_parent_after_shard_job_exhausted("er_shard1")
+
+    assert calls == [("conn-1", "er_parent")]
+
+
+def test_bump_parent_after_shard_job_exhausted_is_a_noop_with_no_parent(monkeypatch):
+    from app.worker import runtime as runtime_mod
+
+    class FakeExtractionRunsRepo:
+        def get(self, run_id):
+            return {"id": run_id, "connection_id": "conn-1", "parent_run_id": None}
+
+    touched: list[bool] = []
+    monkeypatch.setattr("src.repositories.extraction_runs_repo", lambda: FakeExtractionRunsRepo())
+
+    def _must_not_resolve():
+        raise AssertionError("must not resolve source_connections_repo with no parent")
+
+    monkeypatch.setattr("src.repositories.source_connections_repo", _must_not_resolve)
+    monkeypatch.setattr(
+        "connectors.sharepoint.crawler._finish_shard_and_maybe_finalize",
+        lambda *a, **k: touched.append(True),
+    )
+
+    runtime_mod._bump_parent_after_shard_job_exhausted("er_shard1")
+
     assert touched == []
 
 
@@ -1505,6 +1587,17 @@ def test_facts_extraction_completion_runs_the_continuation_check_after_complete(
     asyncio.run(_run_and_cancel(worker_loop(worker_id="test-worker", poll_interval_s=0.05), 0.4))
 
     assert calls == [{"connection_id": "conn-1", "original_job_id": job["id"], "original_status_when_called": "done"}]
+
+
+def test_bump_parent_after_shard_job_exhausted_never_raises(monkeypatch):
+    from app.worker import runtime as runtime_mod
+
+    def _raise():
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr("src.repositories.extraction_runs_repo", _raise)
+
+    runtime_mod._bump_parent_after_shard_job_exhausted("er_shard1")  # must not raise
 
 
 def test_agent_response_fail_notifies_despite_retry_config_when_attempts_exhausted(worker_db, monkeypatch):

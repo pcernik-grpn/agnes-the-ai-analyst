@@ -43,7 +43,7 @@ import os
 import re
 import threading
 from pathlib import Path
-from typing import Any, Dict, Iterator, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +54,7 @@ __all__ = [
     "facts_pass_lock",
     "file_state_path",
     "get",
+    "list_kinds",
     "put",
 ]
 
@@ -140,9 +141,10 @@ def _pg_repo() -> Any:
 
 def get(kind: str, connection_id: str) -> Optional[Dict[str, Any]]:
     """This connection's raw stored payload for ``kind`` (``"crawl"`` /
-    ``"facts"``), or ``None`` when nothing has ever been saved. Callers
-    apply their own defaults — this seam only knows about bytes, not
-    either module's state shape.
+    ``"facts"`` / ``"crawl:<state_key>"`` — a per-delta-unit shard row,
+    2026-09-03 auto-parallel-crawl design §4.2), or ``None`` when nothing has
+    ever been saved. Callers apply their own defaults — this seam only knows
+    about bytes, not either module's state shape.
     """
     from src.repositories import use_pg
 
@@ -153,8 +155,15 @@ def get(kind: str, connection_id: str) -> Optional[Dict[str, Any]]:
     existing = repo.get(connection_id, kind)
     if existing is not None:
         return existing
-    # One-time legacy-file import (module docstring) — only reached when
-    # Postgres has never seen this connection/kind before.
+    # One-time legacy-file import (module docstring) — only ever applies to
+    # the two kinds that ever HAD a legacy file. A shard row (`crawl:<key>`)
+    # never did: sharding postdates the move to Postgres, so there is
+    # nothing to import — `_read_file` would raise on it anyway
+    # (`file_state_path` refuses any kind outside `_SUBDIR_BY_KIND` by
+    # design, which is also what keeps a DuckDB-backed instance from ever
+    # accepting a shard row — see `put`'s docstring).
+    if kind not in _SUBDIR_BY_KIND:
+        return None
     legacy = _read_file(kind, connection_id)
     if legacy is None:
         return None
@@ -168,7 +177,18 @@ def get(kind: str, connection_id: str) -> Optional[Dict[str, Any]]:
 
 
 def put(kind: str, connection_id: str, payload: Dict[str, Any]) -> None:
-    """Persist ``payload`` as this connection's ``kind`` state."""
+    """Persist ``payload`` as this connection's ``kind`` state.
+
+    A ``"crawl:<state_key>"`` kind (a shard's own per-delta-unit row) is
+    accepted on Postgres — the CHECK constraint on ``sharepoint_
+    connection_state.kind`` allows it (migration ``0103_crawl_shards``) —
+    and REFUSED on the DuckDB fallback: ``_write_file`` routes through
+    :func:`file_state_path`, which raises :class:`StateStoreError` for any
+    kind outside the fixed ``{"crawl", "facts"}`` pair. This is the
+    fail-clean half of "the SharePoint auto-parallel-crawl feature is
+    PG-only by construction" (design §4.2) — a DuckDB-backed instance never
+    shards, so it never even TRIES to write a shard row.
+    """
     from src.repositories import use_pg
 
     if not use_pg():
@@ -185,6 +205,23 @@ def delete(kind: str, connection_id: str) -> None:
         file_state_path(kind, connection_id).unlink(missing_ok=True)
         return
     _pg_repo().delete(connection_id, kind)
+
+
+def list_kinds(connection_id: str, prefix: str) -> List[str]:
+    """Every ``kind`` this connection has a state row for, starting with
+    ``prefix`` (e.g. ``"crawl:"`` — every shard's own row) — Postgres only.
+
+    The DuckDB fallback always answers ``[]`` rather than raising: this is a
+    DISCOVERY helper, not a write path, and a DuckDB-backed instance never
+    shards (see :func:`put`'s docstring) — a caller asking "does this
+    connection have any shard rows" must get a plain, honest empty answer,
+    never a crash, on a backend where the question can never have a yes.
+    """
+    from src.repositories import use_pg
+
+    if not use_pg():
+        return []
+    return _pg_repo().list_kinds(connection_id, prefix)
 
 
 # --------------------------------------------------------------------------

@@ -2759,6 +2759,240 @@ class TestExtractionTrigger:
         assert extraction_state.get("last_job_id") == r.json()["job_id"]
         assert extraction_state.get("last_run_at")
 
+    def test_duckdb_backend_ignores_the_run_liveness_check(self, seeded_app, monkeypatch):
+        """`extraction_runs_repo()` is PG-only (A3) — on this DuckDB-backed
+        test app it raises `RequiresPostgresBackend`, which the new
+        top-level-run-liveness gate must swallow rather than let escape as
+        a 501; the existing job-idempotency-key dedup is what still governs
+        this backend (see `test_duplicate_run_is_409` above)."""
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(_ENABLED_EXTRACTION_CONFIG))
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="ex-duckdb-liveness")
+        r = c.post(self.EXTRACT.format(base=BASE, cid=conn_id), headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 202, r.text
+
+    def test_409_when_a_top_level_run_is_already_running(self, seeded_app, monkeypatch):
+        """2026-09-03 auto-parallel-crawl design §4.4: a sharded site's
+        PARENT run can still be `running` long after its OWN enqueueing
+        `jobs` row already finished (the planner returns fast) — the
+        job-level idempotency dedup alone can no longer catch a second
+        trigger in that window, so this checks `extraction_runs_repo()
+        .get_running()` directly."""
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(_ENABLED_EXTRACTION_CONFIG))
+
+        class FakeRunningExtractionRunsRepo:
+            def get_running(self, connection_id):
+                return {"id": "er_parent1", "connection_id": connection_id}
+
+        monkeypatch.setattr("src.repositories.extraction_runs_repo", lambda: FakeRunningExtractionRunsRepo())
+
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="ex-run-liveness")
+        r = c.post(self.EXTRACT.format(base=BASE, cid=conn_id), headers=_auth(seeded_app["admin_token"]))
+
+        assert r.status_code == 409, r.text
+        assert r.json()["detail"]["error"] == "extraction_already_running"
+        assert r.json()["detail"]["run_id"] == "er_parent1"
+
+    def test_no_running_run_lets_the_trigger_through(self, seeded_app, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(_ENABLED_EXTRACTION_CONFIG))
+
+        class FakeIdleExtractionRunsRepo:
+            def get_running(self, connection_id):
+                return None
+
+        monkeypatch.setattr("src.repositories.extraction_runs_repo", lambda: FakeIdleExtractionRunsRepo())
+
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="ex-run-liveness-idle")
+        r = c.post(self.EXTRACT.format(base=BASE, cid=conn_id), headers=_auth(seeded_app["admin_token"]))
+
+        assert r.status_code == 202, r.text
+
+
+class TestExtractionTriggerShardRerun:
+    """``POST .../extract`` with ``{"shards": [...]}`` — re-run named
+    shards from the connection's last persisted plan (2026-09-03
+    auto-parallel-crawl design §4.4), bypassing the planner entirely."""
+
+    EXTRACT = "{base}/{cid}/extract"
+
+    @staticmethod
+    def _idle_running_repo(monkeypatch):
+        class FakeIdleExtractionRunsRepo:
+            def get_running(self, connection_id):
+                return None
+
+        monkeypatch.setattr("src.repositories.extraction_runs_repo", lambda: FakeIdleExtractionRunsRepo())
+
+    def test_404_no_shard_plan_when_the_connection_never_sharded(self, seeded_app, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(_ENABLED_EXTRACTION_CONFIG))
+        self._idle_running_repo(monkeypatch)
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="ex-shards-none")
+
+        r = c.post(
+            self.EXTRACT.format(base=BASE, cid=conn_id),
+            json={"shards": [1]},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+
+        assert r.status_code == 404, r.text
+        assert r.json()["detail"]["error"] == "no_shard_plan"
+
+    def test_400_unknown_shard_index(self, seeded_app, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(_ENABLED_EXTRACTION_CONFIG))
+        self._idle_running_repo(monkeypatch)
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="ex-shards-unknown")
+
+        from connectors.sharepoint.crawler import save_state
+
+        save_state(
+            conn_id,
+            {
+                "delta_links": {},
+                "ctags": {},
+                "failed_items": {},
+                "empty_items": {},
+                "shard_plan": {
+                    "parent_run_id": "er_old_parent",
+                    "shards_total": 2,
+                    "shards": [
+                        {
+                            "scope_id": "b!drive1",
+                            "label": "part 1/2",
+                            "expected": 10,
+                            "exclude_prefixes": [],
+                            "targets": [
+                                {"drive_id": "b!drive1", "root_item_id": "f1", "state_key": "b!drive1:f1", "path": "A"}
+                            ],
+                        },
+                        {
+                            "scope_id": "b!drive1",
+                            "label": "remainder",
+                            "expected": 0,
+                            "exclude_prefixes": ["A"],
+                            "targets": [
+                                {"drive_id": "b!drive1", "root_item_id": None, "state_key": "b!drive1", "path": ""}
+                            ],
+                        },
+                    ],
+                },
+            },
+        )
+
+        r = c.post(
+            self.EXTRACT.format(base=BASE, cid=conn_id),
+            json={"shards": [5]},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+
+        assert r.status_code == 400, r.text
+        assert r.json()["detail"]["error"] == "unknown_shard_index"
+        assert r.json()["detail"]["unknown"] == [5]
+        assert r.json()["detail"]["shards_total"] == 2
+
+    def test_named_shards_are_enqueued_as_a_fresh_parent_run(self, seeded_app, monkeypatch):
+        # NOTE: `use_pg()` is deliberately left at this test app's default
+        # (DuckDB) -- `_trigger_shard_rerun` bypasses `_plan_or_run_inline`
+        # (the only place that decision gates anything) and calls
+        # `_enqueue_shard_plan` directly, which only ever touches the
+        # connection-level `crawl` state row (never a per-shard `crawl:<key>`
+        # one -- that happens later, inside the child jobs this test never
+        # runs), so the DuckDB fallback state store works unmodified here.
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(_ENABLED_EXTRACTION_CONFIG))
+
+        class FakeExtractionRunsRepo:
+            def __init__(self):
+                self.started = []
+
+            def get_running(self, connection_id):
+                return None
+
+            def abandon_stale_running(self, connection_id):
+                return []
+
+            def start(self, *, connection_id, job_id=None, phase="crawl", **shard_kwargs):
+                self.started.append({"connection_id": connection_id, **shard_kwargs})
+                return "er_new_parent"
+
+        runs = FakeExtractionRunsRepo()
+        monkeypatch.setattr("src.repositories.extraction_runs_repo", lambda: runs)
+
+        class FakeJobsRepo:
+            def __init__(self):
+                self.enqueued = []
+
+            def enqueue(self, kind, payload, *, priority=0, run_after=None, max_attempts=3, idempotency_key=None):
+                row = {
+                    "id": f"job-{len(self.enqueued) + 1}",
+                    "kind": kind,
+                    "payload_json": payload,
+                    "priority": priority,
+                    "idempotency_key": idempotency_key,
+                    "deduped": False,
+                }
+                self.enqueued.append(row)
+                return row
+
+        jobs = FakeJobsRepo()
+        monkeypatch.setattr("src.repositories.jobs_repo", lambda: jobs)
+
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="ex-shards-rerun")
+
+        from connectors.sharepoint.crawler import save_state
+
+        shard_a = {
+            "scope_id": "b!drive1",
+            "label": "part 1/2",
+            "expected": 10,
+            "exclude_prefixes": [],
+            "targets": [{"drive_id": "b!drive1", "root_item_id": "f1", "state_key": "b!drive1:f1", "path": "A"}],
+        }
+        shard_b = {
+            "scope_id": "b!drive1",
+            "label": "remainder",
+            "expected": 0,
+            "exclude_prefixes": ["A"],
+            "targets": [{"drive_id": "b!drive1", "root_item_id": None, "state_key": "b!drive1", "path": ""}],
+        }
+        save_state(
+            conn_id,
+            {
+                "delta_links": {},
+                "ctags": {},
+                "failed_items": {},
+                "empty_items": {},
+                "shard_plan": {
+                    "parent_run_id": "er_old_parent",
+                    "shards_total": 2,
+                    "shards": [shard_a, shard_b],
+                },
+            },
+        )
+
+        r = c.post(
+            self.EXTRACT.format(base=BASE, cid=conn_id),
+            json={"shards": [2]},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+
+        assert r.status_code == 202, r.text
+        body = r.json()
+        assert body["mode"] == "sharded"
+        assert body["shards_total"] == 1
+        assert body["parent_run_id"] == "er_new_parent"
+
+        assert len(jobs.enqueued) == 1
+        assert jobs.enqueued[0]["kind"] == "corpus-extraction-shard"
+        assert jobs.enqueued[0]["payload_json"]["shard"]["label"] == "remainder"
+        assert len(runs.started) == 1
+        assert runs.started[0]["connection_id"] == conn_id
+        assert runs.started[0]["shards_total"] == 1
+        assert runs.started[0]["parent_run_id"] is None  # a fresh top-level parent, not chained to the old one
+
 
 class TestRetryEmptyExtraction:
     """``POST /connections/{connection_id}/extraction/retry-empty`` —

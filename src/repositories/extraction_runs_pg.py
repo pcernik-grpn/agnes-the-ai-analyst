@@ -123,16 +123,31 @@ class ExtractionRunsPgRepository:
         connection_id: str,
         job_id: Optional[str] = None,
         phase: str = "crawl",
+        parent_run_id: Optional[str] = None,
+        shard_key: Optional[str] = None,
+        shard_label: Optional[str] = None,
+        shards_total: Optional[int] = None,
     ) -> str:
-        """Open a ``running`` row for a crawl that is about to begin."""
+        """Open a ``running`` row for a crawl that is about to begin.
+
+        ``parent_run_id``/``shard_key``/``shard_label`` (2026-09-03 auto-
+        parallel-crawl design §4.2, migration ``0103_crawl_shards``) mark
+        this row as a SHARD CHILD's own — all three ``None`` (every caller
+        before sharding existed, and every inline run since) is today's
+        plain row. ``shards_total`` marks a PARENT (planner) row instead —
+        the two are never both set on the same row: a shard is not itself
+        sharded.
+        """
         run_id = "er_" + secrets.token_hex(8)
         now = _now()
         with self._engine.begin() as conn:
             conn.execute(
                 sa.text(
                     "INSERT INTO extraction_runs "
-                    "(id, connection_id, job_id, status, phase, started_at, checkpoint_at) "
-                    "VALUES (:id, :connection_id, :job_id, :status, :phase, :started_at, :checkpoint_at)"
+                    "(id, connection_id, job_id, status, phase, started_at, checkpoint_at, "
+                    " parent_run_id, shard_key, shard_label, shards_total) "
+                    "VALUES (:id, :connection_id, :job_id, :status, :phase, :started_at, :checkpoint_at, "
+                    " :parent_run_id, :shard_key, :shard_label, :shards_total)"
                 ),
                 {
                     "id": run_id,
@@ -142,6 +157,10 @@ class ExtractionRunsPgRepository:
                     "phase": phase,
                     "started_at": now,
                     "checkpoint_at": now,
+                    "parent_run_id": parent_run_id,
+                    "shard_key": shard_key,
+                    "shard_label": shard_label,
+                    "shards_total": shards_total,
                 },
             )
         return run_id
@@ -237,7 +256,106 @@ class ExtractionRunsPgRepository:
                 },
             )
 
+    # -- shard-crawl (2026-09-03 auto-parallel-crawl design §4.3) ---------
+
+    def bump_parent_checkpoint(self, parent_run_id: str) -> None:
+        """Advance a PARENT run's ``checkpoint_at`` to now — called from a
+        CHILD's own :meth:`checkpoint` (``connectors.sharepoint.crawler
+        ._RunRecorder.checkpoint``) so a live parent whose children are all
+        still crawling never reads as stale to a liveness check derived
+        from checkpoint age, even though the parent's own row stopped
+        writing the moment it finished enqueueing.
+
+        Scoped to ``status = 'running'`` — same "a late write can never
+        resurrect a finalized row" rule :meth:`checkpoint` already applies
+        to an ordinary run.
+        """
+        with self._engine.begin() as conn:
+            conn.execute(
+                sa.text("UPDATE extraction_runs SET checkpoint_at = :now WHERE id = :id AND status = :running"),
+                {"id": parent_run_id, "now": _now(), "running": RUNNING},
+            )
+
+    def finish_shard(self, parent_run_id: str) -> Optional[Dict[str, int]]:
+        """Atomically increment a PARENT's ``shards_done`` by one — called
+        once by each CHILD as it finishes (success, failure, or stopped).
+
+        Returns ``{"shards_done": <new total>, "shards_total": <int or
+        None>}`` — the child that observes ``shards_done == shards_total``
+        is the one that finalizes (see :meth:`claim_finalize`). ``None``
+        when the parent row does not exist (defensive — should never
+        happen in practice, since a child's own payload always carries a
+        ``parent_run_id`` its planner just opened).
+        """
+        with self._engine.begin() as conn:
+            row = (
+                conn.execute(
+                    sa.text(
+                        "UPDATE extraction_runs SET shards_done = shards_done + 1 "
+                        "WHERE id = :id RETURNING shards_done, shards_total"
+                    ),
+                    {"id": parent_run_id},
+                )
+                .mappings()
+                .first()
+            )
+        if row is None:
+            return None
+        return {"shards_done": int(row["shards_done"]), "shards_total": row["shards_total"]}
+
+    def claim_finalize(self, parent_run_id: str) -> bool:
+        """Win the race to finalize a PARENT run — at most one caller ever
+        gets ``True`` for a given ``parent_run_id``, however many children
+        observe ``shards_done == shards_total`` at once (design §4.3: "the
+        LAST child to finish finalizes the parent", made race-safe here).
+
+        ``phase`` is the flag: flips ``'plan'``/``'crawl'``/whatever the
+        parent's phase last was to ``'finalizing'`` in one atomic
+        ``UPDATE ... WHERE phase <> 'finalizing' RETURNING id`` — a second,
+        concurrent caller's ``WHERE`` matches zero rows and gets ``False``.
+        Idempotent in the sense that matters: a caller that loses the race
+        does no work and does not finalize twice, but a genuinely STUCK
+        parent (finalizer died mid-way, phase left at ``'finalizing'``
+        forever) is not un-stuck by calling this again — that recovery path
+        is "the next ``POST …/extract`` finalizes instead of re-planning"
+        (design §4.3), not a retry of this method.
+        """
+        with self._engine.begin() as conn:
+            row = conn.execute(
+                sa.text(
+                    "UPDATE extraction_runs SET phase = 'finalizing' "
+                    "WHERE id = :id AND phase IS DISTINCT FROM 'finalizing' "
+                    "RETURNING id"
+                ),
+                {"id": parent_run_id},
+            ).first()
+        return row is not None
+
     # -- read -------------------------------------------------------------
+
+    def children_for(self, parent_run_ids: List[str]) -> Dict[str, List[Dict[str, Any]]]:
+        """Every shard child row for the given PARENT run ids, in ONE
+        query — keyed by ``parent_run_id`` — so the fleet view and the
+        finalizer never pay one round trip per parent.
+
+        ``report`` comes back with ``failed_items``/``skipped_items``
+        stripped (see :data:`_RUN_LIST_COLUMNS`) — same LIST-view contract
+        as :meth:`list_latest_for_connections`; the finalizer's own
+        aggregation reads only the counters and top-level keys every
+        report carries, never the itemized lists.
+        """
+        if not parent_run_ids:
+            return {}
+        sql = (
+            f"SELECT {_RUN_LIST_COLUMNS}, parent_run_id, shard_key, shard_label FROM extraction_runs "
+            "WHERE parent_run_id = ANY(:ids) ORDER BY parent_run_id, shard_key"
+        )
+        with self._engine.connect() as conn:
+            rows = conn.execute(sa.text(sql), {"ids": list(parent_run_ids)}).mappings().all()
+        by_parent: Dict[str, List[Dict[str, Any]]] = {pid: [] for pid in parent_run_ids}
+        for r in rows:
+            by_parent.setdefault(str(r["parent_run_id"]), []).append(_decode_row(dict(r)))
+        return by_parent
 
     def get(self, run_id: str) -> Optional[Dict[str, Any]]:
         with self._engine.connect() as conn:
@@ -247,19 +365,24 @@ class ExtractionRunsPgRepository:
         return _decode_row(dict(row)) if row else None
 
     def get_running(self, connection_id: str) -> Optional[Dict[str, Any]]:
-        """The newest still-``running`` row for this connection, or None.
+        """The newest still-``running`` TOP-LEVEL row for this connection,
+        or None — ``parent_run_id IS NULL`` excludes a shard CHILD's own
+        row (2026-09-03 auto-parallel-crawl design §4.3): a child never
+        appears as this connection's "the" running row, only its PARENT
+        (planner) row does, for the whole time any of its children are
+        still crawling.
 
         "Newest" rather than "the only one": the trigger endpoint's
-        idempotency key already prevents two concurrent runs per connection,
-        but a row orphaned by a hard-killed worker (no finalize ever ran)
-        would otherwise shadow the real one forever.
+        idempotency key already prevents two concurrent TOP-LEVEL runs per
+        connection, but a row orphaned by a hard-killed worker (no finalize
+        ever ran) would otherwise shadow the real one forever.
         """
         with self._engine.connect() as conn:
             row = (
                 conn.execute(
                     sa.text(
                         "SELECT * FROM extraction_runs "
-                        "WHERE connection_id = :cid AND status = :running "
+                        "WHERE connection_id = :cid AND status = :running AND parent_run_id IS NULL "
                         "ORDER BY started_at DESC LIMIT 1"
                     ),
                     {"cid": connection_id, "running": RUNNING},
@@ -293,7 +416,10 @@ class ExtractionRunsPgRepository:
         """
         if not connection_ids:
             return {}
-        sql = f"SELECT DISTINCT ON (connection_id) {_RUN_LIST_COLUMNS} FROM extraction_runs WHERE connection_id = ANY(:ids)"
+        sql = (
+            f"SELECT DISTINCT ON (connection_id) {_RUN_LIST_COLUMNS} FROM extraction_runs "
+            "WHERE connection_id = ANY(:ids) AND parent_run_id IS NULL"
+        )
         params: Dict[str, Any] = {"ids": list(connection_ids)}
         if running_only:
             sql += " AND status = :running"
@@ -477,7 +603,10 @@ class ExtractionRunsPgRepository:
         return len(rows)
 
     def last_failed(self, connection_id: str) -> Optional[Dict[str, Any]]:
-        """The newest run that ended in ``failed`` — surfaced ALONGSIDE
+        """The newest TOP-LEVEL run that ended in ``failed`` (``parent_run_id
+        IS NULL`` — a shard child's own failure surfaces through its
+        PARENT's aggregated outcome, never as a top-level row of its own,
+        2026-09-03 auto-parallel-crawl design §4.7) — surfaced ALONGSIDE
         :meth:`last_completed`, never merged into it: that method's own
         contract (and its test coverage) deliberately keeps a hard failure
         out of the "last run" figures an operator reads for corpus-health
@@ -490,7 +619,7 @@ class ExtractionRunsPgRepository:
                 conn.execute(
                     sa.text(
                         "SELECT * FROM extraction_runs "
-                        "WHERE connection_id = :cid AND status = :failed "
+                        "WHERE connection_id = :cid AND status = :failed AND parent_run_id IS NULL "
                         "ORDER BY started_at DESC LIMIT 1"
                     ),
                     {"cid": connection_id, "failed": FAILED},
@@ -507,7 +636,10 @@ class ExtractionRunsPgRepository:
         limit: int = 10,
         include_running: bool = True,
     ) -> List[Dict[str, Any]]:
-        """Most recent runs first — the run-history drawer's rows.
+        """Most recent TOP-LEVEL runs first (``parent_run_id IS NULL`` — a
+        shard child never appears in the run-history drawer as its own
+        row; its parent's row, with its aggregated ``shards_done``/
+        ``shards_total``, does) — the run-history drawer's rows.
 
         ``report`` comes back with ``failed_items``/``skipped_items``
         stripped, same as :meth:`list_latest_for_connections` — see
@@ -515,7 +647,7 @@ class ExtractionRunsPgRepository:
         through :meth:`get`, which keeps every key.
         """
         limit = max(1, min(int(limit or 10), 100))
-        sql = f"SELECT {_RUN_LIST_COLUMNS} FROM extraction_runs WHERE connection_id = :cid"
+        sql = f"SELECT {_RUN_LIST_COLUMNS} FROM extraction_runs WHERE connection_id = :cid AND parent_run_id IS NULL"
         params: Dict[str, Any] = {"cid": connection_id, "limit": limit}
         if not include_running:
             sql += " AND status <> :running"
@@ -526,25 +658,31 @@ class ExtractionRunsPgRepository:
         return [_decode_row(dict(r)) for r in rows]
 
     def count_for_connection(self, connection_id: str) -> int:
-        """Total runs recorded for this connection — the drawer button's
-        count, so "5 more runs" is never a silent truncation."""
+        """Total TOP-LEVEL runs recorded for this connection (``parent_run_id
+        IS NULL``) — the drawer button's count, so "5 more runs" is never a
+        silent truncation, and never inflated by a sharded run's own
+        children."""
         with self._engine.connect() as conn:
             value = conn.execute(
-                sa.text("SELECT COUNT(*) FROM extraction_runs WHERE connection_id = :cid"),
+                sa.text("SELECT COUNT(*) FROM extraction_runs WHERE connection_id = :cid AND parent_run_id IS NULL"),
                 {"cid": connection_id},
             ).scalar()
         return int(value or 0)
 
     def last_completed(self, connection_id: str) -> Optional[Dict[str, Any]]:
-        """The newest run that actually ended (``done`` or ``interrupted``)
-        — the card's "last run" figures come from here, never from a
-        ``failed`` row that has no counters and never from a live one."""
+        """The newest TOP-LEVEL run that actually ended (``done`` or
+        ``interrupted``, ``parent_run_id IS NULL``) — the card's "last run"
+        figures come from here, never from a ``failed`` row that has no
+        counters, never from a live one, and never from a shard child's own
+        row (its parent's aggregated row is what "last run" means for a
+        sharded site)."""
         with self._engine.connect() as conn:
             row = (
                 conn.execute(
                     sa.text(
                         "SELECT * FROM extraction_runs "
                         "WHERE connection_id = :cid AND status IN (:done, :interrupted) "
+                        "AND parent_run_id IS NULL "
                         "ORDER BY started_at DESC LIMIT 1"
                     ),
                     {"cid": connection_id, "done": DONE, "interrupted": INTERRUPTED},

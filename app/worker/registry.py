@@ -90,8 +90,15 @@ DEFAULT_JOB_MAX_ATTEMPTS = 3
 #: reclaims exhausted the shared default of 3 attempts. 25 is generous
 #: headroom for a run spanning many hours and several restarts without
 #: being unbounded.
+#: ``corpus-extraction-shard`` (2026-09-03 auto-parallel-crawl design §4.3)
+#: joins the same override for the same reason: it too registers with
+#: ``retry_in_seconds=None``, so any attempt past the first can only be a
+#: crash-recovery reclaim, never a second try at a handler that already
+#: raised — and a shard child can live just as long as its parent's own
+#: multi-hour run.
 JOB_MAX_ATTEMPTS_BY_KIND: dict[str, int] = {
     "corpus-extraction": 25,
+    "corpus-extraction-shard": 25,
     "sharepoint-facts-extraction": 25,
 }
 
