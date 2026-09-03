@@ -117,9 +117,9 @@ class ChatUploadResponse(BaseModel):
     size_bytes: int
     kind: str
     table_name: Optional[str] = None
-    # Slug of the single-file artefact this upload was also saved as, when the
+    # Slug of the single-file artifact this upload was also saved as, when the
     # file is a document/image (data files stay workspace-only). None when no
-    # artefact was created. Reachable at /library/{artefact_slug}.
+    # artifact was created. Reachable at /library/{artefact_slug}.
     artefact_slug: Optional[str] = None
     hint: str
 
@@ -435,10 +435,10 @@ async def chat_upload(
                     registration_error,
                 )
 
-        # --- also persist docs/images as a single-file artefact -------------
+        # --- also persist docs/images as a single-file artifact -------------
         # A document/image dropped in chat shouldn't vanish with the session:
-        # persist + index it as a private single-file artefact (it then shows
-        # in Artefacts and is searchable). Data files stay workspace-only —
+        # persist + index it as a private single-file artifact (it then shows
+        # in Artifacts and is searchable). Data files stay workspace-only —
         # their job is to become a queryable table, not searchable prose.
         # Best-effort: a failure here never fails the workspace upload the user
         # actually asked for.
@@ -457,7 +457,7 @@ async def chat_upload(
                     background_tasks.add_task(ingest_file, created["file_id"])
             except Exception:
                 logger.warning(
-                    "chat_upload: could not save artefact for user=%s file=%s",
+                    "chat_upload: could not save artifact for user=%s file=%s",
                     email,
                     safe_name,
                     exc_info=True,
@@ -491,7 +491,7 @@ async def chat_upload(
                 "relative to the working directory."
             )
         if artefact_slug:
-            hint += " Saved to your Artefacts."
+            hint += " Saved to your Artifacts."
 
         logger.info(
             "chat_upload: user=%s kind=%s file=%s size=%d table=%s",

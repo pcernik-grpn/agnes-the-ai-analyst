@@ -264,7 +264,7 @@ _COHORT: dict[str, tuple[str, str]] = {
     "/api/data-apps/{slug}": ("app show", "data_app_get"),
     "/api/data-apps/{slug}/deploy": ("app deploy", "data_app_deploy"),
     "/api/data-apps/{slug}/logs": ("app logs", "data_app_logs"),
-    # "Add artefacts to My Stack" — Stack membership for personal file
+    # "Add artifacts to My Stack" — Stack membership for personal file
     # Collections (permission = ownership/sharing, not admin-RBAC grants).
     # POST (add) → stack_artefact_add; DELETE (remove) → stack_artefact_remove
     # — one cohort row per path, mirrors the /api/store/entities/{entity_id}
@@ -1585,7 +1585,7 @@ _EXEMPT: dict[str, str] = {
     ),
     "/api/chat/sessions/{chat_id}/files/save-artefact": (
         "web chat affordance — saves one session-workspace file as the "
-        "caller's private Library artefact (same bridge the chat composer "
+        "caller's private Library artifact (same bridge the chat composer "
         "upload uses); CLI sessions already have the files locally, no MCP "
         "analogue"
     ),

@@ -2348,7 +2348,7 @@ class TestAutoShareAdminUploads:
         assert not self._everyone_grant_exists(body["id"])
 
     def test_flag_on_chat_drop_by_admin_stays_private(self, seeded_app, monkeypatch):
-        # Guard: the chat-upload path creates artefacts through
+        # Guard: the chat-upload path creates artifacts through
         # create_single_file_artefact, which the auto-share hook must not
         # touch — an admin's ad-hoc chat file is not a publication.
         monkeypatch.setenv("AGNES_LIBRARY_AUTO_SHARE_ADMIN_UPLOADS", "true")

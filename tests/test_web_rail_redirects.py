@@ -123,7 +123,7 @@ def test_apps_redirects_under_rail_when_caller_is_granted_not_owner(seeded_app, 
 def test_apps_keeps_empty_state_under_rail_when_caller_sees_none(seeded_app, monkeypatch):
     """A caller the Library would show NO app row must keep this page's
     explicit empty state — redirecting them lands on a Library whose
-    Artefacts band never rendered, with nothing explaining where the apps
+    Artifacts band never rendered, with nothing explaining where the apps
     inventory went (Devin review on PR #1278)."""
     monkeypatch.setenv("AGNES_UI_LAYOUT", "rail")
     monkeypatch.setenv("AGNES_DATA_APPS_ENABLED", "1")

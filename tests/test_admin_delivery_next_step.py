@@ -27,6 +27,8 @@ What these pin:
 
 from __future__ import annotations
 
+from tests import _ds_page_source
+
 import re
 import uuid
 from pathlib import Path
@@ -371,7 +373,7 @@ class TestNextStepHtml:
         import subprocess
         import tempfile
 
-        tpl = _DATA_SOURCES_TPL.read_text(encoding="utf-8")
+        tpl = _ds_page_source.page_source()
         fns = "\n".join(
             self._extract_function(tpl, sig) for sig in ("function _esc(s) {", "function _nextStepHtml(row) {")
         )

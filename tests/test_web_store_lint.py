@@ -37,6 +37,39 @@ def _seed_finding(entity_id: str, *, message: str, rule_id: str = "SL002", conte
     return content_hash
 
 
+class TestLintIsReachable:
+    """The lint page has no sidebar row — it is in ``ADMIN_NAV_OFFNAV``, whose
+    contract is that an off-nav page states the door it IS reached from. This
+    is that door, so it is a guard and not a detail: drop the link and the page
+    becomes URL-only, which is the state the off-nav list exists to prevent.
+
+    On Submissions rather than the moderation hub (/admin/store) on purpose —
+    that page is off by default (``features.store_moderation_enabled``) and
+    redirects home when it is, so lint's only door cannot hang there.
+    """
+
+    def test_the_submissions_queue_links_the_lint_page(self, web_client):  # noqa: F811
+        _, admin_cookies = _make_admin(web_client, "admin@x.com")
+        resp = web_client.get(
+            "/admin/store/submissions", cookies=admin_cookies, headers={"Accept": "text/html"}
+        )
+        assert resp.status_code == 200, resp.text
+        assert '/admin/store/lint' in resp.text, (
+            "the Submissions queue no longer links /admin/store/lint — that link is the "
+            "lint page's only door (see ADMIN_NAV_OFFNAV in app/web/admin_nav.py)"
+        )
+
+    def test_lint_has_no_sidebar_row_of_its_own(self):
+        """The other half of the same decision: if a row comes back, this door
+        is redundant rather than load-bearing, and the two should be reconciled
+        deliberately instead of drifting into both."""
+        from app.web.admin_nav import ADMIN_NAV_OFFNAV, ADMIN_NAV_SECTIONS, _section_entries
+
+        rows = {e["href"] for s in ADMIN_NAV_SECTIONS for e in _section_entries(s)}
+        assert "/admin/store/lint" not in rows
+        assert any(e["href"] == "/admin/store/lint" and e.get("reached_from") for e in ADMIN_NAV_OFFNAV)
+
+
 class TestAdminLintPage:
     def test_admin_sees_findings_and_audit_button(self, web_client):  # noqa: F811
         _, cookies = _create_user(web_client, "alice@x.com")
