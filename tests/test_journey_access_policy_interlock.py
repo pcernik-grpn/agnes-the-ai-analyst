@@ -597,3 +597,74 @@ class TestTwoPoliciedRowsStayUnwindable:
             headers=_auth(token),
         )
         assert cleared.status_code == 200, cleared.text
+
+
+@pytest.mark.journey
+class TestClearAndDistributeInOnePut:
+    """The safety valve the interlock must NOT swallow: clearing the policy
+    and making the table distributable again in ONE request.
+
+    Load-bearing for the repository-level invariant (#2147): `register()` now
+    refuses an upsert that would leave a still-policied row distributable, and
+    it reads the row as it stands on disk — so the handler has to clear the
+    policy BEFORE it upserts, not after.
+    """
+
+    def test_clearing_the_policy_and_distributing_in_one_put_is_allowed(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("AGNES_ACCESS_POLICIES_ENABLED", "1")
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        table_id = _register(c, token, name="clear_and_distribute", server_only=True)
+
+        attach = c.put(
+            f"/api/admin/registry/{table_id}",
+            json={
+                "access_policy_sql": _policy_sql("clear_and_distribute"),
+                "access_policy_note": "pii masking",
+            },
+            headers=_auth(token),
+        )
+        assert attach.status_code == 200, attach.text
+
+        resp = c.put(
+            f"/api/admin/registry/{table_id}",
+            json={"access_policy_sql": None, "server_only": False},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200, resp.text
+
+        from src.repositories import table_registry_repo
+
+        row = table_registry_repo().get(table_id)
+        assert row["access_policy_sql"] is None
+        assert bool(row["server_only"]) is False
+
+    def test_clearing_the_policy_alone_still_leaves_the_table_undistributed(self, seeded_app, monkeypatch):
+        """Clearing without asking for distribution changes nothing else."""
+        monkeypatch.setenv("AGNES_ACCESS_POLICIES_ENABLED", "1")
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        table_id = _register(c, token, name="clear_only", server_only=True)
+
+        c.put(
+            f"/api/admin/registry/{table_id}",
+            json={
+                "access_policy_sql": _policy_sql("clear_only"),
+                "access_policy_note": "pii masking",
+            },
+            headers=_auth(token),
+        )
+        resp = c.put(
+            f"/api/admin/registry/{table_id}",
+            json={"access_policy_sql": None},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200, resp.text
+
+        from src.repositories import table_registry_repo
+
+        row = table_registry_repo().get(table_id)
+        assert row["access_policy_sql"] is None
+        assert row["access_policy_note"] is None
+        assert row["access_policy_updated_by"] is None
+        assert bool(row["server_only"]) is True

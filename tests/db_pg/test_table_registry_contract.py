@@ -445,3 +445,138 @@ class TestDeleteForCorpusCascade:
 
     def test_empty_corpus_is_still_a_no_op(self, repos):
         assert repos["registry"].delete_for_corpus("col_nonexistent") == []
+
+
+class TestPoliciedRowRegisterInvariant:
+    """``register()`` is a blind ``ON CONFLICT (id) DO UPDATE`` upsert, and it
+    does not touch ``access_policy_sql`` — so before this invariant existed,
+    ANY caller re-registering an existing *policied* id (the boot-time
+    internal-table refresh, a connector's auto-discovery, a collection file
+    re-ingest) silently reset ``server_only`` to its ``False`` default and
+    left the row policied AND distributable: exactly the state the API-level
+    interlock ``access_policy_requires_undistributed``
+    (``app/api/admin.py``) forbids, reached by writing through the repository
+    instead of the API.
+
+    The invariant, on BOTH backends: an upsert onto a policied row may never
+    make it distributable. An unspecified ``server_only`` preserves the
+    stored value; an explicit attempt to distribute is refused with
+    ``PoliciedRowDistributionError``. Unpolicied rows behave exactly as
+    before.
+    """
+
+    POLICY = "SELECT * FROM invoices WHERE list_contains($user_groups, cost_center)"
+
+    def _seed_policied(self, repos, table_id, *, query_mode="materialized", server_only=True):
+        repos["registry"].register(
+            id=table_id,
+            name=table_id,
+            source_type="keboola",
+            query_mode=query_mode,
+            server_only=server_only,
+        )
+        repos["registry"].set_access_policy(
+            table_id,
+            sql=self.POLICY,
+            note="cost-centre scoping",
+            updated_by="admin@example.com",
+        )
+
+    def test_reregister_with_default_args_keeps_server_only_and_policy(self, repos):
+        self._seed_policied(repos, "pol_default")
+
+        # The defect: a caller that knows nothing about policies re-registers
+        # the row (deterministic id) with query_mode='local' and no
+        # server_only — the row must stay undistributed.
+        repos["registry"].register(
+            id="pol_default",
+            name="pol_default",
+            source_type="keboola",
+            query_mode="local",
+        )
+
+        row = repos["registry"].get("pol_default")
+        assert bool(row["server_only"]) is True
+        assert row["access_policy_sql"] == self.POLICY
+
+    def test_reregister_with_explicit_server_only_false_is_refused(self, repos):
+        from src.repository_errors import PoliciedRowDistributionError
+
+        self._seed_policied(repos, "pol_explicit")
+
+        with pytest.raises(PoliciedRowDistributionError):
+            repos["registry"].register(
+                id="pol_explicit",
+                name="pol_explicit",
+                source_type="keboola",
+                query_mode="local",
+                server_only=False,
+            )
+
+        row = repos["registry"].get("pol_explicit")
+        assert bool(row["server_only"]) is True
+        assert row["access_policy_sql"] == self.POLICY
+        assert row["query_mode"] == "materialized", "the refused upsert must not have landed"
+
+    def test_reregister_of_a_policied_remote_row_as_local_is_refused(self, repos):
+        """The other undistributed shape: query_mode='remote', server_only
+        false. Moving it to 'local' distributes it, so it is refused rather
+        than silently rewritten."""
+        from src.repository_errors import PoliciedRowDistributionError
+
+        self._seed_policied(repos, "pol_remote", query_mode="remote", server_only=False)
+
+        with pytest.raises(PoliciedRowDistributionError):
+            repos["registry"].register(
+                id="pol_remote",
+                name="pol_remote",
+                source_type="bigquery",
+                query_mode="local",
+            )
+
+        row = repos["registry"].get("pol_remote")
+        assert row["query_mode"] == "remote"
+        assert row["access_policy_sql"] == self.POLICY
+
+    def test_reregister_of_a_policied_remote_row_stays_writable(self, repos):
+        """A policied row is not frozen — an upsert that keeps it
+        undistributed still lands."""
+        self._seed_policied(repos, "pol_edit", query_mode="remote", server_only=False)
+
+        repos["registry"].register(
+            id="pol_edit",
+            name="Renamed",
+            source_type="bigquery",
+            query_mode="remote",
+        )
+
+        row = repos["registry"].get("pol_edit")
+        assert row["name"] == "Renamed"
+        assert row["access_policy_sql"] == self.POLICY
+
+    def test_unpolicied_row_still_resets_server_only_to_the_default(self, repos):
+        """No policy, no new behavior: the upsert keeps its pre-existing
+        last-writer-wins semantics."""
+        repos["registry"].register(
+            id="plain",
+            name="plain",
+            source_type="keboola",
+            query_mode="local",
+            server_only=True,
+        )
+
+        repos["registry"].register(id="plain", name="plain", source_type="keboola", query_mode="local")
+
+        assert bool(repos["registry"].get("plain")["server_only"]) is False
+
+    def test_unpolicied_row_registers_distributable_freely(self, repos):
+        repos["registry"].register(
+            id="plain2",
+            name="plain2",
+            source_type="keboola",
+            query_mode="local",
+            server_only=False,
+        )
+        row = repos["registry"].get("plain2")
+        assert bool(row["server_only"]) is False
+        assert not (row["access_policy_sql"] or "")

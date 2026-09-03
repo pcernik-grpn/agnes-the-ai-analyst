@@ -264,6 +264,7 @@ def _transpile_policy_to_bigquery(policy_sql: str, *, table_id: str) -> str:
     contract — no engine detail in a policy failure — true for this new
     failure mode too.
     """
+    _reject_duckdb_only_functions(policy_sql, table_id=table_id)
     try:
         statements = sqlglot.transpile(policy_sql, read="duckdb", write="bigquery")
     except Exception as exc:
@@ -298,6 +299,7 @@ def _transpile_policy_to_databricks(policy_sql: str, *, table_id: str) -> str:
     failure here means the body uses a construct sqlglot cannot carry across
     dialects, and §16 forbids leaking the engine's own message.
     """
+    _reject_duckdb_only_functions(policy_sql, table_id=table_id)
     try:
         statements = sqlglot.transpile(policy_sql, read="duckdb", write="databricks")
     except Exception as exc:
@@ -305,6 +307,27 @@ def _transpile_policy_to_databricks(policy_sql: str, *, table_id: str) -> str:
     if not statements:
         raise PolicyError(table_id)
     return statements[0]
+
+
+def _reject_duckdb_only_functions(policy_sql: str, *, table_id: str) -> None:
+    """Refuse a body that calls a function only Agnes's own DuckDB connection
+    has (today: ``agnes_hmac``, the keyed pseudonym) before transpiling it for
+    a remote engine.
+
+    Defence in depth, and the depth is the point: the save-time validator
+    already refuses this for a ``query_mode='remote'`` table, so nothing
+    written through the admin API can reach here. A row edited straight into
+    the registry, or a table switched to ``remote`` by a path that skipped
+    re-validation, can -- and sqlglot would carry ``AGNES_HMAC(...)`` across to
+    BigQuery/Databricks verbatim rather than failing, since it does not know
+    the function. Failing here makes that a denied read (§17) instead of a
+    statement sent to a warehouse where the name means nothing, or worse means
+    somebody else's function under a key this instance does not control.
+    """
+    from src.access_policy_udf import references_policy_udf
+
+    if references_policy_udf(policy_sql):
+        raise PolicyError(table_id)
 
 
 def _resolve_table_row(table_id: str) -> dict:

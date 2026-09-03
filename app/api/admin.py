@@ -6680,13 +6680,26 @@ async def update_table(
         ):
             merged.pop(_policy_key, None)
 
+        _touches_policy = "access_policy_sql" in updates or "access_policy_note" in updates
+        # A PUT that CLEARS the policy is allowed to make the table
+        # distributable in the SAME request ("clear the policy first" is one
+        # request, not two). The repo-level invariant (#2147) reads the row as
+        # it stands ON DISK, not as this handler intends to leave it, so the
+        # clear has to land BEFORE register() — otherwise the upsert below
+        # looks like "distribute a still-policied row" and is refused. Every
+        # policy-write check above has already passed at this point, and both
+        # writes are on the same row, so ordering is the only thing that moves.
+        _clearing_policy = _touches_policy and not _final_access_policy_sql
+        if _clearing_policy:
+            repo.set_access_policy(table_id, sql=None, note=None, updated_by=user.get("email"))
+
         repo.register(id=table_id, **merged)
 
         # Persist the access-policy fields through their dedicated setters
         # (Task 2's set_access_policy/set_policy_mapping) — only called when
         # this PUT actually touched one of them, so an unrelated edit never
         # re-stamps access_policy_updated_at.
-        if "access_policy_sql" in updates or "access_policy_note" in updates:
+        if _touches_policy and not _clearing_policy:
             repo.set_access_policy(
                 table_id,
                 sql=_final_access_policy_sql,

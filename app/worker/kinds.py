@@ -434,12 +434,26 @@ def _run_collections_purge(payload: dict) -> None:
     ``_run_analytics_rebuild``.
     """
     from app.api.collections import (
+        _policied_derived_rows_for_file,
         _purge_derived_tabular_row_for_file,
         _purge_derived_tabular_rows,
     )
 
     corpus_id = payload["corpus_id"]
     file_id = payload.get("file_id")
+    # Backstop for the api-plane refusal (#2147): the enqueueing route already
+    # refuses a re-ingest whose derived table carries an access policy, but a
+    # job enqueued BEFORE the policy was attached would still land here and
+    # purge it. Fail the job loudly instead — the file stays 'pending' and an
+    # admin decides, rather than the policy quietly disappearing. Only the
+    # re-ingest shape is refused; a plain delete's purge takes the data with
+    # the row and discloses nothing.
+    if file_id and payload.get("reingest_after_purge") and _policied_derived_rows_for_file(corpus_id, file_id):
+        raise RuntimeError(
+            f"access_policy_protected_row: derived table for file {file_id} in collection "
+            f"{corpus_id} carries an access policy; an admin must clear it before the file "
+            "can be re-ingested"
+        )
     if file_id:
         _purge_derived_tabular_row_for_file(corpus_id, file_id)
     else:

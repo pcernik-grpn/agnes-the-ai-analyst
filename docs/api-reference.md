@@ -310,7 +310,35 @@ duplicated here:
 |---|---|---|
 | `row_rules` | array, optional | `[{"column", "op", "value"}]` — `op` is one of `in_caller_groups`, `eq_caller_email`, `eq_caller_id`, `eq`, `in` |
 | `row_combine` | string, optional | `"and"` (default) or `"or"` |
-| `column_masks` | object, optional | `{column: "show"\|"hide"\|"nullify"\|"hash"\|"unmask"}` — `"unmask"` takes `{"choice": "unmask", "groups": ["..."]}` (single-group `"group"` is still accepted) |
+| `column_masks` | object, optional | `{column: "show"\|"hide"\|"nullify"\|"hash"\|"unmask"\|"last4"\|"email_partial"\|"pseudonymize_keyed"}` — any of them may be written as `{"choice": <mask>, "groups": ["..."]}`, which reveals the column verbatim to those groups and applies the mask to everyone else (`"unmask"` is that shape with the built-in `'*****'`/`NULL` fallback; single-group `"group"` is still accepted). `{"choice": "tiered", "tiers": [{"groups": ["..."], "reveal": "show"\|<mask>}, ...], "default": <mask>}` is the ordered form |
+
+A `groups` list is a modifier, not a mask of its own: an empty or missing list falls back
+to the plain mask, never to "everyone sees it". `hide` cannot take one (a column cannot be
+conditionally absent from a fixed projection, so the output schema would depend on the
+caller) and neither can `show`; both are refused with `422 policy_compile_invalid_spec`.
+
+`tiered` compiles the tiers into **one ordered `CASE` chain** — evaluated top-down, first
+matching tier wins, `default` for everyone else — so what a caller in several groups sees
+is decided by the admin's order. At least one tier is required, every tier needs at least
+one group, `reveal` is `show` or any non-`hide` mask, and `default` must be a mask that
+actually masks (`show` would make the chain a no-op; `hide` cannot be conditional). Each
+of those is a refusal, not a silent normalization.
+
+`pseudonymize_keyed` compiles to `agnes_hmac(col) AS col` — a hex HMAC-SHA256 of the value
+under this instance's own anonymization key, so the pseudonym still joins across tables here
+but cannot be reversed by dictionary the way `hash`'s unsalted md5 can. Text-only, and
+DuckDB-only: attaching a policy that calls it to a `query_mode='remote'` table is rejected
+with `422 policy_function_duckdb_only`. See
+[`table-access-policies.md`](table-access-policies.md#column-masking) — key rotation is
+deliberately not supported.
+
+`last4` (`****6789`) and `email_partial` (`j*****@example.com`) are **text-only** partial
+masks: same output column name, same `VARCHAR` type, a fixed-width asterisk run (one that
+tracked the value's length would publish that length). Both fail closed at the edges — a
+value of four characters or fewer, or an address with no `@`, is redacted whole rather
+than half-revealed, and `NULL` stays `NULL`. On a non-text column the compile is refused
+(`422 policy_compile_invalid_spec`) rather than silently casting the output to text; use
+`nullify`, `hash` or `hide` there.
 
 ```bash
 curl -s -X POST \
@@ -325,9 +353,12 @@ curl -s -X POST \
 #  "warnings": []}
 ```
 
-`warnings` carries what the compiler had to say about the spec — a column it did not
-recognize and dropped, or a spec that filters and masks nothing at all. A spec it cannot
-understand (an unknown `op` or mask) returns `422 policy_compile_invalid_spec`.
+`warnings` carries what the compiler had to say about the spec — a **mask** on a column it
+did not recognize and dropped, or a spec that filters and masks nothing at all. A spec it
+cannot understand (an unknown `op` or mask) returns `422 policy_compile_invalid_spec`, and
+so does a **row rule** on an unrecognized column: dropping that one is fail-open (the
+policy would lose its `WHERE` clause, or quietly widen beside a surviving rule) where
+dropping a mask is not, so it is refused with the column and operator named.
 
 This endpoint never persists anything — it only returns SQL text. Save it the same way
 as any hand-written policy: `PUT /api/admin/registry/{table_id}` with the returned `sql`

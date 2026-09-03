@@ -573,6 +573,61 @@ def _schedule_derived_purge(corpus_id: str, file_id: str | None = None) -> None:
     )
 
 
+def _policied_derived_rows_for_file(corpus_id: str, file_id: str) -> list[dict]:
+    """The derived ``table_registry`` rows for ``file_id`` that carry a SQL
+    access policy.
+
+    Matched exactly as ``_purge_derived_tabular_row_for_file`` matches the rows
+    it purges, so the refusal below can never disagree with what a purge would
+    actually destroy. An empty ``fid_suffix`` matches nothing (``endswith("")``
+    is true for every row — it would otherwise report the whole corpus).
+    """
+    fid_suffix = file_id.replace("cf_", "")[:8]
+    if not fid_suffix:
+        return []
+    rows = table_registry_repo().list_by_source("collection")
+    return [
+        r
+        for r in rows
+        if r.get("bucket") == corpus_id
+        and r.get("id", "").endswith(fid_suffix)
+        and (r.get("access_policy_sql") or "").strip()
+    ]
+
+
+def _refuse_reingest_of_policied_file(corpus_id: str, file_id: str) -> None:
+    """Fail closed before a RE-INGEST purges a policied derived table.
+
+    A derived collection table is an ordinary registered table, so an admin can
+    attach a SQL access policy to it (``docs/table-access-policies.md``). The
+    re-ingest doors — ``POST .../files/{id}/reingest`` and a changed-content
+    re-upload at the same logical path — purge that row and re-register the
+    SAME deterministic ``table_id`` as a fresh, unpolicied, distributable one.
+    Both are gated by ``require_collection_access``, not ``require_admin``: an
+    ordinary collection member could therefore strip an admin's policy and put
+    the table back into ``agnes pull``'s manifest.
+
+    The policy is NOT carried across the re-ingest instead: the replacement
+    file may have different columns, so the old policy could reference a column
+    that no longer exists — silently reinstating it would be a policy that
+    fails open at the first read. An admin clears it deliberately.
+
+    A plain file DELETE is untouched (the data goes with the row, so nothing is
+    disclosed) and so is an unchanged-content resync (it purges nothing).
+    """
+    policied = _policied_derived_rows_for_file(corpus_id, file_id)
+    if not policied:
+        return
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "reason": "access_policy_protected_row",
+            "table_id": policied[0]["id"],
+            "fix": "an admin must clear the table's access policy before the file can be re-ingested",
+        },
+    )
+
+
 def _purge_derived_tabular_row_for_file(corpus_id: str, file_id: str) -> None:
     """Variant of ``_purge_derived_tabular_rows`` for a single file deletion.
 
@@ -1149,6 +1204,12 @@ def _upsert_corpus_file(
         content_changed = existing.get("sha256") != sha256
         old_blob = existing.get("storage_path")
         if content_changed:
+            # A changed-content match purges + re-registers the SAME derived
+            # table_id, so it is a re-ingest by another name: refuse it while
+            # an admin's access policy is attached (#2147). Checked before the
+            # purge, and only on the branch that actually purges — an
+            # unchanged-content resync stays a no-op.
+            _refuse_reingest_of_policied_file(collection_id, file_id)
             claims_purged = _purge_children_and_content(
                 collection_id, existing, new_filename=filename, defer_row_purge=defer_row_purge
             )
@@ -1987,6 +2048,10 @@ async def reingest_file(
     # leave the row permanently stuck and permanently un-reingestable.
     if row.get("processing_status") == "processing" and not _is_stale_processing(row):
         raise HTTPException(status_code=409, detail="reingest_in_progress")
+
+    # Before anything is purged or enqueued: a derived table an admin has
+    # attached an access policy to is not re-ingestable from here (#2147).
+    _refuse_reingest_of_policied_file(collection_id, file_id)
 
     from app.roles import Role, role_enabled
 
