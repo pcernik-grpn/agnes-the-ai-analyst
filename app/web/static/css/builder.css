@@ -84,11 +84,29 @@ body.ag-building .idx > footer { display: none; }
    the strongest edges on the panel. That puts the emphasis on the fields
    instead of the structure, and nothing marks where one section ends and the
    next begins. A card per section is what makes the column scannable. */
-.ag-sec { background: var(--ds-surface); border: 1px solid var(--ds-border); border-radius: 14px; margin-bottom: 14px; overflow: hidden; }
+/* Hairline + a whisper of elevation, rather than a drawn box. On the dim
+   panel a 1px --ds-border rectangle is the strongest edge in the column, and
+   six of them stacked read as a form from 2012; a lighter rule with the card
+   lifted a millimetre off the surface says "card" without outlining it. */
+.ag-sec { background: var(--ds-surface); border: 1px solid var(--ds-border-light);
+  border-radius: 14px; margin-bottom: 14px; overflow: hidden;
+  box-shadow: var(--ds-shadow-sm); }
+/* …but `overflow: hidden` clips an absolutely-positioned child as readily as
+   it clips a corner, and the Category dropdown opens inside this card: it was
+   cut off after three of its eight rows, with the page showing through where
+   the rest should have been. Stop clipping only while a menu is open — the
+   corners still need it every other moment. */
+.ag-sec:has(.ds-dropdown-menu:not([hidden])) { overflow: visible; }
 .ag-sec-head { display: flex; align-items: center; gap: 12px; padding: 14px 18px; cursor: pointer; user-select: none; }
 /* Back to the sunken fill: on a white card the badge is the darker thing
    again, which is what makes it read as a step marker rather than a hole. */
-.ag-sec-no { width: 26px; height: 26px; border-radius: 50%; background: var(--ds-surface-sunken); border: 1px solid var(--ds-border); color: var(--ds-text-secondary); font-size: 12.5px; font-weight: 700; display: grid; place-items: center; flex-shrink: 0; }
+/* A number, not a bordered grey disc. The ring plus the sunken fill made it
+   a wizard step-marker — the most dated object on the panel — for what is
+   just an ordinal. Soft accent tint, no border, tabular figures so 1 and 4
+   occupy the same width. */
+.ag-sec-no { width: 24px; height: 24px; border-radius: 50%; background: var(--ds-primary-light);
+  color: var(--ds-primary); font-size: 12px; font-weight: 700; font-variant-numeric: tabular-nums;
+  display: grid; place-items: center; flex-shrink: 0; }
 .ag-sec-head h3 { font-size: 15px; margin: 0; }
 .ag-sec-head h3 .ag-sec-note { font-weight: 400; color: var(--ds-text-muted); font-size: 13px; margin-left: 4px; }
 .ag-sec-sub { margin: 12px 0 0; font-size: 12.5px; line-height: 1.55; color: var(--ds-text-secondary); }
@@ -100,16 +118,37 @@ body.ag-building .idx > footer { display: none; }
 /* The divider comes back with the card: inside a bounded card a rule between
    the header and the body reads as internal structure, not as a heading cut
    off from what it names — which is only how it read on the flat panel. */
-.ag-sec-body { padding: 4px 18px 18px; border-top: 1px solid var(--ds-border); }
+.ag-sec-body { padding: 6px 18px 20px; border-top: 1px solid var(--ds-border-light); }
 .ag-sec.collapsed .ag-sec-body { display: none; }
 .ag-sec.collapsed .ag-sec-head { padding-bottom: 14px; }
 
 /* Fields. */
-.ag-field { display: block; margin: 14px 0 0; }
-.ag-field > span { display: block; font-size: 13px; font-weight: 600; margin-bottom: 6px; color: var(--ds-text-primary); }
-.ag-field > span em { font-weight: 400; color: var(--ds-text-muted); font-style: normal; }
-.ag-field input[type=text], .ag-field textarea { width: 100%; padding: 9px 12px; border: 1px solid var(--ds-border); border-radius: 9px; font: inherit; font-size: 14px; background: var(--ds-surface); color: var(--ds-text-primary); resize: vertical; }
-.ag-field input:focus, .ag-field textarea:focus { outline: 2px solid var(--ds-primary); outline-offset: -1px; }
+.ag-field { display: block; margin: 18px 0 0; }
+/* `:first-child`, because this rule styles the field's LABEL and a field can
+   hold more than one span. Unscoped it also caught every sub-label under the
+   control — and at one point more specific than a bare class it beat them,
+   so `.ag-hint` and `.sk-hint` both came out as a second bold 13px label
+   instead of a quiet line. The label is always the first child (every
+   `.ag-field` in the codebase opens with it), so scoping it here fixes the
+   hints at their own specificity rather than escalating each one. */
+.ag-field > span:first-child { display: block; font-size: 13px; font-weight: 600; margin-bottom: 6px; color: var(--ds-text-primary); }
+.ag-field > span:first-child em { font-weight: 400; color: var(--ds-text-muted); font-style: normal; }
+/* Softer rule, more room, rounder. The border was a full-strength
+   `--ds-border` on a white card, which made every input the loudest thing in
+   its section and the column a stack of identical boxes. */
+.ag-field input[type=text], .ag-field textarea { width: 100%; padding: 10px 13px;
+  border: 1px solid color-mix(in srgb, var(--ds-border) 78%, transparent);
+  border-radius: 10px; font: inherit; font-size: 14px; background: var(--ds-surface);
+  color: var(--ds-text-primary); resize: vertical;
+  transition: border-color var(--ds-motion-fast) var(--ds-ease-standard),
+              box-shadow var(--ds-motion-fast) var(--ds-ease-standard); }
+.ag-field input[type=text]:hover, .ag-field textarea:hover { border-color: var(--ds-border); }
+/* A halo, not a 2px inset outline. The outline drew a hard second rectangle
+   1px inside the border — two edges on one control, and the thing that most
+   dated the form the moment you clicked into it. */
+.ag-field input:focus, .ag-field textarea:focus { outline: none;
+  border-color: var(--ds-primary);
+  box-shadow: 0 0 0 3px var(--ds-primary-light); }
 .ag-chips { display: flex; flex-wrap: wrap; gap: 8px; }
 .ag-chip { font-size: 13px; font-weight: 500; padding: 5px 13px; border-radius: var(--ds-radius-pill); border: 1px solid var(--ds-border); background: var(--ds-surface); color: var(--ds-text-secondary); cursor: pointer; font-family: inherit; }
 .ag-chip.on { border-color: var(--ds-primary); color: var(--ds-primary); background: var(--ds-primary-light); font-weight: 600; }
@@ -132,8 +171,12 @@ body.ag-building .idx > footer { display: none; }
 /* Ingredient toolbar — a search box over the (now workspace-wide) pool, so
    data · memory · files and every available plugin/skill stay scannable. */
 .ag-toolbar { display: flex; align-items: center; gap: 10px; margin: 14px 0 4px; }
-.ag-search { flex: 1; min-width: 0; padding: 8px 12px; border: 1px solid var(--ds-border); border-radius: 9px; font: inherit; font-size: 13.5px; background: var(--ds-surface); color: var(--ds-text-primary); }
-.ag-search:focus { outline: 2px solid var(--ds-primary); outline-offset: -1px; }
+.ag-search { flex: 1; min-width: 0; padding: 9px 13px;
+  border: 1px solid color-mix(in srgb, var(--ds-border) 78%, transparent);
+  border-radius: 10px; font: inherit; font-size: 13.5px; background: var(--ds-surface);
+  color: var(--ds-text-primary); }
+.ag-search:focus { outline: none; border-color: var(--ds-primary);
+  box-shadow: 0 0 0 3px var(--ds-primary-light); }
 .ag-toolcount { font-size: 12.5px; color: var(--ds-text-muted); white-space: nowrap; flex-shrink: 0; }
 .ag-emptyrows { padding: 16px 2px; font-size: 13px; color: var(--ds-text-muted); }
 /* "Already in your stack" marker — the axis the caller cares about now that
@@ -174,20 +217,67 @@ a.ag-addrow { display: block; box-sizing: border-box; text-align: center; text-d
 /* Picker modal — the full pool, one click behind the "+". Widens and caps
    the shared .modal-card so a long catalogue scrolls inside the card rather
    than growing it past the viewport. */
-.ag-pick { max-width: 620px; display: flex; flex-direction: column; max-height: min(76vh, 720px); }
+/* Sized for a catalogue, not a confirmation. These pickers list every data
+   package, memory domain, file, plugin and skill the caller can reach — the
+   pool runs to hundreds of rows on a real instance — and at 620px/76vh four
+   of them showed at a time. */
+.ag-pick { max-width: 780px; display: flex; flex-direction: column; max-height: min(86vh, 880px); }
+/* A height, not a ceiling — see BuilderShell.picker. The rows area absorbs
+   the difference, so the chrome above and below it stays put whatever the
+   filter leaves behind. */
+.ag-pick--fill { height: min(86vh, 880px); }
 .ag-pick-head { display: flex; align-items: flex-start; gap: 12px; }
 .ag-pick-head > div { flex: 1; min-width: 0; }
 .ag-pick-head p.sub { margin: 4px 0 0; }
 .ag-pick-x { flex-shrink: 0; border: none; background: none; font: inherit; font-size: 15px; color: var(--ds-text-muted); cursor: pointer; padding: 2px 6px; border-radius: 6px; }
 .ag-pick-x:hover, .ag-pick-x:focus-visible { color: var(--ds-text-primary); background: var(--ds-surface-sunken); }
-.ag-pick-rows { flex: 1; overflow-y: auto; min-height: 120px; }
+/* The Filter button, its faceted menu and the applied-filter chips are the
+   Library's own components (filter_toolbar.css) driven by the Library's own
+   engine; this only seats them in the modal. The button is a flex item of the
+   search row (see BuilderShell.toolbar) — its menu is pinned `right: 0`
+   against it, so it has to shrink to the button or the menu flies to whatever
+   edge the element happens to reach. */
+.ag-pick-chips { margin: 12px 0 0; }
+/* The picker's own scroll container must not clip the menu that opens over
+   it, and the modal card must not clip it either. */
+.ag-pick { overflow: visible; }
+/* `.modal-card label { display: block }` (style-custom.css) is one point more
+   specific than a component's own class, and these components were written
+   for pages rather than modals — so a label-based row inside a picker loses
+   the layout it declared and its control drops onto a line of its own. It hit
+   the filter menu's facet rows (each count jammed against its label instead
+   of sitting at the right edge) and the table picker's tree rows (every
+   checkbox on the line above the table it ticks). Restored for the rows the
+   pickers actually render; the general rule is left alone, since every other
+   modal in the product does want a label to be a block. */
+.ag-pick .fbar-menu__opt,
+.ag-pick .pdw-tables__row { display: flex; }
+.ag-pick-rows { flex: 1; overflow-y: auto; min-height: 240px; }
+/* The whole row picks. Aiming at a 90px button to add one of two hundred
+   rows is a needless act of precision, and every list in the product that
+   behaves this way should behave the same way — so the handler lives in the
+   shell, not in each builder (see BuilderShell's row-click delegate). */
+.ag-pick-rows .ag-row { cursor: pointer; border-radius: 10px; padding-left: 10px; padding-right: 10px;
+  margin-left: -10px; margin-right: -10px; width: calc(100% + 20px);
+  transition: background var(--ds-motion-fast) var(--ds-ease-standard); }
+.ag-pick-rows .ag-row:hover { background: var(--ds-surface-dim); }
 .ag-kind--unknown { color: var(--ds-text-muted); background: var(--ds-surface-sunken); }
-.ag-note { font-size: 12.5px; color: var(--ds-text-secondary); background: var(--ds-surface-sunken); border: 1px solid var(--ds-border); border-radius: 9px; padding: 8px 12px; margin: 12px 0 0; }
+/* Standing guidance attached to a field — an aside, not an alert.
+   As a filled box it was a THIRD grey: a sunken slab on a white section card
+   inside the dim pane, which is the palette of a disabled control, so the
+   sentences that explain the form read as chrome and got skipped. A rule in
+   the gutter says "worth knowing" without spending another fill on it.
+   The tinted variants below keep the box — those are events rather than
+   standing text, and the box is what marks them out from it. */
+.ag-note { font-size: 12.5px; line-height: 1.55; color: var(--ds-text-secondary); border-left: 2px solid color-mix(in srgb, var(--ds-text-muted) 32%, transparent); padding: 1px 0 1px 12px; margin: 12px 0 0; }
 .ag-note a { color: var(--ds-primary); }
+.ag-note code { font-family: var(--ds-font-mono); font-size: 11.5px; background: var(--ds-surface-sunken); border-radius: 4px; padding: 0 4px; }
 /* Two tints on the neutral note, for the two things a builder has to say that
-   are not standing guidance: a step that failed, and a degraded engine. Both
-   stay the same box — a different SHAPE for an error would read as a different
-   kind of thing, and it is the same sentence slot. */
+   are not standing guidance: a step that failed, and a degraded engine. These
+   two are where the box survives — a bordered, tinted panel is what separates
+   an event you have to deal with from the standing text around it, and both
+   tints keep the SAME box as each other, since a different shape for an error
+   would read as a different kind of thing in the same sentence slot. */
 /* The interview's progress line. Lived in skills.html's inline <style>, which
    made it invisible on every other builder that rendered the same markup —
    "0 of 4still to settle" with no gap and no box was exactly that. */
@@ -195,23 +285,75 @@ a.ag-addrow { display: block; box-sizing: border-box; text-align: center; text-d
    a boxed status widget in the first slot of the column outweighed the
    fields it was reporting on. Same markup, no chrome. */
 .ag-prog {
-  display: flex; align-items: baseline; justify-content: center; gap: 6px;
+  display: flex; align-items: baseline; justify-content: flex-start; gap: 6px;
   margin: 0; padding: 0; font-size: 12px; line-height: 1.35;
   color: var(--ds-text-muted); max-width: 100%;
 }
-/* One line, and it stays one: a long slot label ellipsises rather than
-   wrapping the header into a third row. */
-.ag-prog-t { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-/* What the thing IS, under the configuration title. Durable, so it survives
-   the states where the conversation does not. */
-/* In the conversation pane the blurb leads the column, so it is left-aligned
-   and spaced like a paragraph rather than centred under a title. */
-.pdw-blurb { text-align: left; margin: 0 22px 12px; max-width: none; }
-.ag-cfg-blurb { margin: 6px 0 0; font-size: 12.5px; line-height: 1.5; color: var(--ds-text-secondary);
-  max-width: 62ch; text-align: center; }
+/* The count is one token and never breaks — squeezed by the label beside it
+   it split across two lines as "0 of" / "4", which is not a number any more. */
+.ag-prog-n { white-space: nowrap; flex-shrink: 0; }
+/* The label WRAPS. It used to ellipsise to keep the header one line, back when
+   the header was centred and narrow — but the thing it names is the list of
+   what is still open ("where it lives, how it authenticates, a name, which
+   tools to expose"), and cut at the pane's width that reads "…which tools to
+   e…". A second line costs 16px; a truncated list costs the whole sentence. */
+.ag-prog-t { min-width: 0; }
+/* `.ag-cfg-blurb` and its `.pdw-blurb` override are gone: they were two of
+   the four looks the "what this is" sentence wore across four builders, and
+   all four now share `.ag-about` below. */
 .ag-prog-n { font-weight: 700; color: var(--ds-text-primary); font-variant-numeric: tabular-nums; }
+/* Everything required is answered. A count that has run out is not the same
+   statement as "you can save this now", and the header is where an author
+   looks to find out which one they are in. */
+.ag-prog--done { color: var(--ds-accent-success-ink); }
+.ag-prog--done .ag-prog-n { color: var(--ds-accent-success-ink); }
+.ag-prog-tick { display: inline-flex; flex-shrink: 0; color: var(--ds-accent-success-ink); }
+.ag-prog-tick svg { width: 14px; height: 14px; display: block; }
+
+/* What the thing you are building IS — one short paragraph at the head of
+   the TRANSCRIPT, above the opening line. See BuilderShell.about for why it
+   lives there and not in the configuration panel or its header.
+
+   Prose, not a callout: a bordered, tinted band is how these pages mark
+   something you must act on, and /skills spent one on every type — a
+   full-bleed banner across the workspace saying "This is a Skill". */
+/* A light tinted card, and it sits UNDER the opening line rather than over
+   it: the assistant's first message is what the reader came to act on, and
+   an unstyled paragraph above it competed with it while reading as another
+   speaker in the transcript. Tinted and boxed, one turn down, it reads as a
+   note about the conversation instead of a turn in it. */
+.ag-about { display: flex; gap: 11px; align-items: flex-start; font-size: 13px;
+  line-height: 1.6; color: var(--ds-text-secondary);
+  background: var(--ds-surface-dim); border-radius: 12px; padding: 13px 15px; }
+.ag-about-body { min-width: 0; }
+.ag-about-body p { margin: 0; }
+.ag-about-body p + p { margin-top: 5px; }
+.ag-about strong { color: var(--ds-text-primary); font-weight: 650; }
+.ag-about a { color: var(--ds-primary); }
+/* The tile matches the assistant's own dot across the column below it — same
+   left edge, one step larger, so the definition reads as the thing the
+   conversation is about rather than as another speaker in it. */
+.ag-about-ico { width: 28px; height: 28px; border-radius: 8px; display: grid; place-items: center;
+  flex-shrink: 0; background: var(--ds-agnes-soft); color: var(--ds-agnes); }
+.ag-about-ico svg { width: 15px; height: 15px; display: block; }
+.ag-about-ico--skill { background: var(--ds-kind-skill-soft); color: var(--ds-kind-skill); }
+.ag-about-ico--plugin { background: var(--ds-kind-plugin-soft); color: var(--ds-kind-plugin); }
+.ag-about-ico--agent { background: var(--ds-kind-agent-soft); color: var(--ds-kind-agent); }
+.ag-about-ico--data { background: var(--ds-kind-data-soft); color: var(--ds-kind-data); }
+/* What the type wants from you — a different KIND of statement from the
+   sentence above it, so it takes its own line. */
+.ag-about-takes { color: var(--ds-text-muted); }
+.ag-about-takes strong { color: var(--ds-text-secondary); font-weight: 650; }
+
+/* A notice that is a direct child of a pane — the scripted-stand-in and
+   no-model warnings — takes the pane's own gutter. The transcript and the
+   composer around it are inset 22px; without this the one element between
+   them ran hard into both edges of the column. */
+.ag-pane > .ag-note { margin: 12px 22px 0; }
+.ag-note--err, .ag-note--warn { border: 1px solid; border-radius: 9px; padding: 8px 12px; }
 .ag-note--err { color: var(--ds-accent-danger-ink); background: var(--ds-accent-danger-bg); border-color: var(--ds-accent-danger-line); }
 .ag-note--warn { color: var(--ds-accent-warn-ink); background: var(--ds-accent-warn-bg); border-color: var(--ds-accent-warn-line); }
+.ag-note--err code, .ag-note--warn code { background: color-mix(in srgb, currentColor 12%, transparent); }
 
 /* Boundaries (read-only, admin-managed). */
 .ag-bnd { margin-top: 12px; border: 1px solid var(--ds-border); border-radius: 10px; overflow: hidden; }
@@ -234,10 +376,24 @@ a.ag-addrow { display: block; box-sizing: border-box; text-align: center; text-d
 .ag-sch-acts { display: flex; align-items: center; gap: 4px; flex-shrink: 0; }
 .ag-sch-form { margin-top: 14px; border-top: 1px dashed var(--ds-border); }
 .ag-sch-form h4 { font-size: 13.5px; margin: 14px 0 0; color: var(--ds-text-primary); }
-.ag-field select { width: 100%; padding: 9px 12px; border: 1px solid var(--ds-border); border-radius: 9px; font: inherit; font-size: 14px; background: var(--ds-surface); color: var(--ds-text-primary); }
-.ag-field select:focus { outline: 2px solid var(--ds-primary); outline-offset: -1px; }
-.ag-hint { display: block; font-weight: 400; font-size: 12px; color: var(--ds-text-muted); margin-top: 5px; line-height: 1.5; }
+.ag-field select { width: 100%; padding: 10px 13px;
+  border: 1px solid color-mix(in srgb, var(--ds-border) 78%, transparent);
+  border-radius: 10px; font: inherit; font-size: 14px; background: var(--ds-surface);
+  color: var(--ds-text-primary); }
+.ag-field select:focus { outline: none; border-color: var(--ds-primary);
+  box-shadow: 0 0 0 3px var(--ds-primary-light); }
+/* Sub-label under a control — see the `:first-child` note on the label rule
+   above for why this now takes effect without escalating its specificity. */
+.ag-hint { display: block; font-weight: 400; font-size: 12px; color: var(--ds-text-muted); margin: 5px 0 0; line-height: 1.5; }
 .ag-hint code { font-family: var(--ds-font-mono); font-size: 11.5px; background: var(--ds-surface-sunken); border: 1px solid var(--ds-border); border-radius: 5px; padding: 0 4px; }
+
+/* A value the builder OWNS: shown, never typed — an agent's address, say.
+   It kept the box metrics of the editable fields so the column keeps one
+   rhythm, but sits on the sunken fill with no focus ring and a mono face, so
+   it reads as a readout rather than an input someone forgot to enable.
+   (It was a `.ag-bnd` key/value row, which put the slug left and a whole
+   sentence hard right inside what looked exactly like a text field.) */
+.ag-readonly { padding: 10px 13px; border: 1px solid var(--ds-border-light); border-radius: 10px; background: var(--ds-surface-sunken); color: var(--ds-text-primary); font-family: var(--ds-font-mono); font-size: 13px; line-height: 1.5; word-break: break-all; }
 .ag-sch-en { display: inline-flex; align-items: center; gap: 7px; font-size: 13px; color: var(--ds-text-primary); margin-top: 14px; cursor: pointer; }
 .ag-sch-err { margin-top: 12px; font-size: 13px; color: var(--ds-accent-danger-ink); background: var(--ds-accent-danger-bg); border: 1px solid var(--ds-accent-danger-line); border-radius: 9px; padding: 8px 12px; }
 .ag-sch-foot { display: flex; align-items: center; gap: 12px; margin-top: 14px; flex-wrap: wrap; }
@@ -279,13 +435,19 @@ a.ag-addrow { display: block; box-sizing: border-box; text-align: center; text-d
 }
 
 /* Create | Preview switch. */
-.ag-tabs { display: flex; justify-content: center; padding: 14px 16px 10px; }
+.ag-tabs { display: flex; justify-content: center; padding: 14px 16px 0; }
 .ag-tabs-in { display: inline-flex; background: var(--ds-surface-sunken); border: 1px solid var(--ds-border); border-radius: 10px; padding: 3px; gap: 3px; }
 .ag-tab { border: none; background: none; font-family: inherit; font-size: 13.5px; font-weight: 600; color: var(--ds-text-secondary); padding: 6px 20px; border-radius: 8px; cursor: pointer; }
 .ag-tab[aria-selected="true"] { background: var(--ds-surface); color: var(--ds-text-primary); box-shadow: var(--ds-shadow-sm); }
 
 /* Conversation. */
-.ag-conv { flex: 1; overflow-y: auto; padding: 8px 22px 4px; display: flex; flex-direction: column; gap: 16px; }
+/* The transcript is inset 22px from the pane on the top as well as the sides
+   — one gutter, all round. It was 8px, which on /agents and /skills went
+   unnoticed because the Create|Preview strip above supplied the air, and on
+   the MCP and package builders (which have no strip) put the opening line
+   almost against the pane's top edge. The strip gives back what it used to
+   add below it, so the tabbed pages are unchanged. */
+.ag-conv { flex: 1; overflow-y: auto; padding: 22px 22px 4px; display: flex; flex-direction: column; gap: 16px; }
 .ag-msg { display: flex; gap: 12px; font-size: 14.5px; line-height: 1.6; }
 .ag-msg-dot { width: 20px; height: 20px; border-radius: 6px; background: var(--ds-agnes); flex-shrink: 0; margin-top: 2px; }
 /* Assistant and owner turns are told apart by alignment + surface, never by
@@ -342,25 +504,43 @@ a.ag-addrow { display: block; box-sizing: border-box; text-align: center; text-d
 }
 .ag-chip { border: 1px solid var(--ds-border); background: var(--ds-surface); color: var(--ds-text-secondary); border-radius: var(--ds-radius-pill); padding: 6px 14px; font-size: 13px; font-family: inherit; cursor: pointer; }
 .ag-chip:hover { border-color: var(--ds-primary); color: var(--ds-primary); }
-.ag-comp-box { display: flex; align-items: flex-end; gap: 8px; border: 1.5px solid var(--ds-primary); border-radius: 12px; background: var(--ds-surface); padding: 7px 7px 7px 14px; }
+/* The chat composer's pill, to the number: `.cloud-chat-composer` under the
+   rail layout is `border-radius: 26px` with a 1.5px rule and 6px of padding
+   (chat.css). This is the same control doing the same job on an adjacent
+   page, and a 12px box beside a 26px pill is two chat inputs in one product. */
+.ag-comp-box { display: flex; align-items: center; gap: 8px; border: 1.5px solid var(--ds-primary); border-radius: 26px; background: var(--ds-surface); padding: 5px 5px 5px 16px; }
 .ag-comp-box:focus-within { box-shadow: 0 0 0 3px var(--ds-primary-light); }
 .ag-comp-box textarea { flex: 1; border: none; background: none; resize: none; font-family: inherit; font-size: 14.5px; color: var(--ds-text-primary); padding: 6px 0; max-height: 140px; }
 .ag-comp-box textarea:focus { outline: none; }
-.ag-send { border: none; background: var(--ds-primary); color: var(--ds-text-inverse); font-family: inherit; font-size: 13.5px; font-weight: 600; border-radius: 9px; padding: 8px 16px; cursor: pointer; display: inline-flex; align-items: center; gap: 7px; }
-.ag-send[disabled] { opacity: 0.55; cursor: not-allowed; }
+/* The chat's send control — a circle on `--ds-assistant` carrying the glyph
+   alone, no visible label (`.cloud-chat-send-btn`, chat.css).
+   34px, not the chat's 44px: there the composer is the page's main event and
+   sets its own height, here it sits under a transcript in half a workspace,
+   and a 44px button inside 7px of padding grew the box ~10px taller than the
+   labelled pill it replaced. The button changed; the input should not have. */
+.ag-send { width: 34px; height: 34px; flex-shrink: 0; border: none; padding: 0;
+  display: grid; place-items: center; border-radius: var(--ds-radius-pill);
+  background: var(--ds-assistant); color: var(--ds-text-inverse); cursor: pointer;
+  transition: background var(--ds-motion-fast) var(--ds-ease-standard); }
+.ag-send svg { width: 16px; height: 16px; display: block; }
+.ag-send:hover { background: var(--ds-assistant-dark); }
+.ag-send:focus-visible { outline: var(--ds-focus-outline); outline-offset: var(--ds-focus-outline-offset); }
+.ag-send[disabled] { opacity: 0.55; cursor: progress; }
 
 /* Configuration pane. */
 /* Column, so an optional second line (the interview's progress) sits UNDER
    the title rather than beside it. The title row keeps its own baseline
-   alignment, so a pane that passes no aside renders identically to before. */
-.ag-cfg-head { display: flex; flex-direction: column; align-items: center; gap: 7px; padding: 18px 16px 16px; border-bottom: 1px solid var(--ds-border); }
-.ag-cfg-head-main { display: flex; align-items: baseline; justify-content: center; gap: 12px; flex-wrap: wrap; }
+   alignment, so a pane that passes no aside renders identically to before.
+
+   Left-aligned, not centred: a centred title over a column of left-aligned
+   fields is a DIALOG's heading, and this is a pane you work in. Its gutter
+   is the body's 22px so the title starts on the same vertical as the section
+   cards under it rather than floating over them. */
+.ag-cfg-head { display: flex; flex-direction: column; align-items: flex-start; gap: 7px; padding: 16px 22px 14px; border-bottom: 1px solid var(--ds-border); }
+.ag-cfg-head-main { display: flex; align-items: baseline; justify-content: flex-start; gap: 12px; flex-wrap: wrap; }
 .ag-cfg-head h3 { font-size: 15.5px; margin: 0; color: var(--ds-text-primary); }
 .ag-cfg-head p { font-size: 13px; margin: 0; color: var(--ds-text-muted); }
 .ag-cfg-body { flex: 1; overflow-y: auto; padding: 22px; }
-.ag-cfg-ava { display: flex; justify-content: center; margin-bottom: 22px; }
-.ag-cfg-ava span { width: 74px; height: 74px; border-radius: 50%; border: 1.5px dashed var(--ds-border); display: grid; place-items: center; color: var(--ds-text-muted); }
-.ag-cfg-ava svg { width: 26px; height: 26px; }
 /* A field the assistant just wrote, flagged for one beat so the owner can
    see WHAT the conversation changed rather than re-reading the whole form. */
 .ag-touched { animation: ag-touch 1.6s var(--ds-ease-standard); }
@@ -394,9 +574,20 @@ a.ag-addrow { display: block; box-sizing: border-box; text-align: center; text-d
 .ds-drawer--builder .ds-drawer__panel { width: min(1360px, 100vw); }
 .ds-drawer--builder .ds-drawer__body { padding: 0; overflow: hidden; display: flex; flex-direction: column; }
 .ds-drawer--builder .ag-work { flex: 1; height: auto; min-height: 0; }
-/* The moved-in form is the configuration pane's content; it keeps the
-   drawer's own field styling and only needs the gutter back. */
-.ds-drawer--builder .ds-drawer__pane { padding: 18px 22px; }
+/* The moved-in form is the configuration pane's content, so it takes the
+   same CARD the other three builders' sections sit on. It kept the drawer's
+   own field styling and nothing else, which left the data-package builder as
+   the one panel whose every label, hint and heading sat directly on the dim
+   pane — the white inputs were then the only edges in the column, and it read
+   as a different product from /agents and /skills next door. Same surface,
+   border and 14px radius as `.ag-sec`; this builder has one pane rather than
+   six sections, so it is one card rather than six. */
+.ds-drawer--builder .ds-drawer__pane {
+  padding: 18px 22px;
+  background: var(--ds-surface);
+  border: 1px solid var(--ds-border);
+  border-radius: 14px;
+}
 .pdw-conv { display: flex; flex-direction: column; flex: 1; min-height: 0; }
 @media (max-width: 900px) {
   .ds-drawer--builder .ds-drawer__body { overflow-y: auto; }

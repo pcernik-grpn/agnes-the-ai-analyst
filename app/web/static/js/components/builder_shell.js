@@ -100,11 +100,18 @@
   /* Search + live count for a pooled list. The count is a separate node so
      the host can repaint it on keystroke without rebuilding the input and
      losing the caret. */
+  /* `after` is pre-built markup that rides the SAME row as the search box —
+     a Filter button belongs beside the field it refines, not on a line of its
+     own under it. It also has to be a flex ITEM of this row: the shared
+     `.fbar-filter` is `position: relative` and its menu is pinned `right: 0`
+     against it, so as a block-level element in a wrapper of its own it spanned
+     the full width and threw the menu to the far edge of the modal. */
   function toolbar(o) {
     return (
       '<div class="ag-toolbar">' +
         '<input type="text" class="ag-search" data-ag-search="' + esc(o.key) + '" ' +
           'value="' + esc(o.value || '') + '" placeholder="' + esc(o.placeholder) + '" autocomplete="off">' +
+        (o.after || '') +
         '<span class="ag-toolcount" data-count="' + esc(o.key) + '">' +
           esc(o.shown) + ' of ' + esc(o.total) +
         '</span>' +
@@ -127,15 +134,78 @@
     );
   }
 
+  /* What the thing you are building IS — one short paragraph at the head of
+     the transcript, above the opening line.
+
+     One component, one position, every builder. It had been none of those:
+     /skills wore it as a full-bleed bordered band across the workspace, the
+     MCP builder as a fourth line of the configuration header, the package
+     builder as a bare paragraph in the conversation, and /agents not at all.
+     Three looks for one sentence is how a product stops reading as one
+     product.
+
+     The transcript is the right home. It is where a reader looks first, the
+     sentence answers the same question the opening line goes on to act on,
+     and it scrolls away with the conversation instead of sitting over every
+     field forever — which is what a definition should do once it has been
+     read. It renders UNDER the opening line (see `conversation`), not over
+     it: the assistant's first message is what the reader came to act on.
+     `iconSvg` is pre-built and should come from the canonical set
+     (macros/_icon.html, or the skill/plugin/agent glyphs the Library and the
+     builders already share); `accent` tints the tile to the entity kind
+     (--ds-kind-*), defaulting to the assistant accent. */
+  /* `check-circle` from the canonical set (macros/_icon.html). Exported so the
+     progress lines on /skills and the MCP builder mark "settled" with the same
+     glyph the rest of the UI marks it with. */
+  var TICK_SVG = '<span class="ag-prog-tick" aria-hidden="true">' +
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" ' +
+    'stroke-linecap="round" stroke-linejoin="round">' +
+    '<circle cx="12" cy="12" r="9"/><path d="m8.5 12 2.5 2.5 4.5-4.5"/></svg></span>';
+
+  function about(o) {
+    if (!o || !o.html) return '';
+    var tile = o.iconSvg
+      ? '<span class="ag-about-ico' + (o.accent ? ' ag-about-ico--' + esc(o.accent) : '') +
+        '" aria-hidden="true">' + o.iconSvg + '</span>'
+      : '';
+    return '<div class="ag-about">' + tile + '<div class="ag-about-body">' + o.html + '</div></div>';
+  }
+
   /* The transcript. `rows` is the whole thing the host wants shown, opening
      line included — this does not prepend one, because what a builder opens
-     with is the most page-specific sentence on the screen. */
+     with is the most page-specific sentence on the screen. `about` is
+     pre-built (see above) and sits after the FIRST message — under the
+     opening line, not above it — falling back to the head of an empty
+     transcript, which is the no-model case where there is no opening line to
+     sit under. */
   function conversation(o) {
     var rows = (o.rows || []).slice();
     if (o.busy) rows.push({ role: 'assistant', text: o.busyText || 'Thinking…', busy: true });
-    var html = rows.map(message).join('');
+    var msgs = rows.map(message);
+    var html = o.about
+      ? (msgs.length ? msgs[0] + o.about + msgs.slice(1).join('') : o.about)
+      : msgs.join('');
     if (o.err) html += '<div class="ag-conv-err">' + esc(o.err) + '</div>';
     return '<div class="ag-conv" id="' + esc(o.id) + '"><div class="ag-conv-in">' + html + '</div></div>';
+  }
+
+  /* Run a full re-render without throwing away where the reader was in the
+     configuration column.
+
+     Every builder rebuilds its whole view for changes a partial render cannot
+     express — picking a tone, switching a mode — and that replaces the
+     `.ag-cfg-body` node, so its scrollTop resets to 0. Clicking a tone chip
+     two thirds of the way down the panel threw you back to the top, which is
+     the sort of thing that makes a form feel like it is fighting you.
+     Section collapse already avoids this by mutating in place; this covers
+     everything that genuinely has to re-render. */
+  function keepCfgScroll(id, write) {
+    var before = document.getElementById(id);
+    var top = before ? before.scrollTop : 0;
+    write();
+    if (!top) return;
+    var after = document.getElementById(id);
+    if (after) after.scrollTop = top;
   }
 
   /* An empty transcript's placeholder — centred in the scroll area. `icon`
@@ -172,9 +242,16 @@
           '<textarea rows="1" data-ag-comp="' + esc(o.kind) + '" ' +
             'placeholder="' + esc(o.placeholder) + '"' + off + (ro ? ' readonly' : '') + '>' +
             esc(o.value || '') + '</textarea>' +
+          /* The chat's own send control: a circular icon button carrying the
+             up-arrow glyph, with the name on `aria-label` rather than in
+             visible text (chat.html → .cloud-chat-send-btn). A labelled
+             "Send →" pill next to a round arrow on the neighbouring page is
+             two send buttons in one product. */
           '<button type="button" class="ag-send" data-ag-send="' + esc(o.kind) + '"' +
-            (off || (ro ? ' disabled' : '')) + '>' +
-            'Send <span aria-hidden="true">→</span></button>' +
+            (off || (ro ? ' disabled' : '')) + ' aria-label="Send">' +
+            '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true">' +
+            '<path d="M12 19V5M6 11l6-6 6 6" stroke="currentColor" stroke-width="2.2" ' +
+            'stroke-linecap="round" stroke-linejoin="round"/></svg></button>' +
         '</div>' +
       '</div></div>'
     );
@@ -261,12 +338,23 @@
   function picker(o) {
     return (
       '<div class="modal-backdrop is-open" data-ag-pick-backdrop>' +
-        '<div class="modal-card ag-pick" role="dialog" aria-modal="true" aria-label="' + esc(o.title) + '">' +
+        /* `ag-pick--fill` fixes the card's height so FILTERING cannot resize
+           it. Without it the card sizes to its rows: narrowing 22 results to
+           2 collapsed the dialog by several hundred pixels, moving the search
+           box, the chips and Done out from under the pointer that was still
+           using them. Only for a pool big enough to overflow the card in the
+           first place — a five-row picker held at 86vh would be mostly empty
+           space, which is the same mistake in the other direction. */
+        '<div class="modal-card ag-pick' + ((o.total || 0) > 8 ? ' ag-pick--fill' : '') +
+          '" role="dialog" aria-modal="true" aria-label="' + esc(o.title) + '">' +
           '<div class="ag-pick-head">' +
             '<div><h3>' + esc(o.title) + '</h3><p class="sub">' + esc(o.sub) + '</p></div>' +
             '<button type="button" class="ag-pick-x" data-ag-pick-close aria-label="Close">✕</button>' +
           '</div>' +
-          toolbar({ key: o.key, placeholder: o.searchPlaceholder, shown: o.shown, total: o.total, value: o.query }) +
+          toolbar({
+            key: o.key, placeholder: o.searchPlaceholder, shown: o.shown, total: o.total,
+            value: o.query, after: o.toolbarExtra,
+          }) +
           (o.controls || '') +
           '<div class="ag-pick-rows ag-rows" data-rows="' + esc(o.key) + '">' + (o.rows || '') + '</div>' +
           '<div class="ag-note">' + (o.foot || '') + '</div>' +
@@ -290,9 +378,8 @@
   function engineNotice(engine) {
     if (engine !== 'stub') return '';
     return (
-      '<div class="ag-note ag-note--warn">Scripted stand-in — this instance has no AI ' +
-      'credential configured (or <code>AGNES_BUILDER_STUB</code> is set), so the replies are ' +
-      'canned. The panel and Save work normally.</div>'
+      '<div class="ag-note ag-note--warn">Scripted stand-in — no AI credential is configured here, ' +
+      'so the replies are canned. The panel and Save work normally.</div>'
     );
   }
 
@@ -398,9 +485,9 @@
      that all fail the same way. */
   function noModelNotice(what) {
     return (
-      '<div class="ag-note ag-note--warn">No AI credential is configured on this instance, so the ' +
-      'assistant cannot draft anything. The ' + esc(what || 'configuration on the right') +
-      ' is editable by hand and saving works normally — or ask an admin to set a model up.</div>'
+      '<div class="ag-note ag-note--warn">No AI credential is configured, so the assistant cannot ' +
+      'draft anything. Fill the ' + esc(what || 'configuration on the right') +
+      ' by hand — saving works normally.</div>'
     );
   }
 
@@ -419,6 +506,27 @@
       esc(busy && o.busyLabel ? o.busyLabel : o.label) + '</button>';
   }
 
+  /* A picker row is the target, not the button sitting on it.
+
+     Every builder renders `.ag-row` with a single toggle on the right, and
+     every one of them made you hit that button to add a row — a needless act
+     of precision when the pool is two hundred entries long. One delegated
+     listener here forwards a click anywhere on the row to that toggle, so the
+     behaviour arrives on all four builders at once and cannot drift between
+     them; each page keeps its own `data-*` handler and learns nothing new.
+
+     Clicks that land on a real control (the toggle itself, a link in the
+     description) are left alone — forwarding those would double-fire. */
+  document.addEventListener('click', function (e) {
+    var row = e.target.closest && e.target.closest('.ag-pick-rows .ag-row');
+    if (!row) return;
+    if (e.target.closest('button, a, input, select, textarea, label')) return;
+    var toggle = row.querySelector('button[data-ag-kn], button[data-ag-cap], button[data-sk-group], ' +
+      'button[data-sk-comp], button[data-pdw-pick], button[data-pdw-unpick], button[data-ag-tgl], ' +
+      '.ag-tglbtn');
+    if (toggle && !toggle.disabled) toggle.click();
+  });
+
   window.BuilderShell = {
     esc: esc,
     engineNotice: engineNotice,
@@ -432,6 +540,9 @@
     section: section,
     toolbar: toolbar,
     message: message,
+    about: about,
+    TICK_SVG: TICK_SVG,
+    keepCfgScroll: keepCfgScroll,
     conversation: conversation,
     conversationEmpty: conversationEmpty,
     composer: composer,
