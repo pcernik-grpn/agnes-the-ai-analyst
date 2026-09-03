@@ -6751,6 +6751,188 @@ class TestParentCheckpointBump:
         assert runs.bump_parent_calls == []
 
 
+# --------------------------------------------------------------------------
+# Automatic parallel site crawl — Task 7: lane priority + facts interplay
+# (2026-09-03 design §4.6). The priority constant itself and its use at the
+# enqueue call site landed in Task 4 (`_SHARD_JOB_PRIORITY`,
+# `_enqueue_shard_plan`); the `claim_next` ordering guarantee is proven at
+# the repo level in `tests/db_pg/test_jobs_contract.py::
+# test_claim_next_prefers_a_queued_facts_pass_over_a_queued_shard`. This
+# class covers the two remaining properties: K shard children's streamed
+# triggers collapse onto ONE facts job, and the finalizer's chained pass
+# runs exactly once, with its own fresh deadline.
+# --------------------------------------------------------------------------
+
+
+class TestShardFactsStreamingCollapse:
+    def _enable_facts_switches(self, monkeypatch) -> None:
+        monkeypatch.setattr("connectors.sharepoint.facts_extraction.facts_extraction_enabled", lambda: True)
+        monkeypatch.setattr("connectors.sharepoint.facts_extraction.facts_surface_enabled", lambda: True)
+
+    def test_k_children_streaming_collapse_onto_one_deduped_facts_job(self, crawl_env, monkeypatch):
+        """Each shard child streams on its OWN counters
+        (``_maybe_stream_facts_extraction`` called from
+        ``_run_shard_crawl_async``), but the idempotency key is
+        CONNECTION-keyed, not shard-keyed — the same
+        ``sharepoint-facts-extraction:{connection_id}`` key a manual
+        trigger uses — so two children's own triggers collapse onto one
+        queued row via ``jobs_repo().enqueue()``'s own dedup, the REAL
+        (DuckDB-backed, this test app) repo, not a fake."""
+        self._enable_facts_switches(monkeypatch)
+        monkeypatch.setattr(crawler, "_facts_stream_every", lambda: 1)
+        store = FakeStateStore()
+        _install_fake_state_store(monkeypatch, store)
+        _install_runs_repo(monkeypatch)
+        connection = _connection([_drive_scope()])
+        monkeypatch.setattr("src.repositories.source_connections_repo", lambda: FakeSourceConnectionsRepo(connection))
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if url.endswith("/content"):
+                return _content_response()
+            if "folderA" in url:
+                return httpx.Response(
+                    200,
+                    json={"value": [_file_item("itemA", name="a.docx")], "@odata.deltaLink": f"{DRIVE_DELTA}?t=A"},
+                )
+            return httpx.Response(
+                200, json={"value": [_file_item("itemB", name="b.docx")], "@odata.deltaLink": f"{DRIVE_DELTA}?t=B"}
+            )
+
+        _install_graph(monkeypatch, handler)
+
+        def _shard(root_item_id: str, label: str) -> Dict[str, Any]:
+            state_key = f"b!drive1:{root_item_id}"
+            return {
+                "scope_id": "b!drive1",
+                "label": label,
+                "expected": 1,
+                "exclude_prefixes": [],
+                "targets": [
+                    {"drive_id": "b!drive1", "root_item_id": root_item_id, "state_key": state_key, "path": label}
+                ],
+            }
+
+        base_payload = {"connection_id": "conn1", "parent_run_id": "er_parent1"}
+        crawler.run_shard_crawl({**base_payload, "shard_index": 1, "shard": _shard("folderA", "A")})
+        crawler.run_shard_crawl({**base_payload, "shard_index": 2, "shard": _shard("folderB", "B")})
+
+        from src.repositories import jobs_repo
+
+        jobs = jobs_repo().list(kind="sharepoint-facts-extraction")
+        assert len(jobs) == 1
+        assert jobs[0]["idempotency_key"] == "sharepoint-facts-extraction:conn1"
+        assert jobs[0]["payload_json"] == {"connection_id": "conn1"}
+
+
+class TestFinalizerFactsPass:
+    def test_the_chained_pass_runs_exactly_once_with_its_own_fresh_deadline(self, monkeypatch):
+        runs = _install_runs_repo(monkeypatch)
+        store = FakeStateStore()
+        _install_fake_state_store(monkeypatch, store)
+        connection = {"id": "conn1", "source_type": "sharepoint"}
+
+        runs.children_for = lambda parent_ids: {
+            parent_ids[0]: [
+                {
+                    "id": "er_1",
+                    "shard_key": "d1",
+                    "shard_label": "A",
+                    "status": "done",
+                    "report": {"new": 3},
+                    "files_seen": 3,
+                    "files_done": 3,
+                    "error": None,
+                }
+            ]
+        }
+
+        calls: List[Any] = []
+
+        def fake_maybe_run_facts_extraction(connection, *, deadline, stats, recorder):
+            calls.append(deadline)
+            return None
+
+        monkeypatch.setattr(crawler, "maybe_run_facts_extraction", fake_maybe_run_facts_extraction)
+
+        crawler._finalize_site_run(connection, "er_parent1")
+
+        assert len(calls) == 1
+        assert isinstance(calls[0], crawler._Deadline)
+
+    def test_a_facts_hard_stop_still_finalizes_the_parent_as_failed(self, monkeypatch):
+        """A hard stop inside the chained pass must not leave the parent
+        stuck `running` forever — it finalizes `failed`, honestly, same
+        severity-first posture the inline crawl's own tail already has."""
+        runs = _install_runs_repo(monkeypatch)
+        store = FakeStateStore()
+        _install_fake_state_store(monkeypatch, store)
+        connection = {"id": "conn1", "source_type": "sharepoint"}
+
+        runs.children_for = lambda parent_ids: {
+            parent_ids[0]: [
+                {
+                    "id": "er_1",
+                    "shard_key": "d1",
+                    "shard_label": "A",
+                    "status": "done",
+                    "report": {"new": 3},
+                    "files_seen": 3,
+                    "files_done": 3,
+                    "error": None,
+                }
+            ]
+        }
+
+        def _raise_facts_stop(connection, *, deadline, stats, recorder):
+            raise RuntimeError("facts model unreachable")
+
+        monkeypatch.setattr(crawler, "maybe_run_facts_extraction", _raise_facts_stop)
+
+        crawler._finalize_site_run(connection, "er_parent1")
+
+        final = runs.finished[-1]
+        assert final["status"] == "failed"
+        assert "facts model unreachable" in final["error"]
+
+    def test_facts_pass_is_skipped_when_every_shard_already_failed(self, monkeypatch):
+        """The finalizer never even attempts the chained pass over a site
+        that already came back `failed` — matching the inline crawl's own
+        posture (a facts pass only ever runs over documents this crawl
+        actually ingested and indexed)."""
+        runs = _install_runs_repo(monkeypatch)
+        store = FakeStateStore()
+        _install_fake_state_store(monkeypatch, store)
+        connection = {"id": "conn1", "source_type": "sharepoint"}
+
+        runs.children_for = lambda parent_ids: {
+            parent_ids[0]: [
+                {
+                    "id": "er_1",
+                    "shard_key": "d1",
+                    "shard_label": "A",
+                    "status": "failed",
+                    "report": {"errors": 5},
+                    "files_seen": 5,
+                    "files_done": 0,
+                    "error": "boom",
+                }
+            ]
+        }
+
+        calls: List[Any] = []
+        monkeypatch.setattr(
+            crawler,
+            "maybe_run_facts_extraction",
+            lambda connection, *, deadline, stats, recorder: calls.append(deadline) or None,
+        )
+
+        crawler._finalize_site_run(connection, "er_parent1")
+
+        assert calls == []
+        assert runs.finished[-1]["status"] == "failed"
+
+
 def test_the_converted_size_cap_is_reachable_by_the_converter():
     """A byte ceiling above what the converter can emit guards nothing.
 

@@ -305,6 +305,25 @@ def test_claim_next_orders_by_priority_then_fifo(repo):
     assert [first["id"], second["id"], third["id"]] == [high1["id"], high2["id"], low["id"]]
 
 
+def test_claim_next_prefers_a_queued_facts_pass_over_a_queued_shard(repo):
+    """2026-09-03 auto-parallel-crawl design §4.6/Task 7: a shard child
+    (``corpus-extraction-shard``, priority -1 — see ``connectors.
+    sharepoint.crawler._SHARD_JOB_PRIORITY``) is enqueued at the DEFAULT
+    priority BELOW a queued ``sharepoint-facts-extraction`` pass (priority
+    0), so a run's tail (the connection-keyed facts pass a streaming
+    threshold — or the finalizer — enqueues) is never starved behind a
+    fresh site's initial K-shard fan-out."""
+    shard = repo.enqueue("corpus-extraction-shard", {"connection_id": "conn-1"}, priority=-1)
+    time.sleep(0.02)
+    facts = repo.enqueue("sharepoint-facts-extraction", {"connection_id": "conn-1"}, priority=0)
+
+    first = repo.claim_next(kinds=["corpus-extraction-shard", "sharepoint-facts-extraction"], worker_id="w1")
+    second = repo.claim_next(kinds=["corpus-extraction-shard", "sharepoint-facts-extraction"], worker_id="w1")
+
+    assert first["id"] == facts["id"]
+    assert second["id"] == shard["id"]
+
+
 def test_claim_next_does_not_reclaim_before_lease_expires(repo):
     job = repo.enqueue("live_lease", {}, max_attempts=5)
     repo.claim_next(kinds=["live_lease"], worker_id="w1", lease_seconds=120)
