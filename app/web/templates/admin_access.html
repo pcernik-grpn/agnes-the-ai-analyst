@@ -3291,8 +3291,19 @@
      for a grant this page owns; the way to the owning surface for one it does
      not (an inherited Everyone grant, a Required plugin). Exactly one of the
      two, because a row either is yours to change or it is not. */
+  /* The act on a memory-domain row is not a revoke. A memory_domain grant is
+     ADDITIVE — it reveals the domain's items to this group and hides them
+     from nobody else — so removing it takes no access away from anyone,
+     which is precisely what a button labelled Revoke implies it does. The
+     first live finding of the audit (F2) was an admin who would click Revoke
+     here, read the success toast, and report a removal that had not
+     happened. The label says the true act; the confirm and the toast below
+     say what still applies. The permission model is unchanged by this —
+     making the grant actually restrict is a separate decision, deferred. */
+  const ACT_WORD = (typeKey) => (typeKey === "memory_domain" ? "Stop revealing" : "Revoke");
   const manageCell = (o) => {
     const m = o || {};
+    const act = ACT_WORD(m.typeKey);
     if (m.inherited) {
       return `<a class="ax-inherit" href="?group=${esc(everyoneGroupId() || "")}"
         title="Granted to Everyone, so it reaches this group's members too. Edit it on Everyone.">via Everyone →</a>`;
@@ -3308,10 +3319,10 @@
       return `<a class="ax-inherit" href="${esc(m.managedBy.href)}">${esc(m.managedBy.surface)} →</a>`;
     }
     if (m.managedBy) {
-      return `<button type="button" class="ax-revoke" data-revoke>Revoke</button>${
+      return `<button type="button" class="ax-revoke" data-revoke>${act}</button>${
         m.managedBy.href ? `<a class="ax-own__edit" href="${esc(m.managedBy.href)}">${esc(m.managedBy.surface)} ↗</a>` : ""}`;
     }
-    return `<button type="button" class="ax-revoke" data-revoke>Revoke</button>${
+    return `<button type="button" class="ax-revoke" data-revoke>${act}</button>${
       m.href ? `<a class="ax-own__edit" href="${m.href}">where it lives ↗</a>` : ""}`;
   };
 
@@ -3862,7 +3873,7 @@
                tier === "required" ? "Automatic" : "Optional"}<span class="ax-managed__src"> · via Everyone</span></span></span>`
         : controlCell(t.type_key, tier, { href: ownHref, managedBy: grant.managed_by, publisherKind: i.publisher_kind });
       const manage = manageCell({
-        inherited: grant.inherited, managedBy: grant.managed_by, href: ownHref,
+        inherited: grant.inherited, managedBy: grant.managed_by, href: ownHref, typeKey: t.type_key,
       });
       return `
       <div class="ax-r" data-kind="${esc(kindToken(t))}" data-type="${esc(t.type_key)}" data-rid="${esc(i.resource_id)}"${grant.inherited ? ' data-inherited="1"' : ""}>
@@ -5435,7 +5446,7 @@
         <span class="ax-r__d">${esc(detail)}${
           who ? `<span class="ax-r__sep"> · </span><span class="ax-r__who">granted by ${esc(who)}</span>` : ""}</span>
         <span class="ax-r__ctl">${controlCell(r.t.type_key, tier, { managedBy: grant.managed_by, publisherKind: r.i.publisher_kind })}</span>
-        <span class="ax-r__rd ax-r__manage">${manageCell({ managedBy: grant.managed_by })}</span>
+        <span class="ax-r__rd ax-r__manage">${manageCell({ managedBy: grant.managed_by, typeKey: r.t.type_key })}</span>
       </div>`;
     };
 
@@ -6020,7 +6031,17 @@
          radius rather than ask "are you sure?". */
       const g = (overview.groups || []).find((x) => x.id === rowGroup);
       const people = g ? (g.member_count ?? 0) : 0;
-      const okRevoke = await window.confirmModal({
+      const reveals = type === "memory_domain";
+      const okRevoke = await window.confirmModal(reveals ? {
+        // Nobody "loses" a memory domain: the grant only revealed it to this
+        // group, and it hides nothing from anyone else. Saying "N people lose
+        // it" here would be the false claim the relabel exists to stop.
+        title: `Stop revealing “${revokeLabel(type, rid)}” to ${g ? titleOf(g) : "this group"}?`,
+        message: `This group stops seeing items from this memory domain. `
+          + `It hides nothing from anyone else — a memory-domain grant only reveals; it never restricts. `
+          + `You can reveal it again from this page.`,
+        confirmText: "Stop revealing",
+      } : {
         title: `Revoke “${revokeLabel(type, rid)}”?`,
         message: `${people} ${people === 1 ? "person" : "people"} in ${g ? titleOf(g) : "this group"} `
           + `lose it, unless another group also grants it to them. `
@@ -6034,9 +6055,11 @@
         // NOT "the owner can share it again from the Library": this is an
         // admin-created group grant, so the admin made it here and remakes it
         // here — the Library's owner is not in that loop at all.
-        toast(`Revoked — grant it again from this page whenever you like`, true);
+        toast(reveals
+          ? `No longer revealed to this group — nothing was hidden from anyone else`
+          : `Revoked — grant it again from this page whenever you like`, true);
       } catch (err) {
-        toast("Could not revoke: " + err.message, false);
+        toast((reveals ? "Could not change: " : "Could not revoke: ") + err.message, false);
       }
       repaintView();
       focusRestore(memo);

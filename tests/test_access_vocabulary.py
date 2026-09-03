@@ -1113,3 +1113,43 @@ class TestTheLocalCopyKnowsWhenItIsStale:
         assert 'document.addEventListener("visibilitychange"' in src
         assert "const STALE_AFTER_MS = 30000;" in src
         assert "if (Date.now() - _overviewFetchedAt < STALE_AFTER_MS) return;" in src
+
+
+class TestRemovingAMemoryDomainGrantIsNotCalledRevoke:
+    """Audit F2, the most dangerous finding: a memory_domain grant is ADDITIVE
+    — it reveals the domain's items to a group and hides them from nobody
+    else — so removing it takes no access away, which is precisely what a
+    button labelled Revoke implies it does. An admin would click Revoke, read
+    the success toast, and report a removal that had not happened.
+
+    Decision recorded: rename honestly now; whether the grant should actually
+    restrict, or leave this page, is a permission-model question deferred.
+    """
+
+    TEMPLATE = "app/web/templates/admin_access.html"
+
+    def _source(self) -> str:
+        from pathlib import Path
+
+        return Path(self.TEMPLATE).read_text(encoding="utf-8")
+
+    def test_the_act_is_named_for_what_it_does(self):
+        src = self._source()
+        assert 'const ACT_WORD = (typeKey) => (typeKey === "memory_domain" ? "Stop revealing" : "Revoke");' in src
+        cell = src[src.index("const manageCell = (o) => {"): src.index("\n  };", src.index("const manageCell = (o) => {"))]
+        assert cell.count("data-revoke>${act}</button>") == 2
+        assert "data-revoke>Revoke</button>" not in cell
+
+    def test_both_row_renderers_tell_the_cell_the_type(self):
+        src = self._source()
+        assert "href: ownHref, typeKey: t.type_key," in src
+        assert "manageCell({ managedBy: grant.managed_by, typeKey: r.t.type_key })" in src
+
+    def test_the_confirm_does_not_claim_anyone_loses_anything(self):
+        src = self._source()
+        assert 'const reveals = type === "memory_domain";' in src
+        assert "It hides nothing from anyone else — a memory-domain grant only reveals; it never restricts." in src
+        assert 'confirmText: "Stop revealing",' in src
+
+    def test_the_toast_agrees(self):
+        assert "No longer revealed to this group — nothing was hidden from anyone else" in self._source()
