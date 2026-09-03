@@ -560,6 +560,36 @@ class TestExport:
         assert r.status_code == 200
         assert r.text == DOC, "export must not re-serialize; comments and key order survive"
 
+    def test_export_sets_etag_and_updated_at_headers(self, seeded_app):
+        """Issue #2153: the export body stays byte-for-byte (the docstring's
+        contract), but the response HEADERS carry the metadata a caller
+        needs to pin *which* revision it read — the ``ETag`` is the row's
+        own ``content_hash`` (quoted per RFC 7232), which must therefore
+        equal sha256 of the body bytes actually returned. No
+        ``X-Semantic-Model-Revision`` — the row has no revision-like
+        column, so nothing is invented for one."""
+        import hashlib
+
+        from src.repositories import semantic_model_repo
+
+        c = seeded_app["client"]
+        created = c.post(
+            "/api/admin/semantic-models",
+            json={"document": DOC},
+            headers=_auth(seeded_app["admin_token"]),
+        ).json()
+
+        r = c.get("/api/semantic-models/retail.yaml", headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 200
+        assert r.content == DOC.encode(), "headers must not change the byte-for-byte body contract"
+
+        row = semantic_model_repo().get(created["id"])
+        etag = r.headers["etag"]
+        assert etag == f'"{row["content_hash"]}"'
+        assert etag.strip('"') == hashlib.sha256(r.content).hexdigest()
+        assert r.headers["x-semantic-model-updated-at"] == row["updated_at"].isoformat()
+        assert "x-semantic-model-revision" not in r.headers
+
     def test_export_missing_model_is_404(self, seeded_app):
         c = seeded_app["client"]
         r = c.get("/api/semantic-models/nope.yaml", headers=_auth(seeded_app["admin_token"]))

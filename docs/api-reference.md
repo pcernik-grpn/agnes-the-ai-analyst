@@ -1984,6 +1984,17 @@ rides the same visibility as the package(s) it belongs to; admins always
 see everything. A model with no linked package is admin-only until an
 admin links it.
 
+The export response body is the stored document byte-for-byte, unchanged;
+provenance rides response HEADERS instead (issue #2153) — `ETag` is the
+row's own `content_hash` (sha256 of the document), quoted per RFC 7232,
+and `X-Semantic-Model-Updated-At` is `updated_at` in ISO-8601, the only
+two fields the row carries that identify *which* revision this is. No
+If-None-Match / conditional GET. MCP `semantic_model_get` folds both into
+its response dict (`content_hash`, and `updated_at` when the header is
+present) — read from the `ETag` header when present, or computed by
+hashing the response body on an older server that sends none (export is
+byte-for-byte, so the two are always equal).
+
 CLI: `agnes semantic-model search <term>` and `agnes semantic-model
 show|export <slug>` are the any-user reads against these two public
 endpoints; `agnes semantic-model validate <file>` schema-checks a document
