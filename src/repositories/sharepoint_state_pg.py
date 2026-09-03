@@ -82,6 +82,47 @@ class SharepointStatePgRepository:
             )
         return _decode(row["payload"]) if row is not None else None
 
+    def backlog_counts(self, connection_id: str, kind: str) -> Dict[str, int]:
+        """``{"failed_items_count", "empty_items_count"}`` — the SIZE of the
+        ``failed_items``/``empty_items`` backlogs (``connectors.sharepoint.
+        crawler.load_state``'s docstrings), without ever pulling either
+        (potentially thousand-entry) dict into Python.
+
+        This is what the "Retry failed (N)"/"Retry empty (N)" buttons on
+        the source card read, through a status poll that runs every few
+        seconds — decoding the whole payload in the request path (as the
+        one-off retry triggers themselves do, via ``load_state`` +
+        ``len()``, cheap enough for a single admin click) would be a
+        materially worse cost on a hot polling path. ``jsonb_object_keys``
+        counts the object's OWN keys server-side; both backlogs are stored
+        as ``stable_id -> entry`` maps, never lists, so this — not
+        ``jsonb_array_length`` — is the right primitive.
+
+        A never-crawled connection (no row for ``(connection_id, kind)``
+        at all) and a row that predates one of these two keys both count
+        as ``0``, not an error — a cheap, honest "nothing to retry".
+        """
+        with self._engine.connect() as conn:
+            row = (
+                conn.execute(
+                    sa.text(
+                        "SELECT "
+                        "  (SELECT count(*) FROM jsonb_object_keys(payload -> 'failed_items')) AS failed_items_count, "
+                        "  (SELECT count(*) FROM jsonb_object_keys(payload -> 'empty_items')) AS empty_items_count "
+                        "FROM sharepoint_connection_state WHERE connection_id = :cid AND kind = :kind"
+                    ),
+                    {"cid": connection_id, "kind": kind},
+                )
+                .mappings()
+                .first()
+            )
+        if row is None:
+            return {"failed_items_count": 0, "empty_items_count": 0}
+        return {
+            "failed_items_count": int(row["failed_items_count"] or 0),
+            "empty_items_count": int(row["empty_items_count"] or 0),
+        }
+
     def put(self, connection_id: str, kind: str, payload: Dict[str, Any]) -> None:
         """Upsert this connection's ``kind`` state — the crawl/facts
         checkpoint write."""

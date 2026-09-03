@@ -93,6 +93,18 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/admin/sharepoint", tags=["admin"])
 
+#: The two worker-queue lanes an extraction run actually enqueues into —
+#: `trigger_extraction`/`retry_empty_extraction` (this module's sibling,
+#: `app/api/admin_sharepoint.py`) enqueue `corpus-extraction`; the
+#: standalone facts trigger enqueues `sharepoint-facts-extraction`. Read by
+#: :func:`fleet_extraction_runs` for the ``jobs`` lane-starvation strip. A
+#: literal tuple, deliberately NOT derived from
+#: `app.worker.registry.JOB_MAX_ATTEMPTS_BY_KIND` — that dict's membership
+#: answers a different question (crash-recovery lease budget) that happens
+#: to share today's two kinds; a future addition there for lease-budget
+#: reasons alone must not silently start (or stop) appearing here too.
+_EXTRACTION_JOB_KINDS: Tuple[str, ...] = ("corpus-extraction", "sharepoint-facts-extraction")
+
 #: The fleet dashboard's own "go look at this" threshold — the checkpoint
 #: age past which a RUNNING run's row renders red on ``/admin/extraction``.
 #: Deliberately tighter than :data:`_STALL_AFTER_S` (30 min): that constant
@@ -540,19 +552,33 @@ def fleet_extraction_runs(
     status is still ``running`` — deliberately not gated on the derived
     ``outcome`` word, so a run already reclassified ``stalled`` or
     job-``failed`` still trips it). ``facts`` is the facts stage's own
-    numbers, read off the same row (:func:`_fleet_facts`).
+    numbers, read off the same row (:func:`_fleet_facts`). ``failed_items_
+    count``/``empty_items_count`` are the SAME persisted-backlog counts
+    ``extraction/status`` carries (:meth:`SharepointStatePgRepository.
+    backlog_counts`) — what the table's own "Retry failed (N)"/"Retry empty
+    (N)" buttons show, one cheap query per row.
 
     PG-only, same as every other route in this module: ``extraction_runs``
     is a post-A3 table, so a DuckDB-backed instance gets the typed ``501``
     from ``extraction_runs_repo()`` via the app-wide handler in
     ``app/main.py`` — nothing here needs its own DuckDB fallback.
 
+    ``jobs`` is ``{kind: {queued, running}}`` for :data:`_EXTRACTION_JOB_KINDS`
+    — the extraction pipeline's own worker lanes — read in ONE grouped query
+    off the (backend-agnostic) jobs table via
+    :meth:`JobsPgRepository.counts_by_kind`, independent of ``active``/
+    ``all``: lane starvation (a growing ``queued`` count with ``running``
+    stuck at 0 — every worker slot busy elsewhere, or none configured for
+    this lane) is exactly the fact an operator scanning ONLY the active
+    scope would otherwise never see, since a starved connection's job has
+    no ``extraction_runs`` row yet to show up as a table row at all.
+
     Plain ``def`` (not ``async def``, zero ``await``s below): blocking,
     synchronous SQLAlchemy I/O, so FastAPI dispatches it to the anyio thread
     pool rather than the single event loop (Tier-1 convention,
     ``tests/test_event_loop_offload_guard.py``).
     """
-    from src.repositories import extraction_runs_repo, source_connections_repo
+    from src.repositories import extraction_runs_repo, jobs_repo, sharepoint_state_repo, source_connections_repo
 
     connections = sorted(
         source_connections_repo().list(source_type="sharepoint"),
@@ -595,6 +621,7 @@ def fleet_extraction_runs(
         )
         facts = _fleet_facts(run)
         cost = _run_total_cost_usd(run)
+        backlog = sharepoint_state_repo().backlog_counts(connection_id, "crawl")
 
         totals["connections"] += 1
         if stored_status == "running":
@@ -622,15 +649,24 @@ def fleet_extraction_runs(
                 "stuck": stuck,
                 "facts": facts,
                 "estimated_cost_usd": round(cost, 4),
+                # Same persisted-backlog counts `extraction/status` carries —
+                # what the fleet table's own "Retry failed (N)"/"Retry empty
+                # (N)" buttons show, so an operator does not need to open a
+                # source card just to see whether there is anything to retry.
+                "failed_items_count": backlog["failed_items_count"],
+                "empty_items_count": backlog["empty_items_count"],
             }
         )
 
     totals["files_per_min"] = round(totals["files_per_min"], 2)
     totals["estimated_cost_usd"] = round(totals["estimated_cost_usd"], 4)
 
+    jobs = jobs_repo().counts_by_kind(list(_EXTRACTION_JOB_KINDS))
+
     return {
         "connections": rows,
         "totals": totals,
+        "jobs": jobs,
         "as_of": now.isoformat(),
     }
 
@@ -723,9 +759,24 @@ async def extraction_status(
     currently ``running`` AND it postdates ``last_completed`` — an old
     failure from long before the run that actually finished last must
     never eclipse it.
+
+    ``failed_items_count``/``empty_items_count`` are the SIZE of this
+    connection's persisted ``failed_items``/``empty_items`` backlogs
+    (``connectors.sharepoint.crawler.load_state``), read with
+    :meth:`SharepointStatePgRepository.backlog_counts` — a cheap
+    ``jsonb_object_keys`` count, never a decode of the (potentially huge)
+    payload on this polled-every-few-seconds path. They are what the
+    source card's "Retry failed (N)"/"Retry empty (N)" buttons show as
+    ``N``, and are ``0`` (never ``null``) for a connection that has never
+    crawled — an honest "nothing to retry", not a missing signal.
+    ``skipped_unsupported_count`` is NOT a persisted backlog (no retry
+    mechanism replays it — see ``CrawlStats.skipped_unsupported``'s
+    docstring), so it is read off whichever of ``running``/``last_failed``/
+    ``last_completed`` above is most recent, in that order, and is ``null``
+    when none of the three exist.
     """
     _sharepoint_connection_or_404(connection_id)
-    from src.repositories import extraction_runs_repo
+    from src.repositories import extraction_runs_repo, sharepoint_state_repo
 
     repo = extraction_runs_repo()
     now = datetime.now(timezone.utc)
@@ -737,11 +788,23 @@ async def extraction_status(
         completed_at = _parse_ts(last_completed.get("started_at"))
         if failed_at is not None and completed_at is not None and failed_at <= completed_at:
             last_failed = None
+
+    running_out = _run_out(running, now=now) if running else None
+    last_completed_out = _run_out(last_completed, now=now) if last_completed else None
+    last_failed_out = _run_out(last_failed, now=now) if last_failed else None
+    skipped_unsupported_count = None
+    for candidate in (running_out, last_failed_out, last_completed_out):
+        if candidate is not None and candidate.get("skipped_unsupported") is not None:
+            skipped_unsupported_count = candidate["skipped_unsupported"]
+            break
+
+    backlog = sharepoint_state_repo().backlog_counts(connection_id, "crawl")
+
     return {
         "connection_id": connection_id,
-        "running": _run_out(running, now=now) if running else None,
-        "last_completed": _run_out(last_completed, now=now) if last_completed else None,
-        "last_failed": _run_out(last_failed, now=now) if last_failed else None,
+        "running": running_out,
+        "last_completed": last_completed_out,
+        "last_failed": last_failed_out,
         "runs_total": repo.count_for_connection(connection_id),
         "facts_job": _facts_job_in_flight(connection_id),
         # `POST …/extraction/stop` (below) always exists and always works —
@@ -751,6 +814,9 @@ async def extraction_status(
         # to infer: a button without a mechanism would be a lie, and this is
         # the field that says the mechanism exists.
         "can_stop": True,
+        "failed_items_count": backlog["failed_items_count"],
+        "empty_items_count": backlog["empty_items_count"],
+        "skipped_unsupported_count": skipped_unsupported_count,
         "as_of": now.isoformat(),
     }
 

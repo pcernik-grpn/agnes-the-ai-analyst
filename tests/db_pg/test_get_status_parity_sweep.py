@@ -75,6 +75,11 @@ _PG_ONLY_ROUTE_EXEMPTIONS: dict[str, str] = {
         "facts_repo() is PG-only (A3 ratchet) -- DuckDB has no implementation "
         "to resolve; see src/repositories/facts_pg.py"
     ),
+    "GET /api/admin/service-accounts": (
+        "list_service_accounts() reads users.kind, a PG-only column (issue "
+        "#1534, A3 ratchet) -- DuckDB has no implementation; see "
+        "src/repositories/users_pg.py"
+    ),
     # Ontology builder draft persistence (spec §13.2) — genuinely
     # parameter-free and reaches ontology_drafts_repo() -- DuckDB -> typed
     # 501, Postgres -> 200 (empty list, nothing seeded).

@@ -485,3 +485,121 @@ def test_status_reports_an_in_flight_facts_pass_off_the_job_queue(tmp_path, monk
     assert body["facts_job"]["id"] == job["id"]
     assert body["facts_job"]["status"] == "queued"
     assert body["running"] is None, "a facts pass is a job, never claimed to be a crawl run"
+
+
+# ---------------------------------------------------------------------------
+# Retry backlog counts — the source card's "Retry failed (N)"/"Retry empty
+# (N)" buttons (TCRD-296 synthesis).
+# ---------------------------------------------------------------------------
+
+
+def test_status_backlog_counts_are_zero_for_a_never_crawled_connection(tmp_path, monkeypatch, pg_engine):
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token, name="sp-backlog-never")
+
+    body = client.get(f"{BASE}/{conn_id}/extraction/status", headers=_auth(token)).json()
+    assert body["failed_items_count"] == 0
+    assert body["empty_items_count"] == 0
+    assert body["skipped_unsupported_count"] is None
+
+
+def test_status_backlog_counts_reflect_the_persisted_crawl_state(tmp_path, monkeypatch, pg_engine):
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token, name="sp-backlog-counts")
+
+    from src.repositories import sharepoint_state_repo
+
+    sharepoint_state_repo().put(
+        conn_id,
+        "crawl",
+        {
+            "failed_items": {"graph:1": {"item": {}}, "graph:2": {"item": {}}},
+            "empty_items": {"graph:3": {"item": {}}},
+        },
+    )
+
+    body = client.get(f"{BASE}/{conn_id}/extraction/status", headers=_auth(token)).json()
+    assert body["failed_items_count"] == 2
+    assert body["empty_items_count"] == 1
+
+
+def test_status_skipped_unsupported_count_reads_off_the_most_recent_run(tmp_path, monkeypatch, pg_engine):
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token, name="sp-skipped-count")
+
+    repo = _repo()
+    run_id = repo.start(connection_id=conn_id)
+    repo.finish(run_id, status="done", report={"skipped_unsupported": 7})
+
+    body = client.get(f"{BASE}/{conn_id}/extraction/status", headers=_auth(token)).json()
+    assert body["skipped_unsupported_count"] == 7
+
+
+def test_status_skipped_unsupported_count_prefers_the_live_run_over_the_last_completed_one(
+    tmp_path, monkeypatch, pg_engine
+):
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token, name="sp-skipped-live")
+
+    repo = _repo()
+    done = repo.start(connection_id=conn_id)
+    repo.finish(done, status="done", report={"skipped_unsupported": 3})
+    running = repo.start(connection_id=conn_id)
+    repo.checkpoint(running, files_seen=10, files_done=10, progress={"skipped_unsupported": 9})
+
+    body = client.get(f"{BASE}/{conn_id}/extraction/status", headers=_auth(token)).json()
+    assert body["skipped_unsupported_count"] == 9
+
+
+# ---------------------------------------------------------------------------
+# Fleet `jobs` block — the queued-vs-running lane strip (TCRD-296 synthesis).
+# ---------------------------------------------------------------------------
+
+
+def test_fleet_row_carries_the_backlog_counts_for_its_retry_buttons(tmp_path, monkeypatch, pg_engine):
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token, name="sp-fleet-backlog")
+
+    from src.repositories import sharepoint_state_repo
+
+    sharepoint_state_repo().put(
+        conn_id,
+        "crawl",
+        {"failed_items": {"graph:1": {"item": {}}}, "empty_items": {"graph:2": {}, "graph:3": {}}},
+    )
+
+    body = client.get(f"{FLEET_URL}?all=1", headers=_auth(token)).json()
+    row = next(r for r in body["connections"] if r["connection_id"] == conn_id)
+    assert row["failed_items_count"] == 1
+    assert row["empty_items_count"] == 2
+
+
+def test_fleet_jobs_block_zero_fills_the_known_extraction_kinds(tmp_path, monkeypatch, pg_engine):
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    _connection(client, token, name="sp-jobs-empty")
+
+    body = client.get(f"{FLEET_URL}?all=1", headers=_auth(token)).json()
+    assert body["jobs"] == {
+        "corpus-extraction": {"queued": 0, "running": 0},
+        "sharepoint-facts-extraction": {"queued": 0, "running": 0},
+    }
+
+
+def test_fleet_jobs_block_reflects_the_queue_independent_of_scope(tmp_path, monkeypatch, pg_engine):
+    """The strip must be visible even under the default `active` scope,
+    which is exactly when a starved (queued, never yet running) job has no
+    `extraction_runs` row and so no table row of its own."""
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    _connection(client, token, name="sp-jobs-queue")
+
+    from src.repositories import jobs_repo
+
+    jobs_repo().enqueue("corpus-extraction", {"connection_id": "whatever"})
+    jobs_repo().enqueue("corpus-extraction", {"connection_id": "whatever-2"})
+    claimed = jobs_repo().enqueue("sharepoint-facts-extraction", {"connection_id": "whatever"})
+    jobs_repo().claim_next(kinds=["sharepoint-facts-extraction"], worker_id="w1")
+    assert jobs_repo().get(claimed["id"])["status"] == "running"
+
+    body = client.get(f"{FLEET_URL}?active=1", headers=_auth(token)).json()
+    assert body["jobs"]["corpus-extraction"] == {"queued": 2, "running": 0}
+    assert body["jobs"]["sharepoint-facts-extraction"] == {"queued": 0, "running": 1}

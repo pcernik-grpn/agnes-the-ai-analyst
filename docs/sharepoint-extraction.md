@@ -85,13 +85,14 @@ spot-check shows pseudonyms, not names.
   manual only).
 - `extraction.crawler.concurrency` (default 6) — files pipelined per delta
   page; the crawl backs off on tenant throttling by itself (AIMD) and
-  reports it. Per-run override in the Run-now options. Editable in
-  `/admin/server-config` → *Extraction* → *crawler*; this is the extraction
-  worker's **memory lever** (every file in flight is a converter child
-  process holding that document — six in flight has exceeded a 12 GiB
-  container on large decks, two held it under 4 GiB), and the worker reads
-  it at the start of each run, so a save applies to the next run with no
-  restart.
+  reports it. Per-run override in the Run-now options. No separate knob to
+  raise: if the container's own memory limit cannot sustain the resolved
+  cap — several crawl jobs can share one worker's EXTRACTION lane, each
+  with its own convert pool — the run's effective cap is clamped down
+  automatically (never up) from the container's cgroup limit and the
+  worker's own lane count, at roughly 2 GB reserved per in-flight file. The
+  run's `concurrency.source` reports `"memory_budget"` when this fired, next
+  to `"config"`/`"payload"`/`"adaptive"`.
 - **Split one large site across several connections**, each with its own
   crawl and facts jobs so they run in parallel instead of one connection's
   worth of concurrency working through the whole site sequentially. Two
@@ -246,6 +247,26 @@ that backlog for another conversion pass, before the connection's ordinary
 incremental crawl — see [`api-reference.md`](api-reference.md) for the exact
 contract.
 
+**Every reprocessing action an operator needed the shell for is a button**
+(TCRD-296 synthesis). Besides the empty-conversion backlog above, a
+connection also keeps a `failed_items` backlog — every convert-stage
+failure (a conversion crash, a transient download error), including ones
+already given up on after repeated attempts — replayed by `POST
+…/connections/{id}/extract` with `{"retry_failed": true}`
+(`agnes admin sharepoint extract <connection_id> --retry-failed`) BEFORE
+the run's ordinary incremental delta walk. The source card's Run row (and
+the fleet table at `/admin/extraction`, one screen down) show **"Retry
+failed (N)"** and **"Retry empty (N)"** next to each connection, `N` read
+from `GET …/extraction/status`'s `failed_items_count`/`empty_items_count`
+— the persisted backlog sizes, never a client-side guess — and disabled
+while a run for that connection is live. A connection whose most recent
+run ended `failed`/`interrupted` also gets a plain **"Re-run"** button
+(`POST …/extract` with no body — the same trigger a scheduled sweep or
+`agnes admin sharepoint extract <connection_id>` would use). Every button
+is a thin wrapper over the routes documented here and in
+[`api-reference.md`](api-reference.md) — nothing new is introduced at the
+protocol level, only a door that does not require a terminal.
+
 All three can run against a self-hosted OpenAI-compatible endpoint instead
 of the Anthropic API — globally (`extraction.llm`) or per stage, e.g. the
 NER detector local while facts stay hosted:
@@ -297,7 +318,15 @@ ones included. `agnes admin sharepoint runs [--all] [--json] [--watch]` is
 the same view from a terminal — `--watch` refreshes every 10s, for an
 operator watching an overnight run over SSH with no browser open. Both read
 `GET /api/admin/sharepoint/extraction/runs`, PG-only like the rest of run
-observability (see the troubleshooting row below).
+observability (see the troubleshooting row below). A small strip above the
+table — printed as a `Jobs — …` line from the CLI — shows queued-vs-running
+counts per worker lane (`corpus-extraction`, `sharepoint-facts-extraction`),
+independent of the `active`/`all` scope: a lane with jobs queued and NONE
+running is flagged (every worker slot busy elsewhere, or none configured
+for it) — the one signal a connection stuck at "queued" forever has no
+`extraction_runs` row to show any other way. Each row also carries its own
+"Retry failed (N)"/"Retry empty (N)"/"Re-run" buttons, same rules as the
+source card's Run row above.
 
 ## Troubleshooting quick table
 

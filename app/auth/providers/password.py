@@ -22,6 +22,7 @@ from app.auth.provider_registry import require_provider
 from app.auth.providers.sso import sso_forced_for_email
 from app.auth.token_hash import hash_token
 from app.auth.rate_limit import limiter as _rate_limiter
+from src.service_accounts import is_service_account
 
 
 from src.repositories import (
@@ -585,7 +586,12 @@ async def reset_request(
         return RedirectResponse(url="/auth/sso/login", status_code=303)
     repo = users_repo()
     user = repo.get_by_email_ci(email)
-    if user and bool(user.get("active", True)):
+    # Issue #1534: a service account is treated exactly like "no such
+    # account" here — same generic anti-enumeration response below, no
+    # token minted, no email attempted. It never holds a password Agnes
+    # would let anyone reset; the only credential it can hold is a PAT an
+    # admin mints for it (POST /api/admin/service-accounts/{id}/tokens).
+    if user and bool(user.get("active", True)) and not is_service_account(user):
         token = secrets.token_urlsafe(32)
         repo.update(
             id=user["id"],
@@ -840,8 +846,12 @@ async def setup_request(
     if email:
         repo = users_repo()
         user = repo.get_by_email_ci(email)
-        # Only issue setup token if user exists, has no password yet, and is active.
-        if user and not user.get("password_hash") and bool(user.get("active", True)):
+        # Only issue setup token if user exists, has no password yet, and is
+        # active. Issue #1534: `not user.get("password_hash")` is otherwise
+        # true for every service account (they never hold a hash), so
+        # without the explicit exclusion this would happily mint a real,
+        # settable password for one.
+        if user and not user.get("password_hash") and bool(user.get("active", True)) and not is_service_account(user):
             token = secrets.token_urlsafe(32)
             repo.update(
                 id=user["id"],

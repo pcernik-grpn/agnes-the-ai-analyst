@@ -1109,6 +1109,10 @@ _FLEET_BODY = {
         "facts_docs_total": 340,
         "estimated_cost_usd": 0.5,
     },
+    "jobs": {
+        "corpus-extraction": {"queued": 3, "running": 1},
+        "sharepoint-facts-extraction": {"queued": 0, "running": 0},
+    },
     "as_of": "2026-09-02T12:00:00+00:00",
 }
 
@@ -1154,6 +1158,35 @@ class TestRuns:
             result = runner.invoke(app, ["admin", "sharepoint", "runs", "--watch"])
         assert result.exit_code == 0, result.output
         assert mock_get.call_count == 2
+
+    def test_the_jobs_lane_strip_is_printed(self):
+        """TCRD-296 synthesis: the queued-vs-running strip `/admin/
+        extraction` shows is also readable from the terminal, without
+        `--json`."""
+        with patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(200, _FLEET_BODY)):
+            result = runner.invoke(app, ["admin", "sharepoint", "runs"])
+        assert result.exit_code == 0, result.output
+        assert "Jobs" in result.output
+        assert "corpus-extraction: 3 queued / 1 running" in result.output
+        assert "sharepoint-facts-extraction: 0 queued / 0 running" in result.output
+
+    def test_a_starved_lane_is_flagged(self):
+        body = json.loads(json.dumps(_FLEET_BODY))
+        body["jobs"] = {"corpus-extraction": {"queued": 5, "running": 0}}
+        with patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(200, body)):
+            result = runner.invoke(app, ["admin", "sharepoint", "runs"])
+        assert result.exit_code == 0, result.output
+        assert "starved" in result.output
+
+    def test_a_body_with_no_jobs_key_prints_no_strip(self):
+        """An older server that has not shipped `jobs` yet must not crash
+        the command — the strip is simply absent."""
+        body = json.loads(json.dumps(_FLEET_BODY))
+        del body["jobs"]
+        with patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(200, body)):
+            result = runner.invoke(app, ["admin", "sharepoint", "runs"])
+        assert result.exit_code == 0, result.output
+        assert "Jobs" not in result.output
 
 
 class TestExtract:
@@ -1217,6 +1250,26 @@ class TestExtract:
         assert result.exit_code == 0, result.output
         _, kwargs = mock_post.call_args
         assert kwargs["json"] == {"retry_failed": True}
+
+    def test_retry_failed_response_prints_the_queued_count(self):
+        """The toast the source card shows and this line must say the same
+        thing — the server computes `queued_count` once, from the same
+        persisted backlog, for both surfaces."""
+        with patch(
+            "cli.commands.admin_sharepoint.api_post",
+            return_value=_resp(202, {"job_id": "e7", "status": "queued", "queued_count": 3}),
+        ):
+            result = runner.invoke(app, ["admin", "sharepoint", "extract", "conn1", "--retry-failed"])
+        assert result.exit_code == 0, result.output
+        assert "queued_count: 3" in result.output
+
+    def test_a_plain_trigger_prints_no_queued_count(self):
+        with patch(
+            "cli.commands.admin_sharepoint.api_post", return_value=_resp(202, {"job_id": "e8", "status": "queued"})
+        ):
+            result = runner.invoke(app, ["admin", "sharepoint", "extract", "conn1"])
+        assert result.exit_code == 0, result.output
+        assert "queued_count" not in result.output
 
     def test_json_output(self):
         body = {"job_id": "e5", "status": "queued"}

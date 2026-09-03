@@ -213,7 +213,12 @@ def extract(
     if as_json:
         typer.echo(json.dumps(body, indent=2))
         return
-    typer.echo(f"Enqueued corpus-extraction job {body.get('job_id')} (status: {body.get('status')})")
+    # `queued_count` only rides the response with `--retry-failed` — the
+    # size of the failure backlog this run is about to replay, read from
+    # the persisted crawl state before the job was enqueued. Absent for a
+    # plain trigger, `--resync`, or `--force-reprocess`, same as the API.
+    suffix = f", queued_count: {body['queued_count']}" if "queued_count" in body else ""
+    typer.echo(f"Enqueued corpus-extraction job {body.get('job_id')} (status: {body.get('status')}{suffix})")
 
 
 @admin_sharepoint_app.command("retry-empty")
@@ -833,6 +838,24 @@ def _fmt_phase(run: Optional[Dict[str, Any]]) -> str:
     return f"{outcome}/{phase}"
 
 
+def _print_jobs_strip(jobs: Optional[Dict[str, Any]]) -> None:
+    """The queued-vs-running lane-starvation line (TCRD-296 synthesis) — the
+    terminal counterpart to `/admin/extraction`'s own strip, so lane
+    starvation is visible without SQL or opening a browser. `jobs` is
+    `{kind: {queued, running}}`; absent/empty prints nothing (an older
+    server that has not shipped the field yet, or a genuinely empty fleet)."""
+    if not jobs:
+        return
+    parts = []
+    for kind, counts in jobs.items():
+        counts = counts or {}
+        queued = counts.get("queued", 0)
+        running = counts.get("running", 0)
+        flag = " [bold red]starved?[/bold red]" if queued > 0 and running == 0 else ""
+        parts.append(f"{kind}: {queued} queued / {running} running{flag}")
+    _console.print("Jobs — " + ", ".join(parts))
+
+
 def _print_fleet_table(body: Dict[str, Any], *, show_all: bool) -> None:
     rows = body.get("connections") or []
     totals = body.get("totals") or {}
@@ -874,6 +897,7 @@ def _print_fleet_table(body: Dict[str, Any], *, show_all: bool) -> None:
         f"stuck: {totals.get('stuck', 0)}, files/min: {_fmt_rate(totals.get('files_per_min'))}, "
         f"facts done: {totals.get('facts_docs_done', 0):,}, est. cost: {_fmt_cost(totals.get('estimated_cost_usd'))}"
     )
+    _print_jobs_strip(body.get("jobs"))
 
 
 @admin_sharepoint_app.command("runs")

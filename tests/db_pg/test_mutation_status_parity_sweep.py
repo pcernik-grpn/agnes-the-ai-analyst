@@ -96,6 +96,19 @@ _PG_ONLY_ROUTE_EXEMPTIONS: dict[str, str] = {
         "facts_repo() is PG-only (A3 ratchet) -- DuckDB has no implementation "
         "to resolve; see src/repositories/facts_pg.py"
     ),
+    # Service accounts (issue #1534): the router-level `_require_pg_backend`
+    # dependency runs BEFORE FastAPI validates the request body, so an empty
+    # body 501s on DuckDB before ever reaching Pydantic validation, while on
+    # Postgres the dependency passes and the (required name/slug) body then
+    # 422s -- a real, unavoidable divergence given `name`/`slug` are
+    # required fields, not the "genuinely reaches the repo on both" shape
+    # POST /api/facts/ingest is above.
+    "POST /api/admin/service-accounts": (
+        "the router-level PG-backend guard answers 501 before FastAPI "
+        "validates the required name/slug body on DuckDB, while Postgres "
+        "reaches body validation first (422) -- see "
+        "app/api/admin_service_accounts.py"
+    ),
     # Ontology builder draft persistence (spec §13.2). `name` defaults, so an
     # empty body reaches ontology_drafts_repo().create() before any other
     # validation -- DuckDB -> typed 501, Postgres -> 201 (a fresh empty

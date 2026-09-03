@@ -13,7 +13,20 @@ let _extInFlight = false;
 
 function _extS(id) {
   if (!_extState[id]) {
-    _extState[id] = { failures: 0, stopped: false, data: null, lastOk: null, error: null, stopping: false };
+    _extState[id] = {
+      failures: 0,
+      stopped: false,
+      data: null,
+      lastOk: null,
+      error: null,
+      stopping: false,
+      // One in-flight guard per reprocessing action, so a slow request
+      // can't be fired twice from a double-click — mirrors `stopping`
+      // above, which does the same job for the Stop button.
+      retryingFailed: false,
+      retryingEmpty: false,
+      rerunning: false,
+    };
   }
   return _extState[id];
 }
@@ -406,9 +419,41 @@ function _extRunRowHtml(connId, st) {
     ? `<button type="button" class="btn btn-sm btn-danger" onclick="extStopRun('${connId}')"
                ${st.stopping ? "disabled" : ""}>${st.stopping ? "Stopping…" : "Stop run"}</button>`
     : "";
+
+  // Every reprocessing action an operator would otherwise need the shell
+  // for (TCRD-296): retry this connection's own failed/empty backlog, or
+  // re-run outright after a failed/interrupted attempt. `live` covers BOTH
+  // a genuinely running row and a `stalled`/job-`failed` zombie one — its
+  // idempotency key may still hold the enqueue dedup lock either way, so
+  // every button below stays disabled rather than let the server's own 409
+  // be the only thing standing between two overlapping runs.
+  const live = !!run;
+  const failedCount = status.failed_items_count || 0;
+  const emptyCount = status.empty_items_count || 0;
+  const retryFailedBtn = `<button type="button" class="btn btn-secondary" onclick="extRetryFailed('${connId}')"
+               ${live || !failedCount || st.retryingFailed ? "disabled" : ""}>${
+    st.retryingFailed ? "Retrying…" : `Retry failed (${failedCount})`
+  }</button>`;
+  const retryEmptyBtn = `<button type="button" class="btn btn-secondary" onclick="extRetryEmpty('${connId}')"
+               ${live || !emptyCount || st.retryingEmpty ? "disabled" : ""}>${
+    st.retryingEmpty ? "Retrying…" : `Retry empty (${emptyCount})`
+  }</button>`;
+  // Re-run only offers itself once there is a most-recent run to react to
+  // AND it did not finish cleanly — a `done` run has nothing to re-run
+  // FROM here (its own next scheduled/manual trigger is the ordinary path).
+  const latestKnown = run || last;
+  const canRerun = !live && !!latestKnown && (latestKnown.outcome === "failed" || latestKnown.outcome === "interrupted");
+  const rerunBtn = canRerun
+    ? `<button type="button" class="btn btn-secondary" onclick="extRerun('${connId}')"
+               ${st.rerunning ? "disabled" : ""}>${st.rerunning ? "Starting…" : "Re-run"}</button>`
+    : "";
+
   const actions = `
       <div class="ext-actions">
         ${stopBtn}
+        ${retryFailedBtn}
+        ${retryEmptyBtn}
+        ${rerunBtn}
         <button type="button" class="btn btn-secondary" onclick="toggleExtractionDrawer('${connId}', 'runs')"
                 ${total ? "" : "disabled"}>Run history (${total})</button>
         <a class="btn btn-secondary" href="/admin/extraction"
@@ -548,6 +593,14 @@ async function _extFetchOne(connId) {
     // (rather than on a timer) is what lets a LATER run on this same
     // connection show a clickable Stop button of its own.
     if (!st.data.running) st.stopping = false;
+    // The three reprocessing actions below are single-shot requests, not a
+    // wait-for-it state like Stop — by the time ANY subsequent poll lands,
+    // the click has already been submitted (202 or a typed refusal), so the
+    // button's disabled state can go back to being governed purely by
+    // `live`/the backlog counts rather than this flag.
+    st.retryingFailed = false;
+    st.retryingEmpty = false;
+    st.rerunning = false;
   } catch (e) {
     // Keep the last good numbers, VISIBLY marked stale. Blanking them, or
     // redrawing them as current, are the two ways this goes wrong.
@@ -662,6 +715,75 @@ async function extStopRun(connId) {
     if (typeof showToast === "function") showToast("Request failed.", false);
     _extRender(connId);
   }
+}
+
+/* Every reprocessing action an operator needed the shell for (TCRD-296):
+   retry this connection's own failed/empty backlog, or re-run outright
+   after a failed/interrupted run. One shared body — POST, flip an
+   in-flight flag so a double-click can't fire the request twice (belt and
+   braces: the server's own per-connection idempotency key already refuses
+   an overlapping run with 409 `extraction_already_running`, surfaced here
+   as a plain sentence via `detailMessage` rather than a raw JSON blob),
+   toast the queued count the SERVER computed (never a client-side guess),
+   and let the existing status poll (`_extFetchOne`) carry the outcome —
+   the row is never redrawn from what this call merely hopes the job will do. */
+async function _extTriggerAction(connId, stKey, url, body, successPrefix) {
+  const st = _extS(connId);
+  st[stKey] = true;
+  _extRender(connId);
+  try {
+    const r = await fetch(url, {
+      method: "POST",
+      credentials: "include",
+      ...(body ? { headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : {}),
+    });
+    if (r.status === 202) {
+      const respBody = await r.json().catch(() => ({}));
+      const count = typeof respBody.queued_count === "number" ? ` (${respBody.queued_count} queued)` : "";
+      if (typeof showToast === "function") showToast(`${successPrefix}${count}.`, true);
+      await _extFetchOne(connId);
+      return;
+    }
+    const respBody = await r.json().catch(() => ({}));
+    st[stKey] = false;
+    const msg = typeof detailMessage === "function" ? detailMessage(respBody, "request failed") : "request failed";
+    if (typeof showToast === "function") showToast(msg, false);
+    _extRender(connId);
+  } catch (e) {
+    st[stKey] = false;
+    if (typeof showToast === "function") showToast("Request failed.", false);
+    _extRender(connId);
+  }
+}
+
+function extRetryFailed(connId) {
+  return _extTriggerAction(
+    connId,
+    "retryingFailed",
+    `/api/admin/sharepoint/connections/${encodeURIComponent(connId)}/extract`,
+    { retry_failed: true },
+    "Retry failed queued",
+  );
+}
+
+function extRetryEmpty(connId) {
+  return _extTriggerAction(
+    connId,
+    "retryingEmpty",
+    `/api/admin/sharepoint/connections/${encodeURIComponent(connId)}/extraction/retry-empty`,
+    null,
+    "Retry empty queued",
+  );
+}
+
+function extRerun(connId) {
+  return _extTriggerAction(
+    connId,
+    "rerunning",
+    `/api/admin/sharepoint/connections/${encodeURIComponent(connId)}/extract`,
+    null,
+    "Extraction queued",
+  );
 }
 
 document.addEventListener("visibilitychange", () => {

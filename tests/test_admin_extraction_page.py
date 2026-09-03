@@ -6,6 +6,12 @@ Shell-only page: the table itself is fetched client-side from
 ``tests/test_admin_extraction.py`` / ``tests/db_pg/test_extraction_api_pg.py``).
 This file covers the page's own contract — auth gate, page-shell markers the
 JS hangs off, and the off-nav registration.
+
+The poll/render logic itself moved into a static, cache-eligible asset
+(``admin_extraction.js``, TCRD-296 synthesis, 2026-09-03 — mirrors the source
+card's own ``data_sources_extraction_observability.js`` externalization a
+day earlier), so the fetch URL and the reprocessing-button wiring live
+there, not inlined into this page's own HTML.
 """
 
 from __future__ import annotations
@@ -24,7 +30,15 @@ class TestExtractionFleetPageAuth:
         assert 'id="ext-tbody"' in body
         assert 'id="ext-scope-active"' in body
         assert 'id="ext-scope-all"' in body
-        assert "/api/admin/sharepoint/extraction/runs" in body
+        assert 'id="ext-jobs-strip"' in body
+        assert "admin_extraction.js" in body
+
+        # …and the referenced asset actually serves the poll/render code,
+        # fetched through the SAME client, the way a browser would.
+        script = client.get("/static/js/admin/admin_extraction.js")
+        assert script.status_code == 200, script.text
+        assert "/api/admin/sharepoint/extraction/runs" in script.text
+        assert "renderJobsStrip" in script.text
 
     def test_non_admin_gets_403(self, seeded_app):
         client, token = seeded_app["client"], seeded_app["analyst_token"]

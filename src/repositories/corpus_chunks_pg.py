@@ -8,12 +8,27 @@ by ``tests/db_pg/test_corpus_chunks_contract.py``.
 from __future__ import annotations
 
 import secrets
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import sqlalchemy as sa
 from sqlalchemy.engine import Engine
 
 _EMBED_DIM = 384
+
+# Column-pruned SELECT list for the retrieval candidate-set fetch (#2151) —
+# mirrors src/repositories/corpus_chunks.py's ``_SELECT_NO_EMBED``. Never
+# selects ``embedding``; ``list_embeddings_for_ids`` is the only path that
+# fetches vectors, and only for a caller-bounded id set.
+_SELECT_NO_EMBED = "id, corpus_id, file_id, ordinal, text, section_path, page, bbox, metadata, created_at"
+# Qualified variant for the ``search_by_filename`` JOIN, where ``corpus_files``
+# also has ``id``/``corpus_id``/``created_at`` columns.
+_SELECT_CC_NO_EMBED = ", ".join(f"cc.{c}" for c in _SELECT_NO_EMBED.split(", "))
+
+# Same 5s budget as src/repositories/facts_pg.py's ``_STATEMENT_TIMEOUT_MS``
+# (SET LOCAL statement_timeout idiom) — duplicated per-module like
+# ``_EMBED_DIM`` above rather than cross-imported from a sibling repo's
+# private constant.
+_STATEMENT_TIMEOUT_MS = 5_000
 
 
 class CorpusChunksPgRepository:
@@ -122,25 +137,87 @@ class CorpusChunksPgRepository:
             )
         return [dict(r) for r in rows]
 
-    def list_for_corpora(self, corpus_ids: List[str]) -> List[Dict[str, Any]]:
-        """All chunks across several corpora (for retrieval). Empty list → []."""
+    def list_for_corpora(
+        self,
+        corpus_ids: List[str],
+        *,
+        query_terms: Optional[List[str]] = None,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Candidate chunks across several corpora, for retrieval (#2151).
+
+        Mirrors ``src/repositories/corpus_chunks.py``'s DuckDB sibling —
+        see its docstring for the column-pruning / prefilter / limit
+        contract. ``SET LOCAL statement_timeout`` guards the query the same
+        way ``src/repositories/facts_pg.py``'s ILIKE-driven candidate scans
+        are guarded (an unbounded prefilter scan must not stall a pooled
+        connection). DuckDB has no equivalent per-statement wall-clock
+        timeout primitive, so that guard is PG-only; the row cap (``limit``)
+        is the shared, cross-backend bound both repos apply.
+        """
         if not corpus_ids:
             return []
-        with self._engine.connect() as conn:
-            rows = (
-                conn.execute(
-                    sa.text(
-                        "SELECT id, corpus_id, file_id, ordinal, text, embedding, "
-                        "       section_path, page, bbox, metadata, created_at "
-                        "FROM corpus_chunks WHERE corpus_id IN :corpus_ids "
-                        "ORDER BY file_id, ordinal"
-                    ).bindparams(sa.bindparam("corpus_ids", expanding=True)),
-                    {"corpus_ids": list(corpus_ids)},
-                )
-                .mappings()
-                .all()
-            )
-        return [dict(r) for r in rows]
+        params: Dict[str, Any] = {"corpus_ids": list(corpus_ids)}
+        where_extra = ""
+        if query_terms:
+            term_clauses = []
+            for i, term in enumerate(query_terms):
+                key = f"term_{i}"
+                term_clauses.append(f"text ILIKE :{key}")
+                params[key] = f"%{term}%"
+            where_extra = " AND (" + " OR ".join(term_clauses) + ")"
+        limit_sql = ""
+        if limit is not None:
+            params["limit_n"] = int(limit)
+            limit_sql = " LIMIT :limit_n"
+        sql = sa.text(
+            f"SELECT {_SELECT_NO_EMBED} FROM corpus_chunks "
+            f"WHERE corpus_id IN :corpus_ids{where_extra} "
+            f"ORDER BY file_id, ordinal{limit_sql}"
+        ).bindparams(sa.bindparam("corpus_ids", expanding=True))
+        with self._engine.begin() as conn:
+            conn.execute(sa.text(f"SET LOCAL statement_timeout = {_STATEMENT_TIMEOUT_MS}"))
+            rows = conn.execute(sql, params).mappings().all()
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["embedding"] = None
+            out.append(d)
+        return out
+
+    def count_for_corpora(self, corpus_ids: List[str]) -> int:
+        """Cheap ``COUNT(*)`` across several corpora (#2151). On the search
+        path this is consulted only when a stopword-only query filled the
+        candidate cap (the ``SearchQueryTooBroad`` message carries it) —
+        never on an ordinary search. Empty ``corpus_ids`` → 0."""
+        if not corpus_ids:
+            return 0
+        with self._engine.begin() as conn:
+            conn.execute(sa.text(f"SET LOCAL statement_timeout = {_STATEMENT_TIMEOUT_MS}"))
+            row = conn.execute(
+                sa.text("SELECT COUNT(*) FROM corpus_chunks WHERE corpus_id IN :corpus_ids").bindparams(
+                    sa.bindparam("corpus_ids", expanding=True)
+                ),
+                {"corpus_ids": list(corpus_ids)},
+            ).first()
+        return int(row[0]) if row else 0
+
+    def list_embeddings_for_ids(self, ids: List[str]) -> Dict[str, List[float]]:
+        """``{chunk_id: embedding}`` for the given ids that HAVE a stored
+        vector (#2151) — phase 2 of the retrieval layer's two-phase hybrid
+        fetch. An id with no stored embedding (or that does not exist) is
+        simply absent from the returned mapping. Empty ``ids`` → ``{}``."""
+        if not ids:
+            return {}
+        with self._engine.begin() as conn:
+            conn.execute(sa.text(f"SET LOCAL statement_timeout = {_STATEMENT_TIMEOUT_MS}"))
+            rows = conn.execute(
+                sa.text("SELECT id, embedding FROM corpus_chunks WHERE id IN :ids").bindparams(
+                    sa.bindparam("ids", expanding=True)
+                ),
+                {"ids": list(ids)},
+            ).all()
+        return {r[0]: list(r[1]) for r in rows if r[1] is not None}
 
     def search_candidates(self, corpus_ids: List[str], query: str, *, limit: int) -> List[Dict[str, Any]]:
         """Bounded, server-ranked candidate set for retrieval (P0 OOM fix,
@@ -160,12 +237,18 @@ class CorpusChunksPgRepository:
         full-text search (``to_tsvector('simple', text) @@
         plainto_tsquery('simple', :query)``), ranked by ``ts_rank_cd``,
         ``LIMIT :limit``. The process never holds more than ``limit`` rows
-        in memory regardless of corpus size — bounded by
-        ``knowledge.retrieval.max_candidate_chunks`` (default 5000; see
-        ``src.ingest.retrieval._max_candidate_chunks``). Ranking WITHIN the
-        candidate set (IDF-lexical + cosine fusion) is unchanged — it still
-        runs in Python (``src.ingest.retrieval.rank_chunks``), just over
-        this bounded set instead of the whole corpus.
+        in memory regardless of corpus size — the caller passes
+        ``min(knowledge.retrieval.max_candidate_chunks,
+        collections.search_max_chunks)`` (defaults 5000 / 25000; see
+        ``src.ingest.retrieval.search_with_meta`` for how the two compose).
+        Ranking WITHIN the candidate set (IDF-lexical + cosine fusion) is
+        unchanged — it still runs in Python
+        (``src.ingest.retrieval.rank_chunks``), just over this bounded set
+        instead of the whole corpus.
+
+        Column-pruned like ``list_for_corpora`` (#2151): ``embedding`` is
+        always ``None`` on the returned dicts — the retrieval layer fetches
+        vectors for its lexical shortlist via ``list_embeddings_for_ids``.
 
         Trade-off, by construction: a query with literally no term overlap
         with any candidate's body text returns no rows here even if some
@@ -181,7 +264,12 @@ class CorpusChunksPgRepository:
         ``0101_corpus_chunks_fts_index``) speeds this query up but is
         not required for correctness — it may be absent on an instance
         whose table was too large to build it in-place at migration time
-        (see that migration's docstring for the operator follow-up).
+        (see that migration's docstring for the operator follow-up). That
+        is also why this query deliberately does NOT carry the
+        ``SET LOCAL statement_timeout`` the ILIKE-driven methods above do:
+        on exactly the instance this fix exists for (index not yet built),
+        a 5s budget would turn every search into a typed 503 rather than a
+        slow-but-correct answer. The row ``LIMIT`` is the bound here.
 
         Empty ``corpus_ids`` → ``[]`` without querying, matching
         ``list_for_corpora``.
@@ -192,8 +280,7 @@ class CorpusChunksPgRepository:
             rows = (
                 conn.execute(
                     sa.text(
-                        "SELECT id, corpus_id, file_id, ordinal, text, embedding, "
-                        "       section_path, page, bbox, metadata, created_at "
+                        f"SELECT {_SELECT_NO_EMBED} "
                         "FROM corpus_chunks "
                         "WHERE corpus_id = ANY(:corpus_ids) "
                         "  AND to_tsvector('simple', text) @@ plainto_tsquery('simple', :query) "
@@ -205,7 +292,7 @@ class CorpusChunksPgRepository:
                 .mappings()
                 .all()
             )
-        return [dict(r) for r in rows]
+        return [dict(r, embedding=None) for r in rows]
 
     def search_by_filename(self, corpus_ids: List[str], terms: List[str], *, limit: int) -> List[Dict[str, Any]]:
         """Bounded candidate set of chunks whose FILE's name matches any of
@@ -221,7 +308,8 @@ class CorpusChunksPgRepository:
         deliberately, so filename matching behaves identically on both
         backends instead of depending on how ``plainto_tsquery`` happens to
         tokenize punctuation-heavy filenames (``quarterly-report.md``).
-        Empty ``corpus_ids``/``terms`` → ``[]``.
+        Column-pruned (``embedding`` always ``None``) like every candidate
+        fetch here. Empty ``corpus_ids``/``terms`` → ``[]``.
         """
         if not corpus_ids or not terms:
             return []
@@ -232,12 +320,11 @@ class CorpusChunksPgRepository:
             clauses.append(f"cf.filename ILIKE :{key}")
             params[key] = f"%{term}%"
         sql = (
-            "SELECT cc.id, cc.corpus_id, cc.file_id, cc.ordinal, cc.text, cc.embedding, "
-            "       cc.section_path, cc.page, cc.bbox, cc.metadata, cc.created_at "
+            f"SELECT {_SELECT_CC_NO_EMBED} "
             "FROM corpus_chunks cc JOIN corpus_files cf ON cf.id = cc.file_id "
             "WHERE cc.corpus_id = ANY(:corpus_ids) AND (" + " OR ".join(clauses) + ") "
             "ORDER BY cc.file_id, cc.ordinal LIMIT :limit"
         )
         with self._engine.connect() as conn:
             rows = conn.execute(sa.text(sql), params).mappings().all()
-        return [dict(r) for r in rows]
+        return [dict(r, embedding=None) for r in rows]

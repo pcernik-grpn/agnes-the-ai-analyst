@@ -2624,6 +2624,55 @@ class TestExtractionTrigger:
         job = jobs_repo().get(r.json()["job_id"])
         assert job["payload_json"] == {"connection_id": conn_id, "retry_failed": True}
 
+    def test_retry_failed_response_carries_queued_count_from_the_backlog(self, seeded_app, monkeypatch):
+        """The toast the button shows after clicking must say the same
+        count the button already promised — read from the SAME persisted
+        backlog `GET .../extraction/status` counts."""
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(_ENABLED_EXTRACTION_CONFIG))
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="ex-retry-failed-count")
+
+        from connectors.sharepoint.crawler import save_state
+
+        save_state(
+            conn_id,
+            {
+                "delta_links": {},
+                "ctags": {},
+                "failed_items": {
+                    "graph:item1": {
+                        "state_key": "b!drive1",
+                        "item": {"id": "item1", "name": "a.pdf"},
+                        "path": "Reports/a.pdf",
+                    },
+                    "graph:item2": {
+                        "state_key": "b!drive1",
+                        "item": {"id": "item2", "name": "b.pdf"},
+                        "path": "Reports/b.pdf",
+                    },
+                },
+                "empty_items": {},
+            },
+        )
+
+        r = c.post(
+            self.EXTRACT.format(base=BASE, cid=conn_id),
+            json={"retry_failed": True},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 202, r.text
+        assert r.json()["queued_count"] == 2
+
+    def test_a_plain_trigger_never_carries_a_queued_count(self, seeded_app, monkeypatch):
+        """`queued_count` is meaningless without `retry_failed` — an ordinary
+        trigger's response shape must stay exactly what it always was."""
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(_ENABLED_EXTRACTION_CONFIG))
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="ex-no-queued-count")
+        r = c.post(self.EXTRACT.format(base=BASE, cid=conn_id), headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 202, r.text
+        assert "queued_count" not in r.json()
+
     def test_out_of_range_run_options_are_refused_not_reclamped(self, seeded_app, monkeypatch):
         """The crawler would clamp these silently; the endpoint refuses them
         instead, where the admin can see why the run isn't what they asked

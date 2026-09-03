@@ -60,6 +60,20 @@
      reuses the shared `.badge` + `.badge--{info,warn,success,danger}`
      vocabulary from components.css, tinted by the SAME accent tokens the
      rest of the product's status pills use (design-system.md rule 4). */
+
+  /* The queued-vs-running lane-starvation strip (TCRD-296 synthesis) — a
+     small pill row above the table, independent of the table's own scope. */
+  .ext-jobs-strip {
+    display: flex; gap: 18px; flex-wrap: wrap; margin-bottom: 14px;
+    font-size: 12.5px; color: var(--ds-text-secondary);
+  }
+  .ext-jobs-strip__item strong { color: var(--ds-text-primary); font-weight: 700; }
+  .ext-jobs-strip__item--starved { color: var(--ds-accent-danger-ink); font-weight: 600; }
+
+  /* One connection's own reprocessing actions (Retry failed/empty, Re-run) —
+     stacked buttons plus a one-line transient result under them. */
+  .ext-row-actions { display: flex; flex-direction: column; gap: 4px; align-items: flex-start; }
+  .ext-row-actions .btn { white-space: nowrap; }
 </style>
 {% endblock %}
 
@@ -103,8 +117,14 @@
   </div>
 </div>
 
+{# The queued-vs-running lane-starvation strip (TCRD-296 synthesis) — a
+   small pill row above the table, independent of the table's own scope: a
+   starved job (queued, never yet claimed) has no `extraction_runs` row and
+   so no table row of its own to show it. #}
+<div class="ext-jobs-strip" id="ext-jobs-strip" hidden></div>
+
 <div class="data-table-wrap">
-  <table class="data-table" id="ext-table">
+  <table class="data-table data-table--pinned-actions" id="ext-table">
     <thead>
       <tr>
         <th>Connection</th>
@@ -116,192 +136,16 @@
         <th>Est. cost</th>
         <th>Last checkpoint</th>
         <th>Error</th>
+        <th>Actions</th>
       </tr>
     </thead>
     <tbody id="ext-tbody">
-      <tr><td colspan="9" class="ext-blank">Loading…</td></tr>
+      <tr><td colspan="10" class="ext-blank">Loading…</td></tr>
     </tbody>
   </table>
 </div>
 {% endblock %}
 
 {% block scripts %}
-<script>
-// Scope: "active" (default — only connections with a run CURRENTLY
-// running, the "is it on pace right now" view) or "all" (every SharePoint
-// connection, idle ones included). Mirrors the API's own `?active=1` /
-// `?all=1` query params one-to-one.
-let extScope = "active";
-let extTimer = null;
-let extInFlight = false;
-
-function esc(s) {
-  const d = document.createElement("div");
-  d.textContent = s == null ? "" : String(s);
-  return d.innerHTML;
-}
-
-function fmtAgo(seconds) {
-  if (seconds == null) return "—";
-  if (seconds < 60) return Math.round(seconds) + "s ago";
-  if (seconds < 3600) return Math.floor(seconds / 60) + "m ago";
-  return Math.floor(seconds / 3600) + "h ago";
-}
-
-function fmtRate(rate) {
-  return rate == null ? "—" : rate.toFixed(1);
-}
-
-function fmtCost(usd) {
-  return usd == null || usd === 0 ? "—" : "$" + usd.toFixed(4);
-}
-
-// Sums input/output tokens across every priced stage (`ner`/`ocr`/`facts`)
-// a run's `usage` carries — see `_run_total_cost_usd`'s docstring on the
-// API side for why `usage` is keyed by stage and only populated once the
-// run has finished.
-function tokenTotals(usage) {
-  let inTok = 0, outTok = 0, any = false;
-  for (const stage of Object.values(usage || {})) {
-    if (!stage || typeof stage !== "object") continue;
-    if (typeof stage.input_tokens === "number") { inTok += stage.input_tokens; any = true; }
-    if (typeof stage.output_tokens === "number") { outTok += stage.output_tokens; any = true; }
-  }
-  return any ? `${inTok.toLocaleString()} / ${outTok.toLocaleString()}` : "—";
-}
-
-function factsCell(facts) {
-  if (!facts) return "—";
-  const done = facts.docs_done;
-  if (facts.phase_active) {
-    const total = facts.docs_total != null ? facts.docs_total : "?";
-    const pending = facts.docs_total != null && done != null ? Math.max(facts.docs_total - done, 0) : "?";
-    return `${done ?? 0} / ${total} <span class="ext-sub">(${pending} pending)</span>`;
-  }
-  if (done != null) {
-    // A pass that finished walked its whole corpus this run — nothing left
-    // pending FROM THIS PASS. Skipped/failed documents are their own
-    // counts, not represented as "pending" (they were looked at, not
-    // deferred).
-    return `${done} <span class="ext-sub">(0 pending)</span>`;
-  }
-  return "—";
-}
-
-function phaseCell(run) {
-  if (!run) return '<span class="badge">idle</span>';
-  const outcome = run.outcome;
-  const phase = run.phase || "crawl";
-  const cls = outcome === "failed" ? "badge--danger"
-    : outcome === "stalled" ? "badge--warn"
-    : outcome === "running" ? "badge--info"
-    : outcome === "interrupted" ? "badge--warn"
-    : "badge--success";
-  return `<span class="badge ${cls}">${esc(outcome)}</span> <span class="ext-sub">${esc(phase)}</span>`;
-}
-
-function renderRow(row) {
-  const run = row.run;
-  const filesDone = run ? (run.files_done ?? 0) : null;
-  const filesSeen = run ? (run.files_seen ?? 0) : null;
-  const usage = run ? (run.usage || {}) : {};
-  const cost = row.estimated_cost_usd || 0;
-  // `extraction.crawl.min_modified` age filter — an operator scanning the
-  // fleet table must be able to tell a connection's cutoff is doing
-  // something without opening its source card. Absent/zero says nothing
-  // rather than a "0 filtered by age" that reads as a claim.
-  const filteredByAge = run && run.filtered_by_age
-    ? ` <span class="ext-sub">(${run.filtered_by_age.toLocaleString()} filtered by age)</span>`
-    : "";
-  const tr = document.createElement("tr");
-  tr.className = row.stuck ? "ext-row--stuck" : "";
-  tr.innerHTML = `
-    <td>
-      <div class="ext-conn">${esc(row.connection_name || row.connection_id)}</div>
-      <div class="ext-sub">${esc(row.connection_id)}</div>
-    </td>
-    <td>${phaseCell(run)}${row.stuck ? ' <span class="badge badge--danger" title="Checkpoint is stale — go look">Stuck?</span>' : ""}</td>
-    <td class="ext-num">${filesDone == null ? "—" : `${filesDone.toLocaleString()} / ${filesSeen.toLocaleString()}${filteredByAge}`}</td>
-    <td class="ext-num">${fmtRate(row.files_per_min)}</td>
-    <td class="ext-num">${factsCell(row.facts)}</td>
-    <td class="ext-num">${tokenTotals(usage)}</td>
-    <td class="ext-num">${fmtCost(cost)}</td>
-    <td class="ext-sub">${fmtAgo(row.checkpoint_age_s)}</td>
-    <td>${run && run.error ? `<span class="ext-error-cell" title="${esc(run.error)}">${esc(run.error)}</span>` : ""}</td>
-  `;
-  return tr;
-}
-
-function renderTable(body) {
-  const tbody = document.getElementById("ext-tbody");
-  const rows = body.connections || [];
-  if (!rows.length) {
-    const msg = extScope === "active"
-      ? "No SharePoint connection currently has a run in progress."
-      : "No SharePoint connections are registered.";
-    tbody.innerHTML = `<tr><td colspan="9" class="ext-blank">${msg}</td></tr>`;
-  } else {
-    tbody.innerHTML = "";
-    for (const row of rows) tbody.appendChild(renderRow(row));
-  }
-
-  const t = body.totals || {};
-  document.getElementById("ext-summary").hidden = false;
-  document.getElementById("ext-stat-active").textContent = t.active ?? 0;
-  document.getElementById("ext-stat-rate").textContent = fmtRate(t.files_per_min);
-  document.getElementById("ext-stat-facts").textContent = (t.facts_docs_done ?? 0).toLocaleString();
-  const stuckEl = document.getElementById("ext-stat-stuck");
-  stuckEl.textContent = t.stuck ?? 0;
-  stuckEl.classList.toggle("danger", (t.stuck || 0) > 0);
-  document.getElementById("ext-stat-cost").textContent = fmtCost(t.estimated_cost_usd);
-
-  document.getElementById("ext-fresh").textContent = "Updated " + new Date().toLocaleTimeString();
-}
-
-function setScope(scope) {
-  extScope = scope;
-  document.getElementById("ext-scope-active").classList.toggle("active", scope === "active");
-  document.getElementById("ext-scope-all").classList.toggle("active", scope === "all");
-  return extTick();
-}
-
-async function extTick() {
-  if (extInFlight) return;
-  if (document.visibilityState !== "visible") return;
-  extInFlight = true;
-  try {
-    const qs = extScope === "all" ? "?all=1" : "?active=1";
-    const r = await fetch("/api/admin/sharepoint/extraction/runs" + qs, { credentials: "include" });
-    if (r.status === 501) {
-      document.getElementById("ext-pg-unavailable").hidden = false;
-      document.getElementById("ext-toolbar").hidden = true;
-      document.getElementById("ext-summary").hidden = true;
-      document.getElementById("ext-tbody").innerHTML = "";
-      return;
-    }
-    if (!r.ok) throw new Error("HTTP " + r.status);
-    const body = await r.json();
-    renderTable(body);
-  } catch (e) {
-    document.getElementById("ext-fresh").textContent = "Refresh failed: " + e.message;
-  } finally {
-    extInFlight = false;
-  }
-}
-
-function extSchedule() {
-  if (extTimer) clearTimeout(extTimer);
-  extTimer = setTimeout(async () => { await extTick(); extSchedule(); }, 5000);
-}
-
-document.getElementById("ext-scope-active").addEventListener("click", (e) => { e.preventDefault(); setScope("active"); });
-document.getElementById("ext-scope-all").addEventListener("click", (e) => { e.preventDefault(); setScope("all"); });
-
-document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "visible") { extTick(); extSchedule(); }
-});
-
-setScope("active");
-extSchedule();
-</script>
+<script src="{{ static_url('js/admin/admin_extraction.js') }}" defer></script>
 {% endblock %}

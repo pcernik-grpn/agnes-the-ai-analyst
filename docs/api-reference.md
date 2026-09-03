@@ -776,6 +776,31 @@ fabricated one is dropped rather than corrected.
 - /api/admin/discover-tables
 - /api/admin/discover-and-register
 
+### `/api/admin/service-accounts` — Service accounts (issue #1534)
+
+Postgres-only (A3 ratchet — 501 on a DuckDB-backed instance). A service
+account is a `users` row flagged `kind='service'`: a headless identity with
+its own group grants and its own independently-revocable PATs, never an
+interactive session and never Admin-group-eligible.
+
+- `POST /api/admin/service-accounts` — create (`name`, `slug`); the row gets
+  a synthetic `<slug>@service.local` address.
+- `GET /api/admin/service-accounts` — list, with a per-account PAT summary
+  (count, `last_used_at`, soonest `expires_at`).
+- `POST /api/admin/service-accounts/{service_account_id}/tokens` — mint a
+  PAT FOR the account. Session-token-only (a PAT-authenticated admin gets
+  403), same boundary as `POST /auth/tokens`.
+- `PATCH /api/admin/service-accounts/{service_account_id}` — body
+  `{"active": bool}`; the same `users.active` flip
+  `POST /api/users/{user_id}/deactivate` uses (deactivating stops every PAT
+  the account holds; re-activation clears `deactivated_at`/`deactivated_by`).
+- Revoking one of its tokens reuses the existing
+  `DELETE /auth/admin/tokens/{token_id}` (admin-on-behalf already works
+  there — no new endpoint).
+
+See [`docs/RBAC.md`](RBAC.md#service-accounts) for the identity model and
+the three guards (no interactive session, no Admin group, PAT-only minting).
+
 ### `/api/admin/users` — User management
 
 - /api/admin/users/{user_id}/activity
@@ -1565,7 +1590,14 @@ unknown/non-sharepoint connection before any other work; refuses cleanly
 `409 extraction_dependencies_missing` (the `extraction` optional dependency
 extra is not installed); a run already queued/running for the same
 connection is `409 extraction_already_running` — deduped on a stable
-per-connection idempotency key shared with the sweep below.
+per-connection idempotency key shared with the sweep below. When the body
+sets `retry_failed: true` (TCRD-296 synthesis — the source card's "Retry
+failed (N)" button and `agnes admin sharepoint extract --retry-failed`),
+the response also carries `queued_count` — the size of this connection's
+persisted `failed_items` backlog at the moment this call reads it, before
+the job is enqueued, mirroring `…/extraction/retry-empty`'s own
+`queued_count` below. Absent for a plain trigger, `--resync`, or
+`--force-reprocess`.
 
 `POST …/extraction/retry-empty` re-queues this connection's `convert_empty`
 backlog — documents that converted fine but carried no text (a scan with no
@@ -1765,7 +1797,17 @@ queued/running standalone facts pass for this connection
 read off the job queue (matched on the same idempotency key the trigger
 dedups on) and never appears in `running`/`last_completed`. The card shows
 it as a "facts pass queued/running" line in the Run row and locks its own
-"Extract facts now" button while one is in flight.
+"Extract facts now" button while one is in flight. `failed_items_count` /
+`empty_items_count` (TCRD-296 synthesis) are the SIZE of this connection's
+persisted `failed_items`/`empty_items` backlogs (a cheap `jsonb_object_keys`
+count, never a decode of the — potentially huge — payload on this
+polled-every-few-seconds path) — what the Run row's "Retry failed (N)" /
+"Retry empty (N)" buttons show as `N`, `0` (never `null`) for a connection
+that has never crawled. `skipped_unsupported_count` has no persisted
+backlog to count (no retry mechanism replays it — see `CrawlStats.
+skipped_unsupported`'s docstring), so it is read off whichever of
+`running`/`last_failed`/`last_completed` above is most recent, and `null`
+when none of the three exist.
 
 `GET …/extraction/runs` (`?limit=`, ≤100) lists runs newest-first with a
 `total` covering every recorded run; `GET …/extraction/runs/{run_id}` adds the
@@ -1835,9 +1877,20 @@ checkpoint older than 10 minutes on a row whose STORED status is still
 `stalled` derivation, meant to catch an operator's eye across a whole fleet
 rather than assert an outcome). `facts` carries the facts stage's own
 counters, read off the SAME run row (crawl and facts are literally one row;
-`phase` flips from `"crawl"` to `"facts"` mid-run). CLI:
-`agnes admin sharepoint runs [--all] [--json] [--watch]` (`--watch`
-refreshes every 10s).
+`phase` flips from `"crawl"` to `"facts"` mid-run). Each row also carries
+`failed_items_count`/`empty_items_count` (TCRD-296 synthesis) — the SAME
+persisted-backlog counts `…/extraction/status` returns, one cheap query per
+row, backing the table's own "Retry failed (N)"/"Retry empty (N)" buttons
+so an operator does not need to open a source card just to see whether
+there is anything to retry. The response also carries a top-level `jobs`
+block — `{kind: {queued, running}}` for `corpus-extraction` and
+`sharepoint-facts-extraction`, read in one grouped query off the jobs table
+independent of `active`/`all` scope — the queued-vs-running lane-starvation
+strip above the table: a starved job (queued, never yet claimed) has no
+`extraction_runs` row and so no table row of its own to show it otherwise.
+CLI: `agnes admin sharepoint runs [--all] [--json] [--watch]` (`--watch`
+refreshes every 10s; the human-readable table also prints a `Jobs — …` line
+for the same `jobs` block, flagging a starved lane).
 
 `PATCH …/extraction/facts-config` (cost-levers task, lever A) sets or clears
 per-connection overrides for the corrective-retry policy, transport and LLM
@@ -2599,6 +2652,21 @@ value falls back to `oldest` rather than erroring. Every ordering carries an
 `id ASC` tie-break, because files uploaded in one batch share a `created_at`
 and without it a page boundary would repeat or skip rows.
 
+**`GET /api/collections/search`** ranks chunks with a server-side cap
+(`collections.search_max_chunks`, default 25000) on how many chunks of the
+caller's accessible collections a single request may rank — the point
+`scripts/bench_retrieval.py` measured at ~371 MB peak RSS. It composes with
+`knowledge.retrieval.max_candidate_chunks` (below): candidate selection
+always runs in SQL under the smaller of the two, so with the defaults this
+cap never binds. When the bounded candidate fetch fills its cap the response
+carries `truncated: true` plus `truncated_cap` (and the additive
+`candidates_capped: true` — the same event under both names); a query with
+no usable (non-stopword) term to narrow by that still fills the cap is
+refused with a typed `422 search_query_too_broad` rather than ranking an
+arbitrary slice of the corpus. A search-backend outage (a database-side
+memory or operational failure) answers a typed `503 search_unavailable`
+instead of an anonymous server error.
+
 **Editing a collection** (`PATCH /api/collections/{collection_id}`) changes
 its `name`, `slug` and `description` — the files inside are untouched. The
 gate is **owner-or-admin**, not every grant-holder: a group grant conveys
@@ -3084,6 +3152,11 @@ metered server-side.
   table catalog cards; typed results (`chunk | knowledge | table`) with
   citations, RBAC fail-closed per source. Params: `q` (required), `k` (1–50,
   default 10). Triple-surface: `agnes search` + MCP tool `knowledge_search`.
+  The chunk leg is bounded server-side (`collections.search_max_chunks`,
+  see `/api/collections` above); a chunk-engine failure or an over-broad
+  query on an oversized corpus degrades that ONE leg to empty (`degraded:
+  {"chunk": "search_unavailable"}` + `degraded_note`) rather than failing
+  the whole combined search — the other legs keep answering.
 - /api/knowledge/artifacts/{corpus_id}/download — streams the per-collection
   `knowledge.duckdb` artifact (chunks + embeddings) built by the K3 local
   packaging pass; listed in the sync manifest's `knowledge_artifacts` array
