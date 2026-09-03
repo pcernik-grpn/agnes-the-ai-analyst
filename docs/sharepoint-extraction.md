@@ -213,6 +213,20 @@ documents without up-to-date facts — so it is safe to repeat, and it runs
 alongside a crawl; while one is queued or running the card's Run row says
 so and the button is locked.
 
+Each document's request is kept under a token budget
+(`extraction.facts.max_prompt_tokens`, default 150 000, hard-ceilinged at
+190 000 regardless of what is configured) on top of the flat character
+pre-cap (`extraction.facts.max_doc_chars`, default 120 000): a dense
+document (a converted spreadsheet, CSV, or EDI-shaped export) is truncated
+further and counted in `docs_truncated`; a binary/decode-garbage document
+(a failed conversion) is skipped outright and counted in
+`docs_skipped_garbled_text`; a dense document too large even at the token
+budget is skipped rather than shipping a meaningless head, counted in
+`docs_skipped_too_large_tabular`. A model call that fails PERMANENTLY for
+one document's own request (most commonly a 400 "prompt is too long") is
+counted in `facts_failed`/`facts_failed_reasons` and the pass continues
+with the next document — it never aborts the whole run.
+
 ## Watching several connections at once
 
 Running crawl + facts over more than one connection (several tenants, or
@@ -239,3 +253,4 @@ observability (see the troubleshooting row below).
 | run ends `interrupted / throttled` | tenant 429 budget exhausted | rerun later; lower concurrency |
 | documents in `anonymize_failed` | fail-closed drop | check key status + detector availability; preview the file (step 3) |
 | run history says "needs a Postgres backend" | `extraction_runs` is PG-only | run state needs Postgres app-state; config/preview still work |
+| a facts pass fails with "prompt is too long" | one document's request exceeded the model's context window | fixed automatically going forward (token-safe bound + per-document failure); a still-oversized/garbled document is skipped and counted, never retried |

@@ -1175,6 +1175,12 @@ def test_a_transient_failure_retries_then_gives_up_loudly():
 
 
 def test_a_permanent_failure_is_not_retried():
+    """A bare 400 (no ``.type`` at all — the shape a plain stub or an older
+    SDK version carries) is classified `invalid_request` by the bare-400
+    fallback (see `_classify_permanent_error`) and fails the DOCUMENT, not
+    the pass — never `FactsExtractionUnavailable`, and never a second
+    attempt."""
+
     class Boom(Exception):
         status_code = 400
 
@@ -1182,9 +1188,68 @@ def test_a_permanent_failure_is_not_retried():
     extractor = _Extractor(
         system_prompt="SYSTEM", model="claude-haiku-4-5", client=client, max_attempts=3, sleep=lambda _s: None
     )
-    with pytest.raises(FactsExtractionUnavailable):
+    with pytest.raises(fe.FactsDocumentError) as exc_info:
         extractor.call("hello")
+    assert exc_info.value.reason == "invalid_request"
     assert len(client.calls) == 1
+
+
+def test_an_invalid_request_error_is_classified_by_type_not_status_alone():
+    """The Anthropic SDK's own ``APIStatusError`` sets ``.type`` from the
+    parsed response body — the SAME field the live incident's error carried
+    (``'type': 'invalid_request_error'``). Classified the same way as a
+    bare 400."""
+
+    class Boom(Exception):
+        status_code = 400
+        type = "invalid_request_error"
+
+    client = FakeClient(Boom("prompt is too long: 316295 tokens > 200000 maximum"))
+    extractor = _Extractor(
+        system_prompt="SYSTEM", model="claude-haiku-4-5", client=client, max_attempts=3, sleep=lambda _s: None
+    )
+    with pytest.raises(fe.FactsDocumentError) as exc_info:
+        extractor.call("hello")
+    assert exc_info.value.reason == "invalid_request"
+    assert "316295" in str(exc_info.value)
+    assert len(client.calls) == 1
+
+
+def test_a_non_document_permanent_failure_stays_pass_level():
+    """401/403/404/422 — the model account or credentials themselves are
+    unusable, not this one document's request — stay
+    `FactsExtractionUnavailable`, never `FactsDocumentError`. The message
+    reports the ACTUAL number of attempts made (1, not `max_attempts`)."""
+
+    class Boom(Exception):
+        status_code = 401
+        type = "authentication_error"
+
+    client = FakeClient(Boom(), Boom(), Boom())
+    extractor = _Extractor(
+        system_prompt="SYSTEM", model="claude-haiku-4-5", client=client, max_attempts=3, sleep=lambda _s: None
+    )
+    with pytest.raises(FactsExtractionUnavailable) as exc_info:
+        extractor.call("hello")
+    assert "failed after 1 attempt(s)" in str(exc_info.value)
+    assert len(client.calls) == 1
+
+
+def test_a_transient_exhaustion_reports_the_real_attempt_count():
+    """The failure message names how many attempts were ACTUALLY made —
+    `max_attempts`, here, since every one of them was transient — never a
+    number the wrapper did not earn."""
+
+    class Boom(Exception):
+        status_code = 503
+
+    client = FakeClient(Boom(), Boom(), Boom())
+    extractor = _Extractor(
+        system_prompt="SYSTEM", model="claude-haiku-4-5", client=client, max_attempts=3, sleep=lambda _s: None
+    )
+    with pytest.raises(FactsExtractionUnavailable) as exc_info:
+        extractor.call("hello")
+    assert "failed after 3 attempt(s)" in str(exc_info.value)
 
 
 # ---------------------------------------------------------------------------
@@ -2263,3 +2328,318 @@ class TestResolveRunTransport:
                 connection_id="conn1", transport=None, connection=None, effective_provider="vertex"
             )
         assert mode == "sync"
+
+
+# ---------------------------------------------------------------------------
+# Token-safe document bound — live incident 2026-09 (a single oversized/
+# garbled document overflowing the model's real context window and killing
+# the whole pass). See `_looks_garbled`, `_is_tabular_text`,
+# `_approx_tokens`, `_token_char_budget`, `_bound_failures_for_retry`.
+# ---------------------------------------------------------------------------
+
+
+class TestMaxDocCharsConfig:
+    def test_defaults(self, monkeypatch):
+        _config(monkeypatch, {})
+        assert fe._max_doc_chars() == fe.DEFAULT_MAX_DOC_CHARS
+
+    def test_reads_the_configured_value(self, monkeypatch):
+        _config(monkeypatch, {("extraction", "facts", "max_doc_chars"): 50_000})
+        assert fe._max_doc_chars() == 50_000
+
+    def test_an_unparseable_value_falls_back_and_is_named(self, monkeypatch, caplog):
+        _config(monkeypatch, {("extraction", "facts", "max_doc_chars"): "a lot"})
+        with caplog.at_level(logging.WARNING, logger="connectors.sharepoint.facts_extraction"):
+            assert fe._max_doc_chars() == fe.DEFAULT_MAX_DOC_CHARS
+        assert any("max_doc_chars" in r.getMessage() for r in caplog.records)
+
+    def test_a_non_positive_value_is_clamped_to_one(self, monkeypatch):
+        _config(monkeypatch, {("extraction", "facts", "max_doc_chars"): 0})
+        assert fe._max_doc_chars() == 1
+
+
+class TestMaxPromptTokensConfig:
+    def test_defaults(self, monkeypatch):
+        _config(monkeypatch, {})
+        assert fe._max_prompt_tokens() == fe.DEFAULT_MAX_PROMPT_TOKENS
+
+    def test_reads_the_configured_value(self, monkeypatch):
+        _config(monkeypatch, {("extraction", "facts", "max_prompt_tokens"): 100_000})
+        assert fe._max_prompt_tokens() == 100_000
+
+    def test_a_value_past_the_ceiling_is_clamped_and_never_exceeds_it(self, monkeypatch):
+        """The hard ceiling wins regardless of what instance.yaml asks for
+        — an operator raising this past the model's real context window
+        would just move the 400 from "too long" to "still too long"."""
+        _config(monkeypatch, {("extraction", "facts", "max_prompt_tokens"): 10_000_000})
+        assert fe._max_prompt_tokens() == fe.MAX_PROMPT_TOKENS_CEILING
+
+    def test_an_unparseable_value_falls_back_and_is_named(self, monkeypatch, caplog):
+        _config(monkeypatch, {("extraction", "facts", "max_prompt_tokens"): "loads"})
+        with caplog.at_level(logging.WARNING, logger="connectors.sharepoint.facts_extraction"):
+            assert fe._max_prompt_tokens() == fe.DEFAULT_MAX_PROMPT_TOKENS
+        assert any("max_prompt_tokens" in r.getMessage() for r in caplog.records)
+
+
+class TestLooksGarbled:
+    """Calibrated directly against a live incident's real
+    `count_tokens()` measurements — see `_GARBLED_READABLE_CHARS`'s
+    docstring for the exact numbers."""
+
+    def test_ordinary_prose_is_not_garbled(self):
+        text = "The Northwind rollout began in March and finished under budget. " * 50
+        assert fe._looks_garbled(text) is False
+
+    def test_a_normal_financial_table_is_not_garbled(self):
+        rows = [f"| 2026-01-{d:02d} | Invoice #{d:04d} | ${d * 137.42:,.2f} | USD |" for d in range(1, 60)]
+        text = "\n".join(rows * 20)
+        assert fe._looks_garbled(text) is False
+
+    def test_an_edi_shaped_dense_sample_is_not_garbled(self):
+        """The live incident's own calibration point: 27% non-alphanumeric
+        (delimiter-heavy) measured well under the garbled threshold."""
+        segment = "ISA*00*          *00*          *ZZ*SENDER*ZZ*RECEIVER*260101*1200*U*00401*000000001*0*P*>~"
+        text = segment * 300
+        assert fe._looks_garbled(text) is False
+
+    def test_symbol_soup_is_garbled(self):
+        """The live incident's killer document: an xlsx-conversion that
+        emitted mostly non-readable characters instead of values."""
+        text = "".join(chr(0x2500 + (i % 200)) for i in range(20_000))
+        assert fe._looks_garbled(text) is True
+
+    def test_a_short_sample_is_never_flagged(self):
+        assert fe._looks_garbled("###@@@***") is False
+
+    def test_empty_text_is_not_garbled(self):
+        assert fe._looks_garbled("") is False
+
+
+class TestIsTabularText:
+    def test_a_markdown_table_is_tabular(self):
+        rows = ["| col_a | col_b | col_c |" for _ in range(30)]
+        assert fe._is_tabular_text("\n".join(rows)) is True
+
+    def test_an_edi_segment_export_is_tabular(self):
+        segment = "ISA*00*SENDER*ZZ*RECEIVER*260101*1200*U*00401*000000001*0*P*>~"
+        assert fe._is_tabular_text("\n".join([segment] * 30)) is True
+
+    def test_ordinary_prose_is_not_tabular(self):
+        prose = "The Northwind rollout began in March.\n" * 30
+        assert fe._is_tabular_text(prose) is False
+
+    def test_empty_text_is_not_tabular(self):
+        assert fe._is_tabular_text("") is False
+
+    def test_one_embedded_table_does_not_flip_a_prose_document(self):
+        prose = "The Northwind rollout began in March.\n" * 60
+        one_table = "| a | b | c |\n| d | e | f |\n"
+        assert fe._is_tabular_text(prose + one_table) is False
+
+
+class TestApproxTokensAndCharBudget:
+    def test_dense_text_is_charged_more_tokens_than_prose_of_the_same_length(self):
+        text = "x" * 10_000
+        assert fe._approx_tokens(text, tabular=True) > fe._approx_tokens(text, tabular=False)
+
+    def test_empty_text_is_zero_tokens(self):
+        assert fe._approx_tokens("") == 0
+
+    def test_char_budget_shrinks_as_the_system_prompt_grows(self):
+        small = fe._token_char_budget(1_000, fe.DEFAULT_MAX_PROMPT_TOKENS, tabular=False)
+        large = fe._token_char_budget(100_000, fe.DEFAULT_MAX_PROMPT_TOKENS, tabular=False)
+        assert large < small
+
+    def test_char_budget_is_never_negative(self):
+        assert fe._token_char_budget(10_000_000, fe.DEFAULT_MAX_PROMPT_TOKENS, tabular=False) == 0
+
+    def test_dense_budget_is_tighter_than_prose_budget(self):
+        prose_budget = fe._token_char_budget(1_000, fe.DEFAULT_MAX_PROMPT_TOKENS, tabular=False)
+        dense_budget = fe._token_char_budget(1_000, fe.DEFAULT_MAX_PROMPT_TOKENS, tabular=True)
+        assert dense_budget < prose_budget
+
+
+class TestBoundFailuresForRetry:
+    def _failure(self, n: int) -> tuple:
+        return ({"id": f"fact:{n}", "type": "engagement", "attrs": {}}, f"quote number {n} " * 5)
+
+    def test_everything_fits_when_the_budget_is_generous(self):
+        failures = [self._failure(i) for i in range(5)]
+        included, overflow = fe._bound_failures_for_retry(failures, char_budget=100_000)
+        assert included == failures
+        assert overflow == []
+
+    def test_failures_past_the_budget_overflow_in_order(self):
+        failures = [self._failure(i) for i in range(50)]
+        # A budget that fits a handful of entries but not all 50.
+        included, overflow = fe._bound_failures_for_retry(failures, char_budget=500)
+        assert included + overflow == failures
+        assert 0 < len(included) < len(failures)
+        assert overflow
+
+    def test_a_zero_budget_still_keeps_the_first_entry(self):
+        """An empty listing would ask the model to "re-emit ONLY these
+        facts" over nothing — nonsensical. Keep the first entry as a
+        rounding error next to the base message."""
+        failures = [self._failure(i) for i in range(3)]
+        included, overflow = fe._bound_failures_for_retry(failures, char_budget=0)
+        assert included == [failures[0]]
+        assert overflow == failures[1:]
+
+    def test_no_failures_is_a_no_op(self):
+        assert fe._bound_failures_for_retry([], char_budget=1000) == ([], [])
+
+
+def test_retry_listing_is_bounded_when_the_extractor_reports_a_tight_budget():
+    """`extract_one`'s retry branch consults `extractor.char_budget` (a
+    test seam only the real `_Extractor` carries) and trims the failing-
+    quote listing sent to the model — this is what closes the live
+    incident: a document with hundreds of gate failures no longer builds
+    an unbounded retry request."""
+
+    class BudgetedStub(StubExtractor):
+        def char_budget(self, *, tabular: bool) -> int:  # noqa: ARG002
+            return 200  # deliberately tiny — forces most failures to overflow
+
+    many_bad_facts = [_node(f"quote number {i} that is not verbatim anywhere") for i in range(30)]
+    reply = _stream(*many_bad_facts)
+    # The retry reply "fixes" nothing further — every fact still fails,
+    # which is fine: this test only cares that the REQUEST sent was bounded.
+    extractor = BudgetedStub([reply, "NODES\nEDGES\n"])
+    work = _work(text="The Northwind rollout began in March.")
+
+    extract_one(extractor, work, retry_mode="always", fingerprint="fp")
+
+    assert len(extractor.seen) == 2
+    retry_request = extractor.seen[1]
+    # Far fewer than 30 quotes made it into the actual retry request.
+    assert retry_request.count("failing quote:") < 30
+
+
+def test_retry_listing_is_unbounded_for_a_stub_without_char_budget():
+    """A bare stub (no `char_budget` method — the shape most of this
+    file's other tests already use) gets the UNBOUNDED listing, exactly as
+    before this bound existed — no regression for the common test seam."""
+    many_bad_facts = [_node(f"quote number {i} that is not verbatim anywhere") for i in range(10)]
+    reply = _stream(*many_bad_facts)
+    extractor = StubExtractor([reply, "NODES\nEDGES\n"])
+    work = _work(text="The Northwind rollout began in March.")
+
+    extract_one(extractor, work, retry_mode="always", fingerprint="fp")
+
+    retry_request = extractor.seen[1]
+    assert retry_request.count("failing quote:") == 10
+
+
+# ---------------------------------------------------------------------------
+# `_plan_documents` — the token-safe bound end to end, without a database
+# ---------------------------------------------------------------------------
+
+
+class _FakeFilesRepo:
+    def __init__(self, rows: list[dict]) -> None:
+        self._rows = rows
+
+    def list_for_corpus(self, collection_id: str) -> list[dict]:  # noqa: ARG002
+        return list(self._rows)
+
+
+class _FakeSourcesRepo:
+    def __init__(self, mapping: dict) -> None:
+        self._mapping = mapping
+
+    def get(self, file_id: str) -> dict:
+        return self._mapping.get(file_id, {})
+
+
+def _plan(monkeypatch, *, text: str, chunk_texts: list[str] | None = None, **kwargs):
+    from connectors.sharepoint.facts_extraction import _Report, _plan_documents
+
+    monkeypatch.setattr(fe, "_document_text", lambda file_id: (chunk_texts or [text], text))  # noqa: ARG005
+    connection = {"config": {"scopes": [{"source_scope_id": "s1", "collection_id": "col_a"}]}}
+    files_repo = _FakeFilesRepo(
+        [
+            {
+                "id": "cf_1",
+                "path": "Finance/model.xlsx",
+                "filename": "model.xlsx",
+                "processing_status": "indexed",
+                "sha256": "sha1",
+            }
+        ]
+    )
+    sources_repo = _FakeSourcesRepo({"cf_1": {"source_doc_id": "doc1"}})
+    report = _Report()
+    works = list(
+        _plan_documents(
+            connection=connection,
+            docs_state={},
+            report=report,
+            files_repo=files_repo,
+            sources_repo=sources_repo,
+            wanted_doc_ids=None,
+            model="claude-haiku-4-5",
+            fingerprint="fp",
+            max_doc_chars=kwargs.pop("max_doc_chars", fe.DEFAULT_MAX_DOC_CHARS),
+            system_prompt_tokens=kwargs.pop("system_prompt_tokens", 0),
+            max_prompt_tokens=kwargs.pop("max_prompt_tokens", fe.DEFAULT_MAX_PROMPT_TOKENS),
+        )
+    )
+    return works, report
+
+
+def test_a_five_mb_dense_document_is_truncated_under_the_token_budget(monkeypatch):
+    """The task's own reproduction: a ~5MB / ~1800-chunk tabular document
+    (a converted spreadsheet) must not produce a request over the token
+    budget, and the truncation must be counted."""
+    row = "| 2026-01-01 | Invoice #0001 | $1,234.56 | USD | Paid |\n"
+    chunk = row * 56  # a representative ~3.1KB chunk
+    chunk_texts = [chunk for _ in range(1_800)]
+    text = "".join(chunk_texts)
+    assert len(text) > 5 * 1024 * 1024  # actually ~5MB, matching the incident
+
+    works, report = _plan(monkeypatch, text=text, chunk_texts=chunk_texts)
+
+    assert len(works) == 1
+    work = works[0]
+    assert work.tabular is True
+    assert report.docs_truncated == 1
+    assert report.docs_skipped_garbled_text == 0
+    # The document portion actually sent stays within the configured
+    # character pre-cap AND the (much tighter, for dense text) token
+    # budget derived from it.
+    assert len(work.user_message) <= fe.DEFAULT_MAX_DOC_CHARS + 2_000  # metadata/notice/fence overhead
+    estimated_tokens = fe._approx_tokens(work.user_message, tabular=True)
+    assert estimated_tokens < fe.DEFAULT_MAX_PROMPT_TOKENS
+
+
+def test_a_garbled_document_is_skipped_and_never_sent(monkeypatch):
+    text = "".join(chr(0x2500 + (i % 200)) for i in range(200_000))
+    works, report = _plan(monkeypatch, text=text)
+
+    assert works == []
+    assert report.docs_skipped_garbled_text == 1
+    assert report.docs_truncated == 0
+
+
+def test_a_severely_oversized_tabular_document_is_skipped_not_truncated_to_noise(monkeypatch):
+    """When even the token-bounded head would keep under 30% of the
+    (already `max_doc_chars`-capped) document, skip it rather than ship a
+    meaningless fragment — forced here with a tiny `max_prompt_tokens`."""
+    row = "| 2026-01-01 | Invoice #0001 | $1,234.56 | USD |\n"
+    text = row * 5_000
+    works, report = _plan(monkeypatch, text=text, max_prompt_tokens=1, system_prompt_tokens=0)
+
+    assert works == []
+    assert report.docs_skipped_too_large_tabular == 1
+
+
+def test_ordinary_prose_under_the_cap_is_untouched(monkeypatch):
+    text = "The Northwind rollout began in March and finished under budget."
+    works, report = _plan(monkeypatch, text=text)
+
+    assert len(works) == 1
+    assert works[0].user_message.endswith("Emit the NODES and EDGES streams now.")
+    assert report.docs_truncated == 0
+    assert report.docs_skipped_garbled_text == 0
+    assert report.docs_skipped_too_large_tabular == 0

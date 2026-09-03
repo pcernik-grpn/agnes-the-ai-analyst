@@ -696,6 +696,50 @@ def test_one_document_failing_never_costs_the_others_their_results(pg_env):
     assert report["claims_written"] == 1
 
 
+def test_a_permanent_model_error_fails_only_that_document(pg_env):
+    """A 400 ``invalid_request_error`` (e.g. "prompt is too long") on the
+    SYNC transport fails only THAT document: `facts_failed` counts it (with
+    `facts_failed_reasons` naming why), the healthy document still lands,
+    and the pass returns NORMALLY rather than raising
+    `FactsExtractionUnavailable` — the sync-transport half of the same
+    contract the batch transport's `invalid_request` handling
+    (`_requeue_or_fail`) already has. Mirrors
+    `test_one_document_failing_never_costs_the_others_their_results`, but
+    for the SPECIFIC permanent-error class the live 2026-09 incident hit."""
+    _seed_collection()
+    _seed_connection()
+    _seed_ontology()
+    _seed_document(file_id="cf_1", doc_id="doc1", text="The Northwind rollout began in March.")
+    _seed_document(file_id="cf_2", doc_id="doc2", text="The Contoso rollout began in April.")
+
+    good2 = {
+        "id": "engagement:b",
+        "type": "engagement",
+        "attrs": {},
+        "evidence": [{"doc_id": "doc2", "quote": "began in April"}],
+    }
+
+    from connectors.sharepoint.facts_extraction import FactsDocumentError
+
+    class OneDocPermanentlyFails(StubExtractor):
+        def call(self, user_message: str) -> str:
+            if "doc1" in user_message:
+                self.seen.append(user_message)
+                raise FactsDocumentError(
+                    "fact extraction permanently failed (invalid_request): BadRequestError: "
+                    "prompt is too long: 316295 tokens > 200000 maximum",
+                    reason="invalid_request",
+                )
+            return super().call(user_message)
+
+    report = _run(OneDocPermanentlyFails([_stream(good2)]), concurrency=1)
+
+    assert report["facts_failed"] == 1
+    assert report["facts_failed_reasons"] == {"invalid_request": 1}
+    assert report["docs_extracted"] == 1, "the healthy document still landed"
+    assert report["claims_written"] == 1
+
+
 def test_an_unreachable_model_stops_the_pass_loudly(pg_env):
     """Never a silent "0 facts": that is indistinguishable from a corpus
     that genuinely has none."""
@@ -1429,6 +1473,10 @@ def test_batch_invalid_request_fails_without_consuming_an_attempt(pg_env):
     report = _run_batch(FakeBatchClient(api))
     assert report["facts_failed"] == 1
     assert report["docs_extracted"] == 0
+    # Same `facts_failed_reasons` breakdown the sync transport's
+    # `FactsDocumentError` handling records — one report shape regardless
+    # of which transport actually ran.
+    assert report["facts_failed_reasons"] == {"invalid_request": 1}
 
     from connectors.sharepoint.facts_extraction import load_state
 

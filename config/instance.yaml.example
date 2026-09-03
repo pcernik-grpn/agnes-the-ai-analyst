@@ -1547,7 +1547,10 @@ extraction:
     # on the order of several hundred dollars for a first pass. Sonnet is
     # roughly 3x. Re-runs are far cheaper: a document is re-extracted only
     # when its content, the model, or the effective prompt changed.
-    # Spreadsheets and CSVs are never sent to the model at all.
+    # Spreadsheets and CSVs are sent like any other document (their
+    # converted markdown tables carry facts too) — see `max_doc_chars` /
+    # `max_prompt_tokens` below for how a dense/tabular or oversized one is
+    # bounded.
     # Needs `facts.enabled` (the fact-graph surface) as well — with that
     # off, the pass is skipped rather than writing claims nothing can read.
     # AGNES_EXTRACTION_FACTS_ENABLED overrides this at the environment level.
@@ -1562,6 +1565,28 @@ extraction:
     # anonymizer's). Accepts a tier name (haiku/sonnet/opus) or a concrete
     # model id. Empty falls back to `extraction.model`, then Haiku.
     model: ""
+    # Flat character pre-cap on the document text sent in one call. Above
+    # this the tail is truncated and the document is counted in
+    # `docs_truncated` — never silently shortened. This is a cheap FIRST
+    # cut; `max_prompt_tokens` below applies a second, token-aware bound on
+    # top of it, since a dense (tabular/numeric) document well under this
+    # character cap can still overflow the model's real token ceiling.
+    max_doc_chars: 120000
+    # SOFT token budget the whole request (system prompt + ontology +
+    # metadata + document text — and, separately, the corrective retry's
+    # failing-quote listing) is kept under. Hard-ceilinged at 190000
+    # regardless of what is configured here: a live incident (2026-09) had
+    # a single oversized/dense document push a request to 316295 tokens
+    # against the model's real 200000-token limit, killing the whole pass
+    # — this bound truncates (and counts, `docs_truncated`) or, for a
+    # binary/decode-garbage or severely oversized dense document, skips it
+    # outright (`docs_skipped_garbled_text` /
+    # `docs_skipped_too_large_tabular`) rather than send a request that
+    # would be rejected. A model call that still fails PERMANENTLY for one
+    # document's own request (e.g. this bound proving too generous for an
+    # unusually dense document) fails only that document
+    # (`facts_failed`/`facts_failed_reasons`), never the whole pass.
+    max_prompt_tokens: 150000
     # Wall-clock budget (seconds) for a STANDALONE run — POST
     # /connections/{id}/facts-extract, `agnes admin sharepoint
     # facts-extract`, the `sharepoint-facts-extraction` job kind. Its OWN
