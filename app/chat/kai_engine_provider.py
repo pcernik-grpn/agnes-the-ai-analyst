@@ -25,13 +25,16 @@ The translation, per turn (``user_msg`` stdin frame → one ``POST /api/chat``):
     text-delta {delta}                       token {text}
     tool-input-available {toolCallId, ...}   tool_call {tool_use_id, tool, args}
     tool-approval-request {toolCallId}       approval_request {request_id, ...}
+      ... for AskUserQuestion                question_request {questions, ...}
     tool-output-available {toolCallId, out}  tool_result {tool_use_id, result}
     tool-output-error {toolCallId, errText}  tool_result {tool_use_id, result}
     error {errorText}                        error {kind: engine_error}
     finish / stream end                      assistant_message + done
 
-``cancel`` maps to ``POST /api/chat/{id}/stop`` and ``approval_decision`` to
-``POST /api/chat/{id}/approval``. The stop is not only the user's Stop: the
+``cancel`` maps to ``POST /api/chat/{id}/stop``; ``approval_decision`` and
+``question_answer`` both map to ``POST /api/chat/{id}/approval`` — on this
+engine the approval channel is also the answer channel (see
+``_raise_question``). The stop is not only the user's Stop: the
 engine's notion of an in-flight message must never outlive this handle's, so
 every involuntary end of a turn (SSE read timeout, mid-stream failure, the
 teardown behind ``pause`` and crash-respawn) stops it upstream too. A turn
@@ -98,6 +101,12 @@ from typing import Any, Callable, Optional
 
 import httpx
 
+# The question round-trip's model-facing wording and answer bounds, shared with
+# the in-sandbox gate that runs the same round-trip on the other providers.
+# `app.chat.runner` is stdlib-only at import time (the manager imports it for
+# the same reason), so this costs nothing at startup.
+from app.chat import runner
+
 # The shared queue+EOF StreamReader shim and the str→bytes write coercion —
 # the same cross-provider imports docker_provider.py already makes, so all
 # three providers' handle streams behave identically for host-side readers.
@@ -130,21 +139,15 @@ _STOP_BUDGET_SECONDS = 5.0
 #: The engine's refusal when a chat already has a message in flight.
 _CONFLICT_STATUS = 409
 
-#: Tools whose approval request is answered here instead of shown to the user.
+#: The one tool whose approval request is not an approval request at all.
 #:
-#: The engine asks for approval on ``AskUserQuestion``, whose entire effect is
-#: to render a multiple-choice card back to the same person being asked. Gating
-#: it put a shield card — with the question's raw JSON sitting behind it — in
-#: front of every clarifying-question turn: the user approved being asked, and
-#: only then got to read the question. Nothing is mutated, nothing leaves the
-#: session, and the decision carries no information, so it is made here (#1974).
-#:
-#: Deliberately a NAMED SET, never a "read-only tools" rule. Whether a tool
-#: mutates is a property of the tool, not of its name, and an approval gate that
-#: infers is a gate that eventually infers wrong in the unsafe direction. A tool
-#: joins this set one at a time, on the same argument: no effect beyond the
-#: asking user's own screen.
-_AUTO_APPROVED_TOOLS = frozenset({"AskUserQuestion"})
+#: The engine parks ``AskUserQuestion`` on the approval channel and merges the
+#: decision's ``answers`` into the SDK's ``updatedInput`` — so on this provider
+#: that channel IS the question round-trip, and it is translated into Agnes's
+#: own question card rather than an approval card (see ``_raise_question``).
+#: Matched by exact name, never by a "read-only tools" inference: whether a tool
+#: mutates is a property of the tool, not of its name.
+_QUESTION_TOOL = "AskUserQuestion"
 
 
 def _default_mint(user_email: str, session_id: str) -> tuple[str, int]:
@@ -230,6 +233,10 @@ class _TurnState:
         #: Approval cards raised and not yet resolved (by a web decision, an
         #: engine-side outcome, or turn-end retirement — whichever is first).
         self.pending_approvals: set[str] = set()
+        #: Question cards raised and not yet answered. Kept apart from the
+        #: approvals: the two retire through different frames, and membership
+        #: here is also the single-resolution claim (see ``_resolve_question``).
+        self.pending_questions: set[str] = set()
         #: SSE payloads that failed to parse — counted so a contract drift
         #: does not degrade into a silently empty answer (the same reason
         #: the CLI's SSE consumer keeps a drop counter).
@@ -470,8 +477,168 @@ class KaiEngineHandle:
             decision = str(frame.get("decision", ""))
             if request_id:
                 self._spawn_side_task(self._post_approval(request_id, decision))
+        elif kind == "question_answer":
+            self._dispatch_question_answer(frame)
         # ticket_push (native egress credentials) has no engine meaning — the
         # engine mints its own per-turn tickets at /api/kai/tickets.
+
+    def _dispatch_question_answer(self, frame: dict) -> None:
+        """Route one ``question_answer`` stdin frame to the engine.
+
+        The three non-answered outcomes deny the parked tool call with the
+        runner's own wording, so the model reads the same sentence whichever
+        runtime asked the question. ``unattended`` is manager-originated only
+        (``ChatManager._resolve_if_unattended``) — a client cannot set it.
+        """
+        state = self._turn_state
+        request_id = str(frame.get("request_id", ""))
+        if state is None or not request_id:
+            # No turn in flight: the card was already retired at turn end, so
+            # there is nothing parked for this answer to unblock.
+            return
+        if frame.get("unattended"):
+            self._spawn_side_task(
+                self._resolve_question(state, request_id, "unattended", reason=runner.QUESTION_UNATTENDED_MESSAGE)
+            )
+            return
+        # Re-validated here even though the manager hardens the payload: these
+        # strings are interpolated into the model's tool result, and the frame
+        # crossed a process boundary from a browser.
+        answers = runner.clean_question_answers(frame.get("answers"))
+        if frame.get("dismissed") or not answers:
+            self._spawn_side_task(
+                self._resolve_question(state, request_id, "dismissed", reason=runner.QUESTION_DISMISSED_MESSAGE)
+            )
+            return
+        self._spawn_side_task(self._resolve_question(state, request_id, "answered", answers=answers))
+
+    def _raise_question(self, state: _TurnState, tool_call_id: str) -> None:
+        """Turn the engine's approval request for ``AskUserQuestion`` into
+        Agnes's own question card.
+
+        On this provider the approval channel IS the question channel: the
+        engine merges whatever ``answers`` the decision carries into the SDK's
+        ``updatedInput`` (the same ``{question: label}`` map the in-sandbox
+        QuestionGate returns), and the tool renders its result from that. So an
+        approval answered ``allow`` with NO answers does not mean "the user let
+        the agent ask" — it means "the user was asked and said nothing", and
+        the tool returns *The user did not answer the questions.* That is what
+        a plain auto-allow shipped: #1974 removed the shield card in front of
+        the question, and with it the only channel the answer had. The model
+        announced a question, no card ever rendered, and the very same turn
+        continued with its defaults (#2151).
+
+        Raised regardless of the ``approvals_enabled`` kill-switch, for the
+        reason the auto-allow gave: that switch exists so tool calls do not sit
+        waiting on a human who is not there, and this one waits on the very
+        person the answer is for. The in-sandbox runner agrees —
+        ``AGNES_APPROVALS=off`` disables its ApprovalGate and leaves its
+        QuestionGate armed.
+        """
+        args = state.tool_args.get(tool_call_id) or {}
+        questions = args.get("questions") if isinstance(args, dict) else None
+        if not isinstance(questions, list) or not questions:
+            # Nothing renderable — a malformed call, or an approval that
+            # arrived before its input event. Allow it silently rather than
+            # park the turn on a card the client would refuse to draw
+            # (`renderQuestionRequest` drops a frame with no questions), and
+            # silently for the same reason `_post_approval` documents: no card
+            # was raised, so there is none to retire.
+            self._spawn_side_task(self._post_approval(tool_call_id, "allow", silent=True))
+            return
+        state.pending_questions.add(tool_call_id)
+        self.stdout.feed_frame(
+            {
+                "type": "question_request",
+                # As with the approval card, request_id IS the toolCallId: the
+                # answer goes back to the engine on that same key.
+                "request_id": tool_call_id,
+                "questions": questions,
+                "timeout_seconds": self._approval_timeout_seconds,
+            }
+        )
+        self._spawn_side_task(self._expire_question(state, tool_call_id))
+
+    async def _expire_question(self, state: _TurnState, request_id: str) -> None:
+        """Backstop for a question nobody answers.
+
+        Unlike a write approval, the engine never auto-denies an interactive
+        one — its sandbox waits ~24 h — so the bound has to live here or a
+        session parks on a card forever. Shares the approval timeout knob for
+        the reason the runner's QuestionGate shares it: both bound "how long a
+        tool call may wait on a human", and a second knob would only drift.
+        """
+        await asyncio.sleep(self._approval_timeout_seconds)
+        await self._resolve_question(
+            state,
+            request_id,
+            "timeout",
+            reason=runner.question_timeout_message(self._approval_timeout_seconds),
+        )
+
+    async def _resolve_question(
+        self,
+        state: _TurnState,
+        request_id: str,
+        decision: str,
+        *,
+        answers: Optional[dict] = None,
+        reason: Optional[str] = None,
+    ) -> None:
+        """Send one question outcome to the engine and retire the card.
+
+        The pending-set membership check is the single-resolution claim: a
+        Submit that races the timeout, or a duplicate frame from a reconnected
+        client, finds the id already gone and does nothing — so the engine
+        never sees two decisions for one parked tool call, and the client never
+        sees two resolutions for one card.
+        """
+        if request_id not in state.pending_questions:
+            return
+        state.pending_questions.discard(request_id)
+        answered = decision == "answered"
+        body: dict = {"toolUseId": request_id, "approved": answered}
+        if answered:
+            body["answers"] = answers or {}
+        elif reason:
+            # A denial the USER authored: the engine persists an interactive
+            # tool's reason onto the tool output and the sandbox hands it to
+            # the SDK as the deny message, which is how the model ends up
+            # reading the same words the in-sandbox gate returns.
+            body["reason"] = reason
+        try:
+            token = await self._bearer()
+            resp = await self._client.post(
+                f"{self._base_url}/api/chat/{self._chat_id}/approval",
+                headers={"Authorization": f"Bearer {token}"},
+                json=body,
+            )
+            resp.raise_for_status()
+        except Exception:  # noqa: BLE001 - the card must still be retired
+            logger.warning("kai engine handle: question answer post failed for %s", self._chat_id, exc_info=True)
+            self.stdout.feed_frame(
+                {
+                    "type": "error",
+                    "kind": "engine_question_failed",
+                    "message": "The answer could not be delivered to the engine.",
+                }
+            )
+            # Retired anyway: this call claimed the request above, so nothing
+            # else will resolve it, and a live card over a tool call that will
+            # never receive this answer is worse than an honest "cancelled".
+            self.stdout.feed_frame(
+                {
+                    "type": "question_resolved",
+                    "request_id": request_id,
+                    "decision": "cancelled",
+                    "reason": "the answer could not be delivered to the engine",
+                }
+            )
+            return
+        frame: dict = {"type": "question_resolved", "request_id": request_id, "decision": decision}
+        if answered and answers:
+            frame["answers"] = answers
+        self.stdout.feed_frame(frame)
 
     async def _stop_within_budget(self, why: str) -> None:
         """Post a stop, bounded and best-effort.
@@ -736,6 +903,19 @@ class KaiEngineHandle:
                     "reason": "the engine turn ended before this was answered",
                 }
             )
+        for request_id in sorted(state.pending_questions):
+            self.stdout.feed_frame(
+                {
+                    "type": "question_resolved",
+                    "request_id": request_id,
+                    "decision": "cancelled",
+                    "reason": "the engine turn ended before this was answered",
+                }
+            )
+        # Cleared, not merely reported: a pending expiry task holds this same
+        # state object and must find the id gone, or it would post a timeout
+        # decision for a card that is already retired.
+        state.pending_questions.clear()
         content = state.text()
         if content or state.tool_names:
             # tokens/model deliberately absent: the engine does not surface
@@ -772,23 +952,8 @@ class KaiEngineHandle:
             )
         elif etype == "tool-approval-request":
             tool_call_id = str(event.get("toolCallId", ""))
-            if state.tool_names.get(tool_call_id, "") in _AUTO_APPROVED_TOOLS:
-                # Answered here, with no card and no pending entry: the user
-                # never sees an approval step for a tool whose only effect is
-                # to put a question in front of them (#1974). Not added to
-                # `pending_approvals` precisely because nothing was raised —
-                # the resolution frames below retire cards, and there is none.
-                # `silent=True` for the same reason: `_post_approval` would
-                # otherwise close with an `approval_resolved` of its own, which
-                # is the exact orphan this branch exists to avoid.
-                #
-                # Ahead of the `approvals_enabled` kill-switch below on
-                # purpose. That switch exists so tool calls do not sit waiting
-                # on a human who is not there; this call waits on nobody, and
-                # denying it would only cost the agent the ability to ask a
-                # clarifying question on exactly the instances that turned
-                # human round-trips off.
-                self._spawn_side_task(self._post_approval(tool_call_id, "allow", silent=True))
+            if state.tool_names.get(tool_call_id, "") == _QUESTION_TOOL:
+                self._raise_question(state, tool_call_id)
                 return
             state.pending_approvals.add(tool_call_id)
             # No-args tools send "" (not "{}"): the client only renders the
@@ -815,6 +980,20 @@ class KaiEngineHandle:
                 self._spawn_side_task(self._post_approval(tool_call_id, "deny"))
         elif etype in ("tool-output-available", "tool-output-error"):
             tool_call_id = str(event.get("toolCallId", ""))
+            if tool_call_id in state.pending_questions:
+                # The engine resolved the round-trip without us — its own
+                # drain/teardown paths deny every parked approval — so the
+                # tool has an outcome while the card is still on screen with
+                # live buttons. Retire it, exactly as the approval branch does.
+                state.pending_questions.discard(tool_call_id)
+                self.stdout.feed_frame(
+                    {
+                        "type": "question_resolved",
+                        "request_id": tool_call_id,
+                        "decision": "cancelled",
+                        "reason": "the engine resolved this question before it was answered",
+                    }
+                )
             if tool_call_id in state.pending_approvals:
                 # Resolved engine-side (its own approval TTL, or a decision
                 # this handle never saw) — retire the card either way.
