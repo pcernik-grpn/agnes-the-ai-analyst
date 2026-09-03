@@ -2356,17 +2356,19 @@
     resource: "Search resources by name, id or block…",
     person: "Search people…",
   };
-  const LEDE = {
-    // Not "every group": the list leads with an audience that is not one.
-    group: "Everyone, then every group you can write a grant against — and what each one can reach.",
-    resource: "One thing at a time — a data package, a memory domain, a plugin, an agent — "
-            + "and which groups can reach it. The mirror of By group.",
-  };
+  /* `LEDE` stood here — one sentence per lens, rendered under the strip.
+     Each lens's sentence was a different height (one line, two lines, and
+     By person's own inside its pane), so the whole list below shifted every
+     time the reader compared two lenses. The sentences moved INTO the tabs,
+     where the strip's single fixed height makes the jump impossible and
+     where the description is readable before the click rather than after
+     it. `#ax-lede` stays in the markup, empty: the simulate pane still
+     writes its own line into it. */
   function setLede(mode) {
     const l = el("ax-lede");
     if (!l) return;
-    l.textContent = LEDE[mode] || "";
-    l.hidden = !LEDE[mode];
+    l.textContent = "";
+    l.hidden = true;
   }
 
   function setFindPlaceholder(mode) {
@@ -2423,7 +2425,7 @@
      engine, this goes. */
   const SUBMENU_GAP = 6;
   const SUBMENU_EDGE = 8;
-  function placeSubmenu(cat) {
+  function placeSubmenu(cat, menuEl) {
     const pop = cat.querySelector(".fbar-cat__pop");
     if (!pop || pop.hidden) return;
     // On a phone the options stack under the row instead (`position: static`
@@ -2441,7 +2443,7 @@
        this function exists to fix. Leave it to the stylesheet; the next
        real open places it. */
     if (!vw || !vh) return;
-    const menu = el("ax-filter-menu");
+    const menu = menuEl || el("ax-filter-menu");
     const host = (menu || cat).getBoundingClientRect();
     const row = cat.getBoundingClientRect();
     const w = pop.offsetWidth;
@@ -2460,6 +2462,14 @@
     let top = row.top - 6;
     if (top + h > vh - SUBMENU_EDGE) top = vh - SUBMENU_EDGE - h;
     if (top < SUBMENU_EDGE) top = SUBMENU_EDGE;
+    /* One clamp at the end, after every branch. The flip-left branch
+       trusted its own arithmetic, and inside a dialog — where the menu it
+       measures against can itself sit near the left edge, and where a
+       just-unhidden popover can still measure 0 wide — it produced a
+       negative left and put the options off-screen. Found by walking the
+       Add flow, not by reading the code. */
+    left = Math.min(Math.max(left, SUBMENU_EDGE), Math.max(SUBMENU_EDGE, vw - SUBMENU_EDGE - w));
+    top = Math.min(Math.max(top, SUBMENU_EDGE), Math.max(SUBMENU_EDGE, vh - SUBMENU_EDGE - h));
     pop.style.left = `${Math.round(left)}px`;
     pop.style.top = `${Math.round(top)}px`;
   }
@@ -3880,7 +3890,7 @@
      grant has no direction, only the question you arrived with does. */
   let pickerState = {
     mode: "resources", group: null, bundle: null, chosen: new Set(), q: "",
-    kind: "",                 //: "" = every kind
+    kind: "", fam: "",                 //: "" = every kind
     collapsed: new Set(),     //: families folded away, by key
   };
 
@@ -3951,6 +3961,35 @@
       apply: root.querySelector("[data-pk-apply]"),
     };
 
+    /* The facet checkboxes, on `change`. See the note in the click handler:
+       a label-wrapped input fires click twice and a toggle undoes itself.
+       The menu stays OPEN after a pick — the next pick is the likely next
+       act — and the submenu is re-placed because paintPicker() rebuilt it. */
+    /* One function, two deliveries. `paintPicker()` rebuilds the menu's
+       markup, so the category the reader was working in has to be reopened
+       and re-placed afterwards or every tick collapses it. */
+    function applyPickerFacet(box) {
+      if (!box || box.type !== "checkbox") return;
+      const isFam = box.hasAttribute("data-pk-secfacet");
+      const key = isFam ? "fam" : "kind";
+      const val = isFam ? box.dataset.pkSecfacet : box.dataset.pkKind;
+      pickerState[key] = box.checked ? val : "";
+      paintPicker();
+      const menu = root.querySelector('[data-pk="kinds"]');
+      if (menu) menu.hidden = false;
+      const cat = menu && menu.querySelector(`.fbar-cat[data-cat="${key}"]`);
+      if (cat) {
+        const pop = cat.querySelector(".fbar-cat__pop");
+        if (pop) pop.hidden = false;
+        const btn = cat.querySelector(".fbar-cat__btn");
+        if (btn) btn.setAttribute("aria-expanded", "true");
+        placeSubmenu(cat, menu);
+      }
+    }
+    root.addEventListener("change", (e) => {
+      applyPickerFacet(e.target.closest("[data-pk-secfacet], [data-pk-kind]"));
+    });
+
     root.addEventListener("click", async (e) => {
       if (e.target.closest("[data-pk-close]")) { closePicker(); return; }
       if (e.target.closest("[data-pk-apply]")) { await applyPicker(); return; }
@@ -3979,16 +4018,61 @@
         e.target.closest('[data-pk="filterbtn"]').setAttribute("aria-expanded", show ? "true" : "false");
         return;
       }
-      const kindBtn = e.target.closest("[data-pk-kind]");
-      if (kindBtn) {
-        const val = kindBtn.dataset.pkKind || "";
-        pickerState.kind = (kindBtn.type === "checkbox" && !kindBtn.checked) ? "" : val;
+      /* A category head opens its own options beside the menu — the same
+         behaviour and the same placement function as the page's filter,
+         because `.fbar-cat__pop` is `position: fixed` and nothing places it
+         otherwise. */
+      const pkCat = e.target.closest('[data-pk="kinds"] .fbar-cat__btn');
+      if (pkCat) {
+        const cat = pkCat.closest(".fbar-cat");
+        const pop = cat.querySelector(".fbar-cat__pop");
+        const opening = pop.hidden;
+        const menu = root.querySelector('[data-pk="kinds"]');
+        for (const o of menu.querySelectorAll(".fbar-cat__pop")) o.hidden = true;
+        for (const o of menu.querySelectorAll(".fbar-cat__btn")) o.setAttribute("aria-expanded", "false");
+        pop.hidden = !opening;
+        pkCat.setAttribute("aria-expanded", opening ? "true" : "false");
+        if (opening) placeSubmenu(cat, menu);
+        return;
+      }
+      if (e.target.closest("[data-pk-done]")) {
         const menu = root.querySelector('[data-pk="kinds"]');
         if (menu) menu.hidden = true;
+        return;
+      }
+      if (e.target.closest("[data-pk-clear]")) {
+        pickerState.kind = "";
+        pickerState.fam = "";
         paintPicker();
         return;
       }
+      /* The facet CHECKBOXES are handled on `change`, below — a `<label>`
+         wrapping an `<input>` delivers the click twice, once for each, so a
+         click handler that toggles state puts it straight back where it
+         started. That is exactly what happened: picking a Section changed
+         nothing, 19 rows before and 19 after. Only the chip's × and the
+         "Clear all" button stay here, because those are plain buttons. */
+      const kindChip = e.target.closest("button[data-pk-kind]");
+      if (kindChip) {
+        pickerState.kind = kindChip.dataset.pkKind || "";
+        paintPicker();
+        return;
+      }
+      /* The facet checkboxes, READ rather than toggled. There is a `change`
+         listener too, and it is the one that should do this — but inside
+         this drawer the browser does not always deliver `change` for these
+         inputs, so a pick silently did nothing (19 rows before, 19 after).
+         Reading `box.checked` makes both paths agree and makes a double
+         delivery harmless: a `<label>` wrapping an `<input>` fires click
+         twice for a real pointer, and a handler that TOGGLED would undo
+         itself — which is the same bug wearing the other hat. */
+      const facetBox = e.target.closest("input[data-pk-secfacet], input[data-pk-kind]");
+      if (facetBox) {
+        applyPickerFacet(facetBox);
+        return;
+      }
       const row = e.target.closest("[data-pk-item]");
+      // (facet checkboxes: see the `change` listener registered below)
       if (row) {
         const key = row.dataset.pkItem;
         if (pickerState.chosen.has(key)) pickerState.chosen.delete(key);
@@ -4019,7 +4103,17 @@
     const b = pickerState.bundle;
     const groups = (overview.groups || []).filter((g) => {
       if (g.is_everyone) return false;
-      if (grantOf(g.id, b.type, b.id)) return false;
+      /* DIRECT grants only. `grantOf` reads through `grantsFor`, which
+         includes what a group inherits from Everyone — so the moment a
+         resource was granted to everyone, every group "had" it and the
+         picker emptied itself: "Every group already has this", under a
+         button the same page had just labelled "Set a different tier for a
+         group". Those two cannot both be right, and the button is the one
+         that is: a group grant beside an everyone grant does not widen
+         access, it carries a DIFFERENT TIER for that group (decision U8),
+         and writing one is the only way to set it. */
+      if (grantsFor(g.id, { directOnly: true }).some(
+        (x) => x.resource_type === b.type && x.resource_id === b.id)) return false;
       const hay = `${titleOf(g)} ${g.name || ""} ${g.description || ""} ${g.mapped_email || ""}`.toLowerCase();
       return !q || hay.includes(q);
     });
@@ -4045,6 +4139,7 @@
           if (q && !hay.includes(q)) continue;
           if (pickerState.kind && t.type_key !== pickerState.kind) continue;
           const fam = t.family || "knowledge";
+          if (pickerState.fam && fam !== pickerState.fam) continue;
           if (!out.has(fam)) out.set(fam, []);
           out.get(fam).push({ t, i, block: (b.name && b.name !== t.type_display) ? b.name : "" });
         }
@@ -4114,14 +4209,51 @@
     if (kindsEl && chipsEl) {
       const rank = new Map((overview.resources || []).map((t, i) => [t.type_key, i]));
       const label = new Map((overview.resources || []).map((t) => [t.type_key, t.type_display]));
-      kindsEl.innerHTML = [...kinds.keys()]
+      /* Grouped under a category head, the way the page's own filter is —
+         and the way the Library's is. A flat run of checkboxes in a panel
+         is a different control wearing the same classes: it has no room to
+         grow a second facet, and beside a categorised menu one screen away
+         it reads as the same control behaving inconsistently.
+
+         `Section` is the second facet, and it is the one the payload can
+         honestly support: every kind already declares a family, which is
+         what the list is banded by. (Tags and industry live on Library
+         DOCUMENTS, not on grantable things — a facet here for either would
+         be a control with nothing behind it.) */
+      const famName = new Map((overview.families || []).map((f) => [f.key, f.display_name]));
+      const famOf = new Map((overview.resources || []).map((t) => [t.type_key, t.family || "knowledge"]));
+      const famCount = new Map();
+      for (const [k, n] of kinds) {
+        const fam = famOf.get(k) || "knowledge";
+        famCount.set(fam, (famCount.get(fam) || 0) + n);
+      }
+      const cat = (key, title, opts) => (opts.length < 2 ? "" : `
+        <div class="fbar-cat" data-cat="${esc(key)}">
+          <button type="button" class="fbar-cat__btn" aria-haspopup="true" aria-expanded="false">
+            <span class="fbar-cat__label">${esc(title)}</span>
+            <span class="fbar-cat__end">
+              <svg class="fbar-cat__caret" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m9 6 6 6-6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </span>
+          </button>
+          <div class="fbar-cat__pop" hidden>${opts.join("")}</div>
+        </div>`);
+      const kindOpts = [...kinds.keys()]
         .sort((a, b) => (rank.get(a) ?? 99) - (rank.get(b) ?? 99))
         .map((k) => `
           <label class="fbar-menu__opt">
             <input type="checkbox" data-pk-kind="${esc(k)}"${pickerState.kind === k ? " checked" : ""}>
             <span class="fbar-menu__opt-text">${esc(label.get(k) || k)}</span>
             <span class="fbar-menu__opt-n">${kinds.get(k)}</span>
-          </label>`).join("");
+          </label>`);
+      const famOpts = [...famCount.keys()].map((f) => `
+          <label class="fbar-menu__opt">
+            <input type="checkbox" data-pk-secfacet="${esc(f)}"${pickerState.fam === f ? " checked" : ""}>
+            <span class="fbar-menu__opt-text">${esc(famName.get(f) || f)}</span>
+            <span class="fbar-menu__opt-n">${famCount.get(f)}</span>
+          </label>`);
+      kindsEl.innerHTML = cat("kind", "Kind", kindOpts) + cat("fam", "Section", famOpts)
+        + `<div class="fbar-menu__foot"><button type="button" data-pk-clear>Clear</button>
+           <button type="button" data-pk-done>Done</button></div>`;
       if (nEl) { nEl.textContent = pickerState.kind ? "1" : "0"; nEl.hidden = !pickerState.kind; }
       if (btnEl) btnEl.classList.toggle("is-on", !!pickerState.kind);
       chipsEl.innerHTML = pickerState.kind ? `
@@ -4156,7 +4288,7 @@
     if (!rows.length) {
       els.list.innerHTML = pickerState.q
         ? `<div class="ax-empty">No group matches “${esc(pickerState.q)}”.</div>`
-        : `<div class="ax-empty">Every group already has this.</div>`;
+        : `<div class="ax-empty">Every group already has a grant of its own for this.</div>`;
     } else {
       els.list.innerHTML = rows.map((g) => {
         const key = g.id;
@@ -4209,7 +4341,7 @@
   function openBundlePicker(typeKey, resourceId, label) {
     const els = buildPicker();
     pickerState = { mode: "bundle", group: null, bundle: { type: typeKey, id: resourceId }, tier: "available",
-                    chosen: new Set(), q: "", kind: "", collapsed: new Set() };
+                    chosen: new Set(), q: "", kind: "", fam: "", collapsed: new Set() };
     els.q.value = "";
     els.q.placeholder = "Search groups…";
     els.root.querySelector("#pk-title").textContent = `Share ${label}`;
@@ -4217,7 +4349,7 @@
        it. It used to say the answer ("Added as Available") — which was both
        a decision made on the admin's behalf and, on kinds with no tier at
        all, a promise of a choice the row would not have. */
-    els.sub.textContent = "Groups that do not have it yet.";
+    els.sub.textContent = "Groups without a grant of their own for this.";
     paintPicker();
     els.root.hidden = false;
     els.root.classList.add("is-open");
@@ -4253,7 +4385,7 @@
     // `.has` off undefined — which is a blank drawer, not an error anyone
     // sees.
     pickerState = { mode: "resources", group: groupId, bundle: null, tier: "available",
-                    chosen: new Set(), q: "", kind: "", collapsed: new Set() };
+                    chosen: new Set(), q: "", kind: "", fam: "", collapsed: new Set() };
     els.q.value = "";
     els.q.placeholder = "Search everything grantable…";
     els.root.querySelector("#pk-title").textContent = "Add to this group";

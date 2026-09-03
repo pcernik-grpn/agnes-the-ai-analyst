@@ -837,9 +837,17 @@ class TestThePersonTabSaysWhatKindOfTabItIs:
         assert 'role="tab"' in tab and 'aria-controls="ax-pane-sim"' in tab
 
     def test_and_says_what_it_does(self):
+        """Every tab now says what its lens is for — the sentence that used
+        to be a lede under the strip, swapping with the lens and changing
+        height as it did. The person tab's line keeps naming the capability
+        that makes it a different KIND of tab (audit I3)."""
         src = self._source()
-        assert '<span class="ax-by__kind">view as someone</span>' in src
+        assert "view as them</span>" in src
+        assert "ax-by__for ax-by__kind" in src, "it keeps its own gloss class"
         assert 'title="Pick a person and see the product as they see it"' in src
+        # And the other two say what they are for, in the tab rather than under it.
+        assert "what one group can reach" in src
+        assert "who can reach one thing" in src
 
 
 class TestTheAdminGroupNamesTheModeItsGrantsDependOn:
@@ -1159,16 +1167,30 @@ class TestRemovingAMemoryDomainGrantIsNotCalledRevoke:
     def test_the_toast_agrees(self):
         assert "No longer revealed to this group — nothing was hidden from anyone else" in self._source()
 
-    def test_the_person_tab_stays_one_line(self):
-        """A first pass stacked the tab's children in a column, which dropped
-        the count badge under the label and made this one tab three lines tall
-        beside two one-line siblings — the active underline no longer lined
-        up. Seen in the preview, not in a test. The kind is inline after the
-        count, behind a separator, and yields first on a narrow strip."""
+    def test_every_tab_is_the_same_shape(self):
+        """The invariant, restated where the old one froze a means to it.
+
+        A first pass stacked the PERSON tab's children in a column while its
+        siblings stayed on one line: the count badge dropped under the label
+        and one tab stood three lines tall beside two one-line ones, so the
+        active underline no longer lined up. This guard was written as "no
+        `flex-direction: column`", which reads as the cause but is not it —
+        the cause was ONE tab differing from the others.
+
+        Every tab is two lines now (name, then what the lens is for), which
+        is the same shape for all three, and the count rides inside
+        `.ax-by__lbl` so it cannot drop below the name. Verified in the
+        preview: three tabs, 62px each, identical baselines, badges inline.
+        """
         src = self._source()
-        assert ".ax-by__tool { flex-direction: column" not in src
-        assert '.ax-by__kind::before { content: "·";' in src
-        assert ".ax-by__kind { display: none; }" in src  # inside the narrow-strip media query
+        # One rule, applied to every tab, not to one of them.
+        assert ".ax-by .tab-strip__item { flex-direction: column" in src
+        assert ".ax-by__tool { flex-direction: column" not in src, (
+            "the person tab must not get its own stacking — that is what put one tab out of line with its siblings"
+        )
+        # The count is inside the label, so stacking cannot separate them.
+        assert 'class="ax-by__lbl">By person <span class="tab-strip__n' in src
+        assert 'class="ax-by__lbl">By group <span class="tab-strip__n' in src
 
 
 class TestAStoreEntityIsATieredKind:

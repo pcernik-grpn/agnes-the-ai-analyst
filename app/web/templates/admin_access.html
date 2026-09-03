@@ -2420,6 +2420,22 @@
     border-left: 3px solid var(--ds-primary);
     padding-left: 9px;
   }
+  /* A left rule alone was not enough: the row sat flush against the GROUPS
+     band underneath it, so the strongest signal on screen was that these
+     are one list — which is exactly the reading the scope exists to
+     prevent. It is its own block now: tinted, bounded, and standing apart
+     from the band below with air on both sides. The tint is mixed against
+     the surface rather than hard-coded, so it follows every theme its rule
+     already follows. */
+  .ax-gs--scope {
+    margin: 0 0 4px;
+    background: color-mix(in srgb, var(--ds-primary) 4%, var(--ds-surface));
+    border: 1px solid color-mix(in srgb, var(--ds-primary) 18%, var(--ds-surface));
+    border-left-width: 0;
+    border-radius: var(--ds-radius-btn, 6px);
+    overflow: hidden;
+  }
+  .ax-gs--scope > .ax-gs__hd { border-radius: var(--ds-radius-btn, 6px); }
   /* The grant list's own band, on the group list's label style so the two
      lists speak one dialect. The hint is not uppercase and not bold: the
      label names the section, the hint says what the section MEANS, and
@@ -2457,11 +2473,21 @@
      longer lined up. One line keeps the strip's geometry exactly; the kind
      follows the count after a separator, small and muted, so it reads as a
      gloss on the tab rather than a second tab. */
-  .ax-by__kind {
-    font-size: 11px; font-weight: 400; color: var(--ds-text-muted);
-    letter-spacing: 0; white-space: nowrap;
+  /* A tab is two lines now: the lens's name, and what the lens is FOR. The
+     second line was a lede under the strip that swapped with the lens and
+     changed height as it did, so the list below jumped whenever a reader
+     compared two of them. Here the strip is one fixed height whatever is
+     selected, and the description is readable BEFORE the click. */
+  .ax-by .tab-strip__item { flex-direction: column; align-items: flex-start; gap: 2px; }
+  .ax-by__lbl { display: inline-flex; align-items: center; gap: 6px; }
+  .ax-by__for {
+    font-size: 11.5px; font-weight: 400; color: var(--ds-text-muted);
+    letter-spacing: 0; white-space: nowrap; text-transform: none;
   }
-  .ax-by__kind::before { content: "·"; margin: 0 6px 0 4px; color: var(--ds-border); }
+  /* Selected, the description is as legible as the label it belongs to —
+     muted-on-muted made the active tab look half-disabled. */
+  .ax-by .tab-strip__item[aria-selected="true"] .ax-by__for { color: var(--ds-text-secondary); }
+  .ax-by__kind { font-size: 11.5px; }
   @media (max-width: 720px) {
     /* On a narrow strip the gloss is the first thing to go; the title
        attribute still carries it. */
@@ -2741,13 +2767,24 @@
          renderGroups. #}
     </div>
   <nav class="tab-strip ax-by" id="ax-by" role="tablist" aria-label="How to read these grants">
+    {# Each tab says what its lens is FOR, on a second line inside the tab.
+       That sentence used to sit under the strip as a lede that swapped with
+       the lens — one line for By group, two for By resource, a third of its
+       own for By person — so the entire list below jumped every time the
+       reader compared two of them. Moving it into the tab fixes the jump by
+       construction (the strip is one fixed height, always showing all
+       three) and puts the description where the choice is made, which is
+       where it was needed: the old lede explained the tab you had ALREADY
+       clicked. #}
     <button type="button" role="tab" id="ax-tab-group" class="tab-strip__item is-active"
             data-by="group" aria-selected="true" aria-controls="ax-pane-edit">
-      By group <span class="tab-strip__n ax-by__n" data-by-n="group"></span>
+      <span class="ax-by__lbl">By group <span class="tab-strip__n ax-by__n" data-by-n="group"></span></span>
+      <span class="ax-by__for">what one group can reach</span>
     </button>
     <button type="button" role="tab" id="ax-tab-bundle" class="tab-strip__item"
             data-by="resource" aria-selected="false" aria-controls="ax-pane-edit" tabindex="-1">
-      By resource <span class="tab-strip__n ax-by__n" data-by-n="resource"></span>
+      <span class="ax-by__lbl">By resource <span class="tab-strip__n ax-by__n" data-by-n="resource"></span></span>
+      <span class="ax-by__for">who can reach one thing</span>
     </button>
     {# A different KIND of tab. The two before it are one list pivoted two
        ways; this one is a simulator — pick a person, see the pages as they
@@ -2760,8 +2797,8 @@
     <button type="button" role="tab" id="ax-tab-person" class="tab-strip__item ax-by__tool"
             data-by="person" aria-selected="false" aria-controls="ax-pane-sim" tabindex="-1"
             title="Pick a person and see the product as they see it">
-      By person <span class="tab-strip__n ax-by__n" data-by-n="person"></span>
-      <span class="ax-by__kind">view as someone</span>
+      <span class="ax-by__lbl">By person <span class="tab-strip__n ax-by__n" data-by-n="person"></span></span>
+      <span class="ax-by__for ax-by__kind">what one person ends up with · view as them</span>
     </button>
   </nav>
 </div>
