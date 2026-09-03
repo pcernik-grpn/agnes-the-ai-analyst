@@ -45,6 +45,14 @@ def _raise_for_status_with_detail(r: httpx.Response) -> None:
     values), is discarded, so the model cannot self-correct and the user
     sees a dead-end error card. Same ``httpx.HTTPStatusError`` raised, with
     the detail appended.
+
+    The URL is deliberately NOT in the message. This helper's output is read
+    by two audiences and helps neither with it: the model called a named tool
+    and cannot act on ``http://localhost:8000/api/query``, and the user reads
+    the same string on the failed tool card, where an internal endpoint makes
+    a mistyped column name look like a server outage (#1974). It is also the
+    longest part of the line, and the card's header has room for about one.
+    The request stays on the exception, so logs and handlers still have it.
     """
     if r.status_code < 400:
         return
@@ -60,7 +68,7 @@ def _raise_for_status_with_detail(r: httpx.Response) -> None:
         body = json.dumps(detail, ensure_ascii=False)
     suffix = f" — {body[:600]}" if body.strip() else ""
     raise httpx.HTTPStatusError(
-        f"{r.status_code} {r.reason_phrase} for {r.request.url}{suffix}",
+        f"{r.status_code} {r.reason_phrase}{suffix}",
         request=r.request,
         response=r,
     )
