@@ -57,10 +57,19 @@ Failure posture, in the two flavours this module keeps strictly apart:
   sibling of ``src.anonymization_ner.DetectionUnavailable``. The run fails
   loudly and resumes next time; it never degenerates into "0 facts found",
   which is indistinguishable from a corpus that genuinely has none.
-* **One document fails** — an unparseable reply, an ingest refusal — is
-  counted in ``facts_failed`` and the pass continues. One bad document
-  must not cost a 100k-document corpus its pass, but it must never be
-  invisible either.
+* **One document fails** — an unparseable reply, an ingest refusal, or a
+  PERMANENT model-call error specific to that document's own request (a
+  400 ``invalid_request_error`` — most commonly "prompt is too long",
+  :class:`FactsDocumentError`, on BOTH transports) — is counted in
+  ``facts_failed`` (with a reason breakdown in ``facts_failed_reasons``)
+  and the pass continues. One bad document must not cost a 100k-document
+  corpus its pass, but it must never be invisible either. A document whose
+  text itself is unsafe to send at all — binary/decode-garbage
+  (``docs_skipped_garbled_text``) or a dense/tabular document too large
+  even at the token budget (``docs_skipped_too_large_tabular``) — is
+  skipped BEFORE any call, never sent and never billed; see
+  :func:`_plan_documents` and the ``extraction.facts.max_prompt_tokens``
+  note below.
 
 Cost: this is the expensive stage, so it is off by default
 (``extraction.facts.enabled``) and reports what it spent
@@ -124,8 +133,121 @@ logger = logging.getLogger(__name__)
 #: Characters of document text sent in one call. Above this the tail is
 #: truncated and the document is COUNTED as truncated in the report — never
 #: silently shortened, because a claim's absence would otherwise look like
-#: "the document does not say that".
+#: "the document does not say that". This is a flat, cheap PRE-cap, applied
+#: before the token-aware bound below ever runs (:func:`_token_char_budget`)
+#: — a document already this dense in ordinary prose is still comfortably
+#: under any reasonable token ceiling, so the more expensive per-character
+#: classification only has to look at what is left after this.
 DEFAULT_MAX_DOC_CHARS = 120_000
+
+#: ``extraction.facts.max_prompt_tokens`` — the SOFT budget one whole
+#: request (system prompt + ontology + metadata + document text, and for
+#: the corrective retry, the failing-quote listing too) is kept under.
+#: Exists because :data:`DEFAULT_MAX_DOC_CHARS` alone is not a token bound:
+#: a live incident (2026-09) shipped a request that measured 316,295 tokens
+#: against the model's real 200,000-token ceiling even though the document
+#: text itself was already capped at 120,000 CHARACTERS — tabular/numeric
+#: content and, worse, garbled/binary-boilerplate text (a failed document
+#: conversion) both tokenize far denser than prose, and the retry's
+#: failing-quote listing (:func:`_retry_message`) had no bound of its own
+#: at all. Clamped to ``[1, MAX_PROMPT_TOKENS_CEILING]`` — see
+#: :func:`_max_prompt_tokens`.
+DEFAULT_MAX_PROMPT_TOKENS = 150_000
+
+#: Hard ceiling for ``extraction.facts.max_prompt_tokens`` regardless of
+#: what instance.yaml asks for — comfortably under every current model's
+#: real context window (measured at 200,000 tokens on the incident above),
+#: so a misconfigured instance can raise the soft budget without ever being
+#: able to reproduce the exact failure this module exists to prevent.
+MAX_PROMPT_TOKENS_CEILING = 190_000
+
+#: Flat reservation (tokens) for the parts of a request this module does
+#: not explicitly account for token-by-token: the metadata JSON row, the
+#: untrusted-data security notice and the fence markers
+#: :func:`build_user_message` wraps the document text in. Small and
+#: essentially constant regardless of the document, so re-measuring it per
+#: call would buy precision the guard rail does not need.
+_MESSAGE_OVERHEAD_TOKENS = 400
+
+#: Chars-per-token heuristics behind :func:`_approx_tokens` — this module's
+#: deterministic, OFFLINE token estimate (no network call, no dependency on
+#: either SDK's own tokenizer, which only one of the two providers this
+#: stage can run against even exposes). Calibrated against a live incident's
+#: real ``count_tokens()`` measurements across one connection's documents,
+#: NOT a generic "prose vs table" guess (an earlier chars/4-ish estimate is
+#: exactly what missed this): plain prose measured close to
+#: :data:`_CHARS_PER_TOKEN_PROSE`, but this connection's OWN "normal" large
+#: financial tables (0-2% non-alphanumeric — i.e. almost entirely digits and
+#: currency text, not prose) already measured 1.76-2.4 chars/token, and a
+#: denser EDI-shaped sample (27% non-alphanumeric, delimiter-heavy) measured
+#: ~1.03 chars/token — denser than any flat "tabular" ratio this module
+#: previously used. :data:`_CHARS_PER_TOKEN_DENSE` is set AT that measured
+#: floor, deliberately with no further margin above it: digit/delimiter-dense
+#: content (:func:`_is_tabular_text`) is charged there regardless of exactly
+#: how dense, because a document need only be as dense as the worst
+#: known-legitimate case to make an ungated flat ratio unsafe again.
+#: Content garbled enough to be denser STILL than this (the incident's own
+#: killer document measured ~2.6 tokens/char, i.e. ~0.38 chars/token) is
+#: never estimated at all — it is detected structurally and SKIPPED outright
+#: (:func:`_looks_garbled`), because it produces zero usable facts no matter
+#: how conservatively it is charged.
+_CHARS_PER_TOKEN_PROSE = 3.5
+_CHARS_PER_TOKEN_DENSE = 1.0
+
+#: A document counts as "dense" (tabular/numeric/delimited — the
+#: :data:`_CHARS_PER_TOKEN_DENSE` ratio, and the oversized-document skip,
+#: ``too_large_tabular`` — see :func:`_plan_documents`) when at least this
+#: fraction of its non-blank lines carry :data:`_DENSE_LINE_DELIMITER_MIN`
+#: or more of :data:`_DENSE_LINE_DELIMITERS` — the field/record separators a
+#: converted spreadsheet's markdown table (``|``), a CSV/TSV (tab), or an
+#: EDI X12/EDIFACT segment (``*``/``~``/``^``/``;``) all use. Not a
+#: MIME/extension check: a prose document that happens to quote one table
+#: stays prose, and a genuinely delimited document is recognized from its
+#: TEXT regardless of what produced it.
+_DENSE_LINE_DELIMITERS = "|\t*~^;"
+_DENSE_LINE_DELIMITER_MIN = 3
+_TABULAR_LINE_RATIO = 0.3
+
+#: Below this fraction of a (already :data:`DEFAULT_MAX_DOC_CHARS`-capped)
+#: dense document's length, a head truncated down to the token budget is
+#: not a meaningful sample of a general-ledger/EDI export — closer to noise
+#: than data. :func:`_plan_documents` skips the document instead
+#: (``too_large_tabular``, counted) rather than shipping a head nobody
+#: asked for.
+_MIN_TABULAR_KEEP_RATIO = 0.30
+
+#: How many characters of a document's text :func:`_looks_garbled` and
+#: :func:`_is_tabular_text` actually sample — O(1) rather than
+#: O(document length), and large enough that a genuinely garbled/dense
+#: multi-megabyte document cannot get lucky with a clean opening.
+_SHAPE_SAMPLE_CHARS = 20_000
+
+#: Characters :func:`_looks_garbled` treats as "readable" — ASCII letters/
+#: digits, ordinary whitespace, and the punctuation that shows up constantly
+#: in both real prose AND a converted markdown/CSV/EDI table (pipes, tabs,
+#: decimal/thousands separators, currency symbols, parens, dashes, slashes,
+#: percent signs, quotes). Calibrated directly against the live incident:
+#: the document that overflowed the model's context window measured 99.9%
+#: characters OUTSIDE this set in its first :data:`DEFAULT_MAX_DOC_CHARS`
+#: cut (an xlsx-conversion "symbol soup"), while this connection's
+#: genuinely large, genuinely dense documents measured 0-2% (financial
+#: tables) and 27% (an EDI sample) — both comfortably under
+#: :data:`_MAX_GARBLED_UNREADABLE_RATIO`.
+_GARBLED_READABLE_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 \t\n\r|.,:;()-_/%$#*'\""
+)
+
+#: Above this fraction of characters OUTSIDE :data:`_GARBLED_READABLE_CHARS`
+#: in a sample of a document's text, the text reads as binary/decode-garbage
+#: — e.g. an xlsx-to-markdown conversion that emitted raw cell-format bytes
+#: instead of values — rather than fact-bearing content, and
+#: :func:`_plan_documents` skips it outright (``garbled_text``, counted)
+#: rather than sending any of it: no truncation ratio is safe enough for
+#: this shape, and it produces zero usable facts regardless of how much of
+#: it is sent. Set well above the highest known-legitimate calibration
+#: point (27%, the EDI sample) and well below the known-garbled one (99.9%),
+#: so neither is close to the line.
+_MAX_GARBLED_UNREADABLE_RATIO = 0.5
 
 DEFAULT_MAX_OUTPUT_TOKENS = 16_000
 DEFAULT_TIMEOUT_S = 300.0
@@ -255,6 +377,59 @@ class FactsExtractionUnavailable(RuntimeError):
     """
 
 
+class FactsDocumentError(RuntimeError):
+    """ONE document's extraction call failed for a reason specific to that
+    document — never worth stopping the pass over, and never worth
+    retrying either.
+
+    The sync-transport sibling of the batch transport's own permanent-
+    failure classification (:func:`_requeue_or_fail`'s ``permanent=True``
+    branch): an ``invalid_request_error`` (a 400 — most commonly "prompt is
+    too long", but any malformed-request response has the same shape) means
+    the API itself rejected THIS document's request, and burning the
+    account's retry budget on an identical resend would only reproduce the
+    same 400. Every OTHER non-retryable failure (401 credentials, 403
+    permission, 404 unknown model...) still means the WHOLE PASS cannot
+    proceed and stays :class:`FactsExtractionUnavailable` — see
+    :func:`_classify_permanent_error`.
+
+    Carries a short, machine-readable ``reason`` alongside the human
+    message — the same "reason class" shape the batch transport's
+    ``docs_state[file_id]["reason"]`` already records, folded into this
+    pass's report as ``facts_failed_reasons`` (:meth:`_Report.render`).
+    """
+
+    def __init__(self, message: str, *, reason: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+def _classify_permanent_error(exc: BaseException) -> Optional[str]:
+    """A ``facts_failed_reasons`` class when ``exc`` is a PER-DOCUMENT
+    permanent error, or ``None`` when it is not (either retryable, or
+    permanent but PASS-level — see :class:`FactsDocumentError`'s
+    docstring).
+
+    Checked the same way :func:`src.anonymization_ner._is_retryable` reads
+    a status code — structurally first (``.type``/``.status_code``, which
+    the Anthropic SDK's own ``APIStatusError`` sets from the parsed
+    response body, see ``anthropic._exceptions``), so this never depends on
+    a specific SDK exception class being importable. Only
+    ``invalid_request_error`` (or a bare 400 with no ``.type`` at all — a
+    stub/older-SDK shape carrying no further detail) is classified as
+    per-document; every other 4xx (401/403/404/422) is left ``None`` and
+    stays pass-level, because those mean the ACCOUNT or the MODEL is
+    unusable, not that this one document's request was malformed.
+    """
+    error_type = str(getattr(exc, "type", "") or "")
+    if error_type.startswith("invalid_request"):
+        return "invalid_request"
+    status = getattr(exc, "status_code", None)
+    if status == 400 and not error_type:
+        return "invalid_request"
+    return None
+
+
 # --------------------------------------------------------------------------
 # Config
 # --------------------------------------------------------------------------
@@ -301,6 +476,110 @@ def _standalone_timeout_seconds() -> float:
         return max(0.0, float(raw))
     except (TypeError, ValueError):
         return float(DEFAULT_STANDALONE_TIMEOUT_S)
+
+
+def _max_doc_chars() -> int:
+    """``extraction.facts.max_doc_chars`` — see :data:`DEFAULT_MAX_DOC_CHARS`.
+    Clamped to a minimum of 1 (a garbage/zero/negative configured value
+    would otherwise skip every document's text outright, silently)."""
+    from app.instance_config import get_value
+
+    raw = get_value("extraction", "facts", "max_doc_chars", default=DEFAULT_MAX_DOC_CHARS)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "facts extraction: extraction.facts.max_doc_chars=%r is not an integer — using %d",
+            raw,
+            DEFAULT_MAX_DOC_CHARS,
+        )
+        return DEFAULT_MAX_DOC_CHARS
+    return max(1, value)
+
+
+def _max_prompt_tokens() -> int:
+    """``extraction.facts.max_prompt_tokens`` — see
+    :data:`DEFAULT_MAX_PROMPT_TOKENS`. Hard-clamped to
+    ``[1, MAX_PROMPT_TOKENS_CEILING]``: an operator raising this past the
+    model's own real context window would just move the 400 from "too
+    long" to "still too long", so the ceiling applies regardless of what
+    instance.yaml asks for.
+    """
+    from app.instance_config import get_value
+
+    raw = get_value("extraction", "facts", "max_prompt_tokens", default=DEFAULT_MAX_PROMPT_TOKENS)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "facts extraction: extraction.facts.max_prompt_tokens=%r is not an integer — using %d",
+            raw,
+            DEFAULT_MAX_PROMPT_TOKENS,
+        )
+        return DEFAULT_MAX_PROMPT_TOKENS
+    return max(1, min(MAX_PROMPT_TOKENS_CEILING, value))
+
+
+def _approx_tokens(text: str, *, tabular: bool = False) -> int:
+    """A deterministic, OFFLINE estimate of ``text``'s token count.
+
+    No network call, no dependency on either provider's own tokenizer (this
+    stage runs against both Anthropic and Vertex clients, and reaching for
+    a real tokenizer would mean two different implementations agreeing by
+    luck, or a network round trip on the hot per-document path). Charged at
+    :data:`_CHARS_PER_TOKEN_DENSE` when ``tabular`` (see :func:`_is_tabular_text`
+    — digit/delimiter-dense content, not necessarily a markdown table), the
+    flat prose ratio otherwise — see the calibration note on
+    :data:`_CHARS_PER_TOKEN_DENSE` for why the dense ratio is set where it
+    is and not merely "a bit tighter than prose".
+    """
+    if not text:
+        return 0
+    ratio = _CHARS_PER_TOKEN_DENSE if tabular else _CHARS_PER_TOKEN_PROSE
+    return max(1, int(len(text) / ratio))
+
+
+def _is_tabular_text(text: str) -> bool:
+    """Whether ``text`` reads as digit/delimiter-dense tabular content — a
+    converted spreadsheet's markdown table, a CSV/TSV, or an EDI-shaped
+    segment export — see :data:`_DENSE_LINE_DELIMITERS` /
+    :data:`_TABULAR_LINE_RATIO`. A structural check on the TEXT itself, not
+    the source file's extension: a spreadsheet that converted to mostly
+    prose stays prose, and a document that happens to embed one markdown
+    table does not flip the whole document dense.
+    """
+    lines = [ln for ln in text[:_SHAPE_SAMPLE_CHARS].splitlines() if ln.strip()]
+    if not lines:
+        return False
+    dense_lines = sum(
+        1 for ln in lines if sum(ln.count(delim) for delim in _DENSE_LINE_DELIMITERS) >= _DENSE_LINE_DELIMITER_MIN
+    )
+    return (dense_lines / len(lines)) >= _TABULAR_LINE_RATIO
+
+
+def _looks_garbled(text: str) -> bool:
+    """Whether ``text`` is more likely binary/decode-garbage than
+    fact-bearing content — see :data:`_GARBLED_READABLE_CHARS` /
+    :data:`_MAX_GARBLED_UNREADABLE_RATIO` for the calibration this exact
+    threshold is set against.
+    """
+    sample = text[:_SHAPE_SAMPLE_CHARS]
+    total = len(sample)
+    if total < 200:
+        return False
+    unreadable = sum(1 for ch in sample if ch not in _GARBLED_READABLE_CHARS)
+    return (unreadable / total) > _MAX_GARBLED_UNREADABLE_RATIO
+
+
+def _token_char_budget(system_prompt_tokens: int, max_prompt_tokens: int, *, tabular: bool) -> int:
+    """How many CHARACTERS of document text (or of a retry's failing-quote
+    listing) fit under ``max_prompt_tokens`` once ``system_prompt_tokens``
+    and :data:`_MESSAGE_OVERHEAD_TOKENS` are reserved. Never negative — a
+    system prompt alone at or past the budget leaves 0, not a crash.
+    """
+    budget_tokens = max(0, max_prompt_tokens - system_prompt_tokens - _MESSAGE_OVERHEAD_TOKENS)
+    chars_per_token = _CHARS_PER_TOKEN_DENSE if tabular else _CHARS_PER_TOKEN_PROSE
+    return int(budget_tokens * chars_per_token)
 
 
 class FactsExtractionDisabled(RuntimeError):
@@ -1472,6 +1751,7 @@ class _Extractor:
         sleep: Callable[[float], None] = time.sleep,
         provider: Optional[str] = None,
         vertex_region: Optional[str] = None,
+        max_prompt_tokens: Optional[int] = None,
     ) -> None:
         self.system_prompt = system_prompt
         self.model = model or _model()
@@ -1493,6 +1773,21 @@ class _Extractor:
         #: answer — unused when `provider` is "anthropic", passed straight
         #: through to :func:`_build_facts_client` otherwise.
         self.vertex_region = vertex_region
+        #: ``extraction.facts.max_prompt_tokens`` (resolved once, here, not
+        #: per document — the test seam mirrors every other knob's ``None``
+        #: -resolves-from-config convention).
+        self.max_prompt_tokens = max_prompt_tokens if max_prompt_tokens is not None else _max_prompt_tokens()
+        #: The system prompt's own estimated token cost, computed ONCE
+        #: (byte-identical for every document/retry of this run) rather
+        #: than re-estimated per call.
+        self._system_prompt_tokens = _approx_tokens(system_prompt)
+
+    def char_budget(self, *, tabular: bool) -> int:
+        """How many characters of a corrective retry's failing-quote
+        listing (or, equivalently, a document's own text) fit under this
+        run's token budget alongside the system prompt — see
+        :func:`_token_char_budget`."""
+        return _token_char_budget(self._system_prompt_tokens, self.max_prompt_tokens, tabular=tabular)
 
     def _ensure_client(self) -> Tuple[Any, str]:
         with self._client_lock:
@@ -1545,20 +1840,39 @@ class _Extractor:
             return dict(self.usage)
 
     def call(self, user_message: str) -> str:
-        """One bounded-retry call. Raises :class:`FactsExtractionUnavailable`
-        on exhaustion — never returns an empty reply to be mistaken for an
-        empty document."""
+        """One bounded-retry call.
+
+        Raises :class:`FactsDocumentError` IMMEDIATELY (no retry, no
+        backoff sleep) for an error :func:`_classify_permanent_error`
+        recognizes as PER-DOCUMENT permanent (an ``invalid_request_error``
+        — most commonly "prompt is too long") — burning the retry budget on
+        an identical resend would only reproduce the same rejection.
+        :class:`FactsExtractionUnavailable` on exhaustion of a genuinely
+        transient failure, or on a non-retryable failure that is NOT
+        document-specific (credentials, permissions...) — never returns an
+        empty reply to be mistaken for an empty document.
+        """
         from src.anonymization_ner import _is_retryable, _reply_text
 
         last_error: BaseException | None = None
+        attempts_made = 0
         for attempt in range(1, self.max_attempts + 1):
+            attempts_made = attempt
             try:
                 response = self._create(user_message)
             except FactsExtractionUnavailable:
                 raise
             except Exception as exc:  # noqa: BLE001 — classified below
                 last_error = exc
-                if not _is_retryable(exc) or attempt == self.max_attempts:
+                if not _is_retryable(exc):
+                    reason = _classify_permanent_error(exc)
+                    if reason is not None:
+                        raise FactsDocumentError(
+                            f"fact extraction permanently failed ({reason}): {type(exc).__name__}: {exc}",
+                            reason=reason,
+                        ) from exc
+                    break
+                if attempt == self.max_attempts:
                     break
                 delay = self.backoff_s * (2 ** (attempt - 1))
                 logger.warning(
@@ -1573,7 +1887,7 @@ class _Extractor:
             self._record(response)
             return _reply_text(response)
         raise FactsExtractionUnavailable(
-            f"fact extraction failed after {self.max_attempts} attempt(s): {type(last_error).__name__}: {last_error}"
+            f"fact extraction failed after {attempts_made} attempt(s): {type(last_error).__name__}: {last_error}"
         ) from last_error
 
 
@@ -1612,6 +1926,44 @@ def _retry_message(base_user_message: str, failures: Sequence[Tuple[dict, str]])
         "or were missing entirely. Re-emit ONLY these facts, corrected — fix the quote to an "
         "exact substring, or drop the fact if you cannot:\n\n" + listing
     )
+
+
+def _bound_failures_for_retry(
+    failures: Sequence[Tuple[dict, str]], *, char_budget: int
+) -> Tuple[List[Tuple[dict, str]], List[Tuple[dict, str]]]:
+    """``(included, overflow)`` — ``failures`` trimmed to what fits in
+    ``char_budget`` characters of :func:`_retry_message`'s own listing
+    format, in ORDER (the model already saw them in this order in the
+    first reply).
+
+    Exists because the listing itself had NO bound at all: a live incident
+    (2026-09) had a document whose first-pass reply produced hundreds of
+    facts that failed the verbatim gate, and the resulting retry request
+    (base message + every one of them) measured 316,295 tokens against the
+    model's real 200,000-token ceiling — the SAME class of failure the
+    token-safe document bound (:func:`_token_char_budget`) closes for the
+    document text itself, just for the failure listing instead.
+    ``overflow`` is dropped by the CALLER without ever being retried — a
+    retry large enough to include it would risk reproducing the exact 400
+    this bound exists to prevent.
+    """
+    included: List[Tuple[dict, str]] = []
+    overflow: List[Tuple[dict, str]] = []
+    used = 0
+    for fact, quote in failures:
+        entry_len = len(f"- {_fact_key(fact)[:200]}\n  failing quote: {quote[:120]!r}\n")
+        if included and used + entry_len > char_budget:
+            overflow.append((fact, quote))
+            continue
+        included.append((fact, quote))
+        used += entry_len
+    if not included and failures:
+        # `char_budget` too tight for even ONE entry: keep the first one
+        # anyway. An empty listing would ask the model to "re-emit ONLY
+        # these facts" over nothing, which is nonsensical, and one entry is
+        # a rounding error next to the base message it rides alongside.
+        return [failures[0]], list(failures[1:])
+    return included, overflow
 
 
 # --------------------------------------------------------------------------
@@ -1704,8 +2056,28 @@ class _Report:
         self.docs_skipped_tabular = 0
         self.docs_skipped_no_text = 0
         self.docs_skipped_not_indexed = 0
+        #: A document skipped OUTRIGHT — never sent to the model at all —
+        #: because :func:`_looks_garbled` classified its text as binary/
+        #: decode-garbage (an xlsx-conversion "symbol soup", the live
+        #: incident's own root cause) rather than fact-bearing content.
+        self.docs_skipped_garbled_text = 0
+        #: A dense/tabular document (:func:`_is_tabular_text`) skipped
+        #: outright because even the token-budget-bounded head
+        #: (:func:`_token_char_budget`) would keep under
+        #: :data:`_MIN_TABULAR_KEEP_RATIO` of its (already
+        #: `max_doc_chars`-capped) length — too small a sample of a
+        #: general-ledger/EDI-shaped export to be worth extracting.
+        self.docs_skipped_too_large_tabular = 0
         self.docs_truncated = 0
         self.facts_failed = 0
+        #: Per-document PERMANENT model-call failures
+        #: (:class:`FactsDocumentError`), keyed by their short reason class
+        #: (currently just ``"invalid_request"``) — a breakdown of the
+        #: SUBSET of `facts_failed` this module can actually name a cause
+        #: for, on both transports (:func:`_drain_one`'s
+        #: `FactsDocumentError` branch, :func:`_requeue_or_fail`'s
+        #: `permanent=True` branch).
+        self.facts_failed_reasons: Dict[str, int] = {}
         self.facts_quotes_dropped = 0
         self.facts_quotes_repaired = 0
         self.facts_retries = 0
@@ -1737,6 +2109,12 @@ class _Report:
         #: Sync-mode passes leave `docs_via_batch` at 0.
         self.docs_via_batch = 0
         self.docs_via_sync = 0
+
+    def record_failure_reason(self, reason: str) -> None:
+        """Bump ``facts_failed_reasons[reason]`` — the shared bookkeeping
+        both transports' permanent-failure paths use (see
+        ``facts_failed_reasons``'s own docstring above)."""
+        self.facts_failed_reasons[reason] = self.facts_failed_reasons.get(reason, 0) + 1
 
     def render(
         self,
@@ -1824,8 +2202,11 @@ class _Report:
             "docs_skipped_tabular": self.docs_skipped_tabular,
             "docs_skipped_no_text": self.docs_skipped_no_text,
             "docs_skipped_not_indexed": self.docs_skipped_not_indexed,
+            "docs_skipped_garbled_text": self.docs_skipped_garbled_text,
+            "docs_skipped_too_large_tabular": self.docs_skipped_too_large_tabular,
             "docs_truncated": self.docs_truncated,
             "facts_failed": self.facts_failed,
+            "facts_failed_reasons": dict(self.facts_failed_reasons),
             "facts_quotes_dropped": self.facts_quotes_dropped,
             "facts_quotes_repaired": self.facts_quotes_repaired,
             "facts_retries": self.facts_retries,
@@ -2077,6 +2458,7 @@ class _Work:
         "mapping",
         "path",
         "sha256",
+        "tabular",
         "user_message",
     )
 
@@ -2092,6 +2474,7 @@ class _Work:
         mapping: Dict[str, Any],
         chunk_texts: List[str],
         user_message: str,
+        tabular: bool = False,
     ) -> None:
         self.file_id = file_id
         self.doc_id = doc_id
@@ -2102,6 +2485,12 @@ class _Work:
         self.mapping = mapping
         self.chunk_texts = chunk_texts
         self.user_message = user_message
+        #: Whether this document's text was classified dense/tabular
+        #: (:func:`_is_tabular_text`) — carried on the work item so the
+        #: corrective retry's own token budget (:meth:`_Extractor.char_budget`)
+        #: charges the SAME ratio the initial truncation used, rather than
+        #: re-deriving it from a document that may already be truncated.
+        self.tabular = tabular
 
 
 class _DocResult:
@@ -2143,6 +2532,8 @@ def _plan_documents(
     model: str,
     fingerprint: str,
     max_doc_chars: int,
+    system_prompt_tokens: int = 0,
+    max_prompt_tokens: int = DEFAULT_MAX_PROMPT_TOKENS,
 ) -> Any:
     """Yield the documents that actually need a model call — the SAME walk
     for BOTH transports (:func:`run_facts_extraction`'s sync loop and
@@ -2155,7 +2546,13 @@ def _plan_documents(
     no text, still mid-flight in an unfinished batch — is made HERE, on the
     caller's thread, before anything is submitted: those documents cost
     nothing and must not occupy a worker slot (or a batch request) to find
-    that out.
+    that out. ``system_prompt_tokens`` / ``max_prompt_tokens`` drive the
+    token-aware bound BEYOND ``max_doc_chars`` (:func:`_token_char_budget`)
+    — a garbled document is skipped outright (``garbled_text``), a
+    severely oversized dense one is skipped rather than shipping a
+    meaningless head (``too_large_tabular``), and everything else still
+    over budget is truncated a second time, tighter than the flat
+    character cap alone.
     """
     for collection_id in collection_ids_for(connection):
         for file_row in files_repo.list_for_corpus(collection_id):
@@ -2208,8 +2605,37 @@ def _plan_documents(
                 report.docs_skipped_no_text += 1
                 docs_state[file_id] = {"status": "skipped-no-text", "at": _now_iso()}
                 continue
+
+            truncated = False
             if len(text) > max_doc_chars:
                 text = text[:max_doc_chars]
+                truncated = True
+
+            if _looks_garbled(text):
+                # Binary/decode-garbage text (see `_looks_garbled`'s
+                # calibration note): no truncation ratio is safe for it —
+                # it tokenizes far denser than any legitimate document this
+                # module has ever measured — and it produces zero usable
+                # facts regardless of how much of it is sent. Skip it
+                # outright rather than gamble a request on it.
+                report.docs_skipped_garbled_text += 1
+                docs_state[file_id] = {"status": "skipped-garbled-text", "at": _now_iso()}
+                continue
+
+            tabular = _is_tabular_text(text)
+            char_budget = _token_char_budget(system_prompt_tokens, max_prompt_tokens, tabular=tabular)
+            if tabular and len(text) > char_budget and char_budget < _MIN_TABULAR_KEEP_RATIO * len(text):
+                # A head this small is not a meaningful sample of a
+                # general-ledger/EDI-shaped export — closer to noise than
+                # data. Skip rather than ship it.
+                report.docs_skipped_too_large_tabular += 1
+                docs_state[file_id] = {"status": "skipped-too-large-tabular", "at": _now_iso()}
+                continue
+            if len(text) > char_budget:
+                text = text[:char_budget]
+                truncated = True
+
+            if truncated:
                 report.docs_truncated += 1
 
             metadata = {
@@ -2228,6 +2654,7 @@ def _plan_documents(
                 mapping=mapping,
                 chunk_texts=chunk_texts,
                 user_message=build_user_message(metadata, text),
+                tabular=tabular,
             )
 
 
@@ -2292,13 +2719,36 @@ def extract_one(
         # already patched the shipped evidence deterministically.
         retry_failures = failures if failures else pre_repair_failures
         retried = True
+        # Bound the retry's failing-quote listing to the SAME token budget
+        # the document text itself was bounded to — see
+        # `_bound_failures_for_retry`'s docstring for the incident this
+        # closes. `char_budget` is a test seam only some `extractor`
+        # objects (the real `_Extractor`) carry; a bare stub without it
+        # gets the unbounded listing, unchanged from before this existed.
+        char_budget_fn = getattr(extractor, "char_budget", None)
+        if callable(char_budget_fn):
+            retry_char_budget = max(0, char_budget_fn(tabular=work.tabular) - len(work.user_message))
+            bounded_failures, overflow_failures = _bound_failures_for_retry(
+                retry_failures, char_budget=retry_char_budget
+            )
+            if overflow_failures:
+                logger.info(
+                    "facts extraction: document %s — retry listing bounded to %d/%d failing quote(s) to "
+                    "stay under the prompt token budget (%d dropped without a retry)",
+                    work.doc_id,
+                    len(bounded_failures),
+                    len(retry_failures),
+                    len(overflow_failures),
+                )
+        else:
+            bounded_failures = list(retry_failures)
         retry_reply = _cache_lookup(
             cache, sha256=work.sha256, model=extractor.model, fingerprint=fingerprint, suffix="retry"
         )
         if retry_reply is not None:
             cache_hits += 1
         else:
-            retry_reply = extractor.call(_retry_message(work.user_message, retry_failures))
+            retry_reply = extractor.call(_retry_message(work.user_message, bounded_failures))
             _cache_store(
                 cache,
                 sha256=work.sha256,
@@ -2635,7 +3085,13 @@ def _batch_is_expired_by_age(submitted_at: Optional[str]) -> bool:
 
 
 def _load_work_for_file(
-    file_id: str, *, files_repo: Any, sources_repo: Any, max_doc_chars: int
+    file_id: str,
+    *,
+    files_repo: Any,
+    sources_repo: Any,
+    max_doc_chars: int,
+    system_prompt_tokens: int = 0,
+    max_prompt_tokens: int = DEFAULT_MAX_PROMPT_TOKENS,
 ) -> Optional[Tuple["_Work", bool]]:
     """Re-derive one document's ``_Work`` FRESH from the database at
     collection time, rather than caching what :func:`_plan_documents` built
@@ -2645,6 +3101,13 @@ def _load_work_for_file(
     was_truncated)``, or ``None`` when the document itself is gone (deleted
     between submission and collection — rare, but a batch's ~hour-to-24h
     round trip makes it possible).
+
+    Applies the SAME token-aware bound :func:`_plan_documents` applies at
+    submission time (:func:`_token_char_budget`) — what matters here is not
+    what was already sent (that already happened, at submission time) but
+    keeping THIS re-derived copy consistent for building a follow-up
+    corrective retry, which is exactly where the SAME unbounded-request risk
+    applies a second time (see :func:`_bound_failures_for_retry`).
     """
     file_row = files_repo.get(file_id)
     if not file_row:
@@ -2663,6 +3126,11 @@ def _load_work_for_file(
     if len(text) > max_doc_chars:
         text = text[:max_doc_chars]
         truncated = True
+    tabular = _is_tabular_text(text)
+    char_budget = _token_char_budget(system_prompt_tokens, max_prompt_tokens, tabular=tabular)
+    if len(text) > char_budget:
+        text = text[:char_budget]
+        truncated = True
     metadata = {"doc_id": doc_id, "name": filename, "path": path, "collection_id": collection_id}
     work = _Work(
         file_id=file_id,
@@ -2674,6 +3142,7 @@ def _load_work_for_file(
         mapping=mapping,
         chunk_texts=chunk_texts,
         user_message=build_user_message(metadata, text),
+        tabular=tabular,
     )
     return work, truncated
 
@@ -2705,6 +3174,12 @@ def _requeue_or_fail(
         docs_state[file_id] = {"status": "failed", "reason": reason, "at": _now_iso()}
         batch_attempts.pop(file_id, None)
         report.facts_failed += 1
+        # Same `facts_failed_reasons` breakdown the sync transport's
+        # `FactsDocumentError` handling records — `reason` here always
+        # starts with `"invalid_request"` (the only `permanent=True`
+        # caller, see `_collect_batch`), so this stays a short, stable
+        # class rather than the full API error message.
+        report.record_failure_reason("invalid_request" if reason.startswith("invalid_request") else reason)
         logger.warning("facts extraction: document %s permanently failed (%s) — not retried", file_id, reason)
         return
     attempts = int(batch_attempts.get(file_id, 0)) + 1
@@ -2782,7 +3257,7 @@ def run_facts_extraction(
     doc_ids: Optional[Sequence[str]] = None,
     deadline: Any | None = None,
     extractor: Any | None = None,
-    max_doc_chars: int = DEFAULT_MAX_DOC_CHARS,
+    max_doc_chars: Optional[int] = None,
     concurrency: Optional[int] = None,
     retry_mode: Optional[str] = None,
     on_progress: Optional[Callable[[Dict[str, Any]], None]] = None,
@@ -2790,6 +3265,7 @@ def run_facts_extraction(
     batch_client: Any | None = None,
     provider: Optional[str] = None,
     vertex_region: Optional[str] = None,
+    max_prompt_tokens: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Run one fact-extraction pass for a SharePoint connection.
 
@@ -2859,6 +3335,17 @@ def run_facts_extraction(
     REGION, so pinning different connections to different regions
     multiplies the account's effective throughput at the same price.
 
+    ``max_doc_chars`` / ``max_prompt_tokens`` override
+    ``extraction.facts.max_doc_chars`` / ``extraction.facts.
+    max_prompt_tokens`` the same way (test seams; ``None`` resolves from
+    config). The first is the flat character pre-cap
+    (:data:`DEFAULT_MAX_DOC_CHARS`); the second is the SOFT token budget
+    the whole request (system prompt + document text, and separately the
+    corrective retry's failing-quote listing) is kept under
+    (:data:`DEFAULT_MAX_PROMPT_TOKENS`, hard-ceilinged at
+    :data:`MAX_PROMPT_TOKENS_CEILING`) — see :func:`_plan_documents` and
+    :func:`_bound_failures_for_retry`.
+
     Returns the pass report (see :meth:`_Report.render`).
     """
     from src.repositories import corpus_file_sources_repo, corpus_files_repo, source_connections_repo
@@ -2885,6 +3372,12 @@ def run_facts_extraction(
     fingerprint = prompt_fingerprint(system_prompt)
 
     model = _model()
+
+    # `None` (the default) resolves from config — the same test-seam
+    # convention every other knob on this function already uses.
+    resolved_max_doc_chars = max_doc_chars if max_doc_chars is not None else _max_doc_chars()
+    resolved_max_prompt_tokens = max_prompt_tokens if max_prompt_tokens is not None else _max_prompt_tokens()
+    system_prompt_tokens = _approx_tokens(system_prompt)
 
     # Provider resolution — independent of the transport dispatch below, but
     # the transport dispatch depends on ITS answer (batch is Anthropic-API-
@@ -2924,12 +3417,13 @@ def run_facts_extraction(
             ontology_models=ontology_models,
             doc_ids=doc_ids,
             deadline=deadline,
-            max_doc_chars=max_doc_chars,
+            max_doc_chars=resolved_max_doc_chars,
             batch_client=batch_client,
             on_progress=on_progress,
             retry_mode=retry_mode if retry_mode in _VALID_RETRY_MODES else resolve_retry_mode(connection)[0],
             provider=effective_provider,
             provider_source=provider_source,
+            max_prompt_tokens=resolved_max_prompt_tokens,
         )
 
     if extractor is None:
@@ -2938,6 +3432,7 @@ def run_facts_extraction(
             model=model,
             provider=effective_provider,
             vertex_region=resolved_vertex_region,
+            max_prompt_tokens=resolved_max_prompt_tokens,
         )
     else:
         model = getattr(extractor, "model", model)
@@ -3055,6 +3550,19 @@ def run_facts_extraction(
         future, work = inflight.popleft()
         try:
             _accept(future.result())
+        except FactsDocumentError as exc:
+            # A PERMANENT, document-specific model-call failure (currently
+            # only `invalid_request` — most commonly "prompt is too long")
+            # — counted the same way any other per-document failure is,
+            # never a hard stop. See `FactsDocumentError`'s docstring for
+            # why this is deliberately NOT `FactsExtractionUnavailable`.
+            report.facts_failed += 1
+            report.record_failure_reason(exc.reason)
+            logger.warning(
+                "facts extraction: document %s permanently failed (%s) — counted, continuing",
+                work.doc_id,
+                exc.reason,
+            )
         except FactsExtractionUnavailable as exc:
             docs_unavailable += 1
             if hard_stop is None:
@@ -3093,7 +3601,9 @@ def run_facts_extraction(
             wanted_doc_ids=wanted_doc_ids,
             model=model,
             fingerprint=fingerprint,
-            max_doc_chars=max_doc_chars,
+            max_doc_chars=resolved_max_doc_chars,
+            system_prompt_tokens=system_prompt_tokens,
+            max_prompt_tokens=resolved_max_prompt_tokens,
         ):
             # Checked between SUBMISSIONS: everything already in flight is
             # drained below rather than abandoned, because those calls are
@@ -3183,6 +3693,7 @@ def _run_batch_pass(
     retry_mode: str = DEFAULT_RETRY_MODE,
     provider: str = "anthropic",
     provider_source: str = "instance",
+    max_prompt_tokens: Optional[int] = None,
 ) -> Dict[str, Any]:
     """The Batches-API transport's own pass — dispatched from
     :func:`run_facts_extraction` when ``extraction.facts.transport`` (or
@@ -3225,6 +3736,8 @@ def _run_batch_pass(
     poll_s = _batch_poll_s()
     batch_size = _batch_size()
     retry_transport = _retry_transport_mode()
+    resolved_max_prompt_tokens = max_prompt_tokens if max_prompt_tokens is not None else _max_prompt_tokens()
+    system_prompt_tokens = _approx_tokens(system_prompt)
 
     # `usage` is the combined running total (what a batch's ingest delta is
     # computed against, exactly like the sync transport's own `_flush`);
@@ -3359,7 +3872,19 @@ def _run_batch_pass(
             _accept(work, final_nodes, final_edges, dropped, retried, repaired, parse_errors2)
             return
         if retry_transport == "sync" and not _deadline_expired(deadline):
-            retry_reply = _sync_retry(_retry_message(work.user_message, failures))
+            # Bound the retry's failing-quote listing to the SAME token
+            # budget the document text itself was bounded to — see
+            # `_bound_failures_for_retry`'s docstring. `failures` (the FULL
+            # set) still drives `_finalize_gate`'s accounting below, so an
+            # overflow entry is correctly counted dropped, never silently
+            # lost and never double-counted.
+            retry_char_budget = max(
+                0,
+                _token_char_budget(system_prompt_tokens, resolved_max_prompt_tokens, tabular=work.tabular)
+                - len(work.user_message),
+            )
+            bounded_failures, _overflow = _bound_failures_for_retry(failures, char_budget=retry_char_budget)
+            retry_reply = _sync_retry(_retry_message(work.user_message, bounded_failures))
             final_nodes, final_edges, dropped, retried, parse_errors2 = _finalize_gate(
                 work=work,
                 nodes=nodes,
@@ -3419,7 +3944,12 @@ def _run_batch_pass(
             result_type = getattr(result, "type", None)
             if result_type == "succeeded":
                 loaded = _load_work_for_file(
-                    file_id, files_repo=files_repo, sources_repo=sources_repo, max_doc_chars=max_doc_chars
+                    file_id,
+                    files_repo=files_repo,
+                    sources_repo=sources_repo,
+                    max_doc_chars=max_doc_chars,
+                    system_prompt_tokens=system_prompt_tokens,
+                    max_prompt_tokens=resolved_max_prompt_tokens,
                 )
                 if loaded is None:
                     docs_state.pop(file_id, None)
@@ -3518,6 +4048,8 @@ def _run_batch_pass(
             model=model,
             fingerprint=fingerprint,
             max_doc_chars=max_doc_chars,
+            system_prompt_tokens=system_prompt_tokens,
+            max_prompt_tokens=resolved_max_prompt_tokens,
         )
     )
     docs_planned += len(pending_works)
@@ -3568,8 +4100,25 @@ def _run_batch_pass(
                 pending_retries.clear()
                 break
             retry_works = [w for w, *_ in pending_retries]
+            # Bound each retry's failing-quote listing to the SAME token
+            # budget the document text itself was bounded to — see
+            # `_bound_failures_for_retry`'s docstring. `failures` (the FULL
+            # set) is still what `docs_state[...]["failed_count"]` below
+            # records, so `_merge_retry_reply`'s dropped-accounting at
+            # collection time is unaffected by the bound.
             messages_by_file = {
-                w.file_id: _retry_message(w.user_message, failures) for w, _, _, failures, _ in pending_retries
+                w.file_id: _retry_message(
+                    w.user_message,
+                    _bound_failures_for_retry(
+                        failures,
+                        char_budget=max(
+                            0,
+                            _token_char_budget(system_prompt_tokens, resolved_max_prompt_tokens, tabular=w.tabular)
+                            - len(w.user_message),
+                        ),
+                    )[0],
+                )
+                for w, _, _, failures, _ in pending_retries
             }
             retry_batch_id = _submit_batch(
                 client,

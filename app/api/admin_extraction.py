@@ -459,7 +459,10 @@ _EMPTY_FLEET_FACTS: Dict[str, Any] = {
     "docs_skipped_tabular": None,
     "docs_skipped_no_text": None,
     "docs_skipped_not_indexed": None,
+    "docs_skipped_garbled_text": None,
+    "docs_skipped_too_large_tabular": None,
     "facts_failed": None,
+    "facts_failed_reasons": None,
     "usage": {},
 }
 
@@ -499,7 +502,10 @@ def _fleet_facts(run: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         out["docs_skipped_tabular"] = final_facts.get("docs_skipped_tabular")
         out["docs_skipped_no_text"] = final_facts.get("docs_skipped_no_text")
         out["docs_skipped_not_indexed"] = final_facts.get("docs_skipped_not_indexed")
+        out["docs_skipped_garbled_text"] = final_facts.get("docs_skipped_garbled_text")
+        out["docs_skipped_too_large_tabular"] = final_facts.get("docs_skipped_too_large_tabular")
         out["facts_failed"] = final_facts.get("facts_failed")
+        out["facts_failed_reasons"] = final_facts.get("facts_failed_reasons")
         if out["docs_done"] is None:
             out["docs_done"] = final_facts.get("docs_extracted")
     # The priced usage for JUST this stage — see `_run_total_cost_usd` for
