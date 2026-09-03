@@ -2590,16 +2590,25 @@ def _library_child_row(
 #: `c.search`), never a per-file fetch, however small the folder.
 _LIBRARY_FOLDER_PEEK = 10
 
-#: How many Artefact collections/loose files the index renders by default —
-#: the last lever of the round-2 incident fix, for the instance that is
-#: STILL over budget once its per-collection cost is bounded (many hundreds
-#: of collections, each now cheap). `?files_limit=<n>` raises it; the "Show
-#: more collections" row this drives (`library_files_more_href`) doubles it
-#: rather than jumping straight to "all", so a caller who does not need the
-#: rest never pays to fetch it. `file_corpora_repo().list()`'s own default
-#: cap (200) was this same idea half-built: a silent, undocumented ceiling
-#: with no indication anything was cut and no way past it.
-_LIBRARY_SECTION_PAGE_CAP = 100
+#: How many collections `library_page` reads in its one flat
+#: `file_corpora_repo().list()` call. NOT a render cap — round 4 of the
+#: 2026-09-03 incident removed the render cap (`_LIBRARY_SECTION_PAGE_CAP`,
+#: `?files_limit=`, the "Show more collections" link) entirely: it applied
+#: to the RAW fetch, before the caller's owned-or-granted filter ran, so
+#: "Show more" appeared whenever the INSTANCE had more than the cap's worth
+#: of collections, never whether the CALLER could see more than that — on a
+#: live instance where one admin owned/was granted only 2 of 397
+#: collections, the link "led nowhere" no matter how far `?files_limit=` was
+#: raised, because raising it only fetched more of the same ~395 invisible
+#: rows. Every collection the caller may see now renders, in one list — no
+#: other Library section paginates either, and a collection's own render
+#: cost is bounded regardless of count now that its peek is fetched lazily
+#: (round 2) and its facet menu is capped server-side (round 3). This
+#: constant exists only so the ONE flat query has an explicit ceiling
+#: instead of `file_corpora_repo().list()`'s own default (200), which would
+#: otherwise silently truncate the visible-set computation on a large
+#: instance before ownership/grants are even checked.
+_LIBRARY_COLLECTIONS_FETCH_CAP = 5000
 
 #: How many values EACH entity facet (client/industry/offering/document
 #: type) offers in the Filter menu — round 3 of the 2026-09-03 incident.
@@ -2751,29 +2760,18 @@ async def library_page(
     # when the surface is actually on (spec §13.2 "Library" — "N files ·
     # M facts").
     facts_repo_ = _facts_repo_if_available()
-    # `?files_limit=` raises the render cap past `_LIBRARY_SECTION_PAGE_CAP`
-    # — the "Show more collections" row's own href (below). Clamped so the
-    # query string cannot turn this back into the unbounded fetch the rest
-    # of this fix removes; a bad value falls back to the default rather than
-    # 500ing the page over a copy-pasted URL.
-    try:
-        _files_limit = max(1, min(int(request.query_params.get("files_limit", "")), 5000))
-    except ValueError:
-        _files_limit = _LIBRARY_SECTION_PAGE_CAP
     _all_cols: list = []
-    library_files_more_href = ""
     try:
         fc_repo = file_corpora_repo()
         cf_repo = corpus_files_repo()
-        # One row PAST the limit, not a separate COUNT — enough to know
-        # whether there is more without a second query, and never fetches
-        # more than the caller will actually see plus one.
-        _fetched = fc_repo.list(limit=_files_limit + 1)
-        if len(_fetched) > _files_limit:
-            _all_cols = _fetched[:_files_limit]
-            library_files_more_href = f"/library?files_limit={_files_limit * 2}"
-        else:
-            _all_cols = _fetched
+        # Every collection up to `_LIBRARY_COLLECTIONS_FETCH_CAP`, in ONE
+        # flat query — round 4 of the 2026-09-03 incident removed the
+        # render cap that used to apply here (see that constant's
+        # docstring). The owned-or-granted filter below decides what
+        # actually renders; nothing here narrows the fetch by visibility,
+        # so there is nothing left that could turn the caller's OWN visible
+        # count into a truncated, misleading one.
+        _all_cols = fc_repo.list(limit=_LIBRARY_COLLECTIONS_FETCH_CAP)
     except Exception as e:
         _lost("files and collections", e)
     # One batch call for every card, not one call per card: each singular
@@ -4359,10 +4357,6 @@ async def library_page(
         # init` actually authenticates with, so holding one IS being
         # connected, however they got there.
         library_connected=_has_connected_tools(user),
-        # "" when every artefact collection fit under `_LIBRARY_SECTION_
-        # PAGE_CAP` (or `?files_limit=` already covers them) — the row this
-        # drives renders only when truncated.
-        library_files_more_href=library_files_more_href,
     )
     return templates.TemplateResponse(request, "library.html", ctx)
 
