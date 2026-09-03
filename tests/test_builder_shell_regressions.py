@@ -118,7 +118,7 @@ class TestTheDrawerWearsOneHeaderAtATime:
         body = block.group(1)
         # As a page it navigates; as an overlay it closes. Neither confirms.
         assert "st.backHref" in body and "close()" in body
-        assert "confirmModal" not in drawer
+        assert "confirmModal" not in body
 
 
 class TestThePackageBuilderIsAPage:

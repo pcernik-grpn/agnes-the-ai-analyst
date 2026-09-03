@@ -28,10 +28,16 @@ PROMPT_IDS: tuple[str, ...] = ("X1", "P1", "P2", "T1", "T2", "A1", "L1", "N1", "
 ARMS: tuple[str, ...] = ("A0", "A1", "A2", "A3", "A4")
 
 #: Arms this harness can drive directly against a live API (A0: Anthropic;
-#: A4: Agnes). A1/A2/A3 run in external product UIs and are manual-transcript
-#: import only -- see scripts/eval/arms.py module docstring.
-API_DRIVEN_ARMS: tuple[str, ...] = ("A0", "A4")
-MANUAL_ARMS: tuple[str, ...] = ("A1", "A2", "A3")
+#: A3: Anthropic with the context pack as a prompt-cached system turn; A4:
+#: Agnes). A1/A2 run in external product UIs and are manual-transcript import
+#: only -- see scripts/eval/arms.py module docstring.
+API_DRIVEN_ARMS: tuple[str, ...] = ("A0", "A3", "A4")
+MANUAL_ARMS: tuple[str, ...] = ("A1", "A2")
+#: Arms `run_eval.py import-transcript` accepts. A3 appears here AND in
+#: API_DRIVEN_ARMS: the API is the preferred method (exact `usage` counts --
+#: token_methods.md: "Run via API where possible"), a hand-run transcript
+#: stays a valid fallback.
+TRANSCRIPT_IMPORT_ARMS: tuple[str, ...] = ("A1", "A2", "A3")
 
 RUNS_PER_PROMPT = 3
 

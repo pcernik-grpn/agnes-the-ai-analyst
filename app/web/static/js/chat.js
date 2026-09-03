@@ -240,7 +240,7 @@ function _resyncOpenSessionMeta() {
   if (!meta) return;
   if (meta.agent_id && !_currentAgentId) {
     _currentAgentId = meta.agent_id;
-    _syncAgentPicker();
+    _syncAgentIdentity();
   }
   if (meta.title && _sessionHasTurns) setThreadTitle(meta.title);
 }
@@ -584,7 +584,7 @@ function stripSourcesFence(markdown) {
   return out.trimEnd();
 }
 
-const _CLAIM_LABEL = { table: "table", metric: "metric", assumption: "assumes" };
+const _CLAIM_LABEL = { table: "table", metric: "metric", document: "document", assumption: "assumes" };
 
 /** Where an assumption came from, as the reader sees it.
  *
@@ -641,6 +641,15 @@ const _ASSUMPTION_ORIGIN_UNSTATED = {
  *  asked. `assumption` is free text about the analyst's own choices, with
  *  nothing to open, so it stays a plain label.
  *
+ *  `document` stays a label too, and for the opposite reason to an
+ *  assumption's: there IS a page, and the ref cannot name it. Document detail
+ *  is `/library/{slug}/f/{file_id}` — a collection slug and a file id, while
+ *  the prompt asks the agent for the filename or the fact-graph subject id it
+ *  actually saw. Neither resolves, and the rule #1974 established is that a
+ *  chip links where its ref identifies a page; a link built from a filename
+ *  would land on a guess. Giving these chips somewhere real to go means
+ *  teaching a surface to resolve a document by name, which is its own change.
+ *
  *  Built with encodeURIComponent, never string-pasted: the ref is model output
  *  and lands in a URL. */
 function _claimHref(claim) {
@@ -677,7 +686,12 @@ function _bubbleHasFigure(bubble) {
 //: five tables cited, "table" was read five times; the glyph says it in a
 //: fraction of the width, and the WORD survives in the chip's aria-label and
 //: tooltip, so nothing is lost to a screen reader.
-const _CLAIM_ICON = { table: "table", metric: "chart-line" };
+//:
+//: One glyph per checkable kind, pinned against the server's
+//: `VERIFIABLE_KINDS` by tests/test_chat_sources_ui.py. `assumption` has
+//: none on purpose — it is not a reference, and it wears an origin badge
+//: instead (see `_renderAssumptionChip`).
+const _CLAIM_ICON = { table: "table", metric: "chart-line", document: "file-text" };
 
 //: How many references the row shows before the rest fold behind "+N more".
 //: Four covers the overwhelming majority of answers outright — under it there
@@ -715,19 +729,28 @@ function _placeInTail(bubble, node, selector) {
   bubble.appendChild(node);
 }
 
-/** One `assumes …` chip: the kind label, the origin badge, the statement,
- *  and — when the answer gave one — the rationale on its own line. Never a
- *  link: an assumption names nothing to open (see _claimHref). */
+/** One assumption: the origin badge, the statement, and — when the answer
+ *  gave one — the rationale on its own line. Never a link: an assumption
+ *  names nothing to open (see _claimHref).
+ *
+ *  It is a ROW, not a pill. As a full-width chip (measured 681-811px at 43px
+ *  tall, mono, filled) five caveats outweighed the provenance above them,
+ *  which inverts what the tail is for. And it repeated exactly what the
+ *  sources row had already stopped doing (see
+ *  `test_the_sources_row_says_each_thing_once`): the word `assumes` on every
+ *  row — unstyled bare mono, that class carried no CSS rule at all — and the
+ *  `WHY` label on every row.
+ *
+ *  Both words are dropped from the FACE and neither leaves the chip: the row
+ *  is already labelled "Assumptions", and the category plus the origin ride
+ *  the accessible name, the same bargain `renderSourcesChips` struck when the
+ *  category became a glyph. */
 function _renderAssumptionChip(c) {
   const known = c.origin && Object.prototype.hasOwnProperty.call(_ASSUMPTION_ORIGIN, c.origin);
   const origin = known ? c.origin : "unstated";
   const copy = known ? _ASSUMPTION_ORIGIN[c.origin] : _ASSUMPTION_ORIGIN_UNSTATED;
   const chip = document.createElement("span");
   chip.className = `msg-source-chip is-neutral is-assumption is-origin-${origin}`;
-  const kind = document.createElement("span");
-  kind.className = "msg-source-kind";
-  kind.textContent = _CLAIM_LABEL.assumption;
-  chip.appendChild(kind);
   const badge = document.createElement("span");
   badge.className = `msg-source-origin is-origin-${origin}`;
   badge.textContent = copy.label;
@@ -740,13 +763,11 @@ function _renderAssumptionChip(c) {
   if (c.why) {
     const why = document.createElement("span");
     why.className = "msg-source-why";
-    const whyLabel = document.createElement("span");
-    whyLabel.className = "msg-source-why-label";
-    whyLabel.textContent = "why";
-    why.appendChild(whyLabel);
     why.appendChild(document.createTextNode(c.why));
     chip.appendChild(why);
   }
+  // What left the face must not leave the chip.
+  chip.setAttribute("aria-label", `${_CLAIM_LABEL.assumption} ${c.ref || ""}, ${copy.label}`);
   return chip;
 }
 
@@ -765,12 +786,19 @@ function renderSourcesChips(bubble, verdict) {
   // an ordinary answer. A greeting still gets nothing. (Devin Review.)
   if (!verdict.declared && claims.length === 0 && !_bubbleHasFigure(bubble)) return;
 
-  // Two rows, not one. A `table:` is something the answer READ; an
-  // `assumption:` is something it DECIDED. Filed together under one SOURCES
-  // label, six `assumes …` chips read as neither (TCRD-289) — and the
-  // "none declared" signal below is about provenance, so it is judged on
-  // the tables and metrics alone: an answer that named only assumptions
-  // has, truthfully, declared no source.
+  // Two rows, not one. A `table:`, `metric:` or `document:` is something the
+  // answer READ; an `assumption:` is something it DECIDED. Filed together
+  // under one SOURCES label, six `assumes …` chips read as neither
+  // (TCRD-289) — and the "none declared" signal below is about provenance,
+  // so it is judged on the references alone: an answer that named only
+  // assumptions has, truthfully, declared no source.
+  //
+  // Which makes this split load-bearing for every kind, not just today's
+  // three: it keys on "not an assumption" rather than on a list of
+  // reference kinds, so `document:` — added because the vocabulary having
+  // no word for a file is what pushed five PDF citations into the
+  // assumptions row, under a "none declared" that was counting only SQL —
+  // landed here without a line of its own.
   const provenance = claims.filter((c) => c.kind !== "assumption");
   const assumptions = claims.filter((c) => c.kind === "assumption");
 
@@ -858,14 +886,70 @@ function renderSourcesChips(bubble, verdict) {
   // badge and a rationale per assumption say strictly more than "Assumes: …"
   // could. It only joins the tail contract here (_placeInTail) so it cannot
   // land under the follow-ups when those arrive first.
+  //
+  // COLLAPSED by default, and the label is the control. An assumption is
+  // something you check when you doubt the number, not something you read on
+  // the way past it — expanded it was the tallest thing under the answer,
+  // which put the method caveats above the answer's own provenance in the
+  // reading order. The count is on the toggle so the row still says how much
+  // is behind it: collapsing a thing to nothing is how the "none declared"
+  // signal drifted in the first place.
   if (!assumptions.length) return;
   const arow = document.createElement("div");
-  arow.className = "msg-sources is-assumptions";
+  arow.className = "msg-sources is-assumptions is-collapsed";
+
+  const toggle = document.createElement("button");
+  toggle.type = "button";
+  toggle.className = "msg-assumptions-toggle";
+  toggle.setAttribute("aria-expanded", "false");
   const alabel = document.createElement("span");
   alabel.className = "msg-sources-label";
   alabel.textContent = "Assumptions";
-  arow.appendChild(alabel);
-  for (const c of assumptions) arow.appendChild(_renderAssumptionChip(c));
+  toggle.appendChild(alabel);
+  const acount = document.createElement("span");
+  acount.className = "msg-assumptions-count";
+  acount.textContent = String(assumptions.length);
+  toggle.appendChild(acount);
+
+  // `judgment` is the one origin the reader most needs to notice — the
+  // answer's own choice, with nothing in the question, the definitions or the
+  // data behind it. Hiding that behind a collapse would undo the point of
+  // TCRD-289, so it is summarised ON the closed toggle, the same way the
+  // provenance row summarises "N unverified" once instead of per chip.
+  const judged = assumptions.filter((c) => c.origin === "judgment").length;
+  if (judged) {
+    const flag = document.createElement("span");
+    flag.className = "msg-assumptions-judged";
+    flag.textContent = `${judged} on own judgment`;
+    flag.title = "Chosen by the answer itself — nothing in the question, the definitions or the data settles it.";
+    toggle.appendChild(flag);
+  }
+  const chev = document.createElement("span");
+  chev.className = "msg-assumptions-chevron";
+  chev.setAttribute("aria-hidden", "true");
+  chev.appendChild(iconEl("chevron-down"));
+  toggle.appendChild(chev);
+  arow.appendChild(toggle);
+
+  // A class of its own, NOT the provenance row's `msg-sources-list`. That
+  // class is `display: contents`, which cannot be hidden — an element that
+  // generates no box has no box to suppress — so borrowing it forced an
+  // author `display` override, and an author `display` outranks the UA
+  // stylesheet's `[hidden] { display: none }` on cascade ORIGIN. The row
+  // then opened expanded with `hidden` set and ignored. A plain div is
+  // block by default and `hidden` just works.
+  const alist = document.createElement("div");
+  alist.className = "msg-assumptions-list";
+  alist.hidden = true;
+  for (const c of assumptions) alist.appendChild(_renderAssumptionChip(c));
+  arow.appendChild(alist);
+
+  toggle.onclick = () => {
+    const open = toggle.getAttribute("aria-expanded") === "true";
+    toggle.setAttribute("aria-expanded", open ? "false" : "true");
+    alist.hidden = open;
+    arow.classList.toggle("is-collapsed", open);
+  };
   _placeInTail(bubble, arow, ".msg-sources.is-assumptions");
 }
 
@@ -1701,26 +1785,44 @@ function _syncSessionUrl(chatId) {
   }
 }
 
-// --- Composer agent picker ------------------------------------------------
+// --- Agents in the chat window --------------------------------------------
 // Which of the caller's agents a conversation runs AS. The runtime for this
 // has existed since the agent-as-API work (`POST /api/chat/sessions` takes an
 // `agent_slug`, and `chat_sessions.agent_id` has recorded the answer since
-// v101) — but the only door into it was the Chat button on an agent card, and
-// nothing in the chat window ever said who you were talking to.
+// v101). What was missing was never the plumbing — it was that the chat window
+// never SAID who you were talking to.
 //
-// An agent is bound at session CREATION: its scope, memory notebook, pinned
-// model and token budget are fixed for the life of the session. So this
-// control cannot re-target a conversation, and it does not pretend to —
-// choosing an agent starts a NEW session as that agent, and once a
-// conversation has turns the button goes disabled with a title that names the
-// way out. An EMPTY session is not a dead end though: picking a different
-// agent there just spawns another one, and `ChatManager.create_session`
-// already soft-archives the orphan (the same GC that keeps repeated "+ New
-// chat" clicks from littering the sidebar).
+// Two jobs, deliberately split, because a single control could not do both
+// honestly. An agent is bound at session CREATION: its scope, memory notebook,
+// pinned model and token budget are fixed for the life of the session, so
+// nothing can re-target a conversation in progress.
+//
+//   • CHOOSING  → #chat-agent-select, one small selector under the composer,
+//     empty state only. Picking starts a NEW session as that agent, which is
+//     the only thing that was ever possible. An empty session is not a dead
+//     end: starting another just spawns it, `newChat` releases the one being
+//     left, and `ChatManager.create_session` soft-archives the orphan (the
+//     same GC that keeps repeated "+ New chat" clicks from littering the
+//     sidebar).
+//   • SAYING WHO → the hero (#chat-agent-intro) before the first turn, and
+//     #chat-thread-agent for the life of the thread after it. Only for an
+//     agent the caller named; the default agent is the plain chat and carries
+//     no badge at all.
+//
+// Two shapes were tried and rejected before this one, and both failures are
+// worth keeping. A pill INSIDE the composer beside Send, labelled "Default":
+// it named the mechanism rather than an identity, and its position promised it
+// adjusted the message being composed when clicking it in fact abandoned that
+// session for a new one. Then a ROW OF CHIPS under the composer, one per
+// agent: right for three, wrong for fifteen — it grew with the list, wrapped
+// over the composer it was meant to sit under, and needed a cap and a "+11
+// more" link, which is a list apologising for being a list. A selector's
+// footprint does not depend on how many agents exist.
 
 /** Resolves when the /api/v1/agents fetch has settled (successfully or not).
  * `loadAndRenderHistory` awaits it before looking up an agent's greeting: the
- * `/chat?agent=<slug>` deep link and a picker click both open a session within
+ * `/chat?agent=<slug>` deep link and a pick from the selector both open a
+ * session within
  * the same tick as the fetch, and without this the greeting silently lost the
  * race about as often as it won it. */
 let _agentsLoaded = Promise.resolve();
@@ -1749,13 +1851,13 @@ let _sessionHasTurns = false;
  * exist: thread header, Copy transcript, composer pushed to the foot, and
  * the dashboard still sitting there underneath.
  *
- * The distinction the picker already drew is the right one everywhere — "has
- * this conversation started", not "does a session row exist" — so the header
- * is driven from here too, and a session with no turns keeps the empty-state
- * layout it had before the switch. */
+ * The distinction the agent code already drew is the right one everywhere —
+ * "has this conversation started", not "does a session row exist" — so the
+ * header is driven from here too, and a session with no turns keeps the
+ * empty-state layout it had before the switch. */
 function _markConversationStarted() {
   _sessionHasTurns = true;
-  _syncAgentPicker();
+  _syncAgentIdentity();
   const meta = _sessionsCache.find(s => s.id === currentChatId);
   setThreadTitle(meta && meta.title ? meta.title : "Untitled chat");
   // #1914: the moment a conversation has a turn is the moment it deserves a
@@ -1765,53 +1867,25 @@ function _markConversationStarted() {
   _syncSessionUrl(currentChatId);
 }
 
-/** The inverse: no turns, so the empty-state dashboard and the live picker,
- * and no thread chrome for a transcript that does not exist yet. */
+/** The inverse: no turns, so the empty-state dashboard and its selector, and
+ * no thread chrome for a transcript that does not exist yet. */
 function _markConversationNotStarted() {
   _sessionHasTurns = false;
-  _syncAgentPicker();
+  _syncAgentIdentity();
   setThreadTitle(null);
 }
 
-/** What to call an agent in the picker. The seeded default agent is named the
- * literal "Default" (`agents_repo().get_or_create_default`), which is a poor
- * answer to "who am I talking to?" — show the instance brand there instead.
- * A default the owner has since RENAMED keeps its own name. */
-/** How long a name may be before the pill abbreviates it. Sized to the widest
- *  name that fits the 9rem cap at the button's weight without ellipsis. */
-const AGENT_LABEL_MAX = 14;
-
-/** The FULL name, for the menu, the in-conversation label and the title
- *  attribute — everywhere there is room to say it.
+/** The name to show for an agent. User-authored, so every caller writes it
+ *  with textContent.
  *
- *  The default agent is "Default", not the brand. It used to render as "Agnes",
- *  which read more naturally on its own but was the odd one out once the caller
- *  had named agents of their own ("Agnes" beside "Delivery Health" looks like a
- *  different kind of thing), and it disagreed with the /agents page, where the
- *  same row is called Default. One name per agent, everywhere. */
-function _agentLabel(a, brand) {
-  if (!a) return brand;
-  if (a.is_default && (!a.name || a.name === "Default")) return "Default";
+ *  The seeded default agent is literally named "Default", which answers "who
+ *  am I talking to?" with the mechanism rather than an identity. Nothing
+ *  displays it any more — the default agent IS the plain chat, and the plain
+ *  chat says nothing about agents at all — so this only ever has to name the
+ *  ones a person built and named themselves. */
+function _agentLabel(a) {
+  if (!a) return "";
   return a.name || "Untitled agent";
-}
-
-/** The label as the PILL shows it: initials once a name is long enough to crowd
- *  the composer ("Finance Proposals" → "FP").
- *
- *  Initials, not an ellipsis, so the pill's width is stable across agents rather
- *  than growing to the cap — the trade is that two names sharing initials look
- *  alike in the pill. The full name is always one hover (title) or one click
- *  (the menu, which ticks the current row) away, and the in-conversation label
- *  spells it out, so nothing depends on reading the pill alone.
- *
- *  Single long word has no initials to take, so it falls back to the CSS
- *  ellipsis rather than rendering one lonely letter. */
-function _agentPillLabel(name) {
-  const full = String(name || "").trim();
-  if (full.length <= AGENT_LABEL_MAX) return full;
-  const words = full.split(/\s+/).filter(Boolean);
-  if (words.length < 2) return full;
-  return words.slice(0, 3).map(w => w[0].toUpperCase()).join("");
 }
 
 function _agentById(id) {
@@ -1822,75 +1896,177 @@ function _defaultAgent() {
   return _agentsCache.find(a => a.is_default) || null;
 }
 
-/** Which of the two agent elements is showing, and what it says.
+/** The agent this conversation runs as, IF it is one worth announcing.
  *
- * Before the first turn there is a real choice, so the picker button shows.
- * After it there is not — the agent is fixed at session creation — so the
- * button is swapped for a plain label. A disabled button was the first
- * version of this and it was worse in two ways: it still announced itself as
- * a button to assistive tech, and it still looked like something to click.
- *
- * The button keeps its server-rendered brand text as the fallback name, so a
- * failed /api/v1/agents fetch degrades to today's behaviour rather than a
- * blank pill. */
-function _syncAgentPicker() {
-  const btn = $("chat-agent-btn");
-  if (!btn) return;
-  const btnLabel = $("chat-agent-btn-label");
-  const staticLabel = $("chat-agent-label");
-  if (!btn.dataset.fallbackLabel) {
-    btn.dataset.fallbackLabel = btnLabel ? btnLabel.textContent : "Agnes";
-  }
-  const agent = _agentById(_currentAgentId) || _defaultAgent();
-  const name = _agentLabel(agent, btn.dataset.fallbackLabel);
-  const pill = _agentPillLabel(name);
-  if (btnLabel) btnLabel.textContent = pill;
-  // When the pill abbreviates, the title is the only place the full name shows
-  // on hover — so say it there rather than repeating the generic instruction.
-  btn.title = pill === name
-    ? "Choose which agent to chat with"
-    : `${name} — choose which agent to chat with`;
-  btn.hidden = _sessionHasTurns;
-  if (staticLabel) {
-    staticLabel.textContent = name;
-    staticLabel.title = `This conversation runs as ${name} — start a new chat to switch agent`;
-    staticLabel.hidden = !_sessionHasTurns;
-  }
-  if (_sessionHasTurns) _closeAgentMenu();
+ * Null for the default agent and null when the list has not loaded — both mean
+ * "show nothing", and they mean it for the same reason: the unmarked state is
+ * the plain chat, so an unknown agent degrades into it rather than into a
+ * half-populated banner. */
+function _namedAgentForSession() {
+  const a = _agentById(_currentAgentId);
+  if (!a || a.is_default) return null;
+  return a;
 }
 
-function _closeAgentMenu() {
-  const btn = $("chat-agent-btn");
-  const menu = $("chat-agent-menu");
+/** Say WHO this conversation is with — in the hero before it starts, and in
+ * the thread header once it has.
+ *
+ * This replaced a pill in the composer, and the placement is the whole fix.
+ * Arriving through an agent's own front door (its Chat button, or a starter
+ * chip) used to look identical to arriving at the general chat: the only
+ * evidence was a small control that read as a settings switch, so people came
+ * through the door and never saw that they had. Now the agent's name is the
+ * heading, in the slot the generic heading was using — same size, same place,
+ * more specific claim — and it follows the conversation into the header.
+ *
+ * The default agent gets NOTHING, in either state. Badging the ordinary case
+ * is how a badge stops being read. */
+function _syncAgentIdentity() {
+  const agent = _namedAgentForSession();
+  const name = _agentLabel(agent);
+
+  // 1. The hero, before the first turn. The whole block swaps: `has-agent-intro`
+  //    hides the greeting/heading/lede that would otherwise be making a
+  //    competing claim about what this page is for (rule in chat.css).
+  const intro = $("chat-agent-intro");
+  const aside = $("chat-capabilities");
+  if (intro) {
+    const nameEl = $("chat-agent-intro-name");
+    const roleEl = $("chat-agent-intro-role");
+    if (agent) {
+      if (nameEl) nameEl.textContent = name;
+      if (roleEl) {
+        // The agent's own role line when its owner wrote one. The fallback is
+        // deliberately about the ARRANGEMENT rather than the agent — anything
+        // that guessed at what this particular agent does would be inventing a
+        // description its owner declined to write.
+        roleEl.textContent = agent.role
+          || "One of your agents, with its own knowledge and permissions.";
+        roleEl.hidden = false;
+      }
+    }
+    intro.hidden = !agent;
+    if (aside) aside.classList.toggle("has-agent-intro", !!agent);
+  }
+
+  // The suggested questions go with it. They are INSTANCE-level prompts —
+  // "Who can see what?", "What are we missing definitions for?" — computed
+  // from what this deployment holds and offered to everyone; under a heading
+  // that just said "You're chatting with Delivery Health" they read as that
+  // agent's suggestions, which is a claim nothing behind them supports. An
+  // agent has no suggestions of its own to put here yet (there is no authored
+  // field for them on `agents`), so the honest state is none rather than four
+  // wrong ones. The class rides `.cloud-chat-main` because #chat-suggested is
+  // the intro panel's SIBLING, not its child.
+  const main = document.querySelector(".cloud-chat-main");
+  if (main) main.classList.toggle("has-agent-intro", !!agent);
+
+  // 2. The thread header, for the life of the conversation. The agent is bound
+  //    at session creation and cannot be re-pointed, so this is a fact about
+  //    the thread, which is exactly what the header is for.
+  // The selector's button states the current agent, so it follows the identity
+  // rather than being painted only at boot.
+  _syncAgentSelect();
+
+  const chip = $("chat-thread-agent");
+  if (chip) {
+    chip.textContent = name;
+    chip.title = agent
+      ? `This conversation runs as ${name} — start a new chat to talk to someone else`
+      : "";
+    chip.hidden = !agent;
+  }
+}
+
+/** The caller's named agents, most recently talked to first.
+ *
+ * Ranked by their own last conversation with each — read off the sidebar
+ * cache, which already carries `agent_id` and `last_message_at` — then the
+ * ones they have never chatted with, in the order the API returned. With
+ * fifteen agents the panel scrolls, so what it puts at the top is the whole
+ * question, and "the ones you were just talking to" beats both alphabetical
+ * and creation order. */
+function _rankedNamedAgents() {
+  const named = _agentsCache.filter(a => !a.is_default && a.slug);
+  const lastSeen = new Map();
+  for (const sess of _sessionsCache) {
+    if (!sess.agent_id) continue;
+    const at = sess.last_message_at || sess.started_at || "";
+    const prev = lastSeen.get(sess.agent_id);
+    if (prev === undefined || at > prev) lastSeen.set(sess.agent_id, at);
+  }
+  return named.slice().sort((a, b) => {
+    const av = lastSeen.get(a.id);
+    const bv = lastSeen.get(b.id);
+    if (av && bv) return av < bv ? 1 : av > bv ? -1 : 0;
+    if (av) return -1;
+    if (bv) return 1;
+    return 0;  // neither has been chatted with: keep the API's own order
+  });
+}
+
+/** Above this many rows the panel grows a filter. Below it, a search box over
+ *  five names is furniture. */
+const AGENT_FILTER_THRESHOLD = 8;
+
+/** Every agent the selector offers: the default first, under the instance's
+ * own name, then the named ones by recency.
+ *
+ * The default entry does NOT depend on its row existing. That row is seeded
+ * lazily — on the owner's first session as the default — so a caller whose
+ * sessions have all been with named agents has none, and building the entry
+ * from the cache alone would drop the way back in exactly the state that needs
+ * it. A slugless entry falls through to `newChat()` with no agent, the same
+ * request "+ New chat" makes, which seeds the row on its way through. */
+function _agentSelectRows() {
+  const wrap = $("chat-agent-select");
+  const brand = (wrap && wrap.dataset.brand) || "Agnes";
+  const dflt = _defaultAgent() || {is_default: true, id: null, slug: null};
+  return [{...dflt, _label: brand}].concat(
+    _rankedNamedAgents().map(a => ({...a, _label: _agentLabel(a)}))
+  );
+}
+
+function _closeAgentSelect() {
+  const btn = $("chat-agent-select-btn");
+  const menu = $("chat-agent-select-menu");
   if (!btn || !menu) return;
   menu.hidden = true;
   btn.classList.remove("is-open");
   btn.setAttribute("aria-expanded", "false");
 }
 
-function _renderAgentMenu() {
-  const menu = $("chat-agent-menu");
-  if (!menu) return;
-  menu.innerHTML = "";
-  if (!_agentsCache.length) {
-    const note = document.createElement("li");
-    note.className = "cloud-chat-agent-menu-note";
-    // No "build one on the Agents page" instruction any more: the create row
-    // below IS that path, so the note only has to state the fact.
-    note.textContent = "No agents yet.";
-    menu.appendChild(note);
+/** Paint the panel. `filter` is the caller's typing, matched against name and
+ * role — the role is what makes a name findable to someone who named an agent
+ * for its subject rather than its job. */
+function _renderAgentSelectMenu(filter) {
+  const list = $("chat-agent-select-list");
+  if (!list) return;
+  const q = (filter || "").trim().toLowerCase();
+  const rows = _agentSelectRows().filter(a => {
+    if (!q) return true;
+    return `${a._label} ${a.role || ""}`.toLowerCase().includes(q);
+  });
+  const currentId = (_namedAgentForSession() || {}).id || null;
+  list.innerHTML = "";
+  if (!rows.length) {
+    const none = document.createElement("li");
+    none.className = "cloud-chat-agent-select-empty";
+    none.textContent = "No agent matches that.";
+    list.appendChild(none);
+    return;
   }
-  const currentId = (_agentById(_currentAgentId) || _defaultAgent() || {}).id;
-  for (const a of (_agentsCache.length ? _agentsCache : [])) {
+  for (const a of rows) {
     const li = document.createElement("li");
-    li.className = "cloud-chat-agent-menu-item";
-    if (a.id === currentId) li.classList.add("is-current");
-    li.setAttribute("role", "menuitem");
+    li.className = "cloud-chat-agent-select-item";
+    li.setAttribute("role", "option");
     li.tabIndex = 0;
-    li.dataset.agentSlug = a.slug || "";
+    const isCurrent = a.is_default ? currentId === null : a.id === currentId;
+    li.setAttribute("aria-selected", isCurrent ? "true" : "false");
+    if (isCurrent) li.classList.add("is-current");
 
     const tick = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-    tick.setAttribute("class", "cloud-chat-agent-menu-item-tick");
+    tick.setAttribute("class", "cloud-chat-agent-select-tick");
     tick.setAttribute("viewBox", "0 0 24 24");
     tick.setAttribute("fill", "none");
     tick.setAttribute("aria-hidden", "true");
@@ -1903,32 +2079,33 @@ function _renderAgentMenu() {
     tick.appendChild(path);
     li.appendChild(tick);
 
-    // textContent throughout — agent name/role are user-authored strings and
-    // this menu is rebuilt from the API on every open.
+    // textContent throughout — name and role are user-authored, and this panel
+    // is rebuilt from the API on every open.
     const text = document.createElement("span");
-    text.className = "cloud-chat-agent-menu-item-text";
+    text.className = "cloud-chat-agent-select-item-text";
     const name = document.createElement("span");
-    name.className = "cloud-chat-agent-menu-item-label";
-    const btnEl = $("chat-agent-btn");
-    name.textContent = _agentLabel(a, (btnEl && btnEl.dataset.fallbackLabel) || "Agnes");
+    name.className = "cloud-chat-agent-select-item-name";
+    name.textContent = a._label;
     text.appendChild(name);
-    const hint = a.role || (a.is_default ? "Your default agent" : "");
+    const hint = a.is_default
+      ? `The general chat — delegates to your other agents`
+      : (a.role || "");
     if (hint) {
-      const hintEl = document.createElement("span");
-      hintEl.className = "cloud-chat-agent-menu-item-hint";
-      hintEl.textContent = hint;
-      text.appendChild(hintEl);
+      const role = document.createElement("span");
+      role.className = "cloud-chat-agent-select-item-role";
+      role.textContent = hint;
+      text.appendChild(role);
     }
     li.appendChild(text);
 
     const choose = () => {
-      _closeAgentMenu();
-      if (!a.slug) return;
-      hideCapabilities();
-      newChat(a.slug).catch((err) => {
+      _closeAgentSelect();
+      // `undefined`, not `null`: newChat only sets `agent_slug` on a truthy
+      // value, and the slugless default entry must post the plain create.
+      newChat(a.slug || undefined).catch((err) => {
         console.error("chat: could not start a session as agent", err);
         if (window.appToast) {
-          window.appToast({ kind: "error", msg: "Could not start a chat with that agent." });
+          window.appToast({ kind: "error", msg: _agentStartMessage(err) });
         }
       });
     };
@@ -1936,54 +2113,99 @@ function _renderAgentMenu() {
     li.addEventListener("keydown", (e) => {
       if (e.key === "Enter" || e.key === " ") { e.preventDefault(); choose(); }
     });
-    menu.appendChild(li);
+    list.appendChild(li);
   }
+}
 
-  /* …and one row that is not an agent: the way to make another.
-   *
-   * It belongs here because this menu is where the caller finds out their
-   * agents are not enough — you go looking for the one that answers this
-   * question, do not find it, and the next move should be in reach rather than
-   * back through the rail to /agents. Standard account-switcher shape: the set,
-   * then "add one".
-   *
-   * `?new=1` is the SAME path the Agents page's own "New agent" card takes
-   * (agents.html strips the param and calls createAgent, so the server mints
-   * the row) — not a second way to create an agent, just a second door to the
-   * one that exists. An <a>, so it is a real link: middle-click and
-   * open-in-new-tab work, and it needs no JS to function.
-   *
-   * Separated from the list by a rule, because it is a different KIND of row:
-   * every item above it switches this conversation, this one leaves the page. */
-  const create = document.createElement("li");
-  create.className = "cloud-chat-agent-menu-create";
-  create.setAttribute("role", "none");
-  const link = document.createElement("a");
-  link.href = "/agents?new=1";
-  link.setAttribute("role", "menuitem");
-  link.className = "cloud-chat-agent-menu-create-link";
-  const plus = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-  plus.setAttribute("class", "cloud-chat-agent-menu-create-ico");
-  plus.setAttribute("viewBox", "0 0 24 24");
-  plus.setAttribute("fill", "none");
-  plus.setAttribute("aria-hidden", "true");
-  const pp = document.createElementNS("http://www.w3.org/2000/svg", "path");
-  pp.setAttribute("d", "M12 5v14M5 12h14");
-  pp.setAttribute("stroke", "currentColor");
-  pp.setAttribute("stroke-width", "2");
-  pp.setAttribute("stroke-linecap", "round");
-  plus.appendChild(pp);
-  link.appendChild(plus);
-  const ctext = document.createElement("span");
-  ctext.textContent = "Create new agent";
-  link.appendChild(ctext);
-  create.appendChild(link);
-  menu.appendChild(create);
+/** The selector's own state: whether it shows at all, and what the button says.
+ *
+ * Hidden unless the caller has at least one agent they BUILT — a control whose
+ * only entry is the agent the composer already talks to cannot change
+ * anything, which is most instances on day one. */
+function _syncAgentSelect() {
+  const wrap = $("chat-agent-select");
+  const label = $("chat-agent-select-label");
+  if (!wrap || !label) return;
+  // Two or more agents, or no control. One entry is not a choice — and the one
+  // entry a caller with no agents of their own has is the default, which is
+  // what the composer directly above already talks to. Counted on the ROWS the
+  // panel would actually offer, so the rule reads the way it is stated rather
+  // than as a claim about a filtered list somewhere else.
+  wrap.hidden = _agentSelectRows().length < 2;
+  if (wrap.hidden) {
+    _closeAgentSelect();
+    return;
+  }
+  const brand = wrap.dataset.brand || "Agnes";
+  const current = _namedAgentForSession();
+  const name = current ? _agentLabel(current) : brand;
+  label.textContent = name;
+  const btn = $("chat-agent-select-btn");
+  if (btn) {
+    btn.title = current && current.role
+      ? `${current.role} — choose which agent to chat with`
+      : "Choose which agent to chat with";
+  }
+}
+
+/** Load the agent list, wire the selector, paint everything it feeds.
+ * Best-effort throughout: every failure path leaves the plain chat intact. */
+async function initAgentSelect() {
+  const btn = $("chat-agent-select-btn");
+  const menu = $("chat-agent-select-menu");
+  const filter = $("chat-agent-select-filter");
+  if (btn && menu) {
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      if (!menu.hidden) { _closeAgentSelect(); return; }
+      // Paint from cache first so the panel opens with no delay, then reconcile
+      // against the API — the DEFAULT agent's row is seeded lazily, so a
+      // boot-time fetch on a fresh account can legitimately have missed it.
+      const rowCount = _agentSelectRows().length;
+      if (filter) {
+        filter.value = "";
+        filter.hidden = rowCount <= AGENT_FILTER_THRESHOLD;
+      }
+      _renderAgentSelectMenu("");
+      menu.hidden = false;
+      btn.classList.add("is-open");
+      btn.setAttribute("aria-expanded", "true");
+      // Flip above the button when the panel would run past the fold. Measured
+      // rather than assumed: the control's distance to the bottom of the window
+      // depends on the empty state's height, which varies with the greeting,
+      // the suggestions and whether this instance has any data registered.
+      menu.classList.remove("is-up");
+      const room = window.innerHeight - btn.getBoundingClientRect().bottom;
+      if (menu.getBoundingClientRect().height + 12 > room) {
+        menu.classList.add("is-up");
+      }
+      if (filter && !filter.hidden) filter.focus();
+      _refreshAgents().then(() => {
+        if (!menu.hidden) _renderAgentSelectMenu(filter ? filter.value : "");
+        _syncAgentSelect();
+      });
+    });
+    if (filter) {
+      filter.addEventListener("input", () => _renderAgentSelectMenu(filter.value));
+      filter.addEventListener("click", (e) => e.stopPropagation());
+    }
+    document.addEventListener("click", (e) => {
+      if (menu.hidden) return;
+      if (!menu.contains(e.target) && !btn.contains(e.target)) _closeAgentSelect();
+    });
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && !menu.hidden) { _closeAgentSelect(); btn.focus(); }
+    });
+  }
+  _agentsLoaded = _refreshAgents();
+  await _agentsLoaded;
+  _syncAgentSelect();
+  _syncAgentIdentity();
 }
 
 /** (Re)fetch the caller's agents. Never throws: a list that cannot be loaded
- * leaves the composer exactly as it is today — brand label, no menu — because
- * failing to enumerate agents must not block chatting with the default one. */
+ * leaves the page exactly as it is without agents — no selector, no identity
+ * banner — because failing to enumerate agents must not block chatting. */
 async function _refreshAgents() {
   try {
     // Re-pointed from this page's own now-deleted /api/agents (Task C1.2) —
@@ -1991,67 +2213,71 @@ async function _refreshAgents() {
     const res = await api("/api/v1/agents");
     // Ready agents only — a draft is unfinished by its author's own say-so,
     // and offering one here invites a conversation with something half-built.
-    // The picker is the "who am I talking to" control, not the agent index;
-    // /agents is where drafts belong, beside the thing that finishes them.
     //
-    // `status`/`is_default` survive the move: v1's `_serialize` starts from
-    // `dict(row)`, so both columns pass through unchanged.
-    //
-    // `|| a.is_default` is a BACKSTOP, not the mechanism. The default agent
-    // is seeded `status: "ready"` and an older draft one is promoted on first
-    // touch (`AgentsRepository.get_or_create_default`), so it passes the
-    // status test on its own. This keeps it from being dropped in the window
-    // before that heal lands — a picker without the default is a one-way
-    // switch, the same dead end the on-open refresh exists to avoid.
+    // `|| a.is_default` is a BACKSTOP, not the mechanism. The default agent is
+    // seeded `status: "ready"` and an older draft one is promoted on first
+    // touch (`AgentsRepository.get_or_create_default`); this keeps it in the
+    // cache in the window before that heal lands, so `_namedAgentForSession`
+    // can still recognise a default session as the unmarked case.
     _agentsCache = (res.data || []).filter(
       a => a.mine && a.slug && (a.status === "ready" || a.is_default)
     );
   } catch (err) {
-    console.warn("chat: could not load agents for the picker", err);
+    console.warn("chat: could not load agents", err);
   }
 }
 
-/** Fetch the agent list and wire the button. Best-effort: any failure leaves
- * the composer exactly as it is today (brand label, no menu), because being
- * unable to LIST agents must not block chatting with the default one. */
-async function initAgentPicker() {
-  const btn = $("chat-agent-btn");
-  const menu = $("chat-agent-menu");
-  if (!btn || !menu) return;
-  btn.addEventListener("click", (e) => {
-    e.stopPropagation();
-    if (_sessionHasTurns) return;
-    if (menu.hidden) {
-      // Paint from cache first (no open-delay), then reconcile. The list goes
-      // stale in one ordinary way: the DEFAULT agent row is seeded lazily, on
-      // the owner's first session — so a boot-time fetch on a fresh account
-      // misses it, and without this refresh someone who switched to a named
-      // agent would have no way back to their default except "+ New chat".
-      _renderAgentMenu();
-      menu.hidden = false;
-      btn.classList.add("is-open");
-      btn.setAttribute("aria-expanded", "true");
-      _refreshAgents().then(() => {
-        if (!menu.hidden) _renderAgentMenu();
-        _syncAgentPicker();
-      });
-    } else {
-      _closeAgentMenu();
-    }
-  });
-  document.addEventListener("click", (e) => {
-    if (menu.hidden) return;
-    if (!menu.contains(e.target) && e.target !== btn) _closeAgentMenu();
-  });
-  document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape" && !menu.hidden) { _closeAgentMenu(); btn.focus(); }
-  });
-  _agentsLoaded = _refreshAgents();
-  await _agentsLoaded;
-  _syncAgentPicker();
+
+/** What to say when starting a chat as an agent fails.
+ *
+ * The generic "Could not start a chat with that agent" blamed the agent for
+ * the one failure that is really about the reader's own open conversations:
+ * the per-user concurrency cap answers 429, and the fix is theirs to make. */
+function _agentStartMessage(err) {
+  const msg = String((err && err.message) || "");
+  if (msg.includes("429")) {
+    return "Too many conversations open. Close one from the sidebar, then try again.";
+  }
+  return "Could not start a chat with that agent.";
+}
+
+/** Let go of the conversation we are leaving, IF there is nothing in it.
+ *
+ * A session becomes live the moment the browser attaches to it, and the
+ * per-user concurrency cap counts live sessions — so three abandoned empty
+ * ones are enough to make the NEXT create fail with 429. That is not
+ * hypothetical: starting a chat with an agent, changing your mind, and
+ * starting one with a different agent is three sessions in about four seconds,
+ * and the third click was refused with "Could not start a chat with that
+ * agent" — a message that blames the agent for a slot the reader is holding
+ * themselves.
+ *
+ * `create_session` already soft-archives a user's prior EMPTY web sessions,
+ * for the same reason ("+ New chat" clicked ten times used to leave ten
+ * 'Untitled chat' rows) — but it does that AFTER the cap check and only in the
+ * database, so the live session keeping the slot survives it. Archiving
+ * through the endpoint is what actually releases one: it kills the sandbox
+ * (`_kill_quietly`) and drops the row from the manager's live registry.
+ *
+ * Only ever an EMPTY session, and only the one we are leaving: a conversation
+ * with a single turn in it is somebody's work. Best-effort — a failure here
+ * must never be the reason a new chat cannot start, so the create runs either
+ * way and the cap simply behaves as it did before. */
+async function _releaseEmptyCurrentSession() {
+  if (!currentChatId || _sessionHasTurns) return;
+  const leaving = currentChatId;
+  try {
+    await api(`/api/chat/sessions/${leaving}/archived`, {
+      method: "PUT",
+      body: JSON.stringify({ archived: true }),
+    });
+  } catch (err) {
+    console.warn("chat: could not release the empty session being left", err);
+  }
 }
 
 async function newChat(agentSlug) {
+  await _releaseEmptyCurrentSession();
   const body = { surface: "web" };
   if (agentSlug) body.agent_slug = agentSlug;
   const created = await api("/api/chat/sessions", {
@@ -2299,8 +2525,8 @@ async function openSession(chatId, wsUrlOverride, { restoring = false } = {}) {
   // Are we ATTACHING to a different conversation, or re-opening this one? Not
   // the same thing: submitUserMessage -> ensureWsReady re-enters openSession
   // for the CURRENT session whenever the socket is closed, so treating every
-  // open as a fresh conversation re-enabled the agent picker one tick after
-  // the first message disabled it.
+  // open as a fresh conversation re-showed the empty-state hero one tick
+  // after the first message replaced it.
   const _switchingSession = currentChatId !== chatId;
   currentChatId = chatId;
   markActiveSidebar(chatId);
@@ -2322,8 +2548,8 @@ async function openSession(chatId, wsUrlOverride, { restoring = false } = {}) {
   // A titled session is necessarily one with turns (titles are derived from
   // the conversation), so it can raise its header right away, before history
   // hydrates. An UNTITLED one cannot be judged yet — it is equally a thread
-  // whose title never landed and a session created a moment ago by the agent
-  // picker — so the chrome waits for `loadAndRenderHistory` to say which.
+  // whose title never landed and a session created a moment ago by a starter
+  // chip — so the chrome waits for `loadAndRenderHistory` to say which.
   setThreadTitle(meta && meta.title ? meta.title : null);
   // Who this conversation runs as. Read from the sidebar row (agent_id is
   // projected by GET /api/chat/sessions) rather than a per-open round-trip;
@@ -2346,7 +2572,7 @@ async function openSession(chatId, wsUrlOverride, { restoring = false } = {}) {
   // restoring it a fetch later is what made a deep link look like a new chat
   // (the address bar lost the id before anything had failed).
   if (!restoring) _syncSessionUrl(_sessionHasTurns ? chatId : null);
-  _syncAgentPicker();
+  _syncAgentIdentity();
   if (!restoring) setStatus("");
 
   // Hydrate history. Show the capability/intro panel only when this
@@ -3847,8 +4073,10 @@ function appendToken(text) {
   clearThinkingPlaceholder();
   if (!currentAssistantArticle) {
     // Prose after a run of tool calls closes that run: the next card belongs
-    // to whatever the agent does AFTER this sentence, not before it.
-    _endToolGroup();
+    // to whatever the agent does AFTER this sentence, not before it. It also
+    // settles whether the run's failures were fatal — they were not, the
+    // agent is answering.
+    _endToolGroup("answered");
     currentAssistantArticle = createMessageShell({ role: "assistant" });
     currentAssistantArticle.classList.add("is-streaming");
     currentAssistantBody = currentAssistantArticle.querySelector(".msg-body");
@@ -3980,13 +4208,16 @@ function finalizeAssistantMessage(frame) {
 // route). Tabular results (`agnes catalog`, `agnes query`,
 // `agnes describe`) get a real <table>; markdown-ish strings render as
 // markdown; everything else is pretty-printed JSON. A FAILED call stays
-// collapsed like any other and puts its diagnosis on the header line, where
-// folding keeps it — auto-opening put the ARGS dump on screen instead (#1974).
+// collapsed like any other, with its diagnosis in the body one click away —
+// auto-opening put the ARGS dump on screen instead (#1974).
 //
 // Consecutive cards fold into one group; see "Tool-call groups" below.
 //
 // Status icons (Lucide sprite, see chat_icons.js): hourglass = running,
-// check = done, triangle-alert = error. The status class on the wrapper
+// check = done, circle-alert = error — a circle rather than the hazard
+// triangle it used to be, which was the loudest graphic in the set aimed at
+// the mildest thing in the transcript, a step the agent went on to fix. The
+// status class on the wrapper
 // tints the left border accordingly so a failed tool call is unmistakable
 // at a glance.
 
@@ -4127,6 +4358,7 @@ const _TOOL_LABELS = {
   // generic JSON/table fallback (see _renderFactClaimsPreview below).
   fact_search: "Searched the knowledge graph",
   fact_neighbors: "Walked related facts",
+  fact_edges: "Listed relationships",
   fact_claims: "Read the evidence",
   // Track C7 (@delegation MVP) — the in-sandbox SDK tool
   // `app/chat/runner.py::_delegation_mcp_server` exposes as
@@ -4600,7 +4832,7 @@ function _buildToolCard({ tool, args, status, state, result, isError }) {
   icon.className = "cloud-chat-tool-icon";
   icon.setAttribute("aria-hidden", "true");
   if (status === "running") icon.appendChild(iconEl("hourglass"));
-  else if (wrapIsError) icon.appendChild(iconEl("triangle-alert"));
+  else if (wrapIsError) icon.appendChild(iconEl("circle-alert"));
   else if (state === "output-available") icon.appendChild(iconEl("check"));
   if (icon.firstChild) head.appendChild(icon);
 
@@ -4632,9 +4864,14 @@ function _buildToolCard({ tool, args, status, state, result, isError }) {
   // beside every row of a six-step run is most of what made the trail feel
   // crowded. The args live in the body, one click away (see _argsPanels).
   //
-  // The element stays, because a FAILED call writes its diagnosis here
-  // (_setToolCardError): on an error the one thing worth a collapsed line is
-  // what went wrong, and that is the only thing this slot now ever holds.
+  // The element stays as the slot a future summary would use. It is empty on
+  // every card today, a failure included: #1974 put the error message here so
+  // that folding a failed card would not bury it, and that turned each failed
+  // row into a full line of red prose — two of them side by side read as
+  // identical, because the part that differs sits at the END of a fixed
+  // "Error executing tool query: 400 Bad Request — Query error:" prefix. The
+  // message was also printed TWICE the moment the card was opened, once here
+  // and once in the body below. The body is now the only place it lives.
   const summary = document.createElement("span");
   summary.className = "cloud-chat-tool-summary";
   head.appendChild(summary);
@@ -4656,12 +4893,6 @@ function _buildToolCard({ tool, args, status, state, result, isError }) {
   head.appendChild(chevron);
 
   wrap.appendChild(head);
-  // A replayed failure carries its diagnosis on the header, exactly as a live
-  // one does once its result lands (see renderToolCallEnd). AFTER the header is
-  // in the card: _setToolCardError finds the summary by querying `wrap`, so
-  // called any earlier it silently does nothing and a reloaded failure shows
-  // its args sketch where its error should be.
-  if (wrapIsError) _setToolCardError(wrap, result);
 
   // Args — visible the moment the card is expanded. The card header is the
   // one click now; the old nested args toggle inside a collapsed card was two
@@ -4682,42 +4913,6 @@ function _buildToolCard({ tool, args, status, state, result, isError }) {
     if (body) wrap.appendChild(body);
   }
   return wrap;
-}
-
-//: The header only has room for a line. The whole payload is one click away
-//: inside the card, so this is a lead, not a truncation of the record.
-const _TOOL_ERROR_LINE_CHARS = 160;
-
-/** The one-line diagnosis a failed card shows on its header, in place of the
- *  args sketch: the args are behind the expander, the error is the thing the
- *  reader needs at a glance.
- *
- *  Returns plain text and is ALWAYS written with `textContent`. An internal
- *  failure routinely names an internal endpoint ("400 Bad Request for
- *  http://localhost:8000/api/query"), and rendering that through markdown made
- *  the chat offer a localhost URL as a link to click (#1974). Nothing in an
- *  error string is improved by markdown, and one thing in it is made worse. */
-function _toolErrorLine(result) {
-  let text = _unwrapMcpEnvelope(result);
-  if (text && typeof text === "object") {
-    text = text.error || text.message || text.detail || text.errorText || JSON.stringify(text);
-  }
-  if (typeof text !== "string") text = text == null ? "" : String(text);
-  text = text.replace(/\s+/g, " ").trim();
-  if (!text) return "";
-  return text.length > _TOOL_ERROR_LINE_CHARS ? text.slice(0, _TOOL_ERROR_LINE_CHARS - 1) + "…" : text;
-}
-
-/** Put the diagnosis on a failed card's header line. No-op when the payload
- *  yields no text — the status icon and edge already say it failed. */
-function _setToolCardError(wrap, result) {
-  const line = _toolErrorLine(result);
-  if (!line) return;
-  const summary = wrap.querySelector(".cloud-chat-tool-summary");
-  if (!summary) return;
-  summary.classList.add("is-error");
-  summary.textContent = line;
-  summary.title = line;
 }
 
 // ---------- Tool-call groups ----------------------------------------------
@@ -4786,8 +4981,21 @@ function _updateToolGroupSummary(group) {
     else if (c.classList.contains("is-error")) failed++;
     else if (!c.classList.contains("is-done")) unknown++;
   }
+  // A run the agent answered after (see `_endToolGroup`) reports what the run
+  // DID, not what happened inside it. A research turn that self-corrects twice
+  // and lands the answer was headed "6 steps · 3 failed" under a red alert —
+  // the same mark a broken turn gets — so the trail said the turn had failed
+  // while the answer sat directly under it saying otherwise (#1974, and the
+  // feedback that reopened it). What changes is that the run stops being scored
+  // as the turn's outcome — the count goes with the alert, because "3 failed"
+  // set beside a tick and a finished answer states an intermediate as a
+  // result. The failures are not hidden: every card inside keeps its own mark,
+  // one click away. A run that NOTHING followed keeps both the alert and the
+  // count, because there the failures are exactly what the turn amounted to.
+  const recovered = group.dataset.recovered === "1" && running === 0;
   group.classList.toggle("is-running", running > 0);
-  group.classList.toggle("is-error", running === 0 && failed > 0);
+  group.classList.toggle("is-error", running === 0 && failed > 0 && !recovered);
+  group.classList.toggle("is-recovered", recovered && failed > 0);
   group.classList.toggle("is-done", running === 0 && failed === 0 && unknown === 0);
   const icon = group.querySelector(".cloud-chat-tool-group-icon");
   if (icon) {
@@ -4795,8 +5003,8 @@ function _updateToolGroupSummary(group) {
     // shows NO status icon rather than a tick it cannot evidence — the same
     // rule the individual card follows.
     if (running > 0) icon.replaceChildren(iconEl("hourglass"));
-    else if (failed > 0) icon.replaceChildren(iconEl("triangle-alert"));
-    else if (unknown === 0) icon.replaceChildren(iconEl("check"));
+    else if (failed > 0 && !recovered) icon.replaceChildren(iconEl("circle-alert"));
+    else if (unknown === 0 || recovered) icon.replaceChildren(iconEl("check"));
     else icon.replaceChildren();
   }
   const steps = `${n} step${n === 1 ? "" : "s"}`;
@@ -4825,7 +5033,7 @@ function _updateToolGroupSummary(group) {
     label.textContent = activeName ? activeName.textContent : `${group.open ? "Hide" : "Show"} ${steps}`;
   }
   const meta = group.querySelector(".cloud-chat-tool-group-meta");
-  if (meta) meta.textContent = running > 0 ? steps : failed > 0 ? `${failed} failed` : "";
+  if (meta) meta.textContent = running > 0 ? steps : failed > 0 && !recovered ? `${failed} failed` : "";
 }
 
 /** Put a tool card in the stream, folding it together with the card before it
@@ -4862,8 +5070,17 @@ function _appendToolCard(wrap) {
   _looseToolCard = wrap;
 }
 
-/** Close the open run. Anything appended after this starts a new one. */
-function _endToolGroup() {
+/** Close the open run. Anything appended after this starts a new one.
+ *
+ *  `reason` is "answered" when what closed the run is the agent's own prose.
+ *  That is the one fact separating "some steps failed and the turn went on"
+ *  from "the turn broke": a run the agent wrote an answer after is a run it
+ *  absorbed. See `_updateToolGroupSummary` for what the header does with it. */
+function _endToolGroup(reason) {
+  if (reason === "answered" && _currentToolGroup) {
+    _currentToolGroup.dataset.recovered = "1";
+    _updateToolGroupSummary(_currentToolGroup);
+  }
   _currentToolGroup = null;
   _looseToolCard = null;
 }
@@ -4874,13 +5091,19 @@ function _endToolGroup() {
 function _groupConsecutiveToolCards(nodes) {
   const out = [];
   let run = [];
-  const flush = () => {
+  //: What ENDED the run, on reload: a text bubble is an <article>, while a
+  //: system note, an approval and a question card are all divs. Same question
+  //: the live path answers with `_endToolGroup("answered")` — did the agent
+  //: go on to say something — asked of the node that terminated the run
+  //: instead of the token that would have opened it.
+  const flush = (endedBy) => {
     if (run.length < 2) {
       out.push(...run);
     } else {
       const group = _buildToolGroup();
       const body = group.querySelector(".cloud-chat-tool-group-body");
       for (const card of run) body.appendChild(card);
+      if (endedBy && endedBy.tagName === "ARTICLE") group.dataset.recovered = "1";
       _updateToolGroupSummary(group);
       out.push(group);
     }
@@ -4889,11 +5112,13 @@ function _groupConsecutiveToolCards(nodes) {
   for (const node of nodes) {
     if (node && node.classList && node.classList.contains("cloud-chat-tool")) run.push(node);
     else {
-      flush();
+      flush(node);
       out.push(node);
     }
   }
-  flush();
+  // Nothing followed the last run — the turn simply ended, which is not an
+  // answer. A run that failed here keeps its alert.
+  flush(null);
   return out;
 }
 
@@ -4912,6 +5137,13 @@ function renderToolCallStart(frame) {
   $("cancel-btn").hidden = false;
 }
 
+//: Where a duration stops being noise and starts being the reason the reader
+//: waited. Two seconds is under the point a person reports something as slow
+//: and well over the point they stop caring — a `query` against a warm local
+//: parquet lands in the low hundreds of ms, so the everyday call says nothing
+//: and a remote scan or a sandbox command says what it cost.
+const _TOOL_SLOW_MS = 2000;
+
 function renderToolCallEnd(frame) {
   const id = _toolCallId(frame);
   const wrap = inFlightToolCalls.get(id);
@@ -4928,25 +5160,32 @@ function renderToolCallEnd(frame) {
   const isError = typeof frame.is_error === "boolean" ? frame.is_error : _looksLikeToolError(result);
   wrap.classList.remove("is-running");
   wrap.classList.add(isError ? "is-error" : "is-done");
-  // A failed card stays COLLAPSED and puts its diagnosis on the header line
-  // instead (see _buildToolCard's note): the reader gets the error without a
-  // click, and the raw args stay behind the same expander as everywhere else.
-  if (isError) _setToolCardError(wrap, result);
+  // A failed card stays COLLAPSED, like every other. What marks it is the
+  // triangle and the danger edge; the message itself is in the body, behind
+  // the same expander as the args (see _buildToolCard's note).
   const icon = wrap.querySelector(".cloud-chat-tool-icon");
-  if (icon) icon.replaceChildren(iconEl(isError ? "triangle-alert" : "check"));
+  if (icon) icon.replaceChildren(iconEl(isError ? "circle-alert" : "check"));
 
-  // Timing meta — "running…" → "1.2s" if we tracked startedAt.
+  // Timing meta — "running…" → a duration, but ONLY a duration worth reading.
+  //
+  // A tool call's elapsed time is information entirely in its tail. "348ms"
+  // answers no question a reader of a chat transcript has: they are not tuning
+  // the agent, and every row carrying one turned the trail into a column of
+  // numbers nobody reads. "12.4s" answers a real one — why the turn took as
+  // long as it did, and which step to blame. So the number appears when it is
+  // the answer to that question and is dropped otherwise; the icon already
+  // says the call finished, which is what the sub-second case was reduced to
+  // saying twice.
+  //
+  // The element is REMOVED rather than blanked: it sits in a flex row with a
+  // gap, so an empty span still spends the gap and leaves the chevron floating
+  // away from the name.
   const meta = wrap.querySelector(".cloud-chat-tool-meta");
   if (meta) {
     const startedAt = parseFloat(wrap.dataset.startedAt || "");
-    if (Number.isFinite(startedAt)) {
-      const elapsedMs = performance.now() - startedAt;
-      meta.textContent = elapsedMs > 1000
-        ? `${(elapsedMs / 1000).toFixed(1)}s`
-        : `${Math.round(elapsedMs)}ms`;
-    } else {
-      meta.textContent = isError ? "failed" : "done";
-    }
+    const elapsedMs = Number.isFinite(startedAt) ? performance.now() - startedAt : NaN;
+    if (elapsedMs >= _TOOL_SLOW_MS) meta.textContent = `${(elapsedMs / 1000).toFixed(1)}s`;
+    else meta.remove();
   }
 
   // Result body — the new bit. Picks a preview shape based on the
@@ -4985,12 +5224,14 @@ function renderToolCallEnd(frame) {
  *  the finished answer. Each card's own <details> toggle still opens it
  *  back up on click.
  *
- *  A FAILED card folds with the rest now. It used to be exempt, because its
+ *  A FAILED card folds with the rest. It used to be exempt, because its
  *  output was the thing the reader needed and folding it put the diagnosis
- *  behind a click nobody knows to make — but the diagnosis is on the HEADER
- *  line since #1974, which is exactly the part folding keeps. Nothing is
- *  hidden by folding it that was visible before; what folds away is the args
- *  dump that came with it.
+ *  behind a click nobody knows to make. #1974 answered that by copying the
+ *  message onto the header line, which cost more than it bought: a wall of
+ *  red prose whose distinguishing half was past the ellipsis, printed twice
+ *  over on an open card. The message is in the body only, and what the
+ *  collapsed line carries is the triangle — the group header above it already
+ *  says how many steps failed, which is the count a reader scans for.
  *
  *  Runs fold too: the group is the compact form of the whole trail, so a
  *  settled turn is one line per run rather than one per call. */
@@ -5923,8 +6164,8 @@ async function submitUserMessage(text) {
   hideCapabilities();
   // The conversation is now under way, so the agent is settled for good: a
   // session's scope/memory/model/budget are fixed at creation and cannot be
-  // re-pointed mid-thread. Disabling here rather than at session creation is
-  // what keeps an empty "+ New chat" from dead-ending the picker.
+  // re-pointed mid-thread. Marking it here rather than at session creation is
+  // what keeps an empty "+ New chat" showing its selector.
   _markConversationStarted();
   const ta = $("chat-input");
   if (ta) {
@@ -5951,7 +6192,7 @@ async function submitUserMessage(text) {
     // Re-asserted for exactly the reason hideCapabilities() is, one line up.
     // For a brand-new chat this submit created the session itself, so
     // openSession saw a session id it had never opened and reset the turns
-    // flag — flipping the settled agent label back into a live picker
+    // flag — flipping the settled thread chrome back into the empty-state hero
     // mid-send. The session is new; the conversation is not.
     _markConversationStarted();
   } catch (err) {
@@ -5969,10 +6210,9 @@ async function submitUserMessage(text) {
     // Same reasoning for what was attached: the turn never started, so the
     // screenshot belongs to the retry, not to the void.
     ChatAttachments.restore(pendingAttachments);
-    // The turn never started, so nothing is settled — hand the picker back
-    // with the dashboard. Otherwise a chat backend that is down strands the
-    // reader on a label they cannot change and a conversation that never
-    // began.
+    // The turn never started, so nothing is settled — hand the empty state
+    // back with the dashboard. Otherwise a chat backend that is down strands
+    // the reader in thread chrome for a conversation that never began.
     _markConversationNotStarted();
     return;
   }
@@ -6128,8 +6368,7 @@ function autosizeComposer() {
 }
 
 // The composer also changes height for reasons no keystroke reports — the
-// window resizing under a wrapped line, the agent picker or an attachment row
-// appearing. Observing the form covers all of them with one rule instead of a
+// window resizing under a wrapped line, or an attachment row appearing. Observing the form covers all of them with one rule instead of a
 // call site per cause; the polyfill-free fallback is the autosize path above,
 // which already covers typing.
 if (typeof ResizeObserver === "function") {
@@ -8308,12 +8547,13 @@ const ChatAttachments = (() => {
   wireSuggestionButtons();
   wireCopyTranscript();
   autosizeComposer();
-  // Composer agent picker. Not awaited: the fetch behind it must never delay
-  // the composer becoming usable, and it degrades to the brand label on
-  // failure. Called BEFORE the deep-link restore below so `_agentsLoaded` is
-  // the real fetch by the time the restore awaits it (an empty session's
-  // greeting is read from it) rather than the resolved placeholder.
-  initAgentPicker();
+  // The agent selector + the "who you are talking to" identity. Not awaited: the
+  // fetch behind it must never delay the composer becoming usable, and every
+  // failure path leaves the plain chat exactly as it is. Called BEFORE the
+  // deep-link restore below so `_agentsLoaded` is the real fetch by the time
+  // the restore awaits it (an empty session's greeting is read from it) rather
+  // than the resolved placeholder.
+  initAgentSelect();
   // #1973: a `?session=` deep link (which is also what a refresh of an open
   // conversation is) starts restoring HERE — before the sidebar fetch, before
   // the dashboard wiring — so the pre-conversation hero never shows for a
@@ -8389,8 +8629,16 @@ const ChatAttachments = (() => {
     newChat(_agentSlug).catch((err) => {
       console.error("chat: could not start a session as agent", err);
       if (window.appToast) {
-        window.appToast({ kind: "error", msg: "Could not start a chat with that agent." });
+        window.appToast({ kind: "error", msg: _agentStartMessage(err) });
       }
+      // Put the page back. The dashboard was hidden one line up in anticipation
+      // of a conversation that never opened, and nothing else was going to
+      // restore it — so a stale link (a renamed or deleted agent, which answers
+      // 404, or the concurrency cap, which answers 429) left a BLANK chat page
+      // behind a toast that fades. Same posture as submitUserMessage's own
+      // failure path: nothing started, so hand back the state we came from.
+      showCapabilities();
+      _syncAgentIdentity();
     });
   }
   // Chat-driven onboarding — render the journey panel and prime the greeting/

@@ -48,7 +48,15 @@
      container. `.data-table` clips its own overflow (that is how it keeps its
      rounded corners), so the columns that lose are the last ones: the actions
      an admin came here to reach. */
-  #users-table { table-layout: fixed; }
+  /* And a FLOOR under it, for the same reason /admin/data-packages has one:
+     fixed layout divides whatever width it is given, so with nothing to stop
+     it a narrow window does not scroll — it crushes. Measured at a 900px
+     window: "DATA ACCESS" overlapping "LAST PULL", "DEACTIVATED" cut
+     mid-word, eight columns of ~70px each, no scrollbar anywhere because
+     nothing technically overflowed. Below this the wrap scrolls and the
+     Actions column is pinned, which is a table you can still read and still
+     act on. */
+  #users-table { table-layout: fixed; min-width: 1040px; }
 
   /* The Actions column header carries no visible word — the column is 56px of
      ⋯ buttons and a label would be wider than the column. It still has to say
@@ -472,7 +480,7 @@
        browser sizes from content, and one long Workspace group name pushes
        the outcome columns into two lines while Actions keeps 90px it has no
        use for. #}
-    <table class="data-table" id="users-table">
+    <table class="data-table data-table--pinned-actions" id="users-table">
       {# All eight in percent, summing to exactly 100. A px width mixed in here
          is not a small inconsistency: under `table-layout: fixed` it is ADDED
          to the percentages rather than taken out of them, so 100% + 56px

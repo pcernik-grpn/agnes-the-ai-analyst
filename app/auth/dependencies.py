@@ -304,6 +304,19 @@ def get_current_user(
     if is_local_dev_mode():
         user = _get_local_dev_user(conn)
         if user:
+            # The same principal swap the cookie path performs below, for the
+            # same reason. Dev mode authenticates from configuration rather
+            # than from a session cookie, so this branch returns before the
+            # one down there — and without the swap here the mode engages by
+            # HALVES: the banner renders and the read-only guard refuses
+            # writes (both read the ticket directly), while every
+            # authorization read still answers for the admin. A page that
+            # says "Viewing as X — read-only" while `is_admin` is still true
+            # is worse than the mode not working, because it looks like it
+            # does. Gated identically to the cookie path: `_maybe_view_as`
+            # returns None unless the ticket is in force for this exact
+            # caller, so nothing changes when no ticket is active.
+            user = _maybe_view_as(user, conn) or user
             _attach_admin_flag(user, conn)
             return _stash_user(request, user)
         # Fall through to normal auth if seed missing — surfaces the bug

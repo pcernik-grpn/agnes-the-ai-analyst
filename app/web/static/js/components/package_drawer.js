@@ -1176,6 +1176,9 @@
       slugTouched: mode === 'edit',
       groupsLoaded: false,
       grantsLoaded: false,
+      // Set once the admin clicks through the "not shared with anyone"
+      // warning (see submit()), so re-submitting after it doesn't ask twice.
+      skipShareWarning: false,
       grantsOriginal: new Map(),
       registry: [],
       tablesOriginal: new Set(),
@@ -1533,9 +1536,38 @@
       return;
     }
 
+    var grants = chosenGrants();
+    // A package with no grant is invisible everywhere an analyst (or an
+    // admin browsing as one, on /library) would look — /admin/data-packages
+    // and the package's own page still show it, but "created it, went to
+    // look, it's gone" is exactly the confusing, embarrassing report this
+    // heads-up exists to prevent. One click either way; `skipShareWarning`
+    // remembers a "create anyway" so re-submitting after it doesn't ask
+    // twice.
+    if (!grants.length && !(st && st.skipShareWarning)) {
+      var warnOpts = {
+        title: 'Not shared with anyone yet',
+        message: '“' + name + '” won’t appear in any analyst’s Library until it’s ' +
+          'granted to a group. Add one under Access, or create it now and share it later from the ' +
+          'package’s own page.',
+        confirmText: 'Create without sharing',
+        cancelText: 'Go back',
+        danger: false,
+      };
+      var ask = (typeof window.confirmModal === 'function')
+        ? window.confirmModal(warnOpts)
+        // Degrade rather than trap the admin on a page without modal.js.
+        : Promise.resolve(window.confirm(warnOpts.title + '\n\n' + warnOpts.message));
+      ask.then(function (ok) {
+        if (!ok) return;
+        if (st) st.skipShareWarning = true;
+        submit();
+      });
+      return;
+    }
+
     els.submit.disabled = true;
     els.submit.textContent = 'Creating…';
-    var grants = chosenGrants();
     // Snapshot both collected sets before the POST, for the same reason the
     // group picks are snapshotted: `st` belongs to the open drawer, and the
     // writes below happen after it has been told to close.

@@ -46,8 +46,20 @@ class TestElevationPausedGetsItsAction:
         assert "/me/profile" in markup, "no route to the control that fixes it"
 
     def test_the_action_is_gated_on_that_detail(self, markup):
-        """A generic 403 must not advertise an admin-only remedy."""
-        assert re.search(r"\{%\s*if .*admin_elevation_paused", markup), (
+        """A generic 403 must not advertise an admin-only remedy.
+
+        `elif` counts, which is the property rather than a loosening: the
+        requirement is that the affordance be conditional on the detail, not
+        that its branch be the FIRST one on the page. A live read-only
+        view-as now takes precedence, because the mode suppresses admin
+        authority through `elevation_paused` and so arrives here carrying
+        this very detail — telling that reader they had paused admin mode
+        was wrong, and offering them `/me/profile#admin-mode` was a dead end
+        (that page renders as the viewed identity, and the toggle is a POST
+        the read-only guard refuses). Matching only `{% if %}` pinned the
+        shape of the chain instead of the guarantee.
+        """
+        assert re.search(r"\{%\s*(?:el)?if .*admin_elevation_paused", markup), (
             "the re-enable affordance is not conditional on the detail"
         )
 
