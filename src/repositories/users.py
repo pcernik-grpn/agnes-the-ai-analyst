@@ -272,6 +272,15 @@ class UserRepository:
         bounded, server-filtered window instead of pulling every account to
         the client. ``EXISTS`` (not a JOIN) keeps the row set free of
         duplicates when a user holds the same group via multiple sources.
+
+        Also the SOLE "add someone to a group" picker in the product
+        (``group_drawer.js``'s new-group seeding and ``admin_access.html``'s
+        per-group member-add search both call ``GET /api/users?search=``) —
+        deliberately does NOT exclude ``kind='service'`` rows (issue #1534):
+        granting a service account its own scoped group membership is
+        exactly the point of the feature, on both the admin listing and the
+        picker. DuckDB has no ``kind`` column to filter on regardless
+        (frozen post-A3 schema).
         """
         clauses: List[str] = []
         params: List[Any] = []
@@ -479,3 +488,23 @@ class UserRepository:
             [user_id],
         )
         self.conn.execute("DELETE FROM users WHERE id = ?", [user_id])
+
+    # -----------------------------------------------------------------
+    # Service accounts (issue #1534) — PG-only (A3 ratchet). DuckDB's
+    # `users` table has no `kind` column at all (frozen post-A3 schema), so
+    # there is no sensible no-op the way `revoke_sessions` has one: "create
+    # an identity flagged with a column that does not exist" and "list rows
+    # by that column" both raise the typed error instead, which
+    # `app/main.py`'s app-wide handler turns into a clean 501 rather than an
+    # unhandled crash.
+    # -----------------------------------------------------------------
+
+    def create_service_account(self, id: str, email: str, name: str) -> None:
+        from src.repositories import RequiresPostgresBackend
+
+        raise RequiresPostgresBackend("service_accounts")
+
+    def list_service_accounts(self) -> List[Dict[str, Any]]:
+        from src.repositories import RequiresPostgresBackend
+
+        raise RequiresPostgresBackend("service_accounts")

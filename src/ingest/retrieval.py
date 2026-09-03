@@ -10,6 +10,18 @@ Brute-force keeps the door open for an indexed strategy (DuckDB
 RBAC is the caller's responsibility: pass only ``corpus_ids`` the caller may
 access. Empty ``corpus_ids`` → empty result (fail-closed) — never "search all".
 
+Scale bound (#2151)
+--------------------
+"Brute-force" above is unconditional only up to ``collections.
+search_max_chunks`` (default 25000) — a real cap, added after a corpus in
+the 100k+ chunk range turned "fetch every candidate's full text AND
+embedding" into a memory blowup. Under the cap this module's behavior is
+exactly what the paragraph above describes; over it, ``search_with_meta``
+narrows the candidate set server-side (a SQL-side lexical prefilter) rather
+than fetching everything, and the ``embedding`` column itself is never part
+of the initial fetch either way — see ``search_with_meta`` and
+``src.repositories.corpus_chunks.CorpusChunksRepository.list_for_corpora``.
+
 Scoring (#756 — tiny-corpus hybrid-search fix)
 -----------------------------------------------
 The naive "fraction of distinct query terms present" lexical score treats
@@ -43,6 +55,80 @@ from src.ingest.embeddings import embed_query, embedding_capability
 from src.repositories import corpus_chunks_repo, corpus_files_repo
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
+
+# #2151: how many of the LEXICALLY top-ranked candidates get a second-phase
+# embedding fetch + vector re-rank (search_with_meta). A generous buffer over
+# the largest allowed `k` (50, see app/api/collections.py) so a realistic
+# "dozens of files" deployment (the module's own design point) never
+# actually shrinks its candidate set — the shortlist covers it whole, and
+# search_with_meta's small-corpus behavior is provably identical to the
+# pre-#2151 unconditional fetch (see
+# tests/test_ingest_retrieval.py::test_search_with_meta_small_corpus_matches_search).
+# Only a corpus with more than 500 chunks that ALSO have zero lexical overlap
+# with the query can ever lose a genuinely vector-best candidate this way —
+# see search_with_meta's docstring for the accepted, documented trade-off.
+_VECTOR_SHORTLIST_SIZE = 500
+
+# Sentinel distinguishing "no q_vec argument given" (compute it via
+# embed_query, the original contract) from "q_vec=None" meaning "no vector is
+# available" (search_with_meta already tried and knows). A caller that
+# already spent one embed_query call must not pay for a second.
+_Q_VEC_UNSET = object()
+
+
+def _search_max_chunks() -> int:
+    """``collections.search_max_chunks`` (#2151) — lazy import to avoid a
+    module-load-time dependency from ``src.ingest`` on ``app.instance_config``
+    (both directions already exist elsewhere in this codebase, e.g.
+    ``src/search/unified.py``, but this module has never needed one until
+    now, so keep it deferred rather than adding a new top-level edge)."""
+    from app.instance_config import get_collections_search_max_chunks
+
+    return get_collections_search_max_chunks()
+
+
+class SearchQueryTooBroad(Exception):
+    """Raised when a corpus is over ``collections.search_max_chunks`` and the
+    query has no usable (non-stopword) term to build a SQL-side lexical
+    prefilter from — e.g. a bare stopword or punctuation-only query.
+
+    An unfiltered ``LIMIT cap`` fetch in that case would be arbitrary
+    (whichever rows the DB happens to return first) rather than a real
+    narrowing, so the caller is asked to narrow the question instead of
+    silently getting a poor-quality answer over a random slice of the
+    corpus. Carries ``cap``/``chunk_count`` so a caller can build an
+    actionable message without re-deriving them.
+    """
+
+    def __init__(self, *, cap: int, chunk_count: int) -> None:
+        self.cap = cap
+        self.chunk_count = chunk_count
+        super().__init__(
+            f"query has no usable term to search a {chunk_count}-chunk corpus "
+            f"(cap {cap}) — narrow the query or the collection"
+        )
+
+
+#: Shared between the 422 (no usable term at all) and the 200-with-
+#: `truncated: true` (usable terms, but still over cap) responses — both are
+#: the same underlying situation from the caller's point of view: this
+#: search spans more than the server will rank in one request.
+BROAD_CORPUS_HINT = (
+    "This search spans more chunks than a single query can safely rank — narrow it "
+    "with collection_id, or use a more specific (less common) query term."
+)
+
+
+def _usable_query_terms(query: str) -> List[str]:
+    """Query terms worth a SQL-side prefilter (#2151).
+
+    Stopwords (``_QUERY_STOP_TOKENS`` — already used by the filename-fallback
+    pass for the same "carries no discriminating power" reason) would make
+    an ILIKE-any-term prefilter degenerate to "everything" on a large
+    corpus, which is no narrowing at all — so they don't count as usable.
+    """
+    return sorted({t for t in _tokenize(query) if t not in _QUERY_STOP_TOKENS})
+
 
 # Confidence calibration (see module docstring point 4). Deliberately
 # conservative: issue #756 was filed because a 2-5 file corpus surfaced a
@@ -150,6 +236,7 @@ def rank_chunks(
     query: str,
     *,
     k: int = 10,
+    q_vec: Any = _Q_VEC_UNSET,
 ) -> tuple[List[tuple[float, Dict[str, Any]]], str]:
     """Score+rank a candidate chunk set (the #756 hybrid pipeline).
 
@@ -159,9 +246,18 @@ def rank_chunks(
     resolution — so both the server's ``search()`` and the offline
     ``src.search.local`` reader can share the exact same ranking behavior
     over their respective candidate sets.
+
+    ``q_vec`` (#2151) lets a caller that already computed the query's
+    embedding (``search_with_meta``'s two-phase shortlist needs it BEFORE
+    ranking, to decide whether a second DB round-trip for vectors is worth
+    making) pass it in instead of paying for a second ``embed_query`` call.
+    Omitting it (the default, every existing caller) preserves the original
+    contract exactly: compute it here via ``embed_query``, ``None`` when the
+    extra is absent or the encode failed.
     """
     q_terms = set(_tokenize(query))
-    q_vec: Optional[List[float]] = embed_query(query)  # None when extra absent
+    if q_vec is _Q_VEC_UNSET:
+        q_vec = embed_query(query)  # None when extra absent or encode failed
 
     # Raw, un-normalized components over the FULL candidate set (not just the
     # ones with a hit) — IDF needs the non-matching candidates to correctly
@@ -207,11 +303,60 @@ def rank_chunks(
 #: file it names. (Devin Review on #1267.)
 _QUERY_STOP_TOKENS = frozenset(
     {
-        "a", "about", "an", "and", "any", "are", "as", "at", "be", "by", "can", "do", "does", "file",
-        "find", "for", "from", "get", "give", "has", "have", "how", "i", "in", "is", "it", "its", "me",
-        "my", "of", "on", "or", "our", "please", "show", "tell", "that", "the", "their", "there",
-        "these", "this", "to", "was", "were", "what", "when", "where", "which", "who", "why", "with",
-        "you", "your",
+        "a",
+        "about",
+        "an",
+        "and",
+        "any",
+        "are",
+        "as",
+        "at",
+        "be",
+        "by",
+        "can",
+        "do",
+        "does",
+        "file",
+        "find",
+        "for",
+        "from",
+        "get",
+        "give",
+        "has",
+        "have",
+        "how",
+        "i",
+        "in",
+        "is",
+        "it",
+        "its",
+        "me",
+        "my",
+        "of",
+        "on",
+        "or",
+        "our",
+        "please",
+        "show",
+        "tell",
+        "that",
+        "the",
+        "their",
+        "there",
+        "these",
+        "this",
+        "to",
+        "was",
+        "were",
+        "what",
+        "when",
+        "where",
+        "which",
+        "who",
+        "why",
+        "with",
+        "you",
+        "your",
     }
 )
 
@@ -291,7 +436,6 @@ def _rank_by_filename(
     # list, get filtered out, and leave the file unfound. (Devin Review on
     # #1267.)
     return scored
-
 
 
 #: The name pass is skipped only when some passage explains the WHOLE
@@ -395,24 +539,101 @@ def apply_filename_fallback(
     return (name_hits + rest)[:k], confidence, filename_ids
 
 
-def search(
+def _lexical_shortlist_ids(chunks: List[Dict[str, Any]], query: str, *, limit: int) -> set:
+    """The ``limit`` highest-lexical-score chunk ids from ``chunks`` (#2151).
+
+    Used ONLY to decide which candidates are worth a second DB round-trip
+    for their embedding — reuses ``_lexical_scores`` (the exact primitive
+    ``rank_chunks`` itself uses for the lexical component) so the shortlist
+    reflects the SAME lexical judgment the final ranking makes, rather than
+    a cheaper approximation that could disagree with it. Ties broken the
+    same stable way ``rank_chunks`` breaks its own ties (score desc, chunk
+    id asc), so which chunks fall exactly on the cutoff is deterministic.
+
+    ``len(chunks) <= limit`` is the common case (a realistic "dozens of
+    files" deployment, or any corpus under the shortlist size) and returns
+    every id untouched — no lexical scoring needed to know that.
+    """
+    if len(chunks) <= limit:
+        return {ch.get("id") for ch in chunks}
+    q_terms = set(_tokenize(query))
+    scores = _lexical_scores(q_terms, [ch.get("text", "") for ch in chunks])
+    ranked = sorted(range(len(chunks)), key=lambda i: (-scores[i], str(chunks[i].get("id") or "")))
+    return {chunks[i].get("id") for i in ranked[:limit]}
+
+
+def search_with_meta(
     corpus_ids: List[str],
     query: str,
     *,
     k: int = 10,
-) -> List[Dict[str, Any]]:
-    """Return up to ``k`` ranked chunks from the given corpora, with citations.
+) -> Dict[str, Any]:
+    """``search()``'s full contract, including the candidate-set metadata
+    ``search()`` itself discards for backward compatibility.
 
-    Fail-closed: empty ``corpus_ids`` or blank query → ``[]``.
+    Returns ``{"results": [...], "truncated": bool, "cap": int | None}``.
+    ``truncated`` is True when the caller's accessible corpora together
+    exceed ``collections.search_max_chunks`` (#2151): a cheap ``COUNT``
+    precheck (``count_for_corpora``) decides this BEFORE any row fetch, and
+    when it fires, ``list_for_corpora`` runs with a SQL-side lexical
+    prefilter (this query's non-stopword terms, ``ILIKE`` any-term) plus
+    ``LIMIT cap`` instead of an unbounded fetch — an intentional,
+    conservative narrowing (see ``list_for_corpora``'s docstring for why a
+    substring prefilter can only ADD candidates the real ranker discards,
+    never wrongly drop a genuine match's chance of being scored). A query
+    with no usable (non-stopword) term to prefilter on over the cap raises
+    :class:`SearchQueryTooBroad` instead of ranking an arbitrary
+    ``LIMIT``-sized slice of the corpus. At or under the cap, this is a
+    complete no-op: no prefilter, no limit, identical to the pre-#2151
+    unconditional fetch.
+
+    Two-phase hybrid fetch (#2151): fetch candidates WITHOUT embeddings
+    (``corpus_chunks_repo().list_for_corpora`` no longer selects that
+    column at all — see its docstring), embed the query ONCE, and — only
+    when a real query vector came back — rank the (embedding-less)
+    candidates lexically to a shortlist of the ``_VECTOR_SHORTLIST_SIZE``
+    best, fetch embeddings for JUST that shortlist
+    (``list_embeddings_for_ids``), and re-rank the shortlist with vectors.
+    Fail-closed: empty ``corpus_ids`` or blank query → empty result.
+
+    Accepted approximation: a chunk with zero lexical overlap that would
+    have won on cosine similarity alone is invisible whenever the corpus
+    has more candidates than the shortlist size, because it never receives
+    an embedding fetch to be judged by. This never happens for a corpus
+    within the shortlist size (the common case this module targets — see
+    ``_VECTOR_SHORTLIST_SIZE``), and it also bounds
+    ``apply_filename_fallback``'s "does any passage explain the whole
+    question" check to the same reduced candidate set — consistent with,
+    not a separate risk from, the same trade-off. Over the cap, the SQL
+    prefilter narrows the pool further, in the same direction.
     """
     if not corpus_ids or not (query or "").strip():
-        return []
+        return {"results": [], "truncated": False, "cap": None}
 
-    chunks = corpus_chunks_repo().list_for_corpora(corpus_ids)
+    cap = _search_max_chunks()
+    chunk_count = corpus_chunks_repo().count_for_corpora(corpus_ids)
+    truncated = chunk_count > cap
+    query_terms: Optional[List[str]] = None
+    if truncated:
+        query_terms = _usable_query_terms(query)
+        if not query_terms:
+            raise SearchQueryTooBroad(cap=cap, chunk_count=chunk_count)
+
+    chunks = corpus_chunks_repo().list_for_corpora(
+        corpus_ids,
+        query_terms=query_terms,
+        limit=cap if truncated else None,
+    )
     if not chunks:
-        return []
+        return {"results": [], "truncated": truncated, "cap": cap if truncated else None}
 
-    top, confidence = rank_chunks(chunks, query, k=k)
+    q_vec = embed_query(query)  # None when the extra is absent or the encode failed
+    if q_vec is not None:
+        shortlist_ids = _lexical_shortlist_ids(chunks, query, limit=_VECTOR_SHORTLIST_SIZE)
+        embeddings = corpus_chunks_repo().list_embeddings_for_ids(list(shortlist_ids))
+        chunks = [dict(ch, embedding=embeddings.get(ch.get("id"))) for ch in chunks if ch.get("id") in shortlist_ids]
+
+    top, confidence = rank_chunks(chunks, query, k=k, q_vec=q_vec)
 
     # Resolve filenames for citations, one file at a time and cached — a
     # normal search cites at most `k` of them. The bulk listing below is
@@ -470,4 +691,24 @@ def search(
                 "matched_on": "filename" if ch.get("id") in filename_ids else "body",
             }
         )
-    return results
+    return {"results": results, "truncated": truncated, "cap": cap if truncated else None}
+
+
+def search(
+    corpus_ids: List[str],
+    query: str,
+    *,
+    k: int = 10,
+) -> List[Dict[str, Any]]:
+    """Return up to ``k`` ranked chunks from the given corpora, with citations.
+
+    Fail-closed: empty ``corpus_ids`` or blank query → ``[]``. Thin wrapper
+    over :func:`search_with_meta` — kept for the many existing callers
+    (``src.search.unified``, the offline ``src.search.local`` reader's
+    sibling, ``scripts/bench_retrieval.py``, and most of this module's own
+    tests) that only ever wanted the ranked list, never the candidate-set
+    truncation metadata. A caller that DOES need to know whether the
+    candidate set was capped (``app.api.collections``,
+    ``app.api.knowledge_search``) calls :func:`search_with_meta` directly.
+    """
+    return search_with_meta(corpus_ids, query, k=k)["results"]

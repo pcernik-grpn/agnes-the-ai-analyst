@@ -75,6 +75,14 @@ class UserGroupMembersPgRepository:
         source: str,
         added_by: Optional[str] = None,
     ) -> None:
+        """Insert a membership row (mirrors the DuckDB sibling exactly).
+
+        Raises ``src.service_accounts.ServiceAccountAdminGroupForbidden``
+        when ``group_id`` is the system Admin group and ``user_id`` names a
+        ``kind='service'`` row (issue #1534) — see
+        :meth:`_refuse_if_service_account_targets_admin_group`.
+        """
+        self._refuse_if_service_account_targets_admin_group(user_id, group_id)
         with self._engine.begin() as conn:
             conn.execute(
                 sa.text(
@@ -85,6 +93,23 @@ class UserGroupMembersPgRepository:
                 ),
                 {"u": user_id, "g": group_id, "s": source, "b": added_by},
             )
+
+    def _refuse_if_service_account_targets_admin_group(self, user_id: str, group_id: str) -> None:
+        """Guard 2 (issue #1534) — see the DuckDB sibling's docstring for the
+        full rationale (one shared choke point inside ``add_member`` rather
+        than N call-site checks). Live on this backend: ``users.kind`` is a
+        real PG-only column, so this is where a service account actually
+        gets refused."""
+        from src.db import SYSTEM_ADMIN_GROUP
+        from src.service_accounts import ServiceAccountAdminGroupForbidden, is_service_account
+
+        with self._engine.connect() as conn:
+            group_row = conn.execute(sa.text("SELECT name FROM user_groups WHERE id = :g"), {"g": group_id}).first()
+            if not group_row or group_row[0] != SYSTEM_ADMIN_GROUP:
+                return
+            user_row = conn.execute(sa.text("SELECT * FROM users WHERE id = :u"), {"u": user_id}).mappings().first()
+        if user_row and is_service_account(dict(user_row)):
+            raise ServiceAccountAdminGroupForbidden(user_id)
 
     def remove_member(
         self,

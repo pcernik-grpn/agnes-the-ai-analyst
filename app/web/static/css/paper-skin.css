@@ -396,9 +396,17 @@
     border-color: var(--ds-border-light);
 }
 
-/* ── Toasts — dark pill, bottom-center (prototype confirmation) ─ */
+/* ── Toasts ───────────────────────────────────────────────────────────
+   The pill radius that used to live here was right for the one-line
+   confirmation the prototype showed ("Saved.") and wrong for everything
+   else: a toast now carries a full sentence (a rate limit, a refused
+   upload), and a fully-round radius on a wrapped two-line block reads as a
+   lozenge with the text crammed into it. Pill stays the BADGE language, per
+   the design-system note on `--ds-radius-pill` — it was never meant for a
+   container that wraps. The toast takes the same radius as the rest of the
+   shared `.notice` it is now built from. */
 [data-theme="paper"] .toast {
-    border-radius: var(--ds-radius-pill);
+    border-radius: var(--radius-lg);
 }
 
 /* ── Detail pages ─────────────────────────────────────────────────────
