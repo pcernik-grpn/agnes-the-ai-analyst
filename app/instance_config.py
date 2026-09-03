@@ -1978,6 +1978,36 @@ def get_llm_usage_retention_days() -> int:
         return 0
 
 
+def get_collections_search_max_chunks() -> int:
+    """Server-side cap on how many chunks ``GET /api/collections/search`` (and
+    the ``/api/knowledge/search`` chunk leg) may rank per request (#2151).
+
+    Reads ``collections.search_max_chunks``. Default **25000** — the point
+    ``scripts/bench_retrieval.py`` measured at ~371 MB peak RSS per query
+    (with production-sized, 3200-char chunks it is a conservative upper
+    bound, not a floor: the bench used 4x-smaller synthetic chunks), which
+    leaves comfortable headroom under the API container's default 4 GiB
+    ``mem_limit`` (``docker-compose.yml``) even with a few concurrent
+    searches in flight. The next bench point (240k chunks, ~1.8 GB) is close
+    to half that budget for a SINGLE query and is exactly the blowup this
+    cap exists to prevent.
+
+    A corpus at or under the cap is unaffected (no prefilter, identical
+    results to before). Over it, the repository applies a SQL-side lexical
+    prefilter + ``LIMIT`` instead of fetching every row — see
+    ``src.ingest.retrieval.search_with_meta``. Unlike the retention knobs
+    above, ``0`` has no special "unlimited" meaning here (an unbounded cap is
+    the exact risk this knob exists to bound), so a non-positive configured
+    value clamps to ``1`` rather than being honored, and a non-numeric value
+    falls back to the default.
+    """
+    val = get_value("collections", "search_max_chunks", default=25000)
+    try:
+        return max(1, int(val))
+    except (TypeError, ValueError):
+        return 25000
+
+
 def get_agent_scope_snapshots_retention_days() -> int:
     """How many days to keep ``agent_scope_snapshots`` rows before the
     daily ``retention-prune`` scheduler job deletes them.

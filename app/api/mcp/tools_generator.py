@@ -17,6 +17,7 @@ import logging
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 
 from connectors.mcp.client import call_tool_async
 from src.repositories import mcp_sources_repo, tool_registry_repo
@@ -243,6 +244,28 @@ def _make_passthrough_callable(
     return fn
 
 
+def passthrough_annotations(mutating: Any) -> ToolAnnotations:
+    """Behaviour hints for one passthrough tool, derived from ``tool_registry.mutating``.
+
+    An MCP client that auto-approves read-only calls keys on
+    ``annotations.readOnlyHint`` — the kai-agent engine's sandbox does exactly
+    that, and raises a ``tool-approval-request`` for every tool without it
+    (issue #2161: every passthrough search tool asked for approval on every
+    call, because the passthrough registration carried no annotations at all
+    while the foundation tools get theirs from ``@tool(read_only=…)``).
+
+    ``mutating`` is the admin's recorded decision for the row (the Keboola
+    chat-tools provisioning copies it from the upstream's own ``readOnlyHint``,
+    recording an unannotated tool as mutating), so the hint follows the same
+    flag the passthrough policy gate already enforces: a read-only row runs
+    unasked, a mutating one keeps asking. Shared by the Streamable-HTTP/SSE
+    servers here and the stdio mirror in ``cli/mcp/_dynamic_passthrough.py``,
+    so the two surfaces cannot drift.
+    """
+    is_mutating = bool(mutating)
+    return ToolAnnotations(readOnlyHint=not is_mutating, destructiveHint=is_mutating)
+
+
 def register_passthrough_tools(
     mcp_instance: FastMCP,
     caller_id_fn: Optional[Callable[[], Optional[str]]] = None,
@@ -283,7 +306,12 @@ def register_passthrough_tools(
         description = tool.get("description") or f"Passthrough to {source['name']}.{tool['original_name']}"
 
         try:
-            mcp_instance.add_tool(fn, name=tool["exposed_name"], description=description)
+            mcp_instance.add_tool(
+                fn,
+                name=tool["exposed_name"],
+                description=description,
+                annotations=passthrough_annotations(tool.get("mutating")),
+            )
         except Exception:
             logger.exception("failed to register passthrough tool %s", tool["exposed_name"])
             continue
@@ -357,7 +385,9 @@ def install_grant_filtered_list_tools(
     ``tool_grants`` (invocation is already gated by ``enforce_passthrough_policy``;
     this closes the *visibility* gap so the SSE / Streamable listing matches the
     REST ``_visible_passthrough_tools`` intersection). Foundation tools are
-    never passthrough-mode, so they always remain visible.
+    never passthrough-mode, so they remain visible — except the ones whose
+    feature switch is off on this instance (``feature_hidden_tool_names``),
+    which would only 404.
 
     The passthrough universe is fixed at install time — pass ``passthrough_names``
     (the ``register_passthrough_tools`` return value) so we don't re-query the
@@ -387,6 +417,20 @@ def install_grant_filtered_list_tools(
 
     async def _filtered_list_tools():
         all_tools = await base_list_tools()
+        # Foundation tools whose feature switch is off on this instance are
+        # hidden too (issue #2161: `fact_search` was offered — and its own
+        # description told the agent to call it first — while every call
+        # 404'd with `facts_disabled`). Evaluated per listing so a switch
+        # flipped in the server-config overlay takes effect without a restart.
+        try:
+            from app.api.mcp.foundation_tools import feature_hidden_tool_names
+
+            hidden = feature_hidden_tool_names()
+        except Exception:
+            logger.exception("feature-gated tools/list filtering failed; listing every foundation tool")
+            hidden = frozenset()
+        if hidden:
+            all_tools = [t for t in all_tools if t.name not in hidden]
         if not universe:
             return all_tools
         try:
