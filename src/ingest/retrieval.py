@@ -63,6 +63,61 @@ _VECTOR_SHORTLIST_SIZE = 500
 # already spent one embed_query call must not pay for a second.
 _Q_VEC_UNSET = object()
 
+
+def _search_max_chunks() -> int:
+    """``collections.search_max_chunks`` (#2151) — lazy import to avoid a
+    module-load-time dependency from ``src.ingest`` on ``app.instance_config``
+    (both directions already exist elsewhere in this codebase, e.g.
+    ``src/search/unified.py``, but this module has never needed one until
+    now, so keep it deferred rather than adding a new top-level edge)."""
+    from app.instance_config import get_collections_search_max_chunks
+
+    return get_collections_search_max_chunks()
+
+
+class SearchQueryTooBroad(Exception):
+    """Raised when a corpus is over ``collections.search_max_chunks`` and the
+    query has no usable (non-stopword) term to build a SQL-side lexical
+    prefilter from — e.g. a bare stopword or punctuation-only query.
+
+    An unfiltered ``LIMIT cap`` fetch in that case would be arbitrary
+    (whichever rows the DB happens to return first) rather than a real
+    narrowing, so the caller is asked to narrow the question instead of
+    silently getting a poor-quality answer over a random slice of the
+    corpus. Carries ``cap``/``chunk_count`` so a caller can build an
+    actionable message without re-deriving them.
+    """
+
+    def __init__(self, *, cap: int, chunk_count: int) -> None:
+        self.cap = cap
+        self.chunk_count = chunk_count
+        super().__init__(
+            f"query has no usable term to search a {chunk_count}-chunk corpus "
+            f"(cap {cap}) — narrow the query or the collection"
+        )
+
+
+#: Shared between the 422 (no usable term at all) and the 200-with-
+#: `truncated: true` (usable terms, but still over cap) responses — both are
+#: the same underlying situation from the caller's point of view: this
+#: search spans more than the server will rank in one request.
+BROAD_CORPUS_HINT = (
+    "This search spans more chunks than a single query can safely rank — narrow it "
+    "with collection_id, or use a more specific (less common) query term."
+)
+
+
+def _usable_query_terms(query: str) -> List[str]:
+    """Query terms worth a SQL-side prefilter (#2151).
+
+    Stopwords (``_QUERY_STOP_TOKENS`` — already used by the filename-fallback
+    pass for the same "carries no discriminating power" reason) would make
+    an ILIKE-any-term prefilter degenerate to "everything" on a large
+    corpus, which is no narrowing at all — so they don't count as usable.
+    """
+    return sorted({t for t in _tokenize(query) if t not in _QUERY_STOP_TOKENS})
+
+
 # Confidence calibration (see module docstring point 4). Deliberately
 # conservative: issue #756 was filed because a 2-5 file corpus surfaced a
 # wrong top match at what read as full confidence.
@@ -504,10 +559,21 @@ def search_with_meta(
     """``search()``'s full contract, including the candidate-set metadata
     ``search()`` itself discards for backward compatibility.
 
-    Returns ``{"results": [...], "truncated": bool, "cap": int | None}`` —
-    ``truncated`` and ``cap`` are reserved for a corpus over the server's
-    chunk cap (wired up alongside ``collections.search_max_chunks``); this
-    function alone never sets ``truncated`` True yet.
+    Returns ``{"results": [...], "truncated": bool, "cap": int | None}``.
+    ``truncated`` is True when the caller's accessible corpora together
+    exceed ``collections.search_max_chunks`` (#2151): a cheap ``COUNT``
+    precheck (``count_for_corpora``) decides this BEFORE any row fetch, and
+    when it fires, ``list_for_corpora`` runs with a SQL-side lexical
+    prefilter (this query's non-stopword terms, ``ILIKE`` any-term) plus
+    ``LIMIT cap`` instead of an unbounded fetch — an intentional,
+    conservative narrowing (see ``list_for_corpora``'s docstring for why a
+    substring prefilter can only ADD candidates the real ranker discards,
+    never wrongly drop a genuine match's chance of being scored). A query
+    with no usable (non-stopword) term to prefilter on over the cap raises
+    :class:`SearchQueryTooBroad` instead of ranking an arbitrary
+    ``LIMIT``-sized slice of the corpus. At or under the cap, this is a
+    complete no-op: no prefilter, no limit, identical to the pre-#2151
+    unconditional fetch.
 
     Two-phase hybrid fetch (#2151): fetch candidates WITHOUT embeddings
     (``corpus_chunks_repo().list_for_corpora`` no longer selects that
@@ -526,14 +592,28 @@ def search_with_meta(
     ``_VECTOR_SHORTLIST_SIZE``), and it also bounds
     ``apply_filename_fallback``'s "does any passage explain the whole
     question" check to the same reduced candidate set — consistent with,
-    not a separate risk from, the same trade-off.
+    not a separate risk from, the same trade-off. Over the cap, the SQL
+    prefilter narrows the pool further, in the same direction.
     """
     if not corpus_ids or not (query or "").strip():
         return {"results": [], "truncated": False, "cap": None}
 
-    chunks = corpus_chunks_repo().list_for_corpora(corpus_ids)
+    cap = _search_max_chunks()
+    chunk_count = corpus_chunks_repo().count_for_corpora(corpus_ids)
+    truncated = chunk_count > cap
+    query_terms: Optional[List[str]] = None
+    if truncated:
+        query_terms = _usable_query_terms(query)
+        if not query_terms:
+            raise SearchQueryTooBroad(cap=cap, chunk_count=chunk_count)
+
+    chunks = corpus_chunks_repo().list_for_corpora(
+        corpus_ids,
+        query_terms=query_terms,
+        limit=cap if truncated else None,
+    )
     if not chunks:
-        return {"results": [], "truncated": False, "cap": None}
+        return {"results": [], "truncated": truncated, "cap": cap if truncated else None}
 
     q_vec = embed_query(query)  # None when the extra is absent or the encode failed
     if q_vec is not None:
@@ -599,7 +679,7 @@ def search_with_meta(
                 "matched_on": "filename" if ch.get("id") in filename_ids else "body",
             }
         )
-    return {"results": results, "truncated": False, "cap": None}
+    return {"results": results, "truncated": truncated, "cap": cap if truncated else None}
 
 
 def search(

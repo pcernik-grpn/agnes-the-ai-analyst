@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 
 def _seed(slug: str, chunks: list[dict]) -> str:
     from src.repositories import corpus_chunks_repo, corpus_files_repo, file_corpora_repo
@@ -298,3 +300,73 @@ def test_search_with_meta_small_corpus_matches_search(e2e_env):
         ],
     )
     assert search_with_meta([cid], "brown fox")["results"] == search([cid], "brown fox")
+
+
+# ---------------------------------------------------------------------------
+# #2151: collections.search_max_chunks cap — over-cap corpora get a SQL-side
+# lexical prefilter + truncated:true instead of an unbounded fetch; a query
+# with no usable term over the cap is refused (SearchQueryTooBroad).
+# ---------------------------------------------------------------------------
+
+
+def test_search_with_meta_under_cap_is_not_truncated(e2e_env, monkeypatch):
+    import src.ingest.retrieval as retrieval
+
+    monkeypatch.setattr(retrieval, "_search_max_chunks", lambda: 10)
+    cid = _seed("rs-cap-under", [{"ordinal": i, "text": "kubernetes cluster guide"} for i in range(3)])
+    meta = retrieval.search_with_meta([cid], "kubernetes")
+    assert meta["truncated"] is False
+    assert meta["cap"] is None
+
+
+def test_search_with_meta_over_cap_is_truncated_and_prefiltered(e2e_env, monkeypatch):
+    import src.ingest.retrieval as retrieval
+
+    monkeypatch.setattr(retrieval, "_search_max_chunks", lambda: 2)
+    cid = _seed(
+        "rs-cap-over",
+        [
+            {"ordinal": 0, "text": "kubernetes cluster guide"},
+            {"ordinal": 1, "text": "totally unrelated weather report"},
+            {"ordinal": 2, "text": "another unrelated row about nothing"},
+        ],
+    )
+    meta = retrieval.search_with_meta([cid], "kubernetes")
+    assert meta["truncated"] is True
+    assert meta["cap"] == 2
+    assert meta["results"]
+    assert meta["results"][0]["text"] == "kubernetes cluster guide"
+
+
+def test_search_with_meta_over_cap_stopword_only_query_raises(e2e_env, monkeypatch):
+    import src.ingest.retrieval as retrieval
+
+    monkeypatch.setattr(retrieval, "_search_max_chunks", lambda: 1)
+    cid = _seed(
+        "rs-cap-broad",
+        [
+            {"ordinal": 0, "text": "kubernetes cluster guide"},
+            {"ordinal": 1, "text": "totally unrelated weather report"},
+        ],
+    )
+    with pytest.raises(retrieval.SearchQueryTooBroad) as excinfo:
+        retrieval.search_with_meta([cid], "the and is")
+    assert excinfo.value.cap == 1
+    assert excinfo.value.chunk_count == 2
+
+
+def test_search_with_meta_over_cap_with_real_terms_never_raises(e2e_env, monkeypatch):
+    """A query with at least one non-stopword term always builds a usable
+    prefilter, even over the cap — only an all-stopword query is refused."""
+    import src.ingest.retrieval as retrieval
+
+    monkeypatch.setattr(retrieval, "_search_max_chunks", lambda: 1)
+    cid = _seed(
+        "rs-cap-ok",
+        [
+            {"ordinal": 0, "text": "kubernetes cluster guide"},
+            {"ordinal": 1, "text": "totally unrelated weather report"},
+        ],
+    )
+    meta = retrieval.search_with_meta([cid], "what is kubernetes")
+    assert meta["truncated"] is True
