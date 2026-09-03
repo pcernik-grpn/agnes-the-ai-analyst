@@ -11602,6 +11602,29 @@ async def profile_session_download(
     )
 
 
+@router.get("/_debug/error-surfaces", response_class=HTMLResponse, include_in_schema=False)
+async def _debug_error_surfaces(request: Request, user: dict = Depends(get_current_user)):
+    """Dev helper — the error surfaces that are NOT the error page.
+
+    Only mounted when DEBUG=1 (gated below), the same as the throw routes it
+    sits beside. Those cover the page side; a transcript note, an upload
+    dialog's error slot and a toast only appear when something upstream
+    actually fails, so they were the hardest surfaces to review and the
+    easiest to ship broken — a 429 during an upload rendered "[object
+    Object]" for as long as those dialogs existed.
+
+    The page renders by importing the shipped ``chat_errors.js`` and calling
+    it, so it cannot drift from what chat actually says.
+    """
+    if not _is_debug():
+        raise HTTPException(status_code=404, detail="Not found")
+    return templates.TemplateResponse(
+        request,
+        "debug_error_surfaces.html",
+        _build_context(request, user=user),
+    )
+
+
 @router.get("/_debug/throw/http/{code:int}", response_class=HTMLResponse, include_in_schema=False)
 async def _debug_throw_http(request: Request, code: int):
     """Dev helper — raise an HTTPException with the given status code.

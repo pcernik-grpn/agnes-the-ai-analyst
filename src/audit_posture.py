@@ -1174,6 +1174,7 @@ READ_POSTURE: dict[str, str] = {
     "GET /metrics": "exempt:health",
     # -- app.web.router --
     "GET /": "exempt:ui_support",
+    "GET /_debug/error-surfaces": "exempt:noise",
     "GET /_debug/throw/exc": "exempt:noise",
     "GET /_debug/throw/http/{code:int}": "exempt:noise",
     "GET /activity-center": "exempt:ui_support",
