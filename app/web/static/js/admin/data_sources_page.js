@@ -489,6 +489,7 @@ function _extRenderCrawlFilter(row) {
       <input type="date" class="ds-dropdown-native" id="ds-sp-crawlfilter-date-${row.id}"
              value="${_esc(value)}" aria-label="Crawl only files modified on/after this date for ${label}">
       <span class="field-hint" id="ds-sp-crawlfilter-status-${row.id}">${_esc(statusText)}</span>
+      <span class="field-hint">Widening this date later needs "Re-enumerate from scratch" on the next run — the delta cursor has already moved past older items.</span>
     </span>
     <span class="ds-src__fact-a">
       <button type="button" class="btn btn-secondary" onclick="crawlFilterSave('${row.id}')">Save</button>
@@ -782,9 +783,35 @@ function _sharepointFactsHtml(row) {
       <option value="on_gate_fail">on_gate_fail</option>
       <option value="always">always</option>
     </select>
+    <label class="field-hint" for="ds-sp-split-collection-id-${row.id}">Route to an EXISTING collection (optional — overrides the default)</label>
+    <input type="text" id="ds-sp-split-collection-id-${row.id}" placeholder="collection id" style="max-width:16rem;">
+    <label class="field-hint" for="ds-sp-split-collection-name-${row.id}">...or mint a NEW collection with this name (optional)</label>
+    <input type="text" id="ds-sp-split-collection-name-${row.id}" placeholder="e.g. Contracts Site" style="max-width:16rem;">
+    <label class="field-hint" for="ds-sp-split-per-folder-${row.id}" style="flex-basis:100%;display:flex;align-items:center;gap:6px;">
+      <input type="checkbox" id="ds-sp-split-per-folder-${row.id}">
+      One collection per folder instead (old default) — forks the site across as many collections as there are folders
+    </label>
     <button type="button" class="btn btn-primary" onclick="previewSpSplit('${row.id}')">Preview split</button>
     <button type="button" class="btn btn-secondary" onclick="toggleSpSplitRow('${row.id}')">Cancel</button>
     <div class="ds-sp-split-result" id="ds-sp-split-result-${row.id}"></div>
+  </div>
+  <div class="ds-src__fact">
+    <span class="ds-src__fact-k" title="Fold this connection's (and, optionally, its site-split siblings') per-scope collections into ONE target.">Consolidate collections</span>
+    <span class="ds-src__fact-v">The after-the-fact fix for a site already split across many per-scope collections.</span>
+    <span class="ds-src__fact-a"><button type="button" class="btn btn-secondary" onclick="toggleSpConsolidateRow('${row.id}')">Consolidate&hellip;</button></span>
+  </div>
+  <div class="ds-rotate-row" id="ds-sp-consolidate-row-${row.id}">
+    <label class="field-hint" for="ds-sp-consolidate-name-${row.id}">New collection name</label>
+    <input type="text" id="ds-sp-consolidate-name-${row.id}" placeholder="e.g. Contracts Site" style="max-width:16rem;">
+    <label class="field-hint" for="ds-sp-consolidate-target-id-${row.id}">...or fold into an EXISTING collection id</label>
+    <input type="text" id="ds-sp-consolidate-target-id-${row.id}" placeholder="collection id" style="max-width:16rem;">
+    <label class="field-hint" for="ds-sp-consolidate-siblings-${row.id}" style="flex-basis:100%;display:flex;align-items:center;gap:6px;">
+      <input type="checkbox" id="ds-sp-consolidate-siblings-${row.id}">
+      Also fold every OTHER connection from the same site split into this target
+    </label>
+    <button type="button" class="btn btn-primary" onclick="previewSpConsolidate('${row.id}')">Preview</button>
+    <button type="button" class="btn btn-secondary" onclick="toggleSpConsolidateRow('${row.id}')">Cancel</button>
+    <div class="ds-sp-consolidate-result" id="ds-sp-consolidate-result-${row.id}"></div>
   </div>
   <div class="ds-src__fact">
     <span class="ds-src__fact-k" title="An ungranted collection is invisible to everyone — fail closed.">Sharing</span>
@@ -1583,82 +1610,128 @@ async function runSpFactsExtraction(id) {
    shared-collection option) into ONE target. `POST .../collections/
    consolidate` — see app/api/admin_sharepoint.py::consolidate_collections.
 
-   Dry-run-first, always: the FIRST call is always `dry_run: true` (a pure
+   An inline drawer row (mirrors the "Split this site…" row above), not a
+   `window.prompt` flow — the "fold every sibling from the same site split
+   too" option is a real checkbox here, not a second confirm dialog.
+   Dry-run-first, always: Preview always sends `dry_run: true` (a pure
    preview — the server never mints anything on that call, see the route's
-   own docstring), rendering "N collection(s), M file(s) → target" for the
-   admin to read BEFORE anything is touched; only an explicit confirm sends
-   the second, real (`dry_run: false`) call. A blocked source (still shared
-   with another connection) is surfaced and the flow stops — it would only
-   be refused with a 409 anyway. */
-async function consolidateSpCollections(id) {
-  const targetName = window.prompt(
-    "Fold this connection's per-scope collections into ONE collection.\n\n" +
-      "Name the target collection (a new one is created):",
-  );
-  if (!targetName || !targetName.trim()) return;
-  const name = targetName.trim();
+   own docstring), rendering the sources/file counts/target for the admin
+   to read BEFORE anything is touched, plus any `blocking` (still shared
+   with another, unrelated connection) or `running` (a sibling's crawl is
+   still in flight) reasons the real merge would be refused for; only
+   Execute sends the second, real (`dry_run: false`) call. */
+function toggleSpConsolidateRow(id) {
+  const row = document.getElementById(`ds-sp-consolidate-row-${id}`);
   setSourceOpen(id, true);
-  const resultEl = document.getElementById(`ds-test-${id}`);
-  if (resultEl) {
-    resultEl.className = "ds-conn-test-result show";
-    resultEl.textContent = "Checking what would be consolidated…";
+  if (row.classList.contains("show")) {
+    row.classList.remove("show");
+    const resultEl = document.getElementById(`ds-sp-consolidate-result-${id}`);
+    if (resultEl) resultEl.innerHTML = "";
+  } else {
+    row.classList.add("show");
+    document.getElementById(`ds-sp-consolidate-name-${id}`).focus();
   }
-  const url = `/api/admin/sharepoint/connections/${encodeURIComponent(id)}/collections/consolidate`;
+}
+
+/* Reads the target fields — `null` on an obvious client-side conflict
+   (both a target id and a target name typed), same 400
+   `both_target_collection_id_and_target` the server would otherwise
+   refuse with. */
+function _spConsolidateTarget(id) {
+  const targetId = (document.getElementById(`ds-sp-consolidate-target-id-${id}`).value || "").trim();
+  const targetName = (document.getElementById(`ds-sp-consolidate-name-${id}`).value || "").trim();
+  if (targetId && targetName) {
+    showToast("Target collection id and target name are mutually exclusive — pick one.", false);
+    return null;
+  }
+  if (!targetId && !targetName) {
+    showToast("Enter a target collection id, or a name for a new one.", false);
+    return null;
+  }
+  const siblingsEl = document.getElementById(`ds-sp-consolidate-siblings-${id}`);
+  const includeSiblings = !!(siblingsEl && siblingsEl.checked);
+  return targetId
+    ? { target_collection_id: targetId, include_split_siblings: includeSiblings }
+    : { target: { name: targetName }, include_split_siblings: includeSiblings };
+}
+
+async function previewSpConsolidate(id) {
+  const target = _spConsolidateTarget(id);
+  if (target === null) return;
+  const resultEl = document.getElementById(`ds-sp-consolidate-result-${id}`);
+  resultEl.innerHTML = `<p class="field-hint">Checking what would be consolidated…</p>`;
   try {
-    const previewResp = await fetch(url, {
+    const r = await fetch(`/api/admin/sharepoint/connections/${encodeURIComponent(id)}/collections/consolidate`, {
       method: "POST",
       credentials: "include",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ target: { name }, dry_run: true }),
+      body: JSON.stringify({ ...target, dry_run: true }),
     });
-    const preview = await previewResp.json().catch(() => ({}));
-    if (!previewResp.ok) {
-      const msg = detailMessage(preview, "failed to preview consolidation");
-      if (resultEl) { resultEl.className = "ds-conn-test-result show fail"; resultEl.textContent = "✗ " + msg; }
-      showToast(msg, false);
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      resultEl.innerHTML = `<p class="ds-conn-test-result show fail">✗ ${_esc(detailMessage(body, "failed to preview consolidation"))}</p>`;
       return;
     }
-    const sources = preview.sources || [];
-    const totalFiles = sources.reduce((sum, s) => sum + (s.file_count || 0), 0);
-    const blocking = preview.blocking || [];
-    if (blocking.length) {
-      const msg = `${blocking.length} collection(s) are still shared with another connection — consolidating would be refused.`;
-      if (resultEl) { resultEl.className = "ds-conn-test-result show fail"; resultEl.textContent = "✗ " + msg; }
-      showToast(msg, false);
-      return;
-    }
-    const proceed = window.confirm(
-      `This will fold ${sources.length} collection(s) (${totalFiles} file(s) total) into ` +
-        `"${name}". This cannot be undone. Continue?`,
-    );
-    if (!proceed) {
-      if (resultEl) { resultEl.className = "ds-conn-test-result show"; resultEl.textContent = ""; }
-      return;
-    }
-    if (resultEl) resultEl.textContent = "Consolidating…";
-    const execResp = await fetch(url, {
-      method: "POST",
-      credentials: "include",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ target: { name }, dry_run: false }),
-    });
-    const execBody = await execResp.json().catch(() => ({}));
-    if (execResp.ok) {
-      if (resultEl) {
-        resultEl.className = "ds-conn-test-result show ok";
-        resultEl.textContent =
-          `✓ Folded ${(execBody.sources || []).length} collection(s) into "${execBody.target.name}" ` +
-          `(${execBody.files_moved} file(s)).`;
-      }
-      showToast("Collections consolidated.", true);
-      await loadConnections();
-    } else {
-      const msg = detailMessage(execBody, "failed to consolidate collections");
-      if (resultEl) { resultEl.className = "ds-conn-test-result show fail"; resultEl.textContent = "✗ " + msg; }
-      showToast(msg, false);
-    }
+    _renderSpConsolidatePreview(id, body);
   } catch (e) {
-    if (resultEl) { resultEl.className = "ds-conn-test-result show fail"; resultEl.textContent = "✗ Request failed"; }
+    resultEl.innerHTML = `<p class="ds-conn-test-result show fail">✗ Request failed</p>`;
+  }
+}
+
+function _renderSpConsolidatePreview(id, preview) {
+  const resultEl = document.getElementById(`ds-sp-consolidate-result-${id}`);
+  const sources = preview.sources || [];
+  const totalFiles = sources.reduce((sum, s) => sum + (s.file_count || 0), 0);
+  const targetLabel = preview.target.id
+    ? `${_esc(preview.target.name)} (existing, id ${_esc(preview.target.id)})`
+    : `${_esc(preview.target.name)} (new — created on Execute)`;
+  const connectionIds = preview.connection_ids || [];
+  const blocking = preview.blocking || [];
+  const running = preview.running || [];
+  const problems = [];
+  if (blocking.length) {
+    problems.push(
+      `${blocking.length} collection(s) are still shared with another, unrelated connection — Execute would be refused.`,
+    );
+  }
+  if (running.length) {
+    problems.push(
+      `${running.length} connection(s) in this family have a crawl queued/running (${running.map(_esc).join(", ")}) — Execute would be refused.`,
+    );
+  }
+  resultEl.innerHTML = `
+    <p class="field-hint" style="flex-basis:100%;">Would fold ${sources.length} collection(s) (${totalFiles} file(s) total)${connectionIds.length > 1 ? ` across ${connectionIds.length} connections` : ""} into ${targetLabel}.</p>
+    ${problems.map((p) => `<p class="ds-conn-test-result show fail" style="flex-basis:100%;">✗ ${_esc(p)}</p>`).join("")}
+    ${sources.length && !problems.length ? `<button type="button" class="btn btn-primary" onclick="applySpConsolidate('${id}')">Execute — fold ${sources.length} collection(s)</button>` : ""}
+  `;
+}
+
+async function applySpConsolidate(id) {
+  const target = _spConsolidateTarget(id);
+  if (target === null) return;
+  const resultEl = document.getElementById(`ds-sp-consolidate-result-${id}`);
+  const proceed = window.confirm("This will move files/chunks/claims and cannot be undone. Continue?");
+  if (!proceed) return;
+  resultEl.insertAdjacentHTML("beforeend", `<p class="field-hint" style="flex-basis:100%;">Consolidating…</p>`);
+  try {
+    const r = await fetch(`/api/admin/sharepoint/connections/${encodeURIComponent(id)}/collections/consolidate`, {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...target, dry_run: false }),
+    });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      showToast(detailMessage(body, "failed to consolidate collections"), false);
+      return;
+    }
+    showToast(
+      `Folded ${(body.sources || []).length} collection(s) into "${body.target.name}" (${body.files_moved} file(s)).`,
+      true,
+    );
+    toggleSpConsolidateRow(id);
+    await loadConnections();
+  } catch (e) {
     showToast("Request failed.", false);
   }
 }
@@ -1670,13 +1743,14 @@ async function consolidateSpCollections(id) {
    the merged connection resumes incrementally. `POST .../splits/merge` —
    see app/api/admin_sharepoint.py::merge_split_connections.
 
-   Dry-run-first, same discipline as `consolidateSpCollections` above: the
-   FIRST call is always `dry_run: true` (nothing is touched, a NAMED
-   target is not even minted yet), rendering a per-sibling summary for the
-   admin to read before anything happens; only an explicit confirm sends
-   the second, real (`dry_run: false`) call. A blocked precondition (a
-   running crawl, ACL zones, a mismatched mirrored-scope audience, or a
-   still-shared collection) is surfaced and the flow stops. */
+   Dry-run-first, same discipline as `previewSpConsolidate`/
+   `applySpConsolidate` above: the FIRST call is always `dry_run: true`
+   (nothing is touched, a NAMED target is not even minted yet), rendering a
+   per-sibling summary for the admin to read before anything happens; only
+   an explicit confirm sends the second, real (`dry_run: false`) call. A
+   blocked precondition (a running crawl, ACL zones, a mismatched
+   mirrored-scope audience, or a still-shared collection) is surfaced and
+   the flow stops. */
 async function mergeSpSplitSiblings(id) {
   const targetName = window.prompt(
     "Merge every sibling connection from this site's split back into this connection.\n\n" +
@@ -1965,6 +2039,33 @@ function _spSplitN(id) {
   return Number.isInteger(n) && n >= 1 && n <= 50 ? n : null;
 }
 
+/* The collection-routing controls (`ds-sp-split-collection-id-`/`-name-`/
+   `-per-folder-`) are shared, read as-is, between the preview
+   (`GET .../split-plan`, query params) and the apply
+   (`POST .../splits`, body) — same three mutually-exclusive options
+   `SplitApplyBody` accepts server-side, so what an admin previews is
+   exactly what the apply call would do. Returns `null` on a
+   client-side-obvious conflict (both an id and a name typed, or
+   per-folder combined with either) — the server would 400
+   `both_target_collection_id_and_target`/`per_folder_collections_and_target`
+   for the exact same combination, but catching it here avoids a round
+   trip for a mistake the form already knows about. */
+function _spSplitCollectionOptions(id) {
+  const collectionId = (document.getElementById(`ds-sp-split-collection-id-${id}`).value || "").trim();
+  const collectionName = (document.getElementById(`ds-sp-split-collection-name-${id}`).value || "").trim();
+  const perFolderEl = document.getElementById(`ds-sp-split-per-folder-${id}`);
+  const perFolder = !!(perFolderEl && perFolderEl.checked);
+  if (collectionId && collectionName) {
+    showToast("Collection id and collection name are mutually exclusive — pick one.", false);
+    return null;
+  }
+  if (perFolder && (collectionId || collectionName)) {
+    showToast("One-collection-per-folder and an explicit collection are mutually exclusive — pick one.", false);
+    return null;
+  }
+  return { collectionId, collectionName, perFolder };
+}
+
 async function previewSpSplit(id) {
   const resultEl = document.getElementById(`ds-sp-split-result-${id}`);
   const n = _spSplitN(id);
@@ -1972,10 +2073,15 @@ async function previewSpSplit(id) {
     showToast("Number of parts must be a whole number between 1 and 50.", false);
     return;
   }
+  const collectionOpts = _spSplitCollectionOptions(id);
+  if (collectionOpts === null) return;
   const minModified = document.getElementById(`ds-sp-split-min-modified-${id}`).value || "";
   resultEl.innerHTML = `<p class="field-hint">Computing plan — reads the drive root and counts each folder's documents live, this can take a few seconds…</p>`;
   const params = new URLSearchParams({ n: String(n) });
   if (minModified) params.set("min_modified", minModified);
+  if (collectionOpts.collectionId) params.set("target_collection_id", collectionOpts.collectionId);
+  if (collectionOpts.collectionName) params.set("target_name", collectionOpts.collectionName);
+  if (collectionOpts.perFolder) params.set("per_folder_collections", "true");
   try {
     const r = await fetch(
       `/api/admin/sharepoint/connections/${encodeURIComponent(id)}/split-plan?${params.toString()}`,
@@ -1990,6 +2096,20 @@ async function previewSpSplit(id) {
   } catch (e) {
     resultEl.innerHTML = `<p class="ds-conn-test-result show fail">✗ Request failed</p>`;
   }
+}
+
+/* `plan.collection` — the resolved (never yet minted) shared target every
+   part's scopes would route to, `null` only for the per-folder opt-in —
+   see `app.api.admin_sharepoint._resolve_split_target_collection_ref`. */
+function _spSplitCollectionLineHtml(collection) {
+  if (collection === undefined) return "";
+  if (collection === null) {
+    return `<p class="field-hint" style="flex-basis:100%;">Every folder will mint its OWN collection.</p>`;
+  }
+  const label = collection.id
+    ? `${_esc(collection.name)} (existing, id ${_esc(collection.id)})`
+    : `${_esc(collection.name)} (new — created when you create the connections)`;
+  return `<p class="field-hint" style="flex-basis:100%;">Every part's scopes will route to ONE shared collection: ${label}</p>`;
 }
 
 function _renderSpSplitPlan(id, plan) {
@@ -2009,6 +2129,7 @@ function _renderSpSplitPlan(id, plan) {
       <tbody>${rows || `<tr><td colspan="3">No folders found at the drive root.</td></tr>`}</tbody>
     </table>
     <p class="field-hint" style="flex-basis:100%;">Total documents across all folders: ${plan.total_documents || 0}</p>
+    ${_spSplitCollectionLineHtml(plan.collection)}
     ${looseHtml}
     <label class="field-hint" style="flex-basis:100%;display:flex;align-items:center;gap:6px;">
       <input type="checkbox" id="ds-sp-split-start-${id}">
@@ -2022,6 +2143,8 @@ async function applySpSplit(id) {
   const resultEl = document.getElementById(`ds-sp-split-result-${id}`);
   const n = _spSplitN(id);
   if (!n) return;
+  const collectionOpts = _spSplitCollectionOptions(id);
+  if (collectionOpts === null) return;
   const minModified = document.getElementById(`ds-sp-split-min-modified-${id}`).value || null;
   const transport = document.getElementById(`ds-sp-split-transport-${id}`).value || null;
   const retryMode = document.getElementById(`ds-sp-split-retry-${id}`).value || null;
@@ -2031,6 +2154,9 @@ async function applySpSplit(id) {
   if (minModified) payload.min_modified = minModified;
   if (transport) payload.transport = transport;
   if (retryMode) payload.retry_mode = retryMode;
+  if (collectionOpts.collectionId) payload.target_collection_id = collectionOpts.collectionId;
+  if (collectionOpts.collectionName) payload.target = { name: collectionOpts.collectionName };
+  if (collectionOpts.perFolder) payload.per_folder_collections = true;
   resultEl.insertAdjacentHTML("beforeend", `<p class="field-hint" style="flex-basis:100%;">Creating connections…</p>`);
   try {
     const r = await fetch(`/api/admin/sharepoint/connections/${encodeURIComponent(id)}/splits`, {
@@ -4635,7 +4761,7 @@ function _sourceMenuItems(row) {
     <button type="button" class="apg-menu__item" role="menuitem" onclick="closeSourceMenu(); runSpFactsExtraction('${id}')">Extract facts now</button>
     <button type="button" class="apg-menu__item" role="menuitem" onclick="closeSourceMenu(); toggleSpSplitRow('${id}')">Split this site…</button>
     <div class="apg-menu__sep"></div>
-    <button type="button" class="apg-menu__item" role="menuitem" onclick="closeSourceMenu(); consolidateSpCollections('${id}')">Consolidate collections…</button>
+    <button type="button" class="apg-menu__item" role="menuitem" onclick="closeSourceMenu(); toggleSpConsolidateRow('${id}')">Consolidate collections…</button>
     <button type="button" class="apg-menu__item" role="menuitem" onclick="closeSourceMenu(); mergeSpSplitSiblings('${id}')">Merge split parts back into this source…</button>
     <button type="button" class="apg-menu__item" role="menuitem" onclick="closeSourceMenu(); toggleSpCertRow('${id}')">Update certificate…</button>
     <div class="apg-menu__sep"></div>

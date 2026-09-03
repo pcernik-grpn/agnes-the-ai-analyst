@@ -95,7 +95,8 @@ spot-check shows pseudonyms, not names.
   to `"config"`/`"payload"`/`"adaptive"`.
 - **Split one large site across several connections**, each with its own
   crawl and facts jobs so they run in parallel instead of one connection's
-  worth of concurrency working through the whole site sequentially:
+  worth of concurrency working through the whole site sequentially. Two
+  paths to the same shape — manual (below) or automated (further down):
   1. `POST /api/admin/sharepoint/connections/{id}/clone` or `agnes admin
      sharepoint connection clone <connection_id> --name <name>` — a sibling
      connection wired to the SAME tenant/client identity and certificate/
@@ -129,26 +130,31 @@ spot-check shows pseudonyms, not names.
   default) lists what would be folded and how many files, `--execute`
   performs the real merge (files/chunks/claims re-pointed, grants unioned,
   emptied sources soft-deleted). Also reachable from the source card's
-  overflow menu (**Consolidate collections…**). PG-only (A3 ratchet).
+  overflow menu (**Consolidate collections…**, an inline drawer row).
+  `--site` (`include_split_siblings: true`) widens the fold to every OTHER
+  connection FROM THE SAME `POST …/splits` call — one call instead of
+  repeating this once per part with the same target; refused with `409
+  sibling_crawl_running` if a family member's crawl is currently queued or
+  running. PG-only (A3 ratchet).
 
-  **Merging the parts back.** Once a split site no longer needs to run in
-  parallel — or a site was split by hand into several sibling connections
-  and it is time to fold it back — `POST …/connections/{id}/splits/merge`
-  or `agnes admin sharepoint split-merge <target_id> --sibling <id>... |
-  --all-siblings --target-collection-id <id> | --target-name <name>
-  [--execute]` (source card overflow menu → **Merge split parts back into
-  this source…**) is the REVERSE of the split above: it moves every
-  sibling's scopes onto the target (deduped by `(source_scope_id,
-  drive_id)`), unions each sibling's crawl state (delta-link cursors,
-  cTags, the failed/empty-document backlogs) and facts state (the
-  extraction ledger) onto the target's own, folds every involved scope
-  collection into one target collection (the SAME repository
-  `collections/consolidate` uses — never reimplemented), and re-points
-  each sibling's run history onto the target. The merged connection then
-  resumes crawling INCREMENTALLY, exactly where every sibling left off,
-  instead of re-downloading the whole site. `--all-siblings` folds in
-  every OTHER connection named like this one's own split family (the
-  `"<source name> — part i/n"` convention `POST …/splits` already
+  **Merging the parts back into one CONNECTION** (a step further than
+  folding collections above — this also unions the crawl/facts progress,
+  so the merged connection resumes incrementally instead of re-downloading
+  the site). Once a split site no longer needs to run in parallel — or a
+  site was split by hand into several sibling connections and it is time
+  to fold it back — `POST …/connections/{id}/splits/merge` or `agnes admin
+  sharepoint split-merge <target_id> --sibling <id>... | --all-siblings
+  --target-collection-id <id> | --target-name <name> [--execute]` (source
+  card overflow menu → **Merge split parts back into this source…**) is
+  the REVERSE of the split above: it moves every sibling's scopes onto the
+  target (deduped by `(source_scope_id, drive_id)`), unions each sibling's
+  crawl state (delta-link cursors, cTags, the failed/empty-document
+  backlogs) and facts state (the extraction ledger) onto the target's own,
+  folds every involved scope collection into one target collection (the
+  SAME repository `collections/consolidate` uses — never reimplemented),
+  and re-points each sibling's run history onto the target. `--all-siblings`
+  folds in every OTHER connection named like this one's own split family
+  (the `"<source name> — part i/n"` convention `POST …/splits` already
   establishes); `--sibling <id>` (repeatable) names siblings explicitly —
   the only form that works for a site split by hand under different
   names. Refused (`409`, nothing touched) while any involved connection
@@ -160,21 +166,15 @@ spot-check shows pseudonyms, not names.
   credentials are left untouched; remove a merged-away sibling later with
   the ordinary `DELETE /api/admin/source-connections/{id}` if it is no
   longer needed. Dry-run by default. PG-only (A3 ratchet).
-
-  reports it. Per-run override in the Run-now options. Editable in
-  `/admin/server-config` → *Extraction* → *crawler*; this is the extraction
-  worker's **memory lever** (every file in flight is a converter child
-  process holding that document — six in flight has exceeded a 12 GiB
-  container on large decks, two held it under 4 GiB), and the worker reads
-  it at the start of each run, so a save applies to the next run with no
-  restart.
-     however many connections the crawl needs to parallelize over.
 - `extraction.crawl.min_modified` — a per-connection age filter for a
   backfill run: crawl only files modified on/after a cutoff date instead of
   re-walking a whole multi-year corpus. `PATCH …/extraction/crawl-config`
   (`agnes admin sharepoint crawl-config <connection_id> --min-modified
   YYYY-MM-DD` / `--clear`) sets or clears it; an item with no modified
-  timestamp is always kept.
+  timestamp is always kept. On the source card, the same control ("Crawl
+  filter", next to "Facts policy") sets it directly — widening the date
+  later needs a "Re-enumerate from scratch" run afterwards, since the
+  delta cursor has already moved past whatever the old cutoff skipped.
 - **Or let Agnes do the split for you.** `GET /api/admin/sharepoint
   /connections/{id}/split-plan?n=<n>[&min_modified=YYYY-MM-DD][&drive_id=<id>]`
   (`agnes admin sharepoint split-plan <connection_id> --n <n> [--min-modified
@@ -200,6 +200,23 @@ spot-check shows pseudonyms, not names.
   `facts-config` writes. `--start` enqueues each clone's crawl immediately
   after creating it, in creation order, skipped silently (never a failed
   apply) when extraction readiness is not currently satisfied.
+
+  **Every part's scopes route to ONE shared collection by default** — a
+  site of 400 folders no longer becomes 400 collections nobody has a grant
+  to. The default reuses this connection's own collection when it has
+  exactly one confirmed scope carrying one (the common "not yet split"
+  shape), otherwise mints one collection named after it — the SAME
+  "assign the precomputed `collection_id` directly" mechanism `scopes/bulk`
+  already uses for its own `--collection-id` option, never a second one.
+  `--collection-id <id>` / `--collection-name <name>` on `split`/`split-plan`
+  name an explicit shared target instead (mutually exclusive with each other
+  and with `--per-folder-collections`; `404 collection_not_found` for an
+  unknown `--collection-id`); `--per-folder-collections` restores the OLD
+  default (every folder mints its own, one collection per folder — the
+  manual clone+bulk-add recipe's shape when `--collection-id` is omitted).
+  Every part also records `config.split = {parent_connection_id, part, n,
+  created_at}` — read by `collections consolidate --site` above to find
+  every part of the split.
 - Webhooks for near-real-time updates: mint the secret
   (`POST …/webhook`), then `POST …/subscriptions/ensure` — Agnes owns the
   Graph subscription lifecycle including renewals

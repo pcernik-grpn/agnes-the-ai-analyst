@@ -1109,7 +1109,11 @@ async def update_connection(
     .ACL_SYNC_SERVER_WRITTEN_CONFIG_KEYS``) — get the same carry-forward
     treatment just below, kept as a separate hand-maintained list because
     that ratchet's static scan is deliberately scoped to one file and
-    cannot see a different module's writes.
+    cannot see a different module's writes. ``config.split`` — the
+    site-split lineage (``connectors.sharepoint.site_split
+    .SPLIT_SERVER_WRITTEN_CONFIG_KEYS``) ``POST …/splits`` writes once, at
+    connection-CREATE time rather than via an ``....update(...)`` call —
+    is carried forward the same hand-maintained way, for the same reason.
     """
     repo = source_connections_repo()
     existing_row = repo.get(connection_id)
@@ -1252,6 +1256,26 @@ async def update_connection(
                 for _sub_key in SUBSCRIPTION_SERVER_WRITTEN_CONFIG_KEYS:
                     if _sub_key not in config and old_config.get(_sub_key) is not None:
                         config = {**config, _sub_key: old_config[_sub_key]}
+
+                # Same class again, fourth writer: site-split LINEAGE
+                # (`app/api/admin_sharepoint.py::apply_split`) records
+                # `config.split = {parent_connection_id, part, n,
+                # created_at}` on every part it creates, at connection-CREATE
+                # time — never via an `....update(config=...)` call, so
+                # `SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS`'s own ratchet
+                # (scoped to that shape) never sees it. Erasing it on an
+                # ordinary edit does not break the split's own crawl — it
+                # only makes `POST …/collections/consolidate
+                # {include_split_siblings: true}` unable to find this part's
+                # siblings, silently narrowing a "fold the whole split"
+                # call to "fold just this one connection" with no error at
+                # all. Same carry-forward as the ACL/subscription keys
+                # above, imported from the module that actually owns it.
+                from connectors.sharepoint.site_split import SPLIT_SERVER_WRITTEN_CONFIG_KEYS
+
+                for _split_key in SPLIT_SERVER_WRITTEN_CONFIG_KEYS:
+                    if _split_key not in config and old_config.get(_split_key) is not None:
+                        config = {**config, _split_key: old_config[_split_key]}
     if body.is_default is not None:
         # RBAC review Finding 1 (2026-08-26): this must run regardless of
         # whether `config` was sent — `PUT /{other_id} {is_default: true}`

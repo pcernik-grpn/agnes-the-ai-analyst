@@ -114,7 +114,14 @@ Surface:
                                                                 false``) — the after-the-fact fix
                                                                 for a large site split across many
                                                                 bulk-added scopes that ended up one
-                                                                collection per scope. See
+                                                                collection per scope.
+                                                                ``include_split_siblings: true``
+                                                                widens the fold to every OTHER
+                                                                connection from the SAME
+                                                                ``POST …/splits`` call (see
+                                                                :func:`_split_family_connection_ids`),
+                                                                one call instead of N repeats with
+                                                                the same target. See
                                                                 :func:`consolidate_collections`.
   POST   /api/admin/sharepoint/connections/{id}/splits/merge   — the REVERSE of
                                                                 ``.../splits``: fold several
@@ -389,11 +396,23 @@ class ConsolidateCollectionsBody(BaseModel):
     collection, not necessarily one of this connection's own) or ``target``
     (mint a new one, by name) must be given. ``dry_run`` defaults to
     ``True`` — a caller must explicitly opt into the real, data-moving
-    merge."""
+    merge.
+
+    ``include_split_siblings`` (default ``False``) widens the fold from
+    THIS connection alone to its whole site-split family (see
+    :func:`connectors.sharepoint.site_split` — the ``config.split`` lineage
+    :func:`apply_split` records on every part it creates): every OTHER
+    SharePoint connection sharing the same
+    ``config.split.parent_connection_id`` as this one, PLUS that parent
+    connection itself (whether it is the one this call was made on, or
+    still exists as a separate row holding scopes of its own) — so a site
+    split into N parts is folded into one target in ONE call instead of N
+    repeats with the same target."""
 
     target_collection_id: Optional[str] = None
     target: Optional[ConsolidateTargetSpec] = None
     dry_run: bool = True
+    include_split_siblings: bool = False
 
 
 class SplitMergeTarget(BaseModel):
@@ -450,6 +469,28 @@ class SplitApplyBody(BaseModel):
     #: review the split before it starts crawling gets exactly the clones,
     #: nothing running yet.
     start: bool = False
+    #: Same shape :class:`ConsolidateCollectionsBody` uses for its own
+    #: target — mutually exclusive with each other (``400
+    #: both_target_collection_id_and_target``) and with
+    #: ``per_folder_collections`` (``400
+    #: per_folder_collections_and_target``). Neither given is the DEFAULT:
+    #: every part's scopes route to ONE shared collection for the whole
+    #: site (see :func:`_resolve_split_target_collection_ref`) — reusing
+    #: the source connection's own collection when it has exactly one
+    #: confirmed scope carrying a ``collection_id`` (the common
+    #: not-yet-split shape), otherwise minting one new collection named
+    #: after the source connection. ``target_collection_id`` routes every
+    #: part to an EXISTING, live collection instead (``404
+    #: collection_not_found`` if unknown/soft-deleted); ``target`` mints
+    #: ONE new, named collection for the whole split.
+    target_collection_id: Optional[str] = None
+    target: Optional[ConsolidateTargetSpec] = None
+    #: Opt into the OLD default: every top-level folder gets its OWN,
+    #: freshly minted collection (:func:`_create_scope_collection`, the
+    #: same call ``POST …/scopes/bulk`` makes without a shared target) —
+    #: forking the site across as many collections as there are folders,
+    #: same as before this shared-collection default existed.
+    per_folder_collections: bool = False
 
 
 #: Config keys :func:`clone_connection` does NOT carry over into a clone —
@@ -2167,19 +2208,78 @@ def _collection_ref(collection: Dict[str, Any]) -> Dict[str, Any]:
     return {"id": collection["id"], "name": collection["name"], "slug": collection["slug"]}
 
 
-def _foreign_connection_referencing(collection_id: str, *, this_connection_id: str) -> Optional[str]:
+def _foreign_connection_referencing(collection_id: str, *, exclude_connection_ids: Any) -> Optional[str]:
     """The id of another SharePoint connection whose OWN scope still routes
     to ``collection_id``, or ``None`` — the guard :func:`consolidate_collections`
     uses to refuse folding away a collection a DIFFERENT connection's crawl
-    still depends on. A scope on THIS SAME connection routing to it is not
-    "foreign" — that is exactly the fold this endpoint performs."""
+    still depends on. ``exclude_connection_ids`` is every connection id THIS
+    fold already covers — a single connection's own id for a plain
+    consolidate, or the whole family for ``include_split_siblings: true``
+    (folding siblings TOGETHER is exactly the point; a sibling's own scope
+    routing to a collection is never "foreign" to its own family)."""
+    excluded = {exclude_connection_ids} if isinstance(exclude_connection_ids, str) else set(exclude_connection_ids)
     for connection in source_connections_repo().list(source_type="sharepoint"):
-        if connection.get("id") == this_connection_id:
+        if connection.get("id") in excluded:
             continue
         for scope in _scopes(connection):
             if scope.get("collection_id") == collection_id:
                 return connection.get("id")
     return None
+
+
+def _split_family_connection_ids(row: Dict[str, Any]) -> List[str]:
+    """Every SharePoint connection id belonging to the SAME site split as
+    ``row`` — its own id, the split's parent connection id, and every OTHER
+    connection whose ``config.split.parent_connection_id`` names that same
+    parent — used by :func:`consolidate_collections`'s
+    ``include_split_siblings`` option (see :data:`connectors.sharepoint.
+    site_split.SPLIT_SERVER_WRITTEN_CONFIG_KEYS`).
+
+    ``row`` may be a PART of a split (its own ``config.split.
+    parent_connection_id`` names the original, un-split connection) or the
+    ORIGINAL/parent itself (some OTHER connection's ``config.split.
+    parent_connection_id`` names ``row``'s own id) — either way the family
+    is every connection sharing that one parent id, plus the parent
+    connection's own id, whether or not a connection with that id still
+    exists (a deleted parent still leaves its parts findable by their
+    shared ``parent_connection_id``, and this function's caller tolerates a
+    missing row for it).
+
+    Sorted for a deterministic order — this feeds both a preview response
+    and an audit row, neither of which should vary run to run for the
+    identical family."""
+    split = (row.get("config") or {}).get("split") or {}
+    parent_id = split.get("parent_connection_id") or row["id"]
+    family = {parent_id, row["id"]}
+    for connection in source_connections_repo().list(source_type="sharepoint"):
+        sibling_split = (connection.get("config") or {}).get("split") or {}
+        if sibling_split.get("parent_connection_id") == parent_id:
+            family.add(connection["id"])
+    return sorted(family)
+
+
+def _connection_ids_with_running_crawl(connection_ids: List[str]) -> List[str]:
+    """Which of ``connection_ids`` currently has a ``corpus-extraction`` job
+    ``queued``/``running`` — read-only (never enqueues) via the SAME stable
+    per-connection idempotency key (:func:`_extraction_idempotency_key`)
+    the manual trigger dedups on, so this check and that trigger's own 409
+    can never disagree about what "running" means. Used by
+    :func:`consolidate_collections`'s ``include_split_siblings`` option to
+    refuse folding away a sibling's collection while its own crawl might
+    still be writing into it."""
+    from src.repositories import jobs_repo
+
+    wanted = {_extraction_idempotency_key(cid): cid for cid in connection_ids}
+    if not wanted:
+        return []
+    repo = jobs_repo()
+    found: set[str] = set()
+    for status in ("queued", "running"):
+        for job in repo.list(kind="corpus-extraction", status=status, limit=200):
+            connection_id = wanted.get(job.get("idempotency_key"))
+            if connection_id is not None:
+                found.add(connection_id)
+    return sorted(found)
 
 
 @router.post("/connections/{connection_id}/collections/consolidate")
@@ -2239,6 +2339,20 @@ async def consolidate_collections(
     those, only scope-level collections. A zone routed to a now-consolidated
     collection needs the ``sharepoint-acl-sync``/``sharepoint-subtree-sweep``
     jobs' own reconciliation to catch up.
+
+    ``include_split_siblings: true`` widens every step above from THIS
+    connection alone to its whole site-split family (see
+    :func:`_split_family_connection_ids`) — one call folds the collections
+    of a site split into N parts instead of N repeats with the same
+    target. A sibling's OWN scope routing to a source is never treated as
+    "foreign" (that would otherwise 409 on every family member's
+    collection). Refused with ``409 sibling_crawl_running`` (nothing
+    touched, checked BEFORE the real merge, never during a dry run —
+    ``running`` is still REPORTED in the preview) when a family member
+    currently has a ``corpus-extraction`` job queued/running — folding a
+    collection a live crawl might still be writing into out from under it
+    is refused the same way an in-flight crawl already blocks other
+    connection-level mutations elsewhere in this module.
     """
     row = _sharepoint_connection_or_404(connection_id)
 
@@ -2256,8 +2370,17 @@ async def consolidate_collections(
             detail={"error": "target_required", "message": "pass exactly one of target_collection_id or target."},
         )
 
+    if body.include_split_siblings:
+        family_ids = [fid for fid in _split_family_connection_ids(row) if fid != connection_id]
+        family_rows = [row] + [r for fid in family_ids if (r := source_connections_repo().get(fid)) is not None]
+    else:
+        family_rows = [row]
+    family_connection_ids = [r["id"] for r in family_rows]
+
     corpora = file_corpora_repo()
-    scope_collection_ids = sorted({s["collection_id"] for s in _scopes(row) if s.get("collection_id")})
+    scope_collection_ids = sorted(
+        {s["collection_id"] for r in family_rows for s in _scopes(r) if s.get("collection_id")}
+    )
 
     # Resolve — but never MINT — a target reference here. A `target:
     # {"name": ...}` mint is a real write, so it is deferred until the call
@@ -2293,15 +2416,22 @@ async def consolidate_collections(
     blocking = [
         {"collection_id": cid, "connection_id": foreign_id}
         for cid in prospective_sources
-        if (foreign_id := _foreign_connection_referencing(cid, this_connection_id=connection_id)) is not None
+        if (foreign_id := _foreign_connection_referencing(cid, exclude_connection_ids=family_connection_ids))
+        is not None
     ]
+    running = _connection_ids_with_running_crawl(family_connection_ids) if body.include_split_siblings else []
 
     if body.dry_run:
         log_safe(
             user_id=user.get("id"),
             action="sharepoint_connection.collections_consolidate",
             resource=f"source_connection:{connection_id}",
-            params={"dry_run": True, "target": target_ref, "source_collection_ids": prospective_sources},
+            params={
+                "dry_run": True,
+                "target": target_ref,
+                "source_collection_ids": prospective_sources,
+                "connection_ids": family_connection_ids,
+            },
             result="success",
         )
         return {
@@ -2309,12 +2439,26 @@ async def consolidate_collections(
             "target": target_ref,
             "sources": sources_out,
             "blocking": blocking,
+            "connection_ids": family_connection_ids,
+            "running": running,
         }
 
     if blocking:
         raise HTTPException(
             status_code=409,
             detail={"error": "collection_referenced_by_other_connection", "blocking": blocking},
+        )
+    if running:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "sibling_crawl_running",
+                "message": (
+                    "a connection in this site split currently has a crawl queued or running — wait for it to "
+                    "finish, or stop it, before consolidating."
+                ),
+                "connection_ids": running,
+            },
         )
 
     # Committing for real: mint the named target NOW (never during a dry
@@ -2335,13 +2479,17 @@ async def consolidate_collections(
             detail={"error": "consolidation_conflict", "kind": exc.kind, "keys": exc.keys},
         ) from exc
 
-    scopes = _scopes(row)
     repointed = 0
-    for scope in scopes:
-        if scope.get("collection_id") in source_ids:
-            scope["collection_id"] = target_id
-            repointed += 1
-    source_connections_repo().update(connection_id, config={**(row.get("config") or {}), "scopes": scopes})
+    for r in family_rows:
+        scopes = _scopes(r)
+        changed = False
+        for scope in scopes:
+            if scope.get("collection_id") in source_ids:
+                scope["collection_id"] = target_id
+                repointed += 1
+                changed = True
+        if changed:
+            source_connections_repo().update(r["id"], config={**(r.get("config") or {}), "scopes": scopes})
 
     log_safe(
         user_id=user.get("id"),
@@ -2352,6 +2500,7 @@ async def consolidate_collections(
             "target_collection_id": target_id,
             "source_collection_ids": source_ids,
             "scopes_repointed": repointed,
+            "connection_ids": family_connection_ids,
             **summary,
         },
         result="success",
@@ -2362,6 +2511,7 @@ async def consolidate_collections(
         "target": _collection_ref(target),
         "sources": sources_out,
         "scopes_repointed": repointed,
+        "connection_ids": family_connection_ids,
         **summary,
     }
 
@@ -2444,12 +2594,99 @@ async def _compute_split_plan(
     }
 
 
+def _validate_split_collection_target(
+    *, target_collection_id: Optional[str], target_name: Optional[str], per_folder_collections: bool
+) -> None:
+    """Shared 400 validation for the collection-routing options on both
+    ``GET …/split-plan`` (query params) and ``POST …/splits``
+    (``SplitApplyBody``) — same two conflicts, same error codes, so a
+    preview and the apply it previews never disagree about what is even a
+    legal combination."""
+    if target_collection_id and target_name:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "both_target_collection_id_and_target",
+                "message": "target_collection_id and target are mutually exclusive — pass at most one.",
+            },
+        )
+    if per_folder_collections and (target_collection_id or target_name):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "per_folder_collections_and_target",
+                "message": "per_folder_collections and target_collection_id/target are mutually exclusive.",
+            },
+        )
+
+
+def _resolve_split_target_collection_ref(
+    row: Dict[str, Any],
+    *,
+    target_collection_id: Optional[str],
+    target_name: Optional[str],
+    per_folder_collections: bool,
+) -> Optional[Dict[str, Any]]:
+    """Resolve — but never MINT — the ONE shared collection a site split's
+    parts will route their scopes to (see the module's "split a large
+    site" docs) — shared by the read-only preview (``GET …/split-plan``,
+    which must never create data) and :func:`apply_split` (which mints for
+    real, past this point, exactly ONCE for the whole split, never once
+    per folder). ``None`` when ``per_folder_collections=True`` — the OLD
+    default, restored by that opt-in: every folder mints its own
+    collection the way :func:`apply_split` always used to
+    (:func:`_create_scope_collection`, the same call ``POST …/scopes/bulk``
+    makes without a shared target).
+
+    Otherwise returns ``{"id", "name", "slug"}`` — the same shape
+    :func:`_collection_ref`/``ConsolidateCollectionsBody``'s dry-run target
+    use. ``id``/``slug`` are ``None`` when the collection does not exist
+    yet (an explicit ``target_name``, or the "mint one named after the
+    source" fallback below) — it is only really minted at
+    :func:`apply_split`'s commit point, never during a preview.
+
+    Resolution order:
+
+    1. ``target_collection_id`` — an existing, live collection
+       (``404 collection_not_found`` if unknown/soft-deleted).
+    2. ``target_name`` — mint one by this name (not yet, at preview time).
+    3. Default: this connection's OWN confirmed scopes carry EXACTLY ONE
+       ``collection_id`` (the common "one root scope, not yet split" shape
+       — e.g. the connect wizard's own single site-level confirm) — reuse
+       THAT collection, the site already has a home.
+    4. Otherwise: mint one collection named after the source connection —
+       reused directly by :func:`bulk_add_scopes`'s own shared-collection
+       mechanism (:func:`_create_named_collection`), never a second one.
+    """
+    if per_folder_collections:
+        return None
+    if target_collection_id:
+        target = file_corpora_repo().get(target_collection_id)
+        if target is None:
+            raise HTTPException(status_code=404, detail={"error": "collection_not_found"})
+        return _collection_ref(target)
+    if target_name:
+        return {"id": None, "name": target_name, "slug": None}
+
+    scopes_with_collection = [s for s in _scopes(row) if s.get("collection_id")]
+    if len(scopes_with_collection) == 1:
+        existing = file_corpora_repo().get(scopes_with_collection[0]["collection_id"])
+        if existing is not None:
+            return _collection_ref(existing)
+
+    source_name = row.get("name") or row["id"]
+    return {"id": None, "name": source_name, "slug": None}
+
+
 @router.get("/connections/{connection_id}/split-plan")
 async def split_plan(
     connection_id: str,
     n: int = Query(..., ge=1, le=_SPLIT_MAX_N),
     min_modified: Optional[str] = None,
     drive_id: Optional[str] = None,
+    target_collection_id: Optional[str] = None,
+    target_name: Optional[str] = None,
+    per_folder_collections: bool = False,
     _user: dict = Depends(require_admin),
 ):
     """Read-only preview of splitting this connection's site into ``n``
@@ -2472,13 +2709,22 @@ async def split_plan(
     automates) can never cover them; an admin sees exactly what would be
     left behind rather than discovering it after the fact.
 
+    ``target_collection_id``/``target_name``/``per_folder_collections`` —
+    same options and validation as ``POST …/splits`` (see
+    :func:`_resolve_split_target_collection_ref`) — preview what collection
+    the apply call WOULD route every part's scopes to, without minting
+    anything: the response's ``collection`` is ``null`` only when
+    ``per_folder_collections=true``, otherwise ``{id, name, slug}`` with
+    ``id``/``slug`` themselves ``null`` for a collection that does not
+    exist yet (a named target, or the "mint one after the source" default).
+
     Response: ``{drive_id, folders: [{name, documents}], loose_root_files:
     [names], groups: [{name, folders: [{name, documents}], documents}],
-    total_documents}`` — ``groups[].name`` is the EXACT name ``POST …/splits``
-    will give the corresponding clone (:func:`connectors.sharepoint.
-    site_split.format_group_name`), so an admin previewing this can see
-    ahead of time what will collide with ``409 split_exists`` on a repeat
-    apply.
+    total_documents, collection}`` — ``groups[].name`` is the EXACT name
+    ``POST …/splits`` will give the corresponding clone
+    (:func:`connectors.sharepoint.site_split.format_group_name`), so an
+    admin previewing this can see ahead of time what will collide with
+    ``409 split_exists`` on a repeat apply.
 
     ``404`` for an unknown/non-SharePoint connection id. A Graph failure
     while listing the root (not a per-folder count failure — those degrade
@@ -2487,6 +2733,20 @@ async def split_plan(
     """
     row = _sharepoint_connection_or_404(connection_id)
     _validate_min_modified(min_modified)
+    _validate_split_collection_target(
+        target_collection_id=target_collection_id,
+        target_name=target_name,
+        per_folder_collections=per_folder_collections,
+    )
+    # Resolved BEFORE the live Graph read below — a bad `target_collection_id`
+    # is a cheap DB precondition, so it fails fast (`404 collection_not_found`)
+    # without needing a mocked/reachable Graph endpoint at all.
+    collection_ref = _resolve_split_target_collection_ref(
+        row,
+        target_collection_id=target_collection_id,
+        target_name=target_name,
+        per_folder_collections=per_folder_collections,
+    )
 
     plan = await _compute_split_plan(row, n=n, min_modified=min_modified, drive_id=drive_id)
 
@@ -2499,6 +2759,7 @@ async def split_plan(
             for g in plan["groups"]
         ],
         "total_documents": plan["total_documents"],
+        "collection": collection_ref,
     }
 
 
@@ -2515,10 +2776,37 @@ async def apply_split(
     wired to the same credential material as the source
     (:func:`_cloned_base_config`, the same helper ``POST …/clone`` uses) and
     given its own slice of the source's top-level folders as confirmed
-    scopes — the same scope-row shape and collection-minting call
-    (:func:`_create_scope_collection`) ``POST …/scopes/bulk`` uses, so a
+    scopes — the same scope-row shape ``POST …/scopes/bulk`` uses, so a
     split clone looks identical to one built by hand through clone +
     bulk-add.
+
+    **Collection routing** (default: ONE shared collection for the whole
+    site — see :func:`_resolve_split_target_collection_ref`, the SAME
+    resolution :func:`split_plan` previews): every part's scopes route to
+    that one collection, using the identical "assign the precomputed
+    ``collection_id`` directly, no per-folder mint" mechanism
+    ``POST …/scopes/bulk``'s own ``collection_id`` option already uses —
+    never a second one. ``body.target_collection_id``/``body.target`` name
+    an explicit shared target instead (same shape
+    ``ConsolidateCollectionsBody`` uses; mutually exclusive with each other
+    — ``400 both_target_collection_id_and_target`` — and with
+    ``body.per_folder_collections`` — ``400
+    per_folder_collections_and_target``); ``body.per_folder_collections:
+    true`` restores the OLD default — every folder mints its own
+    collection (:func:`_create_scope_collection`), forking the site across
+    as many collections as there are folders across every part, same as
+    before this shared default existed.
+
+    **Lineage**: every part's ``config.split`` records
+    ``{parent_connection_id, part, n, created_at}`` (``part`` 1-indexed,
+    matching the ``"part i/n"`` name) — read by ``POST …/collections/
+    consolidate {include_split_siblings: true}`` (see
+    :func:`_split_family_connection_ids`) to find every part of THIS split
+    without guessing off name patterns, and carried forward across an
+    ordinary connection edit the same way every other server-written
+    SharePoint config key is (:data:`connectors.sharepoint.site_split.
+    SPLIT_SERVER_WRITTEN_CONFIG_KEYS`).
+
     ``body.min_modified`` is written onto each clone's
     ``config.extraction.crawl.min_modified`` — the exact key
     ``PATCH …/extraction/crawl-config`` writes and the crawl reads
@@ -2542,11 +2830,29 @@ async def apply_split(
     satisfied; the clones themselves are still created either way.
 
     Returns ``{"connections": [{id, name, folders: [{name, documents}],
-    documents}]}`` — one entry per created clone, in the same order as
-    ``split_plan``'s own ``groups``.
+    documents}], "collection": {id, name, slug} | null}`` — one connection
+    entry per created clone, in the same order as ``split_plan``'s own
+    ``groups``; ``collection`` is the resolved/minted shared target (``null``
+    only when ``per_folder_collections=true``).
     """
     row = _sharepoint_connection_or_404(connection_id)
     _validate_min_modified(body.min_modified)
+    _validate_split_collection_target(
+        target_collection_id=body.target_collection_id,
+        target_name=body.target.name if body.target else None,
+        per_folder_collections=body.per_folder_collections,
+    )
+    # Resolved BEFORE the live Graph read below — a bad `target_collection_id`
+    # is a cheap DB precondition, so it fails fast (`404 collection_not_found`)
+    # without needing a mocked/reachable Graph endpoint at all. NEVER mints
+    # here — a NAMED target (or the "mint after the source" default) is only
+    # minted once the plan itself has succeeded, below.
+    shared_collection_ref = _resolve_split_target_collection_ref(
+        row,
+        target_collection_id=body.target_collection_id,
+        target_name=body.target.name if body.target else None,
+        per_folder_collections=body.per_folder_collections,
+    )
 
     if body.retry_mode is not None:
         from connectors.sharepoint.facts_extraction import _VALID_RETRY_MODES
@@ -2576,6 +2882,24 @@ async def apply_split(
     plan = await _compute_split_plan(row, n=body.n, min_modified=body.min_modified, drive_id=None)
     base_config = _cloned_base_config(row)
 
+    # Mint the shared target NOW if it doesn't exist yet (a named target, or
+    # the "mint one after the source" default) — deferred until the plan
+    # above has actually succeeded, and minted AT MOST once for the whole
+    # split, never once per folder or once per part (that would be exactly
+    # the fork this default exists to avoid). `per_folder_collections=True`
+    # leaves `shared_collection_ref` `None`, and each folder mints its own
+    # below, as before.
+    shared_collection_id: Optional[str] = None
+    if shared_collection_ref is not None:
+        shared_collection_id = shared_collection_ref["id"]
+        if shared_collection_id is None:
+            shared_collection_id = _create_named_collection(
+                name=shared_collection_ref["name"], created_by=user.get("id")
+            )
+            minted = file_corpora_repo().get(shared_collection_id)
+            if minted is not None:
+                shared_collection_ref = _collection_ref(minted)
+
     extraction_cfg: Dict[str, Any] = {}
     if body.min_modified:
         extraction_cfg["crawl"] = {"min_modified": body.min_modified}
@@ -2587,16 +2911,21 @@ async def apply_split(
     if facts_cfg:
         extraction_cfg["facts"] = facts_cfg
 
+    split_created_at = datetime.now(timezone.utc).isoformat()
+
     created: List[Dict[str, Any]] = []
-    for name, group in zip(target_names, plan["groups"]):
+    for part, (name, group) in enumerate(zip(target_names, plan["groups"]), start=1):
         scope_rows = []
         for folder in group["folders"]:
-            collection_id = _create_scope_collection(
-                connection_name=name,
-                display_path=folder["name"],
-                source_scope_id=folder["id"],
-                created_by=user.get("id"),
-            )
+            if shared_collection_id is not None:
+                collection_id = shared_collection_id
+            else:
+                collection_id = _create_scope_collection(
+                    connection_name=name,
+                    display_path=folder["name"],
+                    source_scope_id=folder["id"],
+                    created_by=user.get("id"),
+                )
             scope_rows.append(
                 {
                     "source_scope_id": folder["id"],
@@ -2609,7 +2938,16 @@ async def apply_split(
                 }
             )
 
-        new_config: Dict[str, Any] = {**base_config, "scopes": scope_rows}
+        new_config: Dict[str, Any] = {
+            **base_config,
+            "scopes": scope_rows,
+            "split": {
+                "parent_connection_id": connection_id,
+                "part": part,
+                "n": body.n,
+                "created_at": split_created_at,
+            },
+        }
         if extraction_cfg:
             new_config["extraction"] = dict(extraction_cfg)
 
@@ -2659,11 +2997,13 @@ async def apply_split(
             "retry_mode": body.retry_mode,
             "start": body.start,
             "created_ids": [c["id"] for c in created],
+            "shared_collection_id": shared_collection_id,
+            "per_folder_collections": body.per_folder_collections,
         },
         result="success",
     )
 
-    return {"connections": created}
+    return {"connections": created, "collection": shared_collection_ref}
 
 
 # ---------------------------------------------------------------------------

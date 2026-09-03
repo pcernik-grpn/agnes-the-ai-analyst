@@ -2827,3 +2827,61 @@ class TestSharePointScopesSurviveOrdinaryEdits:
             "unmatched": 1,
         }
         assert r.json()["config"].get("acl_sync_last_success_at") == "2026-08-30T00:00:00+00:00"
+
+    def test_editing_config_without_split_preserves_it(self, seeded_app):
+        """``config.split`` (site-split lineage,
+        ``app/api/admin_sharepoint.py::apply_split``) is written once, at
+        connection-CREATE time — never via an ``....update(config=...)``
+        call, so it is NOT part of ``SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS``
+        (that tuple's own ratchet is scoped to that one write shape) but
+        must be carried forward the SAME "explicit wins" way, or an
+        ordinary edit through this endpoint would silently drop the
+        connection's site-split lineage — the thing
+        ``POST …/collections/consolidate {include_split_siblings: true}``
+        reads to find this connection's siblings."""
+        c, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = self._connection_with_scopes(c, token, name="sp-split-preserve")
+
+        from src.repositories import source_connections_repo
+
+        row = source_connections_repo().get(conn_id)
+        config = dict(row["config"])
+        config["split"] = {
+            "parent_connection_id": "parent-1",
+            "part": 1,
+            "n": 2,
+            "created_at": "2026-09-03T00:00:00+00:00",
+        }
+        source_connections_repo().update(conn_id, config=config)
+
+        r = c.put(
+            f"{BASE}/{conn_id}",
+            json={"config": {"tenant_id": "tenant-1", "client_id": "client-1"}},
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["config"].get("split") == {
+            "parent_connection_id": "parent-1",
+            "part": 1,
+            "n": 2,
+            "created_at": "2026-09-03T00:00:00+00:00",
+        }
+
+    def test_editing_config_with_explicit_null_split_clears_it(self, seeded_app):
+        c, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = self._connection_with_scopes(c, token, name="sp-split-explicit-clear")
+
+        from src.repositories import source_connections_repo
+
+        row = source_connections_repo().get(conn_id)
+        config = dict(row["config"])
+        config["split"] = {"parent_connection_id": "parent-1", "part": 1, "n": 2, "created_at": "x"}
+        source_connections_repo().update(conn_id, config=config)
+
+        r = c.put(
+            f"{BASE}/{conn_id}",
+            json={"config": {"tenant_id": "tenant-1", "client_id": "client-1", "split": None}},
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["config"].get("split") is None

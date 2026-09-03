@@ -407,6 +407,49 @@ class TestCollectionsConsolidate:
         assert result.exit_code == 1
         assert "collection_referenced_by_other_connection" in result.output
 
+    def test_site_flag_rides_the_payload(self):
+        body = {
+            "dry_run": True,
+            "target": {"id": None, "name": "Merged", "slug": None},
+            "sources": [],
+            "blocking": [],
+            "connection_ids": ["conn1", "conn2"],
+            "running": [],
+        }
+        with patch("cli.commands.admin_sharepoint.api_post", return_value=_resp(200, body)) as mock_post:
+            result = runner.invoke(
+                app,
+                ["admin", "sharepoint", "collections", "consolidate", "conn1", "--target-name", "Merged", "--site"],
+            )
+        assert result.exit_code == 0, result.output
+        _, kwargs = mock_post.call_args
+        assert kwargs["json"] == {"dry_run": True, "include_split_siblings": True, "target": {"name": "Merged"}}
+
+    def test_without_site_the_payload_omits_the_key(self):
+        body = {"dry_run": True, "target": {"id": "t", "name": "T", "slug": "t"}, "sources": [], "blocking": []}
+        with patch("cli.commands.admin_sharepoint.api_post", return_value=_resp(200, body)) as mock_post:
+            runner.invoke(app, ["admin", "sharepoint", "collections", "consolidate", "conn1", "--target-name", "T"])
+        _, kwargs = mock_post.call_args
+        assert "include_split_siblings" not in kwargs["json"]
+
+    def test_running_siblings_are_warned_about(self):
+        body = {
+            "dry_run": True,
+            "target": {"id": None, "name": "Merged", "slug": None},
+            "sources": [],
+            "blocking": [],
+            "connection_ids": ["conn1", "conn2"],
+            "running": ["conn2"],
+        }
+        with patch("cli.commands.admin_sharepoint.api_post", return_value=_resp(200, body)):
+            result = runner.invoke(
+                app,
+                ["admin", "sharepoint", "collections", "consolidate", "conn1", "--target-name", "Merged", "--site"],
+            )
+        assert result.exit_code == 0, result.output
+        assert "conn2" in result.output
+        assert "sibling_crawl_running" in result.output
+
 
 class TestSplitMergeCmd:
     """`agnes admin sharepoint split-merge` — CLI counterpart to
@@ -636,6 +679,7 @@ class TestSplitPlanCmd:
                 {"name": "site — part 2/2", "folders": [{"name": "Small", "documents": 10}], "documents": 10},
             ],
             "total_documents": 110,
+            "collection": {"id": "col_1", "name": "site", "slug": "site"},
         }
 
     def test_happy_path_prints_a_table(self):
@@ -683,6 +727,79 @@ class TestSplitPlanCmd:
             result = runner.invoke(app, ["admin", "sharepoint", "split-plan", "conn1", "--n", "2"])
         assert result.exit_code == 1
         assert "drive_id was not supplied" in result.output
+
+    def test_shared_collection_is_printed(self):
+        with patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(200, self._plan_body())):
+            result = runner.invoke(app, ["admin", "sharepoint", "split-plan", "conn1", "--n", "2"])
+        assert result.exit_code == 0, result.output
+        assert "site (col_1)" in result.output
+
+    def test_per_folder_collections_prints_the_old_default(self):
+        body = self._plan_body()
+        body["collection"] = None
+        with patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(200, body)) as mock_get:
+            result = runner.invoke(
+                app, ["admin", "sharepoint", "split-plan", "conn1", "--n", "2", "--per-folder-collections"]
+            )
+        assert result.exit_code == 0, result.output
+        assert "OWN collection" in result.output
+        _, kwargs = mock_get.call_args
+        assert kwargs["params"] == {"n": 2, "per_folder_collections": True}
+
+    def test_collection_id_rides_the_query(self):
+        with patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(200, self._plan_body())) as mock_get:
+            result = runner.invoke(
+                app, ["admin", "sharepoint", "split-plan", "conn1", "--n", "2", "--collection-id", "col_1"]
+            )
+        assert result.exit_code == 0, result.output
+        _, kwargs = mock_get.call_args
+        assert kwargs["params"] == {"n": 2, "target_collection_id": "col_1"}
+
+    def test_collection_name_rides_the_query(self):
+        with patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(200, self._plan_body())) as mock_get:
+            result = runner.invoke(
+                app, ["admin", "sharepoint", "split-plan", "conn1", "--n", "2", "--collection-name", "Whole Site"]
+            )
+        assert result.exit_code == 0, result.output
+        _, kwargs = mock_get.call_args
+        assert kwargs["params"] == {"n": 2, "target_name": "Whole Site"}
+
+    def test_collection_id_and_collection_name_together_is_a_usage_error(self):
+        result = runner.invoke(
+            app,
+            [
+                "admin",
+                "sharepoint",
+                "split-plan",
+                "conn1",
+                "--n",
+                "2",
+                "--collection-id",
+                "col_1",
+                "--collection-name",
+                "X",
+            ],
+        )
+        assert result.exit_code == 1
+        assert "mutually exclusive" in result.output
+
+    def test_per_folder_collections_and_collection_id_together_is_a_usage_error(self):
+        result = runner.invoke(
+            app,
+            [
+                "admin",
+                "sharepoint",
+                "split-plan",
+                "conn1",
+                "--n",
+                "2",
+                "--per-folder-collections",
+                "--collection-id",
+                "col_1",
+            ],
+        )
+        assert result.exit_code == 1
+        assert "mutually exclusive" in result.output
 
 
 class TestCompletenessCmd:
@@ -879,6 +996,89 @@ class TestSplitCmd:
             result = runner.invoke(app, ["admin", "sharepoint", "split", "conn1", "--n", "2"])
         assert result.exit_code == 1
         assert "already exist" in result.output
+
+    def test_collection_id_rides_the_payload_and_is_printed(self):
+        body = self._split_body()
+        body["collection"] = {"id": "col_1", "name": "site", "slug": "site"}
+        with patch("cli.commands.admin_sharepoint.api_post", return_value=_resp(201, body)) as mock_post:
+            result = runner.invoke(
+                app, ["admin", "sharepoint", "split", "conn1", "--n", "2", "--collection-id", "col_1"]
+            )
+        assert result.exit_code == 0, result.output
+        assert "Shared collection: site (col_1)" in result.output
+        _, kwargs = mock_post.call_args
+        assert kwargs["json"] == {"n": 2, "start": False, "target_collection_id": "col_1"}
+
+    def test_collection_name_rides_the_payload(self):
+        body = self._split_body()
+        body["collection"] = {"id": "col_new", "name": "Whole Site", "slug": "whole-site"}
+        with patch("cli.commands.admin_sharepoint.api_post", return_value=_resp(201, body)) as mock_post:
+            result = runner.invoke(
+                app, ["admin", "sharepoint", "split", "conn1", "--n", "2", "--collection-name", "Whole Site"]
+            )
+        assert result.exit_code == 0, result.output
+        _, kwargs = mock_post.call_args
+        assert kwargs["json"] == {"n": 2, "start": False, "target": {"name": "Whole Site"}}
+
+    def test_per_folder_collections_rides_the_payload(self):
+        body = self._split_body()
+        body["collection"] = None
+        with patch("cli.commands.admin_sharepoint.api_post", return_value=_resp(201, body)) as mock_post:
+            result = runner.invoke(
+                app, ["admin", "sharepoint", "split", "conn1", "--n", "2", "--per-folder-collections"]
+            )
+        assert result.exit_code == 0, result.output
+        assert "Shared collection" not in result.output
+        _, kwargs = mock_post.call_args
+        assert kwargs["json"] == {"n": 2, "start": False, "per_folder_collections": True}
+
+    def test_collection_id_and_collection_name_together_is_a_usage_error(self):
+        result = runner.invoke(
+            app,
+            [
+                "admin",
+                "sharepoint",
+                "split",
+                "conn1",
+                "--n",
+                "2",
+                "--collection-id",
+                "col_1",
+                "--collection-name",
+                "X",
+            ],
+        )
+        assert result.exit_code == 1
+        assert "mutually exclusive" in result.output
+
+    def test_per_folder_collections_and_collection_name_together_is_a_usage_error(self):
+        result = runner.invoke(
+            app,
+            [
+                "admin",
+                "sharepoint",
+                "split",
+                "conn1",
+                "--n",
+                "2",
+                "--per-folder-collections",
+                "--collection-name",
+                "X",
+            ],
+        )
+        assert result.exit_code == 1
+        assert "mutually exclusive" in result.output
+
+    def test_unknown_collection_id_is_reported(self):
+        with patch(
+            "cli.commands.admin_sharepoint.api_post",
+            return_value=_resp(404, {"detail": {"error": "collection_not_found"}}),
+        ):
+            result = runner.invoke(
+                app, ["admin", "sharepoint", "split", "conn1", "--n", "2", "--collection-id", "nope"]
+            )
+        assert result.exit_code == 1
+        assert "collection_not_found" in result.output
 
 
 class TestFactsConfig:
