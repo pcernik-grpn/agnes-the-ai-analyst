@@ -1380,34 +1380,48 @@ which the clone already resolves on its own).
 
 `POST …/collections/consolidate` — CLI: `agnes admin sharepoint collections
 consolidate <connection_id>`; UI: the source card's overflow menu
-("Consolidate collections…") — the after-the-fact fix for a site that
-ALREADY ended up split across many per-scope collections (a large split
-predating the shared-collection option above, or several bulk-add calls
-without it). Body `{"target_collection_id"|"target": {"name"}, "dry_run"?}`
-— exactly one of `target_collection_id` (an existing, live collection — not
-necessarily one of this connection's own) or `target` (mint a new one) is
-required (`400 target_required` / `400
-both_target_collection_id_and_target`); an unknown `target_collection_id`
-is `404 collection_not_found`; no OTHER scope collection on this connection
-is `400 nothing_to_consolidate`. `dry_run` defaults to `true` — a pure
-preview (`{"dry_run", "target", "sources": [{"id", "name", "slug",
-"file_count"}], "blocking"}`; a NAMED `target` is not minted during a
-preview, so `target.id` is `null` there) that touches nothing. Set
-`dry_run: false` to perform the real merge: every row carrying a
-`corpus_id` for a source collection (`corpus_files`, `corpus_chunks`,
-`corpus_file_sources`, `corpus_file_events`, `claims`,
-`fact_alias_sources`) is re-pointed to the target in ONE transaction, every
-one of this connection's scopes that routed to a source now routes to the
-target, the sources' `resource_grants` are unioned onto the target (ties
-go to the target's own pre-existing grant), and the emptied sources are
-soft-deleted. Refused with `409 collection_referenced_by_other_connection`
-(nothing touched) when a source is still routed to by a DIFFERENT
-connection's own scope, and `409 consolidation_conflict` (nothing touched)
-when the merge would collide on a duplicate `corpus_files.path` or
-`corpus_file_sources.source_stable_id` across the collections being
-folded. PG-only (A3 ratchet) — `501 requires_postgres_backend` on a
-DuckDB-backed instance. ACL-mirroring permission zones
-(`config.acl_zones`) are NOT touched — only scope-level collections.
+("Consolidate collections…", an inline drawer row) — the after-the-fact fix
+for a site that ALREADY ended up split across many per-scope collections (a
+large split predating the shared-collection default below, or several
+bulk-add calls without it). Body `{"target_collection_id"|"target":
+{"name"}, "dry_run"?, "include_split_siblings"?}` — exactly one of
+`target_collection_id` (an existing, live collection — not necessarily one
+of this connection's own) or `target` (mint a new one) is required (`400
+target_required` / `400 both_target_collection_id_and_target`); an unknown
+`target_collection_id` is `404 collection_not_found`; no OTHER scope
+collection on this connection (or its family, with
+`include_split_siblings`) is `400 nothing_to_consolidate`. `dry_run`
+defaults to `true` — a pure preview (`{"dry_run", "target", "sources":
+[{"id", "name", "slug", "file_count"}], "blocking", "connection_ids",
+"running"}`; a NAMED `target` is not minted during a preview, so `target.id`
+is `null` there) that touches nothing. Set `dry_run: false` to perform the
+real merge: every row carrying a `corpus_id` for a source collection
+(`corpus_files`, `corpus_chunks`, `corpus_file_sources`,
+`corpus_file_events`, `claims`, `fact_alias_sources`) is re-pointed to the
+target in ONE transaction, every scope (across the whole fold) that routed
+to a source now routes to the target, the sources' `resource_grants` are
+unioned onto the target (ties go to the target's own pre-existing grant),
+and the emptied sources are soft-deleted. Refused with `409
+collection_referenced_by_other_connection` (nothing touched) when a source
+is still routed to by a connection OUTSIDE the fold, and `409
+consolidation_conflict` (nothing touched) when the merge would collide on a
+duplicate `corpus_files.path` or `corpus_file_sources.source_stable_id`
+across the collections being folded. PG-only (A3 ratchet) — `501
+requires_postgres_backend` on a DuckDB-backed instance. ACL-mirroring
+permission zones (`config.acl_zones`) are NOT touched — only scope-level
+collections.
+
+`include_split_siblings: true` (CLI `--site`) widens the fold from THIS
+connection alone to its whole site-split family — every OTHER connection
+`POST …/splits` created together with it (sharing its `config.split
+.parent_connection_id`), plus the connection it split FROM — folded into
+ONE target in ONE call instead of N repeats with the same target
+(`connection_ids` in the response lists the whole family). A sibling's own
+scope routing to a source is never "foreign" (that guard is only for a
+connection genuinely OUTSIDE the fold). Refused with `409
+sibling_crawl_running` (nothing touched, checked before the real merge —
+`running` in the preview response reports it ahead of time) when a family
+member currently has a `corpus-extraction` job queued/running.
 
 `GET …/split-plan` / `POST …/splits` — CLI: `agnes admin sharepoint
 split-plan <connection_id> --n <n>` / `agnes admin sharepoint split
@@ -1421,31 +1435,63 @@ which throttles under repetition and biases its own first pages. A folder
 whose count could not be read is still packed into a group at `documents:
 0`, never dropped from the plan.
 
-`GET …/split-plan?n=<n>[&min_modified=YYYY-MM-DD][&drive_id=<id>]` is
-read-only — no state written. `drive_id` is optional, same inference as
-`scopes/bulk` (reused from the connection's first existing scope; `400
-drive_id_required` if neither is available). Response: `{drive_id, folders:
-[{name, documents}], loose_root_files: [names], groups: [{name, folders:
-[{name, documents}], documents}], total_documents}` — `loose_root_files`
-lists drive-root items that are FILES, not folders, so a folder-based split
-can never cover them; `groups[].name` (`"<source name> — part i/n"`) is the
-exact name `POST …/splits` will give the corresponding clone.
+**Collection routing (both endpoints, same options and validation)**:
+every part's scopes route to ONE shared collection by DEFAULT — this
+connection's own, when it has exactly one confirmed scope carrying a
+`collection_id` (the common "one root scope, not yet split" shape),
+otherwise a new collection minted named after the source connection — using
+the SAME "assign the precomputed `collection_id` directly" mechanism
+`scopes/bulk`'s own `collection_id` option already uses, never a second one.
+`target_collection_id`/`target: {"name"}` (query params on `split-plan`:
+`target_collection_id`/`target_name`) name an explicit shared target
+instead — mutually exclusive with each other (`400
+both_target_collection_id_and_target`) and with `per_folder_collections`
+(`400 per_folder_collections_and_target`); an unknown/soft-deleted
+`target_collection_id` is `404 collection_not_found`.
+`per_folder_collections: true` restores the OLD default: every folder
+mints its own collection (`agnes admin sharepoint scope bulk-add`'s
+un-shared shape), forking the site across as many collections as there are
+folders. Every part created by `POST …/splits` also records
+`config.split = {parent_connection_id, part, n, created_at}` — the lineage
+`POST …/collections/consolidate {include_split_siblings: true}` reads to
+find every part of the split without guessing off name patterns; carried
+forward across an ordinary connection edit the same way every other
+server-written SharePoint config key is
+(`connectors.sharepoint.site_split.SPLIT_SERVER_WRITTEN_CONFIG_KEYS`).
+
+`GET …/split-plan?n=<n>[&min_modified=YYYY-MM-DD][&drive_id=<id>]
+[&target_collection_id=<id>|&target_name=<name>][&per_folder_collections=true]`
+is read-only — no state written, no collection minted even for a named
+target (the response's `collection.id` is `null` for a not-yet-minted one).
+`drive_id` is optional, same inference as `scopes/bulk` (reused from the
+connection's first existing scope; `400 drive_id_required` if neither is
+available). Response: `{drive_id, folders: [{name, documents}],
+loose_root_files: [names], groups: [{name, folders: [{name, documents}],
+documents}], total_documents, collection}` — `loose_root_files` lists
+drive-root items that are FILES, not folders, so a folder-based split can
+never cover them; `groups[].name` (`"<source name> — part i/n"`) is the
+exact name `POST …/splits` will give the corresponding clone; `collection`
+is `{id, name, slug}` (the shared target this split would use — `id`/`slug`
+`null` if not minted yet) or `null` only when `per_folder_collections=true`.
 
 `POST …/splits` body `{"n", "min_modified"?, "transport"?: "sync"|"batch",
-"retry_mode"?, "start"?: bool}` creates all `n` clones AND their scopes in
+"retry_mode"?, "start"?: bool, "target_collection_id"?, "target"?: {"name"},
+"per_folder_collections"?: bool}` creates all `n` clones AND their scopes in
 one call (the same `clone` + `scopes/bulk` primitives above, run
 automatically): `409 split_exists` if connections named like this split
 already exist, checked BEFORE creating anything — a repeat call never
 double-creates. `min_modified`, when given, is written onto EACH clone's
-`config.extraction.crawl.min_modified` (bookkeeping today — no admin-facing
-crawl date filter reads that key yet); `transport`/`retry_mode` land on each
-clone's `config.extraction.facts`, the same keys `PATCH …/extraction
+`config.extraction.crawl.min_modified` — the same key the built-in crawl
+reads (`resolve_min_modified`) and `PATCH …/extraction/crawl-config`
+writes; `transport`/`retry_mode` land on each clone's
+`config.extraction.facts`, the same keys `PATCH …/extraction
 /facts-config` writes. `start: true` enqueues each clone's
 `corpus-extraction` job immediately after creating it, in creation order —
 skipped silently, never a failed apply, when extraction readiness
 (`sharepoint.enabled` / the `extraction` extra) is not currently satisfied.
 Returns `{"connections": [{id, name, folders: [{name, documents}],
-documents}]}`, one entry per created clone.
+documents}], "collection"}`, one connection entry per created clone plus the
+resolved/minted shared target (`null` only for `per_folder_collections`).
 
 `POST …/acl-sync` is the admin "sync now" trigger for the
 `sharepoint-acl-sync` job (spec §5.1) — enqueues

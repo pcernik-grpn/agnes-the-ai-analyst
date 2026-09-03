@@ -2371,6 +2371,21 @@ class TestConsolidateCollectionsFailsCleanOnDuckDB:
         assert r.status_code == 501
         assert r.json()["error"] == "requires_postgres_backend"
 
+    def test_include_split_siblings_still_501s_on_duckdb_backend(self, seeded_app):
+        """`include_split_siblings` widens which collections are folded but
+        never changes WHICH repo does the folding — still typed 501, never
+        a raw 500, on a DuckDB-backed instance."""
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = self._connection_with_two_scopes(c, token, "consolidate-duckdb-siblings")
+        r = c.post(
+            f"{BASE}/{conn_id}/collections/consolidate",
+            json={"target": {"name": "Merged"}, "include_split_siblings": True},
+            headers=_auth(token),
+        )
+        assert r.status_code == 501
+        assert r.json()["error"] == "requires_postgres_backend"
+
 
 # ---------------------------------------------------------------------------
 # Extraction enqueue wiring (TCRD-226) — the admin trigger + the scheduled
@@ -4104,6 +4119,111 @@ class TestSplitPlan:
         assert body["folders"] == [{"name": "Flaky", "documents": 0}]
         assert len(body["groups"][0]["folders"]) == 1
 
+    def test_collection_defaults_to_the_source_single_existing_scope(self, seeded_app, monkeypatch):
+        """The default shared-collection resolution reuses the source's OWN
+        collection when it has exactly one confirmed scope carrying a
+        `collection_id` — the common "one root scope, not yet split" shape
+        `_confirm_scope_with_drive` produces."""
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="split-plan-collection-default")
+        _confirm_scope_with_drive(c, token, conn_id)
+        scopes = c.get(f"{BASE}/{conn_id}/scopes", headers=_auth(token)).json()["items"]
+        existing_collection_id = scopes[0]["collection_id"]
+
+        _install_split_mock(monkeypatch, root_children=[_split_folder("f1", "A")], counts={})
+
+        r = c.get(f"{BASE}/{conn_id}/split-plan?n=1", headers=_auth(token))
+        assert r.status_code == 200, r.text
+        assert r.json()["collection"]["id"] == existing_collection_id
+
+    def test_collection_defaults_to_a_new_name_when_no_single_scope(self, seeded_app, monkeypatch):
+        """No confirmed scope at all (nothing to reuse) falls back to
+        minting one collection named after the source connection — not yet
+        minted during a read-only preview, so `id`/`slug` stay `None`."""
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="split-plan-collection-noscope")
+
+        _install_split_mock(monkeypatch, root_children=[_split_folder("f1", "A")], counts={})
+
+        r = c.get(f"{BASE}/{conn_id}/split-plan?n=1&drive_id=drv1", headers=_auth(token))
+        assert r.status_code == 200, r.text
+        assert r.json()["collection"] == {"id": None, "name": "split-plan-collection-noscope", "slug": None}
+
+    def test_per_folder_collections_reports_null_collection(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="split-plan-per-folder")
+        _confirm_scope_with_drive(c, token, conn_id)
+        _install_split_mock(monkeypatch, root_children=[_split_folder("f1", "A")], counts={})
+
+        r = c.get(f"{BASE}/{conn_id}/split-plan?n=1&per_folder_collections=true", headers=_auth(token))
+        assert r.status_code == 200, r.text
+        assert r.json()["collection"] is None
+
+    def test_explicit_target_collection_id_is_previewed(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="split-plan-explicit-target")
+        _confirm_scope_with_drive(c, token, conn_id)
+        scopes = c.get(f"{BASE}/{conn_id}/scopes", headers=_auth(token)).json()["items"]
+        target_id = scopes[0]["collection_id"]
+        _install_split_mock(monkeypatch, root_children=[_split_folder("f1", "A")], counts={})
+
+        r = c.get(
+            f"{BASE}/{conn_id}/split-plan?n=1&target_collection_id={target_id}",
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["collection"]["id"] == target_id
+
+    def test_unknown_target_collection_id_is_404(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="split-plan-404-target")
+        _confirm_scope_with_drive(c, token, conn_id)
+
+        r = c.get(
+            f"{BASE}/{conn_id}/split-plan?n=1&target_collection_id=does-not-exist",
+            headers=_auth(token),
+        )
+        assert r.status_code == 404, r.text
+        assert r.json()["detail"]["error"] == "collection_not_found"
+
+    def test_both_target_fields_is_400(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="split-plan-both-target")
+        _confirm_scope_with_drive(c, token, conn_id)
+
+        r = c.get(
+            f"{BASE}/{conn_id}/split-plan?n=1&target_collection_id=x&target_name=y",
+            headers=_auth(token),
+        )
+        assert r.status_code == 400, r.text
+        assert r.json()["detail"]["error"] == "both_target_collection_id_and_target"
+
+    def test_per_folder_collections_and_target_is_400(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="split-plan-per-folder-and-target")
+        _confirm_scope_with_drive(c, token, conn_id)
+
+        r = c.get(
+            f"{BASE}/{conn_id}/split-plan?n=1&per_folder_collections=true&target_name=y",
+            headers=_auth(token),
+        )
+        assert r.status_code == 400, r.text
+        assert r.json()["detail"]["error"] == "per_folder_collections_and_target"
+
 
 class TestSplitApply:
     """``POST …/splits`` — create N sibling connections from a split plan."""
@@ -4241,6 +4361,224 @@ class TestSplitApply:
         assert params["n"] == 1
         assert params["created_ids"] == created_ids
         assert rows[0]["resource"] == f"source_connection:{conn_id}"
+
+    def test_default_shares_one_collection_across_every_part_reusing_the_source_single_scope(
+        self, seeded_app, monkeypatch
+    ):
+        """A site of 400 folders must not become 400 collections nobody has
+        a grant to — the DEFAULT routes every part's scopes to ONE shared
+        collection. When the source has exactly one confirmed scope
+        carrying a `collection_id` (the common "one root scope" shape),
+        that IS the shared collection — reused, not re-minted."""
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="split-apply-shared-default")
+        _confirm_scope_with_drive(c, token, conn_id)
+        scopes = c.get(f"{BASE}/{conn_id}/scopes", headers=_auth(token)).json()["items"]
+        existing_collection_id = scopes[0]["collection_id"]
+
+        root_children = [_split_folder("f-big", "Big"), _split_folder("f-small", "Small")]
+        counts = {
+            "https://example.sharepoint.com/sites/s/Docs/Big": 100,
+            "https://example.sharepoint.com/sites/s/Docs/Small": 10,
+        }
+        _install_split_mock(monkeypatch, root_children=root_children, counts=counts)
+
+        r = c.post(f"{BASE}/{conn_id}/splits", json={"n": 2}, headers=_auth(token))
+        assert r.status_code == 201, r.text
+        body = r.json()
+        assert body["collection"]["id"] == existing_collection_id
+
+        all_collection_ids = set()
+        for entry in body["connections"]:
+            detail = c.get(f"/api/admin/source-connections/{entry['id']}", headers=_auth(token)).json()
+            for scope in detail["config"]["scopes"]:
+                all_collection_ids.add(scope["collection_id"])
+        assert all_collection_ids == {existing_collection_id}
+
+    def test_default_mints_one_new_collection_when_source_has_no_single_scope(self, seeded_app, monkeypatch):
+        """`apply_split` always infers its drive from an EXISTING scope
+        (`_compute_split_plan(..., drive_id=None)`), so the "no single
+        scope" case that falls through to minting a NEW collection is not
+        "zero scopes" (that 400s on `drive_id_required` before reaching
+        collection resolution at all) but "more than one" — two confirmed
+        scopes here, each with its OWN `collection_id`, so neither is
+        reused; a fresh, source-named collection is minted for the split
+        instead."""
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="split-apply-mint-default")
+        _confirm_scope_with_drive(c, token, conn_id, source_scope_id="seed-1", display_path="Seed1")
+        _confirm_scope_with_drive(c, token, conn_id, source_scope_id="seed-2", display_path="Seed2")
+
+        root_children = [_split_folder("f-big", "Big"), _split_folder("f-small", "Small")]
+        _install_split_mock(monkeypatch, root_children=root_children, counts={})
+
+        r = c.post(f"{BASE}/{conn_id}/splits", json={"n": 2}, headers=_auth(token))
+        assert r.status_code == 201, r.text
+        body = r.json()
+        assert body["collection"] == {
+            "id": body["collection"]["id"],
+            "name": "split-apply-mint-default",
+            "slug": body["collection"]["slug"],
+        }
+        minted_id = body["collection"]["id"]
+        assert minted_id is not None
+
+        scopes = c.get(f"{BASE}/{conn_id}/scopes", headers=_auth(token)).json()["items"]
+        existing_ids = {s["collection_id"] for s in scopes}
+        assert minted_id not in existing_ids  # a genuinely NEW collection, not one of the source's own two
+
+        for entry in body["connections"]:
+            detail = c.get(f"/api/admin/source-connections/{entry['id']}", headers=_auth(token)).json()
+            assert all(scope["collection_id"] == minted_id for scope in detail["config"]["scopes"])
+
+    def test_explicit_target_collection_id_routes_every_part(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="split-apply-explicit-target-id")
+        _confirm_scope_with_drive(c, token, conn_id)
+        scopes = c.get(f"{BASE}/{conn_id}/scopes", headers=_auth(token)).json()["items"]
+        target_id = scopes[0]["collection_id"]
+
+        root_children = [_split_folder("f1", "A"), _split_folder("f2", "B")]
+        _install_split_mock(monkeypatch, root_children=root_children, counts={})
+
+        r = c.post(
+            f"{BASE}/{conn_id}/splits",
+            json={"n": 2, "target_collection_id": target_id},
+            headers=_auth(token),
+        )
+        assert r.status_code == 201, r.text
+        body = r.json()
+        assert body["collection"]["id"] == target_id
+        for entry in body["connections"]:
+            detail = c.get(f"/api/admin/source-connections/{entry['id']}", headers=_auth(token)).json()
+            assert all(scope["collection_id"] == target_id for scope in detail["config"]["scopes"])
+
+    def test_explicit_target_name_mints_exactly_one_collection_for_the_whole_split(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="split-apply-explicit-target-name")
+        _confirm_scope_with_drive(c, token, conn_id)
+
+        root_children = [_split_folder("f1", "A"), _split_folder("f2", "B")]
+        _install_split_mock(monkeypatch, root_children=root_children, counts={})
+
+        r = c.post(
+            f"{BASE}/{conn_id}/splits",
+            json={"n": 2, "target": {"name": "Whole Site"}},
+            headers=_auth(token),
+        )
+        assert r.status_code == 201, r.text
+        body = r.json()
+        assert body["collection"]["name"] == "Whole Site"
+        minted_id = body["collection"]["id"]
+        assert minted_id is not None
+
+        for entry in body["connections"]:
+            detail = c.get(f"/api/admin/source-connections/{entry['id']}", headers=_auth(token)).json()
+            assert all(scope["collection_id"] == minted_id for scope in detail["config"]["scopes"])
+
+    def test_per_folder_collections_restores_the_old_one_per_folder_behavior(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="split-apply-per-folder")
+        _confirm_scope_with_drive(c, token, conn_id)
+
+        root_children = [_split_folder("f1", "A"), _split_folder("f2", "B")]
+        _install_split_mock(monkeypatch, root_children=root_children, counts={})
+
+        r = c.post(
+            f"{BASE}/{conn_id}/splits",
+            json={"n": 2, "per_folder_collections": True},
+            headers=_auth(token),
+        )
+        assert r.status_code == 201, r.text
+        body = r.json()
+        assert body["collection"] is None
+
+        all_collection_ids = set()
+        for entry in body["connections"]:
+            detail = c.get(f"/api/admin/source-connections/{entry['id']}", headers=_auth(token)).json()
+            for scope in detail["config"]["scopes"]:
+                all_collection_ids.add(scope["collection_id"])
+        # Two folders (A, B), each split into its OWN part (n=2) — two
+        # distinct, freshly minted collections, never shared.
+        assert len(all_collection_ids) == 2
+
+    def test_both_target_fields_is_400(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="split-apply-both-target")
+        _confirm_scope_with_drive(c, token, conn_id)
+
+        r = c.post(
+            f"{BASE}/{conn_id}/splits",
+            json={"n": 1, "target_collection_id": "x", "target": {"name": "y"}},
+            headers=_auth(token),
+        )
+        assert r.status_code == 400, r.text
+        assert r.json()["detail"]["error"] == "both_target_collection_id_and_target"
+
+    def test_per_folder_collections_and_target_is_400(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="split-apply-per-folder-and-target")
+        _confirm_scope_with_drive(c, token, conn_id)
+
+        r = c.post(
+            f"{BASE}/{conn_id}/splits",
+            json={"n": 1, "per_folder_collections": True, "target": {"name": "y"}},
+            headers=_auth(token),
+        )
+        assert r.status_code == 400, r.text
+        assert r.json()["detail"]["error"] == "per_folder_collections_and_target"
+
+    def test_unknown_target_collection_id_is_404(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="split-apply-404-target")
+        _confirm_scope_with_drive(c, token, conn_id)
+
+        r = c.post(
+            f"{BASE}/{conn_id}/splits",
+            json={"n": 1, "target_collection_id": "does-not-exist"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 404, r.text
+        assert r.json()["detail"]["error"] == "collection_not_found"
+
+    def test_records_split_lineage_on_every_part(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="split-apply-lineage")
+        _confirm_scope_with_drive(c, token, conn_id)
+
+        root_children = [_split_folder("f1", "A"), _split_folder("f2", "B")]
+        _install_split_mock(monkeypatch, root_children=root_children, counts={})
+
+        r = c.post(f"{BASE}/{conn_id}/splits", json={"n": 2}, headers=_auth(token))
+        assert r.status_code == 201, r.text
+        created = r.json()["connections"]
+        assert len(created) == 2
+
+        for part, entry in enumerate(created, start=1):
+            detail = c.get(f"/api/admin/source-connections/{entry['id']}", headers=_auth(token)).json()
+            split = detail["config"]["split"]
+            assert split["parent_connection_id"] == conn_id
+            assert split["part"] == part
+            assert split["n"] == 2
+            assert split["created_at"]
 
 
 class TestFactsExtractionRefusalNamesTheSwitch:

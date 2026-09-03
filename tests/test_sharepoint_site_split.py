@@ -7,7 +7,11 @@ from __future__ import annotations
 
 import pytest
 
-from connectors.sharepoint.site_split import format_group_name, pack_folders_into_groups
+from connectors.sharepoint.site_split import (
+    SPLIT_SERVER_WRITTEN_CONFIG_KEYS,
+    format_group_name,
+    pack_folders_into_groups,
+)
 
 
 def _folder(name: str, documents: int, **extra) -> dict:
@@ -77,3 +81,14 @@ class TestFormatGroupName:
     def test_one_indexed(self):
         assert format_group_name("Big Site", 1, 8) == "Big Site — part 1/8"
         assert format_group_name("Big Site", 8, 8) == "Big Site — part 8/8"
+
+
+def test_split_server_written_config_keys_is_exactly_split():
+    """Consolidation's `include_split_siblings` reads `config.split` off
+    every connection `app.api.admin_sharepoint.apply_split` created — the
+    ONE key this module declares as server-written, carried forward on an
+    ordinary connection edit by `app.api.admin_source_connections.
+    update_connection` (see that module's own carry-forward test,
+    `tests/test_admin_source_connections.py::
+    test_editing_config_without_split_preserves_it`)."""
+    assert SPLIT_SERVER_WRITTEN_CONFIG_KEYS == ("split",)

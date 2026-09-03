@@ -57,3 +57,26 @@ def format_group_name(source_name: str, index: int, n: int) -> str:
     creation call and the idempotency check that looks for a prior split
     under these same names)."""
     return f"{source_name} — part {index}/{n}"
+
+
+#: Written by ``app.api.admin_sharepoint.apply_split`` (``POST …/splits``)
+#: into EVERY part it creates, at ``repo.create(...)`` time —
+#: ``config.split = {parent_connection_id, part, n, created_at}`` — so a
+#: later ``POST …/collections/consolidate {include_split_siblings: true}``
+#: (or an operator eyeballing the connection list) can tell which
+#: connections came from the SAME site split without guessing off name
+#: patterns. NOT part of ``app.api.admin_sharepoint.
+#: SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS`` — that tuple's own ratchet
+#: (``tests/test_sharepoint_config_carry_forward_ratchet.py``) statically
+#: scans ONLY for keys written via a local ``....update(config=...)`` call
+#: in ``admin_sharepoint.py``, and ``split`` is written once, at CREATE
+#: time, never updated afterwards. It still needs the SAME carry-forward
+#: protection those keys get — an ordinary edit through the generic
+#: connection editor (``app/api/admin_source_connections.py::
+#: update_connection``) replaces ``config`` wholesale — so it is carried
+#: forward there BY HAND, imported from here, exactly the way
+#: ``connectors.sharepoint.acl_sync.ACL_SYNC_SERVER_WRITTEN_CONFIG_KEYS``
+#: and ``connectors.sharepoint.subscriptions.
+#: SUBSCRIPTION_SERVER_WRITTEN_CONFIG_KEYS`` already are, for the same
+#: reason (see that endpoint's own comment for the full explanation).
+SPLIT_SERVER_WRITTEN_CONFIG_KEYS = ("split",)

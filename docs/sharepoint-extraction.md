@@ -85,10 +85,17 @@ spot-check shows pseudonyms, not names.
   manual only).
 - `extraction.crawler.concurrency` (default 6) — files pipelined per delta
   page; the crawl backs off on tenant throttling by itself (AIMD) and
-  reports it. Per-run override in the Run-now options.
+  reports it. Per-run override in the Run-now options. Editable in
+  `/admin/server-config` → *Extraction* → *crawler*; this is the extraction
+  worker's **memory lever** (every file in flight is a converter child
+  process holding that document — six in flight has exceeded a 12 GiB
+  container on large decks, two held it under 4 GiB), and the worker reads
+  it at the start of each run, so a save applies to the next run with no
+  restart.
 - **Split one large site across several connections**, each with its own
   crawl and facts jobs so they run in parallel instead of one connection's
-  worth of concurrency working through the whole site sequentially:
+  worth of concurrency working through the whole site sequentially. Two
+  paths to the same shape — manual (below) or automated (further down):
   1. `POST /api/admin/sharepoint/connections/{id}/clone` or `agnes admin
      sharepoint connection clone <connection_id> --name <name>` — a sibling
      connection wired to the SAME tenant/client identity and certificate/
@@ -122,22 +129,21 @@ spot-check shows pseudonyms, not names.
   default) lists what would be folded and how many files, `--execute`
   performs the real merge (files/chunks/claims re-pointed, grants unioned,
   emptied sources soft-deleted). Also reachable from the source card's
-  overflow menu (**Consolidate collections…**). PG-only (A3 ratchet).
-
-  reports it. Per-run override in the Run-now options. Editable in
-  `/admin/server-config` → *Extraction* → *crawler*; this is the extraction
-  worker's **memory lever** (every file in flight is a converter child
-  process holding that document — six in flight has exceeded a 12 GiB
-  container on large decks, two held it under 4 GiB), and the worker reads
-  it at the start of each run, so a save applies to the next run with no
-  restart.
-     however many connections the crawl needs to parallelize over.
+  overflow menu (**Consolidate collections…**, an inline drawer row).
+  `--site` (`include_split_siblings: true`) widens the fold to every OTHER
+  connection FROM THE SAME `POST …/splits` call — one call instead of
+  repeating this once per part with the same target; refused with `409
+  sibling_crawl_running` if a family member's crawl is currently queued or
+  running. PG-only (A3 ratchet).
 - `extraction.crawl.min_modified` — a per-connection age filter for a
   backfill run: crawl only files modified on/after a cutoff date instead of
   re-walking a whole multi-year corpus. `PATCH …/extraction/crawl-config`
   (`agnes admin sharepoint crawl-config <connection_id> --min-modified
   YYYY-MM-DD` / `--clear`) sets or clears it; an item with no modified
-  timestamp is always kept.
+  timestamp is always kept. On the source card, the same control ("Crawl
+  filter", next to "Facts policy") sets it directly — widening the date
+  later needs a "Re-enumerate from scratch" run afterwards, since the
+  delta cursor has already moved past whatever the old cutoff skipped.
 - **Or let Agnes do the split for you.** `GET /api/admin/sharepoint
   /connections/{id}/split-plan?n=<n>[&min_modified=YYYY-MM-DD][&drive_id=<id>]`
   (`agnes admin sharepoint split-plan <connection_id> --n <n> [--min-modified
@@ -163,6 +169,23 @@ spot-check shows pseudonyms, not names.
   `facts-config` writes. `--start` enqueues each clone's crawl immediately
   after creating it, in creation order, skipped silently (never a failed
   apply) when extraction readiness is not currently satisfied.
+
+  **Every part's scopes route to ONE shared collection by default** — a
+  site of 400 folders no longer becomes 400 collections nobody has a grant
+  to. The default reuses this connection's own collection when it has
+  exactly one confirmed scope carrying one (the common "not yet split"
+  shape), otherwise mints one collection named after it — the SAME
+  "assign the precomputed `collection_id` directly" mechanism `scopes/bulk`
+  already uses for its own `--collection-id` option, never a second one.
+  `--collection-id <id>` / `--collection-name <name>` on `split`/`split-plan`
+  name an explicit shared target instead (mutually exclusive with each other
+  and with `--per-folder-collections`; `404 collection_not_found` for an
+  unknown `--collection-id`); `--per-folder-collections` restores the OLD
+  default (every folder mints its own, one collection per folder — the
+  manual clone+bulk-add recipe's shape when `--collection-id` is omitted).
+  Every part also records `config.split = {parent_connection_id, part, n,
+  created_at}` — read by `collections consolidate --site` above to find
+  every part of the split.
 - Webhooks for near-real-time updates: mint the secret
   (`POST …/webhook`), then `POST …/subscriptions/ensure` — Agnes owns the
   Graph subscription lifecycle including renewals

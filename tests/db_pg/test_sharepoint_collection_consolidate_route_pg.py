@@ -99,6 +99,13 @@ def _set_scopes(conn_id: str, scopes: list) -> None:
     source_connections_repo().update(conn_id, config={**(row.get("config") or {}), "scopes": scopes})
 
 
+def _set_split(conn_id: str, split: dict) -> None:
+    from src.repositories import source_connections_repo
+
+    row = source_connections_repo().get(conn_id)
+    source_connections_repo().update(conn_id, config={**(row.get("config") or {}), "split": split})
+
+
 def _scope(*, source_scope_id: str, collection_id: str, display_path: str) -> dict:
     return {
         "source_scope_id": source_scope_id,
@@ -336,3 +343,170 @@ class TestConsolidateCollectionsRoute:
         assert r.status_code == 409, r.text
         assert r.json()["detail"]["error"] == "consolidation_conflict"
         assert r.json()["detail"]["kind"] == "corpus_files.path"
+
+
+class TestConsolidateCollectionsIncludeSplitSiblings:
+    """``include_split_siblings: true`` — widens the fold from THIS
+    connection alone to its whole site-split family (see
+    ``app.api.admin_sharepoint._split_family_connection_ids``): one call
+    folds the collections of a site split into N parts into a single
+    target, instead of N repeats with the same target."""
+
+    def _family(self, client, token, pg_engine) -> tuple[str, str]:
+        """A two-part split: `part1` (the connection this call is made
+        on) carries `config.split.parent_connection_id == "parent-x"`
+        (a parent id that names no REAL connection — the common case once
+        the original, un-split connection has been deleted); `part2` is
+        the sibling, sharing that same parent id. Each has its own scope
+        collection with one file."""
+        part1 = _create_connection(client, token, name="split-sibling-part1")
+        part2 = _create_connection(client, token, name="split-sibling-part2")
+        _seed_collection(pg_engine, "col_1", "Part 1")
+        _seed_collection(pg_engine, "col_2", "Part 2")
+        _seed_file(pg_engine, file_id="f1", corpus_id="col_1", path="a.docx")
+        _seed_file(pg_engine, file_id="f2", corpus_id="col_2", path="b.docx")
+        _set_scopes(part1, [_scope(source_scope_id="s-1", collection_id="col_1", display_path="A")])
+        _set_scopes(part2, [_scope(source_scope_id="s-2", collection_id="col_2", display_path="B")])
+        _set_split(
+            part1, {"parent_connection_id": "parent-x", "part": 1, "n": 2, "created_at": "2026-09-03T00:00:00+00:00"}
+        )
+        _set_split(
+            part2, {"parent_connection_id": "parent-x", "part": 2, "n": 2, "created_at": "2026-09-03T00:00:00+00:00"}
+        )
+        return part1, part2
+
+    def test_default_false_only_folds_this_connection_not_its_siblings(self, tmp_path, monkeypatch, pg_engine):
+        client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+        part1, part2 = self._family(client, token, pg_engine)
+        # Give part1 a SECOND collection of its own — the target excludes
+        # itself, so `col_1b` is the only candidate source WITHOUT
+        # siblings; part2's `col_2` must never appear.
+        _seed_collection(pg_engine, "col_1b", "Part 1b")
+        _seed_file(pg_engine, file_id="f1b", corpus_id="col_1b", path="c.docx")
+        _set_scopes(
+            part1,
+            [
+                _scope(source_scope_id="s-1", collection_id="col_1", display_path="A"),
+                _scope(source_scope_id="s-1b", collection_id="col_1b", display_path="Ab"),
+            ],
+        )
+
+        r = client.post(
+            f"{BASE}/{part1}/collections/consolidate",
+            json={"target_collection_id": "col_1"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["connection_ids"] == [part1]
+        assert [s["id"] for s in body["sources"]] == ["col_1b"]
+
+    def test_dry_run_reports_the_whole_family_and_changes_nothing(self, tmp_path, monkeypatch, pg_engine):
+        client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+        part1, part2 = self._family(client, token, pg_engine)
+
+        r = client.post(
+            f"{BASE}/{part1}/collections/consolidate",
+            json={"target": {"name": "Whole Site"}, "include_split_siblings": True},
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["dry_run"] is True
+        assert sorted(body["connection_ids"]) == sorted([part1, part2])
+        by_id = {s["id"]: s["file_count"] for s in body["sources"]}
+        assert by_id == {"col_1": 1, "col_2": 1}
+        assert body["blocking"] == []
+        assert body["running"] == []
+        # A NAMED target is not minted during a dry run.
+        assert body["target"]["id"] is None
+
+        with pg_engine.connect() as conn:
+            rows = sorted(conn.execute(sa.text("SELECT corpus_id FROM corpus_files")).scalars().all())
+        assert rows == ["col_1", "col_2"]
+
+    def test_real_merge_folds_every_part_and_repoints_every_connection(self, tmp_path, monkeypatch, pg_engine):
+        client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+        part1, part2 = self._family(client, token, pg_engine)
+
+        r = client.post(
+            f"{BASE}/{part1}/collections/consolidate",
+            json={"target": {"name": "Whole Site"}, "include_split_siblings": True, "dry_run": False},
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        target_id = body["target"]["id"]
+        assert body["scopes_repointed"] == 2
+        assert sorted(body["connection_ids"]) == sorted([part1, part2])
+
+        with pg_engine.connect() as conn:
+            file_corpus_ids = sorted(conn.execute(sa.text("SELECT corpus_id FROM corpus_files")).scalars().all())
+        assert file_corpus_ids == [target_id, target_id]
+
+        from src.repositories import source_connections_repo
+
+        for cid in (part1, part2):
+            scopes = source_connections_repo().get(cid)["config"]["scopes"]
+            assert {s["collection_id"] for s in scopes} == {target_id}
+
+    def test_a_sibling_scope_is_never_treated_as_foreign(self, tmp_path, monkeypatch, pg_engine):
+        """Without `include_split_siblings`, `part2`'s own scope routing to
+        `col_2` would make `col_2` a "foreign" collection blocking the
+        fold — that guard exists to protect a genuinely UNRELATED
+        connection's crawl target, never a sibling of the SAME split being
+        folded together on purpose."""
+        client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+        part1, part2 = self._family(client, token, pg_engine)
+        # Give part1 a SECOND collection of its own so there is something
+        # to consolidate even without pulling in part2's.
+        _seed_collection(pg_engine, "col_1b", "Part 1b")
+        _seed_file(pg_engine, file_id="f1b", corpus_id="col_1b", path="c.docx")
+        _set_scopes(
+            part1,
+            [
+                _scope(source_scope_id="s-1", collection_id="col_1", display_path="A"),
+                _scope(source_scope_id="s-1b", collection_id="col_1b", display_path="Ab"),
+            ],
+        )
+
+        r = client.post(
+            f"{BASE}/{part1}/collections/consolidate",
+            json={"target_collection_id": "col_1", "include_split_siblings": True},
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+        # `col_2` (part2's own) never appears as blocking, because part2 is
+        # part of the SAME family this call already covers.
+        assert r.json()["blocking"] == []
+
+    def test_refuses_when_a_sibling_has_a_running_crawl(self, tmp_path, monkeypatch, pg_engine):
+        client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+        part1, part2 = self._family(client, token, pg_engine)
+
+        from src.repositories import jobs_repo
+
+        jobs_repo().enqueue("corpus-extraction", {"connection_id": part2}, idempotency_key=f"corpus-extraction:{part2}")
+
+        preview = client.post(
+            f"{BASE}/{part1}/collections/consolidate",
+            json={"target": {"name": "Whole Site"}, "include_split_siblings": True},
+            headers=_auth(token),
+        )
+        assert preview.status_code == 200, preview.text
+        assert preview.json()["running"] == [part2]
+
+        real = client.post(
+            f"{BASE}/{part1}/collections/consolidate",
+            json={"target": {"name": "Whole Site"}, "include_split_siblings": True, "dry_run": False},
+            headers=_auth(token),
+        )
+        assert real.status_code == 409, real.text
+        detail = real.json()["detail"]
+        assert detail["error"] == "sibling_crawl_running"
+        assert detail["connection_ids"] == [part2]
+
+        # Nothing touched — the running-crawl refusal fires BEFORE the merge.
+        with pg_engine.connect() as conn:
+            rows = sorted(conn.execute(sa.text("SELECT corpus_id FROM corpus_files")).scalars().all())
+        assert rows == ["col_1", "col_2"]

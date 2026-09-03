@@ -2597,7 +2597,7 @@ console.log(_sourceMenuItems({json.dumps(row)}));
         assert "testConn('sp-conn-1')" not in html
         assert "openSpWizardForConnection('sp-conn-1')" in html
         assert "toggleSpCertRow('sp-conn-1')" in html
-        assert "consolidateSpCollections('sp-conn-1')" in html
+        assert "toggleSpConsolidateRow('sp-conn-1')" in html
 
     def test_keboola_menu_is_unchanged_by_the_sharepoint_branch(self):
         html = self._run(
@@ -3740,3 +3740,46 @@ class TestSharePointSplitControl:
         assert "applySpSplit" in script
         assert "/split-plan?" in script
         assert "/splits`" in script
+        # Collection-routing controls (default shared, explicit target, or
+        # the old per-folder opt-in) — same three options the server's
+        # SplitApplyBody accepts.
+        assert "ds-sp-split-collection-id-" in script
+        assert "ds-sp-split-collection-name-" in script
+        assert "ds-sp-split-per-folder-" in script
+        assert "target_collection_id" in script
+        assert "per_folder_collections" in script
+
+    def test_the_page_ships_the_consolidate_drawer_with_a_sibling_checkbox(self, seeded_app, monkeypatch):
+        """ "Consolidate collections…" opens an inline drawer (mirrors the
+        Split row) with a REAL checkbox for `include_split_siblings` —
+        never a `window.prompt`/`window.confirm` flow, which cannot host
+        one."""
+        from cryptography.fernet import Fernet
+
+        from app.secrets_vault import _reset_ephemeral_key_for_tests
+
+        monkeypatch.setenv("AGNES_VAULT_KEY", Fernet.generate_key().decode())
+        _reset_ephemeral_key_for_tests()
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        c.cookies.set("access_token", token)
+        try:
+            resp = c.get("/admin/data-sources", headers={"Accept": "text/html"})
+        finally:
+            c.cookies.clear()
+            _reset_ephemeral_key_for_tests()
+        assert resp.status_code == 200, resp.text
+
+        from pathlib import Path
+
+        script = Path("app/web/static/js/admin/data_sources_page.js").read_text(encoding="utf-8")
+        assert "toggleSpConsolidateRow" in script
+        assert "previewSpConsolidate" in script
+        assert "applySpConsolidate" in script
+        assert 'id="ds-sp-consolidate-row-${row.id}"' in script
+        assert 'id="ds-sp-consolidate-siblings-${row.id}"' in script
+        assert 'type="checkbox" id="ds-sp-consolidate-siblings-' in script
+        assert "include_split_siblings" in script
+        # The overflow-menu item opens the drawer, never the old prompt flow.
+        assert "toggleSpConsolidateRow('${id}')" in script
+        assert "consolidateSpCollections" not in script

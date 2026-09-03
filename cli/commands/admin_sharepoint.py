@@ -28,15 +28,21 @@ Nine surfaces:
   - ``collections consolidate`` — the after-the-fact fix when a site
     ALREADY ended up split across many per-scope collections: fold them
     into one target (dry-run preview by default, ``--execute`` for the
-    real merge). CLI counterpart to ``POST /api/admin/sharepoint/
+    real merge). ``--site`` widens the fold to every OTHER connection from
+    the SAME site split in one call, refusing (``409
+    sibling_crawl_running``) if any of them currently has a crawl in
+    flight. CLI counterpart to ``POST /api/admin/sharepoint/
     connections/{connection_id}/collections/consolidate``.
   - ``split-plan`` / ``split`` — the AUTOMATED version of the manual
     clone-then-bulk-add recipe right above: greedy-packs the site's
     top-level folders into ``--n`` groups of roughly equal document count
     (a live Graph Search count per folder, never a delta walk) and, on
     ``split``, creates all ``--n`` clones with their scopes in one call.
-    CLI counterparts to ``GET …/split-plan`` (preview, read-only) and
-    ``POST …/splits`` (apply).
+    Every part's scopes route to ONE shared collection by default
+    (``--collection-id``/``--collection-name`` for an explicit target,
+    ``--per-folder-collections`` to restore the old one-per-folder
+    behaviour). CLI counterparts to ``GET …/split-plan`` (preview,
+    read-only) and ``POST …/splits`` (apply).
   - ``runs`` — the extraction fleet dashboard (2026-09-02), from the
     terminal: is it on pace, is anything stuck, what is it costing, across
     every SharePoint connection at once. CLI counterpart to
@@ -447,6 +453,13 @@ def collections_consolidate(
         "--execute",
         help="Actually perform the merge. Without this flag the call is a dry-run preview only.",
     ),
+    site: bool = typer.Option(
+        False,
+        "--site",
+        help="Also fold every OTHER connection from the SAME site split (config.split lineage — "
+        "see `agnes admin sharepoint split`) into this one target, in this one call, instead of "
+        "repeating this command once per part with the same target.",
+    ),
     as_json: bool = typer.Option(False, "--json"),
 ):
     """Fold this connection's own per-scope collections into ONE target —
@@ -460,15 +473,25 @@ def collections_consolidate(
     perform the real merge (files/chunks/claims re-pointed, resource grants
     unioned, source collections soft-deleted).
 
+    ``--site`` widens the fold from this ONE connection to its whole
+    site-split family (every connection ``POST …/splits`` created together
+    with it, plus the original connection it split FROM) — one call
+    instead of N repeats with the same target. Refused with ``409
+    sibling_crawl_running`` (nothing touched) if a connection in that
+    family currently has a crawl queued or running.
+
     ``409`` if a source collection is still routed to by a DIFFERENT
-    connection's own scope, or if the merge would collide on a duplicate
-    file path / source-document id across the collections being folded.
+    connection's own scope (outside this fold), or if the merge would
+    collide on a duplicate file path / source-document id across the
+    collections being folded.
     """
     if bool(target_collection_id) == bool(target_name):
         typer.echo("Error: pass exactly one of --target-collection-id or --target-name", err=True)
         raise typer.Exit(1)
 
     body: dict = {"dry_run": not execute}
+    if site:
+        body["include_split_siblings"] = True
     if target_collection_id:
         body["target_collection_id"] = target_collection_id
     else:
@@ -487,6 +510,13 @@ def collections_consolidate(
 
     target = result["target"]
     sources = result["sources"]
+    running = result.get("running") or []
+    if running:
+        typer.echo(
+            f"[warning] {len(running)} connection(s) in this family have a crawl queued/running "
+            f"({', '.join(running)}) — --execute would be refused with 409 sibling_crawl_running.",
+            err=True,
+        )
     if result["dry_run"]:
         typer.echo(f"[dry run] would fold {len(sources)} collection(s) into '{target['name']}' ({target['id']}):")
         for s in sources:
@@ -523,6 +553,23 @@ def _split_plan_query(n: int, min_modified: Optional[str], drive_id: Optional[st
     return params
 
 
+def _split_collection_flags_checked(
+    collection_id: Optional[str], collection_name: Optional[str], per_folder_collections: bool
+) -> None:
+    """Shared usage-error checks for the collection-routing flags on both
+    ``split-plan`` and ``split`` — same three flags, same conflicts, so a
+    preview and the apply it previews are never validated differently."""
+    if collection_id and collection_name:
+        typer.echo("Error: --collection-id and --collection-name are mutually exclusive", err=True)
+        raise typer.Exit(1)
+    if per_folder_collections and (collection_id or collection_name):
+        typer.echo(
+            "Error: --per-folder-collections and --collection-id/--collection-name are mutually exclusive",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+
 def _print_split_plan(body: Dict[str, Any]) -> None:
     table = Table(title=f"Split plan — drive {body.get('drive_id')}")
     table.add_column("GROUP", style="bold")
@@ -532,6 +579,13 @@ def _print_split_plan(body: Dict[str, Any]) -> None:
         table.add_row(group["name"], str(len(group.get("folders") or [])), str(group.get("documents", 0)))
     _console.print(table)
     _console.print(f"Total documents across all folders: {body.get('total_documents', 0)}")
+    collection = body.get("collection")
+    if collection is not None:
+        label = collection["name"] if collection["id"] is None else f"{collection['name']} ({collection['id']})"
+        minted_note = " — not yet created" if collection["id"] is None else ""
+        _console.print(f"Every part's scopes will route to ONE shared collection: {label}{minted_note}")
+    else:
+        _console.print("Every folder will mint its OWN collection (--per-folder-collections).")
     loose = body.get("loose_root_files") or []
     if loose:
         _console.print(
@@ -555,6 +609,23 @@ def split_plan_cmd(
         "--drive-id",
         help="Graph drive id — required unless this connection already has a scope with one set",
     ),
+    collection_id: Optional[str] = typer.Option(
+        None,
+        "--collection-id",
+        help="Preview routing every part's scopes to this EXISTING, live collection — mutually exclusive "
+        "with --collection-name/--per-folder-collections",
+    ),
+    collection_name: Optional[str] = typer.Option(
+        None,
+        "--collection-name",
+        help="Preview minting ONE new collection with this name for the whole split — mutually exclusive "
+        "with --collection-id/--per-folder-collections",
+    ),
+    per_folder_collections: bool = typer.Option(
+        False,
+        "--per-folder-collections",
+        help="Preview the OLD default instead: every folder mints its OWN collection",
+    ),
     as_json: bool = typer.Option(False, "--json"),
 ):
     """Preview how ``agnes admin sharepoint split`` would divide this
@@ -564,11 +635,25 @@ def split_plan_cmd(
     ``GET /api/admin/sharepoint/connections/{connection_id}/split-plan``.
 
     Files sitting directly at the drive root (not inside any folder) are
-    reported separately — a folder-based split can never cover them.
+    reported separately — a folder-based split can never cover them. By
+    default every part's scopes would route to ONE shared collection (this
+    connection's own, when it has exactly one confirmed scope, otherwise a
+    new one named after it) — shown as the "shared collection" line;
+    ``--collection-id``/``--collection-name``/``--per-folder-collections``
+    preview the same options ``split`` itself accepts, same validation.
     """
+    _split_collection_flags_checked(collection_id, collection_name, per_folder_collections)
+    params = _split_plan_query(n, min_modified, drive_id)
+    if collection_id:
+        params["target_collection_id"] = collection_id
+    if collection_name:
+        params["target_name"] = collection_name
+    if per_folder_collections:
+        params["per_folder_collections"] = True
+
     resp = api_get(
         f"/api/admin/sharepoint/connections/{connection_id}/split-plan",
-        params=_split_plan_query(n, min_modified, drive_id),
+        params=params,
     )
     if resp.status_code != 200:
         _fail(resp)
@@ -596,6 +681,24 @@ def split_cmd(
         "--retry-mode",
         help=f"Per-connection extraction.facts.retry_mode override for every clone: one of {', '.join(_RETRY_MODES)}",
     ),
+    collection_id: Optional[str] = typer.Option(
+        None,
+        "--collection-id",
+        help="Route every part's scopes to this EXISTING, live collection — mutually exclusive with "
+        "--collection-name/--per-folder-collections",
+    ),
+    collection_name: Optional[str] = typer.Option(
+        None,
+        "--collection-name",
+        help="Mint ONE new collection with this name for the whole split — mutually exclusive with "
+        "--collection-id/--per-folder-collections",
+    ),
+    per_folder_collections: bool = typer.Option(
+        False,
+        "--per-folder-collections",
+        help="Restore the OLD default: every folder mints its OWN collection, forking the site across "
+        "as many collections as there are folders",
+    ),
     start: bool = typer.Option(
         False, "--start", help="Enqueue each clone's crawl (corpus-extraction) immediately after creating it"
     ),
@@ -609,10 +712,21 @@ def split_cmd(
     counterpart to ``POST /api/admin/sharepoint/connections/{connection_id}/
     splits``.
 
+    Every part's scopes route to ONE shared collection by DEFAULT — this
+    connection's own (when it has exactly one confirmed scope), otherwise a
+    new one named after it — the same "site of 400 folders becomes 400
+    collections" fix ``scope bulk-add --collection-id``/``--collection-name``
+    gives the manual clone+bulk-add recipe.
+    ``--collection-id``/``--collection-name`` name an explicit shared
+    target instead (mutually exclusive with each other and with
+    ``--per-folder-collections``); ``--per-folder-collections`` restores
+    the OLD default (every folder mints its own collection).
+
     ``409 split_exists`` if connections named like this split (``"<source
     name> — part i/n"``) already exist — inspect with
     ``agnes admin sharepoint split-plan`` first to see the exact names a
-    split would use.
+    split would use. ``404 collection_not_found`` for an unknown/
+    soft-deleted ``--collection-id``.
     """
     if transport is not None and transport not in ("sync", "batch"):
         typer.echo("Error: --transport must be sync or batch", err=True)
@@ -620,6 +734,7 @@ def split_cmd(
     if retry_mode is not None and retry_mode not in _RETRY_MODES:
         typer.echo(f"Error: --retry-mode must be one of {', '.join(_RETRY_MODES)}", err=True)
         raise typer.Exit(1)
+    _split_collection_flags_checked(collection_id, collection_name, per_folder_collections)
 
     payload: Dict[str, Any] = {"n": n, "start": start}
     if min_modified:
@@ -628,6 +743,12 @@ def split_cmd(
         payload["transport"] = transport
     if retry_mode:
         payload["retry_mode"] = retry_mode
+    if collection_id:
+        payload["target_collection_id"] = collection_id
+    if collection_name:
+        payload["target"] = {"name": collection_name}
+    if per_folder_collections:
+        payload["per_folder_collections"] = True
 
     resp = api_post(f"/api/admin/sharepoint/connections/{connection_id}/splits", json=payload)
     if resp.status_code != 201:
@@ -642,6 +763,9 @@ def split_cmd(
         typer.echo(
             f"  {entry['id']}  {entry['name']}  ({len(entry.get('folders') or [])} folders, {entry.get('documents', 0)} documents)"
         )
+    collection = body.get("collection")
+    if collection is not None:
+        typer.echo(f"Shared collection: {collection['name']} ({collection['id']})")
     if start:
         typer.echo("Crawl enqueued for each connection (skipped silently if extraction is not currently usable).")
 
