@@ -2600,6 +2600,18 @@ function _sharepointFactsHtml(row) {
   // highlighted, rather than the wizard-only path the owner called "a
   // dumb path, make it clickable".
   const scopes = fs.scopes || [];
+  // `scopes_total`/`scopes_truncated`: the card inlines only the first
+  // `_CARD_SCOPES_CAP` (50) confirmed scopes — a connection with far more
+  // than that (real ones run to ~180) still gets the full, unbounded list
+  // one click away via the wizard (`GET .../scopes`), never silently
+  // dropped rows with no sign anything was cut.
+  const scopesMoreHtml = fs.scopes_truncated
+    ? `<li class="ds-sp-scope-row--more">
+         <button type="button" class="btn btn-secondary btn-sm" onclick="openSpWizardForConnection('${row.id}')">
+           +${fs.scopes_total - scopes.length} more — manage all ${fs.scopes_total} scopes
+         </button>
+       </li>`
+    : "";
   const scopesHtml = scopes.length
     ? `
   <div class="ds-src__fact">
@@ -2613,7 +2625,7 @@ function _sharepointFactsHtml(row) {
             ${s.collection ? `<span class="ds-badge badge-env">${_esc(s.collection.name)}</span>` : `<span class="ds-badge badge-unset">no collection yet</span>`}
             ${s.no_group_warning ? `<span class="ds-badge badge-warn">no group</span>` : ""}
           </button>
-        </li>`).join("")}
+        </li>`).join("")}${scopesMoreHtml}
       </ul>
     </span>
   </div>`

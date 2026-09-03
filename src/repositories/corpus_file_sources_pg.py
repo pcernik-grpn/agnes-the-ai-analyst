@@ -85,6 +85,43 @@ class CorpusFileSourcesPgRepository:
             )
         return dict(row) if row else None
 
+    def resolve_doc_labels(self, source_doc_ids: list[str]) -> Dict[str, Dict[str, Any]]:
+        """``source_doc_id -> {"name": filename, "collection": collection_name
+        | None}`` for every resolvable id, in ONE query.
+
+        The batched sibling of :meth:`get_by_source_doc_id` + a
+        ``corpus_files``/``file_corpora`` lookup per id — the card's "Last
+        run" drawer (``app.web.router._resolve_sharepoint_rejection_doc_labels``)
+        used to spend 3 round trips PER unique rejected/deferred doc_id in a
+        run report, which on a run with hundreds of rejections dominated the
+        page's query count. An id this instance has never seen is simply
+        absent (same "None" contract as the single-id lookup); when a
+        ``source_doc_id`` maps to more than one row (schema allows it, see
+        :meth:`get_by_source_doc_id`'s docstring) an arbitrary one wins, same
+        as the single-id lookup's unordered ``LIMIT 1``.
+        """
+        if not source_doc_ids:
+            return {}
+        with self._engine.connect() as conn:
+            rows = (
+                conn.execute(
+                    sa.text(
+                        "SELECT cfs.source_doc_id AS doc_id, cf.filename AS name, fc.name AS collection_name "
+                        "FROM corpus_file_sources cfs "
+                        "JOIN corpus_files cf ON cf.id = cfs.corpus_file_id "
+                        "LEFT JOIN file_corpora fc ON fc.id = cf.corpus_id "
+                        "WHERE cfs.source_doc_id = ANY(:ids)"
+                    ),
+                    {"ids": list(source_doc_ids)},
+                )
+                .mappings()
+                .all()
+            )
+        out: Dict[str, Dict[str, Any]] = {}
+        for r in rows:
+            out.setdefault(r["doc_id"], {"name": r["name"], "collection": r["collection_name"]})
+        return out
+
     def upsert(
         self,
         *,

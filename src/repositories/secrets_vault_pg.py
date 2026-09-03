@@ -335,6 +335,19 @@ class ConnectionSecretsPgRepository:
             ).fetchone()
         return row is not None
 
+    def has_many(self, connection_ids: list[str]) -> set[str]:
+        """The subset of ``connection_ids`` that have a stored vault secret,
+        in ONE query. Mirrors the DuckDB sibling — see its docstring for the
+        per-row ``has()`` N+1 it replaces."""
+        if not connection_ids:
+            return set()
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                sa.text("SELECT DISTINCT connection_id FROM connection_secrets WHERE connection_id = ANY(:ids)"),
+                {"ids": list(connection_ids)},
+            ).all()
+        return {r[0] for r in rows}
+
     def updated_at(self, connection_id: str) -> Optional[str]:
         """See ``app.secrets_vault.ConnectionSecretsRepository.updated_at``."""
         with self._engine.connect() as conn:

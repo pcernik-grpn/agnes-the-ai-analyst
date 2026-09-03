@@ -598,7 +598,22 @@ async def _resolved_token(row: Dict[str, Any]) -> str:
         ) from exc
 
 
-def _group_ids_for_collection(collection_id: str) -> List[str]:
+def _group_ids_for_collection(
+    collection_id: str, *, grants_by_collection: Optional[Dict[str, List[str]]] = None
+) -> List[str]:
+    """Group ids granted this collection.
+
+    ``grants_by_collection``, when the caller precomputed it (ONE
+    ``resource_grants_repo().list_all(resource_type="collection")`` read,
+    grouped by ``resource_id``), is reused as-is. ``None`` (every existing
+    call site) falls back to the full-table read here — this used to be the
+    ONLY path, which made a scope-row loop (`_scope_out` called once per
+    scope) redo the SAME full ``resource_grants`` scan once per scope, up to
+    ~180 times for one SharePoint connection
+    (`app.web.router._sharepoint_pipeline_cell`).
+    """
+    if grants_by_collection is not None:
+        return list(grants_by_collection.get(collection_id, []))
     grants = resource_grants_repo().list_all(resource_type=ResourceType.COLLECTION.value)
     return [g["group_id"] for g in grants if g.get("resource_id") == collection_id]
 
@@ -701,9 +716,15 @@ def _scope_out(
     scope: Dict[str, Any],
     declared_corpus_ids: Optional[set] = None,
     connection: Optional[Dict[str, Any]] = None,
+    *,
+    grants_by_collection: Optional[Dict[str, List[str]]] = None,
 ) -> Dict[str, Any]:
+    """``grants_by_collection``, when the caller precomputed it, is passed
+    straight through to :func:`_group_ids_for_collection` — see its
+    docstring for why (a scope-ROWS loop calling this once per scope must
+    not redo a full ``resource_grants`` scan once per scope)."""
     collection = file_corpora_repo().get(scope.get("collection_id") or "")
-    group_ids = _group_ids_for_collection(scope.get("collection_id") or "")
+    group_ids = _group_ids_for_collection(scope.get("collection_id") or "", grants_by_collection=grants_by_collection)
     if declared_corpus_ids is None:
         declared_corpus_ids = _latest_run_anonymized_corpus_ids()
     anonymize = bool(scope.get("anonymize"))
@@ -1344,8 +1365,14 @@ async def list_scopes(
     """
     row = _sharepoint_connection_or_404(connection_id)
     declared = _latest_run_anonymized_corpus_ids()  # one lookup for the whole list, not per row
+    # Same rationale, for grants: one `resource_grants` read for the whole
+    # list, not one full-table scan per scope row (`_group_ids_for_collection`'s
+    # docstring).
+    grants_by_collection: Dict[str, List[str]] = {}
+    for g in resource_grants_repo().list_all(resource_type=ResourceType.COLLECTION.value):
+        grants_by_collection.setdefault(g["resource_id"], []).append(g["group_id"])
     return {
-        "items": [_scope_out(s, declared, row) for s in _scopes(row)],
+        "items": [_scope_out(s, declared, row, grants_by_collection=grants_by_collection) for s in _scopes(row)],
         "zones": [_zone_out(z) for z in zone_rows(row)],
     }
 

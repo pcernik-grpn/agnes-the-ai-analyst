@@ -47,6 +47,23 @@ _JSON_FIELDS = ("report", "progress", "usage", "skips")
 #: VISIBLY truncated rather than silently short.
 _SKIPS_CAP = 200
 
+#: ``report`` keys never read by :func:`app.api.admin_extraction._run_out`
+#: or ``_fleet_facts`` — only by the single-run detail endpoint
+#: (``GET .../extraction/runs/{run_id}``, which reads the row through
+#: :meth:`ExtractionRunsPgRepository.get`, untouched here). Each can hold up
+#: to ``_FAILED_ITEMS_CAP`` (5000, ``connectors/sharepoint/crawler.py``)
+#: itemized ``{path, reason, detail}`` entries — for a finished run that is
+#: the majority of the row's bytes. The LIST projections below strip them at
+#: the SQL level (a JSONB ``-`` key removal is cheap relative to shipping and
+#: re-parsing megabytes of JSON the caller immediately discards), so a
+#: fleet/history listing costs bytes proportional to the number of RUNS
+#: listed, never to how many items any one of them failed on.
+_REPORT_LIST_PROJECTION = "(report - 'failed_items' - 'skipped_items') AS report"
+_RUN_LIST_COLUMNS = (
+    "id, connection_id, job_id, status, phase, started_at, finished_at, checkpoint_at, "
+    "files_seen, files_done, enumeration_done, " + _REPORT_LIST_PROJECTION + ", progress, usage, skips, error"
+)
+
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
@@ -269,10 +286,14 @@ class ExtractionRunsPgRepository:
         specific — this table has no DuckDB sibling) rather than one round
         trip per connection, so an operator's 8-connection dashboard costs
         the same as a 1-connection one.
+
+        ``report`` comes back with ``failed_items``/``skipped_items``
+        stripped (see :data:`_RUN_LIST_COLUMNS`) — this is a LIST view, and
+        nothing that renders a fleet row reads either key.
         """
         if not connection_ids:
             return {}
-        sql = "SELECT DISTINCT ON (connection_id) * FROM extraction_runs WHERE connection_id = ANY(:ids)"
+        sql = f"SELECT DISTINCT ON (connection_id) {_RUN_LIST_COLUMNS} FROM extraction_runs WHERE connection_id = ANY(:ids)"
         params: Dict[str, Any] = {"ids": list(connection_ids)}
         if running_only:
             sql += " AND status = :running"
@@ -438,9 +459,15 @@ class ExtractionRunsPgRepository:
         limit: int = 10,
         include_running: bool = True,
     ) -> List[Dict[str, Any]]:
-        """Most recent runs first — the run-history drawer's rows."""
+        """Most recent runs first — the run-history drawer's rows.
+
+        ``report`` comes back with ``failed_items``/``skipped_items``
+        stripped, same as :meth:`list_latest_for_connections` — see
+        :data:`_RUN_LIST_COLUMNS`. The single-run detail endpoint reads
+        through :meth:`get`, which keeps every key.
+        """
         limit = max(1, min(int(limit or 10), 100))
-        sql = "SELECT * FROM extraction_runs WHERE connection_id = :cid"
+        sql = f"SELECT {_RUN_LIST_COLUMNS} FROM extraction_runs WHERE connection_id = :cid"
         params: Dict[str, Any] = {"cid": connection_id, "limit": limit}
         if not include_running:
             sql += " AND status <> :running"

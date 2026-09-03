@@ -527,6 +527,73 @@ def test_count_by_corpus_is_empty_when_there_are_no_files(repo):
     assert repo.count_by_corpus() == {}
 
 
+def test_status_counts_for_corpora_groups_by_corpus_and_status_in_one_read(repo):
+    """The batched sibling of ``count_by_corpus``: a caller with a LIST of
+    corpus ids (e.g. a connection's confirmed scopes) gets every corpus's
+    per-status breakdown in one call instead of walking ``list_for_corpus``
+    once per scope."""
+    for i in range(2):
+        fid = repo.add(
+            corpus_id="col_a",
+            filename=f"a{i}.pdf",
+            sha256=f"sha_a{i}",
+            file_type="pdf",
+            size_bytes=10,
+            storage_path=f"/tmp/a{i}.pdf",
+        )
+        if i == 0:
+            repo.set_status(fid, status="indexed")
+    repo.add(
+        corpus_id="col_b",
+        filename="b.pdf",
+        sha256="sha_b",
+        file_type="pdf",
+        size_bytes=10,
+        storage_path="/tmp/b.pdf",
+    )
+    counts = repo.status_counts_for_corpora(["col_a", "col_b", "col_absent"])
+    assert counts["col_a"] == {"indexed": 1, "pending": 1}
+    assert counts["col_b"] == {"pending": 1}
+    # A requested id with no files is simply absent, same contract as
+    # ``count_by_corpus``.
+    assert "col_absent" not in counts
+
+
+def test_status_counts_for_corpora_only_counts_requested_ids(repo):
+    """A corpus NOT in the requested list is never counted, even if it has
+    files — this is a scoped read, not a global one."""
+    repo.add(
+        corpus_id="col_a",
+        filename="a.pdf",
+        sha256="sha_a",
+        file_type="pdf",
+        size_bytes=10,
+        storage_path="/tmp/a.pdf",
+    )
+    repo.add(
+        corpus_id="col_unrequested",
+        filename="u.pdf",
+        sha256="sha_u",
+        file_type="pdf",
+        size_bytes=10,
+        storage_path="/tmp/u.pdf",
+    )
+    counts = repo.status_counts_for_corpora(["col_a"])
+    assert set(counts) == {"col_a"}
+
+
+def test_status_counts_for_corpora_empty_ids_returns_empty_dict(repo):
+    repo.add(
+        corpus_id="col_a",
+        filename="a.pdf",
+        sha256="sha_a",
+        file_type="pdf",
+        size_bytes=10,
+        storage_path="/tmp/a.pdf",
+    )
+    assert repo.status_counts_for_corpora([]) == {}
+
+
 # ---------------------------------------------------------------------------
 # list_for_corpus / count_for_corpus — pagination + search (contract §1)
 # ---------------------------------------------------------------------------

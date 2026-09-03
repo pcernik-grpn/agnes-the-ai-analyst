@@ -168,6 +168,24 @@ def test_copy_secret_is_a_noop_when_source_has_no_row(repo):
     assert repo.has("target-conn") is False
 
 
+def test_has_many_returns_only_the_ids_with_a_stored_secret(repo):
+    """Batched sibling of ``has()`` — the admin source-connections list
+    checks presence for every row without one query per row."""
+    repo.upsert("c-has-1", "tok-1")
+    repo.upsert("c-has-2", "tok-2")
+    result = repo.has_many(["c-has-1", "c-has-2", "c-has-absent"])
+    assert result == {"c-has-1", "c-has-2"}
+
+
+def test_has_many_empty_list_returns_empty_set(repo):
+    repo.upsert("c-has-x", "tok-x")
+    assert repo.has_many([]) == set()
+
+
+def test_has_many_none_present_returns_empty_set(repo):
+    assert repo.has_many(["nope-1", "nope-2"]) == set()
+
+
 def test_copy_secret_overwrites_an_existing_target_row(repo):
     repo.upsert("src-conn-2", "source-value")
     repo.upsert("target-conn-2", "stale-target-value")

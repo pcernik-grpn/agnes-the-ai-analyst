@@ -465,3 +465,136 @@ def test_no_sharepoint_connection_renders_no_file_source_cell(tmp_path, monkeypa
     cells = _source_pipelines(user=_admin_user())
     for row in cells.values():
         assert "file_source" not in row
+
+
+# ---------------------------------------------------------------------------
+# Perf regression: /admin/data-sources page (bounded queries, bounded payload)
+#
+# A real SharePoint connection can carry 50-180 confirmed scopes; the page
+# renders every SharePoint connection's pipeline strip in one server-side
+# fold (`_source_inventory`). Before this fix, both the query count AND the
+# inlined JSON payload scaled with total scope count across every
+# connection on the page — see CHANGELOG / PR description for the
+# before/after numbers.
+# ---------------------------------------------------------------------------
+
+
+def _many_scopes(n: int, *, prefix: str = "col") -> list[dict]:
+    """Synthetic confirmed-scope config rows — no backing `file_corpora`/
+    `corpus_files` rows needed: every code path under test degrades a
+    missing collection to `None`/absent rather than raising, so this stays
+    cheap to seed even at n=180."""
+    return [
+        {"source_scope_id": f"s-{prefix}-{i}", "display_path": f"/{prefix}/{i}", "collection_id": f"{prefix}_{i}"}
+        for i in range(n)
+    ]
+
+
+def test_scopes_cell_is_capped_with_an_honest_truncation_count(tmp_path, monkeypatch, pg_engine):
+    pg_env_setup(tmp_path, monkeypatch, pg_engine)
+    conn_id = _create_sharepoint_connection(scopes=_many_scopes(60))
+
+    from app.web.router import _CARD_SCOPES_CAP, _source_pipelines
+
+    fs = _source_pipelines(user=_admin_user())[conn_id]["file_source"]
+    assert len(fs["scopes"]) == _CARD_SCOPES_CAP
+    assert fs["scopes_total"] == 60
+    assert fs["scopes_truncated"] is True
+
+
+def test_scopes_cell_is_not_truncated_under_the_cap(tmp_path, monkeypatch, pg_engine):
+    pg_env_setup(tmp_path, monkeypatch, pg_engine)
+    conn_id = _create_sharepoint_connection(scopes=_many_scopes(3))
+
+    from app.web.router import _source_pipelines
+
+    fs = _source_pipelines(user=_admin_user())[conn_id]["file_source"]
+    assert len(fs["scopes"]) == 3
+    assert fs["scopes_total"] == 3
+    assert fs["scopes_truncated"] is False
+
+
+def test_source_pipelines_payload_size_does_not_scale_with_scope_count(tmp_path, monkeypatch, pg_engine):
+    """The bug this guards: `cell["scopes"]` used to carry EVERY confirmed
+    scope (path, collection, badges) for EVERY SharePoint connection on the
+    page — the exact structure `{{ source_pipelines | tojson }}` inlines
+    into the HTML response verbatim. A connection with 180 scopes made that
+    inline payload roughly proportional to 180; the cap (`_CARD_SCOPES_CAP`)
+    makes it constant past that cap instead. Both sample sizes here are
+    already ABOVE the cap (50), so a passing test proves the cap — not just
+    "still smaller than an under-cap sample" — is what is holding."""
+    import json
+
+    pg_env_setup(tmp_path, monkeypatch, pg_engine)
+    conn_id = _create_sharepoint_connection(scopes=_many_scopes(60))
+
+    from app.web.router import _source_pipelines
+
+    at_cap = _source_pipelines(user=_admin_user())
+    at_cap_bytes = len(json.dumps(at_cap))
+
+    from src.repositories import source_connections_repo
+
+    source_connections_repo().update(conn_id, config={"tenant_id": "tenant-1", "scopes": _many_scopes(180)})
+    over_cap = _source_pipelines(user=_admin_user())
+    over_cap_bytes = len(json.dumps(over_cap))
+
+    # 60 -> 180 scopes is a 3x growth in the underlying config; both sit
+    # above the 50-row cap, so the rendered payload should differ only by
+    # the (tiny) `scopes_total` integer, never by anything proportional to
+    # scope count.
+    assert over_cap_bytes < at_cap_bytes * 1.05, (
+        f"source_pipelines payload grew {at_cap_bytes} -> {over_cap_bytes} bytes for a 3x scope-count "
+        f"increase, both already above the cap — the scopes cap is not holding"
+    )
+
+
+def test_source_inventory_query_count_is_bounded_at_high_scope_count(tmp_path, monkeypatch, pg_engine):
+    """Before this fix: `_sharepoint_pipeline_cell` issued one
+    `corpus_files.list_for_corpus` call PER SCOPE, one full-table
+    `resource_grants` scan PER SCOPE (via `_scope_out` -> `_group_ids_for_
+    collection`), and a `file_corpora.get` PER SCOPE — a 180-scope
+    connection cost roughly 540 round trips on those three alone (verified
+    by temporarily reverting this fix and re-running this test). Batched,
+    those three cost 1 + 1 + 50 (the scopes cap) instead — 52 total,
+    independent of scope count above the cap.
+
+    The remaining, UNCHANGED cost is `facts_repo().count_visible_facts_
+    for_collections`/`count_visible_edges_for_collections` — the caller-
+    scoped fact/edge counts feeding `cell["graph"]` — which still runs one
+    query per corpus_id (~2 per scope). That is a deliberate, documented
+    design in existing, security-sensitive row-visibility SQL (see its own
+    docstring) and is NOT touched here — rewriting a fact-graph visibility
+    CTE to aggregate across collections in one query needs its own
+    focused, carefully-reviewed change, not a drive-by inside a page-perf
+    fix. This test's ceiling accounts for that known, accepted residual
+    (~2 statements per scope) rather than pretending it does not exist.
+    """
+    import sqlalchemy as sa
+
+    pg_env_setup(tmp_path, monkeypatch, pg_engine)
+    _create_sharepoint_connection(scopes=_many_scopes(180))
+
+    import src.db_pg as db_pg
+    from app.web.router import _source_pipelines
+
+    statements: list = []
+
+    def _capture(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    engine = db_pg.get_engine()
+    sa.event.listen(engine, "before_cursor_execute", _capture)
+    try:
+        _source_pipelines(user=_admin_user())
+    finally:
+        sa.event.remove(engine, "before_cursor_execute", _capture)
+
+    # ~360 statements are the known, unaddressed facts/edges visibility
+    # count (2 per scope, see docstring above); everything else this PR
+    # touches must stay flat, so the ceiling is that residual plus a small
+    # constant rather than anything that grows with scope count on its own.
+    assert len(statements) < 460, (
+        f"_source_pipelines issued {len(statements)} statements for a single 180-scope connection "
+        f"— expected ~360 (the known facts/edges residual) plus a small constant, not more"
+    )

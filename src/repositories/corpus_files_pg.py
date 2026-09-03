@@ -242,6 +242,25 @@ class CorpusFilesPgRepository:
             rows = conn.execute(sa.text("SELECT corpus_id, COUNT(*) AS n FROM corpus_files GROUP BY corpus_id")).all()
         return {r[0]: int(r[1]) for r in rows}
 
+    def status_counts_for_corpora(self, corpus_ids: List[str]) -> Dict[str, Dict[str, int]]:
+        """``{corpus_id: {processing_status: count}}`` for exactly the given
+        corpus ids, in ONE query. Mirrors the DuckDB sibling — see its
+        docstring for why this exists (the per-scope N+1 it replaces)."""
+        if not corpus_ids:
+            return {}
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                sa.text(
+                    "SELECT corpus_id, processing_status, COUNT(*) AS n FROM corpus_files "
+                    "WHERE corpus_id = ANY(:ids) GROUP BY corpus_id, processing_status"
+                ),
+                {"ids": list(corpus_ids)},
+            ).all()
+        out: Dict[str, Dict[str, int]] = {}
+        for corpus_id, status, n in rows:
+            out.setdefault(corpus_id, {})[status or "pending"] = int(n)
+        return out
+
     def list_children(self, parent_file_id: str) -> List[Dict[str, Any]]:
         """All child rows extracted from the given archive file, by created_at."""
         with self._engine.connect() as conn:
