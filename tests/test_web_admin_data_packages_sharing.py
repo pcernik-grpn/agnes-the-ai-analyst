@@ -165,7 +165,9 @@ class TestTheRowIsTheSharedAdminTable:
         pkg_id = _mk_pkg("card-shape", "Card Shape Pkg")
         c = seeded_app["client"]
         body = c.get("/admin/data-packages", headers=_auth(seeded_app["admin_token"])).text
-        assert 'class="data-table adp-table"' in body, "packages are not on the shared admin table"
+        # `data-table` first, then the page's own class and the pinned-actions
+        # opt-in — the shared component, not a private copy of one.
+        assert 'class="data-table adp-table' in body, "packages are not on the shared admin table"
         row = _row_of(body, pkg_id)
         assert "<td>" in row, "the row has no cells"
         # …and NOT either card it replaced.

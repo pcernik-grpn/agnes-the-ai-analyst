@@ -426,7 +426,12 @@
       <span id="registered-count" style="font-size: 12px; color: var(--ds-text-secondary);"></span>
     </div>
     <div class="src-card-body" style="padding:0;">
-      <table class="ds-table" id="registered-table">
+      {# `data-table-wrap`: five columns of tool config plus a row of controls
+         outgrow a narrow card, and without a scroll box of its own the table
+         widens the PAGE. The class also brings the visible scrollbar and the
+         edge marking that says a column is cut. #}
+      <div class="data-table-wrap">
+      <table class="ds-table data-table--pinned-actions" id="registered-table">
         <thead>
           <tr>
             <th>Original</th>
@@ -438,6 +443,7 @@
         </thead>
         <tbody id="registered-tbody"></tbody>
       </table>
+      </div>
       <div id="registered-empty" class="empty-row">No tools registered for this source yet.</div>
     </div>
   </div>

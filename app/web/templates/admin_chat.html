@@ -9,8 +9,15 @@
 
 {% block head_extra %}
 <style>
+/* `data-table-wrap` (in the markup below) brings the overflow: this page's
+   own rule was `overflow: hidden`, which does not clip a wide table
+   harmlessly — it clips away the row's Tail and Kill buttons with no
+   scrollbar to reach them, the same failure /admin/data-packages had except
+   unrecoverable. The shared class scrolls instead, paints a visible
+   scrollbar, and marks the cut edge; `auto` still clips the square corners
+   inside this radius, so nothing is lost by dropping `hidden`. */
 .chatops-table-wrap { border: 1px solid var(--border); border-radius: 8px;
-  overflow: hidden; background: var(--surface); }
+  background: var(--surface); }
 .chatops-table { width: 100%; border-collapse: collapse; font-size: 13px; }
 .chatops-table thead th { text-align: left; padding: 10px 12px;
   background: var(--border-light); border-bottom: 1px solid var(--border);
@@ -25,8 +32,8 @@
 {% endblock %}
 
 {% block page %}
-<div class="chatops-table-wrap">
-  <table class="chatops-table" id="sessions">
+<div class="chatops-table-wrap data-table-wrap">
+  <table class="chatops-table data-table--pinned-actions" id="sessions">
     <thead><tr>
       <th>ID</th><th>User</th><th>State</th><th>Started</th><th>Last activity</th><th>Crashes</th><th></th>
     </tr></thead>

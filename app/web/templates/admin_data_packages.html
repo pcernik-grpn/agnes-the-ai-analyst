@@ -84,36 +84,91 @@
     font-size: 12px; color: var(--ds-text-muted);
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
-  /* ── The wide table scrolls inside its own box ───────────────────────
-     `.data-table-wrap` is a bare <div> — nine admin templates wrap a table in
-     it and NO sheet defines it, so it contains nothing. Five columns of
-     package facts have a min-content of ~1105px; below roughly a 1400px
-     window that is wider than the column it sits in, and with no overflow
-     rule the table simply ran out of the page — Shared with and Actions off
-     the right edge, and the whole document scrolling sideways.
+  /* ── The table FITS. That is the fix; the scroll is the fallback ──
+     `.data-table-wrap` scrolls its own overflow — shared now
+     (style-custom.css), so nothing here declares it. It was never the
+     answer: five columns of package facts asked for 1627px inside a 1204px
+     column on a 1440px screen, so the reader arrived at a table whose
+     Shared with was cut in half and whose Edit button sat 400px past the
+     right edge, behind a scrollbar macOS does not paint until you are
+     already scrolling.
 
-     `overflow-x: auto` is what the wrapper was named for. Page-local rather
-     than on the shared class: making a scroll container also makes the other
-     axis scrollable (a non-visible overflow on one axis computes the other to
-     `auto`), and some of those other eight tables carry row menus that would
-     start clipping. This table has none — its only control is a link.
+     What made it that wide was the name cell: `.adp-row__desc` is `nowrap`
+     and ellipsised, but under `table-layout: auto` a nowrap cell never
+     ellipsises — the browser widens the COLUMN to the full sentence instead
+     (1173px of it, for a 42% column). `table-layout: fixed` turns the
+     ellipsis on and makes the <colgroup> binding, the same fix
+     /admin/users, /admin/tables and the Library table already use. */
+  .adp-table { table-layout: fixed; min-width: 720px; }
 
-     Same fix, same reasoning as `.apd-tablewrap` on the package's own page. */
-  .data-table-wrap { overflow-x: auto; }
+  /* ── Narrow: drop a column rather than dress up a scrollbar ─────────
+     Below roughly 1150px the five columns stop fitting, and every cue for a
+     cut table is a consolation prize — a shadow, a fade, a scrollbar under
+     the last row. The reader did not want to scroll sideways through an
+     index; they wanted to read it. So the table gives up its least
+     load-bearing column instead and goes on fitting.
 
-  /* ── The floor the narrow columns need ───────────────────────────────
-     `table-layout` is auto here, so a column is only as wide as the browser
-     decides to spare after the Package column's descriptions have taken what
-     they want — and what it spared was 98px for Category ("Customer Insights"
-     on two lines) and 100px for Tables (a nowrap chip hanging outside its own
-     tint). A minimum on the cell is what auto layout honours; the Package
-     column gives up the difference and ellipsises, which its description
-     already does by design.
+     Category is the one to lose, and it is not a close call. It is the only
+     column here that is decorative rather than diagnostic — muted 12px
+     text, "—" on most rows of a young instance — it survives as a FILTER
+     above the table (where the question "show me Finance packages" is
+     actually asked), and it is stated in full on the package's own page one
+     click away. Everything else answers a question this page exists for:
+     what is in the package (Tables), who gets it (Shared with), and the one
+     verb (Actions).
 
-     Scoped to a 5-column row so the 3-column Memory Domains table below —
-     same classes, no Tables or Category column — is untouched. */
-  .adp-table tr:has(> :nth-child(5)) > :nth-child(2) { min-width: 92px; }
-  .adp-table tr:has(> :nth-child(5)) > :nth-child(3) { min-width: 148px; }
+     A CONTAINER query, not a media query: what decides whether five columns
+     fit is the width of the column the table sits in, which on an admin page
+     is the viewport minus a 200px sidebar that itself disappears at 820px.
+     A viewport breakpoint would be a guess at that arithmetic and would be
+     wrong on both sides of the sidebar's own collapse. `container-type:
+     inline-size` on the wrap makes the real number available; scoped to this
+     page's sections so the other nine consumers of `.data-table-wrap` are
+     untouched.
+
+     The <col> goes to `width: 0` alongside: `display: none` on the cells
+     empties the column but the colgroup still reserves its 14%, which would
+     leave a 14% gutter where Category used to be. The remaining widths do
+     not sum to 100 after that — fixed layout scales them back up in
+     proportion, which is exactly the intent. */
+  .adp-section .data-table-wrap { container-type: inline-size; container-name: adp-table; }
+
+  /* Five columns. Proportions, not pixels — the wrap's width varies with the
+     sidebar, the viewport and the theme's gutters. */
+  .adp-table .adp-col--pkg { width: 38%; }
+  .adp-table .adp-col--tables { width: 10%; }
+  .adp-table .adp-col--cat { width: 14%; }
+  .adp-table .adp-col--shared { width: 27%; }
+  .adp-table .adp-col--act { width: 11%; }
+
+  /* Four. Each remaining column takes a share of what Category gave back,
+     and the set sums to 100 on its own — a colgroup that sums to less does
+     not scale up in proportion under fixed layout: Chrome gives the whole
+     remainder to the LAST column, which measured as 206px of Actions beside
+     a 107px "Shared with" truncated to "Not sh…". */
+  @container adp-table (max-width: 900px) {
+    /* COLLAPSED, not `display: none`. Removing the cells from the row shifts
+       every cell after them one column to the left — the <colgroup> maps by
+       position, so Shared with inherited the zeroed column (measured: 0px)
+       and Actions took its 32%. The cells stay in flow and give up
+       everything that occupies space instead; the column itself is zeroed on
+       the <col>, and under fixed layout content never widens a column, so
+       nothing leaks out of a 0px cell. */
+    .adp-table .adp-col--cat { width: 0; }
+    .adp-table .adp-cell--cat {
+      padding: 0;
+      border-left: 0;
+      /* The <th>'s label is a bare text node — `> *` cannot reach it. */
+      font-size: 0;
+      line-height: 0;
+      overflow: hidden;
+    }
+    .adp-table .adp-cell--cat > * { display: none; }
+    .adp-table .adp-col--pkg { width: 44%; }
+    .adp-table .adp-col--tables { width: 11%; }
+    .adp-table .adp-col--shared { width: 32%; }
+    .adp-table .adp-col--act { width: 13%; }
+  }
 
   .adp-num { font-variant-numeric: tabular-nums; }
   .adp-none { color: var(--ds-text-muted); }
@@ -311,20 +366,20 @@
      put People, Tables and Sources on `.data-table`, which is what this uses
      — the shared admin table, not a private copy of one. #}
   <div class="data-table-wrap">
-    {# These percentages are HINTS, not a grid: `.data-table` never sets
-       `table-layout: fixed`, so the browser still sizes from content and one
-       long description does take the outcome columns down to a word each —
-       which is what cramped the Category cell and squeezed the Tables chip
-       narrower than its own text. What actually holds those columns open is
-       the `min-width` on them in the sheet below; these stay as the
-       proportions to aim for when there IS slack. #}
-    <table class="data-table adp-table">
+    <table class="data-table adp-table data-table--pinned-actions">
+      {# The widths live in the sheet, not in five inline styles, because
+         there are two sets of them — five columns and four — and the narrow
+         set has to sum to 100 in its own right. Under `table-layout: fixed`
+         a colgroup that sums to less than 100 does NOT scale back up in
+         proportion: Chrome hands the remainder to the last column, which
+         measured 206px of Actions against a 107px "Shared with" reading
+         "Not sh…". See `.adp-col--*` in the sheet above. #}
       <colgroup>
-        <col style="width: 42%">
-        <col style="width: 10%">
-        <col style="width: 15%">
-        <col style="width: 24%">
-        <col style="width: 9%">
+        <col class="adp-col--pkg">
+        <col class="adp-col--tables">
+        <col class="adp-col--cat">
+        <col class="adp-col--shared">
+        <col class="adp-col--act">
       </colgroup>
       <thead>
         {# There is no Access column. The tier is an attribute OF the sharing,
@@ -337,7 +392,7 @@
         <tr>
           <th>Package</th>
           <th title="Tables assigned to this package — a package with none delivers nothing">Tables</th>
-          <th>Category</th>
+          <th class="adp-cell--cat">Category</th>
           <th title="Groups this package is granted to, and what it does in their workspace">Shared with</th>
           <th class="adp-cell--act">Actions</th>
         </tr>
@@ -387,7 +442,7 @@
             <span class="adp-num">{{ n_tables }}</span>
             {% endif %}
           </td>
-          <td>{% if entry.category %}<span class="adp-cat">{{ entry.category }}</span>{% else %}<span class="adp-none">&mdash;</span>{% endif %}</td>
+          <td class="adp-cell--cat">{% if entry.category %}<span class="adp-cat">{{ entry.category }}</span>{% else %}<span class="adp-none">&mdash;</span>{% endif %}</td>
           {# Groups only. The TIER is per-grant — a package is routinely
              Automatic for one group and Optional for another — so any single
              value here is false for some of the groups named beside it. It
