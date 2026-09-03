@@ -538,12 +538,15 @@ class KaiEngineHandle:
         args = state.tool_args.get(tool_call_id) or {}
         questions = args.get("questions") if isinstance(args, dict) else None
         if not isinstance(questions, list) or not questions:
-            # Nothing renderable — a malformed call, or an approval that
-            # arrived before its input event. Allow it silently rather than
-            # park the turn on a card the client would refuse to draw
-            # (`renderQuestionRequest` drops a frame with no questions), and
-            # silently for the same reason `_post_approval` documents: no card
-            # was raised, so there is none to retire.
+            # Nothing renderable — the captured tool args carry no non-empty
+            # `questions` list. Not a missing input event: reaching here at all
+            # means `tool-input-available` DID arrive, since the branch that
+            # calls this is keyed on the tool name that event recorded
+            # (Copilot review). Allow it silently rather than park the turn on
+            # a card the client would refuse to draw (`renderQuestionRequest`
+            # drops a frame with no questions), and silently for the same
+            # reason `_post_approval` documents: no card was raised, so there
+            # is none to retire.
             self._spawn_side_task(self._post_approval(tool_call_id, "allow", silent=True))
             return
         state.pending_questions.add(tool_call_id)
