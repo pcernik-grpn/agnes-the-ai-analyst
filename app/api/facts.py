@@ -663,8 +663,17 @@ def facts_ingest(body: FactsIngestRequest, user=Depends(require_admin)) -> Dict[
     Response IS the run report: ``{claims_written,
     claims_accepted_via_identity, claims_rejected: [{row, reason}],
     source_urls_rejected: [{doc_id, reason}], deferred: [...],
-    subjects_created, subjects_deleted, corrections_active: [...],
-    review_items: [...], edges_skipped_missing_endpoint}``.
+    subjects_created, subjects_deleted, sweep_skipped,
+    corrections_active: [...], review_items: [...],
+    edges_skipped_missing_endpoint}``.
+
+    ``sweep_skipped`` (live finding, 2026-09) is True when this batch's own
+    end-of-ingest orphan sweep backed off because a CONCURRENT facts-
+    extraction pass already held its serializing advisory lock — never an
+    error, and ``subjects_deleted`` stays accurate either way, since the
+    next pass's sweep covers whatever this one skipped rather than double-
+    counting or under-counting. See
+    :meth:`FactsPgRepository.sweep_orphans`'s "Concurrency" section.
 
     ``claims_accepted_via_identity`` (spec §8) is the subset of
     ``claims_written`` whose quote passed the verbatim gate ONLY via the

@@ -847,6 +847,15 @@ def _sweep_facts_orphans_after_delete(*, trigger: str) -> None:
     is swallowed here (not surfaced as a 501) because a DuckDB-backed
     instance can never have facts claims to begin with — this is routine
     file-delete housekeeping, not a caller-facing facts API call.
+
+    ``grace_seconds=0``: unlike an `ingest_batch`-driven sweep (which
+    defaults to `sweep_orphans()`'s own grace period — see its
+    "Concurrency" section — because a concurrent pass may be mid-write on
+    the very subject it just orphaned), THIS caller just deleted the file
+    whose claim was the subject's only evidence itself; nothing else could
+    be concurrently minting fresh evidence for the same subject, so the
+    immediate-delete behavior an admin deleting a file expects is both safe
+    and correct here.
     """
     from app.instance_config import feature_enabled
 
@@ -855,14 +864,17 @@ def _sweep_facts_orphans_after_delete(*, trigger: str) -> None:
     try:
         from src.repositories import RequiresPostgresBackend, facts_repo
 
-        deleted = facts_repo().sweep_orphans()
+        result = facts_repo().sweep_orphans(grace_seconds=0)
     except RequiresPostgresBackend:
         return
     except Exception:
         logger.warning("facts orphan sweep failed after %s", trigger, exc_info=True)
         return
+    deleted = result["deleted"]
     if deleted:
         logger.info("facts orphan sweep trigger=%s subjects_deleted=%d", trigger, deleted)
+    if result["skipped"]:
+        logger.info("facts orphan sweep trigger=%s skipped (concurrent sweep in progress)", trigger)
 
 
 def _purge_facts_claims_for_replaced_file(file_id: str) -> int:

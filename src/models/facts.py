@@ -34,6 +34,16 @@ class Fact(Base):
 
     id: Mapped[str] = mapped_column(String, primary_key=True)
     type: Mapped[str] = mapped_column(String, nullable=False)
+    # Grace-period anchor for `FactsPgRepository.sweep_orphans` (live
+    # finding, 2026-09: several concurrent facts-extraction passes racing
+    # their own end-of-batch sweeps against one shared fact graph deleted a
+    # sibling pass's just-minted, not-yet-evidenced subject). A row older
+    # than the sweep's grace window is swept as before; NULL (a row that
+    # predates this column) reads as "old enough" — see migration
+    # 0100_facts_created_at.
+    created_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), server_default=sa.text("now()"), nullable=True
+    )
 
 
 class FactAlias(Base):

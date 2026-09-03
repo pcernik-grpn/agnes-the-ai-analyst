@@ -697,12 +697,19 @@ def test_c2_full_documents_replace_drops_a_subject_the_reextraction_no_longer_me
 
     # Re-extraction drops "beta" entirely; full_documents replace must
     # remove its stale claim so the subject is orphaned and swept.
+    # `orphan_sweep_grace_seconds=0`: this batch's own end-of-ingest sweep
+    # must delete "beta" in the SAME call — its default grace period would
+    # otherwise spare it (it was minted only moments ago, by the batch
+    # above), which is right for the concurrent-pass race this default
+    # defends against but wrong for what this test is asserting.
     report = repo.ingest_batch(
         documents=[],
         full_documents=[doc_id],
         nodes=[_node("engagement:acme", doc_id, "Acme Corp is the client.")],
+        orphan_sweep_grace_seconds=0,
     )
     assert report["subjects_deleted"] >= 1
+    assert report["sweep_skipped"] is False
     remaining = repo.search(_admin(), type="engagement")
     ids = {s["id"] for s in remaining["subjects"]}
     assert len(ids) == 1
@@ -1070,7 +1077,10 @@ def test_wrong_correction_reattaches_after_the_subject_is_deleted_and_recreated(
     )
 
     # Full delete: replace mode with an empty node set orphans the subject.
-    repo.ingest_batch(documents=[], full_documents=[doc_id], nodes=[])
+    # orphan_sweep_grace_seconds=0 — this batch's own sweep must delete it
+    # in the SAME call; the subject was minted moments ago (report1, just
+    # above), well inside the default grace period.
+    repo.ingest_batch(documents=[], full_documents=[doc_id], nodes=[], orphan_sweep_grace_seconds=0)
     assert report1["subjects_created"] == 1
 
     # Re-create the SAME alias under a fresh surrogate id.
@@ -1194,8 +1204,8 @@ def test_c5_orphan_sweep_counts_and_spares_a_subject_with_a_surviving_claim(pg_e
     with pg_env.begin() as conn:
         conn.execute(sa.text("DELETE FROM corpus_files WHERE id = 'cf_a1'"))
 
-    deleted = repo.sweep_orphans()
-    assert deleted == 0  # the fact still has its cf_a2 claim
+    result = repo.sweep_orphans(grace_seconds=0)
+    assert result == {"deleted": 0, "skipped": False}  # the fact still has its cf_a2 claim
     assert len(repo.claims(_admin(), fact_id)["claims"]) == 1
 
 
@@ -1206,8 +1216,8 @@ def test_c5_orphan_sweep_deletes_a_subject_with_zero_remaining_claims(pg_env, re
     with pg_env.begin() as conn:
         conn.execute(sa.text("DELETE FROM corpus_files WHERE id = 'cf_a1'"))
 
-    deleted = repo.sweep_orphans()
-    assert deleted == 1
+    result = repo.sweep_orphans(grace_seconds=0)
+    assert result == {"deleted": 1, "skipped": False}
     assert repo.search(_admin(), type="engagement")["subjects"] == []
 
 
@@ -1237,8 +1247,8 @@ def test_c5_orphan_sweep_spares_a_fact_with_only_a_claimed_incident_edge(pg_env,
         quote="Acme is a SaaS company.",
     )
 
-    deleted = repo.sweep_orphans()
-    assert deleted == 0
+    result = repo.sweep_orphans(grace_seconds=0)
+    assert result == {"deleted": 0, "skipped": False}
     assert repo.claims(_admin(), dst) == {"claims": [], "revealed": False, "limit_applied": False}
 
 
@@ -1255,13 +1265,153 @@ def test_c5_orphan_sweep_deletes_a_fact_when_its_incident_edges_are_also_claimle
     dst = repo.create_fact(type="industry")
     repo.create_edge(src=src, type="works_in_industry", dst=dst)  # no claim ever added
 
-    deleted = repo.sweep_orphans()
-    assert deleted == 2  # the claimless edge AND the now-orphaned dst fact
+    result = repo.sweep_orphans(grace_seconds=0)
+    assert result == {"deleted": 2, "skipped": False}  # the claimless edge AND the now-orphaned dst fact
 
     from src.repositories.facts_pg import FactNotFound
 
     with pytest.raises(FactNotFound):
         repo.claims(_admin(), dst)
+
+
+# ---------------------------------------------------------------------------
+# Orphan sweep concurrency (live finding, 2026-09): several facts-extraction
+# passes racing their own end-of-batch sweep_orphans() against one shared
+# fact graph deleted a sibling pass's just-minted, not-yet-evidenced
+# subject — 75 447 subjects deleted against 10 784 created in 30 minutes on
+# one instance, ~13% of documents failing with ForeignKeyViolation. Two
+# guards close it: a grace period (a subject younger than it is never
+# swept) and a transaction-scoped advisory lock serializing the sweep
+# itself across passes.
+# ---------------------------------------------------------------------------
+
+
+def test_orphan_sweep_grace_period_spares_a_freshly_created_orphan(pg_env, repo):
+    """A fact minted moments ago — by this call or, in production, by a
+    concurrent pass still mid-write — must survive `sweep_orphans()`'s
+    default grace period, however orphaned (zero claims, zero incident
+    edges) it looks right now."""
+    _seed_collection(collection_id=CORPUS_A)
+    fact_id = repo.create_fact(type="engagement", natural_key="engagement:freshly-minted")
+
+    result = repo.sweep_orphans()  # default grace period — the production call shape
+    assert result == {"deleted": 0, "skipped": False}
+
+    with repo._engine.connect() as conn:
+        still_there = conn.execute(sa.text("SELECT 1 FROM facts WHERE id = :id"), {"id": fact_id}).scalar()
+    assert still_there == 1
+
+
+def test_orphan_sweep_deletes_a_subject_older_than_the_grace_period(pg_env, repo):
+    """A genuinely stale orphan — backdated well past the grace period — is
+    still deleted exactly as before; the grace period narrows the sweep, it
+    does not disable it."""
+    _seed_collection(collection_id=CORPUS_A)
+    fact_id = repo.create_fact(type="engagement", natural_key="engagement:stale-orphan")
+    with repo._engine.begin() as conn:
+        conn.execute(
+            sa.text("UPDATE facts SET created_at = now() - interval '1 hour' WHERE id = :id"),
+            {"id": fact_id},
+        )
+
+    result = repo.sweep_orphans()  # default grace period (15 min) — this fact is an hour old
+    assert result == {"deleted": 1, "skipped": False}
+
+    with repo._engine.connect() as conn:
+        still_there = conn.execute(sa.text("SELECT 1 FROM facts WHERE id = :id"), {"id": fact_id}).scalar()
+    assert still_there is None
+
+
+def test_orphan_sweep_skips_when_a_concurrent_pass_holds_the_lock(pg_env, repo):
+    """Another pass's sweep already running is simulated by holding the SAME
+    transaction-scoped advisory lock on a second connection. This call must
+    back off immediately rather than block — deleting nothing, not even a
+    genuinely stale orphan — and report `skipped: True` so the caller knows
+    the next pass's sweep will cover it."""
+    from src.repositories.facts_pg import _SWEEP_LOCK_ID
+
+    fact_id = repo.create_fact(type="engagement", natural_key="engagement:locked-out")
+    with repo._engine.begin() as conn:
+        conn.execute(
+            sa.text("UPDATE facts SET created_at = now() - interval '1 hour' WHERE id = :id"),
+            {"id": fact_id},
+        )
+
+    holder_conn = repo._engine.connect()
+    holder_trans = holder_conn.begin()
+    try:
+        acquired = holder_conn.execute(
+            sa.text("SELECT pg_try_advisory_xact_lock(:key)"), {"key": _SWEEP_LOCK_ID}
+        ).scalar()
+        assert acquired is True
+
+        result = repo.sweep_orphans()
+        assert result == {"deleted": 0, "skipped": True}
+    finally:
+        holder_trans.rollback()
+        holder_conn.close()
+
+    with repo._engine.connect() as conn:
+        still_there = conn.execute(sa.text("SELECT 1 FROM facts WHERE id = :id"), {"id": fact_id}).scalar()
+    assert still_there == 1  # untouched — the sweep never even attempted the DELETE
+
+    # The lock is released once the holder's transaction ends — a later,
+    # unblocked sweep now reaps the same stale orphan.
+    result = repo.sweep_orphans()
+    assert result == {"deleted": 1, "skipped": False}
+
+
+def test_freshly_created_edge_endpoint_survives_a_concurrent_sweep(pg_env, repo, monkeypatch):
+    """The production race itself, exercised with a REAL `sweep_orphans()`
+    call rather than a faked delete (contrast
+    `test_edge_whose_endpoint_fact_vanished_before_insert_is_skipped_and_
+    counted` above, which simulates a concurrent pass via a raw ``DELETE``):
+    a fact minted purely as an edge endpoint (`_endpoint()`'s fallback,
+    `engagement:acme-rollout` below — never listed in `nodes[]`) commits in
+    its OWN transaction, zero claims, before the edge that anchors it. That
+    is a real, if brief, window (`EdgeEndpointMissing`'s docstring) in which
+    a CONCURRENT pass's own end-of-batch sweep could delete it. The grace
+    period closes this without touching any transaction boundary: its
+    default (15 minutes) is far longer than the gap between this batch's
+    own endpoint-resolution commit and its edge's own commit, so a sweep run
+    for real in that exact gap finds nothing to delete, and `create_edge`
+    never sees a missing endpoint."""
+    doc_id = _seed_ready_doc(pg_env)
+
+    from src.repositories.facts_pg import FactsPgRepository
+
+    original_create_edge = FactsPgRepository.create_edge
+
+    def _create_edge_after_concurrent_sweep(self, **kwargs):
+        # Simulate another concurrent ingest_batch's own end-of-batch
+        # sweep_orphans() running in the gap between this edge's endpoint
+        # resolution (already committed, just above) and its own INSERT.
+        result = self.sweep_orphans()
+        assert result == {"deleted": 0, "skipped": False}
+        return original_create_edge(self, **kwargs)
+
+    monkeypatch.setattr(FactsPgRepository, "create_edge", _create_edge_after_concurrent_sweep)
+
+    report = repo.ingest_batch(
+        nodes=[_node("person:jane-doe", doc_id, "engagement is underway")],
+        edges=[
+            {
+                "src": "engagement:acme-rollout",
+                "type": "staffed_by",
+                "dst": "person:jane-doe",
+                "evidence": [{"doc_id": doc_id, "quote": "engagement is underway"}],
+            }
+        ],
+    )
+
+    assert report["edges_skipped_missing_endpoint"] == 0
+    assert report["claims_written"] == 2  # the node's own claim + the edge's own claim
+
+    from src.db_pg import get_engine
+
+    with get_engine().connect() as conn:
+        edge_count = conn.execute(sa.text("SELECT COUNT(*) FROM edges WHERE type = 'staffed_by'")).scalar()
+    assert edge_count == 1
 
 
 # ---------------------------------------------------------------------------
@@ -2824,10 +2974,11 @@ def test_a_candidate_does_not_keep_an_unevidenced_fact_alive(pg_env, repo):
     repo.ingest_batch(nodes=[_node("engagement:norwood-farms-group", doc_b, "Norwood Farms Group signed in April.")])
 
     # Every claim gone — both facts are now unevidenced, and the only thing
-    # touching them is the proposal.
+    # touching them is the proposal. grace_seconds=0: both facts were minted
+    # moments ago by this same test, well inside the default grace window.
     with repo._engine.begin() as conn:
         conn.execute(sa.text("DELETE FROM claims"))
-    repo.sweep_orphans()
+    repo.sweep_orphans(grace_seconds=0)
 
     with repo._engine.connect() as conn:
         facts_left = conn.execute(sa.text("SELECT count(*) FROM facts")).scalar_one()
