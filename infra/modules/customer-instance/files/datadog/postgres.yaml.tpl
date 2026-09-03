@@ -13,8 +13,10 @@
 # on the container, which lives in the app image's compose file, not in this
 # module — so it is a documented limitation, not an oversight.
 #
-# @@DD_PG_PASSWORD@@ is substituted on the host by agnes-datadog-pg-role.sh,
-# which owns the credential; it is not a Terraform value.
+# The password placeholder below is substituted on the host by
+# agnes-datadog-pg-role.sh, which owns the credential; it is not a Terraform
+# value. The substitution is global, so the literal token must appear only in
+# the password field — in a comment it would carry the real credential too.
 #
 # dbm stays false: Database Monitoring is a separate, billed product and this
 # check only needs liveness, connection headroom, size and XID age.
