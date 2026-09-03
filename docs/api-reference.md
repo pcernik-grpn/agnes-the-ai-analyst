@@ -1519,7 +1519,14 @@ unknown/non-sharepoint connection before any other work; refuses cleanly
 `409 extraction_dependencies_missing` (the `extraction` optional dependency
 extra is not installed); a run already queued/running for the same
 connection is `409 extraction_already_running` — deduped on a stable
-per-connection idempotency key shared with the sweep below.
+per-connection idempotency key shared with the sweep below. When the body
+sets `retry_failed: true` (TCRD-296 synthesis — the source card's "Retry
+failed (N)" button and `agnes admin sharepoint extract --retry-failed`),
+the response also carries `queued_count` — the size of this connection's
+persisted `failed_items` backlog at the moment this call reads it, before
+the job is enqueued, mirroring `…/extraction/retry-empty`'s own
+`queued_count` below. Absent for a plain trigger, `--resync`, or
+`--force-reprocess`.
 
 `POST …/extraction/retry-empty` re-queues this connection's `convert_empty`
 backlog — documents that converted fine but carried no text (a scan with no
@@ -1719,7 +1726,17 @@ queued/running standalone facts pass for this connection
 read off the job queue (matched on the same idempotency key the trigger
 dedups on) and never appears in `running`/`last_completed`. The card shows
 it as a "facts pass queued/running" line in the Run row and locks its own
-"Extract facts now" button while one is in flight.
+"Extract facts now" button while one is in flight. `failed_items_count` /
+`empty_items_count` (TCRD-296 synthesis) are the SIZE of this connection's
+persisted `failed_items`/`empty_items` backlogs (a cheap `jsonb_object_keys`
+count, never a decode of the — potentially huge — payload on this
+polled-every-few-seconds path) — what the Run row's "Retry failed (N)" /
+"Retry empty (N)" buttons show as `N`, `0` (never `null`) for a connection
+that has never crawled. `skipped_unsupported_count` has no persisted
+backlog to count (no retry mechanism replays it — see `CrawlStats.
+skipped_unsupported`'s docstring), so it is read off whichever of
+`running`/`last_failed`/`last_completed` above is most recent, and `null`
+when none of the three exist.
 
 `GET …/extraction/runs` (`?limit=`, ≤100) lists runs newest-first with a
 `total` covering every recorded run; `GET …/extraction/runs/{run_id}` adds the
@@ -1789,9 +1806,20 @@ checkpoint older than 10 minutes on a row whose STORED status is still
 `stalled` derivation, meant to catch an operator's eye across a whole fleet
 rather than assert an outcome). `facts` carries the facts stage's own
 counters, read off the SAME run row (crawl and facts are literally one row;
-`phase` flips from `"crawl"` to `"facts"` mid-run). CLI:
-`agnes admin sharepoint runs [--all] [--json] [--watch]` (`--watch`
-refreshes every 10s).
+`phase` flips from `"crawl"` to `"facts"` mid-run). Each row also carries
+`failed_items_count`/`empty_items_count` (TCRD-296 synthesis) — the SAME
+persisted-backlog counts `…/extraction/status` returns, one cheap query per
+row, backing the table's own "Retry failed (N)"/"Retry empty (N)" buttons
+so an operator does not need to open a source card just to see whether
+there is anything to retry. The response also carries a top-level `jobs`
+block — `{kind: {queued, running}}` for `corpus-extraction` and
+`sharepoint-facts-extraction`, read in one grouped query off the jobs table
+independent of `active`/`all` scope — the queued-vs-running lane-starvation
+strip above the table: a starved job (queued, never yet claimed) has no
+`extraction_runs` row and so no table row of its own to show it otherwise.
+CLI: `agnes admin sharepoint runs [--all] [--json] [--watch]` (`--watch`
+refreshes every 10s; the human-readable table also prints a `Jobs — …` line
+for the same `jobs` block, flagging a starved lane).
 
 `PATCH …/extraction/facts-config` (cost-levers task, lever A) sets or clears
 per-connection overrides for the corrective-retry policy, transport and LLM

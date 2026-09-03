@@ -234,6 +234,46 @@ def test_list_respects_limit(repo):
     assert len(repo.list(kind="bulk", limit=50)) == 5
 
 
+def test_counts_by_kind_groups_queued_and_running_per_kind(repo):
+    repo.enqueue("corpus-extraction", {})
+    repo.enqueue("corpus-extraction", {})
+    running = repo.enqueue("corpus-extraction", {})
+    repo.claim_next(kinds=["corpus-extraction"], worker_id="w1")
+    assert repo.get(running["id"]) is not None  # sanity: at least one job exists
+    repo.enqueue("sharepoint-facts-extraction", {})
+
+    counts = repo.counts_by_kind(["corpus-extraction", "sharepoint-facts-extraction"])
+    assert counts["corpus-extraction"]["queued"] == 2
+    assert counts["corpus-extraction"]["running"] == 1
+    assert counts["sharepoint-facts-extraction"]["queued"] == 1
+    assert counts["sharepoint-facts-extraction"]["running"] == 0
+
+
+def test_counts_by_kind_zero_fills_a_kind_with_no_rows(repo):
+    counts = repo.counts_by_kind(["nothing-queued-here"])
+    assert counts == {"nothing-queued-here": {"queued": 0, "running": 0}}
+
+
+def test_counts_by_kind_ignores_kinds_outside_the_requested_set(repo):
+    repo.enqueue("other-kind", {})
+    counts = repo.counts_by_kind(["corpus-extraction"])
+    assert counts == {"corpus-extraction": {"queued": 0, "running": 0}}
+
+
+def test_counts_by_kind_ignores_done_and_failed_jobs(repo):
+    done = repo.enqueue("corpus-extraction", {})
+    claimed = repo.claim_next(kinds=["corpus-extraction"], worker_id="w1")
+    assert claimed["id"] == done["id"]
+    repo.complete(claimed["id"], "w1", claimed["lease_token"])
+
+    counts = repo.counts_by_kind(["corpus-extraction"])
+    assert counts["corpus-extraction"] == {"queued": 0, "running": 0}
+
+
+def test_counts_by_kind_empty_kinds_list_returns_empty_dict(repo):
+    assert repo.counts_by_kind([]) == {}
+
+
 # ---------------------------------------------------------------------------
 # claim / lease / complete / fail lifecycle
 # ---------------------------------------------------------------------------

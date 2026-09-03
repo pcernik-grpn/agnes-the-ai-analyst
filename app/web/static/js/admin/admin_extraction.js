@@ -1,0 +1,346 @@
+/* Extracted from admin_extraction.html (perf/externalization follow-up,
+   TCRD-296 synthesis, 2026-09-03) — was inlined, is now a normal cached
+   static asset, versioned by static_url()'s ?v=<mtime> cache-buster, same
+   move data_sources_extraction_observability.js made a day earlier. */
+
+// Scope: "active" (default — only connections with a run CURRENTLY
+// running, the "is it on pace right now" view) or "all" (every SharePoint
+// connection, idle ones included). Mirrors the API's own `?active=1` /
+// `?all=1` query params one-to-one.
+let extScope = "active";
+let extTimer = null;
+let extInFlight = false;
+
+// The last successfully rendered body — kept so a button click can redraw
+// the table IMMEDIATELY (its own in-flight/disabled state) without waiting
+// for the next scheduled poll, the same way `renderTable` already will once
+// that poll lands.
+let extLastBody = null;
+
+// Per-connection in-flight guards for the three reprocessing actions below
+// (TCRD-296) — belt and braces against a double-click; the server's own
+// per-connection idempotency key already refuses an overlapping run.
+const extPending = {};
+
+function _extPendingFor(connId) {
+  if (!extPending[connId]) extPending[connId] = { failed: false, empty: false, rerun: false };
+  return extPending[connId];
+}
+
+// A small transient per-row message (queued count, or a typed refusal) —
+// this page has no toast component of its own, so the Actions cell carries
+// its own one-line result instead. Naturally cleared by the next poll's
+// full table rebuild (~5s), same lifetime a toast would have had.
+const extActionMsg = {};
+
+function esc(s) {
+  const d = document.createElement("div");
+  d.textContent = s == null ? "" : String(s);
+  return d.innerHTML;
+}
+
+/* A FastAPI `detail` is a string on some paths and a structured object on
+   others (`{error, message, …}`) — see the same reader in
+   data_sources_page.js, duplicated here (this page loads no shared JS
+   module) rather than reached across scripts. */
+function detailMessage(body, fallback) {
+  const detail = body && body.detail;
+  if (detail && typeof detail === "object") return detail.message || detail.error || fallback;
+  return detail || fallback;
+}
+
+function fmtAgo(seconds) {
+  if (seconds == null) return "—";
+  if (seconds < 60) return Math.round(seconds) + "s ago";
+  if (seconds < 3600) return Math.floor(seconds / 60) + "m ago";
+  return Math.floor(seconds / 3600) + "h ago";
+}
+
+function fmtRate(rate) {
+  return rate == null ? "—" : rate.toFixed(1);
+}
+
+function fmtCost(usd) {
+  return usd == null || usd === 0 ? "—" : "$" + usd.toFixed(4);
+}
+
+// Sums input/output tokens across every priced stage (`ner`/`ocr`/`facts`)
+// a run's `usage` carries — see `_run_total_cost_usd`'s docstring on the
+// API side for why `usage` is keyed by stage and only populated once the
+// run has finished.
+function tokenTotals(usage) {
+  let inTok = 0, outTok = 0, any = false;
+  for (const stage of Object.values(usage || {})) {
+    if (!stage || typeof stage !== "object") continue;
+    if (typeof stage.input_tokens === "number") { inTok += stage.input_tokens; any = true; }
+    if (typeof stage.output_tokens === "number") { outTok += stage.output_tokens; any = true; }
+  }
+  return any ? `${inTok.toLocaleString()} / ${outTok.toLocaleString()}` : "—";
+}
+
+function factsCell(facts) {
+  if (!facts) return "—";
+  const done = facts.docs_done;
+  if (facts.phase_active) {
+    const total = facts.docs_total != null ? facts.docs_total : "?";
+    const pending = facts.docs_total != null && done != null ? Math.max(facts.docs_total - done, 0) : "?";
+    return `${done ?? 0} / ${total} <span class="ext-sub">(${pending} pending)</span>`;
+  }
+  if (done != null) {
+    // A pass that finished walked its whole corpus this run — nothing left
+    // pending FROM THIS PASS. Skipped/failed documents are their own
+    // counts, not represented as "pending" (they were looked at, not
+    // deferred).
+    return `${done} <span class="ext-sub">(0 pending)</span>`;
+  }
+  return "—";
+}
+
+function phaseCell(run) {
+  if (!run) return '<span class="badge">idle</span>';
+  const outcome = run.outcome;
+  const phase = run.phase || "crawl";
+  const cls = outcome === "failed" ? "badge--danger"
+    : outcome === "stalled" ? "badge--warn"
+    : outcome === "running" ? "badge--info"
+    : outcome === "interrupted" ? "badge--warn"
+    : "badge--success";
+  return `<span class="badge ${cls}">${esc(outcome)}</span> <span class="ext-sub">${esc(phase)}</span>`;
+}
+
+/* Every reprocessing action an operator would otherwise need the shell for
+   (TCRD-296): "Retry failed (N)"/"Retry empty (N)" (this connection's own
+   persisted crawl-state backlog) and "Re-run" (for a connection whose most
+   recent run did not finish cleanly). Disabled while a run is live — its
+   idempotency key may still hold the enqueue dedup lock either way. */
+function actionsCell(row) {
+  const run = row.run;
+  const live = !!(run && run.stored_status === "running");
+  const pending = _extPendingFor(row.connection_id);
+  const failedCount = row.failed_items_count || 0;
+  const emptyCount = row.empty_items_count || 0;
+
+  const retryFailedBtn = `<button type="button" class="btn btn-sm btn-secondary" onclick="extRetryFailed('${row.connection_id}')"
+      ${live || !failedCount || pending.failed ? "disabled" : ""}>${
+    pending.failed ? "Retrying…" : `Retry failed (${failedCount})`
+  }</button>`;
+  const retryEmptyBtn = `<button type="button" class="btn btn-sm btn-secondary" onclick="extRetryEmpty('${row.connection_id}')"
+      ${live || !emptyCount || pending.empty ? "disabled" : ""}>${
+    pending.empty ? "Retrying…" : `Retry empty (${emptyCount})`
+  }</button>`;
+  // Re-run only offers itself once there is a most-recent run that did NOT
+  // finish cleanly — a `done` run has nothing to re-run FROM here.
+  const canRerun = !live && !!run && (run.outcome === "failed" || run.outcome === "interrupted");
+  const rerunBtn = canRerun
+    ? `<button type="button" class="btn btn-sm btn-secondary" onclick="extRerun('${row.connection_id}')"
+      ${pending.rerun ? "disabled" : ""}>${pending.rerun ? "Starting…" : "Re-run"}</button>`
+    : "";
+
+  const msg = extActionMsg[row.connection_id];
+  const msgHtml = msg ? `<div class="ext-sub ${msg.ok ? "" : "ext-danger"}">${esc(msg.text)}</div>` : "";
+
+  return `<div class="ext-row-actions">${retryFailedBtn}${retryEmptyBtn}${rerunBtn}</div>${msgHtml}`;
+}
+
+function renderRow(row) {
+  const run = row.run;
+  const filesDone = run ? (run.files_done ?? 0) : null;
+  const filesSeen = run ? (run.files_seen ?? 0) : null;
+  const usage = run ? (run.usage || {}) : {};
+  const cost = row.estimated_cost_usd || 0;
+  // `extraction.crawl.min_modified` age filter — an operator scanning the
+  // fleet table must be able to tell a connection's cutoff is doing
+  // something without opening its source card. Absent/zero says nothing
+  // rather than a "0 filtered by age" that reads as a claim.
+  const filteredByAge = run && run.filtered_by_age
+    ? ` <span class="ext-sub">(${run.filtered_by_age.toLocaleString()} filtered by age)</span>`
+    : "";
+  const tr = document.createElement("tr");
+  tr.className = row.stuck ? "ext-row--stuck" : "";
+  tr.innerHTML = `
+    <td>
+      <div class="ext-conn">${esc(row.connection_name || row.connection_id)}</div>
+      <div class="ext-sub">${esc(row.connection_id)}</div>
+    </td>
+    <td>${phaseCell(run)}${row.stuck ? ' <span class="badge badge--danger" title="Checkpoint is stale — go look">Stuck?</span>' : ""}</td>
+    <td class="ext-num">${filesDone == null ? "—" : `${filesDone.toLocaleString()} / ${filesSeen.toLocaleString()}${filteredByAge}`}</td>
+    <td class="ext-num">${fmtRate(row.files_per_min)}</td>
+    <td class="ext-num">${factsCell(row.facts)}</td>
+    <td class="ext-num">${tokenTotals(usage)}</td>
+    <td class="ext-num">${fmtCost(cost)}</td>
+    <td class="ext-sub">${fmtAgo(row.checkpoint_age_s)}</td>
+    <td>${run && run.error ? `<span class="ext-error-cell" title="${esc(run.error)}">${esc(run.error)}</span>` : ""}</td>
+    <td>${actionsCell(row)}</td>
+  `;
+  return tr;
+}
+
+/* The queued-vs-running lane-starvation strip (TCRD-296 synthesis item B.6):
+   `jobs` is `{kind: {queued, running}}` for the extraction pipeline's own
+   worker lanes — visible without SQL, and independent of the table's own
+   scope (a starved job has no `extraction_runs` row yet, so it would never
+   show up as a table row at all). A lane with `queued > 0` and `running ===
+   0` is flagged — every worker slot busy elsewhere, or none configured for
+   this lane. */
+function renderJobsStrip(jobs) {
+  const el = document.getElementById("ext-jobs-strip");
+  if (!el) return;
+  const kinds = Object.keys(jobs || {});
+  if (!kinds.length) {
+    el.hidden = true;
+    el.innerHTML = "";
+    return;
+  }
+  el.hidden = false;
+  el.innerHTML = kinds
+    .map((kind) => {
+      const c = jobs[kind] || { queued: 0, running: 0 };
+      const starved = (c.queued || 0) > 0 && (c.running || 0) === 0;
+      const cls = starved ? "ext-jobs-strip__item ext-jobs-strip__item--starved" : "ext-jobs-strip__item";
+      const flag = starved ? ' <span class="badge badge--warn" title="Queued but nothing running for this lane">starved?</span>' : "";
+      return `<span class="${cls}"><strong>${esc(kind)}</strong>: ${c.queued || 0} queued / ${c.running || 0} running${flag}</span>`;
+    })
+    .join("");
+}
+
+function renderTable(body) {
+  extLastBody = body;
+  const tbody = document.getElementById("ext-tbody");
+  const rows = body.connections || [];
+  if (!rows.length) {
+    const msg = extScope === "active"
+      ? "No SharePoint connection currently has a run in progress."
+      : "No SharePoint connections are registered.";
+    tbody.innerHTML = `<tr><td colspan="10" class="ext-blank">${msg}</td></tr>`;
+  } else {
+    tbody.innerHTML = "";
+    for (const row of rows) tbody.appendChild(renderRow(row));
+  }
+
+  const t = body.totals || {};
+  document.getElementById("ext-summary").hidden = false;
+  document.getElementById("ext-stat-active").textContent = t.active ?? 0;
+  document.getElementById("ext-stat-rate").textContent = fmtRate(t.files_per_min);
+  document.getElementById("ext-stat-facts").textContent = (t.facts_docs_done ?? 0).toLocaleString();
+  const stuckEl = document.getElementById("ext-stat-stuck");
+  stuckEl.textContent = t.stuck ?? 0;
+  stuckEl.classList.toggle("danger", (t.stuck || 0) > 0);
+  document.getElementById("ext-stat-cost").textContent = fmtCost(t.estimated_cost_usd);
+
+  renderJobsStrip(body.jobs);
+
+  document.getElementById("ext-fresh").textContent = "Updated " + new Date().toLocaleTimeString();
+}
+
+function setScope(scope) {
+  extScope = scope;
+  document.getElementById("ext-scope-active").classList.toggle("active", scope === "active");
+  document.getElementById("ext-scope-all").classList.toggle("active", scope === "all");
+  return extTick();
+}
+
+async function extTick() {
+  if (extInFlight) return;
+  if (document.visibilityState !== "visible") return;
+  extInFlight = true;
+  try {
+    const qs = extScope === "all" ? "?all=1" : "?active=1";
+    const r = await fetch("/api/admin/sharepoint/extraction/runs" + qs, { credentials: "include" });
+    if (r.status === 501) {
+      document.getElementById("ext-pg-unavailable").hidden = false;
+      document.getElementById("ext-toolbar").hidden = true;
+      document.getElementById("ext-summary").hidden = true;
+      document.getElementById("ext-tbody").innerHTML = "";
+      const strip = document.getElementById("ext-jobs-strip");
+      if (strip) strip.hidden = true;
+      return;
+    }
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const body = await r.json();
+    renderTable(body);
+  } catch (e) {
+    document.getElementById("ext-fresh").textContent = "Refresh failed: " + e.message;
+  } finally {
+    extInFlight = false;
+  }
+}
+
+function extSchedule() {
+  if (extTimer) clearTimeout(extTimer);
+  extTimer = setTimeout(async () => { await extTick(); extSchedule(); }, 5000);
+}
+
+/* Shared body for the three reprocessing actions (TCRD-296): POST, flip the
+   per-connection in-flight guard, redraw immediately from the cached body
+   (so the click's own button locks without waiting on the network), read
+   the queued count off the SAME 202 body the server computed it from, and
+   let the very next scheduled poll (already running every 5s on this page)
+   carry the real outcome. A 409 means the per-connection idempotency key
+   already refused an overlapping run — rendered as one readable line, not
+   a raw JSON blob. */
+async function _extFleetTriggerAction(connId, pendingKey, url, requestBody, successPrefix) {
+  const pending = _extPendingFor(connId);
+  pending[pendingKey] = true;
+  delete extActionMsg[connId];
+  if (extLastBody) renderTable(extLastBody);
+  try {
+    const r = await fetch(url, {
+      method: "POST",
+      credentials: "include",
+      ...(requestBody ? { headers: { "Content-Type": "application/json" }, body: JSON.stringify(requestBody) } : {}),
+    });
+    const body = await r.json().catch(() => ({}));
+    if (r.status === 202) {
+      const count = typeof body.queued_count === "number" ? ` (${body.queued_count} queued)` : "";
+      extActionMsg[connId] = { text: `${successPrefix}${count}.`, ok: true };
+    } else {
+      extActionMsg[connId] = { text: String(detailMessage(body, "request failed")), ok: false };
+    }
+  } catch (e) {
+    extActionMsg[connId] = { text: "Request failed.", ok: false };
+  } finally {
+    pending[pendingKey] = false;
+    if (extLastBody) renderTable(extLastBody);
+    await extTick();
+  }
+}
+
+function extRetryFailed(connId) {
+  return _extFleetTriggerAction(
+    connId,
+    "failed",
+    `/api/admin/sharepoint/connections/${encodeURIComponent(connId)}/extract`,
+    { retry_failed: true },
+    "Retry failed queued",
+  );
+}
+
+function extRetryEmpty(connId) {
+  return _extFleetTriggerAction(
+    connId,
+    "empty",
+    `/api/admin/sharepoint/connections/${encodeURIComponent(connId)}/extraction/retry-empty`,
+    null,
+    "Retry empty queued",
+  );
+}
+
+function extRerun(connId) {
+  return _extFleetTriggerAction(
+    connId,
+    "rerun",
+    `/api/admin/sharepoint/connections/${encodeURIComponent(connId)}/extract`,
+    null,
+    "Extraction queued",
+  );
+}
+
+document.getElementById("ext-scope-active").addEventListener("click", (e) => { e.preventDefault(); setScope("active"); });
+document.getElementById("ext-scope-all").addEventListener("click", (e) => { e.preventDefault(); setScope("all"); });
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") { extTick(); extSchedule(); }
+});
+
+setScope("active");
+extSchedule();

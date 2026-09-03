@@ -632,6 +632,193 @@ class TestRunRow:
         assert "_extLoadErrorDetail(this)" in html
 
 
+# --------------------------------------------------------------------------
+# Every reprocessing action an operator needed the shell for (TCRD-296):
+# "Retry failed (N)"/"Retry empty (N)" (the persisted crawl-state backlog
+# counts) and "Re-run" (for a run that did not finish cleanly). Rules, not
+# pixels: disabled while a run is live, N comes from the server never the
+# client, Re-run only offers itself when there is something to re-run FROM.
+# --------------------------------------------------------------------------
+
+
+class TestRetryAndRerunButtons:
+    def _html(self, data: dict) -> str:
+        out = _run_js(
+            'console.log(JSON.stringify({html: _extRunRowHtml("sp1", _extState["sp1"])}));',
+            state=_state(data=data),
+        )
+        return out["html"]
+
+    def test_never_run_shows_both_retry_buttons_disabled_at_zero_and_no_rerun(self):
+        html = self._html(
+            {
+                "running": None,
+                "last_completed": None,
+                "last_failed": None,
+                "runs_total": 0,
+                "can_stop": False,
+                "failed_items_count": 0,
+                "empty_items_count": 0,
+                "skipped_unsupported_count": None,
+            }
+        )
+        assert "Retry failed (0)" in html
+        assert "Retry empty (0)" in html
+        assert "Re-run" not in html
+        # both retry buttons carry `disabled` — a zero backlog has nothing
+        # to retry regardless of live/idle state.
+        assert re.search(r"onclick=\"extRetryFailed\('sp1'\)\"\s+disabled", html)
+        assert re.search(r"onclick=\"extRetryEmpty\('sp1'\)\"\s+disabled", html)
+
+    def test_a_live_run_disables_every_reprocessing_button_even_with_a_backlog(self):
+        """A live row's idempotency key may still hold the enqueue dedup
+        lock — the buttons must not invite a race the server would just
+        409 anyway."""
+        running = json.loads(json.dumps(_RUNNING))
+        running["failed_items_count"] = 5
+        running["empty_items_count"] = 2
+        html = self._html(running)
+        assert re.search(r"onclick=\"extRetryFailed\('sp1'\)\"\s+disabled", html)
+        assert re.search(r"onclick=\"extRetryEmpty\('sp1'\)\"\s+disabled", html)
+        assert "Re-run" not in html  # `live` — there is nothing to "re-run FROM", it's already running
+
+    def test_a_backlog_with_no_live_run_enables_both_retry_buttons_with_their_count(self):
+        html = self._html(
+            {
+                "running": None,
+                "last_completed": {
+                    "id": "er_1",
+                    "outcome": "done",
+                    "finished_at": "2026-09-02T10:00:00+00:00",
+                    "files_done": 100,
+                    "usage": {},
+                },
+                "last_failed": None,
+                "runs_total": 1,
+                "can_stop": False,
+                "failed_items_count": 3,
+                "empty_items_count": 9,
+                "skipped_unsupported_count": None,
+            }
+        )
+        assert "Retry failed (3)" in html
+        assert "Retry empty (9)" in html
+        assert not re.search(r"onclick=\"extRetryFailed\('sp1'\)\"\s+disabled", html)
+        assert not re.search(r"onclick=\"extRetryEmpty\('sp1'\)\"\s+disabled", html)
+        # a clean `done` last run has nothing to re-run FROM
+        assert "Re-run" not in html
+
+    def test_a_failed_last_run_offers_rerun_and_it_is_not_disabled(self):
+        failed_last = {
+            "running": None,
+            "last_completed": None,
+            "last_failed": {
+                "id": "er_9",
+                "outcome": "failed",
+                "finished_at": "2026-09-02T10:00:00+00:00",
+                "files_done": 40,
+                "error": "lease expired after max attempts",
+                "usage": {},
+            },
+            "runs_total": 2,
+            "can_stop": False,
+            "failed_items_count": 0,
+            "empty_items_count": 0,
+            "skipped_unsupported_count": None,
+        }
+        html = self._html(failed_last)
+        assert "Re-run" in html
+        assert re.search(r"onclick=\"extRerun\('sp1'\)\"\s+>Re-run", html) or "Re-run</button>" in html
+        assert not re.search(r"onclick=\"extRerun\('sp1'\)\"\s+disabled", html)
+
+    def test_an_interrupted_last_run_also_offers_rerun(self):
+        interrupted_last = {
+            "running": None,
+            "last_completed": {
+                "id": "er_int",
+                "outcome": "interrupted",
+                "finished_at": "2026-09-02T10:00:00+00:00",
+                "files_done": 40,
+                "usage": {},
+            },
+            "last_failed": None,
+            "runs_total": 1,
+            "can_stop": False,
+            "failed_items_count": 0,
+            "empty_items_count": 0,
+            "skipped_unsupported_count": None,
+        }
+        html = self._html(interrupted_last)
+        assert "Re-run" in html
+
+    def test_a_clean_done_last_run_never_offers_rerun(self):
+        clean_last = {
+            "running": None,
+            "last_completed": {
+                "id": "er_ok",
+                "outcome": "done",
+                "finished_at": "2026-09-02T10:00:00+00:00",
+                "files_done": 40,
+                "usage": {},
+            },
+            "last_failed": None,
+            "runs_total": 1,
+            "can_stop": False,
+            "failed_items_count": 0,
+            "empty_items_count": 0,
+            "skipped_unsupported_count": None,
+        }
+        html = self._html(clean_last)
+        assert "Re-run" not in html
+
+    def test_a_pending_retry_click_locks_its_own_button_with_a_progress_label(self):
+        out = _run_js(
+            'console.log(JSON.stringify({html: _extRunRowHtml("sp1", _extState["sp1"])}));',
+            state=_state(
+                data={
+                    "running": None,
+                    "last_completed": None,
+                    "last_failed": None,
+                    "runs_total": 0,
+                    "can_stop": False,
+                    "failed_items_count": 4,
+                    "empty_items_count": 0,
+                    "skipped_unsupported_count": None,
+                },
+                retryingFailed=True,
+            ),
+        )
+        html = out["html"]
+        assert "Retrying…" in html
+        assert re.search(r"onclick=\"extRetryFailed\('sp1'\)\"\s+disabled", html)
+
+    def test_a_pending_rerun_click_locks_the_button_with_a_progress_label(self):
+        failed_last = {
+            "running": None,
+            "last_completed": None,
+            "last_failed": {
+                "id": "er_9",
+                "outcome": "failed",
+                "finished_at": "2026-09-02T10:00:00+00:00",
+                "files_done": 40,
+                "error": "boom",
+                "usage": {},
+            },
+            "runs_total": 1,
+            "can_stop": False,
+            "failed_items_count": 0,
+            "empty_items_count": 0,
+            "skipped_unsupported_count": None,
+        }
+        out = _run_js(
+            'console.log(JSON.stringify({html: _extRunRowHtml("sp1", _extState["sp1"])}));',
+            state=_state(data=failed_last, rerunning=True),
+        )
+        html = out["html"]
+        assert "Starting…" in html
+        assert re.search(r"onclick=\"extRerun\('sp1'\)\"\s+disabled", html)
+
+
 class TestDegradation:
     def test_a_501_renders_once_and_explains_itself(self):
         out = _run_js(

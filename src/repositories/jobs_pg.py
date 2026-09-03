@@ -248,6 +248,30 @@ class JobsPgRepository:
             rows = conn.execute(sa.text(sql), params).mappings().all()
         return [self._decode(dict(r)) for r in rows]
 
+    def counts_by_kind(self, kinds: List[str]) -> Dict[str, Dict[str, int]]:
+        """``{kind: {"queued": n, "running": n}}`` for each of ``kinds``, in
+        ONE grouped query — the extraction fleet header's lane-starvation
+        strip (``GET /api/admin/sharepoint/extraction/runs``'s ``jobs``
+        block), so an operator can see a queued backlog without SQL. Every
+        requested kind is present with ``0``s rather than omitted when it
+        has no queued/running rows — an absent kind and a caught-up kind
+        must read differently to a caller that only checked ``in``.
+        """
+        out: Dict[str, Dict[str, int]] = {kind: {"queued": 0, "running": 0} for kind in kinds}
+        if not kinds:
+            return out
+        stmt = sa.text(
+            "SELECT kind, status, COUNT(*) AS n FROM jobs "
+            "WHERE kind IN :kinds AND status IN ('queued', 'running') "
+            "GROUP BY kind, status"
+        ).bindparams(sa.bindparam("kinds", expanding=True))
+        with self._engine.connect() as conn:
+            rows = conn.execute(stmt, {"kinds": list(kinds)}).all()
+        for kind, status, n in rows:
+            if kind in out and status in out[kind]:
+                out[kind][status] = int(n)
+        return out
+
     def claim_next(
         self,
         *,
