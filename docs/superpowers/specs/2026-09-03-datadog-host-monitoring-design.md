@@ -190,11 +190,27 @@ Postgres side-cars, edge (HTTP response time, TLS days left), ops jobs and watch
 Four things the implementation settled differently from the design above, each
 verified rather than assumed:
 
-- **No `setfacl`.** The design assumed dd-agent would need ACLs to reach the
-  heartbeat paths. It does not: `/data/state` and `/data/backups` are already
-  mode 0755 (the secrets inside them are individually 0600), so the `directory`
-  check can stat the tick files with no permission change at all. That removes
-  the `acl` package dependency and a whole class of boot-time failure.
+- **No `setfacl`, and nothing else touches a shared directory's mode either.**
+  The design assumed dd-agent would need ACLs to reach the heartbeat paths. It
+  does not: `/data/state` and `/data/backups` are already mode 0755 (the secrets
+  inside them are individually 0600), so the `directory` check can stat the tick
+  files with no permission change at all. That removes the `acl` package
+  dependency and a whole class of boot-time failure. The corollary took a review
+  to surface: the Postgres monitoring password must NOT live in `/data/state`
+  either, because `install -d -m 0700` applies its mode to an already-existing
+  directory and would have made the shared state dir unreadable to dd-agent —
+  silently, since the check's own `exists` probe only needs `+x` on `/data`. It
+  lives at `/var/lib/agnes/datadog/pg-password`, a directory this feature owns;
+  losing it to a VM recreate is free, because the timer rewrites the role's
+  password on its next run anyway.
+- **No `%` in a crontab command field.** cron turns an unescaped `%` into a
+  newline and hands everything after it to the command as stdin, so the
+  heartbeat is a `touch`, not `date +%s > file` — which would have run as
+  `date +` and written nothing.
+- **The `directory` check's `pattern` is not a basename match.** It fnmatches
+  the file's full path and its path relative to `directory`, so the recursive
+  backup probe needs `*/STATUS`; a bare `STATUS` matches zero files and reports
+  no metric rather than an error.
 - **`google_compute_address` does accept `labels`** at `hashicorp/google ~> 5.0`
   — confirmed with `terraform validate` against the pinned provider, which this
   design had flagged as unverified.
