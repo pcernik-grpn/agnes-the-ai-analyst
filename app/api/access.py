@@ -41,6 +41,7 @@ from src.repositories import (
     user_group_members_repo,
     user_groups_repo,
     users_repo,
+    tool_registry_repo,
 )
 
 logger = logging.getLogger(__name__)
@@ -192,6 +193,27 @@ async def get_resource_types(
 # ---------------------------------------------------------------------------
 # Access overview — single-shot payload for the group Access tab
 # ---------------------------------------------------------------------------
+
+
+def _mcp_tool_grants() -> dict:
+    """``{source_id: {"total": M, "by_group": {group_id: N}}}`` for every MCP source.
+
+    One pass over the tool registry, grouped by source; per tool, the groups
+    it is granted to. Both calls exist on both app-state backends. A source
+    with no tools reports ``total: 0`` so the row can say so rather than
+    print "0 of 0" as if it were a fraction of something.
+    """
+    tools = tool_registry_repo()
+    out: dict[str, dict] = {}
+    for t in tools.list_all():
+        sid = str(t.get("source_id") or "")
+        if not sid:
+            continue
+        entry = out.setdefault(sid, {"total": 0, "by_group": {}})
+        entry["total"] += 1
+        for gid in tools.grants_for_tool(t["tool_id"]):
+            entry["by_group"][str(gid)] = entry["by_group"].get(str(gid), 0) + 1
+    return out
 
 
 @router.get("/access-overview", response_model=dict)
@@ -458,6 +480,18 @@ async def access_overview(
         "audiences": audiences,
         "grants": grants,
         "resources": resources,
+        # An `mcp_source` grant is necessary but not sufficient: it decides
+        # whether the group sees the SERVER at all, and is ANDed with the
+        # per-tool `tool_grants` maintained on the source's own page. A row
+        # that rendered only the source grant implied completeness it cannot
+        # deliver — the admin finished the visible step and the tool stayed
+        # dark, with the other half of the answer on a page this one never
+        # mentioned (audit F6). So the row can now say "3 of 12 tools
+        # granted →": per source, how many tools it has and how many are
+        # granted to each group. Built once from the registry, both
+        # repositories already exist on both backends, and it is empty on an
+        # instance with no MCP sources.
+        "mcp_tool_grants": _mcp_tool_grants(),
         "families": families,
         # Everyone's reach, at O(1) — see the `member_ids` note above. Also
         # the ceiling for any reach figure the UI prints: no set of groups

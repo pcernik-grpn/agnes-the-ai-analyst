@@ -2315,6 +2315,10 @@
      so the eye still reads "not this group's". */
   .ax-r--inherited-sum { background: color-mix(in srgb, var(--ds-text-primary) 3%, transparent); }
   .ax-r--inherited-sum .ax-r__nm { color: var(--ds-text-secondary); font-weight: 500; }
+  /* "0 of 12 tools granted" is a visible server with nothing usable in it —
+     the state F6 exists to surface — so it gets the warn ink; any other
+     count is ordinary detail. */
+  .ax-r__tools--none { color: var(--ds-accent-warn-ink, #92590a); }
   .ax-pk-r--scope{ border-left: 3px solid var(--ds-primary); }
   .ax-r--scope{
     border-left: 3px solid var(--ds-primary);
@@ -3872,6 +3876,22 @@
             if (i.description) bits.push(esc(String(i.description).slice(0, 120)));
             const prov = itemProvenance(i);
             if (prov) bits.push(prov);
+            /* An MCP source grant is necessary but not sufficient — it is
+               ANDed with per-tool grants set on the source's own page. The
+               row used to imply completeness it could not deliver; now it
+               says the second condition and where it is set. (Audit F6.)
+               "0 of 12" is the state worth seeing most: the server is
+               visible and nothing in it can be used. */
+            if (t.type_key === "mcp_source" && !grant.inherited) {
+              const tc = (overview.mcp_tool_grants || {})[i.resource_id];
+              if (tc) {
+                const n = (tc.by_group || {})[selectedGroup] || 0;
+                const label = tc.total
+                  ? `${n} of ${tc.total} ${tc.total === 1 ? "tool" : "tools"} granted`
+                  : "no tools registered yet";
+                bits.push(`<a class="ax-inherit ax-r__tools${tc.total && !n ? " ax-r__tools--none" : ""}" href="/admin/mcp-sources/${encodeURIComponent(i.resource_id)}" title="Tools are granted per tool on the server's own page">${esc(label)} →</a>`);
+              }
+            }
             if (who) bits.push(`<span class="ax-r__who">${owned ? "shared by" : "granted by"} ${esc(who)}</span>`);
             return bits.join(`<span class="ax-r__sep"> · </span>`);
           })()}</span>

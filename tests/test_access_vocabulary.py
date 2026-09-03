@@ -1019,3 +1019,33 @@ class TestTheRosterNoLongerShipsToTheBrowser:
         cond = src[src.rfind("if (", 0, i) : i]
         assert "users.length" not in cond, cond
         assert "groupFilter.trim().length >= 2" in cond
+
+
+class TestAnMcpSourceRowStatesItsSecondCondition:
+    """Audit F6. An `mcp_source` grant is necessary but not sufficient — it is
+    ANDed with per-tool grants set on the source's own page. The row implied
+    completeness it could not deliver; it now says "N of M tools granted →"
+    and where that is set. "0 of 12" is the state worth seeing most: a
+    visible server with nothing usable in it.
+    """
+
+    TEMPLATE = "app/web/templates/admin_access.html"
+
+    def _source(self) -> str:
+        from pathlib import Path
+
+        return Path(self.TEMPLATE).read_text(encoding="utf-8")
+
+    def test_the_row_reads_the_servers_count_and_links_to_where_tools_are_set(self):
+        src = self._source()
+        assert 'if (t.type_key === "mcp_source" && !grant.inherited) {' in src
+        assert "(overview.mcp_tool_grants || {})[i.resource_id]" in src
+        assert 'href="/admin/mcp-sources/${encodeURIComponent(i.resource_id)}"' in src
+
+    def test_a_source_with_no_tools_says_so_rather_than_printing_a_fraction(self):
+        assert ': "no tools registered yet";' in self._source()
+
+    def test_zero_of_many_is_the_warned_state(self):
+        src = self._source()
+        assert 'tc.total && !n ? " ax-r__tools--none" : ""' in src
+        assert ".ax-r__tools--none { color: var(--ds-accent-warn-ink" in src
