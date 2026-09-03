@@ -761,9 +761,19 @@ function _sharepointFactsHtml(row) {
     <button type="button" class="btn btn-secondary" onclick="toggleSpCertRow('${row.id}')">Cancel</button>
   </div>
   <div class="ds-src__fact">
-    <span class="ds-src__fact-k" title="For a site too large for one connection to crawl in reasonable time: divide its top-level folders across several sibling connections, each with its own crawl, running in parallel.">Split this site</span>
-    <span class="ds-src__fact-v">Divide the drive root's folders into several parallel crawl connections.</span>
-    <span class="ds-src__fact-a"><button type="button" class="btn btn-secondary" onclick="toggleSpSplitRow('${row.id}')">Split&hellip;</button></span>
+    <span class="ds-src__fact-k" title="A site too large for one crawl to finish in reasonable time shards itself automatically the next time extraction runs — no admin action needed. This previews what that plan would look like right now.">Parallel crawl</span>
+    <span class="ds-src__fact-v">Large sites shard themselves automatically when extraction runs.</span>
+    <span class="ds-src__fact-a"><button type="button" class="btn btn-secondary" onclick="toggleSpShardPlanRow('${row.id}')">Preview shards&hellip;</button></span>
+  </div>
+  <div class="ds-rotate-row" id="ds-sp-shardplan-row-${row.id}">
+    <label class="field-hint" for="ds-sp-shardplan-min-modified-${row.id}">Only count documents modified on/after (optional)</label>
+    <input type="date" id="ds-sp-shardplan-min-modified-${row.id}" style="max-width:11rem;">
+    <button type="button" class="btn btn-primary" onclick="previewShardPlan('${row.id}')">Preview shards</button>
+    <button type="button" class="btn btn-secondary" onclick="toggleSpShardPlanRow('${row.id}')">Cancel</button>
+    <div class="ds-sp-shardplan-result" id="ds-sp-shardplan-result-${row.id}"></div>
+    <p class="field-hint" style="flex-basis:100%;">
+      <a href="#" onclick="toggleSpSplitRow('${row.id}'); return false;">Legacy: create N connections manually (deprecated)&hellip;</a>
+    </p>
   </div>
   <div class="ds-rotate-row" id="ds-sp-split-row-${row.id}">
     <label class="field-hint" for="ds-sp-split-n-${row.id}">Number of parts</label>
@@ -2085,13 +2095,90 @@ async function saveSpCertificate(id) {
   }
 }
 
-/* "Split this site" — the product-shaped front end for
+/* "Parallel crawl — preview shards" (2026-09-03 auto-parallel-crawl
+   design §4.7) — the read-only front end for GET .../shard-plan
+   (app/api/admin_sharepoint.py): what the automatic planner would do for
+   this site right now, nothing to apply. Same "show" toggle / clear-on-
+   close shape as toggleSpSplitRow below (which this control replaces as
+   the primary control — that one now lives behind the "Legacy" link this
+   row's own markup renders). */
+function toggleSpShardPlanRow(id) {
+  const row = document.getElementById(`ds-sp-shardplan-row-${id}`);
+  setSourceOpen(id, true);
+  if (row.classList.contains("show")) {
+    row.classList.remove("show");
+    const resultEl = document.getElementById(`ds-sp-shardplan-result-${id}`);
+    if (resultEl) resultEl.innerHTML = "";
+  } else {
+    row.classList.add("show");
+  }
+}
+
+async function previewShardPlan(id) {
+  const resultEl = document.getElementById(`ds-sp-shardplan-result-${id}`);
+  const minModified = document.getElementById(`ds-sp-shardplan-min-modified-${id}`).value || "";
+  resultEl.innerHTML = `<p class="field-hint">Computing plan — reads live document counts, this can take a few seconds…</p>`;
+  const params = new URLSearchParams();
+  if (minModified) params.set("min_modified", minModified);
+  const qs = params.toString();
+  try {
+    const r = await fetch(
+      `/api/admin/sharepoint/connections/${encodeURIComponent(id)}/shard-plan${qs ? `?${qs}` : ""}`,
+      { credentials: "include" }
+    );
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      resultEl.innerHTML = `<p class="ds-conn-test-result show fail">✗ ${_esc(detailMessage(body, "failed to compute the shard plan"))}</p>`;
+      return;
+    }
+    _renderShardPlan(id, body);
+  } catch (e) {
+    resultEl.innerHTML = `<p class="ds-conn-test-result show fail">✗ Request failed</p>`;
+  }
+}
+
+/* `plan.mode === "inline"` means the site would stay a single ordinary
+   crawl — nothing to shard, so no table (a table with one "whole site" row
+   would just be noise). Otherwise one row per shard: label, a live (never
+   exact — index lag) expected document count, and how many delta units it
+   packs, reusing the SAME `.ds-sp-split-table` styling the legacy split
+   preview already uses (one shared table vocabulary, not a second one). */
+function _renderShardPlan(id, plan) {
+  const resultEl = document.getElementById(`ds-sp-shardplan-result-${id}`);
+  if (plan.mode === "inline") {
+    resultEl.innerHTML = `<p class="field-hint" style="flex-basis:100%;">This site would stay a single ordinary crawl — no sharding needed (target ${plan.target_docs || 0} docs/shard).</p>`;
+    return;
+  }
+  const shards = plan.shards || [];
+  const rows = shards
+    .map((s) => `<tr><td>${_esc(s.label)}</td><td>${s.expected ?? 0}</td><td>${s.targets_count ?? 0}</td></tr>`)
+    .join("");
+  const totalExpected = shards.reduce((sum, s) => sum + (s.expected || 0), 0);
+  const loose = plan.loose_root_files || [];
+  const shown = loose.slice(0, 10).map(_esc).join(", ");
+  const looseHtml = loose.length
+    ? `<p class="field-hint" style="flex-basis:100%;">⚠ ${loose.length} file${loose.length === 1 ? "" : "s"} sit directly at a drive root — covered by the remainder shard at crawl time: ${shown}${loose.length > 10 ? ", …" : ""}</p>`
+    : "";
+  resultEl.innerHTML = `
+    <table class="ds-sp-split-table" style="flex-basis:100%;width:100%;">
+      <thead><tr><th>Shard</th><th>Expected (≈)</th><th>Units</th></tr></thead>
+      <tbody>${rows || `<tr><td colspan="3">No shards.</td></tr>`}</tbody>
+    </table>
+    <p class="field-hint" style="flex-basis:100%;">Total expected documents across shards (≈, never exact): ${totalExpected}</p>
+    ${looseHtml}
+    <p class="field-hint" style="flex-basis:100%;">This runs automatically the next time extraction is triggered — nothing to create or apply here.</p>
+  `;
+}
+
+/* "Split this site" (legacy, deprecated) — the product-shaped front end for
    GET/POST .../split-plan and .../splits (app/api/admin_sharepoint.py):
    preview a greedy-packed folder split, then create the sibling
-   connections from it. The panel row's own "show" toggle mirrors
-   toggleSpCertRow above; unlike that one, closing it also clears any
-   preview result so reopening it never shows a stale plan next to fresh
-   inputs. */
+   connections from it. Reachable only via the "Legacy: create N
+   connections manually (deprecated)…" link the shard-plan row above
+   renders — never deleted, the endpoints it calls still exist. The panel
+   row's own "show" toggle mirrors toggleSpCertRow above; unlike that one,
+   closing it also clears any preview result so reopening it never shows a
+   stale plan next to fresh inputs. */
 function toggleSpSplitRow(id) {
   const row = document.getElementById(`ds-sp-split-row-${id}`);
   setSourceOpen(id, true);
@@ -4831,7 +4918,7 @@ function _sourceMenuItems(row) {
     <button type="button" class="apg-menu__item" role="menuitem" data-role="test" onclick="closeSourceMenu(); testSpConn('${id}')">Test connection</button>
     <button type="button" class="apg-menu__item" role="menuitem" onclick="closeSourceMenu(); runSpExtraction('${id}')">Run extraction now</button>
     <button type="button" class="apg-menu__item" role="menuitem" onclick="closeSourceMenu(); runSpFactsExtraction('${id}')">Extract facts now</button>
-    <button type="button" class="apg-menu__item" role="menuitem" onclick="closeSourceMenu(); toggleSpSplitRow('${id}')">Split this site…</button>
+    <button type="button" class="apg-menu__item" role="menuitem" onclick="closeSourceMenu(); toggleSpShardPlanRow('${id}')">Parallel crawl — preview shards…</button>
     <div class="apg-menu__sep"></div>
     <button type="button" class="apg-menu__item" role="menuitem" onclick="closeSourceMenu(); toggleSpConsolidateRow('${id}')">Consolidate collections…</button>
     <button type="button" class="apg-menu__item" role="menuitem" onclick="closeSourceMenu(); mergeSpSplitSiblings('${id}')">Merge split parts back into this source…</button>

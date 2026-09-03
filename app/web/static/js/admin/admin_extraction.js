@@ -151,6 +151,84 @@ function actionsCell(row) {
   return `<div class="ext-row-actions">${cancelBtn}${retryFailedBtn}${retryEmptyBtn}${rerunBtn}</div>${msgHtml}`;
 }
 
+/* "k/K shards" badge (2026-09-03 auto-parallel-crawl design §4.7) — a
+   sharded site's Phase cell gains this, clickable to reveal/hide the
+   per-shard disclosure row `renderShardDisclosureRow` builds. `null` for
+   an ordinary (inline) run — nothing sharded, nothing to disclose. */
+function shardBadgeHtml(connId, run) {
+  if (!run || run.mode !== "sharded" || run.shards_total == null) return "";
+  const done = run.shards_done ?? 0;
+  const total = run.shards_total;
+  return ` <button type="button" class="badge badge--info ext-shard-badge" onclick="toggleShardDisclosure('${connId}')" title="Sharded crawl — click to see per-shard detail">${done}/${total} shards</button>`;
+}
+
+/* Age in seconds since a shard's own `checkpoint_at` ISO timestamp — the
+   disclosure row's own "Checkpoint" column reuses `fmtAgo` for the exact
+   same wording the fleet row's own "Last checkpoint" column already uses. */
+function _shardCheckpointAgeS(checkpointAt) {
+  if (!checkpointAt) return null;
+  const then = new Date(checkpointAt).getTime();
+  if (Number.isNaN(then)) return null;
+  return Math.max(0, (Date.now() - then) / 1000);
+}
+
+function shardRowHtml(shard) {
+  const outcome = shard.outcome || "running";
+  const cls = outcome === "failed" ? "badge--danger"
+    : outcome === "stalled" ? "badge--warn"
+    : outcome === "running" ? "badge--info"
+    : outcome === "interrupted" ? "badge--warn"
+    : "badge--success";
+  // Plan counts are approximate (Graph Search index lag) — "≈", never a
+  // bare number that would read as exact. `null` (no persisted plan found
+  // for this shard, e.g. after a resync re-planned) says "≈ ?" honestly
+  // rather than a fabricated 0.
+  const expected = shard.expected == null ? "≈ ?" : `≈ ${Number(shard.expected).toLocaleString()}`;
+  const filesDone = Number(shard.files_done || 0).toLocaleString();
+  const filesSeen = Number(shard.files_seen || 0).toLocaleString();
+  const stuckFlag = shard.stuck
+    ? ' <span class="badge badge--danger" title="Checkpoint is stale — go look">Stuck?</span>'
+    : "";
+  return `
+    <tr class="${shard.stuck ? "ext-row--stuck" : ""}">
+      <td>${esc(shard.label != null ? shard.label : `shard ${shard.index}`)}</td>
+      <td><span class="badge ${cls}">${esc(outcome)}</span>${stuckFlag}</td>
+      <td class="ext-num">${filesDone} / ${filesSeen}</td>
+      <td class="ext-num">${expected}</td>
+      <td class="ext-sub">${fmtAgo(_shardCheckpointAgeS(shard.checkpoint_at))}</td>
+      <td>${shard.error ? `<span class="ext-error-cell" title="${esc(shard.error)}">${esc(shard.error)}</span>` : ""}</td>
+    </tr>`;
+}
+
+/* One colspan row per sharded connection, hidden by default, toggled by
+   the Phase cell's own "k/K shards" badge — `null` (nothing appended) for
+   an inline run or one whose `shards[]` was never fetched (only the fleet
+   endpoint's own `children_for` batch populates it — see `_run_out`'s
+   `children=` contract server-side). */
+function renderShardDisclosureRow(row) {
+  const run = row.run;
+  if (!run || run.mode !== "sharded" || !run.shards || !run.shards.length) return null;
+  const tr = document.createElement("tr");
+  tr.id = `ext-shard-disclosure-${row.connection_id}`;
+  tr.className = "ext-shard-disclosure";
+  tr.hidden = true;
+  tr.innerHTML = `
+    <td colspan="11">
+      <table class="data-table ext-shard-table">
+        <thead>
+          <tr><th>Shard</th><th>Outcome</th><th>Files done/seen</th><th>Expected</th><th>Checkpoint</th><th>Error</th></tr>
+        </thead>
+        <tbody>${run.shards.map(shardRowHtml).join("")}</tbody>
+      </table>
+    </td>`;
+  return tr;
+}
+
+function toggleShardDisclosure(connId) {
+  const tr = document.getElementById(`ext-shard-disclosure-${connId}`);
+  if (tr) tr.hidden = !tr.hidden;
+}
+
 function renderRow(row) {
   const run = row.run;
   const filesDone = run ? (run.files_done ?? 0) : null;
@@ -171,7 +249,7 @@ function renderRow(row) {
       <div class="ext-conn">${esc(row.connection_name || row.connection_id)}</div>
       <div class="ext-sub">${esc(row.connection_id)}</div>
     </td>
-    <td>${phaseCell(run)}${row.stuck ? ' <span class="badge badge--danger" title="Checkpoint is stale — go look">Stuck?</span>' : ""}</td>
+    <td>${phaseCell(run)}${row.stuck ? ' <span class="badge badge--danger" title="Checkpoint is stale — go look">Stuck?</span>' : ""}${shardBadgeHtml(row.connection_id, run)}</td>
     <td class="ext-num">${filesDone == null ? "—" : `${filesDone.toLocaleString()} / ${filesSeen.toLocaleString()}${filteredByAge}`}</td>
     <td class="ext-num">${fmtRate(row.files_per_min)}</td>
     <td class="ext-num">${factsCell(row.facts)}</td>
@@ -246,7 +324,11 @@ function renderTable(body) {
     tbody.innerHTML = `<tr><td colspan="11" class="ext-blank">${msg}</td></tr>`;
   } else {
     tbody.innerHTML = "";
-    for (const row of rows) tbody.appendChild(renderRow(row));
+    for (const row of rows) {
+      tbody.appendChild(renderRow(row));
+      const disclosure = renderShardDisclosureRow(row);
+      if (disclosure) tbody.appendChild(disclosure);
+    }
   }
 
   const t = body.totals || {};

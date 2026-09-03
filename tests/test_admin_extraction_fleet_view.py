@@ -29,6 +29,11 @@ _SIGNATURES = (
     "function tokenTotals(usage) {",
     "function factsCell(facts) {",
     "function phaseCell(run) {",
+    "function shardBadgeHtml(connId, run) {",
+    "function _shardCheckpointAgeS(checkpointAt) {",
+    "function shardRowHtml(shard) {",
+    "function renderShardDisclosureRow(row) {",
+    "function toggleShardDisclosure(connId) {",
     "function _extPendingFor(connId) {",
     "function actionsCell(row) {",
     "function renderRow(row) {",
@@ -353,3 +358,177 @@ def test_cancel_button_hidden_when_there_is_no_run():
     row["run"] = None
     html = _run_row_js(row)
     assert "Cancel run" not in html
+
+
+# ---------------------------------------------------------------------------
+# Shard roll-up (2026-09-03 auto-parallel-crawl design §4.7) — the Phase
+# cell's "k/K shards" badge and the disclosure row it toggles.
+# ---------------------------------------------------------------------------
+
+
+def test_shard_badge_absent_for_an_inline_run():
+    out = _run_node(f"console.log(JSON.stringify({{ html: shardBadgeHtml('sp1', {json.dumps(_ROW['run'])}) }}));")
+    assert out["html"] == ""
+
+
+def test_shard_badge_absent_when_there_is_no_run_at_all():
+    out = _run_node("console.log(JSON.stringify({ html: shardBadgeHtml('sp1', null) }));")
+    assert out["html"] == ""
+
+
+def test_shard_badge_shows_done_over_total_and_is_clickable():
+    run = {"mode": "sharded", "shards_total": 8, "shards_done": 3}
+    out = _run_node(f"console.log(JSON.stringify({{ html: shardBadgeHtml('sp1', {json.dumps(run)}) }}));")
+    assert "3/8 shards" in out["html"]
+    assert "toggleShardDisclosure('sp1')" in out["html"]
+
+
+def test_shard_row_marks_an_unknown_expected_count_honestly():
+    """A shard whose persisted plan could not be found (a resync since
+    planned) says "≈ ?" — never a fabricated 0."""
+    shard = {
+        "index": 1,
+        "label": "part 1/2",
+        "outcome": "running",
+        "files_done": 5,
+        "files_seen": 5,
+        "expected": None,
+        "checkpoint_at": None,
+        "error": None,
+        "stuck": False,
+    }
+    out = _run_node(
+        f"const document = {{ createElement: () => new FakeEl() }};\n"
+        f"console.log(JSON.stringify({{ html: shardRowHtml({json.dumps(shard)}) }}));",
+        extra_state=_DISCLOSURE_FAKE_EL,
+    )
+    assert "≈ ?" in out["html"]
+
+
+def test_shard_row_shows_a_live_expected_count_and_flags_stuck():
+    shard = {
+        "index": 1,
+        "label": "part 1/2",
+        "outcome": "stalled",
+        "files_done": 5,
+        "files_seen": 5,
+        "expected": 400,
+        "checkpoint_at": None,
+        "error": None,
+        "stuck": True,
+    }
+    out = _run_node(
+        f"const document = {{ createElement: () => new FakeEl() }};\n"
+        f"console.log(JSON.stringify({{ html: shardRowHtml({json.dumps(shard)}) }}));",
+        extra_state=_DISCLOSURE_FAKE_EL,
+    )
+    assert "≈ 400" in out["html"]
+    assert "Stuck?" in out["html"]
+
+
+def test_shard_row_shows_the_error_verbatim():
+    shard = {
+        "index": 2,
+        "label": "remainder",
+        "outcome": "failed",
+        "files_done": 0,
+        "files_seen": 0,
+        "expected": 0,
+        "checkpoint_at": None,
+        "error": "CrawlError: boom",
+        "stuck": False,
+    }
+    out = _run_node(
+        f"const document = {{ createElement: () => new FakeEl() }};\n"
+        f"console.log(JSON.stringify({{ html: shardRowHtml({json.dumps(shard)}) }}));",
+        extra_state=_DISCLOSURE_FAKE_EL,
+    )
+    assert "CrawlError: boom" in out["html"]
+
+
+_DISCLOSURE_FAKE_EL = """
+class FakeEl {
+  constructor() { this._html = ""; this._text = ""; this.className = ""; this.hidden = false; this.id = ""; }
+  set textContent(v) { this._text = v == null ? "" : String(v); }
+  get textContent() { return this._text; }
+  get innerHTML() {
+    if (this._html) return this._html;
+    return this._text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
+  set innerHTML(v) { this._html = v; }
+}
+"""
+
+
+def test_disclosure_row_renders_one_row_per_shard_and_starts_hidden():
+    row = {
+        "connection_id": "sp1",
+        "run": {
+            "mode": "sharded",
+            "shards": [
+                {
+                    "index": 1,
+                    "label": "part 1/2",
+                    "outcome": "done",
+                    "files_done": 10,
+                    "files_seen": 10,
+                    "expected": 10,
+                    "checkpoint_at": None,
+                    "error": None,
+                    "stuck": False,
+                },
+                {
+                    "index": 2,
+                    "label": "remainder",
+                    "outcome": "running",
+                    "files_done": 2,
+                    "files_seen": 2,
+                    "expected": None,
+                    "checkpoint_at": None,
+                    "error": None,
+                    "stuck": False,
+                },
+            ],
+        },
+    }
+    out = _run_node(
+        f"""
+const document = {{ createElement: () => new FakeEl() }};
+const row = {json.dumps(row)};
+const tr = renderShardDisclosureRow(row);
+console.log(JSON.stringify({{ hidden: tr.hidden, id: tr.id, html: tr.innerHTML }}));
+""",
+        extra_state=_DISCLOSURE_FAKE_EL,
+    )
+    assert out["hidden"] is True
+    assert out["id"] == "ext-shard-disclosure-sp1"
+    assert "part 1/2" in out["html"]
+    assert "remainder" in out["html"]
+
+
+def test_disclosure_row_is_null_for_an_inline_run():
+    out = _run_node(
+        """
+const document = { createElement: () => new FakeEl() };
+const row = { connection_id: "sp1", run: { mode: "inline" } };
+const tr = renderShardDisclosureRow(row);
+console.log(JSON.stringify({ isNull: tr === null }));
+""",
+        extra_state="class FakeEl {}",
+    )
+    assert out["isNull"] is True
+
+
+def test_disclosure_row_is_null_when_shards_were_never_fetched():
+    """A run with `mode: "sharded"` but no `shards` key (the caller never
+    passed `children=`) must not crash — null, same as inline."""
+    out = _run_node(
+        """
+const document = { createElement: () => new FakeEl() };
+const row = { connection_id: "sp1", run: { mode: "sharded", shards_total: 2, shards_done: 1 } };
+const tr = renderShardDisclosureRow(row);
+console.log(JSON.stringify({ isNull: tr === null }));
+""",
+        extra_state="class FakeEl {}",
+    )
+    assert out["isNull"] is True
