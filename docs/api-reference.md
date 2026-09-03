@@ -2753,10 +2753,10 @@ metered server-side.
   citations, RBAC fail-closed per source. Params: `q` (required), `k` (1–50,
   default 10). Triple-surface: `agnes search` + MCP tool `knowledge_search`.
   The chunk leg is bounded server-side (`collections.search_max_chunks`,
-  see `/api/collections/search` below); a chunk-engine failure or an
-  over-broad query on an oversized corpus degrades that ONE leg to empty
-  (`degraded: {"chunk": "search_unavailable"}` + `degraded_note`) rather
-  than failing the whole combined search — the other legs keep answering.
+  see `/api/collections` above); a chunk-engine failure or an over-broad
+  query on an oversized corpus degrades that ONE leg to empty (`degraded:
+  {"chunk": "search_unavailable"}` + `degraded_note`) rather than failing
+  the whole combined search — the other legs keep answering.
 - /api/knowledge/artifacts/{corpus_id}/download — streams the per-collection
   `knowledge.duckdb` artifact (chunks + embeddings) built by the K3 local
   packaging pass; listed in the sync manifest's `knowledge_artifacts` array
