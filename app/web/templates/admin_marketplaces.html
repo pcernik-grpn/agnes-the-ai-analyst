@@ -616,9 +616,18 @@
 const API = "/api/marketplaces";
 
 function esc(s) {
+  // `textContent` -> `innerHTML` escapes &, < and > — but NOT quotes, because
+  // a text node has no need of them. Half of this file's 39 call sites are
+  // inside a quoted ATTRIBUTE (`title="${esc(...)}"`), where that is one
+  // character short of safe: `last_error` carries git's stderr for a failed
+  // clone, which quotes the remote it could not reach, so an admin who
+  // registers a marketplace URL containing a double quote breaks out of the
+  // attribute and the next admin to open the page runs whatever followed it.
+  // Escaping both quote forms costs nothing in text context — the browser
+  // renders the entity back — and makes one helper correct in both.
   const d = document.createElement("div");
   d.textContent = s == null ? "" : String(s);
-  return d.innerHTML;
+  return d.innerHTML.replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
 function fmtDate(s) { return s ? (window.AgnesTime.formatDateTime(s) || "—") : "—"; }
 function shortSha(s) { return s ? s.slice(0, 7) : "—"; }
