@@ -121,6 +121,9 @@
   .smb-out--err { background: var(--ds-accent-danger-bg); color: var(--ds-accent-danger-ink); }
   .smb-out a { color: inherit; font-weight: 600; }
   .smb-out ul { margin: 7px 0 0; padding-left: 18px; }
+  .smb-pkglink { margin-top: 8px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .smb-pkglink select { font-family: inherit; font-size: 13px; padding: 5px 8px; border-radius: 8px; border: 1px solid var(--ds-border); background: var(--ds-surface); color: var(--ds-text-primary); }
+  .smb-pkglink .smb-hint { margin: 0; color: inherit; opacity: .85; }
 </style>
 {% endblock %}
 
@@ -178,6 +181,9 @@
   /* Held across renders: the header is rebuilt on every render, so an outcome
      stored only in the DOM would vanish the moment a tab was clicked. */
   var outcome = null;
+  /* Set once Save publishes — only an admin's Save ever reaches 'applied',
+     so this is also what the Data Package link affordance below gates on. */
+  var savedSlug = null;
 
   /* ── Builder conversation ───────────────────────────────────────────────
      The left pane's Start tab. Stateless on the server (app/api/semantic_
@@ -550,6 +556,64 @@
   }
 
   /* ── The one write ───────────────────────────────────────────────────────── */
+  /* ── Post-save: link the just-published model to a Data Package ───────────
+     Admin-only in practice — 'applied' only ever happens on an admin's Save
+     (see app/api/semantic_models.py::apply_semantic_model_endpoint), so
+     nothing here checks role separately. Deliberately outside the main
+     conversation flow: linking is an existing, separate admin action
+     (POST /api/admin/semantic-models/{slug}/packages) this only offers a
+     one-click shortcut to, and the picker's own list is fetched only once an
+     admin actually opens it — never on page load, never on every Save. */
+  function packageLinkOpenHtml() {
+    return '<div class="smb-pkglink" id="smb-pkglink">' +
+      '<button type="button" class="btn" id="smb-pkglink-open">Link to a Data Package</button>' +
+    '</div>';
+  }
+
+  function loadPackagePicker() {
+    var host = document.getElementById('smb-pkglink');
+    if (!host) return;
+    host.innerHTML = '<span class="smb-hint">Loading packages…</span>';
+    fetch('/api/admin/data-packages', { credentials: 'same-origin' })
+      .then(function (r) { return r.json(); })
+      .then(function (pkgs) {
+        if (!Array.isArray(pkgs) || !pkgs.length) {
+          host.innerHTML = '<span class="smb-hint">No Data Packages exist yet.</span>';
+          return;
+        }
+        host.innerHTML =
+          '<select id="smb-pkglink-select">' +
+            pkgs.map(function (p) { return '<option value="' + esc(p.id) + '">' + esc(p.name || p.id) + '</option>'; }).join('') +
+          '</select> <button type="button" class="btn" id="smb-pkglink-go">Link</button>';
+      })
+      .catch(function () {
+        host.innerHTML = '<span class="smb-hint">Could not load Data Packages.</span>';
+      });
+  }
+
+  function linkToPackage() {
+    var host = document.getElementById('smb-pkglink');
+    var select = document.getElementById('smb-pkglink-select');
+    var pkgId = select && select.value;
+    if (!host || !pkgId || !savedSlug) return;
+    var pkgName = select.options[select.selectedIndex].textContent;
+    host.innerHTML = '<span class="smb-hint">Linking…</span>';
+    fetch('/api/admin/semantic-models/' + encodeURIComponent(savedSlug) + '/packages', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ package_id: pkgId })
+    }).then(function (r) {
+      return r.json().then(function (body) { return { status: r.status, body: body }; });
+    }).then(function (res) {
+      host.innerHTML = res.status === 200
+        ? '<span class="smb-hint">Linked to ' + esc(pkgName) + ' — visible to everyone that package is granted to.</span>'
+        : '<span class="smb-hint">Could not link that package.</span>';
+    }).catch(function () {
+      host.innerHTML = '<span class="smb-hint">Could not reach the server.</span>';
+    });
+  }
+
   function save() {
     var btn = document.getElementById('smb-save');
     btn.disabled = true;
@@ -568,8 +632,10 @@
 
       if (res.status === 200 && res.body.outcome === 'applied') {
         var slug = (res.body.model && res.body.model.slug) || draft.name;
+        savedSlug = slug;
         showOutcome('ok', 'Published. <a href="/semantic-layer/' + encodeURIComponent(slug) +
-          '">Open ' + esc(slug) + '</a> — it is live and agents can read it now.');
+          '">Open ' + esc(slug) + '</a> — it is live and agents can read it now.' +
+          packageLinkOpenHtml());
         return;
       }
       if (res.status === 200 && res.body.outcome === 'submitted_for_review') {
@@ -685,6 +751,9 @@
     }
 
     if (t.closest('#smb-save')) { save(); return; }
+
+    if (t.id === 'smb-pkglink-open') { loadPackagePicker(); return; }
+    if (t.id === 'smb-pkglink-go') { linkToPackage(); return; }
 
     if (t.closest('[data-ag-chip]')) {
       sendBuilderTurn(t.closest('[data-ag-chip]').getAttribute('data-ag-chip'));
