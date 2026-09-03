@@ -52,6 +52,12 @@ set -u
 
 STATE=/var/lib/agnes-watchdog
 mkdir -p "$STATE"
+# One marker file per incident signature, for an external monitoring agent that
+# can read a file's mtime but has no way to read this script's alert array. A
+# SUBDIRECTORY of $STATE, not a sibling of it: the markers then hold nothing
+# but signatures (a pattern glob over them sees no run-to-run delta files), and
+# the bash harness's existing $STATE rewrite relocates them for free.
+MARK_DIR="$STATE/markers"
 [ -f /etc/agnes-watchdog.env ] && . /etc/agnes-watchdog.env
 WEBHOOK_URL="${WEBHOOK_URL:-}"
 HOST=$(hostname)
@@ -84,8 +90,33 @@ NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 SINCE=$(cat "$STATE/last_run" 2>/dev/null || date -u -d '-5 min' +%Y-%m-%dT%H:%M:%SZ)
 echo "$NOW" > "$STATE/last_run"
 
+# Records that a signature is firing RIGHT NOW. The file is rewritten on every
+# recurrence and never deleted, so the signal is the marker's AGE, not its
+# existence — an external monitor asks "was this touched in the last N minutes",
+# which needs no pruning and cannot latch on after the incident passes.
+#
+# Called from add(), i.e. before the hourly anti-spam gate suppresses a repeat
+# notification: an incident that is still firing must keep looking fresh even
+# on the ticks that stay quiet.
+mark_signature() {
+    _sig="$1"
+    if [ -z "$_sig" ]; then
+        # No explicit slug: fall back to the alert's own type prefix, minus the
+        # [container] qualifier, so a future alert site that forgets the second
+        # argument still marks something rather than nothing.
+        _sig="${2%%:*}"
+        _sig="${_sig%%[*}"
+        _sig=$(printf '%s' "$_sig" | tr 'A-Z ' 'a-z-')
+    fi
+    mkdir -p "$MARK_DIR" 2>/dev/null || return 0
+    date +%s > "$MARK_DIR/$_sig" 2>/dev/null || true
+}
+
 ALERTS=()
-add() { ALERTS+=("$1"); }
+# The optional second argument is the marker slug — a stable identifier an
+# external monitor keys on, deliberately decoupled from the human-readable
+# message so rewording an alert never silently renames a metric.
+add() { ALERTS+=("$1"); mark_signature "${2:-}" "$1"; }
 # Informational deployment-timeline events (image upgrade, DB schema bump).
 # Separate channel from ALERTS: they ride along with alerts or go out on
 # their own, but never trip the hourly alert-type anti-spam (each is
@@ -128,7 +159,7 @@ while IFS= read -r ctr; do
 done < <(list_role_containers)
 
 if [ "${#CONTAINERS[@]}" -eq 0 ]; then
-    add "CONTAINER: no agnes role containers found (docker compose ps returned none)"
+    add "CONTAINER: no agnes role containers found (docker compose ps returned none)" fleet-empty
 fi
 
 # --- Coordination backend configured? -----------------------------------
@@ -160,15 +191,15 @@ scan_container() {
     logs=$(docker logs "$ctr" --since "$SINCE" 2>&1)
 
     c=$(grep -c "terminate called" <<<"$logs")
-    [ "$c" -gt 0 ] && add "CRASH[$ctr]: ${c}x 'terminate called' (DuckDB FatalException) since $SINCE"
+    [ "$c" -gt 0 ] && add "CRASH[$ctr]: ${c}x 'terminate called' (DuckDB FatalException) since $SINCE" crash
     c=$(grep -c "database has been invalidated" <<<"$logs")
-    [ "$c" -gt 0 ] && add "ZOMBIE[$ctr]: ${c}x 'database has been invalidated' — writes failing while app looks healthy"
+    [ "$c" -gt 0 ] && add "ZOMBIE[$ctr]: ${c}x 'database has been invalidated' — writes failing while app looks healthy" zombie
     c=$(grep -c "WAL replay failed" <<<"$logs")
-    [ "$c" -gt 0 ] && add "WAL-SALVAGE[$ctr]: ${c}x 'WAL replay failed' — possible data-loss window"
+    [ "$c" -gt 0 ] && add "WAL-SALVAGE[$ctr]: ${c}x 'WAL replay failed' — possible data-loss window" wal-salvage
     c=$(grep -c "Failed to delete all rows from index" <<<"$logs")
-    [ "$c" -gt 0 ] && add "INDEX-DESYNC[$ctr]: ${c}x 'Failed to delete all rows from index'"
+    [ "$c" -gt 0 ] && add "INDEX-DESYNC[$ctr]: ${c}x 'Failed to delete all rows from index'" index-desync
     c=$(grep -c "Failed to append to PRIMARY_" <<<"$logs")
-    [ "$c" -gt 0 ] && add "INDEX-APPEND-FATAL[$ctr]: ${c}x 'Failed to append to PRIMARY_*'"
+    [ "$c" -gt 0 ] && add "INDEX-APPEND-FATAL[$ctr]: ${c}x 'Failed to append to PRIMARY_*'" index-append-fatal
 
     # Coordination-backend unreachable (new — wave 2E task 4). Only
     # meaningful when redis coordination is actually configured; the
@@ -181,16 +212,16 @@ scan_container() {
     # one 5-minute scan window before alerting.
     if [ "$REDIS_CONFIGURED" -eq 1 ]; then
         c=$(grep -c "CoordinationUnavailable" <<<"$logs")
-        [ "$c" -ge 3 ] && add "COORDINATION[$ctr]: ${c}x 'CoordinationUnavailable' since $SINCE — redis coordination backend unreachable"
+        [ "$c" -ge 3 ] && add "COORDINATION[$ctr]: ${c}x 'CoordinationUnavailable' since $SINCE — redis coordination backend unreachable" coordination
     fi
 
     rc=$(docker inspect "$ctr" --format '{{.RestartCount}}' 2>/dev/null || echo "")
     if [ -n "$rc" ]; then
         prev_rc=$(cat "$STATE/rc.$ctr" 2>/dev/null || echo "$rc")
         echo "$rc" > "$STATE/rc.$ctr"
-        [ "$rc" -gt "$prev_rc" ] && add "RESTARTS[$ctr]: container RestartCount $prev_rc -> $rc"
+        [ "$rc" -gt "$prev_rc" ] && add "RESTARTS[$ctr]: container RestartCount $prev_rc -> $rc" restarts
     else
-        add "CONTAINER: $ctr not inspectable (down?)"
+        add "CONTAINER: $ctr not inspectable (down?)" container-down
         return 0
     fi
 
@@ -199,11 +230,11 @@ scan_container() {
         ook=$(awk '/^oom_kill /{print $2}' "/sys/fs/cgroup/system.slice/docker-$cid.scope/memory.events")
         prev_ook=$(cat "$STATE/oomk.$ctr" 2>/dev/null || echo "$ook")
         echo "$ook" > "$STATE/oomk.$ctr"
-        [ "$ook" -gt "$prev_ook" ] && add "OOM[$ctr]: oom_kill counter $prev_ook -> $ook"
+        [ "$ook" -gt "$prev_ook" ] && add "OOM[$ctr]: oom_kill counter $prev_ook -> $ook" oom
     fi
 
     health_body=$(docker exec "$ctr" curl -sf -m 10 http://localhost:8000/api/health 2>/dev/null || echo "")
-    [ -z "$health_body" ] && add "HEALTH[$ctr]: /api/health not returning 200"
+    [ -z "$health_body" ] && add "HEALTH[$ctr]: /api/health not returning 200" health
 }
 
 for ctr in "${CONTAINERS[@]}"; do
@@ -211,7 +242,7 @@ for ctr in "${CONTAINERS[@]}"; do
 done
 
 newdisc=$(find /data/state -maxdepth 1 -name "*.wal.discarded.*" -newermt "$SINCE" 2>/dev/null)
-[ -n "$newdisc" ] && add "NEW DISCARDED WAL: $newdisc"
+[ -n "$newdisc" ] && add "NEW DISCARDED WAL: $newdisc" discarded-wal
 
 # Deployment timeline: report an app image change (auto-upgrade recreated
 # the container with a new build) and a DB schema-version change, tracked
@@ -250,10 +281,10 @@ if [ -n "$REF_CTR" ]; then
 fi
 
 s500=$(docker logs agnes-scheduler-1 --since "$SINCE" 2>&1 | grep -c "HTTP 500")
-[ "$s500" -ge 3 ] && add "SCHEDULER: ${s500} job calls returned HTTP 500 since $SINCE"
+[ "$s500" -ge 3 ] && add "SCHEDULER: ${s500} job calls returned HTTP 500 since $SINCE" scheduler
 
 duse=$(df --output=pcent /data 2>/dev/null | tail -1 | tr -dc 0-9)
-[ -n "$duse" ] && [ "$duse" -ge 85 ] && add "DISK: /data at ${duse}%"
+[ -n "$duse" ] && [ "$duse" -ge 85 ] && add "DISK: /data at ${duse}%" disk
 
 [ "${#ALERTS[@]}" -eq 0 ] && [ "${#INFOS[@]}" -eq 0 ] && exit 0
 
