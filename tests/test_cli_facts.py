@@ -393,3 +393,164 @@ def test_claims_revealed_suppresses_quote_and_notes_it():
     assert result.exit_code == 0, result.output
     assert "revealed" in result.output.lower()
     assert "quote withheld" in result.output
+
+
+# ---------------------------------------------------------------------------
+# edges (TCRD-295)
+# ---------------------------------------------------------------------------
+
+
+def test_edges_happy_path_posts_edge_type_and_renders_relationships():
+    captured = {}
+    data = {
+        "nodes": [
+            {"id": "f_c1", "type": "client", "aliases": ["client:c1"], "revealed": False},
+            {"id": "f_s", "type": "sponsor", "aliases": ["sponsor:acme"], "revealed": False},
+        ],
+        "edges": [{"id": "e_1", "src": "f_c1", "dst": "f_s", "type": "owned_by", "attrs": {}}],
+        "truncated": {"result": False, "extension": False, "claims": False},
+    }
+
+    def fake_post(path, **kwargs):
+        captured["path"] = path
+        captured["json"] = kwargs.get("json")
+        return _resp(200, data)
+
+    with patch("cli.commands.facts.api_post", side_effect=fake_post):
+        result = runner.invoke(app, ["facts", "edges", "owned_by"])
+
+    assert result.exit_code == 0, result.output
+    assert captured["path"] == "/api/facts/edges"
+    assert captured["json"] == {"edge_type": "owned_by"}
+    assert "[server]" in result.output
+    assert "2 node(s), 1 edge(s)" in result.output
+    assert "owned_by" in result.output and "f_c1" in result.output and "f_s" in result.output
+
+
+def test_edges_options_map_onto_the_request_body():
+    captured = {}
+
+    def fake_post(path, **kwargs):
+        captured["json"] = kwargs.get("json")
+        return _resp(
+            200, {"nodes": [], "edges": [], "truncated": {"result": False, "extension": False, "claims": False}}
+        )
+
+    with patch("cli.commands.facts.api_post", side_effect=fake_post):
+        result = runner.invoke(
+            app,
+            [
+                "facts",
+                "edges",
+                "owned_by",
+                "--src-type",
+                "client",
+                "--dst-type",
+                "sponsor",
+                "--src",
+                "f_c1",
+                "--dst",
+                "f_s",
+                "--extend",
+                "in_industry",
+                "--extend-from",
+                "src",
+                "--claims",
+                "2",
+                "--limit",
+                "50",
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert captured["json"] == {
+        "edge_type": "owned_by",
+        "src_type": "client",
+        "dst_type": "sponsor",
+        "src_id": "f_c1",
+        "dst_id": "f_s",
+        "extend_edge_type": "in_industry",
+        "extend_from": "src",
+        "include_claims": 2,
+        "limit": 50,
+    }
+
+
+def test_edges_renders_inline_claims_and_truncation_notice():
+    data = {
+        "nodes": [{"id": "f_c1", "type": "client", "aliases": [], "revealed": False}],
+        "edges": [
+            {
+                "id": "e_1",
+                "src": "f_c1",
+                "dst": "f_s",
+                "type": "owned_by",
+                "attrs": {},
+                "claims": [
+                    {
+                        "id": "c_1",
+                        "quote": "c1 is owned by Acme.",
+                        "document": {"name": "sow.pdf"},
+                        "document_date": "2024-01-02",
+                    }
+                ],
+            }
+        ],
+        "truncated": {"result": True, "extension": False, "claims": True},
+    }
+
+    with patch("cli.commands.facts.api_post", return_value=_resp(200, data)):
+        result = runner.invoke(app, ["facts", "edges", "owned_by", "--claims", "1"])
+
+    assert result.exit_code == 0, result.output
+    assert "c1 is owned by Acme." in result.output
+    assert "sow.pdf" in result.output
+    assert "truncated" in result.output and "result" in result.output and "claims" in result.output
+
+
+def test_edges_json_mode_emits_raw_response():
+    data = {"nodes": [], "edges": [], "truncated": {"result": False, "extension": False, "claims": False}}
+    with patch("cli.commands.facts.api_post", return_value=_resp(200, data)):
+        result = runner.invoke(app, ["facts", "edges", "owned_by", "--json"])
+    assert result.exit_code == 0, result.output
+    assert '"truncated"' in result.output
+
+
+def test_neighbors_claims_option_sends_include_claims():
+    captured = {}
+
+    def fake_post(path, **kwargs):
+        captured["json"] = kwargs.get("json")
+        return _resp(200, {"nodes": [], "edges": [], "truncated": {"depth": False, "fanout": False, "result": False}})
+
+    with patch("cli.commands.facts.api_post", side_effect=fake_post):
+        result = runner.invoke(app, ["facts", "neighbors", "f_1", "--claims", "2"])
+
+    assert result.exit_code == 0, result.output
+    assert captured["json"]["include_claims"] == 2
+
+
+def test_claims_limit_option_is_sent_as_a_query_parameter():
+    captured = {}
+
+    def fake_get(path, **kwargs):
+        captured["path"] = path
+        return _resp(200, {"claims": [], "revealed": False, "limit_applied": False})
+
+    with patch("cli.commands.facts.api_get", side_effect=fake_get):
+        result = runner.invoke(app, ["facts", "claims", "f_1", "--limit", "5"])
+
+    assert result.exit_code == 0, result.output
+    assert captured["path"] == "/api/facts/f_1/claims?limit=5"
+
+
+def test_claims_notes_when_the_page_was_capped():
+    data = {
+        "claims": [{"id": "c_1", "quote": "q", "document": {"name": "d.md"}, "document_date": None}],
+        "revealed": False,
+        "limit_applied": True,
+    }
+    with patch("cli.commands.facts.api_get", return_value=_resp(200, data)):
+        result = runner.invoke(app, ["facts", "claims", "f_1"])
+    assert result.exit_code == 0, result.output
+    assert "--limit" in result.output

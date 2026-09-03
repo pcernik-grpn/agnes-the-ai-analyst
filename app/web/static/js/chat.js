@@ -4358,6 +4358,7 @@ const _TOOL_LABELS = {
   // generic JSON/table fallback (see _renderFactClaimsPreview below).
   fact_search: "Searched the knowledge graph",
   fact_neighbors: "Walked related facts",
+  fact_edges: "Listed relationships",
   fact_claims: "Read the evidence",
   // Track C7 (@delegation MVP) — the in-sandbox SDK tool
   // `app/chat/runner.py::_delegation_mcp_server` exposes as

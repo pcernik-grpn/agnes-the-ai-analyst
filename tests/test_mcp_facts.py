@@ -84,3 +84,13 @@ def test_facts_disabled_is_checked_before_authentication(mcp_env, monkeypatch):
         mcp_env("fact_claims", "", subject_id="f_1")
     assert excinfo.value.status_code == 404
     assert excinfo.value.detail == "facts_disabled"
+
+
+def test_fact_edges_flag_off_raises_404(mcp_env, monkeypatch):
+    """The relationship-shaped read (TCRD-295) sits behind the same
+    router-level-equivalent gate as its four siblings."""
+    monkeypatch.setenv("AGNES_FACTS_ENABLED", "0")
+    with pytest.raises(HTTPException) as excinfo:
+        mcp_env("fact_edges", "irrelevant-token", edge_type="owned_by")
+    assert excinfo.value.status_code == 404
+    assert excinfo.value.detail == "facts_disabled"
