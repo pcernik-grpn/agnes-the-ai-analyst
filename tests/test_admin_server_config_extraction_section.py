@@ -642,6 +642,202 @@ def test_saved_convert_child_memory_limit_is_what_the_next_crawl_run_reads(seede
 
 
 # ---------------------------------------------------------------------------
+# extraction.crawler.convert_child_max_rss_mb / convert_spares_per_slot —
+# the two knobs behind the RSS watchdog + N-spares fix (2026-09-03 live-
+# deployment follow-up): the parent-polled ABSOLUTE RSS ceiling, separate
+# from convert_child_memory_limit_mb's own HEADROOM cap, and how many
+# pre-forked standbys each conversion slot keeps ready.
+# ---------------------------------------------------------------------------
+
+
+def test_convert_child_max_rss_is_a_known_field_with_the_crawlers_own_default(seeded_app, monkeypatch):
+    _clear_extraction_env(monkeypatch)
+    client = seeded_app["client"]
+    resp = client.get("/api/admin/server-config", headers=_auth(seeded_app["admin_token"]))
+    spec = resp.json()["known_fields"]["extraction"]["crawler"]["fields"]["convert_child_max_rss_mb"]
+    assert spec["kind"] == "int"
+
+    from connectors.sharepoint.crawler import _DEFAULT_CONVERT_CHILD_MAX_RSS_MB
+
+    assert spec["default"] == _DEFAULT_CONVERT_CHILD_MAX_RSS_MB == 4096
+    assert "rss" in spec["hint"].lower()
+
+
+def test_convert_child_max_rss_bounds_match_the_crawlers_sanity_ceiling():
+    from app.api.admin import _CONVERT_CHILD_MAX_RSS_MAX_MB, _CONVERT_CHILD_MAX_RSS_MIN_MB
+
+    assert _CONVERT_CHILD_MAX_RSS_MIN_MB == 0
+    assert _CONVERT_CHILD_MAX_RSS_MAX_MB == 65536
+
+
+def test_post_convert_child_max_rss_persists_and_get_reflects_it(seeded_app, monkeypatch):
+    _clear_extraction_env(monkeypatch)
+    client = seeded_app["client"]
+    headers = _auth(seeded_app["admin_token"])
+    resp = client.post(
+        "/api/admin/server-config",
+        json={"sections": {"extraction": {"crawler": {"convert_child_max_rss_mb": 8192}}}},
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+
+    from app.secrets import _state_dir
+
+    loaded = yaml.safe_load((_state_dir() / "instance.yaml").read_text())
+    assert loaded["extraction"]["crawler"]["convert_child_max_rss_mb"] == 8192
+
+    resp2 = client.get("/api/admin/server-config", headers=headers)
+    assert resp2.json()["sections"]["extraction"]["crawler"]["convert_child_max_rss_mb"] == 8192
+
+
+def test_convert_child_max_rss_zero_disables_the_watchdog_and_is_accepted(seeded_app, monkeypatch):
+    _clear_extraction_env(monkeypatch)
+    client = seeded_app["client"]
+    resp = client.post(
+        "/api/admin/server-config",
+        json={"sections": {"extraction": {"crawler": {"convert_child_max_rss_mb": 0}}}},
+        headers=_auth(seeded_app["admin_token"]),
+    )
+    assert resp.status_code == 200, resp.text
+
+
+def test_convert_child_max_rss_out_of_range_is_refused(seeded_app, monkeypatch):
+    _clear_extraction_env(monkeypatch)
+    client = seeded_app["client"]
+    for value in (-1, 65537):
+        resp = client.post(
+            "/api/admin/server-config",
+            json={"sections": {"extraction": {"crawler": {"convert_child_max_rss_mb": value}}}},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert resp.status_code == 422, (value, resp.text)
+        assert "extraction.crawler.convert_child_max_rss_mb" in resp.text
+
+
+def test_convert_child_max_rss_must_be_an_integer(seeded_app, monkeypatch):
+    _clear_extraction_env(monkeypatch)
+    client = seeded_app["client"]
+    for value in ("4096", 4096.5, True):
+        resp = client.post(
+            "/api/admin/server-config",
+            json={"sections": {"extraction": {"crawler": {"convert_child_max_rss_mb": value}}}},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert resp.status_code == 422, (value, resp.text)
+
+
+def test_saved_convert_child_max_rss_is_what_the_next_crawl_run_reads(seeded_app, monkeypatch):
+    _clear_extraction_env(monkeypatch)
+    client = seeded_app["client"]
+
+    from connectors.sharepoint.crawler import _convert_child_max_rss_bytes
+
+    assert _convert_child_max_rss_bytes() == 4096 * 1024 * 1024  # the crawler's own default before any save
+
+    resp = client.post(
+        "/api/admin/server-config",
+        json={"sections": {"extraction": {"crawler": {"convert_child_max_rss_mb": 1024}}}},
+        headers=_auth(seeded_app["admin_token"]),
+    )
+    assert resp.status_code == 200, resp.text
+    assert _convert_child_max_rss_bytes() == 1024 * 1024 * 1024
+
+
+def test_convert_spares_per_slot_is_a_known_field_with_the_crawlers_own_default(seeded_app, monkeypatch):
+    _clear_extraction_env(monkeypatch)
+    client = seeded_app["client"]
+    resp = client.get("/api/admin/server-config", headers=_auth(seeded_app["admin_token"]))
+    spec = resp.json()["known_fields"]["extraction"]["crawler"]["fields"]["convert_spares_per_slot"]
+    assert spec["kind"] == "int"
+
+    from connectors.sharepoint.crawler import _DEFAULT_CONVERT_SPARES_PER_SLOT
+
+    assert spec["default"] == _DEFAULT_CONVERT_SPARES_PER_SLOT == 2
+    assert "spare" in spec["hint"].lower()
+
+
+def test_convert_spares_per_slot_bounds_match_the_crawlers_sanity_ceiling():
+    from app.api.admin import _CONVERT_SPARES_PER_SLOT_MAX, _CONVERT_SPARES_PER_SLOT_MIN
+    from connectors.sharepoint.crawler import _MAX_CONVERT_SPARES_PER_SLOT
+
+    assert _CONVERT_SPARES_PER_SLOT_MIN == 0
+    assert _CONVERT_SPARES_PER_SLOT_MAX == _MAX_CONVERT_SPARES_PER_SLOT == 8
+
+
+def test_post_convert_spares_per_slot_persists_and_get_reflects_it(seeded_app, monkeypatch):
+    _clear_extraction_env(monkeypatch)
+    client = seeded_app["client"]
+    headers = _auth(seeded_app["admin_token"])
+    resp = client.post(
+        "/api/admin/server-config",
+        json={"sections": {"extraction": {"crawler": {"convert_spares_per_slot": 4}}}},
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+
+    from app.secrets import _state_dir
+
+    loaded = yaml.safe_load((_state_dir() / "instance.yaml").read_text())
+    assert loaded["extraction"]["crawler"]["convert_spares_per_slot"] == 4
+
+    resp2 = client.get("/api/admin/server-config", headers=headers)
+    assert resp2.json()["sections"]["extraction"]["crawler"]["convert_spares_per_slot"] == 4
+
+
+def test_convert_spares_per_slot_zero_disables_spares_and_is_accepted(seeded_app, monkeypatch):
+    _clear_extraction_env(monkeypatch)
+    client = seeded_app["client"]
+    resp = client.post(
+        "/api/admin/server-config",
+        json={"sections": {"extraction": {"crawler": {"convert_spares_per_slot": 0}}}},
+        headers=_auth(seeded_app["admin_token"]),
+    )
+    assert resp.status_code == 200, resp.text
+
+
+def test_convert_spares_per_slot_out_of_range_is_refused(seeded_app, monkeypatch):
+    _clear_extraction_env(monkeypatch)
+    client = seeded_app["client"]
+    for value in (-1, 9):
+        resp = client.post(
+            "/api/admin/server-config",
+            json={"sections": {"extraction": {"crawler": {"convert_spares_per_slot": value}}}},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert resp.status_code == 422, (value, resp.text)
+        assert "extraction.crawler.convert_spares_per_slot" in resp.text
+
+
+def test_convert_spares_per_slot_must_be_an_integer(seeded_app, monkeypatch):
+    _clear_extraction_env(monkeypatch)
+    client = seeded_app["client"]
+    for value in ("2", 2.5, True):
+        resp = client.post(
+            "/api/admin/server-config",
+            json={"sections": {"extraction": {"crawler": {"convert_spares_per_slot": value}}}},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert resp.status_code == 422, (value, resp.text)
+
+
+def test_saved_convert_spares_per_slot_is_what_the_next_crawl_run_reads(seeded_app, monkeypatch):
+    _clear_extraction_env(monkeypatch)
+    client = seeded_app["client"]
+
+    from connectors.sharepoint.crawler import _convert_spares_per_slot
+
+    assert _convert_spares_per_slot() == 2  # the crawler's own default before any save
+
+    resp = client.post(
+        "/api/admin/server-config",
+        json={"sections": {"extraction": {"crawler": {"convert_spares_per_slot": 5}}}},
+        headers=_auth(seeded_app["admin_token"]),
+    )
+    assert resp.status_code == 200, resp.text
+    assert _convert_spares_per_slot() == 5
+
+
+# ---------------------------------------------------------------------------
 # Run knobs an admin needs without server access (2026-09-02): lane
 # concurrency, and the facts stage's stream_every / run_timeout_s / transport /
 # retry_mode / provider instance defaults — declared, validated, persisted.

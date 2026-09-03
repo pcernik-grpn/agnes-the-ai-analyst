@@ -549,6 +549,23 @@ _CRAWLER_CONCURRENCY_MAX = 64
 # knobs above, 0 is a legitimate, meaningful value here.
 _CONVERT_CHILD_MEMORY_LIMIT_MIN_MB = 0
 _CONVERT_CHILD_MEMORY_LIMIT_MAX_MB = 65536
+# `extraction.crawler.convert_child_max_rss_mb` — the ABSOLUTE per-child RSS
+# ceiling the PARENT itself polls for (`connectors.sharepoint.crawler
+# ._DEFAULT_CONVERT_CHILD_MAX_RSS_MB`/`_ConvertProcessPool._await_reply`),
+# 0 = off. A SEPARATE knob from `convert_child_memory_limit_mb` above (which
+# is HEADROOM above the worker's own VmSize at fork time, not an absolute
+# number) — see that knob's own live-deployment follow-up finding for why
+# an absolute, parent-polled ceiling was still needed on top of it. Same
+# sanity ceiling and same "0 is legitimate" reasoning as its sibling.
+_CONVERT_CHILD_MAX_RSS_MIN_MB = 0
+_CONVERT_CHILD_MAX_RSS_MAX_MB = 65536
+# `extraction.crawler.convert_spares_per_slot` — how many pre-forked standby
+# conversion children `_ConvertProcessPool` keeps ready per slot
+# (`connectors.sharepoint.crawler._DEFAULT_CONVERT_SPARES_PER_SLOT`). 0 = no
+# spares (the pre-spares behaviour). 8 is a cost ceiling (one idle process
+# per spare per slot), not a tuned number.
+_CONVERT_SPARES_PER_SLOT_MIN = 0
+_CONVERT_SPARES_PER_SLOT_MAX = 8
 
 
 def _leaf_touched(patch: Any, path: tuple[str, ...]) -> bool:
@@ -700,6 +717,36 @@ def _validate_extraction_section(sections: Dict[str, Dict[str, Any]]) -> None:
                         "extraction.crawler.convert_child_memory_limit_mb must be between "
                         f"{_CONVERT_CHILD_MEMORY_LIMIT_MIN_MB} and {_CONVERT_CHILD_MEMORY_LIMIT_MAX_MB} "
                         f"(got {mem_limit_mb}); 0 disables the cap"
+                    ),
+                )
+        max_rss_mb = crawler.get("convert_child_max_rss_mb")
+        if max_rss_mb is not None:
+            if not isinstance(max_rss_mb, int) or isinstance(max_rss_mb, bool):
+                raise HTTPException(
+                    status_code=422, detail="extraction.crawler.convert_child_max_rss_mb must be an integer"
+                )
+            if max_rss_mb < _CONVERT_CHILD_MAX_RSS_MIN_MB or max_rss_mb > _CONVERT_CHILD_MAX_RSS_MAX_MB:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "extraction.crawler.convert_child_max_rss_mb must be between "
+                        f"{_CONVERT_CHILD_MAX_RSS_MIN_MB} and {_CONVERT_CHILD_MAX_RSS_MAX_MB} "
+                        f"(got {max_rss_mb}); 0 disables the watchdog"
+                    ),
+                )
+        spares_per_slot = crawler.get("convert_spares_per_slot")
+        if spares_per_slot is not None:
+            if not isinstance(spares_per_slot, int) or isinstance(spares_per_slot, bool):
+                raise HTTPException(
+                    status_code=422, detail="extraction.crawler.convert_spares_per_slot must be an integer"
+                )
+            if spares_per_slot < _CONVERT_SPARES_PER_SLOT_MIN or spares_per_slot > _CONVERT_SPARES_PER_SLOT_MAX:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "extraction.crawler.convert_spares_per_slot must be between "
+                        f"{_CONVERT_SPARES_PER_SLOT_MIN} and {_CONVERT_SPARES_PER_SLOT_MAX} "
+                        f"(got {spares_per_slot}); 0 disables spares"
                     ),
                 )
 
@@ -1261,6 +1308,36 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
                         "case); lower it to make a runaway document fail faster and more "
                         "attributably. 0 disables the cap outright. Read by the worker at the start "
                         "of each run — effective on the next run, no restart."
+                    ),
+                },
+                "convert_child_max_rss_mb": {
+                    "kind": "int",
+                    "default": 4096,
+                    "hint": (
+                        "Absolute per-child RSS ceiling the PARENT itself polls for every ~0.5s while a "
+                        "conversion is in flight — SEPARATE from convert_child_memory_limit_mb above, "
+                        "which is HEADROOM above the worker's own memory footprint at fork time and "
+                        "does not bound RSS once the crawl parent itself has grown over a long run "
+                        "(observed reaching 10-17 GB RSS on one child before that headroom-based cap "
+                        "ever fired). Crossing this ceiling kills the child directly and counts THAT "
+                        "file convert_failed, attributably — never the vaguer wording a kernel- or "
+                        "host-level OOM kill gets. 0 disables the watchdog outright. Linux only (reads "
+                        "/proc/<pid>/status) — a no-op on any other platform. Read by the worker at the "
+                        "start of each run — effective on the next run, no restart."
+                    ),
+                },
+                "convert_spares_per_slot": {
+                    "kind": "int",
+                    "default": 2,
+                    "hint": (
+                        "How many pre-forked standby conversion children each concurrency slot keeps "
+                        "ready, so a slot that recycles or crashes mid-page has somewhere to fail over "
+                        "to WITHOUT waiting for the next page's repair() — a single spare (the original "
+                        "design) could be exhausted by two recycles/crashes on the same slot inside one "
+                        "delta page, leaving it down (or over its RSS budget) for the rest of that page. "
+                        "Costs one idle, import-only process per spare per slot. 0 disables spares "
+                        "outright. Read by the worker at the start of each run — effective on the next "
+                        "run, no restart."
                     ),
                 },
             },

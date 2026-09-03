@@ -1564,6 +1564,72 @@ class TestConvertProcessPoolRecycling:
         finally:
             pool.shutdown()
 
+    def test_two_spares_survive_two_consecutive_recycles_without_a_repair(self, tmp_path, monkeypatch):
+        """`convert_spares_per_slot` (default 2, see
+        `crawler._DEFAULT_CONVERT_SPARES_PER_SLOT`) — the live-deployment
+        gap a single spare per slot left open: a slot that recycles TWICE
+        in the same (up to 200-item) page, before the next `repair()` ever
+        runs, used to have nothing left to swap in after the first recycle
+        and just kept running past its budget for the rest of the page. Two
+        spares survive exactly two such recycles with no `repair()` call in
+        between."""
+        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime: ConvertResult("# ok"))
+        pool = crawler._ConvertProcessPool(1, recycle_after_docs=1, recycle_rss_bytes=0, spares_per_slot=2)
+        pool.start()
+        try:
+            assert len(pool._spare_procs[0]) == 2
+            f = self._write(tmp_path, "doc.txt", b"fine")
+
+            first_pid = pool._procs[0].pid
+            assert pool.convert(0, f, "text/plain").ok  # budget 1 -> recycles onto spare #1
+            second_pid = pool._procs[0].pid
+            assert second_pid != first_pid
+            assert len(pool._spare_procs[0]) == 1, "one spare consumed, one left — no repair() ran yet"
+
+            assert pool.convert(0, f, "text/plain").ok  # budget 1 again -> recycles onto spare #2
+            third_pid = pool._procs[0].pid
+            assert third_pid not in (first_pid, second_pid)
+            assert len(pool._spare_procs[0]) == 0, "both spares now consumed"
+
+            # A THIRD recycle with no spare left simply keeps running past
+            # its budget — the pre-spares behaviour, exactly (see the class
+            # docstring's "N SPARES PER SLOT" section) — never a correctness
+            # issue.
+            assert pool.convert(0, f, "text/plain").ok
+            assert pool._procs[0].pid == third_pid
+        finally:
+            pool.shutdown()
+
+    def test_repair_tops_the_spare_queue_back_up_to_the_configured_count(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime: ConvertResult("# ok"))
+        pool = crawler._ConvertProcessPool(1, recycle_after_docs=1, recycle_rss_bytes=0, spares_per_slot=2)
+        pool.start()
+        try:
+            f = self._write(tmp_path, "doc.txt", b"fine")
+            assert pool.convert(0, f, "text/plain").ok  # consumes spare #1
+            assert pool.convert(0, f, "text/plain").ok  # consumes spare #2
+            assert len(pool._spare_procs[0]) == 0
+
+            pool.repair()
+            assert len(pool._spare_procs[0]) == 2, "repair() must top the queue back up to spares_per_slot"
+            # ...and the refilled spares are genuinely usable, not stubs.
+            assert pool.convert(0, f, "text/plain").ok
+        finally:
+            pool.shutdown()
+
+    def test_convert_spares_per_slot_zero_disables_spares_the_pre_spares_behaviour(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime: ConvertResult("# ok"))
+        pool = crawler._ConvertProcessPool(1, recycle_after_docs=1, recycle_rss_bytes=0, spares_per_slot=0)
+        pool.start()
+        try:
+            assert pool._spare_procs[0] == []
+            f = self._write(tmp_path, "doc.txt", b"fine")
+            first_pid = pool._procs[0].pid
+            assert pool.convert(0, f, "text/plain").ok  # crosses the budget, no spare to swap in
+            assert pool._procs[0].pid == first_pid, "no spare configured — the slot just keeps running"
+        finally:
+            pool.shutdown()
+
 
 class TestConvertProcessPoolRetirement:
     """Retiring a slot (recycle, crash recovery, shutdown) must actually END
@@ -1586,7 +1652,7 @@ class TestConvertProcessPoolRetirement:
             # Sibling forked AFTER the retiree — holds an inherited copy of
             # the retiree's pipe fd, so closing the parent's end alone can
             # never deliver EOF to the retiree (the second half of the leak).
-            assert pool._spare_procs[0] is not None and pool._spare_procs[0].is_alive()
+            assert pool._spare_procs[0] and pool._spare_procs[0][0].is_alive()
             f = tmp_path / "doc.txt"
             f.write_bytes(b"x")
             assert pool.convert(0, f, "text/plain").ok  # budget 1 -> recycles
@@ -1754,6 +1820,31 @@ class TestConvertProcessPoolItemTimeout:
             f = self._write(tmp_path, "doc.txt", b"fine")
             outcome = pool.convert(0, f, "text/plain")
             assert outcome.ok
+        finally:
+            pool.shutdown()
+
+    def test_the_shorter_of_timeout_and_the_rss_guard_fires(self, tmp_path, monkeypatch):
+        """Both bounds share one polling loop (`_ConvertProcessPool._await_reply`)
+        — whichever crosses first raises its OWN exception type, never the
+        other's. A per-item timeout well under the RSS watchdog's own poll
+        cadence (`_RSS_WATCHDOG_POLL_INTERVAL_S`) must fire as a plain
+        timeout, not be masked by an RSS check that would only run AFTER a
+        poll interval elapses."""
+
+        def _convert(path: Path, mime: str) -> Any:
+            time.sleep(30)
+            return ConvertResult("# never reached")
+
+        monkeypatch.setattr(crawler, "convert_to_markdown", _convert)
+        # A cap high enough that a real forked child's RSS could never
+        # cross it in the short time this test runs — if the guard fired
+        # here it would prove the two bounds are wired together wrong.
+        pool = crawler._ConvertProcessPool(1, timeout_s=0.1, max_rss_bytes=10 * 1024 * 1024 * 1024)
+        pool.start()
+        try:
+            f = self._write(tmp_path, "doc.txt", b"fine")
+            with pytest.raises(crawler._ConvertTimedOut):
+                pool.convert(0, f, "application/octet-stream")
         finally:
             pool.shutdown()
 
@@ -1932,6 +2023,187 @@ class TestConvertChildMemoryLimit:
             pool.start()
         try:
             assert not any("RLIMIT_AS ceiling" in r.message for r in caplog.records)
+        finally:
+            pool.shutdown()
+
+    # ------------------------------------------------------------------
+    # The per-child RSS watchdog (`convert_child_max_rss_mb`,
+    # `_ConvertProcessPool._await_reply`/`_child_rss_bytes`) — a live
+    # deployment finding DISTINCT from the RLIMIT_AS tests above: that
+    # ceiling is HEADROOM above the worker's own VmSize *at fork time*, so
+    # on a crawl parent that has grown for hours (VmSize 6-15 GB), a single
+    # child converting one huge document still reached 10-17 GB RSS before
+    # RLIMIT_AS ever fired; with ~80 concurrent children a replica climbed
+    # to 115 GB and had to be SIGKILLed by a host-level watchdog OUTSIDE
+    # this pool's own accounting, which then attributed the loss to
+    # whatever file happened to be in flight AND left the slot dead until
+    # the next page boundary. This watchdog polls the CHILD's own real RSS
+    # from the PARENT and kills it directly — an absolute ceiling, not
+    # headroom above anything — reusing the exact `_reclaim_timed_out_slot`
+    # recovery a per-item timeout already has.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _write(tmp_path: Path, name: str, content: bytes) -> Path:
+        p = tmp_path / name
+        p.write_bytes(content)
+        return p
+
+    def test_the_watchdog_is_disabled_when_max_rss_bytes_is_zero(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime: ConvertResult("# ok"))
+        polled = {"n": 0}
+
+        def _fake_rss(pid):
+            polled["n"] += 1
+            return 999 * 1024 * 1024
+
+        monkeypatch.setattr(crawler, "_child_rss_bytes", _fake_rss)
+        pool = crawler._ConvertProcessPool(1, max_rss_bytes=0)
+        pool.start()
+        try:
+            f = self._write(tmp_path, "doc.txt", b"fine")
+            outcome = pool.convert(0, f, "text/plain")
+            assert outcome.ok
+        finally:
+            pool.shutdown()
+        assert polled["n"] == 0, "the watchdog must never poll RSS at all when its knob is 0"
+
+    def test_watchdog_kills_a_child_whose_rss_crosses_the_ceiling(self, tmp_path, monkeypatch):
+        """Portable: `_child_rss_bytes` is `/proc`-based (Linux-only — see
+        its own docstring), so this drives the watchdog's DECISION through
+        a stub rather than a real allocation, the same way
+        `_effective_memory_limit_bytes`'s own tests stub `_own_vsize_bytes`
+        — see `test_a_runaway_childs_rss_is_caught_by_the_real_watchdog_on_linux`
+        below for the real, Linux-only enforcement."""
+
+        def _convert(path: Path, mime: str) -> Any:
+            time.sleep(30)  # never reached — the watchdog kills this child first
+            return ConvertResult("# never reached")
+
+        monkeypatch.setattr(crawler, "convert_to_markdown", _convert)
+        monkeypatch.setattr(crawler, "_child_rss_bytes", lambda pid: 999 * 1024 * 1024)
+        pool = crawler._ConvertProcessPool(1, max_rss_bytes=100 * 1024 * 1024)
+        pool.start()
+        try:
+            first_pid = pool._procs[0].pid
+            f = self._write(tmp_path, "doc.txt", b"fine")
+            started = time.monotonic()
+            with pytest.raises(crawler._ConvertMemoryGuard) as exc_info:
+                pool.convert(0, f, "application/octet-stream")
+            elapsed = time.monotonic() - started
+            # Bounded near the poll interval, not the 30s sleep — the whole
+            # point of killing rather than waiting it out.
+            assert elapsed < 5
+            assert exc_info.value.rss_bytes == 999 * 1024 * 1024
+            assert exc_info.value.limit_bytes == 100 * 1024 * 1024
+        finally:
+            pool.shutdown()
+        # The offending worker was actually killed.
+        assert first_pid != pool._procs[0].pid if pool._procs[0] else True
+
+    def test_the_slot_recovers_via_the_spare_after_a_memory_guard_kill(self, tmp_path, monkeypatch):
+        def _convert(path: Path, mime: str) -> Any:
+            if Path(path).read_bytes() == b"HOG-ME":
+                time.sleep(30)
+            return ConvertResult("# ok")
+
+        monkeypatch.setattr(crawler, "convert_to_markdown", _convert)
+        monkeypatch.setattr(crawler, "_child_rss_bytes", lambda pid: 999 * 1024 * 1024)
+        pool = crawler._ConvertProcessPool(1, max_rss_bytes=100 * 1024 * 1024)
+        pool.start()
+        try:
+            f_hog = self._write(tmp_path, "hog.xlsx", b"HOG-ME")
+            f_ok = self._write(tmp_path, "ok.txt", b"fine")
+            with pytest.raises(crawler._ConvertMemoryGuard):
+                pool.convert(0, f_hog, "application/octet-stream")
+            # The SAME slot, on the promoted spare, answers the next file —
+            # no crawl-level repair() needed, exactly like a timeout.
+            outcome = pool.convert(0, f_ok, "text/plain")
+            assert outcome.ok
+        finally:
+            pool.shutdown()
+
+    def test_the_watchdog_never_fires_when_rss_cannot_be_read(self, tmp_path, monkeypatch):
+        """No `/proc` (this repo's own macOS test run, or any non-Linux
+        deployment target) must turn the watchdog into a pure no-op —
+        never a raised `_ConvertMemoryGuard` — see `_child_rss_bytes`'s own
+        `None` sentinel. Bounded here by ALSO enabling the per-item
+        timeout, so a platform where the watchdog silently does nothing
+        still eventually reclaims a hung worker through the OTHER bound,
+        exactly as before the RSS watchdog existed."""
+
+        def _convert(path: Path, mime: str) -> Any:
+            time.sleep(30)
+            return ConvertResult("# never reached")
+
+        monkeypatch.setattr(crawler, "convert_to_markdown", _convert)
+        monkeypatch.setattr(crawler, "_child_rss_bytes", lambda pid: None)
+        # An absurdly low cap that would fire instantly if `_child_rss_bytes`
+        # ever returned a real number — proving the `None` path truly never
+        # raises the guard, rather than merely being unlikely to trigger.
+        pool = crawler._ConvertProcessPool(1, max_rss_bytes=1, timeout_s=0.3)
+        pool.start()
+        try:
+            f = self._write(tmp_path, "doc.txt", b"fine")
+            with pytest.raises(crawler._ConvertTimedOut):
+                pool.convert(0, f, "application/octet-stream")
+        finally:
+            pool.shutdown()
+
+    def test_prepare_document_words_a_memory_guard_failure_attributably(self, tmp_path):
+        """`_prepare_document` must never reuse `_convert_crash_detail`'s
+        "may not be this file's fault" wording for a guard THIS pool fired
+        itself — see `_convert_memory_guard_detail`."""
+
+        class _FakePool:
+            def convert(self, slot: int, tmp_path: Path, mime: str) -> Any:
+                raise crawler._ConvertMemoryGuard(rss_bytes=999 * 1024 * 1024, limit_bytes=512 * 1024 * 1024)
+
+        f = self._write(tmp_path, "doc.txt", b"x")
+        prepared = crawler._prepare_document(
+            f,
+            mime="text/plain",
+            path="doc.txt",
+            name="doc.txt",
+            anonymize=False,
+            anonymization_key=None,
+            detector=None,
+            convert_pool=_FakePool(),
+            convert_slot=0,
+        )
+        assert prepared.outcome == "convert_failed"
+        assert "exceeded the conversion memory guard" in prepared.detail
+        assert "999" in prepared.detail
+        assert "may not be this file's fault" not in prepared.detail
+
+    def test_convert_memory_guard_detail_wording(self):
+        detail = crawler._convert_memory_guard_detail(1234 * 1024 * 1024)
+        assert "exceeded the conversion memory guard" in detail
+        assert "1234 MB RSS" in detail
+
+    @pytest.mark.skipif(sys.platform != "linux", reason="/proc/<pid>/status is Linux-only")
+    def test_a_runaway_childs_rss_is_caught_by_the_real_watchdog_on_linux(self, tmp_path, monkeypatch):
+        """The REAL enforcement, not a simulation — only meaningful (and
+        only run) on Linux, this module's deployment target and where the
+        memory pressure this guards against was observed."""
+
+        def _convert(path, mime):
+            _hog = bytearray(200 * 1024 * 1024)  # noqa: F841 — zero-fills, forcing real RSS growth
+            time.sleep(10)  # long enough for the parent's watchdog to notice and kill
+            return ConvertResult("# never reached")
+
+        monkeypatch.setattr(crawler, "convert_to_markdown", _convert)
+        # RLIMIT_AS disabled here — this test is about the RSS watchdog
+        # specifically, not about the two mechanisms racing each other.
+        pool = crawler._ConvertProcessPool(1, max_rss_bytes=50 * 1024 * 1024, memory_limit_bytes=0)
+        pool.start()
+        try:
+            f = self._write(tmp_path, "doc.txt", b"x")
+            started = time.monotonic()
+            with pytest.raises(crawler._ConvertMemoryGuard) as exc_info:
+                pool.convert(0, f, "application/octet-stream")
+            assert time.monotonic() - started < 8
+            assert exc_info.value.rss_bytes >= 50 * 1024 * 1024
         finally:
             pool.shutdown()
 

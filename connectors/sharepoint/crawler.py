@@ -231,6 +231,61 @@ _DEFAULT_CONVERT_RECYCLE_RSS_MB = 512
 #: reading unusable. Not enforceable on every platform (notably macOS,
 #: where this repo's tests run) — see ``_install_memory_limit``.
 _DEFAULT_CONVERT_CHILD_MEMORY_LIMIT_MB = 1536
+#: A per-child RSS ceiling the PARENT itself enforces by polling (see
+#: :meth:`_ConvertProcessPool._await_reply`), independent of — and a
+#: backstop for — ``convert_child_memory_limit_mb`` above. A FOURTH
+#: live-deployment finding, distinct from that one: ``RLIMIT_AS`` is
+#: interpreted as HEADROOM above the worker's OWN VmSize *at fork time*
+#: (see ``_effective_memory_limit_bytes``), so on a long-running crawl
+#: parent whose own VmSize has grown to 6-15 GB after hours of crawling, a
+#: single child converting one huge spreadsheet or PDF reached 10-17 GB
+#: RSS before ``RLIMIT_AS`` — pinned to that already-large baseline — ever
+#: fired; with ~80 concurrent children a replica climbed to 115 GB and had
+#: to be SIGKILLed by a host-level watchdog script outside this pool's own
+#: accounting, which then attributed the loss to whatever file happened to
+#: be in flight AND left the slot dead until the next page boundary (see
+#: ``convert_spares_per_slot`` below for the second half of that gap).
+#: This watchdog polls the CHILD's own ``/proc/<pid>/status`` — not the
+#: parent's — every :data:`_RSS_WATCHDOG_POLL_INTERVAL_S` seconds while a
+#: conversion is in flight, so a child that grows past this absolute
+#: ceiling (however large the parent has grown, unlike the headroom-based
+#: RLIMIT_AS) is SIGKILLed and the file it was converting is counted an
+#: attributable ``convert_failed`` — never the vaguer "killed by memory
+#: pressure outside its control" wording a bare external SIGKILL gets
+#: (see :func:`_convert_crash_detail`), because THIS SIGKILL was issued by
+#: this pool itself, for a reason it can name. Configurable
+#: (``extraction.crawler.convert_child_max_rss_mb``); 0 disables it.
+#: Linux only (reads ``/proc/<pid>/status``) — a no-op on any platform
+#: where that path does not exist, notably macOS, where this repo's own
+#: tests run.
+_DEFAULT_CONVERT_CHILD_MAX_RSS_MB = 4096
+#: How often :meth:`_ConvertProcessPool._await_reply` polls a child's RSS
+#: (and, when the per-item timeout is also enabled, whether it has
+#: answered yet) while a conversion is in flight. Small enough that a
+#: runaway allocation is caught promptly, large enough that polling
+#: ``/proc/<pid>/status`` in a tight loop is not itself the parent's own
+#: CPU cost on a large crawl.
+_RSS_WATCHDOG_POLL_INTERVAL_S = 0.5
+#: How many pre-forked, idle standby children :meth:`_ConvertProcessPool.
+#: start`/:meth:`repair` keep ready PER SLOT — see the class docstring's
+#: "RECYCLING" section for why spares exist at all. A FIFTH live-
+#: deployment finding: the ORIGINAL design kept exactly one spare per
+#: slot, forked only at a delta-page boundary — so a slot that recycled
+#: or crashed a SECOND time inside the same (up to 200-item) page, before
+#: the next :meth:`repair` had a chance to refill it, had nothing left to
+#: swap in and simply kept running unbounded (a recycle) or stayed dead
+#: for the rest of the page (a crash), exactly the pre-spares behaviour in
+#: both cases. Keeping ``N`` spares per slot instead pushes that gap out to
+#: the ``N``-plus-first recycle/crash in one page — never eliminated
+#: entirely (see :meth:`_ConvertProcessPool.repair`'s own docstring for why
+#: a MORE frequent safe point does not exist in the concurrent branch), but
+#: far less likely to matter in practice. Configurable
+#: (``extraction.crawler.convert_spares_per_slot``); 0 disables spares
+#: outright (the pre-spares behaviour, exactly).
+_DEFAULT_CONVERT_SPARES_PER_SLOT = 2
+#: Sanity ceiling on the configured value above — each spare is one idle,
+#: import-only process per slot, so this is a cost cap, not a tuned number.
+_MAX_CONVERT_SPARES_PER_SLOT = 8
 #: How long a single item's CONVERSION may run before its worker is killed
 #: and the file counted an ordinary, attributable ``convert_failed`` — the
 #: per-item TIME bound. Nothing previously bounded how long one document
@@ -2419,6 +2474,38 @@ class _ConvertTimedOut(Exception):
         super().__init__(f"conversion worker did not answer within {timeout_s:.0f}s")
 
 
+class _ConvertMemoryGuard(Exception):
+    """The child process handling this call was SIGKILLed by the PARENT
+    itself for crossing ``convert_child_max_rss_mb`` (see
+    :data:`_DEFAULT_CONVERT_CHILD_MAX_RSS_MB`) — a live RSS ceiling the
+    parent polls for, independent of the child's OWN ``RLIMIT_AS``.
+
+    Raised only inside :meth:`_ConvertProcessPool.convert`, on the PARENT
+    side, after the offending worker has already been reclaimed (SIGKILL,
+    then the pre-forked spare promoted when one is ready — see
+    :meth:`_ConvertProcessPool._reclaim_timed_out_slot`, reused unchanged
+    for this guard: the recovery is identical to a per-item timeout, only
+    the trigger differs). Deliberately a SEPARATE type from
+    :class:`_ConvertCrashed`: a bare SIGKILL discovered via ``EOFError`` on
+    the pipe could have come from OUTSIDE this process's own accounting
+    (the kernel's OOM killer, a host-level watchdog) and may not be this
+    file's fault (see :func:`_convert_crash_detail`'s external-pressure
+    wording) — but THIS SIGKILL was issued by this pool itself, for a
+    reason it can name with certainty, so the caller
+    (:func:`_prepare_document`) words it as attributable, not as
+    "may not be this file's fault".
+    """
+
+    def __init__(self, rss_bytes: int, limit_bytes: int) -> None:
+        self.rss_bytes = rss_bytes
+        self.limit_bytes = limit_bytes
+        rss_mb = rss_bytes / (1024 * 1024)
+        limit_mb = limit_bytes / (1024 * 1024)
+        super().__init__(
+            f"conversion worker exceeded the {limit_mb:.0f} MB RSS guard ({rss_mb:.0f} MB observed) and was killed"
+        )
+
+
 def _peak_rss_bytes() -> int:
     """This (calling) process's peak resident-set size, in bytes.
 
@@ -2463,6 +2550,33 @@ def _own_vsize_bytes() -> int:
     except (OSError, ValueError, IndexError):
         pass
     return 0
+
+
+def _child_rss_bytes(pid: Optional[int]) -> Optional[int]:
+    """``pid``'s current resident-set size (``VmRSS``), in bytes, read from
+    ``/proc/<pid>/status`` — the PARENT-side counterpart to
+    :func:`_peak_rss_bytes` (which only ever reads its OWN
+    ``/proc/self/status``, from inside the process being measured). Used
+    by :meth:`_ConvertProcessPool._await_reply` to watch a CHILD's live RSS
+    while a conversion is in flight — see :data:`_DEFAULT_CONVERT_CHILD_MAX_RSS_MB`.
+
+    Returns ``None`` — never raises — on any failure: an absent/vanished
+    ``pid``, no ``/proc`` at all (notably macOS, where this repo's own
+    tests run), or a malformed line. A platform without ``/proc``, or a
+    child that exited between the pool's own liveness check and this read,
+    can therefore only turn one poll of the RSS watchdog into a no-op,
+    never a broken crawl.
+    """
+    if not pid:
+        return None
+    try:
+        with open(f"/proc/{pid}/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) * 1024  # kB -> bytes
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
 
 
 def _effective_memory_limit_bytes(limit_bytes: int) -> int:
@@ -2729,12 +2843,12 @@ class _ConvertProcessPool:
        spare's own memory footprint is just import overhead, not yet the
        per-document accumulation this whole mechanism exists to bound.
 
-    A slot with no spare ready when its budget is hit (it already recycled
-    once this page, before the last :meth:`repair` had a chance to refill
-    it) simply keeps running past its budget until the next safe point —
-    bounded staleness, never unbounded growth, and never a correctness
-    issue: :meth:`convert` still returns every file's real outcome either
-    way.
+    A slot with no spare ready when its budget is hit (it already consumed
+    every spare this page, before the last :meth:`repair` had a chance to
+    refill them) simply keeps running past its budget until the next safe
+    point — bounded staleness, never unbounded growth, and never a
+    correctness issue: :meth:`convert` still returns every file's real
+    outcome either way.
 
     The SAME swap primitive also repairs a mid-page CRASH instantly when a
     spare happens to be ready, rather than leaving the slot down for the
@@ -2743,6 +2857,38 @@ class _ConvertProcessPool:
     unaffected either way — still counted ``convert_failed``, still logged
     with its signal — only whether a DIFFERENT, later file on the same slot
     in the same page has to wait for the next page boundary changes.
+
+    N SPARES PER SLOT (second live-deployment finding, 2026-09):  a single
+    spare per slot is exactly ONE mid-page recycle/crash of insurance — a
+    slot that hits its budget or crashes a SECOND time in the same page,
+    before the next :meth:`repair` refills it, had nothing left to swap in
+    and fell back to the pre-spares behaviour (unbounded RSS growth for a
+    recycle, a dead slot for a crash) for the rest of that page. ``spares``
+    is now a per-slot QUEUE of ``spares_per_slot`` (default
+    :data:`_DEFAULT_CONVERT_SPARES_PER_SLOT`) pre-forked standbys, consumed
+    FIFO by :meth:`_swap_in_spare` and topped back up to the configured
+    count by :meth:`repair` — same fork sites, same single-threaded
+    constraint, just more of them. This does not raise the ceiling on how
+    MANY times a slot can fail in one page before it runs dry again, it
+    only raises it from one to ``spares_per_slot`` — the cost is one more
+    idle (import-only) process per slot per unit of insurance, so it is a
+    knob, not a fixed multiplier.
+
+    Does ``repair`` run MORE OFTEN than once per (up to 200-item) delta
+    page to shrink that residual gap further? No additional safe point
+    exists in the CONCURRENT branch (``concurrency > 1``) without either
+    forking from a live worker thread (the exact hazard this whole
+    constraint exists to avoid) or splitting one page into several
+    thread-pool lifetimes (defeating the overlap the page's own
+    concurrency exists to provide) — :func:`_process_page`'s
+    ``ThreadPoolExecutor`` is created once and joined once per page, by
+    design, and the join is the ONLY point between its creation and the
+    caller's next page fetch where no worker thread is alive. The
+    SEQUENTIAL branch (``concurrency == 1``) and :func:`_retry_failed_items`
+    both already call :meth:`repair` before EVERY item, since neither ever
+    holds a thread pool at all — narrowing the concurrent branch's cadence
+    below "once per page" is therefore not available cheaply; widening the
+    spare queue is the lever this module actually has.
 
     Every worker this pool ever forks — active or spare — also gets its own
     ``RLIMIT_AS`` ceiling (``memory_limit_bytes``, installed inside the
@@ -2756,6 +2902,19 @@ class _ConvertProcessPool:
     pipe — the two are independent: a document can convert well within its
     own RLIMIT_AS the whole time and still produce more markdown than the
     parent should ever be handed at once.
+
+    RSS WATCHDOG (third live-deployment finding, 2026-09): ``RLIMIT_AS``
+    above only bounds VIRTUAL address space, and is HEADROOM above the
+    worker's own VmSize at FORK time — on a crawl parent that has grown
+    for hours (VmSize 6-15 GB), a single child converting one huge document
+    can still reach 10-17 GB RSS before that (already-large) ceiling ever
+    fires. ``max_rss_bytes`` (see :data:`_DEFAULT_CONVERT_CHILD_MAX_RSS_MB`)
+    is a SEPARATE, absolute ceiling the PARENT polls for directly — see
+    :meth:`_await_reply` — rather than relying on the child's own
+    accounting at all. Reuses the exact recovery :meth:`_reclaim_timed_out_slot`
+    already provides for a per-item timeout (SIGKILL, then promote a spare
+    when one is ready); only the trigger and the exception type
+    (:class:`_ConvertMemoryGuard`) differ.
     """
 
     def __init__(
@@ -2768,6 +2927,8 @@ class _ConvertProcessPool:
         memory_limit_bytes: int = _DEFAULT_CONVERT_CHILD_MEMORY_LIMIT_MB * 1024 * 1024,
         timeout_s: float = 0.0,
         max_output_bytes: int = _DEFAULT_MAX_CONVERTED_MB * 1024 * 1024,
+        max_rss_bytes: int = 0,
+        spares_per_slot: int = _DEFAULT_CONVERT_SPARES_PER_SLOT,
     ) -> None:
         self._ctx = ctx or multiprocessing.get_context("fork")
         self._size = max(1, int(size))
@@ -2779,17 +2940,27 @@ class _ConvertProcessPool:
         #: existed).
         self._timeout_s = max(0.0, float(timeout_s))
         self._max_output_bytes = max(0, int(max_output_bytes))
+        #: Per-item RSS bound the PARENT itself polls for — see
+        #: :data:`_DEFAULT_CONVERT_CHILD_MAX_RSS_MB`. 0 disables the watchdog
+        #: (no polling at all when this AND ``timeout_s`` are both 0 — see
+        #: :meth:`_await_reply`).
+        self._max_rss_bytes = max(0, int(max_rss_bytes))
+        #: How many pre-forked standbys :meth:`start`/:meth:`repair` keep
+        #: ready per slot — see :data:`_DEFAULT_CONVERT_SPARES_PER_SLOT`.
+        self._spares_per_slot = max(0, int(spares_per_slot))
         self._procs: List[Optional[Any]] = [None] * self._size
         self._conns: List[Optional[Connection]] = [None] * self._size
         self._doc_counts: List[int] = [0] * self._size
-        #: Pre-forked, idle standby per slot — see the class docstring's
-        #: "RECYCLING" section for why this exists.
-        self._spare_procs: List[Optional[Any]] = [None] * self._size
-        self._spare_conns: List[Optional[Connection]] = [None] * self._size
+        #: Pre-forked, idle standby QUEUES, one list per slot — see the
+        #: class docstring's "N SPARES PER SLOT" section. Consumed FIFO
+        #: (``pop(0)``) by :meth:`_swap_in_spare`, refilled up to
+        #: ``spares_per_slot`` by :meth:`start`/:meth:`repair`.
+        self._spare_procs: List[List[Any]] = [[] for _ in range(self._size)]
+        self._spare_conns: List[List[Connection]] = [[] for _ in range(self._size)]
 
     def start(self) -> None:
-        """Fork every slot's ACTIVE worker, and a SPARE standing by for the
-        same slot, that are not already alive. Call only from a
+        """Fork every slot's ACTIVE worker, and top its SPARE queue up to
+        ``spares_per_slot``, wherever either is short. Call only from a
         single-threaded context — see the class docstring.
 
         Logs ONE INFO line naming the effective absolute ceiling every
@@ -2807,7 +2978,7 @@ class _ConvertProcessPool:
             if self._procs[slot] is None:
                 self._spawn(slot)
                 spawned_any = True
-            if self._spare_procs[slot] is None:
+            while len(self._spare_procs[slot]) < self._spares_per_slot:
                 self._spawn_spare(slot)
                 spawned_any = True
         if spawned_any and self._memory_limit_bytes > 0:
@@ -2844,20 +3015,23 @@ class _ConvertProcessPool:
         )
         proc.start()
         child_conn.close()
-        self._spare_procs[slot] = proc
-        self._spare_conns[slot] = parent_conn
+        self._spare_procs[slot].append(proc)
+        self._spare_conns[slot].append(parent_conn)
 
     def convert(self, slot: int, tmp_path: Path, mime: str) -> _ConvertOutcome:
         """Blocking. Runs ``tmp_path`` through slot ``slot``'s dedicated
         worker and returns its outcome, or raises :class:`_ConvertCrashed`
-        when that worker died instead of answering, or :class:`_ConvertTimedOut`
+        when that worker died instead of answering, :class:`_ConvertTimedOut`
         when it is still alive but did not answer within ``timeout_s`` (see
-        :data:`_DEFAULT_ITEM_TIMEOUT_S`) — the caller turns either into the
-        same ``convert_failed`` outcome an ordinary exception would, worded
-        for what actually happened. Also where recycling (see the class
-        docstring) is decided and, when a spare is ready, carried out —
-        after this call's own result is already determined, so a recycle
-        never changes what THIS file's outcome was."""
+        :data:`_DEFAULT_ITEM_TIMEOUT_S`), or :class:`_ConvertMemoryGuard`
+        when its RSS crossed ``max_rss_bytes`` (see
+        :data:`_DEFAULT_CONVERT_CHILD_MAX_RSS_MB`) — the caller turns any of
+        the three into the same ``convert_failed`` outcome an ordinary
+        exception would, worded for what actually happened. Also where
+        recycling (see the class docstring) is decided and, when a spare is
+        ready, carried out — after this call's own result is already
+        determined, so a recycle never changes what THIS file's outcome
+        was."""
         proc = self._procs[slot]
         conn = self._conns[slot]
         if proc is None or conn is None or not proc.is_alive():
@@ -2866,13 +3040,7 @@ class _ConvertProcessPool:
             raise _ConvertCrashed(detail)
         try:
             conn.send((str(tmp_path), mime))
-            if self._timeout_s > 0 and not conn.poll(self._timeout_s):
-                # Still alive, just too slow — reclaim the slot (SIGKILL,
-                # since a genuine native hang can freely ignore SIGTERM) and
-                # tell the caller this was a TIMEOUT, not a crash.
-                self._reclaim_timed_out_slot(slot)
-                raise _ConvertTimedOut(self._timeout_s)
-            reply: _ConvertReply = conn.recv()
+            reply = self._await_reply(slot, proc, conn)
         except (EOFError, OSError):
             detail = self._exit_detail(proc)
             self._swap_in_spare(slot)
@@ -2883,6 +3051,49 @@ class _ConvertProcessPool:
         if over_doc_budget or over_rss_ceiling:
             self._swap_in_spare(slot)
         return reply.outcome
+
+    def _await_reply(self, slot: int, proc: Any, conn: Connection) -> "_ConvertReply":
+        """Block for slot ``slot``'s reply, honoring BOTH the per-item time
+        bound (``timeout_s``) and the per-item RSS watchdog (``max_rss_bytes``)
+        — whichever fires first.
+
+        With both disabled this is exactly the pre-watchdog behaviour: one
+        unconditional, un-polled ``conn.recv()`` — no periodic wakeups at
+        all. Otherwise it polls in
+        :data:`_RSS_WATCHDOG_POLL_INTERVAL_S`-second increments (capped by
+        whatever remains of ``timeout_s`` when that bound is also active),
+        reading the CHILD's own ``/proc/<pid>/status`` on every increment
+        the timeout does not fire on. Raises :class:`_ConvertTimedOut` /
+        :class:`_ConvertMemoryGuard` — after reclaiming the slot exactly
+        the same way (SIGKILL, then :meth:`_swap_in_spare` when a spare is
+        ready) — whichever bound crosses first; a caller's ``except
+        (EOFError, OSError)`` around THIS call is for a crash discovered
+        mid-wait instead, a different case from either guard firing
+        cleanly.
+        """
+        if self._timeout_s <= 0 and self._max_rss_bytes <= 0:
+            return conn.recv()
+        deadline = time.monotonic() + self._timeout_s if self._timeout_s > 0 else None
+        while True:
+            wait_for = _RSS_WATCHDOG_POLL_INTERVAL_S
+            if deadline is not None:
+                wait_for = max(0.0, min(wait_for, deadline - time.monotonic()))
+            if conn.poll(wait_for):
+                return conn.recv()
+            if deadline is not None and time.monotonic() >= deadline:
+                # Still alive, just too slow — reclaim the slot (SIGKILL,
+                # since a genuine native hang can freely ignore SIGTERM) and
+                # tell the caller this was a TIMEOUT, not a crash.
+                self._reclaim_timed_out_slot(slot)
+                raise _ConvertTimedOut(self._timeout_s)
+            if self._max_rss_bytes > 0:
+                rss_bytes = _child_rss_bytes(getattr(proc, "pid", None))
+                if rss_bytes is not None and rss_bytes >= self._max_rss_bytes:
+                    # Still alive, just too big — same reclaim path as a
+                    # timeout (SIGKILL, then swap in a spare), a different
+                    # trigger and a differently-worded exception.
+                    self._reclaim_timed_out_slot(slot)
+                    raise _ConvertMemoryGuard(rss_bytes, self._max_rss_bytes)
 
     def _exit_detail(self, proc: Optional[Any]) -> str:
         if proc is None:
@@ -2902,15 +3113,19 @@ class _ConvertProcessPool:
 
     def _reclaim_timed_out_slot(self, slot: int) -> None:
         """Forcibly reclaim slot ``slot`` after its worker failed to answer
-        within ``timeout_s`` (see :data:`_DEFAULT_ITEM_TIMEOUT_S`).
+        within ``timeout_s`` (see :data:`_DEFAULT_ITEM_TIMEOUT_S`) OR
+        crossed the RSS watchdog's ceiling (see
+        :data:`_DEFAULT_CONVERT_CHILD_MAX_RSS_MB`) — the name predates the
+        second trigger, but the reclaim itself is IDENTICAL for both: only
+        the caller's exception type differs.
 
         SIGKILL, never :meth:`Process.terminate`'s SIGTERM: a worker stuck
         inside native conversion code — the same class of failure crash
-        isolation already guards against, just hanging instead of aborting
-        — can freely ignore a termination request, and this path must not
-        itself risk hanging waiting for a process that will never
-        cooperate. Recovery mirrors a crash: :meth:`_swap_in_spare`
-        promotes the pre-forked SPARE immediately when one is ready
+        isolation already guards against, just hanging (or growing)
+        instead of aborting — can freely ignore a termination request, and
+        this path must not itself risk hanging waiting for a process that
+        will never cooperate. Recovery mirrors a crash: :meth:`_swap_in_spare`
+        promotes the next pre-forked SPARE immediately when one is ready
         (safe from ANY thread, same as a crash or a recycle); otherwise the
         slot stays down until the next :meth:`repair`.
         """
@@ -2922,78 +3137,95 @@ class _ConvertProcessPool:
 
     def _swap_in_spare(self, slot: int) -> bool:
         """Retire slot's ACTIVE process (dead from a crash, or simply past
-        its recycle budget) and promote its pre-forked SPARE in its place.
+        its recycle budget) and promote the NEXT pre-forked SPARE in its
+        queue, consumed FIFO (oldest-forked first — see the class
+        docstring's "N SPARES PER SLOT" section).
 
         No ``fork()`` — only a termination signal to the retiree and a
         pointer reassignment — so this is safe to call from ANY thread, at
         ANY point in a page, unlike :meth:`_spawn`/:meth:`repair`; that is
         what lets a slot recycle (or recover from a crash) mid-page rather
-        than only at the next page boundary. Returns ``False``, leaving the
-        slot exactly as it was, when no spare is ready yet — the caller
-        (:meth:`convert`) already handles both outcomes: a dead slot stays
-        dead until :meth:`repair`, same as before recycling existed; a
-        merely over-budget slot just keeps running past its budget.
+        than only at the next page boundary. A spare found already dead in
+        the queue (rare — an idle standby crashing before it was ever used)
+        is reaped and skipped rather than treated as a failed swap, so it
+        never strands a live spare queued behind it. Returns ``False``,
+        leaving the slot exactly as it was, only when the queue is
+        completely empty — the caller (:meth:`convert`) already handles
+        both outcomes: a dead slot stays dead until :meth:`repair`, same as
+        before spares existed; a merely over-budget slot just keeps running
+        past its budget.
         """
-        spare_proc = self._spare_procs[slot]
-        spare_conn = self._spare_conns[slot]
-        if spare_proc is None or spare_conn is None or not spare_proc.is_alive():
-            return False
-        self._close_slot(slot)
-        self._procs[slot] = spare_proc
-        self._conns[slot] = spare_conn
-        self._spare_procs[slot] = None
-        self._spare_conns[slot] = None
-        self._doc_counts[slot] = 0
-        return True
+        spares = self._spare_procs[slot]
+        conns = self._spare_conns[slot]
+        while spares:
+            spare_proc = spares.pop(0)
+            spare_conn = conns.pop(0)
+            if not spare_proc.is_alive():
+                self._close_given(spare_proc, spare_conn)
+                continue
+            self._close_slot(slot)
+            self._procs[slot] = spare_proc
+            self._conns[slot] = spare_conn
+            self._doc_counts[slot] = 0
+            return True
+        return False
 
     def repair(self) -> List[int]:
-        """Replace every dead ACTIVE slot with a fresh worker, and top up
-        any slot whose SPARE was consumed by a mid-page recycle or crash
-        recovery. Call only from a point the caller has proven
-        single-threaded (a delta-page boundary, after that page's
-        item-concurrency thread pool has been joined). Returns the
-        repaired ACTIVE slot indices — used by tests."""
+        """Replace every dead ACTIVE slot with a fresh worker, and top every
+        slot's SPARE queue back up to ``spares_per_slot`` (pruning any spare
+        found dead in the queue first — see :meth:`_swap_in_spare`'s own
+        docstring for when that happens). Call only from a point the caller
+        has proven single-threaded (a delta-page boundary, after that
+        page's item-concurrency thread pool has been joined — see the class
+        docstring for why no MORE frequent safe point exists in that
+        branch). Returns the repaired ACTIVE slot indices — used by tests.
+        """
         repaired = []
         for slot, proc in enumerate(self._procs):
             if proc is None or not proc.is_alive():
                 self._close_slot(slot)
                 self._spawn(slot)
                 repaired.append(slot)
-        for slot, spare in enumerate(self._spare_procs):
-            if spare is None or not spare.is_alive():
-                self._close_spare(slot)
+        for slot in range(self._size):
+            spares = self._spare_procs[slot]
+            conns = self._spare_conns[slot]
+            alive_procs: List[Any] = []
+            alive_conns: List[Connection] = []
+            for spare_proc, spare_conn in zip(spares, conns):
+                if spare_proc.is_alive():
+                    alive_procs.append(spare_proc)
+                    alive_conns.append(spare_conn)
+                else:
+                    self._close_given(spare_proc, spare_conn)
+            self._spare_procs[slot] = alive_procs
+            self._spare_conns[slot] = alive_conns
+            while len(self._spare_procs[slot]) < self._spares_per_slot:
                 self._spawn_spare(slot)
         return repaired
 
-    def _close_slot(self, slot: int) -> None:
-        proc = self._procs[slot]
-        conn = self._conns[slot]
+    def _close_given(self, proc: Optional[Any], conn: Optional[Connection]) -> None:
+        """Close one connection and retire+reap one process — the shared
+        tail of :meth:`_close_slot` and every SPARE-queue cleanup path
+        (:meth:`_swap_in_spare`, :meth:`repair`, :meth:`shutdown`), so all
+        of them terminate a worker the same way."""
         if conn is not None:
             try:
                 conn.close()
             except OSError:
                 pass
         _retire_process(proc)
+
+    def _close_slot(self, slot: int) -> None:
+        self._close_given(self._procs[slot], self._conns[slot])
         self._procs[slot] = None
         self._conns[slot] = None
 
-    def _close_spare(self, slot: int) -> None:
-        proc = self._spare_procs[slot]
-        conn = self._spare_conns[slot]
-        if conn is not None:
-            try:
-                conn.close()
-            except OSError:
-                pass
-        _retire_process(proc)
-        self._spare_procs[slot] = None
-        self._spare_conns[slot] = None
-
     def shutdown(self) -> None:
-        """Signal every live worker (active AND spare) to exit, then reap
-        them all. Safe to call more than once and safe to call on a pool
-        that never started."""
-        for conn in (*self._conns, *self._spare_conns):
+        """Signal every live worker (active AND every queued spare) to
+        exit, then reap them all. Safe to call more than once and safe to
+        call on a pool that never started."""
+        all_spare_conns = [conn for conns in self._spare_conns for conn in conns]
+        for conn in (*self._conns, *all_spare_conns):
             if conn is not None:
                 try:
                     conn.send(None)
@@ -3001,7 +3233,10 @@ class _ConvertProcessPool:
                     pass
         for slot in range(self._size):
             self._close_slot(slot)
-            self._close_spare(slot)
+            for spare_proc, spare_conn in zip(self._spare_procs[slot], self._spare_conns[slot]):
+                self._close_given(spare_proc, spare_conn)
+            self._spare_procs[slot] = []
+            self._spare_conns[slot] = []
 
 
 @dataclass
@@ -3146,6 +3381,19 @@ def _convert_crash_detail(signal_name: str) -> str:
     return f"conversion worker crashed: {signal_name}"
 
 
+def _convert_memory_guard_detail(rss_bytes: int) -> str:
+    """The operator-facing wording for a :class:`_ConvertMemoryGuard`
+    failure — ATTRIBUTABLE, deliberately never the
+    :func:`_convert_crash_detail` "may not be this file's fault" wording a
+    bare external SIGKILL gets: this SIGKILL was issued by this pool
+    itself, for a reason it can name with certainty (the observed RSS this
+    poll crossed the configured ceiling at), not by the kernel's OOM killer
+    or a host-level watchdog acting on pressure this process never saw
+    coming."""
+    rss_mb = rss_bytes / (1024 * 1024)
+    return f"exceeded the conversion memory guard ({rss_mb:.0f} MB RSS)"
+
+
 def _prepare_document(
     tmp_path: Path,
     *,
@@ -3207,6 +3455,14 @@ def _prepare_document(
     built by :func:`_convert_worker_main` from byte counts alone, never
     document content, so there is nothing for an anonymize-marked scope to
     gate.
+
+    A :class:`_ConvertMemoryGuard` failure (live deployment #4, 2026-09:
+    see :data:`_DEFAULT_CONVERT_CHILD_MAX_RSS_MB`) is worded the SAME way
+    regardless of ``anonymize`` too, and — like ``MemoryError`` above, not
+    like a bare signal crash — ATTRIBUTABLY: :func:`_convert_memory_guard_detail`
+    is built from the observed RSS byte count alone, never document
+    content, and this SIGKILL was issued by THIS pool for a reason it can
+    name, not by an OOM killer reaching in from outside its own accounting.
     """
     source_sha256 = _sha256_file(tmp_path)
     # Lazy, and only needed to catch a specific exception TYPE (the pool
@@ -3252,6 +3508,16 @@ def _prepare_document(
         # reason. The crawl continues with the next file.
         detail = f"conversion exceeded the {exc.timeout_s:.0f}s per-item time budget"
         logger.warning("sharepoint crawl: conversion timed out for %s: %s", path, detail)
+        return _PreparedDocument("convert_failed", detail=detail)
+    except _ConvertMemoryGuard as exc:
+        # The child was still ALIVE but its RSS crossed the watchdog's own
+        # ceiling — killed and, when a spare was ready, already replaced by
+        # `convert_pool.convert` itself, exactly like a timeout. Worded
+        # ATTRIBUTABLY (never the external-pressure wording a bare SIGKILL
+        # crash gets): this pool killed its own child, for a reason it can
+        # name. The crawl continues with the next file.
+        detail = _convert_memory_guard_detail(exc.rss_bytes)
+        logger.warning("sharepoint crawl: conversion failed for %s: %s", path, detail)
         return _PreparedDocument("convert_failed", detail=detail)
     except _ConvertCrashed as exc:
         # The child that was converting this file died from a signal (a
@@ -4296,6 +4562,35 @@ def _convert_child_memory_limit_bytes() -> int:
     return mb * 1024 * 1024
 
 
+def _convert_child_max_rss_bytes() -> int:
+    """``extraction.crawler.convert_child_max_rss_mb``, resolved to bytes —
+    see :data:`_DEFAULT_CONVERT_CHILD_MAX_RSS_MB`. 0 disables the parent-side
+    RSS watchdog outright."""
+    from app.instance_config import get_value
+
+    raw = get_value("extraction", "crawler", "convert_child_max_rss_mb", default=_DEFAULT_CONVERT_CHILD_MAX_RSS_MB)
+    try:
+        mb = max(0, int(raw))
+    except (TypeError, ValueError):
+        mb = _DEFAULT_CONVERT_CHILD_MAX_RSS_MB
+    return mb * 1024 * 1024
+
+
+def _convert_spares_per_slot() -> int:
+    """``extraction.crawler.convert_spares_per_slot`` — see
+    :data:`_DEFAULT_CONVERT_SPARES_PER_SLOT`. Clamped to
+    ``[0, _MAX_CONVERT_SPARES_PER_SLOT]``; 0 (or negative, or unparseable)
+    disables spares outright."""
+    from app.instance_config import get_value
+
+    raw = get_value("extraction", "crawler", "convert_spares_per_slot", default=_DEFAULT_CONVERT_SPARES_PER_SLOT)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return _DEFAULT_CONVERT_SPARES_PER_SLOT
+    return max(0, min(_MAX_CONVERT_SPARES_PER_SLOT, value))
+
+
 def _item_timeout_seconds() -> int:
     """``extraction.crawler.item_timeout_s`` — see
     :data:`_DEFAULT_ITEM_TIMEOUT_S`. 0 (or negative, or unparseable)
@@ -4769,6 +5064,8 @@ async def _run_crawl_async(
         memory_limit_bytes=_convert_child_memory_limit_bytes(),
         timeout_s=_item_timeout_seconds(),
         max_output_bytes=_max_converted_output_bytes(),
+        max_rss_bytes=_convert_child_max_rss_bytes(),
+        spares_per_slot=_convert_spares_per_slot(),
     )
     convert_pool.start()
     auth = GraphAuth(
