@@ -449,32 +449,3 @@
     line-height: 1.4;
     color: var(--ds-text-muted);
 }
-
-/* ── The shared filter bar, inside a modal ─────────────────────────────
-   The picker drives the product's filter toolbar (filter_toolbar.js), and
-   two of its controls are `<label>` elements — which the same legacy global
-   in the style-custom.css import tree forces to `display: block`, exactly as
-   it did to the picker's own rows. The symptom is unmistakable: the sheet's
-   `gap` and `padding` apply while its `display: flex` does not, so a menu
-   option renders its checkbox on one line and jams its count against the
-   label ("materialized2"). Restated here under the picker's id, which
-   out-specifies the bleed without touching the toolbar for every other page
-   that uses it. */
-#pdw-picker .fbar-menu__opt,
-#pdw-picker .fbar-menu__foot {
-    display: flex;
-    align-items: center;
-}
-
-/* The bar itself wraps rather than overflowing the card: at 880px the
-   search, Filter, the selection toggle, Sort and the count fit on one line,
-   and on a narrow window they should stack instead of clipping. */
-#pdw-picker .fbar {
-    flex-wrap: wrap;
-    row-gap: 8px;
-}
-
-/* The menu is positioned against the bar; inside a modal it needs to sit
-   above the card's own stacking context or it opens behind the rows. */
-#pdw-picker .fbar-menu,
-#pdw-picker .fbar-cat__pop { z-index: 5; }
