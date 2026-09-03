@@ -1,8 +1,14 @@
 # Example run-config for `run_eval.py run --config <this file>`.
 #
-# Only A0 (bare Anthropic) and A4 (Agnes) are API-driven -- see the
-# `scripts/eval/arms.py` module docstring for why A1/A2/A3 are
-# `import-transcript` only.
+# A0 (bare Anthropic), A3 (Anthropic + context pack) and A4 (Agnes) are
+# API-driven -- see the `scripts/eval/arms.py` module docstring for why
+# A1/A2 are `import-transcript` only (A3 may also be imported by hand, as a
+# fallback).
+#
+# Every Claude arm in a round MUST run the SAME model id -- A0 and A3 below,
+# and whatever model the A4 agent is pinned to. The thresholds compare arms,
+# and a model difference is a confound the workbook has no column for.
+# Change `model` in every stanza together, never in one.
 #
 # No secret value lives here -- only the env var NAME that holds each
 # credential (ANTHROPIC_API_KEY, AGNES_EVAL_TOKEN_PRINCIPAL, ...). Set
@@ -13,12 +19,34 @@ runs_per_prompt: 3
 
 arms:
   - A0
+  - A3
   - A4
 
 arm_config:
   A0:
     model: claude-sonnet-5
     api_key_env: ANTHROPIC_API_KEY
+
+  A3:
+    model: claude-sonnet-5          # same id as A0 -- see the note above
+    api_key_env: ANTHROPIC_API_KEY
+    # The seed/context pack, sent as a prompt-cached `system` turn ahead of
+    # the frozen prompt (the prompt stays the sole user turn). Exactly one of
+    # `system_file` / `system` (inline text) is REQUIRED -- without a pack A3
+    # is just A0, and `run` refuses to start.
+    #
+    # The pack is NOT part of this repo (it is customer content and lives in
+    # a private repo). A relative path resolves against the directory you run
+    # `run_eval.py` from; the file is read once when the round starts, so an
+    # edit mid-round cannot change what later runs send. Every record pins
+    # the pack's sha256 in `raw.system_sha256` (compare with `sha256sum`).
+    #
+    # Cache hits land in `tokens.cache_read_tokens` / `cache_creation_tokens`,
+    # reported separately and never folded into `total`. A pack shorter than
+    # the model's minimum cacheable prefix (roughly 1-4k tokens, model-
+    # dependent) silently never caches -- zero cache reads on a tiny pack is
+    # expected, not a bug.
+    system_file: /path/outside/this/repo/A3-context-pack-v1.md
 
   A4:
     surface: chat

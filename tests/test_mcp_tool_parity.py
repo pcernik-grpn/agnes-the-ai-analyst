@@ -570,3 +570,12 @@ def test_a_shared_tool_takes_the_same_arguments_on_both_servers():
         "these tools take different arguments on the HTTP and stdio MCP servers — "
         f"the contract an agent reads depends on which server it reached: {drift}"
     )
+
+
+def test_fact_edges_is_a_registered_foundation_tool():
+    """TCRD-295: the relationship-shaped read joins the five fact tools in
+    the registry, so `tests/test_mcp_tool_parity.py`'s subset guard covers
+    it on every transport."""
+    from app.api.mcp.foundation_tools import FOUNDATION_TOOL_NAMES
+
+    assert "fact_edges" in FOUNDATION_TOOL_NAMES

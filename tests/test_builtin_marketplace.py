@@ -445,42 +445,76 @@ def test_admin_table_shows_no_sync_state_for_builtin_rows():
     )
 
 
-def test_details_panel_branches_on_is_builtin_before_promising_a_schedule():
-    """The details panel is the sibling surface of the table row above, and it
-    must not describe a sync the server refuses. `sync_marketplace` opens with
-    `if spec.get("is_builtin"): raise MarketplaceNotSyncable`, so a bundled
-    marketplace enters neither sync path — promising it a nightly run, and
-    pointing at a `Sync now` the row does not render for it, describes
+def _sync_schedule_helper() -> str:
+    """The body of `syncScheduleFacts`, the single place both the Details and
+    the Edit modal read the sync facts from."""
+    template = Path("app/web/templates/admin_marketplaces.html").read_text(encoding="utf-8")
+    return template.split("function syncScheduleFacts(m)")[1].split("\n}")[0]
+
+
+def test_sync_facts_branch_on_is_builtin_before_promising_a_schedule():
+    """Neither modal may describe a sync the server refuses. `sync_marketplace`
+    opens with `if spec.get("is_builtin"): raise MarketplaceNotSyncable`, so a
+    bundled marketplace enters neither sync path — promising it a nightly run,
+    and pointing at a `Sync now` the row does not render for it, describes
     something that cannot happen.
 
+    The branch moved out of openDetails into the shared helper when the Edit
+    modal grew the same field (#1956 item 15); pinning it here rather than in
+    one caller is the point — a second surface must not be able to state the
+    schedule without going through this decision.
+
     Source inspection, like its row-cell sibling above: this pins that the
-    branch EXISTS and reaches the schedule sentence, not what the rendered
-    string looks like."""
-    template = Path("app/web/templates/admin_marketplaces.html").read_text(encoding="utf-8")
-    details_js = template.split('const syncEl = document.getElementById("details-sync")')[1]
-    branch = details_js.split("syncEl.innerHTML")[0]
-    assert "is_builtin" in branch, (
-        "openDetails must branch on m.is_builtin before it states the nightly "
-        "schedule — a bundled marketplace never enters the sync path"
+    branch EXISTS, not what the rendered string looks like."""
+    helper = _sync_schedule_helper()
+    assert "is_builtin" in helper, (
+        "syncScheduleFacts must branch on m.is_builtin before it reports a "
+        "cadence — a bundled marketplace never enters the sync path"
+    )
+    assert "syncable" in helper, (
+        "the bundled branch must be reported to callers as a flag they have "
+        "to consult, not left for each surface to re-derive"
     )
 
 
-def test_details_panel_calls_a_failed_attempt_an_attempt():
+def test_sync_facts_call_a_failed_attempt_an_attempt():
     """`last_synced_at` is stamped on FAILURE as well as success: both error
     branches in `src/marketplace.py` call `update_sync_status(..., synced_at=
     now, error=str(e))`. So the timestamp alone means "last attempted", and
     labelling it "Last synced" tells an admin a failed refresh worked.
     `last_error` is what separates the two — set on failure, cleared when a
     commit_sha arrives clean — and the table row already reads it."""
-    template = Path("app/web/templates/admin_marketplaces.html").read_text(encoding="utf-8")
-    details_js = template.split('const syncEl = document.getElementById("details-sync")')[1].split("const body")[0]
-    assert "last_error" in details_js, (
-        "openDetails must consult m.last_error before calling the timestamp "
-        "'Last synced' — it is stamped on failed attempts too"
+    helper = _sync_schedule_helper()
+    assert "last_error" in helper, (
+        "syncScheduleFacts must consult m.last_error before calling the "
+        "timestamp 'Last synced' — it is stamped on failed attempts too"
     )
-    assert "Last synced" in details_js and "Last attempt" in details_js, (
+    assert "Last synced" in helper and "Last attempt" in helper, (
         "both wordings must exist: a success says 'Last synced', a failure "
         "says 'Last attempt ... failed'"
+    )
+
+
+def test_failed_attempt_hands_the_error_to_a_tooltip_not_the_sentence():
+    """A real clone failure is four lines long and carries the server's
+    absolute DATA_DIR path ("git clone failed: Cloning into '/data/...'
+    remote: Repository not found..."). Inlined, it buried the two facts the
+    note exists to state — the cadence and the next run — under the reason
+    for one past failure.
+
+    So the sentence names the failure and the full text moves to a `title`,
+    which is what the table row's `.mp-err-badge` already does with the same
+    string. This pins the split: the error must reach a title attribute, and
+    must NOT be concatenated into the visible sentence."""
+    helper = _sync_schedule_helper()
+    failure = helper.split("Last attempt")[1].split("Last synced")[0]
+    assert 'title="${esc(m.last_error)}"' in failure, (
+        "the full error belongs in a title attribute, hoverable like the "
+        "table row's badge"
+    )
+    assert "failed: ${esc(m.last_error)}" not in helper, (
+        "the error must not be inlined into the visible sentence — it runs "
+        "to several lines and buries the cadence and next run"
     )
 
 
@@ -500,6 +534,80 @@ def test_next_nightly_sync_rolls_forward_on_the_boundary():
     )
     assert "3, 0, 0" in fn, "the hour must stay pinned to the scheduler's 03:00 UTC row"
 
+
+def test_edit_modal_states_the_sync_schedule():
+    """#1956 item 15 anchors its complaint on the EDIT modal: "Marketplaces >
+    Edit covers name/URL/branch/pin/curator/token, but the sync cadence is
+    neither shown nor configurable, and the next scheduled sync time is not
+    displayed anywhere." #2042 answered the visibility half in the Details
+    modal — the surface an admin opens to ask why a marketplace looks stale,
+    not the one they open to change how it is fetched — so the path the issue
+    names still ended in silence. This pins that Edit states it too."""
+    template = Path("app/web/templates/admin_marketplaces.html").read_text(encoding="utf-8")
+    edit_modal = template.split('id="edit-modal"')[1].split("<!-- Sync result modal -->")[0]
+    assert 'id="edit-sync-schedule"' in edit_modal, (
+        "the Edit modal must state the sync schedule — that is the surface "
+        "#1956 item 15 names"
+    )
+    assert 'id="edit-sync-help"' in edit_modal, (
+        "the next run and last-sync status belong with the field"
+    )
+
+
+def test_edit_modal_sync_schedule_is_not_editable_and_never_submitted():
+    """The cadence is one fixed `daily 03:00` row in
+    services/scheduler/__main__.py with no per-marketplace override, so an
+    editable-looking field would promise a knob that does not exist — the
+    other half of item 15, still undone.
+
+    Two things must hold, and the second is the one that would bite: the
+    input is `disabled`, and openEdit's PATCH payload never reads it. A
+    stray `edit-sync-schedule` in the payload would send a made-up field to
+    an endpoint that does not accept one."""
+    template = Path("app/web/templates/admin_marketplaces.html").read_text(encoding="utf-8")
+    edit_modal = template.split('id="edit-modal"')[1].split("<!-- Sync result modal -->")[0]
+    field = edit_modal.split('id="edit-sync-schedule"')[1].split(">")[0]
+    assert "disabled" in field, (
+        "the sync-schedule input must be disabled until the cadence is "
+        "actually configurable"
+    )
+
+    payload = template.split("const payload = {")[1].split("};")[0]
+    assert "edit-sync-schedule" not in payload, (
+        "the read-only schedule must never be read into the PATCH payload"
+    )
+
+
+def test_both_modals_read_the_sync_schedule_from_one_helper():
+    """Details answers "why does this look stale", Edit answers "can I change
+    how this is fetched" — different questions, the same facts, and two
+    copies of the is_builtin / last_error branching would drift apart on the
+    first edit to either. Both callers must go through syncScheduleFacts."""
+    template = Path("app/web/templates/admin_marketplaces.html").read_text(encoding="utf-8")
+    assert template.count("syncScheduleFacts(m)") == 3, (
+        "expected exactly three occurrences — the definition plus one call "
+        "in openDetails and one in openEdit; a fourth means a surface grew "
+        "its own copy, a second means one stopped using it"
+    )
+    open_edit = template.split("function openEdit(id)")[1].split("\nfunction ")[0]
+    assert "syncScheduleFacts(m)" in open_edit, "openEdit must read the shared helper"
+    open_details = template.split("async function openDetails(")[1].split("\nfunction ")[0]
+    assert "syncScheduleFacts(m)" in open_details, "openDetails must read the shared helper"
+
+
+# `test_plugin_control_presents_as_enabled_toggle_checked_when_not_disabled`
+# stood here on main and is deliberately NOT carried across this merge.
+# Checked against the merged template rather than assumed: it asserts
+# `>Enabled<` and `${isDisabled ? "" : "checked"}`, and both are absent
+# here — this branch's control is Off / Available, since `is_system` is
+# deleted and distribution moved to /admin/access. The behaviour it
+# protected (the caption is not the inverted 'Disabled') is asserted by
+# the availability test below, which also pins `>Disabled<` absent.
+#
+# Recorded because the merge would have dropped it either way: git
+# aligned the two function signatures and let this branch's body serve as
+# the continuation for both, so main's assertions never reached the
+# merge output for any resolution to choose.
 
 def test_plugin_availability_is_one_control_with_two_positions():
     """This page answers ONE question, and it is not "who gets it".

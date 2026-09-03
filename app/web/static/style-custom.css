@@ -5730,6 +5730,119 @@ textarea.form-textarea::placeholder { color: var(--text-muted); }
     position: static;
 }
 
+/* ── "There is more this way" — the cue AT the cut ────────────────────────
+   The scrollbar above is an affordance in the wrong PLACE: it sits under the
+   last row, so on a twelve-row table it is 400px below the reader's eye and
+   on a long one it is off-screen. A table cut mid-column then looks
+   complete — /admin/data-packages at a 900px window simply had no "Shared
+   with", with nothing near the cut to say one had been taken away.
+
+   `js/table_scroll_cue.js` sets `is-cue-left` / `is-cue-right` on the wrap
+   for whichever side still has content behind it (globally, no page opt-in);
+   these rules are what those classes draw. Two mechanisms, because the two
+   edges are not symmetrical:
+
+   * the LEFT edge, and the right edge of a table with no pinned column, get
+     a fade — the mask is in the wrap's own box coordinates, so it stays at
+     the edge while the content scrolls under it, and it needs no extra
+     element inside a scroll container (where an absolutely-positioned one
+     would scroll away and a sticky pseudo-element is not reliable);
+   * a table WITH `.data-table--pinned-actions` must not fade its right edge:
+     that is where the pin holds the row's verbs, and a mask applies to
+     sticky children too — it would fade out exactly the button the pin
+     exists to keep. That side gets a shadow under the pinned column instead,
+     which is the same statement ("something is hidden beneath this") in the
+     one form that leaves the button legible.
+
+   One mask declaration driven by two custom properties rather than four
+   selector combinations: a side that is not cut resolves to `0px`, which
+   puts both of that side's colour stops at the same offset and draws no
+   fade. The selector still excludes a pinned table's right-only state
+   outright, so a wrap with nothing to fade carries no mask — and no
+   compositing layer — rather than an inert one. */
+.data-table-wrap {
+    --dtw-fade-left: 0px;
+    --dtw-fade-right: 0px;
+}
+.data-table-wrap.is-cue-left { --dtw-fade-left: 56px; }
+.data-table-wrap.is-cue-right:not(:has(.data-table--pinned-actions)) {
+    --dtw-fade-right: 56px;
+}
+.data-table-wrap.is-cue-left,
+.data-table-wrap.is-cue-right:not(:has(.data-table--pinned-actions)) {
+    -webkit-mask-image: linear-gradient(to right,
+        transparent 0, black var(--dtw-fade-left),
+        black calc(100% - var(--dtw-fade-right)), transparent 100%);
+            mask-image: linear-gradient(to right,
+        transparent 0, black var(--dtw-fade-left),
+        black calc(100% - var(--dtw-fade-right)), transparent 100%);
+}
+
+/* ── The pinned column's own cue, at the weight a frozen pane wants ──────
+   Three passes got this wrong in both directions, so the reasoning is worth
+   keeping. A `-8px` spread against a 12px blur painted a ~4px feather nobody
+   could see. Answering that with 42% ink and a 34% border painted a grey
+   slab down the middle of a white table — heavier than every rule and
+   divider around it, which is not "visible", it is loud.
+
+   What a frozen column wants is PRECISION, not weight: one crisp hairline
+   at a step above the table's own dividers, and a narrow, soft shading to
+   its right so the edge reads as an edge rather than another cell border.
+   The tones sit between `--ds-border` and `--ds-text-muted` — visible
+   against surface at any width, quiet enough that the eye goes to the rows.
+
+   The inset layer is the one that always works: the outer shadow and the
+   slide-under band below both paint over the NEIGHBOURING column, so they
+   are only as visible as whatever is in it, and the width this was reported
+   from had Category next door — "—" and one short word per row, i.e. white
+   fading into white. Inset paints on the pinned column's own background, so
+   it survives a blank neighbour. It is narrow (6px) and light on purpose:
+   its job is to define the edge, not to shade the column. */
+.data-table-wrap.is-cue-right .data-table--pinned-actions tbody td:last-child:not([colspan]),
+.data-table-wrap.is-cue-right .data-table--pinned-actions thead th:last-child {
+    box-shadow:
+        inset 6px 0 6px -6px color-mix(in srgb, var(--ds-text-muted) 26%, transparent),
+        -8px 0 10px -8px color-mix(in srgb, var(--ds-text-primary) 14%, transparent);
+    /* One step above the table's own dividers — enough to read as the edge
+       of a frozen pane, not enough to compete with the header rule. */
+    border-left-color: color-mix(in srgb, var(--ds-text-muted) 42%, transparent);
+}
+
+/* The slide-under band — the pretty half, where there is content to fade.
+   A shadow says "raised", which a reader can take for one more piece of
+   chrome; what says "the table continues beneath this" is seeing the
+   neighbouring column's text DISSOLVE into the pinned column's own
+   background, the way a frozen column reads in a spreadsheet. It is not
+   sufficient on its own — a blank neighbour has nothing to dissolve, which
+   is what the edge above is for — but where there IS text it is the part
+   that reads as designed rather than as an effect.
+
+   It has to be a pseudo-element on the pinned cell rather than a mask on the
+   wrap: a mask would take the button with it (see the note above the
+   `is-cue-*` mask rules). The cell is `position: sticky`, which is a
+   positioned box, so `right: 100%` parks the band immediately to its left
+   and it travels with the pin — down every row, at whatever scroll offset,
+   which is the whole point when the scrollbar is a screen and a half below.
+
+   `--dtw-pin-bg` is set beside each of the three background declarations
+   above, so the band fades to the cell's ACTUAL colour in `thead`, at rest,
+   and under the cursor — a band that guessed would show the guess as a seam
+   the moment anyone hovered a row. */
+.data-table-wrap.is-cue-right .data-table--pinned-actions tbody td:last-child:not([colspan])::before,
+.data-table-wrap.is-cue-right .data-table--pinned-actions thead th:last-child::before {
+    content: "";
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    right: 100%;
+    width: 24px;
+    background: linear-gradient(to left,
+        var(--dtw-pin-bg, var(--ds-surface)),
+        color-mix(in srgb, var(--dtw-pin-bg, var(--ds-surface)) 0%, transparent));
+    /* Decoration only — the cell under it stays clickable. */
+    pointer-events: none;
+}
+
 /* ── A pinned actions column — `.data-table--pinned-actions` ──────────────
    Opt-in, on the TABLE, for the admin tables whose last column is the row's
    own verbs (Sync now · Details · Edit, the `⋯` menu). Those are the one
@@ -5786,19 +5899,28 @@ textarea.form-textarea::placeholder { color: var(--text-muted); }
     top: auto;
     border-left: 1px solid var(--ds-border);
 }
-.data-table--pinned-actions tbody td:last-child:not([colspan]) { background: var(--ds-surface); }
+.data-table--pinned-actions tbody td:last-child:not([colspan]) {
+    background: var(--ds-surface);
+    --dtw-pin-bg: var(--ds-surface);
+}
 /* `--ds-surface-dim`, the token the header band itself uses — NOT
    `--ds-border-light`. The two are the same only in the base `:root`; in
    paper (the default) and in dark they differ, and this rule outranks the
    band's own, so the wrong one shows as an off-tint block at the end of the
    header row. Most visible on /admin/users, where that cell's label is
    screen-reader-only and the tint is all there is to see. */
-.data-table--pinned-actions thead th:last-child { background: var(--ds-surface-dim); }
+.data-table--pinned-actions thead th:last-child {
+    background: var(--ds-surface-dim);
+    --dtw-pin-bg: var(--ds-surface-dim);
+}
 /* The hovered row paints `--ds-surface-dim`, not the `--border-light` the
    rule further up this file declares — measured in the browser, because a
    pinned cell that guesses its neighbour's tint shows the guess as a seam
    down the edge of the column the moment anyone hovers a row. */
-.data-table--pinned-actions tbody tr:hover td:last-child:not([colspan]) { background: var(--ds-surface-dim); }
+.data-table--pinned-actions tbody tr:hover td:last-child:not([colspan]) {
+    background: var(--ds-surface-dim);
+    --dtw-pin-bg: var(--ds-surface-dim);
+}
 
 /* ─── Badges — accent vocabulary ──────────────────────────────────────
    The canonical .badge above gets neutral chrome (chip on
@@ -6247,8 +6369,14 @@ details.section-card > summary {
 .cld-greet[data-tod="day"] .cld-greet-ico--day,
 .cld-greet[data-tod="night"] .cld-greet-ico--night { display: inline-flex; }
 /* The one factual sentence about what this answers. Constrained to a reading
-   measure and centred with the heading above the composer. */
-.cld-lede {
+   measure and centred with the heading above the composer.
+
+   `.cld-agent-intro-role` is the same slot saying something more specific — the
+   agent's own role line, when the conversation runs as one the caller named. It
+   shares the rule rather than the class so a test that reads "the page's lede"
+   by splitting on `class="cld-lede"` cannot land on the agent block instead. */
+.cld-lede,
+.cld-agent-intro-role {
     /* The heading and this lede are one thought. `tight`, because the intro
        column's own flex gap already contributes the other half — the two
        together land on `inner`, which is the step this pair wants. */

@@ -453,7 +453,9 @@ def test_endpoint_only_fact_claims_returns_empty_list_not_404(pg_env, repo):
     _make_group_with_grant(pg_env, group_name="group-liam", collection_id=CORPUS_A, member_user_id="liam")
 
     result = repo.claims(_dict_user("liam"), dst)
-    assert result == {"claims": [], "revealed": False}
+    # `limit_applied` (TCRD-295 cap) is False: nothing was cut, and it is the
+    # caller's own shortfall signal, never a hint at unreadable evidence.
+    assert result == {"claims": [], "revealed": False, "limit_applied": False}
 
 
 def test_endpoint_only_fact_hidden_when_edge_claim_unreadable(pg_env, repo):

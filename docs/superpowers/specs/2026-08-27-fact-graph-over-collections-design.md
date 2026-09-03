@@ -1120,7 +1120,15 @@ content; row numbers drift):
 |---|---|---|
 | `POST /api/facts/search` `{type, filters, limit≤100}` | `agnes facts search` | `fact_search` |
 | `POST /api/facts/neighbors` `{subject_id, edge_types?, depth≤1(max 2), fanout≤100, limit≤500}` | `agnes facts neighbors` | `fact_neighbors` |
-| `GET /api/facts/{subject_id}/claims` | `agnes facts claims` | `fact_claims` |
+| `GET /api/facts/{subject_id}/claims?limit≤200` | `agnes facts claims [--limit]` | `fact_claims` |
+| `POST /api/facts/edges` `{edge_type, src_type?, dst_type?, src_id?, dst_id?, limit≤100, extend_edge_type?, extend_from, include_claims≤3}` (TCRD-295) | `agnes facts edges` | `fact_edges` |
+
+`include_claims≤3` is accepted by `search`, `neighbors` and `edges`
+(TCRD-295): the k newest readable claims per subject/edge, inline, after
+audience dedup, under a per-response budget — the measured reason being that
+the five primitives made every relationship question one `neighbors` per
+root plus one `claims` per citation, and an uncapped `claims` returned 18.5k
+tokens that every later step of a turn re-read.
 
 All filter by caller in the repository (§5); 404 semantics per §5 rule 2;
 results label their origin `[server]` (facts have no local scope — a
@@ -1141,10 +1149,15 @@ derive from these):
  "edges": [{"id", "src", "dst", "type",
             "attrs": {<same projected shape>}}],
  "truncated": {"depth": bool, "fanout": bool, "result": bool}}
-// claims →
+// claims →  (newest first, capped; limit_applied = the caller's OWN shortfall)
 {"claims": [{"id", "corpus_id", "corpus_file_id",
    "document": {"name", "path", "source_url"?},
-   "quote", "attrs", "document_date"}]}
+   "quote", "attrs", "document_date"}], "revealed", "limit_applied"}
+// edges →  (TCRD-295; both endpoints in `nodes`, same subject shape as search)
+{"nodes": [<subject as above>],
+ "edges": [{"id", "src", "dst", "type", "attrs": {<projected>},
+            "claims"?: [<claim as above, quote capped, "quote_truncated"?>]}],
+ "truncated": {"result": bool, "extension": bool, "claims": bool}}
 ```
 
 **The attrs projection runs in SQL, not Python** — a lateral `jsonb_each`
