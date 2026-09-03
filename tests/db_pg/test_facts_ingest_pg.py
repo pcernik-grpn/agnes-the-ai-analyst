@@ -177,6 +177,7 @@ def _seed_second_doc(*, file_id: str, doc_id: str, text: str) -> str:
     _seed_source_mapping(file_id=file_id, source_doc_id=doc_id)
     return doc_id
 
+
 # ---------------------------------------------------------------------------
 # EQ1 — the verbatim gate rejects fabrication, non-zero rejection count.
 # ---------------------------------------------------------------------------
@@ -744,6 +745,94 @@ def test_replaying_the_same_batch_is_a_no_op(pg_env, repo):
     result = repo.search(_admin(), type="engagement")
     assert len(result["subjects"]) == 1
     assert result["subjects"][0]["claim_count"] == 1  # not duplicated
+
+
+# ---------------------------------------------------------------------------
+# Atomicity + edge-endpoint-missing race (pool-starved-replica production
+# finding, 2026-09): a node's fact/alias creation and its own evidence claim
+# now commit or roll back TOGETHER, and an edge whose endpoint fact is
+# genuinely gone by INSERT time (a race with a concurrent pass's own
+# sweep_orphans, or a merge/dedup) is skipped — counted, never crashing the
+# whole batch.
+# ---------------------------------------------------------------------------
+
+
+def test_a_claim_write_failure_rolls_back_the_fact_it_would_have_evidenced(pg_env, repo, monkeypatch):
+    """Before this fix, `create_fact` committed in its OWN transaction — a
+    fact/alias would persist even if the SAME node's claim write failed
+    moments later, leaving a fact with zero claims for a concurrent pass's
+    `sweep_orphans()` to race against (the production FK-violation finding
+    on `edges`). Now the node's fact + its own evidence are one
+    transaction: a failure between them leaves nothing of that node
+    written at all."""
+    doc_id = _seed_ready_doc(pg_env)
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("simulated pool exhaustion mid-claim-write")
+
+    monkeypatch.setattr(repo, "add_claim", _boom)
+
+    with pytest.raises(RuntimeError, match="simulated pool exhaustion"):
+        repo.ingest_batch(nodes=[_node("engagement:acme-rollout", doc_id, "engagement is underway")])
+
+    from src.db_pg import get_engine
+
+    with get_engine().connect() as conn:
+        facts = conn.execute(sa.text("SELECT COUNT(*) FROM facts")).scalar()
+        aliases = conn.execute(sa.text("SELECT COUNT(*) FROM fact_aliases")).scalar()
+        claims = conn.execute(sa.text("SELECT COUNT(*) FROM claims")).scalar()
+    assert (facts, aliases, claims) == (0, 0, 0)
+
+
+def test_edge_whose_endpoint_fact_vanished_before_insert_is_skipped_and_counted(pg_env, repo, monkeypatch):
+    """Live finding: an `edges` INSERT hit `ForeignKeyViolation` when its
+    `src`/`dst` fact — resolved fine moments earlier — was deleted by a
+    concurrent pass before the INSERT ran. `ingest_batch` must skip only
+    that ONE edge (counted via `edges_skipped_missing_endpoint`), never
+    fail the whole batch or the sibling node sharing it."""
+    doc_id = _seed_ready_doc(pg_env)
+    # Pre-existing endpoint, resolved via a FRESH db read in the edge loop
+    # (not this batch's own node_fact_ids cache) — matches the production
+    # shape: the endpoint existed at resolution time.
+    existing_fact_id = repo.create_fact(type="engagement", natural_key="engagement:acme-rollout")
+
+    from src.repositories.facts_pg import FactsPgRepository
+
+    original_create_edge = FactsPgRepository.create_edge
+
+    def _create_edge_after_concurrent_delete(self, **kwargs):
+        # Simulate another concurrent ingest_batch's own sweep_orphans() —
+        # or an admin merge/dedup — deleting the endpoint fact between this
+        # edge's endpoint resolution (above) and its INSERT (below).
+        with self._engine.begin() as conn:
+            conn.execute(sa.text("DELETE FROM facts WHERE id = :id"), {"id": existing_fact_id})
+        return original_create_edge(self, **kwargs)
+
+    monkeypatch.setattr(FactsPgRepository, "create_edge", _create_edge_after_concurrent_delete)
+
+    report = repo.ingest_batch(
+        nodes=[_node("person:jane-doe", doc_id, "engagement is underway")],
+        edges=[
+            {
+                "src": "engagement:acme-rollout",
+                "type": "staffed_by",
+                "dst": "person:jane-doe",
+                "attrs": {},
+                "evidence": [{"doc_id": doc_id, "quote": "engagement is underway"}],
+            }
+        ],
+    )
+
+    assert report["edges_skipped_missing_endpoint"] == 1
+    # The sibling node's own claim is unaffected by the edge's race.
+    assert report["claims_written"] == 1
+    assert report["claims_rejected"] == []
+
+    from src.db_pg import get_engine
+
+    with get_engine().connect() as conn:
+        edge_count = conn.execute(sa.text("SELECT COUNT(*) FROM edges WHERE type = 'staffed_by'")).scalar()
+    assert edge_count == 0
 
 
 # ---------------------------------------------------------------------------
@@ -2653,9 +2742,7 @@ def test_the_document_is_rebuilt_once_per_file_not_once_per_failed_quote(pg_env,
             _CountingSeparator.calls += 1
             return str.join(self, parts)
 
-    monkeypatch.setattr(
-        facts_pg, "CHUNK_JOIN_SEPARATOR", _CountingSeparator(facts_pg.CHUNK_JOIN_SEPARATOR)
-    )
+    monkeypatch.setattr(facts_pg, "CHUNK_JOIN_SEPARATOR", _CountingSeparator(facts_pg.CHUNK_JOIN_SEPARATOR))
 
     file_id = "cf_joinonce"
     doc_id = "doc_joinonce"
@@ -2673,9 +2760,7 @@ def test_the_document_is_rebuilt_once_per_file_not_once_per_failed_quote(pg_env,
                 "id": f"engagement:joinonce{i}",
                 "type": "engagement",
                 "attrs": {},
-                "evidence": [
-                    {"doc_id": doc_id, "quote": "began in March\n\nand concluded successfully"}
-                ],
+                "evidence": [{"doc_id": doc_id, "quote": "began in March\n\nand concluded successfully"}],
             }
             for i in range(5)
         ]
@@ -2702,9 +2787,7 @@ def test_an_automatic_candidate_survives_the_ingest_that_minted_it(pg_env, repo)
     doc_a = _seed_ready_doc(pg_env, text="Norwood Farms signed in March.", file_id="cf_dupa", doc_id="doc_dupa")
     repo.ingest_batch(nodes=[_node("engagement:norwood-farms", doc_a, "Norwood Farms signed in March.")])
 
-    doc_b = _seed_second_doc(
-        text="Norwood Farms Group signed in April.", file_id="cf_dupb", doc_id="doc_dupb"
-    )
+    doc_b = _seed_second_doc(text="Norwood Farms Group signed in April.", file_id="cf_dupb", doc_id="doc_dupb")
     report = repo.ingest_batch(
         nodes=[_node("engagement:norwood-farms-group", doc_b, "Norwood Farms Group signed in April.")]
     )
@@ -2718,8 +2801,7 @@ def test_an_automatic_candidate_survives_the_ingest_that_minted_it(pg_env, repo)
             sa.text("SELECT count(*) FROM edges WHERE type = 'possible_duplicate_of'")
         ).scalar_one()
     assert surviving == 1, (
-        "the candidate must outlive the ingest that proposed it — a claimless "
-        "proposal is not an orphan"
+        "the candidate must outlive the ingest that proposed it — a claimless proposal is not an orphan"
     )
 
 
@@ -2738,12 +2820,8 @@ def test_a_candidate_does_not_keep_an_unevidenced_fact_alive(pg_env, repo):
 
     doc_a = _seed_ready_doc(pg_env, text="Norwood Farms signed in March.", file_id="cf_dupc", doc_id="doc_dupc")
     repo.ingest_batch(nodes=[_node("engagement:norwood-farms", doc_a, "Norwood Farms signed in March.")])
-    doc_b = _seed_second_doc(
-        text="Norwood Farms Group signed in April.", file_id="cf_dupd", doc_id="doc_dupd"
-    )
-    repo.ingest_batch(
-        nodes=[_node("engagement:norwood-farms-group", doc_b, "Norwood Farms Group signed in April.")]
-    )
+    doc_b = _seed_second_doc(text="Norwood Farms Group signed in April.", file_id="cf_dupd", doc_id="doc_dupd")
+    repo.ingest_batch(nodes=[_node("engagement:norwood-farms-group", doc_b, "Norwood Farms Group signed in April.")])
 
     # Every claim gone — both facts are now unevidenced, and the only thing
     # touching them is the proposal.

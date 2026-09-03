@@ -99,6 +99,7 @@ def test_get_round_trips_every_field(pg_engine, monkeypatch):
     assert row["subjects_created"] == 1
     assert row["subjects_deleted"] == 0
     assert row["review_items"] == []
+    assert row["edges_skipped_missing_endpoint"] == 0
     assert row["created_at"] is not None
 
 
@@ -131,6 +132,26 @@ def test_source_urls_rejected_round_trips(pg_engine, monkeypatch):
 
     listed = repo.list_recent(limit=10)
     assert listed[0]["source_urls_rejected"] == rejected
+
+
+def test_edges_skipped_missing_endpoint_defaults_to_zero(pg_engine, monkeypatch):
+    """A run whose edges all resolved cleanly (the normal case) omits the
+    field entirely — the stored column must still round-trip as `0`, never
+    `NULL`, same never-NULL contract as every other count on this table."""
+    repo = _make_repo(pg_engine, monkeypatch)
+    run_id = _create(repo)
+    row = repo.get(run_id)
+    assert row["edges_skipped_missing_endpoint"] == 0
+
+
+def test_edges_skipped_missing_endpoint_round_trips(pg_engine, monkeypatch):
+    repo = _make_repo(pg_engine, monkeypatch)
+    run_id = _create(repo, edges_skipped_missing_endpoint=3)
+    row = repo.get(run_id)
+    assert row["edges_skipped_missing_endpoint"] == 3
+
+    listed = repo.list_recent(limit=10)
+    assert listed[0]["edges_skipped_missing_endpoint"] == 3
 
 
 def test_claims_rejected_count_is_derived_from_the_detail_list(pg_engine, monkeypatch):

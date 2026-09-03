@@ -1720,6 +1720,12 @@ class _Report:
         self.edges_emitted = 0
         self.claims_written = 0
         self.claims_rejected = 0
+        #: Edges the ingest chokepoint skipped because their src/dst fact
+        #: was gone by the time it tried to write them — a race between
+        #: concurrent facts-extraction passes sharing one fact graph
+        #: (`EdgeEndpointMissing` in `src/repositories/facts_pg.py`), never
+        #: a fault in what THIS pass produced.
+        self.edges_skipped_missing_endpoint = 0
         self.ingest_batches = 0
         self.ingest_failures: List[Dict[str, Any]] = []
         self.interrupted = False
@@ -1829,6 +1835,7 @@ class _Report:
             "edges_emitted": self.edges_emitted,
             "claims_written": self.claims_written,
             "claims_rejected": self.claims_rejected,
+            "edges_skipped_missing_endpoint": self.edges_skipped_missing_endpoint,
             "ingest_batches": self.ingest_batches,
             "ingest_failures": self.ingest_failures,
             "docs_via_batch": self.docs_via_batch,
@@ -1958,6 +1965,7 @@ class _BatchShipper:
         self._report.ingest_batches += 1
         self._report.claims_written += int(result.get("claims_written") or 0)
         self._report.claims_rejected += len(result.get("claims_rejected") or [])
+        self._report.edges_skipped_missing_endpoint += int(result.get("edges_skipped_missing_endpoint") or 0)
         self._reset()
 
     def _reset(self) -> None:

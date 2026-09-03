@@ -570,13 +570,22 @@ def facts_ingest(body: FactsIngestRequest, user=Depends(require_admin)) -> Dict[
     claims_accepted_via_identity, claims_rejected: [{row, reason}],
     source_urls_rejected: [{doc_id, reason}], deferred: [...],
     subjects_created, subjects_deleted, corrections_active: [...],
-    review_items: [...]}``.
+    review_items: [...], edges_skipped_missing_endpoint}``.
 
     ``claims_accepted_via_identity`` (spec §8) is the subset of
     ``claims_written`` whose quote passed the verbatim gate ONLY via the
     document's own SERVER-STORED ``filename``/``path`` — never a chunk of
     its extracted text — so an operator can see how much evidence is
     filename-grounded rather than content-grounded.
+
+    ``edges_skipped_missing_endpoint`` counts an edge whose ``src``/``dst``
+    fact resolved fine but no longer existed by the time
+    :meth:`FactsPgRepository.create_edge`'s INSERT ran — a race between
+    concurrent facts-extraction passes sharing one fact graph (a
+    not-yet-evidenced fact swept as orphan by another in-flight call, or two
+    passes merging/deduplicating the same entity), never a producer mistake.
+    That one edge is skipped, never the whole batch; see
+    ``EdgeEndpointMissing`` in ``src/repositories/facts_pg.py``.
 
     ``source_urls_rejected`` (O7 follow-up) is a document's ``source_url``
     the validator dropped as invalid (``too_long`` / ``unparseable`` /
@@ -687,6 +696,7 @@ def facts_ingest(body: FactsIngestRequest, user=Depends(require_admin)) -> Dict[
             review_items=report.get("review_items", []),
             anonymization=body.anonymization.model_dump() if body.anonymization else None,
             llm_usage=body.llm_usage.model_dump(exclude_none=True) if body.llm_usage else None,
+            edges_skipped_missing_endpoint=report.get("edges_skipped_missing_endpoint", 0),
         )
     except Exception:  # noqa: BLE001 — never let a report-write failure look like an ingest failure
         logger.warning("facts.ingest: failed to persist the run report (ingest itself succeeded)", exc_info=True)

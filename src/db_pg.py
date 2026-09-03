@@ -84,23 +84,151 @@ def _resolve_url() -> str:
     )
 
 
+#: Conservative defaults matching Cloud SQL's per-instance connection caps —
+#: unchanged from before these env vars existed, so a deployment that never
+#: sets any of them is byte-for-byte unaffected.
+_DEFAULT_POOL_SIZE = 5
+_DEFAULT_MAX_OVERFLOW = 10
+_DEFAULT_POOL_TIMEOUT_S = 30
+
+_POOL_SIZE_ENV = "AGNES_PG_POOL_SIZE"
+_MAX_OVERFLOW_ENV = "AGNES_PG_MAX_OVERFLOW"
+_POOL_TIMEOUT_ENV = "AGNES_PG_POOL_TIMEOUT_S"
+
+#: Ceiling for the extraction-worker-role pool_size DEFAULT computed below —
+#: not a hard cap on `AGNES_PG_POOL_SIZE` itself, which an operator may set
+#: explicitly to any value. Matches the sane-ceiling posture of the other
+#: per-lane concurrency caps this repo already ships
+#: (`connectors/sharepoint/facts_extraction.py::MAX_CONCURRENCY`,
+#: `app/worker/runtime.py::_MAX_EXTRACTION_CONCURRENCY`).
+_EXTRACTION_ROLE_POOL_SIZE_CAP = 64
+
+
+def _int_env(name: str, default: int) -> int:
+    """``int(os.environ[name])``, or ``default`` when unset/unparseable —
+    never raises on a typo'd env value."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _clamped_int(raw: object, *, default: int, lo: int, hi: int) -> int:
+    try:
+        value = int(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+    return max(lo, min(value, hi))
+
+
+def _extraction_worker_pool_size_hint() -> Optional[int]:
+    """Best-effort ``extraction.concurrency + extraction.facts.concurrency``
+    sizing hint for the pool_size DEFAULT on a process running the
+    ``extraction`` worker lane. Returns ``None`` when this process is not
+    running that lane (every other role/process — api, gateway, a
+    single-process all-in-one deployment — is unaffected and keeps
+    :data:`_DEFAULT_POOL_SIZE`) or when nothing can be resolved.
+
+    Live finding (2026-09): an extraction-worker replica running 2
+    concurrent facts-extraction passes (32 threads each) alongside 4
+    SharePoint crawls, all sharing ONE engine, exhausted the default
+    5+10-connection pool 30 times in 10 minutes — 44 documents failed
+    facts ingest with ``TimeoutError``, and 27 facts-LLM-cache lookups
+    fell through to a paid model call the cache should have answered. A
+    corpus-extraction slot and a facts-extraction pass each hold a
+    connection for their whole run, not per-statement, so the
+    conservative default (sized for short-lived request-scoped
+    connections) starves under this shape of load.
+
+    Reads the SAME knobs ``app/worker/runtime.py::_extraction_concurrency``
+    and ``connectors/sharepoint/facts_extraction.py::resolve_concurrency``
+    read (``AGNES_EXTRACTION_CONCURRENCY``/``extraction.concurrency``,
+    ``extraction.facts.concurrency``) directly, rather than importing those
+    modules: ``src/db_pg.py`` is imported by nearly every process at
+    startup, often before the worker/connector layers are safe to import,
+    so this stays self-contained and simply falls back to the
+    conservative default on any resolution failure — it never raises and
+    never blocks engine creation."""
+    lanes = {t.strip() for t in os.environ.get("AGNES_WORKER_LANES", "").split(",") if t.strip()}
+    if "extraction" not in lanes:
+        return None
+
+    try:
+        from app.instance_config import get_value
+    except Exception:
+        return None
+
+    extraction_raw = os.environ.get("AGNES_EXTRACTION_CONCURRENCY")
+    if extraction_raw is None:
+        try:
+            extraction_raw = get_value("extraction", "concurrency", default=1)
+        except Exception:
+            extraction_raw = 1
+    extraction_n = _clamped_int(extraction_raw, default=1, lo=1, hi=24)
+
+    try:
+        facts_raw = get_value("extraction", "facts", "concurrency", default=3)
+    except Exception:
+        facts_raw = 3
+    facts_n = _clamped_int(facts_raw, default=3, lo=1, hi=64)
+
+    return min(extraction_n + facts_n, _EXTRACTION_ROLE_POOL_SIZE_CAP)
+
+
+def _resolve_pool_settings() -> tuple[int, int, int]:
+    """``(pool_size, max_overflow, pool_timeout_s)`` for ``create_engine``.
+
+    ``AGNES_PG_POOL_SIZE`` / ``AGNES_PG_MAX_OVERFLOW`` /
+    ``AGNES_PG_POOL_TIMEOUT_S`` override the conservative defaults (5 / 10 /
+    30s, unchanged) outright when set. When ``AGNES_PG_POOL_SIZE`` is UNSET
+    and this process is running the ``extraction`` worker lane
+    (``AGNES_WORKER_LANES`` — see ``app/worker/runtime.py``), ``pool_size``
+    instead defaults to that lane's own sizing hint (see
+    :func:`_extraction_worker_pool_size_hint`) — every other process keeps
+    the plain default."""
+    pool_size_raw = os.environ.get(_POOL_SIZE_ENV)
+    if pool_size_raw is not None:
+        pool_size = _int_env(_POOL_SIZE_ENV, _DEFAULT_POOL_SIZE)
+    else:
+        pool_size = _extraction_worker_pool_size_hint() or _DEFAULT_POOL_SIZE
+    max_overflow = _int_env(_MAX_OVERFLOW_ENV, _DEFAULT_MAX_OVERFLOW)
+    pool_timeout = _int_env(_POOL_TIMEOUT_ENV, _DEFAULT_POOL_TIMEOUT_S)
+    return pool_size, max_overflow, pool_timeout
+
+
 def get_engine() -> sa.Engine:
     """Return the process-wide Engine, creating it on first call.
 
-    Connection pool tuning is conservative (5 + overflow 10) to match
-    Cloud SQL's per-instance connection caps. Repository code holding
-    sessions for long stretches should chunk work and release.
+    Connection pool sizing is ``AGNES_PG_POOL_SIZE`` / ``AGNES_PG_MAX_OVERFLOW``
+    / ``AGNES_PG_POOL_TIMEOUT_S`` (defaults 5 / 10 / 30s, unchanged — see
+    :func:`_resolve_pool_settings`), conservative to match Cloud SQL's
+    per-instance connection caps by default, sized larger automatically on
+    an extraction-worker process. Repository code holding sessions for long
+    stretches should still chunk work and release.
     """
+    import logging
+
     global _engine, _session_factory
     with _lock:
         if _engine is None:
             url = _resolve_url()
+            pool_size, max_overflow, pool_timeout = _resolve_pool_settings()
             _engine = sa.create_engine(
                 url,
                 future=True,
-                pool_size=5,
-                max_overflow=10,
+                pool_size=pool_size,
+                max_overflow=max_overflow,
+                pool_timeout=pool_timeout,
                 pool_pre_ping=True,
+            )
+            logging.getLogger(__name__).info(
+                "src.db_pg: Postgres engine created (pool_size=%d, max_overflow=%d, pool_timeout=%ds)",
+                pool_size,
+                max_overflow,
+                pool_timeout,
             )
             _session_factory = sessionmaker(bind=_engine, future=True, expire_on_commit=False)
             # Attach the dev debug-toolbar query capture (idempotent; a no-op on

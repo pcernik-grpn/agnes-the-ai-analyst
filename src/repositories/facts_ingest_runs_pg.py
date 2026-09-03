@@ -142,6 +142,7 @@ class FactsIngestRunsPgRepository:
         anonymization: Optional[Dict[str, Any]] = None,
         source_urls_rejected: Optional[List[Dict[str, Any]]] = None,
         llm_usage: Optional[Dict[str, Any]] = None,
+        edges_skipped_missing_endpoint: int = 0,
     ) -> str:
         """Persist one ingest batch's run report. Returns the generated id.
 
@@ -174,6 +175,14 @@ class FactsIngestRunsPgRepository:
         as "unknown", never a fabricated zero. Never part of the ingest
         fingerprint/idempotency logic — purely descriptive metadata about
         the run that produced this batch.
+
+        ``edges_skipped_missing_endpoint`` is ``ingest_batch``'s count of
+        edges NOT written because their ``src``/``dst`` fact was gone by the
+        time the INSERT ran (see ``EdgeEndpointMissing``) — a race between
+        concurrent facts-extraction passes sharing one fact graph, never a
+        producer mistake, so (unlike ``claims_rejected``) there is no
+        itemized detail list here. Defaults to ``0``, same never-``NULL``
+        contract as every other count on this table.
         """
         run_id = "ir_" + secrets.token_hex(8)
         source_urls_rejected = source_urls_rejected or []
@@ -184,11 +193,13 @@ class FactsIngestRunsPgRepository:
                     "(id, corpus_ids, caller, documents_seen, claims_written, "
                     " claims_rejected_count, claims_rejected, "
                     " source_urls_rejected_count, source_urls_rejected, deferred, "
-                    " subjects_created, subjects_deleted, review_items, anonymization, llm_usage) "
+                    " subjects_created, subjects_deleted, review_items, anonymization, llm_usage, "
+                    " edges_skipped_missing_endpoint) "
                     "VALUES (:id, :corpus_ids, :caller, :documents_seen, :claims_written, "
                     "        :claims_rejected_count, :claims_rejected, "
                     "        :source_urls_rejected_count, :source_urls_rejected, :deferred, "
-                    "        :subjects_created, :subjects_deleted, :review_items, :anonymization, :llm_usage)"
+                    "        :subjects_created, :subjects_deleted, :review_items, :anonymization, :llm_usage, "
+                    "        :edges_skipped_missing_endpoint)"
                 ),
                 {
                     "id": run_id,
@@ -206,6 +217,7 @@ class FactsIngestRunsPgRepository:
                     "review_items": json.dumps(review_items),
                     "anonymization": json.dumps(anonymization or {}),
                     "llm_usage": json.dumps(llm_usage) if llm_usage is not None else None,
+                    "edges_skipped_missing_endpoint": edges_skipped_missing_endpoint,
                 },
             )
         return run_id

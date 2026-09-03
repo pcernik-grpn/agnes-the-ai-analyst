@@ -160,13 +160,31 @@ docker run --rm -e DATABASE_URL=... ghcr.io/keboola/agnes-the-ai-analyst:${IMAGE
 
 ### Connection-pool tuning
 
-`src/db_pg.py` defaults to `pool_size=5, max_overflow=10` — i.e. up to
-15 concurrent connections per app process. Cloud SQL's per-instance
+`src/db_pg.py` defaults to `pool_size=5, max_overflow=10, pool_timeout=30s`
+— i.e. up to 15 concurrent connections per app process, each request
+waiting up to 30s for one before failing. Cloud SQL's per-instance
 connection cap (default 100, configurable up to thousands depending on
 tier) is the binding constraint. For a 3-VM MIG running 1 uvicorn
 worker each, 3 × 15 = 45 connections — comfortably inside the default
 cap. Scale `pool_size` proportionally if you increase uvicorn workers
 per VM.
+
+Override with `AGNES_PG_POOL_SIZE` / `AGNES_PG_MAX_OVERFLOW` /
+`AGNES_PG_POOL_TIMEOUT_S` (env vars, see `config/.env.template`) — the
+defaults above are unchanged unless set. A process running the
+`extraction` worker lane (`AGNES_WORKER_LANES=extraction`, see
+`app/worker/runtime.py` and the `extraction-worker` compose service)
+sizes `pool_size` automatically when `AGNES_PG_POOL_SIZE` is unset:
+`extraction.concurrency + extraction.facts.concurrency`, capped at 64 —
+a corpus-extraction slot and a facts-extraction pass each hold a
+connection for their whole run, not per-statement, so the plain
+request-scoped default of 5 starves under concurrent crawls + facts
+passes (live finding, 2026-09: the pool exhausted 30×/10min under 2
+facts passes + 4 crawls sharing one engine, failing 44 documents'
+ingest with `TimeoutError` and forcing 27 facts-LLM-cache lookups to
+fall through to a paid model call). Every other role/process is
+unaffected. The resolved pool settings are logged once, at engine
+creation.
 
 ## Running migrations
 

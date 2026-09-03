@@ -213,3 +213,10 @@ class IngestRun(Base):
     #: a fabricated `{}`/zero — see
     #: ``migrations/versions/0088_ingest_runs_llm_usage.py``.
     llm_usage: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    #: Edges `ingest_batch` skipped because their `src`/`dst` fact was gone
+    #: by the time the edge INSERT ran — a race with a concurrent pass's
+    #: own `sweep_orphans()` or a merge/dedup, never a producer mistake
+    #: (`EdgeEndpointMissing` in `src/repositories/facts_pg.py`). No
+    #: itemized detail list, unlike `claims_rejected` — see
+    #: ``migrations/versions/0099_ingest_runs_edges_skipped.py``.
+    edges_skipped_missing_endpoint: Mapped[int] = mapped_column(sa.Integer, server_default="0", nullable=False)

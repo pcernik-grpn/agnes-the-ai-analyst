@@ -42,18 +42,22 @@ edges, not the reverse.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
+import logging
 import re
 import secrets
 from datetime import date, datetime
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 from urllib.parse import urlsplit
 
 import sqlalchemy as sa
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Connection, Engine
 
 from src.ingest.member_identity import is_reserved_member_stable_id
+
+logger = logging.getLogger(__name__)
 
 
 # Query-surface caps (spec §12) — the repository enforces these itself
@@ -174,6 +178,29 @@ class IngestReservedStableId(RuntimeError):
     def __init__(self, stable_ids: List[str]) -> None:
         self.stable_ids = stable_ids
         super().__init__(f"reserved stable_ids in documents[]: {stable_ids}")
+
+
+class EdgeEndpointMissing(RuntimeError):
+    """:meth:`FactsPgRepository.create_edge` was rejected by Postgres's
+    foreign-key constraint on ``edges.src``/``edges.dst`` (SQLSTATE
+    ``23503``, foreign_key_violation) — the endpoint fact resolved fine
+    moments earlier but no longer exists in ``facts`` by the time this
+    INSERT ran. Two live triggers observed in production (2026-09): a
+    concurrent ``ingest_batch`` call's own end-of-call ``sweep_orphans()``
+    garbage-collecting a just-created, not-yet-evidenced fact before this
+    call's edge could anchor it, and two facts-extraction passes racing to
+    merge/deduplicate the same entity. Neither is a caller bug — it is
+    inherent to several passes writing into one shared fact graph
+    concurrently — so :meth:`FactsPgRepository.ingest_batch`'s edge loop
+    catches this, counts it (``edges_skipped_missing_endpoint`` in the
+    ingest report) and skips only the one affected edge rather than
+    failing the whole batch."""
+
+    def __init__(self, *, src: str, type: str, dst: str) -> None:
+        self.src = src
+        self.type = type
+        self.dst = dst
+        super().__init__(f"edge endpoint missing: {src} -[{type}]-> {dst}")
 
 
 def _decode_jsonb(value: Any) -> Any:
@@ -542,23 +569,57 @@ class FactsPgRepository:
     def __init__(self, engine: Engine) -> None:
         self._engine = engine
 
+    @contextlib.contextmanager
+    def _write_conn(self, conn: Optional[Connection] = None) -> Iterator[Connection]:
+        """Yield a connection for one or more write statements.
+
+        When ``conn`` is given, the caller already owns an open transaction
+        (typically ``self._engine.begin()`` in ``ingest_batch``) — yield it
+        as-is and leave commit/rollback entirely to the caller, so several
+        of the write helpers below (``create_fact``, ``add_alias_source``,
+        ``create_edge``, ``add_claim``) can be composed into ONE atomic
+        transaction instead of each opening its own. When omitted (every
+        caller outside ``ingest_batch``, and ``ingest_batch`` itself before
+        this atomicity fix), open-and-commit a fresh single-statement
+        transaction exactly as each of these methods always did — an
+        unspecified ``conn`` leaves this method's behavior byte-for-byte
+        unchanged."""
+        if conn is not None:
+            yield conn
+            return
+        with self._engine.begin() as new_conn:
+            yield new_conn
+
     # ------------------------------------------------------------------
     # internal write/seed methods — minimal and obviously correct; the
     # ingest task (build order step 4) builds the real write-path protocol
     # (verbatim gate, union/replace modes, run report) on top of these.
     # ------------------------------------------------------------------
 
-    def create_fact(self, *, type: str, natural_key: Optional[str] = None, corpus_id: Optional[str] = None) -> str:
+    def create_fact(
+        self,
+        *,
+        type: str,
+        natural_key: Optional[str] = None,
+        corpus_id: Optional[str] = None,
+        conn: Optional[Connection] = None,
+    ) -> str:
         """``corpus_id`` is OPTIONAL provenance for the inline alias
         (security hardening, see :meth:`add_alias_source`): the corpus whose
         evidence justifies showing ``natural_key`` to a caller who cannot
         read every corpus this fact ends up carrying claims from. Ignored
-        when ``natural_key`` is absent."""
+        when ``natural_key`` is absent.
+
+        ``conn`` — see :meth:`_write_conn`: pass an already-open transaction
+        to fold this fact's creation into a larger atomic write (e.g.
+        ``ingest_batch``'s per-node transaction, which also writes that
+        node's own evidence); omit it for the pre-existing
+        one-fact-one-transaction behavior."""
         fact_id = "f_" + secrets.token_hex(8)
-        with self._engine.begin() as conn:
-            conn.execute(sa.text("INSERT INTO facts (id, type) VALUES (:id, :type)"), {"id": fact_id, "type": type})
+        with self._write_conn(conn) as c:
+            c.execute(sa.text("INSERT INTO facts (id, type) VALUES (:id, :type)"), {"id": fact_id, "type": type})
             if natural_key:
-                conn.execute(
+                c.execute(
                     sa.text(
                         "INSERT INTO fact_aliases (fact_id, type, natural_key) VALUES (:fid, :type, :nk) "
                         "ON CONFLICT (type, natural_key) DO UPDATE SET fact_id = EXCLUDED.fact_id"
@@ -566,7 +627,7 @@ class FactsPgRepository:
                     {"fid": fact_id, "type": type, "nk": natural_key},
                 )
                 if corpus_id:
-                    conn.execute(
+                    c.execute(
                         sa.text(
                             "INSERT INTO fact_alias_sources (type, natural_key, corpus_id) "
                             "VALUES (:type, :nk, :corpus_id) ON CONFLICT DO NOTHING"
@@ -598,7 +659,9 @@ class FactsPgRepository:
                     {"type": type, "nk": natural_key, "corpus_id": corpus_id},
                 )
 
-    def add_alias_source(self, *, type: str, natural_key: str, corpus_id: str) -> None:
+    def add_alias_source(
+        self, *, type: str, natural_key: str, corpus_id: str, conn: Optional[Connection] = None
+    ) -> None:
         """Record that ``corpus_id``'s evidence contributed to minting/
         reinforcing the alias ``(type, natural_key)`` (security hardening —
         module docstring's alias-visibility rule, spec §5 extended to
@@ -608,9 +671,14 @@ class FactsPgRepository:
         node-id contract) — it never shrinks except via cascade when the
         alias itself is deleted (fact orphaned, see ``sweep_orphans``).
         A no-op if the alias row doesn't exist yet — callers that mint the
-        alias mid-ingest (:meth:`_resolve_alias`) always create it first."""
-        with self._engine.begin() as conn:
-            conn.execute(
+        alias mid-ingest (:meth:`_resolve_alias`) always create it first.
+
+        ``conn`` — see :meth:`_write_conn`: pass an already-open transaction
+        to fold this write into a larger atomic unit (``ingest_batch``'s
+        per-node/per-edge transaction); omit it for the pre-existing
+        own-transaction behavior."""
+        with self._write_conn(conn) as c:
+            c.execute(
                 sa.text(
                     "INSERT INTO fact_alias_sources (type, natural_key, corpus_id) "
                     "SELECT CAST(:type AS TEXT), CAST(:nk AS TEXT), CAST(:corpus_id AS TEXT) WHERE EXISTS ("
@@ -620,18 +688,35 @@ class FactsPgRepository:
                 {"type": type, "nk": natural_key, "corpus_id": corpus_id},
             )
 
-    def create_edge(self, *, src: str, type: str, dst: str) -> str:
+    def create_edge(self, *, src: str, type: str, dst: str, conn: Optional[Connection] = None) -> str:
+        """``conn`` — see :meth:`_write_conn`: pass an already-open
+        transaction to fold this edge's creation into a larger atomic
+        write (``ingest_batch``'s per-edge transaction, which also writes
+        the edge's own evidence); omit it for the pre-existing
+        one-edge-one-transaction behavior.
+
+        Raises :class:`EdgeEndpointMissing` when Postgres rejects the
+        INSERT on the ``src``/``dst`` foreign key (SQLSTATE ``23503``,
+        foreign_key_violation) — see that exception's docstring for why
+        this happens and how ``ingest_batch`` handles it. Any OTHER
+        integrity error re-raises unchanged; this only narrows the one
+        known, expected race."""
         edge_id = "e_" + secrets.token_hex(8)
-        with self._engine.begin() as conn:
-            conn.execute(
-                sa.text(
-                    "INSERT INTO edges (id, src, type, dst) VALUES (:id, :src, :type, :dst) "
-                    "ON CONFLICT (src, type, dst) DO NOTHING"
-                ),
-                {"id": edge_id, "src": src, "type": type, "dst": dst},
-            )
+        with self._write_conn(conn) as c:
+            try:
+                c.execute(
+                    sa.text(
+                        "INSERT INTO edges (id, src, type, dst) VALUES (:id, :src, :type, :dst) "
+                        "ON CONFLICT (src, type, dst) DO NOTHING"
+                    ),
+                    {"id": edge_id, "src": src, "type": type, "dst": dst},
+                )
+            except sa.exc.IntegrityError as exc:
+                if getattr(exc.orig, "sqlstate", None) == "23503":
+                    raise EdgeEndpointMissing(src=src, type=type, dst=dst) from exc
+                raise
             row = (
-                conn.execute(
+                c.execute(
                     sa.text("SELECT id FROM edges WHERE src = :src AND type = :type AND dst = :dst"),
                     {"src": src, "type": type, "dst": dst},
                 )
@@ -653,6 +738,7 @@ class FactsPgRepository:
         attrs: Optional[dict] = None,
         document_date: Optional[date] = None,
         audience: Optional[str] = None,
+        conn: Optional[Connection] = None,
     ) -> Optional[str]:
         """Insert a claim; ``ON CONFLICT ... DO NOTHING`` on the (subject,
         corpus_file_id, quote_hash) functional unique index makes a replay
@@ -661,6 +747,12 @@ class FactsPgRepository:
         ingest write path (build order step 4) uses that to count
         ``claims_written`` accurately across a replayed batch; no other
         caller (read-path fixtures) inspects the return value.
+
+        ``conn`` — see :meth:`_write_conn`: pass an already-open
+        transaction to fold this claim into a larger atomic write
+        (``ingest_batch``'s per-node/per-edge transaction, alongside the
+        fact/edge it evidences); omit it for the pre-existing
+        one-claim-one-transaction behavior.
 
         ``audience`` (Task 10, spec §4.2) is an optional index-time variant
         tag — ``None`` (the default) stays unrestricted-within-collection,
@@ -708,8 +800,8 @@ class FactsPgRepository:
             columns += ", audience"
             placeholders += ", :audience"
             params["audience"] = audience
-        with self._engine.begin() as conn:
-            result = conn.execute(
+        with self._write_conn(conn) as c:
+            result = c.execute(
                 sa.text(
                     f"INSERT INTO claims ({columns}) VALUES ({placeholders}) "
                     "ON CONFLICT (COALESCE(fact_id, edge_id), corpus_file_id, quote_hash) DO NOTHING"
@@ -763,9 +855,7 @@ class FactsPgRepository:
         """
         with self._engine.begin() as conn:
             result = conn.execute(
-                sa.text(
-                    "UPDATE claims SET corpus_id = :target WHERE corpus_file_id = :file_id"
-                ),
+                sa.text("UPDATE claims SET corpus_id = :target WHERE corpus_file_id = :file_id"),
                 {"target": target_corpus_id, "file_id": corpus_file_id},
             )
         return int(result.rowcount or 0)
@@ -2987,11 +3077,14 @@ class FactsPgRepository:
                 "reattached": None,
             }
 
-        fact_id = self.create_fact(type=resolved_type, natural_key=node_id)
-        with self._engine.begin() as reconn:
-            reattached = self._reattach_correction(
-                reconn, subject_kind="fact", subject_id=fact_id, natural_key_probe=node_id
-            )
+        # `conn` is threaded through to `create_fact`/`_reattach_correction`
+        # (rather than each opening its own transaction) so a NEWLY-minted
+        # fact is never visible to a concurrent call's `sweep_orphans()` in
+        # a zero-claims, zero-alias state — see `ingest_batch`'s per-node/
+        # per-edge transaction and `EdgeEndpointMissing`'s docstring for the
+        # race this closes.
+        fact_id = self.create_fact(type=resolved_type, natural_key=node_id, conn=conn)
+        reattached = self._reattach_correction(conn, subject_kind="fact", subject_id=fact_id, natural_key_probe=node_id)
         return {"fact_id": fact_id, "type": resolved_type, "created": True, "error": None, "reattached": reattached}
 
     # ------------------------------------------------------------------
@@ -3415,6 +3508,12 @@ class FactsPgRepository:
         corrections_active: List[Dict[str, Any]] = []
         touched_fact_ids: set = set()
         touched_edge_pairs: set = set()
+        # Edges skipped because `create_edge` hit `EdgeEndpointMissing` — an
+        # endpoint fact resolved fine but was gone by the time the edge
+        # INSERT ran (see that exception's docstring). Counted, never
+        # raised: the race is inherent to concurrent passes sharing one
+        # fact graph, not a caller bug.
+        edges_skipped_missing_endpoint = 0
         single_valued_types = _single_valued_edge_types()
         # (node_id, fact_id, type) for every fact THIS batch newly minted —
         # fed to `_propose_duplicate_candidates` once the node loop below
@@ -3429,6 +3528,7 @@ class FactsPgRepository:
             subject_id: str,
             evidence: List[Dict[str, Any]],
             row_ref: str,
+            conn: Connection,
             row_attrs: Optional[Dict[str, Any]] = None,
             alias_targets: Optional[List[Tuple[str, str]]] = None,
         ) -> None:
@@ -3449,139 +3549,143 @@ class FactsPgRepository:
             `works_in_industry`/`sponsored_by`/`staffed_by`-style ontology
             shape) still gets its alias's provenance from the edge that
             names it, never staying permanently admin-only. The edge
-            itself carries no alias of its own (edges have none)."""
+            itself carries no alias of its own (edges have none).
+
+            ``conn`` is the CALLER's already-open transaction (the node's or
+            edge's own — see the node/edge loops below), not one this
+            function opens itself: the subject's evidence must commit or
+            roll back atomically WITH the fact/edge row it evidences, so a
+            fact is never visible to a concurrent call's `sweep_orphans()`
+            with zero claims when it in fact has some pending in this same
+            batch (`EdgeEndpointMissing`'s docstring)."""
             nonlocal claims_written, claims_accepted_via_identity
-            with self._engine.connect() as conn:
-                for ev_idx, ev in enumerate(evidence):
-                    doc_id = ev.get("doc_id")
-                    quote = ev.get("quote") or ""
-                    item_ref = f"{row_ref}.evidence[{ev_idx}]"
-                    if not quote:
-                        claims_rejected.append({"row": item_ref, "reason": "empty_quote", "doc_id": doc_id})
-                        continue
-                    if not _is_meaningful_quote(quote):
-                        # Applied BEFORE either half of the gate below, so a
-                        # degenerate quote (a bare file-extension fragment, a
-                        # lone separator) cannot fall through the content
-                        # check and be self-certified by the identity
-                        # haystack instead — one check closes the hole on
-                        # both paths. Distinct reason from
-                        # `verbatim_gate_failed`: the quote WAS present
-                        # verbatim (or would be, trivially), it just isn't
-                        # evidence of anything — a different failure an
-                        # operator should be able to tell apart (a producer
-                        # citing junk vs. a producer citing text absent from
-                        # the document).
-                        claims_rejected.append({"row": item_ref, "reason": "quote_not_meaningful", "doc_id": doc_id})
-                        continue
-                    file_id = _resolve_doc(doc_id, conn)
-                    frow = _file_row(file_id) if file_id else None
-                    if file_id is None or frow is None:
-                        reason = (
-                            "ambiguous_cross_collection_doc_id" if doc_id in ambiguous_doc_ids else "unresolved_doc_id"
-                        )
-                        claims_rejected.append({"row": item_ref, "reason": reason, "doc_id": doc_id})
-                        continue
-                    if frow.get("processing_status") != "indexed":
-                        deferred.append(
-                            {
-                                "row": item_ref,
-                                "doc_id": doc_id,
-                                "corpus_file_id": file_id,
-                                "reason": "not_indexed",
-                                "retry_after_seconds": 60,
-                            }
-                        )
-                        continue
-                    texts = _chunk_texts(file_id)
-                    accepted_via_identity = False
-                    # Per-chunk first (the common case, and the cheaper
-                    # check); only join the whole document when no single
-                    # chunk contains it, so a boundary-crossing quote still
-                    # gets a fair look before falling through to identity
-                    # (cost-levers spec §2.1(b)/§2.2 — see
-                    # `CHUNK_JOIN_SEPARATOR`'s docstring above).
-                    if not any(quote in t for t in texts) and quote not in _joined_text(file_id):
-                        # Widened gate: the document's own SERVER-STORED
-                        # identity (`corpus_files.filename`/`path`) counts as
-                        # verbatim evidence too — the extraction ontology
-                        # legitimately grounds a claim in a document's folder
-                        # path + filename (e.g. a `part_of` edge citing
-                        # "Project Kemp/Parts Authority — …pptx"), and those
-                        # quotes have no chunk to land in (spec §8).
-                        # Deliberately `frow` (fetched from `corpus_files`
-                        # above), NEVER anything off the wire (`doc`/`ev`) —
-                        # a producer-declared name/path is used only to
-                        # RESOLVE which row this evidence is about, never as
-                        # evidence itself, or a producer could self-certify
-                        # an invented quote by declaring whatever string it
-                        # likes. P0 review finding: the quote must EQUAL a
-                        # whole identity unit (`_identity_candidates`) —
-                        # never merely a substring of one, which admitted a
-                        # bare ".pptx" or "/" and let a fabricated attribute
-                        # ride in as a confidently-cited quote. No
-                        # normalization is applied here, matching the
-                        # chunk-text check above exactly — an NFC/NFD form
-                        # mismatch fails identically on both sides.
-                        if quote in _identity_candidates(frow.get("filename"), frow.get("path")):
-                            accepted_via_identity = True
-                        else:
-                            claims_rejected.append(
-                                {"row": item_ref, "reason": "verbatim_gate_failed", "doc_id": doc_id}
-                            )
-                            continue
-                    written_id = self.add_claim(
-                        fact_id=subject_id if kind == "fact" else None,
-                        edge_id=subject_id if kind == "edge" else None,
-                        corpus_file_id=file_id,
-                        corpus_id=frow["corpus_id"],
-                        file_sha256=frow.get("sha256") or "",
-                        quote=quote,
-                        # Per-evidence `attrs` isn't part of the producer's
-                        # wire format (spec §7.0) — `attrs` sits on the
-                        # node/edge row itself ("what THIS document says",
-                        # §3), and the concatenated-per-document pipeline
-                        # output means one row object == one document's
-                        # occurrence, so the row's own attrs is what each
-                        # of its claims should carry. An evidence-level
-                        # `attrs` is honored first if a future producer
-                        # ever supplies one (forward-compatible, unused
-                        # today).
-                        attrs=ev.get("attrs") or row_attrs or {},
-                        # P2 review finding: looked up by the EVIDENCE'S OWN
-                        # `doc_id`, not the resolved `file_id` — the
-                        # TCRD-241 deterministic override can resolve this
-                        # doc_id to a corpus_file_id THIS batch never itself
-                        # declared a date for (see `doc_dates`' definition
-                        # above), which previously wrote `document_date` as
-                        # silently NULL.
-                        document_date=doc_dates.get(doc_id),
-                        # Index-time audience-variant tag (Task 10, spec
-                        # §4.2) — format-validated up front by
-                        # `app/api/facts.py` before `ingest_batch` ever
-                        # runs, so a malformed value here would already
-                        # have been refused with a 422; this stores
-                        # whatever survived that gate, verbatim.
-                        audience=ev.get("audience"),
+            for ev_idx, ev in enumerate(evidence):
+                doc_id = ev.get("doc_id")
+                quote = ev.get("quote") or ""
+                item_ref = f"{row_ref}.evidence[{ev_idx}]"
+                if not quote:
+                    claims_rejected.append({"row": item_ref, "reason": "empty_quote", "doc_id": doc_id})
+                    continue
+                if not _is_meaningful_quote(quote):
+                    # Applied BEFORE either half of the gate below, so a
+                    # degenerate quote (a bare file-extension fragment, a
+                    # lone separator) cannot fall through the content
+                    # check and be self-certified by the identity
+                    # haystack instead — one check closes the hole on
+                    # both paths. Distinct reason from
+                    # `verbatim_gate_failed`: the quote WAS present
+                    # verbatim (or would be, trivially), it just isn't
+                    # evidence of anything — a different failure an
+                    # operator should be able to tell apart (a producer
+                    # citing junk vs. a producer citing text absent from
+                    # the document).
+                    claims_rejected.append({"row": item_ref, "reason": "quote_not_meaningful", "doc_id": doc_id})
+                    continue
+                file_id = _resolve_doc(doc_id, conn)
+                frow = _file_row(file_id) if file_id else None
+                if file_id is None or frow is None:
+                    reason = "ambiguous_cross_collection_doc_id" if doc_id in ambiguous_doc_ids else "unresolved_doc_id"
+                    claims_rejected.append({"row": item_ref, "reason": reason, "doc_id": doc_id})
+                    continue
+                if frow.get("processing_status") != "indexed":
+                    deferred.append(
+                        {
+                            "row": item_ref,
+                            "doc_id": doc_id,
+                            "corpus_file_id": file_id,
+                            "reason": "not_indexed",
+                            "retry_after_seconds": 60,
+                        }
                     )
-                    for alias_type, alias_natural_key in alias_targets or []:
-                        # Recorded regardless of `written_id` (a replayed,
-                        # already-existing claim still means this corpus
-                        # genuinely evidences the alias — the provenance
-                        # set only grows, see `add_alias_source`). A no-op
-                        # if the alias row hasn't been minted yet (it
-                        # always has by this point — `_resolve_alias` runs
-                        # before any evidence write, for both nodes and
-                        # edge endpoints).
-                        self.add_alias_source(
-                            type=alias_type, natural_key=alias_natural_key, corpus_id=frow["corpus_id"]
-                        )
-                    if written_id is not None:
-                        claims_written += 1
-                        if accepted_via_identity:
-                            claims_accepted_via_identity += 1
-                        if kind == "fact":
-                            touched_fact_ids.add(subject_id)
+                    continue
+                texts = _chunk_texts(file_id)
+                accepted_via_identity = False
+                # Per-chunk first (the common case, and the cheaper
+                # check); only join the whole document when no single
+                # chunk contains it, so a boundary-crossing quote still
+                # gets a fair look before falling through to identity
+                # (cost-levers spec §2.1(b)/§2.2 — see
+                # `CHUNK_JOIN_SEPARATOR`'s docstring above).
+                if not any(quote in t for t in texts) and quote not in _joined_text(file_id):
+                    # Widened gate: the document's own SERVER-STORED
+                    # identity (`corpus_files.filename`/`path`) counts as
+                    # verbatim evidence too — the extraction ontology
+                    # legitimately grounds a claim in a document's folder
+                    # path + filename (e.g. a `part_of` edge citing
+                    # "Project Kemp/Parts Authority — …pptx"), and those
+                    # quotes have no chunk to land in (spec §8).
+                    # Deliberately `frow` (fetched from `corpus_files`
+                    # above), NEVER anything off the wire (`doc`/`ev`) —
+                    # a producer-declared name/path is used only to
+                    # RESOLVE which row this evidence is about, never as
+                    # evidence itself, or a producer could self-certify
+                    # an invented quote by declaring whatever string it
+                    # likes. P0 review finding: the quote must EQUAL a
+                    # whole identity unit (`_identity_candidates`) —
+                    # never merely a substring of one, which admitted a
+                    # bare ".pptx" or "/" and let a fabricated attribute
+                    # ride in as a confidently-cited quote. No
+                    # normalization is applied here, matching the
+                    # chunk-text check above exactly — an NFC/NFD form
+                    # mismatch fails identically on both sides.
+                    if quote in _identity_candidates(frow.get("filename"), frow.get("path")):
+                        accepted_via_identity = True
+                    else:
+                        claims_rejected.append({"row": item_ref, "reason": "verbatim_gate_failed", "doc_id": doc_id})
+                        continue
+                written_id = self.add_claim(
+                    fact_id=subject_id if kind == "fact" else None,
+                    edge_id=subject_id if kind == "edge" else None,
+                    corpus_file_id=file_id,
+                    corpus_id=frow["corpus_id"],
+                    file_sha256=frow.get("sha256") or "",
+                    quote=quote,
+                    # Per-evidence `attrs` isn't part of the producer's
+                    # wire format (spec §7.0) — `attrs` sits on the
+                    # node/edge row itself ("what THIS document says",
+                    # §3), and the concatenated-per-document pipeline
+                    # output means one row object == one document's
+                    # occurrence, so the row's own attrs is what each
+                    # of its claims should carry. An evidence-level
+                    # `attrs` is honored first if a future producer
+                    # ever supplies one (forward-compatible, unused
+                    # today).
+                    attrs=ev.get("attrs") or row_attrs or {},
+                    # P2 review finding: looked up by the EVIDENCE'S OWN
+                    # `doc_id`, not the resolved `file_id` — the
+                    # TCRD-241 deterministic override can resolve this
+                    # doc_id to a corpus_file_id THIS batch never itself
+                    # declared a date for (see `doc_dates`' definition
+                    # above), which previously wrote `document_date` as
+                    # silently NULL.
+                    document_date=doc_dates.get(doc_id),
+                    # Index-time audience-variant tag (Task 10, spec
+                    # §4.2) — format-validated up front by
+                    # `app/api/facts.py` before `ingest_batch` ever
+                    # runs, so a malformed value here would already
+                    # have been refused with a 422; this stores
+                    # whatever survived that gate, verbatim.
+                    audience=ev.get("audience"),
+                    conn=conn,
+                )
+                for alias_type, alias_natural_key in alias_targets or []:
+                    # Recorded regardless of `written_id` (a replayed,
+                    # already-existing claim still means this corpus
+                    # genuinely evidences the alias — the provenance
+                    # set only grows, see `add_alias_source`). A no-op
+                    # if the alias row hasn't been minted yet (it
+                    # always has by this point — `_resolve_alias` runs
+                    # before any evidence write, for both nodes and
+                    # edge endpoints).
+                    self.add_alias_source(
+                        type=alias_type, natural_key=alias_natural_key, corpus_id=frow["corpus_id"], conn=conn
+                    )
+                if written_id is not None:
+                    claims_written += 1
+                    if accepted_via_identity:
+                        claims_accepted_via_identity += 1
+                    if kind == "fact":
+                        touched_fact_ids.add(subject_id)
 
         # ---- nodes: alias resolution + evidence.
         node_fact_ids: Dict[str, str] = {}
@@ -3598,26 +3702,34 @@ class FactsPgRepository:
             if not node_id:
                 claims_rejected.append({"row": row_ref, "reason": "missing_node_id"})
                 continue
-            with self._engine.connect() as conn:
+            # ATOMICITY: alias resolution (which may mint a new fact + its
+            # alias), correction re-attachment, and this node's OWN evidence
+            # all share ONE transaction — a partial write (e.g. a claim
+            # insert failing mid-loop) rolls the fact back too, rather than
+            # leaving a fact with none of its own evidence for a concurrent
+            # `sweep_orphans()` to race against. See `EdgeEndpointMissing`'s
+            # docstring for the race this closes.
+            with self._engine.begin() as conn:
                 resolution = self._resolve_alias(conn, node_id, node.get("type"))
-            if resolution["error"] is not None:
-                claims_rejected.append({"row": row_ref, "reason": resolution["error"], "node_id": node_id})
-                continue
-            if resolution["created"]:
-                subjects_created += 1
-                if resolution.get("reattached"):
-                    corrections_active.append(resolution["reattached"])
-                newly_created_facts.append((node_id, resolution["fact_id"], resolution["type"]))
-            node_fact_ids[node_id] = resolution["fact_id"]
-            node_types[node_id] = resolution["type"]
-            _write_evidence(
-                kind="fact",
-                subject_id=resolution["fact_id"],
-                evidence=node.get("evidence") or [],
-                row_ref=row_ref,
-                row_attrs=node.get("attrs") or {},
-                alias_targets=[(resolution["type"], node_id)],
-            )
+                if resolution["error"] is not None:
+                    claims_rejected.append({"row": row_ref, "reason": resolution["error"], "node_id": node_id})
+                    continue
+                if resolution["created"]:
+                    subjects_created += 1
+                    if resolution.get("reattached"):
+                        corrections_active.append(resolution["reattached"])
+                    newly_created_facts.append((node_id, resolution["fact_id"], resolution["type"]))
+                node_fact_ids[node_id] = resolution["fact_id"]
+                node_types[node_id] = resolution["type"]
+                _write_evidence(
+                    kind="fact",
+                    subject_id=resolution["fact_id"],
+                    evidence=node.get("evidence") or [],
+                    row_ref=row_ref,
+                    conn=conn,
+                    row_attrs=node.get("attrs") or {},
+                    alias_targets=[(resolution["type"], node_id)],
+                )
 
         # ---- edges: endpoints resolve via the SAME alias mechanism (an
         # edge's src/dst are themselves node ids, spec §7.0) + evidence.
@@ -3641,7 +3753,19 @@ class FactsPgRepository:
             if not src_id or not edge_type or not dst_id:
                 claims_rejected.append({"row": row_ref, "reason": "malformed_edge"})
                 continue
-            with self._engine.connect() as conn:
+            # `.begin()`, not `.connect()`: `_endpoint()` may mint a brand
+            # new fact via `_resolve_alias` -> `create_fact(conn=conn)` — a
+            # real write that must commit regardless of whether THIS edge
+            # itself later succeeds, exactly like the pre-atomicity code's
+            # own `create_fact()` always did on its own internal
+            # transaction. A plain `.connect()` here would silently roll
+            # that INSERT back on `with` exit (SQLAlchemy 2.0's implicit-
+            # transaction-rolls-back-if-uncommitted default), leaving
+            # `create_edge` below referencing a `dst`/`src` that was never
+            # actually persisted — a self-inflicted, always-reproducible
+            # version of the same FK violation `EdgeEndpointMissing` exists
+            # to catch for the genuine cross-process race.
+            with self._engine.begin() as conn:
                 src_res = _endpoint(src_id, conn)
                 dst_res = _endpoint(dst_id, conn)
             if src_res.get("error") or dst_res.get("error"):
@@ -3665,33 +3789,59 @@ class FactsPgRepository:
                         corrections_active.append(res["reattached"])
                     newly_created_facts.append((endpoint_id, res["fact_id"], res["type"]))
 
-            edge_id = self.create_edge(src=src_res["fact_id"], type=edge_type, dst=dst_res["fact_id"])
-            with self._engine.begin() as conn:
-                reattached_edge = self._reattach_correction(
-                    conn, subject_kind="edge", subject_id=edge_id, natural_key_probe=[src_id, edge_type, dst_id]
-                )
-            if reattached_edge:
-                corrections_active.append(reattached_edge)
+            # ATOMICITY: the edge row, its correction re-attachment, and its
+            # OWN evidence all share ONE transaction — same reasoning as the
+            # node loop above. `create_edge` raises `EdgeEndpointMissing`
+            # when Postgres's FK constraint rejects the INSERT because `src`/
+            # `dst` no longer exists (resolved moments ago above, but
+            # deleted since by a concurrent pass's merge/dedup or its own
+            # `sweep_orphans()`) — that is a genuine, expected race, not a
+            # caller bug, so it is counted and this ONE edge is skipped
+            # rather than failing the whole batch.
+            try:
+                with self._engine.begin() as conn:
+                    edge_id = self.create_edge(
+                        src=src_res["fact_id"], type=edge_type, dst=dst_res["fact_id"], conn=conn
+                    )
+                    reattached_edge = self._reattach_correction(
+                        conn, subject_kind="edge", subject_id=edge_id, natural_key_probe=[src_id, edge_type, dst_id]
+                    )
+                    if reattached_edge:
+                        corrections_active.append(reattached_edge)
 
-            if edge_type == "possible_duplicate_of":
-                review_items.append({"type": "possible_duplicate_of", "edge_id": edge_id, "src": src_id, "dst": dst_id})
-            if edge_type in single_valued_types:
-                touched_edge_pairs.add((src_res["fact_id"], edge_type))
-            _write_evidence(
-                kind="edge",
-                subject_id=edge_id,
-                evidence=edge.get("evidence") or [],
-                row_ref=row_ref,
-                row_attrs=edge.get("attrs") or {},
-                # An edge's claim evidences BOTH endpoints too (module
-                # docstring, "Endpoint evidence") — a node with zero
-                # claims of its own, reachable only as an edge anchor
-                # (the common works_in_industry/sponsored_by/staffed_by
-                # ontology shape), must still get its alias's provenance
-                # from here, or it stays permanently admin-only despite
-                # being visible and findable by existence.
-                alias_targets=[(src_res["type"], src_id), (dst_res["type"], dst_id)],
-            )
+                    if edge_type == "possible_duplicate_of":
+                        review_items.append(
+                            {"type": "possible_duplicate_of", "edge_id": edge_id, "src": src_id, "dst": dst_id}
+                        )
+                    if edge_type in single_valued_types:
+                        touched_edge_pairs.add((src_res["fact_id"], edge_type))
+                    _write_evidence(
+                        kind="edge",
+                        subject_id=edge_id,
+                        evidence=edge.get("evidence") or [],
+                        row_ref=row_ref,
+                        conn=conn,
+                        row_attrs=edge.get("attrs") or {},
+                        # An edge's claim evidences BOTH endpoints too (module
+                        # docstring, "Endpoint evidence") — a node with zero
+                        # claims of its own, reachable only as an edge anchor
+                        # (the common works_in_industry/sponsored_by/staffed_by
+                        # ontology shape), must still get its alias's provenance
+                        # from here, or it stays permanently admin-only despite
+                        # being visible and findable by existence.
+                        alias_targets=[(src_res["type"], src_id), (dst_res["type"], dst_id)],
+                    )
+            except EdgeEndpointMissing:
+                edges_skipped_missing_endpoint += 1
+                logger.warning(
+                    "facts ingest: skipping edge %s -[%s]-> %s (%s) — endpoint fact missing, "
+                    "likely merged/deduplicated by a concurrent pass",
+                    src_id,
+                    edge_type,
+                    dst_id,
+                    row_ref,
+                )
+                continue
 
         # ---- entity-resolution candidates (spec's own `entity_resolution`
         # convention: extraction never guess-merges, a probable-but-unsure
@@ -3814,6 +3964,12 @@ class FactsPgRepository:
             "subjects_deleted": subjects_deleted,
             "corrections_active": corrections_active,
             "review_items": review_items,
+            # Edges NOT written because their src/dst fact was gone by the
+            # time the INSERT ran — see `EdgeEndpointMissing`. Never itemized
+            # per-edge (unlike `claims_rejected`): the endpoint node ids are
+            # already logged, and this is a count of a race, not a producer
+            # mistake to fix.
+            "edges_skipped_missing_endpoint": edges_skipped_missing_endpoint,
         }
 
     # ------------------------------------------------------------------
