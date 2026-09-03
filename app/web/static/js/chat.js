@@ -584,7 +584,7 @@ function stripSourcesFence(markdown) {
   return out.trimEnd();
 }
 
-const _CLAIM_LABEL = { table: "table", metric: "metric", assumption: "assumes" };
+const _CLAIM_LABEL = { table: "table", metric: "metric", document: "document", assumption: "assumes" };
 
 /** Where an assumption came from, as the reader sees it.
  *
@@ -641,6 +641,15 @@ const _ASSUMPTION_ORIGIN_UNSTATED = {
  *  asked. `assumption` is free text about the analyst's own choices, with
  *  nothing to open, so it stays a plain label.
  *
+ *  `document` stays a label too, and for the opposite reason to an
+ *  assumption's: there IS a page, and the ref cannot name it. Document detail
+ *  is `/library/{slug}/f/{file_id}` — a collection slug and a file id, while
+ *  the prompt asks the agent for the filename or the fact-graph subject id it
+ *  actually saw. Neither resolves, and the rule #1974 established is that a
+ *  chip links where its ref identifies a page; a link built from a filename
+ *  would land on a guess. Giving these chips somewhere real to go means
+ *  teaching a surface to resolve a document by name, which is its own change.
+ *
  *  Built with encodeURIComponent, never string-pasted: the ref is model output
  *  and lands in a URL. */
 function _claimHref(claim) {
@@ -677,7 +686,12 @@ function _bubbleHasFigure(bubble) {
 //: five tables cited, "table" was read five times; the glyph says it in a
 //: fraction of the width, and the WORD survives in the chip's aria-label and
 //: tooltip, so nothing is lost to a screen reader.
-const _CLAIM_ICON = { table: "table", metric: "chart-line" };
+//:
+//: One glyph per checkable kind, pinned against the server's
+//: `VERIFIABLE_KINDS` by tests/test_chat_sources_ui.py. `assumption` has
+//: none on purpose — it is not a reference, and it wears an origin badge
+//: instead (see `_renderAssumptionChip`).
+const _CLAIM_ICON = { table: "table", metric: "chart-line", document: "file-text" };
 
 //: How many references the row shows before the rest fold behind "+N more".
 //: Four covers the overwhelming majority of answers outright — under it there
@@ -715,19 +729,28 @@ function _placeInTail(bubble, node, selector) {
   bubble.appendChild(node);
 }
 
-/** One `assumes …` chip: the kind label, the origin badge, the statement,
- *  and — when the answer gave one — the rationale on its own line. Never a
- *  link: an assumption names nothing to open (see _claimHref). */
+/** One assumption: the origin badge, the statement, and — when the answer
+ *  gave one — the rationale on its own line. Never a link: an assumption
+ *  names nothing to open (see _claimHref).
+ *
+ *  It is a ROW, not a pill. As a full-width chip (measured 681-811px at 43px
+ *  tall, mono, filled) five caveats outweighed the provenance above them,
+ *  which inverts what the tail is for. And it repeated exactly what the
+ *  sources row had already stopped doing (see
+ *  `test_the_sources_row_says_each_thing_once`): the word `assumes` on every
+ *  row — unstyled bare mono, that class carried no CSS rule at all — and the
+ *  `WHY` label on every row.
+ *
+ *  Both words are dropped from the FACE and neither leaves the chip: the row
+ *  is already labelled "Assumptions", and the category plus the origin ride
+ *  the accessible name, the same bargain `renderSourcesChips` struck when the
+ *  category became a glyph. */
 function _renderAssumptionChip(c) {
   const known = c.origin && Object.prototype.hasOwnProperty.call(_ASSUMPTION_ORIGIN, c.origin);
   const origin = known ? c.origin : "unstated";
   const copy = known ? _ASSUMPTION_ORIGIN[c.origin] : _ASSUMPTION_ORIGIN_UNSTATED;
   const chip = document.createElement("span");
   chip.className = `msg-source-chip is-neutral is-assumption is-origin-${origin}`;
-  const kind = document.createElement("span");
-  kind.className = "msg-source-kind";
-  kind.textContent = _CLAIM_LABEL.assumption;
-  chip.appendChild(kind);
   const badge = document.createElement("span");
   badge.className = `msg-source-origin is-origin-${origin}`;
   badge.textContent = copy.label;
@@ -740,13 +763,11 @@ function _renderAssumptionChip(c) {
   if (c.why) {
     const why = document.createElement("span");
     why.className = "msg-source-why";
-    const whyLabel = document.createElement("span");
-    whyLabel.className = "msg-source-why-label";
-    whyLabel.textContent = "why";
-    why.appendChild(whyLabel);
     why.appendChild(document.createTextNode(c.why));
     chip.appendChild(why);
   }
+  // What left the face must not leave the chip.
+  chip.setAttribute("aria-label", `${_CLAIM_LABEL.assumption} ${c.ref || ""}, ${copy.label}`);
   return chip;
 }
 
@@ -765,12 +786,19 @@ function renderSourcesChips(bubble, verdict) {
   // an ordinary answer. A greeting still gets nothing. (Devin Review.)
   if (!verdict.declared && claims.length === 0 && !_bubbleHasFigure(bubble)) return;
 
-  // Two rows, not one. A `table:` is something the answer READ; an
-  // `assumption:` is something it DECIDED. Filed together under one SOURCES
-  // label, six `assumes …` chips read as neither (TCRD-289) — and the
-  // "none declared" signal below is about provenance, so it is judged on
-  // the tables and metrics alone: an answer that named only assumptions
-  // has, truthfully, declared no source.
+  // Two rows, not one. A `table:`, `metric:` or `document:` is something the
+  // answer READ; an `assumption:` is something it DECIDED. Filed together
+  // under one SOURCES label, six `assumes …` chips read as neither
+  // (TCRD-289) — and the "none declared" signal below is about provenance,
+  // so it is judged on the references alone: an answer that named only
+  // assumptions has, truthfully, declared no source.
+  //
+  // Which makes this split load-bearing for every kind, not just today's
+  // three: it keys on "not an assumption" rather than on a list of
+  // reference kinds, so `document:` — added because the vocabulary having
+  // no word for a file is what pushed five PDF citations into the
+  // assumptions row, under a "none declared" that was counting only SQL —
+  // landed here without a line of its own.
   const provenance = claims.filter((c) => c.kind !== "assumption");
   const assumptions = claims.filter((c) => c.kind === "assumption");
 
@@ -858,14 +886,70 @@ function renderSourcesChips(bubble, verdict) {
   // badge and a rationale per assumption say strictly more than "Assumes: …"
   // could. It only joins the tail contract here (_placeInTail) so it cannot
   // land under the follow-ups when those arrive first.
+  //
+  // COLLAPSED by default, and the label is the control. An assumption is
+  // something you check when you doubt the number, not something you read on
+  // the way past it — expanded it was the tallest thing under the answer,
+  // which put the method caveats above the answer's own provenance in the
+  // reading order. The count is on the toggle so the row still says how much
+  // is behind it: collapsing a thing to nothing is how the "none declared"
+  // signal drifted in the first place.
   if (!assumptions.length) return;
   const arow = document.createElement("div");
-  arow.className = "msg-sources is-assumptions";
+  arow.className = "msg-sources is-assumptions is-collapsed";
+
+  const toggle = document.createElement("button");
+  toggle.type = "button";
+  toggle.className = "msg-assumptions-toggle";
+  toggle.setAttribute("aria-expanded", "false");
   const alabel = document.createElement("span");
   alabel.className = "msg-sources-label";
   alabel.textContent = "Assumptions";
-  arow.appendChild(alabel);
-  for (const c of assumptions) arow.appendChild(_renderAssumptionChip(c));
+  toggle.appendChild(alabel);
+  const acount = document.createElement("span");
+  acount.className = "msg-assumptions-count";
+  acount.textContent = String(assumptions.length);
+  toggle.appendChild(acount);
+
+  // `judgment` is the one origin the reader most needs to notice — the
+  // answer's own choice, with nothing in the question, the definitions or the
+  // data behind it. Hiding that behind a collapse would undo the point of
+  // TCRD-289, so it is summarised ON the closed toggle, the same way the
+  // provenance row summarises "N unverified" once instead of per chip.
+  const judged = assumptions.filter((c) => c.origin === "judgment").length;
+  if (judged) {
+    const flag = document.createElement("span");
+    flag.className = "msg-assumptions-judged";
+    flag.textContent = `${judged} on own judgment`;
+    flag.title = "Chosen by the answer itself — nothing in the question, the definitions or the data settles it.";
+    toggle.appendChild(flag);
+  }
+  const chev = document.createElement("span");
+  chev.className = "msg-assumptions-chevron";
+  chev.setAttribute("aria-hidden", "true");
+  chev.appendChild(iconEl("chevron-down"));
+  toggle.appendChild(chev);
+  arow.appendChild(toggle);
+
+  // A class of its own, NOT the provenance row's `msg-sources-list`. That
+  // class is `display: contents`, which cannot be hidden — an element that
+  // generates no box has no box to suppress — so borrowing it forced an
+  // author `display` override, and an author `display` outranks the UA
+  // stylesheet's `[hidden] { display: none }` on cascade ORIGIN. The row
+  // then opened expanded with `hidden` set and ignored. A plain div is
+  // block by default and `hidden` just works.
+  const alist = document.createElement("div");
+  alist.className = "msg-assumptions-list";
+  alist.hidden = true;
+  for (const c of assumptions) alist.appendChild(_renderAssumptionChip(c));
+  arow.appendChild(alist);
+
+  toggle.onclick = () => {
+    const open = toggle.getAttribute("aria-expanded") === "true";
+    toggle.setAttribute("aria-expanded", open ? "false" : "true");
+    alist.hidden = open;
+    arow.classList.toggle("is-collapsed", open);
+  };
   _placeInTail(bubble, arow, ".msg-sources.is-assumptions");
 }
 

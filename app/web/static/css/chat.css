@@ -870,25 +870,92 @@ a.msg-source-chip.is-link:focus-visible {
    and six `assumes …` chips filed under a SOURCES label read as neither. The
    second row shares the first's voice but not its hairline: one rule, two
    lists. */
+/* Rows, not a wrapping strip of pills — and closed until asked for. */
 .msg-sources.is-assumptions {
+  display: block;
   margin-top: 6px;
   padding-top: 0;
   border-top: 0;
 }
-/* An assumption chip is two lines when the answer gave a rationale: the
-   statement with its origin badge, then the `why` underneath. The chip wraps
-   its own flex items rather than growing a nested block. */
+/* The label IS the control (chat.js), so it has to look like one without
+   growing a second button's worth of chrome next to the row above it. */
+.msg-assumptions-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 0;
+  border: 0;
+  background: none;
+  cursor: pointer;
+  font: inherit;
+  color: inherit;
+}
+.msg-assumptions-toggle:hover .msg-sources-label {
+  color: var(--ds-text);
+}
+.msg-assumptions-count {
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+  color: var(--ds-text-secondary);
+  background: var(--ds-surface-dim);
+  border: 1px solid var(--ds-border);
+  border-radius: var(--ds-radius-pill);
+  padding: 0 6px;
+}
+/* The one thing that must not be buried by the collapse (see chat.js). */
+.msg-assumptions-judged {
+  font-size: var(--text-xs);
+  font-weight: var(--font-semibold);
+  color: var(--ds-accent-warn-ink);
+}
+.msg-assumptions-chevron {
+  display: inline-flex;
+  color: var(--ds-text-muted);
+  transition: transform 0.12s ease;
+}
+.msg-sources.is-assumptions:not(.is-collapsed) .msg-assumptions-chevron {
+  transform: rotate(180deg);
+}
+/* Deliberately declares NO `display`. A plain div is block already, and any
+   author `display` here would beat the UA stylesheet's
+   `[hidden] { display: none }` outright — cascade ORIGIN, which no
+   specificity on this rule can change — leaving the row open with `hidden`
+   set and ignored. That is exactly what happened while this was being built,
+   and only a browser could show it: the JS sets `hidden` correctly, so every
+   DOM test passed. The explicit rule below is the belt to that brace, so a
+   later `display:` added here cannot silently re-break the collapse. Same
+   trap documented at `.cloud-chat-jump[hidden]` and in activity_center.css. */
+.msg-assumptions-list {
+  margin-top: 4px;
+}
+.msg-assumptions-list[hidden] {
+  display: none;
+}
+/* An assumption is a ROW: no fill, no border, no pill, and set in the UI face
+   rather than mono — it is a sentence about method, not an identifier the
+   reader would retype. A hairline carries the grouping the pill used to.
+   See _renderAssumptionChip in chat.js for the measurements behind this. */
 .msg-source-chip.is-assumption {
-  flex-wrap: wrap;
-  row-gap: 2px;
-  padding-top: 3px;
-  padding-bottom: 3px;
+  display: block;
+  padding: 1px 0 1px 9px;
+  margin-bottom: 7px;
+  border: 0;
+  border-left: 2px solid var(--ds-border);
+  border-radius: 0;
+  background: none;
+  font-family: var(--ds-font);
+  color: var(--ds-text);
+  line-height: 1.5;
+}
+.msg-source-chip.is-assumption:last-child {
+  margin-bottom: 0;
 }
 /* Where the assumption came from — a badge in the vocabulary the server
    normalizes to (`ASSUMPTION_ORIGINS`). Set in the UI face, not mono: it is
    a category, not a name the reader would type. No font-size shrink, for
    the same measured reason as `.msg-source-flag` above. */
 .msg-source-origin {
+  margin-right: 6px;
   font-family: var(--ds-font);
   font-weight: var(--font-semibold);
   text-transform: uppercase;
@@ -912,17 +979,13 @@ a.msg-source-chip.is-link:focus-visible {
   border-style: dashed;
   color: var(--ds-text-muted);
 }
+/* The rationale, on its own line under the statement. No "WHY" label: it
+   was on every row, and its position already says what it is. */
 .msg-source-why {
-  flex-basis: 100%;
+  display: block;
+  margin-top: 1px;
   font-family: var(--ds-font);
   color: var(--ds-text-secondary);
-}
-.msg-source-why-label {
-  font-weight: var(--font-semibold);
-  text-transform: uppercase;
-  letter-spacing: 0.03em;
-  color: var(--ds-text-muted);
-  margin-right: 4px;
 }
 
 /* Mermaid output. Inserted WITHOUT the markdown sanitizer (its <style> block
