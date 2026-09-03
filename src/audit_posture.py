@@ -1554,6 +1554,9 @@ MCP_TOOL_POSTURE: dict[str, str] = {
     "schema": "catalog.schema",
     "describe": "catalog.sample",  # calls schema then sample; sample is the substantive read
     "query": "query.local",
+    # Self-service policy diagnosis (#2147) — self-calls GET /api/me/
+    # effective-access, itself declared exempt:self above.
+    "effective_access": "exempt:self",
     "skills": "exempt:ui_support",
     "chat_skills": "exempt:ui_support",
     "stack_browse": "exempt:self",
