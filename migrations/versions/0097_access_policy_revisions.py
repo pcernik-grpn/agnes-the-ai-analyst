@@ -24,8 +24,8 @@ table a hard dependency of a frozen pre-A3 one.
 PG-first ratchet (A3): brand-new app-state table, Alembic-only — no matching
 DuckDB ``_vN_to_v(N+1)`` step, ``SCHEMA_VERSION`` does not move.
 
-Revision ID: 0096_access_policy_revisions
-Revises: 0095_memory_detection_runs
+Revision ID: 0097_access_policy_revisions
+Revises: 0096_users_kind
 Create Date: 2026-09-01
 """
 
@@ -36,8 +36,8 @@ from typing import Sequence, Union
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0096_access_policy_revisions"
-down_revision: Union[str, None] = "0095_memory_detection_runs"
+revision: str = "0097_access_policy_revisions"
+down_revision: Union[str, None] = "0096_users_kind"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

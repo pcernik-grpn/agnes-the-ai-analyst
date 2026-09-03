@@ -1716,6 +1716,24 @@ summary.cloud-chat-tool-head::-webkit-details-marker { display: none; }
   color: var(--ds-text-muted);
   font-variant-numeric: tabular-nums;
 }
+/* The human decision that gated this call, kept on the row after the
+   approval card is retired (and restored on reload from the persisted
+   part). Same outcome palette as the approval card's own badge. */
+.cloud-chat-tool-approval {
+  flex: 0 0 auto;
+  font-size: var(--text-xs);
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--ds-accent-success-line);
+  background: var(--ds-accent-success-bg);
+  color: var(--ds-accent-success-ink);
+  white-space: nowrap;
+}
+.cloud-chat-tool-approval.is-deny {
+  border-color: var(--ds-accent-danger-line);
+  background: var(--ds-accent-danger-bg);
+  color: var(--ds-accent-danger-ink);
+}
 .cloud-chat-tool-chevron {
   flex: 0 0 auto;
   color: var(--ds-text-muted);
@@ -2271,24 +2289,13 @@ summary.cloud-chat-tool-head::-webkit-details-marker { display: none; }
 
 /* System notes — turn-stopping events (budget stop, error, cancel) rendered
    IN the transcript, where the reader scrolls back, not only the status bar. */
+/* Look and tone live on `.notice` (style-custom.css) — this class now only
+   sizes the note inside the message column. It used to be a fully tinted
+   pill with centred, coloured text, which is what made a "come back in a
+   minute" read like a crash; see the .notice block for the whole argument. */
 .cloud-chat-system-note {
-  margin: 8px auto;
-  padding: 6px 14px;
-  /* --radius-md (style-custom.css), like the toast sibling below:
-     --ds-radius-md does not exist in the token set, and a var() to an
-     undefined property with no fallback voids the declaration (radius 0). */
-  border-radius: var(--radius-md);
-  font-size: 0.85rem;
-  text-align: center;
   max-width: 70%;
-  border: 1px solid var(--ds-accent-warn-line);
-  background: var(--ds-accent-warn-bg);
-  color: var(--ds-accent-warn-ink);
-}
-.cloud-chat-system-note.is-error {
-  border-color: var(--ds-accent-danger-line);
-  background: var(--ds-accent-danger-bg);
-  color: var(--ds-accent-danger-ink);
+  margin-inline: auto;
 }
 
 /* Next-action chips — the model's suggested follow-ups, lifted out of the
@@ -2366,36 +2373,18 @@ summary.cloud-chat-tool-head::-webkit-details-marker { display: none; }
   gap: var(--space-2);
   pointer-events: none;
 }
+/* Surface, border, radius and tone come from `.notice--floating`; what is
+   left here is what makes it a TOAST — it can be clicked away, it animates
+   in, and it is capped so a long receipt wraps instead of spanning the
+   window. The three per-tone tint blocks that used to live here are gone: a
+   toast is a receipt, and repainting the whole chip per outcome is what made
+   every one of them shout. */
 .cloud-chat-toast {
   pointer-events: auto;
-  display: inline-flex;
-  align-items: center;
-  gap: var(--space-2);
-  padding: 7px var(--space-3);
-  background: var(--ds-surface);
-  color: var(--ds-text-primary);
-  border: 1px solid var(--ds-border);
-  border-radius: var(--radius-md);
-  box-shadow: var(--shadow-md);
-  font-size: var(--text-sm);
   max-width: 360px;
+  margin: 0;
   cursor: pointer;
   animation: cloudchat-toast-in 140ms ease-out;
-}
-.cloud-chat-toast.is-ok {
-  background: var(--ds-accent-success-bg);
-  border-color: var(--ds-accent-success-line);
-  color: var(--ds-accent-success-ink);
-}
-.cloud-chat-toast.is-warn {
-  background: var(--ds-accent-warn-bg);
-  border-color: var(--ds-accent-warn-line);
-  color: var(--ds-accent-warn-ink);
-}
-.cloud-chat-toast.is-error {
-  background: var(--ds-accent-danger-bg);
-  border-color: var(--ds-accent-danger-line);
-  color: var(--ds-accent-danger-ink);
 }
 .cloud-chat-toast.is-leaving {
   animation: cloudchat-toast-out 120ms ease-in forwards;
@@ -3357,15 +3346,11 @@ html[data-ui-layout="rail"] .cloud-chat-main:has(#chat-capabilities:not([hidden]
 }
 
 /* Error + success inline banners in dialogs. */
-.cloud-chat-upload-error {
-  padding: var(--space-3);
-  border-radius: var(--ds-radius-sm, 4px);
-  background: var(--ds-accent-danger-bg);
-  border: 1px solid var(--ds-accent-danger-line);
-  color: var(--ds-accent-danger-ink);
-  font-size: var(--text-sm);
-  line-height: 1.5;
-}
+/* A HOST for the shared `.notice`, not a box of its own — showDialogError
+   appends one. Was a tinted danger panel with coloured ink, which said
+   "something is broken" for every refusal including the ones that clear by
+   themselves. */
+.cloud-chat-upload-error > .notice { margin: 0; }
 .cloud-chat-upload-error[hidden] { display: none; }
 
 /* Dialog action row */
@@ -4538,6 +4523,21 @@ html[data-ui-layout="rail"] .cloud-chat-shell.has-thread .cloud-chat-main::after
   background: var(--ds-code-bg);
   color: var(--ds-code-ink);
   overflow-x: auto;
+}
+/* The args preview is one <code> inside the dark <pre>. The inline-code
+   chip rule (light background, 1px border, 1px 4px padding) that every
+   bare `code` inherits turned each JSON line into a light chip on the dark
+   block; `pre.code-block-wrap code` resets it for tool-arg blocks, and the
+   approval block needs the same reset (issue #2161). */
+.cloud-chat-approval-cmd code {
+  display: block;
+  background: transparent;
+  color: inherit;
+  padding: 0;
+  border: none;
+  border-radius: 0;
+  font-size: inherit;
+  white-space: pre;
 }
 
 .cloud-chat-approval-actions {

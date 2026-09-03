@@ -8,6 +8,14 @@ deliberate, documented trade — this script exists to find where it stops
 being one, before a corpus in the thousands-of-documents range finds out for
 us in front of a user.
 
+This measures the UNBOUNDED worst case ``fetch_candidates`` below still
+hand-rolls verbatim, on purpose: the numbers here are what justify
+``collections.search_max_chunks`` (#2151) — the server-side cap that keeps
+production from ever reaching this shape at all once a corpus crosses it.
+``src.repositories.corpus_chunks.CorpusChunksRepository.list_for_corpora``
+itself no longer selects the embedding column or fetches unboundedly; see
+its docstring and ``src.ingest.retrieval.search_with_meta``.
+
 What it measures, per scale, over N queries:
 
 * ``fetch``  — ``corpus_chunks_repo().list_for_corpora`` (the DB read and its
@@ -204,11 +212,16 @@ _COLS = [
 
 
 def fetch_candidates(conn: duckdb.DuckDBPyConnection, corpus_id: str) -> List[Dict[str, Any]]:
-    """The production candidate fetch, verbatim in shape.
+    """The PRE-#2151 unbounded candidate fetch, kept verbatim as the
+    worst-case baseline these numbers describe.
 
-    Mirrors ``CorpusChunksRepository.list_for_corpora`` — same column list
-    (``embedding`` included, which is the point) and same dict
-    materialization, against the bench database rather than a real instance.
+    Mirrors what ``CorpusChunksRepository.list_for_corpora`` used to do —
+    same column list (``embedding`` included, which is the point) and same
+    dict materialization, against the bench database rather than a real
+    instance. The current ``list_for_corpora`` no longer matches this
+    shape: it never selects ``embedding`` and accepts an optional
+    ``limit``/``query_terms`` cap (see its docstring) precisely so
+    production never pays what this function still measures.
     """
     rows = conn.execute(
         f"SELECT {', '.join(_COLS)} FROM corpus_chunks WHERE corpus_id IN (?) ORDER BY file_id, ordinal",

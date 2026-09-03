@@ -27,7 +27,9 @@ because it names exactly the distinctions a renderer needs):
      "args": {...},
      "state": "input-available" | "output-available" | "output-error",
      "result": <any>,          # absent while input-available
-     "is_error": bool}         # absent while input-available
+     "is_error": bool,         # absent while input-available
+     "approval": "allow" | "allow_session" | "deny" | "timeout" | "unattended"}
+                               # only when a human decision gated this call
 
 ``state`` is what lets a reloaded tool card look like a live one. Without it
 the reload path could only render the tool's NAME — no status icon, no
@@ -105,6 +107,13 @@ def build_message_parts(frames: list[dict]) -> Optional[list[dict]]:
                 "args": frame.get("args") or {},
                 "state": STATE_INPUT_AVAILABLE,
             }
+            approval = frame.get("approval")
+            if isinstance(approval, str) and approval:
+                # The manager stamps the resolved approval decision onto the
+                # call it gated (`_record_approval_on_tool_call`); keeping it
+                # on the part is what lets a reloaded tool row still say
+                # "approved by you" (issue #2161).
+                part["approval"] = approval
             if tool_use_id:
                 tool_positions[tool_use_id] = len(parts)
             parts.append(part)

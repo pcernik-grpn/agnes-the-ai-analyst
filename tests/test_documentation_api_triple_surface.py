@@ -839,6 +839,30 @@ _EXEMPT: dict[str, str] = {
         "/admin before a demo — an `agnes admin` verb would be a third way "
         "to write one file, with no analyst workflow behind it"
     ),
+    "/api/admin/service-accounts": (
+        "service-account identity CRUD (issue #1534) — CLI-reachable via "
+        "`agnes admin service-account create|list`, deliberately never "
+        "MCP-exposed per the 'admin credential-provisioning writes' standing "
+        "exemption in CONTRIBUTING.md: an agent-invokable tool that can "
+        "mint a new headless identity is the same privilege-provisioning "
+        "seam that paragraph names, one level up from minting a credential "
+        "for an existing one"
+    ),
+    "/api/admin/service-accounts/{service_account_id}/tokens": (
+        "mints a durable PAT for a service account (issue #1534) — "
+        "CLI-reachable via `agnes admin service-account token`, deliberately "
+        "never MCP-exposed per the 'admin credential-provisioning writes' "
+        "standing exemption in CONTRIBUTING.md: an agent-invokable tool that "
+        "can mint a fresh, independently-usable credential is exactly the "
+        "privilege-escalation seam that paragraph names"
+    ),
+    "/api/admin/service-accounts/{service_account_id}": (
+        'PATCH `{"active": bool}` flips a service account\'s `users.active` '
+        "(issue #1534) — CLI-reachable via `agnes admin service-account "
+        "deactivate|activate`, deliberately never MCP-exposed: same class as "
+        "the credential-provisioning writes above, since deactivating is what "
+        "makes the account's already-minted PATs stop authenticating"
+    ),
     "/api/admin/sso/config": (
         "external SSO login config (design 2026-08-28) — CLI-reachable via "
         "`agnes admin sso status|set|delete`, deliberately never MCP-exposed: "
