@@ -332,21 +332,20 @@ jobs:
       #    Same posture as `smoke-test`'s retried GHCR login below (issue
       #    #892): an infra flake must not be indistinguishable from a broken
       #    image.
+      #
+      #    One hypothesis was considered and NOT acted on: v6+ of this action
+      #    attaches a provenance attestation by default, making the pushed
+      #    reference an OCI index with a second manifest, which is the shape
+      #    `unknown blob` reports cluster around. Turning it off was dropped
+      #    because the failure then cleared on its own with provenance still
+      #    on — so it is not established as the cause, and a change to what
+      #    the published image IS does not belong in a flake workaround.
       - name: Build and push
         id: push
         continue-on-error: true
         uses: docker/build-push-action@v7
         with:
           push: true
-          # Off because it is the one part of this push with a NAMED
-          # suspicion behind it. v6+ of this action turns provenance
-          # attestations on by default, which makes the pushed reference an
-          # OCI index carrying a second, attestation manifest — the
-          # configuration GHCR's `unknown blob` reports cluster around.
-          # Nothing in this repo consumes an attestation (no cosign, no SLSA
-          # verification, no policy gate — grepped), so this removes an
-          # artifact no reader has rather than a guarantee anyone relies on.
-          provenance: false
           build-args: |
             AGNES_VERSION=${{ steps.pkgver.outputs.version }}
             RELEASE_CHANNEL=${{ steps.meta.outputs.channel }}
@@ -360,7 +359,6 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           push: true
-          provenance: false
           build-args: |
             AGNES_VERSION=${{ steps.pkgver.outputs.version }}
             RELEASE_CHANNEL=${{ steps.meta.outputs.channel }}

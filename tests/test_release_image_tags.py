@@ -212,17 +212,21 @@ class TestTheRetryCannotLaunderARealFailure:
         assert order.index("push") < order.index("push_retry") < order.index(gate_name)
 
 
-def test_provenance_is_off_on_every_push_attempt(steps: list[dict]) -> None:
-    """Turned off deliberately (the one named suspicion behind the `unknown
-    blob` failures: v6+ attaches an attestation manifest by default, and
-    nothing here consumes one). If it is ever re-enabled, both attempts must
-    agree — a retry that pushes a different artifact shape than the first is
-    not a retry."""
-    for step_id in ("push", "push_retry"):
-        assert _step(steps, step_id)["with"]["provenance"] is False, (
-            f"{step_id} re-enabled provenance; if that is intended, change both attempts "
-            "and re-read the note on the push step"
-        )
+def test_both_push_attempts_are_configured_identically(steps: list[dict]) -> None:
+    """A retry that pushes a DIFFERENT artifact than the first attempt is not
+    a retry — it is a second, quieter release. Whatever the push is
+    configured to produce (tags, build-args, action version, attestations),
+    the two steps must agree, so that which attempt happened to land is
+    invisible downstream."""
+    first, retry = _step(steps, "push"), _step(steps, "push_retry")
+    assert first["uses"] == retry["uses"], (
+        "the retry uses a different build-push-action version than the first attempt"
+    )
+    assert first["with"] == retry["with"], (
+        "the two push attempts would publish different artifacts; keep their "
+        f"`with:` blocks identical (differing keys: "
+        f"{sorted(set(first['with']) ^ set(retry['with'])) or 'same keys, different values'})"
+    )
 
 
 def test_the_assembly_step_precedes_the_pushes(steps: list[dict]) -> None:
