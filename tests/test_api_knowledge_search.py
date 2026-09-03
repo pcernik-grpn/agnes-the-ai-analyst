@@ -249,3 +249,95 @@ def test_knowledge_search_resolves_accessible_tables_once(seeded_app, monkeypatc
     )
     assert resp.status_code == 200, resp.text
     assert calls["get_accessible_tables"] == 1
+
+
+# ---------------------------------------------------------------------------
+# #2151: the chunk leg degrades to empty (with a disclosed note) instead of
+# taking the whole combined search down when the chunk engine fails.
+# ---------------------------------------------------------------------------
+
+
+def _seed_col_with_chunk(seeded_app, name: str, text: str) -> str:
+    c = seeded_app["client"]
+    col = c.post("/api/collections", json={"name": name}, headers=_auth(seeded_app["admin_token"])).json()
+    from src.repositories import corpus_chunks_repo, corpus_files_repo
+
+    fid = corpus_files_repo().add(
+        corpus_id=col["id"], filename="d.txt", sha256="s", file_type="txt", size_bytes=1, storage_path="/x"
+    )
+    corpus_chunks_repo().add_many([{"corpus_id": col["id"], "file_id": fid, "ordinal": 0, "text": text}])
+    return col["id"]
+
+
+def test_chunk_leg_memory_error_degrades_to_empty_with_note(seeded_app, monkeypatch):
+    """A chunk-engine MemoryError must not take the combined search down —
+    it degrades to an empty chunk leg with a disclosed note, and OTHER
+    legs (here: the table catalog) still answer."""
+    import app.api.knowledge_search as ks_module
+
+    _seed_col_with_chunk(seeded_app, "KS Mem", "the magic keyword appears here")
+
+    def _boom(*_a, **_kw):
+        raise MemoryError("simulated OOM")
+
+    monkeypatch.setattr(ks_module, "search_with_meta", _boom)
+    c = seeded_app["client"]
+    resp = c.get(
+        "/api/knowledge/search",
+        params={"q": "magic keyword"},
+        headers=_auth(seeded_app["admin_token"]),
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert [h for h in body["results"] if h["type"] == "chunk"] == []
+    assert body["degraded"] == {"chunk": "search_unavailable"}
+    assert body.get("degraded_note")
+
+
+def test_chunk_leg_operational_error_degrades_to_empty_other_legs_survive(seeded_app, monkeypatch):
+    import sqlalchemy as sa
+
+    import app.api.knowledge_search as ks_module
+    from src.repositories import get_system_db, table_registry_repo
+
+    conn = get_system_db()
+    table_registry_repo().register(
+        id="ks_survive_1",
+        name="ks_survive_1",
+        description="widget catalog for survival test",
+        source_type="keboola",
+        query_mode="materialized",
+    )
+    conn.close()
+    _seed_col_with_chunk(seeded_app, "KS Op", "widget catalog entry")
+
+    def _boom(*_a, **_kw):
+        raise sa.exc.OperationalError("SELECT 1", {}, Exception("simulated"))
+
+    monkeypatch.setattr(ks_module, "search_with_meta", _boom)
+    c = seeded_app["client"]
+    resp = c.get(
+        "/api/knowledge/search",
+        params={"q": "widget catalog"},
+        headers=_auth(seeded_app["admin_token"]),
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert [h for h in body["results"] if h["type"] == "chunk"] == []
+    assert any(h["type"] == "table" for h in body["results"])
+    assert body["degraded"] == {"chunk": "search_unavailable"}
+
+
+def test_chunk_leg_success_is_unaffected_by_degradation_wiring(seeded_app):
+    """Regression pin: the normal (non-failing) path is unchanged."""
+    _seed_col_with_chunk(seeded_app, "KS OK", "the magic keyword appears here")
+    c = seeded_app["client"]
+    resp = c.get(
+        "/api/knowledge/search",
+        params={"q": "magic keyword"},
+        headers=_auth(seeded_app["admin_token"]),
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert "degraded" not in body
+    assert any(h["type"] == "chunk" for h in body["results"])
