@@ -10465,8 +10465,76 @@ async def admin_user_detail_page(
     target = repo.get_by_id(user_id)
     if not target:
         raise HTTPException(status_code=404, detail="User not found")
-    ctx = _build_context(request, user=user, target_user=target)
+    ctx = _build_context(request, user=user, target_user=target, shares=_shares_owned_by(str(target["id"])))
     return templates.TemplateResponse(request, "admin_user_detail.html", ctx)
+
+
+def _shares_owned_by(owner_id: str) -> dict:
+    """Everything this person owns that is shared, and with whom.
+
+    /admin/access shows a shared row from the GROUP's side ("Finance has
+    Ada's agent"); nothing showed it from the person's side, so an admin
+    following the owner's name off that row landed on a page that said
+    nothing about sharing (audit U7). This is the other side of the same
+    fact, rendered server-side from the same repositories — no new endpoint.
+
+    Agents and collections only, for now: they are the two owner-shared kinds
+    whose projections carry an owner. Data apps and skills do not yet, and
+    are named as absent rather than silently left out. Reads only; every call
+    exists on both app-state backends.
+    """
+    from src.repositories import (
+        agents_repo,
+        file_corpora_repo,
+        resource_grants_repo,
+        user_groups_repo,
+        users_repo,
+    )
+
+    groups = {g["id"]: g.get("name") or g["id"] for g in user_groups_repo().list_all()}
+    grants = resource_grants_repo()
+    items: list[dict] = []
+    for a in agents_repo().list_for_user(owner_id) or []:
+        items.append({"kind": "agent", "id": a["id"], "name": a.get("name") or a["id"], "href": None})
+    for c in file_corpora_repo().list_all() or []:
+        if str(c.get("created_by") or "") == owner_id:
+            items.append({"kind": "collection", "id": c["id"], "name": c.get("name") or c["id"],
+                          "href": f"/library/d/{c['id']}"})
+
+    by_kind = {k: grants.list_all(resource_type=k) for k in ("agent", "collection")}
+    # Resolve who granted, once: ids to names (the Library records the sharer's
+    # id), emails pass through.
+    ids = sorted({str(g.get("assigned_by")) for rows in by_kind.values() for g in rows
+                  if g.get("assigned_by") and "@" not in str(g.get("assigned_by"))})
+    who: dict[str, str] = {}
+    if ids:
+        try:
+            for uid_, info_ in (users_repo().get_info_by_ids(ids) or {}).items():
+                who[uid_] = (info_ or {}).get("name") or (info_ or {}).get("email") or uid_
+        except Exception:  # a users-table read failure must not take the page down
+            logger.exception("share names unresolved on /admin/users; falling back to raw ids")
+
+    for it in items:
+        it["grants"] = []
+        for g in by_kind[it["kind"]]:
+            if g.get("resource_id") != it["id"]:
+                continue
+            by = str(g.get("assigned_by") or "")
+            it["grants"].append({
+                "group_id": g.get("group_id"),
+                "group": groups.get(g.get("group_id"), g.get("group_id")),
+                "by_owner": by == owner_id,
+                "by": who.get(by, by.split("@")[0] if "@" in by else by),
+                "requirement": g.get("requirement") or "available",
+            })
+        it["grants"].sort(key=lambda x: str(x["group"]).lower())
+    items.sort(key=lambda x: (x["kind"], str(x["name"]).lower()))
+    # Keyed `owned`, not `items`: in a Jinja template `shares.items` resolves
+    # to the DICT's .items method before any key of that name, and `|length`
+    # on a bound method is a TypeError at render time — which Jinja's compile
+    # step cannot see. Found by rendering the page, not by compiling it.
+    return {"owned": items, "shared": sum(1 for it in items if it["grants"]),
+            "kinds_covered": ["agents", "collections"], "kinds_missing": ["data apps", "skills"]}
 
 
 @router.get("/admin/usage")

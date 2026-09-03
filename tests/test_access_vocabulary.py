@@ -1252,17 +1252,14 @@ class TestAnOwnerSharedRowSaysWhoAndGoesSomewhereReal:
 
         return Path(self.TEMPLATE).read_text(encoding="utf-8")
 
-    def test_an_agent_row_offers_no_link_that_leads_nowhere_relevant(self):
-        """Two destinations were tried and both failed the owner's look: the
-        owner's builder (shows an admin nothing) and the owner's People page
-        (shows nothing about what they share). Until a page answers "what is
-        this agent and who has it", the row names the owner and links nowhere
-        — a link that leads somewhere irrelevant is the defect, not a fix."""
+    def test_an_agents_link_lands_on_its_owners_shares(self):
+        """Two destinations failed the owner's look — the owner's builder
+        (shows an admin nothing) and the owner's People page (showed nothing
+        about sharing). The People page now has a Shares section, so the link
+        goes there, anchored, and says what it is."""
         src = self._source()
-        entity = src[src.index("const ENTITY_PAGE = {"): src.index("};", src.index("const ENTITY_PAGE = {"))]
-        assert "agent:" not in entity.replace("// ", "")   # no agent destination
-        assert "Deliberately absent." in entity
-        assert 'const ownLabel = "where it lives ↗";' in src
+        assert "? `/admin/users/${encodeURIComponent(item.owner_user_id)}#shares`" in src
+        assert 'const ownLabel = t.type_key === "agent" ? "owner ↗" : "where it lives ↗";' in src
 
     def test_the_sharer_leads_the_row(self):
         src = self._source()

@@ -3871,11 +3871,14 @@
       // on nothing — a dead end labelled "where it lives". There is no admin
       // page for an agent; the agent lives with its owner, so the row's link
       // goes to the owner on /admin/users when the owner is known.
-      // Deliberately absent. /agents?agent=<id> is the owner's builder and
-      // shows an admin nothing; /admin/users/<owner> shows nothing about
-      // what that person shares. Until a page exists that answers "what is
-      // this agent and who has it", the row names the owner and offers no
-      // link that would lead somewhere irrelevant.
+      // An agent lives with its owner, and the owner's People page now has a
+      // Shares section — what they own, which groups can use it, and how to
+      // change that. So the link lands on something that answers "what is
+      // this and who has it". (/agents?agent=<id> is the owner's own builder
+      // and shows an admin nothing — the dead end the owner found.)
+      agent: (id, item) => (item && item.owner_user_id)
+        ? `/admin/users/${encodeURIComponent(item.owner_user_id)}#shares`
+        : "",
       // Carries the group out with it. The person lens already round-trips
       // (`?from=simulate&user=`) so a package page opened from an audit says
       // whose audit and offers the way back; the group lens did not, so the
@@ -3908,7 +3911,7 @@
       // What the link is FOR, by kind. "where it lives" was right for a
       // collection (its Library page) and wrong for an agent, whose only
       // reachable home for an admin is its owner.
-      const ownLabel = "where it lives ↗";
+      const ownLabel = t.type_key === "agent" ? "owner ↗" : "where it lives ↗";
       // An inherited row is NOT this group's to change: the tier control and
       // Revoke both act on the Everyone grant, so offering them here would
       // let an admin quietly alter a company-wide grant while looking at one
