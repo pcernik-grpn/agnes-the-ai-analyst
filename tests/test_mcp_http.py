@@ -342,6 +342,12 @@ class TestToolRegistration:
             "schema",
             "describe",
             "query",
+            # Self-service policy diagnosis (issue #2147) — "why is this
+            # table empty/masked for me". Triple-surface with GET
+            # /api/me/effective-access; no CLI verb (the endpoint is
+            # grandfathered REST-only, see
+            # tests/test_documentation_api_triple_surface.py).
+            "effective_access",
             "skills",
             # Triple-surface coverage for /documentation/api — agents read
             # the curated REST guide without leaving the chat. See
@@ -739,6 +745,66 @@ class TestQueryTool:
             _run(mod.query("SELECT 1"))
 
         assert mock_post.call_args[1]["json"]["limit"] == 1000
+
+
+# ── effective_access tool (issue #2147) ─────────────────────────────────────────
+
+
+def _effective_access_payload() -> dict:
+    return {
+        "is_admin": False,
+        "items": [],
+        "tables": [
+            {
+                "table_id": "invoices",
+                "policy": {"applies": False, "rows_visible": None, "reason": "ok", "note": None},
+            },
+            {
+                "table_id": "orders",
+                "policy": {"applies": True, "rows_visible": 0, "reason": "empty_slice", "note": None},
+            },
+        ],
+    }
+
+
+class TestEffectiveAccessTool:
+    def test_calls_the_self_service_endpoint_with_caller_credentials(self):
+        mod = _import_mod()
+
+        with patch("app.api.mcp_http._current_token") as tv, patch("httpx.AsyncClient") as MC:
+            tv.get.return_value = "caller-tok"
+            mock_get = AsyncMock(return_value=_mock_resp(_effective_access_payload()))
+            MC.return_value.__aenter__.return_value.get = mock_get
+            result = _run(mod.effective_access())
+
+        called_url, called_kwargs = mock_get.call_args[0][0], mock_get.call_args[1]
+        assert "/api/me/effective-access" in called_url
+        assert called_kwargs["headers"]["Authorization"] == "Bearer caller-tok"
+        assert result["tables"][0]["table_id"] == "invoices"
+
+    def test_table_argument_returns_only_that_entry(self):
+        mod = _import_mod()
+
+        with patch("app.api.mcp_http._current_token") as tv, patch("httpx.AsyncClient") as MC:
+            tv.get.return_value = "tok"
+            MC.return_value.__aenter__.return_value.get = AsyncMock(
+                return_value=_mock_resp(_effective_access_payload())
+            )
+            result = _run(mod.effective_access(table="orders"))
+
+        assert result["table_id"] == "orders"
+        assert result["policy"]["reason"] == "empty_slice"
+
+    def test_unknown_table_raises_structured_not_found_with_hint(self):
+        mod = _import_mod()
+
+        with patch("app.api.mcp_http._current_token") as tv, patch("httpx.AsyncClient") as MC:
+            tv.get.return_value = "tok"
+            MC.return_value.__aenter__.return_value.get = AsyncMock(
+                return_value=_mock_resp(_effective_access_payload())
+            )
+            with pytest.raises(ValueError, match="catalog"):
+                _run(mod.effective_access(table="does-not-exist"))
 
 
 # ── stack tools (issue #621) ──────────────────────────────────────────────────────

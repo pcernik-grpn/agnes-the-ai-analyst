@@ -108,6 +108,8 @@ The no-SQL builder can also emit two **partial** masks — `last4` (`****6789`) 
 
 The function and construct allowlist is intentionally narrow and closed (logical connectors, `CASE`/`IF`/`COALESCE`/`NULLIF`, `CAST`, `LOWER`, `UPPER`, `TRIM`, `LENGTH`, `CONCAT`, `SUBSTRING`, the regex family for literal patterns, `md5`, `agnes_hmac`, and the group-membership functions below) — anything else is rejected at save time, not silently ignored. A policy body is arbitrary SQL that runs on the server's analytics connection on every analyst request; the allowlist is what keeps that a bounded escalation instead of an open one.
 
+**A masked column stays in the schema; a hidden one disappears.** `* EXCLUDE (national_id)` removes `national_id` from every schema surface — it is `hidden`. `md5(email) AS email` keeps `email` in the schema (same name, same reported type), but it is `masked`: the returned value is the transform's output, not the base column's raw value. `GET /api/v2/schema/{id}` marks a masked column `"masked": true` (alongside the existing `"hidden": true`/`false`), `agnes schema <table>` appends `(masked by access policy)` to its description in the human render (`--json` stays the raw payload), and the catalog table page badges it in the "Columns" section. The marker comes from a static read of the policy body's own `SELECT` list — a `md5(email) AS email` and a plain `email` pass-through DESCRIBE identically (same name, same `VARCHAR`), so there is no runtime signal to diff; only the SQL text itself says which one an admin wrote.
+
 **Don't re-derive a column `*` still emits.** `* EXCLUDE (national_id), md5(email) AS email` looks right but leaves `email` out of the `EXCLUDE` list, so the star still emits the original *and* the re-derived expression appends a second column with the same name — DuckDB accepts the duplicate silently, and every serializer either keeps the first (plaintext) occurrence under the plain name or renames the second one, putting the unmasked value exactly where a caller expects the masked one. Always exclude a column before re-deriving it under the same name (`EXCLUDE (national_id, email)`, as above) — Agnes rejects a policy whose output has a duplicate column name at save time (`policy_duplicate_output_column`).
 
 ### The group-membership idiom
@@ -230,6 +232,16 @@ Silent row filtering is actively dangerous — an analyst (or an agent, with mor
 ```
 
 `reason` is one of `ok` / `empty_slice` / `mapping_empty` / `policy_error` / `identity_unresolvable`, each carrying a `note` explaining it (the mapping table's name and last-sync time for `mapping_empty`, for instance). This is the fastest way to answer "why does Agnes show me nothing on this table" without an admin hunting through table configuration.
+
+An agent can ask the same question mid-conversation via the `effective_access` MCP tool (issue #2147) — a read-only proxy over `GET /api/me/effective-access` with an optional `table` filter (id or name). Its docstring tells the model to call it before reporting an unexpectedly empty or small result, and how to act on each `reason`. No admin variant is exposed over MCP; auditing someone else's access stays REST-only.
+### Shared agents
+
+Which identity `$user_email` / `$user_groups` bind to depends on *how* a caller reaches the agent — `src/access_policy.py::_resolve_identity`:
+
+- **A surface that binds the OWNER.** A Slack channel bound to an agent, and a scheduled run, both run the turn AS THE AGENT'S OWNER end to end — session identity, sandbox workspace, and the row-policy binding all resolve from one identity, regardless of who mentioned the bot or which schedule fired. Everyone who can use the agent through that surface gets the **owner's** row slice.
+- **A direct caller binds itself.** Agent-as-API (`POST /api/v1/agents/{slug}/responses`), a chat session run as a shared agent, and a delegated turn (`@delegate`) each carry the actual caller's own identity (`AgentPrincipal.caller_user_id` / `caller_email`), so each is filtered by its OWN slice — the owner's grant only bounds *which tables* the agent reaches, never whose rows come back.
+
+The `/agents` builder page discloses this before it becomes a surprise: when a table reachable through the agent's declared Data & resources (a data package, expanded to its member tables) carries an access policy, the Boundaries panel shows a warning naming the table(s) and the **owner's** `rows_visible` / `reason` for each — the exact slice a Slack channel or scheduled run would return. The same fields ride on `GET /api/v1/agents` / `GET /api/v1/agents/{id}` as `policied_tables_in_scope` (an id list) and `policied_tables` (one `{table_id, name, policy}` entry per policied table, `policy` being the same shape as the effective-access block above), so `agnes agent show` prints the identical warning. This is disclosure only — it changes no enforcement; the owner-binding behaviour above is unchanged and, for a direct caller, was already correct.
 
 ### Errors
 

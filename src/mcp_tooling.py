@@ -426,6 +426,7 @@ TITLE_OVERRIDES: dict[str, str] = {
     "fact_edges": "List Fact Edges Of One Type",
     "fact_claims": "Get Fact Claims",
     "activity": "Get Activity Timeline",
+    "effective_access": "Check Table Access Policy",
 }
 
 

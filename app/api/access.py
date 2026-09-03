@@ -1463,6 +1463,20 @@ def _table_policy_diagnosis(row: dict, principal: dict) -> dict:
     return {"applies": True, "rows_visible": rows_visible, "reason": reason, "note": None}
 
 
+def table_policy_diagnosis(row: dict, principal: dict) -> dict:
+    """Public wrapper over :func:`_table_policy_diagnosis` (§10.2) for
+    callers outside this module.
+
+    Reused by the agent builder's shared-agent disclosure (design doc §12):
+    an agent surface bound to the OWNER's identity — a Slack channel bound
+    to the agent, a scheduled run — answers with the owner's slice
+    regardless of who is actually asking, so the same self-audit machinery
+    this module already trusts is what tells the owner, on their own
+    agent's page, what that slice looks like.
+    """
+    return _table_policy_diagnosis(row, principal)
+
+
 def _policy_error_diagnosis(table_id: str, *, stage: str) -> dict:
     return {
         "applies": True,
