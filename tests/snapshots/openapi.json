@@ -63790,7 +63790,7 @@
     },
     "/library/{slug}/matching-files": {
       "get": {
-        "description": "The file rows of one collection that match ``q`` \u2014 as Library child rows.\n\nWhy this exists: the Library expands a folder to a PEEK of its files\n(``_LIBRARY_FOLDER_PEEK``), and its search box is live and client-side. A\nfolder is searchable by every filename it holds, so typing a filename\nfinds the folder \u2014 but if that file is not in the ten the peek rendered,\nthe folder opened onto nothing and the reader had to click through to the\ncollection page to see the file they had already named (#2141 item 2,\nreview). The page asks this route for the rows instead, so the match is\nthe answer rather than a signpost to it.\n\nRenders through the SAME ``library_row`` macro the page uses, from the\nsame ``_library_child_row`` dict \u2014 a fragment endpoint precisely so the\nmarkup and the sharing vocabulary have one source, not a second copy in\nJavaScript that would drift from the first.\n\nRBAC: collection access, admins exempt \u2014 the same gate as\n``/library/{slug}``, because that is what this lists. Deliberately NOT the\nwider per-file rule ``library_file_detail`` uses: a caller holding a grant\non one file inside a folder may open that file, and must not be able to\nenumerate its siblings. 404 for missing AND for no-access, matching the\ncollection contract.\n\nAn empty ``q`` returns nothing: this route answers a search, and a blank\nsearch is what the peek already renders.",
+        "description": "The file rows of one collection that match ``q`` \u2014 as Library child rows.\n\nWhy this exists: the Library expands a folder to a PEEK of its files\n(``_LIBRARY_FOLDER_PEEK``, fetched by `library_folder_peek_rows` above),\nand its search box is live and client-side. A capped folder's peek is not\nits whole contents, so a search naming a file outside the peek would\notherwise find the folder (its name/description matched, or an earlier\npeek fetch is already in the DOM) and show nothing for it \u2014 the reader\nhad named a file and was handed a folder with no sign of it (#2141 item 2,\nreview). This route asks the SERVER for the matching rows instead, so the\nmatch is the answer rather than a signpost to it.\n\nRBAC: collection access, admins exempt \u2014 the same gate as\n``/library/{slug}``, because that is what this lists. Deliberately NOT the\nwider per-file rule ``library_file_detail`` uses: a caller holding a grant\non one file inside a folder may open that file, and must not be able to\nenumerate its siblings. 404 for missing AND for no-access, matching the\ncollection contract.\n\nAn empty ``q`` returns nothing: this route answers a search, and a blank\nsearch is what the peek endpoint already answers.",
         "operationId": "library_matching_file_rows_library__slug__matching_files_get",
         "parameters": [
           {
@@ -63852,6 +63852,65 @@
           }
         },
         "summary": "Library Matching File Rows",
+        "tags": [
+          "web"
+        ]
+      }
+    },
+    "/library/{slug}/peek": {
+      "get": {
+        "description": "The first ``_LIBRARY_FOLDER_PEEK`` files of one collection, as Library\nchild rows \u2014 fetched lazily the first time the Library expands a folder\nrow.\n\nRound 2 of the incident fix (2026-09-03): the index used to render this\nsame peek inline, hidden, for every folder at or under a size cap \u2014 which\nbounded what RENDERED but not what the index FETCHED (a `list_for_corpus`\ncall per non-empty collection, however small) or embedded into the\nfolder's own row (a `data-search` value built from every one of those\nfilenames). On a live instance (~392 collections, active crawls) that\nalone cost 19.6 MB of HTML whose live DOM, after the browser discarded\nthe markup's indentation, was 1.09 MB. The index card is now the\ncount/name/description alone (`library_page`); this route is the ONLY\nplace a folder's own files are read, and only on demand.\n\nSame shape as `library_matching_file_rows` (renders through the same\nmacro and dict, same RBAC, same 404-for-missing-and-no-access contract)\n\u2014 the two share `_library_child_row_context` and\n`_library_child_rows_response` rather than a third copy of either.",
+        "operationId": "library_folder_peek_rows_library__slug__peek_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "slug",
+            "required": true,
+            "schema": {
+              "title": "Slug",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Library Folder Peek Rows",
         "tags": [
           "web"
         ]

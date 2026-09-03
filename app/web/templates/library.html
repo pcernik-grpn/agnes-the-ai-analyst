@@ -260,7 +260,7 @@
                        row still opens the collection's own page. #}
                     <button type="button" class="lib-twisty" data-folder-toggle="{{ c.id }}"
                             aria-expanded="false" aria-label="Show files in {{ c.title }}">
-                      <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m9 6 6 6-6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                      {{ ds.icon('chevron-right') }}
                     </button>
                     {% elif _draggable %}
                     {# A real button, not decoration: dragging is a pointer-only
@@ -412,14 +412,18 @@
                  owner can change access — a control that can't act is worse than
                  no control. #}
               <td>
+                {# `private` maps onto the sprite's `lock` 1:1; `shared`/`workspace`
+                   keep their bespoke three-node glyph inline — the sprite carries
+                   no share-graph icon, and `users` would change what this says
+                   rather than just how it is drawn. #}
                 {% set _vis_icon %}
                   {% if c.visibility == 'private' %}
-                  <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="5" y="10.5" width="14" height="9" rx="2" stroke="currentColor" stroke-width="1.9"/><path d="M8 10.5V8a4 4 0 0 1 8 0v2.5" stroke="currentColor" stroke-width="1.9"/></svg>
+                  {{ ds.icon('lock') }}
                   {% else %}
                   <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><circle cx="18" cy="6" r="2.6" stroke="currentColor" stroke-width="1.9"/><circle cx="6" cy="12" r="2.6" stroke="currentColor" stroke-width="1.9"/><circle cx="18" cy="18" r="2.6" stroke="currentColor" stroke-width="1.9"/><path d="M8.4 10.8l7.2-3.6M8.4 13.2l7.2 3.6" stroke="currentColor" stroke-width="1.9"/></svg>
                   {% endif %}
                 {% endset %}
-                {% set _chevron %}<svg class="lib-vis__caret" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m6 9 6 6 6-6" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>{% endset %}
+                {% set _chevron %}{{ ds.icon('chevron-down', klass='lib-vis__caret') }}{% endset %}
                 {% if c.ownership == 'shared_with_me' %}
                 {# `--readonly` is the colour, not just a hook: this badge is the
                    one Sharing state the caller cannot act on, so it must not
@@ -633,6 +637,28 @@
                 </div>
               </td>
             </tr>
+{% endmacro %}
+
+{# ── The Files section's own "Show more" — a full row per page, not a peek ──
+   `_LIBRARY_SECTION_PAGE_CAP` (round 2 of the incident fix): once a
+   collection's own cost is bounded, an instance with hundreds of them can
+   still be over budget purely on COUNT — this is that last lever. A plain
+   link (full page reload, `?files_limit=` doubled) rather than a fetch-and-
+   splice like the folder peek: this row can add hundreds of NEW top-level
+   rows the toolbar's search/filter/sort state has never seen, and re-running
+   `apply()` over a freshly-rendered section is simpler and no slower than
+   keeping a client-side splice in step with all three. #}
+{% macro library_section_more_row(href) %}
+          <tr class="lib-row lib-row--more" data-section-more-row="1">
+            <td colspan="4">
+              <div class="lib-namecell">
+                <a class="lib-more__link" href="{{ href }}">
+                  Show more collections
+                  <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                </a>
+              </div>
+            </td>
+          </tr>
 {% endmacro %}
 {# Library — everything the caller has, in one place. Two item kinds share one
    table: ARTEFACTS (file_corpora uploads — images, documents, data files and
@@ -2780,6 +2806,7 @@
           {% endfor %}
           {% if c.children_hidden %}{{ folder_more_row(c) }}{% endif %}
           {% endfor %}
+          {% if sec.key == 'files' and library_files_more_href %}{{ library_section_more_row(library_files_more_href) }}{% endif %}
         </tbody>
       </table>
     </div>
@@ -3195,6 +3222,11 @@
   //: rather than two that can disagree.
   const matched = new Map();   // folderId -> query string
   let matchTimer = null;
+  //: Folder ids whose peek rows have already been fetched (or are in
+  //: flight) — `true` once landed, a Promise while the request is out —
+  //: so a second expand of the same folder (or a stray double-click) never
+  //: re-asks the server (see `fetchPeek`).
+  const peeked = new Map();
 
   // A drag frequently ends with a click event on the element that was dragged.
   // Without this latch, dropping a file would ALSO open its detail page. Declared
@@ -4320,10 +4352,57 @@
   });
 
   // ── Folders: expand to reveal the files inside ──────────────────────────
-  //    Children are server-rendered right after their folder row and start
-  //    hidden, so expanding is a visibility flip (no fetch, and the rows are
-  //    already part of the engine's filter/sort set).
+  //    Children are NOT server-rendered any more (round 2 of the incident
+  //    fix, 2026-09-03: the index card is the count/name/description alone —
+  //    see `_LIBRARY_FOLDER_PEEK` in router.py). Expanding a folder for the
+  //    first time fetches its peek from `GET /library/{slug}/peek`, exactly
+  //    the way a search past the peek already fetches `matching-files`
+  //    (`fetchMatches` below) — this is that same shape, unconditional
+  //    rather than query-gated. `peeked` caches the result per folder id so
+  //    a second expand (or a stray double-click) is a pure visibility flip.
   //    (`openFolders` itself is declared ABOVE the toolbar — see the note there.)
+  async function fetchPeek(folderRow) {
+    const id = folderRow.dataset.itemId;
+    const slug = folderRow.dataset.slug;
+    if (!slug || peeked.has(id)) return;
+    let resolveDone;
+    peeked.set(id, new Promise(r => { resolveDone = r; }));   // claimed before the await
+    let html = '';
+    try {
+      const resp = await fetch('/library/' + encodeURIComponent(slug) + '/peek', { credentials: 'same-origin' });
+      if (!resp.ok) throw new Error(resp.status);
+      html = await resp.text();
+    } catch (_) {
+      peeked.delete(id);       // a retry (e.g. the next expand) gets another chance
+      resolveDone();
+      return;
+    }
+    const more = document.querySelector('[data-more-row][data-parent-id="' + id + '"]');
+    const tpl = document.createElement('template');
+    tpl.innerHTML = html;
+    const rows = Array.prototype.slice.call(tpl.content.querySelectorAll('tr'));
+    // With a "more" row below, every fetched row slots in right before it
+    // (same insertion point `fetchMatches` uses). With none — the whole
+    // folder fit in the peek — there is nowhere fixed to insert BEFORE, so
+    // each row instead goes immediately after the previous one, chained off
+    // the folder's own row; `folderRow.parentNode` (the section's shared
+    // `<tbody>`) would have appended past every OTHER collection below it.
+    let anchor = folderRow;
+    rows.forEach(tr => {
+      tr.hidden = true;        // syncChildren decides visibility
+      // A "more" row below already carries `lib-row--lastchild` and ends the
+      // connector rail; only the true last child does when there is none.
+      if (more) {
+        tr.classList.remove('lib-row--lastchild');
+        more.parentNode.insertBefore(tr, more);
+      } else {
+        anchor.insertAdjacentElement('afterend', tr);
+        anchor = tr;
+      }
+    });
+    resolveDone();
+    syncChildren();            // reveal what just landed, if the folder is open
+  }
   function setFolderOpen(folderId, open) {
     if (open) openFolders.add(folderId); else openFolders.delete(folderId);
     const toggle = document.querySelector('[data-folder-toggle="' + folderId + '"]');
@@ -4333,6 +4412,10 @@
       // the twisty's own aria-expanded, so the whole row reads as heading a branch.
       const row = toggle.closest('tr.lib-row');
       if (row) row.classList.toggle('is-open', open);
+      if (open) {
+        const folderRow = toggle.closest('tr.lib-row');
+        if (folderRow) fetchPeek(folderRow);
+      }
     }
     syncChildren();
   }

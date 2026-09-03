@@ -1300,6 +1300,11 @@ READ_POSTURE: dict[str, str] = {
     # for the same reason — it renders rows the caller can already read on
     # `GET /library/{slug}`, and it is gated on that same collection access.
     "GET /library/{slug}/matching-files": "exempt:ui_support",
+    # An HTML FRAGMENT of a folder's own peek rows, fetched by the Library
+    # when a folder row is expanded (round 2 of the 2026-09-03 incident fix
+    # — a folder's files are no longer read at all at index-render time).
+    # Same posture and the same reason as the row above.
+    "GET /library/{slug}/peek": "exempt:ui_support",
     "GET /login": "exempt:ui_support",
     "GET /login/email": "exempt:ui_support",
     "GET /login/password": "exempt:ui_support",

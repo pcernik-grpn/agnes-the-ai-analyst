@@ -2462,6 +2462,14 @@ KNOWN_UNTESTED = {
     # than the file page's wider per-file rule (a per-file grant must not
     # enumerate siblings).
     "GET /library/{slug}/matching-files",
+    # The HTML fragment a folder row's twisty fetches on first expand (round
+    # 2 of the 2026-09-03 incident fix — a folder's files are no longer read
+    # at index-render time at all, however small the folder). Same exclusion
+    # reason as the row above: needs a real slug AND a collection with files.
+    # Behaviour covered in tests/test_web_library_artefacts_reading.py (the
+    # peek rows, the cap, 404 for unknown AND for no-access) and
+    # tests/test_web_library_files_folders.py (the child-row markup itself).
+    "GET /library/{slug}/peek",
     # Authoring studio + suggestion queue + memory-mining consent — covered by
     # dedicated suites (tests/test_authoring_suggestions_api.py, tests/test_web_studio.py);
     # web-form / admin-moderation flows, not part of the parameter-free smoke sweep.
