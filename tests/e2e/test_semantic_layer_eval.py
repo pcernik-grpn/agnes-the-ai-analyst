@@ -100,7 +100,7 @@ def eval_run(anthropic_client) -> tuple[ArmResult, ArmResult]:
 
     baseline = run_arm(anthropic_client, questions, has_models=False)
     semantic = run_arm(anthropic_client, questions, has_models=True)
-    # stderr, not stdout: the per-question table is the artefact an operator
+    # stderr, not stdout: the per-question table is the artifact an operator
     # reads when the gate moves, and it must survive pytest's capture whether
     # or not the run failed.
     print(format_report(baseline, semantic), file=sys.stderr)

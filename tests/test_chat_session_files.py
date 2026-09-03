@@ -455,7 +455,7 @@ def test_download_directory_404(client: TestClient, session_dir: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Save to Library (artefact)
+# Save to Library (artifact)
 # ---------------------------------------------------------------------------
 
 
