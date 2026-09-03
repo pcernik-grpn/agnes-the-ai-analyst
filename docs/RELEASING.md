@@ -209,6 +209,8 @@ writes that field, there is no drift to reconcile and no need to cross-check
   `Release`-pipeline, Devin Review) are advisory — green/red doesn't gate merge.
 - **`enforce_admins: true`** in branch protection means `--admin` flag on
   `gh pr merge` does NOT bypass. Don't try; just fix the underlying block.
+- **A cut PR's CI needs one click before it can merge.** See § A cut PR
+  arrives with its CI unapproved below.
 - **`lint-workflows.yml` is advisory.** Triggered on changes to
   `.github/workflows/**` or `scripts/ops/**.sh`. Runs `actionlint` on
   workflow YAMLs + `shellcheck --severity=warning` on freestanding ops
@@ -217,6 +219,42 @@ writes that field, there is no drift to reconcile and no need to cross-check
   once the repo is actionlint-clean. The `shellcheck` step IS blocking at
   warning+ severity — info/style findings ride through, real bugs break
   CI.
+
+### A cut PR arrives with its CI unapproved
+
+`daily-cut.yml` opens the cut PR as `github-actions[bot]`, and GitHub queues
+the `pull_request` workflow run for a bot-opened PR in **`action_required`**
+— created, but not started. Until someone clicks **Approve and run
+workflows** on it, `test` and `docker-build` never report, so `gh pr merge`
+answers:
+
+    405  Repository rule violations found
+         2 of 2 required status checks are expected
+
+That is the whole thing: one click, then merge normally. Nothing is broken
+and no special privilege is involved — the run exists and is waiting.
+
+**Do not reach for `gh workflow run ci.yml` instead.** It looks like the
+obvious workaround and it is not one. A `workflow_dispatch` run does put
+green check-runs on the PR's head SHA — 18 of them on the 0.97.0 cut,
+`test` and `docker-build` among them — and the merge is refused anyway with
+that same message. Tested on two separate cut PRs (#2144, #2159). The
+required contexts want the run from the `pull_request` event; the dispatched
+one does not stand in for it. The dispatch is still useful for *checking* a
+cut's content before approving, but it does not open the gate.
+
+Two things that make this easy to misdiagnose:
+
+- `mergeable_state` reads **`blocked`** in this state. Everywhere else in
+  this repo that means "review required", and here it does not — nothing
+  about approving the PR will clear it.
+- The check tab looks *empty* rather than red, so it reads as "CI never ran"
+  rather than "CI is waiting for you".
+
+For the record of what a healthy cut looks like: on 0.96.0's cut the
+`pull_request` run was created at `06:15:52`, the same minute the bot pushed
+the branch, and shows `run_attempt: 2` — the attempt bump is the approve/
+re-run click, not a second push.
 
 ### Recovery when something derails
 
