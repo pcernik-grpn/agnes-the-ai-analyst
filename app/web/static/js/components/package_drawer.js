@@ -693,12 +693,41 @@
     renderTables();
   }
 
-  /* Leave for the connect flow. The draft is the only thing holding what has
-     been typed, so it is parked BEFORE navigating, never after. `from` tells
-     /admin/data-sources to offer the way back. */
+  /* "Connect a source", two ways.
+
+     Where the host can open the Add-data wizard over us — the builder PAGE,
+     which loads it — nothing is left: the drawer opens on top, and when it
+     has registered tables it hands the rows straight back. That is the whole
+     reason the wizard was lifted out of admin_data_sources.
+
+     Where it cannot — the compact drawer on /admin/tables, which is already
+     an overlay over a lens and cannot stack another — we navigate, and the
+     draft is what makes coming back free. Parked BEFORE the navigation,
+     never after. */
   function leaveToConnect() {
+    if (st && typeof st.openConnectWizard === 'function') {
+      if (st.openConnectWizard(function (tables) { adoptRegistered(tables); })) {
+        closePicker();
+        return;
+      }
+    }
     persistDraft('connect');
     window.location.href = '/admin/data-sources?add=1&from=package-builder';
+  }
+
+  /* Rows handed back by the wizard, adopted without a reload.
+
+     The registry is re-read rather than trusted from the payload: the wizard
+     reports what it registered, but the picker's tree needs each row's
+     project, bucket and query mode as the REGISTRY has them, and inventing
+     that here is how the two drift. The ids are what the hand-off is for. */
+  function adoptRegistered(tables) {
+    var ids = (tables || []).map(function (t) { return t && t.id; }).filter(Boolean);
+    if (!ids.length) return;
+    ids.forEach(function (id) { st.tablesSelected.add(id); });
+    st.returnNote = 'Added ' + (ids.length === 1 ? 'the table' : ids.length + ' tables') +
+      ' you just registered.';
+    hydrateTables(st.mode === 'edit' ? st.pkgId : null, true);
   }
 
   /* The one case the panel still has to speak up about: the package cannot
@@ -1082,7 +1111,7 @@
 
   /* `pkgId` is null on a create: the registry and the project names are
      fetched exactly the same way, and the member set is simply empty. */
-  function hydrateTables(pkgId) {
+  function hydrateTables(pkgId, keepSelected) {
     Promise.all([
       pkgId ? api(PKG_API + '/' + encodeURIComponent(pkgId))
             : Promise.resolve({ tables: [] }),
@@ -1123,7 +1152,12 @@
       });
       var members = (pkg.tables || []).map(function (t) { return t.id; });
       st.tablesOriginal = new Set(members);
-      st.tablesSelected = new Set(members);
+      /* On OPEN the selection is the package's membership. On a re-read
+         mid-edit (the wizard just registered rows and handed them back) it
+         is whatever is ticked right now, plus them — rebuilding from
+         membership there would silently drop every tick the admin had made
+         before they went to connect a source. */
+      if (!keepSelected) st.tablesSelected = new Set(members);
       // A member the registry no longer lists still has to be shown — a row
       // you cannot see is a row you cannot remove.
       var known = new Set(st.registry.map(function (t) { return t.id; }));
@@ -1412,6 +1446,10 @@
       pkgId: opts.pkgId || null,
       chipHost: opts.chipHost || null,
       onCreated: opts.onCreated || function () {},
+      /* Host hook: open the Add-data wizard over this builder and call back
+         with what it registered. Absent on the compact /admin/tables drawer,
+         which navigates instead — see leaveToConnect(). */
+      openConnectWizard: opts.openConnectWizard || null,
       onSaved: opts.onSaved || function () {},
       slugTouched: mode === 'edit',
       groupsLoaded: false,

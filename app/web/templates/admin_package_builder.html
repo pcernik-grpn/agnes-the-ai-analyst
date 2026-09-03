@@ -35,6 +35,10 @@
 {# The builder workspace: two panes, the shell header, the full-bleed
    breakout. Shared with the other builders — see builder.css. #}
 <link rel="stylesheet" href="{{ static_url('css/builder.css') }}">
+{# The Add-data wizard's own styles. Of the 144 classes that drawer uses, 118
+   were defined only inside admin_data_sources.html, so without this it
+   arrives here as unstyled markup. #}
+<link rel="stylesheet" href="{{ static_url('css/ds_page.css') }}">
 {% endblock %}
 
 {% block page_head %}
@@ -46,6 +50,11 @@
 
 {% block page_surface %}
 <div id="pkg-builder-view" class="ag-builder-mount"></div>
+{# The Add-data wizard, so "Connect a source" opens OVER the package being
+   written instead of sending the admin to another page for it. Same markup
+   and same script /admin/data-sources uses — one implementation, so the two
+   entries cannot drift. #}
+{% include "_add_data_wizard.html" %}
 {% endblock %}
 
 {% block scripts %}
@@ -55,6 +64,15 @@
 {# The category picker initialises itself from this; without it the drawer
    renders the branded dropdown's markup with nothing driving it. #}
 <script src="{{ static_url('js/components/ds_dropdown.js') }}"></script>
+{# The wizard's behaviour. `DS_BOOT` is the handover for the values that
+   page renders server-side; the builder has no connections list or source
+   strip of its own, so it hands over empty ones and ds_page.js skips the
+   connections-page boot it guards on those. #}
+<script>
+  window.DS_BOOT = { sourcePipelines: {}, derivedSources: [], warnIcon: "" };
+</script>
+<script src="{{ static_url('js/ds_helpers.js') }}"></script>
+<script src="{{ static_url('js/ds_page.js') }}"></script>
 <script src="{{ static_url('js/components/package_drawer.js') }}"></script>
 <script>
   (function () {
@@ -82,6 +100,16 @@
       },
       onSaved: function () {
         window.location.href = '/admin/data-packages/' + encodeURIComponent(editId);
+      },
+      {# "Connect a source", answered in place. The wizard opens over the
+         package, and when it has registered tables it hands the rows back
+         here — so the draft never has to be parked and reloaded. The
+         component falls back to the navigation when this is absent, which
+         is what /admin/tables' compact drawer still does. #}
+      openConnectWizard: function (onRegistered) {
+        if (!window.AgnesAddDataWizard) return false;
+        window.AgnesAddDataWizard.open({ onRegistered: onRegistered });
+        return true;
       },
     });
   })();
