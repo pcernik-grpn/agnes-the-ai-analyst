@@ -274,23 +274,109 @@ jobs:
           username: oauth2accesstoken
           password: ${{ steps.gcp_auth.outputs.access_token }}
 
+      # ── The tag list, assembled ONCE ────────────────────────────────────
+      #    The push below is attempted twice (see its own note), and two
+      #    copies of this list is the drift hazard that costs an image its
+      #    `dev-<slug>` tag the day someone edits one copy. The expressions
+      #    are the SAME ones that were inline on the push step — GitHub
+      #    evaluates them here exactly as it did there — and every empty one
+      #    (a non-dev channel, no user prefix, no AR mirror) is dropped
+      #    rather than passed on as a blank line.
+      - name: Assemble image tags
+        id: tags
+        env:
+          GHCR_CHANNEL: ghcr.io/${{ github.repository }}:${{ steps.meta.outputs.channel }}
+          GHCR_VERSIONED: ghcr.io/${{ github.repository }}:${{ steps.meta.outputs.versioned_tag }}
+          GHCR_SHA: ghcr.io/${{ github.repository }}:sha-${{ steps.meta.outputs.short_sha }}
+          GHCR_DEV_SLUG: ${{ steps.meta.outputs.channel == 'dev' && format('ghcr.io/{0}:dev-{1}', github.repository, steps.meta.outputs.branch_slug) || '' }}
+          GHCR_DEV_PREFIX_LATEST: ${{ steps.meta.outputs.channel == 'dev' && steps.meta.outputs.user_prefix != '' && format('ghcr.io/{0}:dev-{1}-latest', github.repository, steps.meta.outputs.user_prefix) || '' }}
+          AR_CHANNEL: ${{ steps.armirror.outputs.enabled == 'true' && format('{0}-docker.pkg.dev/{1}/{2}/agnes:{3}', vars.AR_LOCATION, vars.AR_PROJECT, vars.AR_REPO, steps.meta.outputs.channel) || '' }}
+          AR_VERSIONED: ${{ steps.armirror.outputs.enabled == 'true' && format('{0}-docker.pkg.dev/{1}/{2}/agnes:{3}', vars.AR_LOCATION, vars.AR_PROJECT, vars.AR_REPO, steps.meta.outputs.versioned_tag) || '' }}
+        run: |
+          set -euo pipefail
+          {
+            echo "list<<TAGS_EOF"
+            for t in "$GHCR_CHANNEL" "$GHCR_VERSIONED" "$GHCR_SHA" \
+                     "$GHCR_DEV_SLUG" "$GHCR_DEV_PREFIX_LATEST" \
+                     "$AR_CHANNEL" "$AR_VERSIONED"; do
+              if [ -n "$t" ]; then echo "$t"; fi
+            done
+            echo "TAGS_EOF"
+          } >> "$GITHUB_OUTPUT"
+          # The three unconditional GHCR tags are what every consumer pins
+          # to; losing them silently would publish an image nothing can
+          # find, so this refuses rather than pushing a partial tag set.
+          for required in "$GHCR_CHANNEL" "$GHCR_VERSIONED" "$GHCR_SHA"; do
+            case "$required" in
+              *:|*:'') echo "::error::empty image tag computed: '$required'"; exit 1 ;;
+            esac
+          done
+
+      # ── Build, then push — twice if the registry drops the first one ─────
+      #    `unknown blob` from GHCR has failed this job on a fully SUCCESSFUL
+      #    build more than once (`09ce1cf3` on main; PR #2172 twice in a row
+      #    on a diff of two comment edits and two docs files). The image is
+      #    built and every layer uploaded, then the registry rejects a blob
+      #    it should already hold. Nothing about it is diagnosable from this
+      #    side and it is not reproducible on demand — other branches pushed
+      #    successfully in the same minutes.
+      #
+      #    So this is RESILIENCE, not a fix: the root cause is unknown. The
+      #    retry is safe because a push is idempotent and buildx keeps the
+      #    built layers in its local state, so attempt two re-pushes rather
+      #    than rebuilding. `continue-on-error` on the first attempt is what
+      #    lets the second one exist; the gate step after them is what keeps
+      #    a double failure RED, so this can never turn a genuinely broken
+      #    push green.
+      #
+      #    Same posture as `smoke-test`'s retried GHCR login below (issue
+      #    #892): an infra flake must not be indistinguishable from a broken
+      #    image.
       - name: Build and push
+        id: push
+        continue-on-error: true
         uses: docker/build-push-action@v7
         with:
           push: true
+          # Off because it is the one part of this push with a NAMED
+          # suspicion behind it. v6+ of this action turns provenance
+          # attestations on by default, which makes the pushed reference an
+          # OCI index carrying a second, attestation manifest — the
+          # configuration GHCR's `unknown blob` reports cluster around.
+          # Nothing in this repo consumes an attestation (no cosign, no SLSA
+          # verification, no policy gate — grepped), so this removes an
+          # artifact no reader has rather than a guarantee anyone relies on.
+          provenance: false
           build-args: |
             AGNES_VERSION=${{ steps.pkgver.outputs.version }}
             RELEASE_CHANNEL=${{ steps.meta.outputs.channel }}
             AGNES_COMMIT_SHA=${{ github.sha }}
             AGNES_TAG=${{ steps.meta.outputs.versioned_tag }}
-          tags: |
-            ghcr.io/${{ github.repository }}:${{ steps.meta.outputs.channel }}
-            ghcr.io/${{ github.repository }}:${{ steps.meta.outputs.versioned_tag }}
-            ghcr.io/${{ github.repository }}:sha-${{ steps.meta.outputs.short_sha }}
-            ${{ steps.meta.outputs.channel == 'dev' && format('ghcr.io/{0}:dev-{1}', github.repository, steps.meta.outputs.branch_slug) || '' }}
-            ${{ steps.meta.outputs.channel == 'dev' && steps.meta.outputs.user_prefix != '' && format('ghcr.io/{0}:dev-{1}-latest', github.repository, steps.meta.outputs.user_prefix) || '' }}
-            ${{ steps.armirror.outputs.enabled == 'true' && format('{0}-docker.pkg.dev/{1}/{2}/agnes:{3}', vars.AR_LOCATION, vars.AR_PROJECT, vars.AR_REPO, steps.meta.outputs.channel) || '' }}
-            ${{ steps.armirror.outputs.enabled == 'true' && format('{0}-docker.pkg.dev/{1}/{2}/agnes:{3}', vars.AR_LOCATION, vars.AR_PROJECT, vars.AR_REPO, steps.meta.outputs.versioned_tag) || '' }}
+          tags: ${{ steps.tags.outputs.list }}
+
+      - name: Build and push (retry)
+        id: push_retry
+        if: steps.push.outcome == 'failure'
+        uses: docker/build-push-action@v7
+        with:
+          push: true
+          provenance: false
+          build-args: |
+            AGNES_VERSION=${{ steps.pkgver.outputs.version }}
+            RELEASE_CHANNEL=${{ steps.meta.outputs.channel }}
+            AGNES_COMMIT_SHA=${{ github.sha }}
+            AGNES_TAG=${{ steps.meta.outputs.versioned_tag }}
+          tags: ${{ steps.tags.outputs.list }}
+
+      # Without this the job would be green whenever the first attempt was
+      # skipped-by-continue-on-error and the retry never ran or also failed
+      # — i.e. `continue-on-error` alone would silently publish nothing and
+      # report success, which is worse than the flake.
+      - name: Fail if neither push attempt landed the image
+        if: steps.push.outcome == 'failure' && steps.push_retry.outcome != 'success'
+        run: |
+          echo "::error::Both push attempts failed (first: ${{ steps.push.outcome }}, retry: ${{ steps.push_retry.outcome }}). This is not the transient GHCR fault the retry exists for — read the buildx output above."
+          exit 1
 
   smoke-test:
     needs: build-and-push
