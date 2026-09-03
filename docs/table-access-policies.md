@@ -234,6 +234,14 @@ Silent row filtering is actively dangerous — an analyst (or an agent, with mor
 `reason` is one of `ok` / `empty_slice` / `mapping_empty` / `policy_error` / `identity_unresolvable`, each carrying a `note` explaining it (the mapping table's name and last-sync time for `mapping_empty`, for instance). This is the fastest way to answer "why does Agnes show me nothing on this table" without an admin hunting through table configuration.
 
 An agent can ask the same question mid-conversation via the `effective_access` MCP tool (issue #2147) — a read-only proxy over `GET /api/me/effective-access` with an optional `table` filter (id or name). Its docstring tells the model to call it before reporting an unexpectedly empty or small result, and how to act on each `reason`. No admin variant is exposed over MCP; auditing someone else's access stays REST-only.
+### Shared agents
+
+Which identity `$user_email` / `$user_groups` bind to depends on *how* a caller reaches the agent — `src/access_policy.py::_resolve_identity`:
+
+- **A surface that binds the OWNER.** A Slack channel bound to an agent, and a scheduled run, both run the turn AS THE AGENT'S OWNER end to end — session identity, sandbox workspace, and the row-policy binding all resolve from one identity, regardless of who mentioned the bot or which schedule fired. Everyone who can use the agent through that surface gets the **owner's** row slice.
+- **A direct caller binds itself.** Agent-as-API (`POST /api/v1/agents/{slug}/responses`), a chat session run as a shared agent, and a delegated turn (`@delegate`) each carry the actual caller's own identity (`AgentPrincipal.caller_user_id` / `caller_email`), so each is filtered by its OWN slice — the owner's grant only bounds *which tables* the agent reaches, never whose rows come back.
+
+The `/agents` builder page discloses this before it becomes a surprise: when a table reachable through the agent's declared Data & resources (a data package, expanded to its member tables) carries an access policy, the Boundaries panel shows a warning naming the table(s) and the **owner's** `rows_visible` / `reason` for each — the exact slice a Slack channel or scheduled run would return. The same fields ride on `GET /api/v1/agents` / `GET /api/v1/agents/{id}` as `policied_tables_in_scope` (an id list) and `policied_tables` (one `{table_id, name, policy}` entry per policied table, `policy` being the same shape as the effective-access block above), so `agnes agent show` prints the identical warning. This is disclosure only — it changes no enforcement; the owner-binding behaviour above is unchanged and, for a direct caller, was already correct.
 
 ### Errors
 

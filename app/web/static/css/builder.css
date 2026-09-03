@@ -212,6 +212,11 @@ a.ag-addrow { display: block; box-sizing: border-box; text-align: center; text-d
 .ag-prog-n { font-weight: 700; color: var(--ds-text-primary); font-variant-numeric: tabular-nums; }
 .ag-note--err { color: var(--ds-accent-danger-ink); background: var(--ds-accent-danger-bg); border-color: var(--ds-accent-danger-line); }
 .ag-note--warn { color: var(--ds-accent-warn-ink); background: var(--ds-accent-warn-bg); border-color: var(--ds-accent-warn-line); }
+/* The per-table detail under the shared-agent access-policy warning
+   (design doc §12) — a plain list inside the existing warn note, no new
+   box or accent. */
+.ag-policy-tables { margin: 6px 0 0; padding-left: 18px; }
+.ag-policy-tables li { margin: 2px 0; }
 
 /* Boundaries (read-only, admin-managed). */
 .ag-bnd { margin-top: 12px; border: 1px solid var(--ds-border); border-radius: 10px; overflow: hidden; }
