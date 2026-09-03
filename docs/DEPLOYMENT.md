@@ -82,6 +82,19 @@ Three things to know:
   catalogue this design assumes — which signals are paging and which are
   dashboard-only — is in
   [`superpowers/specs/2026-09-03-datadog-host-monitoring-design.md`](superpowers/specs/2026-09-03-datadog-host-monitoring-design.md).
+- **The `agnes-applier` uid is reserved before the agent installs.** The
+  Datadog apt package creates its own `dd-agent` system user, and on a fresh
+  image `useradd --system` allocates the next free system uid — the same uid
+  `agnes-applier` needs pinned so it can read `/data/state/instance.yaml`
+  (#1217). The startup script now reserves `agnes-applier`'s uid as its very
+  first action, before Docker or Datadog install, and Datadog's own
+  `dd-agent` user is additionally pre-created at a fixed uid as a second,
+  order-independent guard — so enabling this on a fresh VM cannot strand the
+  applier on an unpinned uid the way it could before. See the "Reserve the
+  state-applier's pinned uid" block in `startup-script.sh.tpl` and
+  [`docs/postgres-cutover-runbook.md`](postgres-cutover-runbook.md) for the
+  degraded-mode fallback if the uid is ever unavailable for some other
+  reason.
 
 The Postgres side-car check needs a monitoring role inside each container. A
 root-owned timer (`agnes-datadog-pg-role.timer`, every 15 min) creates a

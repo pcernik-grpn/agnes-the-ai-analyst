@@ -187,3 +187,43 @@ def test_registered_noarg_tool_has_no_kwargs_param():
     required = (schema or {}).get("required") or []
     assert "kwargs" not in props, f"unexpected kwargs param: {schema}"
     assert "kwargs" not in required
+
+
+# ── behaviour annotations (issue #2161) ───────────────────────────────────
+
+
+def test_registered_tools_carry_read_only_hint_from_the_mutating_flag():
+    """An MCP client that auto-approves read-only calls keys on
+    ``annotations.readOnlyHint``; the stdio mirror derives it from the
+    listing's ``mutating`` flag exactly as the server transports do."""
+    mcp_inst = _fresh_mcp()
+    tools = _sample_tool_list()
+    tools[0]["mutating"] = False
+    tools[1]["mutating"] = True
+    with patch("cli.mcp._dynamic_passthrough.api_get_json", return_value=tools):
+        register_passthrough_tools(mcp_inst)
+    lookup = mcp_inst._tool_manager.get_tool("test-upstream.lookup")
+    weird = mcp_inst._tool_manager.get_tool("test-upstream.weird")
+    assert lookup.annotations.readOnlyHint is True and lookup.annotations.destructiveHint is False
+    assert weird.annotations.readOnlyHint is False and weird.annotations.destructiveHint is True
+
+
+def test_a_listing_without_the_mutating_field_yields_tools_that_ask():
+    """A server that predates the field: fail toward asking, never toward
+    running a possibly-writing tool unasked."""
+    mcp_inst = _fresh_mcp()
+    with patch("cli.mcp._dynamic_passthrough.api_get_json", return_value=_sample_tool_list()):
+        register_passthrough_tools(mcp_inst)
+    lookup = mcp_inst._tool_manager.get_tool("test-upstream.lookup")
+    assert lookup.annotations.readOnlyHint is False
+
+
+def test_the_two_annotation_helpers_agree():
+    """``cli/mcp/_dynamic_passthrough.py`` keeps a copy of the server-side
+    helper (it must not import the server side); pin the two to the same
+    verdicts so a change to one cannot leave the other behind."""
+    from app.api.mcp.tools_generator import passthrough_annotations as server_side
+    from cli.mcp._dynamic_passthrough import passthrough_annotations as cli_side
+
+    for mutating in (True, False, None, 1, 0):
+        assert server_side(mutating) == cli_side(mutating)

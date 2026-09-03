@@ -9,7 +9,7 @@ Template: src/repositories/corpus_files.py.
 from __future__ import annotations
 
 import secrets
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import duckdb
 
@@ -28,6 +28,16 @@ _COLS = [
 ]
 _SELECT = ", ".join(_COLS)
 _EMBED_DIM = 384
+
+# ``list_for_corpora`` is the retrieval CANDIDATE-SET fetch (#2151): every
+# accessible chunk's ``embedding FLOAT[384]`` was materialized into Python on
+# every search, whether or not anything downstream reads it (measured at
+# ~371 MB RSS for 25k chunks by scripts/bench_retrieval.py). It never
+# selects the embedding column — a caller that actually wants vectors for a
+# bounded id set (the retrieval layer's shortlist re-rank phase) uses
+# ``list_embeddings_for_ids`` instead.
+_COLS_NO_EMBED = [c for c in _COLS if c != "embedding"]
+_SELECT_NO_EMBED = ", ".join(_COLS_NO_EMBED)
 
 
 class CorpusChunksRepository:
@@ -113,13 +123,85 @@ class CorpusChunksRepository:
         ).fetchall()
         return [dict(zip(_COLS, r)) for r in rows]
 
-    def list_for_corpora(self, corpus_ids: List[str]) -> List[Dict[str, Any]]:
-        """All chunks across several corpora (for retrieval). Empty list → []."""
+    def list_for_corpora(
+        self,
+        corpus_ids: List[str],
+        *,
+        query_terms: Optional[List[str]] = None,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Candidate chunks across several corpora, for retrieval (#2151).
+
+        Column-pruned: never selects ``embedding`` (always ``None`` on the
+        returned dicts) — the retrieval layer fetches vectors separately,
+        only for a bounded shortlist, via ``list_embeddings_for_ids``.
+
+        ``query_terms`` (optional) applies a SQL-side lexical prefilter —
+        keep a chunk whose ``text`` contains ANY listed term (case-
+        insensitive substring, ``ILIKE``) — used once a corpus is over the
+        server's chunk cap so the DB does the narrowing instead of shipping
+        every row to Python. Deliberately over-inclusive (a substring
+        match, not the whole-word match the Python ranker applies): a
+        prefilter must never exclude a chunk the real ranker would have
+        scored, only shrink the set it has to look at. Terms are always
+        bound as parameters, never interpolated into the SQL text.
+
+        ``limit`` (optional) caps the row count — paired with
+        ``query_terms`` when over cap, otherwise omitted so an under-cap
+        corpus is fetched in full (unchanged behavior).
+
+        Empty ``corpus_ids`` → ``[]``.
+        """
         if not corpus_ids:
             return []
         placeholders = ", ".join("?" for _ in corpus_ids)
-        rows = self.conn.execute(
-            f"SELECT {_SELECT} FROM corpus_chunks WHERE corpus_id IN ({placeholders}) ORDER BY file_id, ordinal",
+        params: List[Any] = list(corpus_ids)
+        where_extra = ""
+        if query_terms:
+            term_clause = " OR ".join("text ILIKE ?" for _ in query_terms)
+            where_extra = f" AND ({term_clause})"
+            params.extend(f"%{term}%" for term in query_terms)
+        sql = (
+            f"SELECT {_SELECT_NO_EMBED} FROM corpus_chunks "
+            f"WHERE corpus_id IN ({placeholders}){where_extra} "
+            "ORDER BY file_id, ordinal"
+        )
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        rows = self.conn.execute(sql, params).fetchall()
+        out = []
+        for r in rows:
+            d = dict(zip(_COLS_NO_EMBED, r))
+            d["embedding"] = None
+            out.append(d)
+        return out
+
+    def count_for_corpora(self, corpus_ids: List[str]) -> int:
+        """Cheap ``COUNT(*)`` across several corpora — the precheck that
+        decides whether ``list_for_corpora`` needs the cap/prefilter path
+        (#2151). Empty ``corpus_ids`` → 0."""
+        if not corpus_ids:
+            return 0
+        placeholders = ", ".join("?" for _ in corpus_ids)
+        row = self.conn.execute(
+            f"SELECT COUNT(*) FROM corpus_chunks WHERE corpus_id IN ({placeholders})",
             list(corpus_ids),
+        ).fetchone()
+        return int(row[0]) if row else 0
+
+    def list_embeddings_for_ids(self, ids: List[str]) -> Dict[str, List[float]]:
+        """``{chunk_id: embedding}`` for the given ids that HAVE a stored
+        vector (#2151) — phase 2 of the retrieval layer's two-phase hybrid
+        fetch: rank lexically over ``list_for_corpora``'s (embedding-less)
+        candidates first, then fetch vectors only for that shortlist. An id
+        with no stored embedding (or that does not exist) is simply absent
+        from the returned mapping. Empty ``ids`` → ``{}``."""
+        if not ids:
+            return {}
+        placeholders = ", ".join("?" for _ in ids)
+        rows = self.conn.execute(
+            f"SELECT id, embedding FROM corpus_chunks WHERE id IN ({placeholders})",
+            list(ids),
         ).fetchall()
-        return [dict(zip(_COLS, r)) for r in rows]
+        return {r[0]: list(r[1]) for r in rows if r[1] is not None}
