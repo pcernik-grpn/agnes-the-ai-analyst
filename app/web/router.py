@@ -5750,7 +5750,7 @@ def _library_child_rows_response(request: Request, user: dict, conn, col: dict, 
 
 
 @router.get("/library/{slug}/peek", response_class=HTMLResponse)
-async def library_folder_peek_rows(
+def library_folder_peek_rows(
     slug: str,
     request: Request,
     user: dict = Depends(get_current_user),
@@ -5775,6 +5775,12 @@ async def library_folder_peek_rows(
     macro and dict, same RBAC, same 404-for-missing-and-no-access contract)
     — the two share `_library_child_row_context` and
     `_library_child_rows_response` rather than a third copy of either.
+
+    Plain ``def``, not ``async def``: the body is purely blocking
+    ``file_corpora_repo``/`corpus_files_repo`` DB work with zero ``await``s,
+    so FastAPI dispatches it to the thread pool instead of running it on the
+    single event loop (Tier-1 convention, `tests/test_event_loop_offload_
+    guard.py`; Devin Review on #2173).
     """
     from app.auth.access import can_access_collection
 
