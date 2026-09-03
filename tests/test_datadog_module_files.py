@@ -388,6 +388,11 @@ def test_renderer_matches_terraform_semantics():
     # this drifts, every rendering assertion above quietly changes meaning.
     assert render_template("%{ if on ~}\n    body\n%{ endif ~}\nafter\n", {"on": True}) == ("    body\nafter\n")
     assert render_template("a\n%{ if on ~}\n%{ endif ~}\n\nb\n", {"on": True}) == "a\n\nb\n"
+    # `%{~` trims backwards, and by the same "at most one newline" rule. This
+    # case is here because the renderer got it wrong: Python's `$` also matches
+    # just before a trailing newline, so re.sub fired twice on a run of blank
+    # lines. Real terraform 1.14.3 renders "a\n\nb\n" for this input.
+    assert render_template("a\n\n\n%{~ if on }b%{ endif }\n", {"on": True}) == "a\n\nb\n"
     # $${ and %%{ are the escapes for a literal ${ and %{.
     assert render_template("x=$${y//a/$Z} %%{ raw }", {}) == "x=${y//a/$Z} %{ raw }"
     # Two-variable map iteration, in key order.
@@ -467,3 +472,21 @@ def test_every_other_probe_pattern_matches_the_file_it_names():
         assert fnmatch(path, inst["pattern"]) or fnmatch(relpath(path, inst["directory"]), inst["pattern"]), (
             f"{probe}: pattern {inst['pattern']!r} does not match {basename!r}"
         )
+
+
+def test_no_shipped_script_uses_install_d():
+    """`install -d -m MODE` applies MODE to an ALREADY EXISTING directory, so
+    pointed at anything the module does not exclusively own it is a silent
+    chmod on every run. `mkdir -p` is this module's idiom and cannot do that.
+    One occurrence survived the first sweep — the agent package ships
+    conf.d/postgres.d, and the timer re-moded it every 15 minutes."""
+    module_scripts = [
+        *(p for p in (MODULE / "files").rglob("*.sh")),
+        MODULE / "startup-script.sh.tpl",
+    ]
+    for path in module_scripts:
+        for lineno, line in enumerate(path.read_text().splitlines(), 1):
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                continue  # the comments explain WHY it is not used
+            assert "install -d" not in stripped, f"{path.relative_to(MODULE)}:{lineno} uses install -d; use mkdir -p"

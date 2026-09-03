@@ -77,7 +77,12 @@ SQL
 done
 
 if [ -f "$TPL" ]; then
-    install -d -o dd-agent -g dd-agent -m 0750 "$(dirname "$OUT")" 2>/dev/null || true
+    # mkdir -p, not `install -d`: the agent package ships conf.d/postgres.d
+    # already (postgres is a bundled integration), and `install -d` would
+    # re-chown and re-chmod that existing package-owned directory on every
+    # 15-minute tick. The check config itself carries the ownership that
+    # matters, a few lines below.
+    mkdir -p "$(dirname "$OUT")" 2>/dev/null || true
     tmp=$(mktemp) || exit 0
     chmod 0600 "$tmp" 2>/dev/null || true
     rendered=$(cat "$TPL")

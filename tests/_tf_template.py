@@ -67,7 +67,10 @@ def _lex(text: str) -> list:
 # indentation and a blank line after `%{ endif ~}`, and it is verified against
 # the real renderer in tests/test_datadog_module_files.py.
 _TRIM_RIGHT = re.compile(r"^[ \t]*\r?\n?")
-_TRIM_LEFT = re.compile(r"\r?\n?[ \t]*$")
+# `\Z`, not `$`: Python's `$` also matches just before a trailing newline, so
+# `re.sub` fired twice on a run of blank lines and stripped two newlines where
+# Terraform strips one. (`_TRIM_RIGHT` is safe — `^` has only one match point.)
+_TRIM_LEFT = re.compile(r"\r?\n?[ \t]*\Z")
 
 
 def _apply_trims(tokens: list) -> list:
