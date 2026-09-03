@@ -495,6 +495,29 @@ def test_sync_facts_call_a_failed_attempt_an_attempt():
     )
 
 
+def test_failed_attempt_hands_the_error_to_a_tooltip_not_the_sentence():
+    """A real clone failure is four lines long and carries the server's
+    absolute DATA_DIR path ("git clone failed: Cloning into '/data/...'
+    remote: Repository not found..."). Inlined, it buried the two facts the
+    note exists to state — the cadence and the next run — under the reason
+    for one past failure.
+
+    So the sentence names the failure and the full text moves to a `title`,
+    which is what the table row's `.mp-err-badge` already does with the same
+    string. This pins the split: the error must reach a title attribute, and
+    must NOT be concatenated into the visible sentence."""
+    helper = _sync_schedule_helper()
+    failure = helper.split("Last attempt")[1].split("Last synced")[0]
+    assert 'title="${esc(m.last_error)}"' in failure, (
+        "the full error belongs in a title attribute, hoverable like the "
+        "table row's badge"
+    )
+    assert "failed: ${esc(m.last_error)}" not in helper, (
+        "the error must not be inlined into the visible sentence — it runs "
+        "to several lines and buries the cadence and next run"
+    )
+
+
 def test_next_nightly_sync_rolls_forward_on_the_boundary():
     """At exactly 03:00:00 UTC the next run is TOMORROW's, not the instant
     that has just arrived — so the roll-forward comparison has to be `<=`,

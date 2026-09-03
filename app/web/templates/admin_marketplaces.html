@@ -77,6 +77,13 @@
     font-size: 11px; font-weight: 500;
     cursor: help;
   }
+  /* The same fact as .mp-err-badge, inside a sentence: the pill's padding
+     left a visible gap before the following period. Carries the full error
+     in its title, like the badge. */
+  .mp-sync-failed {
+    color: var(--ds-accent-danger-ink); font-weight: 600;
+    border-bottom: 1px dotted currentColor; cursor: help;
+  }
   .mp-ok-dot { color: var(--ds-accent-success-ink); font-weight: 600; }
   .mp-token-dot {
     display: inline-block; width: 10px; height: 10px; border-radius: 50%;
@@ -630,6 +637,7 @@ function nextNightlySync() {
   if (next <= now) next.setUTCDate(next.getUTCDate() + 1);
   return window.AgnesTime.formatDateTime(next.toISOString()) || next.toISOString();
 }
+
 // The sync schedule, read once for every surface that states it. Two modals
 // ask different questions of the same facts — Details answers "why does this
 // look stale", Edit answers "can I change how this is fetched" — and #1956
@@ -655,10 +663,16 @@ function syncScheduleFacts(m) {
   if (m && m.is_builtin) {
     return { syncable: false, cadence: "None — bundled content", next: null, status: "" };
   }
+  // A failed attempt names the failure and hands the reason over on hover,
+  // like the table row's .mp-err-badge, rather than inlining the git output.
+  // A real clone failure runs to four lines and carries the server's absolute
+  // DATA_DIR path, which buried the cadence and the next run — the two facts
+  // this note exists to state.
   const status = !m || !m.last_synced_at
     ? "Never synced yet."
     : m.last_error
-    ? `Last attempt ${esc(fmtDate(m.last_synced_at))} failed: ${esc(m.last_error)}.`
+    ? `Last attempt ${esc(fmtDate(m.last_synced_at))} `
+      + `<span class="mp-sync-failed" title="${esc(m.last_error)}">failed</span>.`
     : `Last synced ${esc(fmtDate(m.last_synced_at))}.`;
   return {
     syncable: true,
