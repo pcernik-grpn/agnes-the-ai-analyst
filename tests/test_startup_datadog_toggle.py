@@ -415,6 +415,40 @@ def test_the_applier_uid_is_reserved_before_docker_and_datadog(on: str, off: str
     )
 
 
+def test_nothing_executable_precedes_the_uid_reservation(on: str, off: str):
+    """The reservation's guarantee is "before ANY package activity", and the
+    relative anchors above cannot carry it alone: a future `apt-get install`
+    (or a `curl | sh`, or another useradd) inserted ABOVE section 0 would
+    leave every before-Docker / before-Datadog comparison true while
+    re-opening the exact race the reservation exists to close — any
+    package's postinst can allocate a system uid, and the top free one is
+    the uid the applier pins. So pin the invariant itself: between the top
+    of the script and the reservation's `if`, the only executable lines are
+    the fixed prelude — the shell options, the log redirect and its chmod,
+    plain variable assignments (no command substitution), and the banner.
+    """
+    prelude_allowed = (
+        re.compile(r"^#"),  # comments, including the shebang
+        re.compile(r"^\s*$"),  # blank lines
+        re.compile(r"^set -euo pipefail$"),
+        re.compile(r"^exec > /var/log/agnes-startup\.log 2>&1$"),
+        re.compile(r"^chmod 640 /var/log/agnes-startup\.log"),
+        # Plain assignments only — `$(` or a backtick would smuggle a
+        # command into what this whitelist treats as inert.
+        re.compile(r"^[A-Z_][A-Z_0-9]*=(?!.*\$\()(?!.*`).*$"),
+        re.compile(r'^echo "=== \[Agnes '),
+    )
+    for label, body in (("on", on), ("off", off)):
+        reservation_at = body.index("if ! id -u agnes-applier")
+        offenders = [
+            line for line in body[:reservation_at].splitlines() if not any(rx.match(line) for rx in prelude_allowed)
+        ]
+        assert not offenders, (
+            f"[{label}] executable statement(s) before the uid reservation — anything "
+            f"running earlier can allocate the pinned uid first: {offenders!r}"
+        )
+
+
 def test_datadog_pre_creates_dd_agent_at_its_own_pinned_uid(on: str, off: str):
     """The second, order-independent guard: dd-agent gets a FIXED uid
     distinct from $AGNES_APPLIER_UID, so even a future reorder that put the
