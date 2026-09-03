@@ -665,6 +665,65 @@ class TestSplitMergeCmd:
         assert "crawl_or_facts_running" in result.output
 
 
+class TestShardPlanCmd:
+    """`agnes admin sharepoint shard-plan` — CLI counterpart to
+    `GET /api/admin/sharepoint/connections/{connection_id}/shard-plan`
+    (2026-09-03 auto-parallel-crawl design §4.7)."""
+
+    def _inline_body(self):
+        return {"mode": "inline", "target_docs": 5000, "signal": "none", "shards": [], "loose_root_files": []}
+
+    def _sharded_body(self):
+        return {
+            "mode": "sharded",
+            "target_docs": 10,
+            "signal": "search",
+            "shards": [
+                {"drive_id": "drv1", "index": 1, "label": "part 1/2", "expected": 400, "targets_count": 1},
+                {"drive_id": "drv1", "index": 2, "label": "remainder", "expected": 0, "targets_count": 1},
+            ],
+            "loose_root_files": ["readme.txt"],
+        }
+
+    def test_inline_mode_prints_a_plain_sentence_not_a_table(self):
+        with patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(200, self._inline_body())) as mock_get:
+            result = runner.invoke(app, ["admin", "sharepoint", "shard-plan", "conn1"])
+        assert result.exit_code == 0, result.output
+        assert "single ordinary crawl" in result.output
+        args, kwargs = mock_get.call_args
+        assert args[0] == "/api/admin/sharepoint/connections/conn1/shard-plan"
+        assert kwargs["params"] == {}
+
+    def test_sharded_mode_prints_a_table_with_expected_and_loose_files(self):
+        with patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(200, self._sharded_body())):
+            result = runner.invoke(app, ["admin", "sharepoint", "shard-plan", "conn1"])
+        assert result.exit_code == 0, result.output
+        assert "part 1/2" in result.output
+        assert "remainder" in result.output
+        assert "readme.txt" in result.output
+
+    def test_min_modified_rides_the_query(self):
+        with patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(200, self._inline_body())) as mock_get:
+            result = runner.invoke(app, ["admin", "sharepoint", "shard-plan", "conn1", "--min-modified", "2023-12-31"])
+        assert result.exit_code == 0, result.output
+        _, kwargs = mock_get.call_args
+        assert kwargs["params"] == {"min_modified": "2023-12-31"}
+
+    def test_json_output(self):
+        body = self._sharded_body()
+        with patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(200, body)):
+            result = runner.invoke(app, ["admin", "sharepoint", "shard-plan", "conn1", "--json"])
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.output) == body
+
+    def test_a_typed_error_is_reported(self):
+        detail = {"error": "sharepoint_cert_unresolved", "message": "no certificate configured"}
+        with patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(409, {"detail": detail})):
+            result = runner.invoke(app, ["admin", "sharepoint", "shard-plan", "conn1"])
+        assert result.exit_code == 1
+        assert "no certificate configured" in result.output
+
+
 class TestSplitPlanCmd:
     """`agnes admin sharepoint split-plan` — CLI counterpart to
     `GET /api/admin/sharepoint/connections/{connection_id}/split-plan`."""

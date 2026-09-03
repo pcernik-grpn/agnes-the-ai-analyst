@@ -1257,8 +1257,9 @@ whole map, so mapping a second site group never clobbers the first).
 - /api/admin/sharepoint/connections/{connection_id}/facts-graph-counts
 - /api/admin/sharepoint/connections/{connection_id}/clone
 - /api/admin/sharepoint/connections/{connection_id}/collections/consolidate
-- /api/admin/sharepoint/connections/{connection_id}/split-plan
-- /api/admin/sharepoint/connections/{connection_id}/splits
+- /api/admin/sharepoint/connections/{connection_id}/shard-plan
+- /api/admin/sharepoint/connections/{connection_id}/split-plan (deprecated)
+- /api/admin/sharepoint/connections/{connection_id}/splits (deprecated)
 - /api/admin/sharepoint/connections/{connection_id}/splits/merge
 - /api/admin/sharepoint/connections/{connection_id}/certificate
 - /api/admin/sharepoint/connections/{connection_id}/extract
@@ -1471,9 +1472,39 @@ sibling_crawl_running` (nothing touched, checked before the real merge —
 `running` in the preview response reports it ahead of time) when a family
 member currently has a `corpus-extraction` job queued/running.
 
-`GET …/split-plan` / `POST …/splits` — CLI: `agnes admin sharepoint
+`GET …/shard-plan` (2026-09-03 auto-parallel-crawl design §4.7) — CLI:
+`agnes admin sharepoint shard-plan <connection_id> [--min-modified
+YYYY-MM-DD] [--json]` — read-only preview of the AUTOMATIC parallel crawl
+`POST …/extract` runs on its own for a large site: no `n` to choose, no
+connections created — one connection, one site, planned into shards behind
+the scenes on trigger. Response: `{mode: "inline"|"sharded", target_docs,
+signal: "search"|"child_count"|"none", shards: [{drive_id, index, label,
+expected, targets_count}], loose_root_files}`. `mode == "inline"` (`shards`
+empty) exactly when the site would stay a single ordinary crawl: the active
+backend is DuckDB (this feature is PG-only, A3 ratchet),
+`extraction.crawler.shard_target_docs` is `0`, there is no confirmed scope
+to plan against, or the site's summed document count stays at or under the
+target. `expected` is a live Graph Search count per shard — `≈`, never
+exact (index lag). `min_modified` narrows every count to that date or later
+for THIS preview call only; omitted, the plan resolves the connection's own
+configured `extraction.crawl.min_modified` (the same cutoff an actual
+triggered run would use). `409 sharepoint_cert_unresolved` /
+`502 sharepoint_graph_error` on a credential/Graph failure — unlike
+`split-plan` below, a shard-plan failure is surfaced rather than silently
+degrading to a small-looking site. See `docs/sharepoint-extraction.md` for
+the full per-site semantics (`resync`, `retry_failed`, `shards: [i]`, …).
+
+**Deprecated** — `GET …/split-plan` / `POST …/splits` (superseded by the
+automatic behavior above; kept as a migration-window escape hatch, slated
+for removal after one release — `POST …/splits` answers with a
+`Deprecation: true` response header). `split-plan`'s response gains one
+ADDITIVE field, `mode` — the SAME `"inline"|"sharded"` verdict `shard-plan`
+would give this connection right now (an informational hint; `null` if it
+could not be computed, which never fails the manual preview below). CLI:
+`agnes admin sharepoint
 split-plan <connection_id> --n <n>` / `agnes admin sharepoint split
-<connection_id> --n <n>` — the AUTOMATED version of the `clone` +
+<connection_id> --n <n>` — the MANUAL, admin-chosen-`n` version of the
+`clone` +
 `scopes/bulk` recipe above: greedy-packs (longest-processing-time-first) the
 drive root's top-level folders into `n` groups of roughly equal document
 count, using a live per-folder Graph Search count (`POST /search/query`,

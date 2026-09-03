@@ -888,6 +888,11 @@ READ_POSTURE: dict[str, str] = {
     # discloses folder names and per-folder document counts, same
     # disclosure class as tree_browse right above.
     "GET /api/admin/sharepoint/connections/{connection_id}/split-plan": "sharepoint_connection.split_plan_read",
+    # Read-only preview of the AUTOMATIC parallel crawl (2026-09-03
+    # auto-parallel-crawl design §4.7, plan Task 9) — the successor to
+    # `split-plan` above; same disclosure class (folder counts, never
+    # document content).
+    "GET /api/admin/sharepoint/connections/{connection_id}/shard-plan": "sharepoint_connection.shard_plan_read",
     # -- app.api.admin_slack_secrets --
     "GET /api/admin/slack-secrets": "slack.secret.read",
     # -- app.api.admin_source_connections --

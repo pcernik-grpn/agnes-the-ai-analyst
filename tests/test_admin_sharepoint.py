@@ -4917,6 +4917,78 @@ class TestSplitPlan:
         assert r.status_code == 400, r.text
         assert r.json()["detail"]["error"] == "per_folder_collections_and_target"
 
+    def test_response_gains_an_additive_mode_hint(self, seeded_app, monkeypatch):
+        """2026-09-03 auto-parallel-crawl design — `split-plan`'s response is
+        unchanged except for this one additive field. A DuckDB-backed
+        instance (the seeded_app default) always resolves `"inline"` — the
+        automatic planner is PG-only by construction (A3 ratchet)."""
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="split-plan-mode-hint")
+        _confirm_scope_with_drive(c, token, conn_id)
+        _install_split_mock(monkeypatch, root_children=[_split_folder("f1", "A")], counts={})
+
+        r = c.get(f"{BASE}/{conn_id}/split-plan?n=1", headers=_auth(token))
+        assert r.status_code == 200, r.text
+        assert r.json()["mode"] == "inline"
+
+
+class TestShardPlan:
+    """``GET …/shard-plan`` — read-only preview of the AUTOMATIC parallel
+    crawl (2026-09-03 auto-parallel-crawl design §4.7, plan Task 9). The
+    real sharded-plan happy path needs Postgres (the planner is PG-only by
+    construction) — see ``tests/db_pg/test_sharepoint_shard_plan_route_pg.py``.
+    This class covers what is backend-independent: auth, 404, validation,
+    and the DuckDB fail-clean-to-inline posture (never a 501 — unlike the
+    PG-only ``extraction_runs`` surface, this route touches no PG-only
+    table; it fails clean by construction, the same posture ``connectors.
+    sharepoint.state_store`` already takes for a `crawl:` state kind)."""
+
+    def test_requires_admin(self, seeded_app):
+        r = seeded_app["client"].get(f"{BASE}/nope/shard-plan", headers=_auth(seeded_app["analyst_token"]))
+        assert r.status_code == 403
+
+    def test_requires_auth(self, seeded_app):
+        r = seeded_app["client"].get(f"{BASE}/nope/shard-plan")
+        assert r.status_code == 401
+
+    def test_404_for_unknown_connection(self, seeded_app):
+        r = seeded_app["client"].get(f"{BASE}/does-not-exist/shard-plan", headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 404
+
+    def test_invalid_min_modified_is_400(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="shard-plan-bad-date")
+
+        r = c.get(f"{BASE}/{conn_id}/shard-plan?min_modified=not-a-date", headers=_auth(token))
+        assert r.status_code == 400, r.text
+        assert r.json()["detail"]["error"] == "invalid_min_modified"
+
+    def test_a_duckdb_backed_instance_previews_inline_without_reaching_graph(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="shard-plan-duckdb")
+        _confirm_scope_with_drive(c, token, conn_id)
+
+        from connectors.sharepoint import graph_client as gc
+
+        def _boom(request: httpx.Request) -> httpx.Response:
+            raise AssertionError("no Graph call expected on a DuckDB-backed instance")
+
+        monkeypatch.setattr(
+            gc, "_http_client", lambda: httpx.AsyncClient(transport=httpx.MockTransport(_boom), timeout=10)
+        )
+
+        r = c.get(f"{BASE}/{conn_id}/shard-plan", headers=_auth(token))
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["mode"] == "inline"
+        assert body["shards"] == []
+
 
 class TestSplitApply:
     """``POST …/splits`` — create N sibling connections from a split plan."""
@@ -4970,6 +5042,9 @@ class TestSplitApply:
             headers=_auth(token),
         )
         assert r.status_code == 201, r.text
+        # Deprecated (2026-09-03 auto-parallel-crawl design): a scripted
+        # caller can detect this without parsing prose (RFC 8594).
+        assert r.headers.get("deprecation") == "true"
         body = r.json()
         created = body["connections"]
         assert len(created) == 2

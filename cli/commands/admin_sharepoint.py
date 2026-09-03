@@ -1,7 +1,7 @@
 """`agnes admin sharepoint` — admin/ops triggers and status for SharePoint
 connector maintenance, plus the split-a-large-site management pair below.
 
-Twelve surfaces:
+Thirteen surfaces:
 
   - ``extract`` — the manual crawl trigger with its per-run options
     (``--concurrency``, ``--timeout-s``, ``--resync``, ``--force-reprocess``,
@@ -33,16 +33,23 @@ Twelve surfaces:
     sibling_crawl_running``) if any of them currently has a crawl in
     flight. CLI counterpart to ``POST /api/admin/sharepoint/
     connections/{connection_id}/collections/consolidate``.
-  - ``split-plan`` / ``split`` — the AUTOMATED version of the manual
-    clone-then-bulk-add recipe right above: greedy-packs the site's
-    top-level folders into ``--n`` groups of roughly equal document count
-    (a live Graph Search count per folder, never a delta walk) and, on
-    ``split``, creates all ``--n`` clones with their scopes in one call.
-    Every part's scopes route to ONE shared collection by default
+  - ``shard-plan`` (2026-09-03 auto-parallel-crawl design §4.7) —
+    read-only preview of the AUTOMATIC parallel crawl ``extract`` runs on
+    its own for a large site: no ``--n`` to choose, no connections
+    created. CLI counterpart to ``GET …/shard-plan``.
+  - ``split-plan`` / ``split`` — **deprecated**, superseded by the
+    automatic behaviour above; kept as the migration-window escape hatch.
+    The MANUAL, admin-chosen-``--n`` version of the clone-then-bulk-add
+    recipe right above: greedy-packs the site's top-level folders into
+    ``--n`` groups of roughly equal document count (a live Graph Search
+    count per folder, never a delta walk) and, on ``split``, creates all
+    ``--n`` clones with their scopes in one call. Every part's scopes
+    route to ONE shared collection by default
     (``--collection-id``/``--collection-name`` for an explicit target,
     ``--per-folder-collections`` to restore the old one-per-folder
     behaviour). CLI counterparts to ``GET …/split-plan`` (preview,
-    read-only) and ``POST …/splits`` (apply).
+    read-only) and ``POST …/splits`` (apply, answers with a
+    ``Deprecation: true`` response header).
   - ``runs`` — the extraction fleet dashboard (2026-09-02), from the
     terminal: is it on pace, is anything stuck, what is it costing, across
     every SharePoint connection at once. CLI counterpart to
@@ -564,9 +571,94 @@ def collections_consolidate(
 
 
 # ---------------------------------------------------------------------------
-# `split-plan` / `split` — split one large site into N crawl connections in
-# one shot, instead of `connection clone` + `scope bulk-add` run by hand N
-# times. CLI counterparts to `GET …/split-plan` and `POST …/splits`.
+# `shard-plan` — read-only preview of the AUTOMATIC parallel crawl
+# (2026-09-03 auto-parallel-crawl design §4.7). CLI counterpart to
+# `GET …/shard-plan`. Unlike `split-plan` below, there is no `--n` to
+# choose and nothing is ever created: this previews what `agnes admin
+# sharepoint extract` would plan on its own for a large site.
+# ---------------------------------------------------------------------------
+
+
+def _print_shard_plan(body: Dict[str, Any]) -> None:
+    mode = body.get("mode")
+    if mode == "inline":
+        _console.print(
+            "[green]This site would stay a single ordinary crawl[/green] — no sharding "
+            f"(target_docs={body.get('target_docs')})."
+        )
+        return
+
+    table = Table(title=f"Shard plan — {body.get('signal')} signal, target {body.get('target_docs')} docs/shard")
+    table.add_column("DRIVE", style="bold")
+    table.add_column("#", justify="right")
+    table.add_column("LABEL")
+    table.add_column("EXPECTED", justify="right")
+    table.add_column("UNITS", justify="right")
+    for shard in body.get("shards") or []:
+        table.add_row(
+            str(shard.get("drive_id")),
+            str(shard.get("index")),
+            str(shard.get("label")),
+            str(shard.get("expected")),
+            str(shard.get("targets_count")),
+        )
+    _console.print(table)
+    total_expected = sum(int(s.get("expected") or 0) for s in (body.get("shards") or []))
+    _console.print(f"Total expected documents across shards (≈, never exact): {total_expected}")
+    loose = body.get("loose_root_files") or []
+    if loose:
+        _console.print(
+            f"[yellow]{len(loose)} file(s) sit directly at a drive root — covered by the "
+            "remainder shard at crawl time, not previewed above:[/yellow]"
+        )
+        for name in loose[:20]:
+            typer.echo(f"  {name}")
+        if len(loose) > 20:
+            typer.echo(f"  ... and {len(loose) - 20} more")
+
+
+@admin_sharepoint_app.command("shard-plan")
+def shard_plan_cmd(
+    connection_id: str = typer.Argument(..., help="SharePoint source_connections id"),
+    min_modified: Optional[str] = typer.Option(
+        None,
+        "--min-modified",
+        help="Only count documents modified on/after this date (YYYY-MM-DD), for this preview call only",
+    ),
+    as_json: bool = typer.Option(False, "--json"),
+):
+    """Preview what ``agnes admin sharepoint extract`` would plan on its
+    own for this connection's site — the AUTOMATIC parallel crawl, no
+    ``--n`` to choose, nothing created. CLI counterpart to
+    ``GET /api/admin/sharepoint/connections/{connection_id}/shard-plan``.
+
+    ``mode: "inline"`` means the site would stay a single ordinary crawl
+    (a DuckDB-backed instance, ``extraction.crawler.shard_target_docs`` at
+    0, or a site whose total stays at or under the target) — nothing to
+    preview beyond that. Otherwise prints one row per shard: its drive, a
+    1-based index, its label, a live (``≈``, never exact) expected document
+    count, and how many delta units it packs.
+    """
+    params: Dict[str, Any] = {}
+    if min_modified:
+        params["min_modified"] = min_modified
+
+    resp = api_get(f"/api/admin/sharepoint/connections/{connection_id}/shard-plan", params=params)
+    if resp.status_code != 200:
+        _fail(resp)
+    body = resp.json()
+    if as_json:
+        typer.echo(json.dumps(body, indent=2))
+        return
+    _print_shard_plan(body)
+
+
+# ---------------------------------------------------------------------------
+# `split-plan` / `split` — **deprecated** (superseded by `shard-plan`
+# above), kept as the migration-window escape hatch: split one large site
+# into N crawl connections in one shot, instead of `connection clone` +
+# `scope bulk-add` run by hand N times. CLI counterparts to
+# `GET …/split-plan` and `POST …/splits`.
 # ---------------------------------------------------------------------------
 
 

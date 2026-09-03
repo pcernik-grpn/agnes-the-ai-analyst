@@ -1126,6 +1126,13 @@ CATALOG: dict[str, AuditEvent] = {
         "read",
         "An admin previewed how a SharePoint connection's site would split into several sibling connections.",
     ),
+    "sharepoint_connection.shard_plan_read": AuditEvent(
+        "sharepoint_connection.shard_plan_read",
+        "read",
+        "An admin previewed how the automatic parallel crawl would shard a SharePoint connection's site "
+        "(2026-09-03 auto-parallel-crawl design). Same disclosure class as split_plan_read: folder counts, "
+        "never document content.",
+    ),
     "sharepoint_connection.completeness_read": AuditEvent(
         "sharepoint_connection.completeness_read",
         "read",
