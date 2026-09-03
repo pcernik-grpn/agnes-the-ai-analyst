@@ -1,3 +1,5 @@
+
+from tests import _ds_page_source
 def test_every_agnes_command_this_module_suggests_is_runnable():
     """Devin Review on #1248: the empty-state hint printed a flag that does not exist.
 
@@ -93,9 +95,7 @@ def test_the_token_mismatch_strip_stays_hidden_when_empty():
     empty orange band rendered under every Keboola connection card."""
     import pathlib
 
-    src = (
-        pathlib.Path(__file__).resolve().parents[1] / "app" / "web" / "templates" / "admin_data_sources.html"
-    ).read_text(encoding="utf-8")
+    src = _ds_page_source.page_source()
     assert ".ds-token-mismatch[hidden]" in src
     assert src.index(".ds-token-mismatch[hidden]") < src.index(".ds-token-mismatch {"), (
         "the hidden rule must not be overridden by the later display:flex"

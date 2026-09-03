@@ -23,6 +23,8 @@ Rules this file exists to hold:
 
 from __future__ import annotations
 
+from tests import _ds_page_source
+
 import json
 import subprocess
 import tempfile
@@ -98,7 +100,7 @@ const document = { getElementById: (id) => _elements[id] };
 
 
 def _run_js(body: str, *, state: dict | None = None, signatures=_SIGNATURES, preamble: str = "") -> dict:
-    tpl = TEMPLATE.read_text(encoding="utf-8")
+    tpl = _ds_page_source.page_source()
     fns = "\n".join(_extract_block(tpl, sig) for sig in signatures)
     script = f"""
 const EXT_MAX_FAILURES = 3;
