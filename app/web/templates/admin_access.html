@@ -1550,10 +1550,18 @@
 
   /* A bundle's rows name AUDIENCES, so the kind column has nothing to put in
      it — the kind belongs to the bundle, and is in its row above. */
+  /* The name track had `minmax(0, 1fr)`: the ONLY flexible column, so on a
+     narrow pane it absorbed the entire shortfall and measured 41px — every
+     audience name clipped to two letters, "Ev" for Everyone. (Audit V1.)
+     A 7rem floor keeps a name legible; the reach column gives up first,
+     down to 6rem, and its text wraps rather than truncates (the scope row
+     already allowed that). The two action columns keep their width because
+     a segmented control and a Revoke button cannot wrap. */
   .ax-gs--bb .ax-colhd,
   .ax-gs--bb .ax-r {
-    grid-template-columns: minmax(0, 1fr) 10rem 12rem 13rem;
+    grid-template-columns: minmax(7rem, 1fr) minmax(6rem, 10rem) 12rem 13rem;
   }
+  .ax-gs--bb .ax-r .ax-r__d { white-space: normal; overflow: visible; }
   @media (max-width: 900px) {
     .ax-gs--bb .ax-colhd, .ax-gs--bb .ax-r { grid-template-columns: minmax(0, 1fr) 8rem 10.5rem; }
   }
@@ -2294,6 +2302,14 @@
     .ax-picker__tier{ order: -1; width: 100%; }
   }
 
+  /* The person tab's kind, said small under the label. Not a badge — a badge
+     would make it read as a status — and not uppercase, so it does not fight
+     the tab label for the eye. */
+  .ax-by__tool { flex-direction: column; align-items: flex-start; gap: 1px; }
+  .ax-by__kind {
+    font-size: 10.5px; font-weight: 400; color: var(--ds-text-muted);
+    line-height: 1.2; letter-spacing: 0;
+  }
   .ax-pk-r--scope{ border-left: 3px solid var(--ds-primary); }
   .ax-r--scope{
     border-left: 3px solid var(--ds-primary);
@@ -2564,9 +2580,19 @@
             data-by="resource" aria-selected="false" aria-controls="ax-pane-edit" tabindex="-1">
       By resource <span class="tab-strip__n ax-by__n" data-by-n="resource"></span>
     </button>
-    <button type="button" role="tab" id="ax-tab-person" class="tab-strip__item"
-            data-by="person" aria-selected="false" aria-controls="ax-pane-sim" tabindex="-1">
+    {# A different KIND of tab. The two before it are one list pivoted two
+       ways; this one is a simulator — pick a person, see the pages as they
+       see them — and presenting it as a third sort order is how the page's
+       most distinctive capability got read as a filter (audit I3). The
+       decision was to keep it in the strip, not to move it out: demoting it
+       would trade the feature's discoverability for a tidier model of the
+       page. So it stays a tab and the strip says what makes it one of a
+       different kind. #}
+    <button type="button" role="tab" id="ax-tab-person" class="tab-strip__item ax-by__tool"
+            data-by="person" aria-selected="false" aria-controls="ax-pane-sim" tabindex="-1"
+            title="Pick a person and see the product as they see it">
       By person <span class="tab-strip__n ax-by__n" data-by-n="person"></span>
+      <span class="ax-by__kind">view as someone</span>
     </button>
   </nav>
 </div>
@@ -2674,7 +2700,7 @@
             <span class="dsec-ico">{{ ico.icon('shield-check', 14) }}</span>
             <div class="dsec-grow">
               <h3>Access</h3>
-              <div class="dsec-sub">What everyone above can use.</div>
+              <div class="dsec-sub" id="ax-access-sub">What everyone above can use.</div>
             </div>
             {# The key sits immediately LEFT of the number it qualifies, and
                opens on hover rather than on a click — one sentence of
@@ -3859,6 +3885,25 @@
        fixed for, one level up: it tells the reader the thing they are
        editing has members. */
     const scopeSelected = !!selectedGroup && selectedGroup === everyoneGroupId();
+    /* The Admin group's grants are inert in the mode an admin is in while
+       reading this page, and load-bearing in the one they cannot be in
+       while reading it: god-mode short-circuits every access check, and only
+       when a person pauses their own elevation (/me/profile) do their
+       explicit grants apply — at which point every /admin page, this one
+       included, answers 403. So the rows below can never be seen in the
+       state where they matter, and nothing said so. (Audit F7 — reduced from
+       the finding as written, whose scenario a paused admin cannot reach.)
+       One sentence, here, where the tier is chosen; not a banner. */
+    const _selGrp = (overview.groups || []).find((g) => g.id === selectedGroup);
+    const adminSelected = !!_selGrp && (_selGrp.is_admin === true || _selGrp.name === "Admin");
+    const subEl = el("ax-access-sub");
+    if (subEl) {
+      subEl.textContent = adminSelected
+        ? "What admins can use with Admin mode paused. While it is on, god-mode reaches everything regardless of these."
+        : scopeSelected
+          ? "What every account can use."
+          : "What everyone above can use.";
+    }
 
     const sectionOf = (grant) =>
       grant.inherited ? "set_elsewhere" : (grant.section || "change_here");

@@ -771,3 +771,96 @@ class TestATierControlIsDrawnOnlyWhereItCanAct:
         src = self._source()
         assert src.count("publisherKind: i.publisher_kind") == 1      # the group's grant list
         assert src.count("publisherKind: r.i.publisher_kind") == 1    # By resource's audience row
+
+
+class TestTheNameColumnHasAFloor:
+    """Audit V1. The By resource name track was `minmax(0, 1fr)` — the ONLY
+    flexible column, so on a narrow pane it absorbed the entire shortfall
+    and measured 41px, clipping every audience name to two letters. The
+    reach column yields first now, and its text wraps rather than truncates.
+    """
+
+    TEMPLATE = "app/web/templates/admin_access.html"
+
+    def _source(self) -> str:
+        from pathlib import Path
+
+        return Path(self.TEMPLATE).read_text(encoding="utf-8")
+
+    def test_the_by_resource_name_track_has_a_minimum(self):
+        src = self._source()
+        rule = src[src.index(".ax-gs--bb .ax-colhd,\n  .ax-gs--bb .ax-r {"):]
+        rule = rule[: rule.index("}")]
+        assert "minmax(7rem, 1fr)" in rule, "the name track must not be allowed to collapse to zero"
+        assert "minmax(6rem, 10rem)" in rule, "the reach track is the one that yields"
+
+    def test_the_reach_text_wraps_instead_of_truncating(self):
+        assert ".ax-gs--bb .ax-r .ax-r__d { white-space: normal; overflow: visible; }" in self._source()
+
+
+class TestThePersonTabSaysWhatKindOfTabItIs:
+    """Audit I3. By group and By resource are one list pivoted two ways; By
+    person is a simulator. Presented as three peers, the page's most
+    distinctive capability read as a third sort order. The decision was to
+    keep it in the strip — demoting it would trade discoverability for a
+    tidier model — so the strip says what makes it a different kind.
+    """
+
+    TEMPLATE = "app/web/templates/admin_access.html"
+
+    def _source(self) -> str:
+        from pathlib import Path
+
+        return Path(self.TEMPLATE).read_text(encoding="utf-8")
+
+    def test_the_person_tab_is_still_a_tab(self):
+        """It stays in the strip, with the same role and pane wiring."""
+        src = self._source()
+        tab = src[src.index('id="ax-tab-person"') - 40 :][:400]
+        assert 'role="tab"' in tab and 'aria-controls="ax-pane-sim"' in tab
+
+    def test_and_says_what_it_does(self):
+        src = self._source()
+        assert '<span class="ax-by__kind">view as someone</span>' in src
+        assert 'title="Pick a person and see the product as they see it"' in src
+
+
+class TestTheAdminGroupNamesTheModeItsGrantsDependOn:
+    """Audit F7, reduced. As written the finding had an admin pause their
+    elevation and then edit grants — but a paused admin is not an admin
+    (`is_admin` is False) and every /admin page answers 403, this one
+    included. What is left: the Admin group's grants are inert in the mode
+    an admin is in while reading this page and load-bearing in the one they
+    cannot be in while reading it, and nothing said so. One sentence where
+    the tier is chosen; not a banner.
+    """
+
+    TEMPLATE = "app/web/templates/admin_access.html"
+
+    def _source(self) -> str:
+        from pathlib import Path
+
+        return Path(self.TEMPLATE).read_text(encoding="utf-8")
+
+    def test_the_access_sub_line_is_addressable(self):
+        assert 'id="ax-access-sub"' in self._source()
+
+    def test_the_admin_group_gets_the_mode_sentence_and_nobody_else_does(self):
+        src = self._source()
+        assert "What admins can use with Admin mode paused." in src
+        # Keyed on the same test addMember uses for the god-mode confirm, so
+        # the two surfaces cannot disagree about which group is Admin.
+        assert '(_selGrp.is_admin === true || _selGrp.name === "Admin")' in src
+        # The other two audiences keep their own sentences.
+        assert '"What every account can use."' in src
+        assert '"What everyone above can use."' in src
+
+    def test_the_route_really_does_lock_a_paused_admin_out(self):
+        """The reduction rests on this. If /admin/access ever stops being
+        admin-gated, the original scenario becomes reachable and a sentence
+        is no longer enough."""
+        from pathlib import Path
+
+        router = Path("app/web/router.py").read_text(encoding="utf-8")
+        i = router.index('@router.get("/admin/access"')
+        assert "Depends(require_admin)" in router[i : i + 300]
