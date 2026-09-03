@@ -150,11 +150,22 @@ class TestTheBuilderConversation:
     chat — the increment PR #2148's own comment said would come next."""
 
     def test_the_start_tab_renders_the_conversation_composer(self, seeded_app, studio_off):
+        """The page's script is INLINE, not an external file, so its source
+        text is part of the HTTP response even though a plain GET never runs
+        it — what to assert on is the JS SOURCE, not an HTML attribute that
+        only exists after the browser builds it (`BuilderShell.conversation`/
+        `.composer` render those at runtime). An earlier version of this test
+        asserted `'data-ag-comp="chat"' in r.text`, which happened to pass
+        only because that exact string also appears, coincidentally, inside
+        this page's own `querySelector('[data-ag-comp="chat"]')` call site —
+        a false-positive that would have stayed green even with the
+        composer never wired up."""
         c = seeded_app["client"]
         r = c.get("/semantic-layer/new", headers=_auth(seeded_app["admin_token"]))
         assert r.status_code == 200
-        assert 'data-ag-comp="chat"' in r.text
-        assert 'id="smb-conv"' in r.text
+        assert "BuilderShell.conversation(" in r.text
+        assert "BuilderShell.composer(" in r.text
+        assert "'smb-conv'" in r.text
 
     def test_the_old_paste_import_ui_is_gone(self, seeded_app, studio_off):
         c = seeded_app["client"]
