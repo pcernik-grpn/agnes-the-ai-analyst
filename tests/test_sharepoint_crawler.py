@@ -4671,6 +4671,94 @@ class TestConcurrencyResolution:
         assert report["new"] == 3
 
 
+_GIB = 1024**3
+
+
+class TestMemoryBudgetConcurrencyClamp:
+    """``_resolve_concurrency`` clamped DOWNWARD by the container's own
+    cgroup memory limit (TCRD-296 C.10) — never a new knob, never raises a
+    configured/payload cap, only lowers it."""
+
+    def test_a_v2_max_limit_means_unlimited_and_is_not_a_clamp(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sys, "platform", "linux")
+        v2 = tmp_path / "memory.max"
+        v2.write_text("max\n")
+        monkeypatch.setattr(crawler, "_CGROUP_V2_MEMORY_MAX_PATH", v2)
+        monkeypatch.setattr(crawler, "_CGROUP_V1_MEMORY_LIMIT_PATH", tmp_path / "no-v1-here")
+
+        assert crawler._cgroup_memory_limit_bytes() is None
+
+    def test_v2_limit_and_four_lanes_derive_a_cap_of_three(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sys, "platform", "linux")
+        v2 = tmp_path / "memory.max"
+        v2.write_text(str(32 * _GIB))
+        monkeypatch.setattr(crawler, "_CGROUP_V2_MEMORY_MAX_PATH", v2)
+
+        limit = crawler._cgroup_memory_limit_bytes()
+        assert limit == 32 * _GIB
+        # floor(32 GiB * 0.8 / (4 * 2 GiB)) = floor(3.2) = 3
+        assert crawler._memory_budget_cap(limit, lanes=4) == 3
+
+    def test_v1_fallback_and_one_lane_derive_a_cap_of_three(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sys, "platform", "linux")
+        # No v2 file — falls back to v1.
+        monkeypatch.setattr(crawler, "_CGROUP_V2_MEMORY_MAX_PATH", tmp_path / "no-v2-here")
+        v1 = tmp_path / "memory.limit_in_bytes"
+        v1.write_text(str(8 * _GIB))
+        monkeypatch.setattr(crawler, "_CGROUP_V1_MEMORY_LIMIT_PATH", v1)
+
+        limit = crawler._cgroup_memory_limit_bytes()
+        assert limit == 8 * _GIB
+        # floor(8 GiB * 0.8 / (1 * 2 GiB)) = floor(3.2) = 3
+        assert crawler._memory_budget_cap(limit, lanes=1) == 3
+
+    def test_the_clamp_never_raises_a_lower_configured_cap(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sys, "platform", "linux")
+        v2 = tmp_path / "memory.max"
+        v2.write_text(str(32 * _GIB))
+        monkeypatch.setattr(crawler, "_CGROUP_V2_MEMORY_MAX_PATH", v2)
+        monkeypatch.setattr("app.worker.runtime._extraction_concurrency", lambda: 4)
+
+        # The budget cap here is 3 (previous test) — a configured cap of 2
+        # must stay 2, never be raised to it.
+        cap, source = crawler._apply_memory_budget_cap(2, "config")
+        assert (cap, source) == (2, "config")
+
+    def test_the_run_report_names_memory_budget_as_the_source_when_it_clamps(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sys, "platform", "linux")
+        v2 = tmp_path / "memory.max"
+        v2.write_text(str(4 * _GIB))
+        monkeypatch.setattr(crawler, "_CGROUP_V2_MEMORY_MAX_PATH", v2)
+        monkeypatch.setattr("app.worker.runtime._extraction_concurrency", lambda: 1)
+        monkeypatch.setattr(crawler, "_crawl_concurrency", lambda: 6)
+
+        # floor(4 GiB * 0.8 / (1 * 2 GiB)) = floor(1.6) = 1, below the
+        # configured cap of 6 — the clamp fires and names itself.
+        cap, configured, source = crawler._resolve_concurrency(None)
+        assert (cap, configured, source) == (1, 6, "memory_budget")
+
+    def test_a_non_linux_platform_is_a_no_op(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sys, "platform", "darwin")
+        v2 = tmp_path / "memory.max"
+        v2.write_text(str(4 * _GIB))
+        monkeypatch.setattr(crawler, "_CGROUP_V2_MEMORY_MAX_PATH", v2)
+
+        assert crawler._cgroup_memory_limit_bytes() is None
+
+    def test_a_configured_cap_already_below_the_budget_keeps_its_own_source(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sys, "platform", "linux")
+        v2 = tmp_path / "memory.max"
+        v2.write_text(str(32 * _GIB))
+        monkeypatch.setattr(crawler, "_CGROUP_V2_MEMORY_MAX_PATH", v2)
+        monkeypatch.setattr("app.worker.runtime._extraction_concurrency", lambda: 4)
+        monkeypatch.setattr(crawler, "_crawl_concurrency", lambda: 2)
+
+        # Budget cap is 3 (same math as above); the configured cap of 2 is
+        # already below it, so the clamp is a no-op and "config" survives.
+        cap, configured, source = crawler._resolve_concurrency(None)
+        assert (cap, configured, source) == (2, 2, "config")
+
+
 class TestItemTimeoutResolution:
     """The knob itself — ``extraction.crawler.item_timeout_s``."""
 
