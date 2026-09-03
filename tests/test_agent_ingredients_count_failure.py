@@ -29,7 +29,7 @@ class _CountWorks:
 @pytest.fixture
 def one_collection(monkeypatch):
     """Two empty stacks and a single reachable collection, so the assertions
-    below are about the artefact section and nothing else."""
+    below are about the artifact section and nothing else."""
     import src.repositories as repos
     from app.services import stack_resolver
 

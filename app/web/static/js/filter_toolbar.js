@@ -81,7 +81,7 @@
                                                // control's wrapper, hidden in
                                                // table view when `headers` are
                                                // present
-       count:   { el: '#af-upload-count', noun: 'artefact' },
+       count:   { el: '#af-upload-count', noun: 'artifact' },
        noResults: '#af-noresults',
        view:    { buttons: '.fbar-view__btn', tableWrap: '#lib-tablewrap',
                   grid: '#lib-grid', storageKey: 'lib-view',

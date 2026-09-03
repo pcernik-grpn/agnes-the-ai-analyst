@@ -19,6 +19,7 @@ transports.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from pathlib import Path
 from typing import Annotated, Any, Callable, Literal
@@ -299,7 +300,7 @@ FOUNDATION_TOOL_NAMES: tuple[str, ...] = (
     "data_app_get",
     "data_app_deploy",
     "data_app_logs",
-    # "Add artefacts to My Stack" — triple-surface with
+    # "Add artifacts to My Stack" — triple-surface with
     # /api/stack/artefacts* + `agnes stack artefacts list/add/remove`. Adds
     # Stack MEMBERSHIP data only (see the module note on stack_subscribe) —
     # NOT a retrieval gate: knowledge_search/collections_search below still
@@ -609,7 +610,7 @@ def register_foundation_tools(
         case you are in; read them before concluding anything about
         permissions.
 
-        NOTE (deferred follow-up, "Add artefacts to My Stack" spec): this
+        NOTE (deferred follow-up, "Add artifacts to My Stack" spec): this
         fans out over every RBAC-accessible collection — it does NOT gate by
         the caller's Stack membership (``user_stack_subscriptions``,
         ``stack_artefacts_candidates``/``stack_artefact_add``). Wiring that
@@ -669,7 +670,7 @@ def register_foundation_tools(
         ``hybrid`` (lexical + semantic) or ``lexical_only`` — the degraded
         mode when the server has no embedding model installed.
 
-        NOTE (deferred follow-up, "Add artefacts to My Stack" spec): the
+        NOTE (deferred follow-up, "Add artifacts to My Stack" spec): the
         Collections leg of this fan-out is not gated by Stack membership
         either — see ``collections_search``'s note.
 
@@ -757,6 +758,17 @@ def register_foundation_tools(
         not admin-only. Use `semantic_model_search` first if you don't
         already know the slug.
 
+        The response also carries `content_hash` — sha256 of `document`,
+        the same value every other semantic-layer surface calls
+        `content_hash` — so a caller that must pin *which* revision it read
+        (a skill citing provenance, an agent comparing against a cached
+        copy) doesn't need to hash the document itself. Read from the
+        export endpoint's `ETag` response header (issue #2153); falls back
+        to hashing the response body when an older server sends no `ETag`
+        (export is byte-for-byte, so the two are always equal). `updated_at`
+        (ISO-8601) is included only when the server's `X-Semantic-Model-
+        Updated-At` header is present.
+
         Args:
             slug: Model slug, e.g. from a `semantic_model_search` result.
         """
@@ -767,7 +779,18 @@ def register_foundation_tools(
                 timeout=30,
             )
             _raise_for_status_with_detail(r)
-            return {"slug": slug, "document": r.text}
+            result: dict[str, Any] = {"slug": slug, "document": r.text}
+            etag = r.headers.get("etag")
+            if etag:
+                # Strip the RFC 7232 quoting, tolerating a weak validator
+                # (`W/"..."`) even though the export endpoint never emits one.
+                result["content_hash"] = etag.removeprefix("W/").strip('"')
+            else:
+                result["content_hash"] = hashlib.sha256(r.content).hexdigest()
+            updated_at = r.headers.get("x-semantic-model-updated-at")
+            if updated_at:
+                result["updated_at"] = updated_at
+            return result
 
     @tool(read_only=True)
     async def validate_semantic_query(

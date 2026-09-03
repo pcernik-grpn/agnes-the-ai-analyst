@@ -4,9 +4,16 @@
 {% set page_hero_eyebrow = "Agent Experience" %}
 {% set page_hero_title = "Prompts" %}
 {% set page_hero_plain = True %}
-{% set page_hero_subtitle = "Install prompt + workspace CLAUDE.md. Edit inline (Editor override) or bind to a file in the Initial Workspace Template repo (Git)." %}
+{% set page_hero_subtitle = "The prompts every analyst workspace is seeded with, and the Git repo they can bind to. Edit inline (Editor override) or point a prompt at a file in the template repo (Git)." %}
 
 {% block head_extra %}
+{# Two tabs, two asset sets, and only the active one is rendered — so only its
+   assets load. The repo tab has no CodeMirror and the prompts tab has no
+   filter toolbar; pulling both on both pages would make each tab pay for the
+   other. Same reasoning as the conditional panes in `block page`. #}
+{% if tab == 'repo' %}
+{% include "_admin_prompts_repo_styles.html" %}
+{% else %}
 <link rel="stylesheet" href="{{ static_url('css/ds_dropdown.css') }}">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.css"
       integrity="sha512-uf06llspW44/LZpHzHT6qBOIVODjWtv4MxCricRxkzvopAlSWnTf6hpZTFxuuZcuNE9CBQhqE0Seu1CoRk84nQ=="
@@ -62,9 +69,30 @@
   .prompt-hint a { color: var(--ds-text-link); }
   .hidden { display: none; }
 </style>
+{% endif %}
 {% endblock %}
 
 {% block page %}
+{# ONE page for the managed prompts and the repo they bind to (they were
+   /admin/prompts and /admin/initial-workspace until they merged — see the
+   Prompts row in app/web/admin_nav.py for why two pages for one job was the
+   wrong shape).
+
+   Real URLs, not panes: `?tab=repo` is resolved SERVER-side and only the
+   active tab's markup and script are rendered. That is what lets each pane
+   stay byte-for-byte the page it was — the repo pane's `iwLoad()` still fires
+   inline and unguarded, because when it runs its elements are there and when
+   it is not the active tab neither the script nor the markup exists. A
+   client-side pane switch would have meant guarding both lifecycles against a
+   hidden DOM, for a strip of two. #}
+{{ ds.tabs(items=[
+     {'label': 'Prompts', 'href': '/admin/prompts', 'active': tab != 'repo'},
+     {'label': 'Template repository', 'href': '/admin/prompts?tab=repo', 'active': tab == 'repo'},
+   ], aria_label='Prompts sections') }}
+
+{% if tab == 'repo' %}
+{% include "_admin_prompts_repo_pane.html" %}
+{% else %}
 <div class="prompt-cards"
      data-iwt-configured="{{ '1' if iwt_configured else '0' }}">
 
@@ -132,22 +160,24 @@
       </div>
       <div class="prompt-hint">
         Bound content is read-only here — edit it in the repo + click
-        “Sync now” in <a href="/admin/server-config">server config</a>.
+        “Sync now” on the <a href="/admin/prompts?tab=repo">Template repository</a> tab.
         If the badge shows <strong>diverged</strong>, re-click <strong>Bind</strong>
         to accept the repo's current version as the new baseline.
       </div>
     </div>
 
     <div class="prompt-hint hidden" data-role="no-iwt">
-      Git mode needs an Initial Workspace Template repo. Register one in
-      <a href="/admin/server-config">server config</a> first.
+      Git mode needs an Initial Workspace Template repo. Register one on the
+      <a href="/admin/prompts?tab=repo">Template repository</a> tab first.
     </div>
   </section>
   {% endfor %}
 </div>
+{% endif %}
 {% endblock %}
 
 {% block scripts %}
+{% if tab != 'repo' %}
 <script src="{{ static_url('js/components/ds_dropdown.js') }}" defer></script>
 <script>
 (function () {
@@ -383,4 +413,5 @@
   });
 })();
 </script>
+{% endif %}
 {% endblock %}
