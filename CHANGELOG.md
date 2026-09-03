@@ -19,6 +19,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 ### Removed
 
 ### Internal
+- **`docs/RELEASING.md`: why a fresh cut PR shows no checks, and what to do when you cannot click.** The `pull_request` run of a bot-opened cut is queued in `action_required` — *Approve and run workflows* is the step, `gh workflow run ci.yml` on the cut branch is not (its check-runs do not satisfy the `pull_request`-bound required contexts), and `mergeable_state` reads `blocked` here without meaning "review required". Records that the REST approve endpoint answers `403 Resource not accessible by integration`, so an automated driver has no click to give and should hand-cut via the documented emergency path instead.
 
 ## [0.97.0] - 2026-09-03
 
