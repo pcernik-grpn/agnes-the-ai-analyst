@@ -149,6 +149,70 @@ def test_a_number_that_merely_contains_429_is_not_a_rate_limit():
 
 
 # ---------------------------------------------------------------------------
+# chatErrorCopy — the broker/sandbox could not be REACHED at all, as opposed
+# to a completed call the provider rejected. Written from a real report: the
+# sandbox's own client failed to reach the LLM broker and the failure reached
+# the reader verbatim — "Cannot reach sandbox egress upstream at
+# https://<host>/api/broker/anthropic: This operation was aborted" — a host
+# and an abort naming nothing a reader can act on.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "kind,message",
+    [
+        (
+            "engine_error",
+            "Cannot reach sandbox egress upstream at https://example.com/api/broker/anthropic: "
+            "This operation was aborted",
+        ),
+        ("engine_error", "connect ECONNREFUSED 127.0.0.1:8000"),
+        ("engine_error", "getaddrinfo ENOTFOUND kai-agent"),
+        ("engine_error", "Request failed with status code 502"),
+        ("engine_error", "upstream responded 503 Service Unavailable"),
+    ],
+)
+def test_a_broker_connectivity_failure_reads_as_a_transient_wait(kind, message):
+    (copy,) = _run_copy([[kind, message]])
+    assert "restarting or temporarily unavailable" in copy, copy
+    # The raw, unactionable phrasing must not survive into the sentence a
+    # reader is asked to act on — that's the whole bug.
+    assert "This operation was aborted" not in copy
+    assert "/api/broker/anthropic" not in copy
+
+
+def test_a_slow_answer_is_not_read_as_a_connectivity_failure():
+    """The connectivity family must not swallow the OTHER meaning of a
+    stalled turn — an answer that took too long is still a stopped turn, not
+    an unreachable broker."""
+    (copy,) = _run_copy([["", "Request timed out after 300s waiting for a response"]])
+    assert "That took too long and was stopped." in copy
+    assert "restarting" not in copy.lower()
+
+
+@pytest.mark.parametrize(
+    "kind,message",
+    [
+        ("engine_error", "connect ECONNREFUSED 127.0.0.1:8000"),
+        ("engine_error", "getaddrinfo ENOTFOUND kai-agent"),
+        (
+            "engine_error",
+            "Cannot reach sandbox egress upstream at https://example.com/api/broker/anthropic: "
+            "This operation was aborted",
+        ),
+    ],
+)
+def test_a_broker_connectivity_failure_is_a_wait_not_a_crash(kind, message):
+    """A failed CONNECTION attempt is transient the same way a restart is —
+    nothing is broken, the reader just waits. A bare 502/503 elsewhere in a
+    message deliberately keeps its existing `_FAULT_RE` red: that regex
+    exists specifically for "genuinely broken", and widening it to any 5xx
+    would repaint messages that earned that color for an unrelated reason."""
+    (tone,) = _run_tone([[kind, message]])
+    assert tone == "warn", tone
+
+
+# ---------------------------------------------------------------------------
 # chatErrorTone — red is reserved for a genuine failure
 # ---------------------------------------------------------------------------
 
@@ -276,14 +340,14 @@ def test_no_shared_sentence_names_what_the_reader_was_doing():
 @pytest.mark.parametrize(
     "status,code",
     [
-        (429, "rate_limit"),          # a quota that refills
-        (429, "concurrency_cap"),     # a slot the reader can free
-        (429, "budget_exhausted"),    # a limit, not a fault
-        (403, "access_denied"),       # a grant to ask for
-        (413, ""),                    # a smaller file
-        (415, ""),                    # a different file
-        (400, "validation_failed"),   # a bundle to fix
-        (409, ""),                    # a name already taken
+        (429, "rate_limit"),  # a quota that refills
+        (429, "concurrency_cap"),  # a slot the reader can free
+        (429, "budget_exhausted"),  # a limit, not a fault
+        (403, "access_denied"),  # a grant to ask for
+        (413, ""),  # a smaller file
+        (415, ""),  # a different file
+        (400, "validation_failed"),  # a bundle to fix
+        (409, ""),  # a name already taken
     ],
 )
 def test_a_refusal_the_reader_can_act_on_is_not_red(status, code):
@@ -326,7 +390,7 @@ def test_a_missing_setup_is_not_a_crash():
 
 
 def test_no_shared_sentence_uses_deployment_vocabulary():
-    """"instance" is a word for whoever runs the deployment; the reader has a
+    """ "instance" is a word for whoever runs the deployment; the reader has a
     workspace. Same for "upstream", which was accurate and unreadable."""
     say = _say()
     for key, sentence in say.items():

@@ -2712,7 +2712,6 @@ async function openSession(chatId, wsUrlOverride, { restoring = false } = {}) {
   };
 }
 
-
 function handleFrame(frame) {
   // Track last-seen seq per session (wave-2F task 2/3 — see
   // lastSeenSeqByChat above). Additive/back-compat: a frame with no `seq`
