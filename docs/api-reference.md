@@ -1779,13 +1779,18 @@ The fleet endpoint two paragraphs down (`.../extraction/runs` with no
 - /api/admin/sharepoint/connections/{connection_id}/extraction/crawl-config
 - /api/admin/sharepoint/connections/{connection_id}/extraction/retry-empty
 - /api/admin/sharepoint/connections/{connection_id}/extraction/completeness
+- /api/admin/sharepoint/extraction/runs/{run_id}/cancel
 
 `GET …/extraction/status` returns the live run (if any) and the last completed
 one. Liveness is **derived, never trusted**: a worker killed outright finalizes
-nothing, so a run whose last checkpoint is older than 30 minutes comes back as
-`outcome: "stalled"` with its `stale_s`, and a run whose `jobs` row already
-ended comes back as `failed` — the stored `running` is reported separately as
-`stored_status`, so the two can never be confused. Counters are **absolute**
+nothing, so a run whose last checkpoint is older than `extraction.stall_after_s`
+(default 900s/15min, admin-editable — `/admin/server-config` → Extraction →
+Stall threshold, same knob the fleet endpoint's own `stuck` flag reads below)
+comes back as `outcome: "stalled"` with its `stale_s`, and a run whose `jobs`
+row already ended comes back as `failed` — the stored `running` is reported
+separately as `stored_status`, so the two can never be confused. A `stalled`
+run can be force-cancelled — see `POST …/extraction/runs/{run_id}/cancel`
+below. Counters are **absolute**
 (files processed, new/changed/unchanged, bytes, elapsed, 429 count and wait):
 there is no fraction, no progress bar and no ETA, because the crawl enumerates
 and processes in lockstep per delta page and `files_per_s` counts only
@@ -1879,26 +1884,57 @@ connection, idle ones included, each with its own latest run or `null`.
 Every row reuses the SAME per-run projection the routes above render, plus
 two fleet-only fields: `files_per_min` (derived from consecutive checkpoints
 this endpoint itself has observed across repeated polls — the table is
-stored, never a history, so there is nothing to read back) and `stuck` (a
-checkpoint older than 10 minutes on a row whose STORED status is still
-`running` — a faster, coarser tripwire than `status`'s own 30-minute
-`stalled` derivation, meant to catch an operator's eye across a whole fleet
-rather than assert an outcome). `facts` carries the facts stage's own
-counters, read off the SAME run row (crawl and facts are literally one row;
-`phase` flips from `"crawl"` to `"facts"` mid-run). Each row also carries
-`failed_items_count`/`empty_items_count` (TCRD-296 synthesis) — the SAME
-persisted-backlog counts `…/extraction/status` returns, one cheap query per
-row, backing the table's own "Retry failed (N)"/"Retry empty (N)" buttons
-so an operator does not need to open a source card just to see whether
-there is anything to retry. The response also carries a top-level `jobs`
-block — `{kind: {queued, running}}` for `corpus-extraction` and
-`sharepoint-facts-extraction`, read in one grouped query off the jobs table
-independent of `active`/`all` scope — the queued-vs-running lane-starvation
-strip above the table: a starved job (queued, never yet claimed) has no
-`extraction_runs` row and so no table row of its own to show it otherwise.
-CLI: `agnes admin sharepoint runs [--all] [--json] [--watch]` (`--watch`
-refreshes every 10s; the human-readable table also prints a `Jobs — …` line
-for the same `jobs` block, flagging a starved lane).
+stored, never a history, so there is nothing to read back) and `stuck`
+(`true` exactly when that same row's `run.outcome` is `"stalled"` — ONE rule,
+read twice, so the fleet's "Stuck?" badge and the per-run outcome word can
+never disagree; before 2026-09-03 this was its own, independent, tighter
+threshold). `facts` carries the facts stage's own counters, read off the SAME
+run row (crawl and facts are literally one row; `phase` flips from `"crawl"`
+to `"facts"` mid-run). Each row also carries `failed_items_count`/
+`empty_items_count` (TCRD-296 synthesis) — the SAME persisted-backlog counts
+`…/extraction/status` returns, one cheap query per row, backing the table's
+own "Retry failed (N)"/"Retry empty (N)" buttons so an operator does not
+need to open a source card just to see whether there is anything to retry.
+The response also carries a top-level `jobs` block — `{kind: {queued,
+running}}` for `corpus-extraction` and `sharepoint-facts-extraction`, read
+in one grouped query off the jobs table independent of `active`/`all` scope
+— the queued-vs-running lane-starvation strip above the table: a starved
+job (queued, never yet claimed) has no `extraction_runs` row and so no
+table row of its own to show it otherwise. CLI: `agnes admin sharepoint
+runs [--all] [--json] [--watch]` (`--watch` refreshes every 10s; the
+human-readable table also prints a `Jobs — …` line for the same `jobs`
+block, flagging a starved lane).
+
+`POST /api/admin/sharepoint/extraction/runs/{run_id}/cancel` (no
+`{connection_id}` — a run id is enough) force-closes a run the cooperative
+Stop above cannot reach: a crawl loop that is genuinely stuck (never yielding,
+never reaching a checkpoint) never observes `stop_requested_at` either, so it
+stays `running` with an ever-extending lease until someone intervenes by
+hand. Cancel = stop + force-close, reusing rather than duplicating the
+cooperative path: it (1) sets the SAME `stop_requested_at` flag `…/extraction
+/stop` does — a merely slow (not truly stuck) run still exits cleanly at its
+next checkpoint; (2) force-finalizes the owning job to `failed`
+(`error: "cancelled_by_admin"`) with no lease token needed (an admin never
+claimed the job) — clearing the lease is what stops the worker's heartbeat
+loop on its own, the next `heartbeat()` call re-checks `status = 'running'`,
+finds it false, and stops extending, no separate worker-side mechanism
+required; (3) closes the `extraction_runs` row immediately as `interrupted`
+with `interrupted_reason: "cancelled"` — never waiting on the crawl to
+notice. A zombie handler thread may keep running a while longer (Python
+cannot force-kill a thread), but its eventual `complete()`/`fail()` call
+carries the now-stale lease token and is a guaranteed no-op, so it can never
+resurrect the state this call just wrote. Returns `{connection_id, ...}` —
+the rest is the run's new projection, same shape as every other run read in
+this module, so the caller repaints without a second fetch. `404
+run_not_found` for an unknown run id; `409 run_not_active` when the run's
+stored status is not `running` (already finished, or already cancelled).
+Audited as `sharepoint_extraction_run.cancel` — the handler writes its own
+row (the connection id, the job id, whether a job was actually
+force-finalized). CLI: `agnes admin sharepoint runs cancel <run_id> [--json]`.
+Web: a "Cancel run" button on `/admin/extraction`'s fleet table for every
+`running`/`stalled` row, and on the SharePoint source card's Run row once a
+run reads `stalled` (a merely `running` one offers Stop first) — both behind
+a confirm dialog.
 
 `PATCH …/extraction/facts-config` (cost-levers task, lever A) sets or clears
 per-connection overrides for the corrective-retry policy, transport and LLM
@@ -1961,12 +1997,12 @@ item whose modified timestamp cannot be read at all (counted separately as
 item is still processed for deletion regardless of the filter.
 
 The four `GET`/stop routes above are admin-only display primitives with no
-analyst CLI/MCP analogue. The fleet endpoint, `facts-config` and
-`crawl-config` are all CLI-reachable — an operator watching the fleet, or
-scripting a per-connection cost/recall/scope tradeoff — but deliberately not
-MCP-exposed: a fleet-wide operational status read and a connection's
-retry/crawl policy are all operator decisions, not query surfaces any agent
-needs.
+analyst CLI/MCP analogue. The fleet endpoint, `cancel`, `facts-config` and
+`crawl-config` are all CLI-reachable — an operator watching the fleet, force-
+closing a stuck run, or scripting a per-connection cost/recall/scope
+tradeoff — but deliberately not MCP-exposed: a fleet-wide operational status
+read, force-terminating a crawl, and a connection's retry/crawl policy are
+all operator decisions, not query surfaces any agent needs.
 
 `GET …/extraction/completeness` (TCRD-296 synthesis item B.9) answers "did we
 really get everything?" — the same question an operator's ad hoc script

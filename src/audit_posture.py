@@ -145,6 +145,12 @@ POSTURE: dict[str, str] = {
     # action, carrying `connection_id` only (no run content, no document
     # paths).
     "POST /api/admin/sharepoint/connections/{connection_id}/extraction/stop": "extraction.stop_requested",
+    # Force-close a run the cooperative stop above cannot reach (a crawl
+    # loop genuinely stuck, never observing the flag). The handler writes
+    # its OWN row (log_safe) carrying the connection id, the job id and
+    # whether a job was actually force-finalized — more than the fallback
+    # middleware could say (it never sees the response body's job details).
+    "POST /api/admin/sharepoint/extraction/runs/{run_id}/cancel": "sharepoint_extraction_run.cancel",
     # Per-connection override for extraction.facts.retry_mode (cost-levers
     # task, lever A). The handler writes its OWN row (log_safe) carrying the
     # requested value, the resolved value and its source — more than the

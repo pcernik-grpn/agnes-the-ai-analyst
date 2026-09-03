@@ -403,7 +403,11 @@ def test_fleet_row_carries_the_age_filter_counters_from_the_same_run(tmp_path, m
     assert row["run"]["age_unknown"] == 3
 
 
-def test_fleet_row_flags_a_stuck_run_past_the_fleet_threshold(tmp_path, monkeypatch, pg_engine):
+def test_fleet_row_flags_a_stuck_run_past_the_stall_threshold(tmp_path, monkeypatch, pg_engine):
+    """The fleet's `stuck` flag and the per-run `outcome: "stalled"` word
+    are ONE rule (2026-09-03 unification) — a row is `stuck` exactly when
+    its own `run.outcome` is `stalled`, never a separate, tighter
+    threshold that could disagree with the badge sitting right next to it."""
     import sqlalchemy as sa
 
     import app.api.admin_extraction as mod
@@ -417,14 +421,71 @@ def test_fleet_row_flags_a_stuck_run_past_the_fleet_threshold(tmp_path, monkeypa
     with get_engine().begin() as conn:
         conn.execute(
             sa.text("UPDATE extraction_runs SET checkpoint_at = now() - make_interval(secs => :s) WHERE id = :id"),
-            {"s": mod._FLEET_STUCK_AFTER_S + 60, "id": run_id},
+            {"s": mod._STALL_AFTER_S + 60, "id": run_id},
         )
 
     body = client.get(f"{FLEET_URL}?active=1", headers=_auth(token)).json()
     row = body["connections"][0]
     assert row["stuck"] is True
-    assert row["checkpoint_age_s"] > mod._FLEET_STUCK_AFTER_S
+    assert row["run"]["outcome"] == "stalled"
+    assert row["checkpoint_age_s"] > mod._STALL_AFTER_S
     assert body["totals"]["stuck"] == 1
+
+
+def test_fleet_row_is_not_stuck_before_the_stall_threshold(tmp_path, monkeypatch, pg_engine):
+    """A checkpoint that is merely old (but not yet past
+    `extraction.stall_after_s`) must not trip `stuck` — proof the fleet no
+    longer uses a separate, tighter tripwire than the run's own outcome."""
+    import sqlalchemy as sa
+
+    import app.api.admin_extraction as mod
+
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token, name="sp-not-yet-stuck")
+
+    run_id = _repo().start(connection_id=conn_id)
+    from src.db_pg import get_engine
+
+    with get_engine().begin() as conn:
+        conn.execute(
+            sa.text("UPDATE extraction_runs SET checkpoint_at = now() - make_interval(secs => :s) WHERE id = :id"),
+            {"s": mod._STALL_AFTER_S - 60, "id": run_id},
+        )
+
+    body = client.get(f"{FLEET_URL}?active=1", headers=_auth(token)).json()
+    row = body["connections"][0]
+    assert row["stuck"] is False
+    assert row["run"]["outcome"] == "running"
+    assert body["totals"]["stuck"] == 0
+
+
+def test_stall_after_s_config_override_lowers_the_threshold(tmp_path, monkeypatch, pg_engine):
+    """`extraction.stall_after_s` is admin-editable and read fresh — a
+    checkpoint just past a LOWERED threshold reports `stalled` even though
+    it is well under the built-in 900s default."""
+    import sqlalchemy as sa
+
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token, name="sp-custom-threshold")
+
+    resp = client.post(
+        "/api/admin/server-config",
+        json={"sections": {"extraction": {"stall_after_s": 60}}},
+        headers=_auth(token),
+    )
+    assert resp.status_code == 200, resp.text
+
+    run_id = _repo().start(connection_id=conn_id)
+    from src.db_pg import get_engine
+
+    with get_engine().begin() as conn:
+        conn.execute(
+            sa.text("UPDATE extraction_runs SET checkpoint_at = now() - make_interval(secs => :s) WHERE id = :id"),
+            {"s": 120, "id": run_id},
+        )
+
+    running = client.get(f"{BASE}/{conn_id}/extraction/status", headers=_auth(token)).json()["running"]
+    assert running["outcome"] == "stalled"
 
 
 def test_fleet_totals_sum_across_connections(tmp_path, monkeypatch, pg_engine):
@@ -603,3 +664,156 @@ def test_fleet_jobs_block_reflects_the_queue_independent_of_scope(tmp_path, monk
     body = client.get(f"{FLEET_URL}?active=1", headers=_auth(token)).json()
     assert body["jobs"]["corpus-extraction"] == {"queued": 2, "running": 0}
     assert body["jobs"]["sharepoint-facts-extraction"] == {"queued": 0, "running": 1}
+
+
+# ---------------------------------------------------------------------------
+# Cancel — force-close a run Stop alone cannot reach (`POST
+# /api/admin/sharepoint/extraction/runs/{run_id}/cancel`).
+# ---------------------------------------------------------------------------
+
+CANCEL_URL = "/api/admin/sharepoint/extraction/runs"
+
+
+def test_cancel_closes_the_run_and_finalizes_the_job(tmp_path, monkeypatch, pg_engine):
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token, name="sp-cancel")
+
+    from src.repositories import jobs_repo
+
+    job = jobs_repo().enqueue("corpus-extraction", {"connection_id": conn_id})
+    claimed = jobs_repo().claim_next(kinds=["corpus-extraction"], worker_id="w1", lease_seconds=600)
+    assert claimed["id"] == job["id"]
+
+    repo = _repo()
+    run_id = repo.start(connection_id=conn_id, job_id=job["id"])
+    repo.checkpoint(run_id, files_seen=40, files_done=37, progress={"new": 37})
+
+    r = client.post(f"{CANCEL_URL}/{run_id}/cancel", headers=_auth(token))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["connection_id"] == conn_id
+    assert body["outcome"] == "interrupted"
+    assert body["interrupted_reason"] == "cancelled"
+    assert body["resumable"] is True
+    # What the crawl had already ingested is kept, not wiped by the cancel.
+    assert body["files_done"] == 37
+
+    job_row = jobs_repo().get(job["id"])
+    assert job_row["status"] == "failed"
+    assert job_row["error"] == "cancelled_by_admin"
+    assert job_row["lease_token"] is None
+    assert job_row["lease_expires_at"] is None
+
+    run_row = repo.get(run_id)
+    assert run_row["status"] == "interrupted"
+
+
+def test_cancel_also_sets_the_cooperative_stop_flag(tmp_path, monkeypatch, pg_engine):
+    """Cancel = stop + force-close, reusing (not duplicating) the crawl's
+    own cooperative-stop path: even a run that is merely SLOW rather than
+    truly stuck sees the SAME `stop_requested_at` flag `POST …/extraction/
+    stop` sets, so it can still exit cleanly at its next checkpoint
+    (`connectors.sharepoint.crawler._StopWatcher`, already covered end to
+    end by `tests/test_sharepoint_crawler.py::TestCooperativeStopEndToEnd`)
+    instead of relying solely on the force-close below."""
+    from connectors.sharepoint.crawler import _stop_requested
+
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token, name="sp-cancel-sets-stop-flag")
+
+    assert _stop_requested(conn_id) is None
+
+    run_id = _repo().start(connection_id=conn_id)
+    r = client.post(f"{CANCEL_URL}/{run_id}/cancel", headers=_auth(token))
+    assert r.status_code == 200, r.text
+
+    assert _stop_requested(conn_id) is not None
+
+
+def test_cancel_works_even_with_no_owning_job(tmp_path, monkeypatch, pg_engine):
+    """A run started outside the worker (a test, a manually-posted payload)
+    may carry no `job_id` — cancel must still close the run row."""
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token, name="sp-cancel-no-job")
+
+    run_id = _repo().start(connection_id=conn_id)
+
+    r = client.post(f"{CANCEL_URL}/{run_id}/cancel", headers=_auth(token))
+    assert r.status_code == 200, r.text
+    assert r.json()["outcome"] == "interrupted"
+
+
+def test_cancel_stops_the_heartbeat_loop_via_the_cleared_lease(tmp_path, monkeypatch, pg_engine):
+    """The mechanism that stops a stuck worker's lease-extension loop: after
+    cancel, the job's own `heartbeat()` (using its old lease_token) must
+    return False."""
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token, name="sp-cancel-heartbeat")
+
+    from src.repositories import jobs_repo
+
+    job = jobs_repo().enqueue("corpus-extraction", {"connection_id": conn_id})
+    claimed = jobs_repo().claim_next(kinds=["corpus-extraction"], worker_id="w1", lease_seconds=600)
+
+    run_id = _repo().start(connection_id=conn_id, job_id=job["id"])
+
+    r = client.post(f"{CANCEL_URL}/{run_id}/cancel", headers=_auth(token))
+    assert r.status_code == 200, r.text
+
+    ok = jobs_repo().heartbeat(job["id"], "w1", claimed["lease_token"], lease_seconds=9999)
+    assert ok is False
+
+
+def test_cancel_unknown_run_is_404(tmp_path, monkeypatch, pg_engine):
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    r = client.post(f"{CANCEL_URL}/er_does_not_exist/cancel", headers=_auth(token))
+    assert r.status_code == 404
+    assert r.json()["detail"] == "run_not_found"
+
+
+def test_cancel_an_already_finished_run_is_409(tmp_path, monkeypatch, pg_engine):
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token, name="sp-cancel-409")
+
+    repo = _repo()
+    run_id = repo.start(connection_id=conn_id)
+    repo.finish(run_id, status="done", report={"new": 3})
+
+    r = client.post(f"{CANCEL_URL}/{run_id}/cancel", headers=_auth(token))
+    assert r.status_code == 409
+    body = r.json()["detail"]
+    assert body["error"] == "run_not_active"
+    assert body["status"] == "done"
+
+
+def test_cancel_a_second_time_is_409_not_a_double_close(tmp_path, monkeypatch, pg_engine):
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token, name="sp-cancel-twice")
+
+    run_id = _repo().start(connection_id=conn_id)
+    first = client.post(f"{CANCEL_URL}/{run_id}/cancel", headers=_auth(token))
+    assert first.status_code == 200
+
+    second = client.post(f"{CANCEL_URL}/{run_id}/cancel", headers=_auth(token))
+    assert second.status_code == 409
+
+
+def test_cancel_writes_an_audit_row(tmp_path, monkeypatch, pg_engine):
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token, name="sp-cancel-audit")
+
+    run_id = _repo().start(connection_id=conn_id)
+    r = client.post(f"{CANCEL_URL}/{run_id}/cancel", headers=_auth(token))
+    assert r.status_code == 200
+
+    from src.repositories import audit_repo
+
+    rows, _ = audit_repo().query(action="sharepoint_extraction_run.cancel", limit=10)
+    matching = [row for row in rows if run_id in str(row.get("resource") or "")]
+    assert matching, "cancel must write its own audit row naming the run"
+    params = matching[0].get("params") or {}
+    if isinstance(params, str):
+        import json
+
+        params = json.loads(params)
+    assert params.get("connection_id") == conn_id

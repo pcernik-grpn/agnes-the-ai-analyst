@@ -449,6 +449,50 @@ class JobsRepository:
             ).fetchall()
             return bool(mutated)
 
+    def cancel(self, job_id: str, *, error: str = "cancelled_by_admin") -> bool:
+        """Force-finalize a ``queued``/``running`` job to ``'failed'`` —
+        an ADMIN-initiated override, unlike :meth:`fail`, which requires the
+        exact ``lease_token`` of the worker holding the job. An admin
+        cancelling a run has no lease token (they never claimed the job),
+        so the guard here is the same lease-agnostic shape
+        :meth:`reap_exhausted` already uses (``WHERE status IN ('queued',
+        'running')``, no ``lease_token``/``worker_id`` check) rather than
+        the claim/heartbeat/complete/fail lifecycle's own atomicity guard.
+
+        Clearing ``lease_expires_at``/``leased_by``/``lease_token`` is what
+        makes this effective even against a handler thread that never
+        notices: the NEXT ``heartbeat()`` call for this job's (now stale)
+        lease token re-checks ``status = 'running'`` and finds it no
+        longer true, returns ``False``, and the worker's heartbeat loop
+        stops extending the lease on its own (see ``app/worker/runtime.py
+        ._heartbeat_loop``) — no new stop mechanism needed on that side.
+        A zombie handler thread may keep running past this call (Python
+        cannot force-kill a thread), but its eventual ``complete()``/
+        ``fail()`` call is guarded by the SAME stale-lease no-op every
+        reclaim race already relies on, so it can never clobber the
+        cancelled state recorded here.
+
+        Returns ``True`` if a row was actually mutated (the job existed
+        and was ``queued`` or ``running``), ``False`` for an unknown job id
+        or one already in a terminal state (``done``/``failed``) — a
+        cancel of an already-finished job is a no-op, not an error.
+        """
+        with _JOBS_LOCK:
+            now = datetime.now(timezone.utc)
+            mutated = self.conn.execute(
+                """UPDATE jobs
+                   SET status = 'failed',
+                       finished_at = ?,
+                       lease_expires_at = NULL,
+                       leased_by = NULL,
+                       lease_token = NULL,
+                       error = ?
+                   WHERE id = ? AND status IN ('queued', 'running')
+                   RETURNING id""",
+                [now, error, job_id],
+            ).fetchall()
+            return bool(mutated)
+
     def reap_exhausted(self, now: Optional[datetime] = None) -> List[Dict[str, Any]]:
         """Finalize stuck ``'running'`` jobs whose lease has expired AND
         which have already exhausted their attempts.

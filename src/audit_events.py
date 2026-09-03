@@ -1210,6 +1210,13 @@ CATALOG: dict[str, AuditEvent] = {
         "mutation",
         "An admin requested a running (or about-to-run) extraction crawl stop at its next quiescent point.",
     ),
+    # -- Force-cancel a stuck run (owner-frustration fix, 2026-09-03) --------
+    "sharepoint_extraction_run.cancel": AuditEvent(
+        "sharepoint_extraction_run.cancel",
+        "mutation",
+        "An admin force-cancelled a running (or stalled) SharePoint extraction run — the job was "
+        "finalized failed and the run row closed interrupted, whether or not the crawl itself ever noticed.",
+    ),
     # -- Per-connection retry-policy override (cost-levers task, lever A) ----
     "extraction.facts_retry_mode_set": AuditEvent(
         "extraction.facts_retry_mode_set",

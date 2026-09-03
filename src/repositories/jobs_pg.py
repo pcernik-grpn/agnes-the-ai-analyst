@@ -496,6 +496,34 @@ class JobsPgRepository:
             ).first()
         return mutated is not None
 
+    def cancel(self, job_id: str, *, error: str = "cancelled_by_admin") -> bool:
+        """Force-finalize a ``queued``/``running`` job to ``'failed'``.
+        Mirrors ``JobsRepository.cancel`` — see that module's docstring for
+        the full rationale (admin override with no lease token, same
+        lease-agnostic guard shape as ``reap_exhausted``, why clearing the
+        lease is what stops the heartbeat loop on its own).
+
+        Returns ``True`` if a row was actually mutated, ``False`` for an
+        unknown job id or one already in a terminal state.
+        """
+        now = datetime.now(timezone.utc)
+        with self._engine.begin() as conn:
+            mutated = conn.execute(
+                sa.text(
+                    """UPDATE jobs
+                       SET status = 'failed',
+                           finished_at = :now,
+                           lease_expires_at = NULL,
+                           leased_by = NULL,
+                           lease_token = NULL,
+                           error = :error
+                       WHERE id = :id AND status IN ('queued', 'running')
+                       RETURNING id"""
+                ),
+                {"now": now, "error": error, "id": job_id},
+            ).first()
+        return mutated is not None
+
     def reap_exhausted(self, now: Optional[datetime] = None) -> List[Dict[str, Any]]:
         """Finalize stuck ``'running'`` jobs whose lease has expired AND
         which have already exhausted their attempts. Mirrors

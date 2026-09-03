@@ -314,3 +314,42 @@ console.log(JSON.stringify({ html: _el.innerHTML }));
 """
     )
     assert "starved" not in out["html"]
+
+
+# ---------------------------------------------------------------------------
+# Cancel run (stalled-crawl-cancel fix, TCRD-296 gap 32) — offered for a
+# running/stalled row, never a finished one, and never disabled by "live"
+# (force-closing a live run is the entire point).
+# ---------------------------------------------------------------------------
+
+
+def test_cancel_button_shown_for_a_running_run():
+    row = json.loads(json.dumps(_ROW))
+    row["run"]["id"] = "er_abc123"
+    html = _run_row_js(row)
+    assert "Cancel run" in html
+    assert "extCancelRun('sp1', 'er_abc123')" in html
+
+
+def test_cancel_button_shown_for_a_stalled_run():
+    row = json.loads(json.dumps(_ROW))
+    row["run"]["id"] = "er_stalled1"
+    row["run"]["outcome"] = "stalled"
+    html = _run_row_js(row)
+    assert "Cancel run" in html
+    assert "extCancelRun('sp1', 'er_stalled1')" in html
+
+
+def test_cancel_button_hidden_for_a_done_run():
+    row = json.loads(json.dumps(_ROW))
+    row["run"]["id"] = "er_done1"
+    row["run"]["outcome"] = "done"
+    html = _run_row_js(row)
+    assert "Cancel run" not in html
+
+
+def test_cancel_button_hidden_when_there_is_no_run():
+    row = json.loads(json.dumps(_ROW))
+    row["run"] = None
+    html = _run_row_js(row)
+    assert "Cancel run" not in html

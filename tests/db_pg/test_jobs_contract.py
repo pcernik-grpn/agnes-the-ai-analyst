@@ -577,6 +577,89 @@ def test_reap_exhausted_returns_rows_across_multiple_stuck_jobs(repo):
 
 
 # ---------------------------------------------------------------------------
+# cancel — admin-initiated force-finalize (no lease token needed)
+# ---------------------------------------------------------------------------
+
+
+def test_cancel_finalizes_a_running_job_without_a_lease_token(repo):
+    repo.enqueue("stuck_kind", {})
+    claimed = repo.claim_next(kinds=["stuck_kind"], worker_id="w1", lease_seconds=120)
+    # The admin caller never claimed this job and has no lease_token — cancel()
+    # must not need one.
+    mutated = repo.cancel(claimed["id"])
+    assert mutated is True
+    row = repo.get(claimed["id"])
+    assert row["status"] == "failed"
+    assert row["error"] == "cancelled_by_admin"
+    assert row["finished_at"] is not None
+    assert row["lease_expires_at"] is None
+    assert row["leased_by"] is None
+    assert row["lease_token"] is None
+
+
+def test_cancel_finalizes_a_queued_job_too(repo):
+    """A run whose job never got claimed at all (still queued) is still
+    cancellable — an admin should not have to wait for a worker to pick it
+    up first."""
+    job = repo.enqueue("never_claimed", {})
+    mutated = repo.cancel(job["id"])
+    assert mutated is True
+    row = repo.get(job["id"])
+    assert row["status"] == "failed"
+
+
+def test_cancel_accepts_a_custom_error_message(repo):
+    repo.enqueue("custom_err", {})
+    claimed = repo.claim_next(kinds=["custom_err"], worker_id="w1")
+    repo.cancel(claimed["id"], error="cancelled by admin zdenek")
+    row = repo.get(claimed["id"])
+    assert row["error"] == "cancelled by admin zdenek"
+
+
+def test_cancel_is_noop_for_unknown_job(repo):
+    assert repo.cancel("does-not-exist") is False
+
+
+def test_cancel_is_noop_for_already_terminal_job(repo):
+    repo.enqueue("already_done", {})
+    claimed = repo.claim_next(kinds=["already_done"], worker_id="w1")
+    repo.complete(claimed["id"], "w1", claimed["lease_token"])
+    mutated = repo.cancel(claimed["id"])
+    assert mutated is False
+    row = repo.get(claimed["id"])
+    assert row["status"] == "done"  # untouched
+
+
+def test_cancel_then_heartbeat_returns_false_stopping_the_lease_extension(repo):
+    """This is the mechanism that stops a stuck worker's lease-extension
+    loop: cancel() clears the lease and flips status away from 'running',
+    so the NEXT heartbeat() call (using the worker's now-stale lease_token)
+    finds `status = 'running'` no longer true and reports False — see
+    `app/worker/runtime.py::_heartbeat_loop`, which stops extending the
+    first time heartbeat() returns False."""
+    repo.enqueue("heartbeat_vs_cancel", {})
+    claimed = repo.claim_next(kinds=["heartbeat_vs_cancel"], worker_id="w1", lease_seconds=120)
+    assert repo.cancel(claimed["id"]) is True
+    ok = repo.heartbeat(claimed["id"], "w1", claimed["lease_token"], lease_seconds=9999)
+    assert ok is False
+
+
+def test_cancel_then_late_complete_from_the_stuck_worker_is_a_noop(repo):
+    """A zombie handler thread that eventually finishes (or errors) after
+    being cancelled must not resurrect the job — its complete()/fail() call
+    still carries the OLD lease_token, which no longer matches a 'running'
+    row."""
+    repo.enqueue("late_complete_vs_cancel", {})
+    claimed = repo.claim_next(kinds=["late_complete_vs_cancel"], worker_id="w1")
+    repo.cancel(claimed["id"])
+    mutated = repo.complete(claimed["id"], "w1", claimed["lease_token"])
+    assert mutated is False
+    row = repo.get(claimed["id"])
+    assert row["status"] == "failed"
+    assert row["error"] == "cancelled_by_admin"
+
+
+# ---------------------------------------------------------------------------
 # reclaim race edges — permanent regression tests for the previous-review
 # carry-over findings (heartbeat-vs-reclaim, complete-vs-reclaim). Both are
 # simulated as deterministic single-thread interleavings (direct repo calls

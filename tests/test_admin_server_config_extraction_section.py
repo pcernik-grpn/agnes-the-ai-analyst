@@ -94,6 +94,8 @@ def test_get_returns_extraction_known_fields(seeded_app, monkeypatch):
     assert fields["schedule"]["kind"] == "string"
     assert fields["timeout_s"]["kind"] == "int"
     assert fields["timeout_s"]["default"] == 3600
+    assert fields["stall_after_s"]["kind"] == "int"
+    assert fields["stall_after_s"]["default"] == 900
 
 
 def test_sharepoint_switch_is_editable(seeded_app, monkeypatch):
@@ -229,6 +231,60 @@ def test_timeout_s_boundaries_accepted(seeded_app, monkeypatch):
             headers=_auth(seeded_app["admin_token"]),
         )
         assert resp.status_code == 200, resp.text
+
+
+def test_stall_after_s_below_min_rejected(seeded_app, monkeypatch):
+    _clear_extraction_env(monkeypatch)
+    client = seeded_app["client"]
+    resp = client.post(
+        "/api/admin/server-config",
+        json={"sections": {"extraction": {"stall_after_s": 59}}},
+        headers=_auth(seeded_app["admin_token"]),
+    )
+    assert resp.status_code == 422, resp.text
+
+
+def test_stall_after_s_above_max_rejected(seeded_app, monkeypatch):
+    _clear_extraction_env(monkeypatch)
+    client = seeded_app["client"]
+    resp = client.post(
+        "/api/admin/server-config",
+        json={"sections": {"extraction": {"stall_after_s": 86401}}},
+        headers=_auth(seeded_app["admin_token"]),
+    )
+    assert resp.status_code == 422, resp.text
+
+
+def test_stall_after_s_boundaries_accepted(seeded_app, monkeypatch):
+    _clear_extraction_env(monkeypatch)
+    client = seeded_app["client"]
+    for value in (60, 86400):
+        resp = client.post(
+            "/api/admin/server-config",
+            json={"sections": {"extraction": {"stall_after_s": value}}},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert resp.status_code == 200, resp.text
+
+
+def test_post_updates_stall_after_s_and_get_reflects_it(seeded_app, monkeypatch):
+    _clear_extraction_env(monkeypatch)
+    client = seeded_app["client"]
+    headers = _auth(seeded_app["admin_token"])
+    resp = client.post(
+        "/api/admin/server-config",
+        json={"sections": {"extraction": {"stall_after_s": 300}}},
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+
+    from app.secrets import _state_dir
+
+    loaded = yaml.safe_load((_state_dir() / "instance.yaml").read_text())
+    assert loaded["extraction"]["stall_after_s"] == 300
+
+    resp2 = client.get("/api/admin/server-config", headers=headers)
+    assert resp2.json()["sections"]["extraction"]["stall_after_s"] == 300
 
 
 # ---------------------------------------------------------------------------

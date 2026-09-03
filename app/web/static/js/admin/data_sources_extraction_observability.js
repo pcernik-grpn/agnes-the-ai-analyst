@@ -26,6 +26,7 @@ function _extS(id) {
       retryingFailed: false,
       retryingEmpty: false,
       rerunning: false,
+      cancelling: false,
     };
   }
   return _extState[id];
@@ -198,6 +199,7 @@ const EXT_STOP_REASON_TEXT = {
   timeout: "the run hit its time ceiling (extraction.timeout_s)",
   throttled: "the tenant's throttling budget was exhausted (HTTP 429)",
   stopped: "stopped by an admin",
+  cancelled: "force-cancelled by an admin — the run did not respond to a stop request in time",
   abandoned: "the worker running it died (crashed or was killed) and never finished — closed when the next run started",
   error: "an unexpected error",
 };
@@ -447,10 +449,21 @@ function _extRunRowHtml(connId, st) {
     ? `<button type="button" class="btn btn-secondary" onclick="extRerun('${connId}')"
                ${st.rerunning ? "disabled" : ""}>${st.rerunning ? "Starting…" : "Re-run"}</button>`
     : "";
+  // Cancel is the FORCE-close hammer, offered only once a run has already
+  // proven Stop alone won't reach it — `outcome === "stalled"` means its
+  // checkpoint is stale well past a live crawl's own cadence (see
+  // `extraction.stall_after_s` server-side), so a run merely `running`
+  // never shows this button; Stop is the right first move there.
+  const canCancelNow = !!run && run.outcome === "stalled";
+  const cancelBtn = canCancelNow
+    ? `<button type="button" class="btn btn-sm btn-danger" onclick="extCancelRun('${connId}', '${run.id}')"
+               ${st.cancelling ? "disabled" : ""}>${st.cancelling ? "Cancelling…" : "Cancel run"}</button>`
+    : "";
 
   const actions = `
       <div class="ext-actions">
         ${stopBtn}
+        ${cancelBtn}
         ${retryFailedBtn}
         ${retryEmptyBtn}
         ${rerunBtn}
@@ -786,6 +799,49 @@ function extRerun(connId) {
     null,
     "Extraction queued",
   );
+}
+
+/* Force-close a run Stop alone cannot reach — a genuinely stuck crawl loop
+   never notices the cooperative flag Stop sets either (the 2026-09-02
+   incident: an hour of `running` with no checkpoint, ended by hand via two
+   SQL updates). Same `confirm()` posture as `extStopRun` above; the
+   phrasing is explicit that this is the "give up on it" button, not a
+   gentler variant of Stop. A 200 means the row is closed server-side
+   immediately (never waiting on the crawl to notice) — the next poll shows
+   it as `interrupted`. */
+async function extCancelRun(connId, runId) {
+  if (
+    !confirm(
+      "Cancel this extraction run? This force-closes it even if the worker never reacts — what it " +
+        "already ingested is kept, but the run itself will not finish on its own. Use this only after " +
+        "Stop hasn't worked."
+    )
+  ) {
+    return;
+  }
+  const st = _extS(connId);
+  st.cancelling = true;
+  _extRender(connId);
+  try {
+    const r = await fetch(`/api/admin/sharepoint/extraction/runs/${encodeURIComponent(runId)}/cancel`, {
+      method: "POST",
+      credentials: "include",
+    });
+    if (r.ok) {
+      if (typeof showToast === "function") showToast("Run cancelled.", true);
+      await _extFetchOne(connId);
+      return;
+    }
+    const body = await r.json().catch(() => ({}));
+    st.cancelling = false;
+    const msg = typeof detailMessage === "function" ? detailMessage(body, "couldn't cancel the run") : "couldn't cancel the run";
+    if (typeof showToast === "function") showToast(`Cancel failed: ${msg}`, false);
+    _extRender(connId);
+  } catch (e) {
+    st.cancelling = false;
+    if (typeof showToast === "function") showToast("Request failed.", false);
+    _extRender(connId);
+  }
 }
 
 document.addEventListener("visibilitychange", () => {
