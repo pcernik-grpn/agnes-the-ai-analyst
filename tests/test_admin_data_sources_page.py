@@ -132,10 +132,12 @@ class TestMasterTokenCardTooltip:
 
     def _fact_fn(self, seeded_app) -> str:
         c = seeded_app["client"]
-        body = c.get(
-            "/admin/data-sources",
-            headers={"Authorization": f"Bearer {seeded_app['admin_token']}"},
-        ).text
+        body = _ds_page_source.rendered_with_scripts(
+            c.get(
+                "/admin/data-sources",
+                headers={"Authorization": f"Bearer {seeded_app['admin_token']}"},
+            ).text
+        )
         return self._extract_function(body, "function _masterTokenFactHtml(row) {")
 
     def test_uses_data_tip_and_aria_label_not_title(self, seeded_app):
@@ -159,10 +161,12 @@ class TestMasterTokenCardTooltip:
         makes the pipeline-strip fallback to the plain link, rather than
         `toggleMasterToken`, for a derived card the only safe choice."""
         c = seeded_app["client"]
-        body = c.get(
-            "/admin/data-sources",
-            headers={"Authorization": f"Bearer {seeded_app['admin_token']}"},
-        ).text
+        body = _ds_page_source.rendered_with_scripts(
+            c.get(
+                "/admin/data-sources",
+                headers={"Authorization": f"Bearer {seeded_app['admin_token']}"},
+            ).text
+        )
         card = self._extract_function(body, "function _connectionCardHtml(row) {")
         derived_branch = card[: card.index("const c = _connector(row.source_type);")]
         assert "_masterTokenFactHtml" not in derived_branch
@@ -701,10 +705,12 @@ class TestSourcePipelineStrip:
 
     def test_the_page_serves_the_strip_data(self, seeded_app):
         c = seeded_app["client"]
-        body = c.get(
-            "/admin/data-sources",
-            headers={"Authorization": f"Bearer {seeded_app['admin_token']}"},
-        ).text
+        body = _ds_page_source.rendered_with_scripts(
+            c.get(
+                "/admin/data-sources",
+                headers={"Authorization": f"Bearer {seeded_app['admin_token']}"},
+            ).text
+        )
         # The strip data is server-rendered into the boot object the page
         # script reads (`DS_BOOT`), not into a Jinja-interpolated `let` — so
         # this still asserts what it always did: that the SERVER shipped it.
@@ -904,10 +910,12 @@ class TestSourcesIsEveryConnector:
 
     def test_the_page_asks_for_every_source_type(self, seeded_app):
         c = seeded_app["client"]
-        body = c.get(
-            "/admin/data-sources",
-            headers={"Authorization": f"Bearer {seeded_app['admin_token']}"},
-        ).text
+        body = _ds_page_source.rendered_with_scripts(
+            c.get(
+                "/admin/data-sources",
+                headers={"Authorization": f"Bearer {seeded_app['admin_token']}"},
+            ).text
+        )
         # The Keboola-only filter is gone, and the derived cards ride along.
         assert "source_type=keboola" not in body
         # Server-rendered into the boot object — see the note in
@@ -1291,10 +1299,12 @@ class TestSourceCardHierarchy:
 
     def test_the_status_word_folds_the_strip(self, seeded_app):
         c = seeded_app["client"]
-        body = c.get(
-            "/admin/data-sources",
-            headers={"Authorization": f"Bearer {seeded_app['admin_token']}"},
-        ).text
+        body = _ds_page_source.rendered_with_scripts(
+            c.get(
+                "/admin/data-sources",
+                headers={"Authorization": f"Bearer {seeded_app['admin_token']}"},
+            ).text
+        )
         assert "_sourceHealth" in body
         for state in ("Healthy", "No tables yet", "Reaches nobody", "failing sync"):
             assert state in body
@@ -1305,10 +1315,12 @@ class TestSourceCardHierarchy:
 
     def test_the_body_is_closed_and_the_caret_says_so(self, seeded_app):
         c = seeded_app["client"]
-        body = c.get(
-            "/admin/data-sources",
-            headers={"Authorization": f"Bearer {seeded_app['admin_token']}"},
-        ).text
+        body = _ds_page_source.rendered_with_scripts(
+            c.get(
+                "/admin/data-sources",
+                headers={"Authorization": f"Bearer {seeded_app['admin_token']}"},
+            ).text
+        )
         assert 'class="ds-src__body" id="ds-body-${id}" hidden' in body
         assert 'aria-expanded="false" aria-controls="ds-body-${id}"' in body
         # A verb reached from the menu opens the body it writes into —
@@ -1321,10 +1333,12 @@ class TestSourceCardHierarchy:
         an empty source. The cell becomes the action instead, which is also
         where the card's primary verb stays one click away."""
         c = seeded_app["client"]
-        body = c.get(
-            "/admin/data-sources",
-            headers={"Authorization": f"Bearer {seeded_app['admin_token']}"},
-        ).text
+        body = _ds_page_source.rendered_with_scripts(
+            c.get(
+                "/admin/data-sources",
+                headers={"Authorization": f"Bearer {seeded_app['admin_token']}"},
+            ).text
+        )
         assert "Add the first tables" in body
         strip = body[body.index("function _pipelineStripHtml") : body.index("function _sourceHealth")]
         # A stored connection browses its own tables; a derived card has none
@@ -1334,10 +1348,12 @@ class TestSourceCardHierarchy:
 
     def test_no_control_was_dropped_with_the_action_strip(self, seeded_app):
         c = seeded_app["client"]
-        body = c.get(
-            "/admin/data-sources",
-            headers={"Authorization": f"Bearer {seeded_app['admin_token']}"},
-        ).text
+        body = _ds_page_source.rendered_with_scripts(
+            c.get(
+                "/admin/data-sources",
+                headers={"Authorization": f"Bearer {seeded_app['admin_token']}"},
+            ).text
+        )
         for fn in (
             "testConn",
             "toggleBrowse",
@@ -3183,7 +3199,12 @@ def test_register_error_text_is_not_html_escaped_before_textcontent(seeded_app):
     omits `_esc`; the two bulk-register paths did not.
     """
     c = seeded_app["client"]
-    html = c.get("/admin/data-sources", headers={"Authorization": f"Bearer {seeded_app['admin_token']}"}).text
+    html = _ds_page_source.rendered_with_scripts(
+        c.get(
+            "/admin/data-sources",
+            headers={"Authorization": f"Bearer {seeded_app['admin_token']}"},
+        ).text
+    )
     assert "_esc(_registerErrorText(" not in html, (
         "a register-error string is HTML-escaped before being assigned to "
         "textContent — the operator sees &quot; entities instead of the quoted "
