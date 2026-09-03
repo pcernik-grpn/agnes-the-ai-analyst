@@ -36,7 +36,7 @@ pytestmark = pytest.mark.skipif(shutil.which("node") is None, reason="node is no
 
 def _esc_source() -> str:
     src = TEMPLATE.read_text(encoding="utf-8")
-    m = re.search(r"function esc\(s\) \{.*?\n\}", src, re.S)
+    m = re.search(r"function esc\(s\) \{.*?\n\}", src, re.DOTALL)
     assert m, "esc() not found in admin_marketplaces.html — has it been renamed?"
     return m.group(0)
 
@@ -59,7 +59,7 @@ def _run_esc(payload: str) -> str:
     };
     """
     script = shim + _esc_source() + f"\nprocess.stdout.write(JSON.stringify(esc({json.dumps(payload)})));"
-    out = subprocess.run(["node", "-e", script], capture_output=True, text=True, timeout=30)
+    out = subprocess.run(["node", "-e", script], capture_output=True, text=True, timeout=30, check=False)
     assert out.returncode == 0, out.stderr
     return json.loads(out.stdout)
 
@@ -83,7 +83,7 @@ def test_a_single_quote_is_escaped_too():
 
 def test_the_ordinary_html_metacharacters_still_go():
     """The behaviour that was already right must survive the addition."""
-    escaped = _run_esc('<script>alert(1)</script> & more')
+    escaped = _run_esc("<script>alert(1)</script> & more")
     assert "<" not in escaped and ">" not in escaped
     assert "&lt;script&gt;" in escaped and "&amp;" in escaped
 
