@@ -98,6 +98,16 @@
   .smb-del:hover { color: var(--ds-accent-danger-ink); background: var(--ds-accent-danger-bg); }
   .smb-empty-sec { font-size: 13px; color: var(--ds-text-muted); margin: 0 0 10px; }
 
+  /* A dataset's columns — one compact row per field, nested inside its
+     dataset row. */
+  .smb-fields { margin-top: 4px; padding-top: 8px; border-top: 1px dashed var(--ds-border); }
+  .smb-field-label { display: block; font-size: 11.5px; font-weight: 600; text-transform: uppercase; letter-spacing: .02em; color: var(--ds-text-muted); margin-bottom: 6px; }
+  .smb-frow { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; }
+  .smb-frow input[type="text"] { flex: 1 1 auto; min-width: 0; font-family: inherit; font-size: 12.5px; padding: 6px 8px; border: 1px solid var(--ds-border); border-radius: 8px; background: var(--ds-surface); color: var(--ds-text-primary); }
+  .smb-frow input[type="text"][data-smb-ff="datatype"] { flex: 0 1 90px; }
+  .smb-fchk { display: flex; align-items: center; gap: 3px; font-size: 11.5px; color: var(--ds-text-secondary); white-space: nowrap; flex: 0 0 auto; }
+  .smb-frow .smb-del { flex: 0 0 auto; }
+
   .smb-doc { font-family: var(--ds-font-mono); font-size: 12px; line-height: 1.55; white-space: pre; overflow-x: auto; margin: 0; padding: 12px 13px; border: 1px solid var(--ds-border); border-radius: 11px; background: var(--ds-surface-sunken); color: var(--ds-text-primary); }
 
   /* Outcome content. The REGION is the shell's (`.ag-alerts`, from
@@ -169,6 +179,24 @@
      stored only in the DOM would vanish the moment a tab was clicked. */
   var outcome = null;
 
+  /* ── Builder conversation ───────────────────────────────────────────────
+     The left pane's Start tab. Stateless on the server (app/api/semantic_
+     model_builder.py) — a model has no row until Save, so the whole draft
+     travels in every turn and the reply's patch is merged into THIS SAME
+     draft the configuration pane reads, never a second copy. */
+  var conv = [];
+  var convBusy = false;
+  var convErr = null;
+  var convChips = [];
+  var convEngine = null;
+  var convDraft = '';
+  var DEFAULT_CHIPS = [
+    'A model over our orders table',
+    'Track revenue and active customers',
+    'Just describe the orders and customers tables for now'
+  ];
+  convChips = DEFAULT_CHIPS.slice();
+
   /* ── The document Save sends ───────────────────────────────────────────────
      Optional keys are omitted rather than emitted empty: an empty string is
      not the same claim as an absent description. */
@@ -179,7 +207,26 @@
     model.datasets = draft.datasets
       .filter(function (d) { return d.name; })
       .map(function (d) {
-        var out = { name: d.name, source: d.source || '', fields: [] };
+        var namedFields = (d.fields || []).filter(function (f) { return f.name; });
+        var out = {
+          name: d.name,
+          source: d.source || '',
+          /* A plain pass-through field still needs an expression naming
+             itself (docs/semantic-layer.md's own documented schema quirk) —
+             never emitted empty. */
+          fields: namedFields.map(function (f) {
+            var field = {
+              name: f.name,
+              datatype: f.datatype || 'String',
+              expression: { dialects: [{ dialect: 'duckdb', expression: f.name }] }
+            };
+            if (f.description) field.description = f.description;
+            if (f.is_time) field.dimension = { is_time: true };
+            return field;
+          })
+        };
+        var primaryKey = namedFields.filter(function (f) { return f.is_primary_key; }).map(function (f) { return f.name; });
+        if (primaryKey.length) out.primary_key = primaryKey;
         if (d.description) out.description = d.description;
         return out;
       });
@@ -222,21 +269,51 @@
     return '<div class="smb-out smb-out--' + outcome.cls + '" role="status">' + outcome.html + '</div>';
   }
 
-  /* ── The left pane: start from a document, or read the one being built ──── */
+  /* ── The left pane: the conversation that drafts the panel, or the document
+     it produces ─────────────────────────────────────────────────────────── */
+  function convHtml() {
+    if (llmUnavailable()) {
+      return BuilderShell.noModelNotice('configuration on the right') +
+        BuilderShell.conversation({ id: 'smb-conv', rows: conv, busy: false, err: null });
+    }
+    return BuilderShell.conversation({
+      id: 'smb-conv',
+      rows: [{ role: 'assistant', text: openingMessage() }].concat(conv),
+      busy: convBusy,
+      err: convErr,
+    });
+  }
+
+  /* Latched once a turn reports it, not guessed up front — the same
+     "the shell owns the turn" pattern every sibling builder follows. */
+  var _llmUnavailable = false;
+  function llmUnavailable() { return _llmUnavailable; }
+
+  function openingMessage() {
+    return 'Hi! I will help you draft a semantic model. Tell me which tables it should describe — ' +
+      'for example, "a model over our orders table" — and I will ground it in what is actually registered here.';
+  }
+
+  function startPaneHtml() {
+    return BuilderShell.engineNotice(convEngine) + convHtml() +
+      BuilderShell.composer({
+        kind: 'chat',
+        value: convDraft,
+        busy: convBusy,
+        readOnly: llmUnavailable(),
+        placeholder: llmUnavailable()
+          ? 'No AI is configured here — fill the configuration on the right by hand.'
+          : 'Tell me what this model should describe…',
+        chips: (!convBusy && !llmUnavailable()) ? convChips : [],
+      });
+  }
+
   function leftPane() {
     var body = tab === 'doc'
       ? '<p class="smb-hint">Exactly what ' + esc(SAVE_VERB_SHORT) +
           ' will send. Generated from the configuration — edit it there.</p>' +
         '<pre class="smb-doc" id="smb-doc">' + esc(documentText()) + '</pre>'
-      : '<p class="smb-hint">Already have an Ossie document? Paste it and it fills the ' +
-          'configuration on the right, where you can check it before anything is written. ' +
-          'Or leave this empty and build the model field by field.</p>' +
-        '<label class="smb-field"><span>Paste a document (YAML or JSON)</span>' +
-          '<textarea id="smb-paste" rows="12" spellcheck="false" ' +
-            'placeholder="version: \'' + SPEC_VERSION + '\'&#10;semantic_model:&#10;  - name: retail&#10;    datasets:&#10;      - name: orders&#10;        source: db.public.orders"></textarea>' +
-        '</label>' +
-        '<button type="button" class="btn" id="smb-import">Fill the configuration</button>' +
-        '<div id="smb-import-out"></div>';
+      : startPaneHtml();
 
     return BuilderShell.tabs({
       active: tab,
@@ -245,6 +322,114 @@
         { id: 'doc', label: 'Document' }
       ]
     }) + '<div class="smb-panel">' + body + '</div>';
+  }
+
+  /* Merge `delta` entries into `existing` by `name` — the client half of the
+     same algorithm app/api/semantic_model_builder.py::_keyed_upsert performs
+     server-side to compute progress. A turn's patch carries only NEW or
+     CHANGED entries, never the whole list, so a naive overwrite here would
+     drop everything an earlier turn (or the author's own typing) had already
+     added. */
+  function keyedUpsert(existing, delta) {
+    var out = (existing || []).slice();
+    var byName = {};
+    out.forEach(function (item, i) { if (item.name) byName[item.name] = i; });
+    delta.forEach(function (item) {
+      if (item.name && Object.prototype.hasOwnProperty.call(byName, item.name)) {
+        var i = byName[item.name];
+        var merged = {};
+        Object.keys(out[i]).forEach(function (k) { merged[k] = out[i][k]; });
+        Object.keys(item).forEach(function (k) { merged[k] = item[k]; });
+        out[i] = merged;
+      } else {
+        out.push(item);
+      }
+    });
+    return out;
+  }
+
+  /* Repaint only the left pane — a full render() on every turn would rebuild
+     the configuration column mid-edit and take the caret with it. */
+  function renderStartPane() {
+    var panel = document.querySelector('#smb-app .smb-panel');
+    if (!panel) { render(); return; }
+    panel.innerHTML = startPaneHtml();
+    var convEl = document.getElementById('smb-conv');
+    if (convEl) convEl.scrollTop = convEl.scrollHeight;
+  }
+
+  function sendBuilderTurn(text) {
+    if (convBusy) return;
+    conv.push({ role: 'user', text: text });
+    convBusy = true; convErr = null; convDraft = ''; convChips = [];
+    /* What the panel held when this turn was dispatched — a scalar field the
+       author edits while the turn is in flight belongs to them, not to the
+       reply (same rule /agents' builder applies). Datasets/metrics are
+       upserted unconditionally: a mid-flight edit there collides only in the
+       rare case of editing the exact row a turn also touches, and every row
+       carries its own Remove/Add controls that already re-render in full. */
+    var sentName = draft.name, sentDescription = draft.description;
+    renderStartPane();
+    BuilderShell.turn({
+      url: '/api/semantic-models/builder/turn',
+      message: text,
+      body: { message: text, history: conv.slice(0, -1), draft: draft },
+    }).then(function (body) {
+      conv.push({ role: 'assistant', text: BuilderShell.clipMsg(body.reply || '') });
+      conv = BuilderShell.trimHistory(conv);
+      convEngine = body.engine || null;
+      convChips = (body.suggestions && body.suggestions.length) ? body.suggestions : [];
+      var patch = body.patch || {};
+      if (typeof patch.name === 'string' && draft.name === sentName) draft.name = patch.name;
+      if (typeof patch.description === 'string' && draft.description === sentDescription) draft.description = patch.description;
+      if (Array.isArray(patch.datasets)) draft.datasets = keyedUpsert(draft.datasets, patch.datasets);
+      if (Array.isArray(patch.metrics)) draft.metrics = keyedUpsert(draft.metrics, patch.metrics);
+    }).catch(function (err) {
+      if (err.kind === 'llm_unavailable') _llmUnavailable = true;
+      convErr = err.message;
+      /* Hand the message back — it was cleared optimistically and, on a
+         failure, existed nowhere the author could retrieve it. */
+      if (text) {
+        convDraft = text;
+        if (conv.length && conv[conv.length - 1].role === 'user') conv.pop();
+      }
+    }).finally(function () {
+      convBusy = false;
+      render();
+    });
+  }
+
+  /* A dataset's columns — compact rows nested inside its section. Hand-
+     editable (a name is all a row needs), but this is also where a
+     conversation turn's grounded field proposals land, so the panel stays
+     the source of truth for what Save will actually send: without this, the
+     document always sent `fields: []` regardless of what a turn drafted. */
+  function fieldRowHtml(datasetIndex, field, fi) {
+    var p = 'data-smb-ds="' + datasetIndex + '" data-smb-fi="' + fi + '"';
+    return (
+      '<div class="smb-frow">' +
+        '<input type="text" ' + p + ' data-smb-ff="name" value="' + esc(field.name || '') + '" placeholder="column_name">' +
+        '<input type="text" ' + p + ' data-smb-ff="datatype" value="' + esc(field.datatype || '') + '" placeholder="type">' +
+        '<label class="smb-fchk" title="Time dimension"><input type="checkbox" ' + p + ' data-smb-ff="is_time"' +
+          (field.is_time ? ' checked' : '') + '> Time</label>' +
+        '<label class="smb-fchk" title="Primary key"><input type="checkbox" ' + p + ' data-smb-ff="is_primary_key"' +
+          (field.is_primary_key ? ' checked' : '') + '> PK</label>' +
+        '<button type="button" class="smb-del" ' + p + ' data-smb-fdel="1" aria-label="Remove field">✕</button>' +
+      '</div>'
+    );
+  }
+
+  function fieldsSubsection(datasetIndex, fields) {
+    var body = fields.length
+      ? fields.map(function (f, fi) { return fieldRowHtml(datasetIndex, f, fi); }).join('')
+      : '<p class="smb-empty-sec">No columns yet — ask the conversation, or add one by hand.</p>';
+    return (
+      '<div class="smb-fields">' +
+        '<span class="smb-field-label">Columns</span>' +
+        body +
+        '<button type="button" class="btn" data-smb-faddto="' + datasetIndex + '">+ Add column</button>' +
+      '</div>'
+    );
   }
 
   /* ── The right pane: the configuration, which IS the source of truth ────── */
@@ -263,7 +448,8 @@
         '<label class="smb-field"><span>Source table</span>' +
           '<input type="text" ' + p + ' data-smb-f="source" value="' + esc(item.source) + '" placeholder="db.public.orders"></label>' +
         '<label class="smb-field"><span>What it holds, and any caveat worth knowing</span>' +
-          '<textarea ' + p + ' data-smb-f="description" placeholder="Order lines. Excludes refunds.">' + esc(item.description) + '</textarea></label>';
+          '<textarea ' + p + ' data-smb-f="description" placeholder="Order lines. Excludes refunds.">' + esc(item.description) + '</textarea></label>' +
+        fieldsSubsection(i, item.fields || []);
     } else {
       rows +=
         '<label class="smb-field"><span>Name</span>' +
@@ -341,6 +527,8 @@
         cfgBodyId: 'smb-cfg',
         cfg: configPane()
       });
+    var convEl = document.getElementById('smb-conv');
+    if (convEl) convEl.scrollTop = convEl.scrollHeight;
   }
 
   /* Repaint only the derived views a keystroke can change. Re-rendering the
@@ -358,60 +546,6 @@
     if (host) {
       host.innerHTML = alertsHtml();
       host.scrollIntoView({ block: 'nearest' });
-    }
-  }
-
-  /* ── Reading a pasted document back into the draft ────────────────────────
-     JSON only, by design: a YAML parser is a dependency this page does not
-     need, and a document pasted as YAML gets a clear "paste JSON, or build it
-     here" rather than a silent half-import. The server remains the only
-     validator either way. */
-  function importPasted() {
-    var raw = (document.getElementById('smb-paste') || {}).value || '';
-    var out = document.getElementById('smb-import-out');
-    if (!raw.trim()) { if (out) out.innerHTML = ''; return; }
-
-    var parsed;
-    try {
-      parsed = JSON.parse(raw);
-    } catch (e) {
-      out.innerHTML = '<div class="smb-out smb-out--err">This reads as YAML, which this box cannot parse yet. ' +
-        'Paste the document as JSON, or build the model in the configuration on the right.</div>';
-      return;
-    }
-
-    var model = (parsed && parsed.semantic_model && parsed.semantic_model[0]) || null;
-    if (!model || !model.name) {
-      out.innerHTML = '<div class="smb-out smb-out--err">No model found. A document is ' +
-        '<code>semantic_model:</code> with at least one named entry.</div>';
-      return;
-    }
-
-    draft.name = String(model.name || '');
-    draft.description = String(model.description || '');
-    draft.datasets = (model.datasets || []).map(function (d) {
-      return {
-        name: String(d.name || ''),
-        source: String(d.source || ''),
-        description: String(d.description || '')
-      };
-    });
-    draft.metrics = (model.metrics || []).map(function (m) {
-      var dia = (m.expression && m.expression.dialects && m.expression.dialects[0]) || {};
-      return {
-        name: String(m.name || ''),
-        expression: String(dia.expression || ''),
-        dialect: String(dia.dialect || ''),
-        description: String(m.description || '')
-      };
-    });
-
-    render();
-    var o = document.getElementById('smb-import-out');
-    if (o) {
-      o.innerHTML = '<div class="smb-out smb-out--ok">Filled the configuration: ' +
-        draft.datasets.length + ' dataset(s), ' + draft.metrics.length + ' metric(s). ' +
-        'Nothing is written yet.</div>';
     }
   }
 
@@ -517,6 +651,26 @@
     if (t.dataset.smbF) {
       draft[t.dataset.smbKind][Number(t.dataset.smbI)][t.dataset.smbF] = t.value;
       refreshDerived();
+      return;
+    }
+    if (t.dataset.smbFf) {
+      var ds = draft.datasets[Number(t.dataset.smbDs)];
+      if (ds) {
+        var field = (ds.fields || [])[Number(t.dataset.smbFi)];
+        if (field) {
+          field[t.dataset.smbFf] = t.type === 'checkbox' ? t.checked : t.value;
+          refreshDerived();
+        }
+      }
+      return;
+    }
+    /* Composer text is state, not just DOM: the config pane can re-render
+       while a turn is in flight, and a draft that only lived in the textarea
+       would vanish under the author mid-sentence. */
+    if (t.dataset.agComp) {
+      convDraft = t.value;
+      t.style.height = 'auto';
+      t.style.height = Math.min(t.scrollHeight, 140) + 'px';
     }
   });
 
@@ -532,13 +686,41 @@
 
     if (t.closest('#smb-save')) { save(); return; }
 
+    if (t.closest('[data-ag-chip]')) {
+      sendBuilderTurn(t.closest('[data-ag-chip]').getAttribute('data-ag-chip'));
+      return;
+    }
+    if (t.closest('[data-ag-send]')) {
+      var box = app.querySelector('[data-ag-comp="chat"]');
+      var text = box ? box.value.trim() : '';
+      if (text) sendBuilderTurn(text);
+      return;
+    }
+
     var add = t.closest('[data-smb-add]');
     if (add) {
       var kind = add.dataset.smbAdd;
       draft[kind].push(kind === 'datasets'
-        ? { name: '', source: '', description: '' }
+        ? { name: '', source: '', description: '', fields: [] }
         : { name: '', expression: '', dialect: '', description: '' });
       render();
+      return;
+    }
+
+    var faddto = t.closest('[data-smb-faddto]');
+    if (faddto) {
+      var dsi = Number(faddto.getAttribute('data-smb-faddto'));
+      var target = draft.datasets[dsi];
+      if (target) {
+        target.fields = target.fields || [];
+        target.fields.push({ name: '', datatype: '', description: '', is_time: false, is_primary_key: false });
+        render();
+      }
+      return;
+    }
+    if (t.dataset.smbFdel) {
+      var fds = draft.datasets[Number(t.dataset.smbDs)];
+      if (fds) { fds.fields.splice(Number(t.dataset.smbFi), 1); render(); }
       return;
     }
 
@@ -548,13 +730,20 @@
       return;
     }
 
-    if (t.id === 'smb-import') { importPasted(); return; }
-
     var tabBtn = t.closest('[data-ag-tab]');
     if (tabBtn) {
       tab = tabBtn.dataset.agTab;
       render();
     }
+  });
+
+  /* Enter sends, Shift+Enter opens a line — the convention every chat box on
+     this site follows. */
+  app.addEventListener('keydown', function (e) {
+    if (!e.target.dataset || !e.target.dataset.agComp || e.key !== 'Enter' || e.shiftKey) return;
+    e.preventDefault();
+    var text = (e.target.value || '').trim();
+    if (text) sendBuilderTurn(text);
   });
 
   render();
