@@ -920,7 +920,7 @@ class TestInheritedRowsCollapseToOneLine:
         assert 'data-inherited-summary="${inheritedN}"' in body
         assert "and everything Everyone has" in body
         # The same deep link the per-row `via Everyone →` used.
-        assert 'href="?group=${esc(everyoneGroupId() || "")}">Everyone →</a>' in body
+        assert 'href="?by=group&group=${esc(everyoneGroupId() || "")}">Everyone →</a>' in body
 
     def test_it_lands_in_set_elsewhere(self):
         """It is a fact about rows the admin cannot act on here."""
@@ -1134,14 +1134,20 @@ class TestRemovingAMemoryDomainGrantIsNotCalledRevoke:
         cell = src[
             src.index("const manageCell = (o) => {") : src.index("\n  };", src.index("const manageCell = (o) => {"))
         ]
-        assert cell.count("data-revoke>${act}</button>") == 2
+        assert cell.count("${act}</button>") == 2, (
+            "both branches must let ACT_WORD name the act — the button "
+            "carries a bin mark now, but the word is still what it says"
+        )
         assert "data-revoke>Revoke</button>" not in cell
 
     def test_both_row_renderers_tell_the_cell_the_type(self):
         src = self._source()
         # The call grew `hrefLabel` when an agent's link learned to say "owner ↗"
-        # (U7); what this pins is that the TYPE still travels with it.
-        assert "hrefLabel: ownLabel, typeKey: t.type_key," in src
+        # (U7), then `resourceId` so a via-Everyone link could land on
+        # Everyone narrowed to the row you came from. What this pins is that
+        # the TYPE still travels with it.
+        assert "hrefLabel: ownLabel," in src
+        assert "typeKey: t.type_key, resourceId: i.resource_id," in src
         assert "manageCell({ managedBy: grant.managed_by, typeKey: r.t.type_key })" in src
 
     def test_the_confirm_does_not_claim_anyone_loses_anything(self):

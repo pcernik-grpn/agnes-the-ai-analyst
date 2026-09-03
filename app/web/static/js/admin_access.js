@@ -146,6 +146,10 @@
   let users = [];        // the person lens's picker; the group-list member search asks the server
 
   const el = (id) => document.getElementById(id);
+  //: `CSS.escape` where it exists. A resource id is server-issued, but
+  //: it reaches a selector here and an unescaped one would be a syntax
+  //: error rather than a miss.
+  const cssEsc = (v) => (window.CSS && CSS.escape ? CSS.escape(String(v)) : String(v));
   const esc = (s) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;")
     .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
   // datetime.js is loaded `defer`, so window.AgnesTime does not exist until
@@ -565,7 +569,17 @@
     const m = o || {};
     const act = ACT_WORD(m.typeKey);
     if (m.inherited) {
-      return `<a class="ax-inherit" href="?group=${esc(everyoneGroupId() || "")}"
+      /* Carries the ROW as well as the destination. Landing on Everyone's
+         whole list and leaving the reader to find the thing they were just
+         looking at is most of the journey undone — Everyone is the longest
+         list on the page by construction. `?resource=` is the same deep
+         link /admin/tables already uses, so this needs no new mechanism:
+         the list arrives filtered to that one row, and `scrollToPick()`
+         brings it into view. */
+      const at = (m.typeKey && m.resourceId)
+        ? `&resource=${encodeURIComponent(`${m.typeKey}:${m.resourceId}`)}`
+        : "";
+      return `<a class="ax-inherit" href="?by=group&group=${esc(everyoneGroupId() || "")}${at}"
         title="Granted to Everyone, so it reaches this group's members too. Edit it on Everyone.">via Everyone →</a>`;
     }
     /* A grant another surface wrote. `revocable` is the honest split: several
@@ -579,10 +593,10 @@
       return `<a class="ax-inherit" href="${esc(m.managedBy.href)}">${esc(m.managedBy.surface)} →</a>`;
     }
     if (m.managedBy) {
-      return `<button type="button" class="ax-revoke" data-revoke>${act}</button>${
+      return `<button type="button" class="ax-revoke" data-revoke><svg class="ax-revoke__x" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-12M9 7V5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>${act}</button>${
         m.managedBy.href ? `<a class="ax-own__edit" href="${esc(m.managedBy.href)}">${esc(m.managedBy.surface)} ↗</a>` : ""}`;
     }
-    return `<button type="button" class="ax-revoke" data-revoke>${act}</button>${
+    return `<button type="button" class="ax-revoke" data-revoke><svg class="ax-revoke__x" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-12M9 7V5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>${act}</button>${
       m.href ? `<a class="ax-own__edit" href="${m.href}">${esc(m.hrefLabel || "where it lives ↗")}</a>` : ""}`;
   };
 
@@ -1137,7 +1151,8 @@
                tier === "required" ? "Automatic" : "Optional"}<span class="ax-managed__src"> · via Everyone</span></span></span>`
         : controlCell(t.type_key, tier, { href: ownHref, managedBy: grant.managed_by, publisherKind: i.publisher_kind });
       const manage = manageCell({
-        inherited: grant.inherited, managedBy: grant.managed_by, href: ownHref, hrefLabel: ownLabel, typeKey: t.type_key,
+        inherited: grant.inherited, managedBy: grant.managed_by, href: ownHref, hrefLabel: ownLabel,
+        typeKey: t.type_key, resourceId: i.resource_id,
       });
       return `
       <div class="ax-r" data-kind="${esc(kindToken(t))}" data-type="${esc(t.type_key)}" data-rid="${esc(i.resource_id)}"${grant.inherited ? ' data-inherited="1"' : ""}>
@@ -1318,7 +1333,7 @@
             <span class="ax-r__d">${inheritedN} ${inheritedN === 1 ? "grant that reaches" : "grants that reach"} every account, this group included</span>
           </span>
           <span class="ax-r__ctl"></span>
-          <span class="ax-r__rd ax-r__manage"><a class="ax-inherit" href="?group=${esc(everyoneGroupId() || "")}">Everyone →</a></span>
+          <span class="ax-r__rd ax-r__manage"><a class="ax-inherit" href="?by=group&group=${esc(everyoneGroupId() || "")}">Everyone →</a></span>
         </div>`
       : "";
     const setElsewhere = inSection("set_elsewhere") + inheritedLine;
@@ -3222,8 +3237,14 @@
     const noneGrantedMsg = (groupFilter.trim() || anyFacetOn())
       ? "Nothing matching this is granted to any group."
       : "Nothing on this instance is granted to anyone yet.";
-    host.innerHTML = (painted
-      || `<div class="ax-empty">${noneGrantedMsg}</div>`) + nobodyLine;
+    /* Above the list, not under it. "Granted to nobody" is the one state
+       nobody goes looking for, which is exactly why it cannot be the last
+       line on a page that scrolls: at the foot of a long list it is reached
+       only by someone who has already read past everything they came for.
+       It is one collapsed line either way, so it costs the reader nothing
+       to have it where they will see it. */
+    host.innerHTML = nobodyLine + (painted
+      || `<div class="ax-empty">${noneGrantedMsg}</div>`);
   }
 
   //: Delegated: the row lives inside `#ax-groups`, which every repaint
@@ -4929,7 +4950,15 @@
     const findBox = el("ax-group-find");
     if (findBox && groupFilter) findBox.value = groupFilter;
     const groups = sortedGroups();
-    const known = (id) => !!(id && groups.some((g) => g.id === id));
+    /* The Everyone carrier is a real, selectable row on this page — it is
+       simply not in `sortedGroups()`, which deliberately excludes it so it
+       renders as an audience above the list rather than as a group in it
+       (decision 04). Checking a `?group=` against that list alone therefore
+       said "that group no longer exists" about the one row every `via
+       Everyone →` link points at — the page told the reader their own link
+       was broken, then dropped them on an unfiltered list. */
+    const known = (id) => !!(id && (id === everyoneGroupId()
+      || groups.some((g) => g.id === id)));
     const wanted = params.get("group");
     /* A bookmark outlives the group it points at, and falling through in
        silence looks like the link worked and the group is empty. */
@@ -4972,6 +5001,20 @@
     }
     renderPick();
     await repaint();
+    /* A `?resource=` arrival has narrowed the list to one row; put that row
+       where the reader is looking. Without this the journey from a "via
+       Everyone →" link ends correctly and invisibly: Everyone selected, the
+       right row rendered, and the viewport still at the top of the longest
+       group on the instance. `center` rather than `start` so the row is not
+       hidden under the sticky group header. */
+    if (PICK) {
+      const at = document.querySelector(
+        `[data-type="${cssEsc(PICK.type)}"][data-rid="${cssEsc(PICK.id)}"]`);
+      if (at && at.scrollIntoView) {
+        at.scrollIntoView({ block: "center", behavior: "smooth" });
+        at.classList.add("is-landed");
+      }
+    }
     // `?user=` — the Simulate deep link. A package page's "Preview access"
     // and the stop rows' round trips arrive with the person pre-resolved
     // instead of "Pick a person…". Validated against the loaded list the

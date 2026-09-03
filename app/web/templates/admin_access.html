@@ -1051,12 +1051,26 @@
 
   /* Oversight, not a second editor: revoke, and a way to where it is owned. */
   .ax-own { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  /* A bordered grey pill on every row is a lot of chrome for an act most
+     rows never receive, and the outline said nothing about what the act
+     does — then hovered toward the LINK colour, which is the one thing a
+     revoke is not. Quiet at rest, warning-coloured under the pointer: the
+     most destructive control in the row should be the one that changes most
+     under the hand. A tone change, not a shrink — it keeps its padding, its
+     hit area and its word, and gains a mark so the column scans without
+     reading. */
   .ax-revoke {
-    font-size: 12px; padding: 3px 10px; border-radius: var(--ds-radius-btn, 4px);
-    border: 1px solid var(--ds-border); background: var(--ds-surface);
-    color: var(--ds-text-secondary); cursor: pointer;
+    display: inline-flex; align-items: center; gap: 5px;
+    font-size: 12px; padding: 4px 9px; border-radius: var(--ds-radius-btn, 4px);
+    border: 1px solid transparent; background: none;
+    color: var(--ds-text-muted); cursor: pointer;
   }
-  .ax-revoke:hover { border-color: var(--ds-text-link); color: var(--ds-text-link); }
+  .ax-revoke:hover, .ax-revoke:focus-visible {
+    background: color-mix(in srgb, var(--ds-danger, #b42318) 8%, var(--ds-surface));
+    border-color: color-mix(in srgb, var(--ds-danger, #b42318) 35%, var(--ds-surface));
+    color: var(--ds-danger, #b42318);
+  }
+  .ax-revoke__x { flex: none; width: 13px; height: 13px; }
   /* Sits after Revoke in the Manage cell, which is a plain right-aligned
      block — the two are inline siblings with no whitespace node between
      them, so without this margin the button's right edge and the link's
@@ -1386,8 +1400,10 @@
   }
   .ax-r__rd .ax-reads__q { color: var(--ds-text-muted); font-weight: 400; font-style: italic; }
 
-  /* Controls stay findable without pulling the eye down the column. */
-  .ax-revoke { font-size: 12px; color: var(--ds-text-secondary); }
+  /* Controls stay findable without pulling the eye down the column.
+     (The revoke's colour is set once, above; restating it here is what
+     used to make it grey again at every width.) */
+  .ax-revoke { font-size: 12px; }
   .ax-own__edit { font-size: 11px; }
   .ax-add { margin-top: 10px; padding: 11px 0; font-size: 13px; }
   .ax-add__hint { color: var(--ds-text-muted); }
@@ -1530,7 +1546,7 @@
   /* Controls: findable, not loud. */
   .ax-r__ctl { padding-top: 1px; }
   .sw b, .fbar-seg.ax-tier .fbar-seg__btn { font-size: 12px; padding: 3px 10px; }
-  .ax-revoke { font-size: 12px; padding: 3px 10px; }
+  .ax-revoke { font-size: 12px; }
 
   .ax-add { margin-top: 12px; padding: 10px 0; }
   /* ══ Measure ═══════════════════════════════════════════════════════════
@@ -1782,7 +1798,12 @@
 
   /* The list's own band — SYSTEM / GROUPS — is a header row of this table,
      so it wears the same treatment the category bands do. */
+  /* `margin-top` because Everyone is not a group — that is the whole point
+     of the row above this band — and with the band butting straight up
+     against it the two read as one list with a heading dropped into the
+     middle. The gap says "different kind of thing" before any word does. */
   .ax-glist__label {
+    margin-top: 18px;
     padding: 7px 12px; background: var(--ds-surface-dim);
     border-bottom: 1px solid var(--ds-border-light);
     font-size: 11px; font-weight: 700; letter-spacing: .06em;
@@ -2300,17 +2321,13 @@
   .ax-fam__hd .fbar-group__n { font-size: 11px; }
   .ax-fam:first-child .ax-fam__hd .fbar-grouptoggle { padding-top: 8px; }
 
-  /* ── Who is in here, before the list of who is in here ────────────────
-     The roster answers "who exactly"; this answers "who, roughly, and how
-     did they get here" — which is the question an admin opening a group
-     actually has, and it is answerable in one line. Faces first because a
-     count of 14 and fourteen initials are not the same fact, then the
-     provenance split, because "3 of these are Google's" is what decides
-     whether this group is yours to edit at all. */
-  .ax-who {
-    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
-    margin: 2px 0 10px;
-  }
+  /* The faces. `.ax-pstrip` — the row that used to hold them alongside a
+     provenance split — is gone: the strip it described IS the people strip
+     now (`.ax-who`, above), which carries the faces and the count itself,
+     and the provenance became a caption on the roster (`.ax-memcap`). The
+     rules are deleted rather than left dead: two strips with near-identical
+     names, one of them unrendered, is how the rename that produced this
+     went wrong in the first place. */
   .ax-avs { display: flex; align-items: center; flex: none; }
   .ax-av {
     display: inline-flex; align-items: center; justify-content: center;
@@ -2321,8 +2338,6 @@
   }
   .ax-avs .ax-av:first-child { margin-left: 0; }
   .ax-av--more { color: var(--ds-text-muted); font-weight: 600; }
-  .ax-who__f { font-size: 12.5px; color: var(--ds-text-muted); min-width: 0; }
-  .ax-who__f b { font-weight: 600; color: var(--ds-text-secondary); }
 
   /* ── The action is a button, not a row ───────────────────────────────
      This block used to span the three add controls across the list, on the
@@ -2480,7 +2495,6 @@
   .ax-people__hdrow h3 { margin: 0; }
   #ax-people-faces:empty { display: none; }
   .ax-people__hdrow .ax-av { width: 22px; height: 22px; font-size: 9px; }
-  .ax-who { margin: 2px 0 10px; }
 
   /* ── The list has no frame ───────────────────────────────────────────
      The white surface under the rows was drawn as a bordered, rounded card
@@ -2899,8 +2913,12 @@
      the shared component for exactly this (admin_page.css), so it looks like
      every other way-back in the admin area rather than a link class bolted
      onto a button. #}
-  <button type="button" class="apg-back" id="ax-sim-back" data-people-back hidden>← All people</button>
-  <div class="ds-card">
+  <div class="ds-card ax-simcard">
+    {# The way back to the roster, INSIDE the card it returns from. It sat
+       above it, on the page's own first line, which read as page-level
+       navigation — the way back out of the whole lens — when what it does is
+       swap this card's contents between one person and the roster. #}
+    <button type="button" class="apg-back ax-simback" id="ax-sim-back" data-people-back hidden>← All people</button>
     {# No second person picker. The toolbar's search sits above the tabs and
        already selects the person on this tab, so a "Person" dropdown here was
        a second control for one choice, ten pixels below the first — and the
@@ -2916,19 +2934,19 @@
       {{ ds.dropdown(id='ax-sim-user-dd', target='ax-sim-user', aria_label='Person',
                      options=[{'value': '', 'label': 'Loading people…'}]) }}
     </span>
+    {# The visible picker was REMOVED when the toolbar's search took over
+       choosing the person — but only in words: the markup stayed, so the
+       page carried two elements with `id="ax-sim-user"`. Every
+       `getElementById` on this page therefore reached the HIDDEN one, which
+       is the one `loadUsers()` fills — and the visible dropdown sat at
+       "Loading people…" forever, on a pane whose roster had already
+       rendered underneath it. Duplicate ids do not error; they resolve to
+       the first, silently, and that is what this looked like.
+
+       The search above the tabs is the picker, and it is a search rather
+       than a select for the reason every people-picker on the instance is:
+       fourteen names fit in a dropdown, four hundred do not. #}
     <div class="ax-simrow">
-      <div>
-        <label for="ax-sim-user">Person</label>
-        <span class="fbar-select">
-          {# Options are fetched once and the <select> rebuilt entirely
-             client-side (loadUsers() below); the paired .ds-dropdown is kept
-             in sync by syncSimUserDropdown() (see below), using
-             ds_dropdown.js's exported re-init hook (#1473). #}
-          <select id="ax-sim-user" class="ds-dropdown-native"><option value="">Loading people…</option></select>
-          {{ ds.dropdown(id='ax-sim-user-dd', target='ax-sim-user', aria_label='Person',
-                         options=[{'value': '', 'label': 'Loading people…'}]) }}
-        </span>
-      </div>
       {# Secondary: ordinary navigation to a page reachable from People too.
          The primary is the view-as below — the one action this lens offers
          that nothing else in the product does. #}
