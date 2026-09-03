@@ -15462,7 +15462,7 @@
     },
     "/admin/initial-workspace": {
       "get": {
-        "description": "Admin page for the Initial Workspace Template repo (register / sync /\ndelete + per-file prompt provenance). Relocated from /admin/server-config\n(#622 Slice 3 PR-B).",
+        "description": "Merged into /admin/prompts as its \"Template repository\" tab.\n\nThe repo and the prompts that bind to it were one job split across two\npages: this page's provenance table sent you to /admin/prompts to change a\nbinding, and that page could not offer git mode at all until this one had\nregistered a repo. 308 keeps every bookmark and in-page link alive \u2014 same\ntreatment /admin/agent-prompt and /admin/workspace-prompt got when #622\nfolded them into the same page.\n\nKEEPS ``require_admin`` even though it only redirects \u2014 the two sibling\nredirects below carry no gate, and a merge is the wrong moment to copy\nthat: this route answered 403 to a non-admin yesterday, and a refactor\nthat quietly turns a 403 into a 308 has changed who the endpoint answers,\nnot where it points. The target is admin-gated too, so the gate here is\nbelt-and-braces rather than the only check.",
         "operationId": "admin_initial_workspace_page_admin_initial_workspace_get",
         "parameters": [
           {
@@ -16103,7 +16103,7 @@
     },
     "/admin/prompts": {
       "get": {
-        "description": "Unified admin page for managed prompts (#622): two cards (install +\nworkspace), each with a Git\u21c4Editor source toggle, a CodeMirror editor for\neditor mode, and a repo-path bind field for git mode. All dynamic state is\nfetched client-side from /api/admin/prompts/{kind}; the route only needs to\nknow whether an IWT repo is registered so the git toggle can be disabled\nwhen there's nothing to bind to.",
+        "description": "Unified admin page for managed prompts (#622): two cards (install +\nworkspace), each with a Git\u21c4Editor source toggle, a CodeMirror editor for\neditor mode, and a repo-path bind field for git mode. All dynamic state is\nfetched client-side from /api/admin/prompts/{kind}; the route only needs to\nknow whether an IWT repo is registered so the git toggle can be disabled\nwhen there's nothing to bind to.\n\n``tab`` picks which of the two panes renders \u2014 the prompt cards, or the\nInitial Workspace Template repo that used to be /admin/initial-workspace.\nResolved here rather than in the browser so each tab is a real URL and\nonly the active pane's markup and script reach the page (see the template's\n`block page` comment). Anything other than ``repo`` is the prompt cards,\nso a stale or hand-typed ``?tab=`` lands on the default rather than an\nempty page.",
         "operationId": "admin_prompts_page_admin_prompts_get",
         "parameters": [
           {

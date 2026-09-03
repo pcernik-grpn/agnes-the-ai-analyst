@@ -125,6 +125,17 @@
 </style>
 {% endblock %}
 
+{% block toolbar %}
+{# Store lint's only door. The findings are advisory quality notes on the same
+   skills this queue reviews, and the page carries no sidebar row of its own
+   (see ADMIN_NAV_OFFNAV in app/web/admin_nav.py) — a reviewer standing here is
+   exactly who wants them, so this link is what keeps that page reachable.
+   NOT hung off /admin/store: the moderation hub is off by default
+   (`features.store_moderation_enabled`) and redirects home when it is, which
+   would leave lint with no door at all on a default instance. #}
+<a class="btn btn-secondary" href="/admin/store/lint">Store lint</a>
+{% endblock %}
+
 {% block page %}
 {# Design-system component macros — form Apply/Reset buttons render via
    `ds.button` (auto-imported by base_ds). Status filter chips, status
