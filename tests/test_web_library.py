@@ -8,7 +8,7 @@ import pytest
 import io
 
 # Glyph path fragments (mirror macros/_catalog_card.html kind_glyph).
-_DOC_GLYPH = "M7 4h7l4 4v12H7z"  # single document — a one-file artefact
+_DOC_GLYPH = "M7 4h7l4 4v12H7z"  # single document — a one-file artifact
 _LIB_GLYPH = "M9 7h6l4 4v9"  # two overlapping sheets — a collection (detail hero)
 # In the Library's Files TABLE a collection wears a folder glyph instead: there
 # it sits beside loose files and takes drops, so it reads as the container it is.
@@ -293,7 +293,7 @@ def test_library_definitions_are_not_at_the_tail_of_an_unbounded_list(seeded_app
     Two fixes since, and this asserts the property both were after rather
     than either mechanism: first a Semantic models section at a fixed slot in
     `_SECTION_ORDER`, now a strip above the toolbar with the whole layer off
-    the table. Either way the definitions precede the unbounded artefact
+    the table. Either way the definitions precede the unbounded artifact
     sections rather than trailing them. Position is asserted rather than mere
     presence, because presence is exactly what the old bug had.
     """
@@ -400,9 +400,9 @@ def test_library_lists_only_accessible(seeded_app):
 
 
 def test_single_file_artefact_presents_as_file(seeded_app, monkeypatch):
-    """One file in an artefact reads AS the file — single-document glyph,
+    """One file in an artifact reads AS the file — single-document glyph,
     filename + size in the meta, "File" framing, never "a collection with 1
-    file" — but the title is the artefact's NAME (what the caller typed), not
+    file" — but the title is the artifact's NAME (what the caller typed), not
     the filename, so distinct names stay distinct (they previously all
     rendered as the same filename)."""
     monkeypatch.setenv("AGNES_UI_LAYOUT", "rail")
@@ -424,8 +424,8 @@ def test_single_file_artefact_presents_as_file(seeded_app, monkeypatch):
 
 
 def test_upload_box_follows_the_file_list_and_explains_promotion(seeded_app):
-    """The page leads with what is IN the artefact; adding to it comes after
-    (Files section above the Add-files drop zone). On a one-file artefact the
+    """The page leads with what is IN the artifact; adding to it comes after
+    (Files section above the Add-files drop zone). On a one-file artifact the
     drop zone also says what uploading does — it turns the file into a
     collection — so the change of shape never surprises. A real collection
     needs no such warning."""
@@ -443,7 +443,7 @@ def test_upload_box_follows_the_file_list_and_explains_promotion(seeded_app):
 
 
 def test_multi_file_artefact_presents_as_collection(seeded_app, monkeypatch):
-    """A second file promotes the artefact to a Collection: the list shows
+    """A second file promotes the artifact to a Collection: the list shows
     ``N files`` + a folder glyph (it's a container among loose files there), and
     the detail page reads as a collection again — under the two-sheet hero."""
     monkeypatch.setenv("AGNES_UI_LAYOUT", "rail")
@@ -462,8 +462,8 @@ def test_multi_file_artefact_presents_as_collection(seeded_app, monkeypatch):
 
 
 def test_single_file_artefacts_with_same_filename_keep_distinct_names(seeded_app, monkeypatch):
-    """Regression: two single-file artefacts holding the *same* filename but
-    given different names must render under their own names on the Artefacts
+    """Regression: two single-file artifacts holding the *same* filename but
+    given different names must render under their own names on the Artifacts
     list — the title is the name, not the filename, so they don't collapse
     into two identical rows."""
     monkeypatch.setenv("AGNES_UI_LAYOUT", "rail")
@@ -491,7 +491,7 @@ def test_single_file_artefacts_with_same_filename_keep_distinct_names(seeded_app
 #   Available grant  → "In stack", plain checkmark. Auto-membership
 #                      (StackResolver's browse() sets in_stack
 #                      unconditionally) — no "add" to offer, the grant did it.
-#   Own artefact     → "In stack" ⇄ "Add to stack", a real toggle. A personal
+#   Own artifact     → "In stack" ⇄ "Add to stack", a real toggle. A personal
 #                      upload has no admin grant tier, so the subscription row
 #                      IS the membership.
 
@@ -857,19 +857,19 @@ def test_library_plugin_stack_state_agrees_with_marketplace_items(seeded_app):
 
 
 def test_library_own_artefact_keeps_a_real_stack_toggle(seeded_app):
-    """The contrast case: an artefact's membership IS the caller's, so its
+    """The contrast case: an artifact's membership IS the caller's, so its
     pill stays an actionable button rather than a status."""
     c = seeded_app["client"]
-    col = _create(seeded_app, "Toggleable Artefact")
+    col = _create(seeded_app, "Toggleable Artifact")
 
-    row = _row_for(c.get("/library", headers=_auth(seeded_app["admin_token"])).text, "Toggleable Artefact")
+    row = _row_for(c.get("/library", headers=_auth(seeded_app["admin_token"])).text, "Toggleable Artifact")
     assert "data-add-to-stack" in row  # not yet added
     assert "lib-instack--locked" not in row
 
     r = c.post(f"/api/stack/artefacts/{col['id']}", headers=_auth(seeded_app["admin_token"]))
     assert r.status_code in (200, 201), r.text
 
-    row = _row_for(c.get("/library", headers=_auth(seeded_app["admin_token"])).text, "Toggleable Artefact")
+    row = _row_for(c.get("/library", headers=_auth(seeded_app["admin_token"])).text, "Toggleable Artifact")
     assert "data-remove-from-stack" in row  # …and removable once added
     assert "lib-instack--fixed" not in row
     assert "lib-instack--locked" not in row

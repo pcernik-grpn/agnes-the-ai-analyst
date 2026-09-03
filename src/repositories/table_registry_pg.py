@@ -337,7 +337,7 @@ class TableRegistryPgRepository:
 
         Rows are identified by ``source_type='collection'`` and
         ``bucket=corpus_id``.  Returns the list of deleted table ids so the
-        caller can clean up derived artefacts (parquet files, extract.duckdb
+        caller can clean up derived artifacts (parquet files, extract.duckdb
         views) before calling ``orchestrator.rebuild_source``.
 
         Dependant cleanup included, mirroring the DuckDB sibling — without

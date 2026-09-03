@@ -397,7 +397,7 @@ TITLE_OVERRIDES: dict[str, str] = {
     "tool_docs": "Get Tool Documentation",
     "documentation_api": "Get API Documentation",
     "pull": "Sync Data To This Machine",
-    "stack_artefacts_candidates": "List Artefact Candidates",
+    "stack_artefacts_candidates": "List Artifact Candidates",
     "admin_config_surface": "Get Config Surface",
     "admin_register_table": "Register Source Table",
     "store_compose_plugin": "Publish A Plugin Bundling Existing Items",

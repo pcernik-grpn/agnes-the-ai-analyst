@@ -1241,7 +1241,7 @@ async def lifespan(app):
     # BG-task / scheduler paths that bypass the per-mutation hook.
     # Soft-failure — logs WARNING and the repo falls back to ILIKE.
     #
-    # DuckDB-only: the BM25 index is a DuckDB FTS-extension artefact built on
+    # DuckDB-only: the BM25 index is a DuckDB FTS-extension artifact built on
     # the system DuckDB. On Postgres there is no system DuckDB (and opening one
     # is forbidden), so skip entirely — memory search there uses the PG path.
     from src.repositories import use_pg as _use_pg

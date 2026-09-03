@@ -67,7 +67,7 @@ _TURN_KEY = {
     "cache_creation": "cache_creation_tokens",
 }
 
-#: USD are rounded for transport so a float artefact does not reach a template
+#: USD are rounded for transport so a float artifact does not reach a template
 #: as ``0.30000000000000004``. Six places keeps sub-cent figures meaningful for
 #: the small token counts a single turn produces.
 _COST_PLACES = 6

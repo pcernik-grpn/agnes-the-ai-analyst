@@ -1,17 +1,17 @@
-"""Shared caller-scoped access computation for artefacts (``file_corpora``).
+"""Shared caller-scoped access computation for artifacts (``file_corpora``).
 
 Three surfaces need the exact same "which collections can I see, and how
 are they shared" computation:
 
   - ``GET /artefacts``            (app/web/router.py::artefacts_page)
-  - ``GET /stack``'s Artefacts tab (app/web/router.py::my_stack_page)
-  - ``GET /api/stack/artefacts/candidates`` (the "Add artefacts" picker)
+  - ``GET /stack``'s Artifacts tab (app/web/router.py::my_stack_page)
+  - ``GET /api/stack/artefacts/candidates`` (the "Add artifacts" picker)
 
 This module is the single place that computes it, instead of three copies
 of the ``resource_grants`` + ``file_corpora`` joins. Permission model is
 ownership/sharing, NOT the admin-RBAC-grant tier ``StackResolver`` models
 for data packages/memory domains — there is no "required" concept for
-artefacts, so this deliberately does not route through ``StackResolver``.
+artifacts, so this deliberately does not route through ``StackResolver``.
 """
 
 from __future__ import annotations
@@ -133,7 +133,7 @@ def collection_visibility(ctx: ArtefactAccessContext, collection_id: str) -> Tup
 
 
 def owner_label_for(ctx: ArtefactAccessContext, col: dict) -> str:
-    """ "You" for the caller's own artefacts, else the owner's display name."""
+    """ "You" for the caller's own artifacts, else the owner's display name."""
     created_by = col.get("created_by")
     if created_by == ctx.uid:
         return "You"
@@ -151,14 +151,14 @@ def _artefact_type_label(file_count: int) -> str:
 
 
 def list_candidate_collections(user_id: str) -> Tuple[List[dict], int]:
-    """Candidates for the "Add artefacts to Stack" picker.
+    """Candidates for the "Add artifacts to Stack" picker.
 
     Returns ``(candidates, total_accessible)``: ``candidates`` are
     collections accessible to the caller (owned ∪ granted to one of their
     groups) that are NOT already in the caller's Stack, shaped for the
     picker row. ``total_accessible`` counts every accessible collection
     regardless of Stack membership, so the caller can distinguish "no
-    artefacts exist at all" from "all accessible artefacts are already
+    artifacts exist at all" from "all accessible artifacts are already
     added" (both render a picker empty state, but with different copy).
     """
     from src.repositories import (

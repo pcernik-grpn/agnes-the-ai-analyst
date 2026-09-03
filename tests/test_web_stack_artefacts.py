@@ -1,6 +1,6 @@
-"""Add Artefacts to My Stack.
+"""Add Artifacts to My Stack.
 
-Artefacts (file_corpora uploads) are available to the *user* the moment
+Artifacts (file_corpora uploads) are available to the *user* the moment
 they're owned or shared with them; they only become available to the
 *default agent* once added to My Stack. This reuses the generic
 ``user_stack_subscriptions`` model (resource_type='collection') — no new
@@ -8,16 +8,16 @@ table, no StackResolver — via three dedicated endpoints
 (POST/DELETE/GET /api/stack/artefacts*) and stack-awareness on /library
 (the renamed /artefacts).
 
-The standalone My Stack page — including its own dedicated Artefacts tab —
+The standalone My Stack page — including its own dedicated Artifacts tab —
 is retired (#1088; /stack now 302s to /library?stack=in_stack). The
 ``/api/stack/artefacts/*`` endpoints stay live and untouched (below,
 ``TestArtefactStackApi``); the Library's inline "Add to stack" / "In stack"
-badge on each artefact row (``TestArtefactsPageStackAwareness``) is the
+badge on each artifact row (``TestArtefactsPageStackAwareness``) is the
 surviving UI for the same membership. One piece of the retired tab's UI has
-no like-for-like replacement: it kept listing an artefact as "Unavailable"
+no like-for-like replacement: it kept listing an artifact as "Unavailable"
 after the caller's access to it was revoked (the membership row outlives the
 grant). The Library's row set is grant-scoped (owned ∪ shared right now), not
-membership-scoped, so a revoked artefact simply stops appearing there —
+membership-scoped, so a revoked artifact simply stops appearing there —
 consistent with the issue's own resolution ("no migration of functionality
 is required"), but worth stating plainly rather than silently dropping the
 assertion that used to pin it.
