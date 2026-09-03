@@ -396,9 +396,9 @@ class SplitApplyBody(BaseModel):
     n: int = Field(..., ge=1, le=50)
     #: Same admin-supplied ``YYYY-MM-DD`` filter as :class:`SplitPlanQuery`
     #: below — passed straight through onto each created connection's
-    #: ``config.extraction.crawl.min_modified`` (see :func:`apply_split`'s
-    #: docstring for why that key, not a new one, and why the crawl does not
-    #: honor it yet).
+    #: ``config.extraction.crawl.min_modified`` — the key the crawl reads
+    #: (``resolve_min_modified``) and ``PATCH …/extraction/crawl-config``
+    #: writes, so every part starts with the same age filter.
     min_modified: Optional[str] = None
     transport: Optional[Literal["sync", "batch"]] = None
     retry_mode: Optional[str] = None
@@ -2478,13 +2478,11 @@ async def apply_split(
     (:func:`_create_scope_collection`) ``POST …/scopes/bulk`` uses, so a
     split clone looks identical to one built by hand through clone +
     bulk-add.
-
-    ``body.min_modified``, when given, is written onto EACH clone's
-    ``config.extraction.crawl.min_modified`` — the crawl does not read that
-    key yet (no admin-facing date filter has shipped for the crawl itself at
-    the time this endpoint was written), so today it is inert bookkeeping
-    that a near-term crawl change will start honoring under the same key,
-    not a promise this endpoint enforces itself. ``body.transport`` /
+    ``body.min_modified`` is written onto each clone's
+    ``config.extraction.crawl.min_modified`` — the exact key
+    ``PATCH …/extraction/crawl-config`` writes and the crawl reads
+    (``resolve_min_modified``), so every part crawls with the same age
+    filter from its first run. ``body.transport`` /
     ``body.retry_mode`` are written onto ``config.extraction.facts`` — the
     exact keys ``PATCH …/extraction/facts-config`` writes — so a split can
     hand every clone the same per-connection retry/transport policy in one
