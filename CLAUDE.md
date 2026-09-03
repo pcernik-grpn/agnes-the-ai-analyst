@@ -664,3 +664,5 @@ state machine in `src/db_state_machine.py` already reserves the enum value.
 ### Git commits & pull requests
 - Keep commit messages clean and concise.
 - Do not include AI attribution in commits or PRs.
+- **"Ready for review" means "ready to merge" — a non-draft PR merges automatically once the required checks pass.** There is no intermediate state where a finished-looking PR waits for someone to press the button. Open every PR as a draft (`gh pr create --draft`) and take it out of draft (`gh pr ready <N>`) only when you would be comfortable with it landing on `main` unattended: the change is complete, the `[Unreleased]` CHANGELOG bullet is in, the test lane you owe is green, and any review feedback you were waiting on is addressed. **Anything not ready to merge stays a draft** — work in progress, a branch opened early for CI, a PR blocked on a question, one opened purely for discussion. Marking it ready is the merge decision; make it deliberately.
+- The daily release-cut PR is the documented exception: `.github/workflows/daily-cut.yml` opens it non-draft and a human merges it (see [`docs/RELEASING.md`](docs/RELEASING.md)).
