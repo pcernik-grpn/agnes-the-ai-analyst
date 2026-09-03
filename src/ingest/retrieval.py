@@ -10,6 +10,18 @@ Brute-force keeps the door open for an indexed strategy (DuckDB
 RBAC is the caller's responsibility: pass only ``corpus_ids`` the caller may
 access. Empty ``corpus_ids`` → empty result (fail-closed) — never "search all".
 
+Scale bound (#2151)
+--------------------
+"Brute-force" above is unconditional only up to ``collections.
+search_max_chunks`` (default 25000) — a real cap, added after a corpus in
+the 100k+ chunk range turned "fetch every candidate's full text AND
+embedding" into a memory blowup. Under the cap this module's behavior is
+exactly what the paragraph above describes; over it, ``search_with_meta``
+narrows the candidate set server-side (a SQL-side lexical prefilter) rather
+than fetching everything, and the ``embedding`` column itself is never part
+of the initial fetch either way — see ``search_with_meta`` and
+``src.repositories.corpus_chunks.CorpusChunksRepository.list_for_corpora``.
+
 Scoring (#756 — tiny-corpus hybrid-search fix)
 -----------------------------------------------
 The naive "fraction of distinct query terms present" lexical score treats
