@@ -4988,16 +4988,24 @@ def _resolve_concurrency(override: Any) -> Tuple[int, int, str]:
     ``[1, _MAX_PAYLOAD_CONCURRENCY]``. An unparseable override is ignored in
     favour of config rather than guessed at: a typo in an ad-hoc payload must
     not silently re-tune the crawl.
+
+    The resolved cap is then handed to :func:`_apply_memory_budget_cap`,
+    which may lower it further (never raise it) against the container's own
+    cgroup memory limit — see that function's docstring.
     """
     configured = _crawl_concurrency()
     if override is None:
-        return configured, configured, "config"
-    try:
-        requested = int(override)
-    except (TypeError, ValueError):
-        logger.warning("sharepoint crawl: ignoring unparseable payload concurrency %r — using config", override)
-        return configured, configured, "config"
-    return max(1, min(_MAX_PAYLOAD_CONCURRENCY, requested)), configured, "payload"
+        cap, source = configured, "config"
+    else:
+        try:
+            requested = int(override)
+        except (TypeError, ValueError):
+            logger.warning("sharepoint crawl: ignoring unparseable payload concurrency %r — using config", override)
+            cap, source = configured, "config"
+        else:
+            cap, source = max(1, min(_MAX_PAYLOAD_CONCURRENCY, requested)), "payload"
+    cap, source = _apply_memory_budget_cap(cap, source)
+    return cap, configured, source
 
 
 def _timeout_seconds() -> int:
@@ -5771,3 +5779,122 @@ def run_builtin_crawl(payload: dict) -> dict:
         # Named cause, not a bare traceback — the same typed handling
         # `app/api/admin_sharepoint.py::_resolved_token` gives this error.
         raise CrawlError(f"sharepoint crawl: {exc}") from exc
+
+
+# ---------------------------------------------------------------------------
+# Memory-budget clamp on per-job concurrency (TCRD-296 C.10 / auto-parallel-
+# crawl design §4.6): several `corpus-extraction*` jobs can share ONE
+# container (the worker's EXTRACTION lane, `app/worker/runtime.py`), each
+# forking its own `_ConvertProcessPool` sized to `_resolve_concurrency`'s
+# cap — so a cap tuned only against Graph's own throttling (see
+# `_MAX_CONCURRENCY` above) can still ask for more in-flight files than the
+# container's own cgroup memory limit can hold. This never raises a
+# configured/payload cap, only lowers it — it is a ceiling derived from
+# where this process actually runs, not a new tuning knob.
+# ---------------------------------------------------------------------------
+
+#: cgroup v2's unified memory limit file. Absent on a v1-only host.
+_CGROUP_V2_MEMORY_MAX_PATH = Path("/sys/fs/cgroup/memory.max")
+#: cgroup v1's memory-controller limit file — the fallback when the v2 path
+#: above does not exist.
+_CGROUP_V1_MEMORY_LIMIT_PATH = Path("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+
+#: Fraction of the container's own cgroup memory limit this clamp assumes is
+#: actually available for in-flight file conversion — headroom for the
+#: crawl parent's own baseline VmSize and everything else sharing the
+#: container, the same class of finding as the parent-OOM notes above
+#: :data:`_DEFAULT_MAX_CONVERTED_MB` and :data:`_DEFAULT_CONVERT_CHILD_MAX_RSS_MB`.
+_MEMORY_HEADROOM = 0.8
+
+#: Bytes reserved per in-flight file when deriving a concurrency cap from the
+#: container's own memory limit — the same "roughly 2 GB per in-flight file"
+#: figure :data:`_MAX_CONCURRENCY`'s own docstring already cites for sizing
+#: a large conversion box.
+_MEMORY_RESERVE_PER_ITEM_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB
+
+
+def _cgroup_memory_limit_bytes() -> Optional[int]:
+    """The container's own memory limit in bytes, or ``None`` when it cannot
+    be determined.
+
+    Reads cgroup v2's ``memory.max`` first, falling back to cgroup v1's
+    ``memory.limit_in_bytes`` when the v2 file does not exist. ``"max"``
+    (v2's spelling for "unlimited"), a missing file, an empty file, or an
+    unparseable value all return ``None`` — the caller then leaves
+    concurrency exactly as configured rather than guessing a limit from
+    nothing. Linux only: :data:`sys.platform` is checked explicitly (rather
+    than relying on the reads failing) so a no-op on macOS — where this
+    repo's own tests run — is by declared intent, not accident.
+    """
+    if sys.platform != "linux":
+        return None
+    for path in (_CGROUP_V2_MEMORY_MAX_PATH, _CGROUP_V1_MEMORY_LIMIT_PATH):
+        try:
+            raw = path.read_text().strip()
+        except OSError:
+            continue
+        if not raw or raw == "max":
+            continue
+        try:
+            value = int(raw)
+        except ValueError:
+            continue
+        if value > 0:
+            return value
+    return None
+
+
+def _memory_budget_cap(limit_bytes: int, lanes: int) -> int:
+    """The concurrency cap the container's own memory limit can sustain,
+    minimum 1.
+
+    ``floor(limit_bytes * _MEMORY_HEADROOM / (lanes * _MEMORY_RESERVE_PER_ITEM_BYTES))``.
+    ``lanes`` is the worker's EXTRACTION lane slot count
+    (``app/worker/runtime.py::_extraction_concurrency``) — several
+    `corpus-extraction*` jobs, each with its OWN convert pool, can hold a
+    lane at once in the same container, so the per-job budget has to divide
+    the container's whole limit by how many jobs can be converting at once,
+    not assume this run is the only one.
+    """
+    lanes = max(1, int(lanes))
+    budget = int((limit_bytes * _MEMORY_HEADROOM) // (lanes * _MEMORY_RESERVE_PER_ITEM_BYTES))
+    return max(1, budget)
+
+
+def _apply_memory_budget_cap(cap: int, source: str) -> Tuple[int, str]:
+    """Clamp ``cap`` DOWNWARD ONLY (never raises it, minimum 1) to what the
+    container's own cgroup memory limit can sustain, given the worker's own
+    EXTRACTION lane count — see :func:`_cgroup_memory_limit_bytes` and
+    :func:`_memory_budget_cap`.
+
+    A missing/unreadable limit (``"max"``, no cgroup files, non-Linux) is a
+    no-op: ``(cap, source)`` unchanged. When a limit IS found, this logs once
+    at INFO with the limit, the lane count and the resulting cap — whether
+    or not it actually reduced ``cap`` — so an operator reading the log for
+    one run sees this ran, not only that it fired. ``source`` becomes
+    ``"memory_budget"`` (joining ``"config"``/``"payload"``/``"adaptive"`` in
+    :attr:`CrawlStats.concurrency_source`'s vocabulary) only when the clamp
+    actually lowered the cap; a cap already at or below the budget keeps its
+    own source label, since nothing about it is attributable to this clamp.
+    """
+    limit_bytes = _cgroup_memory_limit_bytes()
+    if limit_bytes is None:
+        return cap, source
+
+    from app.worker.runtime import _extraction_concurrency as _worker_extraction_lanes
+
+    lanes = _worker_extraction_lanes()
+    budget_cap = _memory_budget_cap(limit_bytes, lanes)
+    clamped = min(cap, budget_cap)
+    logger.info(
+        "sharepoint crawl: cgroup memory limit %d bytes, %d extraction lane(s) -> "
+        "memory-budget cap %d (cap before clamp %d, effective %d)",
+        limit_bytes,
+        lanes,
+        budget_cap,
+        cap,
+        clamped,
+    )
+    if clamped < cap:
+        return clamped, "memory_budget"
+    return cap, source

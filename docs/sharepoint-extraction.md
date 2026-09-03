@@ -85,7 +85,14 @@ spot-check shows pseudonyms, not names.
   manual only).
 - `extraction.crawler.concurrency` (default 6) — files pipelined per delta
   page; the crawl backs off on tenant throttling by itself (AIMD) and
-  reports it. Per-run override in the Run-now options.
+  reports it. Per-run override in the Run-now options. No separate knob to
+  raise: if the container's own memory limit cannot sustain the resolved
+  cap — several crawl jobs can share one worker's EXTRACTION lane, each
+  with its own convert pool — the run's effective cap is clamped down
+  automatically (never up) from the container's cgroup limit and the
+  worker's own lane count, at roughly 2 GB reserved per in-flight file. The
+  run's `concurrency.source` reports `"memory_budget"` when this fired, next
+  to `"config"`/`"payload"`/`"adaptive"`.
 - **Split one large site across several connections**, each with its own
   crawl and facts jobs so they run in parallel instead of one connection's
   worth of concurrency working through the whole site sequentially:
