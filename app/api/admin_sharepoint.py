@@ -2710,7 +2710,19 @@ class ExtractionRunOptions(BaseModel):
     / `extraction.timeout_s`) when absent — the body itself is optional, so
     the pre-options `POST` with no body keeps working unchanged. Bounds
     mirror the crawler's own clamps so a value the run would silently
-    re-clamp is refused here instead, where the admin can see why."""
+    re-clamp is refused here instead, where the admin can see why.
+
+    On a site large enough to auto-shard (2026-09-03 auto-parallel-crawl
+    design — `extraction.crawler.shard_target_docs`, PG-only), every option
+    below except `shards` fans out UNCHANGED to every shard child
+    (`connectors.sharepoint.crawler.run_shard_crawl`'s own payload
+    pass-through): `resync` drops every `crawl:*` state row (the
+    connection-level one AND every shard's own — see
+    `connectors.sharepoint.crawler._apply_resync`) and forces the NEXT
+    trigger to re-plan from scratch (this planner never persists a plan to
+    reuse — see `_plan_or_run_inline`'s own docstring); `timeout_s` bounds
+    EACH child independently, not the site as a whole, so a huge shard
+    getting more time never steals a small one's turn."""
 
     concurrency: Optional[int] = Field(
         None,
@@ -2722,7 +2734,7 @@ class ExtractionRunOptions(BaseModel):
         None,
         ge=0,
         le=86400,
-        description="Hard ceiling for this one run, seconds (0 = unbounded).",
+        description="Hard ceiling for this one run, seconds (0 = unbounded) — per SHARD on a sharded site.",
     )
     resync: Optional[bool] = Field(
         None,
@@ -2730,7 +2742,9 @@ class ExtractionRunOptions(BaseModel):
             "Drop this connection's persisted deltaLinks and item-failure queue before "
             "running, so every drive re-enumerates from scratch (already-ingested files "
             "are not re-downloaded — cTags are kept). The supported recovery path for a "
-            "connection whose delta cursor ran past documents it never actually ingested."
+            "connection whose delta cursor ran past documents it never actually ingested. "
+            "On a sharded site this clears every shard's own state row too, and the next "
+            "trigger re-plans the whole site from scratch."
         ),
     )
     force_reprocess: Optional[bool] = Field(
@@ -2754,7 +2768,23 @@ class ExtractionRunOptions(BaseModel):
             "without a full `resync`. The cheap, targeted recovery for a handful of "
             "permanently-stuck documents (a conversion crash, a transient download error) "
             "that a plain trigger alone would never re-offer. This run's ordinary "
-            "incremental delta walk still runs afterward, unaffected."
+            "incremental delta walk still runs afterward, unaffected. On a sharded site "
+            "each shard replays its OWN backlog — `connectors.sharepoint.crawler."
+            "_retry_failed_items` already filters by `state_key`."
+        ),
+    )
+    shards: Optional[List[int]] = Field(
+        None,
+        description=(
+            "Re-run ONLY these 1-based shard indices from this connection's last "
+            "persisted shard plan, instead of an ordinary trigger — the supported way to "
+            "retry a shard that failed without re-planning or re-crawling the whole site "
+            "(design §4.4, replaces the retired manual-split 're-run one clone' escape "
+            "hatch). Opens a fresh parent run covering only the named shards. Every other "
+            "field above (except `resync`/`force_reprocess`/`retry_failed`, which still "
+            "fan out to the re-run shards) is ignored when this is set. 404 "
+            "`no_shard_plan` when the connection has never sharded; 400 "
+            "`unknown_shard_index` for an index the last plan doesn't have."
         ),
     )
 
@@ -2937,6 +2967,86 @@ async def run_due_subscription_renewal(
     return await renew_due_subscriptions()
 
 
+def _extraction_run_already_in_flight(connection_id: str) -> Optional[str]:
+    """This connection's currently-``running`` TOP-LEVEL ``extraction_runs``
+    row id, or ``None`` — the 409 gate a sharded site needs on top of the
+    existing per-connection job idempotency key (2026-09-03 auto-parallel-
+    crawl design §4.4): once a ``corpus-extraction`` job becomes a PLANNER,
+    its own ``jobs`` row finishes (having enqueued K children) long before
+    the run itself does, so the job-level dedup below alone can no longer
+    tell "the site is still crawling" apart from "the last trigger already
+    finished". ``get_running`` already filters ``parent_run_id IS NULL``,
+    so a live shard CHILD's own row never counts here — only the parent
+    (planner) or an inline run does.
+
+    A DuckDB-backed instance's ``extraction_runs_repo()`` raises the typed
+    ``RequiresPostgresBackend`` (that table is post-A3 Postgres-only) —
+    swallowed here, returning ``None``: on that backend a crawl's own job
+    and its own lifetime are identical, so the existing job-level dedup is
+    already sufficient and this check has nothing to add.
+    """
+    from src.repositories import RequiresPostgresBackend, extraction_runs_repo
+
+    try:
+        running = extraction_runs_repo().get_running(connection_id)
+    except RequiresPostgresBackend:
+        return None
+    return str(running["id"]) if running else None
+
+
+def _trigger_shard_rerun(
+    connection_id: str, row: Dict[str, Any], indices: List[int], options: ExtractionRunOptions
+) -> Dict[str, Any]:
+    """``options.shards`` branch of :func:`trigger_extraction` — re-run only
+    the named 1-based shard indices from this connection's LAST persisted
+    plan (design §4.4), by calling the exact same
+    :func:`connectors.sharepoint.crawler._enqueue_shard_plan` primitive the
+    planner itself uses, over a FILTERED shard list. Opens a fresh parent
+    run scoped to only these shards; never re-plans (a genuine re-plan is
+    what an ordinary trigger, or ``resync``, already does).
+    """
+    from connectors.sharepoint.crawler import _enqueue_shard_plan, load_state
+
+    state = load_state(connection_id)
+    persisted_shards = ((state.get("shard_plan") or {}).get("shards")) or []
+    if not persisted_shards:
+        raise HTTPException(status_code=404, detail={"error": "no_shard_plan", "connection_id": connection_id})
+
+    total = len(persisted_shards)
+    wanted = set(indices)
+    unknown = sorted(i for i in wanted if i < 1 or i > total)
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "unknown_shard_index", "unknown": unknown, "shards_total": total},
+        )
+
+    # Stored WITHOUT their own 1-based index (see `_enqueue_shard_plan`) —
+    # re-derive it positionally, the same way that call originally assigned it.
+    named = [shard for i, shard in enumerate(persisted_shards, start=1) if i in wanted]
+
+    rerun_payload: Dict[str, Any] = {"connection_id": connection_id}
+    if options.force_reprocess:
+        rerun_payload["force_reprocess"] = True
+    if options.retry_failed:
+        rerun_payload["retry_failed"] = True
+    if options.concurrency is not None:
+        rerun_payload["concurrency"] = options.concurrency
+    if options.timeout_s is not None:
+        rerun_payload["timeout_s"] = options.timeout_s
+
+    result = _enqueue_shard_plan(connection_id, named, rerun_payload)
+    _record_extraction_dispatch(row, result["parent_run_id"])
+    logger.info(
+        "sharepoint connection %s: re-running %d shard(s) %s (parent run %s)",
+        connection_id,
+        len(named),
+        sorted(wanted),
+        result["parent_run_id"],
+    )
+    return {"job_id": None, "status": "queued", **result}
+
+
 @router.post("/connections/{connection_id}/extract", status_code=202)
 async def trigger_extraction(
     connection_id: str,
@@ -2962,9 +3072,21 @@ async def trigger_extraction(
     ``connectors.sharepoint.crawler._retry_failed_items``'s
     ``include_given_up``) — never persisted beyond this one run.
 
+    2026-09-03 auto-parallel-crawl design: on a site large enough to
+    auto-shard (``extraction.crawler.shard_target_docs``, PG-only), a
+    ``corpus-extraction`` job is a short PLANNER — it packs the site into
+    shards, opens a parent run, enqueues one ``corpus-extraction-shard``
+    child per shard and returns; ``resync``/``force_reprocess``/
+    ``retry_failed`` fan out unchanged to every child, and ``timeout_s``
+    bounds each child independently, not the run as a whole. ``options.
+    shards`` (a list of 1-based indices) skips planning entirely and
+    re-runs only the named shards from the connection's LAST persisted
+    plan — the supported replacement for the retired manual-split "re-run
+    one clone" escape hatch — see :func:`_trigger_shard_rerun`.
+
     Every option here is per-run, not a setting: an absent key falls back to
-    whatever is currently configured (or, for the three booleans, to "off"),
-    and nothing in this endpoint ever writes an option's value anywhere an
+    whatever is currently configured (or, for the booleans, to "off"), and
+    nothing in this endpoint ever writes an option's value anywhere an
     admin could re-read it as the new default.
 
     404 on an unknown/non-sharepoint connection BEFORE any other work.
@@ -2973,6 +3095,12 @@ async def trigger_extraction(
     (``sharepoint.enabled`` is false) or ``409
     extraction_dependencies_missing`` (the ``extraction`` optional
     dependency extra is not installed) — see :func:`_extraction_readiness`.
+    Then, whenever a TOP-LEVEL ``extraction_runs`` row is still ``running``
+    for this connection — an inline crawl, or a sharded site's parent still
+    waiting on its children (see :func:`_extraction_run_already_in_flight`)
+    — ``409 extraction_already_running`` naming that run's id; on a
+    DuckDB-backed instance this check is a no-op and the ORIGINAL guard
+    below is what fires instead.
 
     Deduped on the STABLE per-connection idempotency key
     (:func:`_extraction_idempotency_key`) also used by the scheduled sweep
@@ -2980,13 +3108,25 @@ async def trigger_extraction(
     flight for the same connection. ``enqueue()``'s own ``"deduped"``
     return value (not a pre-check peek — see ``app/api/sync.py::
     trigger_sync``'s docstring for why a peek races a concurrent call)
-    decides 202 vs. ``409 extraction_already_running``.
+    decides 202 vs. ``409 extraction_already_running`` — this is what still
+    catches two near-simultaneous triggers on a DuckDB-backed instance (or
+    the brief window before a sharded site's parent row exists yet).
     """
     row = _sharepoint_connection_or_404(connection_id)
 
     usable, error = _extraction_readiness()
     if not usable:
         raise HTTPException(status_code=409, detail=error)
+
+    running_run_id = _extraction_run_already_in_flight(connection_id)
+    if running_run_id is not None:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "extraction_already_running", "run_id": running_run_id},
+        )
+
+    if options is not None and options.shards:
+        return _trigger_shard_rerun(connection_id, row, options.shards, options)
 
     from app.worker.registry import job_max_attempts
     from src.repositories import jobs_repo
@@ -3057,15 +3197,27 @@ async def retry_empty_extraction(
     Same preconditions and dedup as :func:`trigger_extraction`: ``404`` for
     an unknown/non-SharePoint connection, ``409 extraction_disabled`` /
     ``409 extraction_dependencies_missing`` when the feature isn't usable,
-    and the SAME per-connection idempotency key — a retry-empty run can
-    never overlap an ordinary trigger (or another retry-empty run) for the
-    same connection, since both mutate the same crawl state file.
+    the SAME per-connection idempotency key — a retry-empty run can never
+    overlap an ordinary trigger (or another retry-empty run) for the same
+    connection, since both mutate the same crawl state file — and the SAME
+    top-level ``extraction_runs`` liveness gate (2026-09-03 auto-parallel-
+    crawl design §4.4, :func:`_extraction_run_already_in_flight`): a
+    sharded site's parent row still ``running`` (its children not all
+    terminal yet) refuses here too, ``409 extraction_already_running``,
+    even though its OWN enqueueing ``jobs`` row already finished.
     """
     row = _sharepoint_connection_or_404(connection_id)
 
     usable, error = _extraction_readiness()
     if not usable:
         raise HTTPException(status_code=409, detail=error)
+
+    running_run_id = _extraction_run_already_in_flight(connection_id)
+    if running_run_id is not None:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "extraction_already_running", "run_id": running_run_id},
+        )
 
     from app.worker.registry import job_max_attempts
     from connectors.sharepoint.crawler import load_state
