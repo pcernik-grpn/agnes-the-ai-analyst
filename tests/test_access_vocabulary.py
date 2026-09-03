@@ -178,10 +178,17 @@ class TestNoSurfaceKeepsTheOldWordsInSource:
         prevent, just wearing a different face.
         """
         src = self._source()
-        tier_cell = src[src.index("const controlCell"):][:1800]
+        # Sliced to the FUNCTION, not to a character count. A 1800-char window
+        # was long enough until the cell grew a comment explaining why twelve
+        # kinds render nothing there, at which point the call it looks for
+        # sat past the window and this failed on code that still carried the
+        # pair. A guard should stop reading where the function does.
+        c0 = src.index("const controlCell")
+        tier_cell = src[c0 : src.index("\n  };", c0)]
         assert "tierControl(" in tier_cell, "the tier cell must carry the tier pair"
 
-        manage_cell = src[src.index("const manageCell"):][:1800]
+        m0 = src.index("const manageCell")
+        manage_cell = src[m0 : src.index("\n  };", m0)]
         assert "data-revoke" in manage_cell, "the manage cell must carry Revoke"
         # No dead ends: every branch that returns without a Revoke returns a
         # link instead. Both non-revocable branches key off `.href`.
@@ -697,3 +704,70 @@ class TestTheAddControlsAreButtons:
         # And nothing earlier fights it, so the next edit here does not have
         # to know the cascade order to be safe.
         assert all(v == "auto" for _, v in widths), widths
+
+
+class TestATierControlIsDrawnOnlyWhereItCanAct:
+    """Render a control where it can act; say nothing where it cannot.
+
+    Audit findings U5 and F8. Twelve of the sixteen grantable kinds have no
+    Optional/Automatic choice, and the page drew the pair on all of them —
+    disabled, with the reason in a tooltip — to keep the column uniform.
+    Uniformity bought with a dead control teaches the reader that the page
+    cannot be trusted about which of its controls work, and it disagreed with
+    itself: a table granted to everyone printed "Optional · to everyone" one
+    row above a table showing the tier greyed out.
+
+    A store entity is the subtler case: it IS tiered, but Automatic is
+    admissible only when the organization is the publisher, and the API
+    refuses anything else with a 422. Drawing the pair on a user-published
+    row offers a choice that fails on click. Optional is the one legal value
+    and already the value, so it is stated as a fact with its reason, not
+    offered as a one-button control.
+    """
+
+    TEMPLATE = "app/web/templates/admin_access.html"
+
+    def _source(self) -> str:
+        from pathlib import Path
+
+        return Path(self.TEMPLATE).read_text(encoding="utf-8")
+
+    def _control_cell(self) -> str:
+        src = self._source()
+        start = src.index("const controlCell = (typeKey, tier, opts) => {")
+        return src[start : src.index("\n  };", start)]
+
+    def test_an_untiered_kind_renders_nothing(self):
+        cell = self._control_cell()
+        assert '? ""' in cell, "an untiered kind must render an empty control, not a greyed pair"
+        # The disabled pair is gone from the page entirely, not merely from
+        # this branch: nothing else may draw a control that cannot act.
+        assert 'aria-disabled="true" role="group"' not in self._source()
+        assert "not applicable to this kind" not in self._source()
+
+    def test_a_user_published_store_entity_states_its_tier_rather_than_offering_it(self):
+        cell = self._control_cell()
+        assert 'typeKey === "store_entity" && !orgPublished' in cell
+        assert "Automatic needs an organization-published item" in cell
+        # The reason is the server's own rule, so the page and the 422 agree.
+        assert "publish it as the organization first" in cell
+
+    def test_an_unknown_publisher_is_treated_as_a_user(self):
+        """The server defaults `publisher_kind` to "user"; so must the page.
+
+        An item whose publisher is unknown must not be granted the wider
+        permission by omission — the same direction the server errs in.
+        """
+        cell = self._control_cell()
+        assert '(o.publisherKind || "user") === "organization"' in cell
+
+    def test_both_row_renderers_pass_the_publisher_through(self):
+        """The rule lives in one function, so both call sites must feed it.
+
+        Written at different times, neither renderer knew about the other —
+        the same way three renderers came to make one false claim about
+        Everyone. Pinning both call sites is what stops that recurring here.
+        """
+        src = self._source()
+        assert src.count("publisherKind: i.publisher_kind") == 1      # the group's grant list
+        assert src.count("publisherKind: r.i.publisher_kind") == 1    # By resource's audience row

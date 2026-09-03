@@ -3195,14 +3195,38 @@
   const controlCell = (typeKey, tier, opts) => {
     const o = opts || {};
     const tiered = TIERED.has(typeKey);
-    const tierPart = tiered
-      ? tierControl(tier, true)
-      : `<span class="fbar-seg ax-tier" aria-disabled="true" role="group"
-              aria-label="Access tier — not applicable to this kind"
-              data-tip="This kind has no Automatic/Optional choice — there is no local copy to keep.">
-           <button type="button" class="fbar-seg__btn is-active" disabled>{{ words.tier_optional }}</button>
-           <button type="button" class="fbar-seg__btn" disabled>{{ words.tier_automatic }}</button>
-         </span>`;
+    /* Render a control where it can act; say nothing where it cannot.
+
+       An untiered kind shows NOTHING here — not a greyed pair. Twelve of the
+       sixteen kinds have no Optional/Automatic choice, and the page drew the
+       pair on all of them, disabled, with the reason in a tooltip, to keep
+       the column uniform. Uniformity bought with a dead control teaches the
+       reader that the page cannot be trusted about which of its controls
+       work — which is the defect this whole effort keeps undoing — and it
+       disagreed with itself: a table granted to everyone printed "Optional ·
+       to everyone" one row above a table showing the tier greyed out. The
+       kind is already named in the row's own Kind column, so nothing is
+       lost. (Audit finding U5.)
+
+       A store entity is tiered, but Automatic is admissible ONLY when the
+       organization is the publisher: requiring something conscripts every
+       member of the group into carrying it, and an admin cannot make that
+       commitment on behalf of a colleague's personal upload. The API refuses
+       it with a 422 (`app/api/access.py`), so drawing the pair on a
+       user-published row offers a choice that fails on click. Optional is
+       the one legal value, and it is already the value — so this is not a
+       control with one live button, it is a fact, stated with its reason
+       where the sibling row's control makes the absence surprising. (F8.)
+       `publisher_kind` rides on the item; the server defaults it to "user",
+       and so does this, because an unknown publisher must not be granted
+       the wider permission by omission. */
+    const orgPublished = (o.publisherKind || "user") === "organization";
+    const tierPart = !tiered
+      ? ""
+      : (typeKey === "store_entity" && !orgPublished)
+        ? `<span class="ax-managed" data-tip="Automatic needs an organization-published item — publish it as the organization first.">${
+            tier === "required" ? "{{ words.tier_automatic }}" : "{{ words.tier_optional }}"}</span>`
+        : tierControl(tier, true);
     /* A grant another surface owns. Marking a plugin Required on
        /admin/marketplaces writes one to EVERY group, and the API then refuses
        to delete them (409 `cannot_revoke_system_grant`). This page was still
@@ -3793,7 +3817,7 @@
         ? `<span class="ax-ctl ax-ctl--managed"><span class="ax-managed"
              data-tip="Granted to Everyone, so it reaches this group's members too. Its tier is set there.">${
                tier === "required" ? "Automatic" : "Optional"}<span class="ax-managed__src"> · via Everyone</span></span></span>`
-        : controlCell(t.type_key, tier, { href: ownHref, managedBy: grant.managed_by });
+        : controlCell(t.type_key, tier, { href: ownHref, managedBy: grant.managed_by, publisherKind: i.publisher_kind });
       const manage = manageCell({
         inherited: grant.inherited, managedBy: grant.managed_by, href: ownHref,
       });
@@ -5190,7 +5214,7 @@
         <span class="ax-r__nm ax-r__nm--g">${AgnesKindGlyph.groupTile()}<span>${esc(label)}</span></span>
         <span class="ax-r__d">${esc(detail)}${
           who ? `<span class="ax-r__sep"> · </span><span class="ax-r__who">granted by ${esc(who)}</span>` : ""}</span>
-        <span class="ax-r__ctl">${controlCell(r.t.type_key, tier, { managedBy: grant.managed_by })}</span>
+        <span class="ax-r__ctl">${controlCell(r.t.type_key, tier, { managedBy: grant.managed_by, publisherKind: r.i.publisher_kind })}</span>
         <span class="ax-r__rd ax-r__manage">${manageCell({ managedBy: grant.managed_by })}</span>
       </div>`;
     };
