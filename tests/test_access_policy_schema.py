@@ -88,10 +88,5 @@ def test_masked_names_are_case_insensitive_lookup():
 
 
 def test_multiple_masked_columns():
-    sql = (
-        "SELECT * EXCLUDE (national_id, email, ssn), "
-        "md5(email) AS email, "
-        "CAST(NULL AS VARCHAR) AS ssn "
-        "FROM invoices"
-    )
+    sql = "SELECT * EXCLUDE (national_id, email, ssn), md5(email) AS email, CAST(NULL AS VARCHAR) AS ssn FROM invoices"
     assert masked_output_columns(sql) == frozenset({"email", "ssn"})
