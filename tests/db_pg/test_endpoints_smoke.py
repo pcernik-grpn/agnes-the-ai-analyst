@@ -3658,6 +3658,18 @@ KNOWN_UNTESTED = {
     # tests/test_admin_sharepoint.py::TestCollectionsConsolidate. Not
     # duplicated here.
     "POST /api/admin/sharepoint/connections/{connection_id}/collections/consolidate",
+    # The reverse of `splits` above — folds several sibling connections'
+    # scopes, crawl/facts state (`sharepoint_connection_state`, PG-only,
+    # no DuckDB sibling to even smoke-test against), collections and run
+    # history back into one. State-union algorithm coverage (collision
+    # tie-breaks) lives in tests/db_pg/test_sharepoint_connection_merge_pg.py;
+    # the route itself (auth matrix, every precondition refusal, dry-run
+    # vs real, end-to-end fold, idempotent repeat) by
+    # tests/db_pg/test_sharepoint_connection_split_merge_route_pg.py; the
+    # DuckDB typed-501 by
+    # tests/test_admin_sharepoint.py::TestSplitMergeFailsCleanOnDuckDB. Not
+    # duplicated here.
+    "POST /api/admin/sharepoint/connections/{connection_id}/splits/merge",
     # Per-connection facts policy override (retry_mode + transport) — writes
     # `source_connections.config`, the same frozen pair, needs a body; 200/
     # 422/clear semantics and the audit row are covered by

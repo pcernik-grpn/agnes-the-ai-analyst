@@ -408,6 +408,220 @@ class TestCollectionsConsolidate:
         assert "collection_referenced_by_other_connection" in result.output
 
 
+class TestSplitMergeCmd:
+    """`agnes admin sharepoint split-merge` — CLI counterpart to
+    `POST /api/admin/sharepoint/connections/{connection_id}/splits/merge`."""
+
+    def _dry_run_body(self):
+        return {
+            "dry_run": True,
+            "target": {"id": "col_target", "name": "Merged", "slug": "merged"},
+            "siblings": [
+                {
+                    "connection_id": "sib1",
+                    "name": "site — part 2/2",
+                    "scopes_moved": 2,
+                    "scopes_deduped": [],
+                    "state": {
+                        "crawl": {
+                            "delta_links_carried": 1,
+                            "ctags_carried": 5,
+                            "failed_items_carried": 0,
+                            "empty_items_carried": 0,
+                            "conflicts": [],
+                        },
+                        "facts": {"docs_carried": 3, "conflicts": []},
+                    },
+                }
+            ],
+            "blocking": [],
+        }
+
+    def test_defaults_to_a_dry_run_with_explicit_siblings(self):
+        with patch(
+            "cli.commands.admin_sharepoint.api_post", return_value=_resp(200, self._dry_run_body())
+        ) as mock_post:
+            result = runner.invoke(
+                app,
+                [
+                    "admin",
+                    "sharepoint",
+                    "split-merge",
+                    "target1",
+                    "--sibling",
+                    "sib1",
+                    "--target-collection-id",
+                    "col_target",
+                ],
+            )
+        assert result.exit_code == 0, result.output
+        assert "[dry run] would fold 1 sibling connection(s)" in result.output
+        assert "delta_links=1 ctags=5" in result.output and "facts_docs=3" in result.output
+        args, kwargs = mock_post.call_args
+        assert args[0] == "/api/admin/sharepoint/connections/target1/splits/merge"
+        assert kwargs["json"] == {
+            "dry_run": True,
+            "sibling_ids": ["sib1"],
+            "target": {"collection_id": "col_target"},
+        }
+
+    def test_all_siblings_flag_rides_the_payload(self):
+        body = {**self._dry_run_body(), "siblings": []}
+        with patch("cli.commands.admin_sharepoint.api_post", return_value=_resp(200, body)) as mock_post:
+            result = runner.invoke(
+                app,
+                [
+                    "admin",
+                    "sharepoint",
+                    "split-merge",
+                    "target1",
+                    "--all-siblings",
+                    "--target-name",
+                    "Merged",
+                ],
+            )
+        assert result.exit_code == 0, result.output
+        _, kwargs = mock_post.call_args
+        assert kwargs["json"] == {"dry_run": True, "all_split_siblings": True, "target": {"name": "Merged"}}
+
+    def test_execute_flag_sends_dry_run_false_and_reports_conflicts_and_dupes(self):
+        body = {
+            "dry_run": False,
+            "target": {"id": "col_target", "name": "Merged", "slug": "merged"},
+            "siblings": [
+                {
+                    "connection_id": "sib1",
+                    "name": "site — part 2/2",
+                    "scopes_moved": 1,
+                    "scopes_deduped": ["dup-scope"],
+                    "state": {
+                        "crawl": {
+                            "delta_links_carried": 1,
+                            "ctags_carried": 0,
+                            "failed_items_carried": 0,
+                            "empty_items_carried": 0,
+                            "conflicts": [{"kind": "delta_links", "key": "drive:a", "resolution": "kept_target"}],
+                        },
+                        "facts": {"docs_carried": 0, "conflicts": []},
+                    },
+                    "runs_repointed": 2,
+                }
+            ],
+        }
+        with patch("cli.commands.admin_sharepoint.api_post", return_value=_resp(200, body)) as mock_post:
+            result = runner.invoke(
+                app,
+                [
+                    "admin",
+                    "sharepoint",
+                    "split-merge",
+                    "target1",
+                    "--sibling",
+                    "sib1",
+                    "--target-collection-id",
+                    "col_target",
+                    "--execute",
+                ],
+            )
+        assert result.exit_code == 0, result.output
+        assert "folded 1 sibling connection(s)" in result.output
+        assert "conflict: delta_links drive:a -> kept_target" in result.output
+        assert "duplicate scope(s) dropped" in result.output and "dup-scope" in result.output
+        _, kwargs = mock_post.call_args
+        assert kwargs["json"] == {
+            "dry_run": False,
+            "sibling_ids": ["sib1"],
+            "target": {"collection_id": "col_target"},
+        }
+
+    def test_neither_sibling_flag_is_a_usage_error(self):
+        result = runner.invoke(app, ["admin", "sharepoint", "split-merge", "target1", "--target-name", "Merged"])
+        assert result.exit_code == 1
+        assert "exactly one" in result.output
+
+    def test_both_sibling_flags_is_a_usage_error(self):
+        result = runner.invoke(
+            app,
+            [
+                "admin",
+                "sharepoint",
+                "split-merge",
+                "target1",
+                "--sibling",
+                "sib1",
+                "--all-siblings",
+                "--target-name",
+                "Merged",
+            ],
+        )
+        assert result.exit_code == 1
+        assert "exactly one" in result.output
+
+    def test_neither_target_flag_is_a_usage_error(self):
+        result = runner.invoke(app, ["admin", "sharepoint", "split-merge", "target1", "--sibling", "sib1"])
+        assert result.exit_code == 1
+        assert "exactly one" in result.output
+
+    def test_both_target_flags_is_a_usage_error(self):
+        result = runner.invoke(
+            app,
+            [
+                "admin",
+                "sharepoint",
+                "split-merge",
+                "target1",
+                "--sibling",
+                "sib1",
+                "--target-collection-id",
+                "col_x",
+                "--target-name",
+                "Y",
+            ],
+        )
+        assert result.exit_code == 1
+        assert "exactly one" in result.output
+
+    def test_json_output(self):
+        body = self._dry_run_body()
+        with patch("cli.commands.admin_sharepoint.api_post", return_value=_resp(200, body)):
+            result = runner.invoke(
+                app,
+                [
+                    "admin",
+                    "sharepoint",
+                    "split-merge",
+                    "target1",
+                    "--sibling",
+                    "sib1",
+                    "--target-collection-id",
+                    "col_target",
+                    "--json",
+                ],
+            )
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.output) == body
+
+    def test_a_typed_error_is_reported_and_exits_nonzero(self):
+        detail = {"error": "crawl_or_facts_running", "jobs": {"sib1": ["job1"]}}
+        with patch("cli.commands.admin_sharepoint.api_post", return_value=_resp(409, {"detail": detail})):
+            result = runner.invoke(
+                app,
+                [
+                    "admin",
+                    "sharepoint",
+                    "split-merge",
+                    "target1",
+                    "--sibling",
+                    "sib1",
+                    "--target-collection-id",
+                    "col_target",
+                    "--execute",
+                ],
+            )
+        assert result.exit_code == 1
+        assert "crawl_or_facts_running" in result.output
+
+
 class TestSplitPlanCmd:
     """`agnes admin sharepoint split-plan` — CLI counterpart to
     `GET /api/admin/sharepoint/connections/{connection_id}/split-plan`."""

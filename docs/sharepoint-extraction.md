@@ -131,6 +131,36 @@ spot-check shows pseudonyms, not names.
   emptied sources soft-deleted). Also reachable from the source card's
   overflow menu (**Consolidate collections…**). PG-only (A3 ratchet).
 
+  **Merging the parts back.** Once a split site no longer needs to run in
+  parallel — or a site was split by hand into several sibling connections
+  and it is time to fold it back — `POST …/connections/{id}/splits/merge`
+  or `agnes admin sharepoint split-merge <target_id> --sibling <id>... |
+  --all-siblings --target-collection-id <id> | --target-name <name>
+  [--execute]` (source card overflow menu → **Merge split parts back into
+  this source…**) is the REVERSE of the split above: it moves every
+  sibling's scopes onto the target (deduped by `(source_scope_id,
+  drive_id)`), unions each sibling's crawl state (delta-link cursors,
+  cTags, the failed/empty-document backlogs) and facts state (the
+  extraction ledger) onto the target's own, folds every involved scope
+  collection into one target collection (the SAME repository
+  `collections/consolidate` uses — never reimplemented), and re-points
+  each sibling's run history onto the target. The merged connection then
+  resumes crawling INCREMENTALLY, exactly where every sibling left off,
+  instead of re-downloading the whole site. `--all-siblings` folds in
+  every OTHER connection named like this one's own split family (the
+  `"<source name> — part i/n"` convention `POST …/splits` already
+  establishes); `--sibling <id>` (repeatable) names siblings explicitly —
+  the only form that works for a site split by hand under different
+  names. Refused (`409`, nothing touched) while any involved connection
+  has a running crawl/facts job, while a sibling carries ACL-mirroring
+  permission zones or a mirrored-scope audience mapping different from the
+  target's own, or while a scope collection being folded is still
+  referenced by a connection OUTSIDE the merge group. Siblings are marked
+  merged-away (their scopes cleared) rather than deleted — their
+  credentials are left untouched; remove a merged-away sibling later with
+  the ordinary `DELETE /api/admin/source-connections/{id}` if it is no
+  longer needed. Dry-run by default. PG-only (A3 ratchet).
+
   reports it. Per-run override in the Run-now options. Editable in
   `/admin/server-config` → *Extraction* → *crawler*; this is the extraction
   worker's **memory lever** (every file in flight is a converter child
