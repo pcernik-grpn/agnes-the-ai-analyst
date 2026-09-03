@@ -531,6 +531,23 @@ def test_list_latest_for_connections_never_returns_a_shard_childs_own_row(pg_eng
     assert latest["conn_a"]["id"] == parent
 
 
+def test_list_latest_for_connections_carries_the_shard_columns(pg_engine, monkeypatch):
+    """A LIST projection's own column set (``_RUN_LIST_COLUMNS``) must
+    carry ``shards_total``/``shards_done`` — a caller deriving "is this a
+    sharded run" (``app.api.admin_extraction._run_out``'s ``mode``) off a
+    row read through this method, not :meth:`get`/:meth:`get_running`, must
+    see the same columns either way. Regression: these two were missing
+    from the LIST projection through 2026-09-03, so every fleet/history row
+    for a sharded site silently reported ``mode: "inline"``."""
+    repo = _make_repo(pg_engine, monkeypatch)
+    parent = repo.start(connection_id="conn_a", shards_total=3)
+
+    latest = repo.list_latest_for_connections(["conn_a"])
+    assert latest["conn_a"]["id"] == parent
+    assert latest["conn_a"]["shards_total"] == 3
+    assert latest["conn_a"]["shards_done"] == 0
+
+
 def test_list_for_connection_and_count_never_include_shard_children(pg_engine, monkeypatch):
     repo = _make_repo(pg_engine, monkeypatch)
     parent = repo.start(connection_id="conn_a", shards_total=2)
@@ -539,6 +556,7 @@ def test_list_for_connection_and_count_never_include_shard_children(pg_engine, m
 
     rows = repo.list_for_connection("conn_a", limit=10)
     assert [r["id"] for r in rows] == [parent]
+    assert rows[0]["shards_total"] == 2  # same LIST-projection regression as list_latest_for_connections above
     assert repo.count_for_connection("conn_a") == 1
 
 

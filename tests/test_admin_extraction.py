@@ -809,6 +809,123 @@ class TestRunProjection:
 
 
 # ---------------------------------------------------------------------------
+# Shard roll-up (2026-09-03 auto-parallel-crawl design §4.7, plan Task 8) —
+# pure unit tests over `_run_out`'s additive keys and `_rollup_children`; the
+# PG happy path (real child rows joined through the API) lives in
+# `tests/db_pg/test_extraction_api_pg.py`.
+# ---------------------------------------------------------------------------
+
+
+class TestShardModeProjection:
+    def test_a_plain_run_reports_inline_mode_and_no_shard_counters(self):
+        from app.api.admin_extraction import _run_out
+
+        out = _run_out({"id": "er_1", "status": "done", "report": {"new": 3}})
+        assert out["mode"] == "inline"
+        assert out["shards_total"] is None
+        assert out["shards_done"] is None
+        assert out["expected_documents"] is None
+        assert out["seen_documents"] is None
+        assert out["shards"] is None
+
+    def test_a_parent_row_reports_sharded_mode_from_its_own_columns_alone(self):
+        """`shards_total`/`shards_done` come straight off the row — no
+        children needed for the mode/counter fields, only for `shards[]`."""
+        from app.api.admin_extraction import _run_out
+
+        out = _run_out({"id": "er_parent", "status": "running", "shards_total": 3, "shards_done": 1})
+        assert out["mode"] == "sharded"
+        assert out["shards_total"] == 3
+        assert out["shards_done"] == 1
+        # No `children=` given — the per-shard rollup is simply not computed.
+        assert out["shards"] is None
+
+    def test_children_none_vs_empty_list_both_render_shards_as_a_list(self):
+        from app.api.admin_extraction import _run_out
+
+        out = _run_out({"id": "er_parent", "status": "running", "shards_total": 2}, children=[])
+        assert out["shards"] == []
+
+
+class TestRollupChildren:
+    def _child(self, **overrides):
+        base = {
+            "id": "er_child",
+            "connection_id": "conn-1",
+            "status": "done",
+            "shard_key": "drive-1:item-1",
+            "shard_label": "part 1/2",
+            "checkpoint_at": "2026-09-03T00:00:00+00:00",
+            "files_done": 40,
+            "files_seen": 40,
+            "report": {"new": 10, "changed": 5, "unchanged": 25, "filtered_by_age": 2},
+            "error": None,
+        }
+        base.update(overrides)
+        return base
+
+    def test_sums_counters_and_carries_one_row_per_child(self):
+        from app.api.admin_extraction import _rollup_children
+
+        children = [
+            self._child(shard_key="k1", shard_label="part 1/2", report={"new": 10, "changed": 0, "unchanged": 10}),
+            self._child(shard_key="k2", shard_label="part 2/2", report={"new": 3, "changed": 1, "unchanged": 1}),
+        ]
+        out = _rollup_children({"connection_id": "conn-1"}, children, expected_by_key={"k1": 20, "k2": 5})
+        assert len(out["shards"]) == 2
+        assert out["shards"][0]["label"] == "part 1/2"
+        assert out["shards"][0]["expected"] == 20
+        assert out["shards"][1]["expected"] == 5
+        # new+changed+unchanged summed across both children.
+        assert out["seen_documents"] == (10 + 0 + 10) + (3 + 1 + 1)
+        assert out["expected_documents"] == 25
+
+    def test_expected_documents_is_none_when_any_shard_has_no_known_plan(self):
+        """A partial sum would silently understate the site's real target —
+        worse than admitting the total is unknown."""
+        from app.api.admin_extraction import _rollup_children
+
+        children = [self._child(shard_key="k1"), self._child(shard_key="k2")]
+        out = _rollup_children({"connection_id": "conn-1"}, children, expected_by_key={"k1": 20})
+        assert out["expected_documents"] is None
+        assert out["shards"][0]["expected"] == 20
+        assert out["shards"][1]["expected"] is None
+
+    def test_no_children_reports_none_not_zero(self):
+        from app.api.admin_extraction import _rollup_children
+
+        out = _rollup_children({"connection_id": "conn-1"}, [], expected_by_key={})
+        assert out["shards"] == []
+        assert out["expected_documents"] is None
+        assert out["seen_documents"] is None
+
+    def test_a_stalled_child_is_flagged_stuck_on_its_own_row(self):
+        from datetime import datetime, timedelta, timezone
+
+        from app.api.admin_extraction import _STALL_AFTER_S, _rollup_children
+
+        now = datetime.now(timezone.utc)
+        stale = (now - timedelta(seconds=_STALL_AFTER_S + 600)).isoformat()
+        children = [
+            self._child(shard_key="k1", status="running", checkpoint_at=stale),
+            self._child(shard_key="k2", status="running", checkpoint_at=now.isoformat()),
+        ]
+        out = _rollup_children({"connection_id": "conn-1"}, children, expected_by_key={}, now=now)
+        assert out["shards"][0]["outcome"] == "stalled"
+        assert out["shards"][0]["stuck"] is True
+        assert out["shards"][1]["outcome"] == "running"
+        assert out["shards"][1]["stuck"] is False
+
+    def test_a_failed_childs_error_rides_its_own_shard_row(self):
+        from app.api.admin_extraction import _rollup_children
+
+        children = [self._child(shard_key="k1", status="failed", error="CrawlError: boom")]
+        out = _rollup_children({"connection_id": "conn-1"}, children, expected_by_key={})
+        assert out["shards"][0]["outcome"] == "failed"
+        assert out["shards"][0]["error"] == "CrawlError: boom"
+
+
+# ---------------------------------------------------------------------------
 # Fleet view (`GET /extraction/runs`, `/admin/extraction`, 2026-09-02) — the
 # pure helper functions first, no database required; the PG happy path (a
 # fleet row actually surfacing through the API) lives in
