@@ -544,11 +544,14 @@ def test_the_pinned_uid_is_reserved_before_any_package_activity():
     """
     body = TPL.read_text()
     reserve_at = body.index('--uid "$AGNES_APPLIER_UID"')
-    docker_install_at = body.index("https://get.docker.com")
-    assert reserve_at < docker_install_at, (
+    # The section header, not the install command's URL — the anchor must
+    # survive a change of install method, because ANY package activity in
+    # that section can allocate a system uid.
+    docker_section_at = body.index("--- 1. Docker")
+    assert reserve_at < docker_section_at, (
         "the pinned useradd must run before the first package activity "
-        "(the Docker install) — any package's postinst can allocate a system "
-        "uid, and the top free one is exactly the uid the applier pins"
+        "(the Docker install section) — any package's postinst can allocate "
+        "a system uid, and the top free one is exactly the uid the applier pins"
     )
     datadog_install_at = body.index('apt-get install -y -qq --allow-downgrades "datadog-agent=')
     assert reserve_at < datadog_install_at, (

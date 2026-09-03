@@ -55,14 +55,18 @@ echo "=== [Agnes $CUSTOMER_NAME $ROLE] Startup at $(date) ==="
 # freshly-created and the pre-existing case, since it re-reads whatever uid
 # the name resolves to right now instead of trusting this block succeeded.
 if ! id -u agnes-applier >/dev/null 2>&1; then
-    # Only the UID is pinned. `--gid` and `--user-group` are mutually
-    # exclusive, so a form passing both always fails — and the gid does not
-    # matter here anyway: instance.yaml is 0600, so the group bits grant
-    # nothing and only the owner's uid decides who can read it.
+    # The group is ensured separately and useradd takes `--gid`, not
+    # `--user-group`: with `--user-group` an orphaned agnes-applier group —
+    # e.g. left behind by the documented userdel+re-run remediation — would
+    # fail BOTH useradd attempts ("group exists") and, under this script's
+    # errexit, abort the whole boot. Only the UID is pinned; the gid does
+    # not matter: instance.yaml is 0600, so the group bits grant nothing
+    # and only the owner's uid decides who can read it.
+    getent group agnes-applier >/dev/null 2>&1 || groupadd --system agnes-applier
     useradd --system --no-create-home --shell /usr/sbin/nologin \
-            --uid "$AGNES_APPLIER_UID" --user-group agnes-applier 2>/dev/null \
+            --uid "$AGNES_APPLIER_UID" --gid agnes-applier agnes-applier 2>/dev/null \
     || useradd --system --no-create-home --shell /usr/sbin/nologin \
-            --user-group agnes-applier
+            --gid agnes-applier agnes-applier
 fi
 
 # --- 1. Docker (install if missing) ---
@@ -1644,10 +1648,11 @@ chmod 600 "$APP_DIR/.env"
 # via this path — #1217 was exactly this kind of duplicate that only one of
 # two copies got fixed.
 if ! id -u agnes-applier >/dev/null 2>&1; then
+    getent group agnes-applier >/dev/null 2>&1 || groupadd --system agnes-applier
     useradd --system --no-create-home --shell /usr/sbin/nologin \
-            --uid "$AGNES_APPLIER_UID" --user-group agnes-applier 2>/dev/null \
+            --uid "$AGNES_APPLIER_UID" --gid agnes-applier agnes-applier 2>/dev/null \
     || useradd --system --no-create-home --shell /usr/sbin/nologin \
-            --user-group agnes-applier
+            --gid agnes-applier agnes-applier
 fi
 chown agnes-applier:agnes-applier /opt/agnes/.env
 chmod 0600 /opt/agnes/.env
