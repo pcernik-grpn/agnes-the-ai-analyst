@@ -300,7 +300,7 @@ FOUNDATION_TOOL_NAMES: tuple[str, ...] = (
     "data_app_get",
     "data_app_deploy",
     "data_app_logs",
-    # "Add artefacts to My Stack" — triple-surface with
+    # "Add artifacts to My Stack" — triple-surface with
     # /api/stack/artefacts* + `agnes stack artefacts list/add/remove`. Adds
     # Stack MEMBERSHIP data only (see the module note on stack_subscribe) —
     # NOT a retrieval gate: knowledge_search/collections_search below still
@@ -610,7 +610,7 @@ def register_foundation_tools(
         case you are in; read them before concluding anything about
         permissions.
 
-        NOTE (deferred follow-up, "Add artefacts to My Stack" spec): this
+        NOTE (deferred follow-up, "Add artifacts to My Stack" spec): this
         fans out over every RBAC-accessible collection — it does NOT gate by
         the caller's Stack membership (``user_stack_subscriptions``,
         ``stack_artefacts_candidates``/``stack_artefact_add``). Wiring that
@@ -670,7 +670,7 @@ def register_foundation_tools(
         ``hybrid`` (lexical + semantic) or ``lexical_only`` — the degraded
         mode when the server has no embedding model installed.
 
-        NOTE (deferred follow-up, "Add artefacts to My Stack" spec): the
+        NOTE (deferred follow-up, "Add artifacts to My Stack" spec): the
         Collections leg of this fan-out is not gated by Stack membership
         either — see ``collections_search``'s note.
 

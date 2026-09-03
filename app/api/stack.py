@@ -260,10 +260,10 @@ async def unsubscribe(
 
 
 # ---------------------------------------------------------------------------
-# Artefacts (file_corpora "collections") — added to My Stack (#feature)
+# Artifacts (file_corpora "collections") — added to My Stack (#feature)
 # ---------------------------------------------------------------------------
 #
-# Artefacts are NOT routed through StackResolver (see module docstring for
+# Artifacts are NOT routed through StackResolver (see module docstring for
 # data_package/memory_domain) — there is no admin-RBAC "required" tier for a
 # personal upload. Permission is ownership/sharing (checked via
 # ``can_access_collection``, the same primitive /artefacts and /library use),
@@ -271,10 +271,10 @@ async def unsubscribe(
 # with ``resource_type='collection'`` — the generic subscribe()/unsubscribe()
 # already used above is idempotent, satisfying "prevent duplicate
 # memberships" for free. Small, dedicated endpoints rather than threading
-# artefacts through ``_validate_type``/``StackResolver``.
+# artifacts through ``_validate_type``/``StackResolver``.
 #
 # NOTE (deferred follow-up — see the product spec's scope note): adding an
-# artefact here makes it *queryable as Stack data*, but the default agent's
+# artifact here makes it *queryable as Stack data*, but the default agent's
 # retrieval tools (``knowledge_search``/``collections_search`` in
 # app/api/mcp/foundation_tools.py, backed by /api/knowledge/search and
 # /api/collections/search) do not yet gate results by Stack membership — they
@@ -288,11 +288,11 @@ async def add_artefact_to_stack(
     corpus_id: str,
     user: dict = Depends(get_current_user),
 ):
-    """Add an artefact (a ``file_corpora`` collection) to the caller's Stack
+    """Add an artifact (a ``file_corpora`` collection) to the caller's Stack
     so the default agent can use it. 404 if the collection doesn't exist
     (or is soft-deleted); 403 if the caller cannot access it (not owned, not
     shared with one of their groups, not workspace-published). Idempotent —
-    adding an already-in-stack artefact just re-confirms membership.
+    adding an already-in-stack artifact just re-confirms membership.
 
     Returns the same catalog-card shape My Stack renders (``card``), so the
     picker/Artefacts-page JS can insert the new row live without a reload.
@@ -355,11 +355,11 @@ async def remove_artefact_from_stack(
     corpus_id: str,
     user: dict = Depends(get_current_user),
 ):
-    """Remove an artefact from the caller's Stack — drops agent access only.
+    """Remove an artifact from the caller's Stack — drops agent access only.
 
-    The artefact itself, its files, ownership and sharing are untouched;
+    The artifact itself, its files, ownership and sharing are untouched;
     this only deletes the ``user_stack_subscriptions`` membership row. No
-    "required" concept exists for artefacts, so there is no 400 case (unlike
+    "required" concept exists for artifacts, so there is no 400 case (unlike
     the data_package/memory_domain unsubscribe endpoint) — always 204.
     """
     _reject_co_session(user)
@@ -373,13 +373,13 @@ async def remove_artefact_from_stack(
 async def stack_artefact_candidates(
     user: dict = Depends(get_current_user),
 ):
-    """List every artefact eligible for the "Add artefacts to Stack" picker:
+    """List every artifact eligible for the "Add artifacts to Stack" picker:
     collections accessible to the caller (owned, or shared with them/their
     team, or workspace-published) that are NOT already in their Stack.
 
-    ``total_accessible`` counts every accessible artefact regardless of
-    Stack membership, distinguishing "no artefacts exist at all" from "all
-    accessible artefacts are already in your Stack" for the picker's empty
+    ``total_accessible`` counts every accessible artifact regardless of
+    Stack membership, distinguishing "no artifacts exist at all" from "all
+    accessible artifacts are already in your Stack" for the picker's empty
     states. Small dataset per caller in practice (mirrors /artefacts, which
     also fetches everything server-side) — the caller's search/visibility
     filter runs client-side over this list, no server-side ``q`` param.

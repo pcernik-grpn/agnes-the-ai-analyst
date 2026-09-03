@@ -111,7 +111,7 @@ def _legacy_walk(node) -> str:
 def test_card_alone_in_paragraph_is_the_whole_body(node_type):
     """The mode that stored ``''``. Every card flavour carries ``attrs.url``."""
     url = "https://example.atlassian.net/browse/SUPPORT-6700"
-    # The trailing space-only text node is Jira's own, not a fixture artefact:
+    # The trailing space-only text node is Jira's own, not a fixture artifact:
     # the editor appends one after an inline smart link.
     doc = _doc(_para(_card(url, node_type), _text(" ")))
 

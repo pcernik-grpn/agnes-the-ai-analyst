@@ -36,7 +36,7 @@ def test_band_lists_visible_app_under_rail(seeded_app, monkeypatch):
     assert resp.status_code == 200
     body = resp.text
     # Its OWN band, on the Knowledge tab. Apps used to render inside the
-    # Artefacts band (router `_SECTION_OF`), which forced that band's hint to
+    # Artifacts band (router `_SECTION_OF`), which forced that band's hint to
     # call an app a file the caller had uploaded. Rows still carry
     # type_key=data_app either way, so the Type facet is unaffected.
     assert 'data-lib-sec="data_app"' in body
@@ -100,7 +100,7 @@ def test_soon_badge_gone_from_files_band(seeded_app, monkeypatch):
 def test_app_band_follows_the_artefacts_band(seeded_app, monkeypatch):
     """Apps read AFTER the caller's own files, as their own band.
 
-    They used to be a trailing block inside Artefacts; the reading order that
+    They used to be a trailing block inside Artifacts; the reading order that
     guarded (your files first, then what runs on them) is the same, but it is
     now carried by the section order rather than by row order within one
     band."""
@@ -114,7 +114,7 @@ def test_app_band_follows_the_artefacts_band(seeded_app, monkeypatch):
     files_at = body.index('data-lib-sec="files"')
     apps_at = body.index('data-lib-sec="data_app"')
     assert files_at < apps_at
-    # The app row is inside its own band, not the Artefacts one.
+    # The app row is inside its own band, not the Artifacts one.
     assert body.index('href="/apps/detail/order-app"') > apps_at
 
 

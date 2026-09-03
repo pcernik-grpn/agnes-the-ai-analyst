@@ -17443,7 +17443,7 @@
     },
     "/agents": {
       "get": {
-        "description": "Agents \u2014 build a focused assistant out of the caller's own stack.\n\nTwo panes: a conversation that fills the configuration in\n(``POST /api/agents/{id}/builder/turn``) and the configuration itself,\nhand-editable throughout. Agents persist server-side in the ``agents``\nregistry behind ``/api/agents``.\n\nThe builder's ingredient lists are REAL and RBAC-scoped:\n``knowledge_sources_for`` resolves the caller's own data packages, memory\ndomains and artefact collections \u2014 the same list the builder assistant is\ngiven as its candidate set, so it can never offer access the picker does\nnot \u2014 and capabilities hydrate client-side from\n``/api/marketplace/items?tab=my`` (the caller's subscribed plugins).",
+        "description": "Agents \u2014 build a focused assistant out of the caller's own stack.\n\nTwo panes: a conversation that fills the configuration in\n(``POST /api/agents/{id}/builder/turn``) and the configuration itself,\nhand-editable throughout. Agents persist server-side in the ``agents``\nregistry behind ``/api/agents``.\n\nThe builder's ingredient lists are REAL and RBAC-scoped:\n``knowledge_sources_for`` resolves the caller's own data packages, memory\ndomains and artifact collections \u2014 the same list the builder assistant is\ngiven as its candidate set, so it can never offer access the picker does\nnot \u2014 and capabilities hydrate client-side from\n``/api/marketplace/items?tab=my`` (the caller's subscribed plugins).",
         "operationId": "agents_page_agents_get",
         "parameters": [
           {
@@ -39944,7 +39944,7 @@
     },
     "/api/chat/sessions/{chat_id}/files/save-artefact": {
       "post": {
-        "description": "Save one session-workspace file as a private single-file artefact.\n\nThe copy outlives the session and shows up in your Library\n(``/library/{slug}``), exactly like a document dropped into the chat\ncomposer. 415 for file types the corpus cannot ingest; 413 above the\ncorpus's per-file ceiling.",
+        "description": "Save one session-workspace file as a private single-file artifact.\n\nThe copy outlives the session and shows up in your Library\n(``/library/{slug}``), exactly like a document dropped into the chat\ncomposer. 415 for file types the corpus cannot ingest; 413 above the\ncorpus's per-file ceiling.",
         "operationId": "save_session_file_as_artefact_api_chat_sessions__chat_id__files_save_artefact_post",
         "parameters": [
           {
@@ -41467,7 +41467,7 @@
     },
     "/api/collections/{collection_id}/files/{file_id}/move": {
       "post": {
-        "description": "Move a file into another collection \u2014 the Library's drag-and-drop.\n\nGated on BOTH ends: the path dependency proves access to the source, and\nthe target is re-checked here (otherwise a caller could push a file into\nsomeone else's collection).\n\nWhen the source collection is left empty it is soft-deleted: a single-file\nartefact IS its file in the Library, so dragging that file into a folder\nmust not strand an empty husk in the listing.",
+        "description": "Move a file into another collection \u2014 the Library's drag-and-drop.\n\nGated on BOTH ends: the path dependency proves access to the source, and\nthe target is re-checked here (otherwise a caller could push a file into\nsomeone else's collection).\n\nWhen the source collection is left empty it is soft-deleted: a single-file\nartifact IS its file in the Library, so dragging that file into a folder\nmust not strand an empty husk in the listing.",
         "operationId": "move_file_api_collections__collection_id__files__file_id__move_post",
         "parameters": [
           {
@@ -53316,7 +53316,7 @@
     },
     "/api/stack/artefacts/candidates": {
       "get": {
-        "description": "List every artefact eligible for the \"Add artefacts to Stack\" picker:\ncollections accessible to the caller (owned, or shared with them/their\nteam, or workspace-published) that are NOT already in their Stack.\n\n``total_accessible`` counts every accessible artefact regardless of\nStack membership, distinguishing \"no artefacts exist at all\" from \"all\naccessible artefacts are already in your Stack\" for the picker's empty\nstates. Small dataset per caller in practice (mirrors /artefacts, which\nalso fetches everything server-side) \u2014 the caller's search/visibility\nfilter runs client-side over this list, no server-side ``q`` param.",
+        "description": "List every artifact eligible for the \"Add artifacts to Stack\" picker:\ncollections accessible to the caller (owned, or shared with them/their\nteam, or workspace-published) that are NOT already in their Stack.\n\n``total_accessible`` counts every accessible artifact regardless of\nStack membership, distinguishing \"no artifacts exist at all\" from \"all\naccessible artifacts are already in your Stack\" for the picker's empty\nstates. Small dataset per caller in practice (mirrors /artefacts, which\nalso fetches everything server-side) \u2014 the caller's search/visibility\nfilter runs client-side over this list, no server-side ``q`` param.",
         "operationId": "stack_artefact_candidates_api_stack_artefacts_candidates_get",
         "parameters": [
           {
@@ -53370,7 +53370,7 @@
     },
     "/api/stack/artefacts/{corpus_id}": {
       "delete": {
-        "description": "Remove an artefact from the caller's Stack \u2014 drops agent access only.\n\nThe artefact itself, its files, ownership and sharing are untouched;\nthis only deletes the ``user_stack_subscriptions`` membership row. No\n\"required\" concept exists for artefacts, so there is no 400 case (unlike\nthe data_package/memory_domain unsubscribe endpoint) \u2014 always 204.",
+        "description": "Remove an artifact from the caller's Stack \u2014 drops agent access only.\n\nThe artifact itself, its files, ownership and sharing are untouched;\nthis only deletes the ``user_stack_subscriptions`` membership row. No\n\"required\" concept exists for artifacts, so there is no 400 case (unlike\nthe data_package/memory_domain unsubscribe endpoint) \u2014 always 204.",
         "operationId": "remove_artefact_from_stack_api_stack_artefacts__corpus_id__delete",
         "parameters": [
           {
@@ -53426,7 +53426,7 @@
         ]
       },
       "post": {
-        "description": "Add an artefact (a ``file_corpora`` collection) to the caller's Stack\nso the default agent can use it. 404 if the collection doesn't exist\n(or is soft-deleted); 403 if the caller cannot access it (not owned, not\nshared with one of their groups, not workspace-published). Idempotent \u2014\nadding an already-in-stack artefact just re-confirms membership.\n\nReturns the same catalog-card shape My Stack renders (``card``), so the\npicker/Artefacts-page JS can insert the new row live without a reload.",
+        "description": "Add an artifact (a ``file_corpora`` collection) to the caller's Stack\nso the default agent can use it. 404 if the collection doesn't exist\n(or is soft-deleted); 403 if the caller cannot access it (not owned, not\nshared with one of their groups, not workspace-published). Idempotent \u2014\nadding an already-in-stack artifact just re-confirms membership.\n\nReturns the same catalog-card shape My Stack renders (``card``), so the\npicker/Artefacts-page JS can insert the new row live without a reload.",
         "operationId": "add_artefact_to_stack_api_stack_artefacts__corpus_id__post",
         "parameters": [
           {
@@ -63093,7 +63093,7 @@
     },
     "/library": {
       "get": {
-        "description": "Library \u2014 everything the caller has: artefacts, skills, and agents.\n\nThis is the renamed and widened former ``/artefacts`` surface. It answers\n\"what do I have?\" across every kind Agnes governs \u2014 the caller's own things\nplus everything shared with them:\n\n  - **Artefacts** \u2014 ``file_corpora`` uploads: images, documents, data\n    files, and multi-file collections, whether *uploaded* by a person or\n    *generated* by an agent (the Source facet).\n  - **Skills** \u2014 the caller's own store entities of type ``skill``, i.e.\n    what the Skill builder (/skills) publishes.\n  - **Granted resources** \u2014 governed **data packages**, **memory\n    domains**, **recipes** and curated **marketplace plugins** granted to\n    one of the caller's groups, plus the community-store items they have\n    **installed**. These are not the caller's to re-share, so they carry no\n    Share action; the grant belongs to an admin.\n\nAgents are deliberately NOT here \u2014 they have their own home at ``/agents``\n(they are still real server-side rows in the v103 ``agents`` registry, and\n``/api/v1/agents`` reads honour agent grants; the Library just isn't their\nlisting surface).\n\nScope is grant-aware: items you OWN plus anything shared into a group you\nbelong to, tagged ``mine`` / ``shared_with_me`` / ``shared_by_me`` so the\ntoolbar can slice by ownership. Deliberately NOT admin god-mode \u2014 an admin\nstill sees their own Library, not every item in the instance (the audit\nview is /admin/access).\n\nEvery row carries its real visibility (Private / Shared / Workspace) and,\nfor the grant-backed kinds, a Share action writing through\n``PUT /api/sharing/{resource_type}/{resource_id}``. Skills are the\nexception: an approved store entity is already readable by every\nauthenticated user, so the row reports that state rather than offering a\ngroup grant nothing would read.\n\nRendering is server-side; the toolbar (search, ownership segments, Type +\nSource facets, sort, and the table \u21c4 grid switch) is client-side over\nthose rows.",
+        "description": "Library \u2014 everything the caller has: artifacts, skills, and agents.\n\nThis is the renamed and widened former ``/artefacts`` surface. It answers\n\"what do I have?\" across every kind Agnes governs \u2014 the caller's own things\nplus everything shared with them:\n\n  - **Artifacts** \u2014 ``file_corpora`` uploads: images, documents, data\n    files, and multi-file collections, whether *uploaded* by a person or\n    *generated* by an agent (the Source facet).\n  - **Skills** \u2014 the caller's own store entities of type ``skill``, i.e.\n    what the Skill builder (/skills) publishes.\n  - **Granted resources** \u2014 governed **data packages**, **memory\n    domains**, **recipes** and curated **marketplace plugins** granted to\n    one of the caller's groups, plus the community-store items they have\n    **installed**. These are not the caller's to re-share, so they carry no\n    Share action; the grant belongs to an admin.\n\nAgents are deliberately NOT here \u2014 they have their own home at ``/agents``\n(they are still real server-side rows in the v103 ``agents`` registry, and\n``/api/v1/agents`` reads honour agent grants; the Library just isn't their\nlisting surface).\n\nScope is grant-aware: items you OWN plus anything shared into a group you\nbelong to, tagged ``mine`` / ``shared_with_me`` / ``shared_by_me`` so the\ntoolbar can slice by ownership. Deliberately NOT admin god-mode \u2014 an admin\nstill sees their own Library, not every item in the instance (the audit\nview is /admin/access).\n\nEvery row carries its real visibility (Private / Shared / Workspace) and,\nfor the grant-backed kinds, a Share action writing through\n``PUT /api/sharing/{resource_type}/{resource_id}``. Skills are the\nexception: an approved store entity is already readable by every\nauthenticated user, so the row reports that state rather than offering a\ngroup grant nothing would read.\n\nRendering is server-side; the toolbar (search, ownership segments, Type +\nSource facets, sort, and the table \u21c4 grid switch) is client-side over\nthose rows.",
         "operationId": "library_page_library_get",
         "parameters": [
           {
@@ -63254,7 +63254,7 @@
     },
     "/library/{slug}/f/{file_id}": {
       "get": {
-        "description": "One file inside a collection \u2014 its own detail page.\n\nA single-file artefact IS its collection, so it keeps using\n``/library/{slug}``; this route serves the files *inside* a folder, which\npreviously had no page of their own. Reachable by anyone who can reach the\nparent collection OR who holds a grant on the file itself (per-file\nsharing), so a file shared out of a folder is actually openable.\n\n404 for missing AND for no-access, matching the collection contract, so the\nURL space can't be probed.",
+        "description": "One file inside a collection \u2014 its own detail page.\n\nA single-file artifact IS its collection, so it keeps using\n``/library/{slug}``; this route serves the files *inside* a folder, which\npreviously had no page of their own. Reachable by anyone who can reach the\nparent collection OR who holds a grant on the file itself (per-file\nsharing), so a file shared out of a folder is actually openable.\n\n404 for missing AND for no-access, matching the collection contract, so the\nURL space can't be probed.",
         "operationId": "library_file_detail_library__slug__f__file_id__get",
         "parameters": [
           {
