@@ -533,6 +533,17 @@ else
             || echo "WARNING: could not install the Datadog artifact '${dd_path}'" >&2
 %{ endfor ~}
         systemctl daemon-reload >/dev/null 2>&1 || true
+        # datadog-agent.service Wants datadog-agent-installer.service (Fleet
+        # Automation's remote-upgrade daemon), which cannot run here: it exits
+        # 255 with "remote config is required to create the updater", because
+        # the rendered datadog.yaml turns remote configuration off. Datadog
+        # confirm that failure is expected once those features are disabled,
+        # and their graceful-exit bug is open (DataDog/datadog-agent#43052).
+        # A soft dependency, so masking does not stop the agent; leaving it
+        # unmasked leaves every consumer a permanently failed unit, which pins
+        # a "failed systemd units" monitor to alert until nobody reads it.
+        systemctl mask datadog-agent-installer.service >/dev/null 2>&1 \
+            || echo "WARNING: could not mask datadog-agent-installer.service — expect a permanently failed unit" >&2
         systemctl enable datadog-agent >/dev/null 2>&1 || true
         systemctl restart datadog-agent >/dev/null 2>&1 \
             || echo "WARNING: the Datadog Agent did not start — inspect 'systemctl status datadog-agent'" >&2

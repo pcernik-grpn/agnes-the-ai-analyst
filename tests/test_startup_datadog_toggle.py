@@ -262,6 +262,23 @@ def test_the_agent_joins_the_docker_group_and_the_service_is_enabled(on: str):
     )
 
 
+def test_the_fleet_installer_unit_is_masked_before_the_agent_starts(on: str):
+    # The deb's datadog-agent-installer.service is a soft dependency of
+    # datadog-agent.service and exits 255 without remote configuration, which
+    # this module deliberately disables. Unmasked, every consumer is left with
+    # a permanently failed unit. See DataDog/datadog-agent#43052.
+    assert "systemctl mask datadog-agent-installer.service" in on
+
+    mask = on.index("systemctl mask datadog-agent-installer.service")
+    enable = on.index("systemctl enable datadog-agent")
+    assert mask < enable, (
+        "mask before the agent starts, or the first boot still records a failed unit"
+    )
+
+    # Masking must not be the step that turns a monitoring hiccup into a failed boot.
+    assert "||" in on[mask : mask + 250], "the mask step is unguarded"
+
+
 def test_every_artifact_is_installed_and_an_empty_payload_removes_its_target(on: str):
     for rel, payload in DATADOG_FILES.items():
         assert f'_dd_install_artifact "{rel}" "{payload}"' in on, rel
