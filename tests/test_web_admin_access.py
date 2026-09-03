@@ -529,24 +529,69 @@ class TestTheRowIsOneLineAndTheGroupOpensOnItsGrants:
         sentence about the group would be the wrong thing to show."""
         assert 'setPeopleHead("Loading…", "Reading who is in this group…")' in js
 
-    def test_people_is_a_strip_not_a_section_to_open(self, tpl):
-        assert '<div class="ax-pstrip" id="ax-sec-people"' in tpl
+    def test_people_is_a_strip_that_reads_as_a_disclosure(self, tpl):
+        """The strip IS the control: the whole row opens the roster, with a
+        caret in the same place the group rows put theirs. It was a line of
+        text with a "Manage" link at the far right — the one word that said
+        it opened sat in the corner a page keeps for its least important
+        control."""
+        assert '<button type="button" class="ax-who" id="ax-sec-people"' in tpl
         assert '<details class="dsec" id="ax-sec-people"' not in tpl
+        assert 'class="ax-gs__car ax-who__car"' in tpl, "the page's own caret"
+        assert 'aria-controls="ax-members"' in tpl
 
-    def test_access_has_no_shutter_of_its_own(self, tpl):
-        """Expanding a group IS the request to see what it can use."""
-        assert '<div class="dsec ax-acc" id="ax-sec-access"' in tpl
+    def test_the_grants_have_no_heading_shutter_or_subtitle(self, tpl):
+        """All three went in one pass, for one reason: each answered a
+        question the reader had already answered by getting here. Expanding
+        a group IS the request to see its grants, the heading named the only
+        thing on screen, and "What everyone above can use" restated the strip
+        directly above it — in a full row of height."""
+        assert '<div id="ax-sec-access"' in tpl
         assert '<details class="dsec" id="ax-sec-access"' not in tpl
+        assert "What everyone above can use." not in tpl
+        assert "<h3>Access</h3>" not in tpl
+
+    def test_the_tier_key_survives_beside_the_control_it_explains(self, tpl, js):
+        """It is not obvious what Optional and Automatic do, so the one
+        sentence of reference stays — on the ACCESS TIER column header."""
+        assert 'id="ax-tierkey-body"' in tpl, "the body outlives the header"
+        assert 'aria-describedby="ax-tierkey-body"' in js
+        assert "ax-colhd__key" in js
+
+    def test_the_elevation_sentence_survived_the_head_it_lived_in(self, tpl, js):
+        """Ticket 14's whole resolution: the page's only statement that the
+        mode exists and that Admin's grants apply only inside it."""
+        assert 'id="ax-access-sub" hidden' in tpl
+        assert "god-mode reaches everything" in js
+        assert "subEl.hidden = !adminSelected" in js, "an ordinary group must pay no height for it"
 
     def test_the_roster_keeps_a_disclosure_because_it_is_a_list(self, tpl):
-        assert 'id="ax-people-toggle"' in tpl
+        """The strip is the control, so the id it is addressed by is the
+        strip's own — one element, not a row with a button on the end."""
+        assert 'id="ax-sec-people"' in tpl
         assert 'id="ax-members" hidden' in tpl
 
-    def test_the_disclosures_word_matches_what_opening_it_can_do(self, js):
-        """`Everyone` and a Workspace-synced group are read-only here, so
-        the control says Show rather than Manage — the page's standing rule
-        about never offering what cannot succeed."""
-        block = js[js.index('const more = el("ax-people-toggle");') :]
-        block = block[: block.index("async function renderMembers()")]
-        assert "is_google_managed" in block and "is_everyone" in block
-        assert '"Manage" : "Show"' in block
+    def test_the_disclosure_claims_nothing_about_what_you_may_do_inside(self, js):
+        """It carried "Manage" / "Show" / "Hide" — a word that had to be
+        chosen per group (`Everyone` and a Workspace-synced group are
+        read-only) and kept in step with the open state, from 900px away. A
+        caret says "this opens" and makes no claim that needs checking."""
+        assert '"Manage" : "Show"' not in js
+        assert '.textContent = open ? "Hide"' not in js
+
+    def test_a_member_row_states_where_it_came_from_once(self, js):
+        """It was printed three times on one row: the strip's "from
+        mock_seed", a source column, and "managed by mock_seed" where the
+        Remove button would be. All three said the same word."""
+        roster = js[js.index("function rosterHtml(members)") :]
+        roster = roster[: roster.index("Member search")]
+        assert roster.count("SOURCE_LABEL") == 1
+        assert "managed by ${esc(m.source" not in roster
+
+    def test_a_group_name_in_the_resource_lens_is_a_way_into_the_group(self, js):
+        """By resource named a group and stopped there — an admin reading
+        "Data has this" could not see who is in Data, and there is no group
+        detail page to send them to (/admin/groups/<id> is a 308 back
+        here). The name is the link, because the name is what the reader is
+        looking at when the question occurs to them."""
+        assert 'class="ax-r__glink" href="?by=group&group=' in js

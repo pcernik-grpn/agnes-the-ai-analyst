@@ -123,7 +123,6 @@ class TestNoSurfaceKeepsTheOldWordsInSource:
     all.
     """
 
-
     def _source(self) -> str:
 
         return access_page_source()
@@ -164,7 +163,7 @@ class TestNoSurfaceKeepsTheOldWordsInSource:
         # growing its own copy of the labels again.
         assert src.count("tierControl(") == 1
         assert src.count("const controlCell") == 1
-        assert src.count("controlCell(") == 2      # the group lens and the bundle lens
+        assert src.count("controlCell(") == 2  # the group lens and the bundle lens
 
     def test_a_grant_of_any_kind_can_be_revoked(self):
         """A control that grants and cannot revoke is a one-way door.
@@ -202,9 +201,7 @@ class TestNoSurfaceKeepsTheOldWordsInSource:
         assert manage_cell.count("data-revoke") >= 2, (
             "Revoke must survive on the ordinary grant AND on a seeded default"
         )
-        assert "href" in manage_cell, (
-            "a grant this page cannot revoke must still point at the surface that can"
-        )
+        assert "href" in manage_cell, "a grant this page cannot revoke must still point at the surface that can"
 
     def test_simulate_speaks_the_person_s_words(self):
         src = self._source()
@@ -222,7 +219,6 @@ class TestRowsAndTheirHandlerAgree:
     rows are still `<tr>`. Nothing failed and nothing logged; the control
     just had no effect.
     """
-
 
     def _source(self) -> str:
 
@@ -257,9 +253,9 @@ class TestRowsAndTheirHandlerAgree:
         # not care about, which is a guard failing on something it was not
         # written to protect.
         row_element = re.compile(r'<div class="ax-r(?:\$\{[^{}]*\}|[^">])*"[^>]*?data-kind=')
-        assert len(row_element.findall(src)) == 2   # one per view
+        assert len(row_element.findall(src)) == 2  # one per view
         assert "<tr data-type=" not in src
-        assert 'class="ax-gs ax-gs--bb' in src             # a bundle is a group-shaped row
+        assert 'class="ax-gs ax-gs--bb' in src  # a bundle is a group-shaped row
 
 
 class TestActingOnARowDoesNotCloseIt:
@@ -273,7 +269,6 @@ class TestActingOnARowDoesNotCloseIt:
     looking at it.
     """
 
-
     def _source(self) -> str:
 
         return access_page_source()
@@ -281,8 +276,8 @@ class TestActingOnARowDoesNotCloseIt:
     def test_open_bundles_are_remembered(self):
         src = self._source()
         assert "const openBundles = new Set()" in src
-        assert "openBundles.has(bkey)" in src        # re-emitted open on render
-        assert "openBundles.add(key)" in src         # …and recorded on toggle
+        assert "openBundles.has(bkey)" in src  # re-emitted open on render
+        assert "openBundles.add(key)" in src  # …and recorded on toggle
         assert "openBundles.delete(key)" in src
 
     def test_the_group_view_re_emits_its_open_group(self):
@@ -314,7 +309,6 @@ class TestAnEveryoneAudienceIsNotARoster:
     ladder too — where there is no `scope` column and the carrier match is
     the only available signal.
     """
-
 
     def _source(self) -> str:
 
@@ -348,9 +342,9 @@ class TestAnEveryoneAudienceIsNotARoster:
 
     def test_the_page_says_what_an_everyone_audience_reaches(self):
         src = self._source()
-        assert "every account, and anyone who joins" in src   # the audience row
-        assert "everyone, and anyone who joins" in src        # the collapsed line
-        assert "`every account · ${grants} granted`" in src   # the By group row
+        assert "every account, and anyone who joins" in src  # the audience row
+        assert "everyone, and anyone who joins" in src  # the collapsed line
+        assert "`every account · ${grants} granted`" in src  # the By group row
 
     def test_all_three_renderers_are_covered(self):
         """Three renderers made the same claim, in three views.
@@ -389,7 +383,6 @@ class TestTheGrantListSplitsOnWhatCanBeActedOn:
     re-assert, so grouping by authorship would file the Library shares an
     admin most often comes here to check under "not yours".
     """
-
 
     def _source(self) -> str:
 
@@ -446,7 +439,6 @@ class TestGivingSomethingToEveryoneIsAnExplicitChoice:
     that key.
     """
 
-
     def _source(self) -> str:
 
         return access_page_source()
@@ -500,9 +492,12 @@ class TestGivingSomethingToEveryoneIsAnExplicitChoice:
         # against — rather than hand-built in writeGrant. Same guarantee,
         # one home.
         assert "overview.grants.push(_rowFromResponse(created));" in src
-        f = src[src.index("function _rowFromResponse(g)"):]
+        f = src[src.index("function _rowFromResponse(g)") :]
         f = f[: f.index("\n  }", 0) + 4]
-        assert 'audience: g.audience ?? ((g.scope === "everyone" || (cid && g.group_id === cid)) ? "everyone" : g.group_id),' in f
+        assert (
+            'audience: g.audience ?? ((g.scope === "everyone" || (cid && g.group_id === cid)) ? "everyone" : g.group_id),'
+            in f
+        )
 
     def test_the_sentinel_counts_as_every_account(self):
         """It is not in `overview.groups`, so a lookup silently drops it.
@@ -534,7 +529,6 @@ class TestEveryoneIsNotInTheGroupList:
     with the first.
     """
 
-
     def _source(self) -> str:
 
         return access_page_source()
@@ -557,10 +551,10 @@ class TestEveryoneIsNotInTheGroupList:
 
     def test_the_entry_carries_no_roster(self):
         src = self._source()
-        entry = src[src.index("const everyoneEntry = cid"):]
+        entry = src[src.index("const everyoneEntry = cid") :]
         entry = entry[: entry.index("host.innerHTML")]
         assert "member_count" not in entry
-        assert "data-gmenu" not in entry     # no rename/delete: it is neither
+        assert "data-gmenu" not in entry  # no rename/delete: it is neither
         assert "every account ·" in entry
 
     def test_the_copy_beside_it_does_not_say_group(self):
@@ -592,7 +586,6 @@ class TestThePickerAsksAboutTheTierInsteadOfDeciding:
     selection contains something the tier can act on: a control that cannot
     act is what this effort keeps removing.
     """
-
 
     def _source(self) -> str:
 
@@ -627,7 +620,7 @@ class TestThePickerAsksAboutTheTierInsteadOfDeciding:
         src = self._source()
         assert "function paintPickerTier() {" in src
         assert "? (chosen.length > 0 && TIERED.has(pickerState.bundle.type))" in src
-        assert ": chosen.some((k) => TIERED.has(k.slice(0, k.indexOf(\":\"))));" in src
+        assert ': chosen.some((k) => TIERED.has(k.slice(0, k.indexOf(":"))));' in src
 
     def test_neither_subtitle_still_announces_the_answer(self):
         """Checked on the ASSIGNMENTS, not on the whole file.
@@ -650,7 +643,7 @@ class TestThePickerAsksAboutTheTierInsteadOfDeciding:
         """Every field, every time — a literal that forgets one leaves the
         painter reading a stale answer into the next write."""
         src = self._source()
-        assert src.count('tier: "available",') == 2   # one per picker mode
+        assert src.count('tier: "available",') == 2  # one per picker mode
 
 
 class TestTheAddControlsAreButtons:
@@ -666,7 +659,6 @@ class TestTheAddControlsAreButtons:
     later block can undo it again. Filled and bordered, the control has
     nothing left to align to, so riding the table's columns bought nothing.
     """
-
 
     def _source(self) -> str:
 
@@ -730,7 +722,6 @@ class TestATierControlIsDrawnOnlyWhereItCanAct:
     offered as a one-button control.
     """
 
-
     def _source(self) -> str:
 
         return access_page_source()
@@ -772,8 +763,8 @@ class TestATierControlIsDrawnOnlyWhereItCanAct:
         Everyone. Pinning both call sites is what stops that recurring here.
         """
         src = self._source()
-        assert src.count("publisherKind: i.publisher_kind") == 1      # the group's grant list
-        assert src.count("publisherKind: r.i.publisher_kind") == 1    # By resource's audience row
+        assert src.count("publisherKind: i.publisher_kind") == 1  # the group's grant list
+        assert src.count("publisherKind: r.i.publisher_kind") == 1  # By resource's audience row
 
 
 class TestTheNameColumnHasAFloor:
@@ -783,14 +774,13 @@ class TestTheNameColumnHasAFloor:
     reach column yields first now, and its text wraps rather than truncates.
     """
 
-
     def _source(self) -> str:
 
         return access_page_source()
 
     def test_the_by_resource_name_track_has_a_minimum(self):
         src = self._source()
-        rule = src[src.index(".ax-gs--bb .ax-colhd,\n  .ax-gs--bb .ax-r {"):]
+        rule = src[src.index(".ax-gs--bb .ax-colhd,\n  .ax-gs--bb .ax-r {") :]
         rule = rule[: rule.index("}")]
         assert "minmax(7rem, 1fr)" in rule, "the name track must not be allowed to collapse to zero"
         assert "minmax(6rem, 10rem)" in rule, "the reach track is the one that yields"
@@ -806,7 +796,6 @@ class TestThePersonTabSaysWhatKindOfTabItIs:
     keep it in the strip — demoting it would trade discoverability for a
     tidier model — so the strip says what makes it a different kind.
     """
-
 
     def _source(self) -> str:
 
@@ -834,7 +823,6 @@ class TestTheAdminGroupNamesTheModeItsGrantsDependOn:
     the tier is chosen; not a banner.
     """
 
-
     def _source(self) -> str:
 
         return access_page_source()
@@ -844,13 +832,20 @@ class TestTheAdminGroupNamesTheModeItsGrantsDependOn:
 
     def test_the_admin_group_gets_the_mode_sentence_and_nobody_else_does(self):
         src = self._source()
-        assert "What admins can use with Admin mode paused." in src
+        assert "what admins can use with Admin mode paused." in src
         # Keyed on the same test addMember uses for the god-mode confirm, so
         # the two surfaces cannot disagree about which group is Admin.
         assert '(_selGrp.is_admin === true || _selGrp.name === "Admin")' in src
-        # The other two audiences keep their own sentences.
-        assert '"What every account can use."' in src
-        assert '"What everyone above can use."' in src
+        # The other two audiences have no sentence any more, and that is the
+        # point of the reduction rather than a loss. "What everyone above can
+        # use" restated the people strip directly above it and "What every
+        # account can use" restated the Everyone row's own line, each in a
+        # full row of height. What is left is the one thing only this page
+        # can say — so the line renders for Admin and is HIDDEN otherwise,
+        # rather than filled with a caption for the thing beside it.
+        assert '"What every account can use."' not in src
+        assert '"What everyone above can use."' not in src
+        assert "subEl.hidden = !adminSelected" in src
 
     def test_the_route_really_does_lock_a_paused_admin_out(self):
         """The reduction rests on this. If /admin/access ever stops being
@@ -874,7 +869,6 @@ class TestInheritedRowsCollapseToOneLine:
     They are one line now, at the end of Set elsewhere, pointing at the
     Everyone audience where they can actually be acted on.
     """
-
 
     def _source(self) -> str:
 
@@ -924,7 +918,6 @@ class TestReachIsTheServersNumber:
     never blanks, and it does not get the last word.
     """
 
-
     def _source(self) -> str:
 
         return access_page_source()
@@ -948,11 +941,11 @@ class TestReachIsTheServersNumber:
     def test_an_unreachable_server_leaves_the_estimate(self):
         src = self._source()
         assert "if (count == null) return;" in src
-        assert ".catch(() => null);" in src[src.index("function fetchReach"):]
+        assert ".catch(() => null);" in src[src.index("function fetchReach") :]
 
     def test_the_same_set_is_asked_once(self):
         src = self._source()
-        f = src[src.index("function fetchReach"):]
+        f = src[src.index("function fetchReach") :]
         f = f[: f.index("\n  }", f.index("return p;"))]
         assert "_reachCache.has(key)" in f and "_reachCache.set(key, p);" in f
         assert 'const key = groupIds.slice().sort().join(",");' in f
@@ -964,7 +957,6 @@ class TestTheRosterNoLongerShipsToTheBrowser:
     search-by-member. Both are answered by the server now, and the payload no
     longer grows with headcount.
     """
-
 
     def _source(self) -> str:
 
@@ -980,7 +972,7 @@ class TestTheRosterNoLongerShipsToTheBrowser:
 
     def test_the_member_search_asks_the_server_once_per_query(self):
         src = self._source()
-        f = src[src.index("function fetchMemberGroups(q)"):]
+        f = src[src.index("function fetchMemberGroups(q)") :]
         f = f[: f.index("\n  }\n", f.index("return _memberCache"))]
         assert "_memberCache.has(q)" in f and "_memberCache.set(q," in f
         assert "if (!q || q.length < 2)" in f, "the two-character floor is applied before asking"
@@ -1020,7 +1012,6 @@ class TestAnMcpSourceRowStatesItsSecondCondition:
     visible server with nothing usable in it.
     """
 
-
     def _source(self) -> str:
 
         return access_page_source()
@@ -1053,7 +1044,6 @@ class TestTheLocalCopyKnowsWhenItIsStale:
     returning to the tab refetches a copy old enough to matter.
     """
 
-
     def _source(self) -> str:
 
         return access_page_source()
@@ -1071,7 +1061,7 @@ class TestTheLocalCopyKnowsWhenItIsStale:
 
     def test_a_404_on_a_shown_row_is_news_on_both_write_paths(self):
         src = self._source()
-        assert src.count('await changedElsewhere("That grant");') == 2   # PUT and DELETE
+        assert src.count('await changedElsewhere("That grant");') == 2  # PUT and DELETE
         assert src.count('throw new Error("changed_elsewhere");') == 2
 
     def test_no_caller_paints_over_the_sentence(self):
@@ -1080,8 +1070,8 @@ class TestTheLocalCopyKnowsWhenItIsStale:
         sentence changedElsewhere had just shown. Every caller must swallow
         the sentinel."""
         src = self._source()
-        assert src.count('if (err.message === "changed_elsewhere") return;') == 2   # tier click, checkbox
-        assert 'if (err.message === "changed_elsewhere") { done++; continue; }' in src   # the bulk loop
+        assert src.count('if (err.message === "changed_elsewhere") return;') == 2  # tier click, checkbox
+        assert 'if (err.message === "changed_elsewhere") { done++; continue; }' in src  # the bulk loop
         # And the bulk loop still counts a real failure — the repair that put
         # `failed++` back after a one-line catch was mangled into a comment.
         i = src.index('if (err.message === "changed_elsewhere") { done++; continue; }')
@@ -1105,7 +1095,6 @@ class TestRemovingAMemoryDomainGrantIsNotCalledRevoke:
     restrict, or leave this page, is a permission-model question deferred.
     """
 
-
     def _source(self) -> str:
 
         return access_page_source()
@@ -1113,7 +1102,9 @@ class TestRemovingAMemoryDomainGrantIsNotCalledRevoke:
     def test_the_act_is_named_for_what_it_does(self):
         src = self._source()
         assert 'const ACT_WORD = (typeKey) => (typeKey === "memory_domain" ? "Stop revealing" : "Revoke");' in src
-        cell = src[src.index("const manageCell = (o) => {"): src.index("\n  };", src.index("const manageCell = (o) => {"))]
+        cell = src[
+            src.index("const manageCell = (o) => {") : src.index("\n  };", src.index("const manageCell = (o) => {"))
+        ]
         assert cell.count("data-revoke>${act}</button>") == 2
         assert "data-revoke>Revoke</button>" not in cell
 
@@ -1142,7 +1133,7 @@ class TestRemovingAMemoryDomainGrantIsNotCalledRevoke:
         src = self._source()
         assert ".ax-by__tool { flex-direction: column" not in src
         assert '.ax-by__kind::before { content: "·";' in src
-        assert ".ax-by__kind { display: none; }" in src   # inside the narrow-strip media query
+        assert ".ax-by__kind { display: none; }" in src  # inside the narrow-strip media query
 
 
 class TestAStoreEntityIsATieredKind:
@@ -1155,14 +1146,13 @@ class TestAStoreEntityIsATieredKind:
     why this one exists.
     """
 
-
     def _source(self) -> str:
 
         return access_page_source()
 
     def test_store_entity_is_in_the_tiered_set(self):
         src = self._source()
-        line = src[src.index("const TIERED = new Set(["):]
+        line = src[src.index("const TIERED = new Set([") :]
         line = line[: line.index("]);")]
         assert '"store_entity"' in line, "without this the whole F8 branch is unreachable"
 
@@ -1170,7 +1160,10 @@ class TestAStoreEntityIsATieredKind:
         """The row's rule, applied at write time too — otherwise a batch with
         Automatic chosen fails on click with the server's 422."""
         src = self._source()
-        assert 'const userSkill = type === "store_entity" && ((itemOf(type, rid) || {}).publisher_kind || "user") !== "organization";' in src
+        assert (
+            'const userSkill = type === "store_entity" && ((itemOf(type, rid) || {}).publisher_kind || "user") !== "organization";'
+            in src
+        )
         assert 'const tier = TIERED.has(type) && !userSkill ? (pickerState.tier || "available") : "available";' in src
 
 
@@ -1184,14 +1177,13 @@ class TestASharedRowNamesTheSharer:
     the same batch reader the collection projection already uses for owners.
     """
 
-
     def _source(self) -> str:
 
         return access_page_source()
 
     def test_the_page_prefers_the_resolved_name(self):
         src = self._source()
-        f = src[src.index("function whoGranted(grant) {"):]
+        f = src[src.index("function whoGranted(grant) {") :]
         f = f[: f.index("\n  }", 0)]
         assert "grant.assigned_by_name" in f
         assert f.index("assigned_by_name") < f.index("const raw = grant && grant.assigned_by;")
@@ -1211,7 +1203,6 @@ class TestAnOwnerSharedRowSaysWhoAndGoesSomewhereReal:
     to the owner by id, not by guessing from names, so "owned by" is said
     once, or not at all when they are the same person.
     """
-
 
     def _source(self) -> str:
 
@@ -1242,14 +1233,14 @@ class TestAnOwnerSharedRowSaysWhoAndGoesSomewhereReal:
         assert "Shared by <b>${esc(who)}</b>" in src
         assert "} else if (owned && who) {" in src
         assert "Granted by <b>${esc(who)}</b>" in src
-        assert "owned by ${esc(i.owner_email)}" in src[src.index("Granted by <b>"):][:200]
+        assert "owned by ${esc(i.owner_email)}" in src[src.index("Granted by <b>") :][:200]
 
     def test_sharer_and_owner_are_compared_by_id(self):
         src = self._source()
         assert "grant.assigned_by === i.owner_user_id" in src
-        assert 'itemProvenance(i, { ownerNamed: !!(owned && who) })' in src
+        assert "itemProvenance(i, { ownerNamed: !!(owned && who) })" in src
         assert "if (i.owner_email && !(opts && opts.ownerNamed))" in src
-        assert 'split("@")[0]' not in src[src.index("const sharerIsOwner"): src.index("const sharerIsOwner") + 600]
+        assert 'split("@")[0]' not in src[src.index("const sharerIsOwner") : src.index("const sharerIsOwner") + 600]
 
 
 class TestSharingBesideAnEveryoneGrantSaysWhatItWouldDo:
@@ -1260,7 +1251,6 @@ class TestSharingBesideAnEveryoneGrantSaysWhatItWouldDo:
     tiered kind that is the offer, named; on an untiered kind a group grant
     would change nothing, and nothing is offered.
     """
-
 
     def _source(self) -> str:
 
@@ -1273,8 +1263,14 @@ class TestSharingBesideAnEveryoneGrantSaysWhatItWouldDo:
 
     def test_tiered_kinds_offer_a_different_tier_and_say_so(self):
         src = self._source()
-        assert '${evGrant ? "Set a different tier for a group" : nobody ? "Share it with a group" : "Share with another group"}' in src
-        assert "if (evGrant) return `everyone already has it as ${evTier} — a group can get it as ${otherTier} instead`;" in src
+        assert (
+            '${evGrant ? "Set a different tier for a group" : nobody ? "Share it with a group" : "Share with another group"}'
+            in src
+        )
+        assert (
+            "if (evGrant) return `everyone already has it as ${evTier} — a group can get it as ${otherTier} instead`;"
+            in src
+        )
 
     def test_the_old_copy_survives_where_no_everyone_grant_exists(self):
         src = self._source()

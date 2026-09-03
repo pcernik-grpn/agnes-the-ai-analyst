@@ -786,25 +786,54 @@
      to right in the order the questions are asked. The description takes
      the flexible width because it is the only part whose length varies;
      everything else is fixed and cannot be pushed off the line. */
-  .ax-pstrip { display: flex; align-items: center; gap: 10px;
-    padding: 12px 2px 12px 0; border-bottom: 1px solid var(--ds-border); }
-  .ax-pstrip__ico { display: inline-flex; color: var(--ds-text-muted); flex: 0 0 auto; }
-  .ax-pstrip__n { font-weight: 600; font-size: 13px; color: var(--ds-text); flex: 0 0 auto; }
+  .ax-who { display: flex; align-items: center; gap: 10px; width: 100%;
+    padding: 12px 8px 12px 4px; border: 0; border-bottom: 1px solid var(--ds-border);
+    background: none; font: inherit; text-align: left; cursor: pointer;
+    border-radius: 8px 8px 0 0; }
+  .ax-who:hover { background: var(--ds-surface-hover); }
+  .ax-who:focus-visible { outline: 2px solid var(--ds-primary); outline-offset: -2px; }
+  /* The same caret the group rows use, turned by the same rule. A reader who
+     has opened one row on this page already knows what it means. */
+  .ax-who__car { flex: 0 0 auto; color: var(--ds-text-muted);
+    transition: transform .15s ease; display: inline-block; }
+  .ax-who[aria-expanded="true"] .ax-who__car { transform: rotate(90deg); }
+  @media (prefers-reduced-motion: reduce) { .ax-who__car { transition: none; } }
+  .ax-who__ico { display: inline-flex; color: var(--ds-text-muted); flex: 0 0 auto; }
+  .ax-who__n { font-weight: 600; font-size: 13px; color: var(--ds-text); flex: 0 0 auto; }
   /* The group's own sentence. Muted and italic ONLY when it is the
      description — the generic fallback and the state lines are neither,
      because italics on boilerplate reads as emphasis on nothing. One line,
      clipped: the full text is the row's `title` and the group's own page. */
-  .ax-pstrip__sub { min-width: 0; flex: 1 1 auto; font-size: 12.5px;
+  .ax-who__sub { min-width: 0; flex: 1 1 auto; font-size: 12.5px;
     color: var(--ds-text-muted); overflow: hidden; text-overflow: ellipsis;
     white-space: nowrap; }
-  .ax-pstrip__sub.is-own { font-style: italic; }
-  .ax-pstrip__more { flex: 0 0 auto; background: none; border: 0; padding: 4px 8px;
-    font: inherit; font-size: 12.5px; color: var(--ds-primary); cursor: pointer;
-    border-radius: 6px; }
-  .ax-pstrip__more:hover { background: var(--ds-surface-hover); }
-  .ax-pstrip__more[hidden] { display: none; }
-  .ax-pstrip__body[hidden] { display: none; }
-  .ax-pstrip__body { padding: 4px 0 12px; }
+  .ax-who__sub.is-own { font-style: italic; }
+  .ax-who__body[hidden] { display: none; }
+  .ax-who__body { padding: 8px 0 12px; }
+
+  /* The Admin group's elevation sentence — the only thing left of the
+     Access section's subtitle, and the one case where it says something
+     only this page can say. */
+  .ax-elev { margin: 10px 0 0; font-size: 12.5px; color: var(--ds-text-muted); }
+  .ax-elev[hidden] { display: none; }
+
+  /* The tier key, on the column header beside the control it explains. */
+  .ax-colhd__key { margin-left: 4px; }
+
+  /* The roster's two quiet columns. `when` is a date, so it is tabular and
+     muted; `act` holds either a Remove button or the reason there is none,
+     and both belong at the row's end where an action is looked for. */
+  .ax-mem__when { color: var(--ds-text-muted); font-size: 12px; white-space: nowrap; }
+  .ax-mem__act { text-align: right; white-space: nowrap; }
+  .ax-memcap { margin: 0 0 8px; font-size: 12px; color: var(--ds-text-muted); }
+
+  /* A group's name in the By-resource list is the way to that group. It
+     stays the row's own text colour at rest — a row of blue names would
+     read as a list of links rather than a list of audiences — and shows it
+     is one on hover, the way the roster's addresses do. */
+  .ax-r__glink { color: inherit; text-decoration: none; }
+  .ax-r__glink:hover, .ax-r__glink:focus-visible {
+    color: var(--ds-primary); text-decoration: underline; }
 
   /* ── Access, without its shutter ─────────────────────────────────────
      The head still names the section and holds the tier key; what went is
@@ -2272,7 +2301,7 @@
      count of 14 and fourteen initials are not the same fact, then the
      provenance split, because "3 of these are Google's" is what decides
      whether this group is yours to edit at all. */
-  .ax-pstrip {
+  .ax-who {
     display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
     margin: 2px 0 10px;
   }
@@ -2286,8 +2315,8 @@
   }
   .ax-avs .ax-av:first-child { margin-left: 0; }
   .ax-av--more { color: var(--ds-text-muted); font-weight: 600; }
-  .ax-pstrip__f { font-size: 12.5px; color: var(--ds-text-muted); min-width: 0; }
-  .ax-pstrip__f b { font-weight: 600; color: var(--ds-text-secondary); }
+  .ax-who__f { font-size: 12.5px; color: var(--ds-text-muted); min-width: 0; }
+  .ax-who__f b { font-weight: 600; color: var(--ds-text-secondary); }
 
   /* ── The action is a button, not a row ───────────────────────────────
      This block used to span the three add controls across the list, on the
@@ -2445,7 +2474,7 @@
   .ax-people__hdrow h3 { margin: 0; }
   #ax-people-faces:empty { display: none; }
   .ax-people__hdrow .ax-av { width: 22px; height: 22px; font-size: 9px; }
-  .ax-pstrip { margin: 2px 0 10px; }
+  .ax-who { margin: 2px 0 10px; }
 
   /* ── The list has no frame ───────────────────────────────────────────
      The white surface under the rows was drawn as a bordered, rounded card
@@ -2787,70 +2816,64 @@
 
          The roster itself is genuinely a list, so it keeps a disclosure —
          but inside the strip, one level down, not wrapped around it. #}
-      <div class="ax-pstrip" id="ax-sec-people" aria-label="People in this group">
-        <span class="dsec-ico ax-pstrip__ico">{{ ico.icon('users', 14) }}</span>
+      {# The whole strip is the control, with a caret in the same place the
+         group rows put theirs. It was a line of text with a "Manage" link at
+         the far right, and nothing about it said it opened — the one word
+         that did was 900px away from the thing you would click, in the
+         corner where a page puts its least important control. A caret at the
+         head of a row is what this page already uses to mean "this opens",
+         four times over, so the roster uses it too. #}
+      <button type="button" class="ax-who" id="ax-sec-people"
+              aria-expanded="false" aria-controls="ax-members"
+              aria-label="People in this group">
+        <span class="ax-gs__car ax-who__car" aria-hidden="true">›</span>
+        <span class="dsec-ico ax-who__ico">{{ ico.icon('users', 14) }}</span>
         <span class="ax-avs" id="ax-people-faces" aria-hidden="true"></span>
-        <span class="ax-pstrip__n" id="ax-people-sum"></span>
-        <span class="ax-pstrip__sub" id="ax-people-sub">Who this group reaches.</span>
-        <button type="button" class="ax-pstrip__more" id="ax-people-toggle"
-                aria-expanded="false" aria-controls="ax-members">Manage</button>
-      </div>
-      <div class="dsec-body ax-pstrip__body" id="ax-members" hidden></div>
+        <span class="ax-who__n" id="ax-people-sum"></span>
+        <span class="ax-who__sub" id="ax-people-sub">Who this group reaches.</span>
+      </button>
+      <div class="ax-who__body" id="ax-members" hidden></div>
 
-      {# ── Access ──────────────────────────────────────────────────────
-         No disclosure around it. Expanding a group IS the request to see
-         what it can use — asking again, on a shutter labelled "Access",
-         answered nothing the group row had not already asked. What is left
-         is a head that names the section and carries the tier key, over the
-         rows themselves.
+      {# ── What the group can use ──────────────────────────────────────
+         No heading, no shutter, no subtitle. All three went in one pass and
+         for one reason: each answered a question the reader had already
+         answered by getting here. Expanding a group IS the request to see
+         its grants, so a disclosure labelled "Access" asked again; the
+         heading named the only thing on screen; and "What everyone above can
+         use" restated the strip directly above it, in a full row of height.
+
+         The tier key survives — it explains Optional/Automatic, which is not
+         obvious — and moves onto the ACCESS TIER column header, beside the
+         control it is about. `#ax-sec-access` stays as the id: it is what
+         the pane switch and the tests address.
 
          The rows inside still collapse per kind, and a big run still opens
          only when asked (see `RUN_OPEN_MAX` in admin_access.js), so removing
          this level does not put an unbounded list on screen. #}
-      <div class="dsec ax-acc" id="ax-sec-access" aria-label="What this group can use">
-        <div class="ax-acc__hd">
-          <div class="dsec-head">
-            <span class="dsec-ico">{{ ico.icon('shield-check', 14) }}</span>
-            <div class="dsec-grow">
-              <h3>Access</h3>
-              <div class="dsec-sub" id="ax-access-sub">What everyone above can use.</div>
-            </div>
-            {# The key sits immediately LEFT of the number it qualifies, and
-               opens on hover rather than on a click — one sentence of
-               reference should not cost a decision. `cursor: help` and
-               `aria-describedby` say what it is; `:focus-within` makes it
-               reachable without a pointer. #}
-            <span class="dsec-act">
-              <span class="ax-tip">
-                <span class="ax-tip__btn" tabindex="0" role="img"
-                      aria-label="What Automatic and Optional mean"
-                      aria-describedby="ax-tierkey-body">i</span>
-                <span class="ax-tip__body" id="ax-tierkey-body" role="tooltip">
-                  The grant already gave access — everyone in this group can query it
-                  now. This only decides the copy: <b>Automatic</b> keeps one on every
-                  pull and only an admin changes that; <b>Optional</b> leaves the person
-                  the choice. Admins can always reach everything regardless of grants.
-                </span>
-              </span>
-            </span>
-            <span class="dsec-sum" id="ax-access-sum"></span>
-          </div>
-        </div>
-        <div class="dsec-body">
-          {# Find one item, and choose the scope the list is showing — on one
-             line, the shape every other filtered surface in the app uses.
-             "Granted only" was a checkbox up in the section head; as a
-             segment beside the search it reads as the scope it is, and each
-             half carries its own count. #}
-          {# The All / Granted segment lived here. Once the list became the
-             group's HOLDING rather than the instance's catalogue, "all" and
-             "granted" named the same set — and the hidden per-group search
-             beside it duplicated the one in the header. Adding is now an
-             explicit act (+ Add), not a scope you browse in. #}
-          <div id="ax-resources"><div class="ax-empty">Select a group on the left.</div></div>
-        </div>
+      <div id="ax-sec-access" aria-label="What this group can use">
+        {# The tier key. It used to sit in the Access section head, beside a
+           count; that head is gone, and the key moved onto the ACCESS TIER
+           column header — beside the control it is about, which is where a
+           reader is already looking when they wonder what Optional means.
+           The tooltip BODY has to live somewhere stable, because the header
+           is rebuilt on every repaint and `aria-describedby` needs a target
+           that outlives it. So the sentence is authored here, once, and the
+           header references it by id. #}
+        <span class="ax-tip__body" id="ax-tierkey-body" role="tooltip" hidden>
+          The grant already gave access — everyone in this group can query it
+          now. This only decides the copy: <b>Automatic</b> keeps one on every
+          pull and only an admin changes that; <b>Optional</b> leaves the person
+          the choice. Admins can always reach everything regardless of grants.
+        </span>
+        {# Empty on every ordinary group, and takes no height when it is:
+           the sentence it used to carry — "What everyone above can use" —
+           restated the people strip directly above it. What survives is the
+           one case with something only this page can say: on the Admin
+           group, that these grants apply while Admin mode is PAUSED, and
+           that god-mode reaches everything while it is not. (Ticket 14.) #}
+        <p class="ax-elev" id="ax-access-sub" hidden></p>
+        <div id="ax-resources"><div class="ax-empty">Select a group on the left.</div></div>
       </div>
-  </div>
 </div>
 
 {# ── Simulate: the reason chain for one person ── #}

@@ -994,10 +994,12 @@
     if (first) first.focus();
   }
 
-  function setAccessHead(text) {
-    const sum = el("ax-access-sum");
-    if (sum) sum.textContent = text || "";
-  }
+  /* `setAccessHead()` stood here, writing "5 granted · 2 via Everyone" into
+     the Access section head. The head is gone, and so is the count: the
+     group's own row already says how much it holds, and every inherited row
+     is in the list below labelled "via Everyone →". A number summarising
+     rows that are on screen is a third place for the same fact to disagree
+     with itself. */
 
   /* One control. The header search filters the group list AND narrows what
      an open group shows — except when the group's own name is what matched,
@@ -1018,7 +1020,6 @@
     const host = el("ax-resources");
     if (!selectedGroup) {
       host.innerHTML = `<div class="ax-empty">Open a group to see what it can use.</div>`;
-      setAccessHead("");
       return;
     }
 
@@ -1028,27 +1029,11 @@
       (t) => (t.blocks || []).some((b) => (b.items || []).length));
     if (!anyItems) {
       findWrap.hidden = true;
-      setAccessHead("nothing registered");
       host.innerHTML = `<div class="ax-empty">Nothing is registered to grant yet — add a
         <a href="/admin/data-packages">data package</a> or a
         <a href="/admin/marketplaces">marketplace</a> first.</div>`;
       return;
     }
-
-    // The head answers its own question while the section is closed: how
-    // much of everything grantable this group actually holds. The same two
-    // numbers label the scope segments, so the control says what picking it
-    // would show before you pick it.
-    const direct = grantsFor(selectedGroup, { directOnly: true }).length;
-    const viaEveryone = grantsFor(selectedGroup).length - direct;
-    // "7 of 25" counted the instance's whole grantable surface — a
-    // denominator this list stopped showing when it became the holding.
-    // What it holds is the number. The inherited count rides alongside
-    // rather than being folded in: "10 granted" for a group with 7 of its
-    // own would be a different claim than the one the rows support.
-    setAccessHead(viaEveryone
-      ? `${direct} granted · ${viaEveryone} via Everyone`
-      : `${direct} granted`);
 
     const types = (overview.resources || []).slice().sort((a, b) => {
       const al = a.type_key === LEAD_TYPE ? 0 : 1;
@@ -1229,13 +1214,18 @@
        One sentence, here, where the tier is chosen; not a banner. */
     const _selGrp = (overview.groups || []).find((g) => g.id === selectedGroup);
     const adminSelected = !!_selGrp && (_selGrp.is_admin === true || _selGrp.name === "Admin");
+    /* The generic halves of this went with the Access head — "What everyone
+       above can use" was a caption for the strip above it. The Admin case
+       stays: it is the page's only statement that the elevation mode exists
+       and that Admin's grants apply only inside it, which is ticket 14's
+       whole resolution. Hidden rather than emptied, so an ordinary group
+       pays no height for it. */
     const subEl = el("ax-access-sub");
     if (subEl) {
       subEl.textContent = adminSelected
-        ? "What admins can use with Admin mode paused. While it is on, god-mode reaches everything regardless of these."
-        : scopeSelected
-          ? "What every account can use."
-          : "What everyone above can use.";
+        ? "These are what admins can use with Admin mode paused. While it is on, god-mode reaches everything regardless of them."
+        : "";
+      subEl.hidden = !adminSelected;
     }
 
     const sectionOf = (grant) =>
@@ -1343,7 +1333,6 @@
         <span class="ax-add__plus" aria-hidden="true">+</span>
         <span class="ax-add__body">
           <span class="ax-add__label">${scopeSelected ? "Add for everyone" : "Add to this group"}</span>
-          <span class="ax-add__hint">packages, memory, plugins, tables — anything grantable</span>
         </span>
       </button>`;
 
@@ -1364,7 +1353,7 @@
     const colhd = sections ? `
       <div class="ax-colhd">
         <span>Kind</span><span>${scopeSelected ? "What every account gets" : "What the group gets"}</span>
-        <span>Access tier</span><span class="ax-colhd__u">Manage</span>
+        <span>Access tier <span class="ax-tip ax-colhd__key"><span class="ax-tip__btn" tabindex="0" role="img" aria-label="What Automatic and Optional mean" aria-describedby="ax-tierkey-body">i</span></span></span><span class="ax-colhd__u">Manage</span>
       </div>` : "";
 
     /* Advanced is gone too. It was the same browsing tree one disclosure
@@ -1606,21 +1595,13 @@
     // what keeps a previous group's faces from lingering on the next one.
     const f = el("ax-people-faces");
     if (f) f.innerHTML = faces || "";
-    /* The roster's own control. Its word has to match what opening it can
-       do — the page's standing rule about never offering what cannot
-       succeed. `Everyone` and a Workspace-synced group are read-only here
-       (membership is decided in the seed or in Workspace), so on those it
-       says Show, not Manage. */
-    const more = el("ax-people-toggle");
-    if (more) {
-      const g = (overview && overview.groups || []).find((x) => x.id === selectedGroup);
-      const editable = !!g && !g.is_everyone && !g.is_google_managed
-        && !(g.is_system && g.name === "Everyone");
-      more.hidden = !g;
-      more.dataset.verb = editable ? "manage" : "show";
-      const open = more.getAttribute("aria-expanded") === "true";
-      more.textContent = open ? "Hide" : (editable ? "Manage" : "Show");
-    }
+    /* The strip IS the control now, so there is no word to keep in step with
+       what opening it can do — a caret says "this opens" and claims nothing
+       about what you may do inside. (It carried "Manage" / "Show" / "Hide",
+       which had to be chosen per group, kept in step with the open state,
+       and still sat 900px from the row it belonged to.) */
+    const more = el("ax-sec-people");
+    if (more) more.hidden = !selectedGroup;
   }
 
   async function renderMembers() {
@@ -1800,7 +1781,13 @@
        they can be removed here), so the number is what goes. */
     const solo = facts.length === 1 && !off;
     const line = solo ? facts[0].replace(/^<b>\d+<\/b>\s*/, "") : facts.join(" · ");
-    return `<div class="ax-pstrip"><div class="ax-pstrip__f">${line}</div></div>`;
+    /* A caption for the table under it, not a row of its own. It read as a
+       stray line ("from mock_seed") floating between the strip and the
+       search box; what it actually says is where this group's membership is
+       decided, which is the sentence that explains why most rows have no
+       Remove. Now that each row names its own state, this is the only place
+       the SOURCE is named, so it stays — as a caption, phrased as one. */
+    return `<p class="ax-memcap">Membership ${line}.</p>`;
   }
 
   /* The roster: the retired detail page's member table, columns and all —
@@ -1811,16 +1798,23 @@
       // Only admin-added membership is ours to undo. Google sync and the
       // system seeds own theirs — the API refuses the write, so the row says
       // who to talk to instead of offering a button that 4xxs.
+      /* Where a member came from was printed THREE times on one row — as
+         the strip's "from mock_seed" above the table, as a source column,
+         and again as "managed by mock_seed" where the Remove button would
+         be. All three said the same word. What each was for is different
+         though: the strip says where the group's membership comes from
+         (once, for the group), and the row needs to say why THIS person has
+         no Remove — but only when that is the case, and only as the reason
+         the button is missing. The middle column had no job at all. */
       const act = m.source === "admin"
         ? `<button type="button" class="btn btn-secondary btn-sm" data-rmmember="${esc(m.user_id)}">Remove</button>`
-        : `<span class="ax-src ax-src--locked">managed by ${esc(m.source || "the system")}</span>`;
+        : `<span class="ax-src ax-src--locked">${esc(SOURCE_LABEL[m.source] || "managed elsewhere")}</span>`;
       return `
       <tr>
         <td><a href="/admin/users/${encodeURIComponent(m.user_id)}">${esc(m.email || m.user_id)}</a></td>
         <td>${esc(m.name || "")}${m.active === false ? ` <span class="ax-src ax-src--locked">· deactivated</span>` : ""}</td>
-        <td><span class="ax-src">${esc(SOURCE_LABEL[m.source] || m.source || "")}${
-          m.added_at ? `<span class="when"> · ${esc(fmtDate(m.added_at))}</span>` : ""}</span></td>
-        <td style="text-align:right">${act}</td>
+        <td class="ax-mem__when">${m.added_at ? esc(fmtDate(m.added_at)) : ""}</td>
+        <td class="ax-mem__act">${act}</td>
       </tr>`;
     }).join("");
     /* No header row. An address, a name, how they got here and a Remove
@@ -2969,7 +2963,20 @@
         : `${g.member_count ?? 0} ${(g.member_count ?? 0) === 1 ? "person" : "people"}`;
       return `
       <div class="ax-r${isEveryone ? " ax-r--scope" : ""}" data-kind="${esc(kindToken(r.t))}" data-type="${esc(r.t.type_key)}" data-rid="${esc(r.i.resource_id)}" data-gid="${esc(gid)}">
-        <span class="ax-r__nm ax-r__nm--g">${AgnesKindGlyph.groupTile()}<span>${esc(label)}</span></span>
+        <span class="ax-r__nm ax-r__nm--g">${AgnesKindGlyph.groupTile()}${isEveryone
+          ? `<span>${esc(label)}</span>`
+          /* The group's NAME is a way into the group. By resource named a
+             group and stopped there: an admin reading "Data has this" could
+             not see who is in Data, and there is no group detail page to
+             send them to — /admin/groups/<id> is a 308 back to this page.
+             So the name goes where the answer is: the same page, By group,
+             with that group opened, which is exactly what the row's own
+             audience question needs. Not an icon or a trailing arrow — the
+             name IS the link, because the name is what the reader is
+             already looking at when the question occurs to them. */
+          : `<a class="ax-r__glink" href="?by=group&group=${encodeURIComponent(gid)}"
+                title="Open ${esc(label)} — its members and everything else it can use"
+                >${esc(label)}</a>`}</span>
         <span class="ax-r__d">${esc(detail)}${
           who ? `<span class="ax-r__sep"> · </span><span class="ax-r__who">granted by ${esc(who)}</span>` : ""}</span>
         <span class="ax-r__ctl">${controlCell(r.t.type_key, tier, { managedBy: grant.managed_by, publisherKind: r.i.publisher_kind })}</span>
@@ -3079,7 +3086,7 @@
                       ${share}
                       <div class="ax-colhd">
                         <span>Group</span><span>Who that reaches</span>
-                        <span>Access tier</span><span class="ax-colhd__u">Manage</span>
+                        <span>Access tier <span class="ax-tip ax-colhd__key"><span class="ax-tip__btn" tabindex="0" role="img" aria-label="What Automatic and Optional mean" aria-describedby="ax-tierkey-body">i</span></span></span><span class="ax-colhd__u">Manage</span>
                       </div>
                       ${r.held.map((grant) => groupRow(r, grant)).join("")}
                     </div>`;
@@ -3279,12 +3286,19 @@
      It was a permanent accent panel between the two sections (where it read
      as an alert about the members above it), then a click-to-open popover
      — which asks for a decision to read one sentence of reference. What it
-     does still need is to not reach the disclosure it sits inside: a click
-     on it would otherwise collapse the section underneath. */
-  document.querySelector(".ax-tip").addEventListener("click", (e) => {
+     does still need is to not reach whatever it sits inside: a click on it
+     would otherwise collapse the row underneath.
+
+     DELEGATED, because the key moved onto the ACCESS TIER column header
+     when the Access section head was removed — and that header is rebuilt on
+     every repaint. Binding to the element found at module-eval time threw on
+     a null (there is no `.ax-tip` in the document until the first render),
+     which killed the whole module before it could boot. */
+  document.addEventListener("click", (e) => {
+    if (!e.target.closest(".ax-tip")) return;
     e.stopPropagation();
     e.preventDefault();
-  });
+  }, true);
 
   /* Dismissal, once, for all three popovers on the page. Escape closes the
      topmost thing that is open; a click outside closes whichever the click
@@ -3464,15 +3478,12 @@
     // The people strip's roster disclosure. The body is rendered already —
     // this only reveals it — so there is nothing to fetch and nothing to
     // repaint, which is what keeps it instant on a large group.
-    const pplToggle = e.target.closest("#ax-people-toggle");
+    const pplToggle = e.target.closest("#ax-sec-people");
     if (pplToggle) {
       const body = el("ax-members");
       const open = pplToggle.getAttribute("aria-expanded") !== "true";
       pplToggle.setAttribute("aria-expanded", open ? "true" : "false");
       if (body) body.hidden = !open;
-      pplToggle.textContent = open
-        ? "Hide"
-        : (pplToggle.dataset.verb === "manage" ? "Manage" : "Show");
       return;
     }
 
