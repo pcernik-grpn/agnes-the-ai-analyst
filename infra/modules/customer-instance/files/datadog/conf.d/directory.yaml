@@ -35,9 +35,14 @@ instances:
   # Recursive because the dated directories are one level down; the pattern
   # keeps this to one gauge per retained day (7), well inside the check's
   # per-instance file-gauge cap.
+  #
+  # The leading */ is load-bearing: the check fnmatches the file's FULL path and
+  # its path relative to `directory`, never the bare basename, so a plain
+  # `STATUS` under a recursive walk matches nothing at all. */STATUS matches
+  # `<YYYYMMDD>/STATUS` and, deliberately, not its `PG_STATUS` sibling.
   - name: agnes_backup
     directory: /data/backups/system-duckdb
-    pattern: STATUS
+    pattern: '*/STATUS'
     recursive: true
     filegauges: true
     ignore_missing: true

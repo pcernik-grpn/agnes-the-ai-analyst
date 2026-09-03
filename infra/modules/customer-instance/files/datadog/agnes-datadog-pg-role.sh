@@ -8,15 +8,22 @@
 # volume is recreated loses the role — a timer re-converges, a boot-time step
 # would not until the next reboot.
 #
-# The password is generated once, kept root-only in /data/state, fed to psql on
-# stdin and substituted into the check config through bash parameter expansion.
-# It never appears on a command line, in the environment, or in Terraform state.
+# The password is generated once, kept root-only in a directory this feature
+# owns, fed to psql on stdin and substituted into the check config through bash
+# parameter expansion. It never appears on a command line, in the environment,
+# or in Terraform state.
+#
+# It lives on the boot disk rather than in /data/state, which is shared with the
+# app and the state applier: a monitoring add-on has no business changing the
+# ownership or mode of a directory other things depend on. Losing it to a VM
+# recreate costs nothing — this script rewrites the role's password on its next
+# run either way.
 #
 # Safe to re-run. Always exits 0: a monitoring bootstrap must never mark a
 # systemd unit failed and thereby trip the very alerting it is setting up.
 set -uo pipefail
 
-PW_FILE=/data/state/datadog-pg-password
+PW_FILE=/var/lib/agnes/datadog/pg-password
 TPL=/etc/datadog-agent/agnes-postgres.yaml.tpl
 OUT=/etc/datadog-agent/conf.d/postgres.d/conf.yaml
 
@@ -26,7 +33,11 @@ warn() { logger -t agnes-datadog-pg-role -p user.warning "$1" 2>/dev/null || tru
 command -v docker >/dev/null 2>&1 || exit 0
 
 if [ ! -s "$PW_FILE" ]; then
-    install -d -m 0700 "$(dirname "$PW_FILE")" 2>/dev/null || true
+    # mkdir -p, never `install -d`: install applies its -m to an ALREADY
+    # EXISTING directory, so the latter is a silent chmod of whatever it is
+    # pointed at.
+    mkdir -p "$(dirname "$PW_FILE")" 2>/dev/null || true
+    chmod 0700 "$(dirname "$PW_FILE")" 2>/dev/null || true
     if ! ( umask 077; openssl rand -hex 24 > "$PW_FILE" ) 2>/dev/null; then
         ( umask 077; od -An -tx1 -N24 /dev/urandom | tr -d ' \n' > "$PW_FILE" ) 2>/dev/null || true
     fi

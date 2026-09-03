@@ -255,7 +255,7 @@ def test_directory_check_covers_all_four_heartbeats():
     by_probe = {t.split(":", 1)[1]: i for i in instances for t in i["tags"] if t.startswith("agnes_probe:")}
     # The backup writes dated subdirectories, so a non-recursive walk finds no file.
     assert by_probe["backup"]["recursive"] is True
-    assert by_probe["backup"]["pattern"] == "STATUS"
+    assert by_probe["backup"]["pattern"] == "*/STATUS"
     assert by_probe["state_applier"]["pattern"] == "agnes-state-applier.tick"
     assert by_probe["auto_upgrade"]["pattern"] == "auto-upgrade.tick"
 
@@ -389,3 +389,64 @@ def test_renderer_refuses_expressions_it_would_have_to_guess_at():
         render_template("${lookup(m, k, 1)}", {})
     with pytest.raises(TemplateError):
         render_template("${nope}", {})
+
+
+def test_the_pg_role_bootstrap_never_re_modes_a_directory_it_does_not_own():
+    """`install -d -m MODE` is not `mkdir -p`: it applies MODE to an ALREADY
+    EXISTING directory. Pointed at /data/state — shared with the app and the
+    state applier, and one of this feature's own probe paths — it silently made
+    it 0700, which cut dd-agent out of the state-applier heartbeat while that
+    directory's own `exists` service check stayed green."""
+    sh = (FILES / "agnes-datadog-pg-role.sh").read_text()
+
+    pw_file = re.search(r"^PW_FILE=(\S+)$", sh, re.M).group(1)
+    assert not pw_file.startswith("/data/"), (
+        "the monitoring password must not live under a directory shared with the app"
+    )
+    assert 'mkdir -p "$(dirname "$PW_FILE")"' in sh
+
+    probe_dirs = {i["directory"] for i in yaml.safe_load((FILES / "conf.d/directory.yaml").read_text())["instances"]}
+    for line in sh.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(("install -d", "chmod ", "chown ")):
+            for probe in probe_dirs:
+                assert probe not in stripped, f"{stripped!r} changes a directory the agent has to be able to read"
+
+
+def test_the_backup_probe_pattern_matches_a_path_the_backup_actually_writes():
+    """The directory check fnmatches the file's FULL path and its path relative
+    to `directory` — never the bare basename. A plain `STATUS` under a recursive
+    walk matches nothing, and the probe then reports no metric rather than an
+    error, so a backup that stops running looks exactly like a healthy one."""
+    from fnmatch import fnmatch
+    from os.path import relpath
+
+    instances = yaml.safe_load((FILES / "conf.d/directory.yaml").read_text())["instances"]
+    backup = next(i for i in instances if "agnes_probe:backup" in i["tags"])
+    root, pattern = backup["directory"], backup["pattern"]
+
+    status = f"{root}/20260903/STATUS"  # what agnes-db-backup.sh writes, last
+    assert fnmatch(status, pattern) or fnmatch(relpath(status, root), pattern), (
+        f"{pattern!r} matches neither {status!r} nor {relpath(status, root)!r}"
+    )
+    # ...and not the PG_STATUS sibling, which would double the gauges per day.
+    pg = f"{root}/20260903/PG_STATUS"
+    assert not (fnmatch(pg, pattern) or fnmatch(relpath(pg, root), pattern))
+
+
+def test_every_other_probe_pattern_matches_the_file_it_names():
+    from fnmatch import fnmatch
+    from os.path import relpath
+
+    expected = {
+        "state_applier": "agnes-state-applier.tick",
+        "auto_upgrade": "auto-upgrade.tick",
+        "watchdog": "crash",
+    }
+    instances = yaml.safe_load((FILES / "conf.d/directory.yaml").read_text())["instances"]
+    for probe, basename in expected.items():
+        inst = next(i for i in instances if f"agnes_probe:{probe}" in i["tags"])
+        path = f"{inst['directory']}/{basename}"
+        assert fnmatch(path, inst["pattern"]) or fnmatch(relpath(path, inst["directory"]), inst["pattern"]), (
+            f"{probe}: pattern {inst['pattern']!r} does not match {basename!r}"
+        )

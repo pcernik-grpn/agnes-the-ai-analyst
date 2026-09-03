@@ -186,9 +186,13 @@ def test_the_key_is_out_of_scope_before_anything_writes_dot_env(on: str):
     unset_at = on.index("unset DD_API_KEY_VALUE")
     env_write = on.index('cat > "$APP_DIR/.env"')
     assert unset_at < env_write
-    for line_no, line in enumerate(on.splitlines(), 1):
-        if "DD_API_KEY_VALUE" in line:
-            assert line_no < env_write, f"line {line_no} touches the key after .env is written"
+    # Character offsets on BOTH sides. Comparing a line NUMBER against a
+    # character offset here is vacuously true for every possible render, which
+    # is what this assertion used to do.
+    for match in re.finditer(r"DD_API_KEY_VALUE", on):
+        assert match.start() < env_write, (
+            f"the key is still referenced at offset {match.start()}, after .env is written"
+        )
 
 
 def test_the_key_never_reaches_argv_or_the_startup_log(on: str):
@@ -252,7 +256,7 @@ def test_no_step_of_the_agent_block_can_fail_the_boot(on: str):
     assert "set -euo pipefail" not in block
     # The install subshell must chain with && (errexit is suppressed inside a
     # command that is part of an || list, so `set -e` in there buys nothing).
-    install = block[block.index("install -d -m 0755 /usr/share/keyrings") : block.index("apt-mark hold")]
+    install = block[block.index("mkdir -p /usr/share/keyrings") : block.index("apt-mark hold")]
     assert install.count("&&") >= 8
     assert '|| echo "WARNING: Datadog Agent' in block
     for risky in ("usermod -aG docker dd-agent", "systemctl restart datadog-agent"):
@@ -293,11 +297,15 @@ def test_the_off_path_is_the_only_datadog_text_in_a_disabled_render(off: str):
 @pytest.mark.parametrize("enabled", [True, False])
 def test_the_auto_upgrade_heartbeat_is_vendor_neutral_and_unconditional(enabled: bool):
     body = _render(enabled)
-    assert (
-        'CRON_LINE="$UPGRADE_SCHEDULE /usr/local/bin/agnes-auto-upgrade.sh '
-        '>> /var/log/agnes-auto-upgrade.log 2>&1; date +%s > /var/lib/agnes/auto-upgrade.tick"'
-    ) in body
-    mkdir_at = body.index("install -d -m 0755 /var/lib/agnes")
+    cron_line = next(ln for ln in body.splitlines() if ln.lstrip().startswith("CRON_LINE="))
+    assert "/usr/local/bin/agnes-auto-upgrade.sh" in cron_line
+    assert "/var/lib/agnes/auto-upgrade.tick" in cron_line
+    # cron turns an unescaped % in the command field into a newline and hands
+    # everything after it to the command as stdin, so `date +%s > file` would
+    # run as `date +` and write nothing at all — silently, because the probe
+    # that reads the file has ignore_missing set.
+    assert "%" not in cron_line.replace("\\%", ""), f"unescaped % in the crontab command field: {cron_line}"
+    mkdir_at = body.index("mkdir -p /var/lib/agnes")
     guard_at = body.index('if [ "$UPGRADE_MODE" = "auto" ]')
     assert mkdir_at < guard_at, (
         "the directory must exist even on a manual-upgrade VM, where a MISSING "

@@ -421,7 +421,7 @@ else
     if [ "$(dpkg-query -W -f='$${Version}' datadog-agent 2>/dev/null || true)" != "1:${datadog_agent_version}-1" ]; then
         echo "installing the Datadog Agent ${datadog_agent_version}..."
         (
-            install -d -m 0755 /usr/share/keyrings \
+            mkdir -p /usr/share/keyrings \
             && : > /tmp/datadog-apt-keys.asc \
             && curl -fsSL https://keys.datadoghq.com/DATADOG_APT_KEY_CURRENT.public >> /tmp/datadog-apt-keys.asc \
             && curl -fsSL https://keys.datadoghq.com/DATADOG_APT_KEY_06462314.public >> /tmp/datadog-apt-keys.asc \
@@ -1833,7 +1833,7 @@ fi
 # external monitor reading a file age needs the directory to exist even on a
 # VM pinned to manual upgrades (where a missing tick file is the answer, not an
 # error).
-install -d -m 0755 /var/lib/agnes
+mkdir -p /var/lib/agnes
 if [ "$UPGRADE_MODE" = "auto" ]; then
     # agnes-auto-upgrade.sh was already extracted to /usr/local/bin/ in
     # section 3 alongside the compose files — the host artifacts ship
@@ -1841,10 +1841,15 @@ if [ "$UPGRADE_MODE" = "auto" ]; then
     :
 
     # Install cron entry idempotently: remove any prior agnes-auto-upgrade line, then append ours.
-    # The trailing tick is a plain heartbeat: it records that the cron fired,
+    # The trailing touch is a plain heartbeat: it records that the cron fired,
     # separately from whether the tick found a new image. Any external monitor
     # can read its age; nothing on the VM depends on it.
-    CRON_LINE="$UPGRADE_SCHEDULE /usr/local/bin/agnes-auto-upgrade.sh >> /var/log/agnes-auto-upgrade.log 2>&1; date +%s > /var/lib/agnes/auto-upgrade.tick"
+    #
+    # `touch`, not `date +%s`: cron turns an unescaped % in the command field
+    # into a newline and feeds everything after it to the command as stdin, so
+    # `date +%s > file` would run as `date +` and never write anything. The
+    # probe reads the mtime, so the contents were never the point.
+    CRON_LINE="$UPGRADE_SCHEDULE /usr/local/bin/agnes-auto-upgrade.sh >> /var/log/agnes-auto-upgrade.log 2>&1; touch /var/lib/agnes/auto-upgrade.tick"
     (crontab -l 2>/dev/null | grep -v agnes-auto-upgrade || true; echo "$CRON_LINE") | crontab -
 fi
 
