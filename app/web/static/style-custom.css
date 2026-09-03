@@ -6369,8 +6369,14 @@ details.section-card > summary {
 .cld-greet[data-tod="day"] .cld-greet-ico--day,
 .cld-greet[data-tod="night"] .cld-greet-ico--night { display: inline-flex; }
 /* The one factual sentence about what this answers. Constrained to a reading
-   measure and centred with the heading above the composer. */
-.cld-lede {
+   measure and centred with the heading above the composer.
+
+   `.cld-agent-intro-role` is the same slot saying something more specific — the
+   agent's own role line, when the conversation runs as one the caller named. It
+   shares the rule rather than the class so a test that reads "the page's lede"
+   by splitting on `class="cld-lede"` cannot land on the agent block instead. */
+.cld-lede,
+.cld-agent-intro-role {
     /* The heading and this lede are one thought. `tight`, because the intro
        column's own flex gap already contributes the other half — the two
        together land on `inner`, which is the step this pair wants. */
