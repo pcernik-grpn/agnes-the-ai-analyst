@@ -388,10 +388,21 @@ class TestTheGrantListSplitsOnWhatCanBeActedOn:
 
         return access_page_source()
 
-    def test_the_two_sections_are_named_for_the_action(self):
+    def test_the_unactionable_side_is_the_one_that_is_named(self):
+        """One band, not two, and it is the one carrying news.
+
+        "Change here" sat BELOW the column header — a section heading inside
+        the table it was meant to head — and named the section that the
+        "+ Add to this group" row already heads: that row is directly above
+        the header, is the only control on the page that writes a grant, and
+        says what this section is by being there. "Set elsewhere" stays,
+        because a row a revoke here cannot remove is not otherwise announced.
+        """
         src = self._source()
-        assert 'sectionLabel("Change here")' in src
+        assert 'sectionLabel("Change here")' not in src
         assert 'sectionLabel("Set elsewhere",' in src
+        # The add row still opens the section, above the header.
+        assert "${addRow}${colhd}${sections}" in src
 
     def test_an_inherited_row_is_set_elsewhere(self):
         """The one case the server's `section` field cannot describe.
@@ -411,7 +422,10 @@ class TestTheGrantListSplitsOnWhatCanBeActedOn:
         cell (`via Everyone →`), on the row, not by a band above it.
         """
         src = self._source()
-        assert "(changeHere && setElsewhere)" in src
+        # Now expressed the other way round — the label rides `setElsewhere`
+        # rather than the pair — because there is only one label left.
+        assert "const sections = changeHere" in src
+        assert "(setElsewhere\n        ? sectionLabel" in src
 
     def test_one_vocabulary_for_the_actionable_side(self):
         """The section and the row's own reason must not use two phrasings."""
@@ -664,19 +678,32 @@ class TestTheAddControlsAreButtons:
 
         return access_page_source()
 
-    def test_no_add_rule_sets_a_full_width(self):
-        """The regression is textual and it has happened twice."""
+    def test_a_full_width_tile_does_not_overflow_its_container(self):
+        """The tile IS full width now, by request — inset by 10px while every
+        row beside it ran edge to edge, it read as a card floating over the
+        list rather than the first line of it.
+
+        This guard's subject moves with it. What it was written to catch was
+        never `width: 100%` as such: it was `100%` arriving together with
+        `display: grid` + `grid-template-columns: inherit`, which put the
+        tile back on the table's column grid and its marker in the Kind
+        column. That invariant is pinned by the test below, which is
+        unchanged. What full width needs instead is `box-sizing: border-box`,
+        or 100% plus the padding overflows by 28px.
+        """
         import re
 
         src = self._source()
-        for m in re.finditer(r"\.ax-(?:add|newrow)[^{}]*\{([^{}]*)\}", src):
-            assert "width: 100%" not in m.group(1), m.group(0)[:120]
+        for m in re.finditer(r"(\.ax-(?:add|newrow)[^{}]*)\{([^{}]*)\}", src):
+            selector, body = m.group(1), m.group(2)
+            if "width: 100%" in body:
+                assert "box-sizing: border-box" in body, selector
 
     def test_the_grid_that_originated_it_is_gone(self):
         src = self._source()
         assert "grid-template-columns: inherit;\n    gap: inherit;" not in src
 
-    def test_the_last_width_declaration_wins_as_auto(self):
+    def test_every_width_declaration_agrees(self):
         """The cascade's answer, not any single rule's.
 
         Asserting that ONE rule has the last word was the wrong shape: two
@@ -697,10 +724,12 @@ class TestTheAddControlsAreButtons:
             for w in re.finditer(r"(?<!max-)(?<!min-)width:\s*([^;]+);", body):
                 widths.append((selector.strip(), w.group(1).strip()))
         assert widths, "no width declarations found; this guard needs rewriting"
-        assert widths[-1][1] == "auto", f"last word is {widths[-1]}"
-        # And nothing earlier fights it, so the next edit here does not have
-        # to know the cascade order to be safe.
-        assert all(v == "auto" for _, v in widths), widths
+        # ONE answer, whatever it is. The bug was never a particular value —
+        # it was two rules hundreds of lines apart disagreeing, so the width
+        # appeared to keep coming back on its own. Pinning agreement rather
+        # than a value means the next deliberate change to it needs one edit,
+        # and an accidental one still fails here.
+        assert len({v for _, v in widths}) == 1, widths
 
 
 class TestATierControlIsDrawnOnlyWhereItCanAct:
@@ -877,7 +906,7 @@ class TestInheritedRowsCollapseToOneLine:
     def _grant_list(self) -> str:
         src = self._source()
         start = src.index("let inheritedN = 0;")
-        return src[start : src.index("const sections = (changeHere && setElsewhere)", start)]
+        return src[start : src.index("const sections = changeHere", start)]
 
     def test_an_inherited_grant_is_counted_not_rendered(self):
         body = self._grant_list()
@@ -1267,11 +1296,28 @@ class TestSharingBesideAnEveryoneGrantSaysWhatItWouldDo:
             '${evGrant ? "Set a different tier for a group" : nobody ? "Share it with a group" : "Share with another group"}'
             in src
         )
-        assert (
-            "if (evGrant) return `everyone already has it as ${evTier} — a group can get it as ${otherTier} instead`;"
-            in src
-        )
+        assert "everyone already has it as ${" in src
+        assert "a group can get it as ${" in src
 
-    def test_the_old_copy_survives_where_no_everyone_grant_exists(self):
-        src = self._source()
-        assert '? `${left} other ${left === 1 ? "group" : "groups"} could have it`' in src
+    def test_it_is_the_only_hint_left_on_the_share_row(self):
+        """The U8 sentence stays because it says something the button
+        cannot: beside an everyone grant, a group grant does not widen
+        access — it can only carry a different TIER, and without saying so
+        the control reads as "share it again".
+
+        The other two hints went. "7 other groups could have it" counted the
+        groups that do NOT have it, which is a fact about the picker rather
+        than about this thing, and it moved with every revoke. "authored,
+        then never handed to anyone" repeated the row's own reach line
+        ("granted to nobody") two lines above it.
+        """
+        # Comments stripped: the retired sentences have to keep being NAMED
+        # in the note explaining why they went, or the next reader re-adds
+        # them. What must not survive is a string the page can render.
+        import re
+
+        src = re.sub(r"/\*.*?\*/", "", self._source(), flags=re.S)
+        src = re.sub(r"(?m)^\s*//.*$", "", src)
+        assert "could have it" not in src
+        assert "every group already has it" not in src
+        assert "authored, then never handed to anyone" not in src

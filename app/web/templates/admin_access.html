@@ -1184,7 +1184,7 @@
   }
 
   .ax-add {
-    display: inline-flex; align-items: baseline; gap: 8px; width: auto;
+    display: inline-flex; align-items: baseline; gap: 8px;
     margin-top: 14px; padding: 10px 2px; text-align: left;
     background: none; border: 0; border-top: 1px dashed var(--ds-border);
     color: var(--ds-text-link); font-size: 13px; font-weight: 600; cursor: pointer;
@@ -1892,7 +1892,7 @@
     display: inline-flex;
     align-items: center;
     gap: 8px;
-    width: auto; margin: 0;
+    margin: 0;
     padding: 10px 10px 10px 8px;
     text-align: left; background: none; border: 0;
     border-bottom: 1px solid var(--ds-border-light);
@@ -1944,7 +1944,7 @@
      the same geometry: the marker where each group's avatar sits, the label
      where each group's name sits. */
   .ax-newrow {
-    display: flex; align-items: center; gap: 12px; width: auto;
+    display: flex; align-items: center; gap: 12px;
     padding: 10px 12px 10px 10px; text-align: left;
     background: none; border: 0; border-bottom: 1px solid var(--ds-border-light);
     cursor: pointer; font: inherit;
@@ -2228,9 +2228,15 @@
      riding the table's column grid — there is nothing left to align to, and
      a marker sitting in the Kind column of a tinted box just reads as an
      indent. Marker, label, hint, in a line, at every width. */
+  /* Full width, and that is the point of the change rather than a tidy-up:
+     inset by 10px on each side while every row beside it ran edge to edge,
+     the tile read as a card floating OVER the list instead of the first
+     line OF it — and the gap was widest exactly where the eye travels from
+     the band heading to the first row. It keeps its own vertical rhythm; it
+     just stops being narrower than everything it belongs to. */
   .ax-add, .ax-table .ax-add, .ax-newrow {
     display: flex; align-items: center; gap: 10px;
-    width: auto; margin: 8px 10px; padding: 10px 14px;
+    width: 100%; box-sizing: border-box; margin: 8px 0; padding: 10px 14px;
   }
   .ax-add__plus, .ax-newrow__plus {
     flex: none; justify-self: start; margin-left: 0;
@@ -2873,8 +2879,9 @@
            that god-mode reaches everything while it is not. (Ticket 14.) #}
         <p class="ax-elev" id="ax-access-sub" hidden></p>
         <div id="ax-resources"><div class="ax-empty">Select a group on the left.</div></div>
-      </div>
-</div>
+      </div>{# /#ax-sec-access #}
+  </div>{# /.ax-work — the panel moved into whichever group row is open #}
+</div>{# /#ax-pane-edit — the sim pane is its SIBLING, never its child #}
 
 {# ── Simulate: the reason chain for one person ── #}
 <div class="ax-pane{% if _lens == 'sim' %} is-on{% endif %}" data-axpane="sim"

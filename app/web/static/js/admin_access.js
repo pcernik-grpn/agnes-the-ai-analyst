@@ -856,7 +856,6 @@
       <button type="button" class="ax-newrow" data-new-group>
         <span class="ax-newrow__plus" aria-hidden="true">+</span>
         <span class="ax-newrow__label">New group</span>
-        <span class="ax-newrow__hint">an audience to write grants against</span>
       </button>`;
     /* The everyone audience, first and outside the GROUPS / SYSTEM bands.
        First because it is the widest reach on the page and therefore the
@@ -900,9 +899,19 @@
       </details>`;
     })() : "";
 
-    host.innerHTML = everyoneEntry + newGroupRow + ((custom.length && system.length)
-      ? label("Groups") + custom.map(row).join("") + label("System") + system.map(row).join("")
-      : groups.map(row).join(""));
+    /* The action sits INSIDE the band it adds to, as that band's first row.
+       It was above the GROUPS label — between the Everyone audience and the
+       heading — where it belonged to neither: an admin scanning for the
+       groups read past a control before reaching the word "Groups", and the
+       control itself was inset while every row under it ran full width, so
+       it read as a card floating over the list rather than the first line of
+       it. Its hint went with the position: "an audience to write grants
+       against" defines the word GROUP, which the band directly above it has
+       just said. */
+    host.innerHTML = everyoneEntry + ((custom.length && system.length)
+      ? label("Groups") + newGroupRow + custom.map(row).join("")
+        + label("System") + system.map(row).join("")
+      : label("Groups") + newGroupRow + groups.map(row).join(""));
     homeWork(selectedGroup);
   }
 
@@ -1316,13 +1325,19 @@
     const sectionLabel = (t, hint) =>
       `<div class="ax-glist__label ax-gsect">${esc(t)}${
         hint ? `<span class="ax-gsect__hint">${esc(hint)}</span>` : ""}</div>`;
-    const sections = (changeHere && setElsewhere)
-      ? sectionLabel("Change here")
-        + changeHere
-        + sectionLabel("Set elsewhere",
+    /* "Change here" is gone as a band. It sat BELOW the column header,
+       which put a section heading inside the table it was meant to head,
+       and it named the section the "+ Add to this group" row already heads
+       — that row sits directly above the header, is the only thing on the
+       page that writes a grant, and says what this section is by being
+       there. "Set elsewhere" stays: it marks rows a revoke here cannot
+       remove, which nothing else on screen says. */
+    const sections = changeHere
+      + (setElsewhere
+        ? sectionLabel("Set elsewhere",
             "A revoke here cannot remove these — Manage points at the surface that owns them.")
-        + setElsewhere
-      : changeHere + setElsewhere;
+        : "")
+      + setElsewhere;
 
     /* Above the list, not after it. At the foot it cost a scroll through
        everything the group already has to reach the thing that adds one
@@ -2991,21 +3006,17 @@
        open block with a table under it. They share the row component now,
        so the switch changes what the list is ABOUT, not what a list IS. */
     const section = (r) => {
-      const reach = reachOf(r.held.map((g) => g.group_id));
       const nobody = !r.held.length;
-      // NAME the groups, don't just count them. "1 group · 1 person" made the
-      // reader expand every row to learn the one thing the lens exists to
-      // answer — who can see this — and "1 group" reads identically whether
-      // that group is Everyone (the whole company) or a two-person team. Up
-      // to three are named inline; beyond that the count is the readable
-      // summary and the rows below carry the detail.
-      const heldNames = r.held
-        .map((g) => (overview.groups || []).find((x) => x.id === g.group_id))
-        .filter(Boolean)
-        .map((g) => g.name);
-      const who = heldNames.length && heldNames.length <= 3
-        ? heldNames.join(", ")
-        : `${r.held.length} ${r.held.length === 1 ? "group" : "groups"}`;
+      /* COUNT the groups. Naming up to three inline was an attempt to
+         answer "who can see this" without expanding the row, and it does
+         not survive real data: a package held by three groups printed
+         "Data, Sales, Engineering · 8 people" — a list long enough to wrap,
+         next to a headcount that is the sum of three rosters and belongs to
+         none of them. The row below names every group, with its own reach
+         and its own tier, which is the honest place for that detail. The
+         summary is the number of audiences, and the caret says the rest is
+         one click away. */
+      const who = `${r.held.length} ${r.held.length === 1 ? "group" : "groups"}`;
       /* "granted to nobody" is the honest reach of a private upload, but on
          its own it reads as an oversight to fix. Naming the owner in the same
          line says which it is: nobody else can reach this AND it belongs to
@@ -3018,11 +3029,18 @@
          printing it invites the reader to believe that number is the answer.
          Straight from the server's `audience`, so it is right on DuckDB too. */
       const reachesAll = (r.held || []).some((g) => g.audience === "everyone");
+      /* The headcount went with the group names. It is a UNION across the
+         groups holding this — a number no row below it shows, and one that
+         changes when someone joins a group that has nothing to do with this
+         thing. Worse, sitting where it did it read as the answer to "who can
+         see this", which is the question the rows below answer per group,
+         each with its own reach and its own tier. What the summary owes the
+         reader is how many audiences there are to look at. */
       const reachLine = nobody
         ? "granted to nobody"
         : reachesAll
           ? "everyone, and anyone who joins"
-          : `${who} · ${reach} ${reach === 1 ? "person" : "people"}`;
+          : who;
       const meta = prov ? `${reachLine} · ${prov}` : reachLine;
       const bkey = `${r.t.type_key}:${r.i.resource_id}`;
       return `
@@ -3063,20 +3081,25 @@
                 <span class="ax-add__plus" aria-hidden="true">+</span>
                 <span class="ax-add__body">
                   <span class="ax-add__label">${evGrant ? "Set a different tier for a group" : nobody ? "Share it with a group" : "Share with another group"}</span>
-                  <span class="ax-add__hint">${(() => {
-                    /* This hint used to be the hard-coded sentence "every
-                       group in the list below already has it" on EVERY
-                       granted bundle — a button telling you not to press it,
-                       which then opened a picker with four groups in it. It
-                       is only true when every group really does have it, so
-                       it is only said then. */
-                    if (evGrant) return `everyone already has it as ${evTier} — a group can get it as ${otherTier} instead`;
-                    if (nobody) return "authored, then never handed to anyone";
-                    const left = (overview.groups || []).length - r.held.length;
-                    return left > 0
-                      ? `${left} other ${left === 1 ? "group" : "groups"} could have it`
-                      : "every group already has it";
-                  })()}</span>
+                  ${(() => {
+                    /* One case left, and it is the one that says something
+                       the button cannot. Beside an everyone grant, a group
+                       grant does not widen access — it can only carry a
+                       DIFFERENT TIER, and without saying so the control
+                       reads as "share it again" (U8).
+
+                       The other two went. "7 other groups could have it"
+                       counted the groups that do not have it, which is a
+                       fact about the picker rather than about this thing,
+                       and it moved with every revoke. "authored, then never
+                       handed to anyone" repeated the row's own reach line
+                       ("granted to nobody") two lines below it. */
+                    if (evGrant) {
+                      return `<span class="ax-add__hint">everyone already has it as ${
+                        esc(evTier)} — a group can get it as ${esc(otherTier)} instead</span>`;
+                    }
+                    return "";
+                  })()}
                 </span>
               </button>`;
             /* Even with nothing granted the table is the right shape: a
