@@ -249,6 +249,17 @@ and opening the PR under your own identity produces the *same* diff, and its
 `pull_request` run starts immediately — the queue-for-approval rule keys on
 who opened the PR, not on what the branch contains. 0.97.0 shipped this way.
 
+**The same 405 has a second, unrelated cause: a branch that is behind.**
+Required status checks are evaluated against the CURRENT base, so a PR whose
+`test` and `docker-build` are green — but whose head predates the latest
+`main` — is refused with that identical message, with nothing waiting for
+approval. Tell the two apart by `mergeable_state`, which reads `behind` here
+and `blocked` in the unapproved-run case, and by the checks themselves:
+green-but-stale versus never reported. The fix is to update the branch (merge
+`main` in, or *Update branch*) and let CI re-run against the new base. Worth
+stating because the message names neither cause, so the one that comes to
+mind is whichever you debugged last.
+
 **Do not reach for `gh workflow run ci.yml` instead.** It looks like the
 obvious workaround and it is not one. A `workflow_dispatch` run does put
 green check-runs on the PR's head SHA — 18 of them on the 0.97.0 cut,
