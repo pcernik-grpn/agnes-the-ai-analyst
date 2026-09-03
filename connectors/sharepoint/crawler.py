@@ -2721,6 +2721,19 @@ def _convert_worker_main(conn: Connection, memory_limit_bytes: int = 0, max_outp
     """
     _reset_inherited_signal_handlers()
     _install_memory_limit(memory_limit_bytes)
+    # What THIS child has added on top of what it inherited: ``ru_maxrss``
+    # (and every other RSS figure) of a forked child starts at the parent's
+    # own resident set — 10+ GB on a crawl parent that has run for hours —
+    # so reporting the raw peak made every slot look "over the recycle
+    # ceiling" after its very first document, burn its spares within a few
+    # documents and then run unbounded for the rest of the page (live
+    # finding, 2026-09). The pool's recycle decision only ever wants the
+    # growth, so that is what every reply carries.
+    start_peak = _peak_rss_bytes()
+
+    def _growth() -> int:
+        return max(0, _peak_rss_bytes() - start_peak)
+
     while True:
         try:
             task = conn.recv()
@@ -2735,7 +2748,7 @@ def _convert_worker_main(conn: Connection, memory_limit_bytes: int = 0, max_outp
         except Exception as exc:  # noqa: BLE001 — this file's failure, not the worker's
             outcome = _ConvertOutcome(ok=False, detail_type=type(exc).__name__, detail_message=str(exc))
             try:
-                conn.send(_ConvertReply(outcome=outcome, rss_bytes=_peak_rss_bytes()))
+                conn.send(_ConvertReply(outcome=outcome, rss_bytes=_growth()))
             except OSError:
                 return
             continue
@@ -2750,12 +2763,12 @@ def _convert_worker_main(conn: Connection, memory_limit_bytes: int = 0, max_outp
                     ),
                 )
                 try:
-                    conn.send(_ConvertReply(outcome=outcome, rss_bytes=_peak_rss_bytes()))
+                    conn.send(_ConvertReply(outcome=outcome, rss_bytes=_growth()))
                 except OSError:
                     return
                 continue
         try:
-            conn.send(_ConvertReply(outcome=_ConvertOutcome(ok=True, markdown=markdown), rss_bytes=_peak_rss_bytes()))
+            conn.send(_ConvertReply(outcome=_ConvertOutcome(ok=True, markdown=markdown), rss_bytes=_growth()))
         except OSError:
             return
 
