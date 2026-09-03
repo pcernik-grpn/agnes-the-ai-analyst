@@ -203,6 +203,8 @@ __all__ = [
     "facts_llm_cache_repo",
     # SharePoint collection consolidation — Postgres-only
     "sharepoint_collection_consolidation_repo",
+    # SharePoint split-merge (crawl/facts state union) — Postgres-only
+    "sharepoint_connection_merge_repo",
 ]
 
 
@@ -718,6 +720,13 @@ _REGISTRY: dict[str, dict[str, tuple[str, str]]] = {
             "SharePointCollectionConsolidationPgRepository",
         ),
     },
+    # SharePoint split-merge (fold several sibling connections' crawl/facts
+    # state back onto one target) — POSTGRES-ONLY, A3 ratchet:
+    # `sharepoint_connection_state` (the table this reads/writes) has no
+    # DuckDB sibling itself.
+    "sharepoint_connection_merge": {
+        PG: ("src.repositories.sharepoint_connection_merge_pg", "SharePointConnectionMergePgRepository"),
+    },
 }
 
 
@@ -1193,3 +1202,7 @@ def facts_llm_cache_repo() -> Any:
 # consolidate_collections) lets it propagate to the app-wide 501 handler.
 def sharepoint_collection_consolidation_repo() -> Any:
     return _build("sharepoint_collection_consolidation")
+
+
+def sharepoint_connection_merge_repo() -> Any:
+    return _build("sharepoint_connection_merge")

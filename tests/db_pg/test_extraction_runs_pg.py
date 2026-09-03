@@ -433,3 +433,54 @@ def test_list_latest_for_connections_running_only_still_prefers_newest_running_r
 
     latest = repo.list_latest_for_connections(["conn_a"], running_only=True)
     assert latest["conn_a"]["id"] == current
+
+
+# ---------------------------------------------------------------------------
+# repoint_connection — split-merge (POST …/splits/merge) folding a sibling's
+# run history onto the surviving target connection.
+# ---------------------------------------------------------------------------
+
+
+def test_repoint_connection_moves_every_run_and_marks_merged_from(pg_engine, monkeypatch):
+    repo = _make_repo(pg_engine, monkeypatch)
+    run_id = repo.start(connection_id="sibling-1")
+    repo.finish(run_id, status="done", report={"files": 3})
+
+    moved = repo.repoint_connection(from_connection_id="sibling-1", to_connection_id="target-1")
+    assert moved == 1
+
+    row = repo.get(run_id)
+    assert row["connection_id"] == "target-1"
+    assert row["progress"]["merged_from"] == "sibling-1"
+    # Everything else about the row is untouched.
+    assert row["report"] == {"files": 3}
+    assert row["status"] == "done"
+
+
+def test_repoint_connection_never_overwrites_an_existing_merged_from(pg_engine, monkeypatch):
+    """A run already carried over by an earlier merge keeps its ORIGINAL
+    connection on `merged_from`, even if it is folded a second time (a
+    merge target that is itself later merged into a bigger target)."""
+    repo = _make_repo(pg_engine, monkeypatch)
+    run_id = repo.start(connection_id="sibling-1")
+    repo.repoint_connection(from_connection_id="sibling-1", to_connection_id="mid")
+    repo.repoint_connection(from_connection_id="mid", to_connection_id="final")
+
+    row = repo.get(run_id)
+    assert row["connection_id"] == "final"
+    assert row["progress"]["merged_from"] == "sibling-1"
+
+
+def test_repoint_connection_with_no_runs_returns_zero(pg_engine, monkeypatch):
+    repo = _make_repo(pg_engine, monkeypatch)
+    assert repo.repoint_connection(from_connection_id="never-ran", to_connection_id="target-1") == 0
+
+
+def test_repoint_connection_only_touches_the_named_source(pg_engine, monkeypatch):
+    repo = _make_repo(pg_engine, monkeypatch)
+    other = repo.start(connection_id="conn_b")
+    repo.start(connection_id="sibling-1")
+
+    repo.repoint_connection(from_connection_id="sibling-1", to_connection_id="target-1")
+
+    assert repo.get(other)["connection_id"] == "conn_b"

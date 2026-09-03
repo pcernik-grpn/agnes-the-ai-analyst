@@ -1212,6 +1212,7 @@ DELETE (`?site_id=`) forgets it again.
 - /api/admin/sharepoint/connections/{connection_id}/collections/consolidate
 - /api/admin/sharepoint/connections/{connection_id}/split-plan
 - /api/admin/sharepoint/connections/{connection_id}/splits
+- /api/admin/sharepoint/connections/{connection_id}/splits/merge
 - /api/admin/sharepoint/connections/{connection_id}/certificate
 - /api/admin/sharepoint/connections/{connection_id}/extract
 - /api/admin/sharepoint/extraction/run-due
@@ -1446,6 +1447,58 @@ skipped silently, never a failed apply, when extraction readiness
 (`sharepoint.enabled` / the `extraction` extra) is not currently satisfied.
 Returns `{"connections": [{id, name, folders: [{name, documents}],
 documents}]}`, one entry per created clone.
+
+`POST …/splits/merge` — CLI: `agnes admin sharepoint split-merge
+<target_id> --sibling <id>... | --all-siblings --target-collection-id <id>
+| --target-name <name> [--execute]`; UI: the source card's overflow menu
+("Merge split parts back into this source…") — the REVERSE of `splits`
+above: folds several sibling SharePoint connections (a large site manually
+split across them, each with its own folder scopes) back into ONE, carrying
+over every sibling's crawl/facts progress so the merged connection resumes
+INCREMENTALLY instead of re-downloading the site. Body
+`{"sibling_ids"|"all_split_siblings", "target": {"collection_id"|"name"},
+"dry_run"?}` — exactly one of `sibling_ids` (explicit connection ids) or
+`all_split_siblings` (every OTHER connection named like this one's own
+split family, `"<base> — part i/n"`, the same convention `POST …/splits`
+establishes) is required, and exactly one of `target.collection_id`/
+`target.name`. `dry_run` defaults to `true`.
+
+Refused BEFORE anything is touched: `404 connection_not_found` (target or
+an explicit sibling); `400 sibling_ids_includes_target` /
+`400 duplicate_sibling_ids`; `409 target_already_merged` /
+`409 sibling_already_merged` (a `config.merged_into` marker from an earlier
+merge); `409 crawl_or_facts_running` (any involved connection has a
+queued/running `corpus-extraction`/`sharepoint-facts-extraction` job);
+`409 acl_zones_present` (a sibling or the target carries `config.acl_zones`
+— permission-zone reconciliation is its own surface and is not folded
+here); `409 audience_class_conflict` (a sibling's `access_mode='mirrored'`
+scopes use a different audience-class vocabulary than the target's own —
+fail closed rather than silently mis-mirror); `409
+collection_referenced_by_other_connection` / `409 consolidation_conflict`
+(the collection fold itself, via the SAME repository `POST …/collections
+/consolidate` uses).
+
+`dry_run: false` performs the real merge, per-step idempotent so a retried
+call after a partial failure converges: folds every involved scope
+collection into the target collection (delegated wholesale to
+`SharePointCollectionConsolidationPgRepository.consolidate` — not
+reimplemented); unions every sibling's crawl/facts state
+(`sharepoint_connection_state`: `delta_links`/`ctags`/`failed_items`/
+`empty_items` for `kind='crawl'`, `docs` for `kind='facts'`) onto the
+target's own — disjoint keys are simply carried over, a genuine collision
+keeps the target's own `delta_links`/`ctags` entry (no per-entry freshness
+signal exists for either) or the newer entry by timestamp for
+`failed_items`/`empty_items`/`docs` (`status='done'` beats any other status
+regardless of timestamp for `docs`); re-points every sibling's
+`extraction_runs` history onto the target, marking each moved run's
+`progress.merged_from`; writes the merged, deduped (by `(source_scope_id,
+drive_id)`) scope list onto the target; marks every sibling
+`config.merged_into` with its scopes cleared — siblings are NEVER deleted,
+only marked merged-away, and their `connection_secrets` vault rows (if any)
+are left completely untouched (an admin who wants to fully remove one can
+still use the generic `DELETE /api/admin/source-connections/{id}`).
+PG-only (A3 ratchet) — `501 requires_postgres_backend` on a DuckDB-backed
+instance.
 
 `POST …/acl-sync` is the admin "sync now" trigger for the
 `sharepoint-acl-sync` job (spec §5.1) — enqueues

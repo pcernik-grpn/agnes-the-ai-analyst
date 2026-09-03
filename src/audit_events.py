@@ -736,6 +736,13 @@ CATALOG: dict[str, AuditEvent] = {
         "An admin split a SharePoint connection's site into several sibling connections, each with its own "
         "slice of the top-level folders.",
     ),
+    "sharepoint_connection.split_merge": AuditEvent(
+        "sharepoint_connection.split_merge",
+        "mutation",
+        "An admin folded several sibling SharePoint connections (a manually split site) back into one, "
+        "carrying over each sibling's crawl/facts progress and re-pointing its scopes, collections and "
+        "run history onto the target.",
+    ),
     "source_connection.chat_tools_disable": AuditEvent(
         "source_connection.chat_tools_disable",
         "mutation",

@@ -10863,6 +10863,76 @@
         "title": "SplitApplyBody",
         "type": "object"
       },
+      "SplitMergeBody": {
+        "description": "Fold several sibling SharePoint connections \u2014 a large site manually\nsplit across them, each with its own folder scopes (see\n:func:`merge_split_connections`) \u2014 back into THIS connection. Exactly\none of ``sibling_ids`` (explicit connection ids \u2014 works for ANY manual\nsplit, regardless of naming) or ``all_split_siblings`` (a convenience\nshortcut: every OTHER SharePoint connection named like ``\"<base> \u2014\npart i/n\"`` for the SAME base as this connection's own name \u2014 the\n``site_split.format_group_name`` convention ``POST \u2026/splits`` already\nestablishes) must be given. ``target`` is required \u2014 exactly one of\n``target.collection_id``/``target.name`` (see :class:`SplitMergeTarget`).\n``dry_run`` defaults to ``True`` \u2014 a caller must explicitly opt into the\nreal, data-moving merge.",
+        "properties": {
+          "all_split_siblings": {
+            "default": false,
+            "title": "All Split Siblings",
+            "type": "boolean"
+          },
+          "dry_run": {
+            "default": true,
+            "title": "Dry Run",
+            "type": "boolean"
+          },
+          "sibling_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sibling Ids"
+          },
+          "target": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SplitMergeTarget"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "title": "SplitMergeBody",
+        "type": "object"
+      },
+      "SplitMergeTarget": {
+        "description": "The ``target`` field of :class:`SplitMergeBody` \u2014 exactly one of\n``collection_id`` (an existing, live collection) or ``name`` (mint one\nnew, by name) must be given, the same XOR ``ConsolidateCollectionsBody``\nenforces for its own (differently-shaped) target fields.",
+        "properties": {
+          "collection_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Collection Id"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          }
+        },
+        "title": "SplitMergeTarget",
+        "type": "object"
+      },
       "SsoConfigBody": {
         "properties": {
           "allowed_email_domains": {
@@ -33925,7 +33995,7 @@
     },
     "/api/admin/sharepoint/connections/{connection_id}/splits": {
       "post": {
-        "description": "Apply a site split (see :func:`split_plan` above for the read-only\npreview this computes identically before creating anything): creates\n``body.n`` sibling connections, each named ``\"<source name> \u2014 part\ni/n\"`` (:func:`connectors.sharepoint.site_split.format_group_name`),\nwired to the same credential material as the source\n(:func:`_cloned_base_config`, the same helper ``POST \u2026/clone`` uses) and\ngiven its own slice of the source's top-level folders as confirmed\nscopes \u2014 the same scope-row shape and collection-minting call\n(:func:`_create_scope_collection`) ``POST \u2026/scopes/bulk`` uses, so a\nsplit clone looks identical to one built by hand through clone +\nbulk-add.\n\n``body.min_modified``, when given, is written onto EACH clone's\n``config.extraction.crawl.min_modified`` \u2014 the crawl does not read that\nkey yet (no admin-facing date filter has shipped for the crawl itself at\nthe time this endpoint was written), so today it is inert bookkeeping\nthat a near-term crawl change will start honoring under the same key,\nnot a promise this endpoint enforces itself. ``body.transport`` /\n``body.retry_mode`` are written onto ``config.extraction.facts`` \u2014 the\nexact keys ``PATCH \u2026/extraction/facts-config`` writes \u2014 so a split can\nhand every clone the same per-connection retry/transport policy in one\ncall instead of ``n`` follow-up PATCHes.\n\n**Idempotency**: refuses with ``409 split_exists`` BEFORE creating\nanything if a connection named like any of this split's target names\nalready exists (the exact names :func:`split_plan` would have shown) \u2014\na repeat ``POST`` never creates a second, name-colliding batch.\n\n``body.start=True`` enqueues each clone's ``corpus-extraction`` job\nimmediately after it is created, in creation order \u2014 the same job\n``POST \u2026/{id}/extract`` enqueues, skipped silently (never a 409/500 that\nwould make a split appear to have failed) when extraction readiness\n(``sharepoint.enabled`` / the ``extraction`` extra) is not currently\nsatisfied; the clones themselves are still created either way.\n\nReturns ``{\"connections\": [{id, name, folders: [{name, documents}],\ndocuments}]}`` \u2014 one entry per created clone, in the same order as\n``split_plan``'s own ``groups``.",
+        "description": "Apply a site split (see :func:`split_plan` above for the read-only\npreview this computes identically before creating anything): creates\n``body.n`` sibling connections, each named ``\"<source name> \u2014 part\ni/n\"`` (:func:`connectors.sharepoint.site_split.format_group_name`),\nwired to the same credential material as the source\n(:func:`_cloned_base_config`, the same helper ``POST \u2026/clone`` uses) and\ngiven its own slice of the source's top-level folders as confirmed\nscopes \u2014 the same scope-row shape and collection-minting call\n(:func:`_create_scope_collection`) ``POST \u2026/scopes/bulk`` uses, so a\nsplit clone looks identical to one built by hand through clone +\nbulk-add.\n``body.min_modified`` is written onto each clone's\n``config.extraction.crawl.min_modified`` \u2014 the exact key\n``PATCH \u2026/extraction/crawl-config`` writes and the crawl reads\n(``resolve_min_modified``), so every part crawls with the same age\nfilter from its first run. ``body.transport`` /\n``body.retry_mode`` are written onto ``config.extraction.facts`` \u2014 the\nexact keys ``PATCH \u2026/extraction/facts-config`` writes \u2014 so a split can\nhand every clone the same per-connection retry/transport policy in one\ncall instead of ``n`` follow-up PATCHes.\n\n**Idempotency**: refuses with ``409 split_exists`` BEFORE creating\nanything if a connection named like any of this split's target names\nalready exists (the exact names :func:`split_plan` would have shown) \u2014\na repeat ``POST`` never creates a second, name-colliding batch.\n\n``body.start=True`` enqueues each clone's ``corpus-extraction`` job\nimmediately after it is created, in creation order \u2014 the same job\n``POST \u2026/{id}/extract`` enqueues, skipped silently (never a 409/500 that\nwould make a split appear to have failed) when extraction readiness\n(``sharepoint.enabled`` / the ``extraction`` extra) is not currently\nsatisfied; the clones themselves are still created either way.\n\nReturns ``{\"connections\": [{id, name, folders: [{name, documents}],\ndocuments}]}`` \u2014 one entry per created clone, in the same order as\n``split_plan``'s own ``groups``.",
         "operationId": "apply_split_api_admin_sharepoint_connections__connection_id__splits_post",
         "parameters": [
           {
@@ -33991,6 +34061,79 @@
           }
         },
         "summary": "Apply Split",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/api/admin/sharepoint/connections/{connection_id}/splits/merge": {
+      "post": {
+        "description": "Fold several sibling SharePoint connections \u2014 a large site manually\nsplit across them (clones of one source, each with its own folder\nscopes; see the module docstring's \"split a large site\" entry and\n:func:`apply_split`) \u2014 back into THIS connection, carrying over every\nsibling's crawl/facts progress so the merged connection resumes\nINCREMENTALLY instead of re-downloading the site.\n\n``sibling_ids`` (explicit connection ids) or ``all_split_siblings``\n(every OTHER connection named like this one's own split family \u2014 see\n:func:`_all_split_siblings`) picks the siblings; ``400\nboth_sibling_ids_and_all_split_siblings`` / ``400\nsibling_ids_or_all_split_siblings_required`` when neither/both are\ngiven, ``400 no_siblings_found`` when ``all_split_siblings`` resolves to\nnothing. ``target`` (exactly one of ``collection_id``/``name`` \u2014 ``400\nboth_target_fields`` / ``400 target_field_required``) is the collection\nevery involved scope collection folds into, via\n:class:`~src.repositories.sharepoint_collection_consolidation_pg.\nSharePointCollectionConsolidationPgRepository` \u2014 the SAME repository\n:func:`consolidate_collections` uses, never reimplemented here.\n\nRefused BEFORE anything is touched:\n\n* ``404 connection_not_found`` \u2014 an unknown/non-sharepoint id (target or\n  an explicit sibling).\n* ``400 sibling_ids_includes_target`` / ``400 duplicate_sibling_ids`` \u2014\n  ``sibling_ids`` names ``connection_id`` itself, or the same id twice.\n* ``409 target_already_merged`` / ``409 sibling_already_merged`` \u2014 the\n  target (or a sibling) already carries a ``config.merged_into`` marker\n  from an EARLIER split-merge.\n* ``409 crawl_or_facts_running`` \u2014 any involved connection has a\n  queued/running ``corpus-extraction``/``sharepoint-facts-extraction``\n  job (:func:`_connections_with_running_jobs`) \u2014 moving state out from\n  under an active crawl would race its own in-memory bookkeeping.\n* ``409 acl_zones_present`` \u2014 a sibling (or the target) carries\n  ``config.acl_zones`` rows: permission-zone reconciliation is its own\n  surface (see :func:`consolidate_collections`'s own \"Not included\"\n  note) and this endpoint does not attempt to fold it.\n* ``409 audience_class_conflict`` \u2014 a sibling has ``access_mode\n  ='mirrored'`` scopes whose audience-class vocabulary\n  (:func:`_mirrored_audience_signature`) differs from the target's own\n  \u2014 fail closed rather than silently mis-mirror a merged scope.\n* ``409 collection_referenced_by_other_connection`` \u2014 a scope\n  collection being folded is still routed to by a connection OUTSIDE\n  this merge group (:func:`_foreign_connection_referencing_any`), same\n  posture as :func:`consolidate_collections`.\n* ``409 consolidation_conflict`` \u2014 the collection fold itself would\n  collide (duplicate ``corpus_files.path`` / ``corpus_file_sources\n  .source_stable_id``), surfaced by the SAME repository consolidate\n  uses.\n\n``dry_run`` (default ``True``) computes and returns everything the real\nmerge WOULD do \u2014 scopes that would move (deduped by ``(source_scope_id,\ndrive_id)``; a duplicate keeps whichever connection's scope was seen\nfirst, target's own winning ties), crawl/facts state that would be\ncarried and any key collisions and how they would resolve\n(:class:`~src.repositories.sharepoint_connection_merge_pg.\nSharePointConnectionMergePgRepository`), collections that would fold,\nand the same blocking conditions above \u2014 WITHOUT writing anything (a\nnamed ``target.name`` is not minted during a dry run, same rule as\n:func:`consolidate_collections`).\n\n``dry_run: false`` performs the real merge, in this order (each step\nindividually idempotent, so a retried call after a partial failure\nconverges rather than double-applying \u2014 see the module's own state-\nmerge repository docstring): mark the target's ``config.split_merge``\n``in_progress``; fold every involved scope collection into the target\ncollection; union every sibling's crawl/facts state onto the target's\nown; re-point every sibling's ``extraction_runs`` history onto the\ntarget (marking each moved run's ``progress.merged_from``); write the\nmerged, deduped scope list onto the target; mark every sibling\n``config.merged_into`` (its scopes cleared) and the target's\n``config.split_merge`` ``done``.\n\nSiblings are never deleted \u2014 only marked merged-away, scopes cleared.\nTheir ``connection_secrets`` vault rows (if any) are left completely\nuntouched: an admin who wants to fully remove a merged-away sibling can\nstill do so with the generic ``DELETE /api/admin/source-connections\n/{id}``, which already knows how to clean those up \u2014 this endpoint does\nnot reimplement that.",
+        "operationId": "merge_split_connections_api_admin_sharepoint_connections__connection_id__splits_merge_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "title": "Connection Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SplitMergeBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Merge Split Connections",
         "tags": [
           "admin"
         ]

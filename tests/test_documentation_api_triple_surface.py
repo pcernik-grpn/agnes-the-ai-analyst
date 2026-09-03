@@ -1286,6 +1286,19 @@ _EXEMPT: dict[str, str] = {
         "exemption with scopes/bulk's collection-minting exemption, both already "
         "carved out above"
     ),
+    # The reverse of `splits` above — folds several sibling connections'
+    # scopes, crawl/facts state, collections and run history back into one.
+    # Same CLI-reachable / not-MCP-exposed shape: an ops-scripting-a-large-
+    # site action combining collection-consolidate's own visibility-write
+    # exemption with clone/splits' connection-lifecycle one, neither
+    # agent-invokable today.
+    "/api/admin/sharepoint/connections/{connection_id}/splits/merge": (
+        "fold several sibling SharePoint connections (a manually split site) back into "
+        "one, carrying over crawl/facts state and folding scope collections — "
+        "CLI-reachable (agnes admin sharepoint split-merge) but deliberately not "
+        "MCP-exposed: combines collections/consolidate's visibility-write exemption "
+        "with clone/splits' connection-lifecycle one, both already carved out above"
+    ),
     "/api/admin/sharepoint/connections/{connection_id}/manual-sites": (
         "persist/forget a site the admin resolved by URL — the Sites.Selected escape "
         "hatch's other half, keeping the wizard's step-2 sites level populated across "

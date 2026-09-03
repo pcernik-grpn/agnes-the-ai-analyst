@@ -428,6 +428,54 @@ class ExtractionRunsPgRepository:
             ).first()
         return str(row[0]) if row else None
 
+    def repoint_connection(self, *, from_connection_id: str, to_connection_id: str) -> int:
+        """Re-point every run recorded under ``from_connection_id`` onto
+        ``to_connection_id`` — the split-merge operation
+        (``POST …/connections/{id}/splits/merge``) folding a sibling
+        connection's run history onto the surviving target, so an admin can
+        still see "when did this document last get crawled" after the
+        connection that originally crawled it is gone.
+
+        Each moved row's ``progress`` gains ``merged_from`` — set to
+        ``from_connection_id`` ONLY when not already present, so a run
+        already carried over by an EARLIER merge (a target that is itself
+        later folded into a bigger target) keeps recording its ORIGINAL
+        connection, not whichever connection happened to fold it most
+        recently. Nothing else about the row (``status``, ``report``,
+        ``usage``, ``checkpoint_at``, …) is touched — this is a re-point,
+        never a rewrite of what actually happened.
+
+        Idempotent: a repeat call with the same ``from_connection_id`` finds
+        no rows left to move (they already carry ``to_connection_id``) and
+        returns ``0`` rather than raising — the split-merge route's own
+        resumable-step design relies on this.
+
+        Returns the number of rows moved.
+        """
+        with self._engine.begin() as conn:
+            rows = (
+                conn.execute(
+                    sa.text("SELECT id, progress FROM extraction_runs WHERE connection_id = :from_id"),
+                    {"from_id": from_connection_id},
+                )
+                .mappings()
+                .all()
+            )
+            for row in rows:
+                progress = row["progress"]
+                if isinstance(progress, str):
+                    try:
+                        progress = json.loads(progress)
+                    except (ValueError, TypeError):
+                        progress = {}
+                progress = dict(progress or {})
+                progress.setdefault("merged_from", from_connection_id)
+                conn.execute(
+                    sa.text("UPDATE extraction_runs SET connection_id = :to_id, progress = :progress WHERE id = :id"),
+                    {"to_id": to_connection_id, "progress": json.dumps(progress), "id": row["id"]},
+                )
+        return len(rows)
+
     def last_failed(self, connection_id: str) -> Optional[Dict[str, Any]]:
         """The newest run that ended in ``failed`` — surfaced ALONGSIDE
         :meth:`last_completed`, never merged into it: that method's own

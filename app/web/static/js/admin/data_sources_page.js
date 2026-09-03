@@ -1757,6 +1757,98 @@ async function consolidateSpCollections(id) {
   }
 }
 
+/* "Merge split parts back into this source…" — the REVERSE of "Split this
+   site…"/"Consolidate collections…" above: folds every OTHER connection
+   named like this one's own split family ("<base> — part i/n") back into
+   THIS connection, carrying over each sibling's crawl/facts progress so
+   the merged connection resumes incrementally. `POST .../splits/merge` —
+   see app/api/admin_sharepoint.py::merge_split_connections.
+
+   Dry-run-first, same discipline as `consolidateSpCollections` above: the
+   FIRST call is always `dry_run: true` (nothing is touched, a NAMED
+   target is not even minted yet), rendering a per-sibling summary for the
+   admin to read before anything happens; only an explicit confirm sends
+   the second, real (`dry_run: false`) call. A blocked precondition (a
+   running crawl, ACL zones, a mismatched mirrored-scope audience, or a
+   still-shared collection) is surfaced and the flow stops. */
+async function mergeSpSplitSiblings(id) {
+  const targetName = window.prompt(
+    "Merge every sibling connection from this site's split back into this connection.\n\n" +
+      "Name the target collection everything folds into (a new one is created):",
+  );
+  if (!targetName || !targetName.trim()) return;
+  const name = targetName.trim();
+  setSourceOpen(id, true);
+  const resultEl = document.getElementById(`ds-test-${id}`);
+  if (resultEl) {
+    resultEl.className = "ds-conn-test-result show";
+    resultEl.textContent = "Checking what would be merged…";
+  }
+  const url = `/api/admin/sharepoint/connections/${encodeURIComponent(id)}/splits/merge`;
+  const body = { all_split_siblings: true, target: { name } };
+  try {
+    const previewResp = await fetch(url, {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...body, dry_run: true }),
+    });
+    const preview = await previewResp.json().catch(() => ({}));
+    if (!previewResp.ok) {
+      const msg = detailMessage(preview, "failed to preview the merge");
+      if (resultEl) { resultEl.className = "ds-conn-test-result show fail"; resultEl.textContent = "✗ " + msg; }
+      showToast(msg, false);
+      return;
+    }
+    const siblings = preview.siblings || [];
+    if (!siblings.length) {
+      const msg = "no sibling connections found (named like this one's own split family) — nothing to merge.";
+      if (resultEl) { resultEl.className = "ds-conn-test-result show fail"; resultEl.textContent = "✗ " + msg; }
+      showToast(msg, false);
+      return;
+    }
+    const blocking = preview.blocking || [];
+    if (blocking.length) {
+      const msg = `${blocking.length} scope collection(s) are still shared with a connection outside this merge — merging would be refused.`;
+      if (resultEl) { resultEl.className = "ds-conn-test-result show fail"; resultEl.textContent = "✗ " + msg; }
+      showToast(msg, false);
+      return;
+    }
+    const scopesMoved = siblings.reduce((sum, s) => sum + (s.scopes_moved || 0), 0);
+    const proceed = window.confirm(
+      `This will fold ${siblings.length} sibling connection(s) (${scopesMoved} scope(s) total) into ` +
+        `"${name}", carrying over their crawl/facts progress. This cannot be undone. Continue?`,
+    );
+    if (!proceed) {
+      if (resultEl) { resultEl.className = "ds-conn-test-result show"; resultEl.textContent = ""; }
+      return;
+    }
+    if (resultEl) resultEl.textContent = "Merging…";
+    const execResp = await fetch(url, {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...body, dry_run: false }),
+    });
+    const execBody = await execResp.json().catch(() => ({}));
+    if (execResp.ok) {
+      if (resultEl) {
+        resultEl.className = "ds-conn-test-result show ok";
+        resultEl.textContent = `✓ Merged ${(execBody.siblings || []).length} sibling connection(s) into "${execBody.target.name}".`;
+      }
+      showToast("Split parts merged back.", true);
+      await loadConnections();
+    } else {
+      const msg = detailMessage(execBody, "failed to merge the split parts");
+      if (resultEl) { resultEl.className = "ds-conn-test-result show fail"; resultEl.textContent = "✗ " + msg; }
+      showToast(msg, false);
+    }
+  } catch (e) {
+    if (resultEl) { resultEl.className = "ds-conn-test-result show fail"; resultEl.textContent = "✗ Request failed"; }
+    showToast("Request failed.", false);
+  }
+}
+
 /* Saves the "Facts policy" control (`_extRenderFactsPolicy` above) via
    `PATCH .../extraction/facts-config`
    (`app/api/admin_extraction.py::patch_extraction_facts_config`). All four
@@ -4685,6 +4777,7 @@ function _sourceMenuItems(row) {
     <button type="button" class="apg-menu__item" role="menuitem" onclick="closeSourceMenu(); toggleSpSplitRow('${id}')">Split this site…</button>
     <div class="apg-menu__sep"></div>
     <button type="button" class="apg-menu__item" role="menuitem" onclick="closeSourceMenu(); consolidateSpCollections('${id}')">Consolidate collections…</button>
+    <button type="button" class="apg-menu__item" role="menuitem" onclick="closeSourceMenu(); mergeSpSplitSiblings('${id}')">Merge split parts back into this source…</button>
     <button type="button" class="apg-menu__item" role="menuitem" onclick="closeSourceMenu(); toggleSpCertRow('${id}')">Update certificate…</button>
     <div class="apg-menu__sep"></div>
     <button type="button" class="apg-menu__item apg-menu__item--danger" role="menuitem" onclick="closeSourceMenu(); deleteConn('${id}')">Delete source</button>`;

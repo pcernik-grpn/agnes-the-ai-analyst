@@ -646,6 +646,110 @@ def split_cmd(
         typer.echo("Crawl enqueued for each connection (skipped silently if extraction is not currently usable).")
 
 
+@admin_sharepoint_app.command("split-merge")
+def split_merge_cmd(
+    target_id: str = typer.Argument(..., help="SharePoint source_connections id to merge the siblings INTO"),
+    sibling: List[str] = typer.Option(
+        [],
+        "--sibling",
+        help="A sibling connection id to fold in — repeatable. Mutually exclusive with --all-siblings.",
+    ),
+    all_siblings: bool = typer.Option(
+        False,
+        "--all-siblings",
+        help='Fold in every OTHER connection named like this one\'s own split family ("<base> — part i/n") '
+        "— the naming convention `agnes admin sharepoint split` already uses. Mutually exclusive with "
+        "--sibling.",
+    ),
+    target_collection_id: Optional[str] = typer.Option(
+        None,
+        "--target-collection-id",
+        help="Fold every involved scope collection into this EXISTING, live collection — mutually "
+        "exclusive with --target-name",
+    ),
+    target_name: Optional[str] = typer.Option(
+        None,
+        "--target-name",
+        help="Mint ONE new collection with this name as the fold target — mutually exclusive with "
+        "--target-collection-id",
+    ),
+    execute: bool = typer.Option(
+        False,
+        "--execute",
+        help="Actually perform the merge. Without this flag the call is a dry-run preview only.",
+    ),
+    as_json: bool = typer.Option(False, "--json"),
+):
+    """Fold several sibling SharePoint connections — a large site manually
+    split across them (``agnes admin sharepoint split``, or a hand-built
+    ``connection clone`` + ``scope bulk-add`` split) — back into ONE,
+    carrying over every sibling's crawl/facts progress so the merged
+    connection resumes INCREMENTALLY instead of re-downloading the site.
+    CLI counterpart to ``POST /api/admin/sharepoint/connections/
+    {target_id}/splits/merge``.
+
+    Defaults to a DRY RUN: reports the scopes/crawl-cursors/facts-docs each
+    sibling would carry over, any key collisions and how they would
+    resolve, and the collections that would fold — without touching
+    anything. Pass ``--execute`` to perform the real merge.
+
+    ``409`` if any involved connection has a running crawl/facts job, if a
+    sibling carries ACL-mirroring permission zones or a different mirrored-
+    scope audience mapping than the target, or if a scope collection being
+    folded is still referenced by a connection OUTSIDE this merge group.
+    """
+    if bool(sibling) == bool(all_siblings):
+        typer.echo("Error: pass exactly one of --sibling (repeatable) or --all-siblings", err=True)
+        raise typer.Exit(1)
+    if bool(target_collection_id) == bool(target_name):
+        typer.echo("Error: pass exactly one of --target-collection-id or --target-name", err=True)
+        raise typer.Exit(1)
+
+    body: Dict[str, Any] = {"dry_run": not execute}
+    if all_siblings:
+        body["all_split_siblings"] = True
+    else:
+        body["sibling_ids"] = list(sibling)
+    body["target"] = {"collection_id": target_collection_id} if target_collection_id else {"name": target_name}
+
+    resp = api_post(f"/api/admin/sharepoint/connections/{target_id}/splits/merge", json=body)
+    if resp.status_code != 200:
+        _fail(resp)
+    result = resp.json()
+    if as_json:
+        typer.echo(json.dumps(result, indent=2))
+        return
+
+    target = result["target"]
+    siblings = result["siblings"]
+    verb = "would fold" if result["dry_run"] else "folded"
+    prefix = "[dry run] " if result["dry_run"] else ""
+    typer.echo(
+        f"{prefix}{verb} {len(siblings)} sibling connection(s) into '{target.get('name')}' ({target.get('id')}):"
+    )
+    for s in siblings:
+        state = s.get("state") or {}
+        crawl = state.get("crawl") or {}
+        facts = state.get("facts") or {}
+        typer.echo(
+            f"  {s['name']} ({s['connection_id']}) — scopes_moved={s['scopes_moved']} "
+            f"delta_links={crawl.get('delta_links_carried', 0)} ctags={crawl.get('ctags_carried', 0)} "
+            f"failed_items={crawl.get('failed_items_carried', 0)} empty_items={crawl.get('empty_items_carried', 0)} "
+            f"facts_docs={facts.get('docs_carried', 0)}"
+        )
+        conflicts = (crawl.get("conflicts") or []) + (facts.get("conflicts") or [])
+        for c in conflicts:
+            typer.echo(f"    conflict: {c['kind']} {c['key']} -> {c['resolution']}")
+        if s.get("scopes_deduped"):
+            typer.echo(f"    duplicate scope(s) dropped (already on the target): {', '.join(s['scopes_deduped'])}")
+    for b in result.get("blocking") or []:
+        typer.echo(
+            f"  BLOCKED: {b['collection_id']} is still referenced by connection {b['connection_id']} "
+            "— merging would refuse with 409",
+            err=True,
+        )
+
+
 # ---------------------------------------------------------------------------
 # `runs` — the extraction fleet dashboard, from the terminal.
 # ---------------------------------------------------------------------------

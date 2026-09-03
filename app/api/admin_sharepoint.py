@@ -116,6 +116,15 @@ Surface:
                                                                 bulk-added scopes that ended up one
                                                                 collection per scope. See
                                                                 :func:`consolidate_collections`.
+  POST   /api/admin/sharepoint/connections/{id}/splits/merge   — the REVERSE of
+                                                                ``.../splits``: fold several
+                                                                sibling connections (a manually
+                                                                split site) back into ONE,
+                                                                carrying over crawl/facts state,
+                                                                scopes, collections and run
+                                                                history so the merged connection
+                                                                resumes incrementally. See
+                                                                :func:`merge_split_connections`.
 
 Scope rows live inside the connection's own ``config.scopes`` — a JSON list,
 no new table (``source_connections.config`` is already a JSON column on both
@@ -183,9 +192,11 @@ from src.repositories import (
     connection_secrets_repo,
     corpus_file_events_repo,
     corpus_files_repo,
+    extraction_runs_repo,
     file_corpora_repo,
     resource_grants_repo,
     sharepoint_collection_consolidation_repo,
+    sharepoint_connection_merge_repo,
     source_connections_repo,
     user_groups_repo,
 )
@@ -382,6 +393,36 @@ class ConsolidateCollectionsBody(BaseModel):
 
     target_collection_id: Optional[str] = None
     target: Optional[ConsolidateTargetSpec] = None
+    dry_run: bool = True
+
+
+class SplitMergeTarget(BaseModel):
+    """The ``target`` field of :class:`SplitMergeBody` — exactly one of
+    ``collection_id`` (an existing, live collection) or ``name`` (mint one
+    new, by name) must be given, the same XOR ``ConsolidateCollectionsBody``
+    enforces for its own (differently-shaped) target fields."""
+
+    collection_id: Optional[str] = None
+    name: Optional[str] = None
+
+
+class SplitMergeBody(BaseModel):
+    """Fold several sibling SharePoint connections — a large site manually
+    split across them, each with its own folder scopes (see
+    :func:`merge_split_connections`) — back into THIS connection. Exactly
+    one of ``sibling_ids`` (explicit connection ids — works for ANY manual
+    split, regardless of naming) or ``all_split_siblings`` (a convenience
+    shortcut: every OTHER SharePoint connection named like ``"<base> —
+    part i/n"`` for the SAME base as this connection's own name — the
+    ``site_split.format_group_name`` convention ``POST …/splits`` already
+    establishes) must be given. ``target`` is required — exactly one of
+    ``target.collection_id``/``target.name`` (see :class:`SplitMergeTarget`).
+    ``dry_run`` defaults to ``True`` — a caller must explicitly opt into the
+    real, data-moving merge."""
+
+    sibling_ids: Optional[List[str]] = None
+    all_split_siblings: bool = False
+    target: Optional[SplitMergeTarget] = None
     dry_run: bool = True
 
 
@@ -2623,6 +2664,433 @@ async def apply_split(
     )
 
     return {"connections": created}
+
+
+# ---------------------------------------------------------------------------
+# Split-merge: fold several sibling connections back into one (the reverse
+# of `apply_split`/the manual clone + scopes/bulk recipe above).
+# ---------------------------------------------------------------------------
+
+#: `site_split.format_group_name`'s own naming convention
+#: (`"<source name> — part i/n"`), parsed backwards — the ONLY thing
+#: `all_split_siblings` uses to find a target's siblings. A manually split
+#: site whose connections were never named this way needs the explicit
+#: `sibling_ids` form instead (see `SplitMergeBody`'s own docstring).
+_PART_NAME_RE = re.compile(r"^(?P<base>.+) — part \d+/\d+$")
+
+
+def _split_base_name(name: str) -> str:
+    match = _PART_NAME_RE.match(name or "")
+    return match.group("base") if match else (name or "")
+
+
+def _all_split_siblings(target_row: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Every OTHER live SharePoint connection named like the SAME split
+    family as ``target_row`` — see :data:`_PART_NAME_RE`."""
+    base = _split_base_name(target_row.get("name") or "")
+    target_id = target_row["id"]
+    return [
+        row
+        for row in source_connections_repo().list(source_type="sharepoint")
+        if row.get("id") != target_id and _split_base_name(row.get("name") or "") == base
+    ]
+
+
+def _mirrored_audience_signature(row: Dict[str, Any]) -> frozenset:
+    """The audience-class VOCABULARY this connection's ``access_mode
+    ='mirrored'`` scopes currently use — ``{(class_name, sorted(group_ids)),
+    ...}``. Two connections agree on "audience settings" when this set is
+    identical; :func:`merge_split_connections` refuses the merge otherwise
+    (fail closed — mirroring a scope under the wrong audience mapping is a
+    silent access-control bug, not a data-loss one, which is exactly the
+    kind of mistake a merge must never make on an admin's behalf)."""
+    signature: set = set()
+    for scope in _scopes(row):
+        if scope.get("access_mode") != "mirrored":
+            continue
+        for ac in scope.get("audience_classes") or []:
+            signature.add((ac.get("name"), tuple(sorted(ac.get("group_ids") or []))))
+    return frozenset(signature)
+
+
+def _foreign_connection_referencing_any(collection_id: str, *, excluded_connection_ids: set) -> Optional[str]:
+    """Same guard as :func:`_foreign_connection_referencing`, generalized to
+    exclude a WHOLE group of connections (the target + every sibling being
+    merged) rather than just one — a scope on ANY connection inside the
+    merge group routing to ``collection_id`` is not "foreign", it is
+    exactly what this merge is folding together."""
+    for connection in source_connections_repo().list(source_type="sharepoint"):
+        if connection.get("id") in excluded_connection_ids:
+            continue
+        for scope in _scopes(connection):
+            if scope.get("collection_id") == collection_id:
+                return connection.get("id")
+    return None
+
+
+#: Job kinds a split-merge refuses to run alongside (task precondition 1):
+#: moving a connection's scopes/crawl-state out from under an ACTIVELY
+#: running crawl or facts pass would race that job's own in-memory state
+#: and in-flight writes. Both carry ``connection_id`` in their payload (see
+#: ``app/worker/kinds.py``).
+_MERGE_BLOCKING_JOB_KINDS = ("corpus-extraction", "sharepoint-facts-extraction")
+
+#: Bound on the per-kind/per-status job scan `_connections_with_running_jobs`
+#: runs — an admin precondition check, not a queue-depth dashboard, so a
+#: generous but finite cap (same trade-off as `/metrics`'s queued-jobs
+#: sampler) beats an unbounded scan of the whole `jobs` table.
+_MERGE_JOB_SCAN_LIMIT = 500
+
+
+def _connections_with_running_jobs(connection_ids: List[str]) -> Dict[str, List[str]]:
+    """``{connection_id: [job_id, ...]}`` for every id in ``connection_ids``
+    that currently has a queued/running crawl or facts job — see
+    :data:`_MERGE_BLOCKING_JOB_KINDS`."""
+    from src.repositories import jobs_repo
+
+    wanted = set(connection_ids)
+    hits: Dict[str, List[str]] = {}
+    for kind in _MERGE_BLOCKING_JOB_KINDS:
+        for status in ("queued", "running"):
+            for job in jobs_repo().list(status=status, kind=kind, limit=_MERGE_JOB_SCAN_LIMIT):
+                cid = (job.get("payload_json") or {}).get("connection_id")
+                if cid in wanted:
+                    hits.setdefault(cid, []).append(job["id"])
+    return hits
+
+
+def _scope_dedupe_key(scope: Dict[str, Any]) -> Tuple[Any, Any]:
+    return (scope.get("source_scope_id"), scope.get("drive_id"))
+
+
+@router.post("/connections/{connection_id}/splits/merge")
+async def merge_split_connections(
+    connection_id: str,
+    body: SplitMergeBody,
+    user: dict = Depends(require_admin),
+):
+    """Fold several sibling SharePoint connections — a large site manually
+    split across them (clones of one source, each with its own folder
+    scopes; see the module docstring's "split a large site" entry and
+    :func:`apply_split`) — back into THIS connection, carrying over every
+    sibling's crawl/facts progress so the merged connection resumes
+    INCREMENTALLY instead of re-downloading the site.
+
+    ``sibling_ids`` (explicit connection ids) or ``all_split_siblings``
+    (every OTHER connection named like this one's own split family — see
+    :func:`_all_split_siblings`) picks the siblings; ``400
+    both_sibling_ids_and_all_split_siblings`` / ``400
+    sibling_ids_or_all_split_siblings_required`` when neither/both are
+    given, ``400 no_siblings_found`` when ``all_split_siblings`` resolves to
+    nothing. ``target`` (exactly one of ``collection_id``/``name`` — ``400
+    both_target_fields`` / ``400 target_field_required``) is the collection
+    every involved scope collection folds into, via
+    :class:`~src.repositories.sharepoint_collection_consolidation_pg.
+    SharePointCollectionConsolidationPgRepository` — the SAME repository
+    :func:`consolidate_collections` uses, never reimplemented here.
+
+    Refused BEFORE anything is touched:
+
+    * ``404 connection_not_found`` — an unknown/non-sharepoint id (target or
+      an explicit sibling).
+    * ``400 sibling_ids_includes_target`` / ``400 duplicate_sibling_ids`` —
+      ``sibling_ids`` names ``connection_id`` itself, or the same id twice.
+    * ``409 target_already_merged`` / ``409 sibling_already_merged`` — the
+      target (or a sibling) already carries a ``config.merged_into`` marker
+      from an EARLIER split-merge.
+    * ``409 crawl_or_facts_running`` — any involved connection has a
+      queued/running ``corpus-extraction``/``sharepoint-facts-extraction``
+      job (:func:`_connections_with_running_jobs`) — moving state out from
+      under an active crawl would race its own in-memory bookkeeping.
+    * ``409 acl_zones_present`` — a sibling (or the target) carries
+      ``config.acl_zones`` rows: permission-zone reconciliation is its own
+      surface (see :func:`consolidate_collections`'s own "Not included"
+      note) and this endpoint does not attempt to fold it.
+    * ``409 audience_class_conflict`` — a sibling has ``access_mode
+      ='mirrored'`` scopes whose audience-class vocabulary
+      (:func:`_mirrored_audience_signature`) differs from the target's own
+      — fail closed rather than silently mis-mirror a merged scope.
+    * ``409 collection_referenced_by_other_connection`` — a scope
+      collection being folded is still routed to by a connection OUTSIDE
+      this merge group (:func:`_foreign_connection_referencing_any`), same
+      posture as :func:`consolidate_collections`.
+    * ``409 consolidation_conflict`` — the collection fold itself would
+      collide (duplicate ``corpus_files.path`` / ``corpus_file_sources
+      .source_stable_id``), surfaced by the SAME repository consolidate
+      uses.
+
+    ``dry_run`` (default ``True``) computes and returns everything the real
+    merge WOULD do — scopes that would move (deduped by ``(source_scope_id,
+    drive_id)``; a duplicate keeps whichever connection's scope was seen
+    first, target's own winning ties), crawl/facts state that would be
+    carried and any key collisions and how they would resolve
+    (:class:`~src.repositories.sharepoint_connection_merge_pg.
+    SharePointConnectionMergePgRepository`), collections that would fold,
+    and the same blocking conditions above — WITHOUT writing anything (a
+    named ``target.name`` is not minted during a dry run, same rule as
+    :func:`consolidate_collections`).
+
+    ``dry_run: false`` performs the real merge, in this order (each step
+    individually idempotent, so a retried call after a partial failure
+    converges rather than double-applying — see the module's own state-
+    merge repository docstring): mark the target's ``config.split_merge``
+    ``in_progress``; fold every involved scope collection into the target
+    collection; union every sibling's crawl/facts state onto the target's
+    own; re-point every sibling's ``extraction_runs`` history onto the
+    target (marking each moved run's ``progress.merged_from``); write the
+    merged, deduped scope list onto the target; mark every sibling
+    ``config.merged_into`` (its scopes cleared) and the target's
+    ``config.split_merge`` ``done``.
+
+    Siblings are never deleted — only marked merged-away, scopes cleared.
+    Their ``connection_secrets`` vault rows (if any) are left completely
+    untouched: an admin who wants to fully remove a merged-away sibling can
+    still do so with the generic ``DELETE /api/admin/source-connections
+    /{id}``, which already knows how to clean those up — this endpoint does
+    not reimplement that.
+    """
+    row = _sharepoint_connection_or_404(connection_id)
+
+    if body.sibling_ids and body.all_split_siblings:
+        raise HTTPException(status_code=400, detail={"error": "both_sibling_ids_and_all_split_siblings"})
+    if not body.sibling_ids and not body.all_split_siblings:
+        raise HTTPException(status_code=400, detail={"error": "sibling_ids_or_all_split_siblings_required"})
+    if (
+        body.target is None
+        or (body.target.collection_id and body.target.name)
+        or (not body.target.collection_id and not body.target.name)
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "target_field_required",
+                "message": "target must carry exactly one of collection_id or name.",
+            },
+        )
+
+    if body.all_split_siblings:
+        sibling_rows = _all_split_siblings(row)
+        if not sibling_rows:
+            raise HTTPException(status_code=400, detail={"error": "no_siblings_found"})
+    else:
+        if connection_id in body.sibling_ids:
+            raise HTTPException(status_code=400, detail={"error": "sibling_ids_includes_target"})
+        if len(set(body.sibling_ids)) != len(body.sibling_ids):
+            raise HTTPException(status_code=400, detail={"error": "duplicate_sibling_ids"})
+        sibling_rows = [_sharepoint_connection_or_404(sid) for sid in body.sibling_ids]
+
+    sibling_ids = [s["id"] for s in sibling_rows]
+    group_ids = {connection_id, *sibling_ids}
+
+    if (row.get("config") or {}).get("merged_into"):
+        raise HTTPException(status_code=409, detail={"error": "target_already_merged"})
+    already_merged = [s["id"] for s in sibling_rows if (s.get("config") or {}).get("merged_into")]
+    if already_merged:
+        raise HTTPException(
+            status_code=409, detail={"error": "sibling_already_merged", "connection_ids": already_merged}
+        )
+
+    # Resolved early (before any precondition check below) so a DuckDB-
+    # backed instance gets a deterministic 501 regardless of which
+    # precondition would otherwise fire first — same shape
+    # `consolidate_collections` resolves its own PG-only repo in.
+    merge_repo = sharepoint_connection_merge_repo()
+
+    running = _connections_with_running_jobs(sorted(group_ids))
+    if running:
+        raise HTTPException(status_code=409, detail={"error": "crawl_or_facts_running", "jobs": running})
+
+    acl_zone_connections = [cid for cid in group_ids if zone_rows(source_connections_repo().get(cid) or {})]
+    if acl_zone_connections:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "acl_zones_present",
+                "message": "permission-zone reconciliation is not folded by this endpoint — remove acl_zones first.",
+                "connection_ids": sorted(acl_zone_connections),
+            },
+        )
+
+    target_signature = _mirrored_audience_signature(row)
+    audience_conflicts = [
+        s["id"]
+        for s in sibling_rows
+        if _mirrored_audience_signature(s) and _mirrored_audience_signature(s) != target_signature
+    ]
+    if audience_conflicts:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "audience_class_conflict", "connection_ids": sorted(audience_conflicts)},
+        )
+
+    # Scope move plan: dedupe by (source_scope_id, drive_id) — target's own
+    # scopes seed the key set, then each sibling in order, so a duplicate
+    # across two SIBLINGS is caught too, not just sibling-vs-target.
+    seen_keys = {_scope_dedupe_key(s) for s in _scopes(row)}
+    moved_scopes_by_sibling: Dict[str, List[Dict[str, Any]]] = {}
+    dropped_dupe_scope_ids_by_sibling: Dict[str, List[str]] = {}
+    for sibling in sibling_rows:
+        moved: List[Dict[str, Any]] = []
+        dropped: List[str] = []
+        for scope in _scopes(sibling):
+            key = _scope_dedupe_key(scope)
+            if key in seen_keys:
+                dropped.append(str(scope.get("source_scope_id")))
+                continue
+            seen_keys.add(key)
+            moved.append(scope)
+        moved_scopes_by_sibling[sibling["id"]] = moved
+        dropped_dupe_scope_ids_by_sibling[sibling["id"]] = dropped
+
+    prospective_source_collection_ids = sorted(
+        {
+            cid
+            for s in [*_scopes(row), *[sc for moved in moved_scopes_by_sibling.values() for sc in moved]]
+            if (cid := s.get("collection_id"))
+        }
+        - ({body.target.collection_id} if body.target.collection_id else set())
+    )
+    blocking = [
+        {"collection_id": cid, "connection_id": foreign_id}
+        for cid in prospective_source_collection_ids
+        if (foreign_id := _foreign_connection_referencing_any(cid, excluded_connection_ids=group_ids)) is not None
+    ]
+
+    corpora = file_corpora_repo()
+    if body.target.collection_id:
+        target_collection = corpora.get(body.target.collection_id)
+        if target_collection is None:
+            raise HTTPException(status_code=404, detail={"error": "collection_not_found"})
+        target_ref = _collection_ref(target_collection)
+    else:
+        target_ref = {"id": None, "name": body.target.name, "slug": None}
+
+    state_diagnostics = merge_repo.plan(target_id=connection_id, sibling_ids=sibling_ids)
+
+    per_sibling = [
+        {
+            "connection_id": sibling["id"],
+            "name": sibling.get("name"),
+            "scopes_moved": len(moved_scopes_by_sibling[sibling["id"]]),
+            "scopes_deduped": dropped_dupe_scope_ids_by_sibling[sibling["id"]],
+            "state": state_diagnostics.get(sibling["id"], {}),
+        }
+        for sibling in sibling_rows
+    ]
+
+    if body.dry_run:
+        log_safe(
+            user_id=user.get("id"),
+            action="sharepoint_connection.split_merge",
+            resource=f"source_connection:{connection_id}",
+            params={"dry_run": True, "sibling_ids": sibling_ids, "target": target_ref},
+            result="success",
+        )
+        return {"dry_run": True, "target": target_ref, "siblings": per_sibling, "blocking": blocking}
+
+    if blocking:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "collection_referenced_by_other_connection", "blocking": blocking},
+        )
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    source_connections_repo().update(
+        connection_id,
+        config={
+            **(row.get("config") or {}),
+            "split_merge": {"status": "in_progress", "sibling_ids": sibling_ids, "at": now_iso},
+        },
+    )
+
+    if body.target.collection_id:
+        target_collection_id = body.target.collection_id
+    else:
+        target_collection_id = _create_named_collection(name=body.target.name, created_by=user.get("id"))
+
+    consolidation_summary: Dict[str, Any] = {}
+    if prospective_source_collection_ids:
+        consolidation_repo = sharepoint_collection_consolidation_repo()
+        try:
+            consolidation_summary = consolidation_repo.consolidate(
+                source_ids=prospective_source_collection_ids, target_id=target_collection_id
+            )
+        except ConsolidationConflict as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"error": "consolidation_conflict", "kind": exc.kind, "keys": exc.keys},
+            ) from exc
+
+    state_diagnostics = merge_repo.apply(target_id=connection_id, sibling_ids=sibling_ids)
+
+    extraction_runs_repository = extraction_runs_repo()
+    runs_repointed: Dict[str, int] = {
+        sibling["id"]: extraction_runs_repository.repoint_connection(
+            from_connection_id=sibling["id"], to_connection_id=connection_id
+        )
+        for sibling in sibling_rows
+    }
+
+    merged_scopes = list(_scopes(row))
+    for scope in merged_scopes:
+        if scope.get("collection_id") in prospective_source_collection_ids:
+            scope["collection_id"] = target_collection_id
+    for sibling in sibling_rows:
+        for scope in moved_scopes_by_sibling[sibling["id"]]:
+            if scope.get("collection_id") in prospective_source_collection_ids:
+                scope["collection_id"] = target_collection_id
+            merged_scopes.append(scope)
+
+    source_connections_repo().update(
+        connection_id,
+        config={
+            **(row.get("config") or {}),
+            "scopes": merged_scopes,
+            "split_merge": {"status": "done", "sibling_ids": sibling_ids, "at": now_iso},
+        },
+    )
+
+    for sibling in sibling_rows:
+        source_connections_repo().update(
+            sibling["id"],
+            config={
+                **(sibling.get("config") or {}),
+                "scopes": [],
+                "merged_into": {"connection_id": connection_id, "at": now_iso},
+            },
+        )
+
+    per_sibling = [
+        {
+            "connection_id": sibling["id"],
+            "name": sibling.get("name"),
+            "scopes_moved": len(moved_scopes_by_sibling[sibling["id"]]),
+            "scopes_deduped": dropped_dupe_scope_ids_by_sibling[sibling["id"]],
+            "state": state_diagnostics.get(sibling["id"], {}),
+            "runs_repointed": runs_repointed[sibling["id"]],
+        }
+        for sibling in sibling_rows
+    ]
+
+    log_safe(
+        user_id=user.get("id"),
+        action="sharepoint_connection.split_merge",
+        resource=f"source_connection:{connection_id}",
+        params={
+            "dry_run": False,
+            "sibling_ids": sibling_ids,
+            "target_collection_id": target_collection_id,
+            **consolidation_summary,
+        },
+        result="success",
+    )
+
+    return {
+        "dry_run": False,
+        "target": _collection_ref(corpora.get(target_collection_id)),
+        "siblings": per_sibling,
+        **consolidation_summary,
+    }
 
 
 @router.get("/connections/{connection_id}/certificate")
