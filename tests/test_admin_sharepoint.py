@@ -3893,3 +3893,166 @@ class TestDispatchBookkeepingKeepsSiblings:
         assert ext["facts"] == {"retry_mode": "off", "transport": "batch"}
         assert ext["crawl"] == {"min_modified": "2023-12-31"}
         assert written["config"]["tenant_id"] == "t"
+
+
+class TestFactsGraphCountsDoesNotBlockTheEventLoop:
+    """Production incident, 2026-09-03: on a live instance with ~390
+    collections and a busy Postgres, a SINGLE `GET .../facts-graph-counts`
+    whose visibility CTE ran 250-316s made the whole app stop answering
+    ANY request — including `/healthz`, which does zero I/O — for as long
+    as that one query ran. `pg_cancel_backend`ing the one active statement
+    fixed it immediately.
+
+    `facts_graph_counts` is a plain `def` (not `async def`) specifically so
+    FastAPI dispatches it to the anyio thread pool instead of the event
+    loop (Tier-1 convention, `tests/test_event_loop_offload_guard.py`) —
+    and so are its dependencies (`require_admin`, the router-level
+    `_require_sharepoint_enabled`). This test proves that dispatch actually
+    holds under a slow repo call, rather than just asserting the function
+    is not a coroutine: a concurrent `/healthz` must answer in well under a
+    second regardless of how long the OTHER request's DB call takes. If
+    this test ever fails, the regression is a NEW blocking call reached
+    from the dependency chain on the event loop thread, not in the
+    endpoint's own body — the guard above only proves the entry points are
+    synchronous, not that everything they transitively call stays off the
+    loop.
+    """
+
+    def test_a_slow_repo_call_does_not_delay_a_concurrent_healthz(self, seeded_app, monkeypatch):
+        import threading
+        import time
+
+        from src.repositories import source_connections_repo
+
+        conn_id = "sp-evloop-perf"
+        source_connections_repo().create(
+            id=conn_id,
+            name="Event Loop Perf Test",
+            source_type="sharepoint",
+            config={
+                "tenant_id": "t1",
+                "client_id": "c1",
+                "scopes": [{"source_scope_id": "s1", "display_path": "A", "collection_id": "col_a"}],
+            },
+        )
+
+        class _SlowFactsRepo:
+            def approximate_counts_for_collections(self, corpus_ids):
+                time.sleep(2)
+                return {cid: {"facts": 0, "edges": 0} for cid in corpus_ids}
+
+        # Patched where `facts_graph_counts` resolves it from — a fresh
+        # `from src.repositories import facts_repo` on every call, so
+        # patching the factory function itself is enough.
+        monkeypatch.setattr("src.repositories.facts_repo", lambda: _SlowFactsRepo())
+
+        client = seeded_app["client"]
+        token = seeded_app["admin_token"]
+
+        results: dict[str, tuple[int, float]] = {}
+        start_barrier = threading.Barrier(2, timeout=5)
+
+        def _slow_request():
+            start_barrier.wait()
+            t0 = time.monotonic()
+            r = client.get(f"{BASE}/{conn_id}/facts-graph-counts", headers=_auth(token))
+            results["slow"] = (r.status_code, time.monotonic() - t0)
+
+        def _healthz_request():
+            start_barrier.wait()
+            time.sleep(0.2)  # let the slow request's DB call actually start first
+            t0 = time.monotonic()
+            r = client.get("/healthz")
+            results["healthz"] = (r.status_code, time.monotonic() - t0)
+
+        t_slow = threading.Thread(target=_slow_request)
+        t_health = threading.Thread(target=_healthz_request)
+        t_slow.start()
+        t_health.start()
+        t_slow.join(timeout=10)
+        t_health.join(timeout=10)
+
+        assert "slow" in results, "the slow request never completed"
+        assert "healthz" in results, "the healthz request never completed"
+        assert results["slow"][0] == 200, results["slow"]
+        assert results["healthz"][0] == 200, results["healthz"]
+        # The whole point: healthz must not queue up behind the slow
+        # request's DB call. A generous ceiling (well under the slow
+        # request's own 2s sleep) — if `facts_graph_counts` (or a
+        # dependency) were blocking the event loop, healthz would take
+        # close to 2s too, not ~0s.
+        assert results["healthz"][1] < 1.0, (
+            f"GET /healthz took {results['healthz'][1]:.2f}s while a slow "
+            f"facts-graph-counts request was in flight — something in that "
+            f"request's dependency chain is running on the event loop "
+            f"instead of the thread pool"
+        )
+
+    def test_eight_concurrent_slow_requests_still_leave_healthz_responsive(self, seeded_app, monkeypatch):
+        """The production trigger was not really "a single request" — the
+        card fires one `facts-graph-counts` fetch PER SharePoint connection
+        on page load (`_fetchSharepointGraphCounts` in
+        app/web/static/js/admin/data_sources_page.js), so a live page with 8
+        connections fires 8 concurrent slow requests at once. Each is
+        individually well-dispatched (see the test above); this proves 8 of
+        them AT ONCE still leave the thread pool (200 tokens,
+        AGNES_THREADPOOL_SIZE) with headroom for an unrelated `/healthz`."""
+        import threading
+        import time
+
+        from src.repositories import source_connections_repo
+
+        conn_ids = []
+        for i in range(8):
+            cid = f"sp-evloop-perf-{i}"
+            source_connections_repo().create(
+                id=cid,
+                name=f"Event Loop Perf Test {i}",
+                source_type="sharepoint",
+                config={
+                    "tenant_id": "t1",
+                    "client_id": "c1",
+                    "scopes": [{"source_scope_id": "s1", "display_path": "A", "collection_id": f"col_{i}"}],
+                },
+            )
+            conn_ids.append(cid)
+
+        class _SlowFactsRepo:
+            def approximate_counts_for_collections(self, corpus_ids):
+                time.sleep(2)
+                return {cid: {"facts": 0, "edges": 0} for cid in corpus_ids}
+
+        monkeypatch.setattr("src.repositories.facts_repo", lambda: _SlowFactsRepo())
+
+        client = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        results: dict[str, tuple[int, float]] = {}
+        start_barrier = threading.Barrier(9, timeout=5)
+
+        def _slow_request(cid):
+            start_barrier.wait()
+            r = client.get(f"{BASE}/{cid}/facts-graph-counts", headers=_auth(token))
+            results[cid] = (r.status_code, 0.0)
+
+        def _healthz_request():
+            start_barrier.wait()
+            time.sleep(0.3)  # let the 8 slow requests' DB calls actually start first
+            t0 = time.monotonic()
+            r = client.get("/healthz")
+            results["healthz"] = (r.status_code, time.monotonic() - t0)
+
+        threads = [threading.Thread(target=_slow_request, args=(cid,)) for cid in conn_ids]
+        threads.append(threading.Thread(target=_healthz_request))
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+
+        assert "healthz" in results, "the healthz request never completed"
+        assert results["healthz"][0] == 200, results["healthz"]
+        assert results["healthz"][1] < 1.0, (
+            f"GET /healthz took {results['healthz'][1]:.2f}s with 8 concurrent slow "
+            f"facts-graph-counts requests in flight"
+        )
+        for cid in conn_ids:
+            assert results.get(cid, (None,))[0] == 200, f"{cid}: {results.get(cid)}"

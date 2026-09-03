@@ -1329,15 +1329,26 @@ to ONE shared target instead of minting one per path — mutually exclusive
 `GET …/facts-graph-counts` — perf follow-up (2026-09-03): the source card's
 "Facts → graph" pipeline-strip cell, fetched by the card ONCE it has painted
 rather than computed for every SharePoint connection during
-`/admin/data-sources`'s own render — the two visibility-scoped counts behind
-it (`facts_repo().count_visible_facts_for_collections`/
-`count_visible_edges_for_collections`) run one query per confirmed scope
-each, which dominated the page's own load time on a live instance with
-several large connections. Returns `{"facts": int, "edges": int}` summed
-across this connection's own confirmed scopes; `{"facts": 0, "edges": 0}`
-with no scopes. `404` for a non-SharePoint or missing connection id; typed
-`501` on a DuckDB-backed instance (the fact graph is PG-only, A3 ratchet).
-Admin display primitive, no analyst CLI/MCP analogue.
+`/admin/data-sources`'s own render. Production incident, same day: the
+first cut of this endpoint called `facts_repo().count_visible_facts_for_
+collections`/`count_visible_edges_for_collections` — correct, per-caller
+visibility CTEs that are deliberately one query PER confirmed scope — which
+on a live ~390-collection instance cost 250-316s for a single connection's
+worth of scopes and starved the shared Postgres connection pool for
+minutes. The endpoint now calls `facts_repo().approximate_counts_for_
+collections` instead — one flat, indexed `GROUP BY corpus_id` statement
+over `claims` for the whole connection at once, capped at a 5s
+`statement_timeout`. Returns `{"facts": int, "edges": int, "graph_counts_
+kind": "approximate"}` summed across this connection's own confirmed
+scopes; the `"approximate"` label names the tradeoff — the number is not
+correction-aware (a `wrong`/`restricted` correction, which withholds a
+fact/edge for every caller, is not excluded) — since the endpoint is
+`require_admin`-gated, the RBAC narrowing the old CTE also did is a no-op
+for every real caller anyway. `{"facts": 0, "edges": 0, "graph_counts_
+kind": "approximate"}` with no scopes. `404` for a non-SharePoint or
+missing connection id; typed `501` on a DuckDB-backed instance (the fact
+graph is PG-only, A3 ratchet). Admin display primitive, no analyst
+CLI/MCP analogue.
 
 `POST …/clone` — CLI: `agnes admin sharepoint connection clone
 <connection_id>` — the other half of the split-a-large-site workflow: body

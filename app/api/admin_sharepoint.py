@@ -1380,26 +1380,38 @@ async def list_scopes(
 @router.get("/connections/{connection_id}/facts-graph-counts")
 def facts_graph_counts(
     connection_id: str,
-    user: dict = Depends(require_admin),
+    _user: dict = Depends(require_admin),
 ):
-    """Caller-scoped fact/edge counts across this connection's OWN confirmed
-    scopes (spec §13.2's "Facts → graph" pipeline-strip cell) — a LAZY
-    sibling of ``GET .../scopes``, fetched by the source card after it
-    paints rather than computed as part of ``/admin/data-sources`` itself
-    (perf follow-up, 2026-09-03 live finding).
+    """Fact/edge counts across this connection's OWN confirmed scopes (spec
+    §13.2's "Facts → graph" pipeline-strip cell) — a LAZY sibling of
+    ``GET .../scopes``, fetched by the source card after it paints rather
+    than computed as part of ``/admin/data-sources`` itself (perf
+    follow-up, 2026-09-03 live finding).
 
+    Production incident, same day, immediately after the fix above shipped:
     ``facts_repo().count_visible_facts_for_collections``/``count_visible_
     edges_for_collections`` are correct and deliberately per-collection —
     each is one query PER corpus_id, because the caller's own readable set
     is resolved once but the count itself is a genuinely separate,
-    security-scoped read every time (see their own docstrings). Summed
-    across every SharePoint connection's scopes at PAGE-RENDER time (up to
-    ~180 each), that dominated the page's own load time on a live instance
-    — 22 of ~28 `pg_stat_activity` samples over one page load were exactly
-    these two statements. Scoping the call to ONE connection, fetched only
-    when its card is on screen, keeps the same per-scope cost but never
-    blocks the page response or bundles it with seven OTHER connections'
-    worth of scopes in the same request.
+    security-scoped read every time (see their own docstrings). Scoping the
+    call to one connection (this endpoint's whole reason to exist) was not
+    enough on an instance with ~390 collections: a `pg_stat_activity`
+    sample during the outage showed ONE of these CTEs running 250-316s —
+    long enough to starve the shared Postgres connection pool for minutes,
+    which is what actually took the whole app down (every other request
+    needing a connection queued behind it), not an event-loop-blocking bug
+    in this handler's own dispatch (proved by
+    `tests/test_admin_sharepoint.py::TestFactsGraphCountsDoesNotBlockThe
+    EventLoop`, which keeps a slow repo call from delaying a concurrent
+    `/healthz` — that dispatch was always correct; the query cost itself
+    was not survivable). Replaced with ``facts_repo().approximate_counts_
+    for_collections`` — one flat, indexed `GROUP BY` over `claims`, no
+    per-caller visibility resolution, capped at a 5s `statement_timeout` so
+    a pathological corpus_id list fails fast instead of repeating the
+    incident (see that method's own docstring for exactly what it does not
+    account for). ``graph_counts_kind: "approximate"`` names the tradeoff
+    in the response rather than silently passing off a cheaper number as
+    the old row-visibility-filtered one.
 
     Plain ``def`` (zero ``await``s): blocking, synchronous, PG-only I/O
     (Tier-1 convention, ``tests/test_event_loop_offload_guard.py``) — a
@@ -1410,14 +1422,14 @@ def facts_graph_counts(
     row = _sharepoint_connection_or_404(connection_id)
     scope_ids = sorted({s["collection_id"] for s in _scopes(row) if isinstance(s, dict) and s.get("collection_id")})
     if not scope_ids:
-        return {"facts": 0, "edges": 0}
+        return {"facts": 0, "edges": 0, "graph_counts_kind": "approximate"}
 
     from src.repositories import facts_repo
 
-    fr = facts_repo()
-    facts_count = sum(fr.count_visible_facts_for_collections(user, scope_ids).values())
-    edges_count = sum(fr.count_visible_edges_for_collections(user, scope_ids).values())
-    return {"facts": facts_count, "edges": edges_count}
+    counts = facts_repo().approximate_counts_for_collections(scope_ids)
+    facts_count = sum(c["facts"] for c in counts.values())
+    edges_count = sum(c["edges"] for c in counts.values())
+    return {"facts": facts_count, "edges": edges_count, "graph_counts_kind": "approximate"}
 
 
 @router.post("/connections/{connection_id}/scopes", status_code=201)
