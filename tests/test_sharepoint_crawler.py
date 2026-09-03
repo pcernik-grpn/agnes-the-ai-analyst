@@ -4024,10 +4024,38 @@ class FakeRunsRepo:
         #: Connection ids `abandon_stale_running` should report as having
         #: closed something, for tests that want to see the log line fire.
         self.abandon_returns: List[str] = []
+        self.bump_parent_calls: List[str] = []
+        #: parent_run_id -> {"shards_done": int, "shards_total": int|None}
+        #: — mirrors `ExtractionRunsPgRepository.finish_shard`'s return.
+        self.shards: Dict[str, Dict[str, Any]] = {}
+        self.finalize_claims: List[str] = []
 
-    def start(self, *, connection_id, job_id=None, phase="crawl"):
-        self.started.append({"connection_id": connection_id, "job_id": job_id, "phase": phase})
-        return f"er_fake{len(self.started)}"
+    def start(
+        self,
+        *,
+        connection_id,
+        job_id=None,
+        phase="crawl",
+        parent_run_id=None,
+        shard_key=None,
+        shard_label=None,
+        shards_total=None,
+    ):
+        self.started.append(
+            {
+                "connection_id": connection_id,
+                "job_id": job_id,
+                "phase": phase,
+                "parent_run_id": parent_run_id,
+                "shard_key": shard_key,
+                "shard_label": shard_label,
+                "shards_total": shards_total,
+            }
+        )
+        run_id = f"er_fake{len(self.started)}"
+        if shards_total is not None:
+            self.shards[run_id] = {"shards_done": 0, "shards_total": shards_total}
+        return run_id
 
     def checkpoint(self, run_id, **kwargs):
         self.checkpoints.append({"run_id": run_id, **kwargs})
@@ -4038,6 +4066,23 @@ class FakeRunsRepo:
     def abandon_stale_running(self, connection_id):
         self.abandon_calls.append(connection_id)
         return list(self.abandon_returns)
+
+    def bump_parent_checkpoint(self, parent_run_id):
+        self.bump_parent_calls.append(parent_run_id)
+
+    def finish_shard(self, parent_run_id):
+        entry = self.shards.setdefault(parent_run_id, {"shards_done": 0, "shards_total": None})
+        entry["shards_done"] += 1
+        return dict(entry)
+
+    def claim_finalize(self, parent_run_id):
+        if parent_run_id in self.finalize_claims:
+            return False
+        self.finalize_claims.append(parent_run_id)
+        return True
+
+    def children_for(self, parent_run_ids):
+        return {pid: [] for pid in parent_run_ids}
 
 
 def _install_runs_repo(monkeypatch, repo=None):
@@ -4058,7 +4103,17 @@ class TestRunRecording:
         _install_graph(monkeypatch, handler)
         report = _run(_connection([_drive_scope()]), monkeypatch)
 
-        assert runs.started == [{"connection_id": "conn1", "job_id": None, "phase": "crawl"}]
+        assert runs.started == [
+            {
+                "connection_id": "conn1",
+                "job_id": None,
+                "phase": "crawl",
+                "parent_run_id": None,
+                "shard_key": None,
+                "shard_label": None,
+                "shards_total": None,
+            }
+        ]
         assert runs.checkpoints, "the crawl's existing checkpoint must also write the run row"
         assert runs.checkpoints[-1]["files_done"] == 1
         # Enumeration is never claimed complete mid-run: the delta feed can
@@ -6297,6 +6352,403 @@ class TestFolderShardDeleteGuard:
 
         assert ingestor.deleted == ["graph:item1"]
         assert stats.deleted == 1
+
+
+# --------------------------------------------------------------------------
+# Automatic parallel site crawl — Task 4: the planner, the shard child, the
+# finalizer (2026-09-03 design §4.3). Fakes throughout: `jobs_repo()` and
+# `sharepoint_state_repo()` are PG-only (A3), so these exercise the
+# orchestration logic against recording fakes rather than a real Postgres —
+# the repo methods themselves already have their own PG contract tests
+# (tests/db_pg/test_extraction_runs_pg.py, tests/db_pg/
+# test_sharepoint_state_store_pg.py).
+# --------------------------------------------------------------------------
+
+
+class FakeJobsRepo:
+    """Records every ``enqueue()`` call — stands in for ``jobs_repo()``."""
+
+    def __init__(self) -> None:
+        self.enqueued: List[Dict[str, Any]] = []
+
+    def enqueue(
+        self,
+        kind: str,
+        payload: Dict[str, Any],
+        *,
+        priority: int = 0,
+        run_after: Any = None,
+        max_attempts: int = 3,
+        idempotency_key: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        row = {
+            "id": f"job-{len(self.enqueued) + 1}",
+            "kind": kind,
+            "payload_json": payload,
+            "priority": priority,
+            "max_attempts": max_attempts,
+            "idempotency_key": idempotency_key,
+            "deduped": False,
+        }
+        self.enqueued.append(row)
+        return row
+
+    def list(self, *, kind: str, status: str, limit: int = 200) -> List[Dict[str, Any]]:
+        """Empty — ``maybe_run_facts_extraction``'s ``_standalone_facts_
+        pass_in_flight`` check calls this on the inline path's own tail;
+        these planner tests never enqueue a facts pass of their own."""
+        return []
+
+
+class FakeStateStore:
+    """In-memory stand-in for ``connectors.sharepoint.state_store`` — the
+    same ``(kind, connection_id) -> payload`` keying, no Postgres/DuckDB
+    needed. Accepts ANY kind (including ``crawl:<key>``) — this fake
+    doesn't enforce the backend-selection rules ``state_store`` itself
+    already has its own tests for."""
+
+    def __init__(self) -> None:
+        self.data: Dict[Any, Dict[str, Any]] = {}
+
+    def get(self, kind: str, connection_id: str) -> Optional[Dict[str, Any]]:
+        stored = self.data.get((kind, connection_id))
+        return dict(stored) if stored is not None else None
+
+    def put(self, kind: str, connection_id: str, payload: Dict[str, Any]) -> None:
+        self.data[(kind, connection_id)] = dict(payload)
+
+    def list_kinds(self, connection_id: str, prefix: str) -> List[str]:
+        return [k for (k, cid) in self.data if cid == connection_id and k.startswith(prefix)]
+
+
+def _install_fake_state_store(monkeypatch, store: "FakeStateStore") -> None:
+    from connectors.sharepoint import state_store
+
+    monkeypatch.setattr(state_store, "get", store.get)
+    monkeypatch.setattr(state_store, "put", store.put)
+    monkeypatch.setattr(state_store, "list_kinds", store.list_kinds)
+
+
+class TestAutoParallelCrawlPlanner:
+    def _install_env(self, monkeypatch, *, target_docs: int = 10):
+        monkeypatch.setattr("src.repositories.use_pg", lambda: True)
+        runs = _install_runs_repo(monkeypatch)
+        jobs = FakeJobsRepo()
+        monkeypatch.setattr("src.repositories.jobs_repo", lambda: jobs)
+        store = FakeStateStore()
+        _install_fake_state_store(monkeypatch, store)
+        monkeypatch.setattr(crawler, "_shard_target_docs", lambda: target_docs)
+        return runs, jobs, store
+
+    def _handler(self) -> Callable[[httpx.Request], httpx.Response]:
+        def handler(request: httpx.Request) -> httpx.Response:
+            path = request.url.path
+            if path.endswith("/content"):
+                raise AssertionError("the planner must never download a file")
+            if path.endswith("/root") and request.method == "GET":
+                return httpx.Response(200, json={"webUrl": "https://x/root"})
+            if path.endswith("/search/query"):
+                body = json.loads(request.content.decode())
+                query = body["requests"][0]["query"]["queryString"]
+                if '"https://x/root"' in query:
+                    return httpx.Response(200, json={"value": [{"hitsContainers": [{"total": 1000}]}]})
+                return httpx.Response(200, json={"value": [{"hitsContainers": [{"total": 5}]}]})
+            if path.endswith("/root/children"):
+                return httpx.Response(
+                    200,
+                    json={
+                        "value": [
+                            {"id": "f1", "name": "A", "folder": {"childCount": 5}, "webUrl": "https://x/root/A"},
+                            {"id": "f2", "name": "B", "folder": {"childCount": 5}, "webUrl": "https://x/root/B"},
+                        ]
+                    },
+                )
+            raise AssertionError(f"unexpected request: {path}")
+
+        return handler
+
+    def test_planner_path_enqueues_k_jobs_and_returns_without_crawling(self, crawl_env, monkeypatch):
+        runs, jobs, store = self._install_env(monkeypatch)
+        seen = _install_graph(monkeypatch, self._handler())
+
+        report = _run(_connection([_drive_scope()]), monkeypatch)
+
+        assert report["mode"] == "sharded"
+        assert report["shards_total"] >= 1
+        assert len(jobs.enqueued) == report["shards_total"]
+        assert all(j["kind"] == "corpus-extraction-shard" for j in jobs.enqueued)
+        assert all(j["priority"] == -1 for j in jobs.enqueued)
+        assert [j["idempotency_key"] for j in jobs.enqueued] == [
+            f"corpus-extraction-shard:conn1:{i}" for i in range(1, report["shards_total"] + 1)
+        ]
+        assert not any(url.endswith("/content") for url in seen)
+        # One parent row opened, with shards_total set — no inline crawl row.
+        assert len(runs.started) == 1
+        assert runs.started[0]["shards_total"] == report["shards_total"]
+        assert store.get("crawl", "conn1")["shard_plan"]["shards_total"] == report["shards_total"]
+
+    def test_shard_target_docs_zero_stays_inline(self, crawl_env, monkeypatch):
+        runs, jobs, _store = self._install_env(monkeypatch, target_docs=0)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        _install_graph(monkeypatch, handler)
+        report = _run(_connection([_drive_scope()]), monkeypatch)
+
+        assert report["mode"] == "builtin"  # the ordinary inline crawl report shape, not "sharded"
+        assert jobs.enqueued == []
+
+    def test_a_small_site_stays_inline_even_with_sharding_enabled(self, crawl_env, monkeypatch):
+        runs, jobs, _store = self._install_env(monkeypatch, target_docs=5000)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            path = request.url.path
+            if path.endswith("/content"):
+                return _content_response()
+            if path.endswith("/root") and request.method == "GET":
+                return httpx.Response(200, json={"webUrl": "https://x/root"})
+            if path.endswith("/search/query"):
+                return httpx.Response(200, json={"value": [{"hitsContainers": [{"total": 10}]}]})
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        _install_graph(monkeypatch, handler)
+        report = _run(_connection([_drive_scope()]), monkeypatch)
+
+        assert report["mode"] == "builtin"
+        assert jobs.enqueued == []
+
+
+class TestShardChildStateIsolation:
+    def test_disjoint_shards_write_only_their_own_state_row(self, crawl_env, monkeypatch):
+        store = FakeStateStore()
+        _install_fake_state_store(monkeypatch, store)
+        runs = _install_runs_repo(monkeypatch)
+        connection = _connection([_drive_scope()])
+        monkeypatch.setattr("src.repositories.source_connections_repo", lambda: FakeSourceConnectionsRepo(connection))
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if url.endswith("/content"):
+                return _content_response()
+            if "folderA" in url:
+                return httpx.Response(
+                    200,
+                    json={"value": [_file_item("itemA", name="a.docx")], "@odata.deltaLink": f"{DRIVE_DELTA}?t=A"},
+                )
+            return httpx.Response(
+                200, json={"value": [_file_item("itemB", name="b.docx")], "@odata.deltaLink": f"{DRIVE_DELTA}?t=B"}
+            )
+
+        _install_graph(monkeypatch, handler)
+
+        def _shard(root_item_id: str, label: str) -> Dict[str, Any]:
+            state_key = f"b!drive1:{root_item_id}"
+            return {
+                "scope_id": "b!drive1",
+                "label": label,
+                "expected": 1,
+                "exclude_prefixes": [],
+                "targets": [
+                    {"drive_id": "b!drive1", "root_item_id": root_item_id, "state_key": state_key, "path": label}
+                ],
+            }
+
+        base_payload = {"connection_id": "conn1", "parent_run_id": "er_parent1"}
+        crawler.run_shard_crawl({**base_payload, "shard_index": 1, "shard": _shard("folderA", "A")})
+        crawler.run_shard_crawl({**base_payload, "shard_index": 2, "shard": _shard("folderB", "B")})
+
+        state_a = store.get("crawl:b!drive1:folderA", "conn1")
+        state_b = store.get("crawl:b!drive1:folderB", "conn1")
+        assert state_a is not None and set(state_a["delta_links"]) == {"b!drive1:folderA"}
+        assert state_b is not None and set(state_b["delta_links"]) == {"b!drive1:folderB"}
+        # Neither wrote the connection-level row nor the other's row.
+        assert store.get("crawl", "conn1") is None
+        assert "graph:itemB" not in state_a["ctags"]
+        assert "graph:itemA" not in state_b["ctags"]
+
+        # Both children rolled into the SAME parent's shards_done tally.
+        assert runs.shards["er_parent1"]["shards_done"] == 2
+
+
+class TestShardStopBeforeClaim:
+    def test_stop_flag_set_before_claim_records_the_shard_as_stopped(self, crawl_env, monkeypatch):
+        _install_fake_state_store(monkeypatch, FakeStateStore())
+        runs = _install_runs_repo(monkeypatch)
+        connection = _connection([_drive_scope()])
+        monkeypatch.setattr("src.repositories.source_connections_repo", lambda: FakeSourceConnectionsRepo(connection))
+        monkeypatch.setattr(crawler, "_stop_requested", lambda connection_id: "2026-09-03T00:00:00+00:00")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise AssertionError("must never reach Graph once a stop is already flagged")
+
+        _install_graph(monkeypatch, handler)
+
+        shard = {
+            "scope_id": "b!drive1",
+            "label": "whole drive",
+            "expected": 0,
+            "exclude_prefixes": [],
+            "targets": [{"drive_id": "b!drive1", "root_item_id": None, "state_key": "b!drive1", "path": ""}],
+        }
+        payload = {"connection_id": "conn1", "parent_run_id": "er_parent1", "shard_index": 1, "shard": shard}
+
+        with pytest.raises(crawler.CrawlStopped):
+            crawler.run_shard_crawl(payload)
+
+        final = runs.finished[-1]
+        assert final["status"] == "interrupted"
+        assert final["report"]["interrupted_reason"] == "stopped"
+        # The shard still counts as finished for the parent's own tally,
+        # even though the job itself re-raises and fails.
+        assert runs.shards["er_parent1"]["shards_done"] == 1
+
+
+class TestFinalizeRaceAndAggregation:
+    def test_last_child_finalize_runs_exactly_once_under_a_simulated_race(self, monkeypatch):
+        runs = _install_runs_repo(monkeypatch)
+        runs.shards["er_parent1"] = {"shards_done": 1, "shards_total": 2}  # one child already finished
+        finalize_calls: List[str] = []
+        monkeypatch.setattr(
+            crawler, "_finalize_site_run", lambda connection, parent_run_id: finalize_calls.append(parent_run_id)
+        )
+        connection = {"id": "conn1", "source_type": "sharepoint"}
+
+        # Two children racing to be "the last one" both call this.
+        crawler._finish_shard_and_maybe_finalize(connection, "er_parent1")
+        crawler._finish_shard_and_maybe_finalize(connection, "er_parent1")
+
+        assert finalize_calls == ["er_parent1"]
+
+    def test_finish_shard_and_maybe_finalize_is_a_noop_before_the_last_child(self, monkeypatch):
+        runs = _install_runs_repo(monkeypatch)
+        runs.shards["er_parent1"] = {"shards_done": 0, "shards_total": 3}
+        finalize_calls: List[str] = []
+        monkeypatch.setattr(
+            crawler, "_finalize_site_run", lambda connection, parent_run_id: finalize_calls.append(parent_run_id)
+        )
+
+        crawler._finish_shard_and_maybe_finalize({"id": "conn1"}, "er_parent1")
+
+        assert finalize_calls == []
+        assert runs.shards["er_parent1"]["shards_done"] == 1
+
+    def test_finish_shard_and_maybe_finalize_never_raises_on_a_coordination_failure(self, monkeypatch):
+        class BoomRepo:
+            def finish_shard(self, parent_run_id):
+                raise RuntimeError("boom")
+
+        monkeypatch.setattr("src.repositories.extraction_runs_repo", lambda: BoomRepo())
+
+        crawler._finish_shard_and_maybe_finalize({"id": "conn1"}, "er_parent1")  # must not raise
+
+    def test_any_failed_child_makes_the_aggregate_status_failed_and_names_the_shard(self):
+        children = [
+            {
+                "id": "er_1",
+                "shard_key": "d1",
+                "shard_label": "A",
+                "status": "done",
+                "report": {"new": 3},
+                "files_seen": 3,
+                "files_done": 3,
+                "error": None,
+            },
+            {
+                "id": "er_2",
+                "shard_key": "d2",
+                "shard_label": "B",
+                "status": "failed",
+                "report": {"errors": 2},
+                "files_seen": 2,
+                "files_done": 0,
+                "error": "boom",
+            },
+        ]
+
+        aggregated = crawler._aggregate_child_reports(children)
+
+        assert aggregated["status"] == "failed"
+        assert aggregated["new"] == 3
+        assert aggregated["errors"] == 2
+        assert aggregated["files_seen"] == 5
+        assert aggregated["files_done"] == 3
+        by_key = {s["shard_key"]: s for s in aggregated["shards"]}
+        assert by_key["d2"]["status"] == "failed"
+        assert by_key["d2"]["error"] == "boom"
+
+    def test_interrupted_beats_done_but_loses_to_failed(self):
+        done_and_interrupted = crawler._aggregate_child_reports(
+            [
+                {"id": "er_1", "status": "done", "report": {}, "files_seen": 0, "files_done": 0},
+                {"id": "er_2", "status": "interrupted", "report": {}, "files_seen": 0, "files_done": 0},
+            ]
+        )
+        assert done_and_interrupted["status"] == "interrupted"
+
+        all_three = crawler._aggregate_child_reports(
+            [
+                {"id": "er_1", "status": "done", "report": {}, "files_seen": 0, "files_done": 0},
+                {"id": "er_2", "status": "interrupted", "report": {}, "files_seen": 0, "files_done": 0},
+                {"id": "er_3", "status": "failed", "report": {}, "files_seen": 0, "files_done": 0},
+            ]
+        )
+        assert all_three["status"] == "failed"
+
+    def test_lists_concatenate_and_stay_capped(self):
+        children = [
+            {
+                "id": "er_1",
+                "status": "done",
+                "report": {"failed_items": [{"path": f"/a{i}"} for i in range(3)]},
+                "files_seen": 0,
+                "files_done": 0,
+            },
+            {
+                "id": "er_2",
+                "status": "done",
+                "report": {"failed_items": [{"path": f"/b{i}"} for i in range(3)]},
+                "files_seen": 0,
+                "files_done": 0,
+            },
+        ]
+        aggregated = crawler._aggregate_child_reports(children)
+        assert len(aggregated["failed_items"]) == 6
+
+    def test_all_done_children_aggregate_to_done(self):
+        aggregated = crawler._aggregate_child_reports(
+            [
+                {"id": "er_1", "status": "done", "report": {"new": 1}, "files_seen": 1, "files_done": 1},
+                {"id": "er_2", "status": "done", "report": {"new": 2}, "files_seen": 2, "files_done": 2},
+            ]
+        )
+        assert aggregated["status"] == "done"
+        assert aggregated["new"] == 3
+        assert aggregated["shards_total"] == 2
+
+
+class TestParentCheckpointBump:
+    def test_a_shard_childs_checkpoint_bumps_its_parent(self, monkeypatch):
+        runs = _install_runs_repo(monkeypatch)
+        recorder = crawler._RunRecorder(
+            "conn1", sweep_stale=False, parent_run_id="er_parent1", shard_key="d1", shard_label="A"
+        )
+        recorder.start()
+
+        recorder.checkpoint(crawler.CrawlStats())
+
+        assert runs.bump_parent_calls == ["er_parent1"]
+
+    def test_an_inline_runs_checkpoint_never_bumps_anything(self, monkeypatch):
+        runs = _install_runs_repo(monkeypatch)
+        recorder = crawler._RunRecorder("conn1")
+        recorder.start()
+
+        recorder.checkpoint(crawler.CrawlStats())
+
+        assert runs.bump_parent_calls == []
 
 
 def test_the_converted_size_cap_is_reachable_by_the_converter():

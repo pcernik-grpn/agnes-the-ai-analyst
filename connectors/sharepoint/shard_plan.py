@@ -89,7 +89,21 @@ def plan_shards(
 
     No I/O, no randomness — safe to call twice on the same input and diff
     the results (a preview endpoint's whole reason to exist).
+
+    ``units`` EMPTY is its own case, not "zero packed shards plus a
+    remainder": a drive with nothing to split by (its own total already at
+    or under ``target_docs``, or a flat listing with no top-level folders)
+    still gets exactly ONE shard — the whole drive, unsplit — never an
+    empty packed shard sitting next to a remainder that duplicates it.
     """
+    if not units:
+        whole_drive_target = {"drive_id": drive_id, "root_item_id": None, "state_key": drive_id, "path": ""}
+        return {
+            "drive_id": drive_id,
+            "shards": [{"index": 1, "label": "whole drive", "targets": [whole_drive_target], "expected": 0}],
+            "expected_total": 0,
+        }
+
     total = sum(int(u.get("documents") or 0) for u in units)
     if force_shard_count is not None:
         k = max(1, min(int(force_shard_count), max_shards))
@@ -241,13 +255,28 @@ async def compute_shard_plan(
     "0 = never shard" contract (design §4.8) applies at this layer too, not
     only in the caller that decides whether to invoke this function at all.
 
-    Returns ``{"drives": [<one plan_shards() result per drive that needed
-    sharding, plus "loose_root_files" and "signal">], "inline_state_keys":
-    [<DriveTarget.state_key, ...>], "signal": <the last non-"none" signal
-    observed, or "none">}``. A drive whose total is at or under
-    ``target_docs`` — or that has no top-level folders to shard by —
-    contributes its target's ``state_key`` to ``inline_state_keys`` and
-    nothing to ``drives`` (design §4.1 point 2).
+    Two passes (design §4.1 points 2-3):
+
+    1. One :func:`connectors.sharepoint.graph_client.search_document_count`
+       per drive ROOT. If EVERY drive answered (none had an unreadable
+       root ``webUrl``) and their SUM is at or under ``target_docs``, the
+       whole site stays inline — ``{"drives": [], "inline_state_keys":
+       [every target's state_key], ...}`` — the same "byte-for-byte
+       today's crawl" path the caller takes for DuckDB / the knob at 0.
+    2. Otherwise every target gets its OWN :func:`plan_shards` result: a
+       drive whose OWN total is at or under ``target_docs`` gets exactly
+       ONE shard (the whole drive, unsplit — :func:`plan_shards`'s empty-
+       units case); an over-target drive (or one whose total could not be
+       read at all — never assumed small) is listed, counted, folded and
+       packed as described above.
+
+    Returns ``{"drives": [<one plan_shards() result per target>],
+    "inline_state_keys": [<every target's state_key, ONLY when the whole
+    site stayed inline>], "signal": <the last non-"none" signal observed,
+    or "none">}`` — ``drives`` and a non-empty ``inline_state_keys`` are
+    mutually exclusive: either the whole site is inline, or every target
+    has its own plan (never a per-drive mix of the two, which would leave
+    an "inline" drive uncrawled by anything the parent enqueues).
     """
     from connectors.sharepoint import graph_client
 
@@ -255,26 +284,49 @@ async def compute_shard_plan(
         return {"drives": [], "inline_state_keys": [t.state_key for t in targets], "signal": SIGNAL_NONE}
 
     token = await auth.token()
+
+    # Pass 1 — one search per drive root, deciding the SITE as a whole.
+    drive_totals: Dict[str, Optional[int]] = {}
+    for target in targets:
+        root_url = await graph_client.get_root_web_url(token, target.drive_id)
+        drive_totals[target.drive_id] = (
+            await graph_client.search_document_count(token, root_url, min_modified=min_modified) if root_url else None
+        )
+
+    if all(total is not None for total in drive_totals.values()):
+        site_total = sum(total or 0 for total in drive_totals.values())
+        if site_total <= target_docs:
+            signal = SIGNAL_SEARCH if site_total else SIGNAL_NONE
+            return {"drives": [], "inline_state_keys": [t.state_key for t in targets], "signal": signal}
+
+    # Pass 2 — the site needs sharding; every target gets its own plan.
     drive_plans: List[Dict[str, Any]] = []
-    inline_state_keys: List[str] = []
     overall_signal = SIGNAL_NONE
 
     for target in targets:
         drive_id = target.drive_id
-        root_url = await graph_client.get_root_web_url(token, drive_id)
-        drive_total = (
-            await graph_client.search_document_count(token, root_url, min_modified=min_modified) if root_url else 0
-        )
-        if drive_total and drive_total <= target_docs:
-            inline_state_keys.append(target.state_key)
+        drive_total = drive_totals.get(drive_id)
+        if drive_total is not None and drive_total <= target_docs:
+            # Small enough on its OWN — one whole-drive shard, no folder
+            # split, no extra listing call.
+            plan = plan_shards([], drive_id=drive_id, target_docs=target_docs, max_shards=max_shards)
+            plan["loose_root_files"] = []
+            plan["signal"] = SIGNAL_SEARCH if drive_total else SIGNAL_NONE
+            drive_plans.append(plan)
+            if drive_total:
+                overall_signal = SIGNAL_SEARCH
             continue
 
         children = await graph_client.list_root_children_with_url(token, drive_id)
         folder_items = [c for c in children if c.get("is_folder")]
         loose_root_files = [c["name"] for c in children if not c.get("is_folder")]
         if not folder_items:
-            # Nothing to shard by — a flat listing of loose files only.
-            inline_state_keys.append(target.state_key)
+            # Nothing to shard by — a flat listing of loose files only;
+            # still one whole-drive shard, same as the "small enough" case.
+            plan = plan_shards([], drive_id=drive_id, target_docs=target_docs, max_shards=max_shards)
+            plan["loose_root_files"] = loose_root_files
+            plan["signal"] = SIGNAL_NONE
+            drive_plans.append(plan)
             continue
 
         units, signal = await _count_top_level_folders(token, drive_id, folder_items, min_modified=min_modified)
@@ -306,4 +358,4 @@ async def compute_shard_plan(
         if signal != SIGNAL_NONE:
             overall_signal = signal
 
-    return {"drives": drive_plans, "inline_state_keys": inline_state_keys, "signal": overall_signal}
+    return {"drives": drive_plans, "inline_state_keys": [], "signal": overall_signal}

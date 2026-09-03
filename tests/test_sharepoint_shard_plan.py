@@ -120,11 +120,17 @@ class TestPlanShardsPure:
         packed = plan["shards"][:-1]
         assert len(packed) == 1
 
-    def test_empty_units_still_produces_a_remainder_shard(self):
+    def test_empty_units_produces_exactly_one_whole_drive_shard(self):
+        """No units to split by (the drive is small enough on its own, or a
+        flat listing with no top-level folders) — ONE shard, the whole
+        drive, unsplit. Never an empty packed shard sitting next to a
+        remainder that would duplicate it."""
         plan = shard_plan.plan_shards([], drive_id="drv1", target_docs=100)
         assert plan["expected_total"] == 0
-        assert len(plan["shards"]) == 2  # one empty packed shard + remainder
-        assert plan["shards"][-1]["targets"][0]["root_item_id"] is None
+        assert len(plan["shards"]) == 1
+        assert plan["shards"][0]["targets"] == [
+            {"drive_id": "drv1", "root_item_id": None, "state_key": "drv1", "path": ""}
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -210,6 +216,55 @@ class TestComputeShardPlanGraphHalf:
         assert plan["drives"] == []
         assert plan["inline_state_keys"] == ["drv1"]
 
+    def test_the_whole_site_stays_inline_when_the_summed_total_is_at_or_under_target(self, monkeypatch):
+        """Two drives, neither over target on its own AND their SUM is
+        also at or under target_docs — the site-level decision (design
+        §4.1 point 2), not a per-drive one."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            path = request.url.path
+            if path.endswith("/root") and request.method == "GET":
+                return httpx.Response(200, json={"webUrl": f"https://x/{path}"})
+            if path.endswith("/search/query"):
+                body = json.loads(request.content.decode())
+                query = body["requests"][0]["query"]["queryString"]
+                if "drv-a" in query:
+                    return _search_response(40)
+                return _search_response(40)
+            raise AssertionError(f"unexpected request: {path}")
+
+        _install_transport(monkeypatch, handler)
+        targets = [_FakeTarget("drv-a"), _FakeTarget("drv-b")]
+
+        plan = asyncio.run(shard_plan.compute_shard_plan(None, _FakeAuth(), {}, targets, target_docs=100))
+
+        assert plan["drives"] == []
+        assert plan["inline_state_keys"] == ["drv-a", "drv-b"]
+
+    def test_a_site_whose_summed_total_exceeds_target_shards_every_drive(self, monkeypatch):
+        """Same two drives as above, but their SUM now exceeds target_docs
+        even though NEITHER is individually over it — every drive still
+        gets its own (whole-drive) shard, none stay inline."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            path = request.url.path
+            if path.endswith("/root") and request.method == "GET":
+                return httpx.Response(200, json={"webUrl": f"https://x/{path}"})
+            if path.endswith("/search/query"):
+                return _search_response(60)
+            raise AssertionError(f"unexpected request: {path}")
+
+        _install_transport(monkeypatch, handler)
+        targets = [_FakeTarget("drv-a"), _FakeTarget("drv-b")]
+
+        plan = asyncio.run(shard_plan.compute_shard_plan(None, _FakeAuth(), {}, targets, target_docs=100))
+
+        assert plan["inline_state_keys"] == []
+        assert {d["drive_id"] for d in plan["drives"]} == {"drv-a", "drv-b"}
+        for drive_plan in plan["drives"]:
+            assert len(drive_plan["shards"]) == 1
+            assert drive_plan["shards"][0]["targets"][0]["root_item_id"] is None
+
     def test_drive_over_target_shards_by_search_counts(self, monkeypatch):
         handler = _make_handler(
             root_total=1000,
@@ -231,9 +286,12 @@ class TestComputeShardPlanGraphHalf:
 
     def test_search_unavailable_falls_back_to_child_count(self, monkeypatch):
         handler = _make_handler(
-            root_total=0,
+            # Root count non-zero so Pass 1 does not short-circuit the
+            # whole site to inline — it is only the per-FOLDER search
+            # (Pass 2) that is unavailable here.
+            root_total=1000,
             root_folders=[_folder("f1", "A"), _folder("f2", "B")],
-            folder_totals={},  # every search call returns 0
+            folder_totals={},  # every folder-level search call returns 0
             folder_child_counts={"A": 30, "B": 10},
         )
         _install_transport(monkeypatch, handler)
@@ -247,7 +305,7 @@ class TestComputeShardPlanGraphHalf:
 
     def test_both_signals_absent_falls_back_to_one_shard_per_folder(self, monkeypatch):
         handler = _make_handler(
-            root_total=0,
+            root_total=1000,
             root_folders=[_folder("f1", "A"), _folder("f2", "B"), _folder("f3", "C")],
         )
         _install_transport(monkeypatch, handler)
@@ -308,15 +366,21 @@ class TestComputeShardPlanGraphHalf:
         assert plan["drives"] == []
         assert seen == []
 
-    def test_a_drive_with_no_top_level_folders_stays_inline(self, monkeypatch):
+    def test_a_drive_with_no_top_level_folders_gets_one_whole_drive_shard(self, monkeypatch):
+        """The SITE stays over target (root_total > target_docs), so the
+        site as a whole is NOT inline — but this drive has nothing to
+        split by, so it gets exactly one shard covering the whole drive."""
         handler = _make_handler(root_total=1000, root_folders=[])
         _install_transport(monkeypatch, handler)
         target = _FakeTarget("drv1")
 
         plan = asyncio.run(shard_plan.compute_shard_plan(None, _FakeAuth(), {}, [target], target_docs=100))
 
-        assert plan["inline_state_keys"] == ["drv1"]
-        assert plan["drives"] == []
+        assert plan["inline_state_keys"] == []
+        assert len(plan["drives"]) == 1
+        drive_plan = plan["drives"][0]
+        assert len(drive_plan["shards"]) == 1
+        assert drive_plan["shards"][0]["targets"][0]["root_item_id"] is None
 
     def test_loose_root_files_are_recorded_on_the_drive_plan(self, monkeypatch):
         def handler(request: httpx.Request) -> httpx.Response:
@@ -348,7 +412,11 @@ class TestComputeShardPlanGraphHalf:
 
         assert plan["drives"][0]["loose_root_files"] == ["readme.txt"]
 
-    def test_multiple_targets_each_get_their_own_drive_plan_or_inline_entry(self, monkeypatch):
+    def test_a_small_drive_alongside_a_big_one_gets_its_own_whole_drive_shard(self, monkeypatch):
+        """The SITE total (10 + 1000) is over target, so nothing is inline
+        — but the small drive still gets exactly one whole-drive shard,
+        never split, while the big one is folder-sharded."""
+
         def handler(request: httpx.Request) -> httpx.Response:
             path = request.url.path
             if path.endswith("/root") and request.method == "GET":
@@ -380,6 +448,9 @@ class TestComputeShardPlanGraphHalf:
 
         plan = asyncio.run(shard_plan.compute_shard_plan(None, _FakeAuth(), {}, [small, big], target_docs=100))
 
-        assert plan["inline_state_keys"] == ["drv-small"]
-        assert len(plan["drives"]) == 1
-        assert plan["drives"][0]["drive_id"] == "drv-big"
+        assert plan["inline_state_keys"] == []
+        assert len(plan["drives"]) == 2
+        by_drive = {d["drive_id"]: d for d in plan["drives"]}
+        assert len(by_drive["drv-small"]["shards"]) == 1
+        assert by_drive["drv-small"]["shards"][0]["targets"][0]["root_item_id"] is None
+        assert len(by_drive["drv-big"]["shards"]) >= 1

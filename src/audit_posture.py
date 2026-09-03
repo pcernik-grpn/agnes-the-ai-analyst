@@ -1564,6 +1564,10 @@ JOB_POSTURE: dict[str, str] = {
     "analytics-rebuild": "job.run",
     "collections-purge": "job.run",
     "corpus-extraction": "job.run",
+    # A shard child (2026-09-03 auto-parallel-crawl design §4.3) is the SAME
+    # crawl pipeline `corpus-extraction` runs, just planner-enqueued over a
+    # narrower set of targets -- same posture, same reasoning.
+    "corpus-extraction-shard": "job.run",
     # Both of these ALSO write their own more-specific rows internally
     # (connectors/sharepoint/acl_sync.py -- e.g. sharepoint_acl.sync_completed/
     # sync_failed for the sync job; the sweep job persists state without a

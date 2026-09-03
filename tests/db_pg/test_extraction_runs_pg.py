@@ -433,3 +433,165 @@ def test_list_latest_for_connections_running_only_still_prefers_newest_running_r
 
     latest = repo.list_latest_for_connections(["conn_a"], running_only=True)
     assert latest["conn_a"]["id"] == current
+
+
+# ---------------------------------------------------------------------------
+# Shard-crawl columns/methods (2026-09-03 auto-parallel-crawl design §4.2/
+# §4.3, migration 0103_crawl_shards).
+# ---------------------------------------------------------------------------
+
+
+def test_start_accepts_shard_columns(pg_engine, monkeypatch):
+    repo = _make_repo(pg_engine, monkeypatch)
+    parent = repo.start(connection_id="conn_a", shards_total=3)
+    child = repo.start(
+        connection_id="conn_a",
+        parent_run_id=parent,
+        shard_key="drv1:folder1",
+        shard_label="Reports/Q1",
+    )
+
+    parent_row = repo.get(parent)
+    assert parent_row["shards_total"] == 3
+    assert parent_row["shards_done"] == 0
+    assert parent_row["parent_run_id"] is None
+
+    child_row = repo.get(child)
+    assert child_row["parent_run_id"] == parent
+    assert child_row["shard_key"] == "drv1:folder1"
+    assert child_row["shard_label"] == "Reports/Q1"
+    assert child_row["shards_total"] is None
+
+
+def test_get_running_never_returns_a_shard_childs_own_row(pg_engine, monkeypatch):
+    repo = _make_repo(pg_engine, monkeypatch)
+    parent = repo.start(connection_id="conn_a", shards_total=2)
+    repo.start(connection_id="conn_a", parent_run_id=parent, shard_key="drv1")
+
+    running = repo.get_running("conn_a")
+    assert running["id"] == parent
+
+
+def test_list_latest_for_connections_never_returns_a_shard_childs_own_row(pg_engine, monkeypatch):
+    repo = _make_repo(pg_engine, monkeypatch)
+    parent = repo.start(connection_id="conn_a", shards_total=1)
+    repo.start(connection_id="conn_a", parent_run_id=parent, shard_key="drv1")
+
+    latest = repo.list_latest_for_connections(["conn_a"])
+    assert latest["conn_a"]["id"] == parent
+
+
+def test_list_for_connection_and_count_never_include_shard_children(pg_engine, monkeypatch):
+    repo = _make_repo(pg_engine, monkeypatch)
+    parent = repo.start(connection_id="conn_a", shards_total=2)
+    repo.start(connection_id="conn_a", parent_run_id=parent, shard_key="drv1")
+    repo.start(connection_id="conn_a", parent_run_id=parent, shard_key="drv2")
+
+    rows = repo.list_for_connection("conn_a", limit=10)
+    assert [r["id"] for r in rows] == [parent]
+    assert repo.count_for_connection("conn_a") == 1
+
+
+def test_last_completed_and_last_failed_never_include_shard_children(pg_engine, monkeypatch):
+    repo = _make_repo(pg_engine, monkeypatch)
+    parent = repo.start(connection_id="conn_a", shards_total=1)
+    child = repo.start(connection_id="conn_a", parent_run_id=parent, shard_key="drv1")
+    repo.finish(child, status="failed", error="boom")
+    repo.finish(parent, status="failed", error="a shard failed: drv1")
+
+    assert repo.last_completed("conn_a") is None
+    failed = repo.last_failed("conn_a")
+    assert failed["id"] == parent
+
+
+def test_bump_parent_checkpoint_advances_the_parents_checkpoint_at(pg_engine, monkeypatch):
+    repo = _make_repo(pg_engine, monkeypatch)
+    parent = repo.start(connection_id="conn_a", shards_total=1)
+    before = repo.get(parent)["checkpoint_at"]
+
+    repo.bump_parent_checkpoint(parent)
+
+    assert repo.get(parent)["checkpoint_at"] >= before
+
+
+def test_bump_parent_checkpoint_is_a_no_op_once_the_parent_finished(pg_engine, monkeypatch):
+    repo = _make_repo(pg_engine, monkeypatch)
+    parent = repo.start(connection_id="conn_a", shards_total=1)
+    repo.finish(parent, status="done")
+    finished_at = repo.get(parent)["checkpoint_at"]
+
+    repo.bump_parent_checkpoint(parent)
+
+    assert repo.get(parent)["checkpoint_at"] == finished_at
+
+
+def test_finish_shard_increments_shards_done_and_returns_the_totals(pg_engine, monkeypatch):
+    repo = _make_repo(pg_engine, monkeypatch)
+    parent = repo.start(connection_id="conn_a", shards_total=2)
+
+    first = repo.finish_shard(parent)
+    assert first == {"shards_done": 1, "shards_total": 2}
+    second = repo.finish_shard(parent)
+    assert second == {"shards_done": 2, "shards_total": 2}
+
+    assert repo.get(parent)["shards_done"] == 2
+
+
+def test_finish_shard_on_an_unknown_parent_returns_none(pg_engine, monkeypatch):
+    repo = _make_repo(pg_engine, monkeypatch)
+    assert repo.finish_shard("er_never_existed") is None
+
+
+def test_claim_finalize_wins_exactly_once_under_a_simulated_race(pg_engine, monkeypatch):
+    repo = _make_repo(pg_engine, monkeypatch)
+    parent = repo.start(connection_id="conn_a", shards_total=2)
+
+    winners = [repo.claim_finalize(parent) for _ in range(5)]
+
+    assert winners.count(True) == 1
+    assert repo.get(parent)["phase"] == "finalizing"
+
+
+def test_children_for_returns_every_child_keyed_by_parent(pg_engine, monkeypatch):
+    repo = _make_repo(pg_engine, monkeypatch)
+    parent_a = repo.start(connection_id="conn_a", shards_total=2)
+    parent_b = repo.start(connection_id="conn_b", shards_total=1)
+    child_a1 = repo.start(connection_id="conn_a", parent_run_id=parent_a, shard_key="drv1")
+    child_a2 = repo.start(connection_id="conn_a", parent_run_id=parent_a, shard_key="drv2")
+    child_b1 = repo.start(connection_id="conn_b", parent_run_id=parent_b, shard_key="drv1")
+
+    children = repo.children_for([parent_a, parent_b])
+
+    assert {c["id"] for c in children[parent_a]} == {child_a1, child_a2}
+    assert {c["id"] for c in children[parent_b]} == {child_b1}
+
+
+def test_children_for_a_parent_with_no_children_yet_is_an_empty_list(pg_engine, monkeypatch):
+    repo = _make_repo(pg_engine, monkeypatch)
+    parent = repo.start(connection_id="conn_a", shards_total=3)
+
+    children = repo.children_for([parent])
+    assert children == {parent: []}
+
+
+def test_children_for_empty_ids_returns_empty(pg_engine, monkeypatch):
+    repo = _make_repo(pg_engine, monkeypatch)
+    assert repo.children_for([]) == {}
+
+
+def test_children_for_strips_failed_and_skipped_items_but_keeps_shard_key(pg_engine, monkeypatch):
+    repo = _make_repo(pg_engine, monkeypatch)
+    parent = repo.start(connection_id="conn_a", shards_total=1)
+    child = repo.start(connection_id="conn_a", parent_run_id=parent, shard_key="drv1", shard_label="Docs")
+    repo.finish(
+        child,
+        status="done",
+        report={"new": 5, "failed_items": [{"path": "/f"}], "skipped_items": [{"path": "/s"}]},
+    )
+
+    rows = repo.children_for([parent])[parent]
+    assert len(rows) == 1
+    assert rows[0]["shard_key"] == "drv1"
+    assert rows[0]["shard_label"] == "Docs"
+    assert "failed_items" not in rows[0]["report"]
+    assert rows[0]["report"]["new"] == 5

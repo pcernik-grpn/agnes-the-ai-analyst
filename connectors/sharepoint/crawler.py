@@ -113,6 +113,7 @@ from connectors.sharepoint import graph_client
 from connectors.sharepoint.acl_sync import active_zone_rows
 from connectors.sharepoint.graph_client import GRAPH_BASE, SharePointGraphError
 from connectors.sharepoint.settings import SharePointSettingsError, resolve_sharepoint_settings
+from connectors.sharepoint.shard_plan import compute_shard_plan
 
 logger = logging.getLogger(__name__)
 
@@ -158,6 +159,28 @@ _MAX_CONCURRENCY = 64
 #: configured ceiling on purpose: an ad-hoc run (an admin pressing "run now")
 #: is the wrong place to go looking for a tenant's throttling limit.
 _MAX_PAYLOAD_CONCURRENCY = 16
+
+# --------------------------------------------------------------------------
+# Auto-parallel-crawl (2026-09-03 design) — the ONE config knob
+# (``extraction.crawler.shard_target_docs``, resolved by
+# :func:`_shard_target_docs`) plus the named constants everything else uses.
+# --------------------------------------------------------------------------
+
+#: The knob's default — see :func:`_shard_target_docs`. 0 (an admin-set
+#: override, never the default) disables sharding entirely.
+_DEFAULT_SHARD_TARGET_DOCS = 5000
+#: Hard ceiling on how many shards one site's plan may produce — mirrors
+#: ``connectors.sharepoint.shard_plan.plan_shards``'s own ``max_shards``
+#: default; passed through explicitly so the two never drift apart.
+_MAX_SHARDS = 32
+#: The child job kind a sharded site's planner enqueues — registered in
+#: ``app/worker/kinds.py``, same EXTRACTION lane as ``corpus-extraction``.
+_SHARD_JOB_KIND = "corpus-extraction-shard"
+#: Below a default-priority job (``sharepoint-facts-extraction``, priority
+#: 0) in ``claim_next``'s ``priority DESC`` order (design §4.6/Task 7): a
+#: queued facts pass always claims before a queued shard, so a run's tail
+#: (facts) is never starved behind a fresh site's initial shard fan-out.
+_SHARD_JOB_PRIORITY = -1
 #: Adaptive downshift trigger. A delta page that met MORE than this many
 #: throttled responses — or spent more than :data:`_THROTTLE_BURST_WAIT_S`
 #: waiting on them — is a tenant pushing back, not one stray 429.
@@ -753,7 +776,17 @@ class _RunRecorder:
     message.
     """
 
-    def __init__(self, connection_id: str, *, job_id: Optional[str] = None, sweep_stale: bool = True) -> None:
+    def __init__(
+        self,
+        connection_id: str,
+        *,
+        job_id: Optional[str] = None,
+        sweep_stale: bool = True,
+        parent_run_id: Optional[str] = None,
+        shard_key: Optional[str] = None,
+        shard_label: Optional[str] = None,
+        shards_total: Optional[int] = None,
+    ) -> None:
         self.connection_id = connection_id
         self.job_id = job_id
         self.run_id: Optional[str] = None
@@ -766,6 +799,15 @@ class _RunRecorder:
         #: SAME connection is not abandoned, it is a peer, and sweeping it
         #: here would race the peer's own finalize.
         self._sweep_stale = sweep_stale
+        #: Shard-crawl columns (migration ``0103_crawl_shards``) — all
+        #: ``None`` for an inline or PARENT (planner) run, which is exactly
+        #: today's row shape. A shard CHILD passes its own ``parent_run_id``/
+        #: ``shard_key``/``shard_label``; a PARENT passes ``shards_total``
+        #: (never the other three — a parent is not itself a shard).
+        self._parent_run_id = parent_run_id
+        self._shard_key = shard_key
+        self._shard_label = shard_label
+        self._shards_total = shards_total
         # Bookkeeping for `maybe_checkpoint` — a SEPARATE, rate-limited
         # sibling of `checkpoint`, never the crawl's own resume state.
         self._progress_lock = threading.Lock()
@@ -831,6 +873,10 @@ class _RunRecorder:
                 connection_id=self.connection_id,
                 job_id=self.job_id,
                 phase="crawl",
+                parent_run_id=self._parent_run_id,
+                shard_key=self._shard_key,
+                shard_label=self._shard_label,
+                shards_total=self._shards_total,
             )
         except Exception as exc:  # noqa: BLE001 — recording is never load-bearing
             self.run_id = None
@@ -856,6 +902,22 @@ class _RunRecorder:
             )
         except Exception as exc:  # noqa: BLE001
             logger.debug("sharepoint crawl: run checkpoint failed (%s) — continuing", type(exc).__name__)
+        # A shard CHILD's own checkpoint also bumps its PARENT's
+        # `checkpoint_at` (design §4.3) — so a live parent whose children
+        # are all still crawling never reads as stale to the liveness check
+        # that derives "is this run alive" from checkpoint age
+        # (`app/api/admin_extraction.py`), even though the parent's OWN
+        # row stopped writing the moment it finished enqueueing. A no-op
+        # for every non-child run (`_parent_run_id is None`).
+        if self._parent_run_id:
+            try:
+                self._resolve().bump_parent_checkpoint(self._parent_run_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "sharepoint crawl: could not bump parent run %s checkpoint (%s) — continuing",
+                    self._parent_run_id,
+                    type(exc).__name__,
+                )
 
     def maybe_checkpoint(self, stats: "CrawlStats", *, clock: Callable[[], float] = time.monotonic) -> None:
         """A RATE-LIMITED sibling of :meth:`checkpoint`, called after every
@@ -5081,6 +5143,25 @@ def _crawl_concurrency() -> int:
     return max(1, min(_MAX_CONCURRENCY, value))
 
 
+def _shard_target_docs() -> int:
+    """``extraction.crawler.shard_target_docs`` (2026-09-03 auto-parallel-
+    crawl design §4.8) — the ONE config knob the whole feature adds.
+
+    Default :data:`_DEFAULT_SHARD_TARGET_DOCS` (5000); ``0`` — an explicit
+    admin override, never the default — disables sharding entirely: every
+    connection crawls inline, unconditionally, exactly as it did before
+    this feature existed. A missing or unparseable value is the default,
+    never a crash — same posture every other resolver in this module takes.
+    """
+    from app.instance_config import get_value
+
+    raw = get_value("extraction", "crawler", "shard_target_docs", default=_DEFAULT_SHARD_TARGET_DOCS)
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return _DEFAULT_SHARD_TARGET_DOCS
+
+
 def _resolve_concurrency(override: Any) -> Tuple[int, int, str]:
     """``(effective_cap, configured, source)`` for one run.
 
@@ -5931,6 +6012,16 @@ def run_builtin_crawl(payload: dict) -> dict:
     (``app/worker/kinds.py::_run_corpus_extraction``, a thin delegate to
     this).
 
+    2026-09-03 auto-parallel-crawl design: this is now sometimes a PLANNER,
+    not always a crawler. ``_plan_or_run_inline`` decides — a DuckDB-backed
+    instance, ``extraction.crawler.shard_target_docs`` at 0, or a site whose
+    total stays at or under that target all take the INLINE path below,
+    byte-for-byte today's crawl. A large site on Postgres instead gets
+    packed into shards, gets ONE parent ``extraction_runs`` row, and this
+    call enqueues K ``corpus-extraction-shard`` children and returns without
+    ever crawling itself — see :func:`_plan_or_run_inline` /
+    :func:`run_shard_crawl` / :func:`_finalize_site_run`.
+
     Bounded by ``extraction.timeout_s``. On expiry the run saves its state,
     reports ``interrupted_reason="timeout"``, and fails the job; the next
     run resumes from the persisted deltaLinks and cTags.
@@ -6010,19 +6101,655 @@ def run_builtin_crawl(payload: dict) -> dict:
         _apply_resync(str(connection_id))
 
     try:
-        return asyncio.run(
-            _run_crawl_async(
-                connection,
-                only_scope_ids=payload.get("scopes"),
-                job_id=payload.get("job_id"),
-                timeout_s=payload.get("timeout_s"),
-                concurrency=payload.get("concurrency"),
-                force_reprocess=bool(payload.get("force_reprocess")),
-                retry_failed=bool(payload.get("retry_failed")),
-                retry_empty=bool(payload.get("retry_empty")),
-            )
-        )
+        return asyncio.run(_plan_or_run_inline(connection, payload))
     except SharePointSettingsError as exc:
         # Named cause, not a bare traceback — the same typed handling
         # `app/api/admin_sharepoint.py::_resolved_token` gives this error.
         raise CrawlError(f"sharepoint crawl: {exc}") from exc
+
+
+# --------------------------------------------------------------------------
+# Automatic parallel site crawl (2026-09-03 design, Task 4) — the planner,
+# the shard child's own crawl, and the finalizer. PG-only by construction
+# (the planner never even tries to shard on a DuckDB-backed instance —
+# `_plan_or_run_inline` checks `use_pg()` itself, the same fail-clean
+# posture `connectors.sharepoint.state_store` already takes for a `crawl:`
+# state kind).
+# --------------------------------------------------------------------------
+
+
+class _ShardPlanUnavailable(RuntimeError):
+    """Raised internally when a shard plan was computed but the PARENT run
+    row could not be opened (run recording — never load-bearing anywhere
+    else in this module — IS the coordination mechanism the children roll
+    up into here). The caller falls back to the inline crawl rather than
+    enqueue children with nothing to join."""
+
+
+async def _plan_or_run_inline(connection: Dict[str, Any], payload: dict) -> Dict[str, Any]:
+    """Decide inline vs. sharded for this connection's run, once, and do
+    whichever one it picks (design §4.1).
+
+    Inline (byte-for-byte :func:`_run_crawl_async`, today's crawl) when ANY
+    of: the active app-state backend is DuckDB (A3 ratchet), ``extraction.
+    crawler.shard_target_docs`` is ``0`` (design §4.8), a scope-resolution
+    Graph call fails (the inline path's own per-scope error isolation is a
+    better fit for that than a half-built plan), or
+    :func:`connectors.sharepoint.shard_plan.compute_shard_plan` finds the
+    connection's SUMMED total at or under the target across every confirmed
+    scope's every drive (its own two-pass site-level decision — see that
+    function's docstring).
+
+    Sharded otherwise: opens ONE parent run row and enqueues one
+    ``corpus-extraction-shard`` child per packed shard (:func:
+    `_enqueue_shard_plan`), across every scope's every drive that needed
+    splitting — never crawls anything itself.
+    """
+    connection_id = str(connection["id"])
+
+    async def _inline() -> Dict[str, Any]:
+        return await _run_crawl_async(
+            connection,
+            only_scope_ids=payload.get("scopes"),
+            job_id=payload.get("job_id"),
+            timeout_s=payload.get("timeout_s"),
+            concurrency=payload.get("concurrency"),
+            force_reprocess=bool(payload.get("force_reprocess")),
+            retry_failed=bool(payload.get("retry_failed")),
+            retry_empty=bool(payload.get("retry_empty")),
+        )
+
+    from src.repositories import use_pg
+
+    target_docs = _shard_target_docs()
+    if not use_pg() or target_docs <= 0:
+        return await _inline()
+
+    scopes = _confirmed_scopes(connection)
+    only_scope_ids = payload.get("scopes")
+    if only_scope_ids:
+        wanted = set(only_scope_ids)
+        scopes = [s for s in scopes if str(s.get("source_scope_id")) in wanted]
+    if not scopes:
+        # No confirmed scope to plan against — let the inline path raise
+        # its own named `CrawlError` for this, rather than duplicating that
+        # check here.
+        return await _inline()
+
+    settings = resolve_sharepoint_settings(connection)
+    min_modified, _min_modified_source = resolve_min_modified(connection)
+    plan_stats = CrawlStats()
+    auth = GraphAuth(
+        acquire=lambda: graph_client.get_app_token(settings.tenant_id, settings.client_id, settings.private_key),
+        stats=plan_stats,
+    )
+    transport = GraphTransport(auth, plan_stats)
+
+    all_targets: List[DriveTarget] = []
+    scope_of_state_key: Dict[str, Dict[str, Any]] = {}
+    for scope in scopes:
+        try:
+            targets = await _drive_targets(transport, scope)
+        except (CrawlError, SharePointGraphError):
+            # One scope's misconfiguration (or a Graph outage) is exactly
+            # the case the inline path's own per-scope isolation already
+            # handles (`scope_errors`) — a half-built plan missing one
+            # scope's coverage would be worse than falling all the way back.
+            return await _inline()
+        for target in targets:
+            all_targets.append(target)
+            scope_of_state_key[target.state_key] = scope
+
+    if not all_targets:
+        return await _inline()
+
+    try:
+        plan = await compute_shard_plan(
+            transport,
+            auth,
+            {},
+            all_targets,
+            min_modified=min_modified,
+            target_docs=target_docs,
+            max_shards=_MAX_SHARDS,
+        )
+    except (CrawlError, SharePointGraphError):
+        return await _inline()
+
+    if not plan["drives"]:
+        # The connection's summed total stayed at or under target — the
+        # site-level "stay inline" decision (design §4.1 point 2).
+        return await _inline()
+
+    shard_defs: List[Dict[str, Any]] = []
+    for drive_plan in plan["drives"]:
+        for shard in drive_plan["shards"]:
+            if not shard["targets"]:
+                # A `pack_folders_into_groups` group that landed empty
+                # (K > the number of folders) — nothing to crawl, nothing
+                # to enqueue.
+                continue
+            # Every target in one plan_shards() shard shares the same
+            # drive, and a drive belongs to exactly one confirmed scope in
+            # any sane configuration — the first target's scope stands in
+            # for the whole shard.
+            owning_scope = scope_of_state_key.get(shard["targets"][0]["state_key"])
+            if owning_scope is None:
+                continue
+            shard_defs.append(
+                {
+                    "scope_id": str(owning_scope.get("source_scope_id")),
+                    "label": shard["label"],
+                    "targets": shard["targets"],
+                    "exclude_prefixes": shard.get("exclude_prefixes") or [],
+                    "expected": shard.get("expected") or 0,
+                }
+            )
+
+    if not shard_defs:
+        return await _inline()
+
+    try:
+        return _enqueue_shard_plan(connection_id, shard_defs, payload)
+    except _ShardPlanUnavailable:
+        return await _inline()
+
+
+def _enqueue_shard_plan(connection_id: str, shard_defs: List[Dict[str, Any]], payload: dict) -> Dict[str, Any]:
+    """Open the PARENT run row and enqueue one ``corpus-extraction-shard``
+    child per entry in ``shard_defs`` (design §4.3) — the planner's own
+    tail. Never crawls: by the time this returns, every shard's work is
+    queued for ANY worker to claim, and this job's own claim is free to
+    finish.
+
+    Idempotency key ``corpus-extraction-shard:{connection_id}:{index}`` —
+    a re-planned connection whose Nth shard now covers different folders
+    still dedups against a STILL-QUEUED-OR-RUNNING Nth shard from a PRIOR
+    plan; this is intentionally cheap protection against a double-trigger
+    racing this same planner, not a guarantee the two plans agree on what
+    index N means (a genuine re-plan only ever runs once the PREVIOUS
+    parent has finalized — see ``app.api.admin_sharepoint.trigger_
+    extraction``'s 409 gate on a top-level running row).
+    """
+    from app.worker.registry import job_max_attempts
+    from src.repositories import jobs_repo
+
+    shards_total = len(shard_defs)
+    recorder = _RunRecorder(connection_id, job_id=payload.get("job_id"), shards_total=shards_total)
+    recorder.start()
+    parent_run_id = recorder.run_id
+    if parent_run_id is None:
+        raise _ShardPlanUnavailable(f"could not open a parent run row for connection {connection_id!r}")
+
+    # Persisted for observability (the read side's plan preview, and a
+    # human diagnosing a stuck parent) — NOT consulted on the next trigger:
+    # this planner always re-plans fresh rather than reusing a persisted
+    # plan (see the design's §4.1 point 5 "re-plan only on resync/scope
+    # change/no plan" — the caching half of that is out of scope here;
+    # always-fresh is still CORRECT, since state stays keyed by
+    # `DriveTarget.state_key`, never by shard index, so a re-plan can never
+    # orphan a cursor — only marginally more Graph reads than necessary).
+    state = load_state(connection_id)
+    state["shard_plan"] = {
+        "parent_run_id": parent_run_id,
+        "shards_total": shards_total,
+        "planned_at": _now_iso(),
+        "shards": shard_defs,
+    }
+    save_state(connection_id, state)
+
+    max_attempts = job_max_attempts(_SHARD_JOB_KIND)
+    for index, shard in enumerate(shard_defs, start=1):
+        child_payload = {
+            "connection_id": connection_id,
+            "parent_run_id": parent_run_id,
+            "shard_index": index,
+            "shard": {**shard, "shard_index": index},
+            "concurrency": payload.get("concurrency"),
+            "timeout_s": payload.get("timeout_s"),
+            "force_reprocess": bool(payload.get("force_reprocess")),
+            "retry_failed": bool(payload.get("retry_failed")),
+            "retry_empty": bool(payload.get("retry_empty")),
+        }
+        jobs_repo().enqueue(
+            _SHARD_JOB_KIND,
+            child_payload,
+            priority=_SHARD_JOB_PRIORITY,
+            max_attempts=max_attempts,
+            idempotency_key=f"{_SHARD_JOB_KIND}:{connection_id}:{index}",
+        )
+
+    logger.info(
+        "sharepoint crawl: connection %s — planned %d shard(s), parent run %s",
+        connection_id,
+        shards_total,
+        parent_run_id,
+    )
+    return {
+        "mode": "sharded",
+        "connection_id": connection_id,
+        "parent_run_id": parent_run_id,
+        "shards_total": shards_total,
+    }
+
+
+def run_shard_crawl(payload: dict) -> dict:
+    """Entry point for the ``corpus-extraction-shard`` job kind — one
+    shard child's own crawl (design §4.3).
+
+    ``payload``: ``connection_id``, ``parent_run_id``, ``shard_index``,
+    ``shard`` (``{scope_id, label, targets, exclude_prefixes, expected}`` —
+    ``targets`` is a list of ``{drive_id, root_item_id, state_key, path}``,
+    :func:`_enqueue_shard_plan`'s own output), plus the same
+    ``concurrency``/``timeout_s``/``force_reprocess``/``retry_failed``/
+    ``retry_empty`` pass-through :func:`run_builtin_crawl` accepts, fanned
+    out unchanged from the parent's own trigger payload.
+
+    Credentials are resolved from the connection row, never from the
+    payload — same posture as :func:`run_builtin_crawl`.
+    """
+    connection_id = payload.get("connection_id")
+    parent_run_id = payload.get("parent_run_id")
+    shard = payload.get("shard") or {}
+    if not connection_id or not parent_run_id or not shard.get("targets"):
+        raise CrawlError("sharepoint crawl: shard payload missing connection_id/parent_run_id/shard.targets")
+
+    from src.repositories import source_connections_repo
+
+    connection = source_connections_repo().get(connection_id)
+    if connection is None or connection.get("source_type") != "sharepoint":
+        raise CrawlError(f"sharepoint crawl: connection {connection_id!r} not found or not a sharepoint connection")
+
+    try:
+        return asyncio.run(
+            _run_shard_crawl_async(connection, parent_run_id=str(parent_run_id), shard=shard, payload=payload)
+        )
+    except SharePointSettingsError as exc:
+        raise CrawlError(f"sharepoint crawl: {exc}") from exc
+
+
+async def _run_shard_crawl_async(
+    connection: Dict[str, Any], *, parent_run_id: str, shard: Dict[str, Any], payload: dict
+) -> Dict[str, Any]:
+    """The shard child's own crawl body — the same pipeline
+    :func:`_run_crawl_async` runs for the inline path, over exactly this
+    shard's ``targets``, with its OWN per-delta-unit state rows (never the
+    connection-level one) and its OWN ``extraction_runs`` row.
+
+    Never clears the connection-wide cooperative-stop flag (``clear_stale_
+    stop`` stays at its default in the sense that this function never even
+    calls :func:`_clear_stale_stop` — only the PARENT planner run does,
+    once, per top-level trigger) and never sweeps stale ``running`` rows
+    for the connection (:class:`_RunRecorder`'s ``sweep_stale=False`` — a
+    sibling shard's still-``running`` row is a peer, not an orphan).
+    """
+    connection_id = str(connection["id"])
+    scope_id = str(shard.get("scope_id") or "")
+    scope = next((s for s in _confirmed_scopes(connection) if str(s.get("source_scope_id")) == scope_id), None)
+    if scope is None:
+        raise CrawlError(
+            f"sharepoint crawl: shard's scope {scope_id!r} is no longer a confirmed scope on connection "
+            f"{connection_id!r} — it may have been removed since this shard was planned"
+        )
+
+    stop_watcher = _StopWatcher(connection_id)
+    settings = resolve_sharepoint_settings(connection)
+    min_modified, _min_modified_source = resolve_min_modified(connection)
+    anonymization_key = _resolve_anonymization_key([scope])
+    detector = _entity_detector() if anonymization_key is not None else None
+    max_file_mb = _max_file_mb()
+    cap, configured_concurrency, concurrency_source = _resolve_concurrency(payload.get("concurrency"))
+    deadline = _Deadline(_timeout_seconds() if payload.get("timeout_s") is None else payload.get("timeout_s"))
+
+    stats = CrawlStats(
+        concurrency=cap,
+        concurrency_configured=configured_concurrency,
+        concurrency_source=concurrency_source,
+        concurrency_effective_max=cap,
+        concurrency_min_target=cap,
+    )
+    governor = _ConcurrencyGovernor(cap, stats=stats)
+    convert_pool = _ConvertProcessPool(
+        cap,
+        recycle_after_docs=_convert_recycle_after_docs(),
+        recycle_rss_bytes=_convert_recycle_rss_bytes(),
+        memory_limit_bytes=_convert_child_memory_limit_bytes(),
+        timeout_s=_item_timeout_seconds(),
+        max_output_bytes=_max_converted_output_bytes(),
+        max_rss_bytes=_convert_child_max_rss_bytes(),
+        spares_per_slot=_convert_spares_per_slot(),
+    )
+    convert_pool.start()
+    auth = GraphAuth(
+        acquire=lambda: graph_client.get_app_token(settings.tenant_id, settings.client_id, settings.private_key),
+        stats=stats,
+    )
+    transport = GraphTransport(auth, stats)
+    ingestor = _Ingestor()
+
+    base_exclusions = await _excluded_path_prefixes(transport, scope)
+    exclusions = _exclusion_index_with_extra_prefixes(base_exclusions, shard.get("exclude_prefixes") or ())
+
+    # Read-only seed from the CONNECTION-level `crawl` row — see
+    # `_ScopeContext.legacy_ctags`'s own docstring. Never the row this
+    # shard writes to.
+    legacy_ctags: Dict[str, str] = dict(load_state(connection_id).get("ctags") or {})
+
+    ctx = _ScopeContext(
+        source_scope_id=scope_id,
+        collection_id=str(scope["collection_id"]),
+        anonymize=bool(scope.get("anonymize")),
+        exclusions=exclusions,
+        zone_routes_by_drive=_zone_routes_for_scope(connection, scope_id),
+        min_modified=min_modified,
+        legacy_ctags=legacy_ctags,
+    )
+
+    targets = [
+        DriveTarget(
+            drive_id=str(t["drive_id"]),
+            drive_name=t.get("path") or None,
+            root_item_id=t.get("root_item_id"),
+        )
+        for t in shard["targets"]
+    ]
+    shard_key = ",".join(t.state_key for t in targets)
+
+    recorder = _RunRecorder(
+        connection_id,
+        job_id=payload.get("job_id"),
+        sweep_stale=False,
+        parent_run_id=parent_run_id,
+        shard_key=shard_key,
+        shard_label=shard.get("label"),
+    )
+    recorder.start()
+
+    scope_errors: List[Dict[str, Any]] = []
+    try:
+        try:
+            await _crawl_targets(
+                connection_id,
+                targets_by_scope=[(ctx, targets)],
+                transport=transport,
+                ingestor=ingestor,
+                stats=stats,
+                max_file_mb=max_file_mb,
+                anonymization_key=anonymization_key,
+                recorder=recorder,
+                detector=detector,
+                deadline=deadline,
+                governor=governor,
+                stop_watcher=stop_watcher,
+                convert_pool=convert_pool,
+                force_reprocess=bool(payload.get("force_reprocess")),
+                retry_failed=bool(payload.get("retry_failed")),
+                retry_empty=bool(payload.get("retry_empty")),
+                state_for=lambda t: load_state(connection_id, shard_key=t.state_key),
+                save_for=lambda t, s: save_state(connection_id, s, shard_key=t.state_key),
+            )
+        finally:
+            convert_pool.shutdown()
+        # Streamed facts tail flush, same shape the inline crawl's own tail
+        # uses (design §4.5): each child streams on its OWN counters; the
+        # connection-keyed idempotency dedup collapses K children's
+        # triggers into one queued pass.
+        _maybe_stream_facts_extraction(connection_id, stats, final=True)
+    except BaseException as exc:
+        reason = _stop_reason(exc)
+        interrupted_report = stats.report(max_file_mb=max_file_mb, interrupted=True, interrupted_reason=reason)
+        interrupted_report["connection_id"] = connection_id
+        interrupted_report["scope_errors"] = scope_errors
+        status = "interrupted" if reason in {r for _, r in _STOP_REASONS} else _record_status_for(exc)
+        recorder.finish(
+            stats,
+            status=status,
+            report=interrupted_report,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        _finish_shard_and_maybe_finalize(connection, parent_run_id)
+        # Re-raised — same posture `_run_crawl_async` already takes: the
+        # SHARD job itself fails too (no auto-retry, `retry_in_seconds=
+        # None`), so an operator sees it, even though the row above already
+        # says `interrupted`/`failed` honestly.
+        raise
+
+    report = stats.report(max_file_mb=max_file_mb)
+    report["connection_id"] = connection_id
+    report["scope_errors"] = scope_errors
+    if _ingested_nothing_despite_errors(stats):
+        status = "failed"
+        finish_error = f"{stats.errors} file(s) errored and 0 documents were ingested in this shard"
+    else:
+        status = "done"
+        finish_error = None
+    recorder.finish(stats, status=status, report=report, error=finish_error)
+    _finish_shard_and_maybe_finalize(connection, parent_run_id)
+    return report
+
+
+def _finish_shard_and_maybe_finalize(connection: Dict[str, Any], parent_run_id: str) -> None:
+    """Bump the PARENT's ``shards_done``; the child that observes
+    ``shards_done == shards_total`` wins the :meth:`claim_finalize` race and
+    runs :func:`_finalize_site_run` (design §4.3 — "the LAST child to
+    finish finalizes the parent").
+
+    Never raises: called from a shard child's own finish path (success OR
+    failure), and a coordination hiccup here must not turn an otherwise-
+    already-recorded shard result into a crash — the same observability-
+    never-load-bearing posture every other write in this module takes. A
+    parent left stuck (this bookkeeping failed on what would have been the
+    last child) is recovered by the next ``POST …/extract`` finalizing it
+    instead of re-planning (design §4.3).
+    """
+    try:
+        from src.repositories import extraction_runs_repo
+
+        repo = extraction_runs_repo()
+        result = repo.finish_shard(parent_run_id)
+        if result is None:
+            return
+        shards_total = result.get("shards_total")
+        if shards_total is not None and result.get("shards_done", 0) >= shards_total:
+            if repo.claim_finalize(parent_run_id):
+                _finalize_site_run(connection, parent_run_id)
+    except Exception:  # noqa: BLE001 — coordination bookkeeping, never load-bearing for THIS shard
+        logger.warning(
+            "sharepoint crawl: shard finish/finalize bookkeeping failed for parent run %s (non-fatal)",
+            parent_run_id,
+            exc_info=True,
+        )
+
+
+#: ``CrawlStats.report()`` numeric fields worth SUMMING across every shard
+#: — everything :meth:`CrawlStats.add` accepts, mirrored here rather than
+#: introspected, so a report's own key set (which also carries strings,
+#: nested dicts and lists) never accidentally gets treated as summable.
+_AGGREGATE_COUNTER_FIELDS = (
+    "new",
+    "changed",
+    "unchanged",
+    "deleted",
+    "errors",
+    "drives",
+    "scopes",
+    "oversize_files",
+    "convert_failed",
+    "anonymize_failed",
+    "permission_skips",
+    "delta_resyncs",
+    "excluded_subtree_skips",
+    "filtered_by_age",
+    "age_unknown",
+    "item_retry_given_up",
+    "item_retry_recovered",
+)
+#: Itemized lists worth CONCATENATING (then capping — see
+#: :data:`_AGGREGATE_LIST_CAP`) across every shard.
+_AGGREGATE_LIST_FIELDS = ("scope_errors", "failed_items", "skipped_items")
+#: Mirrors :data:`_FAILED_ITEMS_CAP` — an honestly-truncated aggregate beats
+#: an unbounded one, same contract ``cap_skips`` already gives a single run.
+_AGGREGATE_LIST_CAP = _FAILED_ITEMS_CAP
+
+
+def _aggregate_child_reports(children: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """Fold every shard child's own ``report`` (``CrawlStats.report()``'s
+    shape, read off ``extraction_runs.report``) into ONE report for the
+    PARENT row — the finalizer's own aggregation (design §4.3).
+
+    Numeric counters sum (:data:`_AGGREGATE_COUNTER_FIELDS`);
+    ``scope_errors``/``failed_items``/``skipped_items`` concatenate, capped
+    (:data:`_AGGREGATE_LIST_CAP`) — a truncated list stays VISIBLY
+    truncated, the same contract :func:`connectors.sharepoint.crawler.
+    CrawlStats.report` already gives a single run.
+
+    ``status`` (popped by the caller before the aggregated dict becomes the
+    persisted ``report``): ``failed`` if ANY child failed, else
+    ``interrupted`` if any child was interrupted, else ``done`` —
+    severity-first, the same precedence :class:`_RunRecorder`'s own
+    docstring already uses for a single run.
+
+    Also carries ``shards``: one summary row per child (``run_id``,
+    ``shard_key``, ``shard_label``, ``status``, ``files_seen``,
+    ``files_done``, ``error``) — the read side's per-shard disclosure
+    (Task 8) reads this rather than re-querying every child individually.
+    """
+    counters: Dict[str, int] = {key: 0 for key in _AGGREGATE_COUNTER_FIELDS}
+    lists: Dict[str, List[Any]] = {key: [] for key in _AGGREGATE_LIST_FIELDS}
+    files_seen = 0
+    files_done = 0
+    any_failed = False
+    any_interrupted = False
+    shards_out: List[Dict[str, Any]] = []
+
+    for child in children:
+        report = child.get("report") or {}
+        for key in _AGGREGATE_COUNTER_FIELDS:
+            value = report.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                counters[key] += int(value)
+        for key in _AGGREGATE_LIST_FIELDS:
+            value = report.get(key)
+            if isinstance(value, list):
+                lists[key].extend(value)
+        files_seen += int(child.get("files_seen") or 0)
+        files_done += int(child.get("files_done") or 0)
+        child_status = child.get("status")
+        if child_status == "failed":
+            any_failed = True
+        elif child_status == "interrupted":
+            any_interrupted = True
+        shards_out.append(
+            {
+                "run_id": child.get("id"),
+                "shard_key": child.get("shard_key"),
+                "shard_label": child.get("shard_label"),
+                "status": child_status,
+                "files_seen": child.get("files_seen"),
+                "files_done": child.get("files_done"),
+                "error": child.get("error"),
+            }
+        )
+
+    for key in _AGGREGATE_LIST_FIELDS:
+        lists[key] = lists[key][:_AGGREGATE_LIST_CAP]
+
+    if any_failed:
+        status = "failed"
+    elif any_interrupted:
+        status = "interrupted"
+    else:
+        status = "done"
+
+    aggregated: Dict[str, Any] = dict(counters)
+    aggregated.update(lists)
+    aggregated["files_seen"] = files_seen
+    aggregated["files_done"] = files_done
+    aggregated["shards"] = shards_out
+    aggregated["shards_total"] = len(children)
+    aggregated["status"] = status
+    return aggregated
+
+
+def _finalize_site_run(connection: Dict[str, Any], parent_run_id: str) -> None:
+    """Aggregate every child's report into the PARENT run row, run the
+    chained facts pass ONCE, and finish the parent (design §4.3).
+
+    Runs on whichever child won :meth:`ExtractionRunsPgRepository.
+    claim_finalize` — by construction only ever reached once
+    ``shards_done == shards_total``, so every child is terminal by the time
+    this starts; there is nothing left to wait for. Best-effort around the
+    final write (never raises past this function — a caller mid-shard-
+    finish must not crash on the finalizer's own bookkeeping failing), but
+    the facts stage's own hard stop is recorded honestly (``status``
+    downgrades to ``failed`` and the parent's ``error`` names it), matching
+    the inline crawl's own severity-first posture.
+    """
+    connection_id = str(connection["id"])
+    from src.repositories import extraction_runs_repo
+
+    repo = extraction_runs_repo()
+    children = repo.children_for([parent_run_id]).get(parent_run_id, [])
+    aggregated = _aggregate_child_reports(children)
+    aggregated["connection_id"] = connection_id
+    status = aggregated.pop("status")
+
+    state = load_state(connection_id)
+    state["last_run"] = aggregated
+    # The legacy connection-level `ctags` seed (`_ScopeContext.legacy_
+    # ctags`) has now served its purpose for every shard that could ever
+    # consult it — cleared ONCE, on the first fully-done sharded run, so a
+    # future resync (or re-plan) never re-seeds from a cursor every shard's
+    # own row has long since superseded.
+    if state.get("ctags"):
+        state["ctags"] = {}
+    save_state(connection_id, state)
+
+    error: Optional[str] = None
+    facts_report: Optional[Dict[str, Any]] = None
+    if status != "failed":
+        try:
+            from connectors.sharepoint.facts_extraction import _standalone_timeout_seconds
+
+            deadline = _Deadline(_standalone_timeout_seconds())
+            facts_recorder = _RunRecorder(connection_id, sweep_stale=False)
+            facts_recorder.run_id = parent_run_id  # already open — only ever FINISHED below
+            facts_stats = CrawlStats()
+            facts_report = maybe_run_facts_extraction(
+                connection, deadline=deadline, stats=facts_stats, recorder=facts_recorder
+            )
+        except BaseException as exc:  # noqa: BLE001 — a facts hard-stop still finalizes the parent, honestly
+            error = f"{type(exc).__name__}: {exc}"
+            status = "failed"
+
+    if facts_report is not None:
+        aggregated["facts"] = facts_report
+        aggregated["facts_usage"] = facts_report.get("facts_usage") or {}
+
+    try:
+        from src.repositories.extraction_runs_pg import cap_skips
+
+        repo.finish(
+            parent_run_id,
+            status=status,
+            report=aggregated,
+            usage={},
+            skips=cap_skips(aggregated.get("failed_items") or [], total=len(aggregated.get("failed_items") or [])),
+            files_seen=aggregated.get("files_seen"),
+            files_done=aggregated.get("files_done"),
+            error=error,
+        )
+        logger.info(
+            "sharepoint crawl: connection %s — parent run %s finalized (%s, %d shard(s))",
+            connection_id,
+            parent_run_id,
+            status,
+            aggregated.get("shards_total"),
+        )
+    except Exception:  # noqa: BLE001 — never load-bearing; see module-wide recorder posture
+        logger.warning(
+            "sharepoint crawl: could not finalize parent run %s for connection %s (non-fatal)",
+            parent_run_id,
+            connection_id,
+            exc_info=True,
+        )
