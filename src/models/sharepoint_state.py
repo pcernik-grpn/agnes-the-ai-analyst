@@ -19,13 +19,24 @@ job queue already uses removes that coincidence.
 
 One row per ``(connection_id, kind)`` — ``kind`` is ``"crawl"`` (the
 delta-link + cTag + failed-item bookkeeping ``connectors/sharepoint/
-crawler.py`` used to keep in ``sharepoint_crawl/<connection_id>.json``) or
+crawler.py`` used to keep in ``sharepoint_crawl/<connection_id>.json``),
 ``"facts"`` (the per-document extraction bookkeeping ``connectors/
 sharepoint/facts_extraction.py`` used to keep in ``sharepoint_facts/
-<connection_id>.json``) — deliberately two ROWS, never one JSON blob keyed
-by both: a corrupt facts pass must never cost the crawl its deltaLinks, and
-a resync must never touch the facts corpus's own bookkeeping, exactly the
-isolation the two separate legacy files gave for free.
+<connection_id>.json``), or ``"crawl:<state_key>"`` (2026-09-03 auto-
+parallel-crawl design §4.2 — one row per DELTA UNIT, owned by exactly one
+shard child; ``state_key`` is a ``DriveTarget.state_key``, e.g. a drive id
+or ``"<drive_id>:<item_id>"``) — deliberately separate ROWS, never one JSON
+blob keyed by all of them: a corrupt facts pass must never cost the crawl
+its deltaLinks, a resync must never touch the facts corpus's own
+bookkeeping, and two shard children must never be able to clobber each
+other's cursor — exactly the isolation the original two separate legacy
+files gave for free, extended to N.
+
+The connection-level ``"crawl"`` row is kept even once a connection shards:
+it still carries the persisted ``shard_plan`` and, read-only, the legacy
+per-drive ``ctags`` a shard's own row seeds from until its first fully-done
+sharded run (see ``connectors/sharepoint/crawler.py``'s ``legacy_ctags``
+docstring) — never written to by a shard child.
 
 ``payload`` keeps the exact same JSON shape either module already wrote to
 its file — nothing about ``crawler.py``'s or ``facts_extraction.py``'s own
@@ -48,7 +59,12 @@ from src.db_pg import Base
 
 class SharepointConnectionState(Base):
     __tablename__ = "sharepoint_connection_state"
-    __table_args__ = (sa.CheckConstraint("kind IN ('crawl', 'facts')", name="ck_sharepoint_connection_state_kind"),)
+    __table_args__ = (
+        sa.CheckConstraint(
+            "kind IN ('crawl', 'facts') OR kind LIKE 'crawl:%'",
+            name="ck_sharepoint_connection_state_kind",
+        ),
+    )
 
     connection_id: Mapped[str] = mapped_column(sa.String, primary_key=True)
     kind: Mapped[str] = mapped_column(sa.String, primary_key=True)

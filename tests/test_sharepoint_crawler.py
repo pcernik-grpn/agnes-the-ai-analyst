@@ -3666,6 +3666,88 @@ class TestState:
         crawler.save_state("conn1", {"delta_links": {"d": "u"}})
         assert ("put", "crawl", "conn1", {"delta_links": {"d": "u"}}) in calls
 
+    def test_a_shard_key_is_encoded_as_a_crawl_colon_kind(self, crawl_env, monkeypatch):
+        """The write-side half of Task 1's ``save_for``: a shard child's
+        checkpoint must land in ITS OWN row, never the connection-level
+        one (2026-09-03 auto-parallel-crawl design §4.2)."""
+        from connectors.sharepoint import state_store
+
+        calls = []
+        monkeypatch.setattr(state_store, "get", lambda kind, cid: calls.append(("get", kind, cid)) or None)
+        monkeypatch.setattr(state_store, "put", lambda kind, cid, payload: calls.append(("put", kind, cid, payload)))
+
+        crawler.load_state("conn1", shard_key="b!drive1")
+        assert ("get", "crawl:b!drive1", "conn1") in calls
+
+        crawler.save_state("conn1", {"delta_links": {}}, shard_key="b!drive1")
+        assert ("put", "crawl:b!drive1", "conn1", {"delta_links": {}}) in calls
+
+        # The connection-level row (no shard_key) is untouched by either call.
+        assert not any(call[1] == "crawl" for call in calls)
+
+    def test_state_store_refuses_a_shard_kind_on_the_duckdb_fallback(self, crawl_env):
+        """A DuckDB-backed instance never shards (design §4.2) — asking the
+        state store to read/write a per-delta-unit row on that backend must
+        fail clean, not silently write somewhere unexpected."""
+        from connectors.sharepoint import state_store
+
+        with pytest.raises(state_store.StateStoreError):
+            state_store.get("crawl:b!drive1", "conn1")
+        with pytest.raises(state_store.StateStoreError):
+            state_store.put("crawl:b!drive1", "conn1", {})
+
+    def test_crawler_load_state_with_a_shard_key_refuses_on_duckdb(self, crawl_env):
+        from connectors.sharepoint.state_store import StateStoreError
+
+        with pytest.raises(StateStoreError):
+            crawler.load_state("conn1", shard_key="b!drive1")
+
+
+class TestRehomeLegacyBacklog:
+    """``crawler.rehome_legacy_backlog`` — the pure planner helper that
+    splits a legacy (connection-level) ``failed_items``/``empty_items`` dict
+    into per-shard groups by path prefix (2026-09-03 auto-parallel-crawl
+    design §4.2). No fixture needed: pure function, no I/O."""
+
+    def test_each_entry_lands_in_the_shard_whose_prefix_it_falls_under(self):
+        legacy = {
+            "graph:1": {"path": "Reports/Q1/a.docx"},
+            "graph:2": {"path": "Reports/Q2/b.docx"},
+            "graph:3": {"path": "Reports/Q1/nested/c.docx"},
+        }
+        shard_prefixes = [("shard-q1", "Reports/Q1"), ("shard-q2", "Reports/Q2")]
+
+        grouped = crawler.rehome_legacy_backlog(legacy, shard_prefixes)
+
+        assert set(grouped["shard-q1"]) == {"graph:1", "graph:3"}
+        assert set(grouped["shard-q2"]) == {"graph:2"}
+
+    def test_an_unmatched_entry_falls_back_to_the_last_pair(self):
+        """The last pair is, by convention, the remainder shard — its own
+        prefix is `""`, matching everything a more specific shard did not
+        claim, but this helper never assumes that; it just uses whatever
+        the caller put last."""
+        legacy = {"graph:1": {"path": "loose-file.docx"}}
+        shard_prefixes = [("shard-q1", "Reports/Q1"), ("remainder", "")]
+
+        grouped = crawler.rehome_legacy_backlog(legacy, shard_prefixes)
+
+        assert grouped == {"remainder": {"graph:1": {"path": "loose-file.docx"}}}
+
+    def test_more_specific_prefix_wins_over_a_shorter_one_when_ordered_first(self):
+        legacy = {"graph:1": {"path": "Reports/Q1/Nested/deep.docx"}}
+        shard_prefixes = [("nested-shard", "Reports/Q1/Nested"), ("q1-shard", "Reports/Q1")]
+
+        grouped = crawler.rehome_legacy_backlog(legacy, shard_prefixes)
+
+        assert grouped == {"nested-shard": {"graph:1": {"path": "Reports/Q1/Nested/deep.docx"}}}
+
+    def test_empty_shard_prefixes_returns_nothing(self):
+        assert crawler.rehome_legacy_backlog({"graph:1": {"path": "a.docx"}}, []) == {}
+
+    def test_empty_legacy_backlog_returns_nothing(self):
+        assert crawler.rehome_legacy_backlog({}, [("shard-a", "")]) == {}
+
 
 # --------------------------------------------------------------------------
 # Entry point / detector choice / run deadline

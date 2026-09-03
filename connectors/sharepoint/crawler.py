@@ -661,17 +661,31 @@ def state_path(connection_id: str) -> Path:
         raise CrawlError(str(exc)) from exc
 
 
-def load_state(connection_id: str) -> Dict[str, Any]:
+def _crawl_state_kind(shard_key: Optional[str] = None) -> str:
+    """``"crawl"`` for the connection-level row; ``"crawl:<shard_key>"`` for
+    one delta unit's own row (2026-09-03 auto-parallel-crawl design §4.2,
+    migration ``0103_crawl_shards``) — a shard child never shares a state
+    row with a sibling or with the connection-level row it seeds its
+    ``legacy_ctags`` from."""
+    return "crawl" if shard_key is None else f"crawl:{shard_key}"
+
+
+def load_state(connection_id: str, shard_key: Optional[str] = None) -> Dict[str, Any]:
     """Read this connection's crawl state, tolerating a torn/absent file or
     a never-before-seen connection.
 
     Unreadable/missing state must not wedge every future run: the worst
     case of starting over is re-work (already-ingested documents upsert to
     a no-op), while refusing to run is a permanent outage.
+
+    ``shard_key`` (optional — the shard-crawl seam, Task 1's ``state_for``)
+    reads a SHARD's own per-delta-unit row instead of the connection-level
+    one — see :func:`_crawl_state_kind`. ``None`` (every caller before
+    sharding existed) is today's connection-wide row, unchanged.
     """
     from connectors.sharepoint.state_store import get as _state_get
 
-    state: Dict[str, Any] = _state_get("crawl", connection_id) or {}
+    state: Dict[str, Any] = _state_get(_crawl_state_kind(shard_key), connection_id) or {}
     state.setdefault("delta_links", {})
     state.setdefault("ctags", {})
     #: ``stable_id -> {state_key, path, item, attempts, ..., given_up}`` —
@@ -693,18 +707,23 @@ def load_state(connection_id: str) -> Dict[str, Any]:
     return state
 
 
-def save_state(connection_id: str, state: Dict[str, Any]) -> None:
+def save_state(connection_id: str, state: Dict[str, Any], shard_key: Optional[str] = None) -> None:
     """Persist this connection's crawl state — a Postgres upsert, or an
     atomic file replace (tmp + ``os.replace``) on the DuckDB fallback.
 
     Serialized on :data:`_state_lock`: one writer at a time, and never
     concurrent with an in-page cTag write (which takes the same lock), so
     what lands is always a whole, self-consistent snapshot.
+
+    ``shard_key`` — see :func:`load_state`'s docstring; the write-side half
+    of the same seam. A shard child's own ``save_for`` closure (Task 4)
+    passes its target's ``state_key`` here so its checkpoint never lands in
+    the connection-level row.
     """
     from connectors.sharepoint.state_store import put as _state_put
 
     with _state_lock:
-        _state_put("crawl", connection_id, state)
+        _state_put(_crawl_state_kind(shard_key), connection_id, state)
 
 
 # --------------------------------------------------------------------------
@@ -5827,6 +5846,46 @@ async def _crawl_targets(
             )
 
 
+def rehome_legacy_backlog(
+    legacy: Mapping[str, Any], shard_prefixes: Sequence[Tuple[str, str]]
+) -> Dict[str, Dict[str, Any]]:
+    """Split a legacy (connection-level) ``failed_items``/``empty_items``
+    dict into per-shard groups by path prefix — the ONE-TIME backlog
+    rehoming a shard plan does the first time it shards an already-crawled
+    drive (2026-09-03 auto-parallel-crawl design §4.2): each entry's own
+    ``path`` (recorded by :func:`_note_retry`/:func:`_note_empty` at
+    failure time) is matched against ``shard_prefixes`` — ``(shard_key,
+    prefix)`` pairs, caller-ordered MOST-SPECIFIC FIRST, first match wins,
+    same contract :func:`_route_collection` already uses for zone routing.
+
+    An entry matching no prefix falls back to the LAST pair — by convention
+    the remainder shard, whose own ``prefix`` is ``""`` and therefore
+    matches everything — never silently dropped. An empty ``shard_prefixes``
+    returns every entry ungrouped (an empty dict), since there is nowhere to
+    put them.
+
+    Pure: no I/O, no state-file reads/writes, no Graph calls — the caller
+    (the planner) writes each returned group into that shard's own
+    ``crawl:<shard_key>`` row via :func:`save_state`. Returns ``{shard_key:
+    {stable_id: entry}}``, one key per ``shard_prefixes`` entry that
+    actually received at least one item (a shard nothing rehomes to is
+    simply absent, not present with an empty dict).
+    """
+    if not shard_prefixes:
+        return {}
+    fallback_key = shard_prefixes[-1][0]
+    grouped: Dict[str, Dict[str, Any]] = {}
+    for stable_id, entry in legacy.items():
+        path = str((entry or {}).get("path") or "")
+        matched = fallback_key
+        for shard_key, prefix in shard_prefixes:
+            if not prefix or path == prefix or path.startswith(prefix + "/"):
+                matched = shard_key
+                break
+        grouped.setdefault(matched, {})[stable_id] = entry
+    return grouped
+
+
 def _apply_resync(connection_id: str) -> None:
     """Force every drive of this connection to re-enumerate from scratch on
     its next crawl — the supported alternative to hand-editing the crawl
@@ -5840,12 +5899,31 @@ def _apply_resync(connection_id: str) -> None:
     including anything already given up on — would otherwise be stale).
     ``ctags`` are kept: a resync should make Graph tell us about everything
     again, not force re-downloading files whose content has not changed.
+
+    Also resets every SHARD's own per-delta-unit row the same way
+    (2026-09-03 auto-parallel-crawl design §4.2): a sharded site's cursors
+    live in ``crawl:<state_key>`` rows the connection-level row no longer
+    tracks once the FIRST fully-done sharded run has cleared its legacy
+    ``ctags`` (see the crawler module's ``legacy_ctags`` docstring), so a
+    resync that touched only the connection-level row would silently leave
+    every shard's cursor untouched. ``ctags`` is kept per shard row too, for
+    the same reason. A DuckDB-backed instance never has shard rows
+    (:func:`connectors.sharepoint.state_store.list_kinds` always answers
+    ``[]`` there) — a no-op extra step, not a new failure mode.
     """
+    from connectors.sharepoint.state_store import list_kinds as _state_list_kinds
+
     with _state_lock:
         state = load_state(connection_id)
         state["delta_links"] = {}
         state["failed_items"] = {}
         save_state(connection_id, state)
+        for kind in _state_list_kinds(connection_id, "crawl:"):
+            shard_key = kind[len("crawl:") :]
+            shard_state = load_state(connection_id, shard_key=shard_key)
+            shard_state["delta_links"] = {}
+            shard_state["failed_items"] = {}
+            save_state(connection_id, shard_state, shard_key=shard_key)
 
 
 def run_builtin_crawl(payload: dict) -> dict:

@@ -21,7 +21,7 @@ from __future__ import annotations
 import contextlib
 import json
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterator, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
 import sqlalchemy as sa
 from sqlalchemy.engine import Engine
@@ -102,6 +102,27 @@ class SharepointStatePgRepository:
                 sa.text("DELETE FROM sharepoint_connection_state WHERE connection_id = :cid AND kind = :kind"),
                 {"cid": connection_id, "kind": kind},
             )
+
+    def list_kinds(self, connection_id: str, prefix: str) -> List[str]:
+        """Every ``kind`` this connection has a row for, starting with
+        ``prefix`` — the shard-state discovery primitive (2026-09-03 auto-
+        parallel-crawl design §4.2). ``list_kinds(cid, "crawl:")`` finds
+        every per-delta-unit state row a resync (or the planner) needs to
+        touch, without the caller having to already know how many shards
+        exist or what their keys are. Order is not significant — callers
+        that care sort for themselves."""
+        with self._engine.connect() as conn:
+            rows = (
+                conn.execute(
+                    sa.text(
+                        "SELECT kind FROM sharepoint_connection_state WHERE connection_id = :cid AND kind LIKE :prefix"
+                    ),
+                    {"cid": connection_id, "prefix": f"{prefix}%"},
+                )
+                .scalars()
+                .all()
+            )
+        return [str(r) for r in rows]
 
     def import_if_absent(self, connection_id: str, kind: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Insert ``payload`` as this row's initial content ONLY if it does
