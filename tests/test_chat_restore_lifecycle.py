@@ -587,6 +587,12 @@ def _chat_js() -> str:
 
 
 def _slice(js: str, start_marker: str, end_marker: str) -> str:
+    """`end_marker` is whatever declaration follows the one under test, so it
+    moves whenever that neighbour does. The markers below were
+    `chatErrorCopy` until the copy helpers moved to `chat_errors.js` (one home
+    for the sentences, shared with /_debug/error-surfaces); `handleFrame` is
+    openSession's neighbour now. A move fails here with a bare ValueError —
+    the fix is to re-point the marker, not to change what is asserted."""
     start = js.index(start_marker)
     return js[start : js.index(end_marker, start)]
 
@@ -623,7 +629,7 @@ class TestDeepLinkRestoreIsNotSilent:
         body = _slice(
             _chat_js(),
             "async function openSession(chatId, wsUrlOverride, { restoring = false } = {}) {",
-            "function chatErrorCopy(raw, kind) {",
+            "function handleFrame(frame) {",
         )
         assert "if (!restoring) _syncSessionUrl(_sessionHasTurns ? chatId : null);" in body
 
@@ -631,7 +637,7 @@ class TestDeepLinkRestoreIsNotSilent:
         body = _slice(
             _chat_js(),
             "async function openSession(chatId, wsUrlOverride, { restoring = false } = {}) {",
-            "function chatErrorCopy(raw, kind) {",
+            "function handleFrame(frame) {",
         )
         assert "if (restoring && !hydrated.ok) {" in body
         # A history failure means the conversation could not be READ — that,
@@ -646,7 +652,7 @@ class TestDeepLinkRestoreIsNotSilent:
         body = _slice(
             _chat_js(),
             "async function openSession(chatId, wsUrlOverride, { restoring = false } = {}) {",
-            "function chatErrorCopy(raw, kind) {",
+            "function handleFrame(frame) {",
         )
         ticket_catch = body[body.index("const t = await api(`/api/chat/sessions/${chatId}/ticket`") :]
         assert "_renderResumeFailure(err.message);" in ticket_catch
@@ -700,7 +706,7 @@ class TestConcurrentOpensCannotClobberEachOther:
         body = _slice(
             _chat_js(),
             "async function openSession(chatId, wsUrlOverride, { restoring = false } = {}) {",
-            "function chatErrorCopy(raw, kind) {",
+            "function handleFrame(frame) {",
         )
         assert "const openGen = ++_openGeneration;" in body
         # One after the history hydrate, one after a successful ticket mint,
@@ -711,7 +717,7 @@ class TestConcurrentOpensCannotClobberEachOther:
         body = _slice(
             _chat_js(),
             "async function openSession(chatId, wsUrlOverride, { restoring = false } = {}) {",
-            "function chatErrorCopy(raw, kind) {",
+            "function handleFrame(frame) {",
         )
         ws_claim = body.index("ws = new WebSocket(")
         guard = body.rindex("openGen !== _openGeneration", 0, ws_claim)
@@ -758,7 +764,7 @@ class TestReattachShowsThatSomethingIsRunning:
         body = _slice(
             _chat_js(),
             "async function openSession(chatId, wsUrlOverride, { restoring = false } = {}) {",
-            "function chatErrorCopy(raw, kind) {",
+            "function handleFrame(frame) {",
         )
         assert "turnInFlight = !!(t && t.turn_in_flight);" in body
         paint = body[body.index("if (turnInFlight) {") :]

@@ -376,6 +376,41 @@ class TestUsersSmoke:
 
 
 # ---------------------------------------------------------------------------
+# Service accounts (issue #1534) — PG-only (A3 ratchet).
+# ---------------------------------------------------------------------------
+
+
+class TestServiceAccountsSmoke:
+    COVERED_ROUTES = {
+        "POST /api/admin/service-accounts",
+        "GET /api/admin/service-accounts",
+        "POST /api/admin/service-accounts/{service_account_id}/tokens",
+        "PATCH /api/admin/service-accounts/{service_account_id}",
+    }
+
+    def test_create_and_list(self, seeded_app_both):
+        r = seeded_app_both["client"].post(
+            "/api/admin/service-accounts",
+            json={"name": "Smoke Bot", "slug": "smoke-bot"},
+            headers=_admin_headers(seeded_app_both),
+        )
+        assert r.status_code in (201, 501)
+
+        r2 = seeded_app_both["client"].get("/api/admin/service-accounts", headers=_admin_headers(seeded_app_both))
+        assert r2.status_code in (200, 501)
+
+    def test_mint_and_lifecycle_update_are_reachable(self, seeded_app_both):
+        """Path-param routes: 404 (no such account) on Postgres, 501
+        (RequiresPostgresBackend) on DuckDB — never a raw 500 either way."""
+        client = seeded_app_both["client"]
+        headers = _admin_headers(seeded_app_both)
+        r = client.post("/api/admin/service-accounts/does-not-exist/tokens", json={"name": "x"}, headers=headers)
+        assert r.status_code in (404, 501), r.status_code
+        r = client.patch("/api/admin/service-accounts/does-not-exist", json={"active": False}, headers=headers)
+        assert r.status_code in (404, 501), r.status_code
+
+
+# ---------------------------------------------------------------------------
 # RBAC (groups + grants + access-overview)
 # ---------------------------------------------------------------------------
 
@@ -2441,6 +2476,18 @@ KNOWN_UNTESTED = {
     "POST /api/chat/uploads",
     "GET /library",
     "GET /library/{slug}",
+    # The HTML fragment the Library's live search fetches for the files a
+    # folder's inline peek did not render (#2141 item 2). Same exclusion and
+    # the same reason as the two rows above: it needs a real slug AND a
+    # collection with files, so it is not a parameter-free route, and it adds
+    # no repo method or migration (its reads go through corpus_files_repo and
+    # resource_grants_repo, both already parity-covered). Behaviour covered in
+    # tests/test_web_library_artefacts_reading.py — the rows the peek left
+    # out, the empty-`q` and no-match empty responses, the result cap, 404 for
+    # unknown AND for no-access, and the gate being COLLECTION access rather
+    # than the file page's wider per-file rule (a per-file grant must not
+    # enumerate siblings).
+    "GET /library/{slug}/matching-files",
     # Authoring studio + suggestion queue + memory-mining consent — covered by
     # dedicated suites (tests/test_authoring_suggestions_api.py, tests/test_web_studio.py);
     # web-form / admin-moderation flows, not part of the parameter-free smoke sweep.

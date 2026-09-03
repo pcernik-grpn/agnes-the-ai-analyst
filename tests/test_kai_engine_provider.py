@@ -1427,3 +1427,204 @@ class TestStopSurvivesTeardownAndRecovery:
         assert "self._finish_turn(state)" in after.split("continue", 1)[0], (
             "a cancelled turn ends through _finish_turn, like the pre-turn race above"
         )
+
+
+# ---------------------------------------------------------------------------
+# "Allow for session" on the engine provider (issue #2161)
+# ---------------------------------------------------------------------------
+
+
+def _gated_call_turn(call_id: str, tool: str, args: dict, gate: "asyncio.Event | None", output: str = "ok") -> dict:
+    """One engine turn: a tool call that needs approval, then its output."""
+    events = [
+        {"type": "tool-input-available", "toolCallId": call_id, "toolName": tool, "input": args},
+        {"type": "tool-approval-request", "toolCallId": call_id},
+    ]
+    tail = [{"type": "tool-output-available", "toolCallId": call_id, "output": output}, {"type": "finish"}]
+    if gate is None:
+        return {"pre": events + tail}
+    return {"pre": events, "gate": gate, "post": tail}
+
+
+async def _answer_card(handle, engine: FakeEngine, request_id: str, decision: str) -> dict:
+    """Read frames up to the card for ``request_id``, answer it, and return
+    the card. Waits until the engine has taken the decision."""
+    while True:
+        frame = json.loads(await handle.stdout.readline())
+        if frame.get("type") == "approval_request":
+            assert frame["request_id"] == request_id
+            break
+    before = len(engine.approvals)
+    await _send(handle, {"type": "approval_decision", "request_id": request_id, "decision": decision})
+    for _ in range(50):
+        if len(engine.approvals) > before:
+            break
+        await asyncio.sleep(0.02)
+    assert engine.approvals[-1] == {"toolUseId": request_id, "approved": decision in ("allow", "allow_session")}
+    return frame
+
+
+def test_allow_for_session_answers_the_next_identical_call_without_a_card():
+    """The engine's approval endpoint knows only allow/deny per call, so the
+    handle honours ``allow_session`` itself: the user approves ``crm_search
+    {"q": "acme"}`` once for the session and the engine's next request for
+    that same call is answered here with no card — the same shape as the
+    ``AskUserQuestion`` auto-approval, keyed on the user's decision instead of
+    a constant (issue #2161). Unlike that one it still closes with an
+    ``approval_resolved`` (marked ``remembered``): that frame is what stamps
+    the earlier decision onto the call's tool line, so the transcript shows
+    the call ran on the session grant rather than unasked."""
+
+    async def _run():
+        engine = FakeEngine()
+        gate = asyncio.Event()
+        engine.turns = [
+            _gated_call_turn("call-a", "crm_search", {"q": "acme"}, gate),
+            _gated_call_turn("call-b", "crm_search", {"q": "acme"}, None),
+        ]
+        provider = KaiEngineProvider(base_url="http://engine:3000", mint=_mint_factory([]), transport=engine)
+        handle = await _spawn(provider)
+
+        await _send(handle, {"type": "user_msg", "text": "find acme"})
+        await _answer_card(handle, engine, "call-a", "allow_session")
+        resolved = json.loads(await handle.stdout.readline())
+        assert resolved["type"] == "approval_resolved" and resolved["decision"] == "allow_session"
+        gate.set()
+        first = await _drain_until_done(handle)
+        assert any(f.get("type") == "tool_result" and f.get("tool_use_id") == "call-a" for f in first)
+
+        await _send(handle, {"type": "user_msg", "text": "again"})
+        second = await _drain_until_done(handle)
+        for _ in range(50):
+            if len(engine.approvals) == 2:
+                break
+            await asyncio.sleep(0.02)
+        second += await _read_trailing(handle)
+        await handle.kill()
+
+        assert "approval_request" not in _types(second), "the identical call was approved for the session"
+        remembered = [f for f in second if f.get("type") == "approval_resolved"]
+        assert remembered == [
+            {"type": "approval_resolved", "request_id": "call-b", "decision": "allow_session", "remembered": True}
+        ], "the remembered decision is recorded on the call — once, marked as remembered"
+        assert engine.approvals == [
+            {"toolUseId": "call-a", "approved": True},
+            {"toolUseId": "call-b", "approved": True},
+        ], "the engine still receives an allow for the second call — it is parked waiting for one"
+        assert any(f.get("type") == "tool_result" and f.get("tool_use_id") == "call-b" for f in second)
+
+    asyncio.run(_run())
+
+
+def test_allow_for_session_is_keyed_on_the_arguments_too():
+    """Mirrors the native gate's ``_session_approved`` key (tool + arguments):
+    approving one call must not pre-approve the next one with different
+    arguments, and a plain ``allow`` remembers nothing at all."""
+
+    async def _run():
+        engine = FakeEngine()
+        gate_a, gate_b, gate_c = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        engine.turns = [
+            _gated_call_turn("call-a", "crm_update", {"id": 1}, gate_a),
+            _gated_call_turn("call-b", "crm_update", {"id": 2}, gate_b),
+            _gated_call_turn("call-c", "crm_update", {"id": 2}, gate_c),
+        ]
+        provider = KaiEngineProvider(base_url="http://engine:3000", mint=_mint_factory([]), transport=engine)
+        handle = await _spawn(provider)
+
+        await _send(handle, {"type": "user_msg", "text": "1"})
+        await _answer_card(handle, engine, "call-a", "allow_session")
+        gate_a.set()
+        await _drain_until_done(handle)
+
+        # Different arguments → a card again.
+        await _send(handle, {"type": "user_msg", "text": "2"})
+        card = await _answer_card(handle, engine, "call-b", "allow")
+        assert json.loads(card["command"]) == {"id": 2}
+        gate_b.set()
+        await _drain_until_done(handle)
+
+        # Same arguments as call-b, but that one was a plain allow → asks again.
+        await _send(handle, {"type": "user_msg", "text": "3"})
+        await _answer_card(handle, engine, "call-c", "deny")
+        gate_c.set()
+        await _drain_until_done(handle)
+        await handle.kill()
+        assert [a["toolUseId"] for a in engine.approvals] == ["call-a", "call-b", "call-c"]
+
+    asyncio.run(_run())
+
+
+def test_allow_for_session_is_not_remembered_when_the_engine_refused_the_post():
+    """A decision that never reached the engine approved nothing — so it must
+    not silently pre-approve the next identical call either."""
+
+    class RefusingEngine(FakeEngine):
+        def __init__(self) -> None:
+            super().__init__()
+            self.refuse_approvals = True
+
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            if request.method == "POST" and request.url.path.endswith("/approval") and self.refuse_approvals:
+                await request.aread()
+                return httpx.Response(500, json={"message": "boom"})
+            return await super().handle_async_request(request)
+
+    async def _run():
+        engine = RefusingEngine()
+        gate = asyncio.Event()
+        engine.turns = [
+            _gated_call_turn("call-a", "crm_update", {"id": 1}, gate),
+            _gated_call_turn("call-b", "crm_update", {"id": 1}, None),
+        ]
+        provider = KaiEngineProvider(base_url="http://engine:3000", mint=_mint_factory([]), transport=engine)
+        handle = await _spawn(provider)
+
+        await _send(handle, {"type": "user_msg", "text": "1"})
+        while True:
+            frame = json.loads(await handle.stdout.readline())
+            if frame.get("type") == "approval_request":
+                break
+        await _send(handle, {"type": "approval_decision", "request_id": "call-a", "decision": "allow_session"})
+        while True:
+            frame = json.loads(await handle.stdout.readline())
+            if frame.get("type") == "error":
+                assert frame["kind"] == "engine_approval_failed"
+                break
+        gate.set()
+        await _drain_until_done(handle)
+
+        engine.refuse_approvals = False
+        await _send(handle, {"type": "user_msg", "text": "2"})
+        frames = []
+        while True:
+            frame = json.loads(await handle.stdout.readline())
+            frames.append(frame)
+            if frame.get("type") in ("approval_request", "done"):
+                break
+        await handle.kill()
+        assert frames[-1]["type"] == "approval_request", "a decision the engine never took is not a session grant"
+
+    asyncio.run(_run())
+
+
+def test_approval_card_reason_names_the_cause():
+    """The card's reason line says WHY the engine asks — the tool is not
+    declared read-only — instead of the generic "requires approval", so the
+    reader can tell a harmless search from a real write (issue #2161)."""
+
+    async def _run():
+        engine = FakeEngine()
+        engine.turns = [_gated_call_turn("call-r", "crm_search", {"q": "x"}, asyncio.Event())]
+        provider = KaiEngineProvider(base_url="http://engine:3000", mint=_mint_factory([]), transport=engine)
+        handle = await _spawn(provider)
+        await _send(handle, {"type": "user_msg", "text": "hi"})
+        while True:
+            frame = json.loads(await handle.stdout.readline())
+            if frame.get("type") == "approval_request":
+                break
+        await handle.kill()
+        assert "read-only" in frame["reason"]
+        assert frame["reason"] == "This tool is not marked read-only, so the engine asks before running it."
+
+    asyncio.run(_run())

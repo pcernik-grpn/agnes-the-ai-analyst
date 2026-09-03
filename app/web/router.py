@@ -2480,6 +2480,105 @@ def _has_connected_tools(user) -> bool:
         return False
 
 
+def _library_child_row(
+    f: dict,
+    col: dict,
+    *,
+    origin: str,
+    owner_label: str,
+    ownership: str,
+    owner_key: str,
+    visibility: str,
+    stack_state: str,
+    stack_title: str,
+    stack_pill: str,
+) -> dict:
+    """One FILE row nested under its collection's folder row in the Library.
+
+    Extracted from ``library_page``'s own loop because a second caller needs
+    the identical dict: ``library_matching_file_rows`` renders the files a
+    live Library search matched but the folder's peek did not include
+    (#2141 item 2), and it renders them through the SAME ``library_row``
+    macro. Two builders would have meant two answers to "what does a file row
+    say about its sharing", which is not a question this page may answer
+    twice.
+
+    The collection-level facts (`origin`, owner, stack membership) are passed
+    in rather than re-derived: they belong to the FOLDER, and a file inside it
+    inherits them — Stack membership in particular is per collection, so a
+    file claiming an independent state would be wrong, not merely redundant.
+    ``visibility`` is the exception and is the file's OWN (per-file sharing is
+    real and independent of the folder's).
+    """
+    from app.resource_types import ResourceType
+    from app.services.artefact_access import VISIBILITY_LABELS
+
+    ftype_key, ftype_label = _artefact_type(1, f)
+    fsize = f.get("size_bytes")
+    slug = col.get("slug") or ""
+    created = f.get("created_at")
+    child = _library_row_base(
+        item_id=f["id"],
+        kind="artefact",
+        title=f.get("filename") or "Untitled file",
+        description="",
+        # Per-file detail page (files inside a folder had none). `?from=library`
+        # is what tells that page the reader arrived from THIS list, so its
+        # back arrow returns here (with the folder reopened) instead of to the
+        # collection page they have never seen — see the crumb block in
+        # library_file_detail.html.
+        href=f"/library/{slug}/f/{f['id']}?from=library",
+        glyph="doc",
+        type_key="files",
+        type_label=ftype_label,
+        origin=origin,
+        origin_label="Generated" if origin == "generated" else "Uploaded",
+        added_iso=(created.isoformat() if created is not None else None),
+        owner_label=owner_label,
+        ownership=ownership,
+        # A file's own sharing is independent of its folder's.
+        visibility=visibility,
+        visibility_label="",
+        meta_text=_human_size(fsize) if fsize else "",
+        share_type=ResourceType.CORPUS_FILE.value,
+        owner_key=owner_key,
+    )
+    child["file_kind"] = ftype_key
+    # A file inside a folder is titled by its FILENAME and carries no
+    # description at all, so before this its second line was blank. It gets
+    # the same format line as a loose file — the nested rows are files too,
+    # and the retired Type column is where their format used to show.
+    child["file_format"] = _artefact_format(f)
+    child["format_keys"] = [child["file_format"]] if child["file_format"] else []
+    # Whether the extraction pass actually got text out of this file. Only
+    # surfaced when it is NOT `indexed`: a healthy file saying "indexed" on
+    # every row is noise, but a file nobody can search is worth knowing about
+    # without opening the collection page to find it.
+    child["ingest_label"] = _ingest_label(f)
+    child["file_id"] = f["id"]
+    child["file_name"] = f.get("filename") or ""
+    child["slug"] = slug
+    child["is_folder"] = False
+    # Stack membership is per collection, so a file inherits its folder's
+    # state rather than claiming an independent one.
+    child["stack_state"] = stack_state
+    child["stack_title"] = stack_title
+    child["stack_pill"] = stack_pill
+    child["parent_id"] = col["id"]
+    # Same vocabulary as every other row — read off the shared map rather than
+    # restated here, which is how this slot came to hold a fourth spelling of
+    # the same three states.
+    child["visibility_label"] = VISIBILITY_LABELS.get(child["visibility"], VISIBILITY_LABELS["private"])
+    return child
+
+
+#: How many files a Library folder row reveals when it is expanded inline.
+#: Deliberately a PEEK: the expansion carries no search, filter or pager, so
+#: past a dozen rows it is a wall rather than an answer — and the collection
+#: page it links on to has all three (#2141 item 2).
+_LIBRARY_FOLDER_PEEK = 10
+
+
 @router.get("/library", response_class=HTMLResponse)
 async def library_page(
     request: Request,
@@ -2528,7 +2627,6 @@ async def library_page(
 
     from app.resource_types import ResourceType
     from app.services.artefact_access import (
-        VISIBILITY_LABELS,
         build_artefact_access_context,
         collection_visibility,
     )
@@ -2823,62 +2921,35 @@ async def library_page(
             # it (the file default differs from the collection default).
             row["own_description"] = col.get("description") or ""
             row["children"] = []
+            # How many files a folder shows INLINE before it hands the reader
+            # over to its own page. A crawled source collection runs to
+            # thousands of files, and the expansion rendered every one of them:
+            # a flat wall of machine-named rows with no search box, no filter
+            # and no pager — the one place the list is actually met, and the
+            # only place it could not be narrowed (#2141 item 2). The
+            # collection page HAS that search, so the expansion is a PEEK with
+            # a way through to it. It also stops the Library from carrying
+            # thousands of hidden <tr>s it never shows.
+            peek = files[:_LIBRARY_FOLDER_PEEK] if is_folder else []
+            # What the peek left out. Drives the "Browse all N files" row; 0
+            # means the expansion is the whole folder and no such row renders.
+            row["children_hidden"] = max(0, file_count - len(peek)) if is_folder else 0
             if is_folder:
-                slug = col.get("slug")
-                for f in files:
-                    ftype_key, ftype_label = _artefact_type(1, f)
-                    fsize = f.get("size_bytes")
-                    child = _library_row_base(
-                        item_id=f["id"],
-                        kind="artefact",
-                        title=f.get("filename") or "Untitled file",
-                        description="",
-                        # Per-file detail page (files inside a folder had none).
-                        href=f"/library/{slug}/f/{f['id']}",
-                        glyph="doc",
-                        type_key="files",
-                        type_label=ftype_label,
-                        origin=origin,
-                        origin_label="Generated" if origin == "generated" else "Uploaded",
-                        added_iso=(f.get("created_at").isoformat() if f.get("created_at") is not None else None),
-                        owner_label=owner_label,
-                        ownership=ownership,
-                        # A file's own sharing is independent of its folder's.
-                        visibility=file_visibility(f["id"]),
-                        visibility_label="",
-                        meta_text=_human_size(fsize) if fsize else "",
-                        share_type=ResourceType.CORPUS_FILE.value,
-                        owner_key="me" if owned else (col.get("created_by") or ""),
+                for f in peek:
+                    row["children"].append(
+                        _library_child_row(
+                            f,
+                            col,
+                            origin=origin,
+                            owner_label=owner_label,
+                            ownership=ownership,
+                            owner_key="me" if owned else (col.get("created_by") or ""),
+                            visibility=file_visibility(f["id"]),
+                            stack_state=row["stack_state"],
+                            stack_title=row["stack_title"],
+                            stack_pill=row["stack_pill"],
+                        )
                     )
-                    child["file_kind"] = ftype_key
-                    # A file inside a folder is titled by its FILENAME and carries
-                    # no description at all, so before this its second line was
-                    # blank. It gets the same format line as a loose file — the
-                    # nested rows are files too, and the retired Type column is
-                    # where their format used to show.
-                    child["file_format"] = _artefact_format(f)
-                    child["format_keys"] = [child["file_format"]] if child["file_format"] else []
-                    # Whether the extraction pass actually got text out of this
-                    # file. Only surfaced when it is NOT `indexed`: a healthy
-                    # file saying "indexed" on every row is noise, but a file
-                    # nobody can search is worth knowing about without opening
-                    # the collection page to find it.
-                    child["ingest_label"] = _ingest_label(f)
-                    child["file_id"] = f["id"]
-                    child["file_name"] = f.get("filename") or ""
-                    child["slug"] = slug or ""
-                    child["is_folder"] = False
-                    # Stack membership is per collection, so a file inherits its
-                    # folder's state rather than claiming an independent one.
-                    child["stack_state"] = row["stack_state"]
-                    child["stack_title"] = row["stack_title"]
-                    child["stack_pill"] = row["stack_pill"]
-                    child["parent_id"] = col["id"]
-                    # Same vocabulary as every other row — read off the shared
-                    # map rather than restated here, which is how this slot came
-                    # to hold a fourth spelling of the same three states.
-                    child["visibility_label"] = VISIBILITY_LABELS.get(child["visibility"], VISIBILITY_LABELS["private"])
-                    row["children"].append(child)
             items.append(row)
     except Exception as e:
         _lost("files and collections", e)
@@ -3678,9 +3749,7 @@ async def library_page(
         try:
             _accessible = get_accessible_tables(user)
             _allowed = None if _accessible is None else set(_accessible)
-            _visible_metrics = [
-                m for m in metric_repo().list() if _first_inaccessible_table(m, _allowed) is None
-            ]
+            _visible_metrics = [m for m in metric_repo().list() if _first_inaccessible_table(m, _allowed) is None]
         except Exception as e:  # noqa: BLE001 — one lost count, not the row
             logger.warning("/library: could not count visible metrics: %s", e)
         # Through the shared helper, not a second inline
@@ -4144,6 +4213,12 @@ async def library_page(
         library_sections=library_sections,
         library_tabs=library_tabs,
         library_active_tab=library_active_tab,
+        # The count the page's own `refreshItemCount` will compute on its first
+        # apply(): the ACTIVE tab's total, not the whole inventory. Rendered
+        # server-side so the line does not change its number a beat after
+        # first paint — the tabs are a partition, and "17 items" swapping to
+        # "10 items" reads as something the reader did (#2141 item 1).
+        library_active_count=_tab_counts.get(library_active_tab, 0),
         library_definitions=library_definitions,
         library_origins=library_origins,
         library_requirements=library_requirements,
@@ -4169,6 +4244,13 @@ async def library_page(
         library_ages=library_ages,
         # Highlight target after "Save to Library" (see the builders).
         library_new_id=request.query_params.get("new") or "",
+        # Folder to expand on arrival — `/library?open=<collection_id>`. Back
+        # from a file's own page returns here, and the row the reader clicked
+        # only exists inside an expanded folder, so without this "back" landed
+        # on a list that did not contain the thing they came from (#2141 item
+        # 3). Passed to the page as a JS string and only ever compared against
+        # ids already in the DOM, exactly like `library_new_id` above.
+        library_open_folder=request.query_params.get("open") or "",
         # Band to open on arrival — a detail page's back link returns here as
         # /library?section=<type_key> (router._detail_back) and the bands are
         # folded by default, so without this the caller lands on a closed
@@ -5514,6 +5596,143 @@ _FILES_SECTION_PAGE_SIZE = 25
 # in the order the status filter offers them — the order a file is most
 # likely to actually be in, not alphabetical.
 _CORPUS_FILE_STATUSES = ("indexed", "processing", "pending", "needs_review", "rejected")
+
+
+#: How many matched files one folder reveals inline under a Library search.
+#: Higher than the unfiltered peek: there the ten rows are an arbitrary
+#: sample, here every row is an answer to what the reader typed.
+_LIBRARY_MATCH_LIMIT = 25
+
+
+@router.get("/library/{slug}/matching-files", response_class=HTMLResponse)
+async def library_matching_file_rows(
+    slug: str,
+    request: Request,
+    q: str = "",
+    user: dict = Depends(get_current_user),
+    conn: duckdb.DuckDBPyConnection = Depends(_get_db),
+):
+    """The file rows of one collection that match ``q`` — as Library child rows.
+
+    Why this exists: the Library expands a folder to a PEEK of its files
+    (``_LIBRARY_FOLDER_PEEK``), and its search box is live and client-side. A
+    folder is searchable by every filename it holds, so typing a filename
+    finds the folder — but if that file is not in the ten the peek rendered,
+    the folder opened onto nothing and the reader had to click through to the
+    collection page to see the file they had already named (#2141 item 2,
+    review). The page asks this route for the rows instead, so the match is
+    the answer rather than a signpost to it.
+
+    Renders through the SAME ``library_row`` macro the page uses, from the
+    same ``_library_child_row`` dict — a fragment endpoint precisely so the
+    markup and the sharing vocabulary have one source, not a second copy in
+    JavaScript that would drift from the first.
+
+    RBAC: collection access, admins exempt — the same gate as
+    ``/library/{slug}``, because that is what this lists. Deliberately NOT the
+    wider per-file rule ``library_file_detail`` uses: a caller holding a grant
+    on one file inside a folder may open that file, and must not be able to
+    enumerate its siblings. 404 for missing AND for no-access, matching the
+    collection contract.
+
+    An empty ``q`` returns nothing: this route answers a search, and a blank
+    search is what the peek already renders.
+    """
+    from app.auth.access import can_access_collection
+    from app.resource_types import ResourceType
+    from src.db import SYSTEM_EVERYONE_GROUP
+
+    q_norm = (q or "").strip()
+    if not q_norm:
+        return HTMLResponse("")
+
+    col = file_corpora_repo().get_by_slug(slug)
+    if not col:
+        raise HTTPException(status_code=404, detail="collection_not_found")
+    is_admin = is_user_admin(user["id"], conn)
+    if not is_admin and not can_access_collection(user["id"], col["id"], conn):
+        raise HTTPException(status_code=404, detail="collection_not_found")
+
+    files = corpus_files_repo().list_for_corpus(col["id"], limit=_LIBRARY_MATCH_LIMIT, q=q_norm, order="newest")
+    if not files:
+        return HTMLResponse("")
+
+    uid = user["id"]
+    owned = col.get("created_by") == uid
+    # The folder-level facts a child inherits. Resolved the same way
+    # `library_page` resolves them, and each failure falls to the
+    # conservative value rather than taking the fragment down — a row that
+    # says "Private" when it cannot prove otherwise is safe; the opposite
+    # is not.
+    try:
+        shared_ids = set(resource_grants_repo().list_resource_ids_for_user(uid, ResourceType.COLLECTION.value))
+    except Exception:
+        shared_ids = set()
+    ownership = "mine" if owned and col["id"] not in shared_ids else ("shared_by_me" if owned else "shared_with_me")
+    owner_label = "You"
+    if not owned:
+        try:
+            from app.api.store import _resolve_owner_display
+
+            owner_label = _resolve_owner_display(col.get("created_by")) or "Someone"
+        except Exception:
+            owner_label = "Someone"
+    try:
+        in_stack = col["id"] in set(user_stack_subscriptions_repo().list_for_user(uid, ResourceType.COLLECTION.value))
+    except Exception:
+        in_stack = False
+
+    # Each matched file's OWN sharing, batched — one grant read for the whole
+    # fragment rather than one per row.
+    file_groups: dict[str, set] = {}
+    try:
+        for g in resource_grants_repo().list_all(resource_type=ResourceType.CORPUS_FILE.value):
+            file_groups.setdefault(g["resource_id"], set()).add(g["group_id"])
+    except Exception:
+        file_groups = {}
+    try:
+        _everyone = user_groups_repo().get_by_name(SYSTEM_EVERYONE_GROUP)
+        everyone_id = _everyone["id"] if _everyone else None
+    except Exception:
+        everyone_id = None
+
+    def _vis(file_id: str) -> str:
+        groups = file_groups.get(file_id)
+        if not groups:
+            return "private"
+        if everyone_id and everyone_id in groups:
+            return "workspace"
+        return "shared"
+
+    rows = [
+        _library_child_row(
+            f,
+            col,
+            origin=col.get("origin") or "uploaded",
+            owner_label=owner_label,
+            ownership=ownership,
+            owner_key="me" if owned else (col.get("created_by") or ""),
+            visibility=_vis(f["id"]),
+            stack_state="in_stack" if in_stack else "available",
+            stack_title=_AGENT_HAS_TOOLTIP if in_stack else _AGENT_ADD_TOOLTIP,
+            stack_pill=_AGENT_HAS,
+        )
+        for f in files
+    ]
+    ctx = _build_context(
+        request,
+        user=user,
+        conn=conn,
+        is_admin=is_admin,
+        rows=rows,
+        # The page-level values `library_row` reads off the context. Empty
+        # here on purpose: the entity facets are a MENU the fragment has no
+        # part in, and a row carrying facet attributes the live menu never
+        # offered would be filtered out by a category it cannot satisfy.
+        library_entity_cats=[],
+        library_active_tab="knowledge",
+    )
+    return templates.TemplateResponse(request, "library_matching_file_rows.html", ctx)
 
 
 @router.get("/library/{slug}", response_class=HTMLResponse)
@@ -11599,6 +11818,29 @@ async def profile_session_download(
         filename=filename,
         media_type="application/x-ndjson",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get("/_debug/error-surfaces", response_class=HTMLResponse, include_in_schema=False)
+async def _debug_error_surfaces(request: Request, user: dict = Depends(get_current_user)):
+    """Dev helper — the error surfaces that are NOT the error page.
+
+    Only mounted when DEBUG=1 (gated below), the same as the throw routes it
+    sits beside. Those cover the page side; a transcript note, an upload
+    dialog's error slot and a toast only appear when something upstream
+    actually fails, so they were the hardest surfaces to review and the
+    easiest to ship broken — a 429 during an upload rendered "[object
+    Object]" for as long as those dialogs existed.
+
+    The page renders by importing the shipped ``chat_errors.js`` and calling
+    it, so it cannot drift from what chat actually says.
+    """
+    if not _is_debug():
+        raise HTTPException(status_code=404, detail="Not found")
+    return templates.TemplateResponse(
+        request,
+        "debug_error_surfaces.html",
+        _build_context(request, user=user),
     )
 
 

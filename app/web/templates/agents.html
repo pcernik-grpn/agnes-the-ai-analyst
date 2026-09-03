@@ -2012,6 +2012,17 @@
     if (t) { e.preventDefault(); t.click(); }
   });
 
+  /* Did the reader arrive with an intent, rather than to browse? Read
+     SYNCHRONOUSLY, at parse time: `routeFromQuery` strips these params once
+     the agents fetch resolves, and the coach-mark below (a module script, so
+     it runs later) would then see a bare `/agents` and narrate over whatever
+     the deep link opened. The tour's own anchor is the "+ Build an agent"
+     card, which it raises above the picker's backdrop — it drew the card and
+     its spotlight straight through the template list. Skipping it costs
+     nothing: `autoLaunchTour` only marks a tour seen once it launches, so it
+     still arrives on the reader's next plain visit to this page. */
+  window.__agnesAgentsDeepLink = /[?&](open|new|template|from_template)=/.test(window.location.search);
+
   /* ── Deep links ──
      The builder is an in-page view, so it had no address of its own — every
      route into it had to be "load /agents, then click". These params give it
@@ -2054,7 +2065,27 @@
       return true;
     }
     if (wantTemplate) { createAgent(null, wantTemplate); return true; }
-    if (wantPicker) { openTemplatePicker(); return true; }
+    /* The picker is an OVERLAY, not a view — so the list has to render under
+       it. Returning early without rendering (as `new`/`template` legitimately
+       do, since both end in the builder) left a modal floating over a blank
+       page, and Cancel dismissed it onto that same blank page.
+
+       And it waits for `loadPlugins()`, exactly as the `data-ag-new` click
+       handler does: `plugins` is fetched in parallel with the agents list, so
+       opening the picker synchronously here raced it — the single agents
+       request usually won, and the caller got a "Start from a template" modal
+       listing no templates. */
+    if (wantPicker) {
+      renderList();
+      loadPlugins().then(function () {
+        if (!installedTemplates().length) {
+          if (window.appToast) window.appToast('No agent templates are available to you yet.');
+          return;
+        }
+        openTemplatePicker();
+      });
+      return true;
+    }
     if (wantNew) { createAgent(null); return true; }
     return false;
   }
@@ -2087,13 +2118,17 @@
    at.
 
    `autoLaunchTour` owns the once-only gate (localStorage) and refuses to stack
-   over a tour already running or mid-hop, so this is safe to fire on every
-   /agents load. The card's anchor is the client-rendered "+ Build an agent"
-   control, which is why its step declares `awaitAnchor` — the fetch above has
-   not resolved when this runs. #}
+   over a tour already running or mid-hop. The one thing it cannot see is a
+   MODAL, so a deep-link arrival (`?from_template=1` and friends) skips it —
+   `__agnesAgentsDeepLink`, read synchronously up in the page script. The
+   card's anchor is the client-rendered "+ Build an agent" control, which is
+   why its step declares `awaitAnchor` — the fetch above has not resolved when
+   this runs. #}
 <script type="module">
-  import("{{ static_url('js/tour.js') }}")
-    .then((mod) => mod.autoLaunchTour("agents"))
-    .catch(() => { /* the coach-mark is additive — never block the page */ });
+  if (!window.__agnesAgentsDeepLink) {
+    import("{{ static_url('js/tour.js') }}")
+      .then((mod) => mod.autoLaunchTour("agents"))
+      .catch(() => { /* the coach-mark is additive — never block the page */ });
+  }
 </script>
 {% endblock %}
