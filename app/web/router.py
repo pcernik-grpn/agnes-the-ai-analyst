@@ -2578,6 +2578,27 @@ def _library_child_row(
 #: page it links on to has all three (#2141 item 2).
 _LIBRARY_FOLDER_PEEK = 10
 
+#: How many files a Library INDEX card fetches (and is therefore searchable
+#: by / has format facets for) per collection — separate from
+#: `_LIBRARY_FOLDER_PEEK`, which only bounds how many of THOSE fetched rows
+#: render as inline children. Comfortably above the peek and above every
+#: existing fixture's file count (the artefacts-reading suite's biggest
+#: folder is 25) so neither is affected. A folder AT or under this size keeps
+#: full drag/drop, per-format, per-filename-search over its whole file list,
+#: same as before. A folder OVER it renders as a plain "N files" card with a
+#: single "Browse all" row and no per-file search text at all: no
+#: `list_for_corpus` call happens for it, so the cost of listing it here can
+#: never again scale with an instance's TOTAL file count. The
+#: `/library/{slug}` detail page (paginated, `_FILES_SECTION_PAGE_SIZE` at a
+#: time) plus this page's own `/library/{slug}/matching-files` search remain
+#: the browse surfaces for a folder that size. Incident, 2026-09-03: an admin
+#: Library with ~390 collections and 216k `corpus_files` rendered every file
+#: of every collection inline, producing a 1 GB / 56 s page — the peek above
+#: already bounds what RENDERS, but not what is FETCHED or embedded into a
+#: folder row's own `data-search`/format facets, which still scaled with the
+#: instance's total file count without this second cap.
+_LIBRARY_INLINE_FILES_CAP = 50
+
 
 @router.get("/library", response_class=HTMLResponse)
 async def library_page(
@@ -2736,17 +2757,30 @@ async def library_page(
     if facts_repo_ is not None:
         _visible_ids = [c["id"] for c in _all_cols if c.get("created_by") == uid or c["id"] in granted_to_me]
         try:
-            _fact_counts = facts_repo_.count_visible_facts_for_collections(user, _visible_ids)
+            if is_user_admin(uid, conn):
+                # `count_visible_facts_for_collections` is a Python-level batch
+                # over an exact, per-caller visibility CTE — but that CTE is
+                # still ONE STATEMENT PER COLLECTION (its own docstring says
+                # so), and on an admin Library that sees every collection
+                # (390 here) that alone cost minutes (incident, 2026-09-03).
+                # `approximate_counts_for_collections` is a single flat
+                # `GROUP BY corpus_id` and is scoped, by its own contract, to
+                # exactly this caller shape — `_readable_ids(caller) is None`
+                # — which `is_user_admin` stands in for without importing the
+                # repo's private RBAC resolver here.
+                approx = facts_repo_.approximate_counts_for_collections(_visible_ids)
+                _fact_counts = {cid: counts.get("facts", 0) for cid, counts in approx.items()}
+            else:
+                _fact_counts = facts_repo_.count_visible_facts_for_collections(user, _visible_ids)
         except Exception as e:
             logger.warning("/library: fact counts failed: %s", e)
-    # Same one-batch-call idea as `_fact_counts` just above: every card below
-    # still needs the FULL file list when a collection is non-empty (it is
-    # searched by every contained filename, its per-format facets, and the
-    # single "file_id" a one-file card links straight to) — only an empty
-    # collection can skip the per-collection query entirely, and this bulk
-    # `count_by_corpus()` is what tells us, in one query, which ones those
-    # are instead of finding out via a `list_for_corpus` call that returns
-    # nothing.
+    # `file_count` per collection, in ONE query — the batched sibling of the
+    # per-collection `list_for_corpus` calls below. Every card needs the
+    # count; only a SMALL collection (`_LIBRARY_INLINE_FILES_CAP`) also gets
+    # its rows fetched (search-by-filename, per-format facets, the single
+    # "file_id" a one-file card links straight to). A large collection reads
+    # its count off this map alone and skips `list_for_corpus` entirely — see
+    # `_LIBRARY_INLINE_FILES_CAP`'s docstring for why.
     _file_counts: dict = {}
     if cf_repo is not None:
         try:
@@ -2773,21 +2807,33 @@ async def library_page(
             owned = col.get("created_by") == uid
             if not owned and col["id"] not in granted_to_me:
                 continue  # not yours and not shared with you -> invisible here
+            # `file_count` is the batched, exact count from `_file_counts` —
+            # never `len(files)`. `files` itself is fetched only up to
+            # `_LIBRARY_INLINE_FILES_CAP` rows: a single-file card needs its
+            # one row (filename/type/size), a small folder needs all of them
+            # (for the child rows below), and a folder past the cap gets
+            # neither — it renders as a count-only card, see the constant's
+            # docstring.
+            file_count = _file_counts.get(col["id"], 0)
             files: list = []
-            if _file_counts.get(col["id"], 0):
+            first_file = None
+            if file_count == 1:
+                try:
+                    files = cf_repo.list_for_corpus(col["id"], limit=1)
+                except Exception:
+                    files = []
+                if files:
+                    f0 = files[0]
+                    first_file = {
+                        "filename": f0.get("filename"),
+                        "file_type": f0.get("file_type"),
+                        "size_bytes": f0.get("size_bytes"),
+                    }
+            elif 1 < file_count <= _LIBRARY_INLINE_FILES_CAP:
                 try:
                     files = cf_repo.list_for_corpus(col["id"])
                 except Exception:
                     files = []
-            file_count = len(files)
-            first_file = None
-            if file_count == 1:
-                f0 = files[0]
-                first_file = {
-                    "filename": f0.get("filename"),
-                    "file_type": f0.get("file_type"),
-                    "size_bytes": f0.get("size_bytes"),
-                }
             fact_count = _fact_counts.get(col["id"], 0)
             c = _catalog_card_upload(
                 {
