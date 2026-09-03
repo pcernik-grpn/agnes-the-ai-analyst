@@ -1,0 +1,12 @@
+[Unit]
+Description=Re-converge the Datadog pg_monitor role and the postgres check config
+
+[Timer]
+# Late enough that compose has usually converged; re-run often enough that a
+# recreated side-car volume regains the role within one alert window.
+OnBootSec=2min
+OnUnitActiveSec=15min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target
