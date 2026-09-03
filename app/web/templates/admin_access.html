@@ -780,6 +780,48 @@
   .ax-onebar .fbar__search { flex: 0 1 26rem; min-width: 0; }
   .ax-filter { margin-right: auto; }
 
+  /* ── The people strip ────────────────────────────────────────────────
+     One line where two collapsed section cards used to be. Faces, the
+     count, what the group is for, and the way into the roster — read left
+     to right in the order the questions are asked. The description takes
+     the flexible width because it is the only part whose length varies;
+     everything else is fixed and cannot be pushed off the line. */
+  .ax-pstrip { display: flex; align-items: center; gap: 10px;
+    padding: 12px 2px 12px 0; border-bottom: 1px solid var(--ds-border); }
+  .ax-pstrip__ico { display: inline-flex; color: var(--ds-text-muted); flex: 0 0 auto; }
+  .ax-pstrip__n { font-weight: 600; font-size: 13px; color: var(--ds-text); flex: 0 0 auto; }
+  /* The group's own sentence. Muted and italic ONLY when it is the
+     description — the generic fallback and the state lines are neither,
+     because italics on boilerplate reads as emphasis on nothing. One line,
+     clipped: the full text is the row's `title` and the group's own page. */
+  .ax-pstrip__sub { min-width: 0; flex: 1 1 auto; font-size: 12.5px;
+    color: var(--ds-text-muted); overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap; }
+  .ax-pstrip__sub.is-own { font-style: italic; }
+  .ax-pstrip__more { flex: 0 0 auto; background: none; border: 0; padding: 4px 8px;
+    font: inherit; font-size: 12.5px; color: var(--ds-primary); cursor: pointer;
+    border-radius: 6px; }
+  .ax-pstrip__more:hover { background: var(--ds-surface-hover); }
+  .ax-pstrip__more[hidden] { display: none; }
+  .ax-pstrip__body[hidden] { display: none; }
+  .ax-pstrip__body { padding: 4px 0 12px; }
+
+  /* ── Access, without its shutter ─────────────────────────────────────
+     The head still names the section and holds the tier key; what went is
+     the `<summary>` that made you ask a second time for what expanding the
+     group already asked for. */
+  .ax-acc { display: block; }
+  /* `text-align: right` reached this head from the rules written for the
+     `<summary>` that used to wrap it — where the trailing count and chevron
+     were the point. Without the summary the same alignment threw the title
+     to the far side of a 700px box, so the section read as a right-hand
+     caption. Stated rather than inherited, in both directions. */
+  .ax-acc__hd { padding: 12px 0 4px; text-align: left; }
+  .ax-acc__hd .dsec-head { align-items: center; gap: 10px; }
+  .ax-acc__hd .dsec-grow { text-align: left; }
+  .ax-acc__hd .dsec-sum { flex: 0 0 auto; text-align: right; }
+  .ax-acc .dsec-body { padding: 0; }
+
   /* The loading state (#2140 item 2). Bars the size of the rows they stand
      in for — an avatar, a name, a count — so the list does not jump when the
      real ones arrive. The pulse is one shared animation on the container, not
@@ -2604,7 +2646,7 @@
           Filter
           <span class="fbar-filter__n" id="ax-filter-n" hidden>0</span>
         </button>
-        <div class="fbar-menu fbar-menu--cats" id="ax-filter-menu" role="menu" aria-label="Filter by kind" hidden></div>
+        <div class="fbar-menu fbar-menu--cats" id="ax-filter-menu" role="menu" aria-label="Filter this list" hidden></div>
       </div>
 
       {# The audience that does not exist yet. "Grant this to the finance
@@ -2728,41 +2770,45 @@
       </div>
       <div class="ax-managed" id="ax-what-managed"></div>
 
-      {# ── People ──────────────────────────────────────────────────────
-         COLLAPSED by default: the head states the count on its own, and
-         editing grants is the more frequent job. The roster is the section
-         body rather than a disclosure inside it, so one number is drawn
-         once. #}
-      <details class="dsec" id="ax-sec-people" aria-label="People in this group">
-        <summary>
-          <div class="dsec-head">
-            <span class="dsec-ico">{{ ico.icon('users', 14) }}</span>
-            <div class="dsec-grow">
-              {# The faces sit ON the header row, beside the word they are the
-                 answer to. They were below it, inside the body, which meant
-                 the one thing you can read at a glance was the one thing you
-                 had to open the section to see. #}
-              <div class="ax-people__hdrow">
-                <h3>People</h3>
-                <span class="ax-avs" id="ax-people-faces" aria-hidden="true"></span>
-              </div>
-              <div class="dsec-sub" id="ax-people-sub">Who this group reaches.</div>
-            </div>
-            <span class="dsec-sum" id="ax-people-sum"></span>
-            <span class="dsec-chev">{{ ico.icon('chevron', 16) }}</span>
-          </div>
-        </summary>
-        <div class="dsec-body" id="ax-members"></div>
-      </details>
+      {# ── People: a strip, not a section ──────────────────────────────
+         Opening a group used to land on TWO closed sections — People and
+         Access — so the first fact was two clicks away, and the second click
+         was on a shutter over the thing you came for. The grants render
+         directly now (see Access below), and People becomes what it was
+         always read as: a line saying who these people are.
+
+         Faces, the count, and the group's own description, in that order.
+         The description is here rather than on the list row for a reason:
+         it is the only text on the page that says what a group is FOR, and
+         "who are these people" is the question it answers — the faces give
+         the machine's answer, the sentence gives the human one. A group
+         without one falls back to the generic line rather than leaving a
+         gap where a sentence was.
+
+         The roster itself is genuinely a list, so it keeps a disclosure —
+         but inside the strip, one level down, not wrapped around it. #}
+      <div class="ax-pstrip" id="ax-sec-people" aria-label="People in this group">
+        <span class="dsec-ico ax-pstrip__ico">{{ ico.icon('users', 14) }}</span>
+        <span class="ax-avs" id="ax-people-faces" aria-hidden="true"></span>
+        <span class="ax-pstrip__n" id="ax-people-sum"></span>
+        <span class="ax-pstrip__sub" id="ax-people-sub">Who this group reaches.</span>
+        <button type="button" class="ax-pstrip__more" id="ax-people-toggle"
+                aria-expanded="false" aria-controls="ax-members">Manage</button>
+      </div>
+      <div class="dsec-body ax-pstrip__body" id="ax-members" hidden></div>
 
       {# ── Access ──────────────────────────────────────────────────────
-         Open by default — the job the page exists for. #}
-      {# Closed on arrival, like People. Opening a group is a step toward an
-         answer, not the answer — and unrolling the tallest thing on the page
-         for someone who came to check the member count is the same mistake
-         the two-pane layout made with the group list. #}
-      <details class="dsec" id="ax-sec-access" aria-label="What this group can use">
-        <summary>
+         No disclosure around it. Expanding a group IS the request to see
+         what it can use — asking again, on a shutter labelled "Access",
+         answered nothing the group row had not already asked. What is left
+         is a head that names the section and carries the tier key, over the
+         rows themselves.
+
+         The rows inside still collapse per kind, and a big run still opens
+         only when asked (see `RUN_OPEN_MAX` in admin_access.js), so removing
+         this level does not put an unbounded list on screen. #}
+      <div class="dsec ax-acc" id="ax-sec-access" aria-label="What this group can use">
+        <div class="ax-acc__hd">
           <div class="dsec-head">
             <span class="dsec-ico">{{ ico.icon('shield-check', 14) }}</span>
             <div class="dsec-grow">
@@ -2788,9 +2834,8 @@
               </span>
             </span>
             <span class="dsec-sum" id="ax-access-sum"></span>
-            <span class="dsec-chev">{{ ico.icon('chevron', 16) }}</span>
           </div>
-        </summary>
+        </div>
         <div class="dsec-body">
           {# Find one item, and choose the scope the list is showing — on one
              line, the shape every other filtered surface in the app uses.
@@ -2804,7 +2849,7 @@
              explicit act (+ Add), not a scope you browse in. #}
           <div id="ax-resources"><div class="ax-empty">Select a group on the left.</div></div>
         </div>
-      </details>
+      </div>
   </div>
 </div>
 

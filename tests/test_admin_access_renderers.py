@@ -73,6 +73,10 @@ _EXPORTS = (
     "manageCell",
     "whoGranted",
     "TIERED",
+    "facets",
+    "rowPassesFacets",
+    "reachOfRow",
+    "originOfGrant",
     "VIEWER_USER_ID",
     "GOOGLE_GROUP_PREFIX",
     "INVITE_DOMAINS",
@@ -386,3 +390,99 @@ class TestAThingWithoutATitleIsStillNamed:
             " api.itemName(null)];"
         )
         assert got == ["N", "s", "r", ""]
+
+
+class TestTheFiltersAreFacets:
+    """Four multi-select facets where there was one single-select radio.
+
+    The page could answer "show me the plugins" and nothing else. Kind kept
+    its place; Reach, Tier and Where-it-came-from are the questions an admin
+    opens this page with, and each reads a field the payload already carries.
+
+    The matching rules are pure and live in the sliced region, so these run
+    the production functions rather than reading them.
+    """
+
+    HELD_EVERYONE = "[{audience: 'everyone', requirement: 'required', source: null}]"
+    HELD_GROUP = "[{audience: 'g1', requirement: 'available', source: null}]"
+    HELD_OWNER = "[{audience: 'g1', requirement: 'available', source: 'library_sharing'}]"
+    HELD_MANAGED = "[{audience: 'g1', requirement: 'required', source: 'marketplace', managed_by: {revocable: false}}]"
+
+    def test_reach_is_derived_from_the_grants_not_stored_beside_them(self):
+        got = _run(
+            f"OUT = [api.reachOfRow({self.HELD_EVERYONE}), api.reachOfRow({self.HELD_GROUP}),"
+            " api.reachOfRow([]), api.reachOfRow(null)];"
+        )
+        assert got == ["everyone", "group", "nobody", "nobody"]
+
+    def test_an_everyone_grant_outranks_a_group_grant_on_the_same_row(self):
+        """A row held by both reaches everyone; saying "specific groups"
+        would be the smaller claim and the false one."""
+        mixed = "[{audience: 'g1'}, {audience: 'everyone'}]"
+        assert _run(f"OUT = api.reachOfRow({mixed});") == "everyone"
+
+    def test_origin_splits_on_whether_the_admin_can_act_not_on_who_wrote_it(self):
+        """Ticket 10's axis. Nine writers are not the admin; only the ones
+        that re-assert produce a row a revoke here cannot remove."""
+        got = _run(
+            "OUT = [api.originOfGrant({source: null}),"
+            " api.originOfGrant({source: 'library_sharing'}),"
+            " api.originOfGrant({source: 'marketplace', managed_by: {revocable: false}}),"
+            " api.originOfGrant({source: 'chat_seed', managed_by: {revocable: true}})];"
+        )
+        assert got == ["admin", "owner", "managed", "admin"]
+
+    def test_a_facet_with_nothing_picked_filters_nothing(self):
+        """Empty is off — not "every value ticked", which a value matching
+        nothing would silently turn into an empty list."""
+        assert _run("OUT = api.rowPassesFacets('agent', []);") is True
+
+    def test_values_inside_one_facet_are_or(self):
+        got = _run(
+            "api.facets.get('kind').add('agent'); api.facets.get('kind').add('data_package');"
+            "OUT = [api.rowPassesFacets('agent', []), api.rowPassesFacets('data_package', []),"
+            " api.rowPassesFacets('chat', [])];"
+        )
+        assert got == [True, True, False]
+
+    def test_facets_are_and_with_each_other(self):
+        got = _run(
+            "api.facets.get('kind').add('agent'); api.facets.get('reach').add('nobody');"
+            f"OUT = [api.rowPassesFacets('agent', []), api.rowPassesFacets('agent', {self.HELD_EVERYONE}),"
+            " api.rowPassesFacets('chat', [])];"
+        )
+        assert got == [True, False, False], "kind AND reach, not kind OR reach"
+
+    def test_a_tier_filter_keeps_a_row_where_any_grant_carries_that_tier(self):
+        got = _run(
+            "api.facets.get('tier').add('required');"
+            f"OUT = [api.rowPassesFacets('data_package', {self.HELD_EVERYONE}),"
+            f" api.rowPassesFacets('data_package', {self.HELD_GROUP})];"
+        )
+        assert got == [True, False]
+
+    def test_an_ungranted_row_survives_no_tier_or_origin_filter(self):
+        """It has no grant to carry either property, so a filter on one is a
+        question it cannot answer yes to."""
+        got = _run("api.facets.get('tier').add('available');OUT = api.rowPassesFacets('agent', []);")
+        assert got is False
+
+    def test_an_owner_shared_row_is_findable_by_where_it_came_from(self):
+        """The fastest way to the rows an admin most often opens this page
+        to check."""
+        got = _run(
+            "api.facets.get('origin').add('owner');"
+            f"OUT = [api.rowPassesFacets('agent', {self.HELD_OWNER}),"
+            f" api.rowPassesFacets('agent', {self.HELD_GROUP}),"
+            f" api.rowPassesFacets('agent', {self.HELD_MANAGED})];"
+        )
+        assert got == [True, False, False]
+
+    def test_the_url_carries_every_facet_so_a_filtered_view_is_a_link(self):
+        from tests.helpers.access_page import access_js
+
+        js = access_js()
+        assert "for (const k of FACET_KEYS) set(k, st[k]);" in js
+        assert 'kind: [...facets.get("kind")].join(",")' in js, (
+            "?kind=agent — the single-value shape in existing links — must read back as the one-element case"
+        )

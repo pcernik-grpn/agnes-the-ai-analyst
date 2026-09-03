@@ -22,7 +22,9 @@ What matters, and so what is pinned here:
 from __future__ import annotations
 
 import re
-from tests.helpers.access_page import with_module
+import pytest
+
+from tests.helpers.access_page import access_js, with_module
 
 
 def _auth(token: str) -> dict:
@@ -48,13 +50,11 @@ class TestAccessPage:
         assert 'class="admin-tabs"' not in body
         # The lens URL still lands on the person view — links into Simulate
         # outnumber the tab that used to point at it.
-        assert c.get("/admin/access?lens=simulate",
-                     headers=_auth(seeded_app["admin_token"])).status_code == 200
+        assert c.get("/admin/access?lens=simulate", headers=_auth(seeded_app["admin_token"])).status_code == 200
         # `?by=bundle` was the old name for this lens and stays readable, for
         # the same reason: it is in shared links and bookmarks. Everything the
         # page WRITES is `resource`.
-        assert c.get("/admin/access?by=bundle",
-                     headers=_auth(seeded_app["admin_token"])).status_code == 200
+        assert c.get("/admin/access?by=bundle", headers=_auth(seeded_app["admin_token"])).status_code == 200
 
     def test_non_admin_is_refused(self, seeded_app):
         c = seeded_app["client"]
@@ -352,8 +352,7 @@ class TestTheGroupItself:
         """Name, upstream address, origin pill, description, created date —
         the detail page's header, which is most of why it existed."""
         body = self._body(seeded_app)
-        for el_id in ("ax-what-title", "ax-what-idsub", "ax-what-origin",
-                      "ax-what-meta", "ax-what-managed"):
+        for el_id in ("ax-what-title", "ax-what-idsub", "ax-what-origin", "ax-what-meta", "ax-what-managed"):
             assert f'id="{el_id}"' in body, f"lost {el_id}"
 
     def test_rename_and_delete_are_here(self, seeded_app):
@@ -442,9 +441,9 @@ class TestTheGroupItself:
         that is missed, it belongs in the picker, not in a second tree.
         """
         body = self._body(seeded_app)
-        assert "data-add-grant" in body          # the one way in, per group
-        assert "openPicker" in body              # …opens the picker
-        assert "data-share-bundle" in body       # and the same act by bundle
+        assert "data-add-grant" in body  # the one way in, per group
+        assert "openPicker" in body  # …opens the picker
+        assert "data-share-bundle" in body  # and the same act by bundle
         assert "openBundlePicker" in body
         # The tree and its bulk control are gone, not hidden.
         assert "data-bucket=" not in body
@@ -461,8 +460,8 @@ class TestTheGroupItself:
         not yet granted.
         """
         body = self._body(seeded_app)
-        assert 'id="ax-group-find"' in body       # the one page-level search
-        assert "Search everything grantable" in body   # the picker's own
+        assert 'id="ax-group-find"' in body  # the one page-level search
+        assert "Search everything grantable" in body  # the picker's own
         # The per-group input is gone: two search boxes on one surface, one
         # of them hidden, was the ambiguity this collapse removed.
         assert 'id="ax-rfind"' not in body
@@ -482,3 +481,72 @@ class TestTheGroupItself:
         body = self._body(seeded_app)
         assert "ax-orig--" in body
         assert "grant_count" in body and "member_count" in body
+
+
+class TestTheRowIsOneLineAndTheGroupOpensOnItsGrants:
+    """The By-group list carried four things per row — name and reach, then a
+    description, a `created` stamp to the minute, and three per-family counts
+    down the right. Opening a row then landed on two more closed sections, so
+    the first fact was three clicks in.
+
+    What survives is what an admin reads before deciding to open a group:
+    the name, where it comes from, and "N people · N granted".
+    """
+
+    @pytest.fixture(scope="class")
+    def js(self):
+        return access_js()
+
+    @pytest.fixture(scope="class")
+    def tpl(self):
+        from tests.helpers.access_page import access_template
+
+        return access_template()
+
+    def test_the_row_no_longer_stamps_a_creation_time(self, js):
+        row = js[js.index("      const open = selectedGroup === g.id;") :]
+        row = row[: row.index("    // Only label the halves")]
+        assert "created ${" not in row and "g.created_at" not in row
+
+    def test_the_per_family_counts_are_gone_from_every_row(self, js):
+        assert "familyCounts" not in js or "`familyCounts()` stood here" in js
+        assert 'class="ax-gs__counts"' not in js, (
+            "three numbers on every row, most of them zero, none of them the one that decides whether to open a group"
+        )
+
+    def test_the_description_moved_rather_than_went(self, js):
+        """It is the only text on the page saying what a group is FOR."""
+        head = js[js.index("function setPeopleHead(text, sub, faces)") :]
+        head = head[: head.index("async function renderMembers()")]
+        assert "g.description" in head
+        assert 'sub || own || "Who this group reaches."' in head, (
+            "a state beats the description, the description beats the "
+            "generic line, and a group without one still says something"
+        )
+
+    def test_an_explicit_state_still_outranks_the_description(self, js):
+        """Loading, and a failed read, are about right now — a standing
+        sentence about the group would be the wrong thing to show."""
+        assert 'setPeopleHead("Loading…", "Reading who is in this group…")' in js
+
+    def test_people_is_a_strip_not_a_section_to_open(self, tpl):
+        assert '<div class="ax-pstrip" id="ax-sec-people"' in tpl
+        assert '<details class="dsec" id="ax-sec-people"' not in tpl
+
+    def test_access_has_no_shutter_of_its_own(self, tpl):
+        """Expanding a group IS the request to see what it can use."""
+        assert '<div class="dsec ax-acc" id="ax-sec-access"' in tpl
+        assert '<details class="dsec" id="ax-sec-access"' not in tpl
+
+    def test_the_roster_keeps_a_disclosure_because_it_is_a_list(self, tpl):
+        assert 'id="ax-people-toggle"' in tpl
+        assert 'id="ax-members" hidden' in tpl
+
+    def test_the_disclosures_word_matches_what_opening_it_can_do(self, js):
+        """`Everyone` and a Workspace-synced group are read-only here, so
+        the control says Show rather than Manage — the page's standing rule
+        about never offering what cannot succeed."""
+        block = js[js.index('const more = el("ax-people-toggle");') :]
+        block = block[: block.index("async function renderMembers()")]
+        assert "is_google_managed" in block and "is_everyone" in block
+        assert '"Manage" : "Show"' in block

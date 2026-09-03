@@ -72,8 +72,69 @@
   }
 
   const _q0 = new URLSearchParams(window.location.search);
-  //: The list's kind filter — "" is every kind.
-  let listKind = _q0.get("kind") || "";
+  /* ── The filters ─────────────────────────────────────────────────────
+     Four facets, multi-select, the Library's shape (`fbar-menu--cats`, one
+     submenu per category, a count beside every option, chips for what is
+     on). It was ONE facet — Kind — as radio buttons, so the page could
+     answer "show me the plugins" and nothing else. The three that joined it
+     are the questions an admin actually opens this page with, and each is a
+     field the payload already carries, so none of them is a new round trip:
+
+       Reach   — everyone / a group / nobody. The page's own subject. It
+                 already renders "granted to nobody" as a state and floats
+                 those rows into a drawer; this is the same distinction
+                 made askable.
+       Tier    — Automatic / Optional. "What am I forcing on people" is the
+                 question the tier exists for and there was no way to ask it.
+       Origin  — granted here / shared by an owner / managed elsewhere. The
+                 axis ticket 10 settled the page on: whether the admin can
+                 act on the row. Also the fastest way to find the rows an
+                 owner shared, which is what an admin most often opens this
+                 page to check.
+
+     Multi-select within a facet is OR (plugins or agents); across facets it
+     is AND (plugins, granted to nobody). That is the Library's rule, and the
+     one every faceted list a person has used follows. */
+  const FACET_KEYS = ["kind", "reach", "tier", "origin"];
+  //: `Set` per facet; empty means the facet is off, which is not the same as
+  //: every value being ticked (a value that matches nothing would then
+  //: silently narrow the list to nothing).
+  const facets = new Map(FACET_KEYS.map((k) => [k, new Set()]));
+  const facetOn = (k) => facets.get(k).size > 0;
+  const facetHas = (k, v) => facets.get(k).has(v);
+  const anyFacetOn = () => FACET_KEYS.some(facetOn);
+  const clearFacets = () => FACET_KEYS.forEach((k) => facets.get(k).clear());
+  for (const k of FACET_KEYS) {
+    for (const v of (_q0.get(k) || "").split(",")) if (v) facets.get(k).add(v);
+  }
+  /* `?kind=` was a single value and is in shared links, so it keeps working
+     — it is simply the one-element case of the set now. */
+
+  /* What a row's grants make it. Derived per row rather than stored, because
+     every input is already on the payload and a second copy could disagree
+     with the rows it is meant to describe. */
+  const REACH = { EVERYONE: "everyone", GROUP: "group", NOBODY: "nobody" };
+  const reachOfRow = (held) => (!held || !held.length
+    ? REACH.NOBODY
+    : held.some((g) => g.audience === "everyone") ? REACH.EVERYONE : REACH.GROUP);
+  const ORIGIN = { ADMIN: "admin", OWNER: "owner", MANAGED: "managed" };
+  /* Three origins, in the order an admin cares about them. `managed_by` with
+     `revocable === false` is a row another surface re-asserts — the one kind
+     a revoke here cannot remove. `section` is the server's own answer to
+     "can the admin act on this", and an owner-shared row is the rest. */
+  const originOfGrant = (g) => (g && g.managed_by && g.managed_by.revocable === false
+    ? ORIGIN.MANAGED
+    : (g && g.source === "library_sharing") ? ORIGIN.OWNER : ORIGIN.ADMIN);
+  const tierOfGrant = (g) => ((g && g.requirement) === "required" ? "required" : "available");
+
+  /* One row against every active facet. AND across facets, OR inside one. */
+  const rowPassesFacets = (typeKey, held) => {
+    if (facetOn("kind") && !facetHas("kind", typeKey)) return false;
+    if (facetOn("reach") && !facetHas("reach", reachOfRow(held))) return false;
+    if (facetOn("tier") && !(held || []).some((g) => facetHas("tier", tierOfGrant(g)))) return false;
+    if (facetOn("origin") && !(held || []).some((g) => facetHas("origin", originOfGrant(g)))) return false;
+    return true;
+  };
   /* `?user=<id>` on its own used to be discarded in silence — it selected
      nothing and landed you on the group lens — even though it is about as
      unambiguous a request as this page receives. Worse, leaving the person
@@ -594,24 +655,13 @@
     return String(raw).includes("@") ? String(raw).split("@")[0] : raw;
   }
 
-  /* The three numbers a collapsed row is worth reading for. Derived from the
-     same grants payload the checkboxes read, so a count can never disagree
-     with the rows underneath it. */
-  function familyCounts(gid) {
-    const famOf = new Map((overview.resources || []).map((t) => [t.type_key, t.family || "knowledge"]));
-    const tally = new Map();
-    for (const gr of grantsFor(gid)) {
-      const fam = famOf.get(gr.resource_type);
-      if (!fam) continue;
-      tally.set(fam, (tally.get(fam) || 0) + 1);
-    }
-    const fams = (overview.families || []);
-    if (!fams.length) return "";
-    return fams.map((f) => {
-      const n = tally.get(f.key) || 0;
-      return `<span class="ax-gs__cnt${n ? " is-held" : ""}">${esc(f.display_name.toLowerCase())} <b>${n}</b></span>`;
-    }).join("");
-  }
+  /* `familyCounts()` stood here — `knowledge 1  capabilities 3  surfaces 0`
+     on every row. It was written when a collapsed row was suspected of
+     saying too little; it turned out to say too much of the wrong thing.
+     Three numbers on every row, most of them zero, none of them the one an
+     admin reads before deciding to open a group — that one is "N granted",
+     two words to the left. The families still organise the list INSIDE a
+     group, which is where the distinction earns its keep. */
 
   /* The panel is one node, moved. Re-rendering the list would otherwise
      destroy it (and every handler bound inside), so it is parked before the
@@ -681,8 +731,12 @@
       return mm.byGroup.get(g.id) || [];
     };
     const memberHit = (g) => q.length >= 2 && peopleFor(g).length > 0;
-    const kindHit = (g) => !listKind
-      || grantsFor(g.id).some((x) => x.resource_type === listKind);
+    /* A group survives the filters if ANY grant it holds does. Filtering
+       groups by a property of their grants is the only reading that makes
+       sense here — "show me the groups that hold something granted to
+       everyone" — and it is what the count beside each option promises. */
+    const kindHit = (g) => !anyFacetOn()
+      || grantsFor(g.id).some((x) => rowPassesFacets(x.resource_type, [x]));
     /* The filter narrows the list it sits above, and in this view that list
        is GROUPS — so it shows the groups holding that kind, not just the
        rows inside a group somebody happens to have opened. Filtering rows
@@ -735,10 +789,18 @@
          deleted where they are owned, in the seed or in Workspace. */
       const open = selectedGroup === g.id;
       /* A COLLAPSED row still has to answer something, or it is a shutter
-         over hidden content rather than a summary — the state the Library
-         redesign removed and should not come back through this page. So it
-         carries origin, reach, and a count per family: enough to decide a
-         group needs no opening. */
+         over hidden content rather than a summary. What it answers is now
+         one line: the name, where the group comes from, and "N people · N
+         granted".
+
+         Three things came OFF it. The per-family counts — `knowledge 1
+         capabilities 3 surfaces 0` on every row — were three numbers, mostly
+         zeros, answering a question nobody asks before opening a group; the
+         count that decides whether to open is already in `meta`. `created`
+         was an age nobody sorts or filters by, printed to the minute. And
+         the description moved rather than went: it is the only text on the
+         page saying what a group is FOR, and it now sits in the people strip
+         inside, where "who are these people" is the question it answers. */
       return `
       <details class="ax-gs${g.is_everyone ? " ax-gs--scope" : ""}" data-gs="${esc(g.id)}" ${open ? "open" : ""}>
         <summary class="ax-gs__hd" title="${esc(g.description || label)}">
@@ -754,19 +816,7 @@
                   ? `matched ${esc(peopleFor(g).slice(0, 2).map((u) => u.name || u.email).join(", "))}`
                   : "matched something it holds"}</span>` : ""}
             </span>
-            ${(() => {
-              // What the retired fact strip uniquely carried — the purpose
-              // and the age. The counts it also carried are two words to the
-              // left of here, which is why the strip went.
-              const when = fmtDate(g.created_at);
-              const bits = [g.description ? esc(g.description) : "",
-                            when ? `created ${esc(when)}` : ""].filter(Boolean);
-              return bits.length
-                ? `<span class="ax-gs__desc">${bits.join(' <span class="ax-r__sep">·</span> ')}</span>`
-                : "";
-            })()}
           </span>
-          <span class="ax-gs__counts">${familyCounts(g.id)}</span>
           ${isEditable(g) ? `
           <span class="ax-grow">
             <button type="button" class="ax-gkebab" data-gmenu="${esc(g.id)}"
@@ -845,7 +895,6 @@
             <span class="ax-gs__desc">Not a group — a scope. Anything here reaches every
               account, including anyone who joins later.</span>
           </span>
-          <span class="ax-gs__counts">${familyCounts(cid)}</span>
         </summary>
         <div class="ax-gs__body" data-gsbody="${esc(cid)}"></div>
       </details>`;
@@ -1201,7 +1250,7 @@
         for (const i of (b.items || [])) {
           const grant = grantOf(selectedGroup, t.type_key, i.resource_id);
           if (!grant) continue;             // the holding, not the catalogue
-          if (listKind && t.type_key !== listKind) continue;
+          if (facetOn("kind") && !facetHas("kind", t.type_key)) continue;
           if (!hits(t, i)) continue;
           /* An inherited row is COUNTED here, not rendered. Every everyone-wide
              grant used to appear in every group's list as its own row, each
@@ -1532,16 +1581,46 @@
     system_seed: "system-managed",
   };
 
+  /* The people strip: faces, the count, and what the group is FOR.
+
+     `sub` used to be the constant "Who this group reaches." under a section
+     heading, which is a caption for the word People rather than anything
+     about this group. The group's own description says something only this
+     group can say, and it has nowhere else to be now that the list row is
+     one line — so it wins here whenever there is one, and the generic line
+     is what a group without a description falls back to rather than a gap.
+     A caller that passes an explicit `sub` (loading, a failed read) still
+     outranks both: a state beats a standing description. */
   function setPeopleHead(text, sub, faces) {
     const sum = el("ax-people-sum");
     if (sum) sum.textContent = text || "";
     const s = el("ax-people-sub");
-    if (s && sub) s.textContent = sub;
+    if (s) {
+      const g = (overview && overview.groups || []).find((x) => x.id === selectedGroup);
+      const own = g && String(g.description || "").trim();
+      s.textContent = sub || own || "Who this group reaches.";
+      s.classList.toggle("is-own", !sub && !!own);
+    }
     // Every caller passes the faces it knows about — including the ones that
     // know there are none (no group open, `Everyone`, still loading), which is
     // what keeps a previous group's faces from lingering on the next one.
     const f = el("ax-people-faces");
     if (f) f.innerHTML = faces || "";
+    /* The roster's own control. Its word has to match what opening it can
+       do — the page's standing rule about never offering what cannot
+       succeed. `Everyone` and a Workspace-synced group are read-only here
+       (membership is decided in the seed or in Workspace), so on those it
+       says Show, not Manage. */
+    const more = el("ax-people-toggle");
+    if (more) {
+      const g = (overview && overview.groups || []).find((x) => x.id === selectedGroup);
+      const editable = !!g && !g.is_everyone && !g.is_google_managed
+        && !(g.is_system && g.name === "Everyone");
+      more.hidden = !g;
+      more.dataset.verb = editable ? "manage" : "show";
+      const open = more.getAttribute("aria-expanded") === "true";
+      more.textContent = open ? "Hide" : (editable ? "Manage" : "Show");
+    }
   }
 
   async function renderMembers() {
@@ -1550,7 +1629,7 @@
       host.innerHTML = "";
       memberIds = new Set();
       memberSource = new Map();
-      setPeopleHead("", "Who this group reaches.");
+      setPeopleHead("", "");
       return;
     }
     const group = (overview.groups || []).find((g) => g.id === selectedGroup);
@@ -1571,7 +1650,7 @@
       return;
     }
 
-    setPeopleHead("Loading…", "Who this group reaches.");
+    setPeopleHead("Loading…", "Reading who is in this group…");
     host.innerHTML = `<div class="ax-res__msg">Loading who is in this group…</div>`;
     /* A FAILED read is not an empty group (#2140).
 
@@ -1617,7 +1696,7 @@
     setPeopleHead(
       membersFailed ? "Unknown"
         : members.length ? `${members.length} ${members.length === 1 ? "member" : "members"}` : "Nobody",
-      membersFailed ? "This group's members could not be read." : "Who this group reaches.",
+      membersFailed ? "This group's members could not be read." : "",
       membersFailed ? "" : peopleFaces(members));
 
     // The find box comes FIRST in the body: at any real group size, "is
@@ -2285,12 +2364,39 @@
   /* Built from what the ACTIVE view actually holds, with counts, so the
      control never offers a kind that would empty the list. Hidden in the
      person view, which is not a list of things. */
+  /* ── The filter menu ─────────────────────────────────────────────────
+     The Library's own shape: a category per facet, a submenu of checkboxes
+     inside each, a count beside every option, and a chip row underneath
+     saying what is on. Nothing here is bespoke styling — `fbar-menu--cats`,
+     `fbar-cat`, `fbar-menu__opt` and `fbar-chip` are the shared classes in
+     `filter_toolbar.css`, so this page's filters look and behave like the
+     Library's because they ARE the Library's.
+
+     Two rules the Library established and this follows:
+
+       A count beside an option is the number of rows PICKING IT WOULD
+       LEAVE, not some other statistic wearing the same slot. Each lens
+       counts the thing it lists — the group lens counts groups, the
+       resource lens counts resources — because "Marketplace plugins 5"
+       above a list that then says "2 of 24 groups" is two different
+       questions answered in the same breath.
+
+       No dead filters. A category with nothing to offer is not rendered at
+       all, so an empty submenu can never be opened. On this page that
+       matters most for Tier, which only exists on five of the sixteen
+       kinds: an instance with no tiered grants has no Tier category. */
   function paintKindFilter() {
     const btn = el("ax-filter-btn");
     const menu = el("ax-filter-menu");
     const chips = el("ax-chips");
     const nBadge = el("ax-filter-n");
     if (!btn || !menu || !chips) return;
+
+    /* Switching to a lens that does not offer a facet drops that facet's
+       picks. Carrying them across would narrow the new list with no control
+       on screen able to undo it — the same invisible-filter state the chip
+       row exists to prevent. */
+    if (viewMode !== "resource" && facetOn("reach")) facets.get("reach").clear();
 
     const wrap = btn.closest(".ax-filter");
     if (viewMode === "person") {
@@ -2300,59 +2406,154 @@
     }
     if (wrap) wrap.hidden = false;
 
-    /* Only the kinds the ACTIVE view can show — `BUNDLE_LEAD`, module scope.
+    const typeLabel = new Map((overview.resources || []).map((t) => [t.type_key, t.type_display]));
+    const rank = new Map((overview.resources || []).map((t, i) => [t.type_key, i]));
 
-       The badge beside an option has to equal the number of ROWS picking it
-       will leave, or it is not a preview, it is a different statistic
-       wearing the same slot. It used to count GRANTS in both lenses, while
-       the bundle list counts bundles and the group list counts groups — so
-       "Marketplace plugins 5" produced "2 of 24 bundles", and "Agents 3"
-       produced "12 of 24". Each lens now counts the thing it lists. */
-    const counts = new Map();
+    /* Every (row, its grants) pair the ACTIVE lens lists, once. Both the
+       option counts and the chip counts are computed from this, so the
+       menu and the list can never disagree about what a pick would do. */
+    const subjects = [];
     if (viewMode === "resource") {
-      // Bundles of that kind, counted exactly as `bundleTotal()` counts.
+      const heldBy = new Map();
+      for (const g of (overview.grants || [])) {
+        const k = `${g.resource_type}\u0000${g.resource_id}`;
+        const at = heldBy.get(k);
+        if (at) at.push(g); else heldBy.set(k, [g]);
+      }
       for (const t of (overview.resources || [])) {
         if (!BUNDLE_LEAD.has(t.type_key)) continue;
-        let n = 0;
-        for (const b of (t.blocks || [])) n += (b.items || []).length;
-        if (n) counts.set(t.type_key, n);
+        for (const b of (t.blocks || [])) {
+          for (const i of (b.items || [])) {
+            subjects.push({ typeKey: t.type_key, held: heldBy.get(`${t.type_key}\u0000${i.resource_id}`) || [] });
+          }
+        }
       }
     } else {
-      // Groups holding at least one grant of that kind — what `kindHit()`
-      // keeps. A group with four plugins still counts once.
+      // A group is one subject holding all of its grants: picking a value
+      // keeps the group if ANY of them matches, which is what it counts.
       for (const g of (overview.groups || [])) {
-        const kinds = new Set(grantsFor(g.id).map((x) => x.resource_type));
-        for (const k of kinds) counts.set(k, (counts.get(k) || 0) + 1);
+        subjects.push({ typeKey: null, held: grantsFor(g.id) });
       }
     }
-    const rank = new Map((overview.resources || []).map((t, i) => [t.type_key, i]));
-    const label = new Map((overview.resources || []).map((t) => [t.type_key, t.type_display]));
-    const kinds = [...counts.keys()].sort((a, b) => (rank.get(a) ?? 99) - (rank.get(b) ?? 99));
 
-    menu.innerHTML = kinds.map((k) => `
-      <label class="fbar-menu__opt">
-        <input type="radio" name="ax-list-kind" data-list-kind="${esc(k)}"${listKind === k ? " checked" : ""}>
-        <span class="fbar-menu__opt-text">${esc(label.get(k) || k)}</span>
-        <span class="fbar-menu__opt-n">${counts.get(k)}</span>
-      </label>`).join("");
+    /* What picking one more value would leave: this facet's set with `v`
+       added, every other facet as it stands. So a count narrows as other
+       facets are picked, which is what makes it a preview rather than a
+       standing total. */
+    const wouldLeave = (facetKey, v) => {
+      const saved = facets.get(facetKey);
+      facets.set(facetKey, new Set([...saved, v]));
+      let n = 0;
+      for (const sub of subjects) {
+        const ok = sub.typeKey !== null
+          ? rowPassesFacets(sub.typeKey, sub.held)
+          : (sub.held || []).some((x) => rowPassesFacets(x.resource_type, [x]));
+        if (ok) n++;
+      }
+      facets.set(facetKey, saved);
+      return n;
+    };
 
-    nBadge.textContent = listKind ? "1" : "0";
-    nBadge.hidden = !listKind;
-    btn.classList.toggle("is-on", !!listKind);
+    //: Values a facet could offer, before any are dropped for being empty.
+    const kindsPresent = [...new Set(
+      viewMode === "resource"
+        ? subjects.map((x) => x.typeKey)
+        : (overview.grants || []).map((g) => g.resource_type))]
+      .filter((k) => viewMode === "resource" ? BUNDLE_LEAD.has(k) : typeLabel.has(k))
+      .sort((a, b) => (rank.get(a) ?? 99) - (rank.get(b) ?? 99));
+
+    const CATS = [
+      { key: "kind", label: "Kind",
+        values: kindsPresent.map((k) => [k, typeLabel.get(k) || k]) },
+      /* Resource lens only, and that is a judgement rather than a
+         limitation. "Which groups hold something granted to everyone" is
+         answered "all of them" by definition — an everyone-scoped grant
+         reaches every group's members — so on the group lens this facet
+         counts the whole list and filters nothing. A control whose every
+         value is a no-op is the dead filter the Library's rule exists to
+         prevent, and a count that equals the total is not a preview. */
+      ...(viewMode === "resource" ? [{ key: "reach", label: "Reach", values: [
+        [REACH.EVERYONE, "Everyone"],
+        [REACH.GROUP, "Specific groups"],
+        [REACH.NOBODY, "Nobody"],
+      ] }] : []),
+      { key: "tier", label: "Tier", values: [
+        ["required", WORDS.tier_automatic || "Automatic"],
+        ["available", WORDS.tier_optional || "Optional"],
+      ] },
+      { key: "origin", label: "Where it came from", values: [
+        [ORIGIN.ADMIN, "Granted here"],
+        [ORIGIN.OWNER, "Shared by an owner"],
+        [ORIGIN.MANAGED, "Managed elsewhere"],
+      ] },
+    ];
+
+    /* A value counting zero is dropped, and a category left with fewer than
+       two values goes with it — one option is not a choice, it is the list
+       you are already looking at. A value that is currently TICKED always
+       survives, or turning a filter on would delete the control that turns
+       it off. */
+    const live = CATS.map((c) => ({
+      ...c,
+      values: c.values
+        .map(([v, lbl]) => [v, lbl, wouldLeave(c.key, v)])
+        .filter(([v, , n]) => n > 0 || facetHas(c.key, v)),
+    })).filter((c) => c.values.length > 1 || c.values.some(([v]) => facetHas(c.key, v)));
+
+    menu.innerHTML = live.map((c) => `
+      <div class="fbar-cat" data-cat="${esc(c.key)}">
+        <button type="button" class="fbar-cat__btn" aria-haspopup="true" aria-expanded="false">
+          <span class="fbar-cat__label">${esc(c.label)}</span>
+          <span class="fbar-cat__end">
+            <span class="fbar-cat__n"${facetOn(c.key) ? "" : " hidden"}>${facets.get(c.key).size}</span>
+            <svg class="fbar-cat__caret" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m9 6 6 6-6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </span>
+        </button>
+        <div class="fbar-cat__pop" hidden>
+          ${c.values.map(([v, lbl, n]) => `
+          <label class="fbar-menu__opt">
+            <input type="checkbox" data-facet="${esc(c.key)}" value="${esc(v)}"${facetHas(c.key, v) ? " checked" : ""}>
+            <span class="fbar-menu__opt-text">${esc(lbl)}</span>
+            <span class="fbar-menu__opt-n">${n}</span>
+          </label>`).join("")}
+        </div>
+      </div>`).join("") + `
+      <div class="fbar-menu__foot">
+        <button type="button" data-fbar-clear>Clear</button>
+        <button type="button" data-fbar-done>Done</button>
+      </div>`;
+
+    const total = FACET_KEYS.reduce((n, k) => n + facets.get(k).size, 0);
+    nBadge.textContent = String(total);
+    nBadge.hidden = !total;
+    btn.classList.toggle("is-on", !!total);
 
     const row = el("ax-chiprow");
     if (row) row.hidden = false;
 
-    chips.innerHTML = listKind ? `
+    /* One chip per PICKED VALUE, labelled with its category. A chip per
+       category ("Kind: 3") would name the count and hide the answer, and
+       the thing a reader wants to undo is one value, not a category. */
+    const labelOf = (catKey, v) => {
+      const c = CATS.find((x) => x.key === catKey);
+      const hit = c && c.values.find(([val]) => val === v);
+      return hit ? hit[1] : v;
+    };
+    const picked = [];
+    for (const k of FACET_KEYS) {
+      for (const v of facets.get(k)) picked.push([k, v]);
+    }
+    chips.innerHTML = picked.length ? picked.map(([k, v]) => `
       <span class="fbar-chip">
         <span class="fbar-chip__edit">
-          <span class="fbar-chip__label">Kind:</span>
-          <span class="fbar-chip__val">${esc(label.get(listKind) || listKind)}</span>
+          <span class="fbar-chip__label">${esc((CATS.find((c) => c.key === k) || {}).label || k)}:</span>
+          <span class="fbar-chip__val">${esc(labelOf(k, v))}</span>
         </span>
-        <button type="button" class="fbar-chip__x" data-chip-clear aria-label="Remove kind filter">×</button>
-      </span>
+        <button type="button" class="fbar-chip__x" data-chip-drop="${esc(k)}" data-chip-val="${esc(v)}"
+                aria-label="Remove ${esc(labelOf(k, v))} filter">×</button>
+      </span>`).join("") + `
       <button type="button" class="fbar-chips__clear" data-chip-clear>Clear all</button>` : "";
-    chips.hidden = !listKind;
+    chips.hidden = !picked.length;
   }
 
   /* "N of M", reported by whoever just rendered the list rather than
@@ -2703,12 +2904,14 @@
     const rows = [];
     for (const t of (overview.resources || [])) {
       if (!BUNDLE_LEAD.has(t.type_key)) continue;
-      if (listKind && t.type_key !== listKind) continue;
+      if (facetOn("kind") && !facetHas("kind", t.type_key)) continue;
       for (const b of (t.blocks || [])) {
         for (const i of (b.items || [])) {
           const hay = `${i.name || ""} ${i.slug || ""} ${i.resource_id || ""} ${i.owner_email || ""} ${b.name || ""} ${t.type_display || ""}`.toLowerCase();
           if (q && !hay.includes(q)) continue;
-          rows.push({ t, b, i, held: heldBy.get(`${t.type_key}\u0000${i.resource_id}`) || [] });
+          const held = heldBy.get(`${t.type_key}\u0000${i.resource_id}`) || [];
+          if (!rowPassesFacets(t.type_key, held)) continue;
+          rows.push({ t, b, i, held });
         }
       }
     }
@@ -2719,13 +2922,10 @@
          searched, and the thing the reader is looking for may be sitting one
          click away behind the filter. So the claim narrows to match the
          scope, and offers the way out. */
-      const kindName = listKind
-        ? ((overview.resources || []).find((t) => t.type_key === listKind) || {}).type_display
-        : "";
       host.innerHTML = `<div class="ax-empty">Nothing here is called “${esc(groupFilter)}”.
-        ${listKind
-          ? `Only ${esc(String(kindName || listKind).toLowerCase())} were searched —
-             <button type="button" class="ax-linkbtn" data-chip-clear>search every kind</button>.`
+        ${anyFacetOn()
+          ? `Filters are narrowing this —
+             <button type="button" class="ax-linkbtn" data-chip-clear>search everything</button>.`
           : "Every resource on the instance was searched."}</div>`;
       paintCount(0, bundleTotal());
       return;
@@ -2989,7 +3189,7 @@
        matching is granted", not "nothing on this instance is granted" — and
        with a search or a filter on, the old sentence was flatly false about
        an instance with grants. */
-    const noneGrantedMsg = (groupFilter.trim() || listKind)
+    const noneGrantedMsg = (groupFilter.trim() || anyFacetOn())
       ? "Nothing matching this is granted to any group."
       : "Nothing on this instance is granted to anyone yet.";
     host.innerHTML = (painted
@@ -3001,6 +3201,32 @@
   //: grant written.
   document.addEventListener("click", (e) => {
     if (e.target.closest("[data-new-group]")) openGroupDrawer(null);
+  });
+
+  /* The facet checkboxes. `change`, not `click`: a `<label>` wrapping an
+     `<input>` delivers the click twice — once for each — and a click handler
+     that toggles a Set would put the value straight back where it started.
+     The menu is NOT closed on a pick: multi-select means the next pick is
+     the likely next act, and closing after each one would make picking three
+     values three trips. `Done` closes it. */
+  document.addEventListener("change", async (e) => {
+    const box = e.target.closest(".ax-filter [data-facet]");
+    if (!box) return;
+    const set = facets.get(box.dataset.facet);
+    if (!set) return;
+    if (box.checked) set.add(box.value); else set.delete(box.value);
+    syncUrl({ push: true });
+    await repaint();
+    // The repaint rebuilt the menu, so the submenu the reader was working
+    // in has to be put back — otherwise every tick collapses the category.
+    const menu = el("ax-filter-menu");
+    const cat = menu && menu.querySelector(`.fbar-cat[data-cat="${box.dataset.facet}"]`);
+    if (cat) {
+      const pop = cat.querySelector(".fbar-cat__pop");
+      if (pop) pop.hidden = false;
+      const btn = cat.querySelector(".fbar-cat__btn");
+      if (btn) btn.setAttribute("aria-expanded", "true");
+    }
   });
 
   /* The group menu, delegated: every repaint replaces the rows, so binding
@@ -3164,10 +3390,10 @@
       return;
     }
     if (e.target.closest("[data-chip-clear]")) {
-      // "Clear all" cleared the kind chip and left the search term live —
-      // and with the chip gone there was nothing left on screen to explain
-      // why the list was still filtered. It means all of it.
-      listKind = "";
+      // "Clear all" left the search term live once, and with the chips gone
+      // there was nothing on screen explaining why the list was still
+      // narrowed. It means all of it: every facet AND the search.
+      clearFacets();
       groupFilter = "";
       const find = el("ax-group-find");
       if (find) find.value = "";
@@ -3175,18 +3401,36 @@
       await repaint();
       return;
     }
-    const kindBox = e.target.closest("[data-list-kind]");
-    if (kindBox) {
-      // One kind at a time: the chip says which, and a second chip for a
-      // second kind would need a menu that can express "or", which this
-      // question does not have. The control is a RADIO for that reason —
-      // it was a checkbox, which promises multi-select and then silently
-      // unset the previous kind when you picked a second one.
-      listKind = kindBox.checked ? kindBox.dataset.listKind : "";
-      el("ax-filter-menu").hidden = true;
-      el("ax-filter-btn").setAttribute("aria-expanded", "false");
+    // One chip's × removes one VALUE, leaving the rest of that facet on.
+    const chipDrop = e.target.closest("[data-chip-drop]");
+    if (chipDrop) {
+      facets.get(chipDrop.dataset.chipDrop).delete(chipDrop.dataset.chipVal);
       syncUrl({ push: true });
       await repaint();
+      return;
+    }
+    // A category head opens its own submenu and closes its siblings — one
+    // open pop at a time, the Library's behaviour.
+    const catBtn = e.target.closest(".ax-filter .fbar-cat__btn");
+    if (catBtn) {
+      const cat = catBtn.closest(".fbar-cat");
+      const pop = cat.querySelector(".fbar-cat__pop");
+      const opening = pop.hidden;
+      for (const other of el("ax-filter-menu").querySelectorAll(".fbar-cat__pop")) other.hidden = true;
+      for (const other of el("ax-filter-menu").querySelectorAll(".fbar-cat__btn")) other.setAttribute("aria-expanded", "false");
+      pop.hidden = !opening;
+      catBtn.setAttribute("aria-expanded", opening ? "true" : "false");
+      return;
+    }
+    if (e.target.closest(".ax-filter [data-fbar-clear]")) {
+      clearFacets();
+      syncUrl({ push: true });
+      await repaint();
+      return;
+    }
+    if (e.target.closest(".ax-filter [data-fbar-done]")) {
+      el("ax-filter-menu").hidden = true;
+      el("ax-filter-btn").setAttribute("aria-expanded", "false");
       return;
     }
     // A click anywhere else closes the menu, as the Library's does.
@@ -3214,6 +3458,21 @@
         paintTabState();
         await repaint();
       }
+      return;
+    }
+
+    // The people strip's roster disclosure. The body is rendered already —
+    // this only reveals it — so there is nothing to fetch and nothing to
+    // repaint, which is what keeps it instant on a large group.
+    const pplToggle = e.target.closest("#ax-people-toggle");
+    if (pplToggle) {
+      const body = el("ax-members");
+      const open = pplToggle.getAttribute("aria-expanded") !== "true";
+      pplToggle.setAttribute("aria-expanded", open ? "true" : "false");
+      if (body) body.hidden = !open;
+      pplToggle.textContent = open
+        ? "Hide"
+        : (pplToggle.dataset.verb === "manage" ? "Manage" : "Show");
       return;
     }
 
@@ -4505,7 +4764,12 @@
       by: viewMode,
       group: viewMode === "group" ? (selectedGroup || "") : "",
       q: groupFilter.trim(),
-      kind: listKind || "",
+      // One comma-joined value per facet. `?kind=agent` — the single-value
+      // shape that is in shared links and bookmarks — reads back unchanged.
+      kind: [...facets.get("kind")].join(","),
+      reach: [...facets.get("reach")].join(","),
+      tier: [...facets.get("tier")].join(","),
+      origin: [...facets.get("origin")].join(","),
       user: viewMode === "person" ? ((el("ax-sim-user") || {}).value || "") : "",
     };
   }
@@ -4517,7 +4781,8 @@
     set("by", st.by === "group" ? "" : st.by);
     set("group", st.group);
     set("q", st.q);
-    set("kind", st.kind);
+    // Every facet, so a filtered view is a link someone can send.
+    for (const k of FACET_KEYS) set(k, st[k]);
     set("user", st.user);
     // `?lens=simulate` is the older spelling of `?by=person`; keep writing it
     // only while that lens is on, so an old bookmark and a new link agree.
@@ -4539,7 +4804,10 @@
       : (_normalizeBy(params.get("by")) || "group");
     viewMode = by;
     groupFilter = params.get("q") || "";
-    listKind = params.get("kind") || "";
+    clearFacets();
+    for (const k of FACET_KEYS) {
+      for (const v of (params.get(k) || "").split(",")) if (v) facets.get(k).add(v);
+    }
     selectedGroup = params.get("group") || selectedGroup;
     const find = el("ax-group-find");
     if (find) find.value = groupFilter;
