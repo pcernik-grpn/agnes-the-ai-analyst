@@ -1515,6 +1515,20 @@ extraction:
     # At 8 MiB an ordinary document passes untouched and the multi-byte
     # ones that really do reach double-digit megabytes are refused.
     max_converted_mb: 8
+    # Suffixes (no leading dot; case-insensitive) skipped BEFORE any
+    # download or conversion attempt — a live crawl's built-in defaults
+    # (audio/video containers, notebooks/code, subtitles, Power BI/Visio,
+    # SVG, fonts, executables) already cover the formats markitdown fails
+    # on every single time, so this list is ADDITIVE to those defaults, not
+    # a replacement: it lets an operator add a format specific to their own
+    # estate without losing the built-in set. Skipped files are counted in
+    # the run report's `skipped_unsupported` (+ per-extension breakdown),
+    # never `errors`/`convert_failed`, and never enter the retry backlog —
+    # unlike a format markitdown itself discovers mid-conversion it cannot
+    # handle, an extension listed here is never even downloaded. Adding
+    # `.zip` here is a mistake, not just discouraged: markitdown converts a
+    # zip's members and this override is not validated against it.
+    unsupported_extensions: []
   # The LLM stage — turn ingested documents into knowledge-graph facts
   # (connectors/sharepoint/facts_extraction.py). Runs after a successful
   # crawl, over the documents that crawl just ingested and indexed.

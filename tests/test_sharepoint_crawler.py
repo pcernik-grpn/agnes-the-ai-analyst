@@ -534,6 +534,84 @@ class TestResume:
         assert "ingest exploded" in messages[0]
 
 
+class TestIngestorRejectedRaisesInsteadOfStranding:
+    """`_Ingestor.ingest()` — the seam between `ingest_file`'s own
+    catch-and-mark-rejected contract and the crawl's retry queue.
+
+    `ingest_file` never raises: it catches its own failures and marks the
+    `corpus_files` row `rejected` so an admin reading Collections can see
+    why. If `_Ingestor.ingest` stayed equally silent, the crawl would treat
+    a rejected document as an ordinary success — the item's cTag is
+    persisted right after `ingest()` returns, and Graph's delta feed only
+    re-offers an item once it CHANGES upstream, so it would never come back
+    around on a normal re-crawl (live finding, 2026-09: 261 documents
+    rejected on a NUL byte in their converted markdown, now itself fixed at
+    the ingest boundary — but the ALREADY-rejected rows still need this to
+    recover on their next crawl). No Graph/Postgres plumbing needed here —
+    every collaborator `_Ingestor.ingest` calls is stubbed, isolating just
+    this one contract.
+    """
+
+    def test_a_rejected_ingest_file_result_raises_instead_of_returning(self, monkeypatch):
+        import app.api.collections as collections_mod
+        import src.file_storage as file_storage_mod
+        import src.ingest.runner as runner_mod
+
+        monkeypatch.setattr(collections_mod, "_upsert_corpus_file", lambda *a, **kw: ("cf_1", True, 0))
+        stored = type("Stored", (), {"sha256": "abc", "ext": ".md", "size_bytes": 3, "storage_path": "p"})()
+        monkeypatch.setattr(file_storage_mod, "store_corpus_bytes", lambda *a, **kw: stored)
+        monkeypatch.setattr(runner_mod, "ingest_file", lambda *a, **kw: "rejected")
+
+        class _FakeCfRepo:
+            def get(self, file_id: str) -> Dict[str, Any]:
+                return {"processing_detail": {"reason": "ingest_error: NUL byte"}}
+
+        monkeypatch.setattr("src.repositories.corpus_files_repo", lambda: _FakeCfRepo())
+
+        ingestor = crawler._Ingestor.__new__(crawler._Ingestor)
+        ingestor._sources_repo = type("R", (), {"resolve": staticmethod(lambda *a, **kw: None)})()
+
+        with pytest.raises(RuntimeError, match="ingest_error: NUL byte"):
+            ingestor.ingest(
+                collection_id="col1",
+                stable_id="graph:item1",
+                path="Reports/doc.md",
+                filename="doc.md",
+                markdown="body",
+                source_sha256="deadbeef",
+            )
+
+    def test_an_indexed_ingest_file_result_returns_normally(self, monkeypatch):
+        """The success path is unaffected — no raise, no extra repo call."""
+        import app.api.collections as collections_mod
+        import src.file_storage as file_storage_mod
+        import src.ingest.runner as runner_mod
+
+        monkeypatch.setattr(collections_mod, "_upsert_corpus_file", lambda *a, **kw: ("cf_1", True, 0))
+        stored = type("Stored", (), {"sha256": "abc", "ext": ".md", "size_bytes": 3, "storage_path": "p"})()
+        monkeypatch.setattr(file_storage_mod, "store_corpus_bytes", lambda *a, **kw: stored)
+        monkeypatch.setattr(runner_mod, "ingest_file", lambda *a, **kw: "indexed")
+
+        def _boom():
+            raise AssertionError("corpus_files_repo() must not be called on a successful ingest")
+
+        monkeypatch.setattr("src.repositories.corpus_files_repo", _boom)
+
+        ingestor = crawler._Ingestor.__new__(crawler._Ingestor)
+        ingestor._sources_repo = type("R", (), {"resolve": staticmethod(lambda *a, **kw: None)})()
+
+        file_id, was_new = ingestor.ingest(
+            collection_id="col1",
+            stable_id="graph:item1",
+            path="Reports/doc.md",
+            filename="doc.md",
+            markdown="body",
+            source_sha256="deadbeef",
+        )
+        assert file_id == "cf_1"
+        assert was_new is True
+
+
 # --------------------------------------------------------------------------
 # force_reprocess: the operator control that ignores the delta cursor
 # (admin_data_sources.html's "Re-process everything" checkbox, wired through
@@ -1200,10 +1278,19 @@ class TestFailedAndSkippedItemVisibility:
         assert row["drive_id"] == "b!drive1"
 
     def test_a_format_with_no_conversion_backend_is_skipped_never_an_error(self, crawl_env, monkeypatch):
+        """Exercises the MID-CONVERSION discovery path — markitdown itself
+        reporting no `accepts()`-ing backend for a format that was NOT known
+        in advance (unlike `.pbix`/`.vsdx`, which `_DEFAULT_UNSUPPORTED_
+        EXTENSIONS` now classifies before any download at all — see
+        `TestUnsupportedExtensionsResolution` and `TestFailedAndSkippedItem
+        Visibility`'s own pre-download tests). `.one` (OneNote) is a real
+        example named in `UnsupportedConversionFormat`'s own docstring and,
+        deliberately, not in that pre-download set, so this test still
+        reaches `_prepare_document`/`convert_to_markdown`."""
         from connectors.sharepoint.convert import UnsupportedConversionFormat
 
         def _boom(path, mime):
-            raise UnsupportedConversionFormat("deck.pbix", "no conversion backend recognizes this file type")
+            raise UnsupportedConversionFormat("notes.one", "no conversion backend recognizes this file type")
 
         monkeypatch.setattr(crawler, "convert_to_markdown", _boom)
 
@@ -1212,7 +1299,7 @@ class TestFailedAndSkippedItemVisibility:
                 return _content_response()
             return httpx.Response(
                 200,
-                json={"value": [_file_item(name="deck.pbix")], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"},
+                json={"value": [_file_item(name="notes.one")], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"},
             )
 
         _install_graph(monkeypatch, handler)
@@ -1226,8 +1313,8 @@ class TestFailedAndSkippedItemVisibility:
         assert row["item_id"] == "item1"
         assert row["drive_id"] == "b!drive1"
         assert row["reason_type"] == "unsupported_type"
-        assert row["suffix"] == ".pbix"
-        assert row["path"].endswith("deck.pbix")
+        assert row["suffix"] == ".one"
+        assert row["path"].endswith("notes.one")
         assert FakeIngestor.instances[-1].ingested == []
 
     def test_failed_items_is_bounded_with_an_honest_truncated_flag(self):
@@ -1276,6 +1363,57 @@ class TestFailedAndSkippedItemVisibility:
         assert report["skipped_items"] == []
         assert report["skipped_items_truncated"] is False
         assert report["skipped_unsupported"] == 0
+
+    def test_a_default_unsupported_extension_is_skipped_before_any_download(self, crawl_env, monkeypatch):
+        """mp4 (and the rest of `_DEFAULT_UNSUPPORTED_EXTENSIONS`) must never
+        reach `download_to_temp` — that is the whole point of classifying it
+        up front (live finding: 868 persisted retry-queue entries, all
+        formats markitdown fails on identically every time)."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert not str(request.url).endswith("/content"), "a pre-classified unsupported file must not be downloaded"
+            return httpx.Response(
+                200,
+                json={"value": [_file_item(name="training.mp4")], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"},
+            )
+
+        _install_graph(monkeypatch, handler)
+        report = _run(_connection([_drive_scope()]), monkeypatch)
+
+        assert report["errors"] == 0
+        assert report["convert_failed"] == 0
+        assert report["skipped_unsupported"] == 1
+        assert report["skipped_unsupported_by_extension"] == {"mp4": 1}
+        assert report["failed_items"] == []
+        row = report["skipped_items"][0]
+        assert row["reason_type"] == "unsupported_type"
+        assert row["suffix"] == ".mp4"
+        assert row["path"].endswith("training.mp4")
+        assert FakeIngestor.instances[-1].ingested == []
+
+    def test_unsupported_extensions_config_override_is_additive(self, crawl_env, monkeypatch):
+        """The configured list widens the pre-download skip set — a format
+        that is NOT one of the built-in defaults is still skipped once
+        configured, and the base set keeps working alongside it."""
+        monkeypatch.setattr(
+            crawler,
+            "_unsupported_extensions",
+            lambda: crawler._DEFAULT_UNSUPPORTED_EXTENSIONS | {"foo"},
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert not str(request.url).endswith("/content")
+            return httpx.Response(
+                200,
+                json={"value": [_file_item(name="custom.foo")], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"},
+            )
+
+        _install_graph(monkeypatch, handler)
+        report = _run(_connection([_drive_scope()]), monkeypatch)
+
+        assert report["skipped_unsupported"] == 1
+        assert report["skipped_unsupported_by_extension"] == {"foo": 1}
+        assert FakeIngestor.instances[-1].ingested == []
 
 
 class TestConversionCrashIsolation:
@@ -4459,6 +4597,34 @@ class TestItemTimeoutResolution:
         crawler.run_builtin_crawl({"connection_id": "conn1"})
 
         assert seen["timeout_s"] == 42
+
+
+class TestUnsupportedExtensionsResolution:
+    """The knob itself — ``extraction.crawler.unsupported_extensions``."""
+
+    def test_an_unset_value_is_just_the_built_in_default_set(self, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", lambda *k, default=None: default)
+        exts = crawler._unsupported_extensions()
+        assert exts == crawler._DEFAULT_UNSUPPORTED_EXTENSIONS
+        assert "mp4" in exts and "zip" not in exts
+
+    def test_a_configured_list_is_additive_never_a_replacement(self, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", lambda *k, default=None: [".foo", "BAR", "  baz  "])
+        exts = crawler._unsupported_extensions()
+        assert {"foo", "bar", "baz"} <= exts
+        # The built-in defaults survive a configured list — this widens,
+        # it never narrows.
+        assert crawler._DEFAULT_UNSUPPORTED_EXTENSIONS <= exts
+
+    def test_a_non_list_value_is_ignored_not_a_crash(self, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", lambda *k, default=None: "mp4")
+        assert crawler._unsupported_extensions() == crawler._DEFAULT_UNSUPPORTED_EXTENSIONS
+
+    def test_non_string_entries_in_the_list_are_ignored(self, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", lambda *k, default=None: [123, None, "ok"])
+        exts = crawler._unsupported_extensions()
+        assert "ok" in exts
+        assert crawler._DEFAULT_UNSUPPORTED_EXTENSIONS <= exts
 
 
 class TestConcurrencyGovernor:
