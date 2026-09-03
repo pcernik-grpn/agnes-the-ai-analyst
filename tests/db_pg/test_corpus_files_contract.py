@@ -654,6 +654,61 @@ def test_status_counts_for_corpora_empty_ids_returns_empty_dict(repo):
     assert repo.status_counts_for_corpora([]) == {}
 
 
+def test_top_folder_status_counts_groups_by_first_path_segment(repo):
+    """The completeness check's per-folder breakdown: a file under
+    ``Reports/2024/q1.pdf`` buckets under ``Reports``, and a file with no
+    ``/`` in its path buckets under ``""`` (the corpus-root bucket)."""
+    a = repo.add(
+        corpus_id="col_a",
+        filename="q1.pdf",
+        sha256="sha_a",
+        file_type="pdf",
+        size_bytes=10,
+        storage_path="/tmp/a.pdf",
+        path="Reports/2024/q1.pdf",
+    )
+    repo.set_status(a, status="indexed")
+    b = repo.add(
+        corpus_id="col_a",
+        filename="q2.pdf",
+        sha256="sha_b",
+        file_type="pdf",
+        size_bytes=10,
+        storage_path="/tmp/b.pdf",
+        path="Reports/2024/q2.pdf",
+    )
+    repo.set_status(b, status="rejected")
+    repo.add(
+        corpus_id="col_a",
+        filename="readme.txt",
+        sha256="sha_c",
+        file_type="txt",
+        size_bytes=10,
+        storage_path="/tmp/c.pdf",
+        path="readme.txt",
+    )
+    counts = repo.top_folder_status_counts("col_a")
+    assert counts["Reports"] == {"indexed": 1, "rejected": 1}
+    assert counts[""] == {"pending": 1}
+
+
+def test_top_folder_status_counts_null_path_buckets_under_root(repo):
+    repo.add(
+        corpus_id="col_a",
+        filename="no-path.pdf",
+        sha256="sha_a",
+        file_type="pdf",
+        size_bytes=10,
+        storage_path="/tmp/a.pdf",
+    )
+    counts = repo.top_folder_status_counts("col_a")
+    assert counts[""] == {"pending": 1}
+
+
+def test_top_folder_status_counts_unknown_corpus_returns_empty_dict(repo):
+    assert repo.top_folder_status_counts("col_absent") == {}
+
+
 # ---------------------------------------------------------------------------
 # list_for_corpus / count_for_corpus — pagination + search (contract §1)
 # ---------------------------------------------------------------------------

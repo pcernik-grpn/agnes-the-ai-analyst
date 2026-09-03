@@ -1,7 +1,7 @@
 """`agnes admin sharepoint` — admin/ops triggers and status for SharePoint
 connector maintenance, plus the split-a-large-site management pair below.
 
-Nine surfaces:
+Ten surfaces:
 
   - ``extract`` — the manual crawl trigger with its per-run options
     (``--concurrency``, ``--timeout-s``, ``--resync``, ``--force-reprocess``,
@@ -55,6 +55,13 @@ Nine surfaces:
     multi-year corpus. CLI counterpart to
     ``PATCH /api/admin/sharepoint/connections/{connection_id}/extraction/
     crawl-config``.
+  - ``completeness`` — "did we really get everything?" (TCRD-296 B.9):
+    Graph Search's own document count per scope (and, for a single
+    whole-drive scope, per top-level folder) against what actually landed
+    in the corpus, with the crawl's own failed/empty/skipped/oversize
+    reasons applied before calling a gap unexplained. CLI counterpart to
+    ``GET /api/admin/sharepoint/connections/{connection_id}/extraction/
+    completeness``.
 
 The ACL-sync / subtree-sweep TRIGGERS stay admin-web-UI-only, an
 established precedent (see CONTRIBUTING.md's "admin/scheduler maintenance
@@ -649,6 +656,111 @@ def split_cmd(
         )
     if start:
         typer.echo("Crawl enqueued for each connection (skipped silently if extraction is not currently usable).")
+
+
+# ---------------------------------------------------------------------------
+# `completeness` — "did we really get everything?" (TCRD-296 B.9). CLI
+# counterpart to `GET …/extraction/completeness`.
+# ---------------------------------------------------------------------------
+
+
+def _fmt_count(value: Optional[int]) -> str:
+    return "—" if value is None else f"{value:,}"
+
+
+_COMPLETENESS_STATUS_STYLE = {
+    "complete": "green",
+    "accounted": "yellow",
+    "missing": "bold red",
+    "unknown": "dim",
+}
+
+
+def _print_completeness_table(body: Dict[str, Any]) -> None:
+    rows = sorted(body.get("rows") or [], key=lambda r: r.get("gap") if r.get("gap") is not None else -1, reverse=True)
+    title = f"SharePoint completeness — connection {body.get('connection_id')}"
+    if body.get("provisional"):
+        title += " [yellow](provisional — a crawl is running)[/yellow]"
+    table = Table(title=title)
+    table.add_column("SCOPE / FOLDER", style="bold")
+    table.add_column("EXPECTED", justify="right")
+    table.add_column("INDEXED", justify="right")
+    table.add_column("REJECTED", justify="right")
+    table.add_column("FAILED", justify="right")
+    table.add_column("EMPTY", justify="right")
+    table.add_column("SKIPPED", justify="right")
+    table.add_column("OVERSIZE", justify="right")
+    table.add_column("GAP", justify="right")
+    table.add_column("STATUS")
+
+    def _add(row: Dict[str, Any], *, indent: bool = False) -> None:
+        style = _COMPLETENESS_STATUS_STYLE.get(row.get("status") or "", "")
+        status = f"[{style}]{row.get('status')}[/{style}]" if style else str(row.get("status"))
+        label = f"  {row['label']}" if indent else row["label"]
+        table.add_row(
+            label,
+            _fmt_count(row.get("expected")),
+            _fmt_count(row.get("indexed")),
+            _fmt_count(row.get("rejected")),
+            _fmt_count(row.get("failed")),
+            _fmt_count(row.get("empty")),
+            _fmt_count(row.get("skipped_unsupported")),
+            _fmt_count(row.get("oversize")),
+            _fmt_count(row.get("gap")),
+            status,
+        )
+
+    for row in rows:
+        if row.get("kind") == "scope":
+            _add(row)
+    for row in rows:
+        if row.get("kind") == "folder":
+            _add(row, indent=True)
+    _console.print(table)
+    total = body.get("total") or {}
+    _console.print(
+        f"Total — expected: {_fmt_count(total.get('expected'))}, indexed: {_fmt_count(total.get('indexed'))}, "
+        f"gap: {_fmt_count(total.get('gap'))}, status: {total.get('status')}"
+    )
+    for caveat in body.get("caveats") or []:
+        _console.print(f"[dim]note: {caveat}[/dim]")
+
+
+@admin_sharepoint_app.command("completeness")
+def completeness_cmd(
+    connection_id: str = typer.Argument(..., help="SharePoint source_connections id"),
+    min_modified: Optional[str] = typer.Option(
+        None,
+        "--min-modified",
+        help="Only count documents modified on/after this date (YYYY-MM-DD); defaults to the connection's own crawl cutoff",
+    ),
+    refresh: bool = typer.Option(False, "--refresh", help="Bypass the 10-minute cache and recompute"),
+    as_json: bool = typer.Option(False, "--json"),
+):
+    """ "Did we really get everything?" — Graph Search's own document count
+    per scope (and, for a single whole-drive scope, per top-level folder)
+    against what actually landed in the corpus, with the crawl's own
+    failed/empty/skipped/oversize reasons applied before calling a gap
+    unexplained. CLI counterpart to ``GET /api/admin/sharepoint/
+    connections/{connection_id}/extraction/completeness``.
+
+    Rows are sorted by ``gap`` descending — the ones most worth a look come
+    first. ``provisional`` in the title means a crawl is running right now;
+    the numbers are still shown, just labeled as a snapshot mid-crawl.
+    """
+    params: Dict[str, Any] = {}
+    if min_modified:
+        params["min_modified"] = min_modified
+    if refresh:
+        params["refresh"] = "true"
+    resp = api_get(f"/api/admin/sharepoint/connections/{connection_id}/extraction/completeness", params=params)
+    if resp.status_code != 200:
+        _fail(resp)
+    body = resp.json()
+    if as_json:
+        typer.echo(json.dumps(body, indent=2))
+        return
+    _print_completeness_table(body)
 
 
 # ---------------------------------------------------------------------------

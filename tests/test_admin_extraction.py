@@ -16,11 +16,46 @@ in ``tests/db_pg/test_extraction_api_pg.py``.
 
 from __future__ import annotations
 
+import datetime as dt
 from datetime import datetime, timedelta, timezone
 
+import httpx
 import pytest
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.x509.oid import NameOID
 
 BASE = "/api/admin/sharepoint/connections"
+
+
+def _self_signed_pem() -> str:
+    """A throwaway self-signed certificate + its private key, concatenated —
+    same idiom as ``tests/test_admin_sharepoint.py``'s helper of the same
+    name (kept local rather than shared: each test module in this codebase
+    owns its own fixtures)."""
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    subject = issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "agnes-test")])
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(issuer)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=1))
+        .not_valid_after(dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=1))
+        .sign(key, hashes.SHA256())
+    )
+    cert_pem = cert.public_bytes(serialization.Encoding.PEM).decode()
+    key_pem = key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode()
+    return cert_pem + key_pem
+
+
+PEM = _self_signed_pem()
 
 
 def _auth(token: str) -> dict:
@@ -46,6 +81,7 @@ _ROUTES = (
     "extraction/runs",
     "extraction/runs/er_whatever",
     "extraction/config",
+    "extraction/completeness",
 )
 
 
@@ -320,6 +356,173 @@ class TestExtractionConfig:
         conn_id = _create_connection(client, token, name="sp-config-secret")
         raw = client.get(f"{BASE}/{conn_id}/extraction/config", headers=_auth(token)).text
         assert "sk-do-not-leak-me" not in raw
+
+
+def _confirm_drive_scope(client, token, conn_id, *, source_scope_id="b!drive1", drive_id="drv1", display_path="Docs"):
+    r = client.post(
+        f"{BASE}/{conn_id}/scopes",
+        json={"source_scope_id": source_scope_id, "display_path": display_path, "drive_id": drive_id},
+        headers=_auth(token),
+    )
+    assert r.status_code == 201, r.text
+    return r.json()
+
+
+def _install_completeness_mock(monkeypatch, *, drive_id="drv1", web_url, count):
+    """Graph token exchange + drive-root webUrl lookup + an empty
+    root/children listing (a whole-drive scope also fetches a per-folder
+    breakdown) + a single Search count — enough for one confirmed drive
+    scope with no sub-folders."""
+    from connectors.sharepoint import graph_client as gc
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/oauth2/v2.0/token"):
+            return httpx.Response(200, json={"access_token": "tok-completeness"})
+        if path == f"/v1.0/drives/{drive_id}/root":
+            return httpx.Response(200, json={"webUrl": web_url})
+        if path == f"/v1.0/drives/{drive_id}/root/children":
+            return httpx.Response(200, json={"value": []})
+        if path == "/v1.0/search/query":
+            return httpx.Response(200, json={"value": [{"hitsContainers": [{"total": count}]}]})
+        raise AssertionError(f"unexpected sharepoint completeness mock path {path}")
+
+    monkeypatch.setattr(
+        gc, "_http_client", lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler), timeout=10)
+    )
+
+
+class TestCompleteness:
+    """``GET …/extraction/completeness`` — A6, "did we really get
+    everything?" (TCRD-296 B.9). Answers on BOTH backends (no
+    ``extraction_runs`` read), unlike A1/A2/A3."""
+
+    def test_no_scopes_never_needs_a_cert(self, seeded_app):
+        """No confirmed scope means nothing to count against — the endpoint
+        must answer 200, never a 409 about a certificate that would only
+        matter once there's a scope to count."""
+        client, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = _create_connection(client, token, name="sp-completeness-nocert-noscope")
+        r = client.get(f"{BASE}/{conn_id}/extraction/completeness", headers=_auth(token))
+        assert r.status_code == 200, r.text
+
+    def test_no_cert_with_a_confirmed_scope_is_409(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("AGNES_SHAREPOINT_ENABLED", "true")
+        client, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = _create_connection(client, token, name="sp-completeness-nocert")
+        _confirm_drive_scope(client, token, conn_id)
+        r = client.get(f"{BASE}/{conn_id}/extraction/completeness", headers=_auth(token))
+        assert r.status_code == 409
+        assert r.json()["detail"]["error"] == "sharepoint_cert_unresolved"
+
+    def test_invalid_min_modified_is_400(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        client, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = _create_connection(client, token, name="sp-completeness-baddate")
+        r = client.get(f"{BASE}/{conn_id}/extraction/completeness?min_modified=not-a-date", headers=_auth(token))
+        assert r.status_code == 400
+        assert r.json()["detail"]["error"] == "invalid_min_modified"
+
+    def test_no_scopes_answers_200_with_an_unknown_total(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        client, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = _create_connection(client, token, name="sp-completeness-noscopes")
+        r = client.get(f"{BASE}/{conn_id}/extraction/completeness", headers=_auth(token))
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["rows"] == []
+        assert body["total"]["status"] == "unknown"
+        assert body["provisional"] is False
+
+    def test_single_drive_scope_answers_200_on_duckdb(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        monkeypatch.setenv("AGNES_SHAREPOINT_ENABLED", "true")
+        client, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = _create_connection(client, token, name="sp-completeness-happy")
+        _confirm_drive_scope(client, token, conn_id)
+        _install_completeness_mock(monkeypatch, web_url="https://example.sharepoint.com/sites/s/Docs", count=3)
+
+        r = client.get(f"{BASE}/{conn_id}/extraction/completeness", headers=_auth(token))
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["connection_id"] == conn_id
+        scope_row = next(row for row in body["rows"] if row["kind"] == "scope")
+        assert scope_row["expected"] == 3
+        assert scope_row["indexed"] == 0
+        assert scope_row["gap"] == 3
+        assert scope_row["status"] == "missing"
+        assert body["total"]["expected"] == 3
+        assert body["cached"] is False
+        assert body["provisional"] is False
+        assert body["min_modified"] == {"value": None, "source": "none"}
+
+        from src.repositories import audit_repo
+
+        rows, _ = audit_repo().query(action="sharepoint_connection.completeness_read", limit=10)
+        assert len(rows) == 1
+
+    def test_repeat_call_is_cached_and_refresh_bypasses_it(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        monkeypatch.setenv("AGNES_SHAREPOINT_ENABLED", "true")
+        client, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = _create_connection(client, token, name="sp-completeness-cache")
+        _confirm_drive_scope(client, token, conn_id)
+
+        calls = {"n": 0}
+        from connectors.sharepoint import graph_client as gc
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            path = request.url.path
+            if path.endswith("/oauth2/v2.0/token"):
+                return httpx.Response(200, json={"access_token": "tok"})
+            if path == "/v1.0/drives/drv1/root":
+                return httpx.Response(200, json={"webUrl": "https://example.sharepoint.com/sites/s/Docs"})
+            if path == "/v1.0/drives/drv1/root/children":
+                return httpx.Response(200, json={"value": []})
+            if path == "/v1.0/search/query":
+                calls["n"] += 1
+                return httpx.Response(200, json={"value": [{"hitsContainers": [{"total": 1}]}]})
+            raise AssertionError(path)
+
+        monkeypatch.setattr(
+            gc, "_http_client", lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler), timeout=10)
+        )
+
+        first = client.get(f"{BASE}/{conn_id}/extraction/completeness", headers=_auth(token))
+        assert first.status_code == 200
+        assert first.json()["cached"] is False
+        first_calls = calls["n"]
+
+        second = client.get(f"{BASE}/{conn_id}/extraction/completeness", headers=_auth(token))
+        assert second.status_code == 200
+        assert second.json()["cached"] is True
+        assert calls["n"] == first_calls  # no new Graph Search calls — served from cache
+
+        refreshed = client.get(f"{BASE}/{conn_id}/extraction/completeness?refresh=true", headers=_auth(token))
+        assert refreshed.status_code == 200
+        assert refreshed.json()["cached"] is False
+        assert calls["n"] > first_calls  # refresh recomputed for real
+
+    def test_provisional_true_while_a_crawl_job_is_in_flight(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        monkeypatch.setenv("AGNES_SHAREPOINT_ENABLED", "true")
+        client, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = _create_connection(client, token, name="sp-completeness-provisional")
+        _confirm_drive_scope(client, token, conn_id)
+        _install_completeness_mock(monkeypatch, web_url="https://example.sharepoint.com/sites/s/Docs", count=1)
+
+        from app.api.admin_sharepoint import _extraction_idempotency_key
+        from src.repositories import jobs_repo
+
+        jobs_repo().enqueue(
+            kind="corpus-extraction",
+            payload={"connection_id": conn_id},
+            idempotency_key=_extraction_idempotency_key(conn_id),
+        )
+
+        r = client.get(f"{BASE}/{conn_id}/extraction/completeness", headers=_auth(token))
+        assert r.status_code == 200, r.text
+        assert r.json()["provisional"] is True
 
 
 class TestDerivedOutcome:

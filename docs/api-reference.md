@@ -1725,6 +1725,7 @@ The fleet endpoint two paragraphs down (`.../extraction/runs` with no
 - /api/admin/sharepoint/connections/{connection_id}/extraction/facts-config
 - /api/admin/sharepoint/connections/{connection_id}/extraction/crawl-config
 - /api/admin/sharepoint/connections/{connection_id}/extraction/retry-empty
+- /api/admin/sharepoint/connections/{connection_id}/extraction/completeness
 
 `GET …/extraction/status` returns the live run (if any) and the last completed
 one. Liveness is **derived, never trusted**: a worker killed outright finalizes
@@ -1913,6 +1914,58 @@ scripting a per-connection cost/recall/scope tradeoff — but deliberately not
 MCP-exposed: a fleet-wide operational status read and a connection's
 retry/crawl policy are all operator decisions, not query surfaces any agent
 needs.
+
+`GET …/extraction/completeness` (TCRD-296 synthesis item B.9) answers "did we
+really get everything?" — the same question an operator's ad hoc script
+answered once by hand, promoted to a read-only surface. One row per confirmed
+scope (and, only when the connection has exactly one WHOLE-DRIVE scope and no
+others, one additional row per top-level folder under it — see
+`connectors.sharepoint.completeness`'s module docstring for the full
+attribution rules), plus a `total` row:
+
+```
+{expected, indexed, rejected, failed, empty, skipped_unsupported, oversize,
+ gap, status}
+```
+
+`expected` is a live Graph Search count (`IsDocument:1`, narrowed to
+convertible formats via the crawler's own unsupported-extension set) under
+the scope/folder's `web_url` — the SAME mechanism `…/split-plan` uses, never
+a delta walk. `indexed`/`rejected` come from `corpus_files.processing_status`
+in the scope's own collection. `failed`/`empty`/`skipped_unsupported`/
+`oversize` come from the persisted crawl state
+(`sharepoint_connection_state(kind="crawl")`) — exact for a single-scope
+connection, best-effort attributed for a multi-scope one (a "site" scope
+spanning several drives cannot resolve a single `expected` count at all,
+and reads `status: "unknown"` rather than a misleading 0). `gap = expected -
+indexed - failed - empty - skipped_unsupported - oversize`; `status` is
+`"complete"` (indexed already covers expected), `"accounted"` (a gap exists
+but every missing document has a recorded reason), `"missing"` (an
+unexplained gap), or `"unknown"` (expected itself could not be resolved).
+Any attribution shortcut taken for this particular connection is named in
+the response's own `caveats` list, never silent.
+
+`min_modified` (`YYYY-MM-DD`, `400 invalid_min_modified` otherwise) defaults
+to the connection's own resolved crawl cutoff (`resolve_min_modified` — same
+`{value, source}` shape as `…/extraction/config`) so "expected" matches the
+population the last crawl actually attempted; an explicit query param
+overrides it. Cached per `(connection_id, resolved min_modified)` for 10
+minutes (`cached: true/false` in the response) — one Graph Search call per
+scope/folder, so a repeat open of the drawer must not re-fan-out;
+`?refresh=true` bypasses and repopulates the cache. `provisional: true` when
+a `corpus-extraction` job is currently queued/running for this connection —
+the numbers are still returned, just flagged as a snapshot mid-crawl.
+Answers on BOTH app-state backends (no `extraction_runs` read — crawl state,
+`corpus_files` and the job queue are all backend-agnostic). `404` for an
+unknown/non-SharePoint connection; the same `409`/`502` `…/split-plan` raises
+when the connection's certificate is unresolved or Graph rejects the token
+exchange (skipped entirely for a connection with no confirmed scope — nothing
+to count against, so no token is ever requested). Audited as
+`sharepoint_connection.completeness_read`, same disclosure class as
+`split_plan_read`. CLI: `agnes admin sharepoint completeness <connection_id>
+[--min-modified <date>] [--refresh] [--json]`, rows sorted by `gap`
+descending. Deliberately not MCP-exposed — an admin/ops display primitive
+over live Graph data, same reasoning as `…/split-plan`.
 
 ### `/api/admin/ontology` — Ontology builder (spec 2026-08-27 §13.2)
 

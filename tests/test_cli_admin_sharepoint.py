@@ -471,6 +471,112 @@ class TestSplitPlanCmd:
         assert "drive_id was not supplied" in result.output
 
 
+class TestCompletenessCmd:
+    """`agnes admin sharepoint completeness` — CLI counterpart to
+    `GET …/extraction/completeness`."""
+
+    def _body(self, *, provisional=False):
+        return {
+            "connection_id": "conn1",
+            "rows": [
+                {
+                    "kind": "scope",
+                    "scope_id": "b!drive1",
+                    "parent_scope_id": None,
+                    "label": "Docs",
+                    "collection_id": "col1",
+                    "expected": 10,
+                    "indexed": 7,
+                    "rejected": 0,
+                    "failed": 1,
+                    "empty": 0,
+                    "skipped_unsupported": 0,
+                    "oversize": 0,
+                    "gap": 2,
+                    "status": "missing",
+                },
+                {
+                    "kind": "folder",
+                    "scope_id": "f1",
+                    "parent_scope_id": "b!drive1",
+                    "label": "Reports",
+                    "collection_id": "col1",
+                    "expected": 5,
+                    "indexed": 5,
+                    "rejected": 0,
+                    "failed": 0,
+                    "empty": 0,
+                    "skipped_unsupported": 0,
+                    "oversize": 0,
+                    "gap": 0,
+                    "status": "complete",
+                },
+            ],
+            "total": {
+                "kind": "total",
+                "scope_id": None,
+                "parent_scope_id": None,
+                "label": "Total",
+                "collection_id": None,
+                "expected": 10,
+                "indexed": 7,
+                "rejected": 0,
+                "failed": 1,
+                "empty": 0,
+                "skipped_unsupported": 0,
+                "oversize": 0,
+                "gap": 2,
+                "status": "missing",
+            },
+            "caveats": [],
+            "min_modified": {"value": None, "source": "none"},
+            "cached": False,
+            "provisional": provisional,
+            "as_of": "2026-09-03T00:00:00+00:00",
+        }
+
+    def test_happy_path_prints_a_table(self):
+        with patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(200, self._body())) as mock_get:
+            result = runner.invoke(app, ["admin", "sharepoint", "completeness", "conn1"])
+        assert result.exit_code == 0, result.output
+        assert "Docs" in result.output
+        assert "Reports" in result.output
+        assert "missing" in result.output
+        args, kwargs = mock_get.call_args
+        assert args[0] == "/api/admin/sharepoint/connections/conn1/extraction/completeness"
+        assert kwargs["params"] == {}
+
+    def test_min_modified_and_refresh_ride_the_query(self):
+        with patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(200, self._body())) as mock_get:
+            result = runner.invoke(
+                app,
+                ["admin", "sharepoint", "completeness", "conn1", "--min-modified", "2023-12-31", "--refresh"],
+            )
+        assert result.exit_code == 0, result.output
+        _, kwargs = mock_get.call_args
+        assert kwargs["params"] == {"min_modified": "2023-12-31", "refresh": "true"}
+
+    def test_provisional_is_flagged_in_the_title(self):
+        with patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(200, self._body(provisional=True))):
+            result = runner.invoke(app, ["admin", "sharepoint", "completeness", "conn1"])
+        assert result.exit_code == 0, result.output
+        assert "provisional" in result.output
+
+    def test_json_output(self):
+        body = self._body()
+        with patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(200, body)):
+            result = runner.invoke(app, ["admin", "sharepoint", "completeness", "conn1", "--json"])
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.output) == body
+
+    def test_a_typed_error_is_reported(self):
+        detail = {"error": "sharepoint_cert_unresolved", "message": "no certificate configured"}
+        with patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(409, {"detail": detail})):
+            result = runner.invoke(app, ["admin", "sharepoint", "completeness", "conn1"])
+        assert result.exit_code == 1
+        assert "no certificate configured" in result.output
+
+
 class TestSplitCmd:
     """`agnes admin sharepoint split` — CLI counterpart to
     `POST /api/admin/sharepoint/connections/{connection_id}/splits`."""

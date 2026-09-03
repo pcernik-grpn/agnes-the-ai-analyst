@@ -286,6 +286,46 @@ one document's own request (most commonly a 400 "prompt is too long") is
 counted in `facts_failed`/`facts_failed_reasons` and the pass continues
 with the next document — it never aborts the whole run.
 
+## Verifying completeness
+
+"Did we really get everything?" is a live Graph Search count compared
+against the corpus, not a guess: **Completeness** in the source card's
+extraction drawer (or `/admin/extraction`'s own per-row button) shows, per
+confirmed scope — and, for a connection with exactly ONE whole-drive scope,
+per top-level folder under it — `expected` (Graph Search's own document
+count, narrowed to convertible formats and to the crawl's own
+`min_modified` cutoff), `indexed`/`rejected` (from the corpus), and the
+crawl's own recorded reasons for anything missing: `failed`, `empty`,
+`skipped_unsupported`, `oversize`. `gap = expected - indexed - failed -
+empty - skipped_unsupported - oversize`, and each row's `status` is:
+
+- **complete** — indexed already covers expected, nothing to explain.
+- **accounted** — some documents are missing from the index, but every one
+  of them has a recorded reason (failed, converted empty, an unsupported
+  type, or over the size cap).
+- **missing** — an unexplained gap remains after every known reason is
+  applied. This is the row worth investigating first.
+- **unknown** — `expected` itself could not be resolved (a scope that spans
+  a whole SharePoint SITE across several drives has no single count to
+  compare against) — never rendered as 0, which would read as "everything
+  is missing" when the truth is "unmeasured".
+
+Rows are sortable by `gap` (click the column header, or in the CLI they are
+sorted descending by default) so the worst-looking scope/folder is always
+the first thing an admin sees. The check fans out one Graph Search call per
+scope/folder, so its answer is cached for 10 minutes — a **Recount** button
+(`?refresh=true`) bypasses the cache for a fresh read. Running it while a
+crawl is active still answers, just labeled `provisional: true` — a
+snapshot mid-crawl, not a settled number. `agnes admin sharepoint
+completeness <connection_id> [--min-modified YYYY-MM-DD] [--refresh]
+[--json]` is the same check from a terminal.
+
+Answers on both app-state backends (crawl state, `corpus_files` and the job
+queue are all backend-agnostic — unlike run history above, this does NOT
+need Postgres). See `connectors/sharepoint/completeness.py`'s module
+docstring for the exact attribution rules behind each reason count on a
+multi-scope connection.
+
 ## Watching several connections at once
 
 Running crawl + facts over more than one connection (several tenants, or

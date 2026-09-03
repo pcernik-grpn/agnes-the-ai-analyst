@@ -1005,12 +1005,54 @@ class TestListRootChildrenWithUrl:
                         "@odata.nextLink": "https://graph.microsoft.com/v1.0/drives/drv1/root/children?skip=1",
                     },
                 )
-            return httpx.Response(200, json={"value": [{"id": "f2", "name": "B", "folder": {}, "webUrl": "https://x/B"}]})
+            return httpx.Response(
+                200, json={"value": [{"id": "f2", "name": "B", "folder": {}, "webUrl": "https://x/B"}]}
+            )
 
         _install_transport(monkeypatch, handler)
         items = asyncio.run(gc.list_root_children_with_url("tok", "drv1"))
         assert [i["id"] for i in items] == ["f1", "f2"]
         assert len(calls) == 2
+
+
+class TestGetItemWebUrl:
+    """``get_item_web_url`` — the completeness check's own resolver from
+    ``(drive_id, item_id)`` to a ``web_url`` :func:`search_document_count`
+    can filter on."""
+
+    def test_drive_root_when_item_id_omitted(self, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.url.path == "/v1.0/drives/drv1/root"
+            return httpx.Response(200, json={"webUrl": "https://example.sharepoint.com/sites/s/Shared Documents"})
+
+        _install_transport(monkeypatch, handler)
+        web_url = asyncio.run(gc.get_item_web_url("tok", "drv1"))
+        assert web_url == "https://example.sharepoint.com/sites/s/Shared Documents"
+
+    def test_specific_item_when_item_id_given(self, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.url.path == "/v1.0/drives/drv1/items/item-42"
+            return httpx.Response(200, json={"webUrl": "https://example.sharepoint.com/sites/s/Docs/Reports"})
+
+        _install_transport(monkeypatch, handler)
+        web_url = asyncio.run(gc.get_item_web_url("tok", "drv1", "item-42"))
+        assert web_url == "https://example.sharepoint.com/sites/s/Docs/Reports"
+
+    def test_never_raises_on_non_200(self, monkeypatch):
+        _install_transport(monkeypatch, lambda request: httpx.Response(404, text="not found"))
+        web_url = asyncio.run(gc.get_item_web_url("tok", "drv1", "item-42"))
+        assert web_url is None
+
+    def test_never_raises_on_transport_error(self, monkeypatch):
+        def _client() -> httpx.AsyncClient:
+            def handler(request: httpx.Request) -> httpx.Response:
+                raise httpx.ConnectError("boom", request=request)
+
+            return httpx.AsyncClient(transport=httpx.MockTransport(handler), timeout=10)
+
+        monkeypatch.setattr(gc, "_http_client", _client)
+        web_url = asyncio.run(gc.get_item_web_url("tok", "drv1", "item-42"))
+        assert web_url is None
 
 
 class TestSearchDocumentCount:
@@ -1048,6 +1090,36 @@ class TestSearchDocumentCount:
             gc.search_document_count("tok", "https://example.sharepoint.com/sites/s/Docs/A", min_modified="2023-12-31")
         )
         assert total == 5
+
+    def test_exclude_extensions_narrows_the_query(self, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content)
+            query = body["requests"][0]["query"]["queryString"]
+            assert "NOT (" in query
+            assert "fileextension:mp4" in query
+            assert "fileextension:zip" in query
+            return httpx.Response(200, json={"value": [{"hitsContainers": [{"total": 3}]}]})
+
+        _install_transport(monkeypatch, handler)
+        total = asyncio.run(
+            gc.search_document_count(
+                "tok",
+                "https://example.sharepoint.com/sites/s/Docs/A",
+                exclude_extensions=frozenset({"mp4", "zip"}),
+            )
+        )
+        assert total == 3
+
+    def test_no_exclude_extensions_omits_the_not_clause(self, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content)
+            query = body["requests"][0]["query"]["queryString"]
+            assert "NOT (" not in query
+            return httpx.Response(200, json={"value": [{"hitsContainers": [{"total": 1}]}]})
+
+        _install_transport(monkeypatch, handler)
+        total = asyncio.run(gc.search_document_count("tok", "https://example.sharepoint.com/sites/s/Docs/A"))
+        assert total == 1
 
     def test_never_raises_on_non_200(self, monkeypatch):
         _install_transport(monkeypatch, lambda request: httpx.Response(500, text="boom"))

@@ -834,6 +834,13 @@ READ_POSTURE: dict[str, str] = {
     "GET /api/admin/sharepoint/connections/{connection_id}/extraction/config": (
         "sharepoint_connection.extraction_config_read"
     ),
+    # A6 — "did we really get everything?" (TCRD-296 B.9). Cataloged (not
+    # exempt), same reasoning as `split-plan` below: it discloses folder
+    # names and per-scope/per-folder document counts, never document
+    # content or secrets.
+    "GET /api/admin/sharepoint/connections/{connection_id}/extraction/completeness": (
+        "sharepoint_connection.completeness_read"
+    ),
     # The fleet dashboard's own poll (`/admin/extraction`, 5s while any run
     # is active) — one row per connection of the SAME run counters A1
     # already exempts, plus a derived rate and a derived "stuck" flag. Same

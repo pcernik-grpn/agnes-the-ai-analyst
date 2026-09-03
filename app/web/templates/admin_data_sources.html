@@ -1180,6 +1180,11 @@
   .ext-cfg th { font-weight: 600; color: var(--ds-text-secondary); white-space: nowrap; }
   .ext-cfg td code { font-size: 11.5px; color: var(--ds-text-muted); }
   .ext-cfg__note { display: block; margin-top: 3px; font-size: 11px; color: var(--ds-text-muted); line-height: 1.45; }
+  /* Completeness drawer (TCRD-296 B.9) — reuses `.ext-cfg`'s table chrome;
+     `.ext-num` right-aligns the count columns (admin_extraction.html's page
+     table defines the same class for its own — separate — table). */
+  .ext-num { text-align: right; font-variant-numeric: tabular-nums; }
+  .ext-completeness__total td { font-weight: 600; border-top: 2px solid var(--ds-border); }
 </style>
 {% endblock %}
 

@@ -1105,6 +1105,13 @@ CATALOG: dict[str, AuditEvent] = {
         "read",
         "An admin previewed how a SharePoint connection's site would split into several sibling connections.",
     ),
+    "sharepoint_connection.completeness_read": AuditEvent(
+        "sharepoint_connection.completeness_read",
+        "read",
+        "An admin ran a SharePoint connection's completeness check (expected vs. indexed document counts "
+        "per scope/folder). Same disclosure class as split_plan_read: folder names and document counts, "
+        "never document content.",
+    ),
     "source_connection.tables_discover": AuditEvent(
         "source_connection.tables_discover",
         "read",
