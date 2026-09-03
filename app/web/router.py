@@ -2601,6 +2601,14 @@ _LIBRARY_FOLDER_PEEK = 10
 #: with no indication anything was cut and no way past it.
 _LIBRARY_SECTION_PAGE_CAP = 100
 
+#: How many values EACH entity facet (client/industry/offering/document
+#: type) offers in the Filter menu — round 3 of the 2026-09-03 incident.
+#: `facet_top_values_for_collections` picks the top this-many by document
+#: count, in SQL; `GET /library/facets/{facet}` (below) is the "search
+#: facets" typeahead for reaching a value past this cap without ever
+#: inlining the full vocabulary.
+_LIBRARY_ENTITY_FACET_LIMIT = 25
+
 
 @router.get("/library", response_class=HTMLResponse)
 async def library_page(
@@ -2807,15 +2815,30 @@ async def library_page(
         except Exception as e:
             logger.warning("/library: file counts failed: %s", e)
     # What each collection is ABOUT — the values its entity facets slice on.
-    # One batch call beside the counts above, for the same reason: the
-    # caller's readable set is the expensive half and it resolves once.
+    # Two bounded batch calls beside the counts above (round 3 of the
+    # 2026-09-03 incident: the exact per-caller `facet_values_for_collections`
+    # has no cap of its own, so tallying it across every rendered row built
+    # an 18 MB facet MENU and cost seconds even for a caller whose own visible
+    # set was small — the unbounded CANDIDATE SCAN, not the output size, was
+    # the expensive part). `facet_top_values_for_collections` picks the menu's
+    # own vocabulary — top `_LIBRARY_ENTITY_FACET_LIMIT` per type by document
+    # count, bounded IN SQL. `facet_membership_for_collections` then asks,
+    # for exactly those (already small) values, which of THIS page's rows
+    # carry one — a row only needs to declare membership in a value the menu
+    # can actually offer, so this is naturally as bounded as the menu is.
     _entity_facets = _entity_facet_spec()
     _entity_values: dict = {}
+    _entity_top: dict = {}
     if facts_repo_ is not None and _entity_facets:
         try:
-            _entity_values = facts_repo_.facet_values_for_collections(
-                user, _visible_ids, types=[t for t, _k, _lbl in _entity_facets]
+            _entity_top = facts_repo_.facet_top_values_for_collections(
+                _visible_ids,
+                types=[t for t, _k, _lbl in _entity_facets],
+                limit_per_type=_LIBRARY_ENTITY_FACET_LIMIT,
             )
+            _menu_fact_ids = [v["fact_id"] for vals in _entity_top.values() for v in vals]
+            if _menu_fact_ids:
+                _entity_values = facts_repo_.facet_membership_for_collections(_visible_ids, _menu_fact_ids)
         except Exception as e:
             # Fails soft exactly as the type map does: the facets are a
             # refinement on a page whose job is the inventory, so a graph
@@ -4342,6 +4365,65 @@ async def library_page(
         library_files_more_href=library_files_more_href,
     )
     return templates.TemplateResponse(request, "library.html", ctx)
+
+
+#: Result cap for the facet typeahead below — the caller-supplied `limit` is
+#: clamped into this range so a copy-pasted URL can never turn the route
+#: back into an unbounded dump.
+_LIBRARY_FACET_SEARCH_MAX = 200
+
+
+@router.get("/library/facets/{facet}")
+def library_facet_search(
+    facet: str,
+    q: str = "",
+    limit: int = 50,
+    user: dict = Depends(get_current_user),
+    conn: duckdb.DuckDBPyConnection = Depends(_get_db),
+):
+    """ "Search facets" typeahead for one entity facet (client / industry /
+    offering / document type) — the way to reach a value past the index's
+    own top-`_LIBRARY_ENTITY_FACET_LIMIT` menu (round 3 of the 2026-09-03
+    incident) without ever inlining the full vocabulary. Bounded, ranked by
+    document count exactly like the menu itself, through the SAME
+    `facet_top_values_for_collections` query.
+
+    RBAC: the same boundary `/library` itself uses — every value returned is
+    scoped to collections `accessible_collection_ids` says this caller can
+    see (`None` for an admin, meaning no filter), never the whole graph.
+    An unknown `facet` name is a 404: the four legal keys come from
+    `_entity_facet_spec()`, the same source the index's own menu columns do,
+    so this route can never offer a category the page does not have.
+
+    Plain ``def``, not ``async def`` — purely blocking `facts_pg` /
+    `accessible_collection_ids` DB work, zero ``await``s (Tier-1
+    convention, `tests/test_event_loop_offload_guard.py`).
+    """
+    facts_repo_ = _facts_repo_if_available()
+    if facts_repo_ is None:
+        return {"values": []}
+    _spec = {k: t for t, k, _lbl in _entity_facet_spec()}
+    fact_type = _spec.get(facet)
+    if fact_type is None:
+        raise HTTPException(status_code=404, detail="unknown_facet")
+
+    from app.auth.access import accessible_collection_ids
+
+    readable = accessible_collection_ids(user, conn)
+    corpus_ids = list(readable) if readable is not None else None
+    limit_norm = max(1, min(limit, _LIBRARY_FACET_SEARCH_MAX))
+    try:
+        top = facts_repo_.facet_top_values_for_collections(
+            corpus_ids, types=[fact_type], limit_per_type=limit_norm, q=q
+        )
+    except Exception as e:
+        logger.warning("/library/facets/%s: search failed: %s", facet, e)
+        return {"values": []}
+    return {
+        "values": [
+            {"value": v["label"], "label": v["label"], "count": v["document_count"]} for v in top.get(fact_type, [])
+        ]
+    }
 
 
 @router.get("/artefacts", include_in_schema=False)

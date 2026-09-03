@@ -1300,6 +1300,12 @@ READ_POSTURE: dict[str, str] = {
     "GET /how-it-works": "exempt:ui_support",
     "GET /install": "exempt:ui_support",
     "GET /library": "exempt:ui_support",
+    # The "search facets" typeahead JSON endpoint (round 3 of the 2026-09-03
+    # incident) — reads the same entity-facet vocabulary the index's own
+    # Filter menu renders (`_entity_facet_spec`), scoped to collections the
+    # caller can already see. No content beyond facet label/count, same
+    # posture as the index it extends.
+    "GET /library/facets/{facet}": "exempt:ui_support",
     "GET /library/{slug}": "exempt:ui_support",
     "GET /library/{slug}/f/{file_id}": "exempt:ui_support",
     # An HTML FRAGMENT of the collection page's own file rows, fetched by the
