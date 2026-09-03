@@ -4169,7 +4169,17 @@
 
   function paintPicker() {
     const els = buildPicker();
-    if (pickerState.mode === "bundle") return paintGroupPicker(els);
+    if (pickerState.mode === "bundle") {
+      /* Picking GROUPS, not things. The kind/section facets describe
+         grantable items and have nothing to say about a list of groups, so
+         `paintPickerFilter` never fills the menu here — which left a live
+         Filter button over an empty panel. This page's own rule is that a
+         control which cannot act is not rendered; the search box above is
+         the whole of what filters this list. */
+      const fw = els.root.querySelector(".fbar-filter");
+      if (fw) fw.hidden = true;
+      return paintGroupPicker(els);
+    }
     const cands = pickerCandidates();
     const families = overview.families || [];
     const total = [...cands.values()].reduce((n, a) => n + a.length, 0);
