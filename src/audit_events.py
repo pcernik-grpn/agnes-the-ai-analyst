@@ -141,6 +141,9 @@ CATALOG: dict[str, AuditEvent] = {
     "broker_llm_auth_failure": AuditEvent(
         "broker_llm_auth_failure", "system", "The secret broker's LLM credential auth failed."
     ),
+    "broker_llm_unreachable": AuditEvent(
+        "broker_llm_unreachable", "system", "The secret broker could not reach the LLM upstream at all."
+    ),
     "broker_path_rejected": AuditEvent("broker_path_rejected", "system", "The secret broker rejected a path."),
     "broker_ticket_scope_mismatch": AuditEvent(
         "broker_ticket_scope_mismatch", "system", "A broker ticket's scope didn't match the request."
