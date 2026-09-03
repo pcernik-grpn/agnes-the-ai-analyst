@@ -73,6 +73,9 @@
 </script>
 <script src="{{ static_url('js/ds_helpers.js') }}"></script>
 <script src="{{ static_url('js/ds_page.js') }}"></script>
+{# The table picker drives the product's shared filter engine — search,
+   Filter menu, chips, sort — the same one /library and /chats use. #}
+<script src="{{ static_url('js/filter_toolbar.js') }}"></script>
 <script src="{{ static_url('js/components/package_drawer.js') }}"></script>
 <script>
   (function () {
