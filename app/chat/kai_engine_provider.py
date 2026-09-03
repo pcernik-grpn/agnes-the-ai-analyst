@@ -45,7 +45,8 @@ gate applies). ``allow_session`` is honoured HERE, not by the engine: its
 approval endpoint knows only allow/deny per call, so the handle remembers the
 approved call — tool plus arguments, the native gate's ``_session_approved``
 key — and answers the engine's next request for that identical call itself,
-with no card (issue #2161). ``ticket_push`` frames are dropped: the engine authenticates
+with no card, recording the remembered decision on that call's tool line
+(issue #2161). ``ticket_push`` frames are dropped: the engine authenticates
 with the session JWT this module mints through
 ``app.api.kai.mint_engine_session_token`` — the same claims contract
 ``POST /api/kai/sessions`` serves to external consumers — and its sandbox
@@ -554,7 +555,9 @@ class KaiEngineHandle:
         except Exception:  # noqa: BLE001 - a failed stop must not kill the handle
             logger.warning("kai engine handle: stop failed for %s", self._chat_id, exc_info=True)
 
-    async def _post_approval(self, request_id: str, decision: str, *, silent: bool = False) -> None:
+    async def _post_approval(
+        self, request_id: str, decision: str, *, silent: bool = False, remembered: bool = False
+    ) -> None:
         """Forward a web approval decision, then resolve the card.
 
         ``request_id`` is the engine's ``toolCallId`` verbatim (that is what
@@ -572,6 +575,17 @@ class KaiEngineHandle:
         below is NOT silenced: a decision that failed to reach the engine
         leaves the tool call hanging either way, which the reader has to be
         told about. (Copilot review on #1985.)
+
+        ``remembered`` is the third caller: a call answered from the
+        ``_session_approved`` set. No card was raised for it either, but there
+        IS a human decision behind it — the earlier "Allow for session" — and
+        the frame is what the manager stamps onto the call's ``tool_call``
+        (``_record_approval_on_tool_call``) so the tool line, live and on
+        reload, says the call was let through by that grant instead of
+        looking like a call nobody gated. The frame carries
+        ``remembered: true`` so a consumer can tell it from a card's own
+        resolution; the web client's ``resolveApprovalCard`` and the Slack
+        sink both already tolerate a resolution for a card they never drew.
         """
         approved = decision in ("allow", "allow_session")
         try:
@@ -604,13 +618,14 @@ class KaiEngineHandle:
                     self._session_approved.add(key)
         if silent:
             return
-        self.stdout.feed_frame(
-            {
-                "type": "approval_resolved",
-                "request_id": request_id,
-                "decision": "deny" if not approved else decision,
-            }
-        )
+        resolved: dict[str, Any] = {
+            "type": "approval_resolved",
+            "request_id": request_id,
+            "decision": "deny" if not approved else decision,
+        }
+        if remembered:
+            resolved["remembered"] = True
+        self.stdout.feed_frame(resolved)
 
     async def _run_turn(self, text: str) -> None:
         """One engine turn: POST the message, translate the SSE stream.
@@ -837,16 +852,20 @@ class KaiEngineHandle:
             tool_name = state.tool_names.get(tool_call_id, "tool")
             args = state.tool_args.get(tool_call_id, {})
             key = _session_key(tool_name, args)
+            state.approval_keys[tool_call_id] = key
             if key in self._session_approved:
                 # "Allow for session", honoured: the user already approved this
                 # exact call (tool + arguments) earlier in this session, so the
                 # engine's request is answered here — no card, no pending
-                # entry, `silent=True` — exactly as the auto-approved set above,
-                # keyed on the user's decision instead of a constant (#2161).
-                self._spawn_side_task(self._post_approval(tool_call_id, "allow", silent=True))
+                # entry — as for the auto-approved set above, keyed on the
+                # user's decision instead of a constant (#2161). NOT silent,
+                # unlike that set: the `approval_resolved` it closes with (marked
+                # `remembered`) is how the earlier decision reaches this call's
+                # tool line, so a reader can still see which calls ran on the
+                # session grant rather than unasked.
+                self._spawn_side_task(self._post_approval(tool_call_id, "allow_session", remembered=True))
                 return
             state.pending_approvals.add(tool_call_id)
-            state.approval_keys[tool_call_id] = key
             # No-args tools send "" (not "{}"): the client only renders the
             # command block when there is something to show. indent=2 keeps
             # the block readable even after the 2000-char truncation.

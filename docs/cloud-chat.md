@@ -683,10 +683,12 @@ Requirements and semantics:
   call — tool **and** arguments, the same key the native gate uses — for the
   life of the live session on this gateway and answers the engine's next
   request for that identical call itself, with no card; a pause/resume or a
-  respawn starts over. The decision (allowed, denied, timed out) is also
-  recorded on the tool line it gated and persisted with the message, so a
-  reloaded transcript still shows which calls a human let through — the
-  approval card itself is never persisted. `chat.approvals_enabled: false`
+  respawn starts over. The decision (allowed, allowed for the session,
+  denied, timed out) is also recorded on the tool line it gated and
+  persisted with the message — including on the later calls the session
+  grant let through, which would otherwise look ungated — so a reloaded
+  transcript still shows which calls a human let through; the approval card
+  itself is never persisted. `chat.approvals_enabled: false`
   auto-denies each request instantly — the same kill-switch semantics as the
   native gate.
 - **Pause/resume is bookkeeping only.** There is no Agnes-side sandbox to

@@ -1468,9 +1468,12 @@ def test_allow_for_session_answers_the_next_identical_call_without_a_card():
     """The engine's approval endpoint knows only allow/deny per call, so the
     handle honours ``allow_session`` itself: the user approves ``crm_search
     {"q": "acme"}`` once for the session and the engine's next request for
-    that same call is answered here — no card, no ``approval_resolved`` for a
-    card nobody saw — the same shape as the ``AskUserQuestion`` auto-approval,
-    keyed on the user's decision instead of a constant (issue #2161)."""
+    that same call is answered here with no card — the same shape as the
+    ``AskUserQuestion`` auto-approval, keyed on the user's decision instead of
+    a constant (issue #2161). Unlike that one it still closes with an
+    ``approval_resolved`` (marked ``remembered``): that frame is what stamps
+    the earlier decision onto the call's tool line, so the transcript shows
+    the call ran on the session grant rather than unasked."""
 
     async def _run():
         engine = FakeEngine()
@@ -1500,7 +1503,10 @@ def test_allow_for_session_answers_the_next_identical_call_without_a_card():
         await handle.kill()
 
         assert "approval_request" not in _types(second), "the identical call was approved for the session"
-        assert "approval_resolved" not in _types(second), "no card was raised, so none may be retired"
+        remembered = [f for f in second if f.get("type") == "approval_resolved"]
+        assert remembered == [
+            {"type": "approval_resolved", "request_id": "call-b", "decision": "allow_session", "remembered": True}
+        ], "the remembered decision is recorded on the call — once, marked as remembered"
         assert engine.approvals == [
             {"toolUseId": "call-a", "approved": True},
             {"toolUseId": "call-b", "approved": True},

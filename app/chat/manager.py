@@ -511,9 +511,12 @@ def _record_approval_on_tool_call(turn_buffer: list, frame: dict) -> None:
     ``request_id`` IS the tool call's id, so the pairing is exact: the buffered
     ``tool_call`` frame gains ``approval``, ``build_message_parts`` copies it
     onto the persisted part, and the web client draws the same
-    "approved by you" note live and on reload. A ``request_id`` that matches
-    no buffered call (the native runner's ``appr-…`` ids are unrelated to tool
-    ids) records nothing — the row cannot claim a decision it cannot pair.
+    "approved by you" note live and on reload. A call the provider let through
+    on an earlier "Allow for session" arrives the same way (its resolution is
+    marked ``remembered``), so those rows say so too instead of looking
+    ungated. A ``request_id`` that matches no buffered call (the native
+    runner's ``appr-…`` ids are unrelated to tool ids) records nothing — the
+    row cannot claim a decision it cannot pair.
     """
     request_id = str(frame.get("request_id") or "")
     decision = frame.get("decision")
