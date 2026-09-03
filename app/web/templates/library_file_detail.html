@@ -1,7 +1,7 @@
 {% extends "base_ds.html" %}
 {# One file inside a collection — its own detail page.
 
-   A single-file artefact IS its collection and keeps using library_detail.html;
+   A single-file artifact IS its collection and keeps using library_detail.html;
    this page serves the files *inside* a folder, which had no page of their own
    before collections became folders in the Library.
 
@@ -105,7 +105,7 @@
    came from: the Library lists the collection's files inline, so its back
    affordance pointing at the collection sent them to a page they had never
    opened (#2141 item 3). `?section=files` opens the band that holds the row,
-   the same link every other artefact detail page's back uses
+   the same link every other artifact detail page's back uses
    (router._detail_back). The collection stays in the trail — it IS this
    file's parent — but as a breadcrumb, not as the back action. #}
 {# WHICH crumb is the back action depends on where the reader came from, and
