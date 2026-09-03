@@ -30,6 +30,7 @@ it was:
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 TEMPLATES = Path("app/web/templates")
@@ -77,21 +78,42 @@ class TestTheConnectRouteLivesWhereTheListFails:
         css = COMPONENT_CSS.read_text(encoding="utf-8")
         assert ".pdw-connect" in css
         assert ".pdw-connectline" not in css, "the retired standing line must not leave its styling behind"
-        # Design-system tokens only — a literal colour here would not follow
-        # the theme the rest of the drawer does.
-        body = css.split('/* ── "Connect a source"', 1)[1]
-        assert "#" not in body.replace("#ds", ""), "the connect affordance must be tokenised, not hex-coloured"
+        # Design-system tokens only — a literal colour would not follow the
+        # theme the rest of the drawer does. Matched as a HEX COLOUR rather
+        # than as a bare "#", which also caught every `#id` selector in the
+        # sheet and made the guard fire on scoping that is entirely correct.
+        hexes = re.findall(r"#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})\b", css)
+        assert not hexes, f"tokenise these instead of hex-coding them: {hexes}"
 
-    def test_the_foot_is_two_actions_not_a_sentence_with_links_buried_in_it(self) -> None:
-        """It is the only route to a source now, and it is what the admin
-        reaches for at the exact moment the list has failed them."""
+    def test_each_option_says_which_case_it_answers(self) -> None:
+        """ "Not here" has exactly two causes needing different work — the table
+        is uncatalogued, or its source was never connected. Two links at
+        opposite ends of a grey bar named the destinations and explained
+        neither, leaving the admin to guess from the verb."""
         src = COMPONENT.read_text(encoding="utf-8")
         assert "pdw-pickfoot__q" in src
-        assert src.count("pdw-pickfoot__a") >= 2
-        assert "Register a table" in src and "Connect a source" in src
+        foot = src.split("pdw-pickfoot__q", 1)[1].split("};", 1)[0]
+        assert "Register a table" in foot and "Connect a source" in foot
+        # Each option carries its own one-line explanation, not just a label.
+        assert foot.count("pdw-pickfoot__hint") == 2
+        assert "already connected" in foot, "the register option must name its case"
+        assert "not connected at all" in foot, "the connect option must name its case"
+        assert "draft is kept" in foot, "the connect option must say the work is not lost"
         css = COMPONENT_CSS.read_text(encoding="utf-8")
-        # The two read as alternatives, not as a list that continues.
-        assert ".pdw-pickfoot__a + .pdw-pickfoot__a" in css
+        # Real options, not text inside the shared notice box.
+        assert "#pdw-picker .ag-note {" in css
+        assert ".pdw-pickfoot__opt {" in css
+
+    def test_a_registry_browser_gets_more_room_than_a_short_list(self) -> None:
+        """The shared card is 620px, which suits a handful of skills. This one
+        browses a project-bucket tree of hundreds of rows, and at 620px it
+        showed three of them above its own foot. Scoped to this picker's own
+        mount so the other builders keep the size that fits them."""
+        css = COMPONENT_CSS.read_text(encoding="utf-8")
+        assert "#pdw-picker .ag-pick {" in css
+        card = css.split("#pdw-picker .ag-pick {", 1)[1].split("}", 1)[0]
+        assert "max-width: 880px" in card
+        assert ".ag-pick { max-width" not in css, "must not widen every builder's picker"
 
 
 class TestThePickerTreeIsLegible:
@@ -120,16 +142,49 @@ class TestThePickerTreeIsLegible:
         rows = src.split("function pickerRowsHtml()", 1)[1].split("function pickerControlsHtml", 1)[0]
         assert "seenSub" in rows, "the picker's row subtitle must dedupe like the panel's does"
 
-    def test_sort_does_not_sit_alone_on_a_row_above_three_readable_rows(self) -> None:
-        """On a small registry the sort dropdown was the only control the strip
-        had, so it sat alone on an otherwise empty row above a list you can
-        read at a glance. It joins the strip once the list is long enough to
-        have an order worth choosing, or once another control is there
-        anyway."""
+    def test_the_controls_strip_is_always_there(self) -> None:
+        """Two earlier versions were wrong in opposite directions. Rendering it
+        only when a facet happened to narrow meant an instance whose tables
+        share a source and a mode got a bare search box and no visible way to
+        narrow anything — which reads as "this modal has no filters". Gating
+        the sort away instead left a lone dropdown right-aligned over three
+        rows, which reads as a stray control. A labelled row in the same place
+        every time is a control panel even when all it holds is Sort."""
         src = COMPONENT.read_text(encoding="utf-8")
         ctl = src.split("function pickerControlsHtml()", 1)[1].split("function pickerHtml", 1)[0]
-        assert "SORT_EARNS_ITS_PLACE" in ctl
-        assert "var body = others + ((enough || others) ? sort : '') + clear;" in ctl
+        assert "if (!body) return ''" not in ctl, "the strip must not vanish on a uniform registry"
+        # The sort label travels with the control it names, not to the far side.
+        assert "pdw-pickctl__k--sort" in ctl
+        css = COMPONENT_CSS.read_text(encoding="utf-8")
+        assert ".pdw-pickctl__k--sort { margin-left: auto; }" in css
+
+    def test_one_filter_narrows_on_every_instance(self) -> None:
+        """Source and query mode only narrow when an instance happens to have
+        two of them, and "in no package" only when some are packaged. "What I
+        have already ticked" narrows whenever anything is ticked — the case
+        that matters in a three-hundred-row tree where your picks are scattered
+        through collapsed groups."""
+        src = COMPONENT.read_text(encoding="utf-8")
+        assert "var pickerSelectedOnly = false;" in src
+        assert "if (pickerSelectedOnly && !st.tablesSelected.has(t.id)) return false;" in src
+        assert "data-selected" in src
+        # It counts as a filter, so Clear offers to undo it...
+        facets = src.split("function facetsActive()", 1)[1].split("function resetPickerFilters", 1)[0]
+        assert "if (pickerSelectedOnly) return true;" in facets
+        # ...and Clear actually clears it.
+        reset = src.split("function resetPickerFilters()", 1)[1].split("function facetOptions", 1)[0]
+        assert "pickerSelectedOnly = false;" in reset
+
+    def test_the_selection_count_refreshes_the_moment_something_is_ticked(self) -> None:
+        """The toggle carries a count of what is ticked, so a tick that redrew
+        only the rows left it stale — and on the FIRST tick the toggle does not
+        exist yet, so ticking looked like it did nothing."""
+        src = COMPONENT.read_text(encoding="utf-8")
+        assert "function renderPickerStrip()" in src
+        change = src.split("els.picker.addEventListener('change'", 1)[1].split("els.tables.addEventListener", 1)[0]
+        assert change.count("renderPickerStrip();") >= 2, (
+            "both the single-table tick and the bulk group tick must refresh the strip"
+        )
 
     def test_a_bucket_tier_that_only_repeats_its_project_is_collapsed(self) -> None:
         """The internal source rendered as "Agnes internal › Agnes Internal ›

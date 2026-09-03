@@ -377,6 +377,11 @@
         renderPickerFiltered();
         return;
       }
+      if (e.target.closest('[data-selected]')) {
+        pickerSelectedOnly = !pickerSelectedOnly;
+        renderPickerFiltered();
+        return;
+      }
       if (e.target.closest('[data-picker-clear]')) {
         resetPickerFilters();
         renderPickerFiltered();
@@ -399,6 +404,10 @@
         // Re-render so the group boxes above it re-tally — a bucket that reads
         // "all" after one of its tables was unticked is worse than no summary.
         renderPickerRows();
+        // …and the strip, whose "In this package" count just changed. Without
+        // this the toggle does not appear until something else redraws it, so
+        // the first tick looked like it did nothing.
+        renderPickerStrip();
         return;
       }
       if (!box.classList.contains('pdw-grp__box')) return;
@@ -410,6 +419,7 @@
         if (want) st.tablesSelected.add(t.id); else st.tablesSelected.delete(t.id);
       });
       renderPickerRows();
+      renderPickerStrip();
     });
     els.picker.addEventListener('click', function (e) {
       // A click on the group's checkbox must not also open/close the <details>
@@ -557,14 +567,22 @@
      "Keboola, tick four, then BigQuery, tick two" add six. */
   var pickerFacets = { source_type: [], query_mode: [] };
   var pickerUnpackagedOnly = false;
+  /* "Show me what I have picked" — the only filter that narrows on EVERY
+     instance, because it is about the package rather than about the
+     registry's shape. In a three-hundred-row tree the tables you have ticked
+     are scattered through collapsed groups, and reviewing them meant
+     scrolling the whole thing. */
+  var pickerSelectedOnly = false;
   var pickerSort = 'name_asc';
 
   function facetsActive() {
+    if (pickerSelectedOnly) return true;
     return pickerFacets.source_type.length + pickerFacets.query_mode.length +
       (pickerUnpackagedOnly ? 1 : 0);
   }
 
   function resetPickerFilters() {
+    pickerSelectedOnly = false;
     pickerFacets = { source_type: [], query_mode: [] };
     pickerUnpackagedOnly = false;
     pickerSort = 'name_asc';
@@ -586,6 +604,7 @@
   }
 
   function matchesFilters(t) {
+    if (pickerSelectedOnly && !st.tablesSelected.has(t.id)) return false;
     if (pickerUnpackagedOnly && t.packaged) return false;
     var src = pickerFacets.source_type;
     if (src.length && src.indexOf(t.source_type || '') === -1) return false;
@@ -908,7 +927,15 @@
         ' aria-label="In no package — tables no analyst can pull yet">' +
         '<span>In no package</span><span class="fbar-toggle__n">' + unpackagedN + '</span></button>'
       : '';
-    var sort = '<span class="fbar-select pdw-pickctl__sort">' +
+    var pickedN = st ? st.tablesSelected.size : 0;
+    var picked = pickedN
+      ? '<button type="button" class="fbar-toggle' + (pickerSelectedOnly ? ' is-active' : '') + '"' +
+        ' data-selected="1" aria-pressed="' + (pickerSelectedOnly ? 'true' : 'false') + '"' +
+        ' aria-label="In this package — only the tables you have ticked">' +
+        '<span>In this package</span><span class="fbar-toggle__n">' + pickedN + '</span></button>'
+      : '';
+    var sort = '<span class="pdw-pickctl__k pdw-pickctl__k--sort">Sort</span>' +
+      '<span class="fbar-select pdw-pickctl__sort">' +
       '<select data-picker-sort aria-label="Sort tables">' +
       SORTS.map(function (o) {
         return '<option value="' + esc(o.value) + '"' +
@@ -917,16 +944,16 @@
     var clear = facetsActive()
       ? '<button type="button" class="pdw-pickctl__clear" data-picker-clear>Clear filters</button>'
       : '';
-    /* Sort earns its place only once the list is long enough to have an order
-       worth choosing. On a small registry it was the ONLY control the strip
-       had, so a single dropdown sat alone on an otherwise empty row above
-       three rows you can read at a glance. Above the fold it goes where the
-       other controls are; below this count the strip disappears entirely. */
-    var others = toggles('source_type', 'source') + toggles('query_mode', 'query mode') + unpackaged;
-    var SORT_EARNS_ITS_PLACE = 5;
-    var enough = (st ? st.registry.length : 0) >= SORT_EARNS_ITS_PLACE;
-    var body = others + ((enough || others) ? sort : '') + clear;
-    if (!body) return '';
+    /* The strip is ALWAYS here now. Both previous versions were wrong in
+       opposite directions: rendering only when a facet happened to narrow
+       meant an instance whose tables share a source and a mode got a bare
+       search box and no visible way to narrow anything, which reads as "this
+       modal has no filters"; and gating the sort away left a lone dropdown
+       right-aligned over three rows, which reads as a stray control. A
+       labelled row that is always in the same place is a control panel — even
+       when all it holds is Sort. */
+    var body = toggles('source_type', 'source') + toggles('query_mode', 'query mode') +
+      unpackaged + picked + sort + clear;
     return '<div class="pdw-pickctl">' + body + '</div>';
   }
 
@@ -952,9 +979,23 @@
          the wrong shape for the thing you reach for at the exact moment the
          list has failed you, and it is now the only place the connect route
          lives (the panel's standing line is gone). */
-      foot: '<span class="pdw-pickfoot__q">Can\u2019t find it?</span>' +
-        '<a class="pdw-pickfoot__a" href="/admin/tables">Register a table</a>' +
-        '<button type="button" class="pdw-pickfoot__a" data-pdw-connect>Connect a source</button>',
+      /* "Not here" has exactly two causes and they need different work, so
+         each option says WHICH case it answers rather than leaving the admin
+         to guess from the verb. Two links at opposite ends of a grey bar
+         named the destinations and explained neither. */
+      foot: '<p class="pdw-pickfoot__q">Can\u2019t find the table you need?</p>' +
+        '<div class="pdw-pickfoot__opts">' +
+          '<a class="pdw-pickfoot__opt" href="/admin/tables">' +
+            '<span class="pdw-pickfoot__label">Register a table</span>' +
+            '<span class="pdw-pickfoot__hint">It is in a source you have already connected, ' +
+            'but nothing has catalogued it yet.</span>' +
+          '</a>' +
+          '<button type="button" class="pdw-pickfoot__opt" data-pdw-connect>' +
+            '<span class="pdw-pickfoot__label">Connect a source</span>' +
+            '<span class="pdw-pickfoot__hint">Its warehouse or project is not connected at all. ' +
+            'Your draft is kept while you do it.</span>' +
+          '</button>' +
+        '</div>',
     });
   }
 
@@ -974,12 +1015,21 @@
      and this never touches it. */
   function renderPickerFiltered() {
     renderPickerRows();
+    renderPickerStrip();
+  }
+
+  /* The controls strip ALONE. Its "In this package" toggle carries a count of
+     what is ticked, so it goes stale on every tick — and re-rendering the
+     rows to refresh a count would throw away the tree's open/closed state
+     under the admin mid-selection. The strip is always rendered now, so this
+     replaces it in place and puts it back if it somehow went missing. */
+  function renderPickerStrip() {
     if (!els || !els.picker) return;
-    var strip = els.picker.querySelector('.pdw-pickctl');
-    if (!strip) return;
     var next = pickerControlsHtml();
-    if (!next) { strip.remove(); return; }
-    strip.outerHTML = next;
+    var strip = els.picker.querySelector('.pdw-pickctl');
+    if (strip) { strip.outerHTML = next; return; }
+    var rows = els.picker.querySelector('.ag-pick-rows');
+    if (rows) rows.insertAdjacentHTML('beforebegin', next);
   }
 
   /* Rows + count only, so the search box keeps its focus and caret. */

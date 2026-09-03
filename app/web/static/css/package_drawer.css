@@ -260,7 +260,10 @@
   font-size: 12px;
   padding: 0 9px;
 }
-.pdw-pickctl__sort { margin-left: auto; }
+/* The sort pair (label + select) is pushed to the end TOGETHER. Only the
+   select carried `margin-left: auto`, which stranded the word "Sort" at the
+   far left with 700px between it and the dropdown it names. */
+.pdw-pickctl__k--sort { margin-left: auto; }
 .pdw-pickctl__clear {
   border: none;
   background: none;
@@ -375,35 +378,74 @@
 .ag-pick .pdw-grp,
 .ag-pick .pdw-grp--bucket { border-bottom: 0; }
 
-/* ── The foot: two actions, not a sentence with links in it ─────────────
-   This is what the admin reaches for at the moment the list has failed
-   them, and since the panel no longer carries a standing connect line it is
-   the only route to one. It gets the shape of a choice. */
-.ag-pick .ag-note {
-    display: flex;
-    align-items: center;
-    flex-wrap: wrap;
-    gap: 8px 14px;
+/* ── A registry browser needs room ────────────────────────────────────
+   The shared `.ag-pick` card is 620px and capped at 76vh, which suits the
+   other builders' pickers (a short list of skills, a handful of plugins).
+   This one browses a table REGISTRY — hundreds of rows in a project › bucket
+   tree — and at 620px it showed three rows above its own foot. Scoped to
+   `#pdw-picker`, the package builder's own mount, so the other pickers keep
+   the size that fits them. */
+#pdw-picker .ag-pick {
+    max-width: 880px;
+    max-height: min(88vh, 900px);
 }
 
-.pdw-pickfoot__q { color: var(--ds-text-muted); }
-
-.pdw-pickfoot__a {
-    font: inherit;
-    font-size: 12.5px;
-    font-weight: 600;
+/* ── The foot: two options, each saying which case it answers ───────────
+   "Not here" has exactly two causes and they need different work — the table
+   is uncatalogued, or its source was never connected. This was two links at
+   opposite ends of a grey bar, which named the destinations and explained
+   neither. The shared `.ag-note` box is dropped here so these can be real
+   options rather than text inside a notice. */
+#pdw-picker .ag-note {
+    display: block;
+    margin: 10px 0 0;
     padding: 0;
     border: 0;
     background: none;
-    color: var(--ds-primary);
-    cursor: pointer;
-    text-decoration: underline;
-    text-underline-offset: 2px;
 }
 
-.pdw-pickfoot__a:hover,
-.pdw-pickfoot__a:focus-visible { color: var(--ds-primary-dark); }
+.pdw-pickfoot__q {
+    margin: 0 0 8px;
+    font-size: 12.5px;
+    font-weight: 600;
+    color: var(--ds-text-secondary);
+}
 
-/* Second action sits at the end of the line, so the two read as alternatives
-   rather than as a list that continues. */
-.pdw-pickfoot__a + .pdw-pickfoot__a { margin-left: auto; }
+.pdw-pickfoot__opts {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 10px;
+}
+
+.pdw-pickfoot__opt {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    text-align: left;
+    font: inherit;
+    padding: 10px 12px;
+    border: 1px solid var(--ds-border);
+    border-radius: 10px;
+    background: var(--ds-surface);
+    color: var(--ds-text-primary);
+    text-decoration: none;
+    cursor: pointer;
+}
+
+.pdw-pickfoot__opt:hover,
+.pdw-pickfoot__opt:focus-visible {
+    border-color: var(--ds-primary);
+    background: color-mix(in srgb, var(--ds-primary) 6%, var(--ds-surface));
+}
+
+.pdw-pickfoot__label {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--ds-primary-dark);
+}
+
+.pdw-pickfoot__hint {
+    font-size: 11.5px;
+    line-height: 1.4;
+    color: var(--ds-text-muted);
+}
