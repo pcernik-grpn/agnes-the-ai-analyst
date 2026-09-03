@@ -3160,12 +3160,10 @@ def get_analytics_db_readonly() -> duckdb.DuckDBPyConnection:
     if analytics_backend() == "ducklake":
         from src.ducklake_session import get_ducklake_read
 
-        ducklake_conn = get_ducklake_read()
-        # Same registration as the file path below — a policy body runs on
-        # whichever of the two this instance serves reads from. Idempotent, so
-        # the per-request cursor of the long-lived DuckLake attach is fine.
-        register_policy_udfs(ducklake_conn)
-        return ducklake_conn
+        # The policy UDFs are registered ONCE at DuckLake session open, under
+        # the reader's own lock (``src/ducklake_session.py``) -- the shared
+        # physical connection must not take a per-request ``CREATE FUNCTION``.
+        return get_ducklake_read()
 
     db_path = _get_data_dir() / "analytics" / "server.duckdb"
     # Serialize the existence-check + materialization + the following
