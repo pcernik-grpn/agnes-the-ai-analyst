@@ -970,3 +970,137 @@ variable "data_apps_runtime_image" {
   type        = string
   default     = "keboolapublic.azurecr.io/data-app-python-js:1.6.2_python-3.13_node-24"
 }
+
+# --- Opt-in Datadog host monitoring --------------------------------------
+#
+# Module-global, like enable_watchdog / enable_gcp_logging: monitoring is an
+# instance-wide posture, not a per-VM presentation choice. The module installs
+# and configures the agent; WHAT is alerted on — thresholds, monitors,
+# dashboards — belongs to the caller's own Datadog Terraform, never to the VM.
+
+variable "enable_datadog" {
+  description = <<-EOT
+    Install the Datadog Agent as a pinned HOST package (apt, `apt-mark hold`)
+    on every VM and ship host, disk, Docker, systemd, TLS, HTTP-health and
+    Postgres side-car checks to Datadog. Off by default; a module bump alone
+    changes nothing for a consumer that does not set this.
+
+    Three things worth knowing before turning it on:
+
+      * The agent is installed by the startup script, which only runs on boot
+        (`lifecycle.ignore_changes = [metadata_startup_script]`). Enabling this
+        on a RUNNING VM produces the IAM binding and the labels but no agent —
+        the instance must be recreated:
+        `terraform apply -replace='module.<name>.google_compute_instance.vm["<vm>"]'`.
+
+      * `dd-agent` joins the `docker` group so the agent can read the daemon's
+        container metrics. That is root-equivalent on this host — the same
+        posture the module already accepts for `agnes-applier`. The rendered
+        `datadog.yaml` compensates: remote configuration, APM, logs, DogStatsD,
+        process/container/discovery collection, runtime security, compliance,
+        SBOM, image and lifecycle collection and both inventory uploads are all
+        off, and the IPC endpoint binds to loopback.
+
+      * No thresholds live on the VM. The checks report; the caller's monitors
+        decide what is an incident.
+  EOT
+  type        = bool
+  default     = false
+}
+
+variable "datadog_api_key_secret" {
+  description = <<-EOT
+    Secret Manager secret NAME (not the value) holding a Datadog API key used
+    ONLY by the agent. Required when enable_datadog is true; the module grants
+    the VM service account secretAccessor on exactly this one secret.
+
+    Deliberately NOT routed through runtime_secret_env: that path writes the
+    value into /opt/agnes/.env, which every container reads via env_file. This
+    key is fetched at boot and written only into /etc/datadog-agent/datadog.yaml
+    (root:dd-agent, 0640). It never enters .env, argv, or Terraform state.
+  EOT
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.datadog_api_key_secret == "" || can(regex("^[A-Za-z0-9_-]{1,255}$", var.datadog_api_key_secret))
+    error_message = "datadog_api_key_secret must be a Secret Manager secret NAME (letters, digits, _ and -), not a secret value or a full resource path."
+  }
+}
+
+variable "datadog_site" {
+  description = "Datadog site the agent reports to. Must match the site the caller's API key belongs to — a key from a different site authenticates but the metrics land in an org nobody is looking at."
+  type        = string
+  default     = "datadoghq.com"
+
+  validation {
+    condition = contains([
+      "datadoghq.com",
+      "datadoghq.eu",
+      "us3.datadoghq.com",
+      "us5.datadoghq.com",
+      "ap1.datadoghq.com",
+      "ap2.datadoghq.com",
+      "ddog-gov.com",
+    ], var.datadog_site)
+    error_message = "datadog_site must be one of the documented Datadog sites (datadoghq.com, datadoghq.eu, us3/us5/ap1/ap2.datadoghq.com, ddog-gov.com)."
+  }
+}
+
+variable "datadog_env" {
+  description = "Value of the `env` tag applied to everything the agent emits, and the dimension every caller-side monitor scopes on. Empty (default) = the GCP project id, which is unique per deployment and is what the module's GCE labels can carry too. Never scope monitors by hostname: on GCE the agent reports the metadata FQDN, not the bare instance name."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.datadog_env == "" || can(regex("^[a-z0-9][a-z0-9._:/-]{0,199}$", var.datadog_env))
+    error_message = "datadog_env must be a lowercase Datadog tag value."
+  }
+}
+
+variable "datadog_agent_version" {
+  description = "Exact datadog-agent package version to install and hold. Pinned rather than tracking `latest` so a boot never silently changes what is collecting; a newer version reaches a running VM only through a recreate."
+  type        = string
+  default     = "7.82.3"
+
+  validation {
+    condition     = can(regex("^7\\.[0-9]+\\.[0-9]+$", var.datadog_agent_version))
+    error_message = "datadog_agent_version must be an exact Agent 7 version, e.g. 7.82.3."
+  }
+}
+
+variable "datadog_extra_tags" {
+  description = "Additional host tags (key:value) applied to everything the agent emits, on top of the module's own customer/app/service/role/agnes_instance/managed set."
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition     = alltrue([for t in var.datadog_extra_tags : can(regex("^[a-z][a-z0-9._/-]*:[a-z0-9][a-z0-9._:/-]*$", t))])
+    error_message = "Each entry of datadog_extra_tags must be a lowercase key:value tag."
+  }
+}
+
+variable "extra_labels" {
+  description = <<-EOT
+    Additional GCE labels merged into the VM, the data disk and the static IP.
+    The module's own keys (app, customer, role, managed) always win, so a
+    caller cannot accidentally re-label a VM out from under the log filters and
+    cron selectors that key off them.
+
+    Independent of Datadog, but this is what makes the Datadog `env` dimension
+    reachable from the GCP side too: pass `{ env = var.gcp_project_id }` and
+    the same string identifies the deployment in both consoles.
+  EOT
+  type        = map(string)
+  default     = {}
+
+  validation {
+    condition     = alltrue([for k in keys(var.extra_labels) : can(regex("^[a-z][a-z0-9_-]{0,62}$", k))])
+    error_message = "GCE label KEYS must start with a lowercase letter and contain only lowercase letters, digits, - and _ (max 63 chars)."
+  }
+
+  validation {
+    condition     = alltrue([for v in values(var.extra_labels) : can(regex("^[a-z0-9_-]{0,63}$", v))])
+    error_message = "GCE label VALUES may contain only lowercase letters, digits, - and _ (max 63 chars) — a value with a dot or an uppercase letter is rejected by the GCE API at apply time, not at plan time."
+  }
+}

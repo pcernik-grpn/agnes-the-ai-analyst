@@ -334,6 +334,143 @@ if [ -d /etc/google-cloud-ops-agent ]; then
 fi
 %{ endif ~}
 
+%{ if enable_datadog ~}
+# --- DATADOG AGENT (opt-in host monitoring) --------------------------------
+# Deliberately here, beside the Ops Agent and BEFORE any docker work: the
+# compose section further down ends in `exit 1` when it cannot converge, so a
+# monitoring block placed after it would be skipped on exactly the boot that
+# needs monitoring most.
+#
+# Every step is failure-tolerant. Monitoring must never fail a boot — an
+# unmonitored VM is degraded, a VM that does not come up is an outage.
+#
+# The API key uses the SILENT form of `gcloud secrets versions access`. The
+# loud form used elsewhere in this script aborts the boot on a missing secret,
+# which is the right trade for the app's own credentials and the wrong one for
+# an add-on. The value is written only into /etc/datadog-agent/datadog.yaml and
+# is unset again before the `.env` heredoc further down can ever see it.
+DD_KEYRING=/usr/share/keyrings/datadog-archive-keyring.gpg
+DD_API_KEY_VALUE=$(gcloud secrets versions access latest --secret=${datadog_api_key_secret} 2>/dev/null || echo "")
+
+_dd_write_keyring() {
+    if command -v gpg >/dev/null 2>&1; then
+        gpg --dearmor --yes -o "$DD_KEYRING" < "$1"
+    else
+        # apt >= 1.4 reads a concatenated ASCII-armored keyring directly, so a
+        # host image without gnupg is not a blocker.
+        DD_KEYRING=/usr/share/keyrings/datadog-archive-keyring.asc
+        install -m 0644 "$1" "$DD_KEYRING"
+    fi
+}
+
+# Decodes one module-shipped artifact to its place on the host. An EMPTY
+# payload means "remove it": a VM that stops terminating TLS must stop
+# reporting on a certificate that is no longer its concern, rather than
+# keeping a stale check config around forever.
+#
+# The API key is substituted through bash parameter expansion on a value read
+# from a variable — never `sed -e "s/…/$KEY/"`, which would put it on argv and
+# from there into /proc and into this script's own log on any error.
+_dd_install_artifact() {
+    _dd_rel="$1"
+    _dd_b64="$2"
+    case "$_dd_rel" in
+        datadog.yaml)
+            _dd_target=/etc/datadog-agent/datadog.yaml; _dd_owner=root; _dd_group=dd-agent; _dd_mode=0640 ;;
+        conf.d/*.yaml)
+            _dd_check=$(basename "$_dd_rel" .yaml)
+            _dd_target="/etc/datadog-agent/conf.d/$_dd_check.d/conf.yaml"; _dd_owner=dd-agent; _dd_group=dd-agent; _dd_mode=0640 ;;
+        postgres.yaml.tpl)
+            _dd_target=/etc/datadog-agent/agnes-postgres.yaml.tpl; _dd_owner=root; _dd_group=root; _dd_mode=0600 ;;
+        *.sh)
+            _dd_target="/usr/local/bin/$_dd_rel"; _dd_owner=root; _dd_group=root; _dd_mode=0755 ;;
+        *.service | *.timer)
+            _dd_target="/etc/systemd/system/$_dd_rel"; _dd_owner=root; _dd_group=root; _dd_mode=0644 ;;
+        *)
+            echo "WARNING: unknown Datadog artifact '$_dd_rel' — not installed" >&2
+            return 0 ;;
+    esac
+
+    if [ -z "$_dd_b64" ]; then
+        rm -f "$_dd_target"
+        return 0
+    fi
+
+    _dd_content=$(printf '%s' "$_dd_b64" | base64 -d 2>/dev/null) || {
+        echo "WARNING: could not decode the Datadog artifact '$_dd_rel'" >&2
+        return 0
+    }
+    if [ "$_dd_rel" = "datadog.yaml" ]; then
+        _dd_content=$${_dd_content//@@DD_API_KEY@@/$DD_API_KEY_VALUE}
+    fi
+
+    _dd_tmp=$(mktemp) || return 0
+    chmod 0600 "$_dd_tmp"
+    printf '%s\n' "$_dd_content" > "$_dd_tmp"
+    unset _dd_content
+    mkdir -p "$(dirname "$_dd_target")" \
+        && install -o "$_dd_owner" -g "$_dd_group" -m "$_dd_mode" "$_dd_tmp" "$_dd_target" \
+        || echo "WARNING: could not install the Datadog artifact '$_dd_rel'" >&2
+    rm -f "$_dd_tmp"
+    return 0
+}
+
+if [ -z "$DD_API_KEY_VALUE" ]; then
+    echo "WARNING: Datadog API key secret '${datadog_api_key_secret}' is unreadable or empty — the agent is not configured this boot" >&2
+else
+    if [ "$(dpkg-query -W -f='$${Version}' datadog-agent 2>/dev/null || true)" != "1:${datadog_agent_version}-1" ]; then
+        echo "installing the Datadog Agent ${datadog_agent_version}..."
+        (
+            install -d -m 0755 /usr/share/keyrings \
+            && : > /tmp/datadog-apt-keys.asc \
+            && curl -fsSL https://keys.datadoghq.com/DATADOG_APT_KEY_CURRENT.public >> /tmp/datadog-apt-keys.asc \
+            && curl -fsSL https://keys.datadoghq.com/DATADOG_APT_KEY_06462314.public >> /tmp/datadog-apt-keys.asc \
+            && curl -fsSL https://keys.datadoghq.com/DATADOG_APT_KEY_C0962C7D.public >> /tmp/datadog-apt-keys.asc \
+            && curl -fsSL https://keys.datadoghq.com/DATADOG_APT_KEY_F14F620E.public >> /tmp/datadog-apt-keys.asc \
+            && curl -fsSL https://keys.datadoghq.com/DATADOG_APT_KEY_382E94DE.public >> /tmp/datadog-apt-keys.asc \
+            && _dd_write_keyring /tmp/datadog-apt-keys.asc \
+            && rm -f /tmp/datadog-apt-keys.asc \
+            && echo "deb [signed-by=$DD_KEYRING] https://apt.datadoghq.com/ stable 7" > /etc/apt/sources.list.d/datadog.list \
+            && apt-get update -qq \
+            && { apt-mark unhold datadog-agent >/dev/null 2>&1 || true; } \
+            && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --allow-downgrades "datadog-agent=1:${datadog_agent_version}-1" datadog-signing-keys \
+            && apt-mark hold datadog-agent >/dev/null
+        ) || echo "WARNING: Datadog Agent ${datadog_agent_version} install failed — host monitoring unavailable this boot" >&2
+    fi
+
+    if id dd-agent >/dev/null 2>&1; then
+        # Root-equivalent on this host, and the only way to read the daemon's
+        # container metrics. The rendered datadog.yaml turns off everything
+        # that could make that membership remotely reachable — see the module's
+        # enable_datadog description.
+        usermod -aG docker dd-agent \
+            || echo "WARNING: could not add dd-agent to the docker group — Docker and container metrics will be missing" >&2
+%{ for dd_path, dd_content in datadog_files_b64 ~}
+        _dd_install_artifact "${dd_path}" "${dd_content}"
+%{ endfor ~}
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        systemctl enable datadog-agent >/dev/null 2>&1 || true
+        systemctl restart datadog-agent >/dev/null 2>&1 \
+            || echo "WARNING: the Datadog Agent did not start — inspect 'systemctl status datadog-agent'" >&2
+    else
+        echo "WARNING: the dd-agent user does not exist — skipping Datadog configuration this boot" >&2
+    fi
+fi
+# Out of scope before anything writes /opt/agnes/.env, whose heredoc is
+# unquoted and whose contents every container reads through env_file.
+unset DD_API_KEY_VALUE
+%{ endif ~}
+
+%{ if !enable_datadog ~}
+# Self-heal the opposite direction: a recreated VM whose module call turned
+# monitoring OFF must stop shipping under a key nobody rotates any more. The
+# package is left installed — removing it would fight apt over a transient
+# toggle — but the service does not run.
+if systemctl is-enabled --quiet datadog-agent 2>/dev/null; then
+    systemctl disable --now datadog-agent >/dev/null 2>&1 || true
+fi
+%{ endif ~}
+
 # Boot-time gcplogs driver probe — defense in depth for #1557. Docker
 # refuses to START a container whose log driver cannot initialize, so an
 # armed overlay on a VM whose service account cannot write to Cloud Logging
@@ -1674,7 +1811,26 @@ if ! docker compose $COMPOSE_PROFILES_ARG pull extraction-worker \
 fi
 %{ endif ~}
 
+%{ if enable_datadog ~}
+# --- DATADOG: Postgres side-car monitoring role ----------------------------
+# The unit files landed with the agent block above, which runs before compose;
+# the timer is started HERE, after compose has converged, so its first run
+# finds the side-cars up. The 15-minute cadence then re-converges the role
+# after a side-car volume is recreated, which a boot-time step never would.
+if [ -x /usr/local/bin/agnes-datadog-pg-role.sh ]; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl enable --now agnes-datadog-pg-role.timer >/dev/null 2>&1 \
+        || echo "WARNING: could not enable agnes-datadog-pg-role.timer — the Postgres side-car check stays unconfigured" >&2
+    systemctl start agnes-datadog-pg-role.service >/dev/null 2>&1 || true
+fi
+%{ endif ~}
+
 # --- 6. Auto-upgrade via cron (pulls new image digest on $UPGRADE_SCHEDULE) ---
+# Unconditional: /var/lib/agnes holds the auto-upgrade heartbeat below, and an
+# external monitor reading a file age needs the directory to exist even on a
+# VM pinned to manual upgrades (where a missing tick file is the answer, not an
+# error).
+install -d -m 0755 /var/lib/agnes
 if [ "$UPGRADE_MODE" = "auto" ]; then
     # agnes-auto-upgrade.sh was already extracted to /usr/local/bin/ in
     # section 3 alongside the compose files — the host artifacts ship
@@ -1682,7 +1838,10 @@ if [ "$UPGRADE_MODE" = "auto" ]; then
     :
 
     # Install cron entry idempotently: remove any prior agnes-auto-upgrade line, then append ours.
-    CRON_LINE="$UPGRADE_SCHEDULE /usr/local/bin/agnes-auto-upgrade.sh >> /var/log/agnes-auto-upgrade.log 2>&1"
+    # The trailing tick is a plain heartbeat: it records that the cron fired,
+    # separately from whether the tick found a new image. Any external monitor
+    # can read its age; nothing on the VM depends on it.
+    CRON_LINE="$UPGRADE_SCHEDULE /usr/local/bin/agnes-auto-upgrade.sh >> /var/log/agnes-auto-upgrade.log 2>&1; date +%s > /var/lib/agnes/auto-upgrade.tick"
     (crontab -l 2>/dev/null | grep -v agnes-auto-upgrade || true; echo "$CRON_LINE") | crontab -
 fi
 

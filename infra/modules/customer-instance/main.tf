@@ -46,6 +46,85 @@ locals {
   # bundle: it configures a HOST service, so it must not depend on which
   # app image tag a VM happens to be pinned to.
   ops_agent_config_b64 = filebase64("${path.module}/files/ops-agent-config.yaml")
+
+  # --- Opt-in Datadog host monitoring (var.enable_datadog) ---
+  #
+  # `env` is the single dimension every caller-side monitor scopes on. It
+  # defaults to the GCP project id: unique per deployment, already known here,
+  # and the same string the caller can push onto the GCE labels through
+  # var.extra_labels so one identifier works in both consoles. coalesce()
+  # skips the empty string, so an explicit datadog_env still wins.
+  datadog_env = coalesce(var.datadog_env, var.gcp_project_id)
+
+  # A secret already granted through runtime_secret_env / _multiline /
+  # runtime_secrets (or to the dispatcher / kai-agent) is subtracted for the
+  # reason the kai-agent set documents: two identical (project, secret, role,
+  # member) bindings make the second apply fail with "already exists".
+  datadog_secrets = var.enable_datadog ? setsubtract(
+    toset(compact([var.datadog_api_key_secret])),
+    setunion(
+      toset(keys(var.runtime_secret_env)),
+      toset(keys(var.runtime_secret_env_multiline)),
+      toset(var.runtime_secrets),
+      local.dispatcher_secrets,
+      local.kai_agent_secrets,
+    ),
+  ) : toset([])
+
+  # Listed explicitly rather than swept with fileset(): every artifact has a
+  # distinct install target and mode on the VM, so a file that appeared under
+  # files/datadog/ without a matching install line would ride along in the
+  # metadata blob and never be used.
+  datadog_static_files = [
+    "conf.d/disk.yaml",
+    "conf.d/docker.yaml",
+    "conf.d/systemd.yaml",
+    "conf.d/directory.yaml",
+    "postgres.yaml.tpl",
+    "agnes-datadog-pg-role.sh",
+    "agnes-datadog-pg-role.service",
+    "agnes-datadog-pg-role.timer",
+  ]
+
+  # Unlike the flat watchdog map, this one is keyed BY INSTANCE: datadog.yaml
+  # carries that VM's own tags and the HTTP/TLS checks its own hostnames. The
+  # templatefile() call below indexes it with each.value.name.
+  datadog_files_b64 = {
+    for inst in local.all_instances : inst.name => var.enable_datadog ? merge(
+      { for f in local.datadog_static_files : f => filebase64("${path.module}/files/datadog/${f}") },
+      {
+        "datadog.yaml" = base64encode(templatefile("${path.module}/files/datadog/datadog.yaml.tpl", {
+          site = var.datadog_site
+          env  = local.datadog_env
+          tags = concat([
+            "customer:${var.customer_name}",
+            "app:agnes",
+            "service:agnes",
+            "role:${inst.role}",
+            "agnes_instance:${inst.name}",
+            "managed:terraform",
+          ], var.datadog_extra_tags)
+        }))
+
+        # A TLS VM probes its own public URL, because that is the path its
+        # users take (Caddy, certificate and all). Anything else probes the
+        # loopback port the app actually listens on — a public-name probe on a
+        # VM with no domain would fail forever and mean nothing.
+        "conf.d/http_check.yaml" = base64encode(templatefile("${path.module}/files/datadog/http_check.yaml.tpl", {
+          base_url   = (inst.tls_mode == "caddy" && inst.domain != "") ? "https://${inst.domain}" : "http://127.0.0.1:8000"
+          acme_hosts = (inst.tls_mode == "caddy" && inst.domain != "") ? [inst.domain] : []
+        }))
+
+        # An empty string means "remove this check from the VM" (see
+        # _dd_install_artifact in the startup script): a VM that stops
+        # terminating TLS must stop reporting on a certificate that is no
+        # longer its concern, rather than keeping a stale config around.
+        "conf.d/tls.yaml" = (inst.tls_mode == "caddy" && inst.domain != "") ? base64encode(templatefile("${path.module}/files/datadog/tls.yaml.tpl", {
+          hosts = compact([inst.domain, try(inst.domain_alias, "")])
+        })) : ""
+      },
+    ) : {}
+  }
   # Per-VM OAuth (Sign-in with Google) secret names, derived from
   # var.oauth_secret_name_template. Empty template -> empty map ->
   # startup-script falls back to legacy `google-oauth-client-{id,secret}`.
@@ -374,6 +453,18 @@ resource "google_secret_manager_secret_iam_member" "vm_oauth" {
   member    = "serviceAccount:${google_service_account.vm.email}"
 }
 
+# Datadog agent API key. One secret, granted only when monitoring is enabled.
+# Kept out of runtime_secret_env on purpose: that path lands the value in
+# /opt/agnes/.env, which every container reads. The startup script fetches this
+# one at boot and writes it only into /etc/datadog-agent/datadog.yaml.
+resource "google_secret_manager_secret_iam_member" "vm_datadog" {
+  for_each  = local.datadog_secrets
+  project   = var.gcp_project_id
+  secret_id = each.value
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.vm.email}"
+}
+
 # Cloud Logging writer for Docker's gcplogs log driver
 # (docker-compose.gcp-logging.yml, gated by var.enable_gcp_logging). The
 # driver authenticates as the VM's service account — the dedicated SA above,
@@ -497,6 +588,13 @@ resource "google_compute_disk" "data" {
   zone    = var.zone
   size    = each.value.data_disk_gb
   type    = "pd-ssd"
+
+  labels = merge(var.extra_labels, {
+    app      = "agnes"
+    customer = var.customer_name
+    role     = each.value.role
+    managed  = "terraform"
+  })
 }
 
 # Attach daily backup policy to data disks (boot disks are ephemeral,
@@ -516,6 +614,13 @@ resource "google_compute_address" "ip" {
   name    = "${each.value.name}-ip"
   project = var.gcp_project_id
   region  = var.region
+
+  labels = merge(var.extra_labels, {
+    app      = "agnes"
+    customer = var.customer_name
+    role     = each.value.role
+    managed  = "terraform"
+  })
 }
 
 resource "google_compute_instance" "vm" {
@@ -630,6 +735,10 @@ resource "google_compute_instance" "vm" {
     alert_webhook_url            = var.alert_webhook_url
     watchdog_files_b64           = local.watchdog_files_b64
     ops_agent_config_b64         = local.ops_agent_config_b64
+    enable_datadog               = var.enable_datadog
+    datadog_api_key_secret       = var.datadog_api_key_secret
+    datadog_agent_version        = var.datadog_agent_version
+    datadog_files_b64            = local.datadog_files_b64[each.value.name]
     dispatcher_enabled           = each.value.dispatcher_enabled
     dispatcher_image             = var.dispatcher_image
     dispatcher_key_secret        = var.dispatcher_key_secret
@@ -659,12 +768,15 @@ resource "google_compute_instance" "vm" {
     scopes = ["cloud-platform"]
   }
 
-  labels = {
+  # var.extra_labels first, module keys second: the module's four keys always
+  # win. Log filters, cron selectors and the ops runbooks all key off them, so
+  # a caller must not be able to re-label a VM out from under them.
+  labels = merge(var.extra_labels, {
     app      = "agnes"
     customer = var.customer_name
     role     = each.value.role
     managed  = "terraform"
-  }
+  })
 
   # Startup script changes do not modify running VMs (script only runs on boot).
   # To propagate module changes, use:
@@ -683,6 +795,14 @@ resource "google_compute_instance" "vm" {
         var.dispatcher_vertex_sa_secret != ""
       )
       error_message = "dispatcher_enabled=true on instance ${each.value.name} requires dispatcher_image, dispatcher_policies, dispatcher_key_secret and dispatcher_vertex_sa_secret to be set on the module."
+    }
+
+    # Monitoring that cannot authenticate is worse than none: the agent
+    # installs, starts, fails every flush and the caller sees an absent host
+    # rather than an error. Catch the missing secret name at plan time.
+    precondition {
+      condition     = !var.enable_datadog || var.datadog_api_key_secret != ""
+      error_message = "enable_datadog = true requires datadog_api_key_secret (the Secret Manager secret NAME holding the agent's API key)."
     }
 
     # Same plan-time catch for the kai-agent engine: an enabled VM without
@@ -718,6 +838,7 @@ resource "google_compute_instance" "vm" {
     google_secret_manager_secret_iam_member.vm_oauth,
     google_secret_manager_secret_iam_member.vm_dispatcher,
     google_secret_manager_secret_iam_member.vm_kai_agent,
+    google_secret_manager_secret_iam_member.vm_datadog,
     google_secret_manager_secret_version.jwt,
     google_secret_manager_secret_version.session,
   ]
