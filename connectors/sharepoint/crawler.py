@@ -2502,7 +2502,7 @@ class _ConvertMemoryGuard(Exception):
         rss_mb = rss_bytes / (1024 * 1024)
         limit_mb = limit_bytes / (1024 * 1024)
         super().__init__(
-            f"conversion worker exceeded the {limit_mb:.0f} MB RSS guard ({rss_mb:.0f} MB observed) and was killed"
+            f"conversion worker grew {rss_mb:.0f} MB RSS during one conversion, past the {limit_mb:.0f} MB guard, and was killed"
         )
 
 
@@ -3074,6 +3074,16 @@ class _ConvertProcessPool:
         if self._timeout_s <= 0 and self._max_rss_bytes <= 0:
             return conn.recv()
         deadline = time.monotonic() + self._timeout_s if self._timeout_s > 0 else None
+        # The watchdog bounds how much THIS conversion grows the child, never
+        # the child's absolute RSS. A forked child's ``VmRSS`` starts out as
+        # every copy-on-write page it shares with the parent — on a crawl
+        # parent that has grown for hours that alone is 9-15 GB, so an
+        # absolute ceiling killed every child at its first poll (live
+        # finding, 2026-09: ~2 200 documents failed in 15 minutes, first by
+        # the guard, then by the slots it had left dead). The baseline is the
+        # first reading of this call; ``None`` (no ``/proc``, child already
+        # gone) disarms the guard for this call exactly like a failed poll.
+        baseline = _child_rss_bytes(getattr(proc, "pid", None)) if self._max_rss_bytes > 0 else None
         while True:
             wait_for = _RSS_WATCHDOG_POLL_INTERVAL_S
             if deadline is not None:
@@ -3086,14 +3096,17 @@ class _ConvertProcessPool:
                 # tell the caller this was a TIMEOUT, not a crash.
                 self._reclaim_timed_out_slot(slot)
                 raise _ConvertTimedOut(self._timeout_s)
-            if self._max_rss_bytes > 0:
+            if self._max_rss_bytes > 0 and baseline is not None:
                 rss_bytes = _child_rss_bytes(getattr(proc, "pid", None))
-                if rss_bytes is not None and rss_bytes >= self._max_rss_bytes:
+                growth = rss_bytes - baseline if rss_bytes is not None else None
+                if growth is not None and growth >= self._max_rss_bytes:
                     # Still alive, just too big — same reclaim path as a
                     # timeout (SIGKILL, then swap in a spare), a different
-                    # trigger and a differently-worded exception.
+                    # trigger and a differently-worded exception. The
+                    # reported number is the GROWTH this conversion caused,
+                    # the only figure the guard is entitled to blame on it.
                     self._reclaim_timed_out_slot(slot)
-                    raise _ConvertMemoryGuard(rss_bytes, self._max_rss_bytes)
+                    raise _ConvertMemoryGuard(growth, self._max_rss_bytes)
 
     def _exit_detail(self, proc: Optional[Any]) -> str:
         if proc is None:
@@ -3391,7 +3404,7 @@ def _convert_memory_guard_detail(rss_bytes: int) -> str:
     or a host-level watchdog acting on pressure this process never saw
     coming."""
     rss_mb = rss_bytes / (1024 * 1024)
-    return f"exceeded the conversion memory guard ({rss_mb:.0f} MB RSS)"
+    return f"exceeded the conversion memory guard (grew {rss_mb:.0f} MB RSS during this conversion)"
 
 
 def _prepare_document(

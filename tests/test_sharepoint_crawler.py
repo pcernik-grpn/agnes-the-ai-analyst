@@ -2038,10 +2038,28 @@ class TestConvertChildMemoryLimit:
     # this pool's own accounting, which then attributed the loss to
     # whatever file happened to be in flight AND left the slot dead until
     # the next page boundary. This watchdog polls the CHILD's own real RSS
-    # from the PARENT and kills it directly — an absolute ceiling, not
-    # headroom above anything — reusing the exact `_reclaim_timed_out_slot`
-    # recovery a per-item timeout already has.
+    # from the PARENT and kills it directly — bounding how much THIS
+    # conversion GREW the child over the baseline read at the start of the
+    # call, never its absolute RSS: a forked child's VmRSS begins as every
+    # copy-on-write page shared with the parent (9-15 GB on a parent that
+    # has crawled for hours), and an absolute ceiling killed every child at
+    # its first poll (live finding, 2026-09) — reusing the exact
+    # `_reclaim_timed_out_slot` recovery a per-item timeout already has.
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _rss_sequence(*readings_mb: int):
+        """A `_child_rss_bytes` stub that answers the given readings in order
+        (the first one is the watchdog's BASELINE) and repeats the last."""
+        values = [mb * 1024 * 1024 for mb in readings_mb]
+        calls = {"n": 0}
+
+        def _fake(pid):
+            i = min(calls["n"], len(values) - 1)
+            calls["n"] += 1
+            return values[i]
+
+        return _fake
 
     @staticmethod
     def _write(tmp_path: Path, name: str, content: bytes) -> Path:
@@ -2081,7 +2099,9 @@ class TestConvertChildMemoryLimit:
             return ConvertResult("# never reached")
 
         monkeypatch.setattr(crawler, "convert_to_markdown", _convert)
-        monkeypatch.setattr(crawler, "_child_rss_bytes", lambda pid: 999 * 1024 * 1024)
+        # Baseline 9 000 MB (a child born from a big parent), then 9 999 MB:
+        # the guard must fire on the 999 MB of GROWTH, and report exactly it.
+        monkeypatch.setattr(crawler, "_child_rss_bytes", self._rss_sequence(9000, 9999))
         pool = crawler._ConvertProcessPool(1, max_rss_bytes=100 * 1024 * 1024)
         pool.start()
         try:
@@ -2108,7 +2128,7 @@ class TestConvertChildMemoryLimit:
             return ConvertResult("# ok")
 
         monkeypatch.setattr(crawler, "convert_to_markdown", _convert)
-        monkeypatch.setattr(crawler, "_child_rss_bytes", lambda pid: 999 * 1024 * 1024)
+        monkeypatch.setattr(crawler, "_child_rss_bytes", self._rss_sequence(9000, 9999))
         pool = crawler._ConvertProcessPool(1, max_rss_bytes=100 * 1024 * 1024)
         pool.start()
         try:
