@@ -1652,6 +1652,7 @@ The fleet endpoint two paragraphs down (`.../extraction/runs` with no
 - /api/admin/sharepoint/connections/{connection_id}/extraction/stop
 - /api/admin/sharepoint/connections/{connection_id}/extraction/facts-config
 - /api/admin/sharepoint/connections/{connection_id}/extraction/crawl-config
+- /api/admin/sharepoint/connections/{connection_id}/extraction/retry-empty
 
 `GET …/extraction/status` returns the live run (if any) and the last completed
 one. Liveness is **derived, never trusted**: a worker killed outright finalizes

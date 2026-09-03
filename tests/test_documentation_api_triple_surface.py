@@ -1392,6 +1392,17 @@ _EXEMPT: dict[str, str] = {
         "admin 'stop this run' control for the source card's Run row — admin display "
         "primitive, no analyst CLI/MCP analogue"
     ),
+    # Re-queue the last crawls' convert_empty documents for a scan-OCR pass —
+    # same class as the facts-extract trigger below: CLI-reachable
+    # (`agnes admin sharepoint retry-empty`) for an operator who just enabled
+    # OCR, but deliberately not MCP-exposed — it spends the instance's
+    # vision-model budget over a whole backlog with one call.
+    "/api/admin/sharepoint/connections/{connection_id}/extraction/retry-empty": (
+        "admin/ops trigger re-queuing convert_empty documents for scan OCR — "
+        "CLI-reachable (agnes admin sharepoint retry-empty) but deliberately not "
+        "MCP-exposed: an agent should not be able to spend the vision-model budget "
+        "over a whole backlog with one tool call"
+    ),
     # Per-connection override for extraction.facts.retry_mode (cost-levers
     # task, lever A) — same class as the facts-extract trigger above:
     # CLI-reachable (`agnes admin sharepoint facts-config`) for an operator
