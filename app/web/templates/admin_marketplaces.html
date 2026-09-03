@@ -120,6 +120,14 @@
   }
   .modal-card textarea { min-height: 60px; resize: vertical; }
   .modal-card input:focus, .modal-card textarea:focus { outline: 2px solid var(--ds-primary, #6366f1); outline-offset: -1px; }
+  /* Read-only until the cadence is actually configurable (#1956 item 15).
+     Styled as a stated fact rather than a form control the admin is failing
+     to focus; -webkit-text-fill-color because WebKit greys disabled text
+     regardless of `color`. */
+  .modal-card input[type="text"]:disabled {
+    background: var(--ds-surface-dim); color: var(--ds-text-secondary);
+    -webkit-text-fill-color: var(--ds-text-secondary); cursor: default;
+  }
   .modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 20px; }
 
   .sync-result {
@@ -474,6 +482,29 @@
         <input id="edit-clear-token" type="checkbox"> Remove the stored token (revert to public access)
       </label>
     </div>
+
+    {# #1956 item 15 anchors its complaint on THIS modal: "Marketplaces > Edit
+       covers name/URL/branch/pin/curator/token, but the sync cadence is
+       neither shown nor configurable, and the next scheduled sync time is not
+       displayed anywhere." #2042 answered the visibility half in the Details
+       modal — the surface an admin opens to ask why a marketplace looks
+       stale, not the one they open to change how it is fetched — so the path
+       the issue actually names still ended in silence.
+
+       Last field in the modal, and deliberately: every control above it
+       is editable, so a read-only row sitting between two of them reads
+       as a field that failed to load. At the bottom it reads as what it
+       is — a stated fact about this marketplace, not an input.
+
+       Disabled, and deliberately: the cadence is one fixed `daily 03:00` row
+       in services/scheduler/__main__.py with no per-marketplace override, so
+       an editable-looking field would promise a knob that does not exist. It
+       carries no name and is never read into the PATCH payload; when the
+       cadence does become configurable, this is the control to enable rather
+       than a new one to design. #}
+    <label for="edit-sync-schedule">Sync schedule</label>
+    <input id="edit-sync-schedule" type="text" disabled>
+    <div class="help" id="edit-sync-help"></div>
 
     <div class="modal-actions">
       {{ ds.button('Cancel', variant='secondary',
@@ -1196,6 +1227,17 @@ function openEdit(id) {
   document.getElementById("edit-curator-email").value = m.curator_email || "";
   document.getElementById("edit-token").value = "";
   document.getElementById("edit-clear-token").checked = false;
+
+  // The cadence, stated where an admin comes to CHANGE how this marketplace
+  // is fetched (#1956 item 15) — same facts the Details modal shows, read
+  // through the same helper so the two cannot drift.
+  const sched = syncScheduleFacts(m);
+  document.getElementById("edit-sync-schedule").value = sched.cadence;
+  document.getElementById("edit-sync-help").innerHTML = sched.syncable
+    ? `Next run ${sched.next}. ${sched.status}`
+      + ` Instance-wide — not editable per marketplace yet.`
+    : `Bundled content ships with Agnes and is re-seeded on boot; there is no`
+      + ` git remote to pull from, so nothing is scheduled.`;
 
   const btn = document.getElementById("confirm-edit-btn");
   btn.onclick = async () => {

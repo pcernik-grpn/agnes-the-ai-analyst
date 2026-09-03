@@ -512,6 +512,66 @@ def test_next_nightly_sync_rolls_forward_on_the_boundary():
     assert "3, 0, 0" in fn, "the hour must stay pinned to the scheduler's 03:00 UTC row"
 
 
+def test_edit_modal_states_the_sync_schedule():
+    """#1956 item 15 anchors its complaint on the EDIT modal: "Marketplaces >
+    Edit covers name/URL/branch/pin/curator/token, but the sync cadence is
+    neither shown nor configurable, and the next scheduled sync time is not
+    displayed anywhere." #2042 answered the visibility half in the Details
+    modal — the surface an admin opens to ask why a marketplace looks stale,
+    not the one they open to change how it is fetched — so the path the issue
+    names still ended in silence. This pins that Edit states it too."""
+    template = Path("app/web/templates/admin_marketplaces.html").read_text(encoding="utf-8")
+    edit_modal = template.split('id="edit-modal"')[1].split("<!-- Sync result modal -->")[0]
+    assert 'id="edit-sync-schedule"' in edit_modal, (
+        "the Edit modal must state the sync schedule — that is the surface "
+        "#1956 item 15 names"
+    )
+    assert 'id="edit-sync-help"' in edit_modal, (
+        "the next run and last-sync status belong with the field"
+    )
+
+
+def test_edit_modal_sync_schedule_is_not_editable_and_never_submitted():
+    """The cadence is one fixed `daily 03:00` row in
+    services/scheduler/__main__.py with no per-marketplace override, so an
+    editable-looking field would promise a knob that does not exist — the
+    other half of item 15, still undone.
+
+    Two things must hold, and the second is the one that would bite: the
+    input is `disabled`, and openEdit's PATCH payload never reads it. A
+    stray `edit-sync-schedule` in the payload would send a made-up field to
+    an endpoint that does not accept one."""
+    template = Path("app/web/templates/admin_marketplaces.html").read_text(encoding="utf-8")
+    edit_modal = template.split('id="edit-modal"')[1].split("<!-- Sync result modal -->")[0]
+    field = edit_modal.split('id="edit-sync-schedule"')[1].split(">")[0]
+    assert "disabled" in field, (
+        "the sync-schedule input must be disabled until the cadence is "
+        "actually configurable"
+    )
+
+    payload = template.split("const payload = {")[1].split("};")[0]
+    assert "edit-sync-schedule" not in payload, (
+        "the read-only schedule must never be read into the PATCH payload"
+    )
+
+
+def test_both_modals_read_the_sync_schedule_from_one_helper():
+    """Details answers "why does this look stale", Edit answers "can I change
+    how this is fetched" — different questions, the same facts, and two
+    copies of the is_builtin / last_error branching would drift apart on the
+    first edit to either. Both callers must go through syncScheduleFacts."""
+    template = Path("app/web/templates/admin_marketplaces.html").read_text(encoding="utf-8")
+    assert template.count("syncScheduleFacts(m)") == 3, (
+        "expected exactly three occurrences — the definition plus one call "
+        "in openDetails and one in openEdit; a fourth means a surface grew "
+        "its own copy, a second means one stopped using it"
+    )
+    open_edit = template.split("function openEdit(id)")[1].split("\nfunction ")[0]
+    assert "syncScheduleFacts(m)" in open_edit, "openEdit must read the shared helper"
+    open_details = template.split("async function openDetails(")[1].split("\nfunction ")[0]
+    assert "syncScheduleFacts(m)" in open_details, "openDetails must read the shared helper"
+
+
 def test_plugin_control_presents_as_enabled_toggle_checked_when_not_disabled():
     """#1956 item 14b: the old "Disabled" toggle was semantically inverted —
     checked meant admin_disabled=true, so switching it ON looked like it
