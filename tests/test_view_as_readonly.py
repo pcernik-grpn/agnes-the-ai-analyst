@@ -93,22 +93,34 @@ def _mint_csrf(client) -> str:
     return token
 
 
-def _enter(client, target_id: str = ANALYST, *, next_path: str = "/me/profile", csrf: str | None = None):
+def _enter(
+    client,
+    target_id: str = ANALYST,
+    *,
+    next_path: str = "/me/profile",
+    return_to: str | None = None,
+    csrf: str | None = None,
+):
     if csrf is None:
         csrf = _mint_csrf(client)
-    return client.post(
-        "/admin/view-as",
-        data={"user_id": target_id, "csrf_token": csrf, "next": next_path},
-        follow_redirects=False,
-    )
+    data = {"user_id": target_id, "csrf_token": csrf, "next": next_path}
+    if return_to is not None:
+        data["return_to"] = return_to
+    return client.post("/admin/view-as", data=data, follow_redirects=False)
 
 
 def _exit(client, csrf: str | None = None):
+    """Exit posts the CSRF token and NOTHING else.
+
+    No destination field on purpose — the route has no auth dependency, so a
+    form-supplied redirect target would be its one attacker-influenced value;
+    where to land comes from the signed ticket instead.
+    """
     if csrf is None:
         csrf = client.cookies.get("web_csrf")
     return client.post(
         "/admin/view-as/exit",
-        data={"csrf_token": csrf or "", "next": "/me/profile"},
+        data={"csrf_token": csrf or ""},
         follow_redirects=False,
     )
 
@@ -566,9 +578,59 @@ def test_exiting_restores_the_admins_own_identity(va):
     assert "view-as-banner" not in client.get("/me/profile").text
 
 
-def test_exit_redirects_only_to_an_internal_path(va):
+def test_exit_returns_to_the_page_the_mode_was_entered_from(va):
+    """The errand, finished — not abandoned wherever the browse stopped.
+
+    The admin left the Access page to answer a question about one person. The
+    banner's exit form used to post the CURRENT page back as `next`, so leaving
+    from `/library` landed them on `/library` as themselves, with the person
+    they were investigating forgotten and the lens closed. The origin rides the
+    signed ticket now, so it survives however far the browse wandered.
+    """
     client = va["client"]
-    assert _enter(client).status_code == 303
+    origin = f"/admin/access?lens=simulate&user={ANALYST}"
+    assert _enter(client, next_path="/library", return_to=origin).status_code == 303
+
+    # Wander: several pages deep, nowhere near where the mode was entered.
+    for path in ("/library", "/me/profile", "/catalog"):
+        client.get(path)
+
+    r = _exit(client)
+
+    assert r.status_code == 303
+    assert r.headers["location"] == origin
+
+
+def test_exit_falls_back_to_the_person_deep_link_when_no_origin_was_recorded(va):
+    """A ticket minted before `return_to` existed is still a valid ticket.
+
+    `_REQUIRED_KEYS` deliberately does not list it, so a deploy does not evict
+    every admin mid-session. The fallback is derived from the ticket rather
+    than being a bare `/admin/access`, because the picker would otherwise come
+    back empty and the admin would have to find their person again.
+    """
+    client = va["client"]
+    assert _enter(client, return_to=None).status_code == 303
+
+    r = _exit(client)
+
+    assert r.status_code == 303
+    location = r.headers["location"]
+    assert location.startswith("/admin/access?")
+    assert "lens=simulate" in location
+    assert f"user={ANALYST}" in location
+
+
+def test_exit_takes_no_destination_from_the_caller(va):
+    """The route mounts no auth dependency, so it accepts no redirect target.
+
+    A `next` field here would be the one attacker-influenced value on an
+    endpoint that has no auth gate to lean on. Posting one must change nothing:
+    the ticket's own origin still wins.
+    """
+    client = va["client"]
+    origin = f"/admin/access?lens=simulate&user={ANALYST}"
+    assert _enter(client, return_to=origin).status_code == 303
     csrf = client.cookies.get("web_csrf")
 
     r = client.post(
@@ -578,7 +640,250 @@ def test_exit_redirects_only_to_an_internal_path(va):
     )
 
     assert r.status_code == 303
-    assert r.headers["location"].startswith("/")
+    assert r.headers["location"] == origin
+
+
+def test_the_banner_exit_form_carries_no_destination(va):
+    """Pins the shape, not just today's behavior.
+
+    The bug was reintroducible by one hidden input: a banner that posts its own
+    page back is a banner that can only ever return the admin to where they
+    already are. If a future edit adds a destination field, this fails.
+    """
+    client = va["client"]
+    assert _enter(client, next_path="/library").status_code == 303
+
+    r = client.get("/library")
+    assert r.status_code == 200
+    banner = r.text.split('action="/admin/view-as/exit"', 1)[1].split("</form>", 1)[0]
+    assert 'name="csrf_token"' in banner
+    assert 'name="next"' not in banner
+    assert 'name="return_to"' not in banner
+
+
+class TestTheModeCanActuallyEngage:
+    """A ticket that can never engage is worse than no ticket.
+
+    The binding rule — a ticket only counts for the viewer it was minted for
+    — was checked against the `access_token` cookie in three places, one of
+    them an inline copy inside the read-only middleware. Under any mode that
+    authenticates WITHOUT that cookie the check does not fail the ticket, it
+    fails to evaluate: the mode silently never engages. Since the banner is
+    the mode's only exit control, "never engages" renders as a button that
+    sets a cookie, redirects to the Library, and leaves the admin on an
+    ordinary page with no banner and no way back.
+
+    Two halves, and both matter: the binding is now ONE definition that knows
+    about every credential (`session_matches_viewer`), and entry refuses
+    before it mints anything when no binding is possible at all.
+    """
+
+    def test_the_middleware_uses_the_one_shared_definition(self) -> None:
+        """`session_matches_viewer`'s own docstring names this middleware as a
+        consumer that bound the ticket at its own layer, and warns that a rule
+        kept in three places will be dropped in a fourth. It was still
+        inlining the check here — so the warning was about itself."""
+        from pathlib import Path
+
+        src = Path("app/middleware/view_as_readonly.py").read_text(encoding="utf-8")
+        assert "session_matches_viewer(" in src
+        # The retired inline copy: its own verify_token call and its own
+        # bare requirement of the cookie.
+        assert 'payload.get("sub")' not in src
+        assert 'session_token = request.cookies.get("access_token")' not in src
+
+    def test_binding_is_possible_needs_a_credential_to_bind_to(self, monkeypatch) -> None:
+        from app.auth import view_as as va_mod
+
+        monkeypatch.setattr(va_mod, "local_dev_viewer_id", lambda: None)
+        assert va_mod.binding_is_possible("a-session-token") is True
+        assert va_mod.binding_is_possible(None) is False
+        assert va_mod.binding_is_possible("") is False
+
+    def test_a_configured_identity_can_be_bound_to(self, monkeypatch) -> None:
+        """The generalization, not a relaxation: dev mode authenticates from
+        configuration, so the binding is checked against THAT identity rather
+        than skipped."""
+        from app.auth import view_as as va_mod
+
+        monkeypatch.setattr(va_mod, "local_dev_viewer_id", lambda: "dev-user-1")
+        ticket = va_mod.ViewAsTicket("dev-user-1", "dev@x", "target-1", "t@x")
+        other = va_mod.ViewAsTicket("someone-else", "s@x", "target-1", "t@x")
+
+        assert va_mod.binding_is_possible(None) is True
+        # Still a binding — a ticket minted for anyone else is inert.
+        assert va_mod.session_matches_viewer(None, ticket) is True
+        assert va_mod.session_matches_viewer(None, other) is False
+        assert va_mod.session_matches_viewer(None, None) is False
+
+    def test_an_unreadable_session_cookie_does_not_defeat_the_fallback(self, monkeypatch) -> None:
+        """The miss that shipped in the first cut of this fix.
+
+        Browser cookies ignore the PORT, so every local instance on 127.0.0.1
+        shares one jar: a developer who has opened any other Agnes on that
+        host carries an `access_token` this instance cannot verify, signed by
+        a different deployment's secret. A fallback that fired only on a
+        MISSING cookie took the token path, failed to read it, and silently
+        declined to engage — the same no-banner-no-exit outcome the fallback
+        exists to prevent, reached by a different route.
+        """
+        from app.auth import view_as as va_mod
+
+        monkeypatch.setattr(va_mod, "local_dev_viewer_id", lambda: "dev-user-1")
+        ticket = va_mod.ViewAsTicket("dev-user-1", "dev@x", "target-1", "t@x")
+
+        assert va_mod.session_matches_viewer("not-a-real-token", ticket) is True
+        # Still a binding: a foreign ticket stays inert whatever is in the jar.
+        other = va_mod.ViewAsTicket("someone-else", "s@x", "target-1", "t@x")
+        assert va_mod.session_matches_viewer("not-a-real-token", other) is False
+
+    def test_an_unreadable_session_cookie_still_fails_off_dev_mode(self, monkeypatch) -> None:
+        """Where real sessions are issued there is nothing to fall back ON, so
+        an unverifiable token must keep failing."""
+        from app.auth import view_as as va_mod
+
+        monkeypatch.setattr(va_mod, "local_dev_viewer_id", lambda: None)
+        ticket = va_mod.ViewAsTicket("viewer-1", "v@x", "target-1", "t@x")
+        assert va_mod.session_matches_viewer("not-a-real-token", ticket) is False
+
+    def test_no_configured_identity_means_no_ticket_without_a_session(self, monkeypatch) -> None:
+        """Fail-closed stays the default everywhere else."""
+        from app.auth import view_as as va_mod
+
+        monkeypatch.setattr(va_mod, "local_dev_viewer_id", lambda: None)
+        ticket = va_mod.ViewAsTicket("viewer-1", "v@x", "target-1", "t@x")
+        assert va_mod.session_matches_viewer(None, ticket) is False
+
+    def test_entry_refuses_rather_than_minting_a_ticket_that_cannot_engage(self, va, monkeypatch) -> None:
+        """The fix for the button that lied: refuse BEFORE setting a cookie."""
+        import app.auth.view_as as va_mod
+
+        client = va["client"]
+        csrf = _mint_csrf(client)
+        # No bindable credential of any kind: no configured identity, and the
+        # route reads the session cookie through the same accessor.
+        monkeypatch.setattr(va_mod, "local_dev_viewer_id", lambda: None)
+        monkeypatch.setattr(va_mod, "binding_is_possible", lambda token: False)
+
+        r = client.post(
+            "/admin/view-as",
+            data={"user_id": ANALYST, "csrf_token": csrf, "next": "/library"},
+            follow_redirects=False,
+        )
+
+        assert r.status_code == 403
+        assert r.json()["detail"] == "view_as_requires_interactive_session"
+        assert not client.cookies.get(VIEW_AS_COOKIE)
+
+
+class TestTheOfferIsWithheldWhereItCannotSucceed:
+    """The caller's own row offers no view-as.
+
+    `view_as_self` is a real 400 at the entry route — there is no view of
+    yourself to open and the mode would have nothing to narrow — but the lens
+    rendered the button for every person including the caller, so picking
+    yourself and clicking it produced a full-page 400 carrying a machine
+    token and no route back to the lens. Same rule the rest of the product
+    follows: never offer what cannot succeed.
+    """
+
+    def test_the_page_tells_the_lens_who_is_asking(self, va) -> None:
+        """Withholding the offer needs the caller's id client-side; without
+        it the guard cannot be written at all."""
+        r = va["client"].get("/admin/access", headers={"Accept": "text/html"})
+        assert r.status_code == 200
+        assert "const VIEWER_USER_ID = " in r.text
+        assert ADMIN in r.text
+
+    def test_the_lens_withholds_the_button_on_the_callers_own_row(self) -> None:
+        from pathlib import Path
+
+        src = Path("app/web/templates/admin_access.html").read_text(encoding="utf-8")
+        # The guard, and the reason that takes the button's place.
+        assert "uid === VIEWER_USER_ID" in src
+        assert 'el("ax-sim-self")' in src
+        assert "pick someone else to open a page as them" in src
+
+    def test_a_stale_post_of_self_still_gets_a_sentence(self, va) -> None:
+        """Defence for the case the guard cannot cover — a cached page, or a
+        hand-made POST. The refusal stands; only its legibility changes."""
+        client = va["client"]
+        csrf = _mint_csrf(client)
+
+        r = client.post(
+            "/admin/view-as",
+            data={"user_id": ADMIN, "csrf_token": csrf, "next": "/library"},
+            headers={"Accept": "text/html"},
+            follow_redirects=False,
+        )
+
+        assert r.status_code == 400
+        assert "There is no view of yourself to open" in r.text
+        assert "/admin/access?lens=simulate" in r.text
+        assert not client.cookies.get(VIEW_AS_COOKIE)
+
+
+class TestARefusalDuringViewAsSaysWhy:
+    """An admin page refused during a view-as must not blame the admin.
+
+    The mode suppresses admin authority by making `elevation_paused` answer
+    True for the narrowed subject, so every admin surface refused during a
+    view-as arrives at the error page carrying `admin_elevation_paused` — and
+    the page told the admin they had paused admin mode and offered
+    "Re-enable admin mode". That action is a dead end twice: the toggle lives
+    on a page that renders as the TARGET while the mode is on, and flipping it
+    is a POST the read-only guard refuses.
+    """
+
+    def test_the_error_page_names_the_mode_and_not_a_paused_toggle(self, va) -> None:
+        client = va["client"]
+        assert _enter(client).status_code == 303
+
+        # `Accept: text/html` on purpose: the copy under test lives in
+        # error.html, and an API-shaped request gets the JSON detail instead.
+        # Which of `require_admin`'s two guards fires first is not the point —
+        # the page branches on a live ticket, not on the detail string, so it
+        # explains the mode whichever refusal brought the reader here.
+        r = client.get(
+            "/admin/access",
+            headers={"Accept": "text/html"},
+            follow_redirects=False,
+        )
+        assert r.status_code == 403
+        body = r.text
+        assert "viewing as" in body.lower()
+        assert ANALYST_EMAIL in body
+        # The wrong explanation and its dead-end action are both gone.
+        assert "You paused admin mode" not in body
+        assert "/me/profile#admin-mode" not in body
+        # The way out is the banner's own control, which this page carries.
+        assert 'action="/admin/view-as/exit"' in body
+
+    def test_the_paused_toggle_copy_survives_when_that_is_the_real_reason(self, va) -> None:
+        """A positive control: without it, the branch above could be gutting
+        the elevation case rather than sitting in front of it."""
+        from pathlib import Path
+
+        src = Path("app/web/templates/error.html").read_text(encoding="utf-8")
+        assert "You paused admin mode for this browser" in src
+        assert "/me/profile#admin-mode" in src
+
+
+def test_a_hostile_origin_at_entry_is_refused_not_signed(va):
+    """`return_to` arrives from a form field, so it is sanitized on the way IN.
+
+    A rejected value must degrade to "not recorded" rather than ride along
+    inside a signed blob, where the next reader would trust it for having a
+    valid signature.
+    """
+    client = va["client"]
+    for hostile in ("https://evil.example.com/", "//evil.example.com/", "/\\evil.example.com"):
+        assert _enter(client, return_to=hostile).status_code == 303
+        r = _exit(client)
+        assert r.status_code == 303
+        location = r.headers["location"]
+        assert location.startswith("/admin/access?"), (hostile, location)
+        assert "evil.example.com" not in location, (hostile, location)
 
 
 def test_enter_redirects_only_to_an_internal_path(va):
@@ -907,3 +1212,46 @@ def test_the_real_admin_can_still_exit_and_it_is_audited(va):
 
     rows, _ = audit_repo().query(user_id=ADMIN, action="view_as.end", limit=50)
     assert len(rows) == 1, "the genuine admin's exit is still recorded on their trail"
+
+
+def test_the_configured_identity_fallback_is_off_outside_dev_mode(monkeypatch):
+    """The one line the whole fallback's safety rests on, tested unmocked.
+
+    Every other test of this fallback monkeypatches `local_dev_viewer_id`, so
+    they pin what its CONSUMERS do with an answer — not that the function
+    itself refuses to answer off dev mode. That gap is worth closing here
+    rather than trusting the guard by reading it, because the function it
+    delegates to does NOT check the mode: `_get_local_dev_user` says "when
+    LOCAL_DEV_MODE is on, else None" in its docstring but its body just looks
+    the configured address up and returns whatever it finds. So
+    `is_local_dev_mode()` inside `local_dev_viewer_id` is the ONLY thing
+    standing between a deployment that happens to hold an account at
+    `get_local_dev_email()` and a `session_matches_viewer` that accepts a
+    ticket carrying no verifiable session at all.
+
+    Removing that check leaves every existing view-as test green — which is
+    the definition of an untested security boundary.
+    """
+    from app.auth import view_as as va_mod
+
+    # Dev mode off (the deployed case) — the answer is None even when the
+    # lookup underneath would happily return a user.
+    monkeypatch.setattr(va_mod, "local_dev_viewer_id", va_mod.local_dev_viewer_id)
+    monkeypatch.setattr("app.auth.dependencies.is_local_dev_mode", lambda: False)
+    monkeypatch.setattr("app.auth.dependencies._get_local_dev_user", lambda conn=None: {"id": "dev-user-1"})
+    assert va_mod.local_dev_viewer_id() is None, (
+        "local_dev_viewer_id answered off dev mode — session_matches_viewer would "
+        "then accept a ticket with no verifiable session behind it"
+    )
+
+    # ...and the consequence, through the real function rather than a stub:
+    # a ticket naming that account is inert without a session token.
+    ticket = va_mod.ViewAsTicket("dev-user-1", "dev@x", "target-1", "t@x")
+    assert va_mod.session_matches_viewer(None, ticket) is False
+    assert va_mod.binding_is_possible(None) is False
+
+    # Positive control: with the mode on, the same wiring does answer, so the
+    # assertions above are about the gate and not about a broken lookup.
+    monkeypatch.setattr("app.auth.dependencies.is_local_dev_mode", lambda: True)
+    assert va_mod.local_dev_viewer_id() == "dev-user-1"
+    assert va_mod.session_matches_viewer(None, ticket) is True

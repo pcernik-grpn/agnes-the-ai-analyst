@@ -240,6 +240,94 @@ class TestThePreviewVerb:
         assert "Dangling grant" in src
 
 
+class TestThePersonLensIsOneList:
+    """One list, one vocabulary, one count per fact.
+
+    The lens grew three renderings of the same package set: a row of chips
+    above the panel, the panel's own rows, and a why-chain entry per package
+    below it. Two of the three were prose, so the guard in
+    `tests/test_access_vocabulary.py` — which matches labels as elements —
+    could pass while the same Required package was worded two different ways
+    two inches apart. And the chips capped themselves at six while the panel
+    listed eight, so the screen showed two disagreeing counts a centimetre
+    apart.
+
+    The panel is the list now. The two facts a granted list cannot contain —
+    what is NOT shared, and what is granted but points at nothing — are bands
+    inside it, in the same row shape and the same vocabulary as everything
+    else.
+
+    Source-reading, for the reason the vocabulary suite gives: these rows are
+    built in JS from a fetch, so they are not in the first byte and a test
+    that reads the response body cannot see them.
+    """
+
+    def _src(self) -> str:
+        return ACCESS.read_text()
+
+    def test_the_chips_row_is_gone(self) -> None:
+        src = self._src()
+        # The green two-thirds: a restatement of the panel directly beneath.
+        assert "Can use:" not in src
+        # Its red counterpart made a claim that is simply false of an admin.
+        assert "Cannot use:" not in src
+        # And the container the row lived in — the two `.ax-chips` rules that
+        # remain belong to the filter toolbar's chip row, which shares the
+        # class name.
+        assert '<div class="ax-chips">' not in src
+
+    def test_the_exceptions_survive_as_bands_in_the_list(self) -> None:
+        """Removing the chips must not remove what only they were saying."""
+        src = self._src()
+        assert '"Not shared with them"' in src
+        assert '"Dangling grants"' in src
+        # Each still carries the action it carried as a chip row.
+        assert "?from=simulate&user=" in src          # share the unshared one
+        assert "/admin/access?group=" in src          # fix the stale grant
+
+    def test_no_band_cuts_its_list_silently(self) -> None:
+        """`missing` was sliced to four in the chips and three in the chain,
+        with nothing on screen saying so. A bounded band says what it left
+        out — the repo's own no-silent-caps rule."""
+        src = self._src()
+        assert "missing.slice(0, 4)" not in src
+        assert "missing.slice(0, 3)" not in src
+        assert "more not shared with them" in src
+
+    def test_the_route_is_in_the_row_it_explains(self) -> None:
+        """`via <group>` was a chain entry per package under the panel. It is
+        a cell in the panel row now, which is what let the chain's per-package
+        rows go without losing the attribution."""
+        src = self._src()
+        assert "ax-preview__via" in src
+        assert "const viaNames = new Map()" in src
+
+    def test_a_tier_is_worded_in_exactly_one_place(self) -> None:
+        """The panel's state chips. The chip suffix that used to word it here
+        from this page's own grant rows is gone, and with it the second
+        source that could disagree with the projection `/library` renders."""
+        src = self._src()
+        assert "in their stack" not in src
+        assert "must add it" not in src
+        assert ">In their Library<" in src
+
+    def test_a_kind_the_panel_lists_gets_no_second_fold_line(self) -> None:
+        """Plugins, recipes and memory are bands in the panel. The chain's
+        per-type fold must skip them, or the duplication simply moves."""
+        src = self._src()
+        assert "const bandKinds = new Set(" in src
+        assert "if (bandKinds.has(key)) {" in src
+        # …except the one thing a band cannot carry: a grant pointing at
+        # something no surface lists.
+        assert "point at something not listed above" in src
+
+    def test_admin_god_mode_is_stated_where_the_person_is(self) -> None:
+        """It is not a grant, so it is not a row in a list of grants. It used
+        to lead the chip row; it belongs in the sentence about who they are."""
+        src = self._src()
+        assert "they reach everything regardless of the grants below" in src
+
+
 class TestNoDeadEnds:
     """The two analyst dead-ends the investigation found, each replaced with
     a door: language + a request path on the exists-but-not-granted 403, and

@@ -45,6 +45,14 @@ def _raise_for_status_with_detail(r: httpx.Response) -> None:
     values), is discarded, so the model cannot self-correct and the user
     sees a dead-end error card. Same ``httpx.HTTPStatusError`` raised, with
     the detail appended.
+
+    The URL is deliberately NOT in the message. This helper's output is read
+    by two audiences and helps neither with it: the model called a named tool
+    and cannot act on ``http://localhost:8000/api/query``, and the user reads
+    the same string on the failed tool card, where an internal endpoint makes
+    a mistyped column name look like a server outage (#1974). It is also the
+    longest part of the line, and the card's header has room for about one.
+    The request stays on the exception, so logs and handlers still have it.
     """
     if r.status_code < 400:
         return
@@ -60,7 +68,7 @@ def _raise_for_status_with_detail(r: httpx.Response) -> None:
         body = json.dumps(detail, ensure_ascii=False)
     suffix = f" — {body[:600]}" if body.strip() else ""
     raise httpx.HTTPStatusError(
-        f"{r.status_code} {r.reason_phrase} for {r.request.url}{suffix}",
+        f"{r.status_code} {r.reason_phrase}{suffix}",
         request=r.request,
         response=r,
     )
@@ -150,6 +158,7 @@ FOUNDATION_TOOL_NAMES: tuple[str, ...] = (
     "fact_facets",
     "fact_neighbors",
     "fact_claims",
+    "fact_edges",
     "schema",
     "describe",
     "query",
@@ -1045,6 +1054,7 @@ def register_foundation_tools(
         filters: dict[str, Any] | None = None,
         q: str | None = None,
         limit: Annotated[int, Field(ge=1, le=100)] = 20,
+        include_claims: Annotated[int, Field(ge=0, le=3)] = 0,
     ) -> dict:
         """Search typed facts extracted from documents — entities (people,
         clients, organizations) and their attributes. Use this FIRST for
@@ -1076,18 +1086,33 @@ def register_foundation_tools(
                 matched against alias names only, never claim text. An
                 exact or prefix match ranks first.
             limit: Max results (server caps at 100).
+            include_claims: 0 (default) or 1-3 — attach that many of each
+                subject's NEWEST readable quotes inline as `claims`, so you
+                can cite without a `fact_claims` call per result. Use 1 when
+                you will cite several results; leave 0 when you only need
+                ids.
 
         Returns ``{"subjects": [{"id", "type", "aliases", "attrs",
-        "claim_count", "quote_count", "revealed"}], "limit_applied"}`` —
-        `limit_applied` is true only when YOUR OWN readable results exceed
-        `limit`, never a signal that grants hid additional matches.
+        "claim_count", "quote_count", "revealed", "claims"?}],
+        "limit_applied", "claims_truncated"?}`` — `limit_applied` is true
+        only when YOUR OWN readable results exceed `limit`, never a signal
+        that grants hid additional matches; `claims_truncated` (only with
+        `include_claims`) means the inline budget ran out part-way.
         """
         from app.auth.access import require_facts_enabled
         from src.repositories import facts_repo
 
         require_facts_enabled()
         caller = _facts_caller(headers_fn)
-        return await asyncio.to_thread(facts_repo().search, caller, type=type, filters=filters or {}, q=q, limit=limit)
+        return await asyncio.to_thread(
+            facts_repo().search,
+            caller,
+            type=type,
+            filters=filters or {},
+            q=q,
+            limit=limit,
+            include_claims=include_claims,
+        )
 
     @tool(read_only=True)
     async def fact_type_map() -> dict:
@@ -1169,13 +1194,14 @@ def register_foundation_tools(
         depth: Annotated[int, Field(ge=1, le=2)] = 1,
         fanout: Annotated[int, Field(ge=1, le=100)] = 100,
         limit: Annotated[int, Field(ge=1, le=500)] = 500,
+        include_claims: Annotated[int, Field(ge=0, le=3)] = 0,
     ) -> dict:
-        """Traverse relationships between facts — use for connection/chain
-        questions ("how are X and Y connected", "who does X report to",
-        "which industries is X in", "which team owns this client") once
-        you have a starting `subject_id` from `fact_search`; prefer this
-        over inferring structure from a SQL join or a document search.
-        Depth <= 2, capped fanout (design doc §12).
+        """Traverse relationships from ONE starting fact — connection/chain
+        questions ("how are X and Y connected", "who does X report to") once
+        you have a `subject_id` from `fact_search`; prefer it over inferring
+        structure from SQL or document search. For ALL relationships of one
+        type, call `fact_edges` once instead of walking every root. Depth
+        <= 2, capped fanout (design doc §12).
 
         PASS `edge_types` WHEN YOU KNOW IT — a well-connected node (a hub
         client, a busy person) can carry many relationship types at once;
@@ -1202,12 +1228,17 @@ def register_foundation_tools(
             depth: Traversal depth, 1 (default) or 2.
             fanout: Max edges expanded per node (server caps at 100).
             limit: Max total nodes+edges returned (server caps at 500).
+            include_claims: 0 (default) or 1-3 — attach that many of each
+                EDGE's newest readable quotes inline as `claims`, so the
+                relationships you report are already cited without a
+                `fact_claims` call per edge.
 
-        Returns ``{"nodes": [...], "edges": [...], "truncated": {"depth",
-        "fanout", "result"}}``. Errors for a `subject_id` that does not
-        exist OR has no readable claim — indistinguishable from your point
-        of view on purpose (design doc §5 rule 2); re-check the id with
-        `fact_search` rather than treating this as a permission signal.
+        Returns ``{"nodes": [...], "edges": [{..., "claims"?}], "truncated":
+        {"depth", "fanout", "result", "claims"?}}``. Errors for a
+        `subject_id` that does not exist OR has no readable claim —
+        indistinguishable from your point of view on purpose (design doc §5
+        rule 2); re-check the id with `fact_search` rather than treating
+        this as a permission signal.
         """
         from app.auth.access import require_facts_enabled
         from src.repositories import facts_repo
@@ -1224,29 +1255,124 @@ def register_foundation_tools(
                 depth=depth,
                 fanout=fanout,
                 limit=limit,
+                include_claims=include_claims,
             )
         except FactNotFound:
             raise ValueError(_FACTS_NOT_FOUND_HINT.format(subject_id=subject_id)) from None
 
     @tool(read_only=True)
-    async def fact_claims(subject_id: str) -> dict:
-        """Your readable evidence for one fact or edge — the exact quote,
-        source document and date backing a result from `fact_search` or
-        `fact_neighbors`. Call this before reporting a fact in your answer:
-        a fact you cannot cite this way is not one you should state as
-        given.
+    async def fact_edges(
+        edge_type: str,
+        src_type: str | None = None,
+        dst_type: str | None = None,
+        src_id: str | None = None,
+        dst_id: str | None = None,
+        extend_edge_type: str | None = None,
+        extend_from: Annotated[str, Field(pattern="^(src|dst)$")] = "dst",
+        include_claims: Annotated[int, Field(ge=0, le=3)] = 0,
+        limit: Annotated[int, Field(ge=1, le=100)] = 100,
+    ) -> dict:
+        """List EVERY relationship of one type you can see, with both ends
+        as full subjects, in ONE call — the tool for aggregation and
+        comparison questions over a relationship ("which clients does each
+        sponsor own", "which industries are our clients in"). Read the type
+        names from `fact_type_map`'s `edge_types`, then call this once; do
+        not call `fact_neighbors` per root. Use `fact_neighbors` only when
+        the question starts from ONE known entity.
 
-        Mirrors `GET /api/facts/{subject_id}/claims` and `agnes facts claims`.
+        Per root, `fact_neighbors` + `fact_claims` is one call per entity
+        plus one per citation; this returns the same edges, both endpoints
+        projected, and (with `include_claims`) the quotes to cite, in a
+        single round trip.
+
+        Two hops in one call: `extend_edge_type` follows a second
+        relationship type from every listed edge's `extend_from` endpoint
+        (e.g. list `owned_by` edges, then from each `src` follow
+        `in_industry`) — the shape of "which sponsor's clients are in which
+        industries".
+
+        Every edge and both its endpoints are filtered to what YOU can read
+        (design doc §5): an edge whose evidence you cannot read, or whose
+        endpoint you may not see, is simply absent — never reported as
+        "hidden". An unknown or unreadable `edge_type` returns an empty
+        page, not an error. Behind the `facts` feature flag; requires the
+        Postgres app-state backend. Mirrors `POST /api/facts/edges` and
+        `agnes facts edges`.
 
         Args:
-            subject_id: Fact or edge id (from `fact_search` / `fact_neighbors`).
+            edge_type: Relationship type to list (a name from
+                `fact_type_map`'s `edge_types`). Required.
+            src_type: Only edges whose source fact has this type.
+            dst_type: Only edges whose destination fact has this type.
+            src_id: Only edges out of this fact id.
+            dst_id: Only edges into this fact id.
+            extend_edge_type: Second relationship type to follow one hop
+                from each listed edge's `extend_from` endpoint.
+            extend_from: Which endpoint the extension starts from, "src"
+                or "dst" (default).
+            include_claims: 0 (default) or 1-3 — attach that many of each
+                edge's newest readable quotes inline as `claims`. Use 1 for
+                a cited table; it saves a `fact_claims` call per row.
+            limit: Max edges per hop (server caps at 100).
+
+        Returns ``{"nodes": [<subject: id, type, aliases, attrs,
+        claim_count, quote_count, revealed>], "edges": [{"id", "src",
+        "dst", "type", "attrs", "claims"?}], "truncated": {"result",
+        "extension", "claims"}}`` — each `truncated` flag is true only when
+        YOUR OWN visible set exceeded the cap, never a hint at hidden
+        matches. When `truncated.result` is true, narrow with `src_type`/
+        `dst_type`/`src_id`/`dst_id` rather than assuming you saw
+        everything.
+        """
+        from app.auth.access import require_facts_enabled
+        from src.repositories import facts_repo
+
+        require_facts_enabled()
+        caller = _facts_caller(headers_fn)
+        return await asyncio.to_thread(
+            facts_repo().edges,
+            caller,
+            edge_type=edge_type,
+            src_type=src_type,
+            dst_type=dst_type,
+            src_id=src_id,
+            dst_id=dst_id,
+            limit=limit,
+            extend_edge_type=extend_edge_type,
+            extend_from=extend_from,
+            include_claims=include_claims,
+        )
+
+    @tool(read_only=True)
+    async def fact_claims(
+        subject_id: str,
+        limit: Annotated[int, Field(ge=1, le=200)] = 25,
+    ) -> dict:
+        """Your readable evidence for one fact or edge — the exact quote,
+        source document and date backing a result from `fact_search`,
+        `fact_neighbors` or `fact_edges`. Call this before reporting a fact
+        in your answer when you did not already get its quotes inline via
+        `include_claims`: a fact you cannot cite this way is not one you
+        should state as given.
+
+        Returns the NEWEST `limit` claims (default 25, max 200); a hub
+        subject can carry hundreds, and pulling them all costs more context
+        than the answer needs. `limit_applied: true` means more readable
+        claims exist beyond this page — raise `limit` only if you actually
+        need older evidence. Mirrors `GET /api/facts/{subject_id}/claims`
+        and `agnes facts claims`.
+
+        Args:
+            subject_id: Fact or edge id (from `fact_search` /
+                `fact_neighbors` / `fact_edges`).
+            limit: Max claims returned, newest first (server caps at 200).
 
         Returns ``{"claims": [{"id", "corpus_id", "corpus_file_id",
         "document": {"name", "path", "source_url"?}, "quote", "attrs",
-        "document_date"}], "revealed"}``. A subject under an admin
-        `revealed` correction is served to every authenticated caller with
-        every `quote` suppressed to an empty string. Errors for a
-        `subject_id` that does not exist OR has no readable claim — same
+        "document_date"}], "revealed", "limit_applied"}``. A subject under
+        an admin `revealed` correction is served to every authenticated
+        caller with every `quote` suppressed to an empty string. Errors for
+        a `subject_id` that does not exist OR has no readable claim — same
         failure either way, on purpose (design doc §5 rule 2).
         """
         from app.auth.access import require_facts_enabled
@@ -1256,7 +1382,7 @@ def register_foundation_tools(
         require_facts_enabled()
         caller = _facts_caller(headers_fn)
         try:
-            return await asyncio.to_thread(facts_repo().claims, caller, subject_id)
+            return await asyncio.to_thread(facts_repo().claims, caller, subject_id, limit=limit)
         except FactNotFound:
             raise ValueError(_FACTS_NOT_FOUND_HINT.format(subject_id=subject_id)) from None
 
