@@ -171,8 +171,31 @@ function renderRow(row) {
     <td class="ext-sub">${fmtAgo(row.checkpoint_age_s)}</td>
     <td>${run && run.error ? `<span class="ext-error-cell" title="${esc(run.error)}">${esc(run.error)}</span>` : ""}</td>
     <td>${actionsCell(row)}</td>
+    <td><button type="button" class="btn btn-sm btn-secondary" onclick="openFleetCompleteness('${row.connection_id}')">Completeness</button></td>
   `;
   return tr;
+}
+
+// "Did we really get everything?" (TCRD-296 B.9) — re-homes the ONE shared
+// drawer shell to this connection's id so
+// data_sources_extraction_observability.js's `toggleExtractionDrawer` /
+// `_extCompletenessHtml` / `extRecountCompleteness` / `extSortCompleteness`
+// (the SAME functions the source card's drawer uses) render it verbatim.
+// Switching to a different connection's drawer simply re-homes the shell —
+// only one completeness drawer is open on this page at a time.
+let extFleetOpenConnId = null;
+
+function openFleetCompleteness(connId) {
+  const shell = document.getElementById("ext-fleet-completeness-shell");
+  if (extFleetOpenConnId === connId) {
+    // Same connection clicked again: let toggleExtractionDrawer's own
+    // open/close logic decide (it closes when already open+visible).
+    toggleExtractionDrawer(connId, "completeness");
+    return;
+  }
+  extFleetOpenConnId = connId;
+  shell.innerHTML = `<div class="ext-drawer" id="ext-drawer-${esc(connId)}" hidden></div>`;
+  toggleExtractionDrawer(connId, "completeness");
 }
 
 /* The queued-vs-running lane-starvation strip (TCRD-296 synthesis item B.6):
@@ -211,7 +234,7 @@ function renderTable(body) {
     const msg = extScope === "active"
       ? "No SharePoint connection currently has a run in progress."
       : "No SharePoint connections are registered.";
-    tbody.innerHTML = `<tr><td colspan="10" class="ext-blank">${msg}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="11" class="ext-blank">${msg}</td></tr>`;
   } else {
     tbody.innerHTML = "";
     for (const row of rows) tbody.appendChild(renderRow(row));

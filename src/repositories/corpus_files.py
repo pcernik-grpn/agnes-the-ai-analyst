@@ -269,6 +269,33 @@ class CorpusFilesRepository:
             out.setdefault(corpus_id, {})[status or "pending"] = int(n)
         return out
 
+    def top_folder_status_counts(self, corpus_id: str) -> Dict[str, Dict[str, int]]:
+        """``{top_folder: {processing_status: count}}`` for one corpus, in ONE
+        grouped query — ``top_folder`` is the first ``/``-delimited segment
+        of ``path`` (``""`` for a file with no ``/`` in its path, i.e. one
+        sitting directly at the corpus root — mirrors the SharePoint
+        site-split planner's ``loose_root_files``; a NULL/blank ``path``
+        buckets under ``""`` too, never dropped).
+
+        The per-folder sibling of ``status_counts_for_corpora``: the
+        SharePoint completeness check (``app.api.admin_extraction``'s
+        ``…/extraction/completeness``) needs an ``indexed``/``rejected``
+        breakdown per top-level folder for a single-scope, drive-root
+        connection, and doing that with ``count_for_corpus`` once per folder
+        made the query count grow with the folder count.
+        """
+        rows = self.conn.execute(
+            "SELECT CASE WHEN path IS NOT NULL AND strpos(path, '/') > 0 "
+            "THEN split_part(path, '/', 1) ELSE '' END AS top_folder, "
+            "processing_status, COUNT(*) FROM corpus_files WHERE corpus_id = ? "
+            "GROUP BY top_folder, processing_status",
+            [corpus_id],
+        ).fetchall()
+        out: Dict[str, Dict[str, int]] = {}
+        for top_folder, status, n in rows:
+            out.setdefault(top_folder, {})[status or "pending"] = int(n)
+        return out
+
     def list_children(self, parent_file_id: str) -> List[Dict[str, Any]]:
         """All child rows extracted from the given archive file, by created_at."""
         rows = self.conn.execute(

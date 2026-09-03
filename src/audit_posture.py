@@ -202,6 +202,13 @@ POSTURE: dict[str, str] = {
     # min_modified, a cross-check on the fallback rather than a fallback
     # emission (same reasoning as scope_bulk_add/clone right above).
     "POST /api/admin/sharepoint/connections/{connection_id}/splits": "sharepoint_connection.split_apply",
+    # The reverse of `splits` above — folds several sibling connections back
+    # into one. Writes its own row EVERY call, dry-run included
+    # (`params.dry_run` distinguishes a preview from the real merge),
+    # richer than the fallback could derive (sibling/target ids, the
+    # per-table consolidation summary) — same posture as `splits`/
+    # `collections/consolidate` above.
+    "POST /api/admin/sharepoint/connections/{connection_id}/splits/merge": "sharepoint_connection.split_merge",
     "POST /api/admin/sharepoint/extraction/run-due": "run_sharepoint_extraction",
     # Persistence for a site added by URL (2026-09-01 bug report): the
     # ``Sites.Selected`` escape hatch used to resolve a site without ever
@@ -833,6 +840,13 @@ READ_POSTURE: dict[str, str] = {
     # `scopes_read` / `certificate_read` siblings below.
     "GET /api/admin/sharepoint/connections/{connection_id}/extraction/config": (
         "sharepoint_connection.extraction_config_read"
+    ),
+    # A6 — "did we really get everything?" (TCRD-296 B.9). Cataloged (not
+    # exempt), same reasoning as `split-plan` below: it discloses folder
+    # names and per-scope/per-folder document counts, never document
+    # content or secrets.
+    "GET /api/admin/sharepoint/connections/{connection_id}/extraction/completeness": (
+        "sharepoint_connection.completeness_read"
     ),
     # The fleet dashboard's own poll (`/admin/extraction`, 5s while any run
     # is active) — one row per connection of the SAME run counters A1

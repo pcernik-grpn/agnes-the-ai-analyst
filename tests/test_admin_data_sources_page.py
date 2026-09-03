@@ -2573,6 +2573,7 @@ console.log(_sourceMenuItems({json.dumps(row)}));
         "Test connection",
         "Run extraction now",
         "Consolidate collections…",
+        "Merge split parts back into this source…",
         "Update certificate…",
         "Delete source",
     ]
@@ -2598,6 +2599,7 @@ console.log(_sourceMenuItems({json.dumps(row)}));
         assert "openSpWizardForConnection('sp-conn-1')" in html
         assert "toggleSpCertRow('sp-conn-1')" in html
         assert "toggleSpConsolidateRow('sp-conn-1')" in html
+        assert "mergeSpSplitSiblings('sp-conn-1')" in html
 
     def test_keboola_menu_is_unchanged_by_the_sharepoint_branch(self):
         html = self._run(

@@ -136,6 +136,36 @@ spot-check shows pseudonyms, not names.
   repeating this once per part with the same target; refused with `409
   sibling_crawl_running` if a family member's crawl is currently queued or
   running. PG-only (A3 ratchet).
+
+  **Merging the parts back into one CONNECTION** (a step further than
+  folding collections above — this also unions the crawl/facts progress,
+  so the merged connection resumes incrementally instead of re-downloading
+  the site). Once a split site no longer needs to run in parallel — or a
+  site was split by hand into several sibling connections and it is time
+  to fold it back — `POST …/connections/{id}/splits/merge` or `agnes admin
+  sharepoint split-merge <target_id> --sibling <id>... | --all-siblings
+  --target-collection-id <id> | --target-name <name> [--execute]` (source
+  card overflow menu → **Merge split parts back into this source…**) is
+  the REVERSE of the split above: it moves every sibling's scopes onto the
+  target (deduped by `(source_scope_id, drive_id)`), unions each sibling's
+  crawl state (delta-link cursors, cTags, the failed/empty-document
+  backlogs) and facts state (the extraction ledger) onto the target's own,
+  folds every involved scope collection into one target collection (the
+  SAME repository `collections/consolidate` uses — never reimplemented),
+  and re-points each sibling's run history onto the target. `--all-siblings`
+  folds in every OTHER connection named like this one's own split family
+  (the `"<source name> — part i/n"` convention `POST …/splits` already
+  establishes); `--sibling <id>` (repeatable) names siblings explicitly —
+  the only form that works for a site split by hand under different
+  names. Refused (`409`, nothing touched) while any involved connection
+  has a running crawl/facts job, while a sibling carries ACL-mirroring
+  permission zones or a mirrored-scope audience mapping different from the
+  target's own, or while a scope collection being folded is still
+  referenced by a connection OUTSIDE the merge group. Siblings are marked
+  merged-away (their scopes cleared) rather than deleted — their
+  credentials are left untouched; remove a merged-away sibling later with
+  the ordinary `DELETE /api/admin/source-connections/{id}` if it is no
+  longer needed. Dry-run by default. PG-only (A3 ratchet).
 - `extraction.crawl.min_modified` — a per-connection age filter for a
   backfill run: crawl only files modified on/after a cutoff date instead of
   re-walking a whole multi-year corpus. `PATCH …/extraction/crawl-config`
@@ -302,6 +332,46 @@ budget is skipped rather than shipping a meaningless head, counted in
 one document's own request (most commonly a 400 "prompt is too long") is
 counted in `facts_failed`/`facts_failed_reasons` and the pass continues
 with the next document — it never aborts the whole run.
+
+## Verifying completeness
+
+"Did we really get everything?" is a live Graph Search count compared
+against the corpus, not a guess: **Completeness** in the source card's
+extraction drawer (or `/admin/extraction`'s own per-row button) shows, per
+confirmed scope — and, for a connection with exactly ONE whole-drive scope,
+per top-level folder under it — `expected` (Graph Search's own document
+count, narrowed to convertible formats and to the crawl's own
+`min_modified` cutoff), `indexed`/`rejected` (from the corpus), and the
+crawl's own recorded reasons for anything missing: `failed`, `empty`,
+`skipped_unsupported`, `oversize`. `gap = expected - indexed - failed -
+empty - skipped_unsupported - oversize`, and each row's `status` is:
+
+- **complete** — indexed already covers expected, nothing to explain.
+- **accounted** — some documents are missing from the index, but every one
+  of them has a recorded reason (failed, converted empty, an unsupported
+  type, or over the size cap).
+- **missing** — an unexplained gap remains after every known reason is
+  applied. This is the row worth investigating first.
+- **unknown** — `expected` itself could not be resolved (a scope that spans
+  a whole SharePoint SITE across several drives has no single count to
+  compare against) — never rendered as 0, which would read as "everything
+  is missing" when the truth is "unmeasured".
+
+Rows are sortable by `gap` (click the column header, or in the CLI they are
+sorted descending by default) so the worst-looking scope/folder is always
+the first thing an admin sees. The check fans out one Graph Search call per
+scope/folder, so its answer is cached for 10 minutes — a **Recount** button
+(`?refresh=true`) bypasses the cache for a fresh read. Running it while a
+crawl is active still answers, just labeled `provisional: true` — a
+snapshot mid-crawl, not a settled number. `agnes admin sharepoint
+completeness <connection_id> [--min-modified YYYY-MM-DD] [--refresh]
+[--json]` is the same check from a terminal.
+
+Answers on both app-state backends (crawl state, `corpus_files` and the job
+queue are all backend-agnostic — unlike run history above, this does NOT
+need Postgres). See `connectors/sharepoint/completeness.py`'s module
+docstring for the exact attribution rules behind each reason count on a
+multi-scope connection.
 
 ## Watching several connections at once
 

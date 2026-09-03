@@ -267,14 +267,15 @@ _N_VISIBLE_ONLY = 150
 _N_OTHER_OWNER = 250
 
 
-def _seed_mixed_visibility_collections(pg_engine) -> None:
-    """`_N_VISIBLE_ONLY` collections owned by admin1 (the probed caller) and
-    `_N_OTHER_OWNER` more owned by someone else who never granted admin1
-    anything — one file each, real enough to render as ordinary artefact
-    cards without the round-1/2 file-count cost this test isn't about."""
+def _seed_mixed_visibility_collections(pg_engine, visible_owner: str = "analyst1") -> None:
+    """`_N_VISIBLE_ONLY` collections owned by `visible_owner` (the probed
+    caller) and `_N_OTHER_OWNER` more owned by someone else who never
+    granted `visible_owner` anything — one file each, real enough to render
+    as ordinary artefact cards without the round-1/2 file-count cost this
+    test isn't about."""
     rows = []
     for i in range(_N_VISIBLE_ONLY + _N_OTHER_OWNER):
-        owner = "admin1" if i < _N_VISIBLE_ONLY else "other_owner"
+        owner = visible_owner if i < _N_VISIBLE_ONLY else "other_owner"
         rows.append(
             {
                 "id": f"col_mix_{i}",
@@ -296,17 +297,26 @@ def _seed_mixed_visibility_collections(pg_engine) -> None:
 
 
 def test_library_index_renders_every_visible_collection_with_no_more_control(tmp_path, monkeypatch, pg_engine):
-    """Round 4 (live incident): an admin who owns/was granted only a SUBSET
+    """Round 4 (live incident): a caller who owns/was granted only a SUBSET
     of the instance's collections must see every one of THAT subset, never
     a cap-truncated slice of it, and never a "Show more collections" control
     — the round-2 mechanism this fixes appeared whenever the INSTANCE had
     more collections than the (removed) cap, regardless of how many the
     caller could actually see, so a caller with 150 of 400 visible saw a
-    link driven by the other 250 they could never reach either way."""
-    client, admin_token = build_seeded_client("pg", tmp_path, monkeypatch, pg_engine)
-    _seed_mixed_visibility_collections(pg_engine)
+    link driven by the other 250 they could never reach either way.
 
-    resp = client.get("/library", headers={"Authorization": f"Bearer {admin_token}"})
+    Probed as a NON-ADMIN (analyst1) — an admin caller now sees every live
+    collection by design (admin god-mode, see the follow-up test below and
+    `library_page`'s docstring), so the "other owner's rows never leak in"
+    half of this guard would no longer hold for an admin. It still holds,
+    unchanged, for an ordinary caller's own subset."""
+    from app.auth.jwt import create_access_token
+
+    client, _admin_token = build_seeded_client("pg", tmp_path, monkeypatch, pg_engine)
+    _seed_mixed_visibility_collections(pg_engine, visible_owner="analyst1")
+    analyst_token = create_access_token("analyst1", "analyst@test.com")
+
+    resp = client.get("/library", headers={"Authorization": f"Bearer {analyst_token}"})
     assert resp.status_code == 200, resp.text
     body = resp.text
 
@@ -319,6 +329,38 @@ def test_library_index_renders_every_visible_collection_with_no_more_control(tmp
         assert f'data-item-id="col_mix_{i}"' not in body
 
     # No pagination control exists at all any more — round 4 removed it.
+    assert "Show more collections" not in body
+    assert "files_limit" not in body
+
+
+def test_library_index_admin_sees_every_collection_including_admin_only(tmp_path, monkeypatch, pg_engine):
+    """Admin god-mode (see ``library_page``'s docstring): unlike the
+    non-admin probe above, an admin caller sees EVERY live collection on the
+    instance — including the 250 owned by someone else with no grant to
+    admin1 at all — each tagged ``ownership="admin_visible"``. Admin
+    god-mode widens which rows PASS the visibility filter; it must not
+    reintroduce an unbounded per-row or per-collection cost, so this stays
+    within the same render-time budget the other 400-collection fixtures in
+    this file establish."""
+    client, admin_token = build_seeded_client("pg", tmp_path, monkeypatch, pg_engine)
+    _seed_mixed_visibility_collections(pg_engine, visible_owner="admin1")
+
+    t0 = time.monotonic()
+    resp = client.get("/library", headers={"Authorization": f"Bearer {admin_token}"})
+    elapsed = time.monotonic() - t0
+    assert resp.status_code == 200, resp.text
+    assert elapsed < 1.0, f"admin GET /library (400 collections, all visible) took {elapsed:.2f}s — expected < 1s"
+    body = resp.text
+
+    # All 400 render — the owned 150 AND the admin-only 250.
+    total = _N_VISIBLE_ONLY + _N_OTHER_OWNER
+    assert body.count('data-item-id="col_mix_') == total
+    for i in range(total):
+        assert f'data-item-id="col_mix_{i}"' in body
+
+    # Only the admin-only 250 carry the ownership tag.
+    assert body.count('data-ownership="admin_visible"') == _N_OTHER_OWNER
+
     assert "Show more collections" not in body
     assert "files_limit" not in body
 

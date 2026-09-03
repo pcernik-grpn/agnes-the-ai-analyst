@@ -74,6 +74,18 @@
      stacked buttons plus a one-line transient result under them. */
   .ext-row-actions { display: flex; flex-direction: column; gap: 4px; align-items: flex-start; }
   .ext-row-actions .btn { white-space: nowrap; }
+  /* Completeness drawer (TCRD-296 B.9) — rendered by the SAME
+     `_extCompletenessHtml`/`toggleExtractionDrawer` functions the source
+     card's drawer uses (data_sources_extraction_observability.js, loaded
+     below): one shared table/actions vocabulary, not a second copy of it. */
+  .ext-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+  .ext-warn { color: var(--ds-accent-warn-ink); }
+  .ext-drawer { margin: 10px 0; padding: 12px; border: 1px solid var(--ds-border); border-radius: var(--ds-radius-btn); background: var(--ds-surface); }
+  .ext-cfg { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  .ext-cfg th, .ext-cfg td { text-align: left; padding: 6px 8px; vertical-align: top; border-bottom: 1px solid var(--ds-border); }
+  .ext-cfg th { font-weight: 600; color: var(--ds-text-secondary); white-space: nowrap; }
+  .ext-completeness .ext-num { text-align: right; font-variant-numeric: tabular-nums; }
+  .ext-completeness__total td { font-weight: 600; border-top: 2px solid var(--ds-border); }
 </style>
 {% endblock %}
 
@@ -137,15 +149,24 @@
         <th>Last checkpoint</th>
         <th>Error</th>
         <th>Actions</th>
+        <th></th>
       </tr>
     </thead>
     <tbody id="ext-tbody">
-      <tr><td colspan="10" class="ext-blank">Loading…</td></tr>
+      <tr><td colspan="11" class="ext-blank">Loading…</td></tr>
     </tbody>
   </table>
 </div>
+
+{# One shared drawer shell, re-homed per connection by `openFleetCompleteness`
+   below to the exact `ext-drawer-<connId>` id
+   `data_sources_extraction_observability.js`'s rendering/recount/sort
+   functions already look up — the source card's drawer and this one render
+   through the SAME code, never a second copy of it (TCRD-296 B.9). #}
+<div id="ext-fleet-completeness-shell"></div>
 {% endblock %}
 
 {% block scripts %}
+<script src="{{ static_url('js/admin/data_sources_extraction_observability.js') }}"></script>
 <script src="{{ static_url('js/admin/admin_extraction.js') }}" defer></script>
 {% endblock %}

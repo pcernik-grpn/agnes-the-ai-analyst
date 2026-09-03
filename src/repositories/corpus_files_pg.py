@@ -282,6 +282,23 @@ class CorpusFilesPgRepository:
             out.setdefault(corpus_id, {})[status or "pending"] = int(n)
         return out
 
+    def top_folder_status_counts(self, corpus_id: str) -> Dict[str, Dict[str, int]]:
+        """Mirrors the DuckDB sibling — see its docstring."""
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                sa.text(
+                    "SELECT CASE WHEN path IS NOT NULL AND strpos(path, '/') > 0 "
+                    "THEN split_part(path, '/', 1) ELSE '' END AS top_folder, "
+                    "processing_status, COUNT(*) AS n FROM corpus_files "
+                    "WHERE corpus_id = :id GROUP BY top_folder, processing_status"
+                ),
+                {"id": corpus_id},
+            ).all()
+        out: Dict[str, Dict[str, int]] = {}
+        for top_folder, status, n in rows:
+            out.setdefault(top_folder, {})[status or "pending"] = int(n)
+        return out
+
     def list_children(self, parent_file_id: str) -> List[Dict[str, Any]]:
         """All child rows extracted from the given archive file, by created_at."""
         with self._engine.connect() as conn:

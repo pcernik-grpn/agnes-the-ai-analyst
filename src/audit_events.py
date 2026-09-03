@@ -141,6 +141,9 @@ CATALOG: dict[str, AuditEvent] = {
     "broker_llm_auth_failure": AuditEvent(
         "broker_llm_auth_failure", "system", "The secret broker's LLM credential auth failed."
     ),
+    "broker_llm_unreachable": AuditEvent(
+        "broker_llm_unreachable", "system", "The secret broker could not reach the LLM upstream at all."
+    ),
     "broker_path_rejected": AuditEvent("broker_path_rejected", "system", "The secret broker rejected a path."),
     "broker_ticket_scope_mismatch": AuditEvent(
         "broker_ticket_scope_mismatch", "system", "A broker ticket's scope didn't match the request."
@@ -736,6 +739,13 @@ CATALOG: dict[str, AuditEvent] = {
         "An admin split a SharePoint connection's site into several sibling connections, each with its own "
         "slice of the top-level folders.",
     ),
+    "sharepoint_connection.split_merge": AuditEvent(
+        "sharepoint_connection.split_merge",
+        "mutation",
+        "An admin folded several sibling SharePoint connections (a manually split site) back into one, "
+        "carrying over each sibling's crawl/facts progress and re-pointing its scopes, collections and "
+        "run history onto the target.",
+    ),
     "source_connection.chat_tools_disable": AuditEvent(
         "source_connection.chat_tools_disable",
         "mutation",
@@ -1104,6 +1114,13 @@ CATALOG: dict[str, AuditEvent] = {
         "sharepoint_connection.split_plan_read",
         "read",
         "An admin previewed how a SharePoint connection's site would split into several sibling connections.",
+    ),
+    "sharepoint_connection.completeness_read": AuditEvent(
+        "sharepoint_connection.completeness_read",
+        "read",
+        "An admin ran a SharePoint connection's completeness check (expected vs. indexed document counts "
+        "per scope/folder). Same disclosure class as split_plan_read: folder names and document counts, "
+        "never document content.",
     ),
     "source_connection.tables_discover": AuditEvent(
         "source_connection.tables_discover",

@@ -2387,6 +2387,48 @@ class TestConsolidateCollectionsFailsCleanOnDuckDB:
         assert r.json()["error"] == "requires_postgres_backend"
 
 
+class TestSplitMergeFailsCleanOnDuckDB:
+    """Split-merge (``POST .../splits/merge``) is PG-only by construction —
+    it touches ``sharepoint_connection_state`` (crawl/facts bookkeeping) and
+    ``extraction_runs``, both PG-only (A3 ratchet), on top of the same
+    PG-only collection consolidation ``TestConsolidateCollectionsFailsCleanOnDuckDB``
+    above already covers. The happy path lives in
+    tests/db_pg/test_sharepoint_connection_split_merge_route_pg.py; this
+    suite (the DuckDB-backed default here) only proves the typed 501 —
+    never a raw 500 — for both the dry-run and the real-merge shape."""
+
+    @pytest.fixture(autouse=True)
+    def _pin_duckdb_backend(self, duckdb_backend_pinned):
+        """Resolve DuckDB regardless of a ``tests/db_pg/`` test having run
+        earlier in this worker process (issue #1658)."""
+
+    def test_dry_run_501_on_duckdb_backend(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        target = _create_connection(c, token, name="split-merge-duckdb-target")
+        sib = _create_connection(c, token, name="split-merge-duckdb-sib")
+        r = c.post(
+            f"{BASE}/{target}/splits/merge",
+            json={"sibling_ids": [sib], "target": {"name": "Merged"}},
+            headers=_auth(token),
+        )
+        assert r.status_code == 501
+        assert r.json()["error"] == "requires_postgres_backend"
+
+    def test_real_merge_501_on_duckdb_backend(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        target = _create_connection(c, token, name="split-merge-duckdb-real-target")
+        sib = _create_connection(c, token, name="split-merge-duckdb-real-sib")
+        r = c.post(
+            f"{BASE}/{target}/splits/merge",
+            json={"sibling_ids": [sib], "target": {"name": "Merged"}, "dry_run": False},
+            headers=_auth(token),
+        )
+        assert r.status_code == 501
+        assert r.json()["error"] == "requires_postgres_backend"
+
+
 # ---------------------------------------------------------------------------
 # Extraction enqueue wiring (TCRD-226) — the admin trigger + the scheduled
 # sweep. Neither test class runs a crawl; they cover the endpoints' OWN

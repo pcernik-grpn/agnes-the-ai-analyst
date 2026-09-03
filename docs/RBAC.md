@@ -143,8 +143,11 @@ writes are audited like any other.
 
 Collections are private to their creator by default — without a grant, only
 the owner (and admins, via god-mode) can see an upload, in every surface at
-once: the Library, the chat agent's `collections_*`/`knowledge_search` tools,
-and the `agnes pull` knowledge artifacts. An instance whose expectation is
+once: the Library (both `/library`'s index and each collection's own
+`/library/{slug}` page — an admin-only-visible row on the index carries a
+"Not shared with you" note, so an admin can tell it apart from an ordinary
+grant at a glance), the chat agent's `collections_*`/`knowledge_search`
+tools, and the `agnes pull` knowledge artifacts. An instance whose expectation is
 "what an admin uploads is for the whole workspace" can opt into
 `library.auto_share_admin_uploads: true` (env
 `AGNES_LIBRARY_AUTO_SHARE_ADMIN_UPLOADS`; default false): a collection an

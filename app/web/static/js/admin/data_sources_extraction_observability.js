@@ -456,6 +456,8 @@ function _extRunRowHtml(connId, st) {
         ${rerunBtn}
         <button type="button" class="btn btn-secondary" onclick="toggleExtractionDrawer('${connId}', 'runs')"
                 ${total ? "" : "disabled"}>Run history (${total})</button>
+        <button type="button" class="btn btn-secondary" onclick="toggleExtractionDrawer('${connId}', 'completeness')"
+                title="Did we really get everything? Compares Graph Search's own document count against what's indexed.">Completeness</button>
         <a class="btn btn-secondary" href="/admin/extraction"
            title="Every connection's crawl and facts extraction on one screen — phase, pace, spend, and what looks stuck.">All connections</a>
       </div>`;
@@ -809,18 +811,39 @@ async function toggleExtractionDrawer(connId, segment) {
   el.dataset.segment = segment;
   el.hidden = false;
   el.innerHTML = `<div class="ds-empty">Loading…</div>`;
-  const path = segment === "config" ? "extraction/config" : "extraction/runs?limit=10";
+  await _extLoadDrawerSegment(connId, segment, el, { refresh: false });
+}
+
+/* `segment`'s data-fetch — split out from `toggleExtractionDrawer` so the
+   Completeness segment's own "Recount" button can re-fetch (with
+   `refresh=true`) and re-render IN PLACE, without going through the
+   open/close toggle above (a recount must not look like closing the
+   drawer). */
+async function _extLoadDrawerSegment(connId, segment, el, { refresh }) {
+  const path = segment === "config"
+    ? "extraction/config"
+    : segment === "completeness"
+      ? `extraction/completeness${refresh ? "?refresh=true" : ""}`
+      : "extraction/runs?limit=10";
   try {
     const r = await fetch(`/api/admin/sharepoint/connections/${encodeURIComponent(connId)}/${path}`, {
       credentials: "include",
     });
     if (r.status === 501) {
-      el.innerHTML = `<div class="ds-empty">Run history needs a Postgres backend — this instance records no extraction runs.</div>`;
+      el.innerHTML = `<div class="ds-empty">This needs a Postgres backend — this instance records no extraction runs.</div>`;
       return;
     }
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const body = await r.json();
-    el.innerHTML = segment === "config" ? _extConfigHtml(body) : _extRunsHtml(connId, body);
+    if (segment === "config") {
+      el.innerHTML = _extConfigHtml(body);
+    } else if (segment === "completeness") {
+      el._completenessBody = body;
+      el.dataset.completenessSort = el.dataset.completenessSort || "desc";
+      el.innerHTML = _extCompletenessHtml(connId, el);
+    } else {
+      el.innerHTML = _extRunsHtml(connId, body);
+    }
   } catch (e) {
     el.innerHTML = `<div class="ds-empty">Couldn't load this ${_extEsc(segment)} — ${_extEsc(e && e.message)}.</div>`;
   }
@@ -950,6 +973,122 @@ function _extConfigHtml(body) {
     <div class="ext-sub">${_extEsc(body.section_lock_reason || "")}</div>
     <div class="ext-sub"><strong>Per scope</strong></div>
     ${scopeBlock}`;
+}
+
+/* ── Drawer: `completeness` segment (TCRD-296 B.9) — "did we really get
+   everything?" One row per confirmed scope, plus (for a single whole-drive
+   scope) one indented row per top-level folder under it, plus a totals
+   line. Sortable by GAP (click the column header) — the rows worth a look
+   float to the top by default. A "Recount" button bypasses the server's
+   10-minute cache. */
+const EXT_COMPLETENESS_STATUS_CLASS = {
+  complete: "badge--success",
+  accounted: "badge--warn",
+  missing: "badge--danger",
+  unknown: "badge--info",
+};
+
+/* `expected`/`gap` are `null` when the count itself could not be resolved
+   (a "site" scope spanning several drives, or a failed Graph lookup) — that
+   MUST render as "—", never as 0, which would read as "zero documents
+   expected" instead of "unknown". Every other completeness field is always
+   a concrete integer. */
+function _extCompletenessNum(n) {
+  return n == null ? "—" : Number(n).toLocaleString();
+}
+
+function _extCompletenessRowHtml(row) {
+  const cls = EXT_COMPLETENESS_STATUS_CLASS[row.status] || "badge--info";
+  const label = row.kind === "folder" ? `<span class="ext-sub">↳</span> ${_extEsc(row.label)}` : `<strong>${_extEsc(row.label)}</strong>`;
+  return `
+    <tr>
+      <td>${label}</td>
+      <td class="ext-num">${_extCompletenessNum(row.expected)}</td>
+      <td class="ext-num">${_extNum(row.indexed)}</td>
+      <td class="ext-num">${_extNum(row.rejected)}</td>
+      <td class="ext-num">${_extNum(row.failed)}</td>
+      <td class="ext-num">${_extNum(row.empty)}</td>
+      <td class="ext-num">${_extNum(row.skipped_unsupported)}</td>
+      <td class="ext-num">${_extNum(row.oversize)}</td>
+      <td class="ext-num">${_extCompletenessNum(row.gap)}</td>
+      <td><span class="badge ${cls}">${_extEsc(row.status)}</span></td>
+    </tr>`;
+}
+
+function _extCompletenessHtml(connId, el) {
+  const body = el._completenessBody || {};
+  const rows = (body.rows || []).slice();
+  const dir = el.dataset.completenessSort === "asc" ? "asc" : "desc";
+  // An unresolved gap (a "site" scope, or a failed Graph lookup) always
+  // sinks to the bottom, regardless of sort direction — it is neither the
+  // biggest nor the smallest gap, it is simply not a number.
+  rows.sort((a, b) => {
+    if (a.gap == null && b.gap == null) return 0;
+    if (a.gap == null) return 1;
+    if (b.gap == null) return -1;
+    return dir === "asc" ? a.gap - b.gap : b.gap - a.gap;
+  });
+  const total = body.total || {};
+  const provisionalNote = body.provisional
+    ? `<div class="ext-sub ext-warn">A crawl is running right now — these numbers are a snapshot mid-crawl.</div>`
+    : "";
+  const cachedNote = body.cached
+    ? `<div class="ext-sub">Cached${body.as_of ? ` as of ${_extEsc(_extTime(body.as_of))}` : ""}.</div>`
+    : "";
+  const caveats = (body.caveats || [])
+    .map((c) => `<div class="ext-sub">note: ${_extEsc(c)}</div>`)
+    .join("");
+  const emptyRow = !rows.length
+    ? `<tr><td colspan="10" class="ds-empty">No confirmed scopes yet.</td></tr>`
+    : "";
+  return `
+    <div class="ext-actions">
+      <button type="button" class="btn btn-secondary" onclick="extRecountCompleteness('${connId}')">Recount</button>
+      <button type="button" class="btn btn-secondary" onclick="extSortCompleteness('${connId}')">
+        Sort by gap: ${dir === "desc" ? "highest first" : "lowest first"}
+      </button>
+    </div>
+    ${provisionalNote}
+    <table class="ext-cfg ext-completeness">
+      <thead>
+        <tr>
+          <th>Scope / folder</th><th>Expected</th><th>Indexed</th><th>Rejected</th>
+          <th>Failed</th><th>Empty</th><th>Skipped</th><th>Oversize</th><th>Gap</th><th>Status</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${rows.map(_extCompletenessRowHtml).join("")}
+        ${emptyRow}
+        <tr class="ext-completeness__total">
+          <td><strong>Total</strong></td>
+          <td class="ext-num">${_extCompletenessNum(total.expected)}</td>
+          <td class="ext-num">${_extNum(total.indexed)}</td>
+          <td class="ext-num">${_extNum(total.rejected)}</td>
+          <td class="ext-num">${_extNum(total.failed)}</td>
+          <td class="ext-num">${_extNum(total.empty)}</td>
+          <td class="ext-num">${_extNum(total.skipped_unsupported)}</td>
+          <td class="ext-num">${_extNum(total.oversize)}</td>
+          <td class="ext-num">${_extCompletenessNum(total.gap)}</td>
+          <td><span class="badge ${EXT_COMPLETENESS_STATUS_CLASS[total.status] || "badge--info"}">${_extEsc(total.status)}</span></td>
+        </tr>
+      </tbody>
+    </table>
+    ${cachedNote}
+    ${caveats}`;
+}
+
+async function extRecountCompleteness(connId) {
+  const el = document.getElementById(`ext-drawer-${connId}`);
+  if (!el) return;
+  el.innerHTML = `<div class="ds-empty">Recounting…</div>`;
+  await _extLoadDrawerSegment(connId, "completeness", el, { refresh: true });
+}
+
+function extSortCompleteness(connId) {
+  const el = document.getElementById(`ext-drawer-${connId}`);
+  if (!el || !el._completenessBody) return;
+  el.dataset.completenessSort = el.dataset.completenessSort === "asc" ? "desc" : "asc";
+  el.innerHTML = _extCompletenessHtml(connId, el);
 }
 
 /* Expanding a card must show its extraction status immediately — not wait

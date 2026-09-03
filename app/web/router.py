@@ -2649,9 +2649,21 @@ async def library_page(
 
     Scope is grant-aware: items you OWN plus anything shared into a group you
     belong to, tagged ``mine`` / ``shared_with_me`` / ``shared_by_me`` so the
-    toolbar can slice by ownership. Deliberately NOT admin god-mode — an admin
-    still sees their own Library, not every item in the instance (the audit
-    view is /admin/access).
+    toolbar can slice by ownership. The grant-backed kinds — data packages,
+    memory domains, recipes, marketplace plugins — stay grant-scoped even for
+    an admin: an admin's OWN Library still only lists what an admin (possibly
+    themselves) has granted a group of theirs, matching ``/admin/access``'s
+    grant model.
+
+    Artefacts are the one exception, matching ``can_access_collection``
+    (``app/auth/access.py``): an admin sees every live collection here, not
+    just the ones they own or were granted, so a live instance where 395 of
+    397 collections sat ungranted no longer reads as "1238 files" to the one
+    person who could actually reach all of them via URL. A collection an
+    admin can only see through admin authority — no ownership, no grant — is
+    tagged ``ownership="admin_visible"`` and carries a "Not shared with you"
+    note in its meta line, so the admin can tell at a glance what an ordinary
+    user in this same Library would NOT see.
 
     Every row carries its real visibility (Private / Shared / Workspace) and,
     for the grant-backed kinds, a Share action writing through
@@ -2675,6 +2687,10 @@ async def library_page(
 
     uid = user.get("id") or ""
     ct = ResourceType.COLLECTION.value
+    # Artefacts get admin god-mode (see the handler docstring); the
+    # grant-backed kinds below do not, so this is read ONCE here and reused
+    # everywhere the artefacts section needs it — never re-derived per row.
+    caller_is_admin = is_user_admin(uid, conn)
 
     # ── What could not be read ────────────────────────────────────────────
     # Every content block below is wrapped so one broken source cannot take the
@@ -2781,9 +2797,15 @@ async def library_page(
     # once — visibility still decided inside the repo, never here.
     _fact_counts: dict = {}
     if facts_repo_ is not None:
-        _visible_ids = [c["id"] for c in _all_cols if c.get("created_by") == uid or c["id"] in granted_to_me]
+        # Admin god-mode widens this to EVERY collection (not just owned or
+        # granted) so an admin-visible-only card's "N facts" is the real
+        # count, never a silent 0 from a set the card-visibility filter below
+        # no longer matches.
+        _visible_ids = [
+            c["id"] for c in _all_cols if caller_is_admin or c.get("created_by") == uid or c["id"] in granted_to_me
+        ]
         try:
-            if is_user_admin(uid, conn):
+            if caller_is_admin:
                 # `count_visible_facts_for_collections` is a Python-level batch
                 # over an exact, per-caller visibility CTE — but that CTE is
                 # still ONE STATEMENT PER COLLECTION (its own docstring says
@@ -2792,7 +2814,7 @@ async def library_page(
                 # `approximate_counts_for_collections` is a single flat
                 # `GROUP BY corpus_id` and is scoped, by its own contract, to
                 # exactly this caller shape — `_readable_ids(caller) is None`
-                # — which `is_user_admin` stands in for without importing the
+                # — which `caller_is_admin` stands in for without importing the
                 # repo's private RBAC resolver here.
                 approx = facts_repo_.approximate_counts_for_collections(_visible_ids)
                 _fact_counts = {cid: counts.get("facts", 0) for cid, counts in approx.items()}
@@ -2845,8 +2867,17 @@ async def library_page(
     try:
         for col in _all_cols:
             owned = col.get("created_by") == uid
-            if not owned and col["id"] not in granted_to_me:
-                continue  # not yours and not shared with you -> invisible here
+            granted = col["id"] in granted_to_me
+            # Admin god-mode (see the handler docstring): a caller who is
+            # neither the owner nor granted access still sees the row when
+            # they are an admin. `admin_only` marks exactly that case, so the
+            # ownership tag and card meta below can label it rather than
+            # silently reading as an ordinary grant.
+            admin_only = False
+            if not owned and not granted:
+                if not caller_is_admin:
+                    continue  # not yours and not shared with you -> invisible here
+                admin_only = True
             # `file_count` is the batched, exact count from `_file_counts` —
             # never `len(files)`. `files` is fetched — one bounded row,
             # `limit=1` — ONLY for the one-file case, to get that file's own
@@ -2881,8 +2912,18 @@ async def library_page(
                     "fact_count": fact_count,
                 }
             )
+            if admin_only:
+                # A user in this same Library would not see this card at
+                # all — say so on the card itself, not just in an audit log
+                # somewhere else, so the admin can tell admin-only visibility
+                # apart from an ordinary grant at a glance.
+                _not_shared_note = "Not shared with you"
+                c["meta_text"] = f"{c['meta_text']} · {_not_shared_note}" if c.get("meta_text") else _not_shared_note
             shared = col["id"] in shared_ids
-            if not owned:
+            if admin_only:
+                ownership = "admin_visible"
+                owner_label = owner_name.get(col.get("created_by"), "Someone")
+            elif not owned:
                 ownership = "shared_with_me"
                 owner_label = owner_name.get(col.get("created_by"), "Someone")
             elif shared:
@@ -4215,8 +4256,10 @@ async def library_page(
     else:
         library_active_tab = _TAB_KNOWLEDGE
 
-    # WHICH emptiness, when there is nothing to list. This page is grant-scoped
-    # and deliberately NOT admin god-mode (see the handler docstring), so a
+    # WHICH emptiness, when there is nothing to list. The grant-backed kinds
+    # this branch is about (data packages, memory, recipes, plugins) stay
+    # grant-scoped and deliberately NOT admin god-mode even for an admin
+    # (see the handler docstring — artefacts are the one exception), so a
     # fully stocked workspace still renders nothing here for a caller no admin
     # has granted anything to. The page had ONE empty state for both cases and
     # it said "your library is empty — upload a file", i.e. it framed the

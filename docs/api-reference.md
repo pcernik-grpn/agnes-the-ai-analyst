@@ -1237,6 +1237,7 @@ DELETE (`?site_id=`) forgets it again.
 - /api/admin/sharepoint/connections/{connection_id}/collections/consolidate
 - /api/admin/sharepoint/connections/{connection_id}/split-plan
 - /api/admin/sharepoint/connections/{connection_id}/splits
+- /api/admin/sharepoint/connections/{connection_id}/splits/merge
 - /api/admin/sharepoint/connections/{connection_id}/certificate
 - /api/admin/sharepoint/connections/{connection_id}/extract
 - /api/admin/sharepoint/extraction/run-due
@@ -1518,6 +1519,58 @@ Returns `{"connections": [{id, name, folders: [{name, documents}],
 documents}], "collection"}`, one connection entry per created clone plus the
 resolved/minted shared target (`null` only for `per_folder_collections`).
 
+`POST …/splits/merge` — CLI: `agnes admin sharepoint split-merge
+<target_id> --sibling <id>... | --all-siblings --target-collection-id <id>
+| --target-name <name> [--execute]`; UI: the source card's overflow menu
+("Merge split parts back into this source…") — the REVERSE of `splits`
+above: folds several sibling SharePoint connections (a large site manually
+split across them, each with its own folder scopes) back into ONE, carrying
+over every sibling's crawl/facts progress so the merged connection resumes
+INCREMENTALLY instead of re-downloading the site. Body
+`{"sibling_ids"|"all_split_siblings", "target": {"collection_id"|"name"},
+"dry_run"?}` — exactly one of `sibling_ids` (explicit connection ids) or
+`all_split_siblings` (every OTHER connection named like this one's own
+split family, `"<base> — part i/n"`, the same convention `POST …/splits`
+establishes) is required, and exactly one of `target.collection_id`/
+`target.name`. `dry_run` defaults to `true`.
+
+Refused BEFORE anything is touched: `404 connection_not_found` (target or
+an explicit sibling); `400 sibling_ids_includes_target` /
+`400 duplicate_sibling_ids`; `409 target_already_merged` /
+`409 sibling_already_merged` (a `config.merged_into` marker from an earlier
+merge); `409 crawl_or_facts_running` (any involved connection has a
+queued/running `corpus-extraction`/`sharepoint-facts-extraction` job);
+`409 acl_zones_present` (a sibling or the target carries `config.acl_zones`
+— permission-zone reconciliation is its own surface and is not folded
+here); `409 audience_class_conflict` (a sibling's `access_mode='mirrored'`
+scopes use a different audience-class vocabulary than the target's own —
+fail closed rather than silently mis-mirror); `409
+collection_referenced_by_other_connection` / `409 consolidation_conflict`
+(the collection fold itself, via the SAME repository `POST …/collections
+/consolidate` uses).
+
+`dry_run: false` performs the real merge, per-step idempotent so a retried
+call after a partial failure converges: folds every involved scope
+collection into the target collection (delegated wholesale to
+`SharePointCollectionConsolidationPgRepository.consolidate` — not
+reimplemented); unions every sibling's crawl/facts state
+(`sharepoint_connection_state`: `delta_links`/`ctags`/`failed_items`/
+`empty_items` for `kind='crawl'`, `docs` for `kind='facts'`) onto the
+target's own — disjoint keys are simply carried over, a genuine collision
+keeps the target's own `delta_links`/`ctags` entry (no per-entry freshness
+signal exists for either) or the newer entry by timestamp for
+`failed_items`/`empty_items`/`docs` (`status='done'` beats any other status
+regardless of timestamp for `docs`); re-points every sibling's
+`extraction_runs` history onto the target, marking each moved run's
+`progress.merged_from`; writes the merged, deduped (by `(source_scope_id,
+drive_id)`) scope list onto the target; marks every sibling
+`config.merged_into` with its scopes cleared — siblings are NEVER deleted,
+only marked merged-away, and their `connection_secrets` vault rows (if any)
+are left completely untouched (an admin who wants to fully remove one can
+still use the generic `DELETE /api/admin/source-connections/{id}`).
+PG-only (A3 ratchet) — `501 requires_postgres_backend` on a DuckDB-backed
+instance.
+
 `POST …/acl-sync` is the admin "sync now" trigger for the
 `sharepoint-acl-sync` job (spec §5.1) — enqueues
 `{"connection_id": connection_id}` and returns `202 {"job_id", "status"}`;
@@ -1771,6 +1824,7 @@ The fleet endpoint two paragraphs down (`.../extraction/runs` with no
 - /api/admin/sharepoint/connections/{connection_id}/extraction/facts-config
 - /api/admin/sharepoint/connections/{connection_id}/extraction/crawl-config
 - /api/admin/sharepoint/connections/{connection_id}/extraction/retry-empty
+- /api/admin/sharepoint/connections/{connection_id}/extraction/completeness
 
 `GET …/extraction/status` returns the live run (if any) and the last completed
 one. Liveness is **derived, never trusted**: a worker killed outright finalizes
@@ -1959,6 +2013,58 @@ scripting a per-connection cost/recall/scope tradeoff — but deliberately not
 MCP-exposed: a fleet-wide operational status read and a connection's
 retry/crawl policy are all operator decisions, not query surfaces any agent
 needs.
+
+`GET …/extraction/completeness` (TCRD-296 synthesis item B.9) answers "did we
+really get everything?" — the same question an operator's ad hoc script
+answered once by hand, promoted to a read-only surface. One row per confirmed
+scope (and, only when the connection has exactly one WHOLE-DRIVE scope and no
+others, one additional row per top-level folder under it — see
+`connectors.sharepoint.completeness`'s module docstring for the full
+attribution rules), plus a `total` row:
+
+```
+{expected, indexed, rejected, failed, empty, skipped_unsupported, oversize,
+ gap, status}
+```
+
+`expected` is a live Graph Search count (`IsDocument:1`, narrowed to
+convertible formats via the crawler's own unsupported-extension set) under
+the scope/folder's `web_url` — the SAME mechanism `…/split-plan` uses, never
+a delta walk. `indexed`/`rejected` come from `corpus_files.processing_status`
+in the scope's own collection. `failed`/`empty`/`skipped_unsupported`/
+`oversize` come from the persisted crawl state
+(`sharepoint_connection_state(kind="crawl")`) — exact for a single-scope
+connection, best-effort attributed for a multi-scope one (a "site" scope
+spanning several drives cannot resolve a single `expected` count at all,
+and reads `status: "unknown"` rather than a misleading 0). `gap = expected -
+indexed - failed - empty - skipped_unsupported - oversize`; `status` is
+`"complete"` (indexed already covers expected), `"accounted"` (a gap exists
+but every missing document has a recorded reason), `"missing"` (an
+unexplained gap), or `"unknown"` (expected itself could not be resolved).
+Any attribution shortcut taken for this particular connection is named in
+the response's own `caveats` list, never silent.
+
+`min_modified` (`YYYY-MM-DD`, `400 invalid_min_modified` otherwise) defaults
+to the connection's own resolved crawl cutoff (`resolve_min_modified` — same
+`{value, source}` shape as `…/extraction/config`) so "expected" matches the
+population the last crawl actually attempted; an explicit query param
+overrides it. Cached per `(connection_id, resolved min_modified)` for 10
+minutes (`cached: true/false` in the response) — one Graph Search call per
+scope/folder, so a repeat open of the drawer must not re-fan-out;
+`?refresh=true` bypasses and repopulates the cache. `provisional: true` when
+a `corpus-extraction` job is currently queued/running for this connection —
+the numbers are still returned, just flagged as a snapshot mid-crawl.
+Answers on BOTH app-state backends (no `extraction_runs` read — crawl state,
+`corpus_files` and the job queue are all backend-agnostic). `404` for an
+unknown/non-SharePoint connection; the same `409`/`502` `…/split-plan` raises
+when the connection's certificate is unresolved or Graph rejects the token
+exchange (skipped entirely for a connection with no confirmed scope — nothing
+to count against, so no token is ever requested). Audited as
+`sharepoint_connection.completeness_read`, same disclosure class as
+`split_plan_read`. CLI: `agnes admin sharepoint completeness <connection_id>
+[--min-modified <date>] [--refresh] [--json]`, rows sorted by `gap`
+descending. Deliberately not MCP-exposed — an admin/ops display primitive
+over live Graph data, same reasoning as `…/split-plan`.
 
 ### `/api/admin/ontology` — Ontology builder (spec 2026-08-27 §13.2)
 

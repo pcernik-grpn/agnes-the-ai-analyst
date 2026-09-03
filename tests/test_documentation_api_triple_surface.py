@@ -1310,6 +1310,19 @@ _EXEMPT: dict[str, str] = {
         "exemption with scopes/bulk's collection-minting exemption, both already "
         "carved out above"
     ),
+    # The reverse of `splits` above — folds several sibling connections'
+    # scopes, crawl/facts state, collections and run history back into one.
+    # Same CLI-reachable / not-MCP-exposed shape: an ops-scripting-a-large-
+    # site action combining collection-consolidate's own visibility-write
+    # exemption with clone/splits' connection-lifecycle one, neither
+    # agent-invokable today.
+    "/api/admin/sharepoint/connections/{connection_id}/splits/merge": (
+        "fold several sibling SharePoint connections (a manually split site) back into "
+        "one, carrying over crawl/facts state and folding scope collections — "
+        "CLI-reachable (agnes admin sharepoint split-merge) but deliberately not "
+        "MCP-exposed: combines collections/consolidate's visibility-write exemption "
+        "with clone/splits' connection-lifecycle one, both already carved out above"
+    ),
     "/api/admin/sharepoint/connections/{connection_id}/manual-sites": (
         "persist/forget a site the admin resolved by URL — the Sites.Selected escape "
         "hatch's other half, keeping the wizard's step-2 sites level populated across "
@@ -1429,6 +1442,17 @@ _EXEMPT: dict[str, str] = {
     "/api/admin/sharepoint/connections/{connection_id}/extraction/config": (
         "read-only effective extraction configuration with per-leaf origins for the "
         "source card's config drawer — admin display primitive, no analyst CLI/MCP analogue"
+    ),
+    # Completeness check (TCRD-296 B.9) — "did we really get everything?":
+    # per-scope/per-folder Graph Search document counts vs. what actually
+    # landed in the corpus. Same class as split-plan above: CLI-reachable
+    # (`agnes admin sharepoint completeness`) for an operator scripting the
+    # same check over SSH, but deliberately not MCP-exposed — an admin/ops
+    # display primitive over live Graph data, not an analyst query surface.
+    "/api/admin/sharepoint/connections/{connection_id}/extraction/completeness": (
+        "per-scope/per-folder expected-vs-indexed document counts (Graph Search fan-out) "
+        "for the completeness drawer — CLI-reachable (agnes admin sharepoint completeness) "
+        "but deliberately not MCP-exposed, same reasoning as split-plan above"
     ),
     # Cooperative stop for the same card's Stop button (owner-frustration fix,
     # 2026-09-01) — an admin-only control over the SAME crawl the trigger
