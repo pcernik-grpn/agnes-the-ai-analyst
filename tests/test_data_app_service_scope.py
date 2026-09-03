@@ -324,8 +324,7 @@ def test_mint_service_token_uses_the_stack_surface(client):
     record = access_token_repo().get_by_id(token_id)
     assert record is not None, "the token row must exist after minting"
     assert record["surface"] == "stack", (
-        "a service token minted without surface='stack' lets an admin-owned "
-        "data app bypass every table access policy"
+        "a service token minted without surface='stack' lets an admin-owned data app bypass every table access policy"
     )
 
 
@@ -345,8 +344,7 @@ def test_admin_owned_service_token_does_not_bypass_access_policies(client):
 
     principal = {"id": "u1", "email": "owner@test.com", "credential_surface": "stack"}
     assert _is_admin_bypass(principal) is False, (
-        "an admin-owned data app's service token must be filtered by access "
-        "policies, not admin-bypass them"
+        "an admin-owned data app's service token must be filtered by access policies, not admin-bypass them"
     )
 
 
@@ -365,7 +363,6 @@ def test_documented_allowlist_names_exist():
     guard whose message names the wrong fix.
     """
     import re
-
     from pathlib import Path
 
     import app.auth.pat_resolver as mod
