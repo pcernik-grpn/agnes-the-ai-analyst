@@ -310,7 +310,15 @@ duplicated here:
 |---|---|---|
 | `row_rules` | array, optional | `[{"column", "op", "value"}]` — `op` is one of `in_caller_groups`, `eq_caller_email`, `eq_caller_id`, `eq`, `in` |
 | `row_combine` | string, optional | `"and"` (default) or `"or"` |
-| `column_masks` | object, optional | `{column: "show"\|"hide"\|"nullify"\|"hash"\|"unmask"}` — `"unmask"` takes `{"choice": "unmask", "groups": ["..."]}` (single-group `"group"` is still accepted) |
+| `column_masks` | object, optional | `{column: "show"\|"hide"\|"nullify"\|"hash"\|"unmask"\|"last4"\|"email_partial"}` — `"unmask"` takes `{"choice": "unmask", "groups": ["..."]}` (single-group `"group"` is still accepted) |
+
+`last4` (`****6789`) and `email_partial` (`j*****@example.com`) are **text-only** partial
+masks: same output column name, same `VARCHAR` type, a fixed-width asterisk run (one that
+tracked the value's length would publish that length). Both fail closed at the edges — a
+value of four characters or fewer, or an address with no `@`, is redacted whole rather
+than half-revealed, and `NULL` stays `NULL`. On a non-text column the compile is refused
+(`422 policy_compile_invalid_spec`) rather than silently casting the output to text; use
+`nullify`, `hash` or `hide` there.
 
 ```bash
 curl -s -X POST \
@@ -325,9 +333,12 @@ curl -s -X POST \
 #  "warnings": []}
 ```
 
-`warnings` carries what the compiler had to say about the spec — a column it did not
-recognize and dropped, or a spec that filters and masks nothing at all. A spec it cannot
-understand (an unknown `op` or mask) returns `422 policy_compile_invalid_spec`.
+`warnings` carries what the compiler had to say about the spec — a **mask** on a column it
+did not recognize and dropped, or a spec that filters and masks nothing at all. A spec it
+cannot understand (an unknown `op` or mask) returns `422 policy_compile_invalid_spec`, and
+so does a **row rule** on an unrecognized column: dropping that one is fail-open (the
+policy would lose its `WHERE` clause, or quietly widen beside a surviving rule) where
+dropping a mask is not, so it is refused with the column and operator named.
 
 This endpoint never persists anything — it only returns SQL text. Save it the same way
 as any hand-written policy: `PUT /api/admin/registry/{table_id}` with the returned `sql`

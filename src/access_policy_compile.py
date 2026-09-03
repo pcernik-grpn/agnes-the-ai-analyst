@@ -14,6 +14,12 @@ source of truth. Its hard invariants:
 3. ``unmask`` masks preserve the original column type for allowed groups and
    return ``'*****'`` for text-like columns / ``NULL`` for all other types when
    the caller is not in any allowed group.
+4. Every mask is **type-preserving** and keeps the column's own output name, so
+   attaching a policy never changes what ``DESCRIBE`` (and therefore
+   ``agnes schema``, the catalog, and the effective-schema surfaces) reports.
+   The partial masks (``last4``, ``email_partial``) are string surgery and buy
+   this by being text-only: on any other column type the compile is refused
+   rather than quietly casting the output to text.
 
 Pure and HTTP-free so it unit-tests without a request and can be reused by the
 CLI later.
@@ -31,13 +37,25 @@ The spec shape (all keys optional except ``table``)::
 ``ROW_OP`` is one of ``in_caller_groups`` (row's column is one of the caller's
 live groups), ``eq_caller_email`` / ``eq_caller_id`` (self-owned rows), ``eq``
 / ``in`` (literal match). ``MASK`` is ``show`` | ``hide`` | ``nullify`` |
-``hash`` | ``unmask`` (``unmask`` needs a ``group`` or ``groups`` list). Unknown
-columns are dropped with a warning rather than reaching the SQL.
+``hash`` | ``unmask`` | ``last4`` | ``email_partial`` (``unmask`` needs a
+``group`` or ``groups`` list; ``last4`` and ``email_partial`` are text-only and
+carry no group allowlist of their own).
 
 ``columns`` is the table's real column list from a DESCRIBE; each entry may be
 a column name string, a ``(name, type)`` tuple, or a ``{"name": ..., "type": ...}``
-dict. Anything the spec references that is not in the list is dropped with a
-warning.
+dict.
+
+A spec reference to a column the table does not have is handled by which way it
+fails, not by a single blanket rule:
+
+* a **mask** on an unknown column is dropped with a warning -- fail-closed,
+  because the projection is assembled from ``columns`` only, so that column is
+  never projected at all and there is no plaintext copy the dropped mask was
+  meant to cover;
+* a **row rule** on an unknown column raises ``ValueError`` -- dropping it is
+  fail-OPEN, since a spec whose only rule names a since-renamed column would
+  compile to a WHERE-less policy handing every caller the whole table (and a
+  dropped rule beside a surviving one silently widens the policy instead).
 """
 
 from __future__ import annotations
@@ -56,6 +74,31 @@ _ID_TOKENS = {
 
 # DuckDB types that should be treated as text for the unmask fallback.
 _TEXT_TYPE_KEYWORDS = ("VARCHAR", "TEXT", "STRING")
+
+# ---------------------------------------------------------------------------
+# Partial masks (`last4`, `email_partial`). Every constant below ends up in the
+# emitted SQL, so each is named once here rather than spelled inline.
+#
+# The asterisk runs are deliberately a FIXED width, never one derived from the
+# value: a redaction whose length tracked the original's would publish that
+# length, which for a national id or an account number is often most of what is
+# left to guess. Both expressions stay inside the save-time validator's existing
+# function allowlist (`src/access_policy_validate.py`) -- CASE, LENGTH, CONCAT,
+# SUBSTRING, REGEXP_REPLACE and LIKE -- on purpose: a new mask kind must not
+# widen what an admin's arbitrary policy SQL may do on every analyst request.
+_LAST4_KEEP = 4
+_LAST4_PREFIX = "****"
+_EMAIL_LOCAL_REDACTION = "*****"
+# Matches the local part of an address, anchored at the start, with NO capture
+# group. Backreference spelling is the one place the three engines genuinely
+# disagree (DuckDB `\1`, BigQuery `\\1`, Databricks `$1`), and `REGEXP_EXTRACT`
+# reads its third argument as a position on BigQuery but a group index on
+# Databricks -- a group-free `REGEXP_REPLACE` to the empty string sidesteps both.
+_EMAIL_LOCAL_PART_PATTERN = "^[^@]*"
+# At least one character, then an `@`. A value that fails this -- no `@` at all,
+# an empty local part, or the empty string -- is redacted whole rather than
+# partially, so the mask never half-reveals a value it cannot properly split.
+_EMAIL_SHAPE_PATTERN = "_%@%"
 
 
 @dataclass
@@ -153,6 +196,54 @@ def _masked_fallback(col_type: str) -> str:
     return f"CAST(NULL AS {col_type})"
 
 
+def _last4_expr(q: str) -> str:
+    """Keep the last four characters, replace everything before them with a
+    fixed asterisk run (``123456789`` -> ``****6789``).
+
+    The explicit ``IS NULL`` arm is load-bearing: DuckDB's ``CONCAT`` treats NULL
+    as the empty string, so without it a NULL would surface as the mask string
+    ``'****'`` -- a real-looking value where there is none. The ``LENGTH <= 4``
+    arm is what stops a short value from being echoed back whole, and it also
+    confines the negative ``SUBSTRING`` start to the length range where DuckDB,
+    BigQuery and Databricks agree exactly.
+    """
+    return (
+        f"CASE WHEN {q} IS NULL THEN NULL "
+        f"WHEN LENGTH({q}) <= {_LAST4_KEEP} THEN {_sql_literal(_LAST4_PREFIX)} "
+        f"ELSE CONCAT({_sql_literal(_LAST4_PREFIX)}, SUBSTRING({q}, -{_LAST4_KEEP})) END"
+    )
+
+
+def _email_partial_expr(q: str) -> str:
+    """``john.doe@example.com`` -> ``j*****@example.com``.
+
+    The domain survives verbatim -- that is the point of the mask (an analyst can
+    still segment by domain) and also its limit: this is a partial mask, not
+    anonymization, and on a small domain the surviving first character can be
+    enough to re-identify. The ``IS NULL`` arm comes first because ``NULL LIKE
+    ...`` is NULL, which would otherwise fall through to the ELSE and turn a NULL
+    into ``'*****'``.
+    """
+    redaction = _sql_literal(_EMAIL_LOCAL_REDACTION)
+    kept_domain = f"REGEXP_REPLACE({q}, {_sql_literal(_EMAIL_LOCAL_PART_PATTERN)}, '')"
+    return (
+        f"CASE WHEN {q} IS NULL THEN NULL "
+        f"WHEN {q} LIKE {_sql_literal(_EMAIL_SHAPE_PATTERN)} "
+        f"THEN CONCAT(SUBSTRING({q}, 1, 1), {redaction}, {kept_domain}) "
+        f"ELSE {redaction} END"
+    )
+
+
+# Masks that are string surgery and therefore text-only. Applying one to a
+# numeric/temporal/composite column would have to either CAST (silently changing
+# the output column's type, which every DESCRIBE-based schema surface downstream
+# then reports) or emit nonsense, so the compiler refuses instead.
+_TEXT_ONLY_MASKS = {
+    "last4": _last4_expr,
+    "email_partial": _email_partial_expr,
+}
+
+
 def _predicate(rule: dict) -> str:
     col = quote_ident(rule["column"])
     op = rule.get("op")
@@ -210,6 +301,14 @@ def compile_policy(spec: dict, columns: Sequence[Any]) -> CompiledPolicy:
             fallback = _masked_fallback(col_type)
             expr = f"CASE WHEN {_unmask_condition(groups)} THEN {q} ELSE {fallback} END AS {q}"
             derived.append(col)
+        elif choice in _TEXT_ONLY_MASKS:
+            if not _is_text_type(col_type):
+                raise ValueError(
+                    f"mask {choice!r} applies to text columns only; column {col!r} is {col_type} "
+                    "-- use 'nullify', 'hash' or 'hide' for a non-text column"
+                )
+            expr = f"{_TEXT_ONLY_MASKS[choice](q)} AS {q}"
+            derived.append(col)
         else:
             raise ValueError(f"unknown mask: {choice!r}")
         masked_exprs[col] = expr
@@ -225,10 +324,20 @@ def compile_policy(spec: dict, columns: Sequence[Any]) -> CompiledPolicy:
         # Fail closed: a policy that would project nothing cannot become `SELECT *`.
         raise ValueError("policy would select no columns; leave at least one column visible")
 
-    rules = [r for r in (spec.get("row_rules") or []) if r.get("column") in known]
-    dropped_rules = [r for r in (spec.get("row_rules") or []) if r.get("column") not in known]
-    for r in dropped_rules:
-        warnings.append(f"unknown column ignored: {r.get('column')}")
+    # Fail closed on a row rule whose column the table does not have. Dropping it
+    # (the previous behaviour) is the one unknown-column case that fails OPEN:
+    # with the rule gone the compiled body either loses its WHERE clause
+    # entirely -- handing every caller the whole table -- or, beside a surviving
+    # rule, quietly widens to a broader row set than the admin authored. Neither
+    # is visible in the generated SQL, which is why a warning is not enough here.
+    rules = list(spec.get("row_rules") or [])
+    for r in rules:
+        if r.get("column") not in known:
+            raise ValueError(
+                f"row rule references unknown column {r.get('column')!r} (op {r.get('op')!r}); "
+                "dropping it would widen the policy, so fix or remove the rule "
+                "-- the column may have been renamed or removed upstream"
+            )
 
     where = ""
     if rules:

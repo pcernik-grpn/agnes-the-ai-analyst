@@ -122,18 +122,55 @@ def test_unmask_empty_allowlist_always_masks():
     assert 'CASE WHEN FALSE THEN "email" ELSE \'*****\' END AS "email"' in out.sql
 
 
-def test_unknown_columns_are_dropped_with_a_warning():
+def test_unknown_mask_columns_are_dropped_with_a_warning():
+    """A mask on a column the table no longer has is fail-CLOSED, so dropping
+    it with a warning is safe: the projection is assembled from the DESCRIBEd
+    column list only, so a column the mask names but the table does not have
+    is never projected in the first place -- there is no plaintext copy left
+    behind for the dropped mask to have covered."""
     spec = {
         "table": "invoices",
-        "row_rules": [{"column": "does_not_exist", "op": "in_caller_groups"}],
+        "row_rules": [],
         "row_combine": "and",
         "column_masks": {"ghost": "hide"},
     }
     out = compile_policy(spec, COLS)
-    # neither the unknown row rule nor the unknown mask reaches the SQL
-    assert "does_not_exist" not in out.sql
     assert "ghost" not in out.sql
     assert any("ghost" in w for w in out.warnings)
+
+
+def test_unknown_row_rule_column_is_refused_not_dropped():
+    """A row rule on an unknown column is fail-OPEN if dropped: a spec whose
+    only rule references a renamed column would compile to a WHERE-less
+    policy that hands every caller the whole table. Refuse the compile
+    instead, naming the column and the op so the admin can fix the rule."""
+    spec = {
+        "table": "invoices",
+        "row_rules": [{"column": "does_not_exist", "op": "in_caller_groups"}],
+        "row_combine": "and",
+        "column_masks": {},
+    }
+    with pytest.raises(ValueError) as exc:
+        compile_policy(spec, COLS)
+    assert "does_not_exist" in str(exc.value)
+    assert "in_caller_groups" in str(exc.value)
+
+
+def test_unknown_row_rule_column_is_refused_even_beside_a_valid_rule():
+    """The whole-table failure mode needs only ONE surviving rule to hide it:
+    a dropped rule beside a kept one silently WIDENS the policy instead of
+    emptying the WHERE clause, which is harder to notice, not easier."""
+    spec = {
+        "table": "invoices",
+        "row_rules": [
+            {"column": "cost_center", "op": "in_caller_groups"},
+            {"column": "renamed_away", "op": "eq_caller_email"},
+        ],
+        "row_combine": "and",
+        "column_masks": {},
+    }
+    with pytest.raises(ValueError, match="renamed_away"):
+        compile_policy(spec, COLS)
 
 
 def test_eq_and_in_row_ops_use_literals():
@@ -386,3 +423,188 @@ def test_a_column_definition_outside_a_type_is_still_refused():
     stray = list(ddl.find_all(exp.ColumnDef))
     assert stray, "expected a ColumnDef in a CREATE TABLE"
     assert not any(_is_inside_data_type(d) for d in stray)
+
+
+# ── Partial masks: `last4` and `email_partial` ─────────────────────────────
+#
+# Both are TEXT-ONLY, type-preserving (VARCHAR in -> VARCHAR out, same output
+# column name) and expressed entirely within the save-time validator's existing
+# function allowlist -- no widening of `_ALLOWED_FUNCTION_NAMES` was needed, and
+# none is acceptable: every name added there widens what an admin's arbitrary
+# SQL may do on every analyst request.
+
+_LAST4_SQL = (
+    'CASE WHEN "national_id" IS NULL THEN NULL '
+    'WHEN LENGTH("national_id") <= 4 THEN \'****\' '
+    'ELSE CONCAT(\'****\', SUBSTRING("national_id", -4)) END AS "national_id"'
+)
+
+_EMAIL_PARTIAL_SQL = (
+    'CASE WHEN "email" IS NULL THEN NULL '
+    'WHEN "email" LIKE \'_%@%\' '
+    'THEN CONCAT(SUBSTRING("email", 1, 1), \'*****\', REGEXP_REPLACE("email", \'^[^@]*\', \'\')) '
+    "ELSE '*****' END AS \"email\""
+)
+
+
+def test_last4_mask_sql_snapshot():
+    spec = {
+        "table": "invoices",
+        "row_rules": [],
+        "row_combine": "and",
+        "column_masks": {"national_id": "last4"},
+    }
+    out = compile_policy(spec, COLS)
+    assert _LAST4_SQL in out.sql
+    # The masked column is projected exactly once -- no plaintext sibling.
+    assert out.sql.count('"national_id"') == _LAST4_SQL.count('"national_id"')
+    assert out.excluded == ["national_id"]
+    assert out.derived == ["national_id"]
+
+
+def test_email_partial_mask_sql_snapshot():
+    spec = {
+        "table": "invoices",
+        "row_rules": [],
+        "row_combine": "and",
+        "column_masks": {"email": "email_partial"},
+    }
+    out = compile_policy(spec, COLS)
+    assert _EMAIL_PARTIAL_SQL in out.sql
+    assert out.sql.count('"email"') == _EMAIL_PARTIAL_SQL.count('"email"')
+    assert out.excluded == ["email"]
+    assert out.derived == ["email"]
+
+
+@pytest.mark.parametrize("choice", ["last4", "email_partial"])
+def test_partial_masks_refuse_non_text_columns(choice):
+    """Both masks are string surgery. Applying one to a BIGINT/DOUBLE/STRUCT
+    column would either change the output column's type (breaking the
+    compiler's type-preservation invariant, which downstream `DESCRIBE`-based
+    schema surfaces depend on) or silently CAST -- so it is refused at compile
+    time, naming the column and its type, exactly like an unknown mask."""
+    cols = COLS + [{"name": "tags", "type": "VARCHAR[]"}]
+    for col in ("invoice_id", "amount_eur", "tags"):
+        spec = {"table": "invoices", "row_rules": [], "row_combine": "and", "column_masks": {col: choice}}
+        with pytest.raises(ValueError) as exc:
+            compile_policy(spec, cols)
+        assert col in str(exc.value)
+        assert choice in str(exc.value)
+
+
+@pytest.mark.parametrize("choice", ["last4", "email_partial"])
+def test_partial_masks_pass_the_real_validator_including_remote(choice):
+    from src.access_policy_validate import validate_policy_sql
+
+    spec = {
+        "table": "invoices",
+        "row_rules": [{"column": "cost_center", "op": "in_caller_groups"}],
+        "row_combine": "and",
+        "column_masks": {"email": choice, "national_id": choice},
+    }
+    out = compile_policy(spec, COLS)
+    for for_remote in (False, True):
+        validate_policy_sql(
+            out.sql,
+            table_id="invoices",
+            table_name="invoices",
+            mapping_table_names=set(),
+            for_remote=for_remote,
+        )
+
+
+def _run(sql: str, values: list):
+    """Execute a compiled policy body over an in-memory single-column table."""
+    import duckdb
+
+    conn = duckdb.connect()
+    try:
+        conn.execute('CREATE TABLE "invoices" ("email" VARCHAR, "national_id" VARCHAR)')
+        conn.executemany('INSERT INTO "invoices" VALUES (?, ?)', [(v, v) for v in values])
+        return [r[0] for r in conn.execute(sql).fetchall()]
+    finally:
+        conn.close()
+
+
+def test_last4_executes_on_duckdb_with_the_documented_edge_cases():
+    """`****1234` for a long value; a value of four characters or fewer is
+    fully redacted rather than shown whole; NULL stays NULL (a CONCAT-only
+    form would turn it into `****`, since DuckDB's CONCAT ignores NULLs)."""
+    spec = {
+        "table": "invoices",
+        "row_rules": [],
+        "row_combine": "and",
+        "column_masks": {"national_id": "last4", "email": "hide"},
+    }
+    out = compile_policy(spec, [{"name": "email", "type": "VARCHAR"}, {"name": "national_id", "type": "VARCHAR"}])
+    values = ["123456789", "abcde", "abcd", "abc", "", None]
+    assert _run(out.sql, values) == ["****6789", "****bcde", "****", "****", "****", None]
+
+
+def test_email_partial_executes_on_duckdb_with_the_documented_edge_cases():
+    """First character, a FIXED five-asterisk run (a run that tracked the local
+    part's length would leak that length), then the domain verbatim. Anything
+    without a local part AND an `@` is fully redacted -- never partially."""
+    spec = {
+        "table": "invoices",
+        "row_rules": [],
+        "row_combine": "and",
+        "column_masks": {"email": "email_partial", "national_id": "hide"},
+    }
+    out = compile_policy(spec, [{"name": "email", "type": "VARCHAR"}, {"name": "national_id", "type": "VARCHAR"}])
+    values = ["john.doe@example.com", "a@b.co", "no-at-sign", "@example.com", "", None]
+    assert _run(out.sql, values) == [
+        "j*****@example.com",
+        "a*****@b.co",
+        "*****",
+        "*****",
+        "*****",
+        None,
+    ]
+
+
+def test_partial_masks_transpile_to_both_remote_engines():
+    """Tripwire on the ACTUAL remote form, not just "it transpiles".
+
+    Both masks were chosen for expressions whose semantics are identical on
+    all three engines: a negative `SUBSTRING` start counts from the end on
+    DuckDB, BigQuery and Databricks alike, and the `REGEXP_REPLACE` pattern
+    carries no capture group, so none of the three engines' incompatible
+    backreference spellings (`\\1` / `\\\\1` / `$1`) or `REGEXP_EXTRACT`
+    group-index conventions can be reached. If a sqlglot upgrade starts
+    emitting a different shape, this fails loudly instead of silently
+    changing what a remote caller sees.
+    """
+    import sqlglot
+
+    spec = {
+        "table": "invoices",
+        "row_rules": [],
+        "row_combine": "and",
+        "column_masks": {"email": "email_partial", "national_id": "last4"},
+    }
+    out = compile_policy(spec, [{"name": "email", "type": "VARCHAR"}, {"name": "national_id", "type": "VARCHAR"}])
+
+    bq = sqlglot.transpile(out.sql, read="duckdb", write="bigquery")[0]
+    assert bq == (
+        "SELECT CASE WHEN `email` IS NULL THEN NULL WHEN `email` LIKE '_%@%' "
+        "THEN CONCAT(COALESCE(SUBSTRING(`email`, 1, 1), ''), '*****', "
+        "COALESCE(REGEXP_REPLACE(`email`, '^[^@]*', ''), '')) ELSE '*****' END AS `email`, "
+        "CASE WHEN `national_id` IS NULL THEN NULL WHEN LENGTH(`national_id`) <= 4 THEN '****' "
+        "ELSE CONCAT('****', COALESCE(SUBSTRING(`national_id`, -4), '')) END AS `national_id` "
+        "FROM `invoices`"
+    )
+
+    dbx = sqlglot.transpile(out.sql, read="duckdb", write="databricks")[0]
+    assert dbx == (
+        "SELECT CASE WHEN `email` IS NULL THEN NULL WHEN `email` LIKE '_%@%' "
+        "THEN CONCAT(COALESCE(SUBSTRING(`email`, 1, 1), ''), '*****', "
+        "COALESCE(REGEXP_REPLACE(`email`, '^[^@]*', ''), '')) ELSE '*****' END AS `email`, "
+        "CASE WHEN `national_id` IS NULL THEN NULL WHEN LENGTH(`national_id`) <= 4 THEN '****' "
+        "ELSE CONCAT('****', COALESCE(SUBSTRING(`national_id`, -4), '')) END AS `national_id` "
+        "FROM `invoices`"
+    )
+    # Neither remote form may reach for a backreference or a group index.
+    for form in (bq, dbx):
+        assert "REGEXP_EXTRACT" not in form.upper()
+        assert "\\1" not in form and "$1" not in form
