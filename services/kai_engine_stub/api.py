@@ -193,8 +193,11 @@ SCENARIOS: dict[str, list[dict]] = {
     # six consecutive calls, THREE of them failing, before the answer's first
     # sentence. Nothing else here reproduces it — every other scenario puts
     # prose between its tool calls — and it is the shape the tool-call group
-    # exists for. The last failure names an internal endpoint on purpose: that
-    # URL must reach the reader as text, never as a link.
+    # exists for. The last failure carries the shape a REAL query error has
+    # now that `_raise_for_status_with_detail` no longer interpolates the
+    # request URL: status, then the DuckDB error the reader can act on. The
+    # `everything` scenario keeps a URL-bearing error so the renderer's
+    # never-a-link rule still has a subject to be tested against.
     "wall": [
         _tool_call("call_w1", "fact_search", {"q": "AI roadmap building products", "limit": 20}),
         _tool_error("call_w1", "Error executing tool fact_search: 404: facts_disabled"),
@@ -207,7 +210,8 @@ SCENARIOS: dict[str, list[dict]] = {
         _tool_call("call_w5", "Bash", {"command": 'agnes query "SELECT COUNT(*) FROM engagements"'}),
         _tool_error(
             "call_w5",
-            "Error executing tool query: 400 Bad Request for http://localhost:8000/api/query",
+            "Error executing tool query: 400 Bad Request — Query error: Binder Error: "
+            'Referenced column "engagement_count" not found in FROM clause!',
         ),
         _tool_call("call_w6", "Bash", {"command": "agnes catalog --json"}),
         _tool_output("call_w6", {"columns": ["id", "rows"], "rows": [["engagements", 812]]}),
@@ -260,6 +264,24 @@ SCENARIOS: dict[str, list[dict]] = {
         _tool_error("call_bad", "Catalog Error: Table with name nope does not exist!"),
         _text("\n\nThat table does not exist — check `agnes catalog`."),
         {"type": "finish"},
+    ],
+    # The counterpart to `wall`: a run whose failures the agent never answered
+    # through. Nothing follows it but the engine dying, so the group keeps its
+    # alert — this is the case the alert is FOR, and the pair is what makes
+    # "recovered" a distinction rather than a way to hide every failure.
+    "broke": [
+        _text("Let me pull the numbers.\n\n"),
+        _tool_call("call_b1", "query", {"sql": "SELECT * FROM fct_revenue"}),
+        _tool_error(
+            "call_b1",
+            "Error executing tool query: 400 Bad Request — Query error: Catalog Error: Table with name fct_revenue does not exist!",
+        ),
+        _tool_call("call_b2", "query", {"sql": "SELECT * FROM revenue"}),
+        _tool_error(
+            "call_b2",
+            "Error executing tool query: 400 Bad Request — Query error: Catalog Error: Table with name revenue does not exist!",
+        ),
+        {"type": "error", "errorText": "upstream model overloaded"},
     ],
     "approval": [
         _text("This one needs your sign-off.\n\n"),

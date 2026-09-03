@@ -83,13 +83,44 @@ _NEXT_ACTIONS_OPEN_RE = re.compile(r"```next_actions[ \t]*\r?\n", re.IGNORECASE)
 #: One claim per line: `kind: ref`. Anything else in the block is ignored
 #: rather than treated as an error — a stray blank line or a comment must not
 #: cost the reader the whole block.
-_CLAIM_RE = re.compile(r"^\s*(table|metric|assumption)\s*:\s*(.+?)\s*$", re.IGNORECASE)
+_CLAIM_RE = re.compile(r"^\s*(table|metric|document|assumption)\s*:\s*(.+?)\s*$", re.IGNORECASE)
 
 #: Claim kinds that name something the agent should have touched, and can
 #: therefore be checked. `assumption` is free text about the analyst's own
 #: choices — there is nothing to check it against, and pretending otherwise
 #: would render every honest assumption as "unverified".
-VERIFIABLE_KINDS = frozenset({"table", "metric"})
+#:
+#: ``document`` joined the two SQL-shaped kinds because the vocabulary having
+#: no word for a file is what pushed citations into ``assumption:``. An answer
+#: built on the fact graph rests on neither a table nor a metric, so its only
+#: legal slot was the one kind nothing checks: observed in the wild as five
+#: ``assumption:`` lines carrying PDF filenames and engagement ids, each
+#: badged "origin not stated" (no origin in :data:`ASSUMPTION_ORIGINS` means
+#: "a source document"), under a row reading "Sources — none declared" —
+#: true by this module's own definition and absurd above five named files.
+#: The last of those lines said it outright: *"No SQL tables queried — this
+#: answer is sourced entirely from the document fact graph"*, a model
+#: reporting a schema mismatch through the only channel it had.
+VERIFIABLE_KINDS = frozenset({"table", "metric", "document"})
+
+#: Floor on a needle this module DERIVES from a claim (a document's basename,
+#: its extensionless stem) rather than one the answer wrote. Peeling is meant
+#: as latitude for a citation spelled differently from the tool output — not
+#: as a rubber stamp, and below a few characters it becomes one: `document:
+#: docs/` peels to a basename of ``""``, which is a substring of every
+#: haystack ever built, and `document: a.pdf` peels to ``"a"``, which is a
+#: substring of essentially any serialized tool call. Both verified against
+#: turns that touched nothing.
+#:
+#: That is the one direction this module must not err in. Accepting too much
+#: is elsewhere the safe failure (see :func:`_tool_call_haystack`) precisely
+#: because a false "verified" costs the reader nothing they did not already
+#: have — but a needle that matches everything is not leniency, it is the
+#: badge asserting a check that never happened. The ref the answer actually
+#: wrote is still matched in full at any length; only the guesses have a
+#: floor. Four characters: shorter than that and a filename fragment is
+#: likelier to appear inside unrelated JSON than to be the document's name.
+_MIN_DERIVED_NEEDLE = 4
 
 #: Where an assumption came from — the closed vocabulary the workspace prompt
 #: asks for on an ``assumption:`` line's ``origin:`` segment. Closed on
@@ -200,7 +231,7 @@ def _split_assumption(ref: str) -> tuple[str, Optional[str], Optional[str]]:
 
 @dataclass(frozen=True)
 class SourceClaim:
-    kind: str  # "table" | "metric" | "assumption"
+    kind: str  # "table" | "metric" | "document" | "assumption"
     ref: str
     #: None for kinds that carry nothing to check (see VERIFIABLE_KINDS).
     verified: Optional[bool] = None
@@ -393,6 +424,22 @@ def verify(claims: list[SourceClaim], tool_calls: Optional[Iterable[Any]]) -> li
         needles = [ref]
         if c.kind == "metric" and "/" in ref:
             needles.append(ref.rsplit("/", 1)[-1])
+        # A document is cited by whatever the agent saw it called, and the
+        # fact tools do not agree with each other on that: `fact_claims`
+        # names the file, a collections listing carries a path in front of
+        # it, and a distillate may drop the extension. All three are the same
+        # citation, so a directory prefix and a trailing extension are peeled
+        # in turn — same latitude, and the same direction of error, as the
+        # metric case above. Peeling is order-dependent (basename first, then
+        # its stem) so `collections/x/a.pdf` reaches `a`.
+        if c.kind == "document":
+            base = ref.rsplit("/", 1)[-1]
+            stem = base.rsplit(".", 1)[0]
+            # Every derived needle goes through the floor (see
+            # _MIN_DERIVED_NEEDLE) — a trailing slash peels to "" and a
+            # one-letter stem to "a", and either would verify every claim
+            # against every turn.
+            needles.extend(n for n in (base, stem) if n != ref and len(n) >= _MIN_DERIVED_NEEDLE)
         out.append(SourceClaim(kind=c.kind, ref=c.ref, verified=any(n in haystack for n in needles)))
     return out
 

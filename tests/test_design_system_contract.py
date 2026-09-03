@@ -1625,6 +1625,168 @@ def test_data_table_wrap_disables_sticky_thead() -> None:
     )
 
 
+# ── Every admin table that ends in verbs pins that column ────────────────
+# An off-screen DESTINATION is recoverable — scroll back to it, or read the
+# header you scrolled past. An off-screen ACTION is simply unavailable, and
+# it is always the last column, so it is always what a cut table takes
+# first. Every admin table whose final column holds the row's verbs
+# therefore carries `.data-table--pinned-actions`; the class does nothing
+# until the table is actually cut, so pinning one that always fits costs
+# nothing and stops a narrow window from hiding the verb.
+_LAST_TH_RE = re.compile(r"<table\b([^>]*)>(.*?)</thead>", re.DOTALL)
+_TH_RE = re.compile(r"<th[^>]*>(.*?)</th>", re.DOTALL)
+_STRIP_RE = re.compile(r"<[^>]+>|\s+")
+
+
+def test_every_admin_table_ending_in_verbs_pins_that_column() -> None:
+    offenders: list[str] = []
+    for path in sorted(TEMPLATES.glob("admin_*.html")) + [TEMPLATES / "data_apps.html"]:
+        src = path.read_text(encoding="utf-8")
+        for m in _LAST_TH_RE.finditer(src):
+            heads = _TH_RE.findall(m.group(2))
+            if not heads:
+                continue
+            last = _STRIP_RE.sub(" ", heads[-1]).strip().lower()
+            # "Open" is data_apps' verb; the blank header on /admin/chat and
+            # /admin/initial-workspace labels a control column too, but a
+            # blank string is also what a checkbox or a chevron column uses,
+            # so only the named ones are enforced here.
+            if last not in ("actions", "action", "open"):
+                continue
+            if "data-table--pinned-actions" not in m.group(1):
+                offenders.append(f"{path.name}: last column {last!r} is not pinned")
+    assert not offenders, (
+        "an admin table ends in the row's verbs without "
+        "`data-table--pinned-actions`, so a narrow window hides the one thing "
+        "scrolling cannot recover:\n  " + "\n  ".join(offenders)
+    )
+
+
+def test_a_fixed_layout_admin_table_has_a_width_floor() -> None:
+    """`table-layout: fixed` divides whatever width it is given, so without a
+    floor a narrow window does not scroll — it CRUSHES. Measured on
+    /admin/users at 900px before this: "DATA ACCESS" overlapping "LAST
+    PULL", "DEACTIVATED" cut mid-word, and no scrollbar anywhere because
+    nothing technically overflowed. A floor turns that back into a scroll,
+    which the wrap and the pinned column are built for."""
+    for name, selector in (
+        ("admin_users.html", "#users-table"),
+        ("admin_tables.html", "#adminTablesFlat"),
+        ("admin_data_packages.html", ".adp-table"),
+    ):
+        src = (TEMPLATES / name).read_text(encoding="utf-8")
+        block = src[src.index(selector + " { table-layout: fixed") :][:120]
+        assert "min-width" in block, (
+            f"{name}: {selector} is `table-layout: fixed` with no min-width — a "
+            "narrow window will crush its columns instead of scrolling"
+        )
+
+
+# ── The edge cue: a cut table has to SAY it is cut ───────────────────────
+# The scrollbar the rules above paint sits under the LAST ROW, so on a
+# twelve-row table it is hundreds of pixels below the reader's eye and on a
+# long list off-screen entirely — a table cut mid-column looked complete
+# (/admin/data-packages at a 900px window simply had no "Shared with").
+# `js/table_scroll_cue.js` marks the wrap `is-cue-left` / `is-cue-right` for
+# whichever side still has content behind it; these three guards pin that the
+# JS is loaded globally, that each class draws something, and that a pinned
+# actions column is never the thing that fades.
+_CUE_MASK_RE = re.compile(
+    r"\.data-table-wrap\.is-cue-left,\s*"
+    r"\.data-table-wrap\.is-cue-right:not\(:has\(\.data-table--pinned-actions\)\)\s*\{"
+    r"[^}]*mask-image[^}]*\}",
+    re.DOTALL,
+)
+_CUE_SHADOW_RE = re.compile(
+    r"\.data-table-wrap\.is-cue-right\s+\.data-table--pinned-actions[^{]*\{"
+    r"[^}]*box-shadow[^}]*\}",
+    re.DOTALL,
+)
+
+
+def test_the_scroll_cue_script_is_loaded_for_every_page() -> None:
+    """The wrap is shared by ten admin pages and none should have to opt in —
+    so the cue rides `_app_scripts.html`, not a per-page `head_extra`."""
+    scripts = (TEMPLATES / "_app_scripts.html").read_text(encoding="utf-8")
+    assert "js/table_scroll_cue.js" in scripts, (
+        "table_scroll_cue.js is not in _app_scripts.html — the is-cue-* classes "
+        "would be set on no page, and a cut table would again say nothing"
+    )
+
+
+def test_a_cut_edge_fades_and_an_uncut_one_does_not() -> None:
+    """Both fade sides ride ONE mask declaration keyed on two custom
+    properties: an uncut side resolves to `0px`, which collapses its two
+    colour stops onto the same offset and draws nothing."""
+    css = (STATIC / "style-custom.css").read_text(encoding="utf-8")
+    assert _CUE_MASK_RE.search(css), (
+        "no `is-cue-*` mask rule in style-custom.css — the wrap's cut edge draws "
+        "no fade, so the only affordance is again the scrollbar under the last row"
+    )
+    assert "--dtw-fade-left: 0px" in css and "--dtw-fade-right: 0px" in css, (
+        "the fade custom properties have no 0px resting value — an uncut edge "
+        "would fade as though content were hidden behind it"
+    )
+
+
+_CUE_BAND_RE = re.compile(
+    r"\.data-table-wrap\.is-cue-right \.data-table--pinned-actions[^{]*::before[^{]*\{"
+    r"[^}]*right:\s*100%[^}]*\}",
+    re.DOTALL,
+)
+
+
+def test_the_pinned_column_shows_content_dissolving_under_it() -> None:
+    """The shadow says "raised", which a reader can take for chrome. What says
+    "the table continues beneath this" is the neighbouring column's text
+    fading into the pinned column's own background — a band on the pinned
+    cell (not a mask on the wrap, which would take the button with it), so it
+    travels down every row at any scroll offset. That travelling is the whole
+    point: the scrollbar can be a screen and a half below the reader."""
+    css = (STATIC / "style-custom.css").read_text(encoding="utf-8")
+    assert _CUE_BAND_RE.search(css), (
+        "no `is-cue-right` ::before band left of the pinned column — the only cue "
+        "left is a shadow, which measured as too quiet to read on screen"
+    )
+    # The band fades to the cell's ACTUAL colour, which differs in `thead`, at
+    # rest and on hover — a guessed colour shows as a seam the moment a row is
+    # hovered. So the variable is declared beside each background it tracks.
+    assert css.count("--dtw-pin-bg: var(") >= 3, (
+        "--dtw-pin-bg is not declared beside all three pinned-cell background "
+        "declarations (thead, rest, hover) — the slide-under band would fade to "
+        "the wrong colour in at least one state"
+    )
+
+
+def test_a_pinned_actions_column_is_shadowed_and_never_faded() -> None:
+    """The mask applies to sticky children too, so fading the right edge of a
+    table with pinned actions would fade out precisely the button the pin
+    exists to keep on screen. That side states the same fact with a shadow."""
+    css = (STATIC / "style-custom.css").read_text(encoding="utf-8")
+    shadow_rule = _CUE_SHADOW_RE.search(css)
+    assert shadow_rule, (
+        "no `is-cue-right` box-shadow on `.data-table--pinned-actions` — a pinned "
+        "column would sit flush over hidden table with nothing to say so"
+    )
+    # An INSET layer, which is the one that always works. The outer shadow and
+    # the slide-under band both paint over the NEIGHBOURING column, so both are
+    # only as visible as whatever happens to be in it — reported from a width
+    # where the neighbour was Category, holding "—" and one short word per row:
+    # white fading into white space, saying nothing. An inset shadow is drawn
+    # on the pinned column's own background, so it reads at every width and
+    # over every neighbour.
+    assert "inset" in shadow_rule.group(0), (
+        "the pinned column's cue has no inset layer — it paints only over the "
+        "neighbouring column, so it vanishes wherever that column is blank"
+    )
+    mask_rule = _CUE_MASK_RE.search(css)
+    assert mask_rule and ":not(:has(.data-table--pinned-actions))" in mask_rule.group(0), (
+        "the fade is not excluded for a table with pinned actions — the mask "
+        "would fade the pinned button itself, which is the one thing that has "
+        "to stay legible while the rest scrolls"
+    )
+
+
 # Every admin page whose `<th>` inline-styled its own right alignment instead
 # of using `.num` — the class style-custom.css already defines for a
 # right-aligned/mono/tabular-nums column and that `admin_moderation_hub.html`
