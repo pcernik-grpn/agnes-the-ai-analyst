@@ -1182,6 +1182,25 @@
   {% include "_page_hero.html" %}
   {% include "_admin_tabs.html" %}
 
+  {# You arrived from the package builder, which parked your draft and sent
+     you for a source it could not hand you itself. Say so, and give the way
+     back: without this the trip is one-way by feel, and an admin two clicks
+     into a warehouse credential has no reason to believe the half-written
+     package still exists. Unhidden by the deep-link block at the foot of
+     this page — `from` is only ever compared against a literal and the href
+     is a constant, so the untrusted param cannot steer the navigation. #}
+  <div class="apg-strip" id="ds-from-package" hidden>
+    <span aria-hidden="true">{{ ico.icon('package', 16) }}</span>
+    <div>
+      <strong>You were building a data package.</strong>
+      Connect what you need here — the draft is kept, and any tables you register
+      land in it already added.
+    </div>
+    <span class="apg-strip__end">
+      <a href="/admin/data-packages/new">Back to the package</a>
+    </span>
+  </div>
+
   {% if not vault_key_configured %}
   {# The shared context strip in its warn state (`.apg-strip`, admin_page.css),
      not a page-local banner: this is the same object People's identity strip
@@ -1906,6 +1925,15 @@
 <script src="{{ static_url('js/components/group_drawer.js') }}" defer></script>
 <script>
 const API_CONNECTIONS = "/api/admin/source-connections";
+
+/* Set when the package builder sent us here (?from=package-builder). It
+   changes exactly one thing: the wizard stops after registering tables and
+   hands them back, instead of walking on into Bundle and Share. Those two
+   steps BUILD A DATA PACKAGE — offering them to an admin who is already
+   half-way through building one is the duplication that made this trip feel
+   broken in the first place. Read near the foot of this script, where the
+   deep-link block parses the query string. */
+let _fromPackageBuilder = false;
 const API_REGISTER_TABLE = "/api/admin/register-table";
 
 // Error text for a failed register-table call. `register-table` answers a
@@ -6161,6 +6189,15 @@ document.getElementById("ds-wizard-register-btn").addEventListener("click", asyn
   try {
     const result = await _registerStepTwo();
     if (!result || !result.ok.length) return; // per-row statuses say why
+    /* Came from the package builder: the tables are registered, which is all
+       it needed, so go back to it. It works out which ones are new by
+       diffing the registry against what it saw before it left, so there is
+       nothing to hand over in the URL and nothing here to keep in step with
+       it. */
+    if (_fromPackageBuilder) {
+      window.location.href = "/admin/data-packages/new";
+      return;
+    }
     if (!_wizardBoard) {
       _wizardTables = result.ok;
       _seedBoard("one");
@@ -6331,7 +6368,28 @@ loadConnections().then(() => {
   // instance that cannot store a secret filled in the whole form behind a
   // banner that had already told them it would fail, and the attempt left a
   // credential-less connection row behind.
-  if (new URLSearchParams(window.location.search).has("add")) {
+  const _params = new URLSearchParams(window.location.search);
+  // The builder's round trip. Equality against a literal, so the param
+  // decides only whether a constant-href strip is shown.
+  if (_params.get("from") === "package-builder") {
+    _fromPackageBuilder = true;
+    const back = document.getElementById("ds-from-package");
+    if (back) back.hidden = false;
+    /* Say what the flow actually is on this entry: two steps, and the
+       primary names where the tables are going. A strip advertising Bundle
+       and Share that this entry never reaches is a map of somewhere else. */
+    document.querySelectorAll("#ds-wizard-overlay .ds-drawer__step").forEach((el) => {
+      if (Number(el.dataset.wstep) > 2) el.hidden = true;
+    });
+    const reg = document.getElementById("ds-wizard-register-btn");
+    if (reg) reg.textContent = "Add selected tables to your package";
+    const early = document.getElementById("ds-wizard-finish-early-btn");
+    if (early) {
+      early.textContent = "Register only";
+      early.title = "Register the selected tables and stay here — your package keeps waiting.";
+    }
+  }
+  if (_params.has("add")) {
     const addBtn = document.getElementById("ds-add-btn");
     if (addBtn && addBtn.disabled) {
       const strip = document.querySelector(".apg-strip--warn[role='alert']");

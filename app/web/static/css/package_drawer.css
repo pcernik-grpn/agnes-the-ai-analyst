@@ -276,3 +276,45 @@
   outline: var(--ds-focus-outline);
   outline-offset: var(--ds-focus-outline-offset);
 }
+
+/* ── "Connect a source", the way out of an empty registry ──────────────
+   Rendered in three places by package_drawer.js — under the table list,
+   inside the picker's empty state and in the picker's foot — so it is one
+   look rather than three. A BUTTON that reads as a link: the action is a
+   navigation, but it has to park the draft first, so it cannot be an <a>. */
+.pdw-connect {
+    font: inherit;
+    padding: 0;
+    border: 0;
+    background: none;
+    color: var(--ds-primary);
+    font-weight: 600;
+    cursor: pointer;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+}
+
+.pdw-connect:hover,
+.pdw-connect:focus-visible {
+    color: var(--ds-primary-dark);
+}
+
+/* The standing version, under the table list. Quiet — it sits below a list
+   the admin is usually happy with, and shouts only when the count beside it
+   is the thing that explains why their table is missing. */
+.pdw-connectline {
+    display: flex;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin: 8px 0 0;
+    font-size: 12.5px;
+    color: var(--ds-text-muted);
+}
+
+.pdw-connectline__q { color: var(--ds-text-secondary); }
+
+.pdw-connectline__n {
+    margin-left: auto;
+    font-variant-numeric: tabular-nums;
+}

@@ -97,6 +97,57 @@
   }
 
   /* URL-safe identifier, same normalisation the server's seed step uses. */
+  /* ── The draft, for the connect detour ────────────────────────────────
+     A package does not exist until Create, and this component has never had
+     anywhere to park one — the comment on `bindConversation`'s back button
+     still says "there is no draft store here to preserve". That was true
+     while leaving was always a decision to abandon. It stops being true the
+     moment the builder itself sends you somewhere: connecting a source is a
+     trip the admin does not choose so much as discover they need, and it can
+     stall for a day on credentials somebody else owns.
+
+     Same shape as mcp_builder.js's draft (`agnes_mcp_builder_draft_v1`):
+     localStorage, create-mode only, soft-fail on quota. */
+  var DRAFT_KEY = 'agnes_pkg_builder_draft_v1';
+
+  function persistDraft(reason) {
+    if (!st || st.mode !== 'create' || !els) return;
+    try {
+      window.localStorage.setItem(DRAFT_KEY, JSON.stringify({
+        reason: reason,
+        name: els.name.value,
+        slug: els.slug.value,
+        desc: els.desc.value,
+        status: els.status.value,
+        category: els.category.value,
+        tables: Array.from(st.tablesSelected),
+        /* Every table id the registry held when we left. Diffing it on the
+           way back is what lets the trip's registrations come back ALREADY
+           TICKED without this component knowing anything about the wizard
+           that did the registering. */
+        knownTables: (st.registry || []).map(function (t) { return t.id; }),
+        conv: conv,
+      }));
+    } catch (e) { /* quota or private mode — the trip just costs the draft */ }
+  }
+
+  function readDraft() {
+    try {
+      var raw = window.localStorage.getItem(DRAFT_KEY);
+      if (!raw) return null;
+      var d = JSON.parse(raw);
+      /* ONLY a draft parked by the connect detour comes back. A builder
+         abandoned last week resurrecting itself over a fresh start is a
+         surprise, not a convenience — and it would quietly re-propose tables
+         someone had decided against. */
+      return (d && d.reason === 'connect') ? d : null;
+    } catch (e) { return null; }
+  }
+
+  function discardDraft() {
+    try { window.localStorage.removeItem(DRAFT_KEY); } catch (e) { /* ignore */ }
+  }
+
   function slugify(name) {
     return (name || '').toLowerCase()
       .replace(/[^a-z0-9]+/g, '-')
@@ -364,6 +415,10 @@
       // A click on the group's checkbox must not also open/close the <details>
       // it lives in the <summary> of.
       if (e.target.closest('.pdw-grp__box')) { e.stopPropagation(); return; }
+      // The picker's own connect route — its empty state and its foot both
+      // offer one. Checked before the close handlers so the navigation is
+      // not swallowed by the backdrop test below.
+      if (e.target.closest('[data-pdw-connect]')) { leaveToConnect(); return; }
       if (e.target.closest('[data-ag-pick-close]')) { closePicker(); return; }
       // Outside the card but inside the overlay — the standard way out.
       if (e.target.hasAttribute && e.target.hasAttribute('data-ag-pick-backdrop')) closePicker();
@@ -372,6 +427,7 @@
     els.tables.addEventListener('click', function (e) {
       if (!st) return;
       if (e.target.closest('[data-pdw-openpick]')) { openPicker(); return; }
+      if (e.target.closest('[data-pdw-connect]')) { leaveToConnect(); return; }
       var rm = e.target.closest('[data-pdw-unpick]');
       if (rm) {
         st.tablesSelected.delete(rm.getAttribute('data-pdw-unpick'));
@@ -586,6 +642,76 @@
     }).length;
   }
 
+  /* Back from the connect trip. The fields return verbatim; the TABLES
+     return with whatever the trip registered already ticked, worked out by
+     diffing the live registry against the ids that existed when we left. So
+     the hand-back needs nothing from the connect flow and cannot drift with
+     it — a connector added later is carried for free. */
+  function applyDraft(d) {
+    els.name.value = d.name || '';
+    els.slug.value = d.slug || '';
+    els.desc.value = d.desc || '';
+    if (d.status) els.status.value = d.status;
+    els.category.value = d.category || '';
+    // A slug that no longer follows the name was edited by hand; keep it off
+    // the auto-derive path, exactly as `applyMode('edit')` does.
+    st.slugTouched = !!(d.slug && d.slug !== slugify(d.name || ''));
+    (d.tables || []).forEach(function (id) { st.tablesSelected.add(id); });
+
+    var known = {};
+    (d.knownTables || []).forEach(function (id) { known[id] = 1; });
+    var fresh = (st.registry || []).filter(function (t) { return !known[t.id]; });
+    fresh.forEach(function (t) { st.tablesSelected.add(t.id); });
+
+    if (Array.isArray(d.conv) && d.conv.length) { conv = d.conv; renderConv(); }
+
+    st.returnNote = fresh.length
+      ? 'Back in your package, and the ' + (fresh.length === 1 ? 'table' : fresh.length + ' tables') +
+        ' you just registered ' + (fresh.length === 1 ? 'is' : 'are') + ' added below.'
+      : 'Back in your package — nothing you typed was lost. Nothing new was registered, ' +
+        'so there is nothing to add yet.';
+    syncSubmitGate();
+    renderTables();
+  }
+
+  /* Leave for the connect flow. The draft is the only thing holding what has
+     been typed, so it is parked BEFORE navigating, never after. `from` tells
+     /admin/data-sources to offer the way back. */
+  function leaveToConnect() {
+    persistDraft('connect');
+    window.location.href = '/admin/data-sources?add=1&from=package-builder';
+  }
+
+  /* The way out of "the table I want is in a source nobody has connected".
+     OUTSIDE the picker deliberately: an admin usually knows the source is
+     missing BEFORE they go browsing for its tables, and an affordance that
+     exists only inside the browse modal is one they have to guess at. It
+     says how many sources exist either way, because "connect a source" on an
+     instance with four of them reads as a mistake unless it does. */
+  function connectHintHtml() {
+    if (!st) return '';
+    var n = (st.connections || []).length;
+    var pool = (st.registry || []).length;
+    /* The strong version only when the package genuinely cannot be filled —
+       nothing registered AND nothing connected. Keying it on the connection
+       count alone claimed "there is nothing a package can carry" on an
+       instance whose internal tables (audit, sessions, telemetry) were
+       registered and packageable the whole time. */
+    if (!pool && !n) {
+      return '<p class="ag-note">No data source is connected, so there is nothing a package ' +
+        'can carry yet. <button type="button" class="pdw-connect" data-pdw-connect>Connect a ' +
+        'source</button></p>';
+    }
+    return '<p class="pdw-connectline">' +
+      '<span class="pdw-connectline__q">Missing a table?</span> ' +
+      '<button type="button" class="pdw-connect" data-pdw-connect>Connect a source</button>' +
+      // No count when there is nothing to count — "0 sources connected"
+      // beside an offer to connect one is the sentence saying itself twice.
+      (n ? '<span class="pdw-connectline__n">' + n +
+        (n === 1 ? ' source connected' : ' sources connected') + '</span>' : '') +
+      '</p>';
+  }
+
   function renderTables() {
     if (!st) return;
     var rows = selectedTables();
@@ -595,11 +721,23 @@
       // agents.html → .ag-slot): a bold line naming the state, one sentence
       // on how to leave it, then the add row. A one-line grey sentence reads
       // as a caption on a broken list rather than as an invitation.
-      body = '<div class="ag-slot">' +
-        '<p class="ag-slot-head">Nothing in it yet.</p>' +
-        '<p class="ag-slot-body">Say what it should carry — “our sales pipeline tables” — ' +
-        'and the builder proposes them. Or add them by hand.</p>' +
-      '</div>';
+      // With an empty registry there is nothing to propose FROM, so the
+      // invitation to describe it would be a promise the instance cannot
+      // keep. Name the actual state instead. The test is the REGISTRY, not
+      // the connection count: internal tables are registered on every
+      // instance and are perfectly packageable.
+      body = (st.registry || []).length
+        ? '<div class="ag-slot">' +
+            '<p class="ag-slot-head">Nothing in it yet.</p>' +
+            '<p class="ag-slot-body">Say what it should carry — “our sales pipeline tables” — ' +
+            'and the builder proposes them. Or add them by hand.</p>' +
+          '</div>'
+        : '<div class="ag-slot">' +
+            '<p class="ag-slot-head">No source to draw from yet.</p>' +
+            '<p class="ag-slot-body">A package carries registered tables, and this instance has ' +
+            'no data source connected. Connect one and its tables become available here — ' +
+            'the name and description you have written are kept while you do.</p>' +
+          '</div>';
     } else {
       body = '<div class="ag-rows">' + rows.map(function (t) {
         // Dedupe: for an internal table the project, the source type and the
@@ -621,8 +759,11 @@
         '</div>';
       }).join('') + '</div>';
     }
-    els.tables.innerHTML = body +
-      '<button type="button" class="ag-addrow" data-pdw-openpick>+ Add tables</button>';
+    els.tables.innerHTML =
+      (st.returnNote ? '<p class="ag-note">' + esc(st.returnNote) + '</p>' : '') +
+      body +
+      '<button type="button" class="ag-addrow" data-pdw-openpick>+ Add tables</button>' +
+      connectHintHtml();
     if (els.tablesLabel) {
       var count = els.tablesLabel.querySelector('.pdw-count');
       if (!count) {
@@ -655,7 +796,20 @@
   function pickerRowsHtml() {
     var projects = tableGroups();
     if (!projects.length) {
-      return '<p class="ag-emptyrows">No table matches that.</p>';
+      /* Three different states used to share one sentence. "No table matches
+         that" over an instance with an EMPTY registry reads as a broken
+         search — the admin never searched, and the message sends them looking
+         for a filter to clear that does not exist. */
+      if (st && st.registry && st.registry.length) {
+        return '<p class="ag-emptyrows">No table matches that.</p>';
+      }
+      var n = (st && st.connections ? st.connections.length : 0);
+      return '<p class="ag-emptyrows">' + (n
+        ? 'No tables are registered yet from the ' +
+          (n === 1 ? 'connected source' : n + ' connected sources') +
+          '. Register them in <a href="/admin/tables">Tables</a>, or '
+        : 'No data source is connected, so there is nothing to add. ') +
+        '<button type="button" class="pdw-connect" data-pdw-connect>connect a source</button>.</p>';
     }
     var searching = !!(pickerQuery || '').trim();
     var html = projects.map(function (p) {
@@ -773,7 +927,12 @@
       total: total,
       rows: pickerRowsHtml(),
       controls: pickerControlsHtml(),
-      foot: 'Not here? Register it in <a href="/admin/tables">Tables</a> first.',
+      // Two different "not here" causes, so two different answers: the table
+      // exists upstream but is unregistered, or its source was never
+      // connected at all. Offering only the first left the second as a
+      // dead end the admin had to leave the builder to work out.
+      foot: 'Not here? Register it in <a href="/admin/tables">Tables</a>, or ' +
+        '<button type="button" class="pdw-connect" data-pdw-connect>connect a source</button>.',
     });
   }
 
@@ -867,9 +1026,11 @@
       var reg = res[1];
       var conns = res[2];
       var connName = {};
-      (Array.isArray(conns) ? conns : (conns.connections || conns.items || [])).forEach(function (c) {
+      var connList = Array.isArray(conns) ? conns : (conns.connections || conns.items || []);
+      connList.forEach(function (c) {
         if (c && c.id) connName[c.id] = c.name || c.id;
       });
+      st.connections = connList.filter(function (c) { return c && c.id; });
       st.registry = (Array.isArray(reg) ? reg : (reg.tables || [])).map(function (t) {
         return {
           id: t.id, name: t.name || t.id, bucket: t.bucket || '',
@@ -904,6 +1065,13 @@
                              packaged: true, rows: 0, last_sync: '' });
         }
       });
+      if (st.pendingDraft) {
+        var d = st.pendingDraft;
+        st.pendingDraft = null;
+        discardDraft();
+        applyDraft(d);
+        return;
+      }
       renderTables();
     }).catch(function (e) {
       els.tables.innerHTML = '<p class="ds-drawer__hint">Could not load tables: ' + esc(e.message) + '</p>';
@@ -1181,6 +1349,16 @@
       skipShareWarning: false,
       grantsOriginal: new Map(),
       registry: [],
+      // The instance's source connections, already on the wire for the
+      // project headings (see hydrateTables). Kept because "how many sources
+      // exist" is the difference between "register the table you want" and
+      // "nothing can go in a package yet", and the panel has to say which.
+      connections: [],
+      // Restored on the way back from connecting a source; applied once the
+      // registry lands, since the tick-what-is-new diff needs it.
+      pendingDraft: mode === 'create' ? readDraft() : null,
+      // What to say about that return trip, rendered above the table list.
+      returnNote: '',
       tablesOriginal: new Set(),
       tablesSelected: new Set(),
       restoreFocus: document.activeElement,
@@ -1278,9 +1456,12 @@
      collide with a builder page underneath. */
   function bindConversation(root) {
     root.addEventListener('click', function (e) {
-      /* The shell's back button is this drawer's close. Nothing is lost by
-         leaving — the package does not exist until Create, and there is no
-         draft store here to preserve — so it does not confirm. */
+      /* The shell's back button is this drawer's close, and it still does
+         not confirm. There IS a draft store now (see DRAFT_KEY), but it is
+         deliberately not consulted here: parking a draft is for a detour the
+         builder sent you on, while Back is the admin saying they are done
+         with this package. Restoring one over an explicit Cancel is how a
+         builder starts arguing with the person using it. */
       if (e.target.closest('[data-ag-back]')) {
         // On a page there is nothing to close — leaving means navigating.
         if (st && st.backHref) window.location.href = st.backHref;
@@ -1616,6 +1797,10 @@
         Promise.allSettled(grantCalls),
         Promise.allSettled(tableCalls),
       ]).then(function (settled) {
+        // The package exists from here on, whatever the grant/table calls
+        // did. A draft that outlived its own create would offer to build a
+        // duplicate on the next visit.
+        discardDraft();
         function rejected(r) { return r.status === 'rejected'; }
         var failures = settled[0].filter(rejected).length;
         var tableFailures = settled[1].filter(rejected).length;
