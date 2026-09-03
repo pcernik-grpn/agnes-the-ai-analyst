@@ -1225,8 +1225,10 @@ _EXEMPT: dict[str, str] = {
     # scheduler sweep, not an analyst query surface.
     "/api/admin/sharepoint/connections/{connection_id}/extract": (
         "admin-triggered one-off run of the existing corpus-extraction job kind — "
-        "admin/scheduler maintenance op, mirrors the run-corporate-memory exemption; "
-        "no analyst CLI/MCP analogue"
+        "admin/scheduler maintenance op, mirrors the run-corporate-memory exemption. "
+        "CLI-reachable (agnes admin sharepoint extract, the operator's route to the "
+        "per-run resync/force_reprocess options without a browser) but deliberately "
+        "not MCP-exposed, same cost-surface reasoning as facts-extract below"
     ),
     "/api/admin/sharepoint/extraction/run-due": (
         "scheduler-driven sweep firing corpus-extraction for every due SharePoint "

@@ -1330,7 +1330,11 @@ never gets a job that fails 30+ minutes later in a worker; `409
 facts_extraction_already_running` when one is already queued/running for
 this connection (its own idempotency key, distinct from every other kind's
 — a facts-extraction trigger never dedups against a crawl, an ACL sync or a
-subtree sweep). CLI: `agnes admin sharepoint facts-extract <connection_id>`.
+subtree sweep). The `facts_extraction_disabled` body also names the config
+key that is off in `switch` (`extraction.facts.enabled` or `facts.enabled`).
+CLI: `agnes admin sharepoint facts-extract <connection_id>`; UI: the source
+card's **Extract facts now** button (next to **Run extraction now**), which
+renders disabled with that same reason while either switch is off.
 
 The exclusion
 handoff (`AGNES_SP_EXCLUDED_SUBTREE_IDS`, carried by the `corpus-extraction`
@@ -1530,7 +1534,14 @@ currently being downloaded/converted/ingested (any of several under
 concurrency) and `recent` is the last up to 5 completed items
 (`{path, outcome}`) — so the card can show what the crawl is touching right
 now instead of only aggregate counters. `activity` is `null`/absent on older
-rows and on a finished run (nothing left in flight).
+rows and on a finished run (nothing left in flight). `facts_job` is the
+queued/running standalone facts pass for this connection
+(`{id, status, created_at, started_at}`) or `null` — a job, never a run: the
+`sharepoint-facts-extraction` pass opens no `extraction_runs` row, so it is
+read off the job queue (matched on the same idempotency key the trigger
+dedups on) and never appears in `running`/`last_completed`. The card shows
+it as a "facts pass queued/running" line in the Run row and locks its own
+"Extract facts now" button while one is in flight.
 
 `GET …/extraction/runs` (`?limit=`, ≤100) lists runs newest-first with a
 `total` covering every recorded run; `GET …/extraction/runs/{run_id}` adds the

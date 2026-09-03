@@ -29,6 +29,15 @@
 // js/components/chat_row_menu.js, shared with chat.js so both renderers offer
 // the identical set. Rename goes through PUT /api/chat/sessions/{id}/title.
 //
+// The feed is re-fetched from `window.railChatHistory.reload()`, which is how
+// ANOTHER page tells the rail its own state moved. /chats archives, restores,
+// pins, renames and deletes conversations while the rail is on screen beside it
+// and updates its own rows in place (a reload there would throw away the search
+// and filters the caller used to find the row) — with nothing exposed here, an
+// archived conversation went on sitting in the rail's Pinned shelf until the
+// next full page load. The rail's OWN actions have always re-fetched; this is
+// the same call, reachable from outside.
+//
 // Loaded with `defer` (not a module) from the rail partial, gated on can_chat.
 (function () {
   "use strict";
@@ -419,4 +428,10 @@
   }
 
   load();
+
+  // See the note at the top of this file: the one hook another page needs to
+  // keep this feed honest. Merged into whatever the rail already published
+  // rather than assigned, so the sections API above survives (and so the order
+  // of the two blocks stops mattering).
+  window.railChatHistory = Object.assign(window.railChatHistory || {}, { reload: load });
 })();
