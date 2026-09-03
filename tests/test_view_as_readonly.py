@@ -689,7 +689,7 @@ class TestTheModeCanActuallyEngage:
         assert "session_matches_viewer(" in src
         # The retired inline copy: its own verify_token call and its own
         # bare requirement of the cookie.
-        assert "payload.get(\"sub\")" not in src
+        assert 'payload.get("sub")' not in src
         assert 'session_token = request.cookies.get("access_token")' not in src
 
     def test_binding_is_possible_needs_a_credential_to_bind_to(self, monkeypatch) -> None:
@@ -1212,3 +1212,46 @@ def test_the_real_admin_can_still_exit_and_it_is_audited(va):
 
     rows, _ = audit_repo().query(user_id=ADMIN, action="view_as.end", limit=50)
     assert len(rows) == 1, "the genuine admin's exit is still recorded on their trail"
+
+
+def test_the_configured_identity_fallback_is_off_outside_dev_mode(monkeypatch):
+    """The one line the whole fallback's safety rests on, tested unmocked.
+
+    Every other test of this fallback monkeypatches `local_dev_viewer_id`, so
+    they pin what its CONSUMERS do with an answer — not that the function
+    itself refuses to answer off dev mode. That gap is worth closing here
+    rather than trusting the guard by reading it, because the function it
+    delegates to does NOT check the mode: `_get_local_dev_user` says "when
+    LOCAL_DEV_MODE is on, else None" in its docstring but its body just looks
+    the configured address up and returns whatever it finds. So
+    `is_local_dev_mode()` inside `local_dev_viewer_id` is the ONLY thing
+    standing between a deployment that happens to hold an account at
+    `get_local_dev_email()` and a `session_matches_viewer` that accepts a
+    ticket carrying no verifiable session at all.
+
+    Removing that check leaves every existing view-as test green — which is
+    the definition of an untested security boundary.
+    """
+    from app.auth import view_as as va_mod
+
+    # Dev mode off (the deployed case) — the answer is None even when the
+    # lookup underneath would happily return a user.
+    monkeypatch.setattr(va_mod, "local_dev_viewer_id", va_mod.local_dev_viewer_id)
+    monkeypatch.setattr("app.auth.dependencies.is_local_dev_mode", lambda: False)
+    monkeypatch.setattr("app.auth.dependencies._get_local_dev_user", lambda conn=None: {"id": "dev-user-1"})
+    assert va_mod.local_dev_viewer_id() is None, (
+        "local_dev_viewer_id answered off dev mode — session_matches_viewer would "
+        "then accept a ticket with no verifiable session behind it"
+    )
+
+    # ...and the consequence, through the real function rather than a stub:
+    # a ticket naming that account is inert without a session token.
+    ticket = va_mod.ViewAsTicket("dev-user-1", "dev@x", "target-1", "t@x")
+    assert va_mod.session_matches_viewer(None, ticket) is False
+    assert va_mod.binding_is_possible(None) is False
+
+    # Positive control: with the mode on, the same wiring does answer, so the
+    # assertions above are about the gate and not about a broken lookup.
+    monkeypatch.setattr("app.auth.dependencies.is_local_dev_mode", lambda: True)
+    assert va_mod.local_dev_viewer_id() == "dev-user-1"
+    assert va_mod.session_matches_viewer(None, ticket) is True
