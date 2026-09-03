@@ -527,6 +527,37 @@ def test_the_applier_uid_is_pinned_not_allocated():
     )
 
 
+def test_the_pinned_uid_is_reserved_before_any_package_activity():
+    """The pin only works while its uid is still free when useradd runs.
+
+    `useradd --system` and a deb postinst's `adduser --system` both allocate
+    the TOP free id in the system range — exactly $AGNES_APPLIER_UID on a
+    fresh image. So any package block that runs before the applier user
+    exists and creates a system user of its own steals the pin. The opt-in
+    Datadog agent did precisely that on the first VM provisioned with it:
+    its postinst created dd-agent as uid 999 seconds before the pinned
+    useradd ran, the pin fell through to the unpinned fallback, and the VM
+    booted into the documented degraded instance.yaml mode — recoverable
+    only by a manual usermod+chown session on the host. Reserving the uid
+    before ANY package activity removes the race for every current and
+    future package block, not just Datadog's.
+    """
+    body = TPL.read_text()
+    reserve_at = body.index('--uid "$AGNES_APPLIER_UID"')
+    docker_install_at = body.index("https://get.docker.com")
+    assert reserve_at < docker_install_at, (
+        "the pinned useradd must run before the first package activity "
+        "(the Docker install) — any package's postinst can allocate a system "
+        "uid, and the top free one is exactly the uid the applier pins"
+    )
+    datadog_install_at = body.index('apt-get install -y -qq --allow-downgrades "datadog-agent=')
+    assert reserve_at < datadog_install_at, (
+        "the pinned useradd must run before the Datadog agent install — its "
+        "postinst creates the dd-agent system user, which is how the pin was "
+        "lost on the first enable_datadog=true provisioning"
+    )
+
+
 def test_the_chmod_is_conditional_on_the_pin_having_taken():
     """The mode must not outrun its own precondition.
 

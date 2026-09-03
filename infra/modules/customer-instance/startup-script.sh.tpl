@@ -32,6 +32,39 @@ AGNES_APPLIER_UID=999
 
 echo "=== [Agnes $CUSTOMER_NAME $ROLE] Startup at $(date) ==="
 
+# Reserve the applier's pinned uid FIRST — before any package activity.
+# `useradd --system` and a deb postinst's `adduser --system` both allocate
+# the TOP free id in the system range, i.e. exactly $AGNES_APPLIER_UID on a
+# fresh image — so any package block that runs before this user exists and
+# creates a system user of its own steals the pin. The opt-in Datadog agent
+# did exactly that on the first VM provisioned with it: its postinst created
+# dd-agent as uid 999 seconds before the applier section ran, the pinned
+# useradd fell through to its fallback, and the VM booted into the degraded
+# instance.yaml mode with a manual usermod+chown session as the only way
+# back. Creating the user costs nothing this early (docker-group membership
+# and /data/state ownership follow in the applier section), and removes the
+# race for every current and future package block, not just Datadog's.
+#
+# This `if` only guards user CREATION, not the uid check — an agnes-applier
+# that already exists (e.g. a VM provisioned before this pin existed, or one
+# where uid $AGNES_APPLIER_UID was taken by something else at the time) is
+# deliberately left alone here rather than remediated automatically:
+# `usermod -u` on a live system user can leave files it already owns
+# pointing at the old uid, which is a worse surprise than a loud warning.
+# The readback in the applier section below fires for BOTH the
+# freshly-created and the pre-existing case, since it re-reads whatever uid
+# the name resolves to right now instead of trusting this block succeeded.
+if ! id -u agnes-applier >/dev/null 2>&1; then
+    # Only the UID is pinned. `--gid` and `--user-group` are mutually
+    # exclusive, so a form passing both always fails — and the gid does not
+    # matter here anyway: instance.yaml is 0600, so the group bits grant
+    # nothing and only the owner's uid decides who can read it.
+    useradd --system --no-create-home --shell /usr/sbin/nologin \
+            --uid "$AGNES_APPLIER_UID" --user-group agnes-applier 2>/dev/null \
+    || useradd --system --no-create-home --shell /usr/sbin/nologin \
+            --user-group agnes-applier
+fi
+
 # --- 1. Docker (install if missing) ---
 if ! command -v docker &>/dev/null; then
     curl -fsSL https://get.docker.com | sh
@@ -455,6 +488,11 @@ else
         # enable_datadog description.
         usermod -aG docker dd-agent \
             || echo "WARNING: could not add dd-agent to the docker group — Docker and container metrics will be missing" >&2
+        # The artifact loop must stay AFTER the apt step above: the deb's
+        # postinst (the embedded fleet installer) recursively chowns
+        # /etc/datadog-agent to dd-agent on install and on every version
+        # change, so an artifact installed before it would lose the root
+        # ownership the datadog.yaml case below sets on purpose.
 %{ for dd_path, dd_content in datadog_files_b64 ~}
         _dd_install_artifact "${dd_path}" "${dd_content}" \
             || echo "WARNING: could not install the Datadog artifact '${dd_path}'" >&2
@@ -526,39 +564,20 @@ fi
 # script + its systemd units are baked into /opt/agnes-host/ via Dockerfile
 # (same image-extract contract as agnes-auto-upgrade.sh above), already
 # pulled into $APP_DIR by the recursive docker cp two lines up.
-# Create dedicated non-root user for the DB-state applier — limits
-# blast radius from full root to "docker group" (still effectively
-# root via /var/run/docker.sock, but no other system surface).
-# Idempotent on re-runs.
+# The dedicated non-root applier user itself is created — uid pinned to
+# $AGNES_APPLIER_UID — by the reservation block at the very top of this
+# script, before any package activity could allocate the id out from under
+# it. Running as agnes-applier limits blast radius from full root to
+# "docker group" (still effectively root via /var/run/docker.sock, but no
+# other system surface). Here it only joins the docker group — which exists
+# once section 1 has installed Docker — and takes ownership of /data/state.
 #
-# The uid is PINNED to $AGNES_APPLIER_UID, not allocated. `chown -R
-# agnes-applier /data/state` below is what finally owns instance.yaml, and
-# the applier re-creates that file under its own uid on every rewrite — so
-# at 0600 the app container (Dockerfile `USER agnes`, same pinned uid) can
-# read its own config only while these two uids are the same number.
-# `useradd --system` picks the top free id in the system range, which lands
-# there on today's image by allocation rather than by intent — so pin it,
-# and let the chmod below check the pin took.
-#
-# This `if` only guards user CREATION, not the uid check — an
-# agnes-applier that already exists (e.g. a VM provisioned before this pin
-# existed, or one where uid $AGNES_APPLIER_UID was taken by something else at
-# the time) is deliberately left alone here rather than remediated
-# automatically: `usermod -u` on a live system user can leave files it
-# already owns pointing at the old uid, which is a worse surprise than a
-# loud warning. The readback below fires for BOTH the freshly-created and
-# the pre-existing case, since it re-reads whatever uid the name resolves to
-# right now instead of trusting this block succeeded.
-if ! id -u agnes-applier >/dev/null 2>&1; then
-    # Only the UID is pinned. `--gid` and `--user-group` are mutually
-    # exclusive, so a form passing both always fails — and the gid does not
-    # matter here anyway: instance.yaml is 0600, so the group bits grant
-    # nothing and only the owner's uid decides who can read it.
-    useradd --system --no-create-home --shell /usr/sbin/nologin \
-            --uid "$AGNES_APPLIER_UID" --user-group agnes-applier 2>/dev/null \
-    || useradd --system --no-create-home --shell /usr/sbin/nologin \
-            --user-group agnes-applier
-fi
+# The uid pin matters because `chown -R agnes-applier /data/state` below is
+# what finally owns instance.yaml, and the applier re-creates that file
+# under its own uid on every rewrite — so at 0600 the app container
+# (Dockerfile `USER agnes`, same pinned uid) can read its own config only
+# while these two uids are the same number. The readback further down
+# checks whether the pin actually took before tightening the mode.
 usermod -aG docker agnes-applier
 mkdir -p /data/state /data/postgres
 chown -R agnes-applier:agnes-applier /data/state
@@ -604,9 +623,9 @@ install -m 0644 "$APP_DIR/agnes-state-applier.timer" /etc/systemd/system/agnes-s
 # agnes-applier user + chowns /data/state on first boot. The main
 # applier unit ``Requires=`` it so by the time systemd resolves
 # ``User=agnes-applier`` for the applier, the user definitely exists.
-# The eager useradd block above (lines ~108-117) is now belt-and-
-# braces; customer infras that don't ship matching provisioning logic
-# get the bootstrap for free via this unit.
+# The eager useradd (the uid-reservation block at the top of this
+# script) is now belt-and-braces; customer infras that don't ship
+# matching provisioning logic get the bootstrap for free via this unit.
 install -m 0644 "$APP_DIR/agnes-state-applier-bootstrap.service" /etc/systemd/system/agnes-state-applier-bootstrap.service
 systemctl daemon-reload
 systemctl enable --now agnes-state-applier-bootstrap.service
@@ -1618,11 +1637,12 @@ chmod 600 "$APP_DIR/.env"
 # already source the file. The bootstrap unit's ExecStart re-asserts
 # this every boot in case an operator (or agnes-auto-upgrade) rewrites
 # .env later.
-# In the normal boot order this `if` is always false — section 3 above
-# already created agnes-applier, pinned to $AGNES_APPLIER_UID. Kept pinned
-# here too (same fallback shape) so a reordering of the two blocks can't
-# quietly reintroduce an unpinned user via this path — #1217 was exactly
-# this kind of duplicate that only one of two copies got fixed.
+# In the normal boot order this `if` is always false — the uid-reservation
+# block at the top of this script already created agnes-applier, pinned to
+# $AGNES_APPLIER_UID. Kept pinned here too (same fallback shape) so a
+# reordering of the two blocks can't quietly reintroduce an unpinned user
+# via this path — #1217 was exactly this kind of duplicate that only one of
+# two copies got fixed.
 if ! id -u agnes-applier >/dev/null 2>&1; then
     useradd --system --no-create-home --shell /usr/sbin/nologin \
             --uid "$AGNES_APPLIER_UID" --user-group agnes-applier 2>/dev/null \

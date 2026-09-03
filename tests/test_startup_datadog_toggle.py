@@ -230,6 +230,29 @@ def test_the_agent_version_is_pinned_and_held(on: str):
     assert f'!= "1:{AGENT_VERSION}-1"' in on
 
 
+def test_the_artifacts_install_after_the_deb_postinst_that_chowns_the_config_dir(on: str):
+    """The order of the apt step and the artifact loop is load-bearing.
+
+    The agent deb's postinst (the embedded fleet installer,
+    `installFilesystem` -> `agentConfigPermissions`, verified on 7.82.3)
+    enforces dd-agent:dd-agent RECURSIVELY on /etc/datadog-agent — on first
+    install and again on every version change. datadog.yaml stays
+    root:dd-agent only because the artifact loop runs AFTER that postinst and
+    re-installs the file with explicit ownership. Swapping the two — say, to
+    have the config in place so the postinst starts the agent already
+    configured — would silently hand the agent user ownership of its own
+    config file, undoing the root-owned-config property the rendered
+    datadog.yaml documents.
+    """
+    apt_at = on.index('apt-get install -y -qq --allow-downgrades "datadog-agent=')
+    first_artifact_at = on.index('_dd_install_artifact "')
+    assert apt_at < first_artifact_at, (
+        "the artifact loop must stay after the apt step — the deb postinst "
+        "recursively chowns /etc/datadog-agent to dd-agent, so artifacts "
+        "installed before it would lose their root ownership"
+    )
+
+
 def test_the_agent_joins_the_docker_group_and_the_service_is_enabled(on: str):
     assert "usermod -aG docker dd-agent" in on
     assert "systemctl enable datadog-agent" in on
