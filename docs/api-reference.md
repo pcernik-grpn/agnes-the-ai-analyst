@@ -1272,6 +1272,7 @@ whole map, so mapping a second site group never clobbers the first).
 - /api/admin/sharepoint/connections/{connection_id}/acl-sync
 - /api/admin/sharepoint/connections/{connection_id}/subtree-sweep
 - /api/admin/sharepoint/connections/{connection_id}/facts-extract
+- /api/admin/sharepoint/connections/{connection_id}/facts/reset-no-claims
 
 `GET …/tree` browses the live Microsoft Graph folder tree one level per call
 (no `site_id`/`drive_id` → sites; `site_id` alone → that site's document
@@ -1632,6 +1633,37 @@ key that is off in `switch` (`extraction.facts.enabled` or `facts.enabled`).
 CLI: `agnes admin sharepoint facts-extract <connection_id>`; UI: the source
 card's **Extract facts now** button (next to **Run extraction now**), which
 renders disabled with that same reason while either switch is off.
+
+**Facts ledger reset-no-claims (TCRD-296 gap #62).** `POST
+…/facts/reset-no-claims` is the recovery surface for a facts-ledger entry a
+PRE-fix pass wrote as `status: "done"` with facts extracted (`nodes > 0`)
+that never landed a single claim in the fact graph — an ingest refusal, or a
+rejected/deferred citation, that happened AFTER the ledger's optimistic
+write. Left alone, the ledger's own `is_up_to_date` check treats `"done"` as
+current forever, so the document is invisible to every later pass — a live
+sweep found roughly 6 400 such documents. A fresh pass now corrects its own
+ledger entries as it runs; this endpoint is the one-time fix for entries an
+older pass already wrote. Every candidate is checked against the REAL claims
+table (the ledger itself never recorded a claim count) and sorted into three
+outcomes: already has a claim (left untouched); a TCRD-241 duplicate copy
+whose SIBLING (same `corpus_id` + `source_doc_id`) carries the claim
+(backfilled with `claims_on_file_id` on the entry, never reset — it already
+has a graph presence via its winner copy); or genuinely missing (the ledger
+entry is removed so the next pass re-derives and re-extracts it — cache-served
+after the evidence doc_id-normalization fix above, so this costs no
+additional model call once the original extraction already produced a usable
+reply). Optional JSON body `{"dry_run": false}` (the default) — `true`
+computes and returns the same counts without writing anything. Response:
+`{dry_run, candidates, reset: [file_id, ...], duplicates_recorded: {file_id:
+winner_file_id, ...}, already_had_claims, unmapped: [file_id, ...]}`. `404`
+on an unknown/non-SharePoint connection; `409 facts_extraction_running` when
+a facts-extraction pass — chained or standalone — currently holds this
+connection's per-connection facts-pass lock (that pass upserts the whole
+ledger payload on its own schedule). CLI: `agnes admin sharepoint facts reset
+--no-claims <connection_id> [--dry-run]`. Deliberately NOT MCP-exposed, same
+reasoning as `extract`/`facts-extract`/`retry-empty` above — it mutates
+per-document extraction state and can trigger a re-extraction spend on the
+next pass, an operator decision no analyst query needs.
 
 The exclusion
 handoff (`AGNES_SP_EXCLUDED_SUBTREE_IDS`, carried by the `corpus-extraction`

@@ -5262,6 +5262,18 @@
         "title": "FactsNeighborsRequest",
         "type": "object"
       },
+      "FactsResetNoClaimsRequest": {
+        "description": "Body for ``POST \u2026/facts/reset-no-claims`` \u2014 optional; a bare POST\nperforms the real reset (``dry_run`` defaults to ``False``, mirroring\nthe CLI's own default: ``agnes admin sharepoint facts reset\n--no-claims <id>`` resets, ``--dry-run`` previews).",
+        "properties": {
+          "dry_run": {
+            "default": false,
+            "title": "Dry Run",
+            "type": "boolean"
+          }
+        },
+        "title": "FactsResetNoClaimsRequest",
+        "type": "object"
+      },
       "FactsSearchRequest": {
         "additionalProperties": false,
         "properties": {
@@ -34124,6 +34136,86 @@
           }
         },
         "summary": "Facts Graph Counts",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/api/admin/sharepoint/connections/{connection_id}/facts/reset-no-claims": {
+      "post": {
+        "description": "TCRD-296 gap #62's recovery surface: a document whose facts ledger\nentry reads ``status: \"done\"`` with facts extracted (``nodes > 0``) but\nthat never contributed a single claim to the fact graph \u2014 a batch an\nearlier, pre-fix pass shipped and got refused, or whose citation the\ningest gate rejected/deferred \u2014 stayed marked done FOREVER (the ledger\nonly ever re-derives a non-``\"done\"`` entry), invisible to every later\npass. A fresh pass now corrects its own ledger entries as it goes\n(:class:`connectors.sharepoint.facts_extraction._BatchShipper`); this\nendpoint is the one-time fix for entries an OLDER pass already wrote\nbefore that existed.\n\nEvery candidate is checked against the REAL fact graph (the ledger\nitself never recorded a claim count) and sorted into three outcomes \u2014\nsee :func:`connectors.sharepoint.facts_extraction\n.reset_no_claims_ledger_entries`'s own docstring for the full\nalgorithm: already has claims (left alone), a TCRD-241 duplicate copy\nwhose SIBLING carries the claims (backfilled with ``claims_on_file_id``,\nnever reset \u2014 resetting it would re-extract a document that already has\na graph presence via its winner copy), or genuinely missing (the ledger\nentry is removed so the next pass re-derives and re-extracts it \u2014 cache-\nserved after the doc_id-normalization fix, so this costs no additional\nmodel call once the original extraction already produced a usable\nreply).\n\n``dry_run`` (default ``False``) computes and returns the same counts\nWITHOUT writing anything.\n\n``404`` on an unknown/non-SharePoint connection. ``409\nfacts_extraction_running`` when a facts-extraction pass \u2014 chained or\nstandalone \u2014 currently holds this connection's\n``connectors.sharepoint.state_store.facts_pass_lock``: that pass\nupserts the WHOLE ledger payload on its own schedule, so resetting\nentries underneath it would race that write.",
+        "operationId": "reset_facts_no_claims_api_admin_sharepoint_connections__connection_id__facts_reset_no_claims_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "title": "Connection Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/FactsResetNoClaimsRequest"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Body"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Reset Facts No Claims",
         "tags": [
           "admin"
         ]

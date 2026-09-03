@@ -1215,6 +1215,12 @@ CATALOG: dict[str, AuditEvent] = {
         "mutation",
         "An admin re-queued a SharePoint connection's convert_empty document backlog for conversion.",
     ),
+    "sharepoint_connection.facts_reset_no_claims": AuditEvent(
+        "sharepoint_connection.facts_reset_no_claims",
+        "mutation",
+        "An admin reset a SharePoint connection's facts ledger entries that carry no claims, "
+        "so the next pass re-extracts them (TCRD-296 gap #62).",
+    ),
     # -- Cooperative stop (owner-frustration fix, 2026-09-01) -----------------
     "extraction.stop_requested": AuditEvent(
         "extraction.stop_requested",

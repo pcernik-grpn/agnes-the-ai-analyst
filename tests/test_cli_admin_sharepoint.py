@@ -96,6 +96,75 @@ class TestFactsExtract:
         assert "connection_not_found" in result.output
 
 
+class TestFactsReset:
+    """`agnes admin sharepoint facts reset --no-claims` — CLI counterpart to
+    `POST /api/admin/sharepoint/connections/{connection_id}/facts/reset-no-claims`
+    (TCRD-296 gap #62)."""
+
+    def test_bare_call_requires_no_claims(self):
+        result = runner.invoke(app, ["admin", "sharepoint", "facts", "reset", "conn1"])
+        assert result.exit_code == 1
+        assert "--no-claims" in result.output
+
+    def test_no_claims_posts_dry_run_false_by_default(self):
+        body = {
+            "dry_run": False,
+            "candidates": 3,
+            "reset": ["cf_1"],
+            "duplicates_recorded": {"cf_2": "cf_3"},
+            "already_had_claims": 1,
+            "unmapped": [],
+        }
+        with patch("cli.commands.admin_sharepoint.api_post", return_value=_resp(200, body)) as mock_post:
+            result = runner.invoke(app, ["admin", "sharepoint", "facts", "reset", "conn1", "--no-claims"])
+        assert result.exit_code == 0, result.output
+        mock_post.assert_called_once()
+        args, kwargs = mock_post.call_args
+        assert args[0] == "/api/admin/sharepoint/connections/conn1/facts/reset-no-claims"
+        assert kwargs["json"] == {"dry_run": False}
+        assert "candidates=3" in result.output
+        assert "reset=1" in result.output
+        assert "duplicates_recorded=1" in result.output
+        assert "already_had_claims=1" in result.output
+
+    def test_dry_run_flag_rides_the_payload_and_is_labeled(self):
+        body = {
+            "dry_run": True,
+            "candidates": 2,
+            "reset": ["cf_1"],
+            "duplicates_recorded": {},
+            "already_had_claims": 1,
+            "unmapped": [],
+        }
+        with patch("cli.commands.admin_sharepoint.api_post", return_value=_resp(200, body)) as mock_post:
+            result = runner.invoke(app, ["admin", "sharepoint", "facts", "reset", "conn1", "--no-claims", "--dry-run"])
+        assert result.exit_code == 0, result.output
+        _, kwargs = mock_post.call_args
+        assert kwargs["json"] == {"dry_run": True}
+        assert "[dry run]" in result.output
+
+    def test_json_output(self):
+        body = {
+            "dry_run": False,
+            "candidates": 0,
+            "reset": [],
+            "duplicates_recorded": {},
+            "already_had_claims": 0,
+            "unmapped": [],
+        }
+        with patch("cli.commands.admin_sharepoint.api_post", return_value=_resp(200, body)):
+            result = runner.invoke(app, ["admin", "sharepoint", "facts", "reset", "conn1", "--no-claims", "--json"])
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.output) == body
+
+    def test_a_typed_error_is_reported_and_exits_nonzero(self):
+        detail = {"error": "facts_extraction_running", "message": "a facts pass is already running"}
+        with patch("cli.commands.admin_sharepoint.api_post", return_value=_resp(409, {"detail": detail})):
+            result = runner.invoke(app, ["admin", "sharepoint", "facts", "reset", "conn1", "--no-claims"])
+        assert result.exit_code == 1
+        assert "a facts pass is already running" in result.output
+
+
 class TestScopeBulkAdd:
     """`agnes admin sharepoint scope bulk-add` — CLI counterpart to
     `POST /api/admin/sharepoint/connections/{connection_id}/scopes/bulk`."""

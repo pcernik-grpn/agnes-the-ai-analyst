@@ -3178,6 +3178,37 @@ class FactsPgRepository:
             out[r["corpus_id"]] = {"facts": int(r["facts"]), "edges": int(r["edges"])}
         return out
 
+    def claims_count_by_file(self, file_ids: List[str]) -> Dict[str, int]:
+        """``{corpus_file_id: count}`` for every id in ``file_ids`` that has
+        AT LEAST ONE claim — an id with zero claims is simply absent (never
+        a zero-valued entry), so a caller reads ``.get(file_id, 0)``.
+
+        Used by the SharePoint facts ledger's reset-no-claims recovery
+        (TCRD-296 gap #62): the ledger itself only ever records ``nodes``/
+        ``edges`` counts (:func:`connectors.sharepoint.facts_extraction
+        ._fold_accepted_result`), never ``claims_written`` — so a caller
+        needing to tell "this file's own evidence was accepted" from "the
+        extraction ran but nothing landed" cannot answer that from the
+        ledger alone and must ask the fact graph directly.
+        """
+        out: Dict[str, int] = {}
+        if not file_ids:
+            return out
+        with self._engine.connect() as conn:
+            rows = (
+                conn.execute(
+                    sa.text(
+                        "SELECT corpus_file_id, COUNT(*) AS n FROM claims WHERE corpus_file_id = ANY(:ids) GROUP BY corpus_file_id"
+                    ),
+                    {"ids": list(set(file_ids))},
+                )
+                .mappings()
+                .all()
+            )
+        for r in rows:
+            out[r["corpus_file_id"]] = int(r["n"])
+        return out
+
     def collection_facts_summary(self, caller, corpus_id: str, *, limit: int = 20, offset: int = 0) -> Dict[str, Any]:
         """Caller-scoped facts section for one collection's detail page
         (spec §13.2 "Collection detail"): fact count by type, a paged list of
@@ -4342,6 +4373,25 @@ class FactsPgRepository:
             return joined_cache[file_id]
 
         claims_written = 0
+        # Per-doc_id breakdown of `claims_written` (TCRD-296 gap #62) — a
+        # producer folding this batch's report into a per-document ledger
+        # cannot otherwise tell "my document's own evidence was accepted"
+        # from "the batch overall wrote claims", which is what let a
+        # ledger entry read `done` for a document that in fact contributed
+        # zero claims (an ingest-time rejection, or — see
+        # `resolved_file_by_doc` below — a TCRD-241 duplicate copy whose
+        # claims all landed on a SIBLING file).
+        claims_written_by_doc: Dict[str, int] = {}
+        # doc_id -> the `corpus_file_id` its evidence actually resolved to
+        # THIS call (set the moment `_resolve_doc` succeeds, regardless of
+        # whether that particular evidence item went on to be written or
+        # rejected). Normally that is simply "this document's own file",
+        # but TCRD-241 collapses every duplicate copy of one (corpus_id,
+        # doc_id) onto ONE deterministic winner `corpus_file_id` — so a
+        # caller keying its own ledger on doc_id can compare this against
+        # the file_id IT declared for that doc_id and tell "my claims are
+        # here" from "my claims are on my duplicate sibling instead".
+        resolved_file_by_doc: Dict[str, str] = {}
         claims_accepted_via_identity = 0
         claims_rejected: List[Dict[str, Any]] = []
         deferred: List[Dict[str, Any]] = []
@@ -4429,6 +4479,12 @@ class FactsPgRepository:
                     reason = "ambiguous_cross_collection_doc_id" if doc_id in ambiguous_doc_ids else "unresolved_doc_id"
                     claims_rejected.append({"row": item_ref, "reason": reason, "doc_id": doc_id})
                     continue
+                # Recorded as soon as doc_id resolves at all — independent
+                # of whether THIS evidence item goes on to be written or
+                # rejected (e.g. `verbatim_gate_failed` below): the mapping
+                # answers "where does doc_id live", not "did this specific
+                # citation succeed".
+                resolved_file_by_doc[doc_id] = file_id
                 if frow.get("processing_status") != "indexed":
                     deferred.append(
                         {
@@ -4524,6 +4580,7 @@ class FactsPgRepository:
                     )
                 if written_id is not None:
                     claims_written += 1
+                    claims_written_by_doc[doc_id] = claims_written_by_doc.get(doc_id, 0) + 1
                     if accepted_via_identity:
                         claims_accepted_via_identity += 1
                     if kind == "fact":
@@ -4793,6 +4850,16 @@ class FactsPgRepository:
 
         return {
             "claims_written": claims_written,
+            # TCRD-296 gap #62: per-doc_id breakdown of `claims_written`,
+            # plus which `corpus_file_id` each cited doc_id actually
+            # resolved to (see the two dicts' own definitions above) — the
+            # pair a caller needs to correct a per-document ledger entry
+            # written OPTIMISTICALLY before this call ran (a document whose
+            # own evidence contributed zero claims must not stay marked
+            # done; a TCRD-241 duplicate copy whose claims landed on a
+            # sibling file must record that fact, not read as "missing").
+            "claims_written_by_doc": claims_written_by_doc,
+            "resolved_file_by_doc": resolved_file_by_doc,
             # Of `claims_written`, the subset that only passed the gate via
             # the document's SERVER-STORED filename/path — never a chunk —
             # so an operator can see how much evidence is filename-grounded

@@ -122,6 +122,25 @@ class CorpusFileSourcesPgRepository:
             out.setdefault(r["doc_id"], {"name": r["name"], "collection": r["collection_name"]})
         return out
 
+    def files_for_doc(self, corpus_id: str, source_doc_id: str) -> list[str]:
+        """Every ``corpus_file_id`` anchored to ``(corpus_id, source_doc_id)``
+        — more than one row can legally match (TCRD-241: a byte-identical
+        copy shares its sha-derived doc_id with every other copy). Mirrors
+        the scope of ``FactsPgRepository.ingest_batch``'s own internal
+        ``_copies_for`` (that closure resolves the ingest-time WRITE
+        winner; this is the public, read-only "who are the copies"
+        equivalent for a caller outside the ingest path — e.g. the facts
+        ledger's reset-no-claims recovery, TCRD-296 gap #62)."""
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                sa.text(
+                    "SELECT corpus_file_id FROM corpus_file_sources "
+                    "WHERE corpus_id = :corpus_id AND source_doc_id = :doc_id"
+                ),
+                {"corpus_id": corpus_id, "doc_id": source_doc_id},
+            ).all()
+        return [r[0] for r in rows]
+
     def upsert(
         self,
         *,

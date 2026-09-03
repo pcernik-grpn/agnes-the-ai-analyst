@@ -186,6 +186,12 @@ POSTURE: dict[str, str] = {
     "POST /api/admin/sharepoint/connections/{connection_id}/extraction/retry-empty": (
         "sharepoint_connection.retry_empty"
     ),
+    # The reset-no-claims recovery handler writes its own row EVERY call —
+    # dry_run included — with the per-outcome counts the fallback could not
+    # derive from the response body alone.
+    "POST /api/admin/sharepoint/connections/{connection_id}/facts/reset-no-claims": (
+        "sharepoint_connection.facts_reset_no_claims"
+    ),
     "POST /api/admin/sharepoint/connections/{connection_id}/scopes": "sharepoint_connection.scope_confirm",
     # Bulk scope-add (split-a-large-site workflow) and connection clone both
     # write their own row with richer params than the fallback could derive

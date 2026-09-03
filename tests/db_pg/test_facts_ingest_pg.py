@@ -1881,6 +1881,54 @@ def test_dup_doc_id_two_copies_one_corpus_one_batch_is_deterministic_across_repl
     assert result["subjects"][0]["claim_count"] == 1  # not doubled across the two copies
 
 
+def test_ingest_batch_reports_claims_written_and_resolved_file_per_doc_id(pg_env, repo):
+    """TCRD-296 gap #62: a caller correcting its own per-document ledger
+    needs BOTH — how many claims THIS doc_id's evidence actually wrote
+    (``claims_written_by_doc``), and which `corpus_file_id` it resolved to
+    (``resolved_file_by_doc``). Two copies of one doc_id in one corpus
+    collapse onto ONE deterministic winner (TCRD-241) — the report names
+    that winner under the shared doc_id, never under either copy's own
+    file_id."""
+    _seed_collection(collection_id=CORPUS_A)
+    _seed_corpus_file(file_id="cf_1", status="indexed")
+    _seed_corpus_file(file_id="cf_2", status="indexed")
+    text = "Acme Corp is the client of record."
+    _seed_chunk(file_id="cf_1", text=text)
+    _seed_chunk(file_id="cf_2", text=text)
+    _seed_source_mapping(file_id="cf_1", source_doc_id="dupdoc5", stable_id="path1")
+    _seed_source_mapping(file_id="cf_2", source_doc_id="dupdoc5", stable_id="path2")
+
+    report = repo.ingest_batch(
+        documents=[
+            {"doc_id": "dupdoc5", "corpus_id": CORPUS_A, "stable_id": "path1"},
+            {"doc_id": "dupdoc5", "corpus_id": CORPUS_A, "stable_id": "path2"},
+        ],
+        nodes=[_node("engagement:dup5", "dupdoc5", text)],
+    )
+    assert report["claims_written"] == 1
+    assert report["claims_written_by_doc"] == {"dupdoc5": 1}
+    assert report["resolved_file_by_doc"]["dupdoc5"] in ("cf_1", "cf_2")
+
+
+def test_ingest_batch_resolved_file_by_doc_names_the_file_even_when_the_claim_is_rejected(pg_env, repo):
+    """A rejected evidence item (here: not verbatim) still resolves its
+    doc_id — the mapping answers "where does this doc_id live", not "did
+    this citation succeed" — but contributes nothing to
+    ``claims_written_by_doc``."""
+    _seed_collection(collection_id=CORPUS_A)
+    _seed_corpus_file(file_id="cf_reject", status="indexed")
+    _seed_chunk(file_id="cf_reject", text="Acme Corp signed the deal.")
+    _seed_source_mapping(file_id="cf_reject", source_doc_id="docreject", stable_id="pathreject")
+
+    report = repo.ingest_batch(
+        documents=[{"doc_id": "docreject", "corpus_id": CORPUS_A, "stable_id": "pathreject"}],
+        nodes=[_node("engagement:reject", "docreject", "This sentence is not in the document.")],
+    )
+    assert report["claims_written"] == 0
+    assert report["claims_written_by_doc"] == {}
+    assert report["resolved_file_by_doc"] == {"docreject": "cf_reject"}
+
+
 def test_dup_doc_id_replace_mode_purges_claims_on_every_anchored_copy(pg_env, repo):
     """`full_documents` replace mode must clear claims off EVERY corpus_file
     anchored to the doc_id within its corpus -- not just the copy this

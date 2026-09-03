@@ -351,6 +351,17 @@ DEFAULT_RETRY_TRANSPORT = "batch"
 #: fails immediately.
 MAX_BATCH_REQUEUE_ATTEMPTS = 3
 
+#: Cross-pass retry ceiling for a document whose ledger entry
+#: :class:`_BatchShipper` had to CORRECT (TCRD-296 gap #62) — an
+#: ``ingest_refused`` batch, or a successful flush whose own doc_id
+#: contributed zero claims despite extracting nodes. The same "attempts
+#: accumulate across runs, given up after N" shape as
+#: :data:`MAX_BATCH_REQUEUE_ATTEMPTS`, kept as its own constant: this
+#: ceiling bounds a WRITE-side (ingest) failure, never a model-call
+#: outcome, so there is no reason the two should ever have to move
+#: together.
+MAX_LEDGER_RETRY_ATTEMPTS = 3
+
 #: Wall-clock budget for a STANDALONE run (``run_standalone_facts_extraction``
 #: — the ``sharepoint-facts-extraction`` job kind / ``POST …/facts-extract``
 #: / ``agnes admin sharepoint facts-extract``), in seconds. Deliberately its
@@ -1267,6 +1278,130 @@ def is_up_to_date(entry: Optional[Dict[str, Any]], *, sha256: str, model: str, f
     )
 
 
+def reset_no_claims_ledger_entries(connection_id: str, *, dry_run: bool = False) -> Dict[str, Any]:
+    """The recovery surface for TCRD-296 gap #62's HISTORICAL backlog — an
+    admin/CLI action (``POST …/connections/{id}/facts/reset-no-claims``,
+    ``agnes admin sharepoint facts reset --no-claims``), not something an
+    ordinary pass calls.
+
+    :class:`_BatchShipper` (``_correct_ledger``/``_revert_ledger``) already
+    keeps a FRESH pass's own ledger entries honest going forward. This
+    function is the one-time fix for entries a PRE-fix pass already wrote:
+    ``status: "done"`` with ``nodes > 0`` but no claim ever landed for that
+    file — an ingest refusal, or a rejected/deferred citation, that the
+    ledger write happened before the batch's real outcome was known. Left
+    alone, :func:`is_up_to_date` treats ``"done"`` as current forever, so
+    the document is invisible to every later pass.
+
+    Every candidate (``status == "done"``, ``nodes > 0``, no
+    ``claims_on_file_id`` marker yet — an entry already carrying one was
+    already resolved, either by a fresh pass's own correction or an
+    earlier call to this same action) is checked against the REAL fact
+    graph, since the ledger itself never recorded a claim count:
+
+    * The file already has a claim (:meth:`~src.repositories.facts_pg
+      .FactsPgRepository.claims_count_by_file`) — nothing to do.
+    * No claim on THIS file, but a SIBLING anchored to the same
+      ``(corpus_id, doc_id)`` has one — a TCRD-241 duplicate copy, by
+      design (the loader collapses every byte-identical copy onto one
+      deterministic winner). Backfilled with ``claims_on_file_id`` rather
+      than reset, so a later run of this same action (or a coverage
+      report) can tell "duplicate" from "still missing".
+    * No claim anywhere for this doc_id — genuinely missing. The entry is
+      REMOVED from the ledger so the next pass re-derives and re-extracts
+      it: cache-served (:func:`_normalize_evidence_doc_ids` now keeps a
+      cache hit's evidence correctly attributed), so the re-extraction
+      itself costs no additional model call once the ORIGINAL call already
+      produced a usable reply.
+
+    ``dry_run`` (default ``False``) computes and reports every outcome
+    WITHOUT writing anything back — the state is loaded but never saved.
+
+    Takes the SAME per-connection ``connectors.sharepoint.state_store
+    .facts_pass_lock`` a real pass holds for its own duration (never
+    waits): a running pass upserts the WHOLE ``docs`` payload on its own
+    schedule, so mutating the ledger underneath it would race that write.
+    Raises :class:`~connectors.sharepoint.state_store.FactsPassLocked`
+    (propagated, not caught — the caller/endpoint translates it to a
+    ``409``), the same posture :func:`run_standalone_facts_extraction`
+    already has for the same lock.
+    """
+    from connectors.sharepoint.state_store import facts_pass_lock
+    from src.repositories import corpus_file_sources_repo, facts_repo
+
+    with facts_pass_lock(connection_id):
+        state = load_state(connection_id)
+        docs_state: Dict[str, Any] = state.get("docs") or {}
+
+        candidates = [
+            file_id
+            for file_id, entry in docs_state.items()
+            if isinstance(entry, dict)
+            and entry.get("status") == "done"
+            and int(entry.get("nodes") or 0) > 0
+            and "claims_on_file_id" not in entry
+        ]
+
+        sources_repo = corpus_file_sources_repo()
+        facts = facts_repo()
+
+        mapping: Dict[str, Dict[str, Any]] = {}
+        siblings_by_file: Dict[str, List[str]] = {}
+        all_file_ids: set = set(candidates)
+        for file_id in candidates:
+            row = sources_repo.get(file_id)
+            if not row or not row.get("source_doc_id"):
+                continue
+            mapping[file_id] = row
+            siblings = sources_repo.files_for_doc(row["corpus_id"], row["source_doc_id"])
+            siblings_by_file[file_id] = siblings
+            all_file_ids.update(siblings)
+
+        counts = facts.claims_count_by_file(sorted(all_file_ids))
+
+        reset_ids: List[str] = []
+        duplicate_ids: Dict[str, str] = {}
+        already_had_claims = 0
+        unmapped: List[str] = []
+
+        for file_id in candidates:
+            if counts.get(file_id, 0) > 0:
+                already_had_claims += 1
+                continue
+            row = mapping.get(file_id)
+            if row is None:
+                # No `corpus_file_sources` mapping (or no `source_doc_id`)
+                # at all — nothing to check a sibling against, and no
+                # doc_id to re-derive by. Left alone; the run report names
+                # it so an operator can look closer rather than have it
+                # silently vanish from either bucket.
+                unmapped.append(file_id)
+                continue
+            siblings = [s for s in siblings_by_file.get(file_id, []) if s != file_id]
+            winner = next((s for s in siblings if counts.get(s, 0) > 0), None)
+            if winner is not None:
+                duplicate_ids[file_id] = winner
+                if not dry_run:
+                    docs_state[file_id]["claims_on_file_id"] = winner
+                continue
+            reset_ids.append(file_id)
+            if not dry_run:
+                docs_state.pop(file_id, None)
+
+        if not dry_run and (reset_ids or duplicate_ids):
+            state["docs"] = docs_state
+            save_state(connection_id, state)
+
+        return {
+            "dry_run": dry_run,
+            "candidates": len(candidates),
+            "reset": sorted(reset_ids),
+            "duplicates_recorded": dict(sorted(duplicate_ids.items())),
+            "already_had_claims": already_had_claims,
+            "unmapped": sorted(unmapped),
+        }
+
+
 # --------------------------------------------------------------------------
 # Ontology — read from the semantic-model store, never a file
 # --------------------------------------------------------------------------
@@ -1450,6 +1585,49 @@ def parse_streams(reply_text: str) -> Tuple[List[dict], List[dict], int]:
         else:
             parse_errors += 1
     return nodes, edges, parse_errors
+
+
+def _normalize_evidence_doc_ids(nodes: List[dict], edges: List[dict], doc_id: str) -> int:
+    """Rewrite every evidence entry's ``doc_id`` to ``doc_id`` — the
+    document actually being processed — and return how many entries were
+    rewritten.
+
+    The model's citation (``evidence.doc_id`` — the prompt tells it to cite
+    "the document you are reading", see ``facts_prompt.py``) is trustworthy
+    on a fresh call, but not necessarily on a content-hash cache hit
+    (:func:`_cache_lookup`): the cache key is ``sha256 | model |
+    fingerprint``, where ``sha256`` hashes the CONVERTED markdown, while
+    ``doc_id`` identifies the SOURCE bytes. Two documents can convert to
+    byte-identical markdown while their source bytes — and therefore
+    ``doc_id`` — differ (a re-save, a metadata-only edit, a re-export from
+    a different tool). That is a legitimate cache hit (same content, no
+    reason to pay for a second call), but the replayed reply's evidence
+    still names the FIRST document that ever produced it. Left uncorrected,
+    ingest resolves those citations against the wrong ``corpus_file_id`` —
+    silently dropped (``ON CONFLICT DO NOTHING`` when the wrong doc_id
+    happens to share this document's corpus) or rejected outright
+    (``ambiguous_cross_collection_doc_id`` when it does not).
+
+    Mutates the ``evidence`` entries in place — a pure post-processing
+    pass with no effect on anything upstream, since the verbatim gate
+    matches on ``quote`` alone, never ``doc_id``. The count is reported
+    (see :class:`_DocResult`\\ 's ``evidence_doc_id_rewritten`` and
+    :class:`_Report`'s field of the same name) so a MODEL that persistently
+    mis-cites its own document — not only a cache replay — stays visible in
+    the run report rather than being silently corrected away.
+    """
+    rewritten = 0
+    for fact in (*nodes, *edges):
+        evidence = fact.get("evidence")
+        if not isinstance(evidence, list):
+            continue
+        for entry in evidence:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("doc_id") != doc_id:
+                entry["doc_id"] = doc_id
+                rewritten += 1
+    return rewritten
 
 
 def quote_is_verbatim(quote: str, *, chunk_texts: Sequence[str], filename: Optional[str], path: Optional[str]) -> bool:
@@ -2134,6 +2312,12 @@ class _Report:
         #: SAME document both count, since each replaces a call that would
         #: otherwise have been made.
         self.facts_cache_hits = 0
+        #: Evidence entries :func:`_normalize_evidence_doc_ids` rewrote —
+        #: a cache-served reply (or, in principle, a persistently
+        #: mis-citing model) that named a document OTHER than the one
+        #: actually being processed. Non-zero here means citations were
+        #: corrected before shipping, never that anything was lost.
+        self.facts_evidence_doc_id_rewritten = 0
         self.parse_errors = 0
         self.nodes_emitted = 0
         self.edges_emitted = 0
@@ -2258,6 +2442,7 @@ class _Report:
             "facts_quotes_repaired": self.facts_quotes_repaired,
             "facts_retries": self.facts_retries,
             "facts_cache_hits": self.facts_cache_hits,
+            "facts_evidence_doc_id_rewritten": self.facts_evidence_doc_id_rewritten,
             "parse_errors": self.parse_errors,
             "nodes_emitted": self.nodes_emitted,
             "edges_emitted": self.edges_emitted,
@@ -2289,27 +2474,49 @@ class _BatchShipper:
     quote that nothing in this pipeline actually established; absent is the
     honest value, and it is exactly what the crawler's own ingest path
     already produces.
+
+    **Ledger correction (TCRD-296 gap #62).** :func:`_fold_accepted_result`
+    writes a document's ``docs_state`` entry as ``status: "done"``
+    OPTIMISTICALLY, before this batch is ever shipped — it has to, since a
+    batch accumulates several documents before flushing. This class holds
+    the ONLY reference (``docs_state``, passed in at construction) able to
+    correct that optimism once the real outcome is known: :meth:`flush`
+    either downgrades every ``done`` entry in a REFUSED batch
+    (:meth:`_revert_ledger`, so :func:`is_up_to_date` — which only ever
+    treats ``status == "done"`` as current — retries it next pass) or, on a
+    successful flush, reconciles each document against what the ingest
+    response says it actually wrote (:meth:`_correct_ledger`).
     """
 
-    def __init__(self, *, report: _Report, anonymize_marked: set, user: Any) -> None:
+    def __init__(self, *, report: _Report, anonymize_marked: set, user: Any, docs_state: Dict[str, Any]) -> None:
         self._report = report
         self._anonymize_marked = anonymize_marked
         self._user = user
+        self._docs_state = docs_state
         self._documents: List[Dict[str, Any]] = []
         self._full_documents: List[str] = []
         self._nodes: List[dict] = []
         self._edges: List[dict] = []
         self._claims = 0
         self._anonymized_counts: Dict[str, int] = {}
+        #: `file_id` per pending document, SAME order/length as
+        #: `self._documents` — never sent over the wire (not part of the
+        #: ingest request shape), kept only so `flush` can correct THIS
+        #: batch's own ledger entries. A `doc_id` is not 1:1 with `file_id`
+        #: (TCRD-241 duplicates), so it cannot be re-derived from `document`
+        #: alone.
+        self._file_ids: List[str] = []
 
     def add(
         self,
         *,
+        file_id: str,
         document: Dict[str, Any],
         nodes: List[dict],
         edges: List[dict],
         claim_count: int,
     ) -> None:
+        self._file_ids.append(file_id)
         self._documents.append(document)
         self._full_documents.append(str(document["doc_id"]))
         self._nodes.extend(nodes)
@@ -2328,9 +2535,12 @@ class _BatchShipper:
 
     def flush(self, *, usage: Dict[str, Any], model: str) -> None:
         """Ship what is pending. An ingest refusal is COUNTED, never
-        raised: the documents in this batch keep their claims un-written
-        and are re-tried on the next pass (their state entry is only
-        written after a successful flush).
+        raised: the documents in this batch keep their claims un-written.
+        Their ``docs_state`` entry was already written ``"done"``
+        OPTIMISTICALLY before this call (:func:`_fold_accepted_result`,
+        ahead of the batch actually shipping) — :meth:`_revert_ledger`
+        downgrades it here so the next pass re-tries them (TCRD-296 gap
+        #62; see the class docstring's "Ledger correction" section).
 
         ``usage`` must be THIS BATCH's spend, not the run's running total:
         ``GET /api/facts/ingest-runs``'s rollup sums every persisted run's
@@ -2376,6 +2586,7 @@ class _BatchShipper:
                 documents=len(self._documents),
             ),
         )
+        pending_file_ids = list(self._file_ids)
         try:
             result = facts_ingest(body, user=self._user)
         except HTTPException as exc:
@@ -2388,13 +2599,89 @@ class _BatchShipper:
                 len(self._documents),
                 exc.status_code,
             )
+            self._revert_ledger(pending_file_ids)
             self._reset()
             raise _IngestRefused(exc) from exc
         self._report.ingest_batches += 1
         self._report.claims_written += int(result.get("claims_written") or 0)
         self._report.claims_rejected += len(result.get("claims_rejected") or [])
         self._report.edges_skipped_missing_endpoint += int(result.get("edges_skipped_missing_endpoint") or 0)
+        self._correct_ledger(result)
         self._reset()
+
+    def _revert_ledger(self, file_ids: Sequence[str]) -> None:
+        """A refused batch's documents were folded into ``docs_state`` as
+        ``done`` before this call ran (see the class docstring) — that
+        optimism was wrong. Downgrade each to a bounded-retry status so
+        :func:`is_up_to_date` does not skip it on the next pass.
+        """
+        for file_id in file_ids:
+            entry = self._docs_state.get(file_id)
+            if isinstance(entry, dict) and entry.get("status") == "done":
+                self._mark_retry(file_id, entry, reason="ingest_refused")
+
+    def _correct_ledger(self, result: Dict[str, Any]) -> None:
+        """Reconcile every document THIS successful flush shipped against
+        what the ingest response says it actually wrote."""
+        claims_by_doc: Dict[str, Any] = result.get("claims_written_by_doc") or {}
+        resolved_by_doc: Dict[str, Any] = result.get("resolved_file_by_doc") or {}
+        for file_id, document in zip(self._file_ids, self._documents):
+            entry = self._docs_state.get(file_id)
+            if not isinstance(entry, dict) or entry.get("status") != "done":
+                continue
+            doc_id = str(document.get("doc_id"))
+            winner = resolved_by_doc.get(doc_id)
+            if winner is not None and str(winner) != str(file_id):
+                # TCRD-241 duplicate copy: this doc_id's claims all landed
+                # on a SIBLING corpus_file_id — by design (the dedupe
+                # collapses every byte-identical copy onto one winner),
+                # never a failure. Stay `done`, but record where the
+                # claims actually are so a coverage report can tell
+                # "duplicate" from "genuinely missing".
+                entry["claims_on_file_id"] = str(winner)
+                continue
+            claims = int(claims_by_doc.get(doc_id, 0) or 0)
+            if claims == 0 and int(entry.get("nodes") or 0) > 0:
+                self._mark_retry(file_id, entry, reason="no_claims")
+
+    def _mark_retry(self, file_id: str, entry: Dict[str, Any], *, reason: str) -> None:
+        """Downgrade a ``done`` entry to ``reason`` (``"ingest_refused"`` or
+        ``"no_claims"``) so the next pass re-extracts it — cache-served
+        (see :func:`_normalize_evidence_doc_ids`), so a retry costs no
+        extra model call once the extraction itself already succeeded.
+        Bounded the same way :func:`_requeue_or_fail` bounds a transient
+        batch-transport failure: after :data:`MAX_LEDGER_RETRY_ATTEMPTS`,
+        give up with a terminal ``"failed"`` entry rather than retry
+        forever.
+        """
+        retries = int(entry.get("retry_count") or 0) + 1
+        if retries >= MAX_LEDGER_RETRY_ATTEMPTS:
+            self._docs_state[file_id] = {
+                "status": "failed",
+                "reason": f"{reason} (gave up after {retries} attempts)",
+                "at": _now_iso(),
+            }
+            self._report.facts_failed += 1
+            self._report.record_failure_reason(reason)
+            logger.warning(
+                "facts extraction: giving up on document %s after %d %s attempts",
+                file_id,
+                retries,
+                reason,
+            )
+            return
+        updated = dict(entry)
+        updated["status"] = reason
+        updated["retry_count"] = retries
+        updated["at"] = _now_iso()
+        self._docs_state[file_id] = updated
+        logger.info(
+            "facts extraction: document %s marked %s — retried next pass (attempt %d/%d)",
+            file_id,
+            reason,
+            retries,
+            MAX_LEDGER_RETRY_ATTEMPTS,
+        )
 
     def _reset(self) -> None:
         self._documents = []
@@ -2403,6 +2690,7 @@ class _BatchShipper:
         self._edges = []
         self._claims = 0
         self._anonymized_counts = {}
+        self._file_ids = []
 
 
 class _IngestRefused(RuntimeError):
@@ -2454,8 +2742,10 @@ def _fold_accepted_result(
     report.facts_quotes_dropped += result.dropped
     report.facts_quotes_repaired += result.repaired
     report.facts_cache_hits += result.cache_hits
+    report.facts_evidence_doc_id_rewritten += result.evidence_doc_id_rewritten
     claim_count = sum(len(f.get("evidence") or []) for f in [*result.nodes, *result.edges])
     shipper.add(
+        file_id=work.file_id,
         document={
             "doc_id": work.doc_id,
             "corpus_id": work.collection_id,
@@ -2556,6 +2846,7 @@ class _DocResult:
         parse_errors: int,
         seconds: float,
         cache_hits: int = 0,
+        evidence_doc_id_rewritten: int = 0,
     ) -> None:
         self.work = work
         self.nodes = nodes
@@ -2566,6 +2857,12 @@ class _DocResult:
         self.parse_errors = parse_errors
         self.seconds = seconds
         self.cache_hits = cache_hits
+        #: How many evidence entries :func:`_normalize_evidence_doc_ids`
+        #: rewrote — only ever non-zero for a document that went through
+        #: :func:`extract_one` (the cache-lookup transport). Always 0 for
+        #: the batch transport (:func:`_run_batch_pass`), which never reads
+        #: the cache and constructs a `_DocResult` directly.
+        self.evidence_doc_id_rewritten = evidence_doc_id_rewritten
 
 
 def _plan_documents(
@@ -2738,6 +3035,12 @@ def extract_one(
         reply = extractor.call(work.user_message)
         _cache_store(cache, sha256=work.sha256, model=extractor.model, fingerprint=fingerprint, suffix="", reply=reply)
     nodes, edges, parse_errors = parse_streams(reply)
+    # See `_normalize_evidence_doc_ids`'s docstring: a cache hit replays a
+    # PRIOR reply verbatim, including whatever `doc_id` that reply cited —
+    # which is only guaranteed correct when the cache key's content hash
+    # (of the CONVERTED markdown) and this document's OWN doc_id (of its
+    # SOURCE bytes) actually agree.
+    evidence_doc_id_rewritten = _normalize_evidence_doc_ids(nodes, edges, work.doc_id)
 
     kwargs = {"chunk_texts": work.chunk_texts, "filename": work.filename, "path": work.path}
     pre_repair_failures = verbatim_failures([*nodes, *edges], **kwargs)
@@ -2805,6 +3108,7 @@ def extract_one(
                 reply=retry_reply,
             )
         retry_nodes, retry_edges, retry_parse_errors = parse_streams(retry_reply)
+        evidence_doc_id_rewritten += _normalize_evidence_doc_ids(retry_nodes, retry_edges, work.doc_id)
         parse_errors += retry_parse_errors
         failed_keys = {_fact_key(fact) for fact, _ in retry_failures}
         nodes = [n for n in nodes if _fact_key(n) not in failed_keys]
@@ -2832,6 +3136,15 @@ def extract_one(
     edges = [e for e in edges if _fact_key(e) not in dropped_keys]
     dropped += len(still_bad)
 
+    if evidence_doc_id_rewritten:
+        logger.info(
+            "facts extraction: document %s — rewrote %d evidence citation(s) that named a different "
+            "doc_id (a cache-served reply originally answered for a different, byte-identical-markdown "
+            "document)",
+            work.doc_id,
+            evidence_doc_id_rewritten,
+        )
+
     return _DocResult(
         work=work,
         nodes=nodes,
@@ -2842,6 +3155,7 @@ def extract_one(
         parse_errors=parse_errors,
         seconds=round(time.time() - started, 1),
         cache_hits=cache_hits,
+        evidence_doc_id_rewritten=evidence_doc_id_rewritten,
     )
 
 
@@ -3499,7 +3813,9 @@ def run_facts_extraction(
     state = load_state(connection_id)
     docs_state: Dict[str, Any] = state["docs"]
     anonymize_marked = anonymize_marked_collection_ids(connection)
-    shipper = _BatchShipper(report=report, anonymize_marked=anonymize_marked, user=_ingest_identity())
+    shipper = _BatchShipper(
+        report=report, anonymize_marked=anonymize_marked, user=_ingest_identity(), docs_state=docs_state
+    )
 
     files_repo = corpus_files_repo()
     sources_repo = corpus_file_sources_repo()
@@ -3532,11 +3848,17 @@ def run_facts_extraction(
         try:
             shipper.flush(usage=_usage_delta(snapshot), model=model)
         except _IngestRefused:
-            # Already counted in the report by the shipper; the documents
-            # in that batch keep no state entry, so the next pass retries
-            # them. A refusal is never allowed to abort the whole pass —
-            # one collection's misconfiguration must not cost the others.
-            pass
+            # Already counted in the report by the shipper. The refused
+            # batch's documents had their `docs_state` entry written
+            # "done" OPTIMISTICALLY before this flush — the shipper's
+            # `_revert_ledger` already downgraded it (in memory) so the
+            # next pass retries them (TCRD-296 gap #62); persist that
+            # correction now rather than letting it live only in memory —
+            # a pass whose EVERY batch gets refused would otherwise never
+            # call `save_state` at all this run. A refusal is never
+            # allowed to abort the whole pass — one collection's
+            # misconfiguration must not cost the others.
+            save_state(connection_id, state)
         else:
             shipped_usage.update({k: int(v) for k, v in snapshot.items() if isinstance(v, (int, float))})
             save_state(connection_id, state)
@@ -3773,7 +4095,9 @@ def _run_batch_pass(
     docs_state: Dict[str, Any] = state["docs"]
     batch_attempts: Dict[str, int] = state.setdefault("batch_attempts", {})
     anonymize_marked = anonymize_marked_collection_ids(connection)
-    shipper = _BatchShipper(report=report, anonymize_marked=anonymize_marked, user=_ingest_identity())
+    shipper = _BatchShipper(
+        report=report, anonymize_marked=anonymize_marked, user=_ingest_identity(), docs_state=docs_state
+    )
 
     files_repo = corpus_files_repo()
     sources_repo = corpus_file_sources_repo()
@@ -3803,10 +4127,13 @@ def _run_batch_pass(
         try:
             shipper.flush(usage=_usage_delta(), model=model)
         except _IngestRefused:
-            # Counted by the shipper already; those documents keep no
-            # state entry, so the next pass resubmits them. A refusal must
-            # never abort the whole pass.
-            pass
+            # Counted by the shipper already; the shipper's own
+            # `_revert_ledger` has already downgraded the refused batch's
+            # optimistically-"done" entries (TCRD-296 gap #62) — persist
+            # that now, same reasoning as the sync transport's `_flush`
+            # above, so it survives even a pass whose every batch is
+            # refused. A refusal must never abort the whole pass.
+            save_state(connection_id, state)
         else:
             shipped_usage.update({k: int(v) for k, v in usage.items()})
             save_state(connection_id, state)
