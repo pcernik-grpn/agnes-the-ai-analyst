@@ -384,6 +384,10 @@
           { label: 'Telemetry',                   hint: 'admin',        href: '/admin/telemetry' },
           { label: 'Sessions',                    hint: 'admin',        href: '/admin/sessions' },
           { label: 'Curated marketplaces',        hint: 'admin · g c',  href: '/admin/marketplaces' },
+          {# Ungated: this list only renders for an admin (`#adminMenu`), and an
+             admin's authoring always succeeds — the apply endpoint's admin
+             branch is a plain admin write, not Studio-gated. #}
+          { label: 'New semantic model',           hint: 'authoring',    href: '/semantic-layer/new' },
           {% if can_studio %}
           { label: 'Studio',                       hint: 'authoring',    href: '/admin/studio' },
           { label: 'Studio · Data package',       hint: 'authoring',    href: '/admin/studio/data-package' },

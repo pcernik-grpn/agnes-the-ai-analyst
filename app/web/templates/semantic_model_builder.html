@@ -1,0 +1,504 @@
+{% extends "base_page.html" %}
+{# Semantic model builder — the page behind Definitions' "+ New model" card.
+
+   THE SHELL IS THE POINT. `css/builder.css` + `js/components/builder_shell.js`
+   are what /agents, /skills, the data-package drawer and the MCP builder all
+   render into, and authoring a semantic model had drifted away from them: its
+   only UI was the generic Studio page (one big YAML textarea beside a chat),
+   which is a different mental model for the same job. This page is the same
+   workspace as its siblings — input on the left, the configuration on the
+   right, the right panel the source of truth, Save the only write.
+
+   WHAT IS DELIBERATELY NOT HERE YET: the conversation. Its siblings' left pane
+   holds a builder chat backed by an `app/api/builder_core.py` adapter, and this
+   type has none. Rather than render a composer that cannot answer, the left
+   pane is the document — paste/import in, generated document out — which is
+   exactly what /admin/ontology's left pane does. The adapter is the next
+   increment and it replaces the "Start" tab; nothing else here moves.
+
+   THE DOCUMENT IS BUILT AS JSON, not YAML. `POST /api/semantic-models/apply`
+   takes "Ossie YAML/JSON text" and YAML is a superset of JSON, so
+   `JSON.stringify` gives a valid document with no hand-rolled serializer to
+   get wrong — and the server validates it either way. The Document tab shows
+   the caller exactly what Save will send.
+
+   ONE WRITE, HONESTLY LABELLED. The apply endpoint branches on authority:
+   an admin's document is published, anyone else's is queued for review. The
+   button says which BEFORE the click — the one thing the Studio page got
+   right and the half worth keeping. `can_author_model` (see
+   router::_can_author_semantic_model) is the server's answer to whether
+   either outcome is available at all; when it is false this page explains
+   itself rather than 404ing, the same posture /admin/ontology takes with the
+   facts flag off. #}
+
+{% block title %}New semantic model — {{ config.INSTANCE_NAME }}{% endblock %}
+{% block container_modifier %}container--wide{% endblock %}
+
+{% set page_hero_eyebrow = "Definitions" %}
+{% set page_hero_title = "New semantic model" %}
+{% set page_hero_subtitle = "Describe your data once — datasets, metrics and the context an agent needs to read them — so every query starts from the same definitions." if can_author_model else "Authoring is unavailable on this instance." %}
+
+{% block head_extra %}
+<link rel="stylesheet" href="{{ static_url('css/builder.css') }}">
+<style>
+  /* Page chrome only. Every colour rides a --ds-* token; the panes, sections
+     and their type come from builder.css unchanged, which is the whole reason
+     this page reads like /agents. */
+  .smb-blocked { text-align: center; padding: 48px 20px; border: 1px dashed var(--ds-border); border-radius: 14px; color: var(--ds-text-secondary); font-size: 14px; line-height: 1.6; }
+  .smb-blocked a { color: var(--ds-primary); }
+
+  /* The body under the left pane's tab strip. `builder.css` styles the strip
+     (`.ag-tabs`) but deliberately not what follows it — each builder's left
+     pane holds something different (a conversation, a picker, a document). */
+  .smb-panel { padding: 4px 22px 22px; overflow-y: auto; }
+
+  .smb-field { display: block; margin-bottom: 12px; }
+  .smb-field > span { display: block; font-size: 12.5px; font-weight: 600; color: var(--ds-text-secondary); margin-bottom: 5px; }
+  .smb-field input, .smb-field textarea {
+    width: 100%; box-sizing: border-box; font-family: inherit; font-size: 13.5px;
+    padding: 8px 10px; border: 1px solid var(--ds-border); border-radius: 9px;
+    background: var(--ds-surface); color: var(--ds-text-primary);
+  }
+  .smb-field textarea { min-height: 66px; resize: vertical; }
+  .smb-field input:focus-visible, .smb-field textarea:focus-visible { outline: var(--ds-focus-outline); outline-offset: var(--ds-focus-outline-offset); }
+  .smb-hint { font-size: 12.5px; color: var(--ds-text-muted); line-height: 1.5; margin: 0 0 10px; }
+
+  /* A repeated row (one dataset, one metric). Bordered rather than bare so a
+     three-field group reads as one object in a stack of them. */
+  .smb-row { border: 1px solid var(--ds-border); border-radius: 11px; padding: 12px 13px 2px; margin-bottom: 10px; background: var(--ds-surface-sunken); }
+  .smb-row-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 9px; }
+  .smb-row-no { font-size: 12px; font-weight: 600; color: var(--ds-text-muted); }
+  .smb-del { border: none; background: none; color: var(--ds-text-muted); cursor: pointer; font-size: 13px; padding: 2px 7px; border-radius: 8px; font-family: inherit; }
+  .smb-del:hover { color: var(--ds-accent-danger-ink); background: var(--ds-accent-danger-bg); }
+  .smb-empty-sec { font-size: 13px; color: var(--ds-text-muted); margin: 0 0 10px; }
+
+  .smb-doc { font-family: var(--ds-font-mono); font-size: 12px; line-height: 1.55; white-space: pre; overflow-x: auto; margin: 0; padding: 12px 13px; border: 1px solid var(--ds-border); border-radius: 11px; background: var(--ds-surface-sunken); color: var(--ds-text-primary); max-height: 60vh; }
+
+  /* Save's outcome, in the pane the reader is already looking at. An `applied`
+     document is live and a `submitted_for_review` one is not, and the two must
+     never look alike — hence separate tones rather than one neutral note. */
+  .smb-out { margin-top: 12px; padding: 11px 13px; border-radius: 11px; font-size: 13px; line-height: 1.55; }
+  .smb-out--ok { background: var(--ds-accent-success-bg); color: var(--ds-accent-success-ink); }
+  .smb-out--queued { background: var(--ds-accent-info-bg); color: var(--ds-accent-info-ink); }
+  .smb-out--err { background: var(--ds-accent-danger-bg); color: var(--ds-accent-danger-ink); }
+  .smb-out a { color: inherit; font-weight: 600; }
+  .smb-out ul { margin: 7px 0 0; padding-left: 18px; }
+</style>
+{% endblock %}
+
+{% block toolbar %}
+<a class="btn" href="/semantic-layer">Definitions</a>
+{% if can_author_model %}
+{# The verb is the outcome. Only ONE of the two ever renders, so the page can
+   never show a reader a promise the endpoint will not keep. #}
+<button type="button" class="btn btn-primary" id="smb-save" disabled>{% if is_admin %}Publish{% else %}Submit for review{% endif %}</button>
+{% endif %}
+{% endblock %}
+
+{% block page %}
+{% if not can_author_model %}
+<div class="smb-blocked">
+  <p>Authoring a semantic model files it for review, and the review queue is switched off on this instance.</p>
+  <p>Ask an admin to turn the Studio surface on, or to author the model for you. You can still read every
+     definition you have access to under <a href="/semantic-layer">Definitions</a>.</p>
+</div>
+{% else %}
+<div id="smb-app"></div>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+{% if can_author_model %}
+{# NOT deferred: the workspace renders on boot, so BuilderShell has to exist
+   already — same reason /agents loads it this way. #}
+<script src="{{ static_url('js/components/builder_shell.js') }}"></script>
+<script>
+(function () {
+  'use strict';
+
+  var esc = BuilderShell.esc;
+  var SPEC_VERSION = '0.2.0.dev0';
+
+  /* The verb, rendered ONCE by the server. It was a client-side ternary in two
+     places, which put BOTH verbs in the page source — so a reader viewing
+     source, or a guard test, could find the review wording in a page that
+     publishes directly. There is one outcome per caller, so there is one word
+     here, and the toolbar button above is stamped from the same condition.
+     (Which is also why this comment describes the two verbs instead of
+     spelling them: the page must contain only the one that applies.) */
+  var SAVE_VERB = {{ ('Publish' if is_admin else 'Submit for review') | tojson }};
+  var SAVE_VERB_SHORT = {{ ('Publish' if is_admin else 'Submit') | tojson }};
+
+  /* The draft. The right pane edits THIS and the document is derived from it
+     on every keystroke — one direction only, so the panel and the document
+     can never disagree about what Save will send. */
+  var draft = { name: '', description: '', datasets: [], metrics: [] };
+  var tab = 'start';
+
+  /* ── The document Save sends ───────────────────────────────────────────────
+     Optional keys are omitted rather than emitted empty: the vendored Ossie
+     schema rejects a `metrics: []` on some shapes, and an empty string is not
+     the same claim as an absent description. */
+  function documentObject() {
+    var model = { name: draft.name || 'untitled' };
+    if (draft.description) model.description = draft.description;
+
+    model.datasets = draft.datasets
+      .filter(function (d) { return d.name; })
+      .map(function (d) {
+        var out = { name: d.name, source: d.source || '', fields: [] };
+        if (d.description) out.description = d.description;
+        return out;
+      });
+
+    var metrics = draft.metrics
+      .filter(function (m) { return m.name && m.expression; })
+      .map(function (m) {
+        var out = {
+          name: m.name,
+          expression: { dialects: [{ dialect: m.dialect || 'duckdb', expression: m.expression }] }
+        };
+        if (m.description) out.description = m.description;
+        return out;
+      });
+    if (metrics.length) model.metrics = metrics;
+
+    return { version: SPEC_VERSION, semantic_model: [model] };
+  }
+
+  function documentText() {
+    return JSON.stringify(documentObject(), null, 2);
+  }
+
+  /* Save is available once the document says something true: a name to file it
+     under and at least one named dataset. A document with neither would be
+     refused by the validator, and a disabled button explains itself better
+     than a 422 does. */
+  function isSubmittable() {
+    return !!draft.name && draft.datasets.some(function (d) { return !!d.name; });
+  }
+
+  /* ── The left pane: start from a document, or read the one being built ──── */
+  function leftPane() {
+    var body = tab === 'doc'
+      ? '<p class="smb-hint">Exactly what ' + SAVE_VERB_SHORT +
+          ' will send. Generated from the configuration — edit it there.</p>' +
+        '<pre class="smb-doc" id="smb-doc">' + esc(documentText()) + '</pre>'
+      : '<p class="smb-hint">Already have an Ossie document? Paste it and it fills the ' +
+          'configuration on the right, where you can check it before anything is written. ' +
+          'Or leave this empty and build the model field by field.</p>' +
+        '<label class="smb-field"><span>Paste a document (YAML or JSON)</span>' +
+          '<textarea id="smb-paste" rows="12" spellcheck="false" ' +
+            'placeholder="version: \'' + SPEC_VERSION + '\'&#10;semantic_model:&#10;  - name: retail&#10;    datasets:&#10;      - name: orders&#10;        source: db.public.orders"></textarea>' +
+        '</label>' +
+        '<button type="button" class="btn" id="smb-import">Fill the configuration</button>' +
+        '<div id="smb-import-out"></div>';
+
+    return BuilderShell.tabs({
+      active: tab,
+      tabs: [
+        { id: 'start', label: 'Start' },
+        { id: 'doc', label: 'Document' }
+      ]
+    }) + '<div class="smb-panel">' + body + '</div>';
+  }
+
+  /* ── The right pane: the configuration, which IS the source of truth ────── */
+  function fieldsFor(kind, item, i) {
+    var p = 'data-smb-kind="' + kind + '" data-smb-i="' + i + '"';
+    var rows =
+      '<div class="smb-row-head">' +
+        '<span class="smb-row-no">' + esc(kind === 'datasets' ? 'Dataset ' : 'Metric ') + (i + 1) + '</span>' +
+        '<button type="button" class="smb-del" ' + p + ' data-smb-del="1">Remove</button>' +
+      '</div>';
+
+    if (kind === 'datasets') {
+      rows +=
+        '<label class="smb-field"><span>Name</span>' +
+          '<input type="text" ' + p + ' data-smb-f="name" value="' + esc(item.name) + '" placeholder="orders"></label>' +
+        '<label class="smb-field"><span>Source table</span>' +
+          '<input type="text" ' + p + ' data-smb-f="source" value="' + esc(item.source) + '" placeholder="db.public.orders"></label>' +
+        '<label class="smb-field"><span>What it holds, and any caveat worth knowing</span>' +
+          '<textarea ' + p + ' data-smb-f="description" placeholder="Order lines. Excludes refunds.">' + esc(item.description) + '</textarea></label>';
+    } else {
+      rows +=
+        '<label class="smb-field"><span>Name</span>' +
+          '<input type="text" ' + p + ' data-smb-f="name" value="' + esc(item.name) + '" placeholder="revenue"></label>' +
+        '<label class="smb-field"><span>Expression</span>' +
+          '<input type="text" ' + p + ' data-smb-f="expression" value="' + esc(item.expression) + '" placeholder="SUM(amount)"></label>' +
+        '<label class="smb-field"><span>Dialect</span>' +
+          '<input type="text" ' + p + ' data-smb-f="dialect" value="' + esc(item.dialect) + '" placeholder="duckdb"></label>' +
+        '<label class="smb-field"><span>What it measures</span>' +
+          '<textarea ' + p + ' data-smb-f="description" placeholder="Total order revenue, net of refunds.">' + esc(item.description) + '</textarea></label>';
+    }
+    return '<div class="smb-row">' + rows + '</div>';
+  }
+
+  function listSection(kind, no, title, sub, emptyLine, addLabel) {
+    var items = draft[kind];
+    var body = items.length
+      ? items.map(function (it, i) { return fieldsFor(kind, it, i); }).join('')
+      : '<p class="smb-empty-sec">' + esc(emptyLine) + '</p>';
+    body += '<button type="button" class="btn" data-smb-add="' + kind + '">' + esc(addLabel) + '</button>';
+
+    return BuilderShell.section({
+      key: kind, no: no, title: title, sub: sub,
+      summary: items.length ? String(items.length) : 'none',
+      collapsed: false,
+      body: body
+    });
+  }
+
+  function configPane() {
+    var model = BuilderShell.section({
+      key: 'model', no: '1', title: 'Model',
+      sub: 'The name files the model and is what a reader sees in Definitions.',
+      summary: draft.name || 'unnamed',
+      collapsed: false,
+      body:
+        '<label class="smb-field"><span>Name</span>' +
+          '<input type="text" data-smb-model="name" value="' + esc(draft.name) + '" placeholder="retail"></label>' +
+        '<label class="smb-field"><span>Description</span>' +
+          '<textarea data-smb-model="description" placeholder="Retail domain: orders and customers.">' + esc(draft.description) + '</textarea></label>'
+    });
+
+    var datasets = listSection('datasets', '2', 'Datasets',
+      'One per table the model describes. A dataset with no name is ignored.',
+      'No dataset yet — a model needs at least one.', '+ Add a dataset');
+
+    var metrics = listSection('metrics', '3', 'Metrics',
+      'Optional. Check for a canonical definition before writing new SQL.',
+      'No metric yet. Datasets alone are a useful model.', '+ Add a metric');
+
+    return model + datasets + metrics;
+  }
+
+  function render() {
+    document.getElementById('smb-app').innerHTML = BuilderShell.workspace({
+      left: leftPane(),
+      cfgTitle: 'Configuration',
+      cfgSub: 'This is what gets written. Nothing is saved until you press ' +
+              SAVE_VERB + '.',
+      cfgBodyId: 'smb-cfg',
+      cfg: configPane()
+    });
+    var save = document.getElementById('smb-save');
+    if (save) save.disabled = !isSubmittable();
+  }
+
+  /* Repaint only the derived views a keystroke can change. Re-rendering the
+     whole workspace on every character would take the caret with it. */
+  function refreshDerived() {
+    var doc = document.getElementById('smb-doc');
+    if (doc) doc.textContent = documentText();
+    var save = document.getElementById('smb-save');
+    if (save) save.disabled = !isSubmittable();
+  }
+
+  /* ── Reading a pasted document back into the draft ────────────────────────
+     JSON only, by design: a YAML parser is a dependency this page does not
+     need, and a document pasted as YAML gets a clear "paste JSON, or build it
+     here" rather than a silent half-import. The server remains the only
+     validator either way. */
+  function importPasted() {
+    var raw = (document.getElementById('smb-paste') || {}).value || '';
+    var out = document.getElementById('smb-import-out');
+    if (!raw.trim()) { out.innerHTML = ''; return; }
+
+    var parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (e) {
+      out.innerHTML = '<div class="smb-out smb-out--err">This reads as YAML, which this box cannot parse yet. ' +
+        'Paste the document as JSON, or build the model in the configuration on the right.</div>';
+      return;
+    }
+
+    var model = (parsed && parsed.semantic_model && parsed.semantic_model[0]) || null;
+    if (!model || !model.name) {
+      out.innerHTML = '<div class="smb-out smb-out--err">No model found. A document is ' +
+        '<code>semantic_model:</code> with at least one named entry.</div>';
+      return;
+    }
+
+    draft.name = String(model.name || '');
+    draft.description = String(model.description || '');
+    draft.datasets = (model.datasets || []).map(function (d) {
+      return {
+        name: String(d.name || ''),
+        source: String(d.source || ''),
+        description: String(d.description || '')
+      };
+    });
+    draft.metrics = (model.metrics || []).map(function (m) {
+      var dia = (m.expression && m.expression.dialects && m.expression.dialects[0]) || {};
+      return {
+        name: String(m.name || ''),
+        expression: String(dia.expression || ''),
+        dialect: String(dia.dialect || ''),
+        description: String(m.description || '')
+      };
+    });
+
+    render();
+    var o = document.getElementById('smb-import-out');
+    if (o) {
+      o.innerHTML = '<div class="smb-out smb-out--ok">Filled the configuration: ' +
+        draft.datasets.length + ' dataset(s), ' + draft.metrics.length + ' metric(s). ' +
+        'Nothing is written yet.</div>';
+    }
+  }
+
+  /* ── The one write ───────────────────────────────────────────────────────── */
+  function outcomeBox(cls, html) {
+    var cfg = document.getElementById('smb-cfg');
+    if (!cfg) return;
+    var old = document.getElementById('smb-out');
+    if (old) old.remove();
+    var box = document.createElement('div');
+    box.id = 'smb-out';
+    box.className = 'smb-out smb-out--' + cls;
+    box.innerHTML = html;
+    cfg.appendChild(box);
+    box.scrollIntoView({ block: 'nearest' });
+  }
+
+  function save() {
+    var btn = document.getElementById('smb-save');
+    btn.disabled = true;
+    var label = btn.textContent;
+    btn.textContent = 'Working…';
+
+    fetch('/api/semantic-models/apply', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ document: documentText(), description: draft.description || '' })
+    }).then(function (r) {
+      return r.json().then(function (body) { return { status: r.status, body: body }; });
+    }).then(function (res) {
+      btn.textContent = label;
+      btn.disabled = !isSubmittable();
+
+      if (res.status === 200 && res.body.outcome === 'applied') {
+        var slug = (res.body.model && res.body.model.slug) || draft.name;
+        outcomeBox('ok', 'Published. <a href="/semantic-layer/' + encodeURIComponent(slug) +
+          '">Open ' + esc(slug) + '</a> — it is live and agents can read it now.');
+        return;
+      }
+      if (res.status === 200 && res.body.outcome === 'submitted_for_review') {
+        outcomeBox('queued', 'Submitted for review. An admin has to approve it before it goes live — ' +
+          'it is <strong>not</strong> readable by agents yet.');
+        return;
+      }
+      outcomeBox('err', errorHtml(res));
+    }).catch(function () {
+      btn.textContent = label;
+      btn.disabled = !isSubmittable();
+      outcomeBox('err', 'Could not reach the server. Nothing was written.');
+    });
+  }
+
+  /* The apply endpoint's failures are all actionable, so each says what to do
+     rather than echoing a code.
+
+     THREE KEYS, ONE CONCEPT. The endpoint names its error under `code` for the
+     shared guards (`source_owned`, `stale_document`, raised as
+     SemanticApplyError and reshaped at semantic_models.py:514), under `kind`
+     for its own two (`studio_disabled`, `duplicate_pending`), and under
+     neither for a plain validation failure. Reading only one of them is why
+     this started out showing the generic "Save failed" for every 409. Left
+     un-normalized on the SERVER on purpose: the CLI, the MCP tools and chat
+     all read these bodies, so collapsing the keys is its own change with its
+     own callers to check, not a detail of this page.
+
+     `errors` is likewise either a list (the admin create path) or one string
+     (SemanticApplyError), so it is normalized before rendering rather than
+     `.map`-ed on faith — a string has a `.length` and no `.map`, which would
+     have thrown inside the error handler. */
+  function errorHtml(res) {
+    var d = (res.body && res.body.detail) || {};
+    var code = d.code || d.kind || d.error || (typeof d === 'string' ? d : '');
+    var serverMsg = typeof d.message === 'string' ? d.message : '';
+
+    if (res.status === 422) {
+      var raw = d.errors;
+      var errs = Array.isArray(raw) ? raw : (raw ? [raw] : []);
+      return 'The document does not validate.' +
+        (errs.length
+          ? '<ul>' + errs.map(function (e) { return '<li>' + esc(String(e)) + '</li>'; }).join('') + '</ul>'
+          : '');
+    }
+    if (code === 'source_owned') {
+      /* The server's own message names the owning source, which is the part
+         that tells the reader where to go. Prefer it over anything canned. */
+      return esc(serverMsg) || 'A model with this name is owned by an imported source, ' +
+        'so it cannot be replaced by hand. Pick another name, or edit it upstream.';
+    }
+    if (code === 'duplicate_pending') {
+      return 'You already have a proposal for this name awaiting review. ' +
+        'Wait for it, or choose another name.';
+    }
+    if (code === 'stale_document') {
+      return esc(serverMsg) || 'This model changed since the page loaded. Reload and reapply your edits.';
+    }
+    if (code === 'studio_disabled') {
+      return 'Submitting for review is switched off on this instance. Ask an admin to turn it on, ' +
+        'or to author the model for you. Nothing was written.';
+    }
+    return 'Save failed' + (code ? ' (' + esc(String(code)) + ')' : '') +
+      '. Nothing was written.' + (serverMsg ? ' ' + esc(serverMsg) : '');
+  }
+
+  /* ── Wiring. One delegated listener per event, on the container. ─────────── */
+  var app = document.getElementById('smb-app');
+
+  app.addEventListener('input', function (e) {
+    var t = e.target;
+    if (t.dataset.smbModel) {
+      draft[t.dataset.smbModel] = t.value;
+      refreshDerived();
+      return;
+    }
+    if (t.dataset.smbF) {
+      draft[t.dataset.smbKind][Number(t.dataset.smbI)][t.dataset.smbF] = t.value;
+      refreshDerived();
+    }
+  });
+
+  app.addEventListener('click', function (e) {
+    var t = e.target;
+
+    var add = t.closest('[data-smb-add]');
+    if (add) {
+      var kind = add.dataset.smbAdd;
+      draft[kind].push(kind === 'datasets'
+        ? { name: '', source: '', description: '' }
+        : { name: '', expression: '', dialect: '', description: '' });
+      render();
+      return;
+    }
+
+    if (t.dataset.smbDel) {
+      draft[t.dataset.smbKind].splice(Number(t.dataset.smbI), 1);
+      render();
+      return;
+    }
+
+    if (t.id === 'smb-import') { importPasted(); return; }
+
+    var tabBtn = t.closest('[data-ag-tab]');
+    if (tabBtn) {
+      tab = tabBtn.dataset.agTab;
+      render();
+    }
+  });
+
+  var saveBtn = document.getElementById('smb-save');
+  if (saveBtn) saveBtn.addEventListener('click', save);
+
+  render();
+})();
+</script>
+{% endif %}
+{% endblock %}

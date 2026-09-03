@@ -1281,6 +1281,10 @@ READ_POSTURE: dict[str, str] = {
     "GET /profile/sessions": "exempt:ui_support",
     "GET /profile/sessions/{filename}": "session_download",
     "GET /semantic-layer": "exempt:ui_support",
+    # The builder page renders a blank draft and reads nothing about the
+    # caller; the WRITE it leads to is POST /api/semantic-models/apply,
+    # which carries its own audit action.
+    "GET /semantic-layer/new": "exempt:ui_support",
     "GET /semantic-layer/{slug}": "exempt:ui_support",
     "GET /semantic-layer/{slug}/{object_id:path}": "exempt:ui_support",
     "GET /setup": "exempt:ui_support",
