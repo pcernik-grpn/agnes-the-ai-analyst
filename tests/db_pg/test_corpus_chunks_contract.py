@@ -228,3 +228,99 @@ def test_list_for_corpora_spans_multiple(repo):
     corpora = {r["corpus_id"] for r in rows}
     assert {"col_a", "col_b"} <= corpora
     assert repo.list_for_corpora([]) == []
+
+
+# ---------------------------------------------------------------------------
+# #2151 hardening: column-pruned fetch, cheap COUNT, shortlist embeddings,
+# SQL-side lexical prefilter + LIMIT cap.
+# ---------------------------------------------------------------------------
+
+
+def test_list_for_corpora_never_returns_a_stored_embedding(repo):
+    """``list_for_corpora`` is the retrieval candidate-set fetch — it must
+    never bring the (potentially large) ``embedding`` column back, even for
+    a chunk that has one stored. Phase 2 (``list_embeddings_for_ids``) is the
+    only path that fetches vectors, and only for a caller-chosen id set."""
+    vec = [0.01 * i for i in range(384)]
+    repo.add_many([{"corpus_id": CORPUS_ID, "file_id": FILE_ID, "ordinal": 0, "text": "v", "embedding": vec}])
+    rows = repo.list_for_corpora([CORPUS_ID])
+    assert len(rows) == 1
+    assert rows[0]["embedding"] is None
+    # The other columns are unaffected by column pruning.
+    assert rows[0]["text"] == "v"
+    assert rows[0]["id"]
+
+
+def test_count_for_corpora_matches_row_count(repo):
+    repo.add_many(
+        [
+            {"corpus_id": CORPUS_ID, "file_id": FILE_ID, "ordinal": 0, "text": "a"},
+            {"corpus_id": CORPUS_ID, "file_id": FILE_ID, "ordinal": 1, "text": "b"},
+        ]
+    )
+    assert repo.count_for_corpora([CORPUS_ID]) == 2
+
+
+def test_count_for_corpora_spans_multiple_and_empty_is_zero(repo):
+    repo.add_many([{"corpus_id": "col_a", "file_id": "cf_a", "ordinal": 0, "text": "aa"}])
+    repo.add_many([{"corpus_id": "col_b", "file_id": "cf_b", "ordinal": 0, "text": "bb"}])
+    assert repo.count_for_corpora(["col_a", "col_b"]) == 2
+    assert repo.count_for_corpora([]) == 0
+    assert repo.count_for_corpora(["col_nonexistent"]) == 0
+
+
+def test_list_embeddings_for_ids_returns_only_requested_ids_with_vectors(repo):
+    vec = [0.02 * i for i in range(384)]
+    repo.add_many(
+        [
+            {"corpus_id": CORPUS_ID, "file_id": FILE_ID, "ordinal": 0, "text": "has vector", "embedding": vec},
+            {"corpus_id": CORPUS_ID, "file_id": FILE_ID, "ordinal": 1, "text": "no vector"},
+        ]
+    )
+    rows = repo.list_for_corpora([CORPUS_ID])
+    by_text = {r["text"]: r["id"] for r in rows}
+    embedded_id, bare_id = by_text["has vector"], by_text["no vector"]
+
+    out = repo.list_embeddings_for_ids([embedded_id, bare_id, "ck_doesnotexist"])
+    assert set(out.keys()) == {embedded_id}
+    assert len(out[embedded_id]) == 384
+    assert abs(out[embedded_id][1] - 0.02) < 1e-6
+
+
+def test_list_embeddings_for_ids_empty_input_returns_empty_dict(repo):
+    assert repo.list_embeddings_for_ids([]) == {}
+
+
+def test_list_for_corpora_query_terms_prefilter_is_any_term_ilike(repo):
+    """The SQL-side lexical prefilter (used once a corpus is over the
+    server's chunk cap) keeps a chunk whose text contains ANY listed term —
+    a conservative, over-inclusive filter safe for a prefilter (the exact,
+    whole-word ranking still runs in Python over whatever this returns)."""
+    repo.add_many(
+        [
+            {"corpus_id": CORPUS_ID, "file_id": FILE_ID, "ordinal": 0, "text": "kubernetes cluster"},
+            {"corpus_id": CORPUS_ID, "file_id": FILE_ID, "ordinal": 1, "text": "unrelated weather report"},
+            {"corpus_id": CORPUS_ID, "file_id": FILE_ID, "ordinal": 2, "text": "another unrelated row"},
+        ]
+    )
+    rows = repo.list_for_corpora([CORPUS_ID], query_terms=["kubernetes"])
+    assert len(rows) == 1
+    assert rows[0]["text"] == "kubernetes cluster"
+
+    # Case-insensitive, and ANY (not ALL) listed term matches.
+    rows_ci = repo.list_for_corpora([CORPUS_ID], query_terms=["KUBERNETES", "weather"])
+    assert {r["text"] for r in rows_ci} == {"kubernetes cluster", "unrelated weather report"}
+
+
+def test_list_for_corpora_limit_caps_row_count(repo):
+    repo.add_many([{"corpus_id": CORPUS_ID, "file_id": FILE_ID, "ordinal": i, "text": f"row {i}"} for i in range(5)])
+    rows = repo.list_for_corpora([CORPUS_ID], limit=2)
+    assert len(rows) == 2
+
+
+def test_list_for_corpora_no_query_terms_or_limit_is_unfiltered(repo):
+    """Under the cap (the default, common case): no prefilter, no cap —
+    behavior identical to the pre-#2151 unfiltered fetch, minus embeddings."""
+    repo.add_many([{"corpus_id": CORPUS_ID, "file_id": FILE_ID, "ordinal": i, "text": f"row {i}"} for i in range(5)])
+    rows = repo.list_for_corpora([CORPUS_ID])
+    assert len(rows) == 5

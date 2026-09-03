@@ -8,12 +8,24 @@ by ``tests/db_pg/test_corpus_chunks_contract.py``.
 from __future__ import annotations
 
 import secrets
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import sqlalchemy as sa
 from sqlalchemy.engine import Engine
 
 _EMBED_DIM = 384
+
+# Column-pruned SELECT list for the retrieval candidate-set fetch (#2151) —
+# mirrors src/repositories/corpus_chunks.py's ``_SELECT_NO_EMBED``. Never
+# selects ``embedding``; ``list_embeddings_for_ids`` is the only path that
+# fetches vectors, and only for a caller-bounded id set.
+_SELECT_NO_EMBED = "id, corpus_id, file_id, ordinal, text, section_path, page, bbox, metadata, created_at"
+
+# Same 5s budget as src/repositories/facts_pg.py's ``_STATEMENT_TIMEOUT_MS``
+# (SET LOCAL statement_timeout idiom) — duplicated per-module like
+# ``_EMBED_DIM`` above rather than cross-imported from a sibling repo's
+# private constant.
+_STATEMENT_TIMEOUT_MS = 5_000
 
 
 class CorpusChunksPgRepository:
@@ -122,22 +134,83 @@ class CorpusChunksPgRepository:
             )
         return [dict(r) for r in rows]
 
-    def list_for_corpora(self, corpus_ids: List[str]) -> List[Dict[str, Any]]:
-        """All chunks across several corpora (for retrieval). Empty list → []."""
+    def list_for_corpora(
+        self,
+        corpus_ids: List[str],
+        *,
+        query_terms: Optional[List[str]] = None,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Candidate chunks across several corpora, for retrieval (#2151).
+
+        Mirrors ``src/repositories/corpus_chunks.py``'s DuckDB sibling —
+        see its docstring for the column-pruning / prefilter / limit
+        contract. ``SET LOCAL statement_timeout`` guards the query the same
+        way ``src/repositories/facts_pg.py``'s ILIKE-driven candidate scans
+        are guarded (an unbounded prefilter scan must not stall a pooled
+        connection). DuckDB has no equivalent per-statement wall-clock
+        timeout primitive, so that guard is PG-only; the row cap (``limit``)
+        is the shared, cross-backend bound both repos apply.
+        """
         if not corpus_ids:
             return []
-        with self._engine.connect() as conn:
-            rows = (
-                conn.execute(
-                    sa.text(
-                        "SELECT id, corpus_id, file_id, ordinal, text, embedding, "
-                        "       section_path, page, bbox, metadata, created_at "
-                        "FROM corpus_chunks WHERE corpus_id IN :corpus_ids "
-                        "ORDER BY file_id, ordinal"
-                    ).bindparams(sa.bindparam("corpus_ids", expanding=True)),
-                    {"corpus_ids": list(corpus_ids)},
-                )
-                .mappings()
-                .all()
-            )
-        return [dict(r) for r in rows]
+        params: Dict[str, Any] = {"corpus_ids": list(corpus_ids)}
+        where_extra = ""
+        if query_terms:
+            term_clauses = []
+            for i, term in enumerate(query_terms):
+                key = f"term_{i}"
+                term_clauses.append(f"text ILIKE :{key}")
+                params[key] = f"%{term}%"
+            where_extra = " AND (" + " OR ".join(term_clauses) + ")"
+        limit_sql = ""
+        if limit is not None:
+            params["limit_n"] = int(limit)
+            limit_sql = " LIMIT :limit_n"
+        sql = sa.text(
+            f"SELECT {_SELECT_NO_EMBED} FROM corpus_chunks "
+            f"WHERE corpus_id IN :corpus_ids{where_extra} "
+            f"ORDER BY file_id, ordinal{limit_sql}"
+        ).bindparams(sa.bindparam("corpus_ids", expanding=True))
+        with self._engine.begin() as conn:
+            conn.execute(sa.text(f"SET LOCAL statement_timeout = {_STATEMENT_TIMEOUT_MS}"))
+            rows = conn.execute(sql, params).mappings().all()
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["embedding"] = None
+            out.append(d)
+        return out
+
+    def count_for_corpora(self, corpus_ids: List[str]) -> int:
+        """Cheap ``COUNT(*)`` across several corpora — the precheck that
+        decides whether ``list_for_corpora`` needs the cap/prefilter path
+        (#2151). Empty ``corpus_ids`` → 0."""
+        if not corpus_ids:
+            return 0
+        with self._engine.begin() as conn:
+            conn.execute(sa.text(f"SET LOCAL statement_timeout = {_STATEMENT_TIMEOUT_MS}"))
+            row = conn.execute(
+                sa.text("SELECT COUNT(*) FROM corpus_chunks WHERE corpus_id IN :corpus_ids").bindparams(
+                    sa.bindparam("corpus_ids", expanding=True)
+                ),
+                {"corpus_ids": list(corpus_ids)},
+            ).first()
+        return int(row[0]) if row else 0
+
+    def list_embeddings_for_ids(self, ids: List[str]) -> Dict[str, List[float]]:
+        """``{chunk_id: embedding}`` for the given ids that HAVE a stored
+        vector (#2151) — phase 2 of the retrieval layer's two-phase hybrid
+        fetch. An id with no stored embedding (or that does not exist) is
+        simply absent from the returned mapping. Empty ``ids`` → ``{}``."""
+        if not ids:
+            return {}
+        with self._engine.begin() as conn:
+            conn.execute(sa.text(f"SET LOCAL statement_timeout = {_STATEMENT_TIMEOUT_MS}"))
+            rows = conn.execute(
+                sa.text("SELECT id, embedding FROM corpus_chunks WHERE id IN :ids").bindparams(
+                    sa.bindparam("ids", expanding=True)
+                ),
+                {"ids": list(ids)},
+            ).all()
+        return {r[0]: list(r[1]) for r in rows if r[1] is not None}

@@ -45,11 +45,13 @@ unaffected.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, List, Optional
 
+import sqlalchemy as sa
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
@@ -411,8 +413,23 @@ async def search_collections(
     conversation's permanent title. The count is what makes the difference
     checkable, and the hint names the three engine behaviours that make a
     reasonable query miss (see ``src.ingest.retrieval``).
+
+    Very large corpora (#2151) are bounded server-side by
+    ``collections.search_max_chunks``: over the cap, the response carries
+    ``truncated: true`` (plus ``truncated_cap`` and a ``truncated_note``)
+    instead of ranking every accessible chunk — narrow with ``corpus_id`` or
+    a more specific query to search the excluded rest. A query with no
+    usable term to narrow BY, over the cap, is refused with a typed
+    ``422 search_query_too_broad`` rather than ranking an arbitrary slice.
+    A search backend outage answers a typed ``503 search_unavailable``
+    instead of an anonymous server error.
     """
-    from src.ingest.retrieval import retrieval_mode, search as _search
+    from src.ingest.retrieval import (
+        BROAD_CORPUS_HINT,
+        SearchQueryTooBroad,
+        retrieval_mode,
+        search_with_meta,
+    )
 
     allowed = _accessible_corpus_ids(user)
     # A BLANK `corpus_id` means "no filter", not "the collection whose id is
@@ -426,7 +443,43 @@ async def search_collections(
     if corpus_id is not None:
         allowed = [c for c in allowed if c == corpus_id]
     k = max(1, min(k, 50))
-    results = _search(allowed, q, k=k)
+    try:
+        # #2151: search_with_meta does a DB fetch + pure-Python IDF/cosine
+        # ranking over up to `collections.search_max_chunks` rows — real CPU
+        # + I/O work that must not run inline on the event loop and block
+        # every other request this process is serving. `asyncio.to_thread`
+        # is this codebase's established offload idiom for exactly this
+        # (e.g. `app/api/mcp/foundation_tools.py`'s
+        # `facts_repo().count_visible_facts_by_type` call).
+        meta = await asyncio.to_thread(search_with_meta, allowed, q, k=k)
+    except SearchQueryTooBroad as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "search_query_too_broad",
+                "hint": BROAD_CORPUS_HINT,
+                "cap": exc.cap,
+                "chunk_count": exc.chunk_count,
+            },
+        ) from exc
+    except (MemoryError, sa.exc.OperationalError, sa.exc.DBAPIError) as exc:
+        # #2151: a genuinely oversized candidate set (or a DB-side timeout/
+        # connection failure while fetching one) must fail typed and loud
+        # server-side, never as the anonymous 500 the app-wide catch-all
+        # would otherwise turn it into. Anything else (a real bug) still
+        # propagates unchanged.
+        logger.warning("collections search unavailable (corpora=%s): %s", allowed, exc)
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "search_unavailable",
+                "hint": (
+                    "Search is temporarily unavailable — retry shortly, or narrow with "
+                    "collection_id or a more specific query."
+                ),
+            },
+        ) from exc
+    results = meta["results"]
 
     # Chunks must not leak what claims withhold (spec §9): a tiered
     # collection's snippets are silently dropped for a caller below its top
@@ -445,6 +498,21 @@ async def search_collections(
 
     results = [r for r in results if _chunk_text_visible(r.get("corpus_id"))]
     payload: dict = {"results": results, "retrieval": retrieval_mode()}
+    if meta["truncated"]:
+        # #2151: the candidate set was capped server-side (collections.
+        # search_max_chunks) — disclosed rather than silently ranking a
+        # partial corpus. `k` bounds `results` regardless, so this response
+        # is never large enough for the MCP tool-output budget compaction
+        # (src.mcp_tooling.compact_search_results, which reuses `truncated`/
+        # `truncated_note` for a DIFFERENT reason — wire-size shortening) to
+        # collide with this note in practice.
+        payload["truncated"] = True
+        payload["truncated_cap"] = meta["cap"]
+        payload["truncated_note"] = (
+            f"This collection set has more than {meta['cap']:,} chunks; the search ran "
+            f"over the {meta['cap']:,} chunks matching your query terms, not the full "
+            f"corpus. {BROAD_CORPUS_HINT}"
+        )
     if not results:
         payload["searched_collections"] = len(allowed)
         payload["hint"] = _empty_search_hint(len(allowed), corpus_id)

@@ -423,6 +423,31 @@ def _facts_caller(headers_fn: Callable[[], dict[str, str]]) -> Any:
     return caller
 
 
+#: The fact-graph query tools — every one of them 404s (``facts_disabled``)
+#: while the ``facts`` feature switch is off, so ``tools/list`` must not offer
+#: them then: each tool's own description tells the agent to reach for it
+#: FIRST on who/what questions, and an instance with the switch off saw the
+#: first tool call of a turn fail with ``404: facts_disabled`` (issue #2161).
+FACT_TOOL_NAMES: frozenset[str] = frozenset(
+    {"fact_search", "fact_type_map", "fact_facets", "fact_neighbors", "fact_claims", "fact_edges"}
+)
+
+
+def feature_hidden_tool_names() -> frozenset[str]:
+    """Foundation tools ``tools/list`` must hide on THIS instance right now.
+
+    Evaluated per listing, not at registration — the switches live in the
+    ``/admin/server-config`` overlay and can flip without a restart. Hidden
+    only, never unregistered: a call to a hidden tool still runs its own
+    gate (``require_facts_enabled``), so the two cannot disagree.
+    """
+    from app.instance_config import feature_enabled
+
+    if feature_enabled("facts", "enabled", env_var="AGNES_FACTS_ENABLED", default=False):
+        return frozenset()
+    return FACT_TOOL_NAMES
+
+
 def register_foundation_tools(
     mcp: FastMCP,
     *,
@@ -600,6 +625,16 @@ def register_foundation_tools(
         in full with ``collection_file_read(collection_id=<corpus_id>,
         file_id=<file_id>)`` (a chunk hit carries both), or narrow the query /
         lower ``k``; ``truncated_note`` says exactly what was cut.
+
+        A large collection set (#2151) can ALSO set ``truncated: true`` for a
+        different reason: the server ranked over a bounded, query-matched
+        subset of the corpus rather than every accessible chunk. That case
+        carries its own ``truncated_cap`` (the chunk limit applied) alongside
+        ``truncated_note`` — narrow with ``collection_id`` or a more specific
+        query to reach what was excluded. A query too generic to narrow the
+        corpus by (e.g. only common words) is refused outright rather than
+        silently ranking an arbitrary slice; the tool call raises with the
+        server's ``search_query_too_broad`` detail in that case.
 
         Args:
             query: Natural-language or keyword query.
