@@ -738,7 +738,12 @@ variable "enable_gcp_logging" {
     files/ops-agent-config.yaml, since enable_datadog is the path that
     collects those; without the role, though, every export cycle fails and
     floods the serial console with monitoring.timeSeries.create
-    PermissionDenied.
+    PermissionDenied. Order matters when upgrading an already-provisioned VM:
+    the grant lands on `terraform apply`, while the agent config only reaches
+    the VM on instance replacement, so until you recreate it that VM keeps
+    the built-in hostmetrics receiver and now exports it successfully, billed
+    by ingested bytes. Recreating closes the window and is the same step
+    every other startup-script change from this module needs anyway.
 
     The IAM grants mean the identity running `terraform apply` must be
     allowed to modify project IAM policy (e.g.
