@@ -625,6 +625,16 @@ def register_foundation_tools(
         file_id=<file_id>)`` (a chunk hit carries both), or narrow the query /
         lower ``k``; ``truncated_note`` says exactly what was cut.
 
+        A large collection set (#2151) can ALSO set ``truncated: true`` for a
+        different reason: the server ranked over a bounded, query-matched
+        subset of the corpus rather than every accessible chunk. That case
+        carries its own ``truncated_cap`` (the chunk limit applied) alongside
+        ``truncated_note`` — narrow with ``collection_id`` or a more specific
+        query to reach what was excluded. A query too generic to narrow the
+        corpus by (e.g. only common words) is refused outright rather than
+        silently ranking an arbitrary slice; the tool call raises with the
+        server's ``search_query_too_broad`` detail in that case.
+
         Args:
             query: Natural-language or keyword query.
             k: Max results (default 10).

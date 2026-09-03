@@ -171,8 +171,8 @@ class TestANameHitCannotCrowdOutRealMatches:
 
         real = retrieval.rank_chunks
 
-        def _always_scores(chunks, query, *, k=10):
-            top, _conf = real(chunks, query, k=k)
+        def _always_scores(chunks, query, *, k=10, **kwargs):
+            top, _conf = real(chunks, query, k=k, **kwargs)
             if top:
                 return top, "medium"
             return [(0.42, ch) for ch in chunks][:k], "medium"
