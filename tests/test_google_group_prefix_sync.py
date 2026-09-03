@@ -613,3 +613,76 @@ class TestSharePointAclSyncManagedGuard:
         )
         assert r.status_code == 409
         assert r.json()["detail"]["code"] == "sharepoint_managed_readonly"
+
+
+class TestMicrosoftSyncManagedGuard:
+    """`_SYNC_MANAGED_SENTINELS` also covers the login-time Microsoft Entra
+    ID group sync (`created_by='system:microsoft-sync'`) — a distinct
+    sentinel/code from both Google's and SharePoint's, even though a
+    Microsoft-synced group shares SharePoint's `entra:<oid>` naming (both
+    key the same Entra group identically, see `src.entra_identity`)."""
+
+    @pytest.fixture
+    def admin_client_with_microsoft_group(self, tmp_path, monkeypatch, shared_app):
+        monkeypatch.setenv("DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("JWT_SECRET_KEY", "test-secret-32chars-minimum!!!!!")
+
+        from app.auth.jwt import create_access_token
+        from src.db import get_system_db
+        from src.repositories.user_group_members import UserGroupMembersRepository
+        from src.repositories.user_groups import UserGroupsRepository
+        from src.repositories.users import UserRepository
+
+        conn = get_system_db()
+        try:
+            ur = UserRepository(conn)
+            ur.create(id="admin1", email="admin@x", name="Admin1")
+            ug = UserGroupsRepository(conn)
+            admin_id = ug.get_by_name("Admin")["id"]
+            UserGroupMembersRepository(conn).add_member("admin1", admin_id, source="system_seed")
+            ug.ensure("entra:ms-test-oid", created_by="system:microsoft-sync")
+        finally:
+            conn.close()
+
+        client = TestClient(shared_app, follow_redirects=False)
+        token = create_access_token("admin1", "admin@x")
+        client.cookies.set("access_token", token)
+        return client
+
+    def _gid(self, name):
+        from src.db import get_system_db
+        from src.repositories.user_groups import UserGroupsRepository
+
+        conn = get_system_db()
+        try:
+            return UserGroupsRepository(conn).get_by_name(name)["id"]
+        finally:
+            conn.close()
+
+    def test_is_google_managed_is_false_for_a_microsoft_group(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("DATA_DIR", str(tmp_path))
+        from app.api.access import _is_google_managed
+
+        g = {"name": "entra:ms-test-oid", "is_system": False, "created_by": "system:microsoft-sync"}
+        assert _is_google_managed(g) is False
+
+    def test_patch_microsoft_managed_returns_409(self, admin_client_with_microsoft_group):
+        gid = self._gid("entra:ms-test-oid")
+        r = admin_client_with_microsoft_group.patch(f"/api/admin/groups/{gid}", json={"name": "renamed"})
+        assert r.status_code == 409
+        assert r.json()["detail"]["code"] == "microsoft_managed_readonly"
+
+    def test_delete_microsoft_managed_returns_409(self, admin_client_with_microsoft_group):
+        gid = self._gid("entra:ms-test-oid")
+        r = admin_client_with_microsoft_group.delete(f"/api/admin/groups/{gid}")
+        assert r.status_code == 409
+        assert r.json()["detail"]["code"] == "microsoft_managed_readonly"
+
+    def test_add_member_to_microsoft_managed_returns_409(self, admin_client_with_microsoft_group):
+        gid = self._gid("entra:ms-test-oid")
+        r = admin_client_with_microsoft_group.post(
+            f"/api/admin/groups/{gid}/members",
+            json={"email": "admin@x"},
+        )
+        assert r.status_code == 409
+        assert r.json()["detail"]["code"] == "microsoft_managed_readonly"

@@ -1323,6 +1323,19 @@ _EXEMPT: dict[str, str] = {
         "MCP-exposed: combines collections/consolidate's visibility-write exemption "
         "with clone/splits' connection-lifecycle one, both already carved out above"
     ),
+    # Site-group -> Agnes-group ACL mirroring map (2026-09 fix) — grants
+    # access to whoever the mapped Agnes group(s) already contain, the same
+    # visibility-shaping write class as scopes/scopes-bulk's own group_ids
+    # checkbox. CLI-reachable (`agnes admin sharepoint acl map-site-group`)
+    # but deliberately not MCP-exposed: an agent-invokable tool that can
+    # widen a collection's grantee set is a privilege-escalation seam, not
+    # a query surface — same standing exemption class as the other
+    # SharePoint admin writers above.
+    "/api/admin/sharepoint/connections/{connection_id}/acl-site-group-map": (
+        "replace a connection's SharePoint site-group -> Agnes-group ACL mirroring map — "
+        "CLI-reachable (agnes admin sharepoint acl map-site-group) but deliberately not "
+        "MCP-exposed: mirrors scopes/scopes-bulk's own group-grant/visibility-write exemption"
+    ),
     "/api/admin/sharepoint/connections/{connection_id}/manual-sites": (
         "persist/forget a site the admin resolved by URL — the Sites.Selected escape "
         "hatch's other half, keeping the wizard's step-2 sites level populated across "

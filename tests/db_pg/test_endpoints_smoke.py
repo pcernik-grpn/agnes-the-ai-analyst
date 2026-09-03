@@ -3645,6 +3645,15 @@ KNOWN_UNTESTED = {
     # not duplicated here.
     "POST /api/admin/sharepoint/connections/{connection_id}/scopes/bulk",
     "POST /api/admin/sharepoint/connections/{connection_id}/clone",
+    # Bulk access_mode flip on existing scopes + the site-group ACL map
+    # (2026-09 fix): both write only `source_connections.config` — the
+    # same frozen pre-A3 pair, both need a body. Auth matrix, selection
+    # validation, the missing_drive_id per-scope failure, and the sentinel
+    # grant deletion on mirrored->manual are covered by
+    # tests/test_admin_sharepoint.py (TestSetScopesMode / TestAclSiteGroupMap);
+    # not duplicated here.
+    "PATCH /api/admin/sharepoint/connections/{connection_id}/scopes/bulk",
+    "PATCH /api/admin/sharepoint/connections/{connection_id}/acl-site-group-map",
     # Collection consolidation — PG-only by construction (it touches
     # corpus_file_sources/corpus_file_events/claims/fact_alias_sources,
     # themselves PG-only, A3 ratchet): the DuckDB side answers the typed

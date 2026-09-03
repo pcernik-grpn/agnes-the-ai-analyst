@@ -719,6 +719,17 @@ CATALOG: dict[str, AuditEvent] = {
         "mutation",
         "An admin confirmed many SharePoint folder paths as scopes in one bulk call.",
     ),
+    "sharepoint_connection.scope_bulk_mode_set": AuditEvent(
+        "sharepoint_connection.scope_bulk_mode_set",
+        "mutation",
+        "An admin flipped access_mode (manual/mirrored) on many of a SharePoint connection's "
+        "existing scopes in one call.",
+    ),
+    "sharepoint_connection.acl_site_group_map_set": AuditEvent(
+        "sharepoint_connection.acl_site_group_map_set",
+        "mutation",
+        "An admin set a SharePoint connection's site-group -> Agnes-group ACL mirroring map.",
+    ),
     "sharepoint_connection.clone": AuditEvent(
         "sharepoint_connection.clone",
         "mutation",

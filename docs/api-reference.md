@@ -1227,11 +1227,33 @@ forgot it on every reopen. The POST resolves and persists it on the
 connection (`config.manual_sites`, idempotent on the resolved site id), the
 DELETE (`?site_id=`) forgets it again.
 
+`PATCH …/scopes/bulk` (2026-09 fix) flips `access_mode` (manual/mirrored) on
+many of a connection's EXISTING scopes in one call — either
+`source_scope_ids` (a list) or `all: true`. Never all-or-nothing: each
+targeted scope is switched or reported `{"source_scope_id", "reason"}` in
+`failed` independently (`missing_drive_id` when switching to `mirrored` a
+scope with no `drive_id`). Switching mirrored -> manual deletes the ACL
+sync's own sentinel-owned grants for that scope's collection, same as
+`POST …/scopes`'s own `access_mode` transition. CLI:
+`agnes admin sharepoint scope set-mode <id> --all|--scope <source_scope_id> --mode manual|mirrored`.
+
+`PATCH …/acl-site-group-map` (2026-09 fix) replaces a connection's whole
+SharePoint site-group (Owners/Members/Visitors, or custom) -> Agnes-group
+mapping. SharePoint site groups are not enumerable through the app-only
+Graph surface the connector uses, so ACL mirroring classifies them
+`unhonored: site_group` and grants nobody unless mapped here — the mapped
+Agnes group(s) are granted directly, never enumerated against the real
+site group's membership. `400 invalid_group_id` for an unknown target
+group. CLI: `agnes admin sharepoint acl map-site-group <id> --site-group
+"<name>" --group <agnes_group_id> [--unmap]` (read-modify-write against the
+whole map, so mapping a second site group never clobbers the first).
+
 - /api/admin/sharepoint/connections/{connection_id}/tree
 - /api/admin/sharepoint/connections/{connection_id}/tree/search
 - /api/admin/sharepoint/connections/{connection_id}/manual-sites
 - /api/admin/sharepoint/connections/{connection_id}/scopes
 - /api/admin/sharepoint/connections/{connection_id}/scopes/bulk
+- /api/admin/sharepoint/connections/{connection_id}/acl-site-group-map
 - /api/admin/sharepoint/connections/{connection_id}/facts-graph-counts
 - /api/admin/sharepoint/connections/{connection_id}/clone
 - /api/admin/sharepoint/connections/{connection_id}/collections/consolidate

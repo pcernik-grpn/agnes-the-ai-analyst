@@ -3681,7 +3681,7 @@ class TestBulkScopeAdd:
         rows, _ = audit_repo().query(action="sharepoint_connection.scope_bulk_add", limit=10)
         assert len(rows) == 1
         params = _audit_params(rows[0])
-        assert params == {"requested": 1, "created": 1, "skipped": 0, "failed": 0}
+        assert params == {"requested": 1, "created": 1, "skipped": 0, "failed": 0, "access_mode": "manual"}
 
     def test_readopts_a_tombstoned_collection_instead_of_minting_a_duplicate(self, seeded_app, monkeypatch):
         """Tick -> untick -> bulk re-add of the same folder must re-adopt the
@@ -3840,6 +3840,374 @@ class TestBulkScopeAdd:
 
         listed = c.get(f"{BASE}/{conn_id}/scopes", headers=_auth(token)).json()["items"]
         assert listed[0]["collection_id"] == own_collection_id
+
+
+class TestBulkScopeAccessMode:
+    """``POST …/scopes/bulk``'s ``access_mode`` field (2026-09 fix) — every
+    scope a bulk-add call creates gets the same mode."""
+
+    def test_defaults_to_manual(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        _install_item_resolver(monkeypatch, {"Folder A": _folder_item("item-a", "Folder A")})
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="bulk-mode-default")
+
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes/bulk",
+            json={"paths": ["Folder A"], "drive_id": "drv1"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["created"][0]["access_mode"] == "manual"
+
+    def test_mirrored_is_persisted_on_every_created_scope(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        _install_item_resolver(
+            monkeypatch,
+            {"Folder A": _folder_item("item-a", "Folder A"), "Folder B": _folder_item("item-b", "Folder B")},
+        )
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="bulk-mode-mirrored")
+
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes/bulk",
+            json={"paths": ["Folder A", "Folder B"], "drive_id": "drv1", "access_mode": "mirrored"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert len(body["created"]) == 2
+        for entry in body["created"]:
+            assert entry["access_mode"] == "mirrored"
+            assert entry["drive_id"] == "drv1"
+
+        listed = c.get(f"{BASE}/{conn_id}/scopes", headers=_auth(token)).json()["items"]
+        assert {i["access_mode"] for i in listed} == {"mirrored"}
+
+
+class TestSetScopesMode:
+    """``PATCH …/scopes/bulk`` — flip ``access_mode`` on many EXISTING
+    scopes in one call (2026-09 fix)."""
+
+    def test_requires_admin(self, seeded_app):
+        r = seeded_app["client"].patch(
+            f"{BASE}/nope/scopes/bulk",
+            json={"all": True, "access_mode": "manual"},
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert r.status_code == 403
+
+    def test_404_for_unknown_connection(self, seeded_app):
+        r = seeded_app["client"].patch(
+            f"{BASE}/does-not-exist/scopes/bulk",
+            json={"all": True, "access_mode": "manual"},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 404
+
+    def test_both_source_scope_ids_and_all_is_400(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="mode-both")
+        r = c.patch(
+            f"{BASE}/{conn_id}/scopes/bulk",
+            json={"source_scope_ids": ["s1"], "all": True, "access_mode": "manual"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 400, r.text
+        assert r.json()["detail"]["error"] == "both_source_scope_ids_and_all"
+
+    def test_neither_source_scope_ids_nor_all_is_400(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="mode-neither")
+        r = c.patch(
+            f"{BASE}/{conn_id}/scopes/bulk",
+            json={"access_mode": "manual"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 400, r.text
+        assert r.json()["detail"]["error"] == "source_scope_ids_or_all_required"
+
+    def _confirm_manual(self, c, token, conn_id, source_scope_id, *, drive_id="drive-x"):
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": source_scope_id, "display_path": source_scope_id, "drive_id": drive_id},
+            headers=_auth(token),
+        )
+        assert r.status_code == 201, r.text
+        return r.json()
+
+    def test_all_true_switches_every_scope_to_mirrored(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="mode-all")
+        self._confirm_manual(c, token, conn_id, "s1")
+        self._confirm_manual(c, token, conn_id, "s2")
+
+        r = c.patch(
+            f"{BASE}/{conn_id}/scopes/bulk",
+            json={"all": True, "access_mode": "mirrored"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert sorted(body["updated"]) == ["s1", "s2"]
+        assert body["failed"] == []
+
+        listed = c.get(f"{BASE}/{conn_id}/scopes", headers=_auth(token)).json()["items"]
+        assert {i["access_mode"] for i in listed} == {"mirrored"}
+
+    def test_specific_ids_switch_only_those(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="mode-specific")
+        self._confirm_manual(c, token, conn_id, "s1")
+        self._confirm_manual(c, token, conn_id, "s2")
+
+        r = c.patch(
+            f"{BASE}/{conn_id}/scopes/bulk",
+            json={"source_scope_ids": ["s1"], "access_mode": "mirrored"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["updated"] == ["s1"]
+
+        listed = {
+            i["source_scope_id"]: i["access_mode"]
+            for i in c.get(f"{BASE}/{conn_id}/scopes", headers=_auth(token)).json()["items"]
+        }
+        assert listed == {"s1": "mirrored", "s2": "manual"}
+
+    def test_unknown_source_scope_id_is_reported_failed_not_found(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="mode-not-found")
+        self._confirm_manual(c, token, conn_id, "s1")
+
+        r = c.patch(
+            f"{BASE}/{conn_id}/scopes/bulk",
+            json={"source_scope_ids": ["s1", "ghost"], "access_mode": "mirrored"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["updated"] == ["s1"]
+        assert body["failed"] == [{"source_scope_id": "ghost", "reason": "not_found"}]
+
+    def test_switching_to_mirrored_without_drive_id_is_reported_failed(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="mode-no-drive")
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "s-no-drive", "display_path": "No Drive"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 201, r.text
+        assert r.json()["drive_id"] is None
+
+        r = c.patch(
+            f"{BASE}/{conn_id}/scopes/bulk",
+            json={"source_scope_ids": ["s-no-drive"], "access_mode": "mirrored"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["updated"] == []
+        assert body["failed"] == [{"source_scope_id": "s-no-drive", "reason": "missing_drive_id"}]
+
+        listed = c.get(f"{BASE}/{conn_id}/scopes", headers=_auth(token)).json()["items"][0]
+        assert listed["access_mode"] == "manual", "a failed switch must leave the scope untouched"
+
+    def test_switching_to_manual_deletes_the_sentinel_grant(self, seeded_app):
+        from app.resource_types import ResourceType
+        from connectors.sharepoint.acl_sync import ACL_SYNC_SENTINEL
+        from src.repositories import resource_grants_repo, user_groups_repo
+
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="mode-to-manual")
+        confirmed = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={
+                "source_scope_id": "s-mirrored",
+                "display_path": "Mirrored",
+                "access_mode": "mirrored",
+                "drive_id": "drive-y",
+            },
+            headers=_auth(token),
+        )
+        assert confirmed.status_code == 201, confirmed.text
+        collection_id = confirmed.json()["collection_id"]
+
+        sentinel_group = user_groups_repo().ensure(name="entra:bulk-mode-oid", created_by=ACL_SYNC_SENTINEL)
+        resource_grants_repo().ensure_grant(
+            sentinel_group["id"], ResourceType.COLLECTION.value, collection_id, assigned_by=ACL_SYNC_SENTINEL
+        )
+
+        r = c.patch(
+            f"{BASE}/{conn_id}/scopes/bulk",
+            json={"source_scope_ids": ["s-mirrored"], "access_mode": "manual"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["updated"] == ["s-mirrored"]
+
+        remaining = [
+            g
+            for g in resource_grants_repo().list_all(resource_type=ResourceType.COLLECTION.value)
+            if g["resource_id"] == collection_id
+        ]
+        assert remaining == []
+
+    def test_writes_an_audit_row(self, seeded_app):
+        from src.repositories import audit_repo
+
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="mode-audit")
+        self._confirm_manual(c, token, conn_id, "s1")
+
+        r = c.patch(
+            f"{BASE}/{conn_id}/scopes/bulk",
+            json={"all": True, "access_mode": "mirrored"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+
+        rows, _ = audit_repo().query(action="sharepoint_connection.scope_bulk_mode_set", limit=10)
+        assert len(rows) == 1
+        assert _audit_params(rows[0]) == {"access_mode": "mirrored", "requested": 1, "updated": 1, "failed": 0}
+
+
+class TestAclSiteGroupMap:
+    """``PATCH …/acl-site-group-map`` — map a SharePoint site group's
+    ``displayName`` to one or more existing Agnes groups (2026-09 fix)."""
+
+    def test_requires_admin(self, seeded_app):
+        r = seeded_app["client"].patch(
+            f"{BASE}/nope/acl-site-group-map",
+            json={"mapping": {}},
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert r.status_code == 403
+
+    def test_404_for_unknown_connection(self, seeded_app):
+        r = seeded_app["client"].patch(
+            f"{BASE}/does-not-exist/acl-site-group-map",
+            json={"mapping": {}},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 404
+
+    def test_unknown_group_id_is_400(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="sgmap-unknown-group")
+
+        r = c.patch(
+            f"{BASE}/{conn_id}/acl-site-group-map",
+            json={"mapping": {"Members": ["does-not-exist"]}},
+            headers=_auth(token),
+        )
+        assert r.status_code == 400, r.text
+        assert r.json()["detail"]["error"] == "invalid_group_id"
+        assert r.json()["detail"]["group_ids"] == ["does-not-exist"]
+
+    def test_sets_and_persists_the_map(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="sgmap-set")
+        group_id = c.post("/api/admin/groups", json={"name": "finance-team"}, headers=_auth(token)).json()["id"]
+
+        r = c.patch(
+            f"{BASE}/{conn_id}/acl-site-group-map",
+            json={"mapping": {"Members": [group_id]}},
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+        assert r.json() == {"acl_site_group_map": {"Members": [group_id]}}
+
+        from src.repositories import source_connections_repo
+
+        row = source_connections_repo().get(conn_id)
+        assert row["config"]["acl_site_group_map"] == {"Members": [group_id]}
+
+    def test_replaces_wholesale_not_merge(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="sgmap-replace")
+        group_a = c.post("/api/admin/groups", json={"name": "sgmap-group-a"}, headers=_auth(token)).json()["id"]
+        group_b = c.post("/api/admin/groups", json={"name": "sgmap-group-b"}, headers=_auth(token)).json()["id"]
+
+        first = c.patch(
+            f"{BASE}/{conn_id}/acl-site-group-map",
+            json={"mapping": {"Members": [group_a]}},
+            headers=_auth(token),
+        )
+        assert first.status_code == 200, first.text
+
+        second = c.patch(
+            f"{BASE}/{conn_id}/acl-site-group-map",
+            json={"mapping": {"Owners": [group_b]}},
+            headers=_auth(token),
+        )
+        assert second.status_code == 200, second.text
+
+        from src.repositories import source_connections_repo
+
+        row = source_connections_repo().get(conn_id)
+        assert row["config"]["acl_site_group_map"] == {"Owners": [group_b]}, (
+            "a second call must replace the whole map, not merge into it"
+        )
+
+    def test_survives_a_generic_connection_edit(self, seeded_app):
+        """The carry-forward ratchet's whole point: an unrelated PUT through
+        the generic connection editor must not silently erase this key."""
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="sgmap-carry-forward")
+        group_id = c.post("/api/admin/groups", json={"name": "sgmap-carry-group"}, headers=_auth(token)).json()["id"]
+
+        c.patch(
+            f"{BASE}/{conn_id}/acl-site-group-map",
+            json={"mapping": {"Members": [group_id]}},
+            headers=_auth(token),
+        )
+
+        edit = c.put(
+            f"/api/admin/source-connections/{conn_id}",
+            json={"name": "sgmap-carry-forward-renamed", "config": {"tenant_id": "tenant-1", "client_id": "client-1"}},
+            headers=_auth(token),
+        )
+        assert edit.status_code == 200, edit.text
+
+        from src.repositories import source_connections_repo
+
+        row = source_connections_repo().get(conn_id)
+        assert row["config"]["acl_site_group_map"] == {"Members": [group_id]}
+
+    def test_writes_an_audit_row(self, seeded_app):
+        from src.repositories import audit_repo
+
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="sgmap-audit")
+        group_id = c.post("/api/admin/groups", json={"name": "sgmap-audit-group"}, headers=_auth(token)).json()["id"]
+
+        r = c.patch(
+            f"{BASE}/{conn_id}/acl-site-group-map",
+            json={"mapping": {"Members": [group_id]}},
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+
+        rows, _ = audit_repo().query(action="sharepoint_connection.acl_site_group_map_set", limit=10)
+        assert len(rows) == 1
+        assert _audit_params(rows[0]) == {"site_groups": 1, "group_ids": [group_id]}
 
 
 class TestConnectionClone:
