@@ -126,6 +126,15 @@ def setup_logging(service: str | None = None, level: str | None = None) -> None:
     access_logger.setLevel(logging.INFO if debug else logging.WARNING)
     access_logger.addFilter(_OAuthCallbackQueryRedactFilter())
     logging.getLogger("httpx").setLevel(logging.WARNING)
+    # Opt-in OTLP trace export shares this one entrypoint choke point, so a
+    # scheduler or collector process gets it with the same env vars as the
+    # app. No-op without OTEL_EXPORTER_OTLP_ENDPOINT; never fatal.
+    try:
+        from src.observability.otel import configure_otel
+
+        configure_otel(role=os.environ.get("AGNES_ROLE") or slug)
+    except Exception:  # noqa: BLE001 - observability must never block startup
+        logging.getLogger(__name__).debug("otel configure failed", exc_info=True)
     _CONFIGURED = True
 
 
