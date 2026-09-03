@@ -703,6 +703,21 @@ _PACKAGE_BUILDER_TURN_REASON = (
     "through POST /api/admin/data-packages, which is grandfathered above."
 )
 
+_SEMANTIC_MODEL_BUILDER_TURN_REASON = (
+    "one turn of the /semantic-layer/new builder's CONVERSATION — web-UI-only "
+    "for the same reason as its four siblings above. It writes nothing (a "
+    "semantic model has no row until Save — the draft lives in the author's "
+    "browser), and its output is a patch the page merges into that draft for "
+    "review, not a resource. Its inputs are the page's own transient state "
+    "(the transcript, the unsaved draft) plus server-fetched grounding "
+    "candidates (the caller's readable registered tables, and a named "
+    "dataset's real columns) that a CLI invocation would have to invent or "
+    "re-derive. The model it helps produce is created through POST "
+    "/api/semantic-models/apply, which has its own coverage; the grounding "
+    "reads themselves (registered tables, column schema) are already "
+    "reachable via `agnes catalog`/`agnes schema`."
+)
+
 _ENTITY_PREVIEW_AGENT_REASON = (
     "points the caller's single scratch agent at the agent TEMPLATE they are "
     "drafting on /skills and returns its slug, so the builder's Preview tab "
@@ -975,6 +990,7 @@ _EXEMPT: dict[str, str] = {
     "/api/store/entities/builder/preview-agent": _ENTITY_PREVIEW_AGENT_REASON,
     "/api/admin/data-packages/builder/turn": _PACKAGE_BUILDER_TURN_REASON,
     "/api/admin/mcp-sources/builder/turn": _MCP_BUILDER_TURN_REASON,
+    "/api/semantic-models/builder/turn": _SEMANTIC_MODEL_BUILDER_TURN_REASON,
     "/api/admin/mcp-sources/preview-introspect": _MCP_PREVIEW_INTROSPECT_REASON,
     "/api/sharing/groups": _LIBRARY_SHARING_REASON,
     "/api/sharing/{resource_type}/{resource_id}": _LIBRARY_SHARING_REASON,

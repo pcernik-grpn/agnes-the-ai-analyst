@@ -143,3 +143,33 @@ class TestTheBuilderRoute:
         assert "New semantic model" in r.text
         detail = c.get("/semantic-layer/new/", headers=_auth(seeded_app["admin_token"]))
         assert detail.status_code in (200, 307, 404)
+
+
+class TestTheBuilderConversation:
+    """The Start tab's paste/import UI (PR #2148) was replaced by a builder
+    chat — the increment PR #2148's own comment said would come next."""
+
+    def test_the_start_tab_renders_the_conversation_composer(self, seeded_app, studio_off):
+        c = seeded_app["client"]
+        r = c.get("/semantic-layer/new", headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 200
+        assert 'data-ag-comp="chat"' in r.text
+        assert 'id="smb-conv"' in r.text
+
+    def test_the_old_paste_import_ui_is_gone(self, seeded_app, studio_off):
+        c = seeded_app["client"]
+        r = c.get("/semantic-layer/new", headers=_auth(seeded_app["admin_token"]))
+        assert "smb-paste" not in r.text
+        assert "smb-import" not in r.text
+
+    def test_the_page_calls_the_semantic_model_builder_turn_endpoint(self, seeded_app, studio_off):
+        c = seeded_app["client"]
+        r = c.get("/semantic-layer/new", headers=_auth(seeded_app["admin_token"]))
+        assert "/api/semantic-models/builder/turn" in r.text
+
+    def test_the_engine_notice_is_rendered_via_the_shared_shell(self, seeded_app, studio_off):
+        """Pins the fifth builder into the invariant
+        tests/test_every_builder_names_its_engine.py enforces across all five."""
+        c = seeded_app["client"]
+        r = c.get("/semantic-layer/new", headers=_auth(seeded_app["admin_token"]))
+        assert "BuilderShell.engineNotice(" in r.text

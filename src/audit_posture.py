@@ -533,6 +533,8 @@ POSTURE: dict[str, str] = {
     "DELETE /api/admin/semantic-model/coverage/tags/{tag_id}": "semantic_coverage_tag.delete",
     "POST /api/admin/semantic-layer/mutes": "semantic_health_mute.create",
     "POST /api/admin/semantic-model/coverage/tags": "semantic_coverage_tag.create",
+    # -- app.api.semantic_model_builder ------------------------------------------
+    "POST /api/semantic-models/builder/turn": "semantic_model.builder_turn",
     # -- app.api.semantic_models -----------------------------------------------
     "DELETE /api/admin/semantic-models/{model_id:path}": "semantic_model.delete",
     "DELETE /api/admin/semantic-sources/{source_id}": "semantic_source.delete",

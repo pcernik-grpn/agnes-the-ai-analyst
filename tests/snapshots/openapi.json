@@ -3965,6 +3965,65 @@
         "title": "CuratedPlugin",
         "type": "object"
       },
+      "DatasetDraft": {
+        "properties": {
+          "description": {
+            "default": "",
+            "title": "Description",
+            "type": "string"
+          },
+          "fields": {
+            "items": {
+              "$ref": "#/components/schemas/DatasetFieldDraft"
+            },
+            "title": "Fields",
+            "type": "array"
+          },
+          "name": {
+            "default": "",
+            "title": "Name",
+            "type": "string"
+          },
+          "source": {
+            "default": "",
+            "title": "Source",
+            "type": "string"
+          }
+        },
+        "title": "DatasetDraft",
+        "type": "object"
+      },
+      "DatasetFieldDraft": {
+        "properties": {
+          "datatype": {
+            "default": "",
+            "title": "Datatype",
+            "type": "string"
+          },
+          "description": {
+            "default": "",
+            "title": "Description",
+            "type": "string"
+          },
+          "is_primary_key": {
+            "default": false,
+            "title": "Is Primary Key",
+            "type": "boolean"
+          },
+          "is_time": {
+            "default": false,
+            "title": "Is Time",
+            "type": "boolean"
+          },
+          "name": {
+            "default": "",
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "title": "DatasetFieldDraft",
+        "type": "object"
+      },
       "DatasetSettingRequest": {
         "properties": {
           "dataset": {
@@ -7232,6 +7291,32 @@
         "title": "MetricCreate",
         "type": "object"
       },
+      "MetricDraft": {
+        "properties": {
+          "description": {
+            "default": "",
+            "title": "Description",
+            "type": "string"
+          },
+          "dialect": {
+            "default": "duckdb",
+            "title": "Dialect",
+            "type": "string"
+          },
+          "expression": {
+            "default": "",
+            "title": "Expression",
+            "type": "string"
+          },
+          "name": {
+            "default": "",
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "title": "MetricDraft",
+        "type": "object"
+      },
       "MigrateRequest": {
         "description": "Body for ``POST /api/admin/db/migrate``.",
         "properties": {
@@ -9864,6 +9949,39 @@
         "title": "SemanticModelCreate",
         "type": "object"
       },
+      "SemanticModelDraft": {
+        "description": "The builder panel's unsaved state, as the page currently has it.\n\nUntrusted, used only to build the prompt \u2014 nothing here is written\nanywhere, and everything that comes back is re-validated on the way out.",
+        "properties": {
+          "datasets": {
+            "items": {
+              "$ref": "#/components/schemas/DatasetDraft"
+            },
+            "title": "Datasets",
+            "type": "array"
+          },
+          "description": {
+            "default": "",
+            "maxLength": 4000,
+            "title": "Description",
+            "type": "string"
+          },
+          "metrics": {
+            "items": {
+              "$ref": "#/components/schemas/MetricDraft"
+            },
+            "title": "Metrics",
+            "type": "array"
+          },
+          "name": {
+            "default": "",
+            "maxLength": 120,
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "title": "SemanticModelDraft",
+        "type": "object"
+      },
       "SemanticModelPackageIds": {
         "properties": {
           "package_ids": {
@@ -9891,6 +10009,37 @@
           "package_id"
         ],
         "title": "SemanticModelPackageLink",
+        "type": "object"
+      },
+      "SemanticModelTurnRequest": {
+        "properties": {
+          "draft": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SemanticModelDraft"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "history": {
+            "items": {
+              "$ref": "#/components/schemas/BuilderMessage"
+            },
+            "title": "History",
+            "type": "array"
+          },
+          "message": {
+            "maxLength": 4000,
+            "title": "Message",
+            "type": "string"
+          }
+        },
+        "required": [
+          "message"
+        ],
+        "title": "SemanticModelTurnRequest",
         "type": "object"
       },
       "SemanticModelUpdate": {
@@ -51973,6 +52122,70 @@
           }
         },
         "summary": "Apply Semantic Model Endpoint",
+        "tags": [
+          "semantic-models"
+        ]
+      }
+    },
+    "/api/semantic-models/builder/turn": {
+      "post": {
+        "description": "Run one turn of the semantic-model builder. Proposes; never writes.\n\nStateless like ``entity_builder`` \u2014 a model has no row until *Save*\n(``POST /api/semantic-models/apply``), so the draft travels in the\nrequest and nothing here reads or writes ``semantic_models``. Open to\nanyone signed in: an admin's eventual Save publishes, anyone else's\nqueues for review, but drafting is not itself gated on that.",
+        "operationId": "semantic_model_builder_turn_api_semantic_models_builder_turn_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SemanticModelTurnRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Semantic Model Builder Turn",
         "tags": [
           "semantic-models"
         ]
