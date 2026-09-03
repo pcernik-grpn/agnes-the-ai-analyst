@@ -173,52 +173,85 @@ def test_the_item_count_is_the_active_tabs_own_total(seeded_app):
 # ---------------------------------------------------------------------------
 
 
-def test_a_big_folder_expands_to_a_capped_peek_with_a_way_through(seeded_app):
-    """25 files used to be 25 child rows (1154 on the instance that reported
-    this) with no search, filter or pager. Now: ten rows and one row that
-    states what is missing and opens the page that can search it."""
-    from app.web.router import _LIBRARY_FOLDER_PEEK
-
+def test_a_big_folder_shows_a_way_through_with_no_files_fetched_up_front(seeded_app):
+    """25 files used to be 25 child rows pre-rendered hidden (1154 on the
+    instance that reported this, #2141) — then, in the first cut of the peek
+    fix, TEN rows pre-rendered hidden plus a "Browse all" row (still an
+    unconditional per-collection file fetch and a `data-search` value built
+    from every filename — the round-2 incident: 19.6 MB of HTML on a
+    392-collection instance whose live DOM was 1.09 MB). Now: the index
+    fetches nothing about this folder's FILES at all — only its batched
+    count — and the "Browse all" row (and its count) comes from that count
+    alone. No child `<tr>` exists until the reader expands the row."""
     tok = seeded_app["admin_token"]
     col = _folder(seeded_app, "Peek Folder", tok, 25)
     text = seeded_app["client"].get("/library", headers=_auth(tok)).text
 
     kids = _rows_of(text, col["id"])
-    # The peek plus exactly one "Browse all" row.
-    assert len(kids) == _LIBRARY_FOLDER_PEEK + 1
-    assert sum(1 for k in kids if "data-more-row" in k) == 1
+    # Exactly the "Browse all" row — no peek rows pre-rendered.
+    assert len(kids) == 1
+    assert "data-more-row" in kids[0]
     assert "Browse all 25 files" in text
-    assert f"{25 - _LIBRARY_FOLDER_PEEK} more, with search and filters" in text
-    assert f'href="/library/{col["slug"]}#files-section"' in text
+    assert 'href="/library/' + col["slug"] + '#files-section"' in text
+    # And no per-file identity anywhere on the index for this folder.
+    assert "f-000.md" not in text
+    assert "f-024.md" not in text
 
 
-def test_a_small_folder_expands_whole_and_has_no_browse_all_row(seeded_app):
-    """The cap must not announce itself when it did not bite: a folder inside
-    the peek is fully expanded and the extra row would be a lie."""
+def test_a_small_folder_also_shows_no_files_up_front_and_no_browse_all_row(seeded_app):
+    """A folder inside the peek size gets the same treatment as a big one now
+    — nothing about its files is fetched at index-render time, so it has no
+    child rows AND no "Browse all" row (nothing was left out of a peek that
+    was never taken)."""
     tok = seeded_app["admin_token"]
     col = _folder(seeded_app, "Whole Folder", tok, 3)
     text = seeded_app["client"].get("/library", headers=_auth(tok)).text
 
     kids = _rows_of(text, col["id"])
-    assert len(kids) == 3
-    assert not any("data-more-row" in k for k in kids)
+    assert kids == []
     # Matched against MARKUP, never the whole page: the row's own CSS block
     # names it in a comment, so `"Browse all" not in text` passes vacuously.
     assert "lib-more__link" not in _markup(text)
 
 
-def test_the_folder_row_is_still_searchable_by_every_filename_it_holds(seeded_app):
-    """The peek is a display cap, NOT a search cap: the folder row's search
-    text still carries every filename, which is what makes the page able to
-    tell that a match exists past the peek at all."""
+def test_a_folders_peek_is_fetched_lazily_from_its_own_route(seeded_app):
+    """The rows a folder's twisty reveals — however many files it holds —
+    live at `GET /library/{slug}/peek`, never the index response. Same
+    contract as `matching-files`: real Library child rows, through the same
+    macro, capped at `_LIBRARY_FOLDER_PEEK`."""
+    from app.web.router import _LIBRARY_FOLDER_PEEK
+
+    tok = seeded_app["admin_token"]
+    big = _folder(seeded_app, "Peek Route Big", tok, 25)
+    small = _folder(seeded_app, "Peek Route Small", tok, 3)
+
+    r = seeded_app["client"].get(f"/library/{big['slug']}/peek", headers=_auth(tok))
+    assert r.status_code == 200
+    kids = _rows_of(r.text, big["id"])
+    assert len(kids) == _LIBRARY_FOLDER_PEEK
+    assert all("data-more-row" not in k for k in kids)
+    assert 'data-filename="f-000.md"' in r.text
+    assert "f-024.md" not in r.text  # past the peek — that is what matching-files is for
+
+    r_small = seeded_app["client"].get(f"/library/{small['slug']}/peek", headers=_auth(tok))
+    assert r_small.status_code == 200
+    assert len(_rows_of(r_small.text, small["id"])) == 3
+
+
+def test_the_folder_row_carries_only_its_own_name_and_description_to_search_by(seeded_app):
+    """The index card is the count/name/description alone (round 2 of the
+    incident fix) — a folder is no longer searchable by a filename it holds
+    without opening it. `matching-files`/`peek` are the ways to reach a file
+    by name now, not the index's own search box."""
     tok = seeded_app["admin_token"]
     col = _folder(seeded_app, "Search Text Folder", tok, 25)
     text = seeded_app["client"].get("/library", headers=_auth(tok)).text
 
     row = next(m for m in re.findall(r"<tr[^>]*>", text) if f'data-item-id="{col["id"]}"' in m)
     search = re.search(r'data-search="([^"]*)"', row).group(1)
-    assert "f-000.md" in search  # inside the peek
-    assert "f-024.md" in search  # far outside it
+    assert "search text folder" in search  # the collection's own name
+    assert "f-000.md" not in search
+    assert "f-024.md" not in search
 
 
 def test_matching_files_route_returns_the_rows_the_peek_left_out(seeded_app):
@@ -423,10 +456,12 @@ def test_the_back_arrow_follows_the_route_the_reader_took(seeded_app):
 def test_the_library_rows_declare_where_they_came_from(seeded_app):
     """The other half of the pair above: the Library's file rows must carry
     `?from=library`, or the arrow silently falls back to the collection for
-    the very path #2141 reported."""
+    the very path #2141 reported. Child rows are fetched lazily from
+    `/library/{slug}/peek` (round 2 of the incident fix), never pre-rendered
+    on the index — this checks the fragment they actually land from."""
     tok = seeded_app["admin_token"]
     col = _folder(seeded_app, "From Folder", tok, 3)
-    text = seeded_app["client"].get("/library", headers=_auth(tok)).text
+    text = seeded_app["client"].get(f"/library/{col['slug']}/peek", headers=_auth(tok)).text
 
     kids = _rows_of(text, col["id"])
     assert kids, "no child rows rendered"

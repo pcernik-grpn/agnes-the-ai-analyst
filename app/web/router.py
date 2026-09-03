@@ -2575,29 +2575,31 @@ def _library_child_row(
 #: How many files a Library folder row reveals when it is expanded inline.
 #: Deliberately a PEEK: the expansion carries no search, filter or pager, so
 #: past a dozen rows it is a wall rather than an answer — and the collection
-#: page it links on to has all three (#2141 item 2).
+#: page it links on to has all three (#2141 item 2). Round 2 (incident
+#: follow-up, 2026-09-03): a folder's peek rows are now fetched on first
+#: expand (`GET /library/{slug}/peek`) rather than pre-rendered hidden in the
+#: index response — see that route and `_library_child_row`. The FIRST cut
+#: of the peek (#2141) rendered it inline for every folder at or under a
+#: separate size cap, which fixed the everything-visible-at-once byte blowup
+#: but not the cost of listing (and embedding a `data-search` value built
+#: from) a folder's files at INDEX render time at all: on a live instance
+#: (~392 collections, active SharePoint crawls) that alone was 19.6 MB for a
+#: page whose live DOM, after the browser discarded the raw markup's
+#: indentation, was 1.09 MB — the index card is now the count/name/
+#: description alone (`_catalog_card_upload`, `_library_row_base`'s own
+#: `c.search`), never a per-file fetch, however small the folder.
 _LIBRARY_FOLDER_PEEK = 10
 
-#: How many files a Library INDEX card fetches (and is therefore searchable
-#: by / has format facets for) per collection — separate from
-#: `_LIBRARY_FOLDER_PEEK`, which only bounds how many of THOSE fetched rows
-#: render as inline children. Comfortably above the peek and above every
-#: existing fixture's file count (the artefacts-reading suite's biggest
-#: folder is 25) so neither is affected. A folder AT or under this size keeps
-#: full drag/drop, per-format, per-filename-search over its whole file list,
-#: same as before. A folder OVER it renders as a plain "N files" card with a
-#: single "Browse all" row and no per-file search text at all: no
-#: `list_for_corpus` call happens for it, so the cost of listing it here can
-#: never again scale with an instance's TOTAL file count. The
-#: `/library/{slug}` detail page (paginated, `_FILES_SECTION_PAGE_SIZE` at a
-#: time) plus this page's own `/library/{slug}/matching-files` search remain
-#: the browse surfaces for a folder that size. Incident, 2026-09-03: an admin
-#: Library with ~390 collections and 216k `corpus_files` rendered every file
-#: of every collection inline, producing a 1 GB / 56 s page — the peek above
-#: already bounds what RENDERS, but not what is FETCHED or embedded into a
-#: folder row's own `data-search`/format facets, which still scaled with the
-#: instance's total file count without this second cap.
-_LIBRARY_INLINE_FILES_CAP = 50
+#: How many Artefact collections/loose files the index renders by default —
+#: the last lever of the round-2 incident fix, for the instance that is
+#: STILL over budget once its per-collection cost is bounded (many hundreds
+#: of collections, each now cheap). `?files_limit=<n>` raises it; the "Show
+#: more collections" row this drives (`library_files_more_href`) doubles it
+#: rather than jumping straight to "all", so a caller who does not need the
+#: rest never pays to fetch it. `file_corpora_repo().list()`'s own default
+#: cap (200) was this same idea half-built: a silent, undocumented ceiling
+#: with no indication anything was cut and no way past it.
+_LIBRARY_SECTION_PAGE_CAP = 100
 
 
 @router.get("/library", response_class=HTMLResponse)
@@ -2741,11 +2743,29 @@ async def library_page(
     # when the surface is actually on (spec §13.2 "Library" — "N files ·
     # M facts").
     facts_repo_ = _facts_repo_if_available()
+    # `?files_limit=` raises the render cap past `_LIBRARY_SECTION_PAGE_CAP`
+    # — the "Show more collections" row's own href (below). Clamped so the
+    # query string cannot turn this back into the unbounded fetch the rest
+    # of this fix removes; a bad value falls back to the default rather than
+    # 500ing the page over a copy-pasted URL.
+    try:
+        _files_limit = max(1, min(int(request.query_params.get("files_limit", "")), 5000))
+    except ValueError:
+        _files_limit = _LIBRARY_SECTION_PAGE_CAP
     _all_cols: list = []
+    library_files_more_href = ""
     try:
         fc_repo = file_corpora_repo()
         cf_repo = corpus_files_repo()
-        _all_cols = fc_repo.list()
+        # One row PAST the limit, not a separate COUNT — enough to know
+        # whether there is more without a second query, and never fetches
+        # more than the caller will actually see plus one.
+        _fetched = fc_repo.list(limit=_files_limit + 1)
+        if len(_fetched) > _files_limit:
+            _all_cols = _fetched[:_files_limit]
+            library_files_more_href = f"/library?files_limit={_files_limit * 2}"
+        else:
+            _all_cols = _fetched
     except Exception as e:
         _lost("files and collections", e)
     # One batch call for every card, not one call per card: each singular
@@ -2774,13 +2794,12 @@ async def library_page(
                 _fact_counts = facts_repo_.count_visible_facts_for_collections(user, _visible_ids)
         except Exception as e:
             logger.warning("/library: fact counts failed: %s", e)
-    # `file_count` per collection, in ONE query — the batched sibling of the
-    # per-collection `list_for_corpus` calls below. Every card needs the
-    # count; only a SMALL collection (`_LIBRARY_INLINE_FILES_CAP`) also gets
-    # its rows fetched (search-by-filename, per-format facets, the single
-    # "file_id" a one-file card links straight to). A large collection reads
-    # its count off this map alone and skips `list_for_corpus` entirely — see
-    # `_LIBRARY_INLINE_FILES_CAP`'s docstring for why.
+    # `file_count` per collection, in ONE query — replaces the per-collection
+    # `list_for_corpus` fetch every card used to pay to learn its own count.
+    # The only per-collection file read the index still does is the single
+    # bounded `limit=1` fetch below, for the one-file "this card IS the file"
+    # case — a folder's own rows are never listed here at all now, however
+    # small (round 2 of the incident fix — see `_LIBRARY_FOLDER_PEEK`).
     _file_counts: dict = {}
     if cf_repo is not None:
         try:
@@ -2808,12 +2827,12 @@ async def library_page(
             if not owned and col["id"] not in granted_to_me:
                 continue  # not yours and not shared with you -> invisible here
             # `file_count` is the batched, exact count from `_file_counts` —
-            # never `len(files)`. `files` itself is fetched only up to
-            # `_LIBRARY_INLINE_FILES_CAP` rows: a single-file card needs its
-            # one row (filename/type/size), a small folder needs all of them
-            # (for the child rows below), and a folder past the cap gets
-            # neither — it renders as a count-only card, see the constant's
-            # docstring.
+            # never `len(files)`. `files` is fetched — one bounded row,
+            # `limit=1` — ONLY for the one-file case, to get that file's own
+            # filename/type/size (the card reads as "this IS the file", not
+            # "a folder holding one file"). A folder's rows are never listed
+            # at index-render time regardless of its size: its peek is
+            # fetched lazily on first expand (`GET /library/{slug}/peek`).
             file_count = _file_counts.get(col["id"], 0)
             files: list = []
             first_file = None
@@ -2829,11 +2848,6 @@ async def library_page(
                         "file_type": f0.get("file_type"),
                         "size_bytes": f0.get("size_bytes"),
                     }
-            elif 1 < file_count <= _LIBRARY_INLINE_FILES_CAP:
-                try:
-                    files = cf_repo.list_for_corpus(col["id"])
-                except Exception:
-                    files = []
             fact_count = _fact_counts.get(col["id"], 0)
             c = _catalog_card_upload(
                 {
@@ -2861,17 +2875,16 @@ async def library_page(
             origin = col.get("origin") or "uploaded"
             created = col.get("created_at")
             is_folder = file_count != 1
-            # What this row can be FOUND by. Nobody searches for the folder —
-            # they search for the file inside it ("kpis"), and until now the
-            # engine saw only the folder's own name, so a file sitting visibly
-            # on screen answered "Nothing matches these filters". A folder is
-            # therefore searchable by every filename it holds; the client then
-            # opens it and hides the siblings, so the hit reads as the file.
-            fname = (
-                " ".join(f.get("filename") or "" for f in files)
-                if is_folder
-                else (first_file.get("filename") if first_file else "")
-            )
+            # What this row can be FOUND by, beyond its own name/description
+            # (`_library_row_base` folds those into `c.search` unconditionally
+            # — see there). A one-file card additionally carries that file's
+            # own filename, since the card reads as the file, not a folder
+            # holding one. A multi-file folder carries nothing further here —
+            # `files` is never fetched for it at index-render time (round 2 of
+            # the incident fix, `_LIBRARY_FOLDER_PEEK`) — so searching by a
+            # filename INSIDE a folder now means opening it, same as searching
+            # by anything else on its detail page.
+            fname = first_file.get("filename") if first_file else ""
             row = _library_row_base(
                 item_id=col["id"],
                 kind="artefact",
@@ -2942,15 +2955,12 @@ async def library_page(
             row["ingest_label"] = "" if is_folder else _ingest_label(first_file)
             # `file_format` is what the row PRINTS (a folder prints its file
             # count instead, so it has none). `format_keys` is what the row can
-            # be FILTERED by, which for a folder is every format inside it —
-            # the same reason its search text holds every filename. Keeping the
-            # two apart is what lets a folder answer "show me PDFs" without
-            # claiming to be a PDF.
-            row["format_keys"] = (
-                sorted({fmt for f in files if (fmt := _artefact_format(f))})
-                if is_folder
-                else ([row["file_format"]] if row["file_format"] else [])
-            )
+            # be FILTERED by — for a one-file card, that one file's own format.
+            # A folder offers no format facet at the index any more: it would
+            # need every file's format, and `files` is never fetched for a
+            # folder here (round 2 of the incident fix). The format facet
+            # still works over a folder's OWN contents on its detail page.
+            row["format_keys"] = [row["file_format"]] if row["file_format"] else []
             # A loose file's ROW id is its collection id (a single-file artefact
             # IS its collection), but moving it needs the corpus_files id — so
             # carry that separately rather than making the drag guess.
@@ -2966,36 +2976,16 @@ async def library_page(
             # to travel separately for the client-side 1-file transition to restore
             # it (the file default differs from the collection default).
             row["own_description"] = col.get("description") or ""
+            # A folder's children are NEVER rendered here, however small —
+            # `GET /library/{slug}/peek` fetches them, lazily, the first time
+            # the reader expands the row (round 2 of the incident fix). This
+            # is pure arithmetic on the already-batched `file_count`, no
+            # per-collection query: what the peek WOULD leave out, so the
+            # "Browse all N files" row (`folder_more_row`) can render up
+            # front — 0 means a click reveals the whole folder and no such
+            # row is needed.
             row["children"] = []
-            # How many files a folder shows INLINE before it hands the reader
-            # over to its own page. A crawled source collection runs to
-            # thousands of files, and the expansion rendered every one of them:
-            # a flat wall of machine-named rows with no search box, no filter
-            # and no pager — the one place the list is actually met, and the
-            # only place it could not be narrowed (#2141 item 2). The
-            # collection page HAS that search, so the expansion is a PEEK with
-            # a way through to it. It also stops the Library from carrying
-            # thousands of hidden <tr>s it never shows.
-            peek = files[:_LIBRARY_FOLDER_PEEK] if is_folder else []
-            # What the peek left out. Drives the "Browse all N files" row; 0
-            # means the expansion is the whole folder and no such row renders.
-            row["children_hidden"] = max(0, file_count - len(peek)) if is_folder else 0
-            if is_folder:
-                for f in peek:
-                    row["children"].append(
-                        _library_child_row(
-                            f,
-                            col,
-                            origin=origin,
-                            owner_label=owner_label,
-                            ownership=ownership,
-                            owner_key="me" if owned else (col.get("created_by") or ""),
-                            visibility=file_visibility(f["id"]),
-                            stack_state=row["stack_state"],
-                            stack_title=row["stack_title"],
-                            stack_pill=row["stack_pill"],
-                        )
-                    )
+            row["children_hidden"] = max(0, file_count - _LIBRARY_FOLDER_PEEK) if is_folder else 0
             items.append(row)
     except Exception as e:
         _lost("files and collections", e)
@@ -4346,6 +4336,10 @@ async def library_page(
         # init` actually authenticates with, so holding one IS being
         # connected, however they got there.
         library_connected=_has_connected_tools(user),
+        # "" when every artefact collection fit under `_LIBRARY_SECTION_
+        # PAGE_CAP` (or `?files_limit=` already covers them) — the row this
+        # drives renders only when truncated.
+        library_files_more_href=library_files_more_href,
     )
     return templates.TemplateResponse(request, "library.html", ctx)
 
@@ -5650,66 +5644,23 @@ _CORPUS_FILE_STATUSES = ("indexed", "processing", "pending", "needs_review", "re
 _LIBRARY_MATCH_LIMIT = 25
 
 
-@router.get("/library/{slug}/matching-files", response_class=HTMLResponse)
-async def library_matching_file_rows(
-    slug: str,
-    request: Request,
-    q: str = "",
-    user: dict = Depends(get_current_user),
-    conn: duckdb.DuckDBPyConnection = Depends(_get_db),
-):
-    """The file rows of one collection that match ``q`` — as Library child rows.
+def _library_child_row_context(col: dict, uid: str) -> dict:
+    """The folder-level facts every child row of ``col`` inherits, resolved
+    once per fragment request — shared by ``library_folder_peek_rows`` and
+    ``library_matching_file_rows`` so the two child-row fragment endpoints
+    cannot derive ownership/sharing/stack state differently. Each failure
+    falls to the conservative value rather than taking the fragment down — a
+    row that says "Private" when it cannot prove otherwise is safe; the
+    opposite is not.
 
-    Why this exists: the Library expands a folder to a PEEK of its files
-    (``_LIBRARY_FOLDER_PEEK``), and its search box is live and client-side. A
-    folder is searchable by every filename it holds, so typing a filename
-    finds the folder — but if that file is not in the ten the peek rendered,
-    the folder opened onto nothing and the reader had to click through to the
-    collection page to see the file they had already named (#2141 item 2,
-    review). The page asks this route for the rows instead, so the match is
-    the answer rather than a signpost to it.
-
-    Renders through the SAME ``library_row`` macro the page uses, from the
-    same ``_library_child_row`` dict — a fragment endpoint precisely so the
-    markup and the sharing vocabulary have one source, not a second copy in
-    JavaScript that would drift from the first.
-
-    RBAC: collection access, admins exempt — the same gate as
-    ``/library/{slug}``, because that is what this lists. Deliberately NOT the
-    wider per-file rule ``library_file_detail`` uses: a caller holding a grant
-    on one file inside a folder may open that file, and must not be able to
-    enumerate its siblings. 404 for missing AND for no-access, matching the
-    collection contract.
-
-    An empty ``q`` returns nothing: this route answers a search, and a blank
-    search is what the peek already renders.
+    Returns ``owned``, ``ownership``, ``owner_label``, ``in_stack``, and a
+    ``visibility(file_id)`` callable for that file's OWN (independent)
+    sharing state.
     """
-    from app.auth.access import can_access_collection
     from app.resource_types import ResourceType
     from src.db import SYSTEM_EVERYONE_GROUP
 
-    q_norm = (q or "").strip()
-    if not q_norm:
-        return HTMLResponse("")
-
-    col = file_corpora_repo().get_by_slug(slug)
-    if not col:
-        raise HTTPException(status_code=404, detail="collection_not_found")
-    is_admin = is_user_admin(user["id"], conn)
-    if not is_admin and not can_access_collection(user["id"], col["id"], conn):
-        raise HTTPException(status_code=404, detail="collection_not_found")
-
-    files = corpus_files_repo().list_for_corpus(col["id"], limit=_LIBRARY_MATCH_LIMIT, q=q_norm, order="newest")
-    if not files:
-        return HTMLResponse("")
-
-    uid = user["id"]
     owned = col.get("created_by") == uid
-    # The folder-level facts a child inherits. Resolved the same way
-    # `library_page` resolves them, and each failure falls to the
-    # conservative value rather than taking the fragment down — a row that
-    # says "Private" when it cannot prove otherwise is safe; the opposite
-    # is not.
     try:
         shared_ids = set(resource_grants_repo().list_resource_ids_for_user(uid, ResourceType.COLLECTION.value))
     except Exception:
@@ -5728,7 +5679,7 @@ async def library_matching_file_rows(
     except Exception:
         in_stack = False
 
-    # Each matched file's OWN sharing, batched — one grant read for the whole
+    # Each file's OWN sharing, batched — one grant read for the whole
     # fragment rather than one per row.
     file_groups: dict[str, set] = {}
     try:
@@ -5742,7 +5693,7 @@ async def library_matching_file_rows(
     except Exception:
         everyone_id = None
 
-    def _vis(file_id: str) -> str:
+    def visibility(file_id: str) -> str:
         groups = file_groups.get(file_id)
         if not groups:
             return "private"
@@ -5750,17 +5701,34 @@ async def library_matching_file_rows(
             return "workspace"
         return "shared"
 
+    return {
+        "owned": owned,
+        "ownership": ownership,
+        "owner_label": owner_label,
+        "in_stack": in_stack,
+        "visibility": visibility,
+    }
+
+
+def _library_child_rows_response(request: Request, user: dict, conn, col: dict, files: list) -> HTMLResponse:
+    """``files`` (raw ``corpus_files`` rows) -> the rendered child-row
+    fragment, through the SAME ``library_row`` macro and ``_library_child_row``
+    dict the full page uses — one source for a file row's markup and sharing
+    vocabulary, never a second copy. Shared tail of both child-row fragment
+    routes below."""
+    uid = user["id"]
+    ctx_facts = _library_child_row_context(col, uid)
     rows = [
         _library_child_row(
             f,
             col,
             origin=col.get("origin") or "uploaded",
-            owner_label=owner_label,
-            ownership=ownership,
-            owner_key="me" if owned else (col.get("created_by") or ""),
-            visibility=_vis(f["id"]),
-            stack_state="in_stack" if in_stack else "available",
-            stack_title=_AGENT_HAS_TOOLTIP if in_stack else _AGENT_ADD_TOOLTIP,
+            owner_label=ctx_facts["owner_label"],
+            ownership=ctx_facts["ownership"],
+            owner_key="me" if ctx_facts["owned"] else (col.get("created_by") or ""),
+            visibility=ctx_facts["visibility"](f["id"]),
+            stack_state="in_stack" if ctx_facts["in_stack"] else "available",
+            stack_title=_AGENT_HAS_TOOLTIP if ctx_facts["in_stack"] else _AGENT_ADD_TOOLTIP,
             stack_pill=_AGENT_HAS,
         )
         for f in files
@@ -5769,7 +5737,7 @@ async def library_matching_file_rows(
         request,
         user=user,
         conn=conn,
-        is_admin=is_admin,
+        is_admin=is_user_admin(uid, conn),
         rows=rows,
         # The page-level values `library_row` reads off the context. Empty
         # here on purpose: the entity facets are a MENU the fragment has no
@@ -5779,6 +5747,97 @@ async def library_matching_file_rows(
         library_active_tab="knowledge",
     )
     return templates.TemplateResponse(request, "library_matching_file_rows.html", ctx)
+
+
+@router.get("/library/{slug}/peek", response_class=HTMLResponse)
+async def library_folder_peek_rows(
+    slug: str,
+    request: Request,
+    user: dict = Depends(get_current_user),
+    conn: duckdb.DuckDBPyConnection = Depends(_get_db),
+):
+    """The first ``_LIBRARY_FOLDER_PEEK`` files of one collection, as Library
+    child rows — fetched lazily the first time the Library expands a folder
+    row.
+
+    Round 2 of the incident fix (2026-09-03): the index used to render this
+    same peek inline, hidden, for every folder at or under a size cap — which
+    bounded what RENDERED but not what the index FETCHED (a `list_for_corpus`
+    call per non-empty collection, however small) or embedded into the
+    folder's own row (a `data-search` value built from every one of those
+    filenames). On a live instance (~392 collections, active crawls) that
+    alone cost 19.6 MB of HTML whose live DOM, after the browser discarded
+    the markup's indentation, was 1.09 MB. The index card is now the
+    count/name/description alone (`library_page`); this route is the ONLY
+    place a folder's own files are read, and only on demand.
+
+    Same shape as `library_matching_file_rows` (renders through the same
+    macro and dict, same RBAC, same 404-for-missing-and-no-access contract)
+    — the two share `_library_child_row_context` and
+    `_library_child_rows_response` rather than a third copy of either.
+    """
+    from app.auth.access import can_access_collection
+
+    col = file_corpora_repo().get_by_slug(slug)
+    if not col:
+        raise HTTPException(status_code=404, detail="collection_not_found")
+    is_admin = is_user_admin(user["id"], conn)
+    if not is_admin and not can_access_collection(user["id"], col["id"], conn):
+        raise HTTPException(status_code=404, detail="collection_not_found")
+
+    files = corpus_files_repo().list_for_corpus(col["id"], limit=_LIBRARY_FOLDER_PEEK)
+    if not files:
+        return HTMLResponse("")
+    return _library_child_rows_response(request, user, conn, col, files)
+
+
+@router.get("/library/{slug}/matching-files", response_class=HTMLResponse)
+async def library_matching_file_rows(
+    slug: str,
+    request: Request,
+    q: str = "",
+    user: dict = Depends(get_current_user),
+    conn: duckdb.DuckDBPyConnection = Depends(_get_db),
+):
+    """The file rows of one collection that match ``q`` — as Library child rows.
+
+    Why this exists: the Library expands a folder to a PEEK of its files
+    (``_LIBRARY_FOLDER_PEEK``, fetched by `library_folder_peek_rows` above),
+    and its search box is live and client-side. A capped folder's peek is not
+    its whole contents, so a search naming a file outside the peek would
+    otherwise find the folder (its name/description matched, or an earlier
+    peek fetch is already in the DOM) and show nothing for it — the reader
+    had named a file and was handed a folder with no sign of it (#2141 item 2,
+    review). This route asks the SERVER for the matching rows instead, so the
+    match is the answer rather than a signpost to it.
+
+    RBAC: collection access, admins exempt — the same gate as
+    ``/library/{slug}``, because that is what this lists. Deliberately NOT the
+    wider per-file rule ``library_file_detail`` uses: a caller holding a grant
+    on one file inside a folder may open that file, and must not be able to
+    enumerate its siblings. 404 for missing AND for no-access, matching the
+    collection contract.
+
+    An empty ``q`` returns nothing: this route answers a search, and a blank
+    search is what the peek endpoint already answers.
+    """
+    from app.auth.access import can_access_collection
+
+    q_norm = (q or "").strip()
+    if not q_norm:
+        return HTMLResponse("")
+
+    col = file_corpora_repo().get_by_slug(slug)
+    if not col:
+        raise HTTPException(status_code=404, detail="collection_not_found")
+    is_admin = is_user_admin(user["id"], conn)
+    if not is_admin and not can_access_collection(user["id"], col["id"], conn):
+        raise HTTPException(status_code=404, detail="collection_not_found")
+
+    files = corpus_files_repo().list_for_corpus(col["id"], limit=_LIBRARY_MATCH_LIMIT, q=q_norm, order="newest")
+    if not files:
+        return HTMLResponse("")
+    return _library_child_rows_response(request, user, conn, col, files)
 
 
 @router.get("/library/{slug}", response_class=HTMLResponse)

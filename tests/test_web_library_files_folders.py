@@ -429,13 +429,17 @@ def test_every_section_shares_one_fixed_column_grid(seeded_app):
 def test_nested_files_use_the_plain_row_with_a_connector(seeded_app):
     """Nesting is carried by indentation + a connector rail, not a tinted band:
     a child row is the same white row as any other, and the last child is marked
-    so its rail can stop at the elbow."""
+    so its rail can stop at the elbow.
+
+    Child rows are never pre-rendered on the index (round 2 of the incident
+    fix) — they are fetched lazily from `/library/{slug}/peek` the first time
+    the reader expands the folder, so that is what this asserts against."""
     import re
 
     tok = seeded_app["admin_token"]
-    _folder(seeded_app, "Connector Folder", tok, names=("c1.md", "c2.md"))
+    col = _folder(seeded_app, "Connector Folder", tok, names=("c1.md", "c2.md"))
 
-    text = seeded_app["client"].get("/library", headers=_auth(tok)).text
+    text = seeded_app["client"].get(f"/library/{col['slug']}/peek", headers=_auth(tok)).text
     kids = re.findall(r'<tr class="lib-row lib-row--file lib-row--child[^"]*"', text)
     assert len(kids) >= 2
     assert any("lib-row--lastchild" in k for k in kids), "last child not marked"
@@ -517,9 +521,12 @@ def test_file_rows_show_their_format_where_the_description_was(seeded_app):
     assert folder_row, "a 2-file artefact must render as a folder row"
     assert _desc(folder_row.group(0)) == "2 files"
 
-    # Children: titled by filename, second line = their own format. No closing
-    # quote in the pattern — the last child carries `lib-row--lastchild` too.
-    kids = re.findall(r'<tr class="lib-row lib-row--file lib-row--child.*?</tr>', text, re.S)
+    # Children: titled by filename, second line = their own format. Fetched
+    # lazily from `/library/{slug}/peek` (round 2 of the incident fix), not
+    # pre-rendered on the index. No closing quote in the pattern — the last
+    # child carries `lib-row--lastchild` too.
+    peek_text = seeded_app["client"].get(f"/library/{folder['slug']}/peek", headers=_auth(tok)).text
+    kids = re.findall(r'<tr class="lib-row lib-row--file lib-row--child.*?</tr>', peek_text, re.S)
     kid_formats = {_desc(k) for k in kids}
     assert {"PNG", "CSV"} <= kid_formats, kid_formats
     # The format also rides the row, for the in-place file⇄collection transitions.
@@ -936,8 +943,10 @@ def test_a_single_file_can_be_shared_without_its_folder(seeded_app):
     assert r.json()["visibility"] == "workspace"
     # The folder itself is untouched.
     assert c.get(f"/api/sharing/collection/{col['id']}", headers=_auth(tok)).json()["visibility"] == "private"
-    # And the Library shows the file's own state.
-    text = c.get("/library", headers=_auth(tok)).text
+    # And the Library shows the file's own state — on its peek row, fetched
+    # lazily on expand rather than pre-rendered on the index (round 2 of the
+    # incident fix: a folder's files are never listed at index-render time).
+    text = c.get(f"/library/{col['slug']}/peek", headers=_auth(tok)).text
     assert 'data-share-type="corpus_file"' in text
 
 
