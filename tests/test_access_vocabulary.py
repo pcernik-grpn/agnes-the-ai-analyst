@@ -963,3 +963,59 @@ class TestReachIsTheServersNumber:
         f = f[: f.index("\n  }", f.index("return p;"))]
         assert "_reachCache.has(key)" in f and "_reachCache.set(key, p);" in f
         assert 'const key = groupIds.slice().sort().join(",");' in f
+
+
+class TestTheRosterNoLongerShipsToTheBrowser:
+    """Audit S2. Every group's full `member_ids` travelled in the overview
+    payload to support two lookups — reach (E3) and the group list's
+    search-by-member. Both are answered by the server now, and the payload no
+    longer grows with headcount.
+    """
+
+    TEMPLATE = "app/web/templates/admin_access.html"
+
+    def _source(self) -> str:
+        from pathlib import Path
+
+        return Path(self.TEMPLATE).read_text(encoding="utf-8")
+
+    def test_nothing_matches_against_a_local_roster_any_more(self):
+        src = self._source()
+        # The only remaining reader is reachOf's fallback, which now says it is
+        # an estimate the server paints over where the number decides anything.
+        readers = [i for i in range(len(src)) if src.startswith("member_ids", i)]
+        assert len(readers) <= 3, f"{len(readers)} mentions of member_ids; expected reachOf's fallback only"
+        assert "new Set(g.member_ids || [])" not in src
+
+    def test_the_member_search_asks_the_server_once_per_query(self):
+        src = self._source()
+        f = src[src.index("function fetchMemberGroups(q)"):]
+        f = f[: f.index("\n  }\n", f.index("return _memberCache"))]
+        assert "_memberCache.has(q)" in f and "_memberCache.set(q," in f
+        assert "if (!q || q.length < 2)" in f, "the two-character floor is applied before asking"
+
+    def test_a_hit_is_stored_with_the_query_it_answers(self):
+        """A repaint for a different query must not read a stale hit."""
+        src = self._source()
+        assert "const mm = (memberMatches.q === q) ? memberMatches : null;" in src
+        assert "memberMatches = { q, byGroup: new Map(" in src
+
+    def test_everyone_is_a_hit_whenever_anyone_matched(self):
+        src = self._source()
+        assert "if (g.is_everyone) return mm.matched_people ?" in src
+
+    def test_the_search_trigger_no_longer_loads_a_roster(self):
+        src = self._source()
+        assert "loadUsers().then(() => { if (groupFilter.trim()) repaintQuery(); });" not in src
+        assert "fetchMemberGroups(groupFilter.trim().toLowerCase()).then(" in src
+
+    def test_the_trigger_is_not_gated_on_a_roster_that_no_longer_loads(self):
+        """`!users.length` belonged to the roster load this replaced. Kept, the
+        member search silently never fires on a visit where the person lens
+        already filled `users` — a search that works until you open the other
+        tab. Found by driving the page: zero requests, list unchanged."""
+        src = self._source()
+        i = src.index("fetchMemberGroups(groupFilter.trim().toLowerCase())")
+        cond = src[src.rfind("if (", 0, i) : i]
+        assert "users.length" not in cond, cond
+        assert "groupFilter.trim().length >= 2" in cond

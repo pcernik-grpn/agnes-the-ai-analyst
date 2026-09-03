@@ -2993,6 +2993,13 @@ KNOWN_UNTESTED = {
     # reaching nobody rather than erroring, and the same person in two groups
     # counted once — the double-count the browser-side union used to make.
     "GET /api/admin/groups/reach",
+    # member-search takes a required `q` (min two characters), so it is not
+    # parameter-free-GET shaped either. Behaviourally covered in
+    # tests/test_access_groups_member_search.py: the 422 without `q` and on a
+    # one-letter `q`, the RBAC gate, a seeded admin found by email fragment
+    # with the Admin group in the answer, a miss returning no groups and zero
+    # matched people, and up to three names per group.
+    "GET /api/admin/groups/member-search",
     # Admin telemetry
     # chat-cost takes a `window` (and optional `user`) query parameter and is
     # admin-gated, so it is not parameter-free-GET shaped for this sweep.

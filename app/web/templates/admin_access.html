@@ -2840,6 +2840,7 @@
 
   const GRANTS_API = "/api/admin/grants";
   const REACH_API = "/api/admin/groups/reach"; // distinct people a set of audiences reaches
+  const MEMBER_SEARCH_API = "/api/admin/groups/member-search"; // which groups hold a matching person
   const OVERVIEW_API = "/api/admin/access-overview";
   const USERS_LIST_API = "/api/users";        // list + search + single user
   const ADMIN_USERS_API = "/api/admin/users"; // memberships + effective-access
@@ -2898,7 +2899,7 @@
      shown, so it implies the lens. */
   let viewMode = _q0.get("lens") === "simulate" ? "person"
     : (_normalizeBy(_q0.get("by")) || (_q0.get("user") ? "person" : "group"));
-  let users = [];        // Simulate's picker only — never the member search
+  let users = [];        // the person lens's picker; the group-list member search asks the server
 
   const el = (id) => document.getElementById(id);
   const esc = (s) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;")
@@ -3446,12 +3447,18 @@
        lens's picker (cached, capped at 500, fetched on the first search
        rather than on every page load). `Everyone` matches any live account
        by construction, which is why it is not consulted by id. */
+    /* The server's answer for THIS query, or nothing yet. `memberMatches` is
+       filled by `fetchMemberGroups` (below, keyed by query) and the list
+       repaints when it lands; until then a person-search simply has no
+       member hits, which reads as "still looking" rather than as a wrong
+       answer. `Everyone` is a hit whenever anyone matched at all — every
+       live account is in it by construction. (Audit S2: the roster no longer
+       ships, so there is nothing to match against locally.) */
+    const mm = (memberMatches.q === q) ? memberMatches : null;
     const peopleFor = (g) => {
-      if (!users.length) return [];
-      const ids = g.is_everyone ? null : new Set(g.member_ids || []);
-      return users.filter((u) => u.active !== false
-        && (!ids || ids.has(u.id))
-        && `${u.email || ""} ${u.name || ""}`.toLowerCase().includes(q));
+      if (!mm) return [];
+      if (g.is_everyone) return mm.matched_people ? [{ name: `${mm.matched_people} matching ${mm.matched_people === 1 ? "person" : "people"}` }] : [];
+      return mm.byGroup.get(g.id) || [];
     };
     const memberHit = (g) => q.length >= 2 && peopleFor(g).length > 0;
     const kindHit = (g) => !listKind
@@ -4734,13 +4741,19 @@
       return;
     }
     repaintQuery();
-    /* The roster the people-match reads is fetched on the first search, not
-       on page load — most visits never search, and this page already makes
-       one big request. `loadUsers()` is idempotent and cached, so this costs
-       one fetch per sitting; the repaint after it lands is what turns a
-       "0 of 5" into the real answer without the reader retyping. */
-    if (groupFilter.trim().length >= 2 && !users.length) {
-      loadUsers().then(() => { if (groupFilter.trim()) repaintQuery(); });
+    /* The people-match asks the server for THIS query (audit S2) — one
+       request per distinct query, memoised in `fetchMemberGroups`, so
+       retyping the same thing costs nothing and the roster never loads for
+       this. The repaint after it lands is what turns a "0 of 5" into the real
+       answer without the reader retyping.
+
+       No `!users.length` guard here. That guard belonged to the roster
+       load it replaced ("fetch once per sitting"); kept, it would have made
+       the member search silently never fire on any visit where the person
+       lens had already filled `users` — a search that works until you open
+       the other tab. */
+    if (groupFilter.trim().length >= 2) {
+      fetchMemberGroups(groupFilter.trim().toLowerCase()).then((done) => { if (done && groupFilter.trim()) repaintQuery(); });
     }
   });
 
@@ -5023,6 +5036,27 @@
      Memoised by the exact set asked about, so toggling a group off and back
      on does not re-ask. Resolves to null on any failure so the caller keeps
      the local estimate rather than painting nothing. */
+  /* Which groups hold a person matching the group-list search. One request
+     per distinct query, memoised; the answer is stored with the query it
+     answers so a repaint for a different query cannot read a stale hit. Under
+     two characters the server refuses (422) and the page does not ask — the
+     same floor `memberHit` always applied. */
+  let memberMatches = { q: "", byGroup: new Map(), matched_people: 0 };
+  const _memberCache = new Map();
+  function fetchMemberGroups(q) {
+    if (!q || q.length < 2) { memberMatches = { q, byGroup: new Map(), matched_people: 0 }; return Promise.resolve(false); }
+    if (!_memberCache.has(q)) {
+      _memberCache.set(q, fetch(`${MEMBER_SEARCH_API}?q=${encodeURIComponent(q)}`, { credentials: "include" })
+        .then((r) => (r.ok ? r.json() : null))
+        .catch(() => null));
+    }
+    return _memberCache.get(q).then((b) => {
+      if (!b) return false;
+      memberMatches = { q, byGroup: new Map((b.matches || []).map((m) => [m.group_id, m.people || []])), matched_people: b.matched_people || 0 };
+      return true;
+    });
+  }
+
   const _reachCache = new Map();
   function fetchReach(groupIds) {
     const key = groupIds.slice().sort().join(",");
@@ -5054,8 +5088,12 @@
     let unknown = 0;
     for (const g of groups) {
       const ids = g.member_ids;
-      // A group whose roster the payload did not carry still has to count for
-      // something; fall back to its own count rather than dropping it.
+      // Rosters no longer ship (audit S2), so this branch is now the rule
+      // rather than the exception: the local figure is a sum of counts, an
+      // ESTIMATE that overshoots when a person is in two groups. Where the
+      // number decides something — the picker footer — `fetchReach` paints
+      // the server's answer over it. Elsewhere it is a summary and says so
+      // by its clamp to the account total.
       if (!Array.isArray(ids)) { unknown += g.member_count ?? 0; continue; }
       for (const id of ids) seen.add(id);
     }

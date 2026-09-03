@@ -260,18 +260,12 @@ async def access_overview(
                 # `is_everyone` + the `account_total` below instead, which is
                 # the same answer at O(1).
                 "is_everyone": g.get("name") == SYSTEM_EVERYONE_GROUP,
-                "member_ids": (
-                    []
-                    if g.get("name") == SYSTEM_EVERYONE_GROUP
-                    else [
-                        # `list_members_for_group` joins users and returns the
-                        # account under `id` (u.id), not `user_id` — identically
-                        # on both backends.
-                        m["id"]
-                        for m in members_repo.list_members_for_group(g["id"])
-                        if m.get("id")
-                    ]
-                ),
+                # No roster. `member_ids` used to ride here so the browser could
+                # union reach and match a search against members; both moved to
+                # the server (`/groups/reach`, `/groups/member-search`), which
+                # is where the memberships are. The payload no longer grows with
+                # headcount, and an admin session no longer distributes the org
+                # chart to do two lookups. (Audit S2.)
             }
         )
 
@@ -642,6 +636,50 @@ async def groups_reach(
             if uid:
                 seen.add(str(uid))
     return {"count": min(len(seen), account_total), "account_total": account_total}
+
+
+@router.get("/groups/member-search", response_model=dict)
+async def groups_member_search(
+    q: str = Query(..., min_length=2, description="Email or name fragment, case-insensitive"),
+    user: dict = Depends(require_admin),
+):
+    """Which groups hold a person matching ``q`` — the group list's third question.
+
+    The Access page's search box has always promised people (its placeholder
+    says so), and it answered by matching the typed text against every
+    group's member roster in the browser — which is why every group's full
+    ``member_ids`` travelled in the overview payload (audit S2). The payload
+    grew with headcount, every admin session distributed the org chart to do
+    one lookup, and the roster was capped at 500 so the answer was quietly
+    wrong on a larger instance.
+
+    Answered here instead, where the memberships are: the same case-insensitive
+    email-or-name match ``/api/users?search=`` makes, then each match's groups.
+    Per group, up to three matched people come back by name so the row can
+    say WHO matched ("matched Ada Lovelace, Grace Hopper"), which is the part
+    of the answer an admin actually reads. ``matched_people`` is the total so
+    the Everyone audience — every live account by construction — can be
+    reported as a hit whenever anyone matched at all.
+
+    ``q`` is required and at least two characters, the same floor the page
+    applied client-side; a one-letter search matches half the instance and
+    says nothing. Declared before ``/groups/{group_id}`` so the literal
+    segment is not captured as a group id.
+    """
+    people = users_repo().search_recent(limit=500, search=q)
+    live = [u for u in people if u.get("active", True) is not False]
+    members_repo = user_group_members_repo()
+    per_group: dict[str, list[dict]] = {}
+    for u in live:
+        label = {"name": u.get("name") or "", "email": u.get("email") or ""}
+        for gid in members_repo.list_groups_for_user(str(u["id"])):
+            bucket = per_group.setdefault(str(gid), [])
+            if len(bucket) < 3:
+                bucket.append(label)
+    return {
+        "matches": [{"group_id": gid, "people": ppl} for gid, ppl in per_group.items()],
+        "matched_people": len(live),
+    }
 
 
 @router.get("/groups/{group_id}", response_model=GroupResponse)

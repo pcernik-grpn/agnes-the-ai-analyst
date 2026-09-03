@@ -714,6 +714,7 @@ READ_POSTURE: dict[str, str] = {
     "GET /api/admin/groups/{group_id}": "exempt:ui_support",
     "GET /api/admin/groups/{group_id}/members": "exempt:ui_support",
     "GET /api/admin/groups/reach": "exempt:ui_support",
+    "GET /api/admin/groups/member-search": "exempt:ui_support",
     "GET /api/admin/resource-types": "exempt:ui_support",
     "GET /api/admin/users/{user_id}/effective-access": "exempt:ui_support",
     "GET /api/admin/users/{user_id}/library-preview": "exempt:ui_support",

@@ -21178,6 +21178,76 @@
         ]
       }
     },
+    "/api/admin/groups/member-search": {
+      "get": {
+        "description": "Which groups hold a person matching ``q`` \u2014 the group list's third question.\n\nThe Access page's search box has always promised people (its placeholder\nsays so), and it answered by matching the typed text against every\ngroup's member roster in the browser \u2014 which is why every group's full\n``member_ids`` travelled in the overview payload (audit S2). The payload\ngrew with headcount, every admin session distributed the org chart to do\none lookup, and the roster was capped at 500 so the answer was quietly\nwrong on a larger instance.\n\nAnswered here instead, where the memberships are: the same case-insensitive\nemail-or-name match ``/api/users?search=`` makes, then each match's groups.\nPer group, up to three matched people come back by name so the row can\nsay WHO matched (\"matched Ada Lovelace, Grace Hopper\"), which is the part\nof the answer an admin actually reads. ``matched_people`` is the total so\nthe Everyone audience \u2014 every live account by construction \u2014 can be\nreported as a hit whenever anyone matched at all.\n\n``q`` is required and at least two characters, the same floor the page\napplied client-side; a one-letter search matches half the instance and\nsays nothing. Declared before ``/groups/{group_id}`` so the literal\nsegment is not captured as a group id.",
+        "operationId": "groups_member_search_api_admin_groups_member_search_get",
+        "parameters": [
+          {
+            "description": "Email or name fragment, case-insensitive",
+            "in": "query",
+            "name": "q",
+            "required": true,
+            "schema": {
+              "description": "Email or name fragment, case-insensitive",
+              "minLength": 2,
+              "title": "Q",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Groups Member Search Api Admin Groups Member Search Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Groups Member Search",
+        "tags": [
+          "access"
+        ]
+      }
+    },
     "/api/admin/groups/reach": {
       "get": {
         "description": "How many distinct people a set of audiences reaches.\n\nThe Access page prints this number at the moment an admin decides to\nshare \u2014 \"3 groups \u00b7 41 people\" beside Apply \u2014 and it used to compute it\nin the browser by unioning each group's member ids, which meant every\ngroup's full roster travelled in the overview payload to support one\narithmetic operation (audit findings E3 and S2). A group whose roster the\npayload did not carry fell back to its own count, double-counting anyone\nin two such groups, and the result was then clamped to the account total\nto hide the overshoot. A figure precise enough to be trusted and not\nalways right, on the screen where reach is being decided.\n\nComputed here instead, where the memberships are. ``everyone`` \u2014 the\nscope sentinel, not a group \u2014 short-circuits to the account total: it is\nevery account by construction, so no union can exceed it and none is\nneeded. Ordinary groups union their distinct member ids. The answer is\nstill clamped to the account total, but as an invariant rather than a\npatch: no set of audiences reaches more people than there are accounts.\n\n``ids`` is required (422 when absent, from FastAPI, identically on both\napp-state backends). Declared before ``/groups/{group_id}`` so the\nliteral segment is not captured as a group id.",
