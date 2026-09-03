@@ -520,6 +520,13 @@ _EXTRACTION_ENV_LOCKS: tuple[tuple[tuple[str, ...], str], ...] = ()
 
 _EXTRACTION_TIMEOUT_MIN = 60
 _EXTRACTION_TIMEOUT_MAX = 86400  # 24h
+# `extraction.stall_after_s` — how stale a `running` run's checkpoint may
+# get before `app/api/admin_extraction.py`'s `_derived_outcome` reports
+# `stalled` instead of `running`. Same range as `timeout_s` above (a stall
+# threshold shorter than a minute would flag a run that is merely between
+# checkpoints; longer than 24h defeats the point of the signal).
+_EXTRACTION_STALL_AFTER_MIN = 60
+_EXTRACTION_STALL_AFTER_MAX = 86400  # 24h
 # `extraction.crawler.concurrency` bounds — the SAME clamp the crawler applies
 # (`connectors.sharepoint.crawler._MAX_CONCURRENCY`), pinned by
 # `tests/test_admin_server_config_extraction_section.py` rather than imported:
@@ -643,6 +650,19 @@ def _validate_extraction_section(sections: Dict[str, Dict[str, Any]]) -> None:
                 detail=(
                     f"extraction.timeout_s must be between {_EXTRACTION_TIMEOUT_MIN} and "
                     f"{_EXTRACTION_TIMEOUT_MAX} (got {timeout_s})"
+                ),
+            )
+
+    stall_after_s = patch.get("stall_after_s")
+    if stall_after_s is not None:
+        if not isinstance(stall_after_s, int) or isinstance(stall_after_s, bool):
+            raise HTTPException(status_code=422, detail="extraction.stall_after_s must be an integer")
+        if stall_after_s < _EXTRACTION_STALL_AFTER_MIN or stall_after_s > _EXTRACTION_STALL_AFTER_MAX:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"extraction.stall_after_s must be between {_EXTRACTION_STALL_AFTER_MIN} and "
+                    f"{_EXTRACTION_STALL_AFTER_MAX} (got {stall_after_s})"
                 ),
             )
 
@@ -1285,6 +1305,20 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
                 "stops between files/pages, persists its state and the job fails; the next "
                 "run resumes from the persisted deltaLinks/cTags. 0 = unbounded. Must be "
                 "between 60 and 86400 (24h)."
+            ),
+        },
+        "stall_after_s": {
+            "kind": "int",
+            "default": 900,
+            "hint": (
+                "How stale a `running` run's last checkpoint may get before the fleet view "
+                "(/admin/extraction) and the source card report it as `stalled` instead of "
+                "`running` — the SAME rule both surfaces use, so the fleet's 'Stuck?' badge "
+                "and the run's own outcome word can never disagree. Being late to say "
+                "'stalled' costs an operator a little patience; being early costs them trust "
+                "in every other number this dashboard shows. Must be between 60 and 86400 "
+                "(24h). A `stalled` run can be force-cancelled from either surface — see "
+                "POST /api/admin/sharepoint/extraction/runs/{run_id}/cancel."
             ),
         },
         "crawler": {

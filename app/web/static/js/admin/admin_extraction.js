@@ -23,7 +23,7 @@ let extLastBody = null;
 const extPending = {};
 
 function _extPendingFor(connId) {
-  if (!extPending[connId]) extPending[connId] = { failed: false, empty: false, rerun: false };
+  if (!extPending[connId]) extPending[connId] = { failed: false, empty: false, rerun: false, cancel: false };
   return extPending[connId];
 }
 
@@ -112,7 +112,11 @@ function phaseCell(run) {
    (TCRD-296): "Retry failed (N)"/"Retry empty (N)" (this connection's own
    persisted crawl-state backlog) and "Re-run" (for a connection whose most
    recent run did not finish cleanly). Disabled while a run is live — its
-   idempotency key may still hold the enqueue dedup lock either way. */
+   idempotency key may still hold the enqueue dedup lock either way.
+   "Cancel run" (stalled-crawl-cancel fix) is the odd one out: it is offered
+   for a `running`/`stalled` row (never a finished one — there is nothing to
+   cancel), it is a FORCE-close rather than a queue action, and it is never
+   disabled by `live` — force-closing a live run is the entire point. */
 function actionsCell(row) {
   const run = row.run;
   const live = !!(run && run.stored_status === "running");
@@ -135,11 +139,16 @@ function actionsCell(row) {
     ? `<button type="button" class="btn btn-sm btn-secondary" onclick="extRerun('${row.connection_id}')"
       ${pending.rerun ? "disabled" : ""}>${pending.rerun ? "Starting…" : "Re-run"}</button>`
     : "";
+  const canCancel = !!run && (run.outcome === "running" || run.outcome === "stalled");
+  const cancelBtn = canCancel
+    ? `<button type="button" class="btn btn-sm btn-danger" onclick="extCancelRun('${row.connection_id}', '${run.id}')"
+      ${pending.cancel ? "disabled" : ""}>${pending.cancel ? "Cancelling…" : "Cancel run"}</button>`
+    : "";
 
   const msg = extActionMsg[row.connection_id];
   const msgHtml = msg ? `<div class="ext-sub ${msg.ok ? "" : "ext-danger"}">${esc(msg.text)}</div>` : "";
 
-  return `<div class="ext-row-actions">${retryFailedBtn}${retryEmptyBtn}${rerunBtn}</div>${msgHtml}`;
+  return `<div class="ext-row-actions">${cancelBtn}${retryFailedBtn}${retryEmptyBtn}${rerunBtn}</div>${msgHtml}`;
 }
 
 function renderRow(row) {
@@ -356,6 +365,47 @@ function extRerun(connId) {
     null,
     "Extraction queued",
   );
+}
+
+/* Force-close a run Stop alone cannot reach — a genuinely stuck crawl loop
+   never notices the cooperative stop flag either (the 2026-09-02 incident:
+   an hour of `running` with no checkpoint, ended by hand via two SQL
+   updates and a re-trigger). A confirm dialog (confirmModal/alertModal —
+   modal.js, globally loaded — never the native browser dialog, see
+   tests/test_design_system_contract.py's native-dialog guard) since this
+   force-closes work that may still be in flight. A 200 means the row is
+   closed server-side IMMEDIATELY (never waiting on the crawl to notice) —
+   redraw from the cached body first (own `pending` lock, same shape the
+   three reprocessing actions above use), then let the next poll carry the
+   real `interrupted` outcome. */
+async function extCancelRun(connId, runId) {
+  const ok = await confirmModal(
+    "Cancel this extraction run? This force-closes it even if the worker never reacts — what it " +
+      "already ingested is kept, but the run itself will not finish on its own."
+  );
+  if (!ok) return;
+  const pending = _extPendingFor(connId);
+  pending.cancel = true;
+  delete extActionMsg[connId];
+  if (extLastBody) renderTable(extLastBody);
+  try {
+    const r = await fetch(`/api/admin/sharepoint/extraction/runs/${encodeURIComponent(runId)}/cancel`, {
+      method: "POST",
+      credentials: "include",
+    });
+    const body = await r.json().catch(() => ({}));
+    if (r.ok) {
+      extActionMsg[connId] = { text: "Run cancelled.", ok: true };
+    } else {
+      await alertModal(`Cancel failed: ${detailMessage(body, "couldn't cancel the run")}`);
+    }
+  } catch (e) {
+    await alertModal(`Request failed: ${e.message}`);
+  } finally {
+    pending.cancel = false;
+    if (extLastBody) renderTable(extLastBody);
+    await extTick();
+  }
 }
 
 document.getElementById("ext-scope-active").addEventListener("click", (e) => { e.preventDefault(); setScope("active"); });

@@ -3683,6 +3683,14 @@ KNOWN_UNTESTED = {
     # Not duplicated here.
     "GET /admin/extraction",
     "GET /api/admin/sharepoint/extraction/runs",
+    # Force-cancel a run (2026-09-03, TCRD-296 gap 32) — reads/writes
+    # `extraction_runs`, the same PG-only table the fleet route right above
+    # does: the DuckDB side answers the typed 501 the A3 ratchet requires
+    # (`tests/test_admin_extraction.py::TestCancelRoute::test_typed_501_on_
+    # duckdb`). Auth matrix, the happy path (job + run finalized, lease
+    # cleared, audit row), and the 404/409 edges are covered directly by
+    # tests/db_pg/test_extraction_api_pg.py. Not duplicated here.
+    "POST /api/admin/sharepoint/extraction/runs/{run_id}/cancel",
     # Ontology builder (spec §13.2) — the admin builder-shell page and its
     # draft CRUD + state-machine actions + dry-run are covered directly by
     # tests/test_api_ontology.py, tests/test_web_admin_ontology_page.py and

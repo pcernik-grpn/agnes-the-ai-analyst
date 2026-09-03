@@ -1309,6 +1309,54 @@ class TestRuns:
         assert "Jobs" not in result.output
 
 
+class TestRunsCancel:
+    """`agnes admin sharepoint runs cancel <run_id>` — CLI counterpart to
+    `POST /api/admin/sharepoint/extraction/runs/{run_id}/cancel`."""
+
+    _CANCEL_BODY = {
+        "connection_id": "conn-1",
+        "id": "er_1",
+        "outcome": "interrupted",
+        "interrupted_reason": "cancelled",
+        "resumable": True,
+    }
+
+    def test_cancel_posts_to_the_run_specific_route(self):
+        with patch("cli.commands.admin_sharepoint.api_post", return_value=_resp(200, self._CANCEL_BODY)) as mock_post:
+            result = runner.invoke(app, ["admin", "sharepoint", "runs", "cancel", "er_1"])
+        assert result.exit_code == 0, result.output
+        mock_post.assert_called_once_with("/api/admin/sharepoint/extraction/runs/er_1/cancel")
+        assert "er_1" in result.output
+        assert "interrupted" in result.output
+
+    def test_cancel_json_output_is_the_raw_body(self):
+        with patch("cli.commands.admin_sharepoint.api_post", return_value=_resp(200, self._CANCEL_BODY)):
+            result = runner.invoke(app, ["admin", "sharepoint", "runs", "cancel", "er_1", "--json"])
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.output) == self._CANCEL_BODY
+
+    def test_cancel_404_is_reported_and_exits_nonzero(self):
+        body = {"detail": "run_not_found"}
+        with patch("cli.commands.admin_sharepoint.api_post", return_value=_resp(404, body)):
+            result = runner.invoke(app, ["admin", "sharepoint", "runs", "cancel", "er_missing"])
+        assert result.exit_code == 1
+        assert "run_not_found" in result.output
+
+    def test_cancel_409_is_reported_and_exits_nonzero(self):
+        body = {"detail": {"error": "run_not_active", "message": "this run is already 'done'"}}
+        with patch("cli.commands.admin_sharepoint.api_post", return_value=_resp(409, body)):
+            result = runner.invoke(app, ["admin", "sharepoint", "runs", "cancel", "er_done"])
+        assert result.exit_code == 1
+        assert "already 'done'" in result.output
+
+    def test_bare_runs_still_works_alongside_the_cancel_subcommand(self):
+        """The sub-app conversion must not break the plain dashboard call."""
+        with patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(200, _FLEET_BODY)) as mock_get:
+            result = runner.invoke(app, ["admin", "sharepoint", "runs"])
+        assert result.exit_code == 0, result.output
+        mock_get.assert_called_once_with("/api/admin/sharepoint/extraction/runs?active=1")
+
+
 class TestExtract:
     """`agnes admin sharepoint extract` — CLI counterpart to
     `POST /api/admin/sharepoint/connections/{connection_id}/extract`, the

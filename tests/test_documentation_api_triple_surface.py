@@ -1427,6 +1427,16 @@ _EXEMPT: dict[str, str] = {
         "dashboard — admin display primitive, CLI-reachable (agnes admin sharepoint "
         "runs) but deliberately not MCP-exposed"
     ),
+    # Force-close a run the cooperative stop above cannot reach (2026-09-03,
+    # TCRD-296 gap 32) — same admin-display-primitive class as the fleet
+    # dashboard right above, CLI-reachable (`agnes admin sharepoint runs
+    # cancel <run_id>`) but deliberately not MCP-exposed: force-terminating
+    # a crawl is an operator decision made from the fleet/card UI or a
+    # support runbook, not a tool call an agent should ever reach for.
+    "/api/admin/sharepoint/extraction/runs/{run_id}/cancel": (
+        "admin 'force-cancel this run' control, for a run the cooperative stop cannot reach — "
+        "CLI-reachable (agnes admin sharepoint runs cancel) but deliberately not MCP-exposed"
+    ),
     # issue #1971 Part 3/4 — corporate-memory detection observability. Same
     # exemption class as the SharePoint extraction run-history rows above:
     # an admin panel's own data (run counters, a policy fingerprint) and an

@@ -363,23 +363,43 @@ several scopes split into separate connections) is one screen:
 `/admin/extraction` (the **All connections** button in any SharePoint
 source card's Run row on `/admin/data-sources`) — one row per connection with its phase, files
 done/seen, a derived files/min, the facts pass's own done/pending counts,
-token spend and estimated cost, and how old its last checkpoint is (flagged
-once it passes 10 minutes on a run still marked running — "stuck?", not an
-outcome, just a prompt to go look). Defaults to connections with a run
-active right now (`?active=1`); `?all=1` broadens to every connection, idle
-ones included. `agnes admin sharepoint runs [--all] [--json] [--watch]` is
-the same view from a terminal — `--watch` refreshes every 10s, for an
-operator watching an overnight run over SSH with no browser open. Both read
-`GET /api/admin/sharepoint/extraction/runs`, PG-only like the rest of run
-observability (see the troubleshooting row below). A small strip above the
-table — printed as a `Jobs — …` line from the CLI — shows queued-vs-running
-counts per worker lane (`corpus-extraction`, `sharepoint-facts-extraction`),
-independent of the `active`/`all` scope: a lane with jobs queued and NONE
-running is flagged (every worker slot busy elsewhere, or none configured
-for it) — the one signal a connection stuck at "queued" forever has no
-`extraction_runs` row to show any other way. Each row also carries its own
-"Retry failed (N)"/"Retry empty (N)"/"Re-run" buttons, same rules as the
-source card's Run row above.
+token spend and estimated cost, and how old its last checkpoint is. A run
+still marked `running` whose checkpoint has gone stale past
+`extraction.stall_after_s` (default 900s/15min, admin-editable in
+`/admin/server-config` → Extraction → Stall threshold) is reported as
+`outcome: "stalled"` — the SAME word and the SAME threshold the fleet row's
+"Stuck?" badge uses, so the two can never disagree. Defaults to connections
+with a run active right now (`?active=1`); `?all=1` broadens to every
+connection, idle ones included. `agnes admin sharepoint runs [--all]
+[--json] [--watch]` is the same view from a terminal — `--watch` refreshes
+every 10s, for an operator watching an overnight run over SSH with no
+browser open. Both read `GET /api/admin/sharepoint/extraction/runs`,
+PG-only like the rest of run observability (see the troubleshooting row
+below). A small strip above the table — printed as a `Jobs — …` line from
+the CLI — shows queued-vs-running counts per worker lane
+(`corpus-extraction`, `sharepoint-facts-extraction`), independent of the
+`active`/`all` scope: a lane with jobs queued and NONE running is flagged
+(every worker slot busy elsewhere, or none configured for it) — the one
+signal a connection stuck at "queued" forever has no `extraction_runs` row
+to show any other way. Each row also carries its own "Retry failed (N)"/
+"Retry empty (N)"/"Re-run" buttons, same rules as the source card's Run row
+above.
+
+### Cancelling a run Stop can't reach
+
+A crawl loop that is genuinely stuck (not merely slow) never notices the
+cooperative Stop button either — nothing yields, so the flag it sets is
+never polled. For exactly that case, both the fleet table (every
+`running`/`stalled` row) and the SharePoint source card's Run row (once it
+reads `stalled`) offer a **Cancel run** button behind a confirm dialog —
+`agnes admin sharepoint runs cancel <run_id>` does the same from a
+terminal. Unlike Stop, cancel does not wait on the crawl: it force-finalizes
+the owning job (`status: failed`, `error: cancelled_by_admin`, its lease
+released — this is also what stops the worker's own lease-renewal loop) and
+closes the run row `interrupted` immediately, while still setting the same
+cooperative flag Stop does in case the loop is merely slow and can still
+exit cleanly on its own. Whatever the run had ingested up to its last
+checkpoint is kept and counted resumable, exactly like a normal stop.
 
 ## Troubleshooting quick table
 
@@ -392,3 +412,4 @@ source card's Run row above.
 | documents in `anonymize_failed` | fail-closed drop | check key status + detector availability; preview the file (step 3) |
 | run history says "needs a Postgres backend" | `extraction_runs` is PG-only | run state needs Postgres app-state; config/preview still work |
 | a facts pass fails with "prompt is too long" | one document's request exceeded the model's context window | fixed automatically going forward (token-safe bound + per-document failure); a still-oversized/garbled document is skipped and counted, never retried |
+| run shows `outcome: "stalled"` and Stop doesn't help | crawl loop stuck, never polling the stop flag | **Cancel run** on the fleet table / source card (or `agnes admin sharepoint runs cancel <run_id>`) force-closes it |

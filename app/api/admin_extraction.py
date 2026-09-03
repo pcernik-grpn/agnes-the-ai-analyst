@@ -74,8 +74,13 @@ run history.
 **Liveness is DERIVED, never trusted.** A SIGKILLed worker finalizes
 nothing, so a row can say ``running`` forever. ``status`` therefore reports
 ``stalled`` for a run whose last checkpoint is older than
-:data:`_STALL_AFTER_S` (and says how old), and consults the run's ``jobs``
-row when one is known. Nothing here renders an unbounded "running" pulse.
+``extraction.stall_after_s`` (:func:`_stall_after_s`, default 900s — and
+says how old), and consults the run's ``jobs`` row when one is known.
+Nothing here renders an unbounded "running" pulse. The fleet dashboard's own
+``stuck`` flag (below) uses the SAME threshold — a run flagged ``stalled``
+here and ``stuck`` there is one rule, read twice, never two thresholds that
+can quietly disagree (2026-09-03 gap: they used to be independent, so a row
+could show a calm "running" badge right next to a red "Stuck?" tag).
 
 **No fraction, no bar, no ETA.** The crawl enumerates and processes in
 lockstep per 200-row delta page, so "files seen" and "files done" are equal
@@ -117,16 +122,6 @@ router = APIRouter(prefix="/api/admin/sharepoint", tags=["admin"])
 #: reasons alone must not silently start (or stop) appearing here too.
 _EXTRACTION_JOB_KINDS: Tuple[str, ...] = ("corpus-extraction", "sharepoint-facts-extraction")
 
-#: The fleet dashboard's own "go look at this" threshold — the checkpoint
-#: age past which a RUNNING run's row renders red on ``/admin/extraction``.
-#: Deliberately tighter than :data:`_STALL_AFTER_S` (30 min): that constant
-#: backs the per-connection card's authoritative ``stalled`` OUTCOME word,
-#: while this one is a faster, coarser tripwire meant to catch an
-#: operator's eye across a whole fleet of connections — a row flagged here
-#: can still resolve into a normal checkpoint moments later, so it never
-#: replaces ``outcome``, it only adds a "go look" flag next to it.
-_FLEET_STUCK_AFTER_S = 600
-
 #: How far back the fleet endpoint's own in-memory rate sampler looks when
 #: deriving files/min. NOT read from stored history — ``extraction_runs``
 #: keeps only the LATEST checkpoint per run, never a series — this is a
@@ -150,13 +145,41 @@ _rate_samples_lock = threading.Lock()
 _rate_samples: Dict[str, "Deque[Tuple[float, int]]"] = {}
 
 
-#: How stale a ``running`` run's last checkpoint may be before the UI is
-#: told to call it ``stalled``. The crawl checkpoints once per 200-row delta
-#: page; a page that downloads and converts 200 documents can legitimately
-#: take many minutes, so this is deliberately generous — several times the
-#: worst plausible cadence. Being late to say "stalled" costs an admin a
-#: little patience; being early costs them trust in every other number here.
-_STALL_AFTER_S = 1800
+#: Default for :func:`_stall_after_s` — how stale a ``running`` run's last
+#: checkpoint may be before the UI is told to call it ``stalled``, absent an
+#: ``extraction.stall_after_s`` override. The crawl checkpoints once per
+#: 200-row delta page; a page that downloads and converts 200 documents can
+#: legitimately take several minutes, so this is deliberately generous —
+#: several times the worst plausible cadence. Being late to say "stalled"
+#: costs an admin a little patience; being early costs them trust in every
+#: other number here. Admin-editable (``/admin/server-config`` → Extraction
+#: → Stall threshold) since a fleet whose checkpoint cadence legitimately
+#: runs longer (a slow tenant, a large-file-heavy scope) needs a looser
+#: tripwire without an instance.yaml edit + restart.
+_STALL_AFTER_S = 900
+
+
+def _stall_after_s() -> int:
+    """The EFFECTIVE stall threshold — ``extraction.stall_after_s`` if set,
+    else :data:`_STALL_AFTER_S`. Read fresh on every call (no restart
+    needed, same posture as every other ``extraction.*`` leaf) rather than
+    cached, since a config change should be visible on the very next poll.
+
+    A malformed or out-of-range value (a hand-edited YAML, not something
+    ``/admin/server-config``'s own validation would ever write) falls back
+    to the default rather than raising — this function backs a READ path
+    that must never 500 an operator out of the one screen that would show
+    them the misconfiguration.
+    """
+    from app.instance_config import get_value
+
+    value = get_value("extraction", "stall_after_s", default=_STALL_AFTER_S)
+    try:
+        resolved = int(value)
+    except (TypeError, ValueError):
+        return _STALL_AFTER_S
+    return resolved if resolved > 0 else _STALL_AFTER_S
+
 
 #: Run outcomes in SEVERITY order. A crashed run is both "did not finish"
 #: and "broke"; the more severe word wins, always, so a crash can never be
@@ -187,11 +210,16 @@ OUTCOME_PRECEDENCE = ("failed", "stalled", "interrupted", "done", "running")
 #: died outright (a native crash, a killed process) — resumable for the
 #: exact same reason a self-detected stop is: the per-item cTag write only
 #: ever happens after a durable ingest, so a dead run's persisted state is
-#: never ahead of what it actually finished. ``"error"`` is deliberately
-#: absent from the set below, and an unknown reason claims nothing — a new
-#: stop has to be vouched for here explicitly before this surface will
-#: promise anything about it.
-RESUMABLE_STOP_REASONS = frozenset({"timeout", "throttled", "stopped", "abandoned"})
+#: never ahead of what it actually finished. ``"cancelled"`` is written by
+#: THIS module's own ``POST …/extraction/runs/{run_id}/cancel`` — an
+#: admin-forced close, not a crawl-detected stop — for the exact same
+#: reason ``"abandoned"`` qualifies: the per-item cTag write only ever
+#: happens after a durable ingest, so whatever the run's last checkpoint
+#: recorded is real regardless of how the run ended. ``"error"`` is
+#: deliberately absent from the set below, and an unknown reason claims
+#: nothing — a new stop has to be vouched for here explicitly before this
+#: surface will promise anything about it.
+RESUMABLE_STOP_REASONS = frozenset({"timeout", "throttled", "stopped", "abandoned", "cancelled"})
 
 
 def _sharepoint_connection_or_404(connection_id: str) -> Dict[str, Any]:
@@ -270,7 +298,7 @@ def _derived_outcome(run: Dict[str, Any], *, now: Optional[datetime] = None) -> 
         }
 
     stale_s = _age_s(run.get("checkpoint_at"), now=now)
-    if stale_s is not None and stale_s > _STALL_AFTER_S:
+    if stale_s is not None and stale_s > _stall_after_s():
         return {
             "outcome": "stalled",
             "stored_status": stored,
@@ -559,16 +587,19 @@ def fleet_extraction_runs(
     Each row's ``run`` reuses :func:`_run_out` — the SAME projection the
     per-connection status/history endpoints render, so a fleet row and a
     source card can never disagree about one run — plus two fleet-only
-    additions: ``files_per_min`` (:func:`_files_per_min`) and ``stuck`` (a
-    checkpoint older than :data:`_FLEET_STUCK_AFTER_S` on a row whose STORED
-    status is still ``running`` — deliberately not gated on the derived
-    ``outcome`` word, so a run already reclassified ``stalled`` or
-    job-``failed`` still trips it). ``facts`` is the facts stage's own
-    numbers, read off the same row (:func:`_fleet_facts`). ``failed_items_
-    count``/``empty_items_count`` are the SAME persisted-backlog counts
-    ``extraction/status`` carries (:meth:`SharepointStatePgRepository.
-    backlog_counts`) — what the table's own "Retry failed (N)"/"Retry empty
-    (N)" buttons show, one cheap query per row.
+    additions: ``files_per_min`` (:func:`_files_per_min`) and ``stuck``
+    (``True`` exactly when that same ``run.outcome`` is ``"stalled"`` — ONE
+    rule, read twice, so the fleet's "Stuck?" badge and the per-run outcome
+    word can never disagree; before 2026-09-03 this used its own, tighter,
+    independent threshold, which could show a calm "running" badge right
+    next to a red "Stuck?" tag on the same row). ``facts`` is the facts
+    stage's own numbers, read off the same row (:func:`_fleet_facts`).
+    ``failed_items_count``/``empty_items_count`` are the SAME persisted-
+    backlog counts ``extraction/status`` carries (:meth:`SharepointStatePg
+    Repository.backlog_counts`) — what the table's own "Retry failed (N)"/
+    "Retry empty (N)" buttons show, one cheap query per row. A ``stalled``
+    row (or one still merely ``running``) can also be force-cancelled — see
+    ``POST …/extraction/runs/{run_id}/cancel`` below.
 
     PG-only, same as every other route in this module: ``extraction_runs``
     is a post-A3 table, so a DuckDB-backed instance gets the typed ``501``
@@ -625,12 +656,7 @@ def fleet_extraction_runs(
         run_out = _run_out(run, now=now) if run else None
         files_per_min = _files_per_min(run) if run else None
         checkpoint_age_s = _age_s(run.get("checkpoint_at"), now=now) if run else None
-        stuck = bool(
-            run
-            and stored_status == "running"
-            and checkpoint_age_s is not None
-            and checkpoint_age_s > _FLEET_STUCK_AFTER_S
-        )
+        stuck = bool(run_out and run_out.get("outcome") == "stalled")
         facts = _fleet_facts(run)
         cost = _run_total_cost_usd(run)
         backlog = sharepoint_state_repo().backlog_counts(connection_id, "crawl")
@@ -681,6 +707,117 @@ def fleet_extraction_runs(
         "jobs": jobs,
         "as_of": now.isoformat(),
     }
+
+
+@router.post("/extraction/runs/{run_id}/cancel")
+def cancel_extraction_run(
+    run_id: str,
+    user: dict = Depends(require_admin),
+):
+    """Force-close a run the cooperative Stop cannot reach — a crawl whose
+    loop is genuinely stuck (no I/O yielding, never reaching a checkpoint)
+    never observes ``config.extraction.stop_requested_at`` either, so the
+    run stays ``running`` with an ever-extending lease until an operator
+    intervenes by hand (the 2026-09-02 incident this endpoint answers: two
+    manual SQL updates and a re-trigger to end one dead crawl).
+
+    Cancel = stop + force-close, reusing rather than duplicating the
+    cooperative path:
+
+    1. :func:`connectors.sharepoint.crawler.request_stop` — the SAME signal
+       the Stop button sets. If the crawl loop is merely slow (not truly
+       stuck), it notices at its next checkpoint and exits cleanly on its
+       own, exactly like a normal stop.
+    2. The owning job (when known) is force-finalized to ``failed`` via
+       ``JobsRepository.cancel``/``JobsPgRepository.cancel`` — an
+       admin-initiated override that needs no lease token (the admin never
+       claimed the job). Clearing the lease is what stops the worker's
+       heartbeat loop on its own: the next ``heartbeat()`` call re-checks
+       ``status = 'running'``, finds it false, returns ``False``, and
+       ``app/worker/runtime.py``'s ``_heartbeat_loop`` stops extending —
+       no separate mechanism needed on the worker side. A zombie handler
+       thread may keep running a while longer (Python cannot force-kill a
+       thread), but its eventual ``complete()``/``fail()`` call carries the
+       now-stale lease token and is a guaranteed no-op against the state
+       this call just wrote — the same reclaim-race guard every stale
+       worker call already respects.
+    3. The ``extraction_runs`` row is closed HERE, immediately, as
+       ``interrupted`` with ``interrupted_reason: "cancelled"`` — never
+       waiting on the crawl to notice, because a genuinely stuck loop might
+       not. Whatever the last checkpoint recorded stays exactly what it
+       recorded; only the outcome and the finish timestamp change. Resumable
+       by the same rule every ``interrupted`` run is (:func:`_is_resumable`):
+       the per-item state on disk is durable as of the last checkpoint
+       regardless of how the run ended.
+
+    ``404 run_not_found`` for an unknown run id. ``409 run_not_active`` when
+    the run's STORED status is not ``running`` — a finished run (including
+    one already cancelled) is not cancellable again; the caller sees the
+    current state in the error body rather than a silent no-op. Returns
+    ``{connection_id, ...}`` where the rest is the run's new projection
+    (:func:`_run_out`), the same shape every other run read in this module
+    returns, so the caller can repaint immediately without a second fetch.
+
+    Handler writes its own audit row (more than the fallback middleware
+    could say: the connection id, the job id, and whether a job was
+    actually force-finalized vs. there being none to touch) — see
+    ``sharepoint_extraction_run.cancel`` in ``src/audit_events.py``.
+    """
+    from src.repositories import extraction_runs_repo
+
+    repo = extraction_runs_repo()
+    run = repo.get(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="run_not_found")
+    stored_status = str(run.get("status") or "")
+    if stored_status != "running":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "run_not_active",
+                "message": f"this run is already {stored_status!r} — only a running run can be cancelled",
+                "status": stored_status,
+            },
+        )
+
+    connection_id = str(run.get("connection_id") or "")
+    job_id = run.get("job_id")
+
+    from connectors.sharepoint.crawler import request_stop
+
+    stop_requested_at = request_stop(connection_id) if connection_id else None
+
+    job_cancelled = False
+    if job_id:
+        from src.repositories import jobs_repo
+
+        job_cancelled = jobs_repo().cancel(str(job_id), error="cancelled_by_admin")
+
+    existing_report = dict(run.get("report") or {})
+    existing_report["interrupted"] = True
+    existing_report["interrupted_reason"] = "cancelled"
+    repo.finish(
+        run_id,
+        status="interrupted",
+        report=existing_report,
+        usage=run.get("usage"),
+        skips=run.get("skips"),
+        error="cancelled by admin",
+    )
+
+    log_safe(
+        user_id=user.get("id"),
+        action="sharepoint_extraction_run.cancel",
+        resource=f"extraction_run:{run_id}",
+        params={
+            "connection_id": connection_id,
+            "job_id": job_id,
+            "job_cancelled": job_cancelled,
+            "stop_requested_at": stop_requested_at,
+        },
+    )
+
+    return {"connection_id": connection_id, **_run_out(repo.get(run_id))}
 
 
 #: The standalone facts pass's job kind and the statuses that mean "in
@@ -1604,6 +1741,18 @@ def _extraction_config_rows(connection: Optional[Dict[str, Any]] = None) -> List
                 "a real ceiling on one run: at expiry the crawl stops, persists its state and the "
                 "job fails. Nothing already ingested is lost and the next run resumes from the "
                 "persisted deltaLinks/cTags, so a timeout costs re-work, never coverage. 0 = unbounded."
+            ),
+        ),
+        _config_row(
+            "Stall threshold (s)",
+            ("extraction", "stall_after_s"),
+            default=_STALL_AFTER_S,
+            value=_stall_after_s(),
+            note=(
+                "how stale a running run's last checkpoint may get before this connection's Run "
+                "row and the fleet view (/admin/extraction) call it stalled instead of running — "
+                "the SAME rule both surfaces read, so they can never disagree. A stalled run can "
+                "be force-cancelled from either surface."
             ),
         ),
         _config_row(

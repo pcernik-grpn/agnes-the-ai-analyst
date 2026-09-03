@@ -935,6 +935,74 @@ def test_heartbeat_keeps_a_short_lease_alive_across_a_longer_running_handler(wor
     assert row["attempts"] == 1, "job was claimed more than once — the heartbeat failed to keep the lease alive"
 
 
+def test_admin_cancel_stops_the_heartbeat_and_a_late_finishing_handler_cannot_resurrect_it(worker_db):
+    """The stalled-crawl-cancel fix (TCRD-296 gap 32): a job whose handler
+    thread is genuinely stuck must be force-closeable from OUTSIDE the
+    worker without a new stop mechanism on the worker side.
+
+    ``jobs_repo().cancel(job_id)`` (the admin action `POST …/runs/{run_id}
+    /cancel` calls) needs no lease token, so it can force-finalize the job
+    to ``'failed'`` while the SAME job's handler thread is still running
+    in the background. Once that happens:
+
+    1. The job row reflects ``'failed'``/``cancelled_by_admin`` immediately
+       — an admin does not have to wait for the (possibly-never-arriving)
+       handler completion to see the effect.
+    2. The next heartbeat tick for this job (still holding the now-stale
+       lease token) returns ``False`` — ``_heartbeat_loop`` stops
+       extending on its own, per its own documented contract.
+    3. When the "stuck" handler eventually DOES finish and the runtime
+       calls ``complete()`` with that same stale lease token, it is a
+       guaranteed no-op (the lease_token/status guard every reclaim race
+       already relies on) — the cancelled state is never clobbered back
+       to ``'done'``.
+    """
+    from app.worker.registry import LIGHT_LANE, JobKind, register_kind
+    from app.worker.runtime import worker_loop
+    from src.repositories import jobs_repo
+
+    handler_duration_s = 1.2
+
+    def slow_handler(payload: dict) -> None:
+        time.sleep(handler_duration_s)
+
+    register_kind(JobKind(name="stuck_then_cancelled_test", handler=slow_handler, lane=LIGHT_LANE, lease_seconds=60))
+
+    repo = jobs_repo()
+    job = repo.enqueue("stuck_then_cancelled_test", {})
+
+    async def _claim_cancel_and_let_finish() -> None:
+        task = asyncio.create_task(worker_loop(worker_id="test-worker", poll_interval_s=0.05))
+        # Give the lane slot time to claim the job and start the handler.
+        await asyncio.sleep(0.3)
+        claimed = repo.get(job["id"])
+        assert claimed["status"] == "running", "test setup bug: the job was never claimed before cancel"
+        lease_token_at_cancel = claimed["lease_token"]
+
+        mutated = repo.cancel(job["id"])
+        assert mutated is True
+
+        # Prove the heartbeat loop itself observes the cancel (not just a
+        # side-channel assertion): the SAME stale lease token now fails.
+        assert repo.heartbeat(job["id"], "test-worker", lease_token_at_cancel, lease_seconds=9999) is False
+
+        # Let the "stuck" handler thread actually finish and the runtime's
+        # own complete() call land — this is the exact race being guarded.
+        await asyncio.sleep(handler_duration_s + 0.5)
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    asyncio.run(_claim_cancel_and_let_finish())
+
+    row = repo.get(job["id"])
+    assert row["status"] == "failed", (
+        "a job cancelled while its handler was still running must stay failed — a late complete() "
+        f"from the stuck handler must never resurrect it (got status={row['status']!r})"
+    )
+    assert row["error"] == "cancelled_by_admin"
+
+
 # ---------------------------------------------------------------------------
 # observability (three-plane wave 2D, task 2): job-queue + worker metrics
 # ---------------------------------------------------------------------------

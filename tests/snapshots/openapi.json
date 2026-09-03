@@ -35203,7 +35203,7 @@
     },
     "/api/admin/sharepoint/extraction/runs": {
       "get": {
-        "description": "One row per SharePoint connection \u2014 the fleet dashboard for an\noperator running several crawls at once: is it on pace, is anything\nstuck, what is it costing.\n\nDefault scope (and ``?active=1``) is connections with a run CURRENTLY\n``running`` \u2014 an idle connection has nothing to say about \"on pace\" and\nits absence here is the honest answer, not an omission. ``?all=1``\nbroadens to every SharePoint connection, each with its own latest run\n(``null`` if it has never run) \u2014 ``all`` wins if both are passed.\n\nEach row's ``run`` reuses :func:`_run_out` \u2014 the SAME projection the\nper-connection status/history endpoints render, so a fleet row and a\nsource card can never disagree about one run \u2014 plus two fleet-only\nadditions: ``files_per_min`` (:func:`_files_per_min`) and ``stuck`` (a\ncheckpoint older than :data:`_FLEET_STUCK_AFTER_S` on a row whose STORED\nstatus is still ``running`` \u2014 deliberately not gated on the derived\n``outcome`` word, so a run already reclassified ``stalled`` or\njob-``failed`` still trips it). ``facts`` is the facts stage's own\nnumbers, read off the same row (:func:`_fleet_facts`). ``failed_items_\ncount``/``empty_items_count`` are the SAME persisted-backlog counts\n``extraction/status`` carries (:meth:`SharepointStatePgRepository.\nbacklog_counts`) \u2014 what the table's own \"Retry failed (N)\"/\"Retry empty\n(N)\" buttons show, one cheap query per row.\n\nPG-only, same as every other route in this module: ``extraction_runs``\nis a post-A3 table, so a DuckDB-backed instance gets the typed ``501``\nfrom ``extraction_runs_repo()`` via the app-wide handler in\n``app/main.py`` \u2014 nothing here needs its own DuckDB fallback.\n\n``jobs`` is ``{kind: {queued, running}}`` for :data:`_EXTRACTION_JOB_KINDS`\n\u2014 the extraction pipeline's own worker lanes \u2014 read in ONE grouped query\noff the (backend-agnostic) jobs table via\n:meth:`JobsPgRepository.counts_by_kind`, independent of ``active``/\n``all``: lane starvation (a growing ``queued`` count with ``running``\nstuck at 0 \u2014 every worker slot busy elsewhere, or none configured for\nthis lane) is exactly the fact an operator scanning ONLY the active\nscope would otherwise never see, since a starved connection's job has\nno ``extraction_runs`` row yet to show up as a table row at all.\n\nPlain ``def`` (not ``async def``, zero ``await``s below): blocking,\nsynchronous SQLAlchemy I/O, so FastAPI dispatches it to the anyio thread\npool rather than the single event loop (Tier-1 convention,\n``tests/test_event_loop_offload_guard.py``).",
+        "description": "One row per SharePoint connection \u2014 the fleet dashboard for an\noperator running several crawls at once: is it on pace, is anything\nstuck, what is it costing.\n\nDefault scope (and ``?active=1``) is connections with a run CURRENTLY\n``running`` \u2014 an idle connection has nothing to say about \"on pace\" and\nits absence here is the honest answer, not an omission. ``?all=1``\nbroadens to every SharePoint connection, each with its own latest run\n(``null`` if it has never run) \u2014 ``all`` wins if both are passed.\n\nEach row's ``run`` reuses :func:`_run_out` \u2014 the SAME projection the\nper-connection status/history endpoints render, so a fleet row and a\nsource card can never disagree about one run \u2014 plus two fleet-only\nadditions: ``files_per_min`` (:func:`_files_per_min`) and ``stuck``\n(``True`` exactly when that same ``run.outcome`` is ``\"stalled\"`` \u2014 ONE\nrule, read twice, so the fleet's \"Stuck?\" badge and the per-run outcome\nword can never disagree; before 2026-09-03 this used its own, tighter,\nindependent threshold, which could show a calm \"running\" badge right\nnext to a red \"Stuck?\" tag on the same row). ``facts`` is the facts\nstage's own numbers, read off the same row (:func:`_fleet_facts`).\n``failed_items_count``/``empty_items_count`` are the SAME persisted-\nbacklog counts ``extraction/status`` carries (:meth:`SharepointStatePg\nRepository.backlog_counts`) \u2014 what the table's own \"Retry failed (N)\"/\n\"Retry empty (N)\" buttons show, one cheap query per row. A ``stalled``\nrow (or one still merely ``running``) can also be force-cancelled \u2014 see\n``POST \u2026/extraction/runs/{run_id}/cancel`` below.\n\nPG-only, same as every other route in this module: ``extraction_runs``\nis a post-A3 table, so a DuckDB-backed instance gets the typed ``501``\nfrom ``extraction_runs_repo()`` via the app-wide handler in\n``app/main.py`` \u2014 nothing here needs its own DuckDB fallback.\n\n``jobs`` is ``{kind: {queued, running}}`` for :data:`_EXTRACTION_JOB_KINDS`\n\u2014 the extraction pipeline's own worker lanes \u2014 read in ONE grouped query\noff the (backend-agnostic) jobs table via\n:meth:`JobsPgRepository.counts_by_kind`, independent of ``active``/\n``all``: lane starvation (a growing ``queued`` count with ``running``\nstuck at 0 \u2014 every worker slot busy elsewhere, or none configured for\nthis lane) is exactly the fact an operator scanning ONLY the active\nscope would otherwise never see, since a starved connection's job has\nno ``extraction_runs`` row yet to show up as a table row at all.\n\nPlain ``def`` (not ``async def``, zero ``await``s below): blocking,\nsynchronous SQLAlchemy I/O, so FastAPI dispatches it to the anyio thread\npool rather than the single event loop (Tier-1 convention,\n``tests/test_event_loop_offload_guard.py``).",
         "operationId": "fleet_extraction_runs_api_admin_sharepoint_extraction_runs_get",
         "parameters": [
           {
@@ -35274,6 +35274,69 @@
           }
         },
         "summary": "Fleet Extraction Runs",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/api/admin/sharepoint/extraction/runs/{run_id}/cancel": {
+      "post": {
+        "description": "Force-close a run the cooperative Stop cannot reach \u2014 a crawl whose\nloop is genuinely stuck (no I/O yielding, never reaching a checkpoint)\nnever observes ``config.extraction.stop_requested_at`` either, so the\nrun stays ``running`` with an ever-extending lease until an operator\nintervenes by hand (the 2026-09-02 incident this endpoint answers: two\nmanual SQL updates and a re-trigger to end one dead crawl).\n\nCancel = stop + force-close, reusing rather than duplicating the\ncooperative path:\n\n1. :func:`connectors.sharepoint.crawler.request_stop` \u2014 the SAME signal\n   the Stop button sets. If the crawl loop is merely slow (not truly\n   stuck), it notices at its next checkpoint and exits cleanly on its\n   own, exactly like a normal stop.\n2. The owning job (when known) is force-finalized to ``failed`` via\n   ``JobsRepository.cancel``/``JobsPgRepository.cancel`` \u2014 an\n   admin-initiated override that needs no lease token (the admin never\n   claimed the job). Clearing the lease is what stops the worker's\n   heartbeat loop on its own: the next ``heartbeat()`` call re-checks\n   ``status = 'running'``, finds it false, returns ``False``, and\n   ``app/worker/runtime.py``'s ``_heartbeat_loop`` stops extending \u2014\n   no separate mechanism needed on the worker side. A zombie handler\n   thread may keep running a while longer (Python cannot force-kill a\n   thread), but its eventual ``complete()``/``fail()`` call carries the\n   now-stale lease token and is a guaranteed no-op against the state\n   this call just wrote \u2014 the same reclaim-race guard every stale\n   worker call already respects.\n3. The ``extraction_runs`` row is closed HERE, immediately, as\n   ``interrupted`` with ``interrupted_reason: \"cancelled\"`` \u2014 never\n   waiting on the crawl to notice, because a genuinely stuck loop might\n   not. Whatever the last checkpoint recorded stays exactly what it\n   recorded; only the outcome and the finish timestamp change. Resumable\n   by the same rule every ``interrupted`` run is (:func:`_is_resumable`):\n   the per-item state on disk is durable as of the last checkpoint\n   regardless of how the run ended.\n\n``404 run_not_found`` for an unknown run id. ``409 run_not_active`` when\nthe run's STORED status is not ``running`` \u2014 a finished run (including\none already cancelled) is not cancellable again; the caller sees the\ncurrent state in the error body rather than a silent no-op. Returns\n``{connection_id, ...}`` where the rest is the run's new projection\n(:func:`_run_out`), the same shape every other run read in this module\nreturns, so the caller can repaint immediately without a second fetch.\n\nHandler writes its own audit row (more than the fallback middleware\ncould say: the connection id, the job id, and whether a job was\nactually force-finalized vs. there being none to touch) \u2014 see\n``sharepoint_extraction_run.cancel`` in ``src/audit_events.py``.",
+        "operationId": "cancel_extraction_run_api_admin_sharepoint_extraction_runs__run_id__cancel_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Cancel Extraction Run",
         "tags": [
           "admin"
         ]

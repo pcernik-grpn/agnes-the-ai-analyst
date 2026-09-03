@@ -388,6 +388,29 @@ class TestRunRow:
         assert "no longer reporting" in html
         assert "no checkpoint for 4200s" in html
 
+    def test_no_cancel_button_while_merely_running(self):
+        """Cancel is the force-close hammer — offered only once a run has
+        already proven Stop alone won't reach it. A merely `running` run
+        should try Stop first."""
+        out = _run_js(
+            'console.log(JSON.stringify({html: _extRunRowHtml("sp1", _extState["sp1"])}));',
+            state=_state(data=_RUNNING),
+        )
+        assert "Cancel run" not in out["html"]
+
+    def test_cancel_button_shown_once_stalled(self):
+        stalled = json.loads(json.dumps(_RUNNING))
+        stalled["running"]["outcome"] = "stalled"
+        stalled["running"]["stale_s"] = 4200.0
+        stalled["running"]["liveness_note"] = "no checkpoint for 4200s"
+        out = _run_js(
+            'console.log(JSON.stringify({html: _extRunRowHtml("sp1", _extState["sp1"])}));',
+            state=_state(data=stalled),
+        )
+        html = out["html"]
+        assert "Cancel run" in html
+        assert "extCancelRun('sp1', 'er_1')" in html
+
     def test_the_run_row_carries_the_door_to_the_fleet_dashboard(self):
         """`/admin/extraction` is off-nav (see `ADMIN_NAV_OFFNAV`): its ONLY
         door is this row. Drawn for a live run and for a connection that

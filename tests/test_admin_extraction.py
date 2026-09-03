@@ -1005,6 +1005,26 @@ class TestFleetRoute:
         assert r.json()["error"] == "requires_postgres_backend"
 
 
+CANCEL_URL = f"{FLEET_URL}/er_whatever/cancel"
+
+
+class TestCancelRoute:
+    def test_requires_auth(self, seeded_app):
+        r = seeded_app["client"].post(CANCEL_URL)
+        assert r.status_code == 401
+
+    def test_requires_admin(self, seeded_app):
+        token = seeded_app["analyst_token"]
+        r = seeded_app["client"].post(CANCEL_URL, headers=_auth(token))
+        assert r.status_code == 403
+
+    def test_typed_501_on_duckdb(self, seeded_app):
+        client, token = seeded_app["client"], seeded_app["admin_token"]
+        r = client.post(CANCEL_URL, headers=_auth(token))
+        assert r.status_code == 501
+        assert r.json()["error"] == "requires_postgres_backend"
+
+
 class TestFactsJobInFlight:
     """The standalone facts pass (``sharepoint-facts-extraction``) writes no
     ``extraction_runs`` row — it is a JOB, not a crawl run — so the card's

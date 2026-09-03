@@ -992,8 +992,17 @@ def _print_fleet_table(body: Dict[str, Any], *, show_all: bool) -> None:
     _print_jobs_strip(body.get("jobs"))
 
 
-@admin_sharepoint_app.command("runs")
+# `runs` is a Typer sub-app (not a flat command) so it can carry both the
+# bare-invocation fleet dashboard (`agnes admin sharepoint runs`) AND a
+# `cancel` subcommand (`agnes admin sharepoint runs cancel <run_id>`) —
+# same shape as `activity_app` (`cli/commands/admin_activity.py`).
+runs_app = typer.Typer(help="Extraction fleet dashboard + run cancellation")
+admin_sharepoint_app.add_typer(runs_app, name="runs")
+
+
+@runs_app.callback(invoke_without_command=True)
 def runs(
+    ctx: typer.Context,
     show_all: bool = typer.Option(
         False,
         "--all",
@@ -1012,6 +1021,11 @@ def runs(
     DuckDB-backed instance this refuses with the typed
     ``501 requires_postgres_backend`` the API itself returns.
     """
+    if ctx.invoked_subcommand is not None:
+        # `agnes admin sharepoint runs cancel …` — the subcommand handles
+        # itself; this callback's own body (the dashboard fetch/print) must
+        # not also run.
+        return
 
     def _fetch() -> Dict[str, Any]:
         qs = "?all=1" if show_all else "?active=1"
@@ -1039,6 +1053,37 @@ def runs(
             time.sleep(10)
     except KeyboardInterrupt:
         raise typer.Exit(0) from None
+
+
+@runs_app.command("cancel")
+def runs_cancel(
+    run_id: str = typer.Argument(..., help="The run id (see `agnes admin sharepoint runs --json`)"),
+    as_json: bool = typer.Option(False, "--json"),
+):
+    """Force-close a run Stop alone cannot reach — a crawl whose loop is
+    genuinely stuck never observes the cooperative stop flag either (the
+    2026-09-02 incident this command answers: an hour of `running` with no
+    checkpoint, ended by hand via two SQL updates and a re-trigger).
+
+    CLI counterpart to ``POST /api/admin/sharepoint/extraction/runs/
+    {run_id}/cancel``. Sets the SAME cooperative stop flag ``crawl-config
+    ... stop`` would (so a merely-slow run still exits cleanly on its own),
+    then force-finalizes the owning job to ``failed`` and closes the run
+    row ``interrupted`` immediately — never waiting on a handler thread
+    that may never notice. ``404`` for an unknown run id; ``409`` if the
+    run is not currently ``running`` (already finished, or already
+    cancelled).
+    """
+    resp = api_post(f"/api/admin/sharepoint/extraction/runs/{run_id}/cancel")
+    if resp.status_code != 200:
+        _fail(resp)
+    body = resp.json()
+    if as_json:
+        typer.echo(json.dumps(body, indent=2))
+    else:
+        typer.echo(
+            f"Cancelled run {run_id} (connection {body.get('connection_id') or 'unknown'}) — outcome: {body.get('outcome')}"
+        )
 
 
 @admin_sharepoint_app.command("facts-config")
