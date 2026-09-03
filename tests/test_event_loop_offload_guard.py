@@ -20,6 +20,8 @@ import inspect
 
 import pytest
 
+from app.api.admin_extraction import fleet_extraction_runs
+from app.api.admin_source_connections import list_connections
 from app.api.broker import require_broker_ticket
 from app.api.catalog import (
     get_metric,
@@ -62,6 +64,7 @@ from app.marketplace_server.router import (
     marketplace_zip,
 )
 from app.resource_types import ResourceType
+from app.web.router import admin_data_sources_page
 
 
 def test_get_current_user_is_not_a_coroutine_function():
@@ -128,6 +131,15 @@ _OFFLOADED_API_HANDLERS = [
     list_setup_tokens,
     revoke_setup_token,
     exchange_setup_token,
+    # /admin/data-sources perf fix: on an instance with a large SharePoint
+    # corpus this trio's own synchronous work could run for 10+ seconds —
+    # as ``async def`` that monopolized the event loop for the whole
+    # duration, and every OTHER concurrent request (including unrelated
+    # ones) queued behind it and looked slow too, even though its own
+    # queries were fast in isolation.
+    admin_data_sources_page,
+    list_connections,
+    fleet_extraction_runs,
 ]
 
 

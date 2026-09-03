@@ -288,6 +288,46 @@ def test_list_for_connection_is_newest_first_and_scoped(pg_engine, monkeypatch):
     assert ids.index(second) < ids.index(first)
 
 
+def test_list_for_connection_strips_failed_and_skipped_items_but_get_keeps_them(pg_engine, monkeypatch):
+    """The LIST projection (history drawer) never needs the itemized
+    ``failed_items``/``skipped_items`` bodies — only the single-run detail
+    endpoint (:meth:`get`) does. A run report can carry thousands of these,
+    each with a path and error text, so shipping them in a list response
+    made the drawer's own byte count scale with how badly one run failed."""
+    repo = _make_repo(pg_engine, monkeypatch)
+    run_id = repo.start(connection_id="conn_a")
+    report = {
+        "new": 3,
+        "failed_items": [{"path": f"/f{i}", "reason": "convert_error"} for i in range(50)],
+        "skipped_items": [{"path": f"/s{i}", "reason": "unsupported"} for i in range(50)],
+    }
+    repo.finish(run_id, status="done", report=report, files_seen=4, files_done=4)
+
+    listed = repo.list_for_connection("conn_a", limit=10)[0]
+    assert "failed_items" not in listed["report"]
+    assert "skipped_items" not in listed["report"]
+    assert listed["report"]["new"] == 3  # every OTHER report key survives
+
+    detail = repo.get(run_id)
+    assert len(detail["report"]["failed_items"]) == 50
+    assert len(detail["report"]["skipped_items"]) == 50
+
+
+def test_list_latest_for_connections_strips_failed_and_skipped_items(pg_engine, monkeypatch):
+    repo = _make_repo(pg_engine, monkeypatch)
+    run_id = repo.start(connection_id="conn_a")
+    repo.finish(
+        run_id,
+        status="done",
+        report={"failed_items": [{"path": "/f0"}], "skipped_items": [{"path": "/s0"}]},
+        files_seen=1,
+        files_done=1,
+    )
+    latest = repo.list_latest_for_connections(["conn_a"], running_only=False)
+    assert "failed_items" not in latest["conn_a"]["report"]
+    assert "skipped_items" not in latest["conn_a"]["report"]
+
+
 def test_count_for_connection_is_the_total_not_the_page(pg_engine, monkeypatch):
     """The drawer button's count is the TOTAL, so "5 more runs" is never a
     silent truncation."""

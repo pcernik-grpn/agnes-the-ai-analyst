@@ -9039,7 +9039,7 @@ async def admin_datasource_credentials_page(
 
 
 @router.get("/admin/data-sources", response_class=HTMLResponse)
-async def admin_data_sources_page(
+def admin_data_sources_page(
     request: Request,
     user: dict = Depends(require_admin),
 ):
@@ -9056,6 +9056,17 @@ async def admin_data_sources_page(
     render the same blocking banner as /admin/datasource-credentials when
     ``AGNES_VAULT_KEY`` is absent (the wizard can't store a secret without
     it).
+
+    Plain ``def`` (not ``async def``, zero ``await``s below): every call
+    this handler makes — ``_build_context``, ``_source_inventory`` and
+    everything it fans out to — is blocking, synchronous SQLAlchemy I/O, so
+    FastAPI dispatches it to the anyio thread pool instead of running it on
+    the single event loop (Tier-1 convention,
+    ``tests/test_event_loop_offload_guard.py``). On an instance with a large
+    SharePoint corpus this handler alone could run for over ten seconds; as
+    ``async def`` that monopolized the event loop for the whole duration,
+    stalling every OTHER concurrent request in the process — including
+    unrelated ones — for as long as it ran.
     """
     # `can_store_secrets()`, NOT `vault_key_configured()`: the write path
     # guards on the former (app/api/admin_source_connections.py), and the
@@ -9508,6 +9519,38 @@ def _source_inventory(user: dict | None = None) -> dict:
         except Exception:
             return False
 
+    # ── SharePoint batched precomputation, once for every connection on the
+    # page rather than once PER connection (which itself used to mean once
+    # PER SCOPE — up to ~180 on a real connection). See
+    # `_sharepoint_pipeline_cell`'s docstring for what each precomputed dict
+    # replaces.
+    sharepoint_conns = [c for c in connections if (c.get("source_type") or "") == "sharepoint"]
+    all_sp_scope_ids: set[str] = set()
+    for c in sharepoint_conns:
+        try:
+            raw_scopes = (c.get("config") or {}).get("scopes") or []
+            all_sp_scope_ids.update(
+                s["collection_id"] for s in raw_scopes if isinstance(s, dict) and s.get("collection_id")
+            )
+        except Exception as e:
+            logger.debug("data-sources pipelines: could not resolve scope collections for %s: %s", c.get("id"), e)
+    corpus_status_counts: dict[str, dict[str, int]] = {}
+    collection_grants_by_id: dict[str, set] = {}
+    if sharepoint_conns:
+        try:
+            from src.repositories import corpus_files_repo
+
+            corpus_status_counts = corpus_files_repo().status_counts_for_corpora(sorted(all_sp_scope_ids))
+        except Exception as e:
+            logger.warning("data-sources pipelines: corpus file status counts unavailable: %s", e)
+        try:
+            from src.repositories import resource_grants_repo
+
+            for g in resource_grants_repo().list_all(resource_type="collection"):
+                collection_grants_by_id.setdefault(g["resource_id"], set()).add(g["group_id"])
+        except Exception as e:
+            logger.warning("data-sources pipelines: collection grants unavailable: %s", e)
+
     now = datetime.now(UTC)
     for conn in [*connections, *derived]:
         cid = conn["id"]
@@ -9615,7 +9658,12 @@ def _source_inventory(user: dict | None = None) -> dict:
         # `_sharepoint_pipeline_cell` for what each sub-block means and its
         # honesty notes (placeholder cost, interim scope heuristic).
         if stype == "sharepoint":
-            cells["file_source"] = _sharepoint_pipeline_cell(conn, user)
+            cells["file_source"] = _sharepoint_pipeline_cell(
+                conn,
+                user,
+                corpus_status_counts=corpus_status_counts,
+                collection_grants_by_id=collection_grants_by_id,
+            )
 
         # ── Feeds: packages holding this source's tables → groups granted →
         # people reached. The end of the chain the redesign cares about; a
@@ -9665,65 +9713,82 @@ def _source_inventory(user: dict | None = None) -> dict:
 # distinct reasons an operator can tell apart in the drawer.
 _VERBATIM_GATE_REASONS = frozenset({"verbatim_gate_failed", "quote_not_meaningful"})
 
+#: Cap on how many of a SharePoint connection's confirmed scope rows the
+#: source card inlines (`_sharepoint_pipeline_cell`'s `cell["scopes"]`). A
+#: real connection can carry ~180 — inlining all of them, for every
+#: SharePoint connection on the page at once, was what made the page's own
+#: response scale with scope count regardless of how fast the queries
+#: behind it were made. `cell["scopes_total"]`/`cell["scopes_truncated"]`
+#: name the cap honestly rather than silently dropping rows (same pattern
+#: as `extraction_runs_pg.cap_skips`); the full, uncapped list is one click
+#: away via `GET .../scopes`.
+_CARD_SCOPES_CAP = 50
 
-def _resolve_sharepoint_rejection_doc(doc_id: str) -> dict | None:
-    """Resolve a "Last run" rejection row's ``doc_id`` (the crawler's
+
+def _resolve_sharepoint_rejection_doc_labels(doc_ids: list[str]) -> dict[str, dict]:
+    """Resolve "Last run" rejection rows' ``doc_id``s (the crawler's
     ``sha256[:16]`` citation key, e.g. ``6a8e0bc93c07c56a``) to the corpus
-    file name + collection name it belongs to, for the card's drawer — a
+    file name + collection name each belongs to, for the card's drawer — a
     bare hash "tells nobody anything" (live-use feedback, TCRD-240/241
     follow-up).
 
-    ``None`` for an id this instance has never seen (`corpus_file_sources`
-    carries no row for it) — the caller renders that as the honest
-    "not in any collection" fallback next to the raw sha16, never a guess.
-    Also ``None`` on any lookup failure (PG-only `corpus_file_sources` on a
-    DuckDB-backed instance, a deleted collection, …) — resolution is a
-    read-only display nicety, never worth a 500 for the card.
+    ONE batched call (:meth:`corpus_file_sources_repo().resolve_doc_labels`)
+    for every id at once — this used to be 3 round trips PER unique doc_id
+    (a mapping lookup, a corpus_files get, a file_corpora get), which on a
+    run with hundreds of rejected/deferred claims dominated this cell's own
+    query count. An id this instance has never seen, or any lookup failure
+    (PG-only ``corpus_file_sources`` on a DuckDB-backed instance, …), is
+    simply absent from the returned dict — the caller renders that as the
+    honest "not in any collection" fallback next to the raw sha16, never a
+    guess, and never a 500 for the card (resolution is a read-only display
+    nicety).
     """
+    if not doc_ids:
+        return {}
     try:
-        from src.repositories import corpus_file_sources_repo, corpus_files_repo, file_corpora_repo
+        from src.repositories import corpus_file_sources_repo
 
-        source_row = corpus_file_sources_repo().get_by_source_doc_id(doc_id)
-        if source_row is None:
-            return None
-        file_row = corpus_files_repo().get(source_row["corpus_file_id"])
-        if file_row is None:
-            return None
-        collection = file_corpora_repo().get(file_row["corpus_id"])
-        return {
-            "name": file_row.get("filename"),
-            "collection": collection.get("name") if collection else None,
-        }
+        return corpus_file_sources_repo().resolve_doc_labels(doc_ids)
     except Exception as e:
-        logger.debug("sharepoint pipeline cell: doc_id resolution failed for %s: %s", doc_id, e)
-        return None
+        logger.debug("sharepoint pipeline cell: doc_id resolution failed: %s", e)
+        return {}
 
 
-def _enrich_sharepoint_rejection_rows(rows: list[dict]) -> list[dict]:
+def _enrich_sharepoint_rejection_rows(rows: list[dict], doc_labels: dict[str, dict] | None = None) -> list[dict]:
     """Add a resolved ``doc`` key (``{name, collection}`` or ``None``) to
-    each "Last run" rejection/deferred row, memoizing the lookup per
-    ``doc_id`` so a run with many claims against the same document does not
-    re-resolve it once per row. Every original key (``row``, ``reason``,
-    ``doc_id``, …) is preserved untouched — this only adds information, it
-    never replaces the raw fields the drawer's category counts and any
-    other reader of this cell already depend on.
+    each "Last run" rejection/deferred row. Every original key (``row``,
+    ``reason``, ``doc_id``, …) is preserved untouched — this only adds
+    information, it never replaces the raw fields the drawer's category
+    counts and any other reader of this cell already depend on.
+
+    ``doc_labels``, when the caller precomputed it via ONE
+    :func:`_resolve_sharepoint_rejection_doc_labels` call spanning EVERY
+    rejection category for this run (not just this one list — the same
+    doc_id can recur across ``rejected_quotes``/``deferred``/…), is reused
+    as-is. ``None`` (a caller with just one list, e.g. a direct unit test)
+    resolves this list's own doc_ids in one batched call — the same shape,
+    at the one-list cost.
     """
-    doc_cache: dict[str, dict | None] = {}
+    if doc_labels is None:
+        doc_labels = _resolve_sharepoint_rejection_doc_labels(
+            sorted({row.get("doc_id") for row in rows if row.get("doc_id")})
+        )
     enriched = []
     for row in rows:
         row = dict(row)
         doc_id = row.get("doc_id")
-        if doc_id:
-            if doc_id not in doc_cache:
-                doc_cache[doc_id] = _resolve_sharepoint_rejection_doc(doc_id)
-            row["doc"] = doc_cache[doc_id]
-        else:
-            row["doc"] = None
+        row["doc"] = doc_labels.get(doc_id) if doc_id else None
         enriched.append(row)
     return enriched
 
 
-def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
+def _sharepoint_pipeline_cell(
+    conn: dict,
+    user: dict | None,
+    *,
+    corpus_status_counts: dict[str, dict[str, int]] | None = None,
+    collection_grants_by_id: dict[str, set] | None = None,
+) -> dict:
     """The file-source pipeline strip + card rows for a SharePoint connection
     (spec §13.2 "Source card"): crawl → text extraction + scan transcription
     → facts → graph counts, a queue-cost PLACEHOLDER (see the constant
@@ -9731,6 +9796,14 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
     never the value), the identity-matching row, and the LAST persisted
     ingest run's error badges — each carrying its itemized detail for the
     admin's filtered drawer.
+
+    `corpus_status_counts`/`collection_grants_by_id` are optional PRECOMPUTED
+    batched reads: `_source_inventory` builds each ONCE across every
+    SharePoint connection on the page (rather than once per connection, per
+    scope) and passes them down. Omitting either (any direct/isolated call,
+    e.g. a unit test) falls back to computing it for just this connection —
+    the same answer, at the one-connection cost this function used to pay
+    for every connection on the page.
 
     **"Scope collections" is this connection's OWN scope mapping** — every
     confirmed scope's `collection_id` off `conn["config"]["scopes"]`, the
@@ -9779,18 +9852,27 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
     # ── crawl / extract: corpus_files across scope collections, bucketed by
     # processing_status (the five-state lifecycle: pending | processing |
     # indexed | needs_review | rejected).
+    #
+    # `corpus_status_counts`, when the caller (`_source_inventory`) already
+    # computed it for every SharePoint connection's scopes in one batched
+    # `corpus_files_repo().status_counts_for_corpora()` call, is reused
+    # as-is — this used to call `list_for_corpus(scope_id)` once PER SCOPE
+    # (up to ~180 on a real connection), which made this cell's query count
+    # scale with scope count instead of staying flat. `None` (a caller that
+    # hasn't precomputed it — e.g. a direct unit-test call) falls back to
+    # doing that one batched call itself, scoped to this connection alone.
     documents = 0
     extracted: dict[str, int] = {}
     if scope_ids:
         try:
-            from src.repositories import corpus_files_repo
+            if corpus_status_counts is None:
+                from src.repositories import corpus_files_repo
 
-            cf_repo = corpus_files_repo()
+                corpus_status_counts = corpus_files_repo().status_counts_for_corpora(scope_ids)
             for scope_id in scope_ids:
-                for f in cf_repo.list_for_corpus(scope_id):
-                    documents += 1
-                    status = f.get("processing_status") or "pending"
-                    extracted[status] = extracted.get(status, 0) + 1
+                for status, n in corpus_status_counts.get(scope_id, {}).items():
+                    documents += n
+                    extracted[status] = extracted.get(status, 0) + n
         except Exception as e:
             logger.warning("sharepoint pipeline cell: could not list corpus files: %s", e)
     cell["crawl"] = {"documents": documents}
@@ -9841,13 +9923,24 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
         # rendering arrives with operator-configured pricing (extraction
         # observability spec §5) — until then no `$` is shown here at all.
         cell["queue"] = {"items": queue_items}
+        # One doc_id resolution pass across ALL FOUR categories — a doc_id
+        # rejected on one claim and deferred on another otherwise resolves
+        # twice. See `_resolve_sharepoint_rejection_doc_labels`.
+        all_doc_ids = sorted(
+            {
+                row.get("doc_id")
+                for row in (*rejected_quotes, *deferred, *protocol_errors, *source_urls_rejected)
+                if row.get("doc_id")
+            }
+        )
+        doc_labels = _resolve_sharepoint_rejection_doc_labels(all_doc_ids)
         cell["last_run"] = {
             "id": last_run.get("id"),
             "created_at": last_run.get("created_at"),
-            "rejected_quotes": _enrich_sharepoint_rejection_rows(rejected_quotes),
-            "deferred": _enrich_sharepoint_rejection_rows(deferred),
-            "protocol_errors": _enrich_sharepoint_rejection_rows(protocol_errors),
-            "source_urls_rejected": _enrich_sharepoint_rejection_rows(source_urls_rejected),
+            "rejected_quotes": _enrich_sharepoint_rejection_rows(rejected_quotes, doc_labels),
+            "deferred": _enrich_sharepoint_rejection_rows(deferred, doc_labels),
+            "protocol_errors": _enrich_sharepoint_rejection_rows(protocol_errors, doc_labels),
+            "source_urls_rejected": _enrich_sharepoint_rejection_rows(source_urls_rejected, doc_labels),
         }
     else:
         cell["queue"] = {"items": 0}
@@ -9999,13 +10092,22 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
     collections_total = len(scope_ids)
     if scope_ids:
         try:
-            from src.repositories import resource_grants_repo
+            # `collection_grants_by_id`, when the caller precomputed it, is
+            # the FULL grants-by-collection map across every scope on the
+            # page — reused as-is rather than re-reading
+            # `resource_grants_repo().list_all()` (a full table scan) once
+            # per SharePoint connection. `None` (no caller-precomputed map)
+            # falls back to reading it here, scoped to nothing since a
+            # single read_all has no narrower form — same cost this always
+            # paid for a lone connection.
+            by_collection = collection_grants_by_id
+            if by_collection is None:
+                from src.repositories import resource_grants_repo
 
-            by_collection: dict[str, set] = {}
-            for g in resource_grants_repo().list_all(resource_type="collection"):
-                if g["resource_id"] in scope_ids:
+                by_collection = {}
+                for g in resource_grants_repo().list_all(resource_type="collection"):
                     by_collection.setdefault(g["resource_id"], set()).add(g["group_id"])
-            groups_matched = len({gid for gids in by_collection.values() for gid in gids})
+            groups_matched = len({gid for scope_id in scope_ids for gid in by_collection.get(scope_id, ())})
             collections_no_group = sum(1 for scope_id in scope_ids if not by_collection.get(scope_id))
         except Exception as e:
             logger.warning("sharepoint pipeline cell: grant lookup unavailable: %s", e)
@@ -10029,16 +10131,28 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
     # ids, this one needs the full row (`source_scope_id`, `display_path`,
     # `anonymize`) `_scope_out` renders — two projections of the SAME field,
     # not two different sources of truth for it.
+    # Capped at `_CARD_SCOPES_CAP`: this list used to render EVERY confirmed
+    # scope inline on the card (up to ~180 on a real connection) — on a page
+    # with several such connections that inflated the HTML response into
+    # the hundreds of KB regardless of how cheap the underlying queries were
+    # made, none of it needed for the card's first paint (the identity cell
+    # above already carries the honest summary counts). The full list stays
+    # one click away — `GET .../scopes` (`admin_sharepoint.list_scopes`),
+    # the SAME projection, unbounded — via the "Manage scopes" wizard entry
+    # point the card already links to.
     scopes: list[dict[str, Any]] = []
+    scopes_total = 0
     try:
         from app.api.admin_sharepoint import _latest_run_anonymized_corpus_ids, _scope_out
 
         declared_corpus_ids = _latest_run_anonymized_corpus_ids()
-        for raw_scope in (conn.get("config") or {}).get("scopes") or []:
-            if not isinstance(raw_scope, dict):
-                continue
+        raw_scopes = [s for s in (conn.get("config") or {}).get("scopes") or [] if isinstance(s, dict)]
+        scopes_total = len(raw_scopes)
+        for raw_scope in raw_scopes[:_CARD_SCOPES_CAP]:
             try:
-                scopes.append(_scope_out(raw_scope, declared_corpus_ids, conn))
+                scopes.append(
+                    _scope_out(raw_scope, declared_corpus_ids, conn, grants_by_collection=collection_grants_by_id)
+                )
             except Exception as e:
                 logger.debug(
                     "sharepoint pipeline cell: scope row resolution failed for %s: %s",
@@ -10048,6 +10162,8 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
     except Exception as e:
         logger.warning("sharepoint pipeline cell: scope rows unavailable: %s", e)
     cell["scopes"] = scopes
+    cell["scopes_total"] = scopes_total
+    cell["scopes_truncated"] = scopes_total > len(scopes)
 
     # ── anonymization (spec §9/§9.2/§13.2): "requested" (this connection's
     # own confirmed scopes marked anonymize=true, read straight off `conn` —

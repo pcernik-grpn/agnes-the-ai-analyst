@@ -509,7 +509,7 @@ def _fleet_facts(run: Optional[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 @router.get("/extraction/runs")
-async def fleet_extraction_runs(
+def fleet_extraction_runs(
     active: bool = Query(False, description="Only connections with a currently running run (the default scope)"),
     show_all: bool = Query(
         False, alias="all", description="Every SharePoint connection, running or not — wins over `active`"
@@ -540,6 +540,11 @@ async def fleet_extraction_runs(
     is a post-A3 table, so a DuckDB-backed instance gets the typed ``501``
     from ``extraction_runs_repo()`` via the app-wide handler in
     ``app/main.py`` — nothing here needs its own DuckDB fallback.
+
+    Plain ``def`` (not ``async def``, zero ``await``s below): blocking,
+    synchronous SQLAlchemy I/O, so FastAPI dispatches it to the anyio thread
+    pool rather than the single event loop (Tier-1 convention,
+    ``tests/test_event_loop_offload_guard.py``).
     """
     from src.repositories import extraction_runs_repo, source_connections_repo
 
