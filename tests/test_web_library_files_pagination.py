@@ -4,7 +4,7 @@ shared-contract brief for this change).
 
 Covers:
   - identity trap: a page slice landing on exactly one row must not make a
-    multi-file collection render as a single-file artefact
+    multi-file collection render as a single-file artifact
   - `q`/`status` filtering (Band 1: file-name substring search)
   - `f.path` rendered as a second meta line when the row carries one
   - default Files order is newest-first
@@ -52,7 +52,7 @@ def _seed_file(corpus_id: str, filename: str, *, status: str = "pending", path: 
 def test_page_2_of_26_files_still_renders_as_collection(seeded_app):
     """26 files, page size 25: page 2 holds exactly ONE row. The page must
     still read as a 26-file collection, never silently promote into looking
-    like a single-file artefact — `_n`/`_single` must come from the true
+    like a single-file artifact — `_n`/`_single` must come from the true
     total, never from the page slice."""
     corpus_id = _new_corpus("big-collection")
     for i in range(26):

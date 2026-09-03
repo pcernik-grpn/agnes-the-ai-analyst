@@ -523,12 +523,12 @@ class TestStackListParity:
 class TestStackArtefactAddRemoveParity:
     """``POST/DELETE /api/stack/artefacts/{id}`` ↔ ``agnes stack artefacts add/remove``.
 
-    Artefacts are NOT resource_grants-gated like data_package/memory_domain
+    Artifacts are NOT resource_grants-gated like data_package/memory_domain
     above — permission is ownership (``file_corpora.created_by``), so the
     setup seeds a plain collection owned by the analyst instead of a grant.
     """
 
-    def _seed_collection(self, conn, *, name: str = "Parity Artefact") -> str:
+    def _seed_collection(self, conn, *, name: str = "Parity Artifact") -> str:
         from src.repositories.file_corpora import FileCorporaRepository
 
         return FileCorporaRepository(conn).create(
@@ -574,7 +574,7 @@ class TestStackArtefactAddRemoveParity:
     def test_remove_parity(self, parity_env):
         conn = get_system_db()
         _purge_user_state(conn)
-        corpus_id = self._seed_collection(conn, name="Parity Artefact Remove")
+        corpus_id = self._seed_collection(conn, name="Parity Artifact Remove")
         conn.execute(
             "INSERT INTO user_stack_subscriptions(user_id, resource_type, resource_id) "
             "VALUES ('analyst1', 'collection', ?)",

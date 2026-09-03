@@ -447,7 +447,7 @@ class TableRegistryRepository:
 
         Rows are identified by ``source_type='collection'`` and
         ``bucket=corpus_id``.  Returns the list of deleted table ids so the
-        caller can clean up derived artefacts (parquet files, extract.duckdb
+        caller can clean up derived artifacts (parquet files, extract.duckdb
         views) before calling ``orchestrator.rebuild_source``.
 
         Clears each dropped row's dependants first (see
@@ -455,7 +455,7 @@ class TableRegistryRepository:
         data package hit the same DuckDB foreign key ``unregister`` does —
         and this path is called from ``DELETE /api/collections/{id}``, which
         unlinks the parquet files right after, so the 500 landed with the
-        durable artefacts already half gone.
+        durable artifacts already half gone.
         """
         rows = self.conn.execute(
             "SELECT id FROM table_registry WHERE source_type = 'collection' AND bucket = ?",
