@@ -64630,6 +64630,56 @@
         ]
       }
     },
+    "/semantic-layer/new": {
+      "get": {
+        "description": "Author one Ossie document \u2014 the Definitions page's **+ New model** card.\n\nNot admin-only, because ``POST /api/semantic-models/apply`` is not: an\nadmin's document is published, anyone else's is queued for moderation.\nWhat *is* conditional is whether authoring can succeed at all \u2014 see\n:func:`_can_author_semantic_model` \u2014 and a caller for whom it cannot gets\nthis page explaining why rather than a 404 (the feature exists) or a\nredirect home (which loses the reason). Same posture as ``/admin/ontology``\nwith the ``facts`` flag off.",
+        "operationId": "semantic_model_builder_page_semantic_layer_new_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Semantic Model Builder Page",
+        "tags": [
+          "web"
+        ]
+      }
+    },
     "/semantic-layer/{slug}": {
       "get": {
         "description": "Level 2 \u2014 one model, one tab per object type (datasets default).\n\n``q`` is the cross-link prefilter carried from another tab (a metric\nrow links to its constraints with ``?tab=constraints&q=<metric name>``,\na dataset row links to its metrics with ``?tab=metrics&q=<dataset\nname>``) \u2014 a plain case-insensitive substring match scoped to whichever\ntab is active, not a new search endpoint.",
