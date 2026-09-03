@@ -142,9 +142,11 @@ WHERE cost_center IN (
 agnes admin update-table user_access --policy-mapping
 ```
 
-(There is no web-UI toggle for `policy_mapping` yet — CLI or a direct `PUT /api/admin/registry/{id}` with `{"policy_mapping": true}` is the only way to set it in v1.) Marking a table this way makes it referenceable from **any** table's policy, not just one specific consumer — and it does **not** itself grant analysts access to `user_access`; that table's own row-level visibility is unaffected.
+The same toggle also lives in the web UI: the Access modal on `/admin/tables` has a mapping switch that PUTs the same `policy_mapping` field — equivalent to the CLI flag above, just reachable without leaving the modal. Marking a table this way makes it referenceable from **any** table's policy, not just one specific consumer — and it does **not** itself grant analysts access to `user_access`; that table's own row-level visibility is unaffected.
 
 **The empty-mapping trap.** If `user_access`'s sync fails, or it lands with zero rows, every policy that joins it returns zero rows for everyone — indistinguishable, from an analyst's side, from "you legitimately have no data". Both look like a healthy Agnes with an empty result. Sync the mapping table like any other registered table and watch its sync status; see [v1 limitations](#v1-limitations) below for how (and how not) this surfaces today.
+
+**A mapping table with a policy of its own is joined unfiltered.** The substitution rewrite runs exactly once, non-recursively, over the *caller's* original SQL — a policy body's own `FROM`/joins are spliced in as literal text, never re-parsed and walked — so if `user_access` is itself a policied table, `invoices`'s policy reads it in full, unfiltered by `user_access`'s own policy; this is admin-authored and server-side by design, not a leak.
 
 ## The admin bypass
 
@@ -160,7 +162,9 @@ An Admin-group member is unfiltered by every policy **only when their credential
 - `—` (plain) on an eligible table with no policy — click to add one.
 - A tinted **Policy** chip, with who/when underneath, once one is attached.
 
-The modal is a plain SQL textarea plus a required note field ("why does this policy exist" — mandatory whenever a non-empty body is saved, so the next admin who finds forty lines of SQL knows whether it's a legal requirement or a hunch), an inline preview runner (persona = one user's email, or an ad-hoc comma-separated group list — see below), and recent edit history. A rejected save renders inline rather than as an auto-dismissing toast, on purpose — a security-invariant refusal has to stay legible while you re-read the SQL.
+The modal has two tabs: a no-SQL **Builder** and an **Advanced SQL** textarea, plus (shared by both) a required note field ("why does this policy exist" — mandatory whenever a non-empty body is saved, so the next admin who finds forty lines of SQL knows whether it's a legal requirement or a hunch), an inline preview runner (persona = one user's email, or an ad-hoc comma-separated group list — see below), and recent edit history. A rejected save renders inline rather than as an auto-dismissing toast, on purpose — a security-invariant refusal has to stay legible while you re-read the SQL.
+
+The **Builder** tab assembles a row-rule repeater plus per-column mask pickers (`GET /api/admin/registry/{id}/policy/columns` supplies the real column list and a PII hint per column) and compiles them server-side (`POST /api/admin/registry/{id}/policy/compile`, `src/access_policy_compile.py`) into the SQL that lands in the Advanced tab. The compiled output is always an explicit, fixed projection — never `SELECT *` — so a column added upstream after the policy is saved is hidden by omission rather than silently appearing. Row rules combine `in_caller_groups` (row's column is one of the caller's live groups), `eq_caller_email` / `eq_caller_id` (self-owned rows), and `eq` / `in` (literal match) with AND or OR. Column masks are `show`, `hide`, `nullify`, `hash` (an md5 pseudonym, same caveats as [Column masking](#column-masking) above), and `unmask` (visible only to an allowed group or groups, falling back type-aware for everyone else: `'*****'` for text-like columns, `NULL` otherwise). The stored artifact is always the compiled SQL, never the builder form — reopening a saved policy starts the Builder empty, with the actual SQL sitting in the Advanced tab. The Builder's PII flag on a column is a name heuristic (the column name contains a substring like `email`, `phone`, `ssn`, `national_id`, `iban`, and a few others) or the profiler's own "unique" alert on a non-numeric column — a nudge toward masking it, never an authoritative classification (`_policy_builder_looks_like_pii` in `app/api/admin.py`).
 
 ### CLI
 
