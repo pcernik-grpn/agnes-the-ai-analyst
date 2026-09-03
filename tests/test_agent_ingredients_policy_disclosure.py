@@ -118,11 +118,13 @@ class TestKnowledgeSourcesForCarriesPolicyFlag:
     def _stub_stack(self, monkeypatch, entries):
         from app.services import stack_resolver
 
-        monkeypatch.setattr(stack_resolver.StackResolver, "stack", lambda self, uid, rt: entries if rt.value == "data_package" else [])
+        monkeypatch.setattr(
+            stack_resolver.StackResolver, "stack", lambda self, uid, rt: entries if rt.value == "data_package" else []
+        )
         monkeypatch.setattr("app.auth.access.accessible_collection_ids", lambda user: None)
         import src.repositories as repos
 
-        monkeypatch.setattr(repos, "file_corpora_repo", lambda: type("R", (), {"list_all": staticmethod(lambda: [])})())
+        monkeypatch.setattr(repos, "file_corpora_repo", lambda: type("R", (), {"list_all": staticmethod(list)})())
         monkeypatch.setattr(repos, "memory_domains_repo", lambda: type("R", (), {})())
 
     def test_data_entry_with_a_policied_table_is_flagged(self, monkeypatch):
