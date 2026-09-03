@@ -36,6 +36,7 @@ from connectors.sharepoint.facts_extraction import (
     _fact_key,
     _resolve_llm_cache,
     _retry_mode,
+    _normalize_evidence_doc_ids,
     build_system_prompt,
     build_user_message,
     extract_one,
@@ -843,6 +844,119 @@ def test_a_cached_retry_response_is_served_without_a_second_call():
     assert [n["evidence"][0]["quote"] for n in result.nodes] == ["rollout began in March"]
 
 
+# ---------------------------------------------------------------------------
+# Evidence doc_id normalization (TCRD-296 gap #62) — a cache-served reply
+# (or, in principle, a persistently mis-citing model) must never ship
+# evidence naming a document other than the one actually being processed.
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_evidence_doc_ids_rewrites_a_mismatched_citation_and_counts():
+    node = _node("rollout began in March")  # evidence.doc_id defaults to "doc1"
+    edge = {
+        "src": "engagement:a",
+        "type": "for_client",
+        "dst": "client:b",
+        "attrs": {},
+        "evidence": [{"doc_id": "doc1", "quote": "for Contoso"}],
+    }
+    rewritten = _normalize_evidence_doc_ids([node], [edge], "doc2")
+    assert rewritten == 2
+    assert node["evidence"][0]["doc_id"] == "doc2"
+    assert edge["evidence"][0]["doc_id"] == "doc2"
+
+
+def test_normalize_evidence_doc_ids_leaves_a_correct_citation_untouched():
+    node = _node("rollout began in March")
+    rewritten = _normalize_evidence_doc_ids([node], [], "doc1")
+    assert rewritten == 0
+    assert node["evidence"][0]["doc_id"] == "doc1"
+
+
+def test_normalize_evidence_doc_ids_tolerates_a_malformed_evidence_shape():
+    """A non-list ``evidence`` or a non-dict entry must not crash the
+    pass — the verbatim gate already tolerates the same malformed shapes
+    (``verbatim_failures``); this is the same defensive posture."""
+    weird_evidence_type = {"id": "x:1", "type": "engagement", "attrs": {}, "evidence": "not-a-list"}
+    weird_entry = {"id": "x:2", "type": "engagement", "attrs": {}, "evidence": ["not-a-dict"]}
+    rewritten = _normalize_evidence_doc_ids([weird_evidence_type, weird_entry], [], "doc1")
+    assert rewritten == 0
+
+
+def test_a_cache_hit_from_a_different_but_byte_identical_document_is_renamed_to_this_documents_doc_id():
+    """The lever-B scenario (`test_the_same_fingerprint_is_a_cache_hit_on_a_second_call`)
+    plus the bug it hid: the SECOND document's evidence must cite ITS OWN
+    doc_id, never the first document's — a cache hit replays the FIRST
+    document's reply verbatim, including its citation."""
+    text = "The Northwind rollout began in March."
+    extractor = StubExtractor([_stream(_node("rollout began in March"))])
+    cache = FakeCache()
+
+    first = extract_one(extractor, _work(text), fingerprint="fp1", cache=cache)
+    second = extract_one(extractor, _work(text, file_id="cf_2", doc_id="doc2"), fingerprint="fp1", cache=cache)
+
+    assert len(extractor.seen) == 1, "the second (byte-identical) document must still cost zero model calls"
+    assert first.evidence_doc_id_rewritten == 0
+    assert first.nodes[0]["evidence"][0]["doc_id"] == "doc1"
+    assert second.cache_hits == 1
+    assert second.evidence_doc_id_rewritten == 1
+    assert second.nodes[0]["evidence"][0]["doc_id"] == "doc2", (
+        "a cache-served reply must be re-attributed to the document actually being processed"
+    )
+
+
+def test_a_model_that_mis_cites_its_own_document_on_a_fresh_call_is_also_corrected():
+    """Not only a cache replay — a model reply naming the wrong doc_id on
+    an ordinary, uncached call is corrected the same way, and counted."""
+    text = "The Northwind rollout began in March."
+    wrong_citation = {
+        "id": "engagement:northwind-rollout",
+        "type": "engagement",
+        "attrs": {},
+        "evidence": [{"doc_id": "some-other-doc", "quote": "rollout began in March"}],
+    }
+    extractor = StubExtractor([_stream(wrong_citation)])
+
+    result = extract_one(extractor, _work(text, doc_id="doc7"))
+
+    assert result.evidence_doc_id_rewritten == 1
+    assert result.nodes[0]["evidence"][0]["doc_id"] == "doc7"
+
+
+def test_evidence_doc_id_rewritten_counts_a_mis_cited_retry_reply_too():
+    text = "The Northwind rollout began in March."
+    # Correctly cited (doc7) so it does not itself count toward the
+    # rewrite total below — only the RETRY reply's mis-citation should.
+    bad = {
+        "id": "engagement:x",
+        "type": "engagement",
+        "attrs": {},
+        "evidence": [{"doc_id": "doc7", "quote": "invented sentence"}],
+    }
+    good_but_mis_cited = {
+        "id": "engagement:northwind-rollout",
+        "type": "engagement",
+        "attrs": {},
+        "evidence": [{"doc_id": "some-other-doc", "quote": "rollout began in March"}],
+    }
+    extractor = StubExtractor([_stream(bad), _stream(good_but_mis_cited)])
+
+    result = extract_one(extractor, _work(text, doc_id="doc7"))
+
+    assert result.retried is True
+    assert result.evidence_doc_id_rewritten == 1
+    assert result.nodes[0]["evidence"][0]["doc_id"] == "doc7"
+
+
+def test_evidence_doc_id_rewritten_defaults_to_zero_on_a_clean_reply():
+    text = "The Northwind rollout began in March."
+    extractor = StubExtractor([_stream(_node("rollout began in March"))])
+
+    result = extract_one(extractor, _work(text))
+
+    assert result.evidence_doc_id_rewritten == 0
+
+
 # Batch-transport gate helpers — the SAME verbatim-gate / one-retry contract
 # as extract_one, generalized to a reply that may have arrived asynchronously
 # (a collected Batches-API result) rather than from a live call.
@@ -1091,6 +1205,150 @@ def test_collect_batch_results_keys_by_custom_id_in_any_order():
     client = type("_Client", (), {"messages": type("_M", (), {"batches": endpoint})()})()
     results = fe._collect_batch_results(client, "batch_1")
     assert set(results.keys()) == {"cf_1", "cf_2"}
+
+
+# ---------------------------------------------------------------------------
+# Ledger correction (TCRD-296 gap #62) — `_fold_accepted_result` writes a
+# document's `docs_state` entry as `status: "done"` OPTIMISTICALLY, before
+# its batch is ever shipped. `_BatchShipper` is the only thing holding a
+# reference able to correct that once the real ingest outcome is known.
+# ---------------------------------------------------------------------------
+
+
+def _shipper(docs_state: dict) -> "fe._BatchShipper":
+    return fe._BatchShipper(report=fe._Report(), anonymize_marked=set(), user={"id": "sched"}, docs_state=docs_state)
+
+
+def test_revert_ledger_downgrades_a_done_entry_after_an_ingest_refusal():
+    docs_state = {"cf_1": {"status": "done", "nodes": 2, "extracted_sha": "sha-1"}}
+    shipper = _shipper(docs_state)
+    shipper._revert_ledger(["cf_1"])
+    entry = docs_state["cf_1"]
+    assert entry["status"] == "ingest_refused"
+    assert entry["retry_count"] == 1
+    assert entry["extracted_sha"] == "sha-1", "diagnostic fields survive the downgrade"
+
+
+def test_revert_ledger_ignores_a_file_id_that_never_reached_done():
+    docs_state = {"cf_1": {"status": "skipped-no-text"}}
+    shipper = _shipper(docs_state)
+    shipper._revert_ledger(["cf_1"])
+    assert docs_state["cf_1"]["status"] == "skipped-no-text"
+
+
+def test_revert_ledger_gives_up_after_the_retry_ceiling():
+    docs_state = {"cf_1": {"status": "done", "nodes": 2, "retry_count": fe.MAX_LEDGER_RETRY_ATTEMPTS - 1}}
+    shipper = _shipper(docs_state)
+    shipper._revert_ledger(["cf_1"])
+    entry = docs_state["cf_1"]
+    assert entry["status"] == "failed"
+    assert "ingest_refused" in entry["reason"]
+    assert "retry_count" not in entry
+
+
+def test_correct_ledger_marks_zero_claims_despite_nodes_as_a_retry_status():
+    docs_state = {"cf_1": {"status": "done", "nodes": 1}}
+    shipper = _shipper(docs_state)
+    shipper._file_ids = ["cf_1"]
+    shipper._documents = [{"doc_id": "doc1", "corpus_id": "col_a"}]
+    shipper._correct_ledger({"claims_written_by_doc": {}, "resolved_file_by_doc": {}})
+    entry = docs_state["cf_1"]
+    assert entry["status"] == "no_claims"
+    assert entry["retry_count"] == 1
+
+
+def test_correct_ledger_leaves_a_document_with_written_claims_done():
+    docs_state = {"cf_1": {"status": "done", "nodes": 1}}
+    shipper = _shipper(docs_state)
+    shipper._file_ids = ["cf_1"]
+    shipper._documents = [{"doc_id": "doc1", "corpus_id": "col_a"}]
+    shipper._correct_ledger({"claims_written_by_doc": {"doc1": 1}, "resolved_file_by_doc": {"doc1": "cf_1"}})
+    entry = docs_state["cf_1"]
+    assert entry["status"] == "done"
+    assert "claims_on_file_id" not in entry
+    assert "retry_count" not in entry
+
+
+def test_correct_ledger_records_the_winner_for_a_duplicate_copy_and_stays_done():
+    """A TCRD-241 duplicate copy: this file's own doc_id resolved to a
+    SIBLING corpus_file_id — by design (the loader collapses every
+    byte-identical copy onto one deterministic winner), never a failure.
+    It must stay `done`, with a pointer to where its claims actually
+    live."""
+    docs_state = {"cf_loser": {"status": "done", "nodes": 1}}
+    shipper = _shipper(docs_state)
+    shipper._file_ids = ["cf_loser"]
+    shipper._documents = [{"doc_id": "dupdoc", "corpus_id": "col_a"}]
+    shipper._correct_ledger({"claims_written_by_doc": {"dupdoc": 1}, "resolved_file_by_doc": {"dupdoc": "cf_winner"}})
+    entry = docs_state["cf_loser"]
+    assert entry["status"] == "done"
+    assert entry["claims_on_file_id"] == "cf_winner"
+
+
+def test_correct_ledger_ignores_a_file_id_that_never_reached_done():
+    docs_state = {"cf_1": {"status": "skipped-no-text"}}
+    shipper = _shipper(docs_state)
+    shipper._file_ids = ["cf_1"]
+    shipper._documents = [{"doc_id": "doc1", "corpus_id": "col_a"}]
+    shipper._correct_ledger({"claims_written_by_doc": {}, "resolved_file_by_doc": {}})
+    assert docs_state["cf_1"]["status"] == "skipped-no-text"
+
+
+def test_correct_ledger_treats_a_document_with_zero_nodes_and_zero_claims_as_fine():
+    """Zero nodes, zero claims — the document simply had nothing to
+    extract (a legitimately empty pass), not a ledger inconsistency. Must
+    stay `done`, no retry."""
+    docs_state = {"cf_1": {"status": "done", "nodes": 0}}
+    shipper = _shipper(docs_state)
+    shipper._file_ids = ["cf_1"]
+    shipper._documents = [{"doc_id": "doc1", "corpus_id": "col_a"}]
+    shipper._correct_ledger({"claims_written_by_doc": {}, "resolved_file_by_doc": {}})
+    assert docs_state["cf_1"]["status"] == "done"
+
+
+def _shipper_document(doc_id: str = "doc1") -> dict:
+    return {"doc_id": doc_id, "corpus_id": "col_a", "stable_id": None, "path": None, "name": None, "sha256": ""}
+
+
+def test_flush_reverts_ledger_entries_when_ingest_is_refused(monkeypatch):
+    from fastapi import HTTPException
+
+    docs_state = {"cf_1": {"status": "done", "nodes": 1}}
+    shipper = _shipper(docs_state)
+    shipper.add(file_id="cf_1", document=_shipper_document(), nodes=[], edges=[], claim_count=0)
+
+    def _raise(body, *, user):
+        raise HTTPException(status_code=403, detail={"reason": "anonymization_not_declared"})
+
+    monkeypatch.setattr("app.api.facts.facts_ingest", _raise)
+
+    with pytest.raises(fe._IngestRefused):
+        shipper.flush(usage={}, model="claude-haiku-4-5")
+
+    assert docs_state["cf_1"]["status"] == "ingest_refused"
+    assert docs_state["cf_1"]["retry_count"] == 1
+
+
+def test_flush_corrects_the_ledger_after_a_successful_zero_claim_ingest(monkeypatch):
+    docs_state = {"cf_1": {"status": "done", "nodes": 1}}
+    shipper = _shipper(docs_state)
+    shipper.add(file_id="cf_1", document=_shipper_document(), nodes=[], edges=[], claim_count=0)
+
+    def _fake_ingest(body, *, user):
+        return {
+            "claims_written": 0,
+            "claims_written_by_doc": {},
+            "resolved_file_by_doc": {},
+            "claims_rejected": [],
+            "edges_skipped_missing_endpoint": 0,
+        }
+
+    monkeypatch.setattr("app.api.facts.facts_ingest", _fake_ingest)
+
+    shipper.flush(usage={}, model="claude-haiku-4-5")
+
+    assert docs_state["cf_1"]["status"] == "no_claims"
+    assert docs_state["cf_1"]["retry_count"] == 1
 
 
 # ---------------------------------------------------------------------------

@@ -1541,6 +1541,22 @@ _EXEMPT: dict[str, str] = {
         "an agent should not be able to spend the instance's LLM budget over an "
         "entire corpus with one tool call"
     ),
+    # TCRD-296 gap #62's recovery surface: one-time backlog fix for a facts
+    # ledger entry a PRE-fix pass wrote as done despite carrying no claims —
+    # same admin/ops maintenance-op class as facts-extract right above.
+    # CLI-reachable (`agnes admin sharepoint facts reset --no-claims`) for an
+    # ops engineer clearing the backlog without opening the admin UI, but
+    # deliberately not MCP-exposed: it mutates per-document extraction state
+    # (and, indirectly, triggers a re-extraction spend on the NEXT pass) —
+    # an operator decision, not something an agent should reach for on a
+    # whim, same reasoning as the facts-extract exemption above.
+    "/api/admin/sharepoint/connections/{connection_id}/facts/reset-no-claims": (
+        "admin/ops recovery action for the facts ledger's historical no-claims "
+        "backlog — CLI-reachable (agnes admin sharepoint facts reset --no-claims) "
+        "but deliberately not MCP-exposed: it mutates per-document extraction "
+        "state and can trigger a re-extraction spend on the next pass, an "
+        "operator decision no analyst query needs"
+    ),
     # The config drawer's "Preview redaction" panel: paste a sample, see what
     # the anonymizer would do to it before a crawl runs over thousands of
     # documents. Same exemption class as the drawer it lives in — an admin

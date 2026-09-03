@@ -365,6 +365,55 @@ one document's own request (most commonly a 400 "prompt is too long") is
 counted in `facts_failed`/`facts_failed_reasons` and the pass continues
 with the next document — it never aborts the whole run.
 
+**What a facts-ledger `"done"` entry means, and what it does not (TCRD-296
+gap #62).** Each document's per-connection facts state (`docs_state`,
+keyed by `corpus_files.id`) is written `status: "done"` once the pass
+extracted its facts — never once its evidence actually landed in the fact
+graph, which happens in a LATER step (the batch's ingest call, possibly
+several documents later). A `"done"` entry is what `is_up_to_date` treats
+as current forever, so a document whose batch was refused, or whose
+citation the ingest gate rejected/deferred, previously stayed `"done"`
+with zero claims — invisible to every later pass, since nothing revisits
+an already-`"done"` entry. Two things now keep this honest:
+
+- **Cache citation.** The response cache (lever B above) keys on the
+  CONVERTED markdown's content hash, while the model cites `doc_id` (the
+  SOURCE document's identity) in its evidence. Two documents that convert
+  to byte-identical markdown but differ in their source bytes share a
+  cache row, and a naive replay would still cite the FIRST document. Every
+  evidence entry is now rewritten to the document actually being
+  processed right after the reply is parsed — the run report's
+  `facts_evidence_doc_id_rewritten` counts how often this fired, whether
+  the mis-citation came from a cache hit or the model itself.
+- **Ledger correction.** The pass now reconciles each document's ledger
+  entry against what its batch's ingest call actually reported: a refused
+  batch downgrades its documents' entries to a bounded-retry status
+  (`ingest_refused`) rather than leaving them `"done"`; a document whose
+  own evidence contributed zero claims despite extracting facts is marked
+  `no_claims` the same way; either status is retried automatically by the
+  next pass (cache-served, so the retry costs no extra model call), up to
+  a small bounded number of attempts before giving up with a terminal
+  `"failed"` entry. A TCRD-241 duplicate copy — a byte-identical file whose
+  claims all land on a SIBLING `corpus_files` row (the loader's
+  deterministic winner-pick) — is the one legitimate zero-claims case: it
+  stays `"done"`, with a `claims_on_file_id` marker pointing at the winner,
+  so a coverage report can tell "duplicate" from "genuinely missing".
+
+**Recovering the historical backlog.** The two fixes above only prevent
+this from happening on a FRESH pass. A document whose ledger entry an
+OLDER, pre-fix pass already wrote `"done"` with zero claims needs a
+one-time reset: `POST /api/admin/sharepoint/connections/{id}
+/facts/reset-no-claims` (`agnes admin sharepoint facts reset --no-claims
+<connection_id> [--dry-run]`) checks every such candidate against the real
+fact graph and either leaves it alone (already has a claim), backfills
+`claims_on_file_id` (a duplicate copy whose sibling carries the claim), or
+removes the ledger entry so the next pass re-extracts it (genuinely
+missing). `--dry-run` computes and reports the same counts without writing
+anything. Refuses with `409 facts_extraction_running` while a
+facts-extraction pass — chained or standalone — holds the connection's
+facts-pass lock, since that pass upserts the whole ledger payload on its
+own schedule.
+
 ## Verifying completeness
 
 "Did we really get everything?" is a live Graph Search count compared

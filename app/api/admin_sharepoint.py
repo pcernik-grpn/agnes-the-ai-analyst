@@ -172,7 +172,7 @@ from uuid import uuid4
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
-from app.auth.access import require_admin
+from app.auth.access import require_admin, require_facts_enabled
 from app.auth.public_url import public_base_url
 from app.resource_types import ResourceType
 from src.audit_helpers import log_safe
@@ -4567,6 +4567,83 @@ async def trigger_facts_extraction(
 
     logger.info("sharepoint connection %s: facts-extraction job %s enqueued (manual trigger)", connection_id, job["id"])
     return {"job_id": job["id"], "status": job["status"]}
+
+
+class FactsResetNoClaimsRequest(BaseModel):
+    """Body for ``POST …/facts/reset-no-claims`` — optional; a bare POST
+    performs the real reset (``dry_run`` defaults to ``False``, mirroring
+    the CLI's own default: ``agnes admin sharepoint facts reset
+    --no-claims <id>`` resets, ``--dry-run`` previews)."""
+
+    dry_run: bool = False
+
+
+@router.post("/connections/{connection_id}/facts/reset-no-claims", dependencies=[Depends(require_facts_enabled)])
+async def reset_facts_no_claims(
+    connection_id: str,
+    body: Optional[FactsResetNoClaimsRequest] = None,
+    user: dict = Depends(require_admin),
+):
+    """TCRD-296 gap #62's recovery surface: a document whose facts ledger
+    entry reads ``status: "done"`` with facts extracted (``nodes > 0``) but
+    that never contributed a single claim to the fact graph — a batch an
+    earlier, pre-fix pass shipped and got refused, or whose citation the
+    ingest gate rejected/deferred — stayed marked done FOREVER (the ledger
+    only ever re-derives a non-``"done"`` entry), invisible to every later
+    pass. A fresh pass now corrects its own ledger entries as it goes
+    (:class:`connectors.sharepoint.facts_extraction._BatchShipper`); this
+    endpoint is the one-time fix for entries an OLDER pass already wrote
+    before that existed.
+
+    Every candidate is checked against the REAL fact graph (the ledger
+    itself never recorded a claim count) and sorted into three outcomes —
+    see :func:`connectors.sharepoint.facts_extraction
+    .reset_no_claims_ledger_entries`'s own docstring for the full
+    algorithm: already has claims (left alone), a TCRD-241 duplicate copy
+    whose SIBLING carries the claims (backfilled with ``claims_on_file_id``,
+    never reset — resetting it would re-extract a document that already has
+    a graph presence via its winner copy), or genuinely missing (the ledger
+    entry is removed so the next pass re-derives and re-extracts it — cache-
+    served after the doc_id-normalization fix, so this costs no additional
+    model call once the original extraction already produced a usable
+    reply).
+
+    ``dry_run`` (default ``False``) computes and returns the same counts
+    WITHOUT writing anything.
+
+    ``404`` on an unknown/non-SharePoint connection. ``409
+    facts_extraction_running`` when a facts-extraction pass — chained or
+    standalone — currently holds this connection's
+    ``connectors.sharepoint.state_store.facts_pass_lock``: that pass
+    upserts the WHOLE ledger payload on its own schedule, so resetting
+    entries underneath it would race that write.
+    """
+    _sharepoint_connection_or_404(connection_id)
+    dry_run = body.dry_run if body is not None else False
+
+    from connectors.sharepoint.facts_extraction import reset_no_claims_ledger_entries
+    from connectors.sharepoint.state_store import FactsPassLocked
+
+    try:
+        result = reset_no_claims_ledger_entries(connection_id, dry_run=dry_run)
+    except FactsPassLocked as exc:
+        raise HTTPException(status_code=409, detail={"error": "facts_extraction_running", "message": str(exc)}) from exc
+
+    log_safe(
+        user_id=user.get("id"),
+        action="sharepoint_connection.facts_reset_no_claims",
+        resource=f"source_connection:{connection_id}",
+        params={
+            "dry_run": dry_run,
+            "candidates": result["candidates"],
+            "reset": len(result["reset"]),
+            "duplicates_recorded": len(result["duplicates_recorded"]),
+            "already_had_claims": result["already_had_claims"],
+            "unmapped": len(result["unmapped"]),
+        },
+        result="success",
+    )
+    return result
 
 
 @router.post("/extraction/run-due")

@@ -1773,6 +1773,143 @@ class TestFactsGraphCountsSmoke:
         assert r.json() == {"facts": 1, "edges": 0, "graph_counts_kind": "approximate"}
 
 
+class TestFactsResetNoClaimsSmoke:
+    """`POST .../facts/reset-no-claims` — TCRD-296 gap #62's recovery
+    surface for a facts-ledger entry a PRE-fix pass wrote as ``done``
+    despite carrying no claims. Deep algorithm coverage (already-has-claims
+    / duplicate-copy / genuinely-missing outcomes, the retry-ceiling) is
+    unit-level in ``tests/test_facts_extraction.py``
+    (``_BatchShipper``/``reset_no_claims_ledger_entries``); this class
+    proves the HTTP wiring, the 401/404 shape, and the PG-only fail-clean
+    shape.
+    """
+
+    COVERED_ROUTES = {
+        "POST /api/admin/sharepoint/connections/{connection_id}/facts/reset-no-claims",
+    }
+
+    def _connection(self, cid="sp-facts-reset-smoke"):
+        from src.repositories import source_connections_repo
+
+        source_connections_repo().create(
+            id=cid,
+            name="Facts Reset Smoke",
+            source_type="sharepoint",
+            config={"tenant_id": "t1", "client_id": "c1", "scopes": []},
+        )
+        return cid
+
+    def test_requires_admin(self, seeded_app_both, monkeypatch):
+        monkeypatch.setenv("AGNES_SHAREPOINT_ENABLED", "true")
+        monkeypatch.setenv("AGNES_FACTS_ENABLED", "1")
+        s = seeded_app_both
+        r = s["client"].post("/api/admin/sharepoint/connections/nope/facts/reset-no-claims")
+        assert r.status_code == 401
+
+    def test_404_for_unknown_connection(self, seeded_app_both, monkeypatch):
+        monkeypatch.setenv("AGNES_SHAREPOINT_ENABLED", "true")
+        monkeypatch.setenv("AGNES_FACTS_ENABLED", "1")
+        s = seeded_app_both
+        client, headers = s["client"], _admin_headers(s)
+        r = client.post("/api/admin/sharepoint/connections/nope/facts/reset-no-claims", headers=headers)
+        assert r.status_code == 404
+
+    def test_404_when_facts_disabled(self, seeded_app_both, monkeypatch):
+        monkeypatch.setenv("AGNES_SHAREPOINT_ENABLED", "true")
+        monkeypatch.delenv("AGNES_FACTS_ENABLED", raising=False)
+        s = seeded_app_both
+        client, headers = s["client"], _admin_headers(s)
+        cid = self._connection("sp-facts-reset-off")
+        r = client.post(f"/api/admin/sharepoint/connections/{cid}/facts/reset-no-claims", headers=headers)
+        assert r.status_code == 404
+
+    def test_fails_clean_on_duckdb(self, state_backend, seeded_app_both, monkeypatch):
+        """DuckDB-backed instance: `facts_repo()` is Postgres-only (A3
+        ratchet) — the typed 501, never a raw 500."""
+        if state_backend != "duckdb":
+            pytest.skip("DuckDB-only assertion")
+        monkeypatch.setenv("AGNES_SHAREPOINT_ENABLED", "true")
+        monkeypatch.setenv("AGNES_FACTS_ENABLED", "1")
+        s = seeded_app_both
+        client, headers = s["client"], _admin_headers(s)
+        cid = self._connection("sp-facts-reset-duckdb")
+        r = client.post(f"/api/admin/sharepoint/connections/{cid}/facts/reset-no-claims", headers=headers)
+        assert r.status_code == 501, r.text
+        assert r.json()["error"] == "requires_postgres_backend"
+
+    def _seed_done_no_claims_entry(self, cid: str, *, corpus_slug: str) -> str:
+        from src.repositories import corpus_file_sources_repo, corpus_files_repo, file_corpora_repo
+
+        corpus_id = file_corpora_repo().create(
+            name=corpus_slug, slug=corpus_slug, description=None, created_by="admin1"
+        )
+        file_id = corpus_files_repo().add(
+            corpus_id=corpus_id,
+            filename="a.md",
+            sha256="sha1",
+            file_type="md",
+            size_bytes=10,
+            storage_path="/blobs/a.md",
+        )
+        corpus_file_sources_repo().upsert(
+            corpus_file_id=file_id, corpus_id=corpus_id, source_stable_id="stable-1", source_doc_id="doc1"
+        )
+
+        from connectors.sharepoint.facts_extraction import load_state, save_state
+
+        state = load_state(cid)
+        state["docs"][file_id] = {"status": "done", "nodes": 2, "at": "2026-01-01T00:00:00Z"}
+        save_state(cid, state)
+        return file_id
+
+    def test_resets_a_genuinely_missing_entry_on_pg(self, state_backend, seeded_app_both, monkeypatch):
+        if state_backend != "pg":
+            pytest.skip("Postgres-only assertion")
+        monkeypatch.setenv("AGNES_SHAREPOINT_ENABLED", "true")
+        monkeypatch.setenv("AGNES_FACTS_ENABLED", "1")
+        s = seeded_app_both
+        client, headers = s["client"], _admin_headers(s)
+        cid = self._connection("sp-facts-reset-pg")
+        file_id = self._seed_done_no_claims_entry(cid, corpus_slug="reset-smoke")
+
+        r = client.post(f"/api/admin/sharepoint/connections/{cid}/facts/reset-no-claims", headers=headers, json={})
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["candidates"] == 1
+        assert body["reset"] == [file_id]
+        assert body["duplicates_recorded"] == {}
+        assert body["already_had_claims"] == 0
+
+        from connectors.sharepoint.facts_extraction import load_state
+
+        after = load_state(cid)
+        assert file_id not in after["docs"]
+
+    def test_dry_run_writes_nothing_on_pg(self, state_backend, seeded_app_both, monkeypatch):
+        if state_backend != "pg":
+            pytest.skip("Postgres-only assertion")
+        monkeypatch.setenv("AGNES_SHAREPOINT_ENABLED", "true")
+        monkeypatch.setenv("AGNES_FACTS_ENABLED", "1")
+        s = seeded_app_both
+        client, headers = s["client"], _admin_headers(s)
+        cid = self._connection("sp-facts-reset-dry-pg")
+        file_id = self._seed_done_no_claims_entry(cid, corpus_slug="reset-dry-smoke")
+
+        r = client.post(
+            f"/api/admin/sharepoint/connections/{cid}/facts/reset-no-claims",
+            headers=headers,
+            json={"dry_run": True},
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["dry_run"] is True
+        assert r.json()["reset"] == [file_id]
+
+        from connectors.sharepoint.facts_extraction import load_state
+
+        after = load_state(cid)
+        assert after["docs"][file_id]["status"] == "done", "dry run must not write anything back"
+
+
 # ---------------------------------------------------------------------------
 # Fact graph over Collections — write surface (build order step 4). Deep
 # ingest-protocol coverage (batch caps, the verbatim gate, union/replace,

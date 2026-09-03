@@ -1,7 +1,7 @@
 """`agnes admin sharepoint` — admin/ops triggers and status for SharePoint
 connector maintenance, plus the split-a-large-site management pair below.
 
-Twelve surfaces:
+Thirteen surfaces:
 
   - ``extract`` — the manual crawl trigger with its per-run options
     (``--concurrency``, ``--timeout-s``, ``--resync``, ``--force-reprocess``,
@@ -15,6 +15,11 @@ Twelve surfaces:
     ``POST /api/admin/sharepoint/connections/{connection_id}/extraction/
     retry-empty``.
   - ``facts-extract`` — the standalone fact-graph trigger.
+  - ``facts reset --no-claims`` — the TCRD-296 gap #62 recovery surface: a
+    facts-ledger entry a PRE-fix pass wrote as ``done`` despite carrying no
+    claims in the fact graph is reset so the next pass re-extracts it. CLI
+    counterpart to ``POST /api/admin/sharepoint/connections/{connection_id}
+    /facts/reset-no-claims``.
   - ``scope bulk-add`` / ``connection clone`` — the CLI counterparts to
     ``POST /api/admin/sharepoint/connections/{connection_id}/scopes/bulk``
     and ``POST /api/admin/sharepoint/connections/{connection_id}/clone`` —
@@ -84,14 +89,17 @@ Twelve surfaces:
 The ACL-sync / subtree-sweep TRIGGERS stay admin-web-UI-only, an
 established precedent (see CONTRIBUTING.md's "admin/scheduler maintenance
 op" exemption class, `tests/test_documentation_api_triple_surface.py`) —
-``extract``, ``retry-empty`` and ``facts-extract`` earn a CLI counterpart
-because an operator asking "how do we re-read everything in this scope?",
-"how do we pick up what scan OCR can now read?" or "how do we get the fact
-graph populated with what we already have?" needs an answer that does not
-require opening a browser (a support runbook, a script run against a remote
-instance); all three are deliberately NOT MCP-exposed — an agent-invokable
-tool that can kick off a full re-crawl, a targeted re-conversion pass, or an
-LLM pass over an entire corpus is a cost surface no analyst query needs.
+``extract``, ``retry-empty``, ``facts-extract`` and ``facts reset
+--no-claims`` earn a CLI counterpart because an operator asking "how do we
+re-read everything in this scope?", "how do we pick up what scan OCR can now
+read?", "how do we get the fact graph populated with what we already have?"
+or "how do we clear the no-claims backlog without opening the admin UI?"
+needs an answer that does not require opening a browser (a support runbook,
+a script run against a remote instance); all four are deliberately NOT
+MCP-exposed — an agent-invokable tool that can kick off a full re-crawl, a
+targeted re-conversion pass, an LLM pass over an entire corpus, or a mutation
+that triggers a re-extraction spend on the next pass is a cost surface no
+analyst query needs.
 ``runs`` earns one for the same reason a monitor does: an operator watching
 a ~20-hour extraction over SSH has no browser open at all.
 """
@@ -116,10 +124,12 @@ scope_app = typer.Typer(help="SharePoint connect wizard scope management")
 connection_app = typer.Typer(help="SharePoint connection management")
 collections_app = typer.Typer(help="SharePoint per-scope collection management")
 acl_app = typer.Typer(help="SharePoint ACL-mirroring configuration")
+facts_app = typer.Typer(help="SharePoint facts-extraction ledger maintenance")
 admin_sharepoint_app.add_typer(scope_app, name="scope")
 admin_sharepoint_app.add_typer(connection_app, name="connection")
 admin_sharepoint_app.add_typer(collections_app, name="collections")
 admin_sharepoint_app.add_typer(acl_app, name="acl")
+admin_sharepoint_app.add_typer(facts_app, name="facts")
 
 # `runs` renders a nine-column table (connection through error). A default,
 # terminal-detected width truncates every cell to a few characters when
@@ -331,6 +341,71 @@ def facts_extract(
         typer.echo(json.dumps(body, indent=2))
         return
     typer.echo(f"Enqueued sharepoint-facts-extraction job {body.get('job_id')} (status: {body.get('status')})")
+
+
+@facts_app.command("reset")
+def facts_reset(
+    connection_id: str = typer.Argument(..., help="SharePoint source_connections id"),
+    no_claims: bool = typer.Option(
+        False,
+        "--no-claims",
+        help=(
+            "Reset ledger entries marked done that carry no claims in the fact graph "
+            "(TCRD-296 gap #62) — required today, the only reset mode this command supports."
+        ),
+    ),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Compute and report without writing anything back."),
+    as_json: bool = typer.Option(False, "--json"),
+):
+    """Recovery surface for a facts-ledger entry a PRE-fix pass wrote as
+    ``done`` despite never landing a single claim in the fact graph — an
+    ingest refusal, or a rejected/deferred citation, that happened AFTER the
+    ledger's optimistic write. Left alone, the ledger's ``is_up_to_date``
+    check treats ``done`` as current forever, so the next pass never
+    revisits it.
+
+    CLI counterpart to ``POST /api/admin/sharepoint/connections/
+    {connection_id}/facts/reset-no-claims``. Every candidate — ``done``,
+    facts extracted, no claim recorded yet — is checked against the REAL
+    fact graph and sorted into three outcomes: already has a claim (left
+    alone); a TCRD-241 duplicate copy whose SIBLING carries the claim
+    (backfilled with a ``claims_on_file_id`` marker, never reset); or
+    genuinely missing (the ledger entry is removed so the next pass
+    re-derives and re-extracts it — cache-served, so this costs no
+    additional model call once the original extraction already produced a
+    usable reply).
+
+    ``--no-claims`` names WHICH class of ledger corruption to reset —
+    required (the only mode this command supports today), kept explicit so
+    a future second mode never silently changes what a bare ``reset`` does.
+
+    Refuses with a clear reason rather than a bare HTTP error: ``409
+    facts_extraction_running`` (a facts-extraction pass currently holds this
+    connection's facts-pass lock), ``404`` (unknown or non-SharePoint
+    connection id).
+    """
+    if not no_claims:
+        typer.echo("Specify what to reset: --no-claims", err=True)
+        raise typer.Exit(code=1)
+
+    resp = api_post(
+        f"/api/admin/sharepoint/connections/{connection_id}/facts/reset-no-claims",
+        json={"dry_run": dry_run},
+    )
+    if resp.status_code != 200:
+        _fail(resp)
+    body = resp.json()
+    if as_json:
+        typer.echo(json.dumps(body, indent=2))
+        return
+    prefix = "[dry run] " if body.get("dry_run") else ""
+    typer.echo(
+        f"{prefix}candidates={body.get('candidates', 0)} "
+        f"reset={len(body.get('reset') or [])} "
+        f"duplicates_recorded={len(body.get('duplicates_recorded') or {})} "
+        f"already_had_claims={body.get('already_had_claims', 0)} "
+        f"unmapped={len(body.get('unmapped') or [])}"
+    )
 
 
 @scope_app.command("bulk-add")

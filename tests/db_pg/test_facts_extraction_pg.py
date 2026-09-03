@@ -788,6 +788,49 @@ def test_an_anonymize_marked_collection_is_declared_so_the_gate_accepts_it(pg_en
     assert runs[0]["anonymization"]["scopes"][CORPUS_A]["docs_anonymized"] == 1
 
 
+def test_a_refused_batchs_ledger_downgrade_survives_a_pass_whose_every_flush_is_refused(pg_env, monkeypatch):
+    """TCRD-296 gap #62: the ledger correction a refused flush applies
+    (``_BatchShipper._revert_ledger``) must be PERSISTED, not merely held
+    in memory — a pass with exactly one batch, and that batch refused,
+    never reaches the success branch's own ``save_state`` call. Forces a
+    REAL ingest refusal (the anonymize-fail-closed gate, undeclared) rather
+    than a mock, so this proves the real `POST …/facts/ingest` -> shipper
+    -> ledger path end to end."""
+    _seed_collection()
+    _seed_connection(scopes=[{"source_scope_id": "site:1", "collection_id": CORPUS_A, "anonymize": True}])
+    _seed_ontology()
+    _seed_document(file_id="cf_1", doc_id="doc1", text="PERSON_a1b2c3 led the Northwind rollout.")
+
+    # The producer-side declaration this pass would normally make on its
+    # own — suppressed, so the SAME undeclared-anonymize-marked-corpus gate
+    # `test_an_anonymize_marked_collection_is_declared_so_the_gate_accepts_it`
+    # proves accepts a correct declaration now refuses this one instead.
+    monkeypatch.setattr("connectors.sharepoint.facts_extraction.anonymize_marked_collection_ids", lambda conn: set())
+
+    node = {
+        "id": "engagement:northwind-rollout",
+        "type": "engagement",
+        "attrs": {},
+        "evidence": [{"doc_id": "doc1", "quote": "led the Northwind rollout"}],
+    }
+    report = _run(StubExtractor([_stream(node)]))
+
+    assert report["docs_extracted"] == 1
+    assert len(report["ingest_failures"]) == 1
+    assert report["ingest_failures"][0]["status"] == 403
+    assert report["claims_written"] == 0
+
+    from connectors.sharepoint.facts_extraction import load_state
+
+    # A FRESH load — proves the correction was actually written to the
+    # state store, not merely mutated on the in-memory `docs_state` this
+    # run's own `state` object happened to hold.
+    persisted = load_state(CONNECTION_ID)
+    entry = persisted["docs"]["cf_1"]
+    assert entry["status"] == "ingest_refused"
+    assert entry["retry_count"] == 1
+
+
 # ---------------------------------------------------------------------------
 # Usage accounting + concurrency
 # ---------------------------------------------------------------------------
@@ -892,6 +935,41 @@ def test_a_byte_identical_document_is_served_from_cache_not_a_second_model_call(
     from src.repositories import facts_llm_cache_repo
 
     assert facts_llm_cache_repo().stats()["rows"] == 1
+
+
+def test_a_cache_served_reply_ships_claims_under_the_serving_documents_own_doc_id(pg_env):
+    """TCRD-296 gap #62: cf_1 and cf_2 share a converted-markdown hash (the
+    LLM-cache key) but are DIFFERENT documents (different doc_id) — a
+    legitimate cache hit whose replayed reply, uncorrected, still cites
+    cf_1's doc_id. The claim the cache-served reply produces for cf_2 must
+    land on cf_2, never silently attach to cf_1 or get rejected."""
+    _seed_collection()
+    _seed_connection()
+    _seed_ontology()
+    text = "The Northwind rollout began in March."
+    _seed_document(file_id="cf_1", doc_id="doc1", text=text, sha256="sha-dup-2")
+    _seed_document(file_id="cf_2", doc_id="doc2", text=text, sha256="sha-dup-2")
+
+    node = {
+        "id": "engagement:northwind-rollout",
+        "type": "engagement",
+        "attrs": {},
+        "evidence": [{"doc_id": "doc1", "quote": "rollout began in March"}],
+    }
+    extractor = StubExtractor([_stream(node)])
+    report = _run(extractor)
+
+    assert report["docs_extracted"] == 2
+    assert len(extractor.seen) == 1, "the cache hit must still cost zero model calls"
+    assert report["claims_written"] == 2, "each document's own evidence is a separate, valid claim"
+    assert report["claims_rejected"] == 0
+    assert report["facts_evidence_doc_id_rewritten"] == 1
+
+    from src.db_pg import get_engine
+
+    with get_engine().connect() as conn:
+        rows = conn.execute(sa.text("SELECT corpus_file_id FROM claims ORDER BY corpus_file_id")).mappings().all()
+    assert sorted(r["corpus_file_id"] for r in rows) == ["cf_1", "cf_2"]
 
 
 def test_llm_cache_can_be_disabled_even_on_postgres(pg_env, monkeypatch):
