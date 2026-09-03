@@ -234,6 +234,21 @@ answers:
 That is the whole thing: one click, then merge normally. Nothing is broken
 and no special privilege is involved — the run exists and is waiting.
 
+**If you are not a human, you cannot give that click.** The REST equivalent,
+`POST /repos/{owner}/{repo}/actions/runs/{run_id}/approve`, answers
+
+    403  Resource not accessible by integration
+
+to an integration token — the `actions: write` permission an app can be
+granted does not cover approving a queued-for-approval run. There is no
+token scope to add and no retry that helps. So a non-human release driver
+should not open a cut through `daily-cut.yml` at all and then get stuck one
+click short of merging; take the § Emergency path when Actions dispatch
+isn't available above instead. Cutting by hand with `scripts/release_cut.py`
+and opening the PR under your own identity produces the *same* diff, and its
+`pull_request` run starts immediately — the queue-for-approval rule keys on
+who opened the PR, not on what the branch contains. 0.97.0 shipped this way.
+
 **Do not reach for `gh workflow run ci.yml` instead.** It looks like the
 obvious workaround and it is not one. A `workflow_dispatch` run does put
 green check-runs on the PR's head SHA — 18 of them on the 0.97.0 cut,
