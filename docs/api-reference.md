@@ -791,6 +791,7 @@ fabricated one is dropped rather than corrected.
 ### `/api/admin/groups` — User groups
 
 - /api/admin/groups
+- /api/admin/groups/reach
 - /api/admin/groups/{group_id}
 - /api/admin/groups/{group_id}/members
 - /api/admin/groups/{group_id}/members/{user_id}

@@ -914,3 +914,52 @@ class TestInheritedRowsCollapseToOneLine:
         carrier, so nothing is inherited there to summarise."""
         src = self._source()
         assert "if (!evId || groupId === evId) return direct;" in src
+
+
+class TestReachIsTheServersNumber:
+    """Audit E3. The picker's "N groups · M people" is read at the moment of
+    deciding to share, and it was computed in the browser by unioning member
+    ids — with a fallback to a group's own count when its roster was absent,
+    which double-counted anyone in two such groups, and a clamp to the
+    account total to hide the overshoot. A figure precise enough to be
+    trusted and not always right.
+
+    The server answers now (`GET /api/admin/groups/reach`), where the
+    memberships are. The local estimate still paints first so the footer
+    never blanks, and it does not get the last word.
+    """
+
+    TEMPLATE = "app/web/templates/admin_access.html"
+
+    def _source(self) -> str:
+        from pathlib import Path
+
+        return Path(self.TEMPLATE).read_text(encoding="utf-8")
+
+    def _picker_footer(self) -> str:
+        src = self._source()
+        start = src.index("const chosen = [...pickerState.chosen];")
+        return src[start : src.index("els.apply.disabled = !n;", start)]
+
+    def test_the_estimate_paints_first_and_the_server_paints_last(self):
+        foot = self._picker_footer()
+        assert 'els.count.textContent = n ? line(reachOf(chosen)) : "No group selected";' in foot
+        assert "fetchReach(chosen).then((count) =>" in foot
+        assert foot.index("line(reachOf(chosen))") < foot.index("fetchReach(chosen)")
+
+    def test_a_stale_answer_is_dropped(self):
+        """The selection can change while a request is in flight."""
+        foot = self._picker_footer()
+        assert 'if ([...pickerState.chosen].sort().join(",") !== asked) return;' in foot
+
+    def test_an_unreachable_server_leaves_the_estimate(self):
+        src = self._source()
+        assert "if (count == null) return;" in src
+        assert ".catch(() => null);" in src[src.index("function fetchReach"):]
+
+    def test_the_same_set_is_asked_once(self):
+        src = self._source()
+        f = src[src.index("function fetchReach"):]
+        f = f[: f.index("\n  }", f.index("return p;"))]
+        assert "_reachCache.has(key)" in f and "_reachCache.set(key, p);" in f
+        assert 'const key = groupIds.slice().sort().join(",");' in f

@@ -20,7 +20,7 @@ from datetime import datetime
 from typing import List, Optional
 
 import duckdb
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy import exc as sa_exc
 
@@ -598,6 +598,50 @@ async def list_groups(
     members_repo = user_group_members_repo()
     grants_repo = resource_grants_repo()
     return [_group_to_response(g, members_repo, grants_repo) for g in groups]
+
+
+@router.get("/groups/reach", response_model=dict)
+async def groups_reach(
+    ids: str = Query(..., description="Comma-separated group ids; `everyone` means every account"),
+    user: dict = Depends(require_admin),
+):
+    """How many distinct people a set of audiences reaches.
+
+    The Access page prints this number at the moment an admin decides to
+    share — "3 groups · 41 people" beside Apply — and it used to compute it
+    in the browser by unioning each group's member ids, which meant every
+    group's full roster travelled in the overview payload to support one
+    arithmetic operation (audit findings E3 and S2). A group whose roster the
+    payload did not carry fell back to its own count, double-counting anyone
+    in two such groups, and the result was then clamped to the account total
+    to hide the overshoot. A figure precise enough to be trusted and not
+    always right, on the screen where reach is being decided.
+
+    Computed here instead, where the memberships are. ``everyone`` — the
+    scope sentinel, not a group — short-circuits to the account total: it is
+    every account by construction, so no union can exceed it and none is
+    needed. Ordinary groups union their distinct member ids. The answer is
+    still clamped to the account total, but as an invariant rather than a
+    patch: no set of audiences reaches more people than there are accounts.
+
+    ``ids`` is required (422 when absent, from FastAPI, identically on both
+    app-state backends). Declared before ``/groups/{group_id}`` so the
+    literal segment is not captured as a group id.
+    """
+    from src.grant_scopes import EVERYONE_TARGET_ID
+
+    wanted = [g.strip() for g in ids.split(",") if g.strip()]
+    account_total = users_repo().count_all()
+    if EVERYONE_TARGET_ID in wanted:
+        return {"count": account_total, "account_total": account_total}
+    members_repo = user_group_members_repo()
+    seen: set[str] = set()
+    for gid in wanted:
+        for m in members_repo.list_members_for_group(gid):
+            uid = m.get("id") or m.get("user_id")
+            if uid:
+                seen.add(str(uid))
+    return {"count": min(len(seen), account_total), "account_total": account_total}
 
 
 @router.get("/groups/{group_id}", response_model=GroupResponse)

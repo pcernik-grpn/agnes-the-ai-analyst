@@ -2982,6 +2982,17 @@ KNOWN_UNTESTED = {
     "POST /api/admin/store/submissions/{submission_id}/override",
     "POST /api/admin/store/submissions/{submission_id}/rescan",
     "POST /api/admin/store/submissions/{submission_id}/retry",
+    # Admin access: reach
+    # groups/reach takes a required `ids` query parameter (a comma-separated
+    # set of audience ids; `everyone` is the scope sentinel), so it is not
+    # parameter-free-GET shaped for this sweep — the same shape as chat-cost
+    # below. Behaviourally covered in tests/test_access_groups_reach.py: the
+    # 422 without `ids` (from FastAPI, so identical on both backends), the
+    # RBAC gate (analyst 403), `everyone` as the account total and dominating
+    # any group beside it, a group's distinct member count, an unknown id
+    # reaching nobody rather than erroring, and the same person in two groups
+    # counted once — the double-count the browser-side union used to make.
+    "GET /api/admin/groups/reach",
     # Admin telemetry
     # chat-cost takes a `window` (and optional `user`) query parameter and is
     # admin-gated, so it is not parameter-free-GET shaped for this sweep.

@@ -2839,6 +2839,7 @@
   "use strict";
 
   const GRANTS_API = "/api/admin/grants";
+  const REACH_API = "/api/admin/groups/reach"; // distinct people a set of audiences reaches
   const OVERVIEW_API = "/api/admin/access-overview";
   const USERS_LIST_API = "/api/users";        // list + search + single user
   const ADMIN_USERS_API = "/api/admin/users"; // memberships + effective-access
@@ -5018,6 +5019,23 @@
      it is every account by construction, so the answer cannot be larger, and
      the overview deliberately does not ship its roster (see the `member_ids`
      note in app/api/access.py). Everything else unions the real ids. */
+  /* The authoritative reach, from the server, where the memberships are.
+     Memoised by the exact set asked about, so toggling a group off and back
+     on does not re-ask. Resolves to null on any failure so the caller keeps
+     the local estimate rather than painting nothing. */
+  const _reachCache = new Map();
+  function fetchReach(groupIds) {
+    const key = groupIds.slice().sort().join(",");
+    if (!key) return Promise.resolve(0);
+    if (_reachCache.has(key)) return _reachCache.get(key);
+    const p = fetch(`${REACH_API}?ids=${encodeURIComponent(key)}`, { credentials: "include" })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((b) => (b && typeof b.count === "number" ? b.count : null))
+      .catch(() => null);
+    _reachCache.set(key, p);
+    return p;
+  }
+
   function reachOf(groupIds) {
     /* The sentinel is not in `overview.groups` — by design, since it is not
        a group — so it would be silently dropped here and the picker's
@@ -6231,13 +6249,27 @@
       }).join("");
     }
     const n = pickerState.chosen.size;
-    const reach = reachOf([...pickerState.chosen]);
+    const chosen = [...pickerState.chosen];
     // The count says PEOPLE, not groups. "3 groups" hides whether this is a
     // share with four people or four hundred, which is the thing worth
     // knowing before pressing Apply.
-    els.count.textContent = n
-      ? `${n} ${n === 1 ? "group" : "groups"} · ${reach} ${reach === 1 ? "person" : "people"}`
-      : "No group selected";
+    const line = (reach) => `${n} ${n === 1 ? "group" : "groups"} · ${reach} ${reach === 1 ? "person" : "people"}`;
+    /* Painted twice on purpose. The local estimate lands instantly so the
+       footer never blanks while a request is in flight; the server's answer
+       replaces it when it arrives, and only if the selection is still the
+       one it was asked about. The estimate can be wrong — it double-counts a
+       person in two groups whose rosters the payload did not carry — which
+       is why it does not get the last word at the moment of deciding.
+       (Audit E3.) */
+    els.count.textContent = n ? line(reachOf(chosen)) : "No group selected";
+    if (n) {
+      const asked = chosen.slice().sort().join(",");
+      fetchReach(chosen).then((count) => {
+        if (count == null) return;                       // server unreachable: the estimate stands
+        if ([...pickerState.chosen].sort().join(",") !== asked) return;   // selection moved on
+        els.count.textContent = line(count);
+      });
+    }
     paintPickerTier();
     els.apply.disabled = !n;
     els.apply.textContent = n ? `Share with ${n} ${n === 1 ? "group" : "groups"}` : "Apply";

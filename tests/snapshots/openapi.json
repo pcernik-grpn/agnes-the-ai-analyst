@@ -21178,6 +21178,75 @@
         ]
       }
     },
+    "/api/admin/groups/reach": {
+      "get": {
+        "description": "How many distinct people a set of audiences reaches.\n\nThe Access page prints this number at the moment an admin decides to\nshare \u2014 \"3 groups \u00b7 41 people\" beside Apply \u2014 and it used to compute it\nin the browser by unioning each group's member ids, which meant every\ngroup's full roster travelled in the overview payload to support one\narithmetic operation (audit findings E3 and S2). A group whose roster the\npayload did not carry fell back to its own count, double-counting anyone\nin two such groups, and the result was then clamped to the account total\nto hide the overshoot. A figure precise enough to be trusted and not\nalways right, on the screen where reach is being decided.\n\nComputed here instead, where the memberships are. ``everyone`` \u2014 the\nscope sentinel, not a group \u2014 short-circuits to the account total: it is\nevery account by construction, so no union can exceed it and none is\nneeded. Ordinary groups union their distinct member ids. The answer is\nstill clamped to the account total, but as an invariant rather than a\npatch: no set of audiences reaches more people than there are accounts.\n\n``ids`` is required (422 when absent, from FastAPI, identically on both\napp-state backends). Declared before ``/groups/{group_id}`` so the\nliteral segment is not captured as a group id.",
+        "operationId": "groups_reach_api_admin_groups_reach_get",
+        "parameters": [
+          {
+            "description": "Comma-separated group ids; `everyone` means every account",
+            "in": "query",
+            "name": "ids",
+            "required": true,
+            "schema": {
+              "description": "Comma-separated group ids; `everyone` means every account",
+              "title": "Ids",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Groups Reach Api Admin Groups Reach Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Groups Reach",
+        "tags": [
+          "access"
+        ]
+      }
+    },
     "/api/admin/groups/{group_id}": {
       "delete": {
         "operationId": "delete_group_api_admin_groups__group_id__delete",
