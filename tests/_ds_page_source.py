@@ -32,7 +32,7 @@ TEMPLATE = _WEB / "templates" / "admin_data_sources.html"
 #: slice of the inline block moves out — that is the whole maintenance cost.
 _LOADED = (
     _WEB / "static" / "js" / "ds_helpers.js",
-    _WEB / "static" / "js" / "ds_add_data_wizard.js",
+    _WEB / "static" / "js" / "ds_page.js",
 )
 
 #: Markup the page pulls in with `{% include %}`. Tests assert on the wizard's
@@ -40,15 +40,39 @@ _LOADED = (
 #: together, so both have to come back together.
 _INCLUDED = (_WEB / "templates" / "_add_data_wizard.html",)
 
+#: The page's stylesheet, moved out of its three inline <style> blocks for the
+#: same reason as the script — the builder needs those rules for the wizard
+#: drawer. Appended for assertions about CSS, which used to read the template.
+_STYLES = (_WEB / "static" / "css" / "ds_page.css",)
+
 
 def page_source() -> str:
     """Template text with every classic script it loads appended."""
     parts = [TEMPLATE.read_text(encoding="utf-8")]
     parts.extend(p.read_text(encoding="utf-8") for p in _INCLUDED if p.exists())
     parts.extend(p.read_text(encoding="utf-8") for p in _LOADED if p.exists())
+    parts.extend(p.read_text(encoding="utf-8") for p in _STYLES if p.exists())
     return "\n".join(parts)
 
 
 def template_text() -> str:
     """The template alone — for assertions about MARKUP, not about script."""
     return TEMPLATE.read_text(encoding="utf-8")
+
+
+def scripts_only() -> str:
+    """Just the classic scripts the page loads, concatenated."""
+    return "\n".join(p.read_text(encoding="utf-8") for p in _LOADED if p.exists())
+
+
+def rendered_with_scripts(html: str) -> str:
+    """A FETCHED page plus the classic scripts it loads.
+
+    Some tests GET the page over a TestClient and then assert on script
+    content — which worked while the script was inline and silently stops
+    meaning anything once it moves into a file. Appending the loaded files
+    keeps those assertions honest without pretending the script is still in
+    the markup, and leaves assertions about SERVER-RENDERED values (which
+    only exist in the response) working as they were.
+    """
+    return html + "\n" + scripts_only()

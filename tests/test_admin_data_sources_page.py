@@ -51,8 +51,8 @@ class TestDataSourcesPageAuth:
         finally:
             c.cookies.clear()
             _reset_ephemeral_key_for_tests()
-        assert resp.status_code == 200, resp.text
-        body = resp.text
+        assert resp.status_code == 200, _ds_page_source.rendered_with_scripts(resp.text)
+        body = _ds_page_source.rendered_with_scripts(resp.text)
 
         # Hero + nav-distinguishing copy (#755 acceptance: data vs MCP sources
         # legible from the page itself).
@@ -181,7 +181,7 @@ class TestDataSourcesPageVaultBanner:
             c.cookies.clear()
             _reset_ephemeral_key_for_tests()
         assert resp.status_code == 200
-        body = resp.text
+        body = _ds_page_source.rendered_with_scripts(resp.text)
         assert "Vault key not configured" in body
         assert "AGNES_VAULT_KEY" in body
         # The "add" flow is disabled without a vault key.
@@ -199,7 +199,7 @@ class TestDataSourcesPageVaultBanner:
             c.cookies.clear()
             _reset_ephemeral_key_for_tests()
         assert resp.status_code == 200
-        body = resp.text
+        body = _ds_page_source.rendered_with_scripts(resp.text)
         assert "Vault key not configured" not in body
         assert 'id="ds-add-btn" disabled' not in body
 
@@ -229,7 +229,7 @@ class TestDataSourcesPageCarriesNoSemanticStatusStrip:
         c = seeded_app["client"]
         resp = c.get("/admin/data-sources", headers=_auth(seeded_app["admin_token"]))
         assert resp.status_code == 200
-        return resp.text
+        return _ds_page_source.rendered_with_scripts(resp.text)
 
     def test_no_band_when_nothing_synced_yet(self, seeded_app):
         body = self._body(seeded_app)
@@ -343,10 +343,12 @@ class TestAddDataWizard:
 
     def _page(self, seeded_app) -> str:
         c = seeded_app["client"]
-        return c.get(
-            "/admin/data-sources",
-            headers={"Authorization": f"Bearer {seeded_app['admin_token']}"},
-        ).text
+        return _ds_page_source.rendered_with_scripts(
+            c.get(
+                "/admin/data-sources",
+                headers={"Authorization": f"Bearer {seeded_app['admin_token']}"},
+            ).text
+        )
 
     def test_the_four_steps_are_declared(self, seeded_app):
         body = self._page(seeded_app)
@@ -517,10 +519,12 @@ class TestAddDataConnectorPicker:
 
     def _page(self, seeded_app) -> str:
         c = seeded_app["client"]
-        return c.get(
-            "/admin/data-sources",
-            headers={"Authorization": f"Bearer {seeded_app['admin_token']}"},
-        ).text
+        return _ds_page_source.rendered_with_scripts(
+            c.get(
+                "/admin/data-sources",
+                headers={"Authorization": f"Bearer {seeded_app['admin_token']}"},
+            ).text
+        )
 
     def test_all_four_connectors_are_offered(self, seeded_app):
         body = self._page(seeded_app)
@@ -701,11 +705,18 @@ class TestSourcePipelineStrip:
             "/admin/data-sources",
             headers={"Authorization": f"Bearer {seeded_app['admin_token']}"},
         ).text
-        assert "SOURCE_PIPELINES" in body
-        assert "_pipelineStripHtml" in body
-        # Each cell routes to the page owning that stage.
+        # The strip data is server-rendered into the boot object the page
+        # script reads (`DS_BOOT`), not into a Jinja-interpolated `let` — so
+        # this still asserts what it always did: that the SERVER shipped it.
+        assert "sourcePipelines" in body
+        assert "DS_BOOT" in body
+        # The renderer that consumes it lives in the loaded script.
+        assert "_pipelineStripHtml" in _ds_page_source.scripts_only()
+        # Each cell routes to the page owning that stage. The cells are built
+        # by the strip renderer, so their hrefs live in the loaded script.
+        script = _ds_page_source.scripts_only()
         for href in ("/admin/tables", "/admin/sync", "/admin/semantic-layer", "/admin/data-packages"):
-            assert href in body
+            assert href in script
 
 
 class TestSemanticLayerCellNoTokenAction:
@@ -899,7 +910,9 @@ class TestSourcesIsEveryConnector:
         ).text
         # The Keboola-only filter is gone, and the derived cards ride along.
         assert "source_type=keboola" not in body
-        assert "DERIVED_SOURCES" in body
+        # Server-rendered into the boot object — see the note in
+        # test_the_page_serves_the_strip_data.
+        assert "derivedSources" in body
         # One heading, one CTA, both connector-agnostic.
         assert "Connected sources" in body
         assert "+ Add source" in body
@@ -3210,7 +3223,7 @@ class TestSourcePipelinesEndpoint:
         )
         try:
             resp = self._get(seeded_app, seeded_app["admin_token"])
-            assert resp.status_code == 200, resp.text
+            assert resp.status_code == 200, _ds_page_source.rendered_with_scripts(resp.text)
             body = resp.json()
             assert conn_id in body
             assert set(body[conn_id]) == {"tables", "sync", "semantic", "feeds"}
@@ -3315,7 +3328,7 @@ class TestSourceCardRefreshWiring:
         return rest[: nxt.start()] if nxt else rest
 
     def _page(self, seeded_app) -> str:
-        return (
+        return _ds_page_source.rendered_with_scripts(
             seeded_app["client"]
             .get(
                 "/admin/data-sources",

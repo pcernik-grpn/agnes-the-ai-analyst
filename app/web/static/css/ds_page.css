@@ -1,0 +1,1200 @@
+/* The Data section's own stylesheet: source cards, the Add-data wizard
+ * drawer, the SharePoint drawer, the extraction panel.
+ *
+ * Moved out of admin_data_sources.html's three inline <style> blocks
+ * verbatim, and shared with the data-package builder — which loads it for
+ * the wizard drawer alone. Of the 144 ds-/so- classes that drawer uses, 118
+ * were defined only inside that page, so the markup and the script could
+ * move out and still arrive somewhere else unstyled.
+ *
+ * Design-system rules are unchanged and still apply: --ds-* tokens only, no
+ * raw hex, theming via [data-theme]. Nothing here was rewritten; if a rule
+ * looks wrong, it looked that way in the template too.
+ */
+  .ds-page {
+    font-family: var(--font-primary, 'Inter', system-ui, -apple-system, BlinkMacSystemFont, sans-serif);
+  }
+
+  /* The vault-key banner, the semantic-layer line, the section head and the
+     closing footnote are the SHARED admin page vocabulary now (`.apg-strip`,
+     `.apg-sechead`, `.apg-foot` in css/admin_page.css, loaded by the admin
+     bases) — People, Data and Access each carried a private copy of the same
+     objects. What is left in this block is this page's own: the connection
+     cards, the pipeline strips and the Add-data wizard. */
+
+  /* Storage token and master token resolving to different projects — the fix
+     belongs on this page, so the warning does too. */
+  /* `display:flex` beats the UA sheet's `[hidden] { display: none }`, so
+     without this the empty warning strip rendered under EVERY Keboola
+     connection card — an orange band warning about nothing. (Devin Review.) */
+  .ds-token-mismatch[hidden] { display: none; }
+  .ds-token-mismatch {
+    display: flex; gap: 8px; align-items: flex-start;
+    margin: 10px 16px; padding: 8px 10px; border-radius: 8px;
+    font-size: 12px; line-height: 1.5;
+    background: var(--ds-accent-warn-bg);
+    border: 1px solid var(--ds-accent-warn-line);
+    color: var(--ds-accent-warn-ink);
+  }
+
+  .ds-empty, .ds-loading {
+    text-align: center; padding: 28px 20px;
+    font-size: 13px; color: var(--text-secondary, var(--ds-text-secondary));
+    background: var(--surface, var(--ds-surface));
+    border: 1px solid var(--border, var(--ds-border));
+    border-radius: 10px;
+  }
+
+  /* ── The source card ───────────────────────────────────────────────────
+     Three bands, in the order an admin reads them:
+
+       head    who this source is, whether it is well, and the verbs
+       pipe    what it has produced and who is getting it   (`.ds-pipe`)
+       body    the settings and the inline tasks — CLOSED by default
+
+     It used to be five stacked bands, every one of them always open: an
+     identity row, the strip, a chat-tools row, a five-button action strip,
+     and a master-token row, plus two hidden input rows that pushed the next
+     card down when they appeared. Nothing was subordinate to anything, so
+     scanning a list of three projects meant reading ~40 controls to find the
+     one amber word among them. The move is not removal — every control is
+     still here — it is RANK: status and the two verbs an admin uses weekly
+     stay on the head; the rest is one click away in the body or the menu,
+     which is where a control that is touched twice a year belongs. */
+  .ds-src {
+    background: var(--surface, var(--ds-surface));
+    border: 1px solid var(--border, var(--ds-border));
+    border-radius: 12px;
+    box-shadow: var(--ds-shadow-sm);
+    margin-bottom: 12px;
+    overflow: hidden;
+  }
+  .ds-src:focus-within { border-color: var(--ds-text-muted); }
+
+  .ds-src__head {
+    display: flex; align-items: center; gap: 12px;
+    padding: 13px 14px 13px 16px;
+  }
+  /* The whole head toggles the body, so it takes the pointer — but the
+     KEYBOARD path is the caret button alone, never a click handler on a
+     div. */
+  .ds-src__head { cursor: pointer; }
+  .ds-src__head:hover { background: var(--ds-surface-dim); }
+
+  /* The connector's mark. The categorical "sticker" palette (--ds-kind-*),
+     never the brand primary: a connector is a KIND, and a tile in the action
+     colour would read as something to press. */
+  .ds-src__logo {
+    width: 34px; height: 34px; border-radius: 9px; flex: 0 0 auto;
+    display: inline-flex; align-items: center; justify-content: center;
+    font-size: 12px; font-weight: 800; letter-spacing: 0.02em;
+  }
+  .ds-src__logo--keboola    { background: var(--ds-kind-data-soft); color: var(--ds-kind-data); }
+  .ds-src__logo--bigquery    { background: var(--ds-accent-info-bg); color: var(--ds-accent-info-ink); }
+  .ds-src__logo--snowflake   { background: var(--ds-accent-info-bg); color: var(--ds-accent-info-ink); }
+  .ds-src__logo--databricks  { background: var(--ds-accent-info-bg); color: var(--ds-accent-info-ink); }
+  .ds-src__logo--jira        { background: var(--ds-kind-plugin-soft); color: var(--ds-kind-plugin); }
+  .ds-src__logo--local       { background: var(--ds-kind-file-soft); color: var(--ds-kind-file); }
+  .connector-logo { width: 60%; height: 60%; display: block; }
+
+  .ds-src__id { min-width: 0; flex: 1 1 auto; }
+  .ds-src__name {
+    display: flex; align-items: center; gap: 8px;
+    font-size: 14.5px; font-weight: 700; letter-spacing: -0.01em;
+    color: var(--text-primary, var(--ds-text-primary));
+  }
+  .ds-src__name > span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* Identity, not status: which project the CLI and the sync reach for when
+     nobody names one. Quiet — it is a fact about this row, not a warning. */
+  .ds-src__tag {
+    flex: 0 0 auto;
+    font-size: 10.5px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase;
+    padding: 2px 7px; border-radius: var(--ds-radius-pill);
+    background: var(--ds-surface-sunken); color: var(--ds-text-secondary);
+  }
+  /* ONE subtitle line, not three. Host, project and mode were three stacked
+     11px lines saying one thing — where this source is — so they are one
+     line with middots, and it truncates from the end where the least
+     identifying part sits. */
+  .ds-src__sub {
+    margin-top: 2px;
+    font-size: 12px; line-height: 1.4;
+    color: var(--ds-text-muted);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .ds-src__sub code {
+    font-family: var(--font-mono, ui-monospace, monospace);
+    font-size: 11.5px; color: var(--ds-text-secondary);
+  }
+
+  /* The card's ONE status word. Folded from the strip below it (see
+     `_sourceHealth`), so the reader gets the verdict before the evidence and
+     can skip a healthy card entirely. */
+  .ds-src__health {
+    flex: 0 0 auto;
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 11.5px; font-weight: 700; white-space: nowrap;
+    padding: 3px 10px; border-radius: var(--ds-radius-pill);
+    border: 1px solid transparent;
+  }
+  .ds-src__health::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+  .ds-src__health.is-ok   { background: var(--ds-accent-success-bg); color: var(--ds-accent-success-ink); border-color: var(--ds-accent-success-line); }
+  .ds-src__health.is-warn { background: var(--ds-accent-warn-bg);    color: var(--ds-accent-warn-ink);    border-color: var(--ds-accent-warn-line); }
+  .ds-src__health.is-err  { background: var(--ds-accent-danger-bg);  color: var(--ds-accent-danger-ink);  border-color: var(--ds-accent-danger-line); }
+
+  .ds-src__acts { flex: 0 0 auto; display: flex; align-items: center; gap: 6px; }
+  /* Icon-only and circular, so it is a badge-shaped control rather than a
+     third button competing with the two labelled ones beside it. 28px keeps
+     it above the 24px target minimum. */
+  .ds-src__caret {
+    width: 28px; height: 28px; padding: 0; flex: 0 0 auto;
+    display: inline-flex; align-items: center; justify-content: center;
+    border: 1px solid transparent; border-radius: var(--ds-radius-pill);
+    background: transparent; color: var(--ds-text-muted); cursor: pointer;
+  }
+  .ds-src__caret:hover { background: var(--ds-surface-sunken); color: var(--ds-text-primary); }
+  .ds-src__caret:focus-visible { outline: var(--ds-focus-outline); outline-offset: var(--ds-focus-outline-offset); }
+  .ds-src__caret .ui-ico { transition: transform var(--ds-motion-fast, 140ms) var(--ds-ease-standard, ease); }
+  .ds-src__caret[aria-expanded="true"] .ui-ico { transform: rotate(90deg); }
+  @media (prefers-reduced-motion: reduce) { .ds-src__caret .ui-ico { transition: none; } }
+
+  /* ── The body: settings + the inline tasks the menu opens ──────────── */
+  .ds-src__body { border-top: 1px solid var(--border, var(--ds-border)); }
+  .ds-src__body[hidden] { display: none; }
+  .ds-src__facts { margin: 0; padding: 4px 16px; }
+  /* Label · state · the control that changes it. The label column is fixed
+     so three rows read as a table of settings rather than three sentences. */
+  .ds-src__fact {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    padding: 9px 0;
+    border-bottom: 1px solid var(--border-light, var(--ds-border-light));
+    font-size: 13px;
+  }
+  .ds-src__fact:last-child { border-bottom: none; }
+  .ds-src__fact-k {
+    flex: 0 0 190px; color: var(--ds-text-secondary);
+  }
+  .ds-src__fact-v { flex: 1 1 auto; min-width: 0; display: flex; align-items: center; gap: 8px; }
+  .ds-src__fact-a { flex: 0 0 auto; display: flex; align-items: center; gap: 6px; }
+  .ds-src__fact-a .btn { padding: 4px 11px; font-size: 12.5px; }
+  @media (max-width: 640px) { .ds-src__fact-k { flex-basis: 100%; } }
+
+  .ds-badge {
+    display: inline-flex; align-items: center; gap: 5px;
+    font-size: 11px; font-weight: 600; letter-spacing: 0.03em;
+    text-transform: uppercase; padding: 3px 8px; border-radius: 6px;
+  }
+  .ds-badge::before { content: ''; display: inline-block; width: 6px; height: 6px; border-radius: 50%; }
+  .ds-badge.badge-env   { background: var(--ds-accent-success-bg); color: var(--ds-accent-success-ink); }
+  .ds-badge.badge-env::before   { background: var(--ds-accent-success-ink); }
+  .ds-badge.badge-vault { background: var(--ds-accent-info-bg); color: var(--ds-accent-info-ink); }
+  .ds-badge.badge-vault::before { background: var(--ds-accent-info-line); }
+  .ds-badge.badge-unset { background: var(--border-light, var(--ds-surface-dim)); color: var(--text-secondary, var(--ds-text-secondary)); }
+  .ds-badge.badge-unset::before { background: var(--ds-text-muted); }
+  .ds-badge.badge-default { background: var(--ds-accent-info-bg); color: var(--ds-accent-info-ink); }
+  .ds-badge.badge-default::before { background: var(--ds-accent-info-line); }
+  /* Certificate expiry status (spec: catch a silently expiring certificate
+     before auth breaks) — reuses the same success/warn/danger accent tokens
+     the health chip and pipeline strip already use. ``badge-warn`` is ALSO
+     "anonymization requested" (a wizard checkbox with nothing declared yet,
+     spec §9.2/§13.2) — same warn tone, distinct from ``badge-env``'s
+     success tone used once a run actually declares it. */
+  .ds-badge.badge-ok     { background: var(--ds-accent-success-bg); color: var(--ds-accent-success-ink); }
+  .ds-badge.badge-ok::before     { background: var(--ds-accent-success-ink); }
+  .ds-badge.badge-warn   { background: var(--ds-accent-warn-bg);    color: var(--ds-accent-warn-ink); }
+  .ds-badge.badge-warn::before   { background: var(--ds-accent-warn-line); }
+  .ds-badge.badge-danger { background: var(--ds-accent-danger-bg);  color: var(--ds-accent-danger-ink); }
+  .ds-badge.badge-danger::before { background: var(--ds-accent-danger-line); }
+  /* The file-source card's error-category badges are BUTTONS (they open the
+     filtered drawer, spec §13.2) — normalize away the browser's default
+     button chrome so a clickable badge still reads as a badge. */
+  button.ds-badge { font: inherit; border: none; cursor: pointer; }
+  button.ds-badge:disabled { cursor: default; opacity: 0.55; }
+  button.ds-badge:focus-visible { outline: var(--ds-focus-outline); outline-offset: 1px; }
+
+  /* File-source error drawer (spec §13.2): the itemized rows for whichever
+     error badge is active. */
+  .ds-filesource-drawer { margin: 4px 16px 8px; }
+  .ds-filesource-drawer__list {
+    margin: 0; padding: 0; list-style: none;
+    border: 1px solid var(--border, var(--ds-border));
+    border-radius: 8px; overflow: hidden;
+  }
+  .ds-filesource-drawer__list li {
+    padding: 6px 12px; font-size: 12.5px;
+    border-bottom: 1px solid var(--border-light, var(--ds-border-light));
+  }
+  .ds-filesource-drawer__list li:last-child { border-bottom: none; }
+
+  /* The Test verdict. It reports on the whole card, so it lands at the top
+     of the body under the fact it is about, not floating after a button in
+     a strip that no longer exists. */
+  .ds-conn-test-result {
+    font-size: 12.5px; display: none; align-items: center; gap: 6px;
+    padding: 8px 16px;
+    border-bottom: 1px solid var(--border-light, var(--ds-border-light));
+  }
+  .ds-conn-test-result.show { display: flex; }
+  .ds-conn-test-result.ok   { color: var(--ds-accent-success-ink); background: var(--ds-accent-success-bg); }
+  .ds-conn-test-result.fail { color: var(--ds-accent-danger-ink); background: var(--ds-accent-danger-bg); }
+
+  /* Inline token rotate row */
+  .ds-rotate-row {
+    display: none; align-items: center; flex-wrap: wrap; gap: 8px;
+    padding: 10px 16px;
+    border-top: 1px solid var(--border-light, var(--ds-border-light));
+    background: var(--ds-surface-dim);
+  }
+  .ds-rotate-row.show { display: flex; }
+  .ds-rotate-row input {
+    flex: 1; padding: 7px 10px;
+    border-radius: 8px; border: 1px solid var(--border, var(--ds-border));
+    background: var(--surface, var(--ds-surface)); color: var(--text-primary, var(--ds-text-primary));
+    font-size: 12px; font-family: var(--font-mono, ui-monospace, monospace);
+  }
+  .ds-rotate-row input:focus { outline: 2px solid var(--ds-primary, var(--ds-primary)); outline-offset: -1px; }
+  /* A run-options checkbox (e.g. "Re-process everything") is not a text
+     field — override the generic `input` rule above so it renders as a
+     normal checkbox instead of stretching to fill the flex row. */
+  .ds-rotate-row input[type="checkbox"] {
+    flex: 0 0 auto; width: 15px; height: 15px; padding: 0;
+    accent-color: var(--ds-primary);
+  }
+  .ds-rotate-row textarea {
+    flex: 1; padding: 7px 10px; resize: vertical;
+    border-radius: 8px; border: 1px solid var(--border, var(--ds-border));
+    background: var(--surface, var(--ds-surface)); color: var(--text-primary, var(--ds-text-primary));
+    font-size: 12px; font-family: var(--font-mono, ui-monospace, monospace);
+  }
+  .ds-rotate-row textarea:focus { outline: 2px solid var(--ds-primary, var(--ds-primary)); outline-offset: -1px; }
+
+  /* SharePoint card: "Scope collections" — clickable rows into the connect
+     wizard, bound to this connection (spec follow-up, TCRD-240/241: "make
+     it clickable" rather than wizard-only). */
+  .ds-sp-scopes { list-style: none; margin: 4px 0 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+  .ds-sp-scope-row {
+    display: flex; align-items: center; gap: 8px; width: 100%;
+    padding: 6px 10px; border: 1px solid var(--ds-border); border-radius: var(--ds-radius-btn);
+    background: var(--ds-surface); cursor: pointer; text-align: left; font: inherit;
+  }
+  .ds-sp-scope-row:hover { background: var(--ds-surface-sunken); border-color: var(--ds-primary); }
+  .ds-sp-scope-row__path { flex: 1 1 auto; min-width: 0; font-size: 12.5px; color: var(--ds-text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  /* File-source "Last run" drawer rows — each rejection's human subline
+     under its resolved name/collection (or fallback sha16). */
+  .ds-filesource-drawer__list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+  .ds-filesource-drawer__list li {
+    padding: 8px 10px; border: 1px solid var(--ds-border); border-radius: var(--ds-radius-btn);
+    background: var(--ds-surface); font-size: 12.5px; color: var(--ds-text-primary);
+  }
+  .ds-filesource-drawer__reason { margin-top: 4px; font-size: 11.5px; color: var(--ds-text-muted); line-height: 1.4; }
+
+  /* Table-browse panel (inline, per connection card) */
+  .ds-browse-panel {
+    display: none;
+    border-top: 1px solid var(--border-light, var(--ds-border-light));
+    padding: 14px 16px;
+    background: var(--ds-surface-dim);
+  }
+  .ds-browse-panel.show { display: block; }
+
+  /* ── Bucket/table picker ───────────────────────────────────────────────
+     A Keboola project routinely lists 40+ buckets and hundreds of tables.
+     Rendering that flat made step 2 a scroll marathon where the admin lost
+     both "where am I" and "what have I picked", so the unit of navigation is
+     the BUCKET: closed by default, one line each, and openable one at a time.
+     The bucket's own checkbox is the bulk gesture (a whole bucket is the
+     common intent), the tri-state tells the truth about partial picks, and
+     the per-table checkboxes underneath keep the granular case. The filter
+     and the running count are what make it survive a big project — the count
+     is always over the WHOLE picker, never over what the filter happens to
+     show, so nothing is silently registered or silently dropped. */
+  .ds-picker-bar {
+    position: sticky; top: 0; z-index: 2;
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    padding: 8px 0 10px;
+    margin-bottom: 8px;
+    background: var(--surface, var(--ds-surface));
+    border-bottom: 1px solid var(--border-light, var(--ds-border-light));
+  }
+  .ds-browse-panel .ds-picker-bar { background: var(--ds-surface-dim); }
+  .ds-picker-search {
+    flex: 1 1 200px; min-width: 140px;
+    padding: 6px 10px; font: inherit; font-size: 12.5px;
+    border: 1px solid var(--border, var(--ds-border)); border-radius: 8px;
+    background: var(--surface, var(--ds-surface)); color: var(--ds-text-primary);
+  }
+  .ds-picker-search:focus-visible {
+    outline: var(--ds-focus-outline); outline-offset: var(--ds-focus-outline-offset);
+  }
+  .ds-picker-count {
+    font-size: 12px; font-weight: 600; color: var(--ds-text-secondary);
+    font-variant-numeric: tabular-nums;
+  }
+  .ds-picker-count .hid { font-weight: 500; color: var(--ds-accent-warn-ink); }
+  .ds-picker-link {
+    font: inherit; font-size: 12px; font-weight: 600;
+    padding: 4px 8px; border-radius: var(--ds-radius-btn);
+    border: 1px solid transparent; background: none; cursor: pointer;
+    color: var(--ds-primary-dark, var(--ds-primary));
+  }
+  .ds-picker-link:hover { background: var(--ds-surface-sunken); }
+  .ds-picker-link[disabled] { opacity: 0.45; cursor: default; background: none; }
+  .ds-picker-link:focus-visible {
+    outline: var(--ds-focus-outline); outline-offset: var(--ds-focus-outline-offset);
+  }
+
+  .ds-bucket-group {
+    margin-bottom: 6px;
+    border: 1px solid var(--border-light, var(--ds-border-light));
+    border-radius: 10px;
+    background: var(--surface, var(--ds-surface));
+    overflow: hidden;
+  }
+  .ds-bucket-group:last-child { margin-bottom: 0; }
+  .ds-bucket-group[hidden] { display: none; }
+  .ds-bucket-group.is-open { border-color: var(--border, var(--ds-border)); }
+  .ds-bucket-hd {
+    display: flex; align-items: center; gap: 8px;
+    padding: 8px 10px;
+  }
+  .ds-bucket-group.is-open .ds-bucket-hd {
+    border-bottom: 1px solid var(--border-light, var(--ds-border-light));
+    background: var(--ds-surface-dim);
+  }
+  .ds-bucket-check { flex: 0 0 auto; margin: 0; cursor: pointer; }
+  .ds-bucket-toggle {
+    flex: 1; min-width: 0;
+    display: flex; align-items: center; gap: 7px;
+    padding: 2px 0; border: none; background: none; cursor: pointer;
+    font: inherit; text-align: left; color: var(--ds-text-primary);
+  }
+  .ds-bucket-toggle:focus-visible {
+    outline: var(--ds-focus-outline); outline-offset: var(--ds-focus-outline-offset);
+  }
+  .ds-bucket-caret {
+    flex: 0 0 auto; width: 12px; color: var(--ds-text-muted);
+    font-size: 10px; line-height: 1;
+    transition: transform 0.12s ease;
+  }
+  .ds-bucket-group.is-open .ds-bucket-caret { transform: rotate(90deg); }
+  .ds-bucket-title {
+    font-size: 12px; font-weight: 600; color: var(--text-primary, var(--ds-text-primary));
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .ds-bucket-stage {
+    flex: 0 0 auto;
+    font-size: 10px; text-transform: uppercase; letter-spacing: 0.03em;
+    color: var(--text-secondary, var(--ds-text-secondary));
+    background: var(--border-light, var(--ds-surface-dim)); border-radius: 4px; padding: 1px 6px;
+  }
+  .ds-bucket-meta {
+    margin-left: auto; flex: 0 0 auto;
+    font-size: 11.5px; color: var(--ds-text-muted);
+    font-variant-numeric: tabular-nums;
+  }
+  .ds-bucket-meta .on {
+    color: var(--ds-primary-dark, var(--ds-primary)); font-weight: 700;
+  }
+  .ds-bucket-tables { padding: 4px 10px 8px 30px; }
+  .ds-bucket-tables[hidden] { display: none; }
+  .ds-table-row {
+    display: flex; align-items: center; gap: 8px;
+    padding: 6px 4px; font-size: 12px;
+    border-radius: 6px;
+  }
+  .ds-table-row[hidden] { display: none; }
+  .ds-table-row:hover { background: var(--border-light, var(--ds-surface-dim)); }
+  .ds-table-row label { flex: 1; cursor: pointer; display: flex; align-items: center; gap: 8px; min-width: 0; }
+  .ds-table-name { color: var(--text-primary, var(--ds-text-primary)); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ds-table-name-input {
+    flex: 1; min-width: 0; font: inherit; font-size: 12px; padding: 2px 6px;
+    border: 1px solid var(--ds-accent-warn-line); border-radius: 6px;
+    background: var(--surface, var(--ds-surface)); color: var(--text-primary, var(--ds-text-primary));
+  }
+  .ds-table-name-input:focus-visible {
+    outline: var(--ds-focus-outline); outline-offset: var(--ds-focus-outline-offset);
+  }
+  .ds-table-rows { color: var(--text-secondary, var(--ds-text-secondary)); flex-shrink: 0; font-variant-numeric: tabular-nums; }
+  .ds-table-mode {
+    font: inherit; font-size: 11px; padding: 2px 6px;
+    border: 1px solid var(--border, var(--ds-border)); border-radius: 6px;
+    background: var(--surface, var(--ds-surface)); color: var(--text-secondary, var(--ds-text-secondary));
+  }
+  /* Show/hide toggling and the flex-item sizing that used to live on
+     .ds-table-mode both move to this wrapper — the paired .ds-dropdown
+     (paper theme) needs the same visibility as the native select, and
+     giving both elements the SAME class here would also hand the select's
+     decorative rules above (font-size, border, background) to the
+     .ds-dropdown wrapper, fighting its own ds_dropdown.css layout. */
+  .ds-table-mode-wrap { flex: 0 0 auto; display: none; align-items: center; gap: 4px; }
+  .ds-table-row.is-sel .ds-table-mode-wrap { display: inline-flex; }
+  .ds-table-status { font-size: 11px; flex-shrink: 0; min-width: 90px; text-align: right; }
+  .ds-table-status.ok { color: var(--ds-accent-success-ink); }
+  .ds-table-status.fail { color: var(--ds-accent-danger-ink); }
+  .ds-browse-actions {
+    display: flex; align-items: center; gap: 8px; margin-top: 10px;
+    padding-top: 10px; border-top: 1px solid var(--border, var(--ds-border));
+  }
+  .ds-browse-error { font-size: 12px; color: var(--ds-accent-danger-ink); }
+  .ds-scope-note {
+    font-size: 12px;
+    color: var(--ds-accent-info-ink);
+    background: var(--ds-accent-info-bg);
+    border-radius: 6px;
+    padding: 6px 10px;
+    margin-bottom: 10px;
+  }
+
+  /* The wizard's chrome — overlay, panel, steps strip, actions row — is the
+     shared drawer (css/drawer.css). What was ~60 lines of page-local modal
+     CSS here is gone; only the pane switch below is this page's, because
+     the wizard drives it by id rather than by the drawer's own class. */
+  .ds-wizard-lede { margin: 0 0 12px; font-size: 13px; color: var(--ds-text-secondary); }
+
+  /* ── Step 1: connector picker ── */
+  .ds-srcpick {
+    display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px;
+    margin-bottom: 16px;
+  }
+  @media (max-width: 640px) { .ds-srcpick { grid-template-columns: 1fr 1fr; } }
+  .ds-srcopt {
+    display: flex; flex-direction: column; align-items: flex-start; gap: 4px;
+    padding: 10px 12px; text-align: left; cursor: pointer;
+    border: 1px solid var(--border, var(--ds-border)); border-radius: 10px;
+    background: var(--surface, var(--ds-surface)); color: var(--ds-text-primary);
+  }
+  .ds-srcopt:hover { border-color: var(--ds-text-muted); }
+  .ds-srcopt.on {
+    border-color: var(--ds-primary);
+    background: var(--ds-primary-light, rgba(2, 132, 199, 0.08));
+    box-shadow: 0 0 0 1px var(--ds-primary);
+  }
+  .ds-srcopt .so-logo {
+    width: 26px; height: 26px; border-radius: 7px;
+    display: inline-flex; align-items: center; justify-content: center;
+    font-weight: 800; font-size: 12px;
+  }
+  .ds-srcopt .so-logo--kbc  { background: var(--ds-kind-data-soft, #e1f3f1); color: var(--ds-kind-data, #185a57); }
+  .ds-srcopt .so-logo--bq   { background: var(--ds-accent-info-bg); color: var(--ds-accent-info-ink); }
+  .ds-srcopt .so-logo--sf   { background: var(--ds-accent-info-bg); color: var(--ds-accent-info-ink); }
+  .ds-srcopt .so-logo--csv  { background: var(--ds-accent-warn-bg); color: var(--ds-accent-warn-ink); }
+  .ds-srcopt .so-logo--jira { background: var(--ds-kind-plugin-soft, #f2e9fb); color: var(--ds-kind-plugin, #391c57); }
+  .ds-srcopt .so-logo--spo  { background: var(--ds-accent-info-bg); color: var(--ds-accent-info-ink); font-size: 10px; }
+  .ds-srcopt .so-name { font-weight: 700; font-size: 13px; }
+  .ds-srcopt .so-sub { font-size: 11.5px; color: var(--ds-text-muted); line-height: 1.3; }
+
+  /* ── The "already connected" offer ────────────────────────────────────
+     It was a grey utility strip — one line of small secondary text, a bare
+     select and a ghost button — sitting above the form it was meant to save
+     you from filling in. On an instance that is already running it is the
+     path most admins want, and it read as chrome. It is the shared
+     connect-banner bar now (`.cbn--bar`, style-custom.css): the Agnes soft
+     surface, a mark in a lifted tile, a full sentence saying what you are
+     spared, and one filled pill for the action. Same tokens, same radii,
+     same CTA weight the analyst side uses, so the two halves of the product
+     look like one. */
+  .ds-wexisting {
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+    padding: 16px 18px; margin-bottom: 14px;
+    border: none; border-radius: 16px;
+    background: var(--ds-agnes-soft);
+  }
+  /* --ds-agnes-soft is a light-only tint; under the dark theme it keeps a
+     near-white fill while the text tokens flip to near-white too. Tint the
+     current surface instead — the idiom `.cbn` uses for the same reason. */
+  :root[data-theme="dark"] .ds-wexisting {
+    background: color-mix(in srgb, var(--ds-agnes) 18%, var(--ds-surface));
+  }
+  .ds-wexisting[hidden] { display: none; }
+  /* Raw upstream text: available, not shouted. Genuinely useful to whoever
+     escalates it, useless noise to the admin who needs to retype a token. */
+  .ds-errdetail { margin-top: 8px; }
+  .ds-errdetail summary { cursor: pointer; font-size: 12px; color: var(--ds-text-muted); }
+  .ds-errdetail pre {
+    margin: 6px 0 0; padding: 8px 10px; overflow-x: auto;
+    background: var(--ds-surface-dim); border: 1px solid var(--ds-border-light);
+    border-radius: 6px; font-size: 11.5px; white-space: pre-wrap; word-break: break-word;
+  }
+  /* Registered but not usable. The default panel is a success shape — a soft
+     brand fill and a forward CTA — and wearing it for a connection with no
+     token is what let "Keboola is already connected" sit above a dead end.
+     The blocked variant keeps the layout and drops the success signals. */
+  .ds-wexisting.is-blocked {
+    background: var(--ds-accent-warning-bg, #fdf6e3);
+    border: 1px solid var(--ds-accent-warning-ink, #8a5a00);
+  }
+  /* Nothing in this state is selectable, so the picker goes with the CTA —
+     emptying the <select> alone left a working-looking dropdown with no
+     options in it, which reads as a control that failed to load. */
+  .ds-wexisting.is-blocked .ds-wexisting__act { display: none; }
+  .ds-wexisting.is-blocked .ds-wexisting__tile {
+    background: color-mix(in srgb, var(--ds-accent-warning-ink, #8a5a00) 14%, transparent);
+    color: var(--ds-accent-warning-ink, #8a5a00);
+  }
+  /* The connector's own mark, in the connector's own PAIR of tokens — the
+     same `-soft` fill under the same ink the picker's Keboola tile above it
+     uses. A lifted white tile (the `.cbn-bar-icon` look) would have been
+     prettier, but --ds-kind-data is a light-only ink: on the dark theme's
+     surface it measures 2.16:1 and the mark disappears. Both halves of this
+     pair are light-only, so they stay legible together in every theme. */
+  .ds-wexisting__tile {
+    flex-shrink: 0; width: 46px; height: 46px; border-radius: 13px;
+    display: grid; place-items: center;
+    background: var(--ds-kind-data-soft, #e1f3f1);
+    color: var(--ds-kind-data, #185a57);
+    box-shadow: 0 2px 8px color-mix(in srgb, var(--ds-text-primary) 7%, transparent);
+    font-weight: 800; font-size: 13px; letter-spacing: -0.01em;
+  }
+  /* Basis kept well under the sentence's own width: flexbox decides wrapping
+     from the BASIS, so a basis wide enough to read the copy on one line broke
+     the action onto a second row on the very width the drawer opens at. */
+  .ds-wexisting__body { flex: 1 1 200px; min-width: 180px; }
+  .ds-wexisting__title {
+    font-size: 15px; font-weight: 750; letter-spacing: -0.02em; line-height: 1.2;
+    color: var(--ds-text-primary); margin-bottom: 3px;
+  }
+  .ds-wexisting__copy {
+    margin: 0; font-size: 12.5px; line-height: 1.45; color: var(--ds-text-secondary);
+  }
+  .ds-wexisting__act {
+    display: flex; align-items: center; gap: 8px; flex-shrink: 0;
+    margin-left: auto;
+  }
+  .ds-wexisting select {
+    font: inherit; font-size: 12.5px; font-weight: 600; padding: 8px 10px;
+    max-width: 200px;
+    border: 1px solid var(--ds-border); border-radius: var(--ds-radius-btn);
+    background: var(--surface, var(--ds-surface)); color: var(--ds-text-primary);
+  }
+  .ds-wexisting select:focus-visible {
+    outline: var(--ds-focus-outline); outline-offset: var(--ds-focus-outline-offset);
+  }
+  .ds-wexisting__cta {
+    display: inline-flex; align-items: center; gap: 7px; flex-shrink: 0;
+    background: var(--ds-primary); color: var(--ds-text-inverse);
+    border: none; border-radius: var(--ds-radius-pill);
+    padding: 10px 20px; font: inherit; font-size: 14px; font-weight: 650;
+    letter-spacing: -0.01em; cursor: pointer; white-space: nowrap;
+    box-shadow: 0 4px 12px color-mix(in srgb, var(--ds-primary) 25%, transparent);
+    transition: background 0.15s, transform 0.1s;
+  }
+  .ds-wexisting__cta:hover { background: var(--ds-primary-dark); }
+  .ds-wexisting__cta:active { transform: translateY(1px); }
+  .ds-wexisting__cta:focus-visible {
+    outline: var(--ds-focus-outline); outline-offset: var(--ds-focus-outline-offset);
+  }
+  /* Narrow: the mark stays BESIDE the sentence it belongs to — a basis wide
+     enough to keep them on one row at drawer width strands the tile alone on
+     its own line here — and the choose-a-project row takes the full width
+     underneath, where the select can use it. */
+  @media (max-width: 620px) {
+    .ds-wexisting { gap: 12px; }
+    /* Basis ZERO, not auto: `auto` means "as wide as the sentence", which is
+       wider than the phone and strands the mark on a line of its own. */
+    .ds-wexisting__body { flex: 1 1 0; min-width: 0; }
+    /* The choose-a-project row wraps INTERNALLY: a select long enough to hold
+       a project name plus its table count and a button that must not
+       hyphenate do not always fit one phone line, and without this the
+       button was pushed off the side of the drawer entirely. */
+    /* min-width:0 — a flex item's automatic minimum is its MIN-CONTENT, which
+       here is the un-shrinkable button plus the select's own intrinsic width;
+       without this the row refuses to fit and spills past the banner's
+       padding instead. */
+    .ds-wexisting__act { flex: 1 1 100%; min-width: 0; margin-left: 0; flex-wrap: wrap; }
+    .ds-wexisting select { flex: 1 1 150px; min-width: 0; max-width: none; }
+    .ds-wexisting__cta { flex: 1 1 auto; justify-content: center; }
+  }
+
+  /* The two paths are the whole point of this screen — a muted sentence
+     inside the offer box could not carry that, so the "or" is a real rule
+     with the choice written on it. */
+  .ds-wor {
+    display: flex; align-items: center; gap: 12px;
+    margin: 0 0 16px; font-size: 12px; font-weight: 600;
+    letter-spacing: 0.02em; text-transform: uppercase;
+    color: var(--ds-text-muted);
+  }
+  .ds-wor[hidden] { display: none; }
+  .ds-wor::before, .ds-wor::after {
+    content: ""; flex: 1; height: 1px; background: var(--ds-border-light);
+  }
+
+  .ds-wguide {
+    border: 1px solid var(--border, var(--ds-border)); border-radius: 10px;
+    padding: 14px 16px; background: var(--ds-surface-dim);
+  }
+  .ds-wguide h4 { margin: 0 0 8px; font-size: 13.5px; color: var(--ds-text-primary); }
+  .ds-wguide p { margin: 0 0 10px; font-size: 13px; color: var(--ds-text-secondary); }
+  .ds-wguide p:last-child { margin-bottom: 0; }
+  .ds-wguide a { color: var(--ds-primary); }
+
+  .ds-bqcred, .ds-sfcred, .ds-dbxcred { display: flex; align-items: center; gap: 8px; min-height: 26px; }
+
+  /* ── Step 2 (BigQuery): manual rows editor ── */
+  .ds-bqrow, .ds-sfrow { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }
+  .ds-bqrow input, .ds-sfrow input, .ds-sfrow select {
+    flex: 1; font: inherit; font-size: 13px; padding: 7px 10px;
+    border: 1px solid var(--border, var(--ds-border)); border-radius: 8px;
+    background: var(--surface, var(--ds-surface)); color: var(--ds-text-primary);
+  }
+  .ds-bqrow .ds-table-status, .ds-sfrow .ds-table-status { flex: 0 0 auto; }
+  .ds-bqrow button, .ds-sfrow button { flex: 0 0 auto; }
+
+  /* ── Pipeline strip — connected → synced → semantic → feeding whom, on
+        every source card. Four (or three) cells reading across the whole
+        vertical for ONE project; previously this took four pages to
+        assemble. Data: `_source_pipelines()` in app/web/router.py. ── */
+  .ds-pipe {
+    display: grid;
+    border-top: 1px solid var(--border-light, var(--ds-border-light));
+    background: var(--ds-surface-dim);
+  }
+  .ds-pipe--4 { grid-template-columns: repeat(4, 1fr); }
+  .ds-pipe--3 { grid-template-columns: repeat(3, 1fr); }
+  @media (max-width: 700px) { .ds-pipe--4, .ds-pipe--3 { grid-template-columns: 1fr 1fr; } }
+  .ds-pipe__cell {
+    padding: 9px 16px;
+    border-right: 1px solid var(--border-light, var(--ds-border-light));
+    display: flex; flex-direction: column; gap: 2px;
+    font-size: 12px; color: var(--ds-text-secondary);
+    text-decoration: none;
+  }
+  .ds-pipe__cell:last-child { border-right: none; }
+  a.ds-pipe__cell:hover,
+  button.ds-pipe__cell:hover { background: var(--surface, var(--ds-surface)); }
+  /* A cell that DOES something rather than going somewhere — the empty-tables
+     cell, where the fix is to add tables and the Tables page is the one place
+     that cannot. Same cell shape either way: the strip's job is to read as one
+     row of facts, so the verb borrows the fact's clothes and says what it does
+     in words (`Add the first tables →`) instead of in a different shape. */
+  button.ds-pipe__cell {
+    font: inherit; text-align: left; cursor: pointer;
+    border-top: 0; border-bottom: 0; border-left: 0;
+    background: transparent;
+  }
+  button.ds-pipe__cell:focus-visible {
+    outline: var(--ds-focus-outline);
+    outline-offset: calc(var(--ds-focus-outline-offset) * -1);
+  }
+  .ds-pipe__k {
+    font-size: 10.5px; font-weight: 700; letter-spacing: 0.06em;
+    text-transform: uppercase; color: var(--ds-text-muted);
+  }
+  .ds-pipe__v {
+    font-weight: 600; color: var(--ds-text-primary);
+    display: flex; align-items: center; gap: 5px;
+  }
+  .ds-pipe__v.is-ok   { color: var(--ds-accent-success-ink); }
+  .ds-pipe__v.is-warn { color: var(--ds-accent-warn-ink); }
+  .ds-pipe__v.is-err  { color: var(--ds-accent-danger-ink); }
+
+  /* ── The next step ─────────────────────────────────────────────────────
+     The strip above says WHAT is true of this source; this one line says
+     what to do about it, and only while the chain is unfinished — a source
+     whose data somebody can already pull renders nothing here. Three states
+     (`_source_next_step()` in app/web/router.py): in no package → in no
+     group → in an empty group.
+
+     Tinted, because a tint on this page means "worth acting on" (the shared
+     `.apg-strip` rule). Card-scoped rather than the page-level `.apg-strip`:
+     the sentence is about ONE source, so it belongs inside that source's
+     border — the same reason `.ds-token-mismatch` above is a band on the
+     card and not a banner over the list. */
+  .ds-next {
+    display: flex; align-items: center; gap: 10px 14px; flex-wrap: wrap;
+    padding: 10px 16px;
+    border-top: 1px solid var(--ds-accent-warn-line);
+    background: var(--ds-accent-warn-bg);
+    color: var(--ds-accent-warn-ink);
+    font-size: 12.5px; line-height: 1.45;
+  }
+  /* Zero basis, for the reason `.apg-strip`'s own sentence carries it: an
+     auto basis makes flexbox wrap the line before it considers shrinking it,
+     leaving the trailing links stranded on a row of their own. */
+  .ds-next__txt { flex: 1 1 0; min-width: 0; }
+  .ds-next__end {
+    margin-left: auto; flex: 0 0 auto;
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  }
+  /* The verify link is deliberately NOT a second button: one primary move
+     per state, and "did that work?" is a lens you open after acting, not an
+     alternative to acting. */
+  .ds-next__verify {
+    font-size: 12.5px; font-weight: 600;
+    color: inherit; text-decoration: underline;
+  }
+  .ds-next__verify:hover { text-decoration: none; }
+  .ds-next__verify:focus-visible {
+    outline: var(--ds-focus-outline);
+    outline-offset: var(--ds-focus-outline-offset);
+  }
+
+  /* ── Step 1: semantic-layer opt-in ── */
+  .ds-wsl-opt {
+    border: 1px solid var(--border, var(--ds-border));
+    border-radius: 10px;
+    padding: 12px 14px;
+    margin-top: 14px;
+    background: var(--ds-surface-dim);
+  }
+  .ds-wsl-opt__head {
+    display: flex; align-items: center; gap: 9px;
+    font-weight: 600; font-size: 13px; color: var(--ds-text-primary);
+    cursor: pointer;
+  }
+  .ds-wsl-opt__head input { width: 15px; height: 15px; accent-color: var(--ds-primary); }
+  .ds-wsl-opt p { margin: 6px 0 0 24px; font-size: 12.5px; color: var(--ds-text-secondary); }
+  .ds-wsl-opt__field { margin: 10px 0 2px 24px; }
+
+  /* ── Step 3: bundle board ── */
+  .ds-seed-row {
+    display: flex; gap: 8px; align-items: center; margin: 0 0 12px;
+    font-size: 12.5px; color: var(--ds-text-muted); flex-wrap: wrap;
+  }
+  .ds-seed-chip {
+    padding: 4px 12px; border-radius: 999px;
+    border: 1px solid var(--border, var(--ds-border)); background: var(--surface, var(--ds-surface));
+    font-size: 12px; font-weight: 600; color: var(--ds-text-secondary); cursor: pointer;
+  }
+  .ds-seed-chip:hover { border-color: var(--ds-primary); color: var(--ds-primary-dark, var(--ds-primary)); }
+  .ds-seed-chip[disabled] { opacity: 0.45; cursor: not-allowed; }
+  .ds-seed-chip[disabled]:hover { border-color: var(--border, var(--ds-border)); color: var(--ds-text-secondary); }
+  .ds-tray-created {
+    font-size: 11px; font-weight: 700; letter-spacing: 0.02em;
+    color: var(--ds-accent-success-ink); background: var(--ds-accent-success-bg);
+    border-radius: 5px; padding: 1px 7px;
+  }
+  /* An attach-only tray bound to a package that already exists: its name is
+     the package's (read-only — renames belong to the package's page) and the
+     badge says what Finish will do. Deliberately NOT .ds-dropdown-native:
+     the paper skin hides that class when it is paired with the custom
+     dropdown, and this select has no twin. */
+  .ds-exist-sel {
+    padding: 4px 10px; border-radius: 999px; max-width: 240px;
+    border: 1px solid var(--border, var(--ds-border)); background: var(--surface, var(--ds-surface));
+    font-size: 12px; font-weight: 600; color: var(--ds-text-secondary); cursor: pointer;
+  }
+  .ds-exist-sel:hover { border-color: var(--ds-primary); color: var(--ds-primary-dark, var(--ds-primary)); }
+  .ds-tray-exist {
+    font-size: 11px; font-weight: 700; letter-spacing: 0.02em;
+    color: var(--ds-accent-info-ink, var(--ds-text-secondary)); background: var(--ds-accent-info-bg, var(--ds-surface-dim));
+    border-radius: 5px; padding: 1px 7px;
+  }
+  .ds-btray.is-created { border-color: var(--ds-accent-success-line, var(--ds-border)); }
+  .ds-btray.is-created .ds-tray-name { cursor: default; }
+  .ds-btray.is-created .ds-tray-name:hover { background: transparent; }
+  .ds-btray {
+    border: 1px solid var(--border, var(--ds-border)); border-radius: 10px;
+    margin-bottom: 10px; overflow: hidden; background: var(--surface, var(--ds-surface));
+  }
+  .ds-btray-hd {
+    display: flex; align-items: center; gap: 8px;
+    padding: 7px 12px; background: var(--ds-surface-dim);
+    border-bottom: 1px solid var(--border-light, var(--ds-border-light));
+  }
+  .ds-btray-hd .cnt { font-size: 11.5px; color: var(--ds-text-muted); font-weight: 600; }
+  .ds-tray-name {
+    font: inherit; font-weight: 700; font-size: 13px; width: 200px;
+    border: none; background: transparent; color: var(--ds-text-primary);
+    padding: 2px 6px; border-radius: 5px;
+  }
+  .ds-tray-name:hover { background: var(--surface, var(--ds-surface)); }
+  .ds-tray-name:focus { background: var(--surface, var(--ds-surface)); outline: 1.5px solid var(--ds-primary); }
+  .ds-btray-row {
+    display: flex; align-items: center; gap: 9px;
+    padding: 6px 12px; border-bottom: 1px solid var(--border-light, var(--ds-border-light));
+    font-size: 13px; color: var(--ds-text-primary);
+  }
+  .ds-btray-row:last-child { border-bottom: none; }
+  .ds-btray-row input { width: 15px; height: 15px; accent-color: var(--ds-primary); }
+  .ds-btray-row .bkt {
+    font-family: var(--font-mono, ui-monospace, monospace); font-size: 11px;
+    background: var(--ds-surface-sunken); color: var(--ds-text-secondary);
+    padding: 1px 6px; border-radius: 5px;
+  }
+  .ds-btray-empty { padding: 9px 12px; font-size: 12.5px; color: var(--ds-text-muted); }
+  .ds-btray.out { border-style: dashed; border-color: var(--ds-accent-warn-line); }
+  .ds-btray.out .ds-btray-hd {
+    background: var(--ds-accent-warn-bg); color: var(--ds-accent-warn-ink);
+    border-bottom-color: var(--ds-accent-warn-line);
+  }
+  .ds-movebar {
+    position: sticky; bottom: 0; z-index: 5;
+    display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+    padding: 8px 12px; margin-top: 10px;
+    background: var(--surface, var(--ds-surface));
+    border: 1px solid var(--ds-primary);
+    border-radius: 10px; box-shadow: 0 4px 16px rgba(0, 0, 0, 0.10);
+    font-size: 12.5px; font-weight: 700; color: var(--ds-text-primary);
+  }
+  .ds-movebar[hidden] { display: none; }
+  .ds-movebar .mv-to { font-weight: 500; color: var(--ds-text-muted); }
+  #ds-movebar-targets { display: flex; gap: 6px; flex-wrap: wrap; }
+
+  /* ── Step 4: share cards ── */
+  .ds-wshare-card {
+    border: 1px solid var(--border, var(--ds-border)); border-radius: 10px;
+    padding: 2px 14px 8px; margin-bottom: 12px; background: var(--surface, var(--ds-surface));
+  }
+  /* "New group…" closes the gap where the audience you want does not exist
+     yet. Styled as an ADD affordance, not a card: dashed, full width, quiet —
+     it belongs to the list above it rather than competing with it. */
+  .ds-wshare-newgroup {
+    display: block; width: 100%; margin-top: 10px; padding: 10px 12px;
+    border: 1px dashed var(--ds-border); border-radius: 10px;
+    background: none; color: var(--ds-text-secondary);
+    font: inherit; font-size: 13px; font-weight: 600; cursor: pointer;
+  }
+  .ds-wshare-newgroup:hover, .ds-wshare-newgroup:focus-visible {
+    border-style: solid; border-color: var(--ds-primary);
+    color: var(--ds-primary); background: var(--ds-primary-light);
+  }
+  .ds-wshare-card__hd { display: flex; align-items: center; gap: 8px; padding: 9px 0 4px; }
+  .ds-wshare-card__hd b { font-size: 13.5px; color: var(--ds-text-primary); }
+  .ds-wshare-card__hd .m { font-size: 12px; color: var(--ds-text-muted); }
+  .ds-wshare-row {
+    display: flex; align-items: center; gap: 10px;
+    padding: 8px 0; border-bottom: 1px solid var(--border-light, var(--ds-border-light));
+    font-size: 13px;
+  }
+  .ds-wshare-row:last-child { border-bottom: none; }
+  .ds-wshare-row input[type="checkbox"] { width: 15px; height: 15px; accent-color: var(--ds-primary); }
+  .ds-wshare-row .g-name { font-weight: 600; color: var(--ds-text-primary); }
+  .ds-wshare-row .g-sub { font-size: 11.5px; color: var(--ds-text-muted); }
+  .ds-wshare-row .g-sub.everyone { color: var(--ds-accent-info-ink); }
+  .ds-wtier {
+    margin-left: auto; display: inline-flex; padding: 2px;
+    background: var(--ds-surface-sunken); border-radius: 9px;
+  }
+  .ds-wtier button {
+    border: none; background: transparent; padding: 3px 10px;
+    font-size: 12px; font-weight: 600; border-radius: 7px;
+    color: var(--ds-text-muted); cursor: pointer;
+  }
+  .ds-wtier button.on { background: var(--surface, var(--ds-surface)); color: var(--ds-text-primary); box-shadow: 0 1px 2px rgba(15, 23, 42, 0.08); }
+  .ds-wtier button.on.auto { color: var(--ds-primary-dark, var(--ds-primary)); }
+  .ds-wtier[aria-disabled="true"] { opacity: .45; pointer-events: none; }
+
+  /* ── Done slab ── */
+  .ds-wdone-slab { text-align: center; padding: 26px 12px 8px; }
+  .ds-wdone-slab .big {
+    width: 48px; height: 48px; margin: 0 auto 12px; border-radius: 50%;
+    background: var(--ds-accent-success-bg); color: var(--ds-accent-success-ink);
+    display: flex; align-items: center; justify-content: center; font-size: 22px;
+  }
+  .ds-wdone-slab h3 { margin: 0 0 10px; font-size: 17px; color: var(--ds-text-primary); }
+  .ds-wdone-slab ul {
+    text-align: left; max-width: 460px; margin: 0 auto 16px; padding-left: 18px;
+    font-size: 13px; color: var(--ds-text-secondary);
+  }
+  .ds-wdone-slab li { margin: 3px 0; }
+  .ds-field { display: block; margin-bottom: 14px; }
+  .ds-field:last-child { margin-bottom: 0; }
+  .ds-field label {
+    display: block; font-size: 13px; font-weight: 500;
+    color: var(--text-primary, var(--ds-text-primary)); margin-bottom: 4px;
+  }
+  .ds-field .field-hint { font-size: 11px; color: var(--text-secondary, var(--ds-text-secondary)); margin-top: 3px; }
+  .ds-field input, .ds-field textarea {
+    width: 100%; box-sizing: border-box; padding: 8px 10px;
+    border-radius: 8px; border: 1px solid var(--border, var(--ds-border));
+    background: var(--surface, var(--ds-surface)); color: var(--text-primary, var(--ds-text-primary));
+    font-size: 13px; font-family: inherit;
+  }
+  .ds-field input:focus, .ds-field textarea:focus { outline: 2px solid var(--ds-primary, var(--ds-primary)); outline-offset: -1px; }
+  /* The PEM box is the only textarea in a .ds-field; without this it renders
+     with browser-default font/border/width next to the styled inputs. */
+  .ds-field textarea { font-family: var(--ds-font-mono, monospace); font-size: 12px; resize: vertical; }
+  .ds-field input[type="password"] { font-family: var(--font-mono, ui-monospace, monospace); }
+
+  .ds-wizard-step { display: none; }
+  .ds-wizard-step.active { display: block; }
+  .ds-wizard-connected-banner {
+    background: var(--ds-accent-success-bg); border: 1px solid var(--ds-accent-success-line); color: var(--ds-accent-success-ink);
+    border-radius: 8px; padding: 10px 12px; font-size: 12px; margin-bottom: 14px;
+  }
+  .ds-wizard-connected-banner .rename-hint {
+    display: block; margin-top: 4px; color: var(--text-secondary, var(--ds-text-secondary));
+  }
+  .ds-wizard-connected-banner .rename-hint button {
+    background: none; border: none; padding: 0; color: var(--ds-primary, var(--ds-primary));
+    cursor: pointer; font-size: 12px; text-decoration: underline;
+  }
+  .ds-wizard-error {
+    display: none; font-size: 12px; color: var(--ds-accent-danger-ink); margin-top: 8px;
+  }
+  /* #1616: step 2's "the connection itself is broken" banner — distinct from
+     `.ds-wizard-error`'s plain highlighted line, which read as ordinary help
+     copy rather than a stop sign. */
+  .ds-sf-conn-error {
+    display: none; align-items: center; gap: 10px;
+    background: var(--ds-accent-danger-bg); border: 1px solid var(--ds-accent-danger-line);
+    color: var(--ds-accent-danger-ink); border-radius: 8px; padding: 10px 12px;
+    font-size: 12px; margin-bottom: 14px;
+  }
+  .ds-sf-conn-error__icon { font-size: 15px; line-height: 1; flex-shrink: 0; }
+  .ds-sf-conn-error__msg { flex: 1; }
+  /* The step-2 variant lives in the drawer's sticky foot, beside the button
+     that refused, so it drops the stacked margin and rides the button row. */
+  .ds-wizard-error--foot {
+    margin: 0 4px 0 0; align-self: center; text-align: right;
+  }
+
+  /* Toast */
+  .ds-toast {
+    position: fixed; bottom: 24px; right: 24px;
+    padding: 10px 16px; border-radius: 8px;
+    font-size: 13px; font-weight: 500;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12);
+    z-index: 9999; display: none; align-items: center; gap: 8px; max-width: 520px;
+    /* The failure text carries the upstream reason ("HTTP 401: invalid token"),
+       so it has to stay readable and selectable rather than clipped. */
+    white-space: pre-wrap; user-select: text;
+  }
+  .ds-toast.show { display: flex; }
+  .ds-toast.toast-fail { cursor: pointer; }
+  .ds-toast.toast-ok   { background: var(--ds-accent-success-bg); color: var(--ds-accent-success-ink); border: 1px solid var(--ds-accent-success-line); }
+  .ds-toast.toast-fail { background: var(--ds-accent-danger-bg); color: var(--ds-accent-danger-ink); border: 1px solid var(--ds-accent-danger-line); }
+
+  /* ── SharePoint connect wizard (spec 2026-08-27 §13.2) ──────────────────
+     Its own drawer, its own three-step strip (connect -> scope -> share —
+     the table wizard's "bundle" step does not apply here: the selected
+     scope of collections IS the package). Shares the drawer chrome
+     (drawer.css) and every other class already established above; only
+     the scope-tree/share-preview rows below are new vocabulary. */
+  .sp-crumbs { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; margin: 0 0 10px; font-size: 12.5px; }
+  .sp-crumbs button { border: none; background: none; padding: 2px 4px; font: inherit; color: var(--ds-primary); cursor: pointer; border-radius: 4px; }
+  .sp-crumbs button:hover { background: var(--ds-surface-sunken); }
+  .sp-crumbs button[disabled] { color: var(--ds-text-primary); font-weight: 700; cursor: default; }
+  .sp-crumbs .sep { color: var(--ds-text-muted); }
+  .sp-tree { border: 1px solid var(--ds-border); border-radius: var(--ds-radius-btn); overflow: hidden; }
+  .sp-tree__row {
+    display: flex; align-items: center; gap: 10px;
+    padding: 9px 12px; border-bottom: 1px solid var(--ds-border-light);
+    font-size: 12.5px;
+  }
+  .sp-tree__row:last-child { border-bottom: none; }
+  .sp-tree__row:hover { background: var(--ds-surface-sunken); }
+  /* `.sp-tree__row` sets `display: flex` as an author rule, which otherwise
+     always beats the user-agent `[hidden] { display: none }` rule
+     regardless of specificity (UA-origin declarations lose to author-origin
+     ones of ANY specificity) — the client-side filter (#2) relies on
+     toggling `hidden` to actually hide a non-matching row. */
+  .sp-tree__row[hidden] { display: none; }
+  .sp-tree__name { flex: 1 1 auto; min-width: 0; display: flex; align-items: center; gap: 6px; }
+  .sp-tree__name button { border: none; background: none; padding: 0; font: inherit; font-weight: 600; color: var(--ds-text-primary); cursor: pointer; text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sp-tree__name button:hover { color: var(--ds-primary); }
+  .sp-tree__name span.leaf { font-weight: 600; color: var(--ds-text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sp-tree__name mark { background: var(--ds-accent-warn-bg); color: var(--ds-accent-warn-ink); border-radius: 3px; padding: 0 1px; }
+  .sp-tree__anon { display: flex; align-items: center; gap: 5px; flex: 0 0 auto; font-size: 11.5px; color: var(--ds-text-muted); }
+  /* "Forget this site" (2026-09-01 manual-sites persistence fix) — a site
+     added by URL that is not (or no longer) a confirmed scope. Deliberately
+     quiet until hovered, same minimal-affordance idiom as the drawer close
+     button, just inline and smaller. */
+  .sp-tree__unlink { flex: 0 0 auto; border: none; background: none; padding: 0 4px; font-size: 15px; line-height: 1; color: var(--ds-text-muted); cursor: pointer; }
+  .sp-tree__unlink:hover { color: var(--ds-accent-danger-ink); }
+  .sp-search { margin-bottom: 14px; }
+  .sp-search__row { display: flex; align-items: flex-end; gap: 10px; flex-wrap: wrap; }
+  .sp-search__q { flex: 1 1 240px; min-width: 200px; }
+  .sp-search__mode { flex: 0 0 auto; min-width: 160px; }
+  .sp-search__selectall { display: flex; align-items: center; gap: 6px; padding: 9px 12px; font-size: 12.5px; font-weight: 600; border-bottom: 1px solid var(--ds-border-light); }
+  /* Permissions are a routine tenant fact, not a failure (TCRD-240 skip
+     hardening) — deliberately quieter than `.ds-wizard-error`'s danger ink:
+     one inaccessible site among several readable ones is not a stop sign. */
+  .sp-search__skipped { display: none; font-size: 12px; color: var(--ds-text-secondary); margin-top: 8px; }
+  .sp-badge {
+    flex: 0 0 auto; font-size: 11px; font-weight: 600; padding: 2px 8px;
+    border-radius: var(--ds-radius-pill); background: var(--ds-accent-info-bg); color: var(--ds-accent-info-ink);
+    white-space: nowrap;
+  }
+  /* "anonymization requested" — the checkbox alone, warn tone (a wish, not
+     yet a fact). ".sp-badge--anon-declared" is the earned state: the latest
+     ingest run actually declared this collection anonymized (spec §9.2). */
+  .sp-badge--anon { background: var(--ds-accent-warn-bg); color: var(--ds-accent-warn-ink); }
+  .sp-badge--anon-declared { background: var(--ds-accent-success-bg); color: var(--ds-accent-success-ink); }
+  /* Unique-permissions advisory (Decision #2: Agnes never derives or
+     enforces anything from a SharePoint ACL — this warns, never gates).
+     Same warn tone as the "anonymization requested" badge — both are a
+     wish/observation, not an earned or enforced state. */
+  .sp-badge--unique-perms { background: var(--ds-accent-warn-bg); color: var(--ds-accent-warn-ink); }
+  .sp-note { margin: 10px 0 0; font-size: 11.5px; color: var(--ds-text-muted); line-height: 1.5; }
+  /* Informational aftermath of an untick (never an error): the collection
+     stayed because it holds indexed files — tells the admin where the
+     deliberate delete lives (the Library). */
+  .sp-untick-notice {
+    margin: 10px 0 0; padding: 8px 12px; font-size: 12px; line-height: 1.5;
+    border: 1px solid var(--ds-border); border-radius: var(--ds-radius-btn);
+    background: var(--ds-accent-warn-bg); color: var(--ds-accent-warn-ink);
+  }
+  .sp-untick-notice a { color: inherit; text-decoration: underline; }
+  /* "Saved scopes" (2026-09-01 fix): every confirmed scope on this
+     connection, rendered from the scope rows alone — independent of
+     whatever the live tree can currently browse to. A folder scope several
+     levels deep in a site carries no site/drive identity to rebuild a
+     navigable tree row from (see `spSeedManualSitesFromScopes`'s
+     docstring), so without this panel reopening "Manage scopes" under
+     `Sites.Selected` showed nothing about it at all — an empty tree, no
+     hint the connection already had a scope configured. */
+  .sp-saved-scopes {
+    margin: 0 0 14px; border: 1px solid var(--ds-border); border-radius: var(--ds-radius-btn);
+    overflow: hidden;
+  }
+  .sp-saved-scopes__title {
+    margin: 0; padding: 8px 12px; font-size: 11.5px; font-weight: 700;
+    text-transform: uppercase; letter-spacing: 0.02em; color: var(--ds-text-secondary);
+    background: var(--ds-surface-sunken); border-bottom: 1px solid var(--ds-border-light);
+  }
+  .sp-saved-scopes__row {
+    display: flex; align-items: center; gap: 10px; padding: 9px 12px;
+    border-bottom: 1px solid var(--ds-border-light); font-size: 12.5px;
+  }
+  .sp-saved-scopes__row:last-child { border-bottom: none; }
+  .sp-saved-scopes__path {
+    flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  /* Discovery-forbidden guidance: an app registration holding only
+     `Sites.Selected` cannot enumerate sites — that is the intended
+     least-privilege posture, not a fault, so it reads as guidance toward
+     "Add a site by URL" (info tone, the same accent `.sp-badge` already
+     uses) rather than `.ds-wizard-error`'s danger ink, which trained an
+     operator to dismiss an expected, permanent state as a failure and
+     buried the one working affordance below a red banner. */
+  .sp-discovery-guidance {
+    margin: 0 0 10px; padding: 8px 12px; font-size: 12px; line-height: 1.5;
+    border: 1px solid var(--ds-accent-info-line); border-radius: var(--ds-radius-btn);
+    background: var(--ds-accent-info-bg); color: var(--ds-accent-info-ink);
+  }
+  /* The by-URL box IS the primary action while discovery is forbidden —
+     matching it to the guidance box above it says so without a second
+     widget. */
+  .sp-search--emphasis {
+    border: 1px solid var(--ds-accent-info-line); border-radius: var(--ds-radius-btn);
+    padding: 10px; background: var(--ds-accent-info-bg);
+  }
+  .sp-share-row {
+    display: flex; align-items: flex-start; gap: 12px;
+    padding: 12px; border: 1px solid var(--ds-border); border-radius: var(--ds-radius-btn); margin-bottom: 10px;
+    transition: box-shadow 0.2s ease, border-color 0.2s ease;
+  }
+  /* Landing effect for a scope row clicked on the collapsed card
+     (`_spHighlightShareRow`) — brief, self-removing. */
+  .sp-share-row--highlight { border-color: var(--ds-primary); box-shadow: 0 0 0 2px var(--ds-primary); }
+  .sp-share-row__main { flex: 1 1 auto; min-width: 0; }
+  .sp-share-row__title { font-weight: 700; font-size: 13px; color: var(--ds-text-primary); }
+  .sp-share-row__badges { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+  .sp-share-row__groups { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+  .sp-share-row__groups label { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--ds-text-secondary); }
+  .sp-warn {
+    display: inline-flex; align-items: center; gap: 5px; font-size: 11px; font-weight: 600;
+    padding: 2px 8px; border-radius: var(--ds-radius-pill);
+    background: var(--ds-accent-danger-bg); color: var(--ds-accent-danger-ink);
+  }
+
+  /* ── Extraction observability (2026-08-31 design §4/§6) ───────────────
+     A self-contained block: every selector is `.ext-*`, every colour is a
+     `--ds-*` token, and nothing here restyles an existing card element.
+     The live crawl cell, the `Run` fact row, the run-history drawer and
+     the configuration drawer are all filled by `extraction-observability`
+     JS below — the card's own markup contributes two empty anchors. */
+  .ext-live { display: inline-flex; align-items: center; gap: 6px; }
+  .ext-dot {
+    width: 7px; height: 7px; border-radius: var(--ds-radius-pill);
+    background: var(--ds-accent-info-ink); flex: none;
+  }
+  /* The pulse marks LIVE work, so it must stop the moment liveness stops
+     being observed — a run past its checkpoint window renders `stalled`
+     with a static warn dot, never an unbounded pulse. */
+  .ext-dot--live { animation: ext-pulse 1.6s var(--ds-ease-standard) infinite; }
+  .ext-dot--warn { background: var(--ds-accent-warn-ink); }
+  .ext-dot--danger { background: var(--ds-accent-danger-ink); }
+  .ext-dot--ok { background: var(--ds-accent-success-ink); }
+  .ext-dot--idle { background: var(--ds-text-muted); }
+  @keyframes ext-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+  @media (prefers-reduced-motion: reduce) {
+    .ext-dot--live { animation: none; }
+  }
+  .ext-lines { display: flex; flex-direction: column; gap: 3px; }
+  .ext-sub { font-size: 11.5px; color: var(--ds-text-muted); line-height: 1.45; }
+  .ext-warn { color: var(--ds-accent-warn-ink); }
+  .ext-danger { color: var(--ds-accent-danger-ink); }
+  .ext-stale {
+    display: inline-block; margin-top: 2px; padding: 1px 8px;
+    border-radius: var(--ds-radius-pill); font-size: 11px; font-weight: 600;
+    background: var(--ds-accent-danger-bg); color: var(--ds-accent-danger-ink);
+  }
+  .ext-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+  .ext-activity__path { font-family: var(--font-mono, ui-monospace, monospace); color: var(--ds-text-primary); }
+  .ext-activity__recent { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; }
+  .ext-activity__recent-item {
+    display: inline-flex; align-items: center; gap: 4px;
+    font-family: var(--font-mono, ui-monospace, monospace);
+  }
+  .ext-drawer { margin: 4px 16px 8px; }
+  .ext-runs { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+  .ext-runs li {
+    padding: 8px 10px; border: 1px solid var(--ds-border);
+    border-radius: var(--ds-radius-btn); background: var(--ds-surface);
+    font-size: 12.5px; color: var(--ds-text-primary);
+  }
+  .ext-run__head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: 12.5px; }
+  .ext-run__when { color: var(--ds-text-muted); }
+  /* Per-file error detail (`<details>`, lazy-fetched on first open — see
+     `_extErrorsSummaryHtml`). The marker is hidden so the summary line reads
+     like every other `.ext-sub` line until it is clicked. */
+  .ext-errors { margin-top: 2px; }
+  .ext-errors > summary { cursor: pointer; list-style: none; }
+  .ext-errors > summary::-webkit-details-marker { display: none; }
+  .ext-errors__list {
+    list-style: none; margin: 6px 0 0; padding: 0; display: flex; flex-direction: column;
+    gap: 4px; max-height: 220px; overflow-y: auto;
+  }
+  .ext-errors__list li {
+    font-size: 11px; color: var(--ds-text-muted); padding: 4px 8px;
+    border: 1px solid var(--ds-border); border-radius: var(--ds-radius-btn);
+    background: var(--ds-surface);
+  }
+  .ext-errors__list code { color: var(--ds-text-primary); }
+  .ext-cfg { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  .ext-cfg th, .ext-cfg td {
+    text-align: left; padding: 6px 8px; vertical-align: top;
+    border-bottom: 1px solid var(--ds-border);
+  }
+  .ext-cfg th { font-weight: 600; color: var(--ds-text-secondary); white-space: nowrap; }
+  .ext-cfg td code { font-size: 11.5px; color: var(--ds-text-muted); }
+  .ext-cfg__note { display: block; margin-top: 3px; font-size: 11px; color: var(--ds-text-muted); line-height: 1.45; }
+
+  .anonprev { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--ds-border-light); }
+  .anonprev__head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
+  .anonprev__title { font-size: 12.5px; font-weight: 600; color: var(--ds-text-primary); }
+  .anonprev__ta {
+    width: 100%; min-height: 92px; resize: vertical; box-sizing: border-box;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; line-height: 1.5;
+    padding: 8px; border: 1px solid var(--ds-border); border-radius: var(--ds-radius-btn);
+    background: var(--ds-surface); color: var(--ds-text-primary);
+  }
+  .anonprev__ta:focus-visible { outline: var(--ds-focus-outline); outline-offset: var(--ds-focus-outline-offset); }
+  .anonprev__row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 8px; }
+  .anonprev__opt {
+    display: inline-flex; align-items: center; gap: 5px;
+    font-size: 11.5px; color: var(--ds-text-secondary);
+  }
+  .anonprev__cost { color: var(--ds-accent-warn-ink); }
+  .anonprev__out {
+    margin-top: 10px; padding: 8px; white-space: pre-wrap; word-break: break-word;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; line-height: 1.5;
+    background: var(--ds-surface-sunken); border: 1px solid var(--ds-border-light);
+    border-radius: var(--ds-radius-btn); color: var(--ds-text-primary);
+    max-height: 320px; overflow: auto;
+  }
+  .anonprev__counts { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .anonprev__chip {
+    font-size: 11px; padding: 2px 8px; border-radius: var(--ds-radius-pill);
+    background: var(--ds-accent-info-bg); color: var(--ds-accent-info-ink);
+    border: 1px solid var(--ds-accent-info-line);
+  }
+  .anonprev__err {
+    margin-top: 10px; padding: 8px; font-size: 12px; border-radius: var(--ds-radius-btn);
+    background: var(--ds-accent-danger-bg); color: var(--ds-accent-danger-ink);
+    border: 1px solid var(--ds-accent-danger-line); white-space: pre-wrap;
+  }
