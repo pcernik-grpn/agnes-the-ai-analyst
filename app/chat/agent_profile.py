@@ -183,17 +183,23 @@ relationships between them) into a queryable graph. For a question about
 **who, what, which entity, or how things relate** — "who owns X", "how do
 these two people connect", "which clients per industry" — reach for the
 fact tools FIRST, before writing SQL or searching documents by keyword:
-`fact_search` -> `fact_neighbors` -> `fact_claims` (the same calls as
-`agnes facts search|neighbors|claims` on the CLI).
+`fact_search` -> `fact_neighbors` / `fact_edges` -> `fact_claims` (the same
+calls as `agnes facts search|neighbors|edges|claims` on the CLI). For a
+question about ALL relationships of one type ("which organizations own
+which companies", "which industries are our clients in"), read the
+relationship names from `fact_type_map` and call `fact_edges` ONCE with
+`include_claims=1` — not `fact_neighbors` once per entity.
 
 ```
 agnes facts search <type> [query] [--filter key=value]   # find subjects by type, an optional name, and/or attrs
-agnes facts neighbors <subject_id>                        # traverse relationships (depth <= 2)
-agnes facts claims <subject_id>                           # the evidencing quote + document for one subject
+agnes facts neighbors <subject_id>                        # traverse relationships from ONE subject (depth <= 2)
+agnes facts edges <edge_type> [--extend <type>] [--claims 1]  # EVERY relationship of one type, both ends, cited
+agnes facts claims <subject_id>                           # the evidencing quotes (newest first) for one subject
 ```
 
-Cite every fact you use — `agnes facts claims` gives you the exact quote and
-its source document, name both in your answer. Facts are filtered
+Cite every fact you use — `--claims`/`include_claims` gives you the quote
+inline, `agnes facts claims` gives the rest; name the quote and its source
+document in your answer. Facts are filtered
 server-side to what YOU can read; a search returning nothing may exist
 outside your access, it is not evidence the fact is absent — fall back to
 `agnes collections search` rather than inventing an answer or refusing
@@ -313,16 +319,24 @@ claim per line, the LAST thing in the reply:
     ```sources
     table: hr_headcount
     metric: headcount/active
+    document: 2026_Workforce_Plan.pdf
     assumption: active employees only | origin: user | why: you asked about "the team"
     assumption: contractors excluded | origin: definition | why: headcount/active counts employees only
     ```
 
 - `table:` — the registry id (as `agnes catalog` gives it) of every table the
   figure was computed from. `metric:` — the canonical metric id, when you
-  adapted one. Each is checked against the tools you actually ran; naming a
-  table you did not query is worse than naming none.
+  adapted one. `document:` — every document or fact-graph subject the answer
+  rests on: the filename as the fact tools give it, or the subject id you
+  passed to `agnes facts claims`. Each is checked against the tools you
+  actually ran; naming a table you did not query, or a file you did not open,
+  is worse than naming none. An answer read entirely out of documents
+  declares `document:` lines and no `table:` — that is a complete answer to
+  "where did this come from", not a gap.
 - `assumption:` — anything the number depends on that you chose rather than
-  read, one per line, always with two more segments separated by ` | `:
+  read, one per line, and never a source: a file you read is a `document:`,
+  and filing it here shows the reader your evidence among your guesses.
+  Always with two more segments separated by ` | `:
   `origin:` is ONE word from `user` (the question said or implied it),
   `definition` (a metric definition, a semantic model or a document in the
   knowledge base says so), `data` (the data forced it: a missing column or

@@ -152,8 +152,8 @@ class ViewAsReadOnlyMiddleware:
 
         ``None`` for: no cookie, a forged/expired one, a request that
         authenticates with a bearer token instead of the session cookie, and
-        — the binding check — a ticket minted for somebody other than
-        whoever this request's session cookie names.
+        — the binding check — a ticket minted for somebody other than whoever
+        this request authenticates as.
 
         ``HTTPConnection``, not ``Request``: this runs for WebSocket scopes
         too, and ``Request.__init__`` asserts ``scope["type"] == "http"`` —
@@ -166,18 +166,22 @@ class ViewAsReadOnlyMiddleware:
             return None
         if request.headers.get("authorization"):
             return None
-        session_token = request.cookies.get("access_token")
-        if not session_token:
-            return None
-
         ticket = verify_ticket(raw)
         if ticket is None:
             return None
 
-        from app.auth.jwt import verify_token
+        # The binding, through the ONE shared definition rather than a fourth
+        # inline copy of it. `session_matches_viewer`'s own docstring names
+        # this middleware as one of three consumers that each bound the ticket
+        # at their own layer — and it was still inlining the check here, which
+        # is exactly the "rule kept in three places" it warns will be dropped
+        # in a fourth. Concretely, the inline copy required an `access_token`
+        # cookie and returned None without one, so under LOCAL_DEV_MODE (which
+        # authenticates from configuration and issues no such cookie) the mode
+        # could never engage — no banner, and therefore no exit control.
+        from app.auth.view_as import session_matches_viewer
 
-        payload = verify_token(session_token) or {}
-        if str(payload.get("sub") or "") != ticket.viewer_user_id:
+        if not session_matches_viewer(request.cookies.get("access_token"), ticket):
             return None
         return ticket
 

@@ -189,6 +189,41 @@ def _assert_names_chart_channel(md: str) -> None:
     assert "broken image" in md, "say what the user sees, not just that it is forbidden"
 
 
+def _assert_charting_is_not_promised_as_certain(md: str) -> None:
+    """The sandbox prompt must not state matplotlib as a fact.
+
+    It is baked into the two sandbox images THIS repo builds (docker, e2b),
+    and that made "You have `matplotlib` … preinstalled" read as universally
+    true. It is not: the default provider is ``kai-agent`` (app/chat/config.py),
+    whose image is engine-side and outside this repo, and observed on a live
+    instance the import fails there. The prompt was instructing the agent into
+    a guaranteed failed step on every chart-worthy question — a red card the
+    user reads as a broken system, on a turn that was going fine.
+
+    The fix is not to name providers in the prompt (it cannot know which one it
+    is running on); it is to make the failure cost nothing: guard the import
+    and fall back inside the same script, so an absent library produces a table
+    instead of a traceback.
+    """
+    assert "You have `matplotlib`, `pandas` and `numpy` preinstalled." not in md, (
+        "asserted as fact, but false on the default kai-agent sandbox — every chart "
+        "request then burns a visible failed step before degrading to a table"
+    )
+    assert "except ImportError" in md, "the fallback has to be IN the sample, or it won't be written"
+    assert "markdown table" in md, "say what to do instead, not just that it may be missing"
+    assert "pip install" in md, "the plausible-looking recovery has to be named to be refused"
+
+
+def test_the_sandbox_prompt_does_not_promise_a_library_it_cannot_guarantee():
+    """Pins the bundled fallback file — sibling below pins the render."""
+    _assert_charting_is_not_promised_as_certain(_prose(WORKSPACE_CLAUDE_MD))
+
+
+def test_the_server_rendered_sandbox_default_does_not_promise_matplotlib():
+    """And what the chat sandbox actually receives (``is_sandbox=True``)."""
+    _assert_charting_is_not_promised_as_certain(_collapse_ws(_rendered_server_default_claude_md(is_sandbox=True)))
+
+
 def test_the_workspace_prompt_names_the_only_chart_channel():
     """Inline SVG is the delivery mechanism; a file path and a data: URI are the
     two plausible-looking things that silently fail. All three must be stated —

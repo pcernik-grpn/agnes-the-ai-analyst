@@ -69,6 +69,8 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Optional
 
+from urllib.parse import quote
+
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 
 from app.auth.jwt import get_signing_secret
@@ -105,6 +107,18 @@ class ViewAsTicket:
     target_user_id: str
     target_email: str
 
+    #: Where the admin was standing when they entered — the page exit sends
+    #: them back to. It lives in the TICKET rather than in the banner's exit
+    #: form because the banner only ever knows the page it is rendering on:
+    #: an admin who entered from the Access page and then clicked through to
+    #: `/library` and `/agents` would otherwise be dropped wherever they
+    #: happened to stop, as their own admin self, with the person they were
+    #: investigating forgotten. Signed, so it cannot be re-pointed mid-mode,
+    #: and re-validated on read. Empty means "not recorded" — an older
+    #: ticket minted before this field existed, or an entry point that did
+    #: not name one; :func:`return_path` derives a destination either way.
+    return_to: str = ""
+
 
 # Request-scoped active ticket. Default None, so every non-request context
 # (scheduler, worker, CLI, a direct function call in a test) behaves exactly
@@ -116,14 +130,27 @@ def _serializer() -> URLSafeTimedSerializer:
     return URLSafeTimedSerializer(get_signing_secret(), salt=_SALT)
 
 
-def sign_ticket(*, viewer_user_id: str, viewer_email: str, target_user_id: str, target_email: str) -> str:
-    """Sign a ticket into the opaque string that rides :data:`VIEW_AS_COOKIE`."""
+def sign_ticket(
+    *,
+    viewer_user_id: str,
+    viewer_email: str,
+    target_user_id: str,
+    target_email: str,
+    return_to: str = "",
+) -> str:
+    """Sign a ticket into the opaque string that rides :data:`VIEW_AS_COOKIE`.
+
+    ``return_to`` is sanitized here as well as on read: it arrives from a form
+    field, and a rejected value must degrade to "not recorded" rather than
+    ride along inside a signed blob where the next reader would trust it.
+    """
     return _serializer().dumps(
         {
             "viewer_user_id": viewer_user_id,
             "viewer_email": viewer_email,
             "target_user_id": target_user_id,
             "target_email": target_email,
+            "return_to": safe_internal_path(return_to, ""),
         }
     )
 
@@ -158,6 +185,12 @@ def verify_ticket(raw: Optional[str]) -> Optional[ViewAsTicket]:
         viewer_email=data["viewer_email"],
         target_user_id=data["target_user_id"],
         target_email=data["target_email"],
+        # Optional on purpose: a ticket minted before this field existed is
+        # still a valid ticket, and adding it to `_REQUIRED_KEYS` would log
+        # every mid-session admin out of the mode on deploy. Re-validated
+        # rather than trusted-because-signed — the signature proves Agnes
+        # wrote it, not that what Agnes wrote was a safe redirect target.
+        return_to=safe_internal_path(data.get("return_to"), ""),
     )
 
 
@@ -228,6 +261,30 @@ def is_narrowed_subject(subject_user_id: Optional[str]) -> bool:
     return subject_user_id is None or subject_user_id == target
 
 
+def local_dev_viewer_id() -> Optional[str]:
+    """The id every request authenticates as under ``LOCAL_DEV_MODE``, else ``None``.
+
+    Not a relaxation of the binding rule — the same rule applied to the
+    credential dev mode actually uses. Dev mode authenticates from
+    configuration rather than from a session cookie, so there is no
+    ``access_token`` for a ticket to be bound TO, and a check written only
+    against that cookie does not fail the ticket, it fails to evaluate at all:
+    the mode silently never engages, which is how a "View a page as them"
+    button came to set a cookie, redirect, and then render no banner and
+    therefore no way out.
+
+    Off in every other mode, and it grants nothing on its own: dev mode
+    already resolves every caller to this one account, so a ticket minted by
+    it can only ever name the identity the request already had.
+    """
+    from app.auth.dependencies import _get_local_dev_user, is_local_dev_mode
+
+    if not is_local_dev_mode():
+        return None
+    user = _get_local_dev_user()
+    return str(user["id"]) if user and user.get("id") else None
+
+
 def session_matches_viewer(session_token: Optional[str], ticket: Optional["ViewAsTicket"]) -> bool:
     """Does this request's OWN session belong to the ticket's viewer?
 
@@ -246,15 +303,54 @@ def session_matches_viewer(session_token: Optional[str], ticket: Optional["ViewA
     a ``view_as.end`` entry against a real admin who did nothing. A rule kept
     in three places is a rule that will be dropped in a fourth.
 
-    Fail-closed: no token, an unverifiable token, or no ticket → ``False``.
+    Fail-closed: an unverifiable token, or no ticket → ``False``. A MISSING
+    token is fail-closed too in every mode that issues one; under
+    ``LOCAL_DEV_MODE`` it means the request authenticates by configuration
+    instead, and the binding is checked against that identity
+    (:func:`local_dev_viewer_id`) rather than skipped.
     """
-    if ticket is None or not session_token:
+    if ticket is None:
         return False
 
-    from app.auth.jwt import verify_token
+    if session_token:
+        from app.auth.jwt import verify_token
 
-    payload = verify_token(session_token) or {}
-    return str(payload.get("sub") or "") == ticket.viewer_user_id
+        payload = verify_token(session_token) or {}
+        if str(payload.get("sub") or "") == ticket.viewer_user_id:
+            return True
+
+    # The configured-identity fallback is reached whenever the session cookie
+    # did not answer — absent, unreadable, or belonging to someone else.
+    #
+    # "Absent" alone was not enough, and the miss is worth naming: browser
+    # cookies ignore the PORT, so every local instance on 127.0.0.1 shares one
+    # jar. A developer who has opened any other Agnes on that host is carrying
+    # an `access_token` this instance cannot verify — signed by a different
+    # deployment's secret — and a check that fired only on a MISSING cookie
+    # took the token path, failed to read it, and silently declined to engage.
+    # Same outcome as the bug this fallback exists to fix: a cookie set, a
+    # redirect served, and no banner.
+    #
+    # Still a binding, and still fail-closed off dev mode: a ticket naming
+    # anyone other than the configured identity is inert, and
+    # `local_dev_viewer_id` answers None in every mode that issues real
+    # sessions — where an unverifiable token must keep failing, since there
+    # the request has no other credential to fall back ON.
+    dev_viewer = local_dev_viewer_id()
+    return dev_viewer is not None and dev_viewer == ticket.viewer_user_id
+
+
+def binding_is_possible(session_token: Optional[str]) -> bool:
+    """Could a ticket minted for this request ever engage?
+
+    Asked at ENTRY, before a cookie is set. Every consumer of a ticket binds
+    it to the caller's own credential, so minting one for a request that
+    carries no bindable credential produces a cookie that is inert for its
+    whole lifetime — and the mode's only exit control lives in the banner that
+    inert cookie never renders. Refusing up front is the difference between a
+    button that fails and a button that lies.
+    """
+    return bool(session_token) or local_dev_viewer_id() is not None
 
 
 def safe_internal_path(candidate: Optional[str], default: str) -> str:
@@ -273,3 +369,29 @@ def safe_internal_path(candidate: Optional[str], default: str) -> str:
     if "\\" in candidate:
         return default
     return candidate
+
+
+#: Where exit lands when the ticket recorded no origin of its own. Not simply
+#: ``/admin/access``: the person under investigation is the whole reason the
+#: admin left that page, and the Simulate lens restores its selection from
+#: ``?lens=simulate&user=`` — so the fallback rebuilds the deep link out of
+#: the ticket rather than dropping the admin on an empty picker.
+_DEFAULT_RETURN = "/admin/access?lens=simulate&user={target_user_id}"
+
+
+def return_path(ticket: Optional[ViewAsTicket]) -> str:
+    """The page exit should land on for ``ticket``.
+
+    The ticket is the only input, deliberately. The exit route mounts no auth
+    dependency (``get_current_user`` resolves to the TARGET while the mode is
+    on, so ``require_admin`` would 403 the very person trying to leave), which
+    makes a form-supplied destination the one attacker-influenced value on an
+    endpoint that has no other. Reading it from the signed ticket instead
+    means the admin can only ever be returned to the page they actually
+    entered from, and there is no redirect parameter left to aim.
+    """
+    if ticket is None:
+        return "/admin/access"
+    if ticket.return_to:
+        return safe_internal_path(ticket.return_to, "/admin/access")
+    return _DEFAULT_RETURN.format(target_user_id=quote(ticket.target_user_id, safe=""))

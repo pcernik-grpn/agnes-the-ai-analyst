@@ -3,6 +3,13 @@
 
   A0  Claude, no connectors, no tools -- the frozen prompt string verbatim
       through the Anthropic Messages API. The hallucination floor.
+  A3  Claude + seed/context pack, no connector, no tools -- the SAME
+      `AnthropicArm` as A0 with the pack as a prompt-cached `system` turn
+      (`system` / `system_file` in the run-config), so A0 and A3 differ in
+      exactly one request field and A3's token counts come from
+      `response.usage` like A0's (token_methods.md: "Run via API where
+      possible"). The hand-run `import-transcript` path stays valid as a
+      fallback.
   A4  Agnes -- run as a given persona (a bearer token per persona, read from
       an env var named in the run-config) through a PLUGGABLE surface. Two
       surfaces are named in the design: `chat` (implemented here, against
@@ -11,12 +18,12 @@
       on a 202 -- see cli/commands/agent.py) and `slack` (the interface is
       defined below; not implemented yet -- needed later for the "Slack
       must answer identically" parity run, design spec Sec 13.2/15.5).
-  A1/A2/A3  Claude+M365/SharePoint, ChatGPT+SharePoint, and Claude+M365+seed
-      pack. These run in external product UIs (Claude.ai / ChatGPT
-      connectors, or a browser-driven M365 connector session) this harness
-      cannot drive headlessly -- there is no executor class for them. An
-      operator runs the prompt there by hand and pastes the transcript back
-      in via `run_eval.py import-transcript` (see `manual_transcript_record`
+  A1/A2  Claude+M365/SharePoint and ChatGPT+SharePoint. These run in
+      external product UIs (Claude.ai / ChatGPT connectors, or a
+      browser-driven M365 connector session) this harness cannot drive
+      headlessly -- there is no executor class for them. An operator runs
+      the prompt there by hand and pastes the transcript back in via
+      `run_eval.py import-transcript` (see `manual_transcript_record`
       below), which normalizes it into the exact same `RunRecord` shape an
       API-driven arm produces, so grading and token counting stay uniform
       across all five arms (workbook-compatible method).
@@ -29,9 +36,11 @@ result, not noise").
 from __future__ import annotations
 
 import abc
+import hashlib
 import os
 import time
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -68,26 +77,50 @@ class ArmExecutor(abc.ABC):
 
 
 # ---------------------------------------------------------------------------
-# A0 -- bare Anthropic API, no tools
+# A0 / A3 -- bare Anthropic API, no tools (A3 adds the context pack as system)
 # ---------------------------------------------------------------------------
 
 
 class AnthropicArm(ArmExecutor):
-    """A0: `claude-sonnet-5` (configurable) via the Anthropic Messages API,
-    no tool schema, the prompt string verbatim as the sole user turn."""
+    """A0 and A3: `claude-sonnet-5` (configurable) via the Anthropic Messages
+    API, no tool schema, the prompt string verbatim as the sole user turn.
 
-    arm = "A0"
+    A0 sends nothing but the prompt. A3 (`arm="A3"`) adds the seed/context
+    pack as a `system` turn with `cache_control: ephemeral`, so runs 2..N of
+    a round read the pack from the prompt cache -- those tokens land in
+    `TokenCounts.cache_read_tokens` / `cache_creation_tokens`, tracked
+    separately and never folded into `total`, so a cache hit cannot make A3
+    look artificially cheap (README!C24). `system` (inline text) and
+    `system_file` (a path, resolved against the current working directory
+    and read ONCE here at construction) are mutually exclusive. When a pack
+    is configured, `raw` carries its sha256 and the resolved path so every
+    record is pinned to the exact pack version; with no pack the request and
+    the record are byte-identical to what A0 always produced."""
 
     def __init__(
         self,
         *,
+        arm: str = "A0",
         model: str = "claude-sonnet-5",
         api_key_env: str = "ANTHROPIC_API_KEY",
         max_tokens: int = 4096,
+        system: str | None = None,
+        system_file: str | None = None,
     ) -> None:
+        if system is not None and system_file is not None:
+            raise ValueError("`system` and `system_file` are mutually exclusive -- configure exactly one")
+        self.arm = arm
         self.model = model
         self.api_key_env = api_key_env
         self.max_tokens = max_tokens
+        self.system_path: Path | None = None
+        if system_file is not None:
+            self.system_path = Path(system_file).resolve()
+            # Decoded from the raw bytes (no newline translation) so the sha256
+            # below equals `sha256sum <file>` on the operator's side.
+            system = self.system_path.read_bytes().decode("utf-8")
+        self.system = system
+        self.system_sha256: str | None = None if system is None else hashlib.sha256(system.encode("utf-8")).hexdigest()
 
     def run(self, prompt: Prompt, *, persona: str | None, run_index: int, round_id: str) -> RunRecord:
         started_at = _now_iso()
@@ -111,11 +144,14 @@ class AnthropicArm(ArmExecutor):
             import anthropic
 
             client = anthropic.Anthropic(api_key=api_key, timeout=_ANTHROPIC_TIMEOUT_S)
-            response = client.messages.create(
-                model=self.model,
-                max_tokens=self.max_tokens,
-                messages=[{"role": "user", "content": prompt.text}],
-            )
+            request: dict[str, Any] = {
+                "model": self.model,
+                "max_tokens": self.max_tokens,
+                "messages": [{"role": "user", "content": prompt.text}],
+            }
+            if self.system is not None:
+                request["system"] = [{"type": "text", "text": self.system, "cache_control": {"type": "ephemeral"}}]
+            response = client.messages.create(**request)
         except Exception as exc:  # noqa: BLE001 -- any SDK/transport failure is a run failure, not a crash
             return RunRecord(
                 round=round_id,
@@ -133,6 +169,10 @@ class AnthropicArm(ArmExecutor):
             )
         answer = "".join(block.text for block in response.content if getattr(block, "type", None) == "text")
         usage = response.usage
+        raw: dict[str, Any] = {"model": self.model, "stop_reason": getattr(response, "stop_reason", None)}
+        if self.system is not None:
+            raw["system_sha256"] = self.system_sha256
+            raw["system_path"] = None if self.system_path is None else str(self.system_path)
         return RunRecord(
             round=round_id,
             arm=self.arm,
@@ -154,7 +194,7 @@ class AnthropicArm(ArmExecutor):
             ),
             turns=1,
             answer=answer,
-            raw={"model": self.model, "stop_reason": getattr(response, "stop_reason", None)},
+            raw=raw,
         )
 
 

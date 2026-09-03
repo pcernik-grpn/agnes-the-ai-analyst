@@ -1413,6 +1413,11 @@
             "title": "Next",
             "type": "string"
           },
+          "return_to": {
+            "default": "",
+            "title": "Return To",
+            "type": "string"
+          },
           "user_id": {
             "default": "",
             "title": "User Id",
@@ -1427,11 +1432,6 @@
           "csrf_token": {
             "default": "",
             "title": "Csrf Token",
-            "type": "string"
-          },
-          "next": {
-            "default": "",
-            "title": "Next",
             "type": "string"
           }
         },
@@ -4576,6 +4576,103 @@
         "title": "FactsCorrectionRequest",
         "type": "object"
       },
+      "FactsEdgesRequest": {
+        "additionalProperties": false,
+        "description": "``POST /api/facts/edges`` (TCRD-295) \u2014 the relationship-shaped read.\n``edge_type`` names come from ``GET /api/facts/type-map``'s\n``edge_types`` list; nothing here knows a customer's vocabulary (spec\n\u00a711). ``extend_edge_type`` follows ONE more hop from every listed edge's\n``extend_from`` endpoint, so a two-hop question is one request.",
+        "properties": {
+          "dst_id": {
+            "anyOf": [
+              {
+                "maxLength": 200,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Dst Id"
+          },
+          "dst_type": {
+            "anyOf": [
+              {
+                "maxLength": 200,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Dst Type"
+          },
+          "edge_type": {
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Edge Type",
+            "type": "string"
+          },
+          "extend_edge_type": {
+            "anyOf": [
+              {
+                "maxLength": 200,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Extend Edge Type"
+          },
+          "extend_from": {
+            "default": "dst",
+            "pattern": "^(src|dst)$",
+            "title": "Extend From",
+            "type": "string"
+          },
+          "include_claims": {
+            "default": 0,
+            "maximum": 3.0,
+            "minimum": 0.0,
+            "title": "Include Claims",
+            "type": "integer"
+          },
+          "limit": {
+            "default": 100,
+            "maximum": 100.0,
+            "minimum": 1.0,
+            "title": "Limit",
+            "type": "integer"
+          },
+          "src_id": {
+            "anyOf": [
+              {
+                "maxLength": 200,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Src Id"
+          },
+          "src_type": {
+            "anyOf": [
+              {
+                "maxLength": 200,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Src Type"
+          }
+        },
+        "required": [
+          "edge_type"
+        ],
+        "title": "FactsEdgesRequest",
+        "type": "object"
+      },
       "FactsExtractionRunOptions": {
         "description": "Optional per-run overrides for one manual facts-extraction trigger.\nThe body itself is optional \u2014 a bare ``POST`` runs over the whole\ncorpus with the configured budget, mirroring :class:`ExtractionRunOptions`'s\n\"absent means configured\" contract for the crawl trigger.",
         "properties": {
@@ -4832,6 +4929,13 @@
             "title": "Fanout",
             "type": "integer"
           },
+          "include_claims": {
+            "default": 0,
+            "maximum": 3.0,
+            "minimum": 0.0,
+            "title": "Include Claims",
+            "type": "integer"
+          },
           "limit": {
             "default": 500,
             "maximum": 500.0,
@@ -4864,6 +4968,13 @@
               }
             ],
             "title": "Filters"
+          },
+          "include_claims": {
+            "default": 0,
+            "maximum": 3.0,
+            "minimum": 0.0,
+            "title": "Include Claims",
+            "type": "integer"
           },
           "limit": {
             "default": 20,
@@ -13721,7 +13832,7 @@
   "info": {
     "description": "Self-hosted AI harness: governed data access, skills marketplace, corporate memory, and agent workspaces",
     "title": "AI Harness",
-    "version": "0.95.0"
+    "version": "0.96.0"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -42986,6 +43097,74 @@
         ]
       }
     },
+    "/api/facts/edges": {
+      "post": {
+        "description": "Every visible edge of ONE type, with both endpoints as full subjects\n(TCRD-295). The read the five primitives lacked: \"which X relate to\nwhich Y\" was one ``neighbors`` call per root plus one ``claims`` call\nper citation; this is one request, optionally with a second hop\n(``extend_edge_type`` from each edge's ``extend_from`` endpoint) and\nthe ``include_claims`` newest readable quotes inline on each edge.\n\nSame visibility posture as :func:`facts_neighbors`, all of it in SQL\nbefore ``LIMIT`` (spec \u00a75): the edge needs its OWN readable claim (or a\n`revealed` correction), BOTH endpoints must be independently visible to\nthe caller, and ``truncated.result`` / ``truncated.extension`` are the\ncaller's own shortfall, never a signal that grants hid more. A type the\ncaller cannot see and a type that does not exist both answer with an\nempty page. Response: ``{\"nodes\": [...], \"edges\": [{\"id\", \"src\",\n\"dst\", \"type\", \"attrs\", \"claims\"?}], \"truncated\": {\"result\",\n\"extension\", \"claims\"}}``.",
+        "operationId": "facts_edges_api_facts_edges_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FactsEdgesRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Facts Edges Api Facts Edges Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Facts Edges",
+        "tags": [
+          "facts"
+        ]
+      }
+    },
     "/api/facts/facets": {
       "get": {
         "description": "Filterable entity values per type, with a document count each \u2014 what\nthe Library's filter menu offers instead of hand-entered tags.\n\nThe vocabulary comes from the extraction pass (client, industry, service\noffering, document type), so it is maintained by ingestion rather than by\nsomebody remembering to tag a file.\n\nGated exactly as :func:`facts_search` is: a facet lists only subjects\nthis caller could reach, and each `document_count` counts only documents\nin collections they can read \u2014 a `revealed` subject's unreadable evidence\nis not tallied, since that would report how many files sit in a\ncollection they cannot open. Response: ``{\"facets\": {type: [{\"subject_id\",\n\"label\", \"document_count\"}]}}``.",
@@ -43419,6 +43598,20 @@
             "schema": {
               "title": "Subject Id",
               "type": "string"
+            }
+          },
+          {
+            "description": "Max claims returned, newest first (TCRD-295 cap). `limit_applied` says whether more exist.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 25,
+              "description": "Max claims returned, newest first (TCRD-295 cap). `limit_applied` says whether more exist.",
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
             }
           },
           {

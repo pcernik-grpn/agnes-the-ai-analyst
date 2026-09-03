@@ -381,9 +381,14 @@ def _view_as_state(ctx) -> dict | None:
     (``app.auth.view_as.active_ticket``), so banner-visible and
     mutations-refused are the same condition, not two that can drift.
 
-    ``pass_context`` for the request: the exit form needs this page's path
-    (to come back to) and the caller's own ``web_csrf`` token (double-submit,
-    read server-side because the cookie is HttpOnly).
+    ``pass_context`` for the request: the exit form needs the caller's own
+    ``web_csrf`` token (double-submit, read server-side because the cookie is
+    HttpOnly). It deliberately does NOT publish this page's path — the exit
+    form used to post it back as ``next``, which is exactly why leaving landed
+    the admin on whatever page they had wandered to instead of where they
+    started. Where to return is the ticket's business
+    (``app.auth.view_as.return_path``), and a banner rendered on page five of
+    a browse has no way to know it.
     """
     from app.auth.view_as import active_ticket
 
@@ -391,16 +396,13 @@ def _view_as_state(ctx) -> dict | None:
     if ticket is None:
         return None
     request = ctx.get("request")
-    path = "/"
     csrf_token = ""
     if isinstance(request, Request):
-        path = request.url.path
         csrf_token = request.cookies.get(_WEB_CSRF_COOKIE, "")
     return {
         "viewer_email": ticket.viewer_email,
         "target_email": ticket.target_email,
         "target_user_id": ticket.target_user_id,
-        "path": path,
         "csrf_token": csrf_token,
     }
 
@@ -7238,6 +7240,7 @@ async def view_as_enter(
     user_id: str = Form(""),
     csrf_token: str = Form(""),
     next: str = Form(""),
+    return_to: str = Form(""),
     user: dict = Depends(require_admin),
 ):
     """Begin a read-only view-as session for ``user_id``.
@@ -7266,6 +7269,18 @@ async def view_as_enter(
         # automation credential.
         raise HTTPException(status_code=403, detail="view_as_requires_interactive_session")
 
+    from app.auth.view_as import binding_is_possible
+
+    if not binding_is_possible(request.cookies.get("access_token")):
+        # Every consumer binds the ticket to the caller's own credential, so a
+        # request with no bindable credential would get a cookie that is inert
+        # for its whole lifetime — and the mode's only exit control lives in
+        # the banner that inert cookie never renders. The failure mode was not
+        # "the mode does not start": it was a button that set a cookie,
+        # redirected to the Library, and left the admin looking at an ordinary
+        # page with no banner and no way back. Refuse before setting anything.
+        raise HTTPException(status_code=403, detail="view_as_requires_interactive_session")
+
     target_id = (user_id or "").strip()
     if not target_id:
         raise HTTPException(status_code=400, detail="user_id is required")
@@ -7282,11 +7297,19 @@ async def view_as_enter(
     from app.auth.view_as import VIEW_AS_COOKIE, safe_internal_path, sign_ticket
     from src.audit_helpers import log_safe
 
+    # `next` is where the mode OPENS (the page whose answer differs most
+    # between two people); `return_to` is where exiting comes BACK to. Two
+    # fields because they are two different pages, and collapsing them is the
+    # bug this pair replaced: the banner's exit form could only ever offer the
+    # page it was rendering on, so leaving dropped the admin wherever they had
+    # stopped browsing — as themselves, with the person they were
+    # investigating forgotten. The origin rides the signed ticket instead.
     ticket = sign_ticket(
         viewer_user_id=str(user["id"]),
         viewer_email=str(user.get("email") or ""),
         target_user_id=str(target["id"]),
         target_email=str(target.get("email") or ""),
+        return_to=return_to,
     )
 
     log_safe(
@@ -7319,7 +7342,6 @@ async def view_as_enter(
 async def view_as_exit(
     request: Request,
     csrf_token: str = Form(""),
-    next: str = Form(""),
 ):
     """End a read-only view-as session — clear the ticket cookie, nothing else.
 
@@ -7339,7 +7361,7 @@ async def view_as_exit(
     from app.auth.public_url import cookie_secure
     from app.auth.view_as import (
         VIEW_AS_COOKIE,
-        safe_internal_path,
+        return_path,
         session_matches_viewer,
         verify_ticket,
     )
@@ -7367,7 +7389,14 @@ async def view_as_exit(
             result="success",
         )
 
-    destination = safe_internal_path(next, "/admin/access")
+    # Back to where the admin STARTED, not to the page they happened to stop
+    # on: they left the Access page to answer a question about one person, so
+    # returning them to that page with that person still picked is the only
+    # landing that finishes the errand. The destination comes from the signed
+    # ticket (`return_path`), which is also why this route no longer takes a
+    # `next` field — it mounts no auth dependency, so a form-supplied redirect
+    # target was the one attacker-influenced value it had.
+    destination = return_path(ticket)
     response = RedirectResponse(url=destination, status_code=303)
     response.delete_cookie(
         VIEW_AS_COOKIE,
@@ -10617,6 +10646,12 @@ async def admin_access_page(request: Request, user: dict = Depends(require_admin
     # POST (F2) — the same mint-and-set pair /me/profile and /auth/logout use.
     csrf_token = _get_or_mint_web_csrf(request)
     ctx["csrf_token"] = csrf_token
+    # Who is asking — so the person lens can decline to OFFER a view-as of the
+    # caller themselves. `view_as_self` is a real 400 at the entry route, and
+    # without this the page rendered the button for the caller's own row and
+    # sent them to a full-page error carrying a machine token and no way back
+    # to the lens they came from.
+    ctx["viewer_user_id"] = str(user["id"])
     response = templates.TemplateResponse(request, "admin_access.html", ctx)
     _set_web_csrf_cookie(response, request, csrf_token)
     return response

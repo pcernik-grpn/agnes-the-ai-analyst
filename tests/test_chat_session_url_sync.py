@@ -24,6 +24,15 @@ def _chat_js() -> str:
 
 
 def _slice(js: str, start_marker: str, end_marker: str) -> str:
+    """The source between two markers.
+
+    ``end_marker`` is the banner of whatever section follows ``_syncSessionUrl``
+    in chat.js — it only has to be the NEXT thing, so it moves whenever that
+    neighbour is renamed (it has been "Composer agent picker" and is now "Agents
+    in the chat window"). A rename fails here with a bare ValueError; if you are
+    reading this because of one, the fix is to re-point the marker, not to
+    change what the helper asserts.
+    """
     start = js.index(start_marker)
     end = js.index(end_marker, start)
     return js[start:end]
@@ -31,7 +40,7 @@ def _slice(js: str, start_marker: str, end_marker: str) -> str:
 
 def test_sync_helper_exists_and_uses_replace_state_not_push_state():
     js = _chat_js()
-    body = _slice(js, "function _syncSessionUrl(chatId) {", "// --- Composer agent picker")
+    body = _slice(js, "function _syncSessionUrl(chatId) {", "// --- Agents in the chat window")
     assert "new URL(window.location.href)" in body
     assert "u.searchParams.set(" in body and '"session"' in body
     assert "u.searchParams.delete(" in body
@@ -44,7 +53,7 @@ def test_sync_helper_clears_the_param_on_a_falsy_id():
     'null'/'undefined' — the bug this whole feature exists to avoid on the
     reverse path (a param that lingers past its session)."""
     js = _chat_js()
-    body = _slice(js, "function _syncSessionUrl(chatId) {", "// --- Composer agent picker")
+    body = _slice(js, "function _syncSessionUrl(chatId) {", "// --- Agents in the chat window")
     assert "if (chatId) {" in body
     delete_idx = body.index("u.searchParams.delete(")
     set_idx = body.index("u.searchParams.set(")
