@@ -3563,6 +3563,13 @@ KNOWN_UNTESTED = {
     # answers identically on both backends by construction; covered by
     # tests/test_admin_extraction.py::TestExtractionConfig.
     "GET /api/admin/sharepoint/connections/{connection_id}/extraction/config",
+    # Completeness check (TCRD-296 B.9) reads crawl state
+    # (sharepoint_connection_state), corpus_files and the job queue — none
+    # of them extraction_runs — so it answers identically on both backends
+    # by construction; covered by
+    # tests/test_admin_extraction.py::TestCompleteness (200/409/400,
+    # cache/refresh, provisional).
+    "GET /api/admin/sharepoint/connections/{connection_id}/extraction/completeness",
     # Cooperative stop (owner-frustration fix, 2026-09-01) writes to
     # `source_connections`/`config_patch`, a frozen pre-A3 pair present on
     # BOTH backends — unlike its `extraction/status|runs|config` siblings

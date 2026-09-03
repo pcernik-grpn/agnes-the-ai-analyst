@@ -25,6 +25,12 @@ class TestExtractionFleetPageAuth:
         assert 'id="ext-scope-active"' in body
         assert 'id="ext-scope-all"' in body
         assert "/api/admin/sharepoint/extraction/runs" in body
+        # Completeness drawer (TCRD-296 B.9) — rendered through the SAME
+        # shared JS the source card's own drawer uses, loaded on this page
+        # too, plus the shell it re-homes per connection.
+        assert 'id="ext-fleet-completeness-shell"' in body
+        assert "openFleetCompleteness" in body
+        assert "data_sources_extraction_observability.js" in body
 
     def test_non_admin_gets_403(self, seeded_app):
         client, token = seeded_app["client"], seeded_app["analyst_token"]

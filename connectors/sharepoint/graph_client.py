@@ -439,19 +439,58 @@ async def list_root_children_with_url(access_token: str, drive_id: str) -> List[
     ]
 
 
-async def search_document_count(access_token: str, web_url: str, *, min_modified: Optional[str] = None) -> int:
+async def get_item_web_url(access_token: str, drive_id: str, item_id: Optional[str] = None) -> Optional[str]:
+    """``webUrl`` of one drive item — the drive ROOT when ``item_id`` is
+    ``None``, else that specific item. Used by the completeness check
+    (``app.api.admin_extraction``'s ``…/extraction/completeness``) to turn a
+    confirmed scope's ``(drive_id, source_scope_id)`` into the ``web_url``
+    :func:`search_document_count` needs — the same identity
+    :func:`list_root_children_with_url` already resolves for drive-ROOT
+    children, extended to one arbitrary item.
+
+    **Never raises** — same contract as :func:`search_document_count`: a
+    failed lookup (network error, non-200, missing field) returns ``None``,
+    and the caller treats a scope whose ``web_url`` could not be resolved as
+    "expected unknown", never as zero.
+    """
+    path = f"/drives/{drive_id}/root" if not item_id else f"/drives/{drive_id}/items/{item_id}"
+    try:
+        body = await _graph_get(access_token, path, params={"$select": "webUrl"})
+    except Exception:  # noqa: BLE001 — best-effort lookup, never fails the caller
+        logger.warning("sharepoint get_item_web_url failed for drive %s item %s", drive_id, item_id, exc_info=True)
+        return None
+    web_url = body.get("webUrl")
+    return str(web_url) if web_url else None
+
+
+async def search_document_count(
+    access_token: str,
+    web_url: str,
+    *,
+    min_modified: Optional[str] = None,
+    exclude_extensions: Optional[frozenset] = None,
+) -> int:
     """Best-effort document count under one drive-item path, via Graph
     Search (``POST /search/query``, ``entityTypes: ["driveItem"]``) — the
-    site-split planner's own balancing signal. Deliberately NEVER a delta
-    walk: a delta walk gets throttled under repetition and its first pages
-    are biased, which would skew which folders look "big" (module docstring
-    of ``app.api.admin_sharepoint``'s split-plan endpoint has the full
+    site-split planner's own balancing signal, and the completeness check's
+    "expected" count (``app.api.admin_extraction``'s ``…/extraction/
+    completeness``). Deliberately NEVER a delta walk: a delta walk gets
+    throttled under repetition and its first pages are biased, which would
+    skew which folders look "big" (module docstring of
+    ``app.api.admin_sharepoint``'s split-plan endpoint has the full
     reasoning). ``region: "NAM"`` is required by Graph Search and pinned the
     same way everywhere it is used in this codebase.
 
     Query: ``path:"<web_url>" AND IsDocument:1``, optionally narrowed by
     ``AND LastModifiedTime>=<min_modified>`` (an admin-supplied
-    ``YYYY-MM-DD``, validated by the caller before it ever reaches here).
+    ``YYYY-MM-DD``, validated by the caller before it ever reaches here) and
+    by ``AND NOT (fileextension:ext1 OR fileextension:ext2 ...)`` when
+    ``exclude_extensions`` is given — the completeness check's caller passes
+    the crawler's own ``_unsupported_extensions()`` so "expected" only
+    counts documents the crawl would actually attempt to convert, matching
+    what a full run could ever land in the corpus. ``exclude_extensions``
+    entries are a closed, internally-defined set (never user text spliced
+    into the query), same trust boundary as ``min_modified``.
 
     **Never raises** — a failed count (network error, non-200, a malformed
     or empty ``hitsContainers``) returns ``0``. A folder whose count could
@@ -463,6 +502,9 @@ async def search_document_count(access_token: str, web_url: str, *, min_modified
     query = f'path:"{web_url}" AND IsDocument:1'
     if min_modified:
         query += f" AND LastModifiedTime>={min_modified}"
+    if exclude_extensions:
+        excluded = " OR ".join(f"fileextension:{ext}" for ext in sorted(exclude_extensions))
+        query += f" AND NOT ({excluded})"
     request_body = {
         "requests": [
             {

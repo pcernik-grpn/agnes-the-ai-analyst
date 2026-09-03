@@ -1406,6 +1406,17 @@ _EXEMPT: dict[str, str] = {
         "read-only effective extraction configuration with per-leaf origins for the "
         "source card's config drawer — admin display primitive, no analyst CLI/MCP analogue"
     ),
+    # Completeness check (TCRD-296 B.9) — "did we really get everything?":
+    # per-scope/per-folder Graph Search document counts vs. what actually
+    # landed in the corpus. Same class as split-plan above: CLI-reachable
+    # (`agnes admin sharepoint completeness`) for an operator scripting the
+    # same check over SSH, but deliberately not MCP-exposed — an admin/ops
+    # display primitive over live Graph data, not an analyst query surface.
+    "/api/admin/sharepoint/connections/{connection_id}/extraction/completeness": (
+        "per-scope/per-folder expected-vs-indexed document counts (Graph Search fan-out) "
+        "for the completeness drawer — CLI-reachable (agnes admin sharepoint completeness) "
+        "but deliberately not MCP-exposed, same reasoning as split-plan above"
+    ),
     # Cooperative stop for the same card's Stop button (owner-frustration fix,
     # 2026-09-01) — an admin-only control over the SAME crawl the trigger
     # above starts, no analyst CLI/MCP analogue.

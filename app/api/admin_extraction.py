@@ -49,16 +49,27 @@ Surface (all gated by ``Depends(require_admin)``):
       thousand documents do to mine?" that no amount of configuration
       documentation can give. Cataloged; the sample text itself is never
       logged and never stored.
+  GET /api/admin/sharepoint/connections/{id}/extraction/completeness
+      A6 — "did we really get everything?" (TCRD-296 B.9): Graph Search's
+      own document count per scope (and, for a single whole-drive scope,
+      per top-level folder) vs. what actually landed in the corpus, with
+      the crawl's own failed/empty/skipped/oversize reasons applied before
+      calling a gap unexplained. All the math is in ``connectors.sharepoint.
+      completeness`` — see that module's docstring. Cataloged (not exempt),
+      same reasoning as ``…/split-plan``: it discloses folder names and
+      per-scope/per-folder document counts, never document content.
 
 **PG-only, and honest about it.** ``extraction_runs`` is a post-A3 table, so
 resolving its repository on a DuckDB-backed instance raises the typed
 ``RequiresPostgresBackend``, which the app-wide handler in ``app/main.py``
 turns into a clean ``501 requires_postgres_backend``. These handlers let it
 surface rather than improvising an empty-but-healthy-looking answer — the
-card stops polling on a 501 and says why (design §4.4). ``…/extraction/config``
-and ``…/extraction/stop`` read/write no run rows and therefore answer on BOTH
-backends: configuration, and the stop signal, are both knowable and settable
-without a database that can show run history.
+card stops polling on a 501 and says why (design §4.4). ``…/extraction/config``,
+``…/extraction/stop`` and ``…/extraction/completeness`` read/write no run rows
+and therefore answer on BOTH backends: configuration, the stop signal, and the
+completeness check (crawl state + ``corpus_files`` + the job queue, none of
+them ``extraction_runs``) are all knowable without a database that can show
+run history.
 
 **Liveness is DERIVED, never trusted.** A SIGKILLed worker finalizes
 nothing, so a row can say ``running`` forever. ``status`` therefore reports
@@ -79,6 +90,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 from collections import deque
 from datetime import date, datetime, timezone
 from typing import Any, Deque, Dict, List, Optional, Tuple
@@ -1622,6 +1634,138 @@ async def extraction_config(
         if section_editable
         else "The `extraction` section is not admin-writable on this instance.",
         "min_modified": {"value": cutoff.isoformat() if cutoff else None, "source": min_modified_source},
+        "as_of": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Completeness check — "did we really get everything?" (TCRD-296 synthesis
+# item B.9). An operator's ad hoc script compared Graph Search document
+# counts per top-level folder against corpus_files rows per scope
+# collection; this is that script, promoted to a read-only admin surface.
+# All the actual math lives in ``connectors.sharepoint.completeness`` — see
+# that module's docstring for the row shape, the status vocabulary
+# (unknown/complete/accounted/missing) and each reason count's honest
+# attribution limits. This section owns only: connection/param resolution,
+# the Graph token, the in-process TTL cache, and the "is a crawl running
+# right now" liveness flag.
+# ---------------------------------------------------------------------------
+
+#: How long a computed report is reused before a repeat open of the drawer
+#: recomputes it — one Graph Search call per scope/folder (an
+#: ``_COUNT_CONCURRENCY``-wide fan-out, same throttle the site-split planner
+#: uses), so this is the only thing standing between "click Recount twice"
+#: and rate-limiting an admin's own tenant. Best-effort and process-local
+#: (not shared across worker processes, same trade-off as the fleet
+#: endpoint's own rate sampler above) — a cache miss just recomputes, never
+#: a correctness issue. ``refresh=true`` bypasses AND repopulates the entry.
+_COMPLETENESS_CACHE_TTL_S = 600
+_completeness_cache_lock = threading.Lock()
+_completeness_cache: Dict[Tuple[str, Optional[str]], Tuple[float, Dict[str, Any]]] = {}
+
+
+def _completeness_cache_get(key: Tuple[str, Optional[str]]) -> Optional[Dict[str, Any]]:
+    with _completeness_cache_lock:
+        entry = _completeness_cache.get(key)
+    if entry is None:
+        return None
+    computed_at, payload = entry
+    if time.monotonic() - computed_at > _COMPLETENESS_CACHE_TTL_S:
+        return None
+    return payload
+
+
+def _completeness_cache_put(key: Tuple[str, Optional[str]], payload: Dict[str, Any]) -> None:
+    with _completeness_cache_lock:
+        _completeness_cache[key] = (time.monotonic(), payload)
+
+
+def _completeness_crawl_running(connection_id: str) -> bool:
+    """Whether a ``corpus-extraction`` job is queued/running for this
+    connection right now — the SAME job-queue lookup :func:`_facts_job_in_
+    flight` uses for the facts pass, matched on the trigger's own
+    idempotency key. Deliberately NOT ``extraction_runs`` (PG-only): this
+    keeps the completeness check answerable on both app-state backends,
+    same reasoning as ``…/extraction/config`` above."""
+    from app.api.admin_sharepoint import _extraction_idempotency_key
+    from src.repositories import jobs_repo
+
+    key = _extraction_idempotency_key(connection_id)
+    repo = jobs_repo()
+    for status in ("running", "queued"):
+        for job in repo.list(status=status, kind="corpus-extraction", limit=200):
+            if job.get("idempotency_key") == key:
+                return True
+    return False
+
+
+@router.get("/connections/{connection_id}/extraction/completeness")
+async def extraction_completeness(
+    connection_id: str,
+    min_modified: Optional[str] = None,
+    refresh: bool = False,
+    _user: dict = Depends(require_admin),
+):
+    """A6 — "did we really get everything?": one row per confirmed scope,
+    plus (only for a connection with exactly one whole-drive scope) one row
+    per top-level folder under it, plus a totals row.
+
+    ``min_modified`` defaults to the connection's OWN resolved crawl cutoff
+    (:func:`connectors.sharepoint.crawler.resolve_min_modified` — same
+    ``{value, source}`` shape ``…/extraction/config`` returns) so "expected"
+    counts exactly the population the last crawl would have attempted, not
+    an unfiltered superset; an explicit query param overrides it
+    (``source: "query"``). ``400 invalid_min_modified`` for a malformed
+    override, same validation ``…/split-plan`` runs on the identical key.
+
+    Cached per ``(connection_id, resolved min_modified)`` for
+    :data:`_COMPLETENESS_CACHE_TTL_S` — the response's own ``cached`` field
+    says whether this answer was reused. ``refresh=true`` bypasses the
+    cache and recomputes.
+
+    ``provisional: true`` when a ``corpus-extraction`` job is currently
+    queued/running for this connection — the numbers are still returned
+    (a stale-but-labeled answer beats none), just flagged as a snapshot
+    mid-crawl rather than a settled one.
+
+    Read-only: no crawl state is written, no corpus row is touched. ``404``
+    for an unknown/non-SharePoint connection id; the same ``409``/``502``
+    ``…/split-plan`` raises when this connection's certificate is
+    unresolved or Graph itself rejects the token exchange.
+    """
+    connection = _sharepoint_connection_or_404(connection_id)
+    from app.api.admin_sharepoint import _resolved_token, _validate_min_modified
+    from connectors.sharepoint.completeness import compute_completeness
+    from connectors.sharepoint.crawler import resolve_min_modified
+
+    _validate_min_modified(min_modified)
+    if min_modified:
+        resolved_min_modified: Optional[str] = min_modified
+        min_modified_source = "query"
+    else:
+        cutoff, min_modified_source = resolve_min_modified(connection)
+        resolved_min_modified = cutoff.isoformat() if cutoff else None
+
+    cache_key = (connection_id, resolved_min_modified)
+    cached = None if refresh else _completeness_cache_get(cache_key)
+    if cached is not None:
+        report = cached
+        was_cached = True
+    else:
+        scopes = [s for s in (connection.get("config") or {}).get("scopes") or [] if isinstance(s, dict)]
+        # No token exchange for a connection with no confirmed scope yet —
+        # there is nothing to count against, and a not-yet-configured
+        # certificate must not turn "no scopes" into a 409.
+        token = await _resolved_token(connection) if scopes else None
+        report = await compute_completeness(connection, min_modified=resolved_min_modified, token=token)
+        _completeness_cache_put(cache_key, report)
+        was_cached = False
+
+    return {
+        **report,
+        "min_modified": {"value": resolved_min_modified, "source": min_modified_source},
+        "cached": was_cached,
+        "provisional": _completeness_crawl_running(connection_id),
         "as_of": datetime.now(timezone.utc).isoformat(),
     }
 

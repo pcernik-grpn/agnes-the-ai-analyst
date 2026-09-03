@@ -32712,6 +32712,95 @@
         ]
       }
     },
+    "/api/admin/sharepoint/connections/{connection_id}/extraction/completeness": {
+      "get": {
+        "description": "A6 \u2014 \"did we really get everything?\": one row per confirmed scope,\nplus (only for a connection with exactly one whole-drive scope) one row\nper top-level folder under it, plus a totals row.\n\n``min_modified`` defaults to the connection's OWN resolved crawl cutoff\n(:func:`connectors.sharepoint.crawler.resolve_min_modified` \u2014 same\n``{value, source}`` shape ``\u2026/extraction/config`` returns) so \"expected\"\ncounts exactly the population the last crawl would have attempted, not\nan unfiltered superset; an explicit query param overrides it\n(``source: \"query\"``). ``400 invalid_min_modified`` for a malformed\noverride, same validation ``\u2026/split-plan`` runs on the identical key.\n\nCached per ``(connection_id, resolved min_modified)`` for\n:data:`_COMPLETENESS_CACHE_TTL_S` \u2014 the response's own ``cached`` field\nsays whether this answer was reused. ``refresh=true`` bypasses the\ncache and recomputes.\n\n``provisional: true`` when a ``corpus-extraction`` job is currently\nqueued/running for this connection \u2014 the numbers are still returned\n(a stale-but-labeled answer beats none), just flagged as a snapshot\nmid-crawl rather than a settled one.\n\nRead-only: no crawl state is written, no corpus row is touched. ``404``\nfor an unknown/non-SharePoint connection id; the same ``409``/``502``\n``\u2026/split-plan`` raises when this connection's certificate is\nunresolved or Graph itself rejects the token exchange.",
+        "operationId": "extraction_completeness_api_admin_sharepoint_connections__connection_id__extraction_completeness_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "title": "Connection Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "min_modified",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Min Modified"
+            }
+          },
+          {
+            "in": "query",
+            "name": "refresh",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Refresh",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Extraction Completeness",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
     "/api/admin/sharepoint/connections/{connection_id}/extraction/config": {
       "get": {
         "description": "A5 \u2014 the read-only effective configuration for this connection's\nextraction, with an origin and a lock state on every row.\n\nCataloged rather than exempt (``sharepoint_connection.extraction_config_read``):\nit discloses credential env-var NAMES and the per-scope audience-class\nmapping \u2014 the same disclosure class as its ``scopes_read`` /\n``certificate_read`` siblings.\n\nAnswers on BOTH backends: nothing here reads ``extraction_runs``, and\nan admin locked out of the configuration read-out because their instance\nis on DuckDB would be a degradation with no cause.\n\n``min_modified`` carries the resolved crawl age filter (the SAME\n``{value, source}`` shape the ``\u2026/extraction/crawl-config`` PATCH\nresponse returns) \u2014 the drawer's Crawl filter panel needs the CURRENT\noverride to pre-fill its date input, not just a place to write a new one.",
@@ -33925,7 +34014,7 @@
     },
     "/api/admin/sharepoint/connections/{connection_id}/splits": {
       "post": {
-        "description": "Apply a site split (see :func:`split_plan` above for the read-only\npreview this computes identically before creating anything): creates\n``body.n`` sibling connections, each named ``\"<source name> \u2014 part\ni/n\"`` (:func:`connectors.sharepoint.site_split.format_group_name`),\nwired to the same credential material as the source\n(:func:`_cloned_base_config`, the same helper ``POST \u2026/clone`` uses) and\ngiven its own slice of the source's top-level folders as confirmed\nscopes \u2014 the same scope-row shape and collection-minting call\n(:func:`_create_scope_collection`) ``POST \u2026/scopes/bulk`` uses, so a\nsplit clone looks identical to one built by hand through clone +\nbulk-add.\n\n``body.min_modified``, when given, is written onto EACH clone's\n``config.extraction.crawl.min_modified`` \u2014 the crawl does not read that\nkey yet (no admin-facing date filter has shipped for the crawl itself at\nthe time this endpoint was written), so today it is inert bookkeeping\nthat a near-term crawl change will start honoring under the same key,\nnot a promise this endpoint enforces itself. ``body.transport`` /\n``body.retry_mode`` are written onto ``config.extraction.facts`` \u2014 the\nexact keys ``PATCH \u2026/extraction/facts-config`` writes \u2014 so a split can\nhand every clone the same per-connection retry/transport policy in one\ncall instead of ``n`` follow-up PATCHes.\n\n**Idempotency**: refuses with ``409 split_exists`` BEFORE creating\nanything if a connection named like any of this split's target names\nalready exists (the exact names :func:`split_plan` would have shown) \u2014\na repeat ``POST`` never creates a second, name-colliding batch.\n\n``body.start=True`` enqueues each clone's ``corpus-extraction`` job\nimmediately after it is created, in creation order \u2014 the same job\n``POST \u2026/{id}/extract`` enqueues, skipped silently (never a 409/500 that\nwould make a split appear to have failed) when extraction readiness\n(``sharepoint.enabled`` / the ``extraction`` extra) is not currently\nsatisfied; the clones themselves are still created either way.\n\nReturns ``{\"connections\": [{id, name, folders: [{name, documents}],\ndocuments}]}`` \u2014 one entry per created clone, in the same order as\n``split_plan``'s own ``groups``.",
+        "description": "Apply a site split (see :func:`split_plan` above for the read-only\npreview this computes identically before creating anything): creates\n``body.n`` sibling connections, each named ``\"<source name> \u2014 part\ni/n\"`` (:func:`connectors.sharepoint.site_split.format_group_name`),\nwired to the same credential material as the source\n(:func:`_cloned_base_config`, the same helper ``POST \u2026/clone`` uses) and\ngiven its own slice of the source's top-level folders as confirmed\nscopes \u2014 the same scope-row shape and collection-minting call\n(:func:`_create_scope_collection`) ``POST \u2026/scopes/bulk`` uses, so a\nsplit clone looks identical to one built by hand through clone +\nbulk-add.\n``body.min_modified`` is written onto each clone's\n``config.extraction.crawl.min_modified`` \u2014 the exact key\n``PATCH \u2026/extraction/crawl-config`` writes and the crawl reads\n(``resolve_min_modified``), so every part crawls with the same age\nfilter from its first run. ``body.transport`` /\n``body.retry_mode`` are written onto ``config.extraction.facts`` \u2014 the\nexact keys ``PATCH \u2026/extraction/facts-config`` writes \u2014 so a split can\nhand every clone the same per-connection retry/transport policy in one\ncall instead of ``n`` follow-up PATCHes.\n\n**Idempotency**: refuses with ``409 split_exists`` BEFORE creating\nanything if a connection named like any of this split's target names\nalready exists (the exact names :func:`split_plan` would have shown) \u2014\na repeat ``POST`` never creates a second, name-colliding batch.\n\n``body.start=True`` enqueues each clone's ``corpus-extraction`` job\nimmediately after it is created, in creation order \u2014 the same job\n``POST \u2026/{id}/extract`` enqueues, skipped silently (never a 409/500 that\nwould make a split appear to have failed) when extraction readiness\n(``sharepoint.enabled`` / the ``extraction`` extra) is not currently\nsatisfied; the clones themselves are still created either way.\n\nReturns ``{\"connections\": [{id, name, folders: [{name, documents}],\ndocuments}]}`` \u2014 one entry per created clone, in the same order as\n``split_plan``'s own ``groups``.",
         "operationId": "apply_split_api_admin_sharepoint_connections__connection_id__splits_post",
         "parameters": [
           {

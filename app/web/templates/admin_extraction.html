@@ -60,6 +60,19 @@
      reuses the shared `.badge` + `.badge--{info,warn,success,danger}`
      vocabulary from components.css, tinted by the SAME accent tokens the
      rest of the product's status pills use (design-system.md rule 4). */
+
+  /* Completeness drawer (TCRD-296 B.9) — rendered by the SAME
+     `_extCompletenessHtml`/`toggleExtractionDrawer` functions the source
+     card's drawer uses (data_sources_extraction_observability.js, loaded
+     below): one shared table/actions vocabulary, not a second copy of it. */
+  .ext-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+  .ext-warn { color: var(--ds-accent-warn-ink); }
+  .ext-drawer { margin: 10px 0; padding: 12px; border: 1px solid var(--ds-border); border-radius: var(--ds-radius-btn); background: var(--ds-surface); }
+  .ext-cfg { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  .ext-cfg th, .ext-cfg td { text-align: left; padding: 6px 8px; vertical-align: top; border-bottom: 1px solid var(--ds-border); }
+  .ext-cfg th { font-weight: 600; color: var(--ds-text-secondary); white-space: nowrap; }
+  .ext-completeness .ext-num { text-align: right; font-variant-numeric: tabular-nums; }
+  .ext-completeness__total td { font-weight: 600; border-top: 2px solid var(--ds-border); }
 </style>
 {% endblock %}
 
@@ -116,16 +129,25 @@
         <th>Est. cost</th>
         <th>Last checkpoint</th>
         <th>Error</th>
+        <th></th>
       </tr>
     </thead>
     <tbody id="ext-tbody">
-      <tr><td colspan="9" class="ext-blank">Loading…</td></tr>
+      <tr><td colspan="10" class="ext-blank">Loading…</td></tr>
     </tbody>
   </table>
 </div>
+
+{# One shared drawer shell, re-homed per connection by `openFleetCompleteness`
+   below to the exact `ext-drawer-<connId>` id
+   `data_sources_extraction_observability.js`'s rendering/recount/sort
+   functions already look up — the source card's drawer and this one render
+   through the SAME code, never a second copy of it (TCRD-296 B.9). #}
+<div id="ext-fleet-completeness-shell"></div>
 {% endblock %}
 
 {% block scripts %}
+<script src="{{ static_url('js/admin/data_sources_extraction_observability.js') }}"></script>
 <script>
 // Scope: "active" (default — only connections with a run CURRENTLY
 // running, the "is it on pace right now" view) or "all" (every SharePoint
@@ -228,8 +250,31 @@ function renderRow(row) {
     <td class="ext-num">${fmtCost(cost)}</td>
     <td class="ext-sub">${fmtAgo(row.checkpoint_age_s)}</td>
     <td>${run && run.error ? `<span class="ext-error-cell" title="${esc(run.error)}">${esc(run.error)}</span>` : ""}</td>
+    <td><button type="button" class="btn btn-sm btn-secondary" onclick="openFleetCompleteness('${row.connection_id}')">Completeness</button></td>
   `;
   return tr;
+}
+
+// "Did we really get everything?" (TCRD-296 B.9) — re-homes the ONE shared
+// drawer shell to this connection's id so
+// data_sources_extraction_observability.js's `toggleExtractionDrawer` /
+// `_extCompletenessHtml` / `extRecountCompleteness` / `extSortCompleteness`
+// (the SAME functions the source card's drawer uses) render it verbatim.
+// Switching to a different connection's drawer simply re-homes the shell —
+// only one completeness drawer is open on this page at a time.
+let extFleetOpenConnId = null;
+
+function openFleetCompleteness(connId) {
+  const shell = document.getElementById("ext-fleet-completeness-shell");
+  if (extFleetOpenConnId === connId) {
+    // Same connection clicked again: let toggleExtractionDrawer's own
+    // open/close logic decide (it closes when already open+visible).
+    toggleExtractionDrawer(connId, "completeness");
+    return;
+  }
+  extFleetOpenConnId = connId;
+  shell.innerHTML = `<div class="ext-drawer" id="ext-drawer-${esc(connId)}" hidden></div>`;
+  toggleExtractionDrawer(connId, "completeness");
 }
 
 function renderTable(body) {
@@ -239,7 +284,7 @@ function renderTable(body) {
     const msg = extScope === "active"
       ? "No SharePoint connection currently has a run in progress."
       : "No SharePoint connections are registered.";
-    tbody.innerHTML = `<tr><td colspan="9" class="ext-blank">${msg}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="10" class="ext-blank">${msg}</td></tr>`;
   } else {
     tbody.innerHTML = "";
     for (const row of rows) tbody.appendChild(renderRow(row));
