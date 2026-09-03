@@ -52718,7 +52718,7 @@
     },
     "/api/semantic-models/{slug}.yaml": {
       "get": {
-        "description": "Export the stored document byte-for-byte \u2014 never re-serialized, so\ncomments and key order survive.",
+        "description": "Export the stored document byte-for-byte \u2014 never re-serialized, so\ncomments and key order survive.\n\nProvenance rides response HEADERS, never the body (issue #2153): ``ETag``\nis the row's own ``content_hash`` (sha256 of the document), quoted per\nRFC 7232, and ``X-Semantic-Model-Updated-At`` is ``updated_at`` in\nISO-8601 \u2014 the only two fields the row actually carries that identify\n*which* revision this is. A caller that must pin provenance (a skill,\nan agent) reads these instead of re-hashing the body itself; the MCP\ntool `semantic_model_get` folds both into its response. No\nIf-None-Match / conditional GET \u2014 the ETag is informational only, not\na caching contract.",
         "operationId": "export_semantic_model_api_semantic_models__slug__yaml_get",
         "parameters": [
           {
