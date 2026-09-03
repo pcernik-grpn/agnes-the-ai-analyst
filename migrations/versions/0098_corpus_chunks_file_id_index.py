@@ -13,12 +13,16 @@ over what was by then 4.3 million rows / 5 GB, 2–3 s each, with three
 PostgreSQL backends pinned at ~90 % CPU. The database, not the crawler,
 bounded the whole fleet at ~240 documents/min.
 
-Created ``CONCURRENTLY`` so an instance mid-crawl is never blocked: Alembic
-runs each revision inside a transaction by default, and ``CREATE INDEX
-CONCURRENTLY`` refuses to run inside one, so this revision commits the
-migration transaction first (``autocommit_block``). ``IF NOT EXISTS`` makes
-it safe on an instance where an operator already built the index by hand
-during the incident.
+A plain (transactional) ``CREATE INDEX IF NOT EXISTS``, on purpose: the
+startup revision repair (``src/db_pg.py``) runs ``alembic upgrade head``
+inside a connection whose transaction it owns, and ``CREATE INDEX
+CONCURRENTLY`` — which needs Alembic's ``autocommit_block()`` to commit
+that transaction first — fails there with ``PendingRollbackError``
+(caught by ``tests/db_pg/test_startup_revision_check.py``). Migrations run
+at process start, before any worker writes, so the short share lock a
+plain build takes on ``corpus_chunks`` costs nothing; an operator who
+already built the index by hand during the incident (the live fix was
+``CREATE INDEX CONCURRENTLY``) is left alone by ``IF NOT EXISTS``.
 
 Revision ID: 0098_corpus_chunks_file_id_index
 Revises: 0097_facts_llm_cache
@@ -40,21 +44,8 @@ INDEX_NAME = "idx_corpus_chunks_file_id"
 
 
 def upgrade() -> None:
-    with op.get_context().autocommit_block():
-        op.create_index(
-            INDEX_NAME,
-            "corpus_chunks",
-            ["file_id"],
-            if_not_exists=True,
-            postgresql_concurrently=True,
-        )
+    op.create_index(INDEX_NAME, "corpus_chunks", ["file_id"], if_not_exists=True)
 
 
 def downgrade() -> None:
-    with op.get_context().autocommit_block():
-        op.drop_index(
-            INDEX_NAME,
-            table_name="corpus_chunks",
-            if_exists=True,
-            postgresql_concurrently=True,
-        )
+    op.drop_index(INDEX_NAME, table_name="corpus_chunks", if_exists=True)
