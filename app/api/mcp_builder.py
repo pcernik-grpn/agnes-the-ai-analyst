@@ -326,9 +326,9 @@ def _stub_turn(message: str, draft: Dict[str, Any]) -> Dict[str, Any]:
     if not message.strip():
         return {
             "reply": (
-                f"[stub] Let's connect a tool server. First thing I need: {first}."
+                f"Let's connect a tool server. First thing I need: {first}."
                 if first
-                else "[stub] Let's connect a tool server."
+                else "Let's connect a tool server."
             ),
             "patch": {},
             "suggestions": [],
@@ -339,7 +339,7 @@ def _stub_turn(message: str, draft: Dict[str, Any]) -> Dict[str, Any]:
         if host:
             patch["name"] = host
     return {
-        "reply": (f"[stub] Noted. Next: {first}." if first else "[stub] That is everything I need."),
+        "reply": (f"Noted. Next: {first}." if first else "That is everything I need."),
         "patch": patch,
         "suggestions": ["It needs a bearer token", "There is no auth"],
     }
