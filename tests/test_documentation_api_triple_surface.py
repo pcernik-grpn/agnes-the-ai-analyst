@@ -1297,6 +1297,15 @@ _EXEMPT: dict[str, str] = {
     # data), and splits carries clone's own credential-provisioning +
     # scopes/bulk's own collection-minting side effects, neither of which
     # is agent-invokable today.
+    # Shard-plan (2026-09-03 auto-parallel-crawl design §4.7) — the
+    # automatic successor to split-plan right below: same shape (read-only
+    # preview over live Graph data), same exemption reasoning.
+    "/api/admin/sharepoint/connections/{connection_id}/shard-plan": (
+        "read-only preview of the automatic parallel crawl's shard plan — CLI-reachable "
+        "(agnes admin sharepoint shard-plan) but deliberately not MCP-exposed: an admin/ops "
+        "display primitive over live Graph data, not an analyst query surface, same "
+        "reasoning as split-plan below"
+    ),
     "/api/admin/sharepoint/connections/{connection_id}/split-plan": (
         "read-only preview of a folder-based site split (greedy-packed groups + "
         "per-folder Graph Search document counts) — CLI-reachable (agnes admin "

@@ -113,7 +113,7 @@ from connectors.sharepoint import graph_client
 from connectors.sharepoint.acl_sync import active_zone_rows
 from connectors.sharepoint.graph_client import GRAPH_BASE, SharePointGraphError
 from connectors.sharepoint.settings import SharePointSettingsError, resolve_sharepoint_settings
-from connectors.sharepoint.shard_plan import compute_shard_plan
+from connectors.sharepoint.shard_plan import SIGNAL_NONE, compute_shard_plan
 
 logger = logging.getLogger(__name__)
 
@@ -6889,3 +6889,148 @@ def _finalize_site_run(connection: Dict[str, Any], parent_run_id: str) -> None:
             connection_id,
             exc_info=True,
         )
+
+
+# --------------------------------------------------------------------------
+# Read-only shard-plan preview (2026-09-03 auto-parallel-crawl design §4.7,
+# plan Task 9) — `GET .../connections/{id}/shard-plan`
+# (`app/api/admin_sharepoint.py`). Mirrors `_plan_or_run_inline`'s own
+# planning decision so a preview and what an actual trigger would build
+# from can never disagree, but NEVER enqueues a job, opens a run row, or
+# falls back to "inline" on a Graph hiccup — a preview that silently
+# swallowed an error would just show a stale/empty plan instead of naming
+# what went wrong.
+# --------------------------------------------------------------------------
+
+
+async def preview_shard_plan(
+    connection: Dict[str, Any],
+    *,
+    only_scope_ids: Optional[List[str]] = None,
+    min_modified_override: Optional[date] = None,
+) -> Dict[str, Any]:
+    """Read-only preview of the automatic parallel-crawl plan for this
+    connection's site.
+
+    Runs the IDENTICAL two decisions :func:`_plan_or_run_inline` makes
+    before it ever enqueues anything (:func:`connectors.sharepoint.
+    shard_plan.compute_shard_plan`, over the same resolved
+    :func:`_drive_targets`), so a preview and the plan an actual trigger
+    would build from never disagree. Unlike :func:`_plan_or_run_inline`
+    this never falls back to "inline" on a Graph error — a scope-resolution
+    or Graph failure propagates as :class:`CrawlError`/
+    :class:`SharePointGraphError` for the caller
+    (``app.api.admin_sharepoint``) to translate into its own typed ``502``,
+    rather than a preview that silently looks like a small, healthy site.
+
+    Returns ``{"mode": "inline"|"sharded", "target_docs": int, "signal":
+    str, "shards": [...], "loose_root_files": [...]}``. ``mode ==
+    "inline"`` — with ``shards`` empty — exactly when
+    :func:`_plan_or_run_inline` would also stay inline: the active backend
+    is DuckDB (A3 ratchet), ``extraction.crawler.shard_target_docs`` is
+    ``0``, there is no confirmed scope to plan against, or the connection's
+    summed total stays at or under the target across every scope's every
+    drive. Each sharded entry: ``{"drive_id", "index", "label", "expected",
+    "targets_count"}`` — ``targets_count`` (never the raw ``targets`` list
+    itself — no Graph item ids leave this module) is how many delta units
+    this shard packs. ``loose_root_files`` concatenates every drive's own
+    root-level files no folder-based shard will cover (design §4.1 point 3
+    — the remainder shard still gets them at crawl time; this is preview-
+    only visibility).
+
+    ``min_modified_override`` narrows every document count to this date
+    or later, for THIS preview call only — the exact "what if I backfilled
+    from here" question ``GET …/split-plan?min_modified=`` already answers
+    for the manual planner. ``None`` (the default) resolves the
+    connection's own configured cutoff (:func:`resolve_min_modified`) —
+    the SAME value an actual triggered run would use, so a preview with no
+    override still matches reality.
+    """
+    target_docs = _shard_target_docs()
+
+    from src.repositories import use_pg
+
+    if not use_pg() or target_docs <= 0:
+        return {
+            "mode": "inline",
+            "target_docs": target_docs,
+            "signal": SIGNAL_NONE,
+            "shards": [],
+            "loose_root_files": [],
+        }
+
+    scopes = _confirmed_scopes(connection)
+    if only_scope_ids:
+        wanted = set(only_scope_ids)
+        scopes = [s for s in scopes if str(s.get("source_scope_id")) in wanted]
+    if not scopes:
+        return {
+            "mode": "inline",
+            "target_docs": target_docs,
+            "signal": SIGNAL_NONE,
+            "shards": [],
+            "loose_root_files": [],
+        }
+
+    settings = resolve_sharepoint_settings(connection)
+    if min_modified_override is not None:
+        min_modified = min_modified_override
+    else:
+        min_modified, _min_modified_source = resolve_min_modified(connection)
+    stats = CrawlStats()
+    auth = GraphAuth(
+        acquire=lambda: graph_client.get_app_token(settings.tenant_id, settings.client_id, settings.private_key),
+        stats=stats,
+    )
+    transport = GraphTransport(auth, stats)
+
+    all_targets: List[DriveTarget] = []
+    for scope in scopes:
+        all_targets.extend(await _drive_targets(transport, scope))
+
+    if not all_targets:
+        return {
+            "mode": "inline",
+            "target_docs": target_docs,
+            "signal": SIGNAL_NONE,
+            "shards": [],
+            "loose_root_files": [],
+        }
+
+    plan = await compute_shard_plan(
+        transport, auth, {}, all_targets, min_modified=min_modified, target_docs=target_docs, max_shards=_MAX_SHARDS
+    )
+
+    if not plan["drives"]:
+        return {
+            "mode": "inline",
+            "target_docs": target_docs,
+            "signal": plan["signal"],
+            "shards": [],
+            "loose_root_files": [],
+        }
+
+    shards_out: List[Dict[str, Any]] = []
+    loose_root_files: List[str] = []
+    for drive_plan in plan["drives"]:
+        loose_root_files.extend(drive_plan.get("loose_root_files") or [])
+        for shard in drive_plan["shards"]:
+            if not shard["targets"]:
+                continue
+            shards_out.append(
+                {
+                    "drive_id": drive_plan["drive_id"],
+                    "index": shard["index"],
+                    "label": shard["label"],
+                    "expected": shard.get("expected") or 0,
+                    "targets_count": len(shard["targets"]),
+                }
+            )
+
+    return {
+        "mode": "sharded",
+        "target_docs": target_docs,
+        "signal": plan["signal"],
+        "shards": shards_out,
+        "loose_root_files": loose_root_files,
+    }

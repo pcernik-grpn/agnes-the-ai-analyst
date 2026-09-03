@@ -3477,6 +3477,14 @@ KNOWN_UNTESTED = {
     # tests/test_admin_sharepoint.py::TestSplitApply; not duplicated here.
     "GET /api/admin/sharepoint/connections/{connection_id}/split-plan",
     "POST /api/admin/sharepoint/connections/{connection_id}/splits",
+    # Shard-plan (2026-09-03 auto-parallel-crawl design §4.7) — the
+    # automatic successor to split-plan right above, same "needs a mocked
+    # Graph transport" reasoning. The real sharded-plan happy path (PG-only
+    # by construction) is
+    # tests/db_pg/test_sharepoint_shard_plan_route_pg.py; the
+    # backend-independent auth/404/validation/DuckDB-fail-clean contract is
+    # tests/test_admin_sharepoint.py::TestShardPlan.
+    "GET /api/admin/sharepoint/connections/{connection_id}/shard-plan",
     # Bounded BFS folder search (TCRD-240) over the same live tree — never
     # Graph's own `/search`. Same "no new schema surface" reasoning as the
     # sibling `/tree` route above; auth matrix, query-length/mode/glob

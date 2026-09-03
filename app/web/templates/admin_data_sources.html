@@ -1156,6 +1156,18 @@
   }
   .ext-run__head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: 12.5px; }
   .ext-run__when { color: var(--ds-text-muted); }
+  /* Shard roll-up (2026-09-03 auto-parallel-crawl design §4.7) — one line
+     per shard, same list vocabulary `.ext-errors__list` already uses. */
+  .ext-shards {
+    list-style: none; margin: 4px 0 0; padding: 0; display: flex; flex-direction: column;
+    gap: 4px;
+  }
+  .ext-shards li {
+    font-size: 11px; color: var(--ds-text-muted); padding: 4px 8px;
+    border: 1px solid var(--ds-border); border-radius: var(--ds-radius-btn);
+    background: var(--ds-surface);
+  }
+  .ext-shards li strong { color: var(--ds-text-primary); }
   /* Per-file error detail (`<details>`, lazy-fetched on first open — see
      `_extErrorsSummaryHtml`). The marker is hidden so the summary line reads
      like every other `.ext-sub` line until it is clicked. */

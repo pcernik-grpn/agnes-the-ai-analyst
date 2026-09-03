@@ -3789,11 +3789,53 @@ global.fetch = async (url, opts) => {{
         assert out["inFlightCleared"] is True
 
 
+class TestSharePointShardPlanControl:
+    """ "Parallel crawl — preview shards" (2026-09-03 auto-parallel-crawl
+    design §4.7) — the read-only front end for `GET .../shard-plan`, the
+    successor to the "Split this site" control below. Same "plain markup
+    assertion is enough" posture: the endpoint itself is covered by
+    tests/test_admin_sharepoint.py."""
+
+    def test_the_page_ships_the_shard_plan_control_and_its_handlers(self, seeded_app, monkeypatch):
+        from cryptography.fernet import Fernet
+
+        from app.secrets_vault import _reset_ephemeral_key_for_tests
+
+        monkeypatch.setenv("AGNES_VAULT_KEY", Fernet.generate_key().decode())
+        _reset_ephemeral_key_for_tests()
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        c.cookies.set("access_token", token)
+        try:
+            resp = c.get("/admin/data-sources", headers={"Accept": "text/html"})
+        finally:
+            c.cookies.clear()
+            _reset_ephemeral_key_for_tests()
+        assert resp.status_code == 200, resp.text
+        body = resp.text
+
+        assert "js/admin/data_sources_page.js" in body
+        from pathlib import Path
+
+        script = Path("app/web/static/js/admin/data_sources_page.js").read_text(encoding="utf-8")
+        assert "Parallel crawl" in script
+        assert "toggleSpShardPlanRow" in script
+        assert "previewShardPlan" in script
+        assert "/shard-plan" in script
+        # The legacy manual-split control is kept, reachable only via an
+        # explicit deprecated link — never deleted, its own endpoints still
+        # exist.
+        assert "Legacy: create N connections manually (deprecated)" in script
+        assert "toggleSpSplitRow" in script
+
+
 class TestSharePointSplitControl:
     """The "Split this site" control on the SharePoint connection card (see
-    `app.api.admin_sharepoint` split-plan/splits) — the page's JS renders it
-    directly into the HTML response, so a plain markup assertion is enough;
-    the endpoints themselves are covered by tests/test_admin_sharepoint.py."""
+    `app.api.admin_sharepoint` split-plan/splits) — **deprecated**, kept as
+    the migration-window escape hatch behind the "Legacy" link the
+    shard-plan control above renders. The page's JS renders it directly
+    into the HTML response, so a plain markup assertion is enough; the
+    endpoints themselves are covered by tests/test_admin_sharepoint.py."""
 
     def test_the_page_ships_the_split_control_and_its_handlers(self, seeded_app, monkeypatch):
         from cryptography.fernet import Fernet
@@ -3821,8 +3863,8 @@ class TestSharePointSplitControl:
         from pathlib import Path
 
         script = Path("app/web/static/js/admin/data_sources_page.js").read_text(encoding="utf-8")
-        # The menu item and card control that open the panel.
-        assert "Split this site" in script
+        # No standalone "Split this site…" button remains — it is reachable
+        # only via the shard-plan control's "Legacy" link now.
         assert "toggleSpSplitRow" in script
         # The preview/apply calls, hitting the exact endpoints this feature adds.
         assert "previewSpSplit" in script

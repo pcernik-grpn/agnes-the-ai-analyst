@@ -6666,6 +6666,87 @@ class TestAutoParallelCrawlPlanner:
         assert jobs.enqueued == []
 
 
+class TestShardPlanPreview(TestAutoParallelCrawlPlanner):
+    """``connectors.sharepoint.crawler.preview_shard_plan`` — the read-only
+    computation behind ``GET …/connections/{id}/shard-plan`` (2026-09-03
+    auto-parallel-crawl design §4.7, plan Task 9). Reuses
+    ``TestAutoParallelCrawlPlanner``'s own ``_install_env``/``_handler`` —
+    the SAME two-pass Graph read the planner itself makes — so a preview
+    and the plan an actual trigger would build from are exercised against
+    the identical fixture, never a second copy of it.
+    """
+
+    def _preview(self, connection: Dict[str, Any], **kwargs: Any) -> Dict[str, Any]:
+        return asyncio.run(crawler.preview_shard_plan(connection, **kwargs))
+
+    def test_never_enqueues_or_opens_a_run_row(self, crawl_env, monkeypatch):
+        runs, jobs, _store = self._install_env(monkeypatch)
+        _install_graph(monkeypatch, self._handler())
+
+        out = self._preview(_connection([_drive_scope()]))
+
+        assert out["mode"] == "sharded"
+        assert jobs.enqueued == []
+        assert runs.started == []
+
+    def test_sharded_preview_reports_target_docs_signal_and_expected_per_shard(self, crawl_env, monkeypatch):
+        self._install_env(monkeypatch, target_docs=10)
+        _install_graph(monkeypatch, self._handler())
+
+        out = self._preview(_connection([_drive_scope()]))
+
+        assert out["target_docs"] == 10
+        assert out["signal"] in ("search", "child_count")
+        assert out["shards"]
+        assert all(s["expected"] is not None for s in out["shards"])
+        assert all("index" in s and "label" in s and "drive_id" in s and "targets_count" in s for s in out["shards"])
+
+    def test_shard_target_docs_zero_previews_inline(self, crawl_env, monkeypatch):
+        self._install_env(monkeypatch, target_docs=0)
+        _install_graph(monkeypatch, self._handler())
+
+        out = self._preview(_connection([_drive_scope()]))
+
+        assert out["mode"] == "inline"
+        assert out["shards"] == []
+
+    def test_a_small_site_previews_inline_even_with_sharding_enabled(self, crawl_env, monkeypatch):
+        self._install_env(monkeypatch, target_docs=5000)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            path = request.url.path
+            if path.endswith("/root") and request.method == "GET":
+                return httpx.Response(200, json={"webUrl": "https://x/root"})
+            if path.endswith("/search/query"):
+                return httpx.Response(200, json={"value": [{"hitsContainers": [{"total": 10}]}]})
+            raise AssertionError(f"unexpected request: {path}")
+
+        _install_graph(monkeypatch, handler)
+        out = self._preview(_connection([_drive_scope()]))
+
+        assert out["mode"] == "inline"
+        assert out["shards"] == []
+
+    def test_duckdb_backend_previews_inline_without_any_graph_call(self, crawl_env, monkeypatch):
+        monkeypatch.setattr("src.repositories.use_pg", lambda: False)
+        seen = _install_graph(monkeypatch, lambda request: (_ for _ in ()).throw(AssertionError("no Graph call")))
+
+        out = self._preview(_connection([_drive_scope()]))
+
+        assert out["mode"] == "inline"
+        assert seen == []
+
+    def test_no_confirmed_scopes_previews_inline(self, crawl_env, monkeypatch):
+        self._install_env(monkeypatch)
+        _install_graph(monkeypatch, lambda request: (_ for _ in ()).throw(AssertionError("no Graph call")))
+
+        connection = _connection([])  # nothing confirmed to plan against
+        out = self._preview(connection)
+
+        assert out["mode"] == "inline"
+        assert out["shards"] == []
+
+
 class TestShardChildStateIsolation:
     def test_disjoint_shards_write_only_their_own_state_row(self, crawl_env, monkeypatch):
         store = FakeStateStore()

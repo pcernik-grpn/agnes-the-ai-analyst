@@ -76,6 +76,8 @@ _SIGNATURES = (
     "async function _extLoadErrorDetail(details) {",
     "function _extErrorItemsHtml(runDetail) {",
     "function _extFailedOrSkippedItemsHtml(items, truncated, heading) {",
+    "function _extShardCountText(run) {",
+    "function _extShardsHtml(shards) {",
     "function _extRunRowHtml(connId, st) {",
     "function _extConfigRowHtml(connId) {",
     "function _extPanelHtml(tone, title, body, connId, retry) {",
@@ -329,6 +331,72 @@ class TestRunRow:
         assert "812/" not in html
         assert "%" not in html
         assert "left" not in html.lower().replace("<", " ")
+
+    def test_a_sharded_run_shows_the_shard_count_and_a_per_shard_breakdown(self):
+        """2026-09-03 auto-parallel-crawl design §4.7: a sharded site's Run
+        row names "k/K shards" in its head line and lists each shard —
+        label, outcome, absolute counters, a live (never exact) expected
+        count, and any error — never a fraction or percentage."""
+        sharded = json.loads(json.dumps(_RUNNING))
+        sharded["running"]["mode"] = "sharded"
+        sharded["running"]["shards_total"] = 3
+        sharded["running"]["shards_done"] = 1
+        sharded["running"]["shards"] = [
+            {
+                "index": 1,
+                "label": "part 1/3",
+                "outcome": "done",
+                "files_done": 400,
+                "files_seen": 400,
+                "expected": 400,
+                "checkpoint_at": "2026-08-31T14:08:00+00:00",
+                "error": None,
+                "stuck": False,
+            },
+            {
+                "index": 2,
+                "label": "part 2/3",
+                "outcome": "failed",
+                "files_done": 12,
+                "files_seen": 20,
+                "expected": None,
+                "checkpoint_at": "2026-08-31T14:07:00+00:00",
+                "error": "CrawlError: boom",
+                "stuck": False,
+            },
+            {
+                "index": 3,
+                "label": "remainder",
+                "outcome": "stalled",
+                "files_done": 0,
+                "files_seen": 0,
+                "expected": 0,
+                "checkpoint_at": "2026-08-31T13:00:00+00:00",
+                "error": None,
+                "stuck": True,
+            },
+        ]
+        out = _run_js(
+            'console.log(JSON.stringify({html: _extRunRowHtml("sp1", _extState["sp1"])}));',
+            state=_state(data=sharded),
+        )
+        html = out["html"]
+        assert "1/3 shards" in html
+        assert "part 1/3" in html
+        assert "≈ 400" in html
+        assert "part 2/3" in html
+        assert "CrawlError: boom" in html
+        assert "≈ ?" in html  # part 2's own missing plan — never a fabricated 0
+        assert "remainder" in html
+        assert "Stuck?" in html
+
+    def test_an_inline_run_shows_no_shard_count_or_breakdown(self):
+        out = _run_js(
+            'console.log(JSON.stringify({html: _extRunRowHtml("sp1", _extState["sp1"])}));',
+            state=_state(data=_RUNNING),
+        )
+        html = out["html"]
+        assert "shards" not in html
 
     def test_a_live_run_names_the_moment_its_numbers_were_true(self):
         out = _run_js(

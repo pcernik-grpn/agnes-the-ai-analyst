@@ -59,9 +59,21 @@ _SKIPS_CAP = 200
 #: fleet/history listing costs bytes proportional to the number of RUNS
 #: listed, never to how many items any one of them failed on.
 _REPORT_LIST_PROJECTION = "(report - 'failed_items' - 'skipped_items') AS report"
+#: ``shards_total``/``shards_done`` (migration ``0103_crawl_shards``) MUST
+#: ride every LIST projection, not just the full-row reads (``get``/
+#: ``get_running``/``last_completed``/``last_failed``, all ``SELECT *``):
+#: a top-level PARENT (planner) row's ``mode`` (``app.api.admin_extraction.
+#: _run_out``) is derived from ``shards_total is not None`` alone, so
+#: omitting it here silently reports every sharded site's fleet/history row
+#: as ``"inline"`` — caught by ``tests/db_pg/test_extraction_api_pg.py``'s
+#: shard-rollup tests (2026-09-03 auto-parallel-crawl design §4.7, plan
+#: Task 8). A CHILD row's own ``shards_total`` is always ``NULL`` by
+#: construction (a shard is never itself sharded), so this costs nothing on
+#: :meth:`children_for`'s use of the same column list.
 _RUN_LIST_COLUMNS = (
     "id, connection_id, job_id, status, phase, started_at, finished_at, checkpoint_at, "
-    "files_seen, files_done, enumeration_done, " + _REPORT_LIST_PROJECTION + ", progress, usage, skips, error"
+    "files_seen, files_done, enumeration_done, " + _REPORT_LIST_PROJECTION + ", progress, usage, skips, error, "
+    "shards_total, shards_done"
 )
 
 

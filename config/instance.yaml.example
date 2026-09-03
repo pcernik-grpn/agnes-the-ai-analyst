@@ -1468,6 +1468,25 @@ extraction:
     # multiply: two concurrent crawls at 6 = twelve files in flight against
     # the same tenant.
     concurrency: 6
+    # A large site shards itself into parallel background jobs instead of
+    # crawling sequentially on one worker slot (2026-09-03 auto-parallel-
+    # crawl design), PG-only (A3 ratchet — a DuckDB-backed instance always
+    # crawls sequentially, this knob has no effect there). When a
+    # connection's estimated total document count is over this many
+    # documents, `POST …/extract` becomes a short PLANNER that packs the
+    # site into up to 32 shards (a live Graph Search document count per
+    # top-level folder, balancing load) and enqueues one
+    # `corpus-extraction-shard` job per shard instead of crawling inline —
+    # each shard writes into the SAME collection the connection already
+    # uses, so no manual split into sibling connections and no
+    # `POST …/collections/consolidate` fold-back is ever needed. `0`
+    # disables sharding entirely — every site crawls sequentially,
+    # unconditionally, the pre-2026-09 behaviour. Preview what a trigger
+    # would plan right now, without triggering anything:
+    # `GET …/connections/{id}/shard-plan` (`agnes admin sharepoint
+    # shard-plan <id>`), or the source card's "Parallel crawl — preview
+    # shards…" control. See docs/sharepoint-extraction.md → "Scale up".
+    shard_target_docs: 5000
     # A conversion worker process is recycled (replaced) after converting
     # this many documents, whichever concurrency slot it is. Insurance
     # against a real, observed failure: markitdown/pypdfium2 hold onto

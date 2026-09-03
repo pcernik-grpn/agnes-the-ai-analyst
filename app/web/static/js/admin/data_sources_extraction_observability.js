@@ -360,6 +360,34 @@ function _extFailedOrSkippedItemsHtml(items, truncated, heading) {
   return `<div class="ext-sub" style="margin-top:8px;"><strong>${_extEsc(heading)}</strong></div><ul class="ext-errors__list">${rows}</ul>${note}`;
 }
 
+/* "k/K shards" — the shard count segment of the `Run` row's own head line
+   (2026-09-03 auto-parallel-crawl design §4.7), `""` for an ordinary
+   (inline) run or one whose `shards_total` is not yet known. */
+function _extShardCountText(run) {
+  if (!run || run.mode !== "sharded" || run.shards_total == null) return "";
+  return ` · ${_extNum(run.shards_done ?? 0)}/${_extNum(run.shards_total)} shards`;
+}
+
+/* One line per shard — label, outcome, absolute files done/seen, a live
+   (never exact — Graph Search index lag) expected document count, and its
+   error when it has one. Reused by the `Run` row itself (a live or last
+   run) and the run-history drawer's own per-run entries — one shared
+   rendering, never a second copy of it. `[]`/`undefined` (the caller never
+   fetched `shards[]`, or this run was never sharded) renders nothing. */
+function _extShardsHtml(shards) {
+  if (!shards || !shards.length) return "";
+  const rows = shards
+    .map((s) => {
+      const label = s.label != null ? s.label : `shard ${s.index}`;
+      const expected = s.expected == null ? "≈ ?" : `≈ ${_extNum(s.expected)}`;
+      const stuckFlag = s.stuck ? ` <span class="ext-warn">Stuck?</span>` : "";
+      const errorLine = s.error ? ` — <span class="ext-danger">${_extEsc(s.error)}</span>` : "";
+      return `<li>${_extDot(s.outcome)}<strong>${_extEsc(label)}</strong> — ${_extEsc(s.outcome)}${stuckFlag} · ${_extNum(s.files_done)}/${_extNum(s.files_seen)} files · ${_extEsc(expected)}${errorLine}</li>`;
+    })
+    .join("");
+  return `<div class="ext-sub">shards:</div><ul class="ext-shards">${rows}</ul>`;
+}
+
 /* The `Run` fact row. Counters are absolute; the caption names the moment
    they were last true (the RUN's own checkpoint), which is not the same
    moment this page last asked. */
@@ -379,7 +407,7 @@ function _extRunRowHtml(connId, st) {
     const verb = run.outcome === "stalled"
       ? "no longer reporting"
       : (_extIsFactsPhase(run) ? "extracting facts" : "running");
-    head = `${_extDot(run.outcome)} <strong>${_extEsc(verb)}</strong> · ${_extPhaseCountText(run)} processed`;
+    head = `${_extDot(run.outcome)} <strong>${_extEsc(verb)}</strong>${_extShardCountText(run)} · ${_extPhaseCountText(run)} processed`;
     const started = `started ${_extEsc(_extTime(run.started_at))}`;
     const elapsed = run.elapsed_s != null ? ` · ${_extEsc(_extDuration(run.elapsed_s))} elapsed` : "";
     sub += `<div class="ext-sub">${started}${elapsed} · as of ${_extEsc(_extTime(run.checkpoint_at))}</div>`;
@@ -390,11 +418,12 @@ function _extRunRowHtml(connId, st) {
       sub += `<div class="ext-sub ext-warn">${_extEsc(run.liveness_note || "no recent checkpoint")}</div>`;
     }
     if (run.activity) sub += _extActivityHtml(run.activity);
+    sub += _extShardsHtml(run.shards);
     if (status.can_stop === false) {
       sub += `<div class="ext-sub">A running crawl cannot be stopped from here yet — it finishes, or the worker ends it.</div>`;
     }
   } else if (last) {
-    head = `${_extDot(last.outcome)} <strong>${_extEsc(last.outcome)}</strong> · ${_extNum(last.files_done)} files`;
+    head = `${_extDot(last.outcome)} <strong>${_extEsc(last.outcome)}</strong>${_extShardCountText(last)} · ${_extNum(last.files_done)} files`;
     sub += `<div class="ext-sub">finished ${_extEsc(_extTime(last.finished_at))}`;
     if (last.duration_s != null) sub += ` · took ${_extEsc(_extDuration(last.duration_s))}`;
     sub += `</div>`;
@@ -419,6 +448,7 @@ function _extRunRowHtml(connId, st) {
     if (last.skips_total) {
       sub += `<div class="ext-sub ext-warn">${_extNum(last.skips_total)} document${last.skips_total === 1 ? "" : "s"} not indexed — see the run</div>`;
     }
+    sub += _extShardsHtml(last.shards);
   } else {
     head = `${_extDot("idle")} never run`;
     sub = `<div class="ext-sub">No extraction run has been recorded for this connection yet.</div>`;
@@ -971,6 +1001,7 @@ function _extRunsHtml(connId, body) {
       detail += `<div class="ext-sub ext-warn">${_extEsc(run.liveness_note)}</div>`;
     }
     if (run.error) detail += `<div class="ext-sub ext-danger">${_extEsc(run.error)}</div>`;
+    detail += _extShardsHtml(run.shards);
     return `
       <li>
         <div class="ext-run__head">
@@ -978,7 +1009,7 @@ function _extRunsHtml(connId, body) {
           <strong>${_extEsc(run.outcome)}</strong>
           <span class="ext-run__when">${_extEsc(when)}</span>
           ${dur ? `<span class="ext-run__when">${_extEsc(dur)}</span>` : ""}
-          <span class="ext-run__when">${_extNum(run.files_done)} files</span>
+          <span class="ext-run__when">${_extNum(run.files_done)} files${_extShardCountText(run)}</span>
         </div>
         ${detail}
       </li>`;

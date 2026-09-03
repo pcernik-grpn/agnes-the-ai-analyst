@@ -75,6 +75,8 @@ _SIGNATURES = (
     "function _extStopReasonText(reason) {",
     "function _extThrottleLine(run) {",
     "function _extActivityHtml(activity) {",
+    "function _extShardCountText(run) {",
+    "function _extShardsHtml(shards) {",
     "function _extFactsJobLine(job) {",
     "function _extFactsPendingLine(status) {",
     "function _extRunRowHtml(connId, st) {",

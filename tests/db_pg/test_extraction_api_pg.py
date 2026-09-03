@@ -865,3 +865,178 @@ def test_fleet_row_carries_facts_pending_documents_and_pass_running(tmp_path, mo
     body = client.get(f"{FLEET_URL}?all=1", headers=_auth(token)).json()
     row = next(r for r in body["connections"] if r["connection_id"] == conn_id)
     assert row["facts"]["facts_pass_running"] is True
+
+
+# ---------------------------------------------------------------------------
+# Shard roll-up (2026-09-03 auto-parallel-crawl design §4.7, plan Task 8) —
+# a PARENT (planner) run row joined with its CHILD rows through the fleet,
+# status, history and detail endpoints alike. The runtime that actually
+# WRITES these rows (the planner, the shard child crawl, the finalizer)
+# lives in `connectors/sharepoint/crawler.py`; these tests drive the same
+# `ExtractionRunsPgRepository` primitives it uses directly, exactly the way
+# every other test in this file drives `_repo()` rather than running a real
+# crawl.
+# ---------------------------------------------------------------------------
+
+
+def _shard_plan_state(conn_id: str, shards: list) -> None:
+    """Seed `state["shard_plan"]` — the ONLY place a shard's `expected`
+    (plan) document count lives (`app.api.admin_extraction.
+    _shard_expected_by_key` reads it back by `state_key`, never off the run
+    row itself)."""
+    from src.repositories import sharepoint_state_repo
+
+    sharepoint_state_repo().put(conn_id, "crawl", {"shard_plan": {"shards": shards}})
+
+
+def test_fleet_row_rolls_up_a_sharded_sites_children(tmp_path, monkeypatch, pg_engine):
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token, name="sp-sharded-fleet")
+
+    _shard_plan_state(
+        conn_id,
+        [
+            {"label": "part 1/2", "targets": [{"state_key": "drive-1:item-1"}], "expected": 30},
+            {"label": "part 2/2", "targets": [{"state_key": "drive-1:item-2"}], "expected": 10},
+        ],
+    )
+
+    repo = _repo()
+    parent_id = repo.start(connection_id=conn_id, shards_total=2)
+    child_a = repo.start(
+        connection_id=conn_id, parent_run_id=parent_id, shard_key="drive-1:item-1", shard_label="part 1/2"
+    )
+    repo.checkpoint(child_a, files_seen=25, files_done=25, progress={"new": 20, "unchanged": 5})
+    child_b = repo.start(
+        connection_id=conn_id, parent_run_id=parent_id, shard_key="drive-1:item-2", shard_label="part 2/2"
+    )
+    repo.finish(child_b, status="done", report={"new": 8, "unchanged": 2}, files_seen=10, files_done=10)
+    repo.finish_shard(parent_id)
+
+    body = client.get(f"{FLEET_URL}?all=1", headers=_auth(token)).json()
+    rows = [r for r in body["connections"] if r["connection_id"] == conn_id]
+    # A child never shows up as its OWN fleet row — one row per SITE.
+    assert len(rows) == 1
+    run = rows[0]["run"]
+    assert run["id"] == parent_id
+    assert run["mode"] == "sharded"
+    assert run["shards_total"] == 2
+    assert run["shards_done"] == 1
+    shards = {s["label"]: s for s in run["shards"]}
+    assert shards["part 1/2"]["expected"] == 30
+    assert shards["part 1/2"]["outcome"] == "running"
+    assert shards["part 2/2"]["expected"] == 10
+    assert shards["part 2/2"]["outcome"] == "done"
+    assert run["expected_documents"] == 40
+    assert run["seen_documents"] == (20 + 5) + (8 + 2)
+
+
+def test_fleet_row_marks_stuck_when_one_shard_stalls_even_if_the_parent_checkpoint_is_fresh(
+    tmp_path, monkeypatch, pg_engine
+):
+    """A sibling shard's own checkpoint keeps bumping the parent's
+    `checkpoint_at` — the parent alone would never look stalled. A dead
+    shard must still surface."""
+    import sqlalchemy as sa
+
+    import app.api.admin_extraction as mod
+    from src.db_pg import get_engine
+
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token, name="sp-sharded-stuck")
+
+    repo = _repo()
+    parent_id = repo.start(connection_id=conn_id, shards_total=2)
+    stale_child = repo.start(connection_id=conn_id, parent_run_id=parent_id, shard_key="k1", shard_label="part 1/2")
+    live_child = repo.start(connection_id=conn_id, parent_run_id=parent_id, shard_key="k2", shard_label="part 2/2")
+    repo.checkpoint(live_child, files_seen=5, files_done=5)  # bumps the PARENT's own checkpoint_at too
+
+    with get_engine().begin() as conn:
+        conn.execute(
+            sa.text("UPDATE extraction_runs SET checkpoint_at = now() - make_interval(secs => :s) WHERE id = :id"),
+            {"s": mod._STALL_AFTER_S + 600, "id": stale_child},
+        )
+
+    body = client.get(f"{FLEET_URL}?all=1", headers=_auth(token)).json()
+    row = next(r for r in body["connections"] if r["connection_id"] == conn_id)
+    assert row["run"]["outcome"] == "running"  # the parent's OWN checkpoint is fresh (bumped by live_child)
+    shards = {s["label"]: s for s in row["run"]["shards"]}
+    assert shards["part 1/2"]["stuck"] is True
+    assert shards["part 2/2"]["stuck"] is False
+    assert row["stuck"] is True  # the fleet's own flag folds in any shard's stuck flag
+
+
+def test_run_detail_includes_shards_for_a_sharded_run(tmp_path, monkeypatch, pg_engine):
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token, name="sp-sharded-detail")
+
+    repo = _repo()
+    parent_id = repo.start(connection_id=conn_id, shards_total=1)
+    child_id = repo.start(
+        connection_id=conn_id, parent_run_id=parent_id, shard_key="drive-1", shard_label="whole drive"
+    )
+    repo.finish(child_id, status="done", report={"new": 5}, files_seen=5, files_done=5)
+    repo.finish_shard(parent_id)
+    repo.finish(parent_id, status="done", report={"new": 5, "shards_total": 1}, files_seen=5, files_done=5)
+
+    detail = client.get(f"{BASE}/{conn_id}/extraction/runs/{parent_id}", headers=_auth(token)).json()
+    assert detail["mode"] == "sharded"
+    assert len(detail["shards"]) == 1
+    assert detail["shards"][0]["outcome"] == "done"
+    assert detail["shards"][0]["label"] == "whole drive"
+
+
+def test_run_history_includes_shards_and_never_lists_a_child_as_its_own_row(tmp_path, monkeypatch, pg_engine):
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token, name="sp-sharded-history")
+
+    repo = _repo()
+    parent_id = repo.start(connection_id=conn_id, shards_total=1)
+    child_id = repo.start(
+        connection_id=conn_id, parent_run_id=parent_id, shard_key="drive-1", shard_label="whole drive"
+    )
+    repo.finish(child_id, status="done", report={"new": 5}, files_seen=5, files_done=5)
+    repo.finish_shard(parent_id)
+    repo.finish(parent_id, status="done", report={"new": 5}, files_seen=5, files_done=5)
+
+    body = client.get(f"{BASE}/{conn_id}/extraction/runs", headers=_auth(token)).json()
+    assert [r["id"] for r in body["runs"]] == [parent_id]
+    assert body["total"] == 1
+    assert body["runs"][0]["shards"][0]["outcome"] == "done"
+
+
+def test_status_running_includes_the_shard_rollup_for_a_sharded_site(tmp_path, monkeypatch, pg_engine):
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token, name="sp-sharded-status")
+
+    repo = _repo()
+    parent_id = repo.start(connection_id=conn_id, shards_total=2)
+    repo.start(connection_id=conn_id, parent_run_id=parent_id, shard_key="k1", shard_label="part 1/2")
+    repo.start(connection_id=conn_id, parent_run_id=parent_id, shard_key="k2", shard_label="part 2/2")
+
+    body = client.get(f"{BASE}/{conn_id}/extraction/status", headers=_auth(token)).json()
+    running = body["running"]
+    assert running["id"] == parent_id
+    assert running["mode"] == "sharded"
+    assert len(running["shards"]) == 2
+
+
+def test_a_plain_inline_run_reports_inline_mode_through_every_endpoint(tmp_path, monkeypatch, pg_engine):
+    """An ordinary (non-sharded) connection's run must not gain a phantom
+    `shards` list anywhere — additive keys stay `None` when there is
+    nothing to roll up."""
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token, name="sp-inline")
+
+    repo = _repo()
+    run_id = repo.start(connection_id=conn_id)
+    repo.finish(run_id, status="done", report={"new": 3}, files_seen=3, files_done=3)
+
+    status = client.get(f"{BASE}/{conn_id}/extraction/status", headers=_auth(token)).json()
+    assert status["last_completed"]["mode"] == "inline"
+    assert status["last_completed"]["shards"] is None
+
+    fleet = client.get(f"{FLEET_URL}?all=1", headers=_auth(token)).json()
+    row = next(r for r in fleet["connections"] if r["connection_id"] == conn_id)
+    assert row["run"]["mode"] == "inline"
+    assert row["run"]["shards"] is None

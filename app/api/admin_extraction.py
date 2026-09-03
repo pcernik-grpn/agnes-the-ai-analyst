@@ -330,14 +330,141 @@ def _is_resumable(run: Dict[str, Any], report: Dict[str, Any]) -> bool:
     return reason in RESUMABLE_STOP_REASONS
 
 
-def _run_out(run: Dict[str, Any], *, now: Optional[datetime] = None) -> Dict[str, Any]:
+def _shard_expected_by_key(connection_id: str) -> Dict[str, int]:
+    """Every persisted shard's own ``expected`` (plan) document count, keyed
+    by the SAME ``shard_key`` a child's own ``extraction_runs.shard_key``
+    column carries (``connectors.sharepoint.crawler._run_shard_crawl_async``:
+    ``",".join(t.state_key for t in targets)``) — read straight off this
+    connection's ``crawl`` state row (``state["shard_plan"]["shards"]``,
+    written once by ``connectors.sharepoint.crawler._enqueue_shard_plan``).
+
+    ``expected`` is never stored on the run row itself (it is a PLANNING
+    fact, not something the crawl measures) — this is the only place it can
+    be read back from. Best-effort and read-only: a missing state row, a
+    connection re-planned since an OLD parent's children were created (a
+    resync always re-plans fresh — design §4.1), or any repo hiccup simply
+    yields no match for the affected keys, never a raised error on this
+    observability path.
+    """
+    from src.repositories import sharepoint_state_repo
+
+    try:
+        state = sharepoint_state_repo().get(connection_id, "crawl") or {}
+    except Exception as exc:  # noqa: BLE001 — best-effort, never load-bearing
+        logger.debug("shard rollup: could not read shard_plan state for %s: %s", connection_id, exc)
+        return {}
+    plan = state.get("shard_plan") or {}
+    out: Dict[str, int] = {}
+    for shard in plan.get("shards") or []:
+        targets = shard.get("targets") or []
+        key = ",".join(str(t.get("state_key")) for t in targets if t.get("state_key"))
+        if key:
+            out[key] = int(shard.get("expected") or 0)
+    return out
+
+
+def _rollup_children(
+    parent: Dict[str, Any],
+    children: List[Dict[str, Any]],
+    *,
+    expected_by_key: Optional[Dict[str, int]] = None,
+    now: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """The shard-aware additive keys a PARENT (planner) run's own
+    projection gains once its CHILD rows are known (2026-09-03 auto-
+    parallel-crawl design §4.7, plan Task 8): ``expected_documents``,
+    ``seen_documents``, ``shards[]`` — one row per child, in the SAME order
+    ``children`` was given (``ExtractionRunsPgRepository.children_for``'s
+    own ``ORDER BY parent_run_id, shard_key``), each ``{index, label,
+    outcome, files_done, files_seen, expected, checkpoint_at, error,
+    stuck}``.
+
+    Pure: never touches a repository itself — ``expected_by_key``
+    (:func:`_shard_expected_by_key`) is the caller's job, so this function
+    stays unit-testable without a database.
+
+    ``seen_documents`` sums each child's own ``new + changed + unchanged +
+    filtered_by_age`` (the completeness definition design §4.7 states,
+    "seen = new+changed+unchanged (+filtered_by_age)") off its live
+    report/progress — never ``files_seen``, which also counts items culled
+    before that classification runs, and is a placeholder (0) on the
+    PARENT's own row until finalize regardless (design §4.3: only the
+    child's own row is checkpointed while sharding is in progress).
+
+    ``expected_documents`` is the sum of every shard's own ``expected``
+    ONLY when every shard resolved one — a partial sum would silently
+    understate the site's real target, which is worse than admitting the
+    total is unknown (``None``, never a lowball number).
+
+    ``stuck`` on each shard row is the SAME rule the parent's/fleet's own
+    ``stuck`` flag uses (``outcome == "stalled"``, :func:`_derived_outcome`)
+    — one rule, read per shard here too, so a dead shard is visible even
+    while sibling shards keep the parent's own bumped ``checkpoint_at``
+    looking fresh.
+    """
+    expected_by_key = expected_by_key or {}
+    shards_out: List[Dict[str, Any]] = []
+    seen_documents = 0
+    for index, child in enumerate(children, start=1):
+        child_out = _run_out(child, now=now)
+        report = child.get("report") or {}
+        progress = child.get("progress") or {}
+        live = report or progress
+        seen_documents += sum(int(live.get(k) or 0) for k in ("new", "changed", "unchanged", "filtered_by_age"))
+        shards_out.append(
+            {
+                "index": index,
+                "label": child.get("shard_label"),
+                "outcome": child_out["outcome"],
+                "files_done": child_out["files_done"],
+                "files_seen": child_out["files_seen"],
+                "expected": expected_by_key.get(str(child.get("shard_key") or "")),
+                "checkpoint_at": child.get("checkpoint_at"),
+                "error": child_out["error"],
+                "stuck": child_out["outcome"] == "stalled",
+            }
+        )
+
+    expected_documents: Optional[int] = None
+    if shards_out:
+        knowns = [s["expected"] for s in shards_out]
+        if all(v is not None for v in knowns):
+            expected_documents = sum(knowns)
+
+    return {
+        "expected_documents": expected_documents,
+        "seen_documents": seen_documents if shards_out else None,
+        "shards": shards_out,
+    }
+
+
+def _run_out(
+    run: Dict[str, Any], *, now: Optional[datetime] = None, children: Optional[List[Dict[str, Any]]] = None
+) -> Dict[str, Any]:
     """One run, in the shape both the history drawer and the status endpoint
-    render. Absolute counters only — no fraction, no percentage, no ETA."""
+    render. Absolute counters only — no fraction, no percentage, no ETA.
+
+    ``mode``/``shards_total``/``shards_done`` are additive keys read
+    straight off the row (2026-09-03 auto-parallel-crawl design §4.7):
+    ``mode`` is ``"sharded"`` exactly when ``shards_total`` is not ``None``
+    — a PARENT (planner) row — else ``"inline"``, the ordinary crawl every
+    run before this design, and every shard CHILD's own row, both are.
+    ``expected_documents``/``seen_documents``/``shards`` stay ``None``
+    unless the caller passes ``children`` (this run's own child rows, from
+    :meth:`ExtractionRunsPgRepository.children_for`) — callers that have not
+    fetched them (most of this module's call sites, for a non-sharded run)
+    pay nothing for a rollup that has nothing to roll up.
+    """
     report = run.get("report") or {}
     progress = run.get("progress") or {}
     live = report or progress
     outcome = _derived_outcome(run, now=now)
     skips = run.get("skips") or {}
+    shards_total = run.get("shards_total")
+    rollup = None
+    if children is not None:
+        expected_by_key = _shard_expected_by_key(str(run.get("connection_id") or ""))
+        rollup = _rollup_children(run, children, expected_by_key=expected_by_key, now=now)
     return {
         "id": run.get("id"),
         "job_id": run.get("job_id"),
@@ -421,6 +548,18 @@ def _run_out(run: Dict[str, Any], *, now: Optional[datetime] = None) -> Dict[str
         # `connectors.sharepoint.facts_extraction.run_facts_extraction`'s
         # `on_progress` docstring) — never invented ahead of that.
         "facts_progress": live.get("facts"),
+        # 2026-09-03 auto-parallel-crawl design §4.7 — additive, present on
+        # EVERY run: "sharded" for a PARENT (planner) row, "inline" for an
+        # ordinary crawl and for a shard CHILD's own row alike (neither is
+        # itself sharded).
+        "mode": "sharded" if shards_total is not None else "inline",
+        "shards_total": shards_total,
+        "shards_done": run.get("shards_done"),
+        # `None` unless the caller passed `children=` — see this function's
+        # own docstring.
+        "expected_documents": rollup["expected_documents"] if rollup else None,
+        "seen_documents": rollup["seen_documents"] if rollup else None,
+        "shards": rollup["shards"] if rollup else None,
     }
 
 
@@ -616,6 +755,17 @@ def fleet_extraction_runs(
     row (or one still merely ``running``) can also be force-cancelled — see
     ``POST …/extraction/runs/{run_id}/cancel`` below.
 
+    A SHARDED site's row is its PARENT run (2026-09-03 auto-parallel-crawl
+    design §4.7) — a child never appears as its own fleet row
+    (``list_latest_for_connections`` already filters ``parent_run_id IS
+    NULL``). ``run.mode == "sharded"`` names it; ``run.shards_total``/
+    ``run.shards_done`` come straight off the parent row, and
+    ``run.shards[]``/``run.expected_documents``/``run.seen_documents`` are
+    filled in from a SINGLE batched :meth:`ExtractionRunsPgRepository.
+    children_for` call across every parent this page is about to render
+    (never one round trip per sharded connection) — see
+    :func:`_rollup_children`.
+
     PG-only, same as every other route in this module: ``extraction_runs``
     is a post-A3 table, so a DuckDB-backed instance gets the typed ``501``
     from ``extraction_runs_repo()`` via the app-wide handler in
@@ -644,7 +794,15 @@ def fleet_extraction_runs(
     )
     connection_ids = [str(c["id"]) for c in connections]
     running_only = not show_all
-    latest = extraction_runs_repo().list_latest_for_connections(connection_ids, running_only=running_only)
+    repo = extraction_runs_repo()
+    latest = repo.list_latest_for_connections(connection_ids, running_only=running_only)
+
+    # Shard children (2026-09-03 auto-parallel-crawl design §4.7): ONE
+    # batched `children_for` call for every PARENT (planner) row this page
+    # is about to render, never one round trip per sharded connection —
+    # the whole reason `children_for` takes a LIST of parent ids.
+    parent_ids = [str(run["id"]) for run in latest.values() if run.get("shards_total") is not None]
+    children_by_parent = repo.children_for(parent_ids) if parent_ids else {}
 
     now = datetime.now(timezone.utc)
     rows: List[Dict[str, Any]] = []
@@ -668,10 +826,19 @@ def fleet_extraction_runs(
             continue
 
         stored_status = str(run.get("status") or "") if run else ""
-        run_out = _run_out(run, now=now) if run else None
+        children = children_by_parent.get(str(run.get("id"))) if run and run.get("shards_total") is not None else None
+        run_out = _run_out(run, now=now, children=children) if run else None
         files_per_min = _files_per_min(run) if run else None
         checkpoint_age_s = _age_s(run.get("checkpoint_at"), now=now) if run else None
-        stuck = bool(run_out and run_out.get("outcome") == "stalled")
+        # A shard-aware "is anything stuck": the parent's OWN derived
+        # outcome (its checkpoint is bumped by every child, so it usually
+        # stays fresh even when one shard died) OR any individual shard
+        # flagged `stuck` by `_rollup_children` — one dead shard must be
+        # visible even while its siblings keep working.
+        stuck = bool(
+            run_out
+            and (run_out.get("outcome") == "stalled" or any(s.get("stuck") for s in (run_out.get("shards") or [])))
+        )
         facts = _fleet_facts(run, connection_id)
         cost = _run_total_cost_usd(run)
         backlog = sharepoint_state_repo().backlog_counts(connection_id, "crawl")
@@ -965,9 +1132,24 @@ async def extraction_status(
         if failed_at is not None and completed_at is not None and failed_at <= completed_at:
             last_failed = None
 
-    running_out = _run_out(running, now=now) if running else None
-    last_completed_out = _run_out(last_completed, now=now) if last_completed else None
-    last_failed_out = _run_out(last_failed, now=now) if last_failed else None
+    # Shard children (2026-09-03 auto-parallel-crawl design §4.7): at most
+    # three parent ids ever need one here (`running`/`last_completed`/
+    # `last_failed`), fetched in ONE batched `children_for` call rather than
+    # up to three.
+    shard_parent_ids = [
+        str(run["id"]) for run in (running, last_completed, last_failed) if run and run.get("shards_total") is not None
+    ]
+    children_by_parent = repo.children_for(shard_parent_ids) if shard_parent_ids else {}
+
+    def _out(run: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if run is None:
+            return None
+        children = children_by_parent.get(str(run["id"])) if run.get("shards_total") is not None else None
+        return _run_out(run, now=now, children=children)
+
+    running_out = _out(running)
+    last_completed_out = _out(last_completed)
+    last_failed_out = _out(last_failed)
     skipped_unsupported_count = None
     for candidate in (running_out, last_failed_out, last_completed_out):
         if candidate is not None and candidate.get("skipped_unsupported") is not None:
@@ -1364,7 +1546,10 @@ async def extraction_runs(
     """A2 — the run-history drawer's rows, newest first.
 
     ``total`` is every recorded run, not just the returned page, so "5 more
-    runs" is never a silent truncation.
+    runs" is never a silent truncation. A SHARDED site's row carries its own
+    ``shards[]`` (2026-09-03 auto-parallel-crawl design §4.7) — one batched
+    :meth:`ExtractionRunsPgRepository.children_for` call across every parent
+    on this page, never one round trip per row.
     """
     _sharepoint_connection_or_404(connection_id)
     from src.repositories import extraction_runs_repo
@@ -1372,9 +1557,17 @@ async def extraction_runs(
     repo = extraction_runs_repo()
     now = datetime.now(timezone.utc)
     rows = repo.list_for_connection(connection_id, limit=limit)
+    parent_ids = [str(r["id"]) for r in rows if r.get("shards_total") is not None]
+    children_by_parent = repo.children_for(parent_ids) if parent_ids else {}
+    runs_out = [
+        _run_out(
+            r, now=now, children=children_by_parent.get(str(r["id"])) if r.get("shards_total") is not None else None
+        )
+        for r in rows
+    ]
     return {
         "connection_id": connection_id,
-        "runs": [_run_out(r, now=now) for r in rows],
+        "runs": runs_out,
         "total": repo.count_for_connection(connection_id),
         "as_of": now.isoformat(),
     }
@@ -1413,10 +1606,14 @@ async def extraction_run_detail(
     _sharepoint_connection_or_404(connection_id)
     from src.repositories import extraction_runs_repo
 
-    run = extraction_runs_repo().get(run_id)
+    repo = extraction_runs_repo()
+    run = repo.get(run_id)
     if run is None or run.get("connection_id") != connection_id:
         raise HTTPException(status_code=404, detail="run_not_found")
-    out = _run_out(run)
+    # A SHARDED (parent) run's own `shards[]` (2026-09-03 auto-parallel-
+    # crawl design §4.7) — read on-demand, only ever for this ONE run.
+    children = repo.children_for([run_id]).get(run_id) if run.get("shards_total") is not None else None
+    out = _run_out(run, children=children)
     out["report"] = run.get("report") or {}
     out["progress"] = run.get("progress") or {}
     out["skips"] = run.get("skips") or {"items": [], "listed": 0, "total": 0, "truncated": False}

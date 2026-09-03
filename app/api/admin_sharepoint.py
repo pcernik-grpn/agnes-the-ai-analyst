@@ -169,7 +169,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple
 from urllib.parse import unquote, urlsplit
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
 
 from app.auth.access import require_admin, require_facts_enabled
@@ -2919,6 +2919,62 @@ def _resolve_split_target_collection_ref(
     return {"id": None, "name": source_name, "slug": None}
 
 
+@router.get("/connections/{connection_id}/shard-plan")
+async def shard_plan(
+    connection_id: str,
+    min_modified: Optional[str] = None,
+    _user: dict = Depends(require_admin),
+):
+    """Read-only preview of the AUTOMATIC parallel crawl (2026-09-03
+    auto-parallel-crawl design §4.7, plan Task 9) — what ``POST …/extract``
+    would plan for this connection's site right now, without triggering
+    anything: :func:`connectors.sharepoint.crawler.preview_shard_plan`.
+
+    ``min_modified`` (``YYYY-MM-DD``, ``400 invalid_min_modified``
+    otherwise) narrows every document count to files modified on/after
+    that date, for THIS preview call only — same validation, and the same
+    "what if I backfilled from here" question, as ``GET …/split-plan``'s
+    own query param. Omitted, the plan resolves the connection's own
+    configured ``extraction.crawl.min_modified`` instead (:func:`connectors.
+    sharepoint.crawler.resolve_min_modified`) — the SAME cutoff an actual
+    triggered run would use, so a preview with no override still matches
+    reality.
+
+    Response: ``{mode: "inline"|"sharded", target_docs, signal, shards:
+    [{drive_id, index, label, expected, targets_count}], loose_root_files}``
+    — ``mode == "inline"`` (``shards`` empty) exactly when the automatic
+    planner would ALSO stay inline: the active backend is DuckDB (A3
+    ratchet), ``extraction.crawler.shard_target_docs`` is ``0``, there is
+    no confirmed scope to plan against, or the site's summed total stays
+    at or under the target. ``expected`` is a live Graph Search count
+    (``≈``, never exact — index lag, see :func:`connectors.sharepoint.
+    graph_client.search_document_count`).
+
+    ``404`` for an unknown/non-SharePoint connection id. ``409
+    sharepoint_cert_unresolved`` when this connection's certificate/secret
+    is not yet configured (same as every other Graph-backed endpoint in
+    this module). A Graph failure while resolving the plan is a typed
+    ``502 sharepoint_graph_error`` — unlike ``GET …/split-plan``'s own
+    per-folder-count degrade-to-zero, a shard-plan failure is surfaced
+    rather than silently shown as a small, healthy site.
+    """
+    row = _sharepoint_connection_or_404(connection_id)
+    _validate_min_modified(min_modified)
+    min_modified_override = date.fromisoformat(min_modified) if min_modified else None
+
+    from connectors.sharepoint.crawler import preview_shard_plan
+
+    try:
+        return await preview_shard_plan(row, min_modified_override=min_modified_override)
+    except SharePointSettingsError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "sharepoint_cert_unresolved", "message": str(exc)},
+        ) from exc
+    except SharePointGraphError as exc:
+        raise HTTPException(status_code=502, detail={"error": "sharepoint_graph_error", "message": str(exc)}) from exc
+
+
 @router.get("/connections/{connection_id}/split-plan")
 async def split_plan(
     connection_id: str,
@@ -2930,10 +2986,26 @@ async def split_plan(
     per_folder_collections: bool = False,
     _user: dict = Depends(require_admin),
 ):
-    """Read-only preview of splitting this connection's site into ``n``
+    """**Deprecated** (2026-09-03 auto-parallel-crawl design): a large site
+    now shards itself automatically on trigger, so the manual N-way split
+    this previews is no longer the recommended path — see ``GET …/
+    shard-plan`` (:func:`shard_plan`) for the automatic preview, and
+    ``docs/sharepoint-extraction.md`` for the migration recipe. Kept, and
+    still fully functional, as the escape hatch — the response is
+    unchanged from before this design except for one ADDITIVE field,
+    ``mode`` (below).
+
+    Read-only preview of splitting this connection's site into ``n``
     sibling connections (see the module docstring's "split a large site"
     entry) — greedy-packs the drive root's top-level folders into ``n``
     groups of roughly equal document count, WITHOUT creating anything.
+
+    ``mode`` — ``"sharded"``/``"inline"``, the SAME verdict :func:`shard_plan`
+    would give for this connection right now (:func:`connectors.sharepoint.
+    crawler.preview_shard_plan`) — an informational hint only: a failure
+    computing it (a Graph hiccup unrelated to the manual plan below, a
+    DuckDB-backed instance) leaves it ``null`` rather than failing this
+    endpoint, since the manual N-way plan is still this endpoint's own job.
 
     ``drive_id`` is optional — same inference as ``POST …/scopes/bulk``:
     reused from this connection's first existing scope when omitted, ``400
@@ -2991,6 +3063,15 @@ async def split_plan(
 
     plan = await _compute_split_plan(row, n=n, min_modified=min_modified, drive_id=drive_id)
 
+    mode: Optional[str] = None
+    try:
+        from connectors.sharepoint.crawler import preview_shard_plan
+
+        shard_preview = await preview_shard_plan(row)
+        mode = shard_preview.get("mode")
+    except Exception as exc:  # noqa: BLE001 — an informational hint only; the manual plan above is the primary answer
+        logger.debug("split-plan: could not compute the automatic shard-plan mode hint for %s: %s", connection_id, exc)
+
     return {
         "drive_id": plan["drive_id"],
         "folders": [_public_folder(f) for f in plan["folders"]],
@@ -3001,6 +3082,7 @@ async def split_plan(
         ],
         "total_documents": plan["total_documents"],
         "collection": collection_ref,
+        "mode": mode,
     }
 
 
@@ -3008,9 +3090,20 @@ async def split_plan(
 async def apply_split(
     connection_id: str,
     body: SplitApplyBody,
+    response: Response,
     user: dict = Depends(require_admin),
 ):
-    """Apply a site split (see :func:`split_plan` above for the read-only
+    """**Deprecated** (2026-09-03 auto-parallel-crawl design — a large site
+    now shards itself automatically on trigger, see :func:`preview_shard_
+    plan`/``GET …/shard-plan``): this manual clone-per-part workflow is no
+    longer the recommended way to parallelize a big crawl, and answers with
+    a ``Deprecation: true`` response header (RFC 8594) so a scripted caller
+    can detect it without parsing prose. Kept as an escape hatch for the
+    migration window — see ``docs/sharepoint-extraction.md`` for the
+    consolidate-then-re-extract fold-back path — and slated for removal
+    after one release; still fully functional until then.
+
+    Apply a site split (see :func:`split_plan` above for the read-only
     preview this computes identically before creating anything): creates
     ``body.n`` sibling connections, each named ``"<source name> — part
     i/n"`` (:func:`connectors.sharepoint.site_split.format_group_name`),
@@ -3244,6 +3337,7 @@ async def apply_split(
         result="success",
     )
 
+    response.headers["Deprecation"] = "true"
     return {"connections": created, "collection": shared_collection_ref}
 
 
