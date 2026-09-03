@@ -1279,6 +1279,21 @@ data_apps:
   deploy_checks: warn          # warn | block | off
 
 
+# --- Collections search (hybrid lexical+vector chunk search) ---
+# Plain instance data (an int, not a bool/select toggle), read directly via
+# get_value — see docs/CONFIGURATION.md's "Collections search" section.
+collections:
+  # Server-side cap (#2151) on how many chunks a single GET
+  # /api/collections/search (or the /api/knowledge/search chunk leg)
+  # request may rank. Above this, the server applies a SQL-side lexical
+  # prefilter + LIMIT instead of fetching every accessible chunk, and the
+  # response carries `truncated: true`. 25000 is the point
+  # scripts/bench_retrieval.py measured at ~371MB peak RSS per query,
+  # comfortably under the API container's default 4g mem_limit even with
+  # a few concurrent searches. 0 has no "unlimited" meaning here.
+  search_max_chunks: 25000
+
+
 # --- Fact graph over Collections (optional) ---
 # `facts.enabled` / `facts.visibility_mode` are switches — set them via the
 # settings panel or AGNES_FACTS_ENABLED / AGNES_FACTS_VISIBILITY_MODE (see

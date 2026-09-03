@@ -107,12 +107,16 @@ def _row_to_admin_item(row: dict) -> AdminTokenItem:
     )
 
 
-@router.post("", response_model=CreateTokenResponse, status_code=201)
-async def create_token(
-    payload: CreateTokenRequest,
-    user: dict = Depends(require_session_token),
-    conn: duckdb.DuckDBPyConnection = Depends(_get_db),
-):
+def mint_pat(user_id: str, email: str, payload: CreateTokenRequest) -> CreateTokenResponse:
+    """The one PAT-creation pipeline (validation → JWT mint → DB row).
+
+    Shared by ``create_token`` (an interactive caller minting their OWN
+    token) and ``app.api.admin_service_accounts`` (an admin minting a token
+    FOR a service account, issue #1534) — the identity a token authenticates
+    as is just ``user_id``/``email``, so the same function covers both
+    without a second token pipeline. Callers are responsible for their own
+    authorization gate and audit call; this function only mints.
+    """
     if not payload.name.strip():
         raise HTTPException(status_code=400, detail="name is required")
     if payload.surface not in ("all", "stack"):
@@ -160,8 +164,8 @@ async def create_token(
     token_id = str(uuid.uuid4())
     # Build the JWT that embeds jti=token_id and typ=pat
     jwt_token = create_access_token(
-        user_id=user["id"],
-        email=user["email"],
+        user_id=user_id,
+        email=email,
         token_id=token_id,
         typ="pat",
         expires_delta=expires_delta,
@@ -176,19 +180,12 @@ async def create_token(
     token_hash = hashlib.sha256(jwt_token.encode()).hexdigest()
     repo.create(
         id=token_id,
-        user_id=user["id"],
+        user_id=user_id,
         name=payload.name.strip(),
         token_hash=token_hash,
         prefix=prefix,
         expires_at=expires_at,
         surface=payload.surface,
-    )
-    _audit(
-        conn,
-        user["id"],
-        "token.create",
-        token_id,
-        {"name": payload.name, "scope": payload.scope, "surface": payload.surface},
     )
     return CreateTokenResponse(
         id=token_id,
@@ -198,6 +195,23 @@ async def create_token(
         expires_at=str(expires_at) if expires_at else None,
         created_at=str(datetime.now(timezone.utc)),
     )
+
+
+@router.post("", response_model=CreateTokenResponse, status_code=201)
+async def create_token(
+    payload: CreateTokenRequest,
+    user: dict = Depends(require_session_token),
+    conn: duckdb.DuckDBPyConnection = Depends(_get_db),
+):
+    result = mint_pat(user["id"], user["email"], payload)
+    _audit(
+        conn,
+        user["id"],
+        "token.create",
+        result.id,
+        {"name": payload.name, "scope": payload.scope, "surface": payload.surface},
+    )
+    return result
 
 
 @router.get("", response_model=List[TokenListItem])
