@@ -219,6 +219,30 @@
   line-height: 1.5;
   color: var(--ds-text-primary);
 }
+/* Markdown pipe tables in a TEXT preview, drawn as grids by
+   `splitMarkdownTables` — same grid as a workbook's sheets, because a
+   converted spreadsheet is what they usually are. These have a real header
+   row (the source's delimiter row says so), unlike the `sheets` branch which
+   has no header concept to read. */
+.fp-blocks {
+  display: grid;
+  gap: 14px;
+  min-width: 0;
+}
+.fp-sheet__grid th {
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--ds-border-light);
+  border-right: 1px solid var(--ds-border-light);
+  white-space: nowrap;
+  vertical-align: bottom;
+  text-align: left;
+  font-weight: 600;
+  background: var(--ds-surface-dim);
+  color: var(--ds-text-primary);
+}
+.fp-sheet__grid th:last-child {
+  border-right: 0;
+}
 .fp-sheet__grid td {
   padding: 6px 10px;
   border-bottom: 1px solid var(--ds-border-light);
@@ -234,8 +258,14 @@
 }
 /* The first row of a generated sheet is its header in practice; styling it
    is a presentation choice, not a claim about the file — SpreadsheetML has
-   no header concept to read. */
-.fp-sheet__grid tr:first-child td {
+   no header concept to read.
+
+   Scoped to a table whose FIRST child is the tbody, i.e. the `sheets` branch.
+   A markdown pipe table has a real <thead> (its delimiter row says which row
+   is the header), and `tr:first-child` matches the first row of its own
+   parent — so unscoped this rule drew that table's first DATA row as a second
+   header. */
+.fp-sheet__grid > tbody:first-child > tr:first-child > td {
   font-weight: 600;
   background: var(--ds-surface-dim);
   color: var(--ds-text-primary);

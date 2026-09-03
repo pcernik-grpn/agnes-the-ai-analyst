@@ -14039,7 +14039,7 @@
   "info": {
     "description": "Self-hosted AI harness: governed data access, skills marketplace, corporate memory, and agent workspaces",
     "title": "AI Harness",
-    "version": "0.96.0"
+    "version": "0.89.1"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -63690,6 +63690,75 @@
           }
         },
         "summary": "Library File Detail",
+        "tags": [
+          "web"
+        ]
+      }
+    },
+    "/library/{slug}/matching-files": {
+      "get": {
+        "description": "The file rows of one collection that match ``q`` \u2014 as Library child rows.\n\nWhy this exists: the Library expands a folder to a PEEK of its files\n(``_LIBRARY_FOLDER_PEEK``), and its search box is live and client-side. A\nfolder is searchable by every filename it holds, so typing a filename\nfinds the folder \u2014 but if that file is not in the ten the peek rendered,\nthe folder opened onto nothing and the reader had to click through to the\ncollection page to see the file they had already named (#2141 item 2,\nreview). The page asks this route for the rows instead, so the match is\nthe answer rather than a signpost to it.\n\nRenders through the SAME ``library_row`` macro the page uses, from the\nsame ``_library_child_row`` dict \u2014 a fragment endpoint precisely so the\nmarkup and the sharing vocabulary have one source, not a second copy in\nJavaScript that would drift from the first.\n\nRBAC: collection access, admins exempt \u2014 the same gate as\n``/library/{slug}``, because that is what this lists. Deliberately NOT the\nwider per-file rule ``library_file_detail`` uses: a caller holding a grant\non one file inside a folder may open that file, and must not be able to\nenumerate its siblings. 404 for missing AND for no-access, matching the\ncollection contract.\n\nAn empty ``q`` returns nothing: this route answers a search, and a blank\nsearch is what the peek already renders.",
+        "operationId": "library_matching_file_rows_library__slug__matching_files_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "slug",
+            "required": true,
+            "schema": {
+              "title": "Slug",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "q",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Q",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Library Matching File Rows",
         "tags": [
           "web"
         ]
