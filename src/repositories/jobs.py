@@ -391,6 +391,45 @@ class JobsRepository:
                 ).fetchall()
             return bool(mutated)
 
+    def record_continuation(self, job_id: str, continued_by_job_id: str) -> bool:
+        """Stamp ``continued_by_job_id`` onto an ALREADY-terminal job's
+        stored ``payload_json["result"]`` — bookkeeping for the
+        ``sharepoint-facts-extraction`` auto-continuation
+        (``app/worker/runtime.py::_maybe_continue_facts_extraction``,
+        ``connectors.sharepoint.facts_extraction.maybe_continue_pass``).
+
+        The continuation job can only be ENQUEUED once this job leaves
+        ``'running'`` — it reuses the SAME idempotency key, and a
+        still-``'running'`` row for that key would either collide with
+        it (Postgres's partial unique index) or dedupe onto it (this
+        backend's own ``enqueue()`` check) instead of creating a genuinely
+        new job. So the continuation's own id is only known AFTER
+        ``complete()`` has already persisted this job's report without
+        it — this method is the follow-up patch that adds it in.
+
+        No status/lease guard, unlike ``complete()``/``fail()``: this
+        never competes with a claim, and runs at most once, well after
+        the job is terminal. Returns ``False`` (no-op) for an unknown job
+        id or one whose stored payload carries no ``"result"`` dict to
+        annotate — never raises.
+        """
+        with _JOBS_LOCK:
+            row = self.conn.execute("SELECT payload_json FROM jobs WHERE id = ?", [job_id]).fetchone()
+            if not row or not row[0]:
+                return False
+            try:
+                payload = json.loads(row[0])
+            except (TypeError, ValueError):
+                return False
+            if not isinstance(payload, dict) or not isinstance(payload.get("result"), dict):
+                return False
+            payload["result"]["continued_by_job_id"] = continued_by_job_id
+            self.conn.execute(
+                "UPDATE jobs SET payload_json = ? WHERE id = ?",
+                [json.dumps(payload), job_id],
+            )
+            return True
+
     def fail(
         self,
         job_id: str,

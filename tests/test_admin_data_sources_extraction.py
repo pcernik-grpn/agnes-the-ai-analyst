@@ -81,6 +81,7 @@ _SIGNATURES = (
     "function _extPanelHtml(tone, title, body, connId, retry) {",
     "function _extRenderInAgnesButton(connId, status) {",
     "function _extFactsJobLine(job) {",
+    "function _extFactsPendingLine(status) {",
     "function _extRenderFactsButton(connId, status) {",
     "function _extRender(connId) {",
     "function _extRunsHtml(connId, body) {",
@@ -1698,6 +1699,63 @@ _extRenderFactsButton('sp1', { facts_job: null });
 console.log(JSON.stringify({ disabled: _elements['ext-facts-btn-sp1'].disabled }));
 """
         assert _run_js(body)["disabled"] is True
+
+
+class TestFactsPendingLine:
+    """TCRD-296 gap #61: a pass that stopped on its own time budget with
+    documents still pending used to leave nothing visible once the crawl
+    that triggered it was long over. `facts_pending_documents`/
+    `facts_pass_running` on the status payload drive one extra line in the
+    Run row, distinct from `_extFactsJobLine` (which only ever shows a
+    SPECIFIC job's id/status)."""
+
+    _IDLE = {
+        "connection_id": "sp1",
+        "running": None,
+        "last_completed": None,
+        "facts_job": None,
+        "runs_total": 0,
+        "can_stop": True,
+        "as_of": "2026-09-02T10:00:00+00:00",
+    }
+
+    def test_a_pending_backlog_with_a_pass_running_says_continuing(self):
+        data = {**self._IDLE, "facts_pending_documents": 42, "facts_pass_running": True}
+        out = _run_js(
+            "console.log(JSON.stringify({ html: _extRunRowHtml('sp1', _extState.sp1) }));",
+            state=_state(data=data),
+        )
+        html = out["html"]
+        assert "42 documents pending facts extraction" in html
+        assert "continuing" in html
+        assert "not running" not in html
+
+    def test_a_pending_backlog_with_nothing_running_says_not_running(self):
+        data = {**self._IDLE, "facts_pending_documents": 7, "facts_pass_running": False}
+        out = _run_js(
+            "console.log(JSON.stringify({ html: _extRunRowHtml('sp1', _extState.sp1) }));",
+            state=_state(data=data),
+        )
+        html = out["html"]
+        assert "7 documents pending facts extraction" in html
+        assert "not running" in html
+
+    def test_zero_pending_says_nothing(self):
+        data = {**self._IDLE, "facts_pending_documents": 0, "facts_pass_running": False}
+        out = _run_js(
+            "console.log(JSON.stringify({ html: _extRunRowHtml('sp1', _extState.sp1) }));",
+            state=_state(data=data),
+        )
+        assert "pending facts extraction" not in out["html"]
+
+    def test_a_status_payload_with_no_field_at_all_says_nothing(self):
+        """Older code paths / a payload that never set the field — never a
+        false "0 pending"."""
+        out = _run_js(
+            "console.log(JSON.stringify({ html: _extRunRowHtml('sp1', _extState.sp1) }));",
+            state=_state(data=self._IDLE),
+        )
+        assert "pending facts extraction" not in out["html"]
 
 
 # --------------------------------------------------------------------------

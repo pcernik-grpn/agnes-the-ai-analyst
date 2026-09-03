@@ -910,22 +910,35 @@ class TestRunTotalCostUsd:
 
 
 class TestFleetFacts:
-    def test_no_run_is_the_empty_shape_with_every_count_none(self):
+    """`_fleet_facts(run, connection_id)` — `connection_id` drives
+    `facts_pending_documents`/`facts_pass_running` (TCRD-296 gap #61),
+    connection-level facts independent of `run`; every test here needs a
+    working repo context (``seeded_app``) for those two lookups even
+    though the connection itself is never seeded — an unknown connection
+    reads as "0 pending, nothing running", never an error."""
+
+    def test_no_run_is_the_empty_shape_with_every_count_none(self, seeded_app):
         from app.api.admin_extraction import _EMPTY_FLEET_FACTS, _fleet_facts
 
-        out = _fleet_facts(None)
-        assert out == _EMPTY_FLEET_FACTS
+        out = _fleet_facts(None, "conn-none")
         assert out["docs_done"] is None
         assert out["usage"] == {}
+        assert out["facts_pending_documents"] == 0
+        assert out["facts_pass_running"] is False
+        # Every OTHER field still matches the run-keyed empty shape.
+        for key, value in _EMPTY_FLEET_FACTS.items():
+            if key in ("facts_pending_documents", "facts_pass_running"):
+                continue
+            assert out[key] == value
 
-    def test_mutating_the_result_never_corrupts_the_shared_empty_constant(self):
+    def test_mutating_the_result_never_corrupts_the_shared_empty_constant(self, seeded_app):
         from app.api.admin_extraction import _EMPTY_FLEET_FACTS, _fleet_facts
 
-        out = _fleet_facts(None)
+        out = _fleet_facts(None, "conn-none")
         out["docs_done"] = 999
         assert _EMPTY_FLEET_FACTS["docs_done"] is None
 
-    def test_live_progress_while_the_facts_phase_is_running(self):
+    def test_live_progress_while_the_facts_phase_is_running(self, seeded_app):
         from app.api.admin_extraction import _fleet_facts
 
         run = {
@@ -933,14 +946,14 @@ class TestFleetFacts:
             "phase": "facts",
             "progress": {"facts": {"docs_done": 12, "docs_total": 340}},
         }
-        out = _fleet_facts(run)
+        out = _fleet_facts(run, "conn-live")
         assert out["phase_active"] is True
         assert out["docs_done"] == 12
         assert out["docs_total"] == 340
         # Not known until `finish()` — a live pass has no outcome breakdown yet.
         assert out["docs_extracted"] is None
 
-    def test_final_report_once_the_pass_has_finished(self):
+    def test_final_report_once_the_pass_has_finished(self, seeded_app):
         from app.api.admin_extraction import _fleet_facts
 
         run = {
@@ -958,7 +971,7 @@ class TestFleetFacts:
             },
             "usage": {"facts": {"estimated_cost_usd": 4.5, "input_tokens": 1000}},
         }
-        out = _fleet_facts(run)
+        out = _fleet_facts(run, "conn-final")
         assert out["phase_active"] is False  # the row is `done`, not `running`
         assert out["docs_done"] == 300  # falls back to docs_extracted
         assert out["docs_extracted"] == 300
@@ -968,11 +981,33 @@ class TestFleetFacts:
         assert out["facts_failed"] == 3
         assert out["usage"]["estimated_cost_usd"] == 4.5
 
-    def test_phase_active_is_false_outside_the_facts_phase(self):
+    def test_phase_active_is_false_outside_the_facts_phase(self, seeded_app):
         from app.api.admin_extraction import _fleet_facts
 
         run = {"status": "running", "phase": "crawl", "progress": {}}
-        assert _fleet_facts(run)["phase_active"] is False
+        assert _fleet_facts(run, "conn-crawl")["phase_active"] is False
+
+    def test_pending_documents_and_pass_running_reflect_the_connection(self, seeded_app, monkeypatch):
+        """Connection-level, not read off `run` — proven by mocking the two
+        underlying lookups (already covered elsewhere: `count_pending_
+        documents` in `tests/db_pg/test_facts_extraction_pg.py`,
+        `_facts_job_in_flight` in `TestFactsJobInFlight` below) and
+        checking `_fleet_facts` threads `connection_id` through to both,
+        regardless of `run`."""
+        from app.api import admin_extraction as mod
+
+        monkeypatch.setattr(mod, "_facts_pending_documents", lambda cid: 7 if cid == "conn-x" else 0)
+        monkeypatch.setattr(
+            mod, "_facts_job_in_flight", lambda cid: {"id": "job-1", "status": "running"} if cid == "conn-x" else None
+        )
+
+        out = mod._fleet_facts(None, "conn-x")
+        assert out["facts_pending_documents"] == 7
+        assert out["facts_pass_running"] is True
+
+        out_other = mod._fleet_facts(None, "conn-y")
+        assert out_other["facts_pending_documents"] == 0
+        assert out_other["facts_pass_running"] is False
 
 
 FLEET_URL = "/api/admin/sharepoint/extraction/runs"

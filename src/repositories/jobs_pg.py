@@ -425,6 +425,26 @@ class JobsPgRepository:
                 ).first()
         return mutated is not None
 
+    def record_continuation(self, job_id: str, continued_by_job_id: str) -> bool:
+        """Mirrors ``JobsRepository.record_continuation`` — see that
+        method's docstring for why this exists (the auto-continuation's
+        own id is only known once ``complete()`` already persisted this
+        job's report) and why it carries no status/lease guard."""
+        with self._engine.begin() as conn:
+            row = conn.execute(sa.text("SELECT payload_json FROM jobs WHERE id = :id"), {"id": job_id}).first()
+            if not row or not row[0]:
+                return False
+            raw = row[0]
+            payload = raw if isinstance(raw, dict) else json.loads(raw)
+            if not isinstance(payload, dict) or not isinstance(payload.get("result"), dict):
+                return False
+            payload["result"]["continued_by_job_id"] = continued_by_job_id
+            conn.execute(
+                sa.text("UPDATE jobs SET payload_json = :payload_json WHERE id = :id"),
+                {"payload_json": json.dumps(payload), "id": job_id},
+            )
+            return True
+
     def fail(
         self,
         job_id: str,

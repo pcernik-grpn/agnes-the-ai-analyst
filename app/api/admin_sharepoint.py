@@ -4295,8 +4295,17 @@ def _facts_extraction_idempotency_key(connection_id: str) -> str:
     shape so a manual "run facts extraction now" and any other in-flight
     pass for the same connection can never both be queued at once, and so
     this job kind can never dedup against ``corpus-extraction`` or any
-    other sibling kind for the same connection (different prefix)."""
-    return f"sharepoint-facts-extraction:{connection_id}"
+    other sibling kind for the same connection (different prefix).
+
+    Delegates to ``connectors.sharepoint.facts_extraction.
+    facts_extraction_idempotency_key`` — the single source of truth
+    (that module's own auto-continuation, ``maybe_continue_pass``, needs
+    the identical key and cannot import it back from this API module
+    without an upward layering dependency, so the canonical copy lives
+    there and this wrapper stays for every existing caller of this name)."""
+    from connectors.sharepoint.facts_extraction import facts_extraction_idempotency_key
+
+    return facts_extraction_idempotency_key(connection_id)
 
 
 def _facts_extraction_readiness() -> Tuple[bool, Optional[Dict[str, str]]]:

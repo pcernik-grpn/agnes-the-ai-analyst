@@ -1379,6 +1379,134 @@ def test_finalize_extraction_run_for_job_swallows_requires_postgres_backend(monk
     runtime_mod._finalize_extraction_run_for_job("job-1", "corpus-extraction", "boom")  # must not raise
 
 
+# ---------------------------------------------------------------------------
+# _maybe_continue_facts_extraction() — a sharepoint-facts-extraction pass
+# that stopped only on its own time budget re-enqueues itself (TCRD-296
+# gap #61). The decision logic lives entirely in
+# connectors.sharepoint.facts_extraction.maybe_continue_pass; these tests
+# cover the wiring: kind-gating, argument threading, and the one invariant
+# the whole feature depends on — the check runs strictly AFTER complete(),
+# not from inside the handler, where the continuation's own enqueue call
+# would self-deadlock against this job's still-'running' row.
+# ---------------------------------------------------------------------------
+
+
+def test_maybe_continue_facts_extraction_is_a_noop_for_other_kinds(monkeypatch):
+    from app.worker import runtime as runtime_mod
+
+    touched: list[bool] = []
+    monkeypatch.setattr(
+        "connectors.sharepoint.facts_extraction.maybe_continue_pass", lambda *a, **kw: touched.append(True)
+    )
+
+    runtime_mod._maybe_continue_facts_extraction({"id": "job-1", "kind": "data-refresh"}, {"interrupted": True})
+
+    assert touched == []
+
+
+def test_maybe_continue_facts_extraction_threads_the_jobs_payload_and_id(monkeypatch):
+    from app.worker import runtime as runtime_mod
+
+    calls: list[dict] = []
+
+    def _fake(connection_id, *, payload, report, original_job_id):
+        calls.append(
+            {
+                "connection_id": connection_id,
+                "payload": payload,
+                "report": report,
+                "original_job_id": original_job_id,
+            }
+        )
+        return "next-job-id"
+
+    monkeypatch.setattr("connectors.sharepoint.facts_extraction.maybe_continue_pass", _fake)
+
+    job = {
+        "id": "job-1",
+        "kind": "sharepoint-facts-extraction",
+        "payload_json": {"connection_id": "conn-1", "doc_ids": ["d1"]},
+    }
+    result = {"interrupted": True, "interrupted_reason": "timeout"}
+    runtime_mod._maybe_continue_facts_extraction(job, result)
+
+    assert calls == [
+        {
+            "connection_id": "conn-1",
+            "payload": job["payload_json"],
+            "report": result,
+            "original_job_id": "job-1",
+        }
+    ]
+
+
+def test_maybe_continue_facts_extraction_is_a_noop_with_no_connection_id(monkeypatch):
+    """A malformed payload must never escape into the job's own
+    already-committed finalize."""
+    from app.worker import runtime as runtime_mod
+
+    touched: list[bool] = []
+    monkeypatch.setattr(
+        "connectors.sharepoint.facts_extraction.maybe_continue_pass", lambda *a, **kw: touched.append(True)
+    )
+
+    runtime_mod._maybe_continue_facts_extraction(
+        {"id": "job-1", "kind": "sharepoint-facts-extraction", "payload_json": {}}, {}
+    )
+
+    assert touched == []
+
+
+def test_maybe_continue_facts_extraction_swallows_exceptions(monkeypatch):
+    from app.worker import runtime as runtime_mod
+
+    def _raise(*a, **kw):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr("connectors.sharepoint.facts_extraction.maybe_continue_pass", _raise)
+
+    runtime_mod._maybe_continue_facts_extraction(
+        {"id": "job-1", "kind": "sharepoint-facts-extraction", "payload_json": {"connection_id": "conn-1"}}, {}
+    )  # must not raise
+
+
+def test_facts_extraction_completion_runs_the_continuation_check_after_complete(worker_db, monkeypatch):
+    """The defining ordering property: by the time the continuation check
+    fires, the ORIGINAL job is already 'done' — proving it ran from the
+    post-complete() hook, never from inside the handler (which would
+    self-deadlock the continuation's own same-key enqueue against this
+    job's still-'running' row — see `maybe_continue_pass`'s docstring)."""
+    from app.worker.registry import LIGHT_LANE, JobKind, register_kind
+    from app.worker.runtime import worker_loop
+    from src.repositories import jobs_repo
+
+    calls: list[dict] = []
+
+    def _fake(connection_id, *, payload, report, original_job_id):
+        calls.append(
+            {
+                "connection_id": connection_id,
+                "original_job_id": original_job_id,
+                "original_status_when_called": jobs_repo().get(original_job_id)["status"],
+            }
+        )
+        return None
+
+    monkeypatch.setattr("connectors.sharepoint.facts_extraction.maybe_continue_pass", _fake)
+    register_kind(
+        JobKind(
+            name="sharepoint-facts-extraction",
+            handler=lambda payload: {"interrupted": True, "interrupted_reason": "timeout"},
+            lane=LIGHT_LANE,
+        )
+    )
+    job = jobs_repo().enqueue("sharepoint-facts-extraction", {"connection_id": "conn-1"})
+
+    asyncio.run(_run_and_cancel(worker_loop(worker_id="test-worker", poll_interval_s=0.05), 0.4))
+
+    assert calls == [{"connection_id": "conn-1", "original_job_id": job["id"], "original_status_when_called": "done"}]
+
+
 def test_agent_response_fail_notifies_despite_retry_config_when_attempts_exhausted(worker_db, monkeypatch):
     """MEDIUM 2b: `fail()` finalizes to 'failed' whenever attempts are
     exhausted, REGARDLESS of the kind's static `retry_in_seconds` config —

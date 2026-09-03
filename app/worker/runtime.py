@@ -461,6 +461,48 @@ def _finalize_extraction_run_for_job(job_id: str, kind: str, error: str) -> None
         )
 
 
+def _maybe_continue_facts_extraction(job: dict, result: dict | None) -> None:
+    """When a ``sharepoint-facts-extraction`` job completes having stopped
+    only on its own time budget with documents still pending, chain the
+    next pass onto it (TCRD-296 gap #61) — delegates entirely to
+    ``connectors.sharepoint.facts_extraction.maybe_continue_pass``; see
+    that function's docstring for the decision rules and for why this
+    MUST run only after ``complete()`` has already flipped the job out of
+    ``'running'`` (the continuation reuses this job's own idempotency
+    key, and enqueuing it while this row is still live would either
+    collide with or dedupe onto that same row instead of creating a
+    genuinely new one).
+
+    A plain no-op for every other kind (mirrors
+    ``_notify_agent_response_webhooks``'s / ``_finalize_extraction_run_for_job``'s
+    own kind-gated shape) and best-effort in its own right — a failure
+    inside ``maybe_continue_pass`` is already caught and logged there,
+    but this wrapper's own lookup (kind check, payload read) is guarded
+    again here so a malformed payload can never turn an already-persisted
+    success into a worker crash.
+    """
+    if job.get("kind") != "sharepoint-facts-extraction":
+        return
+    try:
+        from connectors.sharepoint.facts_extraction import maybe_continue_pass
+
+        payload = job.get("payload_json") or {}
+        connection_id = str(payload.get("connection_id") or "")
+        if not connection_id:
+            return
+        maybe_continue_pass(
+            connection_id,
+            payload=payload,
+            report=result or {},
+            original_job_id=job.get("id"),
+        )
+    except Exception:
+        logger.exception(
+            "worker: sharepoint-facts-extraction auto-continuation check failed for job %s (non-fatal)",
+            job.get("id"),
+        )
+
+
 def _sweep_stale_scratch() -> None:
     """Best-effort orphaned-scratch sweep, run before each HEAVY job.
 
@@ -649,6 +691,10 @@ async def _run_one(job: dict, kind: JobKind, worker_id: str, in_flight: dict[str
                 # `complete()` must not fire a notification for an outcome
                 # another slot already owns.
                 _notify_agent_response_webhooks(job, "completed")
+                # Same `mutated` gate — a stale-lease no-op must not chain
+                # a duplicate facts-extraction continuation onto a job
+                # another slot already owns.
+                _maybe_continue_facts_extraction(job, handler_result)
         finally:
             if not handed_off:
                 obs_metrics.end_job_running(job["kind"], kind.lane)
@@ -805,6 +851,23 @@ async def _notify_in_flight_agent_response(job_id: str, status: str) -> None:
         )
 
 
+async def _maybe_continue_facts_extraction_in_flight(job_id: str, result: dict | None) -> None:
+    """`_drain_in_flight`'s counterpart to `_maybe_continue_facts_extraction`
+    — same re-fetch rationale as `_notify_in_flight_agent_response` above
+    (`_InFlightJob` carries no `payload_json`), and best-effort in its own
+    right for the same reason."""
+    try:
+        job_row = await to_thread_drain_on_cancel(_jobs_repo().get, job_id)
+        if job_row is not None:
+            _maybe_continue_facts_extraction(job_row, result)
+    except Exception:
+        logger.warning(
+            "worker: sharepoint-facts-extraction auto-continuation check (shutdown drain) failed for job %s",
+            job_id,
+            exc_info=True,
+        )
+
+
 async def _drain_in_flight(
     in_flight: dict[str, _InFlightJob], worker_id: str, *, budget_s: float | None = None
 ) -> None:
@@ -903,6 +966,8 @@ async def _drain_in_flight(
                     obs_metrics.record_job_duration(entry.kind_name, "done", duration)
                     if entry.kind_name == "agent_response" and mutated:
                         await _notify_in_flight_agent_response(job_id, "completed")
+                    if entry.kind_name == "sharepoint-facts-extraction" and mutated:
+                        await _maybe_continue_facts_extraction_in_flight(job_id, handler_result)
             except asyncio.CancelledError:
                 raise
             except Exception:

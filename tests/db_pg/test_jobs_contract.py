@@ -459,6 +459,33 @@ def test_complete_with_result_is_noop_for_wrong_token(repo):
     assert "result" not in row["payload_json"]
 
 
+def test_record_continuation_stamps_continued_by_job_id_onto_result(repo):
+    """The sharepoint-facts-extraction auto-continuation flow: `complete()`
+    persists a report under `result`, and once the CONTINUATION job's id
+    is known (only after this job left 'running'), `record_continuation`
+    patches it in — see `JobsRepository.record_continuation`'s docstring."""
+    repo.enqueue("sharepoint-facts-extraction", {"connection_id": "c1"})
+    claimed = repo.claim_next(kinds=["sharepoint-facts-extraction"], worker_id="w1")
+    repo.complete(claimed["id"], "w1", claimed["lease_token"], {"interrupted": True, "interrupted_reason": "timeout"})
+    stamped = repo.record_continuation(claimed["id"], "next-job-id")
+    assert stamped is True
+    row = repo.get(claimed["id"])
+    assert row["payload_json"]["result"]["interrupted_reason"] == "timeout"
+    assert row["payload_json"]["result"]["continued_by_job_id"] == "next-job-id"
+
+
+def test_record_continuation_is_noop_for_unknown_job(repo):
+    assert repo.record_continuation("does-not-exist", "next-job-id") is False
+
+
+def test_record_continuation_is_noop_when_job_has_no_stored_result(repo):
+    """A job whose handler returned `None` (every non-`agent_response`/
+    `sharepoint-facts-extraction` kind, and this one before `complete()`
+    is even called) has no `result` to annotate."""
+    job = repo.enqueue("plain_kind", {})
+    assert repo.record_continuation(job["id"], "next-job-id") is False
+
+
 def test_fail_with_retry_requeues(repo):
     """A successful requeue is NOT terminal — `fail()` must report
     `False` even though it mutated the row (to `'queued'`, not

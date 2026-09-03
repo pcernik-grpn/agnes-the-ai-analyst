@@ -155,6 +155,25 @@ function _extFactsJobLine(job) {
   return `<div class="ext-sub">${_extDot(running ? "running" : "idle")}facts pass <strong>${running ? "running" : "queued"}</strong> · job ${_extEsc(job.id)}${sinceText}</div>`;
 }
 
+/* TCRD-296 gap #61: a pass that stopped on its own time budget with
+   documents still pending used to leave nothing visible here once the
+   crawl that triggered it was long over — an operator had to notice a
+   stale corpus and re-trigger by hand every couple hours. `facts_pass_
+   running` is server-computed (`facts_job` off the same status payload,
+   not re-derived here), so "continuing" here means a job — auto-chained
+   or manual — is actually queued/running for it right now, and "not
+   running" is the honest gap. Renders only when there is at least one
+   pending document (`0`/`null` say nothing, matching every other line's
+   "absence is the honest answer" convention here). */
+function _extFactsPendingLine(status) {
+  const n = status && status.facts_pending_documents;
+  if (n === null || n === undefined || n <= 0) return "";
+  const continuing = !!status.facts_pass_running;
+  const cls = continuing ? "" : " ext-warn";
+  const state = continuing ? "continuing" : "not running";
+  return `<div class="ext-sub${cls}">${_extNum(n)} document${n === 1 ? "" : "s"} pending facts extraction · ${state}</div>`;
+}
+
 function _extRunLine(run) {
   const bits = [];
   if (run.new != null) bits.push(`${_extNum(run.new)} new`);
@@ -406,6 +425,7 @@ function _extRunRowHtml(connId, st) {
   }
 
   sub += _extFactsJobLine(status.facts_job);
+  sub += _extFactsPendingLine(status);
 
   if (st.error) {
     sub += `<div class="ext-sub ext-danger"><span class="ext-stale">stale</span> couldn't refresh — last read ${_extEsc(_extTime(st.lastOk))}</div>`;

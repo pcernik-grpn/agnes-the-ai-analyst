@@ -516,10 +516,15 @@ _EMPTY_FLEET_FACTS: Dict[str, Any] = {
     "facts_failed": None,
     "facts_failed_reasons": None,
     "usage": {},
+    # TCRD-296 gap #61 — see `_fleet_facts`'s docstring for why these two
+    # are connection-level, not read off the run row like everything else
+    # in this shape.
+    "facts_pending_documents": None,
+    "facts_pass_running": False,
 }
 
 
-def _fleet_facts(run: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+def _fleet_facts(run: Optional[Dict[str, Any]], connection_id: str) -> Dict[str, Any]:
     """The facts stage's own numbers for one connection's latest run — read
     off the SAME row the crawl side already reads, never a second
     per-connection query or a re-read of the per-document idempotency state
@@ -536,33 +541,43 @@ def _fleet_facts(run: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     (``docs_extracted``/``docs_unchanged``/the ``skipped-*`` reasons/
     ``facts_failed``) and ``docs_done`` falls back to ``docs_extracted`` so
     a finished run still answers "how many did it do".
+
+    ``facts_pending_documents``/``facts_pass_running`` are NOT read off
+    ``run`` at all — a connection's outstanding backlog and whether a job
+    is chasing it are properties of the CONNECTION, not of its latest
+    crawl run (which may be long finished, or may never have reached the
+    facts phase). Computed unconditionally, even for a connection with no
+    ``run`` — the exact "three connections sat idle for hours" case
+    TCRD-296 gap #61 reported, which a run-keyed field would have stayed
+    blind to.
     """
-    if not run:
-        return dict(_EMPTY_FLEET_FACTS)
-    progress = run.get("progress") or {}
-    report = run.get("report") or {}
-    live_facts = progress.get("facts") or {}
-    final_facts = report.get("facts") or {}
     out = dict(_EMPTY_FLEET_FACTS)
-    out["phase_active"] = str(run.get("phase") or "") == "facts" and str(run.get("status") or "") == "running"
-    if live_facts:
-        out["docs_done"] = live_facts.get("docs_done")
-        out["docs_total"] = live_facts.get("docs_total")
-    if final_facts:
-        out["docs_extracted"] = final_facts.get("docs_extracted")
-        out["docs_unchanged"] = final_facts.get("docs_unchanged")
-        out["docs_skipped_tabular"] = final_facts.get("docs_skipped_tabular")
-        out["docs_skipped_no_text"] = final_facts.get("docs_skipped_no_text")
-        out["docs_skipped_not_indexed"] = final_facts.get("docs_skipped_not_indexed")
-        out["docs_skipped_garbled_text"] = final_facts.get("docs_skipped_garbled_text")
-        out["docs_skipped_too_large_tabular"] = final_facts.get("docs_skipped_too_large_tabular")
-        out["facts_failed"] = final_facts.get("facts_failed")
-        out["facts_failed_reasons"] = final_facts.get("facts_failed_reasons")
-        if out["docs_done"] is None:
-            out["docs_done"] = final_facts.get("docs_extracted")
-    # The priced usage for JUST this stage — see `_run_total_cost_usd` for
-    # why it is only known once the run has finished.
-    out["usage"] = (run.get("usage") or {}).get("facts") or {}
+    if run:
+        progress = run.get("progress") or {}
+        report = run.get("report") or {}
+        live_facts = progress.get("facts") or {}
+        final_facts = report.get("facts") or {}
+        out["phase_active"] = str(run.get("phase") or "") == "facts" and str(run.get("status") or "") == "running"
+        if live_facts:
+            out["docs_done"] = live_facts.get("docs_done")
+            out["docs_total"] = live_facts.get("docs_total")
+        if final_facts:
+            out["docs_extracted"] = final_facts.get("docs_extracted")
+            out["docs_unchanged"] = final_facts.get("docs_unchanged")
+            out["docs_skipped_tabular"] = final_facts.get("docs_skipped_tabular")
+            out["docs_skipped_no_text"] = final_facts.get("docs_skipped_no_text")
+            out["docs_skipped_not_indexed"] = final_facts.get("docs_skipped_not_indexed")
+            out["docs_skipped_garbled_text"] = final_facts.get("docs_skipped_garbled_text")
+            out["docs_skipped_too_large_tabular"] = final_facts.get("docs_skipped_too_large_tabular")
+            out["facts_failed"] = final_facts.get("facts_failed")
+            out["facts_failed_reasons"] = final_facts.get("facts_failed_reasons")
+            if out["docs_done"] is None:
+                out["docs_done"] = final_facts.get("docs_extracted")
+        # The priced usage for JUST this stage — see `_run_total_cost_usd`
+        # for why it is only known once the run has finished.
+        out["usage"] = (run.get("usage") or {}).get("facts") or {}
+    out["facts_pending_documents"] = _facts_pending_documents(connection_id)
+    out["facts_pass_running"] = _facts_job_in_flight(connection_id) is not None
     return out
 
 
@@ -657,7 +672,7 @@ def fleet_extraction_runs(
         files_per_min = _files_per_min(run) if run else None
         checkpoint_age_s = _age_s(run.get("checkpoint_at"), now=now) if run else None
         stuck = bool(run_out and run_out.get("outcome") == "stalled")
-        facts = _fleet_facts(run)
+        facts = _fleet_facts(run, connection_id)
         cost = _run_total_cost_usd(run)
         backlog = sharepoint_state_repo().backlog_counts(connection_id, "crawl")
 
@@ -877,6 +892,18 @@ def _facts_job_in_flight(connection_id: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _facts_pending_documents(connection_id: str) -> int:
+    """Thin delegate to ``connectors.sharepoint.facts_extraction.
+    count_pending_documents`` — see that function's docstring for the
+    (cheap, no-document-text-read) definition of "pending". A tiny
+    wrapper rather than an inline import at each of this module's two
+    call sites (the per-connection status endpoint and the fleet row),
+    same reasoning as ``_facts_job_in_flight`` above."""
+    from connectors.sharepoint.facts_extraction import count_pending_documents
+
+    return count_pending_documents(connection_id)
+
+
 @router.get("/connections/{connection_id}/extraction/status")
 async def extraction_status(
     connection_id: str,
@@ -948,14 +975,27 @@ async def extraction_status(
             break
 
     backlog = sharepoint_state_repo().backlog_counts(connection_id, "crawl")
-
+    facts_job = _facts_job_in_flight(connection_id)
     return {
         "connection_id": connection_id,
         "running": running_out,
         "last_completed": last_completed_out,
         "last_failed": last_failed_out,
         "runs_total": repo.count_for_connection(connection_id),
-        "facts_job": _facts_job_in_flight(connection_id),
+        "facts_job": facts_job,
+        # TCRD-296 gap #61: a pass that stopped on its own time budget left
+        # nothing visible once the crawl that triggered it was long over —
+        # an operator had to notice a stale corpus and re-trigger by hand.
+        # `facts_pending_documents` (`connectors.sharepoint.
+        # facts_extraction.count_pending_documents`, a cheap corpus-vs-
+        # state scan, no document text read) answers "how much is left";
+        # `facts_pass_running` (`facts_job is not None`) answers "is
+        # anything doing it right now" — together the card can say
+        # "pending · continuing" vs. "pending · not running" instead of
+        # a silent gap. See `maybe_continue_pass` for the auto-chain that
+        # normally keeps the second one true whenever the first is > 0.
+        "facts_pending_documents": _facts_pending_documents(connection_id),
+        "facts_pass_running": facts_job is not None,
         # `POST …/extraction/stop` (below) always exists and always works —
         # the flag lives on `source_connections`, not on this PG-only table
         # — so there is now an honest Stop control to draw whenever a run is
