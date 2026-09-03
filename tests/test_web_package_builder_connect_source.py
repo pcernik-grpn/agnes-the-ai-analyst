@@ -33,6 +33,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from tests import _ds_page_source
+
 TEMPLATES = Path("app/web/templates")
 STATIC = Path("app/web/static")
 
@@ -142,49 +144,68 @@ class TestThePickerTreeIsLegible:
         rows = src.split("function pickerRowsHtml()", 1)[1].split("function pickerControlsHtml", 1)[0]
         assert "seenSub" in rows, "the picker's row subtitle must dedupe like the panel's does"
 
-    def test_the_controls_strip_is_always_there(self) -> None:
-        """Two earlier versions were wrong in opposite directions. Rendering it
-        only when a facet happened to narrow meant an instance whose tables
-        share a source and a mode got a bare search box and no visible way to
-        narrow anything — which reads as "this modal has no filters". Gating
-        the sort away instead left a lone dropdown right-aligned over three
-        rows, which reads as a stray control. A labelled row in the same place
-        every time is a control panel even when all it holds is Sort."""
+    def test_the_bar_is_the_products_own_toolbar(self) -> None:
+        """Three private versions of this control preceded it, each wrong in
+        its own way — a bare substring box, a strip that vanished on a uniform
+        registry, and a lone right-aligned dropdown over three rows. The
+        product already has one filter toolbar, driving /library, /chats and
+        three admin pages, so a reader who has filtered the Library knows this
+        one: search, a Filter button whose menu groups the categories, one
+        chip per applied category, sort inline."""
         src = COMPONENT.read_text(encoding="utf-8")
-        ctl = src.split("function pickerControlsHtml()", 1)[1].split("function pickerHtml", 1)[0]
-        assert "if (!body) return ''" not in ctl, "the strip must not vanish on a uniform registry"
-        # The sort label travels with the control it names, not to the far side.
-        assert "pdw-pickctl__k--sort" in ctl
-        css = COMPONENT_CSS.read_text(encoding="utf-8")
-        assert ".pdw-pickctl__k--sort { margin-left: auto; }" in css
+        assert "function pickerBarHtml()" in src
+        bar = src.split("function pickerBarHtml()", 1)[1].split("function pickerHtml", 1)[0]
+        for cls in ("fbar__search", "fbar-filter__btn", "fbar-menu--cats", "fbar-chips"):
+            assert cls in bar, f"the bar must use the shared {cls}"
+        # The private strip and its stylesheet are gone together.
+        assert "pdw-pickctl__k--sort" not in src
+        assert "function pickerControlsHtml" not in src
+        # With nothing to slice the button is disabled, not absent — the same
+        # rule /library follows, so the bar keeps its shape either way.
+        assert "disabled aria-disabled=" in bar
 
     def test_one_filter_narrows_on_every_instance(self) -> None:
         """Source and query mode only narrow when an instance happens to have
         two of them, and "in no package" only when some are packaged. "What I
         have already ticked" narrows whenever anything is ticked — the case
-        that matters in a three-hundred-row tree where your picks are scattered
-        through collapsed groups."""
+        that matters in a long tree where your picks sit in collapsed groups.
+        It rides the bar as its own pressed-state button, the design system's
+        pattern for the one refinement worth seeing at rest."""
         src = COMPONENT.read_text(encoding="utf-8")
-        assert "var pickerSelectedOnly = false;" in src
-        assert "if (pickerSelectedOnly && !st.tablesSelected.has(t.id)) return false;" in src
-        assert "data-selected" in src
-        # It counts as a filter, so Clear offers to undo it...
-        facets = src.split("function facetsActive()", 1)[1].split("function resetPickerFilters", 1)[0]
-        assert "if (pickerSelectedOnly) return true;" in facets
-        # ...and Clear actually clears it.
-        reset = src.split("function resetPickerFilters()", 1)[1].split("function facetOptions", 1)[0]
-        assert "pickerSelectedOnly = false;" in reset
+        cfg = src.split("window.FilterToolbar.init(", 1)[1].split("});", 1)[0]
+        assert "key: 'selected'" in cfg and "attr: 'data-selected'" in cfg
+        assert "control: '#pdw-picked-toggle'" in cfg, "it belongs on the bar, not in the menu"
+        assert "toggle: true" in cfg
+        # Rendered from the start rather than built by the first tick — see
+        # the test below for why that matters.
+        assert "id=\"pdw-picked-toggle\"" in src
+        assert "data-selected=\"' + (on ? 'yes' : 'no') + '\"" in src
 
-    def test_the_selection_count_refreshes_the_moment_something_is_ticked(self) -> None:
-        """The toggle carries a count of what is ticked, so a tick that redrew
-        only the rows left it stale — and on the FIRST tick the toggle does not
-        exist yet, so ticking looked like it did nothing."""
+    def test_a_tick_re_renders_nothing(self) -> None:
+        """This is what keeps the picker usable while filtered. Replacing the
+        rows leaves the engine holding detached nodes, so its next filter does
+        nothing; rebuilding the bar re-mounts the engine, which starts with no
+        facets selected. Either one silently drops the reader's filter and
+        search the moment they tick a box — measured: filter to two of nine,
+        tick one, and all nine come back with the badge cleared."""
         src = COMPONENT.read_text(encoding="utf-8")
-        assert "function renderPickerStrip()" in src
+        assert "function absorbTick()" in src
         change = src.split("els.picker.addEventListener('change'", 1)[1].split("els.tables.addEventListener", 1)[0]
-        assert change.count("renderPickerStrip();") >= 2, (
-            "both the single-table tick and the bulk group tick must refresh the strip"
+        assert change.count("absorbTick();") >= 2, (
+            "both the single tick and the bulk group tick must absorb in place"
         )
+        assert "renderPickerRows()" not in change, "a tick must not re-render the rows"
+        assert "renderPickerBar" not in src, "nor rebuild the bar"
+        # The toggle exists from the start, so no tick has to create it.
+        assert "(pickedN ? '' : ' hidden')" in src
+
+    def test_a_group_tick_only_takes_what_is_visible(self) -> None:
+        """Under a filter the group box means "the rows I can see". Ticking a
+        Keboola group while filtered to live-query tables must not silently
+        add the synced ones you had just filtered away."""
+        src = COMPONENT.read_text(encoding="utf-8")
+        change = src.split("els.picker.addEventListener('change'", 1)[1].split("els.tables.addEventListener", 1)[0]
+        assert "return !row || !row.hidden;" in change
 
     def test_a_bucket_tier_that_only_repeats_its_project_is_collapsed(self) -> None:
         """The internal source rendered as "Agnes internal › Agnes Internal ›
@@ -294,21 +315,43 @@ class TestTheSourcesPageHoldsTheOtherEndOfTheTrip:
         """`from` is untrusted request input. It is compared against a literal
         and the destination is hard-coded, so it cannot steer a navigation the
         way an interpolated value could."""
-        page = SOURCES_PAGE.read_text(encoding="utf-8")
+        page = _ds_page_source.page_source()
         assert '_params.get("from") === "package-builder"' in page
         assert '"/admin/data-packages/new"' in page
 
     def test_the_wizard_stops_after_choosing_tables_on_that_entry(self) -> None:
-        page = SOURCES_PAGE.read_text(encoding="utf-8")
-        assert "let _fromPackageBuilder = false;" in page
-        assert "_fromPackageBuilder = true;" in page
-        # Bundle and Share BUILD a package; they are not offered to someone
-        # already building one.
+        """Bundle and Share BUILD a data package, so they are not offered to
+        someone already building one — on either entry. The flag that used to
+        mean "navigate back" is now a handoff object with an optional
+        callback, which is what lets the builder open this same wizard as a
+        drawer and never leave the page."""
+        page = _ds_page_source.page_source()
+        assert "let _pkgBuilder = null;" in page
+        assert "function _dsWizardForPackageBuilder(opts)" in page
         assert "if (Number(el.dataset.wstep) > 2) el.hidden = true;" in page
         # …and the primary names where the tables are actually going.
         assert '"Add selected tables to your package"' in page
-        # The step-2 handler returns instead of walking on to the board.
+        # The step-2 handler hands back instead of walking on to the board.
         register = page.split('getElementById("ds-wizard-register-btn").addEventListener', 1)[1]
-        hand_back = register.index("if (_fromPackageBuilder)")
+        hand_back = register.index("if (_pkgBuilder)")
         seeds_board = register.index("_seedBoard(")
         assert hand_back < seeds_board, "the hand-back must come before the bundling path"
+        # In-page when the host gave a callback, by navigation when it did not.
+        handoff = register[hand_back : hand_back + 600]
+        assert "_pkgBuilder.onRegistered" in handoff
+        assert '"/admin/data-packages/new"' in handoff
+
+    def test_the_builder_opens_the_wizard_over_itself(self) -> None:
+        """The whole point of lifting the wizard out of admin_data_sources:
+        "Connect a source" answers in place instead of navigating. The compact
+        drawer on /admin/tables cannot stack another overlay, so it passes no
+        hook and keeps the navigation — the host decides."""
+        builder = (TEMPLATES / "admin_package_builder.html").read_text(encoding="utf-8")
+        assert '{% include "_add_data_wizard.html" %}' in builder
+        assert "js/ds_page.js" in builder and "css/ds_page.css" in builder
+        assert "window.DS_BOOT" in builder, "it must hand over the values that page renders"
+        assert "openConnectWizard: function (onRegistered)" in builder
+        src = COMPONENT.read_text(encoding="utf-8")
+        leave = src.split("function leaveToConnect()", 1)[1].split("\n  }", 1)[0]
+        assert "st.openConnectWizard" in leave
+        assert "persistDraft('connect')" in leave, "the navigation stays as the fallback"
