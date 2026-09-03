@@ -151,6 +151,34 @@ CHUNK_JOIN_SEPARATOR = "\n\n"
 # repo, not an operator switch — the caps above are the primary defense.
 _STATEMENT_TIMEOUT_MS = 5_000
 
+# `sweep_orphans()`'s grace period (live finding, 2026-09 — see
+# migrations/versions/0100_facts_created_at.py for the incident numbers): a
+# subject younger than this is never swept, however orphaned it looks right
+# now, because it may simply be mid-write in ITS OWN pass. 15 minutes is
+# generous relative to a single `ingest_batch` call (seconds, not minutes),
+# so it costs nothing to a healthy pass while comfortably outlasting the
+# window between one pass's commits. A constant, not a `get_value` operator
+# knob, for the same reason `MIN_MEANINGFUL_QUOTE_LENGTH` is one: this
+# guards write-path correctness, not an ontology choice — callers that
+# genuinely need immediate-delete semantics (a test, or the collections
+# file-delete hook, where nothing else could be concurrently orphaning the
+# same subject) pass `grace_seconds=0` explicitly.
+_ORPHAN_SWEEP_GRACE_S = 15 * 60
+
+# Global (not per-connection) transaction-scoped advisory-lock key
+# serializing `sweep_orphans()` itself across every concurrent
+# `ingest_batch` pass. Single-bigint `pg_try_advisory_xact_lock` overload —
+# distinct from `_SEED_LEASE_ID`/`_REBUILD_LEASE_ID` (src/db_pg.py, the
+# session-scoped `pg_advisory_lock` overload) and from
+# `_FACTS_LOCK_CLASS_ID` (src/repositories/sharepoint_state_pg.py, a
+# two-int `(class_id, hashtext(connection_id))` key scoped to ONE
+# connection's pass): the sweep has no per-connection scope of its own — it
+# operates over the whole shared fact graph — so there is no natural second
+# key to pair it with, and a bare single-bigint key can never collide with
+# that two-int form (its packed 64-bit value always has a nonzero high
+# 32 bits, this constant's does not).
+_SWEEP_LOCK_ID = 0x46414353  # "FACS" packed as an int32
+
 
 class FactNotFound(RuntimeError):
     """A subject that does not exist OR has no readable claim (spec §5 rule
@@ -3380,14 +3408,15 @@ class FactsPgRepository:
     # orphan sweep (spec §6) — deletes zero-claim subjects, counts them.
     # ------------------------------------------------------------------
 
-    def sweep_orphans(self) -> int:
-        """Delete every orphaned subject (fact or edge); return the count
-        (spec §6, refined per the module docstring's "Endpoint evidence": an
-        edge anchors its endpoints, so a fact is orphaned only when it has
-        NEITHER an own claim NOR an incident edge carrying any claim).
-        Correction-agnostic throughout — this is raw data hygiene, not a
-        visibility check; a `wrong`/`restricted` edge with a live claim
-        still anchors its endpoints here exactly like any other edge.
+    def sweep_orphans(self, *, grace_seconds: int = _ORPHAN_SWEEP_GRACE_S) -> Dict[str, Any]:
+        """Delete every orphaned subject (fact or edge); return
+        ``{"deleted": <int>, "skipped": <bool>}`` (spec §6, refined per the
+        module docstring's "Endpoint evidence": an edge anchors its
+        endpoints, so a fact is orphaned only when it has NEITHER an own
+        claim NOR an incident edge carrying any claim). Correction-agnostic
+        throughout — this is raw data hygiene, not a visibility check; a
+        `wrong`/`restricted` edge with a live claim still anchors its
+        endpoints here exactly like any other edge.
 
         Edges are swept FIRST: an edge with zero claims of its own is
         removed before the fact sweep runs — with ONE exception.
@@ -3416,8 +3445,41 @@ class FactsPgRepository:
         counted here. Safe to call unconditionally (a no-op when nothing is
         orphaned); callers decide when running it is warranted (post-ingest
         — replace mode can orphan a subject a document no longer mentions —
-        and post file delete, spec §6's lifecycle table)."""
+        and post file delete, spec §6's lifecycle table).
+
+        **Concurrency (live finding, 2026-09 — see
+        migrations/versions/0100_facts_created_at.py): two guards close the
+        race between several facts-extraction passes each ending their own
+        `ingest_batch` with this sweep:**
+
+        1. **Grace period** — a FACT younger than ``grace_seconds`` (default
+           :data:`_ORPHAN_SWEEP_GRACE_S`, 15 minutes; NULL ``created_at``, a
+           row written before this column existed, reads as "old enough") is
+           never swept no matter how orphaned it looks right now: a fact
+           minted moments ago purely as an edge endpoint (``_endpoint()``'s
+           fallback, its own transaction — see :class:`EdgeEndpointMissing`)
+           or a node whose own evidence is still deferred/rejected commits
+           with zero claims for a real, if brief, window before the write
+           that gives it its claims. ``grace_seconds=0`` recovers the
+           pre-existing immediate-delete behavior for a caller that knows no
+           other pass could be concurrently orphaning the same subject (a
+           test; the collections file-delete hook). Edges need no such
+           guard — an edge only ever commits already carrying its final
+           claim set for its batch (or legitimately zero, the exempted
+           proposal case above), never a transiently-incomplete one.
+        2. **Serialized sweeps** — a transaction-scoped Postgres advisory
+           lock (:data:`_SWEEP_LOCK_ID`) means at most one pass's sweep
+           actually touches the database at a time. A pass that cannot
+           acquire it skips its OWN sweep rather than waiting — the next
+           pass sweeps instead — and returns ``{"deleted": 0, "skipped":
+           True}`` without running either DELETE.
+        """
         with self._engine.begin() as conn:
+            acquired = bool(
+                conn.execute(sa.text("SELECT pg_try_advisory_xact_lock(:key)"), {"key": _SWEEP_LOCK_ID}).scalar()
+            )
+            if not acquired:
+                return {"deleted": 0, "skipped": True}
             edge_ids = (
                 conn.execute(
                     sa.text(
@@ -3437,13 +3499,15 @@ class FactsPgRepository:
                         "AND NOT EXISTS (SELECT 1 FROM edges e "
                         "WHERE (e.src = f.id OR e.dst = f.id) "
                         "AND e.type <> 'possible_duplicate_of') "
+                        "AND (f.created_at IS NULL OR f.created_at <= now() - make_interval(secs => :grace_seconds)) "
                         "RETURNING f.id"
-                    )
+                    ),
+                    {"grace_seconds": grace_seconds},
                 )
                 .scalars()
                 .all()
             )
-        return len(edge_ids) + len(fact_ids)
+        return {"deleted": len(edge_ids) + len(fact_ids), "skipped": False}
 
     # ------------------------------------------------------------------
     # corrections management support (spec §3/§4) — natural-key snapshots
@@ -3676,7 +3740,15 @@ class FactsPgRepository:
         full_documents: Optional[List[str]] = None,
         nodes: Optional[List[Dict[str, Any]]] = None,
         edges: Optional[List[Dict[str, Any]]] = None,
+        orphan_sweep_grace_seconds: int = _ORPHAN_SWEEP_GRACE_S,
     ) -> Dict[str, Any]:
+        """``orphan_sweep_grace_seconds`` — passed straight through to the
+        end-of-batch :meth:`sweep_orphans` call (see its docstring's
+        "Concurrency" section); no production caller overrides this, it
+        exists so a test that depends on THIS SAME batch's sweep deleting a
+        subject it just orphaned (e.g. `full_documents` replace mode
+        dropping a stale claim) can request the pre-existing immediate-
+        delete behavior with ``orphan_sweep_grace_seconds=0``."""
         documents = documents or []
         full_documents = full_documents or []
         nodes = nodes or []
@@ -4511,7 +4583,8 @@ class FactsPgRepository:
                     }
                 )
 
-        subjects_deleted = self.sweep_orphans()
+        sweep_result = self.sweep_orphans(grace_seconds=orphan_sweep_grace_seconds)
+        subjects_deleted = sweep_result["deleted"]
 
         # TCRD-241 / RBAC review (PR #1736): a doc_id that would only have
         # resolved by escaping every corpus this batch's `documents[]`
@@ -4536,6 +4609,15 @@ class FactsPgRepository:
             "deferred": deferred,
             "subjects_created": subjects_created,
             "subjects_deleted": subjects_deleted,
+            # True when this batch's own end-of-ingest sweep backed off
+            # because a CONCURRENT pass already held `sweep_orphans()`'s
+            # serializing advisory lock (see its docstring's "Concurrency"
+            # section) — never an error, just visibility: the next pass's
+            # sweep covers whatever this one skipped, so a source card that
+            # reads a run of `sweep_skipped: true` alongside
+            # `subjects_deleted: 0` knows nothing was left orphaned, the
+            # sweep simply deferred to a sibling pass.
+            "sweep_skipped": sweep_result["skipped"],
             "corrections_active": corrections_active,
             "review_items": review_items,
             # Edges NOT written because their src/dst fact was gone by the
