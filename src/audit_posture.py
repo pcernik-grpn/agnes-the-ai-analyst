@@ -738,6 +738,7 @@ EXEMPT_REASONS: frozenset[str] = frozenset(
 READ_POSTURE: dict[str, str] = {
     # -- app.api.access --
     "GET /api/admin/access-overview": "exempt:ui_support",
+    "GET /api/admin/access/resources/{resource_type}/search": "exempt:ui_support",
     "GET /api/admin/grants": "exempt:ui_support",
     "GET /api/admin/groups": "exempt:ui_support",
     "GET /api/admin/groups/{group_id}": "exempt:ui_support",

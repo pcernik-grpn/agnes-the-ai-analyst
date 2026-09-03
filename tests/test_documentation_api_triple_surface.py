@@ -803,6 +803,14 @@ _KEBOOLA_LOGIN_PROJECTS_REASON = (
 )
 
 _EXEMPT: dict[str, str] = {
+    "/api/admin/access/resources/{resource_type}/search": (
+        "browser-only admin UI support for the /admin/access per-file grant "
+        "picker — the search counterpart to the grandfathered, equally "
+        "REST-only GET /api/admin/access-overview it complements (see "
+        "app.resource_types._corpus_file_blocks). Granting per-file access "
+        "is an admin-console action; there is no analyst/agent workflow "
+        "that browses individual file grant candidates by name"
+    ),
     "/api/knowledge/digests": (
         "enumerating maintained digests for a WEB surface (TCRD-250). Both "
         "other surfaces already RECEIVE digests by a better route than a "
