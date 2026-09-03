@@ -242,6 +242,27 @@ class CorpusFilesPgRepository:
             rows = conn.execute(sa.text("SELECT corpus_id, COUNT(*) AS n FROM corpus_files GROUP BY corpus_id")).all()
         return {r[0]: int(r[1]) for r in rows}
 
+    def search_across_corpora(self, q: str, *, limit: int = 50) -> List[Dict[str, Any]]:
+        """Mirrors the DuckDB sibling — see its docstring."""
+        q_norm = (q or "").strip()
+        if not q_norm:
+            return []
+        pattern = f"%{self._escape_like(q_norm)}%"
+        with self._engine.connect() as conn:
+            rows = (
+                conn.execute(
+                    sa.text(
+                        "SELECT * FROM corpus_files "
+                        "WHERE LOWER(filename) LIKE LOWER(:q) ESCAPE '\\' OR LOWER(path) LIKE LOWER(:q) ESCAPE '\\' "
+                        "ORDER BY LOWER(filename) ASC, id ASC LIMIT :limit"
+                    ),
+                    {"q": pattern, "limit": limit},
+                )
+                .mappings()
+                .all()
+            )
+        return [self._decode_row(dict(r)) for r in rows]
+
     def status_counts_for_corpora(self, corpus_ids: List[str]) -> Dict[str, Dict[str, int]]:
         """``{corpus_id: {processing_status: count}}`` for exactly the given
         corpus ids, in ONE query. Mirrors the DuckDB sibling — see its

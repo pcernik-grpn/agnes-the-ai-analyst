@@ -395,6 +395,7 @@ class TestRBACSmoke:
         "PUT /api/admin/grants/{grant_id}",
         "DELETE /api/admin/grants/{grant_id}",
         "GET /api/admin/access-overview",
+        "GET /api/admin/access/resources/{resource_type}/search",
         "GET /api/admin/resource-types",
         "GET /api/admin/activity",
         "GET /api/admin/activity/health",
@@ -417,6 +418,14 @@ class TestRBACSmoke:
     def test_resource_types(self, seeded_app_both):
         r = seeded_app_both["client"].get("/api/admin/resource-types", headers=_admin_headers(seeded_app_both))
         assert r.status_code == 200
+
+    def test_corpus_file_search(self, seeded_app_both):
+        r = seeded_app_both["client"].get(
+            "/api/admin/access/resources/corpus_file/search?q=xx",
+            headers=_admin_headers(seeded_app_both),
+        )
+        assert r.status_code == 200
+        assert isinstance(r.json(), list)
 
     def test_activity(self, seeded_app_both):
         r = seeded_app_both["client"].get("/api/admin/activity", headers=_admin_headers(seeded_app_both))

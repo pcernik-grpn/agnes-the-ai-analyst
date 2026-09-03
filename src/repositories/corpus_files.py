@@ -218,6 +218,32 @@ class CorpusFilesRepository:
         rows = self.conn.execute("SELECT corpus_id, COUNT(*) FROM corpus_files GROUP BY corpus_id").fetchall()
         return {r[0]: int(r[1]) for r in rows}
 
+    def search_across_corpora(self, q: str, *, limit: int = 50) -> List[Dict[str, Any]]:
+        """Files across EVERY corpus whose filename or path matches ``q``.
+
+        The bounded, on-demand counterpart to the admin ``/access`` overview
+        projection (``app.resource_types._corpus_file_blocks``), which caps
+        how many files of one collection it lists — on an instance with
+        hundreds of thousands of files, listing them all made that payload
+        tens of megabytes. This is what the per-file grant picker calls
+        instead: a query, not a preloaded scan.
+
+        A blank/whitespace-only ``q`` matches nothing (never "everything") —
+        same convention as ``list_for_corpus``'s ``q`` filter, just without a
+        ``corpus_id`` to scope it.
+        """
+        q_norm = (q or "").strip()
+        if not q_norm:
+            return []
+        pattern = f"%{self._escape_like(q_norm)}%"
+        rows = self.conn.execute(
+            f"SELECT {self._SELECT} FROM corpus_files "
+            "WHERE LOWER(filename) LIKE LOWER(?) ESCAPE '\\' OR LOWER(path) LIKE LOWER(?) ESCAPE '\\' "
+            "ORDER BY LOWER(filename) ASC, id ASC LIMIT ?",
+            [pattern, pattern, limit],
+        ).fetchall()
+        return [self._decode_row(dict(zip(self._COLS, r))) for r in rows]
+
     def status_counts_for_corpora(self, corpus_ids: List[str]) -> Dict[str, Dict[str, int]]:
         """``{corpus_id: {processing_status: count}}`` for exactly the given
         corpus ids, in ONE query.

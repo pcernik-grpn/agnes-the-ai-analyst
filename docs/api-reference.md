@@ -808,6 +808,10 @@ fabricated one is dropped rather than corrected.
 
 - /api/admin/resource-types
 
+### `/api/admin/access/resources/{resource_type}/search` — Bounded grantable-resource search
+
+- /api/admin/access/resources/{resource_type}/search
+
 ### `/api/admin/knowledge-digests` — Maintained digests CRUD (admin, K4)
 
 - /api/admin/knowledge-digests

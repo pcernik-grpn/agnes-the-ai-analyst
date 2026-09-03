@@ -527,6 +527,66 @@ def test_count_by_corpus_is_empty_when_there_are_no_files(repo):
     assert repo.count_by_corpus() == {}
 
 
+def test_search_across_corpora_matches_filename_across_all_corpora(repo):
+    """The admin per-file grant picker's bounded, on-demand search — the
+    counterpart to the (now capped) `/admin/access` overview projection
+    in `app.resource_types._corpus_file_blocks`."""
+    repo.add(
+        corpus_id="col_a",
+        filename="quarterly-report.pdf",
+        sha256="s1",
+        file_type="pdf",
+        size_bytes=10,
+        storage_path="/tmp/1",
+    )
+    repo.add(
+        corpus_id="col_b",
+        filename="Report-2026.docx",
+        sha256="s2",
+        file_type="docx",
+        size_bytes=10,
+        storage_path="/tmp/2",
+    )
+    repo.add(
+        corpus_id="col_b",
+        filename="unrelated.csv",
+        sha256="s3",
+        file_type="csv",
+        size_bytes=10,
+        storage_path="/tmp/3",
+    )
+    results = repo.search_across_corpora("report", limit=50)
+    names = {r["filename"] for r in results}
+    assert names == {"quarterly-report.pdf", "Report-2026.docx"}
+
+
+def test_search_across_corpora_respects_limit(repo):
+    for i in range(5):
+        repo.add(
+            corpus_id="col_a",
+            filename=f"doc-{i}.pdf",
+            sha256=f"s{i}",
+            file_type="pdf",
+            size_bytes=10,
+            storage_path=f"/tmp/{i}",
+        )
+    results = repo.search_across_corpora("doc", limit=2)
+    assert len(results) == 2
+
+
+def test_search_across_corpora_blank_query_matches_nothing(repo):
+    repo.add(
+        corpus_id="col_a",
+        filename="a.pdf",
+        sha256="s1",
+        file_type="pdf",
+        size_bytes=10,
+        storage_path="/tmp/1",
+    )
+    assert repo.search_across_corpora("", limit=50) == []
+    assert repo.search_across_corpora("   ", limit=50) == []
+
+
 def test_status_counts_for_corpora_groups_by_corpus_and_status_in_one_read(repo):
     """The batched sibling of ``count_by_corpus``: a caller with a LIST of
     corpus ids (e.g. a connection's confirmed scopes) gets every corpus's
