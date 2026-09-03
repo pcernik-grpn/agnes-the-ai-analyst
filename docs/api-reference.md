@@ -2494,6 +2494,29 @@ CLI: `agnes collections edit <id> [--name] [--description] [--slug]`. MCP:
 `collection_update` (metadata only — creating, uploading into and deleting a
 collection are deliberately absent from the agent surface).
 
+**Search over large corpora is bounded** (P0 OOM fix, 2026-09):
+`GET /api/collections/search` and `GET /api/knowledge/search` never load
+more than `knowledge.retrieval.max_candidate_chunks` (default 5000)
+candidate chunk rows before ranking — a caller with a wide grant (an admin,
+or a group spanning many collections) used to load every chunk in every
+accessible collection first, which OOM-killed the process on a large corpus.
+Candidate selection now runs in SQL: Postgres full-text search
+(`to_tsvector`/`plainto_tsquery`, `'simple'` config), ranked and `LIMIT`-ed;
+the DuckDB app-state backend (frozen, never reaches this scale) uses a
+plain `ILIKE` prefilter instead. The response carries an additive
+`candidates_capped: true` when the bound was actually hit — read/write
+semantics and RBAC are otherwise unchanged; see
+`src.ingest.retrieval.search`'s docstring for the full design and its
+documented trade-off (a query with literally no shared vocabulary in any
+candidate's body text can no longer be found by embedding similarity alone
+once a corpus exceeds the cap — the filename fallback has its own,
+separate bounded path and is unaffected). The backing GIN index
+(migration `0101_corpus_chunks_fts_index`) is skipped at migration time on
+a table over 1,000,000 rows to avoid a long lock during startup; see that
+migration's docstring for the `CREATE INDEX CONCURRENTLY` statement an
+operator must then run out-of-band. Full-text search works without the
+index either way, just via a slower sequential scan.
+
 - /api/collections
 - /api/collections/search
 - /api/collections/{collection_id}

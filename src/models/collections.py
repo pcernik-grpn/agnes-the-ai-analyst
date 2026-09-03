@@ -103,10 +103,24 @@ class CorpusFile(Base):
 
 class CorpusChunk(Base):
     __tablename__ = "corpus_chunks"
-    # Every ingest deletes and re-reads a file's chunks by ``file_id``; without
-    # this index those were sequential scans over millions of rows (live
-    # finding, 2026-09 — migration ``0098_corpus_chunks_file_id_index``).
-    __table_args__ = (sa.Index("idx_corpus_chunks_file_id", "file_id"),)
+    __table_args__ = (
+        # Every ingest deletes and re-reads a file's chunks by ``file_id``;
+        # without this index those were sequential scans over millions of
+        # rows (live finding, 2026-09 — migration
+        # ``0098_corpus_chunks_file_id_index``).
+        sa.Index("idx_corpus_chunks_file_id", "file_id"),
+        # Backs the bounded retrieval candidate scan
+        # (``CorpusChunksPgRepository.search_candidates``, P0 OOM fix,
+        # 2026-09 — migration ``0101_corpus_chunks_fts_index``). May be
+        # absent on an instance whose table was too large to build it
+        # in-place at migration time — see that migration's docstring for
+        # the operator follow-up; the query it backs still works without it.
+        sa.Index(
+            "idx_corpus_chunks_text_fts",
+            sa.text("to_tsvector('simple', text)"),
+            postgresql_using="gin",
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String, primary_key=True)
     corpus_id: Mapped[str] = mapped_column(String, nullable=False)
