@@ -1605,6 +1605,21 @@ extraction:
     # `vertex` always runs the `sync` transport below, regardless of this
     # instance's `transport` setting — one warning log line, never an error.
     provider: inherit
+    # WHICH Vertex AI region a `provider: vertex` pass's client talks to, on
+    # top of `ai.vertex.region` above — only meaningful when the resolved
+    # provider is `vertex`, resolved and reported unconditionally (harmless,
+    # simply unused otherwise). Google enforces Claude-on-Vertex quotas PER
+    # REGION: a project running every connection's facts pass against the
+    # same (default) region hits that region's requests-per-minute ceiling
+    # well before its account-level spend limit — regions have independent
+    # quotas, so pinning different connections to different regions
+    # multiplies effective throughput at the same per-call price. Empty
+    # (default) falls back to `ai.vertex.region`. A single connection can
+    # override this too — see `config.extraction.facts.vertex_region` on the
+    # connection row, PATCH /api/admin/sharepoint/connections/{id}/
+    # extraction/facts-config or `agnes admin sharepoint facts-config
+    # --vertex-region`.
+    vertex_region: ""
     # Which API carries each document's extraction call. `sync` (default)
     # is the synchronous Messages API, bound by the model account's
     # tokens-per-minute limit — measured on a live instance at ~13k input +

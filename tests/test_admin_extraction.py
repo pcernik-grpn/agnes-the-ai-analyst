@@ -174,6 +174,29 @@ class TestExtractionConfig:
         body = client.get(f"{BASE}/{conn_id}/extraction/config", headers=_auth(token)).json()
         assert body["min_modified"] == {"value": "2023-12-31", "source": "connection"}
 
+    def test_vertex_region_row_falls_back_to_ai_vertex_region_when_no_override(self, seeded_app, monkeypatch):
+        monkeypatch.setattr(
+            "connectors.llm.factory.vertex_config_or_none", lambda *a, **k: ("my-project", "us-central1")
+        )
+        client, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = _create_connection(client, token, name="sp-config-vertex-region")
+        rows = client.get(f"{BASE}/{conn_id}/extraction/config", headers=_auth(token)).json()["effective"]
+        by_key = {r["key"]: r for r in rows if r["key"]}
+        region = by_key["extraction.facts.vertex_region"]
+        assert region["value"] == "us-central1"
+        assert "instance:ai.vertex" in (region["note"] or "")
+
+    def test_vertex_region_row_reflects_a_connection_override(self, seeded_app):
+        client, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = _create_connection(client, token, name="sp-config-vertex-region-override")
+        client.patch(
+            f"{BASE}/{conn_id}/extraction/facts-config", json={"vertex_region": "europe-west4"}, headers=_auth(token)
+        )
+        rows = client.get(f"{BASE}/{conn_id}/extraction/config", headers=_auth(token)).json()["effective"]
+        by_key = {r["key"]: r for r in rows if r["key"]}
+        region = by_key["extraction.facts.vertex_region"]
+        assert region["value"] == "europe-west4"
+
     def test_detector_defaults_to_regex_and_says_no_tokens_are_spent(self, seeded_app):
         client, token = seeded_app["client"], seeded_app["admin_token"]
         conn_id = _create_connection(client, token, name="sp-config-detector")

@@ -834,6 +834,13 @@ class FactsConfigPatch(BaseModel):
     #: onto) Vertex. `"inherit"`/`"anthropic"`/`"vertex"` sets the override,
     #: an explicit `null` clears it, omitting it leaves it alone.
     provider: Optional[str] = None
+    #: `vertex_region` follows `transport`/`provider`'s own PRESENT-in-body
+    #: convention: a lowercase-letters/digits/dash Vertex region (`"global"`
+    #: allowed) sets the override, an explicit `null` clears it, omitting it
+    #: leaves it alone. Only meaningful when the pass's resolved provider is
+    #: `vertex` — harmless (accepted, stored, resolved, simply unused) on a
+    #: connection pinned to (or inheriting) `anthropic`.
+    vertex_region: Optional[str] = None
 
 
 @router.patch("/connections/{connection_id}/extraction/facts-config")
@@ -871,6 +878,17 @@ async def patch_extraction_facts_config(
     actually builds a client from, which can differ from ``provider.value``
     when the latter is ``"inherit"``.
 
+    ``vertex_region`` is a further sibling override
+    (``config.extraction.facts.vertex_region``), only meaningful when the
+    resolved provider is ``vertex`` — it pins WHICH Vertex region a pass's
+    client talks to, on top of this instance's own ``ai.vertex.region``.
+    Google enforces Claude-on-Vertex quotas PER REGION, so a caller can
+    spread several connections' facts passes across regions to multiply the
+    account's effective throughput at the same per-call price. Validated
+    with the same character class ``ai.vertex.region`` itself is held to
+    (lowercase letters, digits, dash; ``"global"`` allowed) — a malformed
+    value is refused with a plain ``422`` rather than silently ignored.
+
     Works on BOTH app-state backends, like the Stop control above: this
     touches only ``source_connections``, never a PG-only table.
     """
@@ -879,10 +897,12 @@ async def patch_extraction_facts_config(
         _VALID_PROVIDERS,
         _VALID_RETRY_MODES,
         _VALID_TRANSPORTS,
+        _region_looks_valid,
         resolve_effective_provider,
         resolve_provider,
         resolve_retry_mode,
         resolve_transport,
+        resolve_vertex_region,
     )
 
     if body.retry_mode is not None and body.retry_mode not in _VALID_RETRY_MODES:
@@ -901,6 +921,19 @@ async def patch_extraction_facts_config(
         raise HTTPException(
             status_code=422,
             detail=f"provider must be one of {sorted(_VALID_PROVIDERS)} or null (to clear the override)",
+        )
+    vertex_region_given = "vertex_region" in body.model_fields_set
+    if (
+        vertex_region_given
+        and body.vertex_region is not None
+        and not _region_looks_valid(body.vertex_region.strip().lower())
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "vertex_region must be lowercase letters, digits and dash ('global' allowed), or null "
+                "(to clear the override)"
+            ),
         )
 
     from src.repositories import source_connections_repo
@@ -922,6 +955,11 @@ async def patch_extraction_facts_config(
             facts_cfg.pop("provider", None)
         else:
             facts_cfg["provider"] = body.provider
+    if vertex_region_given:
+        if body.vertex_region is None:
+            facts_cfg.pop("vertex_region", None)
+        else:
+            facts_cfg["vertex_region"] = body.vertex_region.strip().lower()
     if facts_cfg:
         extraction["facts"] = facts_cfg
     else:
@@ -932,6 +970,7 @@ async def patch_extraction_facts_config(
     transport_value, transport_source = resolve_transport(updated)
     provider_value, provider_source = resolve_provider(updated)
     effective_provider, effective_provider_source = resolve_effective_provider(updated)
+    vertex_region_value, vertex_region_source = resolve_vertex_region(updated)
 
     # More than the fallback middleware can say (it sees only path params
     # and the response status, never the body) — the VALUE an admin set or
@@ -952,6 +991,9 @@ async def patch_extraction_facts_config(
             "provider_resolved": provider_value,
             "provider_source": provider_source,
             "provider_effective": effective_provider,
+            "vertex_region": body.vertex_region if vertex_region_given else "(untouched)",
+            "vertex_region_resolved": vertex_region_value,
+            "vertex_region_source": vertex_region_source,
         },
     )
 
@@ -965,6 +1007,7 @@ async def patch_extraction_facts_config(
             "effective": effective_provider,
             "effective_source": effective_provider_source,
         },
+        "vertex_region": {"value": vertex_region_value, "source": vertex_region_source},
     }
 
 
@@ -1418,6 +1461,33 @@ def _facts_transport_row(connection: Optional[Dict[str, Any]]) -> Dict[str, Any]
     )
 
 
+def _facts_vertex_region_row(connection: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """The facts-extraction Vertex region row — the RESOLVED value
+    (``connectors.sharepoint.facts_extraction.resolve_vertex_region``), one
+    level deeper than ``resolve_provider``/``resolve_transport``: a
+    per-connection override, then ``extraction.facts.vertex_region``, then
+    this instance's own ``ai.vertex.region``. Only meaningful for a pass
+    resolved to ``provider: vertex`` — shown regardless, the same
+    "resolved even where it does not apply" posture :func:`_facts_transport_row`
+    already takes.
+    """
+    from connectors.sharepoint.facts_extraction import resolve_vertex_region
+
+    region, source = resolve_vertex_region(connection)
+    return _config_row(
+        "Facts Vertex region",
+        ("extraction", "facts", "vertex_region"),
+        default=None,
+        value=region,
+        note=(
+            f"resolved via {source} — only used when the facts provider above resolves to vertex. "
+            "Google enforces Claude-on-Vertex quotas per region, so pinning different connections to "
+            "different regions raises the account's effective throughput. A connection can override "
+            "it on its source card."
+        ),
+    )
+
+
 def _extraction_config_rows(connection: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     """The effective ``extraction`` block, one row per leaf (design §6.2).
 
@@ -1460,6 +1530,7 @@ def _extraction_config_rows(connection: Optional[Dict[str, Any]] = None) -> List
         _ner_model_row(),
         _facts_provider_row(connection),
         _facts_transport_row(connection),
+        _facts_vertex_region_row(connection),
         _config_row(
             "Anonymization key",
             ("extraction", "anonymization", "hmac_key_env"),

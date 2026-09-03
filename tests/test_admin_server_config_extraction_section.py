@@ -861,6 +861,7 @@ def test_run_knobs_are_known_fields_with_the_stages_own_defaults(seeded_app, mon
     assert facts["transport"]["default"] == "sync"
     assert facts["retry_mode"]["default"] == "on_gate_fail"
     assert facts["provider"] == {**facts["provider"], "kind": "string", "default": "inherit"}
+    assert facts["vertex_region"] == {**facts["vertex_region"], "kind": "string", "default": ""}
 
 
 def test_caps_match_the_stages_own_clamps():
@@ -891,6 +892,7 @@ def test_post_run_knobs_persist_and_get_reflects_them(seeded_app, monkeypatch):
                         "retry_mode": "off",
                         "run_timeout_s": 7200,
                         "provider": "vertex",
+                        "vertex_region": "europe-west4",
                     },
                 }
             }
@@ -905,6 +907,7 @@ def test_post_run_knobs_persist_and_get_reflects_them(seeded_app, monkeypatch):
     assert got["facts"]["retry_mode"] == "off"
     assert got["facts"]["run_timeout_s"] == 7200
     assert got["facts"]["provider"] == "vertex"
+    assert got["facts"]["vertex_region"] == "europe-west4"
 
 
 @pytest.mark.parametrize(
@@ -919,9 +922,23 @@ def test_post_run_knobs_persist_and_get_reflects_them(seeded_app, monkeypatch):
         {"facts": {"retry_mode": "sometimes"}},
         {"facts": {"stream_every": "300"}},
         {"facts": {"provider": "openai"}},
+        {"facts": {"vertex_region": "US-East4!"}},
+        {"facts": {"vertex_region": 4}},
     ],
 )
 def test_run_knobs_out_of_range_or_wrong_type_are_refused(seeded_app, monkeypatch, patch):
     client, token = _client(seeded_app, monkeypatch)
     resp = client.post("/api/admin/server-config", json={"sections": {"extraction": patch}}, headers=_auth(token))
     assert resp.status_code == 422, resp.text
+
+
+def test_vertex_region_global_is_accepted(seeded_app, monkeypatch):
+    client, token = _client(seeded_app, monkeypatch)
+    resp = client.post(
+        "/api/admin/server-config",
+        json={"sections": {"extraction": {"facts": {"vertex_region": "global"}}}},
+        headers=_auth(token),
+    )
+    assert resp.status_code == 200, resp.text
+    got = client.get("/api/admin/server-config", headers=_auth(token)).json()["sections"]["extraction"]
+    assert got["facts"]["vertex_region"] == "global"

@@ -685,6 +685,21 @@ def _validate_extraction_section(sections: Dict[str, Dict[str, Any]]) -> None:
                     status_code=422,
                     detail=f"extraction.facts.{key} must be one of {list(allowed)} (got {value!r})",
                 )
+        vertex_region = facts.get("vertex_region")
+        if vertex_region is not None:
+            if not isinstance(vertex_region, str):
+                raise HTTPException(status_code=422, detail="extraction.facts.vertex_region must be a string")
+            if vertex_region.strip():
+                from connectors.sharepoint.facts_extraction import _region_looks_valid
+
+                if not _region_looks_valid(vertex_region.strip().lower()):
+                    raise HTTPException(
+                        status_code=422,
+                        detail=(
+                            "extraction.facts.vertex_region must be lowercase letters, digits and dash "
+                            f"('global' allowed), or empty (got {vertex_region!r})"
+                        ),
+                    )
 
     crawler = patch.get("crawler")
     if crawler is not None:
@@ -1439,6 +1454,18 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
                         "Vertex equivalent: a vertex-resolved provider always runs the sync "
                         "transport, regardless of extraction.facts.transport. A connection can "
                         "override it on its source card."
+                    ),
+                },
+                "vertex_region": {
+                    "kind": "string",
+                    "default": "",
+                    "hint": (
+                        "Instance default for WHICH Vertex AI region a provider: vertex pass's client "
+                        "talks to, on top of ai.vertex.region. Google enforces Claude-on-Vertex quotas "
+                        "PER REGION, so pinning different connections to different regions raises the "
+                        "account's effective throughput at the same per-call price. Empty falls back to "
+                        "ai.vertex.region. Lowercase letters, digits and dash ('global' allowed). A "
+                        "connection can override it on its source card."
                     ),
                 },
             },

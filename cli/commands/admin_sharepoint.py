@@ -60,6 +60,7 @@ has no browser open at all.
 from __future__ import annotations
 
 import json
+import re
 import time
 from datetime import date
 from pathlib import Path
@@ -641,25 +642,45 @@ def facts_config(
     clear_provider: bool = typer.Option(
         False, "--clear-provider", help="Remove the provider override — falls back to extraction.facts.provider."
     ),
+    vertex_region: Optional[str] = typer.Option(
+        None,
+        "--vertex-region",
+        help="Per-connection override for WHICH Vertex AI region a provider=vertex pass's client talks to, on "
+        "top of this instance's own ai.vertex.region. Google enforces Claude-on-Vertex quotas per region, so "
+        "pinning different connections to different regions raises the account's effective throughput. "
+        "Lowercase letters, digits and dash ('global' allowed). Only meaningful when the resolved provider "
+        "is vertex. Left untouched when not given.",
+    ),
+    clear_vertex_region: bool = typer.Option(
+        False,
+        "--clear-vertex-region",
+        help="Remove the vertex_region override — falls back to extraction.facts.vertex_region, then this "
+        "instance's ai.vertex.region.",
+    ),
     as_json: bool = typer.Option(False, "--json"),
 ):
     """Set (or clear) this connection's own ``extraction.facts.retry_mode``,
-    ``extraction.facts.transport`` and/or ``extraction.facts.provider``,
-    overriding the instance-level defaults (cost-levers task, lever A) — a
-    curated, high-stakes connection can keep the corrective retry ON and run
-    sync (a dropped quote there is a lost citation, and its facts should
-    land in minutes) while a long-tail connection runs with retries OFF on
-    the Batches API, without an instance.yaml edit that would flip every
-    connection at once. ``--provider`` is the same lever for the incident
-    this knob exists to fix: a connection whose Anthropic key has hit its
-    workspace usage cap can be pinned to ``vertex`` without waiting for the
-    instance-wide ``ai.provider`` to change.
+    ``extraction.facts.transport``, ``extraction.facts.provider`` and/or
+    ``extraction.facts.vertex_region``, overriding the instance-level
+    defaults (cost-levers task, lever A) — a curated, high-stakes connection
+    can keep the corrective retry ON and run sync (a dropped quote there is
+    a lost citation, and its facts should land in minutes) while a
+    long-tail connection runs with retries OFF on the Batches API, without
+    an instance.yaml edit that would flip every connection at once.
+    ``--provider`` is the same lever for the incident this knob exists to
+    fix: a connection whose Anthropic key has hit its workspace usage cap
+    can be pinned to ``vertex`` without waiting for the instance-wide
+    ``ai.provider`` to change. ``--vertex-region`` is a further lever on
+    top of that: Vertex enforces its Claude quotas PER REGION, so spreading
+    several connections' passes across regions multiplies the account's
+    effective throughput at the same per-call price.
 
     ``--retry-mode`` / ``--clear`` are mutually exclusive and one is
     required unless ``--transport`` / ``--clear-transport`` / ``--provider``
-    / ``--clear-provider`` is given. Prints the RESOLVED values and where
-    they came from (``connection`` or ``instance``) — the same shape the
-    admin config drawer would show.
+    / ``--clear-provider`` / ``--vertex-region`` / ``--clear-vertex-region``
+    is given. Prints the RESOLVED values and where they came from
+    (``connection`` or ``instance``) — the same shape the admin config
+    drawer would show.
     """
     if clear and retry_mode is not None:
         typer.echo("Error: pass either --retry-mode or --clear, not both", err=True)
@@ -670,12 +691,23 @@ def facts_config(
     if clear_provider and provider is not None:
         typer.echo("Error: pass either --provider or --clear-provider, not both", err=True)
         raise typer.Exit(1)
+    if clear_vertex_region and vertex_region is not None:
+        typer.echo("Error: pass either --vertex-region or --clear-vertex-region, not both", err=True)
+        raise typer.Exit(1)
     touching_transport = clear_transport or transport is not None
     touching_provider = clear_provider or provider is not None
-    if not clear and retry_mode is None and not touching_transport and not touching_provider:
+    touching_vertex_region = clear_vertex_region or vertex_region is not None
+    if (
+        not clear
+        and retry_mode is None
+        and not touching_transport
+        and not touching_provider
+        and not touching_vertex_region
+    ):
         typer.echo(
             "Error: one of --retry-mode or --clear is required "
-            "(or --transport / --clear-transport / --provider / --clear-provider)",
+            "(or --transport / --clear-transport / --provider / --clear-provider / "
+            "--vertex-region / --clear-vertex-region)",
             err=True,
         )
         raise typer.Exit(1)
@@ -688,12 +720,15 @@ def facts_config(
     if provider is not None and provider not in _PROVIDERS:
         typer.echo(f"Error: --provider must be one of {', '.join(_PROVIDERS)}", err=True)
         raise typer.Exit(1)
+    if vertex_region is not None and not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,31}", vertex_region.strip().lower()):
+        typer.echo("Error: --vertex-region must be lowercase letters, digits and dash ('global' allowed)", err=True)
+        raise typer.Exit(1)
 
     # The retry policy keeps its original contract (omitted == cleared), so a
-    # transport/provider-only call re-sends the connection's current retry
-    # override rather than wiping it.
+    # transport/provider/vertex-region-only call re-sends the connection's
+    # current retry override rather than wiping it.
     payload: dict = {"retry_mode": retry_mode}
-    if not clear and retry_mode is None and (touching_transport or touching_provider):
+    if not clear and retry_mode is None and (touching_transport or touching_provider or touching_vertex_region):
         current = api_get(f"/api/admin/sharepoint/connections/{connection_id}")
         if current.status_code == 200:
             facts_now = (((current.json().get("config") or {}).get("extraction") or {}).get("facts")) or {}
@@ -702,6 +737,8 @@ def facts_config(
         payload["transport"] = None if clear_transport else transport
     if touching_provider:
         payload["provider"] = None if clear_provider else provider
+    if touching_vertex_region:
+        payload["vertex_region"] = None if clear_vertex_region else vertex_region
 
     resp = api_patch(
         f"/api/admin/sharepoint/connections/{connection_id}/extraction/facts-config",
@@ -724,6 +761,9 @@ def facts_config(
             f"provider: {resolved_p.get('value')} (source: {resolved_p.get('source')}) "
             f"— effective: {resolved_p.get('effective')}"
         )
+    resolved_vr = body.get("vertex_region") or {}
+    if resolved_vr:
+        typer.echo(f"vertex_region: {resolved_vr.get('value')} (source: {resolved_vr.get('source')})")
 
 
 @admin_sharepoint_app.command("crawl-config")

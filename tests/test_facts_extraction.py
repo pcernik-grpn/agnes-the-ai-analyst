@@ -1965,6 +1965,87 @@ class TestResolveEffectiveProvider:
         assert resolve_effective_provider(conn) == ("anthropic", "connection")
 
 
+# ---------------------------------------------------------------------------
+# Vertex region override (`extraction.facts.vertex_region`) — Vertex enforces
+# its Claude quotas PER REGION, so spreading several connections' facts
+# passes across regions multiplies the account's effective throughput at the
+# same per-call price. Same per-connection override shape as
+# `transport`/`provider`/`retry_mode` above, plus a THIRD fallback level:
+# this instance's own `ai.vertex.region` (`vertex_config_or_none()`).
+# ---------------------------------------------------------------------------
+
+
+def test_vertex_region_setting_defaults_to_empty(monkeypatch):
+    _config(monkeypatch, {})
+    assert fe._vertex_region_setting() == ""
+
+
+def test_vertex_region_setting_reads_the_configured_value(monkeypatch):
+    _config(monkeypatch, {("extraction", "facts", "vertex_region"): "us-east4"})
+    assert fe._vertex_region_setting() == "us-east4"
+
+
+def test_an_invalid_vertex_region_setting_falls_back_to_empty(monkeypatch):
+    _config(monkeypatch, {("extraction", "facts", "vertex_region"): "US-East4!"})
+    assert fe._vertex_region_setting() == ""
+
+
+def test_global_is_a_valid_instance_level_vertex_region(monkeypatch):
+    _config(monkeypatch, {("extraction", "facts", "vertex_region"): "global"})
+    assert fe._vertex_region_setting() == "global"
+
+
+def test_resolve_vertex_region_with_nothing_set_falls_back_to_ai_vertex_region(monkeypatch):
+    from connectors.sharepoint.facts_extraction import resolve_vertex_region
+
+    monkeypatch.setattr("connectors.llm.factory.vertex_config_or_none", lambda *a, **k: ("proj", "us-central1"))
+    _config(monkeypatch, {})
+    assert resolve_vertex_region(None) == ("us-central1", "instance:ai.vertex")
+    assert resolve_vertex_region({"id": "c1", "config": {}}) == ("us-central1", "instance:ai.vertex")
+
+
+def test_resolve_vertex_region_with_no_vertex_config_at_all_is_none(monkeypatch):
+    from connectors.sharepoint.facts_extraction import resolve_vertex_region
+
+    monkeypatch.setattr("connectors.llm.factory.vertex_config_or_none", lambda *a, **k: None)
+    _config(monkeypatch, {})
+    assert resolve_vertex_region(None) == (None, "none")
+
+
+def test_the_instance_level_vertex_region_setting_beats_ai_vertex_region(monkeypatch):
+    from connectors.sharepoint.facts_extraction import resolve_vertex_region
+
+    monkeypatch.setattr("connectors.llm.factory.vertex_config_or_none", lambda *a, **k: ("proj", "us-central1"))
+    _config(monkeypatch, {("extraction", "facts", "vertex_region"): "europe-west4"})
+    assert resolve_vertex_region(None) == ("europe-west4", "instance")
+
+
+def test_a_connection_vertex_region_override_beats_the_instance_setting(monkeypatch):
+    from connectors.sharepoint.facts_extraction import resolve_vertex_region
+
+    monkeypatch.setattr("connectors.llm.factory.vertex_config_or_none", lambda *a, **k: ("proj", "us-central1"))
+    _config(monkeypatch, {("extraction", "facts", "vertex_region"): "europe-west4"})
+    conn = {"id": "c1", "config": {"extraction": {"facts": {"vertex_region": "asia-northeast1"}}}}
+    assert resolve_vertex_region(conn) == ("asia-northeast1", "connection")
+
+
+def test_an_invalid_connection_vertex_region_falls_back_to_the_instance_level(monkeypatch):
+    from connectors.sharepoint.facts_extraction import resolve_vertex_region
+
+    monkeypatch.setattr("connectors.llm.factory.vertex_config_or_none", lambda *a, **k: ("proj", "us-central1"))
+    _config(monkeypatch, {})
+    conn = {"id": "c1", "config": {"extraction": {"facts": {"vertex_region": "not a region!"}}}}
+    assert resolve_vertex_region(conn) == ("us-central1", "instance:ai.vertex")
+
+
+def test_global_is_a_valid_connection_level_vertex_region(monkeypatch):
+    from connectors.sharepoint.facts_extraction import resolve_vertex_region
+
+    _config(monkeypatch, {})
+    conn = {"id": "c1", "config": {"extraction": {"facts": {"vertex_region": "global"}}}}
+    assert resolve_vertex_region(conn) == ("global", "connection")
+
+
 class TestVertexModelId:
     """`_vertex_model_id` — the facts stage's own zero-config default
     (`claude-haiku-4-5`, undated) must map to a VALID Vertex snapshot, not
@@ -2060,6 +2141,41 @@ class TestBuildFactsClient:
         assert "vertex" in message
         assert "ai.vertex.project_id" in message
 
+    def test_vertex_region_override_wins_over_ai_vertex_region(self, monkeypatch):
+        """The cost-lever this task exists to add: a connection/instance
+        override pins the region a pass talks to, independent of the
+        project id (still `ai.vertex.project_id`)."""
+        captured = {}
+
+        def fake_create_vertex_client(*, project_id, region, timeout=None):
+            captured.update(project_id=project_id, region=region, timeout=timeout)
+            return object()
+
+        monkeypatch.setattr(
+            "connectors.llm.factory.vertex_config_or_none", lambda *a, **k: ("my-project", "us-central1")
+        )
+        monkeypatch.setattr("connectors.llm.vertex_provider.create_vertex_client", fake_create_vertex_client)
+
+        fe._build_facts_client("vertex", "claude-haiku-4-5", 45.0, vertex_region="europe-west4")
+
+        assert captured == {"project_id": "my-project", "region": "europe-west4", "timeout": 45.0}
+
+    def test_no_vertex_region_override_leaves_ai_vertex_region_in_force(self, monkeypatch):
+        captured = {}
+
+        def fake_create_vertex_client(*, project_id, region, timeout=None):
+            captured.update(project_id=project_id, region=region, timeout=timeout)
+            return object()
+
+        monkeypatch.setattr(
+            "connectors.llm.factory.vertex_config_or_none", lambda *a, **k: ("my-project", "us-central1")
+        )
+        monkeypatch.setattr("connectors.llm.vertex_provider.create_vertex_client", fake_create_vertex_client)
+
+        fe._build_facts_client("vertex", "claude-haiku-4-5", 45.0, vertex_region=None)
+
+        assert captured["region"] == "us-central1"
+
 
 class TestExtractorUsesResolvedProvider:
     def test_defaults_to_anthropic_when_not_given(self):
@@ -2070,8 +2186,8 @@ class TestExtractorUsesResolvedProvider:
         sentinel_client = object()
         captured = []
 
-        def fake_build_facts_client(provider, model, timeout_s):
-            captured.append((provider, model, timeout_s))
+        def fake_build_facts_client(provider, model, timeout_s, *, vertex_region=None):
+            captured.append((provider, model, timeout_s, vertex_region))
             return sentinel_client, "vertex-model-id"
 
         monkeypatch.setattr("connectors.sharepoint.facts_extraction._build_facts_client", fake_build_facts_client)
@@ -2079,7 +2195,31 @@ class TestExtractorUsesResolvedProvider:
         client, model = extractor._ensure_client()
         assert client is sentinel_client
         assert model == "vertex-model-id"
-        assert captured == [("vertex", "claude-haiku-4-5", extractor.timeout_s)]
+        assert captured == [("vertex", "claude-haiku-4-5", extractor.timeout_s, None)]
+
+
+class TestExtractorVertexRegion:
+    """`_Extractor.vertex_region` — the caller's already-resolved
+    `resolve_vertex_region` answer, carried through to `_build_facts_client`
+    unchanged."""
+
+    def test_defaults_to_none_when_not_given(self):
+        extractor = _Extractor(system_prompt="SYSTEM", model="claude-haiku-4-5")
+        assert extractor.vertex_region is None
+
+    def test_ensure_client_passes_its_vertex_region_through(self, monkeypatch):
+        captured = []
+
+        def fake_build_facts_client(provider, model, timeout_s, *, vertex_region=None):
+            captured.append(vertex_region)
+            return object(), "vertex-model-id"
+
+        monkeypatch.setattr("connectors.sharepoint.facts_extraction._build_facts_client", fake_build_facts_client)
+        extractor = _Extractor(
+            system_prompt="SYSTEM", model="claude-haiku-4-5", provider="vertex", vertex_region="europe-west4"
+        )
+        extractor._ensure_client()
+        assert captured == ["europe-west4"]
 
 
 class TestResolveRunTransport:

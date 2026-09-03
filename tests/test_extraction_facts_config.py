@@ -308,3 +308,103 @@ class TestProviderOverride:
             "effective": "vertex",
             "effective_source": "connection:inherit",
         }
+
+
+class TestVertexRegionOverride:
+    """`vertex_region` rides the same PATCH but is only touched when
+    PRESENT in the body — the same convention `transport`/`provider` use,
+    for the same reason: a retry-mode-only call must not silently pin (or
+    unpin) a connection's Vertex region. Google enforces Claude-on-Vertex
+    quotas PER REGION, so pinning different connections to different
+    regions raises the account's effective throughput."""
+
+    def test_setting_a_region_is_written_and_resolved_from_the_connection(self, seeded_app):
+        client, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = _create_connection(client, token, name="corp-sharepoint-vertex-region-set")
+
+        r = client.patch(
+            f"{BASE}/{conn_id}/extraction/facts-config", json={"vertex_region": "europe-west4"}, headers=_auth(token)
+        )
+
+        assert r.status_code == 200, r.text
+        assert r.json()["vertex_region"] == {"value": "europe-west4", "source": "connection"}
+        from src.repositories import source_connections_repo
+
+        row = source_connections_repo().get(conn_id)
+        assert row["config"]["extraction"]["facts"]["vertex_region"] == "europe-west4"
+
+    def test_a_region_is_lowercased(self, seeded_app):
+        client, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = _create_connection(client, token, name="corp-sharepoint-vertex-region-lowercase")
+
+        r = client.patch(
+            f"{BASE}/{conn_id}/extraction/facts-config", json={"vertex_region": "US-EAST4"}, headers=_auth(token)
+        )
+
+        assert r.status_code == 200, r.text
+        assert r.json()["vertex_region"] == {"value": "us-east4", "source": "connection"}
+
+    def test_global_is_a_valid_region(self, seeded_app):
+        client, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = _create_connection(client, token, name="corp-sharepoint-vertex-region-global")
+
+        r = client.patch(
+            f"{BASE}/{conn_id}/extraction/facts-config", json={"vertex_region": "global"}, headers=_auth(token)
+        )
+
+        assert r.status_code == 200, r.text
+        assert r.json()["vertex_region"] == {"value": "global", "source": "connection"}
+
+    def test_a_retry_mode_only_patch_leaves_the_vertex_region_alone(self, seeded_app):
+        client, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = _create_connection(client, token, name="corp-sharepoint-vertex-region-untouched")
+        client.patch(
+            f"{BASE}/{conn_id}/extraction/facts-config", json={"vertex_region": "asia-northeast1"}, headers=_auth(token)
+        )
+
+        r = client.patch(f"{BASE}/{conn_id}/extraction/facts-config", json={"retry_mode": "off"}, headers=_auth(token))
+
+        assert r.status_code == 200, r.text
+        assert r.json()["retry_mode"] == {"value": "off", "source": "connection"}
+        assert r.json()["vertex_region"] == {"value": "asia-northeast1", "source": "connection"}
+
+    def test_an_explicit_null_clears_the_vertex_region_override(self, seeded_app, monkeypatch):
+        monkeypatch.setattr("connectors.llm.factory.vertex_config_or_none", lambda *a, **k: None)
+        client, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = _create_connection(client, token, name="corp-sharepoint-vertex-region-clear")
+        client.patch(
+            f"{BASE}/{conn_id}/extraction/facts-config", json={"vertex_region": "asia-northeast1"}, headers=_auth(token)
+        )
+
+        r = client.patch(
+            f"{BASE}/{conn_id}/extraction/facts-config", json={"vertex_region": None}, headers=_auth(token)
+        )
+
+        assert r.status_code == 200, r.text
+        assert r.json()["vertex_region"] == {"value": None, "source": "none"}
+        from src.repositories import source_connections_repo
+
+        row = source_connections_repo().get(conn_id)
+        assert "vertex_region" not in (row["config"]["extraction"].get("facts") or {})
+
+    def test_falls_back_to_ai_vertex_region_when_no_override_is_set(self, seeded_app, monkeypatch):
+        monkeypatch.setattr(
+            "connectors.llm.factory.vertex_config_or_none", lambda *a, **k: ("my-project", "us-central1")
+        )
+        client, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = _create_connection(client, token, name="corp-sharepoint-vertex-region-fallback")
+
+        r = client.patch(f"{BASE}/{conn_id}/extraction/facts-config", json={"retry_mode": "off"}, headers=_auth(token))
+
+        assert r.status_code == 200, r.text
+        assert r.json()["vertex_region"] == {"value": "us-central1", "source": "instance:ai.vertex"}
+
+    def test_an_invalid_region_is_refused_with_422(self, seeded_app):
+        client, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = _create_connection(client, token, name="corp-sharepoint-vertex-region-invalid")
+
+        r = client.patch(
+            f"{BASE}/{conn_id}/extraction/facts-config", json={"vertex_region": "not a region!"}, headers=_auth(token)
+        )
+
+        assert r.status_code == 422

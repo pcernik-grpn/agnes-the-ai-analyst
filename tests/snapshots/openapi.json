@@ -4745,6 +4745,17 @@
               }
             ],
             "title": "Transport"
+          },
+          "vertex_region": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Vertex Region"
           }
         },
         "title": "FactsConfigPatch",
@@ -32577,7 +32588,7 @@
     },
     "/api/admin/sharepoint/connections/{connection_id}/extraction/facts-config": {
       "patch": {
-        "description": "Per-connection override for the facts-extraction retry policy\n(cost-levers task, lever A) \u2014 a single high-value connection (curated,\nhigh-stakes folders) can keep the corrective retry ON, since a dropped\nquote there is a lost citation on stage, while a long-tail connection\nruns with it OFF, without an instance.yaml edit that would flip every\nconnection at once.\n\nWrites ``config.extraction.facts.retry_mode`` on the connection row \u2014\na sibling of ``config.extraction.stop_requested_at`` (the Stop\ncontrol's own field, above): the established home for per-connection\nextraction state, carried forward on every generic connection edit.\n``retry_mode: null`` (or the field simply omitted) CLEARS the override\nand falls back to the instance-level ``extraction.facts.retry_mode``\n(see :func:`connectors.sharepoint.facts_extraction.resolve_retry_mode`).\nA value outside ``{\"off\", \"on_gate_fail\", \"always\"}`` is refused with a\nplain ``422`` rather than silently ignored \u2014 a caller setting a value\nexpects it to take effect.\n\n``provider`` is a sibling override (``config.extraction.facts.provider``):\n``\"inherit\"`` (the default) follows this instance's ``ai.provider``,\n``\"anthropic\"``/``\"vertex\"`` pin this stage regardless of it \u2014 see\n:func:`connectors.sharepoint.facts_extraction.resolve_effective_provider`.\nThe Anthropic Batches API has no Vertex equivalent, so a connection\nresolved to ``provider: vertex`` always runs the ``sync`` transport\nregardless of its own ``transport`` setting (one warning log line, never\nan error) \u2014 the response's ``provider.effective`` field is what a pass\nactually builds a client from, which can differ from ``provider.value``\nwhen the latter is ``\"inherit\"``.\n\nWorks on BOTH app-state backends, like the Stop control above: this\ntouches only ``source_connections``, never a PG-only table.",
+        "description": "Per-connection override for the facts-extraction retry policy\n(cost-levers task, lever A) \u2014 a single high-value connection (curated,\nhigh-stakes folders) can keep the corrective retry ON, since a dropped\nquote there is a lost citation on stage, while a long-tail connection\nruns with it OFF, without an instance.yaml edit that would flip every\nconnection at once.\n\nWrites ``config.extraction.facts.retry_mode`` on the connection row \u2014\na sibling of ``config.extraction.stop_requested_at`` (the Stop\ncontrol's own field, above): the established home for per-connection\nextraction state, carried forward on every generic connection edit.\n``retry_mode: null`` (or the field simply omitted) CLEARS the override\nand falls back to the instance-level ``extraction.facts.retry_mode``\n(see :func:`connectors.sharepoint.facts_extraction.resolve_retry_mode`).\nA value outside ``{\"off\", \"on_gate_fail\", \"always\"}`` is refused with a\nplain ``422`` rather than silently ignored \u2014 a caller setting a value\nexpects it to take effect.\n\n``provider`` is a sibling override (``config.extraction.facts.provider``):\n``\"inherit\"`` (the default) follows this instance's ``ai.provider``,\n``\"anthropic\"``/``\"vertex\"`` pin this stage regardless of it \u2014 see\n:func:`connectors.sharepoint.facts_extraction.resolve_effective_provider`.\nThe Anthropic Batches API has no Vertex equivalent, so a connection\nresolved to ``provider: vertex`` always runs the ``sync`` transport\nregardless of its own ``transport`` setting (one warning log line, never\nan error) \u2014 the response's ``provider.effective`` field is what a pass\nactually builds a client from, which can differ from ``provider.value``\nwhen the latter is ``\"inherit\"``.\n\n``vertex_region`` is a further sibling override\n(``config.extraction.facts.vertex_region``), only meaningful when the\nresolved provider is ``vertex`` \u2014 it pins WHICH Vertex region a pass's\nclient talks to, on top of this instance's own ``ai.vertex.region``.\nGoogle enforces Claude-on-Vertex quotas PER REGION, so a caller can\nspread several connections' facts passes across regions to multiply the\naccount's effective throughput at the same per-call price. Validated\nwith the same character class ``ai.vertex.region`` itself is held to\n(lowercase letters, digits, dash; ``\"global\"`` allowed) \u2014 a malformed\nvalue is refused with a plain ``422`` rather than silently ignored.\n\nWorks on BOTH app-state backends, like the Stop control above: this\ntouches only ``source_connections``, never a PG-only table.",
         "operationId": "patch_extraction_facts_config_api_admin_sharepoint_connections__connection_id__extraction_facts_config_patch",
         "parameters": [
           {

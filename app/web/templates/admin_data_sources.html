@@ -2420,12 +2420,13 @@ function _extRenderFactsPolicy(row) {
   const retryMode = typeof facts.retry_mode === "string" ? facts.retry_mode : "";
   const transport = typeof facts.transport === "string" ? facts.transport : "";
   const provider = typeof facts.provider === "string" ? facts.provider : "";
+  const vertexRegion = typeof facts.vertex_region === "string" ? facts.vertex_region : "";
   const opt = (current, value, label) =>
     `<option value="${_esc(value)}"${current === value ? " selected" : ""}>${_esc(label)}</option>`;
   const label = _esc(row.name || row.id || "");
   return `
   <div class="ds-src__fact">
-    <span class="ds-src__fact-k" title="Per-connection override for the facts-extraction retry policy, API transport and LLM provider (cost levers). Leave all three on 'Instance default' to inherit extraction.facts.* from instance.yaml.">Facts policy</span>
+    <span class="ds-src__fact-k" title="Per-connection override for the facts-extraction retry policy, API transport, LLM provider and (provider=vertex only) Vertex region (cost levers). Leave all on 'Instance default' to inherit extraction.facts.* from instance.yaml.">Facts policy</span>
     <span class="ds-src__fact-v">
       <select id="ds-sp-factspolicy-retry-${row.id}" class="ds-dropdown-native" aria-label="Facts retry mode for ${label}">
         ${opt(retryMode, "", "Instance default")}
@@ -2438,16 +2439,33 @@ function _extRenderFactsPolicy(row) {
         ${opt(transport, "sync", "Sync")}
         ${opt(transport, "batch", "Batch")}
       </select>
-      <select id="ds-sp-factspolicy-provider-${row.id}" class="ds-dropdown-native" aria-label="Facts provider for ${label}">
+      <select id="ds-sp-factspolicy-provider-${row.id}" class="ds-dropdown-native" aria-label="Facts provider for ${label}" onchange="_extToggleVertexRegionInput('${row.id}')">
         ${opt(provider, "", "Instance default")}
         ${opt(provider, "inherit", "Inherit (ai.provider)")}
         ${opt(provider, "anthropic", "Anthropic")}
         ${opt(provider, "vertex", "Vertex")}
       </select>
+      <input type="text" id="ds-sp-factspolicy-vertexregion-${row.id}" class="ds-dropdown-native"
+             placeholder="Instance default" value="${_esc(vertexRegion)}"
+             style="display:${provider === "vertex" ? "" : "none"}"
+             title="Vertex region override — only used when Provider above is Vertex. Google enforces Claude-on-Vertex quotas per region, so pinning connections to different regions raises effective throughput."
+             aria-label="Vertex region override for ${label}">
       <span class="field-hint" id="ds-sp-factspolicy-status-${row.id}"></span>
     </span>
     <span class="ds-src__fact-a"><button type="button" class="btn btn-secondary" onclick="saveSpFactsPolicy('${row.id}')">Save</button></span>
   </div>`;
+}
+
+/* Shows/hides the Vertex region text input next to the "Facts policy"
+   provider select — the region only means anything for a pass resolved to
+   provider=vertex, so it stays hidden (but its value is preserved, never
+   cleared) for every other selection. Fired on the provider select's own
+   `onchange` (`_extRenderFactsPolicy` above). */
+function _extToggleVertexRegionInput(id) {
+  const providerSel = document.getElementById(`ds-sp-factspolicy-provider-${id}`);
+  const regionInput = document.getElementById(`ds-sp-factspolicy-vertexregion-${id}`);
+  if (!providerSel || !regionInput) return;
+  regionInput.style.display = providerSel.value === "vertex" ? "" : "none";
 }
 
 /* Crawl filter (backfill lever) — `extraction.crawl.min_modified`,
@@ -3543,26 +3561,33 @@ async function consolidateSpCollections(id) {
 
 /* Saves the "Facts policy" control (`_extRenderFactsPolicy` above) via
    `PATCH .../extraction/facts-config`
-   (`app/api/admin_extraction.py::patch_extraction_facts_config`). All three
-   selects are always sent — the empty "Instance default" option maps to
-   `null`, which the endpoint reads as "clear the override", the same
-   least-surprise reading the endpoint's own docstring describes. The
-   response carries the RESOLVED value and its source ("connection" once an
-   override is set, "instance" once cleared) — shown here rather than
-   guessed, since this page has no copy of the instance-level default to
-   resolve against itself. `provider` also carries an `effective` field
-   (always a concrete "anthropic"/"vertex", never "inherit") — shown too,
-   since that is what a pass actually spends against. */
+   (`app/api/admin_extraction.py::patch_extraction_facts_config`). All four
+   fields are always sent — the empty "Instance default" option/input maps
+   to `null`, which the endpoint reads as "clear the override", the same
+   least-surprise reading the endpoint's own docstring describes.
+   `vertex_region` is sent regardless of whether it is currently VISIBLE
+   (only shown while Provider is Vertex): its typed value survives a
+   provider switch on this page, so flipping the select back to Vertex
+   later does not silently lose it, and saving is what actually persists
+   or clears it either way. The response carries the RESOLVED value and its
+   source ("connection" once an override is set, "instance"/"none"
+   otherwise) — shown here rather than guessed, since this page has no copy
+   of the instance-level default to resolve against itself. `provider` also
+   carries an `effective` field (always a concrete "anthropic"/"vertex",
+   never "inherit") — shown too, since that is what a pass actually spends
+   against. */
 async function saveSpFactsPolicy(id) {
   const retrySel = document.getElementById(`ds-sp-factspolicy-retry-${id}`);
   const transportSel = document.getElementById(`ds-sp-factspolicy-transport-${id}`);
   const providerSel = document.getElementById(`ds-sp-factspolicy-provider-${id}`);
+  const regionInput = document.getElementById(`ds-sp-factspolicy-vertexregion-${id}`);
   const statusEl = document.getElementById(`ds-sp-factspolicy-status-${id}`);
-  if (!retrySel || !transportSel || !providerSel) return;
+  if (!retrySel || !transportSel || !providerSel || !regionInput) return;
   const body = {
     retry_mode: retrySel.value || null,
     transport: transportSel.value || null,
     provider: providerSel.value || null,
+    vertex_region: regionInput.value.trim() || null,
   };
   if (statusEl) statusEl.textContent = "Saving…";
   try {
@@ -3577,10 +3602,12 @@ async function saveSpFactsPolicy(id) {
       const rm = respBody.retry_mode || {};
       const tr = respBody.transport || {};
       const pr = respBody.provider || {};
+      const vr = respBody.vertex_region || {};
       if (statusEl) {
         statusEl.textContent =
           `Retry: ${rm.value} (${rm.source}) · Transport: ${tr.value} (${tr.source}) · ` +
-          `Provider: ${pr.value} (${pr.source}) — effective: ${pr.effective}`;
+          `Provider: ${pr.value} (${pr.source}) — effective: ${pr.effective} · ` +
+          `Vertex region: ${vr.value} (${vr.source})`;
       }
       showToast("Facts policy saved.", true);
       // Keep the in-memory row current — a later `renderConnList()` (e.g.
@@ -3594,6 +3621,7 @@ async function saveSpFactsPolicy(id) {
         if (body.retry_mode === null) delete facts.retry_mode; else facts.retry_mode = body.retry_mode;
         if (body.transport === null) delete facts.transport; else facts.transport = body.transport;
         if (body.provider === null) delete facts.provider; else facts.provider = body.provider;
+        if (body.vertex_region === null) delete facts.vertex_region; else facts.vertex_region = body.vertex_region;
         conn.config.extraction.facts = facts;
       }
     } else {

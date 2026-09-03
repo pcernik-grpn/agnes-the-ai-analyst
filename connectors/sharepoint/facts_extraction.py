@@ -91,6 +91,17 @@ one point: the Anthropic Batches API has no Vertex equivalent, so a pass
 resolved to ``provider: vertex`` always runs the ``sync`` transport
 (:func:`_resolve_run_transport`), regardless of ``extraction.facts.transport``
 — one warning log line naming why, never an error.
+
+A third, ``provider: vertex``-only knob, ``extraction.facts.vertex_region``
+(:func:`resolve_vertex_region`), pins WHICH Vertex region a pass's client
+talks to, on top of this instance's own ``ai.vertex.region``. Google enforces
+Claude-on-Vertex quotas PER REGION: a live instance running seven
+connections' facts passes all against the same (default) region hit that
+region's requests-per-minute ceiling well before its actual spend limit —
+observed at ~3% of calls answering 429 and throughput capped around 200
+documents/min. Regions have independent quotas, so spreading connections
+across a handful of them multiplies effective throughput at the same
+per-call price.
 """
 
 from __future__ import annotations
@@ -161,6 +172,24 @@ DEFAULT_TRANSPORT = "sync"
 #: monthly usage cap, while the Vertex project had headroom the whole time.
 DEFAULT_PROVIDER = "inherit"
 _VALID_PROVIDERS = frozenset({"inherit", "anthropic", "vertex"})
+
+#: ``extraction.facts.vertex_region`` — per-connection/instance override of
+#: WHICH Vertex AI region a ``provider: vertex`` pass's client is built
+#: against, on top of this instance's own ``ai.vertex.region``. Exists
+#: because Google enforces Claude-on-Vertex quotas PER REGION: a single
+#: project running every connection's facts pass against the same region
+#: (typically ``global``, the zero-config default) hits that region's
+#: requests-per-minute ceiling long before the account's actual spend limit
+#: — observed on a live instance at ~3% of calls answering 429 and
+#: throughput capped around 200 documents/min across 7 connections. Regions
+#: have independent quotas, so spreading connections across a handful of
+#: them multiplies effective throughput at the same per-call price. Only
+#: meaningful when the pass's :func:`resolve_effective_provider` resolves to
+#: ``"vertex"`` — harmless (resolved, never applied) otherwise. Validated
+#: with the same character class :func:`connectors.llm.vertex_provider.
+#: invalid_vertex_setting` holds ``ai.vertex.region``/``chat.llm.vertex.
+#: region`` to (lowercase letters, digits, dash — the value is interpolated
+#: into the outbound Vertex API hostname).
 
 #: ``extraction.facts.batch_size`` — documents per Batches-API submission.
 #: Hard-capped at the API's own per-batch REQUEST ceiling
@@ -632,6 +661,93 @@ def resolve_effective_provider(connection: Optional[Dict[str, Any]] = None) -> T
     if vertex_config_or_none() is not None:
         return "vertex", f"{source}:inherit"
     return "anthropic", f"{source}:inherit"
+
+
+def _region_looks_valid(value: str) -> bool:
+    """Whether ``value`` is a well-formed Vertex region — the same character
+    class :func:`connectors.llm.vertex_provider.invalid_vertex_setting` holds
+    ``ai.vertex.region``/``chat.llm.vertex.region`` to. That function checks
+    a ``(project_id, region)`` pair together, so a syntactically-valid
+    placeholder project id stands in for the one this call does not have —
+    only the ``"region"`` half of its verdict is read.
+    """
+    from connectors.llm.vertex_provider import invalid_vertex_setting
+
+    return invalid_vertex_setting("region-check-placeholder", value) is None
+
+
+def _vertex_region_setting() -> str:
+    """``extraction.facts.vertex_region``: the instance-level default, or
+    ``""`` when unset or malformed — the same loudly-named, quietly-corrected
+    posture :func:`_provider_setting` takes for a garbage value.
+    """
+    from app.instance_config import get_value
+
+    raw = get_value("extraction", "facts", "vertex_region", default="")
+    value = str(raw or "").strip().lower()
+    if not value:
+        return ""
+    if _region_looks_valid(value):
+        return value
+    logger.warning(
+        "facts extraction: extraction.facts.vertex_region=%r is not a valid Vertex region "
+        "(lowercase letters, digits, dash; 'global' allowed) — ignoring",
+        raw,
+    )
+    return ""
+
+
+def resolve_vertex_region(connection: Optional[Dict[str, Any]] = None) -> Tuple[Optional[str], str]:
+    """``(region, source)`` for a PASS's Vertex AI region — THREE levels,
+    one more than :func:`resolve_transport`/:func:`resolve_provider`: a
+    per-connection override (``connection.config.extraction.facts.
+    vertex_region``, a sibling of ``transport``/``provider`` there, set
+    through the same ``PATCH …/extraction/facts-config`` call), then the
+    instance-level ``extraction.facts.vertex_region``
+    (:func:`_vertex_region_setting`), then this instance's own
+    ``ai.vertex.region`` (``connectors.llm.factory.vertex_config_or_none`` —
+    the SAME resolution :func:`resolve_effective_provider`'s own ``inherit``
+    fallback reads).
+
+    Google enforces Claude-on-Vertex quotas PER REGION: a project running
+    every connection's facts pass against the same region hits that
+    region's requests-per-minute ceiling long before the account's actual
+    spend limit — regions have independent quotas, so pinning a connection
+    to its own region multiplies effective throughput at the same per-call
+    price. Only meaningful when the pass's :func:`resolve_effective_provider`
+    resolves to ``"vertex"`` — resolved unconditionally here regardless, and
+    simply unused by :func:`_build_facts_client` for an anthropic pass.
+
+    ``region`` is ``None`` when nothing at any of the three levels names one
+    — this instance has no usable Vertex configuration at all, which
+    :func:`_build_facts_client` already turns into a loud
+    :class:`FactsExtractionUnavailable` for a pass actually resolved to
+    ``provider: vertex``, so a caller here never needs to guess a default.
+    ``source`` is ``"connection"``, ``"instance"`` (the
+    ``extraction.facts.vertex_region`` setting won), ``"instance:ai.vertex"``
+    (both above were unset — ``ai.vertex.region`` won), or ``"none"``.
+    """
+    if connection:
+        raw = (((connection.get("config") or {}).get("extraction") or {}).get("facts") or {}).get("vertex_region")
+        if isinstance(raw, str) and raw.strip():
+            candidate = raw.strip().lower()
+            if _region_looks_valid(candidate):
+                return candidate, "connection"
+            logger.warning(
+                "facts extraction: connection %s config.extraction.facts.vertex_region=%r is not a valid "
+                "Vertex region — falling back to the instance setting",
+                connection.get("id"),
+                raw,
+            )
+    instance_region = _vertex_region_setting()
+    if instance_region:
+        return instance_region, "instance"
+    from connectors.llm.factory import vertex_config_or_none
+
+    vertex = vertex_config_or_none()
+    if vertex is not None:
+        return vertex[1], "instance:ai.vertex"
+    return None, "none"
 
 
 def _retry_should_fire(
@@ -1255,7 +1371,9 @@ def _vertex_model_id(model: str) -> str:
     return to_vertex_model_id(resolved)
 
 
-def _build_facts_client(provider: str, model: str, timeout_s: float) -> Tuple[Any, str]:
+def _build_facts_client(
+    provider: str, model: str, timeout_s: float, *, vertex_region: Optional[str] = None
+) -> Tuple[Any, str]:
     """The client for one pass's resolved :func:`resolve_effective_provider`.
 
     ``"anthropic"`` delegates to ``src.anonymization_ner.build_client`` — its
@@ -1268,6 +1386,14 @@ def _build_facts_client(provider: str, model: str, timeout_s: float) -> Tuple[An
     ``LLM_API_KEY`` sitting in the environment for an unrelated reason — the
     root cause of the incident this knob exists to fix — must never
     silently override that choice.
+
+    ``vertex_region`` is the caller's already-resolved
+    :func:`resolve_vertex_region` answer — a truthy value wins over the
+    region ``vertex_config_or_none()`` itself returns (this instance's
+    ``ai.vertex.region``), so a connection or instance override can pin one
+    pass to a less-saturated Vertex region without touching the project id.
+    ``None``/``""`` (unset, the common case) leaves ``ai.vertex.region`` in
+    force, unchanged from before this parameter existed.
 
     Raises :class:`FactsExtractionUnavailable` — never a bare exception —
     naming the missing setting when ``provider == "vertex"`` but this
@@ -1284,7 +1410,8 @@ def _build_facts_client(provider: str, model: str, timeout_s: float) -> Tuple[An
                 "configuration — set ai.provider: vertex and ai.vertex.project_id (optionally "
                 "ai.vertex.region) in instance.yaml, or the ANTHROPIC_VERTEX_PROJECT_ID env var"
             )
-        project_id, region = vertex
+        project_id, default_region = vertex
+        region = vertex_region or default_region
         return create_vertex_client(project_id=project_id, region=region, timeout=timeout_s), _vertex_model_id(model)
 
     from src.anonymization_ner import DetectionUnavailable, build_client
@@ -1344,6 +1471,7 @@ class _Extractor:
         max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
         sleep: Callable[[float], None] = time.sleep,
         provider: Optional[str] = None,
+        vertex_region: Optional[str] = None,
     ) -> None:
         self.system_prompt = system_prompt
         self.model = model or _model()
@@ -1361,11 +1489,17 @@ class _Extractor:
         #: "inherit" — the caller resolves that via
         #: :func:`resolve_effective_provider` before constructing this.
         self.provider = provider or "anthropic"
+        #: The caller's already-resolved :func:`resolve_vertex_region`
+        #: answer — unused when `provider` is "anthropic", passed straight
+        #: through to :func:`_build_facts_client` otherwise.
+        self.vertex_region = vertex_region
 
     def _ensure_client(self) -> Tuple[Any, str]:
         with self._client_lock:
             if self._client is None:
-                self._client, self._call_model = _build_facts_client(self.provider, self.model, self.timeout_s)
+                self._client, self._call_model = _build_facts_client(
+                    self.provider, self.model, self.timeout_s, vertex_region=self.vertex_region
+                )
             return self._client, (self._call_model or self.model)
 
     def _create(self, user_message: str) -> Any:
@@ -1609,6 +1743,8 @@ class _Report:
         provider: str = "anthropic",
         provider_source: str = "instance",
         transport: str = "sync",
+        vertex_region: Optional[str] = None,
+        vertex_region_source: str = "none",
     ) -> Dict[str, Any]:
         """``batch_usage`` is the SUBSET of ``usage`` that came from the
         Batches API (a batch-mode pass whose corrective retry fell back to
@@ -1624,7 +1760,11 @@ class _Report:
         vertex-resolved provider always runs ``sync``, see
         :func:`run_facts_extraction`) — so an operator reading one run's
         report can see what actually spent money, not just what the
-        instance/connection was configured to try.
+        instance/connection was configured to try. ``vertex_region`` /
+        ``vertex_region_source`` are :func:`resolve_vertex_region`'s own
+        output — reported unconditionally, even for an anthropic-resolved
+        pass (where it is simply unused), the same "resolved regardless of
+        whether it matters" posture ``transport`` already takes.
         """
         from src.llm_pricing import cost_usd
 
@@ -1662,6 +1802,8 @@ class _Report:
             "provider": provider,
             "provider_source": provider_source,
             "transport": transport,
+            "vertex_region": vertex_region,
+            "vertex_region_source": vertex_region_source,
             # What parallelism this pass actually ran at, and where that
             # number came from (`config` / `clamped` / `invalid` /
             # `default` / `caller`). Both, because an operator comparing
@@ -2639,6 +2781,7 @@ def run_facts_extraction(
     transport: Optional[str] = None,
     batch_client: Any | None = None,
     provider: Optional[str] = None,
+    vertex_region: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run one fact-extraction pass for a SharePoint connection.
 
@@ -2701,6 +2844,13 @@ def run_facts_extraction(
     ``provider_source``, ``transport``), so an operator sees what actually
     ran, not just what was configured.
 
+    ``vertex_region`` overrides :func:`resolve_vertex_region` the same way
+    (the test seam; ``None`` resolves it) — only consulted when
+    ``effective_provider`` is ``"vertex"``, resolved and reported
+    unconditionally regardless. Vertex enforces its Claude quotas PER
+    REGION, so pinning different connections to different regions
+    multiplies the account's effective throughput at the same price.
+
     Returns the pass report (see :meth:`_Report.render`).
     """
     from src.repositories import corpus_file_sources_repo, corpus_files_repo, source_connections_repo
@@ -2738,6 +2888,14 @@ def run_facts_extraction(
         (provider, "caller") if provider in ("anthropic", "vertex") else resolve_effective_provider(connection)
     )
 
+    # Vertex region resolution — same test-seam convention as `provider`
+    # above (`None` resolves it). Only meaningful for a `vertex`-resolved
+    # pass, resolved and reported regardless so the run report always shows
+    # what THIS pass would have used had it been vertex.
+    resolved_vertex_region, vertex_region_source = (
+        (vertex_region, "caller") if vertex_region is not None else resolve_vertex_region(connection)
+    )
+
     # Transport dispatch — the ONE branch point between the two transports.
     # Everything above this line (connection, ontology, prompt, model,
     # provider) is shared; nothing below it runs for a batch-mode pass.
@@ -2767,7 +2925,12 @@ def run_facts_extraction(
         )
 
     if extractor is None:
-        extractor = _Extractor(system_prompt=system_prompt, model=model, provider=effective_provider)
+        extractor = _Extractor(
+            system_prompt=system_prompt,
+            model=model,
+            provider=effective_provider,
+            vertex_region=resolved_vertex_region,
+        )
     else:
         model = getattr(extractor, "model", model)
 
@@ -2979,6 +3142,8 @@ def run_facts_extraction(
         provider=getattr(extractor, "provider", effective_provider),
         provider_source=provider_source,
         transport=mode,
+        vertex_region=getattr(extractor, "vertex_region", resolved_vertex_region),
+        vertex_region_source=vertex_region_source,
     )
     logger.info(
         "facts extraction: connection %s — %d extracted, %d unchanged, %d failed, %d quotes dropped, %d claims written",

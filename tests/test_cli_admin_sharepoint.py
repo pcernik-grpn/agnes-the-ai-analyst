@@ -563,6 +563,94 @@ class TestFactsConfigProvider:
         assert result.exit_code == 0, result.output
 
 
+class TestFactsConfigVertexRegion:
+    """`--vertex-region` / `--clear-vertex-region` — the same PRESENT-in-body
+    convention `--transport`/`--provider` use: a vertex-region-only call
+    re-sends the connection's CURRENT retry-mode override rather than
+    wiping it, which is why it needs a mocked `api_get` (the CLI's own
+    re-fetch) as well as `api_patch`."""
+
+    def test_vertex_region_only_patches_and_resends_the_current_retry_mode(self):
+        body = {
+            "connection_id": "conn1",
+            "retry_mode": {"value": "always", "source": "connection"},
+            "vertex_region": {"value": "europe-west4", "source": "connection"},
+        }
+        with (
+            patch(
+                "cli.commands.admin_sharepoint.api_get",
+                return_value=_resp(200, {"config": {"extraction": {"facts": {"retry_mode": "always"}}}}),
+            ) as mock_get,
+            patch("cli.commands.admin_sharepoint.api_patch", return_value=_resp(200, body)) as mock_patch,
+        ):
+            result = runner.invoke(
+                app, ["admin", "sharepoint", "facts-config", "conn1", "--vertex-region", "europe-west4"]
+            )
+        assert result.exit_code == 0, result.output
+        mock_get.assert_called_once()
+        args, kwargs = mock_patch.call_args
+        assert args[0] == "/api/admin/sharepoint/connections/conn1/extraction/facts-config"
+        assert kwargs["json"] == {"retry_mode": "always", "vertex_region": "europe-west4"}
+        assert "europe-west4" in result.output
+
+    def test_clear_vertex_region_sends_a_null_vertex_region(self):
+        body = {
+            "connection_id": "conn1",
+            "retry_mode": {"value": "on_gate_fail", "source": "instance"},
+            "vertex_region": {"value": "us-central1", "source": "instance:ai.vertex"},
+        }
+        with (
+            patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(200, {"config": {}})),
+            patch("cli.commands.admin_sharepoint.api_patch", return_value=_resp(200, body)) as mock_patch,
+        ):
+            result = runner.invoke(app, ["admin", "sharepoint", "facts-config", "conn1", "--clear-vertex-region"])
+        assert result.exit_code == 0, result.output
+        _, kwargs = mock_patch.call_args
+        assert kwargs["json"] == {"retry_mode": None, "vertex_region": None}
+        assert "us-central1" in result.output
+
+    def test_vertex_region_and_clear_vertex_region_together_is_a_usage_error(self):
+        result = runner.invoke(
+            app,
+            [
+                "admin",
+                "sharepoint",
+                "facts-config",
+                "conn1",
+                "--vertex-region",
+                "europe-west4",
+                "--clear-vertex-region",
+            ],
+        )
+        assert result.exit_code == 1
+        assert "not both" in result.output
+
+    def test_an_invalid_vertex_region_is_a_usage_error(self):
+        result = runner.invoke(
+            app, ["admin", "sharepoint", "facts-config", "conn1", "--vertex-region", "not a region!"]
+        )
+        assert result.exit_code == 1
+        assert "lowercase letters" in result.output
+
+    def test_global_is_accepted(self):
+        body = {"connection_id": "conn1", "vertex_region": {"value": "global", "source": "connection"}}
+        with (
+            patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(200, {"config": {}})),
+            patch("cli.commands.admin_sharepoint.api_patch", return_value=_resp(200, body)),
+        ):
+            result = runner.invoke(app, ["admin", "sharepoint", "facts-config", "conn1", "--vertex-region", "global"])
+        assert result.exit_code == 0, result.output
+
+    def test_vertex_region_alone_satisfies_the_required_flag_check(self):
+        body = {"connection_id": "conn1", "vertex_region": {"value": "us-east4", "source": "connection"}}
+        with (
+            patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(200, {"config": {}})),
+            patch("cli.commands.admin_sharepoint.api_patch", return_value=_resp(200, body)),
+        ):
+            result = runner.invoke(app, ["admin", "sharepoint", "facts-config", "conn1", "--vertex-region", "us-east4"])
+        assert result.exit_code == 0, result.output
+
+
 class TestCrawlConfig:
     """`agnes admin sharepoint crawl-config` — CLI counterpart to
     `PATCH /api/admin/sharepoint/connections/{connection_id}/extraction/crawl-config`."""

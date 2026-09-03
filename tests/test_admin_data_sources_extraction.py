@@ -1461,7 +1461,14 @@ console.log(JSON.stringify({ disabled: _elements['ext-facts-btn-sp1'].disabled }
 
 def _run_facts_policy_js(body: str) -> dict:
     tpl = TEMPLATE.read_text(encoding="utf-8")
-    fns = "\n".join(_extract_block(tpl, sig) for sig in ("function _esc(s) {", "function _extRenderFactsPolicy(row) {"))
+    fns = "\n".join(
+        _extract_block(tpl, sig)
+        for sig in (
+            "function _esc(s) {",
+            "function _extRenderFactsPolicy(row) {",
+            "function _extToggleVertexRegionInput(id) {",
+        )
+    )
     script = f"""
 {fns}
 {body}
@@ -1484,7 +1491,16 @@ class TestFactsPolicyControlRendering:
         row = {
             "id": "sp1",
             "name": "Finance SharePoint",
-            "config": {"extraction": {"facts": {"retry_mode": "always", "transport": "batch", "provider": "vertex"}}},
+            "config": {
+                "extraction": {
+                    "facts": {
+                        "retry_mode": "always",
+                        "transport": "batch",
+                        "provider": "vertex",
+                        "vertex_region": "europe-west4",
+                    }
+                }
+            },
         }
         out = _run_facts_policy_js(f"console.log(JSON.stringify({{html: _extRenderFactsPolicy({json.dumps(row)})}}));")
         html = out["html"]
@@ -1495,6 +1511,12 @@ class TestFactsPolicyControlRendering:
         assert '<option value="batch" selected>' in html
         assert '<option value="vertex" selected>' in html
         assert "saveSpFactsPolicy('sp1')" in html
+        # The region input is present, pre-filled, and VISIBLE — the
+        # connection is pinned to provider=vertex, so the region actually
+        # matters here.
+        assert 'id="ds-sp-factspolicy-vertexregion-sp1"' in html
+        assert 'value="europe-west4"' in html
+        assert 'style="display:"' in html
 
     def test_no_override_leaves_instance_default_selected(self):
         row = {"id": "sp2", "name": "Ops SharePoint", "config": {}}
@@ -1508,6 +1530,28 @@ class TestFactsPolicyControlRendering:
         assert '<option value="sync"' in html
         assert '<option value="inherit"' in html
         assert '<option value="anthropic"' in html
+        # provider is not "vertex" — the region input starts hidden and empty.
+        assert 'style="display:none"' in html
+        assert 'value=""' in html
+
+    def test_toggle_shows_the_region_input_only_while_provider_is_vertex(self):
+        out = _run_facts_policy_js(
+            """
+const _elements = {
+  "ds-sp-factspolicy-provider-sp1": { value: "vertex" },
+  "ds-sp-factspolicy-vertexregion-sp1": { style: { display: "none" } },
+};
+const document = { getElementById: (id) => _elements[id] || null };
+_extToggleVertexRegionInput("sp1");
+const shownForVertex = _elements["ds-sp-factspolicy-vertexregion-sp1"].style.display;
+_elements["ds-sp-factspolicy-provider-sp1"].value = "anthropic";
+_extToggleVertexRegionInput("sp1");
+const hiddenForAnthropic = _elements["ds-sp-factspolicy-vertexregion-sp1"].style.display;
+console.log(JSON.stringify({ shownForVertex, hiddenForAnthropic }));
+"""
+        )
+        assert out["shownForVertex"] == ""
+        assert out["hiddenForAnthropic"] == "none"
 
     def test_offers_exactly_the_three_retry_modes_two_transports_and_three_providers(self):
         """Pinned against the API's own vocabulary
@@ -1544,6 +1588,7 @@ class TestFactsPolicySave:
         retry_value,
         transport_value,
         provider_value="",
+        vertex_region_value="",
         response_status=200,
         response_body=None,
         prior_config=None,
@@ -1556,6 +1601,7 @@ const _elements = {{
   "ds-sp-factspolicy-retry-sp1": {{ value: {json.dumps(retry_value)} }},
   "ds-sp-factspolicy-transport-sp1": {{ value: {json.dumps(transport_value)} }},
   "ds-sp-factspolicy-provider-sp1": {{ value: {json.dumps(provider_value)} }},
+  "ds-sp-factspolicy-vertexregion-sp1": {{ value: {json.dumps(vertex_region_value)} }},
   "ds-sp-factspolicy-status-sp1": {{ textContent: "" }},
 }};
 const document = {{ getElementById: (id) => _elements[id] || null }};
@@ -1598,13 +1644,39 @@ async function fetch(url, opts) {{
         assert proc.returncode == 0, proc.stdout + proc.stderr
         return json.loads(proc.stdout)
 
-    def test_an_empty_selection_sends_null_for_all_three_fields(self):
-        out = self._run(retry_value="", transport_value="", provider_value="")
-        assert out["requests"][0]["body"] == {"retry_mode": None, "transport": None, "provider": None}
+    def test_an_empty_selection_sends_null_for_all_four_fields(self):
+        out = self._run(retry_value="", transport_value="", provider_value="", vertex_region_value="")
+        assert out["requests"][0]["body"] == {
+            "retry_mode": None,
+            "transport": None,
+            "provider": None,
+            "vertex_region": None,
+        }
 
     def test_a_chosen_value_is_sent_verbatim(self):
-        out = self._run(retry_value="always", transport_value="batch", provider_value="vertex")
-        assert out["requests"][0]["body"] == {"retry_mode": "always", "transport": "batch", "provider": "vertex"}
+        out = self._run(
+            retry_value="always", transport_value="batch", provider_value="vertex", vertex_region_value="europe-west4"
+        )
+        assert out["requests"][0]["body"] == {
+            "retry_mode": "always",
+            "transport": "batch",
+            "provider": "vertex",
+            "vertex_region": "europe-west4",
+        }
+
+    def test_a_whitespace_only_vertex_region_is_sent_as_null(self):
+        out = self._run(retry_value="off", transport_value="", vertex_region_value="   ")
+        assert out["requests"][0]["body"]["vertex_region"] is None
+
+    def test_the_vertex_region_is_sent_even_while_the_input_is_hidden(self):
+        """The region input stays hidden (never removed) while Provider is
+        not Vertex — its typed value must still ride the save, so switching
+        Provider back to Vertex later shows the same value rather than a
+        silently-lost one."""
+        out = self._run(
+            retry_value="off", transport_value="", provider_value="anthropic", vertex_region_value="us-east4"
+        )
+        assert out["requests"][0]["body"]["vertex_region"] == "us-east4"
 
     def test_it_patches_the_facts_config_endpoint(self):
         out = self._run(retry_value="off", transport_value="sync")
@@ -1616,10 +1688,12 @@ async function fetch(url, opts) {{
             retry_value="always",
             transport_value="",
             provider_value="vertex",
+            vertex_region_value="europe-west4",
             response_body={
                 "retry_mode": {"value": "always", "source": "connection"},
                 "transport": {"value": "sync", "source": "instance"},
                 "provider": {"value": "vertex", "source": "connection", "effective": "vertex"},
+                "vertex_region": {"value": "europe-west4", "source": "connection"},
             },
         )
         assert "always" in out["status"]
@@ -1627,6 +1701,7 @@ async function fetch(url, opts) {{
         assert "sync" in out["status"]
         assert "instance" in out["status"]
         assert "vertex" in out["status"]
+        assert "europe-west4" in out["status"]
 
     def test_a_failed_save_toasts_the_servers_reason_and_clears_the_status(self):
         out = self._run(
@@ -1644,16 +1719,28 @@ async function fetch(url, opts) {{
             retry_value="always",
             transport_value="",
             provider_value="",
-            prior_config={"extraction": {"facts": {"retry_mode": "off", "transport": "batch", "provider": "vertex"}}},
+            vertex_region_value="",
+            prior_config={
+                "extraction": {
+                    "facts": {
+                        "retry_mode": "off",
+                        "transport": "batch",
+                        "provider": "vertex",
+                        "vertex_region": "europe-west4",
+                    }
+                }
+            },
             response_body={
                 "retry_mode": {"value": "always", "source": "connection"},
                 "transport": {"value": "sync", "source": "instance"},
                 "provider": {"value": "inherit", "source": "instance", "effective": "anthropic"},
+                "vertex_region": {"value": None, "source": "none"},
             },
         )
         facts = out["conn"]["config"]["extraction"]["facts"]
         assert facts["retry_mode"] == "always"
-        # transport AND provider were cleared (sent null) — both overrides
-        # are removed, not left at their stale prior values.
+        # transport, provider AND vertex_region were cleared (sent null) —
+        # every override is removed, not left at its stale prior value.
         assert "transport" not in facts
         assert "provider" not in facts
+        assert "vertex_region" not in facts
