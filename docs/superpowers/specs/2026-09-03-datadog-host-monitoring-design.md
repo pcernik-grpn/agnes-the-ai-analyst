@@ -85,10 +85,20 @@ managed databases outside the VM.
    from boot ordering (the agent block runs before compose is up) and converges after a
    side-car volume recreate.
 10. **Watchdog bridge = marker files.** The watchdog writes `date +%s` to
-    `/var/lib/agnes/watchdog/<signature>` on every alert it computes (before its hourly
-    anti-spam), the Agent `directory` check reports `system.disk.directory.file.modified_sec_ago`
-    per marker, and one monitor fires while a marker is fresher than 15 minutes. No
-    DogStatsD, no custom metrics.
+    `$STATE/markers/<signature>` (= `/var/lib/agnes-watchdog/markers/`) on every alert it
+    computes, from inside `add()` and therefore before its hourly anti-spam gate; the Agent
+    `directory` check reports `system.disk.directory.file.modified_sec_ago` per marker, and one
+    monitor fires while a marker is fresher than 15 minutes. No DogStatsD, no custom metrics.
+    A subdirectory of the watchdog's own state dir rather than a sibling of it, for two reasons:
+    the markers then hold nothing but signatures (the check's `*` glob would otherwise pick up
+    the script's run-to-run delta files), and the existing bash harness sandboxes host paths by
+    rewriting the `STATE=` assignment, which relocates the markers for free. The slug is an
+    explicit second argument to `add()` rather than derived from the message text, so rewording
+    an alert never renames a metric; the `[container]` qualifier is deliberately not part of it,
+    which keeps the marker set at 14 signatures instead of 14 x N containers. There are 14 alert
+    sites, one more than this design listed: `CONTAINER: no agnes role containers found` shares
+    an anti-spam prefix with the per-container down alert but is a materially different incident,
+    so it gets its own slug (`fleet-empty`).
 11. **Heartbeats as file mtimes**: the auto-upgrade cron line touches
     `/var/lib/agnes/auto-upgrade.tick` on every tick (unconditional, vendor-neutral); the
     state applier already touches `/data/state/agnes-state-applier.tick`; the daily backup
@@ -108,8 +118,8 @@ managed databases outside the VM.
 | `disk` | `use_mount: true`, `service_check_rw: true`, docker overlay/tmpfs excluded | `device:/` and `device:/data` usage + inodes; a read-only remount of `/data` surfaces as a failed RW check |
 | `docker` + `container` | events on, `unbundle_events: true` | daemon up, containers running, per-service uptime/cpu/memory/OOM |
 | `systemd` | agnes timers + `docker.service` + `cron.service`; `substate_status_mapping` for the oneshot backup unit | failed units; backup failure named by unit |
-| `directory` | four instances tagged `agnes_probe:<state_applier\|auto_upgrade\|backup\|watchdog>` | heartbeat ages, newest backup age, watchdog markers |
-| `http_check` | `agnes_readyz` (200), `agnes_health_body` (`content_match` on `"status": "ok"`), `agnes_acme_http` (port-80 redirect) | app readiness, health body, ACME HTTP-01 reachability |
+| `directory` | four instances tagged `agnes_probe:<state_applier\|auto_upgrade\|backup\|watchdog>` | heartbeat ages, newest backup age, watchdog markers. The backup instance is recursive with `pattern: STATUS`, because the daily backup writes dated SUBDIRECTORIES and a flat walk would find no file at all |
+| `http_check` | `agnes_readyz` (200), `agnes_health_body` (`content_match` on `"status": "ok"`), `agnes_acme_http` (port-80 redirect) | app readiness, health body, ACME HTTP-01 reachability. The templates take a ready-made `base_url` / `acme_hosts` / `hosts` rather than `domain` + `tls_mode`: the "does this VM terminate TLS" policy stays in HCL and the templates stay dumb renderers |
 | `tls` | one instance per public hostname (domain + alias) | certificate expiry, incl. the alias whose ACME account has no contact e-mail |
 | `postgres` | Autodiscovery on `postgres` images, `dbm: false` | `postgres.can_connect`, connections vs `max_connections`, database size, XID wraparound |
 
@@ -174,3 +184,32 @@ Postgres side-cars, edge (HTTP response time, TLS days left), ops jobs and watch
 - Fix or drop the module's GCP uptime check for TLS VMs.
 - A Renovate manager for the agent version pin.
 - A kai-agent readiness probe once its health path is known.
+
+## Implementation notes (2026-09-03)
+
+Four things the implementation settled differently from the design above, each
+verified rather than assumed:
+
+- **No `setfacl`.** The design assumed dd-agent would need ACLs to reach the
+  heartbeat paths. It does not: `/data/state` and `/data/backups` are already
+  mode 0755 (the secrets inside them are individually 0600), so the `directory`
+  check can stat the tick files with no permission change at all. That removes
+  the `acl` package dependency and a whole class of boot-time failure.
+- **`google_compute_address` does accept `labels`** at `hashicorp/google ~> 5.0`
+  — confirmed with `terraform validate` against the pinned provider, which this
+  design had flagged as unverified.
+- **Two `%{ if }` blocks, not `%{ if } / %{ else }`.** The startup template uses
+  no `%{ else ~}` anywhere; a stray whitespace difference from one would show up
+  as a diff on every existing consumer, against the "a bump alone is an empty
+  diff" invariant.
+- **The install steps chain with `&&` inside the tolerance subshell.** `set -e`
+  is suppressed inside a command that is part of an `||` list — including a
+  subshell, and including one that re-runs `set -e` itself (verified in bash
+  5.3) — so `( set -e; step1; step2 ) || warn` would run `step2` after `step1`
+  failed. The existing Ops Agent block's `&&` chain is the pattern that works.
+
+The template renderer the new tests use (`tests/_tf_template.py`) reproduces
+`terraform console`'s `templatefile()` byte-for-byte on the full 1179-line
+startup script, including the `~}` trim rule — it eats the following spaces and
+tabs plus at most one newline, not the whole whitespace run. That is what lets
+those tests assert on what actually boots rather than on template source text.

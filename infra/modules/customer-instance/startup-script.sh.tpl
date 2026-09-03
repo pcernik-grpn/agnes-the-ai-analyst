@@ -469,6 +469,9 @@ unset DD_API_KEY_VALUE
 if systemctl is-enabled --quiet datadog-agent 2>/dev/null; then
     systemctl disable --now datadog-agent >/dev/null 2>&1 || true
 fi
+if systemctl is-enabled --quiet agnes-datadog-pg-role.timer 2>/dev/null; then
+    systemctl disable --now agnes-datadog-pg-role.timer >/dev/null 2>&1 || true
+fi
 %{ endif ~}
 
 # Boot-time gcplogs driver probe — defense in depth for #1557. Docker

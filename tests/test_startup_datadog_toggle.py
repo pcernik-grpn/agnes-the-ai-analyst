@@ -280,6 +280,8 @@ def test_the_off_path_is_the_only_datadog_text_in_a_disabled_render(off: str):
     assert code == [
         "if systemctl is-enabled --quiet datadog-agent 2>/dev/null; then",
         "    systemctl disable --now datadog-agent >/dev/null 2>&1 || true",
+        "if systemctl is-enabled --quiet agnes-datadog-pg-role.timer 2>/dev/null; then",
+        "    systemctl disable --now agnes-datadog-pg-role.timer >/dev/null 2>&1 || true",
     ], code
 
 
@@ -317,3 +319,15 @@ def test_the_rendered_script_is_valid_bash(tmp_path: Path, enabled: bool):
     script.write_text(_render(enabled))
     proc = subprocess.run([bash, "-n", str(script)], capture_output=True, text=True)
     assert proc.returncode == 0, proc.stderr
+
+
+def test_the_rendered_script_stays_well_inside_the_gce_metadata_limit():
+    """Everything the module ships to a VM rides in ONE metadata value, and GCE
+    caps a single value at 256 KiB. Each new base64 artifact eats into that, and
+    the failure mode is an apply that suddenly refuses a VM — so keep the
+    headroom visible rather than discovering it at the ceiling."""
+    rendered = _render(True)
+    # The fixture stubs the artifact payloads; charge the real ones instead.
+    real = sum(len(base64.b64encode(p.read_bytes())) for p in (MODULE / "files/datadog").rglob("*") if p.is_file())
+    size = len(rendered.encode()) - sum(len(v) for v in DATADOG_FILES.values()) + real
+    assert size < 200_000, f"{size} bytes leaves too little of the 262144-byte budget"

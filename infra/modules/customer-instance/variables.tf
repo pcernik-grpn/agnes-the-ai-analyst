@@ -1090,6 +1090,12 @@ variable "extra_labels" {
     Independent of Datadog, but this is what makes the Datadog `env` dimension
     reachable from the GCP side too: pass `{ env = var.gcp_project_id }` and
     the same string identifies the deployment in both consoles.
+
+    NOTE: the data disk and the static IP carried NO labels before this input
+    existed, so the first apply after picking up this module version labels
+    them with the module's four keys even when this map is empty. That is a
+    metadata-only, in-place update on both resources — nothing is recreated —
+    but it is a non-empty plan on a bump that otherwise has none.
   EOT
   type        = map(string)
   default     = {}
