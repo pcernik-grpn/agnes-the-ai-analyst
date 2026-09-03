@@ -497,7 +497,15 @@ class TestGivingSomethingToEveryoneIsAnExplicitChoice:
         stop counting a scope as a roster.
         """
         src = self._source()
-        assert 'audience: scope === "everyone" ? "everyone" : gid,' in src
+        # The optimistic row is now the SERVER's row made renderable
+        # (`_rowFromResponse`, audit E2), so the audience is derived there —
+        # from the row's own scope, or from the carrier group it was stored
+        # against — rather than hand-built in writeGrant. Same guarantee,
+        # one home.
+        assert "overview.grants.push(_rowFromResponse(created));" in src
+        f = src[src.index("function _rowFromResponse(g)"):]
+        f = f[: f.index("\n  }", 0) + 4]
+        assert 'audience: g.audience ?? ((g.scope === "everyone" || (cid && g.group_id === cid)) ? "everyone" : g.group_id),' in f
 
     def test_the_sentinel_counts_as_every_account(self):
         """It is not in `overview.groups`, so a lookup silently drops it.
@@ -1049,3 +1057,59 @@ class TestAnMcpSourceRowStatesItsSecondCondition:
         src = self._source()
         assert 'tc.total && !n ? " ax-r__tools--none" : ""' in src
         assert ".ax-r__tools--none { color: var(--ds-accent-warn-ink" in src
+
+
+class TestTheLocalCopyKnowsWhenItIsStale:
+    """Audit E2. The model this page holds is a copy, and two admins can hold
+    two. Every write was applied to the copy optimistically — the requested
+    tier stored as if it were the server's, a deleted row's 404 swallowed as
+    success — so two people could each see their own answer until a reload
+    and confidently report contradictory access states.
+
+    Full conflict detection is not needed; knowing the copy is stale is. A
+    write takes the server's row back, a 404 on a row still shown means
+    someone else changed it and the page refetches and says so, and
+    returning to the tab refetches a copy old enough to matter.
+    """
+
+    TEMPLATE = "app/web/templates/admin_access.html"
+
+    def _source(self) -> str:
+        from pathlib import Path
+
+        return Path(self.TEMPLATE).read_text(encoding="utf-8")
+
+    def test_there_is_one_way_to_refresh_the_model(self):
+        src = self._source()
+        assert "async function refetchOverview() {" in src
+        # The group-delete path's private copy of the fetch is gone.
+        assert "const fresh = await fetch(OVERVIEW_API" not in src
+
+    def test_a_write_takes_the_servers_row_not_the_request(self):
+        src = self._source()
+        assert "overview.grants.push(_rowFromResponse(created));" in src
+        assert "grant.requirement = saved && saved.requirement ? saved.requirement : requirement;" in src
+
+    def test_a_404_on_a_shown_row_is_news_on_both_write_paths(self):
+        src = self._source()
+        assert src.count('await changedElsewhere("That grant");') == 2   # PUT and DELETE
+        assert src.count('throw new Error("changed_elsewhere");') == 2
+
+    def test_no_caller_paints_over_the_sentence(self):
+        """The first live run showed "Could not save: changed_elsewhere" — the
+        tier handler's generic catch repainting a machine token over the
+        sentence changedElsewhere had just shown. Every caller must swallow
+        the sentinel."""
+        src = self._source()
+        assert src.count('if (err.message === "changed_elsewhere") return;') == 2   # tier click, checkbox
+        assert 'if (err.message === "changed_elsewhere") { done++; continue; }' in src   # the bulk loop
+        # And the bulk loop still counts a real failure — the repair that put
+        # `failed++` back after a one-line catch was mangled into a comment.
+        i = src.index('if (err.message === "changed_elsewhere") { done++; continue; }')
+        assert "failed++;" in src[i : i + 200]
+
+    def test_returning_to_the_tab_refreshes_a_stale_copy(self):
+        src = self._source()
+        assert 'document.addEventListener("visibilitychange"' in src
+        assert "const STALE_AFTER_MS = 30000;" in src
+        assert "if (Date.now() - _overviewFetchedAt < STALE_AFTER_MS) return;" in src

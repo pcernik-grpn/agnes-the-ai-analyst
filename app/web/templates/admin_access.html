@@ -4127,6 +4127,46 @@
      cannot be smuggled in through the group field. We send the carrier
      anyway, because a request that means what it says is easier to read in a
      log than one that relies on being overridden. */
+  /* The model this page holds is a COPY, and two admins can hold two. Every
+     write used to be applied to the copy optimistically — the requested tier
+     stored as if it were the server's, a deleted row's 404 swallowed as "fine,
+     already gone" — so two people could each see their own answer until a
+     reload, and confidently report contradictory access states. On a
+     permissions surface that is worse than an error. (Audit E2.)
+
+     Full conflict detection is not needed; knowing the copy is stale is.
+     Three things do that: a write takes the SERVER's row back, a 404 on a
+     row we still show means someone else changed it and we refetch and say
+     so, and returning to the tab refetches if the copy is old enough to
+     matter. Extracted from the inline copy the group-delete path had, so the
+     page has one way to refresh its model rather than five. */
+  let _overviewFetchedAt = Date.now();
+  async function refetchOverview() {
+    try {
+      const r = await fetch(OVERVIEW_API, { credentials: "include" });
+      if (!r.ok) return false;
+      overview = await r.json();
+      _overviewFetchedAt = Date.now();
+      return true;
+    } catch (e) { return false; }
+  }
+  //: The server's row, made a row this page can render: the three fields the
+  //: overview computes per grant and a GrantResponse does not carry. A row
+  //: this page just wrote is by definition changeable here and machine-free.
+  function _rowFromResponse(g) {
+    const cid = everyoneGroupId();
+    return Object.assign({}, g, {
+      managed_by: g.managed_by ?? null,
+      section: g.section ?? "change_here",
+      audience: g.audience ?? ((g.scope === "everyone" || (cid && g.group_id === cid)) ? "everyone" : g.group_id),
+    });
+  }
+  async function changedElsewhere(what) {
+    await refetchOverview();
+    toast(`${what} was changed by someone else — the page has been refreshed.`, false);
+    await repaint();
+  }
+
   async function writeGrant(type, resourceId, requirement, groupId, scope) {
     const gid = scope === "everyone" ? (everyoneGroupId() || groupId) : (groupId || selectedGroup);
     const r = await fetch(GRANTS_API, {
@@ -4145,13 +4185,10 @@
        split) treat a freshly-written everyone grant as an ordinary group
        grant until the next full repaint — which is the exact false claim
        those renderers were fixed to stop making. */
-    overview.grants.push({
-      id: created.id, group_id: gid,
-      resource_type: type, resource_id: resourceId, requirement,
-      scope: scope || null,
-      audience: scope === "everyone" ? "everyone" : gid,
-      section: "change_here",
-    });
+    /* The server's row, not our guess at it. The tier we asked for and the
+       tier that was written can differ (a store entity refused Automatic, a
+       default applied), and the optimistic row used to record the ask. */
+    overview.grants.push(_rowFromResponse(created));
   }
 
   async function updateGrant(grant, requirement) {
@@ -4160,11 +4197,21 @@
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ requirement }),
     });
+    if (r.status === 404) {
+      // The row we are showing no longer exists: a colleague revoked it.
+      // Applying our change to a copy of a deleted row would show a tier on
+      // a grant nobody has any more.
+      await changedElsewhere("That grant");
+      throw new Error("changed_elsewhere");
+    }
     if (!r.ok) {
       const b = await r.json().catch(() => ({}));
       throw new Error(typeof b.detail === "string" ? b.detail : `HTTP ${r.status}`);
     }
-    grant.requirement = requirement;
+    const saved = await r.json().catch(() => null);
+    // The server's answer, not the one we asked for.
+    grant.requirement = saved && saved.requirement ? saved.requirement : requirement;
+    if (saved && "scope" in saved) grant.scope = saved.scope;
   }
 
   /* A grant this page did not make, and cannot unmake. Marking a plugin
@@ -4192,7 +4239,16 @@
     const r = await fetch(`${GRANTS_API}/${encodeURIComponent(grant.id)}`, {
       method: "DELETE", credentials: "include",
     });
-    if (!r.ok && r.status !== 404) {
+    if (r.status === 404) {
+      // Already gone — but not by our hand, and the page was still showing
+      // it. That is the fact worth surfacing, not swallowing as success:
+      // the admin is about to report "removed" for something a colleague
+      // removed a minute ago, and their copy of everything else may be as
+      // stale as this row was.
+      await changedElsewhere("That grant");
+      throw new Error("changed_elsewhere");
+    }
+    if (!r.ok) {
       const body = await r.json().catch(() => ({}));
       const code = typeof body.detail === "string" ? body.detail : "";
       throw new Error(GRANT_REFUSALS[code] || code || `HTTP ${r.status}`);
@@ -4853,10 +4909,7 @@
       return;
     }
     membersCache.delete(group.id);
-    try {
-      const fresh = await fetch(OVERVIEW_API, { credentials: "include" });
-      if (fresh.ok) overview = await fresh.json();
-    } catch (e) { /* fall through — the list re-renders from what we have */ }
+    await refetchOverview();   // falls through on failure — the list re-renders from what we have
     // The selection only has to move if it was the deleted group: deleting
     // `finance` from its own row while `sales` is open must leave `sales`
     // open, or the menu would quietly navigate the pane as a side effect.
@@ -5198,6 +5251,18 @@
        accounts the lens can show, which the overview now carries. */
     set("person", overview.account_total ?? null);
   }
+
+  /* A tab left open for an hour holds an hour-old model. When it comes back
+     into view, refetch if the copy is older than the threshold and repaint —
+     so a colleague's change shows up when you look, not when you happen to
+     reload. Cheap to skip on a quick alt-tab; the threshold is what keeps a
+     busy admin's switching from becoming a request per glance. */
+  const STALE_AFTER_MS = 30000;
+  document.addEventListener("visibilitychange", async () => {
+    if (document.visibilityState !== "visible") return;
+    if (Date.now() - _overviewFetchedAt < STALE_AFTER_MS) return;
+    if (await refetchOverview()) await repaint();
+  });
 
   async function repaint() {
     // `showPane()` only runs on a lens SWITCH, so the default lens never got
@@ -5888,7 +5953,11 @@
           try {
             if (grantAll && !existing) { await writeGrant(type, i.resource_id, "available"); done++; }
             else if (!grantAll && existing) { await deleteGrant(existing); done++; }
-          } catch (err) { failed++; }
+          } catch (err) {
+            // A colleague got there first; the outcome the admin asked for holds.
+            if (err.message === "changed_elsewhere") { done++; continue; }
+            failed++;
+          }
         }
       } finally {
         bucketBox.disabled = false;
@@ -5932,6 +6001,7 @@
           toast("Grant removed", true);
         }
       } catch (err) {
+        if (err.message === "changed_elsewhere") return;   // already refetched and said so
         box.checked = !box.checked;
         toast("Could not save: " + err.message, false);
       } finally {
@@ -5982,6 +6052,7 @@
         await updateGrant(grant, tierBtn.dataset.tier);
         toast(tierSentence(type, tierBtn.dataset.tier), true);
       } catch (err) {
+        if (err.message === "changed_elsewhere") return;   // already refetched and said so
         toast("Could not save: " + err.message, false);
       }
       repaintView();
