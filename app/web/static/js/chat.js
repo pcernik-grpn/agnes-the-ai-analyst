@@ -3847,8 +3847,10 @@ function appendToken(text) {
   clearThinkingPlaceholder();
   if (!currentAssistantArticle) {
     // Prose after a run of tool calls closes that run: the next card belongs
-    // to whatever the agent does AFTER this sentence, not before it.
-    _endToolGroup();
+    // to whatever the agent does AFTER this sentence, not before it. It also
+    // settles whether the run's failures were fatal — they were not, the
+    // agent is answering.
+    _endToolGroup("answered");
     currentAssistantArticle = createMessageShell({ role: "assistant" });
     currentAssistantArticle.classList.add("is-streaming");
     currentAssistantBody = currentAssistantArticle.querySelector(".msg-body");
@@ -3980,13 +3982,16 @@ function finalizeAssistantMessage(frame) {
 // route). Tabular results (`agnes catalog`, `agnes query`,
 // `agnes describe`) get a real <table>; markdown-ish strings render as
 // markdown; everything else is pretty-printed JSON. A FAILED call stays
-// collapsed like any other and puts its diagnosis on the header line, where
-// folding keeps it — auto-opening put the ARGS dump on screen instead (#1974).
+// collapsed like any other, with its diagnosis in the body one click away —
+// auto-opening put the ARGS dump on screen instead (#1974).
 //
 // Consecutive cards fold into one group; see "Tool-call groups" below.
 //
 // Status icons (Lucide sprite, see chat_icons.js): hourglass = running,
-// check = done, triangle-alert = error. The status class on the wrapper
+// check = done, circle-alert = error — a circle rather than the hazard
+// triangle it used to be, which was the loudest graphic in the set aimed at
+// the mildest thing in the transcript, a step the agent went on to fix. The
+// status class on the wrapper
 // tints the left border accordingly so a failed tool call is unmistakable
 // at a glance.
 
@@ -4600,7 +4605,7 @@ function _buildToolCard({ tool, args, status, state, result, isError }) {
   icon.className = "cloud-chat-tool-icon";
   icon.setAttribute("aria-hidden", "true");
   if (status === "running") icon.appendChild(iconEl("hourglass"));
-  else if (wrapIsError) icon.appendChild(iconEl("triangle-alert"));
+  else if (wrapIsError) icon.appendChild(iconEl("circle-alert"));
   else if (state === "output-available") icon.appendChild(iconEl("check"));
   if (icon.firstChild) head.appendChild(icon);
 
@@ -4632,9 +4637,14 @@ function _buildToolCard({ tool, args, status, state, result, isError }) {
   // beside every row of a six-step run is most of what made the trail feel
   // crowded. The args live in the body, one click away (see _argsPanels).
   //
-  // The element stays, because a FAILED call writes its diagnosis here
-  // (_setToolCardError): on an error the one thing worth a collapsed line is
-  // what went wrong, and that is the only thing this slot now ever holds.
+  // The element stays as the slot a future summary would use. It is empty on
+  // every card today, a failure included: #1974 put the error message here so
+  // that folding a failed card would not bury it, and that turned each failed
+  // row into a full line of red prose — two of them side by side read as
+  // identical, because the part that differs sits at the END of a fixed
+  // "Error executing tool query: 400 Bad Request — Query error:" prefix. The
+  // message was also printed TWICE the moment the card was opened, once here
+  // and once in the body below. The body is now the only place it lives.
   const summary = document.createElement("span");
   summary.className = "cloud-chat-tool-summary";
   head.appendChild(summary);
@@ -4656,12 +4666,6 @@ function _buildToolCard({ tool, args, status, state, result, isError }) {
   head.appendChild(chevron);
 
   wrap.appendChild(head);
-  // A replayed failure carries its diagnosis on the header, exactly as a live
-  // one does once its result lands (see renderToolCallEnd). AFTER the header is
-  // in the card: _setToolCardError finds the summary by querying `wrap`, so
-  // called any earlier it silently does nothing and a reloaded failure shows
-  // its args sketch where its error should be.
-  if (wrapIsError) _setToolCardError(wrap, result);
 
   // Args — visible the moment the card is expanded. The card header is the
   // one click now; the old nested args toggle inside a collapsed card was two
@@ -4682,42 +4686,6 @@ function _buildToolCard({ tool, args, status, state, result, isError }) {
     if (body) wrap.appendChild(body);
   }
   return wrap;
-}
-
-//: The header only has room for a line. The whole payload is one click away
-//: inside the card, so this is a lead, not a truncation of the record.
-const _TOOL_ERROR_LINE_CHARS = 160;
-
-/** The one-line diagnosis a failed card shows on its header, in place of the
- *  args sketch: the args are behind the expander, the error is the thing the
- *  reader needs at a glance.
- *
- *  Returns plain text and is ALWAYS written with `textContent`. An internal
- *  failure routinely names an internal endpoint ("400 Bad Request for
- *  http://localhost:8000/api/query"), and rendering that through markdown made
- *  the chat offer a localhost URL as a link to click (#1974). Nothing in an
- *  error string is improved by markdown, and one thing in it is made worse. */
-function _toolErrorLine(result) {
-  let text = _unwrapMcpEnvelope(result);
-  if (text && typeof text === "object") {
-    text = text.error || text.message || text.detail || text.errorText || JSON.stringify(text);
-  }
-  if (typeof text !== "string") text = text == null ? "" : String(text);
-  text = text.replace(/\s+/g, " ").trim();
-  if (!text) return "";
-  return text.length > _TOOL_ERROR_LINE_CHARS ? text.slice(0, _TOOL_ERROR_LINE_CHARS - 1) + "…" : text;
-}
-
-/** Put the diagnosis on a failed card's header line. No-op when the payload
- *  yields no text — the status icon and edge already say it failed. */
-function _setToolCardError(wrap, result) {
-  const line = _toolErrorLine(result);
-  if (!line) return;
-  const summary = wrap.querySelector(".cloud-chat-tool-summary");
-  if (!summary) return;
-  summary.classList.add("is-error");
-  summary.textContent = line;
-  summary.title = line;
 }
 
 // ---------- Tool-call groups ----------------------------------------------
@@ -4786,8 +4754,21 @@ function _updateToolGroupSummary(group) {
     else if (c.classList.contains("is-error")) failed++;
     else if (!c.classList.contains("is-done")) unknown++;
   }
+  // A run the agent answered after (see `_endToolGroup`) reports what the run
+  // DID, not what happened inside it. A research turn that self-corrects twice
+  // and lands the answer was headed "6 steps · 3 failed" under a red alert —
+  // the same mark a broken turn gets — so the trail said the turn had failed
+  // while the answer sat directly under it saying otherwise (#1974, and the
+  // feedback that reopened it). What changes is that the run stops being scored
+  // as the turn's outcome — the count goes with the alert, because "3 failed"
+  // set beside a tick and a finished answer states an intermediate as a
+  // result. The failures are not hidden: every card inside keeps its own mark,
+  // one click away. A run that NOTHING followed keeps both the alert and the
+  // count, because there the failures are exactly what the turn amounted to.
+  const recovered = group.dataset.recovered === "1" && running === 0;
   group.classList.toggle("is-running", running > 0);
-  group.classList.toggle("is-error", running === 0 && failed > 0);
+  group.classList.toggle("is-error", running === 0 && failed > 0 && !recovered);
+  group.classList.toggle("is-recovered", recovered && failed > 0);
   group.classList.toggle("is-done", running === 0 && failed === 0 && unknown === 0);
   const icon = group.querySelector(".cloud-chat-tool-group-icon");
   if (icon) {
@@ -4795,8 +4776,8 @@ function _updateToolGroupSummary(group) {
     // shows NO status icon rather than a tick it cannot evidence — the same
     // rule the individual card follows.
     if (running > 0) icon.replaceChildren(iconEl("hourglass"));
-    else if (failed > 0) icon.replaceChildren(iconEl("triangle-alert"));
-    else if (unknown === 0) icon.replaceChildren(iconEl("check"));
+    else if (failed > 0 && !recovered) icon.replaceChildren(iconEl("circle-alert"));
+    else if (unknown === 0 || recovered) icon.replaceChildren(iconEl("check"));
     else icon.replaceChildren();
   }
   const steps = `${n} step${n === 1 ? "" : "s"}`;
@@ -4825,7 +4806,7 @@ function _updateToolGroupSummary(group) {
     label.textContent = activeName ? activeName.textContent : `${group.open ? "Hide" : "Show"} ${steps}`;
   }
   const meta = group.querySelector(".cloud-chat-tool-group-meta");
-  if (meta) meta.textContent = running > 0 ? steps : failed > 0 ? `${failed} failed` : "";
+  if (meta) meta.textContent = running > 0 ? steps : failed > 0 && !recovered ? `${failed} failed` : "";
 }
 
 /** Put a tool card in the stream, folding it together with the card before it
@@ -4862,8 +4843,17 @@ function _appendToolCard(wrap) {
   _looseToolCard = wrap;
 }
 
-/** Close the open run. Anything appended after this starts a new one. */
-function _endToolGroup() {
+/** Close the open run. Anything appended after this starts a new one.
+ *
+ *  `reason` is "answered" when what closed the run is the agent's own prose.
+ *  That is the one fact separating "some steps failed and the turn went on"
+ *  from "the turn broke": a run the agent wrote an answer after is a run it
+ *  absorbed. See `_updateToolGroupSummary` for what the header does with it. */
+function _endToolGroup(reason) {
+  if (reason === "answered" && _currentToolGroup) {
+    _currentToolGroup.dataset.recovered = "1";
+    _updateToolGroupSummary(_currentToolGroup);
+  }
   _currentToolGroup = null;
   _looseToolCard = null;
 }
@@ -4874,13 +4864,19 @@ function _endToolGroup() {
 function _groupConsecutiveToolCards(nodes) {
   const out = [];
   let run = [];
-  const flush = () => {
+  //: What ENDED the run, on reload: a text bubble is an <article>, while a
+  //: system note, an approval and a question card are all divs. Same question
+  //: the live path answers with `_endToolGroup("answered")` — did the agent
+  //: go on to say something — asked of the node that terminated the run
+  //: instead of the token that would have opened it.
+  const flush = (endedBy) => {
     if (run.length < 2) {
       out.push(...run);
     } else {
       const group = _buildToolGroup();
       const body = group.querySelector(".cloud-chat-tool-group-body");
       for (const card of run) body.appendChild(card);
+      if (endedBy && endedBy.tagName === "ARTICLE") group.dataset.recovered = "1";
       _updateToolGroupSummary(group);
       out.push(group);
     }
@@ -4889,11 +4885,13 @@ function _groupConsecutiveToolCards(nodes) {
   for (const node of nodes) {
     if (node && node.classList && node.classList.contains("cloud-chat-tool")) run.push(node);
     else {
-      flush();
+      flush(node);
       out.push(node);
     }
   }
-  flush();
+  // Nothing followed the last run — the turn simply ended, which is not an
+  // answer. A run that failed here keeps its alert.
+  flush(null);
   return out;
 }
 
@@ -4912,6 +4910,13 @@ function renderToolCallStart(frame) {
   $("cancel-btn").hidden = false;
 }
 
+//: Where a duration stops being noise and starts being the reason the reader
+//: waited. Two seconds is under the point a person reports something as slow
+//: and well over the point they stop caring — a `query` against a warm local
+//: parquet lands in the low hundreds of ms, so the everyday call says nothing
+//: and a remote scan or a sandbox command says what it cost.
+const _TOOL_SLOW_MS = 2000;
+
 function renderToolCallEnd(frame) {
   const id = _toolCallId(frame);
   const wrap = inFlightToolCalls.get(id);
@@ -4928,25 +4933,32 @@ function renderToolCallEnd(frame) {
   const isError = typeof frame.is_error === "boolean" ? frame.is_error : _looksLikeToolError(result);
   wrap.classList.remove("is-running");
   wrap.classList.add(isError ? "is-error" : "is-done");
-  // A failed card stays COLLAPSED and puts its diagnosis on the header line
-  // instead (see _buildToolCard's note): the reader gets the error without a
-  // click, and the raw args stay behind the same expander as everywhere else.
-  if (isError) _setToolCardError(wrap, result);
+  // A failed card stays COLLAPSED, like every other. What marks it is the
+  // triangle and the danger edge; the message itself is in the body, behind
+  // the same expander as the args (see _buildToolCard's note).
   const icon = wrap.querySelector(".cloud-chat-tool-icon");
-  if (icon) icon.replaceChildren(iconEl(isError ? "triangle-alert" : "check"));
+  if (icon) icon.replaceChildren(iconEl(isError ? "circle-alert" : "check"));
 
-  // Timing meta — "running…" → "1.2s" if we tracked startedAt.
+  // Timing meta — "running…" → a duration, but ONLY a duration worth reading.
+  //
+  // A tool call's elapsed time is information entirely in its tail. "348ms"
+  // answers no question a reader of a chat transcript has: they are not tuning
+  // the agent, and every row carrying one turned the trail into a column of
+  // numbers nobody reads. "12.4s" answers a real one — why the turn took as
+  // long as it did, and which step to blame. So the number appears when it is
+  // the answer to that question and is dropped otherwise; the icon already
+  // says the call finished, which is what the sub-second case was reduced to
+  // saying twice.
+  //
+  // The element is REMOVED rather than blanked: it sits in a flex row with a
+  // gap, so an empty span still spends the gap and leaves the chevron floating
+  // away from the name.
   const meta = wrap.querySelector(".cloud-chat-tool-meta");
   if (meta) {
     const startedAt = parseFloat(wrap.dataset.startedAt || "");
-    if (Number.isFinite(startedAt)) {
-      const elapsedMs = performance.now() - startedAt;
-      meta.textContent = elapsedMs > 1000
-        ? `${(elapsedMs / 1000).toFixed(1)}s`
-        : `${Math.round(elapsedMs)}ms`;
-    } else {
-      meta.textContent = isError ? "failed" : "done";
-    }
+    const elapsedMs = Number.isFinite(startedAt) ? performance.now() - startedAt : NaN;
+    if (elapsedMs >= _TOOL_SLOW_MS) meta.textContent = `${(elapsedMs / 1000).toFixed(1)}s`;
+    else meta.remove();
   }
 
   // Result body — the new bit. Picks a preview shape based on the
@@ -4985,12 +4997,14 @@ function renderToolCallEnd(frame) {
  *  the finished answer. Each card's own <details> toggle still opens it
  *  back up on click.
  *
- *  A FAILED card folds with the rest now. It used to be exempt, because its
+ *  A FAILED card folds with the rest. It used to be exempt, because its
  *  output was the thing the reader needed and folding it put the diagnosis
- *  behind a click nobody knows to make — but the diagnosis is on the HEADER
- *  line since #1974, which is exactly the part folding keeps. Nothing is
- *  hidden by folding it that was visible before; what folds away is the args
- *  dump that came with it.
+ *  behind a click nobody knows to make. #1974 answered that by copying the
+ *  message onto the header line, which cost more than it bought: a wall of
+ *  red prose whose distinguishing half was past the ellipsis, printed twice
+ *  over on an open card. The message is in the body only, and what the
+ *  collapsed line carries is the triangle — the group header above it already
+ *  says how many steps failed, which is the count a reader scans for.
  *
  *  Runs fold too: the group is the compact form of the whole trail, so a
  *  settled turn is one line per run rather than one per call. */

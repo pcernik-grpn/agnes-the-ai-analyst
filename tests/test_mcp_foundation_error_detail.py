@@ -69,8 +69,29 @@ def test_empty_body_keeps_a_clean_message():
     with pytest.raises(httpx.HTTPStatusError) as exc:
         _raise_for_status_with_detail(r)
     msg = str(exc.value)
-    assert msg.endswith(str(r.request.url))
+    assert msg == "401 Unauthorized"
     assert "—" not in msg
+
+
+def test_message_never_names_the_internal_endpoint():
+    """The URL is the server talking to itself, and it reaches two audiences
+    that are both hurt by it.
+
+    The model called a NAMED TOOL, not a URL — ``http://localhost:8000/api/query``
+    tells it nothing it can act on. The user sees the same string on the failed
+    tool card, where an internal endpoint reads as "the server is broken" when
+    the truth is usually "the agent mistyped a column" (#1974, and the Slack
+    thread that reopened it). The request is still on the exception for logs.
+    """
+    r = _resp(400, json_body={"detail": 'Binder Error: Referenced column "revenu" not found'})
+    with pytest.raises(httpx.HTTPStatusError) as exc:
+        _raise_for_status_with_detail(r)
+    msg = str(exc.value)
+    assert "http://" not in msg
+    assert "api/store" not in msg
+    assert "Binder Error" in msg
+    # The URL is not lost, it is just not in the sentence handed to the model.
+    assert str(exc.value.request.url).startswith("http://server/")
 
 
 def test_oversized_detail_is_truncated():

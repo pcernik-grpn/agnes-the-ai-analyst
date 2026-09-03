@@ -1340,8 +1340,11 @@ pre.code-block-wrap code .hljs-deletion {
    (chat.js renderToolCallStart), COLLAPSED to its header line by
    default; expanding shows the formatted-JSON args and result
    panels directly (only oversize payloads keep a nested toggle).
-   A failed call stays collapsed too and carries its diagnosis on the
-   header line instead (see .cloud-chat-tool-summary.is-error). */
+   A failed call stays collapsed too; its diagnosis is in the body, one
+   click away, and the triangle plus the danger edge are what the collapsed
+   line says. Putting the message on the header instead made every failed row
+   a line of red prose whose distinguishing half was cut off by the ellipsis,
+   and printed it twice over on an open card. */
 /* Shared by the THREE things that wear this class — a tool-call step, an
    approval gate, a question card. Only the reading column and the type scale
    are shared. The chrome is deliberately NOT: a step is a trace line the
@@ -1488,12 +1491,17 @@ summary.cloud-chat-tool-group-head {
 summary.cloud-chat-tool-group-head::-webkit-details-marker { display: none; }
 .cloud-chat-tool-group-icon {
   flex: 0 0 auto;
-  font-size: var(--text-md);
+  font-size: var(--text-base); /* matched to the card's, same reason */
   line-height: 1;
 }
 .cloud-chat-tool-group.is-running .cloud-chat-tool-group-icon { color: var(--ds-accent-info-line); }
-.cloud-chat-tool-group.is-done    .cloud-chat-tool-group-icon { color: var(--ds-accent-success-line); }
+.cloud-chat-tool-group.is-done    .cloud-chat-tool-group-icon { color: var(--ds-accent-success-ink); }
 .cloud-chat-tool-group.is-error   .cloud-chat-tool-group-icon { color: var(--ds-accent-danger-line); }
+/* A run whose failures the agent answered through (chat.js →
+   _updateToolGroupSummary). It carries a tick, not an alert: the failures are
+   steps the turn absorbed, not its outcome. The count beside it stays in the
+   meta's muted ink, so the fact survives without the alarm. */
+.cloud-chat-tool-group.is-recovered .cloud-chat-tool-group-icon { color: var(--ds-accent-success-ink); }
 .cloud-chat-tool-group-label {
   flex: 0 1 auto;
   min-width: 0;
@@ -1566,12 +1574,15 @@ summary.cloud-chat-tool-head {
   list-style: none;
 }
 summary.cloud-chat-tool-head::-webkit-details-marker { display: none; }
-/* Status icon — a sprite icon (hourglass / check / triangle-alert, see
+/* Status icon — a sprite icon (hourglass / check / circle-alert, see
    chat_icons.js), tinted to the same status accent the card's left border
    uses so the header and the edge tell one story. */
 .cloud-chat-tool-icon {
   flex: 0 0 auto;
-  font-size: var(--text-md);
+  /* One step below the name it sits beside. At --text-md the status mark was
+     the same weight as the reader-facing verb next to it and heavier than the
+     timing after it, on a row whose whole job is to be skimmed past. */
+  font-size: var(--text-base);
   line-height: 1;
 }
 /* The icon is the ONLY thing carrying a step's status now that a step draws no
@@ -1614,13 +1625,16 @@ summary.cloud-chat-tool-head::-webkit-details-marker { display: none; }
   font-family: var(--font-mono, ui-monospace, monospace);
   color: var(--ds-text-muted);
 }
-/* On a FAILED card this slot carries the diagnosis instead of the args sketch
-   (chat.js _setToolCardError): an error message is prose, so it drops the mono
-   face the args summary needs, and takes the danger ink the card's edge and
-   icon already use. */
-.cloud-chat-tool-summary.is-error {
-  font-family: inherit;
-  color: var(--ds-accent-danger-ink);
+/* An error follows the thing that caused it, so it reads as that block's
+   consequence rather than as a second, unrelated panel. Both panels carry
+   var(--space-2) of vertical padding, which stacked into a 16px trough
+   between the SQL and the message about the SQL — enough to look like two
+   findings. Dropping this one's top padding leaves the args panel's own
+   bottom padding as the whole gap. Padding, not margin: the panels abut at
+   zero margin so their left hairlines join into one line (see the
+   `--step[open]` rule above), and a margin here would break it. */
+.cloud-chat-tool--step[open] > .cloud-chat-tool-args + .cloud-chat-tool-result.is-error {
+  padding-top: 0;
 }
 /* A failed call's expanded output — plain text, never markdown (an internal
    endpoint in an error must not render as a link), so it needs the wrapping a

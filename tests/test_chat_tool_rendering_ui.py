@@ -250,19 +250,22 @@ def test_a_collapsed_step_carries_no_args_only_an_outcome():
     every row of a six-step run is most of what made the trail feel crowded.
     The args moved into the body, one click away.
 
-    The summary ELEMENT stays, because a failed call writes its diagnosis there
-    (_setToolCardError): on an error, what went wrong is the one thing worth a
-    collapsed line, and it is now the only thing this slot ever holds. The
-    summarizer that used to fill it is gone rather than left unused."""
+    The summary ELEMENT stays as an empty slot, but nothing fills it — a
+    failure included. #1974 wrote the error message there so that folding a
+    failed card would not bury it; that made every failed row a line of red
+    prose whose distinguishing half sat past the ellipsis (two "Error
+    executing tool query: 400 Bad Request — Query error: …" rows read as
+    identical), and printed it a second time in the body the moment the card
+    was opened. Both summarizers that used to fill this slot are gone rather
+    than left unused."""
     js = _read(CHAT_JS)
     assert "_summarizeArgs" not in js, "dead once the header stopped showing args — deleted, not orphaned"
+    assert "_setToolCardError" not in js, "dead once the header stopped showing the error — deleted too"
+    assert "_toolErrorLine" not in js
 
-    card = js[js.index("function _buildToolCard") : js.index("function _toolErrorLine")]
-    assert 'summary.className = "cloud-chat-tool-summary"' in card, "the slot survives for the error line"
-    assert "summary.textContent" not in card, "nothing but the error line may fill it"
-
-    err = js[js.index("function _setToolCardError") : js.index("// ---------- Tool-call groups")]
-    assert "summary.textContent = line;" in err, "the diagnosis is what the slot is for now"
+    card = js[js.index("function _buildToolCard") : js.index("// ---------- Tool-call groups")]
+    assert 'summary.className = "cloud-chat-tool-summary"' in card, "the slot survives"
+    assert "summary.textContent" not in card, "and stays empty — the body is where a payload goes"
 
 
 # ── tool results: JSON is one click away, never the primary rendering ───────
@@ -999,13 +1002,15 @@ def test_collapse_cap_clears_an_ordinary_long_answer():
 # args-or-error, timing); expanding shows the formatted-JSON args and result.
 # NOTHING opens a card on its own, a failure included: a failed call used to
 # open itself, which put its ARGS dump on screen above the answer (#1974). Its
-# diagnosis rides the header line instead, which is the part folding keeps.
+# diagnosis lives in the body, one click away — briefly it was copied onto the
+# header line too, which turned every failed row into red prose and printed the
+# message twice on an open card.
 # Any card expanded during a turn folds back the moment that turn ends.
 
 
 def test_tool_call_card_is_a_details_element_collapsed_by_default():
     js = _read(CHAT_JS)
-    card = js[js.index("function _buildToolCard") : js.index("const _TOOL_ERROR_LINE_CHARS")]
+    card = js[js.index("function _buildToolCard") : js.index("// ---------- Tool-call groups")]
     assert 'document.createElement("details")' in card, "the whole card must be collapsible, not just its nested panels"
     assert 'document.createElement("summary")' in card, "the header becomes the <details>'s native toggle"
     # Collapsed by default, with no exception: a card that opens itself is a
@@ -1019,23 +1024,23 @@ def test_tool_call_card_is_a_details_element_collapsed_by_default():
         "tracked so every card opened this turn folds together at turn end"
     )
     end = js[js.index("function renderToolCallEnd") : js.index("/** Fold every tool-call card")]
-    assert "wrap.open = true" not in end
-    assert "if (isError) _setToolCardError(wrap, result)" in end, (
-        "a FAILED card must show its diagnosis without a click — on the header, not by opening"
+    assert "wrap.open = true" not in end, (
+        "a FAILED card is not special either — it stays collapsed, marked by its triangle, "
+        "with the message in the body like every other payload"
     )
 
 
-def test_a_failed_card_puts_its_diagnosis_on_the_header_as_plain_text():
-    """The error line names internal endpoints ("400 Bad Request for
-    http://localhost:8000/api/query"). Rendered through markdown, marked's GFM
-    autolinker turned that into a link the chat offered the reader (#1974) —
-    so the header line is written with textContent, and a failed result's BODY
-    is a <pre>, never `renderMarkdownSafe`."""
-    js = _read(CHAT_JS)
-    setter = js[js.index("function _setToolCardError") : js.index("function renderToolCallStart")]
-    assert "summary.textContent = line" in setter, "the diagnosis is text, never markup"
-    assert "innerHTML" not in setter
+def test_a_failed_cards_diagnosis_is_plain_text_in_the_body_and_nowhere_else():
+    """An error can name an internal endpoint. Rendered through markdown,
+    marked's GFM autolinker turns that into a link the chat offers the reader
+    (#1974), so a failed result's body is a <pre> written with textContent,
+    never `renderMarkdownSafe`.
 
+    The body is now the ONLY place it renders. The header copy that #1974 added
+    is gone — it duplicated this text on every open card and crowded every
+    closed one — which also means this <pre> is the single place the
+    never-a-link rule has to hold."""
+    js = _read(CHAT_JS)
     preview = js[js.index("function _renderToolResultPreview") : js.index("function _appendSemanticValidationNotice")]
     err_branch = preview[preview.index("if (isError === true") : preview.index("// Already-tabular shapes")]
     assert "pre.textContent = result" in err_branch, "an error body renders as text"
@@ -1048,14 +1053,47 @@ def test_a_failed_card_puts_its_diagnosis_on_the_header_as_plain_text():
     assert "_renderToolResultPreview(result, tool, wrapIsError)" in js
 
 
-def test_a_replayed_failure_gets_its_header_line_after_the_header_exists():
-    """`_setToolCardError` finds the summary by querying the CARD, so called
-    before `wrap.appendChild(head)` it silently does nothing and a reloaded
-    failure shows its args sketch where its error should be. Ordering, not
-    presence — which is why this is a position assertion."""
+def test_live_and_replayed_failures_agree_that_the_header_stays_empty():
+    """The two paths built the failed card separately — live stamped the header
+    from `renderToolCallEnd`, reload from `_buildToolCard` — and each had its
+    own ordering bug to get wrong. Neither writes a header line now, so the
+    question is simply that neither grew one back: a reloaded transcript must
+    not read differently from the one the reader just watched."""
     js = _read(CHAT_JS)
-    card = js[js.index("function _buildToolCard") : js.index("const _TOOL_ERROR_LINE_CHARS")]
-    assert card.index("wrap.appendChild(head);") < card.index("if (wrapIsError) _setToolCardError(wrap, result);")
+    card = js[js.index("function _buildToolCard") : js.index("// ---------- Tool-call groups")]
+    end = js[js.index("function renderToolCallEnd") : js.index("/** Fold every tool-call card")]
+    for name, body in (("_buildToolCard", card), ("renderToolCallEnd", end)):
+        assert ".cloud-chat-tool-summary" not in body, f"{name} must not write the header slot"
+    # Both still hand the payload to the body renderer, which is what carries it.
+    assert "_renderToolResultPreview(result, tool, wrapIsError)" in card
+    assert "_renderToolResultPreview(result, toolName, isError)" in end
+
+
+def test_a_step_shows_its_duration_only_when_the_duration_is_the_point():
+    """Every settled row used to carry one — "348ms", "351ms", "343ms" down the
+    whole trail — which is a column of numbers answering a question no reader
+    of a chat transcript is asking. They are not tuning the agent. The number
+    earns its place only in the tail, where it says why the turn took as long
+    as it did and which step to blame.
+
+    Pinned as behaviour, not as a constant: what matters is that the sub-second
+    case renders NOTHING (the icon already says the call finished) and that the
+    element is removed rather than emptied, because it sits in a gapped flex
+    row where an empty span still spends its gap."""
+    js = _read(CHAT_JS)
+    assert "const _TOOL_SLOW_MS" in js, "the threshold is named, not inlined at the call site"
+    end = js[js.index("function renderToolCallEnd") : js.index("/** Fold every tool-call card")]
+    block = end[end.index("const meta = wrap.querySelector") :]
+    block = block[: block.index("// Result body")]
+    assert "meta.remove()" in block, "an empty span still spends the row's flex gap"
+    assert "}ms`" not in block, "a sub-second call reports no duration at all"
+    assert 'meta.textContent = isError ? "failed" : "done"' not in block, (
+        "the icon carries the outcome — this said it a second time in words"
+    )
+    # "running…" is a different question and stays: a live row has to say it is
+    # live, and there is no icon state that says how long it has been going.
+    card = js[js.index("function _buildToolCard") : js.index("// ---------- Tool-call groups")]
+    assert 'meta.textContent = "running…"' in card
 
 
 def test_collapse_finished_tool_calls_folds_and_clears_the_turn_list():
@@ -1088,23 +1126,21 @@ def test_tool_head_summary_gets_pointer_cursor_scoped_to_the_real_toggle():
     assert re.search(r"(?<!summary)\.cloud-chat-tool-head\s*\{[^}]*cursor:\s*pointer", css) is None
 
 
-def test_a_failed_tool_card_folds_with_the_rest_because_its_diagnosis_is_on_the_header():
-    """A failed card used to be exempt from the end-of-turn fold, on the
-    argument that folding put the diagnosis behind a click nobody knows to
-    make. That argument is answered rather than abandoned: the diagnosis moved
-    ONTO the header line (`_setToolCardError`), which is exactly the part
-    folding keeps, so the exemption now only preserves the args dump the fold
-    exists to clear (#1974)."""
+def test_a_failed_tool_card_folds_with_the_rest():
+    """A failed card was once exempt from the end-of-turn fold, so that its
+    output stayed on screen. #1974 removed the exemption by copying the message
+    onto the header line; that copy is gone now and the exemption stays gone
+    with it. What a folded failure leaves on screen is its triangle and the
+    group header's own count — the message is one click away, the same click
+    every other payload is behind.
+
+    The exemption is what this pins: a card that reopens itself is how the wall
+    of machinery above the answer came back the first time."""
     js = _read(CHAT_JS)
     fn = js[js.index("function _collapseFinishedToolCalls") :]
     fn = fn[: fn.index("\n}")]
-    assert 'classList.contains("is-error")' not in fn, (
-        "no card is exempt from the fold — the header carries the error either way"
-    )
+    assert 'classList.contains("is-error")' not in fn, "no card is exempt from the fold"
     assert "wrap.open = false" in fn
-    # The header line the fold leaves behind has to be the one carrying it.
-    end = js[js.index("function renderToolCallEnd") : js.index("/** Fold every tool-call card")]
-    assert "_setToolCardError(wrap, result)" in end
 
 
 def test_no_bare_details_box_rule_can_flatten_a_tool_card():
@@ -1155,8 +1191,8 @@ def test_a_replayed_card_shows_the_outcome_the_record_actually_carries():
     assert 'state === "output-error"' in fn and 'state === "output-available"' in fn, (
         "the persisted state maps onto the same is-error / is-done classes a live result produces"
     )
-    # Sprite icons since #1503 — check for done, triangle-alert for error.
-    assert 'iconEl("check")' in fn and 'iconEl("triangle-alert")' in fn
+    # Sprite icons since #1503 — check for done, circle-alert for error.
+    assert 'iconEl("check")' in fn and 'iconEl("circle-alert")' in fn
     # Neutral only when there is genuinely nothing to report: the fallback
     # class, and an icon appended only when it has content.
     assert 'let statusClass = "is-replayed"' in fn
@@ -1478,6 +1514,11 @@ function mkEl(tag) {
   const node = {
     tag, _cls: new Set(), children: [], parentNode: null, _text: '', open: undefined,
     attrs: {},
+    // Real DOM properties the group code reads: `dataset` carries the
+    // recovered stamp, `tagName` is how the reload walk tells a text bubble
+    // (<article>) from an approval or a system note (both <div>).
+    dataset: {},
+    get tagName() { return String(tag).toUpperCase(); },
     get className() { return [...node._cls].join(' '); },
     set className(v) { node._cls = new Set(String(v).split(/\\s+/).filter(Boolean)); },
     classList: {
@@ -1506,6 +1547,15 @@ function mkEl(tag) {
         if (deep) return deep;
       }
       return null;
+    },
+    querySelectorAll(sel) {
+      const cls = sel.replace(/^\\./, '');
+      const hits = [];
+      for (const k of node.children) {
+        if (k._cls.has(cls)) hits.push(k);
+        hits.push(...k.querySelectorAll(sel));
+      }
+      return hits;
     },
   };
   Object.defineProperty(node, 'textContent', {
@@ -1622,12 +1672,90 @@ process.stdout.write(JSON.stringify({
     assert "is-error" in res["settled"][0], "a run with a failure in it says so on its edge"
     assert res["settled"][1] == "Show 3 steps"
     assert res["settled"][2] == "2 failed"
-    assert res["settled"][3] == ["icon-triangle-alert"]
+    assert res["settled"][3] == ["icon-circle-alert"]
     assert "is-running" in res["live"][0]
     assert res["live"][1] == "Reading a file", "a collapsed live group still says what is happening now"
     assert res["live"][2] == "2 steps"
     assert res["replayed_icon"] == 0, "a pre-v123 run records no outcome — no tick it cannot evidence"
     assert "is-done" not in res["replayed_cls"]
+
+
+def test_a_run_the_agent_answered_after_is_not_scored_as_a_failure():
+    """The complaint that reopened #1974: a research turn that self-corrected
+    twice and landed the answer was headed by a RED ALERT reading "3 failed",
+    directly above the answer it had produced. The alert is the same mark a
+    genuinely broken turn gets, so the trail contradicted the reply under it —
+    "looks like a lot of things failed when in reality it was just a few
+    inconsequential things".
+
+    The fact that separates the two is whether the agent went on to answer.
+    A run stamped ``recovered`` reports what it DID — a tick and the step
+    count, nothing else. The failure count goes with the alert: "3 failed"
+    beside a tick and a finished answer states an intermediate as a result.
+    Every failed card inside keeps its own mark, one click away. A run nothing
+    followed keeps BOTH the alert and the count, which is the case they were
+    always for.
+    """
+    script = (
+        _GROUP_HARNESS
+        + _group_source()
+        + """
+const recovered = _buildToolGroup();
+const rb = recovered.querySelector('.cloud-chat-tool-group-body');
+[card('is-done'), card('is-error'), card('is-error')].forEach((c) => rb.appendChild(c));
+recovered.dataset.recovered = '1';
+_updateToolGroupSummary(recovered);
+
+// Same cards, nothing after them: the turn ended on the failure.
+const abandoned = _buildToolGroup();
+const ab = abandoned.querySelector('.cloud-chat-tool-group-body');
+[card('is-done'), card('is-error'), card('is-error')].forEach((c) => ab.appendChild(c));
+_updateToolGroupSummary(abandoned);
+
+// A run still going is never "recovered" early, whatever the stamp says.
+const running = _buildToolGroup();
+const rn = running.querySelector('.cloud-chat-tool-group-body');
+[card('is-error'), card('is-running', 'Querying data')].forEach((c) => rn.appendChild(c));
+running.dataset.recovered = '1';
+_updateToolGroupSummary(running);
+
+process.stdout.write(JSON.stringify({
+  rec: [recovered.className, head(recovered, '.cloud-chat-tool-group-meta'),
+        recovered.querySelector('.cloud-chat-tool-group-icon').children.map((c) => c.className),
+        rb.querySelectorAll('.is-error').length],
+  aban: [abandoned.className,
+         abandoned.querySelector('.cloud-chat-tool-group-icon').children.map((c) => c.className),
+         head(abandoned, '.cloud-chat-tool-group-meta')],
+  run: [running.className,
+        running.querySelector('.cloud-chat-tool-group-icon').children.map((c) => c.className)],
+}));
+"""
+    )
+    res = json.loads(_node_run(script))
+    assert "is-error" not in res["rec"][0], "the answer arrived — the run is not the turn's failure"
+    assert "is-recovered" in res["rec"][0]
+    assert res["rec"][1] == "", "the count goes with the alert — it stated an intermediate as a result"
+    assert res["rec"][2] == ["icon-check"], "a tick, not an alert"
+    assert res["rec"][3] == 2, "and every failed card inside keeps its own mark"
+    assert "is-error" in res["aban"][0], "nothing followed the run — the alert is exactly for this"
+    assert res["aban"][1] == ["icon-circle-alert"]
+    assert res["aban"][2] == "2 failed", "here the failures ARE what the turn amounted to"
+    assert "is-running" in res["run"][0], "a live run is not recovered yet"
+    assert res["run"][1] == ["icon-hourglass"]
+
+
+def test_both_group_paths_agree_on_what_counts_as_recovery():
+    """Live and reload must reach the same verdict or a refresh would change
+    the header. Live stamps the group when PROSE closes the run
+    (``_endToolGroup("answered")``); reload stamps it when the node that
+    terminated the run is a text ``<article>``. A system note, an approval and
+    a question card are all divs, and none of them is an answer."""
+    src = _read(CHAT_JS)
+    assert '_endToolGroup("answered")' in src, "the live path has to say WHY the run ended"
+    assert 'reason === "answered"' in src
+    assert 'endedBy.tagName === "ARTICLE"' in src, "the reload twin asks the same question of the node"
+    # The turn-end flush must not claim recovery for a run nothing followed.
+    assert "flush(null)" in src
 
 
 def test_the_live_label_names_the_call_that_is_still_running():
@@ -1683,7 +1811,10 @@ def test_a_run_is_ended_by_everything_that_is_not_another_tool_card():
         ("function _collapseFinishedToolCalls", "function _looksLikeToolError"),
     ):
         body = js[js.index(fn_name) : js.index(end)]
-        assert "_endToolGroup()" in body, f"{fn_name} must close the run above it"
+        # `appendToken` passes a reason ("answered") — it is the one appender
+        # whose arrival also says the run did not sink the turn. This guard is
+        # about CLOSING the run, so accept either call shape.
+        assert re.search(r'_endToolGroup\((\)|"answered"\))', body), f"{fn_name} must close the run above it"
     # And a fresh/cleared transcript starts with no run open, or the first card
     # of the next conversation would join the last one's group.
     for clear in re.finditer(r'\$\("chat-messages"\)\.innerHTML = "";', js):
@@ -1918,7 +2049,15 @@ def test_tool_group_css_uses_ds_tokens_only():
     block = css[css.index(".cloud-chat-tool-group {") : css.index(".cloud-chat-tool-group-body > .cloud-chat-tool")]
     assert re.search(r"#[0-9a-fA-F]{3,8}\b", block) is None, "raw hex — the group is --ds-* like everything else"
     assert "var(--primary)" not in block, "the design system's token is --ds-primary"
-    assert "--ds-accent-danger-line" in block and "--ds-accent-success-line" in block
+    assert "--ds-accent-danger-line" in block
+    # Success takes -ink, not -line, for the same reason the CARD's is-done does
+    # (see the WCAG 1.4.11 note above .cloud-chat-tool.is-running): the group
+    # icon is the only thing carrying the run's status, and success-line
+    # measures 3.30:1 — over the 3:1 floor, but by too little for the state a
+    # reader sees on almost every turn. The group was left behind when the card
+    # was fixed; -line here would be that regression coming back.
+    assert "--ds-accent-success-ink" in block
+    assert "--ds-accent-success-line" not in block
 
 
 # ── the composer must not grow over the transcript ─────────────────────────
@@ -1965,7 +2104,7 @@ def test_a_follow_up_label_can_shrink_inside_a_narrow_bubble():
     is load-bearing."""
     js = Path("app/web/static/js/chat.js").read_text(encoding="utf-8")
     block = js.split('label.className = "rdb-action-title"', 1)[0][-600:]
-    assert 'rdb-action-txt' in block, (
+    assert "rdb-action-txt" in block, (
         "the follow-up title must be wrapped in .rdb-action-txt — without it "
         "a nowrap, non-shrinking label overflows the bubble"
     )
