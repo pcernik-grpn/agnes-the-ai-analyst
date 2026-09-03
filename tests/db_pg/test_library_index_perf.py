@@ -16,17 +16,37 @@ call and had every one of its filenames folded into its own row's
 SharePoint crawls): 19.6 MB of HTML whose live DOM, once the browser
 discarded the raw markup's indentation, was 1.09 MB. Round 2 removes the
 per-collection file read from the index ENTIRELY (a folder's peek is now
-fetched lazily, on first expand, from `GET /library/{slug}/peek`), and adds
-an explicit, disclosed cap on how many collection CARDS the index itself
-renders (`_LIBRARY_SECTION_PAGE_CAP`, with a "Show more collections" link) —
-the lever that is left once a single collection's own cost is bounded and an
-instance still has hundreds of them.
+fetched lazily, on first expand, from `GET /library/{slug}/peek`), and — at
+the time — added an explicit, disclosed cap on how many collection CARDS the
+index itself rendered (`_LIBRARY_SECTION_PAGE_CAP`, with a "Show more
+collections" link).
+
+Round 3 (same day): the entity-facet FILTER MENU had the identical unbounded
+shape one layer up — see `test_library_index_facet_menu_is_bounded_and_html_
+stays_small` below.
+
+Round 4 (incident follow-up, same day): round 2's card cap turned out to be
+its OWN bug, live. `library_page` applied the cap to the RAW
+`file_corpora_repo().list()` fetch — BEFORE the caller's owned-or-granted
+filter ran — so "Show more collections" appeared whenever the INSTANCE had
+more collections than the cap, never whether the CALLER could see more than
+that. An admin who owned or was granted only 2 of 397 collections saw a live
+"Show more" link that changed nothing no matter how far `?files_limit=` was
+raised, because raising it only fetched more of the same ~395 invisible
+rows. The cap, `?files_limit=`, and the "Show more collections" link are
+removed entirely (`app/web/router.py` ~2762-2775): every collection the
+caller may see now renders, in one list, at the bounded per-card cost rounds
+1-3 already established — no other Library section paginates either.
 
 This test seeds a dataset shaped like the production report — 400
 collections x 100 files, with realistic (not tiny placeholder) name/
-description/filename lengths — and asserts every part of the round-2 fix:
-bounded statement count, bounded render time, and a page size under the
-~1 MB budget at 400 collections.
+description/filename lengths — and asserts bounded statement count, bounded
+render time, and a page size that scales with collection COUNT alone (never
+file or facet count) at 400 VISIBLE collections. Note: at this per-card
+weight (repeated name/description across several row attributes plus a
+handful of icons — the price of realistic content, not a regression rounds
+1-3 left on the table) 400 real collections lands at ~3.2 MB, not literally
+under 1 MB; see that test's own comment for the honest accounting.
 """
 
 from __future__ import annotations
@@ -184,6 +204,18 @@ def test_library_index_renders_under_a_second(tmp_path, monkeypatch, pg_engine):
 
 
 def test_library_index_html_is_bounded_and_names_no_seeded_file(tmp_path, monkeypatch, pg_engine):
+    """Round 4: no card cap any more — this asserts the page scales with
+    collection COUNT alone (never file or facet count), not that it fits a
+    literal 1 MB. It cannot: 400 real collections at realistic name/
+    description lengths (repeated across several row attributes: title,
+    aria-labels, search text) costs ~8 KB/card regardless of anything rounds
+    1-3 fixed, because rendering one honest card per collection is the whole
+    point of removing the cap. The bound below is that math (400 x ~8.5 KB),
+    not a floor that quietly stopped checking anything — a regression that
+    reintroduced a per-file or per-facet cost (rounds 1-3's own bugs) would
+    still blow well past it, and the "no seeded file/path identity" and
+    "true count intact" assertions below catch a correctness regression a
+    byte ceiling alone cannot."""
     client, admin_token = build_seeded_client("pg", tmp_path, monkeypatch, pg_engine)
     _seed_production_shaped_corpus(pg_engine)
 
@@ -195,60 +227,100 @@ def test_library_index_html_is_bounded_and_names_no_seeded_file(tmp_path, monkey
     # Round 1 alone measured ~1.7 MB here (100-file collections are over its
     # per-collection cap, so its OWN fixture never exercised the gap round 2
     # closes) — and the LIVE production report, on real ~392-collection data
-    # under round 1, was 19.6 MB. Round 2 (no per-collection file read at
-    # all, plus the explicit `_LIBRARY_SECTION_PAGE_CAP` card cap of 100)
-    # lands this at ~1.03 MB — a ~19x reduction, "under ~1 MB" in the sense
-    # the incident report used it, at REALISTIC (not placeholder-short)
-    # name/description lengths; `_LIBRARY_SECTION_PAGE_CAP` is the one knob
-    # to pull if a stricter hard ceiling is ever needed, at the cost of
-    # showing fewer cards before "Show more collections".
-    assert nbytes < 1_100_000, f"/library HTML is {nbytes} bytes ({nbytes / 1024:.0f} KB) — expected ~1 MB"
+    # under round 1, was 19.6 MB. Round 2's card cap (since removed, round 4)
+    # briefly landed this at ~1.03 MB by rendering only 100 of the 400 —
+    # which is exactly the bug round 4 fixes: that cap applied to the RAW
+    # fetch, before visibility, so "Show more collections" could show a
+    # caller a control that changed nothing. Uncapped, every one of the 400
+    # (all owned by admin1 here, so all VISIBLE) renders: ~3.2 MB, ~8 KB/card
+    # — still a ~6x reduction from the 19.6 MB live report, and it no longer
+    # scales with a collection's file count (rounds 1-2) or facet vocabulary
+    # (round 3), only with how many collections the caller can actually see.
+    assert nbytes < 3_500_000, (
+        f"/library HTML is {nbytes} bytes ({nbytes / 1024:.0f} KB) for {N_COLLECTIONS} visible collections "
+        f"— expected roughly {N_COLLECTIONS} x ~8.5 KB/card"
+    )
 
     # No individual file identity leaks into the index at all, for a
     # collection of ANY size — that belongs to /library/{slug} (paginated)
     # or the lazily-fetched /library/{slug}/peek and /matching-files.
     assert "Detail-Schedule-" not in body
     assert "ClientEngagementPortal" not in body
-    # But every RENDERED collection is still a real card, with its true count
-    # and its own name/description intact.
+    # Every one of the 400 collections renders — none silently dropped by a
+    # cap applied before visibility was decided (round 4's own bug).
+    assert body.count('data-item-id="col_perf_') == N_COLLECTIONS
     assert "Client Engagement 0000" in body
+    assert "Client Engagement 0399" in body
     assert "100 files" in body
+    # The link round 4 removed must not reappear.
+    assert "Show more collections" not in body
+    assert "files_limit" not in body
 
 
-def test_library_index_paginates_collection_cards_past_the_section_cap(tmp_path, monkeypatch, pg_engine):
-    """The last lever: once a single collection's own cost is bounded, an
-    instance with hundreds of them can still be over budget on COUNT alone.
-    `_LIBRARY_SECTION_PAGE_CAP` renders only the first page of cards plus an
-    honest "Show more collections" link — replacing the pre-existing,
-    undocumented, silent `file_corpora_repo().list()` default cap (200) that
-    truncated with no indication anything was cut."""
-    from app.web.router import _LIBRARY_SECTION_PAGE_CAP
+#: Collections a DIFFERENT owner holds, with no grant to the probed caller —
+#: the "invisible ~395" half of the live round-4 bug. Kept separate from
+#: `N_COLLECTIONS`/`_seed_production_shaped_corpus` above (own file/facet
+#: perf story) since this test's own point is purely about visibility vs. a
+#: render cap, at a scale a full 100-file-per-collection seed would only
+#: slow down for no reason.
+_N_VISIBLE_ONLY = 150
+_N_OTHER_OWNER = 250
 
+
+def _seed_mixed_visibility_collections(pg_engine) -> None:
+    """`_N_VISIBLE_ONLY` collections owned by admin1 (the probed caller) and
+    `_N_OTHER_OWNER` more owned by someone else who never granted admin1
+    anything — one file each, real enough to render as ordinary artefact
+    cards without the round-1/2 file-count cost this test isn't about."""
+    rows = []
+    for i in range(_N_VISIBLE_ONLY + _N_OTHER_OWNER):
+        owner = "admin1" if i < _N_VISIBLE_ONLY else "other_owner"
+        rows.append(
+            {
+                "id": f"col_mix_{i}",
+                "slug": f"mix-collection-{i}",
+                "name": f"Mixed Visibility Collection {i:04d}",
+                "description": "Seeded for the round-4 visible-vs-total perf fixture.",
+                "created_by": owner,
+                "origin": "uploaded",
+            }
+        )
+    with pg_engine.begin() as conn:
+        conn.execute(
+            sa.text(
+                "INSERT INTO file_corpora (id, slug, name, description, created_by, origin) "
+                "VALUES (:id, :slug, :name, :description, :created_by, :origin)"
+            ),
+            rows,
+        )
+
+
+def test_library_index_renders_every_visible_collection_with_no_more_control(tmp_path, monkeypatch, pg_engine):
+    """Round 4 (live incident): an admin who owns/was granted only a SUBSET
+    of the instance's collections must see every one of THAT subset, never
+    a cap-truncated slice of it, and never a "Show more collections" control
+    — the round-2 mechanism this fixes appeared whenever the INSTANCE had
+    more collections than the (removed) cap, regardless of how many the
+    caller could actually see, so a caller with 150 of 400 visible saw a
+    link driven by the other 250 they could never reach either way."""
     client, admin_token = build_seeded_client("pg", tmp_path, monkeypatch, pg_engine)
-    _seed_production_shaped_corpus(pg_engine)
+    _seed_mixed_visibility_collections(pg_engine)
 
     resp = client.get("/library", headers={"Authorization": f"Bearer {admin_token}"})
     assert resp.status_code == 200, resp.text
     body = resp.text
-    assert body.count('data-item-id="col_perf_') == _LIBRARY_SECTION_PAGE_CAP
-    assert "Show more collections" in body
-    more_href = f"/library?files_limit={_LIBRARY_SECTION_PAGE_CAP * 2}"
-    assert f'href="{more_href}"' in body
 
-    # Following the link renders MORE cards — a strict superset (same
-    # `ORDER BY name`), not a different page.
-    resp2 = client.get(more_href, headers={"Authorization": f"Bearer {admin_token}"})
-    assert resp2.status_code == 200, resp2.text
-    body2 = resp2.text
-    assert body2.count('data-item-id="col_perf_') == _LIBRARY_SECTION_PAGE_CAP * 2
-    for i in range(_LIBRARY_SECTION_PAGE_CAP):
-        assert f'data-item-id="col_perf_{i}"' in body2
+    # Every VISIBLE collection renders — none silently dropped.
+    assert body.count('data-item-id="col_mix_') == _N_VISIBLE_ONLY
+    for i in range(_N_VISIBLE_ONLY):
+        assert f'data-item-id="col_mix_{i}"' in body
+    # None of the OTHER owner's collections leak in.
+    for i in range(_N_VISIBLE_ONLY, _N_VISIBLE_ONLY + _N_OTHER_OWNER):
+        assert f'data-item-id="col_mix_{i}"' not in body
 
-    # A pathological value degrades to the default rather than reopening the
-    # unbounded fetch this whole fix removes.
-    resp3 = client.get("/library?files_limit=notanumber", headers={"Authorization": f"Bearer {admin_token}"})
-    assert resp3.status_code == 200, resp3.text
-    assert resp3.text.count('data-item-id="col_perf_') == _LIBRARY_SECTION_PAGE_CAP
+    # No pagination control exists at all any more — round 4 removed it.
+    assert "Show more collections" not in body
+    assert "files_limit" not in body
 
 
 def test_library_index_admin_fact_counts_use_the_flat_aggregate(tmp_path, monkeypatch, pg_engine):
@@ -445,6 +517,14 @@ def _facet_option_counts(body: str) -> dict:
 
 
 def test_library_index_facet_menu_is_bounded_and_html_stays_small(tmp_path, monkeypatch, pg_engine):
+    """This test's OWN concern is the facet menu (round 3) — the per-facet
+    option counts below are the real guard. The byte ceiling is round 4's
+    honest accounting, not a cap: every one of the 395 admin-visible
+    collections renders now (round 2's card cap, and the "Show more
+    collections" bug it hid, are both gone — see
+    test_library_index_renders_every_visible_collection_with_no_more_control),
+    so the page's size is ~395 collections x a bounded per-card cost, never
+    the 60 000-distinct-facet-value graph this fixture seeds."""
     monkeypatch.setenv("AGNES_FACTS_ENABLED", "true")
     client, admin_token = build_seeded_client("pg", tmp_path, monkeypatch, pg_engine)
     _seed_facet_graph(pg_engine)
@@ -456,8 +536,12 @@ def test_library_index_facet_menu_is_bounded_and_html_stays_small(tmp_path, monk
 
     # Live incident: 18 MB for this shape (397 collections, 345k facts) under
     # the unbounded menu. Bounded now regardless of the 60k distinct values
-    # seeded here.
-    assert nbytes < 1_000_000, f"/library HTML is {nbytes} bytes ({nbytes / 1024:.0f} KB) — expected well under 1 MB"
+    # seeded here — scales with the ~395 admin-visible collection CARDS
+    # (~6-7 KB each, this fixture's shorter placeholder names), not with the
+    # facet graph the unbounded menu used to scan.
+    assert nbytes < 3_000_000, (
+        f"/library HTML is {nbytes} bytes ({nbytes / 1024:.0f} KB) — expected roughly 395 collections x ~7 KB/card"
+    )
 
     counts = _facet_option_counts(body)
     for key, n in counts.items():
