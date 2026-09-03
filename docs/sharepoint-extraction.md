@@ -108,34 +108,96 @@ spot-check shows pseudonyms, not names.
   worker's own lane count, at roughly 2 GB reserved per in-flight file. The
   run's `concurrency.source` reports `"memory_budget"` when this fired, next
   to `"config"`/`"payload"`/`"adaptive"`.
-- **Split one large site across several connections**, each with its own
-  crawl and facts jobs so they run in parallel instead of one connection's
-  worth of concurrency working through the whole site sequentially. Two
-  paths to the same shape — manual (below) or automated (further down):
-  1. `POST /api/admin/sharepoint/connections/{id}/clone` or `agnes admin
-     sharepoint connection clone <connection_id> --name <name>` — a sibling
-     connection wired to the SAME tenant/client identity and certificate/
-     client-secret (a vault-stored one is copied verbatim, never decrypted;
-     an env-var-sourced one resolves on its own — either way the clone is
-     immediately ready to crawl, no re-upload) and site/host discovery
-     bookkeeping (notably `manual_sites` — required under `Sites.Selected`,
-     where `/sites` enumeration is 403-forbidden and a bookmarked site is
-     the only way to resolve it at all), with zero scopes.
-  2. `POST …/scopes/bulk` or `agnes admin sharepoint scope bulk-add
-     <connection_id> --path "Folder A" --path "Folder B/Sub" [--drive-id
-     <id>]` (or `--paths-file split.json`, a JSON list or `{"paths":
-     [...]}`) — confirms every path as a scope in one call, reporting
-     created/skipped/already-failed paths independently rather than
-     all-or-nothing. By default each path still mints its own collection —
-     add `--collection-id <id>` (an existing, live collection) or
-     `--collection-name <name>` (mint one) to route every scope THIS call
-     creates to ONE shared collection instead, so the split site still
-     reads, shares and selects in chat as a single collection rather than
-     one per scope.
-  3. Repeat 1-2 per clone, splitting the site's top-level folders across
-     however many connections the crawl needs to parallelize over — reuse
-     the SAME `--collection-id` across connections to keep the whole site
-     in one collection.
+- **Large sites shard themselves automatically** (2026-09-03
+  auto-parallel-crawl design) — an admin never has to split a site by hand
+  and merge the results back afterwards. When a connection's estimated
+  document total is over `extraction.crawler.shard_target_docs` (default
+  5000; `0` disables sharding entirely — every site crawls sequentially,
+  today's pre-2026-09 behaviour, and is what a DuckDB-backed instance
+  always does — this feature is PG-only, A3 ratchet), the very next
+  `POST …/extract` becomes a short PLANNER instead of crawling itself: it
+  packs the site into K shards (top-level folders grouped by a live Graph
+  Search document count, one held back as a "remainder" shard for loose
+  root files and anything created after planning), opens ONE parent
+  `extraction_runs` row, and enqueues K `corpus-extraction-shard` child
+  jobs — each with its OWN convert pool, its OWN per-delta-unit crawl
+  state, and its OWN run row — that write into the connection's EXISTING
+  collection. No clone, no consolidate, one connection to watch.
+
+  Preview what a trigger would plan right now, without triggering
+  anything: `GET /api/admin/sharepoint/connections/{id}/shard-plan
+  [?min_modified=YYYY-MM-DD]` (`agnes admin sharepoint shard-plan
+  <connection_id> [--min-modified YYYY-MM-DD] [--json]`), or the source
+  card's **Parallel crawl — preview shards…** control. Response:
+  `{mode: "inline"|"sharded", target_docs, signal, shards: [{drive_id,
+  index, label, expected, targets_count}], loose_root_files}` —
+  `expected` is a live count, always shown "≈", never exact.
+
+  **Per-site operator controls fan out to every shard unchanged:**
+  - `resync` drops every shard's cursor AND the persisted plan itself, so
+    the next trigger both re-enumerates from scratch and re-plans fresh.
+  - `force_reprocess` / `retry_failed` / `retry_empty` / `concurrency` /
+    `timeout_s` on `POST …/extract` fan out to every child as-is —
+    `retry_failed`/`retry_empty` replay each shard's OWN backlog (scoped
+    by its own delta-unit keys, never another shard's), and `timeout_s`
+    bounds each CHILD independently, not the run as a whole.
+  - `POST …/extraction/stop` sets ONE cooperative flag; every child stops
+    at its own next checkpoint boundary.
+  - `shards: [i, ...]` (1-based) on `POST …/extract` re-runs only the
+    named shard indices from the connection's LAST persisted plan —
+    opening a fresh parent run scoped to just those shards, never
+    re-planning — the supported replacement for "re-run one clone" below.
+  - `409 extraction_already_running` while the site's TOP-LEVEL run row is
+    still `running` — a sharded site's run is not "done" until its LAST
+    child finishes, even though the triggering job (the planner) itself
+    finished the moment it enqueued the children.
+
+  **Observability**: the fleet dashboard and the source card's Run row
+  both gain a "k/K shards" badge/line for a sharded site, and a per-shard
+  breakdown (label, outcome, absolute files done/seen, the live "≈"
+  expected count, checkpoint age, a stuck flag, and any error) — a shard
+  CHILD never appears as its own row anywhere; only the parent (planner)
+  run does.
+
+  **Migrating an instance with manual split connections** (the pre-2026-09
+  workflow below): nothing breaks on upgrade — each clone auto-shards on
+  its own if it is itself large, and the original connection's whole-drive
+  cursor seeds its own remainder shard, so re-ingesting nothing is a no-op.
+  To fold everything back onto one connection: delete the clone
+  connections (their scopes go with them), `POST …/collections/consolidate`
+  on the original to fold the now-orphaned per-folder collections into its
+  own, then `POST …/extract` — the planner shards it automatically and
+  already-ingested documents upsert to a no-op on `(collection,
+  stable_id)`. To keep every part's crawl/facts progress instead of
+  re-downloading, fold with `POST …/connections/{id}/splits/merge` (below)
+  FIRST — it unions each sibling's scopes and progress onto the target —
+  then trigger the target.
+
+- **Manual multi-connection split (deprecated).** `GET …/split-plan`
+  (`agnes admin sharepoint split-plan`) / `POST …/splits` (`agnes admin
+  sharepoint split`) — the pre-2026-09 way to parallelize a big crawl by
+  hand: clone the connection N times (`POST …/clone` / `agnes admin
+  sharepoint connection clone <connection_id> --name <name>` — a sibling
+  wired to the SAME tenant/client identity and certificate/client-secret,
+  with zero scopes) and bulk-confirm each clone's slice of the site's
+  top-level folders as scopes (`POST …/scopes/bulk` or `agnes admin
+  sharepoint scope bulk-add <connection_id> --path "Folder A" --path
+  "Folder B/Sub" [--drive-id <id>]`, or `--paths-file split.json`), all
+  routed to ONE shared collection by default (`--collection-id <id>` /
+  `--collection-name <name>` for an explicit target, mutually exclusive
+  with each other and with `--per-folder-collections`, which restores the
+  OLD one-collection-per-folder default). Superseded by automatic sharding
+  above for its original purpose (parallelizing one big crawl) — kept as a
+  migration-window escape hatch only: `POST …/splits` answers with a
+  `Deprecation: true` response header, and both endpoints are slated for
+  removal after one release. `GET …/split-plan`'s response gains one
+  ADDITIVE field, `mode` (the SAME verdict `shard-plan` would give this
+  connection right now — an informational hint, `null` if it could not be
+  computed). `409 split_exists` refuses a repeat `POST …/splits` under
+  names that already exist. The SharePoint connection card's legacy split
+  panel (**Legacy: create N connections manually (deprecated)…**, behind
+  the **Parallel crawl — preview shards…** control) still previews and
+  applies it from the browser.
 
   **Already split without the shared-collection option?** `POST
   …/connections/{id}/collections/consolidate` or `agnes admin sharepoint
@@ -190,48 +252,6 @@ spot-check shows pseudonyms, not names.
   filter", next to "Facts policy") sets it directly — widening the date
   later needs a "Re-enumerate from scratch" run afterwards, since the
   delta cursor has already moved past whatever the old cutoff skipped.
-- **Or let Agnes do the split for you.** `GET /api/admin/sharepoint
-  /connections/{id}/split-plan?n=<n>[&min_modified=YYYY-MM-DD][&drive_id=<id>]`
-  (`agnes admin sharepoint split-plan <connection_id> --n <n> [--min-modified
-  YYYY-MM-DD] [--json]`) previews a greedy-packed split of the drive root's
-  top-level folders into `n` groups of roughly equal document count (a live
-  Graph Search count per folder — never a delta walk, which throttles under
-  repetition and biases its own first pages), and reports any file sitting
-  directly at the drive root (`loose_root_files`) that a folder-based split
-  — this one, and the manual clone + `scopes/bulk` recipe above — can never
-  cover. A folder whose count could not be read is still assigned to a
-  group, at `documents: 0`, never dropped from the plan. The SharePoint
-  connection card's own **Split this site…** control (Actions menu, or the
-  same-named button on the card body) previews and applies this from the
-  browser. `POST …/splits` (`agnes admin sharepoint split <connection_id>
-  --n <n> [--min-modified YYYY-MM-DD] [--transport sync|batch] [--retry-mode
-  off|on_gate_fail|always] [--start]`) then creates all `n` clones AND their
-  scopes in one call — the same `clone` + `scopes/bulk` primitives above,
-  run automatically — named `"<source name> — part i/n"`; `409 split_exists`
-  if a split under those names already exists, so a repeat call never
-  double-creates. `--min-modified` lands on each clone's own
-  `config.extraction.crawl.min_modified` above; `--transport`/`--retry-mode`
-  land on each clone's `config.extraction.facts`, the same keys
-  `facts-config` writes. `--start` enqueues each clone's crawl immediately
-  after creating it, in creation order, skipped silently (never a failed
-  apply) when extraction readiness is not currently satisfied.
-
-  **Every part's scopes route to ONE shared collection by default** — a
-  site of 400 folders no longer becomes 400 collections nobody has a grant
-  to. The default reuses this connection's own collection when it has
-  exactly one confirmed scope carrying one (the common "not yet split"
-  shape), otherwise mints one collection named after it — the SAME
-  "assign the precomputed `collection_id` directly" mechanism `scopes/bulk`
-  already uses for its own `--collection-id` option, never a second one.
-  `--collection-id <id>` / `--collection-name <name>` on `split`/`split-plan`
-  name an explicit shared target instead (mutually exclusive with each other
-  and with `--per-folder-collections`; `404 collection_not_found` for an
-  unknown `--collection-id`); `--per-folder-collections` restores the OLD
-  default (every folder mints its own, one collection per folder — the
-  manual clone+bulk-add recipe's shape when `--collection-id` is omitted).
-  Every part also records `config.split = {parent_connection_id, part, n,
-  created_at}` — read by `collections consolidate --site` above to find
-  every part of the split.
 - Webhooks for near-real-time updates: mint the secret
   (`POST …/webhook`), then `POST …/subscriptions/ensure` — Agnes owns the
   Graph subscription lifecycle including renewals

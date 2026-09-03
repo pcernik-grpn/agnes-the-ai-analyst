@@ -145,6 +145,12 @@ includes `shards[]`), `tests/test_admin_extraction.py`, `tests/test_admin_extrac
 **Tests:** parent counters = sum of children; `stuck` per shard and on the row; a child
 never appears as a fleet row; inline runs unchanged (snapshot of existing expectations).
 
+**Done** (PR #2216). Also fixed a real gap found along the way:
+`ExtractionRunsPgRepository._RUN_LIST_COLUMNS` never selected `shards_total`/
+`shards_done`, so every LIST-shaped read (fleet, history) silently reported a sharded
+site as `mode: "inline"` — caught by the new tests, fixed in the same repo file, and
+pinned by a dedicated regression test in `tests/db_pg/test_extraction_runs_pg.py`.
+
 ### Task 9 — Preview endpoint, deprecations, CLI
 **Files:** `app/api/admin_sharepoint.py` (magnet — append `GET …/shard-plan`; `split-plan`
 delegates; `POST …/splits` adds `Deprecation: true` header), `cli/commands/admin_sharepoint.py`
@@ -152,6 +158,18 @@ delegates; `POST …/splits` adds `Deprecation: true` header), `cli/commands/adm
 (+ endpoint tests file used by the split work).
 **Acceptance:** `shard-plan` returns spec §4.7 shape; old callers of `split-plan` see an
 unchanged response plus `mode`.
+
+**Done** (PR #2216). `GET …/split-plan` keeps its EXACT pre-existing request/response
+shape (still `--n`-driven) plus the additive `mode` hint, rather than becoming a literal
+proxy for `shard-plan` — the two answer different questions (an admin-chosen N-way pack
+vs. the automatic planner's own decision) and the acceptance criterion itself ("old
+callers … see an unchanged response plus mode") only requires the additive field.
+`connectors/sharepoint/crawler.py::preview_shard_plan` is new, appended (never touching
+the already-merged Tasks 1-7 code), reusing `compute_shard_plan`/`_drive_targets` so a
+preview can never disagree with what a real trigger would plan. Tests: new
+`TestShardPlanPreview` in `tests/test_sharepoint_crawler.py`, `TestShardPlan` in
+`tests/test_admin_sharepoint.py`, `tests/db_pg/test_sharepoint_shard_plan_route_pg.py`
+(new file — the PG-only sharded happy path), `tests/test_cli_admin_sharepoint.py`.
 
 ### Task 10 — UI: fleet shard rows + source card + retire the split control
 **Files:** `app/web/templates/admin_extraction.html` (badge + disclosure row per site,
@@ -163,12 +181,22 @@ with "Parallel crawl — preview shards" calling `shard-plan`; drop `applySpSpli
 **Tests (node-extracted, existing pattern):** row shows "3/8 shards"; shard row renders
 `≈ expected`, outcome, stuck; no "Create N connections" button remains in the template.
 
+**Done** (PR #2216), with one deliberate deviation from "drop `applySpSplit`": the
+governing task instructions for this build required keeping it reachable — never
+deleted, "the endpoint still exists" — behind an explicit **Legacy: create N connections
+manually (deprecated)…** link under the new **Parallel crawl — preview shards…**
+control, consistent with `POST …/splits` answering `Deprecation: true` rather than being
+removed outright. `applySpSplit`/`toggleSpSplitRow`/the manual split panel are otherwise
+untouched.
+
 ### Task 11 — Docs, config example, CHANGELOG
 **Files:** `docs/sharepoint-extraction.md` (replace the "Split one large site" recipe
 with the automatic behaviour + migration path §5), `docs/api-reference.md`,
 `config/instance.yaml.example` (`shard_target_docs` next to `crawler.concurrency`),
 `CHANGELOG.md` (one Added bullet, one Deprecated bullet for `splits`/`split-plan`).
 **Acceptance:** `scripts/verify_syncmap.py` clean; no customer-specific wording.
+
+**Done** (PR #2216).
 
 ## Out of scope
 Cross-shard load rebalancing while running; sharding for non-SharePoint sources; removing
