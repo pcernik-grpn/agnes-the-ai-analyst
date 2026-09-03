@@ -411,6 +411,8 @@ function _extRunRowHtml(connId, st) {
         ${stopBtn}
         <button type="button" class="btn btn-secondary" onclick="toggleExtractionDrawer('${connId}', 'runs')"
                 ${total ? "" : "disabled"}>Run history (${total})</button>
+        <a class="btn btn-secondary" href="/admin/extraction"
+           title="Every connection's crawl and facts extraction on one screen — phase, pace, spend, and what looks stuck.">All connections</a>
       </div>`;
 
   return `

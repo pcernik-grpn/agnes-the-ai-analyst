@@ -41,7 +41,9 @@ who receives it:
   per connection's crawl + facts pass — phase, files done/seen, a derived
   files/min, facts done/pending, token spend, estimated cost, and a "stuck?"
   flag on a checkpoint stale past 10 minutes. Defaults to connections with a
-  run active right now; `?all=1` shows every connection.
+  run active right now; `?all=1` shows every connection (reached from the
+  *All connections* button in a SharePoint source card's Run row on
+  `/admin/data-sources`).
 
 ### Access
 

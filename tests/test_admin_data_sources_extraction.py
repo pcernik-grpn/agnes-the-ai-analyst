@@ -388,6 +388,21 @@ class TestRunRow:
         assert "no longer reporting" in html
         assert "no checkpoint for 4200s" in html
 
+    def test_the_run_row_carries_the_door_to_the_fleet_dashboard(self):
+        """`/admin/extraction` is off-nav (see `ADMIN_NAV_OFFNAV`): its ONLY
+        door is this row. Drawn for a live run and for a connection that
+        never ran — "how are all of them doing" is a fair question in every
+        state, and a door that exists only sometimes is a page that is
+        sometimes unreachable."""
+        never_ran = {"running": None, "last_completed": None, "runs_total": 0, "can_stop": False}
+        for state in (_state(data=_RUNNING), _state(data=never_ran)):
+            out = _run_js(
+                'console.log(JSON.stringify({html: _extRunRowHtml("sp1", _extState["sp1"])}));',
+                state=state,
+            )
+            assert 'href="/admin/extraction"' in out["html"]
+            assert "All connections" in out["html"]
+
     def test_never_run_says_so_instead_of_showing_zeros(self):
         out = _run_js(
             'console.log(JSON.stringify({html: _extRunRowHtml("sp1", _extState["sp1"])}));',

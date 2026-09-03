@@ -43,6 +43,24 @@ class TestExtractionFleetPageNav:
         entry = next((e for e in ADMIN_NAV_OFFNAV if e["href"] == "/admin/extraction"), None)
         assert entry is not None, "/admin/extraction must be in ADMIN_NAV_OFFNAV with a reached_from"
         assert entry["reached_from"]
+        assert "pending" not in entry["reached_from"], entry
+
+    def test_the_source_card_is_the_door(self):
+        """The off-nav record names the source card's Run row as the door;
+        the template has to actually carry it. The generic guard in
+        `tests/test_web_admin_nav.py` checks every off-nav page has SOME
+        literal link — this pins WHICH template, so the door cannot quietly
+        migrate to a page an operator watching a crawl never opens."""
+        from pathlib import Path
+
+        # The Run row is drawn by the source card's externalized script
+        # (`data_sources_extraction_observability.js`), so that is where the
+        # literal door has to live — the template only loads the script.
+        tpl = Path("app/web/templates/admin_data_sources.html").read_text(encoding="utf-8")
+        assert "data_sources_extraction_observability.js" in tpl
+        script = Path("app/web/static/js/admin/data_sources_extraction_observability.js").read_text(encoding="utf-8")
+        assert 'href="/admin/extraction"' in script
+        assert "All connections" in script
 
     def test_visiting_the_page_lights_the_data_section(self):
         from app.web.admin_nav import resolve_active_section_key

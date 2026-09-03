@@ -575,12 +575,18 @@ ADMIN_NAV_OFFNAV: list[dict] = [
         # connection for an operator running several crawl + facts passes at
         # once. Same off-nav shape as /admin/sync — a status view an operator
         # is SENT to, not a lens they pick among Sources/Tables/Packages.
-        # Intended entry point is a link from each source card's per-
-        # connection extraction status on /admin/data-sources (that page is
-        # under active, separate edit as this lands — wire the link there
-        # once both changes have merged); reachable directly at
-        # /admin/extraction in the interim.
-        "reached_from": "a link from each source card's extraction status (/admin/data-sources) — pending",
+        # The door is the "All connections" button in every SharePoint
+        # source card's Run row on /admin/data-sources — next to "Run
+        # history", because "how is THIS one doing" and "how are ALL of them
+        # doing" are the same question asked at two widths.
+        #
+        # This entry first shipped with a "pending" door and no link
+        # anywhere, which left the page reachable only by typed URL —
+        # exactly what this inventory exists to prevent. `tests/
+        # test_web_admin_nav.py` now requires every off-nav href to be a
+        # literal `href` in some template, so a promise no longer passes
+        # as a door.
+        "reached_from": 'the "All connections" button in each source card\'s Run row (/admin/data-sources)',
     },
     {
         "href": "/admin/semantic-layer",
