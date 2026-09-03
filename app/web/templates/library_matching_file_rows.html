@@ -1,0 +1,12 @@
+{# The file rows of one collection that a live Library search matched — an
+   HTML FRAGMENT, not a page: bare <tr>s, injected into the folder's own
+   <tbody> by library.html (see `loadMatches`).
+
+   It imports `library_row` from the page rather than restating the markup,
+   which is the whole reason this is a server fragment instead of a
+   JavaScript row builder: a file row states its own sharing, its format, its
+   glyph and its Stack membership, and a second builder would have been a
+   second answer to each of those. `with context` hands the macro the same
+   page-level values the full render gives it (see the route). #}
+{% from "library.html" import library_row with context %}
+{%- for c in rows %}{{ library_row(c, child=True, last_child=loop.last) }}{% endfor %}
