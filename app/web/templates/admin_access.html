@@ -2491,19 +2491,20 @@
   /* Selected, the description is as legible as the label it belongs to —
      muted-on-muted made the active tab look half-disabled. */
   .ax-by .tab-strip__item[aria-selected="true"] .ax-by__for { color: var(--ds-text-secondary); }
-  /* The person tab's line carries two things — what the lens answers, and
-     the capability that makes it a different KIND of tab (audit I3). The
-     separator is a rendered element rather than a character in the string,
-     so it can be spaced evenly and can carry the border colour; typed into
-     the text it sat tight against the word before it and loose after. */
-  .ax-by__kind { font-size: 11.5px; }
-  .ax-by__sep { margin: 0 5px; color: var(--ds-border); }
+  /* `.ax-by__kind` / `.ax-by__sep` stood here — the person tab's line used
+     to carry a second clause, "view as them", after a separator. All three
+     tabs say one thing now: what their lens answers. The capability itself
+     is not hidden by this — the pane's own primary action is a "View a page
+     as them" button, and the tab keeps the `title` that names it — but the
+     STRIP no longer advertises it, which is a step back from audit I3's
+     "the strip says what makes this one a different kind of tab". A
+     deliberate one: two clauses made this tab visibly wider than its
+     siblings and the separator was the thing being read. */
   @media (max-width: 720px) {
-    /* On a narrow strip the second line goes — from EVERY tab, not just
-       this one. Hiding only the person tab's left it a line shorter than
-       its siblings, which is precisely the uneven strip an earlier attempt
-       at these tabs produced and was reverted for. The title attribute
-       still carries the sentence. */
+    /* On a narrow strip the second line goes — from EVERY tab. Hiding one
+       tab's left it a line shorter than its siblings, which is precisely
+       the uneven strip an earlier attempt at these tabs was reverted for.
+       The title attribute still carries the sentence. */
     .ax-by__for { display: none; }
   }
   /* The collapsed inherited rows. Muted and italic-free — a summary of rows,
@@ -2811,7 +2812,7 @@
             data-by="person" aria-selected="false" aria-controls="ax-pane-sim" tabindex="-1"
             title="Pick a person and see the product as they see it">
       <span class="ax-by__lbl">By person <span class="tab-strip__n ax-by__n" data-by-n="person"></span></span>
-      <span class="ax-by__for ax-by__kind">what one person ends up with<span class="ax-by__sep" aria-hidden="true">·</span>view as them</span>
+      <span class="ax-by__for">what one person ends up with</span>
     </button>
   </nav>
 </div>

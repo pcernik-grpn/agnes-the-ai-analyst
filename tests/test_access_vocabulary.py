@@ -837,17 +837,41 @@ class TestThePersonTabSaysWhatKindOfTabItIs:
         assert 'role="tab"' in tab and 'aria-controls="ax-pane-sim"' in tab
 
     def test_and_says_what_it_does(self):
-        """Every tab now says what its lens is for — the sentence that used
-        to be a lede under the strip, swapping with the lens and changing
-        height as it did. The person tab's line keeps naming the capability
-        that makes it a different KIND of tab (audit I3)."""
+        """Every tab says what its lens is for — the sentence that used to be
+        a lede under the strip, swapping with the lens and changing height as
+        it did.
+
+        The person tab's line no longer carries a second clause naming the
+        view-as capability. That is a step back from this class's premise
+        ("the strip says what makes it a different kind"), taken
+        deliberately: two clauses made this tab visibly wider than its
+        siblings and the separator became the thing being read. The
+        capability is not hidden — the tab keeps the `title` that names it,
+        and the pane's own primary action is a "View a page as them" button
+        — but it is no longer advertised in the strip. If the lens ever gets
+        hard to find again, this is the line that gave way.
+        """
+        import re
+
         src = self._source()
-        assert "view as them</span>" in src
-        assert "ax-by__for ax-by__kind" in src, "it keeps its own gloss class"
         assert 'title="Pick a person and see the product as they see it"' in src
-        # And the other two say what they are for, in the tab rather than under it.
+        # Comments stripped: the note has to keep NAMING the retired clause
+        # to explain what gave way and why. What must not survive is a
+        # rendered one.
+        text = re.sub(r"\{#.*?#\}", "", src, flags=re.S)
+        text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
+        text = re.sub(r"(?m)^\s*//.*$", "", text)
+        assert "view as them" not in text
+        # All three say what they are for, in the tab rather than under it.
+        assert "what one person ends up with" in src
         assert "what one group can reach" in src
         assert "who can reach one thing" in src
+
+    def test_the_view_as_action_is_still_reachable_from_the_lens(self):
+        """What the tab stopped advertising, the pane still offers — and it
+        is the pane's PRIMARY action, not a link buried in it."""
+        src = self._source()
+        assert "View a page as them" in src
 
 
 class TestTheAdminGroupNamesTheModeItsGrantsDependOn:
