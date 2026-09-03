@@ -1573,13 +1573,39 @@
 
     setPeopleHead("Loading…", "Who this group reaches.");
     host.innerHTML = `<div class="ax-res__msg">Loading who is in this group…</div>`;
+    /* A FAILED read is not an empty group (#2140).
+
+       This used to be `r.ok ? await r.json() : []` with a `catch` that also
+       said `[]`, so a 500, a dropped connection and a genuinely empty group
+       arrived here as the same value — and the empty state below is not a
+       shrug, it is a policy assertion: "anything granted under Access
+       reaches no one until someone is added". A live instance showed it
+       under a header reading "6 people · 7 granted", an inch apart on the
+       same screen. An admin who believes the empty state re-adds members or
+       widens grants to compensate; one who believes the header concludes the
+       opposite. On the page whose job is answering who can use what, the two
+       sources of truth disagreed, confidently.
+
+       So the failure keeps its own value, and — this is the half that made
+       it stick — it is NOT cached. Caching `[]` meant collapsing and
+       reopening the group could not recover: one bad response poisoned the
+       group for the rest of the sitting. */
     let members = membersCache.get(selectedGroup);
+    let membersFailed = false;
     if (!members) {
       try {
         const r = await fetch(`/api/admin/groups/${encodeURIComponent(selectedGroup)}/members`, { credentials: "include" });
-        members = r.ok ? await r.json() : [];
-      } catch (e) { members = []; }
-      membersCache.set(selectedGroup, members);
+        if (r.ok) {
+          members = await r.json();
+          membersCache.set(selectedGroup, members);
+        } else {
+          membersFailed = true;
+          members = [];
+        }
+      } catch (e) {
+        membersFailed = true;
+        members = [];
+      }
     }
     if (selectedGroup !== (group && group.id)) return; // selection moved on
     memberIds = new Set(members.map((m) => m.user_id));
@@ -1589,8 +1615,10 @@
     const inactive = members.filter((m) => m.active === false).length;
     const active = members.length - inactive;
     setPeopleHead(
-      members.length ? `${members.length} ${members.length === 1 ? "member" : "members"}` : "Nobody",
-      "Who this group reaches.", peopleFaces(members));
+      membersFailed ? "Unknown"
+        : members.length ? `${members.length} ${members.length === 1 ? "member" : "members"}` : "Nobody",
+      membersFailed ? "This group's members could not be read." : "Who this group reaches.",
+      membersFailed ? "" : peopleFaces(members));
 
     // The find box comes FIRST in the body: at any real group size, "is
     // Maria in here?" is asked more often than the whole list is read, and
@@ -1608,6 +1636,19 @@
            <div class="ax-pop" id="ax-find-out" role="listbox" hidden></div>
          </div>`;
 
+    /* Reserved for a group the server POSITIVELY reports as empty. The
+       sentence makes a claim about who can reach what, and it may only be
+       made from an answer. */
+    if (membersFailed) {
+      host.innerHTML = `
+        <div class="dsec-empty">
+          <strong>Couldn’t load who is in this group</strong>
+          The grants below still apply — this is the member list failing, not
+          the group emptying.
+          <button type="button" class="ax-linkbtn" data-retry-members>Try again</button>
+        </div>`;
+      return;
+    }
     if (!members.length) {
       host.innerHTML = find + `
         <div class="dsec-empty">
@@ -2602,7 +2643,42 @@
      it fifteen times and finding your place again. */
   let nobodyOpen = false;
   //: Category runs folded away in the bundle list, by kind.
+  /* ── What a collapsed section costs ──────────────────────────────
+     Nothing now. It used to cost everything.
+
+     This function built the HTML for EVERY row it could show — every
+     ungranted one into the "Granted to nobody" drawer, every kind run
+     regardless of size — and handed the lot to `innerHTML`. A closed
+     `<details>` still parses its children into the DOM, so "collapsed by
+     default" bought the reader nothing: the work was already done.
+
+     That held while every grantable kind was admin-curated. `corpus_file`
+     is not: it is one item per crawled file, so the list became the size
+     of the crawl. Measured against a seeded 30,000 files — 4.25 MB of
+     payload, 751,665 DOM nodes, the tab wedged for over 45 seconds. The
+     live report that found this (#2140's sibling) had ~211,000.
+
+     So a run decides its own default from its own size, and an open run
+     renders a bounded number of rows and says so. Neither number is a
+     guess about the machine: they are the point past which a list stops
+     being readable, which is a lower bound than the point past which it
+     stops rendering. */
+  //: A run this size or smaller opens on arrival; a bigger one waits to be
+  //: asked. Twenty-five is about a screenful.
+  const RUN_OPEN_MAX = 25;
+  //: Rows built for one open run. Past this the run says what it is holding
+  //: back and how to narrow it, rather than rendering a wall or lying by
+  //: omission.
+  const RUN_RENDER_CAP = 200;
+  //: Runs the reader explicitly closed, and explicitly opened. Two sets, not
+  //: one: without the second, opening a big run could not outrank the
+  //: size default, and the click would appear to do nothing.
   const shutKinds = new Set();
+  const openedKinds = new Set();
+  const runIsShut = (kindKey, size) => (
+    openedKinds.has(kindKey) ? false
+      : shutKinds.has(kindKey) ? true
+        : size > RUN_OPEN_MAX);
 
   function renderBundles() {
     const host = el("ax-groups");
@@ -2614,6 +2690,16 @@
     // Only the kinds an admin hands out as a unit lead this view (the shared
     // `BUNDLE_LEAD`). The rest are reachable in the group view; leading with
     // 600 tables would bury the four rows that carry the decision.
+    /* Grants indexed once, by the pair a row is keyed on. This used to be a
+       `.filter()` over every grant INSIDE the item loop — fine at a few
+       dozen items, quadratic at the size `corpus_file` reaches, and it ran
+       before anything had a chance to collapse. */
+    const heldBy = new Map();
+    for (const g of (overview.grants || [])) {
+      const k = `${g.resource_type}\u0000${g.resource_id}`;
+      const at = heldBy.get(k);
+      if (at) at.push(g); else heldBy.set(k, [g]);
+    }
     const rows = [];
     for (const t of (overview.resources || [])) {
       if (!BUNDLE_LEAD.has(t.type_key)) continue;
@@ -2622,9 +2708,7 @@
         for (const i of (b.items || [])) {
           const hay = `${i.name || ""} ${i.slug || ""} ${i.resource_id || ""} ${i.owner_email || ""} ${b.name || ""} ${t.type_display || ""}`.toLowerCase();
           if (q && !hay.includes(q)) continue;
-          const held = (overview.grants || []).filter(
-            (g) => g.resource_type === t.type_key && g.resource_id === i.resource_id);
-          rows.push({ t, b, i, held });
+          rows.push({ t, b, i, held: heldBy.get(`${t.type_key}\u0000${i.resource_id}`) || [] });
         }
       }
     }
@@ -2804,6 +2888,25 @@
       </details>`;
     };
 
+    /* An open run renders at most `RUN_RENDER_CAP` rows and then SAYS SO.
+       Silently truncating would be the worse half of the bug this replaces:
+       a reader who cannot find a file would conclude it is not granted,
+       from a list that had simply stopped early. The line names the real
+       total and the two controls that narrow it. */
+    const cappedRuns = (list, kindDisplay) => {
+      const shown = list.slice(0, RUN_RENDER_CAP);
+      const hidden = list.length - shown.length;
+      const body = shown.map(section).join("");
+      if (!hidden) return body;
+      /* The kind's own word where there is one ("…of 30,010 files"); nothing
+         where the list is already mixed, because the drawer below holds
+         several kinds and naming one of them would be wrong. */
+      const word = kindDisplay ? ` ${String(kindDisplay).toLowerCase()}` : "";
+      return body + `<div class="ax-res__msg ax-more">Showing ${RUN_RENDER_CAP}
+        of ${list.length.toLocaleString()}${esc(word)} — search by name, or
+        narrow with Filter, to find a specific one.</div>`;
+    };
+
     // "2 data packages, 4 agents" — counted by kind, because "9 things" is
     // not a sentence anyone can act on.
     const tally = new Map();
@@ -2824,7 +2927,7 @@
           <span class="ax-nobody__hint">Authored, then never handed to anyone.</span>
           <span class="ax-nobody__more">${nobodyOpen ? "Hide" : "Show them"}</span>
         </summary>
-        <div>${nobody.map(section).join("")}</div>
+        <div>${nobodyOpen ? cappedRuns(nobody, "") : ""}</div>
       </details>` : "";
 
     /* Grouped, not alphabetical. A flat A-Z list interleaves a plugin, a
@@ -2847,20 +2950,26 @@
       const kindRank = new Map((overview.resources || []).map((t, i) => [t.type_key, i]));
       mine.sort((a, b) => (kindRank.get(a.t.type_key) ?? 99) - (kindRank.get(b.t.type_key) ?? 99)
         || byName(a, b));
-      let lastKind = null;
-      const body = mine.map((r) => {
-        const shut = shutKinds.has(r.t.type_key);
-        const head = r.t.type_key !== lastKind
-          ? `<button type="button" class="fbar-grouptoggle ax-kindrun" data-kindrun="${esc(r.t.type_key)}"
-                     data-kind="${esc(kindToken(r.t))}" aria-expanded="${shut ? "false" : "true"}">
+      /* The runs, built as runs. They used to be a flat list with a header
+         injected wherever the kind changed, which meant a run never knew
+         its own size — and a run has to know that to decide whether it
+         opens, and to say how much it is holding back. */
+      const runs = [];
+      for (const r of mine) {
+        const last = runs[runs.length - 1];
+        if (last && last.t.type_key === r.t.type_key) last.items.push(r);
+        else runs.push({ t: r.t, items: [r] });
+      }
+      const body = runs.map((run) => {
+        const shut = runIsShut(run.t.type_key, run.items.length);
+        const head = `<button type="button" class="fbar-grouptoggle ax-kindrun" data-kindrun="${esc(run.t.type_key)}"
+                     data-kind="${esc(kindToken(run.t))}" aria-expanded="${shut ? "false" : "true"}">
                <svg class="fbar-group__caret" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m6 9 6 6 6-6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
-               <span class="fbar-group__title">${esc(r.t.type_display)}</span>
-               <span class="fbar-group__n">${mine.filter((x) => x.t.type_key === r.t.type_key).length}</span>
-               ${r.t.type_description ? `<span class="fbar-group__hint ax-kindcaveat">${esc(r.t.type_description)}</span>` : ""}
-             </button>`
-          : "";
-        lastKind = r.t.type_key;
-        return head + (shut ? "" : section(r));
+               <span class="fbar-group__title">${esc(run.t.type_display)}</span>
+               <span class="fbar-group__n">${run.items.length}</span>
+               ${run.t.type_description ? `<span class="fbar-group__hint ax-kindcaveat">${esc(run.t.type_description)}</span>` : ""}
+             </button>`;
+        return head + (shut ? "" : cappedRuns(run.items, run.t.type_display));
       }).join("");
       return `
       <div class="ax-fam">
@@ -3108,6 +3217,13 @@
       return;
     }
 
+    // The retry offered by the members error state. Nothing to invalidate —
+    // a failed read is never cached — so this is simply the read again.
+    if (e.target.closest("[data-retry-members]")) {
+      renderMembers();
+      return;
+    }
+
     const nobodySum = e.target.closest("[data-nobody] > summary");
     if (nobodySum) {
       // Let <details> toggle natively; record which way, so the repaint after
@@ -3115,15 +3231,23 @@
       // waiting for that repaint — a native toggle does not trigger one, so
       // the summary would otherwise still read "Show them" while open.
       nobodyOpen = !nobodySum.parentElement.hasAttribute("open");
-      const more = nobodySum.querySelector(".ax-nobody__more");
-      if (more) more.textContent = nobodyOpen ? "Hide" : "Show them";
+      // The rows inside are built only while this is open (see `nobodyLine`),
+      // so a native toggle is no longer enough — opening has to ask for them.
+      renderBundles();
       return;
     }
 
     const kindRun = e.target.closest("[data-kindrun]");
     if (kindRun) {
       const k = kindRun.dataset.kindrun;
-      if (shutKinds.has(k)) shutKinds.delete(k); else shutKinds.add(k);
+      // `aria-expanded` is what the run currently IS, whichever way it got
+      // there — the size default included. Reading the DOM rather than the
+      // sets is what makes one click always do the opposite of what the
+      // reader can see.
+      const wasOpen = kindRun.getAttribute("aria-expanded") === "true";
+      shutKinds.delete(k);
+      openedKinds.delete(k);
+      (wasOpen ? shutKinds : openedKinds).add(k);
       renderBundles();
       return;
     }
@@ -4456,6 +4580,19 @@
      where its tag happens to sit, and the `readyState` branch means a
      module that lands after DOMContentLoaded still boots immediately.
      (/admin/users/{id} already does exactly this, for the same reason.) */
+  /* The end of the loading state, both halves of it: the skeleton's
+     `aria-busy` comes off the list, and the work panel — hidden so a
+     template "Pick a group" card would not sit beside a list that has not
+     arrived — becomes visible. Called on BOTH exits from the fetch, because
+     a page stuck mid-skeleton after a failure is the state #2140 item 2 was
+     reported against, only worse. */
+  const settled = () => {
+    const list = el("ax-groups");
+    if (list) list.removeAttribute("aria-busy");
+    const work = el("ax-work");
+    if (work) work.hidden = false;
+  };
+
   const bootWhenReady = (fn) => (document.readyState === "loading"
     ? document.addEventListener("DOMContentLoaded", fn, { once: true })
     : fn());
@@ -4468,10 +4605,12 @@
     } catch (e) {
       // The header must not sit at "Pick a group" over a list that has given
       // up — that reads as "there are no groups", not as "this failed".
+      settled();
       el("ax-what-title").textContent = "Access unavailable";
       el("ax-groups").innerHTML = `<div class="ax-empty">Could not load access data (${esc(e.message)}).</div>`;
       return;
     }
+    settled();
     // Which group opens, in falling order of how explicit the ask was:
     //   1. ?group=<id> — a deep link, the only one someone TYPED (the retired
     //      /admin/access?group= URL used to land on a group's Access tab, so

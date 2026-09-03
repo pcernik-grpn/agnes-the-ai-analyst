@@ -779,6 +779,30 @@
   .ax-onebar { align-items: center; gap: 10px; }
   .ax-onebar .fbar__search { flex: 0 1 26rem; min-width: 0; }
   .ax-filter { margin-right: auto; }
+
+  /* The loading state (#2140 item 2). Bars the size of the rows they stand
+     in for — an avatar, a name, a count — so the list does not jump when the
+     real ones arrive. The pulse is one shared animation on the container, not
+     one per bar, and it stops entirely under reduced motion: a moving page is
+     the wrong thing to hand someone who asked for stillness, and a static bar
+     still reads as "not yet". */
+  .ax-skel { display: grid; gap: 8px; padding: 4px 0; }
+  .ax-skel__say { position: absolute; width: 1px; height: 1px; overflow: hidden;
+    clip: rect(0 0 0 0); clip-path: inset(50%); white-space: nowrap; }
+  .ax-skel__row { display: flex; align-items: center; gap: 12px;
+    padding: 14px 12px; border: 1px solid var(--ds-border); border-radius: 10px;
+    background: var(--ds-surface); }
+  .ax-skel__b { display: block; height: 12px; border-radius: 6px;
+    background: var(--ds-border); animation: ax-skel-pulse 1.4s ease-in-out infinite; }
+  .ax-skel__b--ava { width: 24px; height: 24px; border-radius: 50%; flex: 0 0 auto; }
+  .ax-skel__b--nm { width: 168px; }
+  .ax-skel__b--nm2 { width: 124px; }
+  .ax-skel__b--nm3 { width: 196px; }
+  .ax-skel__b--n { width: 56px; margin-left: auto; }
+  @keyframes ax-skel-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.45; } }
+  @media (prefers-reduced-motion: reduce) {
+    .ax-skel__b { animation: none; }
+  }
   .ax-onebar .ax-gnew { margin: 0; white-space: nowrap; }
 
   .ax-gs { border-top: 1px solid var(--ds-border); }
@@ -2649,7 +2673,23 @@
       <span class="ax-count" id="ax-count"></span>
       <div class="fbar-chips ax-chips" id="ax-chips" hidden></div>
     </div>
-    <div id="ax-groups"><div class="ax-empty">Loading groups…</div></div>
+    {# A loading state, not a sentence floating over a page that looks
+       broken. It used to render the whole chrome — header, tabs, search —
+       and then one line of small type above an already-visible "Pick a
+       group" card with its section rows showing, which reads as a render
+       that failed rather than one that has not arrived (#2140 item 2).
+       Rows the size of real rows, in the place real rows go: the page's
+       shape is the same before and after, so nothing jumps. `aria-busy`
+       and the visually-hidden line are what a screen reader gets, since
+       the bars themselves say nothing. #}
+    <div id="ax-groups" aria-busy="true">
+      <div class="ax-skel" role="status">
+        <span class="ax-skel__say">Loading groups…</span>
+        <div class="ax-skel__row"><span class="ax-skel__b ax-skel__b--ava"></span><span class="ax-skel__b ax-skel__b--nm"></span><span class="ax-skel__b ax-skel__b--n"></span></div>
+        <div class="ax-skel__row"><span class="ax-skel__b ax-skel__b--ava"></span><span class="ax-skel__b ax-skel__b--nm2"></span><span class="ax-skel__b ax-skel__b--n"></span></div>
+        <div class="ax-skel__row"><span class="ax-skel__b ax-skel__b--ava"></span><span class="ax-skel__b ax-skel__b--nm3"></span><span class="ax-skel__b ax-skel__b--n"></span></div>
+      </div>
+    </div>
 
     {# ONE panel, three regions divided by hairlines. It was a single
        undifferentiated flow (identity, avatars, a disclosure, a
@@ -2665,7 +2705,10 @@
      function below keeps working untouched; only its parent changes. It is
      parked here whenever nothing is open. #}
   <div id="ax-work-park" hidden></div>
-  <div class="ax-work" id="ax-work">
+  {# Hidden until the first render. Showing "Pick a group" with its
+     People/Access rows already drawn, beside a list that has not arrived,
+     invites the reader to click a card that is not about anything yet. #}
+  <div class="ax-work" id="ax-work" hidden>
       {# STICKY identity. The question this page answered worst was "which
          group am I editing?" — the name scrolled away the moment you reached
          the grant tree, which is the tallest thing on the page. The fact
