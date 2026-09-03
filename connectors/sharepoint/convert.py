@@ -21,9 +21,12 @@ Routing
 ``errors="replace"``) — matching the crawler's historical ``TEXT_SUFFIXES``
 behaviour, so a re-crawl produces byte-identical extractions. ``.pdf`` goes to
 pypdfium2. The legacy Office / OpenDocument suffixes markitdown cannot read
-directly — ``.doc/.rtf/.odt``, ``.ppt/.odp``, ``.xls/.ods`` — are first
-re-saved by headless LibreOffice into the OOXML sibling markitdown already
-handles (docx/pptx/xlsx respectively), then routed through the same
+directly — ``.doc/.rtf/.odt``, ``.ppt/.odp``, ``.xls/.ods``, and (not
+"legacy" by vintage, but the same "markitdown/openpyxl cannot read this one
+directly" constraint — live finding 2026-09, 155 ``.xlsb`` + 21 ``.xlsm``
+failures) ``.xlsb/.xlsm`` — are first re-saved by headless LibreOffice into
+the OOXML sibling markitdown already handles (docx/pptx/xlsx respectively;
+both ``.xlsb`` and ``.xlsm`` target ``xlsx``), then routed through the same
 markitdown call as everything else; the run is reported as
 ``"libreoffice+markitdown"`` so a downstream reader can tell it from a direct
 markitdown conversion. Everything else goes to markitdown directly. The
@@ -115,6 +118,15 @@ MIN_PDF_TEXT_CHARS = 16
 #: format headless LibreOffice must produce so markitdown can take over —
 #: never a second, competing reader, just a re-save into the format the
 #: existing route already handles.
+#:
+#: ``.xlsb``/``.xlsm`` ride the same map for a DIFFERENT reason — they are
+#: not pre-2007 legacy formats, ``.xlsb`` is Excel's binary (non-XML) OOXML
+#: sibling and ``.xlsm`` is the macro-enabled OOXML sibling — but openpyxl
+#: (markitdown's xlsx backend) cannot read the binary container at all and
+#: fails on some macro-enabled workbooks the same way, live finding 2026-09:
+#: 155 ``.xlsb`` + 21 ``.xlsm`` failures on a real crawl. LibreOffice reads
+#: both natively, so the fix is the identical re-save-then-markitdown route,
+#: just targeting the same ``xlsx`` a plain ``.xls`` already does.
 LEGACY_OFFICE_TARGETS: dict[str, str] = {
     ".doc": "docx",
     ".rtf": "docx",
@@ -123,6 +135,8 @@ LEGACY_OFFICE_TARGETS: dict[str, str] = {
     ".odp": "pptx",
     ".xls": "xlsx",
     ".ods": "xlsx",
+    ".xlsb": "xlsx",
+    ".xlsm": "xlsx",
 }
 LEGACY_OFFICE_SUFFIXES = frozenset(LEGACY_OFFICE_TARGETS)
 
@@ -403,8 +417,9 @@ def _convert_legacy_office(path: Path, filename: str, suffix: str) -> str:
     Shells out to headless LibreOffice (``soffice --headless --convert-to
     <target> --outdir <tmpdir> <file>``) to re-save the file into the OOXML
     sibling markitdown already handles — ``.doc/.rtf/.odt`` → docx,
-    ``.ppt/.odp`` → pptx, ``.xls/.ods`` → xlsx — in a throwaway temp dir that
-    is ALWAYS removed, success or failure. ``soffice`` missing from ``PATH``
+    ``.ppt/.odp`` → pptx, ``.xls/.ods/.xlsb/.xlsm`` → xlsx — in a throwaway
+    temp dir that is ALWAYS removed, success or failure. ``soffice`` missing
+    from ``PATH``
     raises the same typed :class:`MissingConversionDependency` a missing
     Python backend would, naming ``"libreoffice"``, so the file is COUNTED as
     a named conversion failure exactly like a missing markitdown today —

@@ -349,6 +349,65 @@ _DEFAULT_ITEM_TIMEOUT_S = 300
 #: so a future change to either cannot silently make this one decorative
 #: again.
 _DEFAULT_MAX_CONVERTED_MB = 8
+#: Suffixes (no leading dot, lower-case) a real crawl has observed failing
+#: `markitdown`'s conversion attempt on EVERY item of that type, identically,
+#: forever — live deployment finding 2026-09: 868 persisted retry-queue
+#: entries were mp4 (78), m4a (21), ipynb (17), vtt (7), pbix (4), vsdx (6)
+#: and more, each re-downloaded and re-attempted on every crawl until
+#: :data:`_MAX_ITEM_RETRY_ATTEMPTS` gave up, then sitting in the state file
+#: forever. Checked in :func:`_process_item` BEFORE any download or convert
+#: attempt (see the check just after the size cap) — distinct from
+#: `convert_unsupported` (`connectors.sharepoint.convert.
+#: UnsupportedConversionFormat`), which is markitdown itself discovering
+#: mid-conversion that no backend `accepts()` a format it was not known in
+#: advance to reject; both land in the SAME `skipped_unsupported` counter and
+#: `skipped_items` list (never `errors`/`convert_failed`, never the retry
+#: queue), because both mean "nothing was attempted". ``.zip`` is
+#: DELIBERATELY absent: markitdown converts a zip's members and a live
+#: corpus indexed 1,577 of them cleanly — an extension failing here is a
+#: property of the FORMAT, not of "unusual to see in a document library".
+#: Additive-only via ``extraction.crawler.unsupported_extensions`` — see
+#: :func:`_unsupported_extensions`.
+_DEFAULT_UNSUPPORTED_EXTENSIONS = frozenset(
+    {
+        # audio / video containers — no text content, no codec markitdown reads
+        "mp4",
+        "m4a",
+        "mp3",
+        "mov",
+        "wav",
+        "avi",
+        "mkv",
+        "wmv",
+        "flv",
+        "webm",
+        # notebooks / source code — markitdown has no backend for these
+        "ipynb",
+        "sql",
+        "py",
+        # subtitles
+        "vtt",
+        "srt",
+        # BI / diagramming formats with no text extraction path
+        "pbix",
+        "vsdx",
+        # vector graphics — markup, not prose
+        "svg",
+        # fonts
+        "ttf",
+        "otf",
+        "woff",
+        "woff2",
+        "eot",
+        # executables / native binaries
+        "exe",
+        "dll",
+        "so",
+        "dylib",
+        "bin",
+        "msi",
+    }
+)
 #: Delta page size asked of Graph — also the RESUME-STATE checkpoint
 #: granularity (deltaLink + cTags, `_crawl_drive`): that one stays exactly
 #: here, load-bearing for the resume contract. The run recorder's PROGRESS
@@ -1143,6 +1202,14 @@ class CrawlStats:
     #: Uncapped count behind :attr:`skipped_items`, mirroring
     #: :attr:`_failed_items_seen`.
     _skipped_items_seen: int = field(default=0, repr=False, compare=False)
+    #: :attr:`skipped_unsupported`, broken down by suffix (no leading dot,
+    #: lower-case; ``""`` for a file with none) — every
+    #: :meth:`note_skipped_unsupported` call bumps this, whether the item was
+    #: classified by :data:`_DEFAULT_UNSUPPORTED_EXTENSIONS` before any
+    #: download, or discovered mid-conversion via
+    #: ``UnsupportedConversionFormat``. Uncapped: the key space is bounded by
+    #: distinct extensions actually seen, never by item count.
+    skipped_unsupported_by_extension: Dict[str, int] = field(default_factory=dict)
     #: Delta rows this run has ENUMERATED and rows it has FINISHED handling.
     #: Not in :meth:`report` — the report's contract is unchanged — but read
     #: by the run recorder so a live run has honest ABSOLUTE counters (a
@@ -1364,6 +1431,8 @@ class CrawlStats:
                 }
             )
             del self.skipped_items[_FAILED_ITEMS_CAP:]
+            ext_key = (suffix or "").lower().lstrip(".")
+            self.skipped_unsupported_by_extension[ext_key] = self.skipped_unsupported_by_extension.get(ext_key, 0) + 1
 
     def enter_item_activity(self, path: str) -> int:
         """One file's download/convert/ingest pipeline STARTING, for the
@@ -1440,6 +1509,9 @@ class CrawlStats:
             # Never an error — see `skipped_unsupported`'s docstring: no
             # backend was even attempted, so nothing failed.
             "skipped_unsupported": self.skipped_unsupported,
+            # Same total, broken down by suffix — see
+            # `skipped_unsupported_by_extension`'s docstring.
+            "skipped_unsupported_by_extension": dict(self.skipped_unsupported_by_extension),
             "excluded_subtree_skips": self.excluded_subtree_skips,
             "permission_skips": self.permission_skips,
             "filtered_by_age": self.filtered_by_age,
@@ -2289,6 +2361,24 @@ class _Ingestor:
         """Store + upsert + (re)ingest one converted document.
 
         Returns ``(file_id, was_new)``.
+
+        Raises when ``ingest_file`` itself marks the row ``rejected`` (a
+        chunking/storage-layer failure on already-converted text — e.g. a
+        PostgreSQL ``text`` column refusing a stray control character, live
+        finding 2026-09: 261 documents). ``ingest_file`` catches its own
+        failures and never raises, which is correct for the ``corpus_files``
+        row (an admin reading Collections must see WHY it is rejected), but
+        this method staying equally silent would strand the document: the
+        CALLER (``_process_item``) persists this item's cTag unconditionally
+        right after ``ingest()`` returns, and Graph's delta feed only
+        re-offers an item once it CHANGES upstream — so a rejected document
+        would never come back around on a normal re-crawl, forever, with
+        nothing wrong with the SOURCE file at all. Raising here instead
+        routes it through ``_process_item``'s existing ``ingest_failed``
+        handling: :func:`_note_retry` queues it for every future run
+        regardless of what delta reports, exactly like a download or convert
+        failure, until it either succeeds or exhausts
+        :data:`_MAX_ITEM_RETRY_ATTEMPTS`.
         """
         from app.api.collections import _upsert_corpus_file
         from src.file_storage import store_corpus_bytes
@@ -2322,7 +2412,13 @@ class _Ingestor:
             # `store_corpus_bytes` just wrote — a redundant full-size copy of
             # the converted markdown, on a parent thread, that this crawl's
             # own memory-pressure finding named as a contributor.
-            ingest_file(file_id, preloaded_text=markdown)
+            status = ingest_file(file_id, preloaded_text=markdown)
+            if status == "rejected":
+                from src.repositories import corpus_files_repo
+
+                row = corpus_files_repo().get(file_id)
+                reason = ((row or {}).get("processing_detail") or {}).get("reason", "unknown reason")
+                raise RuntimeError(f"ingest_file rejected {filename}: {reason}")
         return file_id, not existed
 
     def delete(self, collection_id: str, stable_id: str) -> bool:
@@ -3740,6 +3836,25 @@ async def _process_item(
         logger.info("sharepoint crawl: skipping %s — %s over the %dMB cap", path, human_bytes(size), max_file_mb)
         return
 
+    name_suffix = Path(name).suffix.lower()
+    if name_suffix.lstrip(".") in _unsupported_extensions():
+        # Known-in-advance dead end for the converter (see
+        # `_DEFAULT_UNSUPPORTED_EXTENSIONS`) — classified BEFORE the download
+        # that `convert_unsupported` below still pays for, so a media/BI/
+        # code file never enters the download queue OR the `failed_items`
+        # retry backlog (it would otherwise fail `markitdown` identically on
+        # every future run, forever). Same counters `convert_unsupported`
+        # uses, never `errors`/`convert_failed`.
+        stats.note_skipped_unsupported(
+            path=None if ctx.anonymize else path,
+            item_id=str(item.get("id") or ""),
+            drive_id=target.drive_id,
+            reason="unsupported file type — skipped before download",
+            suffix=name_suffix,
+        )
+        logger.info("sharepoint crawl: skipping %s — unsupported file type, no download attempted", path)
+        return
+
     mime = str((item.get("file") or {}).get("mimeType") or "")
     # In flight from here to the end of the function — the download/convert/
     # ingest span, i.e. the part slow enough to be worth SHOWING an admin
@@ -4641,6 +4756,28 @@ def _max_converted_output_bytes() -> int:
     except (TypeError, ValueError):
         mb = _DEFAULT_MAX_CONVERTED_MB
     return mb * 1024 * 1024
+
+
+def _unsupported_extensions() -> frozenset[str]:
+    """``extraction.crawler.unsupported_extensions`` — ADDITIVE to
+    :data:`_DEFAULT_UNSUPPORTED_EXTENSIONS`, never a replacement: an admin
+    can widen the pre-download skip list for a format this tenant's estate
+    happens to be full of, but cannot narrow the base set — those are a
+    dead end for markitdown regardless of instance. Each configured entry
+    is lower-cased and has any leading dot stripped, so ``"mp4"`` and
+    ``".mp4"`` both work; a value that is not a list, or an entry that is
+    not a non-empty string, is ignored rather than raising — a bad config
+    edit must not take a crawl down.
+    """
+    from app.instance_config import get_value
+
+    raw = get_value("extraction", "crawler", "unsupported_extensions", default=[])
+    extra: set[str] = set()
+    if isinstance(raw, list):
+        for entry in raw:
+            if isinstance(entry, str) and entry.strip():
+                extra.add(entry.strip().lower().lstrip("."))
+    return _DEFAULT_UNSUPPORTED_EXTENSIONS | extra
 
 
 def _crawl_concurrency() -> int:

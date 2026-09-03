@@ -379,6 +379,8 @@ _LEGACY_OFFICE_CASES = [
     (".odp", "pptx"),
     (".xls", "xlsx"),
     (".ods", "xlsx"),
+    (".xlsb", "xlsx"),
+    (".xlsm", "xlsx"),
 ]
 
 
@@ -536,10 +538,51 @@ def test_libreoffice_success_with_no_output_file_raises_conversion_error(tmp_pat
 def test_legacy_office_suffixes_are_exported_and_exact(monkeypatch):
     import connectors.sharepoint.convert as convert_module
 
-    assert convert_module.LEGACY_OFFICE_SUFFIXES == frozenset({".doc", ".rtf", ".odt", ".ppt", ".odp", ".xls", ".ods"})
+    assert convert_module.LEGACY_OFFICE_SUFFIXES == frozenset(
+        {".doc", ".rtf", ".odt", ".ppt", ".odp", ".xls", ".ods", ".xlsb", ".xlsm"}
+    )
     # never overlaps with the routes that already have their own engine
     assert not convert_module.LEGACY_OFFICE_SUFFIXES & convert_module.PASSTHROUGH_SUFFIXES
     assert ".pdf" not in convert_module.LEGACY_OFFICE_SUFFIXES
+    # both target the same OOXML sibling a plain .xls already does
+    assert convert_module.LEGACY_OFFICE_TARGETS[".xlsb"] == "xlsx"
+    assert convert_module.LEGACY_OFFICE_TARGETS[".xlsm"] == "xlsx"
+
+
+def test_missing_soffice_for_xlsb_raises_missing_conversion_dependency_not_a_crash(tmp_path, monkeypatch):
+    """.xlsb (openpyxl cannot read the binary container at all) must fail the
+    SAME attributable, retriable way the pre-2007 legacy formats already do
+    — never an uncaught crash — when LibreOffice is unavailable."""
+    import connectors.sharepoint.convert as convert_module
+
+    path = tmp_path / "workbook.xlsb"
+    path.write_bytes(b"xlsb binary bytes")
+    monkeypatch.setattr(convert_module.shutil, "which", lambda cmd: None)
+
+    with pytest.raises(MissingConversionDependency) as excinfo:
+        convert_to_markdown(path, "application/vnd.ms-excel.sheet.binary.macroenabled.12")
+
+    assert excinfo.value.filename == "workbook.xlsb"
+    assert excinfo.value.package == "libreoffice"
+    assert excinfo.value.engine == "libreoffice+markitdown"
+    assert isinstance(excinfo.value, ConversionError)
+
+
+def test_xlsb_libreoffice_failure_is_a_conversion_error_not_a_crash(tmp_path, monkeypatch):
+    """A non-zero LibreOffice exit on `.xlsb` is an ordinary, attributable
+    `ConversionError` (the crawler's `convert_failed`) — never a crash."""
+    import connectors.sharepoint.convert as convert_module
+
+    path = tmp_path / "workbook.xlsb"
+    path.write_bytes(b"xlsb binary bytes")
+    _stub_soffice(monkeypatch, convert_module, returncode=1, produce_output=False)
+
+    with pytest.raises(ConversionError) as excinfo:
+        convert_to_markdown(path, "application/vnd.ms-excel.sheet.binary.macroenabled.12")
+
+    assert excinfo.value.filename == "workbook.xlsb"
+    assert excinfo.value.engine == "libreoffice+markitdown"
+    assert not isinstance(excinfo.value, MissingConversionDependency)
 
 
 def test_other_suffixes_are_untouched_by_the_legacy_office_route(tmp_path):
