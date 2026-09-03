@@ -2478,20 +2478,33 @@
      changed height as it did, so the list below jumped whenever a reader
      compared two of them. Here the strip is one fixed height whatever is
      selected, and the description is readable BEFORE the click. */
-  .ax-by .tab-strip__item { flex-direction: column; align-items: flex-start; gap: 2px; }
+  .ax-by .tab-strip__item { flex-direction: column; align-items: flex-start; gap: 1px; }
   .ax-by__lbl { display: inline-flex; align-items: center; gap: 6px; }
   .ax-by__for {
     font-size: 11.5px; font-weight: 400; color: var(--ds-text-muted);
     letter-spacing: 0; white-space: nowrap; text-transform: none;
+    /* Tight to the name it belongs to. At the label's own line-height the
+       two read as two separate lines that happen to be stacked; at 1.25
+       they read as one thing with a subtitle, which is what they are. */
+    line-height: 1.25;
   }
   /* Selected, the description is as legible as the label it belongs to —
      muted-on-muted made the active tab look half-disabled. */
   .ax-by .tab-strip__item[aria-selected="true"] .ax-by__for { color: var(--ds-text-secondary); }
+  /* The person tab's line carries two things — what the lens answers, and
+     the capability that makes it a different KIND of tab (audit I3). The
+     separator is a rendered element rather than a character in the string,
+     so it can be spaced evenly and can carry the border colour; typed into
+     the text it sat tight against the word before it and loose after. */
   .ax-by__kind { font-size: 11.5px; }
+  .ax-by__sep { margin: 0 5px; color: var(--ds-border); }
   @media (max-width: 720px) {
-    /* On a narrow strip the gloss is the first thing to go; the title
-       attribute still carries it. */
-    .ax-by__kind { display: none; }
+    /* On a narrow strip the second line goes — from EVERY tab, not just
+       this one. Hiding only the person tab's left it a line shorter than
+       its siblings, which is precisely the uneven strip an earlier attempt
+       at these tabs produced and was reverted for. The title attribute
+       still carries the sentence. */
+    .ax-by__for { display: none; }
   }
   /* The collapsed inherited rows. Muted and italic-free — a summary of rows,
      not a row — with the same faint fill the individual inherited rows had,
@@ -2798,7 +2811,7 @@
             data-by="person" aria-selected="false" aria-controls="ax-pane-sim" tabindex="-1"
             title="Pick a person and see the product as they see it">
       <span class="ax-by__lbl">By person <span class="tab-strip__n ax-by__n" data-by-n="person"></span></span>
-      <span class="ax-by__for ax-by__kind">what one person ends up with · view as them</span>
+      <span class="ax-by__for ax-by__kind">what one person ends up with<span class="ax-by__sep" aria-hidden="true">·</span>view as them</span>
     </button>
   </nav>
 </div>
