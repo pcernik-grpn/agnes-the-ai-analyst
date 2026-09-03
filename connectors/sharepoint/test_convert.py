@@ -384,14 +384,27 @@ _LEGACY_OFFICE_CASES = [
 ]
 
 
-def _stub_soffice(monkeypatch, convert_module, *, returncode=0, produce_output=True, side_effect=None):
+def _stub_soffice(
+    monkeypatch,
+    convert_module,
+    *,
+    returncode=0,
+    produce_output=True,
+    side_effect=None,
+    output_bytes: bytes = b"fake converted bytes",
+):
     """Replace ``soffice`` with a fake that never shells out for real.
 
     Records every invocation's argv and the temp ``--outdir`` it was given
     (so a test can assert the dir is gone afterwards), and — unless told
     otherwise — drops a placeholder output file at the path LibreOffice
     itself would have written, so the caller's glob for the converted file
-    succeeds without a real LibreOffice on the machine.
+    succeeds without a real LibreOffice on the machine. ``output_bytes``
+    defaults to an inert placeholder (fine when the caller of the converted
+    file is ALSO mocked, e.g. ``_convert_markitdown``) — a rescue-chain test
+    reading the converted file for REAL (the CSV/PDF fallback rungs, which
+    read openpyxl/pypdfium2 directly rather than through a mock) passes real
+    xlsx/PDF bytes here instead.
     """
     calls: list[dict] = []
 
@@ -406,7 +419,7 @@ def _stub_soffice(monkeypatch, convert_module, *, returncode=0, produce_output=T
         source = Path(argv[-1])
         calls.append({"argv": argv, "outdir": outdir, "kwargs": kwargs})
         if produce_output:
-            (outdir / f"{source.stem}.{target_format}").write_bytes(b"fake converted bytes")
+            (outdir / f"{source.stem}.{target_format}").write_bytes(output_bytes)
         import subprocess
 
         return subprocess.CompletedProcess(argv, returncode, stdout=b"", stderr=b"")
@@ -414,6 +427,26 @@ def _stub_soffice(monkeypatch, convert_module, *, returncode=0, produce_output=T
     monkeypatch.setattr(convert_module.shutil, "which", _which)
     monkeypatch.setattr(convert_module.subprocess, "run", _run)
     return calls
+
+
+def _xlsx_bytes(sheets: dict[str, list[list[object]]]) -> bytes:
+    """Build a real, tiny multi-sheet ``.xlsx`` in memory with openpyxl (MIT
+    — already a transitive dependency via ``markitdown[all]``, never a new
+    one). Used by the rescue-chain CSV-fallback tests, which read the
+    LibreOffice-produced file with REAL openpyxl rather than a mock."""
+    import io
+
+    import openpyxl
+
+    workbook = openpyxl.Workbook()
+    workbook.remove(workbook.active)
+    for name, rows in sheets.items():
+        sheet = workbook.create_sheet(title=name)
+        for row in rows:
+            sheet.append(row)
+    buf = io.BytesIO()
+    workbook.save(buf)
+    return buf.getvalue()
 
 
 @pytest.mark.parametrize("suffix, target_format", _LEGACY_OFFICE_CASES)
@@ -599,6 +632,294 @@ def test_other_suffixes_are_untouched_by_the_legacy_office_route(tmp_path):
     assert result.engine == "markitdown"
 
 
+# ------------------------------------------------------------ rescue chain
+
+
+def test_xlsx_rescue_chain_resaves_and_retries_once_on_markitdown_failure(tmp_path, monkeypatch):
+    """Rung 1: a genuine markitdown failure on a plain ``.xlsx`` (openpyxl
+    rejects it — the live finding this whole rescue chain exists for) is
+    rescued by a LibreOffice resave-into-xlsx and ONE retry."""
+    import connectors.sharepoint.convert as convert_module
+
+    path = tmp_path / "report.xlsx"
+    path.write_bytes(b"xlsx bytes markitdown rejects on the first try")
+    calls = _stub_soffice(monkeypatch, convert_module)
+
+    attempts: list[Path] = []
+
+    def _fake_markitdown(p, filename):
+        attempts.append(Path(p))
+        if len(attempts) == 1:
+            raise ConversionError(filename, "FileConversionException", engine="markitdown")
+        return "recovered via libreoffice resave"
+
+    monkeypatch.setattr(convert_module, "_convert_markitdown", _fake_markitdown)
+
+    result = convert_to_markdown(path, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+    assert result.engine == "libreoffice_resave+markitdown"
+    assert result.rescue == "libreoffice_resave"
+    assert result.markdown == "recovered via libreoffice resave"
+    # markitdown ran twice: once on the original, once on the resaved copy
+    assert len(attempts) == 2
+    assert attempts[0] == path
+    assert attempts[1] != path and attempts[1].suffix == ".xlsx"
+    # exactly one soffice invocation, resaving to the SAME format (xlsx)
+    assert len(calls) == 1
+    argv = calls[0]["argv"]
+    assert argv[argv.index("--convert-to") + 1] == "xlsx"
+    assert not calls[0]["outdir"].exists()
+
+
+def test_xlsx_rescue_chain_falls_back_to_csv_when_resave_retry_also_fails(tmp_path, monkeypatch):
+    """Rung 2: when the resave-and-retry ALSO fails, a spreadsheet falls
+    back to a LibreOffice-produced ``.xlsx`` read per-sheet as CSV, headed
+    by the sheet name — never ``soffice --convert-to csv`` directly (that
+    would only export the active sheet)."""
+    import connectors.sharepoint.convert as convert_module
+
+    path = tmp_path / "report.xlsx"
+    path.write_bytes(b"xlsx bytes markitdown always rejects")
+    fallback_bytes = _xlsx_bytes({"Summary": [["Region", "Revenue"], ["EMEA", 100]], "Detail": [["Line"], ["one"]]})
+    calls = _stub_soffice(monkeypatch, convert_module, output_bytes=fallback_bytes)
+
+    def _always_fails(p, filename):
+        raise ConversionError(filename, "FileConversionException", engine="markitdown")
+
+    monkeypatch.setattr(convert_module, "_convert_markitdown", _always_fails)
+
+    result = convert_to_markdown(path, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+    assert result.engine == "libreoffice_csv_fallback"
+    assert result.rescue == "csv_fallback"
+    assert "## Summary" in result.markdown
+    assert "EMEA,100" in result.markdown
+    assert "## Detail" in result.markdown
+    assert "one" in result.markdown
+    # two soffice invocations: rung 1's resave-and-retry, then rung 2's own
+    # resave for the csv read — both temp dirs cleaned up
+    assert len(calls) == 2
+    for call in calls:
+        assert not call["outdir"].exists()
+
+
+def test_pptx_rescue_chain_falls_back_to_pdf_when_resave_retry_also_fails(tmp_path, monkeypatch):
+    """Decks/documents fall back to a LibreOffice-produced PDF, run through
+    this module's own PDF route (`pdf_structure`/pypdfium2) rather than a
+    second text extractor."""
+    import connectors.sharepoint.convert as convert_module
+
+    path = tmp_path / "deck.pptx"
+    path.write_bytes(b"pptx bytes markitdown always rejects")
+    pdf_bytes = _build_pdf([[("Quarterly results", 72, 700)]])
+    calls = _stub_soffice(monkeypatch, convert_module, output_bytes=pdf_bytes)
+
+    def _always_fails(p, filename):
+        raise ConversionError(filename, "FileConversionException", engine="markitdown")
+
+    monkeypatch.setattr(convert_module, "_convert_markitdown", _always_fails)
+
+    result = convert_to_markdown(path, "application/vnd.openxmlformats-officedocument.presentationml.presentation")
+
+    assert result.engine == "libreoffice_pdf_fallback"
+    assert result.rescue == "pdf_fallback"
+    assert "Quarterly results" in result.markdown
+    assert len(calls) == 2
+    assert calls[0]["argv"][calls[0]["argv"].index("--convert-to") + 1] == "pptx"
+    assert calls[1]["argv"][calls[1]["argv"].index("--convert-to") + 1] == "pdf"
+
+
+def test_xlsm_already_resaved_skips_rung_one_and_reuses_the_same_file_for_csv_fallback(tmp_path, monkeypatch):
+    """``.xlsm`` already goes through ONE LibreOffice resave via the legacy-
+    office route before markitdown ever sees it — if THAT markitdown
+    attempt fails too, the rescue chain must not pay for a second, redundant
+    resave-and-retry: it escalates straight to the csv fallback rung, which
+    reuses the SAME already-resaved file rather than resaving again."""
+    import connectors.sharepoint.convert as convert_module
+
+    path = tmp_path / "workbook.xlsm"
+    path.write_bytes(b"xlsm bytes markitdown rejects even after the legacy resave")
+    resaved_bytes = _xlsx_bytes({"Data": [["A", "B"], [1, 2]]})
+    calls = _stub_soffice(monkeypatch, convert_module, output_bytes=resaved_bytes)
+
+    def _always_fails(p, filename):
+        raise ConversionError(filename, "FileConversionException", engine="markitdown")
+
+    monkeypatch.setattr(convert_module, "_convert_markitdown", _always_fails)
+
+    result = convert_to_markdown(path, "application/vnd.ms-excel.sheet.macroEnabled.12")
+
+    assert result.engine == "libreoffice_csv_fallback"
+    assert result.rescue == "csv_fallback"
+    assert "## Data" in result.markdown
+    assert "1,2" in result.markdown
+    # ONE soffice call only — the legacy pre-convert to xlsx; the csv
+    # fallback reads that SAME resaved file rather than a second round trip
+    assert len(calls) == 1
+
+
+def test_rescue_chain_reports_every_rungs_last_error_when_all_fail(tmp_path, monkeypatch):
+    """When every rung fails, the raised `ConversionError` must name EACH
+    rung's own last error — not just markitdown's — so the next
+    reconciliation pass can tell WHICH step to fix."""
+    import connectors.sharepoint.convert as convert_module
+
+    path = tmp_path / "report.xlsx"
+    path.write_bytes(b"xlsx bytes")
+    _stub_soffice(monkeypatch, convert_module, returncode=1, produce_output=False)
+
+    def _always_fails(p, filename):
+        raise ConversionError(filename, "FileConversionException: bad zip", engine="markitdown")
+
+    monkeypatch.setattr(convert_module, "_convert_markitdown", _always_fails)
+
+    with pytest.raises(ConversionError) as excinfo:
+        convert_to_markdown(path, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+    message = str(excinfo.value)
+    assert "markitdown: " in message and "bad zip" in message
+    assert "libreoffice resave: " in message
+    assert "csv fallback: " in message
+    assert message.count("exited with status 1") == 2  # rung 1's resave AND rung 2's own
+    assert excinfo.value.filename == "report.xlsx"
+
+
+def test_rescue_chain_never_fires_for_a_non_rescuable_suffix(tmp_path, monkeypatch):
+    """A format outside the rescue chain's suffix maps (``.html``, here)
+    must never even PROBE for LibreOffice on a markitdown failure — the
+    ordinary, immediate `ConversionError` is unchanged."""
+    import connectors.sharepoint.convert as convert_module
+
+    path = tmp_path / "page.html"
+    path.write_text("<html></html>", encoding="utf-8")
+
+    def _boom(p, filename):
+        raise ConversionError(filename, "markitdown could not convert this file", engine="markitdown")
+
+    monkeypatch.setattr(convert_module, "_convert_markitdown", _boom)
+    which_calls: list[str] = []
+    monkeypatch.setattr(convert_module.shutil, "which", lambda cmd: which_calls.append(cmd) or None)
+
+    with pytest.raises(ConversionError):
+        convert_to_markdown(path, "text/html")
+
+    assert which_calls == [], "a non-rescuable suffix must never even check for libreoffice"
+
+
+# ---------------------------------------------------- size-scaled conversion budget
+
+
+def test_conversion_budget_seconds_scales_with_input_size():
+    from connectors.sharepoint.convert import CONVERSION_BUDGET_BASE_SECONDS, conversion_budget_seconds
+
+    assert conversion_budget_seconds(0) == CONVERSION_BUDGET_BASE_SECONDS
+    fifteen_mb = 15 * 1024 * 1024
+    # the live finding this constant is sized against: 221 large xlsx/xlsm
+    # files averaging 15 MB hit the flat 300s budget
+    assert conversion_budget_seconds(fifteen_mb) == pytest.approx(300.0 + 15 * 20.0)
+
+
+def test_conversion_budget_seconds_caps_at_the_ceiling():
+    from connectors.sharepoint.convert import CONVERSION_BUDGET_MAX_SECONDS, conversion_budget_seconds
+
+    huge = 500 * 1024 * 1024
+    assert conversion_budget_seconds(huge) == CONVERSION_BUDGET_MAX_SECONDS
+
+
+def test_conversion_budget_seconds_zero_base_disables_it():
+    from connectors.sharepoint.convert import conversion_budget_seconds
+
+    assert conversion_budget_seconds(15 * 1024 * 1024, base_seconds=0) == 0.0
+
+
+def test_conversion_budget_seconds_respects_a_custom_base():
+    from connectors.sharepoint.convert import conversion_budget_seconds
+
+    assert conversion_budget_seconds(1024 * 1024, base_seconds=120) == pytest.approx(140.0)
+
+
+# ------------------------------------------------------------- xlsx streaming
+
+
+def test_large_xlsx_routes_to_openpyxl_streaming_not_markitdown(tmp_path, monkeypatch):
+    import connectors.sharepoint.convert as convert_module
+
+    path = tmp_path / "huge.xlsx"
+    path.write_bytes(_xlsx_bytes({"Sheet1": [["a", "b"], [1, 2]]}))
+    # force the size-threshold branch regardless of this tiny fixture's real size
+    monkeypatch.setattr(convert_module, "LARGE_XLSX_STREAMING_THRESHOLD_BYTES", 0)
+    markitdown_called: list[int] = []
+    monkeypatch.setattr(convert_module, "_convert_markitdown", lambda p, f: markitdown_called.append(1) or "nope")
+
+    result = convert_to_markdown(path, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+    assert result.engine == "openpyxl_streaming"
+    assert result.rescue == ""
+    assert "## Sheet1" in result.markdown
+    assert "1,2" in result.markdown
+    assert markitdown_called == [], "the whole point of the streaming route is to skip markitdown"
+
+
+def test_large_xlsx_streaming_stops_early_on_a_50k_row_workbook(tmp_path, monkeypatch):
+    """The literal live finding this route exists for: a huge workbook must
+    stop reading once the document-wide char cap is reached, not read every
+    row and truncate afterward — proven here by timing (streaming 50k rows
+    down to a couple thousand characters must stay fast) and by the output
+    staying far short of what reading all 50k rows would produce."""
+    import time
+
+    import openpyxl
+
+    import connectors.sharepoint.convert as convert_module
+
+    path = tmp_path / "wide.xlsx"
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.title = "Rows"
+    row = ["x" * 50] * 10
+    for _ in range(50_000):
+        sheet.append(row)
+    workbook.save(str(path))
+
+    monkeypatch.setattr(convert_module, "LARGE_XLSX_STREAMING_THRESHOLD_BYTES", 0)
+
+    started = time.monotonic()
+    result = convert_to_markdown(
+        path, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", max_chars=2_000
+    )
+    elapsed = time.monotonic() - started
+
+    assert result.engine == "openpyxl_streaming"
+    assert elapsed < 5.0, f"streaming a 50k-row workbook under a small cap took {elapsed:.2f}s"
+    # 50k rows of this shape would produce well over 2.5M raw characters if
+    # read in full — this stays close to the cap, proof the READ stopped
+    # early rather than merely the OUTPUT being cut late
+    assert len(result.markdown) < 50_000
+
+
+def test_large_xlsx_streaming_falls_back_to_libreoffice_resave_on_openpyxl_failure(tmp_path, monkeypatch):
+    """If openpyxl itself cannot open the large file directly, a fresh
+    LibreOffice resave (a clean, re-encoded copy) is tried before giving
+    up — the same CSV-fallback mechanism the rescue chain's rung 2 uses,
+    reached directly here since markitdown is never attempted on this
+    route."""
+    import connectors.sharepoint.convert as convert_module
+
+    path = tmp_path / "huge.xlsx"
+    path.write_bytes(b"not a real xlsx, openpyxl will refuse it")
+    monkeypatch.setattr(convert_module, "LARGE_XLSX_STREAMING_THRESHOLD_BYTES", 0)
+    resaved_bytes = _xlsx_bytes({"Recovered": [["ok"], [1]]})
+    calls = _stub_soffice(monkeypatch, convert_module, output_bytes=resaved_bytes)
+
+    result = convert_to_markdown(path, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+    assert result.engine == "libreoffice_csv_fallback"
+    assert result.rescue == "csv_fallback"
+    assert "## Recovered" in result.markdown
+    assert len(calls) == 1
+    assert calls[0]["argv"][calls[0]["argv"].index("--convert-to") + 1] == "xlsx"
+
+
 # ------------------------------------------------------------------ failures
 
 
@@ -614,11 +935,19 @@ def test_corrupt_pdf_raises_conversion_error_naming_the_file(tmp_path):
     assert excinfo.value.engine == "pypdfium2"
 
 
-def test_corrupt_office_file_raises_conversion_error_naming_the_file(tmp_path):
+def test_corrupt_office_file_raises_conversion_error_naming_the_file(tmp_path, monkeypatch):
     # A truncated OOXML package: the zip header is there, the archive is not.
     # markitdown surfaces this as its own FileConversionException wrapping a
     # zipfile.BadZipFile — one of many backend exception types this module
-    # deliberately funnels into ConversionError.
+    # deliberately funnels into ConversionError. `.xlsx` is rescue-eligible
+    # (see the rescue-chain tests below), so this exercises every rung —
+    # soffice absent here keeps the rescue chain's own subprocess calls out
+    # of this otherwise-hermetic test (a REAL `soffice`, if installed on the
+    # machine running this test, would still fail on this truncated archive,
+    # just slower and non-deterministically so).
+    import connectors.sharepoint.convert as convert_module
+
+    monkeypatch.setattr(convert_module.shutil, "which", lambda cmd: None)
     path = tmp_path / "broken.xlsx"
     path.write_bytes(b"PK\x03\x04\x00\x00truncated archive")
 
