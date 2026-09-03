@@ -52,9 +52,12 @@ before any read-side/UI work; a release can ship after Task 7 with the feature d
 deltaLink; legacy cTag fallback counts `unchanged` without downloading.
 **Acceptance:** `git diff --stat` on `crawler.py` shows no change to the report contract.
 
-### Task 2 — Per-delta-unit state rows + Alembic revision `0102_crawl_shards`
-**Files:** `migrations/versions/0102_crawl_shards.py` (`down_revision =
-"0101_corpus_chunks_fts_index"`), `migrations/shipped_revision_ids.txt`,
+### Task 2 — Per-delta-unit state rows + Alembic revision `0103_crawl_shards`
+**Files:** `migrations/versions/0103_crawl_shards.py` (`down_revision =
+"0102_merge_users_kind_fts"` — the vehicle's head as of 2026-09-03, after
+`origin/main` merged in a competing `0102_merge_users_kind_fts` revision;
+re-check `alembic heads` before writing this file, it may have moved again),
+`migrations/shipped_revision_ids.txt`,
 `src/models/extraction.py`, `src/models/sharepoint_state.py`,
 `src/repositories/sharepoint_state_pg.py` (+`list_kinds(connection_id, prefix)`),
 `src/repositories/extraction_runs_pg.py` (columns only; methods in Task 4),

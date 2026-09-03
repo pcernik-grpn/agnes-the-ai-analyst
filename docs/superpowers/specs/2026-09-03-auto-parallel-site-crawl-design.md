@@ -141,7 +141,9 @@ Planner (in the parent job, `run_builtin_crawl`):
 5. Persist `shard_plan` in the connection's `crawl` state row; re-plan only on `resync`,
    on a scope-set change, or when no plan exists.
 
-### 4.2 Data model (PG-only, one Alembic revision `0102_crawl_shards`)
+### 4.2 Data model (PG-only, one Alembic revision `0103_crawl_shards` — renumbered
+from `0102` when a competing `0102_merge_users_kind_fts` landed on the
+vehicle first; see the plan's Task 2 note)
 - `extraction_runs` += `parent_run_id TEXT NULL` (index `idx_extraction_runs_parent`),
   `shard_key TEXT NULL`, `shard_label TEXT NULL`, `shards_total INT NULL`,
   `shards_done INT NOT NULL DEFAULT 0`. Mirror in `src/models/extraction.py`.
