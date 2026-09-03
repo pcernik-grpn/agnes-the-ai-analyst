@@ -864,3 +864,53 @@ class TestTheAdminGroupNamesTheModeItsGrantsDependOn:
         router = Path("app/web/router.py").read_text(encoding="utf-8")
         i = router.index('@router.get("/admin/access"')
         assert "Depends(require_admin)" in router[i : i + 300]
+
+
+class TestInheritedRowsCollapseToOneLine:
+    """Audit S3. Every everyone-wide grant appeared in every group's list as
+    its own row, each labelled with the reason it was there — a production
+    screenshot read "5 granted · 86 via Everyone" over page after page of rows
+    the group did not hold. The explanation had become the noise, and what
+    the group itself holds — the reason the admin opened it — was buried
+    under what everyone holds.
+
+    They are one line now, at the end of Set elsewhere, pointing at the
+    Everyone audience where they can actually be acted on.
+    """
+
+    TEMPLATE = "app/web/templates/admin_access.html"
+
+    def _source(self) -> str:
+        from pathlib import Path
+
+        return Path(self.TEMPLATE).read_text(encoding="utf-8")
+
+    def _grant_list(self) -> str:
+        src = self._source()
+        start = src.index("let inheritedN = 0;")
+        return src[start : src.index("const sections = (changeHere && setElsewhere)", start)]
+
+    def test_an_inherited_grant_is_counted_not_rendered(self):
+        body = self._grant_list()
+        assert "if (grant.inherited) { inheritedN += 1; continue; }" in body
+        # And the count is taken AFTER the kind and search filters, so the
+        # summary never claims rows a filter hid.
+        assert body.index("if (!hits(t, i)) continue;") < body.index("if (grant.inherited)")
+
+    def test_the_summary_line_points_where_they_can_be_changed(self):
+        body = self._grant_list()
+        assert 'data-inherited-summary="${inheritedN}"' in body
+        assert "and everything Everyone has" in body
+        # The same deep link the per-row `via Everyone →` used.
+        assert 'href="?group=${esc(everyoneGroupId() || "")}">Everyone →</a>' in body
+
+    def test_it_lands_in_set_elsewhere(self):
+        """It is a fact about rows the admin cannot act on here."""
+        body = self._grant_list()
+        assert 'const setElsewhere = inSection("set_elsewhere") + inheritedLine;' in body
+
+    def test_the_everyone_entry_never_shows_it(self):
+        """Zero by construction: `grantsFor` returns only direct rows for the
+        carrier, so nothing is inherited there to summarise."""
+        src = self._source()
+        assert "if (!evId || groupId === evId) return direct;" in src

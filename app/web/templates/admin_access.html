@@ -2310,6 +2310,11 @@
     font-size: 10.5px; font-weight: 400; color: var(--ds-text-muted);
     line-height: 1.2; letter-spacing: 0;
   }
+  /* The collapsed inherited rows. Muted and italic-free — a summary of rows,
+     not a row — with the same faint fill the individual inherited rows had,
+     so the eye still reads "not this group's". */
+  .ax-r--inherited-sum { background: color-mix(in srgb, var(--ds-text-primary) 3%, transparent); }
+  .ax-r--inherited-sum .ax-r__nm { color: var(--ds-text-secondary); font-weight: 500; }
   .ax-pk-r--scope{ border-left: 3px solid var(--ds-primary); }
   .ax-r--scope{
     border-left: 3px solid var(--ds-primary);
@@ -3908,6 +3913,7 @@
     const sectionOf = (grant) =>
       grant.inherited ? "set_elsewhere" : (grant.section || "change_here");
 
+    let inheritedN = 0;
     const byFamily = new Map();
     for (const t of types) {
       const rows = [];
@@ -3918,6 +3924,18 @@
           if (!grant) continue;             // the holding, not the catalogue
           if (listKind && t.type_key !== listKind) continue;
           if (!hits(t, i)) continue;
+          /* An inherited row is COUNTED here, not rendered. Every everyone-wide
+             grant used to appear in every group's list as its own row, each
+             labelled with the reason it was there — a production screenshot
+             read "5 granted · 86 via Everyone" over page after page of rows
+             the group did not hold. The explanation had become the noise,
+             and what the group itself holds — the reason the admin opened it
+             — was buried under what everyone holds. (Audit S3.) Counted AFTER
+             the kind and search filters, so the summary never claims rows a
+             filter hid. They surface as one line at the end of Set elsewhere,
+             pointing at the Everyone audience, which is where they can be
+             acted on anyway. */
+          if (grant.inherited) { inheritedN += 1; continue; }
           rows.push({ html: grantedRow(t, i, blockName, grant), sec: sectionOf(grant) });
         }
       }
@@ -3960,7 +3978,23 @@
         .filter((r) => r.sec === want).map((r) => r.html).join(""))
       .join("");
     const changeHere = inSection("change_here");
-    const setElsewhere = inSection("set_elsewhere");
+    /* The inherited rows, as one line where they used to be many. Shaped as a
+       row so it sits in the grid; the act is the same `?group=` link the
+       per-row `via Everyone →` used, so nothing about where to go changes —
+       only how many times the page says it. Never rendered on the Everyone
+       entry itself: `grantsFor` returns only direct rows there, so the count
+       is zero by construction. */
+    const inheritedLine = inheritedN
+      ? `<div class="ax-r ax-r--inherited-sum" data-inherited-summary="${inheritedN}">
+          <span class="ax-r__kd"></span>
+          <span class="ax-r__nm">and everything Everyone has
+            <span class="ax-r__d">${inheritedN} ${inheritedN === 1 ? "grant that reaches" : "grants that reach"} every account, this group included</span>
+          </span>
+          <span class="ax-r__ctl"></span>
+          <span class="ax-r__rd ax-r__manage"><a class="ax-inherit" href="?group=${esc(everyoneGroupId() || "")}">Everyone →</a></span>
+        </div>`
+      : "";
+    const setElsewhere = inSection("set_elsewhere") + inheritedLine;
     const sectionLabel = (t, hint) =>
       `<div class="ax-glist__label ax-gsect">${esc(t)}${
         hint ? `<span class="ax-gsect__hint">${esc(hint)}</span>` : ""}</div>`;
