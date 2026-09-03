@@ -65,7 +65,7 @@ from app.marketplace_server.router import (
     marketplace_zip,
 )
 from app.resource_types import ResourceType
-from app.web.router import admin_data_sources_page
+from app.web.router import admin_data_sources_page, library_folder_peek_rows
 
 
 def test_get_current_user_is_not_a_coroutine_function():
@@ -145,6 +145,10 @@ _OFFLOADED_API_HANDLERS = [
     # counts endpoint the card fetches after painting — same reasoning,
     # zero awaits, purely blocking PG I/O.
     facts_graph_counts,
+    # /library index round 2: the folder-peek fragment a row's twisty fetches
+    # on first expand — zero awaits, purely blocking corpus_files/collection
+    # reads (Devin Review on #2173).
+    library_folder_peek_rows,
 ]
 
 
