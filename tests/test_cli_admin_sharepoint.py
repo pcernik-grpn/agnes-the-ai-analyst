@@ -1437,6 +1437,43 @@ _FLEET_BODY = {
 }
 
 
+class TestFmtFactsBacklogSuffix:
+    """`_fmt_facts` — TCRD-296 gap #61's two new fields
+    (`facts_pending_documents`/`facts_pass_running`), rendered as a
+    ` · N backlog, continuing/not running` suffix distinct from the
+    existing "(N pending)" text — that number is what's left of the
+    CURRENT run's own submitted batch, this one is the whole connection's
+    outstanding backlog, which can be nonzero even with no run at all."""
+
+    def test_no_backlog_field_renders_nothing_extra(self):
+        from cli.commands.admin_sharepoint import _fmt_facts
+
+        assert _fmt_facts({"docs_done": 5}) == "5 (0 pending)"
+
+    def test_zero_backlog_renders_nothing_extra(self):
+        from cli.commands.admin_sharepoint import _fmt_facts
+
+        facts = {"docs_done": 5, "facts_pending_documents": 0, "facts_pass_running": False}
+        assert _fmt_facts(facts) == "5 (0 pending)"
+
+    def test_backlog_with_a_pass_running_says_continuing(self):
+        from cli.commands.admin_sharepoint import _fmt_facts
+
+        facts = {"docs_done": None, "facts_pending_documents": 12, "facts_pass_running": True}
+        assert _fmt_facts(facts) == "— · 12 backlog, continuing"
+
+    def test_backlog_with_no_pass_running_says_not_running(self):
+        from cli.commands.admin_sharepoint import _fmt_facts
+
+        facts = {"docs_done": None, "facts_pending_documents": 12, "facts_pass_running": False}
+        assert _fmt_facts(facts) == "— · 12 backlog, not running"
+
+    def test_none_facts_dict_is_unaffected(self):
+        from cli.commands.admin_sharepoint import _fmt_facts
+
+        assert _fmt_facts(None) == "—"
+
+
 class TestRuns:
     """`agnes admin sharepoint runs` — CLI counterpart to
     `GET /api/admin/sharepoint/extraction/runs`."""
@@ -1448,6 +1485,15 @@ class TestRuns:
         mock_get.assert_called_once_with("/api/admin/sharepoint/extraction/runs?active=1")
         assert "corp-sharepoint" in result.output
         assert "Totals" in result.output
+
+    def test_a_pending_backlog_with_no_pass_running_is_shown(self):
+        connection = dict(_FLEET_BODY["connections"][0])
+        connection["facts"] = {**connection["facts"], "facts_pending_documents": 42, "facts_pass_running": False}
+        body = {**_FLEET_BODY, "connections": [connection]}
+        with patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(200, body)):
+            result = runner.invoke(app, ["admin", "sharepoint", "runs"])
+        assert result.exit_code == 0, result.output
+        assert "42 backlog, not running" in result.output
 
     def test_all_flag_broadens_the_scope(self):
         with patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(200, _FLEET_BODY)) as mock_get:

@@ -334,6 +334,23 @@ documents without up-to-date facts — so it is safe to repeat, and it runs
 alongside a crawl; while one is queued or running the card's Run row says
 so and the button is locked.
 
+**A pass continues itself until the ledger is done.** A single pass over a
+large backlog can exceed `run_timeout_s` — it stops between documents
+(`interrupted: timeout`), never mid-document, and whatever it already
+extracted is shipped either way. When it stops that way with documents
+still pending, the worker automatically enqueues the next pass on the same
+connection (same idempotency key, so a manual "Extract facts now" click
+never races it), 30 seconds out, carrying over the same `--doc-id`/
+`--timeout-s` the stopped pass ran with. It never continues after a stop,
+a permanent provider error, or once the backlog is actually empty, and it
+caps at 48 consecutive continuations per connection (an operator needs to
+re-trigger by hand past that, which is itself a sign something upstream —
+throughput, quota, a stuck document — needs a look). The source card's
+facts line and `agnes admin sharepoint runs` both show how many documents
+are still pending and whether a pass is currently chasing them ("N pending
+· continuing" vs. "N pending · not running") — the second phrase is the
+one that means an operator should intervene.
+
 Each document's request is kept under a token budget
 (`extraction.facts.max_prompt_tokens`, default 150 000, hard-ceilinged at
 190 000 regardless of what is configured) on top of the flat character

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import secrets
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -1556,7 +1557,7 @@ def test_batch_resume_treats_a_29_day_old_entry_as_expired_without_a_network_cal
     _seed_ontology()
     _seed_document(file_id="cf_1", doc_id="doc1", text="The Northwind rollout began in March.")
 
-    from datetime import datetime, timedelta, timezone
+    from datetime import timedelta
 
     from connectors.sharepoint.facts_extraction import BATCH_RESULT_RETENTION_DAYS, load_state, save_state
 
@@ -1633,3 +1634,245 @@ def test_batch_default_transport_is_still_sync(pg_env):
     report = _run(StubExtractor([_stream(node)]))
     assert report["docs_via_batch"] == 0
     assert report["docs_via_sync"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Auto-continuation (TCRD-296 gap #61): a pass that stopped on its own time
+# budget with documents still pending re-enqueues itself.
+# ---------------------------------------------------------------------------
+
+
+def _seed_four_documents() -> None:
+    _seed_collection()
+    _seed_connection()
+    _seed_ontology()
+    for i in range(4):
+        _seed_document(file_id=f"cf_{i}", doc_id=f"doc{i}", text=f"The rollout number {i} began in March.")
+
+
+class _ExpireAfterOne:
+    """Expires once one document has been submitted — same shape as
+    ``test_an_expired_deadline_stops_between_documents_and_keeps_what_it_paid_for``'s
+    own fixture above."""
+
+    def __init__(self) -> None:
+        self.checks = 0
+
+    @property
+    def expired(self) -> bool:
+        self.checks += 1
+        return self.checks > 1
+
+
+def _reply_for(message: str) -> str:
+    doc_id = json.loads(message.split("```json\n", 1)[1].split("\n```", 1)[0])["doc_id"]
+    index = doc_id.removeprefix("doc")
+    return _stream(
+        {
+            "id": f"engagement:rollout-{index}",
+            "type": "engagement",
+            "attrs": {},
+            "evidence": [{"doc_id": doc_id, "quote": f"rollout number {index} began in March"}],
+        }
+    )
+
+
+class _ScriptedExtractor(StubExtractor):
+    def call(self, user_message: str) -> str:
+        self.seen.append(user_message)
+        self.usage["calls"] += 1
+        return _reply_for(user_message)
+
+
+def _mark_job_done(job_id: str) -> None:
+    """Force a QUEUED job straight to 'done' — bypassing the claim/lease
+    lifecycle (already covered elsewhere) so a chain-cap test doesn't have
+    to wait out each continuation's real `run_after` delay."""
+    from src.db_pg import get_engine
+
+    with get_engine().begin() as conn:
+        conn.execute(sa.text("UPDATE jobs SET status = 'done' WHERE id = :id"), {"id": job_id})
+
+
+def test_count_pending_documents_counts_never_attempted_documents(pg_env):
+    from connectors.sharepoint.facts_extraction import count_pending_documents
+
+    _seed_four_documents()
+    assert count_pending_documents(CONNECTION_ID) == 4
+
+
+def test_count_pending_documents_excludes_done_documents(pg_env):
+    from connectors.sharepoint.facts_extraction import count_pending_documents
+
+    _seed_four_documents()
+    _run(_ScriptedExtractor([]), concurrency=1)
+    assert count_pending_documents(CONNECTION_ID) == 0
+
+
+def test_count_pending_documents_counts_what_a_timed_out_pass_left_behind(pg_env):
+    from connectors.sharepoint.facts_extraction import count_pending_documents
+
+    _seed_four_documents()
+    report = _run(_ScriptedExtractor([]), concurrency=1, deadline=_ExpireAfterOne())
+    assert report["interrupted_reason"] == "timeout"
+    assert count_pending_documents(CONNECTION_ID) == 3
+
+
+def test_count_pending_documents_excludes_a_terminal_skip_state(pg_env):
+    from connectors.sharepoint.facts_extraction import count_pending_documents, load_state
+
+    _seed_collection()
+    _seed_connection()
+    _seed_ontology()
+    _seed_document(file_id="cf_1", doc_id="doc1", text="")  # no chunk text -> skipped-no-text
+
+    _run(_ScriptedExtractor([]), concurrency=1)
+
+    assert load_state(CONNECTION_ID)["docs"]["cf_1"]["status"] == "skipped-no-text"
+    assert count_pending_documents(CONNECTION_ID) == 0
+
+
+def test_count_pending_documents_is_zero_for_unknown_connection(pg_env):
+    from connectors.sharepoint.facts_extraction import count_pending_documents
+
+    assert count_pending_documents("does-not-exist") == 0
+
+
+def test_count_pending_documents_is_zero_with_no_ontology(pg_env):
+    from connectors.sharepoint.facts_extraction import count_pending_documents
+
+    _seed_collection()
+    _seed_connection()
+    _seed_document(file_id="cf_1", doc_id="doc1", text="hello")
+    assert count_pending_documents(CONNECTION_ID) == 0
+
+
+def test_maybe_continue_pass_enqueues_a_delayed_job_carrying_the_run_options(pg_env):
+    from connectors.sharepoint.facts_extraction import (
+        FACTS_CONTINUATION_DELAY_S,
+        facts_extraction_idempotency_key,
+        maybe_continue_pass,
+    )
+    from src.repositories import jobs_repo
+
+    _seed_four_documents()
+    report = _run(_ScriptedExtractor([]), concurrency=1, deadline=_ExpireAfterOne())
+    assert report["interrupted_reason"] == "timeout"
+
+    before = datetime.now(timezone.utc)
+    new_job_id = maybe_continue_pass(
+        CONNECTION_ID,
+        payload={"connection_id": CONNECTION_ID, "doc_ids": ["doc1"], "timeout_s": 900},
+        report=report,
+        original_job_id="orig-job-1",
+    )
+    assert new_job_id is not None
+
+    job = jobs_repo().get(new_job_id)
+    assert job["kind"] == "sharepoint-facts-extraction"
+    assert job["idempotency_key"] == facts_extraction_idempotency_key(CONNECTION_ID)
+    assert job["status"] == "queued"
+    assert job["payload_json"] == {
+        "connection_id": CONNECTION_ID,
+        "doc_ids": ["doc1"],
+        "timeout_s": 900,
+        "continued_from": "orig-job-1",
+    }
+    run_after = job["run_after"]
+    if run_after.tzinfo is None:
+        run_after = run_after.replace(tzinfo=timezone.utc)
+    delta_s = (run_after - before).total_seconds()
+    assert FACTS_CONTINUATION_DELAY_S - 5 <= delta_s <= FACTS_CONTINUATION_DELAY_S + 15
+
+
+def test_maybe_continue_pass_does_nothing_for_a_non_timeout_reason(pg_env):
+    from connectors.sharepoint.facts_extraction import maybe_continue_pass
+    from src.repositories import jobs_repo
+
+    _seed_four_documents()
+    result = maybe_continue_pass(
+        CONNECTION_ID,
+        payload={"connection_id": CONNECTION_ID},
+        report={"interrupted": False, "interrupted_reason": None},
+        original_job_id="orig-job-1",
+    )
+    assert result is None
+    assert jobs_repo().list(kind="sharepoint-facts-extraction", status="queued", limit=10) == []
+
+
+def test_maybe_continue_pass_does_nothing_when_nothing_is_pending(pg_env):
+    from connectors.sharepoint.facts_extraction import maybe_continue_pass
+    from src.repositories import jobs_repo
+
+    _seed_four_documents()
+    _run(_ScriptedExtractor([]), concurrency=1)  # fully drains the corpus
+
+    result = maybe_continue_pass(
+        CONNECTION_ID,
+        payload={"connection_id": CONNECTION_ID},
+        report={"interrupted": True, "interrupted_reason": "timeout"},
+        original_job_id="orig-job-1",
+    )
+    assert result is None
+    assert jobs_repo().list(kind="sharepoint-facts-extraction", status="queued", limit=10) == []
+
+
+def test_maybe_continue_pass_stamps_continued_by_job_id_on_the_original(pg_env):
+    from connectors.sharepoint.facts_extraction import maybe_continue_pass
+    from src.repositories import jobs_repo
+
+    _seed_four_documents()
+    jobs_repo().enqueue("sharepoint-facts-extraction", {"connection_id": CONNECTION_ID})
+    claimed = jobs_repo().claim_next(kinds=["sharepoint-facts-extraction"], worker_id="w1")
+    report = {"interrupted": True, "interrupted_reason": "timeout"}
+    jobs_repo().complete(claimed["id"], "w1", claimed["lease_token"], report)
+
+    new_job_id = maybe_continue_pass(
+        CONNECTION_ID, payload={"connection_id": CONNECTION_ID}, report=report, original_job_id=claimed["id"]
+    )
+
+    assert new_job_id is not None
+    original = jobs_repo().get(claimed["id"])
+    assert original["payload_json"]["result"]["continued_by_job_id"] == new_job_id
+    assert original["payload_json"]["result"]["interrupted_reason"] == "timeout"
+
+
+def test_maybe_continue_pass_stops_at_the_chain_cap(pg_env):
+    from connectors.sharepoint.facts_extraction import MAX_CONSECUTIVE_FACTS_CONTINUATIONS, maybe_continue_pass
+
+    _seed_four_documents()
+    report = {"interrupted": True, "interrupted_reason": "timeout"}
+
+    for _ in range(MAX_CONSECUTIVE_FACTS_CONTINUATIONS):
+        job_id = maybe_continue_pass(
+            CONNECTION_ID, payload={"connection_id": CONNECTION_ID}, report=report, original_job_id=None
+        )
+        assert job_id is not None
+        _mark_job_done(job_id)
+
+    refused = maybe_continue_pass(
+        CONNECTION_ID, payload={"connection_id": CONNECTION_ID}, report=report, original_job_id=None
+    )
+    assert refused is None
+
+
+def test_maybe_continue_pass_resets_the_chain_once_a_pass_drains_the_backlog(pg_env):
+    from connectors.sharepoint.facts_extraction import load_state, maybe_continue_pass
+
+    _seed_four_documents()
+    report = {"interrupted": True, "interrupted_reason": "timeout"}
+
+    job_id = maybe_continue_pass(
+        CONNECTION_ID, payload={"connection_id": CONNECTION_ID}, report=report, original_job_id=None
+    )
+    assert job_id is not None
+    assert load_state(CONNECTION_ID)["facts_continuation_chain"] == 1
+    _mark_job_done(job_id)
+
+    _run(_ScriptedExtractor([]), concurrency=1)  # drains the whole backlog
+
+    result = maybe_continue_pass(
+        CONNECTION_ID, payload={"connection_id": CONNECTION_ID}, report=report, original_job_id=None
+    )
+    assert result is None
+    assert load_state(CONNECTION_ID)["facts_continuation_chain"] == 0

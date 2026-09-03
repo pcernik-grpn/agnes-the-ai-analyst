@@ -124,7 +124,7 @@ import time
 import unicodedata
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -4298,3 +4298,281 @@ def run_standalone_facts_extraction(
     deadline = _Deadline(resolved_timeout)
     with facts_pass_lock(connection_id):
         return run_facts_extraction(connection_id, doc_ids=doc_ids, deadline=deadline)
+
+
+# --------------------------------------------------------------------------
+# Auto-continuation — a pass that stopped on its own time budget with
+# documents still pending re-enqueues itself (TCRD-296 gap #61)
+# --------------------------------------------------------------------------
+
+#: Per-document ``docs_state`` statuses (besides a fresh, current
+#: ``"done"``) that mean :func:`_plan_documents` has already decided THIS
+#: document cannot currently produce facts, and would only re-derive the
+#: same verdict on a future pass unless the file's own content changes —
+#: a fresh ``sha256`` this state does not retain (see
+#: :func:`count_pending_documents`'s docstring for the resulting, narrow,
+#: pre-existing approximation this set accepts).
+_TERMINAL_SKIP_STATUSES = frozenset({"skipped-no-text", "skipped-garbled-text", "skipped-too-large-tabular", "failed"})
+
+#: Consecutive auto-continuations one connection's ``sharepoint-facts-
+#: extraction`` chain may run before :func:`maybe_continue_pass` stops
+#: regardless of remaining pending documents — a circuit breaker against a
+#: pathological loop (a worker that always claims and immediately times
+#: out at ~0s of budget, or a config bug that never lets a pass finish
+#: "done"), not a throughput knob. Not configurable, deliberately: an
+#: instance that needs more than this many back-to-back timeout
+#: continuations for ONE connection has an underlying throughput problem
+#: this cap is meant to surface, not paper over.
+MAX_CONSECUTIVE_FACTS_CONTINUATIONS = 48
+
+#: Delay before a chained continuation's ``run_after``, seconds — long
+#: enough that a crash-looping worker (claim, fail fast, get re-enqueued,
+#: repeat) cannot spin the queue; short enough that an operator watching
+#: the fleet view reads a healthy chain as "continuing", not "stalled".
+FACTS_CONTINUATION_DELAY_S = 30
+
+
+def facts_extraction_idempotency_key(connection_id: str) -> str:
+    """The STABLE per-connection idempotency key for the
+    ``sharepoint-facts-extraction`` job — the single source of truth
+    shared by the manual trigger (``app/api/admin_sharepoint.py::
+    _facts_extraction_idempotency_key``, which delegates here), the
+    fleet/status readers that look a job up by it
+    (``app/api/admin_extraction.py::_facts_job_in_flight``), and this
+    module's own auto-continuation (:func:`maybe_continue_pass`) — so a
+    manual "run now", an auto-continuation of a timed-out pass, and any
+    other trigger for the SAME connection can never both be queued at
+    once, regardless of which of them minted the job.
+    """
+    return f"sharepoint-facts-extraction:{connection_id}"
+
+
+def count_pending_documents(connection_id: str) -> int:
+    """How many of ``connection_id``'s indexed, source-anchored documents
+    still need a facts-extraction attempt — cheap enough for a status page
+    to call on every poll: unlike :func:`run_facts_extraction` /
+    :func:`_plan_documents`, this never reads a document's BODY text (no
+    garbled/tabular classification, no truncation), only ``corpus_files``'
+    own columns and the facts state, so it is safe to call for a
+    connection with tens of thousands of documents without materializing
+    any of their content.
+
+    A document counts as pending when it is indexed, source-anchored, and
+    its ``docs_state`` entry is EITHER missing, ``"batch-submitted"`` (a
+    prior batch pass never finished collecting it), OR ``"done"`` under a
+    stale ``sha256``/model/prompt fingerprint (needs re-extraction). A
+    document already ``"done"`` at its CURRENT content/model/prompt, or
+    permanently skipped/failed (:data:`_TERMINAL_SKIP_STATUSES`), does not
+    count — :func:`_plan_documents` would only re-derive the identical
+    verdict on the next pass.
+
+    Known gap: a skip/failure recorded before the file's content last
+    changed is UNDER-counted here — that state keeps no ``sha256`` at
+    skip time to detect the drift. This is not a new gap: a future pass's
+    OWN planner has no cheaper way to close it either — it always
+    re-reads the text and re-derives the verdict, correcting the state
+    once it does; this function just never pays that read to find out.
+
+    Returns 0 for an unknown/non-sharepoint connection or an instance
+    with no ontology — the same "nothing to extract" verdict
+    :func:`run_facts_extraction` would reach, without raising: this is a
+    read-only status helper, never a trigger path.
+    """
+    from src.repositories import corpus_file_sources_repo, corpus_files_repo, source_connections_repo
+
+    connection = source_connections_repo().get(connection_id)
+    if connection is None or connection.get("source_type") != "sharepoint":
+        return 0
+
+    ontology_models = _ontology_models()
+    if not ontology_models:
+        return 0
+
+    from connectors.sharepoint.facts_prompt import prompt_fingerprint, resolve_extraction_prompt
+
+    prompt_text, _prompt_origin = resolve_extraction_prompt()
+    system_prompt = build_system_prompt(prompt_text, render_ontology(ontology_models))
+    fingerprint = prompt_fingerprint(system_prompt)
+    model = _model()
+
+    state = load_state(connection_id)
+    docs_state: Dict[str, Any] = state["docs"]
+    files_repo = corpus_files_repo()
+    sources_repo = corpus_file_sources_repo()
+
+    pending = 0
+    for collection_id in collection_ids_for(connection):
+        for file_row in files_repo.list_for_corpus(collection_id):
+            file_id = str(file_row["id"])
+            mapping = sources_repo.get(file_id) or {}
+            if not mapping.get("source_doc_id"):
+                continue
+            if file_row.get("processing_status") != "indexed":
+                continue
+            entry = docs_state.get(file_id)
+            if isinstance(entry, dict) and entry.get("status") in _TERMINAL_SKIP_STATUSES:
+                continue
+            sha256 = str(file_row.get("sha256") or "")
+            if is_up_to_date(entry, sha256=sha256, model=model, fingerprint=fingerprint):
+                continue
+            pending += 1
+    return pending
+
+
+def _reset_facts_continuation_chain(connection_id: str) -> None:
+    """Zero the connection's consecutive-continuation counter — a pass
+    that finished with nothing pending, or one that never auto-continues
+    in the first place, closes out any chain in progress."""
+    state = load_state(connection_id)
+    if state.get("facts_continuation_chain"):
+        state["facts_continuation_chain"] = 0
+        save_state(connection_id, state)
+
+
+def _bump_facts_continuation_chain(connection_id: str) -> int:
+    """Increment and persist the connection's consecutive-continuation
+    counter, returning the new value."""
+    state = load_state(connection_id)
+    chain = int(state.get("facts_continuation_chain") or 0) + 1
+    state["facts_continuation_chain"] = chain
+    save_state(connection_id, state)
+    return chain
+
+
+def maybe_continue_pass(
+    connection_id: str,
+    *,
+    payload: Dict[str, Any],
+    report: Dict[str, Any],
+    original_job_id: Optional[str],
+) -> Optional[str]:
+    """Auto-re-enqueue the next ``sharepoint-facts-extraction`` pass for
+    ``connection_id`` when THIS pass stopped ONLY because it ran out of
+    its own time budget — so a crawl's backlog drains on its own instead
+    of needing an operator to re-POST ``…/facts-extract`` by hand every
+    ``extraction.facts.run_timeout_s`` (TCRD-296 gap #61: three
+    connections observed sitting for hours with thousands of documents
+    pending and no pass running).
+
+    Called ONLY from ``app/worker/runtime.py``'s post-``complete()`` hook
+    — NEVER from inside the pass itself
+    (:func:`run_facts_extraction`/:func:`run_standalone_facts_extraction`):
+    the continuation reuses THIS pass's own idempotency key
+    (:func:`facts_extraction_idempotency_key`), and Postgres enforces that
+    key's uniqueness across every ``'queued'``/``'running'`` row with a
+    partial unique index — enqueuing a same-key continuation while the
+    pass whose tail it continues is STILL ``'running'`` would either
+    collide with that index (Postgres) or dedupe onto the still-running
+    row (this backend's own ``enqueue()`` check), in both cases returning
+    the CURRENT job unchanged instead of creating a genuinely new one. By
+    the time this runs, ``complete()`` has already flipped the row to
+    ``'done'``, so the key is free again.
+
+    Continues when ALL of:
+
+    - ``report["interrupted"]`` is true and ``report["interrupted_reason"]
+      == "timeout"`` — the ONLY non-terminal reason this module currently
+      produces (see :meth:`_Report.render`). A stop/cancel or a permanent
+      provider-limit error either leaves a different reason or never
+      reaches this function at all: :class:`FactsExtractionUnavailable`
+      is RAISED (see :func:`run_facts_extraction`'s ``hard_stop``
+      handling), which fails the job rather than completing it, so this
+      function is simply never called for that case. A future per-run
+      DOCUMENT budget (none exists today) would need its own distinct
+      reason value to auto-continue the same way.
+    - :func:`count_pending_documents` reports more than 0 remaining — a
+      pass that timed out exactly as the corpus was exhausted has no more
+      work, and chaining onto it would only spend a worker slot
+      confirming that.
+    - the connection's consecutive-continuation counter, persisted
+      alongside the facts state (reset to 0 the moment a pass finishes
+      with nothing pending), is under
+      :data:`MAX_CONSECUTIVE_FACTS_CONTINUATIONS`.
+
+    On success, ``run_after`` is set :data:`FACTS_CONTINUATION_DELAY_S`
+    seconds out, the new job's payload carries the SAME ``doc_ids``/
+    ``timeout_s`` this pass ran with plus ``continued_from`` (this pass's
+    own job id), and — once the new job exists —
+    ``original_job_id``'s own stored report gains
+    ``continued_by_job_id`` (:meth:`JobsRepository.record_continuation`).
+
+    Returns the new job's id, or ``None`` when no continuation was
+    enqueued (any of the above, or the dedup path unexpectedly winning —
+    see the docstring's opening paragraph for why that should not
+    normally happen). Best-effort: any exception here is caught and
+    logged, never re-raised — a bug in the re-enqueue path must never
+    turn an already-successful pass into a failed job.
+    """
+    try:
+        if not report.get("interrupted") or report.get("interrupted_reason") != "timeout":
+            _reset_facts_continuation_chain(connection_id)
+            return None
+
+        pending = count_pending_documents(connection_id)
+        if pending <= 0:
+            _reset_facts_continuation_chain(connection_id)
+            return None
+
+        chain = _bump_facts_continuation_chain(connection_id)
+        if chain > MAX_CONSECUTIVE_FACTS_CONTINUATIONS:
+            logger.warning(
+                "facts extraction: connection %s — %d documents still pending but the auto-continuation "
+                "chain hit its cap (%d); an operator needs to re-trigger the pass by hand",
+                connection_id,
+                pending,
+                MAX_CONSECUTIVE_FACTS_CONTINUATIONS,
+            )
+            return None
+
+        from src.repositories import jobs_repo
+
+        next_payload: Dict[str, Any] = {"connection_id": connection_id}
+        if payload.get("doc_ids"):
+            next_payload["doc_ids"] = payload["doc_ids"]
+        if payload.get("timeout_s") is not None:
+            next_payload["timeout_s"] = payload["timeout_s"]
+        if original_job_id:
+            next_payload["continued_from"] = original_job_id
+
+        from app.worker.registry import job_max_attempts
+
+        job = jobs_repo().enqueue(
+            "sharepoint-facts-extraction",
+            next_payload,
+            run_after=datetime.now(timezone.utc) + timedelta(seconds=FACTS_CONTINUATION_DELAY_S),
+            idempotency_key=facts_extraction_idempotency_key(connection_id),
+            max_attempts=job_max_attempts("sharepoint-facts-extraction"),
+        )
+        if job.get("deduped"):
+            # Another trigger (a race, or an operator's manual click) beat
+            # this one to the key — the pending backlog is already covered
+            # by whatever job holds it now; nothing more for THIS pass to
+            # do. Not expected in the ordinary chain (see docstring).
+            logger.info(
+                "facts extraction: connection %s — %d documents still pending, but another pass (job %s) "
+                "already holds the key; not chaining a duplicate",
+                connection_id,
+                pending,
+                job["id"],
+            )
+            return None
+
+        if original_job_id:
+            jobs_repo().record_continuation(original_job_id, job["id"])
+
+        logger.info(
+            "facts extraction: connection %s — %d documents pending, continuing (job %s, chain %d/%d)",
+            connection_id,
+            pending,
+            job["id"],
+            chain,
+            MAX_CONSECUTIVE_FACTS_CONTINUATIONS,
+        )
+        return job["id"]
+    except Exception:
+        logger.exception(
+            "facts extraction: connection %s — auto-continuation failed (non-fatal; an operator can "
+            "re-trigger the pass by hand)",
+            connection_id,
+        )
+        return None

@@ -1047,6 +1047,22 @@ def _fmt_tokens(usage: Dict[str, Any]) -> str:
     return f"{in_tok:,} / {out_tok:,}" if seen else "—"
 
 
+def _fmt_facts_backlog_suffix(facts: Dict[str, Any]) -> str:
+    """ " · N backlog, continuing/not running" (TCRD-296 gap #61) — distinct
+    from `_fmt_facts`'s own "(N pending)" text: that number is what's left
+    of the CURRENT run's already-submitted batch, this one is the whole
+    connection's outstanding backlog (`facts_pending_documents`), which
+    can be nonzero even when no run is active at all — the "three
+    connections sat idle for hours" case this column previously had no
+    way to show. Empty when there is no backlog (`0`/`None`), matching
+    `_fmt_facts`'s own "say nothing" convention for an empty case."""
+    n = facts.get("facts_pending_documents")
+    if not n:
+        return ""
+    state = "continuing" if facts.get("facts_pass_running") else "not running"
+    return f" · {n} backlog, {state}"
+
+
 def _fmt_facts(facts: Optional[Dict[str, Any]]) -> str:
     if not facts:
         return "—"
@@ -1054,10 +1070,12 @@ def _fmt_facts(facts: Optional[Dict[str, Any]]) -> str:
     if facts.get("phase_active"):
         total = facts.get("docs_total")
         pending = max((total or 0) - (done or 0), 0) if total is not None and done is not None else "?"
-        return f"{done or 0} / {total if total is not None else '?'} ({pending} pending)"
-    if done is not None:
-        return f"{done} (0 pending)"
-    return "—"
+        base = f"{done or 0} / {total if total is not None else '?'} ({pending} pending)"
+    elif done is not None:
+        base = f"{done} (0 pending)"
+    else:
+        base = "—"
+    return base + _fmt_facts_backlog_suffix(facts)
 
 
 def _fmt_phase(run: Optional[Dict[str, Any]]) -> str:

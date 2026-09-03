@@ -817,3 +817,51 @@ def test_cancel_writes_an_audit_row(tmp_path, monkeypatch, pg_engine):
 
         params = json.loads(params)
     assert params.get("connection_id") == conn_id
+
+
+def test_status_reports_facts_pending_documents_and_pass_running(tmp_path, monkeypatch, pg_engine):
+    """TCRD-296 gap #61: `facts_pending_documents` (the connection's whole
+    outstanding backlog, a connection-level fact, not a run's own
+    progress) and `facts_pass_running` (is anything chasing it right now)
+    — the two fields that make "pending but nothing running" visible. The
+    backlog COUNT's own correctness is covered end-to-end in
+    `tests/db_pg/test_facts_extraction_pg.py`; this proves the status
+    endpoint actually surfaces it and keeps `facts_pass_running` in sync
+    with `facts_job`."""
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token)
+
+    body = client.get(f"{BASE}/{conn_id}/extraction/status", headers=_auth(token)).json()
+    assert body["facts_pending_documents"] == 0
+    assert body["facts_pass_running"] is False
+
+    from src.repositories import jobs_repo
+
+    jobs_repo().enqueue(
+        "sharepoint-facts-extraction",
+        {"connection_id": conn_id},
+        idempotency_key=f"sharepoint-facts-extraction:{conn_id}",
+    )
+    body = client.get(f"{BASE}/{conn_id}/extraction/status", headers=_auth(token)).json()
+    assert body["facts_pass_running"] is True
+
+
+def test_fleet_row_carries_facts_pending_documents_and_pass_running(tmp_path, monkeypatch, pg_engine):
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token)
+
+    body = client.get(f"{FLEET_URL}?all=1", headers=_auth(token)).json()
+    row = next(r for r in body["connections"] if r["connection_id"] == conn_id)
+    assert row["facts"]["facts_pending_documents"] == 0
+    assert row["facts"]["facts_pass_running"] is False
+
+    from src.repositories import jobs_repo
+
+    jobs_repo().enqueue(
+        "sharepoint-facts-extraction",
+        {"connection_id": conn_id},
+        idempotency_key=f"sharepoint-facts-extraction:{conn_id}",
+    )
+    body = client.get(f"{FLEET_URL}?all=1", headers=_auth(token)).json()
+    row = next(r for r in body["connections"] if r["connection_id"] == conn_id)
+    assert row["facts"]["facts_pass_running"] is True

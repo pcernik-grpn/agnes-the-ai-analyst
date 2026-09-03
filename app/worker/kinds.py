@@ -1429,7 +1429,16 @@ def _run_sharepoint_facts_extraction(payload: dict) -> dict:
         deadline, stopping it after 3 documents).
 
     Returns the pass report (see
-    ``connectors.sharepoint.facts_extraction._Report.render``).
+    ``connectors.sharepoint.facts_extraction._Report.render``). When this
+    report says ``interrupted: timeout`` and the connection's ledger still
+    has documents pending, the worker automatically chains the next pass
+    onto this one (TCRD-296 gap #61) — that decision runs from ``app/
+    worker/runtime.py``'s post-``complete()`` hook
+    (``_maybe_continue_facts_extraction`` ->
+    ``connectors.sharepoint.facts_extraction.maybe_continue_pass``), NEVER
+    from inside this handler: the continuation reuses this job's own
+    idempotency key, and enqueuing it before THIS job leaves ``'running'``
+    would self-collide against its own still-live row.
 
     No-op guard: raises (so the job fails cleanly) when ``sharepoint.enabled``
     is false — same "this job only ever exists because something explicitly
