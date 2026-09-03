@@ -80,6 +80,129 @@ if ! id -u agnes-applier >/dev/null 2>&1; then
             --gid agnes-applier agnes-applier
 fi
 
+# --- 0a. VM-derived sizing: container memory ceilings + Postgres tuning ---
+# Terraform's app_mem_limit / scheduler_mem_limit / extraction_worker_mem_limit
+# accept "auto" (the default) to defer sizing to the box this script actually
+# boots on, instead of a fixed literal baked in at `terraform plan` time that
+# never matches a bigger or smaller machine type. An explicit value (e.g.
+# "8g") always wins outright — "auto" is the only trigger for computation
+# below, and every value here is re-derived on EVERY boot (idempotent), so a
+# VM recreate never regresses to a laptop-sized default. Deliberately AFTER
+# section 0 above: the uid reservation's guarantee is "before ANY package
+# activity" (#2137 follow-up), and this section runs commands (awk, nproc) —
+# see tests/test_startup_datadog_toggle.py::test_nothing_executable_
+# precedes_the_uid_reservation.
+#
+# TCRD-296 (F.23/F.24) — live finding on a 64-vCPU/251GB VM: a fixed 4g app
+# cap OOM-killed uvicorn four times while serving DuckDB queries, and
+# Postgres' stock settings (shared_buffers 128-160MB, work_mem 4MB,
+# effective_cache_size 5GB) plus Docker's default 64MB /dev/shm made every
+# parallel worker fail with "could not resize shared memory segment" (~2850
+# times in 30 minutes), killing a facts extraction job. The functions below
+# derive both from /proc/meminfo + nproc instead.
+#
+# Pure integer math, no file I/O — callers (right below the block) read
+# /proc/meminfo and nproc once and pass the results in, which is also what
+# lets the unit tests drive every code path with values a real VM (a
+# 64-vCPU/251GB box down to a 1-vCPU/2GB dev VM) would report, instead of
+# depending on the CI runner's own /proc/meminfo.
+# --- vm-sizing begin (extracted + executed by tests/test_startup_vm_sizing.py) ---
+agnes_clamp() {
+    local value="$1" min="$2" max="$3"
+    if [ "$value" -lt "$min" ]; then value="$min"; fi
+    if [ "$value" -gt "$max" ]; then value="$max"; fi
+    echo "$value"
+}
+
+# Container memory ceilings — the integer number of GiB (the caller adds the
+# "g" suffix docker compose's mem_limit expects). $1 = total RAM in MiB.
+agnes_auto_app_mem_limit_gb() {
+    local ram_mb="$1" gb
+    gb=$(( ram_mb / 8 / 1024 ))
+    agnes_clamp "$gb" 4 32
+}
+
+agnes_auto_worker_mem_limit_gb() {
+    # RAM * 0.6, capped so app + worker + an 8 GiB headroom (Postgres + host)
+    # never asks for more than the box actually has. The app footprint here
+    # is estimated with the SAME auto formula regardless of whether
+    # app_mem_limit itself is "auto" or a hand-set override — an estimate is
+    # all a safety margin needs, and it keeps this function pure (RAM in, no
+    # string parsing of an arbitrary override's unit).
+    local ram_mb="$1" ram_gb app_est_gb ratio_gb headroom_gb gb
+    ram_gb=$(( ram_mb / 1024 ))
+    app_est_gb=$(agnes_clamp $(( ram_gb / 8 )) 4 32)
+    ratio_gb=$(( ram_gb * 6 / 10 ))
+    headroom_gb=$(( ram_gb - app_est_gb - 8 ))
+    gb="$ratio_gb"
+    if [ "$headroom_gb" -lt "$gb" ]; then gb="$headroom_gb"; fi
+    agnes_clamp "$gb" 4 "$ram_gb"
+}
+
+agnes_auto_scheduler_mem_limit_gb() {
+    echo 2
+}
+
+# Postgres tuning — MiB integers (the caller adds the MB/m unit suffix).
+agnes_pg_shared_buffers_mb() {
+    local ram_mb="$1"
+    agnes_clamp $(( ram_mb * 25 / 100 )) 1 32768
+}
+
+agnes_pg_effective_cache_size_mb() {
+    local ram_mb="$1"
+    echo $(( ram_mb * 60 / 100 ))
+}
+
+agnes_pg_work_mem_mb() {
+    local ram_mb="$1"
+    agnes_clamp $(( ram_mb / 512 )) 16 128
+}
+
+agnes_pg_maintenance_work_mem_mb() {
+    local ram_mb="$1"
+    agnes_clamp $(( ram_mb / 16 )) 1 4096
+}
+
+agnes_pg_max_parallel_workers_per_gather() {
+    local nproc="$1"
+    agnes_clamp $(( nproc / 8 )) 0 4
+}
+
+agnes_pg_shm_size_mb() {
+    local ram_mb="$1"
+    agnes_clamp $(( ram_mb * 2 / 100 )) 256 999999
+}
+# --- vm-sizing end ---
+
+AGNES_TOTAL_MEM_MB=$(awk '/MemTotal/ {printf "%d", $2/1024}' /proc/meminfo)
+AGNES_NPROC=$(nproc)
+
+RESOLVED_APP_MEM_LIMIT="${app_mem_limit}"
+if [ "$RESOLVED_APP_MEM_LIMIT" = "auto" ]; then
+    RESOLVED_APP_MEM_LIMIT="$(agnes_auto_app_mem_limit_gb "$AGNES_TOTAL_MEM_MB")g"
+fi
+RESOLVED_SCHEDULER_MEM_LIMIT="${scheduler_mem_limit}"
+if [ "$RESOLVED_SCHEDULER_MEM_LIMIT" = "auto" ]; then
+    RESOLVED_SCHEDULER_MEM_LIMIT="$(agnes_auto_scheduler_mem_limit_gb)g"
+fi
+RESOLVED_EXTRACTION_WORKER_MEM_LIMIT="${extraction_worker_mem_limit}"
+if [ "$RESOLVED_EXTRACTION_WORKER_MEM_LIMIT" = "auto" ]; then
+    RESOLVED_EXTRACTION_WORKER_MEM_LIMIT="$(agnes_auto_worker_mem_limit_gb "$AGNES_TOTAL_MEM_MB")g"
+fi
+
+# Postgres side-car tuning — computed unconditionally (day-zero seeds
+# database.backend=side_car, see section 2 below) and written into .env
+# further down. ALTER SYSTEM values set by hand on a running instance
+# (postgresql.auto.conf) take precedence over these -c flags — see
+# docs/DEPLOYMENT.md ("Sizing the Postgres side-car") for how to clear them.
+AGNES_PG_SHARED_BUFFERS="$(agnes_pg_shared_buffers_mb "$AGNES_TOTAL_MEM_MB")MB"
+AGNES_PG_EFFECTIVE_CACHE_SIZE="$(agnes_pg_effective_cache_size_mb "$AGNES_TOTAL_MEM_MB")MB"
+AGNES_PG_WORK_MEM="$(agnes_pg_work_mem_mb "$AGNES_TOTAL_MEM_MB")MB"
+AGNES_PG_MAINTENANCE_WORK_MEM="$(agnes_pg_maintenance_work_mem_mb "$AGNES_TOTAL_MEM_MB")MB"
+AGNES_PG_MAX_PARALLEL_WORKERS_PER_GATHER="$(agnes_pg_max_parallel_workers_per_gather "$AGNES_NPROC")"
+AGNES_PG_SHM_SIZE="$(agnes_pg_shm_size_mb "$AGNES_TOTAL_MEM_MB")m"
+
 # --- 1. Docker (install if missing) ---
 if ! command -v docker &>/dev/null; then
     curl -fsSL https://get.docker.com | sh
@@ -1627,8 +1750,8 @@ LOG_LEVEL=info
 DOMAIN=$DOMAIN
 AGNES_TAG=$EFFECTIVE_AGNES_TAG
 AGNES_IMAGE_REPO=$IMAGE_REPO
-AGNES_APP_MEM_LIMIT=${app_mem_limit}
-AGNES_SCHEDULER_MEM_LIMIT=${scheduler_mem_limit}
+AGNES_APP_MEM_LIMIT=$RESOLVED_APP_MEM_LIMIT
+AGNES_SCHEDULER_MEM_LIMIT=$RESOLVED_SCHEDULER_MEM_LIMIT
 AGNES_APP_CPUS=${app_cpus}
 AGNES_SCHEDULER_CPUS=${scheduler_cpus}
 # home_route / studio_enabled / theme / experience / data_source.type do NOT
@@ -1657,6 +1780,18 @@ ${env_name}=$${${env_name}}
 %{ endfor ~}
 POSTGRES_PASSWORD=$POSTGRES_PASSWORD
 DATABASE_URL=postgresql+psycopg://agnes:$POSTGRES_PASSWORD@postgres:5432/agnes
+# Postgres side-car tuning (TCRD-296), derived from this VM's own RAM/vCPU —
+# see the "VM-derived sizing" block near the top of this script. Consumed by
+# docker-compose.postgres-host-mount.yml's `command:`/`shm_size:` on the
+# `postgres` service; the fixed knobs (wal_compression, random_page_cost,
+# jit, max_wal_size) are literals in that overlay, not env lines, since they
+# don't vary with VM size.
+AGNES_PG_SHARED_BUFFERS=$AGNES_PG_SHARED_BUFFERS
+AGNES_PG_EFFECTIVE_CACHE_SIZE=$AGNES_PG_EFFECTIVE_CACHE_SIZE
+AGNES_PG_WORK_MEM=$AGNES_PG_WORK_MEM
+AGNES_PG_MAINTENANCE_WORK_MEM=$AGNES_PG_MAINTENANCE_WORK_MEM
+AGNES_PG_MAX_PARALLEL_WORKERS_PER_GATHER=$AGNES_PG_MAX_PARALLEL_WORKERS_PER_GATHER
+AGNES_PG_SHM_SIZE=$AGNES_PG_SHM_SIZE
 %{ if dispatcher_enabled ~}
 DISPATCHER_IMAGE=${dispatcher_image}
 DISPATCHER_PG_PASSWORD=$DISPATCHER_PG_PASSWORD
@@ -1677,7 +1812,7 @@ KAI_BROKER_MCP_ENABLED=true
 %{ if extraction_worker_enabled ~}
 AGNES_COORDINATION_BACKEND=redis
 AGNES_REDIS_URL=redis://redis:6379/0
-AGNES_EXTRACTION_WORKER_MEM_LIMIT=${extraction_worker_mem_limit}
+AGNES_EXTRACTION_WORKER_MEM_LIMIT=$RESOLVED_EXTRACTION_WORKER_MEM_LIMIT
 AGNES_EXTRACTION_WORKER_CPUS=${extraction_worker_cpus}
 %{ if extraction_worker_image != "" ~}
 # A deliberate, TEMPORARY divergence from the app's own image/tag (a
