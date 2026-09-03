@@ -822,6 +822,11 @@ READ_POSTURE: dict[str, str] = {
     # -- app.api.admin_sharepoint --
     "GET /api/admin/sharepoint/connections/{connection_id}/certificate": "sharepoint_connection.certificate_read",
     "GET /api/admin/sharepoint/connections/{connection_id}/changes": "sharepoint_connection.changes_read",
+    # The source card's "Facts → graph" cell, fetched lazily per connection
+    # (perf follow-up, 2026-09-03) — a fact/edge COUNT, no document content,
+    # no secrets, no other user's data. Same class as the extraction
+    # observability counters exempted above.
+    "GET /api/admin/sharepoint/connections/{connection_id}/facts-graph-counts": "exempt:ui_support",
     "GET /api/admin/sharepoint/connections/{connection_id}/scopes": "sharepoint_connection.scopes_read",
     "GET /api/admin/sharepoint/connections/{connection_id}/tree": "sharepoint_connection.tree_browse",
     "GET /api/admin/sharepoint/connections/{connection_id}/tree/search": "sharepoint_connection.tree_search",

@@ -9713,17 +9713,6 @@ def _source_inventory(user: dict | None = None) -> dict:
 # distinct reasons an operator can tell apart in the drawer.
 _VERBATIM_GATE_REASONS = frozenset({"verbatim_gate_failed", "quote_not_meaningful"})
 
-#: Cap on how many of a SharePoint connection's confirmed scope rows the
-#: source card inlines (`_sharepoint_pipeline_cell`'s `cell["scopes"]`). A
-#: real connection can carry ~180 — inlining all of them, for every
-#: SharePoint connection on the page at once, was what made the page's own
-#: response scale with scope count regardless of how fast the queries
-#: behind it were made. `cell["scopes_total"]`/`cell["scopes_truncated"]`
-#: name the cap honestly rather than silently dropping rows (same pattern
-#: as `extraction_runs_pg.cap_skips`); the full, uncapped list is one click
-#: away via `GET .../scopes`.
-_CARD_SCOPES_CAP = 50
-
 
 def _resolve_sharepoint_rejection_doc_labels(doc_ids: list[str]) -> dict[str, dict]:
     """Resolve "Last run" rejection rows' ``doc_id``s (the crawler's
@@ -9878,21 +9867,23 @@ def _sharepoint_pipeline_cell(
     cell["crawl"] = {"documents": documents}
     cell["extract"] = extracted
 
-    # ── facts / graph: caller-scoped (spec §5) — needs the real admin `user`
-    # this request authenticated as; with none supplied (a legacy call site)
-    # the numbers are simply unavailable, same "degrade, don't guess" rule.
-    facts_count = 0
-    edges_count = 0
-    if scope_ids and user is not None:
-        try:
-            from src.repositories import facts_repo
-
-            fr = facts_repo()
-            facts_count = sum(fr.count_visible_facts_for_collections(user, scope_ids).values())
-            edges_count = sum(fr.count_visible_edges_for_collections(user, scope_ids).values())
-        except Exception as e:
-            logger.debug("sharepoint pipeline cell: facts/edges counts unavailable: %s", e)
-    cell["graph"] = {"facts": facts_count, "edges": edges_count}
+    # ── facts / graph: NOT computed here (perf follow-up, 2026-09-03 live
+    # finding). `count_visible_facts_for_collections`/`count_visible_edges_
+    # for_collections` run one query EACH per corpus_id — correct and
+    # deliberate (see their own docstrings: the caller's readable set
+    # resolves once, but the per-collection COUNT is a genuinely separate,
+    # security-scoped read every time), but that means 2 statements per
+    # scope. Summed across every SharePoint connection's scopes on the page
+    # (up to ~180 each), that dominated the page's own render time on a live
+    # instance — 22 of ~28 samples of a page load's `pg_stat_activity` were
+    # exactly these two statements. This cell fold must cost ZERO
+    # `claims`-touching statements (`tests/test_admin_data_sources_page.py`'s
+    # bounded-queries guard), so `cell["graph"]` is `None` here — the strip
+    # fetches it lazily, per connection, via
+    # `GET /api/admin/sharepoint/connections/{id}/facts-graph-counts`
+    # (`app/api/admin_sharepoint.py::facts_graph_counts`) once the card has
+    # painted, never blocking the page response.
+    cell["graph"] = None
 
     # ── the last persisted run report (see facts_ingest_runs_pg.py) — the
     # error badges' source, and this cell's only input for the cost
@@ -10121,49 +10112,18 @@ def _sharepoint_pipeline_cell(
     # reused through `admin_sharepoint._scope_out` so the card renders
     # exactly the connect wizard's own step-3 "Share" shape — one source of
     # truth for what a scope row looks like, not a second projection that
-    # can drift from it. Each row degrades independently (a deleted
-    # collection, an unavailable grants repo) to its raw shape rather than
-    # dropping the row or failing the whole cell; a repo-wide failure
-    # (`resource_grants`/`file_corpora` unavailable) yields no scope rows at
-    # all rather than a 500 for the whole card — same posture as every
-    # other sub-block here. Reads `config.scopes` a second time rather than
-    # projecting from `scope_ids` above: that one is a bare set of collection
-    # ids, this one needs the full row (`source_scope_id`, `display_path`,
-    # `anonymize`) `_scope_out` renders — two projections of the SAME field,
-    # not two different sources of truth for it.
-    # Capped at `_CARD_SCOPES_CAP`: this list used to render EVERY confirmed
-    # scope inline on the card (up to ~180 on a real connection) — on a page
-    # with several such connections that inflated the HTML response into
-    # the hundreds of KB regardless of how cheap the underlying queries were
-    # made, none of it needed for the card's first paint (the identity cell
-    # above already carries the honest summary counts). The full list stays
-    # one click away — `GET .../scopes` (`admin_sharepoint.list_scopes`),
-    # the SAME projection, unbounded — via the "Manage scopes" wizard entry
-    # point the card already links to.
-    scopes: list[dict[str, Any]] = []
-    scopes_total = 0
-    try:
-        from app.api.admin_sharepoint import _latest_run_anonymized_corpus_ids, _scope_out
-
-        declared_corpus_ids = _latest_run_anonymized_corpus_ids()
-        raw_scopes = [s for s in (conn.get("config") or {}).get("scopes") or [] if isinstance(s, dict)]
-        scopes_total = len(raw_scopes)
-        for raw_scope in raw_scopes[:_CARD_SCOPES_CAP]:
-            try:
-                scopes.append(
-                    _scope_out(raw_scope, declared_corpus_ids, conn, grants_by_collection=collection_grants_by_id)
-                )
-            except Exception as e:
-                logger.debug(
-                    "sharepoint pipeline cell: scope row resolution failed for %s: %s",
-                    raw_scope.get("source_scope_id"),
-                    e,
-                )
-    except Exception as e:
-        logger.warning("sharepoint pipeline cell: scope rows unavailable: %s", e)
-    cell["scopes"] = scopes
-    cell["scopes_total"] = scopes_total
-    cell["scopes_truncated"] = scopes_total > len(scopes)
+    # can drift from it — but NOT rendered here (perf follow-up, 2026-09-03,
+    # second finding on the same live instance): `cell["scopes"]` used to
+    # carry every confirmed scope's ENRICHED row (path, collection, group
+    # grants) for every SharePoint connection on the page at once — even
+    # capped at `_CARD_SCOPES_CAP`, 8 connections x 50 scopes each still
+    # inlined ~170 KB of JSON nothing on first paint reads (the identity
+    # cell above already carries the honest summary counts a card needs at a
+    # glance). The full, per-scope enriched list is now ALWAYS fetched
+    # lazily by the card — `GET .../scopes` (`admin_sharepoint.list_scopes`,
+    # the SAME `_scope_out` projection) — the instant it is expanded, never
+    # baked into the page response. Only the cheap count survives here.
+    cell["scopes_total"] = sum(1 for s in (conn.get("config") or {}).get("scopes") or [] if isinstance(s, dict))
 
     # ── anonymization (spec §9/§9.2/§13.2): "requested" (this connection's
     # own confirmed scopes marked anonymize=true, read straight off `conn` —

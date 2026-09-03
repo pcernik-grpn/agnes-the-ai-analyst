@@ -1058,11 +1058,9 @@ def test_the_admin_page_renders_a_structured_error_detail():
     away the one thing the admin needs — which is what the chat-tools toast
     did with the partial-teardown report. (Devin Review on this PR.)
     """
-    import pathlib
+    from tests._admin_data_sources_source import read_admin_data_sources_source
 
-    src = (
-        pathlib.Path(__file__).resolve().parents[1] / "app" / "web" / "templates" / "admin_data_sources.html"
-    ).read_text(encoding="utf-8")
+    src = read_admin_data_sources_source()
     assert "function detailMessage(" in src
     assert "still_present" in src, "the partial-teardown list is never shown"
     assert 'showToast("Failed: " + (body.detail' not in src, "the chat-tools toast still stringifies an object"

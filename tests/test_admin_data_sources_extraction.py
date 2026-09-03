@@ -22,6 +22,12 @@ from pathlib import Path
 
 import pytest
 
+from tests._admin_data_sources_source import read_admin_data_sources_source
+
+# Kept for any future caller that needs the template path itself (e.g.
+# existence checks) — content reads go through `read_admin_data_sources_source()`
+# (perf follow-up, 2026-09-03: most of this page's JS moved into extracted
+# static files, see tests/_admin_data_sources_source.py).
 TEMPLATE = Path(__file__).resolve().parents[1] / "app" / "web" / "templates" / "admin_data_sources.html"
 
 
@@ -83,7 +89,7 @@ _SIGNATURES = (
 
 
 def _run_js(body: str, *, state: dict | None = None) -> dict:
-    tpl = TEMPLATE.read_text(encoding="utf-8")
+    tpl = read_admin_data_sources_source()
     fns = "\n".join(_extract_block(tpl, sig) for sig in _SIGNATURES)
     script = f"""
 const EXT_MAX_FAILURES = 3;
@@ -151,12 +157,19 @@ class TestCardAnchors:
     be rendered entirely by its own script with no load-order coupling."""
 
     def test_template_carries_the_three_anchors(self):
-        tpl = TEMPLATE.read_text(encoding="utf-8")
+        tpl = read_admin_data_sources_source()
         assert 'id="ext-crawl-live-${row.id}"' in tpl
         assert 'id="ext-block-${row.id}" data-ext-conn="${row.id}"' in tpl
         assert 'id="ext-drawer-${row.id}"' in tpl
 
     def test_page_renders_for_an_admin(self, seeded_app):
+        """The extraction-observability script itself moved into a static,
+        cache-eligible asset (perf follow-up, 2026-09-03) — the HTML response
+        now only references it (`<script src="…data_sources_extraction_
+        observability.js…">`), it does not inline it. This still proves the
+        FULL chain an admin's browser walks: the page loads, and the asset it
+        references actually serves the extraction-observability code —
+        fetched through the SAME client, the way a browser would."""
         c = seeded_app["client"]
         c.cookies.set("access_token", seeded_app["admin_token"])
         try:
@@ -165,12 +178,24 @@ class TestCardAnchors:
             c.cookies.clear()
         assert resp.status_code == 200, resp.text
         body = resp.text
-        assert "ext-block-" in body
-        assert "toggleExtractionDrawer" in body
+        assert "data_sources_page.js" in body
+        assert "data_sources_extraction_observability.js" in body
+
+        # The card markup (incl. the anchor) lives in the page script;
+        # the poll/drawer behavior lives in the extraction-observability
+        # script — both fetched through the SAME client, the way a browser
+        # would, proving the full chain rather than just the reference.
+        page_js = c.get("/static/js/admin/data_sources_page.js")
+        assert page_js.status_code == 200, page_js.text
+        assert "ext-block-" in page_js.text
+
+        ext_js = c.get("/static/js/admin/data_sources_extraction_observability.js")
+        assert ext_js.status_code == 200, ext_js.text
+        assert "toggleExtractionDrawer" in ext_js.text
         # The poll cadence the design fixes (3 s active / 30 s idle) is in the
-        # page, not invented per render.
-        assert "EXT_POLL_ACTIVE_MS = 3000" in body
-        assert "EXT_POLL_IDLE_MS = 30000" in body
+        # shipped asset, not invented per render.
+        assert "EXT_POLL_ACTIVE_MS = 3000" in ext_js.text
+        assert "EXT_POLL_IDLE_MS = 30000" in ext_js.text
 
 
 # --------------------------------------------------------------------------
@@ -232,7 +257,7 @@ class TestSetSourceOpenWiring:
     not reimplemented, so the immediate fetch reaches all of them."""
 
     def _run(self, body: str) -> dict:
-        tpl = TEMPLATE.read_text(encoding="utf-8")
+        tpl = read_admin_data_sources_source()
         fns = "\n".join(
             _extract_block(tpl, sig)
             for sig in (
@@ -1104,7 +1129,7 @@ class TestStopReasonVocabularyAgrees:
 
     @staticmethod
     def _js_reason_keys() -> set:
-        block = _extract_block(TEMPLATE.read_text(encoding="utf-8"), "const EXT_STOP_REASON_TEXT = {")
+        block = _extract_block(read_admin_data_sources_source(), "const EXT_STOP_REASON_TEXT = {")
         return set(re.findall(r"^\s*([a-z_]+):", block, re.M))
 
     def test_every_resumable_reason_has_a_human_phrase(self):
@@ -1236,7 +1261,7 @@ def _run_schedule_js(body: str) -> dict:
     Cards on this page arrive over fetch, so the harness starts with none —
     which is exactly the state the script self-starts against in a browser.
     """
-    tpl = TEMPLATE.read_text(encoding="utf-8")
+    tpl = read_admin_data_sources_source()
     fns = "\n".join(_extract_block(tpl, sig) for sig in _SCHEDULE_SIGNATURES)
     script = f"""
 const EXT_POLL_ACTIVE_MS = 3000;
@@ -1359,7 +1384,7 @@ class TestPollFollowsTheCards:
         assert out["repainted"] == ["sp1"], out
 
     def test_the_paint_hook_is_called_from_every_card_paint(self):
-        tpl = TEMPLATE.read_text(encoding="utf-8")
+        tpl = read_admin_data_sources_source()
         # Guarded by `typeof`: the hook lives in a later script block than the
         # renderers that call it, and the parser may run a fetch continuation
         # between the two.
@@ -1460,7 +1485,7 @@ console.log(JSON.stringify({ disabled: _elements['ext-facts-btn-sp1'].disabled }
 
 
 def _run_facts_policy_js(body: str) -> dict:
-    tpl = TEMPLATE.read_text(encoding="utf-8")
+    tpl = read_admin_data_sources_source()
     fns = "\n".join(
         _extract_block(tpl, sig)
         for sig in (
@@ -1593,7 +1618,7 @@ class TestFactsPolicySave:
         response_body=None,
         prior_config=None,
     ):
-        tpl = TEMPLATE.read_text(encoding="utf-8")
+        tpl = read_admin_data_sources_source()
         fn = _extract_block(tpl, "async function saveSpFactsPolicy(id) {")
         response_body = response_body if response_body is not None else {}
         script = f"""

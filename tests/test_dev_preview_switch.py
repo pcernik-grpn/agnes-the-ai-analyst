@@ -227,7 +227,11 @@ class TestTheWizardCanMakeAnAudience:
 
     @pytest.fixture(scope="class")
     def page(self) -> str:
-        return (ROOT / "app" / "web" / "templates" / "admin_data_sources.html").read_text(encoding="utf-8")
+        # The wizard's Share-step JS moved into an extracted static file
+        # (perf follow-up, 2026-09-03) — see tests/_admin_data_sources_source.py.
+        from tests._admin_data_sources_source import read_admin_data_sources_source
+
+        return read_admin_data_sources_source()
 
     def test_the_step_offers_a_new_group(self, page):
         assert 'id="ds-wizard-newgroup"' in page
