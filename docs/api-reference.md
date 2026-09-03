@@ -310,7 +310,7 @@ duplicated here:
 |---|---|---|
 | `row_rules` | array, optional | `[{"column", "op", "value"}]` — `op` is one of `in_caller_groups`, `eq_caller_email`, `eq_caller_id`, `eq`, `in` |
 | `row_combine` | string, optional | `"and"` (default) or `"or"` |
-| `column_masks` | object, optional | `{column: "show"\|"hide"\|"nullify"\|"hash"\|"unmask"\|"last4"\|"email_partial"}` — any of them may be written as `{"choice": <mask>, "groups": ["..."]}`, which reveals the column verbatim to those groups and applies the mask to everyone else (`"unmask"` is that shape with the built-in `'*****'`/`NULL` fallback; single-group `"group"` is still accepted). `{"choice": "tiered", "tiers": [{"groups": ["..."], "reveal": "show"\|<mask>}, ...], "default": <mask>}` is the ordered form |
+| `column_masks` | object, optional | `{column: "show"\|"hide"\|"nullify"\|"hash"\|"unmask"\|"last4"\|"email_partial"\|"pseudonymize_keyed"}` — any of them may be written as `{"choice": <mask>, "groups": ["..."]}`, which reveals the column verbatim to those groups and applies the mask to everyone else (`"unmask"` is that shape with the built-in `'*****'`/`NULL` fallback; single-group `"group"` is still accepted). `{"choice": "tiered", "tiers": [{"groups": ["..."], "reveal": "show"\|<mask>}, ...], "default": <mask>}` is the ordered form |
 
 A `groups` list is a modifier, not a mask of its own: an empty or missing list falls back
 to the plain mask, never to "everyone sees it". `hide` cannot take one (a column cannot be
@@ -323,6 +323,14 @@ is decided by the admin's order. At least one tier is required, every tier needs
 one group, `reveal` is `show` or any non-`hide` mask, and `default` must be a mask that
 actually masks (`show` would make the chain a no-op; `hide` cannot be conditional). Each
 of those is a refusal, not a silent normalization.
+
+`pseudonymize_keyed` compiles to `agnes_hmac(col) AS col` — a hex HMAC-SHA256 of the value
+under this instance's own anonymization key, so the pseudonym still joins across tables here
+but cannot be reversed by dictionary the way `hash`'s unsalted md5 can. Text-only, and
+DuckDB-only: attaching a policy that calls it to a `query_mode='remote'` table is rejected
+with `422 policy_function_duckdb_only`. See
+[`table-access-policies.md`](table-access-policies.md#column-masking) — key rotation is
+deliberately not supported.
 
 `last4` (`****6789`) and `email_partial` (`j*****@example.com`) are **text-only** partial
 masks: same output column name, same `VARCHAR` type, a fixed-width asterisk run (one that

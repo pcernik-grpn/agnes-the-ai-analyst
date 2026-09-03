@@ -50,6 +50,7 @@ from src.access_policy import (
     row_scope_payload,
 )
 from src.audit_helpers import client_kind_from_user
+from src.access_policy_udf import POLICY_UDF_NAMES
 from src.db import _open_duckdb, get_analytics_db_readonly
 from src.rbac import get_accessible_tables, require_table_access
 from src.remote_engines import (
@@ -1637,6 +1638,23 @@ def _assert_select_only(sql_lower: str) -> None:
             status_code=400,
             detail="File-path table sources are not allowed; query registered views by name",
         )
+    # Agnes's own access-policy functions (`agnes_hmac`) are registered on the
+    # very connection this statement runs on, so a caller could otherwise call
+    # them directly — and `agnes_hmac('alice@example.com')` next to a column
+    # masked with `pseudonymize_keyed` is exactly the dictionary attack the
+    # instance key was bought to prevent. Reserved for policy bodies, which are
+    # spliced in AFTER this guard (see `rewrite_sql` below) and are therefore
+    # unaffected. Substring scan over the guard-masked body — a literal that
+    # merely mentions the name must not 400 — same shape as the blocklist above.
+    for _reserved in sorted(POLICY_UDF_NAMES):
+        if _reserved in masked_body:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"{_reserved}() is reserved for access-policy bodies and cannot be "
+                    "called from a query"
+                ),
+            )
     # SQL-as-a-string table functions (query/query_table/…): their target never
     # appears as a matchable token, so the RBAC name denylist cannot see it.
     if _has_sql_string_table_function(body):

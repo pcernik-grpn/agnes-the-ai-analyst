@@ -17,7 +17,8 @@ source of truth. Its hard invariants:
 4. Every mask is **type-preserving** and keeps the column's own output name, so
    attaching a policy never changes what ``DESCRIBE`` (and therefore
    ``agnes schema``, the catalog, and the effective-schema surfaces) reports.
-   The partial masks (``last4``, ``email_partial``) are string surgery and buy
+   The partial masks (``last4``, ``email_partial``) are string surgery, and
+   ``pseudonymize_keyed`` calls a ``VARCHAR -> VARCHAR`` function; all three buy
    this by being text-only: on any other column type the compile is refused
    rather than quietly casting the output to text.
 
@@ -41,8 +42,14 @@ The spec shape (all keys optional except ``table``)::
 ``ROW_OP`` is one of ``in_caller_groups`` (row's column is one of the caller's
 live groups), ``eq_caller_email`` / ``eq_caller_id`` (self-owned rows), ``eq``
 / ``in`` (literal match). ``MASK`` is ``show`` | ``hide`` | ``nullify`` |
-``hash`` | ``unmask`` | ``last4`` | ``email_partial`` (``unmask`` needs a
-``group`` or ``groups`` list; ``last4`` and ``email_partial`` are text-only).
+``hash`` | ``unmask`` | ``last4`` | ``email_partial`` | ``pseudonymize_keyed``
+(``unmask`` needs a ``group`` or ``groups`` list; ``last4``, ``email_partial``
+and ``pseudonymize_keyed`` are text-only). ``pseudonymize_keyed`` is the keyed counterpart of ``hash``: same stable,
+joinable value, but HMAC-SHA256 under this instance's own anonymization key
+(``agnes_hmac``, ``src/access_policy_udf.py``) instead of an unsalted md5 a
+dictionary reverses. It is DuckDB-only -- the key must never travel to a remote
+engine -- so a ``query_mode='remote'`` table's policy is refused at save time
+(``policy_function_duckdb_only``).
 
 A ``groups`` list is a **modifier on any value-producing mask**, not a mask of
 its own: the listed groups see the column verbatim, everyone else gets that
@@ -86,6 +93,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+from src.access_policy_udf import POLICY_HMAC_FUNCTION
 from src.sql_ident import quote_ident
 
 # Row operators the builder can emit. Kept explicit so an unknown op is a loud
@@ -257,13 +265,35 @@ def _email_partial_expr(q: str) -> str:
     )
 
 
-# Masks that are string surgery and therefore text-only. Applying one to a
-# numeric/temporal/composite column would have to either CAST (silently changing
-# the output column's type, which every DESCRIBE-based schema surface downstream
-# then reports) or emit nonsense, so the compiler refuses instead.
+def _pseudonymize_keyed_expr(q: str) -> str:
+    """The KEYED pseudonym: ``agnes_hmac(col)`` -- hex HMAC-SHA256 under this
+    instance's own anonymization key (``src/access_policy_udf.py``).
+
+    Everything ``hash`` (md5) offers, minus the dictionary attack: the value is
+    still stable, so it still joins across tables on this instance, but nobody
+    without the key can turn ``alice@example.com`` into the digest and match it
+    back. NULL-preserving without an explicit arm -- the function itself
+    returns NULL for NULL.
+
+    Text-only for the same reason as the partial masks (it takes and returns
+    VARCHAR, so any other input type would change the output column's type),
+    and DuckDB-only by construction: the key must never travel to a remote
+    engine, which is why the save-time validator refuses this function on a
+    ``query_mode='remote'`` table.
+    """
+    return f"{POLICY_HMAC_FUNCTION}({q})"
+
+
+# Masks that operate on text and therefore only apply to text columns -- string
+# surgery (`last4`, `email_partial`) or a `VARCHAR -> VARCHAR` function
+# (`pseudonymize_keyed`). Applying one to a numeric/temporal/composite column
+# would have to either CAST (silently changing the output column's type, which
+# every DESCRIBE-based schema surface downstream then reports) or emit nonsense,
+# so the compiler refuses instead.
 _TEXT_ONLY_MASKS = {
     "last4": _last4_expr,
     "email_partial": _email_partial_expr,
+    "pseudonymize_keyed": _pseudonymize_keyed_expr,
 }
 
 

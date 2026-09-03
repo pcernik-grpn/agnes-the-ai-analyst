@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 import duckdb
 
 from app.auth.dependencies import get_current_user, _get_db
+from src.access_policy_udf import register_policy_udfs
 from src.db import _open_duckdb
 from src.audit_helpers import identity_for_audit, client_kind_from_user
 from src.rbac import can_access_table
@@ -489,6 +490,13 @@ def build_sample(
         c = _open_duckdb(":memory:")
         try:
             if relation.policied:
+                # `agnes_hmac` (the `pseudonymize_keyed` mask) is registered
+                # by Agnes on the connection a policy body runs on. This
+                # throwaway :memory: DB is one of them -- it is NOT
+                # `get_analytics_db_readonly()`, whose registration covers
+                # /api/query -- so without this the mask would 500 here (fail
+                # closed, but broken) on a table it serves correctly elsewhere.
+                register_policy_udfs(c)
                 # The parquet path is server-resolved, never user input, so
                 # it is safe to splice as an escaped literal — it must NOT
                 # be a `?` placeholder: the policy binds named `$user_*`

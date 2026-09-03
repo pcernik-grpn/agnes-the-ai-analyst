@@ -18,6 +18,7 @@ from src.db import _open_duckdb
 from app.instance_config import get_value
 from src.audit_helpers import identity_for_audit, client_kind_from_user
 from src.rbac import can_access_table
+from src.access_policy_udf import register_policy_udfs
 from src.access_policy import (
     PolicyError,
     PolicyIdentityUnresolvable,
@@ -947,6 +948,13 @@ def run_scan(
             try:
                 projection = ", ".join(quote_ident(c) for c in req.select) if req.select else "*"
                 if relation.policied:
+                    # `agnes_hmac` (the `pseudonymize_keyed` mask) is registered
+                    # by Agnes on the connection a policy body runs on. This
+                    # throwaway :memory: DB is one of them -- it is NOT
+                    # `get_analytics_db_readonly()`, whose registration covers
+                    # /api/query -- so without this the mask would 500 here (fail
+                    # closed, but broken) on a table it serves correctly elsewhere.
+                    register_policy_udfs(local)
                     # The parquet path is server-resolved, never user
                     # input, so it is safe to splice as an escaped literal
                     # — it must NOT be a `?` placeholder: the policy binds
