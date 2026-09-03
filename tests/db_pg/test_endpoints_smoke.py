@@ -2797,6 +2797,13 @@ KNOWN_UNTESTED = {
     "GET /semantic-layer",
     "GET /semantic-layer/{slug}",
     "GET /semantic-layer/{slug}/{object_id}",
+    # The authoring page reached from Definitions' "+ New model" card. Same
+    # reason as the three above: rendering + authority-gating covered by
+    # tests/test_web_semantic_model_builder.py, outside the scanned modules.
+    # It is declared separately because it is a DIFFERENT route registered
+    # BEFORE /semantic-layer/{slug} so the static segment is not swallowed —
+    # if that ordering is ever reversed this entry stops matching a real route.
+    "GET /semantic-layer/new",
     "GET /setup",
     "GET /setup-advanced",
     "GET /slack/bind",

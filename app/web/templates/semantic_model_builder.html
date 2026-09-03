@@ -1,20 +1,46 @@
-{% extends "base_page.html" %}
+{% extends "base_index.html" %}
 {# Semantic model builder — the page behind Definitions' "+ New model" card.
 
-   THE SHELL IS THE POINT. `css/builder.css` + `js/components/builder_shell.js`
-   are what /agents, /skills, the data-package drawer and the MCP builder all
-   render into, and authoring a semantic model had drifted away from them: its
-   only UI was the generic Studio page (one big YAML textarea beside a chat),
-   which is a different mental model for the same job. This page is the same
-   workspace as its siblings — input on the left, the configuration on the
-   right, the right panel the source of truth, Save the only write.
+   IT IS THE SHARED SHELL, not a page that resembles one. The first cut of this
+   page extended `base_page.html` and hung the primary action off
+   `{% block toolbar %}`, which rendered a gradient hero and a page toolbar
+   above two panes — recognisably its own thing sitting next to /agents rather
+   than the same surface. What the four existing builders actually share is
+   this, and all of it matters:
+
+     - `base_index.html`, filling `page_head` + `page_surface` (NOT
+       base_page's hero/toolbar/page).
+     - `body.ag-building`, which is what makes the workspace full-bleed and
+       pinned to the viewport: it unpads `.idx-head`, drops `.idx-band-inner`'s
+       max-width, hides the footer, and turns the band into a flex column.
+     - A mount carrying **`.ag-builder-mount`**, the last link in that flex
+       chain. builder.css says in as many words that a new builder page which
+       misses this hook "silently got no flex column: its panes never became
+       scroll containers, and the composer fell off the bottom of the page" —
+       and that a third builder should not have to rediscover it. This was that
+       page; now it carries the class.
+     - `BuilderShell.head(...)` for the chrome — back link, title, and the
+       primary action in the header where its siblings put it. A workspace
+       whose action sits below a scrolling form reads as a dialog, which is the
+       reason those verbs moved into the header in the first place.
+     - `BuilderShell.head`'s `alertsId` region for every outcome. Its comment
+       records why it exists: refusals used to land in three different places
+       across the builders, one of them the bottom of a scrolling form while
+       the button that caused it had moved to the header. So the outcome of
+       Save goes THERE, not appended to the configuration column.
+
+   The page head is deliberately empty while authoring. Its siblings hide
+   theirs on entering the builder (`setPageHead(false)` in agents.html) because
+   the head belongs to the list and the builder is full-bleed; this page is
+   only ever the builder, so it renders none in the first place and
+   `body.ag-building .idx-head { padding: 0 }` closes the gap.
 
    WHAT IS DELIBERATELY NOT HERE YET: the conversation. Its siblings' left pane
    holds a builder chat backed by an `app/api/builder_core.py` adapter, and this
    type has none. Rather than render a composer that cannot answer, the left
    pane is the document — paste/import in, generated document out — which is
-   exactly what /admin/ontology's left pane does. The adapter is the next
-   increment and it replaces the "Start" tab; nothing else here moves.
+   what /admin/ontology's left pane does. The adapter is the next increment and
+   it replaces the "Start" tab; nothing else here moves.
 
    THE DOCUMENT IS BUILT AS JSON, not YAML. `POST /api/semantic-models/apply`
    takes "Ossie YAML/JSON text" and YAML is a superset of JSON, so
@@ -22,35 +48,35 @@
    get wrong — and the server validates it either way. The Document tab shows
    the caller exactly what Save will send.
 
-   ONE WRITE, HONESTLY LABELLED. The apply endpoint branches on authority:
-   an admin's document is published, anyone else's is queued for review. The
-   button says which BEFORE the click — the one thing the Studio page got
-   right and the half worth keeping. `can_author_model` (see
-   router::_can_author_semantic_model) is the server's answer to whether
-   either outcome is available at all; when it is false this page explains
-   itself rather than 404ing, the same posture /admin/ontology takes with the
-   facts flag off. #}
+   ONE WRITE, HONESTLY LABELLED. The apply endpoint branches on authority: an
+   admin's document is published, anyone else's is queued for review. The
+   button says which BEFORE the click. `can_author_model` (see
+   router::_can_author_semantic_model) is the server's answer to whether either
+   outcome is available at all; when it is false this page explains itself
+   rather than 404ing, the same posture /admin/ontology takes with the facts
+   flag off — and it renders as an ORDINARY page, with a real page head and no
+   `ag-building`, because there is no workspace to go full-bleed for. #}
 
 {% block title %}New semantic model — {{ config.INSTANCE_NAME }}{% endblock %}
 {% block container_modifier %}container--wide{% endblock %}
 
-{% set page_hero_eyebrow = "Definitions" %}
-{% set page_hero_title = "New semantic model" %}
-{% set page_hero_subtitle = "Describe your data once — datasets, metrics and the context an agent needs to read them — so every query starts from the same definitions." if can_author_model else "Authoring is unavailable on this instance." %}
+{# Full-bleed only when there is a workspace. See the block comment. #}
+{% block body_attrs %}{% if can_author_model %}class="ag-building"{% endif %}{% endblock %}
 
 {% block head_extra %}
 <link rel="stylesheet" href="{{ static_url('css/builder.css') }}">
 <style>
-  /* Page chrome only. Every colour rides a --ds-* token; the panes, sections
-     and their type come from builder.css unchanged, which is the whole reason
-     this page reads like /agents. */
+  /* Page-local only. The shell — panes, sections, header strip, alert region —
+     comes from builder.css unchanged, which is the point. Every colour rides a
+     --ds-* token. */
   .smb-blocked { text-align: center; padding: 48px 20px; border: 1px dashed var(--ds-border); border-radius: 14px; color: var(--ds-text-secondary); font-size: 14px; line-height: 1.6; }
   .smb-blocked a { color: var(--ds-primary); }
 
-  /* The body under the left pane's tab strip. `builder.css` styles the strip
+  /* The body under the left pane's tab strip. builder.css styles the strip
      (`.ag-tabs`) but deliberately not what follows it — each builder's left
-     pane holds something different (a conversation, a picker, a document). */
-  .smb-panel { padding: 4px 22px 22px; overflow-y: auto; }
+     pane holds something different (a conversation, a picker, a document) —
+     so the scroll container is the host's to declare. */
+  .smb-panel { padding: 4px 22px 22px; overflow-y: auto; flex: 1 1 auto; min-height: 0; }
 
   .smb-field { display: block; margin-bottom: 12px; }
   .smb-field > span { display: block; font-size: 12.5px; font-weight: 600; color: var(--ds-text-secondary); margin-bottom: 5px; }
@@ -72,12 +98,14 @@
   .smb-del:hover { color: var(--ds-accent-danger-ink); background: var(--ds-accent-danger-bg); }
   .smb-empty-sec { font-size: 13px; color: var(--ds-text-muted); margin: 0 0 10px; }
 
-  .smb-doc { font-family: var(--ds-font-mono); font-size: 12px; line-height: 1.55; white-space: pre; overflow-x: auto; margin: 0; padding: 12px 13px; border: 1px solid var(--ds-border); border-radius: 11px; background: var(--ds-surface-sunken); color: var(--ds-text-primary); max-height: 60vh; }
+  .smb-doc { font-family: var(--ds-font-mono); font-size: 12px; line-height: 1.55; white-space: pre; overflow-x: auto; margin: 0; padding: 12px 13px; border: 1px solid var(--ds-border); border-radius: 11px; background: var(--ds-surface-sunken); color: var(--ds-text-primary); }
 
-  /* Save's outcome, in the pane the reader is already looking at. An `applied`
-     document is live and a `submitted_for_review` one is not, and the two must
-     never look alike — hence separate tones rather than one neutral note. */
-  .smb-out { margin-top: 12px; padding: 11px 13px; border-radius: 11px; font-size: 13px; line-height: 1.55; }
+  /* Outcome content. The REGION is the shell's (`.ag-alerts`, from
+     BuilderShell.head); only the card inside it is page-local, the same
+     division /skills keeps with its own `.sk-alert`. An `applied` document is
+     live and a `submitted_for_review` one is not, so the two never share a
+     tone. */
+  .smb-out { padding: 11px 13px; border-radius: 11px; font-size: 13px; line-height: 1.55; }
   .smb-out--ok { background: var(--ds-accent-success-bg); color: var(--ds-accent-success-ink); }
   .smb-out--queued { background: var(--ds-accent-info-bg); color: var(--ds-accent-info-ink); }
   .smb-out--err { background: var(--ds-accent-danger-bg); color: var(--ds-accent-danger-ink); }
@@ -86,16 +114,18 @@
 </style>
 {% endblock %}
 
-{% block toolbar %}
-<a class="btn" href="/semantic-layer">Definitions</a>
-{% if can_author_model %}
-{# The verb is the outcome. Only ONE of the two ever renders, so the page can
-   never show a reader a promise the endpoint will not keep. #}
-<button type="button" class="btn btn-primary" id="smb-save" disabled>{% if is_admin %}Publish{% else %}Submit for review{% endif %}</button>
+{% block page_head %}
+{% if not can_author_model %}
+{# Only the blocked state gets a page head; while authoring, the shell's own
+   header strip carries the title, the way back, and the action. #}
+<div>
+  <h1 class="page-title">New semantic model</h1>
+  <p class="page-lede">Authoring is unavailable on this instance.</p>
+</div>
 {% endif %}
 {% endblock %}
 
-{% block page %}
+{% block page_surface %}
 {% if not can_author_model %}
 <div class="smb-blocked">
   <p>Authoring a semantic model files it for review, and the review queue is switched off on this instance.</p>
@@ -103,7 +133,9 @@
      definition you have access to under <a href="/semantic-layer">Definitions</a>.</p>
 </div>
 {% else %}
-<div id="smb-app"></div>
+{# `.ag-builder-mount` is load-bearing, not decoration — it is the last link in
+   the flex chain that makes the panes their own scroll containers. #}
+<div id="smb-app" class="ag-builder-mount"></div>
 {% endif %}
 {% endblock %}
 
@@ -123,8 +155,7 @@
      places, which put BOTH verbs in the page source — so a reader viewing
      source, or a guard test, could find the review wording in a page that
      publishes directly. There is one outcome per caller, so there is one word
-     here, and the toolbar button above is stamped from the same condition.
-     (Which is also why this comment describes the two verbs instead of
+     here. (Which is also why this comment describes the two verbs instead of
      spelling them: the page must contain only the one that applies.) */
   var SAVE_VERB = {{ ('Publish' if is_admin else 'Submit for review') | tojson }};
   var SAVE_VERB_SHORT = {{ ('Publish' if is_admin else 'Submit') | tojson }};
@@ -134,11 +165,13 @@
      can never disagree about what Save will send. */
   var draft = { name: '', description: '', datasets: [], metrics: [] };
   var tab = 'start';
+  /* Held across renders: the header is rebuilt on every render, so an outcome
+     stored only in the DOM would vanish the moment a tab was clicked. */
+  var outcome = null;
 
   /* ── The document Save sends ───────────────────────────────────────────────
-     Optional keys are omitted rather than emitted empty: the vendored Ossie
-     schema rejects a `metrics: []` on some shapes, and an empty string is not
-     the same claim as an absent description. */
+     Optional keys are omitted rather than emitted empty: an empty string is
+     not the same claim as an absent description. */
   function documentObject() {
     var model = { name: draft.name || 'untitled' };
     if (draft.description) model.description = draft.description;
@@ -178,10 +211,21 @@
     return !!draft.name && draft.datasets.some(function (d) { return !!d.name; });
   }
 
+  /* ── Chrome: the shell's header strip, with the action in it ────────────── */
+  function headActionsHtml() {
+    return '<button type="button" class="btn btn-primary" id="smb-save"' +
+      (isSubmittable() ? '' : ' disabled') + '>' + esc(SAVE_VERB) + '</button>';
+  }
+
+  function alertsHtml() {
+    if (!outcome) return '';
+    return '<div class="smb-out smb-out--' + outcome.cls + '" role="status">' + outcome.html + '</div>';
+  }
+
   /* ── The left pane: start from a document, or read the one being built ──── */
   function leftPane() {
     var body = tab === 'doc'
-      ? '<p class="smb-hint">Exactly what ' + SAVE_VERB_SHORT +
+      ? '<p class="smb-hint">Exactly what ' + esc(SAVE_VERB_SHORT) +
           ' will send. Generated from the configuration — edit it there.</p>' +
         '<pre class="smb-doc" id="smb-doc">' + esc(documentText()) + '</pre>'
       : '<p class="smb-hint">Already have an Ossie document? Paste it and it fills the ' +
@@ -274,16 +318,29 @@
   }
 
   function render() {
-    document.getElementById('smb-app').innerHTML = BuilderShell.workspace({
-      left: leftPane(),
-      cfgTitle: 'Configuration',
-      cfgSub: 'This is what gets written. Nothing is saved until you press ' +
-              SAVE_VERB + '.',
-      cfgBodyId: 'smb-cfg',
-      cfg: configPane()
-    });
-    var save = document.getElementById('smb-save');
-    if (save) save.disabled = !isSubmittable();
+    document.getElementById('smb-app').innerHTML =
+      BuilderShell.head({
+        backLabel: 'Definitions',
+        title: 'New semantic model',
+        titleId: 'smb-build-title',
+        actionsId: 'smb-build-actions',
+        actions: headActionsHtml(),
+        alertsId: 'smb-alerts',
+        alerts: alertsHtml()
+      }) +
+      BuilderShell.workspace({
+        left: leftPane(),
+        cfgTitle: 'Configuration',
+        /* Same register as every sibling — lowercase, short, no full stop, and
+           four of the five end this way. A longer sentence here wraps inside
+           `.ag-cfg-head-main` (flex, centred, wrapping) and the column head
+           stops matching the others, which is how the first cut looked wrong
+           while using the identical markup. What Save does is the header
+           button's job to say, not this line's. */
+        cfgSub: 'what this model is, editable by hand',
+        cfgBodyId: 'smb-cfg',
+        cfg: configPane()
+      });
   }
 
   /* Repaint only the derived views a keystroke can change. Re-rendering the
@@ -295,6 +352,15 @@
     if (save) save.disabled = !isSubmittable();
   }
 
+  function showOutcome(cls, html) {
+    outcome = { cls: cls, html: html };
+    var host = document.getElementById('smb-alerts');
+    if (host) {
+      host.innerHTML = alertsHtml();
+      host.scrollIntoView({ block: 'nearest' });
+    }
+  }
+
   /* ── Reading a pasted document back into the draft ────────────────────────
      JSON only, by design: a YAML parser is a dependency this page does not
      need, and a document pasted as YAML gets a clear "paste JSON, or build it
@@ -303,7 +369,7 @@
   function importPasted() {
     var raw = (document.getElementById('smb-paste') || {}).value || '';
     var out = document.getElementById('smb-import-out');
-    if (!raw.trim()) { out.innerHTML = ''; return; }
+    if (!raw.trim()) { if (out) out.innerHTML = ''; return; }
 
     var parsed;
     try {
@@ -350,23 +416,9 @@
   }
 
   /* ── The one write ───────────────────────────────────────────────────────── */
-  function outcomeBox(cls, html) {
-    var cfg = document.getElementById('smb-cfg');
-    if (!cfg) return;
-    var old = document.getElementById('smb-out');
-    if (old) old.remove();
-    var box = document.createElement('div');
-    box.id = 'smb-out';
-    box.className = 'smb-out smb-out--' + cls;
-    box.innerHTML = html;
-    cfg.appendChild(box);
-    box.scrollIntoView({ block: 'nearest' });
-  }
-
   function save() {
     var btn = document.getElementById('smb-save');
     btn.disabled = true;
-    var label = btn.textContent;
     btn.textContent = 'Working…';
 
     fetch('/api/semantic-models/apply', {
@@ -377,25 +429,25 @@
     }).then(function (r) {
       return r.json().then(function (body) { return { status: r.status, body: body }; });
     }).then(function (res) {
-      btn.textContent = label;
+      btn.textContent = SAVE_VERB;
       btn.disabled = !isSubmittable();
 
       if (res.status === 200 && res.body.outcome === 'applied') {
         var slug = (res.body.model && res.body.model.slug) || draft.name;
-        outcomeBox('ok', 'Published. <a href="/semantic-layer/' + encodeURIComponent(slug) +
+        showOutcome('ok', 'Published. <a href="/semantic-layer/' + encodeURIComponent(slug) +
           '">Open ' + esc(slug) + '</a> — it is live and agents can read it now.');
         return;
       }
       if (res.status === 200 && res.body.outcome === 'submitted_for_review') {
-        outcomeBox('queued', 'Submitted for review. An admin has to approve it before it goes live — ' +
+        showOutcome('queued', 'Submitted for review. An admin has to approve it before it goes live — ' +
           'it is <strong>not</strong> readable by agents yet.');
         return;
       }
-      outcomeBox('err', errorHtml(res));
+      showOutcome('err', errorHtml(res));
     }).catch(function () {
-      btn.textContent = label;
+      btn.textContent = SAVE_VERB;
       btn.disabled = !isSubmittable();
-      outcomeBox('err', 'Could not reach the server. Nothing was written.');
+      showOutcome('err', 'Could not reach the server. Nothing was written.');
     });
   }
 
@@ -450,7 +502,9 @@
       '. Nothing was written.' + (serverMsg ? ' ' + esc(serverMsg) : '');
   }
 
-  /* ── Wiring. One delegated listener per event, on the container. ─────────── */
+  /* ── Wiring. One delegated listener per event, on the mount. Everything —
+     the header's action and back link included — is rebuilt by render(), so
+     nothing may hold a direct reference to a node. ─────────────────────────── */
   var app = document.getElementById('smb-app');
 
   app.addEventListener('input', function (e) {
@@ -468,6 +522,15 @@
 
   app.addEventListener('click', function (e) {
     var t = e.target;
+
+    /* The shell's own back button. On its siblings this swaps a view; this
+       page IS the builder, so it leaves for the list it was opened from. */
+    if (t.closest('[data-ag-back]')) {
+      window.location.href = '/semantic-layer';
+      return;
+    }
+
+    if (t.closest('#smb-save')) { save(); return; }
 
     var add = t.closest('[data-smb-add]');
     if (add) {
@@ -493,9 +556,6 @@
       render();
     }
   });
-
-  var saveBtn = document.getElementById('smb-save');
-  if (saveBtn) saveBtn.addEventListener('click', save);
 
   render();
 })();
