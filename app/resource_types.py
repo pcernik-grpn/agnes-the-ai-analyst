@@ -702,6 +702,13 @@ def _agent_blocks() -> list[Block]:
     rows = agents_repo().list(limit=_GRANT_PROJECTION_LIMIT)
     if not rows:
         return []
+    # The owner, by email, in one batched read — the same projection the
+    # collection block already makes. Without it an agent someone shared from
+    # the Library had no ownership on its row at all: the only signal was the
+    # grey "shared by" at the end of the detail line, and /admin/access has no
+    # agent page of its own to send an admin to. The owner IS where the agent
+    # lives, so the row needs to be able to say who that is.
+    owners = _owner_emails(r.get("owner_user_id") for r in rows)
     return [
         {
             "id": "agents",
@@ -712,6 +719,8 @@ def _agent_blocks() -> list[Block]:
                     "name": r["name"],
                     "slug": r.get("slug"),
                     "description": r.get("role") or r.get("instructions") or "",
+                    "owner_user_id": r.get("owner_user_id"),
+                    "owner_email": owners.get(str(r.get("owner_user_id") or "")),
                 }
                 for r in rows
             ],
@@ -867,6 +876,10 @@ def _collection_blocks() -> list[Block]:
                     # see these files?" became unanswerable from the one page
                     # that exists to answer it.
                     "owner_email": owners.get(r.get("created_by") or ""),
+                    # The owner's id too, so a row can tell "the sharer IS the
+                    # owner" by comparison rather than by guessing from names
+                    # (audit U7) — and stop saying the same person twice.
+                    "owner_user_id": r.get("created_by"),
                     "file_count": counts.get(r["id"], 0) if counts is not None else None,
                 }
                 for r in rows

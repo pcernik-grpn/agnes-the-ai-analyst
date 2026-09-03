@@ -60,3 +60,23 @@ def test_an_email_passes_through_and_a_stale_id_stays_raw(seeded_app):
     rows = {g["id"]: g for g in _overview(seeded_app)["grants"]}
     assert rows[by_email]["assigned_by_name"] == "someone@test.com"      # untouched
     assert rows[by_ghost]["assigned_by_name"] == "no-such-user-id"       # raw, not dropped
+
+
+def test_agent_and_collection_items_name_their_owner(seeded_app):
+    """Without these two fields a row someone shared had no ownership on it and
+    nowhere an admin could go — the builder page shows only the caller's own
+    agents. Both projections now carry the owner's id and email."""
+    from src.repositories import agents_repo, file_corpora_repo, users_repo
+
+    owner = users_repo().get_by_email("analyst@test.com")
+    agents_repo().create(id="agt_owner_test", owner_user_id=owner["id"], name="Owner test", slug="owner-test")
+    col = file_corpora_repo().create(name="Owner test collection", slug="owner-test-col", description=None, created_by=owner["id"])
+
+    ov = _overview(seeded_app)
+    items = {(r["type_key"], it["resource_id"]): it for r in ov["resources"] for b in r["blocks"] for it in b["items"]}
+    agent = items[("agent", "agt_owner_test")]
+    assert agent["owner_user_id"] == owner["id"]
+    assert agent["owner_email"] == owner["email"]
+    coll = items[("collection", col)]
+    assert coll["owner_user_id"] == owner["id"]
+    assert coll["owner_email"] == owner["email"]

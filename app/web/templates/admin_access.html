@@ -2331,6 +2331,10 @@
      count is ordinary detail. */
   .ax-r__tools--none { color: var(--ds-accent-warn-ink, #92590a); }
   .ax-pk-r--scope{ border-left: 3px solid var(--ds-primary); }
+  /* The sharer on an owner-shared row: body ink, not muted — it is the
+     row's primary fact, not a footnote. The name is bold; the rest is not. */
+  .ax-r__shared { color: var(--ds-text-secondary); }
+  .ax-r__shared b { color: var(--ds-text-primary); font-weight: 600; }
   .ax-r--scope{
     border-left: 3px solid var(--ds-primary);
     padding-left: 9px;
@@ -3207,10 +3211,12 @@
      an owner: a chat file-drop becomes a one-file collection named after the
      file, so an admin — who sees every collection by god-mode — got a flat
      list of filenames with nothing saying they belonged to someone else. */
-  const itemProvenance = (i) => {
+  const itemProvenance = (i, opts) => {
     if (!i) return "";
     const bits = [];
-    if (i.owner_email) bits.push(`owned by ${esc(i.owner_email)}`);
+    // Skipped when the row already names this person as the sharer: "Shared
+    // by Ada Lovelace · owned by ada@example.com" says one fact twice.
+    if (i.owner_email && !(opts && opts.ownerNamed)) bits.push(`owned by ${esc(i.owner_email)}`);
     if (typeof i.file_count === "number") {
       bits.push(`${i.file_count} ${i.file_count === 1 ? "file" : "files"}`);
     }
@@ -3353,7 +3359,7 @@
         m.managedBy.href ? `<a class="ax-own__edit" href="${esc(m.managedBy.href)}">${esc(m.managedBy.surface)} ↗</a>` : ""}`;
     }
     return `<button type="button" class="ax-revoke" data-revoke>${act}</button>${
-      m.href ? `<a class="ax-own__edit" href="${m.href}">where it lives ↗</a>` : ""}`;
+      m.href ? `<a class="ax-own__edit" href="${m.href}">${esc(m.hrefLabel || "where it lives ↗")}</a>` : ""}`;
   };
 
   /* The type, as one word on the row. `display_name` is a plural section
@@ -3860,7 +3866,14 @@
       collection: (id) => `/library/d/${encodeURIComponent(id)}`,
       corpus_file: (id) => `/library/d/${encodeURIComponent(id)}`,
       data_app: (id) => `/apps/${encodeURIComponent(id)}`,
-      agent: (id) => `/agents?agent=${encodeURIComponent(id)}`,
+      // /agents is the OWNER's builder, fed by /api/v1/agents (the caller's
+      // own agents), so for an admin looking at a colleague's agent it opened
+      // on nothing — a dead end labelled "where it lives". There is no admin
+      // page for an agent; the agent lives with its owner, so the row's link
+      // goes to the owner on /admin/users when the owner is known.
+      agent: (id, item) => (item && item.owner_user_id)
+        ? `/admin/users/${encodeURIComponent(item.owner_user_id)}`
+        : `/agents?agent=${encodeURIComponent(id)}`,
       // Carries the group out with it. The person lens already round-trips
       // (`?from=simulate&user=`) so a package page opened from an audit says
       // whose audit and offers the way back; the group lens did not, so the
@@ -3883,13 +3896,17 @@
       const owned = OWNER_SHARED.has(t.type_key);
       const hrefFn = ENTITY_PAGE[t.type_key];
       const name = esc(itemName(i));
-      const nameHtml = hrefFn ? `<a href="${hrefFn(i.resource_id)}">${name}</a>` : name;
+      const nameHtml = hrefFn ? `<a href="${hrefFn(i.resource_id, i)}">${name}</a>` : name;
       const who = whoGranted(grant);
       // An inherited row is NOT this group's to change: the tier control and
       // Revoke both act on the Everyone grant, so offering them here would
       // let an admin quietly alter a company-wide grant while looking at one
       // group. Say where it comes from and send them there instead.
-      const ownHref = owned && hrefFn ? hrefFn(i.resource_id) : "";
+      const ownHref = owned && hrefFn ? hrefFn(i.resource_id, i) : "";
+      // What the link is FOR, by kind. "where it lives" was right for a
+      // collection (its Library page) and wrong for an agent, whose only
+      // reachable home for an admin is its owner.
+      const ownLabel = t.type_key === "agent" ? "owner ↗" : "where it lives ↗";
       // An inherited row is NOT this group's to change: the tier control and
       // Revoke both act on the Everyone grant, so offering them here would
       // let an admin quietly alter a company-wide grant while looking at one
@@ -3909,7 +3926,7 @@
                tier === "required" ? "Automatic" : "Optional"}<span class="ax-managed__src"> · via Everyone</span></span></span>`
         : controlCell(t.type_key, tier, { href: ownHref, managedBy: grant.managed_by, publisherKind: i.publisher_kind });
       const manage = manageCell({
-        inherited: grant.inherited, managedBy: grant.managed_by, href: ownHref, typeKey: t.type_key,
+        inherited: grant.inherited, managedBy: grant.managed_by, href: ownHref, hrefLabel: ownLabel, typeKey: t.type_key,
       });
       return `
       <div class="ax-r" data-kind="${esc(kindToken(t))}" data-type="${esc(t.type_key)}" data-rid="${esc(i.resource_id)}"${grant.inherited ? ' data-inherited="1"' : ""}>
@@ -3920,8 +3937,16 @@
                logic was already the hard-to-read part of this row with two
                possible chunks, and provenance makes three. */
             const bits = [];
+            /* On a row someone shared from the Library, WHO shared it is the
+               fact the row exists to carry — and it sat last, in grey, after
+               the description and the file count. It leads now, as a name,
+               with the owner beside it when the two differ. (Audit U7.) */
+            // Sharer and owner are the same person when the grant's author IS
+            // the item's owner — compared by id, not by guessing from names.
+            const sharerIsOwner = owned && who && !!i.owner_user_id && grant.assigned_by === i.owner_user_id;
+            if (owned && who) bits.push(`<span class="ax-r__shared">Shared by <b>${esc(who)}</b></span>`);
             if (i.description) bits.push(esc(String(i.description).slice(0, 120)));
-            const prov = itemProvenance(i);
+            const prov = itemProvenance(i, { ownerNamed: sharerIsOwner });
             if (prov) bits.push(prov);
             /* An MCP source grant is necessary but not sufficient — it is
                ANDed with per-tool grants set on the source's own page. The
@@ -3939,7 +3964,7 @@
                 bits.push(`<a class="ax-inherit ax-r__tools${tc.total && !n ? " ax-r__tools--none" : ""}" href="/admin/mcp-sources/${encodeURIComponent(i.resource_id)}" title="Tools are granted per tool on the server's own page">${esc(label)} →</a>`);
               }
             }
-            if (who) bits.push(`<span class="ax-r__who">${owned ? "shared by" : "granted by"} ${esc(who)}</span>`);
+            if (who && !owned) bits.push(`<span class="ax-r__who">granted by ${esc(who)}</span>`);
             return bits.join(`<span class="ax-r__sep"> · </span>`);
           })()}</span>
         </span>

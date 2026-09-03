@@ -1148,7 +1148,9 @@ class TestRemovingAMemoryDomainGrantIsNotCalledRevoke:
 
     def test_both_row_renderers_tell_the_cell_the_type(self):
         src = self._source()
-        assert "href: ownHref, typeKey: t.type_key," in src
+        # The call grew `hrefLabel` when an agent's link learned to say "owner ↗"
+        # (U7); what this pins is that the TYPE still travels with it.
+        assert "hrefLabel: ownLabel, typeKey: t.type_key," in src
         assert "manageCell({ managedBy: grant.managed_by, typeKey: r.t.type_key })" in src
 
     def test_the_confirm_does_not_claim_anyone_loses_anything(self):
@@ -1226,3 +1228,46 @@ class TestASharedRowNamesTheSharer:
         f = f[: f.index("\n  }", 0)]
         assert "grant.assigned_by_name" in f
         assert f.index("assigned_by_name") < f.index("const raw = grant && grant.assigned_by;")
+
+
+class TestAnOwnerSharedRowSaysWhoAndGoesSomewhereReal:
+    """Audit U7, the rest of it — found by the owner looking at a seeded row.
+
+    An agent's "where it lives" went to /agents?agent=<id>: the OWNER's
+    builder, fed by /api/v1/agents (the caller's own agents), so for an admin
+    looking at a colleague's agent it opened on nothing. There is no admin
+    page for an agent; it lives with its owner, so the link goes there.
+
+    "shared by <name>" sat last in the detail line, in grey, after the
+    description and the file count — the one fact the row exists to carry,
+    placed as a footnote. It leads now, as a name. And the sharer is compared
+    to the owner by id, not by guessing from names, so "owned by" is said
+    once, or not at all when they are the same person.
+    """
+
+    TEMPLATE = "app/web/templates/admin_access.html"
+
+    def _source(self) -> str:
+        from pathlib import Path
+
+        return Path(self.TEMPLATE).read_text(encoding="utf-8")
+
+    def test_an_agents_link_goes_to_its_owner(self):
+        src = self._source()
+        assert "agent: (id, item) => (item && item.owner_user_id)" in src
+        assert "? `/admin/users/${encodeURIComponent(item.owner_user_id)}`" in src
+        assert 'const ownLabel = t.type_key === "agent" ? "owner ↗" : "where it lives ↗";' in src
+        assert 'hrefLabel: ownLabel' in src
+
+    def test_the_sharer_leads_the_row(self):
+        src = self._source()
+        i = src.index('bits.push(`<span class="ax-r__shared">Shared by <b>${esc(who)}</b></span>`);')
+        j = src.index("if (i.description) bits.push(esc(String(i.description).slice(0, 120)));", i - 400)
+        assert i < j, "the sharer must be pushed before the description"
+
+    def test_sharer_and_owner_are_compared_by_id(self):
+        src = self._source()
+        assert "grant.assigned_by === i.owner_user_id" in src
+        assert 'itemProvenance(i, { ownerNamed: sharerIsOwner })' in src
+        assert "if (i.owner_email && !(opts && opts.ownerNamed))" in src
+        assert 'split("@")[0]' not in src[src.index("const sharerIsOwner"): src.index("const sharerIsOwner") + 600]
