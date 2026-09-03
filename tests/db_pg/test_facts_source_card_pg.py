@@ -82,11 +82,12 @@ def _seed_corpus_file(corpus_id: str, file_id: str, status: str = "indexed", sha
         )
 
 
-def _fixture(pg_env):
+def _fixture(pg_env) -> str:
     """Two collections (A, B), files in each with varied processing_status,
     one fact + one edge claimed in A, an ingest run touching both, and a
     grant on A only (B is left ungranted — the "collections with no group"
-    case)."""
+    case). Returns the fact's own id, for a caller that needs to act on it
+    directly (e.g. a correction)."""
     from src.repositories import resource_grants_repo, user_group_members_repo, user_groups_repo, users_repo
 
     users_repo().create(id="uploader1", email="uploader1@test.com", name="Uploader")
@@ -126,6 +127,7 @@ def _fixture(pg_env):
     grp = user_groups_repo().create(name="sp-group", description="test", created_by="test-fixture")
     user_group_members_repo().add_member("admin1", grp["id"], source="test-fixture")
     resource_grants_repo().create(grp["id"], "collection", CORPUS_A, "test-fixture", "required")
+    return subj
 
 
 def _create_sharepoint_connection_named(conn_id: str, **config_overrides) -> str:
@@ -181,8 +183,11 @@ def test_facts_graph_counts_endpoint_matches_the_old_page_numbers(tmp_path, monk
 
     from app.api.admin_sharepoint import facts_graph_counts
 
-    counts = facts_graph_counts(conn_id, user=_admin_user())
-    assert counts == {"facts": 1, "edges": 1}
+    counts = facts_graph_counts(conn_id, _user=_admin_user())
+    # Approximate (perf incident follow-up, 2026-09-03): a flat GROUP BY
+    # over `claims`, not the row-visibility-filtered count — but with no
+    # corrections in this fixture, the numbers agree exactly.
+    assert counts == {"facts": 1, "edges": 1, "graph_counts_kind": "approximate"}
 
 
 def test_facts_graph_counts_endpoint_is_zero_with_no_scopes(tmp_path, monkeypatch, pg_engine):
@@ -191,7 +196,11 @@ def test_facts_graph_counts_endpoint_is_zero_with_no_scopes(tmp_path, monkeypatc
 
     from app.api.admin_sharepoint import facts_graph_counts
 
-    assert facts_graph_counts(conn_id, user=_admin_user()) == {"facts": 0, "edges": 0}
+    assert facts_graph_counts(conn_id, _user=_admin_user()) == {
+        "facts": 0,
+        "edges": 0,
+        "graph_counts_kind": "approximate",
+    }
 
 
 def test_facts_graph_counts_endpoint_404s_for_a_non_sharepoint_connection(tmp_path, monkeypatch, pg_engine):
@@ -207,8 +216,48 @@ def test_facts_graph_counts_endpoint_404s_for_a_non_sharepoint_connection(tmp_pa
     import pytest
 
     with pytest.raises(HTTPException) as exc:
-        facts_graph_counts("not-sp", user=_admin_user())
+        facts_graph_counts("not-sp", _user=_admin_user())
     assert exc.value.status_code == 404
+
+
+def test_facts_graph_counts_endpoint_excludes_a_withheld_correction(tmp_path, monkeypatch, pg_engine):
+    """The one thing `approximate_counts_for_collections` is honestly NOT
+    the same as: a `wrong`/`restricted` correction still withholds a fact
+    for every caller (a content-moderation concept, not RBAC) under the
+    exact `count_visible_facts_for_collections`, but the flat `GROUP BY`
+    counts every claim regardless. Pinned so a future change to the
+    correction semantics does not silently widen the gap without anyone
+    noticing — the response is labeled `graph_counts_kind: "approximate"`
+    precisely because of gaps like this one."""
+    pg_env = pg_env_setup(tmp_path, monkeypatch, pg_engine)
+    fact_id = _fixture(pg_env)
+    conn_id = _create_sharepoint_connection(
+        cert_private_key_env="SHAREPOINT_CERT_PRIVATE_KEY",
+        scopes=_TWO_SCOPES,
+    )
+    monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", "-----BEGIN PRIVATE KEY-----\nx\n-----END PRIVATE KEY-----")
+
+    from src.repositories.facts_pg import FactsPgRepository
+    import src.db_pg as db_pg
+
+    facts_repo_ = FactsPgRepository(db_pg.get_engine())
+    # Withhold the fixture's one fact claim (CORPUS_A).
+    facts_repo_.upsert_correction(
+        subject_kind="fact",
+        subject_id=fact_id,
+        natural_keys={"aliases": []},
+        verdict="wrong",
+        reason="test",
+        decided_by="admin1",
+    )
+
+    from app.api.admin_sharepoint import facts_graph_counts
+
+    exact = facts_repo_.count_visible_facts_for_collections(_admin_user(), [CORPUS_A, CORPUS_B])
+    approx = facts_graph_counts(conn_id, _user=_admin_user())
+    assert sum(exact.values()) == 0  # withheld -> zero, for every caller including admin
+    assert approx["facts"] == 1  # the approximate count still sees the withheld claim
+    assert approx["graph_counts_kind"] == "approximate"
 
 
 def test_pipeline_strip_counts_documents_with_no_facts_ingest_run_at_all(tmp_path, monkeypatch, pg_engine):
@@ -761,3 +810,135 @@ def test_admin_data_sources_page_response_size_is_bounded(tmp_path, monkeypatch,
     assert "no collection yet" not in resp.text
     assert "/c0/0" not in resp.text
     assert "/c3/25" not in resp.text
+
+
+def test_approximate_counts_for_collections_is_fast_at_200_collections(tmp_path, monkeypatch, pg_engine):
+    """The literal fix for the production incident (2026-09-03): the exact
+    per-caller visibility CTE ran 250-316s for a SINGLE connection's scopes
+    on a live instance with ~390 collections. `approximate_counts_for_
+    collections` — a flat, indexed `GROUP BY` over `claims`, no per-caller
+    CTE — must stay well under a second even at 200 QUERIED collections x
+    500 claims each (100 000 claims), with another 200 collections'
+    worth (100 000 more claims, 200 000 total) as background data the
+    query does NOT touch — a live instance's `claims` holds every
+    connection's collections, not just the one being asked about, so a
+    dataset where the WHERE clause matches 100% of the table (every row
+    ever inserted) tests something artificially easier than production.
+    Whether Postgres picks a sequential scan or an index scan
+    (`idx_claims_corpus_id`, or the composite `idx_claims_corpus_audience`
+    which also leads with `corpus_id`) is a cost-based call that depends on
+    selectivity — see the comment above the EXPLAIN below for measurements
+    at both ends. Either is fine; the timing assertion is what matters."""
+    import time
+
+    import sqlalchemy as sa
+
+    pg_env_setup(tmp_path, monkeypatch, pg_engine)
+
+    import src.db_pg as db_pg
+
+    engine = db_pg.get_engine()
+    n_collections = 200
+    claims_per_collection = 500
+    n_facts = 2000
+    with engine.begin() as conn:
+        # 400 collections total — 200 queried, 200 background noise.
+        conn.execute(
+            sa.text(
+                "INSERT INTO file_corpora (id, slug, name, created_by) "
+                "SELECT 'col_' || i, 'col-' || i, 'Col ' || i, 'test' "
+                "FROM generate_series(0, :n_minus_1) AS i"
+            ),
+            {"n_minus_1": 2 * n_collections - 1},
+        )
+        conn.execute(
+            sa.text(
+                "INSERT INTO corpus_files (id, corpus_id, filename, sha256, processing_status) "
+                "SELECT 'cf_' || i, 'col_' || i, 'f' || i || '.md', 'sha_' || i, 'indexed' "
+                "FROM generate_series(0, :n_minus_1) AS i"
+            ),
+            {"n_minus_1": 2 * n_collections - 1},
+        )
+        conn.execute(
+            sa.text(
+                "INSERT INTO facts (id, type) SELECT 'fact_' || i, 'engagement' "
+                "FROM generate_series(0, :n_minus_1) AS i"
+            ),
+            {"n_minus_1": n_facts - 1},
+        )
+        conn.execute(
+            sa.text(
+                "INSERT INTO edges (id, src, type, dst) "
+                "SELECT 'edge_' || i, 'fact_' || i, 'related_to', 'fact_' || ((i + 1) % :n_facts) "
+                "FROM generate_series(0, :n_minus_1) AS i"
+            ),
+            {"n_minus_1": n_facts - 1, "n_facts": n_facts},
+        )
+        # 400 collections x 500 claims = 200 000 rows; only the first 200
+        # collections are ever passed to the method under test below.
+        conn.execute(
+            sa.text(
+                """
+                INSERT INTO claims (id, fact_id, edge_id, corpus_file_id, corpus_id, file_sha256, quote, quote_hash)
+                SELECT
+                    'claim_' || col || '_' || n,
+                    CASE WHEN n % 2 = 0 THEN 'fact_' || ((col * :per_col + n) % :n_facts) ELSE NULL END,
+                    CASE WHEN n % 2 = 1 THEN 'edge_' || ((col * :per_col + n) % :n_facts) ELSE NULL END,
+                    'cf_' || col,
+                    'col_' || col,
+                    'sha_' || col,
+                    'quote text',
+                    'qh_' || col || '_' || n
+                FROM generate_series(0, :n_col_minus_1) AS col, generate_series(0, :per_col_minus_1) AS n
+                """
+            ),
+            {
+                "per_col": claims_per_collection,
+                "n_facts": n_facts,
+                "n_col_minus_1": 2 * n_collections - 1,
+                "per_col_minus_1": claims_per_collection - 1,
+            },
+        )
+        conn.execute(sa.text("ANALYZE claims"))
+
+    from src.repositories.facts_pg import FactsPgRepository
+
+    repo = FactsPgRepository(engine)
+    queried_ids = [f"col_{i}" for i in range(n_collections)]  # the other 200 are background noise
+
+    # EXPLAIN first — captured for the record, not asserted on the specific
+    # node type: at 50% selectivity (200 of 400 collections queried) the
+    # planner correctly prefers ONE sequential pass over the matching
+    # table (cost-based — a seq scan beats ~100 000 individual index
+    # probes here) over an index scan; a real connection's own scope
+    # count relative to the instance's total collections decides which
+    # one it gets, and either is fine — the timing assertion below is
+    # what actually matters. See the PR body for both EXPLAIN outputs
+    # (this 50%-selectivity one and a low-selectivity one that DOES pick
+    # `idx_claims_corpus_audience`, the composite index that also leads
+    # with `corpus_id`).
+    explain_sql = (
+        "EXPLAIN SELECT corpus_id, COUNT(DISTINCT fact_id) AS facts, COUNT(DISTINCT edge_id) AS edges "
+        "FROM claims WHERE corpus_id = ANY(:ids) GROUP BY corpus_id"
+    )
+    with engine.connect() as conn:
+        plan_lines = [r[0] for r in conn.execute(sa.text(explain_sql), {"ids": queried_ids}).all()]
+    plan_text = "\n".join(plan_lines)
+    assert "claims" in plan_text  # sanity: the plan is actually over this table
+
+    t0 = time.monotonic()
+    counts = repo.approximate_counts_for_collections(queried_ids)
+    elapsed = time.monotonic() - t0
+
+    assert elapsed < 1.0, (
+        f"approximate_counts_for_collections took {elapsed:.3f}s for {n_collections} of "
+        f"{2 * n_collections} total collections ({claims_per_collection} claims each) — expected well under 1s"
+    )
+    assert len(counts) == n_collections
+    # 250 fact claims + 250 edge claims per collection (n % 2 split).
+    assert counts["col_0"] == {"facts": 250, "edges": 250}
+    assert counts["col_199"] == {"facts": 250, "edges": 250}
+    assert sum(c["facts"] for c in counts.values()) == n_collections * 250
+    assert sum(c["edges"] for c in counts.values()) == n_collections * 250
+    # The background noise (col_200..col_399) must never leak in.
+    assert "col_200" not in counts

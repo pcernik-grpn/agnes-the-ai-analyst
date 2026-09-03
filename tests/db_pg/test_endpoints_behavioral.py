@@ -1666,6 +1666,113 @@ class TestFactsReadSurfaceSmoke:
         assert r.json()["detail"] == "fact_not_found"
 
 
+class TestFactsGraphCountsSmoke:
+    """`GET .../sharepoint/connections/{id}/facts-graph-counts` — the
+    per-connection card count on `/admin/data-sources`. Production
+    incident, 2026-09-03: the exact per-caller visibility CTE this route
+    used to call (`count_visible_facts_for_collections`) cost 250-316s per
+    collection on a live ~390-collection instance and starved the app of
+    every other request for as long as it ran. The route now calls
+    ``FactsPgRepository.approximate_counts_for_collections`` instead — one
+    flat `GROUP BY corpus_id` statement over `claims`, unfiltered by the
+    caller's readable set (a no-op narrowing anyway, since this route is
+    `require_admin`-gated) and NOT correction-aware, hence the additive
+    ``graph_counts_kind: "approximate"`` field. See
+    ``tests/db_pg/test_facts_source_card_pg.py`` for the repository-level
+    correctness + timing coverage (200-collection/200k-claim synthetic
+    scale) and ``tests/test_admin_sharepoint.py::
+    TestFactsGraphCountsDoesNotBlockTheEventLoop`` for the event-loop
+    non-blocking proof.
+    """
+
+    COVERED_ROUTES = {
+        "GET /api/admin/sharepoint/connections/{connection_id}/facts-graph-counts",
+    }
+
+    def _connection(self, cid="sp-graph-counts-smoke", scopes=None):
+        from src.repositories import source_connections_repo
+
+        source_connections_repo().create(
+            id=cid,
+            name="Facts Graph Counts Smoke",
+            source_type="sharepoint",
+            config={"tenant_id": "t1", "client_id": "c1", "scopes": scopes or []},
+        )
+        return cid
+
+    def test_requires_admin_on_both_backends(self, seeded_app_both, monkeypatch):
+        monkeypatch.setenv("AGNES_SHAREPOINT_ENABLED", "true")
+        s = seeded_app_both
+        client = s["client"]
+        r = client.get("/api/admin/sharepoint/connections/nope/facts-graph-counts")
+        assert r.status_code == 401
+
+    def test_404_for_unknown_connection_on_both_backends(self, seeded_app_both, monkeypatch):
+        monkeypatch.setenv("AGNES_SHAREPOINT_ENABLED", "true")
+        s = seeded_app_both
+        client, headers = s["client"], _admin_headers(s)
+        r = client.get("/api/admin/sharepoint/connections/nope/facts-graph-counts", headers=headers)
+        assert r.status_code == 404
+
+    def test_zero_counts_with_no_scopes_on_both_backends(self, seeded_app_both, monkeypatch):
+        """No scopes means no corpus_ids to look up — the endpoint returns
+        the zero shape WITHOUT ever reaching ``facts_repo()``, so this is
+        true on either backend (the DuckDB-typed-501 case only fires once
+        a corpus_id is actually looked up — see the test below)."""
+        monkeypatch.setenv("AGNES_SHAREPOINT_ENABLED", "true")
+        s = seeded_app_both
+        client, headers = s["client"], _admin_headers(s)
+        cid = self._connection()
+        r = client.get(f"/api/admin/sharepoint/connections/{cid}/facts-graph-counts", headers=headers)
+        assert r.status_code == 200, r.text
+        assert r.json() == {"facts": 0, "edges": 0, "graph_counts_kind": "approximate"}
+
+    def test_fails_clean_on_duckdb_with_a_scope(self, state_backend, seeded_app_both, monkeypatch):
+        """DuckDB-backed instance with at least one scope: `facts_repo()`
+        is Postgres-only (A3 ratchet) — the typed 501, never a raw 500."""
+        if state_backend != "duckdb":
+            pytest.skip("DuckDB-only assertion")
+        monkeypatch.setenv("AGNES_SHAREPOINT_ENABLED", "true")
+        s = seeded_app_both
+        client, headers = s["client"], _admin_headers(s)
+        cid = self._connection(scopes=[{"source_scope_id": "s1", "display_path": "A", "collection_id": "col_a"}])
+        r = client.get(f"/api/admin/sharepoint/connections/{cid}/facts-graph-counts", headers=headers)
+        assert r.status_code == 501, r.text
+        assert r.json()["error"] == "requires_postgres_backend"
+
+    def test_counts_a_real_claim_on_pg(self, state_backend, seeded_app_both, monkeypatch):
+        """Postgres-backed instance: a directly-seeded claim against a
+        scoped collection is reflected in the approximate count."""
+        if state_backend != "pg":
+            pytest.skip("Postgres-only assertion")
+        monkeypatch.setenv("AGNES_SHAREPOINT_ENABLED", "true")
+        s = seeded_app_both
+        client, headers = s["client"], _admin_headers(s)
+
+        from src.repositories import corpus_files_repo, facts_repo, file_corpora_repo
+
+        corpus_id = file_corpora_repo().create(
+            name="Graph Counts Smoke", slug="graph-counts-smoke", description=None, created_by="admin1"
+        )
+        file_id = corpus_files_repo().add(
+            corpus_id=corpus_id,
+            filename="a.md",
+            sha256="sha1",
+            file_type="md",
+            size_bytes=10,
+            storage_path="/blobs/a.md",
+        )
+        fact_id = facts_repo().create_fact(type="engagement")
+        facts_repo().add_claim(
+            fact_id=fact_id, corpus_file_id=file_id, corpus_id=corpus_id, file_sha256="sha1", quote="Q."
+        )
+
+        cid = self._connection(scopes=[{"source_scope_id": "s1", "display_path": "A", "collection_id": corpus_id}])
+        r = client.get(f"/api/admin/sharepoint/connections/{cid}/facts-graph-counts", headers=headers)
+        assert r.status_code == 200, r.text
+        assert r.json() == {"facts": 1, "edges": 0, "graph_counts_kind": "approximate"}
+
+
 # ---------------------------------------------------------------------------
 # Fact graph over Collections — write surface (build order step 4). Deep
 # ingest-protocol coverage (batch caps, the verbatim gate, union/replace,

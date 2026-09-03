@@ -2982,6 +2982,57 @@ class FactsPgRepository:
                 out[corpus_id] = int(row[0]) if row else 0
         return out
 
+    def approximate_counts_for_collections(self, corpus_ids: List[str]) -> Dict[str, Dict[str, int]]:
+        """``{corpus_id: {"facts": n, "edges": m}}`` for every given corpus,
+        in ONE statement — an APPROXIMATE, unfiltered sibling of
+        :meth:`count_visible_facts_for_collections`/`count_visible_edges_
+        for_collections` for a caller that needs a cheap "how big is this"
+        number, not a correct-for-this-caller one (incident, 2026-09-03).
+
+        Those two methods are correctly one query PER collection each — the
+        caller's readable set is resolved once, but the withheld/revealed-
+        correction-aware, audience-gated visibility CTE genuinely cannot be
+        collapsed across collections without a much larger, security-
+        sensitive rewrite (candidacy and visibility interact per-claim, and
+        endpoint evidence can draw from a DIFFERENT collection than
+        candidacy — see :meth:`_visible_facts_for_corpus_cte`'s docstring).
+        On a live instance with ~390 collections that cost 250-316s for a
+        SINGLE admin page load's worth of connections (a `pg_stat_activity`
+        sample showed one of these CTEs as the entire active query load),
+        which starved the shared Postgres connection pool for minutes at a
+        time regardless of how well the request itself was dispatched to
+        the thread pool — unusable for a per-page-view read on a large
+        corpus.
+
+        This is a flat `COUNT(DISTINCT ...) ... GROUP BY corpus_id` over
+        `claims` — one indexed (`idx_claims_corpus_id`) scan, no
+        `corrections`/`edges`-join subqueries, no per-caller resolution.
+        The ONLY thing it does not account for is a `wrong`/`restricted`
+        correction (which withholds a fact/edge for EVERY caller, admin
+        included) — a small, typically-empty set relative to the corpus,
+        so the caller (`facts_graph_counts`, admin-only — every caller of
+        THIS repo method already sees `_readable_ids(caller) is None`, i.e.
+        no RBAC narrowing applies to begin with) must label the result
+        `graph_counts_kind: "approximate"` rather than present it as the
+        row-visibility-filtered number the other two methods return.
+        `statement_timeout` is set for this call alone so a pathological
+        corpus_id list fails fast with a clear error instead of repeating
+        the incident.
+        """
+        out: Dict[str, Dict[str, int]] = {}
+        if not corpus_ids:
+            return out
+        sql = sa.text(
+            "SELECT corpus_id, COUNT(DISTINCT fact_id) AS facts, COUNT(DISTINCT edge_id) AS edges "
+            "FROM claims WHERE corpus_id = ANY(:ids) GROUP BY corpus_id"
+        )
+        with self._engine.begin() as conn:
+            conn.execute(sa.text(f"SET LOCAL statement_timeout = {_STATEMENT_TIMEOUT_MS}"))
+            rows = conn.execute(sql, {"ids": list(corpus_ids)}).mappings().all()
+        for r in rows:
+            out[r["corpus_id"]] = {"facts": int(r["facts"]), "edges": int(r["edges"])}
+        return out
+
     def collection_facts_summary(self, caller, corpus_id: str, *, limit: int = 20, offset: int = 0) -> Dict[str, Any]:
         """Caller-scoped facts section for one collection's detail page
         (spec §13.2 "Collection detail"): fact count by type, a paged list of
