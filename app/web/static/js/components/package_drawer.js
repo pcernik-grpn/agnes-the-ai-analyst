@@ -682,34 +682,22 @@
     window.location.href = '/admin/data-sources?add=1&from=package-builder';
   }
 
-  /* The way out of "the table I want is in a source nobody has connected".
-     OUTSIDE the picker deliberately: an admin usually knows the source is
-     missing BEFORE they go browsing for its tables, and an affordance that
-     exists only inside the browse modal is one they have to guess at. It
-     says how many sources exist either way, because "connect a source" on an
-     instance with four of them reads as a mistake unless it does. */
-  function connectHintHtml() {
+  /* The one case the panel still has to speak up about: the package cannot
+     be filled AT ALL, because nothing is registered and nothing is
+     connected. That is the state of the page, not a footnote on a list, so
+     it is said where the list would be. Every other "I need a source"
+     moment is answered in the picker's foot.
+
+     Both conditions, not just the connection count: an instance with no
+     source connected still has its internal tables (audit, sessions,
+     telemetry) registered and perfectly packageable, and keying on
+     connections alone told those instances there was nothing to carry. */
+  function emptyRegistryNoteHtml() {
     if (!st) return '';
-    var n = (st.connections || []).length;
-    var pool = (st.registry || []).length;
-    /* The strong version only when the package genuinely cannot be filled —
-       nothing registered AND nothing connected. Keying it on the connection
-       count alone claimed "there is nothing a package can carry" on an
-       instance whose internal tables (audit, sessions, telemetry) were
-       registered and packageable the whole time. */
-    if (!pool && !n) {
-      return '<p class="ag-note">No data source is connected, so there is nothing a package ' +
-        'can carry yet. <button type="button" class="pdw-connect" data-pdw-connect>Connect a ' +
-        'source</button></p>';
-    }
-    return '<p class="pdw-connectline">' +
-      '<span class="pdw-connectline__q">Missing a table?</span> ' +
-      '<button type="button" class="pdw-connect" data-pdw-connect>Connect a source</button>' +
-      // No count when there is nothing to count — "0 sources connected"
-      // beside an offer to connect one is the sentence saying itself twice.
-      (n ? '<span class="pdw-connectline__n">' + n +
-        (n === 1 ? ' source connected' : ' sources connected') + '</span>' : '') +
-      '</p>';
+    if ((st.registry || []).length || (st.connections || []).length) return '';
+    return '<p class="ag-note">No data source is connected, so there is nothing a package ' +
+      'can carry yet. <button type="button" class="pdw-connect" data-pdw-connect>Connect a ' +
+      'source</button></p>';
   }
 
   function renderTables() {
@@ -763,7 +751,12 @@
       (st.returnNote ? '<p class="ag-note">' + esc(st.returnNote) + '</p>' : '') +
       body +
       '<button type="button" class="ag-addrow" data-pdw-openpick>+ Add tables</button>' +
-      connectHintHtml();
+      // The strong "nothing is connected" state only. The standing "Missing a
+      // table? Connect a source" line that used to sit here is gone: under a
+      // list the admin is happy with it was a permanent footnote for a
+      // once-a-quarter errand, and the picker — where you go the moment a
+      // table is actually missing — is where the route belongs.
+      emptyRegistryNoteHtml();
     if (els.tablesLabel) {
       var count = els.tablesLabel.querySelector('.pdw-count');
       if (!count) {
@@ -822,6 +815,15 @@
       // the tree lives behind a `+`, an instance with one source would open
       // the picker onto a single collapsed heading and nothing to add.
       var pOpen = searching || pState !== 'none' || projects.length === 1;
+      /* One bucket whose name only repeats the project's is a tier that
+         costs a click and a line and carries nothing: the internal source
+         rendered as "Agnes internal › Agnes Internal › 3 tables", which
+         reads as a duplication bug. Collapsed only when the labels are the
+         same word — a single bucket with a name of its own (project "crm",
+         bucket "in.c-crm") is real information and keeps its row. */
+      var flat = p.order.length === 1 &&
+        String(p.buckets[p.order[0]].label || '').replace(/\s+/g, '').toLowerCase() ===
+        String(p.label || '').replace(/\s+/g, '').toLowerCase();
       var buckets = p.order.map(function (bk) {
         var b = p.buckets[bk];
         var bState = tallyState(b.tables);
@@ -830,13 +832,24 @@
         var bOpen = searching || bState !== 'none' || (projects.length === 1 && p.order.length === 1);
         var rows = b.tables.map(function (t) {
           var on = st.tablesSelected.has(t.id);
-          var sub = [t.source_type, t.query_mode].filter(Boolean).map(esc).join(' · ');
+          /* Dedupe, for the reason renderTables already does it: for an
+             internal table the source type and the query mode are the same
+             word, and "internal · internal" reads as a rendering bug. The
+             panel fixed this; the picker kept showing it. */
+          var seenSub = {};
+          var sub = [t.source_type, t.query_mode].filter(function (v) {
+            var k = String(v || '').toLowerCase();
+            if (!k || seenSub[k]) return false;
+            seenSub[k] = 1;
+            return true;
+          }).map(esc).join(' · ');
           return '<label class="pdw-tables__row">' +
             '<input type="checkbox" data-table-id="' + esc(t.id) + '"' + (on ? ' checked' : '') +
             ' aria-label="' + esc(t.name || t.id) + '">' +
             '<span class="pdw-tables__g"><span class="pdw-tables__n">' + esc(t.name || t.id) + '</span>' +
             (sub ? '<span class="pdw-tables__s">' + sub + '</span>' : '') + '</span></label>';
         }).join('');
+        if (flat) return rows;
         return '<details class="pdw-grp pdw-grp--bucket"' + (bOpen ? ' open' : '') + '>' +
           '<summary class="pdw-grp__sum">' +
           '<input type="checkbox" class="pdw-grp__box" data-group="bucket"' +
@@ -904,8 +917,15 @@
     var clear = facetsActive()
       ? '<button type="button" class="pdw-pickctl__clear" data-picker-clear>Clear filters</button>'
       : '';
-    var body = toggles('source_type', 'source') + toggles('query_mode', 'query mode') +
-      unpackaged + sort + clear;
+    /* Sort earns its place only once the list is long enough to have an order
+       worth choosing. On a small registry it was the ONLY control the strip
+       had, so a single dropdown sat alone on an otherwise empty row above
+       three rows you can read at a glance. Above the fold it goes where the
+       other controls are; below this count the strip disappears entirely. */
+    var others = toggles('source_type', 'source') + toggles('query_mode', 'query mode') + unpackaged;
+    var SORT_EARNS_ITS_PLACE = 5;
+    var enough = (st ? st.registry.length : 0) >= SORT_EARNS_ITS_PLACE;
+    var body = others + ((enough || others) ? sort : '') + clear;
     if (!body) return '';
     return '<div class="pdw-pickctl">' + body + '</div>';
   }
@@ -927,12 +947,14 @@
       total: total,
       rows: pickerRowsHtml(),
       controls: pickerControlsHtml(),
-      // Two different "not here" causes, so two different answers: the table
-      // exists upstream but is unregistered, or its source was never
-      // connected at all. Offering only the first left the second as a
-      // dead end the admin had to leave the builder to work out.
-      foot: 'Not here? Register it in <a href="/admin/tables">Tables</a>, or ' +
-        '<button type="button" class="pdw-connect" data-pdw-connect>connect a source</button>.',
+      /* Two different "not here" causes, so two answers, and both are
+         ACTIONS. They were a sentence with two links buried in it — which is
+         the wrong shape for the thing you reach for at the exact moment the
+         list has failed you, and it is now the only place the connect route
+         lives (the panel's standing line is gone). */
+      foot: '<span class="pdw-pickfoot__q">Can\u2019t find it?</span>' +
+        '<a class="pdw-pickfoot__a" href="/admin/tables">Register a table</a>' +
+        '<button type="button" class="pdw-pickfoot__a" data-pdw-connect>Connect a source</button>',
     });
   }
 
