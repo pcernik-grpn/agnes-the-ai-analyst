@@ -490,7 +490,7 @@ def _purge_derived_tabular_rows(corpus_id: str) -> None:
     table_id) and ``delete_collection`` (corpus-wide variant). After removing
     registry rows we call ``orchestrator.rebuild_source`` so the master views
     in ``analytics.duckdb`` no longer expose the deleted table(s). Best-effort:
-    a rebuild failure is logged but not raised — the durable artefacts (registry
+    a rebuild failure is logged but not raised — the durable artifacts (registry
     + parquet) are already gone.
     """
 
@@ -1809,7 +1809,7 @@ async def move_file(
     someone else's collection).
 
     When the source collection is left empty it is soft-deleted: a single-file
-    artefact IS its file in the Library, so dragging that file into a folder
+    artifact IS its file in the Library, so dragging that file into a folder
     must not strand an empty husk in the listing.
     """
     target_id = payload.target_collection_id

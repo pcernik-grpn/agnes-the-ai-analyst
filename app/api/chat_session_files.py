@@ -884,7 +884,7 @@ async def save_session_file_as_artefact(
     background_tasks: BackgroundTasks,
     user: dict = Depends(require_chat_access),
 ) -> SaveArtefactResponse:
-    """Save one session-workspace file as a private single-file artefact.
+    """Save one session-workspace file as a private single-file artifact.
 
     The copy outlives the session and shows up in your Library
     (``/library/{slug}``), exactly like a document dropped into the chat
@@ -949,14 +949,14 @@ async def save_session_file_as_artefact(
         data=data,
     )
     if not created:
-        raise HTTPException(status_code=415, detail=f"'{name}' could not be saved as an artefact.")
+        raise HTTPException(status_code=415, detail=f"'{name}' could not be saved as an artifact.")
 
     slug = (created.get("collection") or {}).get("slug") or ""
     from src.ingest.runner import ingest_file
 
     background_tasks.add_task(ingest_file, created["file_id"])
     logger.info(
-        "chat_session_files: user=%s session=%s saved %s as artefact %s",
+        "chat_session_files: user=%s session=%s saved %s as artifact %s",
         user["email"],
         chat_id,
         rel,

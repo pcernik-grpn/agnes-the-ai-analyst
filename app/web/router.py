@@ -1890,11 +1890,11 @@ def _facts_repo_if_available() -> Any | None:
 # catalog_card() macro (templates/macros/_catalog_card.html) and its JS
 # twin. The data-package and memory adapters died with the /catalog browse
 # shell (folded into /library); the upload adapter below is the survivor
-# (the Library's Artefacts band renders through it).
+# (the Library's Artifacts band renders through it).
 
 
 def _catalog_card_upload(c: dict) -> dict:
-    """Private artefact → catalog_card `c`. An artefact is a `file_corpora`
+    """Private artifact → catalog_card `c`. An artifact is a `file_corpora`
     container, but its presentation ADAPTS to how many files it holds:
 
     - exactly one file → it reads as **that file** (title = filename, single-
@@ -1903,7 +1903,7 @@ def _catalog_card_upload(c: dict) -> dict:
     - two or more → it reads as a **Collection** (title = name, two-sheet glyph,
       ``N files`` meta, label "Collection").
 
-    Artefacts aren't stack-toggled (they're owned files); the action opens the
+    Artifacts aren't stack-toggled (they're owned files); the action opens the
     detail page, where adding a second file promotes a File into a Collection.
 
     ``fact_count`` (spec §13.2 "Library" — a collection card reads "N files ·
@@ -1918,8 +1918,8 @@ def _catalog_card_upload(c: dict) -> dict:
     if n == 1 and ff:
         size = _human_size(ff.get("size_bytes") or 0)
         fname = ff.get("filename")
-        # Title is the artefact's NAME (what the caller typed), not the
-        # filename — otherwise several single-file artefacts with distinct
+        # Title is the artifact's NAME (what the caller typed), not the
+        # filename — otherwise several single-file artifacts with distinct
         # names all render as the same filename. The filename + size move to
         # the meta line so the file's identity stays visible.
         meta = (f"{fname} · {size}" if fname else size) + fact_suffix
@@ -1964,11 +1964,11 @@ def _catalog_card_stack_artefact(
     """Artefact-in-My-Stack → catalog_card `c`. Modeled on
     `_catalog_card_upload` for the file-vs-collection title/glyph/meta_text
     logic, but the action is Remove-from-Stack (never Delete — removing a
-    Stack membership must never touch the underlying artefact) instead of a
+    Stack membership must never touch the underlying artifact) instead of a
     plain "Open" link, and it carries the visibility/owner metadata the
     `stack_row` macro's Source column needs.
 
-    ``accessible=False`` means the artefact is still IN the caller's Stack
+    ``accessible=False`` means the artifact is still IN the caller's Stack
     (a membership row is never dropped silently just because access
     changed — see requirement 7) but the caller can no longer reach the
     underlying collection; the row's description is overridden to explain
@@ -1993,7 +1993,7 @@ def _catalog_card_stack_artefact(
 
     description = col.get("description") or ""
     if not accessible:
-        description = "You no longer have access to this artefact."
+        description = "You no longer have access to this artifact."
 
     c: dict = {
         "kind": "library",
@@ -2079,9 +2079,9 @@ async def my_stack_page(user: dict = Depends(get_current_user)):
     return RedirectResponse(url="/library?stack=in_stack", status_code=302)
 
 
-# Artefact type facets for the /artefacts toolbar filter. A single-file
-# artefact filters by its file's kind (so "Images", "Spreadsheets" etc. group
-# naturally); a multi-file artefact is always a "Collection". Keys are stable
+# Artifact type facets for the /artefacts toolbar filter. A single-file
+# artifact filters by its file's kind (so "Images", "Spreadsheets" etc. group
+# naturally); a multi-file artifact is always a "Collection". Keys are stable
 # filter tokens (emitted as data-type); labels are what the dropdown shows.
 _ARTEFACT_TYPE_FACETS: dict[str, tuple[str, str]] = {
     "pdf": ("pdf", "PDF"),
@@ -2149,7 +2149,7 @@ def _artefact_format(first_file: dict | None) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Library — the caller's own things: artefacts (files/images/documents) and
+# Library — the caller's own things: artifacts (files/images/documents) and
 # skills. Agents live on /agents. See ``library_page``.
 # ---------------------------------------------------------------------------
 
@@ -2233,7 +2233,7 @@ def _library_row_base(
 ) -> dict:
     """Assemble one Library row.
 
-    Every kind (artefact / skill / agent) funnels through this so the table,
+    Every kind (artifact / skill / agent) funnels through this so the table,
     the grid projection and the toolbar facets read the same field names
     regardless of which registry the item came from.
 
@@ -2277,7 +2277,7 @@ def _library_row_base(
         # row from wearing the removable row's rest state.
         "stack_locked": False,
         # What Add/Remove writes to, and which of the two the caller may do.
-        # Artefacts and store entities have different membership APIs, so the row
+        # Artifacts and store entities have different membership APIs, so the row
         # carries its own endpoint rather than the template guessing from `kind`.
         "stack_endpoint": "",
         "stack_addable": False,
@@ -2519,7 +2519,7 @@ def _library_child_row(
     created = f.get("created_at")
     child = _library_row_base(
         item_id=f["id"],
-        kind="artefact",
+        kind="artifact",
         title=f.get("filename") or "Untitled file",
         description="",
         # Per-file detail page (files inside a folder had none). `?from=library`
@@ -2585,13 +2585,13 @@ async def library_page(
     user: dict = Depends(get_current_user),
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
 ):
-    """Library — everything the caller has: artefacts, skills, and agents.
+    """Library — everything the caller has: artifacts, skills, and agents.
 
     This is the renamed and widened former ``/artefacts`` surface. It answers
     "what do I have?" across every kind Agnes governs — the caller's own things
     plus everything shared with them:
 
-      - **Artefacts** — ``file_corpora`` uploads: images, documents, data
+      - **Artifacts** — ``file_corpora`` uploads: images, documents, data
         files, and multi-file collections, whether *uploaded* by a person or
         *generated* by an agent (the Source facet).
       - **Skills** — the caller's own store entities of type ``skill``, i.e.
@@ -2697,8 +2697,8 @@ async def library_page(
             return "workspace"
         return "shared"
 
-    # Artefacts already in the caller's Stack — drives the "Add to stack" vs
-    # quiet "In stack" badge on artefact rows.
+    # Artifacts already in the caller's Stack — drives the "Add to stack" vs
+    # quiet "In stack" badge on artifact rows.
     try:
         in_stack_ids = set(user_stack_subscriptions_repo().list_for_user(uid, ct))
     except Exception as e:
@@ -2707,7 +2707,7 @@ async def library_page(
 
     items: list = []
 
-    # ── Artefacts (file_corpora) ──────────────────────────────────────────
+    # ── Artifacts (file_corpora) ──────────────────────────────────────────
     # Resolving the repos and listing the collections sits INSIDE the guard
     # below, not above it: outside, a backend that cannot answer took the whole
     # page down with a 500, which is the one outcome this block's try/except
@@ -2828,7 +2828,7 @@ async def library_page(
             )
             row = _library_row_base(
                 item_id=col["id"],
-                kind="artefact",
+                kind="artifact",
                 title=c.get("title") or "",
                 description=c.get("description") or "",
                 href=f"/library/{col.get('slug')}",
@@ -2868,7 +2868,7 @@ async def library_page(
             row["in_stack"] = col["id"] in in_stack_ids
             row["stack_state"] = "in_stack" if row["in_stack"] else "available"
             row["stack_title"] = _AGENT_HAS_TOOLTIP if row["in_stack"] else _AGENT_ADD_TOOLTIP
-            # An artefact is the one kind whose membership IS the caller's to
+            # An artifact is the one kind whose membership IS the caller's to
             # set (no admin grant tier exists for a personal upload), so its
             # pill is a real toggle and the template supplies the button copy.
             # This value is what the *child* rows fall back to — a file inside
@@ -2905,13 +2905,13 @@ async def library_page(
                 if is_folder
                 else ([row["file_format"]] if row["file_format"] else [])
             )
-            # A loose file's ROW id is its collection id (a single-file artefact
+            # A loose file's ROW id is its collection id (a single-file artifact
             # IS its collection), but moving it needs the corpus_files id — so
             # carry that separately rather than making the drag guess.
             row["file_id"] = files[0]["id"] if (not is_folder and files) else ""
             # The slug + the file's own name are what a client-side move needs to
             # rebuild the moved row (its per-file URL is /library/{slug}/f/{id},
-            # and as a child it is titled by its FILENAME, not the artefact name)
+            # and as a child it is titled by its FILENAME, not the artifact name)
             # without a round-trip to re-render the page.
             row["slug"] = col.get("slug") or ""
             row["file_name"] = fname or ""
@@ -3968,7 +3968,7 @@ async def library_page(
         # Loose files + collections-as-folders.
         "files",
         # Apps read AFTER the caller's own files — the same reading order they
-        # had as a trailing block inside the Artefacts band, now carried by the
+        # had as a trailing block inside the Artifacts band, now carried by the
         # section order instead of by row order within one band.
         "data_app",
         "memory_domain",
@@ -3992,7 +3992,7 @@ async def library_page(
         "agent": _TAB_CAPABILITIES,
     }
     #: Data apps used to land INSIDE the Files band (``_SECTION_OF``). They
-    #: have their own band now: an app is not an artefact the caller uploaded,
+    #: have their own band now: an app is not an artifact the caller uploaded,
     #: and the Files hint had to claim it was one. Their rows keep
     #: ``type_key="data_app"`` either way, so the Type facet and the row label
     #: are unaffected.
@@ -4019,7 +4019,7 @@ async def library_page(
         # collections nested inside it as folders — and hosted data apps as a
         # trailing block (_SECTION_OF): everything the caller or their agent
         # made, hence the umbrella name.
-        "files": "Artefacts",
+        "files": "Artifacts",
         "skill": "Skills",
         "plugin": "Plugins",
         "agent": "Agent templates",
@@ -4336,7 +4336,7 @@ async def agents_page(
 
     The builder's ingredient lists are REAL and RBAC-scoped:
     ``knowledge_sources_for`` resolves the caller's own data packages, memory
-    domains and artefact collections — the same list the builder assistant is
+    domains and artifact collections — the same list the builder assistant is
     given as its candidate set, so it can never offer access the picker does
     not — and capabilities hydrate client-side from
     ``/api/marketplace/items?tab=my`` (the caller's subscribed plugins)."""
@@ -5518,7 +5518,7 @@ async def library_file_detail(
 ):
     """One file inside a collection — its own detail page.
 
-    A single-file artefact IS its collection, so it keeps using
+    A single-file artifact IS its collection, so it keeps using
     ``/library/{slug}``; this route serves the files *inside* a folder, which
     previously had no page of their own. Reachable by anyone who can reach the
     parent collection OR who holds a grant on the file itself (per-file
@@ -5768,7 +5768,7 @@ async def library_detail(
     status_norm = (status or "").strip() or None
 
     # The collection's TRUE size, ignoring `q`/`status` — this is what drives
-    # the page's identity (one-file artefact vs. collection, the hero glyph,
+    # the page's identity (one-file artifact vs. collection, the hero glyph,
     # the noun, the "Searchable" fraction): a search that narrows the visible
     # rows to one, or a page slice that happens to land on the last lone row,
     # must never make a 26-file collection LOOK like a single file. Only the
@@ -5780,7 +5780,7 @@ async def library_detail(
     if files_total_all == 1:
         # Fetch the one true row directly, unfiltered and unpaginated: a
         # `?q=`/`?status=`/`?files_page=` that happens to not match it must
-        # not turn a genuine one-file artefact into a blank single-file page.
+        # not turn a genuine one-file artifact into a blank single-file page.
         _rows = cf_repo.list_for_corpus(col["id"], limit=1)
         single_file = _rows[0] if _rows else None
 
@@ -5810,7 +5810,7 @@ async def library_detail(
     )
 
     # Owner + sharing are rail facts on every resource detail page (see the page
-    # contract in macros/_detail.html); the collection page was the one artefact
+    # contract in macros/_detail.html); the collection page was the one artifact
     # surface that stated neither, so "who can see this folder?" was only
     # answerable from the Library table it was opened from.
     owner_id = col.get("created_by")
@@ -6662,7 +6662,7 @@ async def data_apps_list_page(
     from src.repositories import data_apps_repo, users_repo
 
     enabled = feature_enabled("data_apps", "enabled", env_var="AGNES_DATA_APPS_ENABLED", default=False)
-    # Rail: the apps inventory lives in the Library's Artefacts band now —
+    # Rail: the apps inventory lives in the Library's Artifacts band now —
     # data apps sit among the caller's artifacts (spec 2026-08-12, revised:
     # rows keep type_key=data_app for the Type facet, but Files is their
     # home). Redirect ONLY when the Library will actually show the caller an

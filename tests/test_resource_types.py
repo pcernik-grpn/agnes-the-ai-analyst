@@ -487,7 +487,7 @@ class TestCollectionResourceType:
 class TestCollectionInventoryProjection:
     """The admin /access page is where "what files exist on this instance, and
     whose are they" is answered. An admin sees every collection by god-mode,
-    including the private one-file artefacts a chat file-drop creates, so the
+    including the private one-file artifacts a chat file-drop creates, so the
     projection has to name the owner and the file count — and must not omit
     files."""
 
