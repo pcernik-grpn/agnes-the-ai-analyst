@@ -3411,7 +3411,13 @@
      "owner". One column cannot carry that: an admin can share from the
      Library, and an owner's grant and an admin's grant are the same row.
      Naming the person is true; naming their role would be a guess. */
+  /* The sharer, as a name. The server resolves it now (`assigned_by_name`),
+     because the fallback below only ever worked when the person lens had
+     happened to load the user list — on the group list it had not, and a
+     Library share read "shared by <uuid>" on the one page whose job is to
+     say who. The old path stays for rows the server could not resolve. */
   function whoGranted(grant) {
+    if (grant && grant.assigned_by_name && grant.assigned_by_name !== grant.assigned_by) return grant.assigned_by_name;
     const raw = grant && grant.assigned_by;
     if (!raw) return "";
     const hit = (users || []).find((u) => u.id === raw || u.email === raw);

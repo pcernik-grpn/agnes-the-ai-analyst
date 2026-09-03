@@ -306,6 +306,22 @@ async def access_overview(
         """The surface that owns this grant, when it is not this page."""
         return describe_grant_source(source)
 
+    # Sharers by id → display name, once. `library_sharing` records the
+
+    # actor's user id; the admin API records an email. Only the ids need a
+    # lookup, and `get_info_by_ids` is the existing dual-backend batch reader.
+
+    _grant_rows = grants_repo.list_all()
+    _who: dict[str, str] = {}
+    _ids = sorted({str(x.get("assigned_by")) for x in _grant_rows if x.get("assigned_by") and "@" not in str(x.get("assigned_by"))})
+    if _ids:
+        try:
+            for uid_, info_ in (users_repo().get_info_by_ids(_ids) or {}).items():
+                _who[uid_] = (info_ or {}).get("name") or (info_ or {}).get("email") or uid_
+        except Exception:  # a users-table read failure must not take the page down
+            logger.exception("sharer names unresolved; rows fall back to the raw assigned_by")
+
+
     grants = [
         {
             "id": r["id"],
@@ -327,6 +343,14 @@ async def access_overview(
             # made it. The two shapes are resolved client-side against the
             # user list; neither is assumed to be the other.
             "assigned_by": r.get("assigned_by"),
+            # The sharer, READABLE. The comment above promised client-side
+            # resolution against the user list, and the group list never loads
+            # that list — so a Library share rendered "shared by <uuid>" on the
+            # one page whose job is to say who. Resolved here instead, in one
+            # batched read for the whole page (the same reader the collection
+            # projection uses for owners). Emails pass through untouched; ids
+            # that no longer resolve stay as they are rather than vanishing.
+            "assigned_by_name": _who.get(r.get("assigned_by") or "", r.get("assigned_by")),
             # `None` for an ordinary grant — the page renders those exactly as
             # before. Non-null means: another surface owns this, do not offer a
             # control here that will fail.
@@ -363,7 +387,7 @@ async def access_overview(
             # then a carrier the page must not attribute the grant to.
             "scope": r.get("scope"),
         }
-        for r in grants_repo.list_all()
+        for r in _grant_rows
     ]
 
     # A block of SYNTHESIZED rows lived here — one per (group, system

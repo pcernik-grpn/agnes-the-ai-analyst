@@ -1201,3 +1201,28 @@ class TestAStoreEntityIsATieredKind:
         src = self._source()
         assert 'const userSkill = type === "store_entity" && ((itemOf(type, rid) || {}).publisher_kind || "user") !== "organization";' in src
         assert 'const tier = TIERED.has(type) && !userSkill ? (pickerState.tier || "available") : "available";' in src
+
+
+class TestASharedRowNamesTheSharer:
+    """A Library share records the sharer's user id (`library_sharing` writes
+    `assigned_by=actor_id`), and the page resolved that id only against a user
+    list the group list never loads — so an owner-shared row read
+    "shared by <uuid>" on the one page whose job is to say who. Decision 09
+    said the label names the sharer; a uuid does not. Found by seeding a real
+    share and looking. The server resolves the name now, once per page, with
+    the same batch reader the collection projection already uses for owners.
+    """
+
+    TEMPLATE = "app/web/templates/admin_access.html"
+
+    def _source(self) -> str:
+        from pathlib import Path
+
+        return Path(self.TEMPLATE).read_text(encoding="utf-8")
+
+    def test_the_page_prefers_the_resolved_name(self):
+        src = self._source()
+        f = src[src.index("function whoGranted(grant) {"):]
+        f = f[: f.index("\n  }", 0)]
+        assert "grant.assigned_by_name" in f
+        assert f.index("assigned_by_name") < f.index("const raw = grant && grant.assigned_by;")
