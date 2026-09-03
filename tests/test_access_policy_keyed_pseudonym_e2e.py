@@ -159,6 +159,22 @@ class TestApiQuery:
         )
         assert r.status_code == 400, r.text
 
+    def test_hybrid_query_may_not_call_it_either(self, keyed):
+        """``POST /api/query/hybrid`` executes caller SQL through
+        ``RemoteQueryEngine`` on the same analytics connection the UDF is
+        registered on -- a second blocklist that must carry the same
+        reservation, or an admin could dictionary-match a masked column
+        one endpoint over from the one that refuses it."""
+        c = keyed["client"]
+        r = c.post(
+            "/api/query/hybrid",
+            json={"sql": "SELECT agnes_hmac('alice@example.com') AS probe", "register_bq": {}},
+            headers=_auth(keyed["admin_token"]),
+        )
+        assert r.status_code == 400, r.text
+        assert "agnes_hmac" in r.text
+        assert _expected("alice@example.com") not in r.text
+
 
 class TestOtherReadSurfaces:
     def test_v2_sample_serves_the_digest(self, keyed):
