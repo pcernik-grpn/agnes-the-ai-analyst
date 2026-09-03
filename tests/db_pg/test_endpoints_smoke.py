@@ -2441,6 +2441,18 @@ KNOWN_UNTESTED = {
     "POST /api/chat/uploads",
     "GET /library",
     "GET /library/{slug}",
+    # The HTML fragment the Library's live search fetches for the files a
+    # folder's inline peek did not render (#2141 item 2). Same exclusion and
+    # the same reason as the two rows above: it needs a real slug AND a
+    # collection with files, so it is not a parameter-free route, and it adds
+    # no repo method or migration (its reads go through corpus_files_repo and
+    # resource_grants_repo, both already parity-covered). Behaviour covered in
+    # tests/test_web_library_artefacts_reading.py — the rows the peek left
+    # out, the empty-`q` and no-match empty responses, the result cap, 404 for
+    # unknown AND for no-access, and the gate being COLLECTION access rather
+    # than the file page's wider per-file rule (a per-file grant must not
+    # enumerate siblings).
+    "GET /library/{slug}/matching-files",
     # Authoring studio + suggestion queue + memory-mining consent — covered by
     # dedicated suites (tests/test_authoring_suggestions_api.py, tests/test_web_studio.py);
     # web-form / admin-moderation flows, not part of the parameter-free smoke sweep.

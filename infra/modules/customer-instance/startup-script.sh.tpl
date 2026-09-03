@@ -32,6 +32,49 @@ AGNES_APPLIER_UID=999
 
 echo "=== [Agnes $CUSTOMER_NAME $ROLE] Startup at $(date) ==="
 
+# --- 0. Reserve the state-applier's pinned uid before ANYTHING else can take
+# it -------------------------------------------------------------------
+# `/data/state/instance.yaml` is only readable by the app container (uid
+# $AGNES_APPLIER_UID) while `agnes-applier` resolves to that same number —
+# see the declaration above and the readback further down (#1217). That held
+# for years because nothing else on a fresh VM claimed a uid in the low-900s
+# system range before agnes-applier's own useradd ran, later in this script.
+# The opt-in Datadog agent broke that: its apt postinst creates the
+# `dd-agent` system user with NO uid pin, and `useradd --system` allocates
+# the top free id in the system range — which IS $AGNES_APPLIER_UID on an
+# otherwise-untouched image. Whichever of the two ran first won the number,
+# and agnes-applier used to run second every time. Observed live
+# (2026-09-03, enable_datadog=true on a VM recreate): dd-agent grabbed uid
+# 999, the applier's own pinned useradd failed and fell through to an
+# allocated 997, the recursive /data/state chown further down then re-owned
+# an instance.yaml that was already 0600 from a previous boot onto that
+# uid, and the app container (still uid 999) crash-looped on
+# InstanceConfigUnreadable before Caddy or the scheduler ever started.
+#
+# Reserving the uid HERE — before section 1's Docker install and before the
+# Datadog agent's own apt install, i.e. before anything else that could add
+# a system user — closes the race outright: whichever package runs later
+# simply cannot see $AGNES_APPLIER_UID as free any more. The Datadog block
+# further down additionally pins dd-agent to its own fixed
+# $DATADOG_DD_AGENT_UID as a second, order-independent guard, in case a
+# future reorder ever puts an unpinned-uid installer ahead of this block
+# again.
+#
+# Idempotent and otherwise identical to the belt-and-braces useradd sites
+# further down (kept there too, per #1217 — every useradd site pins the same
+# variable so they cannot drift apart): only the CREATE is skipped when the
+# user already exists here; the actual uid match is verified by the readback
+# right before instance.yaml's chmod, not here.
+if ! id -u agnes-applier >/dev/null 2>&1; then
+    # Only the UID is pinned — see the mutually-exclusive-flags note on the
+    # later useradd sites for why `--gid` is never combined with
+    # `--user-group`.
+    useradd --system --no-create-home --shell /usr/sbin/nologin \
+            --uid "$AGNES_APPLIER_UID" --user-group agnes-applier 2>/dev/null \
+    || useradd --system --no-create-home --shell /usr/sbin/nologin \
+            --user-group agnes-applier
+fi
+
 # --- 1. Docker (install if missing) ---
 if ! command -v docker &>/dev/null; then
     curl -fsSL https://get.docker.com | sh
@@ -334,6 +377,177 @@ if [ -d /etc/google-cloud-ops-agent ]; then
 fi
 %{ endif ~}
 
+%{ if enable_datadog ~}
+# --- DATADOG AGENT (opt-in host monitoring) --------------------------------
+# Deliberately here, beside the Ops Agent and BEFORE any docker work: the
+# compose section further down ends in `exit 1` when it cannot converge, so a
+# monitoring block placed after it would be skipped on exactly the boot that
+# needs monitoring most.
+#
+# Every step is failure-tolerant. Monitoring must never fail a boot — an
+# unmonitored VM is degraded, a VM that does not come up is an outage.
+#
+# The API key uses the SILENT form of `gcloud secrets versions access`. The
+# loud form used elsewhere in this script aborts the boot on a missing secret,
+# which is the right trade for the app's own credentials and the wrong one for
+# an add-on. The value is written only into /etc/datadog-agent/datadog.yaml and
+# is unset again before the `.env` heredoc further down can ever see it.
+DD_KEYRING=/usr/share/keyrings/datadog-archive-keyring.gpg
+DD_API_KEY_VALUE=$(gcloud secrets versions access latest --secret=${datadog_api_key_secret} 2>/dev/null || echo "")
+
+_dd_write_keyring() {
+    if command -v gpg >/dev/null 2>&1; then
+        gpg --dearmor --yes -o "$DD_KEYRING" < "$1"
+    else
+        # apt >= 1.4 reads a concatenated ASCII-armored keyring directly, so a
+        # host image without gnupg is not a blocker.
+        DD_KEYRING=/usr/share/keyrings/datadog-archive-keyring.asc
+        install -m 0644 "$1" "$DD_KEYRING"
+    fi
+}
+
+# Decodes one module-shipped artifact to its place on the host. An EMPTY
+# payload means "remove it": a VM that stops terminating TLS must stop
+# reporting on a certificate that is no longer its concern, rather than
+# keeping a stale check config around forever.
+#
+# The API key is substituted through bash parameter expansion on a value read
+# from a variable — never `sed -e "s/…/$KEY/"`, which would put it on argv and
+# from there into /proc and into this script's own log on any error.
+#
+# Called with a trailing `|| echo WARNING`, which is load-bearing under this
+# script's errexit: bash suppresses it inside a command that is part of an ||
+# list, so no step in here — not a failed write on a full disk, not a chmod on a
+# read-only mount — can abort a boot. The guards inside are belt to that braces.
+_dd_install_artifact() {
+    _dd_rel="$1"
+    _dd_b64="$2"
+    case "$_dd_rel" in
+        datadog.yaml)
+            _dd_target=/etc/datadog-agent/datadog.yaml; _dd_owner=root; _dd_group=dd-agent; _dd_mode=0640 ;;
+        conf.d/*.yaml)
+            _dd_check=$(basename "$_dd_rel" .yaml)
+            _dd_target="/etc/datadog-agent/conf.d/$_dd_check.d/conf.yaml"; _dd_owner=dd-agent; _dd_group=dd-agent; _dd_mode=0640 ;;
+        postgres.yaml.tpl)
+            _dd_target=/etc/datadog-agent/agnes-postgres.yaml.tpl; _dd_owner=root; _dd_group=root; _dd_mode=0600 ;;
+        *.sh)
+            _dd_target="/usr/local/bin/$_dd_rel"; _dd_owner=root; _dd_group=root; _dd_mode=0755 ;;
+        *.service | *.timer)
+            _dd_target="/etc/systemd/system/$_dd_rel"; _dd_owner=root; _dd_group=root; _dd_mode=0644 ;;
+        *)
+            echo "WARNING: unknown Datadog artifact '$_dd_rel' — not installed" >&2
+            return 0 ;;
+    esac
+
+    if [ -z "$_dd_b64" ]; then
+        rm -f "$_dd_target" || true
+        return 0
+    fi
+
+    _dd_content=$(printf '%s' "$_dd_b64" | base64 -d 2>/dev/null) || {
+        echo "WARNING: could not decode the Datadog artifact '$_dd_rel'" >&2
+        return 0
+    }
+    if [ "$_dd_rel" = "datadog.yaml" ]; then
+        _dd_content=$${_dd_content//@@DD_API_KEY@@/$DD_API_KEY_VALUE}
+    fi
+
+    _dd_tmp=$(mktemp) || return 0
+    chmod 0600 "$_dd_tmp" || true
+    if ! printf '%s\n' "$_dd_content" > "$_dd_tmp"; then
+        unset _dd_content
+        rm -f "$_dd_tmp" || true
+        echo "WARNING: could not stage the Datadog artifact '$_dd_rel'" >&2
+        return 0
+    fi
+    unset _dd_content
+    mkdir -p "$(dirname "$_dd_target")" \
+        && install -o "$_dd_owner" -g "$_dd_group" -m "$_dd_mode" "$_dd_tmp" "$_dd_target" \
+        || echo "WARNING: could not install the Datadog artifact '$_dd_rel'" >&2
+    rm -f "$_dd_tmp" || true
+    return 0
+}
+
+if [ -z "$DD_API_KEY_VALUE" ]; then
+    echo "WARNING: Datadog API key secret '${datadog_api_key_secret}' is unreadable or empty — the agent is not configured this boot" >&2
+else
+    # Pin dd-agent to its own fixed uid BEFORE the apt install below can
+    # create it unpinned. Section 0 (top of this script) already reserves
+    # $AGNES_APPLIER_UID first, which is enough on its own to fix the uid
+    # collision this guards against — this is the second, order-independent
+    # half: even if a future edit moved this block ahead of section 0 again,
+    # dd-agent still could not land on $AGNES_APPLIER_UID, because it is
+    # pinned to a different fixed number instead of "whatever the system
+    # allocates next". apt's postinst honours an existing dd-agent user/group
+    # and skips creating its own. Idempotent; the unpinned fallback only
+    # fires if $DATADOG_DD_AGENT_UID is itself somehow already taken, in
+    # which case allocation behaves exactly as it did before this fix.
+    DATADOG_DD_AGENT_UID=998
+    if ! id -u dd-agent >/dev/null 2>&1; then
+        useradd --system --no-create-home --home-dir /opt/datadog-agent \
+                --shell /usr/sbin/nologin --uid "$DATADOG_DD_AGENT_UID" --user-group dd-agent 2>/dev/null \
+        || useradd --system --no-create-home --home-dir /opt/datadog-agent \
+                --shell /usr/sbin/nologin --user-group dd-agent 2>/dev/null \
+        || echo "WARNING: could not pre-create the dd-agent user — the Datadog package's own postinst will create it instead, unpinned" >&2
+    fi
+
+    if [ "$(dpkg-query -W -f='$${Version}' datadog-agent 2>/dev/null || true)" != "1:${datadog_agent_version}-1" ]; then
+        echo "installing the Datadog Agent ${datadog_agent_version}..."
+        (
+            mkdir -p /usr/share/keyrings \
+            && : > /tmp/datadog-apt-keys.asc \
+            && curl -fsSL https://keys.datadoghq.com/DATADOG_APT_KEY_CURRENT.public >> /tmp/datadog-apt-keys.asc \
+            && curl -fsSL https://keys.datadoghq.com/DATADOG_APT_KEY_06462314.public >> /tmp/datadog-apt-keys.asc \
+            && curl -fsSL https://keys.datadoghq.com/DATADOG_APT_KEY_C0962C7D.public >> /tmp/datadog-apt-keys.asc \
+            && curl -fsSL https://keys.datadoghq.com/DATADOG_APT_KEY_F14F620E.public >> /tmp/datadog-apt-keys.asc \
+            && curl -fsSL https://keys.datadoghq.com/DATADOG_APT_KEY_382E94DE.public >> /tmp/datadog-apt-keys.asc \
+            && _dd_write_keyring /tmp/datadog-apt-keys.asc \
+            && rm -f /tmp/datadog-apt-keys.asc \
+            && echo "deb [signed-by=$DD_KEYRING] https://apt.datadoghq.com/ stable 7" > /etc/apt/sources.list.d/datadog.list \
+            && apt-get update -qq \
+            && { apt-mark unhold datadog-agent >/dev/null 2>&1 || true; } \
+            && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --allow-downgrades "datadog-agent=1:${datadog_agent_version}-1" datadog-signing-keys \
+            && apt-mark hold datadog-agent >/dev/null
+        ) || echo "WARNING: Datadog Agent ${datadog_agent_version} install failed — host monitoring unavailable this boot" >&2
+    fi
+
+    if id dd-agent >/dev/null 2>&1; then
+        # Root-equivalent on this host, and the only way to read the daemon's
+        # container metrics. The rendered datadog.yaml turns off everything
+        # that could make that membership remotely reachable — see the module's
+        # enable_datadog description.
+        usermod -aG docker dd-agent \
+            || echo "WARNING: could not add dd-agent to the docker group — Docker and container metrics will be missing" >&2
+%{ for dd_path, dd_content in datadog_files_b64 ~}
+        _dd_install_artifact "${dd_path}" "${dd_content}" \
+            || echo "WARNING: could not install the Datadog artifact '${dd_path}'" >&2
+%{ endfor ~}
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        systemctl enable datadog-agent >/dev/null 2>&1 || true
+        systemctl restart datadog-agent >/dev/null 2>&1 \
+            || echo "WARNING: the Datadog Agent did not start — inspect 'systemctl status datadog-agent'" >&2
+    else
+        echo "WARNING: the dd-agent user does not exist — skipping Datadog configuration this boot" >&2
+    fi
+fi
+# Out of scope before anything writes /opt/agnes/.env, whose heredoc is
+# unquoted and whose contents every container reads through env_file.
+unset DD_API_KEY_VALUE
+%{ endif ~}
+
+%{ if !enable_datadog ~}
+# Self-heal the opposite direction: a recreated VM whose module call turned
+# monitoring OFF must stop shipping under a key nobody rotates any more. The
+# package is left installed — removing it would fight apt over a transient
+# toggle — but the service does not run.
+if systemctl is-enabled --quiet datadog-agent 2>/dev/null; then
+    systemctl disable --now datadog-agent >/dev/null 2>&1 || true
+fi
+if systemctl is-enabled --quiet agnes-datadog-pg-role.timer 2>/dev/null; then
+    systemctl disable --now agnes-datadog-pg-role.timer >/dev/null 2>&1 || true
+fi
+%{ endif ~}
+
 # Boot-time gcplogs driver probe — defense in depth for #1557. Docker
 # refuses to START a container whose log driver cannot initialize, so an
 # armed overlay on a VM whose service account cannot write to Cloud Logging
@@ -389,6 +603,12 @@ fi
 # there on today's image by allocation rather than by intent — so pin it,
 # and let the chmod below check the pin took.
 #
+# Section 0 (top of this script) already creates this user, pinned, before
+# Docker or Datadog can take the uid — so in the normal boot order this `if`
+# is always false. Kept as belt-and-braces anyway, same reasoning as the
+# B3-NEW block further down: a reorder or a partial run should not silently
+# reintroduce an unpinned user via the one copy that lost the pin (#1217).
+#
 # This `if` only guards user CREATION, not the uid check — an
 # agnes-applier that already exists (e.g. a VM provisioned before this pin
 # existed, or one where uid $AGNES_APPLIER_UID was taken by something else at
@@ -424,20 +644,38 @@ chown -R agnes-applier:agnes-applier /data/state
 # time, the pin above fell through to an allocated id, the app cannot read a
 # 0600 file it does not own, and — with the fail-closed read this change
 # also introduces — the instance refuses to start. A full outage in place
-# of a silent degradation. Where the pin did not take, the mode stays as it
-# was and the reason is on the console; the hardening applies exactly where
-# its precondition is met.
+# of a silent degradation. Where the pin did not take, the hardening applies
+# exactly where its precondition is met.
 #
 # Covers both non-happy paths from #1217: (a) the uid was taken at THIS
 # boot's provisioning (the `if` above fell through to the unpinned form) and
 # (b) agnes-applier already existed from before the pin with some other uid
 # (an in-place upgrade) — the `if` above skipped creation entirely, so this
 # readback is the only place either shape is caught.
+#
+# "Leave the mode as it was" — this branch's original shape — is exactly the
+# outage the Datadog uid collision (section 0, top of this script) produced:
+# the recursive /data/state chown just above already re-owns instance.yaml
+# to the mismatched agnes-applier regardless of this check, so an existing
+# file that was 0600 from a PREVIOUS good boot stayed 0600 under a uid the
+# app is not. So the mismatch branch now applies the same degraded-but-
+# readable policy scripts/ops/agnes-state-applier.sh's own writer already
+# established for this exact class of problem (#1298,
+# docs/postgres-cutover-runbook.md): 0640 with the app's own gid
+# ($AGNES_APPLIER_UID, numeric — a group entry need not exist by that name
+# for chown to accept it) as a fallback read grant, or 0644 if even that
+# fails, rather than trusting whatever mode happened to be on disk.
 APPLIER_UID=$(id -u agnes-applier 2>/dev/null || echo "")
 if [ "$APPLIER_UID" = "$AGNES_APPLIER_UID" ]; then
     chmod 600 "$INSTANCE_YAML" 2>/dev/null || true
 else
-    echo "WARN: agnes-applier is uid $APPLIER_UID, not $AGNES_APPLIER_UID — leaving $INSTANCE_YAML at its current mode. 0600 would make it unreadable by the app container (uid $AGNES_APPLIER_UID), which owns neither the file nor this user. Remediation: free uid $AGNES_APPLIER_UID (check what holds it with 'getent passwd $AGNES_APPLIER_UID') and either 'userdel'+re-run this script to recreate agnes-applier pinned, or 'usermod -u $AGNES_APPLIER_UID agnes-applier' followed by 'chown -R agnes-applier:agnes-applier /data/state /opt/agnes/.env' to re-home its existing files onto the new uid. Until then this VM runs in the pre-#1217 degraded mode: instance.yaml stays at its current, looser permissions." >&2
+    echo "ERROR: agnes-applier is uid $APPLIER_UID, not $AGNES_APPLIER_UID — uid $AGNES_APPLIER_UID is held by $(getent passwd "$AGNES_APPLIER_UID" 2>/dev/null | cut -d: -f1 || echo 'nothing (system uid allocation exhausted?)'). Remediation: free uid $AGNES_APPLIER_UID (see above) and either 'userdel agnes-applier'+re-run this script to recreate it pinned, or 'usermod -u $AGNES_APPLIER_UID agnes-applier' followed by 'chown -R agnes-applier:agnes-applier /data/state /opt/agnes/.env' to re-home its existing files onto the new uid. Until then this VM runs $INSTANCE_YAML at 0640/0644 instead of owner-only — see docs/postgres-cutover-runbook.md." >&2
+    if chown ":$AGNES_APPLIER_UID" "$INSTANCE_YAML" 2>/dev/null; then
+        chmod 640 "$INSTANCE_YAML" 2>/dev/null || true
+    else
+        chmod 644 "$INSTANCE_YAML" 2>/dev/null || true
+        echo "WARNING: could not hand $INSTANCE_YAML to group $AGNES_APPLIER_UID — leaving it at 0644 (world-readable) so the app container can still read its own config" >&2
+    fi
 fi
 # /data/postgres must stay 70:70 (postgres image uid) — applier just
 # runs docker exec against the container, doesn't touch the volume.
@@ -1674,7 +1912,26 @@ if ! docker compose $COMPOSE_PROFILES_ARG pull extraction-worker \
 fi
 %{ endif ~}
 
+%{ if enable_datadog ~}
+# --- DATADOG: Postgres side-car monitoring role ----------------------------
+# The unit files landed with the agent block above, which runs before compose;
+# the timer is started HERE, after compose has converged, so its first run
+# finds the side-cars up. The 15-minute cadence then re-converges the role
+# after a side-car volume is recreated, which a boot-time step never would.
+if [ -x /usr/local/bin/agnes-datadog-pg-role.sh ]; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl enable --now agnes-datadog-pg-role.timer >/dev/null 2>&1 \
+        || echo "WARNING: could not enable agnes-datadog-pg-role.timer — the Postgres side-car check stays unconfigured" >&2
+    systemctl start agnes-datadog-pg-role.service >/dev/null 2>&1 || true
+fi
+%{ endif ~}
+
 # --- 6. Auto-upgrade via cron (pulls new image digest on $UPGRADE_SCHEDULE) ---
+# Unconditional: /var/lib/agnes holds the auto-upgrade heartbeat below, and an
+# external monitor reading a file age needs the directory to exist even on a
+# VM pinned to manual upgrades (where a missing tick file is the answer, not an
+# error).
+mkdir -p /var/lib/agnes
 if [ "$UPGRADE_MODE" = "auto" ]; then
     # agnes-auto-upgrade.sh was already extracted to /usr/local/bin/ in
     # section 3 alongside the compose files — the host artifacts ship
@@ -1682,7 +1939,15 @@ if [ "$UPGRADE_MODE" = "auto" ]; then
     :
 
     # Install cron entry idempotently: remove any prior agnes-auto-upgrade line, then append ours.
-    CRON_LINE="$UPGRADE_SCHEDULE /usr/local/bin/agnes-auto-upgrade.sh >> /var/log/agnes-auto-upgrade.log 2>&1"
+    # The trailing touch is a plain heartbeat: it records that the cron fired,
+    # separately from whether the tick found a new image. Any external monitor
+    # can read its age; nothing on the VM depends on it.
+    #
+    # `touch`, not `date +%s`: cron turns an unescaped % in the command field
+    # into a newline and feeds everything after it to the command as stdin, so
+    # `date +%s > file` would run as `date +` and never write anything. The
+    # probe reads the mtime, so the contents were never the point.
+    CRON_LINE="$UPGRADE_SCHEDULE /usr/local/bin/agnes-auto-upgrade.sh >> /var/log/agnes-auto-upgrade.log 2>&1; touch /var/lib/agnes/auto-upgrade.tick"
     (crontab -l 2>/dev/null | grep -v agnes-auto-upgrade || true; echo "$CRON_LINE") | crontab -
 fi
 

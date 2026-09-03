@@ -1,0 +1,64 @@
+# Heartbeat and marker-file ages.
+#
+# Every host-side job on this VM already leaves a file behind when it runs;
+# this check turns those file mtimes into system.disk.directory.file.modified_sec_ago
+# so "did the job run?" is answerable without a custom metric or a StatsD
+# client. Each instance carries an agnes_probe tag that the consumer-side
+# monitors scope on. ignore_missing keeps a not-yet-created path (a fresh VM,
+# a disabled toggle) from turning into a check error.
+init_config: {}
+
+instances:
+  # The state applier touches this on every run (see scripts/ops/agnes-state-applier.sh).
+  - name: agnes_state_applier
+    directory: /data/state
+    pattern: agnes-state-applier.tick
+    recursive: false
+    filegauges: true
+    ignore_missing: true
+    tags:
+      - agnes_probe:state_applier
+
+  # The auto-upgrade cron line touches this on every tick, whether or not the
+  # tick found a new image.
+  - name: agnes_auto_upgrade
+    directory: /var/lib/agnes
+    pattern: auto-upgrade.tick
+    recursive: false
+    filegauges: true
+    ignore_missing: true
+    tags:
+      - agnes_probe:auto_upgrade
+
+  # The daily backup writes /data/backups/system-duckdb/<YYYYMMDD>/STATUS last,
+  # so the newest STATUS mtime is the age of the newest COMPLETED backup.
+  # Recursive because the dated directories are one level down; the pattern
+  # keeps this to one gauge per retained day (7), well inside the check's
+  # per-instance file-gauge cap.
+  #
+  # The leading */ is load-bearing: the check fnmatches the file's FULL path and
+  # its path relative to `directory`, never the bare basename, so a plain
+  # `STATUS` under a recursive walk matches nothing at all. */STATUS matches
+  # `<YYYYMMDD>/STATUS` and, deliberately, not its `PG_STATUS` sibling.
+  - name: agnes_backup
+    directory: /data/backups/system-duckdb
+    pattern: '*/STATUS'
+    recursive: true
+    filegauges: true
+    ignore_missing: true
+    tags:
+      - agnes_probe:backup
+
+  # One marker per incident signature the watchdog computes; the marker is
+  # rewritten on every alert and never deleted, so a FRESH marker means the
+  # signature is firing right now and a stale one is history. Its own
+  # subdirectory of the watchdog's state dir, so this glob sees signatures and
+  # not the script's run-to-run delta files.
+  - name: agnes_watchdog
+    directory: /var/lib/agnes-watchdog/markers
+    pattern: '*'
+    recursive: false
+    filegauges: true
+    ignore_missing: true
+    tags:
+      - agnes_probe:watchdog
