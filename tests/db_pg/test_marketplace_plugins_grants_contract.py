@@ -165,26 +165,6 @@ def _seed_grant(repos: dict, group_id: str, slug: str, name: str) -> None:
             )
 
 
-def _set_is_system(repos: dict, slug: str, name: str, value: bool) -> None:
-    """Flip ``marketplace_plugins.is_system`` directly. No repo method writes
-    this column in isolation (it rides the mark/unmark_system fan-out
-    endpoints), so the contract test sets it via backend-aware raw SQL to
-    seed the "disabling a system plugin clears its flag" scenario."""
-    if repos["backend"] == "duckdb":
-        repos["conn"].execute(
-            "UPDATE marketplace_plugins SET is_system = ? WHERE marketplace_id = ? AND name = ?",
-            [value, slug, name],
-        )
-    else:
-        import sqlalchemy as sa
-
-        with repos["engine"].begin() as conn:
-            conn.execute(
-                sa.text("UPDATE marketplace_plugins SET is_system = :v WHERE marketplace_id = :m AND name = :n"),
-                {"v": value, "m": slug, "n": name},
-            )
-
-
 # ---------------------------------------------------------------------------
 # list_granted_for_groups — the load-bearing JOIN behind the served marketplace
 # ---------------------------------------------------------------------------
@@ -491,50 +471,54 @@ class TestAdminDisabled:
         counts = repos["plugins"].category_counts(group_ids=[g["id"]])
         assert sum(counts.values()) == 1
 
-    def test_disabling_clears_is_system(self, repos):
-        """set_admin_disabled(..., True) must also clear is_system — a hidden
-        plugin must not keep fanning out as a system default."""
+    def test_disabling_and_re_enabling_leaves_the_grants_untouched(self, repos):
+        """Availability is not distribution, and one write must not do both.
+
+        ``set_admin_disabled(..., True)`` used to clear
+        ``marketplace_plugins.is_system`` in the same UPDATE, and re-enabling
+        deliberately did NOT restore it — a deliberate contract, and the one
+        behaviour a plain grant would have silently changed (the effort's
+        ticket 03). 0098 resolved it the other way: there is no flag, a grant
+        is not touched by hiding the thing it grants, and re-enabling gives
+        back exactly the reach the admin last chose. Nothing to re-set by
+        hand, and nothing resurrected behind their back.
+        """
+        g = repos["groups"].create(name="g-disable-grants", created_by="test")
         _seed_registry(repos, "mp-sys1", datetime(2026, 1, 1, tzinfo=timezone.utc))
         _seed_plugin(repos, "mp-sys1", "sys-plug")
-        _set_is_system(repos, "mp-sys1", "sys-plug", True)
+        _seed_grant(repos, g["id"], "mp-sys1", "sys-plug")
 
         repos["plugins"].set_admin_disabled("mp-sys1", "sys-plug", True)
-
         row = repos["plugins"].get("mp-sys1", "sys-plug")
         assert row is not None
         assert row.get("admin_disabled") is True
-        assert bool(row.get("is_system")) is False
+        assert repos["plugins"].list_granted_for_groups([g["id"]]) == [], (
+            "a disabled plugin must reach nobody, grant or no grant"
+        )
 
-    def test_re_enable_does_not_restore_is_system(self, repos):
-        """set_admin_disabled(..., False) re-enables the plugin but must NOT
-        restore the system flag — matching unmark_system semantics."""
-        _seed_registry(repos, "mp-sys2", datetime(2026, 1, 1, tzinfo=timezone.utc))
-        _seed_plugin(repos, "mp-sys2", "sys-plug2")
-        _set_is_system(repos, "mp-sys2", "sys-plug2", True)
-
-        repos["plugins"].set_admin_disabled("mp-sys2", "sys-plug2", True)
-        repos["plugins"].set_admin_disabled("mp-sys2", "sys-plug2", False)
-
-        row = repos["plugins"].get("mp-sys2", "sys-plug2")
+        repos["plugins"].set_admin_disabled("mp-sys1", "sys-plug", False)
+        row = repos["plugins"].get("mp-sys1", "sys-plug")
         assert row is not None
         assert row.get("admin_disabled") is False
-        # System flag stays cleared — admin must re-mark it explicitly.
-        assert bool(row.get("is_system")) is False
+        served = [r["name"] for r in repos["plugins"].list_granted_for_groups([g["id"]])]
+        assert served == ["sys-plug"], (
+            "re-enabling did not restore the grant's reach; the disable had "
+            "side effects it should not have"
+        )
 
-    def test_disabled_system_plugin_excluded_from_all_listing_paths(self, repos):
-        """A plugin marked is_system=TRUE that is then disabled must vanish
-        from every repo listing path: list_granted_for_groups (served feed)
-        and list_with_filters (browse). my_stack + resolve_user_marketplace
-        both funnel through list_granted_for_groups, so this pins the shared
-        choke point on both backends."""
+    def test_disabled_plugin_excluded_from_all_listing_paths(self, repos):
+        """A granted plugin that is then disabled must vanish from every repo
+        listing path: list_granted_for_groups (served feed) and
+        list_with_filters (browse). my_stack + resolve_user_marketplace both
+        funnel through list_granted_for_groups, so this pins the shared choke
+        point on both backends."""
         g = repos["groups"].create(name="g-sys-hidden", created_by="test")
         _seed_registry(repos, "mp-sys3", datetime(2026, 1, 1, tzinfo=timezone.utc))
         _seed_plugins(repos, "mp-sys3", ["keep", "sys-off"])
-        _set_is_system(repos, "mp-sys3", "sys-off", True)
         _seed_grant(repos, g["id"], "mp-sys3", "keep")
         _seed_grant(repos, g["id"], "mp-sys3", "sys-off")
 
-        # Sanity: before disabling, the system plugin is served.
+        # Sanity: before disabling, the granted plugin is served.
         before = [r["name"] for r in repos["plugins"].list_granted_for_groups([g["id"]])]
         assert "sys-off" in before
 
@@ -589,87 +573,45 @@ class TestAdminDisabled:
         assert bool(row.get("admin_disabled")) is True
 
 
+def _set_legacy_flag(repos: dict, slug: str, name: str, value: bool) -> None:
+    """Set the legacy `is_system` flag directly.
+
+    No repo method writes it — the endpoints that did are gone (0098) and the
+    reconciler only ever CLEARS it — so the contract test seeds the
+    pre-migration state via backend-aware raw SQL. The column itself survives
+    on both backends until the contract half of the expand/contract pair
+    drops it a release later.
+    """
+    if repos["backend"] == "duckdb":
+        repos["conn"].execute(
+            "UPDATE marketplace_plugins SET is_system = ? WHERE marketplace_id = ? AND name = ?",
+            [value, slug, name],
+        )
+    else:
+        import sqlalchemy as sa
+
+        with repos["engine"].begin() as conn:
+            conn.execute(
+                sa.text("UPDATE marketplace_plugins SET is_system = :v WHERE marketplace_id = :m AND name = :n"),
+                {"v": value, "m": slug, "n": name},
+            )
+
+
 # ---------------------------------------------------------------------------
-# list_system_keys — backs my-stack toggle-lock (app/api/my_stack.py)
+# `list_system_keys` and `set_system` lived here.
+#
+# Both were about `marketplace_plugins.is_system` — one read it, one flipped
+# it — and both are gone with the column (migration 0098). What they existed
+# to answer is now a grant: "every account gets this plugin automatically" is
+# `resource_grants` at `scope='everyone'`, `requirement='required'`, so the
+# repository that owns plugin ROWS has no opinion about who gets them.
+#
+# The behaviour those tests pinned did not go with them. The read is covered
+# by `src.marketplace_filter.everyone_required_plugin_keys` and by the
+# end-to-end reach tests in `tests/test_marketplace_plugin_reach.py`; the
+# write is the ordinary grant-create path, whose cross-backend contract is in
+# `tests/db_pg/test_rbac_contract.py`.
 # ---------------------------------------------------------------------------
-
-
-class TestSystemKeys:
-    """Contract tests for marketplace_plugins.list_system_keys."""
-
-    def test_empty_when_no_system_plugins(self, repos):
-        _seed_registry(repos, "mp-s0", datetime(2026, 1, 1, tzinfo=timezone.utc))
-        _seed_plugins(repos, "mp-s0", ["pa", "pb"])
-        # No is_system set on anything.
-        assert repos["plugins"].list_system_keys() == []
-
-    def test_returns_only_system_keys(self, repos):
-        _seed_registry(repos, "mp-s1", datetime(2026, 1, 1, tzinfo=timezone.utc))
-        _seed_plugins(repos, "mp-s1", ["sys-a", "sys-b", "plain"])
-        _set_is_system(repos, "mp-s1", "sys-a", True)
-        _set_is_system(repos, "mp-s1", "sys-b", True)
-        # "plain" stays is_system=FALSE.
-
-        keys = set(repos["plugins"].list_system_keys())
-        assert keys == {("mp-s1", "sys-a"), ("mp-s1", "sys-b")}
-
-    def test_excludes_admin_disabled_system_plugin(self, repos):
-        _seed_registry(repos, "mp-s2", datetime(2026, 1, 1, tzinfo=timezone.utc))
-        _seed_plugins(repos, "mp-s2", ["sys-on", "sys-off"])
-        _set_is_system(repos, "mp-s2", "sys-on", True)
-        _set_is_system(repos, "mp-s2", "sys-off", True)
-        # Admin-disable one of the two system plugins — it must drop out.
-        repos["plugins"].set_admin_disabled("mp-s2", "sys-off", True)
-
-        keys = repos["plugins"].list_system_keys()
-        assert keys == [("mp-s2", "sys-on")]
-
-    def test_returns_tuple_pairs(self, repos):
-        _seed_registry(repos, "mp-s3", datetime(2026, 1, 1, tzinfo=timezone.utc))
-        _seed_plugin(repos, "mp-s3", "only")
-        _set_is_system(repos, "mp-s3", "only", True)
-
-        keys = repos["plugins"].list_system_keys()
-        assert len(keys) == 1
-        assert keys[0] == ("mp-s3", "only")
-        assert isinstance(keys[0], tuple)
-
-
-class TestSetSystem:
-    """Contract tests for marketplace_plugins.set_system — the is_system flip
-    behind the mark/unmark_system endpoints. Pins the cross-backend behaviour
-    so a Postgres instance persists the flag (the bug: the endpoints used to
-    UPDATE on the raw DuckDB _get_db conn, a no-op on PG)."""
-
-    def test_set_system_true_then_false(self, repos):
-        _seed_registry(repos, "mp-sys-a", datetime(2026, 1, 1, tzinfo=timezone.utc))
-        _seed_plugin(repos, "mp-sys-a", "plug")
-        # default
-        row = repos["plugins"].get("mp-sys-a", "plug")
-        assert bool(row.get("is_system")) is False
-        # mark
-        assert repos["plugins"].set_system("mp-sys-a", "plug", True) is True
-        row = repos["plugins"].get("mp-sys-a", "plug")
-        assert bool(row.get("is_system")) is True
-        # unmark
-        assert repos["plugins"].set_system("mp-sys-a", "plug", False) is True
-        row = repos["plugins"].get("mp-sys-a", "plug")
-        assert bool(row.get("is_system")) is False
-
-    def test_set_system_nonexistent_returns_false(self, repos):
-        assert repos["plugins"].set_system("no-market", "no-plug", True) is False
-
-    def test_set_system_does_not_touch_admin_disabled(self, repos):
-        """Marking/unmarking system is orthogonal to admin_disabled — the flip
-        must not clear or set the disable flag."""
-        _seed_registry(repos, "mp-sys-b", datetime(2026, 1, 1, tzinfo=timezone.utc))
-        _seed_plugin(repos, "mp-sys-b", "plug")
-        repos["plugins"].set_admin_disabled("mp-sys-b", "plug", True)
-        repos["plugins"].set_system("mp-sys-b", "plug", True)
-        row = repos["plugins"].get("mp-sys-b", "plug")
-        assert row is not None
-        assert bool(row.get("is_system")) is True
-        assert bool(row.get("admin_disabled")) is True
 
 
 # ---------------------------------------------------------------------------
@@ -820,3 +762,43 @@ class TestClearSyncError:
             "clear_sync_error must not stamp a sync that never ran"
         )
         assert row["last_commit_sha"] is None
+
+
+class TestLegacySystemFlag:
+    """`list_legacy_system_keys` / `clear_legacy_system_flags`.
+
+    They exist for exactly one caller: `src.system_plugin_reconcile`, the
+    frozen DuckDB ladder's stand-in for migration 0098's step 4. Alembic
+    runs on Postgres only, so a DuckDB instance has no other way to convert
+    a flagged plugin into the grant that replaced the flag — and no other
+    way to READ the flag, since the serve paths that used to
+    (`list_granted_for_groups`, the deleted `list_system_keys`) stopped,
+    which is the point of 0098.
+
+    Named *legacy* rather than restoring the old name so nothing mistakes
+    them for live reads. Identical on both backends: on Postgres 0098 clears
+    the flag, so the read returns nothing there once it has run.
+    """
+
+    def test_empty_on_a_clean_instance(self, repos):
+        assert repos["plugins"].list_legacy_system_keys() == []
+        assert repos["plugins"].clear_legacy_system_flags() == 0
+
+    def test_reads_only_flagged_and_enabled_then_clears(self, repos):
+        _seed_registry(repos, "mp-legacy", datetime(2026, 1, 1, tzinfo=timezone.utc))
+        _seed_plugins(repos, "mp-legacy", ["flagged", "plain", "flagged-but-off"])
+        _set_legacy_flag(repos, "mp-legacy", "flagged", True)
+        _set_legacy_flag(repos, "mp-legacy", "flagged-but-off", True)
+        repos["plugins"].set_admin_disabled("mp-legacy", "flagged-but-off", True)
+
+        keys = set(repos["plugins"].list_legacy_system_keys())
+        assert keys == {("mp-legacy", "flagged")}, (
+            "a disabled-and-flagged plugin reached NOBODY, so converting it would "
+            "widen access by one plugin"
+        )
+
+        cleared = repos["plugins"].clear_legacy_system_flags()
+        assert cleared == 2, "both flags clear, including the disabled one"
+        assert repos["plugins"].list_legacy_system_keys() == []
+        # Idempotent: this is what makes the reconciler's second boot cheap.
+        assert repos["plugins"].clear_legacy_system_flags() == 0

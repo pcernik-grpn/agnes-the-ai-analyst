@@ -282,8 +282,13 @@ class UserRepository:
         picker. DuckDB has no ``kind`` column to filter on regardless
         (frozen post-A3 schema).
         """
-        clauses: List[str] = []
-        params: List[Any] = []
+        from src.service_accounts import SYSTEM_IDENTITY_EMAILS
+
+        # Mirrors the PG sibling: service accounts stay in the picker, the
+        # seeded system identities drop out (#2256). Matched by address here
+        # for want of a `kind` column.
+        clauses: List[str] = [f"lower(u.email) NOT IN ({','.join('?' for _ in SYSTEM_IDENTITY_EMAILS)})"]
+        params: List[Any] = list(SYSTEM_IDENTITY_EMAILS)
         if search:
             clauses.append("(u.email ILIKE ? OR u.name ILIKE ?)")
             like = f"%{search}%"
@@ -304,6 +309,23 @@ class UserRepository:
 
     def count_all(self) -> int:
         return self.conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+
+    def count_people(self) -> int:
+        """PG sibling's answer, reached without a ``kind`` column.
+
+        A service account cannot exist on this backend
+        (``create_service_account`` is PG-only), so the only non-people rows
+        here are the seeded system identities — and those are known by
+        address. Same number as ``UsersPgRepository.count_people``.
+        """
+        from src.service_accounts import SYSTEM_IDENTITY_EMAILS
+
+        placeholders = ",".join("?" for _ in SYSTEM_IDENTITY_EMAILS)
+        row = self.conn.execute(
+            f"SELECT COUNT(*) FROM users WHERE lower(email) NOT IN ({placeholders})",  # noqa: S608
+            list(SYSTEM_IDENTITY_EMAILS),
+        ).fetchone()
+        return int(row[0]) if row else 0
 
     def any_password_holder(self, exclude_email: Optional[str] = None) -> bool:
         """Whether at least one user row holds a password hash — a
@@ -479,6 +501,18 @@ class UserRepository:
         /auth/logout`` calls ``users_repo().revoke_sessions(...)`` on either
         backend without branching), same pattern as
         ``LlmUsageRepository.insert_batch``'s ``caller_user_id`` no-op."""
+        return None
+
+    def mark_system_identity(self, user_id: str) -> None:
+        """No-op sibling of ``UsersPgRepository.mark_system_identity``.
+
+        This backend has no ``kind`` column (frozen post-A3 schema), so
+        there is nothing to write. The answer stays correct anyway:
+        ``src.service_accounts.is_system_identity`` falls back to the
+        address, and ``count_people`` here excludes the same three by
+        address. Kept as a real method so the seeds call one name on both
+        backends.
+        """
         return None
 
     def delete(self, user_id: str) -> None:

@@ -24,6 +24,7 @@ import re
 import pytest
 
 from app.auth.view_as import VIEW_AS_COOKIE
+from tests.helpers.access_page import access_js, access_page_source
 
 ANALYST = "analyst1"
 ANALYST_EMAIL = "analyst@test.com"
@@ -792,13 +793,15 @@ class TestTheOfferIsWithheldWhereItCannotSucceed:
         it the guard cannot be written at all."""
         r = va["client"].get("/admin/access", headers={"Accept": "text/html"})
         assert r.status_code == 200
-        assert "const VIEWER_USER_ID = " in r.text
+        # The id travels in the page's boot blob and is read by the module.
+        # Both halves are asserted: the page must SEND it, and the script
+        # must still be the thing that reads it.
         assert ADMIN in r.text
+        assert '"viewer_user_id"' in r.text
+        assert "const VIEWER_USER_ID = BOOT.viewer_user_id" in access_js()
 
     def test_the_lens_withholds_the_button_on_the_callers_own_row(self) -> None:
-        from pathlib import Path
-
-        src = Path("app/web/templates/admin_access.html").read_text(encoding="utf-8")
+        src = access_page_source()
         # The guard, and the reason that takes the button's place.
         assert "uid === VIEWER_USER_ID" in src
         assert 'el("ax-sim-self")' in src

@@ -27,6 +27,13 @@ from sqlalchemy import exc as sa_exc
 from app.auth.access import is_user_admin, require_admin
 from app.auth.dependencies import _get_db, get_current_user
 from app.resource_types import ResourceType, list_resource_types
+from src.grant_scopes import EVERYONE_TARGET_ID, EVERYONE_TARGET_LABEL, carrier_group_id
+from src.grant_scopes import reaches_everyone
+from src.grant_scopes import normalize as normalize_scope
+from src.grant_scopes import takes_everyone_scope
+from src.grant_sources import ACCESS_PAGE, describe as describe_grant_source
+from src.grant_sources import section_for as grant_section
+from src.grant_sources import resolve_source
 from src.repositories.user_groups import SystemGroupProtected
 
 from src.repositories import (
@@ -35,6 +42,7 @@ from src.repositories import (
     user_group_members_repo,
     user_groups_repo,
     users_repo,
+    tool_registry_repo,
 )
 
 logger = logging.getLogger(__name__)
@@ -102,26 +110,28 @@ def _sync_managed_reason(g: dict) -> Optional[tuple]:
        ``entra:<oid>`` groups the login-time Entra group sync creates — the
        SAME naming as SharePoint's, since both key the same Entra group
        identically, see ``src.entra_identity.entra_group_name``).
-    2. Google only: ``is_system=TRUE`` AND the group's name matches the
-       env-configured admin/everyone Workspace email — the OAuth callback
-       routes memberships from those Workspace groups into the seeded
-       system row instead of creating a separate ``user_groups`` row, so
-       the system row effectively *becomes* a Google-synced row in this
-       deployment. Without the env mapping, system groups stay regular
-       admin-managed rows (renaming Admin is still blocked separately by
+    2. Google only: ``is_system=TRUE`` AND the group's name matches
+       ``AGNES_GROUP_ADMIN_EMAIL`` — the OAuth callback routes memberships
+       from that Workspace group into the seeded ``Admin`` row instead of
+       creating a separate ``user_groups`` row, so the system row
+       effectively *becomes* a Google-synced row in this deployment.
+       Without the env mapping, system groups stay regular admin-managed
+       rows (renaming Admin is still blocked separately by
        ``UserGroupsRepository`` for code-reference safety).
+
+       ``Everyone`` had the same branch until 0098, keyed on
+       ``AGNES_GROUP_EVERYONE_EMAIL``. That mapping is now an ordinary
+       synced group of its own, which reaches this function through path 1
+       like every other one.
     """
     created_by = g.get("created_by") or ""
     if created_by in _SYNC_MANAGED_SENTINELS:
         return _SYNC_MANAGED_SENTINELS[created_by]
     if g.get("is_system"):
-        from src.db import SYSTEM_ADMIN_GROUP, SYSTEM_EVERYONE_GROUP
+        from src.db import SYSTEM_ADMIN_GROUP
 
         admin_email = os.environ.get("AGNES_GROUP_ADMIN_EMAIL", "").strip().lower()
-        everyone_email = os.environ.get("AGNES_GROUP_EVERYONE_EMAIL", "").strip().lower()
         if admin_email and g.get("name") == SYSTEM_ADMIN_GROUP:
-            return _SYNC_MANAGED_SENTINELS["system:google-sync"]
-        if everyone_email and g.get("name") == SYSTEM_EVERYONE_GROUP:
             return _SYNC_MANAGED_SENTINELS["system:google-sync"]
     return None
 
@@ -284,6 +294,27 @@ async def search_grantable_resources(
 # ---------------------------------------------------------------------------
 
 
+def _mcp_tool_grants() -> dict:
+    """``{source_id: {"total": M, "by_group": {group_id: N}}}`` for every MCP source.
+
+    One pass over the tool registry, grouped by source; per tool, the groups
+    it is granted to. Both calls exist on both app-state backends. A source
+    with no tools reports ``total: 0`` so the row can say so rather than
+    print "0 of 0" as if it were a fraction of something.
+    """
+    tools = tool_registry_repo()
+    out: dict[str, dict] = {}
+    for t in tools.list_all():
+        sid = str(t.get("source_id") or "")
+        if not sid:
+            continue
+        entry = out.setdefault(sid, {"total": 0, "by_group": {}})
+        entry["total"] += 1
+        for gid in tools.grants_for_tool(t["tool_id"]):
+            entry["by_group"][str(gid)] = entry["by_group"].get(str(gid), 0) + 1
+    return out
+
+
 @router.get("/access-overview", response_model=dict)
 async def access_overview(
     user: dict = Depends(require_admin),
@@ -306,6 +337,13 @@ async def access_overview(
     groups_rows = user_groups_repo().list_all()
     members_repo = user_group_members_repo()
     grants_repo = resource_grants_repo()
+
+    # Resolved once for the whole payload rather than per row.
+    try:
+        _carrier = carrier_group_id()
+    except Exception as e:  # noqa: BLE001 - a missing carrier must not 500 the page
+        logger.warning("access-overview: could not resolve the everyone carrier: %s", e)
+        _carrier = None
 
     groups = []
     for g in groups_rows:
@@ -343,20 +381,45 @@ async def access_overview(
                 # `is_everyone` + the `account_total` below instead, which is
                 # the same answer at O(1).
                 "is_everyone": g.get("name") == SYSTEM_EVERYONE_GROUP,
-                "member_ids": (
-                    []
-                    if g.get("name") == SYSTEM_EVERYONE_GROUP
-                    else [
-                        # `list_members_for_group` joins users and returns the
-                        # account under `id` (u.id), not `user_id` — identically
-                        # on both backends.
-                        m["id"]
-                        for m in members_repo.list_members_for_group(g["id"])
-                        if m.get("id")
-                    ]
-                ),
+                # No roster. `member_ids` used to ride here so the browser could
+                # union reach and match a search against members; both moved to
+                # the server (`/groups/reach`, `/groups/member-search`), which
+                # is where the memberships are. The payload no longer grows with
+                # headcount, and an admin session no longer distributes the org
+                # chart to do two lookups. (Audit S2.)
             }
         )
+
+    # ── Grants this page did NOT make and cannot unmake ──────────────────
+    # `assigned_by` answers WHO wrote a grant; `source` (migration 0096)
+    # answers WHERE it was written, which is a different question whenever a
+    # machine writes rows on an admin's behalf.
+    #
+    # ONE path now. There used to be a second, derived one: a set of
+    # `is_system` plugin ids, consulted for rows that predated the column and
+    # for every row on a DuckDB instance. Both were only ever needed because
+    # a flag on the plugin decided reach without any grant row saying so.
+    # 0098 deleted the flag, so a marketplace_plugin grant is a grant, and
+    # what it says about itself is the whole answer.
+    def _managed_by(source: str | None):
+        """The surface that owns this grant, when it is not this page."""
+        return describe_grant_source(source)
+
+    # Sharers by id → display name, once. `library_sharing` records the
+
+    # actor's user id; the admin API records an email. Only the ids need a
+    # lookup, and `get_info_by_ids` is the existing dual-backend batch reader.
+
+    _grant_rows = grants_repo.list_all()
+    _who: dict[str, str] = {}
+    _ids = sorted({str(x.get("assigned_by")) for x in _grant_rows if x.get("assigned_by") and "@" not in str(x.get("assigned_by"))})
+    if _ids:
+        try:
+            for uid_, info_ in (users_repo().get_info_by_ids(_ids) or {}).items():
+                _who[uid_] = (info_ or {}).get("name") or (info_ or {}).get("email") or uid_
+        except Exception:  # a users-table read failure must not take the page down
+            logger.exception("sharer names unresolved; rows fall back to the raw assigned_by")
+
 
     grants = [
         {
@@ -379,8 +442,110 @@ async def access_overview(
             # made it. The two shapes are resolved client-side against the
             # user list; neither is assumed to be the other.
             "assigned_by": r.get("assigned_by"),
+            # The sharer, READABLE. The comment above promised client-side
+            # resolution against the user list, and the group list never loads
+            # that list — so a Library share rendered "shared by <uuid>" on the
+            # one page whose job is to say who. Resolved here instead, in one
+            # batched read for the whole page (the same reader the collection
+            # projection uses for owners). Emails pass through untouched; ids
+            # that no longer resolve stay as they are rather than vanishing.
+            "assigned_by_name": _who.get(r.get("assigned_by") or "", r.get("assigned_by")),
+            # `None` for an ordinary grant — the page renders those exactly as
+            # before. Non-null means: another surface owns this, do not offer a
+            # control here that will fail.
+            # RESOLVED, not raw: on the frozen DuckDB backend there is no
+            # `source` column at all, so a row's writer lives in
+            # `assigned_by`. Sending the raw value would have the page show
+            # "no source" beside a section that says the row is not
+            # actionable — two halves of the payload disagreeing about the
+            # same grant.
+            "source": resolve_source(r.get("source"), r.get("assigned_by")),
+            "managed_by": _managed_by(resolve_source(r.get("source"), r.get("assigned_by"))),
+            # Which of the page's two sections this row belongs in — the
+            # effort's ticket 10. Sent rather than re-derived client-side so
+            # the rule lives in ONE place (`grant_sources.revocable`) and a
+            # future writer picks its own side by declaring that field.
+            #
+            # The axis is whether the ADMIN CAN ACT on the row, not who wrote
+            # it. Nine writers are not the admin; only two produce rows a
+            # revoke cannot remove. Grouping by authorship would file seven
+            # revocable kinds under "not yours", including the Library shares
+            # an admin most often opens this page to check.
+            "section": grant_section(resolve_source(r.get("source"), r.get("assigned_by"))),
+            # WHO this row reaches, as the page should label it: the
+            # `everyone` sentinel, or a group id. Sent because the page must
+            # not have to know about the carrier — an everyone-scoped row is
+            # stored against the seeded `Everyone` group and would otherwise
+            # render as that group's own grant, which is the attribution the
+            # scope exists to stop.
+            #
+            # `reaches_everyone` rather than `scope` alone, so this answers on
+            # BOTH backends: the frozen DuckDB ladder has no `scope` column,
+            # and there an everyone-grant IS a grant on the carrier. Reading
+            # the column alone would leave a DuckDB instance unable to show
+            # an Everyone audience at all.
+            "audience": (
+                EVERYONE_TARGET_ID if reaches_everyone(r, _carrier) else r["group_id"]
+            ),
+            # WHO the grant reaches. NULL/absent means the members of
+            # `group_id`; 'everyone' means every account, and `group_id` is
+            # then a carrier the page must not attribute the grant to.
+            "scope": r.get("scope"),
         }
-        for r in grants_repo.list_all()
+        for r in _grant_rows
+    ]
+
+    # A block of SYNTHESIZED rows lived here — one per (group, system
+    # plugin) pair, because a plugin flagged `is_system` reached every group
+    # without any grant row saying so, and a page built entirely from grants
+    # would otherwise have shown a plugin every user has as held by nobody.
+    # 0098 removed the need: the flag is one real everyone-scoped grant, in
+    # the list like everything else. What the page owes the reader now is
+    # rendering `scope` as an audience instead of attributing the row to its
+    # carrier group — that is the Access page's own work, not this
+    # projection's.
+
+    # ── Audiences: what the page's list is made of ───────────────────────
+    #
+    # An audience is a group OR "everyone". `groups` above stays exactly as
+    # it was for every existing consumer; this is the shape the redesigned
+    # list reads, and it is the answer to "how does an admin see and manage
+    # what everyone gets".
+    #
+    # The everyone entry is NOT a group and says so: no member roster, no
+    # member count, nothing to administer — its reach is every account by
+    # construction. Its grant count comes from the same `reaches_everyone`
+    # test as the rows, so the count and the list can never disagree, and it
+    # works on the backend with no `scope` column.
+    _everyone_grants = [g for g in grants if g["audience"] == EVERYONE_TARGET_ID]
+    audiences = [
+        {
+            "id": EVERYONE_TARGET_ID,
+            "kind": "scope",
+            "name": EVERYONE_TARGET_LABEL,
+            # Every account, and anyone who joins later — which is the whole
+            # difference from the group this replaces.
+            "reaches_all": True,
+            "grant_count": len(_everyone_grants),
+        }
+    ] + [
+        {
+            "id": g["id"],
+            "kind": "group",
+            "name": g["name"],
+            "reaches_all": False,
+            "grant_count": g["grant_count"],
+            "member_count": g["member_count"],
+            "origin": g["origin"],
+        }
+        for g in groups
+        # The carrier is not offered as an audience of its own: its
+        # everyone-scoped rows are the entry above, and its own grants are
+        # counted there too, so listing it again would offer the same reach
+        # twice under two names. On an instance where it still holds
+        # membership-scoped rows of a withheld type they remain reachable
+        # through `groups`/`grants`, which are untouched.
+        if _carrier is None or g["id"] != _carrier
     ]
 
     # Per-resource-type hierarchies. Driven by the registry in
@@ -397,6 +562,20 @@ async def access_overview(
     # registry order. The page renders Knowledge → Capabilities → Surfaces;
     # sending them interleaved (registry order starts on a capability) would
     # make the UI re-derive an order the registry already knows.
+    #
+    # `offered_on_access=False` types are skipped entirely, which is what
+    # takes `table` out of the picker. Observed, not reasoned: the picker
+    # listed every registered table among 239 grantable "knowledge" items,
+    # and a production group's list showed page after page of table rows
+    # inherited from `Everyone`, each labelled "reached through a package" —
+    # rows an admin ticked believing they granted data. Ticking one grants
+    # no analyst access (`src/rbac.py::can_access_table` never reads a table
+    # grant), so the picker was writing rows nothing reads.
+    #
+    # Only the OFFER goes. `grants` above is untouched, so an existing table
+    # row still renders and still revokes — otherwise the rows already
+    # written would become invisible AND unremovable, which is worse than
+    # the crowding this fixes.
     _family_rank = {fam: i for i, fam in enumerate(RESOURCE_FAMILIES)}
     resources = [
         {
@@ -407,7 +586,10 @@ async def access_overview(
             "family_display": RESOURCE_FAMILIES[spec.family].display_name,
             "blocks": spec.list_blocks(),
         }
-        for spec in sorted(enabled_resource_types(), key=lambda s: _family_rank[s.family])
+        for spec in sorted(
+            (s for s in enabled_resource_types() if s.offered_on_access),
+            key=lambda s: _family_rank[s.family],
+        )
     ]
     # Section headers travel separately from the types, so a family with
     # nothing granted still renders as an empty section rather than
@@ -424,13 +606,26 @@ async def access_overview(
 
     return {
         "groups": groups,
+        "audiences": audiences,
         "grants": grants,
         "resources": resources,
+        # An `mcp_source` grant is necessary but not sufficient: it decides
+        # whether the group sees the SERVER at all, and is ANDed with the
+        # per-tool `tool_grants` maintained on the source's own page. A row
+        # that rendered only the source grant implied completeness it cannot
+        # deliver — the admin finished the visible step and the tool stayed
+        # dark, with the other half of the answer on a page this one never
+        # mentioned (audit F6). So the row can now say "3 of 12 tools
+        # granted →": per source, how many tools it has and how many are
+        # granted to each group. Built once from the registry, both
+        # repositories already exist on both backends, and it is empty on an
+        # instance with no MCP sources.
+        "mcp_tool_grants": _mcp_tool_grants(),
         "families": families,
         # Everyone's reach, at O(1) — see the `member_ids` note above. Also
         # the ceiling for any reach figure the UI prints: no set of groups
         # can reach more people than there are accounts.
-        "account_total": users_repo().count_all(),
+        "account_total": users_repo().count_people(),
     }
 
 
@@ -482,9 +677,10 @@ class UpdateGroupRequest(BaseModel):
 def _derive_origin(g: dict) -> str:
     """Project a 3-value origin tag from existing user_groups columns.
 
-    - mapped via ``AGNES_GROUP_{ADMIN,EVERYONE}_EMAIL`` → 'google_sync'
+    - ``Admin`` mapped via ``AGNES_GROUP_ADMIN_EMAIL`` → 'google_sync'
       (the seed badge is suppressed when the row is wired to Workspace —
-      Workspace is the authoritative source of membership)
+      Workspace is the authoritative source of membership). ``Everyone``
+      had the same mapping until 0098; it is now an ordinary synced group.
     - ``is_system=TRUE`` (otherwise)                   → 'system'
     - ``created_by`` starts with 'system:google'       → 'google_sync'
     - other ``system:`` prefixed creator               → 'system'
@@ -497,11 +693,10 @@ def _derive_origin(g: dict) -> str:
     cb = g.get("created_by") or ""
     name = g.get("name") or ""
     if is_system:
-        from src.db import SYSTEM_ADMIN_GROUP, SYSTEM_EVERYONE_GROUP
+        from src.db import SYSTEM_ADMIN_GROUP
 
         admin_email = os.environ.get("AGNES_GROUP_ADMIN_EMAIL", "").strip()
-        everyone_email = os.environ.get("AGNES_GROUP_EVERYONE_EMAIL", "").strip()
-        if (admin_email and name == SYSTEM_ADMIN_GROUP) or (everyone_email and name == SYSTEM_EVERYONE_GROUP):
+        if admin_email and name == SYSTEM_ADMIN_GROUP:
             return "google_sync"
         return "system"
     if cb.startswith("system:google"):
@@ -514,21 +709,19 @@ def _derive_origin(g: dict) -> str:
 def _mapped_email(g: dict) -> Optional[str]:
     """The Workspace group email that funnels members into a system row.
 
-    Only returns a value when the row is the seeded ``Admin`` / ``Everyone``
-    system group AND the matching env var is configured. Null otherwise —
-    regular google_sync rows already carry the email in ``name``, and
-    unmapped system rows have nothing to show.
+    Only returns a value when the row is the seeded ``Admin`` system group
+    AND ``AGNES_GROUP_ADMIN_EMAIL`` is configured. Null otherwise — regular
+    google_sync rows already carry the email in ``name``, and unmapped
+    system rows have nothing to show. ``Everyone`` was the second case
+    until 0098, and is now an ordinary synced group whose ``name`` IS the
+    email.
     """
     if not g.get("is_system"):
         return None
-    from src.db import SYSTEM_ADMIN_GROUP, SYSTEM_EVERYONE_GROUP
+    from src.db import SYSTEM_ADMIN_GROUP
 
-    name = g.get("name")
-    if name == SYSTEM_ADMIN_GROUP:
+    if g.get("name") == SYSTEM_ADMIN_GROUP:
         v = os.environ.get("AGNES_GROUP_ADMIN_EMAIL", "").strip()
-        return v or None
-    if name == SYSTEM_EVERYONE_GROUP:
-        v = os.environ.get("AGNES_GROUP_EVERYONE_EMAIL", "").strip()
         return v or None
     return None
 
@@ -562,6 +755,111 @@ async def list_groups(
     members_repo = user_group_members_repo()
     grants_repo = resource_grants_repo()
     return [_group_to_response(g, members_repo, grants_repo) for g in groups]
+
+
+@router.get("/groups/reach", response_model=dict)
+async def groups_reach(
+    ids: str = Query(..., description="Comma-separated group ids; `everyone` means every account"),
+    user: dict = Depends(require_admin),
+):
+    """How many distinct people a set of audiences reaches.
+
+    The Access page prints this number at the moment an admin decides to
+    share — "3 groups · 41 people" beside Apply — and it used to compute it
+    in the browser by unioning each group's member ids, which meant every
+    group's full roster travelled in the overview payload to support one
+    arithmetic operation (audit findings E3 and S2). A group whose roster the
+    payload did not carry fell back to its own count, double-counting anyone
+    in two such groups, and the result was then clamped to the account total
+    to hide the overshoot. A figure precise enough to be trusted and not
+    always right, on the screen where reach is being decided.
+
+    Computed here instead, where the memberships are. ``everyone`` — the
+    scope sentinel, not a group — short-circuits to the people total: it is
+    every account a person signs in as, by construction, so no union can
+    exceed it and none is needed. Ordinary groups union their distinct member
+    ids, counting the same population. The answer is still clamped to that
+    total, but as an invariant rather than a patch: no set of audiences
+    reaches more people than there are people.
+
+    "People" excludes service accounts and the identities Agnes seeds for
+    itself (``src.service_accounts.is_person``, issue #2256) — the same
+    definition ``scope='everyone'`` enforces, so the number an admin reads
+    beside Apply is the number of colleagues the share will reach.
+
+    ``ids`` is required (422 when absent, from FastAPI, identically on both
+    app-state backends). Declared before ``/groups/{group_id}`` so the
+    literal segment is not captured as a group id.
+    """
+    from src.grant_scopes import EVERYONE_TARGET_ID
+    from src.service_accounts import is_person
+
+    wanted = [g.strip() for g in ids.split(",") if g.strip()]
+    # People, not rows in `users` (issue #2256). `count_all` counts service
+    # accounts and the identities Agnes seeds for itself, and an
+    # everyone-scoped grant reaches neither — so it was both the wrong
+    # short-circuit for the scope and the wrong ceiling for a group's union.
+    account_total = users_repo().count_people()
+    if EVERYONE_TARGET_ID in wanted:
+        return {"count": account_total, "account_total": account_total}
+    members_repo = user_group_members_repo()
+    seen: set[str] = set()
+    for gid in wanted:
+        for m in members_repo.list_members_for_group(gid):
+            uid = m.get("id") or m.get("user_id")
+            # A group MAY hold a service account — that is the only way one
+            # acquires any authority at all (#1534) — but this figure is
+            # printed as "N people", so counting it here would put a CI token
+            # in the headcount an admin reads when deciding how wide a share
+            # is. It would also break the clamp below, which is an invariant
+            # only while both sides count the same population.
+            if uid and is_person(m):
+                seen.add(str(uid))
+    return {"count": min(len(seen), account_total), "account_total": account_total}
+
+
+@router.get("/groups/member-search", response_model=dict)
+async def groups_member_search(
+    q: str = Query(..., min_length=2, description="Email or name fragment, case-insensitive"),
+    user: dict = Depends(require_admin),
+):
+    """Which groups hold a person matching ``q`` — the group list's third question.
+
+    The Access page's search box has always promised people (its placeholder
+    says so), and it answered by matching the typed text against every
+    group's member roster in the browser — which is why every group's full
+    ``member_ids`` travelled in the overview payload (audit S2). The payload
+    grew with headcount, every admin session distributed the org chart to do
+    one lookup, and the roster was capped at 500 so the answer was quietly
+    wrong on a larger instance.
+
+    Answered here instead, where the memberships are: the same case-insensitive
+    email-or-name match ``/api/users?search=`` makes, then each match's groups.
+    Per group, up to three matched people come back by name so the row can
+    say WHO matched ("matched Ada Lovelace, Grace Hopper"), which is the part
+    of the answer an admin actually reads. ``matched_people`` is the total so
+    the Everyone audience — every live account by construction — can be
+    reported as a hit whenever anyone matched at all.
+
+    ``q`` is required and at least two characters, the same floor the page
+    applied client-side; a one-letter search matches half the instance and
+    says nothing. Declared before ``/groups/{group_id}`` so the literal
+    segment is not captured as a group id.
+    """
+    people = users_repo().search_recent(limit=500, search=q)
+    live = [u for u in people if u.get("active", True) is not False]
+    members_repo = user_group_members_repo()
+    per_group: dict[str, list[dict]] = {}
+    for u in live:
+        label = {"name": u.get("name") or "", "email": u.get("email") or ""}
+        for gid in members_repo.list_groups_for_user(str(u["id"])):
+            bucket = per_group.setdefault(str(gid), [])
+            if len(bucket) < 3:
+                bucket.append(label)
+    return {
+        "matches": [{"group_id": gid, "people": ppl} for gid, ppl in per_group.items()],
+        "matched_people": len(live),
+    }
 
 
 @router.get("/groups/{group_id}", response_model=GroupResponse)
@@ -870,9 +1168,17 @@ class GrantResponse(BaseModel):
     # v49: 'available' | 'required' — Required tier is in-stack by default
     # for every group member without an explicit subscription.
     requirement: str = "available"
+    # WHO the grant reaches: null for the members of `group_id`, 'everyone'
+    # for every account. When set, `group_id`/`group_name` name the CARRIER
+    # row the scope is stored on and must not be read as the audience.
+    scope: Optional[str] = None
 
 
 class CreateGrantRequest(BaseModel):
+    # The audience, when the audience is a group. An everyone-scoped grant
+    # still needs one — the column is NOT NULL — and a caller that does not
+    # care which may send the carrier id from `GET /api/admin/groups`; see
+    # `src.grant_scopes.carrier_group_id`.
     group_id: str
     resource_type: str
     resource_id: str
@@ -886,6 +1192,14 @@ class CreateGrantRequest(BaseModel):
     # silently failed. Default kept at None so callers that don't
     # explicitly pass a value still land at DB's column default.
     requirement: Optional[str] = None
+    # ``'everyone'`` makes this grant reach every account rather than the
+    # members of ``group_id``. This is the ONE writer of that state — an
+    # admin used to reach it by marking a plugin "system" on
+    # /admin/marketplaces, which was a second writer of distribution with
+    # its own vocabulary, and applied to plugins only. Withheld for the four
+    # types where "everyone" is not a coherent audience
+    # (``grant_scopes.SCOPE_WITHHELD_TYPES``).
+    scope: Optional[str] = None
 
 
 def _grant_to_response(g: dict) -> GrantResponse:
@@ -898,6 +1212,7 @@ def _grant_to_response(g: dict) -> GrantResponse:
         assigned_at=str(g["assigned_at"]) if g.get("assigned_at") else None,
         assigned_by=g.get("assigned_by"),
         requirement=g.get("requirement") or "available",
+        scope=g.get("scope"),
     )
 
 
@@ -954,13 +1269,42 @@ async def create_grant(
         )
     if payload.requirement == "required":
         _reject_required_on_user_published(rt, payload.resource_id)
+    # Scope, validated here for the same reason as `requirement`: a 422 that
+    # matches the endpoint contract beats a ValueError leaking from the repo.
+    try:
+        scope = normalize_scope(payload.scope)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    if scope is not None and not takes_everyone_scope(rt.value):
+        # Absent, not disabled — the choice does not exist for these types,
+        # each for its own reason (see SCOPE_WITHHELD_TYPES). Accepting it
+        # would store a claim no read path can honour.
+        raise HTTPException(
+            status_code=422,
+            detail=f"resource_type {rt.value!r} does not take an everyone scope",
+        )
+    # The CARRIER is an invariant, and it is enforced in the REPOSITORY
+    # (`ResourceGrantsPgRepository._carrier_or`) rather than here — this
+    # endpoint is not the only writer of an everyone-scoped grant, so an
+    # override at this one call site made the invariant true by coincidence
+    # rather than by construction. All that is left to do here is refuse
+    # early when there is no carrier to store the scope on, so the caller
+    # gets a 409 instead of a row whose `group_id` is their own guess.
+    if scope is not None and carrier_group_id() is None:
+        raise HTTPException(status_code=409, detail="everyone_carrier_group_missing")
+    group_id = payload.group_id
     try:
         grant_id = grants.create(
-            group_id=payload.group_id,
+            # This page IS the source. Recorded rather than left NULL: "an
+            # admin did this here" and "nobody wrote down where this came
+            # from" are different facts, and only one of them is reassuring.
+            source=ACCESS_PAGE,
+            group_id=group_id,
             resource_type=rt.value,
             resource_id=payload.resource_id,
             assigned_by=user.get("email"),
             requirement=payload.requirement,
+            scope=scope,
         )
     except (duckdb.ConstraintException, sa_exc.IntegrityError):
         # Both backends must surface a duplicate as the same 409 — on
@@ -973,21 +1317,38 @@ async def create_grant(
             detail="Grant already exists for this group/resource_type/resource_id",
         )
     if payload.requirement == "required":
-        _fanout_required_store_entity(rt, payload.group_id, payload.resource_id)
+        # An everyone-scoped grant is deliberately NOT fanned out here: this
+        # eager pass walks ONE group's members, and "every account" has no
+        # group to walk (the carrier is a holder for the scope, not the
+        # audience). The lock is still correct — `required_store_entity_ids`
+        # resolves everyone-scoped rows for an account in no group at all —
+        # so the card materializes on the member's next resolve instead of
+        # on this write. Late, not wrong.
+        _fanout_required_store_entity(rt, group_id, payload.resource_id)
+    # Re-read with the group name joined for the response — and BEFORE the
+    # audit, because for an everyone-scoped grant the repository stores the
+    # CARRIER (`_carrier_or`) rather than the `group_id` the caller sent.
+    # Auditing the payload named a group that never held the grant, and the
+    # later `resource_grant.deleted` entry reads the stored row, so the two
+    # halves of the trail disagreed about the same grant.
+    rows = grants.list_all()
+    fresh = next((r for r in rows if r["id"] == grant_id), None)
     _audit(
         conn,
         user["id"],
         "resource_grant.created",
         f"grant:{grant_id}",
         {
-            "group_id": payload.group_id,
+            # The payload is the fallback only for the cannot-happen re-read
+            # miss below: a created grant still deserves an audit row.
+            "group_id": (fresh or {}).get("group_id") or group_id,
             "resource_type": rt.value,
             "resource_id": payload.resource_id,
+            # An instance-wide grant is exactly the audit row an operator
+            # goes looking for later, so the audience is part of it.
+            "scope": scope,
         },
     )
-    # Re-read with the group name joined for the response.
-    rows = grants.list_all()
-    fresh = next((r for r in rows if r["id"] == grant_id), None)
     if not fresh:
         raise HTTPException(status_code=500, detail="Grant created but lookup failed")
     return _grant_to_response(fresh)
@@ -1163,27 +1524,19 @@ async def delete_grant(
     if not existing:
         raise HTTPException(status_code=404, detail="Grant not found")
 
-    # v39: refuse to revoke a grant whose underlying plugin is system-marked.
-    # The mark_system endpoint materializes per-group rows precisely so the
-    # plugin reaches every user; allowing per-group revoke here would punch
-    # a hole in the mandatory tier silently. Admin must unmark on
-    # /admin/marketplaces first, then revoke individual groups.
-    if existing["resource_type"] == "marketplace_plugin":
-        rid = existing["resource_id"] or ""
-        if "/" in rid:
-            mp_id, plugin_name = rid.split("/", 1)
-            from src.repositories import marketplace_plugins_repo
-
-            plugin_rows = marketplace_plugins_repo().list_for_marketplace(mp_id)
-            sys_plugin = next(
-                (p for p in plugin_rows if p["name"] == plugin_name and p.get("is_system")),
-                None,
-            )
-            if sys_plugin is not None:
-                raise HTTPException(
-                    status_code=409,
-                    detail="cannot_revoke_system_grant",
-                )
+    # The v39 guard that refused this delete for an Automatic-for-everyone
+    # plugin is gone, with the fanout that made it necessary. Marking a plugin
+    # Automatic used to WRITE a grant into every group; revoking one of those
+    # punched a silent hole in the mandatory tier, so the endpoint refused with
+    # 409 cannot_revoke_system_grant.
+    #
+    # Nothing writes those rows now — the flag is resolved at read time — so a
+    # marketplace_plugin grant on an Automatic plugin is, by construction, one
+    # an admin set BY HAND. Refusing here would trap the admin's own row and
+    # make it unrevocable for as long as the flag is on. It is also no longer
+    # load-bearing: deleting it cannot remove the plugin from anyone, because
+    # the flag serves it regardless. Turning the plugin Optional again is the
+    # one control that changes that, and it lives on /admin/marketplaces.
 
     grants.delete(grant_id)
 

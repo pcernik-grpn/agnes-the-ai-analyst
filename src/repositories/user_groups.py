@@ -89,41 +89,6 @@ class UserGroupsRepository:
             "VALUES (?, ?, ?, ?, ?, ?)",
             [group_id, name, description, is_system, datetime.now(timezone.utc), created_by],
         )
-        # v39: every newly-created group inherits the mandatory tier — i.e.
-        # gets a resource_grants row for every plugin currently flagged
-        # is_system=TRUE on marketplace_plugins. Centralised here (rather
-        # than at each call site: admin POST, Google sync ensure(),
-        # ensure_system seed) so all three paths stay symmetric. On fresh
-        # installs the SELECT returns 0 rows so the fanout is a free
-        # no-op; on running instances with existing system plugins the
-        # new group is fully provisioned before its first member logs in.
-        # Fail-soft: a fanout error must not block group creation, since
-        # the legacy admin reconcile path (toggling each plugin manually
-        # in /admin/access) still works and remains a recovery option.
-        try:
-            from src.repositories.resource_grants import (
-                ResourceGrantsRepository,
-            )
-
-            ResourceGrantsRepository(self.conn).fanout_system_for_group(
-                group_id,
-                assigned_by=created_by,
-            )
-        except Exception:
-            # Logger import lives at module scope to keep this hot path
-            # cheap; absent (no logger configured) → swallow silently
-            # rather than raise a NameError. The audit_log row written
-            # by the API layer captures the group create event itself,
-            # so an admin can manually fan out via /admin/access.
-            try:
-                import logging as _logging
-
-                _logging.getLogger(__name__).exception(
-                    "system-plugin grant fanout failed for new group %s",
-                    group_id,
-                )
-            except Exception:
-                pass
         return self.get(group_id)  # type: ignore[return-value]
 
     def ensure(

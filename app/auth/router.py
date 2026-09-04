@@ -19,7 +19,6 @@ from src.user_identity import normalize_email
 
 from src.repositories import (
     audit_repo,
-    user_curated_subscriptions_repo,
     user_group_members_repo,
     user_groups_repo,
     users_repo,
@@ -271,17 +270,6 @@ async def bootstrap(
             name=body.name or normalized_email.split("@")[0],
             password_hash=password_hash,
         )
-        # v39: bootstrap user is the very first user; on first install
-        # there are no system plugins yet so the fanout is a noop. Wire
-        # it anyway so the later bootstrap-of-rebuilt-instance path (rare
-        # but supported) inherits the existing mandatory tier.
-        try:
-            user_curated_subscriptions_repo().fanout_system_for_user(user_id)
-        except Exception:
-            logger.exception(
-                "system-plugin fanout failed for bootstrap user %s",
-                body.email,
-            )
         _audit(user_id, "bootstrap_completed")
 
     # Promote the bootstrap user to the Admin system group — replaces the v9
@@ -299,8 +287,7 @@ async def bootstrap(
             added_by="auth.bootstrap",
         )
 
-    # Issue #748: also grant Everyone (unless AGNES_GROUP_EVERYONE_EMAIL maps
-    # it to a Workspace group). Bootstrap is a first-install flow that runs
+    # Issue #748: also grant Everyone. Bootstrap is a first-install flow that runs
     # for both the create and activate-existing-seed branches above, so this
     # sits at the same shared point as the Admin grant rather than inside
     # either branch — opt-out is not meaningful here (there's no "later" to

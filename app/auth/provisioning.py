@@ -55,25 +55,15 @@ def ensure_user(email: str, name: str, *, source: str) -> dict:
         user_id = str(uuid.uuid4())
         email = normalized or email
         repo.create(id=user_id, email=email, name=name)
-        # Issue #748: auto-grant Everyone at creation (source='system_seed')
-        # unless AGNES_GROUP_EVERYONE_EMAIL maps Everyone to a Workspace
-        # group. Creation-time only: never called again for a returning
-        # user, so an admin's manual removal later sticks.
+        # Issue #748: auto-grant Everyone at creation (source='system_seed').
+        # Creation-time only: never called again for a returning user, so an
+        # admin's manual removal later sticks.
         try:
             from app.auth.group_sync import ensure_everyone_membership
 
             ensure_everyone_membership(user_id, added_by=source)
         except Exception:
             logger.exception("ensure_everyone_membership failed for new user %s", email)
-        # v39: subscribe new user to every system plugin so the mandatory
-        # tier reaches them on their first session without an admin
-        # reconcile. Fail-soft.
-        try:
-            from src.repositories import user_curated_subscriptions_repo
-
-            user_curated_subscriptions_repo().fanout_system_for_user(user_id)
-        except Exception:
-            logger.exception("system-plugin fanout failed for new user %s", email)
         user = repo.get_by_email(email)
     if not bool(user.get("active", True)):
         raise UserDeactivatedError(email)

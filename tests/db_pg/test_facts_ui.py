@@ -509,6 +509,14 @@ def test_single_valued_conflict_clears_when_second_dst_claims_deleted(seeded_app
 
     with get_engine().begin() as conn:
         conn.execute(sa.text("DELETE FROM claims WHERE edge_id = :eid"), {"eid": edge2})
+    # This DELETE bypasses `repo` entirely (raw SQL, simulating an
+    # out-of-band data fix), so none of `collection_facts_summary`'s
+    # write-version hooks (`add_claim`/`delete_claims_for_file`/etc., TCRD-
+    # 296 gap #78) fire on their own -- the page's 30s facts-summary cache
+    # would otherwise still serve the pre-delete conflict here. Explicit
+    # invalidation is the documented escape hatch for exactly this case
+    # (`FactsPgRepository.invalidate_corpus_facts_cache`'s own docstring).
+    repo.invalidate_corpus_facts_cache(corpus_id)
 
     r_after = s["client"].get("/library/clearing-sv", headers=_admin_headers(s))
     assert 'conflicting "owned_by" values' not in r_after.text

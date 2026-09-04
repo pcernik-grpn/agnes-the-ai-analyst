@@ -190,9 +190,8 @@ with no `id` is skipped) to bypass the real Graph call entirely (empty value
 in spirit, widened to carry the id every fetched group now needs.
 
 **Not implemented (deliberately out of scope for this feature):** the
-admin/everyone system-group email mapping Google sync offers
-(`AGNES_GROUP_ADMIN_EMAIL` / `AGNES_GROUP_EVERYONE_EMAIL`) has no Microsoft
-equivalent — Entra groups are not required to be mail-enabled, and choosing
+Admin system-group email mapping Google sync offers
+(`AGNES_GROUP_ADMIN_EMAIL`) has no Microsoft equivalent — Entra groups are not required to be mail-enabled, and choosing
 an identifier scheme for that mapping (mail vs. object ID vs. display name)
 is a separate decision than this feature makes.
 

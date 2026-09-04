@@ -1,10 +1,6 @@
 """Postgres-backed user-groups repository.
 
-Mirrors ``src/repositories/user_groups.py``. The ``fanout_system_for_group``
-call from ``create()`` is intentionally a soft-fail when the
-``marketplace_plugins`` table isn't present yet (Phase F is mid-rollout —
-that table ports later). Once marketplace_plugins is ported, the
-soft-fail branch becomes dead code and can be removed.
+Mirrors ``src/repositories/user_groups.py``.
 """
 
 from __future__ import annotations
@@ -99,18 +95,6 @@ class UserGroupsPgRepository:
                     "created_by": created_by,
                 },
             )
-
-        # Soft-fail fanout — marketplace_plugins table may not be migrated
-        # yet during Phase F rollout.
-        try:
-            from src.repositories.resource_grants_pg import ResourceGrantsPgRepository
-
-            ResourceGrantsPgRepository(self._engine).fanout_system_for_group(
-                group_id,
-                assigned_by=created_by,
-            )
-        except Exception:
-            pass
 
         return self.get(group_id)  # type: ignore[return-value]
 
