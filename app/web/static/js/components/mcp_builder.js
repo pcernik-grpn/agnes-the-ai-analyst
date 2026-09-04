@@ -283,12 +283,14 @@
   var appsPanel = null;
 
   function listerTools() {
-    return (draft.tools || []).filter(function (t) {
-      // Turned off in the Tools section means no tool row is registered, so
-      // there is nothing to materialize and nothing to catalogue.
-      if (draft.enabled[t.name] === false) return false;
-      return window.LinkedAppsPanel.isLister(t.name);
+    // Turned off in the Tools section means no tool row is registered, so
+    // there is nothing to materialize and nothing to catalogue.
+    var on = (draft.tools || []).filter(function (t) {
+      return draft.enabled[t.name] !== false;
     });
+    // Ranked best-first, and a tool that writes is not in the list at all —
+    // the panel owns that judgement so both hosts make the same one (#2154).
+    return window.LinkedAppsPanel.listerCandidates(on);
   }
   function hasLister() { return DATA_APPS_ENABLED && listerTools().length > 0; }
 
@@ -309,9 +311,13 @@
     // The lister's registry id is the one `registerTool` sent when it created
     // the row (the builder supplies it rather than letting the server mint a
     // uuid), so it is known here without a round trip.
-    var lister = listerTools()[0];
+    var listers = listerTools();
+    var lister = listers[0];
     if (savedId && lister && appsPanel.sourceId() !== savedId) {
-      appsPanel.setSource(savedId, savedId + '__' + lister.name);
+      appsPanel.setSource(savedId, savedId + '__' + lister.name,
+        listers.map(function (c) {
+          return { name: c.name, tool_id: savedId + '__' + c.name };
+        }));
     }
     return appsPanel;
   }
@@ -1134,6 +1140,10 @@
 
     document.addEventListener('input', function (e) {
       var el = e.target;
+      // The apps panel owns its own value-carrying targets, as it owns its
+      // clicks — the host routes, the panel decides.
+      var li = el.closest && el.closest(window.LinkedAppsPanel.INPUT_SELECTOR);
+      if (li && panel().handleInput(li)) return;
       if (el.getAttribute && el.getAttribute('data-ag-search') === 'mcp-groups') {
         pickerQuery = el.value; renderPickerRows(); return;
       }

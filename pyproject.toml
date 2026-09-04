@@ -1,6 +1,6 @@
 [project]
 name = "agnes-the-ai-analyst"
-version = "0.98.0"
+version = "0.99.0"
 description = "Agnes — self-hosted AI harness for organizations: governed data access, agents as an API, skills marketplace, corporate memory, hosted data apps, and agent surfaces (web chat, Slack, MCP, CLI)"
 requires-python = ">=3.11,<3.14"
 license = {file = "LICENSE"}
@@ -263,12 +263,13 @@ embeddings = [
     "sentence-transformers>=3.0",
 ]
 docling = [
-    # Rich document parsing for Collections ingestion (PDF layout/tables,
-    # DOCX, PPTX, scans). HEAVY — pulls torch and ML models — so it is an
-    # opt-in extra, never a core/server dependency. Imported lazily inside
-    # src/ingest/text_extract.py (guarded); without it, ingestion falls back
-    # to the lightweight per-format extractors (txt/md/html; pdf via pypdf if
-    # present) and rejects formats it cannot read rather than crashing.
+    # Layout-aware document parsing (tables, reading order) for the shared
+    # converter in src/ingest/convert.py, used by Collections uploads and the
+    # SharePoint crawl alike. HEAVY — pulls torch and ML models — so it is an
+    # opt-in extra (the `-rich` image), never a core/server dependency, and
+    # imported lazily (guarded). Without it, .docx/.pptx go through
+    # markitdown from the `extraction` extra below; a build with neither
+    # rejects them with a reason naming both.
     "docling>=2.0",
 ]
 slack-socket = [
@@ -309,8 +310,8 @@ distribution = [
     # (object_store() returns None) instead of crashing at boot.
     "boto3>=1.34",
 ]
-# Document → markdown extraction for the built-in SharePoint/Collections
-# crawl (connectors/sharepoint/convert.py + pdf_structure.py). Deliberately
+# Document → markdown extraction for the SharePoint crawl and Collections
+# uploads (src/ingest/convert.py + pdf_structure.py). Deliberately
 # permissive: markitdown is MIT (mammoth BSD-2, python-pptx MIT, openpyxl MIT
 # underneath) and pypdfium2 is Apache-2.0/BSD-3 over BSD-licensed PDFium.
 # NEVER add PyMuPDF/fitz here — it is AGPL-3.0 and Agnes ships under
@@ -478,4 +479,4 @@ dev-dependencies = [
 override-dependencies = ["urllib3>=2.7.0"]
 
 [tool.agnes]
-released_changelog_sha256 = "87117cc9460344b7e8379046c5e95159e7de504d68a5ecd72ceed7115ea9c8fd"
+released_changelog_sha256 = "42a5653d140dd6e64d97ccfc0edaac3da690110eb7e5ace020b0592da3217bd3"
