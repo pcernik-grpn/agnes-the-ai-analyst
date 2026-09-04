@@ -488,6 +488,65 @@ class TestThePickerFilterReportsBothFacets:
         assert "famCount.size" in line  # either facet having options keeps it
 
 
+class TestTheDrawersFilterFitsTheDrawer:
+    """`.fbar-cat__pop` is `position: fixed` and placed BESIDE the menu.
+
+    That is right on the page's own toolbar and cannot work in the drawer:
+    it leaves roughly 120px to the right of a 264px menu for a 232px
+    popover, so `placeSubmenu`'s collision arm flipped every open to the
+    left — on top of the list it was filtering. Stacking the options under
+    their category is the shared toolbar's own answer to a container too
+    narrow for a flyout (`.fbar-menu--single .fbar-cat__pop`).
+    """
+
+    def _source(self) -> str:
+        return access_page_source()
+
+    def test_the_categories_stack_instead_of_flying_out(self):
+        src = self._source()
+        rule = src[src.index(".ax-picker__filter .fbar-cat__pop") :]
+        rule = rule[: rule.index("}")]
+        assert "position: static" in rule
+
+    def test_the_placer_stands_down_for_a_stacked_popover(self):
+        """No JS branch for this: `placeSubmenu` already returns early for a
+        pop that is not `fixed` (the phone layout stacks the same way), and
+        it clears the offsets a previous flyout left behind."""
+        src = self._source()
+        block = src[src.index("function placeSubmenu") : src.index("const vw = window.innerWidth")]
+        assert 'position !== "fixed"' in block
+        assert 'pop.style.left = "";' in block
+
+
+class TestTheSelectionPopoverIsADropdown:
+    """The page has one look for a popover, and this is a popover."""
+
+    def _source(self) -> str:
+        return access_page_source()
+
+    def test_it_carries_the_shared_menu_metrics(self):
+        src = self._source()
+        rule = src[src.index(".ax-picker__chosen {") :]
+        rule = rule[: rule.index("}")]
+        # `.fbar-menu`'s own values (filter_toolbar.css), to the pixel.
+        assert "width: 264px" in rule
+        assert "border-radius: 12px" in rule
+        assert "var(--ds-shadow-md)" in rule
+        assert "padding: 6px" in rule
+        # It hangs off the FOOTER, so it is the one that opens upward.
+        assert "bottom: calc(100% + 6px)" in rule
+
+    def test_hover_is_driven_from_script_not_a_css_rule(self):
+        """The CSS `:hover` rule fired inconsistently, and the open state has
+        to be shared with the click path or `aria-expanded` starts lying."""
+        src = self._source()
+        assert "countwrap:hover .ax-picker__chosen" not in src
+        assert 'wrap.addEventListener("mouseenter", openChosen)' in src
+        assert 'wrap.addEventListener("focusin", openChosen)' in src
+        # Delayed close, or the pointer cannot reach the rows it opened.
+        assert "closeT = setTimeout(" in src
+
+
 class TestThePersonLensNamesItsSubject:
     """An access audit with no subject on it.
 

@@ -4102,6 +4102,39 @@
       applyPickerFacet(e.target.closest("[data-pk-secfacet], [data-pk-kind]"));
     });
 
+    /* Hover opens the selection too, driven here rather than by a CSS
+       `:hover` rule: the rule fired inconsistently, and the state has to be
+       shared with the click path anyway or `aria-expanded` starts lying.
+       The close is delayed so the pointer can travel from the count into the
+       list it opened — a popover that vanishes on the way to its own rows is
+       worse than one that only clicks. */
+    const wrap = root.querySelector(".ax-picker__countwrap");
+    if (wrap) {
+      let closeT = null;
+      const openChosen = () => {
+        clearTimeout(closeT);
+        const pop = root.querySelector('[data-pk="chosenpop"]');
+        const btn = root.querySelector('[data-pk="countbtn"]');
+        if (!pop || !pickerState.chosen.size) return;
+        pop.hidden = false;
+        if (btn) btn.setAttribute("aria-expanded", "true");
+      };
+      const closeChosen = () => {
+        closeT = setTimeout(() => {
+          const pop = root.querySelector('[data-pk="chosenpop"]');
+          const btn = root.querySelector('[data-pk="countbtn"]');
+          if (pop) pop.hidden = true;
+          if (btn) btn.setAttribute("aria-expanded", "false");
+        }, 220);
+      };
+      wrap.addEventListener("mouseenter", openChosen);
+      wrap.addEventListener("mouseleave", closeChosen);
+      // Keyboard reaches it through the button; focus should hold it open for
+      // the same reason the pointer does.
+      wrap.addEventListener("focusin", openChosen);
+      wrap.addEventListener("focusout", closeChosen);
+    }
+
     root.addEventListener("click", async (e) => {
       if (e.target.closest("[data-pk-close]")) { closePicker(); return; }
       if (e.target.closest("[data-pk-apply]")) { await applyPicker(); return; }

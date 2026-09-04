@@ -1259,31 +1259,43 @@
   .ax-simwho__mail { font-size: 12px; color: var(--ds-text-muted); }
   .ax-simwho__off { font-size: 11px; color: var(--ds-text-muted); border: 1px solid var(--ds-border);
     border-radius: var(--ds-radius-pill); padding: 1px 8px; }
+  /* The drawer's filter stacks its categories INSTEAD of flying them out.
+     `.fbar-cat__pop` is `position: fixed` and placed beside the menu, which
+     works on the page's own toolbar and cannot work here: the drawer leaves
+     ~120px to the right of the menu for a 232px popover, so every open
+     flipped left and landed on top of the list it was filtering. Stacking is
+     the shared toolbar's own answer to a container too narrow for a flyout
+     (`.fbar-menu--single .fbar-cat__pop`, filter_toolbar.css). */
+  .ax-picker__filter .fbar-cat__pop { position: static; width: auto; max-height: none;
+    border: 0; border-radius: 0; box-shadow: none; padding: 2px 0 6px 6px; background: none; }
+  .ax-picker__filter .fbar-cat__caret { transform: rotate(90deg); transition: transform .12s ease; }
+  .ax-picker__filter .fbar-cat__btn[aria-expanded="true"] .fbar-cat__caret { transform: rotate(-90deg); }
   .ax-picker__countwrap { position: relative; margin-right: auto; }
-  /* A button that reads as the label it replaced until there is something
-     to open — the footer should not grow a control that does nothing. */
+  /* Reads as the label it replaced until there is something to open — the
+     footer should not grow a control that does nothing. */
   .ax-picker__count { font: inherit; font-size: 12px; color: var(--ds-text-muted);
     background: none; border: 0; padding: 2px 0; }
   .ax-picker__count:not(:disabled) { color: var(--ds-text-primary); cursor: pointer;
     text-decoration: underline; text-decoration-style: dotted; text-underline-offset: 3px; }
   .ax-picker__count:not(:disabled):hover,
   .ax-picker__count:not(:disabled):focus-visible { color: var(--ds-primary); }
-  /* Hover opens it as well as click: the ask was to see the picks without
-     leaving the footer, and the pointer is already there. */
-  .ax-picker__countwrap:hover .ax-picker__chosen[hidden] { display: block; }
-  .ax-picker__chosen { position: absolute; bottom: calc(100% + 8px); left: 0; z-index: 42;
-    min-width: 260px; max-width: 360px; max-height: 240px; overflow-y: auto;
+  /* The Filter menu's own shell, to the value — this is a dropdown and the
+     page has exactly one look for those (`.fbar-menu` in
+     filter_toolbar.css). It opens UPWARD because it hangs off the footer. */
+  .ax-picker__chosen { position: absolute; bottom: calc(100% + 6px); left: 0; z-index: 40;
+    width: 264px; max-height: 60vh; overflow-y: auto; padding: 6px;
     background: var(--ds-surface); border: 1px solid var(--ds-border);
-    border-radius: var(--ds-radius-lg); box-shadow: var(--ds-shadow-lg); padding: 6px; }
-  .ax-picker__chosen-hd { font-size: 11px; text-transform: uppercase; letter-spacing: .04em;
-    color: var(--ds-text-muted); padding: 4px 6px 6px; }
-  .ax-picker__chosen-r { display: grid; grid-template-columns: auto minmax(0, 1fr) auto;
-    align-items: center; gap: 8px; padding: 4px 6px; border-radius: var(--ds-radius-btn); }
-  .ax-picker__chosen-r:hover { background: var(--ds-surface-dim); }
-  .ax-picker__chosen-nm { font-size: 12px; color: var(--ds-text-primary);
-    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .ax-picker__chosen-x { background: none; border: 0; cursor: pointer; line-height: 1;
-    font-size: 14px; color: var(--ds-text-muted); padding: 0 2px; }
+    border-radius: 12px; box-shadow: var(--ds-shadow-md); }
+  .ax-picker__chosen[hidden] { display: none; }
+  /* `.fbar-menu`'s own heading and row metrics. */
+  .ax-picker__chosen-hd { font-size: 11.5px; font-weight: 600; letter-spacing: .02em;
+    color: var(--ds-text-muted); padding: 6px 10px 4px; }
+  .ax-picker__chosen-r { display: flex; align-items: center; gap: 9px; padding: 7px 10px;
+    border-radius: 8px; font-size: 13.5px; color: var(--ds-text-primary); }
+  .ax-picker__chosen-r:hover { background: color-mix(in srgb, var(--ds-text-primary) 5%, transparent); }
+  .ax-picker__chosen-nm { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ax-picker__chosen-x { margin-left: auto; background: none; border: 0; cursor: pointer;
+    line-height: 1; font-size: 14px; color: var(--ds-text-muted); padding: 0 2px; border-radius: 7px; }
   .ax-picker__chosen-x:hover, .ax-picker__chosen-x:focus-visible { color: var(--ds-accent-danger-ink); }
   .ax-pk-r--g { grid-template-columns: 20px minmax(0, 1fr); }
   /* In By bundle the add sits inside the bundle's own section, so it is
