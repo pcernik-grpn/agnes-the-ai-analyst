@@ -4,12 +4,15 @@ The actual test logic lives in ``tests/test_watchdog_role_containers.sh``
 (same pattern as ``tests/test_auto_upgrade_role_split.sh`` /
 ``tests/test_db_backup_pg_canary.sh``): it fakes `docker` and `logger` on
 PATH, sandboxes the paths ``agnes-watchdog.sh`` reads/writes, and drives
-five scenarios (single-container topology, a role-split fleet scanned and
-named container-by-container with sidecars filtered out, the new
+eight scenarios (single-container topology, a role-split fleet scanned and
+named container-by-container with sidecars filtered out, the
 coordination-backend-unreachable signature firing past its low-noise
 threshold while a single blip does not, that same signature staying
-silent when redis isn't configured, and the legacy-name fallback when
-`docker compose ps` yields nothing) asserting the exact `docker` command
+silent when redis isn't configured, the legacy-name fallback when
+`docker compose ps` yields nothing, the same signature armed from .env
+instead of instance.yaml, and the two shapes of a failed one-shot job —
+blocking a strict boot into an empty fleet, and failing behind a fleet
+that still looks healthy) asserting the exact `docker` command
 lines and alert text the container-enumeration + per-container signature
 scan produces. This wrapper just makes it part of the ``pytest tests/``
 run so CI enforces it automatically instead of requiring a manual

@@ -13,6 +13,10 @@
 #     "Failed to append to PRIMARY_*")
 #   - container restart bursts, cgroup OOM kills, scheduler HTTP-500
 #     streaks, /data disk pressure, dead health endpoint
+#   - a one-shot job (migrate, data-migrate, duckdb-seed) left in a
+#     non-zero exit: the strict boot then holds app/scheduler in `Created`
+#     forever, and the failure is reported with the cause read out of that
+#     job's own log rather than as an empty fleet
 #   - a redis-backed coordination backend going unreachable ("Coordination
 #     Unavailable" repeated in a role container's logs — see below)
 #
@@ -161,6 +165,55 @@ done < <(list_role_containers)
 if [ "${#CONTAINERS[@]}" -eq 0 ]; then
     add "CONTAINER: no agnes role containers found (docker compose ps returned none)" fleet-empty
 fi
+
+# --- Failed one-shot jobs -----------------------------------------------
+# ROLE_CONTAINER_RE above deliberately skips the one-shot jobs (migrate,
+# data-migrate, duckdb-seed): they don't run app code, so none of the log
+# signatures below would ever match them. That reasoning holds for the
+# signature scan and NOT for the thing those jobs actually do, which is
+# gate the boot — leaving their most consequential failure unreported.
+#
+# Two shapes, both seen live on 2026-09-04:
+#   - Strict boot: `migrate` exits non-zero, so app/scheduler never leave
+#     `Created` (they wait on `service_completed_successfully`). The fleet
+#     is then empty and the only alert said "no agnes role containers
+#     found" — the symptom, with the cause one `docker logs` away and
+#     nothing pointing at it. 2.5h at 502.
+#   - Silent drift: the app is still up from BEFORE the upgrade, so the
+#     fleet is not empty and nothing fires at all, while every upgrade
+#     tick re-runs a migrate that keeps failing. Ran undetected for two
+#     days; the instance was one recreate away from not coming back.
+#
+# Derived from `docker compose ps` rather than matched against a hardcoded
+# job list, so a one-shot service added to the compose file later is
+# covered without touching this script. `-a` is load-bearing: a container
+# that has exited is invisible to a bare `docker compose ps`, which is
+# precisely the state being reported on.
+list_failed_jobs() {
+    docker compose ps -a --format '{{.Service}} {{.Name}} {{.State}} {{.ExitCode}}' 2>/dev/null \
+        | awk '$3 == "exited" && $4 ~ /^[0-9]+$/ && $4 != "0" { print $2, $4 }'
+}
+
+# No `--since $SINCE` on the log read: a job that failed before the window
+# opened is still blocking the stack right now, and the window would hide
+# exactly the long-running breakage this is here to catch. Prefer the last
+# line that looks like a raised exception (alembic/SQLAlchemy put the
+# actionable text there) and fall back to the last non-empty line.
+job_failure_cause() {
+    local ctr=$1 cause
+    cause=$(docker logs "$ctr" --tail 60 2>&1 \
+        | grep -aE '^[A-Za-z_][A-Za-z0-9_.]*(Error|Exception|Warning):|^ERROR|^FATAL' | tail -1)
+    if [ -z "$cause" ]; then
+        cause=$(docker logs "$ctr" --tail 30 2>&1 | grep -av '^[[:space:]]*$' | tail -1)
+    fi
+    printf '%.300s' "$cause"
+}
+
+while read -r job_ctr job_code; do
+    [ -n "$job_ctr" ] || continue
+    job_cause=$(job_failure_cause "$job_ctr")
+    add "JOB-FAILED[$job_ctr]: one-shot job exited ${job_code}; app/scheduler stay in Created until it succeeds${job_cause:+ — $job_cause}" job-failed
+done < <(list_failed_jobs)
 
 # --- Coordination backend configured? -----------------------------------
 # Redis coordination is declared via instance.yaml::coordination.backend
