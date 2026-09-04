@@ -4040,7 +4040,21 @@
       '        <button type="button" class="fbar-seg__btn" data-pk-tier="required">' + esc(WORDS.tier_automatic) + '</button>' +
       '      </span>' +
       '    </span>' +
-      '    <span class="ax-picker__count" data-pk="count">Nothing selected</span>' +
+      /* The count is a CONTROL, because the list it counts is unreachable
+         otherwise: with a filter on, or past a screen of rows, the only way
+         to see what is ticked was to scroll the whole list hunting for
+         checkmarks — and a tick made under a filter that is later cleared
+         is somewhere in the middle of it. A button opens the review list
+         (hover reveals it too, but hover alone would leave it unreachable
+         by touch and keyboard). */
+      '    <span class="ax-picker__countwrap">' +
+      '      <button type="button" class="ax-picker__count" data-pk="countbtn"' +
+      '              aria-haspopup="true" aria-expanded="false" disabled>' +
+      '        <span data-pk="count">Nothing selected</span>' +
+      '      </button>' +
+      '      <div class="ax-picker__chosen" data-pk="chosenpop" role="dialog"' +
+      '           aria-label="What is selected" hidden></div>' +
+      '    </span>' +
       '    <button type="button" class="btn btn-secondary" data-pk-close>Cancel</button>' +
       '    <button type="button" class="btn btn-primary" data-pk-apply disabled>Apply</button>' +
       '  </div>' +
@@ -4052,6 +4066,8 @@
       q: root.querySelector('[data-pk="q"]'),
       list: root.querySelector('[data-pk="list"]'),
       count: root.querySelector('[data-pk="count"]'),
+      countBtn: root.querySelector('[data-pk="countbtn"]'),
+      chosenPop: root.querySelector('[data-pk="chosenpop"]'),
       tier: root.querySelector('[data-pk="tier"]'),
       tierseg: root.querySelector('[data-pk="tierseg"]'),
       apply: root.querySelector("[data-pk-apply]"),
@@ -4103,6 +4119,29 @@
         paintPicker();
         return;
       }
+      const unchoose = e.target.closest("[data-pk-unchoose]");
+      if (unchoose) {
+        pickerState.chosen.delete(unchoose.dataset.pkUnchoose);
+        paintPicker();
+        // Keep it open while there is still something to review — the point
+        // is correcting a selection, which usually means more than one.
+        const pop = root.querySelector('[data-pk="chosenpop"]');
+        const btn = root.querySelector('[data-pk="countbtn"]');
+        const still = pickerState.chosen.size > 0;
+        if (pop) pop.hidden = !still;
+        if (btn) btn.setAttribute("aria-expanded", still ? "true" : "false");
+        return;
+      }
+      if (e.target.closest('[data-pk="countbtn"]')) {
+        const pop = root.querySelector('[data-pk="chosenpop"]');
+        const btn = root.querySelector('[data-pk="countbtn"]');
+        if (pop && pickerState.chosen.size) {
+          const show = pop.hidden;
+          pop.hidden = !show;
+          btn.setAttribute("aria-expanded", show ? "true" : "false");
+        }
+        return;
+      }
       if (e.target.closest('[data-pk="filterbtn"]')) {
         // `root`, not `els.root`: this listener is installed inside
         // buildPicker, where the element map is still being assembled and is
@@ -4151,6 +4190,14 @@
       const kindChip = e.target.closest("button[data-pk-kind]");
       if (kindChip) {
         pickerState.kind = kindChip.dataset.pkKind || "";
+        paintPicker();
+        return;
+      }
+      // Its own attribute: `data-pk-fam` is already the family GROUP toggle
+      // in the list below, and a chip sharing it would collapse a band
+      // instead of clearing the filter.
+      if (e.target.closest("button[data-pk-secclear]")) {
+        pickerState.fam = "";
         paintPicker();
         return;
       }
@@ -4309,6 +4356,58 @@
     return out;
   }
 
+  /* What a chosen key POINTS AT. `overview` carries most of it, but a file
+     found through the server-side search is not in that payload at all
+     (`pickerRemoteFiles`) — and a tick on one of those is exactly the pick
+     a reader cannot find again by scrolling, since clearing the search
+     takes the row away. */
+  function chosenEntries() {
+    const byKey = new Map();
+    for (const t of (overview.resources || [])) {
+      for (const b of (t.blocks || [])) {
+        for (const i of (b.items || [])) {
+          byKey.set(`${t.type_key}:${i.resource_id}`, { t, i });
+        }
+      }
+    }
+    const fileType = (overview.resources || []).find((t) => t.type_key === "corpus_file");
+    for (const i of pickerRemoteFiles.items) {
+      const key = `corpus_file:${i.resource_id}`;
+      if (fileType && !byKey.has(key)) byKey.set(key, { t: fileType, i });
+    }
+    return [...pickerState.chosen].map((key) => ({ key, hit: byKey.get(key) }));
+  }
+
+  //: The review list behind the footer count. Removable in place: finding a
+  //: tick and being unable to undo it without hunting for the row again is
+  //: the same problem one step later.
+  function paintChosen(els) {
+    const pop = els.chosenPop;
+    if (!pop) return;
+    const n = pickerState.chosen.size;
+    if (els.countBtn) {
+      els.countBtn.disabled = !n;
+      if (!n) els.countBtn.setAttribute("aria-expanded", "false");
+    }
+    if (!n) { pop.hidden = true; pop.innerHTML = ""; return; }
+    if (pickerState.mode === "bundle") {
+      // Bundle mode ticks AUDIENCES, and its footer already says what they
+      // reach; a second list of the same three rows would say less.
+      pop.hidden = true;
+      pop.innerHTML = "";
+      if (els.countBtn) els.countBtn.disabled = true;
+      return;
+    }
+    pop.innerHTML = `<div class="ax-picker__chosen-hd">${n} selected</div>`
+      + chosenEntries().map(({ key, hit }) => `
+        <div class="ax-picker__chosen-r">
+          ${hit ? kindTag(hit.t) : `<span class="ax-kt">gone</span>`}
+          <span class="ax-picker__chosen-nm">${esc(hit ? itemName(hit.i) : key)}</span>
+          <button type="button" class="ax-picker__chosen-x" data-pk-unchoose="${esc(key)}"
+                  aria-label="Remove ${esc(hit ? itemName(hit.i) : key)} from the selection">×</button>
+        </div>`).join("");
+  }
+
   function paintPicker() {
     const els = buildPicker();
     if (pickerState.mode === "bundle") {
@@ -4368,11 +4467,19 @@
        one that is active, and the filter stops describing the set it filters. */
     const kinds = new Map();
     const wasKind = pickerState.kind;
+    const wasFam = pickerState.fam;
+    /* BOTH facets, not just `kind`. Neutralising one and leaving the other
+       applied made the menu describe the filtered set rather than the
+       offerable one — and `kinds.size` then fell below the threshold that
+       keeps the control on screen, so picking a Section hid the Filter
+       button along with the only way back to "no filter". */
     pickerState.kind = "";
+    pickerState.fam = "";
     for (const list of pickerCandidates().values()) {
       for (const { t } of list) kinds.set(t.type_key, (kinds.get(t.type_key) || 0) + 1);
     }
     pickerState.kind = wasKind;
+    pickerState.fam = wasFam;
     const kindsEl = els.root.querySelector('[data-pk="kinds"]');
     const chipsEl = els.root.querySelector('[data-pk="chips"]');
     const nEl = els.root.querySelector('[data-pk="filtern"]');
@@ -4425,26 +4532,44 @@
       kindsEl.innerHTML = cat("kind", "Kind", kindOpts) + cat("fam", "Section", famOpts)
         + `<div class="fbar-menu__foot"><button type="button" data-pk-clear>Clear</button>
            <button type="button" data-pk-done>Done</button></div>`;
-      if (nEl) { nEl.textContent = pickerState.kind ? "1" : "0"; nEl.hidden = !pickerState.kind; }
-      if (btnEl) btnEl.classList.toggle("is-on", !!pickerState.kind);
-      chipsEl.innerHTML = pickerState.kind ? `
+      /* Both facets are reported, because both filter. Kind alone was, so
+         a Section filter shrank the list with nothing on screen saying so
+         and nothing to clear — the list just looked shorter than it is. */
+      const chip = (label_, value, clearAttr, aria) => `
         <span class="fbar-chip">
           <span class="fbar-chip__edit">
-            <span class="fbar-chip__label">Kind:</span>
-            <span class="fbar-chip__val">${esc(label.get(pickerState.kind) || pickerState.kind)}</span>
+            <span class="fbar-chip__label">${esc(label_)}:</span>
+            <span class="fbar-chip__val">${esc(value)}</span>
           </span>
-          <button type="button" class="fbar-chip__x" data-pk-kind="" aria-label="Remove kind filter">×</button>
-        </span>
-        <button type="button" class="fbar-chips__clear" data-pk-kind="">Clear all</button>` : "";
-      chipsEl.hidden = !pickerState.kind;
-      // The button is the control; it is never hidden, so the way back to
-      // "no filter" cannot disappear with the last unfiltered kind.
+          <button type="button" class="fbar-chip__x" ${clearAttr} aria-label="${esc(aria)}">×</button>
+        </span>`;
+      const activeChips = [
+        pickerState.kind
+          ? chip("Kind", label.get(pickerState.kind) || pickerState.kind, 'data-pk-kind=""', "Remove kind filter")
+          : "",
+        pickerState.fam
+          ? chip("Section", famName.get(pickerState.fam) || pickerState.fam, "data-pk-secclear",
+                 "Remove section filter")
+          : "",
+      ].filter(Boolean);
+      if (nEl) { nEl.textContent = String(activeChips.length); nEl.hidden = !activeChips.length; }
+      if (btnEl) btnEl.classList.toggle("is-on", activeChips.length > 0);
+      chipsEl.innerHTML = activeChips.length
+        ? activeChips.join("") + `<button type="button" class="fbar-chips__clear" data-pk-clear>Clear all</button>`
+        : "";
+      chipsEl.hidden = !activeChips.length;
+      /* The button is the control, so it stays while a filter is ON — the
+         way back to "no filter" cannot be the thing that disappears. It is
+         also kept whenever EITHER facet has something to offer; counting
+         only kinds hid it on an instance whose candidates are one kind
+         across two sections. */
       const wrap = btnEl && btnEl.closest(".fbar-filter");
-      if (wrap) wrap.hidden = !pickerState.kind && kinds.size < 2;
+      if (wrap) wrap.hidden = !activeChips.length && kinds.size < 2 && famCount.size < 2;
     }
 
     const n = pickerState.chosen.size;
     els.count.textContent = n ? `${n} selected` : "Nothing selected";
+    paintChosen(els);
     paintPickerTier();
     els.apply.disabled = !n;
     els.apply.textContent = n
@@ -4594,6 +4719,10 @@
   }
 
   function closePicker() {
+    if (pickerEls && pickerEls.chosenPop) {
+      pickerEls.chosenPop.hidden = true;
+      if (pickerEls.countBtn) pickerEls.countBtn.setAttribute("aria-expanded", "false");
+    }
     if (!pickerEls) return;
     pickerEls.root.classList.remove("is-open");
     pickerEls.root.hidden = true;

@@ -793,7 +793,7 @@
     padding: 12px 8px 12px 4px; border: 0; border-bottom: 1px solid var(--ds-border);
     background: none; font: inherit; text-align: left; cursor: pointer;
     border-radius: 8px 8px 0 0; }
-  .ax-who:hover { background: var(--ds-surface-hover); }
+  .ax-who:hover { background: var(--ds-surface-dim); }
   .ax-who:focus-visible { outline: 2px solid var(--ds-primary); outline-offset: -2px; }
   /* The same caret the group rows use, turned by the same rule. A reader who
      has opened one row on this page already knows what it means. */
@@ -802,7 +802,7 @@
   .ax-who[aria-expanded="true"] .ax-who__car { transform: rotate(90deg); }
   @media (prefers-reduced-motion: reduce) { .ax-who__car { transition: none; } }
   .ax-who__ico { display: inline-flex; color: var(--ds-text-muted); flex: 0 0 auto; }
-  .ax-who__n { font-weight: 600; font-size: 13px; color: var(--ds-text); flex: 0 0 auto; }
+  .ax-who__n { font-weight: 600; font-size: 13px; color: var(--ds-text-primary); flex: 0 0 auto; }
   /* The group's own sentence. Muted and italic ONLY when it is the
      description — the generic fallback and the state lines are neither,
      because italics on boilerplate reads as emphasis on nothing. One line,
@@ -1254,7 +1254,32 @@
     display: flex; align-items: center; gap: 10px;
     padding: 12px 22px; border-top: 1px solid var(--ds-border);
   }
-  .ax-picker__count { margin-right: auto; font-size: 12px; color: var(--ds-text-muted); }
+  .ax-picker__countwrap { position: relative; margin-right: auto; }
+  /* A button that reads as the label it replaced until there is something
+     to open — the footer should not grow a control that does nothing. */
+  .ax-picker__count { font: inherit; font-size: 12px; color: var(--ds-text-muted);
+    background: none; border: 0; padding: 2px 0; }
+  .ax-picker__count:not(:disabled) { color: var(--ds-text-primary); cursor: pointer;
+    text-decoration: underline; text-decoration-style: dotted; text-underline-offset: 3px; }
+  .ax-picker__count:not(:disabled):hover,
+  .ax-picker__count:not(:disabled):focus-visible { color: var(--ds-primary); }
+  /* Hover opens it as well as click: the ask was to see the picks without
+     leaving the footer, and the pointer is already there. */
+  .ax-picker__countwrap:hover .ax-picker__chosen[hidden] { display: block; }
+  .ax-picker__chosen { position: absolute; bottom: calc(100% + 8px); left: 0; z-index: 42;
+    min-width: 260px; max-width: 360px; max-height: 240px; overflow-y: auto;
+    background: var(--ds-surface); border: 1px solid var(--ds-border);
+    border-radius: var(--ds-radius-lg); box-shadow: var(--ds-shadow-lg); padding: 6px; }
+  .ax-picker__chosen-hd { font-size: 11px; text-transform: uppercase; letter-spacing: .04em;
+    color: var(--ds-text-muted); padding: 4px 6px 6px; }
+  .ax-picker__chosen-r { display: grid; grid-template-columns: auto minmax(0, 1fr) auto;
+    align-items: center; gap: 8px; padding: 4px 6px; border-radius: var(--ds-radius-btn); }
+  .ax-picker__chosen-r:hover { background: var(--ds-surface-dim); }
+  .ax-picker__chosen-nm { font-size: 12px; color: var(--ds-text-primary);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ax-picker__chosen-x { background: none; border: 0; cursor: pointer; line-height: 1;
+    font-size: 14px; color: var(--ds-text-muted); padding: 0 2px; }
+  .ax-picker__chosen-x:hover, .ax-picker__chosen-x:focus-visible { color: var(--ds-accent-danger-ink); }
   .ax-pk-r--g { grid-template-columns: 20px minmax(0, 1fr); }
   /* In By bundle the add sits inside the bundle's own section, so it is
      quieter than the group view's — it belongs to the rows above it rather

@@ -441,6 +441,89 @@ class TestAnEveryoneAudienceIsNotARoster:
         assert src.count("memberLabel(") >= 6, src.count("memberLabel(")
 
 
+class TestThePickerFilterReportsBothFacets:
+    """The Add drawer's filter has two facets, Kind and Section, and only
+    one of them was ever reported.
+
+    Picking a Section filtered the list — that part worked — but the badge
+    stayed hidden, the button kept its off state, no chip appeared, and the
+    Filter control itself was HIDDEN, because its visibility test read
+    `kinds.size < 2` off a candidate set the Section had already narrowed.
+    So the list silently got shorter and the only way back to "no filter"
+    left the screen with it.
+    """
+
+    def _source(self) -> str:
+        return access_page_source()
+
+    def test_the_offerable_set_is_counted_with_both_facets_neutralised(self):
+        """`kinds` describes what the group COULD be offered.
+
+        Neutralising `kind` alone left `fam` applied, which is what made the
+        count — and therefore the control's visibility — depend on the
+        filter it was supposed to describe.
+        """
+        src = self._source()
+        block = src[src.index("const kinds = new Map();") : src.index("const kindsEl =")]
+        assert 'pickerState.kind = "";' in block
+        assert 'pickerState.fam = "";' in block
+        # and both are put back, or the neutralisation becomes a reset
+        assert "pickerState.kind = wasKind;" in block
+        assert "pickerState.fam = wasFam;" in block
+
+    def test_the_badge_and_chips_count_every_active_facet(self):
+        src = self._source()
+        # The old shape, which could only ever say 0 or 1 and only for kind.
+        assert 'pickerState.kind ? "1" : "0"' not in src
+        assert "activeChips.length" in src
+        # A Section filter is removable on its own, from its own chip.
+        assert "data-pk-secclear" in src
+
+    def test_a_live_filter_never_hides_its_own_control(self):
+        """The button is the way back. It may hide when there is nothing to
+        filter; it must not hide because something IS filtered."""
+        src = self._source()
+        line = next(ln for ln in src.splitlines() if "wrap.hidden =" in ln and "activeChips" in ln)
+        assert "!activeChips.length" in line
+        assert "famCount.size" in line  # either facet having options keeps it
+
+
+class TestWhatIsTickedCanBeReviewed:
+    """A selection you cannot see is a selection you cannot check.
+
+    The footer counted the picks and nothing listed them, so the only way to
+    review three ticks in a list of thirty was to scroll it hunting for
+    checkmarks — and a tick made under a filter that was later cleared sits
+    somewhere in the middle of the unfiltered list. Worse for a file found
+    through the server-side search: clearing the search takes its row away
+    entirely, so the tick becomes unreachable.
+    """
+
+    def _source(self) -> str:
+        return access_page_source()
+
+    def test_the_count_is_a_control_and_not_just_a_label(self):
+        src = self._source()
+        assert 'data-pk="countbtn"' in src
+        assert 'data-pk="chosenpop"' in src
+        # Disabled while there is nothing to review — a control that opens
+        # an empty popover is worse than no control.
+        assert "els.countBtn.disabled = !n" in src
+
+    def test_a_pick_can_be_undone_from_the_review_list(self):
+        src = self._source()
+        assert "data-pk-unchoose" in src
+        assert "pickerState.chosen.delete(unchoose.dataset.pkUnchoose)" in src
+
+    def test_the_review_list_can_name_a_pick_the_overview_does_not_carry(self):
+        """`pickerRemoteFiles` is the case that makes this more than a
+        convenience: those rows are not in `overview` at all."""
+        src = self._source()
+        block = src[src.index("function chosenEntries()") : src.index("function paintChosen")]
+        assert "pickerRemoteFiles.items" in block
+        assert "overview.resources" in block
+
+
 class TestTheGrantListSplitsOnWhatCanBeActedOn:
     """Two sections, named for where the ACTION lives.
 
