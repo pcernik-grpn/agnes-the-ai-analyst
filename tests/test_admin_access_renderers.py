@@ -75,6 +75,7 @@ _EXPORTS = (
     "addScopeFor",
     "addableAtScope",
     "memberLabel",
+    "memberVerb",
     "SCOPE_WITHHELD_TYPES",
     "TIERED",
     "facets",
@@ -182,6 +183,13 @@ class TestAGroupsCountSaysMembersNotPeople:
     )
     def test_the_count_is_said_in_members(self, n, expected):
         assert _run(f"OUT = api.memberLabel({n});") == expected
+
+    @pytest.mark.parametrize(("n", "expected"), [(0, "lose"), (1, "loses"), (2, "lose"), (41, "lose")])
+    def test_the_verb_agrees_with_the_count(self, n, expected):
+        """The two confirmations read "N members lose …". The count was
+        always the variable and the verb never was, so one member "lose"
+        it — and before the relabel, one person did too."""
+        assert _run(f"OUT = api.memberVerb({n}, 'loses', 'lose');") == expected
 
     def test_the_singular_is_the_only_special_case(self):
         """One member is "1 member" — not "1 members", and not "1 person".

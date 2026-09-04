@@ -208,6 +208,10 @@
      word drifting back in one of them is the regression to design out, not
      to guard against — a guard can only notice it afterwards. */
   const memberLabel = (n) => `${n} ${n === 1 ? "member" : "members"}`;
+  //: The verb for that subject. "1 member lose it" was the reading before
+  //: this, and "1 person lose it" before that — the count was always the
+  //: variable and the verb never was.
+  const memberVerb = (n, singular, plural) => (n === 1 ? singular : plural);
   // System seeds and Google-synced rows are renamed and deleted where they
   // are owned — in the seed, or in Workspace. The retired pages hid both
   // controls on exactly this predicate.
@@ -2381,7 +2385,7 @@
     const grants = grantCountOf(group.id);
     const ok = await window.confirmModal({
       title: `Delete “${titleOf(group)}”?`,
-      message: `${memberLabel(members)} lose the ${grants} `
+      message: `${memberLabel(members)} ${memberVerb(members, "loses", "lose")} the ${grants} `
         + `${grants === 1 ? "thing" : "things"} granted through this group. `
         + `Their accounts and anything granted to them by another group are untouched. This cannot be undone.`,
       confirmText: "Delete group",
@@ -3929,7 +3933,7 @@
       } : {
         title: `Revoke “${revokeLabel(type, rid)}”?`,
         message: `${memberLabel(members)} in ${g ? titleOf(g) : "this group"} `
-          + `lose it, unless another group also grants it to them. `
+          + `${memberVerb(members, "loses", "lose")} it, unless another group also grants it to them. `
           + `You can grant it again from this page.`,
         confirmText: "Revoke",
       });
