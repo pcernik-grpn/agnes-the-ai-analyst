@@ -127,10 +127,12 @@ def test_no_review_banner_absent_when_guardrails_off(seeded_app, monkeypatch):
     """
     monkeypatch.setattr("app.instance_config.get_guardrails_enabled", lambda: False)
     html = seeded_app["client"].get("/skills", headers=_auth(seeded_app["admin_token"])).text
-    # `.sk-no-review` also names the CSS rule in `<style>`, present regardless
-    # of the banner's render state — assert on the div itself, not the class.
-    assert '<div class="sk-no-review"' not in html
-    assert "Automated review is not available on this instance." not in html
+    # The banner is drawn by the page script now, so that it can land BELOW
+    # the builder's own header (this block renders above it) — the server
+    # passes only the condition. Neither the class nor the sentence is a
+    # signal any more: both name the CSS rule and the JS branch, which are in
+    # the document whatever the condition says. The flag is the contract.
+    assert '<script type="application/json" id="sk-no-review">false</script>' in html
 
 
 def test_no_review_banner_present_when_guardrails_on_but_llm_not_ready(seeded_app, monkeypatch):
@@ -141,8 +143,22 @@ def test_no_review_banner_present_when_guardrails_on_but_llm_not_ready(seeded_ap
     monkeypatch.setattr("app.instance_config.get_guardrails_enabled", lambda: True)
     monkeypatch.setattr("app.instance_config.get_guardrails_llm_provider_ready", lambda: False)
     html = seeded_app["client"].get("/skills", headers=_auth(seeded_app["admin_token"])).text
-    assert '<div class="sk-no-review"' in html
+    assert '<script type="application/json" id="sk-no-review">true</script>' in html
     assert "Automated review is not available on this instance." in html
+    # The flag has to be WIRED, or it is a value nobody reads. Asserted as
+    # behaviour rather than as one line of source: the previous version of
+    # this pinned the literal `if (!NO_REVIEW) return ''` and broke the moment
+    # the same gate grew a second clause, which told us nothing about whether
+    # the banner still works.
+    assert "NO_REVIEW" in html                       # read from the island above
+    assert html.count("noReviewHtml()") >= 2         # defined, and rendered
+    # Said in full once, then kept as a reachable mark — both halves exist,
+    # the dismissal is remembered per reader, and the mark carries the whole
+    # sentence, since it is the only copy left once the banner is gone.
+    assert "function noReviewMarkHtml" in html
+    assert "data-sk-noreview-dismiss" in html
+    assert "markNoReviewSeen" in html and "noReviewSeen" in html
+    assert "NO_REVIEW_TEXT" in html
 
 
 # ───────────────────────────── 2. executable ─────────────────────────────────

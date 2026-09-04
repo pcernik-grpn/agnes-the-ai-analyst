@@ -189,11 +189,15 @@ def test_skills_page_is_the_unified_builder(seeded_app):
     # The builder is the whole page.
     assert 'id="sk-builder-view"' in body
     assert 'id="sk-categories"' in body  # store-category options island
-    # Step 1 — every supported type is offered, and picking one is what opens
-    # the form (no type ⇒ no builder).
-    # The cards are built client-side from the TYPES table, so assert on the
-    # table + the hook each card carries, not on markup the server never emits.
-    assert "What are you building?" in body
+    # Every supported type is still offered — from the title menu now, not a
+    # picker screen. The picker asked "What are you building?" on a bare
+    # /skills that nothing in the product linked to; that route redirects to
+    # the Library, which offers the same three next to your drafts.
+    assert "What are you building?" not in body, "the type picker is back"
+    assert "function typeSectionHtml" not in body
+    assert "window.location.replace('/library')" in body
+    # The menu is built client-side from the TYPES table, so assert on the
+    # table + the hook each entry carries, not on markup the server never emits.
     assert "data-sk-type" in body
     assert "var TYPE_ORDER = ['skill', 'plugin', 'agent'];" in body
     for kind in ("skill", "plugin", "agent"):
@@ -202,9 +206,10 @@ def test_skills_page_is_the_unified_builder(seeded_app):
     # 1 (a card with a tick where every other section has a number), then a
     # pill beside the title with "Change" next to it. Both restated the answer
     # the Library entry already carried, and the Change was inert: it set
-    # `typeOpen`, which only the picker read — and the picker only renders
-    # when NO type is set. The type is chosen once, in the picker; the header
-    # carries the title, and the sections are the configuration, 1..3.
+    # `typeOpen`, which only the picker read — and the picker only rendered
+    # when NO type was set. The picker is gone with it: the type arrives in
+    # the URL and is changed from the title menu; the header carries the
+    # title, and the sections are the configuration, 1..3.
     assert "typeBadgeHtml" not in body, "the type badge is back in the builder header"
     assert "data-sk-change" not in body, "a Change hook is back with nothing to open"
     assert "typeOpen" not in body, "the dead re-open flag is back"
