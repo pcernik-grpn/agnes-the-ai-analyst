@@ -15,6 +15,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 ### Changed
 
 ### Fixed
+- **A migration that adds a column no longer takes the instance down when the column is already there.** `0096_resource_grants_source` and `0097_resource_grants_scope` used a bare `op.add_column`, which raises `DuplicateColumn` on any database that already has the column — and that is not hypothetical: an image built from the branch those columns were developed on adds them without the revisions being stamped. It happened the day the access stack shipped. Because boot is strict (`app`, `scheduler` and `data-migrate` all wait for a successful `migrate`), the result is not a warning in a log but a 502 behind "Agnes is upgrading…", retried every 30 s until someone drops the column by hand — about two and a half hours that time, and the same wall faces any instance that has ever run a branch build. Both revisions now check the column first and skip with a log line naming why; the end state is identical either way, so refusing to boot over it bought nothing. `tests/db_pg/test_migration_column_idempotency.py` executes both `upgrade()`s against a table that already has the column (and against one that does not, so the guard cannot turn the revision into a no-op), and ratchets any FUTURE revision adding a column to `resource_grants` — floored at 0096, since a revision every database has already applied cannot meet this case and retro-fitting frozen history would be churn for zero risk.
 
 ### Removed
 

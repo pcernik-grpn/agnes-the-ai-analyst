@@ -31,8 +31,12 @@ the revision id is what the chain is keyed on.
 
 from typing import Sequence, Union
 
+import logging
+
 import sqlalchemy as sa
 from alembic import op
+
+logger = logging.getLogger("alembic.runtime.migration")
 
 revision: str = "0096_resource_grants_source"
 down_revision: Union[str, None] = "0096_users_kind"
@@ -41,6 +45,28 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
+    # Existence-checked, not a bare ``add_column``. Where a grant was written (#1956 item 13).
+    #
+    # A bare ``op.add_column`` raises ``DuplicateColumn`` on a database that
+    # already has the column, and this revision reaches such databases: any
+    # instance that ever ran an image built from the branch this column was
+    # developed on has it without the revision being stamped. That is not a
+    # hypothetical — it happened the day the access stack shipped, and because
+    # boot is strict (``app``/``scheduler``/``worker`` wait for a successful
+    # ``migrate``), the failure is not a warning in a log but a 502 for
+    # however long it takes someone to notice and drop the column by hand.
+    #
+    # The end state is identical either way, so skipping is the safe arm: a
+    # column that is already there needs no adding, and refusing to boot over
+    # it buys nothing. Deliberately NOT ``IF NOT EXISTS`` in raw SQL — the
+    # inspector keeps this revision engine-agnostic and readable, and says in
+    # the log which arm it took.
+    if "source" in {c["name"] for c in sa.inspect(op.get_bind()).get_columns("resource_grants")}:
+        logger.info(
+            "source already exists on resource_grants — leaving it alone. An image built "
+            "from the development branch added it before this revision was stamped."
+        )
+        return
     op.add_column(
         "resource_grants",
         sa.Column("source", sa.String(), nullable=True),
