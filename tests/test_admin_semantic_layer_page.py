@@ -20,6 +20,8 @@ What stays identical: the URL and the ``require_admin`` gate.
 
 from __future__ import annotations
 
+from tests import _ds_page_source
+
 import pytest
 
 
@@ -570,9 +572,7 @@ def test_the_data_sources_page_shows_both_mismatch_codes():
     """
     import pathlib
 
-    src = (
-        pathlib.Path(__file__).resolve().parents[1] / "app" / "web" / "templates" / "admin_data_sources.html"
-    ).read_text(encoding="utf-8")
+    src = _ds_page_source.page_source()
     assert 'w.code === "master_token_project_mismatch"' in src
     assert 'w.code === "token_project_mismatch"' in src
 

@@ -73,13 +73,39 @@ def embed_texts(texts: List[str]) -> Optional[List[List[float]]]:
 
     Returning None (not raising) is deliberate: callers treat "no embeddings"
     as "lexical-only", never as an error.
+
+    ``model.encode`` itself is guarded too (#2151): a query-time failure
+    (malformed input, or a genuine ``MemoryError`` surfacing from the
+    C++/torch runtime under memory pressure — a real, observed failure mode
+    for a large corpus's search path) must degrade exactly like "the extra
+    isn't installed" rather than propagate and take the request down.
+    Mirrors the ingest side's best-effort embedding contract
+    (``src.ingest.runner._chunk_embed_store``), which already tolerates a
+    failed embed without failing the ingest.
+
+    A failure here also flips the module's cached ``_model`` to ``False`` —
+    the SAME self-correction ``embedding_capability()``'s docstring already
+    documents for a load-time failure ("the first real embed call resolves
+    `_model` to False and subsequent labels self-correct"), extended to an
+    encode-time one. Retrying the identical call on every following request
+    would just repeat the same expensive failure (e.g. an input shape that
+    always OOMs), so one bad encode degrades the whole process to
+    lexical-only until restart — same tradeoff a load failure already makes,
+    and it is what makes a `retrieval: "lexical_only"` label (read right
+    after this same failure, in the same request) honest.
     """
     if not texts:
         return []
     model = _load_model()
     if model is None:
         return None
-    vectors = model.encode(list(texts), normalize_embeddings=True)
+    try:
+        vectors = model.encode(list(texts), normalize_embeddings=True)
+    except Exception as exc:  # noqa: BLE001 - any runtime encode failure degrades, never propagates
+        global _model
+        logger.warning("embeddings: encode failed — degrading to lexical-only: %s", exc)
+        _model = False
+        return None
     return [[float(x) for x in row] for row in vectors]
 
 

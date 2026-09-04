@@ -70,7 +70,9 @@ DEPRECATED_CLASSES = {
 # same bug class as the `nav {}` rule this guard was written for, and they are
 # live, not dead. `header {}` (flex + border-bottom + padding) applies to eight
 # bare `<header>` elements across admin_server_config.html,
-# admin_initial_workspace.html and home_not_onboarded.html; `footer {}`
+# _admin_prompts_repo_pane.html (they were admin_initial_workspace.html's
+# until that page merged into /admin/prompts — the elements moved file, not
+# away) and home_not_onboarded.html; `footer {}`
 # (margin + border-top) applies to base_ds.html's bare `<footer>`, i.e. every
 # design-system page. Unpicking them means auditing each call site for a visual
 # change and is out of scope for #1207 — but a future `<header>`/`<footer>`

@@ -7154,8 +7154,8 @@ def _v97_to_v98(conn: duckdb.DuckDBPyConnection) -> None:
 def _v109_to_v110(conn: duckdb.DuckDBPyConnection) -> None:
     """v109→v110: add ``file_corpora.origin`` (``uploaded`` | ``generated``).
 
-    Provenance for the Artefacts toolbar's Source facet. Every existing
-    artefact is user-uploaded, so the column defaults to ``'uploaded'``; the
+    Provenance for the Artifacts toolbar's Source facet. Every existing
+    artifact is user-uploaded, so the column defaults to ``'uploaded'``; the
     future agent-generated-artefact writer sets ``'generated'``. Idempotent
     ``ADD COLUMN IF NOT EXISTS`` guarded on table existence — a no-op on fresh
     installs (``_SYSTEM_SCHEMA`` already declares the column).

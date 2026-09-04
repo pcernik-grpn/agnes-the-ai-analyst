@@ -104,6 +104,42 @@ def get_signing_secret() -> str:
     return _get_cached_secret_key()
 
 
+def _refuse_if_service_account_session(user_id: str, typ: str) -> None:
+    """Guard 1 (issue #1534): the SINGLE choke point every login provider
+    shares to mint the credential a completed login hands back.
+
+    Every provider (Google, Microsoft, password, email magic-link, Keboola,
+    SSO, the legacy ``/auth/token`` endpoint, MCP-OAuth's authorization-code
+    exchange and refresh) calls this function with ``typ="session"`` — none
+    of them share any OTHER common helper (``_set_login_cookie`` lives only
+    in ``app/auth/providers/password.py`` and covers just that provider's own
+    four routes) — so refusing here once covers all of them with no
+    provider-by-provider patch. A PAT minted *for* the service account
+    (``typ="pat"``) always passes that ``typ`` explicitly and sails through
+    unaffected.
+
+    Fails OPEN on any lookup error (missing ``users`` table, no DB wired up
+    at all) rather than raising — a large fraction of the test suite mints
+    tokens for fabricated ids with no backing row and often no DB set up at
+    all, and the actual defense against a service account signing in is that
+    no login provider can ever resolve a real identity to its synthetic
+    address in the first place. This check is defense-in-depth on top of
+    that, and must never turn an infra hiccup into a broken login for
+    everyone else.
+    """
+    if typ != "session":
+        return
+    try:
+        from src.repositories import users_repo
+        from src.service_accounts import ServiceAccountInteractiveLoginError, is_service_account
+
+        user = users_repo().get_by_id(user_id)
+    except Exception:
+        return
+    if is_service_account(user):
+        raise ServiceAccountInteractiveLoginError(user_id)
+
+
 def create_access_token(
     user_id: str,
     email: str,
@@ -128,7 +164,12 @@ def create_access_token(
     No ``role`` claim — authorization is derived from
     ``user_group_members`` at request time via ``app.auth.access.is_user_admin``.
     The JWT carries only identity (``sub``, ``email``) and token metadata.
+
+    Raises ``src.service_accounts.ServiceAccountInteractiveLoginError`` when
+    ``typ="session"`` (the default) and ``user_id`` names a ``kind='service'``
+    row (issue #1534) — see :func:`_refuse_if_service_account_session`.
     """
+    _refuse_if_service_account_session(user_id, typ)
     payload = {
         "sub": user_id,
         "email": email,

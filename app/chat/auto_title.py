@@ -45,9 +45,10 @@ Design notes
   tell me …" — was answered instead of titled roughly half the time on a
   real instance ("I don't have access to SharePoint …"), and the
   answer-shaped guard in :func:`_strip_title` then correctly threw the reply
-  away, leaving "Untitled chat" (TCRD-290). Sampling is pinned to
-  ``temperature=0`` for the same reason: a title is a classification, not
-  prose, and the variance only ever bought answer-mode drift.
+  away, leaving "Untitled chat" (TCRD-290). Sampling runs at the API
+  default: anthropic SDK >= 1.x has no ``temperature`` knob any more (it went
+  with the API's), and passing one is a ``TypeError`` that killed every title
+  call — so the framing and the guard are what hold answer-mode drift off.
 - **A chat with a message never stays "Untitled chat".** When the model
   path yields nothing usable — no credential, a timeout, an answer-shaped
   reply — the manager falls back to :func:`fallback_title`, a deterministic
@@ -340,7 +341,6 @@ def _generate_title_sync(
         resp = client.messages.create(
             model=model,
             max_tokens=_TITLE_MAX_TOKENS,
-            temperature=0.0,
             system=_SYSTEM_PROMPT,
             messages=[{"role": "user", "content": _title_request(user_message)}],
         )

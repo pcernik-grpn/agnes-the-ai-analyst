@@ -44,7 +44,7 @@ def _upload(seeded_app, cid: str, filename: str, content: bytes, ctype: str, tok
 
 def _share_collection_with_user(collection_id: str, user_id: str, group_name: str = "library-share-grp") -> None:
     """Add ``user_id`` to a group and grant that group the collection — the
-    minimal path to a "shared with me" artefact."""
+    minimal path to a "shared with me" artifact."""
     from src.db import get_system_db
     from src.repositories.user_groups import UserGroupsRepository
     from src.repositories.user_group_members import UserGroupMembersRepository
@@ -97,8 +97,8 @@ def test_library_toolbar_controls_render(seeded_app):
 
 
 def test_source_facet_offers_uploaded_option(seeded_app):
-    """The Source facet exposes the artefact's provenance (origin column).
-    A freshly uploaded artefact is 'uploaded' and appears as a Source option."""
+    """The Source facet exposes the artifact's provenance (origin column).
+    A freshly uploaded artifact is 'uploaded' and appears as a Source option."""
     _create(seeded_app, "Prov Demo", seeded_app["admin_token"])
     text = seeded_app["client"].get("/library", headers=_auth(seeded_app["admin_token"])).text
     assert 'data-facet="origin"' in text
@@ -108,7 +108,7 @@ def test_source_facet_offers_uploaded_option(seeded_app):
 def test_filter_menu_offers_recency_ownership_and_format(seeded_app):
     """Beyond owner/source/access, the menu slices on data the rows already
     carry: when it was added, whose it is, and what kind of file it is. Tags
-    cannot do this job — no artefact kind has a tags column — so these are what
+    cannot do this job — no artifact kind has a tags column — so these are what
     "filter by tag" has to mean until entities land (TCRD-250)."""
     col = _create(seeded_app, "Facet Demo", seeded_app["admin_token"])
     _upload(seeded_app, col["id"], "deck.pdf", b"%PDF-1.4 x", "application/pdf", seeded_app["admin_token"])
@@ -193,7 +193,7 @@ def test_files_of_every_format_share_one_files_section(seeded_app):
     text = seeded_app["client"].get("/library", headers=_auth(seeded_app["admin_token"])).text
     # One merged section, not per-format ones.
     assert 'data-lib-sec="files"' in text
-    assert ">Artefacts<" in text
+    assert ">Artifacts<" in text
     for retired in ("image", "document", "collection", "spreadsheet"):
         assert f'data-lib-sec="{retired}"' not in text
     # The row still says what the file actually is — its format, on the second

@@ -1,6 +1,6 @@
 [project]
 name = "agnes-the-ai-analyst"
-version = "0.96.0"
+version = "0.97.0"
 description = "Agnes — self-hosted AI harness for organizations: governed data access, agents as an API, skills marketplace, corporate memory, hosted data apps, and agent surfaces (web chat, Slack, MCP, CLI)"
 requires-python = ">=3.11,<3.14"
 license = {file = "LICENSE"}
@@ -129,6 +129,13 @@ server = [
     # ``connectors.snowflake.attach.install_snowflake_adbc_driver`` copies it from
     # the installed package at runtime, but the package must be on disk.
     "adbc-driver-snowflake>=1.0.0",
+    # Opt-in OpenTelemetry export (docs/observability.md → "OpenTelemetry
+    # export"): the SDK plus the OTLP/HTTP exporter. Inert without
+    # OTEL_EXPORTER_OTLP_ENDPOINT. The API package the instrumented code
+    # imports is a dependency of the SDK; a core (CLI-only) install has
+    # neither, and src/observability/otel.py degrades to a no-op there.
+    "opentelemetry-sdk>=1.27.0",
+    "opentelemetry-exporter-otlp-proto-http>=1.27.0",
     # Web framework (FastAPI). Upper-bounded below 0.137.0: that release
     # regressed APIRouter.include_router so it no longer copies the source
     # router's routes into the app (adds zero routes), leaving create_app()
@@ -450,4 +457,4 @@ dev-dependencies = [
 override-dependencies = ["urllib3>=2.7.0"]
 
 [tool.agnes]
-released_changelog_sha256 = "3164e28d68f8eb454fa37955ee26cc06fb4334d39ab6cbc947533202a98e250a"
+released_changelog_sha256 = "a1bfef3def0621d9f6fb3780b36df7338001f5bafaf1ae497fca6486344ff82f"

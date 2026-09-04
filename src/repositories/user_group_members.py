@@ -147,7 +147,13 @@ class UserGroupMembersRepository:
         Re-adding an existing pair is a silent no-op — the source/added_by of
         the existing row stays. Use ``replace_google_sync_groups`` if you
         want google_sync rows to refresh wholesale.
+
+        Raises ``src.service_accounts.ServiceAccountAdminGroupForbidden``
+        when ``group_id`` is the system Admin group and ``user_id`` names a
+        ``kind='service'`` row (issue #1534) — see
+        :meth:`_refuse_if_service_account_targets_admin_group`.
         """
+        self._refuse_if_service_account_targets_admin_group(user_id, group_id)
         try:
             self.conn.execute(
                 """INSERT INTO user_group_members
@@ -157,6 +163,40 @@ class UserGroupMembersRepository:
             )
         except duckdb.ConstraintException:
             pass  # already a member; preserve original source
+
+    def _refuse_if_service_account_targets_admin_group(self, user_id: str, group_id: str) -> None:
+        """Guard 2 (issue #1534): a service account may never join the
+        system Admin group — its god-mode short-circuit
+        (``app/auth/access.py``) would make every scope/grant check on every
+        OTHER surface moot for it.
+
+        ONE shared choke point inside ``add_member`` itself rather than a
+        check duplicated at each of its ~8 call sites (admin UI/CLI/REST,
+        Google/Microsoft sync provisioning, the scheduler/bootstrap seeds).
+
+        DuckDB has no ``kind`` column at all (frozen post-A3 schema), so a
+        service account cannot exist on this backend in the first place
+        (``create_service_account`` is PG-only) — this check is provably a
+        no-op here: ``SELECT *`` never raises on a column that simply isn't
+        present in the row, so ``is_service_account`` always reads ``False``
+        and every call falls through unchanged. Kept identical in shape to
+        the Postgres sibling anyway (same guard, same call site) rather than
+        omitted, so the pair does not silently diverge in code even though
+        it is guaranteed to agree in behavior.
+        """
+        from src.db import SYSTEM_ADMIN_GROUP
+        from src.service_accounts import ServiceAccountAdminGroupForbidden, is_service_account
+
+        group_row = self.conn.execute("SELECT name FROM user_groups WHERE id = ?", [group_id]).fetchone()
+        if not group_row or group_row[0] != SYSTEM_ADMIN_GROUP:
+            return
+        result = self.conn.execute("SELECT * FROM users WHERE id = ?", [user_id])
+        row = result.fetchone()
+        if not row:
+            return
+        columns = [d[0] for d in self.conn.description]
+        if is_service_account(dict(zip(columns, row))):
+            raise ServiceAccountAdminGroupForbidden(user_id)
 
     def remove_member(
         self,
