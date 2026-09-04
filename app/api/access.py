@@ -1202,14 +1202,31 @@ async def create_grant(
             detail="Grant already exists for this group/resource_type/resource_id",
         )
     if payload.requirement == "required":
+        # An everyone-scoped grant is deliberately NOT fanned out here: this
+        # eager pass walks ONE group's members, and "every account" has no
+        # group to walk (the carrier is a holder for the scope, not the
+        # audience). The lock is still correct — `required_store_entity_ids`
+        # resolves everyone-scoped rows for an account in no group at all —
+        # so the card materializes on the member's next resolve instead of
+        # on this write. Late, not wrong.
         _fanout_required_store_entity(rt, group_id, payload.resource_id)
+    # Re-read with the group name joined for the response — and BEFORE the
+    # audit, because for an everyone-scoped grant the repository stores the
+    # CARRIER (`_carrier_or`) rather than the `group_id` the caller sent.
+    # Auditing the payload named a group that never held the grant, and the
+    # later `resource_grant.deleted` entry reads the stored row, so the two
+    # halves of the trail disagreed about the same grant.
+    rows = grants.list_all()
+    fresh = next((r for r in rows if r["id"] == grant_id), None)
     _audit(
         conn,
         user["id"],
         "resource_grant.created",
         f"grant:{grant_id}",
         {
-            "group_id": group_id,
+            # The payload is the fallback only for the cannot-happen re-read
+            # miss below: a created grant still deserves an audit row.
+            "group_id": (fresh or {}).get("group_id") or group_id,
             "resource_type": rt.value,
             "resource_id": payload.resource_id,
             # An instance-wide grant is exactly the audit row an operator
@@ -1217,9 +1234,6 @@ async def create_grant(
             "scope": scope,
         },
     )
-    # Re-read with the group name joined for the response.
-    rows = grants.list_all()
-    fresh = next((r for r in rows if r["id"] == grant_id), None)
     if not fresh:
         raise HTTPException(status_code=500, detail="Grant created but lookup failed")
     return _grant_to_response(fresh)
