@@ -6403,7 +6403,7 @@ class TestActivityBookkeeping:
         stats.exit_item_activity(token, "Reports/a.docx", "new")
         snap = stats.activity_snapshot(phase="crawl")
         assert snap["current_path"] is None
-        assert snap["recent"] == [{"path": "Reports/a.docx", "outcome": "new"}]
+        assert snap["recent"] == [{"path": "Reports/a.docx", "outcome": "new", "rescue": ""}]
 
     def test_recent_is_capped_and_newest_first(self):
         stats = crawler.CrawlStats()

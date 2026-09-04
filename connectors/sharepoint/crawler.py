@@ -1323,6 +1323,13 @@ class CrawlStats:
     #: ``UnsupportedConversionFormat``. Uncapped: the key space is bounded by
     #: distinct extensions actually seen, never by item count.
     skipped_unsupported_by_extension: Dict[str, int] = field(default_factory=dict)
+    #: How many successfully-ingested documents needed the conversion rescue
+    #: chain (``connectors.sharepoint.convert.ConvertResult.rescue``),
+    #: broken down by which rung succeeded: ``"libreoffice_resave"``
+    #: (resave-and-retry), ``"csv_fallback"``, ``"pdf_fallback"``. A
+    #: document that converted cleanly on the first try never bumps this —
+    #: see :meth:`note_conversion_rescue`.
+    conversion_rescued: Dict[str, int] = field(default_factory=dict)
     #: Delta rows this run has ENUMERATED and rows it has FINISHED handling.
     #: Not in :meth:`report` — the report's contract is unchanged — but read
     #: by the run recorder so a live run has honest ABSOLUTE counters (a
@@ -1547,6 +1554,16 @@ class CrawlStats:
             ext_key = (suffix or "").lower().lstrip(".")
             self.skipped_unsupported_by_extension[ext_key] = self.skipped_unsupported_by_extension.get(ext_key, 0) + 1
 
+    def note_conversion_rescue(self, rescue: str) -> None:
+        """One successfully-ingested document that needed the conversion
+        rescue chain — bumps :attr:`conversion_rescued`'s count for
+        ``rescue`` (``"libreoffice_resave"`` / ``"csv_fallback"`` /
+        ``"pdf_fallback"``). Called only for a non-empty ``rescue`` — the
+        ordinary "converted cleanly, no rescue needed" case never touches
+        this counter at all."""
+        with self._lock:
+            self.conversion_rescued[rescue] = self.conversion_rescued.get(rescue, 0) + 1
+
     def enter_item_activity(self, path: str) -> int:
         """One file's download/convert/ingest pipeline STARTING, for the
         live ``activity`` checkpoint block. Returns a token to pass back to
@@ -1559,12 +1576,16 @@ class CrawlStats:
             self._in_flight_paths[token] = (path, _now_iso())
         return token
 
-    def exit_item_activity(self, token: int, path: str, outcome: str) -> None:
+    def exit_item_activity(self, token: int, path: str, outcome: str, *, rescue: str = "") -> None:
         """The pipeline for ``token`` finished (whatever the outcome) —
-        drop it from the in-flight set and push it onto ``recent``."""
+        drop it from the in-flight set and push it onto ``recent``.
+        ``rescue`` (empty for the ordinary case) is this ITEM's own
+        per-file conversion detail — which rescue-chain rung succeeded, if
+        any — the live-checkpoint counterpart to the run-wide
+        :attr:`conversion_rescued` total."""
         with self._lock:
             self._in_flight_paths.pop(token, None)
-            self.recent.insert(0, {"path": path, "outcome": outcome})
+            self.recent.insert(0, {"path": path, "outcome": outcome, "rescue": rescue})
             del self.recent[_RECENT_ACTIVITY_SAMPLE:]
 
     def activity_snapshot(self, *, phase: str) -> Dict[str, Any]:
@@ -1620,6 +1641,12 @@ class CrawlStats:
             "errors": self.errors,
             "convert_failed": self.convert_failed,
             "anonymize_failed": self.anonymize_failed,
+            # Successfully-ingested documents that needed the conversion
+            # rescue chain (`connectors.sharepoint.convert.ConvertResult.
+            # rescue`), broken down by which rung succeeded — see
+            # `conversion_rescued`'s docstring. Never counted in
+            # `convert_failed`: a rescue that succeeded is a success.
+            "conversion_rescued": dict(self.conversion_rescued),
             # Never an error — see `skipped_unsupported`'s docstring: no
             # backend was even attempted, so nothing failed.
             "skipped_unsupported": self.skipped_unsupported,
@@ -2747,12 +2774,19 @@ class _ConvertOutcome:
     document content never reaches storage in readable form — made by
     :func:`_prepare_document`, which already owns the anonymize decision,
     not by anything upstream of it.
+
+    ``rescue`` (only meaningful when ``ok``) mirrors ``connectors.sharepoint.
+    convert.ConvertResult.rescue`` — which rung of the conversion rescue
+    chain succeeded, or ``""`` when none was needed. Never document content
+    (it is one of a fixed, small vocabulary of rung names), so unlike
+    ``detail_message`` it needs no anonymize-scope gating.
     """
 
     ok: bool
     markdown: str = ""
     detail_type: str = ""
     detail_message: str = ""
+    rescue: str = ""
 
 
 @dataclass
@@ -3083,6 +3117,7 @@ def _convert_worker_main(conn: Connection, memory_limit_bytes: int = 0, max_outp
         try:
             converted = convert_to_markdown(Path(tmp_path_str), mime, source_path=source_path)
             markdown = str(getattr(converted, "markdown", "") or "")
+            rescue = str(getattr(converted, "rescue", "") or "")
         except Exception as exc:  # noqa: BLE001 — this file's failure, not the worker's
             outcome = _ConvertOutcome(ok=False, detail_type=type(exc).__name__, detail_message=str(exc))
             try:
@@ -3106,7 +3141,9 @@ def _convert_worker_main(conn: Connection, memory_limit_bytes: int = 0, max_outp
                     return
                 continue
         try:
-            conn.send(_ConvertReply(outcome=_ConvertOutcome(ok=True, markdown=markdown), rss_bytes=_growth()))
+            conn.send(
+                _ConvertReply(outcome=_ConvertOutcome(ok=True, markdown=markdown, rescue=rescue), rss_bytes=_growth())
+            )
         except OSError:
             return
 
@@ -3369,7 +3406,15 @@ class _ConvertProcessPool:
         self._spare_procs[slot].append(proc)
         self._spare_conns[slot].append(parent_conn)
 
-    def convert(self, slot: int, tmp_path: Path, mime: str, *, source_path: Optional[str] = None) -> _ConvertOutcome:
+    def convert(
+        self,
+        slot: int,
+        tmp_path: Path,
+        mime: str,
+        *,
+        source_path: Optional[str] = None,
+        timeout_s: Optional[float] = None,
+    ) -> _ConvertOutcome:
         """Blocking. Runs ``tmp_path`` through slot ``slot``'s dedicated
         worker and returns its outcome, or raises :class:`_ConvertCrashed`
         when that worker died instead of answering, :class:`_ConvertTimedOut`
@@ -3382,16 +3427,27 @@ class _ConvertProcessPool:
         recycling (see the class docstring) is decided and, when a spare is
         ready, carried out — after this call's own result is already
         determined, so a recycle never changes what THIS file's outcome
-        was."""
+        was.
+
+        ``timeout_s`` overrides THIS call's own deadline — ``None`` (every
+        pre-existing caller) keeps using the pool's own ``timeout_s`` set at
+        construction. ``_prepare_document`` passes a SIZE-SCALED value here
+        (``connectors.sharepoint.convert.conversion_budget_seconds``) so one
+        large document gets a longer budget without raising the ceiling for
+        every other file the pool ever converts — see that function's
+        docstring for the live finding (221 large xlsx/xlsm files that hit
+        the previously-flat bound) this fixes.
+        """
         proc = self._procs[slot]
         conn = self._conns[slot]
         if proc is None or conn is None or not proc.is_alive():
             detail = self._exit_detail(proc)
             self._swap_in_spare(slot)  # best-effort recovery for the NEXT file
             raise _ConvertCrashed(detail)
+        effective_timeout_s = self._timeout_s if timeout_s is None else max(0.0, timeout_s)
         try:
             conn.send((str(tmp_path), mime, source_path))
-            reply = self._await_reply(slot, proc, conn)
+            reply = self._await_reply(slot, proc, conn, effective_timeout_s)
         except (EOFError, OSError):
             detail = self._exit_detail(proc)
             self._swap_in_spare(slot)
@@ -3403,10 +3459,11 @@ class _ConvertProcessPool:
             self._swap_in_spare(slot)
         return reply.outcome
 
-    def _await_reply(self, slot: int, proc: Any, conn: Connection) -> "_ConvertReply":
+    def _await_reply(self, slot: int, proc: Any, conn: Connection, timeout_s: float) -> "_ConvertReply":
         """Block for slot ``slot``'s reply, honoring BOTH the per-item time
-        bound (``timeout_s``) and the per-item RSS watchdog (``max_rss_bytes``)
-        — whichever fires first.
+        bound (``timeout_s`` — THIS call's own, not necessarily the pool's
+        ``self._timeout_s``; see :meth:`convert`'s docstring) and the
+        per-item RSS watchdog (``max_rss_bytes``) — whichever fires first.
 
         With both disabled this is exactly the pre-watchdog behaviour: one
         unconditional, un-polled ``conn.recv()`` — no periodic wakeups at
@@ -3422,9 +3479,9 @@ class _ConvertProcessPool:
         mid-wait instead, a different case from either guard firing
         cleanly.
         """
-        if self._timeout_s <= 0 and self._max_rss_bytes <= 0:
+        if timeout_s <= 0 and self._max_rss_bytes <= 0:
             return conn.recv()
-        deadline = time.monotonic() + self._timeout_s if self._timeout_s > 0 else None
+        deadline = time.monotonic() + timeout_s if timeout_s > 0 else None
         # The watchdog bounds how much THIS conversion grows the child, never
         # the child's absolute RSS. A forked child's ``VmRSS`` starts out as
         # every copy-on-write page it shares with the parent — on a crawl
@@ -3446,7 +3503,7 @@ class _ConvertProcessPool:
                 # since a genuine native hang can freely ignore SIGTERM) and
                 # tell the caller this was a TIMEOUT, not a crash.
                 self._reclaim_timed_out_slot(slot)
-                raise _ConvertTimedOut(self._timeout_s)
+                raise _ConvertTimedOut(timeout_s)
             if self._max_rss_bytes > 0 and baseline is not None:
                 rss_bytes = _child_rss_bytes(getattr(proc, "pid", None))
                 growth = rss_bytes - baseline if rss_bytes is not None else None
@@ -3629,6 +3686,12 @@ class _PreparedDocument:
     #: outcome, and gated by scope: see :func:`_prepare_document`'s
     #: ``_convert_failure_detail`` for what this may and may not contain.
     detail: str = ""
+    #: Which rung of the conversion rescue chain succeeded, on an ``"ok"``
+    #: outcome — ``""`` (the ordinary case, no rescue needed),
+    #: ``"libreoffice_resave"``, ``"csv_fallback"``, or ``"pdf_fallback"``.
+    #: Mirrors ``connectors.sharepoint.convert.ConvertResult.rescue`` — see
+    #: :func:`_process_item`'s use of it for ``CrawlStats.conversion_rescued``.
+    rescue: str = ""
 
 
 def _anonymize_identity(path: str, name: str, *, key: bytes, detector: Any) -> Tuple[str, str]:
@@ -3834,11 +3897,25 @@ def _prepare_document(
     # class NAME the child sent back over the pipe) — see
     # `connectors.sharepoint.convert.UnsupportedConversionFormat`'s
     # docstring for why this is counted apart from `convert_failed`.
-    from connectors.sharepoint.convert import UnsupportedConversionFormat
+    from connectors.sharepoint.convert import UnsupportedConversionFormat, conversion_budget_seconds
 
+    rescue = ""
     try:
         if convert_pool is not None:
-            outcome = convert_pool.convert(convert_slot, tmp_path, mime, source_path=path)
+            # Size-scaled per-item timeout (see `conversion_budget_seconds`'s
+            # docstring for the live finding this fixes — 221 large xlsx/xlsm
+            # files, average 15 MB, hit the previously-flat bound): computed
+            # per FILE, not once at pool construction, so one large document
+            # gets a longer budget without raising the ceiling every other
+            # file in the pool converts under. `_item_timeout_seconds()` is
+            # this run's own configured base (0 disables the bound entirely,
+            # preserved by `conversion_budget_seconds`).
+            try:
+                tmp_size = tmp_path.stat().st_size
+            except OSError:
+                tmp_size = 0
+            timeout_s = conversion_budget_seconds(tmp_size, base_seconds=_item_timeout_seconds())
+            outcome = convert_pool.convert(convert_slot, tmp_path, mime, source_path=path, timeout_s=timeout_s)
             if not outcome.ok:
                 if outcome.detail_type == "MemoryError":
                     detail = "exceeded its own memory limit"
@@ -3852,9 +3929,11 @@ def _prepare_document(
                 logger.warning("sharepoint crawl: conversion failed for %s: %s", path, detail)
                 return _PreparedDocument("convert_failed", detail=detail)
             markdown = outcome.markdown
+            rescue = outcome.rescue
         else:
             converted = convert_to_markdown(tmp_path, mime, source_path=path)
             markdown = str(getattr(converted, "markdown", "") or "")
+            rescue = str(getattr(converted, "rescue", "") or "")
     except UnsupportedConversionFormat as exc:
         # Only reachable via the non-pool (inline) path above — the pool
         # path never raises here, it reports `outcome.ok=False` instead
@@ -3920,7 +3999,9 @@ def _prepare_document(
             return _PreparedDocument("anonymize_failed")
     else:
         out_path, out_filename = path, f"{Path(name).stem or name}.md"
-    return _PreparedDocument("ok", markdown=markdown, source_sha256=source_sha256, path=out_path, filename=out_filename)
+    return _PreparedDocument(
+        "ok", markdown=markdown, source_sha256=source_sha256, path=out_path, filename=out_filename, rescue=rescue
+    )
 
 
 def _note_retry(
@@ -4208,6 +4289,10 @@ async def _process_item(
     # whatever branch below returns or raises.
     activity_token = stats.enter_item_activity(path)
     outcome_label = "error"
+    #: Which conversion-rescue-chain rung succeeded for THIS item, if any —
+    #: see `_PreparedDocument.rescue`. Set once the "ok" outcome is known,
+    #: read by the `finally` below for `activity.recent`'s per-file detail.
+    rescue_label = ""
     try:
         try:
             tmp_path = await transport.download_to_temp(
@@ -4329,6 +4414,14 @@ async def _process_item(
             _note_retry(state, stats, stable_id, target=target, item=item, path=path)
             return
 
+        # This item converted cleanly enough to reach ingest — record which
+        # rescue-chain rung got it there, if any (`""` is the ordinary,
+        # no-rescue case and bumps nothing). `rescue_label` also feeds the
+        # `finally` below's `activity.recent` per-file detail.
+        rescue_label = prepared.rescue
+        if rescue_label:
+            stats.note_conversion_rescue(rescue_label)
+
         try:
             _file_id, was_new = await _run_blocking(
                 pool,
@@ -4384,7 +4477,7 @@ async def _process_item(
         # replay), so it is no longer a `convert_empty` candidate.
         _clear_empty(state, stable_id)
     finally:
-        stats.exit_item_activity(activity_token, path, outcome_label)
+        stats.exit_item_activity(activity_token, path, outcome_label, rescue=rescue_label)
 
 
 class _ConcurrencyGovernor:

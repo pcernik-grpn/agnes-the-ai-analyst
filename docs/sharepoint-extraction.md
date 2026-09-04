@@ -25,12 +25,27 @@ into collections → (optional) facts extraction into the knowledge graph
   `pip install 'agnes[extraction]'`; a missing extra is refused up front
   with `409 extraction_dependencies_missing`, never a crawl that fails on
   every file. Legacy Office/OpenDocument files (`.doc`/`.rtf`/`.odt`,
-  `.ppt`/`.odp`, `.xls`/`.ods`) are pre-converted through headless
-  LibreOffice before the markitdown route — the standard image bundles
-  `libreoffice-core`/`-writer`/`-calc`/`-impress`; a bare-metal install
-  additionally needs the `soffice` binary on `PATH`, or those specific
-  suffixes fail conversion (`MissingConversionDependency`) while every other
-  format keeps working.
+  `.ppt`/`.odp`, `.xls`/`.ods`/`.xlsb`/`.xlsm`) are pre-converted through
+  headless LibreOffice before the markitdown route — the standard image
+  bundles `libreoffice-core`/`-writer`/`-calc`/`-impress`; a bare-metal
+  install additionally needs the `soffice` binary on `PATH`, or those
+  specific suffixes fail conversion (`MissingConversionDependency`) while
+  every other format keeps working. A plain `.xlsx`/`.pptx`/`.docx` that
+  markitdown itself rejects (a real share of them do — 723 of 1 162
+  markitdown "could not convert" failures on one live crawl were `.xlsx`)
+  gets a RESCUE CHAIN instead of an immediate `convert_failed`: one
+  LibreOffice resave-and-retry, then (still failing) a LibreOffice-produced
+  CSV for spreadsheets or PDF-then-text for decks/documents. Which rung
+  rescued a document, if any, shows up per-run in `conversion_rescued`
+  (`{libreoffice_resave, csv_fallback, pdf_fallback}` counts) and in the
+  live checkpoint's per-file `activity.recent` detail. A large `.xlsx`
+  (over 10 MB) skips markitdown entirely and streams through openpyxl
+  directly instead, capped at the same per-document character limit so a
+  multi-million-row workbook stops reading early rather than timing out —
+  and the per-document conversion budget itself scales with input size
+  (base 300s + 20s/MB, capped at 1800s) rather than the flat ceiling every
+  file used to share, fixing the timeouts a population of large (~15 MB
+  average) spreadsheets used to hit.
 - **An Entra app registration** for the tenant: certificate (default) or
   client secret, with admin consent granted. This is the one step Agnes
   cannot do for you.
@@ -586,3 +601,4 @@ checkpoint is kept and counted resumable, exactly like a normal stop.
 | a facts pass fails with "prompt is too long" | one document's request exceeded the model's context window | fixed automatically going forward (token-safe bound + per-document failure); a still-oversized/garbled document is skipped and counted, never retried |
 | run shows `outcome: "stalled"` and Stop doesn't help | crawl loop stuck, never polling the stop flag | **Cancel run** on the fleet table / source card (or `agnes admin sharepoint runs cancel <run_id>`) force-closes it |
 | a renamed/moved file's path went stale in Collections | fixed — a rename/move with unchanged content (same cTag/eTag) now updates the stored path in place, counted `renamed` in the run report, no re-download | nothing to do; visible from the next crawl onward |
+| `.xlsx`/`.pptx`/`.docx` still lands in `convert_failed` after the rescue chain | every rung failed (message names each rung's own last error) | check `soffice` is on `PATH` (bare-metal); a genuinely corrupt source file has nowhere left to go |
