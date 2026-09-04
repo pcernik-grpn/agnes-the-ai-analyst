@@ -81,11 +81,26 @@ locals {
     "conf.d/docker.yaml",
     "conf.d/systemd.yaml",
     "conf.d/directory.yaml",
-    "postgres.yaml.tpl",
     "agnes-datadog-pg-role.sh",
     "agnes-datadog-pg-role.service",
     "agnes-datadog-pg-role.timer",
   ]
+
+  # One identity tag list per instance, shared by datadog.yaml and the
+  # postgres check template. The postgres check attributes its series to the
+  # resolved DB host (the side-car's container IP — a phantom host no host
+  # tag ever joins), so the check must carry these tags per instance; a
+  # second, diverging list would split the deployment's identity in two.
+  datadog_tags = {
+    for inst in local.all_instances : inst.name => concat([
+      "customer:${var.customer_name}",
+      "app:agnes",
+      "service:agnes",
+      "role:${inst.role}",
+      "agnes_instance:${inst.name}",
+      "managed:terraform",
+    ], var.datadog_extra_tags)
+  }
 
   # Unlike the flat watchdog map, this one is keyed BY INSTANCE: datadog.yaml
   # carries that VM's own tags and the HTTP/TLS checks its own hostnames. The
@@ -97,14 +112,17 @@ locals {
         "datadog.yaml" = base64encode(templatefile("${path.module}/files/datadog/datadog.yaml.tpl", {
           site = var.datadog_site
           env  = local.datadog_env
-          tags = concat([
-            "customer:${var.customer_name}",
-            "app:agnes",
-            "service:agnes",
-            "role:${inst.role}",
-            "agnes_instance:${inst.name}",
-            "managed:terraform",
-          ], var.datadog_extra_tags)
+          tags = local.datadog_tags[inst.name]
+        }))
+
+        # Terraform renders the deployment identity (env + the tag list) into
+        # the check template; @@DD_PG_PASSWORD@@ stays for the on-host role
+        # script, exactly like @@DD_API_KEY@@ in datadog.yaml above. Without
+        # the instance tags the check's series land on a phantom container-IP
+        # host that no agent-level env/host tag ever joins.
+        "postgres.yaml.tpl" = base64encode(templatefile("${path.module}/files/datadog/postgres.yaml.tpl", {
+          env  = local.datadog_env
+          tags = local.datadog_tags[inst.name]
         }))
 
         # A TLS VM probes its own public URL, because that is the path its

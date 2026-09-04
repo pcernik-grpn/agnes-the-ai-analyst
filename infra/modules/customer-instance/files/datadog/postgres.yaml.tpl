@@ -37,3 +37,15 @@ instances:
     collect_activity_metrics: false
     collect_wal_metrics: false
     min_collection_interval: 60
+    # The check attributes every series and service check to the hostname it
+    # resolves for the instance — here the side-car's container IP, a phantom
+    # host nothing else reports for — so the agent-level env and host tags
+    # never join them. The deployment identity therefore rides on the
+    # instance: Terraform renders env and the VM's own tag list (the same
+    # list datadog.yaml carries), while the password above stays the role
+    # script's job.
+    tags:
+      - env:${env}
+%{ for t in tags ~}
+      - ${t}
+%{ endfor ~}
