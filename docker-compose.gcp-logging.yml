@@ -34,12 +34,14 @@
 # into the app image at /opt/agnes-host/ (Dockerfile) alongside every other
 # host artifact, and startup-script.sh.tpl's existing recursive
 # `docker cp .../opt/agnes-host/. $APP_DIR/` extracts it onto the VM on every
-# boot. The module's `enable_gcp_logging` variable (default true) then
-# decides whether the script leaves the extracted file in place or removes
-# it again — removal is what turns the resolver's gate off for a VM that
-# opts out. The same variable gates installing the Ops Agent and the
-# module's project-level roles/logging.logWriter grant to the VM service
-# account, which the agent needs to authenticate.
+# boot. The module's `container_logs_destination` then decides whether the
+# script leaves the extracted file in place or removes it again — removal is
+# what turns the resolver's gate off for a VM whose logs go elsewhere, and it
+# is also what puts a Datadog-destination VM back on the json-file driver its
+# agent can read. `enable_gcp_logging` (default true) is the separate PERMIT
+# switch: it gates installing the Ops Agent and the module's project-level
+# roles/logging.logWriter grant to the VM service account, which the agent
+# needs to authenticate. Both must line up for this overlay to be armed.
 #
 # Why not default-on regardless of host: the agent authenticates with Google
 # ADC from the GCE metadata server, so on a non-GCP host there is nothing to

@@ -454,17 +454,40 @@ recent failure is DETERMINISTIC (`markitdown_reject`, `libreoffice_no_output`,
 failed twice is skipped WITHOUT a download on later runs — counted as
 `skipped_doomed` in the run report, the source card's Run row ("N doomed
 skipped (force reprocess to retry)"), the fleet totals line, and
-`agnes admin sharepoint runs`. Timeouts, memory kills, worker crashes and
-download errors are ENVIRONMENTAL, never a property of the document, and
-stay retryable forever. The escape hatch is the same one every other
-cTag-based skip in this module already has: `force_reprocess: true`
-attempts a doomed item anyway, and a genuine content change (a new cTag)
-always gets fresh attempts regardless of history. The conversion rescue
-chain itself is also gated: when LibreOffice's own re-save fails (a
-corrupt/unopenable source, a timeout, or a signal kill), the CSV/PDF
+`agnes admin sharepoint runs`. `download_error` and `other` are ENVIRONMENTAL,
+never a property of the document, and stay retryable forever. The escape
+hatch is the same one every other cTag-based skip in this module already has:
+`force_reprocess: true` attempts a doomed item anyway, and a genuine content
+change (a new cTag) always gets fresh attempts regardless of history. The
+conversion rescue chain itself is also gated: when LibreOffice's own re-save
+fails (a corrupt/unopenable source, a timeout, or a signal kill), the CSV/PDF
 fallback — which would reach the identical LibreOffice mechanism on the
 identical bytes — is skipped rather than retried, and which rung actually
 stopped the chain is named in the recorded error.
+
+**A document that repeatedly crashes or times out the converter is doomed
+too, at a higher bar (TCRD-296 gap #74).** A resync of a 282k-document site
+spent its first hours replaying 253 previously-failed documents in one
+folder — 162 `worker_crash` (the same workbook SIGKILLed by the memory guard
+every time), 71 `timeout` (the same files hit the time budget every run), 16
+`libreoffice_no_output` — at roughly 5 documents per 10 minutes, and because
+these files never get a cTag, every future crawl or resync re-downloaded and
+re-converted them again for nothing. `timeout`, `memory_kill` and
+`worker_crash` stay OUT of the deterministic set above (a busy host is not a
+property of the file), but the SAME file crashing or timing out the
+converter three times running, against an UNCHANGED cTag, is skipped WITHOUT
+a download exactly like a deterministic reject — one extra attempt above the
+deterministic threshold, since a crash or timeout is more plausibly a
+one-off. The recorded reason names which rule fired: `doomed` for a
+deterministic reject, `doomed_after_repeated_<class>` (e.g.
+`doomed_after_repeated_worker_crash`) for this rule, in both the per-run
+`skipped_doomed_items` and the standing `retry_backlog.doomed_sample` — so an
+operator reading the run report or the fleet view can tell "the bytes are
+rejected" from "this keeps crashing the converter" apart. The same
+`force_reprocess`/new-cTag escape hatches apply. `retry_failed` alone does
+NOT replay an already-doomed item under either rule — only `force_reprocess`
+does — so a plain "Retry failed" click never re-burns hours replaying the
+same doomed documents; combine it with "Re-process everything" to force them.
 
 **A resync or an admin-requested backlog replay is consumed once per job,
 not once per byte-identical payload.** A worker recreated mid-run reclaims

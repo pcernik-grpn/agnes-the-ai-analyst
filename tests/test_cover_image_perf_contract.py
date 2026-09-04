@@ -23,6 +23,9 @@ Key responsibilities:
   external cover URL is left without one; the package hero (fixed-size
   tile, never a fluid grid column) fetches the 480 variant directly and
   never carries a srcset.
+- The Agnes orb brand mark (``app/web/static/img/agnes-orb.png``, rendered
+  on every page via ``macros/_agnes_orb.html``) stays under a fixed byte
+  ratchet so it can never silently regress back toward its pre-shrink size.
 
 Design constraints:
 - Uses the session-shared ``seeded_app`` / fresh ``seeded_app_fresh``
@@ -302,3 +305,15 @@ def test_stack_card_cover_protocol_relative_url_has_no_srcset():
     assert "?w=" not in html
     assert "srcset=" not in html
     assert 'src="//cdn.example.com/cover.png"' in html
+
+
+# --- Agnes orb brand mark ratchet -------------------------------------------
+
+
+def test_agnes_orb_asset_stays_under_size_ratchet():
+    """The orb ships on every page (rail avatar, chat, connect banner,
+    favicon) and is never resized server-side like an uploaded cover, so its
+    on-disk bytes ARE the download cost -- pin it well under the pre-shrink
+    107,504 bytes so a future re-export can't silently balloon it back."""
+    orb_path = Path(__file__).resolve().parent.parent / "app" / "web" / "static" / "img" / "agnes-orb.png"
+    assert orb_path.stat().st_size < 32_000

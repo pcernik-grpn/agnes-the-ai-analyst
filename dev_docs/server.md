@@ -181,11 +181,20 @@ A disk space alert fires when `/data` exceeds 85% for 5 minutes.
 ### Container logs (GCP Cloud Logging)
 
 On GCE deployments the container stdout/stderr (app INFO + uncaught-exception
-tracebacks, scheduler, etc.) ships to **GCP Cloud Logging** via Docker's
-`gcplogs` driver, engaged by the `docker-compose.gcp-logging.yml` overlay.
-Activation is **placement + probe driven**: the overlay ships baked into the
-image, the Terraform startup script extracts it into `/opt/agnes/` (and removes
-it again when `enable_gcp_logging=false`), and every `COMPOSE_FILE` builder
+tracebacks, scheduler, etc.) ships to one of two destinations, chosen per VM by
+the module's `container_logs_destination`: **GCP Cloud Logging** via Docker's
+`fluentd` driver into a host Ops Agent that re-parses the JSON line
+([`docs/gcp-logging.md`](../docs/gcp-logging.md)), or **Datadog** via the host
+agent's Docker API tailer on the default json-file driver
+([`docs/datadog-logging.md`](../docs/datadog-logging.md)). One destination per
+VM — Docker allows one log driver per container.
+
+The Cloud Logging half is engaged by the `docker-compose.gcp-logging.yml`
+overlay. Activation is **placement + probe driven**: the overlay ships baked
+into the image, the Terraform startup script extracts it into `/opt/agnes/`
+(and removes it again whenever Cloud Logging is not the chosen destination —
+which includes a VM with `enable_gcp_logging=true` whose destination resolved
+to `datadog`), and every `COMPOSE_FILE` builder
 (the boot script, `agnes-auto-upgrade.sh`, `agnes-state-applier.sh` — all via
 `scripts/ops/agnes-compose-file.sh::agnes_gcp_logging_active`) appends it only
 when the file is present on disk **and** the driver probe has armed
