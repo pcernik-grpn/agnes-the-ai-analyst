@@ -13,6 +13,7 @@ index lookup, not a sequential scan over ``claims``.
 from __future__ import annotations
 
 import json
+import random
 from pathlib import Path
 
 import pytest
@@ -237,6 +238,168 @@ def test_delete_claims_for_file_reconciles_stats(pg_env, repo):
 
     assert _stats_row(pg_env, CORPUS_A) is None  # collection now empty -> row removed
     assert _membership_rows(pg_env, CORPUS_A) == {}
+
+
+def test_delete_claims_for_file_decrements_membership_when_another_file_still_cites_the_fact(pg_env, repo):
+    """TCRD-296 gap #73: `delete_claims_for_file` must be an incremental
+    delta, not a full-collection rebuild — the case that distinguishes the
+    two is exactly this one, where a SECOND file's claims survive the
+    delete."""
+    _seed_uploader("uploader1")
+    _seed_collection(collection_id=CORPUS_A, created_by="uploader1")
+    _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_a1")
+    _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_a2")
+    fact_id = repo.create_fact(type="engagement")
+    repo.add_claim(
+        fact_id=fact_id, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="s", quote="First quote here."
+    )
+    repo.add_claim(
+        fact_id=fact_id, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="s", quote="Second quote here."
+    )
+    repo.add_claim(
+        fact_id=fact_id, corpus_file_id="cf_a2", corpus_id=CORPUS_A, file_sha256="s", quote="Third quote here."
+    )
+    assert _membership_rows(pg_env, CORPUS_A)[fact_id] == (3, 2)
+    assert _stats_row(pg_env, CORPUS_A) == {
+        "facts_count": 1,
+        "claims_count": 3,
+        "edges_count": 0,
+        "documents_with_claims": 2,
+    }
+
+    repo.delete_claims_for_file("cf_a1")
+
+    # cf_a2 still cites the fact -- the membership row survives, decremented
+    # by exactly the 2 claims cf_a1 contributed and by 1 document (its own).
+    assert _membership_rows(pg_env, CORPUS_A)[fact_id] == (1, 1)
+    assert _stats_row(pg_env, CORPUS_A) == {
+        "facts_count": 1,
+        "claims_count": 1,
+        "edges_count": 0,
+        "documents_with_claims": 1,
+    }
+
+    repo.delete_claims_for_file("cf_a2")
+
+    assert _membership_rows(pg_env, CORPUS_A) == {}
+    assert _stats_row(pg_env, CORPUS_A) is None
+
+
+def test_delete_claims_for_file_decrements_edge_membership_when_another_file_still_cites_the_edge(pg_env, repo):
+    _seed_uploader("uploader1")
+    _seed_collection(collection_id=CORPUS_A, created_by="uploader1")
+    _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_a1")
+    _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_a2")
+    src_id = repo.create_fact(type="engagement")
+    dst_id = repo.create_fact(type="industry")
+    edge_id = repo.create_edge(src=src_id, type="works_in_industry", dst=dst_id)
+    repo.add_claim(
+        edge_id=edge_id, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="s", quote="Acme is in SaaS one."
+    )
+    repo.add_claim(
+        edge_id=edge_id, corpus_file_id="cf_a2", corpus_id=CORPUS_A, file_sha256="s", quote="Acme is in SaaS two."
+    )
+
+    def _edge_claims_count():
+        with pg_env.connect() as conn:
+            return conn.execute(
+                sa.text("SELECT claims_count FROM edge_collection_membership WHERE corpus_id = :c AND edge_id = :e"),
+                {"c": CORPUS_A, "e": edge_id},
+            ).scalar()
+
+    assert _edge_claims_count() == 2
+
+    repo.delete_claims_for_file("cf_a1")
+
+    assert _edge_claims_count() == 1
+    assert _stats_row(pg_env, CORPUS_A) == {
+        "facts_count": 0,
+        "claims_count": 1,
+        "edges_count": 1,
+        "documents_with_claims": 1,
+    }
+
+    repo.delete_claims_for_file("cf_a2")
+
+    assert _edge_claims_count() is None
+    assert _stats_row(pg_env, CORPUS_A) is None
+
+
+def test_incremental_maintenance_matches_recompute_after_random_insert_delete_sequence(pg_env, repo):
+    """Property-style check: after a sequence of `add_claim` inserts and
+    per-file `delete_claims_for_file` deletes, the counters `_bump_
+    collection_stats_impl`/`_decrement_collection_stats_impl` maintain
+    incrementally must equal a from-scratch recompute straight from
+    `claims` (the read-only `collection_stats_consistency_check` helper)
+    at every step — not just at the end."""
+    rng = random.Random(20260904)
+    _seed_uploader("uploader1")
+    _seed_collection(collection_id=CORPUS_A, created_by="uploader1")
+    file_ids = [f"cf_prop_{i}" for i in range(4)]
+    for fid in file_ids:
+        _seed_corpus_file(corpus_id=CORPUS_A, file_id=fid)
+
+    fact_ids = [repo.create_fact(type="engagement") for _ in range(3)]
+    edge_id = repo.create_edge(src=fact_ids[0], type="works_in_industry", dst=fact_ids[1])
+    subjects = [("fact", fid) for fid in fact_ids] + [("edge", edge_id)]
+
+    quote_n = 0
+    for fid in file_ids:
+        for _ in range(rng.randint(1, 3)):
+            kind, subject_id = rng.choice(subjects)
+            quote_n += 1
+            kwargs = dict(
+                corpus_file_id=fid, corpus_id=CORPUS_A, file_sha256="s", quote=f"Random quote {quote_n} in the text."
+            )
+            if kind == "fact":
+                repo.add_claim(fact_id=subject_id, **kwargs)
+            else:
+                repo.add_claim(edge_id=subject_id, **kwargs)
+
+    check = repo.collection_stats_consistency_check(CORPUS_A)
+    assert check["consistent"], check
+
+    shuffled_files = list(file_ids)
+    rng.shuffle(shuffled_files)
+    for fid in shuffled_files:
+        repo.delete_claims_for_file(fid)
+        check = repo.collection_stats_consistency_check(CORPUS_A)
+        assert check["consistent"], check
+
+
+def test_delete_claims_for_file_never_runs_a_full_collection_regroup(pg_env, repo):
+    """Regression (TCRD-296 gap #73, live-Postgres finding 2026-09-04): a
+    full `rebuild_collection_stats` on this per-file, per-document HOT path
+    used to re-derive the WHOLE collection's membership from `claims` on
+    every single delete — on a collection with millions of claims, four
+    concurrent extraction passes turned that into a full `GROUP BY
+    corpus_id, fact_id`/`GROUP BY corpus_id, edge_id` regroup every few
+    seconds. Proven by recording every statement `delete_claims_for_file`
+    issues and asserting that full-collection regroup signature (unique to
+    `_rebuild_one_collection_stats`, absent from the targeted per-subject
+    UPDATEs this method now issues) never appears."""
+    from sqlalchemy import event
+
+    _seed_uploader("uploader1")
+    _seed_collection(collection_id=CORPUS_A, created_by="uploader1")
+    _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_a1")
+    fact_id = repo.create_fact(type="engagement")
+    repo.add_claim(fact_id=fact_id, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="s", quote="Some quote.")
+
+    statements: list = []
+
+    def _capture(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    event.listen(repo._engine, "before_cursor_execute", _capture)
+    try:
+        repo.delete_claims_for_file("cf_a1")
+    finally:
+        event.remove(repo._engine, "before_cursor_execute", _capture)
+
+    assert not any("GROUP BY corpus_id, fact_id" in s for s in statements), statements
+    assert not any("GROUP BY corpus_id, edge_id" in s for s in statements), statements
+    assert not any("FROM claims" in s and "GROUP BY" in s for s in statements), statements
 
 
 def test_reassign_file_corpus_reconciles_both_collections(pg_env, repo):
