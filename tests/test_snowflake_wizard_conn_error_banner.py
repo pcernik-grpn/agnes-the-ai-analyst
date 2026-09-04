@@ -16,8 +16,8 @@ executing the script.
 
 from __future__ import annotations
 
-from pathlib import Path
 
+from tests import _ds_page_source
 from tests._admin_data_sources_source import read_admin_data_sources_source
 
 
@@ -130,7 +130,7 @@ def test_conn_error_banner_reuses_the_design_system_danger_tokens():
     # appears in the wizard's JS as well, and in the assembled source the JS
     # comes first — a windowed `index()` search would land on a
     # querySelector call and assert nothing about the styling.
-    css = Path("app/web/static/css/ds_page.css").read_text(encoding="utf-8")
+    css = _ds_page_source.styles_only()
     css_start = css.index(".ds-sf-conn-error")
     css_block = css[css_start : css_start + 400]
     assert "var(--ds-accent-danger" in css_block

@@ -14,10 +14,10 @@ the page keep being split up — the wizard had to come out of here so the
 data-package builder could open the same drawer, and it could not come out
 while every test was pinned to its address.
 
-Only classic (non-module) scripts belong in `_LOADED`: those share one
-global scope with the inline block — `defer`red or not — which is why moving
-a function into one is behaviour-preserving. A module or a component with
-its own scope (`js/components/*.js`) has its own tests.
+Only classic (non-deferred, non-module) scripts belong in `_LOADED`: those
+share one global scope with the inline block, which is why moving a function
+into one is behaviour-preserving. A module or a deferred component
+(`js/components/*.js`) has its own scope and its own tests.
 """
 
 from __future__ import annotations
@@ -46,17 +46,14 @@ _LOADED = (
 #: together, so both have to come back together.
 _INCLUDED = (_WEB / "templates" / "_add_data_wizard.html",)
 
-#: Stylesheets the page loads that used to be inline <style> blocks in the
-#: template. Same reason `_LOADED` exists: a test that string-searches the
-#: "page" for a CSS rule must keep finding it after the rule moved into a
-#: file. Appended AFTER the scripts, which costs nothing — every caller
-#: either searches the whole string or lifts a JS function by name, and a
-#: CSS rule cannot be mistaken for either.
+#: The page's stylesheet, moved out of its three inline <style> blocks for the
+#: same reason as the script — the builder needs those rules for the wizard
+#: drawer. Appended for assertions about CSS, which used to read the template.
 _STYLES = (_WEB / "static" / "css" / "ds_page.css",)
 
 
 def page_source() -> str:
-    """Template text with every classic script and stylesheet it loads appended."""
+    """Template text with every classic script it loads appended."""
     parts = [TEMPLATE.read_text(encoding="utf-8")]
     parts.extend(p.read_text(encoding="utf-8") for p in _INCLUDED if p.exists())
     parts.extend(p.read_text(encoding="utf-8") for p in _LOADED if p.exists())
@@ -67,3 +64,32 @@ def page_source() -> str:
 def template_text() -> str:
     """The template alone — for assertions about MARKUP, not about script."""
     return TEMPLATE.read_text(encoding="utf-8")
+
+
+def scripts_only() -> str:
+    """Just the classic scripts the page loads, concatenated."""
+    return "\n".join(p.read_text(encoding="utf-8") for p in _LOADED if p.exists())
+
+
+def rendered_with_scripts(html: str) -> str:
+    """A FETCHED page plus the classic scripts it loads.
+
+    Some tests GET the page over a TestClient and then assert on script
+    content — which worked while the script was inline and silently stops
+    meaning anything once it moves into a file. Appending the loaded files
+    keeps those assertions honest without pretending the script is still in
+    the markup, and leaves assertions about SERVER-RENDERED values (which
+    only exist in the response) working as they were.
+    """
+    return html + "\n" + scripts_only()
+
+
+def styles_only() -> str:
+    """Just the page's stylesheet.
+
+    A test asserting on CSS must not be handed `page_source()`: the same
+    selector appears there as a STRING inside the script (`querySelector(
+    ".ds-sf-conn-error__msg")`), and an `index()` for it lands in JavaScript
+    400 characters from any declaration.
+    """
+    return "\n".join(p.read_text(encoding="utf-8") for p in _STYLES if p.exists())
