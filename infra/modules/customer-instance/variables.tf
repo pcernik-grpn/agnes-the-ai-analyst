@@ -407,6 +407,16 @@ variable "dev_instances" {
   type = list(object({
     name         = string
     machine_type = optional(string, "e2-small")
+    # Disk sizes, per dev VM. MUST be declared on the object type — Terraform
+    # silently drops attributes absent from the type during conversion, so a
+    # caller's `data_disk_gb = 60` never reached the merge with dev_defaults
+    # and every dev VM was stuck at the default. Same defaults as
+    # dev_defaults in main.tf. Growing `data_disk_gb` is an in-place GCE
+    # resize (no VM change); the filesystem still needs an online
+    # `resize2fs` on the VM afterwards — the startup script only formats a
+    # fresh disk. Shrinking is refused by GCE.
+    disk_size_gb = optional(number, 30)
+    data_disk_gb = optional(number, 20)
     image_tag    = optional(string, "dev")
     tls_mode     = optional(string, "none")
     domain       = optional(string, "")
