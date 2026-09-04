@@ -1177,3 +1177,8 @@ def test_the_prompt_offers_the_kind_and_says_a_term_is_not_an_assumption():
     assert "`glossary:` and `document:` is checked against the tools you actually ran" in checked, (
         "the model has to be told the new kind is checked, or it reads as decoration"
     )
+    assert "not its id" in checked, (
+        "the ref has to be the TERM: the chip's destination filters the glossary tab on `?q=` "
+        "over rows indexed by term/definition/see-also — an id would open an empty list, and a "
+        "chip that lands on nothing is the dead label #1974 removed"
+    )

@@ -78,10 +78,11 @@ LAST thing in the reply, after the `next_actions` block:
   per line. Use the id as `agnes catalog` gives it, not a prose description.
 - `metric:` — the canonical metric id, when you adapted one.
 - `glossary:` — every governed business term whose definition the answer
-  leaned on, written as `agnes glossary search` gives it (the term itself, or
-  the id `agnes glossary show` takes). A term you looked up is evidence, like
-  a table or a file: cite it here, never as an `assumption:` whose origin is a
-  definition.
+  leaned on. Write the TERM as the glossary spells it (`agnes glossary
+  search`, or the `Term:` line of `agnes glossary show`), not its id — the
+  reader's chip opens the glossary on that term. A term you looked up is
+  evidence, like a table or a file: cite it here, never as an `assumption:`
+  whose origin is a definition.
 - `document:` — every document or fact-graph subject the answer rests on, one
   per line: the filename as the fact tools give it
   (`Q3_Board_Review.pdf`), or the subject id you passed to

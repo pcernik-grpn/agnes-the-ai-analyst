@@ -328,7 +328,8 @@ claim per line, the LAST thing in the reply:
 - `table:` — the registry id (as `agnes catalog` gives it) of every table the
   figure was computed from. `metric:` — the canonical metric id, when you
   adapted one. `glossary:` — every governed business term whose definition the
-  answer leaned on, as `agnes glossary` gives it. `document:` — every document
+  answer leaned on, written as the glossary spells the term (`agnes glossary`),
+  not as its id. `document:` — every document
   or fact-graph subject the answer rests on: the filename as the fact tools
   give it, or the subject id you passed to `agnes facts claims`. Each is
   checked against the tools you actually ran; naming a table you did not
