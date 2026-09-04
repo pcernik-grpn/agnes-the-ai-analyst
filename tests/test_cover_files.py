@@ -15,6 +15,8 @@ Key responsibilities:
 - Verify a 480 width request returns a resized WebP smaller than the
   original, an unlisted width serves the original bytes untouched, and
   the resized variant is cached to disk and reused on a repeat GET.
+- Verify the /uploads mount is skip-listed out of gzip (already-compressed
+  binaries -- see app/main.py's _SelectiveGZipMiddleware skip_prefixes).
 
 Design constraints:
 - Use seeded_app_fresh because every test here reads from the disk-mounted
@@ -230,3 +232,27 @@ def test_upload_cover_variant_never_upscales(seeded_app_fresh):
     r = client.get(f"{cover_url}?w=480")
     assert r.status_code == 200
     assert r.content == _SMALL_PNG
+
+
+def test_uploaded_cover_is_not_gzipped(seeded_app_fresh):
+    """Cover images are already-compressed binaries (WebP/PNG/JPEG) -- the
+    /uploads mount must be in _SelectiveGZipMiddleware's skip list, same
+    rationale as the parquet/attachments exclusions in app/main.py.
+    Re-gzipping burns CPU on the event loop for no size win.
+    """
+    app_data = seeded_app_fresh
+    client = app_data["client"]
+    # _NOISE_PNG is incompressible and well above the gzip minimum_size
+    # threshold (1024 bytes), so a real gzip attempt would show up.
+    files = {"file": ("noise.png", io.BytesIO(_NOISE_PNG), "image/png")}
+    upload = client.post(
+        "/api/admin/uploads/cover-image",
+        files=files,
+        headers=_auth(app_data["admin_token"]),
+    )
+    assert upload.status_code == 200
+    cover_url = upload.json()["url"]
+
+    resp = client.get(cover_url, headers={"Accept-Encoding": "gzip"})
+    assert resp.status_code == 200
+    assert "gzip" not in resp.headers.get("content-encoding", "")
