@@ -7413,6 +7413,24 @@ const ChatAttachments = (() => {
     _coDrive = !!on;
   }
 
+  /** The filename a §6 DIALOG upload should bind, sanitized the same way a
+   *  pasted one is.
+   *
+   *  The paste path gets this for free inside add(); the "+" menu dialogs
+   *  build their own FormData and would otherwise send the name the OS gave
+   *  the file. ``_SAFE_FILENAME_RE`` in app/api/chat_uploads.py rejects that
+   *  name for a single space, so picking a document called "AI Value
+   *  Backlog_Report_v1.pdf" in Add Image/Document failed with a message about
+   *  "disallowed characters" while pasting the very same file worked (#2184).
+   *  Sharing ``_seq`` with the paste path is deliberate: it keeps two uploads
+   *  of the browser's generic "image.png" from colliding no matter which of
+   *  the two routes they arrive by.
+   */
+  function uploadName(file, now = new Date()) {
+    _seq += 1;
+    return safeUploadName(file && file.name, file && file.type, now, _seq);
+  }
+
   return {
     add,
     count,
@@ -7421,6 +7439,7 @@ const ChatAttachments = (() => {
     settle,
     setCoDrive,
     composeText,
+    uploadName,
     // Exposed for tests (tests/test_chat_paste_attachments_ui.py runs these
     // under node against the shipped source).
     _pure: { safeUploadName, kindFor, composeText, filesFromTransfer, stampFor },
@@ -7717,7 +7736,9 @@ const ChatAttachments = (() => {
 
       try {
         const fd = new FormData();
-        fd.append("file", _dataFile);
+        // Third argument = the filename the server sees. Without it the OS's
+        // own name goes up and a space in it is a 400 (#2184).
+        fd.append("file", _dataFile, ChatAttachments.uploadName(_dataFile));
         fd.append("kind", "data");
         if (dataRegisterCb && dataRegisterCb.checked) {
           fd.append("register_as_table", "true");
@@ -8015,7 +8036,9 @@ const ChatAttachments = (() => {
       try {
         const kind = _mediaKind(_mediaFile);
         const fd = new FormData();
-        fd.append("file", _mediaFile);
+        // Third argument = the filename the server sees. Without it the OS's
+        // own name goes up and a space in it is a 400 (#2184).
+        fd.append("file", _mediaFile, ChatAttachments.uploadName(_mediaFile));
         fd.append("kind", kind);
 
         const res = await fetch("/api/chat/uploads", {
