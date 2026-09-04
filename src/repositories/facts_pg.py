@@ -48,6 +48,7 @@ import json
 import logging
 import re
 import secrets
+import threading
 from collections import defaultdict
 from datetime import date, datetime
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Set, Tuple
@@ -195,6 +196,41 @@ _SWEEP_LOCK_ID = 0x46414353  # "FACS" packed as an int32
 # must BOTH eventually run (a caller awaiting the result), so this one
 # queues rather than no-ops.
 _COLLECTION_STATS_LOCK_CLASS_ID = 0x53544154  # "STAT" packed as an int32
+
+# TCRD-296 gap #78 follow-up (Devin Review on #2273): a cheap, in-memory
+# "this corpus's fact graph changed" signal for `app/web/router.py`'s
+# `collection_facts_summary` TTL cache. Bumped by every write path below
+# that can change what that method returns for a corpus — a new/deleted
+# claim, a reassigned file, a rebuild, a correction, a merge/split — so a
+# write is visible on the very next read regardless of the cache's TTL: the
+# TTL only smooths repeated reads of UNCHANGED data (the Files section's
+# own pager), never a stale answer after a real write. Process-local, never
+# persisted — a restart naturally invalidates everything, which is correct
+# (nothing cached to invalidate). NOT bumped by a write that bypasses this
+# repository entirely (raw SQL against `claims`/`edges`/`corrections`, e.g.
+# a test fixture or an out-of-band data fix) — there is no application-level
+# write path to hook in that case, the same limitation `fact_collection_
+# stats` itself already has; such a caller must invalidate explicitly via
+# `FactsPgRepository.invalidate_corpus_facts_cache`.
+_corpus_facts_version_lock = threading.Lock()
+_corpus_facts_version: Dict[str, int] = {}
+
+
+def _bump_corpus_facts_version(*corpus_ids: Optional[str]) -> None:
+    with _corpus_facts_version_lock:
+        for cid in corpus_ids:
+            if cid:
+                _corpus_facts_version[cid] = _corpus_facts_version.get(cid, 0) + 1
+
+
+def _clear_all_corpus_facts_versions() -> None:
+    """Coarse invalidation for a write whose affected corpora are not
+    cheaply known here — a correction is scoped by subject id, not corpus,
+    and a subject's claims can span more than one. Corrections are a rare,
+    admin-triggered path, so invalidating every corpus's cache entry rather
+    than tracing the exact affected set is the correct, simple trade-off."""
+    with _corpus_facts_version_lock:
+        _corpus_facts_version.clear()
 
 
 class FactNotFound(RuntimeError):
@@ -993,6 +1029,12 @@ class FactsPgRepository:
         original `claims` scan when it is missing/stale (see
         `rebuild_collection_stats`'s docstring), so degrading silently here
         is the correct failure mode, not a swallowed bug."""
+        # Gap #78 follow-up: bumped unconditionally, BEFORE the try below —
+        # the claim itself is already written by the time this runs
+        # (`add_claim` only calls this after a genuinely new row), so the
+        # cache-invalidation signal must not depend on whether the stats
+        # bookkeeping savepoint below happens to succeed.
+        _bump_corpus_facts_version(corpus_id)
         try:
             with conn.begin_nested():
                 self._bump_collection_stats_impl(
@@ -1114,6 +1156,10 @@ class FactsPgRepository:
         `rebuild_collection_stats`'s docstring)."""
         if not deleted_rows:
             return
+        # Gap #78 follow-up: same "bump before the savepoint, regardless of
+        # its outcome" reasoning as `_bump_collection_stats_on_new_claim` —
+        # the DELETE is already committed by the time this runs.
+        _bump_corpus_facts_version(*{r["corpus_id"] for r in deleted_rows})
         try:
             with conn.begin_nested():
                 self._decrement_collection_stats_impl(conn, deleted_rows)
@@ -1374,6 +1420,11 @@ class FactsPgRepository:
            serializes that case instead — a second rebuild of this same
            `corpus_id` blocks until this transaction commits or rolls back.
         """
+        # Gap #78 follow-up: a rebuild is the RECOMPUTE path every bulk
+        # claims mutation (reassign, merge, split, consolidation) and the
+        # admin repair tool route through — bumping here transitively
+        # covers all of them without a separate hook at each call site.
+        _bump_corpus_facts_version(corpus_id)
         conn.execute(
             sa.text("SELECT pg_advisory_xact_lock(:class_id, hashtext(:cid))"),
             {"class_id": _COLLECTION_STATS_LOCK_CLASS_ID, "cid": corpus_id},
@@ -1543,6 +1594,13 @@ class FactsPgRepository:
                     "by": decided_by,
                 },
             )
+        # Gap #78 follow-up: a correction changes VISIBILITY, never
+        # claims/edges counts, so none of the three stats hooks above see
+        # it — and it is scoped by subject id, not corpus, so the cheap
+        # per-corpus bump those use is not available here. A blanket clear
+        # is the correct, simple trade-off for this rare, admin-triggered
+        # write (see `_clear_all_corpus_facts_versions`'s own docstring).
+        _clear_all_corpus_facts_versions()
 
     def delete_correction(self, *, subject_kind: str, subject_id: str) -> None:
         with self._engine.begin() as conn:
@@ -1550,6 +1608,8 @@ class FactsPgRepository:
                 sa.text("DELETE FROM corrections WHERE subject_kind = :kind AND subject_id = :id"),
                 {"kind": subject_kind, "id": subject_id},
             )
+        # Gap #78 follow-up: same reasoning as `upsert_correction` above.
+        _clear_all_corpus_facts_versions()
 
     def list_wrong_corrections(self) -> List[Dict[str, Any]]:
         """The producer export (spec §7.4): every ``wrong`` subject with its
@@ -4029,6 +4089,24 @@ class FactsPgRepository:
         for r in rows:
             out[r["corpus_file_id"]] = int(r["n"])
         return out
+
+    def corpus_facts_version(self, corpus_id: str) -> int:
+        """Current write-version for ``corpus_id`` (see the module-level
+        registry above `FactNotFound`) — 0 if this process has never
+        bumped it. A cheap in-memory read, no DB round trip;
+        `app/web/router.py`'s `collection_facts_summary` TTL cache folds
+        this into its cache key so a write through this repository is
+        visible on the very next read regardless of the cache's TTL."""
+        with _corpus_facts_version_lock:
+            return _corpus_facts_version.get(corpus_id, 0)
+
+    def invalidate_corpus_facts_cache(self, corpus_id: str) -> None:
+        """Escape hatch for a caller that changed ``corpus_id``'s
+        claims/edges/corrections OUTSIDE this repository (raw SQL — a
+        migration data fix, a test fixture) and needs the next
+        `collection_facts_summary` read to reflect it immediately, the
+        same way a write made THROUGH this repository already does."""
+        _bump_corpus_facts_version(corpus_id)
 
     def collection_facts_summary(self, caller, corpus_id: str, *, limit: int = 20, offset: int = 0) -> Dict[str, Any]:
         """Caller-scoped facts section for one collection's detail page

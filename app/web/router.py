@@ -5784,12 +5784,18 @@ _FACTS_SECTION_PAGE_SIZE = 20
 # INLINE on the initial page load (spec §13.2 "Collection detail" — state,
 # not settings), so there is no natural lazy-load boundary to move it
 # behind without a template/JS change wider than this fix. Keyed by
-# ``(corpus_id, caller_user_id, facts_page)`` — NEVER shared across
-# callers, so a grant change (or a correction) is visible again within one
-# TTL window, not "until the process restarts".
+# ``(corpus_id, caller_user_id, facts_page, write_version)`` — NEVER shared
+# across callers, so a grant change is visible again within one TTL window
+# at most, not "until the process restarts"; the write-version component
+# (`FactsPgRepository.corpus_facts_version`, bumped by every write path
+# that can change a corpus's fact graph) makes a real write visible on the
+# VERY NEXT read regardless of the TTL — Devin Review on #2273 caught a
+# live conflict-review item still reading as present after its second
+# claim was deleted, because the 30s window alone had no way to tell a
+# genuinely stale entry from a merely old-but-still-correct one.
 _FACTS_SUMMARY_CACHE_TTL_S = 30.0
 _facts_summary_cache_lock = threading.Lock()
-_facts_summary_cache: dict[tuple[str, str, int], tuple[float, dict]] = {}
+_facts_summary_cache: dict[tuple[str, str, int, int], tuple[float, dict]] = {}
 
 
 def _cached_collection_facts_summary(facts_repo_, user: dict, corpus_id: str, *, limit: int, offset: int) -> dict:
@@ -5797,8 +5803,13 @@ def _cached_collection_facts_summary(facts_repo_, user: dict, corpus_id: str, *,
     see the cache's own docstring above for why and the key shape. A cache
     miss (or an expired entry) still calls straight through, so a cold
     process or an empty cache degrades to today's per-request cost, never
-    an error."""
-    key = (corpus_id, user.get("id") or "", offset)
+    an error. ``corpus_facts_version`` is read via ``getattr`` rather than
+    called directly — a stub facts repo in a route-level test (e.g.
+    ``tests/test_web_library_files_pagination.py``'s ``_FakeFactsRepo``)
+    need not implement it, and simply never benefits from write-visible
+    invalidation, which does not matter to what that test asserts."""
+    version = getattr(facts_repo_, "corpus_facts_version", lambda _cid: 0)(corpus_id)
+    key = (corpus_id, user.get("id") or "", offset, version)
     now = time.monotonic()
     with _facts_summary_cache_lock:
         cached = _facts_summary_cache.get(key)
