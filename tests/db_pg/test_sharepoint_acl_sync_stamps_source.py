@@ -77,33 +77,29 @@ def test_a_new_mirrored_grant_is_written_with_the_syncs_own_source(pg_repos, mon
     assert describe(rows[0]["source"])["revocable"] is False
 
 
-def test_a_grant_the_sync_made_before_it_stamped_is_adopted(pg_repos):
-    """The half that decides whether existing instances are fixed. Without
-    it the change reaches only new grants, and every mirrored collection
-    already out there keeps drawing a Revoke the next run undoes."""
+def test_a_grant_written_before_the_stamping_is_classified_from_its_sentinel(pg_repos):
+    """The legacy row — sentinel owner, no source — is what every live
+    instance is full of. It is classified from `assigned_by`, with no sync
+    run and no backfill needed, which is also what makes this work on the
+    DuckDB backend where the `source` column does not exist at all."""
     groups, grants, engine = pg_repos
     from connectors.sharepoint import acl_sync
+    from src.grant_sources import SECTION_SET_ELSEWHERE, resolve_source, section_for
 
     grp = groups.create(name="sp-legacy-" + uuid.uuid4().hex[:6], created_by="admin@x.com")
     col = _collection(engine)
-
-    # Exactly what the old code wrote: sentinel owner, no source.
     grants.create(
         group_id=grp["id"],
         resource_type="collection",
         resource_id=col,
         assigned_by=acl_sync.ACL_SYNC_SENTINEL,
     )
-    before = [g for g in grants.list_all(resource_type="collection") if g["resource_id"] == col]
-    assert before[0]["source"] is None, "precondition: the legacy row has no source"
+    row = [g for g in grants.list_all(resource_type="collection") if g["resource_id"] == col][0]
+    assert row["source"] is None, "precondition: the legacy row records no source"
 
-    # A run that changes nothing about membership still adopts it.
-    acl_sync._reconcile_grants(col, [grp["id"]], "scope-1")
-
-    after = [g for g in grants.list_all(resource_type="collection") if g["resource_id"] == col]
-    assert len(after) == 1, "adoption must not duplicate the grant"
-    assert after[0]["id"] == before[0]["id"], "adoption must not recreate it under a new id"
-    assert after[0]["source"] == "sharepoint_acl_sync"
+    resolved = resolve_source(row["source"], row["assigned_by"])
+    assert resolved == "sharepoint_acl_sync"
+    assert section_for(resolved) == SECTION_SET_ELSEWHERE
 
 
 def test_a_wizard_grant_on_the_same_collection_is_left_alone(pg_repos):

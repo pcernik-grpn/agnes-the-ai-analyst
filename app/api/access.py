@@ -33,6 +33,7 @@ from src.grant_scopes import normalize as normalize_scope
 from src.grant_scopes import takes_everyone_scope
 from src.grant_sources import ACCESS_PAGE, describe as describe_grant_source
 from src.grant_sources import section_for as grant_section
+from src.grant_sources import resolve_source
 from src.repositories.user_groups import SystemGroupProtected
 
 from src.repositories import (
@@ -354,8 +355,14 @@ async def access_overview(
             # `None` for an ordinary grant — the page renders those exactly as
             # before. Non-null means: another surface owns this, do not offer a
             # control here that will fail.
-            "source": r.get("source"),
-            "managed_by": _managed_by(r.get("source")),
+            # RESOLVED, not raw: on the frozen DuckDB backend there is no
+            # `source` column at all, so a row's writer lives in
+            # `assigned_by`. Sending the raw value would have the page show
+            # "no source" beside a section that says the row is not
+            # actionable — two halves of the payload disagreeing about the
+            # same grant.
+            "source": resolve_source(r.get("source"), r.get("assigned_by")),
+            "managed_by": _managed_by(resolve_source(r.get("source"), r.get("assigned_by"))),
             # Which of the page's two sections this row belongs in — the
             # effort's ticket 10. Sent rather than re-derived client-side so
             # the rule lives in ONE place (`grant_sources.revocable`) and a
@@ -366,7 +373,7 @@ async def access_overview(
             # revoke cannot remove. Grouping by authorship would file seven
             # revocable kinds under "not yours", including the Library shares
             # an admin most often opens this page to check.
-            "section": grant_section(r.get("source")),
+            "section": grant_section(resolve_source(r.get("source"), r.get("assigned_by"))),
             # WHO this row reaches, as the page should label it: the
             # `everyone` sentinel, or a group id. Sent because the page must
             # not have to know about the carrier — an everyone-scoped row is

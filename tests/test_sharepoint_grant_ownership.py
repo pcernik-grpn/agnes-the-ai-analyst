@@ -23,7 +23,7 @@ writers apart, which is what `resource_grants.source` exists for.
 
 from __future__ import annotations
 
-from src.grant_sources import describe, section_for
+from src.grant_sources import describe, resolve_source, section_for
 
 
 class TestTheWizardsGrantsCanBeManagedHere:
@@ -64,6 +64,55 @@ class TestTheAclSyncsGrantsCannotBe:
         reason = describe("sharepoint_acl_sync")["reason"].lower()
         assert "mirrored" in reason
         assert "data sources" in reason
+
+
+class TestTheClassificationWorksOnBothBackends:
+    """The reason this is not keyed on `source` alone.
+
+    `resource_grants.source` arrived in Alembic 0096, which is Postgres-only
+    under the A3 ratchet — so on the frozen DuckDB app-state backend the
+    column does not exist and no grant can record its writer. A fix that
+    read only `source` would work on one of the two supported backends and
+    silently leave every DuckDB instance with the original bug: a Revoke on
+    a mirrored collection that the next sync undoes.
+
+    `assigned_by` exists on both, and the ACL sync has always written its
+    sentinel there. The writer was already recorded everywhere; it just was
+    not being read.
+    """
+
+    def test_an_explicit_source_wins(self):
+        """A sentinel is a fallback, never an override — what the writer
+        declared about itself outranks what we infer from an id."""
+        assert resolve_source("sharepoint_wizard", "system:sharepoint-acl-sync") == "sharepoint_wizard"
+
+    def test_a_sentinel_owner_is_recognised_with_no_source_at_all(self):
+        """The DuckDB case, and every Postgres row written before stamping."""
+        assert resolve_source(None, "system:sharepoint-acl-sync") == "sharepoint_acl_sync"
+
+    def test_and_that_is_enough_to_withhold_the_revoke(self):
+        assert section_for(resolve_source(None, "system:sharepoint-acl-sync")) == "set_elsewhere"
+
+    def test_an_ordinary_admin_grant_is_untouched(self):
+        """The common case must not be dragged into the inert section by a
+        fallback meant for one writer."""
+        assert resolve_source(None, "admin@example.com") is None
+        assert section_for(resolve_source(None, "admin@example.com")) == "change_here"
+
+    def test_no_source_and_no_assigner_is_still_actionable(self):
+        assert resolve_source(None, None) is None
+        assert section_for(resolve_source(None, None)) == "change_here"
+
+    def test_the_api_resolves_from_both_columns(self):
+        """The payload must not disagree with itself — a row whose section
+        says "not yours" while its source reads null is two halves of one
+        answer contradicting each other."""
+        from pathlib import Path
+
+        src = Path("app/api/access.py").read_text(encoding="utf-8")
+        for field in ('"source"', '"managed_by"', '"section"'):
+            line = next(ln for ln in src.splitlines() if ln.strip().startswith(field + ":"))
+            assert "resolve_source" in line, f"{field} is not resolved from both columns"
 
 
 class TestTheSyncStampsAndAdoptsItsOwnRows:

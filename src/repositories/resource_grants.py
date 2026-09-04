@@ -287,20 +287,6 @@ class ResourceGrantsRepository:
         )
         return prior
 
-    def adopt_source(self, grant_id: str, source: str) -> bool:
-        """Accepted and DROPPED, for the same frozen-ladder reason as the
-        ``source`` argument to :meth:`create`: there is no ``source`` column
-        on the DuckDB app-state backend (it arrived in Alembic ``0096``,
-        which is Postgres-only under the A3 ratchet), so there is nothing
-        here to stamp.
-
-        Always ``False`` — the Postgres sibling returns ``True`` only when it
-        actually writes, and "nothing was written" is the honest answer on
-        this backend. The caller (the SharePoint ACL sync adopting rows it
-        made before it stamped them) treats the result as advisory.
-        """
-        return False
-
     def ensure_grant(
         self,
         group_id: str,

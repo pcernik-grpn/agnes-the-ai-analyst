@@ -730,15 +730,6 @@ def _reconcile_grants(
     current_group_ids = {g["group_id"] for g in current}
     target_set = set(target_group_ids)
 
-    # Adopt rows this module wrote before it stamped a source. Without this
-    # the fix only reaches grants created from here on, and every mirrored
-    # collection already on an instance keeps drawing a Revoke that the next
-    # run undoes. `adopt_source` never overwrites a source somebody else
-    # recorded, so re-running is harmless.
-    for g in current:
-        if not g.get("source"):
-            grants.adopt_source(g["id"], ACL_SYNC_GRANT_SOURCE)
-
     added: List[str] = []
     removed: List[str] = []
 

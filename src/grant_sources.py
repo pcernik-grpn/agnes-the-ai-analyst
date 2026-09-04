@@ -188,6 +188,36 @@ GRANT_SOURCES: Dict[str, GrantSource] = {
 #: The two sections `/admin/access` groups grant rows into (the effort's
 #: ticket 10). Both names say where the ACTION lives, not who owns the row —
 #: which is the axis that answer picked.
+#: Writers that identify themselves in ``assigned_by`` rather than in
+#: ``source``, mapped to the source they mean.
+#:
+#: `resource_grants.source` arrived in Alembic 0096, which is Postgres-only
+#: under the A3 ratchet — so on the frozen DuckDB app-state backend the column
+#: does not exist and NO grant can record its writer. Classifying on `source`
+#: alone therefore worked on exactly one of the two supported backends, and
+#: silently gave DuckDB instances the old behaviour: a Revoke on a mirrored
+#: SharePoint collection that the next sync undoes.
+#:
+#: `assigned_by` exists on both. The ACL sync has always written its own
+#: sentinel there, so the writer is already recorded on every instance — it
+#: just was not being read. This also covers Postgres rows written before the
+#: stamping existed, which is most of them on any live instance.
+SENTINEL_SOURCES: Dict[str, str] = {
+    "system:sharepoint-acl-sync": "sharepoint_acl_sync",
+}
+
+
+def resolve_source(source: Optional[str], assigned_by: Optional[str] = None) -> Optional[str]:
+    """The writer of a grant, from whichever column recorded it.
+
+    An explicit ``source`` always wins: it is what the writer declared, and
+    a sentinel is only ever a fallback for rows that could not carry one.
+    """
+    if source:
+        return source
+    return SENTINEL_SOURCES.get(assigned_by or "")
+
+
 SECTION_CHANGE_HERE = "change_here"
 SECTION_SET_ELSEWHERE = "set_elsewhere"
 
