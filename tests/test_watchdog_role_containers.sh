@@ -60,6 +60,11 @@ fail() {
 #                                            fed back verbatim by `docker
 #                                            logs <container> --since ...`
 #                                            (missing file = empty logs)
+#   FAKE_JOBS                               "<service> <name> <state>
+#                                            <exit>" lines served ONLY to
+#                                            `docker compose ps -a`, the
+#                                            one-shot-job probe (scenarios
+#                                            F/G); unset = no job rows
 build_fake_docker() {
     local dir=$1
     mkdir -p "$dir"
@@ -73,6 +78,16 @@ if [ "${1:-}" = "compose" ]; then
     shift || true
     case "$sub" in
         ps)
+            # `docker compose ps -a --format '... {{.State}} {{.ExitCode}}'`
+            # is the failed-one-shot-job probe, a different question from
+            # the bare `ps` the role enumeration asks. Served from its own
+            # fixture so a scenario can hold a broken migrate and a healthy
+            # fleet at the same time (that combination is the whole point
+            # of scenario G).
+            if [ "${1:-}" = "-a" ]; then
+                printf '%s\n' "${FAKE_JOBS:-}"
+                exit 0
+            fi
             case "${FAKE_TOPOLOGY:-single}" in
                 role_split)
                     printf 'worker agnes-worker-1\n'
@@ -358,6 +373,72 @@ grep -qF "docker logs agnes-redis-1" "$transcript" \
 log_file | grep -qF "COORDINATION[agnes-extraction-worker-1]: 5x 'CoordinationUnavailable'" \
     || fail "F: env-declared redis (AGNES_COORDINATION_BACKEND in .env) must gate the coordination signature ON"
 echo "OK: F — extraction-worker scanned+named; .env AGNES_COORDINATION_BACKEND=redis arms the coordination signature"
+rm -rf "$tmp"
+
+# =====================================================================
+# Scenario G: strict boot blocked by a failed one-shot job. `migrate`
+# exited 1, so app/scheduler never left `Created` and the role fleet is
+# empty. Before this signature existed the ONLY alert was "no agnes role
+# containers found" — the symptom, with the cause sitting unread in the
+# migrate container's log. The alert must now name the job, its exit
+# code, and the exception line; and the sibling job that exited 0 must
+# stay silent.
+# =====================================================================
+run_scenario G
+cat > "$fake_logs_dir/agnes-migrate-1.log" <<'LOG'
+INFO  [alembic.runtime.migration] Running upgrade 0096_users_kind -> 0096_resource_grants_source
+Traceback (most recent call last):
+  File "/usr/local/bin/alembic", line 10, in <module>
+    sys.exit(main())
+sqlalchemy.exc.ProgrammingError: (psycopg.errors.DuplicateColumn) column "source" of relation "resource_grants" already exists
+[SQL: ALTER TABLE resource_grants ADD COLUMN source VARCHAR]
+(Background on this error at: https://sqlalche.me/e/20/f405)
+LOG
+
+TRANSCRIPT="$transcript" FAKE_LOGS_DIR="$fake_logs_dir" \
+    FAKE_TOPOLOGY=empty \
+    FAKE_JOBS='migrate agnes-migrate-1 exited 1
+data-migrate agnes-data-migrate-1 exited 0' \
+    AGNES_WATCHDOG_COMPOSE_DIR="$tmp" \
+    PATH="$fake_bin:$PATH" \
+    bash "$sandboxed"
+
+log_file | grep -qF "JOB-FAILED[agnes-migrate-1]: one-shot job exited 1" \
+    || fail "G: a one-shot job left at a non-zero exit must alert, naming the job and the code"
+log_file | grep -qF "DuplicateColumn" \
+    || fail "G: the alert must carry the cause read out of the job's own log, not just the exit code"
+log_file | grep -qF "JOB-FAILED[agnes-data-migrate-1]" \
+    && fail "G: a one-shot job that exited 0 must never alert"
+echo "OK: G — failed migrate alerts with its exit code and exception line; the exit-0 sibling stays silent"
+rm -rf "$tmp"
+
+# =====================================================================
+# Scenario H: the silent-drift shape, and the reason this signature is
+# not merely a better message on scenario G. The app is still UP from
+# before the upgrade, so the fleet is healthy and every pre-existing
+# check passes — while each upgrade tick re-runs a migrate that keeps
+# failing. This state ran undetected for two days on a live instance and
+# produced no alert of any kind; it must now produce one.
+# =====================================================================
+run_scenario H
+printf 'INFO: nothing wrong here\n' > "$fake_logs_dir/agnes-app-1.log"
+printf 'alembic.script.revision.ResolutionError: no such revision\n' \
+    > "$fake_logs_dir/agnes-migrate-1.log"
+
+TRANSCRIPT="$transcript" FAKE_LOGS_DIR="$fake_logs_dir" \
+    FAKE_TOPOLOGY=single \
+    FAKE_JOBS='migrate agnes-migrate-1 exited 255' \
+    AGNES_WATCHDOG_COMPOSE_DIR="$tmp" \
+    PATH="$fake_bin:$PATH" \
+    bash "$sandboxed"
+
+log_file | grep -qF "CONTAINER: no agnes role containers found" \
+    && fail "H: the fleet is healthy — the empty-fleet alert must not be what carries this"
+log_file | grep -qF "JOB-FAILED[agnes-migrate-1]: one-shot job exited 255" \
+    || fail "H: a failing migrate behind a HEALTHY fleet must alert — this is the two-day silence"
+log_file | grep -qF "ResolutionError" \
+    || fail "H: the alert must carry the cause"
+echo "OK: H — failing migrate behind a healthy fleet alerts instead of going silent"
 rm -rf "$tmp"
 
 echo "OK"

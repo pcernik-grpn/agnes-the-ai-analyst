@@ -50,6 +50,8 @@ def test_watchdog_checks_incident_signatures():
         "RestartCount",  # container restart delta
         "oom_kill",  # cgroup OOM counter delta
         "/api/health",  # liveness probe
+        "ps -a",  # one-shot job probe: an EXITED container is invisible without -a
+        "JOB-FAILED",  # a migrate left at a non-zero exit blocks the whole strict boot
     ]:
         assert signature in sh, f"watchdog no longer checks for: {signature}"
 
@@ -231,7 +233,7 @@ def test_every_alert_site_writes_a_marker_with_a_stable_slug():
     )
 
     calls = re.findall(r'^\s*.*\badd "(?P<msg>[^"]+)"(?P<rest>[^\n]*)$', sh, re.M)
-    assert len(calls) == 14, f"expected 14 alert sites, found {len(calls)}"
+    assert len(calls) == 15, f"expected 15 alert sites, found {len(calls)}"
     slugs = set()
     for msg, rest in calls:
         slug = rest.strip()
@@ -244,6 +246,7 @@ def test_every_alert_site_writes_a_marker_with_a_stable_slug():
         "fleet-empty", "crash", "zombie", "wal-salvage", "index-desync",
         "index-append-fatal", "coordination", "restarts", "container-down",
         "oom", "health", "discarded-wal", "scheduler", "disk",
+        "job-failed",
     }
     # The two CONTAINER alerts share an anti-spam prefix but are materially
     # different incidents: one replica missing vs the whole project gone.
