@@ -3943,10 +3943,16 @@ class ExtractionRunOptions(BaseModel):
             "more chance — including ones already given up on after repeated failures — "
             "without a full `resync`. The cheap, targeted recovery for a handful of "
             "permanently-stuck documents (a conversion crash, a transient download error) "
-            "that a plain trigger alone would never re-offer. This run's ordinary "
-            "incremental delta walk still runs afterward, unaffected. On a sharded site "
-            "each shard replays its OWN backlog — `connectors.sharepoint.crawler."
-            "_retry_failed_items` already filters by `state_key`."
+            "that a plain trigger alone would never re-offer. Does NOT, on its own, replay "
+            "an item already judged doomed (a deterministic reject, or one that has "
+            "repeatedly crashed/timed out the converter against unchanged content — see "
+            "`connectors.sharepoint.crawler._doomed_skip_reason`) — that skip is gated on "
+            "`force_reprocess` alone, so this option never re-burns the full time budget on "
+            "documents already known to be stuck; combine with `force_reprocess` to force "
+            "those too. This run's ordinary incremental delta walk still runs afterward, "
+            "unaffected. On a sharded site each shard replays its OWN backlog — "
+            "`connectors.sharepoint.crawler._retry_failed_items` already filters by "
+            "`state_key`."
         ),
     )
     shards: Optional[List[int]] = Field(

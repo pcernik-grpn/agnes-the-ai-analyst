@@ -1431,6 +1431,217 @@ class TestDoomedItemSkip:
         assert sum(1 for u in seen if u.endswith("/content")) == 4
 
 
+# --------------------------------------------------------------------------
+# Doomed after a REPEATED crash/timeout — a document whose most recent
+# failure is environmental (`timeout`/`memory_kill`/`worker_crash`, never
+# deterministic) is skipped WITHOUT a download once it has failed the SAME
+# environmental way, on UNCHANGED content, three times running (TCRD-296
+# gap #74; see `crawler._DOOMED_SKIP_MIN_ATTEMPTS_REPEATED`'s docstring for
+# the live finding this fixes).
+# --------------------------------------------------------------------------
+
+
+class TestDoomedAfterRepeatedFailure:
+    @staticmethod
+    def _handler():
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            if "t=1" in str(request.url):
+                return httpx.Response(200, json={"value": [], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        return handler
+
+    @staticmethod
+    def _crash(path, mime, **_kw):
+        # The child dies from a real signal — the ONE failure mode a plain
+        # `except Exception` inside the child can never catch (see
+        # `_ConvertCrashed`'s own docstring) — instant, no sleep needed.
+        os.kill(os.getpid(), signal.SIGABRT)
+
+    def test_a_repeated_worker_crash_is_skipped_without_download_after_three_attempts(self, crawl_env, monkeypatch):
+        """Covers both scenario (a) — three failures, then doomed — and
+        scenario (b) — two failures alone are still attempted normally,
+        unlike a deterministic reject which is already doomed at two."""
+        monkeypatch.setattr(crawler, "convert_to_markdown", self._crash)
+        seen = _install_graph(monkeypatch, self._handler())
+        connection = _connection([_drive_scope()])
+
+        first = _run(connection, monkeypatch)
+        assert first["convert_failed"] == 1
+        assert first.get("skipped_doomed", 0) == 0
+        entry = _state(crawl_env)["failed_items"]["graph:item1"]
+        assert entry["attempts"] == 1
+        assert entry["error_class"] == "worker_crash"
+
+        # Two failures — below the REPEATED-failure threshold (3): still
+        # attempted normally.
+        second = _run(connection, monkeypatch)
+        assert second["convert_failed"] == 1
+        assert second.get("skipped_doomed", 0) == 0
+        assert _state(crawl_env)["failed_items"]["graph:item1"]["attempts"] == 2
+
+        # Third attempt — still below the threshold going in (2 < 3), so
+        # still attempted; this is the failure that crosses it.
+        third = _run(connection, monkeypatch)
+        assert third["convert_failed"] == 1
+        assert third.get("skipped_doomed", 0) == 0
+        assert _state(crawl_env)["failed_items"]["graph:item1"]["attempts"] == 3
+        downloads_after_third = sum(1 for u in seen if u.endswith("/content"))
+
+        # Fourth attempt — 3 repeated worker_crash failures, same cTag:
+        # doomed, no download.
+        fourth = _run(connection, monkeypatch)
+        assert fourth["skipped_doomed"] == 1
+        assert fourth["convert_failed"] == 0
+        assert fourth["errors"] == 0
+        assert sum(1 for u in seen if u.endswith("/content")) == downloads_after_third, (
+            "a doomed item must not be downloaded again"
+        )
+        item = fourth["skipped_doomed_items"][0]
+        assert item["error_class"] == "worker_crash"
+        assert item["reason_type"] == "doomed_after_repeated_worker_crash"
+        # The attempt count is unchanged by a doomed skip — nothing was tried.
+        assert _state(crawl_env)["failed_items"]["graph:item1"]["attempts"] == 3
+
+    def test_force_reprocess_still_attempts_a_repeatedly_crashing_item(self, crawl_env, monkeypatch):
+        monkeypatch.setattr(crawler, "convert_to_markdown", self._crash)
+        seen = _install_graph(monkeypatch, self._handler())
+        connection = _connection([_drive_scope()])
+
+        _run(connection, monkeypatch)
+        _run(connection, monkeypatch)
+        _run(connection, monkeypatch)
+        assert _state(crawl_env)["failed_items"]["graph:item1"]["attempts"] == 3
+        downloads_before = sum(1 for u in seen if u.endswith("/content"))
+
+        forced = _run(connection, monkeypatch, force_reprocess=True)
+
+        # Same double-offer shape as the deterministic case (backlog replay
+        # un-skipped + the ordinary page walk, both attempting it).
+        assert forced.get("skipped_doomed", 0) == 0
+        assert forced["convert_failed"] == 2
+        assert sum(1 for u in seen if u.endswith("/content")) > downloads_before
+
+    def test_a_new_ctag_gets_fresh_attempts_even_after_a_repeated_crash_was_doomed(self, crawl_env, monkeypatch):
+        monkeypatch.setattr(crawler, "convert_to_markdown", self._crash)
+
+        state_box = {"ctag": "ctag-1"}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            if "t=1" in str(request.url):
+                return httpx.Response(200, json={"value": [], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+            return httpx.Response(
+                200,
+                json={"value": [_file_item(ctag=state_box["ctag"])], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"},
+            )
+
+        seen = _install_graph(monkeypatch, handler)
+        connection = _connection([_drive_scope()])
+
+        _run(connection, monkeypatch)
+        _run(connection, monkeypatch)
+        _run(connection, monkeypatch)
+        fourth = _run(connection, monkeypatch)
+        assert fourth["skipped_doomed"] == 1
+        downloads_before = sum(1 for u in seen if u.endswith("/content"))
+
+        # New content (a different cTag). Reset the delta cursor so the next
+        # run re-walks the page instead of finding nothing new via its
+        # resumed (empty) deltaLink.
+        state_box["ctag"] = "ctag-2"
+        state = _state(crawl_env)
+        state["delta_links"] = {}
+        crawler.save_state(connection["id"], state)
+
+        fifth = _run(connection, monkeypatch)
+
+        # The BACKLOG replay runs first, still holding the STALE recorded
+        # cTag (ctag-1) — skipped as doomed against that stale record,
+        # cheaply. The ORDINARY delta walk that follows in the SAME run then
+        # offers the item with its NEW cTag (ctag-2), attempted fresh.
+        assert fifth["skipped_doomed"] == 1
+        assert fifth["convert_failed"] == 1
+        assert sum(1 for u in seen if u.endswith("/content")) > downloads_before
+        assert _state(crawl_env)["failed_items"]["graph:item1"]["item"]["cTag"] == "ctag-2"
+
+    def test_a_repeated_timeout_is_also_doomed_after_three_attempts(self, crawl_env, monkeypatch):
+        """The rule applies to `timeout`, not just `worker_crash` — a real,
+        bounded per-item timeout via a tiny configured budget, not a mock."""
+        monkeypatch.setattr(crawler, "_item_timeout_seconds", lambda: 0.3)
+
+        def _hang(path, mime, **_kw):
+            time.sleep(2)  # far longer than the tiny budget above
+            return ConvertResult("# never reached")
+
+        monkeypatch.setattr(crawler, "convert_to_markdown", _hang)
+        seen = _install_graph(monkeypatch, self._handler())
+        connection = _connection([_drive_scope()])
+
+        for _ in range(3):
+            report = _run(connection, monkeypatch)
+            assert report.get("skipped_doomed", 0) == 0
+        assert _state(crawl_env)["failed_items"]["graph:item1"]["error_class"] == "timeout"
+        assert _state(crawl_env)["failed_items"]["graph:item1"]["attempts"] == 3
+        downloads_after_third = sum(1 for u in seen if u.endswith("/content"))
+
+        fourth = _run(connection, monkeypatch)
+        assert fourth["skipped_doomed"] == 1
+        assert sum(1 for u in seen if u.endswith("/content")) == downloads_after_third
+        assert fourth["skipped_doomed_items"][0]["reason_type"] == "doomed_after_repeated_timeout"
+
+
+class TestDoomedClassificationHelper:
+    """Direct, no-crawl coverage of `_doomed_classification` — the single
+    place `_doomed_skip_reason` (live skip) and `_retry_backlog_snapshot`
+    (standing count) both read, so they can never silently disagree."""
+
+    @pytest.mark.parametrize("error_class", ["timeout", "memory_kill", "worker_crash"])
+    def test_a_repeated_failure_class_becomes_doomed_at_the_repeated_threshold(self, error_class):
+        assert crawler._doomed_classification(error_class, 2) is None
+        assert crawler._doomed_classification(error_class, 3) == f"doomed_after_repeated_{error_class}"
+
+    def test_deterministic_classes_are_unaffected_by_the_repeated_rule(self):
+        assert crawler._doomed_classification("markitdown_reject", 2) == "doomed"
+        assert crawler._doomed_classification("markitdown_reject", 1) is None
+
+    def test_download_error_and_other_never_become_doomed(self):
+        assert crawler._doomed_classification("download_error", 10) is None
+        assert crawler._doomed_classification("other", 10) is None
+
+
+class TestNoteRetryAttemptsForEnvironmentalFailures:
+    """`_note_retry` bumps `failed_items[...]['attempts']` for EVERY
+    `error_class`, including `timeout`/`memory_kill`/`worker_crash` — never
+    only the deterministic ones — because the doomed-after-repeat rule
+    (TCRD-296 gap #74) depends on counting these attempts exactly the same
+    way a deterministic failure's are counted."""
+
+    @pytest.mark.parametrize("error_class", ["timeout", "memory_kill", "worker_crash"])
+    def test_attempts_increments_across_repeated_calls(self, error_class):
+        state: Dict[str, Any] = {}
+        stats = crawler.CrawlStats()
+        target = crawler.DriveTarget(drive_id="b!drive1", drive_name="Drive")
+        item = _file_item()
+
+        for expected in (1, 2, 3):
+            crawler._note_retry(
+                state,
+                stats,
+                "graph:item1",
+                target=target,
+                item=item,
+                path="Reports/brief.docx",
+                error_class=error_class,
+            )
+            entry = state["failed_items"]["graph:item1"]
+            assert entry["attempts"] == expected
+            assert entry["error_class"] == error_class
+
+
 class TestEmptyItemBacklog:
     """``state["empty_items"]`` — the persisted backlog of documents that
     converted to ``convert_empty``, and the admin-requested ``retry_empty``

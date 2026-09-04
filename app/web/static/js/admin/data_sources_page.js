@@ -772,7 +772,7 @@ function _sharepointFactsHtml(row) {
       <input type="checkbox" id="ds-sp-runopts-retry-${row.id}">
       Retry failed items
     </label>
-    <span class="field-hint" style="flex-basis:100%;">Gives every document already known to have failed (including ones given up on after repeated failures) one more chance — no full re-enumeration, just this connection's own failure queue.</span>
+    <span class="field-hint" style="flex-basis:100%;">Gives every document already known to have failed (including ones given up on after repeated failures) one more chance — no full re-enumeration, just this connection's own failure queue. A document already judged doomed (rejected deterministically, or repeatedly crashing/timing out the converter on unchanged content) stays skipped — check "Re-process everything" too to force those.</span>
     <button type="button" class="btn btn-primary" onclick="runSpExtraction('${row.id}')">Start run</button>
     <button type="button" class="btn btn-secondary" onclick="toggleSpRunOptsRow('${row.id}')">Cancel</button>
   </div>
