@@ -160,10 +160,20 @@ def test_grant_sections_split_on_whether_the_admin_can_act():
 
     The question this answered assumed the split was "mine versus the
     machine's" — one writer against nine. Measured against
-    `src/grant_sources.py`, nine writers are not the admin but only TWO
-    produce rows a revoke cannot remove: the nightly marketplace sync
-    re-asserts, and the SharePoint wizard rewrites its scope's collection
-    grants. The other seven revoke cleanly and stay revoked.
+    `src/grant_sources.py`, most writers are not the admin but only TWO
+    produce rows a revoke cannot remove.
+
+    WHICH two was wrong until a dev instance showed it. It read "the nightly
+    marketplace sync and the SharePoint wizard". The wizard rewrites a
+    scope's collection grants only when an admin RE-SUBMITS that scope's
+    form — no scheduled pass — so a revoke there stands, and it moved to the
+    actionable side. The writer that genuinely re-asserts is the SharePoint
+    ACL sync, which recomputes grants from SharePoint's own permissions on
+    every run and, until then, recorded no source at all — so its rows were
+    filed here as actionable and drew a Revoke that undid itself.
+
+    The axis is unchanged and so is the count; the membership was a
+    statement of fact about two writers, and one of them was misread.
 
     So grouping by authorship would file seven revocable kinds under "not
     yours" — including the Library shares an admin most often opens the page
@@ -178,7 +188,7 @@ def test_grant_sections_split_on_whether_the_admin_can_act():
     )
 
     elsewhere = {k for k in GRANT_SOURCES if section_for(k) == SECTION_SET_ELSEWHERE}
-    assert elsewhere == {"marketplace_sync", "sharepoint_wizard"}, (
+    assert elsewhere == {"marketplace_sync", "sharepoint_acl_sync"}, (
         f"exactly the two re-asserting writers belong in the inert section, got {elsewhere}"
     )
 
@@ -191,6 +201,10 @@ def test_grant_sections_split_on_whether_the_admin_can_act():
         "mcp_source_default",
         "chat_seed",
         "system_plugin_migration",
+        # Moved here from the inert side: the wizard overwrites only when an
+        # admin re-submits its scope form, which is last-writer-wins, not a
+        # control that cannot act.
+        "sharepoint_wizard",
     ):
         assert section_for(key) == SECTION_CHANGE_HERE, (
             f"{key} revokes cleanly, so it belongs where the admin can act on it"

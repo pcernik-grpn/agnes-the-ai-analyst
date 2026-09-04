@@ -96,8 +96,43 @@ GRANT_SOURCES: Dict[str, GrantSource] = {
         label="From the SharePoint wizard",
         surface="Data sources",
         href="/admin/data-sources",
+        # REVOCABLE, and the correction matters: this was marked False on the
+        # reasoning that "the wizard rewrites them on the next run". It does
+        # not. `confirm_scope` rewrites a scope's collection grants only when
+        # an admin RE-SUBMITS that scope's form with a group list — there is
+        # no scheduled pass behind it. So an admin's revoke here stands until
+        # someone deliberately reopens the wizard, which is ordinary
+        # last-writer-wins, not a control that cannot act.
+        #
+        # The genuinely self-restoring case is the ACL sync below, which is
+        # what `revocable=False` was reaching for and did not name.
+        revocable=True,
+        reason=(
+            "Written by the connect wizard. You can change it here; "
+            "re-submitting that scope in the wizard will overwrite it."
+        ),
+    ),
+    "sharepoint_acl_sync": GrantSource(
+        key="sharepoint_acl_sync",
+        label="Mirrored from SharePoint permissions",
+        surface="Data sources",
+        href="/admin/data-sources",
+        # THIS is the one a revoke cannot hold. A mirrored-mode scope has its
+        # collection grants recomputed from SharePoint's own ACLs on every
+        # sync (`connectors/sharepoint/acl_sync.py::reconcile_collection_grants`),
+        # so a row removed here returns on the next run. Until this key
+        # existed those grants carried no source at all, which filed them
+        # under "change here" and drew a Revoke that silently undid itself —
+        # the exact failure this registry exists to prevent.
+        #
+        # Stopping the mirroring is `access_mode`, on the scope, not a revoke
+        # on one row (spec §2.3).
         revocable=False,
-        reason="The connect wizard owns this scope's collection grants and rewrites them on the next run.",
+        reason=(
+            "Mirrored from SharePoint's own permissions on every sync. "
+            "Change who is in the SharePoint scope, or switch the scope off "
+            "mirrored mode, in Data sources."
+        ),
     ),
     "share_request": GrantSource(
         key="share_request",

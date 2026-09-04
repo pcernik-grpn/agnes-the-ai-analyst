@@ -123,6 +123,10 @@ from src.repositories import (
 logger = logging.getLogger(__name__)
 
 ACL_SYNC_SENTINEL = "system:sharepoint-acl-sync"
+#: What this module is, to `resource_grants.source` (src/grant_sources.py).
+#: Distinct from the sentinel: the sentinel identifies rows to THIS module,
+#: the source tells /admin/access that a revoke here cannot hold.
+ACL_SYNC_GRANT_SOURCE = "sharepoint_acl_sync"
 """Tag written to ``user_groups.created_by`` and ``resource_grants.assigned_by``
 for every group/grant this sync creates or reconciles."""
 
@@ -726,11 +730,31 @@ def _reconcile_grants(
     current_group_ids = {g["group_id"] for g in current}
     target_set = set(target_group_ids)
 
+    # Adopt rows this module wrote before it stamped a source. Without this
+    # the fix only reaches grants created from here on, and every mirrored
+    # collection already on an instance keeps drawing a Revoke that the next
+    # run undoes. `adopt_source` never overwrites a source somebody else
+    # recorded, so re-running is harmless.
+    for g in current:
+        if not g.get("source"):
+            grants.adopt_source(g["id"], ACL_SYNC_GRANT_SOURCE)
+
     added: List[str] = []
     removed: List[str] = []
 
     for group_id in target_set - current_group_ids:
-        grants.ensure_grant(group_id, ResourceType.COLLECTION.value, collection_id, assigned_by=ACL_SYNC_SENTINEL)
+        # `source` as well as the sentinel. The sentinel is what THIS module
+        # matches on to find its own rows; `source` is what /admin/access
+        # reads to decide whether to offer a revoke. Without it these rows
+        # had no recorded writer, so the page filed them under "change
+        # here" and drew a Revoke that the next sync silently undid.
+        grants.ensure_grant(
+            group_id,
+            ResourceType.COLLECTION.value,
+            collection_id,
+            assigned_by=ACL_SYNC_SENTINEL,
+            source=ACL_SYNC_GRANT_SOURCE,
+        )
         added.append(group_id)
         log_safe(
             action="sharepoint_acl.grant_added",

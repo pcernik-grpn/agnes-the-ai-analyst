@@ -311,6 +311,29 @@ class ResourceGrantsPgRepository:
             conn.execute(sql, params)
         return grant_id
 
+    def adopt_source(self, grant_id: str, source: str) -> bool:
+        """Stamp ``source`` on a grant that has none. Returns True iff a row
+        was written.
+
+        Deliberately a no-op when the grant already records a source: the
+        only caller is a writer adopting rows it created before it stamped
+        them, and overwriting a source it did not write would relabel
+        somebody else's grant — which is the one thing `source` must never
+        do, because /admin/access decides whether to offer a revoke from it.
+        """
+        with self._engine.begin() as conn:
+            row = conn.execute(
+                sa.text("SELECT source FROM resource_grants WHERE id = :id"),
+                {"id": grant_id},
+            ).first()
+            if row is None or row[0]:
+                return False
+            conn.execute(
+                sa.text("UPDATE resource_grants SET source = :src WHERE id = :id"),
+                {"src": source, "id": grant_id},
+            )
+        return True
+
     def update_requirement(self, grant_id: str, requirement: str) -> Optional[str]:
         """Update the ``requirement`` enum on a grant. Returns the prior value
         (None if the grant is missing) so callers can detect transitions
