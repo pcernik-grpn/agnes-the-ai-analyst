@@ -25,6 +25,7 @@ from app.chat.skills_catalog import (
     merged_commands,
     merged_skills,
 )
+from app.chat.message_parts import parts_to_tool_results
 from app.chat.sources import verdict as sources_verdict
 from app.chat.types import Surface
 from app.coordination.base import CoordinationUnavailable
@@ -670,7 +671,11 @@ async def list_messages(
             # the pair it needs is already here, so this costs no column, no
             # migration step and no DuckDB/Postgres parity surface — and a
             # better matcher improves history instead of only new answers.
-            **({"sources": sources_verdict(m.content or "", m.tool_calls).to_dict()} if m.role == "assistant" else {}),
+            **(
+                {"sources": sources_verdict(m.content or "", m.tool_calls, parts_to_tool_results(m.parts)).to_dict()}
+                if m.role == "assistant"
+                else {}
+            ),
         }
         for m in msgs
     ]
