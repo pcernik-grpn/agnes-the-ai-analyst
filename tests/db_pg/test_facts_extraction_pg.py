@@ -1992,6 +1992,97 @@ def test_count_pending_documents_is_zero_with_no_ontology(pg_env):
     assert count_pending_documents(CONNECTION_ID) == 0
 
 
+def test_count_pending_documents_matches_the_per_file_predicate_it_replaced(pg_env, monkeypatch):
+    """Parity fixture for TCRD-296 gap #72: the bounded, single-query
+    candidate fetch (``CorpusFileSourcesPgRepository
+    .pending_extraction_candidates``) must reproduce EXACTLY the same
+    per-file predicate the old ``list_for_corpus`` + per-file ``get()``
+    loop applied — one file per branch of :func:`count_pending_documents`'s
+    own docstring:
+
+    * not ``processing_status == "indexed"`` -> excluded
+    * indexed but never source-anchored (no ``source_doc_id``) -> excluded
+    * indexed + anchored but a TERMINAL skip state -> excluded regardless
+      of sha
+    * indexed + anchored + ``"done"`` at the CURRENT sha/model/fingerprint
+      -> excluded (up to date)
+    * indexed + anchored + ``"done"`` under a STALE sha -> included
+    * indexed + anchored + ``"done"`` under a STALE model/fingerprint
+      (current sha) -> included
+
+    ``model``/``prompt_fingerprint`` are pinned via monkeypatch so the
+    "current" value in each ledger entry is under this test's control,
+    not the live default prompt/model resolution.
+    """
+    from connectors.sharepoint.facts_extraction import count_pending_documents, load_state, save_state
+    from src.db_pg import get_engine
+    from src.repositories import corpus_file_sources_repo
+
+    monkeypatch.setattr("connectors.sharepoint.facts_extraction._model", lambda: "model-fixed")
+    monkeypatch.setattr("connectors.sharepoint.facts_prompt.prompt_fingerprint", lambda system_text: "fp-fixed")
+
+    _seed_collection()
+    _seed_connection()
+    _seed_ontology()
+
+    def _seed_file(file_id: str, *, processing_status: str, anchored: bool, sha256: str) -> None:
+        with get_engine().begin() as conn:
+            conn.execute(
+                sa.text(
+                    "INSERT INTO corpus_files (id, corpus_id, filename, sha256, processing_status) "
+                    "VALUES (:id, :corpus_id, :filename, :sha256, :status)"
+                ),
+                {
+                    "id": file_id,
+                    "corpus_id": CORPUS_A,
+                    "filename": f"{file_id}.md",
+                    "sha256": sha256,
+                    "status": processing_status,
+                },
+            )
+        corpus_file_sources_repo().upsert(
+            corpus_file_id=file_id,
+            corpus_id=CORPUS_A,
+            source_stable_id=f"graph:{file_id}",
+            source_doc_id=f"doc-{file_id}" if anchored else None,
+        )
+
+    _seed_file("cf_not_indexed", processing_status="queued", anchored=True, sha256="sha-current")
+    _seed_file("cf_no_doc_id", processing_status="indexed", anchored=False, sha256="sha-current")
+    _seed_file("cf_terminal_skip", processing_status="indexed", anchored=True, sha256="sha-current")
+    _seed_file("cf_up_to_date", processing_status="indexed", anchored=True, sha256="sha-current")
+    _seed_file("cf_stale_sha", processing_status="indexed", anchored=True, sha256="sha-current")
+    _seed_file("cf_stale_model", processing_status="indexed", anchored=True, sha256="sha-current")
+
+    state = load_state(CONNECTION_ID)
+    state["docs"]["cf_terminal_skip"] = {"status": "skipped-no-text"}
+    state["docs"]["cf_up_to_date"] = {
+        "status": "done",
+        "extracted_sha": "sha-current",
+        "model": "model-fixed",
+        "prompt_fingerprint": "fp-fixed",
+    }
+    state["docs"]["cf_stale_sha"] = {
+        "status": "done",
+        "extracted_sha": "sha-OLD",
+        "model": "model-fixed",
+        "prompt_fingerprint": "fp-fixed",
+    }
+    state["docs"]["cf_stale_model"] = {
+        "status": "done",
+        "extracted_sha": "sha-current",
+        "model": "model-OLD",
+        "prompt_fingerprint": "fp-OLD",
+    }
+    # `cf_not_indexed`/`cf_no_doc_id` never got a ledger entry — the
+    # "never attempted" case, which is pending by construction and would
+    # only be excluded by the pre-filter (processing_status/source_doc_id)
+    # this test is checking, not by anything in the ledger.
+    save_state(CONNECTION_ID, state)
+
+    assert count_pending_documents(CONNECTION_ID) == 2
+
+
 def test_maybe_continue_pass_enqueues_a_delayed_job_carrying_the_run_options(pg_env):
     from connectors.sharepoint.facts_extraction import (
         FACTS_CONTINUATION_DELAY_S,

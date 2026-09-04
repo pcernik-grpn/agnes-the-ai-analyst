@@ -5560,8 +5560,19 @@ def count_pending_documents(connection_id: str) -> int:
     with no ontology — the same "nothing to extract" verdict
     :func:`run_facts_extraction` would reach, without raising: this is a
     read-only status helper, never a trigger path.
+
+    Bounded cost (TCRD-296 gap #72): the candidate set (indexed,
+    source-anchored files across this connection's collections) is fetched
+    in ONE query (:meth:`~src.repositories.corpus_file_sources_pg
+    .CorpusFileSourcesPgRepository.pending_extraction_candidates`) — this
+    used to be a ``list_for_corpus`` call per collection plus a per-file
+    ``get()`` lookup, O(N) round trips against a connection's whole corpus
+    (282k on the connection that surfaced the regression). Only the final
+    ``docs_state``-vs-candidate decision (no joinable table backs the
+    ledger, which is a JSON blob) still runs in Python, over that single
+    already-narrow result set.
     """
-    from src.repositories import corpus_file_sources_repo, corpus_files_repo, source_connections_repo
+    from src.repositories import corpus_file_sources_repo, source_connections_repo
 
     connection = source_connections_repo().get(connection_id)
     if connection is None or connection.get("source_type") != "sharepoint":
@@ -5580,25 +5591,18 @@ def count_pending_documents(connection_id: str) -> int:
 
     state = load_state(connection_id)
     docs_state: Dict[str, Any] = state["docs"]
-    files_repo = corpus_files_repo()
     sources_repo = corpus_file_sources_repo()
 
     pending = 0
-    for collection_id in collection_ids_for(connection):
-        for file_row in files_repo.list_for_corpus(collection_id):
-            file_id = str(file_row["id"])
-            mapping = sources_repo.get(file_id) or {}
-            if not mapping.get("source_doc_id"):
-                continue
-            if file_row.get("processing_status") != "indexed":
-                continue
-            entry = docs_state.get(file_id)
-            if isinstance(entry, dict) and entry.get("status") in _TERMINAL_SKIP_STATUSES:
-                continue
-            sha256 = str(file_row.get("sha256") or "")
-            if is_up_to_date(entry, sha256=sha256, model=model, fingerprint=fingerprint):
-                continue
-            pending += 1
+    for row in sources_repo.pending_extraction_candidates(collection_ids_for(connection)):
+        file_id = str(row["file_id"])
+        entry = docs_state.get(file_id)
+        if isinstance(entry, dict) and entry.get("status") in _TERMINAL_SKIP_STATUSES:
+            continue
+        sha256 = str(row.get("sha256") or "")
+        if is_up_to_date(entry, sha256=sha256, model=model, fingerprint=fingerprint):
+            continue
+        pending += 1
     return pending
 
 

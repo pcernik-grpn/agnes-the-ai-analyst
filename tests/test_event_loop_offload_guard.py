@@ -20,7 +20,17 @@ import inspect
 
 import pytest
 
-from app.api.admin_extraction import fleet_extraction_runs
+from app.api.admin_extraction import (
+    extraction_config,
+    extraction_run_detail,
+    extraction_runs,
+    extraction_status,
+    fleet_extraction_runs,
+    patch_extraction_crawl_config,
+    patch_extraction_facts_config,
+    preview_anonymization,
+    request_extraction_stop,
+)
 from app.api.admin_sharepoint import facts_graph_counts
 from app.api.admin_source_connections import list_connections
 from app.api.broker import require_broker_ticket
@@ -152,6 +162,22 @@ _OFFLOADED_API_HANDLERS = [
     # /library index round 3: the "search facets" typeahead — zero awaits,
     # purely blocking facts_pg/accessible_collection_ids DB work.
     library_facet_search,
+    # TCRD-296 gap #72: every OTHER `async def` route in admin_extraction.py
+    # had zero awaits — pure blocking `extraction_runs`/jobs/facts-ledger
+    # reads and writes run directly on the event loop. `extraction_status`
+    # (polled by every open source card) and `fleet_extraction_runs`'s own
+    # `_facts_pending_documents` call chain were the ones a live py-spy
+    # capture caught mid-request; the rest of the module shared the exact
+    # same "async def, no await" shape and are fixed alongside it rather
+    # than left for the next incident to find one at a time.
+    extraction_status,
+    request_extraction_stop,
+    patch_extraction_facts_config,
+    patch_extraction_crawl_config,
+    extraction_runs,
+    extraction_run_detail,
+    extraction_config,
+    preview_anonymization,
 ]
 
 
