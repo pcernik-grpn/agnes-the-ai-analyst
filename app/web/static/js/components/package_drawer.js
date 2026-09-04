@@ -1038,6 +1038,7 @@
          ACTIONS. They were a sentence with two links buried in it — which is
          the wrong shape for the thing you reach for at the exact moment the
          list has failed you, and it is now the only place the connect route
+         lives (the panel's standing line is gone). */
       foot: '<p class="pdw-pickfoot__q">Can\u2019t find the table you need?</p>' +
         '<div class="pdw-pickfoot__opts">' +
           '<a class="pdw-pickfoot__opt" href="/admin/tables">' +
