@@ -862,7 +862,6 @@ def _config_proxy() -> type:
         # operator can flip these via env without an image rebuild.
         AGNES_GOOGLE_GROUP_PREFIX = os.environ.get("AGNES_GOOGLE_GROUP_PREFIX", "")
         AGNES_GROUP_ADMIN_EMAIL = os.environ.get("AGNES_GROUP_ADMIN_EMAIL", "")
-        AGNES_GROUP_EVERYONE_EMAIL = os.environ.get("AGNES_GROUP_EVERYONE_EMAIL", "")
 
         @staticmethod
         def theme_overrides():
@@ -2707,7 +2706,6 @@ async def library_page(
         collection_visibility,
     )
     from app.services.journey import mark_journey
-    from src.db import SYSTEM_EVERYONE_GROUP
 
     uid = user.get("id") or ""
     ct = ResourceType.COLLECTION.value
@@ -2757,15 +2755,20 @@ async def library_page(
     # verdict — resolving that with a visibility_for() call per row would
     # re-read every resource_grants row once per file.
     cft = ResourceType.CORPUS_FILE.value
+    from src.grant_scopes import EVERYONE_TARGET_ID, carrier_group_id, reaches_everyone
+
     try:
-        _everyone = user_groups_repo().get_by_name(SYSTEM_EVERYONE_GROUP)
-        _everyone_id = _everyone["id"] if _everyone else None
+        _carrier = carrier_group_id()
     except Exception:
-        _everyone_id = None
+        _carrier = None
+    # An everyone-scoped grant is recorded under the SENTINEL, not under its
+    # carrier group — same collapse `library_sharing.current_share_group_ids`
+    # makes, so `file_visibility` below is one set-membership test.
     file_shared_groups: dict = {}
     try:
         for g in resource_grants_repo().list_all(resource_type=cft):
-            file_shared_groups.setdefault(g["resource_id"], set()).add(g["group_id"])
+            key = EVERYONE_TARGET_ID if reaches_everyone(g, _carrier) else g["group_id"]
+            file_shared_groups.setdefault(g["resource_id"], set()).add(key)
     except Exception as e:
         logger.warning("/library: could not resolve per-file grants: %s", e)
 
@@ -2773,7 +2776,7 @@ async def library_page(
         groups = file_shared_groups.get(file_id)
         if not groups:
             return "private"
-        if _everyone_id and _everyone_id in groups:
+        if EVERYONE_TARGET_ID in groups:
             return "workspace"
         return "shared"
 
@@ -3613,11 +3616,13 @@ async def library_page(
             # (`curated_install` / `curated_uninstall`). The Library's toggle
             # is kind-agnostic — it POSTs/DELETEs whatever the row names.
             row["stack_endpoint"] = f"/api/marketplace/curated/{mid}/{pname}/install"
-            # Droppable unless an admin pinned it globally (`is_system`) or
-            # required-tier-granted it to one of the caller's groups. Those
-            # are precisely the two cases `curated_uninstall` answers 409
-            # to, so the lock promises exactly what the API enforces.
-            locked = bool(pl.get("is_system")) or g.requirement == "required"
+            # Droppable unless an audience the caller is in holds it at
+            # the required tier — which now covers the case a separate
+            # `is_system` check used to catch, because "automatic for
+            # everyone" is a required grant at `scope='everyone'`. That is
+            # precisely the case `curated_uninstall` answers 409 to, so the
+            # lock promises exactly what the API enforces.
+            locked = g.requirement == "required"
             # Same verb as a store entity, and for the same reason.
             row["stack_action"] = _AGENT_ADD
             row["stack_undo"] = _AGENT_REMOVE
@@ -3732,7 +3737,8 @@ async def library_page(
             _app_shared_groups: dict = {}
             try:
                 for g in resource_grants_repo().list_all(resource_type=ResourceType.DATA_APP.value):
-                    _app_shared_groups.setdefault(g["resource_id"], set()).add(g["group_id"])
+                    _key = EVERYONE_TARGET_ID if reaches_everyone(g, _carrier) else g["group_id"]
+                    _app_shared_groups.setdefault(g["resource_id"], set()).add(_key)
             except Exception as e:
                 logger.warning("/library: could not resolve data-app grants: %s", e)
 
@@ -3740,7 +3746,7 @@ async def library_page(
                 groups = _app_shared_groups.get(slug)
                 if not groups:
                     return "private", "Private"
-                if _everyone_id and _everyone_id in groups:
+                if EVERYONE_TARGET_ID in groups:
                     return "workspace", "Everyone"
                 return "shared", "Specific groups"
 
@@ -11152,8 +11158,81 @@ async def admin_user_detail_page(
     target = repo.get_by_id(user_id)
     if not target:
         raise HTTPException(status_code=404, detail="User not found")
-    ctx = _build_context(request, user=user, target_user=target)
+    ctx = _build_context(request, user=user, target_user=target, shares=_shares_owned_by(str(target["id"])))
     return templates.TemplateResponse(request, "admin_user_detail.html", ctx)
+
+
+def _shares_owned_by(owner_id: str) -> dict:
+    """Everything this person owns that is shared, and with whom.
+
+    /admin/access shows a shared row from the GROUP's side ("Finance has
+    Ada's agent"); nothing showed it from the person's side, so an admin
+    following the owner's name off that row landed on a page that said
+    nothing about sharing (audit U7). This is the other side of the same
+    fact, rendered server-side from the same repositories — no new endpoint.
+
+    Agents and collections only, for now: they are the two owner-shared kinds
+    whose projections carry an owner. Data apps and skills do not yet, and
+    are named as absent rather than silently left out. Reads only; every call
+    exists on both app-state backends.
+    """
+    from src.repositories import (
+        agents_repo,
+        file_corpora_repo,
+        resource_grants_repo,
+        user_groups_repo,
+        users_repo,
+    )
+
+    groups = {g["id"]: g.get("name") or g["id"] for g in user_groups_repo().list_all()}
+    grants = resource_grants_repo()
+    items: list[dict] = []
+    for a in agents_repo().list_for_user(owner_id) or []:
+        items.append({"kind": "agent", "id": a["id"], "name": a.get("name") or a["id"], "href": None})
+    for c in file_corpora_repo().list_all() or []:
+        if str(c.get("created_by") or "") == owner_id:
+            # `/library/{slug}` — the route resolves by SLUG, and there is
+            # no `/library/d/…` path. This built one anyway, so every
+            # collection link in a person's Shares section 404'd. A
+            # collection without a slug gets no link rather than a broken
+            # one (the template renders the name plain when href is None).
+            items.append({"kind": "collection", "id": c["id"], "name": c.get("name") or c["id"],
+                          "href": f"/library/{c['slug']}" if c.get("slug") else None})
+
+    by_kind = {k: grants.list_all(resource_type=k) for k in ("agent", "collection")}
+    # Resolve who granted, once: ids to names (the Library records the sharer's
+    # id), emails pass through.
+    ids = sorted({str(g.get("assigned_by")) for rows in by_kind.values() for g in rows
+                  if g.get("assigned_by") and "@" not in str(g.get("assigned_by"))})
+    who: dict[str, str] = {}
+    if ids:
+        try:
+            for uid_, info_ in (users_repo().get_info_by_ids(ids) or {}).items():
+                who[uid_] = (info_ or {}).get("name") or (info_ or {}).get("email") or uid_
+        except Exception:  # a users-table read failure must not take the page down
+            logger.exception("share names unresolved on /admin/users; falling back to raw ids")
+
+    for it in items:
+        it["grants"] = []
+        for g in by_kind[it["kind"]]:
+            if g.get("resource_id") != it["id"]:
+                continue
+            by = str(g.get("assigned_by") or "")
+            it["grants"].append({
+                "group_id": g.get("group_id"),
+                "group": groups.get(g.get("group_id"), g.get("group_id")),
+                "by_owner": by == owner_id,
+                "by": who.get(by, by.split("@")[0] if "@" in by else by),
+                "requirement": g.get("requirement") or "available",
+            })
+        it["grants"].sort(key=lambda x: str(x["group"]).lower())
+    items.sort(key=lambda x: (x["kind"], str(x["name"]).lower()))
+    # Keyed `owned`, not `items`: in a Jinja template `shares.items` resolves
+    # to the DICT's .items method before any key of that name, and `|length`
+    # on a bound method is a TypeError at render time — which Jinja's compile
+    # step cannot see. Found by rendering the page, not by compiling it.
+    return {"owned": items, "shared": sum(1 for it in items if it["grants"]),
+            "kinds_covered": ["agents", "collections"], "kinds_missing": ["data apps", "skills"]}
 
 
 @router.get("/admin/usage")

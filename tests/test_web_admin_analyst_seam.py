@@ -19,11 +19,15 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from tests.helpers.access_page import access_page_source
+
 TEMPLATES = Path("app/web/templates")
 RAIL = TEMPLATES / "_app_rail.html"
 ADMIN_PKG = TEMPLATES / "admin_package_detail.html"
 CATALOG_PKG = TEMPLATES / "catalog_package_detail.html"
-ACCESS = TEMPLATES / "admin_access.html"
+# The Access page is a template plus the module it loads; the scans below
+# want both halves. See tests/helpers/access_page.py.
+ACCESS_READ_TEXT = access_page_source
 
 _HTML = {"Accept": "text/html"}
 
@@ -199,14 +203,14 @@ class TestThePreviewVerb:
     deep-linkable, and its fix-it links carry the person along."""
 
     def test_the_lens_takes_a_user_deep_link(self) -> None:
-        src = ACCESS.read_text()
+        src = ACCESS_READ_TEXT()
         assert 'params.get("user")' in src
         # Re-picking a person rewrites the URL so the preview survives a
         # round trip through a package page and back.
         assert 'url.searchParams.set("user", uid)' in src
 
     def test_share_it_lands_on_the_package_with_the_person(self) -> None:
-        src = ACCESS.read_text()
+        src = ACCESS_READ_TEXT()
         assert "?from=simulate&user=" in src
         # The old link — the package INDEX, person dropped — must be gone
         # from the stop row.
@@ -235,7 +239,7 @@ class TestThePreviewVerb:
         assert "Fixing access for" not in r.text
 
     def test_dangling_grants_are_warnings_not_green_chips(self) -> None:
-        src = ACCESS.read_text()
+        src = ACCESS_READ_TEXT()
         assert "ax-chip warn" in src
         assert "Dangling grant" in src
 
@@ -263,7 +267,7 @@ class TestThePersonLensIsOneList:
     """
 
     def _src(self) -> str:
-        return ACCESS.read_text()
+        return ACCESS_READ_TEXT()
 
     def test_the_chips_row_is_gone(self) -> None:
         src = self._src()
@@ -543,7 +547,7 @@ class TestTheLibraryShapedPreview:
     def test_the_pane_fetches_and_renders_the_preview(self) -> None:
         """Template hooks: the Simulate lens fetches the endpoint and renders
         the panel in the standardized vocabulary."""
-        src = ACCESS.read_text()
+        src = ACCESS_READ_TEXT()
         assert "/library-preview" in src
         assert "ax-preview" in src
         assert "What their Library shows" in src
@@ -560,7 +564,7 @@ class TestTheLibraryShapedPreview:
         admin page falls back to the row's own analyst href — which is what
         lets a widened preview reach the panel with no per-kind JS, and what
         keeps the next kind from needing a template change either."""
-        src = ACCESS.read_text()
+        src = ACCESS_READ_TEXT()
         assert "preview.sections.map(" in src
         assert "adminPage ? adminPage(it.id) : it.href" in src
 

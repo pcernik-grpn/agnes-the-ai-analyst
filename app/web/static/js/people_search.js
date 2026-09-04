@@ -30,8 +30,28 @@ window.AgnesPeopleSearch = {
   search(query, limit) {
     var q = String(query == null ? '' : query).trim();
     if (!q) return Promise.resolve({ people: [], error: null });
-    var url = window.AgnesPeopleSearch.USERS_API +
-      '?search=' + encodeURIComponent(q) + '&limit=' + (limit || 8);
+    return window.AgnesPeopleSearch._get(
+      window.AgnesPeopleSearch.USERS_API +
+      '?search=' + encodeURIComponent(q) + '&limit=' + (limit || 8));
+  },
+
+  /* The same lookup with no term: the accounts to OFFER before anyone has
+     typed. `search('')` deliberately resolves empty — an empty box is not a
+     query — but a picker that shows nothing until you can spell a colleague's
+     name is only usable by someone who already knows the answer, which is
+     rarely true of the admin doing the adding. The endpoint is
+     `search_recent`, so a bare limit is its natural no-term form.
+
+     Same `{ people, error }` contract, for the same reason: a caller must be
+     able to tell "this instance has nobody else" from "the lookup is down". */
+  recent(limit) {
+    return window.AgnesPeopleSearch._get(
+      window.AgnesPeopleSearch.USERS_API + '?limit=' + (limit || 8));
+  },
+
+  //: One fetch + response-shape handler, so `search` and `recent` cannot
+  //: drift the way the two hand-rolled copies of `search` once did.
+  _get(url) {
     return fetch(url, { credentials: 'include' })
       .then(function (r) {
         if (r.ok) {

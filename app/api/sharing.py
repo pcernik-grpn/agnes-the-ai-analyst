@@ -65,6 +65,12 @@ router = APIRouter(prefix="/api/sharing", tags=["sharing"])
 
 
 class ShareTargetResponse(BaseModel):
+    #: A ``user_groups.id`` for an ordinary audience; the literal
+    #: ``"everyone"`` sentinel (``src.grant_scopes.EVERYONE_TARGET_ID``) when
+    #: ``is_everyone``. Post it back in ``group_ids`` either way — the
+    #: service resolves the sentinel to a scoped grant. Before 0098 this was
+    #: the seeded Everyone group's uuid, so "share with everyone" reached
+    #: whoever that group happened to hold.
     id: str
     name: str
     is_everyone: bool
@@ -84,7 +90,11 @@ class ShareStateResponse(BaseModel):
 class SetSharesRequest(BaseModel):
     group_ids: List[str] = Field(
         default_factory=list,
-        description="Desired end state: the groups this item should be shared with. Empty = private.",
+        description=(
+            "Desired end state: the audiences this item should be shared "
+            'with. Group ids, plus the literal "everyone" for the whole '
+            "workspace. Empty = private."
+        ),
     )
 
 
@@ -105,7 +115,8 @@ def _require_owned(resource_type: str, resource_id: str, user: dict) -> None:
 
 @router.get("/groups", response_model=List[ShareTargetResponse])
 async def list_share_targets(user: dict = Depends(get_current_user)):
-    """Groups the caller may share into — their own memberships + Everyone.
+    """Audiences the caller may share into — their own memberships, plus
+    everyone (the ``"everyone"`` sentinel, flagged ``is_everyone``).
 
     Drives the Library's Share dialog. An admin sees every group.
     """

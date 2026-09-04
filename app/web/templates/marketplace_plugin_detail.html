@@ -1396,12 +1396,15 @@
     installBtn.style.cursor = 'not-allowed';
   }
 
-  // v39: system plugins are mandatory — already in the user's stack and
-  // cannot be removed. Render only the locked amber status pill; the
-  // install + remove controls stay hidden. API also refuses uninstall
-  // with 409 so a devtools-poke can't bypass the visual lock.
-  // Group-scoped required-tier grants (is_required) lock identically.
-  if (d.is_system || d.is_required) {
+  // A required-tier plugin is mandatory — already in the caller's stack and
+  // not removable. Render only the locked amber status pill; the install +
+  // remove controls stay hidden. The API also refuses uninstall with 409 so
+  // a devtools-poke can't bypass the visual lock.
+  //
+  // `d.is_system` was ORed in here for the everyone case. That flag is now a
+  // required grant at `scope='everyone'`, which `is_required` already
+  // reports — one field for one idea.
+  if (d.is_required) {
     installBtn.hidden = true;
     removeBtn.hidden = true;
     statusPill.hidden = false;

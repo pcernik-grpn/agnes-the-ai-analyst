@@ -3129,6 +3129,24 @@ KNOWN_UNTESTED = {
     "POST /api/admin/store/submissions/{submission_id}/override",
     "POST /api/admin/store/submissions/{submission_id}/rescan",
     "POST /api/admin/store/submissions/{submission_id}/retry",
+    # Admin access: reach
+    # groups/reach takes a required `ids` query parameter (a comma-separated
+    # set of audience ids; `everyone` is the scope sentinel), so it is not
+    # parameter-free-GET shaped for this sweep — the same shape as chat-cost
+    # below. Behaviourally covered in tests/test_access_groups_reach.py: the
+    # 422 without `ids` (from FastAPI, so identical on both backends), the
+    # RBAC gate (analyst 403), `everyone` as the account total and dominating
+    # any group beside it, a group's distinct member count, an unknown id
+    # reaching nobody rather than erroring, and the same person in two groups
+    # counted once — the double-count the browser-side union used to make.
+    "GET /api/admin/groups/reach",
+    # member-search takes a required `q` (min two characters), so it is not
+    # parameter-free-GET shaped either. Behaviourally covered in
+    # tests/test_access_groups_member_search.py: the 422 without `q` and on a
+    # one-letter `q`, the RBAC gate, a seeded admin found by email fragment
+    # with the Admin group in the answer, a miss returning no groups and zero
+    # matched people, and up to three names per group.
+    "GET /api/admin/groups/member-search",
     # Admin telemetry
     # chat-cost takes a `window` (and optional `user`) query parameter and is
     # admin-gated, so it is not parameter-free-GET shaped for this sweep.
@@ -3301,7 +3319,6 @@ KNOWN_UNTESTED = {
     # Marketplace detail / asset endpoints
     "DELETE /api/marketplace/curated/{marketplace_id}/{plugin_name}/install",
     "DELETE /api/marketplaces/{marketplace_id}",
-    "DELETE /api/marketplaces/{marketplace_id}/plugins/{plugin_name}/system",
     "POST /api/marketplaces/{marketplace_id}/plugins/{plugin_name}/disable",
     "POST /api/marketplaces/{marketplace_id}/plugins/{plugin_name}/enable",
     "GET /api/marketplace/curated/{marketplace_id}/{plugin_name}",
@@ -3316,7 +3333,6 @@ KNOWN_UNTESTED = {
     "PATCH /api/marketplaces/{marketplace_id}",
     "POST /api/marketplace/curated/{marketplace_id}/{plugin_name}/install",
     "POST /api/marketplaces/sync-all",
-    "POST /api/marketplaces/{marketplace_id}/plugins/{plugin_name}/system",
     "POST /api/marketplaces/{marketplace_id}/sync",
     # MCP passthrough / user secrets
     "DELETE /api/mcp/sources/{source_id}/my-secret",

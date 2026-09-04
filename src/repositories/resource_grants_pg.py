@@ -1,8 +1,6 @@
 """Postgres-backed resource-grants repository.
 
-Mirrors ``src/repositories/resource_grants.py``. ``fanout_system_for_group``
-is soft-failed when ``marketplace_plugins`` isn't migrated yet (Phase F
-in progress); once the table lands, the try/except becomes unnecessary.
+Mirrors ``src/repositories/resource_grants.py``.
 """
 
 from __future__ import annotations
@@ -13,6 +11,9 @@ from uuid import uuid4
 import sqlalchemy as sa
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
+
+from src.grant_scopes import EVERYONE as SCOPE_EVERYONE
+from src.grant_scopes import normalize as normalize_scope
 
 
 # Maps resource_type string to the per-type FK column name (migration 0013).
@@ -28,10 +29,80 @@ _PER_TYPE_COLUMN: Dict[str, str] = {
 
 
 class ResourceGrantsPgRepository:
-    _SELECT_COLS = "id, group_id, resource_type, resource_id, assigned_at, assigned_by, requirement"
+    # `source` rides every read so the Access page can say WHERE a grant came
+    # from, not just who wrote it. PG-only (migration
+    # 0096_resource_grants_source) — the DuckDB sibling has no such column
+    # and its rows simply carry no key.
+    #
+    # `scope` rides them for the same reason and one more: a caller that does
+    # not read it cannot tell an everyone-grant from a grant on the carrier
+    # group, and would answer "who can see this" with the carrier's member
+    # list. PG-only too (migration 0097_resource_grants_scope).
+    _SELECT_COLS = "id, group_id, resource_type, resource_id, assigned_at, assigned_by, requirement, source, scope"
 
     def __init__(self, engine: Engine):
         self._engine = engine
+
+    @staticmethod
+    def _carrier_or(group_id: str, scope: Optional[str]) -> str:
+        """The group an everyone-scoped row MUST be stored against.
+
+        Enforced here rather than at the endpoint, because the endpoint is
+        not the only writer: the built-in marketplace seed, the collections
+        auto-share and the chat-grant seed all write ``scope='everyone'``
+        too, each resolving the group by name on its own. They agree today
+        only because ``user_groups.name`` is unique — an invariant nothing
+        checks at write time, so a fifth writer passing an arbitrary
+        ``group_id`` would silently break the two readers that identify
+        "reaches everyone" BY the carrier group rather than by the column:
+        ``reports._NOT_SYSTEM`` (byte-identical across both backends, since
+        the frozen DuckDB ladder has no ``scope``) and
+        ``marketplace_filter.everyone_required_plugin_keys``.
+
+        Overriding beats raising: every caller that passes a scope means
+        "everyone", and none of them has a reason to care which row carries
+        it. Falls back to the caller's ``group_id`` only if the carrier
+        cannot be resolved, which keeps the NOT NULL constraint satisfiable
+        on an instance whose seeded group is missing.
+        """
+        if scope is None:
+            return group_id
+        from src.grant_scopes import carrier_group_id
+
+        return carrier_group_id() or group_id
+
+    @staticmethod
+    def _audience_clause(
+        group_ids: List[str],
+        params: Dict[str, Any],
+        *,
+        include_everyone: bool,
+    ) -> str:
+        """SQL for "reaches this audience", and the bound ids for it.
+
+        An everyone-scoped grant reaches an account regardless of which
+        groups it is in — including an account in no group at all, which is
+        why this cannot be expressed by adding a group id to the IN list.
+        Mutates ``params`` with the ``a_<i>`` keys it binds.
+
+        Returns ``FALSE`` when there is nothing to match, so the caller gets
+        an empty result from the database rather than having to special-case
+        an empty list into a syntactically invalid ``IN ()``.
+        """
+        terms: List[str] = []
+        if group_ids:
+            in_keys: List[str] = []
+            for i, gid in enumerate(group_ids):
+                k = f"a_{i}"
+                in_keys.append(f":{k}")
+                params[k] = gid
+            terms.append(f"group_id IN ({','.join(in_keys)})")
+        if include_everyone:
+            terms.append("scope = :everyone_scope")
+            params["everyone_scope"] = SCOPE_EVERYONE
+        if not terms:
+            return "FALSE"
+        return "(" + " OR ".join(terms) + ")"
 
     def list_all(
         self,
@@ -48,9 +119,14 @@ class ResourceGrantsPgRepository:
             params["gid"] = group_id
         where_sql = ("WHERE " + " AND ".join(where)) if where else ""
 
+        # `g.source` rides this read too — it is the one the Access overview
+        # uses, and it has its own column list rather than `_SELECT_COLS`
+        # (it joins the group name), so adding the column in one place was
+        # not enough.
         sql = f"""SELECT g.id, g.group_id, ug.name AS group_name,
                        g.resource_type, g.resource_id,
-                       g.assigned_at, g.assigned_by, g.requirement
+                       g.assigned_at, g.assigned_by, g.requirement, g.source,
+                       g.scope
                 FROM resource_grants g
                 JOIN user_groups ug ON ug.id = g.group_id
                 {where_sql}
@@ -63,15 +139,23 @@ class ResourceGrantsPgRepository:
         self,
         group_ids: List[str],
         resource_type: Optional[str] = None,
+        include_everyone: bool = True,
     ) -> List[Dict[str, Any]]:
-        if not group_ids:
-            return []
-        in_keys: List[str] = []
+        """Every grant that reaches an account in ``group_ids``.
+
+        ``include_everyone`` defaults to True because that is what preserves
+        today's answer: before 0098 an everyone-grant WAS a grant on a group
+        holding every account, so every caller of this method already saw it.
+        A caller that opts out is asking a narrower question — "what does
+        this group itself grant" — and only the admin surfaces that attribute
+        rows to a group have any business asking it.
+
+        Works with an empty ``group_ids``: an account in no group still
+        receives everyone-scoped grants, which is precisely the case the old
+        group model could not express.
+        """
         params: Dict[str, Any] = {}
-        for i, gid in enumerate(group_ids):
-            k = f"g_{i}"
-            in_keys.append(f":{k}")
-            params[k] = gid
+        audience = self._audience_clause(group_ids, params, include_everyone=include_everyone)
         type_clause = ""
         if resource_type:
             type_clause = "AND resource_type = :rtype"
@@ -79,7 +163,7 @@ class ResourceGrantsPgRepository:
 
         sql = f"""SELECT {self._SELECT_COLS}
                 FROM resource_grants
-                WHERE group_id IN ({",".join(in_keys)}) {type_clause}
+                WHERE {audience} {type_clause}
                 ORDER BY resource_type, resource_id"""
         with self._engine.connect() as conn:
             rows = conn.execute(sa.text(sql), params).mappings().all()
@@ -89,21 +173,43 @@ class ResourceGrantsPgRepository:
         self,
         user_id: str,
         resource_type: str,
+        include_everyone: bool = True,
     ) -> List[str]:
-        """Distinct ``resource_id`` values of ``resource_type`` granted to
-        any group the user belongs to. Mirrors the DuckDB sibling.
+        """Distinct ``resource_id`` values of ``resource_type`` this user
+        reaches — through a group they belong to, or through scope.
+
+        The everyone-scoped half is a separate SELECT rather than an OR on
+        the join: joined to ``user_group_members`` it would return nothing
+        for an account with no memberships, which is exactly the account an
+        everyone-grant is supposed to reach.
         """
+        sql = """SELECT DISTINCT rg.resource_id
+                 FROM resource_grants rg
+                 JOIN user_group_members m ON m.group_id = rg.group_id
+                 WHERE m.user_id = :u
+                   AND rg.resource_type = :rtype"""
+        if include_everyone:
+            # The audience is people, not every row in `users` (#2256): a
+            # service account holds exactly the grants an admin gave its
+            # groups, and the identities Agnes seeds for itself hold none.
+            # Checked here rather than left to the caller because this is
+            # the one grant read that takes a user instead of a group set.
+            sql += """
+                 UNION
+                 SELECT DISTINCT rg.resource_id
+                 FROM resource_grants rg
+                 WHERE rg.scope = :everyone_scope
+                   AND rg.resource_type = :rtype
+                   AND EXISTS (SELECT 1 FROM users u
+                               WHERE u.id = :u AND u.kind = :human_kind)"""
+        params: Dict[str, Any] = {"u": user_id, "rtype": resource_type}
+        if include_everyone:
+            from src.service_accounts import HUMAN_KIND
+
+            params["everyone_scope"] = SCOPE_EVERYONE
+            params["human_kind"] = HUMAN_KIND
         with self._engine.connect() as conn:
-            rows = conn.execute(
-                sa.text(
-                    """SELECT DISTINCT rg.resource_id
-                       FROM resource_grants rg
-                       JOIN user_group_members m ON m.group_id = rg.group_id
-                       WHERE m.user_id = :u
-                         AND rg.resource_type = :rtype"""
-                ),
-                {"u": user_id, "rtype": resource_type},
-            ).all()
+            rows = conn.execute(sa.text(sql), params).all()
         return [r[0] for r in rows]
 
     def get(self, grant_id: str) -> Optional[Dict[str, Any]]:
@@ -123,17 +229,18 @@ class ResourceGrantsPgRepository:
         group_ids: List[str],
         resource_type: str,
         resource_id: str,
+        include_everyone: bool = True,
     ) -> bool:
-        if not group_ids:
-            return False
-        in_keys: List[str] = []
+        """Whether this audience reaches ``(resource_type, resource_id)``.
+
+        Same ``include_everyone`` default and reasoning as
+        :meth:`list_for_groups`. This one backs ``can_access``, so a caller
+        that opted out would be denying access the grants say exists.
+        """
         params: Dict[str, Any] = {"rtype": resource_type, "rid": resource_id}
-        for i, gid in enumerate(group_ids):
-            k = f"g_{i}"
-            in_keys.append(f":{k}")
-            params[k] = gid
+        audience = self._audience_clause(group_ids, params, include_everyone=include_everyone)
         sql = f"""SELECT 1 FROM resource_grants
-                WHERE group_id IN ({",".join(in_keys)})
+                WHERE {audience}
                   AND resource_type = :rtype
                   AND resource_id = :rid
                 LIMIT 1"""
@@ -148,6 +255,8 @@ class ResourceGrantsPgRepository:
         resource_id: str,
         assigned_by: Optional[str] = None,
         requirement: Optional[str] = None,
+        source: Optional[str] = None,
+        scope: Optional[str] = None,
     ) -> str:
         """Insert a new grant. Returns the assigned id.
 
@@ -155,9 +264,27 @@ class ResourceGrantsPgRepository:
         ``None``. Pass ``'required'`` to create a Required-tier grant in a
         single round-trip (parity with the DuckDB repo). Rejected if it is
         anything other than the two enum values.
+
+        ``source`` names the SURFACE that wrote this grant
+        (``src.grant_sources``) — ``assigned_by`` answers who, which is a
+        different question when a fanout stamps every row with the admin who
+        clicked on another page. Postgres-only (migration
+        0096_resource_grants_source); the DuckDB sibling accepts it and drops
+        it, because that ladder is frozen (A3).
+        ``None`` is stored as NULL, which the API reports as no provenance.
+
+        ``scope`` names WHO the grant reaches (``src.grant_scopes``): ``None``
+        for the members of ``group_id``, ``'everyone'`` for every account.
+        With an everyone-scope, ``group_id`` is OVERRIDDEN with the carrier
+        (see :meth:`_carrier_or`) — the column stays NOT NULL and is ignored
+        on read, and every everyone-grant sharing one carrier is what makes
+        the UNIQUE index reject a second one for the same resource.
+        Postgres-only (migration 0097).
         """
         if requirement is not None and requirement not in ("available", "required"):
             raise ValueError(f"requirement must be 'available' or 'required', got {requirement!r}")
+        scope = normalize_scope(scope)
+        group_id = self._carrier_or(group_id, scope)
         grant_id = str(uuid4())
         per_type_col = _PER_TYPE_COLUMN.get(resource_type)
 
@@ -179,6 +306,14 @@ class ResourceGrantsPgRepository:
             cols.append("requirement")
             vals.append(":req")
             params["req"] = requirement
+        if source is not None:
+            cols.append("source")
+            vals.append(":src")
+            params["src"] = source
+        if scope is not None:
+            cols.append("scope")
+            vals.append(":scope")
+            params["scope"] = scope
 
         sql = sa.text(f"INSERT INTO resource_grants ({', '.join(cols)}) VALUES ({', '.join(vals)})")
         with self._engine.begin() as conn:
@@ -211,53 +346,124 @@ class ResourceGrantsPgRepository:
         resource_type: str,
         resource_id: str,
         assigned_by: Optional[str] = None,
+        source: Optional[str] = None,
+        scope: Optional[str] = None,
     ) -> bool:
         """Create a grant if it does not already exist. Returns True iff the
         grant row exists after the call (whether newly inserted or pre-existing).
 
         Uses INSERT … ON CONFLICT DO NOTHING so repeated calls on every boot
         are idempotent and cheap.
+
+        ``source`` names the SURFACE that wrote this grant
+        (``src.grant_sources``) — ``assigned_by`` answers who, which is a
+        different question when a fanout stamps every row with the admin who
+        clicked on another page. Postgres-only (migration
+        0096_resource_grants_source); the DuckDB sibling accepts it and drops
+        it, because that ladder is frozen (A3).
+        ``None`` is stored as NULL, which the API reports as no provenance.
+
+        ``scope`` — see :meth:`create`. The ON CONFLICT target is
+        ``(group_id, resource_type, resource_id)``, so an everyone-grant is
+        idempotent for the same reason a group grant is: every everyone-grant
+        for a resource shares one carrier group.
         """
+        scope = normalize_scope(scope)
+        group_id = self._carrier_or(group_id, scope)
         grant_id = str(uuid4())
         per_type_col = _PER_TYPE_COLUMN.get(resource_type)
+        params: Dict[str, Any] = {
+            "id": grant_id,
+            "g": group_id,
+            "rt": resource_type,
+            "ri": resource_id,
+            "ab": assigned_by,
+            "src": source,
+            "scope": scope,
+        }
+        cols = ["id", "group_id", "resource_type", "resource_id"]
+        vals = [":id", ":g", ":rt", ":ri"]
+        if per_type_col:
+            cols.append(per_type_col)
+            vals.append(":ri")
+        cols += ["assigned_by", "source", "scope"]
+        vals += [":ab", ":src", ":scope"]
         try:
             with self._engine.begin() as conn:
-                if per_type_col:
-                    conn.execute(
-                        sa.text(
-                            f"INSERT INTO resource_grants "
-                            f"(id, group_id, resource_type, resource_id, {per_type_col}, assigned_by) "
-                            f"VALUES (:id, :g, :rt, :ri, :ri2, :ab) "
-                            f"ON CONFLICT (group_id, resource_type, resource_id) DO NOTHING"
-                        ),
-                        {
-                            "id": grant_id,
-                            "g": group_id,
-                            "rt": resource_type,
-                            "ri": resource_id,
-                            "ri2": resource_id,
-                            "ab": assigned_by,
-                        },
-                    )
-                else:
-                    conn.execute(
-                        sa.text(
-                            "INSERT INTO resource_grants "
-                            "(id, group_id, resource_type, resource_id, assigned_by) "
-                            "VALUES (:id, :g, :rt, :ri, :ab) "
-                            "ON CONFLICT (group_id, resource_type, resource_id) DO NOTHING"
-                        ),
-                        {
-                            "id": grant_id,
-                            "g": group_id,
-                            "rt": resource_type,
-                            "ri": resource_id,
-                            "ab": assigned_by,
-                        },
-                    )
+                conn.execute(
+                    sa.text(
+                        f"INSERT INTO resource_grants ({', '.join(cols)}) "
+                        f"VALUES ({', '.join(vals)}) "
+                        f"ON CONFLICT (group_id, resource_type, resource_id) DO NOTHING"
+                    ),
+                    params,
+                )
         except IntegrityError:
             pass
         return True
+
+    def repoint_group(
+        self,
+        from_group_id: str,
+        to_group_id: str,
+        exclude_types: Optional[List[str]] = None,
+    ) -> int:
+        """Move every grant from one group to another, except ``exclude_types``.
+
+        The frozen DuckDB ladder's half of migration 0098's step 2: an
+        instance that pointed ``Everyone`` at a Workspace group gets that
+        subset its own group, and the grants written against the pseudo-group
+        move with the members.
+
+        ``exclude_types`` is not a convenience. A ``slack_channel`` grant on
+        the seeded group is not an audience grant — it marks a channel open,
+        and ``services.slack_bot.binding`` reads it off that exact group id —
+        so repointing it switches Agnes off in every channel an admin
+        enabled.
+
+        Collisions: where the target already holds the same
+        (resource_type, resource_id), the source row is dropped rather than
+        moved, but the survivor is first upgraded to ``required`` if either
+        side was — or a Required grant would silently become Optional and
+        stop landing in those people's workspaces. Returns rows moved.
+        """
+        excl = list(exclude_types or [])
+        params: Dict[str, Any] = {"src": from_group_id, "tgt": to_group_id}
+        keys = []
+        for i, t in enumerate(excl):
+            k = f"x_{i}"
+            keys.append(f":{k}")
+            params[k] = t
+        notin = f"resource_type NOT IN ({','.join(keys) or 'NULL'})"
+        with self._engine.begin() as conn:
+            conn.execute(
+                sa.text(
+                    f"UPDATE resource_grants t SET requirement = 'required' "
+                    f"WHERE t.group_id = :tgt AND t.{notin} AND EXISTS ("
+                    f"  SELECT 1 FROM resource_grants s "
+                    f"  WHERE s.group_id = :src "
+                    f"    AND s.resource_type = t.resource_type "
+                    f"    AND s.resource_id = t.resource_id "
+                    f"    AND s.requirement = 'required')"
+                ),
+                params,
+            )
+            conn.execute(
+                sa.text(
+                    f"DELETE FROM resource_grants s "
+                    f"WHERE s.group_id = :src AND s.{notin} AND EXISTS ("
+                    f"  SELECT 1 FROM resource_grants t "
+                    f"  WHERE t.group_id = :tgt "
+                    f"    AND t.resource_type = s.resource_type "
+                    f"    AND t.resource_id = s.resource_id)"
+                ),
+                params,
+            )
+            res = conn.execute(
+                sa.text(f"UPDATE resource_grants SET group_id = :tgt WHERE group_id = :src AND {notin}"),
+                params,
+            )
+        return int(res.rowcount or 0)
 
     def delete(self, grant_id: str) -> bool:
         with self._engine.begin() as conn:
@@ -310,67 +516,49 @@ class ResourceGrantsPgRepository:
         return len(rows)
 
     def count_for_group(self, group_id: str) -> int:
+        """Grants this group itself confers.
+
+        Everyone-scoped rows are excluded even though the carrier group holds
+        them: the carrier does not decide their reach, the scope does, and
+        counting them here would report the carrier as the largest grantee on
+        the instance while revoking one of its "grants" would take access
+        away from people who are not its members.
+        """
         with self._engine.connect() as conn:
             row = conn.execute(
-                sa.text("SELECT COUNT(*) FROM resource_grants WHERE group_id = :gid"),
+                sa.text("SELECT COUNT(*) FROM resource_grants WHERE group_id = :gid AND scope IS NULL"),
                 {"gid": group_id},
             ).first()
         return int(row[0]) if row else 0
 
-    def fanout_system_for_group(
+    def count_everyone_scoped(self) -> int:
+        """How many grants reach every account. The counterpart to
+        :meth:`count_for_group` for the audience that is not a group."""
+        with self._engine.connect() as conn:
+            row = conn.execute(
+                sa.text("SELECT COUNT(*) FROM resource_grants WHERE scope = :s"),
+                {"s": SCOPE_EVERYONE},
+            ).first()
+        return int(row[0]) if row else 0
+
+    def list_everyone_scoped(
         self,
-        group_id: str,
-        assigned_by: Optional[str] = None,
-    ) -> int:
-        """Grant every active system marketplace_plugin to ``group_id``.
+        resource_type: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Every grant that reaches all accounts, optionally type-scoped.
 
-        Only plugins with ``is_system=TRUE`` and ``admin_disabled=FALSE`` are
-        granted — a disabled plugin stays hidden instance-wide, so a new group
-        must not inherit a grant that would activate on re-enable. Mirrors the
-        DuckDB sibling and ``fanout_system_for_user``.
-
-        Soft-fail if ``marketplace_plugins`` isn't migrated yet (Phase F
-        in progress). Once that port lands, drop the try/except.
+        The read the Access page needs to render "everyone" as an audience
+        without pretending it is the carrier group.
         """
-        try:
-            with self._engine.connect() as conn:
-                rows = conn.execute(
-                    sa.text(
-                        "SELECT marketplace_id, name FROM marketplace_plugins "
-                        "WHERE is_system = TRUE AND admin_disabled = FALSE"
-                    ),
-                ).all()
-        except Exception:
-            return 0
-
-        inserted = 0
-        for marketplace_id, plugin_name in rows:
-            resource_id = f"{marketplace_id}/{plugin_name}"
-            try:
-                with self._engine.begin() as conn:
-                    result = conn.execute(
-                        sa.text(
-                            """INSERT INTO resource_grants
-                               (id, group_id, resource_type, resource_id, assigned_by)
-                               VALUES (:id, :gid, 'marketplace_plugin', :rid, :ab)
-                               ON CONFLICT ON CONSTRAINT uq_resource_grants_group_type_id
-                                 DO NOTHING"""
-                        ),
-                        {
-                            "id": str(uuid4()),
-                            "gid": group_id,
-                            "rid": resource_id,
-                            "ab": assigned_by,
-                        },
-                    )
-                    # ON CONFLICT DO NOTHING suppresses the duplicate (no
-                    # exception raised), so a pre-existing grant yields
-                    # rowcount 0. Count only real inserts — otherwise the
-                    # diagnostic return value over-reports newly-granted groups
-                    # on every idempotent re-run. Matches the DuckDB sibling,
-                    # which relies on a ConstraintException to skip the bump.
-                    if result.rowcount:
-                        inserted += 1
-            except IntegrityError:
-                continue
-        return inserted
+        params: Dict[str, Any] = {"s": SCOPE_EVERYONE}
+        type_clause = ""
+        if resource_type:
+            type_clause = "AND resource_type = :rtype"
+            params["rtype"] = resource_type
+        sql = f"""SELECT {self._SELECT_COLS}
+                FROM resource_grants
+                WHERE scope = :s {type_clause}
+                ORDER BY resource_type, resource_id"""
+        with self._engine.connect() as conn:
+            rows = conn.execute(sa.text(sql), params).mappings().all()
+        return [dict(r) for r in rows]

@@ -827,6 +827,28 @@ _KEBOOLA_LOGIN_PROJECTS_REASON = (
 )
 
 _EXEMPT: dict[str, str] = {
+    "/api/admin/groups/reach": (
+        "/admin/access's share picker asking how many distinct people the set "
+        "of audiences it currently has ticked would reach — web UI only. Its "
+        "input is the page's own transient state (a selection nobody has "
+        "applied yet), and the number exists to be read beside Apply before "
+        "pressing it. Both other surfaces already answer the durable question "
+        "by a better route: `agnes admin group show` and the MCP group tools "
+        "list a group's members, and a union over a hypothetical set is not a "
+        "thing anyone asks a CLI. It replaced a browser-side union of shipped "
+        "rosters that double-counted (audit E3)."
+    ),
+    "/api/admin/groups/member-search": (
+        "/admin/access's group-list search box answering its own third "
+        "question — 'which groups is this person in?' — for the keystroke "
+        "currently in the box, web UI only. Its input is transient (a partial "
+        "email or name), and the answer is a hint on the rows already on "
+        "screen ('matched Ada Lovelace'). The durable form of the question is "
+        "already served on both other surfaces: `agnes admin user show` and "
+        "the MCP user tools list a person's groups by id. It replaced matching "
+        "against every group's full roster shipped in the overview payload "
+        "(audit S2), which is why the roster no longer ships."
+    ),
     "/api/admin/access/resources/{resource_type}/search": (
         "browser-only admin UI support for the /admin/access per-file grant "
         "picker — the search counterpart to the grandfathered, equally "

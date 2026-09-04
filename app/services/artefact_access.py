@@ -32,7 +32,7 @@ class ArtefactAccessContext:
     shared_ids: Set[str] = field(default_factory=set)
     """Collection ids carrying ANY grant (shared by their owner)."""
     workspace_ids: Set[str] = field(default_factory=set)
-    """Collection ids granted to the ``Everyone`` system group."""
+    """Collection ids reaching every account — an everyone-scoped grant."""
     owner_name: Dict[str, str] = field(default_factory=dict)
     """user_id -> display name, for the owner/"Shared by" columns."""
 
@@ -43,8 +43,8 @@ def build_artefact_access_context(user_id: str) -> ArtefactAccessContext:
     Reads through the ``src.repositories`` factory (never a raw connection)
     so this works identically on the DuckDB and Postgres backends.
     """
-    from src.db import SYSTEM_EVERYONE_GROUP
-    from src.repositories import resource_grants_repo, user_groups_repo, users_repo
+    from src.grant_scopes import carrier_group_id, reaches_everyone
+    from src.repositories import resource_grants_repo, users_repo
 
     ct = ResourceType.COLLECTION.value
     grants_repo = resource_grants_repo()
@@ -57,11 +57,13 @@ def build_artefact_access_context(user_id: str) -> ArtefactAccessContext:
     shared_ids: Set[str] = set()
     workspace_ids: Set[str] = set()
     try:
-        everyone = user_groups_repo().get_by_name(SYSTEM_EVERYONE_GROUP)
-        everyone_id = everyone["id"] if everyone else None
+        # Resolved once for the whole pass rather than per row — see
+        # `reaches_everyone`, which needs the carrier only on the backend
+        # that has no `scope` column.
+        carrier = carrier_group_id()
         for g in grants_repo.list_all(resource_type=ct):
             shared_ids.add(g["resource_id"])
-            if everyone_id and g["group_id"] == everyone_id:
+            if reaches_everyone(g, carrier):
                 workspace_ids.add(g["resource_id"])
     except Exception:
         pass
@@ -114,12 +116,15 @@ VISIBILITY_LABELS: dict[str, str] = {
 def collection_visibility(ctx: ArtefactAccessContext, collection_id: str) -> Tuple[str, str]:
     """``(visibility_key, visibility_label)`` for one collection.
 
-    Mirrors the Everyone-grant convention already used for Slack channels
-    (see ``app/resource_types.py::_slack_channel_blocks``): any grant to the
-    ``Everyone`` group means "published workspace-wide"; any other grant
-    means "shared" (with a specific group); no grant at all means "private".
-    This is independent of ownership — a workspace-published collection you
-    don't own is still "Everyone", not "Specific groups".
+    An everyone-scoped grant means "published workspace-wide"; any other
+    grant means "shared" (with a specific group); no grant at all means
+    "private". This is independent of ownership — a workspace-published
+    collection you don't own is still "Everyone", not "Specific groups".
+
+    It used to be "any grant to the ``Everyone`` group", which was the same
+    answer only while that group held every account — and it did not, on an
+    instance where ``AGNES_GROUP_EVERYONE_EMAIL`` narrowed it. There a
+    collection labelled "Everyone" was visible to a subset.
 
     Labels come from :data:`VISIBILITY_LABELS`; see it for the vocabulary.
     """

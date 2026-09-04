@@ -190,6 +190,27 @@ class ResourceGrant(Base):
     # ``available`` (default) vs ``required`` (must-install for the group).
     # Nullable so legacy rows that predate the column migrate cleanly.
     requirement: Mapped[str | None] = mapped_column(String, nullable=True)
+    # WHICH SURFACE wrote this grant — `assigned_by` answers who, which is a
+    # different question: a Required-plugin fanout stamps every row with the
+    # admin who clicked on another page. One of `src.grant_sources`, or NULL.
+    #
+    # POSTGRES-ONLY (migration 0096_resource_grants_source). The DuckDB
+    # ladder is frozen (A3), so that backend accepts the value and drops it
+    # and the API reports None — which the Access page already renders as an
+    # ordinary grant. NULL is also every pre-existing row: unknown origin,
+    # said out loud rather than backfilled to a guess.
+    source: Mapped[str | None] = mapped_column(String, nullable=True)
+    # WHO this grant reaches — NULL for the members of `group_id` (every
+    # grant written before 0097), 'everyone' for every account on the
+    # instance. An 'everyone' row keeps its `group_id` (the carrier group)
+    # and that column is ignored on read: see 0097's docstring for why it
+    # is not nulled.
+    #
+    # POSTGRES-ONLY (migration 0097), same as `source` above. The DuckDB
+    # sibling accepts the value and drops it; reads that are ABOUT scope
+    # raise RequiresPostgresBackend there rather than silently answering
+    # "this group only".
+    scope: Mapped[str | None] = mapped_column(String, nullable=True)
 
     # --- Per-type FK columns (migration 0013) ---
     # Exactly one of these is non-NULL for each of the 5 typed ResourceTypes;
