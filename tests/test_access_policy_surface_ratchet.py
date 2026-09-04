@@ -1,5 +1,6 @@
 """The access-policy surface ratchet (table access policies design doc §8,
-§23.2; plan Task 13) -- the one acceptance gate for the whole feature.
+§23.2; plan Task 13; issue #2147 backlog item 5) -- the one acceptance gate
+for the whole feature.
 
 Tasks 7-9 wired specific, hand-picked surfaces (``/api/query``, the
 ``table_id``-shaped surfaces, ``/api/v2/schema``) against the resolver in
@@ -12,9 +13,13 @@ would have inherited the blind spot by construction."
 
 So this is a RATCHET, not a list, same shape as ``test_backend_split_guard.py``:
 
-1. Statically scan every ``.py`` file under ``app/api/`` (recursively) and
-   ``app/web/router.py`` for a call to one of the functions that read a
-   *registered table's* rows/columns or the RBAC gate in front of them --
+1. Statically scan every ``.py`` file under ``app/api/`` (recursively),
+   ``app/web/router.py``, ``services/``, ``app/worker/``, ``app/chat/``,
+   ``cli/``, and ``src/`` (excluding ``src/access_policy*.py`` itself --
+   the resolver's own modules, which obviously reference their own target
+   primitives throughout -- and anything under ``tests/``) for a call to
+   one of the functions that read a *registered table's* rows/columns or
+   the RBAC gate in front of them --
    ``can_access_table`` / ``get_accessible_tables`` / ``get_analytics_db_readonly``
    / ``profile_repo`` (table_profiles -- §11's "sharper leak": min/max/
    sample_values/top_values) -- or a raw local-parquet read
@@ -56,7 +61,34 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 # the single `app/web/router.py` file -- web pages elsewhere in `app/web/`
 # render admin/catalog/library chrome, not table row/column data, and are
 # out of this ratchet's stated scope.
-_SCAN_ROOTS = (REPO_ROOT / "app" / "api", REPO_ROOT / "app" / "web" / "router.py")
+#
+# Issue #2147 backlog item 5 widened the scan to every other place a caller
+# principal could plausibly reach a registered table's rows/columns: the
+# standalone services (`services/`), the worker/job-kind surface
+# (`app/worker/`), the chat/agent runtime (`app/chat/`), the analyst CLI
+# (`cli/`), and the rest of the core engine (`src/`) -- the same reasoning
+# that first flagged this file's own blind spot: a hand-picked surface list
+# is exactly the shape that misses a class of surface entirely, not just one
+# member of an already-known class. `src/access_policy*.py` (the resolver's
+# own modules) are excluded from the `src/` scan -- they reference their own
+# target primitives throughout by construction, which would flood this
+# ratchet with matches on the very code THAT IS the enforcement point, not a
+# read surface it protects.
+_SCAN_ROOTS = (
+    REPO_ROOT / "app" / "api",
+    REPO_ROOT / "app" / "web" / "router.py",
+    REPO_ROOT / "services",
+    REPO_ROOT / "app" / "worker",
+    REPO_ROOT / "app" / "chat",
+    REPO_ROOT / "cli",
+    REPO_ROOT / "src",
+)
+
+# Excluded from the `src/` scan root above -- see the comment there. `tests/`
+# is not itself a scan root (never listed in `_SCAN_ROOTS`) so it needs no
+# runtime filter; `src/access_policy*.py` DOES need one, since it lives
+# inside the `src/` root being scanned.
+_EXCLUDED_SRC_MODULE_PREFIX = "access_policy"
 
 # The four RBAC/data-read primitives a route touches on the way to a
 # registered table's rows or columns (src/rbac.py + src/repositories, plus
@@ -101,9 +133,20 @@ def _rel(p: Path) -> str:
 
 def _files_to_scan() -> list[Path]:
     out: list[Path] = []
+    src_root = REPO_ROOT / "src"
     for root in _SCAN_ROOTS:
         if root.is_dir():
-            out.extend(sorted(root.rglob("*.py")))
+            for path in sorted(root.rglob("*.py")):
+                # The resolver's own modules (src/access_policy.py,
+                # src/access_policy_validate.py, ...) reference their own
+                # target primitives throughout -- see _SCAN_ROOTS's comment.
+                if (
+                    root == src_root
+                    and path.parent == src_root
+                    and path.stem.startswith(_EXCLUDED_SRC_MODULE_PREFIX)
+                ):
+                    continue
+                out.append(path)
         else:
             out.append(root)
     return out
@@ -463,6 +506,95 @@ EXEMPT: frozenset[str] = frozenset(
         # to REGISTERED tables; this path creates one that was never
         # registered in the first place.
         "app/api/chat_uploads.py::_register_workspace_table",
+        # ── issue #2147 backlog item 5: the expanded scan roots
+        # (services/, app/worker/, app/chat/, cli/, src/) ────────────────
+        # `agnes admin autodoc-tables` -- a local, operator-run typer CLI
+        # command with no HTTP layer, no principal, and no RBAC gate at all
+        # (the operator already has direct filesystem/DB access to the
+        # instance). It reads `profile_repo()`'s stored sample rows/stats to
+        # ask an LLM for a description -- the same admin-authoring posture
+        # as `app/api/admin.py::_policy_builder_describe`/
+        # `policy_builder_columns` above, just reached from the CLI instead
+        # of the admin web UI.
+        "cli/commands/admin_autodoc.py::autodoc_tables",
+        # `agnes snapshot create` -- client-side CLI, runs on the ANALYST'S
+        # OWN machine. Fetches through `/api/v2/scan` (COVERED,
+        # `app/api/v2_scan.py::run_scan`) first; this function only writes
+        # the ALREADY-POLICY-FILTERED result to a local parquet and
+        # registers a LOCAL DuckDB view over it. Enforcement already
+        # happened server-side by the time this code runs.
+        "cli/commands/snapshot.py::_create_snapshot",
+        # `agnes pull` -- client-side CLI, same "already enforced server-side"
+        # shape as the snapshot command above: these three functions rebuild
+        # LOCAL DuckDB views over parquets `agnes pull` already downloaded
+        # under the caller's own RBAC-filtered manifest. The distribution
+        # interlock (Task 4) guarantees a CURRENTLY-policied table is never
+        # `local`/`materialized` distributed, so there is nothing policied to
+        # read here in the first place (the same reasoning the surface
+        # ratchet's own bottom-of-file note already applies to
+        # `cli/mcp/server.py`'s local execution path).
+        "cli/lib/pull.py::_rebuild_duckdb_views",
+        "cli/lib/pull.py::_register_snapshot_views",
+        "cli/lib/pull.py::_register_stack_views",
+        # `src/claude_md.py` renders the analyst-workspace CLAUDE.md prompt.
+        # `_list_tables` returns only catalog-card metadata (name,
+        # description, query_mode, source_type) gated by the SAME
+        # `get_accessible_tables` stack gate as `app/api/catalog.py::
+        # list_catalog_tables` above -- never a row or a column list, same
+        # §10.1 aggregate-metadata precedent.
+        "src/claude_md.py::_list_tables",
+        # `_metrics_summary` returns a metric COUNT and CATEGORY list, gated
+        # by the same stack check `app/api/metrics.py::list_metrics` already
+        # covers as EXEMPT above -- never a metric's SQL, let alone a row.
+        "src/claude_md.py::_metrics_summary",
+        # `get_ducklake_write`'s docstring PROSE describes the writer's
+        # `CREATE OR REPLACE TABLE ... AS SELECT * FROM read_parquet(...)`
+        # shape -- the `read_parquet(` substring the scanner matches lives
+        # entirely inside this function's own triple-quoted docstring, not
+        # in any statement its body executes (the function only opens/
+        # attaches connections). A scanner false-positive, not a read
+        # surface -- see the module's docstring for where the real DuckLake
+        # write path lives.
+        "src/ducklake_session.py::get_ducklake_write",
+        # `ingest_tabular` converts an uploaded collection file into a new
+        # extract.duckdb + parquet. The `read_parquet(...)` COUNT(*) probe
+        # runs on the freshly-written temp parquet BEFORE `table_registry_
+        # repo().register(...)` is ever called a few lines later -- the
+        # table_id does not exist in the registry yet at the point this scan
+        # root's detector fires, so no access policy could possibly be
+        # attached to it. Same "creates a table that was never registered in
+        # the first place" shape as `app/api/chat_uploads.py::
+        # _register_workspace_table` above.
+        "src/ingest/tabular.py::ingest_tabular",
+        # `SyncOrchestrator._attach_and_create_views` -- ATTACHes each
+        # source's `extract.duckdb` and creates the RAW master views
+        # themselves: the exact `SELECT * FROM <name>` base view every
+        # `policied_relation` PASSTHROUGH (no policy, or admin bypass)
+        # reads FROM. Runs as the service/scheduler identity with no caller
+        # principal at all, and returns nothing to any HTTP caller -- the
+        # same writes-only shape as `app/api/sync.py::_run_sync` above, one
+        # level closer to the storage engine.
+        "src/orchestrator.py::_attach_and_create_views",
+        # `profile_table` -- the scheduler's profiling pass, run over the
+        # raw physical parquet with no caller/principal parameter at all. It
+        # WRITES min/max/sample_values/top_values stats to the profile
+        # store for later, RBAC- and policy-gated reads (`app/api/
+        # catalog.py::get_table_profile`/`refresh_profile`, COVERED above);
+        # it returns nothing to any HTTP caller itself -- the same
+        # writes-only shape as `app/api/sync.py::_run_sync`.
+        "src/profiler.py::profile_table",
+        # `src/rbac.py::require_table_access` -- a thin `can_access_table`-
+        # or-403 convenience wrapper. Its one call site
+        # (`app/api/query.py::execute_query`'s internal-table short-circuit,
+        # already COVERED above) gates access to the SEEDED system tables
+        # (`agnes_sessions`/`agnes_usage`/`agnes_audit`) that live in
+        # system.duckdb and are never rows in `table_registry` -- access
+        # policies attach only to a REGISTERED table_id, so none of these
+        # three can ever carry one. This helper itself returns no table
+        # content (raises 403, or returns None) and runs before the same
+        # handler's `rewrite_sql` step for the SQL that actually can be
+        # policied.
+        "src/rbac.py::require_table_access",
         # ── internal helper, not itself an HTTP route: named "uncached",
         # skips RBAC by its own docstring ("Skips RBAC and cache-hit
         # short-circuit -- call only from contexts where those are

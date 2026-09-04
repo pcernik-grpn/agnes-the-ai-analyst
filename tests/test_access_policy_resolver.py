@@ -3,9 +3,22 @@ enforcement point (Tasks 6-12: SQL rewrite, table_id surfaces, BigQuery,
 disclosure, caches) binds against (table access policies design doc §5,
 §6, §12).
 
-Direct-repository level (no HTTP client, no admin token) -- this module
-tests the resolver's own contract, not the admin write path (that is Task
-4's ``tests/test_journey_access_policy_interlock.py``).
+Mostly direct-repository level (no HTTP client, no admin token) -- this
+module tests the resolver's own contract, not the admin write path (that is
+Task 4's ``tests/test_journey_access_policy_interlock.py``).
+
+``TestEndToEndDuckDbPathResolutionRefusal`` at the bottom is the one
+exception (issue #2147 backlog item 5): the BigQuery arm's fail-closed
+contract has an end-to-end HTTP test
+(``tests/test_access_policy_bigquery.py``'s ``TestFailClosedOnBigQuery
+ExecutionFailure``), and the Databricks arm's ``_PolicyResolutionFailed``/
+``_table_is_registered`` machinery has one too
+(``tests/test_databricks_scan_and_policies.py``) -- but neither engine
+matters for a plain ``query_mode='local'`` table, which is the DEFAULT,
+most common shape and takes ``rewrite_sql``'s ``dialect="duckdb"`` path
+with no remote-engine wrapper in front of ``policied_relation`` at all.
+That class drives ``/api/query`` end to end to pin the same fail-closed
+contract there too.
 """
 
 import pytest
@@ -474,4 +487,87 @@ class TestRewriteThroughTheRealResolver:
             "WITH totals AS (SELECT 1 AS n) SELECT * FROM totals", policy_env["solo_user"]
         )
         assert policied_ids == []
-        assert params == {}
+
+
+class TestEndToEndDuckDbPathResolutionRefusal:
+    """Issue #2147 backlog item 5 -- see the module docstring. The fail-
+    closed contract (#1979: a resolution REFUSAL, distinct from "no such
+    table", must never fall back to the raw unfiltered view) is already
+    pinned end to end for the BigQuery remote arm
+    (``tests/test_access_policy_bigquery.py``) and the Databricks remote arm
+    (``tests/test_databricks_scan_and_policies.py``). This class pins the
+    SAME contract for the path every plain ``query_mode='local'`` table
+    takes: ``rewrite_sql``'s default ``dialect="duckdb"``, no remote-engine
+    resolver wrapper in front of ``policied_relation`` at all.
+    """
+
+    @pytest.fixture
+    def duckdb_path_env(self, seeded_app, mock_extract_factory):
+        """A granted, non-admin analyst and a ``server_only``, purely-local
+        table -- registered with no policy yet, so the RBAC/sync plumbing is
+        set up before the test attaches the body that will be refused."""
+        from app.auth.jwt import create_access_token
+        from src.db import get_system_db
+        from src.orchestrator import SyncOrchestrator
+        from src.repositories.table_registry import TableRegistryRepository
+        from src.repositories.users import UserRepository
+        from tests.conftest import grant_table_via_package
+
+        env = seeded_app["env"]
+        mock_extract_factory(
+            "keboola", [{"name": "invoices", "data": [{"id": "1", "owner_email": "alice@example.com"}]}]
+        )
+        SyncOrchestrator(analytics_db_path=env["analytics_db"]).rebuild()
+
+        conn = get_system_db()
+        try:
+            UserRepository(conn).create(id="u_duckdb_path", email="duckdb-path@example.com", name="DuckDB Path")
+            TableRegistryRepository(conn).register(
+                id="invoices",
+                name="invoices",
+                source_type="keboola",
+                query_mode="local",
+                server_only=True,
+            )
+            grant_table_via_package(conn, "invoices", "u_duckdb_path")
+        finally:
+            conn.close()
+
+        return {
+            **seeded_app,
+            "token": create_access_token("u_duckdb_path", "duckdb-path@example.com"),
+        }
+
+    def test_resolution_refusal_denies_with_500_policy_error_and_no_rows(self, duckdb_path_env):
+        """A body the save-time validator would never have accepted --
+        written straight to the registry here, matching every other
+        ``set_access_policy`` fixture in this file -- refused by the SAME
+        read-time pattern-position guard ``TestPatternPositionVariableRejected``
+        exercises directly against the resolver, now proven through the live
+        HTTP surface every non-admin caller of a local table actually uses."""
+        from src.db import get_system_db
+        from src.repositories.table_registry import TableRegistryRepository
+
+        conn = get_system_db()
+        try:
+            TableRegistryRepository(conn).set_access_policy(
+                "invoices",
+                sql="SELECT * FROM invoices WHERE owner_email LIKE $user_email",
+                note="hand-edited, never validated",
+                updated_by="admin",
+            )
+        finally:
+            conn.close()
+
+        c = duckdb_path_env["client"]
+        r = c.post(
+            "/api/query",
+            json={"sql": "SELECT * FROM invoices"},
+            headers={"Authorization": f"Bearer {duckdb_path_env['token']}"},
+        )
+
+        assert r.status_code == 500, r.text
+        body = r.json()
+        assert body["detail"]["reason"] == "policy_error"
+        assert body["detail"]["table"] == "invoices"
+        assert "rows" not in body, "an error response must never carry a rows key"
