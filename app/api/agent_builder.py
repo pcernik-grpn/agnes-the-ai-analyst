@@ -400,9 +400,9 @@ def _stub_turn(message: str, config: Dict[str, Any], knowledge: List[Dict[str, A
         first = still_open[0].label if still_open else None
         return {
             "reply": (
-                f"[stub] Let's build an agent. First thing I need: {first}."
+                f"Let's build an agent. First thing I need: {first}."
                 if first
-                else "[stub] Let's build an agent. Tell me what it should do."
+                else "Let's build an agent. Tell me what it should do."
             ),
             "patch": {},
             "suggestions": [],
