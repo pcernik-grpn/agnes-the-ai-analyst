@@ -1656,13 +1656,13 @@ class GraphTransport:
 
 
 def convert_to_markdown(path: Path, mime: str) -> Any:
-    """``connectors.sharepoint.convert.convert_to_markdown`` — the seam.
+    """``src.ingest.convert.convert_to_markdown`` — the seam.
 
     Returns that module's ``ConvertResult`` (``.markdown``, ``.engine``).
     An ``ImportError`` propagates: with no converter there is nothing to
     ingest, so the run fails clean rather than silently indexing nothing.
     """
-    from connectors.sharepoint.convert import convert_to_markdown as _convert
+    from src.ingest.convert import convert_to_markdown as _convert
 
     return _convert(path, mime)
 
@@ -3797,6 +3797,8 @@ def _item_timeout_seconds() -> int:
         return max(0, int(raw))
     except (TypeError, ValueError):
         return _DEFAULT_ITEM_TIMEOUT_S
+
+
 def _max_converted_output_bytes() -> int:
     """``extraction.crawler.max_converted_mb``, resolved to bytes — see
     :data:`_DEFAULT_MAX_CONVERTED_MB`. 0 disables the cap."""
@@ -4119,7 +4121,7 @@ async def _run_crawl_async(
     # spend. Import guarded: the module is import-light, but a broken
     # optional install must degrade to "no OCR accounting", not a dead crawl.
     try:
-        from connectors.sharepoint import scan_ocr as _scan_ocr
+        from src.ingest import scan_ocr as _scan_ocr
 
         _scan_ocr.reset_run_usage()
     except Exception:  # noqa: BLE001
