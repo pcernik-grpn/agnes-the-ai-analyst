@@ -1,0 +1,321 @@
+<meta charset="utf-8">
+<title>Data sources of two kinds — mock</title>
+<!-- Companion to 2026-09-03-data-sources-two-kinds-design-note.md. Static
+     mock, no product code; the numbers are illustrative. -->
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap">
+<style>
+  :root {
+    --bg: #F3F4F7; --surface: #FFFFFF; --band: #F5F6F9; --sunken: #EEF0F4; --border: #E2E5EB;
+    --ink: #0F172A; --ink-2: #334155; --muted: #64748B;
+    --primary: #2F6BD8; --primary-ink: #FFFFFF;
+    --warn-bg: #FFF4E0; --warn-ink: #B45309; --warn-line: #F3D9A6;
+    --ok-bg: #E7F6EE; --ok-ink: #15803D; --ok-line: #BFE6CF;
+    --bad-bg: #FDECEC; --bad-ink: #B42318; --bad-line: #F5C2C0;
+    --kb-bg: #E0F2F1; --kb-ink: #0F766E; --sp-bg: #FFF1DC; --sp-ink: #9A5B00;
+    --note-bg: #FFFBEB; --note-line: #F1E1A6; --note-ink: #7C5A00;
+    --mark: #2F6BD8; --shadow: 0 1px 2px rgba(15, 23, 42, 0.06);
+    --font: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0F1319; --surface: #171C24; --band: #1C222B; --sunken: #232A34; --border: #2B333E;
+      --ink: #EEF2F7; --ink-2: #C9D1DC; --muted: #8B97A7; --primary: #5B8DEB; --primary-ink: #0B1220;
+      --warn-bg: #3A2A10; --warn-ink: #F3C46B; --warn-line: #5A4520;
+      --ok-bg: #12301F; --ok-ink: #7BD39A; --ok-line: #1F4A31;
+      --bad-bg: #3B1717; --bad-ink: #F19A93; --bad-line: #5A2424;
+      --kb-bg: #113533; --kb-ink: #6FD3C8; --sp-bg: #3A2A10; --sp-ink: #F3C46B;
+      --note-bg: #2A2410; --note-line: #4A3F1A; --note-ink: #F0D68A; --mark: #5B8DEB; --shadow: none;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0F1319; --surface: #171C24; --band: #1C222B; --sunken: #232A34; --border: #2B333E;
+    --ink: #EEF2F7; --ink-2: #C9D1DC; --muted: #8B97A7; --primary: #5B8DEB; --primary-ink: #0B1220;
+    --warn-bg: #3A2A10; --warn-ink: #F3C46B; --warn-line: #5A4520;
+    --ok-bg: #12301F; --ok-ink: #7BD39A; --ok-line: #1F4A31;
+    --bad-bg: #3B1717; --bad-ink: #F19A93; --bad-line: #5A2424;
+    --kb-bg: #113533; --kb-ink: #6FD3C8; --sp-bg: #3A2A10; --sp-ink: #F3C46B;
+    --note-bg: #2A2410; --note-line: #4A3F1A; --note-ink: #F0D68A; --mark: #5B8DEB; --shadow: none;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--font); font-size: 13px; line-height: 1.45; }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 36px 24px 80px; }
+  .intro { max-width: 72ch; margin-bottom: 28px; }
+  .intro h1 { font-size: 24px; font-weight: 700; letter-spacing: -0.015em; margin: 0 0 8px; text-wrap: balance; }
+  .intro p { margin: 0 0 8px; color: var(--ink-2); font-size: 14px; }
+  .intro .eyebrow { font-size: 11px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); margin-bottom: 8px; }
+  .digest { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin: 0 0 40px; }
+  @media (max-width: 900px) { .digest { grid-template-columns: 1fr; } }
+  .dg { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px; }
+  .dg h3 { margin: 0 0 8px; font-size: 12px; font-weight: 700; letter-spacing: 0.05em; text-transform: uppercase; }
+  .dg--keep h3 { color: var(--ok-ink); } .dg--change h3 { color: var(--warn-ink); } .dg--cut h3 { color: var(--bad-ink); }
+  .dg ul { margin: 0; padding-left: 16px; color: var(--ink-2); font-size: 12.5px; }
+  .dg li { margin-bottom: 5px; } .dg li b { color: var(--ink); font-weight: 600; }
+  .fig { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 24px; align-items: start; margin-bottom: 48px; }
+  @media (max-width: 900px) { .fig { grid-template-columns: 1fr; } }
+  .fig__label { grid-column: 1 / -1; display: flex; align-items: baseline; gap: 10px; margin-bottom: -8px; }
+  .fig__label h2 { font-size: 15px; font-weight: 700; margin: 0; } .fig__label span { color: var(--muted); font-size: 12.5px; }
+  .frame { background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 22px 24px 20px; box-shadow: var(--shadow); overflow-x: auto; position: relative; }
+  .frame--tight { padding: 18px 20px 16px; }
+  .notes { display: flex; flex-direction: column; gap: 10px; position: sticky; top: 16px; }
+  .note { display: grid; grid-template-columns: 22px 1fr; gap: 10px; align-items: start; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; font-size: 12.5px; color: var(--ink-2); }
+  .note b { color: var(--ink); font-weight: 600; }
+  .mk { display: inline-flex; align-items: center; justify-content: center; width: 20px; height: 20px; border-radius: 50%; background: var(--mark); color: #fff; font-size: 11px; font-weight: 700; flex: 0 0 auto; }
+  .mk--in { width: 18px; height: 18px; font-size: 10.5px; margin-right: 8px; vertical-align: -3px; }
+  .pg { min-width: 700px; position: relative; }
+  .pg-title { font-size: 22px; font-weight: 700; margin: 0 0 4px; letter-spacing: -0.01em; }
+  .pg-lede { margin: 0; color: var(--muted); font-size: 13px; max-width: 68ch; }
+  .pg-lede a { color: var(--ink-2); text-decoration: underline; text-underline-offset: 2px; }
+  .pg-lede .new { background: var(--note-bg); border-bottom: 2px solid var(--note-line); color: var(--note-ink); padding: 0 2px; }
+  .tabs { display: flex; align-items: center; gap: 6px; border-bottom: 1px solid var(--border); margin: 16px 0 18px; font-size: 13px; font-weight: 500; color: var(--muted); }
+  .tab { padding: 8px 10px 10px; border-bottom: 2px solid transparent; margin-bottom: -1px; }
+  .tab.on { color: var(--ink); font-weight: 600; border-bottom-color: var(--ink); }
+  .tabs .arr { color: var(--muted); font-size: 12px; } .tabs .brk { width: 1px; height: 18px; background: var(--border); margin: 0 12px; }
+  .sechead { display: flex; align-items: baseline; gap: 10px; margin: 0 0 12px; }
+  .sechead h3 { margin: 0; font-size: 15px; font-weight: 600; } .sechead .cnt { color: var(--muted); font-size: 12.5px; } .sechead .end { margin-left: auto; }
+  .btn { display: inline-flex; align-items: center; gap: 6px; padding: 7px 13px; border-radius: 9px; border: 1px solid var(--border); background: var(--surface); color: var(--ink); font: inherit; font-size: 12.5px; font-weight: 600; }
+  .btn--primary { background: var(--primary); border-color: var(--primary); color: var(--primary-ink); } .btn--sm { padding: 5px 10px; font-size: 12px; }
+  .chev::after { content: "⌄"; font-size: 12px; margin-left: 2px; color: var(--muted); position: relative; top: -2px; }
+  .band { display: flex; align-items: center; gap: 10px; padding: 10px 14px; background: var(--band); border: 1px solid var(--border); border-radius: 10px; margin: 18px 0 10px; }
+  .band:first-of-type { margin-top: 0; }
+  .band .caret { width: 16px; height: 16px; color: var(--muted); display: inline-flex; align-items: center; justify-content: center; font-size: 11px; }
+  .band .t { font-weight: 600; font-size: 13.5px; letter-spacing: 0.01em; } .band .n { font-size: 12.5px; color: var(--muted); font-variant-numeric: tabular-nums; } .band .h { margin-left: 4px; font-size: 12px; color: var(--muted); }
+  .card { border: 1px solid var(--border); border-radius: 12px; background: var(--surface); box-shadow: var(--shadow); margin-bottom: 10px; overflow: hidden; }
+  .card.ghost { opacity: 0.55; border-style: dashed; box-shadow: none; }
+  .head { display: flex; align-items: center; gap: 12px; padding: 12px 14px; }
+  .logo { width: 32px; height: 32px; border-radius: 9px; display: inline-flex; align-items: center; justify-content: center; font-size: 11.5px; font-weight: 800; letter-spacing: 0.02em; flex: 0 0 auto; }
+  .logo--kb { background: var(--kb-bg); color: var(--kb-ink); } .logo--sp { background: var(--sp-bg); color: var(--sp-ink); }
+  .id { min-width: 0; flex: 1 1 auto; }
+  .name { font-size: 14px; font-weight: 700; letter-spacing: -0.01em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .sub { margin-top: 2px; font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .sub code { font-family: var(--mono); font-size: 11px; color: var(--ink-2); background: var(--sunken); padding: 1px 5px; border-radius: 4px; }
+  .health { display: inline-flex; align-items: center; gap: 6px; font-size: 11.5px; font-weight: 700; white-space: nowrap; padding: 3px 10px; border-radius: 999px; border: 1px solid transparent; }
+  .health::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+  .health.ok { background: var(--ok-bg); color: var(--ok-ink); border-color: var(--ok-line); }
+  .health.warn { background: var(--warn-bg); color: var(--warn-ink); border-color: var(--warn-line); }
+  .health.link { text-decoration: underline; text-underline-offset: 2px; cursor: pointer; } .health.link::after { content: "›"; font-size: 12px; }
+  .acts { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; }
+  .caretbtn { width: 26px; height: 26px; border-radius: 999px; display: inline-flex; align-items: center; justify-content: center; color: var(--muted); font-size: 13px; }
+  .pipe { display: grid; grid-template-columns: repeat(4, 1fr); border-top: 1px solid var(--border); background: var(--band); }
+  .cell { padding: 9px 14px; border-right: 1px solid var(--border); } .cell:last-child { border-right: none; }
+  .k { display: block; font-size: 10px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); margin-bottom: 2px; }
+  .v { font-size: 12.5px; font-weight: 600; color: var(--ink); font-variant-numeric: tabular-nums; } .v.ok { color: var(--ok-ink); }
+  .v a { color: var(--ink); text-decoration: underline; text-underline-offset: 2px; }
+  .foot { margin-top: 14px; color: var(--muted); font-size: 12px; max-width: 80ch; }
+  .tblwrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 10px; }
+  .tbl { width: 100%; min-width: 860px; border-collapse: collapse; font-size: 12.5px; table-layout: fixed; }
+  .tbl th { text-align: left; font-size: 10.5px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); padding: 8px 10px; border-bottom: 1px solid var(--border); background: var(--band); }
+  .tbl td { padding: 9px 10px; border-bottom: 1px solid var(--border); vertical-align: middle; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-variant-numeric: tabular-nums; }
+  .tbl tr:last-child td { border-bottom: none; }
+  .tbl td a.lnk { color: var(--ink); font-weight: 600; text-decoration: none; } .tbl td a.act { color: var(--primary); font-weight: 600; text-decoration: none; }
+  .tbl tr.groupband td { background: var(--band); padding: 8px 10px; font-weight: 600; color: var(--ink); } .tbl tr.groupband td .n { font-weight: 500; color: var(--muted); margin-left: 8px; }
+  .tbl tr.dim td { color: var(--muted); font-size: 12px; text-align: center; white-space: normal; }
+  .logo.mini { width: 20px; height: 20px; font-size: 9px; border-radius: 6px; vertical-align: middle; margin-right: 4px; }
+  .num { color: var(--warn-ink); font-weight: 600; text-decoration: underline; text-underline-offset: 2px; }
+  .two { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; } @media (max-width: 900px) { .two { grid-template-columns: 1fr; } }
+  .callout { background: var(--note-bg); border: 1px solid var(--note-line); color: var(--note-ink); border-radius: 10px; padding: 10px 14px; font-size: 12.5px; margin-top: 10px; }
+  .risk { background: var(--bad-bg); border: 1px solid var(--bad-line); color: var(--bad-ink); border-radius: 10px; padding: 10px 14px; font-size: 12.5px; margin-top: 10px; }
+</style>
+
+<div class="wrap">
+  <div class="intro">
+    <div class="eyebrow">Design note mock · /admin/data-sources</div>
+    <h1>Sources in two bands, collections as a lens of their own</h1>
+    <p>Third version, reworked after five independent review passes (information architecture, admin-persona walkthrough, design-system consistency, simplicity, Library coherence). Numbers are illustrative of one production instance: 8 SharePoint connections, 1 Keboola project, ~390 collections, ~250k files.</p>
+  </div>
+
+  <div class="digest">
+    <div class="dg dg--keep">
+      <h3>Kept (agreed by 4–5 of 5)</h3>
+      <ul>
+        <li><b>Rewrite the lede</b> — it names only table sources today.</li>
+        <li><b>Sort table sources first.</b> The table card is last only because of <code>ORDER BY name</code>.</li>
+        <li><b>Bands "Table sources / File sources"</b>, only when both kinds exist; hint = one clause, no links.</li>
+        <li><b>A Collections lens</b> — the data view Access lacks: source, file state, facts.</li>
+      </ul>
+    </div>
+    <div class="dg dg--change">
+      <h3>Changed since v2</h3>
+      <ul>
+        <li><b>The strip keeps its arrows.</b> The new lens goes past the break, like Semantic sources.</li>
+        <li><b>"Files" → "Collections".</b> The Library section is <i>Artefacts</i>; Access, wizard and card say Collections.</li>
+        <li><b>"Document sources" → "File sources".</b> Collides with Semantic sources' own gloss.</li>
+        <li><b>The amber badge is a link.</b> Today it is a plain span.</li>
+        <li><b>"Who can see it" lives in Access.</b> The lens shows a chip and opens the existing Share dialog.</li>
+      </ul>
+    </div>
+    <div class="dg dg--cut">
+      <h3>Dropped</h3>
+      <ul>
+        <li><b>Single-file view</b> — the collection's Library page already has status chips and Re-ingest.</li>
+        <li><b>Picker grouping</b> — a group of one is a label.</li>
+        <li><b>"Scope" outside the wizard</b> — means audience one tab away.</li>
+        <li><b>Ontology link from a hint</b> — the page has no nav home to paper over.</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="fig">
+    <div class="fig__label"><h2>A · Sources after the change</h2><span>9 sources, one instance</span></div>
+    <div class="frame">
+      <div class="pg">
+        <h1 class="pg-title">Data</h1>
+        <p class="pg-lede"><span class="mk mk--in">1</span>Where the data comes from — <span class="new">the projects and warehouses this instance pulls tables from, and the document libraries it indexes into collections</span> — and how both reach people. Looking to connect an MCP server instead? See <a>MCP sources</a>.</p>
+        <div class="tabs">
+          <span class="mk mk--in" style="margin-right:4px">2</span>
+          <span class="tab on">Sources</span><span class="arr">→</span>
+          <span class="tab">Tables</span><span class="arr">→</span>
+          <span class="tab">Data packages</span>
+          <span class="brk"></span>
+          <span class="tab">Collections</span>
+          <span class="tab">Semantic sources</span>
+        </div>
+        <div class="sechead"><h3>Connected sources</h3><span class="cnt">9 sources</span><span class="end"><span class="btn btn--primary">+ Add source</span></span></div>
+
+        <div class="band"><span class="mk mk--in">3</span><span class="caret">▾</span><span class="t">Table sources</span><span class="n">1</span><span class="h">Warehouses and projects; what they register is in Tables.</span></div>
+        <div class="card">
+          <div class="head">
+            <span class="logo logo--kb">KB</span>
+            <div class="id"><div class="name">Production</div><div class="sub"><code>connection.example.com</code> · Analytics – PROD · project 1234</div></div>
+            <span class="health ok">Healthy</span>
+            <div class="acts"><span class="btn btn--sm chev">Actions</span><span class="caretbtn">›</span></div>
+          </div>
+          <div class="pipe">
+            <div class="cell"><span class="k">Tables</span><span class="v">28 registered</span></div>
+            <div class="cell"><span class="k">Sync</span><span class="v ok">✓ 9 min ago</span></div>
+            <div class="cell"><span class="k">Semantic layer health</span><span class="v ok">✓ 27 metrics · 36 terms</span></div>
+            <div class="cell"><span class="k">Feeds</span><span class="v">2 packages → everyone</span></div>
+          </div>
+        </div>
+
+        <div class="band"><span class="caret">▾</span><span class="t">File sources</span><span class="n">8</span><span class="h">Document libraries; what they index lands in Collections.</span></div>
+        <div class="card">
+          <div class="head">
+            <span class="logo logo--sp">SP</span>
+            <div class="id"><div class="name">Corp SharePoint</div><div class="sub"><code>a1b2c3d4…</code> · 2 folders · HQ-Clients</div></div>
+            <span class="health ok">Healthy</span>
+            <div class="acts"><span class="btn btn--primary btn--sm">Manage scopes</span><span class="btn btn--sm chev">Actions</span><span class="caretbtn">›</span></div>
+          </div>
+          <div class="pipe">
+            <div class="cell"><span class="k">Crawl</span><span class="v">2 392 documents</span></div>
+            <div class="cell"><span class="k">Extraction</span><span class="v">2 391 indexed · <a>1 needs review</a></span></div>
+            <div class="cell"><span class="k">Facts → graph</span><span class="v">14 074 facts · 14 613 edges</span></div>
+            <div class="cell"><span class="k">Collections</span><span class="v"><a>2</a> · shared with 2 groups</span></div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="head">
+            <span class="logo logo--sp">SP</span>
+            <div class="id"><div class="name">Clients · Other (non-PE)</div><div class="sub"><code>a1b2c3d4…</code> · 178 folders · 178 sites</div></div>
+            <span class="mk mk--in" style="margin-right:2px">4</span><span class="health warn link">178 collections shared with nobody</span>
+            <div class="acts"><span class="btn btn--primary btn--sm">Manage scopes</span><span class="btn btn--sm chev">Actions</span><span class="caretbtn">›</span></div>
+          </div>
+          <div class="pipe">
+            <div class="cell"><span class="k">Crawl</span><span class="v">26 963 documents</span></div>
+            <div class="cell"><span class="k">Extraction</span><span class="v">26 940 indexed · <a>23 need review</a></span></div>
+            <div class="cell"><span class="k">Facts → graph</span><span class="v">47 529 facts · 44 851 edges</span></div>
+            <div class="cell"><span class="k">Collections</span><span class="v"><a>178</a> · <a class="num">178 shared with nobody</a></span></div>
+          </div>
+        </div>
+        <div class="card ghost">
+          <div class="head">
+            <span class="logo logo--sp">SP</span>
+            <div class="id"><div class="name">Clients · Private Equity 1/6 … 6/6</div><div class="sub">six more cards of the same shape — elided in the mock</div></div>
+            <div class="acts"><span class="caretbtn">›</span></div>
+          </div>
+        </div>
+        <div class="foot">Google Workspace is not in this list — neither of its roles produces tables or collections here. As the <b>identity provider</b> it produces people (<a>Access</a>); as the <b>Drive, Gmail &amp; Calendar connector</b> it runs in each analyst's own session — its OAuth client lives in <a>Instance secrets</a>.</div>
+      </div>
+    </div>
+    <div class="notes">
+      <div class="note"><span class="mk">1</span><div><b>The lede tells the truth.</b> One sentence, both kinds, no vendor names. Nobody reads it, but today it is false.</div></div>
+      <div class="note"><span class="mk">2</span><div><b>Strip: arrows stay, Collections past the break.</b> "Sources → Tables → Data packages" is true for tables; Collections and Semantic sources sit past the divider, "reachable from the same strip, visibly not part of the sentence" (the admin_nav.py comment). A tabs entry without <code>chain</code>; no template change.</div></div>
+      <div class="note"><span class="mk">3</span><div><b>Band = the Library/Access group header.</b> Title · count · one clause of hint without links (the component owns layout, not vocabulary). Collapse persists via <code>data-sec-toggle</code>. Drawn only when both kinds exist; otherwise just the sort.</div></div>
+      <div class="note"><span class="mk">4</span><div><b>The amber badge is a link.</b> Today it is a <code>&lt;span&gt;</code> — an alarm with no target, after which the admin expands eight cards and Ctrl-F's 178 rows. It opens <code>Collections?source=…&amp;sharing=nobody</code>; until the lens exists, the connection's wizard on its Share step. "Shared with nobody" is Access's word.</div></div>
+      <div class="note"><span class="mk">·</span><div><b>"Scope collections" leaves the card body.</b> 178 clickable rows that open the wizard become a Collections cell in the strip: a count and a link into the lens filtered to this source.</div></div>
+      <div class="note"><span class="mk">·</span><div><b>Extraction says what needs attention.</b> "23 need review" links to <code>/library/{slug}?status=needs_review</code>, where the reason and Re-ingest already are. Review queue (facts) stops being mistaken for "failed files".</div></div>
+    </div>
+  </div>
+
+  <div class="fig">
+    <div class="fig__label"><h2>B · The Collections lens</h2><span>/admin/collections — what the document sources brought in, grouped by source</span></div>
+    <div class="frame">
+      <div class="pg">
+        <h1 class="pg-title">Data</h1>
+        <p class="pg-lede">What your document sources brought in — the collections analysts see in their Library, and who can see each.</p>
+        <div class="tabs">
+          <span class="tab">Sources</span><span class="arr">→</span><span class="tab">Tables</span><span class="arr">→</span><span class="tab">Data packages</span>
+          <span class="brk"></span><span class="tab on">Collections</span><span class="tab">Semantic sources</span>
+        </div>
+        <div class="sechead">
+          <h3>Collections</h3><span class="cnt">392 · <span class="health warn" style="padding:1px 8px">390 shared with nobody</span></span>
+          <span class="end"><span class="btn btn--sm">Source: all ⌄</span> <span class="btn btn--sm">Sharing: all ⌄</span> <span class="btn btn--sm">Search…</span></span>
+        </div>
+        <div class="tblwrap">
+        <table class="tbl">
+          <colgroup><col style="width:32%"><col style="width:16%"><col style="width:9%"><col style="width:13%"><col style="width:9%"><col style="width:13%"><col style="width:8%"></colgroup>
+          <thead><tr><th>Collection</th><th>Source</th><th>Files</th><th>Needs attention</th><th>Facts</th><th>Sharing</th><th></th></tr></thead>
+          <tbody>
+            <tr class="groupband"><td colspan="7">Corp SharePoint <span class="n">2 collections</span></td></tr>
+            <tr><td><a class="lnk">Corp SharePoint: Clients / Alpha Holdings</a></td><td><span class="logo logo--sp mini">SP</span>Corp SharePoint</td><td>1 204</td><td><a class="num">1 needs review</a></td><td>7 015</td><td><span class="health ok">2 groups</span></td><td><a class="act">Share…</a></td></tr>
+            <tr><td><a class="lnk">Corp SharePoint: Clients / Beta Advisory</a></td><td><span class="logo logo--sp mini">SP</span>Corp SharePoint</td><td>1 188</td><td>—</td><td>7 059</td><td><span class="health ok">2 groups</span></td><td><a class="act">Share…</a></td></tr>
+            <tr class="groupband"><td colspan="7">Clients · Private Equity 1/6 <span class="n">27 collections · 27 shared with nobody</span></td></tr>
+            <tr><td><a class="lnk">Private Equity 1/6: Gamma Capital</a></td><td><span class="logo logo--sp mini">SP</span>Private Equity 1/6</td><td>846</td><td><a class="num">4 need review</a></td><td>2 190</td><td><span class="health warn">nobody</span></td><td><a class="act">Share…</a></td></tr>
+            <tr><td><a class="lnk">Private Equity 1/6: Delta Partners</a></td><td><span class="logo logo--sp mini">SP</span>Private Equity 1/6</td><td>512</td><td>—</td><td>1 402</td><td><span class="health warn">nobody</span></td><td><a class="act">Share…</a></td></tr>
+            <tr class="groupband"><td colspan="7">Uploaded <span class="n">2 collections</span></td></tr>
+            <tr><td><a class="lnk">Board decks 2025</a></td><td><span class="logo mini" style="background:var(--sunken);color:var(--ink-2)">⇪</span>a.analyst</td><td>14</td><td>—</td><td>—</td><td><span class="health ok">1 group</span></td><td><a class="act">Share…</a></td></tr>
+            <tr class="dim"><td colspan="7">… 386 more · one band per source, the same toolbar as the Library and /chats; the table follows the wide-table pattern (fixed layout, pinned action column)</td></tr>
+          </tbody>
+        </table>
+        </div>
+        <div class="foot">Collection → its Library page (files, status, Re-ingest). Needs attention → the same page filtered to needs_review + rejected. Share… → the existing share dialog; the full grant audit stays in <a>Access</a>. The Facts column is absent on a DuckDB-backed instance.</div>
+      </div>
+    </div>
+    <div class="notes">
+      <div class="note"><span class="mk">·</span><div><b>Why a lens when Access already lists collections.</b> Access answers "who sees what" across everything — without source, file state or facts. This is a data question: what came from which source and in what state. One row per collection, one band per source.</div></div>
+      <div class="note"><span class="mk">·</span><div><b>No new "Grant".</b> Share… opens the dialog the Library detail already has. Access built the one picker; a fourth writer of collection grants would drift.</div></div>
+      <div class="note"><span class="mk">·</span><div><b>Vocabulary.</b> Table ↔ file (the unit), data package ↔ collection (the grant container). A collection is to documents what a data package is to tables — hence its place right after it. "Folder" and "scope" are not said here.</div></div>
+      <div class="note"><span class="mk">·</span><div><b>When the tab shows.</b> Only on an instance with a file source or at least one collection (<code>when:</code> in admin_nav.py) — the same rule as "bands only when both kinds exist".</div></div>
+      <div class="note"><span class="mk">·</span><div><b>Endpoint first, page second.</b> Count-first (<code>count_by_corpus</code> + one grouped status count), and the source card reads the same query — the lens becomes the fix for today's page cost, not an addition to it.</div></div>
+    </div>
+  </div>
+
+  <div class="two">
+    <div>
+      <div class="fig__label" style="margin-bottom:10px"><h2>C · A single-kind instance</h2><span>neither the bands nor the Collections tab render</span></div>
+      <div class="frame frame--tight">
+        <div class="pg" style="min-width:0">
+          <div class="tabs" style="margin-top:0">
+            <span class="tab on">Sources</span><span class="arr">→</span><span class="tab">Tables</span><span class="arr">→</span><span class="tab">Data packages</span><span class="brk"></span><span class="tab">Semantic sources</span>
+          </div>
+          <div class="sechead"><h3>Connected sources</h3><span class="cnt">1 source</span><span class="end"><span class="btn btn--primary btn--sm">+ Add source</span></span></div>
+          <div class="card">
+            <div class="head">
+              <span class="logo logo--kb">KB</span>
+              <div class="id"><div class="name">Production</div><div class="sub"><code>connection.example.com</code> · project 1234</div></div>
+              <span class="health ok">Healthy</span>
+              <div class="acts"><span class="btn btn--sm chev">Actions</span><span class="caretbtn">›</span></div>
+            </div>
+            <div class="pipe">
+              <div class="cell"><span class="k">Tables</span><span class="v">12 registered</span></div>
+              <div class="cell"><span class="k">Sync</span><span class="v ok">✓ 3 min ago</span></div>
+              <div class="cell"><span class="k">Semantic layer health</span><span class="v">never synced</span></div>
+              <div class="cell"><span class="k">Feeds</span><span class="v">1 package → 2 groups</span></div>
+            </div>
+          </div>
+        </div>
+        <div class="callout">Exactly today's page. A band and a tab are information about a difference; where there is none, they have nothing to say.</div>
+      </div>
+    </div>
+    <div>
+      <div class="fig__label" style="margin-bottom:10px"><h2>D · Found beside the question</h2><span>these decide whether the result is usable at this size</span></div>
+      <div class="frame frame--tight">
+        <div class="risk"><b>The Sources page is O(files).</b> The SharePoint card's cell decodes every file of every scope on every render and after every mutation (<code>_sharepoint_pipeline_cell</code>). The lens must be count-first and the card must read the same query.</div>
+        <div class="risk"><b>Access may not load on such an instance.</b> It eagerly projects <i>corpus_file</i> too: ~390 collections × all their files into one JSON. Verify before linking anything there.</div>
+        <div class="callout"><b>Dead link in Access:</b> "Open" on a collection targets <code>/library/d/{id}</code>; the route is <code>/library/{slug}</code>. Ten minutes.</div>
+        <div class="callout"><b>Seven "Private Equity n/6" cards</b> are one site split for crawl parallelism; a root-scope connection is the goal. Bands do not shrink seven cards. Do not design around a workaround.</div>
+        <div class="callout"><b>The one decision:</b> is a collection <i>the document world's data package</i> — a grant container in the same Data section (this mock) — or are documents <i>a second product line</i> with their own section <code>Documents: Sources → Collections → Ontology &amp; graph</code>? The reviews lean to one section now, and to the split once a second document connector exists — which would also give Ontology the nav home it lacks.</div>
+      </div>
+    </div>
+  </div>
+</div>
