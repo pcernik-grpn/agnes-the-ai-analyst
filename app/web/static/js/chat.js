@@ -2705,7 +2705,14 @@ async function openSession(chatId, wsUrlOverride, { restoring = false } = {}) {
   ws = new WebSocket(`${proto}://${location.host}${wsUrl}`);
   ws.onmessage = (ev) => handleFrame(JSON.parse(ev.data));
   ws.onclose = () => {
-    setStatus("Disconnected — click the conversation again to resume.", "warn");
+    // No pill on a close. The line here used to read "Disconnected — click
+    // the conversation again to resume.", which fired on EVERY socket close
+    // and instructed the reader to do something that does not exist: there
+    // is no per-conversation reconnect endpoint, and the next message
+    // re-opens the session by itself via ensureWsReady. The genuinely
+    // actionable failures keep their own copy (_renderResumeFailure, the
+    // runner-not-ready paths) — this one only added noise.
+    setStatus("");
     // Re-arm so the next openSession starts with an unresolved promise;
     // resolveServerReady is replaced fresh in resetServerReady().
     resetServerReady();

@@ -15,6 +15,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 ### Changed
 
 ### Fixed
+- **Web chat: the "Disconnected — click the conversation again to resume" pill is gone.** It fired on any WebSocket close — including the ordinary ones — and the instruction it gave was not a thing the product does: there is no per-conversation reconnect endpoint to click, and the next message re-opens the session by itself via `ensureWsReady`, so the reader was told to perform a manual recovery step for something already handled. A close now leaves the pill area clean, the same treatment the permanent "Connected." pill got. The failures that genuinely need copy keep theirs, unchanged: the ticket-mint failure still says "Could not reconnect to this conversation just now. Nothing is lost — send a message or reload the page to try again." in the transcript, and the runner-not-ready paths still surface their own error line.
 
 ### Removed
 
