@@ -1077,6 +1077,21 @@ _EXEMPT: dict[str, str] = {
         "diagnostic action (§13.1), not an agent-facing data operation, the "
         "same posture as _AGENT_MEMORY_ADMIN_REASON/_AGENT_SCOPE_REASON above."
     ),
+    # review plan P1.4: sweeps the same single-persona preview above across
+    # every REAL user_groups row in one call, to catch a CASE-on-$user_groups
+    # policy with a missing/wrong ELSE branch. Same posture as the
+    # policy/preview exemption right above -- it too runs the policy AS EACH
+    # GROUP and hands back rows_visible/rows_total, an audited
+    # (access_policy.preview_groups), human-witnessed diagnostic action, not
+    # an agent-facing data operation. No CLI/MCP surface planned yet; the web
+    # UI's "Preview all groups" button is the only caller.
+    "/api/admin/registry/{table_id}/policy/preview-groups": (
+        "admin-only access-policy preview across every real group (review "
+        "plan P1.4) -- same reasoning as the policy/preview exemption above: "
+        "runs the policy AS EACH GROUP and returns rows_visible/rows_total, "
+        "an audited, human-witnessed diagnostic action, not an agent-facing "
+        "data operation. No CLI/MCP surface planned yet."
+    ),
     # access-policy-builder-ux plan, Tasks 2/3: the no-SQL builder's
     # columns+samples list and structured-spec-to-SQL compile. Same posture
     # as the policy/preview exemption right above (admin-only authoring
@@ -1094,6 +1109,18 @@ _EXEMPT: dict[str, str] = {
         "the no-SQL builder (plan Task 2). No MCP analogue by design, same "
         "reasoning as the policy/preview exemption above; no CLI planned for "
         "this web-UI-only builder slice."
+    ),
+    "/api/admin/registry/{table_id}/policy/revisions": (
+        "admin-only access-policy revision history (#1979): the saved states "
+        "the editor modal's history panel lists and its Restore button "
+        "prefills from. No MCP analogue by design, same reasoning as the "
+        "policy/preview exemption above — the response carries policy SQL "
+        "bodies, i.e. a map of what each policy is filtering and masking, "
+        "which is not something an agent tool call should be able to read on "
+        "an admin's behalf. No CLI planned for this web-UI-only slice: the "
+        "history exists to feed the editor, and restoring is just the "
+        "already-CLI-reachable PUT /api/admin/registry/{id} with an older "
+        "body."
     ),
     "/api/admin/registry/{table_id}/policy/compile": (
         "admin-only access-policy builder: structured spec -> validated SQL "

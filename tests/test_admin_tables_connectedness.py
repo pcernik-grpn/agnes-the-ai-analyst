@@ -155,7 +155,8 @@ class TestOneConnectednessSignal:
         assert 'data-tooltip="Keboola not connected' not in edit
         assert 'onclick="discoverKeboolaBuckets(' in html
         assert 'onclick="discoverKeboolaTables(' in html
-        assert 'onclick="prefillFromKeboolaTable(' in html
+        # "Use table as base" was retired with the Keboola edit modal's SQL
+        # textarea (#1979) — the two Discover buttons are the whole gated set.
         assert "keboola" in html.split('data-connected-sources="', 1)[1].split('"', 1)[0].split(",")
 
     def test_scalar_only_instance_still_works_regression(self, seeded_app, monkeypatch):
@@ -170,7 +171,6 @@ class TestOneConnectednessSignal:
         assert "Keboola is not connected" not in _kb_edit_section(html)
         assert 'onclick="discoverKeboolaBuckets(' in html
         assert 'onclick="discoverKeboolaTables(' in html
-        assert 'onclick="prefillFromKeboolaTable(' in html
 
     def test_genuinely_unconnected_instance_still_warns(self, seeded_app, monkeypatch):
         """Keboola unreachable by BOTH routes — the EDIT modal's warning +
