@@ -11,6 +11,18 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 ## [Unreleased]
 
 ### Added
+
+### Changed
+
+### Fixed
+
+### Removed
+
+### Internal
+
+## [0.99.0] - 2026-09-04
+
+### Added
 - **Access-policy History panel shows a diff between revisions.** Each saved revision carries a collapsed line diff against its predecessor (and the newest against the currently stored policy), with note-only changes and `policy_mapping` toggles called out explicitly, so an admin can see what changed before restoring it. On an instance without the revision store the audit-derived list says it cannot be diffed. (#1979, live-test finding 2)
 - **The RLS pilot regression pins the table-level RBAC gate as its own layer** (`tests/test_rls_pilot_e2e.py`): a user with no package grant is refused at table level (403), distinguishable from a granted-but-unmatched user's `ELSE FALSE` empty slice; the pilot package is granted only to the pilot groups, never `Everyone`; and revoking one group's grant re-engages the table gate even though the policy would admit their rows. Docs gained a "grant narrowly, or the RBAC layer stays invisible" note. (#1979, live-test finding 3)
 - **Table access policies got a version history you can restore from.** Every policy write through `PUT /api/admin/registry/{id}` (attach, edit, clear) appends a row to a new `access_policy_revisions` store, and the policy editor's History panel lists the last ten — who/when/note and a peek at the body — with a **Restore** button per version. Restore is deliberately not a one-click reattach: it loads the chosen version into the editor and the ordinary Save applies it, so the interlocks, the mandatory note, static validation and the live probe judge a restored body exactly like a freshly typed one. Clearing a policy is itself a revision (NULL body); a policy predating the store is backfilled as a baseline on first edit. Postgres-only (A3): a DuckDB-backed instance gets `501 requires_postgres_backend` and the panel falls back to the read-only audit-derived history. (K1-sweep finding 1, #1979)
