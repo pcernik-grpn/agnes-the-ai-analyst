@@ -75,8 +75,9 @@ COPY . .
 #   - post-deploy-smoke-test.sh — deploy gate (docs/ONBOARDING.md step 8):
 #     public API + new-instance doctor + host-side consistency checks
 #   - docker-compose.{yml,prod.yml,host-mount.yml,tls.yml} — host runtime
-#   - docker-compose.gcp-logging.yml — opt-out gcplogs overlay (removed by
-#     startup-script.sh.tpl when enable_gcp_logging=false; see its own header)
+#   - docker-compose.gcp-logging.yml — Cloud Logging overlay, fluentd driver
+#     into a host Ops Agent (removed by startup-script.sh.tpl whenever
+#     container_logs_destination is not cloud_logging; see its own header)
 #   - Caddyfile — TLS reverse proxy config
 #   - static/maintenance.html — Caddy's handle_errors 502/503 fallback page
 #

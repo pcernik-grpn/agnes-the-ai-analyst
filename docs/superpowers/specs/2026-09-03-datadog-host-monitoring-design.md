@@ -26,8 +26,8 @@ monitoring:
 
 Scope: operational parameters of the VM, its Postgres side-cars (`postgres`,
 `kai-agent-pg`), Docker containers, disks, TLS, host jobs. Out of scope: APM, traces, log
-collection into Datadog (container logs keep going to Cloud Logging via the Ops Agent),
-managed databases outside the VM.
+collection into Datadog (container logs keep going to Cloud Logging via the Ops Agent —
+superseded, see *Scope change (2026-09-04)* below), managed databases outside the VM.
 
 ## Decisions
 
@@ -268,3 +268,51 @@ against the live org rather than assumed:
   stays the container IP, so `compose_service` is the side-car identity and
   `env` the deployment identity — never `host` (see the catalogue's scoping
   note).
+
+## Scope change (2026-09-04): log collection
+
+The "container logs keep going to Cloud Logging via the Ops Agent" clause in
+*Scope* described the state at design time and is superseded by
+`container_logs_destination` ([`docs/datadog-logging.md`](../../datadog-logging.md)).
+
+What the original scoping got right and this change preserves: the two
+pipelines are **alternatives, not layers**. What it did not anticipate is that
+the reason is mechanical rather than editorial. Docker allows one log driver
+per container; Cloud Logging needs `fluentd` (the Ops Agent is what re-parses
+the JSON line into fields), and the Datadog Agent reads containers through the
+Docker API, which under a remote driver serves Docker's dual-logging cache — a
+path that happens to work and that Datadog does not document or support. On the
+default `json-file` driver the same API serves the driver's own logs, and the
+path is supported. So the destination is a single choice, resolved in Terraform
+and refused at plan time when its collector was never provisioned.
+
+Two traps found while implementing it, in the catalogue's numbering:
+
+- **Trap #16 — `dd-agent` cannot read the container log files, and an ACL
+  cannot fix it.** The agent prefers to tail
+  `/var/lib/docker/containers/<id>/<id>-json.log`, but those directories are
+  root-owned and mode `0700`: docker-group membership grants the *socket*, not
+  the filesystem (Datadog's own troubleshooting page says so; DataDog/
+  datadog-agent#11473 is the live report). A default POSIX ACL does not rescue
+  it, because dockerd creates each directory with mode `0700` and the zero
+  group bits clamp the ACL mask, masking out an inherited `u:dd-agent` entry.
+  The agent falls back to the Docker API on its own, once per container and
+  loudly, so the fix is to configure that fallback outright:
+  `logs_config.docker_container_use_file: false`. This is the same conclusion
+  the *Implementation notes* reached for the heartbeat paths — "No setfacl, and
+  nothing else touches a shared directory's mode" — arrived at from the
+  opposite direction.
+- **Trap #17 — the generic `container_exclude` suppresses logs too.** The
+  one-shot `migrate`/`extract` exclusion was written for metrics (a series per
+  boot that nothing queries). Enabling logs without renaming it to
+  `container_exclude_metrics` would have silently dropped exactly the lines an
+  operator reads when a migration fails — and there is no interaction between
+  the global list and the scoped ones, so `container_include_logs` cannot bring
+  a globally excluded container back.
+
+APM, traces and DBM stay out of scope. `logs_enabled` also left the
+docker-group compensating-controls paragraph, which was a category error: it is
+an **egress** control, not a privilege one. Through the docker socket the agent
+could already read every container's logs; the setting only decides whether
+they leave the host. Its real compensating controls are the redaction rules and
+the fact that Agnes never logs prompt or completion text.
