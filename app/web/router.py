@@ -344,6 +344,30 @@ def _admin_setup_rail() -> object:
 
 
 templates.env.globals["admin_setup_rail"] = _admin_setup_rail
+
+
+def _journey_rail(user_id: object) -> object:
+    """The caller's onboarding-checklist progress for the rail's card, or None.
+
+    A Jinja global for the same reason `admin_setup_rail` above is: the card
+    renders on every rail page from a partial both context builders share,
+    and it has to paint in its RESOLVED state — retired at 6/6, otherwise the
+    real count — or the rows above it jump on every navigation while
+    chat_onboarding.js catches up (see `resolve_journey_rail`). Called from
+    the template only where the card renders (`can_chat and not
+    _admin_page`), so an admin page never spends the read. None on any
+    failure leaves the card blank for the script to resolve.
+    """
+    try:
+        from app.services.journey import resolve_journey_rail
+
+        return resolve_journey_rail(str(user_id) if user_id else None)
+    except Exception:
+        logger.warning("rail: onboarding journey unavailable", exc_info=True)
+        return None
+
+
+templates.env.globals["journey_rail"] = _journey_rail
 templates.env.globals["data_apps_enabled"] = _data_apps_nav_enabled
 
 
@@ -9154,7 +9178,7 @@ async def admin_tables(
     user: dict = Depends(require_admin),
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
 ):
-    from app.instance_config import get_data_source_type
+    from app.instance_config import feature_enabled, get_data_source_type
 
     # Branch the register-modal layout server-side so the JS doesn't have
     # to round-trip /api/admin/server-config to learn the source type.
@@ -9164,6 +9188,17 @@ async def admin_tables(
         request,
         user=user,
         data_source_type=data_source_type,
+        # K1-sweep finding 4 (#1979): the Access Policy modal opened
+        # regardless of this flag and only the server-side PUT 422'd —
+        # branched here (same pattern as `facts_enabled`/`studio_enabled`
+        # above) so the modal can show the notice + disable Save up front
+        # instead of after a rejected save. The flag only gates ATTACHING a
+        # policy; enforcement of an existing one always runs (see the
+        # switch's own description in app/switches.py). Drafting and
+        # previewing a policy stay fully usable either way.
+        access_policies_enabled=feature_enabled(
+            "access_policies", "enabled", env_var="AGNES_ACCESS_POLICIES_ENABLED", default=False
+        ),
         # The end of each table's chain — which package carries it and how
         # many people that reaches. The page hydrates its rows client-side
         # from /api/admin/registry, but reach is a grants × group-membership

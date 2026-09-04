@@ -77,13 +77,16 @@
         return Promise.all(rows.map(function (s) {
           return api(SOURCES_API + '/' + encodeURIComponent(s.id))
             .then(function (full) {
-              var lister = (full.tools || []).filter(function (t) {
-                return window.LinkedAppsPanel.isLister(t.original_name || t.exposed_name);
-              })[0];
+              // Ranked, and never a tool that writes — see
+              // `listerCandidates` in the panel (#2154). More than one
+              // survivor is a real outcome, so all of them travel with the
+              // row and the panel offers the choice.
+              var cands = window.LinkedAppsPanel.listerCandidates(full.tools || []);
               return {
                 id: String(full.id), name: String(full.name || full.id),
                 url: String(full.url || full.command || ''),
-                listerToolId: lister ? String(lister.tool_id) : '',
+                listerToolId: cands.length ? cands[0].tool_id : '',
+                listerCandidates: cands,
               };
             })
             // A source whose detail call failed is dropped, as before: nothing
@@ -152,7 +155,7 @@
     var row = sources.filter(function (s) { return s.id === id; })[0];
     if (!row) return;
     picked = row;
-    thePanel().setSource(row.id, row.listerToolId);
+    thePanel().setSource(row.id, row.listerToolId, row.listerCandidates);
     render();
   }
 
@@ -528,6 +531,10 @@
     });
 
     document.addEventListener('input', function (e) {
+      // The apps panel owns its own value-carrying targets, as it owns its
+      // clicks — the host routes, the panel decides.
+      var li = e.target.closest && e.target.closest(window.LinkedAppsPanel.INPUT_SELECTOR);
+      if (li && thePanel().handleInput(li)) return;
       if (e.target.getAttribute && e.target.getAttribute('data-ag-search') === 'la-groups') {
         pickerQuery = e.target.value;
         var host = document.querySelector('[data-rows="la-groups"]');

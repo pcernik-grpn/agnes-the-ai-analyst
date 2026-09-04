@@ -236,16 +236,24 @@ def test_keboola_edit_modal_parity(seeded_app, monkeypatch):
         token = seeded_app["admin_token"]
         r = c.get("/admin/tables", headers=_auth(token))
         html = r.text
-        # Q2 radio in edit (now three modes).
-        assert 'name="editKbSyncMode"' in html
+        # #1979: the mode picker is rendered from the SAME
+        # `CONNECTORS.keboola.modes` the register wizard uses (four modes now,
+        # Live (remote) included) rather than authored here — hence a mount
+        # point plus the radio NAME the save path reads, not radio markup.
+        # Pinned in detail by tests/test_keboola_edit_modal_access_modes.py.
+        assert 'id="editKbSyncModeGroup"' in html
+        assert "editKbSyncMode" in html
         assert 'id="editKbBucket"' in html
         assert 'id="editKbSourceTable"' in html
         assert 'id="editKbSourceQuery"' in html
         assert 'id="editKbSyncSchedule"' in html
-        # Discover/List/Use-as-base buttons mirror Register.
+        # Discover / List tables mirror Register. "Use table as base" is gone
+        # with the SQL textarea it filled: a Keboola materialized source_query
+        # is a JSON filter spec, so seeding a SELECT into it only ever produced
+        # a payload the server refuses (#1979).
         assert "discoverKeboolaBuckets(this, 'editKbBucketList')" in html
         assert "discoverKeboolaTables(this, 'editKbBucket', 'editKbTableList')" in html
-        assert "prefillFromKeboolaTable('editKbSourceQuery')" in html
+        assert "prefillFromKeboolaTable(" not in html
         # v26: Strategy dropdown re-added inside Direct-extract panel
         assert 'id="editKbStrategy"' in html
         assert "editkb-direct-only" in html
@@ -352,7 +360,6 @@ def test_keboola_discover_buttons_visible_on_keboola_instance(seeded_app, monkey
         html = r.text
         assert "discoverKeboolaBuckets" in html
         assert "discoverKeboolaTables" in html
-        assert "prefillFromKeboolaTable" in html
     finally:
         reset_cache()
 

@@ -41,10 +41,11 @@ class SnapshotMeta:
     # Table access policies §3.4/§10.3 (plan Task 18): the
     # `X-Agnes-Policy-Fingerprint` value `/api/v2/scan` returned when this
     # snapshot was fetched -- `sha256(access_policy_sql + '|' +
-    # repr(sorted(caller_group_names)))`, or None when the source table
-    # carried no policy (or the fetch ran as the admin bypass). `agnes pull`
-    # recomputes the CURRENT fingerprint from the manifest and withholds
-    # this snapshot's view once the two disagree. Also MUST stay LAST with
+    # repr(caller_email) + '|' + repr(sorted(caller_group_names)))`, or
+    # None when the source table carried no policy (or the fetch ran as
+    # the admin bypass). `agnes pull` recomputes the CURRENT fingerprint
+    # from the manifest and withholds this snapshot's view once the two
+    # disagree. Also MUST stay LAST with
     # a default, same reason as `expires_at` above -- a `meta.json` written
     # before this feature existed has no such key.
     policy_fingerprint: Optional[str] = None

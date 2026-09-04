@@ -40,7 +40,7 @@ PyMuPDF/``fitz`` is AGPL and is banned in this repository.
 
 Usage::
 
-    from connectors.sharepoint.pdf_structure import reconstruct_pdf
+    from src.ingest.pdf_structure import reconstruct_pdf
 
     markdown = reconstruct_pdf(Path("report.pdf"))
     print(markdown.stats)   # {"pages": 4, "headings": 7, "tables": 2, ...}

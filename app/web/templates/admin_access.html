@@ -459,6 +459,9 @@
   .ax-res__state { flex: 0 0 auto; font-size: 11.5px; font-weight: 600; color: var(--ds-accent-success-ink); }
   .ax-res__act { flex: 0 0 auto; }
   .ax-res__msg { padding: 10px 8px; font-size: 12.5px; color: var(--ds-text-muted); }
+  /* A failed lookup, not an empty one — distinct ink so it does not read
+     as just another "nobody matched" line. */
+  .ax-res__msg--error { color: var(--ds-accent-warn-ink); }
 
   /* Where a member came from, and when — one cell, two weights, the same
      shape the retired detail page's Origin column had. */
@@ -4029,14 +4032,20 @@
     findActive = -1;
     if (!q) { out.innerHTML = ""; closeFind(); return; }
     const seq = ++findSeq;
-    let people = [];
-    try {
-      const r = await fetch(`${USERS_LIST_API}?search=${encodeURIComponent(q)}&limit=${FIND_LIMIT}`,
-                            { credentials: "include" });
-      people = r.ok ? await r.json() : [];
-      if (!Array.isArray(people)) people = people.users || [];
-    } catch (e) { people = []; }
+    // window.AgnesPeopleSearch (js/people_search.js) — the SAME lookup the
+    // group drawer's own People field uses, so the two "find an account"
+    // boxes on this page can never answer a query differently.
+    const { people, error } = await window.AgnesPeopleSearch.search(q, FIND_LIMIT);
     if (seq !== findSeq) return; // a later keystroke already answered
+
+    // A failed lookup (403/500/501, network error) is NOT "no account
+    // matches" — the two used to render identically, which is exactly what
+    // hid a real outage behind a wrong "no such person" reading.
+    if (error) {
+      out.innerHTML = `<p class="ax-res__msg ax-res__msg--error">Could not search accounts: ${esc(error)}</p>`;
+      openFind();
+      return;
+    }
 
     if (!people.length) {
       // (the seeded field is focused below, once it is in the DOM)

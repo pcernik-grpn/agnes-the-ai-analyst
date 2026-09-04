@@ -197,6 +197,23 @@ locals {
     var.kai_agent_e2b_key_secret,
   ])), setunion(toset(keys(var.runtime_secret_env)), toset(keys(var.runtime_secret_env_multiline)), toset(var.runtime_secrets))) : toset([])
 
+  # Opt-in OTLP export: the per-VM headers secret, granted only for the VMs
+  # that name one. Secrets already granted through the runtime maps,
+  # runtime_secrets, the dispatcher, the engine or the OAuth clients are
+  # subtracted — two identical (project, secret, role, member) bindings make
+  # the second apply fail with "already exists", the documented trap.
+  otlp_secrets = setsubtract(
+    toset(compact([for inst in local.all_instances : inst.otlp_headers_secret])),
+    setunion(
+      toset(keys(var.runtime_secret_env)),
+      toset(keys(var.runtime_secret_env_multiline)),
+      toset(var.runtime_secrets),
+      local.dispatcher_secrets,
+      local.kai_agent_secrets,
+      local.per_instance_oauth_secrets,
+    ),
+  )
+
   # --- Vendor-neutral per-instance branding -> /data/state/instance.yaml ---
   # The startup script seeds instance.yaml on FIRST boot only (it never clobbers
   # an existing file). These locals turn the optional per-VM branding fields into
@@ -450,6 +467,16 @@ resource "google_secret_manager_secret_iam_member" "vm_dispatcher" {
 # it twice errors the apply.
 resource "google_secret_manager_secret_iam_member" "vm_kai_agent" {
   for_each  = local.kai_agent_secrets
+  project   = var.gcp_project_id
+  secret_id = each.value
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.vm.email}"
+}
+
+# Per-VM OTLP headers secret (opt-in trace export) — read-only, only for the
+# VMs that set otlp_headers_secret, minus anything already granted above.
+resource "google_secret_manager_secret_iam_member" "vm_otlp" {
+  for_each  = local.otlp_secrets
   project   = var.gcp_project_id
   secret_id = each.value
   role      = "roles/secretmanager.secretAccessor"
@@ -783,13 +810,19 @@ resource "google_compute_instance" "vm" {
     kai_agent_cpus               = each.value.kai_agent_cpus
     kai_agent_pg_mem_limit       = each.value.kai_agent_pg_mem_limit
     kai_agent_broker_mcp_enabled = each.value.kai_agent_broker_mcp_enabled
-    kai_agent_image              = var.kai_agent_image
-    kai_agent_jwt_secret         = var.kai_agent_jwt_secret
-    kai_agent_e2b_key_secret     = var.kai_agent_e2b_key_secret
-    extraction_worker_enabled    = each.value.extraction_worker_enabled
-    extraction_worker_image      = var.extraction_worker_image
-    extraction_worker_mem_limit  = each.value.extraction_worker_mem_limit
-    extraction_worker_cpus       = each.value.extraction_worker_cpus
+    # Opt-in OTLP export (per-VM) + the deployment label. Only the SECRET
+    # NAME reaches the template; the startup script fetches the value.
+    otlp_endpoint               = each.value.otlp_endpoint
+    otlp_headers_secret         = each.value.otlp_headers_secret
+    otlp_capture_content        = each.value.otlp_capture_content ? "1" : "0"
+    deployment_env              = each.value.deployment_env != "" ? each.value.deployment_env : each.value.name
+    kai_agent_image             = var.kai_agent_image
+    kai_agent_jwt_secret        = var.kai_agent_jwt_secret
+    kai_agent_e2b_key_secret    = var.kai_agent_e2b_key_secret
+    extraction_worker_enabled   = each.value.extraction_worker_enabled
+    extraction_worker_image     = var.extraction_worker_image
+    extraction_worker_mem_limit = each.value.extraction_worker_mem_limit
+    extraction_worker_cpus      = each.value.extraction_worker_cpus
     # Rendered to KEY=VALUE lines, base64'd like dispatcher_policies so no
     # value can break the template or the shell heredoc quoting.
     kai_agent_env_b64 = base64encode(join("\n", [

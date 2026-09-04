@@ -7,8 +7,8 @@ safe interim, per §9's own words ("the internal connector already excludes
 itself... that precedent is the one to follow"), but one that leaves a
 policied table's response UNCACHED forever. This turns the bypass into an
 identity-keyed cache instead: a policied table's cache key carries
-`(user_id, sorted(group_names))`, so repeated calls by the SAME caller still
-hit cache, but two different callers never share a slot -- the exact
+`(user_id, user_email, sorted(group_names))`, so repeated calls by the SAME
+caller still hit cache, but two different callers never share a slot -- the exact
 "worse than no policy" failure §5.1 names for a shared key on a
 caller-dependent response.
 
@@ -201,11 +201,52 @@ class TestCacheKeyCarriesCallerIdentity:
     def test_policy_cache_identity_shape(self, policied_orders):
         """Direct unit coverage of the resolver-level helper, independent
         of either endpoint's own key-string formatting: `(user_id,
-        sorted-group-tuple)`, per §9."""
+        user_email, sorted-group-tuple)`, per §9."""
         from src.access_policy import policy_cache_identity
 
         identity = policy_cache_identity({"id": "u_team_a", "email": "team-a@example.com"}, table_id="orders")
-        assert identity == ("u_team_a", ("TeamA",))
+        assert identity == ("u_team_a", "team-a@example.com", ("TeamA",))
+
+    def test_identity_differs_when_only_the_email_differs(self, policied_orders):
+        """A policy binding `$user_email` makes the response depend on the
+        email, so two principals agreeing on id and groups but differing on
+        email must never share a cache slot -- the shape an admin changing
+        an account's email produces, where the old slice would otherwise
+        keep being served for the cache's whole TTL."""
+        from src.access_policy import policy_cache_identity
+
+        before = policy_cache_identity({"id": "u_team_a", "email": "team-a@example.com"}, table_id="orders")
+        after = policy_cache_identity({"id": "u_team_a", "email": "renamed@example.com"}, table_id="orders")
+
+        assert before != after
+        assert before[0] == after[0] and before[2] == after[2], (
+            "the fixture must vary ONLY the email, or this proves nothing about the email"
+        )
+
+    def test_agent_principal_keys_on_the_callers_email_not_the_owners(self, policied_orders):
+        """C2.3: `$user_email` binds to whoever is DRIVING the turn, so the
+        cache identity must too -- otherwise a shared agent serves the
+        owner-keyed slice to every grantee."""
+        from app.auth.session_principal import AgentPrincipal
+        from src.access_policy import policy_cache_identity
+
+        def _agent(caller_user_id, caller_email):
+            return AgentPrincipal(
+                session_id="agent-sess-1",
+                agent_id="agent-1",
+                owner_user_id="u_team_a",
+                owner_email="team-a@example.com",
+                intersection={},
+                caller_user_id=caller_user_id,
+                caller_email=caller_email,
+            )
+
+        as_owner = policy_cache_identity(_agent("u_team_a", "team-a@example.com"), table_id="orders")
+        as_grantee = policy_cache_identity(_agent("u_team_a", "grantee@example.com"), table_id="orders")
+
+        assert as_owner == ("u_team_a", "team-a@example.com", ("TeamA",))
+        assert as_grantee[1] == "grantee@example.com", "the CALLER's email, never the owner's"
+        assert as_owner != as_grantee
 
 
 class TestPolicyEditInvalidatesTheIdentityKeyedSchemaCache:
@@ -279,12 +320,13 @@ class TestPolicyEditInvalidatesTheIdentityKeyedSchemaCache:
         from app.api import v2_schema
         from app.api.v2_catalog import invalidate_for_table
 
-        v2_schema._schema_cache.set("orders|policy:('u_team_a', ('TeamA',))", {"columns": []})
+        identity_key = "orders|policy:('u_team_a', 'team-a@example.com', ('TeamA',))"
+        v2_schema._schema_cache.set(identity_key, {"columns": []})
         v2_schema._schema_cache.set("orders", {"columns": []})
 
         invalidate_for_table("orders")
 
-        assert v2_schema._schema_cache.get("orders|policy:('u_team_a', ('TeamA',))") is None
+        assert v2_schema._schema_cache.get(identity_key) is None
         assert v2_schema._schema_cache.get("orders") is None
 
 
