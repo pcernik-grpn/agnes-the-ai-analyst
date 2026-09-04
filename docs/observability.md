@@ -367,6 +367,14 @@ OTEL_EXPORTER_OTLP_HEADERS=Authorization=Bearer%20<token>    # whatever the coll
 AGNES_OTEL_CAPTURE_CONTENT=1                                 # optional — see below
 ```
 
+On a VM built by the `customer-instance` Terraform module the three
+variables come from the per-instance `otlp_endpoint`, `otlp_headers_secret`
+(a Secret Manager secret name — the value is fetched at boot, never stored
+in state) and `otlp_capture_content` fields; the module also writes
+`AGNES_DEPLOYMENT_ENV` for every VM (the VM's name unless `deployment_env`
+says otherwise). Like everything the startup script renders, they reach a
+running VM only through a recreate.
+
 An unset endpoint leaves the OpenTelemetry API's no-op tracer in place: no
 exporter, no background thread, a dictionary lookup per call. The log line
 `otel: OTLP trace export enabled` at startup says it is on; a collector
