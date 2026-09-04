@@ -13,7 +13,7 @@ import math
 import os
 import re
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Literal, NamedTuple, Optional
@@ -528,12 +528,59 @@ _EXTRACTION_ENV_LOCKS: tuple[tuple[tuple[str, ...], str], ...] = ()
 
 _EXTRACTION_TIMEOUT_MIN = 60
 _EXTRACTION_TIMEOUT_MAX = 86400  # 24h
+# `extraction.stall_after_s` — how stale a `running` run's checkpoint may
+# get before `app/api/admin_extraction.py`'s `_derived_outcome` reports
+# `stalled` instead of `running`. Same range as `timeout_s` above (a stall
+# threshold shorter than a minute would flag a run that is merely between
+# checkpoints; longer than 24h defeats the point of the signal).
+_EXTRACTION_STALL_AFTER_MIN = 60
+_EXTRACTION_STALL_AFTER_MAX = 86400  # 24h
 # `extraction.crawler.concurrency` bounds — the SAME clamp the crawler applies
 # (`connectors.sharepoint.crawler._MAX_CONCURRENCY`), pinned by
 # `tests/test_admin_server_config_extraction_section.py` rather than imported:
 # this module must not carry an import-time dependency on the crawler stack.
 _CRAWLER_CONCURRENCY_MIN = 1
-_CRAWLER_CONCURRENCY_MAX = 32
+# Same posture for the worker's extraction LANE slots and the facts stage's
+# per-pass document concurrency — the cap each stage clamps to itself, pinned
+# by tests rather than imported (no import-time dependency on the worker/
+# connector stacks from this module).
+# `_LANE_CONCURRENCY_MAX` MUST equal `app.worker.runtime._MAX_EXTRACTION_
+# CONCURRENCY` (currently 24) — a live run posted `extraction.concurrency=12`
+# through this endpoint (which accepted it, the cap here was 64), and the
+# worker runtime silently re-clamped it back down to the then-8 on its own,
+# logging a warning nobody saw until after the fact. Pinned equal by
+# `tests/test_admin_server_config_extraction_section.py::
+# test_caps_match_the_stages_own_clamps` rather than imported here.
+_LANE_CONCURRENCY_MAX = 24
+_FACTS_CONCURRENCY_MAX = 64
+_CRAWLER_CONCURRENCY_MAX = 64
+# `extraction.crawler.convert_child_memory_limit_mb` — the RLIMIT_AS
+# HEADROOM a conversion child gets above this worker's own memory
+# footprint at fork time (`connectors.sharepoint.crawler
+# ._DEFAULT_CONVERT_CHILD_MEMORY_LIMIT_MB`/`_install_memory_limit`), 0 =
+# off. 65536 (64 GiB) is a sanity ceiling, not a tuned number — an
+# operator sizing for more should raise the container's own memory limit
+# well before approaching it. Min is 0 (not 1): unlike the concurrency
+# knobs above, 0 is a legitimate, meaningful value here.
+_CONVERT_CHILD_MEMORY_LIMIT_MIN_MB = 0
+_CONVERT_CHILD_MEMORY_LIMIT_MAX_MB = 65536
+# `extraction.crawler.convert_child_max_rss_mb` — the ABSOLUTE per-child RSS
+# ceiling the PARENT itself polls for (`connectors.sharepoint.crawler
+# ._DEFAULT_CONVERT_CHILD_MAX_RSS_MB`/`_ConvertProcessPool._await_reply`),
+# 0 = off. A SEPARATE knob from `convert_child_memory_limit_mb` above (which
+# is HEADROOM above the worker's own VmSize at fork time, not an absolute
+# number) — see that knob's own live-deployment follow-up finding for why
+# an absolute, parent-polled ceiling was still needed on top of it. Same
+# sanity ceiling and same "0 is legitimate" reasoning as its sibling.
+_CONVERT_CHILD_MAX_RSS_MIN_MB = 0
+_CONVERT_CHILD_MAX_RSS_MAX_MB = 65536
+# `extraction.crawler.convert_spares_per_slot` — how many pre-forked standby
+# conversion children `_ConvertProcessPool` keeps ready per slot
+# (`connectors.sharepoint.crawler._DEFAULT_CONVERT_SPARES_PER_SLOT`). 0 = no
+# spares (the pre-spares behaviour). 8 is a cost ceiling (one idle process
+# per spare per slot), not a tuned number.
+_CONVERT_SPARES_PER_SLOT_MIN = 0
+_CONVERT_SPARES_PER_SLOT_MAX = 8
 
 
 def _leaf_touched(patch: Any, path: tuple[str, ...]) -> bool:
@@ -550,6 +597,49 @@ def _leaf_touched(patch: Any, path: tuple[str, ...]) -> bool:
             return False
         node = node[key]
     return True
+
+
+def _validate_vertex_region_model_matrix(region: str, model_in_patch: Any) -> None:
+    """Refuse a ``vertex_region`` this save would pair with a model that has
+    NO documented Claude-on-Vertex quota bucket for it (live finding (b),
+    TCRD-296 synthesis F.25) — a project running Sonnet outside ``global``
+    answers 429 on every call, even a 5-token one, because it has no
+    regional bucket at all; a saturated Haiku region-bucket at peak is the
+    OTHER shape (a real, if temporary, capacity limit — not this guard's
+    job to refuse). Better a ``422`` naming the mismatch here than an
+    operator discovering it one paused pass at a time.
+
+    ``model_in_patch`` is the SAME save's own ``extraction.facts.model``
+    leaf when set (resolved through the same tier table a pass itself
+    would use); otherwise this instance's CURRENTLY configured model
+    (:func:`connectors.sharepoint.facts_extraction._model`) — the model
+    ``vertex_region`` would actually be paired with if this save touches
+    only the region.
+    """
+    from connectors.sharepoint.facts_extraction import VERTEX_REGION_MODEL_MATRIX, vertex_region_supports_model
+
+    if isinstance(model_in_patch, str) and model_in_patch.strip():
+        from connectors.llm.factory import resolve_model_tier
+
+        try:
+            model = resolve_model_tier(model_in_patch.strip())
+        except ValueError:
+            return  # an invalid model tier is a different validator's job
+    else:
+        from connectors.sharepoint.facts_extraction import _model
+
+        model = _model()
+
+    if vertex_region_supports_model(region, model):
+        return
+    matrix_hint = "; ".join(f"{tier}: {', '.join(regions)}" for tier, regions in VERTEX_REGION_MODEL_MATRIX.items())
+    raise HTTPException(
+        status_code=422,
+        detail=(
+            f"extraction.facts.vertex_region={region!r} has no documented Claude-on-Vertex quota bucket for "
+            f"model {model!r} — every call would answer 429. Supported region×model matrix: {matrix_hint}."
+        ),
+    )
 
 
 def _validate_extraction_section(sections: Dict[str, Dict[str, Any]]) -> None:
@@ -614,6 +704,81 @@ def _validate_extraction_section(sections: Dict[str, Dict[str, Any]]) -> None:
                 ),
             )
 
+    stall_after_s = patch.get("stall_after_s")
+    if stall_after_s is not None:
+        if not isinstance(stall_after_s, int) or isinstance(stall_after_s, bool):
+            raise HTTPException(status_code=422, detail="extraction.stall_after_s must be an integer")
+        if stall_after_s < _EXTRACTION_STALL_AFTER_MIN or stall_after_s > _EXTRACTION_STALL_AFTER_MAX:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"extraction.stall_after_s must be between {_EXTRACTION_STALL_AFTER_MIN} and "
+                    f"{_EXTRACTION_STALL_AFTER_MAX} (got {stall_after_s})"
+                ),
+            )
+
+    lane = patch.get("concurrency")
+    if lane is not None:
+        if not isinstance(lane, int) or isinstance(lane, bool):
+            raise HTTPException(status_code=422, detail="extraction.concurrency must be an integer")
+        if lane < 1 or lane > _LANE_CONCURRENCY_MAX:
+            raise HTTPException(
+                status_code=422,
+                detail=f"extraction.concurrency must be between 1 and {_LANE_CONCURRENCY_MAX} (got {lane})",
+            )
+
+    facts = patch.get("facts")
+    if facts is not None:
+        if not isinstance(facts, dict):
+            raise HTTPException(status_code=422, detail="extraction.facts must be a mapping")
+        for key, lo, hi in (
+            ("concurrency", 1, _FACTS_CONCURRENCY_MAX),
+            ("stream_every", 0, 1_000_000),
+            ("run_timeout_s", _EXTRACTION_TIMEOUT_MIN, _EXTRACTION_TIMEOUT_MAX),
+            # TCRD-296 gap #67 — the ceiling on how many partitions a facts
+            # fan-out (connectors.sharepoint.facts_extraction
+            # .enqueue_facts_extraction_passes) ever enqueues at once; same
+            # clamp as `concurrency` above.
+            ("concurrency_passes", 1, _FACTS_CONCURRENCY_MAX),
+        ):
+            value = facts.get(key)
+            if value is None:
+                continue
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise HTTPException(status_code=422, detail=f"extraction.facts.{key} must be an integer")
+            if value < lo or value > hi:
+                raise HTTPException(
+                    status_code=422, detail=f"extraction.facts.{key} must be between {lo} and {hi} (got {value})"
+                )
+        for key, allowed in (
+            ("transport", ("sync", "batch")),
+            ("retry_mode", ("off", "on_gate_fail", "always")),
+            ("provider", ("inherit", "anthropic", "vertex")),
+        ):
+            value = facts.get(key)
+            if value is not None and value not in allowed:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"extraction.facts.{key} must be one of {list(allowed)} (got {value!r})",
+                )
+        vertex_region = facts.get("vertex_region")
+        if vertex_region is not None:
+            if not isinstance(vertex_region, str):
+                raise HTTPException(status_code=422, detail="extraction.facts.vertex_region must be a string")
+            if vertex_region.strip():
+                from connectors.sharepoint.facts_extraction import _region_looks_valid
+
+                region_norm = vertex_region.strip().lower()
+                if not _region_looks_valid(region_norm):
+                    raise HTTPException(
+                        status_code=422,
+                        detail=(
+                            "extraction.facts.vertex_region must be lowercase letters, digits and dash "
+                            f"('global' allowed), or empty (got {vertex_region!r})"
+                        ),
+                    )
+                _validate_vertex_region_model_matrix(region_norm, facts.get("model"))
+
     crawler = patch.get("crawler")
     if crawler is not None:
         if not isinstance(crawler, dict):
@@ -630,6 +795,51 @@ def _validate_extraction_section(sections: Dict[str, Dict[str, Any]]) -> None:
                     detail=(
                         f"extraction.crawler.concurrency must be between {_CRAWLER_CONCURRENCY_MIN} and "
                         f"{_CRAWLER_CONCURRENCY_MAX} (got {concurrency})"
+                    ),
+                )
+        mem_limit_mb = crawler.get("convert_child_memory_limit_mb")
+        if mem_limit_mb is not None:
+            if not isinstance(mem_limit_mb, int) or isinstance(mem_limit_mb, bool):
+                raise HTTPException(
+                    status_code=422, detail="extraction.crawler.convert_child_memory_limit_mb must be an integer"
+                )
+            if mem_limit_mb < _CONVERT_CHILD_MEMORY_LIMIT_MIN_MB or mem_limit_mb > _CONVERT_CHILD_MEMORY_LIMIT_MAX_MB:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "extraction.crawler.convert_child_memory_limit_mb must be between "
+                        f"{_CONVERT_CHILD_MEMORY_LIMIT_MIN_MB} and {_CONVERT_CHILD_MEMORY_LIMIT_MAX_MB} "
+                        f"(got {mem_limit_mb}); 0 disables the cap"
+                    ),
+                )
+        max_rss_mb = crawler.get("convert_child_max_rss_mb")
+        if max_rss_mb is not None:
+            if not isinstance(max_rss_mb, int) or isinstance(max_rss_mb, bool):
+                raise HTTPException(
+                    status_code=422, detail="extraction.crawler.convert_child_max_rss_mb must be an integer"
+                )
+            if max_rss_mb < _CONVERT_CHILD_MAX_RSS_MIN_MB or max_rss_mb > _CONVERT_CHILD_MAX_RSS_MAX_MB:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "extraction.crawler.convert_child_max_rss_mb must be between "
+                        f"{_CONVERT_CHILD_MAX_RSS_MIN_MB} and {_CONVERT_CHILD_MAX_RSS_MAX_MB} "
+                        f"(got {max_rss_mb}); 0 disables the watchdog"
+                    ),
+                )
+        spares_per_slot = crawler.get("convert_spares_per_slot")
+        if spares_per_slot is not None:
+            if not isinstance(spares_per_slot, int) or isinstance(spares_per_slot, bool):
+                raise HTTPException(
+                    status_code=422, detail="extraction.crawler.convert_spares_per_slot must be an integer"
+                )
+            if spares_per_slot < _CONVERT_SPARES_PER_SLOT_MIN or spares_per_slot > _CONVERT_SPARES_PER_SLOT_MAX:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "extraction.crawler.convert_spares_per_slot must be between "
+                        f"{_CONVERT_SPARES_PER_SLOT_MIN} and {_CONVERT_SPARES_PER_SLOT_MAX} "
+                        f"(got {spares_per_slot}); 0 disables spares"
                     ),
                 )
 
@@ -1133,6 +1343,18 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
                 "than accepted and silently disabling the sweep later."
             ),
         },
+        "concurrency": {
+            "kind": "int",
+            "default": 1,
+            "hint": (
+                "Extraction LANE slots on the worker — how many extraction jobs (crawls and "
+                "fact passes, across all connections) run at the same time. 1 serialises "
+                "everything; raise it so a streamed facts pass can overlap a crawl still "
+                "running, or so several connections crawl in parallel. Clamped to [1, 8] — "
+                "same ceiling the worker runtime itself clamps to, so a value accepted here "
+                "is never silently re-clamped on the worker."
+            ),
+        },
         "timeout_s": {
             "kind": "int",
             "default": 3600,
@@ -1141,6 +1363,20 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
                 "stops between files/pages, persists its state and the job fails; the next "
                 "run resumes from the persisted deltaLinks/cTags. 0 = unbounded. Must be "
                 "between 60 and 86400 (24h)."
+            ),
+        },
+        "stall_after_s": {
+            "kind": "int",
+            "default": 900,
+            "hint": (
+                "How stale a `running` run's last checkpoint may get before the fleet view "
+                "(/admin/extraction) and the source card report it as `stalled` instead of "
+                "`running` — the SAME rule both surfaces use, so the fleet's 'Stuck?' badge "
+                "and the run's own outcome word can never disagree. Being late to say "
+                "'stalled' costs an operator a little patience; being early costs them trust "
+                "in every other number this dashboard shows. Must be between 60 and 86400 "
+                "(24h). A `stalled` run can be force-cancelled from either surface — see "
+                "POST /api/admin/sharepoint/extraction/runs/{run_id}/cancel."
             ),
         },
         "crawler": {
@@ -1155,7 +1391,7 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
                     "default": 6,
                     "hint": (
                         "How many files of one delta page a crawl holds in flight at once "
-                        "(download → convert → anonymize → ingest); clamped to [1, 32]. This is "
+                        "(download → convert → anonymize → ingest); clamped to [1, 64]. This is "
                         "the extraction worker's MEMORY lever: every file in flight is a converter "
                         "child process holding that document, so the worker's peak memory scales "
                         "with it — six in flight has exceeded a 12 GiB container on large decks "
@@ -1164,6 +1400,51 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
                         "Multiplies with extraction.concurrency (crawls at once). A per-run "
                         "override lives in the source card's Run-now options. Read by the worker "
                         "at the start of each run — effective on the next run, no restart."
+                    ),
+                },
+                "convert_child_memory_limit_mb": {
+                    "kind": "int",
+                    "default": 1536,
+                    "hint": (
+                        "Per-document HEADROOM above this worker process's own memory footprint "
+                        "at fork time (RLIMIT_AS on the conversion child), NOT an absolute ceiling — "
+                        "a live 64-vCPU worker's own footprint alone was already ~2.2 GB, so reading "
+                        "this knob as an absolute number capped every child before it converted a "
+                        "single document. Raise it for documents that legitimately need more headroom "
+                        "(a large spreadsheet openpyxl loads whole into memory, in one observed "
+                        "case); lower it to make a runaway document fail faster and more "
+                        "attributably. 0 disables the cap outright. Read by the worker at the start "
+                        "of each run — effective on the next run, no restart."
+                    ),
+                },
+                "convert_child_max_rss_mb": {
+                    "kind": "int",
+                    "default": 4096,
+                    "hint": (
+                        "Absolute per-child RSS ceiling the PARENT itself polls for every ~0.5s while a "
+                        "conversion is in flight — SEPARATE from convert_child_memory_limit_mb above, "
+                        "which is HEADROOM above the worker's own memory footprint at fork time and "
+                        "does not bound RSS once the crawl parent itself has grown over a long run "
+                        "(observed reaching 10-17 GB RSS on one child before that headroom-based cap "
+                        "ever fired). Crossing this ceiling kills the child directly and counts THAT "
+                        "file convert_failed, attributably — never the vaguer wording a kernel- or "
+                        "host-level OOM kill gets. 0 disables the watchdog outright. Linux only (reads "
+                        "/proc/<pid>/status) — a no-op on any other platform. Read by the worker at the "
+                        "start of each run — effective on the next run, no restart."
+                    ),
+                },
+                "convert_spares_per_slot": {
+                    "kind": "int",
+                    "default": 2,
+                    "hint": (
+                        "How many pre-forked standby conversion children each concurrency slot keeps "
+                        "ready, so a slot that recycles or crashes mid-page has somewhere to fail over "
+                        "to WITHOUT waiting for the next page's repair() — a single spare (the original "
+                        "design) could be exhausted by two recycles/crashes on the same slot inside one "
+                        "delta page, leaving it down (or over its RSS budget) for the rest of that page. "
+                        "Costs one idle, import-only process per spare per slot. 0 disables spares "
+                        "outright. Read by the worker at the start of each run — effective on the next "
+                        "run, no restart."
                     ),
                 },
             },
@@ -1194,7 +1475,7 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
                     "kind": "int",
                     "default": 3,
                     "hint": (
-                        "How many documents are extracted in parallel; clamped to [1, 16]. "
+                        "How many documents are extracted in parallel; clamped to [1, 64]. "
                         "1 is exactly sequential — the knob buys wall clock, never a different "
                         "result. Raise it to spend a large corpus's time budget on more "
                         "concurrent calls; lower it when the model account's rate limit is the "
@@ -1208,6 +1489,90 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
                         "Optional model override for this stage only — a tier name "
                         "(haiku/sonnet/opus) or a concrete model id. Empty falls back to "
                         "extraction.model, then Haiku."
+                    ),
+                },
+                "stream_every": {
+                    "kind": "int",
+                    "default": 0,
+                    "hint": (
+                        "Run a facts pass WHILE a crawl is still going: after every N "
+                        "successfully ingested files the crawler enqueues a standalone pass "
+                        "for the connection (and one more when it finishes). 0 = off, only "
+                        "the tail pass after the crawl. Needs extraction.concurrency ≥ 2 to "
+                        "actually overlap."
+                    ),
+                },
+                "run_timeout_s": {
+                    "kind": "int",
+                    "default": 3600,
+                    "hint": (
+                        "Time budget of ONE standalone facts pass, seconds. A pass that hits "
+                        "it stops between documents, keeps everything already shipped, and "
+                        "the next pass resumes — a small budget just means more passes."
+                    ),
+                },
+                "concurrency_passes": {
+                    "kind": "int",
+                    "default": 4,
+                    "hint": (
+                        "Ceiling on how many PARTITIONS one facts-extraction trigger fans out "
+                        "into at most — each partition is its own worker-lane job over a "
+                        "disjoint slice of the connection's pending documents, run in "
+                        "parallel. Also capped by the backlog itself (never more than "
+                        "ceil(pending / 2000) partitions). A live finding measured 7 "
+                        "connections running facts extraction in parallel at ~11,800 "
+                        "documents/hour, versus ~1,400/hour once merged into one connection "
+                        "(one lock, one job) — throughput scales with concurrent passes, not "
+                        "corpus size. 1 disables fan-out entirely."
+                    ),
+                },
+                "transport": {
+                    "kind": "string",
+                    "default": "sync",
+                    "hint": (
+                        "Instance default for which API carries the extraction calls: 'sync' "
+                        "(immediate, bound by the model account's per-minute token limit) or "
+                        "'batch' (Anthropic Batches API: no per-minute ceiling, half the price, "
+                        "hours of latency — the right choice for a bulk pass over a large "
+                        "corpus). A connection can override it on its source card."
+                    ),
+                },
+                "retry_mode": {
+                    "kind": "string",
+                    "default": "on_gate_fail",
+                    "hint": (
+                        "Instance default for the ONE corrective retry after the verbatim gate: "
+                        "'on_gate_fail' (retry only when a quote still fails after the free "
+                        "deterministic repair), 'off' (never retry — cheapest, lowest recall), "
+                        "'always' (retry whenever the first pass had any failure). A connection "
+                        "can override it on its source card."
+                    ),
+                },
+                "provider": {
+                    "kind": "string",
+                    "default": "inherit",
+                    "hint": (
+                        "Instance default for which LLM provider carries this stage's calls: "
+                        "'inherit' (default) follows this instance's ai.provider (vertex when "
+                        "chat/LLM traffic already runs through Google Vertex AI, anthropic "
+                        "otherwise); 'anthropic'/'vertex' pin this stage regardless of ai.provider "
+                        "— e.g. keep facts extraction on a still-working Anthropic key while chat "
+                        "has moved to Vertex, or the reverse. The Anthropic Batches API has no "
+                        "Vertex equivalent: a vertex-resolved provider always runs the sync "
+                        "transport, regardless of extraction.facts.transport. A connection can "
+                        "override it on its source card."
+                    ),
+                },
+                "vertex_region": {
+                    "kind": "string",
+                    "default": "",
+                    "hint": (
+                        "Instance default for WHICH Vertex AI region a provider: vertex pass's client "
+                        "talks to, on top of ai.vertex.region. Google enforces Claude-on-Vertex quotas "
+                        "PER REGION, so pinning different connections to different regions raises the "
+                        "account's effective throughput at the same per-call price. Empty falls back to "
+                        "ai.vertex.region. Lowercase letters, digits and dash ('global' allowed). A "
+                        "connection can override it on its source card."
                     ),
                 },
             },
@@ -10455,50 +10820,146 @@ def run_corporate_memory(
     }
 
 
-@router.post("/run-knowledge-packaging")
+@router.post("/run-knowledge-packaging", status_code=202)
 def run_knowledge_packaging(
     user: dict = Depends(require_admin),
 ):
-    """Rebuild per-collection knowledge.duckdb artifacts whose content changed.
+    """Enqueue a ``knowledge-packaging`` worker job (K3, #798).
 
-    Scheduler-driven (K3, #798): fingerprints each corpus's chunks, rebuilds
-    stale artifacts, prunes artifacts for deleted corpora. Idempotent and
-    cheap when nothing changed (fingerprint check only). Mirrors
-    run_corporate_memory's audit + error posture.
+    TCRD-296 synthesis C.15: this used to run the packaging pass INLINE,
+    synchronously, inside the request — the scheduler's own 600s client
+    timeout was the only bound on it, and a pass slower than that left the
+    NEXT scheduler tick free to fire a second, overlapping call. Two
+    overlapping in-process runs raced each other hard enough to OOM the
+    app (see ``src.knowledge_packaging``'s module docstring for the exact
+    collision). This endpoint is now a thin enqueue: the actual pass runs
+    as the ``knowledge-packaging`` worker job kind
+    (``app/worker/kinds.py::_run_knowledge_packaging``), which supplies the
+    single-run guarantee (idempotency-keyed enqueue below, plus a
+    belt-and-braces PG advisory lock inside the handler) and a wall-clock
+    time budget — a scheduler tick can no longer overlap a still-running
+    pass. Poll ``GET /api/jobs/{job_id}`` (or ``agnes admin jobs show
+    <job_id>``) for the result, or use
+    ``GET /api/admin/knowledge-packaging/status`` for a summary of the
+    last run.
+
+    Returns 202 with ``{"status": "queued", "job_id": ...}`` on a fresh
+    enqueue. Returns 409 with the in-flight ``job_id`` when a run is
+    already ``'queued'``/``'running'`` (the scheduler's own cadence can
+    legitimately outpace a slow pass — this is expected, not an error to
+    page on). Returns 501 (typed ``requires_worker_role``) when this
+    process has no worker role: enqueueing here would leave the job
+    ``'queued'`` forever with nothing to claim it — see
+    ``docs/observability.md`` -> "Knowledge packaging" for the operator
+    fix (give a process ``AGNES_ROLE`` including ``worker`` — the default
+    ``all`` role already does).
     """
-    from src.knowledge_packaging import run_packaging_pass
+    from app.roles import Role, role_enabled
+    from src.repositories import jobs_repo
 
-    job_error: Optional[Exception] = None
-    summary: dict = {}
-    try:
-        summary = run_packaging_pass()
-    except Exception as e:
-        # Mirror run_corporate_memory / run_verification_detector: capture
-        # any unhandled error so audit_log + /admin/scheduler-runs reflect
-        # the failure. Re-raised below after audit.
-        job_error = e
+    if not role_enabled(Role.WORKER):
+        raise HTTPException(
+            status_code=501,
+            detail={
+                "error": "requires_worker_role",
+                "message": (
+                    "knowledge packaging needs the worker role — this process has no "
+                    "worker loop to claim the job. Run it on (or add) a process whose "
+                    "AGNES_ROLE includes 'worker' (the default 'all' role already does)."
+                ),
+            },
+        )
 
-    audit_params: dict = {
-        "built": len(summary.get("built", [])),
-        "skipped": len(summary.get("skipped", [])),
-        "pruned": len(summary.get("pruned", [])),
-        "errors": len(summary.get("errors", [])),
-    }
-    if job_error is not None:
-        audit_params["unhandled_error"] = f"{type(job_error).__name__}: {job_error}"
+    job = jobs_repo().enqueue("knowledge-packaging", {}, idempotency_key="knowledge-packaging")
+    already_in_progress = job["deduped"]
 
-    audit_repo().log(
+    log_safe(
         user_id=user.get("id"),
         client_kind=client_kind_from_user(user),
         action="run_knowledge_packaging",
         resource="job:knowledge-packaging",
-        params=audit_params,
+        params={"job_id": job["id"], "deduped": already_in_progress},
+        result="error.in_progress" if already_in_progress else "success",
     )
 
-    if job_error is not None:
-        raise HTTPException(status_code=500, detail=audit_params["unhandled_error"])
+    if already_in_progress:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "knowledge_packaging_already_in_progress", "job_id": job["id"]},
+        )
 
-    return {"ok": not summary.get("errors"), "details": summary}
+    return {"status": "queued", "job_id": job["id"]}
+
+
+@router.get("/knowledge-packaging/status")
+def knowledge_packaging_status(
+    _user: dict = Depends(require_admin),
+):
+    """Observability summary for the ``knowledge-packaging`` worker job
+    kind (TCRD-296 synthesis C.15): the most recent run's outcome, whether
+    one is running right now, and (best-effort) when the next scheduled
+    run is due.
+
+    ``last_run``: the most recent ``knowledge-packaging`` job row
+    (regardless of status), or ``null`` if the kind has never run on this
+    instance — ``{"job_id", "status", "created_at", "finished_at",
+    "result"}`` where ``result`` is the pass summary (built/skipped/
+    pruned/errors/interrupted_reason/duration_s/collections_total/
+    collections_processed) when the job completed.
+    ``running``: whether a ``knowledge-packaging`` job is currently
+    ``'queued'`` or ``'running'``.
+    ``next_due``: an ISO timestamp estimate (last completed run's
+    ``created_at`` + ``SCHEDULER_KNOWLEDGE_PACKAGING_INTERVAL``), or
+    ``null`` when no run has completed yet or the scheduler's durable
+    last-run marker can't be read — this is an ESTIMATE (the scheduler
+    process's own last-run/interval state is the authority; see
+    ``services/scheduler/__main__.py``), not a guaranteed next-fire time.
+    """
+    from src.repositories import jobs_repo
+
+    rows = jobs_repo().list(kind="knowledge-packaging", limit=1)
+    last_run = None
+    running = False
+    if rows:
+        row = rows[0]
+        running = row.get("status") in ("queued", "running")
+        last_run = {
+            "job_id": row.get("id"),
+            "status": row.get("status"),
+            "created_at": row.get("created_at"),
+            "finished_at": row.get("finished_at"),
+            "result": (row.get("payload_json") or {}).get("result"),
+        }
+
+    return {"last_run": last_run, "running": running, "next_due": _knowledge_packaging_next_due()}
+
+
+def _knowledge_packaging_next_due() -> Optional[str]:
+    """Best-effort estimate of the next ``knowledge-packaging`` scheduler
+    tick, read from the scheduler's durable last-run marker
+    (``services/scheduler/__main__.py``'s ``scheduler_last_run.json``, on
+    the ``DATA_DIR`` volume the app and scheduler containers share).
+
+    Never raises — this is observability, not a correctness dependency: a
+    missing/unreadable marker file, an unset entry, or a malformed
+    timestamp all resolve to ``None`` (unknown) rather than failing the
+    status endpoint.
+    """
+    try:
+        data_dir = Path(os.environ.get("DATA_DIR", "/data"))
+        marker_path = data_dir / "state" / "scheduler_last_run.json"
+        if not marker_path.exists():
+            return None
+        marker = json.loads(marker_path.read_text())
+        last_run_iso = marker.get("knowledge-packaging")
+        if not last_run_iso:
+            return None
+        last_run_dt = datetime.fromisoformat(last_run_iso)
+        interval_s = int(os.environ.get("SCHEDULER_KNOWLEDGE_PACKAGING_INTERVAL", 15 * 60))
+        return (last_run_dt + timedelta(seconds=interval_s)).isoformat()
+    except Exception:
+        logger.warning("knowledge-packaging status: could not estimate next_due", exc_info=True)
+        return None
 
 
 @router.post("/run-knowledge-digests")

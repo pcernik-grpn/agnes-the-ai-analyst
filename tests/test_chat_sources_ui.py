@@ -133,13 +133,21 @@ def test_mermaid_is_not_loaded_with_the_page():
 
 def test_mermaid_output_bypasses_the_markdown_sanitizer():
     """The load-bearing decision. If someone routes this through
-    renderMarkdownSafe for consistency, every diagram loses its colours."""
+    renderMarkdownSafe for consistency, every diagram loses its colours.
+
+    The insertion moved into `_buildMermaidFigure` (the figure now carries a
+    toolbar, so building it is its own step) and the redraw in
+    `rerenderMermaidForTheme` is a second insertion point. Both are checked:
+    a sanitizer creeping into either one costs the diagram its palette."""
     js = _read(CHAT_JS)
-    body = js[js.index("function renderMermaidBlocks") : js.index("// ---------- Sources block")]
-    assert "fig.innerHTML = svg;" in body
-    assert "renderMarkdownSafe" not in _code_only(body), (
-        "mermaid's own <style> block is stripped by the sanitizer — see this test's docstring"
-    )
+    build = js[js.index("function _buildMermaidFigure") : js.index("function downloadMermaidSvg")]
+    assert "stage.innerHTML = svg;" in build
+    redraw = js[js.index("function rerenderMermaidForTheme") : js.index("if (typeof MutationObserver")]
+    assert "stage.innerHTML = svg;" in redraw
+    for body in (build, redraw):
+        assert "renderMarkdownSafe" not in _code_only(body), (
+            "mermaid's own <style> block is stripped by the sanitizer — see this test's docstring"
+        )
 
 
 def test_mermaid_treats_the_diagram_source_as_untrusted():
@@ -434,11 +442,19 @@ class TestAnUnsourcedFigureIsNotSilent:
         assert 'closest("button' in fn, "an icon inside a control still counts as a figure"
 
     def test_the_figure_check_covers_both_mermaid_forms(self):
-        """Mermaid rendering is async — at chip time it may still be its <pre>."""
+        """Mermaid rendering is async — at chip time it may still be its <pre>.
+
+        Both names matter and NEITHER is `mermaid`: the sanitized fence is
+        `<pre><code class="language-mermaid">` and the rendered figure is
+        `.msg-mermaid`. The check used to name `pre.mermaid` / `.mermaid`,
+        which match neither, so the pre-render form this test exists to cover
+        was never actually covered — a diagram-only answer read as having no
+        figure at all."""
         js = _chat_js()
         fn = js[js.index("function _bubbleHasFigure") : js.index("function renderSourcesChips")]
-        for sel in ("table", "svg", "pre.mermaid"):
+        for sel in ("table", "svg", "code.language-mermaid", ".msg-mermaid"):
             assert sel in fn, f"figure check misses {sel}"
+        assert "pre.mermaid" not in fn, "a selector that matches nothing is not coverage"
 
 
 # ── the chip is the link ───────────────────────────────────────────────────

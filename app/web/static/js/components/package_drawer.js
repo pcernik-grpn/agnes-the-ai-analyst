@@ -401,12 +401,8 @@
       if (drop) {
         var hook = drop.getAttribute('data-picker-dropfacet');
         if (hook === 'unpackaged') pickerUnpackagedOnly = false;
+        else if (hook === 'selected') pickerSelectedOnly = false;
         else pickerFacets[hook] = [];
-        renderPickerFiltered();
-        return;
-      }
-      if (e.target.closest('[data-selected]')) {
-        pickerSelectedOnly = !pickerSelectedOnly;
         renderPickerFiltered();
         return;
       }
@@ -434,6 +430,11 @@
       }
       if (e.target.closest('[data-unpackaged]')) {
         pickerUnpackagedOnly = !pickerUnpackagedOnly;
+        renderPickerFiltered();
+        return;
+      }
+      if (e.target.closest('[data-selected]')) {
+        pickerSelectedOnly = !pickerSelectedOnly;
         renderPickerFiltered();
         return;
       }
@@ -776,18 +777,17 @@
       // agents.html → .ag-slot): a bold line naming the state, one sentence
       // on how to leave it, then the add row. A one-line grey sentence reads
       // as a caption on a broken list rather than as an invitation.
-      // With an empty registry there is nothing to propose FROM, so the
-      // invitation to describe it would be a promise the instance cannot
-      // keep. Name the actual state instead. The test is the REGISTRY, not
-      // the connection count: internal tables are registered on every
-      // instance and are perfectly packageable.
-      //
-      // The registry-present case deliberately stops at the heading (per
-      // PR #2187): the sentence under it used to repeat the opening line of
-      // the conversation two panes to the left and the "Add tables" button
-      // right below it — three statements of one instruction, stacked. The
-      // no-source case keeps its own body: there is no conversation to defer
-      // to yet, and "connect a source" is the one actionable next step.
+      /* Two states, and they are not the same problem. With tables registered
+         the package is simply empty, and the heading says so on its own: the
+         sentence that used to sit under it repeated the opening line of the
+         conversation two panes to the left (“Tell me what this package should
+         carry…”) and the button directly below it (“Add tables”) — three
+         statements of one instruction, stacked. With NOTHING registered there
+         is nothing to propose from, so the invitation would be a promise the
+         instance cannot keep; name the actual state and offer the way out of
+         it. The test is the REGISTRY, not the connection count: internal
+         tables are registered on every instance and are perfectly
+         packageable. */
       body = (st.registry || []).length
         ? '<div class="ag-slot"><p class="ag-slot-head">Nothing in it yet.</p></div>'
         : '<div class="ag-slot">' +
@@ -950,45 +950,61 @@
      it). Pressed-state toggles rather than a filter MENU: there are two
      vocabularies and both are short, and a menu one level deep is a filter
      you set once and abandon. */
+  /* The Library's filter, in the table picker: a Filter button on the search
+     row, a faceted menu behind it, and one removable chip per applied
+     category. It was a flat strip of `fbar-toggle` pills — the right classes
+     but the wrong shape, and with SOURCE and QUERY MODE both spelled out it
+     ran to two full rows of chrome above the tree before a single table.
+
+     The filtering itself stays this page's own: the rows are a project →
+     bucket → table TREE with parent checkboxes and per-node counts, which is
+     not the flat row set `FilterToolbar` drives. So this borrows the shape and
+     keeps the engine out — the alternative is teaching the engine about trees
+     to save a hundred lines here. */
+  function facetGroupHtml(key, label) {
+    var opts = facetOptions(key);
+    if (opts.length < 2) return '';   // one value filters nothing
+    var chosen = pickerFacets[key];
+    return '<div class="fbar-menu__group"><p class="fbar-menu__title">' + esc(label) + '</p>' +
+      opts.map(function (o) {
+        return '<label class="fbar-menu__opt">' +
+          '<input type="checkbox" data-facet="' + esc(key) + '" value="' + esc(o.value) + '"' +
+          (chosen.indexOf(o.value) !== -1 ? ' checked' : '') + '>' +
+          '<span class="fbar-menu__opt-text">' + esc(o.value) + '</span>' +
+          '<span class="fbar-menu__opt-n">' + o.n + '</span></label>';
+      }).join('') + '</div>';
+  }
+
+  function unpackagedCount() {
+    return (st ? st.registry : []).filter(function (t) { return !t.packaged; }).length;
+  }
+
+  /* Rides the search row: the Filter button, its menu, and the sort control. */
   function pickerControlsHtml() {
-    function toggles(key, label) {
-      var opts = facetOptions(key);
-      if (opts.length < 2) return '';   // one value filters nothing
-      var chosen = pickerFacets[key];
-      // The label is not decoration: `internal` is a value of BOTH
-      // vocabularies (a source_type and a query_mode) and the strip put the
-      // two identical-looking chips one line apart, each meaning something
-      // else. A group is unreadable without saying what it is a group OF.
-      return '<span class="pdw-pickctl__grp" role="group" aria-label="Filter by ' + esc(label) + '">' +
-        '<span class="pdw-pickctl__k">' + esc(label) + '</span>' +
-        opts.map(function (o) {
-          var on = chosen.indexOf(o.value) !== -1;
-          // ONE class attribute — `is-active` is what filter_toolbar.css
-          // paints, `aria-pressed` is what a screen reader reads, and both
-          // have to agree.
-          return '<button type="button" class="fbar-toggle' + (on ? ' is-active' : '') + '"' +
-            ' data-facet="' + esc(key) + '" data-value="' + esc(o.value) + '"' +
-            ' aria-pressed="' + (on ? 'true' : 'false') + '">' +
-            '<span>' + esc(o.value) + '</span>' +
-            '<span class="fbar-toggle__n">' + o.n + '</span></button>';
-        }).join('') + '</span>';
-    }
-    var unpackagedN = unpackagedCount();
+    var groups = facetGroupHtml('source_type', 'Source') + facetGroupHtml('query_mode', 'Query mode');
+    var un = unpackagedCount();
     // Offered only when it narrows something: on a fresh instance every row is
     // unpackaged, and a filter that hides nothing is a control that lies.
-    var unpackaged = (unpackagedN && unpackagedN < (st ? st.registry.length : 0))
-      ? '<button type="button" class="fbar-toggle' + (pickerUnpackagedOnly ? ' is-active' : '') + '"' +
-        ' data-unpackaged="1" aria-pressed="' + (pickerUnpackagedOnly ? 'true' : 'false') + '"' +
-        ' aria-label="In no package — tables no analyst can pull yet">' +
-        '<span>In no package</span><span class="fbar-toggle__n">' + unpackagedN + '</span></button>'
-      : '';
+    if (un && un < (st ? st.registry.length : 0)) {
+      groups += '<div class="fbar-menu__group"><p class="fbar-menu__title">Reach</p>' +
+        '<label class="fbar-menu__opt">' +
+        '<input type="checkbox" data-unpackaged="1"' + (pickerUnpackagedOnly ? ' checked' : '') + '>' +
+        '<span class="fbar-menu__opt-text">In no package</span>' +
+        '<span class="fbar-menu__opt-n">' + un + '</span></label></div>';
+    }
+    /* “In this package” is the same question from the other side, so it is an
+       option in the same menu rather than a button of its own. Offered only
+       once something is ticked: with nothing selected it can only ever
+       return an empty list. */
     var pickedN = st ? st.tablesSelected.size : 0;
-    var picked = pickedN
-      ? '<button type="button" class="fbar-toggle' + (pickerSelectedOnly ? ' is-active' : '') + '"' +
-        ' data-selected="1" aria-pressed="' + (pickerSelectedOnly ? 'true' : 'false') + '"' +
-        ' aria-label="In this package — only the tables you have ticked">' +
-        '<span>In this package</span><span class="fbar-toggle__n">' + pickedN + '</span></button>'
-      : '';
+    if (pickedN) {
+      groups += '<div class="fbar-menu__group"><p class="fbar-menu__title">In this package</p>' +
+        '<label class="fbar-menu__opt">' +
+        '<input type="checkbox" data-selected="1"' + (pickerSelectedOnly ? ' checked' : '') + '>' +
+        '<span class="fbar-menu__opt-text">Only what I have ticked</span>' +
+        '<span class="fbar-menu__opt-n">' + pickedN + '</span></label></div>';
+    }
+    // The label travels with the control it names, not to the far side of the row.
     var sort = '<span class="pdw-pickctl__k pdw-pickctl__k--sort">Sort</span>' +
       '<span class="fbar-select pdw-pickctl__sort">' +
       '<select data-picker-sort aria-label="Sort tables">' +
@@ -996,24 +1012,51 @@
         return '<option value="' + esc(o.value) + '"' +
           (pickerSort === o.value ? ' selected' : '') + '>' + esc(o.label) + '</option>';
       }).join('') + '</select></span>';
-    var clear = facetsActive()
-      ? '<button type="button" class="pdw-pickctl__clear" data-picker-clear>Clear filters</button>'
+    /* The BUTTON is conditional, the ROW is not. With no facet to offer the
+       menu behind it would be empty, so the button stays away; but a row that
+       disappears entirely gave an instance whose tables share one source and
+       one mode a bare search box and no visible way to narrow anything, which
+       reads as "this modal has no filters" — and a lone right-aligned
+       dropdown over three rows reads as a stray control rather than a panel. */
+    var filter = groups
+      ? '<div class="fbar-filter">' +
+          '<button type="button" class="fbar-filter__btn' + (facetsActive() ? ' is-active' : '') + '"' +
+            ' data-picker-filterbtn aria-haspopup="menu" aria-expanded="false">' +
+            '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" ' +
+            'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+            '<path d="M3 5h18M6 12h12M10 19h4"/></svg>Filter' +
+            (facetsActive() ? '<span class="fbar-filter__n">' + facetsActive() + '</span>' : '') +
+          '</button>' +
+          '<div class="fbar-menu" id="pdw-picker-menu" role="menu" aria-label="Filter tables" hidden>' +
+            groups +
+            '<div class="fbar-menu__foot"><button type="button" data-picker-clear>Clear all</button></div>' +
+          '</div>' +
+        '</div>'
       : '';
-    /* The strip is ALWAYS here now. Both previous versions were wrong in
-       opposite directions: rendering only when a facet happened to narrow
-       meant an instance whose tables share a source and a mode got a bare
-       search box and no visible way to narrow anything, which reads as "this
-       modal has no filters"; and gating the sort away left a lone dropdown
-       right-aligned over three rows, which reads as a stray control. A
-       labelled row that is always in the same place is a control panel — even
-       when all it holds is Sort. */
-    var body = toggles('source_type', 'source') + toggles('query_mode', 'query mode') +
-      unpackaged + picked + sort + clear;
-    return '<div class="pdw-pickctl">' + body + '</div>';
+    return '<div class="pdw-pickctl">' + filter + sort + '</div>';
   }
 
-  function unpackagedCount() {
-    return (st ? st.registry : []).filter(function (t) { return !t.packaged; }).length;
+  /* Row two: one chip per applied CATEGORY, reading "Source: keboola, jira".
+     Its × drops that category; the row disappears when nothing is applied. */
+  function pickerChipsHtml() {
+    function chip(hook, label, vals) {
+      return '<span class="fbar-chip">' +
+        '<span class="fbar-chip__edit">' +
+          '<span class="fbar-chip__label">' + esc(label) + (vals ? ':' : '') + '</span>' +
+          (vals ? '<span class="fbar-chip__vals">' + esc(vals) + '</span>' : '') +
+        '</span>' +
+        '<button type="button" class="fbar-chip__x" data-picker-dropfacet="' + esc(hook) + '" ' +
+          'aria-label="Remove ' + esc(label) + ' filter">×</button>' +
+      '</span>';
+    }
+    var out = [];
+    if (pickerFacets.source_type.length) out.push(chip('source_type', 'Source', pickerFacets.source_type.join(', ')));
+    if (pickerFacets.query_mode.length) out.push(chip('query_mode', 'Query mode', pickerFacets.query_mode.join(', ')));
+    if (pickerUnpackagedOnly) out.push(chip('unpackaged', 'In no package', ''));
+    if (pickerSelectedOnly) out.push(chip('selected', 'In this package', ''));
+    if (!out.length) return '<div class="fbar-chips ag-pick-chips" hidden></div>';
+    return '<div class="fbar-chips ag-pick-chips">' + out.join('') +
+      '<button type="button" class="pdw-pickctl__clear" data-picker-clear>Clear all</button></div>';
   }
 
   function pickerHtml() {
@@ -1047,16 +1090,8 @@
       shown: shown,
       total: total,
       rows: pickerRowsHtml(),
-      controls: pickerControlsHtml(),
-      /* Two different "not here" causes, so two answers, and both are
-         ACTIONS. They were a sentence with two links buried in it — which is
-         the wrong shape for the thing you reach for at the exact moment the
-         list has failed you, and it is now the only place the connect route
-         lives (the panel's standing line is gone). */
-      /* "Not here" has exactly two causes and they need different work, so
-         each option says WHICH case it answers rather than leaving the admin
-         to guess from the verb. Two links at opposite ends of a grey bar
-         named the destinations and explained neither. */
+      toolbarExtra: pickerControlsHtml(),
+      controls: pickerChipsHtml(),
       foot: '<p class="pdw-pickfoot__q">Can\u2019t find the table you need?</p>' +
         '<div class="pdw-pickfoot__opts">' +
           '<a class="pdw-pickfoot__opt" href="/admin/tables">' +
@@ -1087,23 +1122,45 @@
      state and whether "Clear filters" exists. Separate from
      `renderPickerRows` because the search box must keep its focus and caret,
      and this never touches it. */
+  /* Repaint the rows, the Filter button's applied-count and the chip row —
+     never the whole modal, which would take the search box's caret with it. */
   function renderPickerFiltered() {
     renderPickerRows();
     renderPickerStrip();
   }
 
-  /* The controls strip ALONE. Its "In this package" toggle carries a count of
+  /* The filter control ALONE. Its "In this package" option carries a count of
      what is ticked, so it goes stale on every tick — and re-rendering the
      rows to refresh a count would throw away the tree's open/closed state
-     under the admin mid-selection. The strip is always rendered now, so this
-     replaces it in place and puts it back if it somehow went missing. */
+     under the admin mid-selection. So the button, its menu and the chip row
+     are replaced in place, and an open menu is reopened after the swap. */
   function renderPickerStrip() {
     if (!els || !els.picker) return;
-    var next = pickerControlsHtml();
-    var strip = els.picker.querySelector('.pdw-pickctl');
-    if (strip) { strip.outerHTML = next; return; }
-    var rows = els.picker.querySelector('.ag-pick-rows');
-    if (rows) rows.insertAdjacentHTML('beforebegin', next);
+    var wasOpen = !!els.picker.querySelector('#pdw-picker-menu:not([hidden])');
+    var host = document.createElement('div');
+    host.innerHTML = pickerControlsHtml();
+    var next = host.firstElementChild;
+    var row = els.picker.querySelector('.pdw-pickctl');
+    if (row && next) row.replaceWith(next);
+    else if (next) {
+      // The row is always supposed to be here; put it back if it went missing.
+      var anchor = els.picker.querySelector('.ag-pick-rows');
+      if (anchor) anchor.insertAdjacentElement('beforebegin', next);
+    }
+    // The popover stays open across a tick: closing it on every choice would
+    // make a multi-select facet a one-select facet in practice.
+    if (wasOpen && next) {
+      var m = next.querySelector('#pdw-picker-menu');
+      if (m) m.hidden = false;
+      var b = next.querySelector('[data-picker-filterbtn]');
+      if (b) b.setAttribute('aria-expanded', 'true');
+    }
+    var chips = els.picker.querySelector('.ag-pick-chips');
+    if (chips) {
+      var ch = document.createElement('div');
+      ch.innerHTML = pickerChipsHtml();
+      chips.replaceWith(ch.firstElementChild);
+    }
   }
 
   /* Rows + count only, so the search box keeps its focus and caret. */

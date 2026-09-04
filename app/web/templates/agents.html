@@ -720,9 +720,6 @@
   }
 
   /* Picker rows — the full RBAC-scoped pool, filtered by the modal's search. */
-  /* The kind strip, in the picker's `controls` slot — the same slot the
-     package builder uses to slice its own pool. A kind with nothing in it is
-     not offered: a filter that can only ever return zero is a dead control. */
   /* The Library's Filter button + faceted menu + chip row, verbatim markup —
      `.fbar-filter`, `.fbar-menu`, `.fbar-chips` (filter_toolbar.css) — so the
      picker filters the way the Library does rather than with a bespoke strip
@@ -770,7 +767,7 @@
   function knowledgeRows(a) {
     if (!KNOWLEDGE.length) {
       return '<p class="ag-emptyrows">Nothing you can access yet — add data or memory from the ' +
-        '<a href="/catalog">Catalog</a>, or upload files in <a href="/artefacts">Artefacts</a>.</p>';
+        '<a href="/catalog">Catalog</a>, or upload files in <a href="/artefacts">Artifacts</a>.</p>';
     }
     return KNOWLEDGE.map(function (k) { return knowledgeRow(a, k, 'pick'); }).join('') +
       '<p class="ag-emptyrows" id="ag-kn-noresults" hidden>Nothing here matches that.</p>';
@@ -1007,36 +1004,6 @@
     '<div class="ag-note">Where the agent will be reachable once publishing lands. Web chat is the base surface.</div>';
   }
 
-  /* Design doc §12 — a table in this agent's Data & resources may carry an
-     access policy, and the slice a request sees through it depends on WHICH
-     identity a surface binds: a Slack channel bound to this agent, or a
-     scheduled run, run AS THE OWNER (the note above already says so for the
-     agent as a whole) — so every mention or scheduled turn gets the OWNER's
-     row slice, never the mentioner's or the schedule's. A direct caller
-     (agent-as-API, chat, a delegated turn) is filtered by its OWN identity
-     instead. `a.policied_tables_in_scope` / `a.policied_tables` come from the
-     server (`app.api.agents_admin._serialize`), computed for the OWNER. */
-  function policyDisclosureNote(a) {
-    var ids = a.policied_tables_in_scope || [];
-    if (!ids.length) return '';
-    var tables = a.policied_tables || [];
-    var detail = tables.map(function (t) {
-      var p = t.policy || {};
-      var slice = p.rows_visible != null
-        ? p.rows_visible + ' row' + (p.rows_visible === 1 ? '' : 's') + ' visible to the owner'
-        : esc(p.note || ('reason: ' + (p.reason || 'unknown')));
-      return '<li>' + esc(t.name || t.table_id) + ' — ' + slice + '</li>';
-    }).join('');
-    return '<div class="ag-note ag-note--warn">' +
-      '<strong>' + ids.length + ' table' + (ids.length === 1 ? '' : 's') + '</strong> in this agent’s data ' +
-      (ids.length === 1 ? 'is' : 'are') + ' filtered by an access policy. A Slack channel bound to this agent, ' +
-      'or a scheduled run, answers everyone with the <strong>owner’s</strong> slice of that data — never the ' +
-      'person actually asking. A direct caller (agent-as-API, chat, or a delegated turn) sees its own slice ' +
-      'instead.' +
-      (detail ? '<ul class="ag-policy-tables">' + detail + '</ul>' : '') +
-    '</div>';
-  }
-
   function boundariesBody() {
     var a = current() || {};
     /* "Scoped to each user's permissions" was false, and false in the
@@ -1058,8 +1025,7 @@
       '</div>' +
       '<div class="ag-note">This agent runs on <strong>your</strong> permissions, never anyone else’s — including ' +
       'when a teammate talks to it. It reaches only what you attached under Data &amp; resources, and it loses that ' +
-      'the moment you do.</div>' +
-      policyDisclosureNote(a);
+      'the moment you do.</div>';
   }
 
   /* ── Schedules — unattended runs on a cadence. CRUD rides the agent-schedules

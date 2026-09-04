@@ -1,0 +1,191 @@
+{% extends "base_admin_page.html" %}
+{% block title %}Extraction fleet — {{ config.INSTANCE_NAME }}{% endblock %}
+
+{# Section-level and PLAIN, matching /admin/sync and /admin/semantic-layer:
+   the h1 names the section ("Data"), the tab strip below names the pipeline
+   lens the reader is one click from. This page is off-nav (see
+   ADMIN_NAV_OFFNAV in app/web/admin_nav.py) — an operator is SENT here from
+   a source card's extraction status, not a lens they pick among Sources /
+   Tables / Data packages. #}
+{% set page_hero_title = "Data" %}
+{% set page_hero_subtitle = "One screen for every SharePoint connection's crawl and fact-graph pass: is it on pace, is anything stuck, what is it costing. Connections live at <a href=\"/admin/data-sources\">Sources</a>." %}
+{% set page_hero_plain = True %}
+
+{% block head_extra %}
+<link rel="stylesheet" href="{{ static_url('css/filter_toolbar.css') }}">
+<style>
+  /* Section head, strip and toolbar placement are the shared admin page
+     vocabulary (`.apg-*` in css/admin_page.css) — only what is specific to
+     this page's own table and cards lives here. */
+
+  .ext-summary { display: flex; gap: 14px; margin-bottom: 20px; flex-wrap: wrap; }
+  .ext-card {
+    background: var(--ds-surface); border: 1px solid var(--ds-border);
+    border-radius: var(--ds-radius-btn); padding: 14px 18px; min-width: 140px; flex: 1;
+  }
+  .ext-card .label {
+    font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase;
+    color: var(--ds-text-muted);
+  }
+  .ext-card .value {
+    font-size: 22px; font-weight: 700; color: var(--ds-text-primary); margin-top: 4px;
+    font-variant-numeric: tabular-nums;
+  }
+  .ext-card .value.danger { color: var(--ds-accent-danger-ink); }
+
+  .ext-scope { display: inline-flex; border: 1px solid var(--ds-border); border-radius: var(--ds-radius-btn); overflow: hidden; }
+  .ext-scope a {
+    padding: 6px 14px; font-size: 12.5px; font-weight: 600; color: var(--ds-text-secondary);
+    text-decoration: none; background: var(--ds-surface);
+  }
+  .ext-scope a.active { background: var(--ds-primary); color: var(--ds-text-inverse); }
+  .ext-scope a + a { border-left: 1px solid var(--ds-border); }
+
+  .ext-fresh { flex: 0 0 auto; font-size: 12px; color: var(--ds-text-muted); white-space: nowrap; }
+
+  .ext-blank { text-align: center; padding: 34px 16px; font-size: 13px; color: var(--ds-text-secondary); }
+
+  .ext-conn { font-weight: 600; color: var(--ds-text-primary); }
+  .ext-sub { font-size: 11px; color: var(--ds-text-secondary); font-family: var(--font-mono, ui-monospace, monospace); }
+  .ext-num { font-size: 12px; font-variant-numeric: tabular-nums; }
+  .ext-error-cell {
+    font-size: 11px; color: var(--ds-accent-danger-ink); max-width: 260px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+
+  tr.ext-row--stuck { background: var(--ds-accent-danger-bg); }
+  tr.ext-row--stuck .ext-conn { color: var(--ds-accent-danger-ink); }
+
+  /* No `.badge` base rule is declared in this page — every status pill below
+     reuses the shared `.badge` + `.badge--{info,warn,success,danger}`
+     vocabulary from components.css, tinted by the SAME accent tokens the
+     rest of the product's status pills use (design-system.md rule 4). */
+
+  /* The queued-vs-running lane-starvation strip (TCRD-296 synthesis) — a
+     small pill row above the table, independent of the table's own scope. */
+  .ext-jobs-strip {
+    display: flex; gap: 18px; flex-wrap: wrap; margin-bottom: 14px;
+    font-size: 12.5px; color: var(--ds-text-secondary);
+  }
+  .ext-jobs-strip__item strong { color: var(--ds-text-primary); font-weight: 700; }
+  .ext-jobs-strip__item--starved { color: var(--ds-accent-danger-ink); font-weight: 600; }
+
+  /* One connection's own reprocessing actions (Retry failed/empty, Re-run) —
+     stacked buttons plus a one-line transient result under them. */
+  .ext-row-actions { display: flex; flex-direction: column; gap: 4px; align-items: flex-start; }
+  .ext-row-actions .btn { white-space: nowrap; }
+  /* Completeness drawer (TCRD-296 B.9) — rendered by the SAME
+     `_extCompletenessHtml`/`toggleExtractionDrawer` functions the source
+     card's drawer uses (data_sources_extraction_observability.js, loaded
+     below): one shared table/actions vocabulary, not a second copy of it. */
+  .ext-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+  .ext-warn { color: var(--ds-accent-warn-ink); }
+  .ext-drawer { margin: 10px 0; padding: 12px; border: 1px solid var(--ds-border); border-radius: var(--ds-radius-btn); background: var(--ds-surface); }
+  .ext-cfg { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  .ext-cfg th, .ext-cfg td { text-align: left; padding: 6px 8px; vertical-align: top; border-bottom: 1px solid var(--ds-border); }
+  .ext-cfg th { font-weight: 600; color: var(--ds-text-secondary); white-space: nowrap; }
+  .ext-completeness .ext-num { text-align: right; font-variant-numeric: tabular-nums; }
+  .ext-completeness__total td { font-weight: 600; border-top: 2px solid var(--ds-border); }
+
+  /* Shard rollup (2026-09-03 auto-parallel-crawl design §4.7) — the
+     Phase cell's own "k/K shards" badge and the disclosure row it toggles.
+     `.ext-shard-badge` is a `<button>` styled as a `.badge`, not a link —
+     clickable, keyboard-reachable, no separate focus style needed since it
+     inherits `.badge`'s own. */
+  .ext-shard-badge { border: none; cursor: pointer; font: inherit; }
+  tr.ext-shard-disclosure > td { padding: 8px 12px 14px 32px; background: var(--ds-surface-sunken); }
+  .ext-shard-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .ext-shard-table th, .ext-shard-table td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--ds-border); }
+  .ext-shard-table th { font-weight: 600; color: var(--ds-text-secondary); white-space: nowrap; }
+</style>
+{% endblock %}
+
+{% block page %}
+{% include "_admin_tabs.html" %}
+
+<div id="ext-pg-unavailable" class="apg-strip apg-strip--warn" role="status" hidden>
+  This dashboard needs the Postgres app-state backend — this instance still runs the DuckDB one.
+  Migrate it to see live extraction runs: <a href="/admin/database">Database backend</a>.
+</div>
+
+{# Fleet-level provider-refusal banner (TCRD-296 synthesis F.25) — one
+   strip per active `provider_limit` condition, rendered by
+   `renderProviderLimitBanner` in admin_extraction.js. Hidden whenever the
+   fleet payload's `conditions` list is empty (every instance before this
+   shipped, and forever on a DuckDB-backed one). #}
+<div id="ext-provider-limit-banner" class="apg-strip apg-strip--warn" role="status" hidden></div>
+
+<div class="fbar apg-bar" id="ext-toolbar" role="group" aria-label="Extraction fleet scope">
+  <div class="ext-scope" role="group" aria-label="Scope">
+    <a href="#" id="ext-scope-active" data-scope="active">Active</a>
+    <a href="#" id="ext-scope-all" data-scope="all">All connections</a>
+  </div>
+  <span class="apg-bar__gap" aria-hidden="true"></span>
+  <span class="ext-fresh" id="ext-fresh"></span>
+</div>
+
+<div class="ext-summary" id="ext-summary" hidden>
+  <div class="ext-card">
+    <div class="label">Active</div>
+    <div class="value" id="ext-stat-active">—</div>
+  </div>
+  <div class="ext-card">
+    <div class="label">Files/min (fleet)</div>
+    <div class="value" id="ext-stat-rate">—</div>
+  </div>
+  <div class="ext-card">
+    <div class="label">Facts done</div>
+    <div class="value" id="ext-stat-facts">—</div>
+  </div>
+  <div class="ext-card">
+    <div class="label">Stuck?</div>
+    <div class="value" id="ext-stat-stuck">—</div>
+  </div>
+  <div class="ext-card">
+    <div class="label">Est. cost</div>
+    <div class="value" id="ext-stat-cost">—</div>
+  </div>
+</div>
+
+{# The queued-vs-running lane-starvation strip (TCRD-296 synthesis) — a
+   small pill row above the table, independent of the table's own scope: a
+   starved job (queued, never yet claimed) has no `extraction_runs` row and
+   so no table row of its own to show it. #}
+<div class="ext-jobs-strip" id="ext-jobs-strip" hidden></div>
+
+<div class="data-table-wrap">
+  <table class="data-table data-table--pinned-actions" id="ext-table">
+    <thead>
+      <tr>
+        <th>Connection</th>
+        <th>Phase</th>
+        <th>Files done / seen</th>
+        <th>Files/min</th>
+        <th>Facts done / pending</th>
+        <th>Tokens in / out</th>
+        <th>Est. cost</th>
+        <th>Last checkpoint</th>
+        <th>Next run</th>
+        <th>Error</th>
+        <th>Actions</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody id="ext-tbody">
+      <tr><td colspan="12" class="ext-blank">Loading…</td></tr>
+    </tbody>
+  </table>
+</div>
+
+{# One shared drawer shell, re-homed per connection by `openFleetCompleteness`
+   below to the exact `ext-drawer-<connId>` id
+   `data_sources_extraction_observability.js`'s rendering/recount/sort
+   functions already look up — the source card's drawer and this one render
+   through the SAME code, never a second copy of it (TCRD-296 B.9). #}
+<div id="ext-fleet-completeness-shell"></div>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ static_url('js/admin/data_sources_extraction_observability.js') }}"></script>
+<script src="{{ static_url('js/admin/admin_extraction.js') }}" defer></script>
+{% endblock %}

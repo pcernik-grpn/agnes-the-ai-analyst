@@ -20,7 +20,7 @@ from datetime import datetime
 from typing import List, Optional
 
 import duckdb
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy import exc as sa_exc
 
@@ -78,6 +78,11 @@ def _audit(
 _SYNC_MANAGED_SENTINELS: dict = {
     "system:google-sync": ("google_managed_readonly", "Google Workspace", "admin.google.com"),
     "system:sharepoint-acl-sync": ("sharepoint_managed_readonly", "SharePoint ACL sync", "the source system"),
+    "system:microsoft-sync": (
+        "microsoft_managed_readonly",
+        "Microsoft Entra ID group sync",
+        "the Entra admin center",
+    ),
 }
 
 
@@ -93,7 +98,10 @@ def _sync_managed_reason(g: dict) -> Optional[tuple]:
        — auto-created/reconciled by that writer (Google: the OAuth
        callback for a prefix-matching Workspace group, ``name`` is the
        full Workspace email; SharePoint: ``entra:<oid>``/``sp-direct:
-       <scope>`` groups the ``sharepoint-acl-sync`` job creates).
+       <scope>`` groups the ``sharepoint-acl-sync`` job creates; Microsoft:
+       ``entra:<oid>`` groups the login-time Entra group sync creates — the
+       SAME naming as SharePoint's, since both key the same Entra group
+       identically, see ``src.entra_identity.entra_group_name``).
     2. Google only: ``is_system=TRUE`` AND the group's name matches the
        env-configured admin/everyone Workspace email — the OAuth callback
        routes memberships from those Workspace groups into the seeded
@@ -179,6 +187,96 @@ async def get_resource_types(
     placeholder hint for the ``resource_id`` input.
     """
     return list_resource_types()
+
+
+# ---------------------------------------------------------------------------
+# Bounded resource search — the picker's counterpart to the (capped)
+# overview projection above
+# ---------------------------------------------------------------------------
+
+
+def _search_corpus_files(q: str, limit: int) -> List[dict]:
+    """``corpus_file`` search: a real query, not a filter over
+    ``_corpus_file_blocks()`` — that projection is now capped per
+    collection (see its docstring) and would miss most files."""
+    from app.resource_types import _file_meta_line, _owner_emails
+    from src.repositories import corpus_files_repo, file_corpora_repo
+
+    files = corpus_files_repo().search_across_corpora(q, limit=limit)
+    if not files:
+        return []
+    corpora_repo = file_corpora_repo()
+    cols: dict = {}
+    for cid in {f["corpus_id"] for f in files}:
+        try:
+            cols[cid] = corpora_repo.get(cid)
+        except Exception:
+            cols[cid] = None
+    owners = _owner_emails((c or {}).get("created_by") for c in cols.values())
+    out = []
+    for f in files:
+        col = cols.get(f["corpus_id"]) or {}
+        owner = owners.get(col.get("created_by") or "")
+        col_name = col.get("name") or col.get("slug") or ""
+        out.append(
+            {
+                "resource_id": f["id"],
+                "name": f.get("filename") or f["id"],
+                "slug": None,
+                "description": _file_meta_line(f),
+                "owner_email": owner,
+                "block_name": f"{col_name} · {owner}" if owner else col_name,
+            }
+        )
+    return out
+
+
+@router.get("/access/resources/{resource_type}/search", response_model=List[dict])
+async def search_grantable_resources(
+    resource_type: str,
+    q: str = Query(..., min_length=2, max_length=200),
+    limit: int = Query(50, ge=1, le=200),
+    user: dict = Depends(require_admin),
+):
+    """Bounded, on-demand search over one resource type's grantable items.
+
+    ``/api/admin/access-overview`` intentionally stopped enumerating every
+    ``corpus_file`` item — an instance with hundreds of thousands of files
+    made that payload tens of megabytes and froze the admin's browser tab
+    rendering it (see ``app.resource_types._corpus_file_blocks``). This is
+    how the per-file grant picker finds a file the overview no longer
+    lists, without reloading a multi-megabyte snapshot.
+
+    Every other resource type's projection is already small (dozens to low
+    hundreds of items, admin-curated), so the same endpoint just filters
+    its existing ``list_blocks()`` output in Python rather than growing a
+    second search path per type.
+    """
+    rtype = _validate_resource_type(resource_type)
+    q_norm = q.strip()
+    if len(q_norm) < 2:
+        return []
+
+    if rtype == ResourceType.CORPUS_FILE:
+        return _search_corpus_files(q_norm, limit)
+
+    from app.resource_types import RESOURCE_TYPES
+
+    spec = RESOURCE_TYPES[rtype]
+    q_low = q_norm.lower()
+    out: List[dict] = []
+    for block in spec.list_blocks():
+        for item in block.get("items", []):
+            hay = " ".join(
+                str(item.get(k) or "") for k in ("name", "slug", "resource_id", "description", "owner_email")
+            ).lower()
+            hay += f" {block.get('name') or ''}".lower()
+            if q_low not in hay:
+                continue
+            out.append({**item, "block_name": block.get("name")})
+            if len(out) >= limit:
+                return out
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1330,7 +1428,7 @@ def _resource_display_index(types_needed: set) -> dict:
             logger.exception("effective-access: list_blocks failed for %s", raw)
             continue
         for block in blocks or []:
-            for item in (block.get("items") or []):
+            for item in block.get("items") or []:
                 rid = item.get("resource_id")
                 if not rid:
                     continue
@@ -1571,8 +1669,7 @@ async def user_effective_access(
         grants_rows,
         key=lambda r: (
             r["resource_type"],
-            (display.get((r["resource_type"], r["resource_id"])) or {}).get("name")
-            or r["resource_id"],
+            (display.get((r["resource_type"], r["resource_id"])) or {}).get("name") or r["resource_id"],
             by_gid.get(r["group_id"], ""),
         ),
     ):

@@ -63,6 +63,10 @@ def _enable_sync(monkeypatch):
     monkeypatch.setenv("AGNES_MICROSOFT_GROUP_SYNC_ENABLED", "true")
 
 
+def _group(object_id: str, mail: str = "", display_name: str = "") -> dict:
+    return {"id": object_id, "mail": mail, "displayName": display_name}
+
+
 def _set_fetch(monkeypatch, groups):
     import app.auth.microsoft_group_sync as mgs
 
@@ -110,7 +114,10 @@ class TestGroupCreationAndSource:
     def test_groups_created_with_microsoft_sync_source(self, microsoft_callback_env):
         env = microsoft_callback_env
         _enable_sync(env["monkeypatch"])
-        _set_fetch(env["monkeypatch"], ["eng@example.com", "finance@example.com"])
+        _set_fetch(
+            env["monkeypatch"],
+            [_group("g-eng", "eng@example.com"), _group("g-fin", "finance@example.com")],
+        )
 
         resp = env["client"].get("/auth/microsoft/callback?code=x&state=y")
         assert resp.status_code == 302
@@ -128,9 +135,9 @@ class TestGroupCreationAndSource:
             ug = UserGroupsRepository(conn)
             rows = UserGroupMembersRepository(conn).list_groups_with_meta_for_user(user["id"])
             by_name = {r["name"]: r for r in rows}
-            assert by_name["eng@example.com"]["source"] == "microsoft_sync"
-            assert by_name["finance@example.com"]["source"] == "microsoft_sync"
-            assert ug.get_by_name("eng@example.com")["created_by"] == "system:microsoft-sync"
+            assert by_name["entra:g-eng"]["source"] == "microsoft_sync"
+            assert by_name["entra:g-fin"]["source"] == "microsoft_sync"
+            assert ug.get_by_name("entra:g-eng")["created_by"] == "system:microsoft-sync"
             # Everyone (system_seed, issue #748 auto-grant-at-creation) is
             # untouched by group sync — same shared ensure_user path Google
             # uses.
@@ -147,9 +154,9 @@ class TestPrefixFilter:
         _set_fetch(
             env["monkeypatch"],
             [
-                "agnes-finance@example.com",
-                "agnes-eng@example.com",
-                "other-team@example.com",
+                _group("g-fin", "agnes-finance@example.com"),
+                _group("g-eng", "agnes-eng@example.com"),
+                _group("g-other", "other-team@example.com"),
             ],
         )
 
@@ -169,8 +176,8 @@ class TestPrefixFilter:
             names = sorted(ug.get(gid)["name"] for gid in group_ids)
             assert names == [
                 "Everyone",
-                "agnes-eng@example.com",
-                "agnes-finance@example.com",
+                "entra:g-eng",
+                "entra:g-fin",
             ]
         finally:
             conn.close()
@@ -179,7 +186,7 @@ class TestPrefixFilter:
         env = microsoft_callback_env
         _enable_sync(env["monkeypatch"])
         env["monkeypatch"].delenv("AGNES_MICROSOFT_GROUP_PREFIX", raising=False)
-        _set_fetch(env["monkeypatch"], ["grp-a@example.com", "grp-b@example.com"])
+        _set_fetch(env["monkeypatch"], [_group("g-a", "grp-a@example.com"), _group("g-b", "grp-b@example.com")])
 
         resp = env["client"].get("/auth/microsoft/callback?code=x&state=y")
         assert resp.status_code == 302
@@ -193,7 +200,7 @@ class TestPrefixFilter:
             user = UserRepository(conn).get_by_email("tester@example.com")
             group_ids = UserGroupMembersRepository(conn).list_groups_for_user(user["id"])
             names = sorted(UserGroupsRepository(conn).get(gid)["name"] for gid in group_ids)
-            assert names == ["Everyone", "grp-a@example.com", "grp-b@example.com"]
+            assert names == ["Everyone", "entra:g-a", "entra:g-b"]
         finally:
             conn.close()
 
@@ -201,7 +208,7 @@ class TestPrefixFilter:
         env = microsoft_callback_env
         _enable_sync(env["monkeypatch"])
         env["monkeypatch"].setenv("AGNES_MICROSOFT_GROUP_PREFIX", "agnes-")
-        _set_fetch(env["monkeypatch"], ["other-team@example.com"])
+        _set_fetch(env["monkeypatch"], [_group("g-other", "other-team@example.com")])
 
         resp = env["client"].get("/auth/microsoft/callback?code=x&state=y")
         assert resp.status_code in (302, 307)
@@ -245,7 +252,7 @@ class TestIdempotency:
         env = microsoft_callback_env
         _enable_sync(env["monkeypatch"])
         env["monkeypatch"].setenv("AGNES_MICROSOFT_GROUP_PREFIX", "agnes-")
-        _set_fetch(env["monkeypatch"], ["agnes-finance@example.com"])
+        _set_fetch(env["monkeypatch"], [_group("g-fin", "agnes-finance@example.com")])
 
         env["client"].get("/auth/microsoft/callback?code=x&state=y")
         env["client"].get("/auth/microsoft/callback?code=x&state=y")
@@ -263,7 +270,7 @@ class TestIdempotency:
 
             count = conn.execute(
                 "SELECT COUNT(*) FROM user_groups WHERE name = ?",
-                ["agnes-finance@example.com"],
+                ["entra:g-fin"],
             ).fetchone()[0]
             assert count == 1
         finally:
@@ -274,9 +281,9 @@ class TestAdminMembershipSurvivesResync:
     def test_admin_added_group_untouched_by_microsoft_sync(self, microsoft_callback_env):
         env = microsoft_callback_env
         _enable_sync(env["monkeypatch"])
-        _set_fetch(env["monkeypatch"], ["eng@example.com"])
+        _set_fetch(env["monkeypatch"], [_group("g-eng", "eng@example.com")])
 
-        # First sign-in provisions the user + eng@example.com via sync.
+        # First sign-in provisions the user + entra:g-eng via sync.
         env["client"].get("/auth/microsoft/callback?code=x&state=y")
 
         conn = _system_db()
@@ -306,6 +313,105 @@ class TestAdminMembershipSurvivesResync:
             rows = UserGroupMembersRepository(conn).list_groups_with_meta_for_user(user["id"])
             by_name = {r["name"]: r["source"] for r in rows}
             assert by_name["hand-picked-group"] == "admin"
-            assert by_name["eng@example.com"] == "microsoft_sync"
+            assert by_name["entra:g-eng"] == "microsoft_sync"
+        finally:
+            conn.close()
+
+
+class TestLegacyKeyMigration:
+    """2026-09 identity-scheme fix: a pre-fix install has groups keyed on
+    lower-cased mail/displayName. The first post-fix sync must rename that
+    row in place to ``entra:<id>`` — preserving its members and grants —
+    rather than creating a duplicate row."""
+
+    def test_legacy_mail_keyed_group_is_renamed_in_place(self, microsoft_callback_env):
+        env = microsoft_callback_env
+        _enable_sync(env["monkeypatch"])
+
+        from src.repositories.user_group_members import UserGroupMembersRepository
+        from src.repositories.user_groups import UserGroupsRepository
+        from src.repositories.users import UserRepository
+
+        conn = _system_db()
+        try:
+            # Seed the OLD keying this module used pre-fix: the group's
+            # lower-cased mail, created by the SAME sentinel this module
+            # still stamps.
+            ug = UserGroupsRepository(conn)
+            legacy_group = ug.create(name="eng@example.com", created_by="system:microsoft-sync")
+            legacy_id = legacy_group["id"]
+            # A grant a group being renamed in place must survive (proves
+            # the rename, not a delete-and-recreate).
+            from app.resource_types import ResourceType
+            from src.repositories import file_corpora_repo, resource_grants_repo
+
+            collection_id = file_corpora_repo().create(
+                name="Legacy Grant Col", slug="legacy-grant-col", description=None, created_by="admin"
+            )
+            resource_grants_repo().ensure_grant(
+                legacy_id, ResourceType.COLLECTION.value, collection_id, assigned_by="admin"
+            )
+        finally:
+            conn.close()
+
+        _set_fetch(env["monkeypatch"], [_group("g-eng", "eng@example.com")])
+        resp = env["client"].get("/auth/microsoft/callback?code=x&state=y")
+        assert resp.status_code == 302
+
+        conn = _system_db()
+        try:
+            ug = UserGroupsRepository(conn)
+            renamed = ug.get_by_name("entra:g-eng")
+            assert renamed is not None
+            assert renamed["id"] == legacy_id, "the rename must preserve the row's id (and thus its grants)"
+            assert ug.get_by_name("eng@example.com") is None, "the legacy key must no longer resolve"
+
+            from src.repositories import resource_grants_repo
+
+            grants = [
+                g
+                for g in resource_grants_repo().list_all(resource_type="collection")
+                if g.get("resource_id") == collection_id
+            ]
+            assert any(g["group_id"] == legacy_id for g in grants), "the pre-existing grant must survive the rename"
+
+            user = UserRepository(conn).get_by_email("tester@example.com")
+            rows = UserGroupMembersRepository(conn).list_groups_with_meta_for_user(user["id"])
+            assert any(r["name"] == "entra:g-eng" and r["source"] == "microsoft_sync" for r in rows)
+        finally:
+            conn.close()
+
+    def test_admin_created_group_with_the_same_name_is_never_seized(self, microsoft_callback_env):
+        """A group named ``eng@example.com`` an ADMIN created by hand (not
+        this sync's sentinel) must never be renamed — only a row this
+        module itself created is eligible for the migration rename."""
+        env = microsoft_callback_env
+        _enable_sync(env["monkeypatch"])
+
+        from src.repositories.user_groups import UserGroupsRepository
+
+        conn = _system_db()
+        try:
+            ug = UserGroupsRepository(conn)
+            admin_group = ug.create(name="eng@example.com", created_by="admin@example.com")
+            admin_group_id = admin_group["id"]
+        finally:
+            conn.close()
+
+        _set_fetch(env["monkeypatch"], [_group("g-eng", "eng@example.com")])
+        resp = env["client"].get("/auth/microsoft/callback?code=x&state=y")
+        assert resp.status_code == 302
+
+        conn = _system_db()
+        try:
+            ug = UserGroupsRepository(conn)
+            untouched = ug.get_by_name("eng@example.com")
+            assert untouched is not None
+            assert untouched["id"] == admin_group_id
+            assert untouched["created_by"] == "admin@example.com"
+
+            synced = ug.get_by_name("entra:g-eng")
+            assert synced is not None
+            assert synced["id"] != admin_group_id, "sync must create its OWN row, never seize the admin's"
         finally:
             conn.close()

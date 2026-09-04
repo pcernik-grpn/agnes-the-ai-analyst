@@ -24,7 +24,28 @@ into collections → (optional) facts extraction into the knowledge graph
   converter backends (`extraction` extra). Bare-metal pip installs need
   `pip install 'agnes[extraction]'`; a missing extra is refused up front
   with `409 extraction_dependencies_missing`, never a crawl that fails on
-  every file.
+  every file. Legacy Office/OpenDocument files (`.doc`/`.rtf`/`.odt`,
+  `.ppt`/`.odp`, `.xls`/`.ods`/`.xlsb`/`.xlsm`) are pre-converted through
+  headless LibreOffice before the markitdown route — the standard image
+  bundles `libreoffice-core`/`-writer`/`-calc`/`-impress`; a bare-metal
+  install additionally needs the `soffice` binary on `PATH`, or those
+  specific suffixes fail conversion (`MissingConversionDependency`) while
+  every other format keeps working. A plain `.xlsx`/`.pptx`/`.docx` that
+  markitdown itself rejects (a real share of them do — 723 of 1 162
+  markitdown "could not convert" failures on one live crawl were `.xlsx`)
+  gets a RESCUE CHAIN instead of an immediate `convert_failed`: one
+  LibreOffice resave-and-retry, then (still failing) a LibreOffice-produced
+  CSV for spreadsheets or PDF-then-text for decks/documents. Which rung
+  rescued a document, if any, shows up per-run in `conversion_rescued`
+  (`{libreoffice_resave, csv_fallback, pdf_fallback}` counts) and in the
+  live checkpoint's per-file `activity.recent` detail. A large `.xlsx`
+  (over 10 MB) skips markitdown entirely and streams through openpyxl
+  directly instead, capped at the same per-document character limit so a
+  multi-million-row workbook stops reading early rather than timing out —
+  and the per-document conversion budget itself scales with input size
+  (base 300s + 20s/MB, capped at 1800s) rather than the flat ceiling every
+  file used to share, fixing the timeouts a population of large (~15 MB
+  average) spreadsheets used to hit.
 - **An Entra app registration** for the tenant: certificate (default) or
   client secret, with admin consent granted. This is the one step Agnes
   cannot do for you.
@@ -48,8 +69,23 @@ libraries / folders). Per scope, two decisions that matter later:
 
 - **anonymize** — this scope's documents are pseudonymized BEFORE anything
   is stored, fail-closed ([`anonymization.md`](anonymization.md)).
-- **access mode** — mirrored ACLs vs. open ([`RBAC.md`](RBAC.md) and the
-  permission-zone notes in [`architecture.md`](architecture.md)).
+- **access mode** — mirrored ACLs vs. open ([`RBAC.md`](RBAC.md) → "SharePoint
+  ACL mirroring" for exactly what a mirrored scope honors, and the
+  permission-zone notes in [`architecture.md`](architecture.md)). Mirroring
+  honors WHO has access, never WHAT they may do with it: Agnes is a
+  read-only consumer of SharePoint content, so a Graph role (`read`/`write`/
+  `owner`) is never read — every honored principal simply gets read access.
+  Flip `access_mode` on many already-confirmed scopes at once with
+  `agnes admin sharepoint scope set-mode <id> --all|--scope <source_scope_id>
+  --mode manual|mirrored` — the fast path for turning mirroring on across a
+  large site split into hundreds of bulk-added scopes.
+- **site groups** (Owners/Members/Visitors, or a custom one) are not
+  enumerable through the app-only Graph surface the connector uses, so a
+  mirrored scope granting one honors nobody by default — map it to one or
+  more existing Agnes groups with `agnes admin sharepoint acl
+  map-site-group <id> --site-group "<name>" --group <agnes_group_id>` (or the
+  source card's **Map site group (ACL)…** action), see
+  [`RBAC.md`](RBAC.md) → "SharePoint ACL mirroring".
 
 ## 3. Sanity-check the anonymization on YOUR documents
 
@@ -79,26 +115,382 @@ spot-check shows pseudonyms, not names.
   manual only).
 - `extraction.crawler.concurrency` (default 6) — files pipelined per delta
   page; the crawl backs off on tenant throttling by itself (AIMD) and
-  reports it. Per-run override in the Run-now options. Editable in
-  `/admin/server-config` → *Extraction* → *crawler*; this is the extraction
-  worker's **memory lever** (every file in flight is a converter child
-  process holding that document — six in flight has exceeded a 12 GiB
-  container on large decks, two held it under 4 GiB), and the worker reads
-  it at the start of each run, so a save applies to the next run with no
-  restart.
+  reports it. Per-run override in the Run-now options. No separate knob to
+  raise: if the container's own memory limit cannot sustain the resolved
+  cap — several crawl jobs can share one worker's EXTRACTION lane, each
+  with its own convert pool — the run's effective cap is clamped down
+  automatically (never up) from the container's cgroup limit and the
+  worker's own lane count, at roughly 2 GB reserved per in-flight file. The
+  run's `concurrency.source` reports `"memory_budget"` when this fired, next
+  to `"config"`/`"payload"`/`"adaptive"`.
+- **Large sites shard themselves automatically** (2026-09-03
+  auto-parallel-crawl design) — an admin never has to split a site by hand
+  and merge the results back afterwards. When a connection's estimated
+  document total is over `extraction.crawler.shard_target_docs` (default
+  5000; `0` disables sharding entirely — every site crawls sequentially,
+  today's pre-2026-09 behaviour, and is what a DuckDB-backed instance
+  always does — this feature is PG-only, A3 ratchet), the very next
+  `POST …/extract` becomes a short PLANNER instead of crawling itself: it
+  packs the site into K shards, one held back as a "remainder" shard for
+  loose root files and anything created after planning, opens ONE parent
+  `extraction_runs` row, and enqueues K `corpus-extraction-shard` child
+  jobs — each with its OWN convert pool, its OWN per-delta-unit crawl
+  state, and its OWN run row — that write into the connection's EXISTING
+  collection. No clone, no consolidate, one connection to watch.
+
+  **Sizing signals, cheapest first (2026-09-04 finding #65).** A live
+  388-scope connection sharing one drive once drove Graph Search into a
+  sustained 429 storm at planning time — 20+ minutes with no run row and
+  no log line, degrading to a zero-balanced plan. The planner now tries,
+  in order, for each top-level folder: **(a)** a caller-supplied count from
+  `corpus_files` — a whole-drive scope whose collection already holds
+  indexed documents gets its per-folder counts from ONE grouped query, no
+  Graph call at all; **(b)** `folder.childCount` from the SAME listing
+  call that discovers the folder in the first place (no extra round trip);
+  **(c)** Graph Search — the LAST resort, only for a folder with neither,
+  at concurrency 2 (was 8) and bounded by a shared wall-clock search
+  budget (120s default) after which any still-unresolved folder just takes
+  childCount (even 0) instead of queuing another Search call. Every
+  folder/shard records which signal sized it
+  (`known`/`child_count`/`search`/`none`) so the UI can say "≈" honestly
+  per shard, not just for the plan as a whole. If the budget runs out with
+  NO usable signal anywhere, planning gives up cleanly and the run falls
+  back to the inline crawl instead of enqueueing a plan balanced on
+  nothing but a 429 storm — the report on that (now closed) planning row
+  names `mode: "inline (planner fallback)"` and why.
+
+  **Visibility from the first second.** The parent `extraction_runs` row
+  opens with `phase="planning"` BEFORE any Graph call — the fleet
+  dashboard and source card show "planning k/N folders" (checkpointed as
+  folders resolve, logged at INFO every 50) instead of nothing for the
+  whole planning window, which used to be silent.
+
+  **The plan is persisted and reused.** A re-trigger reuses the
+  connection's LAST persisted plan — starting children within seconds —
+  unless the confirmed scope SET changed since it was built, `resync` is
+  set (which also drops every cursor), or `force_replan` is set (the
+  targeted "re-balance the shards" control that touches NO cursor —
+  `agnes admin sharepoint extract <id> --replan` / `POST …/extract
+  {"force_replan": true}`).
+
+  Preview what a trigger would plan right now, without triggering
+  anything (and without consulting the persisted plan — a preview always
+  computes fresh): `GET /api/admin/sharepoint/connections/{id}/shard-plan
+  [?min_modified=YYYY-MM-DD]` (`agnes admin sharepoint shard-plan
+  <connection_id> [--min-modified YYYY-MM-DD] [--json]`), or the source
+  card's **Parallel crawl — preview shards…** control. Response:
+  `{mode: "inline"|"sharded", target_docs, signal, shards: [{drive_id,
+  index, label, signal, expected, targets_count}], loose_root_files}` —
+  `expected` is a live count, always shown "≈", never exact.
+
+  **Per-site operator controls fan out to every shard unchanged:**
+  - `resync` drops every shard's cursor AND the persisted plan itself, so
+    the next trigger both re-enumerates from scratch and re-plans fresh.
+  - `force_replan` drops only the persisted plan, without touching any
+    cursor — for re-balancing shards after the site's own shape changed
+    enough that the old grouping no longer fits well.
+  - `force_reprocess` / `retry_failed` / `retry_empty` / `concurrency` /
+    `timeout_s` on `POST …/extract` fan out to every child as-is —
+    `retry_failed`/`retry_empty` replay each shard's OWN backlog (scoped
+    by its own delta-unit keys, never another shard's), and `timeout_s`
+    bounds each CHILD independently, not the run as a whole.
+  - `POST …/extraction/stop` sets ONE cooperative flag; every child stops
+    at its own next checkpoint boundary.
+  - `shards: [i, ...]` (1-based) on `POST …/extract` re-runs only the
+    named shard indices from the connection's LAST persisted plan —
+    opening a fresh parent run scoped to just those shards, never
+    re-planning — the supported replacement for "re-run one clone" below.
+  - `409 extraction_already_running` while the site's TOP-LEVEL run row is
+    still `running` — a sharded site's run is not "done" until its LAST
+    child finishes, even though the triggering job (the planner) itself
+    finished the moment it enqueued the children.
+
+  **Observability**: the fleet dashboard and the source card's Run row
+  both gain a "k/K shards" badge/line for a sharded site, and a per-shard
+  breakdown (label, outcome, absolute files done/seen, the live "≈"
+  expected count, checkpoint age, a stuck flag, and any error) — a shard
+  CHILD never appears as its own row anywhere; only the parent (planner)
+  run does.
+
+  **Migrating an instance with manual split connections** (the pre-2026-09
+  workflow below): nothing breaks on upgrade — each clone auto-shards on
+  its own if it is itself large, and the original connection's whole-drive
+  cursor seeds its own remainder shard, so re-ingesting nothing is a no-op.
+  To fold everything back onto one connection: delete the clone
+  connections (their scopes go with them), `POST …/collections/consolidate`
+  on the original to fold the now-orphaned per-folder collections into its
+  own, then `POST …/extract` — the planner shards it automatically and
+  already-ingested documents upsert to a no-op on `(collection,
+  stable_id)`. To keep every part's crawl/facts progress instead of
+  re-downloading, fold with `POST …/connections/{id}/splits/merge` (below)
+  FIRST — it unions each sibling's scopes and progress onto the target —
+  then trigger the target.
+
+- **Manual multi-connection split (deprecated).** `GET …/split-plan`
+  (`agnes admin sharepoint split-plan`) / `POST …/splits` (`agnes admin
+  sharepoint split`) — the pre-2026-09 way to parallelize a big crawl by
+  hand: clone the connection N times (`POST …/clone` / `agnes admin
+  sharepoint connection clone <connection_id> --name <name>` — a sibling
+  wired to the SAME tenant/client identity and certificate/client-secret,
+  with zero scopes) and bulk-confirm each clone's slice of the site's
+  top-level folders as scopes (`POST …/scopes/bulk` or `agnes admin
+  sharepoint scope bulk-add <connection_id> --path "Folder A" --path
+  "Folder B/Sub" [--drive-id <id>]`, or `--paths-file split.json`), all
+  routed to ONE shared collection by default (`--collection-id <id>` /
+  `--collection-name <name>` for an explicit target, mutually exclusive
+  with each other and with `--per-folder-collections`, which restores the
+  OLD one-collection-per-folder default). Superseded by automatic sharding
+  above for its original purpose (parallelizing one big crawl) — kept as a
+  migration-window escape hatch only: `POST …/splits` answers with a
+  `Deprecation: true` response header, and both endpoints are slated for
+  removal after one release. `GET …/split-plan`'s response gains one
+  ADDITIVE field, `mode` (the SAME verdict `shard-plan` would give this
+  connection right now — an informational hint, `null` if it could not be
+  computed). `409 split_exists` refuses a repeat `POST …/splits` under
+  names that already exist. The SharePoint connection card's legacy split
+  panel (**Legacy: create N connections manually (deprecated)…**, behind
+  the **Parallel crawl — preview shards…** control) still previews and
+  applies it from the browser.
+
+  **Already split without the shared-collection option?** `POST
+  …/connections/{id}/collections/consolidate` or `agnes admin sharepoint
+  collections consolidate <connection_id> --target-name <name> |
+  --target-collection-id <id> [--execute]` folds a connection's per-scope
+  collections into one target after the fact — a dry-run preview (the
+  default) lists what would be folded and how many files, `--execute`
+  performs the real merge (files/chunks/claims re-pointed, grants unioned,
+  emptied sources soft-deleted). Also reachable from the source card's
+  overflow menu (**Consolidate collections…**, an inline drawer row).
+  `--site` (`include_split_siblings: true`) widens the fold to every OTHER
+  connection FROM THE SAME `POST …/splits` call — one call instead of
+  repeating this once per part with the same target; refused with `409
+  sibling_crawl_running` if a family member's crawl is currently queued or
+  running. PG-only (A3 ratchet).
+
+  **Merging the parts back into one CONNECTION** (a step further than
+  folding collections above — this also unions the crawl/facts progress,
+  so the merged connection resumes incrementally instead of re-downloading
+  the site). Once a split site no longer needs to run in parallel — or a
+  site was split by hand into several sibling connections and it is time
+  to fold it back — `POST …/connections/{id}/splits/merge` or `agnes admin
+  sharepoint split-merge <target_id> --sibling <id>... | --all-siblings
+  --target-collection-id <id> | --target-name <name> [--execute]` (source
+  card overflow menu → **Merge split parts back into this source…**) is
+  the REVERSE of the split above: it moves every sibling's scopes onto the
+  target (deduped by `(source_scope_id, drive_id)`), unions each sibling's
+  crawl state (delta-link cursors, cTags, the failed/empty-document
+  backlogs) and facts state (the extraction ledger) onto the target's own,
+  folds every involved scope collection into one target collection (the
+  SAME repository `collections/consolidate` uses — never reimplemented),
+  and re-points each sibling's run history onto the target. `--all-siblings`
+  folds in every OTHER connection named like this one's own split family
+  (the `"<source name> — part i/n"` convention `POST …/splits` already
+  establishes); `--sibling <id>` (repeatable) names siblings explicitly —
+  the only form that works for a site split by hand under different
+  names. Refused (`409`, nothing touched) while any involved connection
+  has a running crawl/facts job, while a sibling carries ACL-mirroring
+  permission zones or a mirrored-scope audience mapping different from the
+  target's own, or while a scope collection being folded is still
+  referenced by a connection OUTSIDE the merge group. Siblings are marked
+  merged-away (their scopes cleared) rather than deleted — their
+  credentials are left untouched; remove a merged-away sibling later with
+  the ordinary `DELETE /api/admin/source-connections/{id}` if it is no
+  longer needed. Dry-run by default. PG-only (A3 ratchet).
+- `extraction.crawl.min_modified` — a per-connection age filter for a
+  backfill run: crawl only files modified on/after a cutoff date instead of
+  re-walking a whole multi-year corpus. `PATCH …/extraction/crawl-config`
+  (`agnes admin sharepoint crawl-config <connection_id> --min-modified
+  YYYY-MM-DD` / `--clear`) sets or clears it; an item with no modified
+  timestamp is always kept. On the source card, the same control ("Crawl
+  schedule & filter", next to "Facts policy") sets it directly — widening
+  the date later needs a "Re-enumerate from scratch" run afterwards, since
+  the delta cursor has already moved past whatever the old cutoff skipped.
 - Webhooks for near-real-time updates: mint the secret
   (`POST …/webhook`), then `POST …/subscriptions/ensure` — Agnes owns the
   Graph subscription lifecycle including renewals
   ([`api-reference.md`](api-reference.md) → *Graph subscription
   lifecycle*). Requires a public HTTPS origin (`AGNES_BASE_URL`).
 
+### Keeping a site current
+
+Two independent switches decide whether — and how often — a connection is
+swept automatically:
+
+1. **The instance-wide switch, `extraction.schedule`, turns the sweep ON at
+   all.** Empty (the default) means manual-only: `POST …/extraction/run-due`
+   never fires, because the scheduler never registers the row that would call
+   it (`services/scheduler/__main__.py`). Set it to any cadence in this
+   grammar — `"every 15m"`/`"every 1h"`, `"daily HH:MM[,HH:MM,...]"` (UTC), or
+   `"cron <5-field expr>"` (UTC) — and the sweep starts polling every
+   SharePoint connection on that cadence, checked independently against each
+   connection's own last-run stamp.
+2. **A connection's own `extraction.crawl.schedule` (D.16) narrows —  it
+   never widens — what the sweep does for THAT connection**, once the
+   instance-wide switch above has turned the sweep on at all:
+   - `"instance"` (the default, same as leaving it unset) — follow
+     `extraction.schedule` exactly as every connection did before this
+     override existed.
+   - `"off"` — never picked up by the sweep, however often it polls; the
+     connection is only crawled by an explicit `POST …/extract` (or a manual
+     "Run extraction now" on the card).
+   - Any other value — the SAME cadence grammar `extraction.schedule` itself
+     uses (`"every 6h"`, `"daily 03:00"`, `"cron 0 3 * * *"`, …) — REPLACES
+     the instance-wide cadence for this one connection's own due-check. A
+     connection with its own interval is evaluated against its own clock,
+     independent of every other connection's cadence.
+
+   Set (or clear) it with `PATCH …/extraction/crawl-config`
+   (`agnes admin sharepoint crawl-config <connection_id> --schedule
+   {off|instance|<cadence>}`) — the SAME endpoint and the SAME source-card
+   control ("Crawl schedule & filter") the `min_modified` age filter above
+   lives on; the two fields are independent (setting one does not disturb
+   the other, as long as the caller re-sends the other's current value —
+   both the CLI and the card panel already do this for you).
+
+**The catch: a per-connection interval is only as fine-grained as the sweep's
+own poll cadence.** If the instance-wide switch polls once a day (`"daily
+03:00"`) but one connection sets its own `"every 6h"`, that connection is
+still only actually EVALUATED when the sweep runs — once a day — so it fires
+at most once a day in practice, not every 6 hours. For a connection that
+genuinely needs a tighter cadence than its siblings, set the instance-wide
+switch to the TIGHTEST cadence any connection needs and let the coarser
+connections either follow it (`"instance"`) or set their own wider interval
+(which is honored exactly, since polling more often than needed is free —
+`is_table_due` just says "not yet").
+
+Both the source card and the fleet dashboard (`/admin/extraction`) show a
+best-effort **"Next run"** hint per connection — `None`/"not scheduled" for
+an `"off"` connection or whenever the instance-wide switch itself has no
+cadence configured (the sweep is not running at all, so there is nothing to
+estimate). It is a display estimate only; the actual due-check re-evaluates
+fresh on every sweep tick.
+
 ## 6. Optional LLM stages (each a cost switch, default off)
 
 | Stage | Switch | What it buys | Cost order |
 |---|---|---|---|
 | LLM name detection | `extraction.anonymization.detector: "llm"` | recall on names regex can't pattern-match | ~$5 / 1 000 docs (Haiku) |
-| Scan OCR | `extraction.scan_ocr.enabled` | text from image-only PDFs | ~$0.006 / page |
+| Scan OCR | `extraction.scan_ocr.enabled` | text from image-only PDFs | ~$0.006 / page (triaged — see below) |
 | Facts extraction | `extraction.facts.enabled` (+ `facts.enabled`) | knowledge-graph facts with verbatim evidence | ~$0.05 / doc (Haiku), measured live — see `config/instance.yaml.example`'s `facts` block |
+
+**Scan OCR triages a document before paying to transcribe all of it**
+(`extraction.scan_ocr.triage`, on by default once `scan_ocr.enabled` is —
+`triage.enabled: false` restores the old all-or-nothing behaviour, byte for
+byte). Two stages, cheapest first:
+
+1. **Metadata rules, no model call.** `skip_path_patterns` /
+   `full_path_patterns` (case-insensitive substring or glob against the
+   document's path — e.g. `"Tax Returns"` to skip, `"Data Room/*Contract*"`
+   to always transcribe in full; a `full_path_patterns` match always wins),
+   `max_size_mb` / `max_pages_for_preview` (skip a document too large or too
+   long), and `min_pages` (a document this short just gets transcribed in
+   full — triaging it costs about the same as skipping it).
+2. **A `preview_pages`-page preview (default 5) + one classification call**,
+   for anything the rules above left undecided: the preview pages transcribe
+   exactly like any other page, then ONE extra text-only call (never the
+   page images again) returns `{doc_type, language, scan_quality, continue,
+   reason}` via a strict tool-use schema. `continue: true` is the only thing
+   that pays for the rest of the document (up to `max_pages`, appended to
+   the preview); a malformed or missing verdict is always treated as
+   `continue: false` ("triage_unparseable"), never a guessed yes.
+
+A document that stops after the preview still keeps those pages and a
+one-line marker (`<!-- scan_ocr: preview N of M pages; triage: <doc_type>;
+continue=<bool>; reason=… -->`) so it stays searchable and identifiable —
+unless `preview_pages: 0`, which reproduces the pre-triage "empty" outcome
+(no text at all) for a document a rule already decided to skip. **Cost
+model**: a `skip`/`triage`-stopped document costs `preview_pages` page-calls
+(≈5 × the per-page price above) instead of up to `max_pages`; only a
+`continue: true` verdict (or an explicit `full_path_patterns` match) pays
+the full bill. The run report's new `scan_ocr` block —
+`{previewed, continued, stopped, pages_transcribed, stop_reasons: {…}}` —
+is what an operator reads to see the split; `ocr_usage` (tokens/cost) keeps
+working unchanged alongside it.
+
+**A document that converted with no text is not a permanent dead end.**
+Every `convert_empty` outcome (typically an unreadable scan, most often
+because scan OCR was off when it was crawled) is recorded in the
+connection's persisted crawl state as it is encountered; turning
+`extraction.scan_ocr.enabled` on does nothing for documents already crawled,
+since Graph's delta feed never re-offers an unchanged item on its own.
+`POST …/connections/{id}/extraction/retry-empty`
+(`agnes admin sharepoint retry-empty <connection_id>`) re-queues exactly
+that backlog for another conversion pass, before the connection's ordinary
+incremental crawl — see [`api-reference.md`](api-reference.md) for the exact
+contract.
+
+**Every reprocessing action an operator needed the shell for is a button**
+(TCRD-296 synthesis). Besides the empty-conversion backlog above, a
+connection also keeps a `failed_items` backlog — every convert-stage
+failure (a conversion crash, a transient download error), including ones
+already given up on after repeated attempts — replayed by `POST
+…/connections/{id}/extract` with `{"retry_failed": true}`
+(`agnes admin sharepoint extract <connection_id> --retry-failed`) BEFORE
+the run's ordinary incremental delta walk. The source card's Run row (and
+the fleet table at `/admin/extraction`, one screen down) show **"Retry
+failed (N)"** and **"Retry empty (N)"** next to each connection, `N` read
+from `GET …/extraction/status`'s `failed_items_count`/`empty_items_count`
+— the persisted backlog sizes, never a client-side guess — and disabled
+while a run for that connection is live. A connection whose most recent
+run ended `failed`/`interrupted` also gets a plain **"Re-run"** button
+(`POST …/extract` with no body — the same trigger a scheduled sweep or
+`agnes admin sharepoint extract <connection_id>` would use). Every button
+is a thin wrapper over the routes documented here and in
+[`api-reference.md`](api-reference.md) — nothing new is introduced at the
+protocol level, only a door that does not require a terminal.
+
+**Documents that never convert stop costing a full attempt (2026-09-04
+finding #66).** A live crawl found a folder of hundreds of spreadsheets that
+had failed conversion identically on every previous pass — each one still
+walked the whole rescue chain under the size-aware conversion budget on
+every replay, holding conversion children for minutes and dropping page
+throughput from ~70k items/h to ~100 items per 10 minutes. Every
+`failed_items` entry now keeps a closed-vocabulary `error_class`
+(`markitdown_reject`, `libreoffice_no_output`, `pdfium_error`, `timeout`,
+`memory_kill`, `worker_crash`, `ingest_error`, `download_error`, `other`)
+alongside its attempt count and last error text. A document whose most
+recent failure is DETERMINISTIC (`markitdown_reject`, `libreoffice_no_output`,
+`pdfium_error`, or `ingest_error` against unchanged content) and has already
+failed twice is skipped WITHOUT a download on later runs — counted as
+`skipped_doomed` in the run report, the source card's Run row ("N doomed
+skipped (force reprocess to retry)"), the fleet totals line, and
+`agnes admin sharepoint runs`. Timeouts, memory kills, worker crashes and
+download errors are ENVIRONMENTAL, never a property of the document, and
+stay retryable forever. The escape hatch is the same one every other
+cTag-based skip in this module already has: `force_reprocess: true`
+attempts a doomed item anyway, and a genuine content change (a new cTag)
+always gets fresh attempts regardless of history. The conversion rescue
+chain itself is also gated: when LibreOffice's own re-save fails (a
+corrupt/unopenable source, a timeout, or a signal kill), the CSV/PDF
+fallback — which would reach the identical LibreOffice mechanism on the
+identical bytes — is skipped rather than retried, and which rung actually
+stopped the chain is named in the recorded error.
+
+**A resync or an admin-requested backlog replay is consumed once per job,
+not once per byte-identical payload.** A worker recreated mid-run reclaims
+the job and re-dispatches the SAME payload — including `resync: true` or
+`retry_failed: true` — to `run_builtin_crawl`. Before this fix, a reclaimed
+`resync` dropped the delta links the interrupted first attempt had already
+progressed past, restarting the whole enumeration from zero on every
+reclaim; a reclaimed `retry_failed`/`retry_empty` redid the entire extra
+backlog pass the same way. Each of these one-shot payload flags now records
+which `job_id` last actually applied it and is a no-op on a second call
+naming that SAME job — a reclaim resumes from whatever the interrupted
+attempt already persisted. A genuinely fresh trigger (a different `job_id`,
+or a manual call this repo has no way to identify as a reclaim) always
+applies, exactly as before.
+
+**A transient database hiccup mid-crawl no longer costs the whole run
+(TCRD-296 C.11).** The ingest step (storing the converted document and
+handing it to the chunker) retries a closed family of infrastructure
+faults — a connection-pool wait timeout, a dropped/reset connection, a
+deadlock, a serialization failure — up to 5 times with a jittered
+exponential backoff (1s → 16s) before counting the document as failed.
+Anything else (a bad row, a bad statement, a genuine `ingest_file`
+rejection) still fails on the first attempt, exactly as before; the retry
+is scoped to infrastructure noise, never a document-content problem.
+Should every retry be exhausted, the document lands in the same
+`failed_items` backlog `--retry-failed` above replays.
 
 All three can run against a self-hosted OpenAI-compatible endpoint instead
 of the Anthropic API — globally (`extraction.llm`) or per stage, e.g. the
@@ -122,6 +514,369 @@ documents without up-to-date facts — so it is safe to repeat, and it runs
 alongside a crawl; while one is queued or running the card's Run row says
 so and the button is locked.
 
+**A pass continues itself until the ledger is done.** A single pass over a
+large backlog can exceed `run_timeout_s` — it stops between documents
+(`interrupted: timeout`), never mid-document, and whatever it already
+extracted is shipped either way. When it stops that way with documents
+still pending, the worker automatically enqueues the next pass on the same
+connection (same idempotency key, so a manual "Extract facts now" click
+never races it), 30 seconds out, carrying over the same `--doc-id`/
+`--timeout-s` the stopped pass ran with. It never continues after a stop,
+a permanent provider error, or once the backlog is actually empty, and it
+caps at 48 consecutive continuations per connection (an operator needs to
+re-trigger by hand past that, which is itself a sign something upstream —
+throughput, quota, a stuck document — needs a look). The source card's
+facts line and `agnes admin sharepoint runs` both show how many documents
+are still pending and whether a pass is currently chasing them ("N pending
+· continuing" vs. "N pending · not running") — the second phrase is the
+one that means an operator should intervene.
+
+### Parallel passes (TCRD-296 gap #67)
+
+A facts pass used to take ONE advisory lock per CONNECTION — fine for
+several small connections, but a live incident merged seven parallel
+SharePoint connections into one and watched throughput fall from ~11,800
+documents/hour (seven passes in parallel) to ~1,400/hour (one lock, one
+pass): a 62k-document backlog went from a manageable few hours to a ~45-hour
+crawl.
+
+**A trigger now fans out into several PARTITIONS of one connection's own
+pass**, instead of requiring several connections to get parallelism. Every
+trigger surface — the source card's **Extract facts now** / `POST
+…/facts-extract` / `agnes admin sharepoint facts-extract`, the crawl's own
+streamed enqueue (`extraction.facts.stream_every`), and a timed-out
+generation's self-continuation — goes through the same fan-out
+(`connectors.sharepoint.facts_extraction.enqueue_facts_extraction_passes`):
+
+- **Count.** `min(extraction.facts.concurrency_passes` (default 4, `/admin/
+  server-config` → Extraction → Facts, `agnes admin server-config`),
+  `ceil(pending_documents / 2000))` — never more partitions than the
+  backlog actually justifies, and never fewer than the config ceiling
+  allows. A backlog small enough to resolve to 1 enqueues exactly today's
+  single job, same idempotency key, same payload shape — nothing about a
+  connection with a modest backlog changes.
+- **Assignment.** Each partition owns a STABLE, disjoint slice of the
+  connection's documents — `hash(corpus_file_id) % count` — so re-running
+  the same `count` later reproduces the identical split, and every document
+  is planned by exactly one partition, never zero or two.
+- **Jobs and locks.** Each partition is its OWN `sharepoint-facts-extraction`
+  job (payload gains `{"partition": {"index", "count"}}`, idempotency key
+  `sharepoint-facts-extraction:{connection_id}:{index}/{count}`) — its own
+  worker-lane slot, its own non-blocking lock, so distinct partitions of the
+  SAME connection never contend with each other, and two identical
+  fan-outs still dedupe cleanly (a second trigger with the same backlog is
+  a no-op, same as before). A partitioned run also forces the sync
+  transport regardless of `extraction.facts.transport` — the Batches API's
+  resume scan is not yet partition-safe.
+- **Ledger.** The shared per-document state
+  (`sharepoint_connection_state`, `kind='facts'`) is written with a
+  per-document Postgres `jsonb` MERGE
+  (`connectors.sharepoint.state_store.merge_docs`) instead of a
+  whole-payload overwrite, so two partitions persisting DIFFERENT documents
+  at the same time never clobber each other's progress — the bug a naive
+  "just enqueue several jobs" fix would have reproduced.
+- **Once-per-connection bookkeeping.** The end-of-pass orphan sweep
+  (#2220) and the decision whether to plan the NEXT generation
+  (self-continuation, above) both run exactly once PER CONNECTION — on
+  whichever partition happens to finish last, mirroring the automatic
+  parallel crawl's "the last child finalizes the parent" rule — never once
+  per partition.
+- **`facts reset --no-claims` refuses while ANY partition is running**, not
+  just a single whole-connection lock — the same `409
+  facts_extraction_running` an operator already sees today, now covering
+  every partition.
+
+**Where it surfaces.** The source card's facts line, the `/admin/
+extraction` fleet table, and `agnes admin sharepoint runs` all gain an
+additive throughput line once more than one partition is involved — "3/4
+passes running, 1,400 docs/h, ETA ~40m" — computed from documents ingested
+in the trailing 10 minutes (`facts_ingest_runs`) for the connection's own
+collections. A connection whose backlog never needs more than one partition
+shows nothing extra.
+
+### Provider limits (TCRD-296 synthesis F.25)
+
+A live incident hit two shapes of "the provider will refuse EVERY call, not
+just this one": an Anthropic workspace exhausting its on-demand usage limit
+(a 400 whose message names a reset date), and a Vertex Claude quota bucket
+with NO allocation at all for a region×model pair (a 429 that retrying the
+SAME region reproduces identically). Before this classification existed,
+both looked identical to any other model-call failure and FAILED THE JOB,
+while the crawl's `extraction.facts.stream_every` trigger kept enqueueing a
+fresh pass every threshold — 161 failed job rows overnight in the incident
+this closes, with no single place saying "facts are paused because the
+provider refuses."
+
+**Classification.** `connectors.sharepoint.facts_extraction.
+classify_provider_limit_error` recognizes a closed set of three reasons —
+`workspace_limit`, `quota_exceeded`, `billing_disabled` — by message content
+(neither provider exposes a distinct exception type or status code for
+"the account is out of usage" versus "this one request was malformed").
+This is deliberately DISTINCT from an ordinary transient 429/5xx, which the
+existing AIMD/backoff retry already absorbs: a non-retryable-shaped error
+(the Anthropic 400 case) classifies immediately, before any retry is
+attempted; a retryable-shaped 429 (the Vertex quota case) is classified only
+once every retry attempt has failed identically — telling a structural
+zero-allocation bucket apart from an ordinary saturated-but-recoverable rate
+limit.
+
+**A hit ends the pass CLEANLY, not with a failed job.** The pass reports
+`interrupted: true, interrupted_reason: "provider_limit"` and completes
+normally — same posture as a `timeout` interruption — rather than raising
+and failing the job. It also persists a fleet-level condition
+(`extraction_conditions_repo()`, Postgres-only — see `docs/migrations.md`):
+`{reason, provider, model, region, message, first_seen, last_seen,
+retry_after_s}`. Fleet-level, not per-connection: the underlying refusal is
+account/workspace/region-scoped, never tied to one SharePoint connection.
+
+**The crawl's own streamed trigger backs off while a condition is active.**
+`extraction.facts.stream_every`'s enqueue
+(`crawler._enqueue_streamed_facts_pass`) checks
+`streamed_pass_suppressed_by_provider_limit()` before enqueueing and skips
+while a condition is still within its cooldown — the provider's own
+`Retry-After` when given, else a 30-minute default. The self-continuation
+chain (`maybe_continue_pass`, above) needs no separate check: it only ever
+continues on `interrupted_reason == "timeout"`, and a provider-limit stop
+always reports `"provider_limit"` instead, so it simply resets and stops on
+its own. **The manual trigger (`POST …/facts-extract`,
+`agnes admin sharepoint facts-extract`) is deliberately NEVER suppressed** —
+an operator who just fixed the underlying limit should not have to wait out
+the cooldown to prove it, and a pass for that provider completing WITHOUT
+hitting a refusal is exactly what clears the condition for everyone else.
+
+**Where it surfaces.** `GET /api/admin/sharepoint/extraction/runs` (the
+fleet endpoint) gains a top-level `conditions[]` array — the `/admin/
+extraction` fleet page renders it as a banner ("Facts extraction paused:
+`<provider>` `<model>` in `<region>` — `<message>`; retrying after
+`<time>`"), and `agnes admin sharepoint runs` prints the same line in the
+terminal. Each connection's own `GET …/extraction/status` gains
+`provider_limit` (the active condition, if any, matching THAT connection's
+resolved facts provider) — the source card's facts line renders it as
+"paused: provider limit" in place of the ordinary "N pending · continuing/
+not running" wording. A condition written by scan OCR (below) carries an
+`ocr_`-prefixed `reason` (`ocr_workspace_limit`, `ocr_http_400`, …) — the
+only thing distinguishing it from a facts-authored row in that shared,
+kindless table — and every rendering surface reads that prefix to say "OCR
+extraction paused" instead of "Facts extraction paused".
+
+**Which provider each stage uses.** Scan OCR and the built-in LLM name
+detector (`extraction.anonymization.detector: "llm"`) resolve their
+provider through the SAME ladder facts extraction does, not independently:
+an explicit per-stage setting (`extraction.scan_ocr.provider` /
+`extraction.anonymization.provider`, both `inherit` by default) wins first;
+otherwise `extraction.facts.provider`; otherwise this instance's own
+`ai.provider`; and only once none of those resolve to Vertex does a static
+`ANTHROPIC_API_KEY`/`LLM_API_KEY` apply. This closes TCRD-296 gap #68: an
+instance that had migrated chat and facts extraction to Vertex but still
+had a stale `ANTHROPIC_API_KEY` in the environment (an exhausted workspace)
+found scan OCR alone still building an Anthropic client against it — every
+scanned page failing `BadRequestError` for the whole crawl. One line is
+logged per run naming the resolved provider/model/region the first time
+scan OCR builds a client.
+
+**Scan OCR joins the provider-limit mechanism too**, with one difference
+from the facts pass: scan OCR has no per-document failure mode a 400/401/403
+could legitimately mean (a page image is never "too long" the way a prompt
+can be), so ANY 400/401/403 — not only one `classify_provider_limit_error`
+recognizes by message — counts as permanent, immediately, with no retry.
+After the FIRST such refusal in a run, scan OCR pauses itself: no further
+page render, no further provider call, for the rest of the run. Documents
+reached after the pause — and the very document that discovered it — return
+empty exactly as they would with `extraction.scan_ocr.enabled: false`, so
+they land in the ordinary `convert_empty` backlog (never `convert_failed`)
+and `POST …/extraction/retry-empty` replays them once an operator fixes the
+provider. The run report's `scan_ocr` block gains `disabled_reason`/
+`provider_error` alongside its triage counters, and the SAME fleet-level
+condition mechanism above is written (`ocr_`-prefixed reason) so the pause
+is visible fleet-wide, not just in that one crawl's own report. A 429
+`classify_provider_limit_error` recognizes as `quota_exceeded` still gets
+its full retry ladder first — same as the facts pass — since a 429 is
+retryable-SHAPED and might be a transient spike rather than a zero-
+allocation bucket.
+
+**Region×model matrix validation** (live finding (b) — Vertex quotas are
+per REGION and per MODEL: a project running Sonnet outside `global` answers
+429 on every call, even a 5-token one, because it has no regional bucket at
+all; Haiku's region buckets can also saturate at peak, a genuine capacity
+limit rather than a missing bucket). `VERTEX_REGION_MODEL_MATRIX` in
+`connectors/sharepoint/facts_extraction.py` documents the known-good
+pairings (`haiku: global, us-east5, europe-west1`; `sonnet: global`); both
+`POST /api/admin/server-config` (the `extraction.facts.vertex_region`
+instance-level setting) and `PATCH …/extraction/facts-config` (a per-
+connection override) refuse an undocumented region×model pairing with a
+`422` naming the mismatch, instead of letting every pass discover it live.
+A model tier the matrix does not name (`opus`, or a future tier) is treated
+as unconstrained — a known-bad-combination guardrail, not a closed
+allowlist.
+
+Each document's request is kept under a token budget
+(`extraction.facts.max_prompt_tokens`, default 150 000, hard-ceilinged at
+190 000 regardless of what is configured) on top of the flat character
+pre-cap (`extraction.facts.max_doc_chars`, default 120 000): a dense
+document (a converted spreadsheet, CSV, or EDI-shaped export) is truncated
+further and counted in `docs_truncated`; a binary/decode-garbage document
+(a failed conversion) is skipped outright and counted in
+`docs_skipped_garbled_text`; a dense document too large even at the token
+budget is skipped rather than shipping a meaningless head, counted in
+`docs_skipped_too_large_tabular`. A model call that fails PERMANENTLY for
+one document's own request (most commonly a 400 "prompt is too long") is
+counted in `facts_failed`/`facts_failed_reasons` and the pass continues
+with the next document — it never aborts the whole run.
+
+**What a facts-ledger `"done"` entry means, and what it does not (TCRD-296
+gap #62).** Each document's per-connection facts state (`docs_state`,
+keyed by `corpus_files.id`) is written `status: "done"` once the pass
+extracted its facts — never once its evidence actually landed in the fact
+graph, which happens in a LATER step (the batch's ingest call, possibly
+several documents later). A `"done"` entry is what `is_up_to_date` treats
+as current forever, so a document whose batch was refused, or whose
+citation the ingest gate rejected/deferred, previously stayed `"done"`
+with zero claims — invisible to every later pass, since nothing revisits
+an already-`"done"` entry. Two things now keep this honest:
+
+- **Cache citation.** The response cache (lever B above) keys on the
+  CONVERTED markdown's content hash, while the model cites `doc_id` (the
+  SOURCE document's identity) in its evidence. Two documents that convert
+  to byte-identical markdown but differ in their source bytes share a
+  cache row, and a naive replay would still cite the FIRST document. Every
+  evidence entry is now rewritten to the document actually being
+  processed right after the reply is parsed — the run report's
+  `facts_evidence_doc_id_rewritten` counts how often this fired, whether
+  the mis-citation came from a cache hit or the model itself.
+- **Ledger correction.** The pass now reconciles each document's ledger
+  entry against what its batch's ingest call actually reported: a refused
+  batch downgrades its documents' entries to a bounded-retry status
+  (`ingest_refused`) rather than leaving them `"done"`; a document whose
+  own evidence contributed zero claims despite extracting facts is marked
+  `no_claims` the same way; either status is retried automatically by the
+  next pass (cache-served, so the retry costs no extra model call), up to
+  a small bounded number of attempts before giving up with a terminal
+  `"failed"` entry. A TCRD-241 duplicate copy — a byte-identical file whose
+  claims all land on a SIBLING `corpus_files` row (the loader's
+  deterministic winner-pick) — is the one legitimate zero-claims case: it
+  stays `"done"`, with a `claims_on_file_id` marker pointing at the winner,
+  so a coverage report can tell "duplicate" from "genuinely missing".
+
+**The orphan sweep runs once per pass, not once per batch (TCRD-296
+C.12).** A pass ships its extracted facts in several batches, and each
+batch's ingest call ends by sweeping subjects (facts/edges) left with zero
+claims — normal hygiene after a replace-mode re-extraction drops a stale
+claim. With several passes running in parallel (e.g. a whole-site crawl
+split into per-scope connections), sweeping after every BATCH let one
+pass's sweep catch a SIBLING pass's just-created, not-yet-evidenced
+subject before that pass's own later batch attached its claim — a live
+30-minute window saw 75,447 subjects deleted against 10,784 created, ~13%
+of documents failing to ingest on a foreign-key violation. A pass's
+batches now all skip their own sweep and the pass runs it itself exactly
+ONCE at the end, under the same 15-minute grace period (a subject younger
+than that is never swept, however orphaned it looks) and the same
+serializing advisory lock (at most one pass's sweep touches the database
+at a time; a pass that cannot acquire it skips its own sweep for a sibling
+pass's to cover) the per-batch sweep already used. The run report's
+`orphans_swept` (and `orphans_sweep_skipped`, true when a concurrent
+pass held the lock) shows the count; the fleet view at `/admin/extraction`
+notes it next to a finished pass's facts count when non-zero.
+
+**Recovering the historical backlog.** The two fixes above only prevent
+this from happening on a FRESH pass. A document whose ledger entry an
+OLDER, pre-fix pass already wrote `"done"` with zero claims needs a
+one-time reset: `POST /api/admin/sharepoint/connections/{id}
+/facts/reset-no-claims` (`agnes admin sharepoint facts reset --no-claims
+<connection_id> [--dry-run]`) checks every such candidate against the real
+fact graph and either leaves it alone (already has a claim), backfills
+`claims_on_file_id` (a duplicate copy whose sibling carries the claim), or
+removes the ledger entry so the next pass re-extracts it (genuinely
+missing). `--dry-run` computes and reports the same counts without writing
+anything. Refuses with `409 facts_extraction_running` while a
+facts-extraction pass — chained or standalone — holds the connection's
+facts-pass lock, since that pass upserts the whole ledger payload on its
+own schedule.
+
+## Verifying completeness
+
+"Did we really get everything?" is a live Graph Search count compared
+against the corpus, not a guess: **Completeness** in the source card's
+extraction drawer (or `/admin/extraction`'s own per-row button) shows, per
+confirmed scope — and, for a connection with exactly ONE whole-drive scope,
+per top-level folder under it — `expected` (Graph Search's own document
+count, narrowed to convertible formats and to the crawl's own
+`min_modified` cutoff), `indexed`/`rejected` (from the corpus), and the
+crawl's own recorded reasons for anything missing: `failed`, `empty`,
+`skipped_unsupported`, `oversize`. `gap = expected - indexed - failed -
+empty - skipped_unsupported - oversize`, and each row's `status` is:
+
+- **complete** — indexed already covers expected, nothing to explain.
+- **accounted** — some documents are missing from the index, but every one
+  of them has a recorded reason (failed, converted empty, an unsupported
+  type, or over the size cap).
+- **missing** — an unexplained gap remains after every known reason is
+  applied. This is the row worth investigating first.
+- **unknown** — `expected` itself could not be resolved (a scope that spans
+  a whole SharePoint SITE across several drives has no single count to
+  compare against) — never rendered as 0, which would read as "everything
+  is missing" when the truth is "unmeasured".
+
+Rows are sortable by `gap` (click the column header, or in the CLI they are
+sorted descending by default) so the worst-looking scope/folder is always
+the first thing an admin sees. The check fans out one Graph Search call per
+scope/folder, so its answer is cached for 10 minutes — a **Recount** button
+(`?refresh=true`) bypasses the cache for a fresh read. Running it while a
+crawl is active still answers, just labeled `provisional: true` — a
+snapshot mid-crawl, not a settled number. `agnes admin sharepoint
+completeness <connection_id> [--min-modified YYYY-MM-DD] [--refresh]
+[--json]` is the same check from a terminal.
+
+Answers on both app-state backends (crawl state, `corpus_files` and the job
+queue are all backend-agnostic — unlike run history above, this does NOT
+need Postgres). See `connectors/sharepoint/completeness.py`'s module
+docstring for the exact attribution rules behind each reason count on a
+multi-scope connection.
+
+## Watching several connections at once
+
+Running crawl + facts over more than one connection (several tenants, or
+several scopes split into separate connections) is one screen:
+`/admin/extraction` (the **All connections** button in any SharePoint
+source card's Run row on `/admin/data-sources`) — one row per connection with its phase, files
+done/seen, a derived files/min, the facts pass's own done/pending counts,
+token spend and estimated cost, and how old its last checkpoint is. A run
+still marked `running` whose checkpoint has gone stale past
+`extraction.stall_after_s` (default 900s/15min, admin-editable in
+`/admin/server-config` → Extraction → Stall threshold) is reported as
+`outcome: "stalled"` — the SAME word and the SAME threshold the fleet row's
+"Stuck?" badge uses, so the two can never disagree. Defaults to connections
+with a run active right now (`?active=1`); `?all=1` broadens to every
+connection, idle ones included. `agnes admin sharepoint runs [--all]
+[--json] [--watch]` is the same view from a terminal — `--watch` refreshes
+every 10s, for an operator watching an overnight run over SSH with no
+browser open. Both read `GET /api/admin/sharepoint/extraction/runs`,
+PG-only like the rest of run observability (see the troubleshooting row
+below). A small strip above the table — printed as a `Jobs — …` line from
+the CLI — shows queued-vs-running counts per worker lane
+(`corpus-extraction`, `sharepoint-facts-extraction`), independent of the
+`active`/`all` scope: a lane with jobs queued and NONE running is flagged
+(every worker slot busy elsewhere, or none configured for it) — the one
+signal a connection stuck at "queued" forever has no `extraction_runs` row
+to show any other way. Each row also carries its own "Retry failed (N)"/
+"Retry empty (N)"/"Re-run" buttons, same rules as the source card's Run row
+above.
+
+### Cancelling a run Stop can't reach
+
+A crawl loop that is genuinely stuck (not merely slow) never notices the
+cooperative Stop button either — nothing yields, so the flag it sets is
+never polled. For exactly that case, both the fleet table (every
+`running`/`stalled` row) and the SharePoint source card's Run row (once it
+reads `stalled`) offer a **Cancel run** button behind a confirm dialog —
+`agnes admin sharepoint runs cancel <run_id>` does the same from a
+terminal. Unlike Stop, cancel does not wait on the crawl: it force-finalizes
+the owning job (`status: failed`, `error: cancelled_by_admin`, its lease
+released — this is also what stops the worker's own lease-renewal loop) and
+closes the run row `interrupted` immediately, while still setting the same
+cooperative flag Stop does in case the loop is merely slow and can still
+exit cleanly on its own. Whatever the run had ingested up to its last
+checkpoint is kept and counted resumable, exactly like a normal stop.
+
 ## Troubleshooting quick table
 
 | Symptom | Meaning | Fix |
@@ -132,3 +887,7 @@ so and the button is locked.
 | run ends `interrupted / throttled` | tenant 429 budget exhausted | rerun later; lower concurrency |
 | documents in `anonymize_failed` | fail-closed drop | check key status + detector availability; preview the file (step 3) |
 | run history says "needs a Postgres backend" | `extraction_runs` is PG-only | run state needs Postgres app-state; config/preview still work |
+| a facts pass fails with "prompt is too long" | one document's request exceeded the model's context window | fixed automatically going forward (token-safe bound + per-document failure); a still-oversized/garbled document is skipped and counted, never retried |
+| run shows `outcome: "stalled"` and Stop doesn't help | crawl loop stuck, never polling the stop flag | **Cancel run** on the fleet table / source card (or `agnes admin sharepoint runs cancel <run_id>`) force-closes it |
+| a renamed/moved file's path went stale in Collections | fixed — a rename/move with unchanged content (same cTag/eTag) now updates the stored path in place, counted `renamed` in the run report, no re-download | nothing to do; visible from the next crawl onward |
+| `.xlsx`/`.pptx`/`.docx` still lands in `convert_failed` after the rescue chain | every rung failed (message names each rung's own last error) | check `soffice` is on `PATH` (bare-metal); a genuinely corrupt source file has nowhere left to go |

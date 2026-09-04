@@ -280,6 +280,45 @@ def _with_secret_status(row: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any
     return row
 
 
+def _with_secret_status_many(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """The batched sibling of :func:`_with_secret_status`, for the LIST
+    endpoint only.
+
+    ``_with_secret_status`` does 3 round trips per row (secret / master
+    secret / derived chat-tools row) — fine for the single-connection
+    callers (create/get/update), but the list endpoint called it once per
+    connection, so its own query count scaled with the number of connections
+    (`app.web.router._sharepoint_pipeline_cell` had the identical shape of
+    bug for the page's pipeline strip). Here every row is annotated from
+    THREE bulk reads total, regardless of ``len(rows)``: one
+    ``has_many`` covering both the plain and master secret slots (their key
+    sets are disjoint — a master key is always suffixed ``:master`` — so one
+    query answers both), and one ``mcp_sources_repo().list_all()`` — a table
+    with as many rows as there are chat-tools-enabled sources, not one query
+    per connection.
+    """
+    if not rows:
+        return rows
+    ids = [str(r["id"]) for r in rows]
+    master_keys = {cid: master_secret_key(cid) for cid in ids}
+    try:
+        present = connection_secrets_repo().has_many([*ids, *master_keys.values()])
+    except Exception:
+        present = set()
+    try:
+        derived_by_id = {d["id"]: d for d in mcp_sources_repo().list_all()}
+    except Exception:
+        derived_by_id = {}
+    for row in rows:
+        cid = str(row["id"])
+        row["has_secret"] = cid in present
+        row["has_master_secret"] = master_keys[cid] in present
+        derived = derived_by_id.get(derived_source_id(cid))
+        row["has_chat_tools"] = bool(derived) and derived.get("enabled", True) is not False
+        row["chat_tools_source_id"] = derived["id"] if derived else None
+    return rows
+
+
 def _workspace_schema_of(config: Optional[Dict[str, Any]]) -> Optional[str]:
     """The connection's ``workspace_schema``, or None when unset.
 
@@ -918,12 +957,20 @@ def _validate_stack_url(config: Optional[Dict[str, Any]], *, required: bool, res
 
 
 @router.get("")
-async def list_connections(
+def list_connections(
     source_type: Optional[str] = None,
     _user: dict = Depends(require_admin),
 ):
-    """List all named source connections, optionally filtered by source_type."""
-    return [_with_secret_status(r) for r in source_connections_repo().list(source_type=source_type)]
+    """List all named source connections, optionally filtered by source_type.
+
+    Plain ``def`` (not ``async def``, zero ``await``s below): every call this
+    handler makes is blocking, synchronous SQLAlchemy/vault I/O, so FastAPI
+    dispatches it to the anyio thread pool instead of running it on the
+    single event loop — see ``tests/test_event_loop_offload_guard.py``'s
+    Tier-1 convention. Annotated via :func:`_with_secret_status_many` (3
+    bulk reads total, not 3 per row).
+    """
+    return _with_secret_status_many(source_connections_repo().list(source_type=source_type))
 
 
 @router.post("", status_code=201)
@@ -1062,7 +1109,11 @@ async def update_connection(
     .ACL_SYNC_SERVER_WRITTEN_CONFIG_KEYS``) — get the same carry-forward
     treatment just below, kept as a separate hand-maintained list because
     that ratchet's static scan is deliberately scoped to one file and
-    cannot see a different module's writes.
+    cannot see a different module's writes. ``config.split`` — the
+    site-split lineage (``connectors.sharepoint.site_split
+    .SPLIT_SERVER_WRITTEN_CONFIG_KEYS``) ``POST …/splits`` writes once, at
+    connection-CREATE time rather than via an ``....update(...)`` call —
+    is carried forward the same hand-maintained way, for the same reason.
     """
     repo = source_connections_repo()
     existing_row = repo.get(connection_id)
@@ -1205,6 +1256,26 @@ async def update_connection(
                 for _sub_key in SUBSCRIPTION_SERVER_WRITTEN_CONFIG_KEYS:
                     if _sub_key not in config and old_config.get(_sub_key) is not None:
                         config = {**config, _sub_key: old_config[_sub_key]}
+
+                # Same class again, fourth writer: site-split LINEAGE
+                # (`app/api/admin_sharepoint.py::apply_split`) records
+                # `config.split = {parent_connection_id, part, n,
+                # created_at}` on every part it creates, at connection-CREATE
+                # time — never via an `....update(config=...)` call, so
+                # `SHAREPOINT_SERVER_WRITTEN_CONFIG_KEYS`'s own ratchet
+                # (scoped to that shape) never sees it. Erasing it on an
+                # ordinary edit does not break the split's own crawl — it
+                # only makes `POST …/collections/consolidate
+                # {include_split_siblings: true}` unable to find this part's
+                # siblings, silently narrowing a "fold the whole split"
+                # call to "fold just this one connection" with no error at
+                # all. Same carry-forward as the ACL/subscription keys
+                # above, imported from the module that actually owns it.
+                from connectors.sharepoint.site_split import SPLIT_SERVER_WRITTEN_CONFIG_KEYS
+
+                for _split_key in SPLIT_SERVER_WRITTEN_CONFIG_KEYS:
+                    if _split_key not in config and old_config.get(_split_key) is not None:
+                        config = {**config, _split_key: old_config[_split_key]}
     if body.is_default is not None:
         # RBAC review Finding 1 (2026-08-26): this must run regardless of
         # whether `config` was sent — `PUT /{other_id} {is_default: true}`

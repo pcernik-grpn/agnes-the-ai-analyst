@@ -160,13 +160,31 @@ docker run --rm -e DATABASE_URL=... ghcr.io/keboola/agnes-the-ai-analyst:${IMAGE
 
 ### Connection-pool tuning
 
-`src/db_pg.py` defaults to `pool_size=5, max_overflow=10` — i.e. up to
-15 concurrent connections per app process. Cloud SQL's per-instance
+`src/db_pg.py` defaults to `pool_size=5, max_overflow=10, pool_timeout=30s`
+— i.e. up to 15 concurrent connections per app process, each request
+waiting up to 30s for one before failing. Cloud SQL's per-instance
 connection cap (default 100, configurable up to thousands depending on
 tier) is the binding constraint. For a 3-VM MIG running 1 uvicorn
 worker each, 3 × 15 = 45 connections — comfortably inside the default
 cap. Scale `pool_size` proportionally if you increase uvicorn workers
 per VM.
+
+Override with `AGNES_PG_POOL_SIZE` / `AGNES_PG_MAX_OVERFLOW` /
+`AGNES_PG_POOL_TIMEOUT_S` (env vars, see `config/.env.template`) — the
+defaults above are unchanged unless set. A process running the
+`extraction` worker lane (`AGNES_WORKER_LANES=extraction`, see
+`app/worker/runtime.py` and the `extraction-worker` compose service)
+sizes `pool_size` automatically when `AGNES_PG_POOL_SIZE` is unset:
+`extraction.concurrency + extraction.facts.concurrency`, capped at 64 —
+a corpus-extraction slot and a facts-extraction pass each hold a
+connection for their whole run, not per-statement, so the plain
+request-scoped default of 5 starves under concurrent crawls + facts
+passes (live finding, 2026-09: the pool exhausted 30×/10min under 2
+facts passes + 4 crawls sharing one engine, failing 44 documents'
+ingest with `TimeoutError` and forcing 27 facts-LLM-cache lookups to
+fall through to a paid model call). Every other role/process is
+unaffected. The resolved pool settings are logged once, at engine
+creation.
 
 ## Running migrations
 
@@ -355,6 +373,67 @@ section** — the DuckDB ladder is frozen regardless of whether the table
 itself predates the ratchet. The new column lands in Postgres only; the
 DuckDB side of that repo simply does not gain the capability that depends on
 it. (`src/db_pg.py` `Base.metadata` still needs the model change either way.)
+
+## Adding an index on a table that may already be huge in production
+
+A migration runs at process start, inside the startup revision repair's own
+transaction — `CREATE INDEX CONCURRENTLY` cannot run there (it needs
+Alembic's `autocommit_block()` to commit that transaction first; see
+`migrations/versions/0098_corpus_chunks_file_id_index.py`'s docstring). A
+plain `CREATE INDEX` is fine for a cheap B-tree (that migration does exactly
+that, unconditionally) but holds a SHARE lock for as long as the build takes
+— seconds for a small/medium table, several MINUTES for a GIN or other
+expensive index over a table already at production scale (tens of millions
+of rows), stalling every writer for the duration.
+
+The pattern (`migrations/versions/0101_corpus_chunks_fts_index.py`): count
+the target table's rows first (`op.get_bind().execute(sa.text("SELECT
+COUNT(*) FROM …")).scalar()`), build in place under a threshold comfortably
+above what a fresh/lightly-loaded instance has and comfortably below the
+scale that made the migration necessary in the first place, and above it
+SKIP the build with a `logger.warning(...)` naming the EXACT `CREATE INDEX
+CONCURRENTLY IF NOT EXISTS …` statement an operator must run out-of-band,
+once, off-peak. Whatever the index accelerates must still WORK without it —
+just slower (a sequential scan) — so a deployment that hits the skip branch
+degrades, it does not break. Unit-test both branches by faking `alembic.op`
+(`op.get_bind()` returning a stub whose `.scalar()` reports a controlled row
+count) rather than actually seeding millions of rows — see
+`tests/db_pg/test_corpus_chunks_fts_index_migration.py`.
+
+## Adding a new table that needs a data backfill on an already-huge sibling
+
+Sibling problem to the index one above: a NEW table can be created cheaply
+(`CREATE TABLE` is instant, no lock contention), but if it needs to be
+POPULATED from an existing, already-huge table, that backfill itself is the
+expensive part — and the same "don't run it inside the migration's own
+boot-time transaction" reasoning applies.
+
+`migrations/versions/0104_fact_collection_stats.py` (TCRD-296 synthesis
+E.21) is the worked example: `fact_collection_stats`/`fact_collection_
+membership`/`edge_collection_membership` are a maintained summary over
+`claims` (already at 2M+ rows on a live instance), and the migration
+creates the tables ONLY — no backfill. Two things make that safe:
+
+1. **New writes are covered from the moment the migration lands** — every
+   `INSERT INTO claims` from that point on maintains the summary
+   incrementally in the SAME transaction (`FactsPgRepository.add_claim` ->
+   `_bump_collection_stats_on_new_claim`), so the table is never MORE than
+   one deploy behind reality for anything written after the upgrade.
+2. **Every reader of the summary has a built-in fallback** to the original
+   full-scan query, embedded in the SQL itself (an uncorrelated `NOT EXISTS
+   (SELECT 1 FROM fact_collection_stats)` branch inside the same `UNION`,
+   not a Python-side round trip) — so a database that hasn't been backfilled
+   yet simply serves the pre-migration behavior, slower but correct, never
+   a wrong answer.
+
+The backfill itself is a REPOSITORY method (`rebuild_collection_stats`,
+bounded per collection — never one giant transaction over the whole
+table) an operator runs once, out of band, after the upgrade:
+`agnes admin facts stats rebuild` / `POST /api/admin/facts/stats/rebuild`.
+This is the "operator runs the CLI once after upgrade" escape hatch this
+doc's own "Adding an index…" section above mentions — pick it whenever the
+backfill's cost is unpredictable (scales with existing data, not with the
+migration's own DDL) rather than a fixed, small `UPDATE`.
 
 ## The four load-bearing tests
 

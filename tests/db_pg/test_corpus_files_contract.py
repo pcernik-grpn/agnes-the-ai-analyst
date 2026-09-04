@@ -494,6 +494,43 @@ def test_update_in_place_does_not_touch_processing_status(repo):
     assert repo.get(file_id)["processing_status"] == "indexed"
 
 
+def test_update_path_changes_path_and_filename_only(repo):
+    """Rename/move with UNCHANGED content (SharePoint crawl rename gate,
+    ``connectors.sharepoint.crawler._Ingestor.rename``) — no sha256/
+    storage_path/size write, unlike ``update_in_place``."""
+    file_id = repo.add(
+        corpus_id=CORPUS_ID,
+        filename="a.md",
+        sha256="s1",
+        file_type="md",
+        size_bytes=5,
+        storage_path="/blobs/s1.md",
+        path="old/a.md",
+    )
+    repo.update_path(file_id, path="new/b.md", filename="b.md")
+    row = repo.get(file_id)
+    assert row["path"] == "new/b.md"
+    assert row["filename"] == "b.md"
+    assert row["sha256"] == "s1"
+    assert row["storage_path"] == "/blobs/s1.md"
+    assert row["size_bytes"] == 5
+
+
+def test_update_path_does_not_touch_processing_status(repo):
+    file_id = repo.add(
+        corpus_id=CORPUS_ID,
+        filename="a.md",
+        sha256="s1",
+        file_type="md",
+        size_bytes=5,
+        storage_path="/blobs/s1.md",
+    )
+    repo.set_status(file_id, status="indexed")
+    repo.update_path(file_id, path=None, filename="a-renamed.md")
+    assert repo.get(file_id)["processing_status"] == "indexed"
+    assert repo.get(file_id)["filename"] == "a-renamed.md"
+
+
 def test_count_by_corpus_groups_every_corpus_in_one_read(repo):
     """The admin /access projection needs a count per collection; doing that
     with `list_for_corpus` per collection made the page's query count grow with
@@ -525,6 +562,188 @@ def test_count_by_corpus_groups_every_corpus_in_one_read(repo):
 
 def test_count_by_corpus_is_empty_when_there_are_no_files(repo):
     assert repo.count_by_corpus() == {}
+
+
+def test_search_across_corpora_matches_filename_across_all_corpora(repo):
+    """The admin per-file grant picker's bounded, on-demand search — the
+    counterpart to the (now capped) `/admin/access` overview projection
+    in `app.resource_types._corpus_file_blocks`."""
+    repo.add(
+        corpus_id="col_a",
+        filename="quarterly-report.pdf",
+        sha256="s1",
+        file_type="pdf",
+        size_bytes=10,
+        storage_path="/tmp/1",
+    )
+    repo.add(
+        corpus_id="col_b",
+        filename="Report-2026.docx",
+        sha256="s2",
+        file_type="docx",
+        size_bytes=10,
+        storage_path="/tmp/2",
+    )
+    repo.add(
+        corpus_id="col_b",
+        filename="unrelated.csv",
+        sha256="s3",
+        file_type="csv",
+        size_bytes=10,
+        storage_path="/tmp/3",
+    )
+    results = repo.search_across_corpora("report", limit=50)
+    names = {r["filename"] for r in results}
+    assert names == {"quarterly-report.pdf", "Report-2026.docx"}
+
+
+def test_search_across_corpora_respects_limit(repo):
+    for i in range(5):
+        repo.add(
+            corpus_id="col_a",
+            filename=f"doc-{i}.pdf",
+            sha256=f"s{i}",
+            file_type="pdf",
+            size_bytes=10,
+            storage_path=f"/tmp/{i}",
+        )
+    results = repo.search_across_corpora("doc", limit=2)
+    assert len(results) == 2
+
+
+def test_search_across_corpora_blank_query_matches_nothing(repo):
+    repo.add(
+        corpus_id="col_a",
+        filename="a.pdf",
+        sha256="s1",
+        file_type="pdf",
+        size_bytes=10,
+        storage_path="/tmp/1",
+    )
+    assert repo.search_across_corpora("", limit=50) == []
+    assert repo.search_across_corpora("   ", limit=50) == []
+
+
+def test_status_counts_for_corpora_groups_by_corpus_and_status_in_one_read(repo):
+    """The batched sibling of ``count_by_corpus``: a caller with a LIST of
+    corpus ids (e.g. a connection's confirmed scopes) gets every corpus's
+    per-status breakdown in one call instead of walking ``list_for_corpus``
+    once per scope."""
+    for i in range(2):
+        fid = repo.add(
+            corpus_id="col_a",
+            filename=f"a{i}.pdf",
+            sha256=f"sha_a{i}",
+            file_type="pdf",
+            size_bytes=10,
+            storage_path=f"/tmp/a{i}.pdf",
+        )
+        if i == 0:
+            repo.set_status(fid, status="indexed")
+    repo.add(
+        corpus_id="col_b",
+        filename="b.pdf",
+        sha256="sha_b",
+        file_type="pdf",
+        size_bytes=10,
+        storage_path="/tmp/b.pdf",
+    )
+    counts = repo.status_counts_for_corpora(["col_a", "col_b", "col_absent"])
+    assert counts["col_a"] == {"indexed": 1, "pending": 1}
+    assert counts["col_b"] == {"pending": 1}
+    # A requested id with no files is simply absent, same contract as
+    # ``count_by_corpus``.
+    assert "col_absent" not in counts
+
+
+def test_status_counts_for_corpora_only_counts_requested_ids(repo):
+    """A corpus NOT in the requested list is never counted, even if it has
+    files — this is a scoped read, not a global one."""
+    repo.add(
+        corpus_id="col_a",
+        filename="a.pdf",
+        sha256="sha_a",
+        file_type="pdf",
+        size_bytes=10,
+        storage_path="/tmp/a.pdf",
+    )
+    repo.add(
+        corpus_id="col_unrequested",
+        filename="u.pdf",
+        sha256="sha_u",
+        file_type="pdf",
+        size_bytes=10,
+        storage_path="/tmp/u.pdf",
+    )
+    counts = repo.status_counts_for_corpora(["col_a"])
+    assert set(counts) == {"col_a"}
+
+
+def test_status_counts_for_corpora_empty_ids_returns_empty_dict(repo):
+    repo.add(
+        corpus_id="col_a",
+        filename="a.pdf",
+        sha256="sha_a",
+        file_type="pdf",
+        size_bytes=10,
+        storage_path="/tmp/a.pdf",
+    )
+    assert repo.status_counts_for_corpora([]) == {}
+
+
+def test_top_folder_status_counts_groups_by_first_path_segment(repo):
+    """The completeness check's per-folder breakdown: a file under
+    ``Reports/2024/q1.pdf`` buckets under ``Reports``, and a file with no
+    ``/`` in its path buckets under ``""`` (the corpus-root bucket)."""
+    a = repo.add(
+        corpus_id="col_a",
+        filename="q1.pdf",
+        sha256="sha_a",
+        file_type="pdf",
+        size_bytes=10,
+        storage_path="/tmp/a.pdf",
+        path="Reports/2024/q1.pdf",
+    )
+    repo.set_status(a, status="indexed")
+    b = repo.add(
+        corpus_id="col_a",
+        filename="q2.pdf",
+        sha256="sha_b",
+        file_type="pdf",
+        size_bytes=10,
+        storage_path="/tmp/b.pdf",
+        path="Reports/2024/q2.pdf",
+    )
+    repo.set_status(b, status="rejected")
+    repo.add(
+        corpus_id="col_a",
+        filename="readme.txt",
+        sha256="sha_c",
+        file_type="txt",
+        size_bytes=10,
+        storage_path="/tmp/c.pdf",
+        path="readme.txt",
+    )
+    counts = repo.top_folder_status_counts("col_a")
+    assert counts["Reports"] == {"indexed": 1, "rejected": 1}
+    assert counts[""] == {"pending": 1}
+
+
+def test_top_folder_status_counts_null_path_buckets_under_root(repo):
+    repo.add(
+        corpus_id="col_a",
+        filename="no-path.pdf",
+        sha256="sha_a",
+        file_type="pdf",
+        size_bytes=10,
+        storage_path="/tmp/a.pdf",
+    )
+    counts = repo.top_folder_status_counts("col_a")
+    assert counts[""] == {"pending": 1}
+
+
+def test_top_folder_status_counts_unknown_corpus_returns_empty_dict(repo):
+    assert repo.top_folder_status_counts("col_absent") == {}
 
 
 # ---------------------------------------------------------------------------

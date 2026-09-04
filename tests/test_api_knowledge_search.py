@@ -66,6 +66,35 @@ def test_response_carries_retrieval_mode(seeded_app, monkeypatch):
     assert resp.json()["retrieval"] == "hybrid"
 
 
+def test_response_carries_candidates_capped_when_the_bound_is_hit(seeded_app, monkeypatch):
+    """P0 OOM fix, 2026-09: `search()`'s bounded candidate scan surfaces an
+    additive `candidates_capped: true` on the response when it hit the
+    configured limit — never present (and never `false`) otherwise."""
+    import src.ingest.retrieval as retrieval
+
+    c = seeded_app["client"]
+    admin = seeded_app["admin_token"]
+
+    col = c.post("/api/collections", json={"name": "Cap Col"}, headers=_auth(admin)).json()
+    for name in ("one.md", "two.md"):
+        up = c.post(
+            f"/api/collections/{col['id']}/files",
+            files={"files": (name, io.BytesIO(b"widget revenue widget revenue"), "text/markdown")},
+            headers=_auth(admin),
+        )
+        assert up.status_code == 201, up.text
+
+    monkeypatch.setattr(retrieval, "_max_candidate_chunks", lambda: 1)
+    resp = c.get("/api/knowledge/search", params={"q": "widget", "k": 10}, headers=_auth(admin))
+    assert resp.status_code == 200, resp.text
+    assert resp.json().get("candidates_capped") is True
+
+    monkeypatch.setattr(retrieval, "_max_candidate_chunks", lambda: 100)
+    resp = c.get("/api/knowledge/search", params={"q": "widget", "k": 10}, headers=_auth(admin))
+    assert resp.status_code == 200, resp.text
+    assert "candidates_capped" not in resp.json()
+
+
 def test_analyst_without_grants_sees_no_chunks(seeded_app):
     c = seeded_app["client"]
     admin = seeded_app["admin_token"]

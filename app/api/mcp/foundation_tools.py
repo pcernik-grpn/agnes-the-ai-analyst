@@ -291,6 +291,13 @@ FOUNDATION_TOOL_NAMES: tuple[str, ...] = (
     # DuckLake analytics-backend migration (wave-2G Task 6), triple-surface
     # with /api/admin/analytics/migrate + `agnes admin analytics migrate`.
     "admin_analytics_migrate",
+    # Knowledge-artifact packaging (K3, #798; TCRD-296 synthesis C.15),
+    # triple-surface with /api/admin/run-knowledge-packaging +
+    # `agnes admin knowledge packaging run` and
+    # /api/admin/knowledge-packaging/status + `agnes admin knowledge
+    # packaging status`.
+    "admin_knowledge_packaging_run",
+    "admin_knowledge_packaging_status",
     # Agent profiles (agent-api V1a, Task 12) — triple-surface with
     # /api/v1/agents + `agnes agent list` (management, session-token only)
     # and /api/v1/agents/{slug}/responses + `agnes agent ask` (runtime,
@@ -3567,6 +3574,56 @@ def register_foundation_tools(
             params["q"] = q
         async with httpx.AsyncClient() as c:
             r = await c.get(f"{base_url}/api/admin/activity", headers=headers_fn(), params=params, timeout=30)
+            _raise_for_status_with_detail(r)
+            return r.json()
+
+    @tool(read_only=False)
+    async def admin_knowledge_packaging_run() -> dict:
+        """Enqueue a knowledge-packaging run (admin only) — rebuilds any
+        Collection's ``knowledge.duckdb`` artifact whose chunk content
+        changed since the last pass (K3, #798; TCRD-296 synthesis C.15).
+
+        Runs as a worker job, not synchronously — poll ``admin_job_get``
+        with the returned ``job_id`` for the result, or call
+        ``admin_knowledge_packaging_status`` for a summary of the last run.
+
+        Returns ``{"status": "queued", "job_id": ...}`` on a fresh enqueue.
+        Mirrors ``POST /api/admin/run-knowledge-packaging`` and
+        ``agnes admin knowledge packaging run``. Requires an admin PAT.
+        Raises on a 409 (a run is already in flight — the error body
+        carries the in-flight ``job_id``) or a 501 (this process/instance
+        has no worker role, so nothing would ever claim the job).
+        """
+        async with httpx.AsyncClient() as c:
+            r = await c.post(
+                f"{base_url}/api/admin/run-knowledge-packaging",
+                headers=headers_fn(),
+                timeout=30,
+            )
+            _raise_for_status_with_detail(r)
+            return r.json()
+
+    @tool(read_only=True)
+    async def admin_knowledge_packaging_status() -> dict:
+        """Observability summary for knowledge-artifact packaging (admin
+        only): the last run's outcome, whether one is running right now,
+        and a best-effort estimate of when the next scheduled run is due.
+
+        Returns ``{"last_run": {"job_id", "status", "created_at",
+        "finished_at", "result"} | null, "running": bool,
+        "next_due": iso-timestamp | null}`` where ``result`` (once the run
+        completes) carries ``built``/``skipped``/``pruned``/``errors``/
+        ``interrupted_reason``/``duration_s``/``collections_total``/
+        ``collections_processed``. Mirrors
+        ``GET /api/admin/knowledge-packaging/status`` and
+        ``agnes admin knowledge packaging status``. Requires an admin PAT.
+        """
+        async with httpx.AsyncClient() as c:
+            r = await c.get(
+                f"{base_url}/api/admin/knowledge-packaging/status",
+                headers=headers_fn(),
+                timeout=30,
+            )
             _raise_for_status_with_detail(r)
             return r.json()
 
