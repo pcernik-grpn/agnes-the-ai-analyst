@@ -85,6 +85,28 @@
         ".env"
       ],
       "port": 8012
+    },
+    {
+      "name": "agnes-dev-kai-real-3011",
+      "runtimeExecutable": "env",
+      "runtimeArgs": [
+        "LOCAL_DEV_MODE=1",
+        "AGNES_CHAT_ENABLED=true",
+        "AGNES_CHAT_PROVIDER=kai-agent",
+        "AGNES_CHAT_KAI_AGENT_URL=http://127.0.0.1:3011",
+        "JWT_SECRET_KEY=local-dev-only-jwt-secret-not-for-any-deployment-0123456789",
+        "DATA_DIR=/private/tmp/claude-501/-Users-adamvyborny-Code-agnes-the-ai-analyst--claude-worktrees-tcrd-291-linear-task-7a9e79/7211aec5-f8a4-49ec-b63c-b2bcf6ebee27/scratchpad/agnes-data",
+        "AGNES_MCP_INTERNAL_URL=http://127.0.0.1:8001",
+        ".venv/bin/uvicorn",
+        "app.main:app",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "8001",
+        "--env-file",
+        ".env"
+      ],
+      "port": 8001
     }
   ]
 }
