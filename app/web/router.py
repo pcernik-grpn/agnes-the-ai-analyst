@@ -5026,10 +5026,27 @@ async def semantic_layer_list(
     #: has no Domain, a metric projected from a document has no Domain of its
     #: own — which is the engine's existing behaviour for an empty attribute,
     #: not a special case.
+    #: A model contributes its OWN values here, not a placeholder row. Every
+    #: model used to be tallied as `_DIRECT_KEY` with an empty source, while
+    #: the card markup declared neither attribute — so the menu and the rows
+    #: disagreed in both directions at once: "Defined directly" counted every
+    #: model into a slice none of them could match, and selecting ANY model
+    #: emptied the Semantic models tab, including the option naming that very
+    #: model. A model IS its model on this axis, and its `source` is real,
+    #: which is why models were absent from the Source facet entirely. Keep in
+    #: step with the card's own `data-*` in semantic_layer_list.html.
     _all_rows = (
         [dict(m, facet_kind="metric") for m in metric_rows]
         + [dict(t, facet_kind="term") for t in glossary_terms]
-        + [{"facet_model": _DIRECT_KEY, "facet_domain": "", "facet_source": "", "facet_kind": "model"} for _ in models]
+        + [
+            {
+                "facet_model": str(m.get("slug") or ""),
+                "facet_domain": "",
+                "facet_source": str(m.get("source") or "manual"),
+                "facet_kind": "model",
+            }
+            for m in models
+        ]
     )
     page_facets = [
         f

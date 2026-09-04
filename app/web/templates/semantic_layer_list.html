@@ -43,8 +43,13 @@
    with fewer than two values does not render — which is what retired the
    glossary's "All 12 / Defined directly 12" nav, a control that could not
    change what was on screen. #}
-{% macro page_toolbar(facets, tabs, total) %}
-<div class="fbar sl-fbar" role="group" aria-label="Search and filter definitions">
+{#- `ds` is a PARAMETER: base_ds.html imports the component macros inside a
+    block, so the name exists at this macro's call site (inside
+    `page_head`) but not in a macro defined at top level. Passing it in
+    beats re-importing `_components.html` here, which the design-system
+    contract asks pages not to do. -#}
+{% macro page_toolbar(facets, tabs, total, ds) %}
+<div class="fbar fbar--ranked sl-fbar" role="group" aria-label="Search and filter definitions">
   <div class="fbar__search" role="search">
     <svg class="fbar__search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5" stroke-linecap="round"/></svg>
     <input id="sl-search" type="search" placeholder="Search definitions…" autocomplete="off" aria-label="Search definitions">
@@ -52,7 +57,7 @@
   {% if facets %}
   <div class="fbar-filter">
     <button type="button" class="fbar-filter__btn" id="sl-filter-btn" aria-haspopup="true" aria-expanded="false">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M3 6h18M7 12h10M11 18h2"/></svg>
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 5h16M7 12h10M10 19h4"></path></svg>
       Filter<span class="fbar-filter__n" hidden>0</span>
     </button>
     <div class="fbar-menu fbar-menu--cats" id="sl-filter-menu" role="menu" aria-label="Filter definitions" hidden>
@@ -84,13 +89,35 @@
      reader who scrolled to the bottom of 21 metrics had no way back up by
      name. Two options only: there is no date on these rows and no size, so
      "recently added" would be a control with nothing behind it. #}
-  <label class="sl-sort">
-    <span class="sl-sort__label">Sort</span>
-    <select id="sl-sort" aria-label="Sort definitions">
-      <option value="name_asc">A → Z</option>
-      <option value="name_desc">Z → A</option>
-    </select>
-  </label>
+  {#- A `<div>`, not the `<label>` this used to be: a label may not wrap the
+      custom dropdown's BUTTON, and the native select below carries its own
+      `aria-label` anyway. The visible "Sort" word stays — /chats drops it
+      because "Recent activity" says what it is, while "A → Z" alone does
+      not name the axis it orders. -#}
+  <div class="sl-sort">
+    <span class="sl-sort__label" aria-hidden="true">Sort</span>
+    {#- `.fbar-select` + a paired `.ds-dropdown` is the shape /library and
+        /chats use, and the reason this is not a bare `<select>` any more: a
+        native select renders the OS menu, so opening Sort dropped an unstyled
+        macOS/Windows popup into the middle of the page. The native control
+        stays as the accessible source of truth (paper hides it and shows the
+        custom one; other themes do the reverse), and filter_toolbar.js's
+        `syncPairedDropdown()` already re-syncs the paired dropdown on every
+        programmatic change, so this needs no page-local JS. -#}
+    <div class="fbar-select">
+      <select id="sl-sort" class="ds-dropdown-native" aria-label="Sort definitions">
+        <option value="name_asc">A → Z</option>
+        <option value="name_desc">Z → A</option>
+      </select>
+      {{ ds.dropdown(
+           id='sl-sort-dd', target='sl-sort',
+           aria_label='Sort definitions', selected='name_asc',
+           options=[
+             {'value': 'name_asc', 'label': 'A → Z'},
+             {'value': 'name_desc', 'label': 'Z → A'},
+           ]) }}
+    </div>
+  </div>
 </div>
 {# Chips under the bar that set them, THEN the tabs. The order is the claim:
    everything above narrows the whole page, and the tabs below split what
@@ -129,6 +156,10 @@
 {% block head_extra %}
 <link rel="stylesheet" href="{{ static_url('css/filter_toolbar.css') }}">
 <link rel="stylesheet" href="{{ static_url('css/catalog_card.css') }}">
+{# The Sort control's custom dropdown. Its component sheet is per-page, like
+   its script — without it the button's visually-hidden field name renders as
+   visible text ("Sort definitions A → Z") and the chevron draws unsized. #}
+<link rel="stylesheet" href="{{ static_url('css/ds_dropdown.css') }}">
 <style>
 /* ── The way back (#1898) ────────────────────────────────────────────────
    This page is reached from the Library's Definitions block and from the
@@ -205,16 +236,26 @@
 .sl-flat { display: flex; flex-direction: column; gap: 0; }
 .sl-fbar { margin: 0; }
 /* The sort control sits at the far end of the bar, after the Filter button —
-   the Library's order, so the two bars read the same left to right. */
+   the Library's order, so the two bars read the same left to right.
+
+   The bar opts into `.fbar--ranked`, the shared treatment /library and /chats
+   run: search is a quiet FIELD, Filter and its neighbours are borderless muted
+   utilities, and every control is 32px so the row sits lighter than the rows it
+   acts on. This page had the order right and the treatment wrong — it rendered
+   the flat default, where Filter is a 38px bordered box on `--ds-surface` and
+   search is the only flex-grow child and therefore the loudest thing on a page
+   whose subject is a list. Opting in is one class; the block's own note is that
+   it lives in the shared sheet precisely so a third page cannot drift.
+
+   Sort carries no metrics of its own here. It is a `.fbar-select` holding a
+   paired `.ds-dropdown` (see the markup), which is exactly what
+   `.fbar--ranked .fbar-select .ds-dropdown-btn` in the shared sheet styles —
+   32px, quiet fill, no resting border. A page-local copy of those numbers was
+   what this had while it rendered a bare `<select>`, and the numbers are not
+   the reason it changed: a native select opens the OS menu, so the one part of
+   the control a reader actually interacts with was unstyled. */
 .sl-sort { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; }
 .sl-sort__label { font-size: 12.5px; color: var(--ds-text-muted); }
-.sl-sort select {
-    height: 34px; padding: 0 8px;
-    border: 1px solid var(--ds-border); border-radius: var(--radius-md, 8px);
-    background: var(--ds-surface); color: var(--ds-text-primary);
-    font: inherit; font-size: 13px; cursor: pointer;
-}
-.sl-sort select:focus-visible { outline: var(--ds-focus-outline); outline-offset: 1px; }
 /* Chips clear of the bar that SET them: butted against it they read as a second
    row of the control rather than as its result. Scoped to the page's own chip
    row (not `.sl-flat`'s, which is inside a bucket) — the row lives above the
@@ -481,7 +522,7 @@
 {% endblock %}
 
 {% block page_surface %}
-{{ page_toolbar(page_facets, tabs, (models | length) + (metric_rows | length) + (glossary_terms | length)) }}
+{{ page_toolbar(page_facets, tabs, (models | length) + (metric_rows | length) + (glossary_terms | length), ds) }}
 
 {# The three buckets, all on the page at once. They used to be three
    server-rendered pages behind link tabs, which is why one search could only
@@ -500,8 +541,17 @@
        three visible chips saying a thing is ABSENT, which pushed the real counts
        behind a "+2" and left the survivors truncated mid-word ("0 constrai…").
        A model with two datasets and two metrics now says exactly that. #}
-    {# `data-tab` is the bucket this row belongs to and `data-ft` the search
-       index — the two things every row on this page must declare.
+    {# `data-tab` is the bucket this row belongs to, `data-ft` the search index,
+       and `data-model`/`data-domain`/`data-source` the three facet axes — what
+       every row on this page must declare.
+
+       The facet attributes are not optional decoration: the engine reads a
+       missing attribute as the empty string and hides the row, so a card
+       without them vanished the moment any facet was selected — including the
+       Model option naming that very card's document. A model's value on the
+       Model axis is ITSELF (its slug), never "Defined directly"; `data-domain`
+       is deliberately empty, since a document has no business domain. Kept in
+       step with the same three values the route tallies the facet counts from.
 
        Escaped with `replace`, not `| e`. The macro emits this whole string
        with `| safe`, so the VALUE has to be escaped here — but `escape`
@@ -538,6 +588,10 @@
          'attrs': ('data-tab="models" data-name="' ~ ((m.name or '') | lower | replace('&', '&amp;') | replace('"', '&quot;') | replace('<', '&lt;')) ~ '" data-ft="'
                    ~ ((m.name ~ ' ' ~ (m.description or '')) | lower
                       | replace('&', '&amp;') | replace('"', '&quot;') | replace('<', '&lt;'))
+                   ~ '" data-model="'
+                   ~ ((m.slug or '') | replace('&', '&amp;') | replace('"', '&quot;') | replace('<', '&lt;'))
+                   ~ '" data-domain="" data-source="'
+                   ~ ((m.source or 'manual') | replace('&', '&amp;') | replace('"', '&quot;') | replace('<', '&lt;'))
                    ~ '"' ~ (' data-status="invalid"' if _is_invalid else '')),
        } %}
     {% if m.is_imported or _is_invalid %}
@@ -750,6 +804,10 @@
 
 {% block scripts %}
 <script src="{{ static_url('js/filter_toolbar.js') }}"></script>
+{# Drives the Sort control's custom dropdown (#1055). Not global — every page
+   that pairs a `.ds-dropdown` to a native select loads it, as /library and
+   /chats do. #}
+<script src="{{ static_url('js/components/ds_dropdown.js') }}" defer></script>
 <script>
 (function () {
     // ── Legacy fragment → tab ────────────────────────────────────────────
