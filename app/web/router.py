@@ -6112,6 +6112,40 @@ async def library_detail(
 
     managing = source_managing_connection(col["id"])
 
+    # SharePoint permissions captured as METADATA (TCRD-296 gap #79) — "in
+    # SharePoint, this folder is visible to: <names>", admin-only (Agnes's
+    # own access for this collection may differ — the Sharing rail fact
+    # above is the authority for that; this is purely informational). Fails
+    # SILENTLY closed on anything short of a full match — no snapshot, no
+    # backend, no scope row — the page must never break because a Graph
+    # read hasn't happened yet.
+    sharepoint_permissions_visible_to: list[str] | None = None
+    if is_admin and managing is not None and managing.get("source_type") == "sharepoint":
+        scope_row = next(
+            (
+                s
+                for s in (managing.get("config") or {}).get("scopes") or []
+                if isinstance(s, dict) and s.get("collection_id") == col["id"]
+            ),
+            None,
+        )
+        if scope_row is not None and scope_row.get("source_scope_id"):
+            from src.repositories import use_pg
+
+            if use_pg():
+                from connectors.sharepoint.acl_sync import acl_snapshot_kind
+                from src.repositories import sharepoint_state_repo
+
+                try:
+                    snap = sharepoint_state_repo().get(managing["id"], acl_snapshot_kind(scope_row["source_scope_id"]))
+                except Exception as e:  # noqa: BLE001 — informational only, never breaks the page
+                    logger.warning("/library/%s: ACL snapshot read failed: %s", slug, e)
+                    snap = None
+                if snap:
+                    names = [p.get("display_name") for p in (snap.get("principals") or []) if p.get("display_name")]
+                    if names:
+                        sharepoint_permissions_visible_to = names
+
     # The one set of "other active query params" every paginated section's
     # pager shares — see `_pager_href` above. Built once here so a Files
     # "Next" link can never drop an active Facts page (or vice versa), and a
@@ -6153,6 +6187,7 @@ async def library_detail(
         can_manage=is_admin or owner_id == user["id"],
         facts_summary=facts_summary,
         source_managed_by=(managing.get("name") or managing.get("id")) if managing else None,
+        sharepoint_permissions_visible_to=sharepoint_permissions_visible_to,
     )
     return templates.TemplateResponse(request, "library_detail.html", ctx)
 

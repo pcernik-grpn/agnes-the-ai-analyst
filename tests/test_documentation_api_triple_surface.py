@@ -1342,6 +1342,15 @@ _EXEMPT: dict[str, str] = {
         "display primitive over live Graph data, not an analyst query surface, same "
         "reasoning as split-plan below"
     ),
+    # ACL-permissions snapshot (TCRD-296 gap #79) — reads ALREADY-CAPTURED
+    # Graph permissions (no live Graph call of its own), same admin/ops
+    # display-primitive class as shard-plan above.
+    "/api/admin/sharepoint/connections/{connection_id}/acl-snapshot": (
+        "who SharePoint itself says can see each scope, already captured by the "
+        "sharepoint-acl-sync job — CLI-reachable (agnes admin sharepoint acl-snapshot) but "
+        "deliberately not MCP-exposed: an admin/ops display primitive over already-captured "
+        "Graph permissions, not an analyst query surface, same reasoning as shard-plan above"
+    ),
     "/api/admin/sharepoint/connections/{connection_id}/split-plan": (
         "read-only preview of a folder-based site split (greedy-packed groups + "
         "per-folder Graph Search document counts) — CLI-reachable (agnes admin "

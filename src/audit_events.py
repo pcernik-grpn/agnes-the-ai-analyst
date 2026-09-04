@@ -1116,6 +1116,13 @@ CATALOG: dict[str, AuditEvent] = {
     "memory.admin_audit_read": AuditEvent(
         "memory.admin_audit_read", "read", "An admin read the corporate-memory governance audit trail."
     ),
+    "sharepoint_connection.acl_snapshot_read": AuditEvent(
+        "sharepoint_connection.acl_snapshot_read",
+        "read",
+        "An admin read a SharePoint connection's captured ACL-permissions snapshot "
+        "(who SharePoint itself says can see each scope) — informational metadata, "
+        "independent of access_mode.",
+    ),
     "sharepoint_connection.certificate_read": AuditEvent(
         "sharepoint_connection.certificate_read",
         "read",

@@ -2411,6 +2411,88 @@ console.log(JSON.stringify({{ html: _spScopeRowHtml("sp-conn-1", {json.dumps(sco
         # Nothing per-scope leaked into the initial render.
         assert "ds-sp-scope-row" not in html
 
+    # -- SharePoint permissions snapshot (TCRD-296 gap #79) -----------------
+
+    def test_acl_snapshot_row_renders_a_loading_placeholder_and_view_button(self):
+        """The fact row starts as a placeholder with a stable id —
+        `_fetchSharepointAclSnapshot` (fetched after the page paints, out of
+        reach for this synchronous node harness) fills in the real counts;
+        this pins only what `_sharepointFactsHtml` itself renders before
+        that fetch fires — same posture as the scope-collections row above."""
+        result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));")
+        html = result["html"]
+        assert "SharePoint permissions" in html
+        assert 'id="ds-sp-acl-sp-conn-1"' in html
+        assert "loading" in html
+        assert "toggleSpAclSnapshotDrawer('sp-conn-1')" in html
+        assert 'id="ds-sp-acl-drawer-sp-conn-1"' in html
+
+    def _run_acl_snapshot_scope_row(self, scope: dict) -> str:
+        """`_spAclSnapshotScopeRowHtml` executed directly — the per-scope
+        principal-list renderer used by `toggleSpAclSnapshotDrawer`'s
+        fetch-on-expand drawer (its own async `fetch()` is out of reach for
+        this synchronous node harness, but the pure rendering function it
+        calls is not — same split as `_run_scope_row` above)."""
+        import json
+        import subprocess
+        import tempfile
+        from pathlib import Path
+
+        tpl = _ds_page_source.page_source()
+        fns = "\n".join(
+            self._extract_function(tpl, sig)
+            for sig in ("function _esc(s) {", "function _spAclSnapshotScopeRowHtml(scope) {")
+        )
+        script = f"""
+{fns}
+console.log(JSON.stringify({{ html: _spAclSnapshotScopeRowHtml({json.dumps(scope)}) }}));
+"""
+        with tempfile.NamedTemporaryFile("w", suffix=".mjs", delete=False) as f:
+            f.write(script)
+            path = f.name
+        try:
+            proc = subprocess.run(["node", path], capture_output=True, text=True)
+        finally:
+            Path(path).unlink(missing_ok=True)
+        if proc.returncode == 127:
+            pytest.skip("node unavailable")
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        return json.loads(proc.stdout)["html"]
+
+    def test_acl_snapshot_scope_row_lists_each_principal_and_its_kind(self):
+        html = self._run_acl_snapshot_scope_row(
+            {
+                "source_scope_id": "s1",
+                "display_path": "Site / Docs / Finance",
+                "principals": [
+                    {"principal_kind": "entra_group", "display_name": "Finance Team"},
+                    {"principal_kind": "user", "display_name": "Alice"},
+                ],
+            }
+        )
+        assert "Site / Docs / Finance" in html
+        assert "Finance Team" in html
+        assert "entra_group" in html
+        assert "Alice" in html
+        assert "(user)" in html
+
+    def test_acl_snapshot_scope_row_escapes_principal_names(self):
+        """Untrusted names (a SharePoint display name is admin/producer
+        content, not Agnes-controlled) must never reach innerHTML raw."""
+        html = self._run_acl_snapshot_scope_row(
+            {
+                "source_scope_id": "s2",
+                "display_path": "<img src=x onerror=alert(1)>",
+                "principals": [{"principal_kind": "user", "display_name": "<script>alert(1)</script>"}],
+            }
+        )
+        assert "<script>" not in html
+        assert "<img" not in html
+
+    def test_acl_snapshot_scope_row_no_principals_state(self):
+        html = self._run_acl_snapshot_scope_row({"source_scope_id": "s3", "display_path": "Empty", "principals": []})
+        assert "no principals" in html
+
     # -- anonymization row (spec §9.2/§13.2): requested vs declared --------
 
     def test_facts_html_has_no_anonymization_row_when_nothing_requested(self):

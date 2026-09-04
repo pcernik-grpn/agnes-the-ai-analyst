@@ -600,6 +600,19 @@
     upload. To hand-manage this collection, unselect its scope in the
     connect wizard first.
   </p>
+  {# SharePoint permissions captured as METADATA (TCRD-296 gap #79) —
+     admin-only, informational: this is what SharePoint's own permission
+     list says, independent of Agnes access (the Sharing card in the aside
+     is the authority for that unless this scope's access mode is
+     'mirrored'). Server-side computed (app/web/router.py::library_detail)
+     so it degrades to nothing rather than an error when no snapshot has
+     been captured yet, or the instance runs the DuckDB app-state backend. #}
+  {% if sharepoint_permissions_visible_to %}
+  <p class="drop__note" title="From SharePoint's own permissions, captured periodically by the sharepoint-acl-sync job. Agnes's own access for this collection may differ (see Sharing) unless this scope's access mode is mirrored.">
+    In SharePoint, this folder is visible to:
+    {%- for n in sharepoint_permissions_visible_to %} <strong>{{ n }}</strong>{% if not loop.last %},{% endif %}{% endfor -%}.
+  </p>
+  {% endif %}
 {{ detail.section_close() }}
 {% else %}
 {{ detail.section_open('Add files', icon='file') }}
