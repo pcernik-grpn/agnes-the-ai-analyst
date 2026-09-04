@@ -34,6 +34,23 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   unset, and requiring it would make linked apps impossible on exactly the
   servers the feature exists for. (#2154)
 
+- **Linked apps: the write tool the old guess left in materialize mode is no
+  longer invoked by a full-source run.** The fix above closes the route that
+  creates that state; it does not clear what already exists. On an instance
+  where "Read the app list" was clicked before it, the wrongly chosen tool is
+  still sitting in `materialize` mode, and a source-level "Materialize now"
+  runs every materialize-mode tool without consulting `read_only` — so the
+  same call is reachable by a different door. `scripts/repair_mcp_materialize_
+  debris.py` finds those rows and returns them to `passthrough`, clearing the
+  inert `daily 03:00` schedule with the mode. It reports and changes nothing by
+  default: materializing a write-shaped tool is a legitimate thing to have
+  chosen on purpose, and a name is a guess, so `--apply` is a deliberate second
+  run. Teaching the run path to skip write-shaped tools was considered and not
+  taken — it would break that legitimate setup, and with the lister guard in
+  place there is no remaining bug route into the state for it to defend. The
+  write-verb list now lives once, in `src/mcp_tool_shape.py`, with a test
+  pinning it to the copy `linked_apps_panel.js` has to carry. (#2251)
+
 ### Removed
 
 ### Internal
