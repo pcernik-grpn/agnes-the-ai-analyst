@@ -260,6 +260,34 @@
     return g ? g.id : null;
   }
 
+  /* WHO an add started on this audience reaches: the everyone SCOPE when the
+     audience is the Everyone carrier, otherwise the group itself.
+
+     The Everyone audience is selected by the carrier's own id — the page
+     renders it as a scope, but `selectedGroup` holds a group id like any
+     other row, which is why `scopeSelected` below compares against
+     `everyoneGroupId()`. The picker read the decision off its MODE instead
+     (`bundleMode`), so the Everyone block's own add control wrote a grant
+     with no scope: reach is the carrier's members, in a section headed
+     "what every account gets". An account that belongs to no group — the
+     case the scope exists for — was left out.
+
+     Pure and taking the list, so a guard can run the decision rather than
+     scan for it. */
+  function addScopeFor(groupId, groups) {
+    const g = (groups || []).find((x) => x.id === groupId);
+    return g && g.is_everyone ? "everyone" : null;
+  }
+
+  /* Whether a kind can be added at a given scope. The four withheld types
+     are refused by the API with a 422, so offering them in a scope-mode
+     picker would trade a silent wrong write for a visible batch failure —
+     the same reason `pickerAudiences` withholds the choice the other way
+     round. */
+  function addableAtScope(typeKey, scope) {
+    return scope !== "everyone" || !SCOPE_WITHHELD_TYPES.has(typeKey);
+  }
+
   /* Grants a group's members can actually use — DIRECT grants plus the ones
      inherited from Everyone.
 
@@ -4154,6 +4182,7 @@
       for (const b of (t.blocks || [])) {
         for (const i of (b.items || [])) {
           if (grantOf(pickerState.group, t.type_key, i.resource_id)) continue;
+          if (!addableAtScope(t.type_key, pickerState.scope)) continue;
           const hay = `${i.name || ""} ${i.slug || ""} ${i.resource_id || ""} ${i.owner_email || ""} ${b.name || ""} ${t.type_display || ""}`.toLowerCase();
           if (q && !hay.includes(q)) continue;
           if (pickerState.kind && t.type_key !== pickerState.kind) continue;
@@ -4305,7 +4334,9 @@
     els.count.textContent = n ? `${n} selected` : "Nothing selected";
     paintPickerTier();
     els.apply.disabled = !n;
-    els.apply.textContent = n ? `Add ${n} to the group` : "Apply";
+    els.apply.textContent = n
+      ? (pickerState.scope === "everyone" ? `Add ${n} for everyone` : `Add ${n} to the group`)
+      : "Apply";
   }
 
   /* Picking groups reuses the row shape, minus the kind chip: what varies
@@ -4413,16 +4444,21 @@
     // literal that forgets `kind` or `collapsed` leaves the painter reading
     // `.has` off undefined — which is a blank drawer, not an error anyone
     // sees.
-    pickerState = { mode: "resources", group: groupId, bundle: null, tier: "available",
+    // Carried on the state, not re-derived at apply time: `applyPicker`
+    // runs after the drawer closes, and the decision belongs to the audience
+    // the admin opened it on.
+    const scope = addScopeFor(groupId, overview.groups || []);
+    pickerState = { mode: "resources", group: groupId, scope, bundle: null, tier: "available",
                     chosen: new Set(), q: "", kind: "", fam: "", collapsed: new Set() };
     els.q.value = "";
     els.q.placeholder = "Search everything grantable…";
-    els.root.querySelector("#pk-title").textContent = "Add to this group";
+    els.root.querySelector("#pk-title").textContent =
+      scope === "everyone" ? "Add for everyone" : "Add to this group";
     // This picker offers every kind at once — tiered and untiered — so it
     // cannot promise the tier either. The row that lands says which it got.
-    els.sub.textContent = g
-      ? `Everything ${titleOf(g)} does not have yet.`
-      : "";
+    els.sub.textContent = scope === "everyone"
+      ? "Everything every account does not already get."
+      : (g ? `Everything ${titleOf(g)} does not have yet.` : "");
     paintPicker();
     // `.ds-drawer` is display:none until `.is-open` — the same two-step the
     // group drawer uses (`group_drawer.js`), because the overlay animates in
@@ -4446,6 +4482,10 @@
     const els = buildPicker();
     const chosen = [...pickerState.chosen];
     const bundleMode = pickerState.mode === "bundle";
+    // Captured before the loop: the toast below reads it after
+    // `closePicker()`, and one mode's answer must not be re-derived from the
+    // other's shape.
+    const scopeMode = !bundleMode && pickerState.scope === "everyone";
     els.apply.disabled = true;
     let ok = 0;
     const failed = [];
@@ -4453,8 +4493,10 @@
       const type = bundleMode ? pickerState.bundle.type : key.slice(0, key.indexOf(":"));
       const rid = bundleMode ? pickerState.bundle.id : key.slice(key.indexOf(":") + 1);
       // In bundle mode the key IS the audience, and one of them is not a
-      // group: the sentinel routes to `scope` instead of `group_id`.
-      const asScope = bundleMode && key === EVERYONE_AUDIENCE.id;
+      // group: the sentinel routes to `scope` instead of `group_id`. In
+      // resources mode the audience is the one the drawer was opened on, so
+      // the answer is on the state — see `addScopeFor`.
+      const asScope = bundleMode ? key === EVERYONE_AUDIENCE.id : scopeMode;
       const gid = bundleMode ? (asScope ? everyoneGroupId() : key) : pickerState.group;
       try {
         /* The admin's answer, for a kind that has the choice. An untiered
@@ -4486,7 +4528,9 @@
         // the word is a label on this very page — on a batch that may hold
         // kinds with no tier at all. Say the reach, which is what actually
         // just happened, and leave the tier to the rows.
-        : `${ok} added — everyone in the group can use ${ok === 1 ? "it" : "them"} now`, !failed.length);
+        : scopeMode
+          ? `${ok} added — every account can use ${ok === 1 ? "it" : "them"} now, including anyone who joins`
+          : `${ok} added — everyone in the group can use ${ok === 1 ? "it" : "them"} now`, !failed.length);
     await repaint();
   }
 
