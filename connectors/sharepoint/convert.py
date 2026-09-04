@@ -304,6 +304,47 @@ def conversion_budget_seconds(size_bytes: int, *, base_seconds: float = CONVERSI
     return min(CONVERSION_BUDGET_MAX_SECONDS, base_seconds + CONVERSION_BUDGET_PER_MB_SECONDS * size_mb)
 
 
+#: Closed vocabulary for WHY one document's conversion failed — the crawler
+#: persists this into ``failed_items[...]['error_class']``
+#: (``connectors.sharepoint.crawler._note_retry``, 2026-09-04 finding #66
+#: item 1) and uses it to decide when a document has failed
+#: DETERMINISTICALLY enough to stop retrying it without a download
+#: (``crawler._doomed_skip_reason``, item 2) — never freeform text, so that
+#: decision never depends on parsing prose. Not every possible crawl-time
+#: failure is listed here — ``download_error``/``ingest_error`` are the
+#: crawler's OWN classes for its download/ingest stages, set there directly
+#: (this module never sees those stages) — the ones below are exactly what
+#: THIS module's own raise sites can attribute a failure to.
+ERROR_CLASS_MARKITDOWN_REJECT = "markitdown_reject"
+ERROR_CLASS_LIBREOFFICE_NO_OUTPUT = "libreoffice_no_output"
+ERROR_CLASS_PDFIUM_ERROR = "pdfium_error"
+ERROR_CLASS_TIMEOUT = "timeout"
+ERROR_CLASS_MEMORY_KILL = "memory_kill"
+ERROR_CLASS_WORKER_CRASH = "worker_crash"
+ERROR_CLASS_INGEST_ERROR = "ingest_error"
+ERROR_CLASS_DOWNLOAD_ERROR = "download_error"
+ERROR_CLASS_OTHER = "other"
+
+#: The subset of the vocabulary above treated as DETERMINISTIC — the same
+#: file, the same bytes, will be rejected the same way every time, so a
+#: bounded number of attempts is enough to know not to try again without an
+#: operator's explicit ``force_reprocess`` (2026-09-04 finding #66 item 2).
+#: Timeouts, memory kills and worker crashes are deliberately EXCLUDED —
+#: they are environmental (a busy host, a transient resource ceiling), not a
+#: property of the document, and stay retryable forever. ``ingest_error`` is
+#: deterministic only when paired with an unchanged content hash — this set
+#: alone is necessary but not sufficient for it; the crawler applies that
+#: extra check itself (``_note_retry``'s ``content_sha``).
+DETERMINISTIC_ERROR_CLASSES = frozenset(
+    {
+        ERROR_CLASS_MARKITDOWN_REJECT,
+        ERROR_CLASS_LIBREOFFICE_NO_OUTPUT,
+        ERROR_CLASS_PDFIUM_ERROR,
+        ERROR_CLASS_INGEST_ERROR,
+    }
+)
+
+
 class ConversionError(RuntimeError):
     """A file could not be converted.
 
@@ -311,11 +352,22 @@ class ConversionError(RuntimeError):
     line per document and "UnicodeDecodeError" on its own is unactionable. The
     message never carries file *content* — a conversion failure is frequently a
     malformed document, and its bytes may be confidential.
+
+    ``error_class`` (one of the ``ERROR_CLASS_*`` constants above, or ``None``
+    when this raise site has no opinion) is set at the exact point that knows
+    which backend rejected the file and why — never inferred later from the
+    message text, which is free-form and scope-gated (see
+    :func:`_convert_failure_detail`). ``None`` propagates as ``"other"`` at
+    the crawler boundary (``_prepare_document``), the same conservative,
+    always-retryable default an unclassified failure already gets.
     """
 
-    def __init__(self, filename: str, message: str, *, engine: str | None = None) -> None:
+    def __init__(
+        self, filename: str, message: str, *, engine: str | None = None, error_class: str | None = None
+    ) -> None:
         self.filename = filename
         self.engine = engine
+        self.error_class = error_class
         super().__init__(f"{filename}: {message}")
 
 
@@ -544,6 +596,7 @@ def _convert_markitdown(path: Path, filename: str) -> str:
             filename,
             f"markitdown could not convert this file ({type(exc).__name__})",
             engine=ENGINE_MARKITDOWN,
+            error_class=ERROR_CLASS_MARKITDOWN_REJECT,
         ) from exc
 
     text = getattr(result, "text_content", None)
@@ -573,6 +626,25 @@ def _libreoffice_profile_dir() -> str:
         profile = tempfile.mkdtemp(prefix=f"agnes-libreoffice-profile-{pid}-")
         _LIBREOFFICE_PROFILES[pid] = profile
     return profile
+
+
+def _libreoffice_exit_error_class(returncode: int) -> str:
+    """Classify a non-zero ``soffice`` exit for :func:`_run_libreoffice_convert`.
+
+    A NEGATIVE returncode (POSIX: ``subprocess`` reports ``-N`` for a
+    process killed by signal ``N``) means something outside the document
+    killed the subprocess — ``SIGKILL`` (``-9``) is this pool's own memory
+    guard or the kernel's OOM killer (:data:`ERROR_CLASS_MEMORY_KILL`, same
+    reasoning as the conversion pool's own ``_ConvertMemoryGuard``), any
+    other signal is an ordinary crash (:data:`ERROR_CLASS_WORKER_CRASH`).
+    Both are ENVIRONMENTAL, not a property of the file, and stay retryable.
+    A POSITIVE returncode means ``soffice`` ran to completion and refused
+    the file on its own — the file itself is the reason
+    (:data:`ERROR_CLASS_LIBREOFFICE_NO_OUTPUT`, deterministic).
+    """
+    if returncode < 0:
+        return ERROR_CLASS_MEMORY_KILL if returncode == -9 else ERROR_CLASS_WORKER_CRASH
+    return ERROR_CLASS_LIBREOFFICE_NO_OUTPUT
 
 
 def _run_libreoffice_convert(path: Path, filename: str, target_format: str, *, engine: str) -> Path:
@@ -633,6 +705,7 @@ def _run_libreoffice_convert(path: Path, filename: str, target_format: str, *, e
                 filename,
                 f"libreoffice conversion timed out after {LIBREOFFICE_TIMEOUT_SECONDS}s",
                 engine=engine,
+                error_class=ERROR_CLASS_TIMEOUT,
             ) from exc
 
         if completed.returncode != 0:
@@ -640,11 +713,17 @@ def _run_libreoffice_convert(path: Path, filename: str, target_format: str, *, e
                 filename,
                 f"libreoffice exited with status {completed.returncode}",
                 engine=engine,
+                error_class=_libreoffice_exit_error_class(completed.returncode),
             )
 
         converted = sorted(Path(tmpdir).glob(f"*.{target_format}"))
         if not converted:
-            raise ConversionError(filename, "libreoffice produced no output file", engine=engine)
+            raise ConversionError(
+                filename,
+                "libreoffice produced no output file",
+                engine=engine,
+                error_class=ERROR_CLASS_LIBREOFFICE_NO_OUTPUT,
+            )
         return converted[0]
     except BaseException:
         shutil.rmtree(tmpdir, ignore_errors=True)
@@ -714,7 +793,10 @@ def _read_xlsx_as_text(path: Path, filename: str, max_chars: int, *, engine: str
         workbook = openpyxl.load_workbook(str(path), read_only=True, data_only=True)
     except Exception as exc:
         raise ConversionError(
-            filename, f"openpyxl could not open this file ({type(exc).__name__})", engine=engine
+            filename,
+            f"openpyxl could not open this file ({type(exc).__name__})",
+            engine=engine,
+            error_class=ERROR_CLASS_MARKITDOWN_REJECT,
         ) from exc
 
     parts: list[str] = []
@@ -734,7 +816,10 @@ def _read_xlsx_as_text(path: Path, filename: str, max_chars: int, *, engine: str
                 total += len(line)
     except Exception as exc:
         raise ConversionError(
-            filename, f"openpyxl could not read this file's rows ({type(exc).__name__})", engine=engine
+            filename,
+            f"openpyxl could not read this file's rows ({type(exc).__name__})",
+            engine=engine,
+            error_class=ERROR_CLASS_MARKITDOWN_REJECT,
         ) from exc
     finally:
         workbook.close()
@@ -767,6 +852,7 @@ def _convert_large_xlsx(path: Path, filename: str, max_chars: int) -> tuple[str,
                 filename,
                 f"openpyxl streaming: {exc} | libreoffice resave+streaming: {exc2}",
                 engine=ENGINE_XLSX_STREAMING,
+                error_class=exc2.error_class or ERROR_CLASS_MARKITDOWN_REJECT,
             ) from exc2
         finally:
             shutil.rmtree(converted_path.parent, ignore_errors=True)
@@ -815,6 +901,30 @@ def _rescue_fallback(path: Path, filename: str, suffix: str, *, max_chars: int, 
     raise ConversionError(filename, "no rescue fallback available for this file type", engine=ENGINE_MARKITDOWN)
 
 
+#: Rescue-chain gating (2026-09-04 finding #66 item 3 — live finding:
+#: hundreds of spreadsheets that fail conversion in every run each walked
+#: BOTH rescue rungs under the size-aware conversion budget, holding 16-22
+#: conversion children for minutes; page throughput fell from ~70k items/h
+#: to ~100 items per 10 minutes). When rung 1's own LibreOffice re-save
+#: fails for one of these reasons, its CSV/PDF fallback (rung 2) reaches the
+#: IDENTICAL LibreOffice mechanism on the IDENTICAL source bytes — retrying
+#: it is not a second chance, it is the same failure again at the same (or
+#: greater) cost, so :func:`_convert_markitdown_with_rescue` stops the chain
+#: right there instead. A markitdown-only failure on the resave's OUTPUT
+#: (``libreoffice resave+retry`` — the resave itself succeeded) is NOT in
+#: this set: the fallback rung reads the file through a different mechanism
+#: (openpyxl direct, or a PDF re-render) and may still succeed where
+#: markitdown alone did not.
+_RESCUE_CHAIN_STOP_CLASSES = frozenset(
+    {
+        ERROR_CLASS_LIBREOFFICE_NO_OUTPUT,
+        ERROR_CLASS_TIMEOUT,
+        ERROR_CLASS_MEMORY_KILL,
+        ERROR_CLASS_WORKER_CRASH,
+    }
+)
+
+
 def _convert_markitdown_with_rescue(
     path: Path, filename: str, suffix: str, *, max_chars: int, pre_resaved: bool
 ) -> tuple[str, str, str]:
@@ -827,18 +937,22 @@ def _convert_markitdown_with_rescue(
     into the SAME already-resaved format) is skipped as redundant and a
     failure escalates straight to rung 2. For the direct route (``.xlsx``/
     ``.pptx``/``.docx``, ``pre_resaved=False``) both rungs are tried in
-    order.
+    order — UNLESS rung 1's own re-save fails in a way
+    :data:`_RESCUE_CHAIN_STOP_CLASSES` says makes rung 2 futile (see that
+    constant's docstring), in which case the chain stops right there.
 
     Never rescues :class:`UnsupportedConversionFormat` (no backend was even
     attempted — see that class's docstring) or :class:`MissingConversion
     Dependency` for markitdown itself (installing LibreOffice cannot fix a
     missing markitdown): both propagate immediately, unrescued.
 
-    Returns ``(markdown, engine, rescue)``. When every rung fails, raises a
-    single :class:`ConversionError` whose message concatenates EACH rung's
-    own last error text (not just the first failure) — see
-    ``docs/sharepoint-extraction.md`` for why: the next reconciliation pass
-    needs to name the reason, and "could not convert" alone does not.
+    Returns ``(markdown, engine, rescue)``. When every rung fails (or the
+    chain is stopped early), raises a single :class:`ConversionError` whose
+    message concatenates EACH rung's own last error text (not just the
+    first failure) — see ``docs/sharepoint-extraction.md`` for why: the next
+    reconciliation pass needs to name the reason, and "could not convert"
+    alone does not. Its ``error_class`` names whichever rung actually
+    stopped the chain, not necessarily the FIRST failure.
     """
     base_engine = ENGINE_LIBREOFFICE_MARKITDOWN if pre_resaved else ENGINE_MARKITDOWN
     try:
@@ -858,6 +972,13 @@ def _convert_markitdown_with_rescue(
                 )
             except ConversionError as resave_exc:
                 errors.append(f"libreoffice resave: {resave_exc}")
+                if resave_exc.error_class in _RESCUE_CHAIN_STOP_CLASSES:
+                    errors.append(
+                        f"{RESCUE_FALLBACK_KIND[suffix]} fallback: skipped — rung 1's own re-save already failed"
+                    )
+                    raise ConversionError(
+                        filename, " | ".join(errors), engine=base_engine, error_class=resave_exc.error_class
+                    ) from first_exc
             else:
                 try:
                     text = _convert_markitdown(resaved_path, filename)
@@ -871,7 +992,12 @@ def _convert_markitdown_with_rescue(
             text, engine = _rescue_fallback(path, filename, suffix, max_chars=max_chars, pre_resaved=pre_resaved)
         except ConversionError as fallback_exc:
             errors.append(f"{RESCUE_FALLBACK_KIND[suffix]} fallback: {fallback_exc}")
-            raise ConversionError(filename, " | ".join(errors), engine=base_engine) from first_exc
+            raise ConversionError(
+                filename,
+                " | ".join(errors),
+                engine=base_engine,
+                error_class=fallback_exc.error_class or ERROR_CLASS_MARKITDOWN_REJECT,
+            ) from first_exc
         rescue = "csv_fallback" if engine == ENGINE_CSV_FALLBACK else "pdf_fallback"
         return text, engine, rescue
 
@@ -921,6 +1047,7 @@ def _convert_pdf(path: Path, filename: str, *, source_path: str | None = None) -
             filename,
             f"could not convert PDF ({type(exc).__name__})",
             engine=ENGINE_PYPDFIUM2,
+            error_class=ERROR_CLASS_PDFIUM_ERROR,
         ) from exc
 
     if len(structured) >= MIN_PDF_TEXT_CHARS:
@@ -996,4 +1123,14 @@ __all__ = [
     "CONVERSION_BUDGET_BASE_SECONDS",
     "CONVERSION_BUDGET_PER_MB_SECONDS",
     "CONVERSION_BUDGET_MAX_SECONDS",
+    "ERROR_CLASS_MARKITDOWN_REJECT",
+    "ERROR_CLASS_LIBREOFFICE_NO_OUTPUT",
+    "ERROR_CLASS_PDFIUM_ERROR",
+    "ERROR_CLASS_TIMEOUT",
+    "ERROR_CLASS_MEMORY_KILL",
+    "ERROR_CLASS_WORKER_CRASH",
+    "ERROR_CLASS_INGEST_ERROR",
+    "ERROR_CLASS_DOWNLOAD_ERROR",
+    "ERROR_CLASS_OTHER",
+    "DETERMINISTIC_ERROR_CLASSES",
 ]

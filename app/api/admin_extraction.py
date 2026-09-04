@@ -513,6 +513,12 @@ def _run_out(
         # `report.skipped_items` (the full-report endpoint), same as
         # `failed_items`/`errors_detail`.
         "skipped_unsupported": live.get("skipped_unsupported"),
+        # Skipped WITHOUT a download because the failure history says this
+        # document is doomed — see `CrawlStats.skipped_doomed` (2026-09-04
+        # finding #66 item 2). Absent from a live `progress` payload, same
+        # as `skipped_unsupported` above — only a finished run's `report`
+        # carries it.
+        "skipped_doomed": live.get("skipped_doomed"),
         # `extraction.crawl.min_modified` age filter — see `CrawlStats.
         # filtered_by_age`/`age_unknown`. `live` already picks `report` (a
         # finished run) or `progress` (a running one), so this reads the
@@ -904,6 +910,11 @@ def fleet_extraction_runs(
         "facts_docs_done": 0,
         "facts_docs_total": 0,
         "estimated_cost_usd": 0.0,
+        # Standing fleet-wide count of documents skipped WITHOUT a download
+        # this run because their failure history says they are doomed
+        # (2026-09-04 finding #66 item 2) — summed across every row's own
+        # `run.skipped_doomed`, same shape as `files_done`/`files_seen`.
+        "skipped_doomed": 0,
     }
     for connection in connections:
         connection_id = str(connection["id"])
@@ -941,6 +952,7 @@ def fleet_extraction_runs(
         if run_out:
             totals["files_done"] += int(run_out.get("files_done") or 0)
             totals["files_seen"] += int(run_out.get("files_seen") or 0)
+            totals["skipped_doomed"] += int(run_out.get("skipped_doomed") or 0)
         if files_per_min:
             totals["files_per_min"] += files_per_min
         if facts.get("docs_done"):

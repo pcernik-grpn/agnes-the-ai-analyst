@@ -444,6 +444,18 @@ _DELTA_PAGE_SIZE = 200
 #: run rather than forever; crossing it is recorded, never silent — see
 #: :func:`_note_retry`.
 _MAX_ITEM_RETRY_ATTEMPTS = 5
+#: Live finding 2026-09-04 (#66 item 2): inside one folder with hundreds of
+#: spreadsheets that had failed conversion in every previous run, each file
+#: walked the FULL rescue chain again on every replay — page throughput fell
+#: from ~70k items/h to ~100 items per 10 minutes. A document whose most
+#: recent failure is DETERMINISTIC (`connectors.sharepoint.convert.
+#: DETERMINISTIC_ERROR_CLASSES` — the same backend will reject the same
+#: bytes again, every time) is skipped WITHOUT a download once it has failed
+#: this many times — see `_doomed_skip_reason`. Deliberately much lower than
+#: `_MAX_ITEM_RETRY_ATTEMPTS` above: a deterministic failure does not need
+#: five tries to be trusted, only enough to rule out a one-off (a partial
+#: download corrupting the file that one time).
+_DOOMED_SKIP_MIN_ATTEMPTS = 2
 #: How often `_RunRecorder.maybe_checkpoint` is allowed to write PROGRESS
 #: (never the resume state above) between delta-page boundaries: at most
 #: once per this many seconds, or once per `_PROGRESS_CHECKPOINT_EVERY_
@@ -1206,6 +1218,7 @@ def _skip_total(stats: "CrawlStats") -> int:
         + stats.excluded_subtree_skips
         + stats.permission_skips
         + stats.filtered_by_age
+        + stats.skipped_doomed
     )
 
 
@@ -1218,15 +1231,35 @@ def _retry_backlog_snapshot(state: Dict[str, Any]) -> Dict[str, Any]:
     ``pending`` still gets retried every run; ``given_up`` stopped being
     retried after :data:`_MAX_ITEM_RETRY_ATTEMPTS` failures and needs a
     human (fix the file, or force a ``resync`` — see :func:`_apply_resync`).
+
+    ``doomed`` (2026-09-04 finding #66 item 2) is the STANDING count of
+    entries :func:`_doomed_skip_reason` would skip on the very next run — a
+    SUBSET of ``pending`` (a doomed item is never given up on; it is simply
+    not attempted), so an operator sees "N are stuck AND M of those are not
+    even being tried" rather than a single conflated number.
     """
+    from connectors.sharepoint.convert import DETERMINISTIC_ERROR_CLASSES
+
     failed_items = state.get("failed_items") or {}
     given_up = [entry for entry in failed_items.values() if isinstance(entry, dict) and entry.get("given_up")]
     pending = len(failed_items) - len(given_up)
+    doomed = [
+        entry
+        for entry in failed_items.values()
+        if isinstance(entry, dict)
+        and entry.get("error_class") in DETERMINISTIC_ERROR_CLASSES
+        and int(entry.get("attempts", 0)) >= _DOOMED_SKIP_MIN_ATTEMPTS
+    ]
     return {
         "pending": pending,
         "given_up": len(given_up),
         "given_up_sample": [
             {"path": entry.get("path"), "attempts": entry.get("attempts")} for entry in given_up[:_OVERSIZE_SAMPLE]
+        ],
+        "doomed": len(doomed),
+        "doomed_sample": [
+            {"path": entry.get("path"), "attempts": entry.get("attempts"), "error_class": entry.get("error_class")}
+            for entry in doomed[:_OVERSIZE_SAMPLE]
         ],
     }
 
@@ -1405,6 +1438,19 @@ class CrawlStats:
     #: ``UnsupportedConversionFormat``. Uncapped: the key space is bounded by
     #: distinct extensions actually seen, never by item count.
     skipped_unsupported_by_extension: Dict[str, int] = field(default_factory=dict)
+    #: Documents skipped WITHOUT a download because their most recent
+    #: recorded failure is deterministic and has repeated enough to trust —
+    #: see :func:`_doomed_skip_reason` (2026-09-04 finding #66 item 2).
+    #: Never bumps ``errors``/``convert_failed``: nothing was attempted THIS
+    #: run, mirroring :attr:`skipped_unsupported`'s own "we didn't even try"
+    #: accounting, just for a different reason (a format that WOULD be
+    #: attempted but has already proven futile on THIS file's own bytes).
+    skipped_doomed: int = 0
+    #: Itemized counterpart, same shape/cap discipline as :attr:`skipped_items`.
+    skipped_doomed_items: List[Dict[str, Any]] = field(default_factory=list)
+    #: Uncapped count behind :attr:`skipped_doomed_items`, mirroring
+    #: :attr:`_skipped_items_seen`.
+    _skipped_doomed_seen: int = field(default=0, repr=False, compare=False)
     #: How many successfully-ingested documents needed the conversion rescue
     #: chain (``connectors.sharepoint.convert.ConvertResult.rescue``),
     #: broken down by which rung succeeded: ``"libreoffice_resave"``
@@ -1636,6 +1682,36 @@ class CrawlStats:
             ext_key = (suffix or "").lower().lstrip(".")
             self.skipped_unsupported_by_extension[ext_key] = self.skipped_unsupported_by_extension.get(ext_key, 0) + 1
 
+    def note_skipped_doomed(
+        self,
+        *,
+        path: Optional[str],
+        item_id: str,
+        drive_id: str,
+        reason: str,
+        suffix: str,
+        error_class: str,
+    ) -> None:
+        """One document skipped WITHOUT a download because its recorded
+        failure history says it is doomed — see :attr:`skipped_doomed`'s
+        docstring. Same anonymize rule as :meth:`note_failed_item`: ``path``
+        is ``None`` when the caller's scope is anonymize-marked."""
+        with self._lock:
+            self.skipped_doomed += 1
+            self._skipped_doomed_seen += 1
+            self.skipped_doomed_items.append(
+                {
+                    "path": path,
+                    "item_id": item_id,
+                    "drive_id": drive_id,
+                    "reason_type": "doomed",
+                    "reason": (reason or "")[:200],
+                    "suffix": suffix,
+                    "error_class": error_class,
+                }
+            )
+            del self.skipped_doomed_items[_FAILED_ITEMS_CAP:]
+
     def note_conversion_rescue(self, rescue: str) -> None:
         """One successfully-ingested document that needed the conversion
         rescue chain — bumps :attr:`conversion_rescued`'s count for
@@ -1806,6 +1882,13 @@ class CrawlStats:
             # docstring. Same shape/cap discipline as `failed_items` above.
             "skipped_items": list(self.skipped_items),
             "skipped_items_truncated": self._skipped_items_seen > len(self.skipped_items),
+            # Skipped WITHOUT a download because the failure history says
+            # this document is doomed — see `skipped_doomed`'s own docstring
+            # (2026-09-04 finding #66 item 2). Never an error, never counted
+            # in `convert_failed`: nothing was attempted THIS run.
+            "skipped_doomed": self.skipped_doomed,
+            "skipped_doomed_items": list(self.skipped_doomed_items),
+            "skipped_doomed_items_truncated": self._skipped_doomed_seen > len(self.skipped_doomed_items),
         }
 
 
@@ -2929,6 +3012,13 @@ class _ConvertOutcome:
     chain succeeded, or ``""`` when none was needed. Never document content
     (it is one of a fixed, small vocabulary of rung names), so unlike
     ``detail_message`` it needs no anonymize-scope gating.
+
+    ``error_class`` (only meaningful when NOT ``ok``) mirrors
+    ``connectors.sharepoint.convert.ConversionError.error_class`` — one of
+    that module's ``ERROR_CLASS_*`` constants, or ``""`` when the exception
+    this child caught had no opinion (a bare ``Exception`` the worker never
+    taught to classify). Same "fixed, small vocabulary" reasoning as
+    ``rescue``: never document content, never scope-gated.
     """
 
     ok: bool
@@ -2936,6 +3026,7 @@ class _ConvertOutcome:
     detail_type: str = ""
     detail_message: str = ""
     rescue: str = ""
+    error_class: str = ""
 
 
 @dataclass
@@ -3268,7 +3359,12 @@ def _convert_worker_main(conn: Connection, memory_limit_bytes: int = 0, max_outp
             markdown = str(getattr(converted, "markdown", "") or "")
             rescue = str(getattr(converted, "rescue", "") or "")
         except Exception as exc:  # noqa: BLE001 — this file's failure, not the worker's
-            outcome = _ConvertOutcome(ok=False, detail_type=type(exc).__name__, detail_message=str(exc))
+            outcome = _ConvertOutcome(
+                ok=False,
+                detail_type=type(exc).__name__,
+                detail_message=str(exc),
+                error_class=getattr(exc, "error_class", None) or "",
+            )
             try:
                 conn.send(_ConvertReply(outcome=outcome, rss_bytes=_growth()))
             except OSError:
@@ -3841,6 +3937,14 @@ class _PreparedDocument:
     #: Mirrors ``connectors.sharepoint.convert.ConvertResult.rescue`` — see
     #: :func:`_process_item`'s use of it for ``CrawlStats.conversion_rescued``.
     rescue: str = ""
+    #: WHY a ``"convert_failed"`` outcome failed, from the closed
+    #: ``connectors.sharepoint.convert.ERROR_CLASS_*`` vocabulary — empty for
+    #: every other outcome. Fed into ``_note_retry`` (2026-09-04 finding #66
+    #: item 1), which is what lets a LATER run decide whether this item's
+    #: failure is DETERMINISTIC enough to skip without a download (item 2).
+    #: Unlike ``detail`` this is never scope-gated: it is one of a fixed,
+    #: small set of class names, never document content.
+    error_class: str = ""
 
 
 def _anonymize_identity(path: str, name: str, *, key: bytes, detector: Any) -> Tuple[str, str]:
@@ -4046,7 +4150,14 @@ def _prepare_document(
     # class NAME the child sent back over the pipe) — see
     # `connectors.sharepoint.convert.UnsupportedConversionFormat`'s
     # docstring for why this is counted apart from `convert_failed`.
-    from connectors.sharepoint.convert import UnsupportedConversionFormat, conversion_budget_seconds
+    from connectors.sharepoint.convert import (
+        ERROR_CLASS_MEMORY_KILL,
+        ERROR_CLASS_OTHER,
+        ERROR_CLASS_TIMEOUT,
+        ERROR_CLASS_WORKER_CRASH,
+        UnsupportedConversionFormat,
+        conversion_budget_seconds,
+    )
 
     rescue = ""
     try:
@@ -4068,15 +4179,18 @@ def _prepare_document(
             if not outcome.ok:
                 if outcome.detail_type == "MemoryError":
                     detail = "exceeded its own memory limit"
+                    error_class = ERROR_CLASS_MEMORY_KILL
                 elif outcome.detail_type == "ConvertedTooLarge":
                     detail = outcome.detail_message
+                    error_class = ERROR_CLASS_OTHER
                 elif outcome.detail_type == "UnsupportedConversionFormat":
                     logger.info("sharepoint crawl: no conversion backend for %s — skipped, not an error", path)
                     return _PreparedDocument("convert_unsupported", detail=outcome.detail_message)
                 else:
                     detail = _convert_failure_detail(outcome.detail_type, outcome.detail_message, anonymize=anonymize)
+                    error_class = outcome.error_class or ERROR_CLASS_OTHER
                 logger.warning("sharepoint crawl: conversion failed for %s: %s", path, detail)
-                return _PreparedDocument("convert_failed", detail=detail)
+                return _PreparedDocument("convert_failed", detail=detail, error_class=error_class)
             markdown = outcome.markdown
             rescue = outcome.rescue
         else:
@@ -4100,7 +4214,7 @@ def _prepare_document(
         # reason. The crawl continues with the next file.
         detail = f"conversion exceeded the {exc.timeout_s:.0f}s per-item time budget"
         logger.warning("sharepoint crawl: conversion timed out for %s: %s", path, detail)
-        return _PreparedDocument("convert_failed", detail=detail)
+        return _PreparedDocument("convert_failed", detail=detail, error_class=ERROR_CLASS_TIMEOUT)
     except _ConvertMemoryGuard as exc:
         # The child was still ALIVE but its RSS crossed the watchdog's own
         # ceiling — killed and, when a spare was ready, already replaced by
@@ -4110,7 +4224,7 @@ def _prepare_document(
         # name. The crawl continues with the next file.
         detail = _convert_memory_guard_detail(exc.rss_bytes)
         logger.warning("sharepoint crawl: conversion failed for %s: %s", path, detail)
-        return _PreparedDocument("convert_failed", detail=detail)
+        return _PreparedDocument("convert_failed", detail=detail, error_class=ERROR_CLASS_MEMORY_KILL)
     except _ConvertCrashed as exc:
         # The child that was converting this file died from a signal (a
         # native abort/segfault, not a Python exception) — the one failure
@@ -4121,11 +4235,12 @@ def _prepare_document(
         # the crawl loop — was never at risk.
         detail = _convert_crash_detail(exc.signal_name)
         logger.warning("sharepoint crawl: conversion failed for %s: %s", path, detail)
-        return _PreparedDocument("convert_failed", detail=detail)
+        return _PreparedDocument("convert_failed", detail=detail, error_class=ERROR_CLASS_WORKER_CRASH)
     except Exception as exc:  # noqa: BLE001 — one unconvertible file, not a broken run
         logger.warning("sharepoint crawl: conversion failed for %s: %s", path, type(exc).__name__)
         detail = _convert_failure_detail(type(exc).__name__, str(exc), anonymize=anonymize)
-        return _PreparedDocument("convert_failed", detail=detail)
+        error_class = getattr(exc, "error_class", None) or ERROR_CLASS_OTHER
+        return _PreparedDocument("convert_failed", detail=detail, error_class=error_class)
     if not markdown.strip():
         logger.info("sharepoint crawl: conversion produced no text for %s", path)
         return _PreparedDocument("convert_empty")
@@ -4161,6 +4276,9 @@ def _note_retry(
     target: DriveTarget,
     item: Dict[str, Any],
     path: str,
+    error_class: str,
+    detail: str = "",
+    content_sha: str = "",
 ) -> None:
     """Record one failed pass over ``stable_id`` so it is retried on a
     future run regardless of what the delta feed offers next — see the
@@ -4174,6 +4292,20 @@ def _note_retry(
     attempt counter accumulates across runs (and across a same-run retry
     replay landing on the same item twice), it is never reset except by a
     success (:func:`_clear_retry`) or an operator-requested resync.
+
+    ``error_class`` (2026-09-04 finding #66 item 1 — a closed vocabulary,
+    see ``connectors.sharepoint.convert.ERROR_CLASS_*``) and ``detail`` (the
+    caller's own human-readable failure text, truncated here) are this
+    ATTEMPT's own classification — always overwritten, never merged with a
+    prior attempt's: a document that failed one way last time and a
+    different way this time should be judged on its MOST RECENT failure,
+    which is what :func:`_doomed_skip_reason` reads. ``content_sha`` (only
+    ever passed for an ``ingest_error`` — conversion succeeded, so a hash of
+    the converted bytes exists) is kept purely for an operator to confirm
+    what was actually re-hashed; the doomed-skip decision itself relies on
+    the item's own cTag (compared against what THIS attempt saw), the same
+    pre-download signal every other cTag-gated skip in this module already
+    trusts.
     """
     with _state_lock:
         failed_items: Dict[str, Any] = state.setdefault("failed_items", {})
@@ -4184,6 +4316,10 @@ def _note_retry(
         entry["item"] = item
         entry["path"] = path
         entry["last_failed_at"] = _now_iso()
+        entry["error_class"] = error_class
+        entry["last_error"] = (detail or "")[:500]
+        if content_sha:
+            entry["content_sha"] = content_sha
         attempts = int(entry.get("attempts", 0)) + 1
         entry["attempts"] = attempts
         just_exhausted = attempts >= _MAX_ITEM_RETRY_ATTEMPTS and not entry.get("given_up")
@@ -4256,6 +4392,56 @@ def _clear_empty(state: Dict[str, Any], stable_id: str) -> bool:
         return empty_items.pop(stable_id, None) is not None
 
 
+def _doomed_skip_reason(
+    state: Dict[str, Any], stable_id: str, *, item: Dict[str, Any], force_reprocess: bool
+) -> Optional[str]:
+    """Whether ``stable_id`` should be skipped WITHOUT a download this run —
+    2026-09-04 finding #66 item 2 (see :data:`_DOOMED_SKIP_MIN_ATTEMPTS`'s
+    docstring for the live finding this fixes).
+
+    Returns the skip reason (for :meth:`CrawlStats.note_skipped_doomed`), or
+    ``None`` when the item should be attempted normally. Never skips when:
+
+    * ``force_reprocess`` is set — the operator's explicit "re-process
+      everything regardless" override, the same escape hatch every other
+      cTag-based skip in this module honors;
+    * fewer than :data:`_DOOMED_SKIP_MIN_ATTEMPTS` attempts are recorded, or
+      the MOST RECENT recorded ``error_class`` is not one of
+      ``connectors.sharepoint.convert.DETERMINISTIC_ERROR_CLASSES``
+      (timeouts, memory kills, worker crashes and download errors are
+      environmental and stay retryable forever);
+    * the item's cTag/eTag no longer matches what was recorded at the last
+      failed attempt — new content deserves fresh attempts, and this is the
+      SAME pre-download "did it change" signal :func:`_process_item`'s own
+      unchanged-detection already trusts elsewhere in this function, which is
+      what lets this decision be made WITHOUT a download. This also covers
+      ``ingest_error``'s own "same content" requirement: Graph's cTag
+      changes whenever a document's content changes, so an unchanged cTag is
+      the same fact an unchanged ``content_sha`` would confirm after a
+      download this function deliberately never pays for.
+    """
+    if force_reprocess:
+        return None
+    failed_items = state.get("failed_items") or {}
+    entry = failed_items.get(stable_id)
+    if not isinstance(entry, dict):
+        return None
+    from connectors.sharepoint.convert import DETERMINISTIC_ERROR_CLASSES
+
+    error_class = entry.get("error_class")
+    if error_class not in DETERMINISTIC_ERROR_CLASSES:
+        return None
+    if int(entry.get("attempts", 0)) < _DOOMED_SKIP_MIN_ATTEMPTS:
+        return None
+    recorded_item = entry.get("item") or {}
+    recorded_ctag = recorded_item.get("cTag") or recorded_item.get("eTag")
+    current_ctag = item.get("cTag") or item.get("eTag")
+    if not recorded_ctag or recorded_ctag != current_ctag:
+        return None
+    last_error = (entry.get("last_error") or "")[:200]
+    return f"{error_class}: failed {entry.get('attempts')} time(s), most recently: {last_error}".strip()
+
+
 async def _process_item(
     item: Dict[str, Any],
     *,
@@ -4291,6 +4477,8 @@ async def _process_item(
     convert/anonymize/ingest section on a worker thread; at ``None`` the
     calls are inline, i.e. the pre-parallel path exactly.
     """
+    from connectors.sharepoint.convert import ERROR_CLASS_DOWNLOAD_ERROR, ERROR_CLASS_INGEST_ERROR, ERROR_CLASS_OTHER
+
     name = str(item.get("name") or "")
     stable_id = f"graph:{item['id']}"
     ctags: Dict[str, Any] = state["ctags"]
@@ -4404,6 +4592,23 @@ async def _process_item(
             stats.add(unchanged=1)
         return
 
+    # 2026-09-04 finding #66 item 2 — a document that has already failed
+    # DETERMINISTICALLY enough times is skipped right here, before the
+    # download this whole function exists to pay for. See
+    # `_doomed_skip_reason`'s own docstring for the exact conditions.
+    doomed_reason = _doomed_skip_reason(state, stable_id, item=item, force_reprocess=force_reprocess)
+    if doomed_reason is not None:
+        stats.note_skipped_doomed(
+            path=None if ctx.anonymize else path,
+            item_id=str(item.get("id") or ""),
+            drive_id=target.drive_id,
+            reason=doomed_reason,
+            suffix=Path(name).suffix.lower(),
+            error_class=str((state.get("failed_items") or {}).get(stable_id, {}).get("error_class") or ""),
+        )
+        logger.info("sharepoint crawl: skipping %s — doomed (%s), no download attempted", path, doomed_reason)
+        return
+
     size = int(item.get("size") or 0)
     if max_file_mb and size > _max_file_bytes(max_file_mb):
         stats.note_oversize(path, size)
@@ -4474,7 +4679,16 @@ async def _process_item(
                 status_code,
                 detail,
             )
-            _note_retry(state, stats, stable_id, target=target, item=item, path=path)
+            _note_retry(
+                state,
+                stats,
+                stable_id,
+                target=target,
+                item=item,
+                path=path,
+                error_class=ERROR_CLASS_DOWNLOAD_ERROR,
+                detail=detail,
+            )
             return
 
         try:
@@ -4517,7 +4731,16 @@ async def _process_item(
                 suffix=suffix,
             )
             outcome_label = "convert_failed"
-            _note_retry(state, stats, stable_id, target=target, item=item, path=path)
+            _note_retry(
+                state,
+                stats,
+                stable_id,
+                target=target,
+                item=item,
+                path=path,
+                error_class=prepared.error_class or ERROR_CLASS_OTHER,
+                detail=prepared.detail,
+            )
             return
         if prepared.outcome == "convert_empty":
             # Not a failure to retry ON THE ORDINARY per-run backlog: the
@@ -4560,7 +4783,16 @@ async def _process_item(
         if prepared.outcome == "anonymize_failed":
             stats.add(anonymize_failed=1)
             outcome_label = "anonymize_failed"
-            _note_retry(state, stats, stable_id, target=target, item=item, path=path)
+            _note_retry(
+                state,
+                stats,
+                stable_id,
+                target=target,
+                item=item,
+                path=path,
+                error_class=ERROR_CLASS_OTHER,
+                detail="anonymization failed",
+            )
             return
 
         # This item converted cleanly enough to reach ingest — record which
@@ -4601,7 +4833,17 @@ async def _process_item(
                 status_code,
                 detail,
             )
-            _note_retry(state, stats, stable_id, target=target, item=item, path=path)
+            _note_retry(
+                state,
+                stats,
+                stable_id,
+                target=target,
+                item=item,
+                path=path,
+                error_class=ERROR_CLASS_INGEST_ERROR,
+                detail=detail,
+                content_sha=prepared.source_sha256,
+            )
             return
 
         outcome_label = "new" if was_new else "changed"
@@ -4957,6 +5199,7 @@ async def _retry_failed_items(
     recorder: Optional["_RunRecorder"],
     convert_pool: Optional[_ConvertProcessPool] = None,
     include_given_up: bool = False,
+    force_reprocess: bool = False,
     save_state_fn: Optional[Callable[[], None]] = None,
 ) -> None:
     """Replay every item THIS drive previously failed on, before asking
@@ -4994,6 +5237,14 @@ async def _retry_failed_items(
     crawl design §4.2): a shard child writes its OWN per-delta-unit state row
     (``kind='crawl:<state_key>'``), never the whole-connection row. ``None``
     (every caller before sharding existed) keeps today's behaviour exactly.
+
+    ``force_reprocess`` (this run's own operator override) is threaded
+    straight through to every :func:`_process_item` call below — the only
+    thing it does INSIDE that function that a backlog-replay item could ever
+    reach is bypass the doomed-item skip (2026-09-04 finding #66 item 2); a
+    failed item never had a matching ``ctags`` entry in the first place, so
+    the cTag-equality "already ingested" skip it also bypasses was never
+    reachable from here regardless.
     """
     _save = save_state_fn or (lambda: save_state(connection_id, state))
     failed_items: Dict[str, Any] = state.setdefault("failed_items", {})
@@ -5036,6 +5287,7 @@ async def _retry_failed_items(
                 detector=detector,
                 convert_pool=convert_pool,
                 convert_slot=0,
+                force_reprocess=force_reprocess,
             )
         finally:
             stats.exit_item(time.monotonic() - started)
@@ -5134,6 +5386,41 @@ async def _retry_empty_items(
         recorder.checkpoint(stats)
 
 
+def _consume_replay_flag_once(
+    state: Dict[str, Any], *, target: DriveTarget, job_id: Optional[str], flag: bool, marker_key: str
+) -> bool:
+    """Whether an admin-requested one-shot backlog-replay flag
+    (``retry_failed``'s ``include_given_up``, ``retry_empty``'s ``run``)
+    should still fire for THIS drive, in THIS job — the same "consume once
+    per job" contract :func:`_apply_resync` gives ``resync`` (2026-09-04
+    finding #66 item 4): a crash-recovery RECLAIM calls :func:`_crawl_drive`
+    again with the byte-identical payload flag, and without this a
+    reclaimed ``retry_failed``/``retry_empty`` run would redo the ENTIRE
+    extra backlog pass on every reclaim rather than picking up past it. The
+    ORDINARY pending-backlog replay (:func:`_retry_failed_items` runs on
+    every crawl regardless of this flag) is UNAFFECTED — only the extra an
+    explicit admin request adds is gated here.
+
+    Keyed by ``target.state_key`` inside ``state`` (never a bare scalar):
+    the inline path shares ONE ``state`` dict across every drive in the
+    connection, and a scalar marker set by the first drive would wrongly
+    suppress a SECOND drive's own first pass in the very same job.
+
+    ``job_id`` is ``None`` for any caller this repo cannot identify as a
+    dispatched job (a manual/test call) — always treated as fresh, the same
+    conservative default :func:`_apply_resync` uses.
+    """
+    if not flag:
+        return False
+    if not job_id:
+        return True
+    marker: Dict[str, str] = state.setdefault(marker_key, {})
+    if marker.get(target.state_key) == job_id:
+        return False
+    marker[target.state_key] = job_id
+    return True
+
+
 async def _crawl_drive(
     target: DriveTarget,
     *,
@@ -5208,6 +5495,15 @@ async def _crawl_drive(
     url: Optional[str] = base if force_reprocess else (delta_links.get(target.state_key) or base)
     resynced = False
     stats.add(drives=1)
+    # Consume `retry_failed`/`retry_empty` once per job (2026-09-04 finding
+    # #66 item 4) — see `_consume_replay_flag_once`'s own docstring.
+    job_id = recorder.job_id if recorder is not None else None
+    effective_include_given_up = _consume_replay_flag_once(
+        state, target=target, job_id=job_id, flag=retry_failed, marker_key="retry_failed_consumed_for_job"
+    )
+    effective_retry_empty = _consume_replay_flag_once(
+        state, target=target, job_id=job_id, flag=retry_empty, marker_key="retry_empty_consumed_for_job"
+    )
     # Retry this drive's OWN backlog first — see `_retry_failed_items`. It
     # runs before the first delta fetch so a resume that starts with a
     # 410 still gets the queued items a chance regardless.
@@ -5225,7 +5521,8 @@ async def _crawl_drive(
         deadline=deadline,
         recorder=recorder,
         convert_pool=convert_pool,
-        include_given_up=retry_failed,
+        include_given_up=effective_include_given_up,
+        force_reprocess=force_reprocess,
         save_state_fn=_save,
     )
     # The `convert_empty` counterpart — a no-op unless this run was an
@@ -5245,7 +5542,7 @@ async def _crawl_drive(
         deadline=deadline,
         recorder=recorder,
         convert_pool=convert_pool,
-        run=retry_empty,
+        run=effective_retry_empty,
         save_state_fn=_save,
     )
     # Where this page's throttle accounting starts. Taken BEFORE the delta
@@ -6397,7 +6694,7 @@ def rehome_legacy_backlog(
     return grouped
 
 
-def _apply_resync(connection_id: str) -> None:
+def _apply_resync(connection_id: str, *, job_id: Optional[str] = None) -> None:
     """Force every drive of this connection to re-enumerate from scratch on
     its next crawl — the supported alternative to hand-editing the crawl
     state file on the data disk to recover a connection whose delta cursor
@@ -6425,14 +6722,36 @@ def _apply_resync(connection_id: str) -> None:
     Also drops the connection's PERSISTED shard plan (2026-09-04 finding
     #65 item 2): a resync forces the next trigger to re-plan from scratch
     rather than reuse a plan built before the cursors it now invalidates.
+
+    Idempotent PER JOB (2026-09-04 finding #66 item 4 — live finding: a
+    worker recreated mid-run reclaimed the job, which called this AGAIN with
+    the identical ``resync: true`` payload, dropping the delta links the
+    interrupted first attempt had already progressed past and restarting
+    the whole enumeration from zero). ``state["resync_applied_for_job"]``
+    records which ``job_id`` last actually applied a resync for this
+    connection; a second call naming that SAME ``job_id`` is a no-op, so a
+    reclaim resumes from whatever the interrupted attempt already
+    persisted. ``job_id=None`` (a manual/test call this repo has no way to
+    identify as a reclaim) always applies — the same conservative default
+    this parameter's absence gave every caller before this marker existed.
+    A FRESH trigger (a different ``job_id``) always re-applies too.
     """
     from connectors.sharepoint.state_store import list_kinds as _state_list_kinds
 
     with _state_lock:
         state = load_state(connection_id)
+        if job_id and state.get("resync_applied_for_job") == job_id:
+            logger.info(
+                "sharepoint crawl: resync for connection %s already applied by job %s — reclaim, not re-applying",
+                connection_id,
+                job_id,
+            )
+            return
         state["delta_links"] = {}
         state["failed_items"] = {}
         state.pop("shard_plan", None)
+        state["resync_applied_for_job"] = job_id
+        state["resync_applied_at"] = _now_iso()
         save_state(connection_id, state)
         for kind in _state_list_kinds(connection_id, "crawl:"):
             shard_key = kind[len("crawl:") :]
@@ -6538,7 +6857,7 @@ def run_builtin_crawl(payload: dict) -> dict:
         raise CrawlError(f"sharepoint crawl: connection {connection_id!r} not found or not a sharepoint connection")
 
     if payload.get("resync"):
-        _apply_resync(str(connection_id))
+        _apply_resync(str(connection_id), job_id=payload.get("job_id"))
 
     try:
         return asyncio.run(_plan_or_run_inline(connection, payload))
@@ -7325,10 +7644,11 @@ _AGGREGATE_COUNTER_FIELDS = (
     "age_unknown",
     "item_retry_given_up",
     "item_retry_recovered",
+    "skipped_doomed",
 )
 #: Itemized lists worth CONCATENATING (then capping — see
 #: :data:`_AGGREGATE_LIST_CAP`) across every shard.
-_AGGREGATE_LIST_FIELDS = ("scope_errors", "failed_items", "skipped_items")
+_AGGREGATE_LIST_FIELDS = ("scope_errors", "failed_items", "skipped_items", "skipped_doomed_items")
 #: Mirrors :data:`_FAILED_ITEMS_CAP` — an honestly-truncated aggregate beats
 #: an unbounded one, same contract ``cap_skips`` already gives a single run.
 _AGGREGATE_LIST_CAP = _FAILED_ITEMS_CAP

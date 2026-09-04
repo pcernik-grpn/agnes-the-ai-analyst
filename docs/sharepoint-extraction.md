@@ -439,6 +439,47 @@ is a thin wrapper over the routes documented here and in
 [`api-reference.md`](api-reference.md) — nothing new is introduced at the
 protocol level, only a door that does not require a terminal.
 
+**Documents that never convert stop costing a full attempt (2026-09-04
+finding #66).** A live crawl found a folder of hundreds of spreadsheets that
+had failed conversion identically on every previous pass — each one still
+walked the whole rescue chain under the size-aware conversion budget on
+every replay, holding conversion children for minutes and dropping page
+throughput from ~70k items/h to ~100 items per 10 minutes. Every
+`failed_items` entry now keeps a closed-vocabulary `error_class`
+(`markitdown_reject`, `libreoffice_no_output`, `pdfium_error`, `timeout`,
+`memory_kill`, `worker_crash`, `ingest_error`, `download_error`, `other`)
+alongside its attempt count and last error text. A document whose most
+recent failure is DETERMINISTIC (`markitdown_reject`, `libreoffice_no_output`,
+`pdfium_error`, or `ingest_error` against unchanged content) and has already
+failed twice is skipped WITHOUT a download on later runs — counted as
+`skipped_doomed` in the run report, the source card's Run row ("N doomed
+skipped (force reprocess to retry)"), the fleet totals line, and
+`agnes admin sharepoint runs`. Timeouts, memory kills, worker crashes and
+download errors are ENVIRONMENTAL, never a property of the document, and
+stay retryable forever. The escape hatch is the same one every other
+cTag-based skip in this module already has: `force_reprocess: true`
+attempts a doomed item anyway, and a genuine content change (a new cTag)
+always gets fresh attempts regardless of history. The conversion rescue
+chain itself is also gated: when LibreOffice's own re-save fails (a
+corrupt/unopenable source, a timeout, or a signal kill), the CSV/PDF
+fallback — which would reach the identical LibreOffice mechanism on the
+identical bytes — is skipped rather than retried, and which rung actually
+stopped the chain is named in the recorded error.
+
+**A resync or an admin-requested backlog replay is consumed once per job,
+not once per byte-identical payload.** A worker recreated mid-run reclaims
+the job and re-dispatches the SAME payload — including `resync: true` or
+`retry_failed: true` — to `run_builtin_crawl`. Before this fix, a reclaimed
+`resync` dropped the delta links the interrupted first attempt had already
+progressed past, restarting the whole enumeration from zero on every
+reclaim; a reclaimed `retry_failed`/`retry_empty` redid the entire extra
+backlog pass the same way. Each of these one-shot payload flags now records
+which `job_id` last actually applied it and is a no-op on a second call
+naming that SAME job — a reclaim resumes from whatever the interrupted
+attempt already persisted. A genuinely fresh trigger (a different `job_id`,
+or a manual call this repo has no way to identify as a reclaim) always
+applies, exactly as before.
+
 **A transient database hiccup mid-crawl no longer costs the whole run
 (TCRD-296 C.11).** The ingest step (storing the converted document and
 handing it to the chunker) retries a closed family of infrastructure

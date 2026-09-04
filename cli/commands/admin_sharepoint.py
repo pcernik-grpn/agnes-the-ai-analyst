@@ -1346,10 +1346,13 @@ def _print_fleet_table(body: Dict[str, Any], *, show_all: bool) -> None:
             error[:60],
         )
     _console.print(table)
+    doomed = totals.get("skipped_doomed") or 0
+    doomed_note = f", doomed skipped: {doomed:,}" if doomed else ""
     _console.print(
         f"Totals — connections: {totals.get('connections', 0)}, active: {totals.get('active', 0)}, "
         f"stuck: {totals.get('stuck', 0)}, files/min: {_fmt_rate(totals.get('files_per_min'))}, "
         f"facts done: {totals.get('facts_docs_done', 0):,}, est. cost: {_fmt_cost(totals.get('estimated_cost_usd'))}"
+        f"{doomed_note}"
     )
     _print_jobs_strip(body.get("jobs"))
 
