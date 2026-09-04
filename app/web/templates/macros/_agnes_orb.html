@@ -7,9 +7,8 @@
 
    `css_class` — the sizing/animation hook the call site owns in CSS
                  (`rail-orb` in rail.css, `cbn-huborb` in style-custom.css).
-   `size`      — rendered square size in px. The source PNG is 256×256, so it
-                 stays crisp from the 30px rail mark up to the 64px banner hub,
-                 retina included.
+   `size`      — rendered square size in px. The source PNG is 192×192, which
+                 covers the 64px banner hub at DPR 3 and everything smaller.
    `alt`       — accessible name. Empty (default) marks the mark decorative
                  (the wordmark/headline beside it carries the name). #}
 {% macro orb(css_class='rail-orb', size=30, alt='') %}

@@ -13,6 +13,7 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 ### Added
 
 ### Changed
+- **The Agnes orb brand mark ships far lighter.** `agnes-orb.png` (rail avatar, chat, connect banner, and the default favicon on every page) is now a 192×192, 96-colour-quantized PNG at ~21 KB instead of a 256×256 full-colour PNG at ~105 KB — same path, same visual result at every size it's rendered, with a size-ratchet test pinning it under 32 KB.
 
 ### Fixed
 
