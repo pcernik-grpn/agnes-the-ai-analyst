@@ -353,3 +353,162 @@ class FactsIngestRunsPgRepository:
                 {"since": since, "corpus_ids": list(corpus_ids)},
             ).scalar()
         return int(total or 0)
+
+    def llm_usage_rollup_by_corpus_ids(self, corpus_ids_by_key: Dict[str, Sequence[str]]) -> Dict[str, Dict[str, Any]]:
+        """Cumulative LLM-usage rollup PER CALLER-SUPPLIED KEY, attributed by
+        ``corpus_ids`` overlap — the batched, connection-scoped sibling of
+        :meth:`llm_usage_rollup` (which stays instance-wide, see its own
+        docstring for why: a run report has no connection id of its own).
+
+        ``corpus_ids_by_key`` is typically ``{connection_id: [collection_id,
+        ...]}`` — the caller's own resolution of a connection's own
+        collections (e.g. ``connectors.sharepoint.facts_extraction.
+        collection_ids_for``), one entry per SharePoint connection a fleet
+        page is about to render. This method issues exactly ONE query
+        (bounded by the union of every requested id) regardless of how many
+        keys are asked about, never one round trip per key — the fix for
+        the fleet view's own cost tile previously reading ~$0 for a
+        connection whose facts stage ran as SEPARATE
+        ``sharepoint-facts-extraction`` jobs, which persist their spend
+        here rather than on the crawl's own ``extraction_runs`` row.
+
+        A key present in ``corpus_ids_by_key`` but matching NO run —
+        including one whose own ``corpus_ids`` list is empty, nothing to
+        overlap — still gets a full zeroed-out entry (``runs_with_usage:
+        0``, ``estimated_cost_usd: None``), never a missing dict key, so a
+        caller can index every connection it asked about without a
+        membership check first.
+
+        A run whose ``corpus_ids`` overlaps MORE THAN ONE key's own
+        collections is counted toward EACH of them — the same "did THIS
+        caller's collections see this run" question :meth:`documents_done_
+        since` already answers per key, extended to every key at once. It
+        is never double-counted WITHIN one key: a run touching two
+        collections that both belong to the same key still contributes its
+        usage exactly once (de-duplicated in Python, since one JSON row can
+        match several of a key's own corpus ids).
+
+        This deliberate multi-key attribution is real and supported — a
+        SharePoint bulk-add / consolidation can point more than one
+        connection's scope at the SAME collection (see
+        ``app/api/admin_sharepoint.py::_collection_still_referenced``) — so
+        each key's own ``estimated_cost_usd``/``runs_with_usage`` here is
+        an honest "what did THIS connection's collections see", not a
+        partition of instance spend; a caller SUMMING several keys'
+        ``estimated_cost_usd`` together would double (or N-times) count a
+        shared run. Each key's ``runs`` list — ``[{id, estimated_cost_usd},
+        ...]``, one entry per contributing run — exists exactly so a caller
+        that needs a page-wide TOTAL can de-duplicate by run id itself
+        (count a run once no matter how many keys' lists it appears in)
+        rather than summing the per-key aggregates directly. See
+        ``app/api/admin_extraction.py::fleet_extraction_runs`` for the
+        de-duplicated total and its per-row ``cost_shared``/
+        ``cost_shared_with`` markers.
+
+        Priced through :mod:`src.llm_pricing` (``cost_usd`` — the SAME
+        model-aware, cache-aware price table ``GET /api/admin/telemetry/
+        chat-cost`` uses), NOT the sampled rate card :func:`_price_run_usd`
+        above uses for the instance-wide rollup: a cache read/write here is
+        priced at its real ~0.1x/~1.25x rate rather than folded into the
+        plain input-token bucket. A run naming exactly one model is priced
+        at that model's rate (falling back to the same "most expensive
+        general-purpose tier" guess every other cost surface in Agnes uses
+        for an unrecognized model id, never a fabricated zero); a run
+        naming zero or more-than-one model cannot be honestly split by
+        model and is left OUT of ``estimated_cost_usd`` — it still counts
+        toward the token/document totals and toward ``models`` — same
+        disclosure contract (``priced_runs`` vs ``runs_with_usage``) as
+        :meth:`llm_usage_rollup`.
+        """
+        keys = list(corpus_ids_by_key)
+        id_sets: Dict[str, set] = {key: {str(c) for c in (corpus_ids_by_key.get(key) or [])} for key in keys}
+        out: Dict[str, Dict[str, Any]] = {
+            key: {
+                "runs_with_usage": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "documents": 0,
+                "wall_seconds": 0.0,
+                "models": [],
+                "priced_runs": 0,
+                "estimated_cost_usd": None,
+                # One entry per contributing run — see this method's own
+                # docstring for why a de-duplicating caller needs run ids,
+                # not just this key's own aggregate.
+                "runs": [],
+            }
+            for key in keys
+        }
+        all_ids = sorted({cid for ids in id_sets.values() for cid in ids})
+        if not all_ids:
+            return out
+
+        from src.llm_pricing import cost_usd
+
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                sa.text(
+                    "SELECT id, corpus_ids, llm_usage FROM facts_ingest_runs "
+                    "WHERE llm_usage IS NOT NULL AND EXISTS ("
+                    "  SELECT 1 FROM jsonb_array_elements_text(corpus_ids) AS cid "
+                    "  WHERE cid = ANY(:all_ids)"
+                    ")"
+                ),
+                {"all_ids": all_ids},
+            ).fetchall()
+
+        models_seen: Dict[str, set] = {key: set() for key in keys}
+        cost_accum: Dict[str, float] = {key: 0.0 for key in keys}
+
+        for run_id, raw_corpus_ids, raw_usage in rows:
+            corpus_ids = (
+                raw_corpus_ids
+                if isinstance(raw_corpus_ids, list)
+                else (json.loads(raw_corpus_ids) if isinstance(raw_corpus_ids, str) else [])
+            )
+            usage = (
+                raw_usage
+                if isinstance(raw_usage, dict)
+                else (json.loads(raw_usage) if isinstance(raw_usage, str) else None)
+            )
+            if not usage:
+                continue
+            models = usage.get("models") or []
+            run_cost: Optional[float] = None
+            if len(models) == 1:
+                run_cost = cost_usd(
+                    model=models[0],
+                    input_tokens=usage.get("input_tokens") or 0,
+                    output_tokens=usage.get("output_tokens") or 0,
+                    cache_read_tokens=usage.get("cache_read_input_tokens") or 0,
+                    cache_creation_tokens=usage.get("cache_creation_input_tokens") or 0,
+                )
+            run_corpus_ids = {str(c) for c in corpus_ids}
+            for key in keys:
+                if not (run_corpus_ids & id_sets[key]):
+                    continue
+                totals = out[key]
+                totals["runs_with_usage"] += 1
+                for field in (
+                    "input_tokens",
+                    "output_tokens",
+                    "cache_read_input_tokens",
+                    "cache_creation_input_tokens",
+                    "documents",
+                ):
+                    totals[field] += usage.get(field) or 0
+                totals["wall_seconds"] += usage.get("wall_seconds") or 0
+                models_seen[key].update(models)
+                totals["runs"].append({"id": str(run_id), "estimated_cost_usd": run_cost})
+                if run_cost is not None:
+                    totals["priced_runs"] += 1
+                    cost_accum[key] += run_cost
+
+        for key in keys:
+            out[key]["wall_seconds"] = round(out[key]["wall_seconds"], 3)
+            out[key]["models"] = sorted(models_seen[key])
+            out[key]["estimated_cost_usd"] = round(cost_accum[key], 4) if out[key]["priced_runs"] else None
+
+        return out

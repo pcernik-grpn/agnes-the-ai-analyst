@@ -83,8 +83,49 @@ function fmtNextRun(iso) {
   return iso ? new Date(iso).toLocaleString() : "not scheduled";
 }
 
-function fmtCost(usd) {
-  return usd == null || usd === 0 ? "—" : "$" + usd.toFixed(4);
+// Cost-truth fix — `usd` is `null` for BOTH "no_usage" (nothing recorded
+// anywhere for this connection) and "unpriced" (tokens known, no model
+// this can honestly price) `cost_status` values; `status` distinguishes
+// the two in the tooltip (see `costTitle`). A GENUINE `$0.00` (`usd === 0`,
+// `cost_status: "priced"`) renders as currency, never collapsed into the
+// same em-dash a missing figure gets — that conflation is exactly the bug
+// this fix closes (row.estimated_cost_usd used to default to `0` for a
+// connection whose crawl run itself had no usage, even when it had real
+// spend attributed through `facts_ingest_runs` instead).
+function fmtCost(usd, status) {
+  if (usd != null) return "$" + usd.toFixed(4);
+  return status === "unpriced" ? "— (unpriced)" : "—";
+}
+
+// The cost cell's own tooltip — names WHY a figure is missing, or which
+// model(s) it was priced at so it can be re-derived (see
+// `_fleet_row_cost`'s docstring on the API side).
+function costTitle(status, models) {
+  const names = (models && models.length) ? models.join(", ") : "";
+  if (status === "no_usage") return "No LLM usage recorded for this connection yet.";
+  if (status === "unpriced") {
+    return names
+      ? `Tokens recorded but the model(s) reported (${names}) could not be priced.`
+      : "Tokens recorded but no model was reported, so this cannot be priced.";
+  }
+  return names ? `Priced at ${names} rates.` : "";
+}
+
+// Shared-collection cost marker (double-count fix) — `row.cost_shared`
+// (`app/api/admin_extraction.py::fleet_extraction_runs`) is true when at
+// least one facts_ingest_runs run counted into THIS row's own
+// estimated_cost_usd is ALSO attributed to another connection (a bulk-add
+// shared collection, or a collection consolidation — see
+// `_collection_still_referenced`). The row's own figure stays a full,
+// un-split attribution on purpose (see the API docstring for why a
+// proportional split was rejected), so the badge is what keeps that
+// visible ON SCREEN rather than only in a repository docstring — the page
+// TOTAL de-duplicates by run id, but a reader scanning individual rows
+// must be able to tell the SAME dollars appear on more than one of them.
+function sharedCostBadgeHtml(row) {
+  if (!row.cost_shared) return "";
+  const withNames = (row.cost_shared_with && row.cost_shared_with.length) ? row.cost_shared_with.join(", ") : "another connection";
+  return ` <span class="badge badge--warn ext-cost-shared" title="${esc("Includes cost also attributed to a shared collection with: " + withNames + ". The fleet total below counts it once, not once per connection.")}">shared</span>`;
 }
 
 /* The fleet table's ERROR cell (TCRD-296 gap #68): a run-level error always
@@ -109,18 +150,20 @@ function fmtEta(seconds) {
   return hours > 0 ? `~${hours}h ${minutes}m` : `~${minutes}m`;
 }
 
-// Sums input/output tokens across every priced stage (`ner`/`ocr`/`facts`)
-// a run's `usage` carries — see `_run_total_cost_usd`'s docstring on the
-// API side for why `usage` is keyed by stage and only populated once the
-// run has finished.
-function tokenTotals(usage) {
-  let inTok = 0, outTok = 0, any = false;
-  for (const stage of Object.values(usage || {})) {
-    if (!stage || typeof stage !== "object") continue;
-    if (typeof stage.input_tokens === "number") { inTok += stage.input_tokens; any = true; }
-    if (typeof stage.output_tokens === "number") { outTok += stage.output_tokens; any = true; }
-  }
-  return any ? `${inTok.toLocaleString()} / ${outTok.toLocaleString()}` : "—";
+// `row.token_totals` (cost-truth fix, `app/api/admin_extraction.py::
+// _fleet_row_cost`) — already the SERVER-COMBINED sum across BOTH cost
+// sources: the crawl run's own inline `usage` (stage-keyed — `ner`/`ocr`/
+// `facts`, populated only once the run has finished) AND this
+// connection's attributable slice of `facts_ingest_runs` (the standalone
+// `sharepoint-facts-extraction` job's own ledger). This cell must never
+// re-derive that sum client-side from `run.usage` alone — that was the
+// bug: a connection whose facts stage ran only through the standalone job
+// had an empty `run.usage` and read as "—" here even with real spend
+// elsewhere.
+function tokenTotals(totals) {
+  const inTok = (totals && totals.input_tokens) || 0;
+  const outTok = (totals && totals.output_tokens) || 0;
+  return inTok || outTok ? `${inTok.toLocaleString()} / ${outTok.toLocaleString()}` : "—";
 }
 
 // TCRD-296 gap #67 — "3/4 passes running, 1,400 docs/h, ETA ~40m", appended
@@ -325,8 +368,7 @@ function renderRow(row) {
   const run = row.run;
   const filesDone = run ? (run.files_done ?? 0) : null;
   const filesSeen = run ? (run.files_seen ?? 0) : null;
-  const usage = run ? (run.usage || {}) : {};
-  const cost = row.estimated_cost_usd || 0;
+  const costTip = costTitle(row.cost_status, row.cost_models);
   // `extraction.crawl.min_modified` age filter — an operator scanning the
   // fleet table must be able to tell a connection's cutoff is doing
   // something without opening its source card. Absent/zero says nothing
@@ -345,8 +387,8 @@ function renderRow(row) {
     <td class="ext-num">${filesDone == null ? "—" : `${filesDone.toLocaleString()} / ${filesSeen.toLocaleString()}${filteredByAge}`}</td>
     <td class="ext-num">${fmtRate(row.files_per_min)}</td>
     <td class="ext-num">${factsCell(row.facts)}</td>
-    <td class="ext-num">${tokenTotals(usage)}</td>
-    <td class="ext-num">${fmtCost(cost)}</td>
+    <td class="ext-num">${tokenTotals(row.token_totals)}</td>
+    <td class="ext-num"${costTip ? ` title="${esc(costTip)}"` : ""}>${fmtCost(row.estimated_cost_usd, row.cost_status)}${sharedCostBadgeHtml(row)}</td>
     <td class="ext-sub">${fmtAgo(row.checkpoint_age_s)}</td>
     <td class="ext-sub">${fmtNextRun(row.next_run_at)}</td>
     <td>${(() => { const cell = fmtErrorCell(run); return cell ? `<span class="ext-error-cell" title="${esc(cell)}">${esc(cell)}</span>` : ""; })()}</td>
@@ -476,6 +518,20 @@ function renderTable(body) {
   stuckEl.textContent = t.stuck ?? 0;
   stuckEl.classList.toggle("danger", (t.stuck || 0) > 0);
   document.getElementById("ext-stat-cost").textContent = fmtCost(t.estimated_cost_usd);
+  // Shared-collection double-count fix — `totals.cost_note` states in the
+  // response itself what this de-duplicated figure sums (see
+  // `app/api/admin_extraction.py::fleet_extraction_runs`'s docstring); the
+  // tile surfaces that as its own tooltip rather than leaving a reader to
+  // guess why it can differ from a naive sum of the rows' own cost cells.
+  const costCard = document.getElementById("ext-card-cost");
+  if (costCard) costCard.title = t.cost_note || "";
+  // Cost-truth fix — the SAME instance-wide cumulative rollup `GET
+  // /api/facts/ingest-runs` already exposes (`llm_usage_totals`), riding
+  // on this response too so the summary strip can show it: everything
+  // this instance has EVER spent on fact extraction, not just what this
+  // page's own (possibly `?active=1`-scoped) rows total.
+  const cumulativeEl = document.getElementById("ext-stat-cumulative-cost");
+  if (cumulativeEl) cumulativeEl.textContent = fmtCost((body.llm_usage_totals || {}).estimated_cost_usd);
 
   renderJobsStrip(body.jobs);
 

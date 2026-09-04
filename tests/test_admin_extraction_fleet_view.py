@@ -26,11 +26,13 @@ _SIGNATURES = (
     "function fmtAgo(seconds) {",
     "function fmtNextRun(iso) {",
     "function fmtRate(rate) {",
-    "function fmtCost(usd) {",
+    "function fmtCost(usd, status) {",
+    "function costTitle(status, models) {",
+    "function sharedCostBadgeHtml(row) {",
     "function fmtErrorCell(run) {",
     "function fmtEta(seconds) {",
     "function factsThroughputNote(facts) {",
-    "function tokenTotals(usage) {",
+    "function tokenTotals(totals) {",
     "function factsCell(facts) {",
     "function phaseCell(run) {",
     "function shardBadgeHtml(connId, run) {",
@@ -163,6 +165,175 @@ _ROW = {
     "failed_items_count": 0,
     "empty_items_count": 0,
 }
+
+
+# ---------------------------------------------------------------------------
+# Cost/token cells (cost-truth fix) — `fmtCost`/`costTitle`/`tokenTotals`
+# must keep "no usage anywhere" (`null`, "no_usage"), "tokens known but
+# unpriced" (`null`, "unpriced") and a REAL figure (a number, "priced")
+# tellable apart — never collapsed into the same "$0.00" or the same
+# bare em-dash the old code rendered for both null AND a genuine zero.
+# ---------------------------------------------------------------------------
+
+
+def test_fmt_cost_renders_a_real_figure_as_currency():
+    out = _run_node('console.log(JSON.stringify({ text: fmtCost(4.5, "priced") }));')
+    assert out["text"] == "$4.5000"
+
+
+def test_fmt_cost_renders_a_genuine_zero_as_currency_not_a_dash():
+    """A real $0.00 must not collapse into the same em-dash a MISSING
+    figure renders as — that conflation is exactly the bug this fix closes."""
+    out = _run_node('console.log(JSON.stringify({ text: fmtCost(0, "priced") }));')
+    assert out["text"] == "$0.0000"
+
+
+def test_fmt_cost_renders_a_dash_for_no_usage():
+    out = _run_node('console.log(JSON.stringify({ text: fmtCost(null, "no_usage") }));')
+    assert out["text"] == "—"
+
+
+def test_fmt_cost_renders_a_distinct_hint_for_unpriced():
+    out = _run_node('console.log(JSON.stringify({ text: fmtCost(null, "unpriced") }));')
+    assert out["text"] != "—"
+    assert "unpriced" in out["text"]
+
+
+def test_cost_title_names_the_priced_models():
+    out = _run_node('console.log(JSON.stringify({ text: costTitle("priced", ["claude-haiku-4-5"]) }));')
+    assert "claude-haiku-4-5" in out["text"]
+
+
+def test_cost_title_explains_no_usage():
+    out = _run_node('console.log(JSON.stringify({ text: costTitle("no_usage", []) }));')
+    assert "No LLM usage" in out["text"]
+
+
+def test_cost_title_explains_unpriced_with_the_unpriceable_models_named():
+    out = _run_node('console.log(JSON.stringify({ text: costTitle("unpriced", ["some-unknown-model"]) }));')
+    assert "some-unknown-model" in out["text"]
+    assert "could not be priced" in out["text"]
+
+
+def test_token_totals_reads_the_row_level_combined_total():
+    out = _run_node("console.log(JSON.stringify({ text: tokenTotals({ input_tokens: 1000, output_tokens: 200 }) }));")
+    assert out["text"] == "1,000 / 200"
+
+
+def test_token_totals_is_a_dash_when_nothing_was_recorded():
+    out = _run_node("console.log(JSON.stringify({ text: tokenTotals({ input_tokens: 0, output_tokens: 0 }) }));")
+    assert out["text"] == "—"
+
+
+def test_token_totals_is_a_dash_for_a_missing_object():
+    out = _run_node("console.log(JSON.stringify({ text: tokenTotals(null) }));")
+    assert out["text"] == "—"
+
+
+def test_row_cost_cell_renders_the_facts_ingest_attributed_figure():
+    """The regression this fix closes: a row whose facts stage ran only
+    through the standalone job carries no `run.usage` at all, yet the row
+    must still show its real, non-zero, facts_ingest_runs-attributed cost."""
+    row = json.loads(json.dumps(_ROW))
+    row["run"]["usage"] = {}
+    row["estimated_cost_usd"] = 4.5
+    row["cost_status"] = "priced"
+    row["cost_models"] = ["claude-haiku-4-5"]
+    row["token_totals"] = {"input_tokens": 1_000_000, "output_tokens": 200_000}
+    html = _run_row_js(row)
+    assert "$4.5000" in html
+    assert "1,000,000 / 200,000" in html
+
+
+def test_row_cost_cell_shows_a_dash_not_a_fabricated_zero_when_nothing_is_recorded():
+    row = json.loads(json.dumps(_ROW))
+    row["estimated_cost_usd"] = None
+    row["cost_status"] = "no_usage"
+    row["cost_models"] = []
+    row["token_totals"] = {"input_tokens": 0, "output_tokens": 0}
+    html = _run_row_js(row)
+    assert "$0.00" not in html
+    assert "—" in html
+
+
+# ---------------------------------------------------------------------------
+# Shared-collection cost marker (double-count fix) — a row whose own cost
+# includes a run also attributed to another connection (a shared
+# collection) must visibly say so, never rely on the fleet total's silent
+# de-duplication alone.
+# ---------------------------------------------------------------------------
+
+
+def test_shared_cost_badge_is_absent_when_not_shared():
+    out = _run_node('console.log(JSON.stringify({ html: sharedCostBadgeHtml({ cost_shared: false }) }));')
+    assert out["html"] == ""
+
+
+def test_shared_cost_badge_names_the_other_connection():
+    out = _run_node(
+        'console.log(JSON.stringify({ html: sharedCostBadgeHtml('
+        '{ cost_shared: true, cost_shared_with: ["Legal SharePoint"] }'
+        ') }));',
+        extra_state="""
+class FakeEl {
+  constructor() { this._html = ""; this._text = ""; this.className = ""; }
+  set textContent(v) { this._text = v == null ? "" : String(v); }
+  get textContent() { return this._text; }
+  get innerHTML() {
+    if (this._html) return this._html;
+    return this._text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
+  set innerHTML(v) { this._html = v; }
+}
+const document = { createElement: () => new FakeEl() };
+""",
+    )
+    assert "shared" in out["html"]
+    assert "Legal SharePoint" in out["html"]
+
+
+def test_shared_cost_badge_falls_back_to_a_generic_note_with_no_names():
+    out = _run_node(
+        'console.log(JSON.stringify({ html: sharedCostBadgeHtml({ cost_shared: true, cost_shared_with: [] }) }));',
+        extra_state="""
+class FakeEl {
+  constructor() { this._html = ""; this._text = ""; this.className = ""; }
+  set textContent(v) { this._text = v == null ? "" : String(v); }
+  get textContent() { return this._text; }
+  get innerHTML() {
+    if (this._html) return this._html;
+    return this._text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
+  set innerHTML(v) { this._html = v; }
+}
+const document = { createElement: () => new FakeEl() };
+""",
+    )
+    assert "shared" in out["html"]
+    assert "another connection" in out["html"]
+
+
+def test_row_cost_cell_shows_the_shared_badge_when_the_row_is_flagged():
+    row = json.loads(json.dumps(_ROW))
+    row["estimated_cost_usd"] = 4.5
+    row["cost_status"] = "priced"
+    row["cost_models"] = ["claude-haiku-4-5"]
+    row["token_totals"] = {"input_tokens": 1000, "output_tokens": 200}
+    row["cost_shared"] = True
+    row["cost_shared_with"] = ["Legal SharePoint (part 2)"]
+    html = _run_row_js(row)
+    assert "$4.5000" in html
+    assert "Legal SharePoint (part 2)" in html
+
+
+def test_row_cost_cell_has_no_shared_badge_when_the_row_is_not_flagged():
+    row = json.loads(json.dumps(_ROW))
+    row["estimated_cost_usd"] = 4.5
+    row["cost_status"] = "priced"
+    row["cost_shared"] = False
+    row["cost_shared_with"] = []
+    html = _run_row_js(row)
+    assert "ext-cost-shared" not in html
 
 
 def test_files_cell_shows_no_age_filter_note_when_nothing_was_filtered():
