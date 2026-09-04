@@ -114,7 +114,15 @@
           aria-label="What definitions are. {{ _defs_tip }}">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 11v5" stroke-linecap="round"/><circle cx="12" cy="7.6" r="1" fill="currentColor" stroke="none"/></svg>
   </button>
-  <span class="lib-defs__counts">{{ defs.metric_count }} metric{{ '' if defs.metric_count == 1 else 's' }}, {{ defs.glossary_count_label }} glossary term{{ '' if defs.glossary_count == 1 else 's' }}</span>
+  {# The models are counted here too, and first. They are not rows on this
+     page (see the note in router.py) and should not be — but under the rail
+     this strip is the ONLY entrance to /semantic-layer, so a sentence naming
+     metrics and glossary terms alone left the documents that declare them
+     unmentioned anywhere a reader could see (#2200). Conditional, because
+     "0 semantic models" beside a populated registry describes an instance
+     whose flat definitions were written by hand — true, and not what this
+     line is for. #}
+  <span class="lib-defs__counts">{% if defs.model_count %}{{ defs.model_count }} semantic model{{ '' if defs.model_count == 1 else 's' }}, {% endif %}{{ defs.metric_count }} metric{{ '' if defs.metric_count == 1 else 's' }}, {{ defs.glossary_count_label }} glossary term{{ '' if defs.glossary_count == 1 else 's' }}</span>
   {# The destination is called Definitions now, so the door is too. It used
      to say "Browse semantic models" and land on the Models tab — which
      shows neither of the two things this line counts. #}

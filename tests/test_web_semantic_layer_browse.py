@@ -1158,6 +1158,78 @@ class TestLibraryEntryPoint:
         assert 'class="lib-defs__cta" href="/semantic-layer' in r.text
 
 
+class TestLibraryStatesTheModelCount:
+    """#2200 — the Definitions strip names the models, not only their contents.
+
+    The models stopped being ROWS on /library (#2069) and should stay gone:
+    a document is not a peer of the things you install. What went with the
+    rows was the WORD. The sentence counted metrics and glossary terms, and
+    under the rail this strip is the only entrance to /semantic-layer — so an
+    instance holding imported documents mentioned them nowhere a reader could
+    see, and the "Semantic models" tab existed for readers with no reason to
+    look for it.
+
+    The count is caller-scoped, so the primary case is a NON-ADMIN holding a
+    grant on one of two models; the admin case is its positive control.
+    """
+
+    def _counts(self, body: str) -> str:
+        """The strip's counts SPAN, not the page. The clause has to read as
+        part of that one sentence — a page-wide substring search would pass on
+        a match anywhere in the document."""
+        after_attr = body.split('class="lib-defs__counts"', 1)[1]
+        return after_attr.split(">", 1)[1].split("</span>", 1)[0]
+
+    def test_a_non_admin_is_told_how_many_models_they_can_read(self, seeded_app):
+        """The primary case. Two models exist, the analyst is granted one, and
+        the sentence states 1 — the count is a visibility property, so the
+        assertion that matters runs as a caller narrowed by construction."""
+        granted = _seed_model()
+        _seed_model(id="manual/_/finance", slug="finance")  # no grant for this analyst
+        _grant_model(granted["id"])
+        _seed_metric()
+        r = seeded_app["client"].get("/library", headers=_auth(seeded_app["analyst_token"]))
+        assert r.status_code == 200
+        counts = self._counts(r.text)
+        assert "1 semantic model," in counts
+        # The model they cannot read is not counted, and the singular is not
+        # pluralised on the way out.
+        assert "2 semantic models" not in counts
+        assert "1 semantic models" not in counts
+
+    def test_an_admin_is_told_about_both(self, seeded_app):
+        """Positive control for the case above: the analyst's 1 is a grant
+        filtering the pair, not a page that can only ever say one."""
+        _seed_model()
+        _seed_model(id="manual/_/finance", slug="finance")
+        _seed_metric()
+        r = seeded_app["client"].get("/library", headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 200
+        assert "2 semantic models," in self._counts(r.text)
+
+    def test_two_rows_sharing_a_slug_are_one_model(self, seeded_app):
+        """Counted per slug, because the Models tab dedupes its cards to the
+        newest readable row per slug (Devin #1398). Counting rows here would
+        state a number the destination contradicts one click later."""
+        _seed_model()
+        _seed_document(_SLUG, _document_json(_SLUG), source="ossie_git")
+        _seed_metric()
+        r = seeded_app["client"].get("/library", headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 200
+        assert "1 semantic model," in self._counts(r.text)
+
+    def test_no_model_means_no_clause_rather_than_a_zero(self, seeded_app):
+        """ "0 semantic models" beside a populated registry describes an
+        instance whose flat definitions were written by hand — true, and not
+        what this line is for."""
+        _seed_metric()
+        r = seeded_app["client"].get("/library", headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 200
+        counts = self._counts(r.text)
+        assert "semantic model" not in counts
+        assert counts.strip().startswith("1 metric")
+
+
 class TestRegistryBackLink:
     """The other half of the #1707 N4 deep link: a metric object page points
     back at the same metric's row in the flat registry, which carries the SQL

@@ -3875,6 +3875,7 @@ async def library_page(
         _visible_metrics: list = []
         _glossary_count = 0
         _has_readable_model = False
+        _model_count = 0
 
         try:
             _accessible = get_accessible_tables(user)
@@ -3911,14 +3912,40 @@ async def library_page(
         # tab is where a model is listed, with its object counts, dialects and
         # validation status. What survives here is the single question this
         # page still has to answer: does this caller have a readable document
-        # at all, which decides where the strip's one link should land.
+        # at all, which decides where the strip's one link should land —
+        # and HOW MANY, which the strip states beside the other two counts.
+        #
+        # The sweep was already paid for by that gate; only its length was
+        # thrown away, and with it the one word on this page that says the
+        # documents exist. Under the rail this strip is the ONLY entrance to
+        # `/semantic-layer` (`_app_rail.html`), so a reader whose instance
+        # holds two models and no mention of them cannot learn they are there.
+        # Dropping the model ROWS was right; dropping the object from the
+        # page's vocabulary was not (#2200).
+        #
+        # Counted per SLUG, not per row, to match the cards the Models tab
+        # renders: a slug is unique only per `(source, source_ref)`, and that
+        # page dedupes to the newest readable row per slug (Devin #1398), so
+        # counting rows here would state a number the destination contradicts
+        # one click later.
+        #
+        # One sweep for both answers — `_readable_semantic_model_rows`'s own
+        # docstring is explicit that a page paying for `_can_read_model`
+        # twice is the #1707 bug.
         try:
-            _has_readable_model = _has_readable_semantic_model(user, conn, surface="/library")
+            _model_rows = _readable_semantic_model_rows(user, conn, surface="/library")
+            _has_readable_model = _has_readable_semantic_model(user, conn, surface="/library", rows=_model_rows)
+            _model_count = len({str(r.get("slug") or "") for r in _model_rows})
         except Exception as e:  # noqa: BLE001 — one lost count, not the row
             logger.warning("/library: could not resolve a readable semantic model: %s", e)
 
         if _visible_metrics or _glossary_count or _has_readable_model:
             library_definitions = {
+                # First in the sentence, because it is the thing that CONTAINS
+                # the other two: a metric and a glossary term are declared by a
+                # document, and naming the document last would read as a third
+                # flat registry beside them.
+                "model_count": _model_count,
                 "metric_count": len(_visible_metrics),
                 "glossary_count": _glossary_count,
                 # The sentence says "N glossary terms"; N saturates at the
