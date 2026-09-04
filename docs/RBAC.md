@@ -60,11 +60,13 @@ scoping or co-sessions, a `TABLE` grant has no live effect at all.
 ### Internal usage tables: the `agnes-usage` package
 
 The internal tables — `agnes_sessions` (Claude Code sessions),
-`agnes_telemetry` (tool/skill invocations), `agnes_audit` (the audit trail)
+`agnes_telemetry` (tool/skill invocations), `agnes_audit` (the audit trail),
 and, on Postgres-backed instances, `agnes_turns` (per-assistant-turn token
-usage) — are registered like any other table and are **members of a seeded
-data package with the stable slug `agnes-usage`** ("Agnes Usage"). Access
-works exactly like any other table:
+usage), `agnes_extraction_runs` (per built-in extraction/crawl run) and
+`agnes_facts_ingest_runs` (per fact-graph ingest batch) — are registered like
+any other table and are **members of a seeded data package with the stable
+slug `agnes-usage`** ("Agnes Usage"). Access works exactly like any other
+table for the visibility half, and forks in two for the row half:
 
 - **Visibility of the table** = the `agnes-usage` package is in the caller's
   stack (a `resource_grants(group, 'data_package', <agnes-usage id>)` row on
@@ -72,16 +74,32 @@ works exactly like any other table:
   not appear in `agnes catalog` / `/api/v2/catalog`, and `SELECT … FROM
   agnes_sessions` returns **403** on `/api/query` (and through the CLI and
   the MCP `query` tool, which proxy to it).
-- **Which rows** = unchanged and independent of the grant: a non-admin sees
-  only their own rows, an admin sees the unscoped table. There is no
-  "grantee sees everyone" tier — granting the package never widens row
-  scope.
+- **Which rows, own-rows tables** (`agnes_sessions`, `agnes_telemetry`,
+  `agnes_audit`, `agnes_turns`) = unchanged and independent of the grant: a
+  non-admin sees only their own rows, an admin sees the unscoped table.
+  There is no "grantee sees everyone" tier — granting the package never
+  widens row scope.
+- **Which rows, admin-only tables** (`agnes_extraction_runs`,
+  `agnes_facts_ingest_runs`) = a DIFFERENT model, deliberately: neither
+  table has a per-row owner column. A crawl run is keyed on a data-source
+  connection (an admin-managed entity with no per-user access model of its
+  own); a fact-ingest run is keyed on a set of collections it touched, and
+  the route that creates the row (`POST /api/facts/ingest`) is itself
+  admin-only. Inventing a per-user filter here would claim a scoping
+  guarantee the columns cannot back up, so instead every non-admin caller
+  gets an unconditional zero-row result — the query still succeeds (the
+  grant makes the TABLE visible), it simply never returns a row. An admin
+  needs no grant and sees every run, including the LLM-token-usage columns
+  (`usage` / `llm_usage`) this table pair exists to make queryable — see
+  [`observability.md`](observability.md#self-service-usage-data-the-agnes-usage-package).
 - **Admins** need no grant (god-mode short-circuit), so admin usage
   dashboards are unaffected.
 - **Agents and co-sessions** (`SessionPrincipal` / `AgentPrincipal`) keep
   reaching the internal tables without the package — a deliberate carve-out:
   a principal has no personal stack, its authority is already owner grants ∩
-  agent scope, and the row filter binds it to the rows it is entitled to.
+  agent scope, and the row filter binds it to the rows it is entitled to
+  (which, on the admin-only tables, is none — the carve-out grants table
+  visibility, not a wider row scope).
 
 The tables are server-side only: `agnes pull` never downloads them, and the
 sync API refuses to sign their parquet URLs, so a package grant is a query

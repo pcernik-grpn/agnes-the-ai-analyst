@@ -49,18 +49,27 @@ class InternalTable:
                         analysts type in SQL (``SELECT * FROM <registry_id>``)
         source_table:   the underlying physical table in ``system.duckdb``
         filter_column:  the column on ``source_table`` carrying the per-row
-                        owner. Used for the non-admin scoping clause.
+                        owner. Used for the non-admin scoping clause. ``None``
+                        when ``filter_kind='admin_only'`` — there is no
+                        per-row owner column on that table at all.
         filter_kind:    how to resolve the filter value from the auth user
-                        dict — ``'username'`` (email local-part) or
-                        ``'user_id'`` (UUID).
+                        dict — ``'username'`` (email local-part), ``'user_id'``
+                        (UUID), or ``'admin_only'``: the table carries no
+                        per-row owner (it is operational/operator data, e.g.
+                        an extraction run keyed on a connection or an ingest
+                        batch keyed on a set of collections, never on a
+                        person), so every non-admin caller gets zero rows —
+                        see :func:`build_filter_clause`. Do not invent a
+                        per-user filter a table's own columns cannot honestly
+                        support; admin-only is the deliberate alternative.
         display_name:   human-readable name (also goes into ``table_registry.name``)
         description:    short blurb (catalog UI + ``agnes catalog`` output)
     """
 
     registry_id: str
     source_table: str
-    filter_column: str
-    filter_kind: str  # 'username' | 'user_id'
+    filter_column: str | None
+    filter_kind: str  # 'username' | 'user_id' | 'admin_only'
     display_name: str
     description: str
     legacy_username_column: str | None = None  # backward-compat OR fallback
@@ -212,6 +221,122 @@ INTERNAL_TABLES: tuple[InternalTable, ...] = (
             "extracted_at": "When the row was written.",
         },
     ),
+    # Postgres-only, same reasoning as `agnes_turns` above: `extraction_runs`
+    # landed after the A3 freeze (Alembic revision 0094, no `src/db.py`
+    # ladder step), so it exists on Postgres alone.
+    #
+    # `filter_kind='admin_only'`: this table has NO per-row owner column. A
+    # run is keyed on a `connection_id` (a data-source connection, an
+    # admin-managed entity with no per-user access model of its own — every
+    # route that reads or writes it, e.g. `app/api/admin_extraction.py`, is
+    # already admin-gated) — never on the person who happened to trigger it.
+    # Treating it as own-rows-per-caller would be inventing a scoping
+    # guarantee the columns cannot back up; treating it as admin/operator
+    # data (every non-admin caller sees zero rows, regardless of package
+    # grant) is the honest model and matches how every other surface over
+    # this table already gates it.
+    InternalTable(
+        registry_id="agnes_extraction_runs",
+        source_table="extraction_runs",
+        filter_column=None,
+        filter_kind="admin_only",
+        display_name="Agnes extraction runs",
+        description=(
+            "One row per built-in extraction (crawl) run: status, phase, "
+            "progress counters, the final run report and LLM token usage "
+            "(`usage`) that run spent. Admin/operator data, not a per-user "
+            "table — a run belongs to a data-source connection, never to a "
+            "person, so there is no per-caller row scoping: non-admins see "
+            "zero rows here even with the agnes-usage grant, admins see "
+            "every run. `report`/`progress`/`skips` are JSON — for a wide scan "
+            "prefer `json_extract(report, '$.key')` over pulling the whole "
+            "blob for many rows at once. Postgres-backed instances only. "
+            "Server-side only; query with `agnes query`."
+        ),
+        column_descriptions={
+            "id": "Run id.",
+            "connection_id": "The source_connections row this run crawled.",
+            "job_id": "The owning jobs row's id, when the caller recorded one (nullable).",
+            "status": "running | done | interrupted | failed. interrupted is its own outcome, not a flavour of failure.",
+            "phase": "Last observed phase at checkpoint_at: crawl | convert | anonymize | ingest | plan | finalizing.",
+            "started_at": "When the run began.",
+            "finished_at": "When the run ended; NULL while running.",
+            "checkpoint_at": "Last time this run wrote progress — the 'as of' timestamp, never re-derived at read time.",
+            "files_seen": "Files enumerated so far.",
+            "files_done": "Files processed so far.",
+            "enumeration_done": "Whether delta enumeration has finished (files_seen can still rise until true). Never a fraction with files_done — absolute counters only.",
+            "report": "Final run report (large JSON) — {} while the run is live. Prefer json_extract over SELECT * at scale.",
+            "progress": "Live counters as of checkpoint_at — a subset of report's own shape.",
+            "usage": "LLM token usage this run spent, when a detector used one: {model, calls, input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens}. {} means no tokens spent — a different claim from $0.00.",
+            "skips": "Capped list of {path, reason, detail} plus a total, so a truncated list stays visibly truncated.",
+            "error": "Error message, when the run failed.",
+            "parent_run_id": "For a shard child: the planner run it was enqueued from. NULL for every non-sharded run.",
+            "shard_key": "This shard's own delta-unit key (e.g. a drive id), when this run is a shard child.",
+            "shard_label": "Human-facing folder path for this shard.",
+            "shards_total": "Parent-only: how many children the plan enqueued. NULL on a non-parent row.",
+            "shards_done": "Parent-only: how many children have finished so far.",
+        },
+    ),
+    # Postgres-only, same reasoning as `agnes_turns`/`agnes_extraction_runs`
+    # above: `facts_ingest_runs` landed after the A3 freeze (Alembic revision
+    # 0078, no `src/db.py` ladder step).
+    #
+    # `filter_kind='admin_only'`, for the same reason as `agnes_extraction_
+    # runs`: there is no per-row owner column. `caller` names who triggered
+    # the batch, but `POST /api/facts/ingest` is itself admin-only
+    # (`app/api/facts.py`), so every row's caller is already an admin —
+    # scoping "your own" against it would filter admins against each other,
+    # not protect analysts from each other. `corpus_ids` names the
+    # collections a batch touched, not an owner; building a collection-
+    # membership filter through this table's generic single-column-equality
+    # mechanism would need one identical WHERE clause valid as both native
+    # Postgres SQL over the JSONB column (source-table materialization) AND
+    # DuckDB SQL over the same column already cast to text (the CTE
+    # re-application over the materialized copy, see
+    # `_select_list_with_json_as_text`) — no single expression satisfies
+    # both cleanly, and a subtly-wrong array-containment filter here would
+    # be a silent over- or under-disclosure of ingest history, not a loud
+    # failure. Admin-only sidesteps that risk entirely: every non-admin
+    # caller sees zero rows, admins see every run.
+    InternalTable(
+        registry_id="agnes_facts_ingest_runs",
+        source_table="facts_ingest_runs",
+        filter_column=None,
+        filter_kind="admin_only",
+        display_name="Agnes facts ingest runs",
+        description=(
+            "One row per POST /api/facts/ingest batch — the fact graph's "
+            "ingest history, including the real LLM spend ledger "
+            "(`llm_usage`). Admin/operator data, not a per-user table — "
+            "ingest is admin-only and a run's corpus_ids name collections "
+            "touched, not an owner, so there is no per-caller row scoping: "
+            "non-admins see zero rows here even with the agnes-usage "
+            "grant, admins see every run. `claims_rejected`/`review_items`/"
+            "`deferred` are JSON — for a wide scan prefer "
+            "`json_extract(claims_rejected, '$[0].reason')` over pulling "
+            "the whole blob for many rows at once. Postgres-backed "
+            "instances only. Server-side only; query with `agnes query`."
+        ),
+        column_descriptions={
+            "id": "Run id.",
+            "created_at": "When the batch was ingested.",
+            "corpus_ids": "Collection ids this batch's documents belonged to — not an owner.",
+            "caller": "Who triggered the ingest (email or id). Always an admin identity, since the route is admin-only.",
+            "documents_seen": "Documents in the batch.",
+            "claims_written": "Claims written by this batch.",
+            "claims_rejected_count": "Claims rejected — the itemized list is claims_rejected.",
+            "claims_rejected": "Itemized rejected claims (large JSON). Prefer json_extract at scale.",
+            "deferred": "Claims deferred pending a subject that did not exist yet at ingest time.",
+            "subjects_created": "New subjects created by this batch.",
+            "subjects_deleted": "Subjects deleted (merged away) by this batch.",
+            "review_items": "Itemized review-queue items this batch created (large JSON). Prefer json_extract at scale.",
+            "anonymization": "Producer's declaration that (some of) this batch went through anonymize-in-front, when reported. {} means not declared.",
+            "source_urls_rejected_count": "documents[].source_url values dropped as invalid — the claim itself still wrote, only its citation link is missing.",
+            "source_urls_rejected": "Itemized {doc_id, reason} for source_urls_rejected_count.",
+            "llm_usage": "Per-run LLM token/cost tally, when reported — the cost ledger for fact extraction: {models, input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens, ...}. NULL means this run reported no usage figure, never a fabricated zero.",
+            "edges_skipped_missing_endpoint": "Edges not written because their src/dst fact was gone by INSERT time — a race between concurrent extraction passes, never a producer mistake.",
+        },
+    ),
 )
 
 INTERNAL_TABLES_BY_ID: dict[str, InternalTable] = {t.registry_id: t for t in INTERNAL_TABLES}
@@ -265,7 +390,14 @@ def build_filter_clause(table: InternalTable, user: dict[str, Any], is_admin: bo
     """Return the WHERE clause for one internal table.
 
     Admins get an empty string (unscoped view). Everyone else get
-    ``WHERE <col> = '<value>'`` where value has been regex-validated.
+    ``WHERE <col> = '<value>'`` where value has been regex-validated —
+    except an ``admin_only`` table (``filter_kind='admin_only'``), which has
+    no per-row owner column at all: every non-admin gets the unconditional
+    ``WHERE FALSE`` (zero rows), regardless of what value ``_filter_value``
+    could resolve for them. The package grant still decides whether the
+    TABLE is visible at all (``agnes catalog`` / ``/api/query`` 403); this
+    is the separate, independent decision of which ROWS a visible table
+    yields, same division of labor as every own-rows table below.
 
     ``agnes_sessions`` and ``agnes_telemetry`` filter primarily on
     ``user_id`` (stable UUID) but include an OR fallback on
@@ -275,6 +407,8 @@ def build_filter_clause(table: InternalTable, user: dict[str, Any], is_admin: bo
     """
     if is_admin:
         return ""
+    if table.filter_kind == "admin_only":
+        return "WHERE FALSE"
     value = _filter_value(user, table.filter_kind)
     safe = value.replace("'", "''")
 

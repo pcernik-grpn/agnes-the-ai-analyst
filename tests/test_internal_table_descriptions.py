@@ -31,8 +31,25 @@ class TestTableDescriptions:
         # The single most important fact for an agent composing SQL: the
         # result set is already filtered to the caller.
         for t in INTERNAL_TABLES:
+            if t.filter_kind == "admin_only":
+                # No per-row owner exists on these tables (operational data,
+                # e.g. an extraction run or an ingest batch) — the honest
+                # claim is admin-only, never "your own rows".
+                continue
             assert "your own" in t.description.lower() or "own rows" in t.description.lower(), (
                 f"{t.registry_id}: description must state the own-rows scoping"
+            )
+
+    def test_every_admin_only_table_says_so(self):
+        # The mirror of the assertion above: an admin_only table's
+        # description must be equally explicit about the OTHER model, never
+        # silent about scoping altogether.
+        for t in INTERNAL_TABLES:
+            if t.filter_kind != "admin_only":
+                continue
+            assert "admin" in t.description.lower(), f"{t.registry_id}: admin-only table description must say so"
+            assert "your own" not in t.description.lower(), (
+                f"{t.registry_id}: admin-only table must not claim own-rows scoping it cannot back up"
             )
 
 
