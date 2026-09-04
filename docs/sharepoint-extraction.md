@@ -84,7 +84,7 @@ libraries / folders). Per scope, two decisions that matter later:
   mirrored scope granting one honors nobody by default — map it to one or
   more existing Agnes groups with `agnes admin sharepoint acl
   map-site-group <id> --site-group "<name>" --group <agnes_group_id>` (or the
-  source card's **Map site group (ACL)…** action), see
+  source card's Access panel → **Map site groups…** form), see
   [`RBAC.md`](RBAC.md) → "SharePoint ACL mirroring".
 
 ### SharePoint permissions as metadata vs. mirrored access
@@ -123,20 +123,21 @@ it simply captures no snapshot, and the read routes answer a typed `501`.
 
 ## 3. Sanity-check the anonymization on YOUR documents
 
-Before any crawl: source card → **View configuration** → **Preview
-redaction**. Paste a sample or upload one real file — the panel shows the
-converted markdown and the redacted version side by side, with per-kind
-counts. Nothing you preview is stored. If your corpus has vocabulary of its
-own (codenames, partners), add `extraction.anonymization.custom_terms`
-first and preview again.
+Before any crawl: source card → ▸ **Settings & defaults** → **Effective
+configuration** → **Preview redaction**. Paste a sample or upload one real
+file — the panel shows the converted markdown and the redacted version
+side by side, with per-kind counts. Nothing you preview is stored. If your
+corpus has vocabulary of its own (codenames, partners), add
+`extraction.anonymization.custom_terms` first and preview again.
 
 ## 4. First crawl — one folder, small limits
 
-Source card → **Run extraction now** → the options row: start with a small
-per-run time limit and default concurrency. The run appears live on the
-card; the drawer shows counters (new / changed / unchanged / skipped with
-reasons), per-stage token usage, and — on interruption — whether the state
-is resumable (`timeout` and `throttled` resume from persisted state; the
+Source card → **Run now ▾**: start with a small per-run time limit under
+**Advanced** and default concurrency. The run appears live on the card
+(the header's live line, and the Runs panel below it); its History drawer
+shows counters (new / changed / unchanged / skipped with reasons),
+per-stage token usage, and — on interruption — whether the state is
+resumable (`timeout` and `throttled` resume from persisted state; the
 next run picks up where this one stopped).
 
 Verify: the scope's collection holds the documents, skips are explainable
@@ -282,9 +283,9 @@ spot-check shows pseudonyms, not names.
   connection right now — an informational hint, `null` if it could not be
   computed). `409 split_exists` refuses a repeat `POST …/splits` under
   names that already exist. The SharePoint connection card's legacy split
-  panel (**Legacy: create N connections manually (deprecated)…**, behind
-  the **Parallel crawl — preview shards…** control) still previews and
-  applies it from the browser.
+  panel (▸ Settings & defaults → Legacy tools → **Split into N connections
+  (deprecated)…**, behind **Preview shards…**) still previews and applies
+  it from the browser.
 
   **Already split without the shared-collection option?** `POST
   …/connections/{id}/collections/consolidate` or `agnes admin sharepoint
@@ -389,7 +390,7 @@ swept automatically:
      override existed.
    - `"off"` — never picked up by the sweep, however often it polls; the
      connection is only crawled by an explicit `POST …/extract` (or a manual
-     "Run extraction now" on the card).
+     "Run now ▾" click on the card).
    - Any other value — the SAME cadence grammar `extraction.schedule` itself
      uses (`"every 6h"`, `"daily 03:00"`, `"cron 0 3 * * *"`, …) — REPLACES
      the instance-wide cadence for this one connection's own due-check. A
@@ -474,7 +475,12 @@ since Graph's delta feed never re-offers an unchanged item on its own.
 (`agnes admin sharepoint retry-empty <connection_id>`) re-queues exactly
 that backlog for another conversion pass, before the connection's ordinary
 incremental crawl — see [`api-reference.md`](api-reference.md) for the exact
-contract.
+contract. The same replay is also available as `retry_empty: true` on the
+main `POST …/connections/{id}/extract` (`agnes admin sharepoint extract
+<connection_id> --retry-empty`), so the source card's `Run now ▾` popover
+can combine it with `resync`/`retry_failed`/`force_reprocess` in one
+request instead of a second call — the standalone `retry-empty` route is
+unchanged and still works on its own.
 
 **Every reprocessing action an operator needed the shell for is a button**
 (TCRD-296 synthesis). Besides the empty-conversion backlog above, a
@@ -483,18 +489,37 @@ failure (a conversion crash, a transient download error), including ones
 already given up on after repeated attempts — replayed by `POST
 …/connections/{id}/extract` with `{"retry_failed": true}`
 (`agnes admin sharepoint extract <connection_id> --retry-failed`) BEFORE
-the run's ordinary incremental delta walk. The source card's Run row (and
-the fleet table at `/admin/extraction`, one screen down) show **"Retry
-failed (N)"** and **"Retry empty (N)"** next to each connection, `N` read
-from `GET …/extraction/status`'s `failed_items_count`/`empty_items_count`
-— the persisted backlog sizes, never a client-side guess — and disabled
-while a run for that connection is live. A connection whose most recent
-run ended `failed`/`interrupted` also gets a plain **"Re-run"** button
-(`POST …/extract` with no body — the same trigger a scheduled sweep or
-`agnes admin sharepoint extract <connection_id>` would use). Every button
-is a thin wrapper over the routes documented here and in
-[`api-reference.md`](api-reference.md) — nothing new is introduced at the
-protocol level, only a door that does not require a terminal.
+the run's ordinary incremental delta walk. The source card's **Not
+indexed** panel shows one action per non-zero category (`Retry failed`,
+`Retry with OCR`); its own **Run now ▾** popover offers `Retry files that
+failed (N)`/`Retry files that came back empty (N)` as checkboxes
+combinable with `resync`/`force_reprocess` in one request; `N` is read
+from `GET …/extraction/status`'s
+`failed_items_count`/`empty_items_count` — the persisted backlog sizes,
+never a client-side guess. The fleet table at `/admin/extraction`, one
+screen down, still shows the same two numbers per connection. A plain
+`Run now ▾` click with no options ticked is the "Re-run" case — the same
+trigger a scheduled sweep or `agnes admin sharepoint extract
+<connection_id>` would use. Every button is a thin wrapper over the
+routes documented here and in [`api-reference.md`](api-reference.md) —
+nothing new is introduced at the protocol level, only a door that does
+not require a terminal.
+
+**The source card reads run state in its header, not only "Healthy".** A
+one-word state chip (`Running` · `Stalled` · `Failed` · `Queued` ·
+`Paused — provider limit` · `Needs attention` · `Up to date` · `Never
+run` · `Certificate expired`, folded in that severity order) sits beside
+five absolute numbers (Indexed, Not indexed, Facts, Shared with, Spent)
+and a live line while a run is going (`N of ≈ M files · rate files/min ·
+about ETA left`, or `Extracting facts · N of M` during the facts phase).
+The live line's rate reads `GET …/extraction/status`'s `files_per_min`
+(the fleet view's own windowed-rate computation, `_files_per_min`); the
+`Queued` rung reads the new `crawl_job` field — the queued/running
+`corpus-extraction` job, mirroring the existing `facts_job` — so a
+connection with a job waiting for a free worker slot no longer reads
+"never run" until the run actually starts. `agnes admin connection
+rename <id> <name>` is the CLI counterpart to the card's overflow-menu
+`Rename…` item.
 
 **Documents that never convert stop costing a full attempt (2026-09-04
 finding #66).** A live crawl found a folder of hundreds of spreadsheets that
@@ -584,7 +609,7 @@ indexed — after turning `extraction.facts.enabled` on for the first time
 over an existing connection, or after a prompt/ontology change — trigger it
 on its own, with its own wall-clock budget
 (`extraction.facts.run_timeout_s`, independent of the crawl's own
-`extraction.timeout_s`): source card → **Extract facts now** (next to
+`extraction.timeout_s`): source card → **Run a facts pass** (next to
 **Run extraction now**; disabled, with the reason, while either switch is
 off), `POST /api/admin/sharepoint/connections/{id}/facts-extract`, or
 `agnes admin sharepoint facts-extract <connection_id>` (`--doc-id` narrows
@@ -599,7 +624,7 @@ large backlog can exceed `run_timeout_s` — it stops between documents
 (`interrupted: timeout`), never mid-document, and whatever it already
 extracted is shipped either way. When it stops that way with documents
 still pending, the worker automatically enqueues the next pass on the same
-connection (same idempotency key, so a manual "Extract facts now" click
+connection (same idempotency key, so a manual "Run a facts pass" click
 never races it), 30 seconds out, carrying over the same `--doc-id`/
 `--timeout-s` the stopped pass ran with. It never continues after a stop,
 a permanent provider error, or once the backlog is actually empty, and it
@@ -622,7 +647,7 @@ crawl.
 
 **A trigger now fans out into several PARTITIONS of one connection's own
 pass**, instead of requiring several connections to get parallelism. Every
-trigger surface — the source card's **Extract facts now** / `POST
+trigger surface — the source card's **Run a facts pass** / `POST
 …/facts-extract` / `agnes admin sharepoint facts-extract`, the crawl's own
 streamed enqueue (`extraction.facts.stream_every`), and a timed-out
 generation's self-continuation — goes through the same fan-out
@@ -947,8 +972,8 @@ the CLI — shows queued-vs-running counts per worker lane
 (every worker slot busy elsewhere, or none configured for it) — the one
 signal a connection stuck at "queued" forever has no `extraction_runs` row
 to show any other way. Each row also carries its own "Retry failed (N)"/
-"Retry empty (N)"/"Re-run" buttons, same rules as the source card's Run row
-above.
+"Retry empty (N)"/"Re-run" buttons, unchanged by the source card's own
+restructure into panels — the fleet table is a different page.
 
 ### Cancelling a run Stop can't reach
 

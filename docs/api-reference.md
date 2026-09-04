@@ -1938,13 +1938,16 @@ unknown/non-sharepoint connection before any other work; refuses cleanly
 extra is not installed); a run already queued/running for the same
 connection is `409 extraction_already_running` — deduped on a stable
 per-connection idempotency key shared with the sweep below. When the body
-sets `retry_failed: true` (TCRD-296 synthesis — the source card's "Retry
-failed (N)" button and `agnes admin sharepoint extract --retry-failed`),
-the response also carries `queued_count` — the size of this connection's
-persisted `failed_items` backlog at the moment this call reads it, before
-the job is enqueued, mirroring `…/extraction/retry-empty`'s own
-`queued_count` below. Absent for a plain trigger, `--resync`, or
-`--force-reprocess`.
+sets `retry_failed: true` and/or `retry_empty: true` (TCRD-296 synthesis /
+source-card redesign — the source card's `Run now ▾` popover checkboxes
+and `agnes admin sharepoint extract --retry-failed --retry-empty`), the
+response also carries `queued_count` — the combined size of this
+connection's persisted `failed_items`/`empty_items` backlogs at the moment
+this call reads them, before the job is enqueued, mirroring
+`…/extraction/retry-empty`'s own `queued_count` below. `retry_empty` here
+is the SAME replay the standalone `…/extraction/retry-empty` route below
+triggers, offered here so one request can combine it with the other
+options. Absent for a plain trigger, `--resync`, or `--force-reprocess`.
 
 `POST …/extraction/retry-empty` re-queues this connection's `convert_empty`
 backlog — documents that converted fine but carried no text (a scan with no
@@ -2154,7 +2157,16 @@ queued/running standalone facts pass for this connection
 read off the job queue (matched on the same idempotency key the trigger
 dedups on) and never appears in `running`/`last_completed`. The card shows
 it as a "facts pass queued/running" line in the Run row and locks its own
-"Extract facts now" button while one is in flight. `failed_items_count` /
+"Extract facts now" button while one is in flight. `crawl_job` mirrors
+`facts_job` for the crawl trigger's own `corpus-extraction` job kind — the
+queued/running job or `null`, source-card redesign §8 — filling the window
+between a trigger enqueueing and a worker claiming it and opening the
+first `extraction_runs` row, where `running` would otherwise read as
+"never run". `files_per_min` is the same windowed-rate computation the
+fleet view's own `files_per_min` column already uses, derived over
+`running` (`null` when nothing is running or the rate is not yet
+computable) — the source card's live line reads this rather than dividing
+absolute counters itself. `failed_items_count` /
 `empty_items_count` (TCRD-296 synthesis) are the SIZE of this connection's
 persisted `failed_items`/`empty_items` backlogs (a cheap `jsonb_object_keys`
 count, never a decode of the — potentially huge — payload on this

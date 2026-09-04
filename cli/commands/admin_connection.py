@@ -5,6 +5,7 @@ Each subcommand maps 1:1 to one HTTP endpoint:
 
   - ``list``    → ``GET /api/admin/source-connections``
   - ``add``     → ``POST /api/admin/source-connections`` + ``PUT /{id}/secret``
+  - ``rename``  → ``PUT /api/admin/source-connections/{id}`` (``{name}`` only)
   - ``remove``  → ``DELETE /api/admin/source-connections/{id}``
   - ``test``    → ``POST /api/admin/source-connections/{id}/test``
   - ``secret``  → ``PUT /{id}/secret`` (or ``DELETE /{id}/secret?kind=``
@@ -110,6 +111,25 @@ def add_connection(
     if secret_resp.status_code not in (200, 204):
         _fail(secret_resp)
     typer.echo(f"Token stored in vault for connection {conn_id}")
+
+
+@admin_connection_app.command("rename")
+def rename_connection(
+    connection_id: str = typer.Argument(..., help="Connection id"),
+    name: str = typer.Argument(..., help="New name"),
+):
+    """Rename a named source connection — CLI counterpart to the source
+    card's overflow menu ``Rename…`` item (source-card redesign §8).
+
+    Sends only ``{"name": ...}``: the update endpoint carries forward
+    everything else — config, confirmed scopes, extraction schedule state —
+    when the request omits those keys, so a rename never touches them.
+    ``409`` when the name is already taken by a different connection.
+    """
+    resp = api_put(f"/api/admin/source-connections/{connection_id}", json={"name": name})
+    if resp.status_code != 200:
+        _fail(resp)
+    typer.echo(f"Renamed connection {connection_id} to {name!r}")
 
 
 @admin_connection_app.command("remove")

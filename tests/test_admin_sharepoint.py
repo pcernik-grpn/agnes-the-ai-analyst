@@ -2982,6 +2982,110 @@ class TestExtractionTrigger:
         assert r.status_code == 202, r.text
         assert "queued_count" not in r.json()
 
+    def test_retry_empty_option_rides_in_the_payload(self, seeded_app, monkeypatch):
+        """`retry_empty` on `POST …/extract` (source-card redesign §8): no
+        key when unset, `retry_empty: true` when the admin ticks the box in
+        the `Run now` popover — the standalone `POST …/extraction/
+        retry-empty` route is unaffected and keeps working on its own."""
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(_ENABLED_EXTRACTION_CONFIG))
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="ex-options-retry-empty")
+        r = c.post(
+            self.EXTRACT.format(base=BASE, cid=conn_id),
+            json={"retry_empty": True},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 202, r.text
+
+        from src.repositories import jobs_repo
+
+        job = jobs_repo().get(r.json()["job_id"])
+        assert job["payload_json"] == {"connection_id": conn_id, "retry_empty": True}
+
+    def test_retry_empty_response_carries_queued_count_from_the_backlog(self, seeded_app, monkeypatch):
+        """Mirrors `retry_failed`'s own `queued_count` — read from the SAME
+        persisted `empty_items` backlog `GET .../extraction/retry-empty`
+        already counts, so the popover's promised number and the toast
+        after clicking Start never disagree."""
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(_ENABLED_EXTRACTION_CONFIG))
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="ex-retry-empty-count")
+
+        from connectors.sharepoint.crawler import save_state
+
+        save_state(
+            conn_id,
+            {
+                "delta_links": {},
+                "ctags": {},
+                "failed_items": {},
+                "empty_items": {
+                    "graph:item1": {
+                        "state_key": "b!drive1",
+                        "item": {"id": "item1", "name": "scan1.pdf"},
+                        "path": "Reports/scan1.pdf",
+                    },
+                },
+            },
+        )
+
+        r = c.post(
+            self.EXTRACT.format(base=BASE, cid=conn_id),
+            json={"retry_empty": True},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 202, r.text
+        assert r.json()["queued_count"] == 1
+
+    def test_retry_failed_and_retry_empty_combine_into_one_queued_count(self, seeded_app, monkeypatch):
+        """The `Run now` popover can tick both boxes in one submission —
+        `queued_count` must reflect the combined backlog, not just one of
+        the two."""
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(_ENABLED_EXTRACTION_CONFIG))
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="ex-retry-both-count")
+
+        from connectors.sharepoint.crawler import save_state
+
+        save_state(
+            conn_id,
+            {
+                "delta_links": {},
+                "ctags": {},
+                "failed_items": {
+                    "graph:item1": {
+                        "state_key": "b!drive1",
+                        "item": {"id": "item1", "name": "a.pdf"},
+                        "path": "Reports/a.pdf",
+                    },
+                },
+                "empty_items": {
+                    "graph:item2": {
+                        "state_key": "b!drive1",
+                        "item": {"id": "item2", "name": "scan1.pdf"},
+                        "path": "Reports/scan1.pdf",
+                    },
+                },
+            },
+        )
+
+        r = c.post(
+            self.EXTRACT.format(base=BASE, cid=conn_id),
+            json={"retry_failed": True, "retry_empty": True},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 202, r.text
+        assert r.json()["queued_count"] == 2
+
+        from src.repositories import jobs_repo
+
+        job = jobs_repo().get(r.json()["job_id"])
+        assert job["payload_json"] == {
+            "connection_id": conn_id,
+            "retry_failed": True,
+            "retry_empty": True,
+        }
+
     def test_out_of_range_run_options_are_refused_not_reclamped(self, seeded_app, monkeypatch):
         """The crawler would clamp these silently; the endpoint refuses them
         instead, where the admin can see why the run isn't what they asked

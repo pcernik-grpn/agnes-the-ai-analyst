@@ -1500,7 +1500,12 @@ class TestSharePointSourceCard:
             assert fs["graph"] is None
             assert fs["last_run"] is None
             assert fs["queue"] == {"items": 0}
-            assert fs["identity"] == {"groups_matched": 0, "collections_no_group": 0, "collections_total": 0}
+            assert fs["identity"] == {
+                "groups_matched": 0,
+                "collections_no_group": 0,
+                "collections_total": 0,
+                "group_names": [],
+            }
             assert fs["scopes_total"] == 0
         finally:
             source_connections_repo().delete(conn_id)
@@ -1950,10 +1955,28 @@ class TestSharePointSourceCardRendering:
             self._extract_function(tpl, sig)
             for sig in (
                 "function _esc(s) {",
-                "function _sharepointPipelineStripHtml(row) {",
+                "function _spHeadHtml(row) {",
+                "function _spExtractionReady(row) {",
+                "function _spExtractionUnreadyReasonText(row) {",
+                "function _spRunNowPopoverHtml(row) {",
+                "function _spStateChip(fs, status) {",
+                "function _spPanelHtml(title, toolbarHtml, bodyHtml) {",
+                "function _spScopesPanelHtml(row) {",
+                "function _spScopesTableHtml(connId, scopes) {",
+                "function _spAccessBadge(s) {",
+                "function _spAnonymizeBadge(s) {",
+                "function _spScopeTableRowHtml(connId, s) {",
+                "function _spScopeMinModifiedBadge(s) {",
+                "function _spRunsPanelHtml(row) {",
+                "function _spNotIndexedPanelHtml(row) {",
+                "function _spFactsPanelHtml(row) {",
+                "function _spAccessPanelHtml(row) {",
+                "function _spMapGroupRowHtml(name, selectedIds, groups) {",
+                "function _spSettingsPanelHtml(row) {",
+                "function _sharepointFactsHtml(row) {",
                 "function _extRenderFactsPolicy(row) {",
                 "function _extRenderCrawlFilter(row) {",
-                "function _sharepointFactsHtml(row) {",
+                "function _extConfigRowHtml(connId) {",
                 "const SP_REJECTION_REASON_TEXT = {",
                 "function _spRejectionReasonText(reason) {",
                 "const EXTRACTION_UNREADY_REASON_TEXT = {",
@@ -1988,79 +2011,104 @@ const row = {{ id: "sp-conn-1", source_type: "sharepoint" }};
         assert proc.returncode == 0, proc.stdout + proc.stderr
         return json.loads(proc.stdout)
 
-    def test_pipeline_strip_renders_the_four_stage_counts(self):
-        result = self._run("console.log(JSON.stringify({ html: _sharepointPipelineStripHtml(row) }));")
+    def test_head_renders_state_chip_and_five_tiles(self):
+        """Header (§2.1): the state chip is rendered by the generic
+        `_sourceHealth`/`.ds-src__health` mechanism (pinned in
+        `TestSourceCardHierarchy`); `_spHeadHtml` renders the FIVE tiles
+        (Indexed, Not indexed, Facts, Shared with, Spent) + the live line
+        slot — replacing the old four-cell pipeline strip."""
+        result = self._run("console.log(JSON.stringify({ html: _spHeadHtml(row) }));")
         html = result["html"]
-        assert "12 documents" in html
-        assert "9 indexed" in html
-        # `graph` is never server-rendered (perf follow-up, 2026-09-03) — the
-        # strip shows a loading placeholder with a stable id so
+        assert "Indexed" in html
+        assert "9" in html  # extract.indexed
+        assert "Not indexed" in html
+        # `Facts` is never server-rendered (perf follow-up, 2026-09-03) — the
+        # tile shows a loading placeholder with a stable id so
         # `_fetchSharepointGraphCounts` can fill it in after the page paints.
         assert 'id="ds-sp-graph-sp-conn-1"' in html
         assert "loading" in html
-        assert "3 items" in html
+        assert "Shared with" in html
+        assert "Spent" in html
+        assert 'id="sp-liveline-sp-conn-1"' in html
 
     def test_facts_html_renders_certificate_identity_and_badge_counts(self):
-        result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));")
-        html = result["html"]
-        assert "built-in crawler" in html
-        assert "vault" in html
+        """Certificate moved to Settings (`_spSettingsPanelHtml`); the
+        rejected-facts badges moved to the Facts panel (`_spFactsPanelHtml`)
+        — the old "Sharing" row retired in favor of the head's `Shared with`
+        tile + the Access panel (source-card redesign §2/§4)."""
+        settings_html = self._run("console.log(JSON.stringify({ html: _spSettingsPanelHtml(row) }));")["html"]
+        assert "vault" in settings_html
         # Never the certificate value, only origin/set-date.
-        assert "BEGIN PRIVATE KEY" not in html
-        # "Sharing" row — rephrased from the cryptic "2 groups matched · 1
-        # collection with no group" to a plain sentence about what it means.
-        assert "1 collection has no group — only admins see them" in html
-        assert "Rejected quotes 1" in html
-        assert "Deferred 1" in html
-        assert "Protocol errors 2" in html
-        assert "Citation links rejected 1" in html
+        assert "BEGIN PRIVATE KEY" not in settings_html
 
-    # -- in-Agnes extraction scheduling + manual trigger (TCRD-226) --------
+        facts_html = self._run("console.log(JSON.stringify({ html: _spFactsPanelHtml(row) }));")["html"]
+        assert "Rejected quotes 1" in facts_html
+        assert "Deferred 1" in facts_html
+        assert "Protocol errors 2" in facts_html
+        assert "Citation links rejected 1" in facts_html
+
+        head_html = self._run("console.log(JSON.stringify({ html: _spHeadHtml(row) }));")["html"]
+        assert "Shared with" in head_html
+
+    # -- Run now ▾ popover + head trigger (TCRD-226, source-card redesign §2.3) --
 
     def test_run_options_carry_a_force_reprocess_checkbox_naming_the_document_count(self):
         """The operator control that ignores the delta cursor entirely — a
-        checkbox on the run-options row, with one sentence naming the cost
-        (re-download/re-convert/re-run-LLM the WHOLE corpus, sized with the
-        card's own known document count, 12 per `_FILE_SOURCE`)."""
-        result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));")
+        popover checkbox with one sentence naming the cost (re-download/
+        re-convert/re-run-LLM the WHOLE corpus, sized with the card's own
+        known document count, 12 per `_FILE_SOURCE`)."""
+        result = self._run("console.log(JSON.stringify({ html: _spRunNowPopoverHtml(row) }));")
         html = result["html"]
-        assert 'id="ds-sp-runopts-force-sp-conn-1"' in html
-        assert 'id="ds-sp-runopts-resync-sp-conn-1"' in html
-        assert "Re-process everything (ignore the delta cursor)" in html
-        assert "all 12 documents" in html
-        assert "not just what changed" in html
+        assert 'id="sp-runnow-forcereprocess-sp-conn-1"' in html
+        assert 'id="sp-runnow-resync-sp-conn-1"' in html
+        assert "Re-process every file" in html
+        assert "all 12 document" in html
+        assert "Costs about as much as the first run" in html
 
     def test_run_options_carry_a_retry_failed_checkbox(self):
         """The admin-facing surface for `retry_failed` (REST × CLI × UI
-        parity, see `POST …/extract`'s `retry_failed` option) — a checkbox
-        alongside resync/force, never a route of its own."""
-        result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));")
+        parity, see `POST …/extract`'s `retry_failed` option) — a popover
+        checkbox alongside resync/force/retry_empty, never a route of its
+        own."""
+        result = self._run("console.log(JSON.stringify({ html: _spRunNowPopoverHtml(row) }));")
         html = result["html"]
-        assert 'id="ds-sp-runopts-retry-sp-conn-1"' in html
-        assert "Retry failed items" in html
+        assert 'id="sp-runnow-retryfailed-sp-conn-1"' in html
+        assert "Retry files that failed" in html
 
     def test_force_reprocess_help_falls_back_when_the_document_count_is_unknown(self):
         fs = dict(self._FILE_SOURCE)
         fs["crawl"] = {}
-        result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)
+        result = self._run("console.log(JSON.stringify({ html: _spRunNowPopoverHtml(row) }));", file_source=fs)
         html = result["html"]
-        assert 'id="ds-sp-runopts-force-sp-conn-1"' in html
-        assert 'id="ds-sp-runopts-resync-sp-conn-1"' in html
-        assert "every document" in html
+        assert 'id="sp-runnow-forcereprocess-sp-conn-1"' in html
+        assert 'id="sp-runnow-resync-sp-conn-1"' in html
+        assert "every file" in html
+
+    def test_run_now_popover_lists_options_in_plain_words(self):
+        result = self._run("console.log(JSON.stringify({ html: _spRunNowPopoverHtml(row) }));")
+        html = result["html"]
+        assert "Run now" in html
+        assert "List every folder again" in html
+        assert "Retry files that failed" in html
+        assert "Retry files that came back empty" in html
+        assert "Re-process every file" in html
+        assert "Re-balance the parallel parts (no re-download)" in html
+        assert "Preview how this site will be split" in html
+        assert "Advanced" in html
+        assert "Files in parallel" in html
+        assert "Time limit" in html
+        assert "Start" in html
+        assert "Cancel" in html
 
     def test_run_extraction_now_button_always_renders_but_defaults_disabled(self):
-        """The button never disappears — even on an older/degraded cell
-        shape (the fixture above carries no `schedule.in_agnes` at all) it
-        still renders and is wired to the SAME endpoint — but the honest-UI
-        gate (`extraction_ready`) is missing here, which reads as "not
-        ready" (fail closed), so it renders `disabled`. See
+        """The `Run now ▾` button never disappears — even on an older/
+        degraded cell shape (the fixture above carries no `schedule.
+        in_agnes` at all) `_spExtractionReady` still answers, fail closed
+        ("not ready" when the field is missing). See
         `test_in_agnes_schedule_ready_enables_the_run_button` for the
         enabled case."""
-        result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));")
-        html = result["html"]
-        assert "Run extraction now" in html
-        assert "runSpExtraction('sp-conn-1')" in html
-        assert "disabled" in html
+        result = self._run("console.log(JSON.stringify({ ready: _spExtractionReady(row) }));")
+        assert result["ready"] is False
 
     def test_in_agnes_schedule_ready_enables_the_run_button(self):
         fs = dict(self._FILE_SOURCE)
@@ -2077,29 +2125,26 @@ const row = {{ id: "sp-conn-1", source_type: "sharepoint" }};
                 "facts_extraction_unready_switch": None,
             },
         }
-        result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)
-        html = result["html"]
-        # Ready -> no unready badge, and neither button carries `disabled`.
-        assert "connector is disabled on this instance" not in html
-        assert "No extraction producer is configured" not in html
-        assert "disabled" not in html
-        assert "8/29/2026" in html or "2026" in html  # locale-rendered date, just prove SOME date landed
+        result = self._run(
+            "console.log(JSON.stringify({ ready: _spExtractionReady(row), reason: _spExtractionUnreadyReasonText(row) }));",
+            file_source=fs,
+        )
+        assert result["ready"] is True
+        assert result["reason"] == ""
 
     def test_in_agnes_schedule_never_run_reads_honestly(self):
+        """ "Never run" now lives in the state chip ladder (`_spStateChip`) —
+        not a schedule fact row, since the redesign folds "last run"/"next
+        run" into the Runs panel's own live poll and Settings' schedule
+        line. `identity.collections_no_group` must be zero here, or the
+        ladder reads `Needs attention` first (severity order, §2.1)."""
         fs = dict(self._FILE_SOURCE)
-        fs["schedule"] = {
-            **fs["schedule"],
-            "in_agnes": {
-                "enabled": True,
-                "schedule": "every 4h",
-                "last_run_at": None,
-                "next_run_at": None,
-                "extraction_ready": True,
-                "extraction_unready_reason": None,
-            },
-        }
-        result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)
-        assert "never run" in result["html"].lower()
+        fs["identity"] = {"groups_matched": 0, "collections_no_group": 0, "collections_total": 0, "group_names": []}
+        chip = self._run(
+            "console.log(JSON.stringify(_spStateChip(SOURCE_PIPELINES['sp-conn-1'].file_source, null)));",
+            file_source=fs,
+        )
+        assert chip["label"] == "Never run"
 
     def test_in_agnes_schedule_disabled_shows_the_reason_and_disables_the_button(self):
         fs = dict(self._FILE_SOURCE)
@@ -2114,11 +2159,12 @@ const row = {{ id: "sp-conn-1", source_type: "sharepoint" }};
                 "extraction_unready_reason": "extraction_disabled",
             },
         }
-        result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)
-        html = result["html"]
-        assert "connector is disabled on this instance" in html
-        assert "no schedule configured" in html.lower()
-        assert "disabled" in html
+        result = self._run(
+            "console.log(JSON.stringify({ ready: _spExtractionReady(row), reason: _spExtractionUnreadyReasonText(row) }));",
+            file_source=fs,
+        )
+        assert result["ready"] is False
+        assert "connector is disabled on this instance" in result["reason"]
 
     def test_in_agnes_schedule_missing_deps_shows_the_reason_and_disables_the_button(self):
         """A DIFFERENT unready reason than the disabled case above — the
@@ -2137,10 +2183,12 @@ const row = {{ id: "sp-conn-1", source_type: "sharepoint" }};
                 "extraction_unready_reason": "extraction_dependencies_missing",
             },
         }
-        result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)
-        html = result["html"]
-        assert "extraction dependencies are not installed" in html.lower() or "agnes[extraction]" in html
-        assert "disabled" in html
+        result = self._run(
+            "console.log(JSON.stringify({ ready: _spExtractionReady(row), reason: _spExtractionUnreadyReasonText(row) }));",
+            file_source=fs,
+        )
+        assert result["ready"] is False
+        assert "extraction dependencies are not installed" in result["reason"].lower()
 
     def test_drawer_filters_to_the_clicked_category_and_toggles_closed(self):
         result = self._run(
@@ -2306,37 +2354,55 @@ const row = {{ id: "sp-conn-1", source_type: "sharepoint" }};
     # -- sharing-state row (rephrased from "Identity matching") ------------
 
     def test_sharing_row_ok_when_every_scope_collection_has_a_group(self):
+        """The old standalone "Sharing" row retired — its verdict now lives
+        in the head's `Shared with` tile (`_spHeadHtml`, source-card
+        redesign §2.1) and, per-scope, the Access panel."""
         fs = dict(self._FILE_SOURCE)
-        fs["identity"] = {"groups_matched": 2, "collections_no_group": 0, "collections_total": 2}
-        result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)
+        fs["identity"] = {
+            "groups_matched": 2,
+            "collections_no_group": 0,
+            "collections_total": 2,
+            "group_names": ["Finance", "Legal"],
+        }
+        result = self._run("console.log(JSON.stringify({ html: _spHeadHtml(row) }));", file_source=fs)
         html = result["html"]
-        assert "all scope collections have a group" in html
-        assert "is-ok" in html
+        assert "Finance, Legal" in html
 
     def test_sharing_row_warn_singular_and_plural_phrasing(self):
         fs = dict(self._FILE_SOURCE)
-        fs["identity"] = {"groups_matched": 0, "collections_no_group": 1, "collections_total": 1}
-        result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)
-        assert "1 collection has no group — only admins see them" in result["html"]
+        fs["identity"] = {
+            "groups_matched": 0,
+            "collections_no_group": 1,
+            "collections_total": 1,
+            "group_names": [],
+        }
+        result = self._run("console.log(JSON.stringify({ html: _spHeadHtml(row) }));", file_source=fs)
+        assert "1 folder hidden" in result["html"]
 
-        fs["identity"] = {"groups_matched": 0, "collections_no_group": 3, "collections_total": 3}
-        result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)
-        assert "3 collections have no group — only admins see them" in result["html"]
+        fs["identity"] = {
+            "groups_matched": 0,
+            "collections_no_group": 3,
+            "collections_total": 3,
+            "group_names": [],
+        }
+        result = self._run("console.log(JSON.stringify({ html: _spHeadHtml(row) }));", file_source=fs)
+        assert "3 folders hidden" in result["html"]
 
     def test_sharing_row_empty_state_when_no_scope_collections_exist_yet(self):
         fs = dict(self._FILE_SOURCE)
-        fs["identity"] = {"groups_matched": 0, "collections_no_group": 0, "collections_total": 0}
-        result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)
-        assert "no scope collections yet" in result["html"]
+        fs["identity"] = {"groups_matched": 0, "collections_no_group": 0, "collections_total": 0, "group_names": []}
+        result = self._run("console.log(JSON.stringify({ html: _spHeadHtml(row) }));", file_source=fs)
+        assert "no scopes yet" in result["html"]
 
     # -- scope rows (spec follow-up: clickable into the wizard) ------------
 
     def _run_scope_row(self, scope: dict) -> str:
-        """`_spScopeRowHtml` executed directly — the per-scope row renderer
-        used by `toggleSpScopesDrawer`'s fetch-on-expand drawer (perf
-        follow-up, 2026-09-03: the drawer's own async `fetch()` is out of
-        reach for this synchronous node harness, but the pure rendering
-        function it calls is not)."""
+        """`_spScopeTableRowHtml` executed directly — the per-scope TABLE
+        ROW renderer used by `_spLoadScopesAndAccess`'s fetch-on-expand
+        table (perf follow-up, 2026-09-03: the fetch itself is out of reach
+        for this synchronous node harness, but the pure rendering function
+        it calls is not). Replaces `_spScopeRowHtml`/the old `<li>` list —
+        the Scopes panel is a `<table class="sp-scopes">` now (§2.2)."""
         import json
         import subprocess
         import tempfile
@@ -2348,12 +2414,14 @@ const row = {{ id: "sp-conn-1", source_type: "sharepoint" }};
             for sig in (
                 "function _esc(s) {",
                 "function _spScopeMinModifiedBadge(s) {",
-                "function _spScopeRowHtml(connId, s) {",
+                "function _spAccessBadge(s) {",
+                "function _spAnonymizeBadge(s) {",
+                "function _spScopeTableRowHtml(connId, s) {",
             )
         )
         script = f"""
 {fns}
-console.log(JSON.stringify({{ html: _spScopeRowHtml("sp-conn-1", {json.dumps(scope)}) }}));
+console.log(JSON.stringify({{ html: _spScopeTableRowHtml("sp-conn-1", {json.dumps(scope)}) }}));
 """
         with tempfile.NamedTemporaryFile("w", suffix=".mjs", delete=False) as f:
             f.write(script)
@@ -2374,6 +2442,8 @@ console.log(JSON.stringify({{ html: _spScopeRowHtml("sp-conn-1", {json.dumps(sco
                 "display_path": "Site / Contracts",
                 "collection": {"id": "col_a", "slug": "contracts", "name": "Contracts"},
                 "no_group_warning": False,
+                "access_mode": "manual",
+                "min_modified": {},
             }
         )
         assert "Site / Contracts" in html
@@ -2387,34 +2457,57 @@ console.log(JSON.stringify({{ html: _spScopeRowHtml("sp-conn-1", {json.dumps(sco
                 "display_path": "Site / Reports",
                 "collection": {"id": "col_b", "slug": "reports", "name": "Reports"},
                 "no_group_warning": True,
+                "access_mode": "manual",
+                "min_modified": {},
             }
         )
-        assert "no group" in html
+        assert "No group yet" in html
         assert "badge-warn" in html
 
-    def test_no_scope_rows_section_when_scopes_total_is_zero(self):
-        """`scopes_total` absent/falsy (this connection has none) — the
-        whole "Scope collections" row, including the fetch-on-expand
-        button, must not render at all."""
-        result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));")
-        assert "Scope collections" not in result["html"]
+    def test_scopes_table_renders_since_with_default_marker(self):
+        """The `Since` column (§2.2, #2282's per-scope `min_modified`
+        field) — a scope's OWN override renders `since <date>`; an
+        INHERITED one (no own value) renders with the `(default)` marker."""
+        own_html = self._run_scope_row(
+            {
+                "source_scope_id": "s1",
+                "display_path": "Site / A",
+                "collection": None,
+                "no_group_warning": False,
+                "access_mode": "manual",
+                "min_modified": {"value": "2024-01-01", "source": "scope", "own_value": "2024-01-01"},
+            }
+        )
+        assert "since 2024-01-01" in own_html
+        assert "(default)" not in own_html
 
-    def test_scope_collections_row_shows_the_count_and_a_view_button(self):
-        """The collapsed row (perf follow-up, 2026-09-03): no per-scope data
-        inline, just the count and a button that fetches the real list on
-        click (`toggleSpScopesDrawer`, exercised end-to-end in
-        tests/test_admin_sharepoint.py — this pins only what
-        `_sharepointFactsHtml` itself renders before that fetch fires)."""
+        inherited_html = self._run_scope_row(
+            {
+                "source_scope_id": "s2",
+                "display_path": "Site / B",
+                "collection": None,
+                "no_group_warning": False,
+                "access_mode": "manual",
+                "min_modified": {"value": "2022-01-01", "source": "connection", "own_value": None},
+            }
+        )
+        assert "since 2022-01-01 (default)" in inherited_html
+
+    def test_scopes_panel_toolbar_shows_the_folder_count_and_add_folders(self):
+        """`+ Add folders…` (§2.2) — the Scopes panel's entry point into the
+        connect wizard, ALWAYS rendered (unlike the old collapsed
+        "Scope collections" row, which vanished entirely at zero scopes)."""
         fs = dict(self._FILE_SOURCE)
         fs["scopes_total"] = 42
-        result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)
+        result = self._run("console.log(JSON.stringify({ html: _spScopesPanelHtml(row) }));", file_source=fs)
         html = result["html"]
-        assert "Scope collections" in html
-        assert "42 scopes" in html
-        assert "toggleSpScopesDrawer('sp-conn-1')" in html
-        assert 'id="ds-sp-scopes-drawer-sp-conn-1"' in html
-        # Nothing per-scope leaked into the initial render.
-        assert "ds-sp-scope-row" not in html
+        assert "42 folders" in html
+        assert "+ Add folders" in html
+        assert "openSpWizardForConnection('sp-conn-1')" in html
+        assert 'id="sp-scopes-body-sp-conn-1"' in html
+        # Nothing per-scope leaked into the initial (synchronous) render —
+        # the table itself is fetched on card expand.
+        assert "sp-scopes" not in html.replace('id="sp-scopes-body-sp-conn-1"', "")
 
     # -- SharePoint permissions snapshot (TCRD-296 gap #79) -----------------
 
@@ -2426,7 +2519,7 @@ console.log(JSON.stringify({{ html: _spScopeRowHtml("sp-conn-1", {json.dumps(sco
         that fetch fires — same posture as the scope-collections row above."""
         result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));")
         html = result["html"]
-        assert "SharePoint permissions" in html
+        assert "SharePoint says" in html
         assert 'id="ds-sp-acl-sp-conn-1"' in html
         assert "loading" in html
         assert "toggleSpAclSnapshotDrawer('sp-conn-1')" in html
@@ -2500,38 +2593,32 @@ console.log(JSON.stringify({{ html: _spAclSnapshotScopeRowHtml({json.dumps(scope
 
     # -- anonymization row (spec §9.2/§13.2): requested vs declared --------
 
-    def test_facts_html_has_no_anonymization_row_when_nothing_requested(self):
-        """No scope has ever been marked anonymize — the row must not
-        appear at all, not render as empty/zero."""
-        result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));")
-        assert "Anonymization" not in result["html"]
+    def test_anonymize_badge_is_a_dash_when_not_anonymized(self):
+        """The old standalone "Anonymization" row (a connection-wide
+        requested/declared count pair) retired — anonymization is now a
+        per-scope column in the Scopes table (`_spAnonymizeBadge`,
+        source-card redesign §2.2)."""
+        out = self._run("console.log(JSON.stringify({ html: _spAnonymizeBadge({ anonymize: false }) }));")
+        assert out["html"] == "&mdash;"
 
-    def test_facts_html_renders_requested_but_not_declared_as_warn(self):
-        fs = dict(self._FILE_SOURCE)
-        fs["anonymization"] = {"requested": ["col_a"], "declared": [], "pending": ["col_a"]}
-        result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)
-        html = result["html"]
-        assert "anonymization requested 1" in html
+    def test_anonymize_badge_warns_when_requested_but_not_declared(self):
+        out = self._run(
+            "console.log(JSON.stringify({ html: _spAnonymizeBadge({ anonymize: true, anonymization_declared: false }) }));"
+        )
+        html = out["html"]
+        assert "Requested" in html
         # Never claims "anonymized" for a scope nothing has declared yet.
-        assert "anonymized 1" not in html
+        assert "Anonymized" not in html
         assert "badge-warn" in html
 
-    def test_facts_html_renders_declared_as_ok(self):
-        fs = dict(self._FILE_SOURCE)
-        fs["anonymization"] = {"requested": ["col_a"], "declared": ["col_a"], "pending": []}
-        result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)
-        html = result["html"]
-        assert "anonymized 1" in html
-        assert "anonymization requested" not in html
+    def test_anonymize_badge_is_ok_once_declared(self):
+        out = self._run(
+            "console.log(JSON.stringify({ html: _spAnonymizeBadge({ anonymize: true, anonymization_declared: true }) }));"
+        )
+        html = out["html"]
+        assert "Anonymized" in html
+        assert "Requested" not in html
         assert "badge-env" in html
-
-    def test_facts_html_renders_both_declared_and_pending_together(self):
-        fs = dict(self._FILE_SOURCE)
-        fs["anonymization"] = {"requested": ["col_a", "col_b"], "declared": ["col_a"], "pending": ["col_b"]}
-        result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)
-        html = result["html"]
-        assert "anonymized 1" in html
-        assert "anonymization requested 1" in html
 
     # -- "Extract facts now" (the standalone sharepoint-facts-extraction pass) --
 
@@ -2553,16 +2640,17 @@ console.log(JSON.stringify({{ html: _spAclSnapshotScopeRowHtml({json.dumps(scope
         }
         return fs
 
-    def test_extract_facts_now_renders_next_to_run_extraction_now_with_its_help_text(self):
+    def test_run_a_facts_pass_renders_with_its_help_text(self):
+        """Renamed from "Extract facts now" to "Run a facts pass" (§3) —
+        its own panel now (`_spFactsPanelHtml`), not next to a crawl
+        trigger that itself moved to the head."""
         fs = self._in_agnes()
-        html = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)["html"]
-        assert "Extract facts now" in html
+        html = self._run("console.log(JSON.stringify({ html: _spFactsPanelHtml(row) }));", file_source=fs)["html"]
+        assert "Run a facts pass" in html
         assert 'id="ext-facts-btn-sp-conn-1"' in html
         assert "runSpFactsExtraction('sp-conn-1')" in html
-        assert "Runs over documents indexed so far; safe to repeat." in html
+        assert "runs over documents indexed so far" in html.lower()
         assert 'data-facts-ready="1"' in html
-        # Both verbs live on the same card block, in order: crawl first.
-        assert html.index("Run extraction now") < html.index("Extract facts now")
 
     def test_extract_facts_now_defaults_disabled_when_the_gate_is_missing(self):
         """Fail closed on an older/degraded cell shape (no `in_agnes` at
@@ -2597,6 +2685,23 @@ console.log(JSON.stringify({{ html: _spAclSnapshotScopeRowHtml({json.dumps(scope
         html = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)["html"]
         assert 'data-facts-ready="0"' in html
         assert "sharepoint.enabled" in html
+
+
+class TestNoPromptCallsRemain:
+    """Phase-1 non-negotiable: no `window.prompt()` remains in the
+    SharePoint card code paths (`mergeSpSplitSiblings`/`mapSpSiteGroup`
+    replaced by inline forms — source-card redesign §0, §2.7, §2.6)."""
+
+    def test_no_prompt_calls_remain(self):
+        script = read_admin_data_sources_source()
+        assert "window.prompt(" not in script
+        # The old functions themselves are gone — a stray comment mentioning
+        # them by name for historical context (why the new form replaced
+        # them) is fine; a live declaration is not.
+        assert "function mergeSpSplitSiblings(" not in script
+        assert "function mapSpSiteGroup(" not in script
+        assert "toggleSpMergeRow" in script
+        assert "toggleSpMapGroupsForm" in script
 
 
 class TestExtRenderCrawlScheduleAndFilter:
@@ -2701,14 +2806,14 @@ console.log(_sourceMenuItems({json.dumps(row)}));
         assert proc.returncode == 0, proc.stdout + proc.stderr
         return proc.stdout
 
+    # Source-card redesign §2.1/§4: the SharePoint overflow menu shrinks to
+    # four items — everything else now has a home in one of the six panels
+    # (Scopes' `+ Add folders…`, the head's `Run now ▾`, Facts/Access
+    # panels, Settings › Legacy tools / Credential).
     _SP_ONLY_ITEMS = [
-        "Manage scopes…",
+        "Rename…",
         "Test connection",
-        "Run extraction now",
-        "Consolidate collections…",
-        "Merge split parts back into this source…",
-        "Map site group (ACL)…",
-        "Update certificate…",
+        "Open fleet view",
         "Delete source",
     ]
     _KEBOOLA_ONLY_ITEMS = [
@@ -2725,16 +2830,18 @@ console.log(_sourceMenuItems({json.dumps(row)}));
             assert item in html, f"missing {item!r} from the SharePoint menu"
         for item in self._KEBOOLA_ONLY_ITEMS:
             assert item not in html, f"Keboola-only item {item!r} leaked into the SharePoint menu"
-        assert "runSpExtraction('sp-conn-1')" in html
+        # Verbs that moved OUT of the menu must not still be wired here.
+        assert "Manage scopes…" not in html
+        assert "runSpExtraction" not in html
+        assert "mergeSpSplitSiblings" not in html
+        assert "mapSpSiteGroup" not in html
         # The wrong "Test connection" (Keboola's storage-token verify) must
         # not be wired — the SharePoint-specific `testSpConn` is.
         assert "testSpConn('sp-conn-1')" in html
         assert "testConn('sp-conn-1')" not in html
-        assert "openSpWizardForConnection('sp-conn-1')" in html
-        assert "toggleSpCertRow('sp-conn-1')" in html
-        assert "toggleSpConsolidateRow('sp-conn-1')" in html
-        assert "mergeSpSplitSiblings('sp-conn-1')" in html
-        assert "mapSpSiteGroup('sp-conn-1')" in html
+        assert "openSpSettingsRename('sp-conn-1')" in html
+        assert 'href="/admin/extraction"' in html
+        assert "deleteConn('sp-conn-1')" in html
 
     def test_keboola_menu_is_unchanged_by_the_sharepoint_branch(self):
         html = self._run(
@@ -2756,15 +2863,55 @@ console.log(_sourceMenuItems({json.dumps(row)}));
 
 
 class TestMapSpSiteGroup:
-    """`mapSpSiteGroup(id)` (2026-09 fix) — maps ONE SharePoint site group
-    to Agnes group(s) in `config.acl_site_group_map`, read-modify-write
-    against the connection's CURRENT map (never a blind overwrite of the
-    whole thing, since the underlying `PATCH …/acl-site-group-map`
-    replaces wholesale)."""
+    """`toggleSpMapGroupsForm`/`saveSpMapGroups` (source-card redesign §2.6)
+    replace `mapSpSiteGroup`'s two `window.prompt()`s with an inline form —
+    one row per site group, an Agnes-group checkbox list per row, `Save`
+    PATCHes the WHOLE map in one call (`PATCH …/acl-site-group-map` always
+    replaces it wholesale, same contract as before)."""
 
     _extract_function = staticmethod(TestSharePointSourceCardRendering._extract_function)
 
-    def _run(self, *, current_map: dict, prompts: list, ok: bool = True, resp_body: dict | None = None) -> dict:
+    def test_no_window_prompt_is_used(self):
+        tpl = read_admin_data_sources_source()
+        for sig in ("async function toggleSpMapGroupsForm(connId) {", "async function saveSpMapGroups(connId) {"):
+            fn = self._extract_function(tpl, sig)
+            assert "window.prompt" not in fn
+
+    def test_map_group_row_html_pre_checks_the_current_selection(self):
+        import json
+        import subprocess
+        import tempfile
+        from pathlib import Path
+
+        tpl = read_admin_data_sources_source()
+        fns = "\n".join(
+            self._extract_function(tpl, sig)
+            for sig in ("function _esc(s) {", "function _spMapGroupRowHtml(name, selectedIds, groups) {")
+        )
+        script = f"""
+{fns}
+console.log(JSON.stringify({{ html: _spMapGroupRowHtml(
+  "Members", ["g1"], [{{id: "g1", name: "Finance"}}, {{id: "g2", name: "Legal"}}]
+) }}));
+"""
+        with tempfile.NamedTemporaryFile("w", suffix=".mjs", delete=False) as f:
+            f.write(script)
+            path = f.name
+        try:
+            proc = subprocess.run(["node", path], capture_output=True, text=True)
+        finally:
+            Path(path).unlink(missing_ok=True)
+        if proc.returncode == 127:
+            pytest.skip("node unavailable")
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        html = json.loads(proc.stdout)["html"]
+        assert "Members" in html
+        assert "Finance" in html
+        assert "Legal" in html
+        assert 'value="g1" checked' in html
+        assert 'value="g2" >' in html  # not checked
+
+    def _run_save(self, *, rows: list, ok: bool = True, resp_body: dict | None = None) -> dict:
         import json
         import subprocess
         import tempfile
@@ -2775,21 +2922,23 @@ class TestMapSpSiteGroup:
             self._extract_function(tpl, sig)
             for sig in (
                 "function detailMessage(body, fallback) {",
-                "async function mapSpSiteGroup(id) {",
+                "async function saveSpMapGroups(connId) {",
             )
+        )
+        rows_js = ",\n".join(
+            "{ dataset: { sitegroup: %s }, querySelectorAll: () => %s.map((v) => ({ value: v })) }"
+            % (json.dumps(r["sitegroup"]), json.dumps(r["checkedIds"]))
+            for r in rows
         )
         script = f"""
 {fns}
 
-let _connections = [{{"id": "c1", "source_type": "sharepoint", "config": {{"acl_site_group_map": {json.dumps(current_map)}}}}}];
-const prompts = {json.dumps(prompts)};
-let promptCalls = [];
-global.window = {{ prompt: (msg, dflt) => {{ promptCalls.push([msg, dflt]); const v = prompts.shift(); return v === undefined ? null : v; }} }};
 let toasts = [];
 function showToast(msg, ok) {{ toasts.push([msg, ok]); }}
 let loadCalls = 0;
 async function loadConnections() {{ loadCalls++; }}
-global.document = {{ getElementById: () => null }};
+const _rowsEl = {{ querySelectorAll: () => [{rows_js}] }};
+global.document = {{ getElementById: (id) => (id === "sp-mapgroups-rows-c1" ? _rowsEl : null) }};
 
 let fetched = null;
 global.fetch = async (url, opts) => {{
@@ -2798,13 +2947,11 @@ global.fetch = async (url, opts) => {{
 }};
 
 (async () => {{
-  await mapSpSiteGroup("c1");
+  await saveSpMapGroups("c1");
   console.log(JSON.stringify({{
     fetchedUrl: fetched && fetched.url,
     method: fetched && fetched.opts && fetched.opts.method,
     body: fetched && fetched.opts && fetched.opts.body ? JSON.parse(fetched.opts.body) : null,
-    promptCallCount: promptCalls.length,
-    secondPromptDefault: promptCalls.length > 1 ? promptCalls[1][1] : null,
     loadCalls,
     toasts,
   }}));
@@ -2822,34 +2969,30 @@ global.fetch = async (url, opts) => {{
         assert proc.returncode == 0, proc.stdout + proc.stderr
         return json.loads(proc.stdout)
 
-    def test_maps_a_new_site_group_preserving_the_others(self):
-        out = self._run(current_map={"Owners": ["grp-owners"]}, prompts=["Members", "grp-members, grp-extra"])
+    def test_save_builds_the_whole_map_from_checked_checkboxes(self):
+        out = self._run_save(
+            rows=[
+                {"sitegroup": "Owners", "checkedIds": ["grp-owners"]},
+                {"sitegroup": "Members", "checkedIds": ["grp-members", "grp-extra"]},
+            ]
+        )
         assert out["fetchedUrl"] == "/api/admin/sharepoint/connections/c1/acl-site-group-map"
         assert out["method"] == "PATCH"
         assert out["body"] == {"mapping": {"Owners": ["grp-owners"], "Members": ["grp-members", "grp-extra"]}}
         assert out["loadCalls"] == 1
 
-    def test_blank_group_ids_unmaps_the_entry(self):
-        out = self._run(current_map={"Owners": ["grp-owners"], "Members": ["grp-members"]}, prompts=["Members", ""])
+    def test_a_row_with_nothing_checked_unmaps_the_entry(self):
+        out = self._run_save(
+            rows=[
+                {"sitegroup": "Owners", "checkedIds": ["grp-owners"]},
+                {"sitegroup": "Members", "checkedIds": []},
+            ]
+        )
         assert out["body"] == {"mapping": {"Owners": ["grp-owners"]}}
 
-    def test_second_prompt_defaults_to_the_current_mapping(self):
-        out = self._run(current_map={"Members": ["grp-a", "grp-b"]}, prompts=["Members", "grp-a, grp-b"])
-        assert out["secondPromptDefault"] == "grp-a, grp-b"
-
-    def test_cancelling_the_site_group_prompt_makes_no_request(self):
-        out = self._run(current_map={}, prompts=[None])
-        assert out["fetchedUrl"] is None
-        assert out["promptCallCount"] == 1
-
-    def test_cancelling_the_group_ids_prompt_makes_no_request(self):
-        out = self._run(current_map={}, prompts=["Members", None])
-        assert out["fetchedUrl"] is None
-
     def test_server_error_shows_a_toast_and_does_not_reload(self):
-        out = self._run(
-            current_map={},
-            prompts=["Members", "grp-a"],
+        out = self._run_save(
+            rows=[{"sitegroup": "Members", "checkedIds": ["grp-a"]}],
             ok=False,
             resp_body={"detail": {"error": "invalid_group_id", "message": "unknown group"}},
         )
@@ -2886,6 +3029,8 @@ function _sharepointFactsHtml(row) {{ return ""; }}
 function _secretBadgeHtml(row) {{ return ""; }}
 function _masterTokenFactHtml(row) {{ return ""; }}
 function _chatToolsFactHtml(row) {{ return ""; }}
+function _spExtractionReady(row) {{ return true; }}
+function _spExtractionUnreadyReasonText(row) {{ return ""; }}
 const ICO_CHEVRON = "";
 const ICO_CARET = "";
 
@@ -2906,13 +3051,19 @@ console.log(_connectionCardHtml({json.dumps(row)}));
         return proc.stdout
 
     def test_present_and_wired_on_a_sharepoint_card(self):
+        """The primary action button changed from "Manage scopes" to
+        "Run now ▾" (source-card redesign §2.1) — `+ Add folders…`, in the
+        Scopes panel, is the new direct entry into the wizard."""
         html = self._run({"id": "sp-conn-1", "source_type": "sharepoint", "name": "Corp SharePoint"})
-        assert "Manage scopes" in html
-        assert "openSpWizardForConnection('sp-conn-1')" in html
+        assert "Run now" in html
+        assert "toggleSpRunNowPopover('sp-conn-1')" in html
+        assert 'id="sp-stop-btn-sp-conn-1"' in html
+        assert 'id="sp-cancel-btn-sp-conn-1"' in html
 
     def test_absent_on_a_keboola_card(self):
         html = self._run({"id": "kbc-conn-1", "source_type": "keboola", "name": "Corp Keboola"})
-        assert "Manage scopes" not in html
+        assert "Run now" not in html
+        assert 'id="sp-runnow-btn-kbc-conn-1"' not in html
 
 
 class TestOpenSpWizardForConnection:
@@ -3747,9 +3898,11 @@ class El {
             for sig in (
                 "function _esc(s) {",
                 "function _relAge(minutes) {",
-                "function _sharepointPipelineStripHtml(row) {",
+                "function _spHeadHtml(row) {",
+                "function _spExtractionReady(row) {",
+                "function _spRunNowPopoverHtml(row) {",
                 "function _pipelineStripHtml(row) {",
-                "function _sharepointHealth(fs) {",
+                "function _spStateChip(fs, status) {",
                 "function _sourceHealth(row) {",
                 "function _nextStepHtml(row) {",
                 "async function refreshSourcePipelines() {",
@@ -3977,7 +4130,7 @@ class TestSharePointShardPlanControl:
         # The legacy manual-split control is kept, reachable only via an
         # explicit deprecated link — never deleted, its own endpoints still
         # exist.
-        assert "Legacy: create N connections manually (deprecated)" in script
+        assert "Split into N connections (deprecated)" in script
         assert "toggleSpSplitRow" in script
 
 
@@ -4066,8 +4219,12 @@ class TestSharePointSplitControl:
         assert "toggleSpConsolidateRow" in script
         assert "previewSpConsolidate" in script
         assert "applySpConsolidate" in script
-        assert 'id="ds-sp-consolidate-row-${row.id}"' in script
-        assert 'id="ds-sp-consolidate-siblings-${row.id}"' in script
+        # This block now renders inside `_spSettingsPanelHtml` (Legacy
+        # tools, source-card redesign §2.7), which uses a local `id` const
+        # (`= row.id`) rather than `${row.id}` inline — same interpolated
+        # value, different literal source text.
+        assert 'id="ds-sp-consolidate-row-${id}"' in script
+        assert 'id="ds-sp-consolidate-siblings-${id}"' in script
         assert 'type="checkbox" id="ds-sp-consolidate-siblings-' in script
         assert "include_split_siblings" in script
         # The overflow-menu item opens the drawer, never the old prompt flow.

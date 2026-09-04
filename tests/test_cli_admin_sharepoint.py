@@ -2353,6 +2353,27 @@ class TestExtract:
         assert result.exit_code == 0, result.output
         assert "queued_count: 3" in result.output
 
+    def test_retry_empty_rides_the_payload_as_true(self):
+        """`--retry-empty` on `extract` (source-card redesign §8) — the same
+        key the `Run now` popover's checkbox sends, so REST × CLI × UI never
+        drift. The standalone `retry-empty` command is unaffected."""
+        with patch(
+            "cli.commands.admin_sharepoint.api_post", return_value=_resp(202, {"job_id": "e9", "status": "queued"})
+        ) as mock_post:
+            result = runner.invoke(app, ["admin", "sharepoint", "extract", "conn1", "--retry-empty"])
+        assert result.exit_code == 0, result.output
+        _, kwargs = mock_post.call_args
+        assert kwargs["json"] == {"retry_empty": True}
+
+    def test_retry_failed_and_retry_empty_combine_in_one_payload(self):
+        with patch(
+            "cli.commands.admin_sharepoint.api_post", return_value=_resp(202, {"job_id": "e10", "status": "queued"})
+        ) as mock_post:
+            result = runner.invoke(app, ["admin", "sharepoint", "extract", "conn1", "--retry-failed", "--retry-empty"])
+        assert result.exit_code == 0, result.output
+        _, kwargs = mock_post.call_args
+        assert kwargs["json"] == {"retry_failed": True, "retry_empty": True}
+
     def test_a_plain_trigger_prints_no_queued_count(self):
         with patch(
             "cli.commands.admin_sharepoint.api_post", return_value=_resp(202, {"job_id": "e8", "status": "queued"})
