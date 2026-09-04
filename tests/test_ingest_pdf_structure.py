@@ -13,7 +13,7 @@ import re
 
 import pytest
 
-from connectors.sharepoint.pdf_structure import (
+from src.ingest.pdf_structure import (
     PAGE_SEPARATOR,
     DocumentMarkdown,
     StructuredPage,

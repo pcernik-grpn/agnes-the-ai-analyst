@@ -612,8 +612,7 @@ def configured_max_output_tokens() -> int:
         # as unexplained `anonymize_failed` counts with nothing pointing at
         # the config that caused them.
         logger.warning(
-            "extraction.anonymization.llm.max_output_tokens=%r is outside [%d, %d]; "
-            "using the default %d instead",
+            "extraction.anonymization.llm.max_output_tokens=%r is outside [%d, %d]; using the default %d instead",
             raw,
             _MIN_OUTPUT_TOKENS,
             _MAX_OUTPUT_TOKENS,
@@ -652,7 +651,7 @@ def build_client(model: str, timeout_s: float) -> tuple[Any, str]:
     because "no credential" must fail the document, not empty it.
 
     **This is the shared ladder, and it stays model-transparent.** Scan OCR
-    (`connectors/sharepoint/scan_ocr.py`) and fact extraction
+    (`src/ingest/scan_ocr.py`) and fact extraction
     (`connectors/sharepoint/facts_extraction.py`) both delegate here and both
     rely on getting a client for the model THEY asked for — a vision model and
     `extraction.facts.model` respectively. The anonymization detector's

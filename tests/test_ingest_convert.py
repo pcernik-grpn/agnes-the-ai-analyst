@@ -1,4 +1,4 @@
-"""Tests for :mod:`connectors.sharepoint.convert`.
+"""Tests for :mod:`src.ingest.convert`.
 
 Every fixture is authored in-test rather than committed as a binary blob: a
 checked-in PDF/DOCX is unreviewable in a diff, and the exact bytes matter here
@@ -13,12 +13,13 @@ rather than skipped.
 from __future__ import annotations
 
 import sys
+import types
 import zipfile
 from pathlib import Path
 
 import pytest
 
-from connectors.sharepoint.convert import (
+from src.ingest.convert import (
     DEFAULT_MAX_CHARS,
     PAGE_BREAK,
     ConversionError,
@@ -380,19 +381,37 @@ def test_corrupt_pdf_raises_conversion_error_naming_the_file(tmp_path):
     assert excinfo.value.engine == "pypdfium2"
 
 
-def test_corrupt_office_file_raises_conversion_error_naming_the_file(tmp_path):
-    # A truncated OOXML package: the zip header is there, the archive is not.
+def test_corrupt_archive_format_raises_conversion_error_naming_the_file(tmp_path):
+    # A truncated EPUB package: the zip header is there, the archive is not.
     # markitdown surfaces this as its own FileConversionException wrapping a
     # zipfile.BadZipFile — one of many backend exception types this module
-    # deliberately funnels into ConversionError.
-    path = tmp_path / "broken.xlsx"
+    # deliberately funnels into ConversionError. EPUB rather than an office
+    # suffix on purpose: the OOXML archive guard would refuse a .docx/.xlsx
+    # before markitdown ever saw it, and this test is about the funnel.
+    path = tmp_path / "broken.epub"
     path.write_bytes(b"PK\x03\x04\x00\x00truncated archive")
 
     with pytest.raises(ConversionError) as excinfo:
-        convert_to_markdown(path, "application/vnd.openxmlformats-officedocument")
+        convert_to_markdown(path, "application/epub+zip")
 
-    assert excinfo.value.filename == "broken.xlsx"
+    assert excinfo.value.filename == "broken.epub"
     assert excinfo.value.engine == "markitdown"
+
+
+def test_office_file_that_is_not_an_archive_is_a_conversion_error(tmp_path):
+    """A ``.docx``/``.pptx``/``.xlsx`` is an OOXML package — a zip — or it is
+    not that file type at all. markitdown sniffs content and would read ASCII
+    bytes behind an office suffix as prose (in practice as UTF-16 mojibake),
+    silently indexing garbage; the converter refuses before it gets there."""
+    path = tmp_path / "notes.docx"
+    path.write_bytes(b"PK\x03\x04 this is not a zip archive at all")
+
+    with pytest.raises(ConversionError) as excinfo:
+        convert_to_markdown(path, "application/octet-stream")
+
+    assert not isinstance(excinfo.value, MissingConversionDependency)
+    assert excinfo.value.filename == "notes.docx"
+    assert "archive" in str(excinfo.value)
 
 
 def test_missing_file_raises_conversion_error(tmp_path):
@@ -442,7 +461,14 @@ def test_missing_backend_raises_a_typed_error_naming_the_extra(tmp_path, monkeyp
     # which is exactly what an uninstalled extra looks like.
     monkeypatch.setitem(sys.modules, module, None)
     path = tmp_path / name
-    path.write_bytes(b"irrelevant, the import fails first")
+    if name.endswith(".docx"):
+        # The OOXML archive guard runs before any engine is imported, so the
+        # office fixture has to be a zip for the dependency probe to be the
+        # thing that fails.
+        with zipfile.ZipFile(path, "w") as package:
+            package.writestr("[Content_Types].xml", "<Types/>")
+    else:
+        path.write_bytes(b"irrelevant, the import fails first")
 
     with pytest.raises(MissingConversionDependency) as excinfo:
         convert_to_markdown(path, mime)
@@ -454,15 +480,150 @@ def test_missing_backend_raises_a_typed_error_naming_the_extra(tmp_path, monkeyp
 
 def test_module_imports_without_the_extraction_extra(monkeypatch):
     """Import-time cost is zero: the backends are only imported on demand."""
-    monkeypatch.setitem(sys.modules, "markitdown", None)
-    monkeypatch.setitem(sys.modules, "pypdfium2", None)
-    monkeypatch.delitem(sys.modules, "connectors.sharepoint.convert", raising=False)
-
     import importlib
 
-    module = importlib.import_module("connectors.sharepoint.convert")
+    import src.ingest as ingest_package
+
+    monkeypatch.setitem(sys.modules, "markitdown", None)
+    monkeypatch.setitem(sys.modules, "pypdfium2", None)
+    # The re-import below rebinds the PACKAGE attribute to a second module
+    # object; ``sys.modules`` is restored by ``delitem`` but the attribute is
+    # not, and a later ``from src.ingest import convert`` would then patch a
+    # module nothing else in the process calls. Pin it so teardown restores it.
+    monkeypatch.setattr(ingest_package, "convert", ingest_package.convert, raising=False)
+    monkeypatch.delitem(sys.modules, "src.ingest.convert", raising=False)
+
+    module = importlib.import_module("src.ingest.convert")
 
     assert module.convert_to_markdown is not None
+
+
+# ------------------------------------------------------------ docling engine
+
+
+@pytest.fixture
+def fake_docling(monkeypatch):
+    """A stand-in for the ``[docling]`` extra.
+
+    The real one pulls torch and cannot be installed in the default test
+    environment; the ``rich-extras`` CI job covers it for real. What is under
+    test here is the ROUTING — which engine answers, and what happens when
+    Docling is present but fails — so the stand-in only has to look like
+    ``docling.document_converter.DocumentConverter`` from the call site's
+    side: ``.convert(path).document.export_to_markdown()``.
+
+    ``docling_capability`` is patched alongside: it is an import-spec probe,
+    and a synthetic module in ``sys.modules`` has no spec to find.
+    """
+    from src.ingest import convert
+
+    calls: list[Path] = []
+    state = {"raise": False, "markdown": "# From docling\n\nconverted by the stand-in"}
+
+    class _Document:
+        def export_to_markdown(self) -> str:
+            return state["markdown"]
+
+    class _Result:
+        document = _Document()
+
+    class DocumentConverter:
+        def convert(self, path):
+            calls.append(Path(path))
+            if state["raise"]:
+                raise RuntimeError("docling choked on purpose")
+            return _Result()
+
+    package = types.ModuleType("docling")
+    module = types.ModuleType("docling.document_converter")
+    module.DocumentConverter = DocumentConverter  # type: ignore[attr-defined]
+    package.document_converter = module  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "docling", package)
+    monkeypatch.setitem(sys.modules, "docling.document_converter", module)
+    monkeypatch.setattr(convert, "docling_capability", lambda: True)
+    return types.SimpleNamespace(calls=calls, state=state)
+
+
+def test_office_document_prefers_docling_when_installed(tmp_path, fake_docling):
+    """The rich image's whole point: layout-aware parsing takes precedence
+    over markitdown for office documents when the extra is there."""
+    path = _write_docx(tmp_path / "handbook.docx")
+
+    result = convert_to_markdown(path, "application/octet-stream")
+
+    assert result.engine == "docling"
+    assert "converted by the stand-in" in result.markdown
+    assert fake_docling.calls == [path]
+
+
+def test_docling_failure_falls_through_to_markitdown(tmp_path, fake_docling):
+    """Docling present but choking on THIS document is not a rejection:
+    markitdown gets the file next, exactly as the Collections extractor
+    always did when Docling failed."""
+    fake_docling.state["raise"] = True
+    path = _write_docx(tmp_path / "handbook.docx")
+
+    result = convert_to_markdown(path, "application/octet-stream")
+
+    assert result.engine == "markitdown"
+    assert "Agnes Handbook" in result.markdown
+
+
+def test_docling_failure_without_markitdown_blames_the_file_not_a_missing_extra(tmp_path, fake_docling, monkeypatch):
+    """On a rich image built without ``[extraction]`` a document Docling
+    cannot read has NO second reader — but that is the file's problem, and
+    ``MissingConversionDependency`` would send an operator to install an extra
+    for a document that would still fail."""
+    fake_docling.state["raise"] = True
+    monkeypatch.setitem(sys.modules, "markitdown", None)
+    path = _write_docx(tmp_path / "handbook.docx")
+
+    with pytest.raises(ConversionError) as excinfo:
+        convert_to_markdown(path, "application/octet-stream")
+
+    assert not isinstance(excinfo.value, MissingConversionDependency)
+    assert excinfo.value.engine == "docling"
+    assert excinfo.value.filename == "handbook.docx"
+
+
+def test_pdf_never_routes_to_docling(tmp_path, fake_docling):
+    """Owner decision 2026-08-31 — one PDF pipeline, no dual modes: the
+    structure pass is the PDF route on every image, Docling or not."""
+    path = tmp_path / "hello.pdf"
+    path.write_bytes(_build_pdf([[("Hello Agnes", 72, 700), ("Second line", 72, 660)]]))
+
+    result = convert_to_markdown(path, "application/pdf")
+
+    assert result.engine == "pypdfium2"
+    assert fake_docling.calls == []
+
+
+def test_passthrough_never_routes_to_docling(tmp_path, fake_docling):
+    path = tmp_path / "notes.md"
+    path.write_text("# already markdown\n", encoding="utf-8")
+
+    result = convert_to_markdown(path, "text/markdown")
+
+    assert result.engine == "passthrough"
+    assert fake_docling.calls == []
+
+
+# ------------------------------------------------------------- suffix hint
+
+
+def test_suffix_hint_routes_a_file_stored_without_its_extension(tmp_path):
+    """Collections store an upload as ``<sha256><ext>`` and keep the declared
+    type as a column; a caller that knows the type better than the storage
+    name says so, and routing follows the hint rather than the path."""
+    blob = tmp_path / "3f2a9c0e"
+    blob.write_text("# stored under a hash\n\nbody", encoding="utf-8")
+
+    assert convert_to_markdown(blob, "application/octet-stream", suffix=".md").engine == "passthrough"
+
+    office = _write_docx(tmp_path / "7b1d")
+    result = convert_to_markdown(office, "application/octet-stream", suffix=".docx")
+    assert result.engine == "markitdown"
+    assert "Agnes Handbook" in result.markdown
 
 
 # --------------------------------------------------------- licence invariant
@@ -478,7 +639,7 @@ _AGPL_MODULES = {"fitz", "pymupdf", "pymupdf4llm", "frontend"}
 def test_no_agpl_dependency_is_imported_by_the_converter():
     import ast
 
-    source = Path(__file__).with_name("convert.py").read_text(encoding="utf-8")
+    source = (Path(__file__).resolve().parents[1] / "src" / "ingest" / "convert.py").read_text(encoding="utf-8")
     imported: set[str] = set()
     for node in ast.walk(ast.parse(source)):
         if isinstance(node, ast.Import):
@@ -497,7 +658,7 @@ def test_structure_pass_failure_raises_conversion_error(tmp_path, monkeypatch):
     convertible: that surfaces as a ``ConversionError`` naming the file, which
     the crawler counts in ``convert_failed`` and walks past — never a silent
     second attempt through a parallel plain-text implementation."""
-    from connectors.sharepoint import pdf_structure
+    from src.ingest import pdf_structure
 
     def _boom(path, max_pages=None):
         raise RuntimeError("structure pass broken on purpose")
