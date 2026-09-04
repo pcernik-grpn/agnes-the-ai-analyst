@@ -388,6 +388,23 @@ class FactsIngestRunsPgRepository:
         usage exactly once (de-duplicated in Python, since one JSON row can
         match several of a key's own corpus ids).
 
+        This deliberate multi-key attribution is real and supported — a
+        SharePoint bulk-add / consolidation can point more than one
+        connection's scope at the SAME collection (see
+        ``app/api/admin_sharepoint.py::_collection_still_referenced``) — so
+        each key's own ``estimated_cost_usd``/``runs_with_usage`` here is
+        an honest "what did THIS connection's collections see", not a
+        partition of instance spend; a caller SUMMING several keys'
+        ``estimated_cost_usd`` together would double (or N-times) count a
+        shared run. Each key's ``runs`` list — ``[{id, estimated_cost_usd},
+        ...]``, one entry per contributing run — exists exactly so a caller
+        that needs a page-wide TOTAL can de-duplicate by run id itself
+        (count a run once no matter how many keys' lists it appears in)
+        rather than summing the per-key aggregates directly. See
+        ``app/api/admin_extraction.py::fleet_extraction_runs`` for the
+        de-duplicated total and its per-row ``cost_shared``/
+        ``cost_shared_with`` markers.
+
         Priced through :mod:`src.llm_pricing` (``cost_usd`` — the SAME
         model-aware, cache-aware price table ``GET /api/admin/telemetry/
         chat-cost`` uses), NOT the sampled rate card :func:`_price_run_usd`
@@ -417,6 +434,10 @@ class FactsIngestRunsPgRepository:
                 "models": [],
                 "priced_runs": 0,
                 "estimated_cost_usd": None,
+                # One entry per contributing run — see this method's own
+                # docstring for why a de-duplicating caller needs run ids,
+                # not just this key's own aggregate.
+                "runs": [],
             }
             for key in keys
         }
@@ -429,7 +450,7 @@ class FactsIngestRunsPgRepository:
         with self._engine.connect() as conn:
             rows = conn.execute(
                 sa.text(
-                    "SELECT corpus_ids, llm_usage FROM facts_ingest_runs "
+                    "SELECT id, corpus_ids, llm_usage FROM facts_ingest_runs "
                     "WHERE llm_usage IS NOT NULL AND EXISTS ("
                     "  SELECT 1 FROM jsonb_array_elements_text(corpus_ids) AS cid "
                     "  WHERE cid = ANY(:all_ids)"
@@ -441,7 +462,7 @@ class FactsIngestRunsPgRepository:
         models_seen: Dict[str, set] = {key: set() for key in keys}
         cost_accum: Dict[str, float] = {key: 0.0 for key in keys}
 
-        for raw_corpus_ids, raw_usage in rows:
+        for run_id, raw_corpus_ids, raw_usage in rows:
             corpus_ids = (
                 raw_corpus_ids
                 if isinstance(raw_corpus_ids, list)
@@ -454,6 +475,16 @@ class FactsIngestRunsPgRepository:
             )
             if not usage:
                 continue
+            models = usage.get("models") or []
+            run_cost: Optional[float] = None
+            if len(models) == 1:
+                run_cost = cost_usd(
+                    model=models[0],
+                    input_tokens=usage.get("input_tokens") or 0,
+                    output_tokens=usage.get("output_tokens") or 0,
+                    cache_read_tokens=usage.get("cache_read_input_tokens") or 0,
+                    cache_creation_tokens=usage.get("cache_creation_input_tokens") or 0,
+                )
             run_corpus_ids = {str(c) for c in corpus_ids}
             for key in keys:
                 if not (run_corpus_ids & id_sets[key]):
@@ -469,18 +500,11 @@ class FactsIngestRunsPgRepository:
                 ):
                     totals[field] += usage.get(field) or 0
                 totals["wall_seconds"] += usage.get("wall_seconds") or 0
-                models = usage.get("models") or []
                 models_seen[key].update(models)
-                if len(models) == 1:
-                    cost = cost_usd(
-                        model=models[0],
-                        input_tokens=usage.get("input_tokens") or 0,
-                        output_tokens=usage.get("output_tokens") or 0,
-                        cache_read_tokens=usage.get("cache_read_input_tokens") or 0,
-                        cache_creation_tokens=usage.get("cache_creation_input_tokens") or 0,
-                    )
+                totals["runs"].append({"id": str(run_id), "estimated_cost_usd": run_cost})
+                if run_cost is not None:
                     totals["priced_runs"] += 1
-                    cost_accum[key] += cost
+                    cost_accum[key] += run_cost
 
         for key in keys:
             out[key]["wall_seconds"] = round(out[key]["wall_seconds"], 3)

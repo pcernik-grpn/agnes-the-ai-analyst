@@ -2141,11 +2141,22 @@ query keyed by each connection's scope collections. `cost_status` is
 `"no_usage"` (nothing recorded anywhere — `estimated_cost_usd: null`, never
 a fabricated `0`), `"unpriced"` (tokens known, no single named model to
 honestly price — also `null`) or `"priced"` (a real figure); `cost_models`
-names what a `"priced"` figure was actually priced at. The top-level
-`llm_usage_totals` is the SAME instance-wide cumulative rollup `GET
-/api/facts/ingest-runs` already returns — every `facts_ingest_runs` row this
-instance has EVER persisted, not scoped to the page's own rows or `active`/
-`all` filter, rendered as its own distinctly-labelled summary tile.
+names what a `"priced"` figure was actually priced at. A SharePoint
+bulk-add's shared-collection option, or the sibling connections a site
+split creates, can legitimately route more than one connection's scope at
+the SAME collection — a row's own figure stays a FULL, un-split
+attribution in that case (never a fabricated fractional split), marked by
+`cost_shared`/`cost_shared_with` (the other connection name(s) sharing at
+least one contributing `facts_ingest_runs` run) so that is never left
+implicit. `totals.estimated_cost_usd` is NOT the sum of the rows' own
+`estimated_cost_usd` — that would double-count a shared run — it sums each
+rendered row's own crawl-run cost (never shared between connections) plus
+the ledger cost de-duplicated by run id exactly once across every rendered
+row, with `totals.cost_note` stating this in the response itself. The
+top-level `llm_usage_totals` is the SAME instance-wide cumulative rollup
+`GET /api/facts/ingest-runs` already returns — every `facts_ingest_runs`
+row this instance has EVER persisted, not scoped to the page's own rows or
+`active`/`all` filter, rendered as its own distinctly-labelled summary tile.
 
 The response also carries a top-level `jobs` block — `{kind: {queued,
 running}}` for `corpus-extraction` and `sharepoint-facts-extraction`, read

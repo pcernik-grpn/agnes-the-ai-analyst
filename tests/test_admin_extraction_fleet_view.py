@@ -28,6 +28,7 @@ _SIGNATURES = (
     "function fmtRate(rate) {",
     "function fmtCost(usd, status) {",
     "function costTitle(status, models) {",
+    "function sharedCostBadgeHtml(row) {",
     "function fmtErrorCell(run) {",
     "function fmtEta(seconds) {",
     "function factsThroughputNote(facts) {",
@@ -253,6 +254,86 @@ def test_row_cost_cell_shows_a_dash_not_a_fabricated_zero_when_nothing_is_record
     html = _run_row_js(row)
     assert "$0.00" not in html
     assert "—" in html
+
+
+# ---------------------------------------------------------------------------
+# Shared-collection cost marker (double-count fix) — a row whose own cost
+# includes a run also attributed to another connection (a shared
+# collection) must visibly say so, never rely on the fleet total's silent
+# de-duplication alone.
+# ---------------------------------------------------------------------------
+
+
+def test_shared_cost_badge_is_absent_when_not_shared():
+    out = _run_node('console.log(JSON.stringify({ html: sharedCostBadgeHtml({ cost_shared: false }) }));')
+    assert out["html"] == ""
+
+
+def test_shared_cost_badge_names_the_other_connection():
+    out = _run_node(
+        'console.log(JSON.stringify({ html: sharedCostBadgeHtml('
+        '{ cost_shared: true, cost_shared_with: ["Legal SharePoint"] }'
+        ') }));',
+        extra_state="""
+class FakeEl {
+  constructor() { this._html = ""; this._text = ""; this.className = ""; }
+  set textContent(v) { this._text = v == null ? "" : String(v); }
+  get textContent() { return this._text; }
+  get innerHTML() {
+    if (this._html) return this._html;
+    return this._text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
+  set innerHTML(v) { this._html = v; }
+}
+const document = { createElement: () => new FakeEl() };
+""",
+    )
+    assert "shared" in out["html"]
+    assert "Legal SharePoint" in out["html"]
+
+
+def test_shared_cost_badge_falls_back_to_a_generic_note_with_no_names():
+    out = _run_node(
+        'console.log(JSON.stringify({ html: sharedCostBadgeHtml({ cost_shared: true, cost_shared_with: [] }) }));',
+        extra_state="""
+class FakeEl {
+  constructor() { this._html = ""; this._text = ""; this.className = ""; }
+  set textContent(v) { this._text = v == null ? "" : String(v); }
+  get textContent() { return this._text; }
+  get innerHTML() {
+    if (this._html) return this._html;
+    return this._text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
+  set innerHTML(v) { this._html = v; }
+}
+const document = { createElement: () => new FakeEl() };
+""",
+    )
+    assert "shared" in out["html"]
+    assert "another connection" in out["html"]
+
+
+def test_row_cost_cell_shows_the_shared_badge_when_the_row_is_flagged():
+    row = json.loads(json.dumps(_ROW))
+    row["estimated_cost_usd"] = 4.5
+    row["cost_status"] = "priced"
+    row["cost_models"] = ["claude-haiku-4-5"]
+    row["token_totals"] = {"input_tokens": 1000, "output_tokens": 200}
+    row["cost_shared"] = True
+    row["cost_shared_with"] = ["Legal SharePoint (part 2)"]
+    html = _run_row_js(row)
+    assert "$4.5000" in html
+    assert "Legal SharePoint (part 2)" in html
+
+
+def test_row_cost_cell_has_no_shared_badge_when_the_row_is_not_flagged():
+    row = json.loads(json.dumps(_ROW))
+    row["estimated_cost_usd"] = 4.5
+    row["cost_status"] = "priced"
+    row["cost_shared"] = False
+    row["cost_shared_with"] = []
+    html = _run_row_js(row)
+    assert "ext-cost-shared" not in html
 
 
 def test_files_cell_shows_no_age_filter_note_when_nothing_was_filtered():

@@ -511,3 +511,52 @@ def test_llm_usage_rollup_by_corpus_ids_prices_via_src_llm_pricing_not_a_hand_ro
 def test_llm_usage_rollup_by_corpus_ids_empty_map_short_circuits_without_a_query(pg_engine, monkeypatch):
     repo = _make_repo(pg_engine, monkeypatch)
     assert repo.llm_usage_rollup_by_corpus_ids({}) == {}
+
+
+# ---------------------------------------------------------------------------
+# `runs` — per-run breakdown so a caller can de-duplicate a page-wide TOTAL
+# across keys that share a collection (fleet cost double-count fix).
+# ---------------------------------------------------------------------------
+
+
+def test_llm_usage_rollup_by_corpus_ids_runs_list_names_each_contributing_run(pg_engine, monkeypatch):
+    repo = _make_repo(pg_engine, monkeypatch)
+    run_id = _create(
+        repo,
+        corpus_ids=["col_a"],
+        llm_usage={"input_tokens": 1000, "output_tokens": 200, "models": ["claude-haiku-4-5"]},
+    )
+
+    out = repo.llm_usage_rollup_by_corpus_ids({"conn_a": ["col_a"]})
+    assert [r["id"] for r in out["conn_a"]["runs"]] == [run_id]
+    assert out["conn_a"]["runs"][0]["estimated_cost_usd"] is not None
+    assert out["conn_a"]["runs"][0]["estimated_cost_usd"] > 0
+
+
+def test_llm_usage_rollup_by_corpus_ids_runs_list_carries_none_cost_for_an_unpriceable_run(pg_engine, monkeypatch):
+    repo = _make_repo(pg_engine, monkeypatch)
+    run_id = _create(repo, corpus_ids=["col_a"], llm_usage={"input_tokens": 1000, "output_tokens": 100})
+
+    out = repo.llm_usage_rollup_by_corpus_ids({"conn_a": ["col_a"]})
+    assert out["conn_a"]["runs"] == [{"id": run_id, "estimated_cost_usd": None}]
+
+
+def test_llm_usage_rollup_by_corpus_ids_a_run_shared_by_two_keys_appears_in_both_runs_lists_with_the_same_id(
+    pg_engine, monkeypatch
+):
+    """The exact shape a de-duplicating caller relies on: a run attributed
+    to two connections (a shared collection) shows up in BOTH keys' `runs`
+    lists, carrying the SAME id and the SAME priced cost — so summing by
+    unique id across keys counts it once, while each key's own aggregate
+    still honestly reflects full attribution."""
+    repo = _make_repo(pg_engine, monkeypatch)
+    run_id = _create(
+        repo,
+        corpus_ids=["col_shared"],
+        llm_usage={"input_tokens": 1000, "output_tokens": 200, "models": ["claude-haiku-4-5"]},
+    )
+
+    out = repo.llm_usage_rollup_by_corpus_ids({"conn_a": ["col_shared"], "conn_b": ["col_shared"]})
+    assert [r["id"] for r in out["conn_a"]["runs"]] == [run_id]
+    assert [r["id"] for r in out["conn_b"]["runs"]] == [run_id]
+    assert out["conn_a"]["runs"][0]["estimated_cost_usd"] == out["conn_b"]["runs"][0]["estimated_cost_usd"]

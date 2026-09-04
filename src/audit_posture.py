@@ -899,9 +899,21 @@ READ_POSTURE: dict[str, str] = {
     ),
     # The fleet dashboard's own poll (`/admin/extraction`, 5s while any run
     # is active) — one row per connection of the SAME run counters A1
-    # already exempts, plus a derived rate and a derived "stuck" flag. Same
-    # noise class as A1: nothing here is document content, a secret, or
-    # another user's data.
+    # already exempts, plus a derived rate, a derived "stuck" flag, and
+    # (cost-truth fix) each connection's own attributed LLM spend/token
+    # figures plus an instance-wide cumulative rollup. Still exempt, and
+    # deliberately NOT its sibling `GET /api/admin/telemetry/chat-cost`
+    # (cataloged `usage.chat_cost` — "measured chat token/cost breakdown
+    # read ACROSS USERS"): that route ties spend to an identifiable person
+    # (`user_email`/`session_id` per row — an admin cross-user read) via an
+    # on-demand query, which is exactly the "another user's data" category
+    # that always earns an action. This route's spend figures are scoped
+    # to a CONNECTION (a data source), never a person — no document
+    # content, no secret, no user identity — and it stays a passively-open
+    # dashboard's poll every few seconds, where cataloging would flood the
+    # audit log for a repaint rather than an interaction. Revisit this
+    # posture if a figure here is ever tied back to a specific person
+    # rather than a data source.
     "GET /api/admin/sharepoint/extraction/runs": "exempt:noise",
     # -- app.api.admin_sharepoint --
     "GET /api/admin/sharepoint/connections/{connection_id}/certificate": "sharepoint_connection.certificate_read",

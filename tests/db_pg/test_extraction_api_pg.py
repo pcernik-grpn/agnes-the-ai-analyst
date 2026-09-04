@@ -751,6 +751,128 @@ def test_fleet_row_cost_sums_crawl_run_and_facts_ingest_without_double_counting(
     assert row["cost_status"] == "priced"
 
 
+def test_fleet_total_de_duplicates_a_run_shared_by_two_connections_own_collections(
+    tmp_path, monkeypatch, pg_engine
+):
+    """The exact configuration the whole cost-truth fix came from: a site
+    split into siblings (`POST .../split/apply`) — or a bulk-add's shared-
+    collection option — can legitimately route more than one connection's
+    scope at the SAME collection. A `facts_ingest_runs` run touching that
+    collection is honestly attributed in FULL to both connections' own
+    rows (neither row understates what it can see), but the fleet-wide
+    TOTAL must count that run's cost exactly once, not once per connection
+    that shares it — and both rows must say, on screen, that their figure
+    is shared."""
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_a = _connection(client, token, name="sp-shared-a")
+    conn_b = _connection(client, token, name="sp-shared-b")
+
+    from src.repositories import facts_ingest_runs_repo, source_connections_repo
+
+    source_connections_repo().update(
+        conn_a, config={"scopes": [{"source_scope_id": "s1", "collection_id": "col_shared_ab"}]}
+    )
+    source_connections_repo().update(
+        conn_b, config={"scopes": [{"source_scope_id": "s2", "collection_id": "col_shared_ab"}]}
+    )
+
+    facts_ingest_runs_repo().create(
+        corpus_ids=["col_shared_ab"],
+        caller="scheduler@system.local",
+        documents_seen=500,
+        claims_written=10,
+        claims_rejected=[],
+        deferred=[],
+        subjects_created=0,
+        subjects_deleted=0,
+        review_items=[],
+        llm_usage={"input_tokens": 1_000_000, "output_tokens": 200_000, "models": ["claude-haiku-4-5"]},
+    )
+
+    body = client.get(f"{FLEET_URL}?all=1", headers=_auth(token)).json()
+    by_id = {r["connection_id"]: r for r in body["connections"]}
+    row_a, row_b = by_id[conn_a], by_id[conn_b]
+
+    import pytest
+
+    from src.llm_pricing import cost_usd
+
+    expected_run_cost = cost_usd(model="claude-haiku-4-5", input_tokens=1_000_000, output_tokens=200_000)
+
+    # BOTH rows show the full, un-split figure — neither understates what
+    # its own connection's collections can see.
+    assert row_a["estimated_cost_usd"] == pytest.approx(expected_run_cost, abs=1e-4)
+    assert row_b["estimated_cost_usd"] == pytest.approx(expected_run_cost, abs=1e-4)
+
+    # Both are visibly marked shared, naming the OTHER connection.
+    assert row_a["cost_shared"] is True
+    assert row_b["cost_shared"] is True
+    assert row_a["cost_shared_with"] == ["sp-shared-b"]
+    assert row_b["cost_shared_with"] == ["sp-shared-a"]
+
+    # The page total counts the shared run's cost ONCE, not twice — the
+    # double-count this fix closes.
+    assert body["totals"]["estimated_cost_usd"] == pytest.approx(expected_run_cost, abs=1e-4)
+    assert body["totals"]["cost_note"]
+
+
+def test_fleet_total_does_not_deduplicate_two_genuinely_different_runs(tmp_path, monkeypatch, pg_engine):
+    """A sibling proof for the de-duplication test above: two connections
+    with their OWN, non-overlapping collections and their OWN separate
+    ingest runs must still sum normally — de-duplication must never
+    collapse two genuinely different runs into one."""
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_a = _connection(client, token, name="sp-distinct-a")
+    conn_b = _connection(client, token, name="sp-distinct-b")
+
+    from src.repositories import facts_ingest_runs_repo, source_connections_repo
+
+    source_connections_repo().update(
+        conn_a, config={"scopes": [{"source_scope_id": "s1", "collection_id": "col_distinct_a"}]}
+    )
+    source_connections_repo().update(
+        conn_b, config={"scopes": [{"source_scope_id": "s2", "collection_id": "col_distinct_b"}]}
+    )
+    facts_ingest_runs_repo().create(
+        corpus_ids=["col_distinct_a"],
+        caller="scheduler@system.local",
+        documents_seen=10,
+        claims_written=0,
+        claims_rejected=[],
+        deferred=[],
+        subjects_created=0,
+        subjects_deleted=0,
+        review_items=[],
+        llm_usage={"input_tokens": 1000, "output_tokens": 100, "models": ["claude-haiku-4-5"]},
+    )
+    facts_ingest_runs_repo().create(
+        corpus_ids=["col_distinct_b"],
+        caller="scheduler@system.local",
+        documents_seen=10,
+        claims_written=0,
+        claims_rejected=[],
+        deferred=[],
+        subjects_created=0,
+        subjects_deleted=0,
+        review_items=[],
+        llm_usage={"input_tokens": 2000, "output_tokens": 200, "models": ["claude-haiku-4-5"]},
+    )
+
+    body = client.get(f"{FLEET_URL}?all=1", headers=_auth(token)).json()
+    by_id = {r["connection_id"]: r for r in body["connections"]}
+    assert by_id[conn_a]["cost_shared"] is False
+    assert by_id[conn_b]["cost_shared"] is False
+
+    import pytest
+
+    from src.llm_pricing import cost_usd
+
+    expected_total = cost_usd(model="claude-haiku-4-5", input_tokens=1000, output_tokens=100) + cost_usd(
+        model="claude-haiku-4-5", input_tokens=2000, output_tokens=200
+    )
+    assert body["totals"]["estimated_cost_usd"] == pytest.approx(expected_total, abs=1e-4)
+
+
 def test_fleet_response_carries_the_instance_wide_cumulative_llm_usage_totals(tmp_path, monkeypatch, pg_engine):
     """The SAME cumulative rollup GET /api/facts/ingest-runs already exposes
     (`llm_usage_totals`) must also ride on the fleet response, so the

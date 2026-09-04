@@ -141,8 +141,16 @@
     <div class="label">Stuck?</div>
     <div class="value" id="ext-stat-stuck">—</div>
   </div>
-  <div class="ext-card">
-    <div class="label">Est. cost (this view)</div>
+  {# Shared-collection double-count fix — the tile's own tooltip is set
+     dynamically from `totals.cost_note` (admin_extraction.js's
+     `renderTable`), which states plainly that this sums each row's own
+     crawl-run cost plus a run-id-de-duplicated slice of the
+     facts_ingest_runs ledger, NOT the sum of the rows' own
+     `estimated_cost_usd` figures (those are each row's full, un-split
+     attribution and would double-count a collection shared across
+     connections — see the affected rows' own "shared" badge). #}
+  <div class="ext-card" id="ext-card-cost">
+    <div class="label">Est. cost (this view, de-duplicated)</div>
     <div class="value" id="ext-stat-cost">—</div>
   </div>
   {# Cost-truth fix — the SAME instance-wide cumulative rollup GET
