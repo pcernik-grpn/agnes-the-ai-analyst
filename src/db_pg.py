@@ -889,3 +889,48 @@ def rebuild_lease() -> Iterator[None]:
             yield
         finally:
             conn.execute(sa.text("SELECT pg_advisory_unlock(:key)"), {"key": _REBUILD_LEASE_ID})
+
+
+#: Session-scoped PG advisory lock id for the knowledge-packaging worker job
+#: handler — "AGNV" packed as an int, distinct from every lease id above.
+_KNOWLEDGE_PACKAGING_LEASE_ID = 0x41474E56
+
+
+@contextlib.contextmanager
+def knowledge_packaging_lease() -> Iterator[bool]:
+    """Non-blocking, session-scoped Postgres advisory lock guarding the
+    ``knowledge-packaging`` worker job handler (TCRD-296 synthesis C.15).
+
+    Belt-and-braces on top of the primary safeguard, which is the job
+    queue's own idempotency-keyed enqueue (``jobs_repo().enqueue(...,
+    idempotency_key="knowledge-packaging")`` — see
+    ``app/api/admin.py::run_knowledge_packaging``): that dedupe already
+    prevents a SECOND ``knowledge-packaging`` job row from ever being
+    queued while one is ``'queued'``/``'running'``. This lock instead
+    guards the narrower gap dedup doesn't cover — e.g. a stray manual
+    enqueue via ``POST /api/jobs`` (no idempotency key required there), or
+    two worker replicas' lane slots racing to claim two DIFFERENT job rows
+    that both ended up runnable. ``pg_try_advisory_lock`` (non-blocking, not
+    ``pg_advisory_lock``): a second concurrent handler should skip
+    immediately and let the first run finish, not queue up behind it and
+    then redo work the first run already covers.
+
+    Yields ``True`` when the lock was acquired (caller should run its
+    packaging pass) or ``False`` when another run already holds it (caller
+    should skip, not wait). No-op (always yields ``True``) on the DuckDB
+    backend — DuckDB app-state deployments are single-process already
+    (Task 2's startup guard), so there is no second process to race.
+    """
+    if not _lease_use_pg():
+        yield True
+        return
+    engine = get_engine()
+    with engine.connect() as conn:
+        acquired = bool(
+            conn.execute(sa.text("SELECT pg_try_advisory_lock(:key)"), {"key": _KNOWLEDGE_PACKAGING_LEASE_ID}).scalar()
+        )
+        try:
+            yield acquired
+        finally:
+            if acquired:
+                conn.execute(sa.text("SELECT pg_advisory_unlock(:key)"), {"key": _KNOWLEDGE_PACKAGING_LEASE_ID})

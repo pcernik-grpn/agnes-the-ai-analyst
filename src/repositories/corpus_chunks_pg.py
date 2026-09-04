@@ -137,6 +137,46 @@ class CorpusChunksPgRepository:
             )
         return [dict(r) for r in rows]
 
+    def list_for_corpus_batch(
+        self, corpus_id: str, *, after_id: Optional[str] = None, limit: int
+    ) -> List[Dict[str, Any]]:
+        """One bounded, keyset-paginated page of a corpus's chunks, ordered
+        by ``id`` ascending — the PG twin of
+        ``CorpusChunksRepository.list_for_corpus_batch``. See that
+        docstring for the full contract (keyset pagination via
+        ``after_id``, the memory-bound rationale, TCRD-296 synthesis C.15).
+        """
+        with self._engine.connect() as conn:
+            if after_id is None:
+                rows = (
+                    conn.execute(
+                        sa.text(
+                            "SELECT id, corpus_id, file_id, ordinal, text, embedding, "
+                            "       section_path, page, bbox, metadata, created_at "
+                            "FROM corpus_chunks WHERE corpus_id = :corpus_id "
+                            "ORDER BY id LIMIT :limit"
+                        ),
+                        {"corpus_id": corpus_id, "limit": limit},
+                    )
+                    .mappings()
+                    .all()
+                )
+            else:
+                rows = (
+                    conn.execute(
+                        sa.text(
+                            "SELECT id, corpus_id, file_id, ordinal, text, embedding, "
+                            "       section_path, page, bbox, metadata, created_at "
+                            "FROM corpus_chunks WHERE corpus_id = :corpus_id AND id > :after_id "
+                            "ORDER BY id LIMIT :limit"
+                        ),
+                        {"corpus_id": corpus_id, "after_id": after_id, "limit": limit},
+                    )
+                    .mappings()
+                    .all()
+                )
+        return [dict(r) for r in rows]
+
     def list_for_corpora(
         self,
         corpus_ids: List[str],

@@ -467,46 +467,54 @@ class TestRunCorporateMemory:
 
 
 class TestRunKnowledgePackaging:
-    """POST /api/admin/run-knowledge-packaging — scheduler-driven rebuild of
-    per-collection knowledge.duckdb artifacts (K3, #798). Mirrors
-    run_corporate_memory's audit + error posture exactly."""
+    """POST /api/admin/run-knowledge-packaging — TCRD-296 synthesis C.15: a
+    thin enqueue of the ``knowledge-packaging`` worker job (K3, #798), not a
+    synchronous run. Handler behavior itself is covered in
+    ``tests/test_worker_kinds.py::TestKnowledgePackagingHandler`` and
+    ``tests/test_knowledge_packaging.py``."""
 
-    def test_admin_can_trigger_knowledge_packaging(self, seeded_app):
+    def test_admin_can_enqueue_knowledge_packaging(self, seeded_app):
         c = seeded_app["client"]
         token = seeded_app["admin_token"]
-        fake_summary = {
-            "built": ["col_a"],
-            "skipped": ["col_b"],
-            "pruned": [],
-            "errors": [],
-        }
-        with patch(
-            "src.knowledge_packaging.run_packaging_pass",
-            return_value=fake_summary,
-        ) as m:
-            resp = c.post("/api/admin/run-knowledge-packaging", headers=_auth(token))
-        assert resp.status_code == 200, resp.text
+        resp = c.post("/api/admin/run-knowledge-packaging", headers=_auth(token))
+        assert resp.status_code == 202, resp.text
         body = resp.json()
-        assert body["ok"] is True
-        assert body["details"] == fake_summary
-        m.assert_called_once()
+        assert body["status"] == "queued"
+        assert body["job_id"]
 
-    def test_errors_set_ok_false(self, seeded_app):
+    def test_second_enqueue_while_running_is_409_deduped(self, seeded_app):
+        """The jobs-repo idempotency-key dedupe means a second enqueue
+        while one is queued/running returns the SAME in-flight job id,
+        surfaced as a typed 409 — not a second, redundant run."""
         c = seeded_app["client"]
         token = seeded_app["admin_token"]
-        fake_summary = {
-            "built": [],
-            "skipped": [],
-            "pruned": [],
-            "errors": [{"corpus_id": "col_a", "error": "boom"}],
-        }
-        with patch(
-            "src.knowledge_packaging.run_packaging_pass",
-            return_value=fake_summary,
-        ):
+        first = c.post("/api/admin/run-knowledge-packaging", headers=_auth(token))
+        assert first.status_code == 202
+        first_job_id = first.json()["job_id"]
+
+        second = c.post("/api/admin/run-knowledge-packaging", headers=_auth(token))
+        assert second.status_code == 409
+        detail = second.json()["detail"]
+        assert detail["error"] == "knowledge_packaging_already_in_progress"
+        assert detail["job_id"] == first_job_id
+
+    def test_no_worker_role_fails_clean_with_typed_501(self, seeded_app, monkeypatch):
+        """An instance/process with no worker role has no loop that will
+        ever claim the job — enqueueing anyway would leave it queued
+        forever with no visible error. Fail clean instead."""
+        from app.roles import reset_roles_cache
+
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        monkeypatch.setenv("AGNES_ROLE", "api")
+        reset_roles_cache()
+        try:
             resp = c.post("/api/admin/run-knowledge-packaging", headers=_auth(token))
-        assert resp.status_code == 200
-        assert resp.json()["ok"] is False
+        finally:
+            monkeypatch.delenv("AGNES_ROLE", raising=False)
+            reset_roles_cache()
+        assert resp.status_code == 501, resp.text
+        assert resp.json()["detail"]["error"] == "requires_worker_role"
 
     def test_non_admin_blocked(self, seeded_app):
         c = seeded_app["client"]
@@ -519,21 +527,15 @@ class TestRunKnowledgePackaging:
         resp = c.post("/api/admin/run-knowledge-packaging")
         assert resp.status_code == 401
 
-    def test_unhandled_exception_still_audits(self, seeded_app):
-        """Mirror run_corporate_memory: record the failure in audit_log even
-        when run_packaging_pass() raises, so /admin/scheduler-runs sees the
-        failure instead of only docker logs."""
+    def test_enqueue_is_audited_with_job_id(self, seeded_app):
         from src.db import get_system_db
 
         c = seeded_app["client"]
         token = seeded_app["admin_token"]
-        with patch(
-            "src.knowledge_packaging.run_packaging_pass",
-            side_effect=RuntimeError("simulated DuckDB lock"),
-        ):
-            resp = c.post("/api/admin/run-knowledge-packaging", headers=_auth(token))
-        assert resp.status_code == 500
-        assert "RuntimeError" in resp.json()["detail"]
+        resp = c.post("/api/admin/run-knowledge-packaging", headers=_auth(token))
+        assert resp.status_code == 202
+        job_id = resp.json()["job_id"]
+
         conn = get_system_db()
         try:
             rows = conn.execute(
@@ -541,10 +543,49 @@ class TestRunKnowledgePackaging:
             ).fetchall()
         finally:
             conn.close()
-        assert rows, "audit row missing on unhandled exception"
-        params_json = rows[0][0]
-        assert "unhandled_error" in params_json
-        assert "RuntimeError" in params_json
+        assert rows, "audit row missing on enqueue"
+        params = json.loads(rows[0][0])
+        assert params["job_id"] == job_id
+        assert params["deduped"] is False
+
+
+class TestKnowledgePackagingStatus:
+    """GET /api/admin/knowledge-packaging/status — TCRD-296 synthesis C.15
+    observability surface."""
+
+    def test_no_runs_yet(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        resp = c.get("/api/admin/knowledge-packaging/status", headers=_auth(token))
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["last_run"] is None
+        assert body["running"] is False
+
+    def test_reflects_a_queued_run(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        enqueue_resp = c.post("/api/admin/run-knowledge-packaging", headers=_auth(token))
+        assert enqueue_resp.status_code == 202
+        job_id = enqueue_resp.json()["job_id"]
+
+        resp = c.get("/api/admin/knowledge-packaging/status", headers=_auth(token))
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["running"] is True
+        assert body["last_run"]["job_id"] == job_id
+        assert body["last_run"]["status"] == "queued"
+
+    def test_non_admin_blocked(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["analyst_token"]
+        resp = c.get("/api/admin/knowledge-packaging/status", headers=_auth(token))
+        assert resp.status_code == 403
+
+    def test_unauth_blocked(self, seeded_app):
+        c = seeded_app["client"]
+        resp = c.get("/api/admin/knowledge-packaging/status")
+        assert resp.status_code == 401
 
 
 class TestRunKnowledgeDigests:
@@ -816,6 +857,10 @@ class TestSchedulerJobsWireUp:
         assert json_body == {"kind": "corporate-memory", "idempotency_key": "corporate-memory"}
 
     def test_knowledge_packaging_endpoint_is_registered(self, monkeypatch):
+        """TCRD-296 synthesis C.15: the endpoint is now a thin enqueue, so
+        the scheduler's own client timeout shrinks to the short
+        enqueue-only budget every other `queued`-classified row uses —
+        it no longer has to outlast a real packaging pass."""
         for v in (
             "SCHEDULER_DATA_REFRESH_INTERVAL",
             "SCHEDULER_HEALTH_CHECK_INTERVAL",
@@ -823,14 +868,14 @@ class TestSchedulerJobsWireUp:
             "SCHEDULER_SCRIPT_RUN_INTERVAL",
         ):
             monkeypatch.delenv(v, raising=False)
-        from services.scheduler.__main__ import build_jobs
+        from services.scheduler.__main__ import _ENQUEUE_TIMEOUT_SEC, build_jobs
 
         target = next(j for j in build_jobs() if j[0] == "knowledge-packaging")
         _, schedule, endpoint, method, timeout = target
         assert schedule == "every 15m"
         assert endpoint == "/api/admin/run-knowledge-packaging"
         assert method == "POST"
-        assert timeout == 600
+        assert timeout == _ENQUEUE_TIMEOUT_SEC
 
     def test_knowledge_digests_endpoint_is_registered(self, monkeypatch):
         for v in (

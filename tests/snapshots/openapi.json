@@ -22963,6 +22963,60 @@
         ]
       }
     },
+    "/api/admin/knowledge-packaging/status": {
+      "get": {
+        "description": "Observability summary for the ``knowledge-packaging`` worker job\nkind (TCRD-296 synthesis C.15): the most recent run's outcome, whether\none is running right now, and (best-effort) when the next scheduled\nrun is due.\n\n``last_run``: the most recent ``knowledge-packaging`` job row\n(regardless of status), or ``null`` if the kind has never run on this\ninstance \u2014 ``{\"job_id\", \"status\", \"created_at\", \"finished_at\",\n\"result\"}`` where ``result`` is the pass summary (built/skipped/\npruned/errors/interrupted_reason/duration_s/collections_total/\ncollections_processed) when the job completed.\n``running``: whether a ``knowledge-packaging`` job is currently\n``'queued'`` or ``'running'``.\n``next_due``: an ISO timestamp estimate (last completed run's\n``created_at`` + ``SCHEDULER_KNOWLEDGE_PACKAGING_INTERVAL``), or\n``null`` when no run has completed yet or the scheduler's durable\nlast-run marker can't be read \u2014 this is an ESTIMATE (the scheduler\nprocess's own last-run/interval state is the authority; see\n``services/scheduler/__main__.py``), not a guaranteed next-fire time.",
+        "operationId": "knowledge_packaging_status_api_admin_knowledge_packaging_status_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Knowledge Packaging Status",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
     "/api/admin/mcp-sources": {
       "get": {
         "operationId": "list_mcp_sources_api_admin_mcp_sources_get",
@@ -29572,7 +29626,7 @@
     },
     "/api/admin/run-knowledge-packaging": {
       "post": {
-        "description": "Rebuild per-collection knowledge.duckdb artifacts whose content changed.\n\nScheduler-driven (K3, #798): fingerprints each corpus's chunks, rebuilds\nstale artifacts, prunes artifacts for deleted corpora. Idempotent and\ncheap when nothing changed (fingerprint check only). Mirrors\nrun_corporate_memory's audit + error posture.",
+        "description": "Enqueue a ``knowledge-packaging`` worker job (K3, #798).\n\nTCRD-296 synthesis C.15: this used to run the packaging pass INLINE,\nsynchronously, inside the request \u2014 the scheduler's own 600s client\ntimeout was the only bound on it, and a pass slower than that left the\nNEXT scheduler tick free to fire a second, overlapping call. Two\noverlapping in-process runs raced each other hard enough to OOM the\napp (see ``src.knowledge_packaging``'s module docstring for the exact\ncollision). This endpoint is now a thin enqueue: the actual pass runs\nas the ``knowledge-packaging`` worker job kind\n(``app/worker/kinds.py::_run_knowledge_packaging``), which supplies the\nsingle-run guarantee (idempotency-keyed enqueue below, plus a\nbelt-and-braces PG advisory lock inside the handler) and a wall-clock\ntime budget \u2014 a scheduler tick can no longer overlap a still-running\npass. Poll ``GET /api/jobs/{job_id}`` (or ``agnes admin jobs show\n<job_id>``) for the result, or use\n``GET /api/admin/knowledge-packaging/status`` for a summary of the\nlast run.\n\nReturns 202 with ``{\"status\": \"queued\", \"job_id\": ...}`` on a fresh\nenqueue. Returns 409 with the in-flight ``job_id`` when a run is\nalready ``'queued'``/``'running'`` (the scheduler's own cadence can\nlegitimately outpace a slow pass \u2014 this is expected, not an error to\npage on). Returns 501 (typed ``requires_worker_role``) when this\nprocess has no worker role: enqueueing here would leave the job\n``'queued'`` forever with nothing to claim it \u2014 see\n``docs/observability.md`` -> \"Knowledge packaging\" for the operator\nfix (give a process ``AGNES_ROLE`` including ``worker`` \u2014 the default\n``all`` role already does).",
         "operationId": "run_knowledge_packaging_api_admin_run_knowledge_packaging_post",
         "parameters": [
           {
@@ -29593,7 +29647,7 @@
           }
         ],
         "responses": {
-          "200": {
+          "202": {
             "content": {
               "application/json": {
                 "schema": {}

@@ -805,6 +805,11 @@ READ_POSTURE: dict[str, str] = {
     "GET /api/admin/activity/sync": "activity.read",
     # -- app.api.admin --
     "GET /api/admin/discover-tables": "table_registry.discover_preview",
+    # Operational status only (last run outcome, running flag, next-due
+    # estimate) — no data content, secrets, or other users' data. Same
+    # posture as GET /api/jobs/{job_id} and
+    # GET /api/admin/sharepoint/extraction/runs below.
+    "GET /api/admin/knowledge-packaging/status": "exempt:noise",
     "GET /api/admin/registry": "exempt:ui_support",
     "GET /api/admin/registry/{table_id}/policy/columns": "exempt:ui_support",
     "GET /api/admin/server-config": "server_config.read",
@@ -1604,6 +1609,7 @@ JOB_POSTURE: dict[str, str] = {
     "analytics-migrate": "job.run",
     "distribution-mirror": "job.run",
     "webhook-deliver": "job.run",
+    "knowledge-packaging": "job.run",
     "analytics-rebuild": "job.run",
     "collections-purge": "job.run",
     "corpus-extraction": "job.run",
@@ -1743,6 +1749,8 @@ MCP_TOOL_POSTURE: dict[str, str] = {
     "admin_job_get": "exempt:noise",
     "admin_job_enqueue": "job.enqueue",
     "activity": "activity.read",
+    "admin_knowledge_packaging_run": "run_knowledge_packaging",
+    "admin_knowledge_packaging_status": "exempt:noise",
     "admin_analytics_migrate": "analytics.migrate",
     "agent_list": "exempt:self",
     "agent_ask": "agent.invoke",
