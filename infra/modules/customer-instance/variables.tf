@@ -1130,10 +1130,14 @@ variable "enable_datadog" {
       * `dd-agent` joins the `docker` group so the agent can read the daemon's
         container metrics. That is root-equivalent on this host — the same
         posture the module already accepts for `agnes-applier`. The rendered
-        `datadog.yaml` compensates: remote configuration, APM, logs, DogStatsD,
+        `datadog.yaml` compensates: remote configuration, APM, DogStatsD,
         process/container/discovery collection, runtime security, compliance,
         SBOM, image and lifecycle collection and both inventory uploads are all
-        off, and the IPC endpoint binds to loopback.
+        off, and the IPC endpoint binds to loopback. Log collection is NOT on
+        that list any more — it is off unless container_logs_destination
+        resolves to `datadog`, which it does by default whenever this variable
+        is true. That is an egress decision rather than a privilege one; see
+        that variable and docs/datadog-logging.md.
 
       * No thresholds live on the VM. The checks report; the caller's monitors
         decide what is an incident.

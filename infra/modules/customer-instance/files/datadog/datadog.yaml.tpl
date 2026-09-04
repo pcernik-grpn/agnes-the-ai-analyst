@@ -158,6 +158,10 @@ logs_config:
       name: mask_url_credentials
       pattern: '([a-zA-Z][a-zA-Z0-9+.\-]*)://[^\s/:@]*:[^\s/@]+@'
       replace_placeholder: '$1://***:***@'
+    # Both quote styles: Python's dict repr writes {'Authorization': '…'},
+    # so a rule that only accepted double quotes missed every header logged
+    # through a repr — which is most of them.
+    #
     # The scheme word is optional AND alternated. With `bearer` alone, a
     # `Basic <base64>` header slipped through whole: once the bearer branch
     # failed, the value class had to match from `Basic`, and the space after it
@@ -166,11 +170,15 @@ logs_config:
     # the PAT resolver — so that was the more likely leak of the two.
     - type: mask_sequences
       name: mask_authorization_values
-      pattern: '(?i)((?:authorization|x-api-key|x-storageapi-token)"?\s*[:=]\s*"?\s*)(?:bearer|basic|token)?\s*[A-Za-z0-9._~+/-]{12,}'
+      pattern: '(?i)((?:authorization|x-api-key|x-storageapi-token)["'']?\s*[:=]\s*["'']?\s*)(?:bearer|basic|token)?\s*[A-Za-z0-9._~+/-]{12,}'
       replace_placeholder: '$1***'
     - type: mask_sequences
       name: mask_known_key_shapes
-      pattern: '(sk-ant-[A-Za-z0-9_-]{16,}|sk-[A-Za-z0-9]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|AIza[A-Za-z0-9_-]{20,})'
+      # `sk-` accepts - and _ so a project-scoped key (sk-proj-…, sk-ant-…)
+      # is not cut short at its second hyphen. That subsumes an explicit
+      # sk-ant- branch exactly — sk-ant- plus 16 is sk- plus 20 — so there
+      # isn't one.
+      pattern: '(sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|AIza[A-Za-z0-9_-]{20,})'
       replace_placeholder: '***'
     # The payload segment's bound is deliberately loose. A JWT whose claims
     # are small base64s to very little — `{}` is `e30`, three characters — so

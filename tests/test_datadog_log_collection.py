@@ -352,6 +352,24 @@ EXTRA_LEAKS = [
         "hunter2swordfish",
         id="empty-username-dsn",
     ),
+    pytest.param(
+        "mask_authorization_values",
+        "upstream 401 headers={'Authorization': 'Bearer abcdEFGH1234ijklMNOP'}",
+        "abcdEFGH1234ijklMNOP",
+        id="python-dict-repr-single-quotes",
+    ),
+    pytest.param(
+        "mask_known_key_shapes",
+        "openai call failed key=sk-proj-AbCdEfGh1234IjKlMnOp5678QrSt",
+        "sk-proj-AbCdEfGh1234IjKlMnOp5678QrSt",
+        id="project-scoped-openai-key",
+    ),
+    pytest.param(
+        "mask_known_key_shapes",
+        "anthropic call failed key=sk-ant-api03-AAAABBBBCCCCDDDDEEEE",
+        "sk-ant-api03-AAAABBBBCCCCDDDDEEEE",
+        id="anthropic-key-after-branch-collapse",
+    ),
 ]
 
 
@@ -362,7 +380,13 @@ def test_the_rules_cover_the_credential_shapes_this_stack_actually_emits(rule_na
     router's PAT header and the PAT resolver. With `bearer` as the only
     recognised scheme the whole header passed through unmasked, because once
     that branch failed the value class had to match from `Basic` and the space
-    after it is not in the class."""
+    after it is not in the class.
+
+    The single-quote case is the same class of near-miss: Python's dict repr
+    writes {'Authorization': '...'}, so a rule that only accepted double quotes
+    missed every header logged through a repr — which is most of them. And a
+    key class of `[A-Za-z0-9]` stops at the second hyphen of a project-scoped
+    `sk-proj-` key, leaving it in the clear."""
     rule = _processing_rules()[rule_name]
     masked = re.sub(rule["pattern"], rule["replace_placeholder"].replace("$1", r"\1"), line)
     assert secret not in masked, f"{rule_name} left {secret!r} in the clear"
