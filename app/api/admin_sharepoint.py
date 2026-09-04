@@ -3876,13 +3876,18 @@ class ExtractionRunOptions(BaseModel):
     design — `extraction.crawler.shard_target_docs`, PG-only), every option
     below except `shards` fans out UNCHANGED to every shard child
     (`connectors.sharepoint.crawler.run_shard_crawl`'s own payload
-    pass-through): `resync` drops every `crawl:*` state row (the
-    connection-level one AND every shard's own — see
-    `connectors.sharepoint.crawler._apply_resync`) and forces the NEXT
-    trigger to re-plan from scratch (this planner never persists a plan to
-    reuse — see `_plan_or_run_inline`'s own docstring); `timeout_s` bounds
-    EACH child independently, not the site as a whole, so a huge shard
-    getting more time never steals a small one's turn."""
+    pass-through). The planner PERSISTS its plan and reuses it on the next
+    trigger (2026-09-04 finding #65 item 2 — a live 388-scope connection's
+    planning window alone took 20+ minutes; a reused plan starts children
+    within seconds instead) UNLESS the scope set changed since it was
+    built, `resync` is set, or `force_replan` is: `resync` drops every
+    `crawl:*` state row (the connection-level one AND every shard's own —
+    see `connectors.sharepoint.crawler._apply_resync`) AND the persisted
+    plan, forcing the NEXT trigger to re-plan from scratch; `force_replan`
+    does the SAME to the plan alone, without touching any cursor — the
+    targeted control for "re-balance the shards" with no data re-read.
+    `timeout_s` bounds EACH child independently, not the site as a whole,
+    so a huge shard getting more time never steals a small one's turn."""
 
     concurrency: Optional[int] = Field(
         None,
@@ -3905,6 +3910,17 @@ class ExtractionRunOptions(BaseModel):
             "connection whose delta cursor ran past documents it never actually ingested. "
             "On a sharded site this clears every shard's own state row too, and the next "
             "trigger re-plans the whole site from scratch."
+        ),
+    )
+    force_replan: Optional[bool] = Field(
+        None,
+        description=(
+            "On a site large enough to auto-shard, re-plan from scratch instead of reusing "
+            "the connection's persisted shard plan — WITHOUT touching any cursor (unlike "
+            "`resync`, every drive still resumes incrementally). The targeted control for "
+            "re-balancing shards after the site's own shape changed enough that the old "
+            "plan's grouping no longer fits well, without paying a full re-enumeration. "
+            "A no-op on a connection too small to shard, or on a DuckDB-backed instance."
         ),
     )
     force_reprocess: Optional[bool] = Field(
@@ -4311,6 +4327,8 @@ async def trigger_extraction(
             payload["timeout_s"] = options.timeout_s
         if options.resync:
             payload["resync"] = True
+        if options.force_replan:
+            payload["force_replan"] = True
         if options.force_reprocess:
             payload["force_reprocess"] = True
         if options.retry_failed:

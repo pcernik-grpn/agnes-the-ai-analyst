@@ -113,7 +113,7 @@ from connectors.sharepoint import graph_client
 from connectors.sharepoint.acl_sync import active_zone_rows
 from connectors.sharepoint.graph_client import GRAPH_BASE, SharePointGraphError
 from connectors.sharepoint.settings import SharePointSettingsError, resolve_sharepoint_settings
-from connectors.sharepoint.shard_plan import SIGNAL_NONE, compute_shard_plan
+from connectors.sharepoint.shard_plan import SIGNAL_NONE, PlanningBudgetExhausted, compute_shard_plan
 
 logger = logging.getLogger(__name__)
 
@@ -829,11 +829,16 @@ class _RunRecorder:
             self._repo = extraction_runs_repo()
         return self._repo
 
-    def start(self, *, clock: Callable[[], float] = time.monotonic) -> None:
+    def start(self, *, phase: str = "crawl", clock: Callable[[], float] = time.monotonic) -> None:
         # Measured from here, not from process epoch: a run whose first
         # delta page takes a while must not have its very first item
         # trigger `maybe_checkpoint` purely because "now - 0" is huge.
         # ``clock`` is a test seam only — production never passes one.
+        #
+        # ``phase`` (2026-09-04 finding #65 item 3) lets a PARENT row open
+        # as ``"planning"`` before the planner ever calls Graph, instead of
+        # the row only existing (silently, as ``"crawl"``) once a plan is
+        # already built — see ``_plan_or_run_inline``.
         self._last_progress_at = clock()
         try:
             repo = self._resolve()
@@ -872,7 +877,7 @@ class _RunRecorder:
             self.run_id = repo.start(
                 connection_id=self.connection_id,
                 job_id=self.job_id,
-                phase="crawl",
+                phase=phase,
                 parent_run_id=self._parent_run_id,
                 shard_key=self._shard_key,
                 shard_label=self._shard_label,
@@ -1059,6 +1064,83 @@ class _RunRecorder:
             )
         except Exception as exc:  # noqa: BLE001
             logger.debug("sharepoint crawl: run finalize failed (%s) — continuing", type(exc).__name__)
+
+    def checkpoint_planning(self, folders_done: int, folders_total: int) -> None:
+        """The PLANNING phase's own checkpoint (2026-09-04 finding #65 item
+        3: a large site's ``compute_shard_plan`` used to run for 20+ minutes
+        with no run row and no log line at all). Writes ``phase="planning"``
+        and ``progress={"planning": {"folders_done", "folders_total"},
+        "activity": {"phase": "planning", ...}}`` — the SAME projection
+        shape ``checkpoint_facts`` layers its own ``progress["facts"]``
+        onto. The ``planning`` block is read by the fleet view via the
+        additive ``planning_progress`` key on ``_run_out``
+        (``app/api/admin_extraction.py``); the ``activity`` block reuses the
+        SAME field the source card already renders live activity from
+        (``_extActivityHtml``), so "planning" shows there for free with no
+        new front-end code. Wired as
+        :func:`connectors.sharepoint.shard_plan.compute_shard_plan`'s own
+        ``on_progress`` callback."""
+        if not self.run_id:
+            return
+        try:
+            self._resolve().checkpoint(
+                self.run_id,
+                phase="planning",
+                files_seen=0,
+                files_done=0,
+                enumeration_done=False,
+                progress={
+                    "planning": {"folders_done": folders_done, "folders_total": folders_total},
+                    "activity": {
+                        "phase": "planning",
+                        "current_path": f"{folders_done}/{folders_total} folders counted" if folders_total else None,
+                        "current_started_at": None,
+                        "recent": [],
+                    },
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("sharepoint crawl: planning checkpoint failed (%s) — continuing", type(exc).__name__)
+
+    def mark_planned(self, shards_total: int) -> None:
+        """The plan is built and about to be enqueued — flips this row's
+        ``phase`` to ``"plan"`` and sets ``shards_total`` (unknown at
+        :meth:`start` time, since this row opens BEFORE planning runs —
+        finding #65 item 3). ``shards_total`` is otherwise an INSERT-only
+        column (:meth:`ExtractionRunsPgRepository.start`); this is the one
+        place it is set after the fact."""
+        if not self.run_id:
+            return
+        try:
+            self._resolve().mark_planned(self.run_id, shards_total=shards_total)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("sharepoint crawl: mark_planned failed (%s) — continuing", type(exc).__name__)
+
+    def finish_planning_as_inline_fallback(self, *, reason: str) -> None:
+        """The planner opened this row (finding #65 item 3) but then decided
+        NOT to shard — no usable signal within the search budget (finding
+        #65 item 4) or a Graph/scope-resolution error mid-plan. Closes it as
+        a trivial, honest ``done`` row (`report={"mode": "inline (planner
+        fallback)", "reason": ...}`) rather than leaving it `running`
+        forever or silently repurposing it: the actual crawl that follows
+        opens its OWN fresh row exactly as it always has, so `abandon_stale_
+        running`'s "one running row per connection" invariant never has to
+        reason about a half-finished planning row."""
+        if not self.run_id:
+            return
+        try:
+            self._resolve().finish(
+                self.run_id,
+                status="done",
+                report={"mode": "inline (planner fallback)", "reason": reason},
+                usage={},
+                skips={},
+                files_seen=0,
+                files_done=0,
+                error=None,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("sharepoint crawl: could not close the planning row (%s) — continuing", type(exc).__name__)
 
 
 def _progress_snapshot(stats: "CrawlStats") -> Dict[str, Any]:
@@ -6339,6 +6421,10 @@ def _apply_resync(connection_id: str) -> None:
     the same reason. A DuckDB-backed instance never has shard rows
     (:func:`connectors.sharepoint.state_store.list_kinds` always answers
     ``[]`` there) — a no-op extra step, not a new failure mode.
+
+    Also drops the connection's PERSISTED shard plan (2026-09-04 finding
+    #65 item 2): a resync forces the next trigger to re-plan from scratch
+    rather than reuse a plan built before the cursors it now invalidates.
     """
     from connectors.sharepoint.state_store import list_kinds as _state_list_kinds
 
@@ -6346,6 +6432,7 @@ def _apply_resync(connection_id: str) -> None:
         state = load_state(connection_id)
         state["delta_links"] = {}
         state["failed_items"] = {}
+        state.pop("shard_plan", None)
         save_state(connection_id, state)
         for kind in _state_list_kinds(connection_id, "crawl:"):
             shard_key = kind[len("crawl:") :]
@@ -6418,7 +6505,12 @@ def run_builtin_crawl(payload: dict) -> dict:
     the empty-document backlog alone, since replaying it changes nothing
     while scan OCR stays off. The targeted admin action for "I just turned
     ``extraction.scan_ocr.enabled`` on, reconsider what it can now read" —
-    see ``POST …/extraction/retry-empty`` in ``app/api/admin_sharepoint.py``).
+    see ``POST …/extraction/retry-empty`` in ``app/api/admin_sharepoint.py``),
+    and ``force_replan`` (truthy — on a site large enough to auto-shard,
+    discards the connection's PERSISTED shard plan and builds a fresh one
+    for this trigger, without touching any cursor (unlike ``resync``, every
+    drive still resumes incrementally); a no-op everywhere else. See
+    :func:`_plan_or_run_inline` — 2026-09-04 finding #65 item 2).
     Credentials are resolved from the row, never from the payload.
 
     Returns the crawl report — the same dict persisted as ``last_run`` in
@@ -6593,24 +6685,119 @@ class _ShardPlanUnavailable(RuntimeError):
     enqueue children with nothing to join."""
 
 
+def _scope_set_hash(scopes: Sequence[Dict[str, Any]]) -> str:
+    """A stable fingerprint of WHICH scopes a shard plan was built from —
+    the plan-reuse validity check (2026-09-04 finding #65 item 2): a scope
+    added, removed, or un-confirmed since the last plan invalidates it.
+    Nothing else about a scope row (``display_path``, ``anonymize``,
+    ``access_mode``, ...) does, since none of those change what a shard's
+    own delta targets are."""
+    ids = sorted(str(s.get("source_scope_id") or "") for s in scopes)
+    return hashlib.sha256("|".join(ids).encode("utf-8")).hexdigest()[:16]
+
+
+def _known_folder_counts(scopes: Sequence[Dict[str, Any]]) -> Tuple[Dict[str, int], Dict[str, Dict[str, int]]]:
+    """Cheap, non-Graph size signal for the shard planner (2026-09-04
+    finding #65 item 1(a)): for a whole-DRIVE scope whose collection already
+    holds indexed documents, ``corpus_files.top_folder_status_counts`` gives
+    a per-top-level-folder document count in ONE query per distinct
+    collection — the same projection ``connectors.sharepoint.completeness``
+    already combines with ``list_root_children_with_url`` for its own
+    "expected" column, reused rather than reinvented.
+
+    Returns ``(known_totals, known_folder_counts)`` —
+    ``known_totals``: ``drive_id -> total documents already known`` (the
+    sum of a drive's own folder counts, fed to
+    :func:`connectors.sharepoint.shard_plan.compute_shard_plan`'s Pass 1);
+    ``known_folder_counts``: ``drive_id -> {folder_name -> documents}`` (fed
+    to its Pass 2). A "folder"/"site"-kind scope (not the drive root itself)
+    is skipped: its own collection's paths are relative to the SCOPE's
+    root, not the DRIVE's top-level folder names the planner packs by, so
+    there is no signal to attach here — childCount/Search still cover it.
+    An empty/never-crawled collection yields no entry at all (nothing
+    known yet), never a false ``0``.
+    """
+    from src.repositories import corpus_files_repo
+
+    known_totals: Dict[str, int] = {}
+    known_folder_counts: Dict[str, Dict[str, int]] = {}
+    try:
+        files_repo = corpus_files_repo()
+    except Exception:  # noqa: BLE001 — a cheap-signal lookup failing must never block planning
+        logger.debug("sharepoint shard planner: corpus_files_repo() unavailable — skipping known counts", exc_info=True)
+        return known_totals, known_folder_counts
+
+    for scope in scopes:
+        source_scope_id = str(scope.get("source_scope_id") or "")
+        if _scope_kind(source_scope_id) != "drive":
+            continue
+        collection_id = scope.get("collection_id")
+        if not collection_id:
+            continue
+        try:
+            folder_status = files_repo.top_folder_status_counts(str(collection_id))
+        except Exception:  # noqa: BLE001 — a cheap-signal lookup failing must never block planning
+            logger.debug(
+                "sharepoint shard planner: known-count lookup failed for drive %r", source_scope_id, exc_info=True
+            )
+            continue
+        by_folder: Dict[str, int] = {}
+        for folder, status_counts in folder_status.items():
+            if not folder:
+                continue  # "" = loose root files, not a top-level folder unit
+            by_folder[folder] = sum(status_counts.values())
+        if by_folder:
+            known_folder_counts[source_scope_id] = by_folder
+            known_totals[source_scope_id] = sum(by_folder.values())
+    return known_totals, known_folder_counts
+
+
+def _reusable_shard_plan(connection_id: str, scopes: Sequence[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """The connection's LAST persisted shard plan, if it is still valid to
+    reuse for THIS trigger (2026-09-04 finding #65 item 2) — present, and
+    built from the SAME scope set. Returns the persisted entry VERBATIM
+    (``{"shards", "scope_set_hash", "signal", "min_modified", ...}`` — see
+    :func:`_enqueue_shard_plan`'s own persisted shape) so the caller can
+    re-persist the SAME fingerprint after reusing it, letting a THIRD,
+    FOURTH, ... trigger keep reusing it too — or ``None`` (build a fresh
+    plan). The caller is responsible for the OTHER two invalidation
+    triggers (``resync`` — handled by :func:`_apply_resync` dropping the
+    persisted plan outright before this is ever consulted — and
+    ``force_replan``, which skips calling this at all)."""
+    state = load_state(connection_id)
+    persisted = state.get("shard_plan") or {}
+    if not persisted.get("shards"):
+        return None
+    if persisted.get("scope_set_hash") != _scope_set_hash(scopes):
+        return None
+    return dict(persisted)
+
+
 async def _plan_or_run_inline(connection: Dict[str, Any], payload: dict) -> Dict[str, Any]:
     """Decide inline vs. sharded for this connection's run, once, and do
     whichever one it picks (design §4.1).
 
     Inline (byte-for-byte :func:`_run_crawl_async`, today's crawl) when ANY
     of: the active app-state backend is DuckDB (A3 ratchet), ``extraction.
-    crawler.shard_target_docs`` is ``0`` (design §4.8), a scope-resolution
-    Graph call fails (the inline path's own per-scope error isolation is a
-    better fit for that than a half-built plan), or
-    :func:`connectors.sharepoint.shard_plan.compute_shard_plan` finds the
-    connection's SUMMED total at or under the target across every confirmed
-    scope's every drive (its own two-pass site-level decision — see that
-    function's docstring).
+    crawler.shard_target_docs`` is ``0`` (design §4.8), there is no
+    confirmed scope to plan against, a scope-resolution Graph call fails
+    (the inline path's own per-scope error isolation is a better fit for
+    that than a half-built plan), :func:`connectors.sharepoint.shard_plan.
+    compute_shard_plan` finds the connection's SUMMED total at or under the
+    target across every confirmed scope's every drive (its own two-pass
+    site-level decision), or planning exhausts its search budget with no
+    usable signal at all (:class:`connectors.sharepoint.shard_plan.
+    PlanningBudgetExhausted` — 2026-09-04 finding #65 item 4: a plan
+    balanced on nothing but a 429 storm is worse than falling back).
 
-    Sharded otherwise: opens ONE parent run row and enqueues one
-    ``corpus-extraction-shard`` child per packed shard (:func:
-    `_enqueue_shard_plan`), across every scope's every drive that needed
-    splitting — never crawls anything itself.
+    Sharded otherwise: opens ONE parent run row BEFORE any Graph call
+    (2026-09-04 finding #65 item 3 — a large site's planning window used to
+    run with no run row and no log line at all), reuses the connection's
+    LAST persisted plan when it is still valid for this scope set (finding
+    #65 item 2 — ``resync``/``force_replan``/a scope-set change force a
+    fresh plan instead), and enqueues one ``corpus-extraction-shard`` child
+    per packed shard (:func:`_enqueue_shard_plan`) — never crawls anything
+    itself.
     """
     connection_id = str(connection["id"])
 
@@ -6643,6 +6830,37 @@ async def _plan_or_run_inline(connection: Dict[str, Any], payload: dict) -> Dict
         # check here.
         return await _inline()
 
+    # Opened BEFORE any Graph call (finding #65 item 3): the fleet view and
+    # source card must show SOMETHING for the whole planning window, not
+    # only once a plan already exists. A row that cannot be opened at all
+    # means run recording itself is unavailable — the same case that would
+    # have made `_enqueue_shard_plan` refuse below; decided here, up front,
+    # instead of after paying for a plan with nothing to join it to.
+    recorder = _RunRecorder(connection_id, job_id=payload.get("job_id"))
+    recorder.start(phase="planning")
+    if recorder.run_id is None:
+        return await _inline()
+
+    force_replan = bool(payload.get("force_replan"))
+    if not force_replan:
+        reused = _reusable_shard_plan(connection_id, scopes)
+        if reused is not None:
+            try:
+                return _enqueue_shard_plan(
+                    connection_id,
+                    list(reused["shards"]),
+                    payload,
+                    recorder=recorder,
+                    # Re-persisted VERBATIM (same fingerprint) so a THIRD,
+                    # FOURTH, ... trigger can keep reusing this plan too —
+                    # not just the one right after it was built.
+                    scope_set_hash=reused.get("scope_set_hash"),
+                    signal=reused.get("signal"),
+                    min_modified=reused.get("min_modified"),
+                )
+            except _ShardPlanUnavailable:
+                return await _inline()
+
     settings = resolve_sharepoint_settings(connection)
     min_modified, _min_modified_source = resolve_min_modified(connection)
     plan_stats = CrawlStats()
@@ -6657,18 +6875,22 @@ async def _plan_or_run_inline(connection: Dict[str, Any], payload: dict) -> Dict
     for scope in scopes:
         try:
             targets = await _drive_targets(transport, scope)
-        except (CrawlError, SharePointGraphError):
+        except (CrawlError, SharePointGraphError) as exc:
             # One scope's misconfiguration (or a Graph outage) is exactly
             # the case the inline path's own per-scope isolation already
             # handles (`scope_errors`) — a half-built plan missing one
             # scope's coverage would be worse than falling all the way back.
+            recorder.finish_planning_as_inline_fallback(reason=f"scope resolution failed: {exc}")
             return await _inline()
         for target in targets:
             all_targets.append(target)
             scope_of_state_key[target.state_key] = scope
 
     if not all_targets:
+        recorder.finish_planning_as_inline_fallback(reason="no delta targets resolved for any confirmed scope")
         return await _inline()
+
+    known_totals, known_folder_counts = _known_folder_counts(scopes)
 
     try:
         plan = await compute_shard_plan(
@@ -6679,13 +6901,25 @@ async def _plan_or_run_inline(connection: Dict[str, Any], payload: dict) -> Dict
             min_modified=min_modified,
             target_docs=target_docs,
             max_shards=_MAX_SHARDS,
+            known_totals=known_totals,
+            known_folder_counts=known_folder_counts,
+            on_progress=recorder.checkpoint_planning,
         )
-    except (CrawlError, SharePointGraphError):
+    except (CrawlError, SharePointGraphError) as exc:
+        recorder.finish_planning_as_inline_fallback(reason=f"Graph error while planning: {exc}")
+        return await _inline()
+    except PlanningBudgetExhausted as exc:
+        # Finding #65 item 4: the search budget ran out before ANY signal
+        # (known/childCount/Search) resolved for any drive or folder — a
+        # plan built on nothing but a 429 storm is worse than no plan.
+        logger.warning("sharepoint crawl: connection %s — %s; falling back to inline", connection_id, exc)
+        recorder.finish_planning_as_inline_fallback(reason=str(exc))
         return await _inline()
 
     if not plan["drives"]:
         # The connection's summed total stayed at or under target — the
         # site-level "stay inline" decision (design §4.1 point 2).
+        recorder.finish_planning_as_inline_fallback(reason="connection total at or under shard_target_docs")
         return await _inline()
 
     shard_defs: List[Dict[str, Any]] = []
@@ -6707,6 +6941,7 @@ async def _plan_or_run_inline(connection: Dict[str, Any], payload: dict) -> Dict
                 {
                     "scope_id": str(owning_scope.get("source_scope_id")),
                     "label": shard["label"],
+                    "signal": shard.get("signal") or SIGNAL_NONE,
                     "targets": shard["targets"],
                     "exclude_prefixes": shard.get("exclude_prefixes") or [],
                     "expected": shard.get("expected") or 0,
@@ -6714,20 +6949,54 @@ async def _plan_or_run_inline(connection: Dict[str, Any], payload: dict) -> Dict
             )
 
     if not shard_defs:
+        recorder.finish_planning_as_inline_fallback(reason="plan produced no non-empty shard")
         return await _inline()
 
     try:
-        return _enqueue_shard_plan(connection_id, shard_defs, payload)
+        return _enqueue_shard_plan(
+            connection_id,
+            shard_defs,
+            payload,
+            recorder=recorder,
+            scope_set_hash=_scope_set_hash(scopes),
+            signal=plan.get("signal"),
+            min_modified=str(min_modified) if min_modified else None,
+        )
     except _ShardPlanUnavailable:
         return await _inline()
 
 
-def _enqueue_shard_plan(connection_id: str, shard_defs: List[Dict[str, Any]], payload: dict) -> Dict[str, Any]:
+def _enqueue_shard_plan(
+    connection_id: str,
+    shard_defs: List[Dict[str, Any]],
+    payload: dict,
+    *,
+    recorder: Optional["_RunRecorder"] = None,
+    scope_set_hash: Optional[str] = None,
+    signal: Optional[str] = None,
+    min_modified: Optional[str] = None,
+) -> Dict[str, Any]:
     """Open the PARENT run row and enqueue one ``corpus-extraction-shard``
     child per entry in ``shard_defs`` (design §4.3) — the planner's own
     tail. Never crawls: by the time this returns, every shard's work is
     queued for ANY worker to claim, and this job's own claim is free to
     finish.
+
+    ``recorder`` (2026-09-04 finding #65 item 3): an already-started
+    ``_RunRecorder`` — ``_plan_or_run_inline`` opens its parent row with
+    ``phase="planning"`` BEFORE calling the planner at all, so this reuses
+    that SAME row (flipping it to ``phase="plan"`` and setting
+    ``shards_total``, only now known) instead of opening a second one.
+    ``None`` (the default) opens a fresh row itself — the shape
+    ``app.api.admin_sharepoint._trigger_shard_rerun`` still uses: re-running
+    NAMED shards from an already-persisted plan skips planning (and its
+    visibility concerns) entirely.
+
+    ``scope_set_hash``/``signal``/``min_modified`` (finding #65 item 2) ride
+    into the persisted plan so the NEXT trigger can validate and reuse it
+    without recomputing anything — all three ``None`` for a shard RE-RUN
+    (``_trigger_shard_rerun``), which does not touch the persisted plan at
+    all.
 
     Idempotency key ``corpus-extraction-shard:{connection_id}:{index}`` —
     a re-planned connection whose Nth shard now covers different folders
@@ -6742,25 +7011,30 @@ def _enqueue_shard_plan(connection_id: str, shard_defs: List[Dict[str, Any]], pa
     from src.repositories import jobs_repo
 
     shards_total = len(shard_defs)
-    recorder = _RunRecorder(connection_id, job_id=payload.get("job_id"), shards_total=shards_total)
-    recorder.start()
+    if recorder is None:
+        recorder = _RunRecorder(connection_id, job_id=payload.get("job_id"), shards_total=shards_total)
+        recorder.start()
+    else:
+        recorder.mark_planned(shards_total)
     parent_run_id = recorder.run_id
     if parent_run_id is None:
         raise _ShardPlanUnavailable(f"could not open a parent run row for connection {connection_id!r}")
 
-    # Persisted for observability (the read side's plan preview, and a
-    # human diagnosing a stuck parent) — NOT consulted on the next trigger:
-    # this planner always re-plans fresh rather than reusing a persisted
-    # plan (see the design's §4.1 point 5 "re-plan only on resync/scope
-    # change/no plan" — the caching half of that is out of scope here;
-    # always-fresh is still CORRECT, since state stays keyed by
-    # `DriveTarget.state_key`, never by shard index, so a re-plan can never
-    # orphan a cursor — only marginally more Graph reads than necessary).
+    # Persisted so the NEXT trigger can REUSE this plan instead of
+    # recomputing it (finding #65 item 2 — a live 388-scope connection's
+    # planning window alone took 20+ minutes; a reused plan starts children
+    # within seconds). `scope_set_hash` is the reuse validity check
+    # (`_reusable_shard_plan`); `resync` drops this whole entry
+    # (`_apply_resync`) and `force_replan` skips consulting it, both forcing
+    # a fresh plan on the NEXT trigger, not this one.
     state = load_state(connection_id)
     state["shard_plan"] = {
         "parent_run_id": parent_run_id,
         "shards_total": shards_total,
         "planned_at": _now_iso(),
+        "scope_set_hash": scope_set_hash,
+        "signal": signal,
+        "min_modified": min_modified,
         "shards": shard_defs,
     }
     save_state(connection_id, state)
@@ -7247,8 +7521,14 @@ async def preview_shard_plan(
     Runs the IDENTICAL two decisions :func:`_plan_or_run_inline` makes
     before it ever enqueues anything (:func:`connectors.sharepoint.
     shard_plan.compute_shard_plan`, over the same resolved
-    :func:`_drive_targets`), so a preview and the plan an actual trigger
-    would build from never disagree. Unlike :func:`_plan_or_run_inline`
+    :func:`_drive_targets` AND the same :func:`_known_folder_counts` cheap
+    signal), so a FRESHLY COMPUTED preview and the plan an actual trigger
+    would build from never disagree. The one deliberate divergence
+    (2026-09-04 finding #65 item 2): this NEVER consults or reuses the
+    connection's persisted plan — a preview answering from a stale cached
+    plan while claiming to show "right now" would defeat its own purpose;
+    an actual trigger reuses it (see :func:`_reusable_shard_plan`) purely
+    for speed, never for correctness. Unlike :func:`_plan_or_run_inline`
     this never falls back to "inline" on a Graph error — a scope-resolution
     or Graph failure propagates as :class:`CrawlError`/
     :class:`SharePointGraphError` for the caller
@@ -7262,8 +7542,12 @@ async def preview_shard_plan(
     is DuckDB (A3 ratchet), ``extraction.crawler.shard_target_docs`` is
     ``0``, there is no confirmed scope to plan against, or the connection's
     summed total stays at or under the target across every scope's every
-    drive. Each sharded entry: ``{"drive_id", "index", "label", "expected",
-    "targets_count"}`` — ``targets_count`` (never the raw ``targets`` list
+    drive. Each sharded entry: ``{"drive_id", "index", "label", "signal",
+    "expected", "targets_count"}`` — ``signal`` (2026-09-04 finding #65
+    item 1 — one of ``"known"``/``"child_count"``/``"search"``/``"none"``)
+    is the WORST (least certain) counting signal behind this shard's own
+    ``expected``, so the UI can say "≈" honestly per shard, not just for
+    the plan as a whole. ``targets_count`` (never the raw ``targets`` list
     itself — no Graph item ids leave this module) is how many delta units
     this shard packs. ``loose_root_files`` concatenates every drive's own
     root-level files no folder-based shard will cover (design §4.1 point 3
@@ -7329,8 +7613,17 @@ async def preview_shard_plan(
             "loose_root_files": [],
         }
 
+    known_totals, known_folder_counts = _known_folder_counts(scopes)
     plan = await compute_shard_plan(
-        transport, auth, {}, all_targets, min_modified=min_modified, target_docs=target_docs, max_shards=_MAX_SHARDS
+        transport,
+        auth,
+        {},
+        all_targets,
+        min_modified=min_modified,
+        target_docs=target_docs,
+        max_shards=_MAX_SHARDS,
+        known_totals=known_totals,
+        known_folder_counts=known_folder_counts,
     )
 
     if not plan["drives"]:
@@ -7354,6 +7647,7 @@ async def preview_shard_plan(
                     "drive_id": drive_plan["drive_id"],
                     "index": shard["index"],
                     "label": shard["label"],
+                    "signal": shard.get("signal") or SIGNAL_NONE,
                     "expected": shard.get("expected") or 0,
                     "targets_count": len(shard["targets"]),
                 }

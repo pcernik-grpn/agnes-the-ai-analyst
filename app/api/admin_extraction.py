@@ -555,6 +555,13 @@ def _run_out(
         # `connectors.sharepoint.facts_extraction.run_facts_extraction`'s
         # `on_progress` docstring) — never invented ahead of that.
         "facts_progress": live.get("facts"),
+        # ``{folders_done, folders_total}`` while `phase == "planning"`
+        # (2026-09-04 finding #65 item 3) — absent otherwise, same
+        # "layered onto `progress`, never invented ahead of it" contract as
+        # `facts_progress` above. What lets the fleet view/source card say
+        # "planning k/N folders" instead of showing nothing for the whole
+        # planning window.
+        "planning_progress": live.get("planning"),
         # 2026-09-03 auto-parallel-crawl design §4.7 — additive, present on
         # EVERY run: "sharded" for a PARENT (planner) row, "inline" for an
         # ordinary crawl and for a shard CHILD's own row alike (neither is

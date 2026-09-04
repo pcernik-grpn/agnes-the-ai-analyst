@@ -117,6 +117,29 @@ console.log(JSON.stringify({{ html: factsCell(facts) }}));
     return out["html"]
 
 
+def _run_phase_cell_js(run: dict) -> str:
+    out = _run_node(
+        f"""
+const run = {json.dumps(run)};
+console.log(JSON.stringify({{ html: phaseCell(run) }}));
+""",
+        extra_state="""
+class FakeEl {
+  constructor() { this._html = ""; this._text = ""; this.className = ""; }
+  set textContent(v) { this._text = v == null ? "" : String(v); }
+  get textContent() { return this._text; }
+  get innerHTML() {
+    if (this._html) return this._html;
+    return this._text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
+  set innerHTML(v) { this._html = v; }
+}
+const document = { createElement: () => new FakeEl() };
+""",
+    )
+    return out["html"]
+
+
 _ROW = {
     "connection_id": "sp1",
     "connection_name": "Legal SharePoint",
@@ -195,6 +218,50 @@ def test_facts_cell_omits_the_swept_note_when_the_field_is_unset():
 def test_facts_cell_omits_the_swept_note_while_the_pass_is_still_running():
     html = _run_facts_cell_js({"docs_done": 10, "docs_total": 40, "phase_active": True, "orphans_swept": 5})
     assert "swept" not in html
+
+
+# ---------------------------------------------------------------------------
+# phaseCell — the planning phase (2026-09-04 finding #65 item 3: a large
+# site's shard planner used to run for 20+ minutes with no run row and no
+# visible phase at all).
+# ---------------------------------------------------------------------------
+
+
+def test_phase_cell_names_planning_progress_when_the_parent_row_is_planning():
+    html = _run_phase_cell_js(
+        {
+            "outcome": "running",
+            "phase": "planning",
+            "planning_progress": {"folders_done": 12, "folders_total": 40},
+        }
+    )
+    assert "planning 12/40 folders" in html
+
+
+def test_phase_cell_uses_singular_folder_for_one_total():
+    html = _run_phase_cell_js(
+        {
+            "outcome": "running",
+            "phase": "planning",
+            "planning_progress": {"folders_done": 0, "folders_total": 1},
+        }
+    )
+    assert "planning 0/1 folder" in html
+    assert "1 folders" not in html
+
+
+def test_phase_cell_falls_back_to_bare_planning_label_with_no_progress_yet():
+    """The row just opened — the very first checkpoint has not landed —
+    must still render SOMETHING, never `undefined`."""
+    html = _run_phase_cell_js({"outcome": "running", "phase": "planning"})
+    assert "planning" in html
+    assert "undefined" not in html
+
+
+def test_phase_cell_is_unaffected_for_an_ordinary_crawl_phase():
+    html = _run_phase_cell_js({"outcome": "running", "phase": "crawl"})
+    assert ">crawl<" in html
+    assert "planning" not in html
 
 
 # ---------------------------------------------------------------------------

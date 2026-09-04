@@ -4,10 +4,10 @@ connector maintenance, plus the split-a-large-site management pair below.
 Thirteen surfaces:
 
   - ``extract`` — the manual crawl trigger with its per-run options
-    (``--concurrency``, ``--timeout-s``, ``--resync``, ``--force-reprocess``,
-    ``--retry-failed``); CLI counterpart to ``POST /api/admin/sharepoint/
-    connections/{connection_id}/extract`` — the same job the source card's
-    "Run extraction now" button enqueues.
+    (``--concurrency``, ``--timeout-s``, ``--resync``, ``--replan``,
+    ``--force-reprocess``, ``--retry-failed``); CLI counterpart to
+    ``POST /api/admin/sharepoint/connections/{connection_id}/extract`` —
+    the same job the source card's "Run extraction now" button enqueues.
   - ``retry-empty`` — re-queues the connection's ``convert_empty`` backlog
     (documents that converted fine but carried no text — a scan, most
     commonly) for another pass, the targeted follow-up to turning
@@ -216,6 +216,15 @@ def extract(
         "documents (a conversion crash, a transient download error). This run's ordinary "
         "incremental delta walk still runs afterward, unaffected.",
     ),
+    force_replan: bool = typer.Option(
+        False,
+        "--replan",
+        help="On a site large enough to auto-shard, re-plan from scratch instead of reusing "
+        "the connection's persisted shard plan — WITHOUT touching any cursor (unlike "
+        "--resync, every drive still resumes incrementally). For re-balancing shards after "
+        "the site's own shape changed enough that the old plan no longer fits well. A no-op "
+        "on a connection too small to shard, or on a DuckDB-backed instance.",
+    ),
     as_json: bool = typer.Option(False, "--json"),
 ):
     """Run the built-in crawl for this connection now.
@@ -239,6 +248,8 @@ def extract(
         payload["timeout_s"] = timeout_s
     if resync:
         payload["resync"] = True
+    if force_replan:
+        payload["force_replan"] = True
     if force_reprocess:
         payload["force_reprocess"] = True
     if retry_failed:

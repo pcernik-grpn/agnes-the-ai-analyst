@@ -1919,6 +1919,17 @@ class TestExtract:
         _, kwargs = mock_post.call_args
         assert kwargs["json"] == {"resync": True}
 
+    def test_replan_rides_the_payload_as_true(self):
+        """2026-09-04 finding #65 item 2 — the targeted "re-balance shards
+        without a re-enumeration" control, distinct from `--resync`."""
+        with patch(
+            "cli.commands.admin_sharepoint.api_post", return_value=_resp(202, {"job_id": "e5", "status": "queued"})
+        ) as mock_post:
+            result = runner.invoke(app, ["admin", "sharepoint", "extract", "conn1", "--replan"])
+        assert result.exit_code == 0, result.output
+        _, kwargs = mock_post.call_args
+        assert kwargs["json"] == {"force_replan": True}
+
     def test_retry_failed_rides_the_payload_as_true(self):
         """The targeted alternative to `--resync` — same key the source
         card's checkbox sends, so REST × CLI × UI never drift."""
