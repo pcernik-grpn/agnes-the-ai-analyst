@@ -74,6 +74,20 @@ def _no_repo_factory_captured_by_a_late_import(monkeypatch):
     swap one. A test in this module must therefore never swap a factory on
     an ``app.*`` module directly — swap it on ``src.repositories``, which
     is what every helper here does.
+
+    "Captured" means the module holds an object that is NOT a genuine
+    ``src.repositories`` factory — never merely "is not the object this
+    fixture saw at setup". ``importlib.reload(src.repositories)`` (the PG
+    parity sweeps, ``tests/test_requires_postgres_backend.py``) re-mints
+    every factory function, so on a worker where such a test ran earlier
+    every module that imported a factory BEFORE the reload holds the
+    previous — still real — function object, and an identity check against
+    this fixture's post-reload snapshot flagged all of them (``acl_sync``,
+    ``ingest_gate``, ``app.api.*`` — 14 teardown errors on one CI shard
+    from a test that captured nothing). A real factory is a plain
+    module-level ``def`` in ``src/repositories/__init__.py`` whichever
+    reload minted it; a fake a test installs (a lambda, a closure, a
+    ``Mock``) never carries that module and qualname.
     """
     import src.repositories as repos
 
@@ -82,6 +96,10 @@ def _no_repo_factory_captured_by_a_late_import(monkeypatch):
     swapped = {name for name, obj in real.items() if getattr(repos, name, obj) is not obj}
     if not swapped:
         return
+
+    def _is_genuine_factory(name: str, obj: Any) -> bool:
+        return getattr(obj, "__module__", None) == repos.__name__ and getattr(obj, "__qualname__", None) == name
+
     captured: List[str] = []
     for mod_name, mod in list(sys.modules.items()):
         if mod is repos or mod is None or not mod_name.startswith(_FACTORY_HOST_PREFIXES):
@@ -90,7 +108,8 @@ def _no_repo_factory_captured_by_a_late_import(monkeypatch):
         if not namespace:
             continue
         for name in swapped & namespace.keys():
-            if namespace[name] is not real[name]:
+            bound = namespace[name]
+            if bound is not real[name] and not _is_genuine_factory(name, bound):
                 captured.append(f"{mod_name}.{name}")
     assert not captured, (
         f"a src.repositories factory swapped by this test was captured by a module imported "

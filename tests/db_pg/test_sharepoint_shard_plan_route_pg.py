@@ -106,11 +106,20 @@ def _install_shard_graph(monkeypatch, *, site_total: int, folder_totals: dict) -
     ``search_document_count`` against the drive ROOT (deciding whether the
     site stays inline), then — only when that total is over target — a
     root-children listing plus one ``search_document_count`` per top-level
-    folder. ``folder_totals`` maps a folder's ``webUrl`` to its count."""
+    folder. ``folder_totals`` maps a folder's ``webUrl`` to its count.
+
+    The planner counts a folder by precedence — the collection's own
+    ``corpus_files`` rows, else the listing's ``folder.childCount``, else
+    Graph Search (``_count_top_level_folders``). This connection's
+    collection is empty (never crawled) and the folder facet below
+    deliberately carries NO ``childCount``, so Search is the signal that
+    actually decides — which is what makes ``folder_totals`` the numbers a
+    test can expect back in the preview. A ``childCount`` here would
+    silently pre-empt Search and the seeded totals would never be read."""
     from connectors.sharepoint import graph_client as gc
 
     folder_children = [
-        {"id": f"f{index}", "name": url.rsplit("/", 1)[-1], "folder": {"childCount": 5}, "webUrl": url}
+        {"id": f"f{index}", "name": url.rsplit("/", 1)[-1], "folder": {}, "webUrl": url}
         for index, url in enumerate(folder_totals, start=1)
     ]
 
@@ -171,9 +180,27 @@ def test_a_site_over_target_previews_sharded_with_expected_counts(tmp_path, monk
     assert body["mode"] == "sharded"
     assert body["target_docs"] == 10
     assert body["shards"]
-    assert sum(s["expected"] for s in body["shards"]) > 0
     for shard in body["shards"]:
-        assert set(shard.keys()) == {"drive_id", "index", "label", "expected", "targets_count"}
+        assert set(shard.keys()) == {"drive_id", "index", "label", "signal", "expected", "targets_count"}
+        assert shard["drive_id"] == "b!drive1"
+
+    # An EMPTY corpus and a listing without ``childCount`` leave Graph Search
+    # as the only counting signal, so the seeded per-folder totals must come
+    # back verbatim — each folder is over target on its own, so it is its own
+    # shard — and every shard, plus the plan, must say so via ``signal``.
+    packed = [s for s in body["shards"] if s["label"] != "remainder"]
+    assert sorted(s["expected"] for s in packed) == [400, 600]
+    assert all(s["signal"] == "search" for s in packed)
+    assert all(s["targets_count"] == 1 for s in packed)
+    assert body["signal"] == "search"
+
+    # The remainder (loose root files + anything created after planning)
+    # is one whole-drive target whose count nobody can know in advance.
+    remainder = [s for s in body["shards"] if s["label"] == "remainder"]
+    assert len(remainder) == 1
+    assert remainder[0]["expected"] == 0
+    assert remainder[0]["signal"] == "none"
+    assert remainder[0]["targets_count"] == 1
 
 
 def test_a_small_site_previews_inline(tmp_path, monkeypatch, pg_engine):
