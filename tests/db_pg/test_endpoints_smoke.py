@@ -2438,6 +2438,14 @@ KNOWN_UNTESTED = {
     # Sandboxed data-apps authoring replay (Task 7, wave 3B) — same
     # ticket-authed, never parameter-free shape as the broker routes above.
     "POST /api/broker/data-apps",
+    # Telemetry egress for the embedded engine's sandbox — the same
+    # ticket-authed, never parameter-free shape: it needs a `kai_otlp` ticket
+    # and an OTLP protobuf body, and forwards to an operator-configured
+    # collector. Behaviour covered in tests/test_broker_otlp.py (scope
+    # enforcement, signal allowlist, credential injection, size cap,
+    # collector-error containment) and tests/test_kai_host.py (the ticket is
+    # minted exactly when a collector is configured).
+    "POST /api/broker/otlp/v1/{signal}",
     # apps-runner audit report-back: shared-secret (X-Runner-Token) header
     # auth, not a user session, so this parameter-free sweep can only ever
     # 401 here uninformatively. Behaviour — token floor, constant-time

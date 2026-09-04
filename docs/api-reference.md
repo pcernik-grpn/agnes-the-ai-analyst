@@ -3645,6 +3645,19 @@ the engine exposes nothing.
   mints. A co-session is refused (`403 mcp_not_available_to_co_session`)
   rather than resolved to its stored owner. Point the engine's
   `HOST_BROKER_MCP_URL` here and set `KAI_BROKER_MCP_ENABLED`.
+- /api/broker/otlp/v1/{signal} — `POST`, authenticated by a **`kai_otlp`-scoped
+  broker ticket** — the one `/api/kai/tickets` returns under the `otlp` key,
+  and only while this instance's own OTLP export is configured
+  (`OTEL_EXPORTER_OTLP_ENDPOINT`; without it the key is absent and the route
+  answers `503 otlp_export_not_configured`). `signal` is exactly `traces`,
+  `metrics` or `logs` (anything else is `404 otlp_signal_not_supported`). The
+  body is the sandbox SDK's OTLP protobuf batch, forwarded byte-for-byte to
+  `<endpoint>/v1/<signal>` with the operator's `OTEL_EXPORTER_OTLP_HEADERS`
+  injected server-side; the collector's 2xx response comes back as-is, an
+  error only as its status code plus `Retry-After`. Batches above 8 MiB are
+  refused with `413`. This is how the embedded engine's own spans (turn →
+  step → tool) reach the same collector as the broker's completion spans —
+  see `docs/observability.md`.
 - /api/kai/workspace — `GET`, authenticated by the session credential (the
   engine's *server* calls it once per SDK process spawn; the sandbox never
   sees it). Returns `200` with a gzipped tar of the caller's workspace tree,
