@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import uuid
 from typing import Any, Dict, List, Optional
 
@@ -222,6 +223,57 @@ class UpdateMCPSourceRequest(BaseModel):
     @classmethod
     def _check_auth_method(cls, v: Optional[str]) -> Optional[str]:
         return _validate_auth_method(v)
+
+
+#: Verbs that rule a tool out as the data-app lister whatever the rest of its
+#: name says. Deliberately kept in step with `WRITE_VERB` in
+#: app/web/static/js/components/linked_apps_panel.js: the client ranks with
+#: these and this refuses with them, so the UI never nominates what the
+#: endpoint would then reject.
+_LISTER_WRITE_VERB = re.compile(
+    r"^(create|delete|remove|drop|deploy|modify|update|patch|set|add|put|post|write|"
+    r"rename|move|copy|start|stop|restart|enable|disable|install|uninstall|run|"
+    r"execute|trigger|publish|unpublish|share|revoke|grant|import|upload)(_|$)"
+)
+
+
+def _lister_refusal(tool: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Why ``tool`` cannot be the data-app lister — ``None`` when it can.
+
+    The client already ranks candidates and will not nominate a write tool
+    (#2154), but that is not a guard: ``lister: true`` is what makes a run
+    project rows into ``data_apps``, so a hand-rolled request could otherwise
+    still invoke a mutating tool and catalogue whatever it wrote. The rules
+    are the two the client DISQUALIFIES on, not the ones it merely ranks by:
+
+      * a write-shaped verb in front of the name;
+      * required arguments — the lister is invoked with no arguments, so a
+        schema demanding one cannot answer that call. The one hard fact
+        available here; the rest is a name.
+
+    ``readOnlyHint`` is deliberately absent. It is a tri-state, most servers
+    send nothing, and registration stores that as ``mutating=True`` — refusing
+    an undeclared tool would make linked apps impossible on exactly the servers
+    the feature exists for.
+
+    The client additionally requires "data" and "app" in the name; that is a
+    DISCOVERY rule, not a safety one, so it is not repeated here — it would
+    only refuse setups that are already harmless.
+    """
+    if not tool:
+        return None  # unknown id — the extractor answers for it, as before
+    name = str(tool.get("original_name") or tool.get("exposed_name") or "")
+    if _LISTER_WRITE_VERB.match(name.lower()):
+        return f"'{name}' is named as a tool that changes data, so it cannot be the app lister."
+    schema = tool.get("input_schema") or {}
+    required = schema.get("required") if isinstance(schema, dict) else None
+    if required:
+        return (
+            f"'{name}' requires the argument{'s' if len(required) > 1 else ''} "
+            f"{', '.join(str(r) for r in required)}. The app lister is called with none, "
+            "so this tool cannot answer it."
+        )
+    return None
 
 
 class MaterializeRequest(BaseModel):
@@ -1911,6 +1963,19 @@ async def materialize_mcp_source(
     # and still fully dialable here on every run.
     await _check_source_url_or_400(src)
     only_tool_id = payload.tool_id if payload else None
+    # Refuse a bad lister designation BEFORE dialling: invoking the tool is
+    # the harm, so a check that ran at projection time would be too late.
+    if payload is not None and payload.lister and only_tool_id:
+        why = _lister_refusal(tool_registry_repo().get(only_tool_id))
+        if why:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "not_a_lister_tool",
+                    "message": why,
+                    "hint": "Choose the tool that lists apps — usually one named get_/list_.",
+                },
+            )
     try:
         # extract_source_async — async-safe; the sync variant wraps
         # ``_materialize_one_tool`` with asyncio.run() which blows up

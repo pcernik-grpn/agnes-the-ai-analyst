@@ -16,6 +16,23 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Fixed
 
+- **Linked apps: "Read the app list" no longer calls a tool that writes.** The
+  lister was picked by one substring test — a name carrying both `data` and
+  `app`, first match wins — which on the Keboola MCP server selects
+  `create_python_js_data_app_git_credential` and never reaches the real
+  `get_data_apps`. Reading the list therefore put a mutating tool into
+  materialize mode and invoked it with no arguments. Candidates are now ranked,
+  and two things remove a tool from the running outright rather than ranking it
+  low: a write-shaped verb in front of its name, and a schema with required
+  arguments (the lister is called with none). Where several survive, the panel
+  names them and the choice is the admin's. `POST
+  /api/admin/mcp-sources/{id}/materialize` applies the same two rules to
+  `lister: true` and refuses with `400 not_a_lister_tool` before dialling the
+  upstream, so the guard does not depend on the client. `readOnlyHint`
+  deliberately does not gate any of this — it is a tri-state most servers leave
+  unset, and requiring it would make linked apps impossible on exactly the
+  servers the feature exists for. (#2154)
+
 ### Removed
 
 ### Internal
