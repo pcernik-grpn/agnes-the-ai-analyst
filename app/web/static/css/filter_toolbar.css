@@ -93,6 +93,7 @@
 .fbar-menu__opt { display: flex; align-items: center; gap: 9px; padding: 7px 10px; border-radius: 8px; font-size: 13.5px; color: var(--ds-text-primary); cursor: pointer; }
 .fbar-menu__opt:hover { background: color-mix(in srgb, var(--ds-text-primary) 5%, transparent); }
 .fbar-menu__opt input { accent-color: var(--ds-primary); width: 15px; height: 15px; flex-shrink: 0; }
+<<<<<<< HEAD
 .fbar-menu__opt-n { margin-left: auto; font-size: 11.5px; color: var(--ds-text-muted); }
 /* The "search facets" typeahead (round 3 of the 2026-09-03 incident):
    reaches a value past the server's own top-N cut without ever inlining the
@@ -102,6 +103,18 @@
 .fbar-menu__search-input { width: 100%; box-sizing: border-box; height: 30px; padding: 0 9px; font: inherit; font-size: 12.5px; color: var(--ds-text-primary); background: var(--ds-surface); border: 1px solid var(--ds-border); border-radius: 7px; }
 .fbar-menu__search-input:focus-visible { outline: var(--ds-focus-outline); outline-offset: var(--ds-focus-outline-offset); }
 .fbar-menu__search-input::placeholder { color: var(--ds-text-muted); }
+=======
+/* An option's LABEL is data, not chrome: a facet value can be a long
+   underscored identifier ("acme_engagement_offerings"), which has no break
+   opportunity of its own and so ran straight out of the popover's fixed width
+   and pushed the count clean off the visible box — the one number that says
+   what clicking the option will leave on screen. It wraps rather than
+   ellipsing, because these values differ in their TAILS and "acme_engage…"
+   twice over is two options a reader cannot tell apart. `anywhere` (not
+   `break-word`) is what breaks a single unspaced token. */
+.fbar-menu__opt-text { min-width: 0; overflow-wrap: anywhere; }
+.fbar-menu__opt-n { margin-left: auto; flex: none; padding-left: 6px; font-size: 11.5px; color: var(--ds-text-muted); }
+>>>>>>> origin/fix/definitions-filters
 /* A BINARY refinement worth seeing at rest ("In stack only") is a toolbar
    BUTTON, not a menu row: its two states are complementary, so a category
    popover offering both would only ever be a longer way to say the same thing —
