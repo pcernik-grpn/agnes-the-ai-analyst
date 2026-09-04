@@ -58,12 +58,80 @@
     });
   }
 
-  /* A tool that lists data apps. Name-shaped rather than declared, because
-     nothing in the MCP protocol says "this one lists apps" — the same guess
-     the projection endpoint makes when it is told `lister: true`. */
-  function isLister(name) {
-    var n = String(name || '').toLowerCase();
-    return n.indexOf('data') >= 0 && n.indexOf('app') >= 0;
+  /* ── Which tool lists the apps ────────────────────────────────────────
+     Nothing in the MCP protocol says "this one lists apps", so it has to be
+     guessed — the same guess the projection endpoint makes when it is told
+     `lister: true`.
+
+     The guess used to be one substring test, name carries both "data" and
+     "app", first match wins. On the connector this was built around that
+     match is `create_python_js_data_app_git_credential` and the real lister,
+     `get_data_apps`, is fifteenth: "Read the app list", offered as a read,
+     put a WRITE tool into materialize mode and invoked it with `{}` (#2154).
+
+     So the guess is ranked, and two things disqualify a tool outright rather
+     than merely ranking it low — because a fallback that can still reach a
+     write tool is the bug itself:
+
+       * a write-shaped verb in front of the name. `create_…`, `deploy_…`,
+         `modify_…` do not list, whatever the rest of the name says.
+       * required arguments. The lister is called with `{}`, so a schema
+         demanding `configuration_id` cannot answer that call however it is
+         named. This is the one hard FACT here; the rest is a name.
+
+     `readOnlyHint` deliberately does NOT gate this. It is a tri-state, most
+     public servers still send nothing, and registration stores that as
+     `mutating: true` — so "candidates must be declared read-only" would leave
+     no lister at all on exactly the servers this feature exists for. It ranks
+     a candidate up when present; it never removes one. */
+
+  var WRITE_VERB = /^(create|delete|remove|drop|deploy|modify|update|patch|set|add|put|post|write|rename|move|copy|start|stop|restart|enable|disable|install|uninstall|run|execute|trigger|publish|unpublish|share|revoke|grant|import|upload)(_|$)/;
+  var READ_VERB = /^(get|list|read|search|fetch|describe|show|find|query)(_|$)/;
+
+  /* Both shapes reach here: a registry row (`original_name` + `mutating`,
+     from a registered source) and a probe row (`name` + the upstream's own
+     tri-state `read_only`, from the builder before anything is registered).
+     A registry row cannot tell "declared write" from "server said nothing" —
+     both are `mutating: true` — so it reports `null`, which ranks rather
+     than disqualifies. */
+  function normalizeTool(t) {
+    if (!t) return null;
+    var name = String(t.original_name || t.exposed_name || t.name || '');
+    if (!name) return null;
+    var required = t.input_schema && t.input_schema.required;
+    return {
+      name: name,
+      toolId: t.tool_id ? String(t.tool_id) : '',
+      declaredReadOnly: typeof t.read_only === 'boolean'
+        ? t.read_only
+        : (t.mutating === false ? true : null),
+      requiresArgs: !!(required && required.length),
+    };
+  }
+
+  /* -1 = not a candidate. Lower is better. */
+  function listerRank(t) {
+    if (!t) return -1;
+    var n = t.name.toLowerCase();
+    if (n.indexOf('data') < 0 || n.indexOf('app') < 0) return -1;
+    if (WRITE_VERB.test(n)) return -1;
+    if (t.requiresArgs) return -1;
+    var reads = READ_VERB.test(n);
+    if (t.declaredReadOnly === true && reads) return 0;
+    if (reads) return 1;
+    if (t.declaredReadOnly === true) return 2;
+    return 3;
+  }
+
+  /* Best first. Ties hold the server's own order, so the pick is stable
+     across reads rather than depending on how the list arrived. */
+  function listerCandidates(tools) {
+    return (tools || [])
+      .map(function (t, i) { return { t: normalizeTool(t), i: i }; })
+      .map(function (c) { c.rank = listerRank(c.t); return c; })
+      .filter(function (c) { return c.rank >= 0; })
+      .sort(function (a, b) { return a.rank - b.rank || a.i - b.i; })
+      .map(function (c) { return { name: c.t.name, tool_id: c.t.toolId, rank: c.rank }; });
   }
 
   /**
@@ -196,6 +264,34 @@
           'anything added since.</p>'
         : '';
       if (st.err) fetchBtn += '<div class="ag-note ag-note--err">' + esc(st.err) + '</div>';
+      /* WHICH tool reads the list is worth stating either way: a plausible
+         tool that answers with the wrong list looks exactly like a server
+         with odd apps, so the failure it guards is a silent one.
+
+         One candidate is a fact, and says so in a line. Several is a choice,
+         and takes a select — not a row of buttons. This is configuration,
+         not a view switch, so the tab vocabulary would mis-signal it; and
+         real tool names run past 40 characters, which a button row cannot
+         hold. The select also keeps the ranking honest: Agnes made a pick and
+         it is shown as the chosen VALUE, not as one of N equal options. */
+      var cands = o.candidates || [];
+      var current = cands.filter(function (c) { return c.tool_id === o.toolId; })[0];
+      var chooser = '';
+      if (cands.length === 1) {
+        chooser = '<p class="ag-note">Reading with <code>' + esc(cands[0].name) + '</code>.</p>';
+      } else if (cands.length > 1) {
+        chooser = '<label class="ag-field"><span>Tool that reads the list' +
+          '<em> — Agnes picked the one most likely to list apps</em></span>' +
+          '<select data-la-lister aria-label="Tool that reads the app list">' +
+          cands.map(function (c) {
+            return '<option value="' + esc(c.tool_id) + '"' +
+              (c.tool_id === o.toolId ? ' selected' : '') + '>' + esc(c.name) + '</option>';
+          }).join('') + '</select></label>';
+      }
+      if (cands.length > 1 && !current) {
+        chooser += '<div class="ag-note ag-note--warn">The chosen tool is no longer offered by this ' +
+          'server. Pick another before reading.</div>';
+      }
       if (!o.sourceId) {
         var idle = o.idlePrompt || {};
         return '<div class="ag-slot">' +
@@ -208,13 +304,13 @@
             '<p class="ag-slot-head">This server lists apps.</p>' +
             '<p class="ag-slot-body">Agnes can read the list and catalogue it here, so the apps show up in the ' +
             'Library for the groups you grant. Reading it writes the catalogue; nothing is shared until you grant.</p>' +
-          '</div>' + refresh + fetchBtn;
+          '</div>' + chooser + refresh + fetchBtn;
       }
       if (!st.apps.length) {
         return '<div class="ag-slot">' +
             '<p class="ag-slot-head">The server listed no apps.</p>' +
             '<p class="ag-slot-body">It answered, and the list was empty.</p>' +
-          '</div>' + refresh + fetchBtn;
+          '</div>' + chooser + refresh + fetchBtn;
       }
       var rows = st.apps.map(function (a) {
         var on = st.chosen[a.id] !== false;
@@ -229,7 +325,7 @@
         ? '<div class="ag-note ag-note--warn">' + st.skipped + ' row' + (st.skipped > 1 ? 's' : '') +
           ' could not be read — the columns did not match what Agnes expects of an app.</div>'
         : '';
-      return '<div class="ag-rows">' + rows + '</div>' + skipped + refresh + fetchBtn;
+      return '<div class="ag-rows">' + rows + '</div>' + skipped + chooser + refresh + fetchBtn;
     }
 
     /* One click handler for the whole panel. Returns true when it acted, so a
@@ -237,6 +333,7 @@
     function handle(t) {
       if (!t || !t.hasAttribute) return false;
       if (t.hasAttribute('data-la-read')) { fetchApps(); return true; }
+
       if (t.hasAttribute('data-la-app')) {
         var id = t.getAttribute('data-la-app');
         st.chosen[id] = st.chosen[id] === false;
@@ -246,18 +343,37 @@
       return false;
     }
 
+    /* The select's counterpart to `handle`. A host routes its existing
+       `input` listener here the way it routes clicks — the panel still owns
+       what the change MEANS, which is the rule both hosts are held to. */
+    function handleInput(t) {
+      if (!t || !t.hasAttribute || !t.hasAttribute('data-la-lister')) return false;
+      var tid = t.value;
+      if (tid && tid !== o.toolId) {
+        /* Re-pointing at another lister drops what was read, for the same
+           reason `setSource` does: a list read through one tool, shown under
+           another tool's name, is the bug that would replace this one. */
+        o.toolId = tid;
+        st.apps = []; st.chosen = {}; st.fetched = false; st.err = null; st.skipped = 0;
+        repaint();
+      }
+      return true;
+    }
+
     return {
       html: html,
       handle: handle,
+      handleInput: handleInput,
       summary: summary,
       publish: publish,
       chosen: chosen,
       /* Re-point at another source. The catalogue belongs to the source it
          came from, so everything read so far is dropped — showing one
          server's apps under another's name is the bug this prevents. */
-      setSource: function (sourceId, toolId) {
+      setSource: function (sourceId, toolId, candidates) {
         o.sourceId = sourceId || null;
         o.toolId = toolId || null;
+        o.candidates = candidates || [];
         st.apps = []; st.chosen = {}; st.fetched = false; st.err = null; st.skipped = 0;
       },
       sourceId: function () { return o.sourceId; },
@@ -273,5 +389,6 @@
     };
   }
 
-  window.LinkedAppsPanel = { create: create, isLister: isLister, SELECTOR: '[data-la-read],[data-la-app]' };
+  window.LinkedAppsPanel = { create: create, listerCandidates: listerCandidates, SELECTOR: '[data-la-read],[data-la-app]',
+    INPUT_SELECTOR: '[data-la-lister]' };
 })(window);
