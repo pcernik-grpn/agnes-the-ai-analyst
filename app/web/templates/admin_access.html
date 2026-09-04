@@ -1254,6 +1254,11 @@
     display: flex; align-items: center; gap: 10px;
     padding: 12px 22px; border-top: 1px solid var(--ds-border);
   }
+  .ax-simwho { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; margin: 2px 0 10px; }
+  .ax-simwho__name { font-size: 16px; font-weight: 650; color: var(--ds-text-primary); }
+  .ax-simwho__mail { font-size: 12px; color: var(--ds-text-muted); }
+  .ax-simwho__off { font-size: 11px; color: var(--ds-text-muted); border: 1px solid var(--ds-border);
+    border-radius: var(--ds-radius-pill); padding: 1px 8px; }
   .ax-picker__countwrap { position: relative; margin-right: auto; }
   /* A button that reads as the label it replaced until there is something
      to open — the footer should not grow a control that does nothing. */
@@ -3042,6 +3047,13 @@
        navigation — the way back out of the whole lens — when what it does is
        swap this card's contents between one person and the roster. #}
     <button type="button" class="apg-back ax-simback" id="ax-sim-back" data-people-back hidden>← All people</button>
+    {# WHOSE access this is. The card showed the back link, two actions and
+       the chain — and never the person's name, so an admin who arrived by
+       deep link, or who picked from a roster of similar names, was reading
+       an access audit with no subject on it. The name belongs above the
+       actions: "open their profile" and "view a page as them" both say
+       "them" and nothing said who. #}
+    <div class="ax-simwho" id="ax-sim-who" hidden></div>
     {# No second person picker. The toolbar's search sits above the tabs and
        already selects the person on this tab, so a "Person" dropdown here was
        a second control for one choice, ten pixels below the first — and the

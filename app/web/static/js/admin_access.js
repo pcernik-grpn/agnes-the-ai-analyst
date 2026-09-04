@@ -4835,6 +4835,37 @@
     if (label && opt) label.textContent = opt.textContent.trim();
   }
 
+  /* WHO the person lens is about. The roster cache answers for anyone in
+     it, but it is capped at 500 and only loaded on the no-selection branch,
+     so a `?user=` deep link (or an instance past the cap) would have
+     nothing to read — hence the single-user fetch behind it. Failing to
+     name someone must not blank their access chain, so every failure path
+     ends in `null` and the caller simply shows no name. */
+  async function resolvePerson(uid) {
+    const hit = users.find((u) => u.id === uid);
+    if (hit) return hit;
+    try {
+      const r = await fetch(`${USERS_LIST_API}/${encodeURIComponent(uid)}`, { credentials: "include" });
+      return r.ok ? await r.json() : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function paintSimWho(person) {
+    const who = el("ax-sim-who");
+    if (!who) return;
+    if (!person) { who.hidden = true; who.innerHTML = ""; return; }
+    const name = person.name || person.email || "";
+    const mail = person.email && person.email !== name ? person.email : "";
+    who.innerHTML = `<span class="ax-simwho__name">${esc(name)}</span>`
+      + (mail ? `<span class="ax-simwho__mail">${esc(mail)}</span>` : "")
+      // An inactive account still has grants on paper; saying so here stops
+      // the chain below reading as live access.
+      + (person.active === false ? `<span class="ax-simwho__off">deactivated</span>` : "");
+    who.hidden = false;
+  }
+
   async function loadUsers() {
     if (users.length) return;
     try {
@@ -4935,10 +4966,12 @@
       // "pick a person" placeholder to paint over it. `renderPeopleList`
       // hides the detail button itself, which is why that is not repeated.
       if (viewAsForm) viewAsForm.hidden = true;
+      paintSimWho(null);
       await loadUsers();
       renderPeopleList();
       return;
     }
+    paintSimWho(await resolvePerson(uid));
     detailBtn.hidden = false;
     detailBtn.href = `/admin/users/${encodeURIComponent(uid)}`;
     // The caller's own row offers no view-as: the entry route refuses it

@@ -488,6 +488,47 @@ class TestThePickerFilterReportsBothFacets:
         assert "famCount.size" in line  # either facet having options keeps it
 
 
+class TestThePersonLensNamesItsSubject:
+    """An access audit with no subject on it.
+
+    By person showed the back link, "Open their profile →", "View a page as
+    them →" and the whole grant chain — and never the person's name. Both
+    actions say "them"; nothing said who. An admin arriving by `?user=`
+    deep link, or picking from a roster of similar names, was reading one
+    person's access with no way to confirm whose.
+    """
+
+    def _source(self) -> str:
+        return access_page_source()
+
+    def test_the_card_has_somewhere_to_put_the_name(self):
+        src = self._source()
+        assert 'id="ax-sim-who"' in src
+        assert "ax-simwho__name" in src
+
+    def test_the_name_survives_an_empty_roster_cache(self):
+        """`users` is capped and only filled on the no-selection branch, so
+        a deep link would find it empty — the single-user fetch behind it is
+        the whole reason the name appears on that path."""
+        src = self._source()
+        block = src[src.index("async function resolvePerson(") : src.index("function paintSimWho")]
+        assert "users.find(" in block            # cache first
+        assert "USERS_LIST_API}/" in block       # then the one account
+        assert "return null" in block            # and never throw into the chain
+
+    def test_picking_paints_it_and_going_back_clears_it(self):
+        src = self._source()
+        assert "paintSimWho(await resolvePerson(uid))" in src
+        assert "paintSimWho(null)" in src
+
+    def test_a_deactivated_account_says_so_beside_the_name(self):
+        """Its grants still resolve, so the chain below would otherwise read
+        as live access."""
+        src = self._source()
+        assert "person.active === false" in src
+        assert "deactivated" in src
+
+
 class TestWhatIsTickedCanBeReviewed:
     """A selection you cannot see is a selection you cannot check.
 
