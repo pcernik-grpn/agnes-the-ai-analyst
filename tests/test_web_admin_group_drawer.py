@@ -23,7 +23,7 @@ What these tests pin:
 from __future__ import annotations
 
 from pathlib import Path
-from tests.helpers.access_page import with_module
+from tests.helpers.access_page import access_page_source, with_module
 
 STATIC = Path("app/web/static")
 
@@ -245,12 +245,17 @@ class TestPeopleSearchIsOneImplementation:
         assert "?search=" not in js
 
     def test_group_detail_search_calls_the_shared_lookup_not_its_own_fetch(self):
-        html = (self.TEMPLATES / "admin_access.html").read_text(encoding="utf-8")
-        assert "window.AgnesPeopleSearch.search(" in html
+        # The page, not the template: /admin/access's script is a static
+        # asset (`js/admin_access.js`), so a scan of the rendered template
+        # finds only the `<script src>` tag. `access_page_source()`
+        # concatenates both halves for exactly this reason — a string that
+        # moves between markup and script does not stop being checked.
+        src = access_page_source()
+        assert "window.AgnesPeopleSearch.search(" in src
         # The ax-find "add someone" box's OWN runFind must not still build
         # its own `/api/users?search=` URL — the shared helper is the only
         # thing allowed to.
-        assert "USERS_LIST_API}?search=" not in html
+        assert "USERS_LIST_API}?search=" not in src
 
 
 
@@ -296,12 +301,14 @@ class TestPeopleSearchDistinguishesErrorFromEmpty:
         assert "var(--ds-" in css.split(".gdw-found__error", 1)[1].split("}", 1)[0]
 
     def test_group_detail_search_renders_the_failure_distinctly_from_no_match(self):
-        html = (self.TEMPLATES / "admin_access.html").read_text(encoding="utf-8")
-        assert "const { people, error } = await window.AgnesPeopleSearch.search(" in html
-        assert "ax-res__msg--error" in html
+        # Both halves of the page: the error CSS lives in the template, the
+        # branch that uses it in the extracted script.
+        src = access_page_source()
+        assert "const { people, error } = await window.AgnesPeopleSearch.search(" in src
+        assert "ax-res__msg--error" in src
         # The no-match / invite copy must still exist, and only reached
         # when the lookup succeeded with zero results.
-        assert "No account for" in html or "No account matches" in html
+        assert "No account for" in src or "No account matches" in src
 
     def test_admin_access_error_css_uses_design_system_tokens(self):
         html = (self.TEMPLATES / "admin_access.html").read_text(encoding="utf-8")
