@@ -27,7 +27,6 @@ from app.auth.dependencies import _get_db, get_current_user
 from src.marketplace_filter import granted_store_entity_keys, required_plugin_keys, resolve_allowed_plugins
 from src.repositories import (
     audit_repo,
-    marketplace_plugins_repo,
     user_curated_subscriptions_repo,
     user_store_installs_repo,
 )
@@ -44,15 +43,16 @@ class CuratedPlugin(BaseModel):
     description: Optional[str] = None
     version: Optional[str] = None
     enabled: bool
-    # v39: when TRUE, the user cannot unsubscribe (UI disables the
-    # toggle, API guard returns 409). Pre-subscribed by mark_system +
-    # creation hooks so ``enabled`` is always TRUE here.
-    is_system: bool = False
-    # Group-scoped Required tier: TRUE when any of the caller's groups
-    # holds a ``requirement='required'`` grant for this plugin. Same
-    # locked-toggle semantics as ``is_system`` (409 on unsubscribe), but
-    # scoped to the granted groups; served without a subscription row,
-    # so ``enabled`` reports TRUE even with no explicit subscription.
+    # TRUE when the caller cannot unsubscribe: some audience they are in
+    # holds this plugin at ``requirement='required'`` — one of their groups,
+    # or ``scope='everyone'``. The UI disables the toggle and the API guard
+    # returns 409. Served without a subscription row, so ``enabled`` reports
+    # TRUE even with no explicit subscription.
+    #
+    # There used to be an ``is_system`` field beside this one with the same
+    # two behaviours, fed by ``marketplace_plugins.is_system``. It was the
+    # everyone-audience case of exactly this field, and the two names were
+    # the defect. 0098 deleted the flag; this field answers for both.
     is_required: bool = False
 
 
@@ -126,19 +126,15 @@ async def get_my_stack(
     # subscription row — the toggle must not claim "off" for a plugin the
     # user's sandbox actually has.
     subs = user_curated_subscriptions_repo().subscribed_set(user["id"])
+    # One round trip, and it now covers the everyone audience too — the
+    # separate ``list_system_keys()`` read that used to sit here answered the
+    # same question for a flag that no longer exists.
     required = required_plugin_keys(conn, user["id"])
-
-    # v39: surface is_system flag so the template can lock the toggle.
-    # One round trip — set membership intersection in Python is cheaper
-    # than joining marketplace_plugins per-row inside resolve_allowed_plugins
-    # (which is also called from the marketplace_filter / packager hot path).
-    system_plugins: set[tuple[str, str]] = set(marketplace_plugins_repo().list_system_keys())
 
     curated: List[CuratedPlugin] = []
     for p in granted:
         key = (p["marketplace_id"], p["original_name"])
         is_subscribed = key in subs
-        is_system = key in system_plugins
         is_required = key in required
         curated.append(
             CuratedPlugin(
@@ -149,7 +145,6 @@ async def get_my_stack(
                 description=p["raw"].get("description"),
                 version=p.get("version"),
                 enabled=is_subscribed or is_required,
-                is_system=is_system,
                 is_required=is_required,
             )
         )
@@ -222,20 +217,18 @@ async def toggle_curated(
     if not has_grant:
         raise HTTPException(status_code=404, detail="grant_not_found")
 
-    # v39: system plugins are pinned in every user's stack — refuse the
+    # Required-tier plugins are pinned in the caller's stack — refuse the
     # unsubscribe path. Subscribe is still allowed (no-op on the
     # already-materialized row).
+    #
+    # ONE guard, not two. There was a `cannot_unsubscribe_system_plugin` 409
+    # above this for `marketplace_plugins.is_system`, which said the same
+    # thing about the same plugins; the flag is now a required
+    # everyone-scoped grant, so `required_plugin_keys` sees it.
     if not body.enabled:
-        row = marketplace_plugins_repo().get(marketplace_id, plugin_name)
-        if row and bool(row.get("is_system")):
-            raise HTTPException(
-                status_code=409,
-                detail="cannot_unsubscribe_system_plugin",
-            )
-        # Group-scoped Required tier: the resolver serves required-granted
-        # plugins regardless of the subscription row, so honoring the
-        # unsubscribe would leave the toggle claiming "off" for a plugin
-        # still in the user's sandbox. Refuse, mirroring is_system.
+        # The resolver serves required-granted plugins regardless of the
+        # subscription row, so honoring the unsubscribe would leave the
+        # toggle claiming "off" for a plugin still in the user's sandbox.
         if (marketplace_id, plugin_name) in required_plugin_keys(conn, user["id"]):
             raise HTTPException(
                 status_code=409,

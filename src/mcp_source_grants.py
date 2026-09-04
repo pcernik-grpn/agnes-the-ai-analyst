@@ -38,6 +38,9 @@ from typing import Optional
 
 from app.resource_types import ResourceType
 
+#: What this module is, to `resource_grants.source` (src/grant_sources.py).
+GRANT_SOURCE = "mcp_source_default"
+
 logger = logging.getLogger(__name__)
 
 #: The group every already-registered (and newly registered) MCP source is
@@ -76,6 +79,7 @@ def ensure_default_mcp_source_grant(source_id: str) -> None:
         group_id=group_id,
         resource_type=ResourceType.MCP_SOURCE.value,
         resource_id=source_id,
+        source=GRANT_SOURCE,
     )
     logger.info("mcp_source RBAC seed: granted Everyone -> mcp_source:%s", source_id)
 
@@ -107,6 +111,7 @@ def seed_default_mcp_source_grants() -> None:
             group_id=group_id,
             resource_type=ResourceType.MCP_SOURCE.value,
             resource_id=src["id"],
+            source=GRANT_SOURCE,
         )
         seeded += 1
     if seeded:

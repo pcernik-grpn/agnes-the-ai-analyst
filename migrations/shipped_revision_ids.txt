@@ -156,3 +156,8 @@
 0097_access_policy_revisions
 0107_merge_access_policy_revs
 0108_sp_acl_snapshot_kind
+0096_resource_grants_source
+0108_merge_grants_source
+0097_resource_grants_scope
+0098_everyone_becomes_a_scope
+0109_merge_access_stack

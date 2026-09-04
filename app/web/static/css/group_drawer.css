@@ -93,6 +93,10 @@
 .gdw-found__who { font-size: 13px; font-weight: 600; color: var(--ds-text-primary); }
 .gdw-found__mail { font-size: 12px; color: var(--ds-text-muted); }
 .gdw-found__none { margin: 0; padding: 10px 12px; font-size: 12.5px; color: var(--ds-text-muted); }
+/* Says which list this is: the roster an empty box offers, not the answer to
+   a query. Without it a sample of twelve reads as twelve matches. */
+.gdw-found__hd { padding: 6px 10px 4px; font-size: 11.5px; font-weight: 600;
+  color: var(--ds-text-muted); }
 /* A failed lookup, not an empty one — distinct ink so it does not read
    as just another "no account" line. */
 .gdw-found__error { color: var(--ds-accent-warn-ink); }
