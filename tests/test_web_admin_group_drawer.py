@@ -259,6 +259,43 @@ class TestPeopleSearchIsOneImplementation:
 
 
 
+class TestThePeopleFieldOffersARosterBeforeAnyoneTypes:
+    """A field that shows nothing until you can spell a colleague's name is
+    only usable by someone who already knows the answer — and the admin
+    creating a group very often does not, which is the same reason By person
+    grew a roster instead of demanding a name.
+    """
+
+    def test_the_shared_lookup_can_list_without_a_term(self):
+        """`search('')` resolves empty on purpose (an empty box is not a
+        query), so browsing needs its own entry point — on the SHARED helper,
+        not a second fetch in the drawer."""
+        js = (STATIC / "js" / "people_search.js").read_text(encoding="utf-8")
+        assert "recent(limit)" in js
+        # One fetch + shape handler behind both, or they drift the way the two
+        # hand-rolled copies of `search` once did.
+        assert "_get(url)" in js
+        assert js.count("credentials: 'include'") == 1
+
+    def test_focus_and_an_emptied_box_both_offer_the_roster(self):
+        js = (STATIC / "js" / "components" / "group_drawer.js").read_text(encoding="utf-8")
+        assert "addEventListener('focus'" in js
+        assert "runBrowse()" in js
+        # Clearing the box returns to the roster rather than closing it.
+        assert "if (!q) { runBrowse(); return; }" in js
+        # Still no second copy of the URL in the drawer.
+        assert "?search=" not in js
+
+    def test_the_roster_says_which_list_it_is(self):
+        """A sample of twelve otherwise reads as twelve matches — and its
+        empty case means "nobody left to add", not "nobody matched"."""
+        js = (STATIC / "js" / "components" / "group_drawer.js").read_text(encoding="utf-8")
+        assert "Anyone on this instance" in js
+        assert "Everyone with an account is already in this group." in js
+        css = (STATIC / "css" / "group_drawer.css").read_text(encoding="utf-8")
+        assert ".gdw-found__hd" in css
+
+
 class TestPeopleSearchDistinguishesErrorFromEmpty:
     """A non-ok response from `GET /api/users` (403/500/501, a network
     failure) used to collapse into the SAME empty array a genuine
