@@ -82,6 +82,28 @@ class TestOwnedModelCountColumn:
         amber_branch = renderer.split("ss-models-empty")[0]
         assert 'n === 0 && s.last_sync_status === "ok"' in amber_branch
 
+    def test_a_count_with_models_behind_it_opens_them(self, seeded_app):
+        """#2200 — the cell stating "2 models" was the one thing on this page
+        that could not show them. The only door was the words "Semantic
+        models" in the subtitle, which is not where an admin reading a row
+        asks the question."""
+        body = self._body(seeded_app)
+        renderer = body.split("function fmtOwnedModels")[1].split("\nfunction ")[0]
+        positive = renderer.split("if (n > 0)")[1]
+        assert "<a class=" in positive
+        assert 'href="/semantic-layer?tab=models"' in positive
+
+    def test_a_count_of_zero_is_not_a_link(self, seeded_app):
+        """Nothing to open. A link landing on a list this source contributed
+        nothing to is the "browse" affordance the never-synced row already
+        declines to offer — and the amber "synced and owns nothing" finding
+        keeps its own accent by being evaluated first."""
+        body = self._body(seeded_app)
+        renderer = body.split("function fmtOwnedModels")[1].split("\nfunction ")[0]
+        before_the_link = renderer.split("if (n > 0)")[0]
+        assert "<a " not in before_the_link
+        assert "ss-models-empty" in before_the_link, "the zero-with-a-clean-sync branch must still come first"
+
     def test_an_unknown_count_is_not_rendered_as_zero(self, seeded_app):
         """`owned_model_count: null` means "cannot say" — the page must show
         the unknown marker, never a confident "0 models"."""
