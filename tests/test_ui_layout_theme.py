@@ -768,11 +768,18 @@ class TestRailChatHistory:
         # Row anatomy: the ring (icon) + title + progress sentence.
         assert 'id="rail-getstarted-ring-fill"' in text
         assert 'id="rail-getstarted-title"' in text
-        assert ">Set up Agnes<" in text
+        # "Continue setup", not "Set up Agnes": opening /library IS the
+        # "Explore your Library" step, landed before the page renders, and the
+        # title and count are the caller's REAL state now rather than a static
+        # placeholder for chat_onboarding.js to overwrite.
+        assert ">Continue setup<" in text
         assert 'id="rail-getstarted-count"' in text
-        # The progress line renders EMPTY — a static "0 of 5" would flash the
-        # wrong number at anyone mid-way through.
-        assert '<span class="rail-getstarted-sub" id="rail-getstarted-count"></span>' in text
+        # The progress line used to render empty, on the reasoning that a
+        # static "0 of 5" would flash the wrong number at anyone mid-way; the
+        # real number is what removes the flash instead, since an empty line
+        # that fills in a beat later grew the row and moved every row above it
+        # (tests/test_rail_onboarding_first_paint.py).
+        assert '<span class="rail-getstarted-sub" id="rail-getstarted-count">1 of 6 steps complete</span>' in text
         # Retired anatomy: the horizontal bar and the chevron are gone — the
         # ring carries progress now, and this row navigates via the same
         # click as always rather than "expanding".
