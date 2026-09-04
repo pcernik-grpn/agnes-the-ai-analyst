@@ -153,3 +153,5 @@
 0104_extraction_conditions
 0105_fact_collection_stats
 0106_hot_path_indexes
+0097_access_policy_revisions
+0107_merge_access_policy_revs

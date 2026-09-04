@@ -168,6 +168,8 @@ __all__ = [
     "extraction_runs_repo",
     # Fleet-level provider-refusal conditions (TCRD-296 synthesis F.25)
     "extraction_conditions_repo",
+    # Table access-policy revision history (#1979)
+    "access_policy_revisions_repo",
     # External SSO login (design 2026-08-28)
     "sso_config_repo",
     "user_external_identities_repo",
@@ -601,6 +603,14 @@ _REGISTRY: dict[str, dict[str, tuple[str, str]]] = {
     # ratchet: no DuckDB backend.
     "extraction_conditions": {
         PG: ("src.repositories.extraction_conditions_pg", "ExtractionConditionsPgRepository"),
+    },
+    # Table access-policy revision history (#1979 K1-sweep finding 1) —
+    # PG-only, A3 ratchet: no DuckDB backend. Deliberately NOT audit_log:
+    # `audit_log.params` redacts `access_policy_sql`, so the trail records
+    # that a policy changed but never what it was, and "restore this
+    # version" needs the body.
+    "access_policy_revisions": {
+        PG: ("src.repositories.access_policy_revisions_pg", "AccessPolicyRevisionsPgRepository"),
     },
     # External SSO login (design 2026-08-28) — PG-only, A3 ratchet: no
     # DuckDB backend. The singleton runtime config for the `sso` provider
@@ -1102,6 +1112,15 @@ def extraction_conditions_repo() -> Any:
     ``connectors.sharepoint.facts_extraction`` treats that as "no
     condition tracked here", never a hard failure."""
     return _build("extraction_conditions")
+
+
+def access_policy_revisions_repo() -> Any:
+    """Saved states of a table's access policy (#1979) — what the history
+    panel lists and what "restore this version" prefills the editor from.
+    PG-only — raises ``RequiresPostgresBackend`` on a DuckDB-backed
+    instance, which every caller treats as "no revision history here" (the
+    modal falls back to the audit-derived, read-only history)."""
+    return _build("access_policy_revisions")
 
 
 def sso_config_repo() -> Any:

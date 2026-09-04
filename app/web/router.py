@@ -9367,7 +9367,7 @@ async def admin_tables(
     user: dict = Depends(require_admin),
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
 ):
-    from app.instance_config import get_data_source_type
+    from app.instance_config import feature_enabled, get_data_source_type
 
     # Branch the register-modal layout server-side so the JS doesn't have
     # to round-trip /api/admin/server-config to learn the source type.
@@ -9377,6 +9377,17 @@ async def admin_tables(
         request,
         user=user,
         data_source_type=data_source_type,
+        # K1-sweep finding 4 (#1979): the Access Policy modal opened
+        # regardless of this flag and only the server-side PUT 422'd —
+        # branched here (same pattern as `facts_enabled`/`studio_enabled`
+        # above) so the modal can show the notice + disable Save up front
+        # instead of after a rejected save. The flag only gates ATTACHING a
+        # policy; enforcement of an existing one always runs (see the
+        # switch's own description in app/switches.py). Drafting and
+        # previewing a policy stay fully usable either way.
+        access_policies_enabled=feature_enabled(
+            "access_policies", "enabled", env_var="AGNES_ACCESS_POLICIES_ENABLED", default=False
+        ),
         # The end of each table's chain — which package carries it and how
         # many people that reaches. The page hydrates its rows client-side
         # from /api/admin/registry, but reach is a grants × group-membership
