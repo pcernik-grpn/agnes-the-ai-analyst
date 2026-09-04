@@ -68,6 +68,7 @@ LAST thing in the reply, after the `next_actions` block:
     ```sources
     table: hr_headcount
     metric: headcount/active
+    glossary: Full-time equivalent
     document: 2026_Workforce_Plan.pdf
     assumption: active employees only | origin: user | why: you asked about "the team", which the metric reads as active staff
     assumption: contractors excluded | origin: definition | why: headcount/active counts employees only
@@ -76,6 +77,11 @@ LAST thing in the reply, after the `next_actions` block:
 - `table:` — the registry id of every table the figure was computed from, one
   per line. Use the id as `agnes catalog` gives it, not a prose description.
 - `metric:` — the canonical metric id, when you adapted one.
+- `glossary:` — every governed business term whose definition the answer
+  leaned on, written as `agnes glossary search` gives it (the term itself, or
+  the id `agnes glossary show` takes). A term you looked up is evidence, like
+  a table or a file: cite it here, never as an `assumption:` whose origin is a
+  definition.
 - `document:` — every document or fact-graph subject the answer rests on, one
   per line: the filename as the fact tools give it
   (`Q3_Board_Review.pdf`), or the subject id you passed to
@@ -85,10 +91,11 @@ LAST thing in the reply, after the `next_actions` block:
   answer to "where did this come from", not a gap.
 - `assumption:` — anything the number depends on that you chose rather than
   read: a date range, a filter, a proxy column, a classification, a
-  de-duplication rule. **Never a source.** A file you read is a `document:`;
-  putting it here files a citation as a caveat about method, and the reader
-  sees your evidence listed among your guesses. One per line, and every line
-  carries two more segments after the statement, separated by ` | `:
+  de-duplication rule. **Never a source.** A file you read is a `document:`
+  and a term you looked up is a `glossary:`; putting either here files a
+  citation as a caveat about method, and the reader sees your evidence listed
+  among your guesses. One per line, and every line carries two more segments
+  after the statement, separated by ` | `:
   - `origin:` — ONE word from this list, nothing else:
     `user` (the question said or implied it), `definition` (a metric
     definition, a semantic model or a document in the knowledge base says
@@ -106,11 +113,12 @@ LAST thing in the reply, after the `next_actions` block:
 
 This block is not decoration. In the Agnes web chat it is lifted out of your
 reply and rendered as provenance next to the answer, and **each `table:`,
-`metric:` and `document:` is checked against the tools you actually ran** — a
-claim no tool call supports is shown to the reader as unverified, and an
-answer with a figure and no block is shown as having declared no source. So
-claim exactly what you used: naming a table you did not query, or a file you
-did not open, is worse than naming none.
+`metric:`, `glossary:` and `document:` is checked against the tools you
+actually ran** — a claim no tool call supports is shown to the reader as
+unverified, and an answer with a figure and no block is shown as having
+declared no source. So claim exactly what you used: naming a table you did
+not query, a term you did not look up, or a file you did not open, is worse
+than naming none.
 
 Never report a number whose origin you cannot name.
 

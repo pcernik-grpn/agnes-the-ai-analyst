@@ -83,7 +83,7 @@ _NEXT_ACTIONS_OPEN_RE = re.compile(r"```next_actions[ \t]*\r?\n", re.IGNORECASE)
 #: One claim per line: `kind: ref`. Anything else in the block is ignored
 #: rather than treated as an error — a stray blank line or a comment must not
 #: cost the reader the whole block.
-_CLAIM_RE = re.compile(r"^\s*(table|metric|document|assumption)\s*:\s*(.+?)\s*$", re.IGNORECASE)
+_CLAIM_RE = re.compile(r"^\s*(table|metric|glossary|document|assumption)\s*:\s*(.+?)\s*$", re.IGNORECASE)
 
 #: Claim kinds that name something the agent should have touched, and can
 #: therefore be checked. `assumption` is free text about the analyst's own
@@ -101,7 +101,23 @@ _CLAIM_RE = re.compile(r"^\s*(table|metric|document|assumption)\s*:\s*(.+?)\s*$"
 #: The last of those lines said it outright: *"No SQL tables queried — this
 #: answer is sourced entirely from the document fact graph"*, a model
 #: reporting a schema mismatch through the only channel it had.
-VERIFIABLE_KINDS = frozenset({"table", "metric", "document"})
+#:
+#: ``glossary`` joined for the same reason one kind later (#2258): a governed
+#: business term the answer leaned on had no word either, so its only legal
+#: slot was ``assumption: … | origin: definition`` — a citation filed as a
+#: caveat about method, which is precisely what the prompt warns against on
+#: the line above it. A term is evidence.
+#:
+#: Its read tier is its OWN, and the difference matters downstream rather
+#: than here: ``GET /api/glossary*`` serves any authenticated caller with no
+#: per-resource narrowing (business vocabulary, not data), while ``GET
+#: /api/metrics`` drops every metric bound to a table outside the caller's
+#: stack. Nothing in this module reads either registry — verification is
+#: containment over the turn's own tool calls — so the verdict is outside
+#: that split by construction, and the client is where it has to be honoured
+#: (a glossary chip opens the glossary tab, never the filtered metrics one;
+#: see ``_claimHref`` in ``chat.js``).
+VERIFIABLE_KINDS = frozenset({"table", "metric", "glossary", "document"})
 
 #: Floor on a needle this module DERIVES from a claim (a document's basename,
 #: its extensionless stem) rather than one the answer wrote. Peeling is meant
@@ -231,7 +247,7 @@ def _split_assumption(ref: str) -> tuple[str, Optional[str], Optional[str]]:
 
 @dataclass(frozen=True)
 class SourceClaim:
-    kind: str  # "table" | "metric" | "document" | "assumption"
+    kind: str  # "table" | "metric" | "glossary" | "document" | "assumption"
     ref: str
     #: None for kinds that carry nothing to check (see VERIFIABLE_KINDS).
     verified: Optional[bool] = None
@@ -424,6 +440,14 @@ def verify(claims: list[SourceClaim], tool_calls: Optional[Iterable[Any]]) -> li
         needles = [ref]
         if c.kind == "metric" and "/" in ref:
             needles.append(ref.rsplit("/", 1)[-1])
+        # A `glossary:` ref gets NO derived needle, deliberately — it is the
+        # one kind whose ref has no structure to peel. A metric id is a
+        # namespaced `family/name` and a document is a path, so their tails
+        # are the same identifier written shorter; a term is prose, where a
+        # slash or a dot is punctuation inside the name ("bookings/billings"
+        # is one term). Splitting it would not be latitude, it would invent a
+        # needle the answer never wrote and verify the citation against a
+        # turn that looked up something else.
         # A document is cited by whatever the agent saw it called, and the
         # fact tools do not agree with each other on that: `fact_claims`
         # names the file, a collections listing carries a path in front of
