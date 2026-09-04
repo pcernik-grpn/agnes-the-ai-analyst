@@ -2003,16 +2003,13 @@ unknown/non-sharepoint connection before any other work; refuses cleanly
 extra is not installed); a run already queued/running for the same
 connection is `409 extraction_already_running` — deduped on a stable
 per-connection idempotency key shared with the sweep below. When the body
-sets `retry_failed: true` and/or `retry_empty: true` (TCRD-296 synthesis /
-source-card redesign — the source card's `Run now ▾` popover checkboxes
-and `agnes admin sharepoint extract --retry-failed --retry-empty`), the
-response also carries `queued_count` — the combined size of this
-connection's persisted `failed_items`/`empty_items` backlogs at the moment
-this call reads them, before the job is enqueued, mirroring
-`…/extraction/retry-empty`'s own `queued_count` below. `retry_empty` here
-is the SAME replay the standalone `…/extraction/retry-empty` route below
-triggers, offered here so one request can combine it with the other
-options. Absent for a plain trigger, `--resync`, or `--force-reprocess`.
+sets `retry_failed: true` (TCRD-296 synthesis — the source card's "Retry
+failed (N)" button and `agnes admin sharepoint extract --retry-failed`),
+the response also carries `queued_count` — the size of this connection's
+persisted `failed_items` backlog at the moment this call reads it, before
+the job is enqueued, mirroring `…/extraction/retry-empty`'s own
+`queued_count` below. Absent for a plain trigger, `--resync`, or
+`--force-reprocess`.
 
 `POST …/extraction/retry-empty` re-queues this connection's `convert_empty`
 backlog — documents that converted fine but carried no text (a scan with no
@@ -2187,7 +2184,6 @@ The fleet endpoint two paragraphs down (`.../extraction/runs` with no
 - /api/admin/sharepoint/connections/{connection_id}/extraction/crawl-config
 - /api/admin/sharepoint/connections/{connection_id}/extraction/retry-empty
 - /api/admin/sharepoint/connections/{connection_id}/extraction/completeness
-- /api/admin/sharepoint/connections/{connection_id}/extraction/breakdown
 - /api/admin/sharepoint/extraction/runs/{run_id}/cancel
 
 `GET …/extraction/status` returns the live run (if any) and the last completed
@@ -2222,16 +2218,7 @@ queued/running standalone facts pass for this connection
 read off the job queue (matched on the same idempotency key the trigger
 dedups on) and never appears in `running`/`last_completed`. The card shows
 it as a "facts pass queued/running" line in the Run row and locks its own
-"Extract facts now" button while one is in flight. `crawl_job` mirrors
-`facts_job` for the crawl trigger's own `corpus-extraction` job kind — the
-queued/running job or `null`, source-card redesign §8 — filling the window
-between a trigger enqueueing and a worker claiming it and opening the
-first `extraction_runs` row, where `running` would otherwise read as
-"never run". `files_per_min` is the same windowed-rate computation the
-fleet view's own `files_per_min` column already uses, derived over
-`running` (`null` when nothing is running or the rate is not yet
-computable) — the source card's live line reads this rather than dividing
-absolute counters itself. `failed_items_count` /
+"Extract facts now" button while one is in flight. `failed_items_count` /
 `empty_items_count` (TCRD-296 synthesis) are the SIZE of this connection's
 persisted `failed_items`/`empty_items` backlogs (a cheap `jsonb_object_keys`
 count, never a decode of the — potentially huge — payload on this
@@ -2326,32 +2313,6 @@ need to open a source card just to see whether there is anything to retry.
 Each row also carries `next_run_at` (D.16) — the same best-effort "next
 sweep" hint the crawl-config PATCH response and `…/extraction/status`
 carry, pure computation, no extra query per row.
-
-Each row's `estimated_cost_usd`/`cost_status`/`cost_models`/`token_totals`
-(cost-truth fix) sum TWO cost sources: the crawl run's own inline `usage`
-block, and this connection's own attributable slice of `facts_ingest_runs`
-— the SEPARATE ledger a standalone `sharepoint-facts-extraction` job writes
-to instead of the crawl's row, resolved for the WHOLE page in one batched
-query keyed by each connection's scope collections. `cost_status` is
-`"no_usage"` (nothing recorded anywhere — `estimated_cost_usd: null`, never
-a fabricated `0`), `"unpriced"` (tokens known, no single named model to
-honestly price — also `null`) or `"priced"` (a real figure); `cost_models`
-names what a `"priced"` figure was actually priced at. A SharePoint
-bulk-add's shared-collection option, or the sibling connections a site
-split creates, can legitimately route more than one connection's scope at
-the SAME collection — a row's own figure stays a FULL, un-split
-attribution in that case (never a fabricated fractional split), marked by
-`cost_shared`/`cost_shared_with` (the other connection name(s) sharing at
-least one contributing `facts_ingest_runs` run) so that is never left
-implicit. `totals.estimated_cost_usd` is NOT the sum of the rows' own
-`estimated_cost_usd` — that would double-count a shared run — it sums each
-rendered row's own crawl-run cost (never shared between connections) plus
-the ledger cost de-duplicated by run id exactly once across every rendered
-row, with `totals.cost_note` stating this in the response itself. The
-top-level `llm_usage_totals` is the SAME instance-wide cumulative rollup
-`GET /api/facts/ingest-runs` already returns — every `facts_ingest_runs`
-row this instance has EVER persisted, not scoped to the page's own rows or
-`active`/`all` filter, rendered as its own distinctly-labelled summary tile.
 
 The response also carries a top-level `jobs` block — `{kind: {queued,
 running}}` for `corpus-extraction` and `sharepoint-facts-extraction`, read
@@ -2562,78 +2523,6 @@ to count against, so no token is ever requested). Audited as
 [--min-modified <date>] [--refresh] [--json]`, rows sorted by `gap`
 descending. Deliberately not MCP-exposed — an admin/ops display primitive
 over live Graph data, same reasoning as `…/split-plan`.
-
-`GET …/extraction/breakdown` (2026-09-04) answers a different question than
-completeness above: not "does the corpus match what Graph Search says
-exists", but "of what the crawl itself touched, what became of it" — read
-entirely from `extraction_runs`/`corpus_files`, no Graph calls. `since`/
-`until` (`400 invalid_since`/`invalid_until` on a malformed bound) scope
-which runs contribute; the default is every run on record for this
-connection, capped defensively at 500, newest first — every PARENT (planner)
-row and every shard CHILD alike, so a sharded site's real per-shard failures
-count once each rather than folding into (or missing from) a near-empty
-parent report.
-
-`by_extension` groups `corpus_files` rows by the extension parsed from
-`path` — **never `filename`/`file_type`**, which for a converted document
-always name the stored markdown artifact ("md" regardless of whether the
-source was a `.pdf` or a `.pptx`) — into `indexed`/`rejected`/`processing`/
-`pending`/`needs_review` counts and byte totals, merged with per-extension
-`failed`/`empty_text` counts from `failures` below. `needs_review`
-(`src/ingest/runner.py`) is a DIFFERENT "produced no text" signal than
-`empty_text` — conversion succeeded and CHUNKING still yielded zero chunks,
-one stage later in the pipeline than the crawler's own `convert_empty`.
-This is the corpus's CURRENT state, unscoped by `since`/`until` by design;
-narrowing the window only narrows which runs' failure/skip/scalar counters
-are aggregated, so `reconciliation.unexplained` becomes an increasingly
-approximate figure the narrower the window gets (never hidden either way —
-see its own `note`).
-
-`failures` groups `report.failed_items` by NORMALIZED reason: every item's
-`reason` has its leading local-temp-filename prefix stripped (crawl items
-download to a `tempfile.mkstemp()` path before conversion, and a convert
-failure's message is `"{temp_filename}: {message}"`, so one underlying fault
-across a thousand files would otherwise list as a thousand one-row reasons)
-before grouping, and the `convert_empty` cohort — "conversion succeeded but
-produced no extractable text", usually a scanned document that needs OCR,
-not a broken pipeline — is called out separately from every other failure
-rather than folded in with it. `listed` is a lower bound, never a fabricated
-total, when `truncated` is true (a contributing run's own `failed_items`
-list hit its 5000-item cap; the crawl does not persist how many more there
-were past it).
-
-`scalars` sums the run-level counters (`new`/`changed`/`unchanged`/
-`filtered_by_age`/`permission_skips`/`excluded_subtree_skips`/
-`bytes_downloaded`/`http_429`/`requests`/... ) across the window, reading
-each run's REPORT when it finished normally and its live PROGRESS checkpoint
-otherwise — the trap this exists to avoid: an interrupted run (worker killed
-before writing a report) has an empty `report` and only `progress`, and a
-few fields (`permission_skips`, `excluded_subtree_skips`, `requests`,
-`item_seconds`, `duration_s`, oversize bytes) exist ONLY in a finished run's
-report, so they undercount by exactly however many runs in the window never
-got one — `runs.progress_only` and `scalars.contributed_runs` say by how
-much, rather than a silent average. `reconciliation` reads `seen = new +
-changed + unchanged + filtered_by_age` against `accounted_for = indexed +
-needs_review + failed + empty_text + skipped_unsupported +
-permission_skips + excluded_subtree_skips + oversize_files`, and reports
-`unexplained` as their difference — positive, negative, or zero, never
-suppressed.
-
-`404` for an unknown/non-SharePoint connection. Exempt (`ui_support`), same
-disclosure class as A2/A3 above: unlike `extraction/runs/{run_id}` (A3),
-this never carries a `path`/`item_id`/`drive_id`, only extensions,
-normalized reason strings and counts — with one exception on "reason
-strings": a `convert_failed` reason can itself quote a short fragment of the
-document the converter just failed on (`_convert_failure_detail`,
-`connectors/sharepoint/crawler.py`) when the owning scope is not
-anonymize-marked, the same exposure A3's own `report.failed_items`/
-`errors_detail` already carry (A3 additionally names the real path/item_id,
-which this endpoint never does — so this sits at or below A3's own
-disclosure level). CLI: `agnes admin sharepoint breakdown <connection_id>
-[--since <iso>] [--until <iso>] [--limit <n>] [--json]`, same reasoning as
-`completeness` above. Deliberately not MCP-exposed — an
-aggregate operational diagnostic, not a bounded analyst query, same
-reasoning as `…/extraction/config`.
 
 ### `/api/admin/ontology` — Ontology builder (spec 2026-08-27 §13.2)
 
