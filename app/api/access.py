@@ -287,11 +287,12 @@ async def access_overview(
         """The surface that owns this grant, when it is not this page.
 
         Two paths, and the order matters. `source` is the RECORDED answer
-        (migration 0095) and wins when present. The plugin lookup below is the
-        DERIVED one, kept for the two cases the column cannot cover: a row
-        written before it existed, and any row on a DuckDB instance, where the
-        column does not exist at all. Both of those are real and neither is a
-        migration away — one is history, the other is the frozen ladder.
+        (migration 0096_resource_grants_source) and wins when present. The
+        plugin lookup below is the DERIVED one, kept for the two cases the
+        column cannot cover: a row written before it existed, and any row on a
+        DuckDB instance, where the column does not exist at all. Both of those
+        are real and neither is a migration away — one is history, the other
+        is the frozen ladder.
         """
         described = describe_grant_source(source)
         if described is not None:

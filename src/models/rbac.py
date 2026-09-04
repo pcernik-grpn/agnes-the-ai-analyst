@@ -194,11 +194,11 @@ class ResourceGrant(Base):
     # different question: a Required-plugin fanout stamps every row with the
     # admin who clicked on another page. One of `src.grant_sources`, or NULL.
     #
-    # POSTGRES-ONLY (migration 0095). The DuckDB ladder is frozen (A3), so
-    # that backend accepts the value and drops it and the API reports None —
-    # which the Access page already renders as an ordinary grant. NULL is
-    # also every pre-existing row: unknown origin, said out loud rather than
-    # backfilled to a guess.
+    # POSTGRES-ONLY (migration 0096_resource_grants_source). The DuckDB
+    # ladder is frozen (A3), so that backend accepts the value and drops it
+    # and the API reports None — which the Access page already renders as an
+    # ordinary grant. NULL is also every pre-existing row: unknown origin,
+    # said out loud rather than backfilled to a guess.
     source: Mapped[str | None] = mapped_column(String, nullable=True)
 
     # --- Per-type FK columns (migration 0013) ---

@@ -162,11 +162,11 @@ class ResourceGrantsRepository:
 
         ``source`` names the SURFACE that wrote this grant
         (``src.grant_sources``). Accepted and DROPPED here: the column is
-        Postgres-only (migration 0095) because the DuckDB ladder is frozen
-        (A3), so this backend simply does not gain provenance and the API
-        reports ``None`` — which the Access page already renders as an
-        ordinary grant. The parameter exists so every caller can pass it
-        without asking which backend is active.
+        Postgres-only (migration 0096_resource_grants_source) because the
+        DuckDB ladder is frozen (A3), so this backend simply does not gain
+        provenance and the API reports ``None`` — which the Access page
+        already renders as an ordinary grant. The parameter exists so every
+        caller can pass it without asking which backend is active.
 
         ``requirement`` defaults to the column default (``'available'``)
         when ``None``. Pass ``'required'`` to create a Required-tier
@@ -258,11 +258,11 @@ class ResourceGrantsRepository:
 
         ``source`` names the SURFACE that wrote this grant
         (``src.grant_sources``). Accepted and DROPPED here: the column is
-        Postgres-only (migration 0095) because the DuckDB ladder is frozen
-        (A3), so this backend simply does not gain provenance and the API
-        reports ``None`` — which the Access page already renders as an
-        ordinary grant. The parameter exists so every caller can pass it
-        without asking which backend is active.
+        Postgres-only (migration 0096_resource_grants_source) because the
+        DuckDB ladder is frozen (A3), so this backend simply does not gain
+        provenance and the API reports ``None`` — which the Access page
+        already renders as an ordinary grant. The parameter exists so every
+        caller can pass it without asking which backend is active.
         """
         grant_id = str(uuid4())
         per_type_col = _PER_TYPE_COLUMN.get(resource_type)
