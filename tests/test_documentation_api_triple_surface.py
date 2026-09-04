@@ -1108,6 +1108,32 @@ _EXEMPT: dict[str, str] = {
         "an audited, human-witnessed diagnostic action, not an agent-facing "
         "data operation. No CLI/MCP surface planned yet."
     ),
+    # issue #2147, design doc §13.1 "The preview is a matrix, not a run":
+    # the persona MATRIX built from the SAME single-persona primitive
+    # `.../policy/preview` uses, run once per enumerated persona (the
+    # distinct group-sets of users who can reach the table, plus every
+    # group literal the policy body names). CLI-reachable (`agnes admin
+    # table-policy preview <id> --matrix`, mirroring plan Task 16's
+    # `--as`/`--as-groups` flags for the single-persona preview) -- same
+    # posture as the policy/preview exemption above: mirrors the
+    # grandfathered /api/admin/prompts/{kind}/preview exemption, and this
+    # endpoint too hands each enumerated persona's row/column slice to the
+    # calling admin -- an audited (access_policy.preview_matrix),
+    # human-witnessed diagnostic action, not an agent-facing data operation.
+    # No MCP analogue by design, same reasoning as policy/preview and
+    # policy/preview-groups above.
+    "/api/admin/registry/{table_id}/policy/preview-matrix": (
+        "admin-only access-policy persona-matrix preview (design doc §13.1, "
+        "issue #2147) -- reachable via `agnes admin table-policy preview "
+        "<id> --matrix` (mirroring plan Task 16's single-persona preview "
+        "CLI). No MCP analogue by design: mirrors the grandfathered "
+        "/api/admin/prompts/{kind}/preview exemption, and separately, this "
+        "endpoint runs the policy AS EACH ENUMERATED PERSONA and hands that "
+        "persona's row-filtered slice to the calling admin -- an audited, "
+        "human-witnessed diagnostic action (§13.1), not an agent-facing "
+        "data operation, same posture as policy/preview and "
+        "policy/preview-groups right above."
+    ),
     # access-policy-builder-ux plan, Tasks 2/3: the no-SQL builder's
     # columns+samples list and structured-spec-to-SQL compile. Same posture
     # as the policy/preview exemption right above (admin-only authoring

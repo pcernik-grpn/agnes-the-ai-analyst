@@ -16,7 +16,7 @@ import threading
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, List, NamedTuple, Optional
+from typing import Any, Dict, List, Literal, NamedTuple, Optional
 
 import duckdb
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
@@ -50,7 +50,9 @@ from src.repositories import (
     sync_state_repo,
     table_registry_repo,
     usage_repo,
+    user_group_members_repo,
     user_store_installs_repo,
+    users_repo,
 )
 from src.scheduler import is_valid_schedule
 from src.sql_safe import is_safe_project_id as _is_safe_project_id
@@ -7942,6 +7944,56 @@ def _policy_preview_mapping_warning(
     return None
 
 
+def _policy_preview_run_persona(
+    analytics_conn,
+    policy_sql: str,
+    table_name: str,
+    referenced: set,
+    *,
+    persona_user_id: Optional[str],
+    persona_user_email: Optional[str],
+    persona_groups: List[str],
+) -> Dict[str, Any]:
+    """One persona's slice of a policy body -- the COUNT and the before/
+    after bounded sample -- factored out of ``preview_table_policy`` so the
+    persona-matrix endpoint (design doc §13.1, issue #2147) can run the
+    exact same primitive once per persona instead of duplicating the
+    CTE-redirect/sampling logic (``_policy_preview_samples``) a second time.
+
+    Every caller has already: resolved ``policy_sql``, run the
+    mapping-empty and pattern-position refusals, and computed ``referenced``
+    (``_policy_preview_variable_usage``) -- this only binds ONE persona's
+    values and runs the live queries.
+    """
+    params: Dict[str, Any] = {}
+    if "user_email" in referenced:
+        params["user_email"] = persona_user_email
+    if "user_id" in referenced:
+        params["user_id"] = persona_user_id
+    if "user_groups" in referenced:
+        params["user_groups"] = persona_groups
+
+    rows_visible = analytics_conn.execute(
+        f"SELECT COUNT(*) FROM ({policy_sql}) AS __agnes_policy_preview__",
+        params,
+    ).fetchone()[0]
+    # Slice 2 (§13.1 before/after): the policied slice AND the RAW sample
+    # the authoring admin (god-mode) may see, so the UI can diff them --
+    # struck-through dropped rows, real->masked cells. Both must cover the
+    # SAME bounded rows or the diff pairs unrelated rows; `_policy_preview_
+    # samples` arranges that (and says so via `comparable`) on ONE bounded
+    # read.
+    sample_rows, base_sample_rows, base_sample_comparable = _policy_preview_samples(
+        analytics_conn, table_name, policy_sql, params
+    )
+    return {
+        "rows_visible": int(rows_visible),
+        "sample_rows": _sanitize_for_json(sample_rows),
+        "base_sample_rows": _sanitize_for_json(base_sample_rows),
+        "base_sample_comparable": bool(base_sample_comparable),
+    }
+
+
 @router.post("/registry/{table_id}/policy/preview")
 # Both preview handlers are plain `def` on purpose: they run synchronous
 # DuckDB (and, for a remote table, engine-attached) COUNT/sample queries --
@@ -8188,38 +8240,26 @@ def preview_table_policy(
                 ),
             )
 
-        params: Dict[str, Any] = {}
-        if "user_email" in referenced:
-            params["user_email"] = persona_user_email
-        if "user_id" in referenced:
-            params["user_id"] = persona_user_id
-        if "user_groups" in referenced:
-            params["user_groups"] = persona_groups
-
         try:
             rows_total = analytics_conn.execute(f"SELECT COUNT(*) FROM {quote_ident(row['name'])}").fetchone()[0]
-            rows_visible = analytics_conn.execute(
-                f"SELECT COUNT(*) FROM ({policy_sql}) AS __agnes_policy_preview__",
-                params,
-            ).fetchone()[0]
-            # Slice 2 (§13.1 before/after): the policied slice AND the RAW
-            # sample the authoring admin (god-mode) may see, so the UI can
-            # diff them — struck-through dropped rows, real->masked cells.
-            # Both must cover the SAME bounded rows or the diff pairs
-            # unrelated rows; `_policy_preview_samples` arranges that (and
-            # says so via `comparable`) on ONE bounded read, so it never adds
-            # to the two full COUNT(*) scans above, which are the pre-existing
-            # per-call cost on a remote/BQ-backed table.
-            sample_rows, base_sample_rows, base_sample_comparable = _policy_preview_samples(
-                analytics_conn, row["name"], policy_sql, params
+            persona_result = _policy_preview_run_persona(
+                analytics_conn,
+                policy_sql,
+                row["name"],
+                referenced,
+                persona_user_id=persona_user_id,
+                persona_user_email=persona_user_email,
+                persona_groups=persona_groups,
             )
         except Exception as exc:
             raise HTTPException(status_code=422, detail=_policy_preview_failed_detail(exc, table_id=table_id)) from exc
     finally:
         analytics_conn.close()
 
-    sample_rows = _sanitize_for_json(sample_rows)
-    base_sample_rows = _sanitize_for_json(base_sample_rows)
+    rows_visible = persona_result["rows_visible"]
+    sample_rows = persona_result["sample_rows"]
+    base_sample_rows = persona_result["base_sample_rows"]
+    base_sample_comparable = persona_result["base_sample_comparable"]
 
     audit_repo().log(
         user_id=user.get("id"),
@@ -8433,6 +8473,460 @@ def preview_table_policy_all_groups(
     return {
         "rows_total": int(rows_total),
         "groups": results,
+        # Always None here -- the check above already returned early when it
+        # was set, before any of these live queries ran.
+        "mapping_warning": mapping_warning,
+    }
+
+
+class PolicyPreviewMatrixRequest(BaseModel):
+    """Body for ``POST /registry/{table_id}/policy/preview-matrix`` (design
+    doc §13.1 "The preview is a matrix, not a run"; issue #2147, backlog
+    item 18). ``sql`` is optional, same meaning as :class:`PolicyPreviewRequest`
+    -- omitted previews the stored policy, given previews a candidate body
+    first.
+
+    ``personas`` picks which persona families populate the matrix:
+    ``group_sets`` (the distinct group-sets real users who can reach this
+    table actually hold), ``policy_groups`` (each group literal the policy
+    body itself names, plus the empty group set), or ``both`` (default).
+
+    ``limit`` bounds how many distinct ``group_sets`` personas are
+    enumerated -- see ``_POLICY_PREVIEW_MATRIX_MAX_GROUP_SETS`` for the
+    absolute ceiling a caller can never raise past.
+    """
+
+    sql: Optional[str] = None
+    personas: Literal["group_sets", "policy_groups", "both"] = "both"
+    limit: Optional[int] = None
+
+
+# §13.1: "enumerates the distinct group-sets among users who can access the
+# table (bounded by group-sets, not users)". Bounding by SETS rather than by
+# how many users are scanned means an instance with many users but few real
+# group combinations pays no penalty, while one with many ad-hoc per-user
+# combinations cannot turn a single preview into an unbounded response --
+# enumeration keeps scanning past the cap only long enough to notice a
+# DIFFERENT set exists (`truncated`), never to grow the returned list.
+_POLICY_PREVIEW_MATRIX_MAX_GROUP_SETS = 50
+
+
+def _policy_preview_group_set_personas(table_id: str, *, max_group_sets: int) -> tuple[list[list[str]], bool]:
+    """``(group_sets, truncated)`` -- the missing primitive
+    ``preview_table_policy_all_groups``'s own docstring names: "list the
+    distinct group-sets of users with access to this table".
+
+    One entry per DISTINCT sorted tuple of live group names held by an
+    active, non-admin user for whom ``can_access_table`` is true. Never an
+    admin persona (§13.1 task instructions) -- an admin's live read bypasses
+    the policy entirely (§12), so previewing "as" one would show a slice the
+    admin bypass makes irrelevant to check; excluded even though this
+    preview never itself routes through the bypass, same reasoning
+    ``preview_table_policy``/``preview_table_policy_all_groups`` document for
+    not using ``policied_relation``'s admin path.
+    """
+    from app.auth.access import is_user_admin
+    from src.rbac import can_access_table
+
+    seen: "dict[tuple[str, ...], list[str]]" = {}
+    truncated = False
+    for u in users_repo().list_all():
+        if u.get("active") is False:
+            continue
+        if is_user_admin(u["id"]):
+            continue
+        if not can_access_table(u, table_id):
+            continue
+        groups = tuple(sorted(user_group_members_repo().list_group_names_for_user(u["id"])))
+        if groups in seen:
+            continue
+        if len(seen) >= max_group_sets:
+            truncated = True
+            continue
+        seen[groups] = list(groups)
+    return list(seen.values()), truncated
+
+
+def _policy_preview_referenced_group_literals(policy_sql: str) -> list[str]:
+    """Group-name literals the policy body itself compares ``$user_groups``
+    against -- an sqlglot AST walk, never regex (a policy body is untrusted-
+    ish admin-authored SQL, and matching structure rather than substrings is
+    the same discipline the rest of this module already applies to it).
+
+    Covers the three shapes ``docs/table-access-policies.md``'s
+    "group-membership idiom" documents: ``list_contains($user_groups, 'x')``
+    and ``ARRAY_CONTAINS($user_groups, 'x')`` both parse to the same
+    ``exp.ArrayContains`` node under sqlglot's duckdb dialect (verified
+    empirically -- there is no separate ``ARRAY_CONTAINS`` node), and an
+    ``IN`` comparison naming ``$user_groups`` on either side (``$user_groups
+    IN ('a', 'b')`` or the reverse, ``'a' IN (SELECT unnest($user_groups))``
+    the "not rejected but no reason to use it" unnest form documents).
+    """
+    import sqlglot
+    from sqlglot import exp
+
+    try:
+        statement = sqlglot.parse_one(policy_sql, read="duckdb")
+    except Exception:
+        return []
+    if statement is None:
+        return []
+
+    def _is_user_groups_placeholder(node: Optional[exp.Expression]) -> bool:
+        return isinstance(node, exp.Placeholder) and node.name == "user_groups"
+
+    def _string_literal(node: Optional[exp.Expression]) -> Optional[str]:
+        return node.this if isinstance(node, exp.Literal) and node.is_string else None
+
+    names: set = set()
+
+    for call in statement.find_all(exp.ArrayContains):
+        a, b = call.this, call.expression
+        lit = _string_literal(b) if _is_user_groups_placeholder(a) else (_string_literal(a) if _is_user_groups_placeholder(b) else None)
+        if lit:
+            names.add(lit)
+
+    for in_expr in statement.find_all(exp.In):
+        this = in_expr.this
+        candidates = in_expr.expressions or []
+        if _is_user_groups_placeholder(this):
+            # `$user_groups IN ('a', 'b')`
+            for c in candidates:
+                lit = _string_literal(c)
+                if lit:
+                    names.add(lit)
+            continue
+        lit = _string_literal(this)
+        if lit is None:
+            continue
+        # `'a' IN (...)` -- only a group-membership check if `$user_groups`
+        # appears somewhere on the right-hand side, either as a sibling
+        # literal-list member or (the "unnest" idiom the docs name) nested
+        # inside the `query`/`expressions` subtree via UNNEST/EXPLODE.
+        if any(_is_user_groups_placeholder(c) for c in candidates) or any(
+            _is_user_groups_placeholder(p) for p in in_expr.find_all(exp.Placeholder)
+        ):
+            names.add(lit)
+
+    return sorted(names)
+
+
+@router.post("/registry/{table_id}/policy/preview-matrix")
+# Same threadpool reasoning as the two preview handlers above: this fans out
+# into several synchronous DuckDB queries (one persona at a time) plus, for
+# `group_sets` personas, a `can_access_table` check per active user, so it
+# stays a plain `def` route.
+def preview_table_policy_matrix(
+    table_id: str,
+    request: PolicyPreviewMatrixRequest,
+    user: dict = Depends(require_admin_all_surface),
+    conn: duckdb.DuckDBPyConnection = Depends(_get_db),
+    bq: BqAccess = Depends(get_bq_access),
+):
+    """The persona MATRIX (design doc §13.1 "The preview is a matrix, not a
+    run"; issue #2147, backlog item 18) -- built from the SAME single-
+    persona primitive ``preview_table_policy`` uses (``_policy_preview_run_
+    persona``), run once per persona in the matrix instead of once for a
+    single admin-chosen persona.
+
+    A single-persona preview with a row count against the unfiltered total
+    catches only the extremes -- 0 rows and all rows. The dangerous middle
+    is invisible, and the permissive bug that actually happens (a ``CASE``
+    on ``$user_groups`` with a missing branch falling through to the open
+    arm) cannot be seen by previewing one persona. This enumerates the
+    distinct group-sets among users who can actually reach the table
+    (``_policy_preview_group_set_personas``) plus every group literal the
+    policy body itself names (``_policy_preview_referenced_group_literals``,
+    plus the empty group set) and reports, per persona, rows/columns, then
+    two derived numbers: ``union_coverage`` (rows visible to >=1 persona vs
+    the bounded sample -- 100% for every persona AND the union means the
+    policy is a no-op) and ``pairwise_overlap`` (a non-zero overlap where a
+    partitioning policy should show zero is the permissive bug, rendered).
+
+    Row identity for both is BEST-EFFORT: no stable row key exists on this
+    codebase's server side (the modal-side row-matcher §13.1 names is not
+    implemented yet), so identity is the full tuple of a row's UNMASKED,
+    UNHIDDEN ("visible") column values -- two rows with identical values in
+    every visible column are indistinguishable here, and a column whose mask
+    itself varies by persona (rare, but the allowlist does not forbid it)
+    can under-count overlap for a row that is genuinely the same one. This
+    never affects the row FILTERING result (``rows_visible``), only the
+    union/overlap math layered on top of the bounded sample.
+
+    Gated by ``require_admin_all_surface`` and audited
+    (``access_policy.preview_matrix``), same reasoning as
+    ``preview_table_policy``/``preview_table_policy_all_groups`` above: this
+    hands back real row content for every enumerated persona with no
+    per-table grant check and no policy rewrite standing behind it.
+    """
+    from src.sql_ident import quote_ident
+
+    row = table_registry_repo().get(table_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Table not found")
+
+    if request.limit is not None and not (1 <= request.limit <= _POLICY_PREVIEW_MATRIX_MAX_GROUP_SETS):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "policy_preview_matrix_limit_out_of_range: `limit` must be between 1 and "
+                f"{_POLICY_PREVIEW_MATRIX_MAX_GROUP_SETS}"
+            ),
+        )
+    max_group_sets = request.limit or _POLICY_PREVIEW_MATRIX_MAX_GROUP_SETS
+
+    is_candidate = request.sql is not None
+    policy_sql = request.sql if is_candidate else row.get("access_policy_sql")
+    if not policy_sql:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "policy_preview_no_policy: this table has no stored access policy, and "
+                "no candidate `sql` was given to preview"
+            ),
+        )
+
+    if is_candidate:
+        from src.access_policy_validate import PolicyValidationError, validate_policy_sql
+
+        mapping_table_names = {
+            r["name"] for r in table_registry_repo().list_all() if r.get("policy_mapping") and r.get("name")
+        }
+        try:
+            validate_policy_sql(
+                policy_sql,
+                table_id=table_id,
+                table_name=row.get("name") or table_id,
+                mapping_table_names=mapping_table_names,
+                for_remote=(row.get("query_mode") == "remote"),
+            )
+        except PolicyValidationError as e:
+            raise HTTPException(status_code=422, detail=f"{e.reason}: {e.detail}") from e
+
+    # K1-sweep finding 3 (#1979), same as `preview_table_policy` above: a
+    # `query_mode='remote'` table on a transpiling engine does not execute
+    # the DuckDB text below on a live read.
+    transpiled = None
+    preview_dialect = _policy_preview_dialect(row)
+    if preview_dialect is not None:
+        from src.access_policy import PolicyError, transpile_policy_sql
+
+        try:
+            transpiled_sql = transpile_policy_sql(policy_sql, table_id=table_id, dialect=preview_dialect)
+        except PolicyError:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"policy_preview_transpile_failed: this policy body does not transpile to "
+                    f"{preview_dialect} SQL, which is what a live read of this remote table actually runs"
+                ),
+            )
+        transpiled = {"dialect": preview_dialect, "relation_sql": transpiled_sql}
+
+    mapping_warning = _policy_preview_mapping_warning(policy_sql, table_id=table_id, table_name=row.get("name"))
+    if mapping_warning:
+        log_safe(
+            user_id=user.get("id"),
+            action="access_policy.preview_matrix",
+            resource=table_id,
+            params=_sanitize_for_audit(
+                {"personas": request.personas, "candidate_sql": request.sql, "mapping_warning": True}
+            ),
+        )
+        return {
+            "rows_total": None,
+            "personas": [],
+            "union_coverage": None,
+            "no_op": None,
+            "pairwise_overlap": [],
+            "identity_columns": [],
+            "truncated": False,
+            "transpiled": transpiled,
+            "mapping_warning": mapping_warning,
+        }
+
+    preview_unavailable = _policy_preview_local_view_unavailable(row)
+    if preview_unavailable:
+        raise HTTPException(
+            status_code=422,
+            detail=f"policy_preview_remote_unsupported: {preview_unavailable}",
+        )
+
+    from src.access_policy_schema import masked_output_columns
+    from src.access_policy_validate import PolicyValidationError, probe_policy
+    from src.db import get_analytics_db_readonly
+
+    analytics_conn = get_analytics_db_readonly()
+    try:
+        try:
+            probed_columns = probe_policy(policy_sql, table_id, analytics_conn)
+        except PolicyValidationError as e:
+            raise HTTPException(status_code=422, detail=f"{e.reason}: {e.detail}") from e
+
+        base_columns, _base_columns_error = _policy_builder_schema_columns(table_id, row, conn, bq)
+        base_names = [c["name"] for c in base_columns]
+        probed_names = {c["name"] for c in probed_columns}
+        hidden_columns = sorted(name for name in base_names if name not in probed_names)
+        masked_lower = masked_output_columns(policy_sql)
+        masked_columns = sorted(name for name in probed_names if name.lower() in masked_lower)
+        # Row identity for union/overlap (docstring above): columns that
+        # survive from base to policied output UNCHANGED -- never hidden,
+        # never masked. A column absent from this list is one this preview
+        # cannot use to recognize "the same underlying row" across personas.
+        identity_columns = [n for n in base_names if n not in hidden_columns and n not in masked_columns]
+
+        try:
+            referenced, pattern_positioned = _policy_preview_variable_usage(policy_sql)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=_policy_preview_failed_detail(exc, table_id=table_id),
+            ) from exc
+
+        if pattern_positioned & referenced:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "policy_var_in_pattern_position: this table's stored policy matches an "
+                    "identity variable as a LIKE/ILIKE/SIMILAR TO or regex pattern, which the "
+                    "policy resolver refuses to bind -- it can never be served to any caller; "
+                    "rewrite the policy to compare the variable as a value"
+                ),
+            )
+
+        try:
+            rows_total = analytics_conn.execute(f"SELECT COUNT(*) FROM {quote_ident(row['name'])}").fetchone()[0]
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=_policy_preview_failed_detail(exc, table_id=table_id)) from exc
+
+        # The fixed universe union coverage is measured against -- read ONCE
+        # here rather than trusting N independent per-persona base samples
+        # (each `_policy_preview_run_persona` call below creates its own
+        # per-request temp table) to happen to read the identical LIMIT
+        # window every time.
+        universe_cursor = analytics_conn.execute(
+            f"SELECT * FROM {quote_ident(row['name'])} LIMIT {_POLICY_PREVIEW_SAMPLE_LIMIT}"
+        )
+        universe_names = [d[0] for d in universe_cursor.description]
+        universe_rows = [dict(zip(universe_names, r)) for r in universe_cursor.fetchall()]
+
+        def _row_key(d: dict) -> tuple:
+            return tuple(d.get(c) for c in identity_columns)
+
+        universe_keys = {_row_key(r) for r in universe_rows}
+
+        # Persona enumeration (§13.1) ------------------------------------
+        personas: List[Dict[str, Any]] = []
+        seen_group_tuples: set = set()
+        truncated = False
+
+        if request.personas in ("group_sets", "both"):
+            group_sets, truncated = _policy_preview_group_set_personas(table_id, max_group_sets=max_group_sets)
+            for groups in group_sets:
+                key = tuple(groups)
+                if key in seen_group_tuples:
+                    continue
+                seen_group_tuples.add(key)
+                personas.append(
+                    {
+                        "kind": "group_set",
+                        "label": ", ".join(groups) if groups else "(no groups)",
+                        "groups": list(groups),
+                    }
+                )
+
+        if request.personas in ("policy_groups", "both"):
+            for literal_group in _policy_preview_referenced_group_literals(policy_sql):
+                key = (literal_group,)
+                if key in seen_group_tuples:
+                    continue
+                seen_group_tuples.add(key)
+                personas.append({"kind": "policy_group", "label": literal_group, "groups": [literal_group]})
+            if () not in seen_group_tuples:
+                seen_group_tuples.add(())
+                personas.append({"kind": "policy_group", "label": "(no groups)", "groups": []})
+
+        entries: List[Dict[str, Any]] = []
+        persona_visible_keys: List[set] = []
+        for persona in personas:
+            try:
+                result = _policy_preview_run_persona(
+                    analytics_conn,
+                    policy_sql,
+                    row["name"],
+                    referenced,
+                    persona_user_id=None,
+                    persona_user_email=None,
+                    persona_groups=persona["groups"],
+                )
+            except Exception as exc:
+                raise HTTPException(status_code=422, detail=_policy_preview_failed_detail(exc, table_id=table_id)) from exc
+            visible_keys = {_row_key(r) for r in result["sample_rows"]} & universe_keys
+            persona_visible_keys.append(visible_keys)
+            entries.append(
+                {
+                    "kind": persona["kind"],
+                    "label": persona["label"],
+                    "groups": persona["groups"],
+                    "rows_visible": result["rows_visible"],
+                    "rows_total": int(rows_total),
+                    "hidden_columns": hidden_columns,
+                    "masked_columns": masked_columns,
+                    "sample_rows": result["sample_rows"],
+                }
+            )
+    finally:
+        analytics_conn.close()
+
+    # Derived numbers (§13.1) --------------------------------------------
+    union_coverage = None
+    no_op = None
+    if universe_keys:
+        union_visible: set = set()
+        for keys in persona_visible_keys:
+            union_visible |= keys
+        union_coverage = len(union_visible) / len(universe_keys)
+        per_persona_coverage = [len(keys) / len(universe_keys) for keys in persona_visible_keys]
+        no_op = bool(entries) and union_coverage == 1.0 and all(c == 1.0 for c in per_persona_coverage)
+
+    pairwise_overlap = []
+    for i in range(len(entries)):
+        for j in range(i + 1, len(entries)):
+            a_keys, b_keys = persona_visible_keys[i], persona_visible_keys[j]
+            intersection = a_keys & b_keys
+            denom = min(len(a_keys), len(b_keys))
+            pairwise_overlap.append(
+                {
+                    "persona_a": entries[i]["label"],
+                    "persona_b": entries[j]["label"],
+                    "overlap_rows": len(intersection),
+                    "overlap_fraction": (len(intersection) / denom) if denom else 0.0,
+                }
+            )
+
+    log_safe(
+        user_id=user.get("id"),
+        action="access_policy.preview_matrix",
+        resource=table_id,
+        params=_sanitize_for_audit(
+            {
+                "personas": request.personas,
+                "persona_count": len(entries),
+                "candidate_sql": request.sql,
+                "truncated": truncated,
+            }
+        ),
+    )
+
+    return {
+        "rows_total": int(rows_total),
+        "personas": entries,
+        "union_coverage": union_coverage,
+        "no_op": no_op,
+        "pairwise_overlap": pairwise_overlap,
+        "identity_columns": identity_columns,
+        "truncated": truncated,
+        "transpiled": transpiled,
         # Always None here -- the check above already returned early when it
         # was set, before any of these live queries ran.
         "mapping_warning": mapping_warning,

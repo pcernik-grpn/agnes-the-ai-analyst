@@ -94,6 +94,11 @@ CATALOG: dict[str, AuditEvent] = {
         "read",
         "An admin previewed a table access policy's effect across every group.",
     ),
+    "access_policy.preview_matrix": AuditEvent(
+        "access_policy.preview_matrix",
+        "read",
+        "An admin previewed a table access policy's effect across a persona matrix.",
+    ),
     "attachment.download": AuditEvent("attachment.download", "read", "A chat attachment was downloaded."),
     "catalog.list": AuditEvent("catalog.list", "read", "The table/dataset catalog was listed."),
     "catalog.sample": AuditEvent("catalog.sample", "read", "A table sample was fetched via the catalog."),

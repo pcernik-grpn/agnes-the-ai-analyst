@@ -1009,6 +1009,26 @@ def table_policy_preview(
         "--as-groups",
         help="Preview as an ad-hoc, comma-separated group set — no real user needs to exist.",
     ),
+    matrix: bool = typer.Option(
+        False,
+        "--matrix",
+        help=(
+            "Run the persona MATRIX (design doc §13.1, issue #2147) instead of a single "
+            "chosen persona: every distinct group-set of real users who can reach this "
+            "table, plus every group literal the policy body names, each run through the "
+            "same single-persona primitive. Mutually exclusive with --as / --as-groups."
+        ),
+    ),
+    personas: str = typer.Option(
+        "both",
+        "--personas",
+        help="With --matrix: which persona families to enumerate — group_sets | policy_groups | both.",
+    ),
+    limit: int = typer.Option(
+        None,
+        "--limit",
+        help="With --matrix: bound how many distinct group_sets personas are enumerated.",
+    ),
     as_json: bool = typer.Option(False, "--json", help="Output as JSON"),
 ):
     """Run a stored or candidate access policy as a chosen persona and show
@@ -1017,10 +1037,27 @@ def table_policy_preview(
     primitive the admin UI's persona matrix is built from. Exactly one of
     --as / --as-groups selects the persona. Every call is audited
     server-side.
+
+    `--matrix` switches to the persona MATRIX instead
+    (`POST .../policy/preview-matrix`, issue #2147) — no persona to choose,
+    since it enumerates every one itself.
     """
     from pathlib import Path
 
-    if (as_user is None) == (as_groups is None):
+    if matrix:
+        if as_user is not None or as_groups is not None:
+            typer.echo(
+                "Error: --matrix enumerates its own personas — it is mutually exclusive with --as / --as-groups.",
+                err=True,
+            )
+            raise typer.Exit(2)
+        if personas not in ("group_sets", "policy_groups", "both"):
+            typer.echo(
+                "Error: --personas must be one of group_sets, policy_groups, both.",
+                err=True,
+            )
+            raise typer.Exit(2)
+    elif (as_user is None) == (as_groups is None):
         typer.echo(
             "Error: choose exactly one of --as <user> or --as-groups a,b to select the preview persona.",
             err=True,
@@ -1040,12 +1077,19 @@ def table_policy_preview(
             typer.echo(f"Error: SQL file not found: {sql_path}", err=True)
             raise typer.Exit(2)
         payload["sql"] = sql_path.read_text(encoding="utf-8").strip()
-    if as_user is not None:
-        payload["as_user"] = as_user
-    if as_groups is not None:
-        payload["as_groups"] = [g.strip() for g in as_groups.split(",") if g.strip()]
 
-    resp = api_post(f"/api/admin/registry/{table_id}/policy/preview", json=payload)
+    if matrix:
+        payload["personas"] = personas
+        if limit is not None:
+            payload["limit"] = limit
+        resp = api_post(f"/api/admin/registry/{table_id}/policy/preview-matrix", json=payload)
+    else:
+        if as_user is not None:
+            payload["as_user"] = as_user
+        if as_groups is not None:
+            payload["as_groups"] = [g.strip() for g in as_groups.split(",") if g.strip()]
+        resp = api_post(f"/api/admin/registry/{table_id}/policy/preview", json=payload)
+
     if resp.status_code != 200:
         try:
             detail = resp.json().get("detail", resp.text)
@@ -1057,6 +1101,10 @@ def table_policy_preview(
     body = resp.json()
     if as_json:
         typer.echo(json.dumps(body, indent=2))
+        return
+
+    if matrix:
+        _render_policy_preview_matrix(table_id, body)
         return
 
     rows_visible = body.get("rows_visible", 0)
@@ -1093,6 +1141,49 @@ def table_policy_preview(
             "status. (An unresolvable persona would have failed this "
             "command outright, above, rather than showing 0 rows.)"
         )
+
+
+def _render_policy_preview_matrix(table_id: str, body: dict) -> None:
+    """Human-readable render for `POST .../policy/preview-matrix` (design
+    doc §13.1, issue #2147) — a compact table of persona -> rows visible /
+    total / hidden / masked, plus the two derived numbers (union coverage,
+    pairwise overlap) that catch the two bugs a single-persona preview
+    cannot: a policy that is a no-op, and a partition that isn't.
+    """
+    if body.get("mapping_warning"):
+        typer.echo(f"Matrix preview for {table_id}: {body['mapping_warning']}")
+        return
+
+    personas = body.get("personas") or []
+    rows_total = body.get("rows_total", 0)
+    typer.echo(f"Persona matrix for {table_id} ({len(personas)} persona(s), {rows_total} row(s) total):")
+    for persona in personas:
+        hidden = persona.get("hidden_columns") or []
+        masked = persona.get("masked_columns") or []
+        typer.echo(
+            f"  {persona['label']:<24s} {persona['rows_visible']:>6} / {persona['rows_total']:<6} row(s) visible"
+            f"  (hidden: {len(hidden)}, masked: {len(masked)})"
+        )
+
+    if body.get("truncated"):
+        typer.echo("  Note: group-set enumeration was truncated at the configured cap — not every persona is shown.")
+
+    union_coverage = body.get("union_coverage")
+    if union_coverage is not None:
+        typer.echo(f"  union coverage: {union_coverage:.0%}")
+    if body.get("no_op"):
+        typer.echo(
+            "  WARNING: every persona sees the whole table and the union is 100% — this policy is a NO-OP."
+        )
+
+    overlap = body.get("pairwise_overlap") or []
+    if overlap:
+        typer.echo("  pairwise overlap:")
+        for pair in overlap:
+            typer.echo(
+                f"    {pair['persona_a']} <-> {pair['persona_b']}: "
+                f"{pair['overlap_rows']} row(s) ({pair['overlap_fraction']:.0%})"
+            )
 
 
 @admin_app.command("metadata-show")

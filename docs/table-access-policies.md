@@ -234,11 +234,46 @@ Prints rows-visible / rows-total, which columns are hidden, and a sample. `0` ro
 
 This calls the same single-persona primitive the web modal uses (`POST /api/admin/registry/{id}/policy/preview`) — every call is audited, because "who looked at whose data, when" is the first question after an incident. See [v1 limitations](#v1-limitations) for what this preview does *not* yet do.
 
-**The preview surfaces need a full-surface admin credential.** `.../policy/preview`, `.../policy/preview-groups`, `.../policy/columns` and `.../policy/revisions` hand back real content — raw unfiltered sample rows, per-group visibility, profiler sample values, historical policy bodies — with no per-table grant check and no policy rewrite behind them, so the same rule as the admin bypass above applies to *who may ask*: a `surface='stack'` PAT (the `agnes init` default) is refused with a `403` naming the fix, and a browser session, a regular PAT or `agnes init --as-admin` is not. `.../policy/compile` persists nothing and returns only generated SQL, so it stays on the plain admin gate.
+**The preview surfaces need a full-surface admin credential.** `.../policy/preview`, `.../policy/preview-groups`, `.../policy/preview-matrix`, `.../policy/columns` and `.../policy/revisions` hand back real content — raw unfiltered sample rows, per-group visibility, profiler sample values, historical policy bodies — with no per-table grant check and no policy rewrite behind them, so the same rule as the admin bypass above applies to *who may ask*: a `surface='stack'` PAT (the `agnes init` default) is refused with a `403` naming the fix, and a browser session, a regular PAT or `agnes init --as-admin` is not. `.../policy/compile` persists nothing and returns only generated SQL, so it stays on the plain admin gate.
 
 **A failing preview never quotes the engine.** When the policy body cannot be executed, both previews answer `policy_preview_failed: … (<reason class>)` naming the table, and the per-group sweep puts that same message in the failing group's `error` — a raw DuckDB/BigQuery message can quote literals and column names straight out of the policy body, so it goes to the server log instead (same rule as the live `policy_error`).
 
 **Transpiled form (#1979).** For a `query_mode='remote'` table on BigQuery or Databricks, a live read does not execute the DuckDB text above — it executes that body *transpiled* to the engine's own SQL (the BigQuery jobs-API path, the Databricks Statement Execution API path). The preview response carries a `transpiled: {dialect, relation_sql} | null` field so what you're checking is what would actually run: `null` for a `local`/`materialized` table (the DuckDB text *is* what executes) and, deliberately, also `null` for a `remote` Snowflake table — a registered Snowflake row is a plain DuckDB `VIEW` over the ATTACHed `sf` catalog, so its live reads stay on the ordinary DuckDB arm too, and showing the Snowflake transpile there would preview a body that never runs. `relation_sql` never carries a bound *value* — only the same `$name`/`@name`/`:name` markers the live resolver itself sends, exactly like the row/column preview above never shows a bound value inlined either. The web modal renders this, collapsed, as "Transpiled for `<dialect>`" under the row/column result. A policy body that doesn't transpile to the table's engine surfaces as `policy_preview_transpile_failed` (a stored body attached before the table became `query_mode='remote'` is the realistic case — see `policy_untranspilable` below for the save-time check that catches a *new* remote-table write).
+
+**Matrix preview (§13.1, issue #2147).** A single-persona preview catches only
+the extremes — 0 rows and all rows — and cannot see a `CASE`-on-`$user_groups`
+with a missing branch. `POST /api/admin/registry/{id}/policy/preview-matrix`
+(`agnes admin table-policy preview <id> --matrix`) runs the SAME single-persona
+primitive once per PERSONA instead of once for a hand-picked one:
+
+```bash
+agnes admin table-policy preview invoices --matrix
+agnes admin table-policy preview invoices --matrix --personas policy_groups
+agnes admin table-policy preview invoices --matrix --limit 10 --json
+```
+
+Personas come from two families (`--personas group_sets | policy_groups |
+both`, default `both`): **`group_sets`** — the distinct sets of live group
+names held by real users who can actually reach the table (bounded by
+group-SETS, not users — capped at 50 distinct sets, `truncated: true`
+beyond); **`policy_groups`** — every group literal the policy body itself
+compares `$user_groups` against (an `sqlglot` AST walk, never regex), plus
+the empty group set. An admin persona never appears — the god-mode bypass
+makes previewing "as" one meaningless. Each persona reports
+`rows_visible`/`rows_total`/`hidden_columns`/`masked_columns`, plus two
+numbers derived from the bounded sample every persona is checked against:
+**`union_coverage`** (the fraction of sampled rows visible to at least one
+persona — 100% *and* every persona individually at 100% flags `no_op: true`,
+the policy does nothing) and **`pairwise_overlap`** (a non-zero overlap
+between two personas that should partition the table is the permissive bug,
+rendered directly rather than inferred from row counts alone). Row identity
+for both is best-effort: no stable row key exists server-side yet, so it
+falls back to the tuple of columns that survive from base to policied output
+unchanged (never hidden, never masked) — two rows identical across every one
+of those columns are indistinguishable to this preview, and a mask that
+itself varies by persona can under-count overlap for a row that is genuinely
+the same one. Audited (`access_policy.preview_matrix`), same admin gate as
+the single-persona preview right above.
 
 **Databricks `remote` tables cannot be previewed unless the Unity Catalog attach is on.** Both previews (single-persona and the all-groups sweep) execute the policy on the server's local analytics view, and a `query_mode='remote'` Databricks row only has one when `data_source.databricks.attach_enabled` (experimental) is enabled — otherwise both refuse with `policy_preview_remote_unsupported` instead of an opaque catalog error; live analyst reads are unaffected (they run natively on the SQL warehouse through the same transpiled policy), and a `materialized` copy of the table previews normally.
 
@@ -296,6 +331,7 @@ Every policy-related rejection is a structured `reason`-keyed detail (never a ra
 | `policy_var_in_pattern_position` | 422, admin write and preview | an identity variable stands on the *pattern* side of `LIKE` / `ILIKE` / `SIMILAR TO` or a regex function — rejected at save time, and refused again by the resolver (and so by the preview) if a stored body carries the shape anyway |
 | `policy_preview_transpile_failed` | 422, preview only | the previewed body (stored or candidate) does not transpile to the table's engine — the realistic case is a body saved before the table became `query_mode='remote'`, so `policy_untranspilable`'s save-time check never ran against it (#1979) |
 | `policy_preview_remote_unsupported` | 422, preview only | the table is a `query_mode='remote'` Databricks row and `data_source.databricks.attach_enabled` is off, so there is no local analytics view for the preview to execute the policy against — enable the attach, or preview against a `materialized` copy (#1979) |
+| `policy_preview_matrix_limit_out_of_range` | 422, matrix preview only | `--limit`/`limit` on `.../policy/preview-matrix` was outside `1..50` (issue #2147) |
 
 **The case of the table name is not a way out.** DuckDB's catalog is case-insensitive — `FROM ORDERS`, `FROM "Orders"` and `FROM orders` all read the same view — so the registry lookup behind the policy resolver folds case the same way, and every spelling is rewritten identically (#1979). If two registry rows carry names that differ only by case, the read is refused with `policy_error` instead: the catalog can hold only one of those views, so which row's policy governs it is unknowable, and guessing is the one thing a policy must never do.
 
@@ -313,6 +349,8 @@ Two known gaps, both fail-closed (nothing here degrades to leaking unfiltered da
 2. **The admin preview is single-persona.** `table-policy preview` / the web modal's preview runner shows one chosen persona (a user, or an ad-hoc group set) at a time — not the full persona matrix (union coverage across every distinct group-set, pairwise overlap) that would catch a `CASE`-with-a-missing-branch bug automatically. Preview as more than one persona by hand before trusting a policy that branches on `$user_groups`; the full matrix view is a planned enhancement.
 
 (A former limitation 3 — the empty-mapping check being `POST /api/query`-only — is closed as of #2147: `GET /api/v2/sample`, `POST /api/v2/scan`'s local-parquet branch, and `POST /api/mcp/query-table/{id}` all raise the same `policy_mapping_empty` now, and `GET /api/admin/registry` surfaces the check's own read-only diagnosis up front via `policy_mapping_status` — see [Mapping tables](#mapping-tables) above.)
+2. **The persona matrix samples, it does not scan.** `POST .../policy/preview-matrix` (see [Matrix preview](#previewing-before-you-trust-it) above) computes `union_coverage`/`pairwise_overlap` over the same bounded sample the before/after preview uses (`_POLICY_PREVIEW_SAMPLE_LIMIT` rows), not the whole table — a bug that only shows up past that window is invisible to it, same class of gap as the row-count-only `preview-groups` sweep it complements. Row identity across personas is also best-effort (documented above) rather than a real primary key.
+3. **An empty or stale mapping table still fails closed silently on the sample/scan preview surfaces.** `agnes query` / `POST /api/query` now raise a distinct `500 policy_mapping_empty` (naming the policied table and the empty mapping table) the moment the caller's SQL touches a policy whose `policy_mapping` dependency has zero (or never-synced) rows — the exact same check `GET /api/me/effective-access` uses for its `reason: "mapping_empty"` diagnosis, so the two surfaces never disagree. `/api/v2/sample` and `/api/v2/scan` do not yet carry this check, so a suspiciously-empty result from either of those two is still worth checking against effective-access before treating it as a real answer; wiring them the same way is a planned follow-up (see limitation 1 above, the same two surfaces).
 
 ## See also
 

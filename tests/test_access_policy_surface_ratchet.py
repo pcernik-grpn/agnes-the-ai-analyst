@@ -344,6 +344,23 @@ EXEMPT: frozenset[str] = frozenset(
         # caller and unpolicied data, so a `surface='stack'` admin PAT is
         # refused (same reasoning as `query_hybrid.py::hybrid_query` below).
         "app/api/admin.py::preview_table_policy_all_groups",
+        # issue #2147, design doc §13.1 "The preview is a matrix, not a run"
+        # -- POST .../policy/preview-matrix. Same exemption reasoning as the
+        # two entries directly above: it runs the SAME single-persona
+        # primitive (`_policy_preview_run_persona`, shared with
+        # `preview_table_policy`) once per enumerated persona, deliberately
+        # bypassing the resolver's admin-bypass path the same way, gated by
+        # `require_admin_all_surface` and audited
+        # (`access_policy.preview_matrix`) for the same F2 reasons.
+        "app/api/admin.py::preview_table_policy_matrix",
+        # Same feature, its own node: `_policy_preview_group_set_personas`
+        # calls `can_access_table` directly to enumerate which real users
+        # can reach the table (§13.1's "list the distinct group-sets of
+        # users with access to this table" primitive) -- an RBAC visibility
+        # check on the ADMIN's behalf while building the persona list, not a
+        # caller-facing content read of its own, so it is exempt for the
+        # same reason `preview_table_policy_matrix` above is.
+        "app/api/admin.py::_policy_preview_group_set_personas",
         # access-policy-builder-ux plan, Tasks 2/3 -- GET .../policy/columns
         # and its shared `_policy_builder_describe` DESCRIBE helper. Same
         # admin-authoring posture as `preview_table_policy` right above:

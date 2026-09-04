@@ -508,3 +508,160 @@ class TestTablePolicyPreviewSurfaceRefusal:
         assert result.exit_code == 1, result.output
         assert "agnes init --as-admin" in result.output
         assert "data-read surface" in result.output
+
+
+class TestTablePolicyPreviewMatrix:
+    """``agnes admin table-policy preview <id> --matrix`` (design doc §13.1,
+    issue #2147) -- calls `POST .../policy/preview-matrix` instead of the
+    single-persona endpoint. No persona flag is accepted: the matrix
+    enumerates its own personas.
+    """
+
+    def _matrix_body(self):
+        return {
+            "rows_total": 3,
+            "personas": [
+                {
+                    "kind": "group_set",
+                    "label": "Finance",
+                    "groups": ["Finance"],
+                    "rows_visible": 2,
+                    "rows_total": 3,
+                    "hidden_columns": ["secret"],
+                    "masked_columns": [],
+                },
+                {
+                    "kind": "group_set",
+                    "label": "Ops",
+                    "groups": ["Ops"],
+                    "rows_visible": 1,
+                    "rows_total": 3,
+                    "hidden_columns": ["secret"],
+                    "masked_columns": [],
+                },
+            ],
+            "union_coverage": 1.0,
+            "no_op": False,
+            "pairwise_overlap": [
+                {"persona_a": "Finance", "persona_b": "Ops", "overlap_rows": 0, "overlap_fraction": 0.0}
+            ],
+            "identity_columns": ["id"],
+            "truncated": False,
+            "transpiled": None,
+            "mapping_warning": None,
+        }
+
+    def test_matrix_calls_the_matrix_endpoint(self):
+        captured = {}
+
+        def fake_post(path, **kwargs):
+            captured["path"] = path
+            captured["json"] = kwargs.get("json")
+            return _resp(200, self._matrix_body())
+
+        with patch("cli.commands.admin.api_post", side_effect=fake_post):
+            result = runner.invoke(app, ["admin", "table-policy", "preview", "invoices", "--matrix"])
+        assert result.exit_code == 0, result.output
+        assert captured["path"] == "/api/admin/registry/invoices/policy/preview-matrix"
+        assert captured["json"] == {"personas": "both"}
+        assert "Finance" in result.output
+        assert "Ops" in result.output
+        assert "union coverage: 100%" in result.output
+
+    def test_matrix_json_clean_stdout(self):
+        body = self._matrix_body()
+        with patch("cli.commands.admin.api_post", return_value=_resp(200, body)):
+            result = runner.invoke(app, ["admin", "table-policy", "preview", "invoices", "--matrix", "--json"])
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.output) == body
+
+    def test_matrix_personas_and_limit_forwarded(self):
+        captured = {}
+
+        def fake_post(path, **kwargs):
+            captured["json"] = kwargs.get("json")
+            return _resp(200, self._matrix_body())
+
+        with patch("cli.commands.admin.api_post", side_effect=fake_post):
+            result = runner.invoke(
+                app,
+                [
+                    "admin",
+                    "table-policy",
+                    "preview",
+                    "invoices",
+                    "--matrix",
+                    "--personas",
+                    "policy_groups",
+                    "--limit",
+                    "10",
+                ],
+            )
+        assert result.exit_code == 0, result.output
+        assert captured["json"] == {"personas": "policy_groups", "limit": 10}
+
+    def test_matrix_rejects_as_user(self):
+        with patch("cli.commands.admin.api_post") as mock_post:
+            result = runner.invoke(
+                app, ["admin", "table-policy", "preview", "invoices", "--matrix", "--as", "alice@x.com"]
+            )
+        assert result.exit_code == 2
+        mock_post.assert_not_called()
+
+    def test_matrix_rejects_as_groups(self):
+        with patch("cli.commands.admin.api_post") as mock_post:
+            result = runner.invoke(
+                app, ["admin", "table-policy", "preview", "invoices", "--matrix", "--as-groups", "Finance"]
+            )
+        assert result.exit_code == 2
+        mock_post.assert_not_called()
+
+    def test_matrix_rejects_an_unknown_personas_value(self):
+        with patch("cli.commands.admin.api_post") as mock_post:
+            result = runner.invoke(
+                app, ["admin", "table-policy", "preview", "invoices", "--matrix", "--personas", "bogus"]
+            )
+        assert result.exit_code == 2
+        mock_post.assert_not_called()
+
+    def test_matrix_flags_a_no_op_policy(self):
+        body = self._matrix_body()
+        body["union_coverage"] = 1.0
+        body["no_op"] = True
+        for persona in body["personas"]:
+            persona["rows_visible"] = persona["rows_total"]
+
+        with patch("cli.commands.admin.api_post", return_value=_resp(200, body)):
+            result = runner.invoke(app, ["admin", "table-policy", "preview", "invoices", "--matrix"])
+        assert result.exit_code == 0, result.output
+        assert "NO-OP" in result.output
+
+    def test_matrix_mapping_warning_short_circuits_the_render(self):
+        body = {
+            "rows_total": None,
+            "personas": [],
+            "union_coverage": None,
+            "no_op": None,
+            "pairwise_overlap": [],
+            "identity_columns": [],
+            "truncated": False,
+            "transpiled": None,
+            "mapping_warning": "policy_mapping_empty: the mapping table has never synced",
+        }
+        with patch("cli.commands.admin.api_post", return_value=_resp(200, body)):
+            result = runner.invoke(app, ["admin", "table-policy", "preview", "invoices", "--matrix"])
+        assert result.exit_code == 0, result.output
+        assert "policy_mapping_empty" in result.output
+
+    def test_matrix_api_error_surfaces_detail(self):
+        with patch(
+            "cli.commands.admin.api_post",
+            return_value=_resp(
+                422,
+                {"detail": "policy_preview_no_policy: no stored or candidate policy"},
+                text="policy_preview_no_policy",
+            ),
+        ):
+            result = runner.invoke(app, ["admin", "table-policy", "preview", "orders", "--matrix"])
+        assert result.exit_code == 1
+        assert "policy_preview_no_policy" in result.output

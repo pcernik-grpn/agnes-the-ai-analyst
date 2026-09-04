@@ -79,6 +79,7 @@ are the unit of curation and user-facing discovery.
 | `DELETE` | `/api/admin/registry/{table_id}` | — | Unregister |
 | `POST` | `/api/admin/registry/{table_id}/policy/preview` | see §3.7 | Preview a stored or candidate access policy as a chosen persona |
 | `POST` | `/api/admin/registry/{table_id}/policy/preview-groups` | see §3.7 | Preview a stored or candidate access policy across every real group in one call |
+| `POST` | `/api/admin/registry/{table_id}/policy/preview-matrix` | see §3.7 | Preview a stored or candidate access policy across a persona matrix (union coverage, pairwise overlap) |
 | `GET` | `/api/admin/registry/{table_id}/policy/columns` | — | No-SQL policy builder: real column schema + sample values (see §3.8) |
 | `POST` | `/api/admin/registry/{table_id}/policy/compile` | see §3.8 | No-SQL policy builder: structured spec → validated SQL (never persisted) |
 | `GET` | `/api/admin/registry/{table_id}/policy/revisions` | — | Saved states of a table's access policy, newest first (see §3.9) |
@@ -255,8 +256,9 @@ attached/replaced/cleared via `PUT /api/admin/registry/{table_id}` (`access_poli
 Every call is recorded to the audit log (`access_policy.preview`) — it shows one admin
 another person's data slice.
 
-These four policy-content routes (`.../policy/preview`, `.../policy/preview-groups`,
-`.../policy/columns`, `.../policy/revisions`) need an admin credential whose data-read
+These five policy-content routes (`.../policy/preview`, `.../policy/preview-groups`,
+`.../policy/preview-matrix`, `.../policy/columns`, `.../policy/revisions`) need an
+admin credential whose data-read
 **surface** is `all` — a browser session, a regular PAT, or `agnes init --as-admin`.
 A `surface='stack'` PAT (the `agnes init` default, filtered like an analyst everywhere
 else) gets `403` with a detail naming the fix: they return real table content with no
@@ -321,6 +323,54 @@ curl -s -X POST \
 #             {"group": "Everyone", "rows_visible": 0, "error": null}],
 #  "mapping_warning": null}
 ```
+
+#### `POST /api/admin/registry/{table_id}/policy/preview-matrix`
+
+The persona **matrix** (design doc §13.1 "The preview is a matrix, not a run";
+issue #2147) — runs the SAME single-persona primitive `.../policy/preview` uses
+once per enumerated persona, instead of once for a single admin-chosen one, and
+derives two numbers a single-persona run cannot show: whether the policy is a
+no-op, and whether two personas meant to partition the table actually overlap.
+
+| Field | Type | Notes |
+|---|---|---|
+| `sql` | string, optional | Same meaning as `.../policy/preview` — omit to preview the stored policy. |
+| `personas` | string, optional | `"group_sets"` \| `"policy_groups"` \| `"both"` (default). `group_sets` enumerates the distinct sets of live group names held by real users who can reach the table; `policy_groups` enumerates every group literal the policy body itself compares `$user_groups` against, plus the empty group set. An admin persona never appears. |
+| `limit` | integer, optional | Bounds how many distinct `group_sets` personas are enumerated — `1..50`; `422 policy_preview_matrix_limit_out_of_range` outside that range. |
+
+```bash
+curl -s -X POST \
+  "https://{your-instance}/api/admin/registry/orders_daily/policy/preview-matrix" \
+  -H "Authorization: Bearer $PAT" \
+  -H "Content-Type: application/json" \
+  -d '{"personas": "group_sets"}'
+# {"rows_total": 4200,
+#  "personas": [
+#    {"kind": "group_set", "label": "Finance", "groups": ["Finance"],
+#     "rows_visible": 1200, "rows_total": 4200,
+#     "hidden_columns": ["secret"], "masked_columns": []},
+#    {"kind": "group_set", "label": "Ops", "groups": ["Ops"],
+#     "rows_visible": 900, "rows_total": 4200,
+#     "hidden_columns": ["secret"], "masked_columns": []}
+#  ],
+#  "union_coverage": 0.7, "no_op": false,
+#  "pairwise_overlap": [{"persona_a": "Finance", "persona_b": "Ops",
+#                        "overlap_rows": 0, "overlap_fraction": 0.0}],
+#  "identity_columns": ["id"], "truncated": false,
+#  "transpiled": null, "mapping_warning": null}
+```
+
+`union_coverage` is the fraction of the SAME bounded sample `.../policy/preview`
+uses that is visible to at least one persona — `1.0` together with every
+persona individually at `1.0` sets `no_op: true`. `pairwise_overlap` reports,
+for every pair of personas, how many of their visible sampled rows coincide —
+a non-zero overlap between two personas a partitioning policy should keep
+disjoint is the permissive `CASE`-with-a-missing-branch bug, rendered
+directly. Row identity across personas (`identity_columns`) is best-effort:
+the columns that survive from base to policied output unchanged (never
+hidden, never masked). With no stored policy at all and no candidate `sql`
+given, this 422s the same way `.../policy/preview` does
+(`policy_preview_no_policy`).
 
 ### 3.8 No-SQL policy builder — `GET .../policy/columns`, `POST .../policy/compile`
 
@@ -848,6 +898,7 @@ checks against.
 - /api/admin/registry/{table_id}/docs
 - /api/admin/registry/{table_id}/policy/preview
 - /api/admin/registry/{table_id}/policy/preview-groups
+- /api/admin/registry/{table_id}/policy/preview-matrix
 - /api/admin/registry/{table_id}/policy/columns
 - /api/admin/registry/{table_id}/policy/compile
 - /api/admin/registry/{table_id}/policy/revisions
