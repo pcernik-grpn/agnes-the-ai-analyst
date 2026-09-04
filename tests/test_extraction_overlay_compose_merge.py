@@ -60,9 +60,15 @@ WORKER_IMAGE = "registry.example.com/agnes/extraction-worker:canary-1.2.3"
 
 VM_ENV_WITH_WORKER_IMAGE = VM_ENV + f"AGNES_EXTRACTION_WORKER_IMAGE={WORKER_IMAGE}\n"
 
+VM_ENV_WITH_REPLICAS = VM_ENV + (
+    "AGNES_EXTRACTION_WORKER_REPLICAS=6\n"
+    "AGNES_EXTRACTION_WORKER_PG_POOL_SIZE=8\n"
+    "AGNES_EXTRACTION_WORKER_PG_MAX_OVERFLOW=8\n"
+)
+
 
 def _resolve_image_conditional(text: str, image_set: bool) -> str:
-    """Hand-evaluate the ONE Terraform conditional this harness does not run
+    """Hand-evaluate the Terraform conditional this harness does not run
     ``templatefile()`` for: ``%{ if extraction_worker_image != "" ~}`` /
     ``%{ endif ~}``. Mirrors exactly what Terraform renders for each case —
     the guarded lines survive when ``image_set`` is True, vanish otherwise.
@@ -76,20 +82,38 @@ def _resolve_image_conditional(text: str, image_set: bool) -> str:
     return text[:start] + kept + text[close + len(endif) :]
 
 
-def overlay_as_written_on_vm(image_set: bool = False) -> str:
+def _resolve_replicas_conditional(text: str, replicas: int) -> str:
+    """Hand-evaluate the other Terraform conditional this harness does not
+    run ``templatefile()`` for: ``%{ if extraction_worker_replicas > 1 ~}`` /
+    ``%{ endif ~}`` (the pinned ``AGNES_PG_POOL_SIZE``/``AGNES_PG_MAX_OVERFLOW``
+    lines). Mirrors Terraform: kept when ``replicas > 1``, absent otherwise —
+    the default (1) must render byte-identically to before this field
+    existed."""
+    guard = "%{ if extraction_worker_replicas > 1 ~}\n"
+    endif = "%{ endif ~}\n"
+    start = text.index(guard)
+    close = text.index(endif, start)
+    inner = text[start + len(guard) : close]
+    kept = inner if replicas > 1 else ""
+    return text[:start] + kept + text[close + len(endif) :]
+
+
+def overlay_as_written_on_vm(image_set: bool = False, replicas: int = 1) -> str:
     """The exact docker-compose.extraction.yml bytes a VM ends up with.
 
     The template writes the overlay through a quoted heredoc, so the only
     transformation between template text and on-disk file is Terraform's
-    ``$${`` → ``${`` unescape (templatefile) plus resolving the
-    ``extraction_worker_image`` conditional above, which the shell's quoted
-    heredoc then passes through verbatim. ``image_set=False`` (the default)
-    is the normal, unpinned case every other test in this file exercises.
+    ``$${`` → ``${`` unescape (templatefile) plus resolving the two
+    conditionals above, which the shell's quoted heredoc then passes through
+    verbatim. ``image_set=False``/``replicas=1`` (the defaults) are the
+    normal, unpinned/single-replica case every other test in this file
+    exercises.
     """
     m = re.search(r"<<'EXTRYAML'\n(.*?)\nEXTRYAML\n", TPL.read_text(), re.DOTALL)
     assert m, "startup-script.sh.tpl must write the extraction overlay via an EXTRYAML heredoc"
     raw = m.group(1).replace("$${", "${") + "\n"
-    return _resolve_image_conditional(raw, image_set)
+    raw = _resolve_image_conditional(raw, image_set)
+    return _resolve_replicas_conditional(raw, replicas)
 
 
 def _compose_config(project: Path, files: list[str]) -> dict:
@@ -140,6 +164,18 @@ def project_with_worker_image(tmp_path: Path, compose_available) -> Path:
         shutil.copy(REPO / name, tmp_path / name)
     (tmp_path / "docker-compose.extraction.yml").write_text(overlay_as_written_on_vm(image_set=True))
     (tmp_path / ".env").write_text(VM_ENV_WITH_WORKER_IMAGE)
+    return tmp_path
+
+
+@pytest.fixture()
+def project_with_replicas(tmp_path: Path, compose_available) -> Path:
+    """Same as ``project``, but for a VM whose root module set
+    ``extraction_worker_replicas > 1`` — the pinned-pool case (TCRD-296 gap
+    #76)."""
+    for name in ("docker-compose.yml", "docker-compose.prod.yml", "docker-compose.host-mount.yml"):
+        shutil.copy(REPO / name, tmp_path / name)
+    (tmp_path / "docker-compose.extraction.yml").write_text(overlay_as_written_on_vm(replicas=6))
+    (tmp_path / ".env").write_text(VM_ENV_WITH_REPLICAS)
     return tmp_path
 
 
@@ -253,6 +289,33 @@ def test_overlay_pins_the_worker_when_extraction_worker_image_is_set(project_wit
     assert env["AGNES_WORKER_LANES"] == "extraction"
     deps = {k: v["condition"] for k, v in worker["depends_on"].items()}
     assert deps == {"app": "service_healthy", "redis": "service_healthy"}
+
+
+def test_single_replica_pins_no_pool_override(project: Path):
+    """The default (1 replica) must be byte-identical to before this field
+    existed — no AGNES_PG_POOL_SIZE/_MAX_OVERFLOW override on the worker, so
+    it keeps sizing its pool from the per-process runtime hint
+    (src/db_pg.py)."""
+    cfg = _compose_config(project, BASE_CHAIN + ["docker-compose.extraction.yml"])
+    env = cfg["services"]["extraction-worker"]["environment"]
+    assert "AGNES_PG_POOL_SIZE" not in env
+    assert "AGNES_PG_MAX_OVERFLOW" not in env
+
+
+def test_multi_replica_pins_the_worker_pool_only(project_with_replicas: Path):
+    """> 1 replica pins AGNES_PG_POOL_SIZE/_MAX_OVERFLOW on the
+    extraction-worker service ONLY — app and scheduler never carry these two
+    lines and keep sizing their pool from src/db_pg.py's own conservative
+    defaults (TCRD-296 gap #76)."""
+    cfg = _compose_config(project_with_replicas, BASE_CHAIN + ["docker-compose.extraction.yml"])
+    services = cfg["services"]
+    worker_env = services["extraction-worker"]["environment"]
+    assert worker_env["AGNES_PG_POOL_SIZE"] == "8"
+    assert worker_env["AGNES_PG_MAX_OVERFLOW"] == "8"
+    for svc in ("app", "scheduler"):
+        env = services[svc]["environment"]
+        assert "AGNES_PG_POOL_SIZE" not in env
+        assert "AGNES_PG_MAX_OVERFLOW" not in env
 
 
 def test_coordination_env_reaches_app_and_worker_via_env_file(project: Path):
@@ -370,7 +433,8 @@ def _run_tolerant_phase(tmp_path: Path, failing_pulls: str) -> tuple[str, str]:
     script = (
         "set -euo pipefail\n"
         'COMPOSE_PROFILES_ARG=""\n'
-        'EXTRACTION_FULL_COMPOSE_FILE="docker-compose.yml:docker-compose.extraction.yml"\n' + _tolerant_block()
+        'EXTRACTION_FULL_COMPOSE_FILE="docker-compose.yml:docker-compose.extraction.yml"\n'
+        'RESOLVED_EXTRACTION_WORKER_REPLICAS="1"\n' + _tolerant_block()
     )
     proc = subprocess.run(
         ["bash", "-c", script],
@@ -394,7 +458,7 @@ def test_tolerant_phase_brings_redis_up_before_the_worker(tmp_path: Path):
         "docker compose pull redis",
         "docker compose up -d redis",
         "docker compose pull extraction-worker",
-        "docker compose up -d extraction-worker",
+        "docker compose up -d --scale extraction-worker=1 extraction-worker",
     ], "redis must be pulled+started before the worker's private-registry pull"
     assert stderr == ""
 

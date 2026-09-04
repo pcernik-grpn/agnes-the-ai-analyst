@@ -1276,3 +1276,318 @@ def test_switching_back_to_the_builder_refreshes_the_representation_state(seeded
     body = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
     fn = body[body.index("function apSwitchTab") : body.index("var _AP_MASK_LABELS")]
     assert "_apRenderRepresentationNotice()" in fn
+
+
+# ── issue #2147: the Builder tab's mask picker grows the four masks
+# `src/access_policy_compile.py` shipped beyond the original five — `last4`,
+# `email_partial`, `pseudonymize_keyed`, `tiered` — plus the `groups`
+# modifier any value-producing mask can now carry. These tests run the
+# SHIPPED JS under node (same rationale as ``TestDiffAlgorithmUnderNode``
+# above: a Python transcription of the disabled-state/spec-assembly rules
+# would pass regardless of what those rules actually are).
+
+
+def test_mask_picker_lists_the_new_masks_and_help_text(seeded_app):
+    c = seeded_app["client"]
+    body = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
+    labels = body[body.index("var _AP_MASK_LABELS") : body.index("var _AP_MASK_HELP")]
+    for value in ("last4", "email_partial", "pseudonymize_keyed", "tiered"):
+        assert value + ":" in labels, f"missing mask label wiring: {value}"
+    help_block = body[body.index("var _AP_MASK_HELP") : body.index("_AP_TEXT_ONLY_MASKS =")]
+    # The hash option's help text is pinned verbatim (issue #2147 spec).
+    assert "md5, unsalted — prefer keyed pseudonym on a server-only table." in help_block
+    for value in ("last4", "email_partial", "pseudonymize_keyed", "tiered"):
+        assert value + ":" in help_block, f"missing mask help text: {value}"
+
+
+def test_mask_picker_options_cover_the_compiler_vocabulary(seeded_app):
+    """Every mask ``src/access_policy_compile.py`` understands must be
+    reachable from the picker — mirrors
+    ``test_row_rule_builder_ops_cover_the_compiler_vocabulary`` above."""
+    c = seeded_app["client"]
+    body = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
+    render = body[body.index("function _apRenderColList") : body.index("function _apOnMaskChange")]
+    assert (
+        "var maskChoices = ['show', 'hide', 'nullify', 'hash', 'unmask', "
+        "'last4', 'email_partial', 'pseudonymize_keyed', 'tiered'];" in render
+    )
+
+
+class TestMaskBuilderUnderNode:
+    """Runs the SHIPPED mask-picker helpers under node."""
+
+    @staticmethod
+    def _extract_snippet() -> str:
+        text = _template_text()
+        esc_start = text.index("function escapeHtml(str)")
+        esc_end = text.index("function _dropdownMarkupHtml")
+        mask_start = text.index("var _AP_MASK_LABELS")
+        mask_end = text.index("function _apCancelPendingCompile")
+        return text[esc_start:esc_end] + text[mask_start:mask_end]
+
+    def _run(self, setup: str, expression: str):
+        node = shutil.which("node")
+        if not node:
+            pytest.skip("node not available")
+        # Same DOM shim as `TestDiffAlgorithmUnderNode` — only what
+        # `escapeHtml`'s textContent/innerHTML round-trip needs for plain
+        # text, nothing about the mask logic under test.
+        shim = (
+            "var document = { createElement: function() { "
+            "  var v = ''; return { set textContent(s) { v = String(s)"
+            ".replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }, "
+            "  get innerHTML() { return v; } }; } };\n"
+        )
+        # `_apRenderColList`/`_apScheduleCompile` touch the live DOM and a
+        # debounce timer this harness has neither — the state-mutation
+        # functions under test (`_apOnMaskChange`, the tier mutators) call
+        # them as side effects only, so a no-op override is enough to
+        # exercise the STATE change without dragging in a fake DOM tree.
+        overrides = "\nfunction _apRenderColList() {}\nfunction _apScheduleCompile() {}\n"
+        script = (
+            shim
+            + self._extract_snippet()
+            + overrides
+            + "\n"
+            + setup
+            + "\nprocess.stdout.write(JSON.stringify(" + expression + "));\n"
+        )
+        out = subprocess.run([node, "-e", script], capture_output=True, text=True, check=False)
+        assert out.returncode == 0, out.stderr
+        return json.loads(out.stdout)
+
+    # ── per-option disabled state ──
+
+    def test_last4_disabled_on_a_non_text_column(self):
+        meta = self._run("", "_apMaskOptionMeta('last4', false, false)")
+        assert meta["disabled"] is True
+        assert "text" in meta["title"].lower()
+
+    def test_last4_enabled_on_a_text_column(self):
+        meta = self._run("", "_apMaskOptionMeta('last4', true, false)")
+        assert meta["disabled"] is False
+
+    def test_email_partial_disabled_on_a_non_text_column(self):
+        meta = self._run("", "_apMaskOptionMeta('email_partial', false, false)")
+        assert meta["disabled"] is True
+
+    def test_pseudonymize_keyed_disabled_on_a_non_text_column(self):
+        meta = self._run("", "_apMaskOptionMeta('pseudonymize_keyed', false, false)")
+        assert meta["disabled"] is True
+
+    def test_pseudonymize_keyed_disabled_on_a_remote_table_even_when_text(self):
+        meta = self._run("", "_apMaskOptionMeta('pseudonymize_keyed', true, true)")
+        assert meta["disabled"] is True
+        assert "policy_function_duckdb_only" in meta["title"]
+
+    def test_pseudonymize_keyed_enabled_on_a_text_column_of_a_local_table(self):
+        meta = self._run("", "_apMaskOptionMeta('pseudonymize_keyed', true, false)")
+        assert meta["disabled"] is False
+
+    def test_disabled_masks_are_never_text_only_restrictions_for_hash_or_nullify(self):
+        """`hash`/`nullify`/`show`/`hide`/`unmask`/`tiered` apply to every
+        column type — only the three text-surgery masks (plus
+        `pseudonymize_keyed` on a remote table) are ever disabled."""
+        for choice in ("show", "hide", "nullify", "hash", "unmask", "tiered"):
+            meta = self._run("", f"_apMaskOptionMeta('{choice}', false, true)")
+            assert meta["disabled"] is False, f"{choice} must never be disabled by column type or remote mode"
+
+    # ── the `groups` modifier ──
+
+    def test_groups_modifier_hidden_for_show_and_hide(self):
+        assert self._run("", "_apGroupsCapableMask('show')") is False
+        assert self._run("", "_apGroupsCapableMask('hide')") is False
+
+    def test_groups_modifier_hidden_for_tiered(self):
+        """A tiered chain has its own per-tier groups — the flat modifier
+        would be a second, conflicting way to say the same thing."""
+        assert self._run("", "_apGroupsCapableMask('tiered')") is False
+
+    def test_groups_modifier_available_for_every_value_producing_mask(self):
+        for choice in ("nullify", "hash", "unmask", "last4", "email_partial", "pseudonymize_keyed"):
+            assert self._run("", f"_apGroupsCapableMask('{choice}')") is True, choice
+
+    def test_groups_change_emits_the_groups_modifier_on_a_plain_mask(self):
+        """Picking `hash` then typing groups must produce
+        ``{choice: 'hash', groups: [...]}`` — the exact shape
+        `compile_policy` reads via `_unmask_groups`."""
+        state = self._run(
+            "_apMaskState = {}; _apMaskState['email'] = 'hash'; "
+            "_apOnMaskGroupsChange('email', 'Finance, Legal');",
+            "_apMaskState['email']",
+        )
+        assert state == {"choice": "hash", "groups": ["Finance", "Legal"]}
+
+    def test_groups_change_on_unmask_keeps_its_own_spelling(self):
+        state = self._run(
+            "_apMaskState = {}; _apOnMaskChange('email', 'unmask'); "
+            "_apOnMaskGroupsChange('email', 'Compliance');",
+            "_apMaskState['email']",
+        )
+        assert state == {"choice": "unmask", "groups": ["Compliance"]}
+
+    def test_empty_groups_degrade_to_the_plain_mask_shape(self):
+        """Clearing the groups box must not leave a stray empty allowlist
+        the compiler would treat differently from a bare mask -- ``''``
+        parses to no groups, same as never having typed any."""
+        state = self._run(
+            "_apMaskState = {}; _apMaskState['email'] = 'hash'; "
+            "_apOnMaskGroupsChange('email', '');",
+            "_apMaskState['email']",
+        )
+        assert state == {"choice": "hash", "groups": []}
+
+    def test_switching_away_from_a_mask_with_groups_preserves_them(self):
+        """Switching the choice while groups are set (e.g. hash -> nullify)
+        keeps the allowlist rather than silently dropping it."""
+        state = self._run(
+            "_apMaskState = {}; _apMaskState['email'] = { choice: 'hash', groups: ['Finance'] }; "
+            "_apOnMaskChange('email', 'nullify');",
+            "_apMaskState['email']",
+        )
+        assert state == {"choice": "nullify", "groups": ["Finance"]}
+
+    # ── the tiered editor ──
+
+    def test_choosing_tiered_seeds_one_empty_tier_and_a_default(self):
+        state = self._run(
+            "_apMaskState = {}; _apOnMaskChange('nid', 'tiered');",
+            "_apMaskState['nid']",
+        )
+        assert state["choice"] == "tiered"
+        assert state["tiers"] == [{"groups": [], "reveal": "show"}]
+        assert state["default"] in ("nullify", "hash", "last4", "email_partial", "pseudonymize_keyed")
+
+    def test_add_tier_appends_in_order(self):
+        state = self._run(
+            "_apMaskState = {}; _apOnMaskChange('nid', 'tiered'); "
+            "_apMaskState['nid'].tiers[0].groups = ['Compliance']; "
+            "_apAddTier('nid'); "
+            "_apMaskState['nid'].tiers[1].groups = ['Finance']; "
+            "_apMaskState['nid'].tiers[1].reveal = 'last4';",
+            "_apMaskState['nid'].tiers",
+        )
+        assert state == [
+            {"groups": ["Compliance"], "reveal": "show"},
+            {"groups": ["Finance"], "reveal": "last4"},
+        ]
+
+    def test_move_tier_reorders_first_match_wins_order(self):
+        state = self._run(
+            "_apMaskState = {}; _apOnMaskChange('nid', 'tiered'); "
+            "_apMaskState['nid'].tiers[0].groups = ['Compliance']; "
+            "_apAddTier('nid'); "
+            "_apMaskState['nid'].tiers[1].groups = ['Finance']; "
+            "_apMoveTier('nid', 1, -1);",
+            "_apMaskState['nid'].tiers.map(function(t){return t.groups[0];})",
+        )
+        assert state == ["Finance", "Compliance"]
+
+    def test_remove_tier_drops_only_that_tier(self):
+        state = self._run(
+            "_apMaskState = {}; _apOnMaskChange('nid', 'tiered'); "
+            "_apMaskState['nid'].tiers[0].groups = ['Compliance']; "
+            "_apAddTier('nid'); "
+            "_apMaskState['nid'].tiers[1].groups = ['Finance']; "
+            "_apRemoveTier('nid', 0);",
+            "_apMaskState['nid'].tiers",
+        )
+        assert state == [{"groups": ["Finance"], "reveal": "show"}]
+
+    def test_tier_default_change_updates_state(self):
+        state = self._run(
+            "_apMaskState = {}; _apOnMaskChange('nid', 'tiered'); "
+            "_apOnTierDefaultChange('nid', 'hash');",
+            "_apMaskState['nid'].default",
+        )
+        assert state == "hash"
+
+    # ── validation, mirroring the compiler's own refusals ──
+
+    def test_validation_message_when_no_tiers(self):
+        msg = self._run("", "_apTierValidationMessage({choice: 'tiered', tiers: [], default: 'nullify'})")
+        assert "at least one tier" in msg
+
+    def test_validation_message_when_a_tier_has_no_groups(self):
+        msg = self._run(
+            "",
+            "_apTierValidationMessage({choice: 'tiered', "
+            "tiers: [{groups: [], reveal: 'show'}], default: 'nullify'})",
+        )
+        assert "at least one group" in msg
+
+    def test_validation_message_when_default_is_show_or_hide(self):
+        for bad_default in ("show", "hide", ""):
+            msg = self._run(
+                "",
+                "_apTierValidationMessage({choice: 'tiered', "
+                "tiers: [{groups: ['A'], reveal: 'show'}], default: '" + bad_default + "'})",
+            )
+            assert msg, f"default {bad_default!r} must be refused"
+            assert "default" in msg.lower()
+
+    def test_validation_message_empty_for_a_complete_spec(self):
+        msg = self._run(
+            "",
+            "_apTierValidationMessage({choice: 'tiered', "
+            "tiers: [{groups: ['A'], reveal: 'show'}], default: 'nullify'})",
+        )
+        assert msg == ""
+
+    def test_tier_editor_renders_ordered_rows_add_button_and_default_select(self):
+        html = self._run(
+            "_apMaskState = {}; _apOnMaskChange('nid', 'tiered'); "
+            "_apMaskState['nid'].tiers[0].groups = ['Compliance']; "
+            "_apAddTier('nid'); "
+            "_apMaskState['nid'].tiers[1].groups = ['Finance']; "
+            "_apMaskState['nid'].tiers[1].reveal = 'last4'; "
+            "_apOnTierDefaultChange('nid', 'nullify');",
+            "_apRenderTierEditor('nid', '\\'nid\\'', _apMaskState['nid'], true, false, false)",
+        )
+        assert html.index("Compliance") < html.index("Finance"), "tiers must render in the admin's own order"
+        assert "Add tier" in html
+        assert 'ap-tier-default' in html
+        assert "selected" in html  # the chosen reveal/default land as the selected <option>
+
+    def test_tier_editor_shows_the_validation_message_inline(self):
+        html = self._run(
+            "_apMaskState = {}; _apOnMaskChange('nid', 'tiered');",
+            "_apRenderTierEditor('nid', '\\'nid\\'', _apMaskState['nid'], true, false, false)",
+        )
+        assert "ap-tier-validation" in html
+        assert "at least one group" in html
+        assert 'style="display:none;"' not in html.split("ap-tier-validation")[1][:50]
+
+    def test_tier_editor_hides_the_validation_message_when_valid(self):
+        html = self._run(
+            "_apMaskState = {}; _apOnMaskChange('nid', 'tiered'); "
+            "_apMaskState['nid'].tiers[0].groups = ['Compliance']; "
+            "_apOnTierDefaultChange('nid', 'nullify');",
+            "_apRenderTierEditor('nid', '\\'nid\\'', _apMaskState['nid'], true, false, false)",
+        )
+        tail = html[html.index("ap-tier-validation") :]
+        assert 'style="display:none;"' in tail[:60]
+
+    def test_tier_reveal_options_disable_text_only_masks_on_a_non_text_column(self):
+        html = self._run(
+            "_apMaskState = {}; _apOnMaskChange('nid', 'tiered');",
+            "_apRenderTierEditor('nid', '\\'nid\\'', _apMaskState['nid'], false, false, false)",
+        )
+        assert '<option value="last4" disabled' in html
+        assert '<option value="email_partial" disabled' in html
+
+    def test_tier_default_options_disable_pseudonymize_keyed_on_a_remote_table(self):
+        html = self._run(
+            "_apMaskState = {}; _apOnMaskChange('nid', 'tiered');",
+            "_apRenderTierEditor('nid', '\\'nid\\'', _apMaskState['nid'], true, true, false)",
+        )
+        assert '<option value="pseudonymize_keyed" disabled' in html
+
+
+def test_docs_builder_paragraph_names_the_groups_modifier_and_tiered_mask(seeded_app):
+    """Sync-map: the Builder paragraph in docs/table-access-policies.md must
+    list every picker option, including the ones this issue adds."""
+    docs_path = Path(__file__).resolve().parents[1] / "docs" / "table-access-policies.md"
+    text = docs_path.read_text(encoding="utf-8")
+    assert "tiered" in text
+    assert "`groups`" in text

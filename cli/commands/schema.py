@@ -39,9 +39,10 @@ def schema(
     typer.echo("")
     typer.echo(f"{'COLUMN':30s}  {'TYPE':15s}  {'NULL':5s}  DESCRIPTION")
     for c in data.get("columns", []):
-        typer.echo(
-            f"{c['name']:30s}  {c['type']:15s}  {'YES' if c.get('nullable') else 'NO':5s}  {c.get('description', '')}"
-        )
+        description = c.get("description", "")
+        if c.get("masked"):
+            description = f"{description} (masked by access policy)".strip()
+        typer.echo(f"{c['name']:30s}  {c['type']:15s}  {'YES' if c.get('nullable') else 'NO':5s}  {description}")
     if data.get("partition_by"):
         typer.echo(f"\nPartition: {data['partition_by']}")
     if data.get("clustered_by"):

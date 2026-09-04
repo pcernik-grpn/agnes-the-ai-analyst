@@ -28,6 +28,7 @@ from services.session_pipeline.lib import parse_jsonl
 from src.repositories import (
     audit_repo,
     usage_repo,
+    users_repo,
 )
 
 logger = logging.getLogger(__name__)
@@ -161,34 +162,87 @@ def facets(
 # Transcript viewer
 # ---------------------------------------------------------------------------
 
-# Username constraint: same allowlist as the session-file regex (alnums + `._-`).
-# Filesystem username is the local-part of an email today, so no `@` etc.
+# Username constraint. The segment is normally the on-disk session DIRECTORY
+# name, but `/list` reports `username` as the display e-mail (v60) and that is
+# the string an operator copies out of `agnes admin sessions list` — so `@` and
+# `+` are in the class and `_resolve_dir_candidates` maps an e-mail onto the
+# real directory. Neither character is a path separator on any platform, and
+# neither is what keeps the path contained: `..` matched this class before the
+# widening too, and is refused by the ``resolve()``/``relative_to(root)`` guard
+# in `_resolve_session_target` below. `/`, `\` and NUL stay out of the class.
 import re as _re
 
-_USERNAME_RE = _re.compile(r"^[A-Za-z0-9._-]{1,200}$")
+_USERNAME_RE = _re.compile(r"^[A-Za-z0-9._@+-]{1,200}$")
 
 
-def _safe_session_path(username: str, session_file: str) -> Path:
-    """Resolve a session jsonl path with three layers of guards.
+def _resolve_dir_candidates(username: str) -> list[str]:
+    """URL ``{username}`` segment → on-disk directory names to try, in order.
 
-    1. Both segments must match the allowlist regex; reject `..`, `/`, etc.
-    2. After joining, ``resolve().relative_to(root)`` confirms no symlink
-       escape moved the final path outside the user-sessions root.
-    3. The file must end in ``.jsonl``.
+    The two ingestion paths name their directory differently — ``users.id``
+    (upload API, chat export) or the e-mail local-part (legacy collector) —
+    and neither is the display e-mail the listing shows. Same pair
+    ``admin_user_sessions._user_session_dirs`` scans; resolved here so the
+    only identity a caller can actually see is a usable path segment.
+
+    The segment itself is always tried first (that is what the web UI sends
+    as ``session_dir``); the derived names are appended, never substituted.
+    """
+    names = [username]
+    if "@" in username:
+        local_part = username.split("@", 1)[0]
+        if local_part:
+            names.append(local_part)
+        try:
+            row = users_repo().get_by_email_ci(username)
+        except Exception:
+            logger.debug("session path: user lookup failed for %r", username, exc_info=True)
+            row = None
+        if row and row.get("id"):
+            names.append(str(row["id"]))
+    return list(dict.fromkeys(names))
+
+
+def _resolve_session_target(username: str, session_file: str) -> tuple[str, Path]:
+    """Resolve a session jsonl to ``(on-disk dir name, path)``, guarded.
+
+    1. Both segments must match the allowlist regex; rejects `/`, NUL, etc.
+    2. Every candidate directory — including the ones derived from an e-mail,
+       which are re-validated against the same regex — is joined and then
+       ``resolve().relative_to(root)``-checked, so no `..` and no symlink can
+       move the final path outside the user-sessions root.
+    3. The file must end in ``.jsonl`` (``_SESSION_FILE_RE``).
+
+    The directory name is returned alongside the path because rows in
+    ``usage_session_summary`` are keyed on ``<dir>/<file>``: a caller who
+    passed the e-mail must still get the right summary row.
     """
     if not _USERNAME_RE.match(username):
         raise HTTPException(status_code=400, detail="invalid username")
     if not _SESSION_FILE_RE.match(session_file):
         raise HTTPException(status_code=400, detail="invalid session_file")
     root = _session_data_dir().resolve()
-    path = (root / username / session_file).resolve()
-    try:
-        path.relative_to(root)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="path escape rejected")
-    if not path.is_file():
-        raise HTTPException(status_code=404, detail="session not found")
-    return path
+    for idx, name in enumerate(_resolve_dir_candidates(username)):
+        if not _USERNAME_RE.match(name):
+            # Derived candidates are DB-shaped, not caller-shaped, but they
+            # pass the same gate before they may become a path segment.
+            continue
+        path = (root / name / session_file).resolve()
+        try:
+            path.relative_to(root)
+        except ValueError:
+            if idx == 0:
+                # The segment the caller actually typed escaped the root —
+                # name it, rather than hiding it behind a 404.
+                raise HTTPException(status_code=400, detail="path escape rejected")
+            continue
+        if path.is_file():
+            return name, path
+    raise HTTPException(status_code=404, detail="session not found")
+
+
+def _safe_session_path(username: str, session_file: str) -> Path:
+    """``_resolve_session_target`` without the directory name."""
+    return _resolve_session_target(username, session_file)[1]
 
 
 def _flatten_text_content(content: Any) -> str:
@@ -333,7 +387,7 @@ def download(
     same way as ``/transcript``. Audit-logged."""
     from fastapi.responses import StreamingResponse
 
-    path = _safe_session_path(username, session_file)
+    session_dir, path = _resolve_session_target(username, session_file)
 
     def _iter():
         with path.open("rb") as fh:
@@ -347,7 +401,9 @@ def download(
         audit_repo().log(
             user_id=user.get("id"),
             action="session_download",
-            resource=f"{username}/{session_file}",
+            # Resolved directory, not the segment the caller typed: two
+            # aliases for one file must audit as the same resource.
+            resource=f"{session_dir}/{session_file}",
             params={"bytes": path.stat().st_size},
             result="success",
             # client_kind intentionally omitted (F0 audit-context autofill,
@@ -406,13 +462,16 @@ def transcript(
     session_file: str,
     user: dict = Depends(require_admin),
 ):
-    path = _safe_session_path(username, session_file)
+    session_dir, path = _resolve_session_target(username, session_file)
     turns = parse_jsonl(path)
     events = _render_transcript(turns)
     tokens = _sum_usage_from_turns(turns)
     counts = _count_tools_from_events(events)
 
-    summary_data = usage_repo().get_session_summary(f"{username}/{session_file}")
+    # Summary rows are keyed on `<on-disk dir>/<file>`, so look them up with
+    # the RESOLVED directory — a caller who passed the display e-mail would
+    # otherwise get a transcript with a silently empty header.
+    summary_data = usage_repo().get_session_summary(f"{session_dir}/{session_file}")
     summary: dict[str, Any] = {}
     if summary_data:
         summary = summary_data
@@ -427,7 +486,7 @@ def transcript(
         audit_repo().log(
             user_id=user.get("id"),
             action="session.transcript_view",
-            resource=f"{username}/{session_file}",
+            resource=f"{session_dir}/{session_file}",
             params={"events": len(events)},
             result="success",
             # client_kind intentionally omitted (F0 audit-context autofill,

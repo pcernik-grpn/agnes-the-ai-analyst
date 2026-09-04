@@ -2344,7 +2344,12 @@ const row = {{ id: "sp-conn-1", source_type: "sharepoint" }};
 
         tpl = read_admin_data_sources_source()
         fns = "\n".join(
-            self._extract_function(tpl, sig) for sig in ("function _esc(s) {", "function _spScopeRowHtml(connId, s) {")
+            self._extract_function(tpl, sig)
+            for sig in (
+                "function _esc(s) {",
+                "function _spScopeMinModifiedBadge(s) {",
+                "function _spScopeRowHtml(connId, s) {",
+            )
         )
         script = f"""
 {fns}
@@ -2410,6 +2415,88 @@ console.log(JSON.stringify({{ html: _spScopeRowHtml("sp-conn-1", {json.dumps(sco
         assert 'id="ds-sp-scopes-drawer-sp-conn-1"' in html
         # Nothing per-scope leaked into the initial render.
         assert "ds-sp-scope-row" not in html
+
+    # -- SharePoint permissions snapshot (TCRD-296 gap #79) -----------------
+
+    def test_acl_snapshot_row_renders_a_loading_placeholder_and_view_button(self):
+        """The fact row starts as a placeholder with a stable id —
+        `_fetchSharepointAclSnapshot` (fetched after the page paints, out of
+        reach for this synchronous node harness) fills in the real counts;
+        this pins only what `_sharepointFactsHtml` itself renders before
+        that fetch fires — same posture as the scope-collections row above."""
+        result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));")
+        html = result["html"]
+        assert "SharePoint permissions" in html
+        assert 'id="ds-sp-acl-sp-conn-1"' in html
+        assert "loading" in html
+        assert "toggleSpAclSnapshotDrawer('sp-conn-1')" in html
+        assert 'id="ds-sp-acl-drawer-sp-conn-1"' in html
+
+    def _run_acl_snapshot_scope_row(self, scope: dict) -> str:
+        """`_spAclSnapshotScopeRowHtml` executed directly — the per-scope
+        principal-list renderer used by `toggleSpAclSnapshotDrawer`'s
+        fetch-on-expand drawer (its own async `fetch()` is out of reach for
+        this synchronous node harness, but the pure rendering function it
+        calls is not — same split as `_run_scope_row` above)."""
+        import json
+        import subprocess
+        import tempfile
+        from pathlib import Path
+
+        tpl = _ds_page_source.page_source()
+        fns = "\n".join(
+            self._extract_function(tpl, sig)
+            for sig in ("function _esc(s) {", "function _spAclSnapshotScopeRowHtml(scope) {")
+        )
+        script = f"""
+{fns}
+console.log(JSON.stringify({{ html: _spAclSnapshotScopeRowHtml({json.dumps(scope)}) }}));
+"""
+        with tempfile.NamedTemporaryFile("w", suffix=".mjs", delete=False) as f:
+            f.write(script)
+            path = f.name
+        try:
+            proc = subprocess.run(["node", path], capture_output=True, text=True)
+        finally:
+            Path(path).unlink(missing_ok=True)
+        if proc.returncode == 127:
+            pytest.skip("node unavailable")
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        return json.loads(proc.stdout)["html"]
+
+    def test_acl_snapshot_scope_row_lists_each_principal_and_its_kind(self):
+        html = self._run_acl_snapshot_scope_row(
+            {
+                "source_scope_id": "s1",
+                "display_path": "Site / Docs / Finance",
+                "principals": [
+                    {"principal_kind": "entra_group", "display_name": "Finance Team"},
+                    {"principal_kind": "user", "display_name": "Alice"},
+                ],
+            }
+        )
+        assert "Site / Docs / Finance" in html
+        assert "Finance Team" in html
+        assert "entra_group" in html
+        assert "Alice" in html
+        assert "(user)" in html
+
+    def test_acl_snapshot_scope_row_escapes_principal_names(self):
+        """Untrusted names (a SharePoint display name is admin/producer
+        content, not Agnes-controlled) must never reach innerHTML raw."""
+        html = self._run_acl_snapshot_scope_row(
+            {
+                "source_scope_id": "s2",
+                "display_path": "<img src=x onerror=alert(1)>",
+                "principals": [{"principal_kind": "user", "display_name": "<script>alert(1)</script>"}],
+            }
+        )
+        assert "<script>" not in html
+        assert "<img" not in html
+
+    def test_acl_snapshot_scope_row_no_principals_state(self):
+        html = self._run_acl_snapshot_scope_row({"source_scope_id": "s3", "display_path": "Empty", "principals": []})
+        assert "no principals" in html
 
     # -- anonymization row (spec §9.2/§13.2): requested vs declared --------
 
@@ -2955,7 +3042,7 @@ class TestOpenSpWizardPreselectsSingleExistingConnection:
 {fns}
 
 const SP_CONN_API = "/api/admin/source-connections";
-let spConnId, spCertChoice, spLevel, spCrumbs, spItems, spScopes, spGroups, spPendingGroups, spTreeFilterQuery, spLastSearchMatches, spUniquePerms, spManualSites, spBoundToExisting, spConnListPromise;
+let spConnId, spCertChoice, spLevel, spCrumbs, spItems, spScopes, spGroups, spPendingGroups, spPendingMinModified, spTreeFilterQuery, spLastSearchMatches, spUniquePerms, spManualSites, spBoundToExisting, spConnListPromise;
 function spSetCertChoice(c) {{}}
 function spGoStep(n) {{}}
 function _syncDropdownRebuild(sel) {{}}
@@ -3038,6 +3125,7 @@ class TestSharePointWizardShareBadgeRendering:
 const _host = {{ innerHTML: "", querySelectorAll: () => [] }};
 const document = {{ getElementById: (id) => (id === "spw-share-rows" ? _host : null) }};
 let spPendingGroups = {{}};
+let spPendingMinModified = {{}};
 let spGroups = [];
 // `spRenderShare` reads `spUniquePerms[source_scope_id]` for its advisory
 // summary line — an empty map here means "nothing flagged", which is
@@ -3920,11 +4008,18 @@ class TestSharePointSplitControl:
         body = resp.text
 
         # The card is drawn by the page's externalized script (#2146 moved
-        # the inline JS out), so the page must load that script and the
-        # script must carry the control; the panel's own styles stay inline.
+        # the inline JS out) and styled by its externalized stylesheet (the
+        # three inline <style> blocks moved into css/ds_page.css so the
+        # data-package builder can load them too). The page must load both,
+        # and each must carry its half of the control. Asserting the CSS
+        # SELECTOR against the response text is what this line used to do,
+        # which only ever proved the stylesheet mentioned the class — and
+        # silently stopped proving even that once the stylesheet moved out.
         assert "js/admin/data_sources_page.js" in body
-        assert ".ds-sp-split-table" in body
+        assert "css/ds_page.css" in body
         from pathlib import Path
+
+        assert ".ds-sp-split-table" in Path("app/web/static/css/ds_page.css").read_text(encoding="utf-8")
 
         script = Path("app/web/static/js/admin/data_sources_page.js").read_text(encoding="utf-8")
         # No standalone "Split this site…" button remains — it is reachable

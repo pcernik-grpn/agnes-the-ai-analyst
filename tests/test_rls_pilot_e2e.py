@@ -919,6 +919,9 @@ class TestPolicyContentSurfacesRequireFullSurface:
     ROUTES = [
         ("POST", "/api/admin/registry/orders/policy/preview", {"as_groups": [GROUP_CZ]}),
         ("POST", "/api/admin/registry/orders/policy/preview-groups", {}),
+        # issue #2147, design doc §13.1 -- the persona matrix built from the
+        # same single-persona primitive, same admin-gate reasoning.
+        ("POST", "/api/admin/registry/orders/policy/preview-matrix", {"personas": "group_sets"}),
         ("GET", "/api/admin/registry/orders/policy/columns", None),
         ("GET", "/api/admin/registry/orders/policy/revisions", None),
     ]

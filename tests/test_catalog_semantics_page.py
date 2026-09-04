@@ -18,6 +18,20 @@ in tests/test_web_semantic_layer_browse.py::TestFlatProjectionTabsFold.
 from __future__ import annotations
 
 
+def _direct_key() -> str:
+    """The route's own key for "declared by no document", so a test asserting
+    what that option counts cannot drift from the value it counts under.
+
+    Imported inside the call, not at module scope: importing `app.web.router`
+    at collection time pulls the route module in ahead of the app factory the
+    `seeded_app` fixture builds, and the half-initialised FastAPI/pydantic
+    models that leaves behind fail the fixture's own build with a
+    `TypeAdapter` error on an unrelated header parameter."""
+    from app.web.router import _DIRECT_KEY
+
+    return _DIRECT_KEY
+
+
 def _auth(token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}
 
@@ -1403,6 +1417,187 @@ class TestOneToolbarOverThreeBuckets:
         # which is exactly the conflation the split undoes.
         row = body.split('data-model="commercial"', 1)[1].split(">", 1)[0]
         assert 'data-domain=""' in row, row
+
+    def _facet_options(self, body: str) -> dict:
+        """Every rendered option as ``{facet: {value: count}}``, read off the
+        menu the page actually serves."""
+        import re
+
+        menu = body.split('id="sl-filter-menu"', 1)[1].split('id="sl-tabs"', 1)[0]
+        out: dict = {}
+        for m in re.finditer(
+            r'data-facet="([^"]+)" value="([^"]*)">'
+            r'<span class="fbar-menu__opt-text">([^<]*)</span>'
+            r'<span class="fbar-menu__opt-n">(\d+)',
+            menu,
+        ):
+            out.setdefault(m.group(1), {})[m.group(2)] = int(m.group(4))
+        return out
+
+    def _seed_two_documents(self) -> None:
+        """Two documents that declare metrics, plus one hand-authored metric —
+        the shape that makes the Model facet split three ways (two models and
+        "Defined directly") with model CARDS on the page beside the rows."""
+        from src.repositories import semantic_model_repo
+        from src.semantic.projection import projected_metric_id
+
+        for slug, metrics in (("retail", ("win_rate", "headcount")), ("finance_ops", ("utilization",))):
+            doc = {"name": slug, "datasets": [], "metrics": [{"name": n} for n in metrics]}
+            semantic_model_repo().upsert(
+                id=f"manual/_/{slug}", slug=slug, name=slug, description="",
+                document="# fixture", document_json={"semantic_model": [doc]},
+                spec_version="0.2.0.dev0", content_hash=f"h-{slug}", source="manual",
+                source_ref=None, status="valid", validation_errors=None, validated_at=None,
+            )
+            for n in metrics:
+                _make_metric(id=projected_metric_id("manual", None, doc, n), name=n,
+                             display_name=n, category=slug, sql="SELECT 1",
+                             description=f"Projected from {slug}.")
+        _make_metric(id="finance/dso", name="dso", display_name="dso", category="finance",
+                     sql="SELECT 1", description="Hand-authored.")
+
+    def test_a_model_card_declares_the_three_facet_axes(self, seeded_app):
+        """The engine reads a MISSING facet attribute as the empty string and
+        hides the row, so a card that declared none vanished the moment any
+        facet was selected — including the Model option naming that very card's
+        document. A model's value on the Model axis is itself."""
+        self._seed_two_documents()
+        body = self._body(seeded_app)
+        card = body.split('data-tab="models" data-name="retail"', 1)[1].split(">", 1)[0]
+        assert 'data-model="retail"' in card, (
+            f"a model card is its OWN model, never {_direct_key()!r}: {card}"
+        )
+        assert 'data-source="manual"' in card, f"a model has a real source: {card}"
+        assert 'data-domain=""' in card, f"a document has no business domain: {card}"
+
+    def test_every_option_counts_the_rows_it_will_leave_on_screen(self, seeded_app):
+        """`_flat_facet`'s whole contract: "an option's number is the number of
+        rows clicking it leaves on screen". It was false for every Model and
+        Source option while the model cards were tallied but unmatchable — the
+        route counted each card into "Defined directly" and into no source at
+        all, so the menu over-stated one slice by the number of models and
+        under-stated the rest."""
+        self._seed_two_documents()
+        body = self._body(seeded_app)
+        options = self._facet_options(body)
+        assert options.get("model"), "the Model facet has to render for this to mean anything"
+        for facet, attr in (("model", "data-model"), ("domain", "data-domain"), ("source", "data-source")):
+            for value, stated in options.get(facet, {}).items():
+                on_page = body.count(f'{attr}="{value}"')
+                assert stated == on_page, (
+                    f"{facet}={value!r} offers {stated} but {on_page} rows carry it"
+                )
+
+    def test_defined_directly_does_not_count_the_model_cards(self, seeded_app):
+        """The visible face of the same bug: two documents and ONE
+        hand-authored metric reported "Defined directly 3"."""
+        self._seed_two_documents()
+        options = self._facet_options(self._body(seeded_app))
+        assert options["model"][_direct_key()] == 1, (
+            "only the hand-authored metric is defined directly; the model cards are not"
+        )
+        assert options["model"]["retail"] == 3, "two projected metrics and the card itself"
+        assert options["model"]["finance_ops"] == 2, "one projected metric and the card itself"
+
+    def test_a_long_option_label_cannot_push_its_count_out_of_the_popover(self):
+        """A facet value is DATA — a model slug is routinely a long underscored
+        identifier with no break opportunity of its own, which ran out of the
+        popover's fixed width and carried the count off the visible box with
+        it. The count is the one thing an option has to state, so the label has
+        to yield to it. Asserted on the stylesheet because nothing else on this
+        page can see a number that is merely off-screen."""
+        from pathlib import Path
+
+        css = Path("app/web/static/css/filter_toolbar.css").read_text(encoding="utf-8")
+        label = css.split(".fbar-menu__opt-text {", 1)[1].split("}", 1)[0]
+        assert "min-width: 0" in label and "overflow-wrap: anywhere" in label, label
+        count = css.split(".fbar-menu__opt-n {", 1)[1].split("}", 1)[0]
+        assert "flex: none" in count, f"the count must not be squeezed to nothing: {count}"
+
+    def test_the_toolbar_looks_like_the_one_it_claims_to_be(self, seeded_app):
+        """This page ran the Library's filtering ENGINE and the Library's
+        left-to-right ORDER while rendering the flat default treatment, so the
+        two bars still read as different products: Filter was a 38px bordered
+        box on `--ds-surface` next to the Library's 32px borderless utility,
+        search was the row's only flex-grow child and therefore its loudest
+        element, and the Filter glyph was a one-off nobody else drew.
+
+        `.fbar--ranked` is the shared block /library and /chats opt into, and
+        its own note is that it lives in the shared sheet precisely so a third
+        page cannot drift. Asserted against the LIVE Library markup rather than
+        a copied literal — a hard-coded path would let the two diverge again the
+        next time the icon is redrawn."""
+        from pathlib import Path
+
+        import re
+
+        #: The Filter control renders only when a facet has two values, so the
+        #: bar has to have something to filter before this can look at it.
+        self._seed_two_documents()
+        body = self._body(seeded_app)
+
+        bar = re.search(r'<div class="([^"]*\bsl-fbar\b[^"]*)"', body)
+        assert bar, "the page's own toolbar element must be findable by its sl-fbar class"
+        assert "fbar--ranked" in bar.group(1).split(), (
+            f"the bar must opt into the ranked treatment its neighbours use: {bar.group(1)!r}"
+        )
+
+        #: The PATH, matched as such. Splitting on the first `d="` after the
+        #: button silently lands on `aria-expanded="false"` and compares
+        #: "false" with "false", which passes whatever either icon is drawn as.
+        def glyph(markup: str, btn_id: str) -> str:
+            after = markup.split(f'id="{btn_id}"', 1)[1]
+            found = re.search(r'<path d="([^"]+)"', after)
+            assert found, f"{btn_id} must draw a path: {after[:200]}"
+            return found.group(1)
+
+        library = Path("app/web/templates/library.html").read_text(encoding="utf-8")
+        canonical = glyph(library.split("{% else %}", 1)[-1], "lib-filter-btn")
+        ours = glyph(body, "sl-filter-btn")
+        assert ours == canonical, f"one Filter glyph for the app: {ours!r} != {canonical!r}"
+        assert ours.startswith("M4 5h16"), f"the funnel every other page draws: {ours!r}"
+
+    def test_sort_opens_a_styled_menu_not_the_operating_systems(self, seeded_app):
+        """A bare `<select>` renders the OS menu, so opening Sort dropped an
+        unstyled macOS/Windows popup into the middle of the page — the one part
+        of the control a reader actually interacts with was the one part the
+        design system never touched.
+
+        The fix is the shape /library and /chats use: a `.fbar-select` holding
+        the native select (kept as the accessible source of truth) paired to a
+        `.ds-dropdown` by `data-ds-dropdown-target`. Paper hides the native one
+        and shows the custom one; other themes do the reverse, which is the
+        component's documented default, not this page's business."""
+        body = self._body(seeded_app)
+        wrap = body.split('class="sl-sort"', 1)[1].split("</div>", 3)[0]
+        assert 'class="fbar-select"' in wrap, f"the ranked row's own select shape: {wrap}"
+        assert 'id="sl-sort"' in body and 'class="ds-dropdown-native"' in body, (
+            "the native select stays as the accessible source of truth"
+        )
+        assert 'data-ds-dropdown-target="sl-sort"' in body, (
+            "the custom dropdown must be PAIRED, or it renders beside the native one"
+        )
+
+    def test_the_sort_dropdowns_own_assets_are_on_the_page(self, seeded_app):
+        """Both are per-page, like /library's and /chats's, and missing either
+        one fails silently in a way only a human eye catches: without the
+        stylesheet the button's visually-hidden field name renders as visible
+        text ("Sort definitions A → Z") and the chevron draws unsized; without
+        the script the menu never opens at all."""
+        body = self._body(seeded_app)
+        assert "css/ds_dropdown.css" in body, "the component's stylesheet"
+        assert "js/components/ds_dropdown.js" in body, "the component's script"
+
+    def test_the_page_states_no_metrics_the_shared_row_already_owns(self):
+        """`.fbar--ranked .fbar-select .ds-dropdown-btn` sizes the control now,
+        so a page-local copy of 32px/12.5px/transparent would be exactly the
+        drift the shared block exists to prevent."""
+        from pathlib import Path
+
+        tpl = Path("app/web/templates/semantic_layer_list.html").read_text(encoding="utf-8")
+        assert ".sl-sort select {" not in tpl, (
+            "the page must not restyle the control the ranked row already sizes"
+        )
 
     def test_a_facet_with_one_value_does_not_render(self, seeded_app):
         """P7, and the rule that kills it for good. The glossary's provenance

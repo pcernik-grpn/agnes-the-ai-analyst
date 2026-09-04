@@ -64,6 +64,14 @@ services:
       - work_mem=${AGNES_PG_WORK_MEM:-16MB}
       - -c
       - maintenance_work_mem=${AGNES_PG_MAINTENANCE_WORK_MEM:-256MB}
+      # Derived from extraction_worker_replicas, not RAM (TCRD-296 gap #76):
+      # app + scheduler + every extraction-worker replica's own Postgres
+      # pool budget, plus headroom — see agnes_pg_max_connections in
+      # startup-script.sh.tpl. The :-100 fallback matches Postgres' OWN
+      # stock default, so a self-hosted install that never sets the env var
+      # (see docs/DEPLOYMENT.md "Sizing the Postgres side-car") is unaffected.
+      - -c
+      - max_connections=${AGNES_PG_MAX_CONNECTIONS:-100}
       # Fixed knobs — do not vary with VM size, so they are literals here
       # rather than another .env round-trip:
       #   max_wal_size: fewer forced checkpoints under write-heavy ingest,

@@ -165,6 +165,38 @@ class TestEffectiveSchemaResolver:
         assert by_name["email"]["hidden"] is False
         assert by_name["email"]["type"] == "VARCHAR"
 
+    def test_masked_column_is_marked(self, policied_invoices):
+        """``md5(email) AS email`` -- the canonical example a runtime
+        DESCRIBE diff cannot detect (same name, same VARCHAR type on both
+        sides) but a static read of the policy body's own SELECT list can."""
+        from src.access_policy import effective_schema
+
+        columns = effective_schema("invoices", policied_invoices["finance_user"])
+        by_name = {c["name"]: c for c in columns}
+
+        assert by_name["email"]["masked"] is True
+
+    def test_untouched_columns_are_not_marked_masked(self, policied_invoices):
+        from src.access_policy import effective_schema
+
+        columns = effective_schema("invoices", policied_invoices["finance_user"])
+        by_name = {c["name"]: c for c in columns}
+
+        assert by_name["cost_center"]["masked"] is False
+        assert by_name["amount"]["masked"] is False
+        assert by_name["id"]["masked"] is False
+
+    def test_hidden_column_is_not_also_marked_masked(self, policied_invoices):
+        """A star-excluded column is ``hidden``, not ``masked`` -- the two
+        markers are disjoint by construction."""
+        from src.access_policy import effective_schema
+
+        columns = effective_schema("invoices", policied_invoices["finance_user"])
+        by_name = {c["name"]: c for c in columns}
+
+        assert by_name["national_id"]["hidden"] is True
+        assert by_name["national_id"]["masked"] is False
+
     def test_does_not_crash_on_duplicate_output_column_name(self, policied_invoices):
         """The canonical policy body projects both the star's pass-through
         ``email`` AND ``md5(email) AS email`` without also excluding the
@@ -224,6 +256,19 @@ class TestSchemaEndpointWiring:
         assert "national_id" not in names
         assert by_name["cost_center"]["hidden"] is False
 
+    def test_masked_column_is_flagged_over_the_wire(self, policied_invoices):
+        """``GET /api/v2/schema`` emits ``masked`` the same way it already
+        emits ``hidden`` -- a ``md5(email) AS email`` column stays present
+        (not dropped, unlike ``hidden``) but is flagged so a caller can
+        tell it apart from an untouched pass-through column."""
+        c = policied_invoices["client"]
+        r = c.get("/api/v2/schema/invoices", headers=_auth(policied_invoices["finance_token"]))
+        assert r.status_code == 200, r.text
+        by_name = {col["name"]: col for col in r.json()["columns"]}
+
+        assert by_name["email"]["masked"] is True
+        assert by_name["cost_center"]["masked"] is False
+
     def test_admin_sees_the_raw_unfiltered_schema(self, policied_invoices):
         c = policied_invoices["client"]
         r = c.get("/api/v2/schema/invoices", headers=_auth(policied_invoices["admin_token"]))
@@ -234,7 +279,7 @@ class TestSchemaEndpointWiring:
     def test_non_policied_sibling_table_is_byte_identical(self, policied_invoices):
         """The inert case: a table with no access_policy_sql returns the
         exact same shape it did before this feature existed -- no `hidden`
-        key anywhere in the column list, for admin OR non-admin."""
+        or `masked` key anywhere in the column list, for admin OR non-admin."""
         c = policied_invoices["client"]
         for token in (policied_invoices["finance_token"], policied_invoices["admin_token"]):
             r = c.get("/api/v2/schema/products", headers=_auth(token))
@@ -243,6 +288,7 @@ class TestSchemaEndpointWiring:
             names = {col["name"] for col in columns}
             assert names == {"id", "sku"}
             assert all("hidden" not in col for col in columns)
+            assert all("masked" not in col for col in columns)
 
     def test_cache_does_not_leak_admins_raw_schema_to_a_non_admin(self, policied_invoices):
         """Regression guard for the cache fix: `_schema_cache` is keyed on

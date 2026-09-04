@@ -2,15 +2,27 @@
 relation into a caller's SQL on every read surface that has a SQL tree to
 walk (table access policies design doc §5.2, §16, §19).
 
-Pure unit tests against a FAKE ``resolve`` callable -- deliberately not the
-real ``policied_relation`` (Task 5's own contract test,
+Most of this file is pure unit tests against a FAKE ``resolve`` callable --
+deliberately not the real ``policied_relation`` (Task 5's own contract test,
 ``tests/test_access_policy_resolver.py``, already covers that end) -- so
 this module does not depend on live registry rows, per the plan's Task 6
 instruction.
+
+``TestRewriteAgainstTheRealResolver`` at the bottom is the one exception
+(issue #2147 backlog item 5): the fake resolver above folds case itself
+(see its own docstring), which is exactly how the #1979 case-folding leak
+survived a green suite here while ``rewrite_sql``'s REAL default resolve --
+``policied_relation``, whose registry lookup used to be exact-equality --
+did not fold at all. That class drives ``rewrite_sql`` with NO ``resolve=``
+override against a registry seeded through the repository factory (the
+same pattern ``tests/test_access_policy_resolver.py``'s ``policy_env``
+fixture uses), so a regression in the real wiring -- not merely in this
+file's own double -- fails here too.
 """
 
 from __future__ import annotations
 
+import functools
 import inspect
 
 import pytest
@@ -353,3 +365,106 @@ class TestSecurityRefusalIsNeverSwallowed:
         out, params, ids = rewrite_sql(sql, SOLO_USER, resolve=resolver_raising_for_unknown("invoices"))
         assert out == sql
         assert ids == []
+
+
+class TestRewriteAgainstTheRealResolver:
+    """Issue #2147 backlog item 5: every fixture above proves the DOUBLE --
+    a fake resolver that folds case itself. This class proves the SYSTEM:
+    ``rewrite_sql(sql, principal)`` called with no ``resolve=`` override (its
+    real production shape on every caller in ``app/api/query.py``) against a
+    registry row seeded through the repository factory, exactly as
+    ``tests/test_access_policy_resolver.py``'s ``policy_env`` fixture seeds
+    one.
+    """
+
+    @pytest.fixture
+    def real_env(self, e2e_env):
+        """One policied table (``invoices``, referencing only
+        ``$user_groups``) and a solo, non-admin analyst in its group --
+        seeded directly through the repositories, no HTTP client needed."""
+        from src.db import get_system_db
+        from src.repositories.table_registry import TableRegistryRepository
+        from src.repositories.user_group_members import UserGroupMembersRepository
+        from src.repositories.user_groups import UserGroupsRepository
+        from src.repositories.users import UserRepository
+
+        conn = get_system_db()
+        try:
+            UserRepository(conn).create(id="u_real", email="real@example.com", name="Real")
+            finance_gid = UserGroupsRepository(conn).create(name="Finance")["id"]
+            UserGroupMembersRepository(conn).add_member("u_real", finance_gid, source="admin")
+
+            registry = TableRegistryRepository(conn)
+            registry.register(
+                id="tbl_invoices",
+                name="invoices",
+                source_type="keboola",
+                query_mode="local",
+                server_only=True,
+            )
+            registry.set_access_policy(
+                "tbl_invoices",
+                sql=POLICY_SQL,
+                note="cost-centre filter",
+                updated_by="admin",
+            )
+        finally:
+            conn.close()
+
+        return {"id": "u_real", "email": "real@example.com"}
+
+    def test_uppercase_name_is_rewritten_by_the_real_resolver(self, real_env):
+        out, params, ids = rewrite_sql("SELECT * FROM INVOICES", real_env)
+        assert ids == ["tbl_invoices"]
+        assert "list_contains" in out
+        assert params["user_groups"] == ["Finance"]
+
+    def test_quoted_mixed_case_reference_to_a_lowercase_name(self, real_env):
+        # DuckDB folds a QUOTED identifier onto an existing view regardless
+        # of case (verified: see tests/test_access_policy_resolver.py's
+        # TestCaseInsensitiveNameResolution docstring) -- the registry
+        # lookup must fold the same way.
+        out, params, ids = rewrite_sql('SELECT * FROM "Invoices"', real_env)
+        assert ids == ["tbl_invoices"]
+        assert "list_contains" in out
+        assert params["user_groups"] == ["Finance"]
+
+    def test_main_qualified_name_is_rewritten_by_the_real_resolver(self, real_env):
+        out, params, ids = rewrite_sql("SELECT * FROM main.invoices", real_env)
+        assert ids == ["tbl_invoices"]
+        assert "list_contains" in out
+        assert params["user_groups"] == ["Finance"]
+
+    def test_a_resolution_refusal_through_the_real_resolver_is_never_swallowed(self, real_env):
+        """The #1979 shape, driven end to end: a policied, REGISTERED table
+        whose stored body cannot be carried to a remote dialect (here,
+        because it calls the DuckDB-only ``agnes_hmac`` pseudonym function,
+        refused by ``_reject_duckdb_only_functions`` before any transpile is
+        even attempted) must REFUSE the read -- never fall back to the raw,
+        unfiltered base view with a 200. Exercises the exact production
+        wiring ``app/api/query.py``'s BigQuery remote path uses:
+        ``resolve=functools.partial(policied_relation, dialect="bigquery")``.
+        """
+        from src.db import get_system_db
+        from src.repositories.table_registry import TableRegistryRepository
+
+        conn = get_system_db()
+        try:
+            TableRegistryRepository(conn).set_access_policy(
+                "tbl_invoices",
+                sql="SELECT id, agnes_hmac(email) AS email FROM invoices "
+                "WHERE list_contains($user_groups, cost_center)",
+                note="duckdb-only pseudonym, unsafe to transpile",
+                updated_by="admin",
+            )
+        finally:
+            conn.close()
+
+        with pytest.raises(PolicyError) as exc_info:
+            rewrite_sql(
+                "SELECT * FROM invoices",
+                real_env,
+                resolve=functools.partial(policied_relation, dialect="bigquery"),
+            )
+        assert exc_info.value.table_id == "tbl_invoices"
+        assert not isinstance(exc_info.value, PolicyUnknownTable)
