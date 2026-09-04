@@ -1349,7 +1349,7 @@ def _condition_label(condition: Dict[str, Any]) -> str:
     telling an OCR-authored `provider_limit` condition apart from a
     facts-authored one in that shared, kindless table is the ``ocr_``
     prefix scan OCR puts on its own ``reason``
-    (`connectors.sharepoint.scan_ocr._mark_run_disabled`)."""
+    (`src.ingest.scan_ocr._mark_run_disabled`)."""
     reason = str(condition.get("reason") or "")
     return "OCR extraction paused" if reason.startswith("ocr_") else "Facts extraction paused"
 

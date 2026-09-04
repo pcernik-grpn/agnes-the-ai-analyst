@@ -154,9 +154,11 @@ def test_ingest_unextractable_document_rejected(e2e_env, tmp_path):
     from src.repositories import corpus_files_repo
 
     corpus_id = _new_corpus("ing-rej")
-    # .docx has no lightweight fallback extractor (and docling not installed in CI)
+    # A truncated OOXML package: no reader on any image can open it. NULs on
+    # purpose — markitdown sniffs content, and ASCII bytes in a ".docx" would
+    # be read as the prose they are rather than rejected.
     doc = tmp_path / "report.docx"
-    doc.write_bytes(b"PK\x03\x04 not really a docx")
+    doc.write_bytes(b"PK\x03\x04\x00\x00 not really a docx")
     file_id = _add_file(corpus_id, "report.docx", "docx", str(doc))
 
     assert ingest_file(file_id) == "rejected"

@@ -387,7 +387,7 @@ function renderJobsStrip(jobs) {
    the ONLY thing distinguishing an OCR-authored condition from a
    facts-authored one in that shared, kindless table is the `ocr_` prefix
    scan OCR puts on its own `reason`
-   (`connectors.sharepoint.scan_ocr._mark_run_disabled`). */
+   (`src.ingest.scan_ocr._mark_run_disabled`). */
 function conditionLabel(c) {
   const reason = String((c && c.reason) || "");
   return reason.startsWith("ocr_") ? "OCR extraction paused" : "Facts extraction paused";

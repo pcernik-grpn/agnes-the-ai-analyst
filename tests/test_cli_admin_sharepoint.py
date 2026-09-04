@@ -1739,7 +1739,7 @@ class TestFmtErrorCellShowsAnOcrPause:
 class TestConditionLabelDistinguishesOcrFromFacts:
     """`_print_provider_limit_conditions` labels an OCR-authored condition
     differently from a facts-authored one, keyed on the `ocr_` prefix
-    `connectors.sharepoint.scan_ocr._mark_run_disabled` puts on its own
+    `src.ingest.scan_ocr._mark_run_disabled` puts on its own
     `reason` — the ONLY thing distinguishing the two in that shared table."""
 
     def test_a_facts_reason_is_labeled_facts(self):

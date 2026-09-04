@@ -9,7 +9,7 @@ own contract is "what does the crawl do with a Graph response", not "does
 Postgres accept the row".
 
 The two seams written in parallel with this module
-(``connectors.sharepoint.convert`` / ``src.anonymization``) are substituted
+(``src.ingest.convert`` / ``src.anonymization``) are substituted
 at their wrapper functions, which is exactly the substitution point those
 wrappers exist to provide.
 """
@@ -1291,7 +1291,7 @@ class TestDoomedItemSkip:
         return handler
 
     def test_a_deterministic_failure_is_skipped_without_download_after_two_attempts(self, crawl_env, monkeypatch):
-        from connectors.sharepoint.convert import ConversionError
+        from src.ingest.convert import ConversionError
 
         def _boom(path, mime, **_kw):
             raise ConversionError("f1.docx", "could not convert", engine="markitdown", error_class="markitdown_reject")
@@ -1330,7 +1330,7 @@ class TestDoomedItemSkip:
         assert _state(crawl_env)["failed_items"]["graph:item1"]["attempts"] == 2
 
     def test_force_reprocess_still_attempts_a_doomed_item(self, crawl_env, monkeypatch):
-        from connectors.sharepoint.convert import ConversionError
+        from src.ingest.convert import ConversionError
 
         def _boom(path, mime, **_kw):
             raise ConversionError("f1.docx", "could not convert", engine="markitdown", error_class="markitdown_reject")
@@ -1355,7 +1355,7 @@ class TestDoomedItemSkip:
         assert sum(1 for u in seen if u.endswith("/content")) > downloads_before
 
     def test_a_new_ctag_gets_fresh_attempts_even_after_it_was_doomed(self, crawl_env, monkeypatch):
-        from connectors.sharepoint.convert import ConversionError
+        from src.ingest.convert import ConversionError
 
         def _boom(path, mime, **_kw):
             raise ConversionError("f1.docx", "could not convert", engine="markitdown", error_class="markitdown_reject")
@@ -2085,7 +2085,7 @@ class TestFailedAndSkippedItemVisibility:
         example named in `UnsupportedConversionFormat`'s own docstring and,
         deliberately, not in that pre-download set, so this test still
         reaches `_prepare_document`/`convert_to_markdown`."""
-        from connectors.sharepoint.convert import UnsupportedConversionFormat
+        from src.ingest.convert import UnsupportedConversionFormat
 
         def _boom(path, mime, **_kw):
             raise UnsupportedConversionFormat("notes.one", "no conversion backend recognizes this file type")
@@ -8016,7 +8016,7 @@ def test_the_converted_size_cap_is_reachable_by_the_converter():
     has to stay reachable, and it has to stay above an ordinary single-byte
     document so the common case is never refused.
     """
-    from connectors.sharepoint.convert import DEFAULT_MAX_CHARS
+    from src.ingest.convert import DEFAULT_MAX_CHARS
     from connectors.sharepoint.crawler import _DEFAULT_MAX_CONVERTED_MB
 
     cap_bytes = _DEFAULT_MAX_CONVERTED_MB * 1024 * 1024

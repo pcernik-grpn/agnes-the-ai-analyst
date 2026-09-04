@@ -817,7 +817,7 @@ class TestRunProjection:
         assert out["scan_ocr"] is None
 
     def test_scan_ocr_carries_the_disabled_reason_once_the_crawl_reports_it(self):
-        """`connectors.sharepoint.scan_ocr.triage_run_usage` — the crawl's
+        """`src.ingest.scan_ocr.triage_run_usage` — the crawl's
         own `report["scan_ocr"]` block — rides straight through, same
         "layered onto report/progress" contract as `facts_progress`."""
         from app.api.admin_extraction import _run_out

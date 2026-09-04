@@ -1,4 +1,4 @@
-"""Tests for :mod:`connectors.sharepoint.scan_ocr` and its converter seam.
+"""Tests for :mod:`src.ingest.scan_ocr` and its converter seam.
 
 No test here reaches a model: every one drives a fake client whose
 ``messages.create`` records the request it was handed and replays a scripted
@@ -19,20 +19,20 @@ import time
 
 import pytest
 
-from connectors.sharepoint.convert import ConversionError, convert_to_markdown
+from src.ingest.convert import ConversionError, convert_to_markdown
 
 
 pypdfium2 = pytest.importorskip("pypdfium2", reason="extraction extra not installed")
 pytest.importorskip("PIL", reason="Pillow is required to encode rendered pages")
 
-from connectors.sharepoint import scan_ocr  # noqa: E402
-from connectors.sharepoint.scan_ocr import (  # noqa: E402
+from src.ingest import scan_ocr  # noqa: E402
+from src.ingest.scan_ocr import (  # noqa: E402
     MAX_PAGES_CEILING,
     ScanOcrSettings,
     ScanOcrUnavailable,
     ScanTranscriber,
 )
-from connectors.sharepoint.test_convert import _build_pdf  # noqa: E402
+from tests.test_ingest_convert import _build_pdf  # noqa: E402
 
 
 # ----------------------------------------------------------------- fixtures
@@ -486,7 +486,7 @@ def test_the_provider_is_logged_once_per_run_not_once_per_document(tmp_path, mon
     settings = _enable(monkeypatch, client)
     _fixed_provider(monkeypatch, provider="vertex", region="us-central1")
 
-    with caplog.at_level("INFO", logger="connectors.sharepoint.scan_ocr"):
+    with caplog.at_level("INFO", logger="src.ingest.scan_ocr"):
         ScanTranscriber(settings, client=client).transcribe(_scan_pdf(tmp_path, pages=1, name="one.pdf"))
         ScanTranscriber(settings, client=client).transcribe(_scan_pdf(tmp_path, pages=1, name="two.pdf"))
 

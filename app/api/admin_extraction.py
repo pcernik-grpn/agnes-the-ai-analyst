@@ -561,7 +561,7 @@ def _run_out(
         # `connectors.sharepoint.facts_extraction.run_facts_extraction`'s
         # `on_progress` docstring) — never invented ahead of that.
         "facts_progress": live.get("facts"),
-        # Scan OCR's own block (`connectors.sharepoint.scan_ocr.
+        # Scan OCR's own block (`src.ingest.scan_ocr.
         # triage_run_usage`, wired through the crawl's `report["scan_ocr"]`)
         # — triage decision counters, plus, once a permanent provider
         # refusal has fired this run, `disabled_reason`/`provider_error`

@@ -12,7 +12,7 @@ FROM python:3.13-slim AS base
 # keeps out the GUI/help-browser/Java deps) + fonts-liberation (metric-
 # compatible with the common Office fonts, so a headless conversion doesn't
 # fall back to box glyphs) back the legacy Office/OpenDocument pre-converter
-# in connectors/sharepoint/convert.py (.doc/.rtf/.odt/.ppt/.odp/.xls/.ods →
+# in src/ingest/convert.py (.doc/.rtf/.odt/.ppt/.odp/.xls/.ods →
 # docx/pptx/xlsx via `soffice --headless`, then the existing markitdown
 # route). Same apt layer as curl/git so the image gains one cache-friendly
 # layer, not two.

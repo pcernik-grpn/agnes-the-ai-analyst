@@ -10,20 +10,20 @@ from __future__ import annotations
 
 import pytest
 
-from connectors.sharepoint.convert import convert_to_markdown
+from src.ingest.convert import convert_to_markdown
 
 
 pypdfium2 = pytest.importorskip("pypdfium2", reason="extraction extra not installed")
 pytest.importorskip("PIL", reason="Pillow is required to encode rendered pages")
 
-from connectors.sharepoint import scan_ocr  # noqa: E402
-from connectors.sharepoint.scan_ocr import (  # noqa: E402
+from src.ingest import scan_ocr  # noqa: E402
+from src.ingest.scan_ocr import (  # noqa: E402
     ScanOcrSettings,
     ScanTranscriber,
     Stage0Decision,
     stage0_decision,
 )
-from connectors.sharepoint.test_scan_ocr import _enable, _FakeClient, _scan_pdf  # noqa: E402
+from tests.test_ingest_scan_ocr import _enable, _FakeClient, _scan_pdf  # noqa: E402
 
 
 # --------------------------------------------------------------- stage 0
@@ -439,7 +439,7 @@ class TestConvertPySourcePathThreading:
         client = _FakeClient("this must never be requested")
         _enable(monkeypatch, client, triage_enabled=True, preview_pages=0, skip_path_patterns=("Archive",))
         path = tmp_path / "scan.pdf"
-        from connectors.sharepoint.test_convert import _build_pdf
+        from tests.test_ingest_convert import _build_pdf
 
         path.write_bytes(_build_pdf([[]]))
 
@@ -452,7 +452,7 @@ class TestConvertPySourcePathThreading:
         client = _FakeClient("page text")
         _enable(monkeypatch, client, triage_enabled=True, preview_pages=1, skip_path_patterns=("Archive",))
         path = tmp_path / "scan.pdf"
-        from connectors.sharepoint.test_convert import _build_pdf
+        from tests.test_ingest_convert import _build_pdf
 
         path.write_bytes(_build_pdf([[]]))
 

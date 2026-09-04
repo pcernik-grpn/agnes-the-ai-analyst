@@ -39,7 +39,7 @@ Vertex AI) builds the client via :func:`resolve_llm_provider` — the SAME
 ladder ``connectors.sharepoint.facts_extraction.resolve_effective_provider``
 uses for its own default: an explicit per-stage setting
 (``extraction.anonymization.provider`` for this module, ``extraction.
-scan_ocr.provider`` for :mod:`connectors.sharepoint.scan_ocr`) wins outright;
+scan_ocr.provider`` for :mod:`src.ingest.scan_ocr`) wins outright;
 otherwise ``extraction.facts.provider`` (when it itself names a concrete
 provider rather than its own default ``inherit``); otherwise this instance's
 own ``ai.provider`` (``connectors.llm.factory.vertex_config_or_none``); and
@@ -757,7 +757,7 @@ def build_client(model: str, timeout_s: float, *, own_setting_path: tuple[str, .
     because "no credential" must fail the document, not empty it.
 
     **This is the shared ladder, and it stays model-transparent.** Scan OCR
-    (`connectors/sharepoint/scan_ocr.py`) and fact extraction
+    (`src/ingest/scan_ocr.py`) and fact extraction
     (`connectors/sharepoint/facts_extraction.py`) both delegate here and both
     rely on getting a client for the model THEY asked for — a vision model and
     `extraction.facts.model` respectively. The anonymization detector's

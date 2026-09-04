@@ -1,4 +1,4 @@
-"""Tests for :mod:`connectors.sharepoint.convert`.
+"""Tests for :mod:`src.ingest.convert`.
 
 Every fixture is authored in-test rather than committed as a binary blob: a
 checked-in PDF/DOCX is unreviewable in a diff, and the exact bytes matter here
@@ -12,13 +12,15 @@ rather than skipped.
 
 from __future__ import annotations
 
+import io
 import sys
+import types
 import zipfile
 from pathlib import Path
 
 import pytest
 
-from connectors.sharepoint.convert import (
+from src.ingest.convert import (
     DEFAULT_MAX_CHARS,
     PAGE_BREAK,
     ConversionError,
@@ -370,7 +372,7 @@ def test_html_routes_to_markitdown(tmp_path):
 
 
 #: Legacy suffix → the OOXML target format LibreOffice must produce, per the
-#: mapping in :mod:`connectors.sharepoint.convert`.
+#: mapping in :mod:`src.ingest.convert`.
 _LEGACY_OFFICE_CASES = [
     (".doc", "docx"),
     (".rtf", "docx"),
@@ -382,6 +384,26 @@ _LEGACY_OFFICE_CASES = [
     (".xlsb", "xlsx"),
     (".xlsm", "xlsx"),
 ]
+
+
+def _ooxml_shaped_bytes(note: bytes = b"a package no reader accepts") -> bytes:
+    """A real zip package whose CONTENT no reader accepts.
+
+    The OOXML archive guard refuses a ``.docx``/``.pptx``/``.xlsx`` that is
+    not a zip AT ALL before any route runs — nothing a LibreOffice resave or a
+    CSV/PDF rescue rung does can turn non-zip bytes into an OOXML package, so
+    the guard answers for free what three subprocesses would answer slowly. A
+    test that wants to exercise what happens AFTER a reader rejects the file
+    therefore has to hand it a structurally valid zip. That is also the shape
+    of the live finding this chain exists for: a genuine ``.xlsx`` openpyxl
+    refuses, not a file that was never a workbook. Same convention as the
+    dependency-probe fixture below.
+    """
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as package:
+        package.writestr("[Content_Types].xml", "<Types/>")
+        package.writestr("agnes-test-note.txt", note)
+    return buffer.getvalue()
 
 
 def _stub_soffice(
@@ -451,7 +473,7 @@ def _xlsx_bytes(sheets: dict[str, list[list[object]]]) -> bytes:
 
 @pytest.mark.parametrize("suffix, target_format", _LEGACY_OFFICE_CASES)
 def test_legacy_office_suffix_is_preconverted_then_handed_to_markitdown(tmp_path, monkeypatch, suffix, target_format):
-    import connectors.sharepoint.convert as convert_module
+    import src.ingest.convert as convert_module
 
     path = tmp_path / f"legacy{suffix}"
     path.write_bytes(b"legacy office bytes")
@@ -459,7 +481,7 @@ def test_legacy_office_suffix_is_preconverted_then_handed_to_markitdown(tmp_path
 
     markitdown_calls = []
 
-    def _fake_markitdown(converted_path, filename):
+    def _fake_markitdown(converted_path, filename, *, file_extension=None):
         markitdown_calls.append((converted_path, filename))
         return "converted text from libreoffice output"
 
@@ -490,7 +512,7 @@ def test_legacy_office_suffix_is_preconverted_then_handed_to_markitdown(tmp_path
 
 
 def test_legacy_office_temp_dir_is_removed_even_on_failure(tmp_path, monkeypatch):
-    import connectors.sharepoint.convert as convert_module
+    import src.ingest.convert as convert_module
 
     path = tmp_path / "legacy.doc"
     path.write_bytes(b"legacy office bytes")
@@ -504,7 +526,7 @@ def test_legacy_office_temp_dir_is_removed_even_on_failure(tmp_path, monkeypatch
 
 
 def test_missing_soffice_raises_missing_conversion_dependency(tmp_path, monkeypatch):
-    import connectors.sharepoint.convert as convert_module
+    import src.ingest.convert as convert_module
 
     path = tmp_path / "legacy.doc"
     path.write_bytes(b"legacy office bytes")
@@ -520,7 +542,7 @@ def test_missing_soffice_raises_missing_conversion_dependency(tmp_path, monkeypa
 
 
 def test_libreoffice_non_zero_exit_raises_conversion_error(tmp_path, monkeypatch):
-    import connectors.sharepoint.convert as convert_module
+    import src.ingest.convert as convert_module
 
     path = tmp_path / "legacy.doc"
     path.write_bytes(b"legacy office bytes")
@@ -535,7 +557,7 @@ def test_libreoffice_non_zero_exit_raises_conversion_error(tmp_path, monkeypatch
 
 
 def test_libreoffice_timeout_raises_conversion_error(tmp_path, monkeypatch):
-    import connectors.sharepoint.convert as convert_module
+    import src.ingest.convert as convert_module
     import subprocess
 
     path = tmp_path / "legacy.ppt"
@@ -555,7 +577,7 @@ def test_libreoffice_timeout_raises_conversion_error(tmp_path, monkeypatch):
 
 
 def test_libreoffice_success_with_no_output_file_raises_conversion_error(tmp_path, monkeypatch):
-    import connectors.sharepoint.convert as convert_module
+    import src.ingest.convert as convert_module
 
     path = tmp_path / "legacy.xls"
     path.write_bytes(b"legacy office bytes")
@@ -569,7 +591,7 @@ def test_libreoffice_success_with_no_output_file_raises_conversion_error(tmp_pat
 
 
 def test_legacy_office_suffixes_are_exported_and_exact(monkeypatch):
-    import connectors.sharepoint.convert as convert_module
+    import src.ingest.convert as convert_module
 
     assert convert_module.LEGACY_OFFICE_SUFFIXES == frozenset(
         {".doc", ".rtf", ".odt", ".ppt", ".odp", ".xls", ".ods", ".xlsb", ".xlsm"}
@@ -586,7 +608,7 @@ def test_missing_soffice_for_xlsb_raises_missing_conversion_dependency_not_a_cra
     """.xlsb (openpyxl cannot read the binary container at all) must fail the
     SAME attributable, retriable way the pre-2007 legacy formats already do
     — never an uncaught crash — when LibreOffice is unavailable."""
-    import connectors.sharepoint.convert as convert_module
+    import src.ingest.convert as convert_module
 
     path = tmp_path / "workbook.xlsb"
     path.write_bytes(b"xlsb binary bytes")
@@ -604,7 +626,7 @@ def test_missing_soffice_for_xlsb_raises_missing_conversion_dependency_not_a_cra
 def test_xlsb_libreoffice_failure_is_a_conversion_error_not_a_crash(tmp_path, monkeypatch):
     """A non-zero LibreOffice exit on `.xlsb` is an ordinary, attributable
     `ConversionError` (the crawler's `convert_failed`) — never a crash."""
-    import connectors.sharepoint.convert as convert_module
+    import src.ingest.convert as convert_module
 
     path = tmp_path / "workbook.xlsb"
     path.write_bytes(b"xlsb binary bytes")
@@ -639,15 +661,15 @@ def test_xlsx_rescue_chain_resaves_and_retries_once_on_markitdown_failure(tmp_pa
     """Rung 1: a genuine markitdown failure on a plain ``.xlsx`` (openpyxl
     rejects it — the live finding this whole rescue chain exists for) is
     rescued by a LibreOffice resave-into-xlsx and ONE retry."""
-    import connectors.sharepoint.convert as convert_module
+    import src.ingest.convert as convert_module
 
     path = tmp_path / "report.xlsx"
-    path.write_bytes(b"xlsx bytes markitdown rejects on the first try")
+    path.write_bytes(_ooxml_shaped_bytes(b"xlsx bytes markitdown rejects on the first try"))
     calls = _stub_soffice(monkeypatch, convert_module)
 
     attempts: list[Path] = []
 
-    def _fake_markitdown(p, filename):
+    def _fake_markitdown(p, filename, *, file_extension=None):
         attempts.append(Path(p))
         if len(attempts) == 1:
             raise ConversionError(filename, "FileConversionException", engine="markitdown")
@@ -676,14 +698,14 @@ def test_xlsx_rescue_chain_falls_back_to_csv_when_resave_retry_also_fails(tmp_pa
     back to a LibreOffice-produced ``.xlsx`` read per-sheet as CSV, headed
     by the sheet name — never ``soffice --convert-to csv`` directly (that
     would only export the active sheet)."""
-    import connectors.sharepoint.convert as convert_module
+    import src.ingest.convert as convert_module
 
     path = tmp_path / "report.xlsx"
-    path.write_bytes(b"xlsx bytes markitdown always rejects")
+    path.write_bytes(_ooxml_shaped_bytes(b"xlsx bytes markitdown always rejects"))
     fallback_bytes = _xlsx_bytes({"Summary": [["Region", "Revenue"], ["EMEA", 100]], "Detail": [["Line"], ["one"]]})
     calls = _stub_soffice(monkeypatch, convert_module, output_bytes=fallback_bytes)
 
-    def _always_fails(p, filename):
+    def _always_fails(p, filename, *, file_extension=None):
         raise ConversionError(filename, "FileConversionException", engine="markitdown")
 
     monkeypatch.setattr(convert_module, "_convert_markitdown", _always_fails)
@@ -707,14 +729,14 @@ def test_pptx_rescue_chain_falls_back_to_pdf_when_resave_retry_also_fails(tmp_pa
     """Decks/documents fall back to a LibreOffice-produced PDF, run through
     this module's own PDF route (`pdf_structure`/pypdfium2) rather than a
     second text extractor."""
-    import connectors.sharepoint.convert as convert_module
+    import src.ingest.convert as convert_module
 
     path = tmp_path / "deck.pptx"
-    path.write_bytes(b"pptx bytes markitdown always rejects")
+    path.write_bytes(_ooxml_shaped_bytes(b"pptx bytes markitdown always rejects"))
     pdf_bytes = _build_pdf([[("Quarterly results", 72, 700)]])
     calls = _stub_soffice(monkeypatch, convert_module, output_bytes=pdf_bytes)
 
-    def _always_fails(p, filename):
+    def _always_fails(p, filename, *, file_extension=None):
         raise ConversionError(filename, "FileConversionException", engine="markitdown")
 
     monkeypatch.setattr(convert_module, "_convert_markitdown", _always_fails)
@@ -735,14 +757,14 @@ def test_xlsm_already_resaved_skips_rung_one_and_reuses_the_same_file_for_csv_fa
     attempt fails too, the rescue chain must not pay for a second, redundant
     resave-and-retry: it escalates straight to the csv fallback rung, which
     reuses the SAME already-resaved file rather than resaving again."""
-    import connectors.sharepoint.convert as convert_module
+    import src.ingest.convert as convert_module
 
     path = tmp_path / "workbook.xlsm"
     path.write_bytes(b"xlsm bytes markitdown rejects even after the legacy resave")
     resaved_bytes = _xlsx_bytes({"Data": [["A", "B"], [1, 2]]})
     calls = _stub_soffice(monkeypatch, convert_module, output_bytes=resaved_bytes)
 
-    def _always_fails(p, filename):
+    def _always_fails(p, filename, *, file_extension=None):
         raise ConversionError(filename, "FileConversionException", engine="markitdown")
 
     monkeypatch.setattr(convert_module, "_convert_markitdown", _always_fails)
@@ -763,10 +785,10 @@ def test_rescue_chain_reports_every_rungs_last_error_when_both_are_reached(tmp_p
     resaved copy, rung 2 is reached and the raised `ConversionError` names
     EACH rung's own last error — not just markitdown's — so the next
     reconciliation pass can tell WHICH step to fix."""
-    import connectors.sharepoint.convert as convert_module
+    import src.ingest.convert as convert_module
 
     path = tmp_path / "report.xlsx"
-    path.write_bytes(b"xlsx bytes")
+    path.write_bytes(_ooxml_shaped_bytes(b"xlsx bytes"))
     # Every soffice invocation SUCCEEDS (exit 0, produces a file) — a
     # resave-itself failure is a DIFFERENT scenario (see the "unopenable"
     # test below) that stops the chain before rung 2 is even reached. Here
@@ -775,7 +797,7 @@ def test_rescue_chain_reports_every_rungs_last_error_when_both_are_reached(tmp_p
     # which is what lets BOTH rungs actually run.
     _stub_soffice(monkeypatch, convert_module, output_bytes=b"not a real xlsx")
 
-    def _always_fails(p, filename):
+    def _always_fails(p, filename, *, file_extension=None):
         raise ConversionError(filename, "FileConversionException: bad zip", engine="markitdown")
 
     monkeypatch.setattr(convert_module, "_convert_markitdown", _always_fails)
@@ -797,13 +819,13 @@ def test_rescue_chain_stops_after_rung_one_when_the_resave_itself_is_unopenable(
     corrupt/unopenable (a non-zero, non-signal exit), rung 2's CSV/PDF
     fallback — which would reach the IDENTICAL LibreOffice mechanism on the
     IDENTICAL bytes — is skipped rather than retried."""
-    import connectors.sharepoint.convert as convert_module
+    import src.ingest.convert as convert_module
 
     path = tmp_path / "report.xlsx"
-    path.write_bytes(b"xlsx bytes")
+    path.write_bytes(_ooxml_shaped_bytes(b"xlsx bytes"))
     calls = _stub_soffice(monkeypatch, convert_module, returncode=1, produce_output=False)
 
-    def _always_fails(p, filename):
+    def _always_fails(p, filename, *, file_extension=None):
         raise ConversionError(filename, "FileConversionException: bad zip", engine="markitdown")
 
     monkeypatch.setattr(convert_module, "_convert_markitdown", _always_fails)
@@ -828,10 +850,10 @@ def test_rescue_chain_stops_after_rung_one_on_a_libreoffice_timeout(tmp_path, mo
     time out again (2026-09-04 finding #66 item 3)."""
     import subprocess
 
-    import connectors.sharepoint.convert as convert_module
+    import src.ingest.convert as convert_module
 
     path = tmp_path / "report.xlsx"
-    path.write_bytes(b"xlsx bytes")
+    path.write_bytes(_ooxml_shaped_bytes(b"xlsx bytes"))
     _stub_soffice(monkeypatch, convert_module, side_effect=subprocess.TimeoutExpired(cmd="soffice", timeout=120))
     run_count = 0
     real_run = convert_module.subprocess.run
@@ -843,7 +865,7 @@ def test_rescue_chain_stops_after_rung_one_on_a_libreoffice_timeout(tmp_path, mo
 
     monkeypatch.setattr(convert_module.subprocess, "run", _counting_run)
 
-    def _always_fails(p, filename):
+    def _always_fails(p, filename, *, file_extension=None):
         raise ConversionError(filename, "FileConversionException", engine="markitdown")
 
     monkeypatch.setattr(convert_module, "_convert_markitdown", _always_fails)
@@ -865,13 +887,13 @@ def test_rescue_chain_stops_after_rung_one_on_a_signal_killed_resave(tmp_path, m
     other signal) is environmental, not a property of the file — but it
     STILL stops the chain: retrying the identical subprocess mechanism on
     the identical bytes right away is not a rescue."""
-    import connectors.sharepoint.convert as convert_module
+    import src.ingest.convert as convert_module
 
     path = tmp_path / "report.xlsx"
-    path.write_bytes(b"xlsx bytes")
+    path.write_bytes(_ooxml_shaped_bytes(b"xlsx bytes"))
     calls = _stub_soffice(monkeypatch, convert_module, returncode=returncode, produce_output=False)
 
-    def _always_fails(p, filename):
+    def _always_fails(p, filename, *, file_extension=None):
         raise ConversionError(filename, "FileConversionException", engine="markitdown")
 
     monkeypatch.setattr(convert_module, "_convert_markitdown", _always_fails)
@@ -887,12 +909,12 @@ def test_rescue_chain_never_fires_for_a_non_rescuable_suffix(tmp_path, monkeypat
     """A format outside the rescue chain's suffix maps (``.html``, here)
     must never even PROBE for LibreOffice on a markitdown failure — the
     ordinary, immediate `ConversionError` is unchanged."""
-    import connectors.sharepoint.convert as convert_module
+    import src.ingest.convert as convert_module
 
     path = tmp_path / "page.html"
     path.write_text("<html></html>", encoding="utf-8")
 
-    def _boom(p, filename):
+    def _boom(p, filename, *, file_extension=None):
         raise ConversionError(filename, "markitdown could not convert this file", engine="markitdown")
 
     monkeypatch.setattr(convert_module, "_convert_markitdown", _boom)
@@ -909,7 +931,7 @@ def test_rescue_chain_never_fires_for_a_non_rescuable_suffix(tmp_path, monkeypat
 
 
 def test_conversion_budget_seconds_scales_with_input_size():
-    from connectors.sharepoint.convert import CONVERSION_BUDGET_BASE_SECONDS, conversion_budget_seconds
+    from src.ingest.convert import CONVERSION_BUDGET_BASE_SECONDS, conversion_budget_seconds
 
     assert conversion_budget_seconds(0) == CONVERSION_BUDGET_BASE_SECONDS
     fifteen_mb = 15 * 1024 * 1024
@@ -919,20 +941,20 @@ def test_conversion_budget_seconds_scales_with_input_size():
 
 
 def test_conversion_budget_seconds_caps_at_the_ceiling():
-    from connectors.sharepoint.convert import CONVERSION_BUDGET_MAX_SECONDS, conversion_budget_seconds
+    from src.ingest.convert import CONVERSION_BUDGET_MAX_SECONDS, conversion_budget_seconds
 
     huge = 500 * 1024 * 1024
     assert conversion_budget_seconds(huge) == CONVERSION_BUDGET_MAX_SECONDS
 
 
 def test_conversion_budget_seconds_zero_base_disables_it():
-    from connectors.sharepoint.convert import conversion_budget_seconds
+    from src.ingest.convert import conversion_budget_seconds
 
     assert conversion_budget_seconds(15 * 1024 * 1024, base_seconds=0) == 0.0
 
 
 def test_conversion_budget_seconds_respects_a_custom_base():
-    from connectors.sharepoint.convert import conversion_budget_seconds
+    from src.ingest.convert import conversion_budget_seconds
 
     assert conversion_budget_seconds(1024 * 1024, base_seconds=120) == pytest.approx(140.0)
 
@@ -941,14 +963,16 @@ def test_conversion_budget_seconds_respects_a_custom_base():
 
 
 def test_large_xlsx_routes_to_openpyxl_streaming_not_markitdown(tmp_path, monkeypatch):
-    import connectors.sharepoint.convert as convert_module
+    import src.ingest.convert as convert_module
 
     path = tmp_path / "huge.xlsx"
     path.write_bytes(_xlsx_bytes({"Sheet1": [["a", "b"], [1, 2]]}))
     # force the size-threshold branch regardless of this tiny fixture's real size
     monkeypatch.setattr(convert_module, "LARGE_XLSX_STREAMING_THRESHOLD_BYTES", 0)
     markitdown_called: list[int] = []
-    monkeypatch.setattr(convert_module, "_convert_markitdown", lambda p, f: markitdown_called.append(1) or "nope")
+    monkeypatch.setattr(
+        convert_module, "_convert_markitdown", lambda p, f, **_kw: markitdown_called.append(1) or "nope"
+    )
 
     result = convert_to_markdown(path, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
@@ -969,7 +993,7 @@ def test_large_xlsx_streaming_stops_early_on_a_50k_row_workbook(tmp_path, monkey
 
     import openpyxl
 
-    import connectors.sharepoint.convert as convert_module
+    import src.ingest.convert as convert_module
 
     path = tmp_path / "wide.xlsx"
     workbook = openpyxl.Workbook()
@@ -1002,10 +1026,10 @@ def test_large_xlsx_streaming_falls_back_to_libreoffice_resave_on_openpyxl_failu
     up — the same CSV-fallback mechanism the rescue chain's rung 2 uses,
     reached directly here since markitdown is never attempted on this
     route."""
-    import connectors.sharepoint.convert as convert_module
+    import src.ingest.convert as convert_module
 
     path = tmp_path / "huge.xlsx"
-    path.write_bytes(b"not a real xlsx, openpyxl will refuse it")
+    path.write_bytes(_ooxml_shaped_bytes(b"not a real xlsx, openpyxl will refuse it"))
     monkeypatch.setattr(convert_module, "LARGE_XLSX_STREAMING_THRESHOLD_BYTES", 0)
     resaved_bytes = _xlsx_bytes({"Recovered": [["ok"], [1]]})
     calls = _stub_soffice(monkeypatch, convert_module, output_bytes=resaved_bytes)
@@ -1034,27 +1058,37 @@ def test_corrupt_pdf_raises_conversion_error_naming_the_file(tmp_path):
     assert excinfo.value.engine == "pypdfium2"
 
 
-def test_corrupt_office_file_raises_conversion_error_naming_the_file(tmp_path, monkeypatch):
-    # A truncated OOXML package: the zip header is there, the archive is not.
+def test_corrupt_archive_format_raises_conversion_error_naming_the_file(tmp_path):
+    # A truncated EPUB package: the zip header is there, the archive is not.
     # markitdown surfaces this as its own FileConversionException wrapping a
     # zipfile.BadZipFile — one of many backend exception types this module
-    # deliberately funnels into ConversionError. `.xlsx` is rescue-eligible
-    # (see the rescue-chain tests below), so this exercises every rung —
-    # soffice absent here keeps the rescue chain's own subprocess calls out
-    # of this otherwise-hermetic test (a REAL `soffice`, if installed on the
-    # machine running this test, would still fail on this truncated archive,
-    # just slower and non-deterministically so).
-    import connectors.sharepoint.convert as convert_module
-
-    monkeypatch.setattr(convert_module.shutil, "which", lambda cmd: None)
-    path = tmp_path / "broken.xlsx"
+    # deliberately funnels into ConversionError. EPUB rather than an office
+    # suffix on purpose: the OOXML archive guard would refuse a .docx/.xlsx
+    # before markitdown ever saw it, and this test is about the funnel.
+    path = tmp_path / "broken.epub"
     path.write_bytes(b"PK\x03\x04\x00\x00truncated archive")
 
     with pytest.raises(ConversionError) as excinfo:
-        convert_to_markdown(path, "application/vnd.openxmlformats-officedocument")
+        convert_to_markdown(path, "application/epub+zip")
 
-    assert excinfo.value.filename == "broken.xlsx"
+    assert excinfo.value.filename == "broken.epub"
     assert excinfo.value.engine == "markitdown"
+
+
+def test_office_file_that_is_not_an_archive_is_a_conversion_error(tmp_path):
+    """A ``.docx``/``.pptx``/``.xlsx`` is an OOXML package — a zip — or it is
+    not that file type at all. markitdown sniffs content and would read ASCII
+    bytes behind an office suffix as prose (in practice as UTF-16 mojibake),
+    silently indexing garbage; the converter refuses before it gets there."""
+    path = tmp_path / "notes.docx"
+    path.write_bytes(b"PK\x03\x04 this is not a zip archive at all")
+
+    with pytest.raises(ConversionError) as excinfo:
+        convert_to_markdown(path, "application/octet-stream")
+
+    assert not isinstance(excinfo.value, MissingConversionDependency)
+    assert excinfo.value.filename == "notes.docx"
+    assert "archive" in str(excinfo.value)
 
 
 def test_missing_file_raises_conversion_error(tmp_path):
@@ -1123,7 +1157,14 @@ def test_missing_backend_raises_a_typed_error_naming_the_extra(tmp_path, monkeyp
     # which is exactly what an uninstalled extra looks like.
     monkeypatch.setitem(sys.modules, module, None)
     path = tmp_path / name
-    path.write_bytes(b"irrelevant, the import fails first")
+    if name.endswith(".docx"):
+        # The OOXML archive guard runs before any engine is imported, so the
+        # office fixture has to be a zip for the dependency probe to be the
+        # thing that fails.
+        with zipfile.ZipFile(path, "w") as package:
+            package.writestr("[Content_Types].xml", "<Types/>")
+    else:
+        path.write_bytes(b"irrelevant, the import fails first")
 
     with pytest.raises(MissingConversionDependency) as excinfo:
         convert_to_markdown(path, mime)
@@ -1169,7 +1210,9 @@ def test_missing_backend_import_failure_carries_the_causes_type_and_text(tmp_pat
     )
     monkeypatch.setattr(sys, "meta_path", [finder, *sys.meta_path])
     path = tmp_path / name
-    path.write_bytes(b"irrelevant, the import fails first")
+    # A zip for the .docx case, for the same reason as the parametrized test
+    # above: the archive guard runs before any engine is imported.
+    path.write_bytes(_ooxml_shaped_bytes() if name.endswith(".docx") else b"irrelevant, the import fails first")
 
     with pytest.raises(MissingConversionDependency) as excinfo:
         convert_to_markdown(path, mime)
@@ -1190,7 +1233,7 @@ def test_missing_backend_import_failure_message_truncates_a_long_cause(tmp_path,
     finder = _RaisingMetaPathFinder("markitdown", RuntimeError(long_text))
     monkeypatch.setattr(sys, "meta_path", [finder, *sys.meta_path])
     path = tmp_path / "handbook.docx"
-    path.write_bytes(b"irrelevant, the import fails first")
+    path.write_bytes(_ooxml_shaped_bytes())
 
     with pytest.raises(MissingConversionDependency) as excinfo:
         convert_to_markdown(path, "application/octet-stream")
@@ -1202,15 +1245,150 @@ def test_missing_backend_import_failure_message_truncates_a_long_cause(tmp_path,
 
 def test_module_imports_without_the_extraction_extra(monkeypatch):
     """Import-time cost is zero: the backends are only imported on demand."""
-    monkeypatch.setitem(sys.modules, "markitdown", None)
-    monkeypatch.setitem(sys.modules, "pypdfium2", None)
-    monkeypatch.delitem(sys.modules, "connectors.sharepoint.convert", raising=False)
-
     import importlib
 
-    module = importlib.import_module("connectors.sharepoint.convert")
+    import src.ingest as ingest_package
+
+    monkeypatch.setitem(sys.modules, "markitdown", None)
+    monkeypatch.setitem(sys.modules, "pypdfium2", None)
+    # The re-import below rebinds the PACKAGE attribute to a second module
+    # object; ``sys.modules`` is restored by ``delitem`` but the attribute is
+    # not, and a later ``from src.ingest import convert`` would then patch a
+    # module nothing else in the process calls. Pin it so teardown restores it.
+    monkeypatch.setattr(ingest_package, "convert", ingest_package.convert, raising=False)
+    monkeypatch.delitem(sys.modules, "src.ingest.convert", raising=False)
+
+    module = importlib.import_module("src.ingest.convert")
 
     assert module.convert_to_markdown is not None
+
+
+# ------------------------------------------------------------ docling engine
+
+
+@pytest.fixture
+def fake_docling(monkeypatch):
+    """A stand-in for the ``[docling]`` extra.
+
+    The real one pulls torch and cannot be installed in the default test
+    environment; the ``rich-extras`` CI job covers it for real. What is under
+    test here is the ROUTING — which engine answers, and what happens when
+    Docling is present but fails — so the stand-in only has to look like
+    ``docling.document_converter.DocumentConverter`` from the call site's
+    side: ``.convert(path).document.export_to_markdown()``.
+
+    ``docling_capability`` is patched alongside: it is an import-spec probe,
+    and a synthetic module in ``sys.modules`` has no spec to find.
+    """
+    from src.ingest import convert
+
+    calls: list[Path] = []
+    state = {"raise": False, "markdown": "# From docling\n\nconverted by the stand-in"}
+
+    class _Document:
+        def export_to_markdown(self) -> str:
+            return state["markdown"]
+
+    class _Result:
+        document = _Document()
+
+    class DocumentConverter:
+        def convert(self, path):
+            calls.append(Path(path))
+            if state["raise"]:
+                raise RuntimeError("docling choked on purpose")
+            return _Result()
+
+    package = types.ModuleType("docling")
+    module = types.ModuleType("docling.document_converter")
+    module.DocumentConverter = DocumentConverter  # type: ignore[attr-defined]
+    package.document_converter = module  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "docling", package)
+    monkeypatch.setitem(sys.modules, "docling.document_converter", module)
+    monkeypatch.setattr(convert, "docling_capability", lambda: True)
+    return types.SimpleNamespace(calls=calls, state=state)
+
+
+def test_office_document_prefers_docling_when_installed(tmp_path, fake_docling):
+    """The rich image's whole point: layout-aware parsing takes precedence
+    over markitdown for office documents when the extra is there."""
+    path = _write_docx(tmp_path / "handbook.docx")
+
+    result = convert_to_markdown(path, "application/octet-stream")
+
+    assert result.engine == "docling"
+    assert "converted by the stand-in" in result.markdown
+    assert fake_docling.calls == [path]
+
+
+def test_docling_failure_falls_through_to_markitdown(tmp_path, fake_docling):
+    """Docling present but choking on THIS document is not a rejection:
+    markitdown gets the file next, exactly as the Collections extractor
+    always did when Docling failed."""
+    fake_docling.state["raise"] = True
+    path = _write_docx(tmp_path / "handbook.docx")
+
+    result = convert_to_markdown(path, "application/octet-stream")
+
+    assert result.engine == "markitdown"
+    assert "Agnes Handbook" in result.markdown
+
+
+def test_docling_failure_without_markitdown_blames_the_file_not_a_missing_extra(tmp_path, fake_docling, monkeypatch):
+    """On a rich image built without ``[extraction]`` a document Docling
+    cannot read has NO second reader — but that is the file's problem, and
+    ``MissingConversionDependency`` would send an operator to install an extra
+    for a document that would still fail."""
+    fake_docling.state["raise"] = True
+    monkeypatch.setitem(sys.modules, "markitdown", None)
+    path = _write_docx(tmp_path / "handbook.docx")
+
+    with pytest.raises(ConversionError) as excinfo:
+        convert_to_markdown(path, "application/octet-stream")
+
+    assert not isinstance(excinfo.value, MissingConversionDependency)
+    assert excinfo.value.engine == "docling"
+    assert excinfo.value.filename == "handbook.docx"
+
+
+def test_pdf_never_routes_to_docling(tmp_path, fake_docling):
+    """Owner decision 2026-08-31 — one PDF pipeline, no dual modes: the
+    structure pass is the PDF route on every image, Docling or not."""
+    path = tmp_path / "hello.pdf"
+    path.write_bytes(_build_pdf([[("Hello Agnes", 72, 700), ("Second line", 72, 660)]]))
+
+    result = convert_to_markdown(path, "application/pdf")
+
+    assert result.engine == "pypdfium2"
+    assert fake_docling.calls == []
+
+
+def test_passthrough_never_routes_to_docling(tmp_path, fake_docling):
+    path = tmp_path / "notes.md"
+    path.write_text("# already markdown\n", encoding="utf-8")
+
+    result = convert_to_markdown(path, "text/markdown")
+
+    assert result.engine == "passthrough"
+    assert fake_docling.calls == []
+
+
+# ------------------------------------------------------------- suffix hint
+
+
+def test_suffix_hint_routes_a_file_stored_without_its_extension(tmp_path):
+    """Collections store an upload as ``<sha256><ext>`` and keep the declared
+    type as a column; a caller that knows the type better than the storage
+    name says so, and routing follows the hint rather than the path."""
+    blob = tmp_path / "3f2a9c0e"
+    blob.write_text("# stored under a hash\n\nbody", encoding="utf-8")
+
+    assert convert_to_markdown(blob, "application/octet-stream", suffix=".md").engine == "passthrough"
+
+    office = _write_docx(tmp_path / "7b1d")
+    result = convert_to_markdown(office, "application/octet-stream", suffix=".docx")
+    assert result.engine == "markitdown"
+    assert "Agnes Handbook" in result.markdown
 
 
 # --------------------------------------------------------- licence invariant
@@ -1226,7 +1404,7 @@ _AGPL_MODULES = {"fitz", "pymupdf", "pymupdf4llm", "frontend"}
 def test_no_agpl_dependency_is_imported_by_the_converter():
     import ast
 
-    source = Path(__file__).with_name("convert.py").read_text(encoding="utf-8")
+    source = (Path(__file__).resolve().parents[1] / "src" / "ingest" / "convert.py").read_text(encoding="utf-8")
     imported: set[str] = set()
     for node in ast.walk(ast.parse(source)):
         if isinstance(node, ast.Import):
@@ -1245,7 +1423,7 @@ def test_structure_pass_failure_raises_conversion_error(tmp_path, monkeypatch):
     convertible: that surfaces as a ``ConversionError`` naming the file, which
     the crawler counts in ``convert_failed`` and walks past — never a silent
     second attempt through a parallel plain-text implementation."""
-    from connectors.sharepoint import pdf_structure
+    from src.ingest import pdf_structure
 
     def _boom(path, max_pages=None):
         raise RuntimeError("structure pass broken on purpose")
@@ -1271,10 +1449,10 @@ def test_legacy_office_runs_on_a_per_process_profile_and_serializes(tmp_path, mo
     start), and calls within one process are serialized by a lock."""
     import os
 
-    import connectors.sharepoint.convert as convert_module
+    import src.ingest.convert as convert_module
 
     monkeypatch.setattr(convert_module, "_LIBREOFFICE_PROFILES", {})
-    monkeypatch.setattr(convert_module, "_convert_markitdown", lambda p, f: "text")
+    monkeypatch.setattr(convert_module, "_convert_markitdown", lambda p, f, **_kw: "text")
     calls = _stub_soffice(monkeypatch, convert_module)
 
     for name in ("a.doc", "b.xls"):

@@ -2,7 +2,7 @@
 
 A PDF with no usable text layer — a scan, a photographed contract, an export
 that flattened its glyphs into an image — converts to nothing today:
-:func:`connectors.sharepoint.convert.convert_to_markdown` reports
+:func:`src.ingest.convert.convert_to_markdown` reports
 ``engine="empty"`` and the document is lost to search and to the fact graph.
 This module is the second chance: render each page to a bitmap with
 **pypdfium2** (Apache-2.0/BSD-3 over BSD-licensed PDFium — the same permissive
@@ -126,7 +126,7 @@ from typing import Any, Callable, Optional, Sequence
 # re-used here rather than restated. A module-level import is safe in this
 # direction — ``convert`` reaches back into this module only from inside
 # ``_convert_pdf``, so there is no cycle.
-from connectors.sharepoint.convert import ENGINE_OCR, PAGE_BREAK
+from src.ingest.convert import ENGINE_OCR, PAGE_BREAK
 
 logger = logging.getLogger(__name__)
 

@@ -380,7 +380,7 @@ _DEFAULT_MAX_CONVERTED_MB = 8
 #: :data:`_MAX_ITEM_RETRY_ATTEMPTS` gave up, then sitting in the state file
 #: forever. Checked in :func:`_process_item` BEFORE any download or convert
 #: attempt (see the check just after the size cap) — distinct from
-#: `convert_unsupported` (`connectors.sharepoint.convert.
+#: `convert_unsupported` (`src.ingest.convert.
 #: UnsupportedConversionFormat`), which is markitdown itself discovering
 #: mid-conversion that no backend `accepts()` a format it was not known in
 #: advance to reject; both land in the SAME `skipped_unsupported` counter and
@@ -448,7 +448,7 @@ _MAX_ITEM_RETRY_ATTEMPTS = 5
 #: spreadsheets that had failed conversion in every previous run, each file
 #: walked the FULL rescue chain again on every replay — page throughput fell
 #: from ~70k items/h to ~100 items per 10 minutes. A document whose most
-#: recent failure is DETERMINISTIC (`connectors.sharepoint.convert.
+#: recent failure is DETERMINISTIC (`src.ingest.convert.
 #: DETERMINISTIC_ERROR_CLASSES` — the same backend will reject the same
 #: bytes again, every time) is skipped WITHOUT a download once it has failed
 #: this many times — see `_doomed_skip_reason`. Deliberately much lower than
@@ -1238,7 +1238,7 @@ def _retry_backlog_snapshot(state: Dict[str, Any]) -> Dict[str, Any]:
     not attempted), so an operator sees "N are stuck AND M of those are not
     even being tried" rather than a single conflated number.
     """
-    from connectors.sharepoint.convert import DETERMINISTIC_ERROR_CLASSES
+    from src.ingest.convert import DETERMINISTIC_ERROR_CLASSES
 
     failed_items = state.get("failed_items") or {}
     given_up = [entry for entry in failed_items.values() if isinstance(entry, dict) and entry.get("given_up")]
@@ -1416,7 +1416,7 @@ class CrawlStats:
     _failed_items_seen: int = field(default=0, repr=False, compare=False)
     #: A file no conversion backend even attempts — video/audio containers
     #: with no usable codec path, Power BI ``.pbix``, OneNote ``.one``, and
-    #: similar formats (see ``connectors.sharepoint.convert.
+    #: similar formats (see ``src.ingest.convert.
     #: UnsupportedConversionFormat``). Deliberately NOT an error: nothing was
     #: attempted and nothing failed, so it must never inflate ``errors`` or
     #: ``convert_failed`` the way a genuine conversion failure does — see
@@ -1452,7 +1452,7 @@ class CrawlStats:
     #: :attr:`_skipped_items_seen`.
     _skipped_doomed_seen: int = field(default=0, repr=False, compare=False)
     #: How many successfully-ingested documents needed the conversion rescue
-    #: chain (``connectors.sharepoint.convert.ConvertResult.rescue``),
+    #: chain (``src.ingest.convert.ConvertResult.rescue``),
     #: broken down by which rung succeeded: ``"libreoffice_resave"``
     #: (resave-and-retry), ``"csv_fallback"``, ``"pdf_fallback"``. A
     #: document that converted cleanly on the first try never bumps this —
@@ -1800,7 +1800,7 @@ class CrawlStats:
             "convert_failed": self.convert_failed,
             "anonymize_failed": self.anonymize_failed,
             # Successfully-ingested documents that needed the conversion
-            # rescue chain (`connectors.sharepoint.convert.ConvertResult.
+            # rescue chain (`src.ingest.convert.ConvertResult.
             # rescue`), broken down by which rung succeeded — see
             # `conversion_rescued`'s docstring. Never counted in
             # `convert_failed`: a rescue that succeeded is a success.
@@ -2260,7 +2260,7 @@ class GraphTransport:
 
 
 def convert_to_markdown(path: Path, mime: str, *, source_path: Optional[str] = None) -> Any:
-    """``connectors.sharepoint.convert.convert_to_markdown`` — the seam.
+    """``src.ingest.convert.convert_to_markdown`` — the seam.
 
     ``source_path`` (the document's ORIGINAL drive-relative path, as opposed
     to ``path``, the local temp file) rides through to the scan-OCR triage
@@ -2272,7 +2272,7 @@ def convert_to_markdown(path: Path, mime: str, *, source_path: Optional[str] = N
     An ``ImportError`` propagates: with no converter there is nothing to
     ingest, so the run fails clean rather than silently indexing nothing.
     """
-    from connectors.sharepoint.convert import convert_to_markdown as _convert
+    from src.ingest.convert import convert_to_markdown as _convert
 
     return _convert(path, mime, source_path=source_path)
 
@@ -3014,7 +3014,7 @@ class _ConvertOutcome:
     ``detail_message`` it needs no anonymize-scope gating.
 
     ``error_class`` (only meaningful when NOT ``ok``) mirrors
-    ``connectors.sharepoint.convert.ConversionError.error_class`` — one of
+    ``src.ingest.convert.ConversionError.error_class`` — one of
     that module's ``ERROR_CLASS_*`` constants, or ``""`` when the exception
     this child caught had no opinion (a bare ``Exception`` the worker never
     taught to classify). Same "fixed, small vocabulary" reasoning as
@@ -3677,7 +3677,7 @@ class _ConvertProcessPool:
         ``timeout_s`` overrides THIS call's own deadline — ``None`` (every
         pre-existing caller) keeps using the pool's own ``timeout_s`` set at
         construction. ``_prepare_document`` passes a SIZE-SCALED value here
-        (``connectors.sharepoint.convert.conversion_budget_seconds``) so one
+        (``src.ingest.convert.conversion_budget_seconds``) so one
         large document gets a longer budget without raising the ceiling for
         every other file the pool ever converts — see that function's
         docstring for the live finding (221 large xlsx/xlsm files that hit
@@ -3934,11 +3934,11 @@ class _PreparedDocument:
     #: Which rung of the conversion rescue chain succeeded, on an ``"ok"``
     #: outcome — ``""`` (the ordinary case, no rescue needed),
     #: ``"libreoffice_resave"``, ``"csv_fallback"``, or ``"pdf_fallback"``.
-    #: Mirrors ``connectors.sharepoint.convert.ConvertResult.rescue`` — see
+    #: Mirrors ``src.ingest.convert.ConvertResult.rescue`` — see
     #: :func:`_process_item`'s use of it for ``CrawlStats.conversion_rescued``.
     rescue: str = ""
     #: WHY a ``"convert_failed"`` outcome failed, from the closed
-    #: ``connectors.sharepoint.convert.ERROR_CLASS_*`` vocabulary — empty for
+    #: ``src.ingest.convert.ERROR_CLASS_*`` vocabulary — empty for
     #: every other outcome. Fed into ``_note_retry`` (2026-09-04 finding #66
     #: item 1), which is what lets a LATER run decide whether this item's
     #: failure is DETERMINISTIC enough to skip without a download (item 2).
@@ -4148,9 +4148,9 @@ def _prepare_document(
     # Lazy, and only needed to catch a specific exception TYPE (the pool
     # path below never imports this module at all — it only compares the
     # class NAME the child sent back over the pipe) — see
-    # `connectors.sharepoint.convert.UnsupportedConversionFormat`'s
+    # `src.ingest.convert.UnsupportedConversionFormat`'s
     # docstring for why this is counted apart from `convert_failed`.
-    from connectors.sharepoint.convert import (
+    from src.ingest.convert import (
         ERROR_CLASS_MEMORY_KILL,
         ERROR_CLASS_OTHER,
         ERROR_CLASS_TIMEOUT,
@@ -4294,7 +4294,7 @@ def _note_retry(
     success (:func:`_clear_retry`) or an operator-requested resync.
 
     ``error_class`` (2026-09-04 finding #66 item 1 — a closed vocabulary,
-    see ``connectors.sharepoint.convert.ERROR_CLASS_*``) and ``detail`` (the
+    see ``src.ingest.convert.ERROR_CLASS_*``) and ``detail`` (the
     caller's own human-readable failure text, truncated here) are this
     ATTEMPT's own classification — always overwritten, never merged with a
     prior attempt's: a document that failed one way last time and a
@@ -4407,7 +4407,7 @@ def _doomed_skip_reason(
       cTag-based skip in this module honors;
     * fewer than :data:`_DOOMED_SKIP_MIN_ATTEMPTS` attempts are recorded, or
       the MOST RECENT recorded ``error_class`` is not one of
-      ``connectors.sharepoint.convert.DETERMINISTIC_ERROR_CLASSES``
+      ``src.ingest.convert.DETERMINISTIC_ERROR_CLASSES``
       (timeouts, memory kills, worker crashes and download errors are
       environmental and stay retryable forever);
     * the item's cTag/eTag no longer matches what was recorded at the last
@@ -4426,7 +4426,7 @@ def _doomed_skip_reason(
     entry = failed_items.get(stable_id)
     if not isinstance(entry, dict):
         return None
-    from connectors.sharepoint.convert import DETERMINISTIC_ERROR_CLASSES
+    from src.ingest.convert import DETERMINISTIC_ERROR_CLASSES
 
     error_class = entry.get("error_class")
     if error_class not in DETERMINISTIC_ERROR_CLASSES:
@@ -4477,7 +4477,7 @@ async def _process_item(
     convert/anonymize/ingest section on a worker thread; at ``None`` the
     calls are inline, i.e. the pre-parallel path exactly.
     """
-    from connectors.sharepoint.convert import ERROR_CLASS_DOWNLOAD_ERROR, ERROR_CLASS_INGEST_ERROR, ERROR_CLASS_OTHER
+    from src.ingest.convert import ERROR_CLASS_DOWNLOAD_ERROR, ERROR_CLASS_INGEST_ERROR, ERROR_CLASS_OTHER
 
     name = str(item.get("name") or "")
     stable_id = f"graph:{item['id']}"
@@ -5324,7 +5324,7 @@ async def _retry_empty_items(
     ``run`` defaults to ``False`` and is the whole reason this is a SEPARATE
     function rather than a branch inside :func:`_retry_failed_items`: the
     empty-document backlog is routinely thousands of items on a real corpus
-    (leases, tax returns, scans — see ``connectors/sharepoint/scan_ocr.py``),
+    (leases, tax returns, scans — see ``src/ingest/scan_ocr.py``),
     and replaying it on every ordinary crawl would burn a full re-walk of
     that backlog for no reason while scan OCR stays off. Only an explicit
     ``retry_empty`` run (which is exactly what turning scan OCR on and
@@ -6356,7 +6356,7 @@ async def _run_crawl_async(
     # spend. Import guarded: the module is import-light, but a broken
     # optional install must degrade to "no OCR accounting", not a dead crawl.
     try:
-        from connectors.sharepoint import scan_ocr as _scan_ocr
+        from src.ingest import scan_ocr as _scan_ocr
 
         _scan_ocr.reset_run_usage()
     except Exception:  # noqa: BLE001

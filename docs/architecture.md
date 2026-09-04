@@ -968,15 +968,17 @@ built in-process, and SharePoint is its first — currently only — file
 source. The seams between what is SOURCE-AGNOSTIC and what is
 SharePoint's are deliberate, and they are the map for the next file
 connector (OneDrive, S3, GCS, …). Today's packaging does not fully match
-those seams — several engine modules live under `connectors/sharepoint/`
-for historical reasons — so this section records which is which, before
-a second connector makes the distinction load-bearing.
+those seams — the converter now lives under `src/ingest/` and is shared with
+Collections uploads, but the facts-extraction stage still sits under
+`connectors/sharepoint/` for historical reasons — so this section records
+which is which, before a second connector makes the distinction
+load-bearing.
 
 **Engine (source-agnostic — a new file connector reuses ALL of this):**
 
 | Concern | Where | Contract |
 |---|---|---|
-| Convert to markdown | `connectors/sharepoint/convert.py`, `pdf_structure.py`, `scan_ocr.py` | bytes + filename → markdown; knows nothing about the source |
+| Convert to markdown | `src/ingest/convert.py`, `pdf_structure.py`, `scan_ocr.py` | bytes + filename → markdown; knows nothing about the source. The same call reads a Collections upload (`src/ingest/text_extract.py`), so a format one path can read, both can |
 | Anonymize | `src/anonymization*.py` | markdown → redacted markdown, fail-closed; per-scope flag decided by the caller |
 | Ingest | `POST /api/collections/{id}/files` internals, `corpus_files` repos | collection + stable_id + markdown; source-neutral idempotence |
 | Facts extraction | `connectors/sharepoint/facts_extraction.py`, `facts_prompt.py` | reads ingested markdown from collections; no source types anywhere |
