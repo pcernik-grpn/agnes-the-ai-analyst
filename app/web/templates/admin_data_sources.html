@@ -142,6 +142,14 @@
   .ds-src__health.is-ok   { background: var(--ds-accent-success-bg); color: var(--ds-accent-success-ink); border-color: var(--ds-accent-success-line); }
   .ds-src__health.is-warn { background: var(--ds-accent-warn-bg);    color: var(--ds-accent-warn-ink);    border-color: var(--ds-accent-warn-line); }
   .ds-src__health.is-err  { background: var(--ds-accent-danger-bg);  color: var(--ds-accent-danger-ink);  border-color: var(--ds-accent-danger-line); }
+  /* State chip ladder additions (source-card redesign §2.1): `is-info` for
+     `Running`/`Queued`, `is-muted` for `Never run` — the three tones
+     already above (`is-ok`/`is-warn`/`is-err`) cover the rest. `is-live`
+     pulses the chip's own dot, reusing the crawl live-dot's animation. */
+  .ds-src__health.is-info  { background: var(--ds-accent-info-bg); color: var(--ds-accent-info-ink); border-color: var(--ds-accent-info-line); }
+  .ds-src__health.is-muted { background: var(--ds-surface-dim); color: var(--ds-text-secondary); border-color: var(--ds-surface-dim); }
+  .ds-src__health.is-live::before { animation: ext-pulse 1.6s var(--ds-ease-standard) infinite; }
+  @media (prefers-reduced-motion: reduce) { .ds-src__health.is-live::before { animation: none; } }
 
   .ds-src__acts { flex: 0 0 auto; display: flex; align-items: center; gap: 6px; }
   /* Icon-only and circular, so it is a badge-shaped control rather than a
@@ -284,17 +292,84 @@
   .ds-sp-split-table th { color: var(--ds-text-muted); font-weight: 600; }
   .ds-sp-split-table td { color: var(--ds-text-primary); }
 
-  /* SharePoint card: "Scope collections" — clickable rows into the connect
-     wizard, bound to this connection (spec follow-up, TCRD-240/241: "make
-     it clickable" rather than wizard-only). */
-  .ds-sp-scopes { list-style: none; margin: 4px 0 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+  /* SharePoint card: Scopes panel's Folder cell — a clickable row into the
+     connect wizard, bound to this connection (spec follow-up, TCRD-240/241:
+     "make it clickable" rather than wizard-only). Reused, unchanged, inside
+     the new `.sp-scopes` table's first `<td>` (source-card redesign §2.2). */
   .ds-sp-scope-row {
-    display: flex; align-items: center; gap: 8px; width: 100%;
-    padding: 6px 10px; border: 1px solid var(--ds-border); border-radius: var(--ds-radius-btn);
-    background: var(--ds-surface); cursor: pointer; text-align: left; font: inherit;
+    display: inline-flex; align-items: center; gap: 8px; max-width: 100%;
+    padding: 4px 8px; border: 1px solid transparent; border-radius: var(--ds-radius-btn);
+    background: transparent; cursor: pointer; text-align: left; font: inherit;
+    color: var(--ds-text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
   .ds-sp-scope-row:hover { background: var(--ds-surface-sunken); border-color: var(--ds-primary); }
-  .ds-sp-scope-row__path { flex: 1 1 auto; min-width: 0; font-size: 12.5px; color: var(--ds-text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  /* ── Six-panel card body (source-card redesign §2) ─────────────────────
+     A panel is a `<section>` (or, for the collapsed Settings panel, a
+     `<details>`) — "a section is a panel, everything inside is whitespace":
+     no card-shaped border inside a panel, only `.ds-src__fact` rows and
+     plain spacing. */
+  .ds-src__panel { padding: 12px 16px; border-bottom: 1px solid var(--border-light, var(--ds-border-light)); }
+  .ds-src__panel:last-child { border-bottom: none; }
+  .ds-src__panel-head { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
+  .ds-src__panel-title { margin: 0; font-size: 13px; font-weight: 700; color: var(--ds-text-primary); }
+  .ds-src__panel-tools { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
+  .ds-src__panel-tools .btn { padding: 4px 11px; font-size: 12.5px; }
+  .ds-src__panel .ds-src__fact { padding: 8px 0; }
+  .ds-src__fact--danger .ds-src__fact-k { color: var(--ds-accent-danger-ink); }
+
+  /* Settings & defaults — a native `<details>`, collapsed by default; no JS
+     needed to expand/collapse it. */
+  .ds-src__panel--settings { padding: 0; }
+  .ds-src__panel--settings > summary.ds-src__panel-title {
+    padding: 12px 16px; cursor: pointer; list-style: none; display: flex; align-items: center; gap: 6px;
+  }
+  .ds-src__panel--settings > summary.ds-src__panel-title::-webkit-details-marker { display: none; }
+  .ds-src__panel--settings > summary.ds-src__panel-title::before {
+    content: '▸'; display: inline-block; color: var(--ds-text-muted);
+    transition: transform var(--ds-motion-fast, 140ms) var(--ds-ease-standard, ease);
+  }
+  .ds-src__panel--settings[open] > summary.ds-src__panel-title::before { transform: rotate(90deg); }
+  .ds-src__panel--settings > .field-hint { margin: 0 16px 8px; }
+  .ds-src__panel--settings .ds-src__fact,
+  .ds-src__panel--settings .ds-rotate-row { padding-left: 16px; padding-right: 16px; }
+  .ds-src__legacy { margin: 8px 16px 0; padding-top: 8px; border-top: 1px solid var(--border-light, var(--ds-border-light)); }
+  .ds-src__legacy > summary { cursor: pointer; font-size: 12.5px; font-weight: 600; color: var(--ds-text-secondary); }
+  .ds-src__legacy .ds-src__fact,
+  .ds-src__legacy .ds-rotate-row { padding-left: 0; padding-right: 0; }
+
+  /* Scopes panel table (§2.2) — `Since`/`(default)` marker badges reuse
+     `.ds-badge`; the row's `⋯` actions are plain buttons in the last cell. */
+  .sp-scopes { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  .sp-scopes th, .sp-scopes td {
+    padding: 6px 8px; text-align: left; border-bottom: 1px solid var(--border-light, var(--ds-border-light));
+    vertical-align: middle;
+  }
+  .sp-scopes th { color: var(--ds-text-muted); font-weight: 600; font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.02em; }
+  .sp-scopes td { color: var(--ds-text-primary); }
+  .sp-scope-since-edit { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
+
+  /* Run now ▾ popover and Map site groups form — both an inline
+     `.ds-rotate-row`-flavored panel, boxed and offset from the panel it
+     opens inside (§2.3/§2.6). */
+  .sp-popover {
+    display: block; margin-top: 8px; padding: 12px;
+    border: 1px solid var(--ds-border); border-radius: var(--ds-radius-btn);
+    background: var(--ds-surface-dim);
+  }
+  .sp-popover[hidden] { display: none; }
+  .sp-popover-title { font-size: 13px; font-weight: 700; margin-bottom: 6px; }
+  .sp-popover-opt { display: flex; align-items: flex-start; gap: 8px; padding: 6px 0; font-size: 12.5px; }
+  .sp-popover-opt input[type="checkbox"] { margin-top: 2px; accent-color: var(--ds-primary); }
+  .sp-popover-opt--danger { color: var(--ds-accent-danger-ink); }
+  .sp-popover-advanced { margin: 6px 0; font-size: 12.5px; }
+  .sp-popover-advanced summary { cursor: pointer; color: var(--ds-text-secondary); }
+  .sp-popover-foot { display: flex; justify-content: flex-end; gap: 8px; margin-top: 8px; }
+  .sp-mapgroups-check { display: inline-flex; align-items: center; gap: 4px; margin-right: 10px; font-size: 12px; }
+
+  /* Not indexed panel (§2.4, phase-1 reduced form) — one line per category. */
+  .sp-notindexed-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+  .sp-notindexed-list li { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 4px 0; font-size: 12.5px; }
 
   /* File-source "Last run" drawer rows — each rejection's human subline
      under its resolved name/collection (or fallback sha16). */
@@ -666,9 +741,13 @@
     border-top: 1px solid var(--border-light, var(--ds-border-light));
     background: var(--ds-surface-dim);
   }
+  /* Five tiles (source-card redesign §2.1 head: Indexed / Not indexed /
+     Facts / Shared with / Spent) — `.ds-src__tiles` marks the SAME grid the
+     four-cell strip already used. */
+  .ds-pipe--5 { grid-template-columns: repeat(5, 1fr); }
   .ds-pipe--4 { grid-template-columns: repeat(4, 1fr); }
   .ds-pipe--3 { grid-template-columns: repeat(3, 1fr); }
-  @media (max-width: 700px) { .ds-pipe--4, .ds-pipe--3 { grid-template-columns: 1fr 1fr; } }
+  @media (max-width: 700px) { .ds-pipe--5, .ds-pipe--4, .ds-pipe--3 { grid-template-columns: 1fr 1fr; } }
   .ds-pipe__cell {
     padding: 9px 16px;
     border-right: 1px solid var(--border-light, var(--ds-border-light));
@@ -1436,7 +1515,7 @@
          loaded. #}
       <section class="ds-drawer__pane" data-spw-pane="2">
         <p class="ds-wizard-lede">
-          Pick the sites, libraries or folders you want indexed. Each one becomes its own Collection.
+          Pick the sites, libraries or folders to index. Folders on one connection share one collection unless you choose otherwise.
         </p>
 
         {# What this connection already has configured, rendered from the

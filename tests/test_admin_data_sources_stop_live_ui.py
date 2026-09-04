@@ -69,7 +69,7 @@ _SIGNATURES = (
     "function _extDot(outcome) {",
     "function _extIsFactsPhase(run) {",
     "function _extPhaseCountText(run) {",
-    "function _extRenderCrawlCell(connId, status) {",
+    "function _extLiveLine(connId, status) {",
     "function _extRunLine(run) {",
     "const EXT_STOP_REASON_TEXT = {",
     "function _extStopReasonText(reason) {",
@@ -85,8 +85,14 @@ _SIGNATURES = (
     "function _extRunRowHtml(connId, st) {",
     "function _extConfigRowHtml(connId) {",
     "function _extPanelHtml(tone, title, body, connId, retry) {",
-    "function _extRenderInAgnesButton(connId, status) {",
+    "function _extRenderRunNowButton(connId, status) {",
     "function _extRenderFactsButton(connId, status) {",
+    "function _extNotIndexedCounts(status) {",
+    "function _extRenderHeadTiles(connId, status) {",
+    "function _extRenderNotIndexedPanel(connId, status) {",
+    "function _extRenderFactsPanel(connId, status) {",
+    "function _spStateChip(fs, status) {",
+    "function _extStateChip(connId, status) {",
     "function _extRender(connId) {",
     "function _extRenderNextRun(connId, status) {",
 )
@@ -97,15 +103,25 @@ _SIGNATURES = (
 _ASYNC_SIGNATURES = _SIGNATURES + (
     "async function _extFetchOne(connId) {",
     "async function extStopRun(connId) {",
+    "async function extCancelRun(connId, runId) {",
 )
 
 
 def _elements_js() -> str:
     return """
+const SOURCE_PIPELINES = {};
 const _elements = {
   "ext-block-sp1": { hidden: true, innerHTML: "" },
-  "ext-crawl-live-sp1": { hidden: true, innerHTML: "" },
-  "ext-inagnes-btn-sp1": { dataset: { extractionReady: "1" }, disabled: false, title: "" },
+  "sp-liveline-sp1": { hidden: true, innerHTML: "" },
+  "sp-chip-sp1": { className: "", textContent: "" },
+  "sp-tile-notindexed-sp1": { textContent: "" },
+  "sp-tile-spent-sp1": { textContent: "" },
+  "sp-notindexed-body-sp1": { innerHTML: "" },
+  "sp-facts-body-sp1": { innerHTML: "" },
+  "sp-runnow-btn-sp1": { dataset: { extractionReady: "1" }, disabled: false, title: "", style: {} },
+  "sp-stop-btn-sp1": { dataset: {}, disabled: false, textContent: "", style: {} },
+  "sp-cancel-btn-sp1": { dataset: {}, disabled: false, textContent: "", style: {} },
+  "ext-facts-btn-sp1": { dataset: { factsReady: "1" }, disabled: false, title: "" },
 };
 const document = { getElementById: (id) => _elements[id] };
 """
@@ -174,15 +190,34 @@ def _run_row_html(status: dict, *, stopping: bool = False) -> str:
     return out["html"]
 
 
+def _render_run_now_button(status) -> dict:
+    return _run_js(
+        f"""
+_extRenderRunNowButton("sp1", {json.dumps(status)});
+console.log(JSON.stringify({{
+  runDisplay: _elements["sp-runnow-btn-sp1"].style.display,
+  stopDisplay: _elements["sp-stop-btn-sp1"].style.display,
+  cancelDisplay: _elements["sp-cancel-btn-sp1"].style.display,
+}}));
+"""
+    )
+
+
 class TestStopButtonVisibility:
+    """Stop/Cancel now live in the HEAD (source-card redesign §2.1's "the
+    primary slot shows Stop while live"), rendered by
+    `_extRenderRunNowButton` — not inside `_extRunRowHtml`'s own markup any
+    more (that row has nothing left to act on directly)."""
+
     def test_shows_for_a_running_run(self):
-        html = _run_row_html(_running())
-        assert "Stop run" in html
-        assert "extStopRun('sp1')" in html
+        out = _render_run_now_button(_running())
+        assert out["stopDisplay"] == ""
+        assert out["runDisplay"] == "none"
 
     def test_shows_for_a_stalled_run(self):
-        html = _run_row_html(_running(outcome="stalled", liveness_note="no checkpoint for 4200s"))
-        assert "Stop run" in html
+        out = _render_run_now_button(_running(outcome="stalled", liveness_note="no checkpoint for 4200s"))
+        assert out["stopDisplay"] == ""
+        assert out["cancelDisplay"] == ""
 
     def test_hidden_once_the_run_is_a_completed_one(self):
         status = {
@@ -191,42 +226,48 @@ class TestStopButtonVisibility:
             "runs_total": 9,
             "can_stop": True,
         }
-        html = _run_row_html(status)
-        assert "Stop run" not in html
+        out = _render_run_now_button(status)
+        assert out["stopDisplay"] == "none"
+        assert out["runDisplay"] == ""
 
     def test_hidden_when_the_server_says_can_stop_is_false(self):
         """The pre-existing honest-degradation sentence keeps covering this
-        case — a button that cannot succeed is never drawn instead of it."""
+        case in the Run row — the head's Stop button is never drawn
+        instead of it."""
         status = _running()
         status["can_stop"] = False
+        out = _render_run_now_button(status)
+        assert out["stopDisplay"] == "none"
         html = _run_row_html(status)
-        assert "Stop run" not in html
         assert "cannot be stopped from here yet" in html
 
     def test_never_run_draws_no_stop_button_either(self):
-        html = _run_row_html({"running": None, "last_completed": None, "runs_total": 0, "can_stop": True})
-        assert "Stop run" not in html
+        out = _render_run_now_button({"running": None, "last_completed": None, "runs_total": 0, "can_stop": True})
+        assert out["stopDisplay"] == "none"
 
 
 class TestStoppingState:
     def test_the_button_flips_to_disabled_stopping_before_the_click_resolves(self):
         """`extStopRun` mutates state and re-renders synchronously, BEFORE its
         `await fetch(...)` — so the disabled state is observable the instant
-        the click handler returns control, not once the network answers."""
+        the click handler returns control, not once the network answers. The
+        button lives in the HEAD now (`sp-stop-btn-<id>`), not inside the
+        Run row's own markup."""
         out = _run_js(
             """
 globalThis.confirm = () => true;
 const fetch = () => new Promise(() => {});  // never resolves — we only care about the synchronous prefix
 extStopRun("sp1");
-console.log(JSON.stringify({ html: _elements["ext-block-sp1"].innerHTML }));
+console.log(JSON.stringify({
+  text: _elements["sp-stop-btn-sp1"].textContent,
+  disabled: _elements["sp-stop-btn-sp1"].disabled,
+}));
 """,
             state=_state(data=_running()),
             signatures=_ASYNC_SIGNATURES,
         )
-        html = out["html"]
-        assert "Stopping…" in html
-        assert "disabled" in html
-        assert "onclick=\"extStopRun('sp1')\"" in html or "extStopRun('sp1')" in html
+        assert out["text"] == "Stopping…"
+        assert out["disabled"] is True
 
     def test_a_declined_confirm_sends_no_request_and_changes_nothing(self):
         out = _run_js(
@@ -323,14 +364,18 @@ console.log(JSON.stringify({ stopping: _extState["sp1"].stopping, calls }));
 globalThis.confirm = () => true;
 const fetch = () => Promise.resolve({ status: 409, json: async () => ({ detail: { error: "not_running", message: "no run to stop" } }) });
 await extStopRun("sp1");
-console.log(JSON.stringify({ stopping: _extState["sp1"].stopping, html: _elements["ext-block-sp1"].innerHTML }));
+console.log(JSON.stringify({
+  stopping: _extState["sp1"].stopping,
+  stopDisabled: _elements["sp-stop-btn-sp1"].disabled,
+  stopText: _elements["sp-stop-btn-sp1"].textContent,
+}));
 """,
             state=_state(data=_running()),
             signatures=_ASYNC_SIGNATURES,
         )
         assert out["stopping"] is False
-        assert "Stop run" in out["html"]
-        assert "disabled" not in out["html"] or "Stop run" in out["html"]
+        assert out["stopDisabled"] is False
+        assert out["stopText"] == "Stop"
 
 
 class TestStopReasonRendersSentence:
@@ -426,22 +471,21 @@ class TestActivityDoesNotBreakOlderRows:
         assert "ext-activity" not in html
 
 
-class TestInAgnesButtonReflectsLiveRun:
-    """The static "In-Agnes extraction" fact row's own trigger button is
-    server-rendered once, from dispatch bookkeeping (`config.extraction.
-    last_run_at`) — but it must never keep offering "Run extraction now"
-    while a run is already active, since the server can only ever 409 that
-    click (`extraction_already_running`). `_extRenderInAgnesButton` reuses
-    the SAME status this script already polls for the `Run` row above,
-    rather than opening a second live-state channel for one button."""
+class TestRunNowButtonReflectsLiveRun:
+    """The head's `Run now ▾` button is server-rendered once, from dispatch
+    bookkeeping (`identity.extraction_ready`) — but it must never keep
+    offering itself while a run is already active, since the server can
+    only ever 409 that click (`extraction_already_running`). Renamed from
+    `_extRenderInAgnesButton` / `TestInAgnesButtonReflectsLiveRun` — the row
+    it used to live in no longer exists (source-card redesign §2.1)."""
 
     def test_disables_the_button_while_a_run_is_active(self):
         out = _run_js(
             f"""
-_extRenderInAgnesButton("sp1", {json.dumps(_running())});
+_extRenderRunNowButton("sp1", {json.dumps(_running())});
 console.log(JSON.stringify({{
-  disabled: _elements["ext-inagnes-btn-sp1"].disabled,
-  title: _elements["ext-inagnes-btn-sp1"].title,
+  disabled: _elements["sp-runnow-btn-sp1"].disabled,
+  title: _elements["sp-runnow-btn-sp1"].title,
 }}));
 """
         )
@@ -452,11 +496,11 @@ console.log(JSON.stringify({{
         idle_status = {"running": None, "last_completed": None, "runs_total": 9, "can_stop": True}
         out = _run_js(
             f"""
-_extRenderInAgnesButton("sp1", {json.dumps(_running())});
-_extRenderInAgnesButton("sp1", {json.dumps(idle_status)});
+_extRenderRunNowButton("sp1", {json.dumps(_running())});
+_extRenderRunNowButton("sp1", {json.dumps(idle_status)});
 console.log(JSON.stringify({{
-  disabled: _elements["ext-inagnes-btn-sp1"].disabled,
-  title: _elements["ext-inagnes-btn-sp1"].title,
+  disabled: _elements["sp-runnow-btn-sp1"].disabled,
+  title: _elements["sp-runnow-btn-sp1"].title,
 }}));
 """
         )
@@ -470,9 +514,9 @@ console.log(JSON.stringify({{
         place."""
         out = _run_js(
             """
-_elements["ext-inagnes-btn-sp1"].dataset.extractionReady = "0";
-_extRenderInAgnesButton("sp1", null);
-console.log(JSON.stringify({ disabled: _elements["ext-inagnes-btn-sp1"].disabled }));
+_elements["sp-runnow-btn-sp1"].dataset.extractionReady = "0";
+_extRenderRunNowButton("sp1", null);
+console.log(JSON.stringify({ disabled: _elements["sp-runnow-btn-sp1"].disabled }));
 """
         )
         assert out["disabled"] is True
@@ -481,7 +525,7 @@ console.log(JSON.stringify({ disabled: _elements["ext-inagnes-btn-sp1"].disabled
         out = _run_js(
             f"""
 let threw = false;
-try {{ _extRenderInAgnesButton("no-such-conn", {json.dumps(_running())}); }} catch (e) {{ threw = true; }}
+try {{ _extRenderRunNowButton("no-such-conn", {json.dumps(_running())}); }} catch (e) {{ threw = true; }}
 console.log(JSON.stringify({{ threw }}));
 """
         )
