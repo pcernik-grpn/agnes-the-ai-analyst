@@ -48,8 +48,9 @@ import json
 import logging
 import re
 import secrets
+from collections import defaultdict
 from datetime import date, datetime
-from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Set, Tuple
 from urllib.parse import urlsplit
 
 import sqlalchemy as sa
@@ -910,22 +911,40 @@ class FactsPgRepository:
     # index over "which fact/edge has a claim in which collection" and
     # "how big is this collection", so the read surface (facets/type-map,
     # the Library index, admin graph counts) never re-derives candidacy by
-    # scanning `claims` per request. Two halves:
+    # scanning `claims` per request. Three legs:
     #
-    # * `_bump_collection_stats_on_new_claim` — the HOT path, called from
-    #   `add_claim` for every genuinely new claim. Deliberately incremental
-    #   (a handful of tiny, indexed point lookups scoped to ONE subject or
-    #   ONE document, never a corpus-wide scan) — ingest throughput must
-    #   not regress just because this summary now exists.
-    # * `rebuild_collection_stats` — the RECOMPUTE path, called after any
-    #   BULK claims mutation (file purge, corpus reassignment, the
+    # * `_bump_collection_stats_on_new_claim` — the HOT INSERT path, called
+    #   from `add_claim` for every genuinely new claim. Deliberately
+    #   incremental (a handful of tiny, indexed point lookups scoped to ONE
+    #   subject or ONE document, never a corpus-wide scan) — ingest
+    #   throughput must not regress just because this summary now exists.
+    # * `_decrement_collection_stats_for_deleted_claims` — the per-file
+    #   DELETE path, called from `delete_claims_for_file` for every claim a
+    #   re-extraction pass just removed. The exact inverse of the bump
+    #   above, keyed the same way (subject, document, corpus) so that
+    #   `bump(insert) then decrement(delete)` is a no-op — scoped to the
+    #   deleted claim rows themselves (bounded by ONE file's claim count,
+    #   never a corpus-wide scan). TCRD-296 gap #73: a full
+    #   `rebuild_collection_stats` here used to re-derive the WHOLE
+    #   collection's membership from `claims` on every single-document
+    #   delete, which is exactly the cost this summary exists to avoid —
+    #   on a collection with millions of claims, a facts pass re-extracting
+    #   one document at a time turned every document into a full-collection
+    #   regroup.
+    # * `rebuild_collection_stats` — the RECOMPUTE (repair) path, called
+    #   after any genuinely BULK claims mutation (corpus reassignment, the
     #   `full_documents` replace-mode delete, a fact merge/split, SharePoint
-    #   collection consolidation). Scoped to the affected collection(s)
-    #   only — cheap even on a large instance, since it is bounded by ONE
-    #   collection's own claims, never the whole graph — and is also the
-    #   one-time backfill an operator runs after this feature's migration
+    #   collection consolidation) where computing a precise delta is not
+    #   worth the complexity, plus the explicit admin repair tool
     #   (`agnes admin facts stats rebuild` / `POST /api/admin/facts/stats/
-    #   rebuild`), since the migration itself only creates the tables.
+    #   rebuild`) and the one-time backfill an operator runs after this
+    #   feature's migration, since the migration itself only creates the
+    #   tables. Scoped to the affected collection(s) only — cheap even on a
+    #   large instance, since it is bounded by ONE collection's own claims,
+    #   never the whole graph — but still a full per-collection regroup, so
+    #   it must never run once per document on a hot path; see
+    #   `collection_stats_consistency_check` for a read-only way to verify
+    #   the incremental legs above stay exact without invoking this repair.
     #
     # Every reader that consults these tables falls back to the original
     # claims-scan query, unchanged, whenever `fact_collection_stats` is
@@ -1064,6 +1083,220 @@ class FactsPgRepository:
             },
         )
 
+    def _decrement_collection_stats_for_deleted_claims(
+        self, conn: Connection, deleted_rows: Sequence[Mapping[str, Any]]
+    ) -> None:
+        """Best-effort wrapper around :meth:`_decrement_collection_stats_impl`:
+        runs it under its OWN savepoint, so a failure there (the summary
+        tables unreachable — an instance mid-migration, or a schema pinned
+        before this feature, the same precedent `_bump_collection_stats_on_
+        new_claim`'s docstring sets) rolls back ONLY the stats bookkeeping,
+        never the claim delete `delete_claims_for_file` just committed. This
+        summary is deliberately a best-effort accelerator, never a
+        correctness-critical store — every reader falls back to the
+        original `claims` scan when it is missing/stale (see
+        `rebuild_collection_stats`'s docstring)."""
+        if not deleted_rows:
+            return
+        try:
+            with conn.begin_nested():
+                self._decrement_collection_stats_impl(conn, deleted_rows)
+        except sa.exc.DBAPIError:
+            _warn_collection_stats_unavailable_once()
+
+    def _decrement_collection_stats_impl(self, conn: Connection, deleted_rows: Sequence[Mapping[str, Any]]) -> None:
+        """The exact inverse of :meth:`_bump_collection_stats_impl`, applied
+        in bulk for every claim `delete_claims_for_file` just deleted for
+        ONE file. `deleted_rows` (`corpus_id`, `fact_id`, `edge_id` per
+        deleted claim, via `DELETE ... RETURNING`) bounds this to that one
+        file's own claim count — never a corpus-wide scan, so this is safe
+        to run inside the delete's own transaction even on a collection
+        with millions of claims (TCRD-296 gap #73).
+
+        A single `corpus_file_id` contributes to `documents_count`/
+        `documents_with_claims` at most once per (corpus, subject) /
+        (corpus,) pair — exactly the `id <> :new_id` check in the bump
+        above establishes on insert. Deleting EVERY claim a file has for a
+        subject therefore always removes that file's one contribution,
+        regardless of how many other files still evidence the same
+        subject — so every decrement below is unconditional on `deleted_
+        rows`, never re-derived by rescanning `claims`.
+        """
+        fact_claims_removed: Dict[Tuple[str, str], int] = defaultdict(int)
+        edge_claims_removed: Dict[Tuple[str, str], int] = defaultdict(int)
+        corpus_claims_removed: Dict[str, int] = defaultdict(int)
+
+        for row in deleted_rows:
+            corpus_id = row["corpus_id"]
+            corpus_claims_removed[corpus_id] += 1
+            if row["fact_id"] is not None:
+                fact_claims_removed[(corpus_id, row["fact_id"])] += 1
+            if row["edge_id"] is not None:
+                edge_claims_removed[(corpus_id, row["edge_id"])] += 1
+
+        facts_removed_per_corpus: Dict[str, int] = defaultdict(int)
+        edges_removed_per_corpus: Dict[str, int] = defaultdict(int)
+
+        for (corpus_id, fact_id), removed in fact_claims_removed.items():
+            remaining = conn.execute(
+                sa.text(
+                    "UPDATE fact_collection_membership SET "
+                    "claims_count = claims_count - :removed, "
+                    "documents_count = documents_count - 1 "
+                    "WHERE corpus_id = :corpus_id AND fact_id = :fact_id "
+                    "RETURNING claims_count"
+                ),
+                {"removed": removed, "corpus_id": corpus_id, "fact_id": fact_id},
+            ).scalar()
+            if remaining is None:
+                continue  # summary not populated for this subject (fallback mode) — nothing to reconcile
+            if remaining <= 0:
+                conn.execute(
+                    sa.text(
+                        "DELETE FROM fact_collection_membership WHERE corpus_id = :corpus_id AND fact_id = :fact_id"
+                    ),
+                    {"corpus_id": corpus_id, "fact_id": fact_id},
+                )
+                facts_removed_per_corpus[corpus_id] += 1
+
+        for (corpus_id, edge_id), removed in edge_claims_removed.items():
+            remaining = conn.execute(
+                sa.text(
+                    "UPDATE edge_collection_membership SET claims_count = claims_count - :removed "
+                    "WHERE corpus_id = :corpus_id AND edge_id = :edge_id "
+                    "RETURNING claims_count"
+                ),
+                {"removed": removed, "corpus_id": corpus_id, "edge_id": edge_id},
+            ).scalar()
+            if remaining is None:
+                continue
+            if remaining <= 0:
+                conn.execute(
+                    sa.text(
+                        "DELETE FROM edge_collection_membership WHERE corpus_id = :corpus_id AND edge_id = :edge_id"
+                    ),
+                    {"corpus_id": corpus_id, "edge_id": edge_id},
+                )
+                edges_removed_per_corpus[corpus_id] += 1
+
+        for corpus_id, claims_removed in corpus_claims_removed.items():
+            remaining = conn.execute(
+                sa.text(
+                    "UPDATE fact_collection_stats SET "
+                    "claims_count = claims_count - :claims_removed, "
+                    "facts_count = facts_count - :facts_removed, "
+                    "edges_count = edges_count - :edges_removed, "
+                    "documents_with_claims = documents_with_claims - 1, "
+                    "updated_at = now() "
+                    "WHERE corpus_id = :corpus_id "
+                    "RETURNING claims_count"
+                ),
+                {
+                    "claims_removed": claims_removed,
+                    "facts_removed": facts_removed_per_corpus.get(corpus_id, 0),
+                    "edges_removed": edges_removed_per_corpus.get(corpus_id, 0),
+                    "corpus_id": corpus_id,
+                },
+            ).scalar()
+            if remaining is None:
+                continue  # summary not populated for this collection (fallback mode) — nothing to reconcile
+            if remaining <= 0:
+                conn.execute(
+                    sa.text("DELETE FROM fact_collection_stats WHERE corpus_id = :corpus_id"), {"corpus_id": corpus_id}
+                )
+
+    def collection_stats_consistency_check(self, corpus_id: str) -> Dict[str, Any]:
+        """Read-only drift check: recompute one collection's stats straight
+        from `claims` (the same ground-truth query `_rebuild_one_collection_
+        stats` writes) and diff it against the currently MAINTAINED
+        `fact_collection_membership`/`edge_collection_membership`/
+        `fact_collection_stats` rows, without writing anything.
+
+        For tests (and an operator chasing a reported drift) to verify the
+        incremental legs — `_bump_collection_stats_impl` on insert,
+        `_decrement_collection_stats_impl` on delete — stay exact under
+        normal operation. `rebuild_collection_stats` remains the actual
+        repair tool; this helper never calls it and is not itself exposed
+        as a new API surface.
+
+        Returns ``{"consistent": bool, "maintained": {...}, "computed": {...}}``.
+        """
+        with self._engine.connect() as conn:
+            maintained_stats_row = (
+                conn.execute(
+                    sa.text(
+                        "SELECT facts_count, claims_count, edges_count, documents_with_claims "
+                        "FROM fact_collection_stats WHERE corpus_id = :cid"
+                    ),
+                    {"cid": corpus_id},
+                )
+                .mappings()
+                .first()
+            )
+            maintained_facts = {
+                r["fact_id"]: (r["claims_count"], r["documents_count"])
+                for r in conn.execute(
+                    sa.text(
+                        "SELECT fact_id, claims_count, documents_count "
+                        "FROM fact_collection_membership WHERE corpus_id = :cid"
+                    ),
+                    {"cid": corpus_id},
+                ).mappings()
+            }
+            maintained_edges = {
+                r["edge_id"]: r["claims_count"]
+                for r in conn.execute(
+                    sa.text("SELECT edge_id, claims_count FROM edge_collection_membership WHERE corpus_id = :cid"),
+                    {"cid": corpus_id},
+                ).mappings()
+            }
+
+            computed_facts = {
+                r["fact_id"]: (r["claims_count"], r["documents_count"])
+                for r in conn.execute(
+                    sa.text(
+                        "SELECT fact_id, COUNT(*) AS claims_count, COUNT(DISTINCT corpus_file_id) AS documents_count "
+                        "FROM claims WHERE corpus_id = :cid AND fact_id IS NOT NULL GROUP BY fact_id"
+                    ),
+                    {"cid": corpus_id},
+                ).mappings()
+            }
+            computed_edges = {
+                r["edge_id"]: r["claims_count"]
+                for r in conn.execute(
+                    sa.text(
+                        "SELECT edge_id, COUNT(*) AS claims_count FROM claims "
+                        "WHERE corpus_id = :cid AND edge_id IS NOT NULL GROUP BY edge_id"
+                    ),
+                    {"cid": corpus_id},
+                ).mappings()
+            }
+            computed_stats_row = (
+                conn.execute(
+                    sa.text(
+                        "SELECT COUNT(DISTINCT fact_id) AS facts_count, COUNT(*) AS claims_count, "
+                        "COUNT(DISTINCT edge_id) AS edges_count, COUNT(DISTINCT corpus_file_id) AS documents_with_claims "
+                        "FROM claims WHERE corpus_id = :cid"
+                    ),
+                    {"cid": corpus_id},
+                )
+                .mappings()
+                .first()
+            )
+
+        computed_stats = dict(computed_stats_row) if computed_stats_row and computed_stats_row["claims_count"] else None
+        maintained = {
+            "stats": dict(maintained_stats_row) if maintained_stats_row else None,
+            "fact_membership": maintained_facts,
+            "edge_membership": maintained_edges,
+        }
+        computed = {
+            "stats": computed_stats,
+            "fact_membership": computed_facts,
+            "edge_membership": computed_edges,
+        }
+        return {"consistent": maintained == computed, "maintained": maintained, "computed": computed}
+
     def rebuild_collection_stats(self, corpus_ids: Optional[List[str]] = None) -> Dict[str, int]:
         """Recompute `fact_collection_membership`/`edge_collection_membership`/
         `fact_collection_stats` from `claims` — the ground truth for "what is
@@ -1168,28 +1401,32 @@ class FactsPgRepository:
         Deliberately claims-only: facts/edges left with no evidence are
         removed by ``sweep_orphans`` as its own step afterwards (§6), exactly
         like the delete-driven cascade path.
+
+        TCRD-296 gap #73: this is a HOT path, not a bulk one — a facts
+        re-extraction pass calls it once per document, so a full
+        ``rebuild_collection_stats`` here (this method's original
+        implementation) turned every single-document delete into a
+        full-collection regroup of ``claims``: on a collection with
+        millions of claims, four concurrent extraction passes did that
+        every few seconds, at ~230% Postgres CPU, for stats tables whose
+        entire purpose is to make reads cheap. The collection-stats
+        bookkeeping below is therefore an incremental delta — bounded by
+        this one file's own claim count, never a corpus-wide scan — run
+        INSIDE this delete's own transaction (unlike a genuinely bulk
+        mutation, a delta this small costs nothing extra to keep atomic
+        with the delete it reconciles).
         """
         with self._engine.begin() as conn:
-            affected = (
+            deleted_rows = (
                 conn.execute(
-                    sa.text("SELECT DISTINCT corpus_id FROM claims WHERE corpus_file_id = :file_id"),
+                    sa.text("DELETE FROM claims WHERE corpus_file_id = :file_id RETURNING corpus_id, fact_id, edge_id"),
                     {"file_id": corpus_file_id},
                 )
-                .scalars()
+                .mappings()
                 .all()
             )
-            result = conn.execute(
-                sa.text("DELETE FROM claims WHERE corpus_file_id = :file_id"),
-                {"file_id": corpus_file_id},
-            )
-        # TCRD-296 E.21: outside the delete's own transaction (its own
-        # scoped transaction per collection, same pattern `rebuild_
-        # collection_stats` always uses) — a bulk delete, unlike `add_claim`,
-        # is rare enough that a full per-collection recompute (not an
-        # incremental delta) is the simpler, obviously-correct choice.
-        if affected:
-            self.rebuild_collection_stats(corpus_ids=list(affected))
-        return int(result.rowcount or 0)
+            self._decrement_collection_stats_for_deleted_claims(conn, deleted_rows)
+        return len(deleted_rows)
 
     def reassign_file_corpus(self, corpus_file_id: str, target_corpus_id: str) -> int:
         """Repoint one file's claims at the collection it now lives in; return
