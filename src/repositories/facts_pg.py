@@ -281,6 +281,29 @@ def _visibility_mode() -> str:
     return mode if mode == "all_evidence" else "any_evidence"
 
 
+_COLLECTION_STATS_WARNED = False
+
+
+def _warn_collection_stats_unavailable_once() -> None:
+    """TCRD-296 E.21: logged once per process — `_bump_collection_stats_
+    on_new_claim` degraded to a no-op because `fact_collection_stats`/
+    `*_collection_membership` aren't reachable (an instance mid-migration,
+    or the deliberate pre-0104 schema pin in `tests/db_pg/
+    test_facts_read_pg.py`'s S9 backfill tests). Every reader of these
+    tables already falls back to the original `claims` scan on its own —
+    this line exists purely so an operator notices "the summary isn't
+    being maintained" rather than silently getting the slow path forever."""
+    global _COLLECTION_STATS_WARNED
+    if not _COLLECTION_STATS_WARNED:
+        _COLLECTION_STATS_WARNED = True
+        logger.warning(
+            "fact_collection_stats/*_collection_membership unavailable — "
+            "collection-stats summary not maintained for this write; readers "
+            "fall back to the original claims scan until "
+            "`agnes admin facts stats rebuild` runs on a fully-migrated database"
+        )
+
+
 def _readable_ids(caller) -> Optional[frozenset]:
     """The caller's readable-collection set. ``None`` = admin (no filter).
 
@@ -867,7 +890,264 @@ class FactsPgRepository:
                 ),
                 params,
             )
+            if result.rowcount:
+                # TCRD-296 E.21: maintain the collection-stats summary
+                # incrementally on this hot path — see "Collection stats
+                # summary" below. A replayed claim (ON CONFLICT DO NOTHING,
+                # rowcount 0) changes nothing, so nothing to bump either.
+                self._bump_collection_stats_on_new_claim(
+                    c,
+                    fact_id=fact_id,
+                    edge_id=edge_id,
+                    corpus_id=corpus_id,
+                    corpus_file_id=corpus_file_id,
+                    new_claim_id=claim_id,
+                )
         return claim_id if result.rowcount else None
+
+    # ------------------------------------------------------------------
+    # Collection stats summary (TCRD-296 synthesis E.21) — a maintained
+    # index over "which fact/edge has a claim in which collection" and
+    # "how big is this collection", so the read surface (facets/type-map,
+    # the Library index, admin graph counts) never re-derives candidacy by
+    # scanning `claims` per request. Two halves:
+    #
+    # * `_bump_collection_stats_on_new_claim` — the HOT path, called from
+    #   `add_claim` for every genuinely new claim. Deliberately incremental
+    #   (a handful of tiny, indexed point lookups scoped to ONE subject or
+    #   ONE document, never a corpus-wide scan) — ingest throughput must
+    #   not regress just because this summary now exists.
+    # * `rebuild_collection_stats` — the RECOMPUTE path, called after any
+    #   BULK claims mutation (file purge, corpus reassignment, the
+    #   `full_documents` replace-mode delete, a fact merge/split, SharePoint
+    #   collection consolidation). Scoped to the affected collection(s)
+    #   only — cheap even on a large instance, since it is bounded by ONE
+    #   collection's own claims, never the whole graph — and is also the
+    #   one-time backfill an operator runs after this feature's migration
+    #   (`agnes admin facts stats rebuild` / `POST /api/admin/facts/stats/
+    #   rebuild`), since the migration itself only creates the tables.
+    #
+    # Every reader that consults these tables falls back to the original
+    # claims-scan query, unchanged, whenever `fact_collection_stats` is
+    # still empty (nothing has been rebuilt yet) — see `_visible_facts_for_
+    # corpus_cte`/`_visible_edges_for_corpus_cte`/`approximate_counts_for_
+    # collections`/`facet_top_values_for_collections` below, and
+    # `_warn_collection_stats_fallback_once` for the one-time log line.
+    # ------------------------------------------------------------------
+
+    def _bump_collection_stats_on_new_claim(
+        self,
+        conn: Connection,
+        *,
+        fact_id: Optional[str],
+        edge_id: Optional[str],
+        corpus_id: str,
+        corpus_file_id: str,
+        new_claim_id: str,
+    ) -> None:
+        """Best-effort wrapper around :meth:`_bump_collection_stats_impl`:
+        runs it under its OWN savepoint, so a failure there (the one
+        expected case: `tests/db_pg/test_facts_read_pg.py`'s S9 backfill
+        tests deliberately pin the Alembic chain to
+        ``0083_ingest_runs_source_urls`` — before these tables existed —
+        and seed data through this exact method, the same precedent the
+        ``audience`` column's own docstring above already sets) rolls back
+        ONLY the stats bookkeeping, never the claim `add_claim` just wrote.
+        This summary is deliberately a best-effort accelerator, never a
+        correctness-critical store — every reader falls back to the
+        original `claims` scan when it is missing/stale (see
+        `rebuild_collection_stats`'s docstring), so degrading silently here
+        is the correct failure mode, not a swallowed bug."""
+        try:
+            with conn.begin_nested():
+                self._bump_collection_stats_impl(
+                    conn,
+                    fact_id=fact_id,
+                    edge_id=edge_id,
+                    corpus_id=corpus_id,
+                    corpus_file_id=corpus_file_id,
+                    new_claim_id=new_claim_id,
+                )
+        except sa.exc.DBAPIError:
+            _warn_collection_stats_unavailable_once()
+
+    def _bump_collection_stats_impl(
+        self,
+        conn: Connection,
+        *,
+        fact_id: Optional[str],
+        edge_id: Optional[str],
+        corpus_id: str,
+        corpus_file_id: str,
+        new_claim_id: str,
+    ) -> None:
+        """Incrementally advance `fact_collection_membership` (or
+        `edge_collection_membership`) and `fact_collection_stats` for ONE
+        freshly-inserted claim. `conn` is the caller's own open transaction
+        (`add_claim`'s atomicity contract) — this never opens its own.
+
+        Every predicate below is scoped to ONE subject or ONE document
+        (`:new_id` excludes the row `add_claim` just inserted, so "did this
+        subject/document already have a claim" reads as it stood BEFORE
+        this write) — no corpus-wide scan, so this is safe on the hot
+        ingest path even for a collection with millions of claims."""
+        is_edge = edge_id is not None
+        subject_id = edge_id if is_edge else fact_id
+        subject_col = "edge_id" if is_edge else "fact_id"
+
+        doc_seen_for_subject = conn.execute(
+            sa.text(
+                f"SELECT EXISTS(SELECT 1 FROM claims WHERE {subject_col} = :sid "
+                "AND corpus_file_id = :cfid AND id <> :new_id)"
+            ),
+            {"sid": subject_id, "cfid": corpus_file_id, "new_id": new_claim_id},
+        ).scalar()
+        doc_delta_for_subject = 0 if doc_seen_for_subject else 1
+
+        if is_edge:
+            was_new_subject = bool(
+                conn.execute(
+                    sa.text(
+                        "INSERT INTO edge_collection_membership (corpus_id, edge_id, claims_count) "
+                        "VALUES (:corpus_id, :sid, 1) "
+                        "ON CONFLICT (corpus_id, edge_id) DO UPDATE SET "
+                        "claims_count = edge_collection_membership.claims_count + 1 "
+                        "RETURNING (xmax = 0)"
+                    ),
+                    {"corpus_id": corpus_id, "sid": subject_id},
+                ).scalar()
+            )
+        else:
+            was_new_subject = bool(
+                conn.execute(
+                    sa.text(
+                        "INSERT INTO fact_collection_membership "
+                        "(corpus_id, fact_id, claims_count, documents_count) "
+                        "VALUES (:corpus_id, :sid, 1, :doc_delta) "
+                        "ON CONFLICT (corpus_id, fact_id) DO UPDATE SET "
+                        "claims_count = fact_collection_membership.claims_count + 1, "
+                        "documents_count = fact_collection_membership.documents_count + :doc_delta "
+                        "RETURNING (xmax = 0)"
+                    ),
+                    {"corpus_id": corpus_id, "sid": subject_id, "doc_delta": doc_delta_for_subject},
+                ).scalar()
+            )
+
+        doc_seen_for_corpus = conn.execute(
+            sa.text(
+                "SELECT EXISTS(SELECT 1 FROM claims WHERE corpus_id = :corpus_id "
+                "AND corpus_file_id = :cfid AND id <> :new_id)"
+            ),
+            {"corpus_id": corpus_id, "cfid": corpus_file_id, "new_id": new_claim_id},
+        ).scalar()
+        doc_delta_for_corpus = 0 if doc_seen_for_corpus else 1
+        facts_delta = 1 if (was_new_subject and not is_edge) else 0
+        edges_delta = 1 if (was_new_subject and is_edge) else 0
+
+        conn.execute(
+            sa.text(
+                "INSERT INTO fact_collection_stats "
+                "(corpus_id, facts_count, claims_count, edges_count, documents_with_claims, updated_at) "
+                "VALUES (:corpus_id, :facts_delta, 1, :edges_delta, :doc_delta, now()) "
+                "ON CONFLICT (corpus_id) DO UPDATE SET "
+                "facts_count = fact_collection_stats.facts_count + :facts_delta, "
+                "claims_count = fact_collection_stats.claims_count + 1, "
+                "edges_count = fact_collection_stats.edges_count + :edges_delta, "
+                "documents_with_claims = fact_collection_stats.documents_with_claims + :doc_delta, "
+                "updated_at = now()"
+            ),
+            {
+                "corpus_id": corpus_id,
+                "facts_delta": facts_delta,
+                "edges_delta": edges_delta,
+                "doc_delta": doc_delta_for_corpus,
+            },
+        )
+
+    def rebuild_collection_stats(self, corpus_ids: Optional[List[str]] = None) -> Dict[str, int]:
+        """Recompute `fact_collection_membership`/`edge_collection_membership`/
+        `fact_collection_stats` from `claims` — the ground truth for "what is
+        currently evidenced", as opposed to the incremental counters
+        `_bump_collection_stats_on_new_claim` maintains on the ingest path.
+
+        `corpus_ids=None` rebuilds EVERY collection that currently carries
+        at least one claim, plus zeroes out (deletes) the summary row of any
+        collection that no longer has one — a `full_documents` replace, a
+        fact merge, or a SharePoint consolidation can empty a collection out
+        entirely. Bounded PER COLLECTION (its own transaction, never one
+        giant transaction spanning the whole graph) — safe to run on a live,
+        multi-million-claim instance (TCRD-296 synthesis E.21): the migration
+        that creates these tables does not backfill them (see
+        `migrations/versions/0104_fact_collection_stats.py`), so this is also
+        the one-time backfill an operator runs once after upgrading
+        (`agnes admin facts stats rebuild` / `POST /api/admin/facts/stats/
+        rebuild`), and the scoped recompute the delete/reassign/merge/split/
+        consolidation call sites use to keep a handful of affected
+        collections in sync after a bulk mutation.
+
+        Returns ``{"collections_rebuilt": n}``."""
+        if corpus_ids is None:
+            with self._engine.connect() as conn:
+                touched = conn.execute(sa.text("SELECT DISTINCT corpus_id FROM claims")).scalars().all()
+                stale = conn.execute(sa.text("SELECT corpus_id FROM fact_collection_stats")).scalars().all()
+            targets = sorted({*touched, *stale})
+        else:
+            targets = sorted(set(corpus_ids))
+
+        for corpus_id in targets:
+            with self._engine.begin() as conn:
+                self._rebuild_one_collection_stats(conn, corpus_id)
+        return {"collections_rebuilt": len(targets)}
+
+    def _rebuild_one_collection_stats(self, conn: Connection, corpus_id: str) -> None:
+        """The scoped recompute for ONE collection — see
+        :meth:`rebuild_collection_stats`. `conn` is the caller's own open
+        transaction."""
+        conn.execute(sa.text("DELETE FROM fact_collection_membership WHERE corpus_id = :cid"), {"cid": corpus_id})
+        conn.execute(sa.text("DELETE FROM edge_collection_membership WHERE corpus_id = :cid"), {"cid": corpus_id})
+        conn.execute(
+            sa.text(
+                "INSERT INTO fact_collection_membership (corpus_id, fact_id, claims_count, documents_count) "
+                "SELECT corpus_id, fact_id, COUNT(*), COUNT(DISTINCT corpus_file_id) FROM claims "
+                "WHERE corpus_id = :cid AND fact_id IS NOT NULL GROUP BY corpus_id, fact_id"
+            ),
+            {"cid": corpus_id},
+        )
+        conn.execute(
+            sa.text(
+                "INSERT INTO edge_collection_membership (corpus_id, edge_id, claims_count) "
+                "SELECT corpus_id, edge_id, COUNT(*) FROM claims "
+                "WHERE corpus_id = :cid AND edge_id IS NOT NULL GROUP BY corpus_id, edge_id"
+            ),
+            {"cid": corpus_id},
+        )
+        stats = (
+            conn.execute(
+                sa.text(
+                    "SELECT COUNT(DISTINCT fact_id) AS facts_count, COUNT(*) AS claims_count, "
+                    "COUNT(DISTINCT edge_id) AS edges_count, COUNT(DISTINCT corpus_file_id) AS documents_with_claims "
+                    "FROM claims WHERE corpus_id = :cid"
+                ),
+                {"cid": corpus_id},
+            )
+            .mappings()
+            .first()
+        )
+        if stats and stats["claims_count"]:
+            conn.execute(
+                sa.text(
+                    "INSERT INTO fact_collection_stats "
+                    "(corpus_id, facts_count, claims_count, edges_count, documents_with_claims, updated_at) "
+                    "VALUES (:cid, :facts_count, :claims_count, :edges_count, :documents_with_claims, now()) "
+                    "ON CONFLICT (corpus_id) DO UPDATE SET "
+                    "facts_count = EXCLUDED.facts_count, claims_count = EXCLUDED.claims_count, "
+                    "edges_count = EXCLUDED.edges_count, "
+                    "documents_with_claims = EXCLUDED.documents_with_claims, updated_at = now()"
+                ),
+                {"cid": corpus_id, **stats},
+            )
+        else:
+            conn.execute(sa.text("DELETE FROM fact_collection_stats WHERE corpus_id = :cid"), {"cid": corpus_id})
 
     def delete_claims_for_file(self, corpus_file_id: str) -> int:
         """Delete every claim anchored to one ``corpus_files`` row; return the
@@ -890,10 +1170,25 @@ class FactsPgRepository:
         like the delete-driven cascade path.
         """
         with self._engine.begin() as conn:
+            affected = (
+                conn.execute(
+                    sa.text("SELECT DISTINCT corpus_id FROM claims WHERE corpus_file_id = :file_id"),
+                    {"file_id": corpus_file_id},
+                )
+                .scalars()
+                .all()
+            )
             result = conn.execute(
                 sa.text("DELETE FROM claims WHERE corpus_file_id = :file_id"),
                 {"file_id": corpus_file_id},
             )
+        # TCRD-296 E.21: outside the delete's own transaction (its own
+        # scoped transaction per collection, same pattern `rebuild_
+        # collection_stats` always uses) — a bulk delete, unlike `add_claim`,
+        # is rare enough that a full per-collection recompute (not an
+        # incremental delta) is the simpler, obviously-correct choice.
+        if affected:
+            self.rebuild_collection_stats(corpus_ids=list(affected))
         return int(result.rowcount or 0)
 
     def reassign_file_corpus(self, corpus_file_id: str, target_corpus_id: str) -> int:
@@ -913,10 +1208,24 @@ class FactsPgRepository:
         one's. Called on the move path, immediately after the file row moves.
         """
         with self._engine.begin() as conn:
+            source_ids = (
+                conn.execute(
+                    sa.text("SELECT DISTINCT corpus_id FROM claims WHERE corpus_file_id = :file_id"),
+                    {"file_id": corpus_file_id},
+                )
+                .scalars()
+                .all()
+            )
             result = conn.execute(
                 sa.text("UPDATE claims SET corpus_id = :target WHERE corpus_file_id = :file_id"),
                 {"target": target_corpus_id, "file_id": corpus_file_id},
             )
+        # TCRD-296 E.21: both the vacated source collection(s) and the
+        # target need a recompute — same reasoning as `delete_claims_
+        # for_file`'s hook.
+        affected = {*source_ids, target_corpus_id}
+        if affected:
+            self.rebuild_collection_stats(corpus_ids=list(affected))
         return int(result.rowcount or 0)
 
     def upsert_correction(
@@ -2525,7 +2834,22 @@ class FactsPgRepository:
         population ``search()`` gates with ``type=None``. The visibility
         rule below is shared verbatim rather than restated for the wider
         scope — a second copy is how the two drift, and drift in this gate
-        is the S2 existence oracle the spec's rev 1->2 closed."""
+        is the S2 existence oracle the spec's rev 1->2 closed.
+
+        **Candidate SOURCE (TCRD-296 E.21).** The "at least one OWN claim"
+        existence check below reads `fact_collection_membership` — a row
+        exists there iff a matching claim exists in `claims`, maintained by
+        `_bump_collection_stats_on_new_claim`/`rebuild_collection_stats` —
+        rather than scanning `claims` itself (5-8s per request over a
+        2M-row table under load, TCRD-296 synthesis E.21). This changes
+        WHERE candidacy is read from, never WHAT counts as a candidate: the
+        same "any claim in scope" universe, just a smaller, indexed table to
+        scan it in. The visibility GATE below (`vis`/`vis3`/`vis_ec`, via
+        `_visibility_predicate`/`_audience_context`) is completely
+        unchanged. Falls back to the original `claims` scan, unconditionally,
+        whenever `fact_collection_stats` is still empty (nothing has been
+        rebuilt since the migration that created these tables) — see
+        `rebuild_collection_stats`'s docstring."""
         vis = self._visibility_predicate("c2.corpus_id", is_admin)
         vis3 = self._visibility_predicate("c3.corpus_id", is_admin)
         vis_ec = self._visibility_predicate("ec.corpus_id", is_admin)
@@ -2533,14 +2857,22 @@ class FactsPgRepository:
         candidate_where = (
             "c.fact_id IS NOT NULL" if all_collections else "c.corpus_id = :corpus_id AND c.fact_id IS NOT NULL"
         )
+        membership_where = "TRUE" if all_collections else "corpus_id = :corpus_id"
         return f"""
-            candidates AS (
+            candidate_ids AS (
+                SELECT fact_id AS subject_id FROM fact_collection_membership
+                WHERE {membership_where} AND EXISTS (SELECT 1 FROM fact_collection_stats)
+                UNION
                 SELECT DISTINCT c.fact_id AS subject_id
                 FROM claims c
-                WHERE {candidate_where}
-                  AND NOT EXISTS (
+                WHERE {candidate_where} AND NOT EXISTS (SELECT 1 FROM fact_collection_stats)
+            ),
+            candidates AS (
+                SELECT ci.subject_id
+                FROM candidate_ids ci
+                WHERE NOT EXISTS (
                     SELECT 1 FROM corrections co
-                    WHERE co.subject_kind = 'fact' AND co.subject_id = c.fact_id
+                    WHERE co.subject_kind = 'fact' AND co.subject_id = ci.subject_id
                       AND co.verdict IN ('wrong', 'restricted')
                   )
             ),
@@ -2901,13 +3233,25 @@ class FactsPgRepository:
         narrows to labels matching it, ranked the same way (by document
         count) rather than alphabetically — the most useful few matches
         first. `statement_timeout` is set for this call alone.
+
+        **TCRD-296 E.21**: ``n`` (document count per fact) is read from
+        `fact_collection_membership.documents_count`, summed across every
+        matching ``corpus_id`` — algebraically identical to the old
+        `COUNT(DISTINCT corpus_file_id)` over `claims`, since a
+        `corpus_files` row belongs to exactly one collection (disjoint
+        document sets per collection, so a per-collection distinct-document
+        count sums cleanly across collections). Falls back to the original
+        `claims` scan, unconditionally, whenever `fact_collection_stats` is
+        still empty — see `rebuild_collection_stats`'s docstring.
         """
         if not types:
             return {}
         params: Dict[str, Any] = {"types": list(types), "limit_per_type": limit_per_type}
         corpus_filter = ""
+        membership_filter = ""
         if corpus_ids is not None:
             corpus_filter = "c.corpus_id = ANY(:corpus_ids) AND "
+            membership_filter = "corpus_id = ANY(:corpus_ids) AND "
             params["corpus_ids"] = list(corpus_ids)
         q_norm = (q or "").strip()
         label_where = ""
@@ -2916,17 +3260,31 @@ class FactsPgRepository:
             params["q"] = f"%{q_norm}%"
         sql = sa.text(
             f"""
-            WITH scoped_claims AS (
-                SELECT DISTINCT c.fact_id, c.corpus_id, c.corpus_file_id
+            WITH counted_from_membership AS (
+                SELECT fact_id, SUM(documents_count) AS n
+                FROM fact_collection_membership
+                WHERE {membership_filter}EXISTS (SELECT 1 FROM fact_collection_stats)
+                GROUP BY fact_id
+            ),
+            scoped_claims AS (
+                SELECT DISTINCT c.fact_id, c.corpus_file_id
                 FROM claims c
-                WHERE {corpus_filter}c.fact_id IS NOT NULL
+                WHERE {corpus_filter}c.fact_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM fact_collection_stats)
+            ),
+            counted_from_claims AS (
+                SELECT fact_id, COUNT(DISTINCT corpus_file_id) AS n
+                FROM scoped_claims
+                GROUP BY fact_id
             ),
             counted AS (
-                SELECT f.type AS type, sc.fact_id AS fact_id, COUNT(DISTINCT sc.corpus_file_id) AS n
-                FROM scoped_claims sc
-                JOIN facts f ON f.id = sc.fact_id
+                SELECT f.type AS type, m.fact_id AS fact_id, m.n AS n
+                FROM (
+                    SELECT fact_id, n FROM counted_from_membership
+                    UNION ALL
+                    SELECT fact_id, n FROM counted_from_claims
+                ) m
+                JOIN facts f ON f.id = m.fact_id
                 WHERE f.type = ANY(:types)
-                GROUP BY f.type, sc.fact_id
             ),
             aliased AS (
                 SELECT fact_id, MIN(natural_key) AS label
@@ -3075,19 +3433,34 @@ class FactsPgRepository:
         evidenced by a bound ``:corpus_id`` — same relationship the fact
         CTE's own ``all_collections`` flag has to its per-collection form,
         shared verbatim rather than restated (a second copy is how the two
-        drift, and drift in this gate is the S2 existence oracle)."""
+        drift, and drift in this gate is the S2 existence oracle).
+
+        **Candidate SOURCE (TCRD-296 E.21)** — same swap and same fallback
+        contract as :meth:`_visible_facts_for_corpus_cte`'s own docstring:
+        `edge_collection_membership` instead of scanning `claims`, falling
+        back unconditionally when `fact_collection_stats` is still empty.
+        The visibility gate (`vis`, via `_visibility_predicate`) is
+        unchanged."""
         vis = self._visibility_predicate("c2.corpus_id", is_admin)
         candidate_where = (
             "c.edge_id IS NOT NULL" if all_collections else "c.corpus_id = :corpus_id AND c.edge_id IS NOT NULL"
         )
+        membership_where = "TRUE" if all_collections else "corpus_id = :corpus_id"
         return f"""
-            edge_candidates AS (
+            edge_candidate_ids AS (
+                SELECT edge_id AS subject_id FROM edge_collection_membership
+                WHERE {membership_where} AND EXISTS (SELECT 1 FROM fact_collection_stats)
+                UNION
                 SELECT DISTINCT c.edge_id AS subject_id
                 FROM claims c
-                WHERE {candidate_where}
-                  AND NOT EXISTS (
+                WHERE {candidate_where} AND NOT EXISTS (SELECT 1 FROM fact_collection_stats)
+            ),
+            edge_candidates AS (
+                SELECT eci.subject_id
+                FROM edge_candidate_ids eci
+                WHERE NOT EXISTS (
                     SELECT 1 FROM corrections co
-                    WHERE co.subject_kind = 'edge' AND co.subject_id = c.edge_id
+                    WHERE co.subject_kind = 'edge' AND co.subject_id = eci.subject_id
                       AND co.verdict IN ('wrong', 'restricted')
                   )
             ),
@@ -3163,13 +3536,35 @@ class FactsPgRepository:
         `statement_timeout` is set for this call alone so a pathological
         corpus_id list fails fast with a clear error instead of repeating
         the incident.
+
+        **TCRD-296 E.21**: reads `fact_collection_stats.facts_count`/
+        `edges_count` directly — an EXACT match for what the old `GROUP BY`
+        computed (both count every fact/edge with >=1 claim in the corpus,
+        `wrong`/`restricted` included either way), just a primary-key lookup
+        per corpus instead of a scan over every claim in it. Falls back to
+        the original query, unconditionally, whenever `fact_collection_
+        stats` is still empty — see `rebuild_collection_stats`'s docstring.
         """
         out: Dict[str, Dict[str, int]] = {}
         if not corpus_ids:
             return out
         sql = sa.text(
-            "SELECT corpus_id, COUNT(DISTINCT fact_id) AS facts, COUNT(DISTINCT edge_id) AS edges "
-            "FROM claims WHERE corpus_id = ANY(:ids) GROUP BY corpus_id"
+            """
+            WITH from_stats AS (
+                SELECT corpus_id, facts_count AS facts, edges_count AS edges
+                FROM fact_collection_stats
+                WHERE corpus_id = ANY(:ids) AND EXISTS (SELECT 1 FROM fact_collection_stats)
+            ),
+            from_claims AS (
+                SELECT corpus_id, COUNT(DISTINCT fact_id) AS facts, COUNT(DISTINCT edge_id) AS edges
+                FROM claims
+                WHERE corpus_id = ANY(:ids) AND NOT EXISTS (SELECT 1 FROM fact_collection_stats)
+                GROUP BY corpus_id
+            )
+            SELECT * FROM from_stats
+            UNION ALL
+            SELECT * FROM from_claims
+            """
         )
         with self._engine.begin() as conn:
             conn.execute(sa.text(f"SET LOCAL statement_timeout = {_STATEMENT_TIMEOUT_MS}"))
@@ -4342,6 +4737,7 @@ class FactsPgRepository:
         # over from before indexed-preference picked a different winner)
         # never survives a replace either (TCRD-241).
         replaced_file_ids: Set[str] = set()
+        replaced_corpus_ids: Set[str] = set()
         if full_documents:
             with self._engine.connect() as conn:
                 for d in full_documents:
@@ -4350,12 +4746,18 @@ class FactsPgRepository:
                         continue
                     for copy in _copies_for(corpus_id, d, conn):
                         replaced_file_ids.add(copy["corpus_file_id"])
+                        replaced_corpus_ids.add(corpus_id)
         if replaced_file_ids:
             with self._engine.begin() as conn:
                 conn.execute(
                     sa.text("DELETE FROM claims WHERE corpus_file_id = ANY(:ids)"),
                     {"ids": list(replaced_file_ids)},
                 )
+            # TCRD-296 E.21: the replace-mode delete runs BEFORE this same
+            # batch's own fresh evidence is written below — rebuilding now
+            # sets an accurate baseline that `add_claim`'s incremental hook
+            # then keeps current as this batch's own writes land.
+            self.rebuild_collection_stats(corpus_ids=list(replaced_corpus_ids))
 
         file_row_cache: Dict[str, Optional[dict]] = {}
 
@@ -5003,6 +5405,16 @@ class FactsPgRepository:
             claim_ids = (
                 conn.execute(sa.text("SELECT id FROM claims WHERE fact_id = :id"), {"id": merged_id}).scalars().all()
             )
+            # TCRD-296 E.21: every corpus a moved-or-dropped claim touches —
+            # captured BEFORE the repoint/delete below — needs a stats
+            # recompute (both `merged_id`'s membership rows, cascade-deleted
+            # with the fact itself, and `canonical_id`'s, which just gained
+            # these claims).
+            affected_corpus_ids = set(
+                conn.execute(sa.text("SELECT DISTINCT corpus_id FROM claims WHERE fact_id = :id"), {"id": merged_id})
+                .scalars()
+                .all()
+            ) | {r["corpus_id"] for r in dup_rows}
             conn.execute(
                 sa.text("UPDATE fact_aliases SET fact_id = :canonical WHERE fact_id = :merged"),
                 {"canonical": canonical_id, "merged": merged_id},
@@ -5012,6 +5424,9 @@ class FactsPgRepository:
                 {"canonical": canonical_id, "merged": merged_id},
             )
             conn.execute(sa.text("DELETE FROM facts WHERE id = :id"), {"id": merged_id})
+
+        if affected_corpus_ids:
+            self.rebuild_collection_stats(corpus_ids=list(affected_corpus_ids))
 
         from src.repositories import audit_repo
 
@@ -5065,7 +5480,20 @@ class FactsPgRepository:
                     ),
                     {"new": new_id, "aliases": list(aliases), "canonical": canonical_id},
                 )
+            # TCRD-296 E.21: same reasoning as `merge_facts`'s hook — every
+            # corpus a moved-back or re-created claim touches needs a stats
+            # recompute (`canonical_id` loses these claims, `new_id` gains
+            # them).
+            affected_corpus_ids: Set[str] = {dup["corpus_id"] for dup in duplicate_claims}
             if claim_ids:
+                moved_corpus_ids = (
+                    conn.execute(
+                        sa.text("SELECT DISTINCT corpus_id FROM claims WHERE id = ANY(:ids)"), {"ids": list(claim_ids)}
+                    )
+                    .scalars()
+                    .all()
+                )
+                affected_corpus_ids.update(moved_corpus_ids)
                 conn.execute(
                     sa.text("UPDATE claims SET fact_id = :new WHERE id = ANY(:ids)"),
                     {"new": new_id, "ids": list(claim_ids)},
@@ -5092,6 +5520,9 @@ class FactsPgRepository:
                         "document_date": _parse_document_date(dup.get("document_date")),
                     },
                 )
+
+        if affected_corpus_ids:
+            self.rebuild_collection_stats(corpus_ids=list(affected_corpus_ids))
 
         from src.repositories import audit_repo
 

@@ -3211,6 +3211,25 @@ not an analyst query (no CLI/MCP analogue).
 - /api/facts/corrections
 - /api/facts/corrections/{subject_kind}/{subject_id}
 
+**Collection-stats summary rebuild (TCRD-296 synthesis E.21).** `search`/
+`type-map`/`facets`, the Library index's per-collection counts, and the
+admin graph-counts card all read candidacy from a maintained summary
+(`fact_collection_stats`/`fact_collection_membership`/
+`edge_collection_membership`) instead of scanning `claims` per request —
+kept current incrementally on ingest, and by a scoped recompute on the
+delete/reassign/merge/split/consolidation paths (see
+`src/repositories/facts_pg.py`'s "Collection stats summary" section).
+`POST /api/admin/facts/stats/rebuild` (admin) recomputes it from `claims` —
+`{"corpus_ids": [...]}` scopes the rebuild to those collections, an absent/
+`null` body rebuilds every collection that currently carries a claim (the
+one-time backfill an operator runs once after this feature's migration,
+which creates the tables but does not backfill them). Response:
+`{"collections_rebuilt": n}`. CLI: `agnes admin facts stats rebuild
+[--corpus-id ...]`; deliberately not MCP-exposed — an unscoped call
+recomputes the whole graph, an operator decision no analyst query needs.
+
+- /api/admin/facts/stats/rebuild
+
 ### `/api/connectors` — Connector manifest
 
 - /api/connectors/manifest

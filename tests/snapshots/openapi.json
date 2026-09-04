@@ -11214,6 +11214,27 @@
         "title": "SsoSecretBody",
         "type": "object"
       },
+      "StatsRebuildRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "corpus_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Corpus Ids"
+          }
+        },
+        "title": "StatsRebuildRequest",
+        "type": "object"
+      },
       "StoreEntityListResponse": {
         "properties": {
           "items": {
@@ -21523,6 +21544,81 @@
           }
         },
         "summary": "Doctor Support",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/api/admin/facts/stats/rebuild": {
+      "post": {
+        "description": "Recompute the collection-stats summary from `claims` \u2014 bounded PER\nCOLLECTION (see `FactsPgRepository.rebuild_collection_stats`'s\ndocstring), so this is safe to run on a live, multi-million-claim\ninstance. Response: ``{\"collections_rebuilt\": n}``.",
+        "operationId": "facts_stats_rebuild_api_admin_facts_stats_rebuild_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/StatsRebuildRequest"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Body"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Facts Stats Rebuild Api Admin Facts Stats Rebuild Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Facts Stats Rebuild",
         "tags": [
           "admin"
         ]

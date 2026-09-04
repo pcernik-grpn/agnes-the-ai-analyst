@@ -171,6 +171,11 @@ POSTURE: dict[str, str] = {
     # its own row (`log_safe`) carrying the sample's LENGTH and the redaction
     # counts — never the text.
     "POST /api/admin/sharepoint/anonymization/preview": "anonymization.preview",
+    # -- app.api.admin_facts -----------------------------------------------------
+    # Handler writes its OWN row (log_safe) carrying how many collections
+    # were rebuilt and whether the call was scoped — more than the fallback
+    # middleware could say (it never sees the response body).
+    "POST /api/admin/facts/stats/rebuild": "facts.stats.rebuild",
     # -- app.api.admin_sharepoint ----------------------------------------------
     "DELETE /api/admin/sharepoint/connections/{connection_id}/scopes": "sharepoint_connection.scope_remove",
     # Landed on `integration` in parallel with this wave, declared "fallback"

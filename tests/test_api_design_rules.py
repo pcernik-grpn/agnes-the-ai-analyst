@@ -157,6 +157,11 @@ _VERB_PATH_ALLOWLIST = frozenset(
         # Registry rebuild — fire-and-forget; rebuilds the extract + master
         # views once. Companion to register-table's defer_rebuild (bulk onboarding).
         "/api/admin/registry/rebuild",
+        # Fact-graph collection-stats summary rebuild (TCRD-296 synthesis
+        # E.21) — same fire-and-forget recompute-in-place shape as the
+        # registry rebuild directly above; "rebuild" isn't a state change on
+        # a single addressable resource.
+        "/api/admin/facts/stats/rebuild",
         # Store submission rescan — re-runs guardrail scan on an existing submission
         "/api/admin/store/submissions/{submission_id}/rescan",
         # Telemetry export — GET because it streams a report, not a resource collection
