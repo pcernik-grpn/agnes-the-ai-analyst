@@ -868,6 +868,95 @@ class TestShardPlanCmd:
         assert "no certificate configured" in result.output
 
 
+class TestAclSnapshotCmd:
+    """`agnes admin sharepoint acl-snapshot` — CLI counterpart to
+    `GET /api/admin/sharepoint/connections/{connection_id}/acl-snapshot`
+    (TCRD-296 gap #79)."""
+
+    def _body(self):
+        return {
+            "aggregate": {
+                "entra_groups": 2,
+                "site_groups": 1,
+                "folders_with_org_links": 1,
+                "folders_with_individual_users": 3,
+                "scopes_captured": 4,
+                "captured_at": "2026-09-04T00:00:00+00:00",
+            }
+        }
+
+    def test_bare_call_prints_the_aggregate_and_no_scopes_param(self):
+        with patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(200, self._body())) as mock_get:
+            result = runner.invoke(app, ["admin", "sharepoint", "acl-snapshot", "conn1"])
+        assert result.exit_code == 0, result.output
+        assert "2 Entra group(s)" in result.output
+        assert "1 site group(s)" in result.output
+        assert "4 scope(s) captured" in result.output
+        args, kwargs = mock_get.call_args
+        assert args[0] == "/api/admin/sharepoint/connections/conn1/acl-snapshot"
+        assert kwargs["params"] == {}
+
+    def test_nothing_captured_yet_is_named_honestly(self):
+        body = {
+            "aggregate": {
+                "entra_groups": 0,
+                "site_groups": 0,
+                "folders_with_org_links": 0,
+                "folders_with_individual_users": 0,
+                "scopes_captured": 0,
+                "captured_at": None,
+            }
+        }
+        with patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(200, body)):
+            result = runner.invoke(app, ["admin", "sharepoint", "acl-snapshot", "conn1"])
+        assert result.exit_code == 0, result.output
+        assert "nothing captured yet" in result.output
+
+    def test_scopes_flag_rides_the_query_and_prints_per_scope_rows(self):
+        body = {
+            **self._body(),
+            "scopes": [
+                {
+                    "source_scope_id": "s1",
+                    "display_path": "Site / Docs / Finance",
+                    "principals": [
+                        {"principal_kind": "entra_group", "display_name": "Finance Team"},
+                        {"principal_kind": "user", "display_name": "Alice"},
+                    ],
+                }
+            ],
+        }
+        with patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(200, body)) as mock_get:
+            result = runner.invoke(app, ["admin", "sharepoint", "acl-snapshot", "conn1", "--scopes"])
+        assert result.exit_code == 0, result.output
+        _, kwargs = mock_get.call_args
+        assert kwargs["params"] == {"scopes": "true"}
+        assert "Site / Docs / Finance" in result.output
+        assert "Finance Team (entra_group)" in result.output
+        assert "Alice (user)" in result.output
+
+    def test_json_output(self):
+        body = self._body()
+        with patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(200, body)):
+            result = runner.invoke(app, ["admin", "sharepoint", "acl-snapshot", "conn1", "--json"])
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.output) == body
+
+    def test_duckdb_typed_501_is_reported(self):
+        # The app-wide RequiresPostgresBackend handler (app/main.py) sends
+        # `detail` as a plain STRING, not a nested object — see
+        # src/repository_errors.py::RequiresPostgresBackend.
+        body = {
+            "detail": "'sharepoint_state' requires the Postgres app-state backend.",
+            "error": "requires_postgres_backend",
+            "feature": "sharepoint_state",
+        }
+        with patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(501, body)):
+            result = runner.invoke(app, ["admin", "sharepoint", "acl-snapshot", "conn1"])
+        assert result.exit_code == 1
+        assert "requires the Postgres app-state backend" in result.output
+
+
 class TestSplitPlanCmd:
     """`agnes admin sharepoint split-plan` — CLI counterpart to
     `GET /api/admin/sharepoint/connections/{connection_id}/split-plan`."""

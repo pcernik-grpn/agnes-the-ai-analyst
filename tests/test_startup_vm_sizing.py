@@ -67,6 +67,8 @@ def test_env_heredoc_uses_resolved_bash_vars_not_raw_terraform_values():
     assert 'RESOLVED_APP_MEM_LIMIT="${app_mem_limit}"' in tpl
     assert 'RESOLVED_SCHEDULER_MEM_LIMIT="${scheduler_mem_limit}"' in tpl
     assert 'RESOLVED_EXTRACTION_WORKER_MEM_LIMIT="${extraction_worker_mem_limit}"' in tpl
+    assert "AGNES_EXTRACTION_WORKER_REPLICAS=$RESOLVED_EXTRACTION_WORKER_REPLICAS" in tpl
+    assert 'RESOLVED_EXTRACTION_WORKER_REPLICAS="${extraction_worker_replicas}"' in tpl
 
 
 def test_env_heredoc_carries_postgres_tuning():
@@ -78,6 +80,7 @@ def test_env_heredoc_carries_postgres_tuning():
         "AGNES_PG_MAINTENANCE_WORK_MEM=$AGNES_PG_MAINTENANCE_WORK_MEM",
         "AGNES_PG_MAX_PARALLEL_WORKERS_PER_GATHER=$AGNES_PG_MAX_PARALLEL_WORKERS_PER_GATHER",
         "AGNES_PG_SHM_SIZE=$AGNES_PG_SHM_SIZE",
+        "AGNES_PG_MAX_CONNECTIONS=$AGNES_PG_MAX_CONNECTIONS",
     ):
         assert line in tpl, f"missing .env line: {line}"
 
@@ -143,9 +146,13 @@ def test_postgres_effective_cache_size_60pct_uncapped():
     assert _call("agnes_pg_effective_cache_size_mb", "4096") == "2457"
 
 
-def test_postgres_work_mem_clamped_16_to_128mb():
+def test_postgres_work_mem_clamped_16_to_256mb():
+    # TCRD-296 gap #76: the cap moved from 128 to 256 MiB — a live 14M-row
+    # FTS bitmap needed 256 MiB on the 252 GiB VM. Every host under 128 GiB
+    # is unaffected: 65536 MiB / 512 = 128, already the OLD cap.
     assert _call("agnes_pg_work_mem_mb", "2048") == "16"  # floor
-    assert _call("agnes_pg_work_mem_mb", "257024") == "128"  # cap
+    assert _call("agnes_pg_work_mem_mb", "65536") == "128"  # 64 GiB host, unchanged by the raised cap
+    assert _call("agnes_pg_work_mem_mb", "257024") == "256"  # 251 GiB host now reaches the new cap
 
 
 def test_postgres_maintenance_work_mem_capped_4gb():
@@ -196,16 +203,20 @@ def test_full_resolution_end_to_end():
         'app_mem_limit="auto"\n'
         'scheduler_mem_limit="auto"\n'
         'extraction_worker_mem_limit="16g"\n'  # explicit override must win untouched
+        'extraction_worker_replicas="6"\n'  # the live TCRD-296 gap #76 incident: 6 replicas
          + section + "\n"
         'printf "%s\\n" "$RESOLVED_APP_MEM_LIMIT" "$RESOLVED_SCHEDULER_MEM_LIMIT" '
-        '"$RESOLVED_EXTRACTION_WORKER_MEM_LIMIT" "$AGNES_PG_SHARED_BUFFERS" "$AGNES_PG_SHM_SIZE"\n'
+        '"$RESOLVED_EXTRACTION_WORKER_MEM_LIMIT" "$AGNES_PG_SHARED_BUFFERS" "$AGNES_PG_SHM_SIZE" '
+        '"$AGNES_PG_MAX_CONNECTIONS"\n'
     )
     proc = subprocess.run([bash, "-c", script], capture_output=True, text=True, timeout=30)
     assert proc.returncode == 0, proc.stderr
     lines = proc.stdout.strip().splitlines()
-    app, scheduler, worker, shared_buffers, shm_size = lines
+    app, scheduler, worker, shared_buffers, shm_size, max_connections = lines
     assert app == "31g"
     assert scheduler == "2g"
     assert worker == "16g", "an explicit override must pass through untouched"
     assert shared_buffers == "32768MB"
     assert shm_size == "5140m"
+    # 15 (app) + 15 (scheduler) + 6 replicas * (8 pool + 8 overflow) + 40 headroom = 166.
+    assert max_connections == "166"

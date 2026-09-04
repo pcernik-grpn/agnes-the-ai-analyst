@@ -58,6 +58,71 @@ class TestRowScopePayload:
         assert payload["policied_tables"] == ["orders", "invoices"]
 
 
+# ── cli.query_hints.row_scope_note / row_scope_note_from_header: the ONE
+# wording source `agnes query`, `agnes describe` and `agnes snapshot
+# create`/`refresh` all render through. ────────────────────────────────────
+
+
+class TestRowScopeNoteHelper:
+    _ROW_SCOPE = {
+        "policied_tables": ["orders"],
+        "note": "rows in 'orders' are filtered by an access policy — this is your slice, not the whole table",
+    }
+
+    def test_renders_the_scope_prefix_and_note(self):
+        from cli.query_hints import row_scope_note
+
+        assert row_scope_note(self._ROW_SCOPE) == f"[scope] {self._ROW_SCOPE['note']}"
+
+    def test_none_input_returns_none(self):
+        from cli.query_hints import row_scope_note
+
+        assert row_scope_note(None) is None
+
+    def test_non_dict_input_returns_none(self):
+        from cli.query_hints import row_scope_note
+
+        assert row_scope_note("not a dict") is None
+
+    def test_dict_without_note_key_returns_none(self):
+        from cli.query_hints import row_scope_note
+
+        assert row_scope_note({"policied_tables": ["orders"]}) is None
+
+
+class TestRowScopeNoteFromHeaderHelper:
+    _HEADER_JSON = json.dumps(
+        {
+            "policied_tables": ["orders"],
+            "note": "rows in 'orders' are filtered by an access policy — this is your slice, not the whole table",
+        }
+    )
+
+    def test_parses_the_json_header_and_renders_the_note(self):
+        from cli.query_hints import row_scope_note_from_header
+
+        assert row_scope_note_from_header(self._HEADER_JSON) == (
+            "[scope] rows in 'orders' are filtered by an access policy — this is your slice, not the whole table"
+        )
+
+    def test_missing_header_returns_none(self):
+        from cli.query_hints import row_scope_note_from_header
+
+        assert row_scope_note_from_header(None) is None
+        assert row_scope_note_from_header("") is None
+
+    def test_malformed_json_returns_none_not_raises(self):
+        from cli.query_hints import row_scope_note_from_header
+
+        assert row_scope_note_from_header("{not json") is None
+
+    def test_valid_json_but_wrong_shape_returns_none_not_raises(self):
+        from cli.query_hints import row_scope_note_from_header
+
+        assert row_scope_note_from_header("[1, 2, 3]") is None
+        assert row_scope_note_from_header('"just a string"') is None
+
+
 # ── shared fixture: one policied table + one untouched sibling ─────────────
 
 
@@ -403,6 +468,62 @@ class TestCliQueryRowScopeStderr:
         assert result.exit_code == 0
         parsed = json.loads(result.stdout.strip())
         assert parsed == [{"id": 1}]
+        assert "[scope]" not in result.stdout
+        assert "[scope]" in result.stderr
+
+
+class TestCliDescribeRowScopeStderr:
+    """`agnes describe`'s human render drops `sample.row_scope` entirely --
+    `--json` dumps the full payload (row_scope included) but a human never
+    sees the caveat. Mirrors `TestCliQueryRowScopeStderr` above."""
+
+    @pytest.fixture(autouse=True)
+    def _tmp_config(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("AGNES_CONFIG_DIR", str(tmp_path / "config"))
+        monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
+        (tmp_path / "config").mkdir()
+        (tmp_path / "data").mkdir()
+
+    _SCHEMA = {
+        "table_id": "orders",
+        "columns": [{"name": "id", "type": "INTEGER"}],
+    }
+    _SAMPLE_WITH_SCOPE = {
+        "table_id": "orders",
+        "rows": [{"id": 1}],
+        "row_scope": {
+            "policied_tables": ["orders"],
+            "note": "rows in 'orders' are filtered by an access policy — this is your slice, not the whole table",
+        },
+    }
+    _SAMPLE_NO_SCOPE = {"table_id": "orders", "rows": [{"id": 1}]}
+
+    @staticmethod
+    def _fake_get(sample_payload):
+        def _get(path, **kwargs):
+            return TestCliDescribeRowScopeStderr._SCHEMA if "schema" in path else sample_payload
+
+        return _get
+
+    def test_scope_note_printed_when_row_scope_present(self):
+        with patch("cli.commands.describe.api_get_json", side_effect=self._fake_get(self._SAMPLE_WITH_SCOPE)):
+            result = ClickCliRunner().invoke(_click_app, ["describe", "orders"])
+        assert result.exit_code == 0
+        assert "[scope]" in result.stderr
+        assert "rows in 'orders' are filtered by an access policy" in result.stderr
+
+    def test_no_scope_note_when_row_scope_absent(self):
+        with patch("cli.commands.describe.api_get_json", side_effect=self._fake_get(self._SAMPLE_NO_SCOPE)):
+            result = ClickCliRunner().invoke(_click_app, ["describe", "orders"])
+        assert result.exit_code == 0
+        assert "[scope]" not in result.stderr
+
+    def test_scope_note_on_stderr_keeps_json_stdout_pure(self):
+        with patch("cli.commands.describe.api_get_json", side_effect=self._fake_get(self._SAMPLE_WITH_SCOPE)):
+            result = ClickCliRunner().invoke(_click_app, ["describe", "orders", "--json"])
+        assert result.exit_code == 0
+        data = json.loads(result.stdout)
+        assert data["sample"]["row_scope"]["policied_tables"] == ["orders"]
         assert "[scope]" not in result.stdout
         assert "[scope]" in result.stderr
 

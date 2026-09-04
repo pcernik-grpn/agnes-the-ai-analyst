@@ -11,7 +11,7 @@ Scope is deliberately the subset Terraform templates in this repo use:
 * `${name}` interpolation of a plain variable (no expressions),
 * `%{ if ... ~}` / `%{ else ~}` / `%{ endif ~}` over the guard subset the
   repo actually uses (a bool, `!bool`, `name == \"lit\"`, `name != \"lit\"`,
-  and `&&` / `||` chains of those),
+  `name >|>=|<|<= <int literal>`, and `&&` / `||` chains of those),
 * `%{ for x in list ~}` and `%{ for k, v in map ~}` / `%{ endfor ~}`,
 * the `$${` and `%%{` escapes, and the `~` whitespace-trim markers.
 
@@ -97,15 +97,17 @@ def _lookup(name: str, scope: Mapping[str, Any]) -> Any:
 
 
 _COMPARE = re.compile(r'^([A-Za-z_]\w*)\s*(==|!=)\s*"([^"]*)"$')
+_COMPARE_NUM = re.compile(r"^([A-Za-z_]\w*)\s*(>|>=|<|<=)\s*(-?\d+)$")
 
 
 def _truth(expr: str, scope: Mapping[str, Any]) -> bool:
     """Evaluate the guard subset the repo's templates use.
 
-    `a && b`, `a || b`, `!a`, `a == "lit"`, `a != "lit"`, and a bare bool.
-    Left-to-right with no precedence between && and ||, which is enough
-    because no template here mixes them; a template that did would be too
-    clever for a dumb renderer to guess at, and raises instead.
+    `a && b`, `a || b`, `!a`, `a == "lit"`, `a != "lit"`,
+    `a >|>=|<|<= <int literal>`, and a bare bool. Left-to-right with no
+    precedence between && and ||, which is enough because no template here
+    mixes them; a template that did would be too clever for a dumb renderer
+    to guess at, and raises instead.
     """
     expr = expr.strip()
     for op, combine in (("&&", all), ("||", any)):
@@ -120,6 +122,20 @@ def _truth(expr: str, scope: Mapping[str, Any]) -> bool:
         name, op, literal = m.groups()
         value = _stringify(_lookup(name, scope))
         return value == literal if op == "==" else value != literal
+
+    m = _COMPARE_NUM.match(expr)
+    if m:
+        name, op, literal = m.groups()
+        value = _lookup(name, scope)
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TemplateError(f"`if {expr}` needs an int variable, got {type(value).__name__}")
+        threshold = int(literal)
+        return {
+            ">": value > threshold,
+            ">=": value >= threshold,
+            "<": value < threshold,
+            "<=": value <= threshold,
+        }[op]
 
     negate = expr.startswith("!")
     value = _lookup(expr[1:].strip() if negate else expr, scope)

@@ -596,7 +596,13 @@ def _mint_service_token(slug: str, owner: dict) -> tuple[str, str]:
     What the gate does NOT change: within that surface the app still reads
     with the OWNER's grants, evaluated live per request. That is the
     documented trade-off in docs/DEPLOYMENT.md ("granting access to view/open
-    an app is an act of publication"), not something a scope can narrow.
+    an app is an act of publication"), not something a scope can narrow. Table
+    access policies also apply as the owner, never as an admin bypass: the
+    token is minted with `surface="stack"` (not the repository's `"all"`
+    default), so an app owned by an Admin is filtered by any policy attached
+    to a table it reads instead of skipping it outright (`src.access_policy
+    ._is_admin_bypass` follows the credential surface, not merely group
+    membership — see docs/table-access-policies.md, "The admin bypass").
 
     Mirrors `app/api/tokens.py::create_token`'s minting lines exactly (JWT +
     sha256 hash + prefix) — the raw JWT is only handed to `build_config_json`
@@ -626,6 +632,7 @@ def _mint_service_token(slug: str, owner: dict) -> tuple[str, str]:
         token_hash=token_hash,
         prefix=prefix,
         expires_at=None,
+        surface="stack",
     )
     return token_id, jwt_token
 

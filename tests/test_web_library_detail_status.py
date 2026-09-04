@@ -208,6 +208,39 @@ def test_a_source_managed_collection_offers_no_editor(seeded_app, tmp_path):
     assert "data-delete-collection>" in r.text
 
 
+def test_source_managed_collection_acl_snapshot_degrades_clean_on_duckdb(seeded_app, tmp_path):
+    """TCRD-296 gap #79: the "In SharePoint, this folder is visible to"
+    line reads a PG-only table (`sharepoint_connection_state`). On the
+    DuckDB-backed default (`seeded_app`) it must render nothing rather than
+    a 500 — the happy path (a real captured snapshot rendering names) lives
+    in tests/db_pg/test_sharepoint_acl_snapshot_pg.py."""
+    from src.repositories import source_connections_repo
+
+    doc = tmp_path / "d.csv"
+    doc.write_text("d\n")
+    corpus_id = _new_corpus("source-managed-acl-ui")
+    _add_file(corpus_id, "d.csv", "csv", str(doc))
+    source_connections_repo().create(
+        id="conn-ui-sm-acl",
+        name="Corp SharePoint ACL",
+        source_type="sharepoint",
+        config={
+            "scopes": [
+                {
+                    "source_scope_id": "root",
+                    "display_path": "Site / Docs",
+                    "drive_id": "drive-1",
+                    "collection_id": corpus_id,
+                }
+            ]
+        },
+    )
+
+    r = seeded_app["client"].get("/library/source-managed-acl-ui", headers=_auth(seeded_app["admin_token"]))
+    assert r.status_code == 200
+    assert "In SharePoint, this folder is visible to" not in r.text
+
+
 def test_file_page_offers_delete_to_its_owner(seeded_app, tmp_path):
     doc = tmp_path / "d.csv"
     doc.write_text("d\n")
@@ -230,9 +263,7 @@ def test_file_page_offers_delete_under_the_legacy_chrome_too(seeded_app, tmp_pat
     _add_file(corpus_id, "g.csv", "csv", str(doc))
 
     monkeypatch.setenv("AGNES_INSTANCE_THEME", "blue")
-    r = seeded_app["client"].get(
-        f"/library/legacy-file-delete/f/{file_id}", headers=_auth(seeded_app["admin_token"])
-    )
+    r = seeded_app["client"].get(f"/library/legacy-file-delete/f/{file_id}", headers=_auth(seeded_app["admin_token"]))
     assert r.status_code == 200, r.text
     assert "data-delete-file>" in r.text
 

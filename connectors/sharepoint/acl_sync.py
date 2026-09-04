@@ -360,6 +360,289 @@ def classify_permissions(
 
 
 # ---------------------------------------------------------------------------
+# Permissions snapshot (TCRD-296 gap #79) — "who can see this folder in
+# SharePoint" captured as METADATA, independent of ``access_mode``. This is a
+# deliberately separate concern from ``classify_permissions`` above:
+# ``classify_permissions`` decides which grantees Agnes MIRRORS into a real
+# grant (honored vs. unhonored), and only ever runs for ``access_mode=
+# 'mirrored'`` scopes; :func:`snapshot_principals` below shows EVERY grantee
+# SharePoint itself reports — a site group Agnes would never mirror, an
+# anonymous link, an external guest — for EVERY scope regardless of mode,
+# because the point is "what does SharePoint say", not "what does Agnes do
+# about it". A manual scope gets a snapshot and nothing else: no group, no
+# membership, no grant (see :func:`_snapshot_scope` and the module docstring).
+#
+# Storage reuses ``sharepoint_connection_state`` (migration
+# ``0108_sp_acl_snapshot_kind``, widening the same CHECK constraint
+# ``0103_crawl_shards`` already widened once) — one row per scope, keyed
+# ``acl_snapshot:<source_scope_id>`` — rather than a new table, and rather
+# than growing ``config["acl_sync_last_run"]`` (that block is a per-RUN
+# summary that gets fully overwritten every sync; a permissions snapshot is
+# per-SCOPE state that should survive a run in which that particular scope
+# was skipped or errored). PG-only, same posture as the ``crawl:<state_key>``
+# shard rows it sits beside: see :func:`_store_acl_snapshot`.
+# ---------------------------------------------------------------------------
+
+ACL_SNAPSHOT_KIND_PREFIX = "acl_snapshot:"
+
+
+def acl_snapshot_kind(source_scope_id: str) -> str:
+    """``sharepoint_connection_state.kind`` for one scope's stored ACL
+    snapshot row."""
+    return f"{ACL_SNAPSHOT_KIND_PREFIX}{source_scope_id}"
+
+
+def _principal_row(kind: str, principal_id: str, display_name: str, roles: List[str], via: str) -> Dict[str, Any]:
+    return {
+        "principal_kind": kind,
+        "principal_id": principal_id,
+        "display_name": display_name,
+        "roles": roles,
+        "via": via,
+    }
+
+
+def _identity_name_id_kind(granted: Dict[str, Any]) -> "tuple[str, str, str]":
+    """Best-effort ``(display_name, principal_id, principal_kind)`` for one
+    Graph ``grantedToV2``-shaped (or ``grantedToIdentitiesV2`` element)
+    identity dict — the informational-snapshot sibling of
+    :func:`classify_permissions`'s honored/unhonored grantee dispatch, minus
+    the honoring decision itself. Reuses :func:`_permission_email` /
+    :func:`_site_user_email` so the two functions never disagree about what
+    a grantee's email is."""
+    if "group" in granted:
+        group = granted.get("group") or {}
+        return (str(group.get("displayName") or group.get("id") or "group"), str(group.get("id") or ""), "entra_group")
+    if "siteGroup" in granted:
+        site_group = granted.get("siteGroup") or {}
+        name = site_group.get("displayName") or site_group.get("id") or "site group"
+        pid = site_group.get("id") or site_group.get("displayName") or ""
+        return (str(name), str(pid), "site_group")
+    if "siteUser" in granted:
+        site_user = granted.get("siteUser") or {}
+        email = _site_user_email(site_user)
+        name = site_user.get("displayName") or email or site_user.get("id") or "site user"
+        return (str(name), str(email or site_user.get("id") or ""), "site_user")
+    if "application" in granted:
+        application = granted.get("application") or {}
+        name = application.get("displayName") or application.get("id") or "application"
+        return (str(name), str(application.get("id") or ""), "application")
+    if "user" in granted:
+        user = granted.get("user") or {}
+        email = _permission_email(user)
+        name = user.get("displayName") or email or user.get("id") or "user"
+        return (str(name), str(email or user.get("id") or ""), "user")
+    return ("Unknown principal", str(granted.get("id") or ""), "unknown")
+
+
+def snapshot_principals(perms: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """The ACL-snapshot's per-principal rows for one scope root's raw Graph
+    ``permission`` objects — informational only, independent of
+    :func:`classify_permissions`'s honored/unhonored split. Never calls
+    Graph, never writes anything — a pure transform, same posture as
+    ``classify_permissions`` itself.
+
+    Each row: ``{principal_kind, principal_id, display_name, roles, via}``.
+    ``via`` is ``"link"`` (this permission IS a sharing link), ``"inherited"``
+    (Graph's own ``inheritedFrom`` marks it as coming from an ancestor of the
+    scope root), or ``"direct"`` (set on this item itself). ``principal_kind``
+    is one of ``entra_group``, ``site_group``, ``site_user``, ``user``,
+    ``application``, ``link_anonymous``, ``link_organization``,
+    ``link_people``, ``unknown``.
+    """
+    rows: List[Dict[str, Any]] = []
+    for perm in perms:
+        roles = [str(r) for r in (perm.get("roles") or [])]
+        via = "link" if perm.get("link") else ("inherited" if perm.get("inheritedFrom") else "direct")
+        link = perm.get("link")
+
+        if link:
+            scope = link.get("scope") or "unknown"
+            if scope == "anonymous":
+                rows.append(
+                    _principal_row("link_anonymous", str(perm.get("id") or ""), "Anyone with the link", roles, via)
+                )
+                continue
+            if scope == "organization":
+                rows.append(
+                    _principal_row(
+                        "link_organization", str(perm.get("id") or ""), "People in the organization", roles, via
+                    )
+                )
+                continue
+            identities = perm.get("grantedToIdentitiesV2") or []
+            if not identities:
+                rows.append(
+                    _principal_row("link_people", str(perm.get("id") or ""), "Specific people (link)", roles, via)
+                )
+                continue
+            for identity in identities:
+                name, pid, kind = _identity_name_id_kind(identity)
+                rows.append(_principal_row(kind, pid, name, roles, "link"))
+            continue
+
+        granted = perm.get("grantedToV2") or perm.get("grantedTo") or {}
+        name, pid, kind = _identity_name_id_kind(granted)
+        rows.append(_principal_row(kind, pid, name, roles, via))
+    return rows
+
+
+def summarize_snapshot_principals(principals: List[Dict[str, Any]]) -> Dict[str, int]:
+    """Per-scope count by ``principal_kind`` — the ``summary`` stored
+    alongside a scope's ``principals`` list."""
+    counts: Dict[str, int] = {}
+    for p in principals:
+        kind = str(p.get("principal_kind") or "unknown")
+        counts[kind] = counts.get(kind, 0) + 1
+    return counts
+
+
+def aggregate_acl_snapshot(snapshots: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Connection-wide rollup over several scopes' already-stored
+    :func:`snapshot_principals` payloads — the counts the source card and
+    the CLI's aggregate view show. Purely a fold over already-captured
+    payloads; never reads Graph itself.
+
+    Returns ``{entra_groups, site_groups, folders_with_org_links,
+    folders_with_individual_users, scopes_captured, captured_at}`` —
+    ``entra_groups``/``site_groups`` are DISTINCT principal counts across
+    every scope; ``folders_with_org_links``/``folders_with_individual_users``
+    count SCOPES (one connection could have the same Entra group on ten
+    scopes — that's still one "distinct Entra group" but ten "folders with
+    individual users" if each also names a person directly).
+    ``captured_at`` is the latest of every scope's own ``captured_at``, or
+    ``None`` when ``snapshots`` is empty.
+    """
+    entra_group_ids: set = set()
+    site_group_ids: set = set()
+    folders_with_org_links = 0
+    folders_with_individual_users = 0
+    captured_ats: List[str] = []
+
+    for snap in snapshots:
+        has_org_link = False
+        has_individual_user = False
+        for p in snap.get("principals") or []:
+            kind = p.get("principal_kind")
+            pid = p.get("principal_id")
+            if kind == "entra_group" and pid:
+                entra_group_ids.add(pid)
+            elif kind == "site_group" and pid:
+                site_group_ids.add(pid)
+            elif kind == "link_organization":
+                has_org_link = True
+            elif kind in ("user", "site_user"):
+                has_individual_user = True
+        if has_org_link:
+            folders_with_org_links += 1
+        if has_individual_user:
+            folders_with_individual_users += 1
+        captured_at = snap.get("captured_at")
+        if captured_at:
+            captured_ats.append(str(captured_at))
+
+    return {
+        "entra_groups": len(entra_group_ids),
+        "site_groups": len(site_group_ids),
+        "folders_with_org_links": folders_with_org_links,
+        "folders_with_individual_users": folders_with_individual_users,
+        "scopes_captured": len(snapshots),
+        "captured_at": max(captured_ats) if captured_ats else None,
+    }
+
+
+def _store_acl_snapshot(
+    connection_id: str,
+    source_scope_id: Optional[str],
+    display_path: Optional[str],
+    perms: List[Dict[str, Any]],
+) -> None:
+    """Persist one scope's ACL snapshot — Postgres only (same posture as the
+    auto-parallel-crawl shard rows this reuses the table for): a DuckDB-
+    backed instance silently captures no snapshot rather than raising,
+    because this is a background job body, never an HTTP route (see
+    ``connectors/sharepoint/state_store.py``'s module docstring for the same
+    fail-clean posture applied to crawl/facts state). A write failure is
+    logged and swallowed — a snapshot write must never fail the sync it
+    rides along with.
+    """
+    if not source_scope_id:
+        return
+    from src.repositories import use_pg
+
+    if not use_pg():
+        return
+
+    from connectors.sharepoint import state_store
+
+    principals = snapshot_principals(perms)
+    payload = {
+        "source_scope_id": source_scope_id,
+        "display_path": display_path,
+        "captured_at": datetime.now(timezone.utc).isoformat(),
+        "principals": principals,
+        "summary": summarize_snapshot_principals(principals),
+    }
+    try:
+        state_store.put(acl_snapshot_kind(source_scope_id), connection_id, payload)
+    except Exception:  # noqa: BLE001 — never let a snapshot write fail the sync itself
+        logger.warning(
+            "sharepoint-acl-sync: failed to persist ACL snapshot for scope %s (connection %s)",
+            source_scope_id,
+            connection_id,
+            exc_info=True,
+        )
+
+
+async def _snapshot_scope(connection_id: str, scope: Dict[str, Any], token: str) -> Dict[str, Any]:
+    """Capture-only path for a scope :func:`_sync_scope` never touches (any
+    ``access_mode`` other than ``'mirrored'`` — typically ``'manual'``):
+    read + snapshot + store, no honored/unhonored decision, no group/
+    membership sync, no grant reconciliation (module docstring's
+    "Permissions snapshot" note). Costs exactly one Graph permissions read
+    per scope — never called for a scope :func:`_sync_scope` already reads
+    (see :func:`_snapshot_only_scopes`), so a connection with N scopes never
+    costs more than N Graph permission reads total for this feature.
+
+    Returns ``{"source_scope_id", "error"}`` — ``error`` is ``None`` on
+    success, or ``"missing_drive_id"``/the Graph error string.
+    """
+    source_scope_id = scope.get("source_scope_id")
+    drive_id = scope.get("drive_id")
+    display_path = scope.get("display_path")
+    if not drive_id or not source_scope_id:
+        return {"source_scope_id": source_scope_id, "error": "missing_drive_id"}
+    try:
+        perms = await graph_client.list_item_permissions(token, drive_id, source_scope_id)
+    except SharePointGraphError as exc:
+        return {"source_scope_id": source_scope_id, "error": str(exc)}
+    _store_acl_snapshot(connection_id, source_scope_id, display_path, perms)
+    return {"source_scope_id": source_scope_id, "error": None}
+
+
+def _snapshot_only_scopes(connection: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """This connection's scope rows :func:`_sync_scope` never reads — every
+    scope whose ``access_mode`` is not ``'mirrored'`` (typically the default,
+    ``'manual'``) — the complement of :func:`_mirrored_scopes`. These get an
+    ACL snapshot only (see :func:`_snapshot_scope`)."""
+    scopes = (connection.get("config") or {}).get("scopes")
+    if not isinstance(scopes, list):
+        return []
+    return [s for s in scopes if isinstance(s, dict) and s.get("access_mode") != "mirrored"]
+
+
+def _has_any_scopes(connection: Dict[str, Any]) -> bool:
+    """This connection has at least one scope row, mirrored or not — the
+    nightly sweep's inclusion filter (:func:`_run_acl_sync_async`). Broader
+    than :func:`_mirrored_scopes` alone: a manual-only connection still needs
+    its scopes' ACL snapshots captured (independent of ``access_mode`` — see
+    the module docstring's "Permissions snapshot" note) even though it has
+    nothing to mirror."""
+    scopes = (connection.get("config") or {}).get("scopes")
+    return isinstance(scopes, list) and bool(scopes)
+
+
+# ---------------------------------------------------------------------------
 # Sync job body (2026-08-30 plan, Task 4). See the module docstring for the
 # division of labor with classify_permissions() above.
 # ---------------------------------------------------------------------------
@@ -489,7 +772,11 @@ async def _run_acl_sync_async(payload: dict) -> dict:
             connections = []
             errors.append({"connection_id": connection_id, "error": "connection_not_found"})
     else:
-        connections = [c for c in connections_repo.list(source_type="sharepoint") if _mirrored_scopes(c)]
+        # `_has_any_scopes`, not `_mirrored_scopes` alone (TCRD-296 gap #79):
+        # a manual-only connection has nothing to MIRROR but still needs its
+        # scopes' ACL SNAPSHOTs captured every run — see the "Permissions
+        # snapshot" section above and `_sync_connection`'s own snapshot loop.
+        connections = [c for c in connections_repo.list(source_type="sharepoint") if _has_any_scopes(c)]
 
     totals: Dict[str, Any] = {"connections": 0, "scopes": 0, "matched": 0, "unmatched": 0, "errors": errors}
     for connection in connections:
@@ -603,6 +890,20 @@ async def _sync_connection(connection: Dict[str, Any]) -> Dict[str, Any]:
             _accumulate(zone_report)
             if zone_report.get("error") and error is None:
                 error = zone_report["error"]
+
+        # TCRD-296 gap #79: every scope `_sync_scope` above never reads
+        # (any access_mode other than 'mirrored') still gets its
+        # informational ACL snapshot captured — but ONLY when there is
+        # somewhere to put it (`use_pg()`), so a DuckDB-backed instance never
+        # spends a Graph call on a feature it cannot persist. Snapshot
+        # failures are swallowed here (never fed into `error`/`ok`): they
+        # must never trip must_not staleness suspension for the connection's
+        # actual grant-mirroring health, which is what `error` governs below.
+        from src.repositories import use_pg
+
+        if use_pg():
+            for scope in _snapshot_only_scopes(connection):
+                await _snapshot_scope(connection_id, scope, token)
 
     grant_deltas: Dict[str, Dict[str, List[str]]] = {}
     for collection_id, group_ids in honored_by_collection.items():
@@ -719,6 +1020,13 @@ async def _sync_scope(
         perms = await graph_client.list_item_permissions(token, drive_id, source_scope_id)
     except SharePointGraphError as exc:
         return {**base, "error": str(exc), "stale": True}
+
+    # TCRD-296 gap #79: the SAME read above also feeds this scope's
+    # informational ACL snapshot — no second Graph call. Independent of
+    # `classify_permissions` below (that decision never affects what the
+    # snapshot shows) and never allowed to affect this scope's grant
+    # mirroring — see `_store_acl_snapshot`'s own fail-swallowed posture.
+    _store_acl_snapshot(connection_id, source_scope_id, scope.get("display_path"), perms)
 
     classified = classify_permissions(perms, site_group_map=site_group_map)
 

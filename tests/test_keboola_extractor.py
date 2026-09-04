@@ -59,7 +59,7 @@ class TestKeboolaExtractor:
         """Test that run() creates extract.duckdb with correct structure."""
         from connectors.keboola.extractor import run
 
-        def write_parquet(conn, tc, pq_path):
+        def write_parquet(conn, tc, pq_path, *a, **kw):
             _write_parquet(pq_path)
 
         with (
@@ -186,13 +186,15 @@ class TestKeboolaExtractor:
         at use must make the extraction succeed against the bare name."""
         from connectors.keboola.extractor import run
 
-        configs = [{
-            "name": "orders",
-            "bucket": "in.c-crm",
-            "source_table": "in.c-crm.orders",  # legacy wizard shape
-            "query_mode": "local",
-            "description": "Order data",
-        }]
+        configs = [
+            {
+                "name": "orders",
+                "bucket": "in.c-crm",
+                "source_table": "in.c-crm.orders",  # legacy wizard shape
+                "query_mode": "local",
+                "description": "Order data",
+            }
+        ]
 
         def mock_attach_with_rows(conn, url, token):
             conn.execute("ATTACH ':memory:' AS kbc")
@@ -265,7 +267,7 @@ class TestKeboolaExtractor:
 
         call_count = 0
 
-        def side_effect(conn, tc, pq_path):
+        def side_effect(conn, tc, pq_path, *a, **kw):
             nonlocal call_count
             call_count += 1
             if call_count == 1:
@@ -297,7 +299,7 @@ class TestKeboolaExtractor:
         """Test that data/ subdirectory is created."""
         from connectors.keboola.extractor import run
 
-        def write_pq(conn, tc, pq_path):
+        def write_pq(conn, tc, pq_path, *a, **kw):
             _write_parquet(pq_path, "SELECT 1 AS id")
 
         with (
@@ -315,7 +317,7 @@ class TestKeboolaExtractor:
 
         configs = [{"name": "test_table", "query_mode": "local", "description": "Test"}]
 
-        def write_pq(conn, tc, pq_path):
+        def write_pq(conn, tc, pq_path, *a, **kw):
             _write_parquet(pq_path, "SELECT 42 AS value, 'hello' AS msg")
 
         with (
@@ -338,7 +340,7 @@ class TestKeboolaExtractor:
 
         configs = [{"name": "t", "query_mode": "local", "description": "desc"}]
 
-        def write_pq(conn, tc, pq_path):
+        def write_pq(conn, tc, pq_path, *a, **kw):
             _write_parquet(pq_path, "SELECT 1 AS x")
 
         with (
@@ -392,7 +394,7 @@ class TestKeboolaExtractorFailureModes:
         from connectors.keboola.extractor import run
 
         # First, create a valid extract.duckdb
-        def write_pq(conn, tc, pq_path):
+        def write_pq(conn, tc, pq_path, *a, **kw):
             _write_parquet(pq_path, "SELECT 1 AS id")
 
         with (
@@ -432,7 +434,7 @@ class TestKeboolaExtractorFailureModes:
 
         call_count = 0
 
-        def side_effect(conn, tc, pq_path):
+        def side_effect(conn, tc, pq_path, *a, **kw):
             nonlocal call_count
             call_count += 1
             if tc["name"] == "bad_table":
@@ -469,7 +471,7 @@ class TestKeboolaExtractorFailureModes:
 
         call_count = 0
 
-        def side_effect(conn, tc, pq_path):
+        def side_effect(conn, tc, pq_path, *a, **kw):
             nonlocal call_count
             call_count += 1
             if tc["name"] == "timeout_table":
@@ -551,7 +553,7 @@ class TestKeboolaExtractorFailureModes:
             }
         ]
 
-        def extension_scan_fails(conn, tc, pq_path):
+        def extension_scan_fails(conn, tc, pq_path, *a, **kw):
             raise RuntimeError(
                 "Keboola scan failed: Schema 'KBC_USE4_NNNN.\"in.c-test\"' does not exist or not authorized."
             )
@@ -584,7 +586,7 @@ class TestKeboolaExtractorFailureModes:
             {"name": "t2", "query_mode": "local", "description": ""},
         ]
 
-        def always_fail(conn, tc, pq_path):
+        def always_fail(conn, tc, pq_path, *a, **kw):
             raise RuntimeError("Extraction failed")
 
         # Mock legacy too — otherwise it would attempt a real HTTP call to
@@ -634,7 +636,7 @@ class TestKeboolaExtractorFailureModes:
             call_count += 1
             _write_parquet(pq_path, "SELECT 1 AS x")
 
-        def extension_always_fails(conn, tc, pq_path):
+        def extension_always_fails(conn, tc, pq_path, *a, **kw):
             raise RuntimeError("Schema not authorized")
 
         monkeypatch.setenv("AGNES_KEBOOLA_PARALLELISM", "1")
@@ -665,7 +667,7 @@ class TestKeboolaExtractorFailureModes:
             for i in range(5)
         ]
 
-        def extension_always_fails(conn, tc, pq_path):
+        def extension_always_fails(conn, tc, pq_path, *a, **kw):
             raise RuntimeError("Schema not authorized")
 
         # Stand in for ProcessPoolExecutor — runs everything in-process
@@ -721,7 +723,7 @@ class TestKeboolaExtractorFailureModes:
             {"name": "good_name", "query_mode": "local", "description": "OK"},
         ]
 
-        def write_pq(conn, tc, pq_path):
+        def write_pq(conn, tc, pq_path, *a, **kw):
             _write_parquet(pq_path, "SELECT 1 AS id")
 
         with (

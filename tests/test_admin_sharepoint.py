@@ -2530,6 +2530,43 @@ class TestChangesFeedFailsCleanOnDuckDB:
         assert r.json()["error"] == "requires_postgres_backend"
 
 
+class TestAclSnapshotFailsCleanOnDuckDB:
+    """The ACL-permissions snapshot (`GET .../acl-snapshot`, TCRD-296 gap
+    #79) is PG-only — it reads `sharepoint_connection_state`, which has no
+    DuckDB counterpart (A3 ratchet). The happy path (a real captured
+    snapshot, the connection-wide aggregate, `?scopes=true`, RBAC, audit)
+    lives in tests/db_pg/test_sharepoint_acl_snapshot_pg.py; this suite
+    (the DuckDB-backed default here) only proves the typed 501 — never a
+    raw 500 — regardless of whether the connection has any confirmed
+    scopes yet."""
+
+    @pytest.fixture(autouse=True)
+    def _pin_duckdb_backend(self, duckdb_backend_pinned):
+        """Resolve DuckDB regardless of a `tests/db_pg/` test having run
+        earlier in this worker process (issue #1658)."""
+
+    def test_acl_snapshot_501_on_duckdb_backend_no_scopes(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="acl-snapshot-noscope-conn")
+        r = c.get(f"{BASE}/{conn_id}/acl-snapshot", headers=_auth(token))
+        assert r.status_code == 501
+        assert r.json()["error"] == "requires_postgres_backend"
+
+    def test_acl_snapshot_501_on_duckdb_backend_with_a_confirmed_scope(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="acl-snapshot-scoped-conn")
+        c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "drive:a", "display_path": "A"},
+            headers=_auth(token),
+        )
+        r = c.get(f"{BASE}/{conn_id}/acl-snapshot?scopes=true", headers=_auth(token))
+        assert r.status_code == 501
+        assert r.json()["error"] == "requires_postgres_backend"
+
+
 class TestConsolidateCollectionsFailsCleanOnDuckDB:
     """Collection consolidation (`POST .../collections/consolidate`) is
     PG-only by construction — it touches `corpus_file_sources` / `claims` /

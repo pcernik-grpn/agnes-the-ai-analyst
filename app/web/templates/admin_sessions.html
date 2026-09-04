@@ -427,10 +427,10 @@
         : '<span style="color:var(--text-secondary, #6b7280)">0</span>';
       // URL `{username}` segment is the on-disk directory name (UUID for
       // upload-API sessions, OS-username for the legacy collector), NOT
-      // r.username — that's now the display email (v60 collapse, #458)
-      // which the `_safe_session_path` regex on the server rejects. The
-      // listing API returns `session_dir` derived from `session_file`
-      // explicitly so the UI doesn't have to re-derive it.
+      // r.username — that's the display email (v60 collapse, #458). The
+      // server accepts the email too since #2266, but resolving it costs a
+      // user lookup per request; the listing API returns `session_dir`
+      // derived from `session_file` so the UI can address the file directly.
       const sessionDir = r.session_dir || '_';
       const viewerHref = '/admin/sessions/' + encodeURIComponent(sessionDir)
                        + '/' + encodeURIComponent(r.session_file.split('/').pop());

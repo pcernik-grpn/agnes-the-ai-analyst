@@ -899,9 +899,15 @@ def test_mention_same_thread_reuses_session(monkeypatch):
     assert mgr.sent and mgr.sent[0][1] == "again"
 
 
-def _seed_channel_bound_agent(conn, channel="C_OK", *, owner="uid_U_OK", slug="router"):
+def _seed_channel_bound_agent(conn, channel="C_OK", *, owner="uid_U_OK", slug="router", knowledge=None):
     """An agent profile holding ('slack_channel', <channel>) — the mention
-    router's lookup target. Uses the repo factory like the handler does."""
+    router's lookup target. Uses the repo factory like the handler does.
+
+    ``knowledge`` (design doc §12 tests) is a list of data_package ids the
+    agent is grounded in — encoded exactly like the `/agents` builder
+    encodes it (opaque JSON text on the `knowledge` column)."""
+    import json
+
     from src.repositories import agents_repo
 
     agent_id = f"ag_{slug}"
@@ -917,6 +923,7 @@ def _seed_channel_bound_agent(conn, channel="C_OK", *, owner="uid_U_OK", slug="r
         connections_mode="selected",
         tables_mode="selected",
         memory_mode="selected",
+        knowledge=json.dumps(knowledge or []),
     )
     agents_repo().set_scope(agent_id, [("slack_channel", channel)])
     return agent_id
@@ -952,6 +959,89 @@ def test_mention_routed_channel_gets_agent_header_and_reaction(monkeypatch):
     assert sent_text.startswith("[slack context: channel=C_OK thread_ts=9.5 message_ts=9.5 sender=<@U_OK>]")
     assert sent_text.endswith("draft this")
     assert reactions == [("C_OK", "9.5", "eyes")]
+
+
+def test_mention_routed_channel_with_policied_scope_gets_a_notice(monkeypatch):
+    """Design doc §12 — a FRESH routing to an agent whose scope holds an
+    access-policied table posts a one-time, channel-visible notice: a
+    routed thread runs entirely as the agent's OWNER, so every mention here
+    answers with the owner's row slice through that policy, never the
+    mentioner's own — unlike this same agent's API/chat/delegated-turn
+    callers, who are filtered by their OWN identity instead."""
+    import asyncio
+
+    import services.slack_bot.events as ev
+    from src.repositories.table_registry import TableRegistryRepository
+    from tests.conftest import grant_table_via_package
+
+    monkeypatch.setattr(ev, "send_ephemeral_to_user", lambda *a, **k: None)
+
+    async def _fake_react(channel, ts, emoji):
+        return None
+
+    monkeypatch.setattr(ev, "add_reaction", _fake_react)
+    notices = []
+
+    async def _fake_reply(channel, thread_ts, text):
+        notices.append((channel, thread_ts, text))
+
+    monkeypatch.setattr(ev, "send_thread_reply", _fake_reply)
+    conn = get_system_db()
+    _ensure_schema(conn)
+    uid = _seed_bound_chat_user(conn)
+    _allow_channel(conn)
+
+    registry = TableRegistryRepository(conn)
+    registry.register(id="tbl_orders", name="orders", source_type="keboola", query_mode="local", server_only=True)
+    registry.set_access_policy(
+        "tbl_orders",
+        sql="SELECT * FROM orders WHERE list_contains($user_groups, unit)",
+        note="unit filter",
+        updated_by="admin",
+    )
+    pkg_id = grant_table_via_package(conn, "tbl_orders", uid, group_name="owner-pkg-orders")
+    _seed_channel_bound_agent(conn, owner=uid, slug="router-policy", knowledge=[pkg_id])
+
+    mgr = _FakeMgr()
+    app = _FakeApp(conn=conn, mgr=mgr)
+    asyncio.run(ev._handle_mention(app, {"channel": "C_OK", "ts": "9.51", "user": "U_OK", "text": "<@U07BOT> hi"}))
+
+    assert len(notices) == 1
+    channel, thread_ts, text = notices[0]
+    assert channel == "C_OK" and thread_ts == "9.51"
+    assert "orders" in text
+    assert "owner" in text.lower()
+
+
+def test_mention_routed_channel_without_policied_scope_gets_no_notice(monkeypatch):
+    """Contrast case — an agent grounded in nothing policied posts none."""
+    import asyncio
+
+    import services.slack_bot.events as ev
+
+    monkeypatch.setattr(ev, "send_ephemeral_to_user", lambda *a, **k: None)
+
+    async def _fake_react(channel, ts, emoji):
+        return None
+
+    monkeypatch.setattr(ev, "add_reaction", _fake_react)
+    notices = []
+
+    async def _fake_reply(channel, thread_ts, text):
+        notices.append((channel, thread_ts, text))
+
+    monkeypatch.setattr(ev, "send_thread_reply", _fake_reply)
+    conn = get_system_db()
+    _ensure_schema(conn)
+    uid = _seed_bound_chat_user(conn)
+    _allow_channel(conn)
+    _seed_channel_bound_agent(conn, owner=uid, slug="router-nopolicy")
+
+    mgr = _FakeMgr()
+    app = _FakeApp(conn=conn, mgr=mgr)
+    asyncio.run(ev._handle_mention(app, {"channel": "C_OK", "ts": "9.52", "user": "U_OK", "text": "<@U07BOT> hi"}))
+
+    assert notices == []
 
 
 def test_mention_unbound_channel_stays_unrouted_and_unprefixed(monkeypatch):

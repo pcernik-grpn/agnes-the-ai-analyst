@@ -100,6 +100,11 @@ Thirteen surfaces:
     second mapping never clobbers the first. CLI counterpart to
     ``PATCH /api/admin/sharepoint/connections/{connection_id}/
     acl-site-group-map``.
+  - ``acl-snapshot`` (TCRD-296 gap #79) — who SharePoint itself says can see
+    each of this connection's scopes, captured periodically for EVERY scope
+    regardless of ``access_mode`` — informational metadata, never Agnes
+    access itself. CLI counterpart to
+    ``GET /api/admin/sharepoint/connections/{connection_id}/acl-snapshot``.
 
 The ACL-sync / subtree-sweep TRIGGERS stay admin-web-UI-only, an
 established precedent (see CONTRIBUTING.md's "admin/scheduler maintenance
@@ -820,6 +825,70 @@ def shard_plan_cmd(
         typer.echo(json.dumps(body, indent=2))
         return
     _print_shard_plan(body)
+
+
+# ---------------------------------------------------------------------------
+# `acl-snapshot` (TCRD-296 gap #79) — SharePoint permissions captured as
+# METADATA, independent of `access_mode`. CLI counterpart to
+# `GET …/acl-snapshot`.
+# ---------------------------------------------------------------------------
+
+
+@admin_sharepoint_app.command("acl-snapshot")
+def acl_snapshot_cmd(
+    connection_id: str = typer.Argument(..., help="SharePoint source_connections id"),
+    show_scopes: bool = typer.Option(False, "--scopes", help="Also print every captured scope's own principal list"),
+    as_json: bool = typer.Option(False, "--json"),
+):
+    """Who SharePoint itself says can see this connection's scopes —
+    captured periodically by the ``sharepoint-acl-sync`` job for EVERY
+    scope, regardless of ``access_mode``. Informational only: this never
+    changes what Agnes grants — only a scope confirmed with ``access_mode
+    =mirrored`` (``agnes admin sharepoint scope set-mode``) actually derives
+    Agnes access from it. CLI counterpart to ``GET /api/admin/sharepoint/
+    connections/{connection_id}/acl-snapshot``.
+
+    Prints the connection-wide aggregate: distinct Entra groups, distinct
+    SharePoint site groups, how many scopes carry an organization-wide
+    sharing link, how many name an individual person directly, how many
+    scopes have been captured at all, and the latest capture time.
+    ``--scopes`` additionally prints one line per captured scope with its
+    own principal list.
+
+    ``501`` on a DuckDB-backed instance (this feature reads a Postgres-only
+    table — see ``docs/sharepoint-extraction.md`` -> "SharePoint permissions
+    as metadata vs. mirrored access"); ``404`` for an unknown or
+    non-SharePoint connection id.
+    """
+    params: Dict[str, Any] = {}
+    if show_scopes:
+        params["scopes"] = "true"
+
+    resp = api_get(f"/api/admin/sharepoint/connections/{connection_id}/acl-snapshot", params=params)
+    if resp.status_code != 200:
+        _fail(resp)
+    body = resp.json()
+    if as_json:
+        typer.echo(json.dumps(body, indent=2))
+        return
+
+    agg = body.get("aggregate") or {}
+    captured_note = f"captured {agg['captured_at']}" if agg.get("captured_at") else "nothing captured yet"
+    typer.echo(
+        f"{agg.get('entra_groups', 0)} Entra group(s) · {agg.get('site_groups', 0)} site group(s) · "
+        f"{agg.get('folders_with_org_links', 0)} folder(s) with an organization-wide link · "
+        f"{agg.get('folders_with_individual_users', 0)} folder(s) naming an individual person · "
+        f"{agg.get('scopes_captured', 0)} scope(s) captured · {captured_note}"
+    )
+    if show_scopes:
+        for scope in body.get("scopes") or []:
+            principals = scope.get("principals") or []
+            names = (
+                ", ".join(f"{p.get('display_name')} ({p.get('principal_kind')})" for p in principals)
+                if principals
+                else "(no principals)"
+            )
+            typer.echo(f"  {scope.get('display_path') or scope.get('source_scope_id')}: {names}")
 
 
 # ---------------------------------------------------------------------------

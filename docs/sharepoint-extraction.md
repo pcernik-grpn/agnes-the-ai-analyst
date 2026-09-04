@@ -87,6 +87,40 @@ libraries / folders). Per scope, two decisions that matter later:
   source card's Access panel → **Map site groups…** form), see
   [`RBAC.md`](RBAC.md) → "SharePoint ACL mirroring".
 
+### SharePoint permissions as metadata vs. mirrored access
+
+The `sharepoint-acl-sync` job (every few hours, `acl_sync.interval_hours` —
+see "Keeping a site current" below) captures a **permissions snapshot** for
+EVERY scope, regardless of `access_mode` — who SharePoint itself reports can
+see that folder. This is purely informational metadata: capturing it never
+changes what Agnes grants. Only a scope confirmed with `access_mode
+=mirrored` also reconciles a real Agnes grant from the same read (the
+"Connect the tenant" section above). A `manual` scope gets a snapshot and
+nothing else.
+
+The distinction matters for one Entra permission specifically:
+**`GroupMember.Read.All`** (transitive membership expansion — resolving an
+Entra security/M365 group's members into individual Agnes accounts) is only
+ever needed for a `mirrored` scope's grant reconciliation. The snapshot
+itself only needs `Sites.FullControl.All`/`Sites.Selected` (already required
+to read `.../permissions` at all) — it lists the group as a principal
+without expanding its membership, so an instance that captures snapshots on
+every scope but has never turned on `GroupMember.Read.All` sees every scope's
+principals just fine.
+
+Read a connection's captured snapshot with `agnes admin sharepoint
+acl-snapshot <id>` (`--scopes` for the per-scope principal list, `--json`
+for the raw shape) or `GET /api/admin/sharepoint/connections/{id}/
+acl-snapshot` — the source card's **SharePoint permissions** row shows the
+same connection-wide aggregate (distinct Entra groups, distinct site groups,
+how many scopes carry an organization-wide sharing link, how many name an
+individual person) with a **View** disclosure for the per-scope detail. A
+scope-managed collection's own page also shows a one-line "In SharePoint,
+this folder is visible to: …" note (admin only) when a snapshot exists for
+its scope. PG-only (A3 ratchet — `sharepoint_connection_state`): on a
+DuckDB-backed instance the sync still runs (grant mirroring is unaffected),
+it simply captures no snapshot, and the read routes answer a typed `501`.
+
 ## 3. Sanity-check the anonymization on YOUR documents
 
 Before any crawl: source card → ▸ **Settings & defaults** → **Effective

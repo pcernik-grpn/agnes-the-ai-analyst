@@ -155,3 +155,4 @@
 0106_hot_path_indexes
 0097_access_policy_revisions
 0107_merge_access_policy_revs
+0108_sp_acl_snapshot_kind

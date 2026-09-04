@@ -994,3 +994,379 @@ class TestSourceTableExclusionIsNarrow:
             table_name="ledger2",
             table_id="tbl_ledger2",
         )
+
+
+# ---------------------------------------------------------------------------
+# #2147 -- the SAME structured `policy_mapping_empty` refusal, on every OTHER
+# read surface that actually executes a policied relation (not just
+# `POST /api/query`): `GET /api/v2/sample`, `POST /api/v2/scan` (local-parquet
+# branch and its `--from-query` sibling), and `POST /api/mcp/query-table/{id}`.
+# One shared implementation (`app.api.access_policy_http.
+# assert_no_empty_policy_mapping`), so these can never drift from `/api/query`
+# on the reason code or the `last_sync` shape -- reuses `mapping_workspace`.
+# ---------------------------------------------------------------------------
+
+
+class TestSampleSurfaceGetsTheSameRefusal:
+    def test_empty_mapping_table_returns_structured_error(self, mapping_workspace):
+        c = mapping_workspace["client"]
+        r = c.get("/api/v2/sample/tbl_orders?n=5", headers=_auth(mapping_workspace["team_a_token"]))
+        assert r.status_code == 500, r.text
+        detail = r.json()["detail"]
+        assert detail["reason"] == "policy_mapping_empty"
+        assert detail["table"] == "tbl_orders"
+        assert detail["mapping_table"] == "user_access"
+        assert detail["last_sync"] is None
+
+    def test_populated_mapping_table_is_never_misreported_as_empty(self, mapping_workspace):
+        """`/api/v2/sample`'s local-parquet branch resolves its base table
+        as a throwaway `read_parquet(...)` in a fresh `:memory:` connection
+        with nothing ELSE attached, so it cannot execute a genuinely
+        cross-table `policy_mapping` JOIN at all -- a pre-existing,
+        documented limitation independent of this check (see
+        `tests/test_access_policy_table_id_surfaces.py`'s own note on the
+        same limitation). This pins the piece THIS check owns: a real,
+        POPULATED `policy_mapping` dependency (`tbl_invoices` -> `user_access2`,
+        the exact fixture `/api/query`'s own happy-path test uses) is never
+        misreported as empty by the shared helper every surface calls."""
+        from app.api.access_policy_http import assert_no_empty_policy_mapping
+        from src.repositories import table_registry_repo
+
+        row = table_registry_repo().get("tbl_invoices")
+        assert_no_empty_policy_mapping(table_id="tbl_invoices", row=row)  # must not raise
+
+    def test_admin_bypass_is_unaffected(self, mapping_workspace):
+        c = mapping_workspace["client"]
+        r = c.get("/api/v2/sample/tbl_orders?n=5", headers=_auth(mapping_workspace["admin_token"]))
+        assert r.status_code == 200, r.text
+        assert len(r.json()["rows"]) == 2
+
+
+class TestScanSurfaceGetsTheSameRefusal:
+    def test_synced_but_empty_mapping_table_returns_structured_error(self, mapping_workspace):
+        """`tbl_orders` (never-synced `user_access`) trips
+        `run_scan`'s own PRE-EXISTING schema resolution
+        (`_resolve_schema` -> `effective_schema`, which DESCRIBEs the
+        wrapped relation against the FULL analytics connection) before this
+        check even runs, since `user_access` never synced at all and so has
+        no view there either -- that surfaces as the pre-existing
+        `policy_error`, not this one. `tbl_returns` (`user_access3`, SYNCED
+        but zero rows) has a real view there, so schema resolution succeeds
+        and this check is what actually trips, inside the local-execution
+        branch -- the shape this test pins."""
+        c = mapping_workspace["client"]
+        r = c.post(
+            "/api/v2/scan",
+            json={"table_id": "tbl_returns"},
+            headers=_auth(mapping_workspace["team_a_token"]),
+        )
+        assert r.status_code == 500, r.text
+        detail = r.json()["detail"]
+        assert detail["reason"] == "policy_mapping_empty"
+        assert detail["table"] == "tbl_returns"
+        assert detail["mapping_table"] == "user_access3"
+        assert detail["last_sync"] is not None
+
+    def test_populated_mapping_table_is_never_misreported_as_empty(self, mapping_workspace):
+        """Same pre-existing cross-table-JOIN limitation as `/api/v2/sample`
+        (see that class's own note) -- pins that THIS check does not
+        misreport a real, populated dependency as empty."""
+        from app.api.access_policy_http import assert_no_empty_policy_mapping
+        from src.repositories import table_registry_repo
+
+        row = table_registry_repo().get("tbl_invoices")
+        assert_no_empty_policy_mapping(table_id="tbl_invoices", row=row)  # must not raise
+
+    def test_from_query_snapshot_gets_the_same_refusal(self, mapping_workspace):
+        """The `--from-query` snapshot-materialize path shares `/api/query`'s
+        own `rewrite_sql` AND its full analytics connection (unlike the
+        table_id-shaped branch above), so `tbl_orders`'s never-synced
+        `user_access` reaches this check directly, exactly like
+        `POST /api/query` itself (it did not, before #2147 -- see
+        `app.api.query.run_remote_select_to_arrow`)."""
+        c = mapping_workspace["client"]
+        r = c.post(
+            "/api/v2/scan",
+            json={"from_query": "SELECT * FROM orders"},
+            headers=_auth(mapping_workspace["team_a_token"]),
+        )
+        assert r.status_code == 500, r.text
+        detail = r.json()["detail"]
+        assert detail["reason"] == "policy_mapping_empty"
+        assert detail["mapping_table"] == "user_access"
+
+
+class TestMcpPerTableSurfaceGetsTheSameRefusal:
+    """`POST /api/mcp/query-table/{id}` resolves its analytics view by the
+    registry ``id`` directly (``view_name = table_id``, no name lookup) --
+    unlike `/api/query`, which resolves by name. `mapping_workspace`'s rows
+    deliberately have `id != name` (`tbl_invoices` / `invoices`), so this
+    needs its own small workspace where the two coincide -- but it DOES run
+    on the full analytics connection (like `/api/query`, unlike sample/scan's
+    throwaway single-parquet one), so a genuine cross-table `policy_mapping`
+    JOIN executes here and both the refusal AND the happy path are testable
+    end to end.
+    """
+
+    @pytest.fixture
+    def mcp_mapping_workspace(self, seeded_app, mock_extract_factory, monkeypatch):
+        from app.auth.jwt import create_access_token
+        from src.db import get_system_db
+        from src.orchestrator import SyncOrchestrator
+        from src.repositories.table_registry import TableRegistryRepository
+        from src.repositories.users import UserRepository
+        from tests.conftest import grant_table_via_package
+
+        monkeypatch.setenv("AGNES_ACCESS_POLICIES_ENABLED", "true")
+
+        env = seeded_app["env"]
+        mock_extract_factory(
+            "keboola",
+            [
+                {
+                    "name": "alerts_never",
+                    "data": [{"id": "1", "unit": "TeamA", "sev": "high"}, {"id": "2", "unit": "TeamB", "sev": "low"}],
+                },
+                {
+                    "name": "alerts_ok",
+                    "data": [{"id": "1", "unit": "TeamA", "sev": "high"}, {"id": "2", "unit": "TeamB", "sev": "low"}],
+                },
+                {"name": "access_mcp_ok", "data": [{"email": "mcp-a@example.com", "unit": "TeamA"}]},
+                # `access_mcp_never` is deliberately absent -- never synced.
+            ],
+        )
+        SyncOrchestrator(analytics_db_path=env["analytics_db"]).rebuild()
+
+        conn = get_system_db()
+        try:
+            registry = TableRegistryRepository(conn)
+
+            registry.register(
+                id="alerts_never", name="alerts_never", source_type="keboola", query_mode="local", server_only=True
+            )
+            registry.set_access_policy(
+                "alerts_never",
+                sql="SELECT * FROM alerts_never WHERE unit IN (SELECT unit FROM access_mcp_never WHERE email = $user_email)",
+                note="mapping filter",
+                updated_by="admin",
+            )
+            registry.register(
+                id="access_mcp_never", name="access_mcp_never", source_type="keboola", query_mode="local"
+            )
+            registry.set_policy_mapping("access_mcp_never", True)
+
+            registry.register(
+                id="alerts_ok", name="alerts_ok", source_type="keboola", query_mode="local", server_only=True
+            )
+            registry.set_access_policy(
+                "alerts_ok",
+                sql="SELECT * FROM alerts_ok WHERE unit IN (SELECT unit FROM access_mcp_ok WHERE email = $user_email)",
+                note="mapping filter",
+                updated_by="admin",
+            )
+            registry.register(id="access_mcp_ok", name="access_mcp_ok", source_type="keboola", query_mode="local")
+            registry.set_policy_mapping("access_mcp_ok", True)
+
+            users = UserRepository(conn)
+            users.create(id="u_mcp", email="mcp-a@example.com", name="MCP Team A")
+            grant_table_via_package(conn, "alerts_never", "u_mcp", group_name="TeamMcp")
+            grant_table_via_package(conn, "alerts_ok", "u_mcp", group_name="TeamMcp")
+        finally:
+            conn.close()
+
+        return {**seeded_app, "mcp_token": create_access_token("u_mcp", "mcp-a@example.com")}
+
+    def test_empty_mapping_table_returns_structured_error(self, mcp_mapping_workspace):
+        c = mcp_mapping_workspace["client"]
+        r = c.post(
+            "/api/mcp/query-table/alerts_never",
+            json={"filter": {}, "limit": 50},
+            headers=_auth(mcp_mapping_workspace["mcp_token"]),
+        )
+        assert r.status_code == 500, r.text
+        detail = r.json()["detail"]
+        assert detail["reason"] == "policy_mapping_empty"
+        assert detail["table"] == "alerts_never"
+        assert detail["mapping_table"] == "access_mcp_never"
+
+    def test_non_empty_mapping_table_returns_a_normal_result(self, mcp_mapping_workspace):
+        c = mcp_mapping_workspace["client"]
+        r = c.post(
+            "/api/mcp/query-table/alerts_ok",
+            json={"filter": {}, "limit": 50},
+            headers=_auth(mcp_mapping_workspace["mcp_token"]),
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["row_count"] == 1
+        assert body["row_scope"] is not None
+
+
+# ---------------------------------------------------------------------------
+# #2147 -- `GET /api/admin/registry`'s read-only `policy_mapping_status`
+# field: derived from the SAME per-mapping-table state
+# (`src.access_policy.policy_mapping_statuses`) the fail-closed checks above
+# use, so an admin scanning the registry list sees the identical diagnosis a
+# live read would trip.
+# ---------------------------------------------------------------------------
+
+
+class TestAdminRegistryMappingStatusField:
+    def _entry(self, tables, table_id):
+        return next(t for t in tables if t["id"] == table_id)
+
+    def test_never_synced_mapping_table(self, mapping_workspace):
+        c = mapping_workspace["client"]
+        r = c.get("/api/admin/registry", headers=_auth(mapping_workspace["admin_token"]))
+        assert r.status_code == 200, r.text
+        entry = self._entry(r.json()["tables"], "tbl_orders")
+        assert entry["policy_mapping_status"] == [
+            {"mapping_table": "user_access", "state": "never_synced", "last_sync": None}
+        ]
+
+    def test_synced_but_empty_mapping_table(self, mapping_workspace):
+        c = mapping_workspace["client"]
+        r = c.get("/api/admin/registry", headers=_auth(mapping_workspace["admin_token"]))
+        assert r.status_code == 200, r.text
+        entry = self._entry(r.json()["tables"], "tbl_returns")
+        statuses = entry["policy_mapping_status"]
+        assert len(statuses) == 1
+        assert statuses[0]["mapping_table"] == "user_access3"
+        assert statuses[0]["state"] == "empty"
+        assert statuses[0]["last_sync"] is not None
+
+    def test_mixed_case_reference_resolves_to_the_same_mapping_table(self, mapping_workspace):
+        c = mapping_workspace["client"]
+        r = c.get("/api/admin/registry", headers=_auth(mapping_workspace["admin_token"]))
+        assert r.status_code == 200, r.text
+        entry = self._entry(r.json()["tables"], "tbl_shipments")
+        statuses = entry["policy_mapping_status"]
+        assert len(statuses) == 1
+        assert statuses[0]["mapping_table"] == "user_access3"
+        assert statuses[0]["state"] == "empty"
+
+    def test_healthy_mapping_table(self, mapping_workspace):
+        c = mapping_workspace["client"]
+        r = c.get("/api/admin/registry", headers=_auth(mapping_workspace["admin_token"]))
+        assert r.status_code == 200, r.text
+        entry = self._entry(r.json()["tables"], "tbl_invoices")
+        assert entry["policy_mapping_status"] == [
+            {"mapping_table": "user_access2", "state": "ok", "last_sync": entry["policy_mapping_status"][0]["last_sync"]}
+        ]
+        assert entry["policy_mapping_status"][0]["last_sync"] is not None
+
+    def test_unpolicied_table_carries_no_field(self, mapping_workspace):
+        c = mapping_workspace["client"]
+        r = c.get("/api/admin/registry", headers=_auth(mapping_workspace["admin_token"]))
+        assert r.status_code == 200, r.text
+        entry = self._entry(r.json()["tables"], "tbl_products")
+        assert "policy_mapping_status" not in entry
+
+    def test_self_referencing_policied_table_has_an_empty_status_list(self, mapping_workspace):
+        """`ledger` is policied AND `policy_mapping=true`, but its own policy
+        body only references itself -- the field is present (it IS policied)
+        but empty (it has no OTHER mapping dependency)."""
+        c = mapping_workspace["client"]
+        r = c.get("/api/admin/registry", headers=_auth(mapping_workspace["admin_token"]))
+        assert r.status_code == 200, r.text
+        entry = self._entry(r.json()["tables"], "ledger")
+        assert entry["policy_mapping_status"] == []
+
+
+class TestPolicyMappingStatusesUnit:
+    """Unit tests directly on `src.access_policy.policy_mapping_statuses` --
+    the ONE implementation every surface (including the registry list above)
+    derives its diagnosis from."""
+
+    def test_remote_mapping_table_is_remote_unknown(self, e2e_env):
+        from src.access_policy import policy_mapping_statuses
+        from src.db import get_system_db
+        from src.repositories.sync_state import SyncStateRepository
+        from src.repositories.table_registry import TableRegistryRepository
+
+        conn = get_system_db()
+        try:
+            registry = TableRegistryRepository(conn)
+            registry.register(
+                id="remote_map2",
+                name="remote_map2",
+                source_type="bigquery",
+                query_mode="remote",
+                bucket="ds",
+                source_table="m",
+            )
+            registry.set_policy_mapping("remote_map2", True)
+            SyncStateRepository(conn).update_sync("remote_map2", rows=0, file_size_bytes=0, hash="")
+        finally:
+            conn.close()
+
+        statuses = policy_mapping_statuses(
+            "SELECT * FROM orders WHERE unit IN (SELECT unit FROM remote_map2 WHERE email = $user_email)"
+        )
+        assert statuses == [{"mapping_table": "remote_map2", "state": "remote_unknown", "last_sync": None}]
+
+    def test_never_synced_is_case_insensitive(self, e2e_env):
+        from src.access_policy import policy_mapping_statuses
+        from src.db import get_system_db
+        from src.repositories.table_registry import TableRegistryRepository
+
+        conn = get_system_db()
+        try:
+            registry = TableRegistryRepository(conn)
+            registry.register(id="cost_centres", name="cost_centres", source_type="keboola", query_mode="local")
+            registry.set_policy_mapping("cost_centres", True)
+        finally:
+            conn.close()
+
+        statuses = policy_mapping_statuses(
+            "SELECT * FROM orders WHERE unit IN (SELECT unit FROM Cost_Centres WHERE email = $user_email)"
+        )
+        assert statuses == [{"mapping_table": "cost_centres", "state": "never_synced", "last_sync": None}]
+
+    def test_no_dependency_returns_empty_list(self, e2e_env):
+        from src.access_policy import policy_mapping_statuses
+
+        assert policy_mapping_statuses("SELECT * FROM orders WHERE owner = $user_email") == []
+
+    def test_self_reference_is_excluded(self, e2e_env):
+        from src.access_policy import policy_mapping_statuses
+        from src.db import get_system_db
+        from src.repositories.table_registry import TableRegistryRepository
+
+        conn = get_system_db()
+        try:
+            registry = TableRegistryRepository(conn)
+            registry.register(id="ledger9", name="ledger9", source_type="keboola", query_mode="local")
+            registry.set_policy_mapping("ledger9", True)
+        finally:
+            conn.close()
+
+        assert (
+            policy_mapping_statuses("SELECT * FROM ledger9 WHERE owner = $user_email", table_name="ledger9") == []
+        )
+
+    def test_count_unavailable_reads_as_ok_not_empty(self, e2e_env):
+        from src.access_policy import policy_mapping_statuses
+        from src.db import get_system_db
+        from src.repositories.sync_state import SyncStateRepository
+        from src.repositories.table_registry import TableRegistryRepository
+
+        conn = get_system_db()
+        try:
+            registry = TableRegistryRepository(conn)
+            registry.register(id="uncounted_map2", name="uncounted_map2", source_type="keboola", query_mode="local")
+            registry.set_policy_mapping("uncounted_map2", True)
+            state_repo = SyncStateRepository(conn)
+            state_repo.update_sync("uncounted_map2", rows=0, file_size_bytes=10, hash="abc")
+            state_repo.set_error(
+                "uncounted_map2",
+                "Row count unavailable for table 'uncounted_map2' in source 'x' -- the published rows=0 is NOT a "
+                "verified empty table. See #1364.",
+            )
+        finally:
+            conn.close()
+
+        statuses = policy_mapping_statuses(
+            "SELECT * FROM orders WHERE unit IN (SELECT unit FROM uncounted_map2 WHERE email = $user_email)"
+        )
+        assert statuses[0]["state"] == "ok"
