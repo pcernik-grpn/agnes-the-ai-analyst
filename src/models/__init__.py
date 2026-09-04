@@ -9,6 +9,7 @@ from ``src.db_pg`` and adds it to the ``__all__`` re-export below.
 
 from __future__ import annotations
 
+from src.models.access_policy_revisions import AccessPolicyRevision
 from src.models.agents import (
     Agent,
     AgentArtifact,
@@ -112,6 +113,7 @@ from src.models.user_journey import UserJourneyState
 from src.models.vault import SystemSecret
 
 __all__ = [
+    "AccessPolicyRevision",
     "Agent",
     "AgentArtifact",
     "AgentMemory",

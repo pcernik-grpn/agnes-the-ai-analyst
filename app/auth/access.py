@@ -560,6 +560,57 @@ def require_admin(
     return user
 
 
+def require_admin_all_surface(
+    user=Depends(get_current_user),
+    conn: duckdb.DuckDBPyConnection = Depends(_get_db),
+):
+    """Like :func:`require_admin`, but ALSO requires the credential's
+    data-read surface to be ``'all'`` (v106) -- for a route whose "admin"
+    gate is the ONLY authorization check between the caller and raw,
+    unfiltered, unpolicied data: no per-table grant check, no access-policy
+    rewrite, no direct-path guardrail of its own.
+
+    ``agnes init`` / ``agnes login`` mint ``surface='stack'`` PATs by
+    default (``app/api/cli_auth.py``) -- deliberately filtered like an
+    ordinary analyst everywhere else in Agnes
+    (``docs/table-access-policies.md``, "The admin bypass"). A route gated
+    by plain ``require_admin`` alone hands that PAT full admin god-mode
+    anyway, which is exactly wrong for a route with no table-level RBAC or
+    policy rewrite standing behind it -- see ``POST /api/query/hybrid``
+    (finding K2, RLS review #1979). Every OTHER place this codebase decides
+    whether the admin bypass applies runs the identical
+    ``is_user_admin(...) and _credential_surface(user) == 'all'`` check --
+    ``src/rbac.py``'s ``can_access_table`` / ``get_accessible_tables``, and
+    ``app/api/query.py``'s ``_caller_is_unrestricted_admin`` (guarding a
+    direct ``bq.``/``sf.``/``kbc.`` path reference). This dependency is
+    that same, established predicate, mirrored for a route gated purely on
+    ``require_admin`` with no table-grain resolver underneath it to key
+    off instead -- not a new mechanism.
+
+    Distinct 403 detail from ``require_admin``'s own, so a client can tell
+    "you are not an admin" apart from "you ARE an admin, but this
+    credential's surface is too narrow for this endpoint" -- the fix for
+    the second is a fresh ``surface='all'`` PAT (``agnes init --as-admin``
+    / ``POST /cli/auth/rescope-surface``) or a browser session, not an
+    admin-group change.
+    """
+    user = require_admin(user=user, conn=conn)
+    from src.rbac import _credential_surface
+
+    if _credential_surface(user) != "all":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "This endpoint requires an admin credential with the full "
+                "('all') data-read surface — a surface='stack' PAT (the "
+                "`agnes init` default) is filtered like an analyst here. "
+                "Use a browser session, a regular PAT, or "
+                "`agnes init --as-admin`."
+            ),
+        )
+    return user
+
+
 def require_agent_profiles_enabled() -> None:
     """Dependency: 403 the whole request when the instance-level Agent
     profiles toggle is off.
