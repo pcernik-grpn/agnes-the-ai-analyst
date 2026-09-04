@@ -41316,6 +41316,53 @@
         ]
       }
     },
+    "/api/broker/otlp/v1/{signal}": {
+      "post": {
+        "description": "Forward one OTLP/HTTP export batch from the engine's sandbox to the\ninstance's collector, credential injected server-side.\n\nAccepts ONLY the ``kai_otlp`` scope \u2014 the ticket ``/api/kai/tickets`` mints\nfor the relay's ``otlp`` scope, and only while this instance exports OTLP\nitself (``OTEL_EXPORTER_OTLP_ENDPOINT``); an ``llm``/``main`` ticket is\nrefused with the usual scope-mismatch audit. Without a configured\ncollector the route answers ``503 otlp_export_not_configured`` so a\nmisordered rollout (engine env set before the export) fails loudly per\nbatch instead of silently swallowing telemetry \u2014 the turn itself is\nunaffected, the SDK's exporter just logs the refusal.\n\nThe body is the SDK's protobuf batch, forwarded byte-for-byte with its\nwire-format and compression headers; the collector's 2xx body comes back\nas-is (the OTLP success response), its error text never does \u2014 the status\n(and ``Retry-After``, which the exporter's retry honours) is enough.",
+        "operationId": "otlp_proxy_api_broker_otlp_v1__signal__post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "signal",
+            "required": true,
+            "schema": {
+              "title": "Signal",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Otlp Proxy",
+        "tags": [
+          "broker"
+        ]
+      }
+    },
     "/api/catalog/metrics/{metric_path}": {
       "get": {
         "deprecated": true,

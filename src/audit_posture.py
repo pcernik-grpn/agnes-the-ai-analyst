@@ -356,6 +356,7 @@ POSTURE: dict[str, str] = {
     "POST /api/broker/anthropic/{subpath:path}": "broker_llm_auth_failure",
     "POST /api/broker/data-apps": "broker_admin_route_rejected",
     "POST /api/broker/data-apps.git/{slug}/{path:path}": "broker_data_apps_git_rejected",
+    "POST /api/broker/otlp/v1/{signal}": "broker_ticket_scope_mismatch",
     # -- app.api.cache_warmup --------------------------------------------------
     "POST /api/admin/cache-warmup/run": "cache_warmup.run",
     # -- app.api.catalog -------------------------------------------------------
