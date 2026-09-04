@@ -2,10 +2,12 @@
 
 Wrap the synchronous provider call in :func:`trace_generation`; on exit it
 emits a single ``llm_generation`` record carrying provider, model, token
-counts, latency and whether the call failed. There is no second sink and no
-vendor account: the record goes to the logger every deployment already has,
-and ``app/logging_config.py``'s JSON formatter promotes the fields so they
-stay filterable.
+counts, latency and whether the call failed. The record goes to the logger
+every deployment already has, and ``app/logging_config.py``'s JSON formatter
+promotes the fields so they stay filterable. When the opt-in OTLP export is
+on (``src/observability/otel.py``) the same numbers also close a span, so
+server-side generations and brokered chat completions land in one trace
+table.
 
 Prompts and completions are deliberately not recorded — in this product they
 routinely carry customer data, and a log pipeline is the wrong place to hold
@@ -32,6 +34,8 @@ import logging
 import time
 from contextlib import contextmanager
 from typing import Any, Iterator
+
+from src.observability import otel as _otel
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +111,7 @@ def trace_generation(
     capture = _Capture()
     started = time.monotonic()
     error_type: str | None = None
+    span = _otel.start_generation_span(provider=provider, model=model)
     try:
         yield capture
     except BaseException as exc:
@@ -133,3 +138,12 @@ def trace_generation(
             logger.info("llm generation", extra=fields)
         except Exception:  # noqa: BLE001 - instrumentation never fails the call
             logger.debug("llm tracing: could not emit the generation record", exc_info=True)
+        _otel.end_generation_span(
+            span,
+            input_tokens=capture.input_tokens,
+            output_tokens=capture.output_tokens,
+            prompt_chars=capture.prompt_chars,
+            completion_chars=capture.completion_chars,
+            error_type=error_type,
+            user_id=distinct_id,
+        )

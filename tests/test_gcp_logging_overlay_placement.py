@@ -146,11 +146,43 @@ def test_main_tf_grants_log_writer_to_the_vm_sa_gated_on_the_flag():
     assert re.search(r"project\s*=\s*var\.gcp_project_id", block)
 
 
+def test_main_tf_grants_metric_writer_for_the_self_metrics_that_cannot_be_off():
+    body = (MODULE / "main.tf").read_text()
+    m = re.search(
+        r'resource\s+"google_project_iam_member"\s+"vm_metric_writer"\s*\{([^}]*)\}',
+        body,
+        re.DOTALL,
+    )
+    assert m, (
+        "main.tf must declare google_project_iam_member.vm_metric_writer — the "
+        "Ops Agent's OpenTelemetry sub-agent exports its own free "
+        "agent.googleapis.com/agent/* self-metrics whatever the config says, "
+        "and without roles/monitoring.metricWriter every export cycle fails "
+        "and floods the serial console with monitoring.timeSeries.create "
+        "PermissionDenied"
+    )
+    block = m.group(1)
+    assert "roles/monitoring.metricWriter" in block
+    assert "google_service_account.vm.email" in block, (
+        "the binding must target the dedicated VM SA the compute instance "
+        "actually runs as (service_account block in main.tf)"
+    )
+    assert re.search(r"count\s*=\s*var\.enable_gcp_logging\s*\?\s*1\s*:\s*0", block), (
+        "the binding must be gated on the same variable that installs the agent"
+    )
+    assert re.search(r"project\s*=\s*var\.gcp_project_id", block)
+
+
 def test_variables_tf_documents_the_iam_requirement():
     body = (MODULE / "variables.tf").read_text()
     m = re.search(r'variable\s+"enable_gcp_logging"\s*\{([^}]*)\}', body, re.DOTALL)
     assert m
     block = m.group(1)
+    assert "monitoring.metricWriter" in block, (
+        "enable_gcp_logging's description must state that the module also "
+        "grants the metric role — an operator granting IAM out-of-band needs "
+        "to know it is two roles, not one"
+    )
     assert "logging.logWriter" in block, (
         "enable_gcp_logging's description must state the IAM role the driver "
         "needs (and that the module grants it) — the missing-role failure "

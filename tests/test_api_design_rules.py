@@ -412,15 +412,23 @@ def test_admin_mutating_endpoints_all_require_admin():
     it without explicit security sign-off.
     """
     from fastapi.routing import APIRoute
-    from app.auth.access import require_admin
+    from app.auth.access import require_admin, require_admin_all_surface
     from app.main import create_app
 
     app = create_app()
 
+    # `require_admin_all_surface` is the STRICTER sibling (admin AND a
+    # full-surface credential -- a `surface='stack'` admin PAT is refused);
+    # a route carrying it is at least as gated as one carrying
+    # `require_admin`, so it satisfies this rule (#1979, security review:
+    # the access-policy previews moved to it because they return raw,
+    # unpolicied rows).
+    _ADMIN_GATES = (require_admin, require_admin_all_surface)
+
     def _has_require_admin(dependant) -> bool:
-        """Recursively walk the FastAPI dependant tree for require_admin."""
+        """Recursively walk the FastAPI dependant tree for an admin gate."""
         for sub in dependant.dependencies:
-            if sub.call is require_admin:
+            if sub.call in _ADMIN_GATES:
                 return True
             if _has_require_admin(sub):
                 return True

@@ -23,12 +23,12 @@ Two real-world incidents drove this split:
 """
 
 from __future__ import annotations
+
 from unittest.mock import MagicMock
 
 import pytest
 
 from app.api.admin import _build_keboola_discovery_plan, _split_keboola_table_id
-
 
 # ---- _split_keboola_table_id (id parser fallback) --------------------------
 
@@ -320,6 +320,67 @@ class TestPlanRefusesAPoliciedTablesPhysicalSourceTwin:
                 "bucket": "in.c-finance",
                 "source_table": "invoices",
                 "query_mode": "local",
+            },
+        }
+        discovered = [
+            {"id": "in.c-finance.invoices", "name": "invoices", "bucket_id": "in.c-finance"},
+        ]
+
+        plan = _build_keboola_discovery_plan(MagicMock(), discovered)
+
+        assert [e["table_id"] for e in plan["new"]] == ["in_c-finance_invoices"]
+        assert plan["invalid"] == []
+
+    def test_a_twin_of_a_connection_pinned_policied_row_is_classified_invalid_not_new(self, stub_table_registry):
+        """S5 wildcard gap (issue #1979, mirrors
+        ``tests/test_journey_access_policy_interlock.py::
+        TestUnpinnedConnectionIdIsWildcard``): the policied row is PINNED to
+        a real ``connection_id``, and Keboola discovery never produces one
+        (single-connection by construction) — a discovered entry's
+        ``bucket_table`` signal is always the unpinned/wildcard shape, so it
+        does not literally equal the pinned signal. Before the
+        ``policied_by_bucket_table`` fallback, this sailed past the
+        exact-signal lookup and the twin landed in ``new``."""
+        stub_table_registry["rows"] = {
+            "finance_invoices_governed": {
+                "name": "invoices_governed",
+                "bucket": "in.c-finance",
+                "source_table": "invoices",
+                "query_mode": "local",
+                "server_only": True,
+                "access_policy_sql": "SELECT * FROM invoices_governed",
+                "connection_id": "conn-a",
+            },
+        }
+        discovered = [
+            {"id": "in.c-finance.invoices", "name": "invoices", "bucket_id": "in.c-finance"},
+            {"id": "in.c-finance.products", "name": "products", "bucket_id": "in.c-finance"},
+        ]
+
+        plan = _build_keboola_discovery_plan(MagicMock(), discovered)
+
+        assert [e["table_id"] for e in plan["new"]] == ["in_c-finance_products"], (
+            "the pinned policied table's physical-source twin must never reach the writer's `new` bucket"
+        )
+        assert len(plan["invalid"]) == 1
+        offender = plan["invalid"][0]
+        assert offender["table_id"] == "in_c-finance_invoices"
+        assert "access_policy_physical_source_conflict" in offender["reason"]
+        assert "finance_invoices_governed" in offender["reason"]
+
+    def test_a_connection_pinned_unpolicied_row_does_not_block_discovery(self, stub_table_registry):
+        """Negative twin of the test above: pinning ``connection_id`` on a
+        row that carries NO policy must not, by itself, start blocking
+        discovery — the conflict is about a POLICY being routed around, same
+        as ``test_an_unpolicied_registry_row_does_not_block_discovery``
+        above, just with a pinned connection this time."""
+        stub_table_registry["rows"] = {
+            "finance_invoices_copy": {
+                "name": "invoices_copy",
+                "bucket": "in.c-finance",
+                "source_table": "invoices",
+                "query_mode": "local",
+                "connection_id": "conn-a",
             },
         }
         discovered = [
