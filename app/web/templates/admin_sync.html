@@ -187,10 +187,19 @@ let allRows = [];
 let filterText = "";
 let pollInterval = null;
 
+/* Escapes both quote forms, not only `&`, `<`, `>`. The `textContent` ->
+   `innerHTML` round-trip this replaced covers what a TEXT node needs, and
+   this page interpolates into quoted ATTRIBUTES too, where a bare `"` closes
+   the value early and everything after it parses as further attributes — so
+   `" onmouseover="…` injects a live handler with no `<` involved, and the
+   dashboard CSP does not block inline handlers. Text positions are unharmed:
+   the browser renders the entities back. One helper correct in both contexts
+   rather than two an author has to choose between; `tests/
+   test_admin_attribute_escaping.py` holds every page to it. */
 function esc(s) {
-  const d = document.createElement("div");
-  d.textContent = s == null ? "" : String(s);
-  return d.innerHTML;
+  return String(s == null ? "" : s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
 
 function toast(msg, kind = "") {

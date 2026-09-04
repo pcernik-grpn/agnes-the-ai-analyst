@@ -13,10 +13,13 @@
   'use strict';
 
   function esc(s) {
-    const d = document.createElement('div');
-    d.textContent = s == null ? '' : String(s);
-    return d.innerHTML;
-  }
+  /* Both quote forms, not only &, < and >: this helper may reach a
+     quoted ATTRIBUTE, where a bare `"` is an attribute break-out. Text
+     positions are unharmed — the browser renders the entities back. */
+  return String(s == null ? "" : s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
 
   /* The glyph set moved to js/kind_glyph.js — the copy that lived here had
      fallen six kinds behind the `kind_glyph()` macro it was supposed to be in
