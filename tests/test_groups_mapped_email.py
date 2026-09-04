@@ -19,6 +19,7 @@ import uuid
 
 import pytest
 from fastapi.testclient import TestClient
+from tests.helpers.access_page import access_js
 
 
 @pytest.fixture
@@ -76,7 +77,18 @@ def test_admin_row_origin_is_google_sync_when_env_mapped(fresh_db, monkeypatch):
     assert admin["is_google_managed"] is True
 
 
-def test_everyone_row_origin_is_google_sync_when_env_mapped(fresh_db, monkeypatch):
+def test_everyone_row_stays_a_plain_system_row_with_the_legacy_env_set(fresh_db, monkeypatch):
+    """The seeded ``Everyone`` row no longer wears a Workspace address.
+
+    It reported ``origin='google_sync'`` and the configured
+    ``mapped_email`` while ``AGNES_GROUP_EVERYONE_EMAIL`` was set, because
+    the row genuinely WAS that Workspace group's membership — which is what
+    made "everyone" a subset. 0098 gave the Workspace group a group of its
+    own (whose ``name`` IS the email, so it needs no ``mapped_email``), and
+    ``Everyone`` went back to being an ordinary system row meaning every
+    account. ``AGNES_GROUP_ADMIN_EMAIL`` is untouched — ``Admin`` is a
+    capability, not an audience, and mapping it narrows nothing.
+    """
     monkeypatch.setenv("AGNES_GROUP_EVERYONE_EMAIL", "everyone@workspace.test")
     from app.main import app
 
@@ -85,9 +97,9 @@ def test_everyone_row_origin_is_google_sync_when_env_mapped(fresh_db, monkeypatc
     groups = _groups_by_name(client, token)
     everyone = groups["Everyone"]
 
-    assert everyone["origin"] == "google_sync"
-    assert everyone["mapped_email"] == "everyone@workspace.test"
-    assert everyone["is_google_managed"] is True
+    assert everyone["origin"] == "system"
+    assert everyone["mapped_email"] is None
+    assert everyone["is_google_managed"] is False
 
 
 def test_admin_row_is_plain_system_without_env_mapping(fresh_db):
@@ -175,7 +187,10 @@ def test_admin_groups_template_uses_mapped_email_in_subtitle(fresh_db):
         cookies={"access_token": token},
     )
     assert resp.status_code == 200
-    body = resp.text
+    # The page's script is a static module now, so the strings these
+    # assertions are about are served from `admin_access.js` rather than
+    # inlined in the response. Both halves, as before the extraction.
+    body = f"{resp.text}\n{access_js()}"
     assert "mapped_email" in body
     # The three-way naming rule itself, not just the field read.
     assert "function titleOf" in body and "function subtitleOf" in body
@@ -228,7 +243,10 @@ def test_admin_groups_template_renders_origin_pill_and_mapped_email(fresh_db, mo
         cookies={"access_token": token},
     )
     assert resp.status_code == 200, resp.text
-    body = resp.text
+    # The page's script is a static module now, so the strings these
+    # assertions are about are served from `admin_access.js` rather than
+    # inlined in the response. Both halves, as before the extraction.
+    body = f"{resp.text}\n{access_js()}"
     # JS reads these fields per group when rendering each row.
     assert "g.origin" in body
     assert "g.mapped_email" in body
@@ -502,7 +520,7 @@ def test_my_effective_access_lists_explicit_grants_for_admin_user(fresh_db):
     rationale as the admin-side endpoint: audit the grant graph, not the
     runtime god-mode."""
     from app.main import app
-    from src.db import SYSTEM_ADMIN_GROUP, get_system_db
+    from src.db import get_system_db
     from src.repositories.resource_grants import ResourceGrantsRepository
     from src.repositories.user_group_members import UserGroupMembersRepository
     from src.repositories.user_groups import UserGroupsRepository
@@ -712,7 +730,10 @@ def test_admin_group_detail_template_uses_mapped_email_subtitle(fresh_db, monkey
         cookies={"access_token": token},
     )
     assert resp.status_code == 200, resp.text
-    body = resp.text
+    # The page's script is a static module now, so the strings these
+    # assertions are about are served from `admin_access.js` rather than
+    # inlined in the response. Both halves, as before the extraction.
+    body = f"{resp.text}\n{access_js()}"
     # The header renders the canonical name with the Workspace email beneath
     # it (`.ax-idsub`), fed by `subtitleOf()` off the overview payload.
     assert 'id="ax-what-idsub"' in body

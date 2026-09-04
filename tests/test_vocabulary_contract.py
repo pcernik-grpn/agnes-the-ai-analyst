@@ -28,11 +28,13 @@ from app.web import vocabulary
 TEMPLATES = Path(__file__).resolve().parents[1] / "app" / "web" / "templates"
 
 #: Sites that legitimately keep an old word in text a person can read.
-ALLOWED = {
-    # The Access page still ANSWERS to ?by=bundle so shared links survive; the
-    # normalizer names the old value in order to translate it.
-    ("admin_access.html", "bundle"),
-}
+#: Empty, and that is the correct state: the one entry it held — the Access
+#: page's `?by=bundle` normalizer — names the retired value only inside a
+#: comment and a wire literal, both of which `_renderable_text` already
+#: removes. It was dead before the script moved out of the template and
+#: pointed at a file the text had left; a guard whose exceptions do not
+#: match reality is how a real finding gets waved through as known.
+ALLOWED: set[tuple[str, str]] = set()
 
 
 def _renderable_text(src: str) -> str:
@@ -68,8 +70,19 @@ def _renderable_text(src: str) -> str:
     return src
 
 
+#: Page behaviour that lives in a static module rather than in a `<script>`
+#: inside its template. The Access page's script was 4,500 lines of this file's
+#: subject matter until it was extracted; scanning only `templates/` would have
+#: silently dropped every retired phrase in it on the day it moved. A page that
+#: extracts its script belongs here — this is not the whole static tree, which
+#: has never been in scope and would need its own pass.
+PAGE_SCRIPTS = [
+    Path(__file__).resolve().parents[1] / "app" / "web" / "static" / "js" / "admin_access.js",
+]
+
+
 def _templates():
-    return sorted(TEMPLATES.rglob("*.html"))
+    return sorted(TEMPLATES.rglob("*.html")) + PAGE_SCRIPTS
 
 
 @pytest.mark.parametrize("phrase", vocabulary.RETIRED)
@@ -84,7 +97,7 @@ def test_no_template_renders_a_retired_phrase(phrase):
                 (i for i, ln in enumerate(text.splitlines(), 1) if phrase.lower() in ln.lower()),
                 0,
             )
-            offenders.append(f"{path.relative_to(TEMPLATES)}:{line}")
+            offenders.append(f"{path.name}:{line}")
     assert not offenders, (
         f'"{phrase}" is retired but still renders in: {", ".join(offenders)}. '
         f"Use app.web.vocabulary (exposed to templates as `words`) instead of a new literal."

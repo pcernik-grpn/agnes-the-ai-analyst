@@ -1578,6 +1578,78 @@ def grant_list(
     )
 
 
+@grant_app.command("everyone")
+def grant_everyone(
+    resource_type: str = typer.Argument(..., help="Resource type (e.g. marketplace_plugin)"),
+    resource_id: str = typer.Argument(..., help="Resource path (e.g. foundry-ai/metrics-plugin)"),
+    requirement: str = typer.Option(
+        "available",
+        "--requirement",
+        help="'available' (each person opts in) or 'required' (in every stack, not removable)",
+    ),
+):
+    """Give a resource to EVERY account on the instance.
+
+    A separate verb from ``create`` because the audience is not a group and
+    never was one. It used to be spelled as a grant on the seeded
+    ``Everyone`` group, which normally held every account but was mirrored
+    from a Workspace group on any instance that set
+    ``AGNES_GROUP_EVERYONE_EMAIL`` — so the same command reached a subset
+    there. A scope always means every account, including one that belongs to
+    no group at all.
+
+    \b
+        agnes admin grant everyone chat chat
+        agnes admin grant everyone marketplace_plugin agnes-builtin/agnes-analyst --requirement required
+
+    Not offered for the four types where "everyone" is not a coherent
+    audience (``slack_channel``, ``table``, ``memory_domain``,
+    ``memory_item``); the server answers 422 and says which.
+
+    Postgres only, like the column behind it. A DuckDB instance stores it as
+    an ordinary grant on the seeded group — which reaches the same people,
+    since every account is auto-joined to it at creation.
+    """
+    if requirement not in ("available", "required"):
+        typer.echo(
+            f"--requirement must be 'available' or 'required', got {requirement!r}",
+            err=True,
+        )
+        raise typer.Exit(2)
+    # `group_id` is required by the endpoint (the column is NOT NULL) and
+    # then OVERRIDDEN by it: every everyone-scoped row shares one carrier, so
+    # whatever is sent here is discarded. Send the seeded group's id anyway
+    # rather than a placeholder, so a server that has not yet been upgraded
+    # writes a grant on the group — the same reach, one release earlier.
+    gid = _resolve_group_id("Everyone")
+    resp = api_post(
+        "/api/admin/grants",
+        json={
+            "group_id": gid,
+            "resource_type": resource_type,
+            "resource_id": resource_id,
+            "requirement": requirement,
+            "scope": "everyone",
+        },
+    )
+    if resp.status_code == 409:
+        typer.echo(f"Everyone already has {resource_type}/{resource_id}")
+        return
+    if resp.status_code != 201:
+        _fail(resp)
+    body = resp.json()
+    if body.get("scope") != "everyone":
+        # The frozen DuckDB ladder has no `scope` column, so say what
+        # actually landed instead of implying a scope was stored.
+        typer.echo(
+            f"Granted {resource_type}/{resource_id} to everyone via the "
+            f"Everyone group (requirement={requirement}) — this instance's "
+            f"app-state backend does not store grant scopes."
+        )
+        return
+    typer.echo(f"Granted {resource_type}/{resource_id} to everyone (requirement={requirement})")
+
+
 @grant_app.command("create")
 def grant_create(
     group_ref: str = typer.Argument(..., help="Group id or name"),

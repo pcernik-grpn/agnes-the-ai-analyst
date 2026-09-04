@@ -3259,6 +3259,17 @@
           "resource_type": {
             "title": "Resource Type",
             "type": "string"
+          },
+          "scope": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Scope"
           }
         },
         "required": [
@@ -4184,11 +4195,6 @@
           "is_required": {
             "default": false,
             "title": "Is Required",
-            "type": "boolean"
-          },
-          "is_system": {
-            "default": false,
-            "title": "Is System",
             "type": "boolean"
           },
           "manifest_name": {
@@ -5632,6 +5638,17 @@
           "resource_type": {
             "title": "Resource Type",
             "type": "string"
+          },
+          "scope": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Scope"
           }
         },
         "required": [
@@ -6869,11 +6886,6 @@
           "is_required": {
             "default": false,
             "title": "Is Required",
-            "type": "boolean"
-          },
-          "is_system": {
-            "default": false,
-            "title": "Is System",
             "type": "boolean"
           },
           "is_viewer_owner": {
@@ -8561,11 +8573,6 @@
             "title": "Is Required",
             "type": "boolean"
           },
-          "is_system": {
-            "default": false,
-            "title": "Is System",
-            "type": "boolean"
-          },
           "manifest_name": {
             "title": "Manifest Name",
             "type": "string"
@@ -8828,11 +8835,6 @@
               }
             ],
             "title": "Homepage"
-          },
-          "is_system": {
-            "default": false,
-            "title": "Is System",
-            "type": "boolean"
           },
           "name": {
             "title": "Name",
@@ -10988,7 +10990,7 @@
       "SetSharesRequest": {
         "properties": {
           "group_ids": {
-            "description": "Desired end state: the groups this item should be shared with. Empty = private.",
+            "description": "Desired end state: the audiences this item should be shared with. Group ids, plus the literal \"everyone\" for the whole workspace. Empty = private.",
             "items": {
               "type": "string"
             },
@@ -11980,40 +11982,6 @@
           "datasets"
         ],
         "title": "SyncSettingsUpdate",
-        "type": "object"
-      },
-      "SystemFlagResponse": {
-        "description": "Return shape of the mark/unmark_system endpoints.",
-        "properties": {
-          "affected_groups": {
-            "default": 0,
-            "title": "Affected Groups",
-            "type": "integer"
-          },
-          "affected_users": {
-            "default": 0,
-            "title": "Affected Users",
-            "type": "integer"
-          },
-          "is_system": {
-            "title": "Is System",
-            "type": "boolean"
-          },
-          "marketplace_id": {
-            "title": "Marketplace Id",
-            "type": "string"
-          },
-          "plugin_name": {
-            "title": "Plugin Name",
-            "type": "string"
-          }
-        },
-        "required": [
-          "marketplace_id",
-          "plugin_name",
-          "is_system"
-        ],
-        "title": "SystemFlagResponse",
         "type": "object"
       },
       "TableAccessDiagnosis": {
@@ -22277,6 +22245,145 @@
           }
         },
         "summary": "Create Group",
+        "tags": [
+          "access"
+        ]
+      }
+    },
+    "/api/admin/groups/member-search": {
+      "get": {
+        "description": "Which groups hold a person matching ``q`` \u2014 the group list's third question.\n\nThe Access page's search box has always promised people (its placeholder\nsays so), and it answered by matching the typed text against every\ngroup's member roster in the browser \u2014 which is why every group's full\n``member_ids`` travelled in the overview payload (audit S2). The payload\ngrew with headcount, every admin session distributed the org chart to do\none lookup, and the roster was capped at 500 so the answer was quietly\nwrong on a larger instance.\n\nAnswered here instead, where the memberships are: the same case-insensitive\nemail-or-name match ``/api/users?search=`` makes, then each match's groups.\nPer group, up to three matched people come back by name so the row can\nsay WHO matched (\"matched Ada Lovelace, Grace Hopper\"), which is the part\nof the answer an admin actually reads. ``matched_people`` is the total so\nthe Everyone audience \u2014 every live account by construction \u2014 can be\nreported as a hit whenever anyone matched at all.\n\n``q`` is required and at least two characters, the same floor the page\napplied client-side; a one-letter search matches half the instance and\nsays nothing. Declared before ``/groups/{group_id}`` so the literal\nsegment is not captured as a group id.",
+        "operationId": "groups_member_search_api_admin_groups_member_search_get",
+        "parameters": [
+          {
+            "description": "Email or name fragment, case-insensitive",
+            "in": "query",
+            "name": "q",
+            "required": true,
+            "schema": {
+              "description": "Email or name fragment, case-insensitive",
+              "minLength": 2,
+              "title": "Q",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Groups Member Search Api Admin Groups Member Search Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Groups Member Search",
+        "tags": [
+          "access"
+        ]
+      }
+    },
+    "/api/admin/groups/reach": {
+      "get": {
+        "description": "How many distinct people a set of audiences reaches.\n\nThe Access page prints this number at the moment an admin decides to\nshare \u2014 \"3 groups \u00b7 41 people\" beside Apply \u2014 and it used to compute it\nin the browser by unioning each group's member ids, which meant every\ngroup's full roster travelled in the overview payload to support one\narithmetic operation (audit findings E3 and S2). A group whose roster the\npayload did not carry fell back to its own count, double-counting anyone\nin two such groups, and the result was then clamped to the account total\nto hide the overshoot. A figure precise enough to be trusted and not\nalways right, on the screen where reach is being decided.\n\nComputed here instead, where the memberships are. ``everyone`` \u2014 the\nscope sentinel, not a group \u2014 short-circuits to the people total: it is\nevery account a person signs in as, by construction, so no union can\nexceed it and none is needed. Ordinary groups union their distinct member\nids, counting the same population. The answer is still clamped to that\ntotal, but as an invariant rather than a patch: no set of audiences\nreaches more people than there are people.\n\n\"People\" excludes service accounts and the identities Agnes seeds for\nitself (``src.service_accounts.is_person``, issue #2256) \u2014 the same\ndefinition ``scope='everyone'`` enforces, so the number an admin reads\nbeside Apply is the number of colleagues the share will reach.\n\n``ids`` is required (422 when absent, from FastAPI, identically on both\napp-state backends). Declared before ``/groups/{group_id}`` so the\nliteral segment is not captured as a group id.",
+        "operationId": "groups_reach_api_admin_groups_reach_get",
+        "parameters": [
+          {
+            "description": "Comma-separated group ids; `everyone` means every account",
+            "in": "query",
+            "name": "ids",
+            "required": true,
+            "schema": {
+              "description": "Comma-separated group ids; `everyone` means every account",
+              "title": "Ids",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Groups Reach Api Admin Groups Reach Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Groups Reach",
         "tags": [
           "access"
         ]
@@ -49376,7 +49483,7 @@
     },
     "/api/marketplaces/{marketplace_id}/plugins/{plugin_name}/disable": {
       "post": {
-        "description": "Admin-disable a plugin instance-wide.\n\nDisabled plugins are filtered from the served feed for all callers\nregardless of their RBAC grants. Distinct from per-user opt-outs.\nPrimarily intended for built-in plugins (is_builtin=TRUE registry row),\nbut works on any registered plugin.\n\nOptional JSON body ``{\"revoke_grants\": true}`` additionally deletes every\ngroup grant on the plugin (one-action retirement) \u2014 without it the grants\nstay, so re-enabling restores the plugin for the same groups. The response\nreports the number of grants removed as ``revoked_grants``.",
+        "description": "Admin-disable a plugin instance-wide.\n\nDisabled plugins are filtered from the served feed for all callers\nregardless of their RBAC grants \u2014 including an everyone-scoped grant,\nwhich is what makes this an availability switch rather than a\ndistribution one. Distinct from per-user opt-outs. Primarily intended\nfor built-in plugins (is_builtin=TRUE registry row), but works on any\nregistered plugin.\n\nOptional JSON body ``{\"revoke_grants\": true}`` additionally deletes every\ngroup grant on the plugin (one-action retirement) \u2014 without it the grants\nstay, so re-enabling restores the plugin for the same groups. The response\nreports the number of grants removed as ``revoked_grants``.",
         "operationId": "disable_plugin_api_marketplaces__marketplace_id__plugins__plugin_name__disable_post",
         "parameters": [
           {
@@ -49534,145 +49641,6 @@
           }
         },
         "summary": "Enable Plugin",
-        "tags": [
-          "marketplaces"
-        ]
-      }
-    },
-    "/api/marketplaces/{marketplace_id}/plugins/{plugin_name}/system": {
-      "delete": {
-        "description": "Flip ``is_system`` to FALSE. Materialized grants/subscriptions\nsurvive \u2014 admin curates cleanup via the standard /admin/access UI\n(which immediately unlocks the checkboxes for this plugin) and\nusers can unsubscribe normally on /marketplace?tab=my.",
-        "operationId": "unmark_plugin_system_api_marketplaces__marketplace_id__plugins__plugin_name__system_delete",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "marketplace_id",
-            "required": true,
-            "schema": {
-              "title": "Marketplace Id",
-              "type": "string"
-            }
-          },
-          {
-            "in": "path",
-            "name": "plugin_name",
-            "required": true,
-            "schema": {
-              "title": "Plugin Name",
-              "type": "string"
-            }
-          },
-          {
-            "in": "header",
-            "name": "authorization",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Authorization"
-            }
-          }
-        ],
-        "responses": {
-          "204": {
-            "description": "Successful Response"
-          },
-          "401": {
-            "description": "Not authenticated"
-          },
-          "403": {
-            "description": "Insufficient permissions"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Unmark Plugin System",
-        "tags": [
-          "marketplaces"
-        ]
-      },
-      "post": {
-        "description": "Mark a plugin as system (mandatory for every user).\n\nIdempotent \u2014 re-running a mark on an already-system plugin still\nruns the fanout (cheap; ON CONFLICT DO NOTHING) so any user/group\nthat slipped past the creation hooks gets caught up.",
-        "operationId": "mark_plugin_system_api_marketplaces__marketplace_id__plugins__plugin_name__system_post",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "marketplace_id",
-            "required": true,
-            "schema": {
-              "title": "Marketplace Id",
-              "type": "string"
-            }
-          },
-          {
-            "in": "path",
-            "name": "plugin_name",
-            "required": true,
-            "schema": {
-              "title": "Plugin Name",
-              "type": "string"
-            }
-          },
-          {
-            "in": "header",
-            "name": "authorization",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Authorization"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/SystemFlagResponse"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "401": {
-            "description": "Not authenticated"
-          },
-          "403": {
-            "description": "Insufficient permissions"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Mark Plugin System",
         "tags": [
           "marketplaces"
         ]
@@ -55636,7 +55604,7 @@
     },
     "/api/sharing/groups": {
       "get": {
-        "description": "Groups the caller may share into \u2014 their own memberships + Everyone.\n\nDrives the Library's Share dialog. An admin sees every group.",
+        "description": "Audiences the caller may share into \u2014 their own memberships, plus\neveryone (the ``\"everyone\"`` sentinel, flagged ``is_everyone``).\n\nDrives the Library's Share dialog. An admin sees every group.",
         "operationId": "list_share_targets_api_sharing_groups_get",
         "parameters": [
           {

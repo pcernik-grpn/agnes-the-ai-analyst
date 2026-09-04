@@ -256,13 +256,15 @@ class StackResolver:
         return self._members_repo().list_groups_for_user(user_id)
 
     def _grants(self, group_ids: List[str], resource_type: ResourceType) -> Tuple[set, set]:
-        """Split (required, available) resource_id sets for the user's groups.
+        """Split (required, available) resource_id sets for the audience.
 
-        Empty group_ids → ({}, {}); the resolver short-circuits to "no
-        entries" for both browse() and stack().
+        NOT short-circuited on an empty group set. An everyone-scoped grant
+        reaches an account regardless of membership — including one in no
+        group at all — and `list_for_groups` answers an empty list correctly.
+        Returning ({}, {}) here used to be right, because "everyone" was a
+        group nobody could be outside of; since 0098 it discards exactly the
+        audience the scope exists to express, for `data_package` among others.
         """
-        if not group_ids:
-            return set(), set()
         rows = self._grants_repo().list_for_groups(list(group_ids), str(resource_type))
         required_ids = {r["resource_id"] for r in rows if r.get("requirement") == "required"}
         available_ids = {r["resource_id"] for r in rows if r.get("requirement") == "available"}

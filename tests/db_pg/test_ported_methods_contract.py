@@ -324,8 +324,9 @@ def test_table_registry_set_description_is_surgical(ctx):
 # ---------------------------------------------------------------------------
 
 def test_marketplace_plugins_get(ctx):
-    """get() backs the curated install/uninstall existence + is_system checks.
-    A raw DuckDB read 404'd every plugin on a PG instance (the reported bug)."""
+    """get() backs the curated install/uninstall existence + admin-disabled
+    checks. A raw DuckDB read 404'd every plugin on a PG instance (the
+    reported bug)."""
     repo = ctx.marketplace_plugins()
     repo.replace_for_marketplace(
         "mkt-1",
@@ -336,10 +337,12 @@ def test_marketplace_plugins_get(ctx):
     assert row is not None
     assert row["name"] == "alpha"
     assert row["marketplace_id"] == "mkt-1"
-    # is_system is surfaced (defaults FALSE on a freshly-synced plugin) — the
-    # uninstall guard reads it.
-    assert "is_system" in row
-    assert bool(row["is_system"]) is False
+    # `admin_disabled` is surfaced (defaults FALSE on a freshly-synced
+    # plugin) — the serve paths read it. `is_system` used to be asserted here
+    # beside it; 0098 deleted the column, and the uninstall guard that read
+    # it now reads the grant instead.
+    assert "admin_disabled" in row
+    assert bool(row["admin_disabled"]) is False
 
     # Misses return None on both backends (the 404 path).
     assert repo.get("mkt-1", "missing") is None

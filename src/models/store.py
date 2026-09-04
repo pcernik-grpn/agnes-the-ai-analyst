@@ -86,6 +86,17 @@ class MarketplacePlugin(Base):
     cover_photo_url: Mapped[str | None] = mapped_column(String, nullable=True)
     video_url: Mapped[str | None] = mapped_column(String, nullable=True)
     doc_links: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    # DEAD SINCE 0098, and still here on purpose. It said "every account gets
+    # this plugin, automatically" — one cell of a WHO x CHOICE grid wearing a
+    # name that described neither axis, and a second implementation of an idea
+    # `resource_grants` already had. It is now an ordinary grant
+    # (scope='everyone', requirement='required') and nothing reads this column.
+    #
+    # Dropping it is the CONTRACT half of an expand/contract pair and ships in
+    # a later release: an old `api` replica still selecting it during a rolling
+    # recreate would get `UndefinedColumn`, and this repo cannot stage a drop
+    # within one release (see 0098's MID-FLIGHT note). Delete this column, this
+    # comment, and the reconciler's clear-the-flag step together.
     is_system: Mapped[bool] = mapped_column(Boolean, server_default=text("FALSE"), nullable=False)
     # Admin per-plugin disable for built-in plugins — instance-wide, distinct
     # from per-user opt-outs. Disabled plugins are filtered from the served feed.

@@ -8,11 +8,11 @@ pins the endpoints around it:
 
 * ``GET /api/my-stack`` — required plugin reports ``enabled=True`` +
   ``is_required=True`` with no subscription row
-* unsubscribe / uninstall refusals (409), mirroring the v39 ``is_system``
-  guards
+* unsubscribe / uninstall refusals (409) — one code each since 0098, when
+  the ``is_system`` guards they used to mirror collapsed into these
 * an ``available`` grant keeps the pre-existing Model B behavior
 
-Helper pattern shared with ``test_marketplace_plugin_system.py`` (plain
+Helper pattern shared with ``test_marketplace_plugin_reach.py`` (plain
 functions imported from there; the client fixture is local because pytest
 resolves fixtures per-module).
 """
@@ -22,7 +22,7 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
-from tests.test_marketplace_plugin_system import (
+from tests.test_marketplace_plugin_reach import (
     _add_group,
     _create_user,
     _seed_marketplace_with_plugin,
@@ -91,11 +91,16 @@ class TestMyStackView:
         curated = r.json()["curated"]
         assert len(curated) == 1
         entry = curated[0]
-        # Served without a subscription row → the toggle must report ON,
-        # and is_required drives the locked UI state (like is_system).
+        # Served without a subscription row → the toggle must report ON, and
+        # `is_required` drives the locked UI state. There was an `is_system`
+        # field beside it, asserted False here, saying the same thing about
+        # the everyone audience only; 0098 deleted the flag behind it and
+        # this one field now answers for both audiences.
         assert entry["enabled"] is True
         assert entry["is_required"] is True
-        assert entry["is_system"] is False
+        assert "is_system" not in entry, (
+            "the wire still carries a second name for this idea"
+        )
 
     def test_available_plugin_stays_opt_in(self, web_client):
         _, cookies = _seed_required_for(web_client, requirement="available")

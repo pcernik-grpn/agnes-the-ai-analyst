@@ -44,6 +44,9 @@ from src.repositories import (
     users_repo,
 )
 
+#: What this module is, to `resource_grants.source` (src/grant_sources.py).
+GRANT_SOURCE = "share_request"
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/admin/share-requests", tags=["share-requests"])
@@ -145,6 +148,7 @@ def _decide(request_id: str, *, decision: str, user: dict) -> Dict[str, Any]:
             row["resource_type"],
             row["resource_id"],
             assigned_by=user["id"],
+            source=GRANT_SOURCE,
         )
 
     _audit(

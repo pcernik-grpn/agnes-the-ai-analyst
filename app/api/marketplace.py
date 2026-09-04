@@ -55,6 +55,7 @@ from src.marketplace import is_safe_plugin_name
 from src.marketplace_filter import (
     _contained_plugin_dir,
     _resolve_raw,
+    everyone_required_plugin_keys,
     is_unserved_path,
     required_plugin_keys,
     resolve_allowed_plugins,
@@ -109,13 +110,12 @@ class MarketplaceItem(BaseModel):
     # own non-approved cards. Approved cards omit both fields.
     visibility_status: Optional[str] = None
     is_viewer_owner: bool = False
-    # v39: drives the "Required" pill on the curated browse cards. Only
-    # set on curated items (flea/store entities are never system).
-    is_system: bool = False
-    # Group-scoped Required tier: TRUE when any of the caller's groups
-    # holds a ``requirement='required'`` grant for this plugin. Renders
-    # the same locked "Required" state as ``is_system`` but only for the
-    # granted groups' members, not globally.
+    # Drives the "Required" pill on the curated browse cards: TRUE when an
+    # audience the caller is in holds this plugin at
+    # ``requirement='required'`` — one of their groups, or
+    # ``scope='everyone'``. An ``is_system`` field sat beside this one and
+    # said the same thing for the everyone case only; 0098 deleted the flag
+    # behind it and this field answers for both.
     is_required: bool = False
     # Rich-content fields from marketplace-metadata.json (plugin-level only
     # for now; skill/agent rich content lands in a later phase). Frontend
@@ -145,9 +145,10 @@ class MarketplaceItem(BaseModel):
     publisher_name: Optional[str] = None
     verification_state: str = "none"
     # stack_count = how many users have this item in their stack.
-    # - Curated: COUNT(*) on user_plugin_optouts (post-v28 PRESENCE = subscribed).
-    #   System pluginy are fanned out to every user via
-    #   fanout_system_for_user, so the COUNT naturally includes them too.
+    # - Curated: COUNT(*) on user_plugin_optouts (post-v28 PRESENCE = subscribed),
+    #   overlaid with the total user count for an Automatic-for-everyone
+    #   plugin — it has no subscription rows to count (see
+    #   ``_load_curated_stack_counts``).
     # - Flea: store_entities.install_count (bumped on /install).
     # Frontend renders this alongside active_users_30d as a funnel:
     # "12 stacked → 5 active → 143 calls".
@@ -337,13 +338,10 @@ class PluginDetailResponse(BaseModel):
     # insufficient because `blocked_llm` keeps the entity at
     # `visibility_status='pending'`.
     submission_status: Optional[str] = None
-    # v39: drives the disabled install button on the curated plugin
-    # detail page. The same flag travels via /api/marketplace/items so
-    # the browse cards can show a "Required" pill.
-    is_system: bool = False
-    # Group-scoped Required tier (resource_grants.requirement='required'
-    # on any of the caller's groups) — same locked UI treatment as
-    # ``is_system``, scoped to the granted groups instead of all users.
+    # Drives the disabled install button on the curated plugin detail page,
+    # and the "Required" pill on the browse cards via
+    # /api/marketplace/items. TRUE when an audience the caller is in holds
+    # this plugin at ``requirement='required'`` — see the listing model.
     is_required: bool = False
     # Rich-content fields from marketplace-metadata.json (plugin-level, curated
     # only — flea entities don't have a metadata layer). All optional; UI
@@ -533,9 +531,8 @@ def _curated_stack_sets(conn: Optional[duckdb.DuckDBPyConnection], user_id: str)
     ``in_stack`` is the union ``resolve_user_marketplace`` actually serves:
     explicit subscriptions ∪ required-tier grant keys
     (``resource_grants.requirement='required'`` for any of the user's
-    groups). ``required`` is surfaced separately so cards / detail pages
-    can render the locked "Required" state for group-required plugins the
-    same way they do for global ``is_system`` ones.
+    groups, or ``scope='everyone'``). ``required`` is surfaced separately
+    so cards / detail pages can render the locked "Required" state.
 
     ``conn`` is optional — it is only a DuckDB-backend fast path for the
     group-membership read (see ``app.auth.access._user_group_ids``), so a
@@ -625,7 +622,6 @@ def _curated_to_item(
         marketplace_slug=marketplace_id,
         marketplace_name=meta["name"],
         detail_url=_curated_detail_url(marketplace_id, plugin_name),
-        is_system=bool(plugin_row.get("is_system")),
         is_required=(marketplace_id, plugin_name) in required_keys,
         display_name=enrichment.get("display_name"),
         tagline=enrichment.get("tagline"),
@@ -762,8 +758,21 @@ def _load_curated_stack_counts() -> Dict[Tuple[str, str], int]:
     Thin wrapper over ``UserCuratedSubscriptionsRepository.stack_counts`` /
     ``UserCuratedSubscriptionsPgRepository.stack_counts`` so callers stay
     backend-agnostic — one query per page render, avoids N+1.
+
+    An Automatic-for-everyone plugin is overlaid with the total user count.
+    It used to arrive in the subscription tally for free, because marking it
+    wrote a subscription row per user; nothing writes those rows now, so
+    without this overlay a plugin every user has would report a stack of 0.
+    The number the reader wants is unchanged — "how many people have this" —
+    only where it is read from.
     """
-    return user_curated_subscriptions_repo().stack_counts()
+    counts = dict(user_curated_subscriptions_repo().stack_counts())
+    everyone_keys = everyone_required_plugin_keys()
+    if everyone_keys:
+        total_users = users_repo().count_all()
+        for key in everyone_keys:
+            counts[key] = total_users
+    return counts
 
 
 def _available_sorts(stats_dicts: List[Dict[str, Dict]]) -> List[str]:
@@ -1863,7 +1872,6 @@ async def curated_detail(
         mcps=mcps,
         files=_walk_files(plugin_root) if plugin_root else [],
         docs=doc_link_entries,
-        is_system=bool(plugin_row.get("is_system")),
         is_required=(marketplace_id, plugin_name) in required,
         **enrichment,
         telemetry=_build_telemetry("curated", plugin_name),
@@ -2119,20 +2127,14 @@ async def curated_uninstall(
     ),
     user: dict = Depends(get_current_user),
 ):
-    # v39: system plugins are mandatory for every user — refuse uninstall.
-    # Backend-aware read (see curated_install) — raw DuckDB would miss the
-    # is_system flag on a Postgres-backed instance.
-    plugin = marketplace_plugins_repo().get(marketplace_id, plugin_name)
-    if plugin and bool(plugin.get("is_system")):
-        raise HTTPException(
-            status_code=409,
-            detail="cannot_uninstall_system_plugin",
-        )
-
-    # Group-scoped Required tier: a ``requirement='required'`` grant keeps
-    # the plugin in every group member's served set regardless of the
-    # subscription row, so uninstall would be a lie — the resolver would
-    # keep serving it. Refuse, mirroring the is_system guard above.
+    # ONE guard, not two. A `cannot_uninstall_system_plugin` 409 for
+    # `marketplace_plugins.is_system` used to precede this and refuse the
+    # same plugins for the same reason; the flag is now a required
+    # everyone-scoped grant, which `required_plugin_keys` sees.
+    #
+    # A ``requirement='required'`` grant keeps the plugin in the reached
+    # set regardless of the subscription row, so uninstall would be a lie —
+    # the resolver would keep serving it.
     if (marketplace_id, plugin_name) in required_plugin_keys(None, user["id"]):
         raise HTTPException(
             status_code=409,

@@ -13,6 +13,7 @@ unticked grant.
 from __future__ import annotations
 
 from pathlib import Path
+from tests.helpers.access_page import access_page_source
 
 
 def _bootstrap(tmp_path: Path, monkeypatch):
@@ -103,7 +104,7 @@ class TestAccessPageShowsTheOrphan:
         It still derives from the grants payload the controls read, which is
         the part that matters — a second source could disagree with them.
         """
-        template = Path("app/web/templates/admin_access.html").read_text(encoding="utf-8")
+        template = access_page_source()
         assert "granted to nobody" in template
         assert "Granted to nobody:" in template          # the collected line
         assert "is-nobody" in template                   # …and the row's own state

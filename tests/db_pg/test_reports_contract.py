@@ -96,6 +96,27 @@ def _insert(repo, backend, table, cols, rows):
                 c.execute(sa.text(sql), {k: r[k] for k in cols})
 
 
+def _resolve_or_create_everyone(repo, backend) -> str:
+    """The carrier group id, whichever backend seeded (or did not seed) it."""
+    if backend == "duckdb":
+        row = repo.conn.execute("SELECT id FROM user_groups WHERE name = 'Everyone'").fetchone()
+        if row:
+            return row[0]
+    else:
+        with repo._engine.connect() as c:
+            row = c.execute(sa.text("SELECT id FROM user_groups WHERE name = 'Everyone'")).first()
+        if row:
+            return row[0]
+    _insert(
+        repo,
+        backend,
+        "user_groups",
+        ["id", "name", "is_system", "created_by"],
+        [{"id": "g-everyone", "name": "Everyone", "is_system": True, "created_by": "system:seed"}],
+    )
+    return "g-everyone"
+
+
 def _seed(repo, backend):
     # usage_events: anchor day = 3 events / 2 users / 1 error; one event late in
     # the UTC day (23:30) to pin day-bucketing. prev day = 1 event.
@@ -275,19 +296,47 @@ def _seed(repo, backend):
         ],
     )
 
-    # The plugin registry the install ledger is judged against. `platform-core`
-    # is a system plugin: it lands in every stack by platform action, so its
-    # subscription rows are provisioning, not adoption.
+    # The plugin registry the install ledger is judged against.
     _insert(
         repo,
         backend,
         "marketplace_plugins",
-        ["marketplace_id", "name", "is_system"],
+        ["marketplace_id", "name"],
         [
-            {"marketplace_id": "curated-product", "name": "product-analyzer", "is_system": False},
-            {"marketplace_id": "curated-product", "name": "platform-core", "is_system": True},
+            {"marketplace_id": "curated-product", "name": "product-analyzer"},
+            {"marketplace_id": "curated-product", "name": "platform-core"},
         ],
     )
+
+    # `platform-core` reaches EVERY account automatically: it lands in every
+    # stack by platform action, so its subscription rows are provisioning,
+    # not adoption. That used to be `marketplace_plugins.is_system`; since
+    # 0098 it is a required grant at `scope='everyone'`.
+    #
+    # Held by the CARRIER group, which is how both backends spell it: the
+    # frozen DuckDB ladder has no `scope` column, and every everyone-scoped
+    # row on Postgres is written against that same group anyway.
+    # DuckDB seeds the system groups on schema creation; Postgres does not
+    # (the app does it at boot). Resolve-or-create rather than insert, so the
+    # carrier is the ONE row the DuckDB clause looks for by name.
+    carrier_id = _resolve_or_create_everyone(repo, backend)
+    grant_cols = ["id", "group_id", "resource_type", "resource_id", "requirement"]
+    grant_row = {
+        "id": "rg-platform-core",
+        "group_id": carrier_id,
+        "resource_type": "marketplace_plugin",
+        "resource_id": "curated-product/platform-core",
+        "requirement": "required",
+    }
+    if backend != "duckdb":
+        # Postgres has the column and a real writer always sets it; the
+        # classifier does not READ it (it matches the carrier group, which is
+        # the one spelling both backends share), so this is here to keep the
+        # seeded row shaped like a live one rather than to make the assertion
+        # pass.
+        grant_cols.append("scope")
+        grant_row["scope"] = "everyone"
+    _insert(repo, backend, "resource_grants", grant_cols, [grant_row])
 
     # installs (anchor day): 2 curated subscriptions by 2 users + 1 flea install
     # (by one of the same users), plus a 3-user system-plugin rollout that must
