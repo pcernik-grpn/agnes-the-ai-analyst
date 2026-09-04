@@ -2841,10 +2841,18 @@
             /* Even with nothing granted the table is the right shape: a
                header, the action as its first row, and no rows under it —
                rather than a button floating beside an empty sentence. */
+            /* "Who that reaches" promised a reach and delivered a member
+               count: `member_count` counts MEMBERSHIPS, and a group may
+               hold a service account (#1534) or a system identity that
+               `is_person` — which `groups/reach` counts by — does not. The
+               column is also heterogeneous by design: an ordinary group
+               gets "3 members", the Everyone audience gets "every account,
+               and anyone who joins" and no number at all. "Audience size"
+               is the one heading true of both cells. */
             return `<div class="ax-table">
                       ${share}
                       <div class="ax-colhd">
-                        <span>Group</span><span>Who that reaches</span>
+                        <span>Group</span><span>Audience size</span>
                         <span>Access tier</span><span class="ax-colhd__u">Manage</span>
                       </div>
                       ${r.held.map((grant) => groupRow(r, grant)).join("")}

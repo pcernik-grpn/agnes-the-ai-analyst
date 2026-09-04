@@ -404,6 +404,27 @@ class TestAnEveryoneAudienceIsNotARoster:
         assert "matched_people === 1 ?" in src              # the member search
         assert '${reach} ${reach === 1 ? "person" : "people"}' in src  # the footer
 
+    def test_the_column_over_the_count_does_not_promise_a_reach(self):
+        """The header and the cell under it have to agree.
+
+        "Who that reaches" over a `member_count` cell is the same false
+        claim as the row's old "3 people", one level up: a membership is
+        not a person, and `groups/reach` — which IS people — can be
+        smaller. The column is heterogeneous besides, so the heading has to
+        be true of both cells: an ordinary group's "3 members" and the
+        Everyone audience's "every account, and anyone who joins", which
+        carries no number at all.
+        """
+        src = self._source()
+        # The rendered CELL, not the file: the comment above this heading
+        # quotes the old wording to explain why it went, and a whole-file
+        # scan would fire on the explanation.
+        assert "<span>Who that reaches</span>" not in src
+        assert "<span>Audience size</span>" in src
+        # Both cells the heading has to cover, still rendered by that column.
+        assert "every account, and anyone who joins" in src
+        assert "memberLabel(g.member_count ?? 0)" in src
+
     def test_the_member_label_is_written_once(self):
         """Eight renderers, one definition.
 
