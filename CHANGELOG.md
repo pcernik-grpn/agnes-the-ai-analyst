@@ -16,6 +16,10 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **The Agnes orb brand mark ships far lighter.** `agnes-orb.png` (rail avatar, chat, connect banner, and the default favicon on every page) is now a 192×192, 96-colour-quantized PNG at ~21 KB instead of a 256×256 full-colour PNG at ~105 KB — same path, same visual result at every size it's rendered, with a size-ratchet test pinning it under 32 KB.
 - **`/static` assets are cached for a year when the request carries the `?v=` cache-buster most pages already append, and no longer gzipped when serving cover images under `/uploads`.** Cuts a revalidation round trip per CSS/JS asset on every page load and stops the server re-compressing already-compressed cover images.
 
+- Cover image uploads pre-generate both resize variants (480/960) at upload
+  time, so the first visitor after an upload no longer pays the in-request
+  decode.
+
 ### Fixed
 
 ### Removed

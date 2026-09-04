@@ -17,6 +17,8 @@ Key responsibilities:
   the resized variant is cached to disk and reused on a repeat GET.
 - Verify the /uploads mount is skip-listed out of gzip (already-compressed
   binaries -- see app/main.py's _SelectiveGZipMiddleware skip_prefixes).
+- Verify both variants are pre-generated at upload time (app/api/uploads.py),
+  before any ``?w=`` GET is made.
 
 Design constraints:
 - Use seeded_app_fresh because every test here reads from the disk-mounted
@@ -256,3 +258,22 @@ def test_uploaded_cover_is_not_gzipped(seeded_app_fresh):
     resp = client.get(cover_url, headers={"Accept-Encoding": "gzip"})
     assert resp.status_code == 200
     assert "gzip" not in resp.headers.get("content-encoding", "")
+def test_upload_prewarms_variants(seeded_app_fresh):
+    """S4: both cover variants exist on disk right after upload -- the
+    first visitor's GET must not be the thing that triggers the decode."""
+    app_data = seeded_app_fresh
+    client = app_data["client"]
+    files = {"file": ("noise.png", io.BytesIO(_NOISE_PNG), "image/png")}
+    upload = client.post(
+        "/api/admin/uploads/cover-image",
+        files=files,
+        headers=_auth(app_data["admin_token"]),
+    )
+    assert upload.status_code == 200
+    body = upload.json()
+    assert set(body) == {"url", "content_type", "size"}
+
+    data_dir = Path(app_data["env"]["data_dir"])
+    cache_dir = data_dir / "cache" / "img"
+    for width in (480, 960):
+        assert list(cache_dir.glob(f"*-w{width}.webp")), f"no pre-warmed w{width} variant"
