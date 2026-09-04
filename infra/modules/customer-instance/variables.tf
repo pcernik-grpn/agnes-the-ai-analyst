@@ -843,11 +843,21 @@ variable "container_logs_destination" {
     behaviour, which this module does not do.
 
     ** BEHAVIOUR CHANGE ON A MODULE BUMP. ** A VM that already has
-    enable_datadog = true resolves to `datadog` and STOPS shipping to Cloud
-    Logging the next time it is recreated. That is the intended default —
-    metrics, monitors and logs belong in one console — but it is the one
-    diff a bump alone carries. Set container_logs_destination =
-    "cloud_logging" to keep the old behaviour explicitly.
+    enable_datadog = true resolves to `datadog` the next time it is recreated,
+    and that has two halves — state both when reviewing a bump:
+
+      * it STOPS shipping to Cloud Logging, so any log-based alert, dashboard
+        or saved query pointed there goes quiet rather than red; and
+      * it STARTS exporting every container log line to a third-party SaaS in
+        whatever region datadog_site names. On a VM with enable_gcp_logging =
+        false this is not a redirect at all: nothing left the host before, and
+        now everything does. Data residency is a decision to make before the
+        redaction rules, which bound only WHAT is sent, never WHERE.
+
+    That is the intended default — metrics, monitors and logs belong in one
+    console — but it is the one diff a bump alone carries. Set
+    container_logs_destination = "cloud_logging" (or "none") to keep the old
+    behaviour explicitly. See docs/datadog-logging.md.
 
     Startup-script-owned like every other setting here: it reaches a running
     VM only through `terraform apply -replace` of the instance.

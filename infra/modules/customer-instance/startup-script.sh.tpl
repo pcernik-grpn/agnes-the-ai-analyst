@@ -343,8 +343,13 @@ chmod +x /usr/local/bin/agnes-auto-upgrade.sh
 # script's own first `up -d` engages it too. On a non-GCE / non-GCP
 # deployment (or an operator who wants the default json-file driver
 # instead), remove it right back out so that gate stays false. Runs on
-# every boot, so it also self-heals a VM whose log destination flipped since
-# the last provisioning.
+# every boot, so the overlay itself self-heals on a VM whose log destination
+# flipped since the last provisioning. The Ops Agent PACKAGE does not: its
+# install block below is inside the cloud_logging guard, so a VM moving away
+# from Cloud Logging would keep an installed agent listening on 24224. That is
+# inert (the overlay is gone and the marker cleared, so nothing forwards to it)
+# and unreachable through the supported path anyway — a destination change is a
+# -replace onto a fresh boot disk.
 #
 # Removing it is also what makes the Datadog destination work: the containers
 # fall back to the daemon's default json-file driver, which is the one the

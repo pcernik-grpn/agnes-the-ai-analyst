@@ -207,6 +207,77 @@ def test_no_rule_touches_an_ordinary_log_line(name: str, line: str):
     assert masked == line, f"{name} over-matched: {line!r} -> {masked!r}"
 
 
+# Shapes a single per-rule fixture does not reach. Each entry found a real gap
+# in review, so they are pinned separately rather than folded into LEAKS.
+EXTRA_LEAKS = [
+    pytest.param(
+        "mask_authorization_values",
+        "upstream 401 authorization=Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ",
+        "QWxhZGRpbjpvcGVuIHNlc2FtZQ",
+        id="basic-auth",
+    ),
+    pytest.param(
+        "mask_authorization_values",
+        "jira 403 Authorization: Token abcdEFGH1234ijklMNOP",
+        "abcdEFGH1234ijklMNOP",
+        id="token-scheme",
+    ),
+    pytest.param(
+        "mask_authorization_values",
+        'X-StorageApi-Token: "abcdEFGH1234ijklMNOP"',
+        "abcdEFGH1234ijklMNOP",
+        id="bare-value-no-scheme",
+    ),
+    pytest.param(
+        "mask_url_credentials",
+        "redis connect failed: redis://:hunter2swordfish@cache:6379/0",
+        "hunter2swordfish",
+        id="empty-username-dsn",
+    ),
+]
+
+
+@pytest.mark.parametrize("rule_name, line, secret", EXTRA_LEAKS)
+def test_the_rules_cover_the_credential_shapes_this_stack_actually_emits(rule_name: str, line: str, secret: str):
+    """`Authorization: Basic <base64>` is the one that mattered: this stack
+    speaks Basic in the Jira connector, the MCP client, the marketplace git
+    router's PAT header and the PAT resolver. With `bearer` as the only
+    recognised scheme the whole header passed through unmasked, because once
+    that branch failed the value class had to match from `Basic` and the space
+    after it is not in the class."""
+    rule = _processing_rules()[rule_name]
+    masked = re.sub(rule["pattern"], rule["replace_placeholder"].replace("$1", r"\1"), line)
+    assert secret not in masked, f"{rule_name} left {secret!r} in the clear"
+
+
+@pytest.mark.parametrize(
+    "claims",
+    [
+        pytest.param({}, id="empty-payload"),
+        pytest.param({"a": 1}, id="one-claim"),
+        pytest.param({"sub": "1234567890", "name": "analyst", "iat": 1516239022}, id="typical"),
+    ],
+)
+def test_the_jwt_rule_masks_small_payloads_too(claims: dict):
+    """A JWT's middle segment is only as long as its claims: `{}` base64s to
+    `e30`, three characters. A bound tuned to a typical payload would let
+    exactly the smallest tokens through — the failure mode a spot-check with
+    one realistic token never surfaces."""
+    import base64
+    import json
+
+    def seg(obj: dict) -> str:
+        return base64.urlsafe_b64encode(json.dumps(obj, separators=(",", ":")).encode()).decode().rstrip("=")
+
+    token = f"{seg({'alg': 'HS256', 'typ': 'JWT'})}.{seg(claims)}.dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+    rule = _processing_rules()["mask_jwt"]
+    masked = re.sub(
+        rule["pattern"], rule["replace_placeholder"].replace("$1", r"\1"), f"auth rejected token {token} from peer"
+    )
+    assert token not in masked, f"unmasked JWT with {len(seg(claims))}-char payload"
+    assert "auth rejected token" in masked
+
+
 def test_no_compose_file_sets_an_autodiscovery_log_label():
     """An integration-level `com.datadoghq.ad.logs` config COMPLETELY overrides
     the global processing_rules for that container — i.e. it would un-redact

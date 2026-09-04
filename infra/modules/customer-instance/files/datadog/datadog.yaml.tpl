@@ -57,6 +57,12 @@ container_env_as_tags: {}
 # excluded globally cannot be brought back with container_include_logs. Their
 # LOGS are the opposite of noise; a failed migration is exactly what an
 # operator goes looking for.
+#
+# Note what else moved with it: the generic list also feeds SBOM, compliance,
+# runtime security, process_config.container_collection and container
+# image/lifecycle collection. All of those are off below, so this is inert
+# today — but turning any of them on brings the oneshot containers back with
+# it, and the exclusion would have to be restated for that surface.
 container_exclude_metrics:
   - "name:^agnes-(migrate|data-migrate|kai-agent-migrate|extract)-[0-9]+$"
 exclude_pause_container: true
@@ -146,21 +152,34 @@ logs_config:
     # A DSN with inline credentials. instance.yaml carries one (which is why
     # that file is 0600), and any connection error that formats it into an
     # exception puts the password on a log line.
+    # The username atom is `*`, not `+`: `redis://:secret@host` is a legal
+    # URL and the password is the part that matters.
     - type: mask_sequences
       name: mask_url_credentials
-      pattern: '([a-zA-Z][a-zA-Z0-9+.\-]*)://[^\s/:@]+:[^\s/@]+@'
+      pattern: '([a-zA-Z][a-zA-Z0-9+.\-]*)://[^\s/:@]*:[^\s/@]+@'
       replace_placeholder: '$1://***:***@'
+    # The scheme word is optional AND alternated. With `bearer` alone, a
+    # `Basic <base64>` header slipped through whole: once the bearer branch
+    # failed, the value class had to match from `Basic`, and the space after it
+    # is not in the class. This stack speaks Basic in several places — the Jira
+    # connector, the MCP client, the marketplace git router's PAT header and
+    # the PAT resolver — so that was the more likely leak of the two.
     - type: mask_sequences
       name: mask_authorization_values
-      pattern: '(?i)((?:authorization|x-api-key|x-storageapi-token)"?\s*[:=]\s*"?\s*)(?:bearer\s+)?[A-Za-z0-9._~+/-]{12,}'
+      pattern: '(?i)((?:authorization|x-api-key|x-storageapi-token)"?\s*[:=]\s*"?\s*)(?:bearer|basic|token)?\s*[A-Za-z0-9._~+/-]{12,}'
       replace_placeholder: '$1***'
     - type: mask_sequences
       name: mask_known_key_shapes
       pattern: '(sk-ant-[A-Za-z0-9_-]{16,}|sk-[A-Za-z0-9]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|AIza[A-Za-z0-9_-]{20,})'
       replace_placeholder: '***'
+    # The payload segment's bound is deliberately loose. A JWT whose claims
+    # are small base64s to very little — `{}` is `e30`, three characters — so
+    # a bound tuned to a typical payload lets exactly the smallest tokens
+    # through unmasked. `eyJ` plus two dots plus base64url is already specific
+    # enough that lowering it costs no false positives.
     - type: mask_sequences
       name: mask_jwt
-      pattern: 'eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}'
+      pattern: 'eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{2,}\.[A-Za-z0-9_-]{8,}'
       replace_placeholder: '***'
 
 # The oneshot containers are excluded from METRICS above. Stated here as an

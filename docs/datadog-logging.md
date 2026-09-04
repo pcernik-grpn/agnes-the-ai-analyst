@@ -85,6 +85,16 @@ entry is masked out. Left at its default the agent would fail the open and fall
 back to the API anyway — once per container and loudly. Saying it outright is
 deterministic and touches no directory Docker owns and re-asserts on upgrade.
 
+**This is a real trade, not a free one.** Socket collection makes `dockerd`
+stream and serialize every log line, so at high volume it costs daemon CPU and
+the agent can drop lines — Datadog's own guidance is that file collection
+performs better. It is acceptable here because this stack is quiet by
+construction (see *Cost* below), and because the alternative is not "tail the
+files" but "run the agent as root", which would undo the posture the whole
+Datadog design rests on. If `dockerd` CPU becomes visible, that is the signal to
+reduce what is collected (`container_exclude_logs`), not to widen the agent's
+privileges. Watch it alongside the log volume on the first VM.
+
 ## Scope
 
 Every container (`logs_config.container_collect_all: true`), including
@@ -164,6 +174,13 @@ this.
 
 Nothing here can mask what nobody anticipated. Every log line added from now on
 is a line that leaves the host.
+
+**And leaves the cloud.** Cloud Logging keeps entries inside the deployment's own
+GCP project; Datadog is a third-party SaaS, in whatever region `datadog_site`
+names. Switching destination is therefore a data-residency and processor
+decision as well as an operational one, and on a deployment with commitments
+about where operational data may live it is the part to settle first — before
+the redaction rules, which bound only *what* is sent, never *where*.
 
 ## Cost
 
