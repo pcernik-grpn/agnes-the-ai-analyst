@@ -20,7 +20,8 @@ unset. See ``docs/auth-microsoft-oauth.md``.
 On success the user is created (or matched) via the shared ``ensure_user``
 provisioning path and granted Everyone membership. Group sync mirrors
 ``app.auth.providers.google``'s ``apply_user_groups`` — Entra ID group
-memberships (Graph ``GET /me/memberOf``) are written into
+memberships (Graph ``GET /me/transitiveMemberOf/microsoft.graph.group``,
+groups keyed ``entra:<object-id>``) are written into
 ``user_group_members`` (``source='microsoft_sync'``) via
 ``app.auth.microsoft_group_sync.apply_user_groups`` — but is config-gated
 and OFF by default (``auth.microsoft.group_sync_enabled`` /
@@ -209,7 +210,8 @@ def _oauth_scope() -> str:
     ``openid email profile`` unless Entra group sync is turned on
     (``auth.microsoft.group_sync_enabled`` / ``AGNES_MICROSOFT_GROUP_SYNC_ENABLED``),
     in which case the delegated Graph permission ``GroupMember.Read.All`` is
-    added so the resulting access token can call ``GET /me/memberOf`` — see
+    added so the resulting access token can call
+    ``GET /me/transitiveMemberOf/microsoft.graph.group`` — see
     ``app.auth.microsoft_group_sync`` and ``docs/auth-microsoft-oauth.md``.
 
     Read once, at import time (this function runs inside ``_setup_oauth()``

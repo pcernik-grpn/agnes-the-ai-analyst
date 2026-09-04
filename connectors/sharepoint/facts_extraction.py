@@ -11,9 +11,12 @@ have POSTed to.
 What one pass does, per connection:
 
 1. Walk the documents ingested for the connection's confirmed scopes'
-   collections. Skip TABULAR sources (spreadsheets, CSV) — deterministic
-   converters own structured data, and an LLM reading a pivot table is the
-   most expensive way to get a worse answer.
+   collections — including spreadsheets and CSV/TSV files. There is no
+   tabular skip: by the time a document reaches this stage the crawl+
+   convert pipeline has already turned it into markdown (tables rendered
+   as markdown tables) and indexed it as chunks exactly like any prose
+   document, so a spreadsheet's rows and cells are read, and can carry
+   facts, the same way a sentence does.
 2. Skip any document whose facts are already up to date: the per-document
    state file records the document's content hash, the model, and a
    fingerprint of the effective system prompt (prompt + ontology). Change
@@ -39,13 +42,16 @@ What one pass does, per connection:
    COUNTED (``facts_quotes_dropped``), never quietly shipped for the
    server to reject.
 5. Ship accepted facts in batches through
-   ``app.api.facts.facts_ingest`` — the function the HTTP route calls, in
-   process, not over HTTP. That is deliberate: the verbatim gate (§8), the
-   anonymization declaration (§9.2), the audience validation and the
-   producer scope rules are all enforced there, so an in-process producer
-   is held to exactly the same contract as an external one. Every batch
-   uses ``full_documents`` replace mode, so a re-extraction replaces a
-   document's claims instead of duplicating them.
+   ``app.api.facts._facts_ingest_core`` — the SAME function the HTTP
+   route's ``facts_ingest`` thinly wraps, called in process, not over HTTP.
+   That is deliberate: the verbatim gate (§8), the anonymization
+   declaration (§9.2), the audience validation and the producer scope rules
+   are all enforced there, so an in-process producer is held to exactly the
+   same contract as an external one. Every batch uses ``full_documents``
+   replace mode, so a re-extraction replaces a document's claims instead of
+   duplicating them. ``run_orphan_sweep=False`` (TCRD-296 C.12) on every
+   batch — a whole PASS's own end-of-pass sweep runs once, not once per
+   batch; see :func:`run_facts_extraction`'s own end-of-pass sweep call.
 
 Failure posture, in the two flavours this module keeps strictly apart:
 
@@ -54,21 +60,68 @@ Failure posture, in the two flavours this module keeps strictly apart:
   sibling of ``src.anonymization_ner.DetectionUnavailable``. The run fails
   loudly and resumes next time; it never degenerates into "0 facts found",
   which is indistinguishable from a corpus that genuinely has none.
-* **One document fails** — an unparseable reply, an ingest refusal — is
-  counted in ``facts_failed`` and the pass continues. One bad document
-  must not cost a 100k-document corpus its pass, but it must never be
-  invisible either.
+* **One document fails** — an unparseable reply, an ingest refusal, or a
+  PERMANENT model-call error specific to that document's own request (a
+  400 ``invalid_request_error`` — most commonly "prompt is too long",
+  :class:`FactsDocumentError`, on BOTH transports) — is counted in
+  ``facts_failed`` (with a reason breakdown in ``facts_failed_reasons``)
+  and the pass continues. One bad document must not cost a 100k-document
+  corpus its pass, but it must never be invisible either. A document whose
+  text itself is unsafe to send at all — binary/decode-garbage
+  (``docs_skipped_garbled_text``) or a dense/tabular document too large
+  even at the token budget (``docs_skipped_too_large_tabular``) — is
+  skipped BEFORE any call, never sent and never billed; see
+  :func:`_plan_documents` and the ``extraction.facts.max_prompt_tokens``
+  note below.
 
 Cost: this is the expensive stage, so it is off by default
 (``extraction.facts.enabled``) and reports what it spent
 (``facts_usage``, into the run report and ``extraction_runs.usage``).
+
+Two transports share everything above except step 3's actual model call.
+``extraction.facts.transport: sync`` (default) is the flow just described.
+``transport: batch`` submits pending documents through the Anthropic
+Batches API instead — no per-minute rate ceiling and half the price, at
+the cost of latency (usually under an hour, up to 24h per batch): the
+right trade for a bulk pass over hundreds of thousands of documents, the
+wrong one for "extract this one document now". A batch-mode pass
+(:func:`_run_batch_pass`) is resumable — a batch still in flight when the
+run's deadline expires stays recorded in the per-document state file, and
+the next pass collects it before submitting anything new — and folds every
+result through the SAME gate, corrective-retry-recovery and ingest-shipping
+contract the sync transport uses, so a document's final shape never
+reveals which transport produced it.
+
+Independently, ``extraction.facts.provider: inherit`` (default) | ``anthropic``
+| ``vertex`` decides WHICH LLM provider builds the client — ``inherit``
+follows this instance's own ``ai.provider`` (see
+:func:`resolve_effective_provider`), fixing an incident where an instance
+whose chat already ran through Google Vertex AI kept building an Anthropic
+client for this stage and exhausted its Anthropic workspace's monthly usage
+cap while the Vertex project had headroom. The two knobs interact at exactly
+one point: the Anthropic Batches API has no Vertex equivalent, so a pass
+resolved to ``provider: vertex`` always runs the ``sync`` transport
+(:func:`_resolve_run_transport`), regardless of ``extraction.facts.transport``
+— one warning log line naming why, never an error.
+
+A third, ``provider: vertex``-only knob, ``extraction.facts.vertex_region``
+(:func:`resolve_vertex_region`), pins WHICH Vertex region a pass's client
+talks to, on top of this instance's own ``ai.vertex.region``. Google enforces
+Claude-on-Vertex quotas PER REGION: a live instance running seven
+connections' facts passes all against the same (default) region hit that
+region's requests-per-minute ceiling well before its actual spend limit —
+observed at ~3% of calls answering 429 and throughput capped around 200
+documents/min. Regions have independent quotas, so spreading connections
+across a handful of them multiplies effective throughput at the same
+per-call price.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
-import os
+import math
 import re
 import secrets
 import threading
@@ -76,33 +129,130 @@ import time
 import unicodedata
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
 
-#: Sub-directory of the state dir holding one JSON file per connection —
-#: sibling of the crawler's own ``sharepoint_crawl`` state, deliberately
-#: NOT the same file: a corrupt facts state must never cost the crawl its
-#: deltaLinks (which would re-download an entire estate), and vice versa.
-_STATE_SUBDIR = "sharepoint_facts"
-
-#: Same validation the crawler applies to a connection id before it becomes
-#: a path segment (security playbook §6 — validate AND contain).
-_SAFE_SEGMENT_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
-
-#: Original-source extensions whose content belongs to a deterministic
-#: converter, not to a reader. Matched on the document's stored ``path``,
-#: which keeps the SOURCE file's extension (the crawler stores the markdown
-#: under ``<stem>.md`` but the path is the drive-relative original).
-_TABULAR_EXTENSIONS = frozenset({".xlsx", ".xlsm", ".xls", ".csv", ".tsv"})
-
 #: Characters of document text sent in one call. Above this the tail is
 #: truncated and the document is COUNTED as truncated in the report — never
 #: silently shortened, because a claim's absence would otherwise look like
-#: "the document does not say that".
+#: "the document does not say that". This is a flat, cheap PRE-cap, applied
+#: before the token-aware bound below ever runs (:func:`_token_char_budget`)
+#: — a document already this dense in ordinary prose is still comfortably
+#: under any reasonable token ceiling, so the more expensive per-character
+#: classification only has to look at what is left after this.
 DEFAULT_MAX_DOC_CHARS = 120_000
+
+#: ``extraction.facts.max_prompt_tokens`` — the SOFT budget one whole
+#: request (system prompt + ontology + metadata + document text, and for
+#: the corrective retry, the failing-quote listing too) is kept under.
+#: Exists because :data:`DEFAULT_MAX_DOC_CHARS` alone is not a token bound:
+#: a live incident (2026-09) shipped a request that measured 316,295 tokens
+#: against the model's real 200,000-token ceiling even though the document
+#: text itself was already capped at 120,000 CHARACTERS — tabular/numeric
+#: content and, worse, garbled/binary-boilerplate text (a failed document
+#: conversion) both tokenize far denser than prose, and the retry's
+#: failing-quote listing (:func:`_retry_message`) had no bound of its own
+#: at all. Clamped to ``[1, MAX_PROMPT_TOKENS_CEILING]`` — see
+#: :func:`_max_prompt_tokens`.
+DEFAULT_MAX_PROMPT_TOKENS = 150_000
+
+#: Hard ceiling for ``extraction.facts.max_prompt_tokens`` regardless of
+#: what instance.yaml asks for — comfortably under every current model's
+#: real context window (measured at 200,000 tokens on the incident above),
+#: so a misconfigured instance can raise the soft budget without ever being
+#: able to reproduce the exact failure this module exists to prevent.
+MAX_PROMPT_TOKENS_CEILING = 190_000
+
+#: Flat reservation (tokens) for the parts of a request this module does
+#: not explicitly account for token-by-token: the metadata JSON row, the
+#: untrusted-data security notice and the fence markers
+#: :func:`build_user_message` wraps the document text in. Small and
+#: essentially constant regardless of the document, so re-measuring it per
+#: call would buy precision the guard rail does not need.
+_MESSAGE_OVERHEAD_TOKENS = 400
+
+#: Chars-per-token heuristics behind :func:`_approx_tokens` — this module's
+#: deterministic, OFFLINE token estimate (no network call, no dependency on
+#: either SDK's own tokenizer, which only one of the two providers this
+#: stage can run against even exposes). Calibrated against a live incident's
+#: real ``count_tokens()`` measurements across one connection's documents,
+#: NOT a generic "prose vs table" guess (an earlier chars/4-ish estimate is
+#: exactly what missed this): plain prose measured close to
+#: :data:`_CHARS_PER_TOKEN_PROSE`, but this connection's OWN "normal" large
+#: financial tables (0-2% non-alphanumeric — i.e. almost entirely digits and
+#: currency text, not prose) already measured 1.76-2.4 chars/token, and a
+#: denser EDI-shaped sample (27% non-alphanumeric, delimiter-heavy) measured
+#: ~1.03 chars/token — denser than any flat "tabular" ratio this module
+#: previously used. :data:`_CHARS_PER_TOKEN_DENSE` is set AT that measured
+#: floor, deliberately with no further margin above it: digit/delimiter-dense
+#: content (:func:`_is_tabular_text`) is charged there regardless of exactly
+#: how dense, because a document need only be as dense as the worst
+#: known-legitimate case to make an ungated flat ratio unsafe again.
+#: Content garbled enough to be denser STILL than this (the incident's own
+#: killer document measured ~2.6 tokens/char, i.e. ~0.38 chars/token) is
+#: never estimated at all — it is detected structurally and SKIPPED outright
+#: (:func:`_looks_garbled`), because it produces zero usable facts no matter
+#: how conservatively it is charged.
+_CHARS_PER_TOKEN_PROSE = 3.5
+_CHARS_PER_TOKEN_DENSE = 1.0
+
+#: A document counts as "dense" (tabular/numeric/delimited — the
+#: :data:`_CHARS_PER_TOKEN_DENSE` ratio, and the oversized-document skip,
+#: ``too_large_tabular`` — see :func:`_plan_documents`) when at least this
+#: fraction of its non-blank lines carry :data:`_DENSE_LINE_DELIMITER_MIN`
+#: or more of :data:`_DENSE_LINE_DELIMITERS` — the field/record separators a
+#: converted spreadsheet's markdown table (``|``), a CSV/TSV (tab), or an
+#: EDI X12/EDIFACT segment (``*``/``~``/``^``/``;``) all use. Not a
+#: MIME/extension check: a prose document that happens to quote one table
+#: stays prose, and a genuinely delimited document is recognized from its
+#: TEXT regardless of what produced it.
+_DENSE_LINE_DELIMITERS = "|\t*~^;"
+_DENSE_LINE_DELIMITER_MIN = 3
+_TABULAR_LINE_RATIO = 0.3
+
+#: Below this fraction of a (already :data:`DEFAULT_MAX_DOC_CHARS`-capped)
+#: dense document's length, a head truncated down to the token budget is
+#: not a meaningful sample of a general-ledger/EDI export — closer to noise
+#: than data. :func:`_plan_documents` skips the document instead
+#: (``too_large_tabular``, counted) rather than shipping a head nobody
+#: asked for.
+_MIN_TABULAR_KEEP_RATIO = 0.30
+
+#: How many characters of a document's text :func:`_looks_garbled` and
+#: :func:`_is_tabular_text` actually sample — O(1) rather than
+#: O(document length), and large enough that a genuinely garbled/dense
+#: multi-megabyte document cannot get lucky with a clean opening.
+_SHAPE_SAMPLE_CHARS = 20_000
+
+#: Characters :func:`_looks_garbled` treats as "readable" — ASCII letters/
+#: digits, ordinary whitespace, and the punctuation that shows up constantly
+#: in both real prose AND a converted markdown/CSV/EDI table (pipes, tabs,
+#: decimal/thousands separators, currency symbols, parens, dashes, slashes,
+#: percent signs, quotes). Calibrated directly against the live incident:
+#: the document that overflowed the model's context window measured 99.9%
+#: characters OUTSIDE this set in its first :data:`DEFAULT_MAX_DOC_CHARS`
+#: cut (an xlsx-conversion "symbol soup"), while this connection's
+#: genuinely large, genuinely dense documents measured 0-2% (financial
+#: tables) and 27% (an EDI sample) — both comfortably under
+#: :data:`_MAX_GARBLED_UNREADABLE_RATIO`.
+_GARBLED_READABLE_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 \t\n\r|.,:;()-_/%$#*'\""
+)
+
+#: Above this fraction of characters OUTSIDE :data:`_GARBLED_READABLE_CHARS`
+#: in a sample of a document's text, the text reads as binary/decode-garbage
+#: — e.g. an xlsx-to-markdown conversion that emitted raw cell-format bytes
+#: instead of values — rather than fact-bearing content, and
+#: :func:`_plan_documents` skips it outright (``garbled_text``, counted)
+#: rather than sending any of it: no truncation ratio is safe enough for
+#: this shape, and it produces zero usable facts regardless of how much of
+#: it is sent. Set well above the highest known-legitimate calibration
+#: point (27%, the EDI sample) and well below the known-garbled one (99.9%),
+#: so neither is close to the line.
+_MAX_GARBLED_UNREADABLE_RATIO = 0.5
 
 DEFAULT_MAX_OUTPUT_TOKENS = 16_000
 DEFAULT_TIMEOUT_S = 300.0
@@ -123,7 +273,99 @@ DEFAULT_BATCH_CLAIMS = 1_000
 #: and retry backoff instead of throughput.
 DEFAULT_CONCURRENCY = 3
 MIN_CONCURRENCY = 1
-MAX_CONCURRENCY = 16
+MAX_CONCURRENCY = 64
+
+#: ``extraction.facts.transport``. The synchronous Messages API is bound by
+#: the model account's tokens-per-minute limit — measured on a live
+#: instance at ~13k input + ~4.3k output tokens/document, 285 documents/min
+#: needs ~1.2M output tokens/min, well above what most accounts allow. The
+#: Batches API has no per-minute ceiling and is half the price; the cost is
+#: latency (usually under an hour, up to 24h per batch) rather than rate
+#: limiting, which is the right trade for a bulk pass over an existing
+#: corpus and the wrong one for "extract this one document now".
+DEFAULT_TRANSPORT = "sync"
+
+#: ``extraction.facts.provider`` — which LLM provider this stage's client is
+#: built against. ``inherit`` (the default) follows the instance's own
+#: ``ai.provider`` (see :func:`resolve_effective_provider`); ``anthropic`` /
+#: ``vertex`` pin this stage to one provider regardless of it. Exists
+#: because this stage otherwise shared ``src.anonymization_ner.build_client``
+#: wholesale — a ladder where a static ``ANTHROPIC_API_KEY``/``LLM_API_KEY``
+#: wins over Vertex even when ``ai.provider: vertex`` is configured (the
+#: right default for a detector with no per-connection concept of its own).
+#: On a live instance that had moved chat traffic to Vertex but still had a
+#: leftover Anthropic key in the environment, that precedence meant this
+#: stage kept spending against the Anthropic workspace until it hit its
+#: monthly usage cap, while the Vertex project had headroom the whole time.
+DEFAULT_PROVIDER = "inherit"
+_VALID_PROVIDERS = frozenset({"inherit", "anthropic", "vertex"})
+
+#: ``extraction.facts.vertex_region`` — per-connection/instance override of
+#: WHICH Vertex AI region a ``provider: vertex`` pass's client is built
+#: against, on top of this instance's own ``ai.vertex.region``. Exists
+#: because Google enforces Claude-on-Vertex quotas PER REGION: a single
+#: project running every connection's facts pass against the same region
+#: (typically ``global``, the zero-config default) hits that region's
+#: requests-per-minute ceiling long before the account's actual spend limit
+#: — observed on a live instance at ~3% of calls answering 429 and
+#: throughput capped around 200 documents/min across 7 connections. Regions
+#: have independent quotas, so spreading connections across a handful of
+#: them multiplies effective throughput at the same per-call price. Only
+#: meaningful when the pass's :func:`resolve_effective_provider` resolves to
+#: ``"vertex"`` — harmless (resolved, never applied) otherwise. Validated
+#: with the same character class :func:`connectors.llm.vertex_provider.
+#: invalid_vertex_setting` holds ``ai.vertex.region``/``chat.llm.vertex.
+#: region`` to (lowercase letters, digits, dash — the value is interpolated
+#: into the outbound Vertex API hostname).
+
+#: ``extraction.facts.batch_size`` — documents per Batches-API submission.
+#: Hard-capped at the API's own per-batch REQUEST ceiling
+#: (:data:`MAX_BATCH_API_REQUESTS`); the payload-BYTE ceiling
+#: (:data:`MAX_BATCH_API_BYTES`) is enforced separately, per group, since a
+#: batch of the configured size can still be too large in bytes for a
+#: corpus of unusually long documents.
+DEFAULT_BATCH_SIZE = 500
+MAX_BATCH_API_REQUESTS = 100_000
+MAX_BATCH_API_BYTES = 256 * 1024 * 1024
+
+#: ``extraction.facts.batch_poll_s`` — how often an in-flight batch's
+#: ``processing_status`` is re-checked while the run's deadline allows it.
+DEFAULT_BATCH_POLL_S = 60.0
+
+#: Anthropic serves a batch's results for this many days after it ends. A
+#: ``batch-submitted`` state entry older than this is treated as expired
+#: WITHOUT a network call — a reference surviving this long in our own
+#: state file (a long-idle instance, a big gap between standalone passes)
+#: can never be collected either way.
+BATCH_RESULT_RETENTION_DAYS = 29
+
+#: ``extraction.facts.retry_transport`` — which transport carries the ONE
+#: corrective verbatim retry when the initial completion came from a
+#: batch. ``batch`` (the default) keeps the retry off the model account's
+#: per-minute budget, at the cost of a second batch round-trip;
+#: ``sync`` trades that latency for an immediate per-document retry.
+DEFAULT_RETRY_TRANSPORT = "batch"
+
+#: Cross-pass requeue ceiling for one document's batch attempt — the same
+#: "attempts accumulate across runs, given up after N" shape
+#: ``connectors.sharepoint.crawler._note_retry`` already applies to a
+#: failed download (there: :data:`connectors.sharepoint.crawler.
+#: _MAX_ITEM_RETRY_ATTEMPTS`). Applies to a transient batch outcome
+#: (errored-but-not-``invalid_request``, canceled, expired, or a missing
+#: result row) — an ``invalid_request`` error is never retried at all, it
+#: fails immediately.
+MAX_BATCH_REQUEUE_ATTEMPTS = 3
+
+#: Cross-pass retry ceiling for a document whose ledger entry
+#: :class:`_BatchShipper` had to CORRECT (TCRD-296 gap #62) — an
+#: ``ingest_refused`` batch, or a successful flush whose own doc_id
+#: contributed zero claims despite extracting nodes. The same "attempts
+#: accumulate across runs, given up after N" shape as
+#: :data:`MAX_BATCH_REQUEUE_ATTEMPTS`, kept as its own constant: this
+#: ceiling bounds a WRITE-side (ingest) failure, never a model-call
+#: outcome, so there is no reason the two should ever have to move
+#: together.
+MAX_LEDGER_RETRY_ATTEMPTS = 3
 
 #: Wall-clock budget for a STANDALONE run (``run_standalone_facts_extraction``
 #: — the ``sharepoint-facts-extraction`` job kind / ``POST …/facts-extract``
@@ -149,6 +391,317 @@ class FactsExtractionUnavailable(RuntimeError):
     has no ontology — extraction that conforms to no schema is not a
     cheaper extraction, it is a different (and unusable) one.
     """
+
+
+class FactsDocumentError(RuntimeError):
+    """ONE document's extraction call failed for a reason specific to that
+    document — never worth stopping the pass over, and never worth
+    retrying either.
+
+    The sync-transport sibling of the batch transport's own permanent-
+    failure classification (:func:`_requeue_or_fail`'s ``permanent=True``
+    branch): an ``invalid_request_error`` (a 400 — most commonly "prompt is
+    too long", but any malformed-request response has the same shape) means
+    the API itself rejected THIS document's request, and burning the
+    account's retry budget on an identical resend would only reproduce the
+    same 400. Every OTHER non-retryable failure (401 credentials, 403
+    permission, 404 unknown model...) still means the WHOLE PASS cannot
+    proceed and stays :class:`FactsExtractionUnavailable` — see
+    :func:`_classify_permanent_error`.
+
+    Carries a short, machine-readable ``reason`` alongside the human
+    message — the same "reason class" shape the batch transport's
+    ``docs_state[file_id]["reason"]`` already records, folded into this
+    pass's report as ``facts_failed_reasons`` (:meth:`_Report.render`).
+    """
+
+    def __init__(self, message: str, *, reason: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+def _classify_permanent_error(exc: BaseException) -> Optional[str]:
+    """A ``facts_failed_reasons`` class when ``exc`` is a PER-DOCUMENT
+    permanent error, or ``None`` when it is not (either retryable, or
+    permanent but PASS-level — see :class:`FactsDocumentError`'s
+    docstring).
+
+    Checked the same way :func:`src.anonymization_ner._is_retryable` reads
+    a status code — structurally first (``.type``/``.status_code``, which
+    the Anthropic SDK's own ``APIStatusError`` sets from the parsed
+    response body, see ``anthropic._exceptions``), so this never depends on
+    a specific SDK exception class being importable. Only
+    ``invalid_request_error`` (or a bare 400 with no ``.type`` at all — a
+    stub/older-SDK shape carrying no further detail) is classified as
+    per-document; every other 4xx (401/403/404/422) is left ``None`` and
+    stays pass-level, because those mean the ACCOUNT or the MODEL is
+    unusable, not that this one document's request was malformed.
+    """
+    error_type = str(getattr(exc, "type", "") or "")
+    if error_type.startswith("invalid_request"):
+        return "invalid_request"
+    status = getattr(exc, "status_code", None)
+    if status == 400 and not error_type:
+        return "invalid_request"
+    return None
+
+
+# --------------------------------------------------------------------------
+# Provider-limit classification (TCRD-296 synthesis F.25, gaps #25/#48)
+# --------------------------------------------------------------------------
+#
+# A live incident (2026-09) hit two DIFFERENT shapes of "the provider will
+# refuse every call, not just this one": an Anthropic workspace exhausting
+# its on-demand usage limit (a 400 `invalid_request_error` whose message
+# names a reset date), and a Vertex AI Claude quota bucket with NO
+# allocation at all for a region×model pair (a 429 that retrying the SAME
+# region reproduces identically). Before this classification existed, both
+# reached `run_facts_extraction` as an undifferentiated
+# `FactsExtractionUnavailable` — which FAILS THE JOB — while the crawl's
+# `extraction.facts.stream_every` trigger kept enqueueing a fresh pass every
+# threshold, 161 failed job rows overnight with no single place saying
+# "facts are paused because the provider refuses".
+
+#: The closed set of :func:`classify_provider_limit_error` outcomes. A
+#: pass that hits one of these stops itself cleanly
+#: (``interrupted_reason: "provider_limit"``) instead of failing the job,
+#: and records a fleet-level condition (``extraction_conditions_repo()``)
+#: that suppresses further STREAMED enqueues until it clears — see
+#: :func:`streamed_pass_suppressed_by_provider_limit`. Deliberately NOT the
+#: same thing as an ordinary transient 429/5xx: those are exactly what
+#: :func:`src.anonymization_ner._is_retryable`'s AIMD/backoff already
+#: absorbs, and retrying THEM usually succeeds on the next attempt.
+PROVIDER_LIMIT_REASONS = ("workspace_limit", "quota_exceeded", "billing_disabled")
+
+
+class ProviderLimitHit(RuntimeError):
+    """A provider refusal classified as one of :data:`PROVIDER_LIMIT_REASONS`
+    — see the module section docstring above. Carries what
+    :func:`record_provider_limit_condition` needs to persist the fleet-level
+    condition; ``provider``/``model``/``region`` are filled in by the
+    CALLER (this exception is raised from deep inside a model-call helper
+    that does not always know the pass's own resolved provider), never by
+    the classifier itself.
+    """
+
+    def __init__(self, message: str, *, reason: str, retry_after_s: Optional[int] = None) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.retry_after_s = retry_after_s
+
+
+def _retry_after_seconds(exc: BaseException) -> Optional[int]:
+    """Best-effort ``Retry-After`` (seconds) off a provider error — ``None``
+    when absent or unparseable, in which case
+    :data:`PROVIDER_LIMIT_COOLDOWN_S` applies instead. Checked structurally
+    (an attribute, then an HTTP response header) so this never depends on a
+    specific SDK exception type being importable.
+    """
+    retry_after = getattr(exc, "retry_after", None)
+    if isinstance(retry_after, (int, float)) and retry_after > 0:
+        return int(retry_after)
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None)
+    if headers is not None:
+        try:
+            raw = headers.get("retry-after")
+            if raw is not None:
+                value = int(float(raw))
+                return value if value > 0 else None
+        except (TypeError, ValueError, AttributeError):
+            pass
+    return None
+
+
+def classify_provider_limit_error(exc: BaseException) -> Optional[str]:
+    """One of :data:`PROVIDER_LIMIT_REASONS` when ``exc`` is a provider
+    refusal this module treats as a FLEET-LEVEL condition, or ``None`` for
+    everything else — including an ordinary transient 429/5xx
+    (``_is_retryable`` already retries those) and a per-document
+    ``invalid_request_error`` like "prompt is too long"
+    (:func:`_classify_permanent_error` already handles that).
+
+    Message-based, deliberately: neither provider exposes a distinct
+    exception TYPE or status code for "the whole account/workspace/region
+    is out of usage" versus "this one request was malformed" (both are a
+    400 ``invalid_request_error`` on Anthropic) or "temporarily rate
+    limited" versus "this bucket has zero allocation" (both are a 429 on
+    Vertex) — status code and SDK type are checked first where they help,
+    but the message is the only signal that actually distinguishes them.
+    Kept to phrases observed live (TCRD-296 synthesis F.25):
+
+    - ``"workspace_limit"``: message mentions BOTH "workspace" and "usage
+      limit(s)" — the exact shape hit live, "Your workspace has hit the
+      API usage limits for on-demand daily spend ... You'll regain access
+      on 2026-10-01".
+    - ``"billing_disabled"``: message mentions "billing" together with
+      "disabled"/"inactive"/"not enabled" — grouped with the other two
+      rather than dropped because it is the same "nothing will succeed
+      until an operator acts" shape.
+    - ``"quota_exceeded"``: message mentions "quota" — Vertex's own
+      ``ResourceExhausted`` messages name the exhausted quota metric by
+      id ("Quota exceeded for quota metric ... and limit ... for consumer
+      ..."), which a genuinely transient rate-limit 429 does not (those
+      say "rate limit" / "too many requests", not "quota").
+    """
+    message = str(exc)
+    lowered = message.lower()
+    if "billing" in lowered and any(word in lowered for word in ("disabled", "inactive", "not enabled")):
+        return "billing_disabled"
+    if "workspace" in lowered and "usage limit" in lowered:
+        return "workspace_limit"
+    if "quota" in lowered:
+        return "quota_exceeded"
+    return None
+
+
+#: How long an active ``provider_limit`` condition suppresses a STREAMED
+#: pass (``crawler._enqueue_streamed_facts_pass``) after it last fired —
+#: see :func:`streamed_pass_suppressed_by_provider_limit`. A provider-given
+#: ``retry_after`` (seconds, :func:`_retry_after_seconds`) wins over this
+#: constant when present. The MANUAL trigger (``POST …/facts-extract``) is
+#: deliberately NEVER gated by this — an operator who just fixed the
+#: underlying limit should not have to wait out a cooldown to prove it, and
+#: a successful manual pass is exactly what clears the condition for
+#: everyone else (:func:`clear_provider_limit_conditions`).
+PROVIDER_LIMIT_COOLDOWN_S = 1800
+
+
+def record_provider_limit_condition(
+    *,
+    reason: str,
+    provider: str,
+    model: str,
+    region: Optional[str],
+    message: str,
+    retry_after_s: Optional[int],
+) -> None:
+    """Persist (or refresh) the fleet-level condition a
+    :class:`ProviderLimitHit` produced. Best-effort — a broken write here
+    must never turn an already-gracefully-stopped pass into a failed job,
+    and ``extraction_conditions`` is PG-only (A3 ratchet): on a DuckDB-
+    backed instance this silently no-ops (logged at debug), the same "fail
+    clean, never a 500" posture every other PG-only surface in this
+    pipeline takes.
+    """
+    try:
+        from src.repositories import extraction_conditions_repo
+
+        extraction_conditions_repo().record(
+            reason=reason, provider=provider, model=model, region=region, message=message, retry_after_s=retry_after_s
+        )
+    except Exception as exc:  # noqa: BLE001 — observability, never load-bearing
+        logger.debug("facts extraction: could not persist the provider_limit condition (%s) — continuing", exc)
+
+
+def clear_provider_limit_conditions(provider: str) -> None:
+    """Clear every active ``provider_limit`` condition for ``provider`` —
+    called once a pass for that provider completes WITHOUT hitting one,
+    the signal the provider is answering again. Same best-effort, fail-
+    clean posture as :func:`record_provider_limit_condition`.
+    """
+    try:
+        from src.repositories import extraction_conditions_repo
+
+        extraction_conditions_repo().clear_for_provider(provider)
+    except Exception as exc:  # noqa: BLE001 — observability, never load-bearing
+        logger.debug(
+            "facts extraction: could not clear provider_limit conditions for %s (%s) — continuing", provider, exc
+        )
+
+
+def active_provider_limit_conditions() -> List[Dict[str, Any]]:
+    """Every currently-active ``provider_limit`` condition, fleet-wide
+    (never per-connection — the underlying refusal is account/workspace/
+    region-scoped, not tied to one SharePoint connection). ``[]`` on a
+    DuckDB-backed instance (PG-only, A3 ratchet) or on any other repo
+    hiccup: a broken READ here must never itself block a pass, only an
+    actually-persisted condition should.
+    """
+    try:
+        from src.repositories import extraction_conditions_repo
+
+        return list(extraction_conditions_repo().list_active())
+    except Exception:  # noqa: BLE001 — RequiresPostgresBackend or any repo hiccup
+        return []
+
+
+def _condition_still_cooling_down(condition: Dict[str, Any], *, now: Optional[datetime] = None) -> bool:
+    """Whether ``condition`` (one row from :func:`active_provider_limit_conditions`)
+    is still within its cooldown window — its own ``retry_after_s`` past
+    ``last_seen`` when the provider gave one, else :data:`PROVIDER_LIMIT_COOLDOWN_S`.
+    An unparseable ``last_seen`` is treated as still cooling down — the
+    safer default when the stored row cannot say otherwise.
+    """
+    now = now or datetime.now(timezone.utc)
+    last_seen = condition.get("last_seen")
+    if not isinstance(last_seen, datetime):
+        try:
+            last_seen = datetime.fromisoformat(str(last_seen))
+        except (TypeError, ValueError):
+            return True
+    if last_seen.tzinfo is None:
+        last_seen = last_seen.replace(tzinfo=timezone.utc)
+    retry_after = condition.get("retry_after_s")
+    cooldown = (
+        int(retry_after) if isinstance(retry_after, (int, float)) and retry_after > 0 else PROVIDER_LIMIT_COOLDOWN_S
+    )
+    return (now - last_seen).total_seconds() < cooldown
+
+
+def streamed_pass_suppressed_by_provider_limit() -> Optional[Dict[str, Any]]:
+    """The active, still-cooling-down ``provider_limit`` condition that
+    should stop a STREAMED pass from being enqueued, or ``None`` when none
+    applies. Called ONLY from ``crawler._enqueue_streamed_facts_pass`` — the
+    self-continuation chain (``maybe_continue_pass``) never needs its own
+    call to this: it already only fires on ``interrupted_reason ==
+    "timeout"``, and a provider-limit stop always reports
+    ``"provider_limit"`` instead, so the chain simply resets and stops on
+    its own (see that function's docstring). The MANUAL trigger
+    (``POST …/facts-extract``) never calls this either — see
+    :data:`PROVIDER_LIMIT_COOLDOWN_S`.
+    """
+    for condition in active_provider_limit_conditions():
+        if _condition_still_cooling_down(condition):
+            return condition
+    return None
+
+
+# --------------------------------------------------------------------------
+# Vertex region × model quota matrix (live finding (b), TCRD-296 synthesis F.25)
+# --------------------------------------------------------------------------
+
+#: Vertex Claude quota buckets that actually exist, keyed by the model
+#: TIER substring found in a resolved model id (``"haiku"``/``"sonnet"``),
+#: not the exact dated id — a model bump within a tier must not silently
+#: invalidate this table. A region NOT listed for a tier has NO quota
+#: allocation for it at all: a pass pinned there answers 429 on every call,
+#: even a 5-token one — observed live for Sonnet outside ``global`` (the
+#: project had no regional bucket at all) and for Haiku at peak load
+#: (region buckets saturated). A model tier this table does not name
+#: (``opus``, or a future tier) is treated as unconstrained — this is a
+#: known-bad-combination guardrail, not a closed allowlist, so an unlisted
+#: tier is never refused on a stale table.
+VERTEX_REGION_MODEL_MATRIX: Dict[str, Tuple[str, ...]] = {
+    "haiku": ("global", "us-east5", "europe-west1"),
+    "sonnet": ("global",),
+}
+
+
+def vertex_region_supports_model(region: str, model: str) -> bool:
+    """Whether ``region`` has a documented Claude-on-Vertex quota bucket for
+    ``model`` per :data:`VERTEX_REGION_MODEL_MATRIX`. ``True`` for an empty
+    region/model (nothing to refuse yet) and for a model tier the matrix
+    does not name.
+    """
+    region_norm = (region or "").strip().lower()
+    model_lower = (model or "").lower()
+    if not region_norm or not model_lower:
+        return True
+    for tier, regions in VERTEX_REGION_MODEL_MATRIX.items():
+        if tier in model_lower:
+            return region_norm in regions
+    return True
 
 
 # --------------------------------------------------------------------------
@@ -186,6 +739,53 @@ def facts_surface_enabled() -> bool:
     return bool(feature_enabled("facts", "enabled", env_var="AGNES_FACTS_ENABLED", default=False))
 
 
+def facts_extraction_readiness() -> Tuple[bool, Optional[Dict[str, str]]]:
+    """Whether a standalone facts-extraction run can be enqueued right now
+    — ``(True, None)``, or ``(False, refusal)`` where ``refusal`` names the
+    switch that is off (``switch``) next to ``error``/``message``.
+
+    The single source of truth for BOTH triggers of the
+    ``sharepoint-facts-extraction`` job: the manual one
+    (``app/api/admin_sharepoint.py::_facts_extraction_readiness``, which
+    delegates here and turns a refusal into ``409 facts_extraction_disabled``)
+    and the crawl's own streamed passes
+    (``connectors.sharepoint.crawler._enqueue_streamed_facts_pass``). Both
+    check it BEFORE enqueueing, so neither ever hands the worker a job that
+    can only fail once claimed. The source card's pipeline cell
+    (``app/web/router.py``) renders the same ``switch`` as its disabled
+    reason, so the UI and the 409 can never disagree about what an admin
+    has to flip.
+
+    Lives here, not in the API module, for the same reason as
+    :func:`facts_extraction_idempotency_key`: the crawler needs it and a
+    connector must not import an ``app.api`` module — that is an upward
+    layering dependency, and one with teeth: the API module binds
+    ``source_connections_repo`` at import time, so importing it lazily from
+    inside a crawl bound whatever factory was installed at that moment
+    for the rest of the process.
+    """
+    if not facts_extraction_enabled():
+        return False, {
+            "error": "facts_extraction_disabled",
+            "switch": "extraction.facts.enabled",
+            "message": (
+                "extraction.facts.enabled is off — turn it on in /admin/server-config "
+                "before running a facts-extraction pass (it is the cost gate: this stage "
+                "spends model tokens per document)."
+            ),
+        }
+    if not facts_surface_enabled():
+        return False, {
+            "error": "facts_extraction_disabled",
+            "switch": "facts.enabled",
+            "message": (
+                "facts.enabled is off — turn it on before running a facts-extraction pass "
+                "(writing claims into a surface nothing can read is never useful)."
+            ),
+        }
+    return True, None
+
+
 def _standalone_timeout_seconds() -> float:
     """``extraction.facts.run_timeout_s`` — see
     :data:`DEFAULT_STANDALONE_TIMEOUT_S`. 0 (or negative, or unparseable)
@@ -197,6 +797,110 @@ def _standalone_timeout_seconds() -> float:
         return max(0.0, float(raw))
     except (TypeError, ValueError):
         return float(DEFAULT_STANDALONE_TIMEOUT_S)
+
+
+def _max_doc_chars() -> int:
+    """``extraction.facts.max_doc_chars`` — see :data:`DEFAULT_MAX_DOC_CHARS`.
+    Clamped to a minimum of 1 (a garbage/zero/negative configured value
+    would otherwise skip every document's text outright, silently)."""
+    from app.instance_config import get_value
+
+    raw = get_value("extraction", "facts", "max_doc_chars", default=DEFAULT_MAX_DOC_CHARS)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "facts extraction: extraction.facts.max_doc_chars=%r is not an integer — using %d",
+            raw,
+            DEFAULT_MAX_DOC_CHARS,
+        )
+        return DEFAULT_MAX_DOC_CHARS
+    return max(1, value)
+
+
+def _max_prompt_tokens() -> int:
+    """``extraction.facts.max_prompt_tokens`` — see
+    :data:`DEFAULT_MAX_PROMPT_TOKENS`. Hard-clamped to
+    ``[1, MAX_PROMPT_TOKENS_CEILING]``: an operator raising this past the
+    model's own real context window would just move the 400 from "too
+    long" to "still too long", so the ceiling applies regardless of what
+    instance.yaml asks for.
+    """
+    from app.instance_config import get_value
+
+    raw = get_value("extraction", "facts", "max_prompt_tokens", default=DEFAULT_MAX_PROMPT_TOKENS)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "facts extraction: extraction.facts.max_prompt_tokens=%r is not an integer — using %d",
+            raw,
+            DEFAULT_MAX_PROMPT_TOKENS,
+        )
+        return DEFAULT_MAX_PROMPT_TOKENS
+    return max(1, min(MAX_PROMPT_TOKENS_CEILING, value))
+
+
+def _approx_tokens(text: str, *, tabular: bool = False) -> int:
+    """A deterministic, OFFLINE estimate of ``text``'s token count.
+
+    No network call, no dependency on either provider's own tokenizer (this
+    stage runs against both Anthropic and Vertex clients, and reaching for
+    a real tokenizer would mean two different implementations agreeing by
+    luck, or a network round trip on the hot per-document path). Charged at
+    :data:`_CHARS_PER_TOKEN_DENSE` when ``tabular`` (see :func:`_is_tabular_text`
+    — digit/delimiter-dense content, not necessarily a markdown table), the
+    flat prose ratio otherwise — see the calibration note on
+    :data:`_CHARS_PER_TOKEN_DENSE` for why the dense ratio is set where it
+    is and not merely "a bit tighter than prose".
+    """
+    if not text:
+        return 0
+    ratio = _CHARS_PER_TOKEN_DENSE if tabular else _CHARS_PER_TOKEN_PROSE
+    return max(1, int(len(text) / ratio))
+
+
+def _is_tabular_text(text: str) -> bool:
+    """Whether ``text`` reads as digit/delimiter-dense tabular content — a
+    converted spreadsheet's markdown table, a CSV/TSV, or an EDI-shaped
+    segment export — see :data:`_DENSE_LINE_DELIMITERS` /
+    :data:`_TABULAR_LINE_RATIO`. A structural check on the TEXT itself, not
+    the source file's extension: a spreadsheet that converted to mostly
+    prose stays prose, and a document that happens to embed one markdown
+    table does not flip the whole document dense.
+    """
+    lines = [ln for ln in text[:_SHAPE_SAMPLE_CHARS].splitlines() if ln.strip()]
+    if not lines:
+        return False
+    dense_lines = sum(
+        1 for ln in lines if sum(ln.count(delim) for delim in _DENSE_LINE_DELIMITERS) >= _DENSE_LINE_DELIMITER_MIN
+    )
+    return (dense_lines / len(lines)) >= _TABULAR_LINE_RATIO
+
+
+def _looks_garbled(text: str) -> bool:
+    """Whether ``text`` is more likely binary/decode-garbage than
+    fact-bearing content — see :data:`_GARBLED_READABLE_CHARS` /
+    :data:`_MAX_GARBLED_UNREADABLE_RATIO` for the calibration this exact
+    threshold is set against.
+    """
+    sample = text[:_SHAPE_SAMPLE_CHARS]
+    total = len(sample)
+    if total < 200:
+        return False
+    unreadable = sum(1 for ch in sample if ch not in _GARBLED_READABLE_CHARS)
+    return (unreadable / total) > _MAX_GARBLED_UNREADABLE_RATIO
+
+
+def _token_char_budget(system_prompt_tokens: int, max_prompt_tokens: int, *, tabular: bool) -> int:
+    """How many CHARACTERS of document text (or of a retry's failing-quote
+    listing) fit under ``max_prompt_tokens`` once ``system_prompt_tokens``
+    and :data:`_MESSAGE_OVERHEAD_TOKENS` are reserved. Never negative — a
+    system prompt alone at or past the budget leaves 0, not a crash.
+    """
+    budget_tokens = max(0, max_prompt_tokens - system_prompt_tokens - _MESSAGE_OVERHEAD_TOKENS)
+    chars_per_token = _CHARS_PER_TOKEN_DENSE if tabular else _CHARS_PER_TOKEN_PROSE
+    return int(budget_tokens * chars_per_token)
 
 
 class FactsExtractionDisabled(RuntimeError):
@@ -216,7 +920,7 @@ def resolve_concurrency() -> Tuple[int, str]:
     """``(workers, source)`` for ``extraction.facts.concurrency``.
 
     ``source`` is ``config``, ``clamped`` (a configured value outside
-    ``[1, 16]``, corrected rather than obeyed), ``invalid`` (unparseable —
+    ``[1, 64]``, corrected rather than obeyed), ``invalid`` (unparseable —
     the default, loudly named rather than silently assumed), or ``default``.
     Both halves travel into the run report: an operator comparing two runs'
     wall clock must be able to see what parallelism each actually used, and
@@ -253,6 +957,84 @@ def resolve_concurrency() -> Tuple[int, str]:
     return clamped, "config"
 
 
+def _transport_mode() -> str:
+    """``extraction.facts.transport``: ``sync`` (default) or ``batch``.
+
+    An unrecognized value falls back to ``sync`` rather than raising — the
+    same "loudly named, quietly corrected" posture :func:`resolve_
+    concurrency` takes for an out-of-range value, since a typo in an
+    optional cost-shape knob must never turn into a run that refuses to
+    start.
+    """
+    from app.instance_config import get_value
+
+    raw = get_value("extraction", "facts", "transport", default=DEFAULT_TRANSPORT)
+    value = str(raw or "").strip().lower()
+    if value in ("sync", "batch"):
+        return value
+    if value:
+        logger.warning(
+            "facts extraction: extraction.facts.transport=%r is neither sync nor batch — using %s",
+            raw,
+            DEFAULT_TRANSPORT,
+        )
+    return DEFAULT_TRANSPORT
+
+
+def _retry_transport_mode() -> str:
+    """``extraction.facts.retry_transport``: ``batch`` (default) or
+    ``sync``. Only consulted by the batch transport — the sync transport's
+    corrective retry is always sync, it has no other client to use."""
+    from app.instance_config import get_value
+
+    raw = get_value("extraction", "facts", "retry_transport", default=DEFAULT_RETRY_TRANSPORT)
+    value = str(raw or "").strip().lower()
+    if value in ("sync", "batch"):
+        return value
+    if value:
+        logger.warning(
+            "facts extraction: extraction.facts.retry_transport=%r is neither sync nor batch — using %s",
+            raw,
+            DEFAULT_RETRY_TRANSPORT,
+        )
+    return DEFAULT_RETRY_TRANSPORT
+
+
+def _batch_size() -> int:
+    """``extraction.facts.batch_size``, default :data:`DEFAULT_BATCH_SIZE`,
+    hard-clamped to ``[1, MAX_BATCH_API_REQUESTS]`` — the Batches API's own
+    per-batch request ceiling, never just a suggestion."""
+    from app.instance_config import get_value
+
+    raw = get_value("extraction", "facts", "batch_size", default=DEFAULT_BATCH_SIZE)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "facts extraction: extraction.facts.batch_size=%r is not an integer — using %d",
+            raw,
+            DEFAULT_BATCH_SIZE,
+        )
+        return DEFAULT_BATCH_SIZE
+    return max(1, min(MAX_BATCH_API_REQUESTS, value))
+
+
+def _batch_poll_s() -> float:
+    """``extraction.facts.batch_poll_s``, default :data:`DEFAULT_BATCH_POLL_S`."""
+    from app.instance_config import get_value
+
+    raw = get_value("extraction", "facts", "batch_poll_s", default=DEFAULT_BATCH_POLL_S)
+    try:
+        return max(1.0, float(raw))
+    except (TypeError, ValueError):
+        logger.warning(
+            "facts extraction: extraction.facts.batch_poll_s=%r is not a number — using %.0f",
+            raw,
+            DEFAULT_BATCH_POLL_S,
+        )
+        return DEFAULT_BATCH_POLL_S
+
+
 def _model() -> str:
     """The model for this pass.
 
@@ -281,62 +1063,628 @@ def _model() -> str:
     return resolve_model_tier(raw)
 
 
+#: ``extraction.facts.retry_mode`` values (cost-levers task, retry lever).
+#: ``on_gate_fail`` is the DEFAULT and reproduces today's unmodified
+#: trigger: :func:`extract_one`'s ONE corrective retry fires exactly when
+#: the verbatim gate (:func:`verbatim_failures`) still rejects part of a
+#: document's output AFTER the zero-token deterministic repair pass
+#: (cost-levers spec 2026-09-02 §2.2, already shipped) has had its chance
+#: to fix it for free — this is the sole trigger the retry has ever had, so
+#: the default changes nothing observable. ``off`` disables the retry
+#: outright: whatever still fails the gate after repair is dropped and
+#: counted immediately, the cheapest and lowest-recall setting. ``always``
+#: retries whenever the FIRST-PASS output had ANY verbatim failure, even
+#: one the deterministic repair already fixed for free — the model is asked
+#: to re-confirm its own original mistake instead of trusting the
+#: byte-level snap. That is the most expensive setting, and (rarely) risks
+#: losing an already-good, already-repaired fact if the retry's reply does
+#: not reproduce it — a documented trade an operator opts into, not a
+#: silent regression.
+DEFAULT_RETRY_MODE = "on_gate_fail"
+_VALID_RETRY_MODES = ("always", "on_gate_fail", "off")
+
+
+def _retry_mode() -> str:
+    """``extraction.facts.retry_mode`` — see :data:`DEFAULT_RETRY_MODE`."""
+    from app.instance_config import get_value
+
+    raw = ""
+    try:
+        value = get_value("extraction", "facts", "retry_mode", default="")
+        if isinstance(value, str):
+            raw = value.strip().lower()
+    except Exception:  # noqa: BLE001 — no config package/instance.yaml is fine
+        raw = ""
+    if not raw:
+        return DEFAULT_RETRY_MODE
+    if raw not in _VALID_RETRY_MODES:
+        logger.warning(
+            "facts extraction: extraction.facts.retry_mode=%r is not one of %s — using %r",
+            raw,
+            _VALID_RETRY_MODES,
+            DEFAULT_RETRY_MODE,
+        )
+        return DEFAULT_RETRY_MODE
+    return raw
+
+
+def resolve_retry_mode(connection: Optional[Dict[str, Any]] = None) -> Tuple[str, str]:
+    """``(mode, source)`` for a PASS's retry policy — a per-connection
+    override first, the instance-level :func:`_retry_mode` otherwise.
+
+    A single high-value connection (curated, high-stakes folders — a
+    dropped quote there is a lost citation on stage) can keep the
+    corrective retry ON while the long-tail connection runs with it OFF,
+    without an instance.yaml edit that would flip every connection at
+    once. The override lives at ``connection.config.extraction.facts.
+    retry_mode`` — a sibling of ``config.extraction.stop_requested_at``
+    (:data:`connectors.sharepoint.crawler.STOP_REQUESTED_AT_KEY`), the
+    established home for per-connection extraction state on the
+    connection row, carried forward on every generic connection edit.
+
+    ``source`` mirrors :func:`resolve_concurrency`'s ``(value, source)``
+    shape: ``"connection"`` (the override won), ``"instance"`` (no
+    override set, or the connection has none — the instance-level setting
+    won), or ``"invalid"`` (a connection value was set but is not one of
+    :data:`_VALID_RETRY_MODES` — ignored and logged, same fallback as an
+    invalid instance-level value).
+    """
+    if connection:
+        raw = (((connection.get("config") or {}).get("extraction") or {}).get("facts") or {}).get("retry_mode")
+        if isinstance(raw, str) and raw.strip():
+            candidate = raw.strip().lower()
+            if candidate in _VALID_RETRY_MODES:
+                return candidate, "connection"
+            logger.warning(
+                "facts extraction: connection %s config.extraction.facts.retry_mode=%r is not one of %s "
+                "— falling back to the instance setting",
+                connection.get("id"),
+                raw,
+                _VALID_RETRY_MODES,
+            )
+    return _retry_mode(), "instance"
+
+
+_VALID_TRANSPORTS = frozenset({"sync", "batch"})
+
+
+def resolve_transport(connection: Optional[Dict[str, Any]] = None) -> Tuple[str, str]:
+    """``(transport, source)`` for a PASS — a per-connection override first,
+    the instance-level :func:`_transport_mode` otherwise; the exact shape of
+    :func:`resolve_retry_mode`, for the same reason.
+
+    A small, high-value connection (curated folders, retries ON) wants the
+    synchronous transport — its facts land within minutes of the crawl and
+    a corrective retry is immediate — while the long-tail connection over
+    the rest of a large site wants the Batches API: no per-minute token
+    ceiling and half the price, at hours of latency nobody is waiting on.
+    The override lives at ``connection.config.extraction.facts.transport``,
+    a sibling of ``retry_mode`` there, set through the same
+    ``PATCH …/extraction/facts-config`` call.
+    """
+    if connection:
+        raw = (((connection.get("config") or {}).get("extraction") or {}).get("facts") or {}).get("transport")
+        if isinstance(raw, str) and raw.strip():
+            candidate = raw.strip().lower()
+            if candidate in _VALID_TRANSPORTS:
+                return candidate, "connection"
+            logger.warning(
+                "facts extraction: connection %s config.extraction.facts.transport=%r is not one of %s "
+                "— falling back to the instance setting",
+                connection.get("id"),
+                raw,
+                sorted(_VALID_TRANSPORTS),
+            )
+    return _transport_mode(), "instance"
+
+
+def _provider_setting() -> str:
+    """``extraction.facts.provider``: ``inherit`` (default), ``anthropic``,
+    or ``vertex``. An unrecognized value falls back to ``inherit`` — the
+    same loudly-named, quietly-corrected posture :func:`_transport_mode`
+    takes for a garbage value.
+    """
+    from app.instance_config import get_value
+
+    raw = get_value("extraction", "facts", "provider", default=DEFAULT_PROVIDER)
+    value = str(raw or "").strip().lower()
+    if value in _VALID_PROVIDERS:
+        return value
+    if value:
+        logger.warning(
+            "facts extraction: extraction.facts.provider=%r is not one of %s — using %s",
+            raw,
+            sorted(_VALID_PROVIDERS),
+            DEFAULT_PROVIDER,
+        )
+    return DEFAULT_PROVIDER
+
+
+def resolve_provider(connection: Optional[Dict[str, Any]] = None) -> Tuple[str, str]:
+    """``(setting, source)`` for a PASS's LLM provider SETTING — a
+    per-connection override first, the instance-level :func:`_provider_setting`
+    otherwise; the exact shape of :func:`resolve_transport`, for the same
+    reason. The override lives at ``connection.config.extraction.facts.
+    provider``, a sibling of ``transport``/``retry_mode`` there, set through
+    the same ``PATCH …/extraction/facts-config`` call.
+
+    The returned value can itself be ``"inherit"`` — this resolves only
+    WHICH SETTING is in force, not the concrete client provider a pass
+    actually builds; see :func:`resolve_effective_provider` for that.
+    """
+    if connection:
+        raw = (((connection.get("config") or {}).get("extraction") or {}).get("facts") or {}).get("provider")
+        if isinstance(raw, str) and raw.strip():
+            candidate = raw.strip().lower()
+            if candidate in _VALID_PROVIDERS:
+                return candidate, "connection"
+            logger.warning(
+                "facts extraction: connection %s config.extraction.facts.provider=%r is not one of %s "
+                "— falling back to the instance setting",
+                connection.get("id"),
+                raw,
+                sorted(_VALID_PROVIDERS),
+            )
+    return _provider_setting(), "instance"
+
+
+def resolve_effective_provider(connection: Optional[Dict[str, Any]] = None) -> Tuple[str, str]:
+    """``(provider, source)`` — ALWAYS a concrete ``"anthropic"`` or
+    ``"vertex"``, the provider whose client this pass actually builds
+    (:func:`_build_facts_client`).
+
+    :func:`resolve_provider` resolves the SETTING, which may be ``"inherit"``
+    (the default) — meaning "follow this instance's ai.provider", read the
+    same way every other server-side LLM call-site reads it
+    (``connectors.llm.factory.vertex_config_or_none``, the SAME resolution
+    ``ai.provider: vertex`` gets everywhere else). ``src.anonymization_ner.
+    build_client``'s own ladder (:func:`src.anonymization_ner.
+    resolve_llm_provider`) resolves the SAME way for its OWN callers —
+    ``extraction.facts.provider``/``ai.provider`` before a static
+    ``ANTHROPIC_API_KEY``/``LLM_API_KEY`` — with one addition this function
+    has no need for: a caller-named per-stage knob
+    (``extraction.anonymization.provider``/``extraction.scan_ocr.provider``)
+    that wins ahead of even ``extraction.facts.provider``, for a stage that
+    has no per-connection override of its own the way this one does.
+
+    ``source`` extends :func:`resolve_provider`'s own with a ``:inherit``
+    suffix when the setting resolved through ``ai.provider`` rather than
+    naming a provider outright — an operator reading a run report can tell
+    "this connection is pinned" from "this connection follows the instance
+    default, which currently means X".
+    """
+    setting, source = resolve_provider(connection)
+    if setting != "inherit":
+        return setting, source
+    from connectors.llm.factory import vertex_config_or_none
+
+    if vertex_config_or_none() is not None:
+        return "vertex", f"{source}:inherit"
+    return "anthropic", f"{source}:inherit"
+
+
+def _region_looks_valid(value: str) -> bool:
+    """Whether ``value`` is a well-formed Vertex region — the same character
+    class :func:`connectors.llm.vertex_provider.invalid_vertex_setting` holds
+    ``ai.vertex.region``/``chat.llm.vertex.region`` to. That function checks
+    a ``(project_id, region)`` pair together, so a syntactically-valid
+    placeholder project id stands in for the one this call does not have —
+    only the ``"region"`` half of its verdict is read.
+    """
+    from connectors.llm.vertex_provider import invalid_vertex_setting
+
+    return invalid_vertex_setting("region-check-placeholder", value) is None
+
+
+def _vertex_region_setting() -> str:
+    """``extraction.facts.vertex_region``: the instance-level default, or
+    ``""`` when unset or malformed — the same loudly-named, quietly-corrected
+    posture :func:`_provider_setting` takes for a garbage value.
+    """
+    from app.instance_config import get_value
+
+    raw = get_value("extraction", "facts", "vertex_region", default="")
+    value = str(raw or "").strip().lower()
+    if not value:
+        return ""
+    if _region_looks_valid(value):
+        return value
+    logger.warning(
+        "facts extraction: extraction.facts.vertex_region=%r is not a valid Vertex region "
+        "(lowercase letters, digits, dash; 'global' allowed) — ignoring",
+        raw,
+    )
+    return ""
+
+
+def resolve_vertex_region(connection: Optional[Dict[str, Any]] = None) -> Tuple[Optional[str], str]:
+    """``(region, source)`` for a PASS's Vertex AI region — THREE levels,
+    one more than :func:`resolve_transport`/:func:`resolve_provider`: a
+    per-connection override (``connection.config.extraction.facts.
+    vertex_region``, a sibling of ``transport``/``provider`` there, set
+    through the same ``PATCH …/extraction/facts-config`` call), then the
+    instance-level ``extraction.facts.vertex_region``
+    (:func:`_vertex_region_setting`), then this instance's own
+    ``ai.vertex.region`` (``connectors.llm.factory.vertex_config_or_none`` —
+    the SAME resolution :func:`resolve_effective_provider`'s own ``inherit``
+    fallback reads).
+
+    Google enforces Claude-on-Vertex quotas PER REGION: a project running
+    every connection's facts pass against the same region hits that
+    region's requests-per-minute ceiling long before the account's actual
+    spend limit — regions have independent quotas, so pinning a connection
+    to its own region multiplies effective throughput at the same per-call
+    price. Only meaningful when the pass's :func:`resolve_effective_provider`
+    resolves to ``"vertex"`` — resolved unconditionally here regardless, and
+    simply unused by :func:`_build_facts_client` for an anthropic pass.
+
+    ``region`` is ``None`` when nothing at any of the three levels names one
+    — this instance has no usable Vertex configuration at all, which
+    :func:`_build_facts_client` already turns into a loud
+    :class:`FactsExtractionUnavailable` for a pass actually resolved to
+    ``provider: vertex``, so a caller here never needs to guess a default.
+    ``source`` is ``"connection"``, ``"instance"`` (the
+    ``extraction.facts.vertex_region`` setting won), ``"instance:ai.vertex"``
+    (both above were unset — ``ai.vertex.region`` won), or ``"none"``.
+    """
+    if connection:
+        raw = (((connection.get("config") or {}).get("extraction") or {}).get("facts") or {}).get("vertex_region")
+        if isinstance(raw, str) and raw.strip():
+            candidate = raw.strip().lower()
+            if _region_looks_valid(candidate):
+                return candidate, "connection"
+            logger.warning(
+                "facts extraction: connection %s config.extraction.facts.vertex_region=%r is not a valid "
+                "Vertex region — falling back to the instance setting",
+                connection.get("id"),
+                raw,
+            )
+    instance_region = _vertex_region_setting()
+    if instance_region:
+        return instance_region, "instance"
+    from connectors.llm.factory import vertex_config_or_none
+
+    vertex = vertex_config_or_none()
+    if vertex is not None:
+        return vertex[1], "instance:ai.vertex"
+    return None, "none"
+
+
+def _retry_should_fire(
+    retry_mode: str,
+    *,
+    pre_repair_failures: Sequence[Tuple[dict, str]],
+    post_repair_failures: Sequence[Tuple[dict, str]],
+) -> bool:
+    """Whether :func:`extract_one` spends its ONE corrective retry, per
+    :data:`DEFAULT_RETRY_MODE`'s three modes.
+
+    ``pre_repair_failures`` and ``post_repair_failures`` are almost always
+    the SAME list (repair only recomputes the latter when it actually fixed
+    something) — they diverge in exactly the case ``always`` exists to
+    reach: repair fixed every failure, so the gate is clean, but the
+    first-pass output was not."""
+    if retry_mode == "off":
+        return False
+    if retry_mode == "always":
+        return bool(pre_repair_failures)
+    return bool(post_repair_failures)
+
+
+def _facts_llm_cache_enabled() -> bool:
+    """``extraction.facts.llm_cache`` — on by default. The cache table is
+    Postgres-only (see :func:`_resolve_llm_cache`); this flag is *in
+    addition* to that, for an operator who wants the pass to always call
+    the model fresh (e.g. auditing whether the model's output is stable)
+    even on a Postgres-backed instance.
+    """
+    from app.instance_config import feature_enabled
+
+    return bool(
+        feature_enabled("extraction", "facts", "llm_cache", env_var="AGNES_EXTRACTION_FACTS_LLM_CACHE", default=True)
+    )
+
+
+def _resolve_llm_cache() -> Any | None:
+    """This pass's content-hash LLM-response cache, or ``None``.
+
+    ``None`` is the ordinary "no cache" state, not an error — every
+    caller in this module treats it that way. Two independent reasons
+    produce it: :func:`_facts_llm_cache_enabled` is off, or the active
+    backend is DuckDB (the cache table is Postgres-only, A3 ratchet — see
+    ``docs/migrations.md`` -> "Adding a PG-only feature"). The DuckDB case
+    logs once, here, at the START of the pass — never per document, and
+    never a crash.
+    """
+    if not _facts_llm_cache_enabled():
+        return None
+    from src.repositories import RequiresPostgresBackend, facts_llm_cache_repo
+
+    try:
+        return facts_llm_cache_repo()
+    except RequiresPostgresBackend:
+        logger.info(
+            "facts extraction: the LLM response cache is Postgres-only — running this pass without it "
+            "(extraction.facts.llm_cache has no effect on a DuckDB-backed instance)"
+        )
+        return None
+
+
+def _facts_cache_key(*, sha256: str, model: str, fingerprint: str, suffix: str = "") -> str:
+    """content + model + prompt/ontology fingerprint (+ an optional
+    call-kind suffix) -> cache key.
+
+    The same three-way identity :func:`is_up_to_date` already uses to
+    decide whether a document needs re-extraction at all — a cache hit is
+    "the model already answered this exact question", a state-file hit is
+    "we already shipped this exact answer". ``suffix`` keeps the ONE
+    corrective retry's response in its own row: it is a reply to a
+    DIFFERENT prompt (the base message plus a listing of what failed), so
+    conflating the two keys would serve a first-pass reply to a retry
+    lookup or vice versa.
+    """
+
+    raw = "|".join((sha256 or "", model or "", fingerprint or "", suffix or "")).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _cache_lookup(cache: Any, *, sha256: str, model: str, fingerprint: str, suffix: str = "") -> Optional[str]:
+    """A previously-successful LLM reply for this exact
+    (document content, model, effective prompt[, call kind]) — a zero-token
+    substitute for the model call about to follow. ``None`` on a miss OR
+    when ``cache`` is ``None`` (caching disabled/unavailable — see
+    :func:`_resolve_llm_cache`); a lookup failure is swallowed the same way,
+    because a broken cache read must degrade to "call the model", never
+    fail the document."""
+    if cache is None:
+        return None
+    key = _facts_cache_key(sha256=sha256, model=model, fingerprint=fingerprint, suffix=suffix)
+    try:
+        row = cache.get(key)
+    except Exception as exc:  # noqa: BLE001 — a cache read must never fail the document
+        logger.warning("facts extraction: cache lookup failed (%s) — calling the model", type(exc).__name__)
+        return None
+    if not row:
+        return None
+    response = row.get("response")
+    return response.get("text") if isinstance(response, dict) else None
+
+
+def _cache_store(
+    cache: Any,
+    *,
+    sha256: str,
+    model: str,
+    fingerprint: str,
+    suffix: str,
+    reply: str,
+    usage: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Store a successful reply so the next document with the SAME content
+    hash, model and fingerprint (a duplicate file, or a re-run) never pays
+    for this call again. Best-effort: a failed write is logged and
+    swallowed — a document whose facts already shipped must never fail
+    because caching them for NEXT time did not work."""
+    if cache is None:
+        return
+    key = _facts_cache_key(sha256=sha256, model=model, fingerprint=fingerprint, suffix=suffix)
+    try:
+        cache.put(key, sha256=sha256, model=model, fingerprint=fingerprint, response={"text": reply}, usage=usage)
+    except Exception as exc:  # noqa: BLE001 — a failed cache write must never fail the document
+        logger.warning(
+            "facts extraction: cache store failed (%s) — continuing without caching this reply", type(exc).__name__
+        )
+
+
+# --------------------------------------------------------------------------
+# Partitioned passes (TCRD-296 gap #67) — stable document->partition
+# assignment, shared by the planner (`_plan_documents`) and the fan-out
+# trigger (`enqueue_facts_extraction_passes`) below.
+# --------------------------------------------------------------------------
+
+
+def _partition_of(corpus_file_id: str, count: int) -> int:
+    """Which partition (``0..count-1``) owns this document — a STABLE
+    function of ``corpus_file_id`` alone, so the same document always
+    lands in the same partition regardless of which process/host computes
+    it, and re-running the SAME ``count`` later reproduces the identical
+    split (idempotent re-runs, exactly like :func:`is_up_to_date` already
+    relies on for the per-document ledger). Python's built-in ``hash()``
+    is deliberately NOT used here — string hashing is randomized per
+    process (``PYTHONHASHSEED``), which would scatter one connection's
+    documents across a DIFFERENT split every time a worker restarts.
+    ``sha1`` is fast enough for this (a handful of bytes, once per
+    document per pass) and its first 8 bytes give more than enough
+    entropy to distribute evenly across any realistic partition count.
+    """
+    if count <= 1:
+        return 0
+    digest = hashlib.sha1(corpus_file_id.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big") % count
+
+
+class _PartitionDocsLedger(dict):
+    """A ``docs_state`` dict SCOPED to one partition's own documents,
+    tracking which keys were set/removed since the last
+    :meth:`drain_dirty` call.
+
+    Every existing ``docs_state[file_id] = {...}`` / ``docs_state.pop(file_id,
+    None)`` call site in this module (:func:`_plan_documents`,
+    :func:`_fold_accepted_result`, :class:`_BatchShipper`, ...) already
+    treats ``docs_state`` as a plain dict and needs no change to work
+    against this — the ONLY thing that changes for a partitioned run is
+    HOW the caller persists it afterwards (see :func:`_persist_facts_docs`):
+    a per-document MERGE into the connection-wide ledger instead of a
+    whole-payload overwrite, which is what keeps a sibling partition's own
+    concurrent progress from being clobbered by a stale in-memory
+    snapshot (TCRD-296 gap #67's finding — a single connection-wide
+    ``save_state`` call turned a 7-connection-parallel pass into one
+    connection with ONE slow pass once those connections were merged).
+    """
+
+    def __init__(self, initial: Dict[str, Any]) -> None:
+        super().__init__(initial)
+        self._dirty_set: set = set()
+        self._dirty_removed: set = set()
+
+    def __setitem__(self, key: str, value: Any) -> None:  # noqa: D105
+        super().__setitem__(key, value)
+        self._dirty_set.add(key)
+        self._dirty_removed.discard(key)
+
+    def pop(self, key: str, *default: Any) -> Any:  # noqa: D102
+        had_key = key in self
+        result = super().pop(key, *default)
+        if had_key:
+            self._dirty_removed.add(key)
+            self._dirty_set.discard(key)
+        return result
+
+    def drain_dirty(self) -> Tuple[Dict[str, Any], List[str]]:
+        """Every key set/removed since the last drain — ``(set_entries,
+        removed)`` — and clears the tracking. Called right before each
+        merge-write (:func:`_persist_facts_docs`)."""
+        set_entries = {key: self[key] for key in self._dirty_set if key in self}
+        removed = sorted(self._dirty_removed)
+        self._dirty_set.clear()
+        self._dirty_removed.clear()
+        return set_entries, removed
+
+
+def _load_facts_state_for_partition(
+    connection_id: str, partition: Optional[Tuple[int, int]]
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """``(state, docs_state)`` for one pass — the un-partitioned shape
+    (``partition`` ``None`` or ``count <= 1``, every caller before this
+    feature existed) unchanged: ``state["docs"]`` itself, mutated and
+    persisted whole exactly as today.
+
+    For a partitioned run, ``state`` is still the FULL connection-wide
+    blob (top-level fields like ``facts_continuation_chain`` are read off
+    it, though a partitioned pass never writes them directly — see
+    :func:`maybe_continue_pass`), but ``docs_state`` is a
+    :class:`_PartitionDocsLedger` scoped to only the documents THIS
+    partition owns (:func:`_partition_of`). :func:`_plan_documents`'s own
+    partition filter already keeps a partitioned walk from ever offering
+    another partition's file, so this scoping is belt-and-braces there —
+    but it is also what keeps the batch transport's resume scan (``for
+    fid, e in docs_state.items() if e["batch_id"] == ...``) from ever
+    picking up a SIBLING partition's still in-flight batch id, which is
+    why :func:`run_facts_extraction` forces the sync transport for a
+    partitioned run instead (see its own docstring).
+    """
+    state = load_state(connection_id)
+    if partition is None or partition[1] <= 1:
+        return state, state["docs"]
+    index, count = partition
+    scoped = {fid: entry for fid, entry in state["docs"].items() if _partition_of(fid, count) == index}
+    return state, _PartitionDocsLedger(scoped)
+
+
+def _persist_facts_docs(
+    connection_id: str, state: Dict[str, Any], docs_state: Dict[str, Any], *, partition: Optional[Tuple[int, int]]
+) -> None:
+    """Persist this pass's progress — a plain :func:`save_state` (whole
+    payload) for an un-partitioned run, or a per-document
+    :func:`~connectors.sharepoint.state_store.merge_docs` write of only
+    what changed since the last call, for a partitioned one (see
+    :func:`_load_facts_state_for_partition`'s docstring for why a whole
+    overwrite is unsafe there)."""
+    if partition is None or partition[1] <= 1:
+        save_state(connection_id, state)
+        return
+    if not isinstance(docs_state, _PartitionDocsLedger):
+        return
+    set_entries, removed = docs_state.drain_dirty()
+    if not set_entries and not removed:
+        return
+    from connectors.sharepoint.state_store import merge_docs
+
+    merge_docs("facts", connection_id, set_entries=set_entries, removed=removed)
+
+
+def _is_last_facts_partition(connection_id: str, partition: Optional[Tuple[int, int]]) -> bool:
+    """Whether THIS partition is the last of its generation to finish —
+    true unconditionally for an un-partitioned run (``partition`` ``None``
+    or ``count <= 1``). For a partitioned one, true exactly when no OTHER
+    ``sharepoint-facts-extraction`` job for this connection, sharing the
+    same ``count``, is still ``queued``/``running`` — mirrors the crawl
+    shard design's "the LAST child to finish finalizes the parent"
+    (2026-09-03 auto-parallel-crawl design §4.3), reused here for the same
+    reason: only the last completer of a generation should run work that
+    must happen exactly once per connection (the end-of-pass orphan sweep,
+    #2220; the decision whether to plan the NEXT generation,
+    :func:`maybe_continue_pass`).
+
+    THIS job's own row (still ``running`` while this function executes,
+    for the in-process caller) is excluded by matching ``index`` — every
+    OTHER row is a genuine sibling.
+    """
+    if partition is None or partition[1] <= 1:
+        return True
+    index, count = partition
+    from src.repositories import jobs_repo
+
+    repo = jobs_repo()
+    for status in ("queued", "running"):
+        for job in repo.list(kind="sharepoint-facts-extraction", status=status, limit=200):
+            payload = job.get("payload_json") or {}
+            if str(payload.get("connection_id")) != str(connection_id):
+                continue
+            other = payload.get("partition") or {}
+            if int(other.get("count") or 1) != count:
+                continue
+            if int(other.get("index") or 0) == index:
+                continue  # this job's own row
+            return False
+    return True
+
+
 # --------------------------------------------------------------------------
 # Per-document state (idempotent re-runs)
 # --------------------------------------------------------------------------
 
 
 def state_path(connection_id: str) -> Path:
-    """``<state dir>/sharepoint_facts/<connection_id>.json``.
+    """``<state dir>/sharepoint_facts/<connection_id>.json`` — the DuckDB
+    fallback (and, until imported, the Postgres path's own source of truth)
+    location. See ``connectors.sharepoint.state_store.file_state_path``.
 
-    Validates ``connection_id`` as a single safe segment AND contains the
-    resolved path inside the state directory — both layers, exactly as
-    ``connectors.sharepoint.crawler.state_path`` does for the crawl state.
+    Sibling of the crawler's own ``sharepoint_crawl`` state, deliberately
+    NOT the same store: a corrupt facts state must never cost the crawl its
+    deltaLinks (which would re-download an entire estate), and vice versa —
+    see ``connectors.sharepoint.state_store``'s module docstring.
     """
-    if not _SAFE_SEGMENT_RE.match(connection_id or "") or connection_id in (".", ".."):
-        raise FactsExtractionUnavailable(f"unsafe connection id for a state file: {connection_id!r}")
-    from src.db import _get_state_dir
+    from connectors.sharepoint.state_store import StateStoreError, file_state_path
 
-    base = (_get_state_dir() / _STATE_SUBDIR).resolve()
-    base.mkdir(parents=True, exist_ok=True)
-    resolved = (base / f"{connection_id}.json").resolve()
-    resolved.relative_to(base)  # containment assertion; raises ValueError if escaped
-    return resolved
+    try:
+        return file_state_path("facts", connection_id)
+    except StateStoreError as exc:
+        raise FactsExtractionUnavailable(str(exc)) from exc
 
 
 def load_state(connection_id: str) -> Dict[str, Any]:
     """This connection's per-document extraction state, tolerating a torn
-    or absent file.
+    or absent file, or a never-before-seen connection.
 
-    An unreadable state file means "re-extract everything", which costs
+    Unreadable/missing state means "re-extract everything", which costs
     money but is correct; refusing to run would be a permanent outage, and
     replace-mode ingest means the re-extraction cannot duplicate anything.
     """
-    path = state_path(connection_id)
-    state: Dict[str, Any] = {}
-    if path.exists():
-        try:
-            loaded = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                state = loaded
-        except (json.JSONDecodeError, OSError) as exc:
-            logger.warning(
-                "facts extraction: state for connection %s unreadable (%s) — re-extracting from scratch",
-                connection_id,
-                exc,
-            )
+    from connectors.sharepoint.state_store import get as _state_get
+
+    state: Dict[str, Any] = _state_get("facts", connection_id) or {}
     state.setdefault("version", 1)
     state.setdefault("docs", {})
     return state
 
 
 def save_state(connection_id: str, state: Dict[str, Any]) -> None:
-    """Atomically replace this connection's facts state (tmp + ``os.replace``)."""
+    """Persist this connection's facts state — a Postgres upsert, or an
+    atomic file replace (tmp + ``os.replace``) on the DuckDB fallback."""
+    from connectors.sharepoint.state_store import put as _state_put
 
-    path = state_path(connection_id)
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(state, sort_keys=True), encoding="utf-8")
-    os.replace(tmp, path)
+    _state_put("facts", connection_id, state)
 
 
 def is_up_to_date(entry: Optional[Dict[str, Any]], *, sha256: str, model: str, fingerprint: str) -> bool:
@@ -354,6 +1702,137 @@ def is_up_to_date(entry: Optional[Dict[str, Any]], *, sha256: str, model: str, f
         and entry.get("model") == model
         and entry.get("prompt_fingerprint") == fingerprint
     )
+
+
+def reset_no_claims_ledger_entries(connection_id: str, *, dry_run: bool = False) -> Dict[str, Any]:
+    """The recovery surface for TCRD-296 gap #62's HISTORICAL backlog — an
+    admin/CLI action (``POST …/connections/{id}/facts/reset-no-claims``,
+    ``agnes admin sharepoint facts reset --no-claims``), not something an
+    ordinary pass calls.
+
+    :class:`_BatchShipper` (``_correct_ledger``/``_revert_ledger``) already
+    keeps a FRESH pass's own ledger entries honest going forward. This
+    function is the one-time fix for entries a PRE-fix pass already wrote:
+    ``status: "done"`` with ``nodes > 0`` but no claim ever landed for that
+    file — an ingest refusal, or a rejected/deferred citation, that the
+    ledger write happened before the batch's real outcome was known. Left
+    alone, :func:`is_up_to_date` treats ``"done"`` as current forever, so
+    the document is invisible to every later pass.
+
+    Every candidate (``status == "done"``, ``nodes > 0``, no
+    ``claims_on_file_id`` marker yet — an entry already carrying one was
+    already resolved, either by a fresh pass's own correction or an
+    earlier call to this same action) is checked against the REAL fact
+    graph, since the ledger itself never recorded a claim count:
+
+    * The file already has a claim (:meth:`~src.repositories.facts_pg
+      .FactsPgRepository.claims_count_by_file`) — nothing to do.
+    * No claim on THIS file, but a SIBLING anchored to the same
+      ``(corpus_id, doc_id)`` has one — a TCRD-241 duplicate copy, by
+      design (the loader collapses every byte-identical copy onto one
+      deterministic winner). Backfilled with ``claims_on_file_id`` rather
+      than reset, so a later run of this same action (or a coverage
+      report) can tell "duplicate" from "still missing".
+    * No claim anywhere for this doc_id — genuinely missing. The entry is
+      REMOVED from the ledger so the next pass re-derives and re-extracts
+      it: cache-served (:func:`_normalize_evidence_doc_ids` now keeps a
+      cache hit's evidence correctly attributed), so the re-extraction
+      itself costs no additional model call once the ORIGINAL call already
+      produced a usable reply.
+
+    ``dry_run`` (default ``False``) computes and reports every outcome
+    WITHOUT writing anything back — the state is loaded but never saved.
+
+    Refuses (:class:`~connectors.sharepoint.state_store.FactsPassLocked`,
+    propagated — the caller/endpoint translates it to a ``409``) while ANY
+    facts-extraction pass for this connection — the un-partitioned chained/
+    standalone lock, or ANY partition of a fanned-out pass (TCRD-296 gap
+    #67) — currently holds
+    ``connectors.sharepoint.state_store.any_facts_pass_running``'s answer
+    as ``True``: an in-flight pass upserts the ledger on its own schedule
+    (whole-payload for an un-partitioned run, a per-document merge for a
+    partitioned one), so mutating it here at the same time would race that
+    write. Checked once, up front, rather than held as a lock for this
+    call's own duration — a real pass can run for up to an hour, and this
+    is a rare, deliberate operator action, not a hot path a lock needs to
+    protect from itself.
+    """
+    from connectors.sharepoint.state_store import FactsPassLocked, any_facts_pass_running
+    from src.repositories import corpus_file_sources_repo, facts_repo
+
+    if any_facts_pass_running(connection_id):
+        raise FactsPassLocked(f"a facts-extraction pass is already running for connection {connection_id!r}")
+
+    state = load_state(connection_id)
+    docs_state: Dict[str, Any] = state.get("docs") or {}
+
+    candidates = [
+        file_id
+        for file_id, entry in docs_state.items()
+        if isinstance(entry, dict)
+        and entry.get("status") == "done"
+        and int(entry.get("nodes") or 0) > 0
+        and "claims_on_file_id" not in entry
+    ]
+
+    sources_repo = corpus_file_sources_repo()
+    facts = facts_repo()
+
+    mapping: Dict[str, Dict[str, Any]] = {}
+    siblings_by_file: Dict[str, List[str]] = {}
+    all_file_ids: set = set(candidates)
+    for file_id in candidates:
+        row = sources_repo.get(file_id)
+        if not row or not row.get("source_doc_id"):
+            continue
+        mapping[file_id] = row
+        siblings = sources_repo.files_for_doc(row["corpus_id"], row["source_doc_id"])
+        siblings_by_file[file_id] = siblings
+        all_file_ids.update(siblings)
+
+    counts = facts.claims_count_by_file(sorted(all_file_ids))
+
+    reset_ids: List[str] = []
+    duplicate_ids: Dict[str, str] = {}
+    already_had_claims = 0
+    unmapped: List[str] = []
+
+    for file_id in candidates:
+        if counts.get(file_id, 0) > 0:
+            already_had_claims += 1
+            continue
+        row = mapping.get(file_id)
+        if row is None:
+            # No `corpus_file_sources` mapping (or no `source_doc_id`)
+            # at all — nothing to check a sibling against, and no
+            # doc_id to re-derive by. Left alone; the run report names
+            # it so an operator can look closer rather than have it
+            # silently vanish from either bucket.
+            unmapped.append(file_id)
+            continue
+        siblings = [s for s in siblings_by_file.get(file_id, []) if s != file_id]
+        winner = next((s for s in siblings if counts.get(s, 0) > 0), None)
+        if winner is not None:
+            duplicate_ids[file_id] = winner
+            if not dry_run:
+                docs_state[file_id]["claims_on_file_id"] = winner
+            continue
+        reset_ids.append(file_id)
+        if not dry_run:
+            docs_state.pop(file_id, None)
+
+    if not dry_run and (reset_ids or duplicate_ids):
+        state["docs"] = docs_state
+        save_state(connection_id, state)
+
+    return {
+        "dry_run": dry_run,
+        "candidates": len(candidates),
+        "reset": sorted(reset_ids),
+        "duplicates_recorded": dict(sorted(duplicate_ids.items())),
+        "already_had_claims": already_had_claims,
+        "unmapped": sorted(unmapped),
+    }
 
 
 # --------------------------------------------------------------------------
@@ -539,6 +2018,49 @@ def parse_streams(reply_text: str) -> Tuple[List[dict], List[dict], int]:
         else:
             parse_errors += 1
     return nodes, edges, parse_errors
+
+
+def _normalize_evidence_doc_ids(nodes: List[dict], edges: List[dict], doc_id: str) -> int:
+    """Rewrite every evidence entry's ``doc_id`` to ``doc_id`` — the
+    document actually being processed — and return how many entries were
+    rewritten.
+
+    The model's citation (``evidence.doc_id`` — the prompt tells it to cite
+    "the document you are reading", see ``facts_prompt.py``) is trustworthy
+    on a fresh call, but not necessarily on a content-hash cache hit
+    (:func:`_cache_lookup`): the cache key is ``sha256 | model |
+    fingerprint``, where ``sha256`` hashes the CONVERTED markdown, while
+    ``doc_id`` identifies the SOURCE bytes. Two documents can convert to
+    byte-identical markdown while their source bytes — and therefore
+    ``doc_id`` — differ (a re-save, a metadata-only edit, a re-export from
+    a different tool). That is a legitimate cache hit (same content, no
+    reason to pay for a second call), but the replayed reply's evidence
+    still names the FIRST document that ever produced it. Left uncorrected,
+    ingest resolves those citations against the wrong ``corpus_file_id`` —
+    silently dropped (``ON CONFLICT DO NOTHING`` when the wrong doc_id
+    happens to share this document's corpus) or rejected outright
+    (``ambiguous_cross_collection_doc_id`` when it does not).
+
+    Mutates the ``evidence`` entries in place — a pure post-processing
+    pass with no effect on anything upstream, since the verbatim gate
+    matches on ``quote`` alone, never ``doc_id``. The count is reported
+    (see :class:`_DocResult`\\ 's ``evidence_doc_id_rewritten`` and
+    :class:`_Report`'s field of the same name) so a MODEL that persistently
+    mis-cites its own document — not only a cache replay — stays visible in
+    the run report rather than being silently corrected away.
+    """
+    rewritten = 0
+    for fact in (*nodes, *edges):
+        evidence = fact.get("evidence")
+        if not isinstance(evidence, list):
+            continue
+        for entry in evidence:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("doc_id") != doc_id:
+                entry["doc_id"] = doc_id
+                rewritten += 1
+    return rewritten
 
 
 def quote_is_verbatim(quote: str, *, chunk_texts: Sequence[str], filename: Optional[str], path: Optional[str]) -> bool:
@@ -756,8 +2278,87 @@ def repair_verbatim_failures(
 
 # --------------------------------------------------------------------------
 # The model call — same credentials, same client, same retry classification
-# as src/anonymization_ner.py
+# as src/anonymization_ner.py, EXCEPT for provider selection (see
+# :func:`_build_facts_client`), which this stage resolves itself rather than
+# delegating to ``build_client``'s static-key-wins-over-Vertex ladder.
 # --------------------------------------------------------------------------
+
+
+def _vertex_model_id(model: str) -> str:
+    """``model`` translated for Vertex — ``to_vertex_model_id`` with one
+    extra substitution: this stage's own zero-config default
+    (``src.anonymization_ner.FALLBACK_MODEL``, ``"claude-haiku-4-5"``, no
+    dated snapshot) passes through ``to_vertex_model_id`` UNCHANGED, since
+    that function only rewrites an ALREADY-dated id's ``-YYYYMMDD`` suffix
+    to Vertex's ``@YYYYMMDD`` spelling — and an undated id is not a Vertex-
+    recognized model there (Vertex requires an explicit snapshot). The known-
+    good Vertex snapshot for the same Haiku tier is
+    ``connectors.llm.factory.MODEL_TIERS["haiku"]``
+    (``"claude-haiku-4-5-20251001"``) — substituted here, and ONLY here, so
+    every other caller of the shared bare default (the anonymization
+    detector, scan OCR) is unaffected: both run against the first-party
+    Anthropic API, where the undated alias is valid.
+    """
+    from connectors.llm.factory import MODEL_TIERS
+    from connectors.llm.vertex_provider import to_vertex_model_id
+
+    from src.anonymization_ner import FALLBACK_MODEL
+
+    resolved = MODEL_TIERS["haiku"] if model == FALLBACK_MODEL else model
+    return to_vertex_model_id(resolved)
+
+
+def _build_facts_client(
+    provider: str, model: str, timeout_s: float, *, vertex_region: Optional[str] = None
+) -> Tuple[Any, str]:
+    """The client for one pass's resolved :func:`resolve_effective_provider`.
+
+    ``"anthropic"`` delegates to ``src.anonymization_ner.build_client``
+    (called with no ``own_setting_path`` — this pass has already resolved
+    its OWN provider, so it only needs that shared function's
+    ``extraction.facts.provider``/``ai.provider``-then-static-key tail, not
+    a second per-stage override level). ``"vertex"`` builds an
+    ``AnthropicVertex`` client DIRECTLY instead, deliberately bypassing that
+    ladder entirely: the caller already resolved WHICH provider this pass
+    must use (an explicit ``extraction.facts.provider: vertex``, or
+    ``inherit`` reading ``ai.provider: vertex``), and a static
+    ``ANTHROPIC_API_KEY`` / ``LLM_API_KEY`` sitting in the environment for an
+    unrelated reason — the root cause of the incident this knob exists to
+    fix — must never silently override that choice.
+
+    ``vertex_region`` is the caller's already-resolved
+    :func:`resolve_vertex_region` answer — a truthy value wins over the
+    region ``vertex_config_or_none()`` itself returns (this instance's
+    ``ai.vertex.region``), so a connection or instance override can pin one
+    pass to a less-saturated Vertex region without touching the project id.
+    ``None``/``""`` (unset, the common case) leaves ``ai.vertex.region`` in
+    force, unchanged from before this parameter existed.
+
+    Raises :class:`FactsExtractionUnavailable` — never a bare exception —
+    naming the missing setting when ``provider == "vertex"`` but this
+    instance has no usable Vertex configuration.
+    """
+    if provider == "vertex":
+        from connectors.llm.factory import vertex_config_or_none
+        from connectors.llm.vertex_provider import create_vertex_client
+
+        vertex = vertex_config_or_none()
+        if vertex is None:
+            raise FactsExtractionUnavailable(
+                "extraction.facts.provider resolved to 'vertex' but this instance has no usable Vertex "
+                "configuration — set ai.provider: vertex and ai.vertex.project_id (optionally "
+                "ai.vertex.region) in instance.yaml, or the ANTHROPIC_VERTEX_PROJECT_ID env var"
+            )
+        project_id, default_region = vertex
+        region = vertex_region or default_region
+        return create_vertex_client(project_id=project_id, region=region, timeout=timeout_s), _vertex_model_id(model)
+
+    from src.anonymization_ner import DetectionUnavailable, build_client
+
+    try:
+        return build_client(model, timeout_s)
+    except DetectionUnavailable as exc:
+        raise FactsExtractionUnavailable(str(exc)) from exc
 
 
 def _empty_usage() -> Dict[str, int]:
@@ -774,14 +2375,18 @@ def _empty_usage() -> Dict[str, int]:
 class _Extractor:
     """One run's model client, prompt and token accounting.
 
-    Credential resolution, the Vertex branch, the retry classification and
-    the reply-text extraction are all
+    The retry classification and the reply-text extraction are
     ``src.anonymization_ner``'s — imported, not copied, so this stage can
-    never drift into a second (weaker) definition of "which key, which
-    client, which failure is worth retrying". Private names are imported
-    deliberately: duplicating them is strictly worse than depending on
-    them, and the same lazy cross-module private import is already the
-    convention between the crawler and ``app.worker.kinds``.
+    never drift into a second (weaker) definition of "which failure is worth
+    retrying". Private names are imported deliberately: duplicating them is
+    strictly worse than depending on them, and the same lazy cross-module
+    private import is already the convention between the crawler and
+    ``app.worker.kinds``. Client construction itself is
+    :func:`_build_facts_client` — the resolved ``provider`` decides whether
+    that delegates to ``src.anonymization_ner.build_client`` (the anthropic
+    case) or builds an ``AnthropicVertex`` client directly (the vertex case,
+    bypassing that shared ladder's own static-key-wins-over-Vertex
+    precedence — see :func:`_build_facts_client`'s docstring for why).
 
     **Called from several worker threads at once** (see
     :func:`run_facts_extraction`'s bounded pool), so the two pieces of
@@ -804,6 +2409,9 @@ class _Extractor:
         backoff_s: float = DEFAULT_BACKOFF_S,
         max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
         sleep: Callable[[float], None] = time.sleep,
+        provider: Optional[str] = None,
+        vertex_region: Optional[str] = None,
+        max_prompt_tokens: Optional[int] = None,
     ) -> None:
         self.system_prompt = system_prompt
         self.model = model or _model()
@@ -817,19 +2425,36 @@ class _Extractor:
         self._sleep = sleep
         self._usage_lock = threading.Lock()
         self._client_lock = threading.Lock()
+        #: ALWAYS a concrete provider ("anthropic"/"vertex"), never
+        #: "inherit" — the caller resolves that via
+        #: :func:`resolve_effective_provider` before constructing this.
+        self.provider = provider or "anthropic"
+        #: The caller's already-resolved :func:`resolve_vertex_region`
+        #: answer — unused when `provider` is "anthropic", passed straight
+        #: through to :func:`_build_facts_client` otherwise.
+        self.vertex_region = vertex_region
+        #: ``extraction.facts.max_prompt_tokens`` (resolved once, here, not
+        #: per document — the test seam mirrors every other knob's ``None``
+        #: -resolves-from-config convention).
+        self.max_prompt_tokens = max_prompt_tokens if max_prompt_tokens is not None else _max_prompt_tokens()
+        #: The system prompt's own estimated token cost, computed ONCE
+        #: (byte-identical for every document/retry of this run) rather
+        #: than re-estimated per call.
+        self._system_prompt_tokens = _approx_tokens(system_prompt)
+
+    def char_budget(self, *, tabular: bool) -> int:
+        """How many characters of a corrective retry's failing-quote
+        listing (or, equivalently, a document's own text) fit under this
+        run's token budget alongside the system prompt — see
+        :func:`_token_char_budget`."""
+        return _token_char_budget(self._system_prompt_tokens, self.max_prompt_tokens, tabular=tabular)
 
     def _ensure_client(self) -> Tuple[Any, str]:
         with self._client_lock:
             if self._client is None:
-                from src.anonymization_ner import DetectionUnavailable, build_client
-
-                try:
-                    self._client, self._call_model = build_client(self.model, self.timeout_s)
-                except DetectionUnavailable as exc:
-                    # Same condition, this stage's own name for it: no
-                    # credential means the pass cannot run, not that the
-                    # corpus has no facts.
-                    raise FactsExtractionUnavailable(str(exc)) from exc
+                self._client, self._call_model = _build_facts_client(
+                    self.provider, self.model, self.timeout_s, vertex_region=self.vertex_region
+                )
             return self._client, (self._call_model or self.model)
 
     def _create(self, user_message: str) -> Any:
@@ -875,20 +2500,58 @@ class _Extractor:
             return dict(self.usage)
 
     def call(self, user_message: str) -> str:
-        """One bounded-retry call. Raises :class:`FactsExtractionUnavailable`
-        on exhaustion — never returns an empty reply to be mistaken for an
-        empty document."""
+        """One bounded-retry call.
+
+        Raises :class:`ProviderLimitHit` IMMEDIATELY (no retry, no backoff
+        sleep) for an error :func:`classify_provider_limit_error` recognizes
+        as a closed-set provider refusal that is NOT document-specific
+        (workspace/usage-limit exhaustion, billing disabled — checked
+        before the per-document classification below, since a workspace-
+        limit 400 would otherwise be misread as "this document's prompt is
+        too long"). :class:`FactsDocumentError` IMMEDIATELY (no retry, no
+        backoff sleep) for an error :func:`_classify_permanent_error`
+        recognizes as PER-DOCUMENT permanent (an ``invalid_request_error``
+        — most commonly "prompt is too long") — burning the retry budget on
+        an identical resend would only reproduce the same rejection. A
+        genuinely transient failure (429/5xx) is retried up to
+        ``max_attempts``; on exhaustion, :func:`classify_provider_limit_error`
+        is checked ONE more time against the LAST error — a Vertex quota
+        bucket with zero allocation answers 429 (retryable-shaped) on every
+        attempt, so this is where that structural refusal is finally told
+        apart from an ordinary saturated-but-recoverable rate limit.
+        :class:`FactsExtractionUnavailable` for everything else that
+        exhausts retries, or a non-retryable failure that is neither of the
+        above (credentials, permissions...) — never returns an empty reply
+        to be mistaken for an empty document.
+        """
         from src.anonymization_ner import _is_retryable, _reply_text
 
         last_error: BaseException | None = None
+        attempts_made = 0
         for attempt in range(1, self.max_attempts + 1):
+            attempts_made = attempt
             try:
                 response = self._create(user_message)
             except FactsExtractionUnavailable:
                 raise
             except Exception as exc:  # noqa: BLE001 — classified below
                 last_error = exc
-                if not _is_retryable(exc) or attempt == self.max_attempts:
+                if not _is_retryable(exc):
+                    limit_reason = classify_provider_limit_error(exc)
+                    if limit_reason is not None:
+                        raise ProviderLimitHit(
+                            f"fact extraction: provider refused ({limit_reason}): {type(exc).__name__}: {exc}",
+                            reason=limit_reason,
+                            retry_after_s=_retry_after_seconds(exc),
+                        ) from exc
+                    reason = _classify_permanent_error(exc)
+                    if reason is not None:
+                        raise FactsDocumentError(
+                            f"fact extraction permanently failed ({reason}): {type(exc).__name__}: {exc}",
+                            reason=reason,
+                        ) from exc
+                    break
+                if attempt == self.max_attempts:
                     break
                 delay = self.backoff_s * (2 ** (attempt - 1))
                 logger.warning(
@@ -902,8 +2565,17 @@ class _Extractor:
                 continue
             self._record(response)
             return _reply_text(response)
+        if last_error is not None:
+            limit_reason = classify_provider_limit_error(last_error)
+            if limit_reason is not None:
+                raise ProviderLimitHit(
+                    f"fact extraction: provider refused ({limit_reason}) after {attempts_made} attempt(s): "
+                    f"{type(last_error).__name__}: {last_error}",
+                    reason=limit_reason,
+                    retry_after_s=_retry_after_seconds(last_error),
+                ) from last_error
         raise FactsExtractionUnavailable(
-            f"fact extraction failed after {self.max_attempts} attempt(s): {type(last_error).__name__}: {last_error}"
+            f"fact extraction failed after {attempts_made} attempt(s): {type(last_error).__name__}: {last_error}"
         ) from last_error
 
 
@@ -944,18 +2616,47 @@ def _retry_message(base_user_message: str, failures: Sequence[Tuple[dict, str]])
     )
 
 
+def _bound_failures_for_retry(
+    failures: Sequence[Tuple[dict, str]], *, char_budget: int
+) -> Tuple[List[Tuple[dict, str]], List[Tuple[dict, str]]]:
+    """``(included, overflow)`` — ``failures`` trimmed to what fits in
+    ``char_budget`` characters of :func:`_retry_message`'s own listing
+    format, in ORDER (the model already saw them in this order in the
+    first reply).
+
+    Exists because the listing itself had NO bound at all: a live incident
+    (2026-09) had a document whose first-pass reply produced hundreds of
+    facts that failed the verbatim gate, and the resulting retry request
+    (base message + every one of them) measured 316,295 tokens against the
+    model's real 200,000-token ceiling — the SAME class of failure the
+    token-safe document bound (:func:`_token_char_budget`) closes for the
+    document text itself, just for the failure listing instead.
+    ``overflow`` is dropped by the CALLER without ever being retried — a
+    retry large enough to include it would risk reproducing the exact 400
+    this bound exists to prevent.
+    """
+    included: List[Tuple[dict, str]] = []
+    overflow: List[Tuple[dict, str]] = []
+    used = 0
+    for fact, quote in failures:
+        entry_len = len(f"- {_fact_key(fact)[:200]}\n  failing quote: {quote[:120]!r}\n")
+        if included and used + entry_len > char_budget:
+            overflow.append((fact, quote))
+            continue
+        included.append((fact, quote))
+        used += entry_len
+    if not included and failures:
+        # `char_budget` too tight for even ONE entry: keep the first one
+        # anyway. An empty listing would ask the model to "re-emit ONLY
+        # these facts" over nothing, which is nonsensical, and one entry is
+        # a rounding error next to the base message it rides alongside.
+        return [failures[0]], list(failures[1:])
+    return included, overflow
+
+
 # --------------------------------------------------------------------------
 # Document walk
 # --------------------------------------------------------------------------
-
-
-def _is_tabular(path: Optional[str], filename: Optional[str]) -> bool:
-    for candidate in (path, filename):
-        if not candidate:
-            continue
-        if Path(str(candidate)).suffix.lower() in _TABULAR_EXTENSIONS:
-            return True
-    return False
 
 
 def collection_ids_for(connection: Dict[str, Any]) -> List[str]:
@@ -1033,42 +2734,157 @@ class _Report:
         self.docs_seen = 0
         self.docs_extracted = 0
         self.docs_unchanged = 0
+        #: Always 0. Spreadsheets and CSV/TSV files are no longer skipped —
+        #: they go through the same walk as any other document (see the
+        #: module docstring). Kept, rather than removed, purely for the
+        #: run report's backward compatibility (fleet view, `agnes admin
+        #: sharepoint runs`); a pre-existing `"skipped-tabular"` state
+        #: entry from before this change is treated as stale and
+        #: re-extracted, never counted here again.
         self.docs_skipped_tabular = 0
         self.docs_skipped_no_text = 0
         self.docs_skipped_not_indexed = 0
+        #: A document skipped OUTRIGHT — never sent to the model at all —
+        #: because :func:`_looks_garbled` classified its text as binary/
+        #: decode-garbage (an xlsx-conversion "symbol soup", the live
+        #: incident's own root cause) rather than fact-bearing content.
+        self.docs_skipped_garbled_text = 0
+        #: A dense/tabular document (:func:`_is_tabular_text`) skipped
+        #: outright because even the token-budget-bounded head
+        #: (:func:`_token_char_budget`) would keep under
+        #: :data:`_MIN_TABULAR_KEEP_RATIO` of its (already
+        #: `max_doc_chars`-capped) length — too small a sample of a
+        #: general-ledger/EDI-shaped export to be worth extracting.
+        self.docs_skipped_too_large_tabular = 0
         self.docs_truncated = 0
         self.facts_failed = 0
+        #: Per-document PERMANENT model-call failures
+        #: (:class:`FactsDocumentError`), keyed by their short reason class
+        #: (currently just ``"invalid_request"``) — a breakdown of the
+        #: SUBSET of `facts_failed` this module can actually name a cause
+        #: for, on both transports (:func:`_drain_one`'s
+        #: `FactsDocumentError` branch, :func:`_requeue_or_fail`'s
+        #: `permanent=True` branch).
+        self.facts_failed_reasons: Dict[str, int] = {}
         self.facts_quotes_dropped = 0
         self.facts_quotes_repaired = 0
         self.facts_retries = 0
+        #: Documents (or retries) served from the content-hash LLM
+        #: response cache instead of a model call — cost-levers spec
+        #: 2026-09-02, lever B. A first-pass hit and a retry hit on the
+        #: SAME document both count, since each replaces a call that would
+        #: otherwise have been made.
+        self.facts_cache_hits = 0
+        #: Evidence entries :func:`_normalize_evidence_doc_ids` rewrote —
+        #: a cache-served reply (or, in principle, a persistently
+        #: mis-citing model) that named a document OTHER than the one
+        #: actually being processed. Non-zero here means citations were
+        #: corrected before shipping, never that anything was lost.
+        self.facts_evidence_doc_id_rewritten = 0
         self.parse_errors = 0
         self.nodes_emitted = 0
         self.edges_emitted = 0
         self.claims_written = 0
         self.claims_rejected = 0
+        #: Edges the ingest chokepoint skipped because their src/dst fact
+        #: was gone by the time it tried to write them — a race between
+        #: concurrent facts-extraction passes sharing one fact graph
+        #: (`EdgeEndpointMissing` in `src/repositories/facts_pg.py`), never
+        #: a fault in what THIS pass produced.
+        self.edges_skipped_missing_endpoint = 0
         self.ingest_batches = 0
         self.ingest_failures: List[Dict[str, Any]] = []
         self.interrupted = False
         self.interrupted_reason: Optional[str] = None
+        #: How many documents' FINAL completion came from each transport —
+        #: "final" because a batch-mode document whose corrective retry
+        #: fell back to sync (``retry_transport: sync``) still counts as
+        #: ``docs_via_batch``, its INITIAL (and dominant-cost) completion.
+        #: Sync-mode passes leave `docs_via_batch` at 0.
+        self.docs_via_batch = 0
+        self.docs_via_sync = 0
+        #: Subjects (facts/edges) removed by THIS PASS's own end-of-pass
+        #: orphan sweep (TCRD-296 C.12 — live finding, 2026-09: with
+        #: `sweep_orphans()` running per BATCH, 7 parallel passes deleted
+        #: 75,447 subjects against 10,784 created in 30 minutes — one
+        #: pass's sweep kept catching a SIBLING pass's just-created,
+        #: not-yet-evidenced subject before that pass's own later batch
+        #: could attach its claim). Running it once per pass instead of
+        #: once per batch cuts the sweep's OWN contribution to that race
+        #: by the batch count; see `run_facts_extraction`'s end-of-pass
+        #: `sweep_orphans()` call.
+        self.orphans_swept = 0
+        #: True when this pass's end-of-pass sweep backed off because a
+        #: CONCURRENT pass already held `sweep_orphans()`'s serializing
+        #: advisory lock — never an error, just visibility: the sibling
+        #: pass's own sweep covers whatever this one skipped.
+        self.orphans_sweep_skipped = False
+
+    def record_failure_reason(self, reason: str) -> None:
+        """Bump ``facts_failed_reasons[reason]`` — the shared bookkeeping
+        both transports' permanent-failure paths use (see
+        ``facts_failed_reasons``'s own docstring above)."""
+        self.facts_failed_reasons[reason] = self.facts_failed_reasons.get(reason, 0) + 1
 
     def render(
-        self, *, model: str, prompt_origin: str, ontology: Dict[str, Any], usage: Dict[str, Any]
+        self,
+        *,
+        model: str,
+        prompt_origin: str,
+        ontology: Dict[str, Any],
+        usage: Dict[str, Any],
+        batch_usage: Optional[Dict[str, Any]] = None,
+        provider: str = "anthropic",
+        provider_source: str = "instance",
+        transport: str = "sync",
+        vertex_region: Optional[str] = None,
+        vertex_region_source: str = "none",
     ) -> Dict[str, Any]:
+        """``batch_usage`` is the SUBSET of ``usage`` that came from the
+        Batches API (a batch-mode pass whose corrective retry fell back to
+        ``retry_transport: sync`` mixes both within one run) — priced at
+        :data:`src.llm_pricing.BATCH_PRICE_MULTIPLIER`, the remainder at
+        the synchronous rate, and summed. ``None`` (every sync-mode call
+        site) prices the whole of ``usage`` at the synchronous rate, exactly
+        as before this parameter existed.
+
+        ``provider`` / ``provider_source`` are :func:`resolve_effective_provider`'s
+        own output and ``transport`` is the transport this pass ACTUALLY ran
+        (which can differ from :func:`resolve_transport`'s answer — a
+        vertex-resolved provider always runs ``sync``, see
+        :func:`run_facts_extraction`) — so an operator reading one run's
+        report can see what actually spent money, not just what the
+        instance/connection was configured to try. ``vertex_region`` /
+        ``vertex_region_source`` are :func:`resolve_vertex_region`'s own
+        output — reported unconditionally, even for an anthropic-resolved
+        pass (where it is simply unused), the same "resolved regardless of
+        whether it matters" posture ``transport`` already takes.
+        """
         from src.llm_pricing import cost_usd
 
         elapsed = max(time.monotonic() - self.started, 1e-6)
         priced = dict(usage)
         priced["model"] = model
-        priced["estimated_cost_usd"] = round(
-            cost_usd(
-                model=model,
-                input_tokens=usage.get("input_tokens", 0),
-                output_tokens=usage.get("output_tokens", 0),
-                cache_read_tokens=usage.get("cache_read_input_tokens", 0),
-                cache_creation_tokens=usage.get("cache_creation_input_tokens", 0),
-            ),
-            4,
+        batch_usage = batch_usage or {}
+        sync_portion = {
+            field: int(usage.get(field, 0)) - int(batch_usage.get(field, 0))
+            for field in ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
+        }
+        cost = cost_usd(
+            model=model,
+            input_tokens=sync_portion["input_tokens"],
+            output_tokens=sync_portion["output_tokens"],
+            cache_read_tokens=sync_portion["cache_read_input_tokens"],
+            cache_creation_tokens=sync_portion["cache_creation_input_tokens"],
+        ) + cost_usd(
+            model=model,
+            input_tokens=batch_usage.get("input_tokens", 0),
+            output_tokens=batch_usage.get("output_tokens", 0),
+            cache_read_tokens=batch_usage.get("cache_read_input_tokens", 0),
+            cache_creation_tokens=batch_usage.get("cache_creation_input_tokens", 0),
+            batch=True,
         )
+        priced["estimated_cost_usd"] = round(cost, 4)
         return {
             "started_at": self.started_at,
             "finished_at": _now_iso(),
@@ -1077,6 +2893,11 @@ class _Report:
             "interrupted_reason": self.interrupted_reason,
             "model": model,
             "prompt_origin": prompt_origin,
+            "provider": provider,
+            "provider_source": provider_source,
+            "transport": transport,
+            "vertex_region": vertex_region,
+            "vertex_region_source": vertex_region_source,
             # What parallelism this pass actually ran at, and where that
             # number came from (`config` / `clamped` / `invalid` /
             # `default` / `caller`). Both, because an operator comparing
@@ -1091,18 +2912,28 @@ class _Report:
             "docs_skipped_tabular": self.docs_skipped_tabular,
             "docs_skipped_no_text": self.docs_skipped_no_text,
             "docs_skipped_not_indexed": self.docs_skipped_not_indexed,
+            "docs_skipped_garbled_text": self.docs_skipped_garbled_text,
+            "docs_skipped_too_large_tabular": self.docs_skipped_too_large_tabular,
             "docs_truncated": self.docs_truncated,
             "facts_failed": self.facts_failed,
+            "facts_failed_reasons": dict(self.facts_failed_reasons),
             "facts_quotes_dropped": self.facts_quotes_dropped,
             "facts_quotes_repaired": self.facts_quotes_repaired,
             "facts_retries": self.facts_retries,
+            "facts_cache_hits": self.facts_cache_hits,
+            "facts_evidence_doc_id_rewritten": self.facts_evidence_doc_id_rewritten,
             "parse_errors": self.parse_errors,
             "nodes_emitted": self.nodes_emitted,
             "edges_emitted": self.edges_emitted,
             "claims_written": self.claims_written,
             "claims_rejected": self.claims_rejected,
+            "edges_skipped_missing_endpoint": self.edges_skipped_missing_endpoint,
             "ingest_batches": self.ingest_batches,
             "ingest_failures": self.ingest_failures,
+            "docs_via_batch": self.docs_via_batch,
+            "docs_via_sync": self.docs_via_sync,
+            "orphans_swept": self.orphans_swept,
+            "orphans_sweep_skipped": self.orphans_sweep_skipped,
             "facts_usage": priced,
         }
 
@@ -1110,12 +2941,16 @@ class _Report:
 class _BatchShipper:
     """Accumulates rows and ships them through the ingest chokepoint.
 
-    ``app.api.facts.facts_ingest`` — the function the HTTP route calls —
-    is used deliberately instead of ``facts_repo().ingest_batch``: the
-    audience validation, the anonymize-fail-closed declaration gate and the
-    producer scope rules live in the handler, and an in-process producer
-    that skipped them would be held to a weaker contract than an external
-    one for no reason other than sharing a process.
+    ``app.api.facts._facts_ingest_core`` — the SAME function the HTTP
+    route's ``facts_ingest`` thinly wraps — is used deliberately instead of
+    ``facts_repo().ingest_batch`` directly: the audience validation, the
+    anonymize-fail-closed declaration gate and the producer scope rules
+    live in that handler, and an in-process producer that skipped them
+    would be held to a weaker contract than an external one for no reason
+    other than sharing a process. ``run_orphan_sweep=False`` on every call
+    (TCRD-296 C.12) — this class ships MANY batches per pass, and the
+    orphan sweep runs once at the end of the whole pass instead (see
+    :func:`run_facts_extraction`), not once per batch.
 
     **No ``evidence[].audience`` is emitted**, deliberately. The tag is an
     optional index-time variant marker, and the crawl that produced these
@@ -1124,27 +2959,55 @@ class _BatchShipper:
     quote that nothing in this pipeline actually established; absent is the
     honest value, and it is exactly what the crawler's own ingest path
     already produces.
+
+    **Ledger correction (TCRD-296 gap #62).** :func:`_fold_accepted_result`
+    writes a document's ``docs_state`` entry as ``status: "done"``
+    OPTIMISTICALLY, before this batch is ever shipped — it has to, since a
+    batch accumulates several documents before flushing. This class holds
+    the ONLY reference (``docs_state``, passed in at construction) able to
+    correct that optimism once the real outcome is known: :meth:`flush`
+    either downgrades every ``done`` entry in a REFUSED batch
+    (:meth:`_revert_ledger`, so :func:`is_up_to_date` — which only ever
+    treats ``status == "done"`` as current — retries it next pass) or, on a
+    successful flush, reconciles each document against what the ingest
+    response says it actually wrote (:meth:`_correct_ledger`). A batch that
+    raises an unexpected database error (TCRD-296 gap #73b — a transient
+    deadlock/serialization failure inside ``ingest_batch`` itself, as
+    opposed to a well-formed refusal) gets the SAME ``_revert_ledger``
+    treatment before the error is re-raised — a replace-mode batch whose
+    old claims were already deleted before the failure must never sit at
+    ``done`` with neither its old claims nor any new ones.
     """
 
-    def __init__(self, *, report: _Report, anonymize_marked: set, user: Any) -> None:
+    def __init__(self, *, report: _Report, anonymize_marked: set, user: Any, docs_state: Dict[str, Any]) -> None:
         self._report = report
         self._anonymize_marked = anonymize_marked
         self._user = user
+        self._docs_state = docs_state
         self._documents: List[Dict[str, Any]] = []
         self._full_documents: List[str] = []
         self._nodes: List[dict] = []
         self._edges: List[dict] = []
         self._claims = 0
         self._anonymized_counts: Dict[str, int] = {}
+        #: `file_id` per pending document, SAME order/length as
+        #: `self._documents` — never sent over the wire (not part of the
+        #: ingest request shape), kept only so `flush` can correct THIS
+        #: batch's own ledger entries. A `doc_id` is not 1:1 with `file_id`
+        #: (TCRD-241 duplicates), so it cannot be re-derived from `document`
+        #: alone.
+        self._file_ids: List[str] = []
 
     def add(
         self,
         *,
+        file_id: str,
         document: Dict[str, Any],
         nodes: List[dict],
         edges: List[dict],
         claim_count: int,
     ) -> None:
+        self._file_ids.append(file_id)
         self._documents.append(document)
         self._full_documents.append(str(document["doc_id"]))
         self._nodes.extend(nodes)
@@ -1163,9 +3026,12 @@ class _BatchShipper:
 
     def flush(self, *, usage: Dict[str, Any], model: str) -> None:
         """Ship what is pending. An ingest refusal is COUNTED, never
-        raised: the documents in this batch keep their claims un-written
-        and are re-tried on the next pass (their state entry is only
-        written after a successful flush).
+        raised: the documents in this batch keep their claims un-written.
+        Their ``docs_state`` entry was already written ``"done"``
+        OPTIMISTICALLY before this call (:func:`_fold_accepted_result`,
+        ahead of the batch actually shipping) — :meth:`_revert_ledger`
+        downgrades it here so the next pass re-tries them (TCRD-296 gap
+        #62; see the class docstring's "Ledger correction" section).
 
         ``usage`` must be THIS BATCH's spend, not the run's running total:
         ``GET /api/facts/ingest-runs``'s rollup sums every persisted run's
@@ -1175,13 +3041,14 @@ class _BatchShipper:
         if not self._documents:
             return
         from fastapi import HTTPException
+        from sqlalchemy.exc import DBAPIError
 
         from app.api.facts import (
             FactsIngestAnonymizationReport,
             FactsIngestAnonymizationScope,
             FactsIngestLlmUsage,
             FactsIngestRequest,
-            facts_ingest,
+            _facts_ingest_core,
         )
 
         anonymization = None
@@ -1211,8 +3078,11 @@ class _BatchShipper:
                 documents=len(self._documents),
             ),
         )
+        pending_file_ids = list(self._file_ids)
         try:
-            result = facts_ingest(body, user=self._user)
+            # `run_orphan_sweep=False` (TCRD-296 C.12) — see the class
+            # docstring's own note.
+            result = _facts_ingest_core(body, user=self._user, run_orphan_sweep=False)
         except HTTPException as exc:
             self._report.ingest_failures.append(
                 {"documents": len(self._documents), "status": exc.status_code, "detail": exc.detail}
@@ -1223,12 +3093,114 @@ class _BatchShipper:
                 len(self._documents),
                 exc.status_code,
             )
+            self._revert_ledger(pending_file_ids)
             self._reset()
             raise _IngestRefused(exc) from exc
+        except DBAPIError:
+            # TCRD-296 gap #73b: an unexpected DATABASE failure inside
+            # `ingest_batch` itself (as opposed to a well-formed refusal
+            # the route already translates to an `HTTPException` above) —
+            # a transient deadlock/serialization failure, say — used to
+            # propagate straight out of this method uncaught, past
+            # `_revert_ledger`/`_correct_ledger` both. If this batch's
+            # `full_documents` had already replaced (deleted) their old
+            # claims before the failure, this batch's `docs_state` entries
+            # stayed optimistically "done" with NEITHER their old claims
+            # NOR any new ones — silently losing them until whatever next
+            # touches this document happens to re-extract it, unbounded.
+            # Same remedy as a refused batch: downgrade the ledger, log,
+            # then RE-RAISE — a genuine unexpected database error still
+            # stops the pass (this is a "never lose the retry" fix, not a
+            # "swallow and continue" one).
+            logger.warning(
+                "facts extraction: ingest raised a database error for a batch of %d document(s)",
+                len(self._documents),
+                exc_info=True,
+            )
+            self._revert_ledger(pending_file_ids, reason="ingest_db_error")
+            self._reset()
+            raise
         self._report.ingest_batches += 1
         self._report.claims_written += int(result.get("claims_written") or 0)
         self._report.claims_rejected += len(result.get("claims_rejected") or [])
+        self._report.edges_skipped_missing_endpoint += int(result.get("edges_skipped_missing_endpoint") or 0)
+        self._correct_ledger(result)
         self._reset()
+
+    def _revert_ledger(self, file_ids: Sequence[str], *, reason: str = "ingest_refused") -> None:
+        """A refused (or DB-error-raising) batch's documents were folded
+        into ``docs_state`` as ``done`` before this call ran (see the class
+        docstring) — that optimism was wrong. Downgrade each to a
+        bounded-retry status so :func:`is_up_to_date` does not skip it on
+        the next pass.
+        """
+        for file_id in file_ids:
+            entry = self._docs_state.get(file_id)
+            if isinstance(entry, dict) and entry.get("status") == "done":
+                self._mark_retry(file_id, entry, reason=reason)
+
+    def _correct_ledger(self, result: Dict[str, Any]) -> None:
+        """Reconcile every document THIS successful flush shipped against
+        what the ingest response says it actually wrote."""
+        claims_by_doc: Dict[str, Any] = result.get("claims_written_by_doc") or {}
+        resolved_by_doc: Dict[str, Any] = result.get("resolved_file_by_doc") or {}
+        for file_id, document in zip(self._file_ids, self._documents):
+            entry = self._docs_state.get(file_id)
+            if not isinstance(entry, dict) or entry.get("status") != "done":
+                continue
+            doc_id = str(document.get("doc_id"))
+            winner = resolved_by_doc.get(doc_id)
+            if winner is not None and str(winner) != str(file_id):
+                # TCRD-241 duplicate copy: this doc_id's claims all landed
+                # on a SIBLING corpus_file_id — by design (the dedupe
+                # collapses every byte-identical copy onto one winner),
+                # never a failure. Stay `done`, but record where the
+                # claims actually are so a coverage report can tell
+                # "duplicate" from "genuinely missing".
+                entry["claims_on_file_id"] = str(winner)
+                continue
+            claims = int(claims_by_doc.get(doc_id, 0) or 0)
+            if claims == 0 and int(entry.get("nodes") or 0) > 0:
+                self._mark_retry(file_id, entry, reason="no_claims")
+
+    def _mark_retry(self, file_id: str, entry: Dict[str, Any], *, reason: str) -> None:
+        """Downgrade a ``done`` entry to ``reason`` (``"ingest_refused"`` or
+        ``"no_claims"``) so the next pass re-extracts it — cache-served
+        (see :func:`_normalize_evidence_doc_ids`), so a retry costs no
+        extra model call once the extraction itself already succeeded.
+        Bounded the same way :func:`_requeue_or_fail` bounds a transient
+        batch-transport failure: after :data:`MAX_LEDGER_RETRY_ATTEMPTS`,
+        give up with a terminal ``"failed"`` entry rather than retry
+        forever.
+        """
+        retries = int(entry.get("retry_count") or 0) + 1
+        if retries >= MAX_LEDGER_RETRY_ATTEMPTS:
+            self._docs_state[file_id] = {
+                "status": "failed",
+                "reason": f"{reason} (gave up after {retries} attempts)",
+                "at": _now_iso(),
+            }
+            self._report.facts_failed += 1
+            self._report.record_failure_reason(reason)
+            logger.warning(
+                "facts extraction: giving up on document %s after %d %s attempts",
+                file_id,
+                retries,
+                reason,
+            )
+            return
+        updated = dict(entry)
+        updated["status"] = reason
+        updated["retry_count"] = retries
+        updated["at"] = _now_iso()
+        self._docs_state[file_id] = updated
+        logger.info(
+            "facts extraction: document %s marked %s — retried next pass (attempt %d/%d)",
+            file_id,
+            reason,
+            retries,
+            MAX_LEDGER_RETRY_ATTEMPTS,
+        )
 
     def _reset(self) -> None:
         self._documents = []
@@ -1237,6 +3209,7 @@ class _BatchShipper:
         self._edges = []
         self._claims = 0
         self._anonymized_counts = {}
+        self._file_ids = []
 
 
 class _IngestRefused(RuntimeError):
@@ -1248,6 +3221,78 @@ class _IngestRefused(RuntimeError):
         self.status_code = getattr(exc, "status_code", None)
         self.detail = getattr(exc, "detail", None)
         super().__init__(f"ingest refused: {self.status_code} {self.detail}")
+
+
+def _ontology_report(ontology_models: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """The report's ``ontology`` block — shared by both transports so they
+    can never describe the same ontology differently."""
+    return {
+        "models": [m.get("slug") for m in ontology_models],
+        "node_types": sum(
+            1
+            for m in ontology_models
+            for d in (m["model"].get("datasets") or [])
+            if str((d or {}).get("source") or "").startswith("ontology_node_type:")
+        ),
+        "edge_types": sum(len(m["model"].get("relationships") or []) for m in ontology_models),
+    }
+
+
+def _fold_accepted_result(
+    *,
+    report: "_Report",
+    shipper: "_BatchShipper",
+    docs_state: Dict[str, Any],
+    result: "_DocResult",
+    model: str,
+    fingerprint: str,
+) -> None:
+    """Fold one finished document into the report, the batch shipper and
+    the per-document state — the SAME "done" shape and the SAME counters
+    regardless of which transport produced ``result``, so a document's
+    final state can never reveal which one ran. Shared by
+    :func:`run_facts_extraction`'s sync loop and :func:`_run_batch_pass`.
+    """
+    from connectors.sharepoint.facts_prompt import PROMPT_VERSION
+
+    work = result.work
+    report.parse_errors += result.parse_errors
+    report.facts_retries += 1 if result.retried else 0
+    report.facts_quotes_dropped += result.dropped
+    report.facts_quotes_repaired += result.repaired
+    report.facts_cache_hits += result.cache_hits
+    report.facts_evidence_doc_id_rewritten += result.evidence_doc_id_rewritten
+    claim_count = sum(len(f.get("evidence") or []) for f in [*result.nodes, *result.edges])
+    shipper.add(
+        file_id=work.file_id,
+        document={
+            "doc_id": work.doc_id,
+            "corpus_id": work.collection_id,
+            "stable_id": work.mapping.get("source_stable_id"),
+            "path": work.path,
+            "name": work.filename,
+            "sha256": work.mapping.get("source_sha256") or work.sha256,
+        },
+        nodes=result.nodes,
+        edges=result.edges,
+        claim_count=claim_count,
+    )
+    report.docs_extracted += 1
+    report.nodes_emitted += len(result.nodes)
+    report.edges_emitted += len(result.edges)
+    docs_state[work.file_id] = {
+        "status": "done",
+        "doc_id": work.doc_id,
+        "extracted_sha": work.sha256,
+        "model": model,
+        "prompt_fingerprint": fingerprint,
+        "prompt_version": PROMPT_VERSION,
+        "nodes": len(result.nodes),
+        "edges": len(result.edges),
+        "dropped": result.dropped,
+        "seconds": result.seconds,
+        "at": _now_iso(),
+    }
 
 
 class _Work:
@@ -1269,6 +3314,7 @@ class _Work:
         "mapping",
         "path",
         "sha256",
+        "tabular",
         "user_message",
     )
 
@@ -1284,6 +3330,7 @@ class _Work:
         mapping: Dict[str, Any],
         chunk_texts: List[str],
         user_message: str,
+        tabular: bool = False,
     ) -> None:
         self.file_id = file_id
         self.doc_id = doc_id
@@ -1294,6 +3341,12 @@ class _Work:
         self.mapping = mapping
         self.chunk_texts = chunk_texts
         self.user_message = user_message
+        #: Whether this document's text was classified dense/tabular
+        #: (:func:`_is_tabular_text`) — carried on the work item so the
+        #: corrective retry's own token budget (:meth:`_Extractor.char_budget`)
+        #: charges the SAME ratio the initial truncation used, rather than
+        #: re-deriving it from a document that may already be truncated.
+        self.tabular = tabular
 
 
 class _DocResult:
@@ -1311,6 +3364,8 @@ class _DocResult:
         repaired: int,
         parse_errors: int,
         seconds: float,
+        cache_hits: int = 0,
+        evidence_doc_id_rewritten: int = 0,
     ) -> None:
         self.work = work
         self.nodes = nodes
@@ -1320,25 +3375,205 @@ class _DocResult:
         self.repaired = repaired
         self.parse_errors = parse_errors
         self.seconds = seconds
+        self.cache_hits = cache_hits
+        #: How many evidence entries :func:`_normalize_evidence_doc_ids`
+        #: rewrote — only ever non-zero for a document that went through
+        #: :func:`extract_one` (the cache-lookup transport). Always 0 for
+        #: the batch transport (:func:`_run_batch_pass`), which never reads
+        #: the cache and constructs a `_DocResult` directly.
+        self.evidence_doc_id_rewritten = evidence_doc_id_rewritten
 
 
-def extract_one(extractor: Any, work: _Work) -> _DocResult:
-    """The whole per-document LLM half: call, verbatim-check, deterministic
-    repair, ONE corrective retry, drop-and-count.
+def _plan_documents(
+    *,
+    connection: Dict[str, Any],
+    docs_state: Dict[str, Any],
+    report: "_Report",
+    files_repo: Any,
+    sources_repo: Any,
+    wanted_doc_ids: Optional[set],
+    model: str,
+    fingerprint: str,
+    max_doc_chars: int,
+    system_prompt_tokens: int = 0,
+    max_prompt_tokens: int = DEFAULT_MAX_PROMPT_TOKENS,
+    partition: Optional[Tuple[int, int]] = None,
+) -> Any:
+    """Yield the documents that actually need a model call — the SAME walk
+    for BOTH transports (:func:`run_facts_extraction`'s sync loop and
+    :func:`_run_batch_pass`), taking every input as an explicit parameter
+    rather than closing over one function's locals, so a document's
+    eligibility can never drift between them. Module-level rather than a
+    per-call nested closure for exactly that reason.
 
-    Pure with respect to this process's shared state — it reads nothing but
-    its ``work`` and returns a result — which is exactly why it can run in
-    a worker thread while the main thread keeps sole ownership of the
-    report counters, the state file and every database call. Raised
-    exceptions travel back through the future; the caller decides which
-    are per-document and which stop the pass.
+    Every cheap decision — not a source document, not indexed, unchanged,
+    no text, still mid-flight in an unfinished batch — is made HERE, on the
+    caller's thread, before anything is submitted: those documents cost
+    nothing and must not occupy a worker slot (or a batch request) to find
+    that out. ``system_prompt_tokens`` / ``max_prompt_tokens`` drive the
+    token-aware bound BEYOND ``max_doc_chars`` (:func:`_token_char_budget`)
+    — a garbled document is skipped outright (``garbled_text``), a
+    severely oversized dense one is skipped rather than shipping a
+    meaningless head (``too_large_tabular``), and everything else still
+    over budget is truncated a second time, tighter than the flat
+    character cap alone.
+
+    ``partition`` (``(index, count)``, TCRD-296 gap #67) narrows the walk
+    to documents THIS partition owns (:func:`_partition_of`) — ``None``
+    (every caller before this feature existed) or ``count <= 1`` sees
+    every document, unchanged. Applied FIRST, before even the source-doc
+    mapping lookup: a document belonging to another partition costs this
+    pass nothing to skip.
+    """
+    for collection_id in collection_ids_for(connection):
+        for file_row in files_repo.list_for_corpus(collection_id):
+            file_id = str(file_row["id"])
+            if partition is not None and partition[1] > 1 and _partition_of(file_id, partition[1]) != partition[0]:
+                continue
+            mapping = sources_repo.get(file_id) or {}
+            doc_id = mapping.get("source_doc_id")
+            if not doc_id:
+                # Not a source-anchored document (a hand upload); it has
+                # no producer doc_id to cite, so ingest could not resolve
+                # its evidence anyway.
+                continue
+            doc_id = str(doc_id)
+            if wanted_doc_ids is not None and doc_id not in wanted_doc_ids:
+                continue
+
+            entry = docs_state.get(file_id)
+            if isinstance(entry, dict) and entry.get("status") == "batch-submitted":
+                # Still mid-flight in a batch this pass's resume step
+                # either just collected (rewriting `entry`) or is still
+                # polling — either way it must not be submitted again.
+                continue
+
+            report.docs_seen += 1
+            # `path`/`filename` here are exactly what `corpus_files`
+            # stores — for an anonymize-marked collection that is the
+            # ANONYMIZED value (``connectors.sharepoint.crawler
+            # ._anonymize_identity`` writes it there at ingest time, the
+            # same as the document body), never the real SharePoint name
+            # or folder. This module deliberately has no anonymize gate
+            # of its own: there is no raw text left to gate by the time
+            # it gets here, so `build_user_message` and
+            # `quote_is_verbatim` below can only ever see/cite the
+            # already-redacted identity, same as the chunk text.
+            path = file_row.get("path")
+            filename = file_row.get("filename")
+            if file_row.get("processing_status") != "indexed":
+                # The gate defers a claim on a non-indexed document, so
+                # extracting it now would spend a call on claims the
+                # ingest cannot accept yet.
+                report.docs_skipped_not_indexed += 1
+                continue
+
+            sha256 = str(file_row.get("sha256") or "")
+            if is_up_to_date(docs_state.get(file_id), sha256=sha256, model=model, fingerprint=fingerprint):
+                report.docs_unchanged += 1
+                continue
+
+            chunk_texts, text = _document_text(file_id)
+            if not text.strip():
+                report.docs_skipped_no_text += 1
+                docs_state[file_id] = {"status": "skipped-no-text", "at": _now_iso()}
+                continue
+
+            truncated = False
+            if len(text) > max_doc_chars:
+                text = text[:max_doc_chars]
+                truncated = True
+
+            if _looks_garbled(text):
+                # Binary/decode-garbage text (see `_looks_garbled`'s
+                # calibration note): no truncation ratio is safe for it —
+                # it tokenizes far denser than any legitimate document this
+                # module has ever measured — and it produces zero usable
+                # facts regardless of how much of it is sent. Skip it
+                # outright rather than gamble a request on it.
+                report.docs_skipped_garbled_text += 1
+                docs_state[file_id] = {"status": "skipped-garbled-text", "at": _now_iso()}
+                continue
+
+            tabular = _is_tabular_text(text)
+            char_budget = _token_char_budget(system_prompt_tokens, max_prompt_tokens, tabular=tabular)
+            if tabular and len(text) > char_budget and char_budget < _MIN_TABULAR_KEEP_RATIO * len(text):
+                # A head this small is not a meaningful sample of a
+                # general-ledger/EDI-shaped export — closer to noise than
+                # data. Skip rather than ship it.
+                report.docs_skipped_too_large_tabular += 1
+                docs_state[file_id] = {"status": "skipped-too-large-tabular", "at": _now_iso()}
+                continue
+            if len(text) > char_budget:
+                text = text[:char_budget]
+                truncated = True
+
+            if truncated:
+                report.docs_truncated += 1
+
+            metadata = {
+                "doc_id": doc_id,
+                "name": filename,
+                "path": path,
+                "collection_id": collection_id,
+            }
+            yield _Work(
+                file_id=file_id,
+                doc_id=doc_id,
+                collection_id=collection_id,
+                filename=filename,
+                path=path,
+                sha256=sha256,
+                mapping=mapping,
+                chunk_texts=chunk_texts,
+                user_message=build_user_message(metadata, text),
+                tabular=tabular,
+            )
+
+
+def extract_one(
+    extractor: Any,
+    work: _Work,
+    *,
+    retry_mode: str = DEFAULT_RETRY_MODE,
+    fingerprint: str = "",
+    cache: Any | None = None,
+) -> _DocResult:
+    """The whole per-document LLM half: cache lookup, call, verbatim-check,
+    deterministic repair, ONE corrective retry (policy: ``retry_mode``),
+    drop-and-count.
+
+    Reads nothing but its ``work`` and the shared, read-only ``extractor``/
+    ``cache`` objects, and touches no MUTABLE shared state — which is what
+    lets it run in a worker thread while the main thread keeps sole
+    ownership of the report counters, the state file and every database
+    call that ISN'T the cache. The cache repo is the one exception: each of
+    its methods opens and closes its own pooled connection per call (see
+    ``src/db_pg.py::get_engine`` — a fresh checkout per call is exactly what
+    a connection pool is for), so concurrent workers calling it is ordinary
+    SQLAlchemy usage, not a new thread-safety hazard. Raised exceptions
+    travel back through the future; the caller decides which are
+    per-document and which stop the pass.
     """
     started = time.time()
-    reply = extractor.call(work.user_message)
+    cache_hits = 0
+    reply = _cache_lookup(cache, sha256=work.sha256, model=extractor.model, fingerprint=fingerprint)
+    if reply is not None:
+        cache_hits += 1
+    else:
+        reply = extractor.call(work.user_message)
+        _cache_store(cache, sha256=work.sha256, model=extractor.model, fingerprint=fingerprint, suffix="", reply=reply)
     nodes, edges, parse_errors = parse_streams(reply)
+    # See `_normalize_evidence_doc_ids`'s docstring: a cache hit replays a
+    # PRIOR reply verbatim, including whatever `doc_id` that reply cited —
+    # which is only guaranteed correct when the cache key's content hash
+    # (of the CONVERTED markdown) and this document's OWN doc_id (of its
+    # SOURCE bytes) actually agree.
+    evidence_doc_id_rewritten = _normalize_evidence_doc_ids(nodes, edges, work.doc_id)
 
     kwargs = {"chunk_texts": work.chunk_texts, "filename": work.filename, "path": work.path}
-    failures = verbatim_failures([*nodes, *edges], **kwargs)
+    pre_repair_failures = verbatim_failures([*nodes, *edges], **kwargs)
+    failures = pre_repair_failures
     repaired = 0
     if failures:
         from src.repositories.facts_pg import CHUNK_JOIN_SEPARATOR
@@ -1354,12 +3589,57 @@ def extract_one(extractor: Any, work: _Work) -> _DocResult:
             failures = verbatim_failures([*nodes, *edges], **kwargs)
     retried = False
     dropped = 0
-    if failures:
+    if _retry_should_fire(retry_mode, pre_repair_failures=pre_repair_failures, post_repair_failures=failures):
+        # `always` can reach this with `failures` (post-repair) empty —
+        # repair already fixed everything the gate would have complained
+        # about. There is nothing left to correct, so the retry falls back
+        # to the PRE-repair listing: the model is shown its own original
+        # mistake and asked to re-confirm it, even though the system has
+        # already patched the shipped evidence deterministically.
+        retry_failures = failures if failures else pre_repair_failures
         retried = True
-        retry_reply = extractor.call(_retry_message(work.user_message, failures))
+        # Bound the retry's failing-quote listing to the SAME token budget
+        # the document text itself was bounded to — see
+        # `_bound_failures_for_retry`'s docstring for the incident this
+        # closes. `char_budget` is a test seam only some `extractor`
+        # objects (the real `_Extractor`) carry; a bare stub without it
+        # gets the unbounded listing, unchanged from before this existed.
+        char_budget_fn = getattr(extractor, "char_budget", None)
+        if callable(char_budget_fn):
+            retry_char_budget = max(0, char_budget_fn(tabular=work.tabular) - len(work.user_message))
+            bounded_failures, overflow_failures = _bound_failures_for_retry(
+                retry_failures, char_budget=retry_char_budget
+            )
+            if overflow_failures:
+                logger.info(
+                    "facts extraction: document %s — retry listing bounded to %d/%d failing quote(s) to "
+                    "stay under the prompt token budget (%d dropped without a retry)",
+                    work.doc_id,
+                    len(bounded_failures),
+                    len(retry_failures),
+                    len(overflow_failures),
+                )
+        else:
+            bounded_failures = list(retry_failures)
+        retry_reply = _cache_lookup(
+            cache, sha256=work.sha256, model=extractor.model, fingerprint=fingerprint, suffix="retry"
+        )
+        if retry_reply is not None:
+            cache_hits += 1
+        else:
+            retry_reply = extractor.call(_retry_message(work.user_message, bounded_failures))
+            _cache_store(
+                cache,
+                sha256=work.sha256,
+                model=extractor.model,
+                fingerprint=fingerprint,
+                suffix="retry",
+                reply=retry_reply,
+            )
         retry_nodes, retry_edges, retry_parse_errors = parse_streams(retry_reply)
+        evidence_doc_id_rewritten += _normalize_evidence_doc_ids(retry_nodes, retry_edges, work.doc_id)
         parse_errors += retry_parse_errors
-        failed_keys = {_fact_key(fact) for fact, _ in failures}
+        failed_keys = {_fact_key(fact) for fact, _ in retry_failures}
         nodes = [n for n in nodes if _fact_key(n) not in failed_keys]
         edges = [e for e in edges if _fact_key(e) not in failed_keys]
         recovered = 0
@@ -1385,6 +3665,15 @@ def extract_one(extractor: Any, work: _Work) -> _DocResult:
     edges = [e for e in edges if _fact_key(e) not in dropped_keys]
     dropped += len(still_bad)
 
+    if evidence_doc_id_rewritten:
+        logger.info(
+            "facts extraction: document %s — rewrote %d evidence citation(s) that named a different "
+            "doc_id (a cache-served reply originally answered for a different, byte-identical-markdown "
+            "document)",
+            work.doc_id,
+            evidence_doc_id_rewritten,
+        )
+
     return _DocResult(
         work=work,
         nodes=nodes,
@@ -1394,7 +3683,444 @@ def extract_one(extractor: Any, work: _Work) -> _DocResult:
         repaired=repaired,
         parse_errors=parse_errors,
         seconds=round(time.time() - started, 1),
+        cache_hits=cache_hits,
+        evidence_doc_id_rewritten=evidence_doc_id_rewritten,
     )
+
+
+# --------------------------------------------------------------------------
+# Batch-transport gate helpers — the SAME verbatim-gate / one-corrective-
+# retry contract `extract_one` applies to a LIVE reply, generalized to a
+# reply that may arrive asynchronously (an already-collected Batches API
+# result) instead. Deliberately NOT shared code with `extract_one` itself —
+# that function's own call site stays untouched, so the synchronous
+# transport's tested behaviour carries zero risk from this addition; these
+# three functions duplicate its filtering/merging RULES, verified against
+# the same fixtures `extract_one`'s own tests use.
+# --------------------------------------------------------------------------
+
+
+def _filter_kept(
+    nodes: List[dict], edges: List[dict], failures: Sequence[Tuple[dict, str]]
+) -> Tuple[List[dict], List[dict]]:
+    """``(nodes, edges)`` with every fact named in ``failures`` removed —
+    the same by-key filter `extract_one`'s own retry branch applies before
+    merging in what the retry recovers."""
+    failed_keys = {_fact_key(fact) for fact, _ in failures}
+    return (
+        [n for n in nodes if _fact_key(n) not in failed_keys],
+        [e for e in edges if _fact_key(e) not in failed_keys],
+    )
+
+
+def _merge_retry_reply(
+    *,
+    work: "_Work",
+    kept_nodes: List[dict],
+    kept_edges: List[dict],
+    failed_count: int,
+    retry_reply_text: str,
+    parse_errors: int,
+) -> Tuple[List[dict], List[dict], int, int]:
+    """Merge a corrective-retry's reply into the facts that already passed
+    the gate (``kept_nodes``/``kept_edges`` — the ORIGINAL reply already
+    filtered of its failures via :func:`_filter_kept`). ``failed_count`` is
+    how many facts the retry needed to recover — the same denominator
+    `extract_one` counts against. Returns ``(nodes, edges, dropped,
+    parse_errors)``, applying the SAME final safety net `extract_one` does:
+    whatever is STILL not verbatim after the merge is dropped and counted,
+    never shipped for the server to reject.
+    """
+    retry_nodes, retry_edges, retry_parse_errors = parse_streams(retry_reply_text)
+    parse_errors += retry_parse_errors
+    kwargs = {"chunk_texts": work.chunk_texts, "filename": work.filename, "path": work.path}
+    nodes = list(kept_nodes)
+    edges = list(kept_edges)
+    recovered = 0
+    for fact in [*retry_nodes, *retry_edges]:
+        if verbatim_failures([fact], **kwargs):
+            continue
+        (edges if "src" in fact and "dst" in fact else nodes).append(fact)
+        recovered += 1
+    dropped = max(0, failed_count - recovered)
+
+    still_bad = verbatim_failures([*nodes, *edges], **kwargs)
+    dropped_keys = {_fact_key(fact) for fact, _ in still_bad}
+    nodes = [n for n in nodes if _fact_key(n) not in dropped_keys]
+    edges = [e for e in edges if _fact_key(e) not in dropped_keys]
+    dropped += len(still_bad)
+    return nodes, edges, dropped, parse_errors
+
+
+def _finalize_gate(
+    *,
+    work: "_Work",
+    nodes: List[dict],
+    edges: List[dict],
+    failures: Sequence[Tuple[dict, str]],
+    retry_reply: Optional[str],
+    parse_errors: int,
+) -> Tuple[List[dict], List[dict], int, bool, int]:
+    """Resolve a document's verbatim-gate failures given a retry reply that
+    may have arrived from EITHER transport (a live sync call, or an
+    already-collected batch result) — or none at all, when the pass ran
+    out of budget for one. Returns ``(nodes, edges, dropped, retried,
+    parse_errors)``, matching :class:`_DocResult`'s own fields.
+    """
+    if not failures:
+        return nodes, edges, 0, False, parse_errors
+    kept_nodes, kept_edges = _filter_kept(nodes, edges, failures)
+    if retry_reply is None:
+        kwargs = {"chunk_texts": work.chunk_texts, "filename": work.filename, "path": work.path}
+        still_bad = verbatim_failures([*kept_nodes, *kept_edges], **kwargs)
+        dropped_keys = {_fact_key(f) for f, _ in still_bad}
+        kept_nodes = [n for n in kept_nodes if _fact_key(n) not in dropped_keys]
+        kept_edges = [e for e in kept_edges if _fact_key(e) not in dropped_keys]
+        return kept_nodes, kept_edges, len(failures) + len(still_bad), False, parse_errors
+    final_nodes, final_edges, dropped, parse_errors2 = _merge_retry_reply(
+        work=work,
+        kept_nodes=kept_nodes,
+        kept_edges=kept_edges,
+        failed_count=len(failures),
+        retry_reply_text=retry_reply,
+        parse_errors=parse_errors,
+    )
+    return final_nodes, final_edges, dropped, True, parse_errors2
+
+
+# --------------------------------------------------------------------------
+# Batches API client machinery — submit / poll / collect. No retry/backoff
+# of its own: a submit or retrieve failure means the model account is
+# unreachable, exactly the condition :class:`FactsExtractionUnavailable`
+# already names for the sync transport, so callers translate it the same
+# way rather than growing a second failure taxonomy.
+# --------------------------------------------------------------------------
+
+
+def _ensure_batch_client(
+    model: str, *, client: Any | None = None, timeout_s: float = DEFAULT_TIMEOUT_S
+) -> Tuple[Any, str]:
+    """Resolve a real Anthropic client + its resolved model id — the SAME
+    credential ladder :meth:`_Extractor._ensure_client` uses
+    (``build_client``), reused rather than duplicated so a batch-mode pass
+    can never disagree with a sync-mode one about which key/endpoint/model
+    resolution applies. The Anthropic client this returns is the ordinary
+    Messages client — ``client.messages.batches.*`` is the same object's
+    Batches API surface, not a second client. ``client`` is the test seam
+    (and doubles as the corrective retry's client when
+    ``extraction.facts.retry_transport: sync``).
+    """
+    if client is not None:
+        return client, model
+    from src.anonymization_ner import DetectionUnavailable, build_client
+
+    try:
+        return build_client(model, timeout_s)
+    except DetectionUnavailable as exc:
+        raise FactsExtractionUnavailable(str(exc)) from exc
+
+
+def _estimate_request_bytes(*, system_prompt: str, user_message: str, max_output_tokens: int) -> int:
+    """A conservative OVER-estimate of one request's on-wire JSON size — a
+    guard rail against the Batches API's 256 MB per-batch cap
+    (:data:`MAX_BATCH_API_BYTES`), not a byte-exact accounting. Mirrors the
+    exact field shape :func:`_submit_batch` sends, padded with placeholder
+    ids/model strings so the estimate never UNDER-counts what the real
+    request will carry.
+    """
+    payload = {
+        "custom_id": "x" * 64,
+        "params": {
+            "model": "x" * 40,
+            "max_tokens": max_output_tokens,
+            "system": [{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}],
+            "messages": [{"role": "user", "content": user_message}],
+        },
+    }
+    return len(json.dumps(payload).encode("utf-8"))
+
+
+def _group_pending_into_batches(
+    works: Sequence["_Work"], *, system_prompt: str, batch_size: int, max_output_tokens: int
+) -> List[List["_Work"]]:
+    """Group planned documents into Batches-API-sized groups — at most
+    ``batch_size`` requests (already clamped to the API's own 100,000-
+    request ceiling by :func:`_batch_size`) and never over the API's
+    256 MB per-batch payload cap (:data:`MAX_BATCH_API_BYTES`), estimated
+    per request via :func:`_estimate_request_bytes`. A single oversized
+    document lands alone in its own group rather than blocking the ones
+    beside it — the API itself is the final judge of a truly-too-large
+    request.
+    """
+    groups: List[List["_Work"]] = []
+    current: List["_Work"] = []
+    current_bytes = 0
+    for work in works:
+        nbytes = _estimate_request_bytes(
+            system_prompt=system_prompt, user_message=work.user_message, max_output_tokens=max_output_tokens
+        )
+        if current and (len(current) >= batch_size or current_bytes + nbytes > MAX_BATCH_API_BYTES):
+            groups.append(current)
+            current = []
+            current_bytes = 0
+        current.append(work)
+        current_bytes += nbytes
+    if current:
+        groups.append(current)
+    return groups
+
+
+def _submit_batch(
+    client: Any,
+    *,
+    model: str,
+    system_prompt: str,
+    works: Sequence["_Work"],
+    messages_by_file: Dict[str, str],
+    max_output_tokens: int,
+) -> str:
+    """Submit ONE Batches-API call for ``works`` and return the new batch's
+    id. ``messages_by_file`` lets a corrective-retry batch send the RETRY
+    prompt (not the document's original ``user_message``) for the same
+    work items — the initial submission passes ``{w.file_id: w.user_message
+    for w in works}``.
+    """
+    from anthropic.types.message_create_params import MessageCreateParamsNonStreaming
+    from anthropic.types.messages.batch_create_params import Request
+
+    requests = [
+        Request(
+            custom_id=work.file_id,
+            params=MessageCreateParamsNonStreaming(
+                model=model,
+                max_tokens=max_output_tokens,
+                system=[{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}],
+                messages=[{"role": "user", "content": messages_by_file[work.file_id]}],
+            ),
+        )
+        for work in works
+    ]
+    try:
+        batch = client.messages.batches.create(requests=requests)
+    except (FactsExtractionUnavailable, ProviderLimitHit):
+        raise
+    except Exception as exc:  # noqa: BLE001 — the model account is unreachable, not one document's failure
+        limit_reason = classify_provider_limit_error(exc)
+        if limit_reason is not None:
+            # The live incident this classification exists for: a workspace
+            # usage-limit exhaustion surfaces AT SUBMISSION, not per
+            # document — every subsequent batch would fail identically.
+            raise ProviderLimitHit(
+                f"facts extraction: batch submission refused ({limit_reason}): {type(exc).__name__}: {exc}",
+                reason=limit_reason,
+                retry_after_s=_retry_after_seconds(exc),
+            ) from exc
+        raise FactsExtractionUnavailable(
+            f"facts extraction: batch submission failed: {type(exc).__name__}: {exc}"
+        ) from exc
+    return batch.id
+
+
+def _poll_batch_until_ended(
+    client: Any, batch_id: str, *, poll_s: float, deadline: Any, sleep: Callable[[float], None] = time.sleep
+) -> Optional[Any]:
+    """Poll ``batch_id`` until its ``processing_status`` is ``"ended"``, or
+    the run's deadline elapses first — in which case this returns ``None``
+    and the caller leaves the batch's documents ``batch-submitted`` in
+    state for the next pass to resume. Checks status BEFORE sleeping, so an
+    already-ended batch (the common case on resume) returns immediately
+    with zero wait.
+    """
+    while True:
+        try:
+            batch = client.messages.batches.retrieve(batch_id)
+        except (FactsExtractionUnavailable, ProviderLimitHit):
+            raise
+        except Exception as exc:  # noqa: BLE001 — the model account is unreachable
+            limit_reason = classify_provider_limit_error(exc)
+            if limit_reason is not None:
+                raise ProviderLimitHit(
+                    f"facts extraction: batch status check refused ({limit_reason}): {type(exc).__name__}: {exc}",
+                    reason=limit_reason,
+                    retry_after_s=_retry_after_seconds(exc),
+                ) from exc
+            raise FactsExtractionUnavailable(
+                f"facts extraction: batch status check failed: {type(exc).__name__}: {exc}"
+            ) from exc
+        if getattr(batch, "processing_status", None) == "ended":
+            return batch
+        if _deadline_expired(deadline):
+            return None
+        sleep(poll_s)
+
+
+def _collect_batch_results(client: Any, batch_id: str) -> Dict[str, Any]:
+    """``{custom_id: result}`` for an ENDED batch. The SDK's own iterator
+    arrives in ANY order (Anthropic's own contract), so callers key off
+    ``custom_id`` rather than position — never assume request N's result
+    is the Nth item returned.
+    """
+    try:
+        return {item.custom_id: item.result for item in client.messages.batches.results(batch_id)}
+    except (FactsExtractionUnavailable, ProviderLimitHit):
+        raise
+    except Exception as exc:  # noqa: BLE001 — the model account is unreachable
+        limit_reason = classify_provider_limit_error(exc)
+        if limit_reason is not None:
+            raise ProviderLimitHit(
+                f"facts extraction: batch result collection refused ({limit_reason}): {type(exc).__name__}: {exc}",
+                reason=limit_reason,
+                retry_after_s=_retry_after_seconds(exc),
+            ) from exc
+        raise FactsExtractionUnavailable(
+            f"facts extraction: batch result collection failed: {type(exc).__name__}: {exc}"
+        ) from exc
+
+
+def _batch_is_expired_by_age(submitted_at: Optional[str]) -> bool:
+    """Whether a ``batch-submitted`` state entry is older than Anthropic's
+    own :data:`BATCH_RESULT_RETENTION_DAYS`-day results-retention window —
+    checked BEFORE any network call, so a stale reference from a long-idle
+    instance is treated as expired without wasting a ``retrieve()`` call on
+    a batch the API has already forgotten. Tolerates a missing or
+    unparseable timestamp as "not expired" — the safer default when the
+    state file itself cannot say otherwise.
+    """
+    if not submitted_at:
+        return False
+    try:
+        submitted = datetime.fromisoformat(str(submitted_at))
+    except ValueError:
+        return False
+    if submitted.tzinfo is None:
+        submitted = submitted.replace(tzinfo=timezone.utc)
+    age_s = (datetime.now(timezone.utc) - submitted).total_seconds()
+    return age_s > BATCH_RESULT_RETENTION_DAYS * 86400
+
+
+def _load_work_for_file(
+    file_id: str,
+    *,
+    files_repo: Any,
+    sources_repo: Any,
+    max_doc_chars: int,
+    system_prompt_tokens: int = 0,
+    max_prompt_tokens: int = DEFAULT_MAX_PROMPT_TOKENS,
+) -> Optional[Tuple["_Work", bool]]:
+    """Re-derive one document's ``_Work`` FRESH from the database at
+    collection time, rather than caching what :func:`_plan_documents` built
+    at submission time — a batch's result may be collected in a LATER pass
+    (a different process invocation entirely), so nothing about the
+    document can be assumed to have survived in memory. Returns ``(work,
+    was_truncated)``, or ``None`` when the document itself is gone (deleted
+    between submission and collection — rare, but a batch's ~hour-to-24h
+    round trip makes it possible).
+
+    Applies the SAME token-aware bound :func:`_plan_documents` applies at
+    submission time (:func:`_token_char_budget`) — what matters here is not
+    what was already sent (that already happened, at submission time) but
+    keeping THIS re-derived copy consistent for building a follow-up
+    corrective retry, which is exactly where the SAME unbounded-request risk
+    applies a second time (see :func:`_bound_failures_for_retry`).
+    """
+    file_row = files_repo.get(file_id)
+    if not file_row:
+        return None
+    mapping = sources_repo.get(file_id) or {}
+    doc_id = mapping.get("source_doc_id")
+    if not doc_id:
+        return None
+    doc_id = str(doc_id)
+    collection_id = str(file_row.get("corpus_id") or "")
+    path = file_row.get("path")
+    filename = file_row.get("filename")
+    sha256 = str(file_row.get("sha256") or "")
+    chunk_texts, text = _document_text(file_id)
+    truncated = False
+    if len(text) > max_doc_chars:
+        text = text[:max_doc_chars]
+        truncated = True
+    tabular = _is_tabular_text(text)
+    char_budget = _token_char_budget(system_prompt_tokens, max_prompt_tokens, tabular=tabular)
+    if len(text) > char_budget:
+        text = text[:char_budget]
+        truncated = True
+    metadata = {"doc_id": doc_id, "name": filename, "path": path, "collection_id": collection_id}
+    work = _Work(
+        file_id=file_id,
+        doc_id=doc_id,
+        collection_id=collection_id,
+        filename=filename,
+        path=path,
+        sha256=sha256,
+        mapping=mapping,
+        chunk_texts=chunk_texts,
+        user_message=build_user_message(metadata, text),
+        tabular=tabular,
+    )
+    return work, truncated
+
+
+def _requeue_or_fail(
+    file_id: str,
+    *,
+    reason: str,
+    permanent: bool,
+    docs_state: Dict[str, Any],
+    batch_attempts: Dict[str, int],
+    report: "_Report",
+) -> None:
+    """One document's batch attempt did not produce a usable reply.
+
+    ``permanent`` (an ``invalid_request`` error) fails it outright — no
+    resubmission fixes a request the API itself rejected as malformed.
+    Everything else (errored/canceled/expired/a missing result row) is
+    transient and gets bounded resubmission — the same "attempts accumulate
+    across runs, reset only by success" shape
+    ``connectors.sharepoint.crawler._note_retry`` already applies to a
+    failed download, applied here to :data:`MAX_BATCH_REQUEUE_ATTEMPTS`.
+    The attempt counter lives in ``batch_attempts`` (kept apart from
+    ``docs_state``, which is CLEARED on a transient requeue so
+    :func:`_plan_documents` re-derives and resubmits the document next
+    pass) and is only dropped on success or permanent failure.
+    """
+    if permanent:
+        docs_state[file_id] = {"status": "failed", "reason": reason, "at": _now_iso()}
+        batch_attempts.pop(file_id, None)
+        report.facts_failed += 1
+        # Same `facts_failed_reasons` breakdown the sync transport's
+        # `FactsDocumentError` handling records — `reason` here always
+        # starts with `"invalid_request"` (the only `permanent=True`
+        # caller, see `_collect_batch`), so this stays a short, stable
+        # class rather than the full API error message.
+        report.record_failure_reason("invalid_request" if reason.startswith("invalid_request") else reason)
+        logger.warning("facts extraction: document %s permanently failed (%s) — not retried", file_id, reason)
+        return
+    attempts = int(batch_attempts.get(file_id, 0)) + 1
+    batch_attempts[file_id] = attempts
+    docs_state.pop(file_id, None)
+    if attempts >= MAX_BATCH_REQUEUE_ATTEMPTS:
+        docs_state[file_id] = {
+            "status": "failed",
+            "reason": f"{reason} (gave up after {attempts} batch attempts)",
+            "at": _now_iso(),
+        }
+        batch_attempts.pop(file_id, None)
+        report.facts_failed += 1
+        logger.warning(
+            "facts extraction: giving up on document %s after %d failed batch attempts (%s)",
+            file_id,
+            attempts,
+            reason,
+        )
+    else:
+        logger.info(
+            "facts extraction: document %s requeued for batch retry (%s, attempt %d/%d)",
+            file_id,
+            reason,
+            attempts,
+            MAX_BATCH_REQUEUE_ATTEMPTS,
+        )
 
 
 def _ingest_identity() -> Any:
@@ -1412,15 +4138,80 @@ def _ingest_identity() -> Any:
     return ensure_scheduler_user()
 
 
+def _resolve_run_transport(
+    *,
+    connection_id: str,
+    transport: Optional[str],
+    connection: Optional[Dict[str, Any]],
+    effective_provider: str,
+) -> str:
+    """The transport ONE pass actually runs — an explicit ``transport`` (the
+    test seam) wins; otherwise :func:`resolve_transport`'s answer — downgraded
+    from ``"batch"`` to ``"sync"`` when ``effective_provider`` is
+    ``"vertex"``: the Anthropic Batches API has no Vertex equivalent, and
+    this is never an error and never a silent switch — ONE warning naming
+    why, and the caller reports the (possibly-downgraded) return value as
+    the pass's ACTUAL transport (:meth:`_Report.render`'s own ``transport``
+    field), not what was configured.
+    """
+    mode = transport if transport is not None else resolve_transport(connection)[0]
+    if mode == "batch" and effective_provider == "vertex":
+        logger.warning(
+            "facts extraction: connection %s resolved provider=vertex but transport=batch — the "
+            "Anthropic Batches API has no Vertex equivalent, falling back to transport=sync for this pass",
+            connection_id,
+        )
+        return "sync"
+    return mode
+
+
+def _run_end_of_pass_orphan_sweep(report: "_Report") -> None:
+    """Run ``sweep_orphans()`` exactly ONCE, after a pass's every batch has
+    already flushed with ``run_orphan_sweep=False`` (TCRD-296 C.12 — see
+    :attr:`_Report.orphans_swept`'s docstring for the live finding this
+    replaces the per-batch sweep for).
+
+    The DEFAULT grace period (``FactsPgRepository.sweep_orphans``'s own
+    ``_ORPHAN_SWEEP_GRACE_S``), not an immediate delete: this pass's fact
+    graph is SHARED with any sibling pass running concurrently, exactly the
+    condition that grace period exists for — unlike
+    ``app.api.collections._sweep_facts_orphans_after_delete``'s
+    ``grace_seconds=0``, where deleting one file is known to be the only
+    possible source of a fresh orphan.
+
+    Never raises: a sweep failure must not turn a pass that otherwise
+    finished cleanly into a `failed` run — logged and left at the report's
+    default (``orphans_swept=0``), same posture
+    ``_sweep_facts_orphans_after_delete`` already takes for the identical
+    call on the file-delete path.
+    """
+    from src.repositories import facts_repo
+
+    try:
+        result = facts_repo().sweep_orphans()
+    except Exception:
+        logger.warning("facts extraction: end-of-pass orphan sweep failed (non-fatal)", exc_info=True)
+        return
+    report.orphans_swept = result["deleted"]
+    report.orphans_sweep_skipped = result["skipped"]
+
+
 def run_facts_extraction(
     connection_id: str,
     *,
     doc_ids: Optional[Sequence[str]] = None,
     deadline: Any | None = None,
     extractor: Any | None = None,
-    max_doc_chars: int = DEFAULT_MAX_DOC_CHARS,
+    max_doc_chars: Optional[int] = None,
     concurrency: Optional[int] = None,
+    retry_mode: Optional[str] = None,
     on_progress: Optional[Callable[[Dict[str, Any]], None]] = None,
+    transport: Optional[str] = None,
+    batch_client: Any | None = None,
+    provider: Optional[str] = None,
+    vertex_region: Optional[str] = None,
+    max_prompt_tokens: Optional[int] = None,
+    partition: Optional[Tuple[int, int]] = None,
 ) -> Dict[str, Any]:
     """Run one fact-extraction pass for a SharePoint connection.
 
@@ -1436,14 +4227,17 @@ def run_facts_extraction(
     -> str`` method and a ``usage`` dict.
 
     Documents are extracted through a bounded pool
-    (``extraction.facts.concurrency``, default 3, clamped to ``[1, 16]``).
+    (``extraction.facts.concurrency``, default 3, clamped to ``[1, 64]``).
     Only the model half runs in a worker (:func:`extract_one`); the walk,
     every database read, the ingest and the state file stay on this
     thread, and results are consumed in SUBMISSION order — so a run at
     concurrency 1 does exactly what a sequential run did, batch
     composition included, and a run at 8 differs only in wall clock.
     ``concurrency`` overrides the configured value (the test seam for
-    that).
+    that). ``retry_mode`` overrides the resolved retry policy the same way
+    (the test seam); absent, the connection's own ``config.extraction.
+    facts.retry_mode`` wins over the instance-level ``extraction.facts.
+    retry_mode`` — see :func:`resolve_retry_mode`.
 
     ``on_progress`` is the liveness seam (owner-frustration fix,
     2026-09-02: a healthy multi-hour pass over this phase alone read as
@@ -1459,6 +4253,62 @@ def run_facts_extraction(
     invented ahead of that. Exceptions from the callback are swallowed:
     this is observability, never load-bearing, the same posture every
     other progress signal in this pipeline takes.
+
+    ``transport`` overrides ``extraction.facts.transport`` (the test seam;
+    ``None`` reads config, same convention as ``concurrency`` above). When
+    resolved to ``"batch"`` this function dispatches everything below to
+    :func:`_run_batch_pass` — the sync loop's own connection/ontology/
+    prompt resolution above this point is shared by both, but nothing
+    past the dispatch runs for a batch-mode pass. ``batch_client`` is that
+    transport's own test seam (an object exposing ``.messages.batches.
+    create/retrieve/results``), unused for a sync pass.
+
+    ``provider`` overrides ``extraction.facts.provider`` (the test seam,
+    same convention — a concrete ``"anthropic"``/``"vertex"`` here skips
+    :func:`resolve_effective_provider` entirely; ``None`` resolves it). The
+    Anthropic Batches API has no Vertex equivalent: when the resolved
+    provider is ``"vertex"`` and the resolved transport is ``"batch"``, this
+    function falls back to ``"sync"`` with ONE warning naming why, rather
+    than an error or a silent switch — the effective provider AND transport
+    are then reported by :meth:`_Report.render` (``provider``,
+    ``provider_source``, ``transport``), so an operator sees what actually
+    ran, not just what was configured.
+
+    ``vertex_region`` overrides :func:`resolve_vertex_region` the same way
+    (the test seam; ``None`` resolves it) — only consulted when
+    ``effective_provider`` is ``"vertex"``, resolved and reported
+    unconditionally regardless. Vertex enforces its Claude quotas PER
+    REGION, so pinning different connections to different regions
+    multiplies the account's effective throughput at the same price.
+
+    ``max_doc_chars`` / ``max_prompt_tokens`` override
+    ``extraction.facts.max_doc_chars`` / ``extraction.facts.
+    max_prompt_tokens`` the same way (test seams; ``None`` resolves from
+    config). The first is the flat character pre-cap
+    (:data:`DEFAULT_MAX_DOC_CHARS`); the second is the SOFT token budget
+    the whole request (system prompt + document text, and separately the
+    corrective retry's failing-quote listing) is kept under
+    (:data:`DEFAULT_MAX_PROMPT_TOKENS`, hard-ceilinged at
+    :data:`MAX_PROMPT_TOKENS_CEILING`) — see :func:`_plan_documents` and
+    :func:`_bound_failures_for_retry`.
+
+    ``partition`` (``(index, count)``, TCRD-296 gap #67) narrows this pass
+    to the slice of the corpus :func:`_partition_of` assigns it, and
+    switches the ledger's persistence from a whole-payload
+    :func:`save_state` to a per-document merge (see
+    :func:`_load_facts_state_for_partition` / :func:`_persist_facts_docs`)
+    — so several partitions of the SAME connection can run at once without
+    clobbering each other's progress. ``None`` (every caller before this
+    feature existed) or ``count <= 1`` is byte-identical to today's single,
+    un-partitioned pass. A partitioned run also FORCES the sync transport
+    regardless of ``extraction.facts.transport`` — the Batches API resume
+    scan is not yet partition-safe (it would need to tell a sibling
+    partition's still in-flight batch id apart from its own), same posture
+    as the existing vertex/batch fallback above. The end-of-pass orphan
+    sweep (#2220) and the auto-continuation decision
+    (:func:`maybe_continue_pass`) both run only once PER CONNECTION, on
+    whichever partition happens to finish last (:func:`_is_last_facts_partition`)
+    — never once per partition.
 
     Returns the pass report (see :meth:`_Report.render`).
     """
@@ -1479,15 +4329,90 @@ def run_facts_extraction(
         )
     ontology_text = render_ontology(ontology_models)
 
-    from connectors.sharepoint.facts_prompt import PROMPT_VERSION, prompt_fingerprint, resolve_extraction_prompt
+    from connectors.sharepoint.facts_prompt import prompt_fingerprint, resolve_extraction_prompt
 
     prompt_text, prompt_origin = resolve_extraction_prompt()
     system_prompt = build_system_prompt(prompt_text, ontology_text)
     fingerprint = prompt_fingerprint(system_prompt)
 
     model = _model()
+
+    # `None` (the default) resolves from config — the same test-seam
+    # convention every other knob on this function already uses.
+    resolved_max_doc_chars = max_doc_chars if max_doc_chars is not None else _max_doc_chars()
+    resolved_max_prompt_tokens = max_prompt_tokens if max_prompt_tokens is not None else _max_prompt_tokens()
+    system_prompt_tokens = _approx_tokens(system_prompt)
+
+    # Provider resolution — independent of the transport dispatch below, but
+    # the transport dispatch depends on ITS answer (batch is Anthropic-API-
+    # only). An explicit `provider` (the test seam) wins outright; otherwise
+    # `resolve_effective_provider` — connection override, then the instance
+    # setting, then (when either resolves to "inherit", the default) this
+    # instance's own `ai.provider`.
+    effective_provider, provider_source = (
+        (provider, "caller") if provider in ("anthropic", "vertex") else resolve_effective_provider(connection)
+    )
+
+    # Vertex region resolution — same test-seam convention as `provider`
+    # above (`None` resolves it). Only meaningful for a `vertex`-resolved
+    # pass, resolved and reported regardless so the run report always shows
+    # what THIS pass would have used had it been vertex.
+    resolved_vertex_region, vertex_region_source = (
+        (vertex_region, "caller") if vertex_region is not None else resolve_vertex_region(connection)
+    )
+
+    # Transport dispatch — the ONE branch point between the two transports.
+    # Everything above this line (connection, ontology, prompt, model,
+    # provider) is shared; nothing below it runs for a batch-mode pass.
+    mode = _resolve_run_transport(
+        connection_id=connection_id, transport=transport, connection=connection, effective_provider=effective_provider
+    )
+    if mode == "batch" and partition is not None and partition[1] > 1:
+        # A partitioned run's resume scan (`_run_batch_pass`'s "batches a
+        # PRIOR pass left in flight") walks the WHOLE connection-wide
+        # ledger by `batch_id`, with no notion of partition ownership yet
+        # — not partition-safe. Force sync instead, same posture as the
+        # vertex/batch fallback below (one warning naming why, never an
+        # error or a silent switch).
+        logger.warning(
+            "facts extraction: connection %s — partition %d/%d forces the sync transport "
+            "(extraction.facts.transport: batch is not yet partition-safe)",
+            connection_id,
+            partition[0],
+            partition[1],
+        )
+        mode = "sync"
+    if mode == "batch":
+        # Same precedence as the sync loop below: an explicit `retry_mode`
+        # (the test seam) wins, else the connection's override, else the
+        # instance default — so a per-connection `off` holds on BOTH transports.
+        return _run_batch_pass(
+            connection_id,
+            connection=connection,
+            model=model,
+            system_prompt=system_prompt,
+            fingerprint=fingerprint,
+            prompt_origin=prompt_origin,
+            ontology_models=ontology_models,
+            doc_ids=doc_ids,
+            deadline=deadline,
+            max_doc_chars=resolved_max_doc_chars,
+            batch_client=batch_client,
+            on_progress=on_progress,
+            retry_mode=retry_mode if retry_mode in _VALID_RETRY_MODES else resolve_retry_mode(connection)[0],
+            provider=effective_provider,
+            provider_source=provider_source,
+            max_prompt_tokens=resolved_max_prompt_tokens,
+        )
+
     if extractor is None:
-        extractor = _Extractor(system_prompt=system_prompt, model=model)
+        extractor = _Extractor(
+            system_prompt=system_prompt,
+            model=model,
+            provider=effective_provider,
+            vertex_region=resolved_vertex_region,
+            max_prompt_tokens=resolved_max_prompt_tokens,
+        )
     else:
         model = getattr(extractor, "model", model)
 
@@ -1496,11 +4421,18 @@ def run_facts_extraction(
         workers = max(MIN_CONCURRENCY, min(MAX_CONCURRENCY, int(concurrency)))
         concurrency_source = "caller"
 
+    # Explicit param (the test seam, same precedence as `concurrency` above)
+    # wins outright; otherwise the connection's own override wins over the
+    # instance-level default (`resolve_retry_mode`).
+    resolved_retry_mode = retry_mode if retry_mode in _VALID_RETRY_MODES else resolve_retry_mode(connection)[0]
+    llm_cache = _resolve_llm_cache()
+
     report = _Report()
-    state = load_state(connection_id)
-    docs_state: Dict[str, Any] = state["docs"]
+    state, docs_state = _load_facts_state_for_partition(connection_id, partition)
     anonymize_marked = anonymize_marked_collection_ids(connection)
-    shipper = _BatchShipper(report=report, anonymize_marked=anonymize_marked, user=_ingest_identity())
+    shipper = _BatchShipper(
+        report=report, anonymize_marked=anonymize_marked, user=_ingest_identity(), docs_state=docs_state
+    )
 
     files_repo = corpus_files_repo()
     sources_repo = corpus_file_sources_repo()
@@ -1533,133 +4465,32 @@ def run_facts_extraction(
         try:
             shipper.flush(usage=_usage_delta(snapshot), model=model)
         except _IngestRefused:
-            # Already counted in the report by the shipper; the documents
-            # in that batch keep no state entry, so the next pass retries
-            # them. A refusal is never allowed to abort the whole pass —
-            # one collection's misconfiguration must not cost the others.
-            pass
+            # Already counted in the report by the shipper. The refused
+            # batch's documents had their `docs_state` entry written
+            # "done" OPTIMISTICALLY before this flush — the shipper's
+            # `_revert_ledger` already downgraded it (in memory) so the
+            # next pass retries them (TCRD-296 gap #62); persist that
+            # correction now rather than letting it live only in memory —
+            # a pass whose EVERY batch gets refused would otherwise never
+            # persist anything this run. A refusal is never allowed to
+            # abort the whole pass — one collection's misconfiguration
+            # must not cost the others.
+            _persist_facts_docs(connection_id, state, docs_state, partition=partition)
         else:
             shipped_usage.update({k: int(v) for k, v in snapshot.items() if isinstance(v, (int, float))})
-            save_state(connection_id, state)
-
-    def _plan() -> Any:
-        """Yield the documents that actually need a model call.
-
-        Every cheap decision — not a source document, tabular, not
-        indexed, unchanged, no text — is made HERE, on the main thread,
-        before anything is submitted: those documents cost nothing and
-        must not occupy a worker slot to find that out.
-        """
-        for collection_id in collection_ids_for(connection):
-            for file_row in files_repo.list_for_corpus(collection_id):
-                file_id = str(file_row["id"])
-                mapping = sources_repo.get(file_id) or {}
-                doc_id = mapping.get("source_doc_id")
-                if not doc_id:
-                    # Not a source-anchored document (a hand upload); it has
-                    # no producer doc_id to cite, so ingest could not resolve
-                    # its evidence anyway.
-                    continue
-                doc_id = str(doc_id)
-                if wanted_doc_ids is not None and doc_id not in wanted_doc_ids:
-                    continue
-
-                report.docs_seen += 1
-                # `path`/`filename` here are exactly what `corpus_files`
-                # stores — for an anonymize-marked collection that is the
-                # ANONYMIZED value (``connectors.sharepoint.crawler
-                # ._anonymize_identity`` writes it there at ingest time, the
-                # same as the document body), never the real SharePoint name
-                # or folder. This module deliberately has no anonymize gate
-                # of its own: there is no raw text left to gate by the time
-                # it gets here, so `build_user_message` and
-                # `quote_is_verbatim` below can only ever see/cite the
-                # already-redacted identity, same as the chunk text.
-                path = file_row.get("path")
-                filename = file_row.get("filename")
-                if _is_tabular(path, filename):
-                    report.docs_skipped_tabular += 1
-                    docs_state[file_id] = {"status": "skipped-tabular", "at": _now_iso()}
-                    continue
-                if file_row.get("processing_status") != "indexed":
-                    # The gate defers a claim on a non-indexed document, so
-                    # extracting it now would spend a call on claims the
-                    # ingest cannot accept yet.
-                    report.docs_skipped_not_indexed += 1
-                    continue
-
-                sha256 = str(file_row.get("sha256") or "")
-                if is_up_to_date(docs_state.get(file_id), sha256=sha256, model=model, fingerprint=fingerprint):
-                    report.docs_unchanged += 1
-                    continue
-
-                chunk_texts, text = _document_text(file_id)
-                if not text.strip():
-                    report.docs_skipped_no_text += 1
-                    docs_state[file_id] = {"status": "skipped-no-text", "at": _now_iso()}
-                    continue
-                if len(text) > max_doc_chars:
-                    text = text[:max_doc_chars]
-                    report.docs_truncated += 1
-
-                metadata = {
-                    "doc_id": doc_id,
-                    "name": filename,
-                    "path": path,
-                    "collection_id": collection_id,
-                }
-                yield _Work(
-                    file_id=file_id,
-                    doc_id=doc_id,
-                    collection_id=collection_id,
-                    filename=filename,
-                    path=path,
-                    sha256=sha256,
-                    mapping=mapping,
-                    chunk_texts=chunk_texts,
-                    user_message=build_user_message(metadata, text),
-                )
+            _persist_facts_docs(connection_id, state, docs_state, partition=partition)
 
     def _accept(result: _DocResult) -> None:
         """Fold one finished document into the report, the batch and the
         state file. Main thread only — which is what makes the report
         counters, the shipper and ``docs_state`` need no locks of their
-        own."""
-        work = result.work
-        report.parse_errors += result.parse_errors
-        report.facts_retries += 1 if result.retried else 0
-        report.facts_quotes_dropped += result.dropped
-        report.facts_quotes_repaired += result.repaired
-        claim_count = sum(len(f.get("evidence") or []) for f in [*result.nodes, *result.edges])
-        shipper.add(
-            document={
-                "doc_id": work.doc_id,
-                "corpus_id": work.collection_id,
-                "stable_id": work.mapping.get("source_stable_id"),
-                "path": work.path,
-                "name": work.filename,
-                "sha256": work.mapping.get("source_sha256") or work.sha256,
-            },
-            nodes=result.nodes,
-            edges=result.edges,
-            claim_count=claim_count,
+        own. The fold itself is :func:`_fold_accepted_result`, shared with
+        :func:`_run_batch_pass` so a document's final "done" shape can
+        never drift between transports."""
+        _fold_accepted_result(
+            report=report, shipper=shipper, docs_state=docs_state, result=result, model=model, fingerprint=fingerprint
         )
-        report.docs_extracted += 1
-        report.nodes_emitted += len(result.nodes)
-        report.edges_emitted += len(result.edges)
-        docs_state[work.file_id] = {
-            "status": "done",
-            "doc_id": work.doc_id,
-            "extracted_sha": work.sha256,
-            "model": model,
-            "prompt_fingerprint": fingerprint,
-            "prompt_version": PROMPT_VERSION,
-            "nodes": len(result.nodes),
-            "edges": len(result.edges),
-            "dropped": result.dropped,
-            "seconds": result.seconds,
-            "at": _now_iso(),
-        }
+        report.docs_via_sync += 1
         if shipper.should_flush():
             _flush()
 
@@ -1697,14 +4528,37 @@ def run_facts_extraction(
 
         A per-document failure is COUNTED and the pass continues — one
         document's bad reply must never cost the documents beside it their
-        results. A :class:`FactsExtractionUnavailable` is remembered
-        instead of raised here, so the remaining in-flight calls (already
-        paid for) still get drained before the pass stops.
+        results. A :class:`FactsExtractionUnavailable` (or
+        :class:`ProviderLimitHit`) is remembered instead of raised here, so
+        the remaining in-flight calls (already paid for) still get drained
+        before the pass stops.
         """
         nonlocal hard_stop, docs_unavailable
         future, work = inflight.popleft()
         try:
             _accept(future.result())
+        except FactsDocumentError as exc:
+            # A PERMANENT, document-specific model-call failure (currently
+            # only `invalid_request` — most commonly "prompt is too long")
+            # — counted the same way any other per-document failure is,
+            # never a hard stop. See `FactsDocumentError`'s docstring for
+            # why this is deliberately NOT `FactsExtractionUnavailable`.
+            report.facts_failed += 1
+            report.record_failure_reason(exc.reason)
+            logger.warning(
+                "facts extraction: document %s permanently failed (%s) — counted, continuing",
+                work.doc_id,
+                exc.reason,
+            )
+        except ProviderLimitHit as exc:
+            # A closed-set provider refusal (workspace/usage-limit,
+            # region×model quota, billing) — remembered like
+            # `FactsExtractionUnavailable` below, but turned into a CLEAN
+            # `interrupted_reason: "provider_limit"` stop after the drain
+            # rather than a failed job (see the `hard_stop` handling below).
+            docs_unavailable += 1
+            if hard_stop is None:
+                hard_stop = exc
         except FactsExtractionUnavailable as exc:
             docs_unavailable += 1
             if hard_stop is None:
@@ -1734,7 +4588,20 @@ def run_facts_extraction(
         # immediately, rather than only once the (possibly slow) first
         # document finishes.
         _report_progress(docs_done=0)
-        for work in _plan():
+        for work in _plan_documents(
+            connection=connection,
+            docs_state=docs_state,
+            report=report,
+            files_repo=files_repo,
+            sources_repo=sources_repo,
+            wanted_doc_ids=wanted_doc_ids,
+            model=model,
+            fingerprint=fingerprint,
+            max_doc_chars=resolved_max_doc_chars,
+            system_prompt_tokens=system_prompt_tokens,
+            max_prompt_tokens=resolved_max_prompt_tokens,
+            partition=partition,
+        ):
             # Checked between SUBMISSIONS: everything already in flight is
             # drained below rather than abandoned, because those calls are
             # paid for whether or not this process waits for them.
@@ -1745,7 +4612,19 @@ def run_facts_extraction(
             if hard_stop is not None:
                 break
             docs_planned += 1
-            inflight.append((executor.submit(extract_one, extractor, work), work))
+            inflight.append(
+                (
+                    executor.submit(
+                        extract_one,
+                        extractor,
+                        work,
+                        retry_mode=resolved_retry_mode,
+                        fingerprint=fingerprint,
+                        cache=llm_cache,
+                    ),
+                    work,
+                )
+            )
             while len(inflight) >= workers:
                 _drain_one()
                 if hard_stop is not None:
@@ -1757,38 +4636,621 @@ def run_facts_extraction(
         # Ship (and persist) whatever is pending, on every exit path —
         # including a hard stop. Work already paid for is never thrown away.
         _flush()
+        # TCRD-296 C.12 — the pass's OWN single sweep, now that every batch
+        # it shipped has flushed with `run_orphan_sweep=False`. Runs on
+        # every exit path (including a hard stop), same "always finish
+        # this pass's own bookkeeping" reasoning as the `_flush()` above.
+        # Gap #67: for a PARTITIONED run this must fire once per
+        # CONNECTION, not once per partition — only the partition that
+        # finishes LAST (no sibling still queued/running) actually sweeps.
+        if _is_last_facts_partition(connection_id, partition):
+            _run_end_of_pass_orphan_sweep(report)
 
+    resolved_provider_for_report = getattr(extractor, "provider", effective_provider)
     if hard_stop is not None:
-        # Loud, after the drain: the pass cannot be trusted, and "0 facts"
-        # would be indistinguishable from a corpus that has none.
-        raise hard_stop
+        if isinstance(hard_stop, ProviderLimitHit):
+            # A closed-set provider refusal ends the pass CLEANLY —
+            # `interrupted_reason: "provider_limit"`, never a failed job
+            # (see the module's provider-limit classification section) —
+            # and persists the fleet-level condition that suppresses
+            # further STREAMED enqueues until it clears.
+            report.interrupted = True
+            report.interrupted_reason = "provider_limit"
+            record_provider_limit_condition(
+                reason=hard_stop.reason,
+                provider=resolved_provider_for_report,
+                model=model,
+                region=getattr(extractor, "vertex_region", resolved_vertex_region),
+                message=str(hard_stop),
+                retry_after_s=hard_stop.retry_after_s,
+            )
+        else:
+            # Loud, after the drain: the pass cannot be trusted, and "0
+            # facts" would be indistinguishable from a corpus that has none.
+            raise hard_stop
+    else:
+        # No provider refusal this pass — the signal the provider is
+        # answering again, for whichever fleet-level condition (if any)
+        # this provider still has active.
+        clear_provider_limit_conditions(resolved_provider_for_report)
 
     usage = _usage()
     usage["documents"] = report.docs_extracted
     usage["concurrency"] = workers
     usage["concurrency_source"] = concurrency_source
+    # 0 API tokens for every cache-served reply (see extract_one) — this is
+    # what makes a cache hit genuinely free rather than merely un-metered.
+    usage["cache_hits"] = report.facts_cache_hits
     rendered = report.render(
         model=model,
         prompt_origin=prompt_origin,
-        ontology={
-            "models": [m.get("slug") for m in ontology_models],
-            "node_types": sum(
-                1
-                for m in ontology_models
-                for d in (m["model"].get("datasets") or [])
-                if str((d or {}).get("source") or "").startswith("ontology_node_type:")
-            ),
-            "edge_types": sum(len(m["model"].get("relationships") or []) for m in ontology_models),
-        },
+        ontology=_ontology_report(ontology_models),
         usage=usage,
+        provider=resolved_provider_for_report,
+        provider_source=provider_source,
+        transport=mode,
+        vertex_region=getattr(extractor, "vertex_region", resolved_vertex_region),
+        vertex_region_source=vertex_region_source,
     )
     logger.info(
-        "facts extraction: connection %s — %d extracted, %d unchanged, %d tabular, %d failed, "
-        "%d quotes dropped, %d claims written",
+        "facts extraction: connection %s — %d extracted, %d unchanged, %d failed, %d quotes dropped, %d claims written",
         connection_id,
         rendered["docs_extracted"],
         rendered["docs_unchanged"],
-        rendered["docs_skipped_tabular"],
+        rendered["facts_failed"],
+        rendered["facts_quotes_dropped"],
+        rendered["claims_written"],
+    )
+    return rendered
+
+
+def _run_batch_pass(
+    connection_id: str,
+    *,
+    connection: Dict[str, Any],
+    model: str,
+    system_prompt: str,
+    fingerprint: str,
+    prompt_origin: str,
+    ontology_models: List[Dict[str, Any]],
+    doc_ids: Optional[Sequence[str]],
+    deadline: Any,
+    max_doc_chars: int,
+    max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
+    batch_client: Any | None = None,
+    on_progress: Optional[Callable[[Dict[str, Any]], None]] = None,
+    retry_mode: str = DEFAULT_RETRY_MODE,
+    provider: str = "anthropic",
+    provider_source: str = "instance",
+    max_prompt_tokens: Optional[int] = None,
+) -> Dict[str, Any]:
+    """The Batches-API transport's own pass — dispatched from
+    :func:`run_facts_extraction` when ``extraction.facts.transport`` (or
+    the ``transport`` override) resolves to ``"batch"``.
+
+    Flow: resume any batch a PRIOR pass left ``batch-submitted`` in state,
+    submit fresh batches for whatever :func:`_plan_documents` still finds
+    pending (:func:`_group_pending_into_batches`, respecting the request-
+    count and byte caps), then drain a queue of batch ids — poll each to
+    ``"ended"`` (bounded by ``deadline``, never a fixed wall-clock guess),
+    collect its results (:func:`_collect_batch_results`) and fold every one
+    through the SAME gate / corrective-retry-recovery / ingest-shipping
+    contract the sync transport uses (:func:`_fold_accepted_result`), so a
+    document's FINAL shape is transport-independent. A corrective-retry
+    batch (``extraction.facts.retry_transport: batch``, the default) is
+    submitted per collected initial batch and enqueued the same way, so it
+    drains through the identical poll/collect step.
+
+    Resumable by construction: every document that leaves the queue with a
+    transient outcome (submitted-but-not-yet-collected, errored, canceled,
+    expired, or a missing result row) either stays ``batch-submitted`` in
+    state (deadline hit mid-poll) or is cleared back to plain "pending"
+    (:func:`_requeue_or_fail`) for :func:`_plan_documents` to pick up next
+    pass — never silently dropped, never resubmitted twice.
+    """
+    from src.repositories import corpus_file_sources_repo, corpus_files_repo
+
+    report = _Report()
+    state = load_state(connection_id)
+    docs_state: Dict[str, Any] = state["docs"]
+    batch_attempts: Dict[str, int] = state.setdefault("batch_attempts", {})
+    anonymize_marked = anonymize_marked_collection_ids(connection)
+    shipper = _BatchShipper(
+        report=report, anonymize_marked=anonymize_marked, user=_ingest_identity(), docs_state=docs_state
+    )
+
+    files_repo = corpus_files_repo()
+    sources_repo = corpus_file_sources_repo()
+    wanted_doc_ids = {str(d) for d in doc_ids} if doc_ids else None
+
+    client, resolved_model = _ensure_batch_client(model, client=batch_client)
+    poll_s = _batch_poll_s()
+    batch_size = _batch_size()
+    retry_transport = _retry_transport_mode()
+    resolved_max_prompt_tokens = max_prompt_tokens if max_prompt_tokens is not None else _max_prompt_tokens()
+    system_prompt_tokens = _approx_tokens(system_prompt)
+
+    # `usage` is the combined running total (what a batch's ingest delta is
+    # computed against, exactly like the sync transport's own `_flush`);
+    # `batch_usage` is the SUBSET attributable to Batches-API calls, kept
+    # apart only so the final report can price it at the batch multiplier
+    # while a sync-transport corrective retry (`retry_transport: sync`)
+    # still prices at the synchronous rate.
+    usage = _empty_usage()
+    batch_usage = _empty_usage()
+    shipped_usage: Dict[str, Any] = {}
+
+    def _usage_delta() -> Dict[str, Any]:
+        return {k: int(v) - int(shipped_usage.get(k, 0)) for k, v in usage.items()}
+
+    def _flush() -> None:
+        try:
+            shipper.flush(usage=_usage_delta(), model=model)
+        except _IngestRefused:
+            # Counted by the shipper already; the shipper's own
+            # `_revert_ledger` has already downgraded the refused batch's
+            # optimistically-"done" entries (TCRD-296 gap #62) — persist
+            # that now, same reasoning as the sync transport's `_flush`
+            # above, so it survives even a pass whose every batch is
+            # refused. A refusal must never abort the whole pass.
+            save_state(connection_id, state)
+        else:
+            shipped_usage.update({k: int(v) for k, v in usage.items()})
+            save_state(connection_id, state)
+
+    def _record_usage(bucket: str, response_usage: Any) -> None:
+        from src.anonymization_ner import _usage_value
+
+        for field in ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"):
+            value = _usage_value(response_usage, field)
+            usage[field] += value
+            if bucket == "batch":
+                batch_usage[field] += value
+        usage["calls"] += 1
+
+    docs_done = 0
+    docs_planned = 0
+
+    def _report_progress(current_path: Optional[str] = None) -> None:
+        if on_progress is None:
+            return
+        try:
+            on_progress({"docs_done": docs_done, "docs_total": docs_planned, "current_path": current_path})
+        except Exception as exc:  # noqa: BLE001 — observability, never load-bearing
+            logger.debug("facts extraction: progress callback failed (%s) — continuing", type(exc).__name__)
+
+    def _accept(
+        work: "_Work",
+        nodes: List[dict],
+        edges: List[dict],
+        dropped: int,
+        retried: bool,
+        repaired: int,
+        parse_errors: int,
+    ) -> None:
+        nonlocal docs_done
+        result = _DocResult(
+            work=work,
+            nodes=nodes,
+            edges=edges,
+            dropped=dropped,
+            retried=retried,
+            repaired=repaired,
+            parse_errors=parse_errors,
+            seconds=0.0,
+        )
+        _fold_accepted_result(
+            report=report, shipper=shipper, docs_state=docs_state, result=result, model=model, fingerprint=fingerprint
+        )
+        batch_attempts.pop(work.file_id, None)
+        report.docs_via_batch += 1
+        docs_done += 1
+        _report_progress(current_path=work.path or work.filename)
+        if shipper.should_flush():
+            _flush()
+
+    def _requeue(file_id: str, *, reason: str, permanent: bool) -> None:
+        nonlocal docs_done
+        _requeue_or_fail(
+            file_id,
+            reason=reason,
+            permanent=permanent,
+            docs_state=docs_state,
+            batch_attempts=batch_attempts,
+            report=report,
+        )
+        docs_done += 1
+        _report_progress()
+
+    def _sync_retry(message: str) -> str:
+        from src.anonymization_ner import _reply_text
+
+        response = client.messages.create(
+            model=resolved_model,
+            max_tokens=max_output_tokens,
+            system=[{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}],
+            messages=[{"role": "user", "content": message}],
+        )
+        _record_usage("sync", getattr(response, "usage", None))
+        return _reply_text(response)
+
+    queue: "deque[str]" = deque()
+    # Documents whose initial-batch gate failed and whose corrective retry
+    # is deferred to a follow-up batch (`retry_transport: batch`) — flushed
+    # into ONE retry-batch submission right after the initial batch that
+    # produced them finishes collecting.
+    pending_retries: List[Tuple["_Work", List[dict], List[dict], List[Tuple[dict, str]], int]] = []
+
+    def _finalize_initial(work: "_Work", reply_text: str) -> None:
+        nodes, edges, parse_errors = parse_streams(reply_text)
+        kwargs = {"chunk_texts": work.chunk_texts, "filename": work.filename, "path": work.path}
+        failures = verbatim_failures([*nodes, *edges], **kwargs)
+        repaired = 0
+        if failures:
+            from src.repositories.facts_pg import CHUNK_JOIN_SEPARATOR
+
+            repaired = repair_verbatim_failures(failures, document_text=CHUNK_JOIN_SEPARATOR.join(work.chunk_texts))
+            if repaired:
+                failures = verbatim_failures([*nodes, *edges], **kwargs)
+        if not failures:
+            _accept(work, nodes, edges, 0, False, repaired, parse_errors)
+            return
+        if retry_mode == "off":
+            # Per-connection / instance policy says no corrective retry at
+            # all (cost-levers lever A): drop the still-failing quotes and
+            # count them now, on either retry transport, exactly as the
+            # sync loop's `extract_one` does under the same setting.
+            final_nodes, final_edges, dropped, retried, parse_errors2 = _finalize_gate(
+                work=work, nodes=nodes, edges=edges, failures=failures, retry_reply=None, parse_errors=parse_errors
+            )
+            _accept(work, final_nodes, final_edges, dropped, retried, repaired, parse_errors2)
+            return
+        if retry_transport == "sync" and not _deadline_expired(deadline):
+            # Bound the retry's failing-quote listing to the SAME token
+            # budget the document text itself was bounded to — see
+            # `_bound_failures_for_retry`'s docstring. `failures` (the FULL
+            # set) still drives `_finalize_gate`'s accounting below, so an
+            # overflow entry is correctly counted dropped, never silently
+            # lost and never double-counted.
+            retry_char_budget = max(
+                0,
+                _token_char_budget(system_prompt_tokens, resolved_max_prompt_tokens, tabular=work.tabular)
+                - len(work.user_message),
+            )
+            bounded_failures, _overflow = _bound_failures_for_retry(failures, char_budget=retry_char_budget)
+            retry_reply = _sync_retry(_retry_message(work.user_message, bounded_failures))
+            final_nodes, final_edges, dropped, retried, parse_errors2 = _finalize_gate(
+                work=work,
+                nodes=nodes,
+                edges=edges,
+                failures=failures,
+                retry_reply=retry_reply,
+                parse_errors=parse_errors,
+            )
+            _accept(work, final_nodes, final_edges, dropped, retried, repaired, parse_errors2)
+            return
+        if retry_transport == "sync":
+            # Deadline already gone — no budget left for another call this
+            # pass; drop and count exactly as an exhausted retry would.
+            final_nodes, final_edges, dropped, retried, parse_errors2 = _finalize_gate(
+                work=work, nodes=nodes, edges=edges, failures=failures, retry_reply=None, parse_errors=parse_errors
+            )
+            _accept(work, final_nodes, final_edges, dropped, retried, repaired, parse_errors2)
+            return
+        # retry_transport == "batch": defer to the follow-up batch this
+        # initial batch's collection submits once every result is seen.
+        kept_nodes, kept_edges = _filter_kept(nodes, edges, failures)
+        pending_retries.append((work, kept_nodes, kept_edges, failures, parse_errors))
+
+    def _finalize_retry(work: "_Work", entry: Dict[str, Any], reply_text: str) -> None:
+        kept_nodes = entry.get("kept_nodes") or []
+        kept_edges = entry.get("kept_edges") or []
+        parse_errors = int(entry.get("parse_errors") or 0)
+        failed_count = int(entry.get("failed_count") or 0)
+        final_nodes, final_edges, dropped, parse_errors2 = _merge_retry_reply(
+            work=work,
+            kept_nodes=kept_nodes,
+            kept_edges=kept_edges,
+            failed_count=failed_count,
+            retry_reply_text=reply_text,
+            parse_errors=parse_errors,
+        )
+        _accept(work, final_nodes, final_edges, dropped, True, 0, parse_errors2)
+
+    def _collect_batch(batch_id: str) -> None:
+        started = time.monotonic()
+        entries = [
+            (fid, e)
+            for fid, e in list(docs_state.items())
+            if isinstance(e, dict) and e.get("batch_id") == batch_id and e.get("status") == "batch-submitted"
+        ]
+        if not entries:
+            return
+        results = _collect_batch_results(client, batch_id)
+        succeeded = requeued = failed = 0
+        for file_id, entry in entries:
+            phase = entry.get("phase", "initial")
+            result = results.get(file_id)
+            if result is None:
+                _requeue(file_id, reason="missing_result", permanent=False)
+                requeued += 1
+                continue
+            result_type = getattr(result, "type", None)
+            if result_type == "succeeded":
+                loaded = _load_work_for_file(
+                    file_id,
+                    files_repo=files_repo,
+                    sources_repo=sources_repo,
+                    max_doc_chars=max_doc_chars,
+                    system_prompt_tokens=system_prompt_tokens,
+                    max_prompt_tokens=resolved_max_prompt_tokens,
+                )
+                if loaded is None:
+                    docs_state.pop(file_id, None)
+                    batch_attempts.pop(file_id, None)
+                    report.facts_failed += 1
+                    logger.warning(
+                        "facts extraction: document %s vanished before its batch result could be collected", file_id
+                    )
+                    continue
+                work, truncated = loaded
+                if truncated:
+                    report.docs_truncated += 1
+                message = getattr(result, "message", None)
+                from src.anonymization_ner import _reply_text
+
+                reply_text = _reply_text(message)
+                _record_usage("batch", getattr(message, "usage", None))
+                if phase == "retry":
+                    _finalize_retry(work, entry, reply_text)
+                else:
+                    _finalize_initial(work, reply_text)
+                succeeded += 1
+            elif result_type == "errored":
+                error = getattr(result, "error", None)
+                error_type = str(getattr(error, "type", "") or "")
+                if error_type.startswith("invalid_request"):
+                    _requeue(
+                        file_id, reason=f"invalid_request: {getattr(error, 'message', error_type)}", permanent=True
+                    )
+                    failed += 1
+                else:
+                    _requeue(file_id, reason=f"errored: {error_type or 'unknown'}", permanent=False)
+                    requeued += 1
+            else:  # "canceled" / "expired" / anything unrecognized
+                _requeue(file_id, reason=str(result_type or "unknown"), permanent=False)
+                requeued += 1
+        elapsed = time.monotonic() - started
+        logger.info(
+            "facts extraction: connection %s — batch %s collected (%d succeeded, %d requeued, %d failed, %.1fs)",
+            connection_id,
+            batch_id,
+            succeeded,
+            requeued,
+            failed,
+            elapsed,
+        )
+
+    def _submit_and_track(works: Sequence["_Work"], messages_by_file: Dict[str, str], *, phase: str) -> str:
+        batch_id = _submit_batch(
+            client,
+            model=resolved_model,
+            system_prompt=system_prompt,
+            works=works,
+            messages_by_file=messages_by_file,
+            max_output_tokens=max_output_tokens,
+        )
+        submitted_at = _now_iso()
+        for w in works:
+            docs_state[w.file_id] = {
+                "status": "batch-submitted",
+                "batch_id": batch_id,
+                "custom_id": w.file_id,
+                "submitted_at": submitted_at,
+                "phase": phase,
+            }
+        save_state(connection_id, state)
+        logger.info(
+            "facts extraction: connection %s — batch %s submitted (%s, %d document(s))",
+            connection_id,
+            batch_id,
+            phase,
+            len(works),
+        )
+        return batch_id
+
+    # -- Phase 0: resume batches a PRIOR pass left in flight ---------------
+    resumed_ids = sorted(
+        {
+            e["batch_id"]
+            for e in docs_state.values()
+            if isinstance(e, dict) and e.get("status") == "batch-submitted" and e.get("batch_id")
+        }
+    )
+    for batch_id in resumed_ids:
+        queue.append(batch_id)
+
+    def _drive_batches() -> None:
+        """Phase 1 (submit fresh batches for whatever :func:`_plan_documents`
+        still finds pending) + Phase 2 (drain the queue — poll, collect,
+        finalize; collecting a batch may enqueue MORE ids, a follow-up
+        retry batch). A single function so a :class:`ProviderLimitHit` from
+        ANY provider call inside either phase (:func:`_submit_and_track`,
+        :func:`_poll_batch_until_ended`, :func:`_collect_batch` via
+        :func:`_collect_batch_results`, or the retry submission's own
+        :func:`_submit_batch`) propagates to ONE `try`/`except` at the call
+        site instead of four separate ones — the caller converts it into a
+        clean ``interrupted_reason: "provider_limit"`` stop rather than a
+        failed job. Whatever is left un-drained (still ``batch-submitted``
+        in state, or an initial batch collected but its follow-up retry
+        never submitted) simply resumes next pass — this transport's own
+        documented resumability, unchanged.
+        """
+        nonlocal docs_planned
+        pending_works = list(
+            _plan_documents(
+                connection=connection,
+                docs_state=docs_state,
+                report=report,
+                files_repo=files_repo,
+                sources_repo=sources_repo,
+                wanted_doc_ids=wanted_doc_ids,
+                model=model,
+                fingerprint=fingerprint,
+                max_doc_chars=max_doc_chars,
+                system_prompt_tokens=system_prompt_tokens,
+                max_prompt_tokens=resolved_max_prompt_tokens,
+            )
+        )
+        docs_planned += len(pending_works)
+        _report_progress()
+        groups = _group_pending_into_batches(
+            pending_works, system_prompt=system_prompt, batch_size=batch_size, max_output_tokens=max_output_tokens
+        )
+        for group in groups:
+            if _deadline_expired(deadline):
+                report.interrupted = True
+                report.interrupted_reason = "timeout"
+                break
+            batch_id = _submit_and_track(group, {w.file_id: w.user_message for w in group}, phase="initial")
+            queue.append(batch_id)
+
+        while queue:
+            batch_id = queue.popleft()
+            stale = [
+                fid
+                for fid, e in list(docs_state.items())
+                if isinstance(e, dict)
+                and e.get("batch_id") == batch_id
+                and e.get("status") == "batch-submitted"
+                and _batch_is_expired_by_age(e.get("submitted_at"))
+            ]
+            if stale:
+                for file_id in stale:
+                    _requeue(file_id, reason="expired (past the 29-day results window)", permanent=False)
+                continue
+            ended = _poll_batch_until_ended(client, batch_id, poll_s=poll_s, deadline=deadline)
+            if ended is None:
+                report.interrupted = True
+                report.interrupted_reason = "timeout"
+                break
+            _collect_batch(batch_id)
+            if pending_retries:
+                if _deadline_expired(deadline):
+                    report.interrupted = True
+                    report.interrupted_reason = "timeout"
+                    # The failures that never got their retry are counted as
+                    # dropped now — their INITIAL reply already shipped what
+                    # passed the gate, and no more budget remains this pass to
+                    # ship a follow-up batch for the rest.
+                    for work, kept_nodes, kept_edges, failures, parse_errors in pending_retries:
+                        _accept(work, kept_nodes, kept_edges, len(failures), False, 0, parse_errors)
+                    pending_retries.clear()
+                    break
+                retry_works = [w for w, *_ in pending_retries]
+                # Bound each retry's failing-quote listing to the SAME token
+                # budget the document text itself was bounded to — see
+                # `_bound_failures_for_retry`'s docstring. `failures` (the FULL
+                # set) is still what `docs_state[...]["failed_count"]` below
+                # records, so `_merge_retry_reply`'s dropped-accounting at
+                # collection time is unaffected by the bound.
+                messages_by_file = {
+                    w.file_id: _retry_message(
+                        w.user_message,
+                        _bound_failures_for_retry(
+                            failures,
+                            char_budget=max(
+                                0,
+                                _token_char_budget(system_prompt_tokens, resolved_max_prompt_tokens, tabular=w.tabular)
+                                - len(w.user_message),
+                            ),
+                        )[0],
+                    )
+                    for w, _, _, failures, _ in pending_retries
+                }
+                retry_batch_id = _submit_batch(
+                    client,
+                    model=resolved_model,
+                    system_prompt=system_prompt,
+                    works=retry_works,
+                    messages_by_file=messages_by_file,
+                    max_output_tokens=max_output_tokens,
+                )
+                submitted_at = _now_iso()
+                for w, kept_nodes, kept_edges, failures, parse_errors in pending_retries:
+                    docs_state[w.file_id] = {
+                        "status": "batch-submitted",
+                        "batch_id": retry_batch_id,
+                        "custom_id": w.file_id,
+                        "submitted_at": submitted_at,
+                        "phase": "retry",
+                        "kept_nodes": kept_nodes,
+                        "kept_edges": kept_edges,
+                        "failed_count": len(failures),
+                        "parse_errors": parse_errors,
+                    }
+                save_state(connection_id, state)
+                docs_planned += len(pending_retries)
+                logger.info(
+                    "facts extraction: connection %s — batch %s submitted (retry, %d document(s))",
+                    connection_id,
+                    retry_batch_id,
+                    len(pending_retries),
+                )
+                pending_retries.clear()
+                queue.append(retry_batch_id)
+
+    try:
+        _drive_batches()
+    except ProviderLimitHit as exc:
+        # A closed-set provider refusal ends the pass CLEANLY, same posture
+        # as the sync transport's own `hard_stop` handling above — never a
+        # failed job. Whatever `_drive_batches` already collected/accepted
+        # before the refusal is kept; the flush below ships it.
+        report.interrupted = True
+        report.interrupted_reason = "provider_limit"
+        record_provider_limit_condition(
+            reason=exc.reason,
+            provider=provider,
+            model=model,
+            region=None,  # the Batches API is Anthropic-only — no Vertex region applies
+            message=str(exc),
+            retry_after_s=exc.retry_after_s,
+        )
+    else:
+        # No provider refusal this pass — the signal the provider is
+        # answering again.
+        clear_provider_limit_conditions(provider)
+
+    _flush()
+    # TCRD-296 C.12 — same single end-of-pass sweep as the sync transport's
+    # own `run_facts_extraction`, now that every batch this pass shipped
+    # flushed with `run_orphan_sweep=False`.
+    _run_end_of_pass_orphan_sweep(report)
+
+    usage["documents"] = report.docs_extracted
+    # Concurrency governs request FAN-OUT, which the batch transport has no
+    # use for (the Batches API itself parallelizes) — left honestly absent
+    # rather than reporting a number that governed nothing.
+    usage["concurrency"] = None
+    usage["concurrency_source"] = "not_applicable"
+    rendered = report.render(
+        model=model,
+        prompt_origin=prompt_origin,
+        ontology=_ontology_report(ontology_models),
+        usage=usage,
+        batch_usage=batch_usage,
+        provider=provider,
+        provider_source=provider_source,
+        transport="batch",
+    )
+    logger.info(
+        "facts extraction (batch transport): connection %s — %d extracted (%d via batch, %d via sync retry), "
+        "%d failed, %d quotes dropped, %d claims written",
+        connection_id,
+        rendered["docs_extracted"],
+        rendered["docs_via_batch"],
+        rendered["docs_via_sync"],
         rendered["facts_failed"],
         rendered["facts_quotes_dropped"],
         rendered["claims_written"],
@@ -1802,12 +5264,21 @@ def maybe_run_after_crawl(
     deadline: Any | None = None,
     on_progress: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> Optional[Dict[str, Any]]:
-    """The crawl's chaining seam — returns ``None`` when this pass is off.
+    """The crawl's chaining seam — returns ``None`` when this pass is off,
+    OR when a facts-extraction pass is already running for this connection.
 
     Two switches, both of which must be on: ``extraction.facts.enabled``
     (the cost gate for this stage) and ``facts.enabled`` (the fact graph
     itself — writing claims into an instance whose ``/api/facts*`` surface
     answers 404 would spend money producing data nobody can read).
+
+    Takes ``connectors.sharepoint.state_store.facts_pass_lock`` for the
+    duration of the pass — the SAME per-connection lock
+    :func:`run_standalone_facts_extraction` takes, so the two can never run
+    over one connection at once. Unlike that function this one is a
+    background continuation of the crawl, not something an operator is
+    waiting on, so a lock already held SKIPS quietly (logged, not raised):
+    the standalone pass already covers this connection's corpus this run.
 
     ``on_progress`` is passed straight through to :func:`run_facts_extraction`
     — see its docstring for the liveness contract.
@@ -1820,13 +5291,28 @@ def maybe_run_after_crawl(
             "skipping the pass rather than writing claims no surface can serve"
         )
         return None
-    return run_facts_extraction(str(connection["id"]), deadline=deadline, on_progress=on_progress)
+    connection_id = str(connection["id"])
+    from connectors.sharepoint.state_store import FactsPassLocked, facts_pass_lock
+
+    try:
+        with facts_pass_lock(connection_id):
+            return run_facts_extraction(connection_id, deadline=deadline, on_progress=on_progress)
+    except FactsPassLocked as exc:
+        logger.info(
+            "facts extraction: connection %s — %s; skipping the crawl's chained facts pass this run "
+            "(a standalone pass already covers this connection's corpus)",
+            connection_id,
+            exc,
+        )
+        return None
+
 
 def run_standalone_facts_extraction(
     connection_id: str,
     *,
     doc_ids: Optional[Sequence[str]] = None,
     timeout_s: Optional[float] = None,
+    partition: Optional[Tuple[int, int]] = None,
 ) -> Dict[str, Any]:
     """Run one fact-extraction pass OUTSIDE a crawl, over whatever this
     connection's collections already hold — the operator's OWN trigger
@@ -1857,13 +5343,24 @@ def run_standalone_facts_extraction(
     enabled()``, :func:`facts_surface_enabled`) — both must be on — but LOUD
     (raises :class:`FactsExtractionDisabled`) rather than returning ``None``:
     this only ever runs because something explicitly asked for it, so a
-    silent no-op would look like a hang, not a refusal.
+    silent no-op would look like a hang, not a refusal. A THIRD gate is the
+    same posture: ``connectors.sharepoint.state_store.facts_pass_lock``
+    raises :class:`~connectors.sharepoint.state_store.FactsPassLocked`
+    (propagated, not caught) when a pass — chained or standalone — is
+    already running for this connection, rather than queuing behind it.
 
     ``deadline`` reuses ``connectors.sharepoint.crawler._Deadline`` — the
     exact type :func:`run_facts_extraction` already accepts from the crawl
     seam (duck-typed on ``.expired()``, see ``_deadline_expired`` above) —
     rather than inventing a second implementation of the same wall-clock
     bound.
+
+    ``partition`` (``(index, count)``, TCRD-296 gap #67) is threaded
+    straight through to :func:`run_facts_extraction` and used to scope the
+    lock (:func:`~connectors.sharepoint.state_store.facts_pass_lock`) to
+    THIS partition alone — ``None`` (the un-partitioned trigger, still the
+    default for a job payload with no ``partition`` key) is byte-identical
+    to today's single whole-connection lock and pass.
     """
     if not facts_extraction_enabled():
         raise FactsExtractionDisabled(
@@ -1877,7 +5374,453 @@ def run_standalone_facts_extraction(
         )
 
     from connectors.sharepoint.crawler import _Deadline
+    from connectors.sharepoint.state_store import facts_pass_lock
 
     resolved_timeout = _standalone_timeout_seconds() if timeout_s is None else timeout_s
     deadline = _Deadline(resolved_timeout)
-    return run_facts_extraction(connection_id, doc_ids=doc_ids, deadline=deadline)
+    with facts_pass_lock(connection_id, partition=partition):
+        return run_facts_extraction(connection_id, doc_ids=doc_ids, deadline=deadline, partition=partition)
+
+
+# --------------------------------------------------------------------------
+# Auto-continuation — a pass that stopped on its own time budget with
+# documents still pending re-enqueues itself (TCRD-296 gap #61)
+# --------------------------------------------------------------------------
+
+#: Per-document ``docs_state`` statuses (besides a fresh, current
+#: ``"done"``) that mean :func:`_plan_documents` has already decided THIS
+#: document cannot currently produce facts, and would only re-derive the
+#: same verdict on a future pass unless the file's own content changes —
+#: a fresh ``sha256`` this state does not retain (see
+#: :func:`count_pending_documents`'s docstring for the resulting, narrow,
+#: pre-existing approximation this set accepts).
+_TERMINAL_SKIP_STATUSES = frozenset({"skipped-no-text", "skipped-garbled-text", "skipped-too-large-tabular", "failed"})
+
+#: Consecutive auto-continuations one connection's ``sharepoint-facts-
+#: extraction`` chain may run before :func:`maybe_continue_pass` stops
+#: regardless of remaining pending documents — a circuit breaker against a
+#: pathological loop (a worker that always claims and immediately times
+#: out at ~0s of budget, or a config bug that never lets a pass finish
+#: "done"), not a throughput knob. Not configurable, deliberately: an
+#: instance that needs more than this many back-to-back timeout
+#: continuations for ONE connection has an underlying throughput problem
+#: this cap is meant to surface, not paper over.
+MAX_CONSECUTIVE_FACTS_CONTINUATIONS = 48
+
+#: Delay before a chained continuation's ``run_after``, seconds — long
+#: enough that a crash-looping worker (claim, fail fast, get re-enqueued,
+#: repeat) cannot spin the queue; short enough that an operator watching
+#: the fleet view reads a healthy chain as "continuing", not "stalled".
+FACTS_CONTINUATION_DELAY_S = 30
+
+
+def facts_extraction_idempotency_key(
+    connection_id: str, *, index: Optional[int] = None, count: Optional[int] = None
+) -> str:
+    """The STABLE per-connection (or per-partition) idempotency key for the
+    ``sharepoint-facts-extraction`` job — the single source of truth
+    shared by the manual trigger (``app/api/admin_sharepoint.py::
+    _facts_extraction_idempotency_key``, which delegates here), the
+    fleet/status readers that look a job up by it
+    (``app/api/admin_extraction.py::_facts_job_in_flight``/
+    ``_facts_jobs_in_flight``), and this module's own auto-continuation
+    (:func:`maybe_continue_pass`) — so a manual "run now", an
+    auto-continuation of a timed-out pass, and any other trigger for the
+    SAME connection (or the SAME partition of it) can never both be
+    queued at once, regardless of which of them minted the job.
+
+    ``index``/``count`` (TCRD-296 gap #67) are BOTH optional and default
+    to ``None`` — omitted, or ``count <= 1``, returns exactly today's
+    legacy key (``sharepoint-facts-extraction:{connection_id}``), so every
+    existing caller (none of which pass these) and every legacy job
+    payload from before this feature keep working unchanged. Only
+    ``count > 1`` mints the partitioned form
+    (``sharepoint-facts-extraction:{connection_id}:{index}/{count}``) —
+    the presence of a ``:{index}/{count}`` suffix IS the signal "this is a
+    fanned-out pass", so a fan-out that resolves to a single partition
+    (a small backlog) never even looks partitioned.
+    """
+    if count is None or count <= 1:
+        return f"sharepoint-facts-extraction:{connection_id}"
+    return f"sharepoint-facts-extraction:{connection_id}:{index or 0}/{count}"
+
+
+#: ``extraction.facts.concurrency_passes`` — the ceiling on how many
+#: ``sharepoint-facts-extraction`` PARTITIONS a fan-out
+#: (:func:`enqueue_facts_extraction_passes`) ever enqueues for one
+#: connection at once (TCRD-296 gap #67). Default 4: the live finding this
+#: closes measured seven connections in parallel giving ~11,800
+#: documents/hour against the SAME provider account that one merged
+#: connection (one lock, one job) gave only ~1,400 documents/hour —
+#: throughput scales with concurrent PASSES, not with corpus size, because
+#: the bottleneck is per-document ingest latency under load, not the model
+#: call itself (mostly cache hits). 4 is deliberately below that 7-wide
+#: figure: each partition is its own ``sharepoint-facts-extraction`` job
+#: competing for the SAME ``extraction.concurrency`` lane budget every
+#: other extraction job kind shares (`app/worker/runtime.py`), so a
+#: connection's own fan-out must leave lane headroom for its OWN crawl and
+#: for every other connection's jobs — 4 is safe against the lane budget's
+#: own default sizing without an operator having to tune it for the
+#: common case; a fleet with more lane headroom can raise it.
+DEFAULT_FACTS_CONCURRENCY_PASSES = 4
+
+#: How many pending documents justify ONE partition — a fan-out never
+#: creates more partitions than ``ceil(pending / this)`` even when
+#: ``concurrency_passes`` allows more, so a small backlog (a handful of
+#: documents left over after a normal pass) never gets split into passes
+#: that would spend more on job/lock overhead than the work itself.
+_FACTS_PARTITION_TARGET_DOCS = 2000
+
+
+def _facts_concurrency_passes() -> int:
+    """``extraction.facts.concurrency_passes``, clamped to ``[1, 64]`` —
+    the same ceiling :data:`MAX_CONCURRENCY` already uses for the
+    per-document worker pool, reused here since both bound "how many
+    things run against the same provider account at once"."""
+    from app.instance_config import get_value
+
+    raw = get_value("extraction", "facts", "concurrency_passes", default=DEFAULT_FACTS_CONCURRENCY_PASSES)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = DEFAULT_FACTS_CONCURRENCY_PASSES
+    return max(1, min(value, MAX_CONCURRENCY))
+
+
+def plan_facts_partition_count(pending: int) -> int:
+    """How many partitions a fan-out should enqueue for a backlog of
+    ``pending`` documents: ``min(concurrency_passes, ceil(pending /
+    _FACTS_PARTITION_TARGET_DOCS))``, never less than 1. A non-positive
+    ``pending`` (nothing to do, or an unknown/misconfigured connection)
+    always resolves to 1 — the legacy, un-partitioned shape — rather than
+    fanning out zero real work into several no-op jobs."""
+    if pending <= 0:
+        return 1
+    configured = _facts_concurrency_passes()
+    return max(1, min(configured, math.ceil(pending / _FACTS_PARTITION_TARGET_DOCS)))
+
+
+def enqueue_facts_extraction_passes(
+    connection_id: str,
+    *,
+    extra_payload: Optional[Dict[str, Any]] = None,
+    pending: Optional[int] = None,
+    run_after: Optional[datetime] = None,
+) -> List[Dict[str, Any]]:
+    """Enqueue this connection's ``sharepoint-facts-extraction`` pass,
+    fanned out into however many partitions the current backlog and
+    ``extraction.facts.concurrency_passes`` justify
+    (:func:`plan_facts_partition_count`) — the SHARED fan-out every trigger
+    surface for this job kind goes through: the manual operator trigger
+    (``POST …/facts-extract``), the crawl's own streamed enqueue
+    (``connectors.sharepoint.crawler._enqueue_streamed_facts_pass``), and
+    the self-continuation of a timed-out generation
+    (:func:`maybe_continue_pass`).
+
+    ``pending`` lets a caller that already computed
+    :func:`count_pending_documents` (``maybe_continue_pass`` does) avoid
+    paying for that scan twice; omitted, it is computed here.
+
+    A resolved ``count`` of 1 (no real backlog, or the knob/backlog says a
+    single pass is enough) enqueues EXACTLY today's single, un-partitioned
+    job — same idempotency key, same payload shape (no ``partition`` key
+    at all) — so every existing caller and test of the singular trigger is
+    unaffected. Only ``count > 1`` adds ``payload["partition"] =
+    {"index", "count"}`` and mints the partitioned idempotency key
+    (:func:`facts_extraction_idempotency_key`).
+
+    Returns every enqueued (or deduped-onto-existing) job dict, in
+    partition-index order — ``len(result) == count``. A caller that only
+    cares about "did this actually start something new" checks whether
+    EVERY entry is ``deduped`` (a second, identical trigger — see
+    ``app/api/admin_sharepoint.py::trigger_facts_extraction``).
+    """
+    from src.repositories import jobs_repo
+
+    resolved_pending = count_pending_documents(connection_id) if pending is None else pending
+    count = plan_facts_partition_count(resolved_pending)
+
+    from app.worker.registry import job_max_attempts
+
+    max_attempts = job_max_attempts("sharepoint-facts-extraction")
+    repo = jobs_repo()
+    jobs: List[Dict[str, Any]] = []
+    for index in range(count):
+        payload: Dict[str, Any] = {"connection_id": connection_id}
+        if extra_payload:
+            payload.update(extra_payload)
+        if count > 1:
+            payload["partition"] = {"index": index, "count": count}
+        job = repo.enqueue(
+            "sharepoint-facts-extraction",
+            payload,
+            run_after=run_after,
+            idempotency_key=facts_extraction_idempotency_key(connection_id, index=index, count=count),
+            max_attempts=max_attempts,
+        )
+        jobs.append(job)
+    return jobs
+
+
+def count_pending_documents(connection_id: str) -> int:
+    """How many of ``connection_id``'s indexed, source-anchored documents
+    still need a facts-extraction attempt — cheap enough for a status page
+    to call on every poll: unlike :func:`run_facts_extraction` /
+    :func:`_plan_documents`, this never reads a document's BODY text (no
+    garbled/tabular classification, no truncation), only ``corpus_files``'
+    own columns and the facts state, so it is safe to call for a
+    connection with tens of thousands of documents without materializing
+    any of their content.
+
+    A document counts as pending when it is indexed, source-anchored, and
+    its ``docs_state`` entry is EITHER missing, ``"batch-submitted"`` (a
+    prior batch pass never finished collecting it), OR ``"done"`` under a
+    stale ``sha256``/model/prompt fingerprint (needs re-extraction). A
+    document already ``"done"`` at its CURRENT content/model/prompt, or
+    permanently skipped/failed (:data:`_TERMINAL_SKIP_STATUSES`), does not
+    count — :func:`_plan_documents` would only re-derive the identical
+    verdict on the next pass.
+
+    Known gap: a skip/failure recorded before the file's content last
+    changed is UNDER-counted here — that state keeps no ``sha256`` at
+    skip time to detect the drift. This is not a new gap: a future pass's
+    OWN planner has no cheaper way to close it either — it always
+    re-reads the text and re-derives the verdict, correcting the state
+    once it does; this function just never pays that read to find out.
+
+    Returns 0 for an unknown/non-sharepoint connection or an instance
+    with no ontology — the same "nothing to extract" verdict
+    :func:`run_facts_extraction` would reach, without raising: this is a
+    read-only status helper, never a trigger path.
+
+    Bounded cost (TCRD-296 gap #72): the candidate set (indexed,
+    source-anchored files across this connection's collections) is fetched
+    in ONE query (:meth:`~src.repositories.corpus_file_sources_pg
+    .CorpusFileSourcesPgRepository.pending_extraction_candidates`) — this
+    used to be a ``list_for_corpus`` call per collection plus a per-file
+    ``get()`` lookup, O(N) round trips against a connection's whole corpus
+    (282k on the connection that surfaced the regression). Only the final
+    ``docs_state``-vs-candidate decision (no joinable table backs the
+    ledger, which is a JSON blob) still runs in Python, over that single
+    already-narrow result set.
+    """
+    from src.repositories import corpus_file_sources_repo, source_connections_repo
+
+    connection = source_connections_repo().get(connection_id)
+    if connection is None or connection.get("source_type") != "sharepoint":
+        return 0
+
+    ontology_models = _ontology_models()
+    if not ontology_models:
+        return 0
+
+    from connectors.sharepoint.facts_prompt import prompt_fingerprint, resolve_extraction_prompt
+
+    prompt_text, _prompt_origin = resolve_extraction_prompt()
+    system_prompt = build_system_prompt(prompt_text, render_ontology(ontology_models))
+    fingerprint = prompt_fingerprint(system_prompt)
+    model = _model()
+
+    state = load_state(connection_id)
+    docs_state: Dict[str, Any] = state["docs"]
+    sources_repo = corpus_file_sources_repo()
+
+    pending = 0
+    for row in sources_repo.pending_extraction_candidates(collection_ids_for(connection)):
+        file_id = str(row["file_id"])
+        entry = docs_state.get(file_id)
+        if isinstance(entry, dict) and entry.get("status") in _TERMINAL_SKIP_STATUSES:
+            continue
+        sha256 = str(row.get("sha256") or "")
+        if is_up_to_date(entry, sha256=sha256, model=model, fingerprint=fingerprint):
+            continue
+        pending += 1
+    return pending
+
+
+def _reset_facts_continuation_chain(connection_id: str) -> None:
+    """Zero the connection's consecutive-continuation counter — a pass
+    that finished with nothing pending, or one that never auto-continues
+    in the first place, closes out any chain in progress."""
+    state = load_state(connection_id)
+    if state.get("facts_continuation_chain"):
+        state["facts_continuation_chain"] = 0
+        save_state(connection_id, state)
+
+
+def _bump_facts_continuation_chain(connection_id: str) -> int:
+    """Increment and persist the connection's consecutive-continuation
+    counter, returning the new value."""
+    state = load_state(connection_id)
+    chain = int(state.get("facts_continuation_chain") or 0) + 1
+    state["facts_continuation_chain"] = chain
+    save_state(connection_id, state)
+    return chain
+
+
+def maybe_continue_pass(
+    connection_id: str,
+    *,
+    payload: Dict[str, Any],
+    report: Dict[str, Any],
+    original_job_id: Optional[str],
+) -> Optional[str]:
+    """Auto-re-enqueue the next ``sharepoint-facts-extraction`` pass for
+    ``connection_id`` when THIS pass stopped ONLY because it ran out of
+    its own time budget — so a crawl's backlog drains on its own instead
+    of needing an operator to re-POST ``…/facts-extract`` by hand every
+    ``extraction.facts.run_timeout_s`` (TCRD-296 gap #61: three
+    connections observed sitting for hours with thousands of documents
+    pending and no pass running).
+
+    Called ONLY from ``app/worker/runtime.py``'s post-``complete()`` hook
+    — NEVER from inside the pass itself
+    (:func:`run_facts_extraction`/:func:`run_standalone_facts_extraction`):
+    the continuation reuses THIS pass's own idempotency key
+    (:func:`facts_extraction_idempotency_key`), and Postgres enforces that
+    key's uniqueness across every ``'queued'``/``'running'`` row with a
+    partial unique index — enqueuing a same-key continuation while the
+    pass whose tail it continues is STILL ``'running'`` would either
+    collide with that index (Postgres) or dedupe onto the still-running
+    row (this backend's own ``enqueue()`` check), in both cases returning
+    the CURRENT job unchanged instead of creating a genuinely new one. By
+    the time this runs, ``complete()`` has already flipped the row to
+    ``'done'``, so the key is free again.
+
+    Continues when ALL of:
+
+    - **The generation is over.** ``payload["partition"]`` (TCRD-296 gap
+      #67 — absent/``count <= 1`` for the un-partitioned case) names which
+      partition THIS job was; when ``count > 1`` this function does
+      NOTHING (no chain touch, no continuation) unless
+      :func:`_is_last_facts_partition` says every sibling partition of the
+      SAME generation has already terminated — mirrors the crawl shard
+      design's "the last child finalizes the parent". Only the last
+      completer decides whether to plan the NEXT generation, and it does
+      so once, for the WHOLE connection, never once per partition.
+    - **The stop reason allows it.** For an un-partitioned run
+      (``count <= 1``): ``report["interrupted"]`` is true and
+      ``report["interrupted_reason"] == "timeout"`` — the ONLY reason this
+      module auto-continues on (see :meth:`_Report.render`). For a
+      partitioned run's last-completer evaluation: no active
+      ``provider_limit`` condition (:func:`streamed_pass_suppressed_by_
+      provider_limit`) — the per-partition ``report`` this hook receives
+      is only ONE partition's own outcome, but the aggregate "should the
+      next generation run" decision only needs to know whether ANY
+      partition this generation hit a provider refusal (that condition is
+      GLOBAL, set by whichever partition hit it) and whether work remains
+      (the pending count below, which reflects the WHOLE connection
+      regardless of which partition left it). A stop/cancel or a
+      genuinely unrecoverable failure (credentials, permissions...) still
+      raises :class:`FactsExtractionUnavailable`, which fails the job
+      rather than completing it, so this function is simply never called
+      for that case.
+    - :func:`count_pending_documents` reports more than 0 remaining — a
+      pass (or generation) that ended exactly as the corpus was exhausted
+      has no more work, and chaining onto it would only spend a worker
+      slot confirming that.
+    - the connection's consecutive-continuation counter, persisted
+      alongside the facts state (reset to 0 the moment a pass finishes
+      with nothing pending), is under
+      :data:`MAX_CONSECUTIVE_FACTS_CONTINUATIONS`.
+
+    On success, the next generation is enqueued through
+    :func:`enqueue_facts_extraction_passes` (fresh partition count, since
+    the backlog may have shrunk or grown since the last plan) with
+    ``run_after`` set :data:`FACTS_CONTINUATION_DELAY_S` seconds out; the
+    new payload carries the SAME ``doc_ids``/``timeout_s`` this generation
+    ran with plus ``continued_from`` (this job's own id). Once the new
+    job(s) exist, ``original_job_id``'s own stored report gains
+    ``continued_by_job_id`` (:meth:`JobsRepository.record_continuation`)
+    pointing at the FIRST (index 0) of them — the representative link; the
+    log line below names every id in the new generation.
+
+    Returns the first new job's id, or ``None`` when no continuation was
+    enqueued (any of the above, a sibling partition still in flight, or
+    the dedup path unexpectedly winning — see the docstring's opening
+    paragraph for why that should not normally happen). Best-effort: any
+    exception here is caught and logged, never re-raised — a bug in the
+    re-enqueue path must never turn an already-successful pass into a
+    failed job.
+    """
+    try:
+        partition_field = payload.get("partition") or {}
+        count = max(1, int(partition_field.get("count") or 1))
+        index = int(partition_field.get("index") or 0)
+
+        if count > 1:
+            if not _is_last_facts_partition(connection_id, (index, count)):
+                return None  # a sibling of this generation is still in flight
+            if streamed_pass_suppressed_by_provider_limit() is not None:
+                _reset_facts_continuation_chain(connection_id)
+                return None
+        elif not report.get("interrupted") or report.get("interrupted_reason") != "timeout":
+            _reset_facts_continuation_chain(connection_id)
+            return None
+
+        pending = count_pending_documents(connection_id)
+        if pending <= 0:
+            _reset_facts_continuation_chain(connection_id)
+            return None
+
+        chain = _bump_facts_continuation_chain(connection_id)
+        if chain > MAX_CONSECUTIVE_FACTS_CONTINUATIONS:
+            logger.warning(
+                "facts extraction: connection %s — %d documents still pending but the auto-continuation "
+                "chain hit its cap (%d); an operator needs to re-trigger the pass by hand",
+                connection_id,
+                pending,
+                MAX_CONSECUTIVE_FACTS_CONTINUATIONS,
+            )
+            return None
+
+        next_payload: Dict[str, Any] = {}
+        if payload.get("doc_ids"):
+            next_payload["doc_ids"] = payload["doc_ids"]
+        if payload.get("timeout_s") is not None:
+            next_payload["timeout_s"] = payload["timeout_s"]
+        if original_job_id:
+            next_payload["continued_from"] = original_job_id
+
+        jobs = enqueue_facts_extraction_passes(
+            connection_id,
+            extra_payload=next_payload,
+            pending=pending,
+            run_after=datetime.now(timezone.utc) + timedelta(seconds=FACTS_CONTINUATION_DELAY_S),
+        )
+        if all(job.get("deduped") for job in jobs):
+            # Another trigger (a race, or an operator's manual click) beat
+            # this one to every key — the pending backlog is already
+            # covered by whatever job(s) hold them now; nothing more for
+            # THIS pass to do. Not expected in the ordinary chain (see
+            # docstring).
+            logger.info(
+                "facts extraction: connection %s — %d documents still pending, but another pass (job(s) %s) "
+                "already holds the key; not chaining a duplicate",
+                connection_id,
+                pending,
+                ", ".join(job["id"] for job in jobs),
+            )
+            return None
+
+        if original_job_id:
+            from src.repositories import jobs_repo
+
+            jobs_repo().record_continuation(original_job_id, jobs[0]["id"])
+
+        logger.info(
+            "facts extraction: connection %s — %d documents pending, continuing (job(s) %s, chain %d/%d)",
+            connection_id,
+            pending,
+            ", ".join(job["id"] for job in jobs),
+            chain,
+            MAX_CONSECUTIVE_FACTS_CONTINUATIONS,
+        )
+        return jobs[0]["id"]
+    except Exception:
+        logger.exception(
+            "facts extraction: connection %s — auto-continuation failed (non-fatal; an operator can "
+            "re-trigger the pass by hand)",
+            connection_id,
+        )
+        return None

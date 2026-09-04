@@ -20,15 +20,15 @@ physical-source-catalog reference, a distributable registry twin, clearing
 
 Group names double as the ``cost_center`` values the policy compares
 against (``list_contains($user_groups, cost_center)`` requires the two
-namespaces to coincide) — they are spelled WITHOUT ``_``/``%`` on purpose:
-``$user_groups`` binds the caller's ENTIRE live group list (not merely the
-group relevant to this table), and ``policied_relation`` (§6.3) raises
-``PolicyError`` for the whole request the moment ANY of those group names
-contains a LIKE/SIMILAR-TO metacharacter — so ``CC_A``/``CC_B`` (the
-design doc's own example values, which contain ``_``) would 500 every
-request from a member of them. That guard is real, working, security
-behaviour; using group names that trip it here would break the fixture,
-not exercise the feature.
+namespaces to coincide). They are spelled without ``_``/``%`` for purely
+historical reasons: ``policied_relation`` used to raise ``PolicyError``
+for the whole request the moment ANY live group name of the caller
+contained a LIKE/SIMILAR-TO metacharacter, so ``CC_A``/``CC_B`` (the
+design doc's own example values) 500-ed every read by a member of them.
+That refusal is now scoped to a policy body that actually MATCHES an
+identity variable as a pattern (#1979) — this policy compares it as a
+value, so the underscore-spelled names would work here too; they are left
+as-is only to keep the diff off an unrelated fixture.
 
 Two things this file deliberately does NOT try to be:
 

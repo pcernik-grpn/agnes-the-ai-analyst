@@ -232,6 +232,30 @@ class JobsRepository:
         rows = self.conn.execute(sql, params).fetchall()
         return self._rows_to_dicts(rows)
 
+    def counts_by_kind(self, kinds: List[str]) -> Dict[str, Dict[str, int]]:
+        """``{kind: {"queued": n, "running": n}}`` for each of ``kinds``, in
+        ONE grouped query — the extraction fleet header's lane-starvation
+        strip (``GET /api/admin/sharepoint/extraction/runs``'s ``jobs``
+        block), so an operator can see a queued backlog without SQL. Every
+        requested kind is present with ``0``s rather than omitted when it
+        has no queued/running rows — an absent kind and a caught-up kind
+        must read differently to a caller that only checked ``in``.
+        """
+        out: Dict[str, Dict[str, int]] = {kind: {"queued": 0, "running": 0} for kind in kinds}
+        if not kinds:
+            return out
+        placeholders = ",".join(["?"] * len(kinds))
+        rows = self.conn.execute(
+            f"SELECT kind, status, COUNT(*) FROM jobs "
+            f"WHERE kind IN ({placeholders}) AND status IN ('queued', 'running') "
+            f"GROUP BY kind, status",
+            list(kinds),
+        ).fetchall()
+        for kind, status, n in rows:
+            if kind in out and status in out[kind]:
+                out[kind][status] = int(n)
+        return out
+
     def claim_next(
         self,
         *,
@@ -367,6 +391,45 @@ class JobsRepository:
                 ).fetchall()
             return bool(mutated)
 
+    def record_continuation(self, job_id: str, continued_by_job_id: str) -> bool:
+        """Stamp ``continued_by_job_id`` onto an ALREADY-terminal job's
+        stored ``payload_json["result"]`` — bookkeeping for the
+        ``sharepoint-facts-extraction`` auto-continuation
+        (``app/worker/runtime.py::_maybe_continue_facts_extraction``,
+        ``connectors.sharepoint.facts_extraction.maybe_continue_pass``).
+
+        The continuation job can only be ENQUEUED once this job leaves
+        ``'running'`` — it reuses the SAME idempotency key, and a
+        still-``'running'`` row for that key would either collide with
+        it (Postgres's partial unique index) or dedupe onto it (this
+        backend's own ``enqueue()`` check) instead of creating a genuinely
+        new job. So the continuation's own id is only known AFTER
+        ``complete()`` has already persisted this job's report without
+        it — this method is the follow-up patch that adds it in.
+
+        No status/lease guard, unlike ``complete()``/``fail()``: this
+        never competes with a claim, and runs at most once, well after
+        the job is terminal. Returns ``False`` (no-op) for an unknown job
+        id or one whose stored payload carries no ``"result"`` dict to
+        annotate — never raises.
+        """
+        with _JOBS_LOCK:
+            row = self.conn.execute("SELECT payload_json FROM jobs WHERE id = ?", [job_id]).fetchone()
+            if not row or not row[0]:
+                return False
+            try:
+                payload = json.loads(row[0])
+            except (TypeError, ValueError):
+                return False
+            if not isinstance(payload, dict) or not isinstance(payload.get("result"), dict):
+                return False
+            payload["result"]["continued_by_job_id"] = continued_by_job_id
+            self.conn.execute(
+                "UPDATE jobs SET payload_json = ? WHERE id = ?",
+                [json.dumps(payload), job_id],
+            )
+            return True
+
     def fail(
         self,
         job_id: str,
@@ -422,6 +485,50 @@ class JobsRepository:
                    WHERE id = ? AND lease_token = ? AND status = 'running'
                    RETURNING id""",
                 [now, error, job_id, lease_token],
+            ).fetchall()
+            return bool(mutated)
+
+    def cancel(self, job_id: str, *, error: str = "cancelled_by_admin") -> bool:
+        """Force-finalize a ``queued``/``running`` job to ``'failed'`` —
+        an ADMIN-initiated override, unlike :meth:`fail`, which requires the
+        exact ``lease_token`` of the worker holding the job. An admin
+        cancelling a run has no lease token (they never claimed the job),
+        so the guard here is the same lease-agnostic shape
+        :meth:`reap_exhausted` already uses (``WHERE status IN ('queued',
+        'running')``, no ``lease_token``/``worker_id`` check) rather than
+        the claim/heartbeat/complete/fail lifecycle's own atomicity guard.
+
+        Clearing ``lease_expires_at``/``leased_by``/``lease_token`` is what
+        makes this effective even against a handler thread that never
+        notices: the NEXT ``heartbeat()`` call for this job's (now stale)
+        lease token re-checks ``status = 'running'`` and finds it no
+        longer true, returns ``False``, and the worker's heartbeat loop
+        stops extending the lease on its own (see ``app/worker/runtime.py
+        ._heartbeat_loop``) — no new stop mechanism needed on that side.
+        A zombie handler thread may keep running past this call (Python
+        cannot force-kill a thread), but its eventual ``complete()``/
+        ``fail()`` call is guarded by the SAME stale-lease no-op every
+        reclaim race already relies on, so it can never clobber the
+        cancelled state recorded here.
+
+        Returns ``True`` if a row was actually mutated (the job existed
+        and was ``queued`` or ``running``), ``False`` for an unknown job id
+        or one already in a terminal state (``done``/``failed``) — a
+        cancel of an already-finished job is a no-op, not an error.
+        """
+        with _JOBS_LOCK:
+            now = datetime.now(timezone.utc)
+            mutated = self.conn.execute(
+                """UPDATE jobs
+                   SET status = 'failed',
+                       finished_at = ?,
+                       lease_expires_at = NULL,
+                       leased_by = NULL,
+                       lease_token = NULL,
+                       error = ?
+                   WHERE id = ? AND status IN ('queued', 'running')
+                   RETURNING id""",
+                [now, error, job_id],
             ).fetchall()
             return bool(mutated)
 

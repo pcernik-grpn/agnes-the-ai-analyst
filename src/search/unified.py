@@ -243,6 +243,16 @@ def unified_search(
     keep working. Glossary is fetched inside via ``_glossary_search`` — it has
     no RBAC (public to any authenticated user), so there is nothing to pre-filter.
 
+    The returned list carries a ``.capped`` attribute (P0 OOM fix, 2026-09):
+    ``True`` when the chunk leg's bounded candidate scan
+    (``src.ingest.retrieval.search``) hit its configured limit, meaning some
+    matching chunks may have been left out. Additive — every existing caller
+    that only iterates/indexes/compares the return value is unaffected; see
+    ``src.ingest.retrieval.SearchResults``, which this reuses. When the
+    caller supplies ``chunk_hits`` (below), the flag is read off THAT list
+    instead — pass a ``SearchResults`` to propagate it, a plain list reads
+    as not capped.
+
     ``chunk_hits`` (#2151) lets a caller pre-resolve the Collections leg
     itself instead of this function calling ``src.ingest.retrieval.search``
     (via ``_chunk_search``) internally — ``app.api.knowledge_search`` does,
@@ -273,11 +283,11 @@ def unified_search(
     # below and `_minmax` both reason about "how many slots this bucket takes",
     # and six passages of one file are one document's worth of answer, not six.
     if chunk_hits is not None:
-        resolved_chunk_hits = [dict(h, type="chunk") for h in chunk_hits]
+        _raw_chunk_hits: List[Dict[str, Any]] = chunk_hits
     else:
-        resolved_chunk_hits = (
-            [dict(h, type="chunk") for h in _chunk_search(corpus_ids, query, k=k)] if corpus_ids else []
-        )
+        _raw_chunk_hits = _chunk_search(corpus_ids, query, k=k) if corpus_ids else []
+    candidates_capped = bool(getattr(_raw_chunk_hits, "capped", False))
+    resolved_chunk_hits = [dict(h, type="chunk") for h in _raw_chunk_hits]
     # Cap the NAME-matched hits inside the bucket, rather than only capping a
     # bucket that is entirely name hits: since the fallback keeps body hits
     # and merely rescales them, an all-filename bucket is now rare and an
@@ -406,4 +416,6 @@ def unified_search(
             str(h.get("chunk_id") or h.get("id") or h.get("table_id") or ""),
         )
     )
-    return merged[:k]
+    from src.ingest.retrieval import SearchResults
+
+    return SearchResults(merged[:k], capped=candidates_capped)

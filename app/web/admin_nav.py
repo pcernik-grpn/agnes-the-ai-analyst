@@ -187,7 +187,11 @@ ADMIN_NAV_SECTIONS: list[dict] = [
         # for the same reason now that it has no tab of its own (see the
         # "Semantic layer health" comment below) — it's still reachable from a
         # source card's pipeline cell, just not part of the strip.
-        "match": ["/admin/sync", "/admin/semantic-layer"],
+        # `/admin/extraction` (2026-09-02) is the same pattern once more: the
+        # SharePoint extraction FLEET dashboard, reached from a source card's
+        # extraction status, not a lens an admin picks among Sources/Tables/
+        # Packages — see ADMIN_NAV_OFFNAV below for the full reasoning.
+        "match": ["/admin/sync", "/admin/semantic-layer", "/admin/extraction"],
         # ── The one strip that is a PIPELINE, not a set of categories ──────
         # Sources, Tables and Packages are not three kinds of thing you choose
         # between; they are one flow seen from three places — where data comes
@@ -560,6 +564,25 @@ ADMIN_NAV_OFFNAV: list[dict] = [
         # you MANAGE, and this is a log you CHECK — and the cross-source version
         # of that question ("what failed today") is what /admin/activity is.
         "reached_from": "the SYNC cell on each source card (/admin/data-sources)",
+    },
+    {
+        "href": "/admin/extraction",
+        # The SharePoint extraction FLEET dashboard (2026-09-02): one row per
+        # connection for an operator running several crawl + facts passes at
+        # once. Same off-nav shape as /admin/sync — a status view an operator
+        # is SENT to, not a lens they pick among Sources/Tables/Packages.
+        # The door is the "All connections" button in every SharePoint
+        # source card's Run row on /admin/data-sources — next to "Run
+        # history", because "how is THIS one doing" and "how are ALL of them
+        # doing" are the same question asked at two widths.
+        #
+        # This entry first shipped with a "pending" door and no link
+        # anywhere, which left the page reachable only by typed URL —
+        # exactly what this inventory exists to prevent. `tests/
+        # test_web_admin_nav.py` now requires every off-nav href to be a
+        # literal `href` in some template, so a promise no longer passes
+        # as a door.
+        "reached_from": 'the "All connections" button in each source card\'s Run row (/admin/data-sources)',
     },
     {
         "href": "/admin/semantic-layer",

@@ -356,15 +356,35 @@ strips it and shows a broken image; a terminal has no image renderer at all.
 {% if is_sandbox %}
 For *structure* rather than *quantity* — a pipeline, a table relationship, a
 sequence of steps, a dependency — write a ` ```mermaid ` fenced block instead.
-The chat renders it as a diagram.
+The chat renders it as a diagram, and the reader can expand it full-screen.
+
+**Draw one whenever the answer is about how things connect.** A pipeline, a
+lineage, table relationships, a job or dependency order, the flow of a
+process, the states something moves through — these are answers a reader
+takes in far faster as a picture than as a paragraph, and prose describing a
+five-node flow is strictly harder to follow than the flow. Don't ask
+permission and don't offer to draw one instead of drawing it. Keep it simple
+and focused: the diagram carries the shape, the text carries the detail.
 
     ```mermaid
     flowchart LR
       raw[raw_orders] --> t[daily_revenue] --> r[Report]
     ```
 
-Keep to the well-supported types: `flowchart`, `sequenceDiagram`, `erDiagram`,
-`classDiagram`, `stateDiagram-v2`, `gantt`.
+Keep to the well-supported types: `flowchart` (`graph TD` / `graph LR`),
+`sequenceDiagram`, `erDiagram`, `classDiagram`, `stateDiagram-v2`, `gantt`.
+Do NOT use `C4Context`, `pie`, `mindmap`, `gitGraph`, `architecture-beta` or
+the other advanced types — they may fail to render, and a fence that fails is
+shown to the reader as an error over its own source.
+
+Two syntax rules that fail silently if you get them wrong:
+
+- `gantt` needs full dates — `dateFormat YYYY-MM-DD`, never a time-only
+  format like `HH:mm`. Use `dateFormat YYYY-MM-DD HH:mm` with
+  `axisFormat %H:%M` when you genuinely need times.
+- No icons in nodes. Neither the `@{ icon: "lucide:name" }` shape nor the
+  older `fa:fa-*` syntax renders here — no icon pack is registered, so both
+  leave a blank placeholder. Label nodes with words.
 
 The split is worth getting right: mermaid draws relationships and cannot plot
 values, matplotlib plots values and should not be used to draw a box diagram.

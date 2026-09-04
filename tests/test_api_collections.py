@@ -898,6 +898,41 @@ class TestSearch:
         assert resp.status_code == 200, resp.text
         assert resp.json()["retrieval"] == "hybrid"
 
+    def test_search_response_carries_candidates_capped_when_the_bound_is_hit(self, seeded_app, monkeypatch):
+        """P0 OOM fix, 2026-09: an additive `candidates_capped: true` on the
+        response when the bounded candidate scan hit its configured limit —
+        never present (and never `false`) when it did not."""
+        import src.ingest.retrieval as retrieval
+
+        c = seeded_app["client"]
+        cid = self._seed_corpus_with_chunk(seeded_app, "CapOne", "widget revenue widget revenue", grant=True)
+        from src.repositories import corpus_chunks_repo, corpus_files_repo
+
+        fid2 = corpus_files_repo().add(
+            corpus_id=cid, filename="d2.txt", sha256="s2", file_type="txt", size_bytes=1, storage_path="/x"
+        )
+        corpus_chunks_repo().add_many(
+            [{"corpus_id": cid, "file_id": fid2, "ordinal": 0, "text": "widget revenue widget revenue"}]
+        )
+
+        monkeypatch.setattr(retrieval, "_max_candidate_chunks", lambda: 1)
+        resp = c.get(
+            "/api/collections/search",
+            params={"q": "widget"},
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json().get("candidates_capped") is True
+
+        monkeypatch.setattr(retrieval, "_max_candidate_chunks", lambda: 100)
+        resp = c.get(
+            "/api/collections/search",
+            params={"q": "widget"},
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert resp.status_code == 200, resp.text
+        assert "candidates_capped" not in resp.json()
+
     def test_search_fail_closed_excludes_ungranted(self, seeded_app):
         c = seeded_app["client"]
         # Collection is NOT granted to analyst1.

@@ -273,9 +273,7 @@ class TestConfigureWizardIsGuardedToo:
         )
         assert resp.status_code == 200, resp.text
 
-    def test_wizard_repoint_applies_when_confirmed(
-        self, seeded_app, bigquery_overlay, registered_bq_table
-    ):
+    def test_wizard_repoint_applies_when_confirmed(self, seeded_app, bigquery_overlay, registered_bq_table):
         c = seeded_app["client"]
         resp = c.post(
             "/api/admin/configure",
@@ -319,11 +317,23 @@ class TestEveryConnectionSaveSurfaceIsWired:
         "app/web/templates/setup.html",  # first-boot / re-run setup
     ]
 
-    @pytest.mark.parametrize("template", SURFACES)
-    def test_surface_saves_through_the_shared_confirm_helper(self, template):
+    @staticmethod
+    def _surface_text(template: str) -> str:
+        """The surface's own source — except `admin_data_sources.html`, most
+        of whose inline JS (including the Snowflake/Databricks wizard code
+        this guard checks) moved into extracted static files (perf
+        follow-up, 2026-09-03; see tests/_admin_data_sources_source.py)."""
         from pathlib import Path
 
-        body = Path(template).read_text()
+        if template.endswith("admin_data_sources.html"):
+            from tests._admin_data_sources_source import read_admin_data_sources_source
+
+            return read_admin_data_sources_source()
+        return Path(template).read_text()
+
+    @pytest.mark.parametrize("template", SURFACES)
+    def test_surface_saves_through_the_shared_confirm_helper(self, template):
+        body = self._surface_text(template)
         assert "saveConnectionConfig" in body, (
             f"{template} writes a data_source connection but does not go through "
             "saveConnectionConfig, so it cannot answer the repoint 409"
@@ -334,9 +344,7 @@ class TestEveryConnectionSaveSurfaceIsWired:
         """This 409's `detail` is an object (a 422's is an array); interpolating
         either into a template literal prints "[object Object]" at the exact
         moment the operator needs to read why."""
-        from pathlib import Path
-
-        body = Path(template).read_text()
+        body = self._surface_text(template)
         assert "apiDetailText" in body
 
     def test_the_helper_is_loaded_on_every_page(self):

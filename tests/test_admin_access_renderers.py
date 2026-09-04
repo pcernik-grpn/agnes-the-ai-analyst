@@ -74,6 +74,7 @@ _EXPORTS = (
     "whoGranted",
     "addScopeFor",
     "addableAtScope",
+    "memberLabel",
     "SCOPE_WITHHELD_TYPES",
     "TIERED",
     "facets",
@@ -159,6 +160,38 @@ class TestTheModuleReadsWhatTheTemplateSends:
         assert got["prefix"] == ""
         assert got["domains"] == []
         assert "<button" in got["tier"]
+
+
+class TestAGroupsCountSaysMembersNotPeople:
+    """The one function eight renderers now call, executed.
+
+    `member_count` counts MEMBERSHIPS: a group may hold a service account
+    (#1534) or a seeded system identity, and `is_person` — which
+    `/api/admin/groups/reach` counts by — counts neither. So the group row
+    said "3 people" two words from the reach line's people-only "2 people",
+    on one screen, and both numbers were right.
+
+    Asserted by running it rather than by grepping for the ternary: the
+    label was hand-rolled in seven places before this, and a scan for the
+    string passed on every one of them while they disagreed.
+    """
+
+    @pytest.mark.parametrize(
+        ("n", "expected"),
+        [(0, "0 members"), (1, "1 member"), (2, "2 members"), (41, "41 members")],
+    )
+    def test_the_count_is_said_in_members(self, n, expected):
+        assert _run(f"OUT = api.memberLabel({n});") == expected
+
+    def test_the_singular_is_the_only_special_case(self):
+        """One member is "1 member" — not "1 members", and not "1 person".
+
+        The plural boundary is the whole reason this was a ternary in seven
+        places, which is the reason it is one function now.
+        """
+        got = _run("OUT = [0, 1, 2].map((n) => api.memberLabel(n));")
+        assert got == ["0 members", "1 member", "2 members"]
+        assert "person" not in " ".join(got)
 
 
 class TestTheTierControlSaysTheVocabularysWords:

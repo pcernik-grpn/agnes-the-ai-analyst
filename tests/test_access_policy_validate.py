@@ -169,8 +169,9 @@ class TestRuleFiveVariables:
 
 
 class TestRuleSixRemoteTranspile:
-    """Rule 6: for a remote table, the policy must transpile to BigQuery;
-    the unnest-in-IN group-membership idiom warns rather than rejects."""
+    """Rule 6: for a remote table, the policy must transpile to every remote
+    engine's SQL (BigQuery, Databricks, Snowflake); the unnest-in-IN
+    group-membership idiom warns rather than rejects."""
 
     def test_rejects_when_untranspilable(self, monkeypatch):
         def _raise(*args, **kwargs):
@@ -182,6 +183,33 @@ class TestRuleSixRemoteTranspile:
         with pytest.raises(PolicyValidationError) as e:
             _validate(HAPPY_PATH_SQL, for_remote=True)
         assert e.value.reason == "policy_untranspilable"
+
+    def test_checks_snowflake_too(self):
+        """S2 (RLS review, issue #1979): a policy that transpiles to
+        BigQuery/Databricks but not Snowflake would save clean and then
+        DENY at read time on a Snowflake table -- an outage shipped as an
+        access rule, exactly the failure mode the Databricks-parity test
+        (`tests/test_databricks_scan_and_policies.py::
+        test_save_time_validation_covers_databricks_too`) pins for that
+        engine. The save is the cheap place to find out."""
+        import src.access_policy_validate as v
+
+        # Sanity: the ordinary shape passes every engine.
+        v._reject_untranspilable(HAPPY_PATH_SQL)
+
+        calls = []
+        original = v.sqlglot.transpile
+
+        def fake(sql, read, write):
+            calls.append(write)
+            return original(sql, read=read, write=write)
+
+        v.sqlglot.transpile = fake
+        try:
+            v._reject_untranspilable(HAPPY_PATH_SQL)
+        finally:
+            v.sqlglot.transpile = original
+        assert "snowflake" in calls
 
     def test_ignores_transpile_check_when_not_remote(self, monkeypatch):
         """The same broken transpile() must not affect a local/server_only

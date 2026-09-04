@@ -526,6 +526,12 @@ class TestToolRegistration:
             # surface with POST /api/admin/analytics/migrate + `agnes admin
             # analytics migrate`.
             "admin_analytics_migrate",
+            # Knowledge-artifact packaging (K3, #798; TCRD-296 synthesis
+            # C.15). Triple-surface with POST /api/admin/run-knowledge-
+            # packaging + GET /api/admin/knowledge-packaging/status +
+            # `agnes admin knowledge packaging run|status`.
+            "admin_knowledge_packaging_run",
+            "admin_knowledge_packaging_status",
             # Contributed-skill triple-surface — admin can list, publish, and
             # delete skills in the Agnes Contributed marketplace without leaving
             # the chat. Mirrors REST + `agnes admin skill` CLI surface.

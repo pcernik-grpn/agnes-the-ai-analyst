@@ -722,8 +722,12 @@ class TestPolicyDialect:
             _transpile_policy_to_databricks("this is not sql at all !!", table_id="t")
 
     def test_unknown_dialect_still_rejected(self):
+        # "snowflake" is a KNOWN dialect since S2 (RLS review, issue #1979,
+        # `tests/test_access_policy_snowflake.py`) -- use a genuinely
+        # unrecognized one so this stays a real assertion about the
+        # allowlist rather than a stale pin on a dialect that shipped.
         with pytest.raises(ValueError, match="unknown dialect"):
-            policied_relation("whatever", {"id": "u"}, dialect="snowflake")
+            policied_relation("whatever", {"id": "u"}, dialect="postgres")
 
     def test_save_time_validation_covers_databricks_too(self):
         """A policy that transpiles to BigQuery but not Databricks would save

@@ -362,10 +362,83 @@ class TestAnEveryoneAudienceIsNotARoster:
         assert 'grant.audience === "everyone"' in src
         assert '(g) => g.audience === "everyone"' in src
 
-    def test_the_row_still_says_people_for_an_ordinary_group(self):
-        """The fix must not cost the ordinary case its member count."""
+    def test_the_ordinary_row_counts_its_members_and_says_so(self):
+        """The fix must not cost the ordinary case its count — and the noun
+        has to match the quantity it prints.
+
+        `member_count` counts MEMBERSHIPS. A group may legitimately hold a
+        service account (issue #1534) or a seeded system identity, and
+        `is_person` counts neither — so this row printed "3 people" beside
+        `groups/reach`'s people-only "2 people" next to Apply, on one
+        screen. Both numbers were right; the noun on this one was not.
+
+        Asserted on the row alone: the page has two labels that ARE
+        people-sourced, and a whole-file scan could not tell them from a
+        member count wearing the word.
+        """
+        row = self._group_row()
+        assert "member_count" in row
+        assert "memberLabel(" in row
+        assert '"person" : "people"' not in row
+
+    def test_only_a_people_sourced_number_is_labelled_people(self):
+        """The two survivors, and why each is entitled to the word.
+
+        The member SEARCH counts matched people server-side
+        (`matched_people`), and the picker footer paints `fetchReach` — the
+        server's `is_person` answer — over its local estimate. A third
+        occurrence means a member count has taken the word back, which is
+        the regression this guard is here for: the noun drifts one renderer
+        at a time, and every renderer was written by someone who could not
+        see the others.
+        """
         src = self._source()
-        assert '=== 1 ? "person" : "people"' in src
+        labelled = src.count('"person" : "people"')
+        assert labelled == 2, f"expected 2 people-sourced labels, found {labelled}"
+        assert "matched_people === 1 ?" in src              # the member search
+        assert '${reach} ${reach === 1 ? "person" : "people"}' in src  # the footer
+
+    def test_the_column_over_the_count_does_not_promise_a_reach(self):
+        """The header and the cell under it have to agree.
+
+        "Who that reaches" over a `member_count` cell is the same false
+        claim as the row's old "3 people", one level up: a membership is
+        not a person, and `groups/reach` — which IS people — can be
+        smaller. The column is heterogeneous besides, so the heading has to
+        be true of both cells: an ordinary group's "3 members" and the
+        Everyone audience's "every account, and anyone who joins", which
+        carries no number at all.
+        """
+        src = self._source()
+        # The rendered CELL, not the file: the comment above this heading
+        # quotes the old wording to explain why it went, and a whole-file
+        # scan would fire on the explanation.
+        assert "<span>Who that reaches</span>" not in src
+        assert "<span>Audience size</span>" in src
+        # Both cells the heading has to cover, still rendered by that column.
+        assert "every account, and anyone who joins" in src
+        assert "memberLabel(g.member_count ?? 0)" in src
+
+    def test_the_member_label_is_written_once(self):
+        """Eight renderers, one definition.
+
+        The seven that printed a member count each hand-rolled the ternary,
+        and the eighth (the roster strip) had already picked the right noun
+        on its own — which is how the page ended up disagreeing with itself
+        in the first place. A second definition means the drift is back,
+        whichever word the new one chooses.
+        """
+        src = self._source()
+        defs = src.count('=== 1 ? "member" : "members"')
+        assert defs == 1, f"expected exactly one member-label definition, found {defs}"
+        assert "const memberLabel = (n) =>" in src
+        # A LOWER bound, not the exact count. The arrow declaration holds no
+        # call, so this counts callers alone — and how many there are is a
+        # property of the page's current renderers, not of this rule: the
+        # branch stacked above deletes one of them (the collapsed line drops
+        # its count entirely, which is a better answer than relabelling it).
+        # Pinning the number would fail there on code that is right.
+        assert src.count("memberLabel(") >= 6, src.count("memberLabel(")
 
 
 class TestTheGrantListSplitsOnWhatCanBeActedOn:

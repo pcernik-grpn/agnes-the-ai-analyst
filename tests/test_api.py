@@ -715,6 +715,30 @@ class TestMetadataAPI:
 # ---- Hybrid Query ----
 
 
+def _mint_admin_pat(user_id: str, email: str, *, surface: str) -> str:
+    """Mint a PAT for an already-admin user with an explicit ``surface``
+    (K2 regression coverage -- ``agnes init`` mints ``surface='stack'`` by
+    default; only a ``surface='all'`` PAT or browser session should get
+    ``POST /api/query/hybrid``'s unrestricted admin bypass)."""
+    import hashlib
+    import uuid
+
+    from app.auth.jwt import create_access_token
+    from src.repositories import access_token_repo
+
+    token_id = str(uuid.uuid4())
+    jwt_token = create_access_token(user_id=user_id, email=email, token_id=token_id, typ="pat")
+    access_token_repo().create(
+        id=token_id,
+        user_id=user_id,
+        name="test-admin-pat",
+        token_hash=hashlib.sha256(jwt_token.encode()).hexdigest(),
+        prefix=token_id.replace("-", "")[:8],
+        surface=surface,
+    )
+    return jwt_token
+
+
 class TestHybridQueryAPI:
     def test_hybrid_query_requires_admin(self, seeded_client):
         client, _, analyst_token = seeded_client
@@ -724,6 +748,38 @@ class TestHybridQueryAPI:
             headers={"Authorization": f"Bearer {analyst_token}"},
         )
         assert resp.status_code == 403
+
+    def test_hybrid_query_stack_surface_admin_forbidden(self, seeded_client):
+        """K2 -- an admin holding a surface='stack' PAT (the `agnes init`
+        default, deliberately filtered like an analyst everywhere else --
+        see docs/table-access-policies.md "The admin bypass") must NOT get
+        this endpoint's unrestricted admin bypass: it has no per-table
+        grant check and no policy rewrite of its own, so the surface check
+        IS the whole guardrail here."""
+        client, _, _ = seeded_client
+        stack_pat = _mint_admin_pat("admin1", "admin@acme.com", surface="stack")
+        resp = client.post(
+            "/api/query/hybrid",
+            json={"sql": "SELECT 1 AS val", "register_bq": {}},
+            headers=_auth(stack_pat),
+        )
+        assert resp.status_code == 403
+        assert "surface" in resp.json()["detail"].lower()
+
+    def test_hybrid_query_all_surface_pat_allowed(self, seeded_client):
+        """A regular (surface='all') admin PAT keeps working -- the fix
+        narrows the endpoint by credential surface, not by admin status."""
+        client, _, _ = seeded_client
+        all_pat = _mint_admin_pat("admin1", "admin@acme.com", surface="all")
+        resp = client.post(
+            "/api/query/hybrid",
+            json={"sql": "SELECT 1 AS val", "register_bq": {}},
+            headers=_auth(all_pat),
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["columns"] == ["val"]
+        assert data["rows"] == [[1]]
 
     def test_hybrid_query_local_only(self, seeded_client):
         client, admin_token, _ = seeded_client

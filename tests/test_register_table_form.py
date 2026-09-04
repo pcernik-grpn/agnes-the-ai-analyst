@@ -219,7 +219,9 @@ def test_admin_data_sources_register_flow_still_targets_the_validated_endpoint()
     are genuinely 2 registration UIs, not 3. This guard only pins that the
     (unchanged) flow still targets the validated endpoint, so a future
     change to admin_data_sources.html can't quietly repoint it."""
-    html = Path("app/web/templates/admin_data_sources.html").read_text(encoding="utf-8")
+    from tests._admin_data_sources_source import read_admin_data_sources_source
+
+    html = read_admin_data_sources_source()
     assert 'API_REGISTER_TABLE = "/api/admin/register-table"' in html
 
 
@@ -279,15 +281,7 @@ let state;
 
 
 def _run_selection(setup: str, report: str) -> dict:
-    script = (
-        _HARNESS
-        + _selection_slice()
-        + "\n"
-        + setup
-        + "\nprocess.stdout.write(JSON.stringify("
-        + report
-        + "));\n"
-    )
+    script = _HARNESS + _selection_slice() + "\n" + setup + "\nprocess.stdout.write(JSON.stringify(" + report + "));\n"
     return json.loads(_node_run(script))
 
 
@@ -426,7 +420,8 @@ def test_open_resets_every_configure_step_control():
     covering a control rather than merely if it stops being called."""
     reset = _JS.read_text(encoding="utf-8")
     body = reset[reset.index("  function _resetConfigureStep() {") : reset.index("  function close() {")]
-    script = """
+    script = (
+        """
 const fields = {};
 const TEXT = ['rtfViewName','rtfDescription','rtfFolder','rtfSyncSchedule','rtfProject',
   'rtfCustomQuery','rtfPrimaryKey','rtfKbPartitionBy','rtfKbIncrementalWindowDays',
@@ -436,7 +431,9 @@ fields['rtfServerOnly'] = { checked: true };
 fields['rtfKbStrategy'] = { selectedIndex: 2 };
 fields['rtfKbPartitionGranularity'] = { selectedIndex: 1 };
 const document = { getElementById(id) { return fields[id] || null; } };
-""" + body + """
+"""
+        + body
+        + """
 _resetConfigureStep();
 process.stdout.write(JSON.stringify({
   values: TEXT.map(function (id) { return fields[id].value; }),
@@ -446,6 +443,7 @@ process.stdout.write(JSON.stringify({
   filterHidden: fields['rtfKbWhereFilters'].style.display,
 }));
 """
+    )
     out = json.loads(_node_run(script))
     assert out["values"] == [""] * 12, f"a text/number control kept its previous value: {out['values']}"
     assert out["serverOnly"] is False, "server-only must not stay checked from the previous registration"

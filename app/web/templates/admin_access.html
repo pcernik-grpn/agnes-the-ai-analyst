@@ -459,6 +459,9 @@
   .ax-res__state { flex: 0 0 auto; font-size: 11.5px; font-weight: 600; color: var(--ds-accent-success-ink); }
   .ax-res__act { flex: 0 0 auto; }
   .ax-res__msg { padding: 10px 8px; font-size: 12.5px; color: var(--ds-text-muted); }
+  /* A failed lookup, not an empty one — distinct ink so it does not read
+     as just another "nobody matched" line. */
+  .ax-res__msg--error { color: var(--ds-accent-warn-ink); }
 
   /* Where a member came from, and when — one cell, two weights, the same
      shape the retired detail page's Origin column had. */

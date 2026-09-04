@@ -66,7 +66,10 @@ def test_both_object_types_declare_the_fields_default_off():
         # instance repo must render a byte-identical startup script for every
         # VM that did not opt in.
         assert re.search(r"extraction_worker_enabled\s*=\s*optional\(bool,\s*false\)", block)
-        assert re.search(r'extraction_worker_mem_limit\s*=\s*optional\(string,\s*"4g"\)', block)
+        # "auto" (TCRD-296) — the startup script derives the ceiling from the
+        # VM's own RAM when this stays at its default; see
+        # tests/test_startup_vm_sizing.py + tests/test_infra_vm_sizing_plumbing.py.
+        assert re.search(r'extraction_worker_mem_limit\s*=\s*optional\(string,\s*"auto"\)', block)
         assert re.search(r'extraction_worker_cpus\s*=\s*optional\(string,\s*"2.0"\)', block)
     # extraction_worker_image is module-level (like kai_agent_image), still
     # forwarded and still able to pin the worker away from the app image —
@@ -134,7 +137,9 @@ def test_tpl_gates_everything_on_the_flag():
         'COMPOSE_FILE_VALUE="$COMPOSE_FILE_VALUE:docker-compose.extraction.yml"',
         "AGNES_COORDINATION_BACKEND=redis",
         "AGNES_REDIS_URL=redis://redis:6379/0",
-        "AGNES_EXTRACTION_WORKER_MEM_LIMIT=${extraction_worker_mem_limit}",
+        # "auto"-resolved bash var (TCRD-296), not the raw Terraform value —
+        # see tests/test_startup_vm_sizing.py.
+        "AGNES_EXTRACTION_WORKER_MEM_LIMIT=$RESOLVED_EXTRACTION_WORKER_MEM_LIMIT",
         "AGNES_EXTRACTION_WORKER_CPUS=${extraction_worker_cpus}",
         # TCRD-259 follow-up: the app-side gate (the sharepoint switch) must
         # also ride .env, or the TF flag alone never activates the
@@ -178,25 +183,23 @@ def test_overlay_and_env_image_line_are_conditional():
     guard = '%{ if extraction_worker_image != "" ~}'
     endif = "%{ endif ~}"
     assert body.count(guard) == 3, (
-        "expected exactly three guarded blocks: registry auth, the overlay's "
-        "image: line, and the .env line"
+        "expected exactly three guarded blocks: registry auth, the overlay's image: line, and the .env line"
     )
 
     # 1. The overlay's image: line, inside the extraction-worker service.
     overlay = _extraction_overlay_heredoc(body)
     worker = _extraction_worker_block(overlay)
-    assert guard in worker, "the extraction-worker image: line must be gated on extraction_worker_image != \"\""
+    assert guard in worker, 'the extraction-worker image: line must be gated on extraction_worker_image != ""'
     opening = worker.index(guard)
     closing = worker.index(endif, opening)
     image_line = "image: $${AGNES_EXTRACTION_WORKER_IMAGE}"
     assert image_line in worker, "the extraction-worker service must be ABLE to carry a pinned image"
     assert opening < worker.index(image_line) < closing, "the image: line must sit inside its own guard"
     # No stray, unconditional `image:` line elsewhere in the service.
-    unconditional = worker[: opening] + worker[closing + len(endif) :]
+    unconditional = worker[:opening] + worker[closing + len(endif) :]
     yaml_lines = [ln for ln in unconditional.splitlines() if ln.strip() and not ln.strip().startswith("#")]
     assert not any(re.match(r"^\s*image:", ln) for ln in yaml_lines), (
-        "outside its own guard, the extraction-worker service must carry no "
-        "unconditional image override"
+        "outside its own guard, the extraction-worker service must carry no unconditional image override"
     )
 
     # 2. The .env line, inside the outer extraction_worker_enabled block.
