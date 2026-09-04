@@ -141,6 +141,41 @@ class CorpusFileSourcesPgRepository:
             ).all()
         return [r[0] for r in rows]
 
+    def pending_extraction_candidates(self, corpus_ids: list[str]) -> list[Dict[str, Any]]:
+        """Every indexed, source-anchored file across ``corpus_ids``,
+        projected to ``{file_id, sha256}`` — ONE query, regardless of how
+        many files the corpora hold (TCRD-296 gap #72).
+
+        This is the candidate set ``connectors.sharepoint.facts_extraction
+        .count_pending_documents`` used to assemble with a ``list_for_corpus``
+        call per collection PLUS a ``get(file_id)`` call PER FILE (282k round
+        trips on the connection that surfaced this) — replaced by the same
+        ``indexed`` + ``source_doc_id IS NOT NULL`` pre-filter that loop
+        applied, pushed into the join instead of Python. The caller still
+        finishes the per-file decision itself (the ledger's ``docs_state``
+        is a JSON blob, not a joinable table), but over this single,
+        already-narrow result set rather than one query per row.
+        """
+        if not corpus_ids:
+            return []
+        with self._engine.connect() as conn:
+            rows = (
+                conn.execute(
+                    sa.text(
+                        "SELECT cf.id AS file_id, cf.sha256 AS sha256 "
+                        "FROM corpus_files cf "
+                        "JOIN corpus_file_sources cfs ON cfs.corpus_file_id = cf.id "
+                        "WHERE cf.corpus_id = ANY(:corpus_ids) "
+                        "AND cf.processing_status = 'indexed' "
+                        "AND cfs.source_doc_id IS NOT NULL"
+                    ),
+                    {"corpus_ids": list(corpus_ids)},
+                )
+                .mappings()
+                .all()
+            )
+        return [dict(r) for r in rows]
+
     def upsert(
         self,
         *,

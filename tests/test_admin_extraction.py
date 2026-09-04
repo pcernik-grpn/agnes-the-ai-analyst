@@ -1209,6 +1209,72 @@ class TestCancelRoute:
         assert r.json()["error"] == "requires_postgres_backend"
 
 
+class TestFactsPendingDocumentsCache:
+    """``_facts_pending_documents``'s TTL cache (TCRD-296 gap #72) — the
+    source card polls ``…/extraction/status`` every few seconds and the
+    fleet view polls it once per row, so this collapses repeat polls onto
+    one real ``count_pending_documents`` call within the TTL window."""
+
+    CONN_ID = "sp-pending-cache-ttl"
+
+    def setup_method(self):
+        from app.api import admin_extraction as mod
+
+        mod._facts_pending_cache.pop(self.CONN_ID, None)
+
+    teardown_method = setup_method
+
+    def test_a_repeat_call_within_the_ttl_reuses_the_cached_value(self, monkeypatch):
+        from app.api import admin_extraction as mod
+
+        calls = {"n": 0}
+
+        def fake_count(connection_id: str) -> int:
+            calls["n"] += 1
+            return calls["n"]
+
+        monkeypatch.setattr("connectors.sharepoint.facts_extraction.count_pending_documents", fake_count)
+
+        first = mod._facts_pending_documents(self.CONN_ID)
+        second = mod._facts_pending_documents(self.CONN_ID)
+        assert (first, second) == (1, 1)
+        assert calls["n"] == 1, "a call within the TTL must not recompute"
+
+    def test_a_call_past_the_ttl_recomputes(self, monkeypatch):
+        from app.api import admin_extraction as mod
+
+        calls = {"n": 0}
+
+        def fake_count(connection_id: str) -> int:
+            calls["n"] += 1
+            return calls["n"]
+
+        monkeypatch.setattr("connectors.sharepoint.facts_extraction.count_pending_documents", fake_count)
+
+        assert mod._facts_pending_documents(self.CONN_ID) == 1
+        # Backdate the cache entry past the TTL rather than sleeping or
+        # monkeypatching the global `time` module — same value, an earlier
+        # timestamp, exactly what "the TTL elapsed" looks like to the cache.
+        computed_at, value = mod._facts_pending_cache[self.CONN_ID]
+        mod._facts_pending_cache[self.CONN_ID] = (computed_at - mod._FACTS_PENDING_CACHE_TTL_S - 1, value)
+
+        assert mod._facts_pending_documents(self.CONN_ID) == 2
+        assert calls["n"] == 2, "a call past the TTL must recompute"
+
+    def test_different_connections_do_not_share_a_cache_entry(self, monkeypatch):
+        from app.api import admin_extraction as mod
+
+        monkeypatch.setattr(
+            "connectors.sharepoint.facts_extraction.count_pending_documents",
+            lambda cid: 5 if cid == self.CONN_ID else 9,
+        )
+        try:
+            assert mod._facts_pending_documents(self.CONN_ID) == 5
+            assert mod._facts_pending_documents("sp-pending-cache-other") == 9
+        finally:
+            mod._facts_pending_cache.pop("sp-pending-cache-other", None)
+
+
 class TestFactsJobInFlight:
     """The standalone facts pass (``sharepoint-facts-extraction``) writes no
     ``extraction_runs`` row — it is a JOB, not a crawl run — so the card's

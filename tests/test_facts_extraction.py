@@ -1710,6 +1710,71 @@ def test_the_fingerprint_covers_the_ontology_as_well_as_the_prompt():
     assert a != b
 
 
+# ---------------------------------------------------------------------------
+# `count_pending_documents` — bounded repository cost (TCRD-296 gap #72)
+# ---------------------------------------------------------------------------
+
+
+class _FakeSourceConnectionsRepo:
+    def __init__(self, connection: dict) -> None:
+        self._connection = connection
+
+    def get(self, connection_id: str) -> dict | None:
+        return self._connection if connection_id == self._connection["id"] else None
+
+
+class _CountingCorpusFileSourcesRepo:
+    """Counts calls to :meth:`pending_extraction_candidates` — the fake
+    proving ``count_pending_documents`` issues a BOUNDED number of
+    repository calls, not one per candidate file."""
+
+    def __init__(self, rows: list[dict]) -> None:
+        self._rows = rows
+        self.calls = 0
+
+    def pending_extraction_candidates(self, corpus_ids: list[str]) -> list[dict]:
+        self.calls += 1
+        return list(self._rows)
+
+
+def test_count_pending_documents_issues_a_bounded_number_of_repo_calls(monkeypatch):
+    """1,000 candidate files must cost ONE ``pending_extraction_candidates``
+    call, not one ``list_for_corpus`` + 1,000 per-file ``get()`` calls — the
+    O(N) round-trip pattern that made this a 300s+ endpoint on a 282k-file
+    connection."""
+    connection = {
+        "id": "conn-bounded",
+        "source_type": "sharepoint",
+        "config": {"scopes": [{"source_scope_id": "site:1", "collection_id": "col-a"}]},
+    }
+    rows = [{"file_id": f"cf_{i}", "sha256": f"sha-{i}"} for i in range(1_000)]
+    sources_repo = _CountingCorpusFileSourcesRepo(rows)
+
+    monkeypatch.setattr("src.repositories.source_connections_repo", lambda: _FakeSourceConnectionsRepo(connection))
+    monkeypatch.setattr("src.repositories.corpus_file_sources_repo", lambda: sources_repo)
+    monkeypatch.setattr(fe, "_ontology_models", lambda: [ONTOLOGY_MODEL])
+    monkeypatch.setattr(fe, "load_state", lambda connection_id: {"version": 1, "docs": {}})  # noqa: ARG005
+
+    pending = fe.count_pending_documents("conn-bounded")
+
+    assert pending == 1_000  # every candidate is "never attempted" -> pending
+    assert sources_repo.calls == 1, "must be O(1) repository calls, not O(N) per-file calls"
+
+
+def test_count_pending_documents_is_zero_for_a_non_sharepoint_connection(monkeypatch):
+    """No repository calls past the connection lookup for a connection this
+    function never counts against — the type check short-circuits before
+    the (potentially expensive) candidate fetch."""
+    connection = {"id": "conn-kbc", "source_type": "keboola", "config": {}}
+    sources_repo = _CountingCorpusFileSourcesRepo([{"file_id": "cf_1", "sha256": "s1"}])
+
+    monkeypatch.setattr("src.repositories.source_connections_repo", lambda: _FakeSourceConnectionsRepo(connection))
+    monkeypatch.setattr("src.repositories.corpus_file_sources_repo", lambda: sources_repo)
+
+    assert fe.count_pending_documents("conn-kbc") == 0
+    assert sources_repo.calls == 0
+
+
 def test_state_path_refuses_a_traversing_connection_id(tmp_path, monkeypatch):
     from connectors.sharepoint.facts_extraction import state_path
 

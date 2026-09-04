@@ -1221,16 +1221,51 @@ def _facts_job_in_flight(connection_id: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+#: How long a computed pending-documents count is reused before the next
+#: poll recomputes it (TCRD-296 gap #72) — the source card polls
+#: ``…/extraction/status`` every few seconds and the fleet view
+#: (``…/extraction/runs``) polls it once PER ROW, so even after the O(N)
+#: round-trip fix above, an admin with several large connections open still
+#: reissues the same bounded query several times a second. Process-local
+#: (not shared across worker processes) and best-effort, same trade-off as
+#: the completeness cache above — a miss just recomputes, never a
+#: correctness issue. Not configurable, deliberately (CLAUDE.md's "no
+#: speculative config knobs"): 30s keeps the card and fleet row visibly
+#: live while collapsing the redundant polls that made this a hot path.
+_FACTS_PENDING_CACHE_TTL_S = 30
+_facts_pending_cache_lock = threading.Lock()
+_facts_pending_cache: Dict[str, Tuple[float, int]] = {}
+
+
 def _facts_pending_documents(connection_id: str) -> int:
-    """Thin delegate to ``connectors.sharepoint.facts_extraction.
-    count_pending_documents`` — see that function's docstring for the
-    (cheap, no-document-text-read) definition of "pending". A tiny
-    wrapper rather than an inline import at each of this module's two
-    call sites (the per-connection status endpoint and the fleet row),
-    same reasoning as ``_facts_job_in_flight`` above."""
+    """Thin, TTL-CACHED delegate to ``connectors.sharepoint.
+    facts_extraction.count_pending_documents`` — see that function's
+    docstring for the (cheap, no-document-text-read, single-query as of
+    TCRD-296 gap #72) definition of "pending". A tiny wrapper rather than
+    an inline import at each of this module's two call sites (the
+    per-connection status endpoint and the fleet row), same reasoning as
+    ``_facts_job_in_flight`` above.
+
+    The returned count may lag the true value by up to
+    :data:`_FACTS_PENDING_CACHE_TTL_S` — see that constant's docstring.
+    Worker-side callers (``enqueue_facts_extraction_passes``,
+    ``maybe_continue_pass``) call ``count_pending_documents`` directly and
+    bypass this cache entirely, since a stale count there would mis-size a
+    fan-out or a continuation decision, not just a status display.
+    """
+    with _facts_pending_cache_lock:
+        cached = _facts_pending_cache.get(connection_id)
+    if cached is not None:
+        computed_at, value = cached
+        if time.monotonic() - computed_at <= _FACTS_PENDING_CACHE_TTL_S:
+            return value
+
     from connectors.sharepoint.facts_extraction import count_pending_documents
 
-    return count_pending_documents(connection_id)
+    value = count_pending_documents(connection_id)
+    with _facts_pending_cache_lock:
+        _facts_pending_cache[connection_id] = (time.monotonic(), value)
+    return value
 
 
 def _facts_jobs_in_flight(connection_id: str) -> List[Dict[str, Any]]:
@@ -1326,7 +1361,7 @@ def _facts_throughput_and_eta(connection: Dict[str, Any], *, pending: int) -> Di
 
 
 @router.get("/connections/{connection_id}/extraction/status")
-async def extraction_status(
+def extraction_status(
     connection_id: str,
     _user: dict = Depends(require_admin),
 ):
@@ -1475,7 +1510,7 @@ async def extraction_status(
 
 
 @router.post("/connections/{connection_id}/extraction/stop", status_code=202)
-async def request_extraction_stop(
+def request_extraction_stop(
     connection_id: str,
     _user: dict = Depends(require_admin),
 ):
@@ -1574,7 +1609,7 @@ class FactsConfigPatch(BaseModel):
 
 
 @router.patch("/connections/{connection_id}/extraction/facts-config")
-async def patch_extraction_facts_config(
+def patch_extraction_facts_config(
     connection_id: str,
     body: FactsConfigPatch,
     _user: dict = Depends(require_admin),
@@ -1813,7 +1848,7 @@ def _crawl_schedule_next_run_at(connection: Dict[str, Any], *, now: datetime) ->
 
 
 @router.patch("/connections/{connection_id}/extraction/crawl-config")
-async def patch_extraction_crawl_config(
+def patch_extraction_crawl_config(
     connection_id: str,
     body: CrawlConfigPatch,
     _user: dict = Depends(require_admin),
@@ -1921,7 +1956,7 @@ async def patch_extraction_crawl_config(
 
 
 @router.get("/connections/{connection_id}/extraction/runs")
-async def extraction_runs(
+def extraction_runs(
     connection_id: str,
     limit: int = Query(10, ge=1, le=100),
     _user: dict = Depends(require_admin),
@@ -1957,7 +1992,7 @@ async def extraction_runs(
 
 
 @router.get("/connections/{connection_id}/extraction/runs/{run_id}")
-async def extraction_run_detail(
+def extraction_run_detail(
     connection_id: str,
     run_id: str,
     _user: dict = Depends(require_admin),
@@ -2413,7 +2448,7 @@ def _extraction_config_rows(connection: Optional[Dict[str, Any]] = None) -> List
 
 
 @router.get("/connections/{connection_id}/extraction/config")
-async def extraction_config(
+def extraction_config(
     connection_id: str,
     _user: dict = Depends(require_admin),
 ):
@@ -2689,7 +2724,7 @@ def _preview_key() -> bytes:
 
 
 @router.post("/anonymization/preview")
-async def preview_anonymization(
+def preview_anonymization(
     request: AnonymizationPreviewRequest,
     user: dict = Depends(require_admin),
 ):
