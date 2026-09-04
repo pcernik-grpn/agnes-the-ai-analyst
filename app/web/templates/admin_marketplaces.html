@@ -198,65 +198,18 @@
   .plugin-meta a { color: var(--ds-primary, #6366f1); text-decoration: none; }
   .plugin-meta a:hover { text-decoration: underline; }
 
-  /* v39: SYSTEM pill + per-plugin toggle button. Pill uses the same
-     amber palette as the .ax-orig--system chip on /admin/access so the
-     "system" semantic reads consistently across the admin surface. */
-  .plugin-system-pill {
-    display: inline-block; padding: 1px 7px; border-radius: 999px;
-    background: var(--ds-accent-warn-bg); color: var(--ds-accent-warn-ink);
-    font-size: 10px; font-weight: 600;
-    text-transform: uppercase; letter-spacing: 0.4px;
-  }
+  /* `.plugin-system-pill` (the amber SYSTEM/AUTOMATIC pill) is gone with the
+     flag it reported. Distribution is stated on /admin/access, which is the
+     one place that decides it. */
   .plugin-item-head .spacer { flex: 1; }
   /* Toggle-style chip: same size/weight in both states, differentiated
      only by tonal fill (outlined ↔ tinted). Off state reads as "click to
      enable", on state reads as "currently on, click to revert". The
      amber palette is shared with the SYSTEM pill + Required badge so
-     the org-policy semantic stays visually consistent across surfaces. */
-  .plugin-system-btn {
-    display: inline-flex; align-items: center; gap: 5px;
-    background: var(--ds-surface); border: 1px solid var(--ds-accent-warn-line);
-    /* #1956 item 14c: every other labelled button in the app wears
-       --ds-radius-btn — this one hardcoded a bespoke 6px, which is part of
-       why it read as a different species of control than the toggle beside
-       it. */
-    border-radius: var(--ds-radius-btn); padding: 5px 11px; font-size: 11px;
-    font-weight: 600; cursor: pointer;
-    color: var(--ds-accent-warn-ink); white-space: nowrap;
-    transition: background 0.15s, border-color 0.15s, color 0.15s;
-  }
-  .plugin-system-btn svg { display: block; flex-shrink: 0; }
-  .plugin-system-btn:hover {
-    background: color-mix(in srgb, var(--ds-accent-warn-bg) 60%, transparent); border-color: var(--ds-accent-warn-line); color: var(--ds-accent-warn-ink);
-  }
-  .plugin-system-btn.is-system {
-    background: var(--ds-accent-warn-bg); border-color: var(--ds-accent-warn-line); color: var(--ds-accent-warn-ink);
-  }
-  .plugin-system-btn.is-system:hover {
-    background: color-mix(in srgb, var(--ds-accent-warn-bg) 80%, var(--ds-accent-warn-ink)); border-color: var(--ds-accent-warn-line); color: var(--ds-accent-warn-ink);
-  }
-  .plugin-system-btn[disabled] { opacity: 0.5; cursor: wait; }
-  /* v78: when a plugin is admin-disabled the system button is locked so a
-     hidden plugin can't be marked mandatory. `is-locked` is a persistent
-     greyed state (distinct from the transient `[disabled]` "Working…"
-     spinner state above). */
-  .plugin-system-btn.is-locked {
-    opacity: 0.45; cursor: not-allowed;
-    background: var(--surface, #fff); border-color: var(--border, #e5e7eb); color: var(--text-secondary, #9ca3af);
-  }
-  .plugin-system-btn.is-locked:hover {
-    background: var(--surface, #fff); border-color: var(--border, #e5e7eb); color: var(--text-secondary, #9ca3af);
-  }
-
-  /* v78: DISABLED pill — replaces the amber SYSTEM pill for admin-disabled
-     plugins. Neutral grey so it reads as "hidden / inert" rather than a
-     policy state. */
-  .plugin-disabled-pill {
-    display: inline-block; padding: 1px 7px; border-radius: 999px;
-    background: var(--border-light, #f3f4f6); color: var(--text-secondary, #6b7280);
-    font-size: 10px; font-weight: 600;
-    text-transform: uppercase; letter-spacing: 0.4px;
-  }
+  /* The bespoke `.plugin-system-btn` styling is gone with the button it
+     dressed: Automatic-for-everyone is a switch now, so it reuses the
+     shared `.toggle` widget below and cannot drift from the Enabled
+     switch beside it the way a separately-styled control did. */
 
   /* v78: on/off toggle switch — copied from admin_users.html so the widget
      itself reads identically across the admin surface. #1956 item 14b: the
@@ -267,11 +220,40 @@
      writes (admin_disabled) is unchanged, only the presentation flipped. */
   .plugin-enabled-toggle { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
   .plugin-enabled-toggle .toggle-label { font-size: 11px; font-weight: 600; color: var(--text-secondary, #6b7280); }
-  /* #1956 item 14c: shared wrapper so the Enabled toggle and the system-mark
-     button (still a button — see the JS comment above sysBtnIcon for why)
-     read as one matched row of controls instead of two unrelated widgets. */
+  /* #1956 item 14c: the two controls are now the SAME widget, not merely
+     aligned — "Enabled" and "Automatic for everyone" are both switches, and
+     the complaint that two on/off states wore two different widgets is
+     answered rather than argued with. */
+  /* ── Is this plugin available here: ONE question, two answers ─────────
+     This control had three positions — Off / By group / Everyone. Two of
+     them were not controls: "By group" was a signpost to /admin/access (it
+     set nothing), and "Everyone" was a shortcut that wrote a distribution
+     decision from the page that owns availability. Two writers of reach is
+     how the flag and the grants drifted apart in the first place.
+
+     What is left is the one decision this page genuinely owns: whether the
+     plugin exists on this instance at all. Who gets it is answered on
+     Access, where every other grant is. */
+  .plugin-reach { display: inline-flex; border: 1px solid var(--ds-border); border-radius: var(--ds-radius-btn); overflow: hidden; }
+  .plugin-reach__btn {
+    appearance: none; border: 0; background: var(--ds-surface); cursor: pointer;
+    font-size: 11px; font-weight: 600; padding: 5px 10px; white-space: nowrap;
+    color: var(--text-secondary, #6b7280);
+    border-right: 1px solid var(--ds-border);
+    transition: background 0.15s, color 0.15s;
+  }
+  .plugin-reach__btn:last-child { border-right: 0; }
+  .plugin-reach__btn:hover:not(.is-active):not([disabled]) { background: var(--ds-surface-sunken); color: var(--ds-text); }
+  .plugin-reach__btn:focus-visible { outline: 2px solid var(--ds-primary); outline-offset: -2px; }
+  .plugin-reach__btn[disabled] { opacity: 0.5; cursor: wait; }
+  /* The active position carries the MEANING of the state it names, so the
+     row can be read without the label: muted for Off, ordinary for
+     Available. */
+  .plugin-reach__btn.is-active { background: var(--ds-surface-sunken); color: var(--ds-text); }
+  .plugin-reach__btn.is-active[data-reach="off"] { color: var(--text-secondary, #6b7280); }
+
   .plugin-controls { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
-  .plugin-system-control { display: inline-flex; align-items: center; gap: 6px; }
+
   /* Small, always-visible help affordance — a bare `title` on the button
      text alone was not discoverable enough (#1913 traces back to exactly
      this control being misread). */
@@ -303,9 +285,6 @@
   .toggle input:checked + .toggle-slider::before { transform: translateX(16px); }
   .toggle input:focus-visible + .toggle-slider { outline: 2px solid var(--ds-primary, #6366f1); outline-offset: 2px; }
   .toggle input:disabled + .toggle-slider { opacity: 0.5; cursor: wait; }
-
-  /* Amber primary modal action — pairs with the system-confirm modal so
-     the OK button matches the trigger button's visual weight. */
 
   /* Toast */
   .toast-stack {
@@ -569,31 +548,10 @@
   </div>
 </div>
 
-<!-- v39: confirm dialog for Mark/Unmark system. Replaces the native
-     confirm() because operators need a clear, scannable summary of
-     what fanout actually does to existing + future principals before
-     they hit OK. Title + body are populated dynamically so the same
-     modal handles both directions. -->
-<div class="modal-backdrop" id="system-confirm-modal" role="dialog" aria-modal="true" aria-labelledby="system-confirm-title">
-  <div class="modal-card" style="max-width: 520px;">
-    <h3 id="system-confirm-title">Mark as system plugin?</h3>
-    <p class="sub" id="system-confirm-plugin" style="margin: 0 0 14px; font-size: 13px; color: var(--text-primary, #111827); font-weight: 500;"></p>
-    <div id="system-confirm-body" style="font-size: 13px; line-height: 1.55; color: var(--text-secondary, #374151);"></div>
-    <div class="modal-actions">
-      {{ ds.button('Cancel', variant='secondary',
-                   attrs='data-close-modal="system-confirm-modal"') }}
-      {# Confirm starts as `.btn-danger` (Mark-as-system is destructive — fans
-         out a forced grant to every principal). JS below toggles between
-         `.btn-danger` (mark) and `.btn-primary` (unmark) on open. #}
-      {{ ds.button('Confirm', variant='danger', id='system-confirm-ok-btn') }}
-    </div>
-  </div>
-</div>
-
-<!-- v78: confirm dialog for the "Disable plugin" toggle. Separate modal from
-     system-confirm-modal so the two confirm flows never leak listeners into
-     each other. Title + body populated dynamically to handle both the
-     disable and enable directions. -->
+<!-- v78: confirm dialog for the Off / Available control. Title + body are
+     populated dynamically to handle both directions. A second modal
+     (system-confirm-modal) stood beside this one for the Mark/Unmark system
+     flow; both it and the flow are gone. -->
 <div class="modal-backdrop" id="disable-confirm-modal" role="dialog" aria-modal="true" aria-labelledby="disable-confirm-title">
   <div class="modal-card" style="max-width: 520px;">
     <h3 id="disable-confirm-title">Disable plugin?</h3>
@@ -933,11 +891,12 @@ async function openDetails(id, name) {
       // admin who never touched the toggle otherwise has no way to learn a
       // deprecated-upstream plugin got re-hidden on the last sync (see
       // src/marketplace.py's deprecated-plugin sync step).
+      // One pill, one axis. An AUTOMATIC pill used to sit beside this one
+      // for `is_system`; distribution is not this page's subject any more, so
+      // stating it here would be repeating Access's answer without owning it.
       const sysPill = isDisabled
-        ? `<span class="plugin-disabled-pill" title="Admin-disabled — hidden from every user across all served surfaces. If the marketplace's metadata marks this plugin deprecated, sync re-disables it automatically on every run.">DISABLED</span>`
-        : (p.is_system
-          ? `<span class="plugin-system-pill" title="Mandatory for every user — managed below">SYSTEM</span>`
-          : "");
+        ? `<span class="plugin-disabled-pill" title="Admin-disabled — hidden from every user across all served surfaces, including anyone granted it on Access. If the marketplace's metadata marks this plugin deprecated, sync re-disables it automatically on every run.">DISABLED</span>`
+        : "";
       // Curator-side lifecycle: marketplace-metadata.json marks the plugin
       // deprecated. Sync auto-disables it; the pill explains WHY it is (or
       // keeps becoming) disabled, incl. the curator's note + replacement.
@@ -949,184 +908,95 @@ async function openDetails(id, name) {
       const depPill = p.deprecated === true
         ? `<span class="plugin-disabled-pill" title="${esc(depTitle)}">DEPRECATED</span>`
         : "";
-      const sysBtnLabel = p.is_system ? "Unmark system" : "Mark as system";
-      // #1956 item 14a: every branch now restates what "system" fundamentally
-      // means (mandatory for every user), not just the next click's specific
-      // side effect — "Unmark system" previously explained only the unmark
-      // consequence, never the concept itself.
-      const sysBtnTitle = isDisabled
-        ? "System means mandatory for every user. Plugin is disabled, so it can't be marked as system — re-enable it first."
-        : (p.is_system
-          ? "System means mandatory for every user. Unmark removes that going forward, but existing per-group grants and per-user subscriptions remain — admin can clean them up on each group's Access tab."
-          : "Mark as system to make this plugin mandatory for every user: adds an RBAC grant for every group and a subscription for every user.");
-      // Shield icon on both states — it's the semantic anchor for
-      // "org policy / system" and dropping it on unmark broke visual
-      // parity between the two toggle states.
-      const sysBtnIcon =
-        `<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-              stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-           <path d="M12 2 4 6v6c0 5 3.4 9.5 8 10 4.6-.5 8-5 8-10V6l-8-4z"/>
-         </svg>`;
-      // #1956 item 14a: a small always-visible help affordance beside the
-      // system control — a bare `title` on the button text was already there
-      // and was evidently not discoverable enough (this is exactly what
-      // #1913's reporter misread). This one carries a constant explanation of
-      // the *concept*, independent of is_system/admin_disabled, so it reads
-      // the same in every state.
-      const sysHelpIcon =
+      // ONE state along one axis, and one flag holds it.
+      const reach = isDisabled ? "off" : "available";
+      // No literal double quotes — esc() round-trips through textContent /
+      // innerHTML, which escapes &/</> but not ", so one would break out of
+      // the surrounding title="…" attribute.
+      const reachHelpText =
+        "Whether this plugin exists on this instance. Off: hidden everywhere, even from groups granted it on Access. Available: it can be granted, and the groups granted it get it. Off is also set by the nightly sync when the marketplace marks a plugin deprecated. Who gets an available plugin is decided on Access.";
+      const autoHelpIcon =
         `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor"
               stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
            <circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="11.5"/><line x1="12" y1="8" x2="12" y2="8"/>
          </svg>`;
-      // No literal double quotes here — esc() round-trips through
-      // textContent/innerHTML, which (correctly, per the HTML text-node
-      // serialization algorithm) escapes &/</> but not ", so a literal "
-      // would break out of the surrounding title="…" attribute.
-      const sysHelpText =
-        "System marks a plugin mandatory for every user: it grants every existing group, subscribes every existing user, and new users/groups inherit it automatically from then on. Users can't remove it themselves. Unmarking stops that going forward but does not undo grants or subscriptions already made — clean those up on each group's Access tab.";
       return `<div class="plugin-item">
         <div class="plugin-item-head">
           <span class="plugin-name">${esc(p.name)}</span>${ver}${src}${sysPill}${depPill}
           <span class="spacer"></span>
           <span class="plugin-controls">
-            <label class="plugin-enabled-toggle" title="${esc(isDisabled
-                ? "Hidden from every served surface for all users. Toggle on to make it available again."
-                : "Available to users with a grant. Toggle off to admin-disable it instance-wide — hides it from every served surface for all users.")}">
-              <span class="toggle-label">Enabled</span>
-              <span class="toggle">
-                <input type="checkbox"
-                       data-action="toggle-disabled"
-                       data-marketplace="${esc(id)}"
-                       data-plugin="${esc(p.name)}"
-                       data-admin-disabled="${isDisabled ? "1" : "0"}"
-                       ${isDisabled ? "" : "checked"}>
-                <span class="toggle-slider"></span>
-              </span>
-            </label>
-            <span class="plugin-system-control">
-              <button class="plugin-system-btn ${p.is_system ? "is-system" : ""} ${isDisabled ? "is-locked" : ""}"
-                      data-action="toggle-system"
-                      data-marketplace="${esc(id)}"
-                      data-plugin="${esc(p.name)}"
-                      data-is-system="${p.is_system ? "1" : "0"}"
-                      ${isDisabled ? "disabled" : ""}
-                      title="${esc(sysBtnTitle)}">${sysBtnIcon}${esc(sysBtnLabel)}</button>
-              <span class="plugin-help-icon" tabindex="0" role="img"
-                    aria-label="What does marking a plugin as system do?"
-                    title="${esc(sysHelpText)}">${sysHelpIcon}</span>
+            <span class="plugin-reach" role="group" aria-label="Is this plugin available here">
+              <button type="button" class="plugin-reach__btn ${reach === "off" ? "is-active" : ""}"
+                      data-action="set-reach" data-reach="off"
+                      data-marketplace="${esc(id)}" data-plugin="${esc(p.name)}"
+                      data-current="${reach}"
+                      aria-pressed="${reach === "off"}"
+                      title="Hidden everywhere, even from groups granted it on Access.">Off</button>
+              <button type="button" class="plugin-reach__btn ${reach === "available" ? "is-active" : ""}"
+                      data-action="set-reach" data-reach="available"
+                      data-marketplace="${esc(id)}" data-plugin="${esc(p.name)}"
+                      data-current="${reach}"
+                      aria-pressed="${reach === "available"}"
+                      title="It exists here and can be granted on Access. The groups granted it get it.">Available</button>
             </span>
+            <span class="plugin-help-icon" tabindex="0" role="img"
+                  aria-label="What do Off and Available mean?"
+                  title="${esc(reachHelpText)}">${autoHelpIcon}</span>
           </span>
         </div>${desc}${metaHtml}
       </div>`;
     }).join("");
-    body.querySelectorAll('[data-action="toggle-system"]').forEach(btn =>
-      btn.addEventListener("click", () => toggleSystem(btn, id, name)));
-    body.querySelectorAll('[data-action="toggle-disabled"]').forEach(el =>
-      el.addEventListener("change", () => toggleDisabled(el, id, name)));
+    // Buttons, so nothing moves until the server agrees: a confirm modal can
+    // be dismissed three ways (Cancel, backdrop, Escape) and only one runs our
+    // code, so an optimistically-moved switch would be left lying by the other
+    // two. The re-fetch after a successful call is what repaints the control.
+    body.querySelectorAll('[data-action="set-reach"]').forEach(btn =>
+      btn.addEventListener("click", () => setReach(btn, id, name)));
   } catch (e) {
     body.innerHTML = `<div class="empty" style="color:var(--ds-accent-danger-ink);">Failed to load plugins: ${esc(e.message)}</div>`;
   }
 }
 
-function toggleSystem(btn, marketplaceId, marketplaceName) {
-  // Two-step: render a populated confirm modal, then on OK perform the
-  // PUT/DELETE. The native confirm() lost the operator's eye in a tiny
-  // OS popup that didn't make the fanout consequences obvious.
-  const pluginName = btn.dataset.plugin;
-  const isSystem = btn.dataset.isSystem === "1";
-  const titleEl = document.getElementById("system-confirm-title");
-  const pluginEl = document.getElementById("system-confirm-plugin");
-  const bodyEl = document.getElementById("system-confirm-body");
-  const okBtn = document.getElementById("system-confirm-ok-btn");
+/* One entry point for the two positions. Both are the same call — the
+   disable/enable endpoint — so this is a thin adapter rather than a router.
 
-  if (isSystem) {
-    titleEl.textContent = "Unmark system plugin?";
-    pluginEl.textContent = pluginName;
-    bodyEl.innerHTML = `
-      <p style="margin: 0 0 10px;">This removes the <strong>system</strong> flag.
-        The plugin is no longer required.</p>
-      <ul style="margin: 0; padding-left: 20px;">
-        <li>Existing per-group RBAC grants <strong>stay</strong>.</li>
-        <li>Existing per-user subscriptions <strong>stay</strong>.</li>
-        <li>Operators can revoke either via a group's <a href="/admin/access" style="color: var(--ds-primary, #6366f1);">Access workspace</a> or by uninstalling on each user's stack.</li>
-      </ul>`;
-    okBtn.textContent = "Unmark system";
-    okBtn.classList.remove("btn-danger");
-    okBtn.classList.add("btn-primary");
-  } else {
-    titleEl.textContent = "Mark as system plugin?";
-    pluginEl.textContent = pluginName;
-    bodyEl.innerHTML = `
-      <p style="margin: 0 0 10px;">After confirming, <strong>every Agnes user</strong> will
-        receive this plugin as <strong>required</strong>:</p>
-      <ul style="margin: 0 0 10px; padding-left: 20px;">
-        <li>RBAC grants are added for <strong>every existing group</strong>.</li>
-        <li>Subscriptions are created for <strong>every existing user</strong>.</li>
-        <li>Every <strong>new user</strong> and <strong>new group</strong> inherits it automatically.</li>
-        <li>Users see it as <strong>Automatic</strong> — in their stack with no way to uninstall it.</li>
-        <li>Admins cannot revoke it from a group's Access tab while the system flag is on.</li>
-      </ul>
-      <p style="margin: 0; font-size: 12px; color: var(--text-secondary, #6b7280);">
-        Unmarking later does not auto-clean the materialized grants — they stay until manually removed.
-      </p>`;
-    okBtn.textContent = "Mark as system";
-    okBtn.classList.remove("btn-primary");
-    okBtn.classList.add("btn-danger");
-  }
-
-  // Single assignment (NOT addEventListener) so re-opening for a different
-  // plugin REPLACES any prior handler instead of stacking. Robust to every
-  // close path — Cancel button, backdrop click, Escape: a dismissed modal
-  // leaves a handler that can't fire until the modal is reopened, and
-  // reopening overwrites it. (addEventListener stacked listeners, and the
-  // backdrop/Escape close paths skipped cleanup, so a cancelled confirm could
-  // later fire on a different plugin.)
-  okBtn.onclick = async () => {
-    okBtn.onclick = null;
-    closeModal("system-confirm-modal");
-    await performToggleSystem(btn, marketplaceId, marketplaceName, isSystem);
+   It used to dispatch three positions across two endpoints, including a
+   two-call Off-to-Everyone transition with a confirm of its own. Those went
+   with `is_system`: `toggleSystem`, `performToggleSystem` and
+   `confirmReachFromOff` are gone, and giving a plugin to everyone is now a
+   grant written on /admin/access like any other. */
+function setReach(btn, marketplaceId, marketplaceName) {
+  const target = btn.dataset.reach;
+  const current = btn.dataset.current;
+  if (target === current) return;   // already there; nothing to confirm
+  // The confirm flow was written against the old switch and reads its state
+  // off the element. Hand it a stand-in carrying the same dataset, so the
+  // transition reuses the existing, already-reviewed copy and network path.
+  const shim = {
+    dataset: {
+      plugin: btn.dataset.plugin,
+      adminDisabled: current === "off" ? "1" : "0",
+    },
+    set disabled(v) { setReachBusy(btn, v); },
+    get disabled() { return false; },
+    set checked(_v) {},
+    get checked() { return false; },
   };
-
-  openModal("system-confirm-modal");
+  return toggleDisabled(shim, marketplaceId, marketplaceName);
 }
 
-async function performToggleSystem(btn, marketplaceId, marketplaceName, isSystem) {
-  const pluginName = btn.dataset.plugin;
-  const method = isSystem ? "DELETE" : "POST";
-  btn.disabled = true;
-  const prevHtml = btn.innerHTML;
-  btn.textContent = "Working…";
-  try {
-    const url = `${API}/${encodeURIComponent(marketplaceId)}/plugins/${encodeURIComponent(pluginName)}/system`;
-    const r = await fetch(url, { method, credentials: "include" });
-    if (!r.ok) {
-      const err = await r.json().catch(() => ({}));
-      toast(`Toggle failed: ${err.detail || r.status}`, "error");
-      btn.disabled = false;
-      btn.innerHTML = prevHtml;
-      return;
-    }
-    if (!isSystem) {
-      const result = await r.json();
-      toast(`Marked ${pluginName} as system (${result.affected_groups} groups, ${result.affected_users} users)`, "success");
-    } else {
-      toast(`Unmarked ${pluginName} from system`, "success");
-    }
-    // Reload the modal so the pill + button label refresh from a fresh fetch.
-    openDetails(marketplaceId, marketplaceName);
-  } catch (e) {
-    toast(`Network error: ${e.message}`, "error");
-    btn.disabled = false;
-    btn.innerHTML = prevHtml;
-  }
+function setReachBusy(btn, busy) {
+  const group = btn.closest(".plugin-reach");
+  if (!group) return;
+  group.querySelectorAll(".plugin-reach__btn").forEach(b => { b.disabled = !!busy; });
 }
 
 // ── Disable / enable plugin (v78) ──
 function toggleDisabled(el, marketplaceId, marketplaceName) {
-  // Mirrors toggleSystem: render a populated confirm modal, then on OK
-  // perform the disable/enable POST. The checkbox state is reverted up-front
-  // and only persisted by the re-fetch in performToggleDisabled, so a
-  // cancelled confirm leaves the switch matching server state.
+  // Render a populated confirm modal, then on OK perform the disable/enable
+  // POST. The control's state is reverted up-front and only persisted by the
+  // re-fetch in performToggleDisabled, so a cancelled confirm leaves it
+  // matching server state.
   const pluginName = el.dataset.plugin;
   const isDisabled = el.dataset.adminDisabled === "1";
   const titleEl = document.getElementById("disable-confirm-title");
@@ -1145,9 +1015,9 @@ function toggleDisabled(el, marketplaceId, marketplaceName) {
     bodyEl.innerHTML = `
       <p style="margin: 0 0 10px;">This re-enables the plugin instance-wide.</p>
       <ul style="margin: 0; padding-left: 20px;">
-        <li>It returns to the served feed (RBAC) for every user holding a grant.</li>
+        <li>It returns to the served feed (RBAC) for everyone holding a grant.</li>
         <li>It reappears on the marketplace page, my-stack, and the synthetic served marketplace.</li>
-        <li>The <strong>system flag is NOT restored</strong> — if it should be mandatory again, re-mark it as system.</li>
+        <li>Grants are exactly as they were — disabling never touched them, so nothing has to be re-granted.</li>
       </ul>`;
     okBtn.textContent = "Enable plugin";
     okBtn.classList.remove("btn-danger");
@@ -1165,8 +1035,9 @@ function toggleDisabled(el, marketplaceId, marketplaceName) {
         <li>It is removed from the synthetic served marketplace.</li>
       </ul>
       <p style="margin: 0 0 10px; font-size: 12px; color: var(--text-secondary, #6b7280);">
-        If this plugin is marked as <strong>system</strong>, disabling also clears the system flag.
-        Re-enabling later does not restore it.
+        Grants are left alone, including one that reaches everyone — this hides
+        the plugin, it does not un-grant it. Turning it back on restores exactly
+        the reach it had.
       </p>
       <label style="display: flex; align-items: flex-start; gap: 8px; cursor: pointer; font-size: 13px;">
         <input type="checkbox" id="disable-revoke-grants" style="margin-top: 2px;">

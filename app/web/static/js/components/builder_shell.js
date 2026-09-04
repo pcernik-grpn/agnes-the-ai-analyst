@@ -351,10 +351,15 @@
             '<div><h3>' + esc(o.title) + '</h3><p class="sub">' + esc(o.sub) + '</p></div>' +
             '<button type="button" class="ag-pick-x" data-ag-pick-close aria-label="Close">✕</button>' +
           '</div>' +
-          toolbar({
-            key: o.key, placeholder: o.searchPlaceholder, shown: o.shown, total: o.total,
-            value: o.query, after: o.toolbarExtra,
-          }) +
+          /* `bar` replaces the shell's own search+count with a caller-built
+             one. The package builder's table picker browses a REGISTRY —
+             hundreds of rows across several sources — so it drives the
+             product's shared filter toolbar (filter_toolbar.js: search,
+             Filter menu, chips, sort) rather than a substring box. Every
+             other picker passes nothing and renders exactly as before. */
+          (o.bar || toolbar({ key: o.key, placeholder: o.searchPlaceholder,
+                              shown: o.shown, total: o.total, value: o.query,
+                              after: o.toolbarExtra })) +
           (o.controls || '') +
           '<div class="ag-pick-rows ag-rows" data-rows="' + esc(o.key) + '">' + (o.rows || '') + '</div>' +
           '<div class="ag-note">' + (o.foot || '') + '</div>' +
