@@ -2464,7 +2464,6 @@ def test_the_add_project_wizard_reuses_its_connection_on_retry():
     import subprocess
     import tempfile
 
-    page = pathlib.
     src = _ds_page_source.page_source()
 
     assert "if (_wizardConnId) {" in src, "the wizard does not reuse the connection it already created"
