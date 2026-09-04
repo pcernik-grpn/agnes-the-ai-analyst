@@ -138,6 +138,54 @@
     // outcomes the reader acknowledges and moves on from. Anything the reader
     // has to act on (a validation failure naming a field) belongs on the page,
     // next to the thing that has to change, not in a strip that times out.
+    // ── the shared inline-status element ────────────────────────────────
+    // One builder for every surface that says "this happened": the global
+    // toast below, chat's transcript notes, and the upload dialogs' error
+    // slots. Lives here rather than in a module because app.js loads on every
+    // page as a classic script, so both a module (chat.js) and inline page
+    // scripts can reach it — the same reason window.appToast and
+    // window.confirmModal live here.
+    //
+    // Tone is carried by the glyph alone; see the `.notice` block in
+    // style-custom.css for why the surface no longer changes colour.
+    var NOTICE_GLYPHS = {
+        // A clock: come back in a moment. The default for anything transient.
+        wait: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 1.8"/></svg>',
+        // A triangle: we failed. The only tone that spends a colour.
+        error: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4 2.7 20h18.6z"/><path d="M12 10v4"/><path d="M12 17.2h.01"/></svg>',
+        info: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 11v5"/><path d="M12 7.8h.01"/></svg>',
+        ok: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M8.2 12.4l2.6 2.6 5-5.4"/></svg>',
+    };
+    // Kinds callers already pass, mapped onto the four glyphs above.
+    var NOTICE_GLYPH_FOR = { warn: "wait", wait: "wait", error: "error", ok: "ok", success: "ok", info: "info" };
+
+    /**
+     * Build a .notice element. `placement` is "inline" (in the content) or
+     * "floating" (over it). Returns the element; the caller decides where it
+     * goes and whether it auto-dismisses.
+     */
+    function agnesNotice(text, kind, opts) {
+        opts = opts || {};
+        var k = NOTICE_GLYPH_FOR[kind] ? kind : "info";
+        var glyph = NOTICE_GLYPHS[NOTICE_GLYPH_FOR[k]];
+        var el = document.createElement("div");
+        el.className = "notice notice--" + (opts.placement === "floating" ? "floating" : "inline") + " is-" + k;
+        if (opts.extraClass) el.className += " " + opts.extraClass;
+        var icon = document.createElement("span");
+        icon.className = "notice__icon";
+        icon.setAttribute("aria-hidden", "true");
+        // Static, author-controlled markup from the table above — never
+        // caller text, which goes through textContent below.
+        icon.innerHTML = glyph;
+        el.appendChild(icon);
+        var msg = document.createElement("span");
+        msg.className = "notice__msg";
+        msg.textContent = String(text == null ? "" : text);
+        el.appendChild(msg);
+        return el;
+    }
+    window.agnesNotice = agnesNotice;
+
     var TOAST_MAX = 4;   // a repeated action must not paper over the page
     function ensureToastContainer() {
         var c = document.getElementById("appToastContainer");
@@ -161,12 +209,11 @@
         var msg = String(opts.msg || "");
         var timeout = opts.timeout == null ? 4000 : opts.timeout;
 
-        var el = document.createElement("div");
-        el.className = "toast is-" + kind;
-        var text = document.createElement("span");
-        text.className = "toast-msg";
-        text.textContent = msg;
-        el.appendChild(text);
+        // Composes the shared .notice (icon + message) and keeps the .toast
+        // hooks the container's positioning and the existing guards use.
+        var el = agnesNotice(msg, kind, { placement: "floating", extraClass: "toast" });
+        el.querySelector(".notice__msg").classList.add("toast-msg");
+        var text = el.querySelector(".toast-msg");
         // A real dismiss control: click-anywhere stays, but an affordance that
         // only exists as `cursor: pointer` is invisible to anyone not already
         // hovering it — and unreachable by keyboard.

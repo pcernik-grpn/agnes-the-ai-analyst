@@ -1,6 +1,16 @@
-{% extends "base_admin.html" %}
+{% extends "base_admin_page.html" %}
 
 {% block title %}Store lint — {{ instance_brand or 'Agnes' }}{% endblock %}
+
+{# The hero the rest of admin opens on. The <h1> + lead paragraph this
+   replaces said the same two things in page-local markup, one of them with an
+   inline `style=` colour — so the page named itself in a different voice and a
+   different size from every neighbour. `page_hero_plain` matches Prompts and
+   Submissions rather than the gradient variant. #}
+{% set page_hero_eyebrow = "Content" %}
+{% set page_hero_title = "Store lint" %}
+{% set page_hero_plain = True %}
+{% set page_hero_subtitle = "Advisory craft findings across published skills. Findings never block publication — they flag bloat, weak triggers, and likely duplicates for authors and curators." %}
 
 {% block head_extra %}
 <style>
@@ -35,23 +45,38 @@
   .lint-msg { font-size: var(--text-sm); color: var(--ds-text-primary); margin: 2px 0; }
   .lint-doc { font-size: var(--text-xs); }
   .lint-empty { color: var(--ds-text-muted); padding: var(--space-6); text-align: center; }
+  .lint-back {
+    display: inline-block; margin-bottom: var(--space-3);
+    font-size: var(--text-sm); color: var(--ds-text-secondary); text-decoration: none;
+  }
+  .lint-back:hover { color: var(--ds-text-primary); }
 </style>
 {% endblock %}
 
-{% block admin_content %}
-<div class="container">
-  <h1>Store lint</h1>
-  <p style="color: var(--ds-text-secondary);">Advisory craft findings across published skills. Findings never block publication — they flag bloat, weak triggers, and likely duplicates for authors and curators.</p>
+{# The way back, above the heading. This page has no sidebar row
+   (ADMIN_NAV_OFFNAV) and is reached from the Submissions toolbar, so without
+   this link the only exits are the browser's Back button and the rail — a dead
+   end for anyone who arrived by URL or bookmark. Points at the door it is
+   reached FROM, so the trip is reversible. #}
+{% block page_prehead %}
+<a class="lint-back" href="/admin/store/submissions">&larr; Submissions</a>
+{% endblock %}
 
-  <div class="lint-toolbar">
+{# The page's two controls belong in the toolbar slot, where every other admin
+   page carries its actions — not in a page-local row under the lead text. #}
+{% block toolbar %}
+<div class="lint-toolbar">
     <button class="btn btn-primary" id="lint-audit" type="button">Audit now</button>
     <a class="btn btn-secondary" href="?include_dismissed={{ 'false' if include_dismissed else 'true' }}">
       {% if include_dismissed %}Hide dismissed{% else %}Show dismissed{% endif %}
     </a>
-    <span class="lint-runline">
-      {% if last_run %}Last run: {{ last_run.trigger }} · {{ last_run.entities_linted }} linted · {{ last_run.findings_count }} findings{% else %}No audit has run yet.{% endif %}
-    </span>
-  </div>
+  <span class="lint-runline">
+    {% if last_run %}Last run: {{ last_run.trigger }} · {{ last_run.entities_linted }} linted · {{ last_run.findings_count }} findings{% else %}No audit has run yet.{% endif %}
+  </span>
+</div>
+{% endblock %}
+
+{% block page %}
 
   <div class="lint-list" id="lint-list">
     {% for group in groups %}
@@ -79,7 +104,6 @@
     <div class="lint-empty">No advisory findings. Run an audit to check the current store.</div>
     {% endfor %}
   </div>
-</div>
 {% endblock %}
 
 {% block scripts %}

@@ -603,10 +603,25 @@ class TestTheChatWindowSaysWhoYouAreTalkingTo:
 
     def test_the_cap_failure_says_whose_problem_it_is(self):
         """"Could not start a chat with that agent" blamed the agent for a slot
-        the reader is holding themselves."""
+        the reader is holding themselves.
+
+        Asserted on the branch and what it names, not on one exact sentence:
+        the copy is now selected by the server's ``concurrency_cap`` code
+        rather than by spotting "429" in a status line (an upstream model
+        quota answers 429 too, and deleting conversations does nothing about
+        that one).
+        """
         js = self._js()
         assert "function _agentStartMessage" in js
-        assert "Too many conversations open" in js
+        body = js[js.index("function _agentStartMessage") :][:1400]
+        assert 'code === "concurrency_cap"' in body, "the cap branch no longer keys on the server's code"
+        cap_copy = body[body.index('code === "concurrency_cap"') :]
+        # The sentence itself lives in chat_errors.js's SAY, shared with the
+        # upload dialogs and the transcript — this branch must REFERENCE it,
+        # not restate it. The cap once had three different wordings across
+        # those three call sites, one naming a "close" control that does not
+        # exist; tests/test_chat_upstream_rate_limit_copy.py pins the wording.
+        assert "SAY.conversationCap" in cap_copy[:200], cap_copy[:400]
 
     def test_an_agents_chat_withholds_the_instance_suggestions(self):
         """The suggested questions are computed from what this DEPLOYMENT holds

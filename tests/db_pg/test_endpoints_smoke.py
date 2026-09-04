@@ -376,6 +376,41 @@ class TestUsersSmoke:
 
 
 # ---------------------------------------------------------------------------
+# Service accounts (issue #1534) — PG-only (A3 ratchet).
+# ---------------------------------------------------------------------------
+
+
+class TestServiceAccountsSmoke:
+    COVERED_ROUTES = {
+        "POST /api/admin/service-accounts",
+        "GET /api/admin/service-accounts",
+        "POST /api/admin/service-accounts/{service_account_id}/tokens",
+        "PATCH /api/admin/service-accounts/{service_account_id}",
+    }
+
+    def test_create_and_list(self, seeded_app_both):
+        r = seeded_app_both["client"].post(
+            "/api/admin/service-accounts",
+            json={"name": "Smoke Bot", "slug": "smoke-bot"},
+            headers=_admin_headers(seeded_app_both),
+        )
+        assert r.status_code in (201, 501)
+
+        r2 = seeded_app_both["client"].get("/api/admin/service-accounts", headers=_admin_headers(seeded_app_both))
+        assert r2.status_code in (200, 501)
+
+    def test_mint_and_lifecycle_update_are_reachable(self, seeded_app_both):
+        """Path-param routes: 404 (no such account) on Postgres, 501
+        (RequiresPostgresBackend) on DuckDB — never a raw 500 either way."""
+        client = seeded_app_both["client"]
+        headers = _admin_headers(seeded_app_both)
+        r = client.post("/api/admin/service-accounts/does-not-exist/tokens", json={"name": "x"}, headers=headers)
+        assert r.status_code in (404, 501), r.status_code
+        r = client.patch("/api/admin/service-accounts/does-not-exist", json={"active": False}, headers=headers)
+        assert r.status_code in (404, 501), r.status_code
+
+
+# ---------------------------------------------------------------------------
 # RBAC (groups + grants + access-overview)
 # ---------------------------------------------------------------------------
 
@@ -2737,7 +2772,7 @@ KNOWN_UNTESTED = {
     # Agent builder (rail-layout WIP surface) — rendering covered by
     # tests/test_ui_layout_theme.py::TestRailOptIn.
     "GET /agents",
-    # Personal artefacts page (rail-layout IA) — rendering covered by
+    # Personal artifacts page (rail-layout IA) — rendering covered by
     # tests/test_ui_layout_theme.py::TestRailOptIn.
     "GET /artefacts",
     # Knowledge-search chat landing (#896) — rendering covered by
@@ -3135,10 +3170,10 @@ KNOWN_UNTESTED = {
     "DELETE /api/chat/sessions/{chat_id}/permanent",
     # Session-workspace file delivery (#1611) — owner-scoped reads over the
     # caller's own session dir plus the save-to-Library bridge. No new repo
-    # methods/migration (ownership rides chat_repo.get_session, the artefact
+    # methods/migration (ownership rides chat_repo.get_session, the artifact
     # path reuses create_single_file_artefact — both already parity-proven);
     # behaviour (ownership 404s, traversal/symlink containment, download
-    # headers, artefact creation) covered in tests/test_chat_session_files.py.
+    # headers, artifact creation) covered in tests/test_chat_session_files.py.
     # The preview pair joins them on the same grounds: `…/preview` reads the
     # caller's own session file and describes it, `…/raw` streams the closed
     # image/PDF allowlist inline for the modal to draw — same ownership and
@@ -3285,7 +3320,7 @@ KNOWN_UNTESTED = {
     # component in page mode. No PG-specific behaviour of its own; the
     # package writes it performs are the /api/admin/data-packages routes.
     "GET /admin/data-packages/new",
-    # Add artefacts to My Stack — covered by tests/test_web_stack_artefacts.py
+    # Add artifacts to My Stack — covered by tests/test_web_stack_artefacts.py
     # (DuckDB) + tests/test_cli_api_parity.py (add/remove parity); no
     # dedicated PG smoke class yet, same convention as the stack rows above.
     "DELETE /api/stack/artefacts/{corpus_id}",

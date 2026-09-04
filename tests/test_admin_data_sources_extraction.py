@@ -14,6 +14,8 @@ no Stop control while the crawl has no cancel flag.
 
 from __future__ import annotations
 
+from tests import _ds_page_source
+
 import json
 import re
 import subprocess
@@ -81,7 +83,7 @@ _SIGNATURES = (
 
 
 def _run_js(body: str, *, state: dict | None = None) -> dict:
-    tpl = TEMPLATE.read_text(encoding="utf-8")
+    tpl = _ds_page_source.page_source()
     fns = "\n".join(_extract_block(tpl, sig) for sig in _SIGNATURES)
     script = f"""
 const EXT_MAX_FAILURES = 3;
@@ -149,7 +151,7 @@ class TestCardAnchors:
     be rendered entirely by its own script with no load-order coupling."""
 
     def test_template_carries_the_three_anchors(self):
-        tpl = TEMPLATE.read_text(encoding="utf-8")
+        tpl = _ds_page_source.page_source()
         assert 'id="ext-crawl-live-${row.id}"' in tpl
         assert 'id="ext-block-${row.id}" data-ext-conn="${row.id}"' in tpl
         assert 'id="ext-drawer-${row.id}"' in tpl
@@ -785,7 +787,7 @@ class TestStopReasonVocabularyAgrees:
 
     @staticmethod
     def _js_reason_keys() -> set:
-        block = _extract_block(TEMPLATE.read_text(encoding="utf-8"), "const EXT_STOP_REASON_TEXT = {")
+        block = _extract_block(_ds_page_source.page_source(), "const EXT_STOP_REASON_TEXT = {")
         return set(re.findall(r"^\s*([a-z_]+):", block, re.M))
 
     def test_every_resumable_reason_has_a_human_phrase(self):
@@ -917,7 +919,7 @@ def _run_schedule_js(body: str) -> dict:
     Cards on this page arrive over fetch, so the harness starts with none —
     which is exactly the state the script self-starts against in a browser.
     """
-    tpl = TEMPLATE.read_text(encoding="utf-8")
+    tpl = _ds_page_source.page_source()
     fns = "\n".join(_extract_block(tpl, sig) for sig in _SCHEDULE_SIGNATURES)
     script = f"""
 const EXT_POLL_ACTIVE_MS = 3000;
@@ -1040,7 +1042,7 @@ class TestPollFollowsTheCards:
         assert out["repainted"] == ["sp1"], out
 
     def test_the_paint_hook_is_called_from_every_card_paint(self):
-        tpl = TEMPLATE.read_text(encoding="utf-8")
+        tpl = _ds_page_source.page_source()
         # Guarded by `typeof`: the hook lives in a later script block than the
         # renderers that call it, and the parser may run a fetch continuation
         # between the two.
