@@ -292,8 +292,7 @@ def test_directory_check_watches_the_same_marker_dir_the_watchdog_writes():
 
 
 def test_postgres_check_is_autodiscovery_on_the_image_and_not_billed_dbm():
-    tpl = (FILES / "postgres.yaml.tpl").read_text()
-    doc = yaml.safe_load(tpl)
+    doc = yaml.safe_load(_render("postgres.yaml.tpl", env="example-project", tags=[]))
     assert doc["ad_identifiers"] == ["postgres"], (
         "one template must cover every postgres side-car; the module does not know how many there are"
     )
@@ -304,14 +303,53 @@ def test_postgres_check_is_autodiscovery_on_the_image_and_not_billed_dbm():
     assert inst["ssl"] == "disable", "loopback-only compose network"
 
 
+def test_postgres_check_carries_the_deployment_identity_on_every_series():
+    """The postgres check attributes everything it emits — `postgresql.*` and
+    `postgres.can_connect` alike — to the hostname it RESOLVES for the
+    instance. Under Autodiscovery that is the side-car's container IP: a
+    phantom host nothing else reports for, which agent-level `env`/host tags
+    never join (spec trap #15, found live). The deployment identity must
+    therefore ride on the instance itself, or every env-scoped pg monitor in
+    the consumer catalogue is permanent no-data."""
+    tags = ["customer:acme", "app:agnes", "service:agnes", "role:prod"]
+    doc = yaml.safe_load(_render("postgres.yaml.tpl", env="example-project", tags=tags))
+    inst = doc["instances"][0]
+    assert inst["tags"][0] == "env:example-project", "env is the one dimension every consumer-side monitor scopes on"
+    for t in tags:
+        assert t in inst["tags"], t
+    # Identity is Terraform's job, the credential stays the role script's: the
+    # placeholder must survive the Terraform render for agnes-datadog-pg-role.sh
+    # to substitute on the host.
+    assert inst["password"] == "@@DD_PG_PASSWORD@@"
+
+
+def test_postgres_template_is_terraform_rendered_from_the_same_tags_as_datadog_yaml():
+    """Two render mechanisms split this file's identity from the agent's —
+    Terraform templated datadog.yaml while the on-host role script owned this
+    template whole — and that split is how the check shipped with no identity
+    tags at all. One mechanism now: Terraform renders identity into BOTH from
+    one tag local; the host script substitutes only the credential."""
+    static_block = MAIN_TF[MAIN_TF.index("datadog_static_files = [") : MAIN_TF.index("datadog_files_b64 =")]
+    assert "postgres.yaml.tpl" not in static_block, (
+        "shipped raw it would collide with the rendered entry in the merge()"
+    )
+    assert '"postgres.yaml.tpl" = base64encode(templatefile(' in MAIN_TF
+    assert MAIN_TF.count("local.datadog_tags[inst.name]") == 2, (
+        "datadog.yaml and the postgres check must share ONE identity tag list"
+    )
+
+
 def test_rendering_the_pg_check_puts_the_password_only_in_the_password_field():
     """agnes-datadog-pg-role.sh renders the template with bash's GLOBAL
     `${rendered//placeholder/$PW}`, so every occurrence of the placeholder
     becomes the real credential — a comment that names the literal token ships
     the password into the rendered file's comments, which is exactly where a
-    `grep -v password` redaction pass does not look before the file is shared."""
+    `grep -v password` redaction pass does not look before the file is shared.
+    The substitution runs on the file the VM actually holds, which is the
+    Terraform-rendered template — so render first, exactly like the boot does."""
     pw = "s3cr3t-rendered-password"
-    rendered = (FILES / "postgres.yaml.tpl").read_text().replace("@@DD_PG_PASSWORD@@", pw)
+    tpl = _render("postgres.yaml.tpl", env="example-project", tags=["customer:acme"])
+    rendered = tpl.replace("@@DD_PG_PASSWORD@@", pw)
     carrying = [line for line in rendered.splitlines() if pw in line]
     assert len(carrying) == 1 and carrying[0].strip().startswith("password:"), (
         f"the rendered check config must carry the password exactly once, in the password: field; got {carrying!r}"
