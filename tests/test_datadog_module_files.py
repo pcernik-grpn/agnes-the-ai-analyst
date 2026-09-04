@@ -121,7 +121,11 @@ def test_the_agent_key_is_granted_as_its_own_secret_and_never_through_dot_env():
     assert "google_secret_manager_secret_iam_member.vm_datadog" in depends
     # The secret NAME may be forwarded to the template; the VALUE may not be
     # resolved in Terraform at all.
-    assert "datadog_api_key_secret       = var.datadog_api_key_secret" in MAIN_TF
+    # Whitespace-tolerant: `terraform fmt` re-aligns the whole assignment
+    # block whenever a longer key joins it, so an exact-spacing assertion
+    # fails on an unrelated addition rather than on the thing it guards —
+    # that the secret NAME is forwarded and the value never resolved.
+    assert re.search(r"datadog_api_key_secret\s+= var\.datadog_api_key_secret", MAIN_TF)
     assert "google_secret_manager_secret_version.datadog" not in MAIN_TF
     assert 'data "google_secret_manager_secret_version"' not in MAIN_TF
 
@@ -161,7 +165,7 @@ def test_the_check_configs_are_rendered_per_instance_not_once_per_module():
     # datadog.yaml carries the instance's own role/name tags and the HTTP+TLS
     # checks its own hostnames, so a flat module-wide map would give a dev VM
     # the prod VM's identity.
-    assert "datadog_files_b64            = local.datadog_files_b64[each.value.name]" in MAIN_TF
+    assert re.search(r"datadog_files_b64\s+= local\.datadog_files_b64\[each\.value\.name\]", MAIN_TF)
     assert "for inst in local.all_instances : inst.name => var.enable_datadog" in MAIN_TF
 
 

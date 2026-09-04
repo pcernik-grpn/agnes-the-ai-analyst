@@ -150,6 +150,39 @@ def _print_agent(row: dict) -> None:
     typer.echo(f"memory_write_mode: {row.get('memory_write_mode')}")
     typer.echo(f"is_default:        {row.get('is_default', False)}")
     typer.echo(f"created_at:        {row.get('created_at')}")
+    _print_policy_disclosure(row)
+
+
+def _print_policy_disclosure(row: dict) -> None:
+    """Design doc §12 — the same shared-agent warning the `/agents` builder
+    page shows, computed server-side for the OWNER and carried on every
+    `/api/v1/agents` response (`policied_tables_in_scope` /
+    `policied_tables`). A Slack channel bound to this agent, or a scheduled
+    run, answers everyone with the OWNER's slice of a policied table —
+    never the person actually asking — so this prints whenever that list is
+    non-empty, regardless of which subcommand got here.
+    """
+    ids = row.get("policied_tables_in_scope") or []
+    if not ids:
+        return
+    typer.echo("")
+    plural = "s" if len(ids) != 1 else ""
+    typer.echo(f"Warning: {len(ids)} table{plural} in this agent's data {'are' if plural else 'is'} filtered by an access policy.")
+    typer.echo(
+        "  A Slack channel bound to this agent, or a scheduled run, answers everyone with the"
+    )
+    typer.echo(
+        "  OWNER's slice of that data — never the person asking. A direct caller (agent-as-API,"
+    )
+    typer.echo("  chat, or a delegated turn) sees its own slice instead.")
+    for t in row.get("policied_tables") or []:
+        p = t.get("policy") or {}
+        rows_visible = p.get("rows_visible")
+        if rows_visible is not None:
+            slice_desc = f"{rows_visible} row(s) visible to the owner"
+        else:
+            slice_desc = p.get("note") or f"reason: {p.get('reason', 'unknown')}"
+        typer.echo(f"    - {t.get('name') or t.get('table_id')}: {slice_desc}")
 
 
 @agent_app.command("list")

@@ -678,3 +678,25 @@ class TestHybridQueryBigQuery:
             engine.register_bq("bad alias!", "SELECT 1")
 
         assert exc_info.value.error_type == "query_error"
+
+
+class TestPolicyUdfReservation:
+    """The access-policy UDFs are registered on the connection this engine
+    executes against, so caller SQL naming them is refused up front."""
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT agnes_hmac('x')",
+            "select AGNES_HMAC(email) from t",
+            "WITH p AS (SELECT main.agnes_hmac('x') AS h) SELECT * FROM p",
+        ],
+    )
+    def test_reserved_function_is_refused(self, sql):
+        with pytest.raises(RemoteQueryError) as exc:
+            _validate_sql(sql)
+        assert exc.value.details["reserved_function"] == "agnes_hmac"
+        assert exc.value.details["reason"] == "policy_udf_reserved"
+
+    def test_plain_select_still_passes(self):
+        _validate_sql("SELECT 1")

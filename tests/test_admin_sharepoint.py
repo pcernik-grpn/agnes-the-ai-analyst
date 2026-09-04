@@ -1111,6 +1111,185 @@ class TestScopeConfirmationIdempotency:
         assert r1.json()["collection_id"] != r2.json()["collection_id"]
 
 
+class TestScopeMinModifiedField:
+    """TCRD-296 gap #80: the "modified since" crawl filter belongs to the
+    scope's own definition (``ConfirmScopeBody.min_modified``), not just the
+    connection's ``PATCH …/extraction/crawl-config`` drawer default. The
+    crawler's own resolution/enforcement is covered end-to-end in
+    ``tests/test_sharepoint_crawler.py`` (``TestScopeMinModifiedFilter``);
+    this class covers the HTTP surface: validation, persistence, and the
+    ``{value, source, own_value}`` projection ``GET …/scopes`` returns."""
+
+    def test_confirming_with_a_min_modified_reports_source_scope(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="mm-conn-1")
+
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={
+                "source_scope_id": "drive:mm1",
+                "display_path": "Site / Docs",
+                "min_modified": "2024-06-01",
+            },
+            headers=_auth(token),
+        )
+        assert r.status_code == 201, r.text
+        assert r.json()["min_modified"] == {"value": "2024-06-01", "source": "scope", "own_value": "2024-06-01"}
+
+    def test_no_min_modified_and_no_connection_default_reports_none(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="mm-conn-2")
+
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "drive:mm2", "display_path": "Site / Docs"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 201, r.text
+        assert r.json()["min_modified"] == {"value": None, "source": "none", "own_value": None}
+
+    def test_a_scope_with_no_own_override_inherits_the_connection_default(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="mm-conn-3")
+
+        cfg = c.patch(
+            f"{BASE}/{conn_id}/extraction/crawl-config",
+            json={"min_modified": "2023-01-01"},
+            headers=_auth(token),
+        )
+        assert cfg.status_code == 200, cfg.text
+
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "drive:mm3", "display_path": "Site / Docs"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 201, r.text
+        assert r.json()["min_modified"] == {"value": "2023-01-01", "source": "connection", "own_value": None}
+
+        listed = c.get(f"{BASE}/{conn_id}/scopes", headers=_auth(token))
+        assert listed.json()["items"][0]["min_modified"] == {
+            "value": "2023-01-01",
+            "source": "connection",
+            "own_value": None,
+        }
+
+    def test_a_scopes_own_override_wins_over_the_connection_default(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="mm-conn-4")
+
+        c.patch(
+            f"{BASE}/{conn_id}/extraction/crawl-config",
+            json={"min_modified": "2020-01-01"},
+            headers=_auth(token),
+        )
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={
+                "source_scope_id": "drive:mm4",
+                "display_path": "Site / Docs",
+                "min_modified": "2024-06-01",
+            },
+            headers=_auth(token),
+        )
+        assert r.json()["min_modified"] == {"value": "2024-06-01", "source": "scope", "own_value": "2024-06-01"}
+
+    def test_an_invalid_min_modified_is_refused_with_400(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="mm-conn-5")
+
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "drive:mm5", "display_path": "Site / Docs", "min_modified": "not-a-date"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 400, r.text
+        assert r.json()["detail"]["error"] == "invalid_min_modified"
+
+    def test_re_confirming_without_min_modified_clears_a_previously_set_override(self, seeded_app):
+        """Same "not omitted-means-unchanged" contract as ``access_mode``/
+        ``anonymize``/``include_excluded_subtrees`` — a re-confirm that omits
+        ``min_modified`` clears the scope's own override back to "inherit
+        the connection default", it does not leave the old value standing."""
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="mm-conn-6")
+
+        first = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "drive:mm6", "display_path": "Site / Docs", "min_modified": "2024-01-01"},
+            headers=_auth(token),
+        )
+        assert first.json()["min_modified"]["own_value"] == "2024-01-01"
+
+        second = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "drive:mm6", "display_path": "Site / Docs"},
+            headers=_auth(token),
+        )
+        assert second.json()["min_modified"] == {"value": None, "source": "none", "own_value": None}
+
+
+class TestBulkAddScopesMinModified:
+    """``BulkScopeBody.min_modified`` — a BULK DEFAULT applied to every
+    scope THIS call creates (TCRD-296 gap #80). See ``TestBulkScopeAdd``
+    below for the rest of this endpoint's coverage."""
+
+    def test_min_modified_is_stored_on_every_created_scope(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        _install_item_resolver(
+            monkeypatch,
+            {"Folder A": _folder_item("item-a", "Folder A"), "Folder B": _folder_item("item-b", "Folder B")},
+        )
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="bulk-mm-conn")
+
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes/bulk",
+            json={"paths": ["Folder A", "Folder B"], "drive_id": "drv1", "min_modified": "2024-03-01"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert len(body["created"]) == 2
+        for entry in body["created"]:
+            assert entry["min_modified"] == {"value": "2024-03-01", "source": "scope", "own_value": "2024-03-01"}
+
+    def test_omitted_min_modified_leaves_each_new_scope_uninherited_at_creation(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        _install_item_resolver(monkeypatch, {"Folder A": _folder_item("item-a", "Folder A")})
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="bulk-mm-conn-2")
+
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes/bulk",
+            json={"paths": ["Folder A"], "drive_id": "drv1"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["created"][0]["min_modified"] == {"value": None, "source": "none", "own_value": None}
+
+    def test_an_invalid_min_modified_is_refused_with_400(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="bulk-mm-conn-3")
+
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes/bulk",
+            json={"paths": ["Folder A"], "drive_id": "drv1", "min_modified": "not-a-date"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 400, r.text
+        assert r.json()["detail"]["error"] == "invalid_min_modified"
+
+
 class TestAnonymizationDeclaredField:
     """The wizard's honest badge state (spec §9.2/§13.2): `anonymize` is the
     admin's checkbox (a wish); `anonymization_declared` is whether the LAST
@@ -2347,6 +2526,43 @@ class TestChangesFeedFailsCleanOnDuckDB:
             headers=_auth(token),
         )
         r = c.get(f"{BASE}/{conn_id}/changes", headers=_auth(token))
+        assert r.status_code == 501
+        assert r.json()["error"] == "requires_postgres_backend"
+
+
+class TestAclSnapshotFailsCleanOnDuckDB:
+    """The ACL-permissions snapshot (`GET .../acl-snapshot`, TCRD-296 gap
+    #79) is PG-only — it reads `sharepoint_connection_state`, which has no
+    DuckDB counterpart (A3 ratchet). The happy path (a real captured
+    snapshot, the connection-wide aggregate, `?scopes=true`, RBAC, audit)
+    lives in tests/db_pg/test_sharepoint_acl_snapshot_pg.py; this suite
+    (the DuckDB-backed default here) only proves the typed 501 — never a
+    raw 500 — regardless of whether the connection has any confirmed
+    scopes yet."""
+
+    @pytest.fixture(autouse=True)
+    def _pin_duckdb_backend(self, duckdb_backend_pinned):
+        """Resolve DuckDB regardless of a `tests/db_pg/` test having run
+        earlier in this worker process (issue #1658)."""
+
+    def test_acl_snapshot_501_on_duckdb_backend_no_scopes(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="acl-snapshot-noscope-conn")
+        r = c.get(f"{BASE}/{conn_id}/acl-snapshot", headers=_auth(token))
+        assert r.status_code == 501
+        assert r.json()["error"] == "requires_postgres_backend"
+
+    def test_acl_snapshot_501_on_duckdb_backend_with_a_confirmed_scope(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="acl-snapshot-scoped-conn")
+        c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "drive:a", "display_path": "A"},
+            headers=_auth(token),
+        )
+        r = c.get(f"{BASE}/{conn_id}/acl-snapshot?scopes=true", headers=_auth(token))
         assert r.status_code == 501
         assert r.json()["error"] == "requires_postgres_backend"
 

@@ -65,11 +65,13 @@ class TestKeboolaExtractorFull:
         """run() with extension produces extract.duckdb that passes contract validation."""
         from connectors.keboola.extractor import run
 
-        def write_pq(conn, tc, pq_path):
+        def write_pq(conn, tc, pq_path, *a, **kw):
             _write_parquet(pq_path, "SELECT 1 AS id, 'Alice' AS name")
 
-        with patch("connectors.keboola.extractor._try_attach_extension", side_effect=_mock_attach), \
-             patch("connectors.keboola.extractor._extract_via_extension", side_effect=write_pq):
+        with (
+            patch("connectors.keboola.extractor._try_attach_extension", side_effect=_mock_attach),
+            patch("connectors.keboola.extractor._extract_via_extension", side_effect=write_pq),
+        ):
             result = run(output_dir, sample_local_configs, "https://kbc.example.com", "token-abc")
 
         assert result["tables_extracted"] == 2
@@ -88,8 +90,10 @@ class TestKeboolaExtractorFull:
         def mock_legacy(tc, pq_path, url, token):
             _write_parquet(pq_path, "SELECT 99 AS value")
 
-        with patch("connectors.keboola.extractor._try_attach_extension", return_value=False), \
-             patch("connectors.keboola.extractor._extract_via_legacy", side_effect=mock_legacy):
+        with (
+            patch("connectors.keboola.extractor._try_attach_extension", return_value=False),
+            patch("connectors.keboola.extractor._extract_via_legacy", side_effect=mock_legacy),
+        ):
             result = run(output_dir, configs, "https://kbc.example.com", "token-abc")
 
         assert result["tables_extracted"] == 1
@@ -106,22 +110,21 @@ class TestKeboolaExtractorFull:
 
         configs = [{"name": "t", "query_mode": "local", "description": "desc"}]
 
-        def write_pq(conn, tc, pq_path):
+        def write_pq(conn, tc, pq_path, *a, **kw):
             _write_parquet(pq_path, "SELECT 1 AS x")
 
-        with patch("connectors.keboola.extractor._try_attach_extension", side_effect=_mock_attach), \
-             patch("connectors.keboola.extractor._extract_via_extension", side_effect=write_pq):
+        with (
+            patch("connectors.keboola.extractor._try_attach_extension", side_effect=_mock_attach),
+            patch("connectors.keboola.extractor._extract_via_extension", side_effect=write_pq),
+        ):
             run(output_dir, configs, "https://kbc.example.com", "token-abc")
 
         conn = duckdb.connect(str(Path(output_dir) / "extract.duckdb"), read_only=True)
         cols = conn.execute(
-            "SELECT column_name FROM information_schema.columns "
-            "WHERE table_name='_meta' ORDER BY ordinal_position"
+            "SELECT column_name FROM information_schema.columns WHERE table_name='_meta' ORDER BY ordinal_position"
         ).fetchall()
         conn.close()
-        assert [c[0] for c in cols] == [
-            "table_name", "description", "rows", "size_bytes", "extracted_at", "query_mode"
-        ]
+        assert [c[0] for c in cols] == ["table_name", "description", "rows", "size_bytes", "extracted_at", "query_mode"]
 
     def test_remote_attach_table_created_for_remote_tables(self, output_dir):
         """_remote_attach table is created when any table has query_mode='remote'."""
@@ -133,13 +136,15 @@ class TestKeboolaExtractorFull:
             conn.execute('CREATE TABLE kbc."in.c-events"."big_table" (id VARCHAR)')
             return True
 
-        configs = [{
-            "name": "big_table",
-            "bucket": "in.c-events",
-            "source_table": "big_table",
-            "query_mode": "remote",
-            "description": "Large remote table",
-        }]
+        configs = [
+            {
+                "name": "big_table",
+                "bucket": "in.c-events",
+                "source_table": "big_table",
+                "query_mode": "remote",
+                "description": "Large remote table",
+            }
+        ]
 
         with patch("connectors.keboola.extractor._try_attach_extension", side_effect=mock_attach_with_schema):
             result = run(output_dir, configs, "https://kbc.example.com", "token-abc")
@@ -165,13 +170,15 @@ class TestKeboolaExtractorFull:
             conn.execute('CREATE TABLE kbc."in.c-big"."events" (id VARCHAR)')
             return True
 
-        configs = [{
-            "name": "events",
-            "bucket": "in.c-big",
-            "source_table": "events",
-            "query_mode": "remote",
-            "description": "",
-        }]
+        configs = [
+            {
+                "name": "events",
+                "bucket": "in.c-big",
+                "source_table": "events",
+                "query_mode": "remote",
+                "description": "",
+            }
+        ]
 
         with patch("connectors.keboola.extractor._try_attach_extension", side_effect=mock_attach_with_schema):
             run(output_dir, configs, "https://kbc.example.com", "token-abc")
@@ -191,7 +198,7 @@ class TestKeboolaExtractorFull:
 
         call_count = [0]
 
-        def failing_first(conn, tc, pq_path):
+        def failing_first(conn, tc, pq_path, *a, **kw):
             call_count[0] += 1
             if call_count[0] == 1:
                 raise RuntimeError("Connection reset")
@@ -209,9 +216,11 @@ class TestKeboolaExtractorFull:
         def legacy_reraise(tc, pq_path, url, token):
             raise RuntimeError("Connection reset")
 
-        with patch("connectors.keboola.extractor._try_attach_extension", side_effect=_mock_attach), \
-             patch("connectors.keboola.extractor._extract_via_extension", side_effect=failing_first), \
-             patch("connectors.keboola.extractor._extract_via_legacy", side_effect=legacy_reraise):
+        with (
+            patch("connectors.keboola.extractor._try_attach_extension", side_effect=_mock_attach),
+            patch("connectors.keboola.extractor._extract_via_extension", side_effect=failing_first),
+            patch("connectors.keboola.extractor._extract_via_legacy", side_effect=legacy_reraise),
+        ):
             result = run(output_dir, sample_local_configs, "https://kbc.example.com", "token-abc")
 
         assert result["tables_extracted"] == 1
@@ -221,20 +230,26 @@ class TestKeboolaExtractorFull:
 
     def test_create_mock_extract_contract(self, extracts_dir):
         """create_mock_extract helper produces contract-compliant extract.duckdb."""
-        db_path = create_mock_extract(extracts_dir, "keboola", [
-            {"name": "orders", "data": [{"id": "1", "amount": "100"}], "query_mode": "local"},
-        ])
+        db_path = create_mock_extract(
+            extracts_dir,
+            "keboola",
+            [
+                {"name": "orders", "data": [{"id": "1", "amount": "100"}], "query_mode": "local"},
+            ],
+        )
         validate_extract_contract(str(db_path))
 
     def test_data_directory_created(self, output_dir, sample_local_configs):
         """data/ subdirectory is created alongside extract.duckdb."""
         from connectors.keboola.extractor import run
 
-        def write_pq(conn, tc, pq_path):
+        def write_pq(conn, tc, pq_path, *a, **kw):
             _write_parquet(pq_path, "SELECT 1 AS id")
 
-        with patch("connectors.keboola.extractor._try_attach_extension", side_effect=_mock_attach), \
-             patch("connectors.keboola.extractor._extract_via_extension", side_effect=write_pq):
+        with (
+            patch("connectors.keboola.extractor._try_attach_extension", side_effect=_mock_attach),
+            patch("connectors.keboola.extractor._extract_via_extension", side_effect=write_pq),
+        ):
             run(output_dir, sample_local_configs, "https://kbc.example.com", "token-abc")
 
         assert (Path(output_dir) / "data").is_dir()

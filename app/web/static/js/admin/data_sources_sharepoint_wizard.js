@@ -55,6 +55,13 @@ let spItems = [];         // current level's tree items
 let spScopes = {};        // source_scope_id -> scope row (server shape, incl. no_group_warning)
 let spGroups = null;      // cached [{id, name}]
 let spPendingGroups = {}; // source_scope_id -> Set(group_id), locally ticked but not yet applied
+// source_scope_id -> ISO date string | "" | undefined — the step-3 "Share &
+// finish" date input's live value (TCRD-296 gap #80), locally edited but not
+// yet applied. `undefined` (never touched this session) falls back to the
+// scope's own last-known `min_modified.own_value` at submit time — see
+// spExistingScopeFields. An explicit `""` means "clear this scope's own
+// override, inherit the connection default" — different from "untouched".
+let spPendingMinModified = {};
 let spTreeFilterQuery = "";   // client-side instant filter (#2) over spItems, reset on navigation
 let spLastSearchMatches = null; // last server-search (#3) result list, or null if none run yet
 // item_id -> true|false|null, accumulated from `?with_permissions=1` tree
@@ -115,6 +122,7 @@ function openSpWizard() {
   spScopes = {};
   spGroups = null;
   spPendingGroups = {};
+  spPendingMinModified = {};
   spTreeFilterQuery = "";
   spLastSearchMatches = null;
   spUniquePerms = {};
@@ -851,6 +859,14 @@ function spExistingScopeFields(scope) {
     include_excluded_subtrees: !!scope.include_excluded_subtrees,
   };
   if (scope.drive_id) out.drive_id = scope.drive_id;
+  // TCRD-296 gap #80: round-trip this scope's OWN `min_modified` override —
+  // NEVER the resolved `value` (`_scope_out`'s `{value, source, own_value}`
+  // shape), which can be inherited from the connection default. Round-
+  // tripping the resolved value would silently turn an inherited default
+  // into a permanent scope-level override the moment an unrelated field
+  // (e.g. the anonymize checkbox) gets re-confirmed.
+  const mm = scope.min_modified;
+  if (mm && mm.own_value) out.min_modified = mm.own_value;
   return out;
 }
 
@@ -1116,11 +1132,39 @@ function spRenderShare(items) {
       const on = pending.has(g.id);
       return `<label><input type="checkbox" data-spw-share-group="${spEsc(s.source_scope_id)}" value="${spEsc(g.id)}"${on ? " checked" : ""}> ${AgnesKindGlyph.groupGlyph()}${spEsc(g.name)}</label>`;
     }).join("") || '<span class="ds-drawer__opt">No groups yet — create one in <a href="/admin/access">Access</a>.</span>';
+    // TCRD-296 gap #80 — this scope's OWN "modified since" crawl filter.
+    // Pre-filled from `own_value` (never the resolved `value`, which may be
+    // inherited from the connection default — see spExistingScopeFields),
+    // unless this session already edited it (spPendingMinModified). The
+    // same `<input type="date">` control the "Crawl filter (default)" panel
+    // on the source card uses for the connection-wide one.
+    const mm = s.min_modified || {};
+    const pendingMm = spPendingMinModified[s.source_scope_id];
+    const mmValue = pendingMm !== undefined ? pendingMm : (mm.own_value || "");
+    const mmHint = mmValue
+      ? "This scope's own filter."
+      : mm.value
+        ? `Inherits the connection default: since ${spEsc(mm.value)}.`
+        : "No filter — every file in this scope is crawled.";
+    const mmHtml = `<div class="sp-share-row__minmod">` +
+      `<label for="spw-share-minmod-${spEsc(s.source_scope_id)}">Crawl filter (this scope)</label>` +
+      `<input type="date" id="spw-share-minmod-${spEsc(s.source_scope_id)}" ` +
+      `title="Crawl only files in this scope modified on or after this date." ` +
+      `data-spw-share-minmod="${spEsc(s.source_scope_id)}" value="${spEsc(mmValue)}">` +
+      `<span class="field-hint" data-spw-share-minmod-hint="${spEsc(s.source_scope_id)}">${mmHint}</span>` +
+      // Same "the delta cursor already moved past older items" caveat the
+      // connection-level "Crawl filter (default)" panel on the source card
+      // shows — widening (or newly narrowing) a scope's OWN filter after it
+      // has already been crawled needs a resync to actually pick up the
+      // now-in-scope older files.
+      `<span class="field-hint">Widening this date later needs "Re-enumerate from scratch" on the next run — the delta cursor has already moved past older items.</span>` +
+      `</div>`;
     return `<div class="sp-share-row" data-spw-share-row="${spEsc(s.source_scope_id)}">` +
       `<div class="sp-share-row__main">` +
       `<div class="sp-share-row__title">${spEsc(s.display_path)}</div>` +
       `<div class="sp-share-row__badges">${collBadge}${anonBadge}${warn}</div>` +
       `<div class="sp-share-row__groups">${groupsHtml}</div>` +
+      mmHtml +
       `</div></div>`;
   }).join("");
   host.querySelectorAll("[data-spw-share-group]").forEach((cb) => {
@@ -1140,6 +1184,11 @@ function spRenderShare(items) {
       }
     });
   });
+  host.querySelectorAll("[data-spw-share-minmod]").forEach((input) => {
+    input.addEventListener("change", () => {
+      spPendingMinModified[input.dataset.spwShareMinmod] = input.value || "";
+    });
+  });
 }
 
 document.getElementById("spw-finish-btn").addEventListener("click", () => {
@@ -1155,11 +1204,19 @@ document.getElementById("spw-finish-btn").addEventListener("click", () => {
     // re-confirms EVERY scope on the connection in one pass, so without
     // this it silently blanked drive_id (and reverted any mirrored scope
     // to manual) on every single wizard completion, not just an edited row.
+    //
+    // `min_modified` (TCRD-296 gap #80): `spExistingScopeFields` already
+    // round-trips the scope's OWN last-known value — this override wins
+    // ONLY when this session's date input was actually touched (present in
+    // `spPendingMinModified`, `""` meaning "clear it, inherit the default").
+    const pendingMm = spPendingMinModified[id];
+    const minModifiedOverride = pendingMm !== undefined ? { min_modified: pendingMm || null } : {};
     return spApi(`${SP_API}/${encodeURIComponent(spConnId)}/scopes`, {
       method: "POST",
       body: Object.assign(
         { source_scope_id: id, display_path: s.display_path, anonymize: !!s.anonymize, group_ids: groupIds },
-        spExistingScopeFields(s)
+        spExistingScopeFields(s),
+        minModifiedOverride
       ),
     });
   });

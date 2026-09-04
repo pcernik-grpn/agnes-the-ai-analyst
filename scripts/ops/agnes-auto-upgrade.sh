@@ -89,6 +89,10 @@ CHAT_PROVIDER="$(_env_get AGNES_CHAT_PROVIDER)"
 # deploy on this host isn't a 1.3 GB fetch inside the runner's request.
 DATA_APPS_RUNTIME_IMAGE="$(_env_get AGNES_DATA_APPS_RUNTIME_IMAGE)"
 AGNES_IMAGE_REPO="$(_env_get AGNES_IMAGE_REPO)"
+# extraction-worker replica count (TCRD-296 gap #76) — written by
+# startup-script.sh.tpl from the module's `extraction_worker_replicas`.
+# Default 1 when unset (an older release's .env, or the lane disabled).
+EXTRACTION_WORKER_REPLICAS="$(_env_get AGNES_EXTRACTION_WORKER_REPLICAS)"
 export AGNES_TAG STATE_DIR COMPOSE_FILE SCHEDULER_API_TOKEN COMPOSE_PROFILES AGNES_IMAGE_REPO
 
 STATE_DIR="${STATE_DIR:-/data/state}"
@@ -566,6 +570,19 @@ if [ "$APPS_PROFILE_WANTED" = "1" ] && [[ " ${PROFILE_ARGS[*]-} " != *" apps "* 
     PROFILE_ARGS+=( --profile apps )
 fi
 
+# --scale extraction-worker=N (TCRD-296 gap #76): threaded through every
+# BARE `docker compose up -d` below (the ones that recreate the whole
+# resolved stack, not a single named service) so a routine recreate never
+# silently collapses a multi-replica extraction lane back to one container
+# — `up -d` with no `--scale` re-asserts a service's default replica count.
+# Gated on the FINAL, reconciled COMPOSE_FILE (set above) actually carrying
+# the overlay: passing --scale for a service the resolved compose config
+# doesn't define errors "no such service".
+SCALE_ARGS=()
+if [[ ":$COMPOSE_FILE:" == *":docker-compose.extraction.yml:"* ]]; then
+    SCALE_ARGS=( --scale "extraction-worker=${EXTRACTION_WORKER_REPLICAS:-1}" )
+fi
+
 # gcplogs overlay — ships container stdout/stderr to GCP Cloud Logging.
 # Gated on file presence (the file is baked into the image but PLACED only
 # by the GCE deploy layer's startup script, and it is NOT in CONFIG_FILES)
@@ -928,13 +945,13 @@ if [ "$IMAGE_DRIFT" = "1" ] || [ "$CONFIG_DRIFT" = "1" ]; then
         COMPOSE_FILE=$(printf '%s' "$COMPOSE_FILE" | tr ':' '\n' \
             | grep -vx 'docker-compose.kai-agent.yml' | paste -sd: -)
         export COMPOSE_FILE
-        docker compose ${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"} up -d
+        docker compose ${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"} up -d ${SCALE_ARGS[@]+"${SCALE_ARGS[@]}"}
         COMPOSE_FILE="$_kai_full_compose_file"
         export COMPOSE_FILE
-        docker compose ${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"} up -d \
+        docker compose ${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"} up -d ${SCALE_ARGS[@]+"${SCALE_ARGS[@]}"} \
             || logger -t agnes-auto-upgrade "WARN: kai-agent engine sidecar failed to start; base stack recreated — next tick retries"
     else
-        docker compose ${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"} up -d
+        docker compose ${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"} up -d ${SCALE_ARGS[@]+"${SCALE_ARGS[@]}"}
     fi
     # Record the config hash that is now in effect — config drift is
     # declared against this marker on subsequent ticks.

@@ -199,6 +199,22 @@ def _validate_sql(sql: str) -> None:
                 details={"blocked_keyword": keyword},
             )
 
+    # The access-policy scalar UDFs (``agnes_hmac``) are registered on the
+    # very analytics connection this engine executes against, so a caller
+    # who could name them would compute the keyed pseudonym of any candidate
+    # value and dictionary-match a masked column. Same reservation as
+    # ``app/api/query.py::_assert_select_only`` -- kept on the shared name
+    # set so the two guards cannot drift.
+    from src.access_policy_udf import POLICY_UDF_NAMES
+
+    for reserved in sorted(POLICY_UDF_NAMES):
+        if reserved in body:
+            raise RemoteQueryError(
+                f"Reserved function {reserved!r} may only appear in an access policy body",
+                error_type="query_error",
+                details={"reserved_function": reserved, "reason": "policy_udf_reserved"},
+            )
+
     import re as _re
 
     if not _re.match(r"^(select|with)\s", _strip_leading_sql_comments(body)):

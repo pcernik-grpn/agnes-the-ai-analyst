@@ -71,6 +71,11 @@ _ACCESS_POLICY_HINTS: dict[str, str] = {
         "policy depends on a mapping table that is currently empty or was "
         "never synced. Contact your administrator to check its sync."
     ),
+    "access_policy_protected_row": (
+        "The table derived from this file carries an access policy, and a "
+        "re-ingest would replace the table without it. Ask an administrator "
+        "to clear the policy first — retrying the upload will keep failing."
+    ),
     "policy_error": (
         "The access policy attached to this table failed to resolve or "
         "execute. Contact your administrator — the underlying engine error "

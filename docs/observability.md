@@ -512,12 +512,26 @@ independently (in a Data-Streams style sink that means mapping the
 `agnes.completion_chars`) are on the span whether capture is on or not.
 Turn it on only where the collector is allowed to hold that data.
 
-### What is not exported
+### The embedded engine's own spans
 
-HTTP request spans, database calls and the sandbox's own per-tool spans. The
-broker sees a completion, not the agent loop around it; an engine that
-traces its own turns needs its host to broker an `otlp` egress scope for
-that, which this route does not yet do.
+The broker sees a completion, not the agent loop around it. The embedded
+turn engine's sandbox traces that loop itself — one span per turn, per
+model step and per tool call, properly nested — and exports it through its
+in-sandbox relay's `otlp` scope to `POST /api/broker/otlp/v1/{signal}` on
+this instance, which swaps the per-turn `kai_otlp` ticket for the same
+collector credential the app's own export uses and forwards the batch. The
+scope is minted by `/api/kai/tickets` exactly when `OTEL_EXPORTER_OTLP_ENDPOINT`
+is set, so the sandbox's traces land wherever the broker's do, and nowhere
+when the instance exports nothing.
+
+Two halves, in this order: the app version carrying the route first, the
+engine's `HOST_BROKER_OTLP_URL` second. The URL is what makes the sandbox
+initialize OTel at all, and it also makes `otlp` an *active* relay scope
+that every turn needs a ticket for — set it against an app that does not
+mint one and every turn fails before the prompt is sent. Rolling back is
+the reverse: clear the URL, then the app.
+
+Not exported by anything: HTTP request spans and database calls.
 
 ## No telemetry vendor
 

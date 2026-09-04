@@ -911,6 +911,99 @@ async def _start_otel_completion_span(
     )
 
 
+# --- OTLP telemetry egress for the embedded engine's sandbox ----------------
+#
+# The engine's sandbox exports its own spans (turn → step → tool) through the
+# in-sandbox relay's ``otlp`` scope, which forwards ``/otlp/<rest>`` to this
+# instance's ``HOST_BROKER_OTLP_URL`` with a ``kai_otlp`` ticket and no other
+# credential (docs/observability.md → "OpenTelemetry export"). This route is
+# the broker half: it swaps the ticket for the collector credential the
+# instance's own export already holds (``OTEL_EXPORTER_OTLP_HEADERS``) and
+# forwards the batch to the same collector, so the sandbox's traces land in
+# the same place as the broker's completion spans.
+
+#: The three OTLP/HTTP signal paths an SDK exports to. Exact allowlist — the
+#: relay forwards whatever path the sandbox names, so anything else is refused
+#: here and never resolved against the collector.
+_OTLP_SIGNALS = frozenset({"traces", "metrics", "logs"})
+#: One OTLP export batch is bounded by the SDK's batch processor (hundreds of
+#: KiB at the very most); anything past this is not telemetry.
+_OTLP_MAX_BODY_BYTES = 8 * 1024 * 1024
+_OTLP_TIMEOUT = httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=10.0)
+#: Inbound headers worth forwarding: the wire format and its compression. The
+#: relay already dropped the credential/hop-by-hop sets; everything else is
+#: the sandbox's business, not the collector's.
+_OTLP_FORWARDED_REQUEST_HEADERS = frozenset({"content-type", "content-encoding"})
+
+
+# The collector (base endpoint + operator headers) comes from ONE place —
+# ``src.observability.otel.collector`` — which is also what
+# ``/api/kai/tickets`` mints the ``kai_otlp`` ticket from, so the ticket and
+# the route can never disagree about whether there is somewhere to forward to.
+_otlp_collector = _otel.collector
+_parse_otlp_headers = _otel.parse_otlp_headers
+
+
+@router.post("/otlp/v1/{signal}", name="otlp_proxy")
+async def otlp_proxy(signal: str, request: Request, row: Dict[str, Any] = Depends(require_broker_ticket)) -> Response:
+    """Forward one OTLP/HTTP export batch from the engine's sandbox to the
+    instance's collector, credential injected server-side.
+
+    Accepts ONLY the ``kai_otlp`` scope — the ticket ``/api/kai/tickets`` mints
+    for the relay's ``otlp`` scope, and only while this instance exports OTLP
+    itself (``OTEL_EXPORTER_OTLP_ENDPOINT``); an ``llm``/``main`` ticket is
+    refused with the usual scope-mismatch audit. Without a configured
+    collector the route answers ``503 otlp_export_not_configured`` so a
+    misordered rollout (engine env set before the export) fails loudly per
+    batch instead of silently swallowing telemetry — the turn itself is
+    unaffected, the SDK's exporter just logs the refusal.
+
+    The body is the SDK's protobuf batch, forwarded byte-for-byte with its
+    wire-format and compression headers; the collector's 2xx body comes back
+    as-is (the OTLP success response), its error text never does — the status
+    (and ``Retry-After``, which the exporter's retry honours) is enough.
+    """
+    _require_scope(row, "kai_otlp")
+    if signal not in _OTLP_SIGNALS:
+        raise HTTPException(status_code=404, detail={"code": "otlp_signal_not_supported"})
+    collector = _otlp_collector()
+    if collector is None:
+        raise HTTPException(status_code=503, detail={"code": "otlp_export_not_configured"})
+    base, operator_headers = collector
+    # Refuse a declared-oversized batch before buffering it; the post-read
+    # check below still catches an undeclared or lying length.
+    declared = request.headers.get("content-length", "")
+    if declared.isdigit() and int(declared) > _OTLP_MAX_BODY_BYTES:
+        raise HTTPException(status_code=413, detail={"code": "otlp_batch_too_large"})
+    body = await request.body()
+    if len(body) > _OTLP_MAX_BODY_BYTES:
+        raise HTTPException(status_code=413, detail={"code": "otlp_batch_too_large"})
+    headers = {k: v for k, v in request.headers.items() if k.lower() in _OTLP_FORWARDED_REQUEST_HEADERS}
+    headers.setdefault("content-type", "application/x-protobuf")
+    headers.update(operator_headers)
+    try:
+        async with httpx.AsyncClient(timeout=_OTLP_TIMEOUT) as client:
+            upstream = await client.post(f"{base}/v1/{signal}", content=body, headers=headers)
+    except httpx.HTTPError as exc:
+        # The collector's hostname/credential is operator config; the sandbox
+        # gets a typed 502 and the operator gets the class of failure.
+        logger.warning("broker: OTLP collector unreachable for %s batch: %s", signal, type(exc).__name__)
+        raise HTTPException(status_code=502, detail={"code": "otlp_collector_unreachable"}) from exc
+    passthrough: Dict[str, str] = {}
+    retry_after = upstream.headers.get("retry-after")
+    if retry_after:
+        passthrough["retry-after"] = retry_after
+    if 200 <= upstream.status_code < 300:
+        return Response(
+            content=upstream.content,
+            status_code=upstream.status_code,
+            media_type=upstream.headers.get("content-type"),
+            headers=passthrough or None,
+        )
+    logger.warning("broker: OTLP collector answered %s for a %s batch", upstream.status_code, signal)
+    return Response(status_code=upstream.status_code, headers=passthrough or None)
+
+
 @router.post("/anthropic", name="anthropic_proxy_bare")
 @router.post("/anthropic/{subpath:path}", name="anthropic_proxy_subpath")
 async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(require_broker_ticket)) -> Response:
