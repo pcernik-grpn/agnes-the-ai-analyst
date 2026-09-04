@@ -1000,6 +1000,7 @@ class TestAdminRegistrySmoke:
         "DELETE /api/admin/registry/{table_id}",
         "POST /api/admin/registry/{table_id}/policy/preview",
         "POST /api/admin/registry/{table_id}/policy/preview-groups",
+        "POST /api/admin/registry/{table_id}/policy/preview-matrix",
         "GET /api/admin/discover-tables",
         "POST /api/admin/configure",
         "GET /api/admin/metadata/{table_id}",
@@ -1131,6 +1132,36 @@ class TestAdminRegistrySmoke:
         r = seeded_app_both["client"].post(
             f"/api/admin/registry/{table_id}/policy/preview-groups",
             json={"sql": "SELECT * FROM policy_preview_groups_smoke"},
+            headers=h,
+        )
+        assert r.status_code in (200, 422), r.text
+
+    def test_registry_policy_preview_matrix(self, seeded_app_both):
+        """issue #2147 (design doc §13.1) -- the persona-matrix preview reads
+        through the same factory-backed repos as the single-persona preview
+        and the all-groups sweep above (table_registry_repo / user_groups_repo /
+        user_group_members_repo / audit_repo), so the smoke assertion is the
+        same: reachable, and identical on DuckDB and Postgres. The table is
+        never synced, so a 422 from its own live analytics-DB read is a
+        legitimate outcome here."""
+        h = _admin_headers(seeded_app_both)
+        rc = seeded_app_both["client"].post(
+            "/api/admin/register-table",
+            json={
+                "name": "policy_preview_matrix_smoke",
+                "source_type": "keboola",
+                "bucket": "in.c-smoke",
+                "source_table": "orders",
+                "query_mode": "local",
+            },
+            headers=h,
+        )
+        assert rc.status_code == 201
+        table_id = rc.json()["id"]
+
+        r = seeded_app_both["client"].post(
+            f"/api/admin/registry/{table_id}/policy/preview-matrix",
+            json={"sql": "SELECT * FROM policy_preview_matrix_smoke", "personas": "policy_groups"},
             headers=h,
         )
         assert r.status_code in (200, 422), r.text
