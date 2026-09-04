@@ -3920,11 +3920,18 @@ class TestSharePointSplitControl:
         body = resp.text
 
         # The card is drawn by the page's externalized script (#2146 moved
-        # the inline JS out), so the page must load that script and the
-        # script must carry the control; the panel's own styles stay inline.
+        # the inline JS out) and styled by its externalized stylesheet (the
+        # three inline <style> blocks moved into css/ds_page.css so the
+        # data-package builder can load them too). The page must load both,
+        # and each must carry its half of the control. Asserting the CSS
+        # SELECTOR against the response text is what this line used to do,
+        # which only ever proved the stylesheet mentioned the class — and
+        # silently stopped proving even that once the stylesheet moved out.
         assert "js/admin/data_sources_page.js" in body
-        assert ".ds-sp-split-table" in body
+        assert "css/ds_page.css" in body
         from pathlib import Path
+
+        assert ".ds-sp-split-table" in Path("app/web/static/css/ds_page.css").read_text(encoding="utf-8")
 
         script = Path("app/web/static/js/admin/data_sources_page.js").read_text(encoding="utf-8")
         # No standalone "Split this site…" button remains — it is reachable
