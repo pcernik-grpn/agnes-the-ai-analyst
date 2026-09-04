@@ -561,6 +561,16 @@ def _run_out(
         # `connectors.sharepoint.facts_extraction.run_facts_extraction`'s
         # `on_progress` docstring) — never invented ahead of that.
         "facts_progress": live.get("facts"),
+        # Scan OCR's own block (`connectors.sharepoint.scan_ocr.
+        # triage_run_usage`, wired through the crawl's `report["scan_ocr"]`)
+        # — triage decision counters, plus, once a permanent provider
+        # refusal has fired this run, `disabled_reason`/`provider_error`
+        # naming why scan OCR paused itself. Absent (`None`) when the
+        # switch is off, nothing has been previewed, and no refusal has
+        # fired — never invented ahead of the crawl reporting it. `live`
+        # again collapses to `report`/`progress` the same way every other
+        # field on this projection does.
+        "scan_ocr": live.get("scan_ocr"),
         # ``{folders_done, folders_total}`` while `phase == "planning"`
         # (2026-09-04 finding #65 item 3) — absent otherwise, same
         # "layered onto `progress`, never invented ahead of it" contract as

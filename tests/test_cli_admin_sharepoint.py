@@ -1708,6 +1708,67 @@ class TestFmtFactsBacklogSuffix:
         assert "backlog, not running" not in rendered
 
 
+class TestFmtErrorCellShowsAnOcrPause:
+    """`_fmt_error_cell` — the fleet table's ERROR column falls back to a
+    scan-OCR pause line (TCRD-296 gap #68) when the run itself carries no
+    error of its own."""
+
+    def test_no_run_is_a_blank_cell(self):
+        from cli.commands.admin_sharepoint import _fmt_error_cell
+
+        assert _fmt_error_cell(None) == ""
+
+    def test_a_run_error_wins_over_a_scan_ocr_pause(self):
+        from cli.commands.admin_sharepoint import _fmt_error_cell
+
+        run = {"error": "connection reset", "scan_ocr": {"disabled_reason": "http_400"}}
+        assert _fmt_error_cell(run) == "connection reset"
+
+    def test_a_scan_ocr_pause_renders_when_there_is_no_run_error(self):
+        from cli.commands.admin_sharepoint import _fmt_error_cell
+
+        run = {"error": None, "scan_ocr": {"disabled_reason": "workspace_limit"}}
+        assert _fmt_error_cell(run) == "OCR: paused — provider refused (workspace_limit)"
+
+    def test_neither_present_is_a_blank_cell(self):
+        from cli.commands.admin_sharepoint import _fmt_error_cell
+
+        assert _fmt_error_cell({"error": None, "scan_ocr": None}) == ""
+
+
+class TestConditionLabelDistinguishesOcrFromFacts:
+    """`_print_provider_limit_conditions` labels an OCR-authored condition
+    differently from a facts-authored one, keyed on the `ocr_` prefix
+    `connectors.sharepoint.scan_ocr._mark_run_disabled` puts on its own
+    `reason` — the ONLY thing distinguishing the two in that shared table."""
+
+    def test_a_facts_reason_is_labeled_facts(self):
+        from cli.commands.admin_sharepoint import _condition_label
+
+        assert _condition_label({"reason": "workspace_limit"}) == "Facts extraction paused"
+
+    def test_an_ocr_prefixed_reason_is_labeled_ocr(self):
+        from cli.commands.admin_sharepoint import _condition_label
+
+        assert _condition_label({"reason": "ocr_http_400"}) == "OCR extraction paused"
+
+    def test_the_fleet_banner_names_an_ocr_condition(self):
+        conditions = [
+            {
+                "provider": "vertex",
+                "model": "claude-haiku-4-5",
+                "region": "us-central1",
+                "reason": "ocr_workspace_limit",
+                "message": "Your workspace has hit the API usage limits ...",
+            }
+        ]
+        body = {"connections": [], "totals": {}, "conditions": conditions}
+        with patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(200, body)):
+            result = runner.invoke(app, ["admin", "sharepoint", "runs"])
+        assert result.exit_code == 0, result.output
+        assert "OCR extraction paused" in result.output
+
+
 class TestRuns:
     """`agnes admin sharepoint runs` — CLI counterpart to
     `GET /api/admin/sharepoint/extraction/runs`."""

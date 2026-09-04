@@ -67,6 +67,7 @@ _SIGNATURES = (
     "function _extIsFactsPhase(run) {",
     "function _extPhaseCountText(run) {",
     "function _extRenderCrawlCell(connId, status) {",
+    "function _extScanOcrPausedLine(run) {",
     "function _extRunLine(run) {",
     "const EXT_STOP_REASON_TEXT = {",
     "function _extStopReasonText(reason) {",
@@ -332,6 +333,28 @@ class TestRunRow:
         assert "812/" not in html
         assert "%" not in html
         assert "left" not in html.lower().replace("<", " ")
+
+    def test_a_scan_ocr_pause_shows_on_a_live_run(self):
+        """TCRD-296 gap #68 — a permanent provider refusal pauses scan OCR
+        for the rest of the run without failing the run itself, so it has
+        no `run.error` of its own; `run.scan_ocr.disabled_reason` is what
+        names it on the card."""
+        paused = json.loads(json.dumps(_RUNNING))
+        paused["running"]["scan_ocr"] = {"disabled_reason": "http_400"}
+        out = _run_js(
+            'console.log(JSON.stringify({html: _extRunRowHtml("sp1", _extState["sp1"])}));',
+            state=_state(data=paused),
+        )
+        html = out["html"]
+        assert "OCR: paused" in html
+        assert "http_400" in html
+
+    def test_no_scan_ocr_pause_note_when_nothing_is_disabled(self):
+        out = _run_js(
+            'console.log(JSON.stringify({html: _extRunRowHtml("sp1", _extState["sp1"])}));',
+            state=_state(data=_RUNNING),
+        )
+        assert "OCR: paused" not in out["html"]
 
     def test_a_sharded_run_shows_the_shard_count_and_a_per_shard_breakdown(self):
         """2026-09-03 auto-parallel-crawl design §4.7: a sharded site's Run

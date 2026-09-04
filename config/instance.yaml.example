@@ -1907,6 +1907,26 @@ extraction:
     # must be vision-capable; a model that is not fails every page, which
     # fails the document loudly rather than emptying it.
     model: ""
+    # Which LLM provider carries this stage's calls — the SAME ladder
+    # `extraction.facts.provider` uses. `inherit` (default) checks
+    # `extraction.facts.provider` next, then falls back to this instance's
+    # own `ai.provider` — vertex when chat/LLM traffic already runs through
+    # Google Vertex AI, anthropic otherwise. `anthropic` / `vertex` pin this
+    # stage to one provider regardless of either of those. Fixes an
+    # incident where an instance running everything else on Vertex still
+    # had a stale ANTHROPIC_API_KEY in the environment (an exhausted
+    # workspace) and scan OCR kept building an Anthropic client against it —
+    # a static key wins ONLY once neither this setting, `extraction.facts.
+    # provider`, nor `ai.provider` resolves to vertex.
+    provider: inherit
+    # A provider refusal Agnes recognizes as PERMANENT (a 400/401/403, or a
+    # workspace-limit/quota/billing-disabled refusal) is never retried per
+    # page; after the first one in a run, scan OCR pauses itself for every
+    # document that follows — no further render, no further call — so the
+    # documents land in the ordinary `convert_empty` backlog
+    # (`extraction/retry-empty` replays them once the provider is fixed)
+    # instead of burning a bounded set of failed attempts per document.
+    # See `docs/sharepoint-extraction.md` → *Provider limits*.
     # Pages transcribed per document. A 500-page scan must not burn the
     # budget silently: past this cap the first N pages are transcribed and a
     # truncation marker naming the cap is appended to the markdown. Clamped

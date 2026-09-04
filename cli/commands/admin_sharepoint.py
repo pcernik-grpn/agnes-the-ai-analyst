@@ -1275,6 +1275,26 @@ def _fmt_phase(run: Optional[Dict[str, Any]]) -> str:
     return f"{outcome}/{phase}"
 
 
+def _fmt_error_cell(run: Optional[Dict[str, Any]]) -> str:
+    """The fleet table's ERROR cell — a run-level error always wins (it is
+    the more severe claim: the crawl itself broke), otherwise a scan-OCR
+    pause reads as "OCR: paused — provider refused (<reason>)" off `run.
+    scan_ocr.disabled_reason` (TCRD-296 gap #68) — scan OCR pausing itself
+    is not a run error (the crawl keeps going, documents land in
+    `convert_empty`), so it has no `run.error` of its own to show without
+    this fallback."""
+    if not run:
+        return ""
+    error = run.get("error") or ""
+    if error:
+        return error
+    scan_ocr = run.get("scan_ocr") or {}
+    disabled_reason = scan_ocr.get("disabled_reason")
+    if disabled_reason:
+        return f"OCR: paused — provider refused ({disabled_reason})"
+    return ""
+
+
 def _print_jobs_strip(jobs: Optional[Dict[str, Any]]) -> None:
     """The queued-vs-running lane-starvation line (TCRD-296 synthesis) — the
     terminal counterpart to `/admin/extraction`'s own strip, so lane
@@ -1293,10 +1313,20 @@ def _print_jobs_strip(jobs: Optional[Dict[str, Any]]) -> None:
     _console.print("Jobs — " + ", ".join(parts))
 
 
+def _condition_label(condition: Dict[str, Any]) -> str:
+    """ "Facts extraction paused" vs "OCR extraction paused" — the ONLY thing
+    telling an OCR-authored `provider_limit` condition apart from a
+    facts-authored one in that shared, kindless table is the ``ocr_``
+    prefix scan OCR puts on its own ``reason``
+    (`connectors.sharepoint.scan_ocr._mark_run_disabled`)."""
+    reason = str(condition.get("reason") or "")
+    return "OCR extraction paused" if reason.startswith("ocr_") else "Facts extraction paused"
+
+
 def _print_provider_limit_conditions(conditions: Optional[List[Dict[str, Any]]]) -> None:
-    """The fleet-level provider-refusal banner (TCRD-296 synthesis F.25),
-    from the terminal — one line per active condition. `conditions` is
-    `[]`/absent on every instance before this shipped and forever on a
+    """The fleet-level provider-refusal banner (TCRD-296 synthesis F.25,
+    gap #68), from the terminal — one line per active condition. `conditions`
+    is `[]`/absent on every instance before this shipped and forever on a
     DuckDB-backed one, so this prints nothing in the common case."""
     for condition in conditions or []:
         scope_bits = [b for b in (condition.get("model"), condition.get("region")) if b]
@@ -1304,7 +1334,7 @@ def _print_provider_limit_conditions(conditions: Optional[List[Dict[str, Any]]])
         retry_after = condition.get("retry_after_s")
         retry_hint = f"retrying in {max(1, round(retry_after / 60))}m" if retry_after else "retrying automatically"
         _console.print(
-            f"[bold yellow]Facts extraction paused:[/bold yellow] {condition.get('provider')}{scope} — "
+            f"[bold yellow]{_condition_label(condition)}:[/bold yellow] {condition.get('provider')}{scope} — "
             f"{condition.get('message') or condition.get('reason')}; {retry_hint}."
         )
 
@@ -1333,7 +1363,7 @@ def _print_fleet_table(body: Dict[str, Any], *, show_all: bool) -> None:
         phase = _fmt_phase(run)
         if row.get("stuck"):
             phase = f"[bold red]{phase} STUCK?[/bold red]"
-        error = (run or {}).get("error") or ""
+        error = _fmt_error_cell(run)
         table.add_row(
             str(row.get("connection_name") or row.get("connection_id")),
             phase,

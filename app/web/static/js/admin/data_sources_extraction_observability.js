@@ -184,6 +184,18 @@ function _extFactsPendingLine(status) {
   return `<div class="ext-sub${cls}">${_extNum(n)} document${n === 1 ? "" : "s"} pending facts extraction · ${state}</div>`;
 }
 
+/* TCRD-296 gap #68 — a permanent provider refusal pauses scan OCR for the
+   rest of a run without failing the run itself (documents land in
+   `convert_empty`, not `convert_failed`), so it has no `run.error` of its
+   own to show. `run.scan_ocr.disabled_reason` (`app/api/admin_extraction.py
+   ::_run_out`, mirrored by the fleet table's `fmtErrorCell` and the CLI's
+   `_fmt_error_cell`) is what names it here instead. */
+function _extScanOcrPausedLine(run) {
+  const disabledReason = run && run.scan_ocr && run.scan_ocr.disabled_reason;
+  if (!disabledReason) return "";
+  return `<div class="ext-sub ext-warn">OCR: paused — provider refused (${_extEsc(disabledReason)})</div>`;
+}
+
 function _extRunLine(run) {
   const bits = [];
   if (run.new != null) bits.push(`${_extNum(run.new)} new`);
@@ -429,6 +441,7 @@ function _extRunRowHtml(connId, st) {
     sub += `<div class="ext-sub">${started}${elapsed} · as of ${_extEsc(_extTime(run.checkpoint_at))}</div>`;
     const line = _extRunLine(run);
     if (line) sub += `<div class="ext-sub">${_extEsc(line)}</div>`;
+    sub += _extScanOcrPausedLine(run);
     sub += _extThrottleLine(run);
     if (run.outcome === "stalled") {
       sub += `<div class="ext-sub ext-warn">${_extEsc(run.liveness_note || "no recent checkpoint")}</div>`;
@@ -445,6 +458,7 @@ function _extRunRowHtml(connId, st) {
     sub += `</div>`;
     const line = _extRunLine(last);
     if (line) sub += `<div class="ext-sub">${_extEsc(line)}</div>`;
+    sub += _extScanOcrPausedLine(last);
     // Errors before skips, deliberately: a skip is a policy DECISION (over
     // the size cap, permissions), an error is something that FAILED. A run
     // that erred on nearly everything and ingested nothing must not read as

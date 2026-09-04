@@ -74,6 +74,19 @@ function fmtCost(usd) {
   return usd == null || usd === 0 ? "—" : "$" + usd.toFixed(4);
 }
 
+/* The fleet table's ERROR cell (TCRD-296 gap #68): a run-level error always
+   wins (the crawl itself broke), otherwise a scan-OCR pause — which is NOT
+   a run error, the crawl keeps going and documents land in `convert_empty`
+   — reads as "OCR: paused — provider refused (<reason>)" off `run.scan_ocr.
+   disabled_reason` (`app/api/admin_extraction.py::_run_out`, mirrored by
+   the CLI's own `_fmt_error_cell`). */
+function fmtErrorCell(run) {
+  if (!run) return "";
+  if (run.error) return run.error;
+  const disabledReason = run.scan_ocr && run.scan_ocr.disabled_reason;
+  return disabledReason ? `OCR: paused — provider refused (${disabledReason})` : "";
+}
+
 // Sums input/output tokens across every priced stage (`ner`/`ocr`/`facts`)
 // a run's `usage` carries — see `_run_total_cost_usd`'s docstring on the
 // API side for why `usage` is keyed by stage and only populated once the
@@ -286,7 +299,7 @@ function renderRow(row) {
     <td class="ext-num">${fmtCost(cost)}</td>
     <td class="ext-sub">${fmtAgo(row.checkpoint_age_s)}</td>
     <td class="ext-sub">${fmtNextRun(row.next_run_at)}</td>
-    <td>${run && run.error ? `<span class="ext-error-cell" title="${esc(run.error)}">${esc(run.error)}</span>` : ""}</td>
+    <td>${(() => { const cell = fmtErrorCell(run); return cell ? `<span class="ext-error-cell" title="${esc(cell)}">${esc(cell)}</span>` : ""; })()}</td>
     <td>${actionsCell(row)}</td>
     <td><button type="button" class="btn btn-sm btn-secondary" onclick="openFleetCompleteness('${row.connection_id}')">Completeness</button></td>
   `;
@@ -343,8 +356,18 @@ function renderJobsStrip(jobs) {
     .join("");
 }
 
+/* "Facts extraction paused" vs "OCR extraction paused" (TCRD-296 gap #68) —
+   the ONLY thing distinguishing an OCR-authored condition from a
+   facts-authored one in that shared, kindless table is the `ocr_` prefix
+   scan OCR puts on its own `reason`
+   (`connectors.sharepoint.scan_ocr._mark_run_disabled`). */
+function conditionLabel(c) {
+  const reason = String((c && c.reason) || "");
+  return reason.startsWith("ocr_") ? "OCR extraction paused" : "Facts extraction paused";
+}
+
 /* Fleet-level provider-refusal banner (TCRD-296 synthesis F.25, gaps
-   #25/#48) — one strip per active condition, e.g. a workspace usage-limit
+   #25/#48/#68) — one strip per active condition, e.g. a workspace usage-limit
    exhaustion or a saturated Vertex region×model quota bucket. Additive:
    `conditions` is `[]` on every instance before this shipped and forever
    on a DuckDB-backed one, so the strip simply stays hidden. This is the
@@ -368,7 +391,7 @@ function renderProviderLimitBanner(conditions) {
         ? `retrying in ${Math.max(1, Math.round(c.retry_after_s / 60))}m`
         : "retrying automatically once the condition clears";
       return (
-        `<div>Facts extraction paused: ${esc(c.provider || "provider")}` +
+        `<div>${esc(conditionLabel(c))}: ${esc(c.provider || "provider")}` +
         `${scope ? " " + esc(scope) : ""} — ${esc(c.message || c.reason || "provider limit")}; ${esc(retryHint)}.</div>`
       );
     })
