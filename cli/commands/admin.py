@@ -14,7 +14,9 @@ from cli.commands.admin_connection import admin_connection_app
 from cli.commands.admin_data_package import admin_data_package_app
 from cli.commands.admin_digest import admin_digest_app
 from cli.commands.admin_doctor import doctor_app as admin_doctor_app
+from cli.commands.admin_facts import admin_facts_app
 from cli.commands.admin_jobs import admin_jobs_app
+from cli.commands.admin_knowledge_packaging import packaging_app as admin_knowledge_packaging_app
 from cli.commands.admin_marketplace import admin_marketplace_app
 from cli.commands.admin_mcp import mcp_app as admin_mcp_app
 from cli.commands.admin_memory_domain import admin_memory_domain_app
@@ -25,7 +27,9 @@ from cli.commands.admin_semantic_layer import admin_semantic_layer_app
 from cli.commands.admin_semantic_model import admin_semantic_model_app
 from cli.commands.admin_semantic_source import admin_semantic_source_app
 from cli.commands.admin_sessions import sessions_app as admin_sessions_app
+from cli.commands.admin_sharepoint import admin_sharepoint_app
 from cli.commands.admin_skills import admin_skills_app
+from cli.commands.admin_service_account import service_account_app as admin_service_account_app
 from cli.commands.admin_sso import admin_sso_app
 from cli.commands.admin_store import admin_store_app
 from cli.commands.admin_usage import app as admin_usage_app
@@ -57,8 +61,19 @@ admin_app.add_typer(admin_usage_app, name="usage", help="(deprecated alias of `t
 admin_app.add_typer(admin_data_package_app, name="data-package", help="Data Package CRUD (v49)")
 admin_app.add_typer(admin_memory_domain_app, name="memory-domain", help="Memory Domain CRUD (v49)")
 admin_app.add_typer(admin_digest_app, name="digest", help="Maintained digest CRUD (K4)")
+knowledge_app = typer.Typer(help="Knowledge-artifact packaging + digests (K3/K4)")
+knowledge_app.add_typer(
+    admin_knowledge_packaging_app, name="packaging", help="Per-collection knowledge.duckdb artifact packaging (K3)"
+)
+admin_app.add_typer(knowledge_app, name="knowledge")
 admin_app.add_typer(admin_db_app, name="db", help="Manage app-state DB backend (DuckDB / Postgres)")
 admin_app.add_typer(admin_sso_app, name="sso", help="External SSO login (Entra ID OIDC) runtime config")
+admin_app.add_typer(
+    admin_service_account_app,
+    name="service-account",
+    help="Service-account identities (headless, own grants, own PATs) — issue #1534",
+)
+admin_app.add_typer(admin_sharepoint_app, name="sharepoint", help="SharePoint connector maintenance triggers")
 admin_app.add_typer(
     admin_doctor_app, name="doctor", help="Deployment-gate diagnostics (`agnes admin doctor --new-instance`)"
 )
@@ -85,6 +100,7 @@ admin_app.add_typer(
 admin_app.add_typer(admin_skills_app, name="skill", help="Contributed skills management")
 admin_app.add_typer(admin_jobs_app, name="jobs", help="Job queue admin (wave-2B worker runtime)")
 admin_app.add_typer(admin_analytics_app, name="analytics", help="DuckLake analytics-backend migration (wave-2G)")
+admin_app.add_typer(admin_facts_app, name="facts", help="Fact-graph maintenance (TCRD-296 synthesis E.21)")
 # Single direct command (mirrors `register-table` / `discover-and-register`):
 # LLM-generate descriptions for undescribed tables (#399).
 admin_app.command("autodoc-tables")(autodoc_tables)
@@ -935,6 +951,10 @@ def table_policy_show(
         raise typer.Exit(1)
 
     sql = row.get("access_policy_sql")
+    # #2147: read-only, per-mapping-table health -- present only on a
+    # policied row (`GET /api/admin/registry`'s own presence rule; see
+    # `app/api/admin.py::list_registry`'s docstring).
+    mapping_status = row.get("policy_mapping_status")
     if as_json:
         typer.echo(
             json.dumps(
@@ -945,6 +965,7 @@ def table_policy_show(
                     "access_policy_updated_at": row.get("access_policy_updated_at"),
                     "access_policy_updated_by": row.get("access_policy_updated_by"),
                     "policy_mapping": bool(row.get("policy_mapping")),
+                    "policy_mapping_status": mapping_status,
                 },
                 indent=2,
             )
@@ -962,6 +983,15 @@ def table_policy_show(
     typer.echo(f"  updated_by:     {row.get('access_policy_updated_by') or ''}")
     typer.echo(f"  updated_at:     {row.get('access_policy_updated_at') or ''}")
     typer.echo(f"  policy_mapping: {bool(row.get('policy_mapping'))}")
+    if mapping_status:
+        typer.echo("  mapping status:")
+        for entry in mapping_status:
+            state = entry.get("state")
+            flag = "  <-- broken, see docs/table-access-policies.md" if state in ("empty", "never_synced") else ""
+            typer.echo(
+                f"    {entry.get('mapping_table')}: {state} "
+                f"(last_sync: {entry.get('last_sync') or 'never'}){flag}"
+            )
     typer.echo("  sql:")
     for line in sql.splitlines():
         typer.echo(f"    {line}")
@@ -987,6 +1017,26 @@ def table_policy_preview(
         "--as-groups",
         help="Preview as an ad-hoc, comma-separated group set — no real user needs to exist.",
     ),
+    matrix: bool = typer.Option(
+        False,
+        "--matrix",
+        help=(
+            "Run the persona MATRIX (design doc §13.1, issue #2147) instead of a single "
+            "chosen persona: every distinct group-set of real users who can reach this "
+            "table, plus every group literal the policy body names, each run through the "
+            "same single-persona primitive. Mutually exclusive with --as / --as-groups."
+        ),
+    ),
+    personas: str = typer.Option(
+        "both",
+        "--personas",
+        help="With --matrix: which persona families to enumerate — group_sets | policy_groups | both.",
+    ),
+    limit: int = typer.Option(
+        None,
+        "--limit",
+        help="With --matrix: bound how many distinct group_sets personas are enumerated.",
+    ),
     as_json: bool = typer.Option(False, "--json", help="Output as JSON"),
 ):
     """Run a stored or candidate access policy as a chosen persona and show
@@ -995,10 +1045,27 @@ def table_policy_preview(
     primitive the admin UI's persona matrix is built from. Exactly one of
     --as / --as-groups selects the persona. Every call is audited
     server-side.
+
+    `--matrix` switches to the persona MATRIX instead
+    (`POST .../policy/preview-matrix`, issue #2147) — no persona to choose,
+    since it enumerates every one itself.
     """
     from pathlib import Path
 
-    if (as_user is None) == (as_groups is None):
+    if matrix:
+        if as_user is not None or as_groups is not None:
+            typer.echo(
+                "Error: --matrix enumerates its own personas — it is mutually exclusive with --as / --as-groups.",
+                err=True,
+            )
+            raise typer.Exit(2)
+        if personas not in ("group_sets", "policy_groups", "both"):
+            typer.echo(
+                "Error: --personas must be one of group_sets, policy_groups, both.",
+                err=True,
+            )
+            raise typer.Exit(2)
+    elif (as_user is None) == (as_groups is None):
         typer.echo(
             "Error: choose exactly one of --as <user> or --as-groups a,b to select the preview persona.",
             err=True,
@@ -1018,12 +1085,19 @@ def table_policy_preview(
             typer.echo(f"Error: SQL file not found: {sql_path}", err=True)
             raise typer.Exit(2)
         payload["sql"] = sql_path.read_text(encoding="utf-8").strip()
-    if as_user is not None:
-        payload["as_user"] = as_user
-    if as_groups is not None:
-        payload["as_groups"] = [g.strip() for g in as_groups.split(",") if g.strip()]
 
-    resp = api_post(f"/api/admin/registry/{table_id}/policy/preview", json=payload)
+    if matrix:
+        payload["personas"] = personas
+        if limit is not None:
+            payload["limit"] = limit
+        resp = api_post(f"/api/admin/registry/{table_id}/policy/preview-matrix", json=payload)
+    else:
+        if as_user is not None:
+            payload["as_user"] = as_user
+        if as_groups is not None:
+            payload["as_groups"] = [g.strip() for g in as_groups.split(",") if g.strip()]
+        resp = api_post(f"/api/admin/registry/{table_id}/policy/preview", json=payload)
+
     if resp.status_code != 200:
         try:
             detail = resp.json().get("detail", resp.text)
@@ -1035,6 +1109,10 @@ def table_policy_preview(
     body = resp.json()
     if as_json:
         typer.echo(json.dumps(body, indent=2))
+        return
+
+    if matrix:
+        _render_policy_preview_matrix(table_id, body)
         return
 
     rows_visible = body.get("rows_visible", 0)
@@ -1071,6 +1149,49 @@ def table_policy_preview(
             "status. (An unresolvable persona would have failed this "
             "command outright, above, rather than showing 0 rows.)"
         )
+
+
+def _render_policy_preview_matrix(table_id: str, body: dict) -> None:
+    """Human-readable render for `POST .../policy/preview-matrix` (design
+    doc §13.1, issue #2147) — a compact table of persona -> rows visible /
+    total / hidden / masked, plus the two derived numbers (union coverage,
+    pairwise overlap) that catch the two bugs a single-persona preview
+    cannot: a policy that is a no-op, and a partition that isn't.
+    """
+    if body.get("mapping_warning"):
+        typer.echo(f"Matrix preview for {table_id}: {body['mapping_warning']}")
+        return
+
+    personas = body.get("personas") or []
+    rows_total = body.get("rows_total", 0)
+    typer.echo(f"Persona matrix for {table_id} ({len(personas)} persona(s), {rows_total} row(s) total):")
+    for persona in personas:
+        hidden = persona.get("hidden_columns") or []
+        masked = persona.get("masked_columns") or []
+        typer.echo(
+            f"  {persona['label']:<24s} {persona['rows_visible']:>6} / {persona['rows_total']:<6} row(s) visible"
+            f"  (hidden: {len(hidden)}, masked: {len(masked)})"
+        )
+
+    if body.get("truncated"):
+        typer.echo("  Note: group-set enumeration was truncated at the configured cap — not every persona is shown.")
+
+    union_coverage = body.get("union_coverage")
+    if union_coverage is not None:
+        typer.echo(f"  union coverage: {union_coverage:.0%}")
+    if body.get("no_op"):
+        typer.echo(
+            "  WARNING: every persona sees the whole table and the union is 100% — this policy is a NO-OP."
+        )
+
+    overlap = body.get("pairwise_overlap") or []
+    if overlap:
+        typer.echo("  pairwise overlap:")
+        for pair in overlap:
+            typer.echo(
+                f"    {pair['persona_a']} <-> {pair['persona_b']}: "
+                f"{pair['overlap_rows']} row(s) ({pair['overlap_fraction']:.0%})"
+            )
 
 
 @admin_app.command("metadata-show")

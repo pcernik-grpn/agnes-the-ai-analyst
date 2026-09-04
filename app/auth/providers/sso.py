@@ -33,6 +33,22 @@ This module deliberately does NOT duplicate the hardened pure helpers of the
 ``microsoft`` provider — ``tenant_id_error``, ``resolve_identity``,
 ``_is_directory_guid`` are imported from ``app.auth.providers.microsoft``.
 
+**No Entra group sync here.** Unlike the ``microsoft`` provider, this
+callback never calls ``app.auth.microsoft_group_sync.apply_user_groups`` —
+deliberately, not an oversight. That sync's whole design (module-level
+``group_sync_enabled()`` switch, the OAuth scope widened once at process
+start in ``app.auth.providers.microsoft._setup_oauth``) assumes ONE
+env-configured tenant known at boot; this provider's tenant/client id are
+runtime-configured, per-instance, PG-only rows that can change without a
+restart, so tying the SAME sync — and the SAME widened-consent-scope
+tradeoff that reaches every signed-in user — to a config an admin can flip
+at any moment is a different, unbuilt feature, not a small wire-up. An
+external IdP's group claims (if this protocol widens to SAML, which can
+assert groups directly in the response) may get a purpose-built sync later;
+until then, RBAC for an ``sso``-provisioned account is admin-assigned
+(`/admin/access`) like any account with no group sync configured. See
+``docs/auth-microsoft-oauth.md`` → "Entra group sync" for the full contrast.
+
 Availability contract: :func:`is_available` (and :func:`is_configured`) must
 NEVER let ``RequiresPostgresBackend`` escape — the provider-registry probes
 treat a raising probe as "could not tell", which would suppress the registry

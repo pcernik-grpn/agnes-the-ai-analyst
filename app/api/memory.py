@@ -254,6 +254,19 @@ class BulkUpdateRequest(BaseModel):
     updates: dict
 
 
+class BulkRejectRequest(BaseModel):
+    """Reject every ``pending`` id in ``item_ids``. Issue #1957.
+
+    Deliberately narrower than ``BulkUpdateRequest``: no ``updates`` dict and
+    no action choice — this is a bulk REJECT only, never a generic bulk
+    status setter. See ``admin_bulk_reject`` for why there is no bulk-approve
+    counterpart.
+    """
+
+    item_ids: List[str]
+    reason: Optional[str] = None
+
+
 class ResolveDuplicateRequest(BaseModel):
     """Resolve a duplicate-candidate relation row.
 
@@ -1297,6 +1310,88 @@ async def admin_resolve_duplicate_candidate(
     }
 
 
+# ---- Detection run logs + dry-run (issue #1971 Parts 3/4) ----
+#
+# Registered BEFORE the `/admin/{item_id}` catch-all below — Starlette
+# matches routes in registration order, so a literal path segment must be
+# declared first or it would bind to `{item_id}` instead.
+
+
+class DetectionDryRunRequest(BaseModel):
+    #: Sessions to preview, capped server-side (see
+    #: dry_run_verification_detection's own clamp) — never unbounded, since
+    #: each session spends one real LLM call.
+    limit: Optional[int] = None
+
+
+@router.get("/admin/detection-runs")
+async def admin_detection_runs(
+    page: int = 1,
+    per_page: int = 20,
+    user: dict = Depends(require_admin),
+):
+    """Recent corporate-memory detection runs (issue #1971 Part 3) — the
+    admin panel's "How detection works" observability list, newest first.
+
+    PG-only: ``memory_detection_runs_repo()`` raises
+    ``RequiresPostgresBackend`` on a DuckDB-backed instance, translated to a
+    typed ``501`` by the app-wide handler in ``app/main.py`` — no bespoke
+    try/except needed here. The run PATHS themselves (the verification
+    processor, the collector wrapper) never fail this way: they write
+    through ``src.memory_detection_logging.record_detection_run``, which
+    catches this (and any other error) and degrades to one warning log line.
+    """
+    from src.repositories import memory_detection_runs_repo
+
+    page = max(page, 1)
+    per_page = max(1, min(per_page, 100))
+    offset = (page - 1) * per_page
+    repo = memory_detection_runs_repo()
+    runs = repo.list_recent(limit=per_page, offset=offset)
+    return {
+        "runs": runs,
+        "total": repo.count(),
+        "page": page,
+        "per_page": per_page,
+    }
+
+
+@router.post("/admin/detection-dry-run")
+async def admin_detection_dry_run(
+    payload: Optional[DetectionDryRunRequest] = None,
+    user: dict = Depends(require_admin),
+):
+    """Preview the transcript detector with the CURRENT saved policy (issue
+    #1971 Part 4) — writes NOTHING to ``knowledge_items``. A "Dry run"
+    button in the admin panel calls this and shows the result inline.
+
+    Never fails on a DuckDB-backed instance even though the observability
+    row it also tries to record is Postgres-only: recording goes through
+    ``src.memory_detection_logging.record_detection_run``, which swallows
+    that failure (and any other) into one warning log line — this endpoint
+    always returns the preview, regardless of whether the run-log write
+    succeeded.
+    """
+    from app.instance_config import load_instance_config
+    from connectors.llm import create_extractor_from_env_or_config
+    from services.session_processors.verification import dry_run_verification_detection
+
+    try:
+        instance_config = load_instance_config()
+    except (ValueError, FileNotFoundError):
+        instance_config = {}
+    ai_config = instance_config.get("ai") if instance_config else None
+    try:
+        extractor = create_extractor_from_env_or_config(ai_config)
+    except ValueError as e:
+        # Same fail-fast contract as collect_all() (#176): a missing ai:
+        # block / API key is an actionable misconfiguration, not a crash.
+        raise HTTPException(status_code=500, detail=str(e))
+
+    limit = (payload.limit if payload else None) or 5
+    return dry_run_verification_detection(extractor, limit=limit)
+
+
 # ---- Admin PATCH + bulk-update + tree endpoints (issue #62) ----
 
 
@@ -1462,6 +1557,67 @@ async def admin_bulk_update(
         else:
             errors[item_id] = status
     return {"updated": updated, "not_found": not_found, "errors": errors}
+
+
+@router.post("/admin/bulk-reject")
+async def admin_bulk_reject(
+    request: BulkRejectRequest,
+    user: dict = Depends(require_admin),
+    conn: duckdb.DuckDBPyConnection = Depends(_get_db),
+):
+    """Reject every ``pending`` id in ``item_ids`` — the bulk counterpart to
+    ``POST /admin/reject`` (issue #1957: the review queue otherwise forces an
+    admin to reject harvested candidates one at a time).
+
+    ``bulk-update`` above excludes ``status`` from its allowlist because a
+    bulk status flip would bypass the dedicated governance endpoints and
+    their per-item audit rows (PR #126 review) — that objection was about
+    AUDIT, not about bulkness. This endpoint resolves it by looping the exact
+    single-item governance path instead of a generic field setter: the same
+    status transition (``repo.update_status(item_id, "rejected")``) and the
+    same ``corporate_memory.reject`` audit action per item that a one-by-one
+    click would write (``batch: True`` in the params distinguishes it from a
+    single click, the same convention ``/admin/batch``'s reject action uses).
+
+    Only ``pending`` items are rejected. Anything else — already approved or
+    revoked, or an unknown id — is reported per-id and never raises, so one
+    stale id in a large selection can't abort the rest. 200 even on partial
+    failure, mirroring ``admin_bulk_update``.
+
+    Deliberately NO bulk-approve sibling. Approving in bulk injects items
+    into every analyst's ``.claude/rules/`` without a human reading each one
+    first (issue #1957's own warning), so that capability stays single-item
+    (``POST /admin/approve``) or on the audited-but-broader ``/admin/batch``
+    surface — this narrower, safety-focused endpoint adds no path to it.
+    """
+    repo = knowledge_repo()
+    if not request.item_ids:
+        return {"rejected": [], "not_found": [], "skipped_not_pending": [], "errors": {}}
+
+    rejected: List[str] = []
+    not_found: List[str] = []
+    skipped_not_pending: List[str] = []
+    errors: dict = {}
+    for item_id in request.item_ids:
+        try:
+            item = repo.get_by_id(item_id)
+            if not item:
+                not_found.append(item_id)
+                continue
+            if item.get("status") != "pending":
+                skipped_not_pending.append(item_id)
+                continue
+            repo.update_status(item_id, "rejected")
+            _audit_action(conn, user, "reject", item_id, {"reason": request.reason, "batch": True})
+            rejected.append(item_id)
+        except Exception as exc:  # pragma: no cover - defensive, mirrors KnowledgeRepository.bulk_update
+            errors[item_id] = f"error: {exc}"
+    return {
+        "rejected": rejected,
+        "not_found": not_found,
+        "skipped_not_pending": skipped_not_pending,
+        "errors": errors,
+    }
 
 
 # Axes the tree endpoint groups by. Anything else → 400. Order matters for

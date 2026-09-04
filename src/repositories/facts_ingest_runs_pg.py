@@ -19,7 +19,8 @@ from __future__ import annotations
 
 import json
 import secrets
-from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import sqlalchemy as sa
 from sqlalchemy.engine import Engine
@@ -142,6 +143,7 @@ class FactsIngestRunsPgRepository:
         anonymization: Optional[Dict[str, Any]] = None,
         source_urls_rejected: Optional[List[Dict[str, Any]]] = None,
         llm_usage: Optional[Dict[str, Any]] = None,
+        edges_skipped_missing_endpoint: int = 0,
     ) -> str:
         """Persist one ingest batch's run report. Returns the generated id.
 
@@ -174,6 +176,14 @@ class FactsIngestRunsPgRepository:
         as "unknown", never a fabricated zero. Never part of the ingest
         fingerprint/idempotency logic — purely descriptive metadata about
         the run that produced this batch.
+
+        ``edges_skipped_missing_endpoint`` is ``ingest_batch``'s count of
+        edges NOT written because their ``src``/``dst`` fact was gone by the
+        time the INSERT ran (see ``EdgeEndpointMissing``) — a race between
+        concurrent facts-extraction passes sharing one fact graph, never a
+        producer mistake, so (unlike ``claims_rejected``) there is no
+        itemized detail list here. Defaults to ``0``, same never-``NULL``
+        contract as every other count on this table.
         """
         run_id = "ir_" + secrets.token_hex(8)
         source_urls_rejected = source_urls_rejected or []
@@ -184,11 +194,13 @@ class FactsIngestRunsPgRepository:
                     "(id, corpus_ids, caller, documents_seen, claims_written, "
                     " claims_rejected_count, claims_rejected, "
                     " source_urls_rejected_count, source_urls_rejected, deferred, "
-                    " subjects_created, subjects_deleted, review_items, anonymization, llm_usage) "
+                    " subjects_created, subjects_deleted, review_items, anonymization, llm_usage, "
+                    " edges_skipped_missing_endpoint) "
                     "VALUES (:id, :corpus_ids, :caller, :documents_seen, :claims_written, "
                     "        :claims_rejected_count, :claims_rejected, "
                     "        :source_urls_rejected_count, :source_urls_rejected, :deferred, "
-                    "        :subjects_created, :subjects_deleted, :review_items, :anonymization, :llm_usage)"
+                    "        :subjects_created, :subjects_deleted, :review_items, :anonymization, :llm_usage, "
+                    "        :edges_skipped_missing_endpoint)"
                 ),
                 {
                     "id": run_id,
@@ -206,6 +218,7 @@ class FactsIngestRunsPgRepository:
                     "review_items": json.dumps(review_items),
                     "anonymization": json.dumps(anonymization or {}),
                     "llm_usage": json.dumps(llm_usage) if llm_usage is not None else None,
+                    "edges_skipped_missing_endpoint": edges_skipped_missing_endpoint,
                 },
             )
         return run_id
@@ -234,37 +247,23 @@ class FactsIngestRunsPgRepository:
             )
         return [_decode_row(dict(r)) for r in rows]
 
-    def distinct_corpus_ids(self) -> List[str]:
-        """Every collection id that has ever appeared in a run report.
-
-        Interim heuristic for "this file source's scope collections" (spec
-        §13.2's source card) until a real connection-to-collection scope
-        mapping exists (the connect wizard's step 2, a sibling effort) —
-        only a file-source producer ever calls ``POST /api/facts/ingest``,
-        so the set of collections it has ever ingested into is, today, the
-        best available proxy for its scope. Two sharepoint connections
-        would not be distinguishable by this alone; that limitation is
-        acceptable for a single-connection instance and named here so it is
-        not rediscovered as a surprise.
-        """
-        with self._engine.connect() as conn:
-            rows = conn.execute(
-                sa.text("SELECT DISTINCT jsonb_array_elements_text(corpus_ids) AS cid FROM facts_ingest_runs")
-            ).fetchall()
-        return sorted({r[0] for r in rows if r[0]})
-
     def llm_usage_rollup(self) -> Dict[str, Any]:
         """Cumulative producer-reported LLM usage across EVERY persisted
         ingest run — honest, ongoing cost VISIBILITY, not a metric to win
         (the token-efficiency criterion this feeds is a separate,
         known-losing comparison against baselines).
 
-        Instance-wide, not per-connection: there is no persisted
-        connection -> collection mapping yet (the SAME limitation
-        :meth:`distinct_corpus_ids` documents), so a per-connection split
-        would silently misattribute usage the moment a second SharePoint
-        connection exists on one instance. Acceptable for today's common
-        single-connection instance; revisit alongside that mapping.
+        Instance-wide, not per-connection: an ingest run report has no
+        column tying it back to the connection that produced it (only the
+        ``corpus_ids`` it touched), so a per-connection split here would
+        silently misattribute usage the moment a second SharePoint
+        connection exists on one instance. Unlike ``_sharepoint_pipeline_
+        cell``'s crawl/extract/facts counts (``app/web/router.py``), which
+        DO resolve a connection's own scope collections from its
+        ``config.scopes[].collection_id``, this rollup has nothing
+        equivalent to key off — acceptable for today's common
+        single-connection instance; revisit if a run report ever carries
+        its own connection id.
 
         A run whose ``llm_usage`` is ``NULL`` (never reported, or predates
         this feature) contributes nothing and is not counted in
@@ -320,3 +319,37 @@ class FactsIngestRunsPgRepository:
                 "from the rate card)"
             ),
         }
+
+    def documents_done_since(self, corpus_ids: Sequence[str], since: datetime) -> int:
+        """``sum(documents_seen)`` across every run report persisted at or
+        after ``since`` whose ``corpus_ids`` OVERLAPS ``corpus_ids`` — the
+        fleet/status throughput signal for a SharePoint connection's own
+        facts pass (TCRD-296 gap #67, ``app/api/admin_extraction.py::
+        _facts_throughput_and_eta``: "documents done in the last N minutes
+        for the connection's collections").
+
+        Connection-scoped by OVERLAP, not equality: a run report's
+        ``corpus_ids`` is whatever collections that ONE batch actually
+        touched (typically all of a connection's own, but not guaranteed
+        — see :meth:`create`'s docstring). ``jsonb_array_elements_text`` +
+        ``= ANY(:corpus_ids)`` is exactly "did this run touch at least one
+        of THIS connection's own collections" without decoding the column
+        in Python — deliberately not the ``?|`` "any key" jsonb operator,
+        whose bare ``?`` collides with this driver's bind-parameter style.
+        Empty ``corpus_ids`` answers ``0`` without a query — nothing to
+        overlap.
+        """
+        if not corpus_ids:
+            return 0
+        with self._engine.connect() as conn:
+            total = conn.execute(
+                sa.text(
+                    "SELECT COALESCE(SUM(documents_seen), 0) FROM facts_ingest_runs "
+                    "WHERE created_at >= :since AND EXISTS ("
+                    "  SELECT 1 FROM jsonb_array_elements_text(corpus_ids) AS cid "
+                    "  WHERE cid = ANY(:corpus_ids)"
+                    ")"
+                ),
+                {"since": since, "corpus_ids": list(corpus_ids)},
+            ).scalar()
+        return int(total or 0)

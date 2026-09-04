@@ -30,6 +30,16 @@
 # Usage on customer-instance VMs (set in /opt/agnes/.env):
 #
 #   COMPOSE_FILE=docker-compose.yml:docker-compose.prod.yml:docker-compose.postgres.yml:docker-compose.host-mount.yml:docker-compose.postgres-host-mount.yml
+#
+# `postgres`'s `command:`/`shm_size:` below are VM-only for the same reason
+# as the host bind above: they tune the side-car for the box the
+# customer-instance startup script actually derives AGNES_PG_* from (see
+# that script's "VM-derived sizing" section, TCRD-296) — a bare
+# docker-compose.postgres.yml (local dev / CI) stays on Postgres' own stock
+# defaults, which is the right posture for a laptop. The `:-` fallbacks are
+# belt-and-braces only for a manual `compose up` of this file outside the
+# startup script (AGNES_PG_* absent from .env); every provisioned VM always
+# has them.
 
 services:
   data-migrate:
@@ -39,3 +49,44 @@ services:
   postgres:
     volumes: !override
       - /data/postgres:/var/lib/postgresql/data
+    # Docker's default 64MB /dev/shm starves Postgres' parallel-worker DSM
+    # segments the moment max_parallel_workers_per_gather > 0 — live finding
+    # (TCRD-296): ~2850 "could not resize shared memory segment" failures in
+    # 30 minutes on a 64-vCPU VM, which killed a facts extraction job.
+    shm_size: ${AGNES_PG_SHM_SIZE:-1g}
+    command:
+      - postgres
+      - -c
+      - shared_buffers=${AGNES_PG_SHARED_BUFFERS:-256MB}
+      - -c
+      - effective_cache_size=${AGNES_PG_EFFECTIVE_CACHE_SIZE:-1GB}
+      - -c
+      - work_mem=${AGNES_PG_WORK_MEM:-16MB}
+      - -c
+      - maintenance_work_mem=${AGNES_PG_MAINTENANCE_WORK_MEM:-256MB}
+      # Derived from extraction_worker_replicas, not RAM (TCRD-296 gap #76):
+      # app + scheduler + every extraction-worker replica's own Postgres
+      # pool budget, plus headroom — see agnes_pg_max_connections in
+      # startup-script.sh.tpl. The :-100 fallback matches Postgres' OWN
+      # stock default, so a self-hosted install that never sets the env var
+      # (see docs/DEPLOYMENT.md "Sizing the Postgres side-car") is unaffected.
+      - -c
+      - max_connections=${AGNES_PG_MAX_CONNECTIONS:-100}
+      # Fixed knobs — do not vary with VM size, so they are literals here
+      # rather than another .env round-trip:
+      #   max_wal_size: fewer forced checkpoints under write-heavy ingest,
+      #     8GB comfortably covers a facts-extraction burst without
+      #     unbounded WAL growth (floor 2GB if you override it downward).
+      #   wal_compression: cuts WAL volume on the same class of burst.
+      #   random_page_cost: every customer-instance data disk is pd-ssd.
+      #   jit: measured slower on this app's visibility CTEs.
+      - -c
+      - max_wal_size=8GB
+      - -c
+      - wal_compression=on
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - max_parallel_workers_per_gather=${AGNES_PG_MAX_PARALLEL_WORKERS_PER_GATHER:-2}
+      - -c
+      - jit=off

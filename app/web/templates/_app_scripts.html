@@ -1,3 +1,15 @@
+    <!-- Cache-buster URLs for /static assets that a plain <script src> or
+         hardcoded fetch() can't run through static_url() (external file, or
+         a lazy runtime fetch/import) — so VersionedStaticFiles' immutable
+         cache still applies to them instead of falling back to no-cache on
+         every load. Non-deferred: must run before icon_sprite.js (deferred)
+         fetches the sprite below. Included from both base.html and
+         base_ds.html, so every page gets these regardless of layout. -->
+    <script>
+      window._agLucideSpriteUrl = "{{ static_url('vendor/lucide-sprite.svg') }}";
+      window._agMermaidUrl = "{{ static_url('vendor/mermaid.min.js') }}";
+      window._agTourUrl = "{{ static_url('js/tour.js') }}";
+    </script>
     <!-- Lucide sprite loader (#1503) — injects vendor/lucide-sprite.svg inline
          so `ds.icon()` / `iconEl()` can use SAME-DOCUMENT <use href="#name">
          references (external-document <use> only works in Safari 17.1+).
@@ -17,12 +29,27 @@
          the user circle renders identically across /admin/users, /admin/adoption,
          etc. See app/web/static/js/identity.js. -->
     <script src="{{ static_url('js/identity.js') }}" defer></script>
+    <!-- window.AgnesPeopleSearch — the one "find an account by name or
+         email" client lookup, so the group drawer's People field and the
+         group detail pane's "add someone" search can never drift onto two
+         different endpoints again. See app/web/static/js/people_search.js. -->
+    <script src="{{ static_url('js/people_search.js') }}" defer></script>
     <!-- Fast `[data-tip]` tooltip (v113). Shared because the trust markers are
          icon-only, so the tooltip IS their label, and the native `title` delay
          (600ms+, OS-controlled) is far too slow for that. Delegated on document,
          so cloned markup (the Library's grid cards are built from its table rows)
          needs no re-wiring. Styling: `.ds-tip` in components.css. -->
     <script src="{{ static_url('js/components/tooltip.js') }}" defer></script>
+    {# Dismissal for any `connect_banner(dismiss_key=…)` on the page. Loaded
+       app-wide because the macro is, and it binds nothing when no card on the
+       page carries a key. #}
+    <script src="{{ static_url('js/connect_banner.js') }}" defer></script>
+    <!-- Edge cue for `.data-table-wrap`: sets is-cue-left / is-cue-right so a
+         table cut mid-column says so AT the cut, rather than only through a
+         scrollbar sitting under its last row. Global because the wrap is —
+         ten admin pages use it and none should have to opt in.
+         See app/web/static/js/table_scroll_cue.js. -->
+    <script src="{{ static_url('js/table_scroll_cue.js') }}" defer></script>
     <!-- window.confirmModal / alertModal / promptModal — design-system
          replacements for native confirm()/alert()/prompt() (#497 §1).
          Defined here alongside the other end-of-<body> app globals (e.g.
@@ -42,6 +69,19 @@
       // soft-deleted resources can be brought back inside the dwell
       // window (default 10s). Click Undo → POST + onSuccess() (typically
       // a list refresh) — then the toast closes.
+      //
+      // `restoreUrl` may instead be a FUNCTION returning a promise, for an
+      // undo that is not a bare POST to a URL: /chats un-archives with
+      // `PUT /api/chat/sessions/{id}/archived {archived:false}`, which this
+      // helper cannot express as a URL alone. Everything else about the toast
+      // is identical, so a caller with an odd verb does not need its own.
+      //
+      // The two forms report failure differently and must not be conflated: a
+      // URL is judged on `response.ok`, while a CALLBACK is judged on whether
+      // its promise settles — resolve is success, reject is failure. Reading
+      // `.ok` off a callback's result is what would break the common case,
+      // since a fetch wrapper that throws on non-2xx (the app's own `api()`
+      // does) resolves with parsed JSON that has no `ok` at all.
       window.showUndoToast = function (message, restoreUrl, onSuccess, dwellMs) {
         const dwell = dwellMs || 10000;
         let el = document.getElementById('agnes-undo-toast');
@@ -83,25 +123,28 @@
           clearTimeout(timer);
           btn.disabled = true;
           btn.textContent = 'Restoring…';
+          const fail = (why) => {
+            msg.textContent = 'Undo failed: ' + why;
+            btn.textContent = 'Undo';
+            btn.disabled = false;
+          };
           try {
-            const r = await fetch(restoreUrl, {
-              method: 'POST', credentials: 'same-origin',
-            });
-            if (!r.ok) {
-              const d = await r.json().catch(() => ({}));
-              msg.textContent = 'Undo failed: ' + (d.detail || r.statusText);
-              btn.textContent = 'Undo';
-              btn.disabled = false;
-              return;
+            if (typeof restoreUrl === 'function') {
+              await restoreUrl();   // rejects on failure; nothing to inspect
+            } else {
+              const r = await fetch(restoreUrl, { method: 'POST', credentials: 'same-origin' });
+              if (!r.ok) {
+                const d = await r.json().catch(() => ({}));
+                fail(d.detail || r.statusText);
+                return;
+              }
             }
             dismiss();
             if (typeof onSuccess === 'function') {
               try { onSuccess(); } catch (_) { /* swallow */ }
             }
           } catch (e) {
-            msg.textContent = 'Network error: ' + e.message;
-            btn.textContent = 'Undo';
-            btn.disabled = false;
+            fail(e.message || 'something went wrong');
           }
         });
       };
@@ -358,6 +401,10 @@
           { label: 'Telemetry',                   hint: 'admin',        href: '/admin/telemetry' },
           { label: 'Sessions',                    hint: 'admin',        href: '/admin/sessions' },
           { label: 'Curated marketplaces',        hint: 'admin · g c',  href: '/admin/marketplaces' },
+          {# Ungated: this list only renders for an admin (`#adminMenu`), and an
+             admin's authoring always succeeds — the apply endpoint's admin
+             branch is a plain admin write, not Studio-gated. #}
+          { label: 'New semantic model',           hint: 'authoring',    href: '/semantic-layer/new' },
           {% if can_studio %}
           { label: 'Studio',                       hint: 'authoring',    href: '/admin/studio' },
           { label: 'Studio · Data package',       hint: 'authoring',    href: '/admin/studio/data-package' },

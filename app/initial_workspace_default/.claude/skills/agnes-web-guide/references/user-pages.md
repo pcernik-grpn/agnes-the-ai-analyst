@@ -11,7 +11,7 @@ user sees there, and when to send them.
   rename, pin, bulk cleanup. "Where did our conversation from last week go?"
   → here.
 - `/library` — the one browse surface for everything the user can have or
-  already has: uploaded files & artefacts, data packages, corporate-memory
+  already has: uploaded files & artifacts, data packages, corporate-memory
   domains, marketplace plugins, recipes, skills, agents, and items shared
   with them. An *In stack only* toggle narrows the list to what they
   subscribed to, the *Not in stack yet* filter (in the Filter menu) shows
@@ -23,6 +23,11 @@ user sees there, and when to send them.
   (schema, sample rows, query mode), a data package at
   `/catalog/p/{slug}`, a recipe at `/catalog/r/{slug}`, a memory domain at
   `/memory/d/{slug}`, a hosted data app at `/apps/detail/{slug}`.
+  A collection's own page is also where its OWNER (or an admin) manages it:
+  *Edit details* renames it and rewrites its description, *Delete* removes it,
+  and each file row has its own delete. A collection fed by a source
+  connection shows "managed by …" instead — its name and content come from
+  that source. Renaming never changes the `/library/{slug}` URL.
 - `/agents` — the agent builder: create a named, scoped agent over the
   user's own stack — identity, knowledge, capabilities, surfaces,
   schedules, boundaries. The model and other boundaries are admin-set
@@ -33,14 +38,23 @@ user sees there, and when to send them.
 
 ## Data & semantics
 
-- `/semantic-layer` — the semantic models: datasets, fields, relationships,
-  metrics, glossary. Each model opens at `/semantic-layer/{slug}` and each
-  object at `/semantic-layer/{slug}/{object_id}`.
-  Two more tabs on the same page list every metric and glossary term
-  registered here, document-backed or not:
-  `/semantic-layer?tab=all_metrics` and `/semantic-layer?tab=all_glossary`.
-  "What is our canonical MRR?" → the All metrics tab (or
+- `/semantic-layer` — **Definitions**: the organization's metrics, glossary
+  and the semantic models they are projected from, in three views of one
+  page. Metrics and glossary terms are listed whether or not a document
+  backs them (`?tab=all_metrics`, `?tab=all_glossary`); the models view
+  lists the stored documents, each opening at `/semantic-layer/{slug}` and
+  each object at `/semantic-layer/{slug}/{object_id}`.
+  "What is our canonical MRR?" → the metrics view (or
   `agnes catalog --metrics` in chat).
+- `/semantic-layer/new` — author a semantic model: tell a conversation which
+  tables it should describe and it drafts datasets, columns and metrics for
+  you, grounded in what is actually registered here — it never invents a
+  table path or a column name. The panel on the right is the real
+  configuration, always hand-editable. Reached from the **+ New model** card
+  on Definitions. An admin's model publishes straight away; anyone else's is
+  submitted for an admin to review, and the button says which before you
+  press it. Available to non-admins only while the Studio surface is on —
+  the page says so when it is not.
 
 ## Skills, plugins & the store
 

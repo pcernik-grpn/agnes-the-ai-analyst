@@ -3,7 +3,7 @@
 Every file format (images, documents, anything else) shares ONE top-level
 "Files" section, with multi-file collections nested inside it as folders:
 
-  - a single-file artefact IS its file — a loose row, draggable into a folder;
+  - a single-file artifact IS its file — a loose row, draggable into a folder;
   - a multi-file collection is a folder row: a drop target that expands to its
     files, each of which has its own detail page AND its own sharing;
   - non-file kinds (skills, data packages, memory, …) stay separate top-level
@@ -267,7 +267,7 @@ def test_group_header_carries_label_count_and_hint(seeded_app):
     assert 'aria-expanded="true"' in head
     assert "fbar-group__caret" in head
     assert "lib-sec-icon" in head  # the per-type glyph
-    assert ">Artefacts<" in head
+    assert ">Artifacts<" in head
     assert "data-sec-count" in head
     assert "Files you upload and the outputs your agent generates." in head
 
@@ -429,13 +429,17 @@ def test_every_section_shares_one_fixed_column_grid(seeded_app):
 def test_nested_files_use_the_plain_row_with_a_connector(seeded_app):
     """Nesting is carried by indentation + a connector rail, not a tinted band:
     a child row is the same white row as any other, and the last child is marked
-    so its rail can stop at the elbow."""
+    so its rail can stop at the elbow.
+
+    Child rows are never pre-rendered on the index (round 2 of the incident
+    fix) — they are fetched lazily from `/library/{slug}/peek` the first time
+    the reader expands the folder, so that is what this asserts against."""
     import re
 
     tok = seeded_app["admin_token"]
-    _folder(seeded_app, "Connector Folder", tok, names=("c1.md", "c2.md"))
+    col = _folder(seeded_app, "Connector Folder", tok, names=("c1.md", "c2.md"))
 
-    text = seeded_app["client"].get("/library", headers=_auth(tok)).text
+    text = seeded_app["client"].get(f"/library/{col['slug']}/peek", headers=_auth(tok)).text
     kids = re.findall(r'<tr class="lib-row lib-row--file lib-row--child[^"]*"', text)
     assert len(kids) >= 2
     assert any("lib-row--lastchild" in k for k in kids), "last child not marked"
@@ -508,18 +512,21 @@ def test_file_rows_show_their_format_where_the_description_was(seeded_app):
         return m.group(1).strip() if m else ""
 
     loose = re.search(r'<tr class="lib-row lib-row--file"(?:(?!</tr>).)*?Format Solo.*?</tr>', text, re.S)
-    assert loose, "the single-file artefact must render as a loose file row"
+    assert loose, "the single-file artifact must render as a loose file row"
     assert _desc(loose.group(0)) == "MD"
     # The retired boilerplate is gone from the row entirely.
     assert "A private file — searchable by your agents." not in loose.group(0)
 
     folder_row = re.search(r'<tr class="lib-row lib-row--folder"(?:(?!</tr>).)*?Format Folder.*?</tr>', text, re.S)
-    assert folder_row, "a 2-file artefact must render as a folder row"
+    assert folder_row, "a 2-file artifact must render as a folder row"
     assert _desc(folder_row.group(0)) == "2 files"
 
-    # Children: titled by filename, second line = their own format. No closing
-    # quote in the pattern — the last child carries `lib-row--lastchild` too.
-    kids = re.findall(r'<tr class="lib-row lib-row--file lib-row--child.*?</tr>', text, re.S)
+    # Children: titled by filename, second line = their own format. Fetched
+    # lazily from `/library/{slug}/peek` (round 2 of the incident fix), not
+    # pre-rendered on the index. No closing quote in the pattern — the last
+    # child carries `lib-row--lastchild` too.
+    peek_text = seeded_app["client"].get(f"/library/{folder['slug']}/peek", headers=_auth(tok)).text
+    kids = re.findall(r'<tr class="lib-row lib-row--file lib-row--child.*?</tr>', peek_text, re.S)
     kid_formats = {_desc(k) for k in kids}
     assert {"PNG", "CSV"} <= kid_formats, kid_formats
     # The format also rides the row, for the in-place file⇄collection transitions.
@@ -936,8 +943,10 @@ def test_a_single_file_can_be_shared_without_its_folder(seeded_app):
     assert r.json()["visibility"] == "workspace"
     # The folder itself is untouched.
     assert c.get(f"/api/sharing/collection/{col['id']}", headers=_auth(tok)).json()["visibility"] == "private"
-    # And the Library shows the file's own state.
-    text = c.get("/library", headers=_auth(tok)).text
+    # And the Library shows the file's own state — on its peek row, fetched
+    # lazily on expand rather than pre-rendered on the index (round 2 of the
+    # incident fix: a folder's files are never listed at index-render time).
+    text = c.get(f"/library/{col['slug']}/peek", headers=_auth(tok)).text
     assert 'data-share-type="corpus_file"' in text
 
 
@@ -1024,7 +1033,7 @@ def test_per_file_sharing_is_owner_scoped(seeded_app):
 
 
 def test_move_puts_a_loose_file_into_a_folder_and_tidies_the_husk(seeded_app):
-    """Dragging a single-file artefact into a folder must not strand an empty
+    """Dragging a single-file artifact into a folder must not strand an empty
     collection in the listing — a loose file IS its collection."""
     tok = seeded_app["admin_token"]
     solo = _collection(seeded_app, "Lonely File", tok)

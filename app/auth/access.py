@@ -141,7 +141,22 @@ def is_user_admin(user_id: str, conn: Optional[duckdb.DuckDBPyConnection] = None
 
     ``conn`` honored when explicitly passed (test isolation); falls back
     to the global factory otherwise.
+
+    **Always False for the subject of an active read-only view-as** (see
+    ``app/auth/view_as.py``). This is the choke point every admin gate in the
+    codebase is built out of — ``require_admin``, ``is_admin_session``,
+    ``src.rbac``'s short-circuit, ``_attach_admin_flag``'s chrome flag — so
+    suppressing god-mode HERE is what makes "view-as can only ever narrow"
+    true by construction rather than by remembering to check it at each gate.
+    It matters most in the case that looks harmless: viewing as another ADMIN
+    must not hand the mode admin authority. Subject-scoped, so a question
+    asked about somebody ELSE (an admin page listing who is an admin) still
+    gets its true answer.
     """
+    from app.auth.view_as import is_narrowed_subject
+
+    if is_narrowed_subject(user_id):
+        return False
     admin_id = _get_group_id_by_name(SYSTEM_ADMIN_GROUP, conn=conn)
     if admin_id is None:
         # No Admin group seeded — defensively deny. Fail-closed beats the
@@ -462,11 +477,8 @@ def can_access_session(
     already built without the admin short-circuit, so consulting either here
     would re-introduce god-mode through the back door.
 
-    A ``ProducerPrincipal`` (or any future ``Principal`` outside this pair)
-    has no ``intersection`` at all — its authority is enforced elsewhere
-    (see ``app.auth.producer_token``'s module docstring) via a small,
-    explicit, per-endpoint scope check, never this generic grant-table
-    primitive. Fail closed here rather than raise ``AttributeError`` — this
+    Any future ``Principal`` outside this pair may carry no
+    ``intersection`` at all. Fail closed here rather than raise ``AttributeError`` — this
     is what makes ``require_resource_access``/``require_collection_access``
     403 such a principal cleanly on every route that doesn't know it
     exists, instead of 500ing."""
@@ -548,104 +560,55 @@ def require_admin(
     return user
 
 
-def require_admin_or_producer(
+def require_admin_all_surface(
     user=Depends(get_current_user),
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
 ):
-    """Like :func:`require_admin`, but ALSO accepts a ``ProducerPrincipal``
-    — the corpus-extraction producer's own ingest/corrections callback
-    credential (see ``app.auth.producer_token``). Used by
-    ``POST /api/facts/ingest`` and ``GET /api/facts/corrections``, neither
-    of which has a single path-scoped resource id to check up front the
-    way ``require_admin_or_producer_connection`` / ``require_collection_
-    write_or_producer_access`` below do — each of those two routes applies
-    its own body-level (ingest) or documented (corrections) scope handling
-    instead.
+    """Like :func:`require_admin`, but ALSO requires the credential's
+    data-read surface to be ``'all'`` (v106) -- for a route whose "admin"
+    gate is the ONLY authorization check between the caller and raw,
+    unfiltered, unpolicied data: no per-table grant check, no access-policy
+    rewrite, no direct-path guardrail of its own.
+
+    ``agnes init`` / ``agnes login`` mint ``surface='stack'`` PATs by
+    default (``app/api/cli_auth.py``) -- deliberately filtered like an
+    ordinary analyst everywhere else in Agnes
+    (``docs/table-access-policies.md``, "The admin bypass"). A route gated
+    by plain ``require_admin`` alone hands that PAT full admin god-mode
+    anyway, which is exactly wrong for a route with no table-level RBAC or
+    policy rewrite standing behind it -- see ``POST /api/query/hybrid``
+    (finding K2, RLS review #1979). Every OTHER place this codebase decides
+    whether the admin bypass applies runs the identical
+    ``is_user_admin(...) and _credential_surface(user) == 'all'`` check --
+    ``src/rbac.py``'s ``can_access_table`` / ``get_accessible_tables``, and
+    ``app/api/query.py``'s ``_caller_is_unrestricted_admin`` (guarding a
+    direct ``bq.``/``sf.``/``kbc.`` path reference). This dependency is
+    that same, established predicate, mirrored for a route gated purely on
+    ``require_admin`` with no table-grain resolver underneath it to key
+    off instead -- not a new mechanism.
+
+    Distinct 403 detail from ``require_admin``'s own, so a client can tell
+    "you are not an admin" apart from "you ARE an admin, but this
+    credential's surface is too narrow for this endpoint" -- the fix for
+    the second is a fresh ``surface='all'`` PAT (``agnes init --as-admin``
+    / ``POST /cli/auth/rescope-surface``) or a browser session, not an
+    admin-group change.
     """
-    from app.auth.session_principal import ProducerPrincipal
+    user = require_admin(user=user, conn=conn)
+    from src.rbac import _credential_surface
 
-    if isinstance(user, ProducerPrincipal):
-        return user
-    return require_admin(user=user, conn=conn)
-
-
-def require_admin_or_producer_connection(path_template: str):
-    """Dependency factory: admin (see :func:`require_admin`) OR a
-    ``ProducerPrincipal`` whose own ``connection_id`` matches the path's
-    resolved connection id — the corpus-map / scopes handoff a
-    corpus-extraction producer calls back into (see
-    ``app.auth.producer_token``). A producer token minted for a DIFFERENT
-    connection, or any other non-admin credential, 403s.
-    """
-
-    def dep(
-        request: Request,
-        user=Depends(get_current_user),
-        conn: duckdb.DuckDBPyConnection = Depends(_get_db),
-    ):
-        from app.auth.session_principal import ProducerPrincipal
-
-        if isinstance(user, ProducerPrincipal):
-            try:
-                resource_id = path_template.format(**request.path_params)
-            except KeyError as e:
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail=(
-                        f"require_admin_or_producer_connection: path_template {path_template!r} "
-                        f"references missing path_param {e}"
-                    ),
-                )
-            if resource_id != user.connection_id:
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="producer_wrong_connection",
-                )
-            return user
-        return require_admin(user=user, conn=conn)
-
-    return dep
-
-
-def require_collection_write_or_producer_access(path_template: str):
-    """Dependency factory mirroring :func:`require_collection_access`, but
-    ALSO accepting a ``ProducerPrincipal`` scoped to this collection (the
-    corpus-extraction producer's upload callback — see
-    ``app.auth.producer_token``). Used ONLY by
-    ``POST /api/collections/{collection_id}/files`` — every OTHER
-    collection route keeps ``require_collection_access`` unchanged, so a
-    producer token that authenticates here still 403s on
-    read/delete/reingest/preview/raw for the SAME collection.
-    """
-    base_dep = require_collection_access(path_template)
-
-    def dep(
-        request: Request,
-        user=Depends(get_current_user),
-        conn: duckdb.DuckDBPyConnection = Depends(_get_db),
-    ):
-        from app.auth.session_principal import ProducerPrincipal
-
-        if isinstance(user, ProducerPrincipal):
-            try:
-                resource_id = path_template.format(**request.path_params)
-            except KeyError as e:
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail=(
-                        f"require_collection_write_or_producer_access: path_template {path_template!r} "
-                        f"references missing path_param {e}"
-                    ),
-                )
-            if resource_id not in user.collection_ids:
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail=f"Access denied to collection {resource_id!r}",
-                )
-            return user
-        return base_dep(request=request, user=user, conn=conn)
-
-    return dep
+    if _credential_surface(user) != "all":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "This endpoint requires an admin credential with the full "
+                "('all') data-read surface — a surface='stack' PAT (the "
+                "`agnes init` default) is filtered like an analyst here. "
+                "Use a browser session, a regular PAT, or "
+                "`agnes init --as-admin`."
+            ),
+        )
+    return user
 
 
 def require_agent_profiles_enabled() -> None:

@@ -459,6 +459,9 @@
   .ax-res__state { flex: 0 0 auto; font-size: 11.5px; font-weight: 600; color: var(--ds-accent-success-ink); }
   .ax-res__act { flex: 0 0 auto; }
   .ax-res__msg { padding: 10px 8px; font-size: 12.5px; color: var(--ds-text-muted); }
+  /* A failed lookup, not an empty one — distinct ink so it does not read
+     as just another "nobody matched" line. */
+  .ax-res__msg--error { color: var(--ds-accent-warn-ink); }
 
   /* Where a member came from, and when — one cell, two weights, the same
      shape the retired detail page's Origin column had. */
@@ -581,7 +584,33 @@
   .ax-simrow { display: flex; align-items: flex-end; gap: 10px; flex-wrap: wrap; margin-bottom: 16px; }
   .ax-simrow label { display: block; font-size: 12.5px; font-weight: 700; margin-bottom: 5px; color: var(--ds-text-primary); }
   .ax-simrow .fbar-select select { min-width: 320px; }
-  .ax-chips { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 14px; }
+  /* The row's controls are ONE horizontal set with the person picker, so they
+     take the picker's height (38px) rather than `.btn`'s own.
+
+     `font-family` and `line-height` are re-inherited here because a
+     `<button>` does not get them from `.btn`: browsers apply their own UA
+     font to form controls, and `.btn` sets only font-size and font-weight.
+     That is why the two controls in this row came out different sizes — the
+     anchor ("Open their profile") rendered in Inter at the body's
+     line-height and the submit button ("View a page as them") in the UA font
+     at `line-height: normal`.
+
+     Scoped to this row deliberately. The same mismatch exists anywhere a
+     `ds.button(type='submit')` sits beside a `ds.button(href=…)`, but the
+     shared `.btn` rule is the wrong place to fix it from here: correcting it
+     there changes the height of every button in the product, and the anchors
+     are the ones that would move. That is its own change, with its own
+     visual sweep — not a side effect of this one. */
+  .ax-simrow .btn {
+    height: 38px;
+    padding: 0 16px;
+    font-family: inherit;
+    line-height: 1;
+  }
+  /* `.ax-chips` — the row of badges that stood between the picker and the
+     panel — is gone with the badges. The two rules that remain further down
+     (`margin`, `[hidden]`) belong to the FILTER toolbar's chip row, which
+     shares the class name and gets its layout from `.fbar-chips`. */
   .ax-chip {
     display: inline-flex; align-items: center; gap: 6px;
     font-size: 12px; font-weight: 700; padding: 3px 10px;
@@ -625,9 +654,27 @@
     border-top: 1px solid var(--ds-border-light);
   }
   .ax-preview__row:first-child { border-top: 0; }
-  .ax-preview__name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ax-preview__name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .ax-preview__name a { color: inherit; text-decoration: none; }
   .ax-preview__name a:hover { color: var(--ds-primary); text-decoration: underline; text-underline-offset: 2px; }
+  /* Which group the grant travels through — the WHY, in the row it explains.
+     It used to be a separate chain entry per package below this panel, which
+     is how one package came to be rendered three times on one screen: a
+     chip up top, a row here, and a chain entry underneath, in two different
+     vocabularies. One row now carries name, route and state. */
+  .ax-preview__via {
+    flex: 0 1 auto; min-width: 0;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    font-size: 12px; color: var(--ds-text-muted);
+  }
+  .ax-preview__via code { font-size: 11.5px; }
+  /* A band of things that are WRONG or MISSING reads as part of the same
+     list, not as an alert box beside it — the whole point of folding the
+     chips in here. Only the label earns weight. */
+  .ax-preview__band--gap .ax-preview__label { color: var(--ds-text-primary); }
+  .ax-preview__more { padding: 5px 0 0; font-size: 12px; color: var(--ds-text-muted); }
+  .ax-selfnote { align-self: center; font-size: 12.5px; color: var(--ds-text-muted); }
+  .ax-selfnote[hidden] { display: none; }
 
   .ax-chain { margin: 6px 0 0; padding: 0; list-style: none; }
   .ax-chain li {
@@ -2569,8 +2616,38 @@
                          options=[{'value': '', 'label': 'Loading people…'}]) }}
         </span>
       </div>
+      {# Secondary: ordinary navigation to a page reachable from People too.
+         The primary is the view-as below — the one action this lens offers
+         that nothing else in the product does. #}
       {{ ds.button('Open their profile →', variant='secondary', id='ax-sim-detail',
                    href='/admin/users', attrs='hidden') }}
+      {# Read-only view-as. A POST form, never a link: entering changes the
+         effective principal of this browser session, and a state change on a
+         GET is exactly the CSRF hole `slack_bind` was bitten by (security
+         playbook §10). The hidden `user_id` is filled in by the person
+         picker below; `next` sends the admin to the Library, the page whose
+         answer differs most between two people.
+
+         `return_to` is the other half of that trip: this page, with this
+         person still picked, so exiting finishes the errand instead of
+         abandoning the admin on whichever page they stopped browsing. Filled
+         in by the picker alongside `user_id` (the lens + person already live
+         in the URL), and signed into the ticket so the whole browse comes
+         back here however far it wandered. #}
+      <form method="post" action="/admin/view-as" id="ax-sim-viewas" hidden>
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="user_id" id="ax-sim-viewas-uid" value="">
+        <input type="hidden" name="next" value="/library">
+        <input type="hidden" name="return_to" id="ax-sim-viewas-return" value="">
+        {{ ds.button('View a page as them →', variant='primary', type='submit',
+                     attrs='title="Opens Agnes read-only as this person — you cannot change anything until you exit."') }}
+      </form>
+      {# The caller's own row. `view_as_self` is a real refusal at the entry
+         route — there is no view of yourself to open, and the mode would have
+         nothing to narrow — so the button is not offered rather than offered
+         and then refused with a machine token on a full-page 400. Same rule
+         the rest of the product follows: never offer what cannot succeed. #}
+      <span class="ax-selfnote" id="ax-sim-self" hidden>That is you — pick someone else to open a page as them.</span>
     </div>
     <div id="ax-sim-out"><div class="ax-empty">Pick a person to see what they can use, and why.</div></div>
   </div>
@@ -2589,6 +2666,9 @@
   const OVERVIEW_API = "/api/admin/access-overview";
   const USERS_LIST_API = "/api/users";        // list + search + single user
   const ADMIN_USERS_API = "/api/admin/users"; // memberships + effective-access
+  // Who is looking. Used only to withhold the view-as offer on the caller's
+  // own row — the server refuses it either way (`view_as_self`).
+  const VIEWER_USER_ID = {{ viewer_user_id | tojson }};
 
   // Data packages first — the redesign's spine. Everything else keeps a
   // section but stays collapsed: breadth disclosed, never removed.
@@ -2887,6 +2967,25 @@
      on 32 hex characters, and it is what the rest of the product calls it. */
   const itemName = (i) => (i && (i.name || i.slug || i.resource_id)) || "";
 
+  /* WHOSE it is, and how much is in it — returns escaped HTML, so callers
+     must not re-escape. Only the collection/file projections carry these
+     fields today (app/resource_types.py); every other kind renders exactly as
+     before, because both bits are simply absent.
+
+     This exists because an inventory of private uploads is unreadable without
+     an owner: a chat file-drop becomes a one-file collection named after the
+     file, so an admin — who sees every collection by god-mode — got a flat
+     list of filenames with nothing saying they belonged to someone else. */
+  const itemProvenance = (i) => {
+    if (!i) return "";
+    const bits = [];
+    if (i.owner_email) bits.push(`owned by ${esc(i.owner_email)}`);
+    if (typeof i.file_count === "number") {
+      bits.push(`${i.file_count} ${i.file_count === 1 ? "file" : "files"}`);
+    }
+    return bits.join(" · ");
+  };
+
   /* Admin-side page per kind — where an ADMIN goes to change a grant, as
      opposed to where an analyst goes to use the thing. Only the kinds that
      have one; anything else keeps its analyst link. */
@@ -3077,7 +3176,7 @@
       for (const b of (t.blocks || [])) {
         for (const i of (b.items || [])) {
           itemText.set(`${t.type_key}:${i.resource_id}`,
-            `${i.name || ""} ${i.slug || ""} ${i.resource_id || ""} ${b.name || ""} ${t.type_display || ""}`.toLowerCase());
+            `${i.name || ""} ${i.slug || ""} ${i.resource_id || ""} ${i.owner_email || ""} ${b.name || ""} ${t.type_display || ""}`.toLowerCase());
         }
       }
     }
@@ -3376,7 +3475,7 @@
     // description, the block it sits in, and the kind it is.
     const fq = resourceFilter.trim().toLowerCase();
     const hits = (t, i) =>
-      !fq || `${i.name || ""} ${i.slug || ""} ${i.resource_id || ""} ${i.description || ""} ${i._block || ""} ${t.type_display || ""}`
+      !fq || `${i.name || ""} ${i.slug || ""} ${i.resource_id || ""} ${i.description || ""} ${i.owner_email || ""} ${i._block || ""} ${t.type_display || ""}`
         .toLowerCase().includes(fq);
     // "What does this group actually HAVE?" — the question that otherwise
     // means opening every type in turn to find the two that hold anything.
@@ -3432,9 +3531,17 @@
       <div class="ax-r" data-kind="${esc(kindToken(t))}" data-type="${esc(t.type_key)}" data-rid="${esc(i.resource_id)}"${grant.inherited ? ' data-inherited="1"' : ""}>
         ${kindTag(t)}
         <span class="ax-r__nm">${nameHtml}${blockName ? `<span class="ax-r__blk"> · ${esc(blockName)}</span>` : ""}
-          <span class="ax-r__d">${i.description ? esc(String(i.description).slice(0, 120)) : ""}${
-            i.description && who ? `<span class="ax-r__sep"> · </span>` : ""}${
-            who ? `<span class="ax-r__who">${owned ? "shared by" : "granted by"} ${esc(who)}</span>` : ""}</span>
+          <span class="ax-r__d">${(() => {
+            /* Built as a list rather than nested ternaries: the separator
+               logic was already the hard-to-read part of this row with two
+               possible chunks, and provenance makes three. */
+            const bits = [];
+            if (i.description) bits.push(esc(String(i.description).slice(0, 120)));
+            const prov = itemProvenance(i);
+            if (prov) bits.push(prov);
+            if (who) bits.push(`<span class="ax-r__who">${owned ? "shared by" : "granted by"} ${esc(who)}</span>`);
+            return bits.join(`<span class="ax-r__sep"> · </span>`);
+          })()}</span>
         </span>
         <span class="ax-r__ctl">${control}</span>
         <span class="ax-r__rd">${readsLabelled(t.type_key, tier)}</span>
@@ -3925,14 +4032,20 @@
     findActive = -1;
     if (!q) { out.innerHTML = ""; closeFind(); return; }
     const seq = ++findSeq;
-    let people = [];
-    try {
-      const r = await fetch(`${USERS_LIST_API}?search=${encodeURIComponent(q)}&limit=${FIND_LIMIT}`,
-                            { credentials: "include" });
-      people = r.ok ? await r.json() : [];
-      if (!Array.isArray(people)) people = people.users || [];
-    } catch (e) { people = []; }
+    // window.AgnesPeopleSearch (js/people_search.js) — the SAME lookup the
+    // group drawer's own People field uses, so the two "find an account"
+    // boxes on this page can never answer a query differently.
+    const { people, error } = await window.AgnesPeopleSearch.search(q, FIND_LIMIT);
     if (seq !== findSeq) return; // a later keystroke already answered
+
+    // A failed lookup (403/500/501, network error) is NOT "no account
+    // matches" — the two used to render identically, which is exactly what
+    // hid a real outage behind a wrong "no such person" reading.
+    if (error) {
+      out.innerHTML = `<p class="ax-res__msg ax-res__msg--error">Could not search accounts: ${esc(error)}</p>`;
+      openFind();
+      return;
+    }
 
     if (!people.length) {
       // (the seeded field is focused below, once it is in the DOM)
@@ -4390,9 +4503,17 @@
      package, and a real instance has hundreds of them, which would bury
      every row that carries a decision. `bundleFootnote()` says so on the
      page rather than leaving the omission to be discovered. */
+  /* `corpus_file` is here so the resource lens can answer "what files exist
+     on this instance, and who can reach them" — the question an admin asks
+     after seeing a filename they did not recognise. It is the one kind that
+     can run to thousands of rows, which is exactly what the kind filter and
+     the granted-to-nobody drawer are for: private uploads collect behind one
+     counted line at the foot instead of burying the rows that carry a
+     decision. (`table` stays out for the same volume reason with none of the
+     privacy question attached — a table name is in the catalog already.) */
   const BUNDLE_LEAD = new Set(["data_package", "memory_domain", "semantic_model", "recipe",
                                "marketplace_plugin", "store_entity", "data_app", "agent",
-                               "collection", "chat"]);
+                               "collection", "corpus_file", "chat"]);
 
   /* How many DISTINCT people a set of groups reaches.
 
@@ -4596,12 +4717,19 @@
     // `BUNDLE_LEAD`). The rest are reachable in the group view; leading with
     // 600 tables would bury the four rows that carry the decision.
     const rows = [];
+    let filesTruncated = false;
     for (const t of (overview.resources || [])) {
       if (!BUNDLE_LEAD.has(t.type_key)) continue;
       if (listKind && t.type_key !== listKind) continue;
       for (const b of (t.blocks || [])) {
+        // `items_truncated` (only ever true for `corpus_file`, see
+        // `_corpus_file_blocks`): this list is a bounded preview PLUS every
+        // file that already carries a grant, never the whole collection —
+        // said once below rather than the reader wondering why a file they
+        // remember uploading is not in the list.
+        if (t.type_key === "corpus_file" && b.items_truncated) filesTruncated = true;
         for (const i of (b.items || [])) {
-          const hay = `${i.name || ""} ${i.slug || ""} ${i.resource_id || ""} ${b.name || ""} ${t.type_display || ""}`.toLowerCase();
+          const hay = `${i.name || ""} ${i.slug || ""} ${i.resource_id || ""} ${i.owner_email || ""} ${b.name || ""} ${t.type_display || ""}`.toLowerCase();
           if (q && !hay.includes(q)) continue;
           const held = (overview.grants || []).filter(
             (g) => g.resource_type === t.type_key && g.resource_id === i.resource_id);
@@ -4609,6 +4737,11 @@
         }
       }
     }
+    const truncatedNote = filesTruncated
+      ? `<div class="ax-empty">Files: showing granted files plus a preview of the rest — not
+           every file on the instance. Use a group's <b>+ Add</b> and search by name to find one
+           that is not listed here.</div>`
+      : "";
     if (!rows.length) {
       /* "Every bundle on the instance was searched" is the best sentence on
          this page when it is TRUE — it pre-empts exactly the doubt a miss
@@ -4619,7 +4752,7 @@
       const kindName = listKind
         ? ((overview.resources || []).find((t) => t.type_key === listKind) || {}).type_display
         : "";
-      host.innerHTML = `<div class="ax-empty">Nothing here is called “${esc(groupFilter)}”.
+      host.innerHTML = truncatedNote + `<div class="ax-empty">Nothing here is called “${esc(groupFilter)}”.
         ${listKind
           ? `Only ${esc(String(kindName || listKind).toLowerCase())} were searched —
              <button type="button" class="ax-linkbtn" data-chip-clear>search every kind</button>.`
@@ -4678,9 +4811,15 @@
       const who = heldNames.length && heldNames.length <= 3
         ? heldNames.join(", ")
         : `${r.held.length} ${r.held.length === 1 ? "group" : "groups"}`;
-      const meta = nobody
+      /* "granted to nobody" is the honest reach of a private upload, but on
+         its own it reads as an oversight to fix. Naming the owner in the same
+         line says which it is: nobody else can reach this AND it belongs to
+         someone — i.e. working as intended. */
+      const prov = itemProvenance(r.i);
+      const reachLine = nobody
         ? "granted to nobody"
         : `${who} · ${reach} ${reach === 1 ? "person" : "people"}`;
+      const meta = prov ? `${reachLine} · ${prov}` : reachLine;
       const bkey = `${r.t.type_key}:${r.i.resource_id}`;
       return `
       <details class="ax-gs ax-gs--bb${nobody ? " is-nobody" : ""}" data-bb="${esc(bkey)}"${
@@ -4818,7 +4957,7 @@
     const noneGrantedMsg = (groupFilter.trim() || listKind)
       ? "Nothing matching this is granted to any group."
       : "Nothing on this instance is granted to anyone yet.";
-    host.innerHTML = (painted
+    host.innerHTML = truncatedNote + (painted
       || `<div class="ax-empty">${noneGrantedMsg}</div>`) + nobodyLine;
   }
 
@@ -5278,6 +5417,43 @@
     collapsed: new Set(),     //: families folded away, by key
   };
 
+  /* `corpus_file` is the one kind the picker cannot answer from `overview`
+     any more — the overview projection caps how many files of one
+     collection it lists (see `_corpus_file_blocks`), so past that cap the
+     picker has to ASK the server instead of filtering a preloaded array.
+     `q`/`token` guard against a slow response for an earlier keystroke
+     clobbering a faster one for a later keystroke. */
+  let pickerRemoteFiles = { q: "", items: [], token: 0 };
+
+  async function fetchCorpusFileCandidates(q) {
+    const term = q.trim();
+    const token = ++pickerRemoteFiles.token;
+    if (term.length < 2) {
+      pickerRemoteFiles = { q: "", items: [], token };
+      paintPicker();
+      return;
+    }
+    let items = [];
+    try {
+      const r = await fetch(
+        `/api/admin/access/resources/corpus_file/search?q=${encodeURIComponent(term)}&limit=50`,
+        { credentials: "include" },
+      );
+      if (r.ok) items = await r.json();
+    } catch (err) {
+      items = [];
+    }
+    if (token !== pickerRemoteFiles.token) return; // a newer keystroke already superseded this fetch
+    pickerRemoteFiles = { q: term, items, token };
+    paintPicker();
+  }
+
+  let pickerRemoteDebounce = null;
+  function scheduleCorpusFileSearch(q) {
+    if (pickerRemoteDebounce) clearTimeout(pickerRemoteDebounce);
+    pickerRemoteDebounce = setTimeout(() => fetchCorpusFileCandidates(q), 200);
+  }
+
   function buildPicker() {
     if (pickerEls) return pickerEls;
     const root = document.createElement("div");
@@ -5355,6 +5531,12 @@
         const menu = root.querySelector('[data-pk="kinds"]');
         if (menu) menu.hidden = true;
         paintPicker();
+        // Switching the filter TO corpus_file (or clearing it) while a
+        // query is already typed needs a fetch of its own — the picker
+        // only searched files if that kind was already selected.
+        if (pickerState.mode === "resources" && (!pickerState.kind || pickerState.kind === "corpus_file")) {
+          scheduleCorpusFileSearch(pickerState.q);
+        }
         return;
       }
       const row = e.target.closest("[data-pk-item]");
@@ -5365,7 +5547,15 @@
         paintPicker();
       }
     });
-    pickerEls.q.addEventListener("input", (e) => { pickerState.q = e.target.value; paintPicker(); });
+    pickerEls.q.addEventListener("input", (e) => {
+      pickerState.q = e.target.value;
+      paintPicker();
+      // `corpus_file` items past the overview's preview cap only exist on
+      // the server — everything else is already filtered locally above.
+      if (pickerState.mode === "resources" && (!pickerState.kind || pickerState.kind === "corpus_file")) {
+        scheduleCorpusFileSearch(pickerState.q);
+      }
+    });
     document.addEventListener("keydown", (e) => {
       if (e.key === "Escape" && !root.hidden) closePicker();
     });
@@ -5384,20 +5574,38 @@
   }
 
   //: Everything grantable the group does not already hold, by family.
+  //: `corpus_file` also mixes in the server-side search results — the
+  //: overview projection only ever carries a capped preview of each
+  //: collection's files (see `_corpus_file_blocks`), so most files are
+  //: reachable only through `pickerRemoteFiles`.
   function pickerCandidates() {
     const q = pickerState.q.trim().toLowerCase();
     const out = new Map();
+    const seenCorpusFileIds = new Set();
+    const corpusFileType = (overview.resources || []).find((t) => t.type_key === "corpus_file");
     for (const t of (overview.resources || [])) {
       for (const b of (t.blocks || [])) {
         for (const i of (b.items || [])) {
           if (grantOf(pickerState.group, t.type_key, i.resource_id)) continue;
-          const hay = `${i.name || ""} ${i.slug || ""} ${i.resource_id || ""} ${b.name || ""} ${t.type_display || ""}`.toLowerCase();
+          const hay = `${i.name || ""} ${i.slug || ""} ${i.resource_id || ""} ${i.owner_email || ""} ${b.name || ""} ${t.type_display || ""}`.toLowerCase();
           if (q && !hay.includes(q)) continue;
           if (pickerState.kind && t.type_key !== pickerState.kind) continue;
+          if (t.type_key === "corpus_file") seenCorpusFileIds.add(i.resource_id);
           const fam = t.family || "knowledge";
           if (!out.has(fam)) out.set(fam, []);
           out.get(fam).push({ t, i, block: (b.name && b.name !== t.type_display) ? b.name : "" });
         }
+      }
+    }
+    const kindAllowsFiles = !pickerState.kind || pickerState.kind === "corpus_file";
+    if (corpusFileType && kindAllowsFiles && pickerRemoteFiles.q.toLowerCase() === q && q) {
+      const fam = corpusFileType.family || "knowledge";
+      if (!out.has(fam)) out.set(fam, []);
+      for (const i of pickerRemoteFiles.items) {
+        if (seenCorpusFileIds.has(i.resource_id)) continue;
+        if (grantOf(pickerState.group, "corpus_file", i.resource_id)) continue;
+        seenCorpusFileIds.add(i.resource_id);
+        out.get(fam).push({ t: corpusFileType, i, block: i.block_name || "" });
       }
     }
     return out;
@@ -5561,6 +5769,7 @@
     // sees.
     pickerState = { mode: "resources", group: groupId, bundle: null,
                     chosen: new Set(), q: "", kind: "", collapsed: new Set() };
+    pickerRemoteFiles = { q: "", items: [], token: pickerRemoteFiles.token };
     els.q.value = "";
     els.q.placeholder = "Search everything grantable…";
     els.root.querySelector("#pk-title").textContent = "Add to this group";
@@ -5569,6 +5778,17 @@
     els.sub.textContent = g
       ? `Everything ${titleOf(g)} does not have yet. Anything with a tier is added as Available.`
       : "";
+    // `items_truncated` is how the (capped) overview says "this is a
+    // preview, not the whole list" — said once, here, rather than the
+    // reader discovering it by counting rows against a total they cannot
+    // see. Only files ever truncate; every other kind's projection is
+    // small enough to list in full (see `_corpus_file_blocks`).
+    const filesTruncated = ((overview.resources || []).find((t) => t.type_key === "corpus_file")?.blocks || [])
+      .some((b) => b.items_truncated);
+    if (filesTruncated) {
+      els.sub.textContent += (els.sub.textContent ? " " : "") +
+        "Files: only a preview is listed — type 2+ characters to search every file by name.";
+    }
     paintPicker();
     // `.ds-drawer` is display:none until `.is-open` — the same two-step the
     // group drawer uses (`group_drawer.js`), because the overlay animates in
@@ -5583,6 +5803,7 @@
     if (!pickerEls) return;
     pickerEls.root.classList.remove("is-open");
     pickerEls.root.hidden = true;
+    if (pickerRemoteDebounce) { clearTimeout(pickerRemoteDebounce); pickerRemoteDebounce = null; }
   }
 
   /* Apply writes every choice, then says what happened — including what did
@@ -5695,13 +5916,38 @@
     history.replaceState(null, "", url);
     const out = el("ax-sim-out");
     const detailBtn = el("ax-sim-detail");
+    // Read-only view-as form: shown only once a person is picked, and the id
+    // is set on the hidden field rather than in the action URL so the POST
+    // body carries it alongside the CSRF token.
+    const viewAsForm = el("ax-sim-viewas");
+    const viewAsUid = el("ax-sim-viewas-uid");
+    const viewAsReturn = el("ax-sim-viewas-return");
+    const viewAsSelf = el("ax-sim-self");
+    if (viewAsSelf) viewAsSelf.hidden = true;
     if (!uid) {
       out.innerHTML = `<div class="ax-empty">Pick a person to see what they can use, and why.</div>`;
       detailBtn.hidden = true;
+      if (viewAsForm) viewAsForm.hidden = true;
       return;
     }
     detailBtn.hidden = false;
     detailBtn.href = `/admin/users/${encodeURIComponent(uid)}`;
+    // The caller's own row offers no view-as: the entry route refuses it
+    // (`view_as_self`), so offering it can only ever produce an error page.
+    const isSelf = !!VIEWER_USER_ID && uid === VIEWER_USER_ID;
+    if (isSelf) {
+      if (viewAsForm) viewAsForm.hidden = true;
+      if (viewAsSelf) viewAsSelf.hidden = false;
+    } else if (viewAsForm && viewAsUid) {
+      viewAsUid.value = uid;
+      // Where exiting comes back to: THIS lens with THIS person, read off the
+      // URL `history.replaceState` just wrote (path + search only — the server
+      // rejects anything that is not a same-origin absolute path). Set here
+      // rather than server-side in the template because the person changes
+      // without a page load, and a stale origin is worse than none.
+      if (viewAsReturn) viewAsReturn.value = url.pathname + url.search;
+      viewAsForm.hidden = false;
+    }
     out.innerHTML = `<div class="ax-empty">Resolving…</div>`;
     try {
       const [effResp, memResp, prevResp] = await Promise.all([
@@ -5748,16 +5994,16 @@
   // no local copy yet" (classic mode, not subscribed — granted but not
   // delivered). This lens exists to show what THEY see; saying it in words
   // they never see would defeat the whole point of it.
-  function renderLibraryPreview(preview, uid, isAdmin) {
+  function renderLibraryPreview(preview, uid, isAdmin, ctx) {
     if (!preview || !Array.isArray(preview.sections)) return "";
-    if (!preview.sections.length) {
-      // "nothing granted yet" is true of the GRANTS and false of the reach,
-      // and for an admin the difference is the whole answer.
-      return `<div class="ax-preview"><div class="ax-preview__head">What their Library shows</div>
-        <div class="ax-empty">${isAdmin
-          ? "The shared bands of their Library are empty — nothing is granted to their groups. They still reach everything as an admin."
-          : "The shared bands of their Library are empty — nothing granted yet."}</div></div>`;
-    }
+    /* The joined half: which group carries each grant, what is not shared at
+       all, and which grants point at nothing. Normalized rather than
+       required, so a caller that has not resolved it yet degrades to the
+       granted list alone instead of throwing. */
+    ctx = ctx || {};
+    const viaNames = ctx.viaNames || new Map();
+    const missing = ctx.missing || [];
+    const dangling = ctx.dangling || [];
     /* Where a row in this preview should take you.
 
        It used to be the item's ANALYST url with `?from=admin&user=` glued on
@@ -5781,7 +6027,24 @@
       return `${base}${sep}from=simulate&user=${encodeURIComponent(uid)}`;
     };
 
-    const bands = preview.sections.map((sec) => {
+    /* Which group carries the grant, joined from the effective-access read
+       this pane already holds. Absent for a kind the grant list does not
+       enumerate, in which case the row simply says nothing rather than
+       guessing a route. */
+    const viaText = (kind, id) => {
+      const names = viaNames.get(`${kind}:${id}`) || [];
+      if (!names.length) return "";
+      const shown = names.length > 2 ? `${names.slice(0, 2).join(", ")} +${names.length - 2}` : names.join(", ");
+      return `<span class="ax-preview__via" title="${esc(names.join(", "))}">via ${esc(shown)}</span>`;
+    };
+    const row = (name, via, state) =>
+      `<li class="ax-preview__row"><span class="ax-preview__name">${name}</span>${via}${state}</li>`;
+    const band = (label, count, rows, extra = "", cls = "") =>
+      `<div class="ax-preview__band${cls}">
+        <div class="ax-preview__label">${esc(label)} <span class="ax-preview__n">${count}</span></div>
+        <ul class="ax-preview__rows">${rows}</ul>${extra}</div>`;
+
+    const grantedBands = preview.sections.map((sec) => {
       const rows = (sec.items || []).map((it) => {
         const state = it.requirement === "required"
           ? `<span class="ax-chip ok" title="{{ words.tier_automatic_help }}">Automatic — set by you</span>`
@@ -5790,68 +6053,123 @@
             : `<span class="ax-chip info" title="{{ words.tier_optional_help }}">Optional — no local copy yet</span>`;
         const href = previewHref(sec.kind, it);
         const name = href ? `<a href="${esc(href)}">${esc(it.name)}</a>` : esc(it.name);
-        return `<li class="ax-preview__row"><span class="ax-preview__name">${name}</span>${state}</li>`;
+        return row(name, viaText(sec.kind, it.id), state);
       }).join("");
-      return `<div class="ax-preview__band">
-        <div class="ax-preview__label">${esc(sec.label)} <span class="ax-preview__n">${(sec.items || []).length}</span></div>
-        <ul class="ax-preview__rows">${rows}</ul></div>`;
+      /* "6 of 8" only where the remainder is ON SCREEN — the gap band below
+         is where those 2 are listed, so the two numbers are the same two
+         arrays and cannot disagree. The old chips claimed a count of their
+         own from a third source and capped it at six, which is how the
+         screen came to show 6 above a list of 8. */
+      const items = sec.items || [];
+      const total = sec.kind === "data_package" && missing.length
+        ? `${items.length} of ${items.length + missing.length}`
+        : `${items.length}`;
+      return band(sec.label, total, rows);
     }).join("");
+
+    // "nothing granted yet" is true of the GRANTS and false of the reach,
+    // and for an admin the difference is the whole answer.
+    const granted = preview.sections.length
+      ? grantedBands
+      : `<div class="ax-empty">${isAdmin
+          ? "The shared bands of their Library are empty — nothing is granted to their groups. They still reach everything as an admin."
+          : "The shared bands of their Library are empty — nothing granted yet."}</div>`;
+
+    /* ── The two bands the chips used to be ──────────────────────────────
+       Not a decorative move. These are the only two facts on this pane that
+       the granted list cannot contain — what is NOT shared, and what is
+       granted but points at nothing — and as chips above the panel they were
+       outnumbered six to one by green badges restating the list directly
+       beneath them. Same list, same vocabulary, same row shape: an admin
+       reads down one column and the exceptions are simply where they fall. */
+    const GAP_MAX = 12;
+
+    let gaps = "";
+    if (missing.length) {
+      const shown = missing.slice(0, GAP_MAX);
+      const rows = shown.map((p) => {
+        const href = `/admin/data-packages/${encodeURIComponent(p.resource_id)}?from=simulate&user=${encodeURIComponent(uid)}`;
+        // For an admin this is a fact about the PACKAGE, not a limit on the
+        // person — they reach it regardless, and saying "cannot use" to one
+        // was the loudest wrong answer on a page about who reaches what.
+        const state = isAdmin
+          ? `<span class="ax-chip info" title="Granted to no group at all. This person reaches it as an admin; nobody else does.">Granted to nobody</span>`
+          : `<span class="ax-chip no" title="No group this person is in has been granted this package.">No group of theirs</span>`;
+        return row(`<a href="${esc(href)}">${esc(p.name)}</a>`, "", state);
+      }).join("");
+      // Never a silent cut: the count in the label is the true one and the
+      // overflow says what it is not showing.
+      const more = missing.length > GAP_MAX
+        ? `<div class="ax-preview__more">+${missing.length - GAP_MAX} more not shared with them</div>`
+        : "";
+      gaps += band("Not shared with them", missing.length, rows, more, " ax-preview__band--gap");
+    }
+
+    if (dangling.length) {
+      const rows = dangling.map((p) => {
+        const g0 = (p.via_groups || [])[0];
+        const gid = g0 && g0.group_id;
+        const href = gid ? `/admin/access?group=${encodeURIComponent(gid)}` : "/admin/access";
+        // No name to print: nothing this page can list answers to the id,
+        // which is the finding. Deliberately "deleted OR unlisted" and not
+        // "deleted" — the test is membership in the admin projection, and a
+        // package that is soft-deleted or private to its owner fails it while
+        // still existing. A local preview surfaced one of each, which is how
+        // the stronger wording got caught.
+        //
+        // The id is set as code so it reads as an identifier rather than as a
+        // package someone named `pkg_356b2e8f37e5` — the retired chip ran it
+        // together with prose, which is exactly what the chain refuses to do.
+        return row(
+          `<a href="${esc(href)}"><code>${esc(p.resource_id)}</code></a>`,
+          viaText("data_package", p.resource_id) || (g0
+            ? `<span class="ax-preview__via">via ${esc(g0.group_name || g0.group_id)}</span>`
+            : ""),
+          `<span class="ax-chip warn" title="A grant still points at this id, but nothing this page can list answers to it — the package was deleted, or it is private to its owner. Open the group to remove the grant.">Deleted or unlisted</span>`,
+        );
+      }).join("");
+      gaps += band("Dangling grants", dangling.length, rows, "", " ax-preview__band--gap");
+    }
+
     return `<div class="ax-preview">
-      <div class="ax-preview__head">What their Library shows</div>${bands}</div>`;
+      <div class="ax-preview__head">What their Library shows</div>${granted}${gaps}</div>`;
   }
 
   function renderSimulation(uid, eff, memberships, preview) {
     const person = users.find((u) => u.id === uid) || {};
     const items = eff.items || [];
     const idx = resourceIndex();
-    const nameOf = (it) => {
-      const hit = idx.get(`${it.resource_type}:${it.resource_id}`);
-      return hit ? hit.name : it.resource_id;
-    };
 
     const packages = items.filter((i) => i.resource_type === "data_package");
     const others = items.filter((i) => i.resource_type !== "data_package");
 
     // A grant row whose target the projection no longer lists is a DANGLING
     // grant (package deleted, grant left behind) — the one thing this lens
-    // must not paint green. Split them out before the chips are built.
-    const live = packages.filter((p) => idx.has(`data_package:${p.resource_id}`));
+    // must not paint green. It gets its own band in the panel below.
     const dangling = packages.filter((p) => !idx.has(`data_package:${p.resource_id}`));
 
-    // Tier, joined from the same access-overview this page already holds:
-    // "can use" is a weaker answer than the one the pane's own lede promises
-    // ("membership to grant to tier"). required via any of their groups wins
-    // — one Required grant lands it in the stack regardless of the others.
-    const tierOf = (p) => {
-      const viaIds = new Set((p.via_groups || []).map((g) => g.group_id));
-      const rows = ((overview && overview.grants) || []).filter(
-        (g) => g.resource_type === "data_package"
-            && g.resource_id === p.resource_id
-            && viaIds.has(g.group_id),
-      );
-      if (!rows.length) return null;
-      return rows.some((g) => g.requirement === "required") ? "required" : "available";
-    };
-    /* Available's suffix words by MEMBERSHIP MODE (the preview reports which
-       one it computed under): under auto-membership every grant already IS a
-       stack membership, so "must add it" — the classic-mode fact — would
-       contradict the Library-shaped panel right below these chips. When the
-       preview failed to load the mode is unknown; classic is the default.
+    /* No tier words are computed here any more, and that is the shape of
+       this pane rather than a deletion.
 
-       The tier words here were the retired pair that
-       `tests/test_access_vocabulary.py` exists to keep off this page. They
-       survived its sweep because that guard matched the label as a whole
-       element and these are prose inside a chip — so one Required package
-       was named two different ways within two inches of itself, once here
-       and once as "Required by your admin" in the Library panel below.
-       One vocabulary now, and the guard reads the chip suffix too. */
-    const simMode = preview && preview.mode;
-    const tierText = (p) => {
-      const t = tierOf(p);
-      return t === "required" ? " · Required — in their stack"
-           : t === "available" ? (simMode === "auto" ? " · Available — in their stack" : " · Available — must add it")
-           : "";
-    };
+       A package's tier used to be written three times on one screen: as a
+       prose suffix on a chip up here, as a state chip in the Library panel
+       ("In their Library"), and again in the why-chain below it. The retired
+       suffix is deliberately not quoted here — the guard that keeps those
+       words off this page matches any occurrence, comments included, which
+       is the property that makes it worth having. Two of the three were prose, which is how the sweep in
+       `tests/test_access_vocabulary.py` — written after one Required package
+       was named two different ways within two inches of itself — could pass
+       while the drift was still on the page. The panel's own chips are the
+       only place a tier is worded now, so there is one definition instead of
+       three kept in step by a guard. The panel resolves it from
+       `library-preview`, the same projection `/library` renders that person's
+       bands from, which is a better source than this page's grant rows: it
+       already accounts for membership mode and it cannot drift from the page
+       it predicts.
+
+       The chips also capped themselves at six while the panel listed eight,
+       so the screen carried two disagreeing counts a centimetre apart. The
+       panel counts what it renders. */
 
     // What is NOT shared with them — the half a grant list cannot show, and
     // the reason someone opens this page at all.
@@ -5862,25 +6180,15 @@
     const missing = allPackages.filter((p) => !has.has(p.resource_id));
 
     const groupNames = memberships.map((g) => g.name || g.group_name || g.id).filter(Boolean);
-    /* An admin short-circuits every authorization check, so "Cannot use" is
-       simply false for one — and it was being rendered in red, four times,
-       directly under the grey chip saying they reach everything. On a page
-       whose whole job is answering "who can reach what", the loudest thing
-       on the screen was the wrong answer.
 
-       The ungranted packages are still worth naming for an admin: "granted
-       to nobody" is a real fact about the PACKAGE, and it is what an admin
-       looking at their own row is usually checking. So the fact survives and
-       only the claim changes. */
-    const chips = [
-      ...live.slice(0, 6).map((p) => `<span class="ax-chip ok">Can use: ${esc(nameOf(p))}${tierText(p)}</span>`),
-      ...missing.slice(0, 4).map((p) => (eff.is_admin
-        ? `<span class="ax-chip info">Granted to nobody: ${esc(p.name)} — reachable as an admin</span>`
-        : `<span class="ax-chip no">Cannot use: ${esc(p.name)}</span>`)),
-      ...dangling.map((p) => `<span class="ax-chip warn">Dangling grant: ${esc(p.resource_id)} — target deleted or unlisted</span>`),
-    ];
-    if (eff.is_admin) {
-      chips.unshift(`<span class="ax-chip info">Admin — reaches everything regardless of grants</span>`);
+    /* Which groups carry each grant, keyed the way the Library panel keys its
+       rows — so the panel can print the route in the row it explains instead
+       of the chain repeating every package underneath it. */
+    const viaNames = new Map();
+    for (const it of items) {
+      const key = `${it.resource_type}:${it.resource_id}`;
+      const names = (it.via_groups || []).map((g) => g.group_name || g.group_id).filter(Boolean);
+      if (names.length) viaNames.set(key, [...new Set([...(viaNames.get(key) || []), ...names])]);
     }
 
     const chain = [];
@@ -5891,6 +6199,15 @@
     chain.push(`<li><b>${esc(person.name || person.email || "This person")}</b> is in ${
       groupNames.length ? groupNames.map(gname).join(", ") : "<span class=\"muted\">no groups</span>"
     }</li>`);
+
+    /* The one thing the panel above genuinely cannot show, because it is not
+       a grant: an admin short-circuits every authorization check, so the
+       list is what they are GRANTED and not what they can reach. It used to
+       be a grey chip leading a row of badges; here it sits in the sentence
+       about who they are, which is where a reader is already asking. */
+    if (eff.is_admin) {
+      chain.push(`<li>They are an <b>admin</b> — they reach everything regardless of the grants below.</li>`);
+    }
 
     if (!items.length) {
       // A real link to the editor, carrying the FIRST group this person is
@@ -5906,24 +6223,16 @@
         <a href="${href}">Grant something →</a></li>`);
     }
 
-    // Data packages, one row each and named — the spine of the question.
-    for (const p of live) {
-      const via = (p.via_groups || []).map((g) => gname(g.group_name || g.group_id)).join(", ");
-      chain.push(`<li><b>${esc(nameOf(p))}</b> <span class="muted">(data package)</span>
-        — via ${via || "<span class=\"muted\">a group</span>"}${esc(tierText(p))}</li>`);
-    }
+    /* The per-package rows that stood here are gone, and so are the dangling
+       and not-shared stops below them: all three are rows in the Library
+       panel above now, each carrying the group it travels through. Three
+       renderings of one package set — chip, panel row, chain entry — is what
+       this pane actually had, and the chain's copy was the one that could
+       never show the whole set (`missing` was cut to three, silently).
 
-    // Dangling grants get a stop row with the fix one click away — the group
-    // whose grant is stale is named in the row itself.
-    for (const p of dangling) {
-      const g0 = (p.via_groups || [])[0];
-      const fixHref = g0 && g0.group_id
-        ? `/admin/access?group=${encodeURIComponent(g0.group_id)}`
-        : "/admin/access";
-      chain.push(`<li class="stop"><b>${esc(p.resource_id)}</b> — a grant via
-        ${gname(g0 ? (g0.group_name || g0.group_id) : "a group")} points at a package that
-        no longer exists. <a href="${fixHref}">Fix the grant →</a></li>`);
-    }
+       What is left here is what a list of packages cannot say: who they are,
+       which groups they are in, the kinds the panel does not enumerate, and
+       what still has to happen for a grant to reach their machine. */
 
     // Everything else FOLDED PER TYPE. Listing eight collection rows
     // individually buried the packages under them and answered a question
@@ -5950,28 +6259,27 @@
       if (!idx.has(`${key}:${it.resource_id}`)) bucket.unlisted += 1;
       for (const g of it.via_groups || []) bucket.via.add(g.group_name || g.group_id);
     }
+    /* A kind the panel renders as its own band (plugins, recipes, memory)
+       does NOT get a fold line: that would restate a list sitting directly
+       above it, which is the duplication this pane was carrying in three
+       places at once. Its `unlisted` count still surfaces, because a grant
+       pointing at something no surface can show is the one part of that kind
+       the band genuinely cannot contain. */
+    const bandKinds = new Set(((preview && preview.sections) || []).map((sec) => sec.kind));
     for (const [key, b] of byType) {
       const label = typeDisplay.get(key) || key.replace(/_/g, " ");
       const unlisted = b.unlisted
         ? ` <span class="muted">(${b.unlisted} not listed here — deleted, or private to its owner)</span>`
         : "";
+      if (bandKinds.has(key)) {
+        if (b.unlisted) {
+          chain.push(`<li class="stop"><b>${esc(label)}</b> <span class="muted">— ${b.unlisted} grant${
+            b.unlisted === 1 ? "" : "s"} point at something not listed above</span> <span class="muted">(deleted, or private to its owner)</span></li>`);
+        }
+        continue;
+      }
       chain.push(`<li><b>${esc(label)}</b> <span class="muted">— ${b.n} item${b.n === 1 ? "" : "s"}</span>
         via ${b.via.size ? [...b.via].map(gname).join(", ") : "<span class=\"muted\">a group</span>"}${unlisted}</li>`);
-    }
-
-    for (const p of missing.slice(0, 3)) {
-      // Straight to the package's OWN page, carrying who you came for — the
-      // old link landed on the package INDEX and dropped the person, so the
-      // fix started over from a card grid. ?from=simulate&user= renders a
-      // context banner + a one-click way back to this exact preview.
-      // Same correction as the chips: for an admin this is a fact about the
-      // package, not a limit on the person. The Share link stays — it is
-      // still the thing you would do next — but it stops being a `stop`.
-      chain.push(eff.is_admin
-        ? `<li><b>${esc(p.name)}</b> is not shared with any group — they reach it as an admin, nobody else does.
-           <a href="/admin/data-packages/${encodeURIComponent(p.resource_id)}?from=simulate&user=${encodeURIComponent(uid)}">Share it →</a></li>`
-        : `<li class="stop"><b>${esc(p.name)}</b> is not shared with any group they are in.
-           <a href="/admin/data-packages/${encodeURIComponent(p.resource_id)}?from=simulate&user=${encodeURIComponent(uid)}">Share it →</a></li>`);
     }
 
     // "Delivery" here means SHIPPING, and it sat in a list where every other
@@ -5980,8 +6288,7 @@
       <code>agnes pull</code> — sharing it is not the same as it having arrived.</li>`);
 
     el("ax-sim-out").innerHTML =
-      `<div class="ax-chips">${chips.join("") || '<span class="ax-chip no">Nothing shared with them yet</span>'}</div>
-       ${renderLibraryPreview(preview, uid, !!eff.is_admin)}
+      `${renderLibraryPreview(preview, uid, !!eff.is_admin, { viaNames, missing, dangling })}
        <ul class="ax-chain">${chain.join("")}</ul>`;
   }
 

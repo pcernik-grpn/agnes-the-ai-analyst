@@ -40,7 +40,7 @@ fail differently:
   ``Request.state`` is an ordinary object keyed into the shared ASGI
   ``scope["state"]`` dict (``starlette.requests.HTTPConnection.state``), so
   ``_stash_user``'s ``request.state.user = user`` assignment is visible
-  here regardless of which thread set it — the same mechanism the PostHog
+  here regardless of which thread set it — the same mechanism the response-
   snippet injector and the 500 handler already rely on to read the caller
   without re-running auth. ``auto_audit_identity()`` (the ContextVar) is
   only the fallback for the rarer case where ``request.state.user`` was
@@ -219,6 +219,17 @@ class AuditFallbackMiddleware:
 
     @staticmethod
     def _resolve_user_id(scope):
+        # Read-only view-as (app/auth/view_as.py) makes the resolved caller the
+        # TARGET's user row, so both reads below would name them. They did
+        # nothing: the row describes what the VIEWING ADMIN read while looking
+        # through their surfaces, and attributing it to the target would put a
+        # false action in a person's audit trail.
+        from app.auth.view_as import active_viewer_user_id
+
+        viewer_id = active_viewer_user_id()
+        if viewer_id is not None:
+            return viewer_id
+
         request = Request(scope)
         state_user = getattr(request.state, "user", None)
         if state_user is not None:

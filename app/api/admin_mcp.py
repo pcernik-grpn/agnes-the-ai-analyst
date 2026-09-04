@@ -75,6 +75,7 @@ from src.repositories.mcp_sources import (  # noqa: F401  # MCPSourceRepository 
     validate_oauth_scope_coupling,
     validate_source_fields,
 )
+from src.mcp_tool_shape import is_write_shaped, required_arguments, tool_name
 from src.repositories.tool_registry import (
     MATERIALIZE,
     PASSTHROUGH,
@@ -222,6 +223,48 @@ class UpdateMCPSourceRequest(BaseModel):
     @classmethod
     def _check_auth_method(cls, v: Optional[str]) -> Optional[str]:
         return _validate_auth_method(v)
+
+
+def _lister_refusal(tool: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Why ``tool`` cannot be the data-app lister — ``None`` when it can.
+
+    The client already ranks candidates and will not nominate a write tool
+    (#2154), but that is not a guard: ``lister: true`` is what makes a run
+    project rows into ``data_apps``, so a hand-rolled request could otherwise
+    still invoke a mutating tool and catalogue whatever it wrote. The rules
+    are the two the client DISQUALIFIES on, not the ones it merely ranks by:
+
+      * a write-shaped verb in front of the name;
+      * required arguments — the lister is invoked with no arguments, so a
+        schema demanding one cannot answer that call. The one hard fact
+        available here; the rest is a name.
+
+    Both live in ``src/mcp_tool_shape.py`` rather than here, because the repair
+    script for the rows the old heuristic already wrote (#2251) has to
+    recognise exactly what this refuses.
+
+    ``readOnlyHint`` is deliberately absent. It is a tri-state, most servers
+    send nothing, and registration stores that as ``mutating=True`` — refusing
+    an undeclared tool would make linked apps impossible on exactly the servers
+    the feature exists for.
+
+    The client additionally requires "data" and "app" in the name; that is a
+    DISCOVERY rule, not a safety one, so it is not repeated here — it would
+    only refuse setups that are already harmless.
+    """
+    if not tool:
+        return None  # unknown id — the extractor answers for it, as before
+    name = tool_name(tool)
+    if is_write_shaped(name):
+        return f"'{name}' is named as a tool that changes data, so it cannot be the app lister."
+    required = required_arguments(tool.get("input_schema"))
+    if required:
+        return (
+            f"'{name}' requires the argument{'s' if len(required) > 1 else ''} "
+            f"{', '.join(required)}. The app lister is called with none, "
+            "so this tool cannot answer it."
+        )
+    return None
 
 
 class MaterializeRequest(BaseModel):
@@ -1368,7 +1411,7 @@ async def register_oauth_client(
     # registration access token — passing those through wipes both. Losing the
     # RAT silently disables upstream deregistration (best_effort_revoke_
     # registration no-ops without one); losing the secret is worse, demoting a
-    # confidential registration to a public one so _client_auth_kwargs stops
+    # confidential registration to a public one so _post_token_request stops
     # sending Basic auth and every token call fails. A DIFFERENT client_id is
     # a new registration and replaces both wholesale (Devin Review on #1124
     # for the RAT; the secret has the same exposure).
@@ -1541,7 +1584,7 @@ async def set_oauth_client_config(
     # the request where it matters most: repointing issuer/token_endpoint at a
     # DIFFERENT authorization server while re-typing the same client name
     # purged the user tokens (identity changed) yet kept the previous
-    # provider's client secret — which _client_auth_kwargs then sends as HTTP
+    # provider's client secret — which _post_token_request then sends as HTTP
     # Basic to the new token_endpoint, and best_effort_revoke_registration
     # bearer-sends the retained registration token to the new provider too
     # (Devin Review on #1124).
@@ -1573,7 +1616,7 @@ async def set_oauth_client_config(
             # The column holds ciphertext we can no longer open (vault key
             # rotated). Carrying the decrypted None forward would write NULL
             # and silently demote a confidential registration to a public
-            # PKCE-only one — _client_auth_kwargs would stop sending Basic
+            # PKCE-only one — _post_token_request would stop sending Basic
             # auth. Refusing is the honest move: the admin either re-enters
             # the secret or clears it deliberately (Devin Review on #1124).
             raise HTTPException(
@@ -1911,6 +1954,19 @@ async def materialize_mcp_source(
     # and still fully dialable here on every run.
     await _check_source_url_or_400(src)
     only_tool_id = payload.tool_id if payload else None
+    # Refuse a bad lister designation BEFORE dialling: invoking the tool is
+    # the harm, so a check that ran at projection time would be too late.
+    if payload is not None and payload.lister and only_tool_id:
+        why = _lister_refusal(tool_registry_repo().get(only_tool_id))
+        if why:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "not_a_lister_tool",
+                    "message": why,
+                    "hint": "Choose the tool that lists apps — usually one named get_/list_.",
+                },
+            )
     try:
         # extract_source_async — async-safe; the sync variant wraps
         # ``_materialize_one_tool`` with asyncio.run() which blows up

@@ -1,4 +1,4 @@
-"""`agnes facts search|neighbors|claims` — fact graph over Collections
+"""`agnes facts search|neighbors|edges|claims` — fact graph over Collections
 (read surface, build order step 6 of
 docs/superpowers/specs/2026-08-27-fact-graph-over-collections-design.md).
 
@@ -140,13 +140,17 @@ def search_facts(
 def facts_type_map(
     json: bool = typer.Option(False, "--json", help="Emit raw JSON"),
 ) -> None:
-    """Show every node type in the graph with a live count of what YOU can see.
+    """Show every node type AND every edge (relationship) type in the graph,
+    each with a live count of what YOU can see.
 
-    Each row is a way in: pass its TYPE to `agnes facts search` to list the
-    subjects behind the number. Counts are gated exactly as `search` is, so
-    a type's number is what you could reach and never a total that includes
-    evidence you cannot read. A type you have no visible subjects for is
-    omitted entirely rather than shown as 0.
+    Each node-type row is a way in: pass its TYPE to `agnes facts search` to
+    list the subjects behind the number. Each edge-type row is a valid
+    `--edge-types` value for `agnes facts neighbors` — check here BEFORE
+    traversing a well-connected subject, since omitting `--edge-types`
+    returns every relationship type it has. Counts are gated exactly as
+    `search`/`neighbors` are, so a number is what you could reach and never
+    a total that includes evidence you cannot read. A type you have no
+    visible subjects/edges for is omitted entirely rather than shown as 0.
     """
     resp = api_get("/api/facts/type-map")
     if resp.status_code != 200:
@@ -160,20 +164,29 @@ def facts_type_map(
         return
 
     types = data.get("types", [])
-    if not types:
-        typer.echo("No node types are visible to you.")
+    edge_types = data.get("edge_types", [])
+    if not types and not edge_types:
+        typer.echo("No node or edge types are visible to you.")
         typer.echo(
             "Either nothing has been extracted into the graph yet, or none of its evidence "
             "is in a collection you can read — ask an admin about collection grants."
         )
         return
 
-    width = max(len(t["type"]) for t in types)
-    typer.echo(f"{'TYPE':{width}s}  COUNT")
-    for t in types:
-        typer.echo(f"{t['type']:{width}s}  {t['count']}")
-    typer.echo(f"\n{data.get('total', 0)} subjects across {len(types)} types.")
-    typer.echo("Run `agnes facts search <TYPE>` to list the subjects behind a row.", err=True)
+    if types:
+        width = max(len(t["type"]) for t in types)
+        typer.echo(f"{'TYPE':{width}s}  COUNT")
+        for t in types:
+            typer.echo(f"{t['type']:{width}s}  {t['count']}")
+        typer.echo(f"\n{data.get('total', 0)} subjects across {len(types)} types.")
+        typer.echo("Run `agnes facts search <TYPE>` to list the subjects behind a row.", err=True)
+
+    if edge_types:
+        ewidth = max(len(t["type"]) for t in edge_types)
+        typer.echo(f"\n{'EDGE TYPE':{ewidth}s}  COUNT")
+        for t in edge_types:
+            typer.echo(f"{t['type']:{ewidth}s}  {t['count']}")
+        typer.echo("Run `agnes facts neighbors <ID> --edge-types <TYPE>` to traverse just that relationship.", err=True)
 
 
 @facts_app.command("facets")
@@ -224,11 +237,22 @@ def facts_facets(
 @facts_app.command("neighbors")
 def facts_neighbors(
     subject_id: str = typer.Argument(..., help="Fact id to traverse from (from `agnes facts search`)"),
-    edge_types: str = typer.Option("", "--edge-types", help="Comma-separated edge type filter (default: all)"),
+    edge_types: str = typer.Option(
+        "", "--edge-types", help="Comma-separated edge type filter — see `agnes facts type-map` (default: all)"
+    ),
     depth: int = typer.Option(1, "--depth", min=1, max=2, help="Traversal depth, 1 (default) or 2"),
+    claims: int = typer.Option(
+        0, "--claims", min=0, max=3, help="Attach this many newest readable quotes per edge inline (0-3)"
+    ),
     json: bool = typer.Option(False, "--json", help="Emit raw JSON"),
 ) -> None:
     """Bounded graph traversal from one subject (depth <= 2).
+
+    Pass --edge-types when you know it — a well-connected subject can carry
+    many relationship types, and omitting --edge-types returns ALL of them.
+    Run `agnes facts type-map` first for a cheap list of valid edge type
+    names with a count each. For EVERY relationship of one type (not just
+    one subject's), use `agnes facts edges <edge_type>` instead.
 
     Re-checks visibility at EVERY hop: an edge into a subject whose claims
     you cannot read is dropped silently, never revealed as "there but
@@ -237,6 +261,8 @@ def facts_neighbors(
     body: dict = {"subject_id": subject_id, "depth": depth}
     if edge_types:
         body["edge_types"] = [t.strip() for t in edge_types.split(",") if t.strip()]
+    if claims:
+        body["include_claims"] = claims
 
     resp = api_post("/api/facts/neighbors", json=body)
     if resp.status_code == 404:
@@ -261,27 +287,128 @@ def facts_neighbors(
         typer.echo(f"{n['id']:20s}  {n.get('type', '')}{marker}")
     if edges:
         typer.echo("")
-        typer.echo(f"{'EDGE':20s}  {'TYPE':14s}  {'SRC':20s}  DST")
-        for e in edges:
-            typer.echo(f"{e['id']:20s}  {e.get('type', ''):14s}  {e.get('src', ''):20s}  {e.get('dst', '')}")
+        _echo_edge_table(edges)
 
     truncated = data.get("truncated") or {}
     hit = [k for k, v in truncated.items() if v]
     if hit:
-        typer.echo(f"(truncated: {', '.join(hit)} — narrow --edge-types or lower --depth)", err=True)
+        typer.echo(f"(truncated: {', '.join(hit)} — narrow --edge-types, lower --depth or --claims)", err=True)
+
+
+def _echo_edge_table(edges: List[dict]) -> None:
+    """The shared edge rendering for `neighbors` and `edges`: one row per
+    edge, then any inline claims (``--claims``) indented under it."""
+    typer.echo(f"{'EDGE':20s}  {'TYPE':14s}  {'SRC':20s}  DST")
+    for e in edges:
+        typer.echo(f"{e['id']:20s}  {e.get('type', ''):14s}  {e.get('src', ''):20s}  {e.get('dst', '')}")
+        for c in e.get("claims") or []:
+            doc = c.get("document") or {}
+            quote = c.get("quote") or "(quote withheld)"
+            suffix = " …" if c.get("quote_truncated") else ""
+            typer.echo(
+                f"    [{c.get('id', '?')}] {doc.get('name', '?')} ({c.get('document_date') or 'undated'}): {quote}{suffix}"
+            )
+
+
+@facts_app.command("edges")
+def facts_edges(
+    edge_type: str = typer.Argument(..., help="Relationship type to list — see `agnes facts type-map` for the names"),
+    src_type: str = typer.Option("", "--src-type", help="Only edges whose source fact has this type"),
+    dst_type: str = typer.Option("", "--dst-type", help="Only edges whose destination fact has this type"),
+    src_id: str = typer.Option("", "--src", help="Only edges out of this fact id"),
+    dst_id: str = typer.Option("", "--dst", help="Only edges into this fact id"),
+    extend: str = typer.Option(
+        "", "--extend", help="Second relationship type to follow one hop from each edge's --extend-from endpoint"
+    ),
+    extend_from: str = typer.Option("dst", "--extend-from", help="Endpoint the extension starts from: dst or src"),
+    claims: int = typer.Option(
+        0, "--claims", min=0, max=3, help="Attach this many newest readable quotes per edge inline (0-3)"
+    ),
+    limit: Optional[int] = typer.Option(None, "--limit", min=1, max=100, help="Max edges per hop (server caps at 100)"),
+    json: bool = typer.Option(False, "--json", help="Emit raw JSON"),
+) -> None:
+    """Every readable relationship of ONE type, both ends included, in one
+    call (TCRD-295) — the shape of "which A relate to which B": list the
+    type, optionally filter by endpoint type or anchor on one id, follow a
+    second type one hop with --extend, and get the quotes to cite with
+    --claims. Use `agnes facts neighbors` only when you start from ONE
+    known subject.
+
+    Edges and both endpoints are filtered to what YOU can read; an unknown
+    or unreadable type is an empty page, not an error (spec §5 rule 2).
+    """
+    body: dict = {"edge_type": edge_type}
+    if src_type:
+        body["src_type"] = src_type
+    if dst_type:
+        body["dst_type"] = dst_type
+    if src_id:
+        body["src_id"] = src_id
+    if dst_id:
+        body["dst_id"] = dst_id
+    if extend:
+        body["extend_edge_type"] = extend
+        body["extend_from"] = extend_from
+    if claims:
+        body["include_claims"] = claims
+    if limit is not None:
+        body["limit"] = limit
+
+    resp = api_post("/api/facts/edges", json=body)
+    if resp.status_code != 200:
+        typer.echo(render_error(resp.status_code, resp.json()), err=True)
+        raise typer.Exit(1)
+
+    _echo_server_label()
+    data = resp.json()
+    if json:
+        typer.echo(json_lib.dumps(data, indent=2, default=str))
+        return
+
+    nodes = data.get("nodes", [])
+    edges = data.get("edges", [])
+    typer.echo(f"{len(nodes)} node(s), {len(edges)} edge(s)")
+    if not edges:
+        typer.echo(
+            f"No readable '{edge_type}' edges. Check the relationship name with `agnes facts type-map` — "
+            "an unknown type and one outside your access look the same on purpose."
+        )
+        return
+    typer.echo(f"{'ID':20s}  {'TYPE':14s}  ALIASES")
+    for n in nodes:
+        marker = " [revealed]" if n.get("revealed") else ""
+        aliases = ", ".join(n.get("aliases") or [])
+        typer.echo(f"{n['id']:20s}  {n.get('type', ''):14s}  {aliases}{marker}")
+    typer.echo("")
+    _echo_edge_table(edges)
+
+    truncated = data.get("truncated") or {}
+    hit = [k for k, v in truncated.items() if v]
+    if hit:
+        typer.echo(
+            f"(truncated: {', '.join(hit)} — narrow with --src-type/--dst-type/--src/--dst, or lower --claims)",
+            err=True,
+        )
 
 
 @facts_app.command("claims")
 def facts_claims(
-    subject_id: str = typer.Argument(..., help="Fact or edge id (from `agnes facts search`/`neighbors`)"),
+    subject_id: str = typer.Argument(..., help="Fact or edge id (from `agnes facts search`/`neighbors`/`edges`)"),
+    limit: Optional[int] = typer.Option(
+        None, "--limit", min=1, max=200, help="Max claims, newest first (server default 25, cap 200)"
+    ),
     json: bool = typer.Option(False, "--json", help="Emit raw JSON"),
 ) -> None:
     """Show YOUR readable evidence for one subject — quote, document, date.
 
+    Newest first, capped (default 25) — a note says when more exist.
     `404` (never `403`) whether the id is wrong or you simply have no
     readable claim for it — see the hint printed below for the next step.
     """
-    resp = api_get(f"/api/facts/{subject_id}/claims")
+    path = f"/api/facts/{subject_id}/claims"
+    if limit is not None:
+        path += f"?limit={limit}"
+    resp = api_get(path)
     if resp.status_code == 404:
         typer.echo(facts_not_found_hint(subject_id, surface="cli"), err=True)
         raise typer.Exit(1)
@@ -310,3 +437,8 @@ def facts_claims(
         attrs = c.get("attrs")
         if attrs:
             typer.echo(f"  attrs: {_format_attrs(attrs)}")
+    if data.get("limit_applied"):
+        typer.echo(
+            f"(showing the newest {len(claims)} — more readable claims exist; raise --limit for older evidence)",
+            err=True,
+        )

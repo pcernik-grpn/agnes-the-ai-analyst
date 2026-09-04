@@ -56,11 +56,21 @@ ALGORITHM = "HS256"
 # JWT `exp` (default in create_access_token) and the `access_token` cookie
 # max_age set by every login provider (google / email / password).
 #
-# Deliberate tradeoff: session JWTs (typ="session") are trusted purely off
-# signature + exp — pat_resolver does NO per-session DB lookup or revocation
-# for them (see app/auth/pat_resolver.py). So a 30-day session means a leaked
-# cookie stays valid 30 days; the only server-side kill switch is deactivating
-# the account (users.active). Accepted for login-persistence UX.
+# A session JWT (typ="session") is trusted off signature + exp for most of its
+# life, but not unconditionally: app.auth.pat_resolver.resolve_token_to_user
+# also compares its `iat` against users.session_revoked_before (issue #1676),
+# a per-user timestamp floor bumped by users_repo().revoke_sessions(...). That
+# floor is bumped by three doors today — POST /auth/logout, a self-serve
+# password change (app/auth/providers/password.py::password_change, which
+# mints the caller a fresh cookie in the same response so the browser that
+# just changed its own password is not the collateral damage), and a
+# password reset (reset_confirm) — plus the admin-only POST /api/admin/
+# users/{user_id}/revoke-sessions (app/api/admin_user_sessions.py), which
+# ends a user's sessions without deactivating the account. So a 30-day
+# session's *default* lifetime is still 30 days, but deactivating the
+# account is no longer the only server-side kill switch — the column is
+# PG-only (A3 ratchet): on a DuckDB-backed instance revoke_sessions() is a
+# documented no-op and an old token keeps resolving for the rest of its exp.
 SESSION_TOKEN_TTL_DAYS = 30
 ACCESS_TOKEN_EXPIRE_HOURS = SESSION_TOKEN_TTL_DAYS * 24  # 720 h = 30 days (default JWT exp)
 SESSION_COOKIE_MAX_AGE_SECONDS = SESSION_TOKEN_TTL_DAYS * 24 * 3600  # 2_592_000 s
@@ -94,6 +104,42 @@ def get_signing_secret() -> str:
     return _get_cached_secret_key()
 
 
+def _refuse_if_service_account_session(user_id: str, typ: str) -> None:
+    """Guard 1 (issue #1534): the SINGLE choke point every login provider
+    shares to mint the credential a completed login hands back.
+
+    Every provider (Google, Microsoft, password, email magic-link, Keboola,
+    SSO, the legacy ``/auth/token`` endpoint, MCP-OAuth's authorization-code
+    exchange and refresh) calls this function with ``typ="session"`` — none
+    of them share any OTHER common helper (``_set_login_cookie`` lives only
+    in ``app/auth/providers/password.py`` and covers just that provider's own
+    four routes) — so refusing here once covers all of them with no
+    provider-by-provider patch. A PAT minted *for* the service account
+    (``typ="pat"``) always passes that ``typ`` explicitly and sails through
+    unaffected.
+
+    Fails OPEN on any lookup error (missing ``users`` table, no DB wired up
+    at all) rather than raising — a large fraction of the test suite mints
+    tokens for fabricated ids with no backing row and often no DB set up at
+    all, and the actual defense against a service account signing in is that
+    no login provider can ever resolve a real identity to its synthetic
+    address in the first place. This check is defense-in-depth on top of
+    that, and must never turn an infra hiccup into a broken login for
+    everyone else.
+    """
+    if typ != "session":
+        return
+    try:
+        from src.repositories import users_repo
+        from src.service_accounts import ServiceAccountInteractiveLoginError, is_service_account
+
+        user = users_repo().get_by_id(user_id)
+    except Exception:
+        return
+    if is_service_account(user):
+        raise ServiceAccountInteractiveLoginError(user_id)
+
+
 def create_access_token(
     user_id: str,
     email: str,
@@ -118,7 +164,12 @@ def create_access_token(
     No ``role`` claim — authorization is derived from
     ``user_group_members`` at request time via ``app.auth.access.is_user_admin``.
     The JWT carries only identity (``sub``, ``email``) and token metadata.
+
+    Raises ``src.service_accounts.ServiceAccountInteractiveLoginError`` when
+    ``typ="session"`` (the default) and ``user_id`` names a ``kind='service'``
+    row (issue #1534) — see :func:`_refuse_if_service_account_session`.
     """
+    _refuse_if_service_account_session(user_id, typ)
     payload = {
         "sub": user_id,
         "email": email,

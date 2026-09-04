@@ -35,6 +35,9 @@ def repo(tmp_path):
     conn.execute("ALTER TABLE table_registry ADD COLUMN IF NOT EXISTS server_only BOOLEAN DEFAULT false")
     # v79: named source connections — register() now writes connection_id.
     conn.execute("ALTER TABLE table_registry ADD COLUMN IF NOT EXISTS connection_id VARCHAR")
+    # v116: table access policies — register() now READS access_policy_sql to
+    # refuse an upsert that would leave a policied row distributable (#2147).
+    conn.execute("ALTER TABLE table_registry ADD COLUMN IF NOT EXISTS access_policy_sql VARCHAR")
     return TableRegistryRepository(conn)
 
 

@@ -434,14 +434,6 @@ _NON_SQL_QUOTED_FAMILIES: list[tuple[str, str]] = [
         r"require_collection_access\(",
         'FastAPI path-template argument — the COLLECTION-scoped wrapper of require_resource_access, same "{collection_id}" placeholder',
     ),
-    (
-        r"require_admin_or_producer_connection\(",
-        'FastAPI path-template argument — the admin-or-producer wrapper of require_resource_access, same "{connection_id}" placeholder',
-    ),
-    (
-        r"require_collection_write_or_producer_access\(",
-        'FastAPI path-template argument — the upload-only admin-or-producer wrapper of require_collection_access, same "{collection_id}" placeholder',
-    ),
     (r'(?i)content-disposition|filename="\{', "HTTP header: quotes are RFC 6266 filename syntax"),
     (r"(?i)etag", "HTTP entity tag: quotes are part of the ETag grammar (RFC 7232)"),
     (r'"\{\}"', "empty JSON object as a literal default / json.loads fallback"),
@@ -471,6 +463,10 @@ _NON_SQL_QUOTED_FAMILIES: list[tuple[str, str]] = [
     (r'#.*"\{', "comment describing the shape"),
     (r'resource_metadata="\{', "WWW-Authenticate challenge parameter (RFC 9728)"),
     (r'"\{token\}"', "welcome-template placeholder, substituted at render time"),
+    (
+        r'path:"\{web_url\}"',
+        "KQL (Graph Search) path filter — the quotes are KQL string-literal syntax around a URL, not a SQL identifier",
+    ),
     (r"^app/web/setup_instructions\.py:", "copy-paste CLI instructions and their placeholder tokens"),
 ]
 

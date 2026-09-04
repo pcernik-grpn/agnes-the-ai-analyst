@@ -13,7 +13,7 @@ Three things ship together here and are locked in one place:
     lets the creator of an item share it with groups they belong to. The
     security-relevant invariants are ownership and group containment.
   - ``/library`` — the renamed, widened former ``/artefacts``, listing
-    artefacts + skills with per-row visibility. Agents are deliberately NOT
+    artifacts + skills with per-row visibility. Agents are deliberately NOT
     listed there (they have their own home at ``/agents``), but they remain
     real registry rows whose grants ``/api/v1/agents`` honours.
 
@@ -363,7 +363,7 @@ def test_share_targets_include_everyone(seeded_app):
 
 def test_collection_share_cycles_private_shared_workspace(seeded_app):
     """The three visibility states are reachable and reversible through one
-    idempotent PUT, for the artefact kind."""
+    idempotent PUT, for the artifact kind."""
     from src.db import SYSTEM_EVERYONE_GROUP
 
     c = seeded_app["client"]
@@ -570,7 +570,7 @@ def test_linked_app_sharing_is_admin_only_and_deliberate(seeded_app, monkeypatch
 
 
 def test_library_lists_artefacts_with_visibility_but_not_agents(seeded_app):
-    """One table for the caller's things — artefacts (and skills) with a type
+    """One table for the caller's things — artifacts (and skills) with a type
     facet and a visibility chip. Agents are excluded: they live on /agents."""
     tok = seeded_app["admin_token"]
     _create_collection(seeded_app, "Quarterly Deck", tok)
@@ -578,8 +578,8 @@ def test_library_lists_artefacts_with_visibility_but_not_agents(seeded_app):
 
     text = seeded_app["client"].get("/library", headers=_auth(tok)).text
     assert "Quarterly Deck" in text
-    assert 'data-kind="artefact"' in text
-    # Visibility chip + the share affordance for the grant-backed artefact kind.
+    assert 'data-kind="artifact"' in text
+    # Visibility chip + the share affordance for the grant-backed artifact kind.
     assert "lib-vis--private" in text
     assert 'data-share-type="collection"' in text
     # The agent exists in the registry but is NOT a Library row.
@@ -679,7 +679,10 @@ def test_search_and_new_ride_the_toolbar(seeded_app):
     # The page header holds the title, the banner and the tabs. The controls do
     # not live there, and there is no leftover action row for a script to ferry.
     head = text.split('class="lib-head"', 1)[1].split('class="lib-browse"', 1)[0]
-    assert 'id="lib-tabs"' in head
+    # The tabs are NOT here any more: they moved under the toolbar, because one
+    # search runs across both halves and each tab badge is that half's share of
+    # its result. Above the search box they described a set nobody had narrowed.
+    assert 'id="lib-tabs"' not in head
     assert 'id="lib-search"' not in head
     assert 'id="lib-new-btn"' not in head
     assert 'class="lib-actions"' not in text
@@ -717,23 +720,27 @@ def test_search_and_new_ride_the_toolbar(seeded_app):
     assert "fbar-chips--center" not in text
     assert 'class="fbar-chips" id="lib-chips"' in text
 
-    # The state line carries the count and the chips — not the controls.
+    # The state line carries the count and the cross-tab note — list metadata,
+    # not controls and no longer the chips (see the order below).
     row = text.split('class="lib-browse__state"', 1)[1].split('<div class="lib-list">', 1)[0]
     assert 'id="lib-item-count"' in row
-    assert 'id="lib-chips"' in row
+    assert 'id="lib-crosstab"' in row
     assert 'id="lib-new-btn"' not in row
+    assert 'id="lib-chips"' not in row
 
-    # Page order: title → tabs → controls → count+chips → groups. Everything
-    # that acts on the list is contiguous and adjacent to it.
-    assert text.index('class="lib-head__bar"') < text.index('id="lib-tabs"')
-    assert text.index('id="lib-tabs"') < text.index('class="lib-browse"')
+    # Page order: title → controls → chips → tabs → count → groups.
+    #
+    # The chips follow the toolbar that produced them and precede the tabs,
+    # because they narrow the WHOLE Library: one search and one filter set run
+    # across both halves, and the tabs then split what survives. Chips stated
+    # after the split described the wrong scope — a condition on the active
+    # bucket rather than on the set the buckets divide.
+    assert text.index('class="lib-head__bar"') < text.index('class="lib-browse"')
+    assert text.index('class="lib-browse"') < text.index('aria-label="Search, filter and sort library"')
     assert text.index('id="lib-filter-btn"') < text.index('id="lib-chips"')
-    assert text.index('id="lib-chips"') < text.index('<div class="lib-list">')
-    # The chips now FOLLOW the controls that produced them, because they moved
-    # to the list they describe: inside the old dock they had to sit above the
-    # bar (a card whose two rows read top-down); beside the list they read as
-    # the list's current narrowing, which is what they are.
-    assert text.index('id="lib-tabs"') < text.index('aria-label="Search, filter and sort library"')
+    assert text.index('id="lib-chips"') < text.index('id="lib-tabs"')
+    assert text.index('id="lib-tabs"') < text.index('id="lib-item-count"')
+    assert text.index('id="lib-item-count"') < text.index('<div class="lib-list">')
     assert text.index('class="lib-browse"') < text.index("data-lib-sec=")
 
 
@@ -782,9 +789,12 @@ def test_page_header_carries_the_controls_and_the_bands_own_the_top(seeded_app):
 
     # Page furniture, then the browsing block, then the list.
     head = text.split('class="lib-head"', 1)[1].split('<div class="lib-list">', 1)[0]
-    assert head.index('class="lib-head__titles"') < head.index('id="lib-tabs"')
-    assert head.index('id="lib-tabs"') < head.index('class="lib-browse"')
+    # Title, then the browsing block: toolbar, the chips it produces, the tabs
+    # that split what survives, then the count.
+    assert head.index('class="lib-head__titles"') < head.index('class="lib-browse"')
     assert head.index('class="lib-browse"') < head.index('id="lib-chips"')
+    assert head.index('id="lib-chips"') < head.index('id="lib-tabs"')
+    assert head.index('id="lib-tabs"') < head.index('id="lib-item-count"')
 
     # The HEADER does not pin — the group bands do. A pinned header of title +
     # count + banner + controls + tabs runs ~270px, a third of an 800px
@@ -844,12 +854,15 @@ def test_library_title_carries_no_setup_caveat(seeded_app):
     # The title stands alone. The prose lede that used to follow it is gone —
     # what it became is the count, and the count belongs on the list.
     assert 'class="lede"' not in text
-    # Where the note lives now: beside the item count, as list metadata. Not a
-    # panel, not a row above the list, and not a pill on the h1 (the two bans
-    # above still catch that).
-    assert 'class="lib-count-note"' in text
-    assert ">More coming soon<" in text
-    assert text.index('class="lib-browse__state"') < text.index('class="lib-count-note"')
+    # The note is gone entirely — four homes were four attempts to place a
+    # sentence about the product's roadmap on a page about the reader's own
+    # things. What sits beside the item count now is list metadata that
+    # actually describes the list: how many matched, and how many of the same
+    # answer fell in the other tab.
+    assert 'class="lib-count-note"' not in text
+    assert "More coming soon" not in text
+    assert 'id="lib-crosstab"' in text
+    assert text.index('class="lib-browse__state"') < text.index('id="lib-crosstab"')
     # It reads as GROWTH, not as a caveat: no warn vocabulary, no "incomplete",
     # and no cue to explain itself away. The Library is being filled, which is
     # good news — dressing good news in amber is what the old versions got wrong.
@@ -862,27 +875,26 @@ def test_library_title_carries_no_setup_caveat(seeded_app):
     assert "may be incomplete" not in body
     assert "still being prepared" not in body
     assert "What this means" not in body
-    # The elaboration is reachable without hover: fast tooltip + accessible name.
-    note = text[text.index('class="lib-count-note"') :]
-    note = note[: note.index("</span>")]
-    assert "data-tip=" in note
-    assert "aria-label=" in note
+    # Nothing to elaborate any more: the note itself is gone (see the count-row
+    # assertions above), so there is no tooltip to keep reachable.
+    assert 'class="lib-count-note"' not in body
 
 
-def test_more_coming_note_is_a_sibling_of_the_count_not_a_child(seeded_app):
-    """The note sits BESIDE `#lib-item-count`, never inside it.
+def test_the_cross_tab_note_is_a_sibling_of_the_count_not_a_child(seeded_app):
+    """It sits BESIDE `#lib-item-count`, never inside it.
 
-    Not a style preference — a correctness constraint. The shared filter toolbar
-    rewrites that element's text on every facet change (`count: { el:
-    '#lib-item-count', noun: 'item' }`), rendering e.g. "14 of 41 items". Anything
-    nested inside the count is destroyed by the first click of a filter, and the
-    failure is invisible server-side: the page ships correct HTML and loses the
-    note only once the user interacts. So the structure is pinned here.
+    Not a style preference — a correctness constraint, inherited from the
+    "More coming soon" note that used to hold this slot. The shared filter
+    toolbar rewrites that element's text on every facet change (`count: { el:
+    '#lib-item-count', noun: 'item' }`), rendering e.g. "14 of 41 items".
+    Anything nested inside the count is destroyed by the first click of a
+    filter, and the failure is invisible server-side: the page ships correct
+    HTML and loses the note only once the user interacts.
     """
     text = seeded_app["client"].get("/library", headers=_auth(seeded_app["admin_token"])).text
 
     count_at = text.index('id="lib-item-count"')
-    note_at = text.index('class="lib-count-note"')
+    note_at = text.index('id="lib-crosstab"')
     assert count_at < note_at, "the note follows the count"
 
     # The count element closes BEFORE the note opens — i.e. they are siblings.
@@ -891,10 +903,6 @@ def test_more_coming_note_is_a_sibling_of_the_count_not_a_child(seeded_app):
         "the note is nested inside #lib-item-count; the filter toolbar's count "
         "rewrite will delete it on the first facet click"
     )
-    # Both inside the header's count line, under the title.
-    head_at = text.index('class="lib-head__titles"')
-    assert head_at < count_at
-
 
 def test_data_apps_schedule_badge_retired_when_the_kind_shipped(seeded_app):
     """The "Data apps coming soon" badge promised the kind would land in the
@@ -956,7 +964,7 @@ def _stock_domain(domain_id: str, item_id: str) -> None:
 
 def test_library_lists_granted_resources_of_every_kind(seeded_app):
     """The Library answers "what do I have?" across kinds: the caller's own
-    artefacts PLUS the governed data packages, memory domains and recipes
+    artifacts PLUS the governed data packages, memory domains and recipes
     granted to one of their groups."""
     from src.repositories import data_packages_repo, memory_domains_repo, recipes_repo
 

@@ -110,13 +110,83 @@ class CorpusFilesRepository:
             return None
         return self._decode_row(dict(zip(self._COLS, row)))
 
-    def list_for_corpus(self, corpus_id: str) -> List[Dict[str, Any]]:
-        """All files for a given corpus, ordered by created_at."""
-        rows = self.conn.execute(
-            f"SELECT {self._SELECT} FROM corpus_files WHERE corpus_id = ? ORDER BY created_at",
-            [corpus_id],
-        ).fetchall()
+    # ``order`` is mapped through this literal dict — never interpolated as a
+    # raw caller string — so an unrecognised value simply falls back to
+    # "oldest" instead of raising or reaching SQL as text. Every fragment ends
+    # in ``, id ASC``: files uploaded in one batch share a ``created_at``, and
+    # without that tie-break a page 2 lookup can repeat or skip rows.
+    _ORDER_SQL = {
+        "oldest": "created_at ASC, id ASC",
+        "newest": "created_at DESC, id ASC",
+        "name": "LOWER(filename) ASC, id ASC",
+        "size": "size_bytes DESC NULLS LAST, id ASC",
+    }
+
+    @staticmethod
+    def _escape_like(value: str) -> str:
+        """Escape LIKE metacharacters so untrusted search text matches
+        literally (see ``users.py::get_by_email_prefix`` for the same idiom)."""
+        return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+    def _filter_clause(self, corpus_id: str, q: Optional[str], status: Optional[str]) -> tuple[str, List[Any]]:
+        """Shared WHERE-clause builder for ``list_for_corpus``/``count_for_corpus``.
+
+        Blank (``None``/empty/whitespace-only) ``q``/``status`` means "no
+        filter" — never "match nothing".
+        """
+        where = ["corpus_id = ?"]
+        params: List[Any] = [corpus_id]
+        q_norm = q.strip() if q else ""
+        if q_norm:
+            pattern = f"%{self._escape_like(q_norm)}%"
+            where.append("(LOWER(filename) LIKE LOWER(?) ESCAPE '\\' OR LOWER(path) LIKE LOWER(?) ESCAPE '\\')")
+            params.extend([pattern, pattern])
+        status_norm = status.strip() if status else ""
+        if status_norm:
+            where.append("processing_status = ?")
+            params.append(status_norm)
+        return " AND ".join(where), params
+
+    def list_for_corpus(
+        self,
+        corpus_id: str,
+        *,
+        limit: Optional[int] = None,
+        offset: int = 0,
+        q: Optional[str] = None,
+        status: Optional[str] = None,
+        order: str = "oldest",
+    ) -> List[Dict[str, Any]]:
+        """Files for a given corpus, paginated/filtered/ordered.
+
+        Backwards compatible: a bare ``list_for_corpus(corpus_id)`` call
+        keeps returning every row ordered by ``created_at`` ascending, as it
+        always has — 14 existing callers depend on this.
+        """
+        where_sql, params = self._filter_clause(corpus_id, q, status)
+        order_sql = self._ORDER_SQL.get(order, self._ORDER_SQL["oldest"])
+        sql = f"SELECT {self._SELECT} FROM corpus_files WHERE {where_sql} ORDER BY {order_sql}"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(limit)
+        if offset:
+            sql += " OFFSET ?"
+            params.append(offset)
+        rows = self.conn.execute(sql, params).fetchall()
         return [self._decode_row(dict(zip(self._COLS, r))) for r in rows]
+
+    def count_for_corpus(
+        self,
+        corpus_id: str,
+        *,
+        q: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> int:
+        """Row count for ``list_for_corpus`` under the same ``q``/``status``
+        filters (and nothing else — no limit/offset applies to a count)."""
+        where_sql, params = self._filter_clause(corpus_id, q, status)
+        row = self.conn.execute(f"SELECT COUNT(*) FROM corpus_files WHERE {where_sql}", params).fetchone()
+        return int(row[0]) if row else 0
 
     def count_by_storage_path(self, corpus_id: str, storage_path: str) -> int:
         """How many rows in this corpus reference ``storage_path``.
@@ -132,6 +202,99 @@ class CorpusFilesRepository:
             [corpus_id, storage_path],
         ).fetchone()
         return int(row[0]) if row else 0
+
+    def count_by_corpus(self) -> Dict[str, int]:
+        """``corpus_id -> file count`` for every corpus that has files, in ONE
+        query.
+
+        For listings that need only the number: the admin /access projection
+        shows a file count per collection, and doing that with
+        ``list_for_corpus`` per collection made the page's query count grow
+        with the number of collections — which on an instance where every chat
+        file-drop is its own one-file collection is the common case, not the
+        pathological one. A corpus with no files is simply absent (the caller
+        renders 0), so nothing here has to know which corpora exist.
+        """
+        rows = self.conn.execute("SELECT corpus_id, COUNT(*) FROM corpus_files GROUP BY corpus_id").fetchall()
+        return {r[0]: int(r[1]) for r in rows}
+
+    def search_across_corpora(self, q: str, *, limit: int = 50) -> List[Dict[str, Any]]:
+        """Files across EVERY corpus whose filename or path matches ``q``.
+
+        The bounded, on-demand counterpart to the admin ``/access`` overview
+        projection (``app.resource_types._corpus_file_blocks``), which caps
+        how many files of one collection it lists — on an instance with
+        hundreds of thousands of files, listing them all made that payload
+        tens of megabytes. This is what the per-file grant picker calls
+        instead: a query, not a preloaded scan.
+
+        A blank/whitespace-only ``q`` matches nothing (never "everything") —
+        same convention as ``list_for_corpus``'s ``q`` filter, just without a
+        ``corpus_id`` to scope it.
+        """
+        q_norm = (q or "").strip()
+        if not q_norm:
+            return []
+        pattern = f"%{self._escape_like(q_norm)}%"
+        rows = self.conn.execute(
+            f"SELECT {self._SELECT} FROM corpus_files "
+            "WHERE LOWER(filename) LIKE LOWER(?) ESCAPE '\\' OR LOWER(path) LIKE LOWER(?) ESCAPE '\\' "
+            "ORDER BY LOWER(filename) ASC, id ASC LIMIT ?",
+            [pattern, pattern, limit],
+        ).fetchall()
+        return [self._decode_row(dict(zip(self._COLS, r))) for r in rows]
+
+    def status_counts_for_corpora(self, corpus_ids: List[str]) -> Dict[str, Dict[str, int]]:
+        """``{corpus_id: {processing_status: count}}`` for exactly the given
+        corpus ids, in ONE query.
+
+        The batched sibling of ``count_by_corpus`` (same rationale, scoped
+        rather than global, and broken down by status): a caller that used to
+        call ``list_for_corpus(scope_id)`` once per scope to bucket files by
+        status had its query count grow with the number of scopes — up to
+        ~180 on a real SharePoint connection — instead of staying flat
+        (`app.web.router._sharepoint_pipeline_cell`). A corpus id with no
+        files, or not in ``corpus_ids`` at all, is simply absent.
+        """
+        if not corpus_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in corpus_ids)
+        rows = self.conn.execute(
+            f"SELECT corpus_id, processing_status, COUNT(*) FROM corpus_files "
+            f"WHERE corpus_id IN ({placeholders}) GROUP BY corpus_id, processing_status",
+            list(corpus_ids),
+        ).fetchall()
+        out: Dict[str, Dict[str, int]] = {}
+        for corpus_id, status, n in rows:
+            out.setdefault(corpus_id, {})[status or "pending"] = int(n)
+        return out
+
+    def top_folder_status_counts(self, corpus_id: str) -> Dict[str, Dict[str, int]]:
+        """``{top_folder: {processing_status: count}}`` for one corpus, in ONE
+        grouped query — ``top_folder`` is the first ``/``-delimited segment
+        of ``path`` (``""`` for a file with no ``/`` in its path, i.e. one
+        sitting directly at the corpus root — mirrors the SharePoint
+        site-split planner's ``loose_root_files``; a NULL/blank ``path``
+        buckets under ``""`` too, never dropped).
+
+        The per-folder sibling of ``status_counts_for_corpora``: the
+        SharePoint completeness check (``app.api.admin_extraction``'s
+        ``…/extraction/completeness``) needs an ``indexed``/``rejected``
+        breakdown per top-level folder for a single-scope, drive-root
+        connection, and doing that with ``count_for_corpus`` once per folder
+        made the query count grow with the folder count.
+        """
+        rows = self.conn.execute(
+            "SELECT CASE WHEN path IS NOT NULL AND strpos(path, '/') > 0 "
+            "THEN split_part(path, '/', 1) ELSE '' END AS top_folder, "
+            "processing_status, COUNT(*) FROM corpus_files WHERE corpus_id = ? "
+            "GROUP BY top_folder, processing_status",
+            [corpus_id],
+        ).fetchall()
+        out: Dict[str, Dict[str, int]] = {}
+        for top_folder, status, n in rows:
+            out.setdefault(top_folder, {})[status or "pending"] = int(n)
+        return out
 
     def list_children(self, parent_file_id: str) -> List[Dict[str, Any]]:
         """All child rows extracted from the given archive file, by created_at."""
@@ -210,4 +373,20 @@ class CorpusFilesRepository:
             "    storage_path = ?, path = ?, updated_at = current_timestamp "
             "WHERE id = ?",
             [filename, sha256, file_type, size_bytes, storage_path, path, file_id],
+        )
+
+    def update_path(self, file_id: str, *, path: Optional[str], filename: str) -> None:
+        """Narrower sibling of :meth:`update_in_place`: a rename/move whose
+        CONTENT is unchanged (the caller already proved that — e.g. a
+        SharePoint crawl item whose cTag still matches, see
+        ``connectors.sharepoint.crawler._Ingestor.rename``), so only the
+        LOCATION fields move. No ``sha256``/``storage_path``/``size_bytes``
+        write, no read of the row's current values first — the whole point
+        is to cost one indexed lookup plus one targeted UPDATE, never a
+        re-download/re-convert/re-ingest. Leaves ``processing_status``
+        untouched, same discipline as ``update_in_place``.
+        """
+        self.conn.execute(
+            "UPDATE corpus_files SET filename = ?, path = ?, updated_at = current_timestamp WHERE id = ?",
+            [filename, path, file_id],
         )

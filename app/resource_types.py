@@ -26,10 +26,13 @@ value verbatim.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import logging
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 class ResourceType(StrEnum):
@@ -611,40 +614,122 @@ def _slack_channel_blocks() -> list[Block]:
 # ---------------------------------------------------------------------------
 
 
+#: Cap on how many files of one collection ride along in the /admin/access
+#: overview payload. Past this, browsing switches to
+#: ``GET /api/admin/access/resources/corpus_file/search`` (the picker's
+#: search-as-you-type) instead of scrolling a preloaded list — see the
+#: `#2158`-class regression this bounds: an instance with ~216k files
+#: across ~390 collections made the unbounded projection a 37 MB payload
+#: that froze the admin's browser tab rendering it.
+_CORPUS_FILE_PREVIEW_LIMIT = 10
+
+
 def _corpus_file_blocks() -> list[Block]:
     """Project ``corpus_files`` into the (block → items) shape the admin
     /access page renders — one block per parent collection.
 
-    A file inside a multi-file collection is independently shareable (the
-    Library lets its owner share one file without sharing the whole folder), so
-    its grants need to be visible and correctable here. Single-file artefacts
-    are NOT listed: they are shared as their collection, which is the same
-    thing, and listing them twice would invite contradictory grants.
+    A file inside a collection is independently shareable (the Library lets its
+    owner share one file without sharing the whole folder), so its grants need
+    to be visible and correctable here.
+
+    EVERY live collection's files are listed, including the one-file artifacts
+    a chat file-drop creates. Those used to be skipped, on the reasoning that a
+    lone file IS its collection and listing it twice would invite
+    contradictory grants — but the two grants are OR'd, never contradictory
+    (``_readable_file_or_404``: collection access OR a file grant), and the
+    skip had a cost the reasoning did not account for: it made most of a real
+    instance's files invisible on the one page that answers "what is in here
+    and who can reach it". An inventory with a silent hole is worse than a
+    slightly redundant one. Filenames and sizes only — never content, and
+    never a link that would serve it.
+
+    ``items`` is BOUNDED to :data:`_CORPUS_FILE_PREVIEW_LIMIT` files per
+    collection, in filename order — this projection used to list every file
+    of every collection (see the module-level cap docstring above for the
+    payload it produced). Two things stay unbounded on purpose:
+
+    - ``items_total`` / ``items_truncated`` so the UI can say "25 of 6,204
+      shown" rather than silently look complete.
+    - a file that ALREADY carries its own grant is always included, even
+      past the cap — the ``/admin/access`` "By group" tab resolves a
+      group's held resources by looking the resource id up in this
+      projection, and a per-file grant that quietly fell out of the preview
+      window would be a group holding something an admin can no longer see
+      or revoke. Per-file grants are a narrow, manual feature (the Library's
+      "share one file" action), so this set is expected to stay small even
+      on a large instance — nothing like the file count itself.
     """
-    from src.repositories import corpus_files_repo, file_corpora_repo
+    from src.repositories import corpus_files_repo, file_corpora_repo, resource_grants_repo
+
+    cf_repo = corpus_files_repo()
+    cols = file_corpora_repo().list(limit=_GRANT_PROJECTION_LIMIT)
+    if not cols:
+        return []
+    owners = _owner_emails(c.get("created_by") for c in cols)
+
+    # One grouped count for the whole page (see `count_by_corpus`) instead of
+    # a second per-collection query — `items_total` reuses it rather than
+    # `len(list_for_corpus(col_id))`, which would re-fetch every row just to
+    # count them.
+    try:
+        counts: dict[str, int] = cf_repo.count_by_corpus()
+    except Exception:
+        logger.exception("corpus-file count projection failed; listing collections without counts")
+        counts = {}
+
+    # Files that already carry a grant, grouped by their parent collection —
+    # see the "always included" note above. One bulk grants read plus one
+    # `get()` per granted file (bounded by how many per-file grants exist on
+    # the instance, not by how many files it has).
+    granted_by_corpus: dict[str, list[dict]] = {}
+    try:
+        granted_ids = {
+            g["resource_id"] for g in resource_grants_repo().list_all(resource_type=ResourceType.CORPUS_FILE.value)
+        }
+    except Exception:
+        logger.exception("corpus-file grant lookup failed; previewing without the always-included set")
+        granted_ids = set()
+    for fid in granted_ids:
+        try:
+            f = cf_repo.get(fid)
+        except Exception:
+            f = None
+        if f:
+            granted_by_corpus.setdefault(f["corpus_id"], []).append(f)
 
     blocks: list[Block] = []
-    cf_repo = corpus_files_repo()
-    for col in file_corpora_repo().list(limit=_GRANT_PROJECTION_LIMIT):
+    for col in cols:
+        total = counts.get(col["id"], 0)
+        if not total:
+            continue  # nothing to list, and an empty block renders as noise
         try:
-            files = cf_repo.list_for_corpus(col["id"])
+            preview = cf_repo.list_for_corpus(col["id"], limit=_CORPUS_FILE_PREVIEW_LIMIT)
         except Exception:
             continue
-        if len(files) < 2:
-            continue  # a lone file IS its collection
+        preview_ids = {f["id"] for f in preview}
+        always_included = [f for f in granted_by_corpus.get(col["id"], []) if f["id"] not in preview_ids]
+        files = preview + always_included
+        owner = owners.get(col.get("created_by") or "")
+        name = col.get("name") or col.get("slug")
         blocks.append(
             {
                 "id": col["id"],
-                "name": col.get("name") or col.get("slug"),
+                "name": f"{name} · {owner}" if owner else name,
                 "items": [
                     {
                         "resource_id": f["id"],
                         "name": f.get("filename") or f["id"],
                         "slug": None,
-                        "description": None,
+                        # Format + size: enough to recognise a file and judge
+                        # what it is, with none of its contents. The admin
+                        # asked "does this exist", not "what does it say".
+                        "description": _file_meta_line(f),
+                        "owner_email": owner,
                     }
                     for f in files
                 ],
+                "items_total": total,
+                "items_truncated": total > len(preview),
             }
         )
     return blocks
@@ -727,6 +812,56 @@ def _store_entity_blocks() -> list[Block]:
     return [blocks[k] for k in ("skill", "agent", "plugin") if k in blocks]
 
 
+def _file_meta_line(row: dict) -> str:
+    """``"pdf · 2.1 MB"`` — a file's shape, never its content."""
+    bits = []
+    ftype = (row.get("file_type") or "").strip()
+    if ftype:
+        bits.append(ftype)
+    size = row.get("size_bytes")
+    if isinstance(size, (int, float)) and size > 0:
+        units = ("B", "kB", "MB", "GB", "TB")
+        val = float(size)
+        i = 0
+        while val >= 1024 and i < len(units) - 1:
+            val /= 1024
+            i += 1
+        bits.append(f"{val:.0f} {units[i]}" if i == 0 or val >= 10 else f"{val:.1f} {units[i]}")
+    return " · ".join(bits)
+
+
+def _owner_emails(user_ids: Iterable[str]) -> dict[str, str]:
+    """Batched ``created_by`` → email map for the projections below.
+
+    Email, not display name: this feeds the admin /access page, where the
+    question is "whose collection is this" and a duplicate first name is not
+    an answer. One query for the whole page (``get_info_by_ids`` is the
+    existing dual-backend batch reader), because these projections run over
+    every collection on the instance and a per-row lookup would make the page
+    cost grow with the collection count.
+
+    Unresolvable ids are simply absent — a collection whose creator's account
+    was deleted still lists, unowned, rather than disappearing from an
+    inventory whose whole job is completeness.
+    """
+    from src.repositories import users_repo
+
+    wanted = {uid for uid in user_ids if uid}
+    if not wanted:
+        return {}
+    try:
+        info = users_repo().get_info_by_ids(sorted(wanted))
+    except Exception:  # pragma: no cover - a users-table read failure
+        logger.exception("owner-email projection failed; listing collections without owners")
+        return {}
+    out: dict[str, str] = {}
+    for uid, row in (info or {}).items():
+        email = (row or {}).get("email")
+        if email:
+            out[uid] = str(email)
+    return out
+
+
 def _collection_blocks() -> list[Block]:
     """Project ``file_corpora`` into the (block → items) shape rendered by
     the admin /access page.
@@ -743,7 +878,7 @@ def _collection_blocks() -> list[Block]:
     badge in every list that shows it"). The admin /access page renders the
     badge off this field for `type_key === 'collection'`.
     """
-    from src.repositories import file_corpora_repo, resource_grants_repo
+    from src.repositories import corpus_files_repo, file_corpora_repo, resource_grants_repo
 
     rows = file_corpora_repo().list(limit=_GRANT_PROJECTION_LIMIT)
     if not rows:
@@ -751,6 +886,15 @@ def _collection_blocks() -> list[Block]:
     grant_counts: dict[str, int] = {}
     for g in resource_grants_repo().list_all(resource_type=ResourceType.COLLECTION.value):
         grant_counts[g["resource_id"]] = grant_counts.get(g["resource_id"], 0) + 1
+    owners = _owner_emails(r.get("created_by") for r in rows)
+    # ONE grouped count for the whole page — see `count_by_corpus`. `None` when
+    # the read fails, which the item below reports as an unknown count rather
+    # than as zero files.
+    try:
+        counts: dict[str, int] | None = corpus_files_repo().count_by_corpus()
+    except Exception:  # pragma: no cover - a corpus_files read failure
+        logger.exception("file-count projection failed; listing collections without counts")
+        counts = None
     return [
         {
             "id": "collections",
@@ -762,6 +906,17 @@ def _collection_blocks() -> list[Block]:
                     "slug": r.get("slug"),
                     "description": r.get("description"),
                     "grant_count": grant_counts.get(r["id"], 0),
+                    # WHOSE collection this is. Every collection on the
+                    # instance is listed here — including the one-file
+                    # artifacts a chat file-drop creates, which are private to
+                    # their uploader — and an admin reading an inventory of
+                    # private uploads has to be able to tell them apart from
+                    # their own. Without this the page showed a flat list of
+                    # names with no owner anywhere, which is how "why can I
+                    # see these files?" became unanswerable from the one page
+                    # that exists to answer it.
+                    "owner_email": owners.get(r.get("created_by") or ""),
+                    "file_count": counts.get(r["id"], 0) if counts is not None else None,
                 }
                 for r in rows
             ],
@@ -1005,9 +1160,10 @@ RESOURCE_TYPES: dict[ResourceType, ResourceTypeSpec] = {
         family=ResourceFamily.KNOWLEDGE,
         display_name="Files in collections",
         description=(
-            "A single file inside a multi-file collection. Grant a group access "
-            "to share ONE file without sharing its whole collection. Owners "
-            "normally write these grants themselves from the Library."
+            "Every file in every collection on this instance, listed by name, "
+            "format and size — never its contents. Grant a group access to "
+            "share ONE file without sharing its whole collection; owners "
+            "normally write those grants themselves from the Library."
         ),
         id_format="<corpus_file_id>",
         list_blocks=_corpus_file_blocks,

@@ -484,6 +484,284 @@ class TestCollectionResourceType:
             assert "col_del" not in ids
 
 
+class TestCollectionInventoryProjection:
+    """The admin /access page is where "what files exist on this instance, and
+    whose are they" is answered. An admin sees every collection by god-mode,
+    including the private one-file artifacts a chat file-drop creates, so the
+    projection has to name the owner and the file count — and must not omit
+    files."""
+
+    def _seed_user(self, conn, user_id: str, email: str) -> None:
+        conn.execute(
+            "INSERT INTO users (id, email, name) VALUES (?, ?, ?)",
+            [user_id, email, email.split("@")[0]],
+        )
+
+    def test_collection_item_names_its_owner(self, system_conn):
+        from app.resource_types import _collection_blocks
+
+        self._seed_user(system_conn, "u_owner", "jan@example.com")
+        system_conn.execute(
+            "INSERT INTO file_corpora (id, slug, name, created_by) "
+            "VALUES ('col_owned', 'owned', 'Owned Files', 'u_owner')"
+        )
+        items = {i["resource_id"]: i for i in _collection_blocks()[0]["items"]}
+        assert items["col_owned"]["owner_email"] == "jan@example.com"
+
+    def test_owner_is_none_when_the_account_is_gone(self, system_conn):
+        """An orphaned collection still lists — an inventory that drops rows it
+        cannot fully describe is worse than one with a blank column."""
+        from app.resource_types import _collection_blocks
+
+        system_conn.execute(
+            "INSERT INTO file_corpora (id, slug, name, created_by) "
+            "VALUES ('col_orphan', 'orphan', 'Orphan', 'u_deleted')"
+        )
+        items = {i["resource_id"]: i for i in _collection_blocks()[0]["items"]}
+        assert "col_orphan" in items
+        assert items["col_orphan"]["owner_email"] is None
+
+    def test_collection_item_counts_its_files(self, system_conn):
+        from app.resource_types import _collection_blocks
+        from src.repositories import corpus_files_repo
+
+        system_conn.execute(
+            "INSERT INTO file_corpora (id, slug, name, created_by) VALUES ('col_two', 'two', 'Two', 'u1')"
+        )
+        repo = corpus_files_repo()
+        for n in ("a.pdf", "b.pdf"):
+            repo.add(
+                corpus_id="col_two",
+                filename=n,
+                sha256="0" * 64,
+                file_type="pdf",
+                size_bytes=1024,
+                storage_path=f"/tmp/{n}",
+            )
+        items = {i["resource_id"]: i for i in _collection_blocks()[0]["items"]}
+        assert items["col_two"]["file_count"] == 2
+
+    def test_a_single_file_collection_is_listed_in_the_file_inventory(self, system_conn):
+        """The regression this projection change exists for: a chat file-drop
+        creates a ONE-file collection, and skipping those hid most of a real
+        instance's files from the page that inventories them."""
+        from app.resource_types import _corpus_file_blocks
+        from src.repositories import corpus_files_repo
+
+        self._seed_user(system_conn, "u_drop", "eva@example.com")
+        system_conn.execute(
+            "INSERT INTO file_corpora (id, slug, name, created_by) "
+            "VALUES ('col_drop', 'test-download', 'test_download.md', 'u_drop')"
+        )
+        corpus_files_repo().add(
+            corpus_id="col_drop",
+            filename="test_download.md",
+            sha256="1" * 64,
+            file_type="md",
+            size_bytes=2048,
+            storage_path="/tmp/test_download.md",
+        )
+        blocks = {b["id"]: b for b in _corpus_file_blocks()}
+        assert "col_drop" in blocks, "a one-file collection's file must be visible to an admin"
+        item = blocks["col_drop"]["items"][0]
+        assert item["name"] == "test_download.md"
+        assert item["owner_email"] == "eva@example.com"
+        # The block header names the owner too, so the file list reads as
+        # "somebody's upload" rather than as a folder on the instance.
+        assert "eva@example.com" in blocks["col_drop"]["name"]
+
+    def test_file_inventory_states_shape_never_content(self, system_conn):
+        from app.resource_types import _corpus_file_blocks
+        from src.repositories import corpus_files_repo
+
+        system_conn.execute(
+            "INSERT INTO file_corpora (id, slug, name, created_by) VALUES ('col_meta', 'meta', 'Meta', 'u1')"
+        )
+        corpus_files_repo().add(
+            corpus_id="col_meta",
+            filename="report.pdf",
+            sha256="2" * 64,
+            file_type="pdf",
+            size_bytes=2_202_010,
+            storage_path="/tmp/report.pdf",
+        )
+        item = {b["id"]: b for b in _corpus_file_blocks()}["col_meta"]["items"][0]
+        assert item["description"] == "pdf · 2.1 MB"
+        # Nothing in the projection can carry document text.
+        assert "text" not in item and "content" not in item
+
+    def test_empty_collection_contributes_no_file_block(self, system_conn):
+        from app.resource_types import _corpus_file_blocks
+
+        system_conn.execute(
+            "INSERT INTO file_corpora (id, slug, name, created_by) VALUES ('col_empty', 'empty', 'Empty', 'u1')"
+        )
+        assert "col_empty" not in {b["id"] for b in _corpus_file_blocks()}
+
+    def test_a_large_collection_is_bounded_and_reports_truncation(self, system_conn):
+        """The regression this bound exists for: an instance with ~216k
+        files across ~390 collections made the unbounded projection a
+        37 MB payload that froze the admin's browser tab rendering it."""
+        from app.resource_types import _CORPUS_FILE_PREVIEW_LIMIT, _corpus_file_blocks
+        from src.repositories import corpus_files_repo
+
+        system_conn.execute(
+            "INSERT INTO file_corpora (id, slug, name, created_by) VALUES ('col_big', 'big', 'Big', 'u1')"
+        )
+        repo = corpus_files_repo()
+        total = _CORPUS_FILE_PREVIEW_LIMIT + 5
+        for i in range(total):
+            repo.add(
+                corpus_id="col_big",
+                filename=f"f{i}.pdf",
+                sha256=str(i) * 8,
+                file_type="pdf",
+                size_bytes=10,
+                storage_path=f"/tmp/f{i}.pdf",
+            )
+        block = {b["id"]: b for b in _corpus_file_blocks()}["col_big"]
+        assert len(block["items"]) == _CORPUS_FILE_PREVIEW_LIMIT
+        assert block["items_total"] == total
+        assert block["items_truncated"] is True
+
+    def test_a_collection_within_the_cap_is_not_marked_truncated(self, system_conn):
+        from app.resource_types import _corpus_file_blocks
+        from src.repositories import corpus_files_repo
+
+        system_conn.execute(
+            "INSERT INTO file_corpora (id, slug, name, created_by) VALUES ('col_small', 'small', 'Small', 'u1')"
+        )
+        corpus_files_repo().add(
+            corpus_id="col_small",
+            filename="one.pdf",
+            sha256="a" * 8,
+            file_type="pdf",
+            size_bytes=10,
+            storage_path="/tmp/one.pdf",
+        )
+        block = {b["id"]: b for b in _corpus_file_blocks()}["col_small"]
+        assert len(block["items"]) == 1
+        assert block["items_total"] == 1
+        assert block["items_truncated"] is False
+
+    def test_an_already_granted_file_stays_visible_past_the_preview_cap(self, system_conn):
+        """A group holding a per-file grant must stay resolvable on the
+        /admin/access 'By group' tab even when the file falls outside the
+        bounded preview — otherwise a real grant becomes invisible and
+        unrevokable through the admin UI."""
+        from app.resource_types import _CORPUS_FILE_PREVIEW_LIMIT, _corpus_file_blocks
+        from src.db import SYSTEM_EVERYONE_GROUP
+        from src.repositories import corpus_files_repo, resource_grants_repo
+
+        system_conn.execute(
+            "INSERT INTO file_corpora (id, slug, name, created_by) VALUES ('col_grant', 'grant', 'Grant', 'u1')"
+        )
+        repo = corpus_files_repo()
+        total = _CORPUS_FILE_PREVIEW_LIMIT + 5
+        ids = [
+            repo.add(
+                corpus_id="col_grant",
+                filename=f"g{i}.pdf",
+                sha256=str(i) * 8,
+                file_type="pdf",
+                size_bytes=10,
+                storage_path=f"/tmp/g{i}.pdf",
+            )
+            for i in range(total)
+        ]
+        preview_ids = {f["id"] for f in repo.list_for_corpus("col_grant", limit=_CORPUS_FILE_PREVIEW_LIMIT)}
+        outside_id = next(fid for fid in ids if fid not in preview_ids)
+
+        group_id = system_conn.execute("SELECT id FROM user_groups WHERE name = ?", [SYSTEM_EVERYONE_GROUP]).fetchone()[
+            0
+        ]
+        resource_grants_repo().create(group_id=group_id, resource_type="corpus_file", resource_id=outside_id)
+
+        block = {b["id"]: b for b in _corpus_file_blocks()}["col_grant"]
+        item_ids = {i["resource_id"] for i in block["items"]}
+        assert outside_id in item_ids
+        assert len(block["items"]) == _CORPUS_FILE_PREVIEW_LIMIT + 1
+        assert block["items_total"] == total
+        assert block["items_truncated"] is True
+
+
+class TestCorpusFileSearch:
+    """The picker's bounded, on-demand counterpart to the (now capped)
+    ``_corpus_file_blocks`` projection above."""
+
+    def test_admin_can_search_by_filename(self, seeded_app, system_conn):
+        from src.repositories import corpus_files_repo
+
+        system_conn.execute("INSERT INTO file_corpora (id, slug, name, created_by) VALUES ('col_s', 's', 'S', 'u1')")
+        corpus_files_repo().add(
+            corpus_id="col_s",
+            filename="quarterly-report.pdf",
+            sha256="a" * 8,
+            file_type="pdf",
+            size_bytes=10,
+            storage_path="/tmp/qr.pdf",
+        )
+        corpus_files_repo().add(
+            corpus_id="col_s",
+            filename="unrelated.csv",
+            sha256="b" * 8,
+            file_type="csv",
+            size_bytes=10,
+            storage_path="/tmp/u.csv",
+        )
+        r = seeded_app["client"].get(
+            "/api/admin/access/resources/corpus_file/search?q=report",
+            headers={"Authorization": f"Bearer {seeded_app['admin_token']}"},
+        )
+        assert r.status_code == 200
+        names = {i["name"] for i in r.json()}
+        assert names == {"quarterly-report.pdf"}
+
+    def test_non_admin_is_refused(self, seeded_app):
+        r = seeded_app["client"].get(
+            "/api/admin/access/resources/corpus_file/search?q=report",
+            headers={"Authorization": f"Bearer {seeded_app['analyst_token']}"},
+        )
+        assert r.status_code == 403
+
+    def test_limit_is_respected(self, seeded_app, system_conn):
+        from src.repositories import corpus_files_repo
+
+        system_conn.execute(
+            "INSERT INTO file_corpora (id, slug, name, created_by) VALUES ('col_lim', 'lim', 'Lim', 'u1')"
+        )
+        repo = corpus_files_repo()
+        for i in range(5):
+            repo.add(
+                corpus_id="col_lim",
+                filename=f"doc-{i}.pdf",
+                sha256=str(i) * 8,
+                file_type="pdf",
+                size_bytes=10,
+                storage_path=f"/tmp/doc-{i}.pdf",
+            )
+        r = seeded_app["client"].get(
+            "/api/admin/access/resources/corpus_file/search?q=doc&limit=2",
+            headers={"Authorization": f"Bearer {seeded_app['admin_token']}"},
+        )
+        assert r.status_code == 200
+        assert len(r.json()) == 2
+
+    def test_a_query_under_two_chars_is_rejected(self, seeded_app):
+        r = seeded_app["client"].get(
+            "/api/admin/access/resources/corpus_file/search?q=a",
+            headers={"Authorization": f"Bearer {seeded_app['admin_token']}"},
+        )
+        assert r.status_code == 422
+
+    def test_an_unknown_resource_type_is_rejected(self, seeded_app):
+        r = seeded_app["client"].get(
+            "/api/admin/access/resources/not_a_real_type/search?q=xx",
+            headers={"Authorization": f"Bearer {seeded_app['admin_token']}"},
+        )
+        assert r.status_code == 400
+
+
 class TestMcpSourceResourceType:
     """TCRD-236: ``mcp_source`` makes a registered MCP server a grantable
     resource, ANDed with the existing per-tool ``tool_grants`` gate."""

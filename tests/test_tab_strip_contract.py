@@ -75,9 +75,7 @@ class TestOneDefinition:
                 f"admin_page.css restyles the tab item again: {block.strip()[:90]}"
             )
 
-    @pytest.mark.parametrize(
-        "prop", ["font-size: 13.5px", "font-weight: 600", "padding: 9px 14px 10px"]
-    )
+    @pytest.mark.parametrize("prop", ["font-size: 13.5px", "font-weight: 600", "padding: 9px 14px 10px"])
     def test_the_shared_item_carries_the_look(self, prop):
         assert prop in COMPONENTS.read_text()
 
@@ -119,9 +117,7 @@ class TestEveryStripUsesIt:
         buggy combination passes it."""
         src = (TEMPLATES / "library.html").read_text()
         tag = src.split('id="lib-tabs"', 1)[0].rsplit("<div", 1)[1]
-        assert "fbar-seg" not in tag, (
-            f"the library tab container carries the pill control's chrome again: <div{tag}"
-        )
+        assert "fbar-seg" not in tag, f"the library tab container carries the pill control's chrome again: <div{tag}"
 
     def test_the_library_keeps_its_engine_hook(self):
         """`.fbar-seg__btn` is how filter_toolbar.js finds these buttons. The
@@ -194,7 +190,31 @@ class TestActiveStateAttributeIsMaintained:
         seg = self._set_segment()
         assert "'radio'" in seg and "aria-checked" in seg, seg
 
+        markup = (TEMPLATES / "library.html").read_text(encoding="utf-8")
+        strip = markup[markup.index('role="radiogroup"') :]
+        assert 'role="radio"' in strip[:2000], "library.html: the segments are no longer radios"
+
+    def test_a_native_radiogroup_holds_native_radios(self):
+        """The other way to satisfy the same contract, and /chats' way since it
+        left the `segments` engine.
+
+        A `role="radiogroup"` announces a group whose members are radios; the
+        members can say so with an explicit `role="radio"` (the engine-driven
+        strip above, where `setSegment` also owns `aria-checked`) or by BEING
+        native `<input type="radio">`, whose radio role and checked state the
+        platform exposes with no ARIA at all. What is never acceptable is a
+        radiogroup whose options are neither — the group promises radios and
+        the options do not answer, which is the accessibility bug this class
+        exists to keep out however the markup is built.
+
+        Asserted per page rather than over one union, so a page that loses its
+        radios cannot be covered by another page that kept them.
+        """
         for name in ("library.html", "chats.html"):
             markup = (TEMPLATES / name).read_text(encoding="utf-8")
-            strip = markup[markup.index('role="radiogroup"'):]
-            assert 'role="radio"' in strip[:2000], f"{name}: the segments are no longer radios"
+            group = markup[markup.index('role="radiogroup"') :][:2000]
+            assert 'role="radio"' in group or 'type="radio"' in group, (
+                f"{name}: a role=radiogroup whose options are neither role=radio "
+                "nor native <input type=radio> — the group promises radios and "
+                "nothing in it announces as one"
+            )

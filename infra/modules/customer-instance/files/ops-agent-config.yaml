@@ -1,0 +1,68 @@
+# Google Cloud Ops Agent — receives Agnes' container logs over the Docker
+# fluentd driver (docker-compose.gcp-logging.yml) and writes them to Cloud
+# Logging as structured entries.
+#
+# Installed and placed at /etc/google-cloud-ops-agent/config.yaml by
+# startup-script.sh.tpl when enable_gcp_logging is true. The agent
+# authenticates as the VM service account, which the module grants
+# roles/logging.logWriter and roles/monitoring.metricWriter.
+#
+# The two processors are the whole point of using the agent instead of
+# Docker's gcplogs driver: parse_json turns the app's log line back into
+# fields, and modify_fields lifts its `severity` onto the entry so the Logs
+# Explorer's level filter works. Without them every entry is DEFAULT
+# severity with the payload as one string.
+logging:
+  receivers:
+    agnes_containers:
+      type: fluent_forward
+      # `listen_host` / `listen_port`, not `port` — the agent refuses to
+      # start on an unknown field, and a refusal here means nothing is
+      # accepting the containers' logs at all. Verified on a live VM.
+      listen_host: 127.0.0.1
+      listen_port: 24224
+  processors:
+    # Docker's fluentd driver puts the container's line in `log`; Agnes
+    # writes one JSON object per line (app/logging_config.py).
+    agnes_json:
+      type: parse_json
+      # `field: log` is load-bearing. The fluent_forward receiver hands the
+      # agent a record whose fields are Docker's (`log`, `container_id`,
+      # `container_name`, `source`); the app's own JSON is the STRING in
+      # `log`. Without this the record is already structured, parse_json
+      # finds nothing to do, and the line arrives as an opaque string at
+      # severity DEFAULT — the exact outcome this pipeline exists to avoid.
+      field: log
+      time_key: time
+      time_format: "%Y-%m-%dT%H:%M:%S.%L%z"
+    agnes_severity:
+      type: modify_fields
+      fields:
+        severity:
+          move_from: jsonPayload.severity
+          # A line the app did not write as JSON (a library writing plain
+          # text, a crash dump) has no severity to lift — default it rather
+          # than dropping the entry.
+          default_value: INFO
+  service:
+    pipelines:
+      agnes:
+        receivers: [agnes_containers]
+        processors: [agnes_json, agnes_severity]
+
+# Host metrics are not this agent's job: Cloud Monitoring bills the
+# agent.googleapis.com host metrics by ingested bytes, and on a VM with
+# enable_datadog those are collected twice over. Emptying the default
+# pipeline is Google's documented way to turn collection off.
+#
+# What it does NOT stop is the collector's own agent.googleapis.com/agent/*
+# self-metrics: they are free, they have no off switch, and the
+# OpenTelemetry sub-agent exports them whatever this file says. That is what
+# roles/monitoring.metricWriter is for — without it every export cycle fails
+# and the serial console fills with monitoring.timeSeries.create
+# PermissionDenied.
+metrics:
+  service:
+    pipelines:
+      default_pipeline:
+        receivers: []

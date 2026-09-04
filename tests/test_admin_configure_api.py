@@ -1219,6 +1219,45 @@ class TestDocumentedServerConfigKeysAreWritable:
             assert spec["default"] is default, (section, field)
             assert _is_secret_key(field) is False, f"{field} must not be masked"
 
+    def test_the_chat_sender_limits_render_as_numbers_with_runtime_defaults(self):
+        """The three per-sender limits `enforce_sender_limits` applies —
+        `daily_anthropic_spend_usd`, `max_session_tokens`,
+        `rate_messages_per_hour` — were documented as configurable in
+        /admin/server-config, but the panel only renders declared fields plus
+        whatever the overlay already holds, so an instance that had never
+        hand-edited its YAML showed nothing to raise: the daily spend cap could
+        only be lifted with a YAML edit on the data disk. Pinned as numeric
+        kinds (a free-text box would post a string) with defaults derived from
+        `ChatConfig` — the same one-copy rule the flag defaults follow."""
+        import dataclasses
+
+        from app.api.admin import _KNOWN_FIELDS, _SECTION_BASELINE_EFFECT, _is_secret_key
+        from app.chat.config import ChatConfig
+
+        runtime = {f.name: f.default for f in dataclasses.fields(ChatConfig)}
+        for field, kind in (
+            ("daily_anthropic_spend_usd", "float"),
+            ("max_session_tokens", "int"),
+            ("rate_messages_per_hour", "int"),
+        ):
+            spec = _KNOWN_FIELDS["chat"][field]
+            assert spec["kind"] == kind, field
+            assert spec["default"] == runtime[field], field
+            assert type(spec["default"]) is type(runtime[field]), field
+            assert "restart" in spec["hint"], f"{field}: hint must say it applies after a restart"
+            assert _is_secret_key(field) is False, f"{field} must not be masked"
+        # The hints promise a restart because app.state.chat_config is built
+        # once at boot; the save response must say the same.
+        assert _SECTION_BASELINE_EFFECT["chat"] == "restart"
+        # And `agnes admin config export` keeps the budget: the key-name gate
+        # used to omit it as a "secret" literal, so an exported overlay lost it.
+        from app.api.admin import _export_scrub
+
+        omitted: list[str] = []
+        kept = _export_scrub({"chat": {"max_session_tokens": 123456, "api_token": "x"}}, omitted=omitted)
+        assert kept == {"chat": {"max_session_tokens": 123456}}
+        assert omitted == ["chat.api_token"]
+
     def test_declared_defaults_match_the_registry(self):
         """No second copy of a flag's default.
 
@@ -1300,7 +1339,7 @@ class TestDocumentedServerConfigKeysAreWritable:
         assert "mcp" in _EDITABLE_SECTIONS
         field = _KNOWN_FIELDS["mcp"]["allow_query_param_token"]
         assert field["kind"] == "bool"
-        assert field["default"] is True, "the fallback is on by default; the switch turns it off"
+        assert field["default"] is False, "off by default since #1656; the switch opts back in"
 
 
 class TestBooleanConfigFieldsAreNeverMasked:

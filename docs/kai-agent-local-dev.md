@@ -85,12 +85,18 @@ default turn, which names the others.
 
 | Type this          | You get                                                        |
 | ------------------ | -------------------------------------------------------------- |
+| `everything`       | EVERY renderable shape in one turn — a lone step, a group with failures in it, all four result renderers, both language arg panels, the full markdown vocabulary, and the sources / next_actions trailers. Start here when eyeballing the chat surface as a whole. (`approval` and `deliverable` stay separate: one blocks on a human decision, the other needs the sandbox file store.) |
 | `interleaved`      | text → tool → text → tool → text; an MCP envelope and a 6-row table. The #1504 shape. |
+| `wall`             | six CONSECUTIVE calls, three failing, before the first sentence — the #1974 shape: the tool-call group, the failure diagnosis on the header line, and an internal endpoint that must stay text |
 | `table`            | a 400-row result, to see the preview cap and the "show all rows" route |
-| `fail`             | a tool that fails with `tool-output-error` — red card, auto-opened |
+| `fail`             | a tool that fails with `tool-output-error` — red card, its error on the header line |
 | `approval`         | a `tool-approval-request`; the turn blocks until you Allow or Deny |
 | `error`            | a mid-turn engine `error` event after partial text             |
 | `markdown`         | a tool returning a markdown table, rendered as a real table    |
+| `tabular`          | a table the MODEL writes, streamed a few characters per delta — the header row must not flash as raw pipes and the table must be styled while it grows (TCRD-288) |
+| `nextactions`      | the production tail: prose, then the `next_actions` and `sources` trailers — for the withheld-fence window, the mid-stream chips and the strip; its three `assumption:` lines cover a stated origin + rationale, an `origin: judgment`, and a legacy line with neither (the "origin not stated" badge) |
+| `console`          | a rich box-drawing table, the shape `agnes query`/`agnes catalog` actually print — for the `<pre>` route that keeps its column alignment |
+| `doc`              | a DOCUMENT-shaped answer — h1/h2/h3, numbered steps, fenced code, a bullet list, a table, a rule, a quote. Nothing to do with tool calls: it is the message body's own markdown rhythm, only judgeable on a real document |
 | `nextactions`      | the production tail: prose, then the `next_actions` and `sources` trailers — for the withheld-fence window, the mid-stream chips and the strip |
 | `deliverable`      | a turn that registers `outputs/report.docx` + `outputs/deck.pptx` in the stub's sandbox file store — for the **Files** overlay |
 
@@ -140,7 +146,8 @@ Worth knowing before you trust a local result:
   `/api/kai/tickets` or `GET /api/kai/workspace`, so the broker scope split and
   the workspace tarball path are not exercised — `tests/test_kai_host.py`
   covers those from the host side.
-- **Auto-title still needs a real key.** `chat_sessions.title` stays `NULL`
-  locally because auto-title asks Haiku directly and skips silently (at debug
-  level) when neither `ANTHROPIC_API_KEY` nor a WIF configuration is present.
-  A null title in local dev is expected, not a bug.
+- **A model-written title still needs a real key.** Auto-title asks Haiku
+  directly, and without `ANTHROPIC_API_KEY` or a WIF configuration that call is
+  skipped. The session is titled all the same — with a cut of your own first
+  sentence (the deterministic fallback, TCRD-290) — so a sidebar title that
+  merely echoes your message in local dev is expected, not a bug.

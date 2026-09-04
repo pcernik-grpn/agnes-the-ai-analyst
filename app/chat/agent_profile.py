@@ -183,21 +183,170 @@ relationships between them) into a queryable graph. For a question about
 **who, what, which entity, or how things relate** — "who owns X", "how do
 these two people connect", "which clients per industry" — reach for the
 fact tools FIRST, before writing SQL or searching documents by keyword:
-`fact_search` -> `fact_neighbors` -> `fact_claims` (the same calls as
-`agnes facts search|neighbors|claims` on the CLI).
+`fact_search` -> `fact_neighbors` / `fact_edges` -> `fact_claims` (the same
+calls as `agnes facts search|neighbors|edges|claims` on the CLI). For a
+question about ALL relationships of one type ("which organizations own
+which companies", "which industries are our clients in"), read the
+relationship names from `fact_type_map` and call `fact_edges` ONCE with
+`include_claims=1` — not `fact_neighbors` once per entity.
 
 ```
 agnes facts search <type> [query] [--filter key=value]   # find subjects by type, an optional name, and/or attrs
-agnes facts neighbors <subject_id>                        # traverse relationships (depth <= 2)
-agnes facts claims <subject_id>                           # the evidencing quote + document for one subject
+agnes facts neighbors <subject_id>                        # traverse relationships from ONE subject (depth <= 2)
+agnes facts edges <edge_type> [--extend <type>] [--claims 1]  # EVERY relationship of one type, both ends, cited
+agnes facts claims <subject_id>                           # the evidencing quotes (newest first) for one subject
 ```
 
-Cite every fact you use — `agnes facts claims` gives you the exact quote and
-its source document, name both in your answer. Facts are filtered
+Cite every fact you use — `--claims`/`include_claims` gives you the quote
+inline, `agnes facts claims` gives the rest; name the quote and its source
+document in your answer. Facts are filtered
 server-side to what YOU can read; a search returning nothing may exist
 outside your access, it is not evidence the fact is absent — fall back to
 `agnes collections search` rather than inventing an answer or refusing
 outright.
+"""
+
+#: File-delivery rails appended after :data:`DATA_ACCESS_RAILS`, ungated.
+#:
+#: Same failure shape as :data:`FACTS_ACCESS_RAILS`, one section over:
+#: `config/claude_md_template.txt` carries the "Files you produce" section
+#: that names ``outputs/`` as the ONE directory a deliverable can reach the
+#: user from — and a persona REPLACES that template wholesale. So a persona'd
+#: agent asked for a ``.docx`` had no text telling it where to write one, and
+#: none of the "never disclaim the handover" rule either; the observed
+#: behavior (#1975) was an agent writing to ``/tmp`` or a skill directory and
+#: then telling the user that this sandbox has no download channel and they
+#: should copy markdown into their own editor — while the chat's Files panel
+#: sat beside the conversation waiting for a file that was never written
+#: anywhere it could see.
+#:
+#: Ungated on purpose, unlike the facts rails: ``outputs/`` is not a feature
+#: switch but the platform's one delivery convention, shared by the chat
+#: files channel (``app/api/chat_session_files.py``) and the agent API's
+#: artifact harvest (``app/chat/artifact_harvest.py``, which scans exactly
+#: ``{workdir}/outputs``). Every surface that spawns a persona'd agent honors
+#: it, so there is no instance where this text would steer an agent at
+#: something that does not exist.
+#:
+#: The closing paragraph is not padding: an agent that overclaims ("click the
+#: download button below") is the mirror-image bug, and it is the likelier
+#: one once the agent knows a panel exists at all. Only web chat draws the
+#: file beside the conversation; a Slack thread carries a Continue-on-web link
+#: to the same session's drawer, and an `api` session (``agnes chat``, the
+#: one-shot agent API) has its ``outputs/`` harvested to
+#: ``GET /api/v1/sessions/{id}/artifacts`` — reachable on every surface, shown
+#: inline on exactly one. So this text says where to WRITE and never how the
+#: reader will get it, which is the only claim true everywhere; a
+#: surface-conditional block would have to drop the never-disclaim rule on
+#: Slack and the CLI, and that rule is the actual defect in #1975.
+FILE_DELIVERY_RAILS = """
+
+---
+
+## Files you produce
+
+Agnes adds this section to every agent; it holds regardless of the persona
+above.
+
+A **document** — a `.docx`, a `.pptx`, an `.xlsx`, a PDF, a CSV export —
+reaches the user as a file, and where you write it decides whether it reaches
+them at all: write it to **`outputs/`**, relative to your working directory,
+under a descriptive filename. Create the directory if it isn't there.
+
+`outputs/` is the one directory Agnes collects deliverables from. A file
+written anywhere else stays in this sandbox: `.claude/` (skill directories
+included), `/tmp`, or a bare filename in the working directory are all
+invisible — however well the file itself rendered. A skill whose scaffolds
+live in `.claude/skills/<name>/` must still write its *output* to `outputs/`.
+
+```
+outputs/q3-revenue.xlsx      <- they get this
+.claude/skills/deck/out.pptx <- they never see it
+```
+
+A **chart** is the one exception: it belongs inside your reply as inline SVG,
+not in `outputs/` — a picture the user has to open in another window is not an
+answer.
+
+**Never disclaim the handover.** Writing the file to `outputs/` is your whole
+part of it. Do not tell the user that this filesystem is not their machine,
+that you cannot produce a downloadable file, that there is no way to hand one
+over here, that they need Claude Code or the Agnes CLI to fetch it, or that
+they should copy your answer into their own editor instead — each of those is
+false, and each sends the reader hunting for a problem that does not exist.
+
+Do not overclaim in the other direction either. How the file then reaches the
+reader is the surface's job, not yours, and it differs: web chat lists it
+beside the conversation, other surfaces collect it and hand it over their own
+way. You cannot see which, so do not promise a download button, do not say
+where to click, and do not claim it is already in front of them. Name what you
+wrote and where: "The deck is ready as `outputs/q3-review.pptx`" is the whole
+job — true on every surface, and it needs no caveat on either side.
+"""
+
+
+#: Provenance rails appended after :data:`FILE_DELIVERY_RAILS`, ungated.
+#:
+#: Third instance of the same gap: the "Say where every number came from"
+#: section of `config/claude_md_template.txt` is the ONLY text that asks for
+#: the ```sources trailer — the `table:` claims the server checks against the
+#: turn's tool calls, and the `assumption:` lines whose `origin:`/`why:`
+#: segments the chat renders as badges and rationale (TCRD-289) — and a
+#: persona REPLACES that template wholesale. So a persona'd agent's figures
+#: rendered as "Sources — none declared" and its assumptions never reached
+#: the reader at all, while the default agent, one prompt over, was held to
+#: the product's promise on every answer. (Devin Review on #2047.)
+#:
+#: Ungated for the same reason the file rails are: the renderer, the verdict
+#: and the push-sink strip (`app/chat/sources.py`) run on every surface a
+#: persona'd agent can answer from, so there is no instance where this text
+#: steers an agent at machinery that does not exist. The origin vocabulary is
+#: the server's (`ASSUMPTION_ORIGINS`), pinned by
+#: `tests/test_chat_sources_verdict.py` alongside the template's copy — one
+#: contract, three carriers, none allowed to drift.
+PROVENANCE_RAILS = """
+
+---
+
+## Say where every number came from
+
+Agnes adds this section to every agent; it holds regardless of the persona
+above.
+
+An answer that reports a figure ends with a fenced `sources` block — one
+claim per line, the LAST thing in the reply:
+
+    ```sources
+    table: hr_headcount
+    metric: headcount/active
+    document: 2026_Workforce_Plan.pdf
+    assumption: active employees only | origin: user | why: you asked about "the team"
+    assumption: contractors excluded | origin: definition | why: headcount/active counts employees only
+    ```
+
+- `table:` — the registry id (as `agnes catalog` gives it) of every table the
+  figure was computed from. `metric:` — the canonical metric id, when you
+  adapted one. `document:` — every document or fact-graph subject the answer
+  rests on: the filename as the fact tools give it, or the subject id you
+  passed to `agnes facts claims`. Each is checked against the tools you
+  actually ran; naming a table you did not query, or a file you did not open,
+  is worse than naming none. An answer read entirely out of documents
+  declares `document:` lines and no `table:` — that is a complete answer to
+  "where did this come from", not a gap.
+- `assumption:` — anything the number depends on that you chose rather than
+  read, one per line, and never a source: a file you read is a `document:`,
+  and filing it here shows the reader your evidence among your guesses.
+  Always with two more segments separated by ` | `:
+  `origin:` is ONE word from `user` (the question said or implied it),
+  `definition` (a metric definition, a semantic model or a document in the
+  knowledge base says so), `data` (the data forced it: a missing column or
+  value, so a proxy or a subset stood in), `judgment` (your own choice, with
+  nothing behind it); `why:` is one short sentence a reader could check. An
+  assumption without them is shown to the reader as "origin not stated".
+
+The chat lifts this block out of your reply and renders it as provenance next
+to the answer; it never appears as text. Never report a number whose origin
+you cannot name — when no tool call backs a figure, say so in the answer.
 """
 
 
@@ -399,7 +548,11 @@ def build_profile(
     never be able to silently drop the platform's data-access floor — then,
     when the `facts` feature switch is on, :data:`FACTS_ACCESS_RAILS` after
     it (see that constant for why a persona needs its own copy of the
-    fact-tool guidance too), and finally :func:`_semantic_layer_section`.
+    fact-tool guidance too), then :data:`FILE_DELIVERY_RAILS` (the
+    ``outputs/`` handover convention, ungated — see that constant), then
+    :data:`PROVENANCE_RAILS` (the ```sources trailer with the assumption
+    origin/why contract, ungated — see that constant), and finally
+    :func:`_semantic_layer_section`.
     The early return above means this only ever applies where a persona
     actually replaces the workspace prompt; an agent with no persona keeps
     the full symlinked rails — including the template's own facts and
@@ -422,6 +575,8 @@ def build_profile(
     claude_md = system_prompt + DATA_ACCESS_RAILS
     if _facts_rails_enabled():
         claude_md += FACTS_ACCESS_RAILS
+    claude_md += FILE_DELIVERY_RAILS
+    claude_md += PROVENANCE_RAILS
     claude_md += _semantic_layer_section(user_email)
     return ChatProfile(
         slug=f"agent-{slug}",

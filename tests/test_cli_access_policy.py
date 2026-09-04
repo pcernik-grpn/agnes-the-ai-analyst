@@ -265,6 +265,92 @@ class TestTablePolicyShow:
         assert result.exit_code == 1
 
 
+class TestTablePolicyShowMappingStatus:
+    """#2147: `policy_mapping_status` -- the read-only, per-mapping-table
+    health `GET /api/admin/registry` now attaches to a policied row -- is
+    rendered by `table-policy show`, both human and `--json`."""
+
+    def test_broken_mapping_table_is_flagged(self):
+        tables = [
+            {
+                "id": "invoices",
+                "name": "invoices",
+                "access_policy_sql": "SELECT * FROM invoices WHERE unit IN (SELECT unit FROM user_access)",
+                "access_policy_note": "restrict to unit",
+                "access_policy_updated_by": "admin@x.com",
+                "access_policy_updated_at": "2026-08-11T00:00:00",
+                "policy_mapping": False,
+                "policy_mapping_status": [{"mapping_table": "user_access", "state": "never_synced", "last_sync": None}],
+            }
+        ]
+        with patch("cli.commands.admin.api_get", return_value=_registry_resp(tables)):
+            result = runner.invoke(app, ["admin", "table-policy", "show", "invoices"])
+        assert result.exit_code == 0, result.output
+        assert "mapping status" in result.output.lower()
+        assert "user_access: never_synced" in result.output
+        assert "last_sync: never" in result.output
+
+    def test_healthy_mapping_table_is_shown_without_a_broken_flag(self):
+        tables = [
+            {
+                "id": "invoices",
+                "name": "invoices",
+                "access_policy_sql": "SELECT * FROM invoices",
+                "access_policy_note": "note",
+                "access_policy_updated_by": "admin@x.com",
+                "access_policy_updated_at": "2026-08-11T00:00:00",
+                "policy_mapping": False,
+                "policy_mapping_status": [
+                    {"mapping_table": "user_access2", "state": "ok", "last_sync": "2026-08-11T00:00:00"}
+                ],
+            }
+        ]
+        with patch("cli.commands.admin.api_get", return_value=_registry_resp(tables)):
+            result = runner.invoke(app, ["admin", "table-policy", "show", "invoices"])
+        assert result.exit_code == 0, result.output
+        assert "user_access2: ok" in result.output
+        assert "broken" not in result.output.lower()
+
+    def test_json_carries_the_field(self):
+        tables = [
+            {
+                "id": "invoices",
+                "name": "invoices",
+                "access_policy_sql": "SELECT 1",
+                "access_policy_note": "note",
+                "access_policy_updated_by": "admin@x.com",
+                "access_policy_updated_at": "2026-08-11T00:00:00",
+                "policy_mapping": False,
+                "policy_mapping_status": [{"mapping_table": "user_access", "state": "empty", "last_sync": None}],
+            }
+        ]
+        with patch("cli.commands.admin.api_get", return_value=_registry_resp(tables)):
+            result = runner.invoke(app, ["admin", "table-policy", "show", "invoices", "--json"])
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert data["policy_mapping_status"] == [{"mapping_table": "user_access", "state": "empty", "last_sync": None}]
+
+    def test_no_status_field_when_the_table_has_no_dependency(self):
+        """A policied row with no `policy_mapping` dependency at all carries
+        no `policy_mapping_status` key (`GET /api/admin/registry` only adds
+        it for a policied row)."""
+        tables = [
+            {
+                "id": "invoices",
+                "name": "invoices",
+                "access_policy_sql": "SELECT * FROM invoices",
+                "access_policy_note": "note",
+                "access_policy_updated_by": "admin@x.com",
+                "access_policy_updated_at": "2026-08-11T00:00:00",
+                "policy_mapping": False,
+            }
+        ]
+        with patch("cli.commands.admin.api_get", return_value=_registry_resp(tables)):
+            result = runner.invoke(app, ["admin", "table-policy", "show", "invoices"])
+        assert result.exit_code == 0, result.output
+        assert "mapping status" not in result.output.lower()
+
+
 class TestTablePolicyPreview:
     def test_preview_as_groups_prints_row_counts(self):
         captured = {}
@@ -396,5 +482,186 @@ class TestTablePolicyPreview:
             ),
         ):
             result = runner.invoke(app, ["admin", "table-policy", "preview", "orders", "--as-groups", "X"])
+        assert result.exit_code == 1
+        assert "policy_preview_no_policy" in result.output
+
+
+class TestTablePolicyPreviewSurfaceRefusal:
+    """F2 (#1979, security review): the preview endpoint is gated by
+    ``require_admin_all_surface``, so an admin running it from an
+    ``agnes init``-ed workspace (a ``surface='stack'`` PAT) gets a 403 whose
+    detail names the fix. The CLI must show that detail rather than a bare
+    "Failed" -- the credential, not the policy, is what needs changing."""
+
+    def test_the_403_detail_reaches_the_terminal(self):
+        detail = (
+            "This endpoint requires an admin credential with the full "
+            "('all') data-read surface — a surface='stack' PAT (the "
+            "`agnes init` default) is filtered like an analyst here. "
+            "Use a browser session, a regular PAT, or "
+            "`agnes init --as-admin`."
+        )
+
+        with patch("cli.commands.admin.api_post", side_effect=lambda *a, **k: _resp(403, {"detail": detail})):
+            result = runner.invoke(app, ["admin", "table-policy", "preview", "invoices", "--as-groups", "Finance"])
+
+        assert result.exit_code == 1, result.output
+        assert "agnes init --as-admin" in result.output
+        assert "data-read surface" in result.output
+
+
+class TestTablePolicyPreviewMatrix:
+    """``agnes admin table-policy preview <id> --matrix`` (design doc §13.1,
+    issue #2147) -- calls `POST .../policy/preview-matrix` instead of the
+    single-persona endpoint. No persona flag is accepted: the matrix
+    enumerates its own personas.
+    """
+
+    def _matrix_body(self):
+        return {
+            "rows_total": 3,
+            "personas": [
+                {
+                    "kind": "group_set",
+                    "label": "Finance",
+                    "groups": ["Finance"],
+                    "rows_visible": 2,
+                    "rows_total": 3,
+                    "hidden_columns": ["secret"],
+                    "masked_columns": [],
+                },
+                {
+                    "kind": "group_set",
+                    "label": "Ops",
+                    "groups": ["Ops"],
+                    "rows_visible": 1,
+                    "rows_total": 3,
+                    "hidden_columns": ["secret"],
+                    "masked_columns": [],
+                },
+            ],
+            "union_coverage": 1.0,
+            "no_op": False,
+            "pairwise_overlap": [
+                {"persona_a": "Finance", "persona_b": "Ops", "overlap_rows": 0, "overlap_fraction": 0.0}
+            ],
+            "identity_columns": ["id"],
+            "truncated": False,
+            "transpiled": None,
+            "mapping_warning": None,
+        }
+
+    def test_matrix_calls_the_matrix_endpoint(self):
+        captured = {}
+
+        def fake_post(path, **kwargs):
+            captured["path"] = path
+            captured["json"] = kwargs.get("json")
+            return _resp(200, self._matrix_body())
+
+        with patch("cli.commands.admin.api_post", side_effect=fake_post):
+            result = runner.invoke(app, ["admin", "table-policy", "preview", "invoices", "--matrix"])
+        assert result.exit_code == 0, result.output
+        assert captured["path"] == "/api/admin/registry/invoices/policy/preview-matrix"
+        assert captured["json"] == {"personas": "both"}
+        assert "Finance" in result.output
+        assert "Ops" in result.output
+        assert "union coverage: 100%" in result.output
+
+    def test_matrix_json_clean_stdout(self):
+        body = self._matrix_body()
+        with patch("cli.commands.admin.api_post", return_value=_resp(200, body)):
+            result = runner.invoke(app, ["admin", "table-policy", "preview", "invoices", "--matrix", "--json"])
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.output) == body
+
+    def test_matrix_personas_and_limit_forwarded(self):
+        captured = {}
+
+        def fake_post(path, **kwargs):
+            captured["json"] = kwargs.get("json")
+            return _resp(200, self._matrix_body())
+
+        with patch("cli.commands.admin.api_post", side_effect=fake_post):
+            result = runner.invoke(
+                app,
+                [
+                    "admin",
+                    "table-policy",
+                    "preview",
+                    "invoices",
+                    "--matrix",
+                    "--personas",
+                    "policy_groups",
+                    "--limit",
+                    "10",
+                ],
+            )
+        assert result.exit_code == 0, result.output
+        assert captured["json"] == {"personas": "policy_groups", "limit": 10}
+
+    def test_matrix_rejects_as_user(self):
+        with patch("cli.commands.admin.api_post") as mock_post:
+            result = runner.invoke(
+                app, ["admin", "table-policy", "preview", "invoices", "--matrix", "--as", "alice@x.com"]
+            )
+        assert result.exit_code == 2
+        mock_post.assert_not_called()
+
+    def test_matrix_rejects_as_groups(self):
+        with patch("cli.commands.admin.api_post") as mock_post:
+            result = runner.invoke(
+                app, ["admin", "table-policy", "preview", "invoices", "--matrix", "--as-groups", "Finance"]
+            )
+        assert result.exit_code == 2
+        mock_post.assert_not_called()
+
+    def test_matrix_rejects_an_unknown_personas_value(self):
+        with patch("cli.commands.admin.api_post") as mock_post:
+            result = runner.invoke(
+                app, ["admin", "table-policy", "preview", "invoices", "--matrix", "--personas", "bogus"]
+            )
+        assert result.exit_code == 2
+        mock_post.assert_not_called()
+
+    def test_matrix_flags_a_no_op_policy(self):
+        body = self._matrix_body()
+        body["union_coverage"] = 1.0
+        body["no_op"] = True
+        for persona in body["personas"]:
+            persona["rows_visible"] = persona["rows_total"]
+
+        with patch("cli.commands.admin.api_post", return_value=_resp(200, body)):
+            result = runner.invoke(app, ["admin", "table-policy", "preview", "invoices", "--matrix"])
+        assert result.exit_code == 0, result.output
+        assert "NO-OP" in result.output
+
+    def test_matrix_mapping_warning_short_circuits_the_render(self):
+        body = {
+            "rows_total": None,
+            "personas": [],
+            "union_coverage": None,
+            "no_op": None,
+            "pairwise_overlap": [],
+            "identity_columns": [],
+            "truncated": False,
+            "transpiled": None,
+            "mapping_warning": "policy_mapping_empty: the mapping table has never synced",
+        }
+        with patch("cli.commands.admin.api_post", return_value=_resp(200, body)):
+            result = runner.invoke(app, ["admin", "table-policy", "preview", "invoices", "--matrix"])
+        assert result.exit_code == 0, result.output
+        assert "policy_mapping_empty" in result.output
+
+    def test_matrix_api_error_surfaces_detail(self):
+        with patch(
+            "cli.commands.admin.api_post",
+            return_value=_resp(
+                422,
+                {"detail": "policy_preview_no_policy: no stored or candidate policy"},
+                text="policy_preview_no_policy",
+            ),
+        ):
+            result = runner.invoke(app, ["admin", "table-policy", "preview", "orders", "--matrix"])
         assert result.exit_code == 1
         assert "policy_preview_no_policy" in result.output

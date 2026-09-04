@@ -24,6 +24,15 @@ def _chat_js() -> str:
 
 
 def _slice(js: str, start_marker: str, end_marker: str) -> str:
+    """The source between two markers.
+
+    ``end_marker`` is the banner of whatever section follows ``_syncSessionUrl``
+    in chat.js — it only has to be the NEXT thing, so it moves whenever that
+    neighbour is renamed (it has been "Composer agent picker" and is now "Agents
+    in the chat window"). A rename fails here with a bare ValueError; if you are
+    reading this because of one, the fix is to re-point the marker, not to
+    change what the helper asserts.
+    """
     start = js.index(start_marker)
     end = js.index(end_marker, start)
     return js[start:end]
@@ -31,7 +40,7 @@ def _slice(js: str, start_marker: str, end_marker: str) -> str:
 
 def test_sync_helper_exists_and_uses_replace_state_not_push_state():
     js = _chat_js()
-    body = _slice(js, "function _syncSessionUrl(chatId) {", "// --- Composer agent picker")
+    body = _slice(js, "function _syncSessionUrl(chatId) {", "// --- Agents in the chat window")
     assert "new URL(window.location.href)" in body
     assert "u.searchParams.set(" in body and '"session"' in body
     assert "u.searchParams.delete(" in body
@@ -44,7 +53,7 @@ def test_sync_helper_clears_the_param_on_a_falsy_id():
     'null'/'undefined' — the bug this whole feature exists to avoid on the
     reverse path (a param that lingers past its session)."""
     js = _chat_js()
-    body = _slice(js, "function _syncSessionUrl(chatId) {", "// --- Composer agent picker")
+    body = _slice(js, "function _syncSessionUrl(chatId) {", "// --- Agents in the chat window")
     assert "if (chatId) {" in body
     delete_idx = body.index("u.searchParams.delete(")
     set_idx = body.index("u.searchParams.set(")
@@ -71,16 +80,29 @@ def test_load_and_render_history_reaching_turns_goes_through_mark_started():
     test file covers directly above."""
     js = _chat_js()
     body = _slice(
-        js, "async function loadAndRenderHistory(chatId) {", "async function openSession(chatId, wsUrlOverride) {"
+        js,
+        "async function loadAndRenderHistory(chatId) {",
+        "/** A deep-link restore that could not be completed",
     )
     assert "_markConversationStarted();" in body
 
 
 def test_open_session_writes_the_url_from_session_has_turns():
     js = _chat_js()
-    body = _slice(js, "async function openSession(chatId, wsUrlOverride) {", "function chatErrorCopy(raw, kind) {")
+    body = _slice(
+        js,
+        "async function openSession(chatId, wsUrlOverride, { restoring = false, reconnecting = false, turnInFlight: turnInFlightHint = null } = {}) {",
+        # The copy helpers that used to sit here moved to chat_errors.js
+        # (one home for the sentences, shared with /_debug/error-surfaces),
+        # so handleFrame is openSession's neighbour now.
+        "function handleFrame(frame) {",
+    )
     assert "if (_switchingSession) _sessionHasTurns = false;" in body
-    sync_call = "_syncSessionUrl(_sessionHasTurns ? chatId : null);"
+    # #1973: a RESTORE (deep link / refresh) keeps the param it was opened
+    # from — clearing it on entry and putting it back a fetch later is what
+    # made a slow restore look like a silent new chat. Every other open keeps
+    # the #1914 behavior.
+    sync_call = "if (!restoring) _syncSessionUrl(_sessionHasTurns ? chatId : null);"
     assert sync_call in body
     # Must run AFTER the switch reset (so a switch to an unproven session
     # starts cleared) and BEFORE the history fetch settles (so an
@@ -102,13 +124,28 @@ def test_delete_session_clears_the_url_when_deleting_the_open_conversation():
 
 
 def test_new_chat_failure_path_clears_the_url():
-    """``#new-chat``'s click handler resets every session pointer on a failed
+    """The new-conversation gesture resets every session pointer on a failed
     ``newChat()`` — the URL is one of them, or a refresh after a failed "New
-    chat" click could re-open a stale prior session id."""
+    chat" click could re-open a stale prior session id.
+
+    The recovery moved out of ``#new-chat``'s click handler into
+    ``startNewChatFromGesture`` so the ``n`` shortcut shares it; the shortcut
+    used to call ``newChat()`` bare, so a refused create was an unhandled
+    rejection and the keypress silently did nothing."""
     js = _chat_js()
-    body = _slice(js, '$("new-chat")?.addEventListener("click"', '$("chat-form").onsubmit')
+    body = _slice(js, "async function startNewChatFromGesture()", '$("new-chat")?.addEventListener("click"')
     assert "currentChatId = null;" in body
     assert "_syncSessionUrl(null);" in body
+
+
+def test_both_new_chat_gestures_share_the_recovery():
+    """A second entry point that calls ``newChat()`` directly would reintroduce
+    the silent-failure path this function exists to close."""
+    js = _chat_js()
+    assert js.count("startNewChatFromGesture()") >= 2, "the keyboard shortcut no longer shares the recovery"
+    shortcut = _slice(js, 'if (e.key === "n" || e.key === "N")', 'else if (e.key === "/")')
+    assert "startNewChatFromGesture()" in shortcut
+    assert "newChat()" not in shortcut, "the shortcut calls newChat() bare again — rejections vanish"
 
 
 def test_no_popstate_handling_was_added():

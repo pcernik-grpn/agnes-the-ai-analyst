@@ -160,6 +160,55 @@ class TestShow:
         assert result.exit_code == 1
         assert "agnes agent list" in result.output
 
+    def test_show_warns_about_a_policied_table_in_scope(self):
+        """Design doc §12 — a Slack channel bound to this agent, or a
+        scheduled run, answers everyone with the OWNER's slice of a policied
+        table, so `agnes agent show` surfaces the same warning the `/agents`
+        page renders, straight off the management API's
+        `policied_tables_in_scope` / `policied_tables` fields."""
+        row = dict(
+            _AGENT_ROW,
+            policied_tables_in_scope=["tbl_orders"],
+            policied_tables=[
+                {
+                    "table_id": "tbl_orders",
+                    "name": "orders",
+                    "access_policy": True,
+                    "policy": {"applies": True, "rows_visible": 2, "reason": "ok", "note": None},
+                }
+            ],
+        )
+        with patch(
+            "cli.commands.agent.api_get",
+            return_value=_resp(200, {"data": [row], "has_more": False, "next_cursor": None}),
+        ):
+            result = runner.invoke(app, ["agent", "show", "research"])
+        assert result.exit_code == 0
+        assert "1 table" in result.output
+        assert "filtered by an access policy" in result.output
+        assert "owner" in result.output.lower()
+        assert "orders" in result.output
+        assert "2 row(s) visible to the owner" in result.output
+
+    def test_show_json_still_carries_the_raw_fields(self):
+        row = dict(_AGENT_ROW, policied_tables_in_scope=["tbl_orders"], policied_tables=[])
+        with patch(
+            "cli.commands.agent.api_get",
+            return_value=_resp(200, {"data": [row], "has_more": False, "next_cursor": None}),
+        ):
+            result = runner.invoke(app, ["agent", "show", "research", "--json"])
+        data = json.loads(result.output)
+        assert data["policied_tables_in_scope"] == ["tbl_orders"]
+
+    def test_show_no_warning_without_a_policied_table(self):
+        with patch(
+            "cli.commands.agent.api_get",
+            return_value=_resp(200, {"data": [_AGENT_ROW], "has_more": False, "next_cursor": None}),
+        ):
+            result = runner.invoke(app, ["agent", "show", "research"])
+        assert result.exit_code == 0
+        assert "access policy" not in result.output
+
 
 class TestScopeSet:
     def test_scope_set_sends_put_with_items(self):

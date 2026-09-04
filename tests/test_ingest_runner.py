@@ -103,6 +103,34 @@ def test_ingest_txt_creates_chunks(e2e_env, tmp_path):
     assert row["processing_detail"]["chunk_count"] == len(chunks)
 
 
+def test_ingest_uses_preloaded_text_and_skips_the_disk_re_read(e2e_env, tmp_path):
+    """A caller that already has the document's text in memory (the
+    SharePoint crawl pipeline: `_prepare_document` converts, then
+    `_Ingestor.ingest` writes it and calls `ingest_file`) must not pay a
+    redundant read of the same content back off disk — a real, measured
+    contributor to the crawl's parent-process memory pressure (a second
+    full-size copy of the converted markdown, on top of every copy already
+    held by convert/anonymize/encode/store). Proven here by pointing
+    `storage_path` at a file that does not exist at all: if `ingest_file`
+    ever fell back to reading it, this fails loudly instead of indexing the
+    preloaded text.
+    """
+    from src.ingest.runner import ingest_file
+    from src.repositories import corpus_chunks_repo, corpus_files_repo
+
+    corpus_id = _new_corpus("ing-preloaded")
+    missing_path = str(tmp_path / "does-not-exist.md")
+    file_id = _add_file(corpus_id, "doc.md", "md", missing_path)
+
+    status = ingest_file(file_id, preloaded_text="already-converted markdown body")
+    assert status == "indexed"
+    row = corpus_files_repo().get(file_id)
+    assert row["processing_status"] == "indexed"
+    chunks = corpus_chunks_repo().list_for_file(file_id)
+    assert len(chunks) == 1
+    assert chunks[0]["text"] == "already-converted markdown body"
+
+
 def test_ingest_image_stays_pending_for_vision_slice(e2e_env, tmp_path, monkeypatch):
     import src.ingest.vision as vision
 
@@ -126,9 +154,11 @@ def test_ingest_unextractable_document_rejected(e2e_env, tmp_path):
     from src.repositories import corpus_files_repo
 
     corpus_id = _new_corpus("ing-rej")
-    # .docx has no lightweight fallback extractor (and docling not installed in CI)
+    # A truncated OOXML package: no reader on any image can open it. NULs on
+    # purpose — markitdown sniffs content, and ASCII bytes in a ".docx" would
+    # be read as the prose they are rather than rejected.
     doc = tmp_path / "report.docx"
-    doc.write_bytes(b"PK\x03\x04 not really a docx")
+    doc.write_bytes(b"PK\x03\x04\x00\x00 not really a docx")
     file_id = _add_file(corpus_id, "report.docx", "docx", str(doc))
 
     assert ingest_file(file_id) == "rejected"
@@ -229,6 +259,38 @@ def test_zero_chunk_document_is_needs_review(e2e_env, tmp_path, monkeypatch):
     row = corpus_files_repo().get(file_id)
     assert row["processing_status"] == "needs_review"
     assert row["processing_detail"]["reason"] == "extraction produced no text chunks"
+
+
+def test_ingest_preloaded_text_with_a_nul_byte_is_indexed_and_searchable(e2e_env, tmp_path):
+    """A NUL byte mid-word in converted text (a SharePoint crawl's own path:
+    `preloaded_text`) must not reject the document — PostgreSQL `text`
+    columns refuse to store `0x00` outright, which surfaced live as 261
+    rejected documents (an Oracle table export, several ordinary
+    SharePoint files) before `src.ingest.chunking._sanitize_control_chars`
+    started stripping it at the ingest boundary. Proven end to end: the
+    document indexes (not rejects) and a term either side of the stripped
+    byte finds it back through `src.ingest.retrieval.search`.
+    """
+    from src.ingest.retrieval import search
+    from src.ingest.runner import ingest_file
+    from src.repositories import corpus_chunks_repo, corpus_files_repo
+
+    corpus_id = _new_corpus("ing-nul")
+    missing_path = str(tmp_path / "does-not-exist.md")
+    file_id = _add_file(corpus_id, "ap_suppliers.md", "md", missing_path)
+
+    status = ingest_file(file_id, preloaded_text="in.c_keboola_ex_db_or\x00acle_ap_suppliers table export")
+    assert status == "indexed"
+    row = corpus_files_repo().get(file_id)
+    assert row["processing_status"] == "indexed"
+
+    chunks = corpus_chunks_repo().list_for_file(file_id)
+    assert len(chunks) == 1
+    assert "\x00" not in chunks[0]["text"]
+    assert chunks[0]["text"] == "in.c_keboola_ex_db_oracle_ap_suppliers table export"
+
+    results = search([corpus_id], "oracle_ap_suppliers")
+    assert any(r["file_id"] == file_id for r in results)
 
 
 def test_ingest_file_routes_zip_to_bundle(e2e_env, tmp_path, monkeypatch):

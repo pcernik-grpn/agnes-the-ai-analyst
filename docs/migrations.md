@@ -18,6 +18,7 @@ alembic.ini                              ; Alembic config, no DB URL
 migrations/                              ; revision chain
   env.py                                 ; reads DATABASE_URL / AGNES_DB_URL (legacy alias)
   script.py.mako
+  shipped_revision_ids.txt               ; append-only ratchet — every id ever shipped (issue #2086)
   versions/
     0001_baseline.py                     ; empty anchor
     0002_audit_log.py
@@ -159,13 +160,31 @@ docker run --rm -e DATABASE_URL=... ghcr.io/keboola/agnes-the-ai-analyst:${IMAGE
 
 ### Connection-pool tuning
 
-`src/db_pg.py` defaults to `pool_size=5, max_overflow=10` — i.e. up to
-15 concurrent connections per app process. Cloud SQL's per-instance
+`src/db_pg.py` defaults to `pool_size=5, max_overflow=10, pool_timeout=30s`
+— i.e. up to 15 concurrent connections per app process, each request
+waiting up to 30s for one before failing. Cloud SQL's per-instance
 connection cap (default 100, configurable up to thousands depending on
 tier) is the binding constraint. For a 3-VM MIG running 1 uvicorn
 worker each, 3 × 15 = 45 connections — comfortably inside the default
 cap. Scale `pool_size` proportionally if you increase uvicorn workers
 per VM.
+
+Override with `AGNES_PG_POOL_SIZE` / `AGNES_PG_MAX_OVERFLOW` /
+`AGNES_PG_POOL_TIMEOUT_S` (env vars, see `config/.env.template`) — the
+defaults above are unchanged unless set. A process running the
+`extraction` worker lane (`AGNES_WORKER_LANES=extraction`, see
+`app/worker/runtime.py` and the `extraction-worker` compose service)
+sizes `pool_size` automatically when `AGNES_PG_POOL_SIZE` is unset:
+`extraction.concurrency + extraction.facts.concurrency`, capped at 64 —
+a corpus-extraction slot and a facts-extraction pass each hold a
+connection for their whole run, not per-statement, so the plain
+request-scoped default of 5 starves under concurrent crawls + facts
+passes (live finding, 2026-09: the pool exhausted 30×/10min under 2
+facts passes + 4 crawls sharing one engine, failing 44 documents'
+ingest with `TimeoutError` and forcing 27 facts-LLM-cache lookups to
+fall through to a paid model call). Every other role/process is
+unaffected. The resolved pool settings are logged once, at engine
+creation.
 
 ## Running migrations
 
@@ -183,6 +202,101 @@ DATABASE_URL=... alembic upgrade head --sql > /tmp/up.sql
 DATABASE_URL=... alembic revision --autogenerate -m "your message"
 # (then hand-review the file in migrations/versions/)
 ```
+
+## A database stranded by a renumbered revision
+
+Revision ids are immutable once shipped — see
+`migrations/shipped_revision_ids.txt`, the append-only manifest
+`tests/test_alembic_revision_ratchet.py` checks on every PR. This section is
+what to do when that discipline was violated before the ratchet existed
+(issue #2086: `facts_ingest_runs` shipped as `0077_facts_ingest_runs`, then
+got renumbered to `0078_facts_ingest_runs` when `0077_ontology_drafts` was
+inserted ahead of it).
+
+**What the state is.** A database that had already applied the OLD id is
+stamped in `alembic_version` at a string no image's `migrations/versions/`
+contains any more — not the current one, not any past or future one, because
+the id itself stopped existing the moment it was renamed. `assert_pg_at_head`
+cannot tell this apart from a plain app rollback by the stamped string alone,
+so it disambiguates using this repo's strict `NNNN_name` numbering: an
+unknown id whose leading 4-digit prefix is <= the shipped head's prefix
+cannot have come from a newer image (a newer image's head number only goes
+up), so it must be a **STRANDED** database rather than one that is merely
+**AHEAD** — a distinct `RuntimeError` names the id and says so, instead of
+telling the operator to "roll the image forward" (impossible: no image knows
+that id) or restore a backup (usually unnecessary: the database's data is
+fine, only its migration bookkeeping is confused).
+
+**Why stamping forward without applying the skipped revision is unsafe.** The
+stranded id is missing exactly the migration(s) that were inserted ahead of
+it when it got renumbered — in the #2086 case, the `ontology_drafts` table.
+Simply `UPDATE alembic_version SET version_num = '<the new id>'` would tell
+Alembic "you are here" for a database that is NOT actually there: every
+later migration that assumes `ontology_drafts` exists (a `add_column` on it,
+a foreign key into it, …) now runs against a schema silently missing it, and
+future `alembic upgrade head` runs never revisit the gap because, as far as
+Alembic is concerned, that step is already behind it.
+
+**The automatic repair.** `src/db_pg.py`'s `RENUMBERED_REVISION_REPAIRS` maps
+a stranded id to the revision(s) that were inserted ahead of it and the id
+that now occupies its old position in the chain. `ensure_pg_at_head()` (the
+self-migrating startup path — see "Adding a PG-only feature" below for how
+that path fits together) checks the DB's stamped revision against this map
+before its normal behind-head upgrade: on a match it applies the listed
+revision(s)' DDL directly, then atomically re-stamps `alembic_version` to the
+map's target id (guarded by `WHERE version_num = <the stranded id>` plus a
+rowcount check), then falls through to the ordinary upgrade-to-head — so one
+boot cycle both repairs the gap and catches the database up to the image's
+real head. The repair tolerates a half-applied prior attempt (a crash
+between applying the DDL and re-stamping, or an operator having applied the
+same DDL by hand already): each listed revision runs its own DDL inside a
+savepoint, and a duplicate-object error is treated as "already done" rather
+than crashing the boot loop. `assert_pg_at_head()` — the check-only path used
+where `ensure_pg_at_head()` doesn't run — never applies this repair itself;
+it only names it.
+
+**Generic manual recipe**, for a stranding this map does not (yet) cover, or
+for an operator who wants to apply the fix by hand instead of relying on the
+next boot's auto-repair:
+
+```bash
+# 1. Identify the gap: which revision(s) exist in the CURRENT chain between
+#    the stranded id's old position and where it was renumbered to. Read the
+#    migration file(s)' upgrade() bodies — do not guess; a botched CREATE TABLE
+#    against a database whose real state you're unsure of is the failure mode
+#    this whole section exists to avoid.
+
+# 2. Apply exactly that DDL by hand (adapt column/table names — this is
+#    illustrative, not literal SQL to paste):
+psql "$DATABASE_URL" -c '
+    CREATE TABLE <the_skipped_table> (
+        id VARCHAR PRIMARY KEY,
+        ...
+    );
+    CREATE INDEX <the_skipped_index> ON <the_skipped_table> (...);
+'
+
+# 3. Re-stamp alembic_version — guarded by WHERE + a rowcount check so an
+#    unexpected concurrent change is caught rather than silently overwritten:
+psql "$DATABASE_URL" -c "
+    UPDATE alembic_version
+       SET version_num = '<the id that now occupies the old position>'
+     WHERE version_num = '<the stranded id>';
+"
+# Confirm exactly one row changed ("UPDATE 1") before continuing.
+
+# 4. Restart the app. ensure_pg_at_head() (or a manual `alembic upgrade
+#    head`) picks up from the freshly-stamped id and migrates the rest of
+#    the way normally — the stranded id no longer matches any
+#    RENUMBERED_REVISION_REPAIRS key, so this is now an ordinary
+#    behind-head upgrade.
+```
+
+Whichever path is used, **never renumber a revision id to "fix" this** — that
+only moves the strand to whichever id gets reused. Register the repair in
+`RENUMBERED_REVISION_REPAIRS` once identified, so the next database (or the
+next operator) that hits the same stranded id self-heals on its next boot
+instead of needing this recipe again.
 
 ## Adding a PG-only feature (post-A3)
 
@@ -259,6 +373,67 @@ section** — the DuckDB ladder is frozen regardless of whether the table
 itself predates the ratchet. The new column lands in Postgres only; the
 DuckDB side of that repo simply does not gain the capability that depends on
 it. (`src/db_pg.py` `Base.metadata` still needs the model change either way.)
+
+## Adding an index on a table that may already be huge in production
+
+A migration runs at process start, inside the startup revision repair's own
+transaction — `CREATE INDEX CONCURRENTLY` cannot run there (it needs
+Alembic's `autocommit_block()` to commit that transaction first; see
+`migrations/versions/0098_corpus_chunks_file_id_index.py`'s docstring). A
+plain `CREATE INDEX` is fine for a cheap B-tree (that migration does exactly
+that, unconditionally) but holds a SHARE lock for as long as the build takes
+— seconds for a small/medium table, several MINUTES for a GIN or other
+expensive index over a table already at production scale (tens of millions
+of rows), stalling every writer for the duration.
+
+The pattern (`migrations/versions/0101_corpus_chunks_fts_index.py`): count
+the target table's rows first (`op.get_bind().execute(sa.text("SELECT
+COUNT(*) FROM …")).scalar()`), build in place under a threshold comfortably
+above what a fresh/lightly-loaded instance has and comfortably below the
+scale that made the migration necessary in the first place, and above it
+SKIP the build with a `logger.warning(...)` naming the EXACT `CREATE INDEX
+CONCURRENTLY IF NOT EXISTS …` statement an operator must run out-of-band,
+once, off-peak. Whatever the index accelerates must still WORK without it —
+just slower (a sequential scan) — so a deployment that hits the skip branch
+degrades, it does not break. Unit-test both branches by faking `alembic.op`
+(`op.get_bind()` returning a stub whose `.scalar()` reports a controlled row
+count) rather than actually seeding millions of rows — see
+`tests/db_pg/test_corpus_chunks_fts_index_migration.py`.
+
+## Adding a new table that needs a data backfill on an already-huge sibling
+
+Sibling problem to the index one above: a NEW table can be created cheaply
+(`CREATE TABLE` is instant, no lock contention), but if it needs to be
+POPULATED from an existing, already-huge table, that backfill itself is the
+expensive part — and the same "don't run it inside the migration's own
+boot-time transaction" reasoning applies.
+
+`migrations/versions/0104_fact_collection_stats.py` (TCRD-296 synthesis
+E.21) is the worked example: `fact_collection_stats`/`fact_collection_
+membership`/`edge_collection_membership` are a maintained summary over
+`claims` (already at 2M+ rows on a live instance), and the migration
+creates the tables ONLY — no backfill. Two things make that safe:
+
+1. **New writes are covered from the moment the migration lands** — every
+   `INSERT INTO claims` from that point on maintains the summary
+   incrementally in the SAME transaction (`FactsPgRepository.add_claim` ->
+   `_bump_collection_stats_on_new_claim`), so the table is never MORE than
+   one deploy behind reality for anything written after the upgrade.
+2. **Every reader of the summary has a built-in fallback** to the original
+   full-scan query, embedded in the SQL itself (an uncorrelated `NOT EXISTS
+   (SELECT 1 FROM fact_collection_stats)` branch inside the same `UNION`,
+   not a Python-side round trip) — so a database that hasn't been backfilled
+   yet simply serves the pre-migration behavior, slower but correct, never
+   a wrong answer.
+
+The backfill itself is a REPOSITORY method (`rebuild_collection_stats`,
+bounded per collection — never one giant transaction over the whole
+table) an operator runs once, out of band, after the upgrade:
+`agnes admin facts stats rebuild` / `POST /api/admin/facts/stats/rebuild`.
+This is the "operator runs the CLI once after upgrade" escape hatch this
+doc's own "Adding an index…" section above mentions — pick it whenever the
+backfill's cost is unpredictable (scales with existing data, not with the
+migration's own DDL) rather than a fixed, small `UPDATE`.
 
 ## The four load-bearing tests
 

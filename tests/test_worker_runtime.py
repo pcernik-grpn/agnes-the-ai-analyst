@@ -229,9 +229,9 @@ class TestExtractionConcurrency:
     def test_value_above_max_is_clamped_and_warns(self, monkeypatch, caplog):
         from app.worker.runtime import _extraction_concurrency
 
-        monkeypatch.setenv("AGNES_EXTRACTION_CONCURRENCY", "20")
+        monkeypatch.setenv("AGNES_EXTRACTION_CONCURRENCY", "40")
         with caplog.at_level("WARNING"):
-            assert _extraction_concurrency() == 8
+            assert _extraction_concurrency() == 24
         assert "clamp" in caplog.text.lower()
 
     def test_zero_is_clamped_to_min_and_warns(self, monkeypatch, caplog):
@@ -256,6 +256,37 @@ class TestExtractionConcurrency:
         with caplog.at_level("WARNING"):
             assert _extraction_concurrency() == 1
         assert "invalid" in caplog.text.lower()
+
+
+# ---------------------------------------------------------------------------
+# BLAS/OpenMP thread-count guard (live finding: OpenBLAS sized per-thread
+# buffers by the 64-vCPU host, blew a conversion child's RLIMIT_AS, and
+# `import markitdown` died reading as "not installed")
+# ---------------------------------------------------------------------------
+
+
+def test_blas_env_vars_default_to_one_but_never_override_an_operator_value(monkeypatch):
+    """Module import must pin every BLAS/OpenMP thread-count var to "1" —
+    a single-document conversion child never benefits from more than one
+    thread, on any host size — but an operator's own explicit value must
+    always win (`setdefault`, not `[...] = "1"`)."""
+    import importlib
+
+    import app.worker.runtime as runtime_module
+
+    monkeypatch.delenv("OPENBLAS_NUM_THREADS", raising=False)
+    monkeypatch.delenv("OMP_NUM_THREADS", raising=False)
+    monkeypatch.setenv("MKL_NUM_THREADS", "4")  # the operator's own explicit value
+    monkeypatch.delenv("NUMEXPR_NUM_THREADS", raising=False)
+
+    try:
+        importlib.reload(runtime_module)
+        assert os.environ["OPENBLAS_NUM_THREADS"] == "1"
+        assert os.environ["OMP_NUM_THREADS"] == "1"
+        assert os.environ["MKL_NUM_THREADS"] == "4"
+        assert os.environ["NUMEXPR_NUM_THREADS"] == "1"
+    finally:
+        importlib.reload(runtime_module)
 
 
 # ---------------------------------------------------------------------------
@@ -483,6 +514,76 @@ def test_handler_exception_at_max_attempts_finalizes_failed(worker_db):
     row = repo.get(job["id"])
     assert row["status"] == "failed"
     assert row["error"] == "nope"
+    assert row["finished_at"] is not None
+
+
+def test_transient_db_error_is_reclassified_and_requeued_when_kind_opts_in(worker_db):
+    """TCRD-296 C.11: a kind with ``retry_in_seconds=None`` (a raised
+    exception normally finalizes on the FIRST attempt) still requeues when
+    the exception is a TRANSIENT infra fault AND the kind opted in via
+    ``transient_retry_in_seconds`` — extraction kinds do."""
+    import sqlalchemy as sa
+
+    from app.worker.registry import LIGHT_LANE, JobKind, register_kind
+    from app.worker.runtime import worker_loop
+    from src.repositories import jobs_repo
+
+    def boom_handler(payload: dict) -> None:
+        raise sa.exc.TimeoutError("QueuePool limit of size 5 reached, connection timed out")
+
+    register_kind(
+        JobKind(
+            name="transient_test",
+            handler=boom_handler,
+            lane=LIGHT_LANE,
+            lease_seconds=30,
+            retry_in_seconds=None,
+            transient_retry_in_seconds=60,
+        )
+    )
+
+    repo = jobs_repo()
+    job = repo.enqueue("transient_test", {}, max_attempts=5)
+
+    asyncio.run(_run_and_cancel(worker_loop(worker_id="test-worker", poll_interval_s=0.05), 0.4))
+
+    row = repo.get(job["id"])
+    assert row["status"] == "queued", "a transient failure on an opted-in kind must requeue, not finalize"
+    assert row["run_after"] is not None
+    assert row["attempts"] == 1
+    assert row["leased_by"] is None
+
+
+def test_non_transient_error_still_finalizes_even_when_kind_opts_in(worker_db):
+    """The SAME opted-in kind still finalizes a NON-transient exception on
+    its first attempt — reclassification never widens `retry_in_seconds`'s
+    plain policy for a handler bug."""
+    from app.worker.registry import LIGHT_LANE, JobKind, register_kind
+    from app.worker.runtime import worker_loop
+    from src.repositories import jobs_repo
+
+    def boom_handler(payload: dict) -> None:
+        raise ValueError("a genuine handler bug")
+
+    register_kind(
+        JobKind(
+            name="transient_test",
+            handler=boom_handler,
+            lane=LIGHT_LANE,
+            lease_seconds=30,
+            retry_in_seconds=None,
+            transient_retry_in_seconds=60,
+        )
+    )
+
+    repo = jobs_repo()
+    job = repo.enqueue("transient_test", {}, max_attempts=5)
+
+    asyncio.run(_run_and_cancel(worker_loop(worker_id="test-worker", poll_interval_s=0.05), 0.4))
+
+    row = repo.get(job["id"])
+    assert row["status"] == "failed"
+    assert row["error"] == "a genuine handler bug"
     assert row["finished_at"] is not None
 
 
@@ -863,6 +964,115 @@ def test_worker_loop_reaps_stuck_jobs(worker_db):
     assert row["error"] == "lease expired after max attempts"
 
 
+def test_heartbeat_keeps_a_short_lease_alive_across_a_longer_running_handler(worker_db):
+    """A short ``lease_seconds`` must not become a de facto duration cap.
+
+    Regression guard for ``app/worker/kinds.py``'s lease-sizing fix
+    (several kinds — ``data-refresh``, ``corpus-extraction``,
+    ``sharepoint-subtree-sweep`` — moved from a lease sized to their own
+    expected DURATION to one sized to the heartbeat CADENCE instead): the
+    heartbeat renews the lease every ``lease_seconds/3`` for as long as the
+    handler thread is alive, so a handler that legitimately runs LONGER
+    than its own ``lease_seconds`` must still complete normally — never
+    get reclaimed by a second slot mid-run — as long as it keeps
+    heartbeating. Proves the small default those kinds now share doesn't
+    quietly reintroduce a duration cap by the back door."""
+    from app.worker.registry import LIGHT_LANE, JobKind, register_kind
+    from app.worker.runtime import worker_loop
+    from src.repositories import jobs_repo
+
+    lease_seconds = 1  # heartbeat every max(1/3, 0.5) = 0.5s
+    handler_duration_s = 1.5  # 1.5x the lease's own nominal length
+
+    def slow_handler(payload: dict) -> None:
+        time.sleep(handler_duration_s)
+
+    register_kind(
+        JobKind(name="slow_short_lease_test", handler=slow_handler, lane=LIGHT_LANE, lease_seconds=lease_seconds)
+    )
+
+    repo = jobs_repo()
+    job = repo.enqueue("slow_short_lease_test", {})
+
+    asyncio.run(_run_and_cancel(worker_loop(worker_id="test-worker", poll_interval_s=0.05), 2.2))
+
+    row = repo.get(job["id"])
+    assert row["status"] == "done", (
+        f"expected the handler to complete normally despite outliving its own lease_seconds "
+        f"({lease_seconds}s < {handler_duration_s}s handler duration) — got status={row['status']!r}; "
+        f"a short lease must be kept alive by the heartbeat, not treated as a run-time ceiling"
+    )
+    assert row["attempts"] == 1, "job was claimed more than once — the heartbeat failed to keep the lease alive"
+
+
+def test_admin_cancel_stops_the_heartbeat_and_a_late_finishing_handler_cannot_resurrect_it(worker_db):
+    """The stalled-crawl-cancel fix (TCRD-296 gap 32): a job whose handler
+    thread is genuinely stuck must be force-closeable from OUTSIDE the
+    worker without a new stop mechanism on the worker side.
+
+    ``jobs_repo().cancel(job_id)`` (the admin action `POST …/runs/{run_id}
+    /cancel` calls) needs no lease token, so it can force-finalize the job
+    to ``'failed'`` while the SAME job's handler thread is still running
+    in the background. Once that happens:
+
+    1. The job row reflects ``'failed'``/``cancelled_by_admin`` immediately
+       — an admin does not have to wait for the (possibly-never-arriving)
+       handler completion to see the effect.
+    2. The next heartbeat tick for this job (still holding the now-stale
+       lease token) returns ``False`` — ``_heartbeat_loop`` stops
+       extending on its own, per its own documented contract.
+    3. When the "stuck" handler eventually DOES finish and the runtime
+       calls ``complete()`` with that same stale lease token, it is a
+       guaranteed no-op (the lease_token/status guard every reclaim race
+       already relies on) — the cancelled state is never clobbered back
+       to ``'done'``.
+    """
+    from app.worker.registry import LIGHT_LANE, JobKind, register_kind
+    from app.worker.runtime import worker_loop
+    from src.repositories import jobs_repo
+
+    handler_duration_s = 1.2
+
+    def slow_handler(payload: dict) -> None:
+        time.sleep(handler_duration_s)
+
+    register_kind(JobKind(name="stuck_then_cancelled_test", handler=slow_handler, lane=LIGHT_LANE, lease_seconds=60))
+
+    repo = jobs_repo()
+    job = repo.enqueue("stuck_then_cancelled_test", {})
+
+    async def _claim_cancel_and_let_finish() -> None:
+        task = asyncio.create_task(worker_loop(worker_id="test-worker", poll_interval_s=0.05))
+        # Give the lane slot time to claim the job and start the handler.
+        await asyncio.sleep(0.3)
+        claimed = repo.get(job["id"])
+        assert claimed["status"] == "running", "test setup bug: the job was never claimed before cancel"
+        lease_token_at_cancel = claimed["lease_token"]
+
+        mutated = repo.cancel(job["id"])
+        assert mutated is True
+
+        # Prove the heartbeat loop itself observes the cancel (not just a
+        # side-channel assertion): the SAME stale lease token now fails.
+        assert repo.heartbeat(job["id"], "test-worker", lease_token_at_cancel, lease_seconds=9999) is False
+
+        # Let the "stuck" handler thread actually finish and the runtime's
+        # own complete() call land — this is the exact race being guarded.
+        await asyncio.sleep(handler_duration_s + 0.5)
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    asyncio.run(_claim_cancel_and_let_finish())
+
+    row = repo.get(job["id"])
+    assert row["status"] == "failed", (
+        "a job cancelled while its handler was still running must stay failed — a late complete() "
+        f"from the stuck handler must never resurrect it (got status={row['status']!r})"
+    )
+    assert row["error"] == "cancelled_by_admin"
+
+
 # ---------------------------------------------------------------------------
 # observability (three-plane wave 2D, task 2): job-queue + worker metrics
 # ---------------------------------------------------------------------------
@@ -1109,6 +1319,355 @@ def test_reap_exhausted_notifies_failed_webhook(worker_db, monkeypatch):
     row = repo.get(job["id"])
     assert row["status"] == "failed"
     assert calls == [("agent-1", job["id"], "failed")]
+
+
+# ---------------------------------------------------------------------------
+# JOB_MAX_ATTEMPTS_BY_KIND / job_max_attempts() (2026-09 incident: a worker
+# restart mid-crawl must not exhaust the same small budget a genuinely
+# broken handler uses)
+# ---------------------------------------------------------------------------
+
+
+def test_job_max_attempts_overrides_extraction_kinds_to_25():
+    from app.worker.registry import job_max_attempts
+
+    assert job_max_attempts("corpus-extraction") == 25
+    assert job_max_attempts("sharepoint-facts-extraction") == 25
+
+
+def test_job_max_attempts_falls_back_to_default_for_every_other_kind():
+    from app.worker.registry import DEFAULT_JOB_MAX_ATTEMPTS, job_max_attempts
+
+    assert DEFAULT_JOB_MAX_ATTEMPTS == 3
+    assert job_max_attempts("data-refresh") == 3
+    assert job_max_attempts("agent_response") == 3
+    assert job_max_attempts("some-unregistered-kind") == 3
+
+
+# ---------------------------------------------------------------------------
+# _finalize_extraction_run_for_job() — an exhausted job closes its own
+# extraction_runs row (2026-09 incident: 6 of 7 multi-hour SharePoint crawls
+# died with the `jobs` row flipped to 'failed' while `extraction_runs`
+# stayed 'running' forever, invisible to both the fleet view and the source
+# card).
+# ---------------------------------------------------------------------------
+
+
+def _patch_extraction_runs_repo(monkeypatch):
+    """Fake `extraction_runs_repo()` factory recording `fail_for_job` calls
+    — the real repository is Postgres-only (A3), so a plain unit/worker-loop
+    test against the DuckDB-backed ``worker_db`` fixture stubs it rather
+    than standing up a real Postgres instance."""
+    calls: list[tuple[str, str]] = []
+
+    class FakeExtractionRunsRepo:
+        def fail_for_job(self, job_id: str, *, error: str):
+            calls.append((job_id, error))
+            return "er_fake"
+
+    monkeypatch.setattr("src.repositories.extraction_runs_repo", lambda: FakeExtractionRunsRepo())
+    return calls
+
+
+def test_exhausted_corpus_extraction_job_closes_its_extraction_run(worker_db, monkeypatch):
+    """A `corpus-extraction` job the runtime marks 'failed' via a live
+    `fail()` call (the handler raised on its LAST attempt) must also close
+    its own `extraction_runs` row, in the SAME code path — never a later,
+    separate sweep an operator has to trigger by hand."""
+    from app.worker.registry import LIGHT_LANE, JobKind, register_kind
+    from app.worker.runtime import worker_loop
+    from src.repositories import jobs_repo
+
+    def boom_handler(payload: dict) -> None:
+        raise RuntimeError("crawl exploded")
+
+    register_kind(
+        JobKind(
+            name="corpus-extraction", handler=boom_handler, lane=LIGHT_LANE, lease_seconds=30, retry_in_seconds=None
+        )
+    )
+    calls = _patch_extraction_runs_repo(monkeypatch)
+
+    repo = jobs_repo()
+    job = repo.enqueue("corpus-extraction", {"connection_id": "conn-1"}, max_attempts=25)
+
+    asyncio.run(_run_and_cancel(worker_loop(worker_id="test-worker", poll_interval_s=0.05), 0.4))
+
+    assert repo.get(job["id"])["status"] == "failed"
+    assert calls == [(job["id"], "crawl exploded")]
+
+
+def test_reap_exhausted_corpus_extraction_closes_its_extraction_run(worker_db, monkeypatch):
+    """Same guarantee via the OTHER finalize path: a job the reap sweep
+    itself finalizes (the worker holding its lease died outright — an OOM
+    kill, an image-swap recreate — so no live `fail()` call ever ran) must
+    close its own `extraction_runs` row too."""
+    from app.worker.runtime import worker_loop
+    from src.repositories import jobs_repo
+
+    calls = _patch_extraction_runs_repo(monkeypatch)
+    repo = jobs_repo()
+    job = repo.enqueue("corpus-extraction", {"connection_id": "conn-1"}, max_attempts=1)
+    claimed = repo.claim_next(kinds=["corpus-extraction"], worker_id="dead-worker", lease_seconds=-5)
+    assert claimed is not None
+
+    asyncio.run(_run_and_cancel(worker_loop(worker_id="test-worker", poll_interval_s=0.05), 0.3))
+
+    row = repo.get(job["id"])
+    assert row["status"] == "failed"
+    assert calls == [(job["id"], "lease expired after max attempts")]
+
+
+def test_finalize_extraction_run_for_job_is_a_noop_for_non_owning_kinds(monkeypatch):
+    """Only `corpus-extraction` opens an `extraction_runs` row — a job of
+    any other kind reaching 'failed' must never even resolve the (PG-only)
+    repo, let alone attempt a write."""
+    from app.worker import runtime as runtime_mod
+
+    touched: list[bool] = []
+    monkeypatch.setattr("src.repositories.extraction_runs_repo", lambda: touched.append(True))
+
+    runtime_mod._finalize_extraction_run_for_job("job-1", "data-refresh", "boom")
+
+    assert touched == []
+
+
+def test_finalize_extraction_run_for_job_swallows_requires_postgres_backend(monkeypatch):
+    """A DuckDB-backed instance's `extraction_runs_repo()` raises the typed
+    `RequiresPostgresBackend` — this cleanup step is best-effort
+    observability (mirrors `connectors.sharepoint.crawler._RunRecorder`'s
+    own posture for every write to this table) and must never let that
+    escape into the job's own already-committed finalize."""
+    from app.worker import runtime as runtime_mod
+    from src.repositories import RequiresPostgresBackend
+
+    def _raise():
+        raise RequiresPostgresBackend("extraction_runs")
+
+    monkeypatch.setattr("src.repositories.extraction_runs_repo", _raise)
+
+    runtime_mod._finalize_extraction_run_for_job("job-1", "corpus-extraction", "boom")  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# _maybe_continue_facts_extraction() — a sharepoint-facts-extraction pass
+# that stopped only on its own time budget re-enqueues itself (TCRD-296
+# gap #61). The decision logic lives entirely in
+# connectors.sharepoint.facts_extraction.maybe_continue_pass; these tests
+# cover the wiring: kind-gating, argument threading, and the one invariant
+# the whole feature depends on — the check runs strictly AFTER complete(),
+# not from inside the handler, where the continuation's own enqueue call
+# would self-deadlock against this job's still-'running' row.
+# ---------------------------------------------------------------------------
+
+
+def test_maybe_continue_facts_extraction_is_a_noop_for_other_kinds(monkeypatch):
+    from app.worker import runtime as runtime_mod
+
+    touched: list[bool] = []
+    monkeypatch.setattr(
+        "connectors.sharepoint.facts_extraction.maybe_continue_pass", lambda *a, **kw: touched.append(True)
+    )
+
+    runtime_mod._maybe_continue_facts_extraction({"id": "job-1", "kind": "data-refresh"}, {"interrupted": True})
+
+
+# corpus-extraction-shard also owns a row (2026-09-03 auto-parallel-crawl
+# design §4.3) — an exhausted shard job's own row closes the SAME way, and
+# the PARENT must hear about it (design: "a dead child's job fails through
+# the existing reclaim budget and fail_for_job closes its row; the parent
+# then finalizes as failed on the last live child").
+# ---------------------------------------------------------------------------
+
+
+def test_finalize_extraction_run_for_job_also_rolls_a_shard_into_its_parent(monkeypatch):
+    from app.worker import runtime as runtime_mod
+
+    calls = _patch_extraction_runs_repo(monkeypatch)
+    bumped: list[str] = []
+    monkeypatch.setattr(runtime_mod, "_bump_parent_after_shard_job_exhausted", lambda run_id: bumped.append(run_id))
+
+    runtime_mod._finalize_extraction_run_for_job("job-1", "corpus-extraction-shard", "boom")
+
+    assert calls == [("job-1", "boom")]
+    assert bumped == ["er_fake"]
+
+
+def test_finalize_extraction_run_for_job_never_bumps_for_the_plain_kind(monkeypatch):
+    """The PARENT (planner) run's own job is `corpus-extraction`, not the
+    shard kind — its exhaustion must never try to roll itself into
+    "its parent" (it has none)."""
+    from app.worker import runtime as runtime_mod
+
+    _patch_extraction_runs_repo(monkeypatch)
+    bumped: list[str] = []
+    monkeypatch.setattr(runtime_mod, "_bump_parent_after_shard_job_exhausted", lambda run_id: bumped.append(run_id))
+
+    runtime_mod._finalize_extraction_run_for_job("job-1", "corpus-extraction", "boom")
+
+    assert bumped == []
+
+
+def test_bump_parent_after_shard_job_exhausted_rolls_the_shard_into_its_parent(monkeypatch):
+    from app.worker import runtime as runtime_mod
+
+    class FakeExtractionRunsRepo:
+        def get(self, run_id):
+            return {"id": run_id, "connection_id": "conn-1", "parent_run_id": "er_parent"}
+
+    class FakeSourceConnectionsRepo:
+        def get(self, connection_id):
+            return {"id": connection_id, "source_type": "sharepoint"}
+
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr("src.repositories.extraction_runs_repo", lambda: FakeExtractionRunsRepo())
+    monkeypatch.setattr("src.repositories.source_connections_repo", lambda: FakeSourceConnectionsRepo())
+    monkeypatch.setattr(
+        "connectors.sharepoint.crawler._finish_shard_and_maybe_finalize",
+        lambda connection, parent_run_id: calls.append((connection["id"], parent_run_id)),
+    )
+
+    runtime_mod._bump_parent_after_shard_job_exhausted("er_shard1")
+
+    assert calls == [("conn-1", "er_parent")]
+
+
+def test_bump_parent_after_shard_job_exhausted_is_a_noop_with_no_parent(monkeypatch):
+    from app.worker import runtime as runtime_mod
+
+    class FakeExtractionRunsRepo:
+        def get(self, run_id):
+            return {"id": run_id, "connection_id": "conn-1", "parent_run_id": None}
+
+    touched: list[bool] = []
+    monkeypatch.setattr("src.repositories.extraction_runs_repo", lambda: FakeExtractionRunsRepo())
+
+    def _must_not_resolve():
+        raise AssertionError("must not resolve source_connections_repo with no parent")
+
+    monkeypatch.setattr("src.repositories.source_connections_repo", _must_not_resolve)
+    monkeypatch.setattr(
+        "connectors.sharepoint.crawler._finish_shard_and_maybe_finalize",
+        lambda *a, **k: touched.append(True),
+    )
+
+    runtime_mod._bump_parent_after_shard_job_exhausted("er_shard1")
+
+    assert touched == []
+
+
+def test_maybe_continue_facts_extraction_threads_the_jobs_payload_and_id(monkeypatch):
+    from app.worker import runtime as runtime_mod
+
+    calls: list[dict] = []
+
+    def _fake(connection_id, *, payload, report, original_job_id):
+        calls.append(
+            {
+                "connection_id": connection_id,
+                "payload": payload,
+                "report": report,
+                "original_job_id": original_job_id,
+            }
+        )
+        return "next-job-id"
+
+    monkeypatch.setattr("connectors.sharepoint.facts_extraction.maybe_continue_pass", _fake)
+
+    job = {
+        "id": "job-1",
+        "kind": "sharepoint-facts-extraction",
+        "payload_json": {"connection_id": "conn-1", "doc_ids": ["d1"]},
+    }
+    result = {"interrupted": True, "interrupted_reason": "timeout"}
+    runtime_mod._maybe_continue_facts_extraction(job, result)
+
+    assert calls == [
+        {
+            "connection_id": "conn-1",
+            "payload": job["payload_json"],
+            "report": result,
+            "original_job_id": "job-1",
+        }
+    ]
+
+
+def test_maybe_continue_facts_extraction_is_a_noop_with_no_connection_id(monkeypatch):
+    """A malformed payload must never escape into the job's own
+    already-committed finalize."""
+    from app.worker import runtime as runtime_mod
+
+    touched: list[bool] = []
+    monkeypatch.setattr(
+        "connectors.sharepoint.facts_extraction.maybe_continue_pass", lambda *a, **kw: touched.append(True)
+    )
+
+    runtime_mod._maybe_continue_facts_extraction(
+        {"id": "job-1", "kind": "sharepoint-facts-extraction", "payload_json": {}}, {}
+    )
+
+    assert touched == []
+
+
+def test_maybe_continue_facts_extraction_swallows_exceptions(monkeypatch):
+    from app.worker import runtime as runtime_mod
+
+    def _raise(*a, **kw):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr("connectors.sharepoint.facts_extraction.maybe_continue_pass", _raise)
+
+    runtime_mod._maybe_continue_facts_extraction(
+        {"id": "job-1", "kind": "sharepoint-facts-extraction", "payload_json": {"connection_id": "conn-1"}}, {}
+    )  # must not raise
+
+
+def test_facts_extraction_completion_runs_the_continuation_check_after_complete(worker_db, monkeypatch):
+    """The defining ordering property: by the time the continuation check
+    fires, the ORIGINAL job is already 'done' — proving it ran from the
+    post-complete() hook, never from inside the handler (which would
+    self-deadlock the continuation's own same-key enqueue against this
+    job's still-'running' row — see `maybe_continue_pass`'s docstring)."""
+    from app.worker.registry import LIGHT_LANE, JobKind, register_kind
+    from app.worker.runtime import worker_loop
+    from src.repositories import jobs_repo
+
+    calls: list[dict] = []
+
+    def _fake(connection_id, *, payload, report, original_job_id):
+        calls.append(
+            {
+                "connection_id": connection_id,
+                "original_job_id": original_job_id,
+                "original_status_when_called": jobs_repo().get(original_job_id)["status"],
+            }
+        )
+        return None
+
+    monkeypatch.setattr("connectors.sharepoint.facts_extraction.maybe_continue_pass", _fake)
+    register_kind(
+        JobKind(
+            name="sharepoint-facts-extraction",
+            handler=lambda payload: {"interrupted": True, "interrupted_reason": "timeout"},
+            lane=LIGHT_LANE,
+        )
+    )
+    job = jobs_repo().enqueue("sharepoint-facts-extraction", {"connection_id": "conn-1"})
+
+    asyncio.run(_run_and_cancel(worker_loop(worker_id="test-worker", poll_interval_s=0.05), 0.4))
+
+    assert calls == [{"connection_id": "conn-1", "original_job_id": job["id"], "original_status_when_called": "done"}]
+
+
+def test_bump_parent_after_shard_job_exhausted_never_raises(monkeypatch):
+    from app.worker import runtime as runtime_mod
+
+    def _raise():
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr("src.repositories.extraction_runs_repo", _raise)
+
+    runtime_mod._bump_parent_after_shard_job_exhausted("er_shard1")  # must not raise
 
 
 def test_agent_response_fail_notifies_despite_retry_config_when_attempts_exhausted(worker_db, monkeypatch):

@@ -9,10 +9,16 @@ Covers:
 
 from __future__ import annotations
 
+from tests import _ds_page_source
+
 import pytest
 from cryptography.fernet import Fernet
 
 from app.secrets_vault import _reset_ephemeral_key_for_tests
+from tests._admin_data_sources_source import (
+    fetch_admin_data_sources_page,
+    read_admin_data_sources_source,
+)
 
 
 def _auth(token):
@@ -50,7 +56,14 @@ class TestDataSourcesPageAuth:
             c.cookies.clear()
             _reset_ephemeral_key_for_tests()
         assert resp.status_code == 200, resp.text
-        body = resp.text
+        # "Data sources" itself only ever appeared in a JS comment/string
+        # literal (never a rendered hero — the hero says just "Data", shared
+        # with its Data-tab siblings) — moved into the extracted page script
+        # (perf follow-up, 2026-09-03), so this still proves the page SHIPS
+        # that copy, appended from the static asset the response references.
+        from tests._admin_data_sources_source import ADMIN_DATA_SOURCES_SOURCE_FILES
+
+        body = resp.text + "\n" + "\n".join(p.read_text(encoding="utf-8") for p in ADMIN_DATA_SOURCES_SOURCE_FILES[1:])
 
         # Hero + nav-distinguishing copy (#755 acceptance: data vs MCP sources
         # legible from the page itself).
@@ -129,11 +142,7 @@ class TestMasterTokenCardTooltip:
         raise AssertionError(f"unbalanced braces extracting {signature!r}")
 
     def _fact_fn(self, seeded_app) -> str:
-        c = seeded_app["client"]
-        body = c.get(
-            "/admin/data-sources",
-            headers={"Authorization": f"Bearer {seeded_app['admin_token']}"},
-        ).text
+        body = fetch_admin_data_sources_page(seeded_app)
         return self._extract_function(body, "function _masterTokenFactHtml(row) {")
 
     def test_uses_data_tip_and_aria_label_not_title(self, seeded_app):
@@ -156,11 +165,7 @@ class TestMasterTokenCardTooltip:
         stored connection to hold the secret in) — proving this here is what
         makes the pipeline-strip fallback to the plain link, rather than
         `toggleMasterToken`, for a derived card the only safe choice."""
-        c = seeded_app["client"]
-        body = c.get(
-            "/admin/data-sources",
-            headers={"Authorization": f"Bearer {seeded_app['admin_token']}"},
-        ).text
+        body = fetch_admin_data_sources_page(seeded_app)
         card = self._extract_function(body, "function _connectionCardHtml(row) {")
         derived_branch = card[: card.index("const c = _connector(row.source_type);")]
         assert "_masterTokenFactHtml" not in derived_branch
@@ -224,10 +229,7 @@ class TestDataSourcesPageCarriesNoSemanticStatusStrip:
     _BAND_COPY = ("Never synced yet.", "Last sync attempt", "— OK.")
 
     def _body(self, seeded_app):
-        c = seeded_app["client"]
-        resp = c.get("/admin/data-sources", headers=_auth(seeded_app["admin_token"]))
-        assert resp.status_code == 200
-        return resp.text
+        return fetch_admin_data_sources_page(seeded_app)
 
     def test_no_band_when_nothing_synced_yet(self, seeded_app):
         body = self._body(seeded_app)
@@ -272,10 +274,7 @@ class TestWizardRegisterPayloadContract:
 
     @staticmethod
     def _template_text():
-        from pathlib import Path
-
-        tpl = Path(__file__).resolve().parents[1] / "app" / "web" / "templates" / "admin_data_sources.html"
-        return tpl.read_text(encoding="utf-8")
+        return _ds_page_source.page_source()
 
     def test_register_payload_uses_bare_table_name(self):
         tpl = self._template_text()
@@ -343,11 +342,12 @@ class TestAddDataWizard:
     anything else."""
 
     def _page(self, seeded_app) -> str:
-        c = seeded_app["client"]
-        return c.get(
-            "/admin/data-sources",
-            headers={"Authorization": f"Bearer {seeded_app['admin_token']}"},
-        ).text
+        # Perf follow-up (2026-09-03): most of this page's JS moved into
+        # extracted static files, so a real HTTP GET's `.text` alone no
+        # longer carries it — see tests/_admin_data_sources_source.py.
+        from tests._admin_data_sources_source import fetch_admin_data_sources_page
+
+        return fetch_admin_data_sources_page(seeded_app)
 
     def test_the_four_steps_are_declared(self, seeded_app):
         body = self._page(seeded_app)
@@ -517,11 +517,12 @@ class TestAddDataConnectorPicker:
     are shared."""
 
     def _page(self, seeded_app) -> str:
-        c = seeded_app["client"]
-        return c.get(
-            "/admin/data-sources",
-            headers={"Authorization": f"Bearer {seeded_app['admin_token']}"},
-        ).text
+        # Perf follow-up (2026-09-03): most of this page's JS moved into
+        # extracted static files, so a real HTTP GET's `.text` alone no
+        # longer carries it — see tests/_admin_data_sources_source.py.
+        from tests._admin_data_sources_source import fetch_admin_data_sources_page
+
+        return fetch_admin_data_sources_page(seeded_app)
 
     def test_all_four_connectors_are_offered(self, seeded_app):
         body = self._page(seeded_app)
@@ -697,11 +698,7 @@ class TestSourcePipelineStrip:
             source_connections_repo().delete(conn_id)
 
     def test_the_page_serves_the_strip_data(self, seeded_app):
-        c = seeded_app["client"]
-        body = c.get(
-            "/admin/data-sources",
-            headers={"Authorization": f"Bearer {seeded_app['admin_token']}"},
-        ).text
+        body = fetch_admin_data_sources_page(seeded_app)
         assert "SOURCE_PIPELINES" in body
         assert "_pipelineStripHtml" in body
         # Each cell routes to the page owning that stage.
@@ -746,9 +743,7 @@ class TestSemanticLayerCellNoTokenAction:
         import tempfile
         from pathlib import Path
 
-        tpl = (Path(__file__).resolve().parents[1] / "app" / "web" / "templates" / "admin_data_sources.html").read_text(
-            encoding="utf-8"
-        )
+        tpl = _ds_page_source.page_source()
         fn = self._extract_function(tpl, "function _pipelineStripHtml(row) {")
         pipeline = {
             "tables": {"count": 5},
@@ -895,11 +890,7 @@ class TestSourcesIsEveryConnector:
             source_connections_repo().delete(conn_id)
 
     def test_the_page_asks_for_every_source_type(self, seeded_app):
-        c = seeded_app["client"]
-        body = c.get(
-            "/admin/data-sources",
-            headers={"Authorization": f"Bearer {seeded_app['admin_token']}"},
-        ).text
+        body = fetch_admin_data_sources_page(seeded_app)
         # The Keboola-only filter is gone, and the derived cards ride along.
         assert "source_type=keboola" not in body
         assert "DERIVED_SOURCES" in body
@@ -925,10 +916,7 @@ class TestKeboolaImportAsManagedConnection:
 
     @staticmethod
     def _template_text() -> str:
-        from pathlib import Path
-
-        tpl = Path(__file__).resolve().parents[1] / "app" / "web" / "templates" / "admin_data_sources.html"
-        return tpl.read_text(encoding="utf-8")
+        return _ds_page_source.page_source()
 
     def test_button_only_renders_for_the_keboola_derived_card(self):
         tpl = self._template_text()
@@ -1003,9 +991,7 @@ class TestImportKeboolaConnectionBehavior:
         import tempfile
         from pathlib import Path
 
-        tpl = (Path(__file__).resolve().parents[1] / "app" / "web" / "templates" / "admin_data_sources.html").read_text(
-            encoding="utf-8"
-        )
+        tpl = _ds_page_source.page_source()
         fn = self._extract_function(tpl, "async function importKeboolaConnection(id) {")
 
         script = f"""
@@ -1189,10 +1175,7 @@ class TestKeboolaBulkPickerRenameSuggestion:
 
     @staticmethod
     def _template_text() -> str:
-        from pathlib import Path
-
-        tpl = Path(__file__).resolve().parents[1] / "app" / "web" / "templates" / "admin_data_sources.html"
-        return tpl.read_text(encoding="utf-8")
+        return _ds_page_source.page_source()
 
     def test_picker_renders_an_editable_input_only_for_names_that_would_fail(self):
         tpl = self._template_text()
@@ -1288,11 +1271,7 @@ class TestSourceCardHierarchy:
     """
 
     def test_the_status_word_folds_the_strip(self, seeded_app):
-        c = seeded_app["client"]
-        body = c.get(
-            "/admin/data-sources",
-            headers={"Authorization": f"Bearer {seeded_app['admin_token']}"},
-        ).text
+        body = fetch_admin_data_sources_page(seeded_app)
         assert "_sourceHealth" in body
         for state in ("Healthy", "No tables yet", "Reaches nobody", "failing sync"):
             assert state in body
@@ -1302,11 +1281,7 @@ class TestSourceCardHierarchy:
         assert "semantic" not in health
 
     def test_the_body_is_closed_and_the_caret_says_so(self, seeded_app):
-        c = seeded_app["client"]
-        body = c.get(
-            "/admin/data-sources",
-            headers={"Authorization": f"Bearer {seeded_app['admin_token']}"},
-        ).text
+        body = fetch_admin_data_sources_page(seeded_app)
         assert 'class="ds-src__body" id="ds-body-${id}" hidden' in body
         assert 'aria-expanded="false" aria-controls="ds-body-${id}"' in body
         # A verb reached from the menu opens the body it writes into —
@@ -1318,11 +1293,7 @@ class TestSourceCardHierarchy:
         the list of tables that already exist is the one page that cannot fix
         an empty source. The cell becomes the action instead, which is also
         where the card's primary verb stays one click away."""
-        c = seeded_app["client"]
-        body = c.get(
-            "/admin/data-sources",
-            headers={"Authorization": f"Bearer {seeded_app['admin_token']}"},
-        ).text
+        body = fetch_admin_data_sources_page(seeded_app)
         assert "Add the first tables" in body
         strip = body[body.index("function _pipelineStripHtml") : body.index("function _sourceHealth")]
         # A stored connection browses its own tables; a derived card has none
@@ -1331,11 +1302,7 @@ class TestSourceCardHierarchy:
         assert "openWizard(" in strip
 
     def test_no_control_was_dropped_with_the_action_strip(self, seeded_app):
-        c = seeded_app["client"]
-        body = c.get(
-            "/admin/data-sources",
-            headers={"Authorization": f"Bearer {seeded_app['admin_token']}"},
-        ).text
+        body = fetch_admin_data_sources_page(seeded_app)
         for fn in (
             "testConn",
             "toggleBrowse",
@@ -1364,11 +1331,7 @@ class TestSnowflakeWizardCredentialNames:
     from `GET /api/admin/server-config`."""
 
     def _template(self):
-        from pathlib import Path
-
-        import app.web.router as web_router
-
-        return (Path(web_router.__file__).parent / "templates" / "admin_data_sources.html").read_text()
+        return _ds_page_source.page_source()
 
     def test_the_save_writes_the_connection_row_not_the_yaml_overlay(self):
         src = self._template()
@@ -1441,11 +1404,7 @@ class TestDatabricksWizardCredentialAndRestartNotice:
     boundary to import."""
 
     def _template(self):
-        from pathlib import Path
-
-        import app.web.router as web_router
-
-        return (Path(web_router.__file__).parent / "templates" / "admin_data_sources.html").read_text()
+        return _ds_page_source.page_source()
 
     def test_the_credential_badge_row_is_styled_like_its_siblings(self):
         """`.ds-dbxcred` was on the div and in no stylesheet rule, so the badge
@@ -1535,21 +1494,30 @@ class TestSharePointSourceCard:
             fs = inv["pipelines"][conn_id]["file_source"]
             assert fs["crawl"]["documents"] == 0
             assert fs["extract"] == {}
-            assert fs["graph"] == {"facts": 0, "edges": 0}
+            # Never computed at page-render time at all (perf follow-up,
+            # 2026-09-03) — served lazily by `GET .../facts-graph-counts`
+            # instead, so this is `None` regardless of backend.
+            assert fs["graph"] is None
             assert fs["last_run"] is None
             assert fs["queue"] == {"items": 0}
             assert fs["identity"] == {"groups_matched": 0, "collections_no_group": 0, "collections_total": 0}
-            # `scopes` needs no Postgres at all (config.scopes + the dual-
-            # backend file_corpora/resource_grants repos) — an empty
-            # connection still yields an empty (not missing) list.
-            assert fs["scopes"] == []
+            assert fs["scopes_total"] == 0
         finally:
             source_connections_repo().delete(conn_id)
 
     def test_scopes_resolve_collection_name_and_no_group_warning_without_postgres(self, seeded_app):
         """`scopes` reuses `admin_sharepoint._scope_out`, which only touches
         the dual-backend `file_corpora`/`resource_grants` repos — no
-        Postgres required, unlike the rest of this cell."""
+        Postgres required, unlike the rest of this cell.
+
+        Not part of the page fold any more (perf follow-up, 2026-09-03,
+        second finding) — `_source_inventory` keeps only the cheap
+        `scopes_total` count; the enriched rows this test pins now come
+        exclusively from `GET .../scopes` (`admin_sharepoint.list_scopes`),
+        fetched by the card on expand — same DuckDB-only requirement, since
+        that route touches only `file_corpora`/`resource_grants` too.
+        """
+        import asyncio
         import uuid
 
         from src.repositories import file_corpora_repo, source_connections_repo
@@ -1578,8 +1546,13 @@ class TestSharePointSourceCard:
             from app.web.router import _source_inventory
 
             fs = _source_inventory()["pipelines"][conn_id]["file_source"]
-            assert len(fs["scopes"]) == 1
-            row = fs["scopes"][0]
+            assert fs["scopes_total"] == 1
+
+            from app.api.admin_sharepoint import list_scopes
+
+            body = asyncio.run(list_scopes(conn_id, user={"id": "admin1", "email": "admin@test.com"}))
+            assert len(body["items"]) == 1
+            row = body["items"][0]
             assert row["source_scope_id"] == "site1-drive1"
             assert row["display_path"] == "Site / Contracts"
             assert row["collection"]["name"] == "Contracts"
@@ -1619,6 +1592,11 @@ class TestSharePointSourceCard:
                 "next_run_at": None,
                 "extraction_ready": False,
                 "extraction_unready_reason": "extraction_disabled",
+                # The "Extract facts now" gate: the connector switch is
+                # checked first (the whole admin surface 409s without it),
+                # then the pass's own two switches.
+                "facts_extraction_ready": False,
+                "facts_extraction_unready_switch": "sharepoint.enabled",
             }
         finally:
             source_connections_repo().delete(conn_id)
@@ -1704,6 +1682,60 @@ class TestSharePointSourceCard:
             in_agnes = inv["pipelines"][conn_id]["file_source"]["schedule"]["in_agnes"]
             assert in_agnes["extraction_ready"] is True
             assert in_agnes["extraction_unready_reason"] is None
+        finally:
+            source_connections_repo().delete(conn_id)
+
+    def test_facts_extraction_gate_names_the_first_switch_that_is_off(self, seeded_app, monkeypatch):
+        """`facts_extraction_ready` mirrors `_facts_extraction_readiness`
+        (the SAME two switches the `sharepoint-facts-extraction` job honors)
+        behind the connector switch, and `facts_extraction_unready_switch`
+        names the first one that is off — the card renders that key as the
+        button's disabled reason, so a click can never 409 on a switch the
+        page already knew about."""
+        import uuid
+
+        from app.web.router import _source_inventory
+        from src.repositories import source_connections_repo
+
+        monkeypatch.setenv("AGNES_SHAREPOINT_ENABLED", "true")
+        configured: dict = {}
+
+        def _fake_get_value(*keys, default=None):
+            node = configured
+            for key in keys:
+                if isinstance(node, dict) and key in node:
+                    node = node[key]
+                else:
+                    return default
+            return node
+
+        monkeypatch.setattr("app.instance_config.get_value", _fake_get_value)
+
+        conn_id = f"sp-{uuid.uuid4().hex[:8]}"
+        source_connections_repo().create(
+            id=conn_id,
+            name="Corp SharePoint",
+            source_type="sharepoint",
+            config={"tenant_id": "t1", "client_id": "c1"},
+        )
+        try:
+
+            def _gate():
+                return _source_inventory()["pipelines"][conn_id]["file_source"]["schedule"]["in_agnes"]
+
+            g = _gate()
+            assert g["facts_extraction_ready"] is False
+            assert g["facts_extraction_unready_switch"] == "extraction.facts.enabled"
+
+            configured["extraction"] = {"facts": {"enabled": True}}
+            g = _gate()
+            assert g["facts_extraction_ready"] is False
+            assert g["facts_extraction_unready_switch"] == "facts.enabled"
+
+            configured["facts"] = {"enabled": True}
+            g = _gate()
+            assert g["facts_extraction_ready"] is True
+            assert g["facts_extraction_unready_switch"] is None
         finally:
             source_connections_repo().delete(conn_id)
 
@@ -1867,7 +1899,11 @@ class TestSharePointSourceCardRendering:
     _FILE_SOURCE = {
         "crawl": {"documents": 12},
         "extract": {"indexed": 9, "processing": 2, "needs_review": 1},
-        "graph": {"facts": 7, "edges": 3},
+        # Never server-rendered (perf follow-up, 2026-09-03) — the strip
+        # shows a loading placeholder and fills it in from
+        # `GET .../facts-graph-counts` client-side; `None` is the REAL shape
+        # `_source_pipelines()` now always sends.
+        "graph": None,
         "queue": {"items": 3},
         "schedule": {"text": "built-in crawler"},
         "certificate": {"origin": "vault", "env_name": None, "set_at": "2026-08-20T12:00:00+00:00", "error": None},
@@ -1909,19 +1945,21 @@ class TestSharePointSourceCardRendering:
         import tempfile
         from pathlib import Path
 
-        tpl = (Path(__file__).resolve().parents[1] / "app" / "web" / "templates" / "admin_data_sources.html").read_text(
-            encoding="utf-8"
-        )
+        tpl = _ds_page_source.page_source()
         fns = "\n".join(
             self._extract_function(tpl, sig)
             for sig in (
                 "function _esc(s) {",
                 "function _sharepointPipelineStripHtml(row) {",
+                "function _extRenderFactsPolicy(row) {",
+                "function _extRenderCrawlFilter(row) {",
                 "function _sharepointFactsHtml(row) {",
                 "const SP_REJECTION_REASON_TEXT = {",
                 "function _spRejectionReasonText(reason) {",
                 "const EXTRACTION_UNREADY_REASON_TEXT = {",
                 "function _extractionUnreadyReasonText(reason) {",
+                "const FACTS_EXTRACTION_UNREADY_TEXT = {",
+                "function _factsExtractionUnreadyText(switchKey) {",
                 "function _spGroupRejectionRows(rows) {",
                 "function _spRejectionRowHtml(r) {",
                 "function toggleFileSourceDrawer(connId, category) {",
@@ -1955,7 +1993,11 @@ const row = {{ id: "sp-conn-1", source_type: "sharepoint" }};
         html = result["html"]
         assert "12 documents" in html
         assert "9 indexed" in html
-        assert "7 facts · 3 edges" in html
+        # `graph` is never server-rendered (perf follow-up, 2026-09-03) — the
+        # strip shows a loading placeholder with a stable id so
+        # `_fetchSharepointGraphCounts` can fill it in after the page paints.
+        assert 'id="ds-sp-graph-sp-conn-1"' in html
+        assert "loading" in html
         assert "3 items" in html
 
     def test_facts_html_renders_certificate_identity_and_badge_counts(self):
@@ -1974,6 +2016,37 @@ const row = {{ id: "sp-conn-1", source_type: "sharepoint" }};
         assert "Citation links rejected 1" in html
 
     # -- in-Agnes extraction scheduling + manual trigger (TCRD-226) --------
+
+    def test_run_options_carry_a_force_reprocess_checkbox_naming_the_document_count(self):
+        """The operator control that ignores the delta cursor entirely — a
+        checkbox on the run-options row, with one sentence naming the cost
+        (re-download/re-convert/re-run-LLM the WHOLE corpus, sized with the
+        card's own known document count, 12 per `_FILE_SOURCE`)."""
+        result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));")
+        html = result["html"]
+        assert 'id="ds-sp-runopts-force-sp-conn-1"' in html
+        assert 'id="ds-sp-runopts-resync-sp-conn-1"' in html
+        assert "Re-process everything (ignore the delta cursor)" in html
+        assert "all 12 documents" in html
+        assert "not just what changed" in html
+
+    def test_run_options_carry_a_retry_failed_checkbox(self):
+        """The admin-facing surface for `retry_failed` (REST × CLI × UI
+        parity, see `POST …/extract`'s `retry_failed` option) — a checkbox
+        alongside resync/force, never a route of its own."""
+        result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));")
+        html = result["html"]
+        assert 'id="ds-sp-runopts-retry-sp-conn-1"' in html
+        assert "Retry failed items" in html
+
+    def test_force_reprocess_help_falls_back_when_the_document_count_is_unknown(self):
+        fs = dict(self._FILE_SOURCE)
+        fs["crawl"] = {}
+        result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)
+        html = result["html"]
+        assert 'id="ds-sp-runopts-force-sp-conn-1"' in html
+        assert 'id="ds-sp-runopts-resync-sp-conn-1"' in html
+        assert "every document" in html
 
     def test_run_extraction_now_button_always_renders_but_defaults_disabled(self):
         """The button never disappears — even on an older/degraded cell
@@ -2000,11 +2073,13 @@ const row = {{ id: "sp-conn-1", source_type: "sharepoint" }};
                 "next_run_at": "2026-08-29T12:00:00+00:00",
                 "extraction_ready": True,
                 "extraction_unready_reason": None,
+                "facts_extraction_ready": True,
+                "facts_extraction_unready_switch": None,
             },
         }
         result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)
         html = result["html"]
-        # Ready -> no unready badge, and the button carries no `disabled`.
+        # Ready -> no unready badge, and neither button carries `disabled`.
         assert "connector is disabled on this instance" not in html
         assert "No extraction producer is configured" not in html
         assert "disabled" not in html
@@ -2256,41 +2331,172 @@ const row = {{ id: "sp-conn-1", source_type: "sharepoint" }};
 
     # -- scope rows (spec follow-up: clickable into the wizard) ------------
 
+    def _run_scope_row(self, scope: dict) -> str:
+        """`_spScopeRowHtml` executed directly — the per-scope row renderer
+        used by `toggleSpScopesDrawer`'s fetch-on-expand drawer (perf
+        follow-up, 2026-09-03: the drawer's own async `fetch()` is out of
+        reach for this synchronous node harness, but the pure rendering
+        function it calls is not)."""
+        import json
+        import subprocess
+        import tempfile
+        from pathlib import Path
+
+        tpl = read_admin_data_sources_source()
+        fns = "\n".join(
+            self._extract_function(tpl, sig)
+            for sig in (
+                "function _esc(s) {",
+                "function _spScopeMinModifiedBadge(s) {",
+                "function _spScopeRowHtml(connId, s) {",
+            )
+        )
+        script = f"""
+{fns}
+console.log(JSON.stringify({{ html: _spScopeRowHtml("sp-conn-1", {json.dumps(scope)}) }}));
+"""
+        with tempfile.NamedTemporaryFile("w", suffix=".mjs", delete=False) as f:
+            f.write(script)
+            path = f.name
+        try:
+            proc = subprocess.run(["node", path], capture_output=True, text=True)
+        finally:
+            Path(path).unlink(missing_ok=True)
+        if proc.returncode == 127:
+            pytest.skip("node unavailable")
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        return json.loads(proc.stdout)["html"]
+
     def test_scope_rows_render_clickable_and_wire_the_connection_id(self):
-        fs = dict(self._FILE_SOURCE)
-        fs["scopes"] = [
+        html = self._run_scope_row(
             {
                 "source_scope_id": "site1-drive1",
                 "display_path": "Site / Contracts",
                 "collection": {"id": "col_a", "slug": "contracts", "name": "Contracts"},
                 "no_group_warning": False,
             }
-        ]
-        result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)
-        html = result["html"]
-        assert "Scope collections" in html
+        )
         assert "Site / Contracts" in html
         assert "Contracts" in html
         assert "openSpWizardForConnection('sp-conn-1', { highlightScopeId: 'site1-drive1' })" in html
 
     def test_scope_row_warns_when_ungranted(self):
-        fs = dict(self._FILE_SOURCE)
-        fs["scopes"] = [
+        html = self._run_scope_row(
             {
                 "source_scope_id": "site1-drive2",
                 "display_path": "Site / Reports",
                 "collection": {"id": "col_b", "slug": "reports", "name": "Reports"},
                 "no_group_warning": True,
             }
-        ]
-        result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)
-        html = result["html"]
+        )
         assert "no group" in html
         assert "badge-warn" in html
 
-    def test_no_scope_rows_section_when_scopes_is_empty(self):
+    def test_no_scope_rows_section_when_scopes_total_is_zero(self):
+        """`scopes_total` absent/falsy (this connection has none) — the
+        whole "Scope collections" row, including the fetch-on-expand
+        button, must not render at all."""
         result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));")
         assert "Scope collections" not in result["html"]
+
+    def test_scope_collections_row_shows_the_count_and_a_view_button(self):
+        """The collapsed row (perf follow-up, 2026-09-03): no per-scope data
+        inline, just the count and a button that fetches the real list on
+        click (`toggleSpScopesDrawer`, exercised end-to-end in
+        tests/test_admin_sharepoint.py — this pins only what
+        `_sharepointFactsHtml` itself renders before that fetch fires)."""
+        fs = dict(self._FILE_SOURCE)
+        fs["scopes_total"] = 42
+        result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)
+        html = result["html"]
+        assert "Scope collections" in html
+        assert "42 scopes" in html
+        assert "toggleSpScopesDrawer('sp-conn-1')" in html
+        assert 'id="ds-sp-scopes-drawer-sp-conn-1"' in html
+        # Nothing per-scope leaked into the initial render.
+        assert "ds-sp-scope-row" not in html
+
+    # -- SharePoint permissions snapshot (TCRD-296 gap #79) -----------------
+
+    def test_acl_snapshot_row_renders_a_loading_placeholder_and_view_button(self):
+        """The fact row starts as a placeholder with a stable id —
+        `_fetchSharepointAclSnapshot` (fetched after the page paints, out of
+        reach for this synchronous node harness) fills in the real counts;
+        this pins only what `_sharepointFactsHtml` itself renders before
+        that fetch fires — same posture as the scope-collections row above."""
+        result = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));")
+        html = result["html"]
+        assert "SharePoint permissions" in html
+        assert 'id="ds-sp-acl-sp-conn-1"' in html
+        assert "loading" in html
+        assert "toggleSpAclSnapshotDrawer('sp-conn-1')" in html
+        assert 'id="ds-sp-acl-drawer-sp-conn-1"' in html
+
+    def _run_acl_snapshot_scope_row(self, scope: dict) -> str:
+        """`_spAclSnapshotScopeRowHtml` executed directly — the per-scope
+        principal-list renderer used by `toggleSpAclSnapshotDrawer`'s
+        fetch-on-expand drawer (its own async `fetch()` is out of reach for
+        this synchronous node harness, but the pure rendering function it
+        calls is not — same split as `_run_scope_row` above)."""
+        import json
+        import subprocess
+        import tempfile
+        from pathlib import Path
+
+        tpl = _ds_page_source.page_source()
+        fns = "\n".join(
+            self._extract_function(tpl, sig)
+            for sig in ("function _esc(s) {", "function _spAclSnapshotScopeRowHtml(scope) {")
+        )
+        script = f"""
+{fns}
+console.log(JSON.stringify({{ html: _spAclSnapshotScopeRowHtml({json.dumps(scope)}) }}));
+"""
+        with tempfile.NamedTemporaryFile("w", suffix=".mjs", delete=False) as f:
+            f.write(script)
+            path = f.name
+        try:
+            proc = subprocess.run(["node", path], capture_output=True, text=True)
+        finally:
+            Path(path).unlink(missing_ok=True)
+        if proc.returncode == 127:
+            pytest.skip("node unavailable")
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        return json.loads(proc.stdout)["html"]
+
+    def test_acl_snapshot_scope_row_lists_each_principal_and_its_kind(self):
+        html = self._run_acl_snapshot_scope_row(
+            {
+                "source_scope_id": "s1",
+                "display_path": "Site / Docs / Finance",
+                "principals": [
+                    {"principal_kind": "entra_group", "display_name": "Finance Team"},
+                    {"principal_kind": "user", "display_name": "Alice"},
+                ],
+            }
+        )
+        assert "Site / Docs / Finance" in html
+        assert "Finance Team" in html
+        assert "entra_group" in html
+        assert "Alice" in html
+        assert "(user)" in html
+
+    def test_acl_snapshot_scope_row_escapes_principal_names(self):
+        """Untrusted names (a SharePoint display name is admin/producer
+        content, not Agnes-controlled) must never reach innerHTML raw."""
+        html = self._run_acl_snapshot_scope_row(
+            {
+                "source_scope_id": "s2",
+                "display_path": "<img src=x onerror=alert(1)>",
+                "principals": [{"principal_kind": "user", "display_name": "<script>alert(1)</script>"}],
+            }
+        )
+        assert "<script>" not in html
+        assert "<img" not in html
+
+    def test_acl_snapshot_scope_row_no_principals_state(self):
+        html = self._run_acl_snapshot_scope_row({"source_scope_id": "s3", "display_path": "Empty", "principals": []})
+        assert "no principals" in html
 
     # -- anonymization row (spec §9.2/§13.2): requested vs declared --------
 
@@ -2327,6 +2533,135 @@ const row = {{ id: "sp-conn-1", source_type: "sharepoint" }};
         assert "anonymized 1" in html
         assert "anonymization requested 1" in html
 
+    # -- "Extract facts now" (the standalone sharepoint-facts-extraction pass) --
+
+    def _in_agnes(self, **over):
+        fs = dict(self._FILE_SOURCE)
+        fs["schedule"] = {
+            **fs["schedule"],
+            "in_agnes": {
+                "enabled": True,
+                "schedule": None,
+                "last_run_at": None,
+                "next_run_at": None,
+                "extraction_ready": True,
+                "extraction_unready_reason": None,
+                "facts_extraction_ready": True,
+                "facts_extraction_unready_switch": None,
+                **over,
+            },
+        }
+        return fs
+
+    def test_extract_facts_now_renders_next_to_run_extraction_now_with_its_help_text(self):
+        fs = self._in_agnes()
+        html = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)["html"]
+        assert "Extract facts now" in html
+        assert 'id="ext-facts-btn-sp-conn-1"' in html
+        assert "runSpFactsExtraction('sp-conn-1')" in html
+        assert "Runs over documents indexed so far; safe to repeat." in html
+        assert 'data-facts-ready="1"' in html
+        # Both verbs live on the same card block, in order: crawl first.
+        assert html.index("Run extraction now") < html.index("Extract facts now")
+
+    def test_extract_facts_now_defaults_disabled_when_the_gate_is_missing(self):
+        """Fail closed on an older/degraded cell shape (no `in_agnes` at
+        all) — same posture as the Run button."""
+        html = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));")["html"]
+        assert 'id="ext-facts-btn-sp-conn-1"' in html
+        assert 'data-facts-ready="0"' in html
+
+    def test_extract_facts_now_is_disabled_with_the_cost_switch_named(self):
+        fs = self._in_agnes(facts_extraction_ready=False, facts_extraction_unready_switch="extraction.facts.enabled")
+        html = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)["html"]
+        assert 'data-facts-ready="0"' in html
+        assert "extraction.facts.enabled" in html
+        # The reason is a visible badge, not only a tooltip.
+        assert "Fact extraction is off" in html
+
+    def test_extract_facts_now_is_disabled_with_the_surface_switch_named(self):
+        fs = self._in_agnes(facts_extraction_ready=False, facts_extraction_unready_switch="facts.enabled")
+        html = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)["html"]
+        assert 'data-facts-ready="0"' in html
+        assert "fact graph is off" in html.lower()
+        assert "facts.enabled" in html
+
+    def test_extract_facts_now_is_disabled_when_the_connector_is_off(self):
+        fs = self._in_agnes(
+            enabled=False,
+            extraction_ready=False,
+            extraction_unready_reason="extraction_disabled",
+            facts_extraction_ready=False,
+            facts_extraction_unready_switch="sharepoint.enabled",
+        )
+        html = self._run("console.log(JSON.stringify({ html: _sharepointFactsHtml(row) }));", file_source=fs)["html"]
+        assert 'data-facts-ready="0"' in html
+        assert "sharepoint.enabled" in html
+
+
+class TestExtRenderCrawlScheduleAndFilter:
+    """D.16 — the "Crawl schedule & filter" panel
+    (`_extRenderCrawlFilter`, ``app/web/static/js/admin/
+    data_sources_page.js``): the schedule select's pre-filled selection,
+    the custom-cadence input's conditional visibility, and the status
+    text — all pure string-building, no DOM calls, so it renders straight
+    off ``row.config.extraction.crawl`` with no server round trip."""
+
+    def _run_crawl_filter(self, crawl: dict) -> str:
+        import json
+        import subprocess
+        import tempfile
+        from pathlib import Path
+
+        tpl = _ds_page_source.page_source()
+        fns = "\n".join(
+            TestSharePointSourceCardRendering._extract_function(tpl, sig)
+            for sig in ("function _esc(s) {", "function _extRenderCrawlFilter(row) {")
+        )
+        row = {"id": "sp-conn-1", "name": "Corp SharePoint", "config": {"extraction": {"crawl": crawl}}}
+        script = f"""
+{fns}
+
+const row = {json.dumps(row)};
+console.log(JSON.stringify({{ html: _extRenderCrawlFilter(row) }}));
+"""
+        with tempfile.NamedTemporaryFile("w", suffix=".mjs", delete=False) as f:
+            f.write(script)
+            path = f.name
+        try:
+            proc = subprocess.run(["node", path], capture_output=True, text=True)
+        finally:
+            Path(path).unlink(missing_ok=True)
+        if proc.returncode == 127:
+            pytest.skip("node unavailable")
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        return json.loads(proc.stdout)["html"]
+
+    def test_default_selects_instance_and_shows_no_custom_input(self):
+        html = self._run_crawl_filter({})
+        assert 'value="instance" selected' in html
+        assert "Crawl schedule &amp; filter" in html or "Crawl schedule & filter" in html
+        assert 'style="display:none"' in html  # the custom-cadence text input, hidden by default
+        assert "following the instance-wide cadence" in html
+
+    def test_off_is_pre_selected_and_the_status_line_names_it(self):
+        html = self._run_crawl_filter({"schedule": "off"})
+        assert 'value="off" selected' in html
+        assert "Currently: off (connection)." in html
+
+    def test_a_custom_cadence_is_pre_selected_and_the_input_is_shown_and_prefilled(self):
+        html = self._run_crawl_filter({"schedule": "every 6h"})
+        assert 'value="custom" selected' in html
+        assert 'value="every 6h"' in html
+        assert 'style="display:"' in html  # the custom-cadence input, now visible
+        assert "Currently: every 6h (connection)." in html
+
+    def test_min_modified_still_renders_the_date_filter_panel(self):
+        html = self._run_crawl_filter({"min_modified": "2023-12-31"})
+        assert 'id="ds-sp-crawlfilter-date-sp-conn-1"' in html
+        assert 'value="2023-12-31"' in html
+        assert "Currently: files modified on/after 2023-12-31" in html
+
 
 class TestSourceTypeAwareActionsMenu:
     """`_sourceMenuItems(row)` — a SharePoint connection gets its OWN verb
@@ -2345,9 +2680,7 @@ class TestSourceTypeAwareActionsMenu:
         import tempfile
         from pathlib import Path
 
-        tpl = (Path(__file__).resolve().parents[1] / "app" / "web" / "templates" / "admin_data_sources.html").read_text(
-            encoding="utf-8"
-        )
+        tpl = _ds_page_source.page_source()
         fns = "\n".join(
             self._extract_function(tpl, sig) for sig in ("function _esc(s) {", "function _sourceMenuItems(row) {")
         )
@@ -2372,6 +2705,9 @@ console.log(_sourceMenuItems({json.dumps(row)}));
         "Manage scopes…",
         "Test connection",
         "Run extraction now",
+        "Consolidate collections…",
+        "Merge split parts back into this source…",
+        "Map site group (ACL)…",
         "Update certificate…",
         "Delete source",
     ]
@@ -2396,6 +2732,9 @@ console.log(_sourceMenuItems({json.dumps(row)}));
         assert "testConn('sp-conn-1')" not in html
         assert "openSpWizardForConnection('sp-conn-1')" in html
         assert "toggleSpCertRow('sp-conn-1')" in html
+        assert "toggleSpConsolidateRow('sp-conn-1')" in html
+        assert "mergeSpSplitSiblings('sp-conn-1')" in html
+        assert "mapSpSiteGroup('sp-conn-1')" in html
 
     def test_keboola_menu_is_unchanged_by_the_sharepoint_branch(self):
         html = self._run(
@@ -2416,6 +2755,109 @@ console.log(_sourceMenuItems({json.dumps(row)}));
         assert "testConn('kbc-conn-1')" in html
 
 
+class TestMapSpSiteGroup:
+    """`mapSpSiteGroup(id)` (2026-09 fix) — maps ONE SharePoint site group
+    to Agnes group(s) in `config.acl_site_group_map`, read-modify-write
+    against the connection's CURRENT map (never a blind overwrite of the
+    whole thing, since the underlying `PATCH …/acl-site-group-map`
+    replaces wholesale)."""
+
+    _extract_function = staticmethod(TestSharePointSourceCardRendering._extract_function)
+
+    def _run(self, *, current_map: dict, prompts: list, ok: bool = True, resp_body: dict | None = None) -> dict:
+        import json
+        import subprocess
+        import tempfile
+        from pathlib import Path
+
+        tpl = read_admin_data_sources_source()
+        fns = "\n".join(
+            self._extract_function(tpl, sig)
+            for sig in (
+                "function detailMessage(body, fallback) {",
+                "async function mapSpSiteGroup(id) {",
+            )
+        )
+        script = f"""
+{fns}
+
+let _connections = [{{"id": "c1", "source_type": "sharepoint", "config": {{"acl_site_group_map": {json.dumps(current_map)}}}}}];
+const prompts = {json.dumps(prompts)};
+let promptCalls = [];
+global.window = {{ prompt: (msg, dflt) => {{ promptCalls.push([msg, dflt]); const v = prompts.shift(); return v === undefined ? null : v; }} }};
+let toasts = [];
+function showToast(msg, ok) {{ toasts.push([msg, ok]); }}
+let loadCalls = 0;
+async function loadConnections() {{ loadCalls++; }}
+global.document = {{ getElementById: () => null }};
+
+let fetched = null;
+global.fetch = async (url, opts) => {{
+  fetched = {{ url, opts }};
+  return {{ ok: {str(ok).lower()}, status: {200 if ok else 400}, json: async () => ({json.dumps(resp_body or {})}) }};
+}};
+
+(async () => {{
+  await mapSpSiteGroup("c1");
+  console.log(JSON.stringify({{
+    fetchedUrl: fetched && fetched.url,
+    method: fetched && fetched.opts && fetched.opts.method,
+    body: fetched && fetched.opts && fetched.opts.body ? JSON.parse(fetched.opts.body) : null,
+    promptCallCount: promptCalls.length,
+    secondPromptDefault: promptCalls.length > 1 ? promptCalls[1][1] : null,
+    loadCalls,
+    toasts,
+  }}));
+}})();
+"""
+        with tempfile.NamedTemporaryFile("w", suffix=".mjs", delete=False) as f:
+            f.write(script)
+            path = f.name
+        try:
+            proc = subprocess.run(["node", path], capture_output=True, text=True)
+        finally:
+            Path(path).unlink(missing_ok=True)
+        if proc.returncode == 127:
+            pytest.skip("node unavailable")
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        return json.loads(proc.stdout)
+
+    def test_maps_a_new_site_group_preserving_the_others(self):
+        out = self._run(current_map={"Owners": ["grp-owners"]}, prompts=["Members", "grp-members, grp-extra"])
+        assert out["fetchedUrl"] == "/api/admin/sharepoint/connections/c1/acl-site-group-map"
+        assert out["method"] == "PATCH"
+        assert out["body"] == {"mapping": {"Owners": ["grp-owners"], "Members": ["grp-members", "grp-extra"]}}
+        assert out["loadCalls"] == 1
+
+    def test_blank_group_ids_unmaps_the_entry(self):
+        out = self._run(current_map={"Owners": ["grp-owners"], "Members": ["grp-members"]}, prompts=["Members", ""])
+        assert out["body"] == {"mapping": {"Owners": ["grp-owners"]}}
+
+    def test_second_prompt_defaults_to_the_current_mapping(self):
+        out = self._run(current_map={"Members": ["grp-a", "grp-b"]}, prompts=["Members", "grp-a, grp-b"])
+        assert out["secondPromptDefault"] == "grp-a, grp-b"
+
+    def test_cancelling_the_site_group_prompt_makes_no_request(self):
+        out = self._run(current_map={}, prompts=[None])
+        assert out["fetchedUrl"] is None
+        assert out["promptCallCount"] == 1
+
+    def test_cancelling_the_group_ids_prompt_makes_no_request(self):
+        out = self._run(current_map={}, prompts=["Members", None])
+        assert out["fetchedUrl"] is None
+
+    def test_server_error_shows_a_toast_and_does_not_reload(self):
+        out = self._run(
+            current_map={},
+            prompts=["Members", "grp-a"],
+            ok=False,
+            resp_body={"detail": {"error": "invalid_group_id", "message": "unknown group"}},
+        )
+        assert out["loadCalls"] == 0
+        assert any("unknown group" in t[0] for t in out["toasts"])
+        assert all(t[1] is not True for t in out["toasts"])
+
+
 class TestManageScopesButtonOnTheCard:
     """The collapsed card's primary "Manage scopes" button — the owner's
     explicit demand ("a dumb path, make it clickable") for a direct, one-
@@ -2430,9 +2872,7 @@ class TestManageScopesButtonOnTheCard:
         import tempfile
         from pathlib import Path
 
-        tpl = (Path(__file__).resolve().parents[1] / "app" / "web" / "templates" / "admin_data_sources.html").read_text(
-            encoding="utf-8"
-        )
+        tpl = _ds_page_source.page_source()
         fn = self._extract_function(tpl, "function _connectionCardHtml(row) {")
         script = f"""
 function _esc(s) {{ return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;"); }}
@@ -2441,6 +2881,7 @@ function _connectorLogo(t) {{ return ""; }}
 function _sourceHealth(row) {{ return null; }}
 function _sourceSubtitle(row) {{ return ""; }}
 function _pipelineStripHtml(row) {{ return ""; }}
+function _nextStepHtml(row) {{ return ""; }}
 function _sharepointFactsHtml(row) {{ return ""; }}
 function _secretBadgeHtml(row) {{ return ""; }}
 function _masterTokenFactHtml(row) {{ return ""; }}
@@ -2492,9 +2933,7 @@ class TestOpenSpWizardForConnection:
         import tempfile
         from pathlib import Path
 
-        tpl = (Path(__file__).resolve().parents[1] / "app" / "web" / "templates" / "admin_data_sources.html").read_text(
-            encoding="utf-8"
-        )
+        tpl = _ds_page_source.page_source()
         fns = "\n".join(
             self._extract_function(tpl, sig)
             for sig in (
@@ -2515,6 +2954,9 @@ function spEnableStep(n) {{ calls.push(["spEnableStep", n]); }}
 function spGoStep(n) {{ calls.push(["spGoStep", n]); }}
 function spLoadScopesThenTree() {{ calls.push(["spLoadScopesThenTree"]); }}
 function spLoadShare() {{ calls.push(["spLoadShare"]); return Promise.resolve(); }}
+// Loads the bound connection's saved values into step 1 — a collaborator
+// like the rest, recorded so the orchestration below stays asserted.
+function spBindStep1ToConnection(id) {{ calls.push(["spBindStep1ToConnection", id]); }}
 
 global.CSS = {{ escape: (s) => s }};
 const highlighted = [];
@@ -2546,6 +2988,7 @@ global.setTimeout = (fn) => fn();  // run the un-highlight synchronously, determ
         assert result["spConnId"] == "sp-conn-1"
         assert result["calls"] == [
             ["openSpWizard"],
+            ["spBindStep1ToConnection", "sp-conn-1"],
             ["spEnableStep", 2],
             ["spEnableStep", 3],
             ["spGoStep", 2],
@@ -2560,6 +3003,7 @@ global.setTimeout = (fn) => fn();  // run the un-highlight synchronously, determ
         assert result["spConnId"] == "sp-conn-1"
         assert result["calls"] == [
             ["openSpWizard"],
+            ["spBindStep1ToConnection", "sp-conn-1"],
             ["spEnableStep", 2],
             ["spEnableStep", 3],
             ["spGoStep", 3],
@@ -2589,9 +3033,7 @@ class TestOpenSpWizardPreselectsSingleExistingConnection:
         import tempfile
         from pathlib import Path
 
-        tpl = (Path(__file__).resolve().parents[1] / "app" / "web" / "templates" / "admin_data_sources.html").read_text(
-            encoding="utf-8"
-        )
+        tpl = _ds_page_source.page_source()
         fns = "\n".join(
             self._extract_function(tpl, sig)
             for sig in ("function spEsc(s) {", "function spApi(url, opts) {", "function openSpWizard() {")
@@ -2600,7 +3042,7 @@ class TestOpenSpWizardPreselectsSingleExistingConnection:
 {fns}
 
 const SP_CONN_API = "/api/admin/source-connections";
-let spConnId, spCertChoice, spLevel, spCrumbs, spItems, spScopes, spGroups, spPendingGroups, spTreeFilterQuery, spLastSearchMatches, spUniquePerms, spManualSites;
+let spConnId, spCertChoice, spLevel, spCrumbs, spItems, spScopes, spGroups, spPendingGroups, spPendingMinModified, spTreeFilterQuery, spLastSearchMatches, spUniquePerms, spManualSites, spBoundToExisting, spConnListPromise;
 function spSetCertChoice(c) {{}}
 function spGoStep(n) {{}}
 function _syncDropdownRebuild(sel) {{}}
@@ -2673,9 +3115,7 @@ class TestSharePointWizardShareBadgeRendering:
         import tempfile
         from pathlib import Path
 
-        tpl = (Path(__file__).resolve().parents[1] / "app" / "web" / "templates" / "admin_data_sources.html").read_text(
-            encoding="utf-8"
-        )
+        tpl = _ds_page_source.page_source()
         fns = "\n".join(
             self._extract_function(tpl, sig) for sig in ("function spEsc(s) {", "function spRenderShare(items) {")
         )
@@ -2685,6 +3125,7 @@ class TestSharePointWizardShareBadgeRendering:
 const _host = {{ innerHTML: "", querySelectorAll: () => [] }};
 const document = {{ getElementById: (id) => (id === "spw-share-rows" ? _host : null) }};
 let spPendingGroups = {{}};
+let spPendingMinModified = {{}};
 let spGroups = [];
 // `spRenderShare` reads `spUniquePerms[source_scope_id]` for its advisory
 // summary line — an empty map here means "nothing flagged", which is
@@ -2892,9 +3333,7 @@ class TestSourceCardSubtitleIdentity:
         import tempfile
         from pathlib import Path
 
-        tpl = (Path(__file__).resolve().parents[1] / "app" / "web" / "templates" / "admin_data_sources.html").read_text(
-            encoding="utf-8"
-        )
+        tpl = _ds_page_source.page_source()
         fns = "\n".join(
             self._extract_function(tpl, sig)
             for sig in (
@@ -3040,8 +3479,9 @@ def test_register_error_text_is_not_html_escaped_before_textcontent(seeded_app):
     mangled message on the one line that matters. The single-row path already
     omits `_esc`; the two bulk-register paths did not.
     """
-    c = seeded_app["client"]
-    html = c.get("/admin/data-sources", headers={"Authorization": f"Bearer {seeded_app['admin_token']}"}).text
+    from tests._admin_data_sources_source import fetch_admin_data_sources_page
+
+    html = fetch_admin_data_sources_page(seeded_app)
     assert "_esc(_registerErrorText(" not in html, (
         "a register-error string is HTML-escaped before being assigned to "
         "textContent — the operator sees &quot; entities instead of the quoted "
@@ -3186,14 +3626,12 @@ class TestSourceCardRefreshWiring:
         return rest[: nxt.start()] if nxt else rest
 
     def _page(self, seeded_app) -> str:
-        return (
-            seeded_app["client"]
-            .get(
-                "/admin/data-sources",
-                headers={"Authorization": f"Bearer {seeded_app['admin_token']}"},
-            )
-            .text
-        )
+        # Perf follow-up (2026-09-03): most of this page's JS moved into
+        # extracted static files, so a real HTTP GET's `.text` alone no
+        # longer carries it — see tests/_admin_data_sources_source.py.
+        from tests._admin_data_sources_source import fetch_admin_data_sources_page
+
+        return fetch_admin_data_sources_page(seeded_app)
 
     def test_the_refresh_function_reads_the_endpoint(self, seeded_app):
         body = self._js_function_body(self._page(seeded_app), "refreshSourcePipelines")
@@ -3303,9 +3741,7 @@ class El {
         import tempfile
         from pathlib import Path
 
-        tpl = (Path(__file__).resolve().parents[1] / "app" / "web" / "templates" / "admin_data_sources.html").read_text(
-            encoding="utf-8"
-        )
+        tpl = _ds_page_source.page_source()
         fns = "\n".join(
             self._extract_function(tpl, sig)
             for sig in (
@@ -3315,6 +3751,7 @@ class El {
                 "function _pipelineStripHtml(row) {",
                 "function _sharepointHealth(fs) {",
                 "function _sourceHealth(row) {",
+                "function _nextStepHtml(row) {",
                 "async function refreshSourcePipelines() {",
                 "function _repaintSourceCards() {",
             )
@@ -3344,7 +3781,11 @@ chip.textContent = "No tables yet";
 const acts = new El("ds-src__acts");
 const bodyEl = new El("ds-src__body");
 bodyEl.hidden = false;  // the admin has this card expanded
-card.kids = {{".ds-src__head": head, ":scope > .ds-pipe": strip}};
+// The next-step row the card was drawn with — "these tables are in no data
+// package". The refresh has to be able to REMOVE it, because the mutation
+// that triggered the refresh is usually the very act that finished the chain.
+const nextRow = new El("ds-next");
+card.kids = {{".ds-src__head": head, ":scope > .ds-pipe": strip, ":scope > .ds-next": nextRow}};
 head.kids = {{".ds-src__health": chip, ".ds-src__acts": acts}};
 const breakRepaint = {break_repaint_js};
 global.document = {{
@@ -3379,6 +3820,8 @@ global.fetch = async (url, opts) => {{
     stripWritten: strip.written,
     stripRemoved: strip.removed,
     stripsInserted: head.inserted,
+    nextWritten: nextRow.written,
+    nextRemoved: nextRow.removed,
     chipText: chip.textContent,
     chipClass: chip.className,
     chipRemoved: chip.removed,
@@ -3459,5 +3902,174 @@ global.fetch = async (url, opts) => {{
         out = self._run(fresh=self._FRESH, concurrent=3)
         assert out["fetchCount"] == 1
         assert out["results"] == [True, True, True]
+
+    def test_a_finished_chain_takes_the_next_step_row_with_it(self):
+        """The card was drawn with "these tables are in no data package". The
+        wizard that just bundled and shared them is what triggered this
+        refresh, so the row has to GO — a next step still demanding the move
+        the admin just made is worse than no next step at all."""
+        out = self._run(fresh=self._FRESH)
+        assert out["nextRemoved"] is True
+        assert out["nextWritten"] is None
+
+    def test_a_still_open_chain_gets_the_fresh_next_step(self):
+        fresh = {
+            "c1": {
+                "tables": {"count": 3, "unlinked": 0, "basis": "connection", "distributable": 3},
+                "sync": {"last_sync": None, "age_minutes": None, "errors": 0},
+                "semantic": {"token": True, "metrics": 0, "terms": 0},
+                "feeds": {
+                    "packages": 1,
+                    "groups": 0,
+                    "people": 0,
+                    "next": {
+                        "key": "share",
+                        "text": "Bundled into 1 data package, shared with no group.",
+                        "cta": "Share it with a group",
+                        "href": "/admin/data-packages",
+                        "verify_cta": "Preview someone's Library",
+                        "verify_href": "/admin/access?lens=simulate",
+                    },
+                },
+            }
+        }
+        out = self._run(fresh=fresh)
+        assert out["nextRemoved"] is False
+        assert "Share it with a group" in (out["nextWritten"] or "")
+        assert "/admin/access?lens=simulate" in (out["nextWritten"] or "")
         # And the marker is cleared, so the NEXT mutation still gets a fresh read.
         assert out["inFlightCleared"] is True
+
+
+class TestSharePointShardPlanControl:
+    """ "Parallel crawl — preview shards" (2026-09-03 auto-parallel-crawl
+    design §4.7) — the read-only front end for `GET .../shard-plan`, the
+    successor to the "Split this site" control below. Same "plain markup
+    assertion is enough" posture: the endpoint itself is covered by
+    tests/test_admin_sharepoint.py."""
+
+    def test_the_page_ships_the_shard_plan_control_and_its_handlers(self, seeded_app, monkeypatch):
+        from cryptography.fernet import Fernet
+
+        from app.secrets_vault import _reset_ephemeral_key_for_tests
+
+        monkeypatch.setenv("AGNES_VAULT_KEY", Fernet.generate_key().decode())
+        _reset_ephemeral_key_for_tests()
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        c.cookies.set("access_token", token)
+        try:
+            resp = c.get("/admin/data-sources", headers={"Accept": "text/html"})
+        finally:
+            c.cookies.clear()
+            _reset_ephemeral_key_for_tests()
+        assert resp.status_code == 200, resp.text
+        body = resp.text
+
+        assert "js/admin/data_sources_page.js" in body
+        from pathlib import Path
+
+        script = Path("app/web/static/js/admin/data_sources_page.js").read_text(encoding="utf-8")
+        assert "Parallel crawl" in script
+        assert "toggleSpShardPlanRow" in script
+        assert "previewShardPlan" in script
+        assert "/shard-plan" in script
+        # The legacy manual-split control is kept, reachable only via an
+        # explicit deprecated link — never deleted, its own endpoints still
+        # exist.
+        assert "Legacy: create N connections manually (deprecated)" in script
+        assert "toggleSpSplitRow" in script
+
+
+class TestSharePointSplitControl:
+    """The "Split this site" control on the SharePoint connection card (see
+    `app.api.admin_sharepoint` split-plan/splits) — **deprecated**, kept as
+    the migration-window escape hatch behind the "Legacy" link the
+    shard-plan control above renders. The page's JS renders it directly
+    into the HTML response, so a plain markup assertion is enough; the
+    endpoints themselves are covered by tests/test_admin_sharepoint.py."""
+
+    def test_the_page_ships_the_split_control_and_its_handlers(self, seeded_app, monkeypatch):
+        from cryptography.fernet import Fernet
+
+        from app.secrets_vault import _reset_ephemeral_key_for_tests
+
+        monkeypatch.setenv("AGNES_VAULT_KEY", Fernet.generate_key().decode())
+        _reset_ephemeral_key_for_tests()
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        c.cookies.set("access_token", token)
+        try:
+            resp = c.get("/admin/data-sources", headers={"Accept": "text/html"})
+        finally:
+            c.cookies.clear()
+            _reset_ephemeral_key_for_tests()
+        assert resp.status_code == 200, resp.text
+        body = resp.text
+
+        # The card is drawn by the page's externalized script (#2146 moved
+        # the inline JS out) and styled by its externalized stylesheet (the
+        # three inline <style> blocks moved into css/ds_page.css so the
+        # data-package builder can load them too). The page must load both,
+        # and each must carry its half of the control. Asserting the CSS
+        # SELECTOR against the response text is what this line used to do,
+        # which only ever proved the stylesheet mentioned the class — and
+        # silently stopped proving even that once the stylesheet moved out.
+        assert "js/admin/data_sources_page.js" in body
+        assert "css/ds_page.css" in body
+        from pathlib import Path
+
+        assert ".ds-sp-split-table" in Path("app/web/static/css/ds_page.css").read_text(encoding="utf-8")
+
+        script = Path("app/web/static/js/admin/data_sources_page.js").read_text(encoding="utf-8")
+        # No standalone "Split this site…" button remains — it is reachable
+        # only via the shard-plan control's "Legacy" link now.
+        assert "toggleSpSplitRow" in script
+        # The preview/apply calls, hitting the exact endpoints this feature adds.
+        assert "previewSpSplit" in script
+        assert "applySpSplit" in script
+        assert "/split-plan?" in script
+        assert "/splits`" in script
+        # Collection-routing controls (default shared, explicit target, or
+        # the old per-folder opt-in) — same three options the server's
+        # SplitApplyBody accepts.
+        assert "ds-sp-split-collection-id-" in script
+        assert "ds-sp-split-collection-name-" in script
+        assert "ds-sp-split-per-folder-" in script
+        assert "target_collection_id" in script
+        assert "per_folder_collections" in script
+
+    def test_the_page_ships_the_consolidate_drawer_with_a_sibling_checkbox(self, seeded_app, monkeypatch):
+        """ "Consolidate collections…" opens an inline drawer (mirrors the
+        Split row) with a REAL checkbox for `include_split_siblings` —
+        never a `window.prompt`/`window.confirm` flow, which cannot host
+        one."""
+        from cryptography.fernet import Fernet
+
+        from app.secrets_vault import _reset_ephemeral_key_for_tests
+
+        monkeypatch.setenv("AGNES_VAULT_KEY", Fernet.generate_key().decode())
+        _reset_ephemeral_key_for_tests()
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        c.cookies.set("access_token", token)
+        try:
+            resp = c.get("/admin/data-sources", headers={"Accept": "text/html"})
+        finally:
+            c.cookies.clear()
+            _reset_ephemeral_key_for_tests()
+        assert resp.status_code == 200, resp.text
+
+        from pathlib import Path
+
+        script = Path("app/web/static/js/admin/data_sources_page.js").read_text(encoding="utf-8")
+        assert "toggleSpConsolidateRow" in script
+        assert "previewSpConsolidate" in script
+        assert "applySpConsolidate" in script
+        assert 'id="ds-sp-consolidate-row-${row.id}"' in script
+        assert 'id="ds-sp-consolidate-siblings-${row.id}"' in script
+        assert 'type="checkbox" id="ds-sp-consolidate-siblings-' in script
+        assert "include_split_siblings" in script
+        # The overflow-menu item opens the drawer, never the old prompt flow.
+        assert "toggleSpConsolidateRow('${id}')" in script
+        assert "consolidateSpCollections" not in script

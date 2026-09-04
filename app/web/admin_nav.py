@@ -183,8 +183,15 @@ ADMIN_NAV_SECTIONS: list[dict] = [
         # sidebar that lit nothing — "you are nowhere" on a page one click deep.
         # It lights Data and renders Data's strip with NO tab active, which is
         # the truth: you are in this section, on none of its four lenses, and
-        # every one of them is one click away.
-        "match": ["/admin/sync"],
+        # every one of them is one click away. `/admin/semantic-layer` is here
+        # for the same reason now that it has no tab of its own (see the
+        # "Semantic layer health" comment below) — it's still reachable from a
+        # source card's pipeline cell, just not part of the strip.
+        # `/admin/extraction` (2026-09-02) is the same pattern once more: the
+        # SharePoint extraction FLEET dashboard, reached from a source card's
+        # extraction status, not a lens an admin picks among Sources/Tables/
+        # Packages — see ADMIN_NAV_OFFNAV below for the full reasoning.
+        "match": ["/admin/sync", "/admin/semantic-layer", "/admin/extraction"],
         # ── The one strip that is a PIPELINE, not a set of categories ──────
         # Sources, Tables and Packages are not three kinds of thing you choose
         # between; they are one flow seen from three places — where data comes
@@ -240,32 +247,21 @@ ADMIN_NAV_SECTIONS: list[dict] = [
                 "match": ["/admin/data-packages"],
                 "chain": True,
             },
-            # Semantic layer EARNS a tab where Sync does not, and the reason is
-            # what each thing is. A sync run is per-source and per-table — the
-            # source card's own SYNC cell is where it belongs, and the only
-            # cross-source question ("what failed today") is Activity's. The
-            # metric/glossary registry is the opposite: `metric_definitions` is
-            # ONE instance-wide table that several Keboola projects write into
-            # under their own `source_ref` (connectors/keboola/semantic_layer.py
-            # ::sync_semantic_layer), so a per-source panel structurally cannot
-            # show the thing that matters most — the same metric defined in two
-            # projects. Its singularity is the product promise (`agnes catalog
-            # --metrics` must give ONE answer for "what is MRR"), so it gets a
-            # surface of its own. Syncing stays per project.
-            {
-                "label": "Semantic layer health",
-                "href": "/admin/semantic-layer",
-                "match": ["/admin/semantic-layer"],
-                # No `chain` — see the block comment above the tabs list.
-            },
-            # Semantic layer health (above) answers "is what exists complete and
-            # healthy" — coverage/health/mute/feedback over the DOCUMENTS
-            # already imported. This tab answers the question upstream of
-            # that: where a document comes from in the first place —
-            # every `semantic_source` row, any kind (git/upload/connection)
-            # and any adapter (Keboola, Snowflake, Databricks), with its own
-            # sync-now action. Same "no chain" reasoning: instance-wide, not
-            # a pipeline stage.
+            # Semantic layer health (coverage/health/mute/feedback over the
+            # DOCUMENTS already imported) is NOT a tab here for now — the
+            # page is real and stays reachable (source cards still link to
+            # it, `/admin/semantic-layer` still renders), but the feature
+            # behind it is unfinished (tag-based checks only, coverage is a
+            # manual admin read with no automated scoring yet, no
+            # notifications) and isn't part of the demoed surface. Restore
+            # the tab once that work lands; until then keep it out of the
+            # strip so it doesn't read as a finished destination.
+            #
+            # This tab answers where a document comes from in the first
+            # place — every `semantic_source` row, any kind (git/upload/
+            # connection) and any adapter (Keboola, Snowflake, Databricks),
+            # with its own sync-now action. Same "no chain" reasoning as
+            # Semantic layer health: instance-wide, not a pipeline stage.
             {
                 "label": "Semantic sources",
                 "href": "/admin/semantic-sources",
@@ -353,6 +349,9 @@ ADMIN_NAV_SECTIONS: list[dict] = [
             # docstring). `match` stays the bare prefix: Submissions and Store
             # lint are their own rows below and win on longest-prefix, so the
             # hub never lights while you stand on one of them.
+            # "Submissions", not "Flea submissions": the trust vocabulary
+            # moved to Organization/Verified/Community and the seam spec's
+            # decision 8 retires the WORD flea, never the URLs.
             {
                 "label": "Store moderation",
                 "href": "/admin/store",
@@ -360,20 +359,11 @@ ADMIN_NAV_SECTIONS: list[dict] = [
                 "match": ["/admin/store"],
                 "when": "can_store_moderation",
             },
-            # "Submissions", not "Flea submissions": the trust vocabulary
-            # moved to Organization/Verified/Community and the seam spec's
-            # decision 8 retires the WORD flea, never the URLs.
             {
                 "label": "Submissions",
                 "href": "/admin/store/submissions",
                 "gloss": "Plugins, skills and agents awaiting review",
                 "match": ["/admin/store/submissions"],
-            },
-            {
-                "label": "Store lint",
-                "href": "/admin/store/lint",
-                "gloss": "Advisory quality findings on skills",
-                "match": ["/admin/store/lint"],
             },
             # Conditional too, on the SAME flag as the Studio row below: the
             # route reads `get_studio_enabled()` and redirects home when it is
@@ -451,23 +441,25 @@ ADMIN_NAV_SECTIONS: list[dict] = [
                 "gloss": "Edit instance.yaml from the browser",
                 "match": ["/admin/server-config"],
             },
-            {
-                "label": "Database backend",
-                "href": "/admin/database",
-                "gloss": "Move app state between DuckDB and Postgres",
-                "match": ["/admin/database"],
-            },
-            {
-                "label": "Initial workspace",
-                "href": "/admin/initial-workspace",
-                "gloss": "Git repo seeding analyst workspaces",
-                "match": ["/admin/initial-workspace"],
-            },
+            # ONE row for what were two: the managed prompts and the template
+            # repo they bind to. They were never independent — the Prompts page
+            # had to ask `initial_workspace.is_configured()` before it could
+            # offer git mode at all, and each page carried a "go do that part
+            # over there" link at the other (Initial workspace's provenance
+            # table sent you to Prompts to change a binding; Prompts' git pane
+            # sent you to register a repo). Two pages for one job, with a
+            # round trip in the middle. `/admin/initial-workspace` 308s onto
+            # this page's repo tab, so the old row's bookmarks still land.
             {
                 "label": "Prompts",
                 "href": "/admin/prompts",
-                "gloss": "The install prompt and workspace CLAUDE.md",
-                "match": ["/admin/prompts", "/admin/agent-prompt", "/admin/workspace-prompt"],
+                "gloss": "Managed prompts and the repo they bind to",
+                "match": [
+                    "/admin/prompts",
+                    "/admin/agent-prompt",
+                    "/admin/workspace-prompt",
+                    "/admin/initial-workspace",
+                ],
             },
             {
                 "label": "Instance secrets",
@@ -572,6 +564,65 @@ ADMIN_NAV_OFFNAV: list[dict] = [
         # you MANAGE, and this is a log you CHECK — and the cross-source version
         # of that question ("what failed today") is what /admin/activity is.
         "reached_from": "the SYNC cell on each source card (/admin/data-sources)",
+    },
+    {
+        "href": "/admin/extraction",
+        # The SharePoint extraction FLEET dashboard (2026-09-02): one row per
+        # connection for an operator running several crawl + facts passes at
+        # once. Same off-nav shape as /admin/sync — a status view an operator
+        # is SENT to, not a lens they pick among Sources/Tables/Packages.
+        # The door is the "All connections" button in every SharePoint
+        # source card's Run row on /admin/data-sources — next to "Run
+        # history", because "how is THIS one doing" and "how are ALL of them
+        # doing" are the same question asked at two widths.
+        #
+        # This entry first shipped with a "pending" door and no link
+        # anywhere, which left the page reachable only by typed URL —
+        # exactly what this inventory exists to prevent. `tests/
+        # test_web_admin_nav.py` now requires every off-nav href to be a
+        # literal `href` in some template, so a promise no longer passes
+        # as a door.
+        "reached_from": 'the "All connections" button in each source card\'s Run row (/admin/data-sources)',
+    },
+    {
+        "href": "/admin/semantic-layer",
+        # Pulled off the Data tab strip on purpose: the feature (coverage,
+        # health, mute, feedback) is unfinished — tag-based checks only, no
+        # automated coverage scoring yet, no notifications — so it isn't part
+        # of the surface admins are meant to discover right now. The page
+        # itself still works and admins who know it exists still reach it: a
+        # source card's semantic cell on /admin/data-sources links here, and
+        # so does the "Manage this model" door on a semantic model's own page.
+        "reached_from": "the semantic cell on a source card (/admin/data-sources) "
+        "and the model detail page's manage door",
+    },
+    {
+        "href": "/admin/database",
+        # A once-per-instance operation that had a permanent row. Every door it
+        # needs already exists and each one opens exactly when the question does:
+        # the command palette (`g d`), and — better — the pages that TELL you the
+        # backend is the problem. `ontology_builder.html` says "this instance is
+        # still on DuckDB … See Database to migrate"; `admin_semantic_layer.html`
+        # links here from four PG-only panels. A migration surface reached from
+        # the page that just refused to work is worth more than a row you scroll
+        # past for months.
+        "reached_from": "the command palette (`g d`), the DuckDB-only notices on "
+        "/admin/ontology, and the PG-only panels on /admin/semantic-layer",
+    },
+    {
+        "href": "/admin/store/lint",
+        # Advisory findings on skills — a report you pull while reviewing, not a
+        # place you go. Its sidebar row was its ONLY door (nothing else in the
+        # app linked it), so the row could not just be dropped; the Submissions
+        # queue now carries the link, which is where a reviewer already is when
+        # the findings matter.
+        #
+        # Submissions and NOT the moderation hub (/admin/store), the more
+        # obvious parent: that page is off by default
+        # (`features.store_moderation_enabled`) and redirects home when it is,
+        # so hanging lint's only door there would have orphaned it on a default
+        # instance. Submissions is plain `require_admin`, always reachable.
+        "reached_from": "the toolbar on /admin/store/submissions",
     },
 ]
 

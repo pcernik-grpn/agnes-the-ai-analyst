@@ -35,6 +35,7 @@ it. What this suite pins:
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 TEMPLATES = Path("app/web/templates")
@@ -386,16 +387,25 @@ class TestThePickerKeptWhatTheRetiredDrawerHad:
         # Multi-select: "the Keboola tables AND the BigQuery ones" is one
         # question, not two visits.
         assert "matchesFilters" in src
-        assert "list.splice(at, 1)" in src, "a chosen facet must be un-choosable"
+        assert "flist.splice(fat, 1)" in src, "a chosen facet must be un-choosable"
 
     def test_a_facet_group_says_what_it_is_a_group_of(self) -> None:
         """`internal` is a value of BOTH vocabularies — a source_type and a
-        query_mode — so an unlabelled strip renders the same chip twice, a line
-        apart, meaning two different things."""
+        query_mode — so an unlabelled list renders the same option twice,
+        meaning two different things.
+
+        The filter is the Library's now (a Filter button, a faceted menu, a
+        chip row) rather than a flat strip of pills, so the heading is the
+        shared `.fbar-menu__title` and the chip names its category. The rule is
+        unchanged: neither surface may show a bare value.
+        """
         src = COMPONENT.read_text(encoding="utf-8")
-        assert "pdw-pickctl__k" in src
-        css = (STATIC / "css" / "package_drawer.css").read_text(encoding="utf-8")
-        assert ".pdw-pickctl__k" in css
+        assert "fbar-menu__title" in src
+        assert "facetGroupHtml('source_type', 'Source')" in src
+        assert "facetGroupHtml('query_mode', 'Query mode')" in src
+        # The chip carries the category too — "Source: keboola, jira".
+        assert "'Source', pickerFacets.source_type.join" in src
+        assert "'Query mode', pickerFacets.query_mode.join" in src
 
     def test_the_in_no_package_toggle_reads_a_server_flag(self) -> None:
         """Membership spans every OTHER package, so the client cannot derive
@@ -424,7 +434,7 @@ class TestThePickerKeptWhatTheRetiredDrawerHad:
         """On a fresh instance every row is unpackaged, and a control that
         hides nothing is a control that lies."""
         src = COMPONENT.read_text(encoding="utf-8")
-        assert "unpackagedN < (st ? st.registry.length : 0)" in src
+        assert "un < (st ? st.registry.length : 0)" in src
 
     def test_the_sorts_came_across_including_the_stale_first_one(self) -> None:
         src = COMPONENT.read_text(encoding="utf-8")
@@ -444,28 +454,97 @@ class TestThePickerKeptWhatTheRetiredDrawerHad:
         assert "(o.controls || '')" in shell, "the slot must be optional, not required"
 
 
-class TestTheGridsTableStaysInsideThePage:
-    """The five-column package table outgrows its column below ~1400px.
+def _decommented() -> str:
+    """The template's <style> text with CSS comments stripped.
 
-    `.data-table-wrap` is a bare <div> that nine admin templates wrap a table
-    in, and no sheet defines it — so when the table's ~1105px of min-content
-    exceeded the available width it simply ran out of the page: "Shared with"
-    and "Actions" off the right edge, and the whole document scrolling
-    sideways. The wrapper is named for containing exactly this.
+    Not cosmetic: the narrow block's own comment explains why `display: none`
+    is wrong there, and a naive substring check reads that prose as the
+    declaration it warns about.
+    """
+    src = (TEMPLATES / "admin_data_packages.html").read_text(encoding="utf-8")
+    return re.sub(r"/\*.*?\*/", "", src, flags=re.DOTALL)
+
+
+def _narrow_block() -> str:
+    """The `@container` block that drops the Category column."""
+    src = _decommented()
+    start = src.index("@container adp-table")
+    return src[start : src.index("\n  }", start)]
+
+
+class TestTheGridsTableStaysInsideThePage:
+    """The five-column package table has to FIT its column, not just scroll.
+
+    `.data-table-wrap` scrolls its own overflow (style-custom.css, #1707 A6),
+    and that alone was not enough here. `.adp-row__desc` is `nowrap` +
+    ellipsis, and under `table-layout: auto` a nowrap cell never ellipsises —
+    the browser widens the COLUMN to the whole sentence instead. Measured at
+    1440px: 1173px for the Package column, 1627px of table inside a 1204px
+    box, "Shared with" cut in half and the Edit button 400px past the right
+    edge, behind a nested scrollbar macOS does not paint until you are
+    already scrolling.
+
+    `table-layout: fixed` turns the ellipsis on and makes the <colgroup>
+    binding — the same fix /admin/users, /admin/tables and the Library table
+    already carry — with a `min-width` floor under it and the Actions column
+    pinned for the widths below that floor.
     """
 
-    def test_the_wrapper_scrolls_its_own_overflow(self) -> None:
+    def test_the_table_is_sized_by_its_colgroup_not_by_its_longest_sentence(
+        self,
+    ) -> None:
         src = (TEMPLATES / "admin_data_packages.html").read_text(encoding="utf-8")
-        assert ".data-table-wrap { overflow-x: auto; }" in src
+        assert "table-layout: fixed" in src
+        # The floor: fixed layout divides whatever width it is given, so
+        # without one a narrow window shrinks Actions below its own button
+        # instead of handing the overflow to the wrap. 720px is the FOUR
+        # column floor — see the responsive test below for why five is not
+        # what has to fit.
+        assert "min-width: 720px" in src
 
-    def test_the_narrow_columns_keep_their_floor(self) -> None:
-        """The two cells that were cramped: a nowrap chip rendered narrower
-        than its own text, and a category on two lines."""
+    def test_a_narrow_table_drops_a_column_instead_of_scrolling(self) -> None:
+        """Every cue for a cut table is a consolation prize. The reader came
+        to read an index, not to scroll one sideways, so below the width where
+        five columns fit the table gives up its least load-bearing column and
+        goes on fitting — Category, the only decorative column here, which
+        survives as a filter above the table and in full on the package's own
+        page.
+
+        A CONTAINER query, because what decides this is the width of the
+        column the table sits in — the viewport minus a 200px sidebar that
+        itself disappears at 820px. A viewport breakpoint would be a guess at
+        that arithmetic, wrong on both sides of the sidebar's collapse."""
         src = (TEMPLATES / "admin_data_packages.html").read_text(encoding="utf-8")
-        assert "min-width: 92px" in src and "min-width: 148px" in src
-        # Scoped to a 5-column row, so the 3-column Memory Domains table below
-        # — same classes, no Tables or Category column — is untouched.
-        assert "tr:has(> :nth-child(5))" in src
+        assert "container-type: inline-size" in src
+        assert "@container adp-table (max-width: 900px)" in src
+
+    def test_the_dropped_column_collapses_rather_than_leaves_the_row(self) -> None:
+        """`display: none` on the cells shifts every cell after them one
+        column left — the <colgroup> maps by position, so Shared with
+        inherited the zeroed column (measured at 0px) and Actions took its
+        32%. The cells have to stay in flow and give up what occupies space
+        instead."""
+        narrow = _narrow_block()
+        assert "display: none" not in narrow.split(".adp-cell--cat > *")[0], (
+            "the collapsed column uses `display: none` on its cells, which "
+            "re-maps every column after it"
+        )
+        assert "font-size: 0" in narrow, (
+            "the <th>'s label is a bare text node — `> * { display: none }` "
+            "cannot reach it, so the header would still print 'Category'"
+        )
+
+    def test_both_width_sets_sum_to_a_hundred(self) -> None:
+        """Under `table-layout: fixed` a colgroup summing to less than 100
+        does NOT scale back up in proportion: Chrome hands the whole
+        remainder to the LAST column — measured as 206px of Actions beside a
+        107px 'Shared with' reading 'Not sh…'."""
+        src = _decommented()
+        wide = re.findall(r"\.adp-table \.adp-col--\w+ \{ width: (\d+)%", src)
+        assert wide and sum(int(v) for v in wide[:5]) == 100, f"five-column set: {wide[:5]}"
+        narrow = re.findall(r"width: (\d+)%", _narrow_block())
+        # Category's own `width: 0` carries no unit and is excluded.
+        assert narrow and sum(int(v) for v in narrow) == 100, f"four-column set: {narrow}"
 
     def test_the_chip_is_capped_by_its_cell_not_by_a_fraction_of_it(self) -> None:
         """`max-width: 60%` of a ~100px column was 41px of pill around 58px of

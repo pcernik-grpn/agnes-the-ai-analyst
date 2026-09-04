@@ -393,18 +393,16 @@ def test_boot_seed_clears_a_stale_sync_error(tmp_path, monkeypatch):
 
     seed_builtin_marketplace()
     # The pre-fix wound: a manual sync attempt stamped its failure.
-    marketplace_registry_repo().update_sync_status(
-        BUILTIN_MARKETPLACE_SLUG, error="fatal: 'builtin' helper not found"
+    marketplace_registry_repo().update_sync_status(BUILTIN_MARKETPLACE_SLUG, error="fatal: 'builtin' helper not found")
+    assert marketplace_registry_repo().get(BUILTIN_MARKETPLACE_SLUG)["last_error"] is not None, (
+        "precondition: the stale stamp is in place"
     )
-    assert (
-        marketplace_registry_repo().get(BUILTIN_MARKETPLACE_SLUG)["last_error"] is not None
-    ), "precondition: the stale stamp is in place"
 
     seed_builtin_marketplace()
 
-    assert (
-        marketplace_registry_repo().get(BUILTIN_MARKETPLACE_SLUG)["last_error"] is None
-    ), "boot re-seed must clear the stale sync error it makes moot"
+    assert marketplace_registry_repo().get(BUILTIN_MARKETPLACE_SLUG)["last_error"] is None, (
+        "boot re-seed must clear the stale sync error it makes moot"
+    )
     conn.close()
 
 
@@ -427,9 +425,9 @@ def test_contributed_registry_row_seed_clears_a_stale_sync_error(tmp_path, monke
 
     _ensure_registry_row(registered_by="test")
 
-    assert (
-        marketplace_registry_repo().get(CONTRIBUTED_MARKETPLACE_SLUG)["last_error"] is None
-    ), "re-asserting the contributed registry row must clear the stale sync error"
+    assert marketplace_registry_repo().get(CONTRIBUTED_MARKETPLACE_SLUG)["last_error"] is None, (
+        "re-asserting the contributed registry row must clear the stale sync error"
+    )
     conn.close()
 
 
@@ -445,6 +443,215 @@ def test_admin_table_shows_no_sync_state_for_builtin_rows():
         "the sync-state cell must branch on m.is_builtin — a bundled row "
         "otherwise shows 'failed'/'never' for a sync that can never run"
     )
+
+
+def _sync_schedule_helper() -> str:
+    """The body of `syncScheduleFacts`, the single place both the Details and
+    the Edit modal read the sync facts from."""
+    template = Path("app/web/templates/admin_marketplaces.html").read_text(encoding="utf-8")
+    return template.split("function syncScheduleFacts(m)")[1].split("\n}")[0]
+
+
+def test_sync_facts_branch_on_is_builtin_before_promising_a_schedule():
+    """Neither modal may describe a sync the server refuses. `sync_marketplace`
+    opens with `if spec.get("is_builtin"): raise MarketplaceNotSyncable`, so a
+    bundled marketplace enters neither sync path — promising it a nightly run,
+    and pointing at a `Sync now` the row does not render for it, describes
+    something that cannot happen.
+
+    The branch moved out of openDetails into the shared helper when the Edit
+    modal grew the same field (#1956 item 15); pinning it here rather than in
+    one caller is the point — a second surface must not be able to state the
+    schedule without going through this decision.
+
+    Source inspection, like its row-cell sibling above: this pins that the
+    branch EXISTS, not what the rendered string looks like."""
+    helper = _sync_schedule_helper()
+    assert "is_builtin" in helper, (
+        "syncScheduleFacts must branch on m.is_builtin before it reports a "
+        "cadence — a bundled marketplace never enters the sync path"
+    )
+    assert "syncable" in helper, (
+        "the bundled branch must be reported to callers as a flag they have "
+        "to consult, not left for each surface to re-derive"
+    )
+
+
+def test_sync_facts_call_a_failed_attempt_an_attempt():
+    """`last_synced_at` is stamped on FAILURE as well as success: both error
+    branches in `src/marketplace.py` call `update_sync_status(..., synced_at=
+    now, error=str(e))`. So the timestamp alone means "last attempted", and
+    labelling it "Last synced" tells an admin a failed refresh worked.
+    `last_error` is what separates the two — set on failure, cleared when a
+    commit_sha arrives clean — and the table row already reads it."""
+    helper = _sync_schedule_helper()
+    assert "last_error" in helper, (
+        "syncScheduleFacts must consult m.last_error before calling the "
+        "timestamp 'Last synced' — it is stamped on failed attempts too"
+    )
+    assert "Last synced" in helper and "Last attempt" in helper, (
+        "both wordings must exist: a success says 'Last synced', a failure "
+        "says 'Last attempt ... failed'"
+    )
+
+
+def test_failed_attempt_hands_the_error_to_a_tooltip_not_the_sentence():
+    """A real clone failure is four lines long and carries the server's
+    absolute DATA_DIR path ("git clone failed: Cloning into '/data/...'
+    remote: Repository not found..."). Inlined, it buried the two facts the
+    note exists to state — the cadence and the next run — under the reason
+    for one past failure.
+
+    So the sentence names the failure and the full text moves to a `title`,
+    which is what the table row's `.mp-err-badge` already does with the same
+    string. This pins the split: the error must reach a title attribute, and
+    must NOT be concatenated into the visible sentence."""
+    helper = _sync_schedule_helper()
+    failure = helper.split("Last attempt")[1].split("Last synced")[0]
+    assert 'title="${esc(m.last_error)}"' in failure, (
+        "the full error belongs in a title attribute, hoverable like the "
+        "table row's badge"
+    )
+    assert "failed: ${esc(m.last_error)}" not in helper, (
+        "the error must not be inlined into the visible sentence — it runs "
+        "to several lines and buries the cadence and next run"
+    )
+
+
+def test_next_nightly_sync_rolls_forward_on_the_boundary():
+    """At exactly 03:00:00 UTC the next run is TOMORROW's, not the instant
+    that has just arrived — so the roll-forward comparison has to be `<=`,
+    not `<`. With `<` the panel would show a "next" time equal to now for a
+    whole second, which reads as "it is happening" rather than "it just did".
+
+    Source inspection: this pins the comparison, not the arithmetic. The date
+    math itself is the browser's `Date.UTC`, which is not ours to test."""
+    template = Path("app/web/templates/admin_marketplaces.html").read_text(encoding="utf-8")
+    fn = template.split("function nextNightlySync()")[1].split("\n}")[0]
+    assert "next <= now" in fn, (
+        "the roll-forward must use <=, so exactly 03:00:00 UTC advances to "
+        "the following day instead of reporting the current instant"
+    )
+    assert "3, 0, 0" in fn, "the hour must stay pinned to the scheduler's 03:00 UTC row"
+
+
+def test_edit_modal_states_the_sync_schedule():
+    """#1956 item 15 anchors its complaint on the EDIT modal: "Marketplaces >
+    Edit covers name/URL/branch/pin/curator/token, but the sync cadence is
+    neither shown nor configurable, and the next scheduled sync time is not
+    displayed anywhere." #2042 answered the visibility half in the Details
+    modal — the surface an admin opens to ask why a marketplace looks stale,
+    not the one they open to change how it is fetched — so the path the issue
+    names still ended in silence. This pins that Edit states it too."""
+    template = Path("app/web/templates/admin_marketplaces.html").read_text(encoding="utf-8")
+    edit_modal = template.split('id="edit-modal"')[1].split("<!-- Sync result modal -->")[0]
+    assert 'id="edit-sync-schedule"' in edit_modal, (
+        "the Edit modal must state the sync schedule — that is the surface "
+        "#1956 item 15 names"
+    )
+    assert 'id="edit-sync-help"' in edit_modal, (
+        "the next run and last-sync status belong with the field"
+    )
+
+
+def test_edit_modal_sync_schedule_is_not_editable_and_never_submitted():
+    """The cadence is one fixed `daily 03:00` row in
+    services/scheduler/__main__.py with no per-marketplace override, so an
+    editable-looking field would promise a knob that does not exist — the
+    other half of item 15, still undone.
+
+    Two things must hold, and the second is the one that would bite: the
+    input is `disabled`, and openEdit's PATCH payload never reads it. A
+    stray `edit-sync-schedule` in the payload would send a made-up field to
+    an endpoint that does not accept one."""
+    template = Path("app/web/templates/admin_marketplaces.html").read_text(encoding="utf-8")
+    edit_modal = template.split('id="edit-modal"')[1].split("<!-- Sync result modal -->")[0]
+    field = edit_modal.split('id="edit-sync-schedule"')[1].split(">")[0]
+    assert "disabled" in field, (
+        "the sync-schedule input must be disabled until the cadence is "
+        "actually configurable"
+    )
+
+    payload = template.split("const payload = {")[1].split("};")[0]
+    assert "edit-sync-schedule" not in payload, (
+        "the read-only schedule must never be read into the PATCH payload"
+    )
+
+
+def test_both_modals_read_the_sync_schedule_from_one_helper():
+    """Details answers "why does this look stale", Edit answers "can I change
+    how this is fetched" — different questions, the same facts, and two
+    copies of the is_builtin / last_error branching would drift apart on the
+    first edit to either. Both callers must go through syncScheduleFacts."""
+    template = Path("app/web/templates/admin_marketplaces.html").read_text(encoding="utf-8")
+    assert template.count("syncScheduleFacts(m)") == 3, (
+        "expected exactly three occurrences — the definition plus one call "
+        "in openDetails and one in openEdit; a fourth means a surface grew "
+        "its own copy, a second means one stopped using it"
+    )
+    open_edit = template.split("function openEdit(id)")[1].split("\nfunction ")[0]
+    assert "syncScheduleFacts(m)" in open_edit, "openEdit must read the shared helper"
+    open_details = template.split("async function openDetails(")[1].split("\nfunction ")[0]
+    assert "syncScheduleFacts(m)" in open_details, "openDetails must read the shared helper"
+
+
+def test_plugin_control_presents_as_enabled_toggle_checked_when_not_disabled():
+    """#1956 item 14b: the old "Disabled" toggle was semantically inverted —
+    checked meant admin_disabled=true, so switching it ON looked like it
+    should turn something *on* while it actually hid the plugin. #1913's
+    reporter mistook a checked (= hidden) toggle for "still active". The
+    control now presents as "Enabled": checked means the plugin is available
+    to users (admin_disabled=false); the underlying admin_disabled write is
+    unchanged, only the rendered semantics flip."""
+    template = Path("app/web/templates/admin_marketplaces.html").read_text(encoding="utf-8")
+    assert "plugin-enabled-toggle" in template, "toggle wrapper class must be renamed off the inverted 'disable' name"
+    assert ">Enabled<" in template
+    assert ">Disabled<" not in template, "the inverted 'Disabled' caption must not remain anywhere in the markup"
+    assert '${isDisabled ? "" : "checked"}' in template, (
+        "checkbox must be checked when isDisabled is false (Enabled == ON)"
+    )
+    assert '${isDisabled ? "checked" : ""}' not in template, "the old inverted checked-binding must be gone"
+
+
+def test_plugin_controls_share_one_wrapper_for_visual_consistency():
+    """#1956 item 14c: the Enabled toggle and the system-mark control used to
+    sit loose in the row as two unrelated widgets (toggle vs. bare button).
+    They now share a common flex wrapper so they read as a matched pair of
+    controls rather than a random mix, and the system button wears the same
+    --ds-radius-btn every other labelled button in the app uses (it
+    previously hardcoded a bespoke 6px)."""
+    template = Path("app/web/templates/admin_marketplaces.html").read_text(encoding="utf-8")
+    assert "plugin-controls" in template
+    assert "border-radius: var(--ds-radius-btn)" in template.split(".plugin-system-btn {")[1].split("}")[0]
+
+
+def test_plugin_system_control_carries_a_discoverable_explanation():
+    """#1956 item 14a (reporter kbcMichal): "Unmark system" had no
+    explanation of what system-marking actually does. A hover-only `title`
+    on the button was already there and evidently was not enough — this adds
+    a persistent, always-visible help affordance next to the control whose
+    tooltip explains the *concept* (mandatory-for-everyone fanout) rather
+    than only the next click's side effect, and it reads the same regardless
+    of the plugin's current is_system value."""
+    template = Path("app/web/templates/admin_marketplaces.html").read_text(encoding="utf-8")
+    assert "plugin-help-icon" in template
+    help_text = template.split("sysHelpText =")[1].split(";")[0]
+    assert "mandatory" in help_text
+    assert "every" in help_text
+
+
+def test_disabled_pill_tooltip_calls_out_deprecation_auto_hide():
+    """#1956 item 14d: keep the DISABLED pill (it renders a real curator-level
+    state) but its tooltip must mention that a plugin marked `deprecated`
+    upstream (src/marketplace.py's sync-time auto-disable) is re-hidden on
+    every sync — otherwise an admin who never touched the toggle has no way
+    to learn why it flipped back."""
+    template = Path("app/web/templates/admin_marketplaces.html").read_text(encoding="utf-8")
+    disabled_pill_line = next(
+        line for line in template.splitlines() if 'class="plugin-disabled-pill"' in line and "DISABLED<" in line
+    )
+    assert "deprecated" in disabled_pill_line.lower()
+    assert "sync" in disabled_pill_line.lower()
 
 
 def test_hub_sync_signal_ignores_bundled_rows(tmp_path, monkeypatch):

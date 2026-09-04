@@ -1,4 +1,4 @@
-# Observability — PostHog integration
+# Observability — logs, cost, and metrics
 
 ## Audit & activity trails (retention status)
 
@@ -144,6 +144,59 @@ model attached — a guardrail that must guess should guess in the direction
 that stops sooner. It is a soft guardrail, not a billing ledger; this
 endpoint is the ledger.
 
+## Knowledge packaging — worker job, single-run, checkpointed
+
+```bash
+agnes admin knowledge packaging run                # enqueue a pass
+agnes admin knowledge packaging status              # last run, running?, next due
+agnes admin knowledge packaging status --json
+```
+
+Per-collection `knowledge.duckdb` artifacts (K3, #798) are rebuilt by the
+`knowledge-packaging` worker job kind (LIGHT lane,
+`app/worker/kinds.py::_run_knowledge_packaging`), not inline inside an HTTP
+request. TCRD-296 synthesis C.15: it used to run synchronously behind
+`POST /api/admin/run-knowledge-packaging`, bounded only by the scheduler's
+own client timeout — a pass slower than that timeout let the next scheduler
+tick fire a second, overlapping call, and two overlapping in-process runs
+raced hard enough to OOM the app.
+
+**Single-run.** The scheduler's tick (`SCHEDULER_KNOWLEDGE_PACKAGING_INTERVAL`,
+default 15 min) still calls `POST /api/admin/run-knowledge-packaging`, but the
+endpoint is now a thin, idempotency-keyed enqueue: a second tick while one run
+is still `queued`/`running` gets back the SAME job id as a `409` (expected
+under a fast cadence, not an error to page on) instead of starting a redundant
+run. Belt-and-braces on top of that dedupe, the job handler also takes a
+non-blocking Postgres advisory lock (`src.db_pg.knowledge_packaging_lease`,
+no-op on the frozen DuckDB app-state backend, which is single-process by
+construction) before running — a stray manual `POST /api/jobs` enqueue with a
+different idempotency key skips cleanly instead of racing the in-flight run.
+
+**Bounded and resumable.** One run is capped at a 20-minute wall-clock budget
+(`_DEFAULT_KNOWLEDGE_PACKAGING_TIMEOUT_S`, a plain constant — the incident was
+an *unbounded* run, not a mistuned number). `run_packaging_pass` checkpoints
+`state.json` after every collection it finishes, so hitting the deadline
+mid-sweep loses progress on at most the ONE collection in flight; the result
+carries `interrupted_reason: "timeout"` and the next scheduled run picks up
+where it left off (an already-recorded, unchanged fingerprint is a skip, not a
+rebuild). Reads are bounded too: `build_artifact`/`corpus_fingerprint` page
+through a corpus's chunks (`CorpusChunksRepository.list_for_corpus_batch`,
+keyset-paginated by id) rather than materializing the whole corpus's rows —
+including every 384-dim embedding — in one call.
+
+**No worker role, no silent black hole.** `POST /api/admin/run-knowledge-packaging`
+checks `role_enabled(Role.WORKER)` before enqueueing — a process/instance with
+no worker role has no loop that will ever claim the job, and enqueueing anyway
+would leave it `queued` forever with no visible error. That case answers a
+typed `501` (`{"error": "requires_worker_role"}`) instead.
+
+`GET /api/admin/knowledge-packaging/status` (`agnes admin knowledge packaging
+status`) reports the last run's outcome — including
+`built`/`skipped`/`pruned`/`errors`/`interrupted_reason`/`duration_s`/
+`collections_total`/`collections_processed` — whether one is running right
+now, and a best-effort `next_due` estimate read from the scheduler's own
+durable last-run marker.
+
 ## Audit log volume — how much does audit logging cost you
 
 The audit-coverage work (wave 1 + wave 2 of the audit-full-coverage plan)
@@ -218,126 +271,82 @@ own `DATA_DIR` rather than relying on the figures above; they exist to show
 the methodology and a plausible order of magnitude, not to stand in for a
 measurement of your instance.
 
-Optional integration that wires four signals into a single PostHog project:
+Agnes writes one JSON object per log line and nothing else. There is no
+telemetry sink to configure, no key to set, and no data leaving the host on
+Agnes's account: whatever already collects the container's stdout — a
+platform log service, a sidecar collector, `docker logs` — is the whole
+pipeline.
 
-1. **Backend exceptions** — every unhandled FastAPI exception, plus rebuild
-   failures from `src/orchestrator.py` and HTTP-job failures from
-   `services/scheduler/`.
-2. **LLM tracing** — every Anthropic / OpenAI-compat call emits a
-   `$ai_generation` event with provider, model, latency, and token counts.
-3. **Frontend errors + pageviews** — `window.error` /
-   `unhandledrejection` forwarded via `posthog.captureException`; automatic
-   `$pageview` and `$pageleave`.
-4. **Session replay (masked) + feature flags** — both gated behind the same
-   single `POSTHOG_API_KEY`.
+## Structured logs
 
-The integration ships **off by default**. Setting one environment variable
-turns everything on.
+In production (`DEBUG` unset) every process installs a JSON formatter
+(`app/logging_config.py`). One record per line:
 
-## Enabling the integration
-
-```bash
-# Required — the only switch that controls on/off.
-# Use a PROJECT key (publishable phc_…), never a personal API key.
-POSTHOG_API_KEY=phc_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-```
-
-That's the entire minimum. Defaults will:
-
-- Send to `https://eu.i.posthog.com` (override with `POSTHOG_HOST`).
-- Identify logged-in users by id + email (override with `POSTHOG_IDENTIFY_PII`).
-- Record session replay with all inputs and known data surfaces masked
-  (override with `POSTHOG_REPLAY=false` or
-  `POSTHOG_REPLAY_MASK_SELECTOR=…`).
-- Skip prompt / completion bodies in LLM events; emit token counts + latency
-  only (override with `POSTHOG_LLM_PAYLOADS=1` if you accept the privacy
-  trade-off — LLM prompts in this product routinely include customer SQL
-  and data).
-
-## All knobs
-
-| Variable | Default | Notes |
-|---|---|---|
-| `POSTHOG_API_KEY` | unset | **The on/off switch.** Unset = integration is fully off. Project key only. |
-| `POSTHOG_HOST` | `https://eu.i.posthog.com` | Full URL. Use `https://us.i.posthog.com` for the US region or your own host. |
-| `POSTHOG_IDENTIFY_PII` | `email` | `none` / `id` / `email` / `full`. |
-| `POSTHOG_REPLAY` | `true` | Disable replay only, keeping errors / events / flags. |
-| `POSTHOG_REPLAY_MASK_SELECTOR` | empty | CSS selector appended to the default mask list. |
-| `POSTHOG_LLM_PAYLOADS` | `0` | `1` adds `$ai_input` + `$ai_output_choices` to LLM events. Off by default. |
-| `POSTHOG_ENVIRONMENT` | auto | Tagged on every event as the `environment` super-property. Auto-resolves to `local` when `LOCAL_DEV_MODE=1`, else `RELEASE_CHANNEL`, else `AGNES_DEPLOYMENT_ENV`, else `unknown`. |
-
-## Splitting traffic by environment
-
-Every captured event — backend exceptions, `$ai_generation`, browser
-`$pageview`, JS errors, custom events — is tagged with two super
-properties so PostHog dashboards can slice cleanly:
-
-- `environment` — resolved at startup (see table above). Operators
-  typically set this to `local`, `staging`, or `production` explicitly,
-  or rely on the auto-resolver.
-- `release` — the running `AGNES_VERSION`, falling back to
-  `RELEASE_CHANNEL`. Useful for "is this error new in this release?"
-  cohorting.
-
-Both apply to backend events via the SDK's `super_properties` and to
-browser events via `posthog.register({...})` in the loaded callback, so
-filtering by `environment = production` in PostHog hides every event
-generated from a developer laptop, CI, or staging.
-
-## Privacy posture
-
-- The PostHog **project key** is publishable — it's safe in browser HTML.
-  PostHog uses a separate **personal API key** for admin operations. This
-  integration only ever exposes the project key. Treat the personal key like
-  any other secret and never set it as `POSTHOG_API_KEY`.
-- Session replay defaults: `maskAllInputs: true`, plus a CSS-selector mask
-  for known data-bearing classes (`.data-cell`, `.query-result`,
-  `.sql-output`, plain `<code>` and `<pre>`, and any element marked
-  `data-sensitive`). Add your own with `POSTHOG_REPLAY_MASK_SELECTOR`.
-- LLM payloads are **off by default** because the prompts and completions
-  in this product include customer SQL, query results, and table samples.
-  Token counts and latency are always sent (no payload contents in them).
-- `person_profiles: 'identified_only'` — anonymous visits do not create
-  person records.
-
-## Where the events come from
-
-| Event | Code path |
+| field | what it carries |
 |---|---|
-| `$exception` (unhandled 500) | `app/main.py:_unhandled_exception_handler` |
-| `$exception` (orchestrator rebuild) | `src/orchestrator.py:_capture_orchestrator_exception` |
-| `$exception` (scheduler job) | `services/scheduler/__main__.py:_call_api` |
-| `$exception` (CLI uncaught) | `cli/main.py:main` |
-| `$ai_generation` | `src/observability/llm_tracing.py:trace_generation` wrapped at `connectors/llm/anthropic_provider.py:_attempt_extraction` and `connectors/llm/openai_compat.py` |
-| `$pageview`, `$pageleave`, JS errors | injected into every `text/html` response by `app/middleware/posthog_inject.py` |
+| `severity` | `DEBUG` / `INFO` / `WARNING` / `ERROR` / `CRITICAL` |
+| `message` | the formatted log message |
+| `time` | UTC ISO-8601 |
+| `logger` | the module's logger name |
+| `service` | `app`, `scheduler`, … — which process wrote it |
+| `env` | `AGNES_DEPLOYMENT_ENV`, else `RELEASE_CHANNEL`, else `unknown` |
+| `replica` | `hostname:pid`, for correlating across replicas |
+| `request_id` | present when the line was written inside a request |
+| `exc` | the formatted traceback, when the record carries one |
 
-## CLI coverage
+The names are the ones a collector looks for when deciding whether a line is
+a structured entry or just text. Under this project's older `lvl`/`msg`/`ts`
+every line arrived at its collector's default severity with the payload as
+one opaque string — filterable by substring only, which is the same as
+having no levels at all.
 
-The `da` CLI (`cli/main.py:main`) catches every uncaught exception from a
-command, forwards it to PostHog with `component=cli` and the invoked
-command name, then flushes the client before re-raising for Typer's
-default error printer. Normal Typer / Click exits, `SystemExit`, and
-`KeyboardInterrupt` are intentionally skipped.
+Anything a caller passes as `extra={...}` is promoted to a real field
+alongside these, so numbers stay filterable instead of being formatted into
+the message. Core fields win a name collision: an `extra` cannot relabel its
+own line's `severity` or `service`.
 
-Operators must surface `POSTHOG_API_KEY` (and any other `POSTHOG_*` knob)
-into the shell that runs `da` — typically by sourcing the same `.env` the
-server uses, or by setting the variable in their shell profile. The CLI
-respects exactly the same env-var contract as the server.
+In development (`DEBUG=1`) the same records render through `rich` with
+colour and tracebacks instead.
 
-LLM calls made by CLI commands (`da query`, `da explore`, etc.) flow
-through the provider wrappers in `connectors/llm/` and therefore emit
-`$ai_generation` events via the same tracing path the server uses.
+### What is emitted, and from where
 
-## Testing the integration
+- **Unhandled exceptions** — the FastAPI 500 handler logs the exception with
+  the request's method, path and `request_id`. Rebuild failures
+  (`src/orchestrator.py`) and HTTP-job failures (`services/scheduler/`) log
+  as `event: component_error` with the component named.
+- **LLM calls** — every Anthropic / OpenAI-compat generation emits one
+  `event: llm_generation` record (`src/observability/llm_tracing.py`) with
+  `provider`, `model`, `latency_ms`, `input_tokens`, `output_tokens`,
+  `prompt_chars`, `completion_chars` and `is_error`. Prompts and completions
+  are **never** recorded — in this product they routinely carry customer
+  data, and a log pipeline is the wrong place to hold it. Their sizes are,
+  because a size is the part that explains a cost or a latency. For per-turn
+  cost as a measurement rather than a sample, use *Chat cost* above.
 
-Boot the app with the key set, hit `/`, then provoke a 500 (e.g. via a
-debug-only route). One **Errors** event should arrive within seconds along
-with one `$pageview` per page load. Open **Session replay** and pick the
-session — every `<input>` should show as a masked rectangle.
+### Splitting traffic by environment
 
-The unit tests in `tests/test_posthog_*.py` cover the disabled and enabled
-configurations; `tests/test_llm_tracing.py` exercises the success and error
-variants of the LLM event.
+Set `AGNES_DEPLOYMENT_ENV` per deployment (`production`, `staging`, a
+developer's name) and filter on `env`. It falls back to `RELEASE_CHANNEL`
+and finally to the literal `unknown` — never absent, so `env != "production"`
+keeps matching a deployment that forgot to label itself. The same variable
+is what the host-side operator scripts (`agnes-watchdog.sh`,
+`agnes-db-backup.sh`) read to tag their alerts.
+
+### Shipping the logs somewhere
+
+Nothing in Agnes decides this — it writes to stdout and stops. On the
+GCE-hosted deployments the Terraform module wires it up, to one of two
+destinations (a VM has exactly one, because Docker allows one log driver per
+container): Google Cloud Logging, see [`gcp-logging.md`](gcp-logging.md), or
+Datadog, see [`datadog-logging.md`](datadog-logging.md).
+
+### Verifying the wiring
+
+With `DEBUG=1`, `GET /api/debug/throw?kind=ValueError&msg=hello` raises after
+authentication resolves, so you can confirm a real unhandled exception
+reaches your collector with the request context attached. It returns 404
+whenever `DEBUG` is unset.
+
 
 ## Prometheus `/metrics`
 
@@ -400,7 +409,119 @@ caveat on cAdvisor's fidelity. A production deployment that doesn't use
 this profile should scrape the same `/metrics` path on whatever ports each
 role's `/healthz`/`/readyz` already answer on, at a similar interval.
 
-## Self-hosting note
+## OpenTelemetry export — opt-in, one span per LLM completion
 
-PostHog is itself open source — operators with a self-hosted PostHog instance
-just point `POSTHOG_HOST` at their endpoint. No code changes required.
+Agnes can ship traces to any OTLP/HTTP collector. It is off until the
+standard variables are set on the process (every process: the app, the
+scheduler, a collector — they share one logging entrypoint and that is where
+the exporter is installed):
+
+```bash
+OTEL_EXPORTER_OTLP_ENDPOINT=https://<collector>/<base-path>   # the SDK appends /v1/traces
+OTEL_EXPORTER_OTLP_HEADERS=Authorization=Bearer%20<token>    # whatever the collector wants
+AGNES_OTEL_CAPTURE_CONTENT=1                                 # optional — see below
+```
+
+On a VM built by the `customer-instance` Terraform module the three
+variables come from the per-instance `otlp_endpoint`, `otlp_headers_secret`
+(a Secret Manager secret name — the value is fetched at boot, never stored
+in state) and `otlp_capture_content` fields; the module also writes
+`AGNES_DEPLOYMENT_ENV` for every VM (the VM's name unless `deployment_env`
+says otherwise). Like everything the startup script renders, they reach a
+running VM only through a recreate.
+
+An unset endpoint leaves the OpenTelemetry API's no-op tracer in place: no
+exporter, no background thread, a dictionary lookup per call. The log line
+`otel: OTLP trace export enabled` at startup says it is on; a collector
+that refuses the batches shows up as the SDK's own
+`Failed to export span batch` warnings.
+
+### What is exported
+
+- **One span per LLM completion that transits the chat broker**
+  (`app/api/broker.py`) — every chat surface and every engine, because all of
+  a session's LLM traffic goes through that one route. Named `chat <model>`,
+  kind `CLIENT`, with the duration of the upstream call.
+- **One span per server-side generation** wrapped in `trace_generation`
+  (`src/observability/llm_tracing.py`: summaries, extraction, the semantic
+  layer) — the same tracer, the same table.
+
+| attribute | on | carries |
+|---|---|---|
+| `gen_ai.system`, `gen_ai.request.model`, `gen_ai.response.model` | both | provider (`anthropic`, `gcp.vertex_ai`) and models |
+| `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens` | both | uncached input and output |
+| `gen_ai.usage.cache_read_input_tokens`, `gen_ai.usage.cache_creation_input_tokens` | broker | prompt-cache reads and writes, **separately** — folding them into `input_tokens` undercounts an agentic run by orders of magnitude (see *Chat cost*) |
+| `gen_ai.response.finish_reasons` | broker | the stop reason |
+| `agnes.session_id`, `agnes.user_email`, `agnes.user_id`, `agnes.agent_id`, `agnes.ticket_scope` | broker | which session, who ran it, under which agent; `llm` is the embedded turn engine, `main` the native sandbox |
+| `agnes.upstream`, `agnes.stream`, `http.response.status_code`, `error.type` | broker | where the call went and how it ended |
+| `agnes.response_bytes`, `agnes.stream_complete` | broker | how much of the response came back, and for a stream whether the model reached its stop reason — a client that walks away mid-turn leaves a span with no answer and no final usage, and this is what tells it apart from a lost export |
+| `agnes.prompt_chars`, `agnes.completion_chars` | both | sizes of the exchange, never text |
+| `agnes.kind` | both | `completion` (the broker) or `generation` (a server-side call) |
+
+The resource on every span is `service.name=agnes`, `service.version`,
+`deployment.environment` and `service.instance.id` (`hostname:pid`) —
+`deployment.environment` is the same `AGNES_DEPLOYMENT_ENV` /
+`RELEASE_CHANNEL` label the logs carry, so one instance is one value in
+both signals. `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES` override
+any of them.
+
+### Content
+
+Prompt and completion text is **not** exported by default, for the same
+reason the logs never carry it: in this product it routinely holds customer
+data. `AGNES_OTEL_CAPTURE_CONTENT=1` adds two **span events** — never span
+attributes — in the OpenTelemetry GenAI message shape (`[{role, parts}]`
+as JSON):
+
+| event | attribute | carries |
+|---|---|---|
+| `gen_ai.content.prompt` | `gen_ai.prompt` | system prompt and conversation, tool calls and tool results included, binary blocks reduced to their type |
+| `gen_ai.content.completion` | `gen_ai.completion` | the answer, re-assembled from the stream |
+
+Events rather than attributes on purpose: a collector stores a span's
+attributes as one JSON object with keys in alphabetical order, and an
+agent turn's prompt runs to hundreds of KiB, so anything sorting after
+`gen_ai.input…` — the answer, the usage — fell past every preview or size
+cap downstream. With the text on events the attribute object stays small
+and parseable however long the conversation is, and each side of the
+exchange is its own record the collector can map, cap or drop
+independently (in a Data-Streams style sink that means mapping the
+`events` field to a column). Each event's text is capped
+(`MAX_CONTENT_CHARS`, 256 KiB) and a cut is flagged on the span as
+`agnes.content_truncated`; the sizes (`agnes.prompt_chars` /
+`agnes.completion_chars`) are on the span whether capture is on or not.
+Turn it on only where the collector is allowed to hold that data.
+
+### The embedded engine's own spans
+
+The broker sees a completion, not the agent loop around it. The embedded
+turn engine's sandbox traces that loop itself — one span per turn, per
+model step and per tool call, properly nested — and exports it through its
+in-sandbox relay's `otlp` scope to `POST /api/broker/otlp/v1/{signal}` on
+this instance, which swaps the per-turn `kai_otlp` ticket for the same
+collector credential the app's own export uses and forwards the batch. The
+scope is minted by `/api/kai/tickets` exactly when `OTEL_EXPORTER_OTLP_ENDPOINT`
+is set, so the sandbox's traces land wherever the broker's do, and nowhere
+when the instance exports nothing.
+
+Two halves, in this order: the app version carrying the route first, the
+engine's `HOST_BROKER_OTLP_URL` second. The URL is what makes the sandbox
+initialize OTel at all, and it also makes `otlp` an *active* relay scope
+that every turn needs a ticket for — set it against an app that does not
+mint one and every turn fails before the prompt is sent. Rolling back is
+the reverse: clear the URL, then the app.
+
+Not exported by anything: HTTP request spans and database calls.
+
+## No telemetry vendor
+
+Agnes sends nothing to a third-party analytics or error-tracking service, and
+has no key for one. The OTLP export above goes only where the operator
+points it, with the operator's credential, and is off until they do. An
+optional integration with a hosted product-analytics vendor existed until
+0.96 and was removed (see `CHANGELOG.md`): it was off on every deployment,
+it never saw the failures that mattered — a handled error is not a 500, so
+it was never captured — and it asked operators to ship prompts and session
+replays off-host to get numbers the log pipeline already carries. What it
+did well, LLM call metadata and an environment label, is above, in logs
+and, opt-in, in traces.

@@ -28,6 +28,7 @@ Two rules for every call site:
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 log = logging.getLogger(__name__)
 
@@ -54,3 +55,52 @@ def mark_journey(user_id: str | None, **flags: bool) -> None:
         repo.update(user_id, **pending)
     except Exception:  # pragma: no cover - defensive; see module docstring
         log.debug("journey: could not mark %s for %s", sorted(flags), user_id, exc_info=True)
+
+
+#: The checklist's steps, in the order the rail's onboarding card lists them —
+#: a mirror of ``STEP_KEYS`` in ``app/web/static/js/chat_onboarding.js``, and
+#: pinned equal to it by ``tests/test_rail_onboarding_first_paint.py``. Six of
+#: the journey's seven booleans: ``onboarded`` records that the greeting was
+#: shown, and is not a step anyone completes.
+JOURNEY_STEP_KEYS: tuple[str, ...] = (
+    "first_asked",
+    "explored_stack",
+    "stack_setup_done",
+    "catalog_discovered",
+    "use_anywhere",
+    "agent_created",
+)
+
+
+def resolve_journey_rail(user_id: str | None) -> dict[str, Any] | None:
+    """The caller's checklist progress as the rail's onboarding card needs it.
+
+    ``{"done", "total", "complete"}`` — the same three numbers
+    ``updateGetStartedIndicator`` in chat_onboarding.js derives from
+    ``GET /api/chat/journey`` and writes into the card once that fetch
+    resolves. The server renders them FIRST, so the card's first paint is
+    already its resolved state: retired at 6/6, otherwise the real title,
+    count and arc. Left to the script alone, a caller who had finished
+    onboarding saw the card for one paint on every page load, and since it
+    sits in the rail foot — whose height positions every row above it —
+    Library · Agents · Admin jumped up and dropped back on every navigation
+    (62px, measured); a caller mid-way got the same thing 6px tall when the
+    empty count line filled in and grew the row.
+
+    None when there is no user or the read fails: the card then renders
+    blank and the script resolves it — "we could not check", never a wrong
+    number, and never a card retired on a guess. Same fallback direction as
+    ``resolve_setup_rail`` for the admin chain beside it.
+    """
+    if not user_id:
+        return None
+    try:
+        from src.repositories import user_journey_repo
+
+        state = user_journey_repo().get(user_id)
+    except Exception:
+        log.warning("journey: could not read state for the rail card", exc_info=True)
+        return None
+    done = sum(1 for key in JOURNEY_STEP_KEYS if state.get(key))
+    total = len(JOURNEY_STEP_KEYS)
+    return {"done": done, "total": total, "complete": done == total}

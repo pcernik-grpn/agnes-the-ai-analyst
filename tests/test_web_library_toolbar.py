@@ -9,6 +9,8 @@ classification.
 """
 
 from __future__ import annotations
+
+import pathlib
 import pytest
 
 import io
@@ -42,7 +44,7 @@ def _upload(seeded_app, cid: str, filename: str, content: bytes, ctype: str, tok
 
 def _share_collection_with_user(collection_id: str, user_id: str, group_name: str = "library-share-grp") -> None:
     """Add ``user_id`` to a group and grant that group the collection — the
-    minimal path to a "shared with me" artefact."""
+    minimal path to a "shared with me" artifact."""
     from src.db import get_system_db
     from src.repositories.user_groups import UserGroupsRepository
     from src.repositories.user_group_members import UserGroupMembersRepository
@@ -95,8 +97,8 @@ def test_library_toolbar_controls_render(seeded_app):
 
 
 def test_source_facet_offers_uploaded_option(seeded_app):
-    """The Source facet exposes the artefact's provenance (origin column).
-    A freshly uploaded artefact is 'uploaded' and appears as a Source option."""
+    """The Source facet exposes the artifact's provenance (origin column).
+    A freshly uploaded artifact is 'uploaded' and appears as a Source option."""
     _create(seeded_app, "Prov Demo", seeded_app["admin_token"])
     text = seeded_app["client"].get("/library", headers=_auth(seeded_app["admin_token"])).text
     assert 'data-facet="origin"' in text
@@ -106,7 +108,7 @@ def test_source_facet_offers_uploaded_option(seeded_app):
 def test_filter_menu_offers_recency_ownership_and_format(seeded_app):
     """Beyond owner/source/access, the menu slices on data the rows already
     carry: when it was added, whose it is, and what kind of file it is. Tags
-    cannot do this job — no artefact kind has a tags column — so these are what
+    cannot do this job — no artifact kind has a tags column — so these are what
     "filter by tag" has to mean until entities land (TCRD-250)."""
     col = _create(seeded_app, "Facet Demo", seeded_app["admin_token"])
     _upload(seeded_app, col["id"], "deck.pdf", b"%PDF-1.4 x", "application/pdf", seeded_app["admin_token"])
@@ -191,7 +193,7 @@ def test_files_of_every_format_share_one_files_section(seeded_app):
     text = seeded_app["client"].get("/library", headers=_auth(seeded_app["admin_token"])).text
     # One merged section, not per-format ones.
     assert 'data-lib-sec="files"' in text
-    assert ">Artefacts<" in text
+    assert ">Artifacts<" in text
     for retired in ("image", "document", "collection", "spreadsheet"):
         assert f'data-lib-sec="{retired}"' not in text
     # The row still says what the file actually is — its format, on the second
@@ -516,3 +518,219 @@ def test_chip_label_keeps_a_name_that_ends_in_a_number(seeded_app):
     js = seeded_app["client"].get("/static/js/filter_toolbar.js").text
     assert "var span = opt.querySelector('.fbar-menu__opt-text');" in js
     assert "if (!span) txt = txt.replace(/\\s+\\d+\\s*$/, '');" in js
+
+
+# ---------------------------------------------------------------------------
+# The filter menu's own height. Entity facets took the Library from five
+# categories to nine (eleven on a fully-granted instance), which is what broke
+# the assumption the CSS opt-out below was written on.
+# ---------------------------------------------------------------------------
+
+_TOOLBAR_CSS = pathlib.Path(__file__).resolve().parents[1] / "app/web/static/css/filter_toolbar.css"
+_TOOLBAR_JS = pathlib.Path(__file__).resolve().parents[1] / "app/web/static/js/filter_toolbar.js"
+
+
+def test_a_category_menu_is_not_exempt_from_the_height_cap():
+    """`.fbar-menu--cats` used to set `overflow: visible; max-height: none`,
+    because a popover positioned `absolute` inside it was clipped. The popover
+    has been `position: fixed` since collision detection moved into the JS, so
+    the exemption bought nothing and cost the menu its scrolling — with nine
+    categories, Clear/Done sat below the fold of a 720px window."""
+    css = _TOOLBAR_CSS.read_text(encoding="utf-8")
+    assert ".fbar-menu--cats { overflow: visible; max-height: none; }" not in css
+    # The BASE rule, anchored at the start of a line: the single-category form
+    # deliberately re-positions its own popover `static` (it is the menu, not a
+    # popover beside one), and a loose substring search finds that one first.
+    base = [ln for ln in css.splitlines() if ln.startswith(".fbar-cat__pop {")]
+    assert base, "the base popover rule must exist"
+    body = css.split(base[0], 1)[1].split("}")[0]
+    assert "position: fixed" in base[0] + body, (
+        "the default popover must stay `fixed` — it is what lets the menu scroll without clipping it"
+    )
+
+
+def test_the_clamp_does_not_fight_the_menus_own_scrolling():
+    """The clamp must not clear `max-height` to re-measure: dropping the cap
+    momentarily removes the overflow, which resets `scrollTop` to 0 — and the
+    re-clamp runs on a capture-phase window `scroll` listener, so it fires on
+    the MENU's own scrolling. The menu snapped back to the top on every wheel
+    tick and read as unscrollable. The stylesheet's cap is cached instead, and
+    a scroll originating inside the menu skips the clamp entirely."""
+    js = _TOOLBAR_JS.read_text(encoding="utf-8")
+    body = js.split("function clampMenuHeight()")[1].split("\n    }")[0]
+    assert "style.maxHeight = ''" not in body.split("var top")[0], (
+        "clearing the inline cap before measuring is what reset scrollTop"
+    )
+    assert "cssMenuMaxHeight" in body, "the stylesheet's cap must be cached, not re-read"
+    replacer = js.split("function replaceOpenSubmenu(e)")[1][:600]
+    assert "menuEl.contains(e.target)" in replacer, "a scroll from inside the menu must not trigger a re-clamp"
+
+
+def test_an_open_submenu_is_re_placed_when_the_menu_itself_scrolls():
+    """The popover is `position: fixed`, so it does not follow the row it points
+    at — it has to be re-placed. A `scroll` event on an element does not bubble,
+    and leaning on it reaching a window capture listener left the popover
+    stranded beside a row that had scrolled away. A listener bound directly to
+    the menu cannot be missed."""
+    js = _TOOLBAR_JS.read_text(encoding="utf-8")
+    assert "on(menuEl, 'scroll'" in js, "the menu needs its own scroll listener"
+    handler = js.split("on(menuEl, 'scroll'")[1][:300]
+    assert "placeSubmenu(open)" in handler
+    assert "clampMenuHeight" not in handler, (
+        "the menu's own scrolling must not re-clamp its height — that is what reset scrollTop"
+    )
+
+
+def test_the_menu_is_clamped_to_the_room_below_its_trigger():
+    """A CSS `max-height` is a limit on height and says nothing about where the
+    menu starts, so a toolbar partway down the page can still push the footer
+    off-screen. The clamp measures live rects, like every other coordinate in
+    this component, and must run when the menu opens and whenever the anchor
+    moves."""
+    js = _TOOLBAR_JS.read_text(encoding="utf-8")
+    assert "function clampMenuHeight()" in js
+    assert "innerHeight" in js.split("function clampMenuHeight()")[1][:600]
+    # The whole function body, not a fixed slice: the single-category cleanup
+    # now sits between the signature and the clamp call.
+    opener = js.split("function openMenu(open)")[1].split("\n    }")[0]
+    assert "clampMenuHeight()" in opener, "the clamp must run on open"
+    replacer = js.split("function replaceOpenSubmenu(e)")[1][:600]
+    assert "clampMenuHeight()" in replacer, "…and again when the page moves or resizes under it"
+
+
+# ---------------------------------------------------------------------------
+# Page structure. Four chrome tiers stood between the lede and the first row —
+# Definitions panel, toolbar, tabs, type map — and a reader could not tell
+# which was the page's real structure. These pin the decisions that fixed it.
+# ---------------------------------------------------------------------------
+
+_LIBRARY_HTML = pathlib.Path(__file__).resolve().parents[1] / "app/web/templates/library.html"
+
+
+def test_a_chip_opens_only_its_own_filter():
+    """The Filter button means "narrow this list" and the whole vocabulary
+    belongs on screen. A chip means "change THIS one" — answering that with
+    eleven categories makes the reader find their way back to the filter they
+    were already pointing at."""
+    js = _TOOLBAR_JS.read_text(encoding="utf-8")
+    css = _TOOLBAR_CSS.read_text(encoding="utf-8")
+    assert "openCategory(f.key, true)" in js, "a chip asks for the single-category form"
+    assert "fbar-menu--single" in js and "fbar-menu--single" in css
+    # Closing must drop it, or the next press of Filter answers with one category.
+    closer = js.split("function openMenu(open)")[1].split("\n    }")[0]
+    assert "remove('fbar-menu--single')" in closer
+    # In single mode the siblings and the footer are gone.
+    rule = [ln for ln in css.splitlines() if ln.startswith(".fbar-menu--single .fbar-cat:not(.is-single)")]
+    assert rule or ".fbar-cat:not(.is-single) { display: none; }" in css
+
+
+def test_the_library_does_not_restyle_the_shared_chip():
+    """One chip design across the platform. This page used to quieten the
+    component — transparent fill, muted text, its own height — which made the
+    Library's chips a different control from the ones on /admin/access, and
+    killed the component's own hover into the bargain (same specificity, later
+    in the document)."""
+    html = _LIBRARY_HTML.read_text(encoding="utf-8")
+    assert ".library-page .fbar-chip" not in html
+
+
+def test_the_applied_chips_sit_between_the_toolbar_and_the_tabs():
+    """The chips state what narrowed the WHOLE Library — both halves — and the
+    tabs then split what survived. Below the tabs they described the wrong
+    scope: a condition on the active bucket rather than on the set the buckets
+    divide. They belong under the control that set them."""
+    html = _LIBRARY_HTML.read_text(encoding="utf-8")
+    toolbar = html.index('class="fbar fbar--ranked"')
+    chips = html.index('id="lib-chips"')
+    tabs = html.index('id="lib-tabs"')
+    assert toolbar < chips < tabs, "toolbar → chips → tabs"
+    state = html[html.index('class="lib-browse__state"') :]
+    assert 'id="lib-chips"' not in state.split("</div>")[0], (
+        "the chips left the count row; leaving a second copy behind is how two would drift"
+    )
+
+
+def test_the_count_row_carries_the_cross_tab_number():
+    """One line of list metadata: how many matched here, and how many of the
+    same answer fell in the other bucket. Standing on its own below the tabs it
+    read as a notice; beside the count it reads as what it is."""
+    html = _LIBRARY_HTML.read_text(encoding="utf-8")
+    state = html[html.index('class="lib-browse__state"') :]
+    row = state[: state.index("</div>")]
+    assert 'id="lib-item-count"' in row and 'id="lib-crosstab"' in row
+
+
+def test_more_coming_soon_is_gone():
+    """A permanent 'more is coming' note is furniture: it says nothing about
+    the list a reader is looking at, and it had already been moved three times
+    looking for a home. Removed with its macro and CSS — a macro nobody calls
+    is the fourth home waiting to be found."""
+    html = _LIBRARY_HTML.read_text(encoding="utf-8")
+    assert "library_more_coming" not in html
+    assert "lib-count-note" not in html
+    assert "More coming soon" not in html
+
+
+def test_the_tabs_stay_below_the_toolbar():
+    """Not cosmetic: `refreshTabCounts` matches rows with `ignoreTab`, so search
+    and every facet apply across BOTH halves and a tab badge is that half's
+    share of one result set. The tabs are the buckets a search falls into, not
+    a scope chosen before searching — above the toolbar they would describe a
+    set the reader has not narrowed yet."""
+    html = _LIBRARY_HTML.read_text(encoding="utf-8")
+    toolbar = html.index('class="fbar fbar--ranked"')
+    tabs = html.index('id="lib-tabs"')
+    assert toolbar < tabs, "the toolbar must come first — the tabs read its results"
+
+
+def test_definitions_is_one_row_and_keeps_its_explanation():
+    """It went through a footer aside, a band, a one-line sign, a card with a
+    paragraph — and now one row with the paragraph on an info affordance.
+
+    The sentence is needed exactly once, the first time a reader meets the word
+    "Definitions"; after that it is four lines of chrome between the page's
+    lede and its controls, on a block that never changes. So it moves to a
+    hover, which is the whole point of this guard: the explanation must still
+    be IN the markup and reachable, not deleted. The counts stay visible —
+    they are the only part of the block that is a fact about this instance
+    rather than about the product.
+    """
+    html = _LIBRARY_HTML.read_text(encoding="utf-8")
+    macro = html.split("{% macro definitions_strip(defs) %}")[1].split("{% endmacro %}")[0]
+    assert "lib-defs__title" in macro
+    # Its OWN glyph. It borrowed the data-package cylinder, which on this very
+    # page marks the Data packages listed below — one mark for "a store of rows
+    # you can query" and for "the rule you apply to those rows", side by side.
+    assert "kind_glyph('definitions')" in macro
+    assert "kind_glyph('data')" not in macro
+    assert "lib-defs__counts" in macro and "lib-defs__cta" in macro
+
+    # The sentence survives, on the affordance rather than as a paragraph.
+    assert "lib-defs__desc" not in macro, "the paragraph is gone from the row"
+    assert "lib-defs__info" in macro
+    assert "what counts as revenue" in macro, "the explanation is one hover away, not lost"
+    assert "data-tip=" in macro, (
+        "the page's fast tooltip, never `title` — the OS delay is far too slow "
+        "for the affordance that explains a word"
+    )
+    assert "aria-label=" in macro, "the bubble is not what a screen reader reads"
+
+    rule = html.split("  .lib-defs {")[1].split("}")[0]
+    assert "border:" in rule and "border-radius:" in rule
+    assert "align-items: center;" in rule, "one baseline — a row, not a stack"
+    assert "border-bottom: 1px solid var(--ds-border);" not in rule, (
+        "a divider under a bordered block draws a second line 1px from the first"
+    )
+
+
+def test_a_match_in_the_other_tab_is_never_silent():
+    """The dangerous state is not an empty tab — that already offers a jump. It
+    is a tab with results while the other holds more: search 'margin' in
+    Knowledge, get hits, and never learn a Margin recipe sits in Capabilities.
+    A match you cannot see is worse than no match, because you stop looking."""
+    html = _LIBRARY_HTML.read_text(encoding="utf-8")
+    assert 'id="lib-crosstab"' in html
+    fn = html.split("function syncCrossTab()")[1].split("\n  }")[0]
+    assert "otherTabHit()" in fn, "reuse the empty state's own count, never a second one"
+    assert "thisTabEmpty" in fn, "the empty state owns that case — no double messaging"
+    assert "searching || filtered" in fn, "with nothing narrowed this only repeats the tab's own badge"

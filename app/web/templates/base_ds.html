@@ -114,6 +114,12 @@
        it. Same inert-until-used pattern as tour.css above. #}
     <link rel="stylesheet" href="{{ static_url('css/chat_row_menu.css') }}">
 
+    {# Read-only view-as banner (_view_as_banner.html, included at the top of
+       <body> below). Loaded unconditionally like dev_preview.css above: the
+       partial renders nothing outside a view-as session, and a conditional
+       include is one more thing to forget. #}
+    <link rel="stylesheet" href="{{ static_url('css/view_as.css') }}">
+
     {% block head_extra %}{% endblock %}
     {% include '_theme.html' ignore missing %}
     {# Operator-injected scripts (placement=head_end, the default) —
@@ -124,6 +130,12 @@
     {% endfor %}
 </head>
 <body {% block body_attrs %}{% endblock %}>
+
+    {# Read-only view-as banner — FIRST in <body>, before the rail and any
+       page chrome, so the mode is the first thing on the page in the source
+       order a screen reader follows too. Self-guarded: renders nothing unless
+       this request is actually in a view-as session. #}
+    {% include '_view_as_banner.html' %}
 
     {# Auto-import component macros for child templates. Children call
        directly: {{ ds.button(...) }}, {% call ds.panel(...) %}…{% endcall %} #}

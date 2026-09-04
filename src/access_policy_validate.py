@@ -33,6 +33,8 @@ import logging
 import sqlglot
 from sqlglot import exp
 
+from src.access_policy_udf import POLICY_HMAC_FUNCTION, POLICY_UDF_NAMES
+
 logger = logging.getLogger(__name__)
 
 
@@ -153,6 +155,15 @@ _ALLOWED_FUNCTION_NAMES: frozenset[str] = frozenset(
         # masking / pseudonymization (§1, §21 -- md5 is a pseudonym, not a
         # mask, but it is the design doc's own documented example).
         "MD5",
+        # The KEYED pseudonym (`src/access_policy_udf.py`). Agnes registers
+        # this function itself on the analytics connection, so unlike every
+        # other name here it is not "a thing DuckDB can already do that we
+        # allow" -- it is ours, and it is DuckDB-ONLY: `_reject_duckdb_only_
+        # functions` below refuses it for a remote table, because the
+        # instance's HMAC key must never travel to BigQuery/Databricks and a
+        # same-named remote function would pseudonymize under a key Agnes does
+        # not control.
+        POLICY_HMAC_FUNCTION.upper(),
         # group-membership idiom (§6.5) -- list_contains() parses to ArrayContains.
         "ARRAY_CONTAINS",
         # the discouraged-but-still-valid unnest idiom (§6.5), warned about
@@ -220,6 +231,7 @@ def validate_policy_sql(
     _reject_bad_table_references(statement, table_name=table_name, mapping_table_names=mapping_table_names)
     _reject_bad_variables(statement)
     if for_remote:
+        _reject_duckdb_only_functions(statement)
         _reject_untranspilable(sql)
         _warn_group_membership_idiom(statement, table_id=table_id)
 
@@ -413,6 +425,22 @@ def _is_identifier_position(node: exp.Placeholder) -> bool:
     return False
 
 
+def variables_in_pattern_position(statement: exp.Expression) -> set[str]:
+    """Names of the ``$variable`` placeholders in ``statement`` that stand on
+    the PATTERN side of a LIKE-family or regex node -- rule 5's own question,
+    exported so the READ path can ask it too.
+
+    ``src/access_policy.py`` re-derives this from the stored policy text on
+    every resolve and refuses the table when a bound identity variable would
+    be matched as a pattern (§6.3). That is the same rule this module
+    enforces at save time; it lives here, in one implementation, so the two
+    can never drift into disagreeing about what "pattern position" means --
+    a drift that would make read-time defense in depth quietly cover less
+    than the save-time rule it is backing up.
+    """
+    return {p.name for p in statement.find_all(exp.Placeholder) if _is_pattern_position(p)}
+
+
 def _is_pattern_position(node: exp.Placeholder) -> bool:
     """True if ``node`` is anywhere inside the pattern (``expression``) side
     of a LIKE-family or regex node -- walking up the ancestor chain instead
@@ -428,19 +456,50 @@ def _is_pattern_position(node: exp.Placeholder) -> bool:
     return False
 
 
+def _reject_duckdb_only_functions(statement: exp.Select) -> None:
+    """Rule 6, part 0: a remote-table policy may not call a function Agnes
+    registers on its OWN DuckDB connection (today: ``agnes_hmac``).
+
+    The transpile check below cannot stand in for this one, and that is the
+    whole reason this exists: sqlglot does not know the function, so it carries
+    it across verbatim -- ``AGNES_HMAC(email)`` is valid output for every
+    dialect. The policy would save clean and then, at read time on the remote
+    engine, either fail (denying every caller -- an outage wearing an access
+    rule's clothes, §7.2's own worry) or, far worse, resolve to a same-named
+    UDF somebody defined in that warehouse and pseudonymize under a key this
+    instance does not control.
+
+    Refused at save time, in the one moment where the feedback is cheap and the
+    admin can pick `md5()` (transpiles everywhere) or make the table
+    ``server_only`` instead.
+    """
+    for node in statement.find_all(exp.Func):
+        raw = node.args.get("this")
+        name = raw if isinstance(raw, str) else (getattr(raw, "name", "") or "")
+        if isinstance(name, str) and name.lower() in POLICY_UDF_NAMES:
+            raise PolicyValidationError(
+                "policy_function_duckdb_only",
+                f"{name.lower()}() runs only on Agnes's own DuckDB connection and cannot be "
+                "transpiled to BigQuery or Databricks, so it may not be used in a policy on a "
+                "query_mode='remote' table. Use md5() for a pseudonym that works on every engine, "
+                "or make the table server_only if you need the keyed one.",
+            )
+
+
 def _reject_untranspilable(sql: str) -> None:
     """Rule 6, part 1: a remote-table policy must transpile to every remote
     engine's SQL without error (§7.2) -- the admin authors DuckDB SQL once,
     and sqlglot produces the form actually run against the source.
 
-    Checked for BOTH remote engines at save time, not just the one this
+    Checked for EVERY remote engine at save time, not just the one this
     particular table happens to sit on. A policy that transpiles to BigQuery
-    but not to Databricks would save clean and then fail at read time on a
-    Databricks table -- and a policy read that fails, correctly, denies (§17),
-    so the admin would have shipped an outage instead of an access rule. The
-    save-time check is the only moment where the feedback is cheap.
+    but not to Databricks (or Snowflake, S2 -- RLS review issue #1979) would
+    save clean and then fail at read time on that engine's table -- and a
+    policy read that fails, correctly, denies (§17), so the admin would have
+    shipped an outage instead of an access rule. The save-time check is the
+    only moment where the feedback is cheap.
     """
-    for engine in ("bigquery", "databricks"):
+    for engine in ("bigquery", "databricks", "snowflake"):
         try:
             sqlglot.transpile(sql, read="duckdb", write=engine)
         except Exception as exc:

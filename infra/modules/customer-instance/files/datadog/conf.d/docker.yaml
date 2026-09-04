@@ -1,0 +1,16 @@
+# Docker daemon + container metrics.
+#
+# docker.service_up is the daemon-down signal; container.* carries the
+# per-compose-service dimension (see container_labels_as_tags in datadog.yaml).
+# Image and container-size collection stay off — they walk every layer on every
+# run and buy nothing this stack monitors.
+init_config: {}
+
+instances:
+  - collect_events: true
+    unbundle_events: true
+    collect_container_size: false
+    collect_images_stats: false
+    collect_image_size: false
+    collect_disk_stats: false
+    collect_exit_codes: true

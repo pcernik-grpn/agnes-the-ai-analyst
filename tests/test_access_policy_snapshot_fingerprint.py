@@ -5,8 +5,8 @@
 laptop, bypassing every live-read enforcement point the rest of this
 feature built (Tasks 5-12) -- the parquet keeps answering from whatever
 slice was current at fetch time even after the policy tightens. This closes
-that gap: `/api/v2/scan` stamps a fingerprint of (policy SQL, caller's live
-groups) onto the `X-Agnes-Policy-Fingerprint` response header;
+that gap: `/api/v2/scan` stamps a fingerprint of (policy SQL, caller's email,
+caller's live groups) onto the `X-Agnes-Policy-Fingerprint` response header;
 `SnapshotMeta` stores it; `agnes pull` recomputes the CURRENT fingerprint
 from the manifest's per-table `access_policy_fingerprint`
 (`app/api/sync.py::_table_manifest_entry`) and withholds a mismatched
@@ -91,7 +91,7 @@ class TestPolicyFingerprintFormula:
         from src.access_policy import policy_fingerprint
 
         fp = policy_fingerprint("orders", TEAM_A_PRINCIPAL)
-        expected = hashlib.sha256(f"{POLICY_SQL}|{sorted(['TeamA'])!r}".encode()).hexdigest()
+        expected = hashlib.sha256(f"{POLICY_SQL}|{'team-a@example.com'!r}|{sorted(['TeamA'])!r}".encode()).hexdigest()
         assert fp == expected
 
     def test_none_for_a_table_with_no_policy(self, policied_orders):
@@ -135,6 +135,42 @@ class TestPolicyFingerprintFormula:
         from src.access_policy import policy_fingerprint
 
         assert policy_fingerprint("orders", TEAM_A_PRINCIPAL) == policy_fingerprint("orders", TEAM_A_PRINCIPAL)
+
+    def test_changes_when_only_the_callers_email_changes(self, policied_orders):
+        """A policy may bind ``$user_email``, so a snapshot taken under an
+        account's PREVIOUS email must stop being honoured once an admin
+        renames it -- same reasoning as the group set, which the
+        fingerprint has always folded in."""
+        from src.access_policy import policy_fingerprint
+
+        before = policy_fingerprint("orders", TEAM_A_PRINCIPAL)
+        after = policy_fingerprint("orders", {"id": "u_team_a", "email": "renamed@example.com"})
+
+        assert before != after
+
+    def test_agent_principal_keys_on_the_callers_email_not_the_owners(self, policied_orders):
+        """C2.3: ``$user_email`` binds to whoever drives the turn, so a
+        shared agent's fingerprint must follow the CALLER's email."""
+        from app.auth.session_principal import AgentPrincipal
+        from src.access_policy import policy_fingerprint
+
+        def _agent(caller_email):
+            return AgentPrincipal(
+                session_id="agent-sess-1",
+                agent_id="agent-1",
+                owner_user_id="u_team_a",
+                owner_email="team-a@example.com",
+                intersection={},
+                caller_user_id="u_team_a",
+                caller_email=caller_email,
+            )
+
+        assert policy_fingerprint("orders", _agent("team-a@example.com")) == policy_fingerprint(
+            "orders", TEAM_A_PRINCIPAL
+        )
+        assert policy_fingerprint("orders", _agent("grantee@example.com")) != policy_fingerprint(
+            "orders", TEAM_A_PRINCIPAL
+        )
 
 
 # ── /api/v2/scan: X-Agnes-Policy-Fingerprint header ──────────────────────
@@ -560,6 +596,246 @@ class TestCreateAndRefreshPersistTheFingerprint:
 
         meta = read_meta(snap_dir, "orders_snap")
         assert meta.policy_fingerprint == "NEW_FP"
+
+
+# ── `agnes snapshot create`/`refresh` disclose `X-Agnes-Row-Scope` (§10) ──
+#
+# `/api/v2/scan` has no JSON body to carry `row_scope` in, so it ships the
+# same envelope as the `X-Agnes-Row-Scope` response header instead
+# (`src/access_policy.py::row_scope_payload`, `app/api/v2_scan.py`). Before
+# this fix, `cli/commands/snapshot.py` read the sibling
+# `X-Agnes-Policy-Fingerprint`/`X-Agnes-Policy-Table-Id` headers but never
+# this one, so an analyst who materializes a filtered slice got no `[scope]`
+# note at all -- the same disclosure gap `TestCliQueryRowScopeStderr`
+# (tests/test_access_policy_disclosure.py) pins for `agnes query`.
+
+
+def _row_scope_header(table_id="orders"):
+    import json as json_lib
+
+    return json_lib.dumps(
+        {
+            "policied_tables": [table_id],
+            "note": f"rows in '{table_id}' are filtered by an access policy — this is your slice, not the whole table",
+        }
+    )
+
+
+class TestCreateAndRefreshDiscloseRowScope:
+    def test_create_prints_scope_note_to_stderr(self, tmp_path, monkeypatch, capsys):
+        import pyarrow as pa
+        from cli.commands import snapshot as snap_mod
+
+        monkeypatch.setenv("AGNES_LOCAL_DIR", str(tmp_path))
+        db = tmp_path / "user" / "duckdb" / "analytics.duckdb"
+        db.parent.mkdir(parents=True, exist_ok=True)
+        db.write_bytes(b"")
+
+        table = pa.table({"a": [1, 2, 3]})
+        monkeypatch.setattr(
+            snap_mod,
+            "api_post_arrow_with_headers",
+            lambda *a, **k: (table, {"X-Agnes-Row-Scope": _row_scope_header()}),
+        )
+        monkeypatch.setattr(snap_mod, "api_post_json", lambda *a, **k: {"estimated_scan_bytes": 0})
+        monkeypatch.setattr(snap_mod, "_open_duckdb", lambda *a, **k: _FakeConn())
+
+        snap_mod.create_cmd(
+            table_id="orders",
+            select=None,
+            where=None,
+            limit=None,
+            order_by=None,
+            as_name="orders_snap",
+            estimate=False,
+            no_estimate=True,
+            force=False,
+            from_query=None,
+            ttl=None,
+        )
+
+        captured = capsys.readouterr()
+        assert "[scope]" in captured.err
+        assert "rows in 'orders' are filtered by an access policy" in captured.err
+        assert "[scope]" not in captured.out
+
+    def test_create_no_scope_note_when_header_absent(self, tmp_path, monkeypatch, capsys):
+        import pyarrow as pa
+        from cli.commands import snapshot as snap_mod
+
+        monkeypatch.setenv("AGNES_LOCAL_DIR", str(tmp_path))
+        db = tmp_path / "user" / "duckdb" / "analytics.duckdb"
+        db.parent.mkdir(parents=True, exist_ok=True)
+        db.write_bytes(b"")
+
+        table = pa.table({"a": [1]})
+        monkeypatch.setattr(snap_mod, "api_post_arrow_with_headers", lambda *a, **k: (table, {}))
+        monkeypatch.setattr(snap_mod, "api_post_json", lambda *a, **k: {"estimated_scan_bytes": 0})
+        monkeypatch.setattr(snap_mod, "_open_duckdb", lambda *a, **k: _FakeConn())
+
+        snap_mod.create_cmd(
+            table_id="line_items",
+            select=None,
+            where=None,
+            limit=None,
+            order_by=None,
+            as_name="plain_snap",
+            estimate=False,
+            no_estimate=True,
+            force=False,
+            from_query=None,
+            ttl=None,
+        )
+
+        captured = capsys.readouterr()
+        assert "[scope]" not in captured.err
+
+    def test_create_malformed_header_does_not_crash(self, tmp_path, monkeypatch, capsys):
+        """A disclosure header must never crash a snapshot fetch -- a
+        malformed `X-Agnes-Row-Scope` is a silent no-op, same as an absent
+        one."""
+        import pyarrow as pa
+        from cli.commands import snapshot as snap_mod
+
+        monkeypatch.setenv("AGNES_LOCAL_DIR", str(tmp_path))
+        db = tmp_path / "user" / "duckdb" / "analytics.duckdb"
+        db.parent.mkdir(parents=True, exist_ok=True)
+        db.write_bytes(b"")
+
+        table = pa.table({"a": [1]})
+        monkeypatch.setattr(
+            snap_mod,
+            "api_post_arrow_with_headers",
+            lambda *a, **k: (table, {"X-Agnes-Row-Scope": "{not valid json"}),
+        )
+        monkeypatch.setattr(snap_mod, "api_post_json", lambda *a, **k: {"estimated_scan_bytes": 0})
+        monkeypatch.setattr(snap_mod, "_open_duckdb", lambda *a, **k: _FakeConn())
+
+        snap_mod.create_cmd(
+            table_id="line_items",
+            select=None,
+            where=None,
+            limit=None,
+            order_by=None,
+            as_name="malformed_snap",
+            estimate=False,
+            no_estimate=True,
+            force=False,
+            from_query=None,
+            ttl=None,
+        )
+
+        captured = capsys.readouterr()
+        assert "[scope]" not in captured.err
+        from cli.snapshot_meta import read_meta
+
+        assert read_meta(tmp_path / "user" / "snapshots", "malformed_snap") is not None
+
+    def test_from_query_create_prints_scope_note(self, tmp_path, monkeypatch, capsys):
+        """The `--from-query` path (also used by `agnes query --remote
+        --auto-snapshot`) funnels through the same `_create_snapshot` fetch,
+        so it must disclose too."""
+        import pyarrow as pa
+        from cli.commands import snapshot as snap_mod
+
+        monkeypatch.setenv("AGNES_LOCAL_DIR", str(tmp_path))
+        db = tmp_path / "user" / "duckdb" / "analytics.duckdb"
+        db.parent.mkdir(parents=True, exist_ok=True)
+        db.write_bytes(b"")
+
+        table = pa.table({"a": [1, 2, 3]})
+        monkeypatch.setattr(
+            snap_mod,
+            "api_post_arrow_with_headers",
+            lambda *a, **k: (
+                table,
+                {
+                    "X-Agnes-Row-Scope": _row_scope_header(),
+                    "X-Agnes-Policy-Table-Id": "orders",
+                },
+            ),
+        )
+        monkeypatch.setattr(snap_mod, "_open_duckdb", lambda *a, **k: _FakeConn())
+
+        snap_mod.create_cmd(
+            table_id="q_snap",
+            select=None,
+            where=None,
+            limit=None,
+            order_by=None,
+            as_name=None,
+            estimate=False,
+            no_estimate=False,
+            force=False,
+            from_query="SELECT * FROM orders",
+            ttl=None,
+        )
+
+        captured = capsys.readouterr()
+        assert "[scope]" in captured.err
+        assert "[scope]" not in captured.out
+
+    def test_refresh_prints_scope_note_to_stderr(self, tmp_path, monkeypatch, capsys):
+        import pyarrow as pa
+        from cli.commands import snapshot as snap_mod
+        from cli.snapshot_meta import write_meta
+
+        monkeypatch.setenv("AGNES_LOCAL_DIR", str(tmp_path))
+        snap_dir = tmp_path / "user" / "snapshots"
+        write_meta(snap_dir, _minimal_meta(name="orders_snap", table_id="orders"))
+
+        table = pa.table({"a": [1, 2]})
+        monkeypatch.setattr(
+            snap_mod,
+            "api_post_arrow_with_headers",
+            lambda *a, **k: (table, {"X-Agnes-Row-Scope": _row_scope_header()}),
+        )
+
+        snap_mod.refresh_cmd(name="orders_snap", where=None, ttl=None)
+
+        captured = capsys.readouterr()
+        assert "[scope]" in captured.err
+        assert "rows in 'orders' are filtered by an access policy" in captured.err
+        assert "[scope]" not in captured.out
+
+    def test_refresh_no_scope_note_when_header_absent(self, tmp_path, monkeypatch, capsys):
+        import pyarrow as pa
+        from cli.commands import snapshot as snap_mod
+        from cli.snapshot_meta import write_meta
+
+        monkeypatch.setenv("AGNES_LOCAL_DIR", str(tmp_path))
+        snap_dir = tmp_path / "user" / "snapshots"
+        write_meta(snap_dir, _minimal_meta(name="orders_snap", table_id="orders"))
+
+        table = pa.table({"a": [1, 2]})
+        monkeypatch.setattr(snap_mod, "api_post_arrow_with_headers", lambda *a, **k: (table, {}))
+
+        snap_mod.refresh_cmd(name="orders_snap", where=None, ttl=None)
+
+        captured = capsys.readouterr()
+        assert "[scope]" not in captured.err
+
+    def test_refresh_malformed_header_does_not_crash(self, tmp_path, monkeypatch, capsys):
+        import pyarrow as pa
+        from cli.commands import snapshot as snap_mod
+        from cli.snapshot_meta import read_meta, write_meta
+
+        monkeypatch.setenv("AGNES_LOCAL_DIR", str(tmp_path))
+        snap_dir = tmp_path / "user" / "snapshots"
+        write_meta(snap_dir, _minimal_meta(name="orders_snap", table_id="orders"))
+
+        table = pa.table({"a": [1, 2]})
+        monkeypatch.setattr(
+            snap_mod,
+            "api_post_arrow_with_headers",
+            lambda *a, **k: (table, {"X-Agnes-Row-Scope": "not json at all"}),
+        )
+
+        snap_mod.refresh_cmd(name="orders_snap", where=None, ttl=None)
+
+        captured = capsys.readouterr()
+        assert "[scope]" not in captured.err
+        assert read_meta(snap_dir, "orders_snap") is not None
 
 
 # ── agnes pull: block a snapshot whose fingerprint went stale ────────────

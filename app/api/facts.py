@@ -34,11 +34,7 @@ either a human admin session/PAT or the scheduler shared-secret bearer token
 ``get_current_user`` — the SAME dual-accept pattern ``app/api/jobs.py`` uses,
 no special-casing needed here). CSRF is n/a — bearer auth only, never a
 cookie session. ``POST /api/facts/ingest`` and ``GET /api/facts/corrections``
-use ``Depends(require_admin_or_producer)`` instead — the SAME admin/scheduler
-acceptance, plus a ``ProducerPrincipal`` (a corpus-extraction producer's own
-scoped callback credential, ``app.auth.producer_token``), scope-checked
-per-document at ``/ingest`` and unfiltered (documented TODO) at
-``/corrections``:
+share that same admin/scheduler acceptance:
 
 - ``POST /api/facts/ingest``          — the producer contract (spec §7.2):
   batch caps, doc_id resolution, the verbatim gate (§8), union/replace
@@ -64,7 +60,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.auth.access import require_admin, require_admin_or_producer, require_facts_enabled
+from app.auth.access import require_admin, require_facts_enabled
 from app.auth.dependencies import get_current_user
 from src.audit_helpers import identity_for_audit, log_safe
 from src.repositories import audit_repo, facts_ingest_runs_repo, facts_repo
@@ -98,6 +94,8 @@ class FactsSearchRequest(BaseModel):
     filters: Optional[Dict[str, Any]] = None
     q: Optional[str] = Field(default=None, max_length=200)
     limit: int = Field(default=20, ge=1, le=100)
+    # TCRD-295: k newest readable claims inline per subject (0 = none).
+    include_claims: int = Field(default=0, ge=0, le=3)
 
 
 class FactsNeighborsRequest(BaseModel):
@@ -108,6 +106,28 @@ class FactsNeighborsRequest(BaseModel):
     depth: int = Field(default=1, ge=1, le=2)
     fanout: int = Field(default=100, ge=1, le=100)
     limit: int = Field(default=500, ge=1, le=500)
+    # TCRD-295: k newest readable claims inline per EDGE (0 = none).
+    include_claims: int = Field(default=0, ge=0, le=3)
+
+
+class FactsEdgesRequest(BaseModel):
+    """``POST /api/facts/edges`` (TCRD-295) — the relationship-shaped read.
+    ``edge_type`` names come from ``GET /api/facts/type-map``'s
+    ``edge_types`` list; nothing here knows a customer's vocabulary (spec
+    §11). ``extend_edge_type`` follows ONE more hop from every listed edge's
+    ``extend_from`` endpoint, so a two-hop question is one request."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    edge_type: str = Field(min_length=1, max_length=200)
+    src_type: Optional[str] = Field(default=None, max_length=200)
+    dst_type: Optional[str] = Field(default=None, max_length=200)
+    src_id: Optional[str] = Field(default=None, max_length=200)
+    dst_id: Optional[str] = Field(default=None, max_length=200)
+    limit: int = Field(default=100, ge=1, le=100)
+    extend_edge_type: Optional[str] = Field(default=None, max_length=200)
+    extend_from: str = Field(default="dst", pattern="^(src|dst)$")
+    include_claims: int = Field(default=0, ge=0, le=3)
 
 
 DEFAULT_FACET_TYPES = ("client", "industry", "service_offering", "doc_type")
@@ -147,21 +167,31 @@ def facts_facets(
 
 @router.get("/type-map")
 def facts_type_map(user=Depends(get_current_user)) -> Dict[str, Any]:
-    """Live counts per node type over everything the caller can see — the
-    head of the Library's Knowledge tab, where each type is a way in.
+    """Live counts per node type AND per edge (relationship) type over
+    everything the caller can see — the head of the Library's Knowledge
+    tab, where each node type is a way in, and the cheap primer to read
+    BEFORE calling ``POST /api/facts/neighbors`` with an ``edge_types``
+    filter on a well-connected node (a live-run finding: omitting
+    ``edge_types`` because the caller had no cheap way to learn a valid
+    name pulled every relationship off the node instead of the one wanted).
 
     Same visibility gate as :func:`facts_search` with no ``type``, just
-    aggregated: a type's ``count`` is exactly how many subjects a
-    ``search(type=...)`` would let this caller reach. A type nobody can see
-    is absent rather than reported as ``0``, so the response never
-    distinguishes "no such type here" from "none you may read" — the same
-    non-disclosure ``search()`` makes. Response: ``{"types": [{"type",
-    "count"}], "total"}``, ordered by type.
+    aggregated: a node type's ``count`` is exactly how many subjects a
+    ``search(type=...)`` would let this caller reach, and an edge type's
+    ``count`` is exactly how many edges of that type
+    ``neighbors(edge_types=[that type])`` would let this caller reach from
+    somewhere. A type nobody can see is absent rather than reported as
+    ``0``, so the response never distinguishes "no such type here" from
+    "none you may read" — the same non-disclosure ``search()``/``neighbors()``
+    make. Response: ``{"types": [{"type", "count"}], "total",
+    "edge_types": [{"type", "count"}]}``, both lists ordered by type.
     """
     counts = facts_repo().count_visible_facts_by_type(user)
+    edge_counts = facts_repo().count_visible_edges_by_type(user)
     return {
         "types": [{"type": t, "count": n} for t, n in counts.items()],
         "total": sum(counts.values()),
+        "edge_types": [{"type": t, "count": n} for t, n in edge_counts.items()],
     }
 
 
@@ -186,7 +216,14 @@ def facts_search(body: FactsSearchRequest, user=Depends(get_current_user)) -> Di
     additional matches.
     """
     try:
-        result = facts_repo().search(user, type=body.type, filters=body.filters or {}, q=body.q, limit=body.limit)
+        result = facts_repo().search(
+            user,
+            type=body.type,
+            filters=body.filters or {},
+            q=body.q,
+            limit=body.limit,
+            include_claims=body.include_claims,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
     user_id, _email = identity_for_audit(user)
@@ -222,6 +259,7 @@ def facts_neighbors(body: FactsNeighborsRequest, user=Depends(get_current_user))
             depth=body.depth,
             fanout=body.fanout,
             limit=body.limit,
+            include_claims=body.include_claims,
         )
     except FactNotFound:
         raise HTTPException(status_code=404, detail="fact_not_found")
@@ -235,8 +273,66 @@ def facts_neighbors(body: FactsNeighborsRequest, user=Depends(get_current_user))
     return result
 
 
+@router.post("/edges")
+def facts_edges(body: FactsEdgesRequest, user=Depends(get_current_user)) -> Dict[str, Any]:
+    """Every visible edge of ONE type, with both endpoints as full subjects
+    (TCRD-295). The read the five primitives lacked: "which X relate to
+    which Y" was one ``neighbors`` call per root plus one ``claims`` call
+    per citation; this is one request, optionally with a second hop
+    (``extend_edge_type`` from each edge's ``extend_from`` endpoint) and
+    the ``include_claims`` newest readable quotes inline on each edge.
+
+    Same visibility posture as :func:`facts_neighbors`, all of it in SQL
+    before ``LIMIT`` (spec §5): the edge needs its OWN readable claim (or a
+    `revealed` correction), BOTH endpoints must be independently visible to
+    the caller, and ``truncated.result`` / ``truncated.extension`` are the
+    caller's own shortfall, never a signal that grants hid more. A type the
+    caller cannot see and a type that does not exist both answer with an
+    empty page. Response: ``{"nodes": [...], "edges": [{"id", "src",
+    "dst", "type", "attrs", "claims"?}], "truncated": {"result",
+    "extension", "claims"}}``.
+    """
+    try:
+        result = facts_repo().edges(
+            user,
+            edge_type=body.edge_type,
+            src_type=body.src_type,
+            dst_type=body.dst_type,
+            src_id=body.src_id,
+            dst_id=body.dst_id,
+            limit=body.limit,
+            extend_edge_type=body.extend_edge_type,
+            extend_from=body.extend_from,
+            include_claims=body.include_claims,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    user_id, _email = identity_for_audit(user)
+    log_safe(
+        user_id=user_id,
+        action="facts.edges",
+        params={
+            "edge_type": body.edge_type,
+            "extend_edge_type": body.extend_edge_type,
+            "node_count": len(result.get("nodes", [])),
+            "edge_count": len(result.get("edges", [])),
+            "include_claims": body.include_claims,
+        },
+    )
+    return result
+
+
 @router.get("/{subject_id}/claims")
-def facts_claims(subject_id: str, user=Depends(get_current_user)) -> Dict[str, Any]:
+def facts_claims(
+    subject_id: str,
+    limit: int = Query(
+        default=25,
+        ge=1,
+        le=200,
+        description="Max claims returned, newest first (TCRD-295 cap). `limit_applied` says whether more exist.",
+    ),
+    user=Depends(get_current_user),
+) -> Dict[str, Any]:
     """The caller's readable evidence for one subject (fact or edge).
 
     Each entry carries the evidencing document's identity (``corpus_id``,
@@ -254,7 +350,7 @@ def facts_claims(subject_id: str, user=Depends(get_current_user)) -> Dict[str, A
     # collection, so no route-template gate can express the check; every
     # repo read method filters by the caller (spec §5), tested S1-S6.
     try:
-        result = facts_repo().claims(user, subject_id)
+        result = facts_repo().claims(user, subject_id, limit=limit)
     except FactNotFound:
         raise HTTPException(status_code=404, detail="fact_not_found")
     user_id, _email = identity_for_audit(user)
@@ -262,7 +358,11 @@ def facts_claims(subject_id: str, user=Depends(get_current_user)) -> Dict[str, A
         user_id=user_id,
         action="facts.claims",
         resource=f"fact:{subject_id}",
-        params={"claim_count": len(result.get("claims", []))},
+        params={
+            "claim_count": len(result.get("claims", [])),
+            "limit": limit,
+            "limit_applied": bool(result.get("limit_applied")),
+        },
     )
     return result
 
@@ -435,85 +535,6 @@ def _batch_references_a_doc_id(body: "FactsIngestRequest") -> bool:
     return False
 
 
-def _refuse_producer_out_of_scope_documents(body: "FactsIngestRequest", user: Any) -> None:
-    """Authorization-level gate for a ``ProducerPrincipal`` caller: every
-    ``documents[]`` row's ``corpus_id`` must be one of the token's own
-    ``collection_ids`` — a producer scoped to collections A/B must never
-    write into collection C just because it can reach this endpoint at
-    all.
-
-    Independent of (and checked BEFORE) ``FactsPgRepository.ingest_batch``'s
-    own ``ambiguous_cross_collection_doc_id`` handling, which is a
-    data-integrity rule about EVIDENCE anchoring, not an authorization
-    boundary — a document naming an in-scope ``corpus_id`` here can still
-    be rejected by that other rule for an unrelated reason.
-
-    A no-op for every other caller (human admin, or the scheduler token
-    resolving to the admin user) — neither has a ``collection_ids`` claim
-    to check against, and neither is scope-restricted this way.
-    """
-    from app.auth.session_principal import ProducerPrincipal
-
-    if not isinstance(user, ProducerPrincipal):
-        return
-    out_of_scope = sorted(
-        {
-            str(d["corpus_id"])
-            for d in body.documents
-            if d.get("corpus_id") and str(d["corpus_id"]) not in user.collection_ids
-        }
-    )
-    if out_of_scope:
-        raise HTTPException(
-            status_code=403,
-            detail={
-                "reason": "producer_corpus_out_of_scope",
-                "corpus_ids": out_of_scope,
-                "message": (
-                    "this producer credential is scoped to a different set of collections; these "
-                    "documents' corpus_id are outside its scope"
-                ),
-            },
-        )
-
-    # …and the batch must DECLARE a corpus whenever anything in it needs a
-    # doc_id resolved. Without this the check above is bypassable outright:
-    # `FactsPgRepository.ingest_batch`'s doc_id ladder falls back to an
-    # UNRESTRICTED, instance-wide scan (`_resolve_doc` tier 3b) precisely
-    # when `documents[]` declared no `(doc_id, corpus_id)` pair at all —
-    # the documented "documents may be omitted when every doc_id already
-    # resolves" replay flow (spec §7.2). A producer scoped to collections
-    # A/B could therefore POST `documents: []` plus `nodes`/`edges` whose
-    # evidence names a doc_id living in collection C, and its claims would
-    # anchor onto C's file — or pass that doc_id in `full_documents` and
-    # DELETE C's existing claims for it (replace mode). Neither row carries
-    # a `corpus_id` for the loop above to inspect, so both slip through.
-    #
-    # Refused only for a ProducerPrincipal: tier 3b stays exactly as it was
-    # for an admin or the scheduler token, which is what the replay flow's
-    # existing callers use and what its docstring says depends on it. A
-    # producer that declares at least one `documents[]` pair keeps every
-    # tier, because `declared_corpus_ids` is then a subset of the token's
-    # own scope (the loop above has already refused any other corpus_id) and
-    # resolution cannot leave it.
-    declares_corpus = any(d.get("doc_id") and d.get("corpus_id") for d in body.documents)
-    if declares_corpus:
-        return
-    if _batch_references_a_doc_id(body):
-        raise HTTPException(
-            status_code=403,
-            detail={
-                "reason": "producer_batch_declares_no_corpus",
-                "message": (
-                    "a producer credential must declare each document's corpus_id in "
-                    "documents[]; a batch that references doc_ids without declaring any "
-                    "corpus would resolve them across every collection, escaping this "
-                    "credential's scope"
-                ),
-            },
-        )
-
-
 def _refuse_source_acl_excluded_documents(body: "FactsIngestRequest") -> None:
     """MUST NOT enforcement (2026-08-31 plan, Task 5): a document under an
     excluded SharePoint subtree/file, or under another collection's active
@@ -613,10 +634,16 @@ def _validate_evidence_audience(body: "FactsIngestRequest") -> None:
 
 
 @router.post("/ingest")
-def facts_ingest(body: FactsIngestRequest, user=Depends(require_admin_or_producer)) -> Dict[str, Any]:
-    """Ingest one producer batch (spec §7.2) — scheduler token, admin PAT,
-    or a corpus-extraction producer credential (``ProducerPrincipal``, see
-    ``app.auth.producer_token``) scoped to a set of collections.
+def facts_ingest(body: FactsIngestRequest, user=Depends(require_admin)) -> Dict[str, Any]:
+    """Ingest one facts batch (spec §7.2) — scheduler token or admin PAT.
+
+    Thin wrapper over :func:`_facts_ingest_core`, kept separate so this
+    route's signature (and OpenAPI contract) never grows an internal-only
+    parameter: :func:`connectors.sharepoint.facts_extraction._BatchShipper.
+    flush` calls :func:`_facts_ingest_core` directly, in-process, with
+    ``run_orphan_sweep=False`` (TCRD-296 C.12 — a multi-batch pass sweeps
+    ONCE, at the end, rather than once per batch) — never through this HTTP
+    surface, and never with the ability to suppress the sweep from outside.
 
     Batch caps (≤500 documents, ≤5000 claims/request) 413; a single
     document's evidence alone exceeding the claim cap is a distinct 422
@@ -644,14 +671,32 @@ def facts_ingest(body: FactsIngestRequest, user=Depends(require_admin_or_produce
     Response IS the run report: ``{claims_written,
     claims_accepted_via_identity, claims_rejected: [{row, reason}],
     source_urls_rejected: [{doc_id, reason}], deferred: [...],
-    subjects_created, subjects_deleted, corrections_active: [...],
-    review_items: [...]}``.
+    subjects_created, subjects_deleted, sweep_skipped,
+    corrections_active: [...], review_items: [...],
+    edges_skipped_missing_endpoint}``.
+
+    ``sweep_skipped`` (live finding, 2026-09) is True when this batch's own
+    end-of-ingest orphan sweep backed off because a CONCURRENT facts-
+    extraction pass already held its serializing advisory lock — never an
+    error, and ``subjects_deleted`` stays accurate either way, since the
+    next pass's sweep covers whatever this one skipped rather than double-
+    counting or under-counting. See
+    :meth:`FactsPgRepository.sweep_orphans`'s "Concurrency" section.
 
     ``claims_accepted_via_identity`` (spec §8) is the subset of
     ``claims_written`` whose quote passed the verbatim gate ONLY via the
     document's own SERVER-STORED ``filename``/``path`` — never a chunk of
     its extracted text — so an operator can see how much evidence is
     filename-grounded rather than content-grounded.
+
+    ``edges_skipped_missing_endpoint`` counts an edge whose ``src``/``dst``
+    fact resolved fine but no longer existed by the time
+    :meth:`FactsPgRepository.create_edge`'s INSERT ran — a race between
+    concurrent facts-extraction passes sharing one fact graph (a
+    not-yet-evidenced fact swept as orphan by another in-flight call, or two
+    passes merging/deduplicating the same entity), never a producer mistake.
+    That one edge is skipped, never the whole batch; see
+    ``EdgeEndpointMissing`` in ``src/repositories/facts_pg.py``.
 
     ``source_urls_rejected`` (O7 follow-up) is a document's ``source_url``
     the validator dropped as invalid (``too_long`` / ``unparseable`` /
@@ -700,24 +745,8 @@ def facts_ingest(body: FactsIngestRequest, user=Depends(require_admin_or_produce
     itself refused (``503`` ``anonymization_check_unavailable``) rather
     than treated as "nothing is marked" — see
     :func:`_refuse_undeclared_anonymize_marked_corpora`.
-
-    Producer scope gate: a ``ProducerPrincipal`` caller additionally has
-    every ``documents[]`` row's ``corpus_id`` checked against its own
-    ``collection_ids`` claim — any row naming a corpus outside that set is
-    REJECTED whole-batch (``403`` ``producer_corpus_out_of_scope``,
-    itemizing the offending corpus ids), an authorization boundary
-    independent of the ``ambiguous_cross_collection_doc_id`` data-integrity
-    rule above — AND, because the repository's doc_id ladder falls back to
-    an unrestricted instance-wide scan exactly when ``documents[]`` declared
-    no corpus at all, a producer batch that references any doc_id (node/edge
-    evidence, or ``full_documents``' replace-mode delete list) without
-    declaring one is refused whole (``403``
-    ``producer_batch_declares_no_corpus``). See
-    :func:`_refuse_producer_out_of_scope_documents`. A human admin (or the
-    scheduler token) has no such claim, keeps the documented
-    documents-omitted replay flow, and is unaffected by either half.
     ``evidence[].audience`` (Task 10, spec §4.2) is format-validated FIRST,
-    before either gate below — see :func:`_validate_evidence_audience`.
+    before either gate — see :func:`_validate_evidence_audience`.
 
     A fourth gate (2026-08-31 plan, Task 5) refuses any ``documents[]`` row
     whose ``path``/``stable_id`` falls under a SharePoint connection's
@@ -726,9 +755,16 @@ def facts_ingest(body: FactsIngestRequest, user=Depends(require_admin_or_produce
     honored the crawl-time exclusion list. See
     :func:`_refuse_source_acl_excluded_documents`.
     """
+    return _facts_ingest_core(body, user)
+
+
+def _facts_ingest_core(body: FactsIngestRequest, user, *, run_orphan_sweep: bool = True) -> Dict[str, Any]:
+    """The implementation :func:`facts_ingest` (the HTTP route) wraps —
+    see ITS docstring for the full producer contract (batch caps, gates,
+    response shape). The ONLY behavior this adds is ``run_orphan_sweep``
+    (TCRD-296 C.12), never reachable from the route itself."""
     _validate_evidence_audience(body)
     _refuse_undeclared_anonymize_marked_corpora(body)
-    _refuse_producer_out_of_scope_documents(body, user)
     _refuse_source_acl_excluded_documents(body)
     try:
         report = facts_repo().ingest_batch(
@@ -736,6 +772,7 @@ def facts_ingest(body: FactsIngestRequest, user=Depends(require_admin_or_produce
             full_documents=body.full_documents,
             nodes=body.nodes,
             edges=body.edges,
+            run_orphan_sweep=run_orphan_sweep,
         )
     except IngestBatchTooLarge as exc:
         raise HTTPException(status_code=413, detail=exc.detail)
@@ -752,14 +789,10 @@ def facts_ingest(body: FactsIngestRequest, user=Depends(require_admin_or_produce
             detail={"reason": "reserved_source_stable_id", "stable_ids": exc.stable_ids},
         )
 
-    from app.auth.session_principal import ProducerPrincipal
-
-    is_producer = isinstance(user, ProducerPrincipal)
     user_id, _email = identity_for_audit(user)
     log_safe(
         user_id=user_id,
         action="facts.ingest",
-        client_kind="producer" if is_producer else None,
         params={
             "documents": len(body.documents),
             "claims_written": report.get("claims_written", 0),
@@ -769,7 +802,7 @@ def facts_ingest(body: FactsIngestRequest, user=Depends(require_admin_or_produce
 
     try:
         corpus_ids = sorted({d.get("corpus_id") for d in body.documents if d.get("corpus_id")})
-        caller = f"producer:{user.connection_id}" if is_producer else (user.get("email") or user.get("id", "admin"))
+        caller = user.get("email") or user.get("id", "admin")
         facts_ingest_runs_repo().create(
             corpus_ids=corpus_ids,
             caller=caller,
@@ -783,6 +816,7 @@ def facts_ingest(body: FactsIngestRequest, user=Depends(require_admin_or_produce
             review_items=report.get("review_items", []),
             anonymization=body.anonymization.model_dump() if body.anonymization else None,
             llm_usage=body.llm_usage.model_dump(exclude_none=True) if body.llm_usage else None,
+            edges_skipped_missing_endpoint=report.get("edges_skipped_missing_endpoint", 0),
         )
     except Exception:  # noqa: BLE001 — never let a report-write failure look like an ingest failure
         logger.warning("facts.ingest: failed to persist the run report (ingest itself succeeded)", exc_info=True)
@@ -861,14 +895,13 @@ def delete_correction(
 
 
 @router.get("/corrections")
-def list_corrections(user=Depends(require_admin_or_producer)) -> Dict[str, Any]:
-    """The producer export (spec §7.4): every ``wrong`` subject with its
-    ``natural_keys`` snapshot, so a producer's re-extraction pass can prune
-    them before re-asserting claims. Server-side, corrections are ALSO
-    enforced at read time regardless (§4) — a producer that ignores this
+def list_corrections(user=Depends(require_admin)) -> Dict[str, Any]:
+    """The corrections export (spec §7.4): every ``wrong`` subject with its
+    ``natural_keys`` snapshot, so a re-extraction pass can prune them
+    before re-asserting claims. Server-side, corrections are ALSO enforced
+    at read time regardless (§4) — an extraction pass that ignores this
     export cannot resurrect a withheld fact, this just saves it the wasted
-    work. Scheduler token, admin PAT, or a corpus-extraction
-    ``ProducerPrincipal`` (``app.auth.producer_token``).
+    work. Scheduler token or admin PAT.
 
     NOT filtered to the caller's own ``collection_ids`` — a ``corrections``
     row is keyed on ``(subject_kind, subject_id)`` with only a
@@ -906,9 +939,9 @@ def list_ingest_runs(
     priced; see :meth:`FactsIngestRunsPgRepository.llm_usage_rollup` for
     why it is never a fabricated precise number). It covers EVERY run this
     instance has ever persisted, not just the ``limit``-bounded ``runs``
-    list above, and is instance-wide rather than per-connection (same
-    interim limitation as ``distinct_corpus_ids``'s "scope collections"
-    heuristic) — a per-connection split is a documented follow-up once a
-    real connection-to-collection mapping exists."""
+    list above, and is instance-wide rather than per-connection — see that
+    method's own docstring for why (an ingest run report carries no
+    connection id to split on, unlike ``_sharepoint_pipeline_cell``'s
+    crawl/extract/facts counts)."""
     repo = facts_ingest_runs_repo()
     return {"runs": repo.list_recent(limit=limit), "llm_usage_totals": repo.llm_usage_rollup()}

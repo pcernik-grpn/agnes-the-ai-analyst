@@ -32,6 +32,31 @@ _loaded_once: bool = False
 # `load_instance_config` returns early whenever it is not.
 _last_good_config: Optional[dict] = None
 
+# ``(mtime_ns, size)`` of the writable overlay the last time this process
+# built `_instance_config` from it (or ``None`` when no overlay file existed
+# at that point). Compared against the file's CURRENT stat on every
+# `load_instance_config()` call so a save from a SIBLING process — this
+# deployment's `app`, `scheduler` and `extraction-worker` are separate
+# processes off the same image, each with its own copy of this module — is
+# observed within seconds, with no restart and no explicit `reset_cache()`
+# call from the process that didn't handle the save. See
+# `_overlay_fingerprint`.
+_overlay_cache_fingerprint: Optional[tuple[int, int]] = None
+
+# ``id(_instance_config)`` at the moment this module itself last built and
+# cached it. The test suite widely relies on
+# ``monkeypatch.setattr(instance_config, "_instance_config", {...})`` to
+# inject a config directly, bypassing the loader entirely (25+ files, e.g.
+# ``test_theme_overrides_ds.py``) — that pattern must go on being trusted
+# completely, exactly as it was before the staleness check below existed.
+# Comparing THIS dict's identity, not just "is it None", is what tells the
+# two apart: a dict this module built has a matching id and gets the
+# staleness check; a dict something else swapped in does not, and is
+# returned as-is with no second-guessing. Deliberately not reset by
+# `reset_cache()` — an id that no longer matches `_instance_config` (which
+# `reset_cache()` sets to ``None``) is inert on its own.
+_last_built_instance_config_id: Optional[int] = None
+
 # Why the static `CONFIG_DIR/instance.yaml` could not be loaded, if it could
 # not. A validation failure there is NOT fatal — the app boots on built-in
 # defaults — which is a footgun: one typo'd key and the instance runs under
@@ -83,25 +108,36 @@ def get_static_config_error() -> Optional[str]:
     return _static_config_error
 
 
-def reset_cache() -> None:
-    """Drop the in-process instance.yaml cache; the next ``load_instance_config``
-    call re-reads from disk. Used by `/api/admin/server-config` after a save.
-    Public alias so callers don't have to reach into the private global.
+def _overlay_fingerprint(path) -> Optional[tuple[int, int]]:
+    """``(mtime_ns, size)`` of ``path``, or ``None`` if it doesn't exist or
+    can't be stat'd. A plain ``stat()`` — no read — so it works even while
+    the file is unreadable to this process (0600 + uid mismatch): staleness
+    detection must not depend on the same permission the content read can
+    fail on. Two fields, not one: relying on mtime alone risks a same-tick
+    collision on filesystems with coarse timestamp resolution; a changed
+    size alone is still detected even then.
+    """
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return (st.st_mtime_ns, st.st_size)
 
-    Also clears ``connectors.bigquery.access.get_bq_access`` so the v2 endpoints
+
+def _clear_derived_config_caches() -> None:
+    """Invalidate caches this module doesn't own but that are derived from
+    a config value — called by both ``reset_cache()`` (an explicit save in
+    THIS process) and the automatic staleness reload in
+    ``load_instance_config()`` (a save observed from ANOTHER process), so
+    neither path trades a fresh ``instance_config`` for a stale derivative.
+
+    Clears ``connectors.bigquery.access.get_bq_access`` so the v2 endpoints
     pick up new BigQuery project IDs after an admin saves `instance.yaml` —
     without this, `get_bq_access`'s `@functools.cache` would freeze the projects
     at first call and require a container restart to pick up changes (Devin
     ANALYSIS_0004 on PR #138). Lazy-imported so this module stays usable in
     environments where the connectors package can't be imported (e.g. unit
     tests of instance_config in isolation)."""
-    global _instance_config
-    _instance_config = None
-    # `_loaded_once` is deliberately NOT reset: it records that this process
-    # got a good config at least once, which is what separates "refuse to
-    # start" from "do not 500 every live request". This function runs on a
-    # live instance after an admin save, and that must not re-arm a
-    # boot-time guard.
     try:
         from connectors.bigquery.access import get_bq_access
 
@@ -109,6 +145,23 @@ def reset_cache() -> None:
     except Exception:
         # Connectors module not loaded yet, or BQ deps missing — both fine.
         pass
+
+
+def reset_cache() -> None:
+    """Drop the in-process instance.yaml cache; the next ``load_instance_config``
+    call re-reads from disk. Used by `/api/admin/server-config` after a save.
+    Public alias so callers don't have to reach into the private global.
+
+    Also clears every derived cache ``_clear_derived_config_caches`` knows
+    about (currently ``get_bq_access``) — see its docstring."""
+    global _instance_config
+    _instance_config = None
+    # `_loaded_once` is deliberately NOT reset: it records that this process
+    # got a good config at least once, which is what separates "refuse to
+    # start" from "do not 500 every live request". This function runs on a
+    # live instance after an admin save, and that must not re-arm a
+    # boot-time guard.
+    _clear_derived_config_caches()
 
 
 def get_database_config() -> dict:
@@ -179,8 +232,46 @@ def load_instance_config(*, strict: bool = False) -> dict:
     list) saw empty defaults. See PR #107.
     """
     global _instance_config, _loaded_once, _last_good_config, _static_config_error
+    global _overlay_cache_fingerprint, _last_built_instance_config_id
+
+    # Resolve via _state_dir() so the path matches the writer in
+    # app/api/admin.py — under the flat-mount layout (STATE_DIR=/data-state)
+    # both the configure-endpoint and the server-config-endpoint write
+    # ``/data-state/instance.yaml``; reading from ``/data/state/...`` here
+    # would silently load stale config from the regenerable data disk.
+    # Resolved up front, even on the cache-hit path below, because the
+    # staleness check needs it before it knows whether it can return early.
+    from app.secrets import _state_dir
+
+    overlay_path = _state_dir() / "instance.yaml"
+    current_fingerprint = _overlay_fingerprint(overlay_path)
+
     if _instance_config is not None:
-        return _instance_config
+        if id(_instance_config) != _last_built_instance_config_id:
+            # Something OTHER than this function set `_instance_config` —
+            # see `_last_built_instance_config_id`'s docstring. Trust it as-
+            # is; there is no fingerprint recorded for it to compare
+            # against, and manufacturing one would be a guess.
+            return _instance_config
+        if current_fingerprint == _overlay_cache_fingerprint:
+            return _instance_config
+        # The overlay changed on disk since this process last built its
+        # cache: a save this process did NOT handle (a multi-container
+        # deployment runs `app`/`scheduler`/`extraction-worker` as separate
+        # processes off the same image, each with its own copy of this
+        # module-level cache) or a manual edit. Invalidate and fall through
+        # to rebuild below — this is what lets a process that did not
+        # perform the save still observe the new value within seconds, with
+        # no restart and no explicit `reset_cache()` call from here.
+        logger.info(
+            "instance.yaml overlay at %s changed on disk since this process's "
+            "cached config was built (%r -> %r) — reloading",
+            overlay_path,
+            _overlay_cache_fingerprint,
+            current_fingerprint,
+        )
+        _instance_config = None
+        _clear_derived_config_caches()
 
     import yaml
 
@@ -222,14 +313,13 @@ def load_instance_config(*, strict: bool = False) -> dict:
     # mirror the resolver here before the deep-merge — without it, the
     # LLM factory receives the literal placeholder and rejects it as an
     # invalid api key (#179 review fix).
-    # Resolve via _state_dir() so the path matches the writer in
-    # app/api/admin.py — under the flat-mount layout (STATE_DIR=/data-state)
-    # both the configure-endpoint and the server-config-endpoint write
-    # ``/data-state/instance.yaml``; reading from ``/data/state/...`` here
-    # would silently load stale config from the regenerable data disk.
-    from app.secrets import _state_dir
-
-    overlay_path = _state_dir() / "instance.yaml"
+    #
+    # `overlay_degraded` tracks whether THIS read/parse attempt failed for
+    # any reason short of the fail-closed OSError-unreadable case below
+    # (which returns on its own). Checked once, after the whole block, to
+    # decide whether to prefer `_last_good_config` over the plain static
+    # `base` this attempt produced — see there.
+    overlay_degraded = False
     if overlay_path.exists():
         try:
             raw = overlay_path.read_text()
@@ -298,6 +388,20 @@ def load_instance_config(*, strict: bool = False) -> dict:
                     exc,
                 )
                 _instance_config = _last_good_config
+                # Without these two, the top-of-function staleness check
+                # would see this same broken file again on the very next
+                # call (its fingerprint hasn't moved) and repeat this whole
+                # attempt — re-reading, re-failing, re-logging — on every
+                # request, exactly the log storm the comment above already
+                # guards against for the OLD "no mtime check" cache. This is
+                # that same guard, extended to the new staleness check;
+                # `_last_built_instance_config_id` also has to move together
+                # with `_instance_config` or the NEXT call's identity check
+                # would treat this fallback value as "someone else set it"
+                # and skip the staleness check (and the fingerprint update)
+                # entirely.
+                _overlay_cache_fingerprint = current_fingerprint
+                _last_built_instance_config_id = id(_instance_config)
                 return _instance_config
             raise InstanceConfigUnreadable(
                 f"cannot read the instance.yaml overlay at {overlay_path}: {exc}. "
@@ -318,12 +422,13 @@ def load_instance_config(*, strict: bool = False) -> dict:
             # that looks healthy and 500s on everything. So it degrades to the
             # base config like any other malformed file.
             logger.exception(
-                "instance.yaml overlay at %s could not be decoded — falling back to "
-                "static base config; saves through the editor will refuse until the "
-                "file is repaired",
+                "instance.yaml overlay at %s could not be decoded — this read "
+                "will not update the cached config; saves through the editor "
+                "will refuse until the file is repaired",
                 overlay_path,
             )
             raw = None
+            overlay_degraded = True
         try:
             overlay = yaml.safe_load(raw or "") or {}
             from config.loader import _resolve_env_refs
@@ -333,15 +438,39 @@ def load_instance_config(*, strict: bool = False) -> dict:
             logger.info("Merged overlay from %s", overlay_path)
         except Exception:
             logger.exception(
-                "instance.yaml overlay at %s is corrupt — falling back to "
-                "static base config; saves through the editor will refuse "
-                "until the file is repaired",
+                "instance.yaml overlay at %s is corrupt — this read will not "
+                "update the cached config; saves through the editor will "
+                "refuse until the file is repaired",
                 overlay_path,
             )
+            overlay_degraded = True
+
+    if overlay_degraded and _last_good_config is not None:
+        # Same reasoning as the OSError-unreadable branch above, one failure
+        # mode over: a corrupt/undecodable overlay observed mid-write by
+        # ANOTHER process's save (or a manual edit gone wrong) must not
+        # silently demote a process that has already loaded a good config
+        # down to `base` — the static file alone, missing every
+        # operator-set section the overlay carried. Deliberately does NOT
+        # touch `_last_good_config` itself: it must still hold the last
+        # actually-good MERGE the next corruption falls back to, not this
+        # attempt's degraded static-only `base`.
+        logger.error(
+            "instance.yaml overlay at %s is corrupt or undecodable — serving "
+            "the last good config; saves through the editor will refuse "
+            "until the file is repaired",
+            overlay_path,
+        )
+        _instance_config = _last_good_config
+        _overlay_cache_fingerprint = current_fingerprint
+        _last_built_instance_config_id = id(_instance_config)
+        return _instance_config
 
     _instance_config = base
     _last_good_config = base
     _loaded_once = True
+    _overlay_cache_fingerprint = current_fingerprint
+    _last_built_instance_config_id = id(_instance_config)
     return _instance_config
 
 
@@ -1545,6 +1674,9 @@ _DATA_APPS_ENV_DEFAULTS = {
     # image), fork-bomb ceiling on.
     "container_read_only": False,
     "container_pids_limit": 512,
+    # Mirrors `app/api/data_apps.py::_CONFIG_DEFAULTS` — deploy-time exposure
+    # scan mode (#1946): `warn` (default) / `block` / `off`.
+    "deploy_checks": "warn",
 }
 
 
@@ -1844,6 +1976,36 @@ def get_llm_usage_retention_days() -> int:
         return max(0, int(val))
     except (TypeError, ValueError):
         return 0
+
+
+def get_collections_search_max_chunks() -> int:
+    """Server-side cap on how many chunks ``GET /api/collections/search`` (and
+    the ``/api/knowledge/search`` chunk leg) may rank per request (#2151).
+
+    Reads ``collections.search_max_chunks``. Default **25000** — the point
+    ``scripts/bench_retrieval.py`` measured at ~371 MB peak RSS per query
+    (with production-sized, 3200-char chunks it is a conservative upper
+    bound, not a floor: the bench used 4x-smaller synthetic chunks), which
+    leaves comfortable headroom under the API container's default 4 GiB
+    ``mem_limit`` (``docker-compose.yml``) even with a few concurrent
+    searches in flight. The next bench point (240k chunks, ~1.8 GB) is close
+    to half that budget for a SINGLE query and is exactly the blowup this
+    cap exists to prevent.
+
+    A corpus at or under the cap is unaffected (no prefilter, identical
+    results to before). Over it, the repository applies a SQL-side lexical
+    prefilter + ``LIMIT`` instead of fetching every row — see
+    ``src.ingest.retrieval.search_with_meta``. Unlike the retention knobs
+    above, ``0`` has no special "unlimited" meaning here (an unbounded cap is
+    the exact risk this knob exists to bound), so a non-positive configured
+    value clamps to ``1`` rather than being honored, and a non-numeric value
+    falls back to the default.
+    """
+    val = get_value("collections", "search_max_chunks", default=25000)
+    try:
+        return max(1, int(val))
+    except (TypeError, ValueError):
+        return 25000
 
 
 def get_agent_scope_snapshots_retention_days() -> int:
@@ -2172,9 +2334,9 @@ def warn_retired_sharepoint_flags() -> list[str]:
     assert on the result instead of scraping the log.
     """
     warned: list[str] = []
-    new_switch_set = bool(os.environ.get("AGNES_SHAREPOINT_ENABLED")) or get_value(
-        "sharepoint", "enabled", default=None
-    ) is not None
+    new_switch_set = (
+        bool(os.environ.get("AGNES_SHAREPOINT_ENABLED")) or get_value("sharepoint", "enabled", default=None) is not None
+    )
     for env_var, path in _RETIRED_SHAREPOINT_FLAGS:
         if os.environ.get(env_var) is None and get_value(*path, default=None) is None:
             continue

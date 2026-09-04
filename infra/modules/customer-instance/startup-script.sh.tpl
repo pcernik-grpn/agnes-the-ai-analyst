@@ -32,6 +32,230 @@ AGNES_APPLIER_UID=999
 
 echo "=== [Agnes $CUSTOMER_NAME $ROLE] Startup at $(date) ==="
 
+# --- 0. Reserve the state-applier's pinned uid before ANYTHING else can take
+# it -------------------------------------------------------------------
+# `/data/state/instance.yaml` is only readable by the app container (uid
+# $AGNES_APPLIER_UID) while `agnes-applier` resolves to that same number —
+# see the declaration above and the readback further down (#1217). That held
+# for years because nothing else on a fresh VM claimed a uid in the low-900s
+# system range before agnes-applier's own useradd ran, later in this script.
+# The opt-in Datadog agent broke that: its apt postinst creates the
+# `dd-agent` system user with NO uid pin, and `useradd --system` allocates
+# the top free id in the system range — which IS $AGNES_APPLIER_UID on an
+# otherwise-untouched image. Whichever of the two ran first won the number,
+# and agnes-applier used to run second every time. Observed live
+# (2026-09-03, enable_datadog=true on a VM recreate): dd-agent grabbed uid
+# 999, the applier's own pinned useradd failed and fell through to an
+# allocated 997, the recursive /data/state chown further down then re-owned
+# an instance.yaml that was already 0600 from a previous boot onto that
+# uid, and the app container (still uid 999) crash-looped on
+# InstanceConfigUnreadable before Caddy or the scheduler ever started.
+#
+# Reserving the uid HERE — before section 1's Docker install and before the
+# Datadog agent's own apt install, i.e. before anything else that could add
+# a system user — closes the race outright: whichever package runs later
+# simply cannot see $AGNES_APPLIER_UID as free any more. The Datadog block
+# further down additionally pins dd-agent to its own fixed
+# $DATADOG_DD_AGENT_UID as a second, order-independent guard, in case a
+# future reorder ever puts an unpinned-uid installer ahead of this block
+# again.
+#
+# Idempotent and otherwise identical to the belt-and-braces useradd sites
+# further down (kept there too, per #1217 — every useradd site pins the same
+# variable so they cannot drift apart): only the CREATE is skipped when the
+# user already exists here; the actual uid match is verified by the readback
+# right before instance.yaml's chmod, not here.
+if ! id -u agnes-applier >/dev/null 2>&1; then
+    # The group is ensured separately and useradd takes `--gid`, not
+    # `--user-group`: with `--user-group` an orphaned agnes-applier group —
+    # e.g. left behind by the documented userdel+re-run remediation — would
+    # fail BOTH useradd attempts ("group exists") and, under this script's
+    # errexit, abort the whole boot. Only the UID is pinned; the gid does
+    # not matter: instance.yaml is 0600, so the group bits grant nothing
+    # and only the owner's uid decides who can read it.
+    getent group agnes-applier >/dev/null 2>&1 || groupadd --system agnes-applier
+    useradd --system --no-create-home --shell /usr/sbin/nologin \
+            --uid "$AGNES_APPLIER_UID" --gid agnes-applier agnes-applier 2>/dev/null \
+    || useradd --system --no-create-home --shell /usr/sbin/nologin \
+            --gid agnes-applier agnes-applier
+fi
+
+# --- 0a. VM-derived sizing: container memory ceilings + Postgres tuning ---
+# Terraform's app_mem_limit / scheduler_mem_limit / extraction_worker_mem_limit
+# accept "auto" (the default) to defer sizing to the box this script actually
+# boots on, instead of a fixed literal baked in at `terraform plan` time that
+# never matches a bigger or smaller machine type. An explicit value (e.g.
+# "8g") always wins outright — "auto" is the only trigger for computation
+# below, and every value here is re-derived on EVERY boot (idempotent), so a
+# VM recreate never regresses to a laptop-sized default. Deliberately AFTER
+# section 0 above: the uid reservation's guarantee is "before ANY package
+# activity" (#2137 follow-up), and this section runs commands (awk, nproc) —
+# see tests/test_startup_datadog_toggle.py::test_nothing_executable_
+# precedes_the_uid_reservation.
+#
+# TCRD-296 (F.23/F.24) — live finding on a 64-vCPU/251GB VM: a fixed 4g app
+# cap OOM-killed uvicorn four times while serving DuckDB queries, and
+# Postgres' stock settings (shared_buffers 128-160MB, work_mem 4MB,
+# effective_cache_size 5GB) plus Docker's default 64MB /dev/shm made every
+# parallel worker fail with "could not resize shared memory segment" (~2850
+# times in 30 minutes), killing a facts extraction job. The functions below
+# derive both from /proc/meminfo + nproc instead.
+#
+# Pure integer math, no file I/O — callers (right below the block) read
+# /proc/meminfo and nproc once and pass the results in, which is also what
+# lets the unit tests drive every code path with values a real VM (a
+# 64-vCPU/251GB box down to a 1-vCPU/2GB dev VM) would report, instead of
+# depending on the CI runner's own /proc/meminfo.
+# --- vm-sizing begin (extracted + executed by tests/test_startup_vm_sizing.py) ---
+agnes_clamp() {
+    local value="$1" min="$2" max="$3"
+    if [ "$value" -lt "$min" ]; then value="$min"; fi
+    if [ "$value" -gt "$max" ]; then value="$max"; fi
+    echo "$value"
+}
+
+# Container memory ceilings — the integer number of GiB (the caller adds the
+# "g" suffix docker compose's mem_limit expects). $1 = total RAM in MiB.
+agnes_auto_app_mem_limit_gb() {
+    local ram_mb="$1" gb
+    gb=$(( ram_mb / 8 / 1024 ))
+    agnes_clamp "$gb" 4 32
+}
+
+agnes_auto_worker_mem_limit_gb() {
+    # RAM * 0.6, capped so app + worker + an 8 GiB headroom (Postgres + host)
+    # never asks for more than the box actually has. The app footprint here
+    # is estimated with the SAME auto formula regardless of whether
+    # app_mem_limit itself is "auto" or a hand-set override — an estimate is
+    # all a safety margin needs, and it keeps this function pure (RAM in, no
+    # string parsing of an arbitrary override's unit).
+    local ram_mb="$1" ram_gb app_est_gb ratio_gb headroom_gb gb
+    ram_gb=$(( ram_mb / 1024 ))
+    app_est_gb=$(agnes_clamp $(( ram_gb / 8 )) 4 32)
+    ratio_gb=$(( ram_gb * 6 / 10 ))
+    headroom_gb=$(( ram_gb - app_est_gb - 8 ))
+    gb="$ratio_gb"
+    if [ "$headroom_gb" -lt "$gb" ]; then gb="$headroom_gb"; fi
+    agnes_clamp "$gb" 4 "$ram_gb"
+}
+
+agnes_auto_scheduler_mem_limit_gb() {
+    echo 2
+}
+
+# Postgres tuning — MiB integers (the caller adds the MB/m unit suffix).
+agnes_pg_shared_buffers_mb() {
+    local ram_mb="$1"
+    agnes_clamp $(( ram_mb * 25 / 100 )) 1 32768
+}
+
+agnes_pg_effective_cache_size_mb() {
+    local ram_mb="$1"
+    echo $(( ram_mb * 60 / 100 ))
+}
+
+agnes_pg_work_mem_mb() {
+    # Was capped at 128 MiB until TCRD-296 gap #76: a live 14M-row FTS
+    # bitmap on a 252 GiB VM needed 256 MiB to avoid spilling to disk. The
+    # divisor is unchanged (RAM/512), so the floor and the ratio for smaller
+    # hosts are identical to before — only the ceiling moved, and it takes a
+    # 128 GiB+ host to reach it (65536 MiB / 512 = 128, already the OLD cap,
+    # so every host under 128 GiB sees no change at all).
+    local ram_mb="$1"
+    agnes_clamp $(( ram_mb / 512 )) 16 256
+}
+
+agnes_pg_maintenance_work_mem_mb() {
+    local ram_mb="$1"
+    agnes_clamp $(( ram_mb / 16 )) 1 4096
+}
+
+agnes_pg_max_parallel_workers_per_gather() {
+    local nproc="$1"
+    agnes_clamp $(( nproc / 8 )) 0 4
+}
+
+agnes_pg_shm_size_mb() {
+    local ram_mb="$1"
+    agnes_clamp $(( ram_mb * 2 / 100 )) 256 999999
+}
+
+# Per-replica Postgres connection budget for the `extraction-worker` service
+# (TCRD-296 gap #76). A conservative CONSTANT, not derived from
+# `extraction.concurrency`/`extraction.facts.concurrency` (instance.yaml,
+# runtime-editable, unreachable from a boot-time shell): 2x the DEFAULT
+# per-process pool-size hint `src/db_pg.py::_extraction_worker_pool_size_hint`
+# computes for a SINGLE replica when both knobs are left at their own
+# defaults (extraction.concurrency=1 + extraction.facts.concurrency=3 = 4
+# lanes) — headroom for an operator who raises either knob without also
+# raising these two by hand. Only rendered onto the extraction-worker
+# service (never app/scheduler) when extraction_worker_replicas > 1 — see
+# the EXTRYAML overlay below — so a single-replica VM keeps today's
+# per-process dynamic sizing untouched.
+agnes_pg_extraction_worker_pool_size() {
+    echo 8
+}
+
+agnes_pg_extraction_worker_max_overflow() {
+    echo 8
+}
+
+# Postgres side-car `max_connections` — sized to comfortably hold app +
+# scheduler (each at their own unchanged pool_size(5) + max_overflow(10)
+# defaults from src/db_pg.py = 15 connections apiece) plus every
+# extraction-worker replica's own pool budget above, plus headroom for
+# manual psql/pg_isready/monitoring connections. $1 = extraction-worker
+# replica count (1 when the lane is off or unset — see
+# extraction_worker_replicas in variables.tf). At the default of 1 replica
+# this clamps to Postgres' OWN stock default (100), so rendering it
+# explicitly changes nothing for an instance that never touches the field —
+# see docs/DEPLOYMENT.md#sizing-an-extraction-instance for the worked
+# example on a 6-replica VM.
+agnes_pg_max_connections() {
+    local replicas="$1" pool overflow app_budget=15 scheduler_budget=15 headroom=40
+    pool=$(agnes_pg_extraction_worker_pool_size)
+    overflow=$(agnes_pg_extraction_worker_max_overflow)
+    agnes_clamp $(( app_budget + scheduler_budget + (pool + overflow) * replicas + headroom )) 100 999999
+}
+# --- vm-sizing end ---
+
+AGNES_TOTAL_MEM_MB=$(awk '/MemTotal/ {printf "%d", $2/1024}' /proc/meminfo)
+AGNES_NPROC=$(nproc)
+
+RESOLVED_APP_MEM_LIMIT="${app_mem_limit}"
+if [ "$RESOLVED_APP_MEM_LIMIT" = "auto" ]; then
+    RESOLVED_APP_MEM_LIMIT="$(agnes_auto_app_mem_limit_gb "$AGNES_TOTAL_MEM_MB")g"
+fi
+RESOLVED_SCHEDULER_MEM_LIMIT="${scheduler_mem_limit}"
+if [ "$RESOLVED_SCHEDULER_MEM_LIMIT" = "auto" ]; then
+    RESOLVED_SCHEDULER_MEM_LIMIT="$(agnes_auto_scheduler_mem_limit_gb)g"
+fi
+RESOLVED_EXTRACTION_WORKER_MEM_LIMIT="${extraction_worker_mem_limit}"
+if [ "$RESOLVED_EXTRACTION_WORKER_MEM_LIMIT" = "auto" ]; then
+    RESOLVED_EXTRACTION_WORKER_MEM_LIMIT="$(agnes_auto_worker_mem_limit_gb "$AGNES_TOTAL_MEM_MB")g"
+fi
+# Plain integer, no "auto" — an operator sets the replica count directly
+# (default 1, TCRD-296 gap #76). Threaded through every `docker compose up`
+# that could otherwise recreate the stack back to one replica — see the
+# `--scale extraction-worker=` sites below and in agnes-auto-upgrade.sh.
+RESOLVED_EXTRACTION_WORKER_REPLICAS="${extraction_worker_replicas}"
+
+# Postgres side-car tuning — computed unconditionally (day-zero seeds
+# database.backend=side_car, see section 2 below) and written into .env
+# further down. ALTER SYSTEM values set by hand on a running instance
+# (postgresql.auto.conf) take precedence over these -c flags — see
+# docs/DEPLOYMENT.md ("Sizing the Postgres side-car") for how to clear them.
+AGNES_PG_SHARED_BUFFERS="$(agnes_pg_shared_buffers_mb "$AGNES_TOTAL_MEM_MB")MB"
+AGNES_PG_EFFECTIVE_CACHE_SIZE="$(agnes_pg_effective_cache_size_mb "$AGNES_TOTAL_MEM_MB")MB"
+AGNES_PG_WORK_MEM="$(agnes_pg_work_mem_mb "$AGNES_TOTAL_MEM_MB")MB"
+AGNES_PG_MAINTENANCE_WORK_MEM="$(agnes_pg_maintenance_work_mem_mb "$AGNES_TOTAL_MEM_MB")MB"
+AGNES_PG_MAX_PARALLEL_WORKERS_PER_GATHER="$(agnes_pg_max_parallel_workers_per_gather "$AGNES_NPROC")"
+AGNES_PG_SHM_SIZE="$(agnes_pg_shm_size_mb "$AGNES_TOTAL_MEM_MB")m"
+# Sized from the replica count, not RAM — see agnes_pg_max_connections above.
+AGNES_PG_MAX_CONNECTIONS="$(agnes_pg_max_connections "$RESOLVED_EXTRACTION_WORKER_REPLICAS")"
+AGNES_EXTRACTION_WORKER_PG_POOL_SIZE="$(agnes_pg_extraction_worker_pool_size)"
+AGNES_EXTRACTION_WORKER_PG_MAX_OVERFLOW="$(agnes_pg_extraction_worker_max_overflow)"
+
 # --- 1. Docker (install if missing) ---
 if ! command -v docker &>/dev/null; then
     curl -fsSL https://get.docker.com | sh
@@ -65,8 +289,12 @@ fi
 # rotates — a routinely-recreated container (agnes-auto-upgrade ticks every
 # 5 min) can accumulate unbounded log files on the boot disk, on top of the
 # recreate itself already destroying the previous container's log history.
-# This is the fallback for VMs that don't run docker-compose.gcp-logging.yml
-# (enable_gcp_logging=false, or any non-GCE deployment of this module).
+# This is the driver for every VM that does not run
+# docker-compose.gcp-logging.yml — any destination other than cloud_logging
+# (container_logs_destination), or any non-GCE deployment of this module. On a
+# VM shipping to Datadog it is not a fallback but the primary log store the
+# agent reads through the Docker API, so the rotation bound below is what caps
+# what a burst can cost the boot disk.
 # Placed here — BEFORE the data disk mount and well before any `docker
 # compose up` — because a daemon restart is safe with no containers running
 # and unsafe once they are. Written ONLY when the file is absent: an
@@ -291,21 +519,267 @@ chmod +x /usr/local/bin/agnes-auto-upgrade.sh
 # script's own first `up -d` engages it too. On a non-GCE / non-GCP
 # deployment (or an operator who wants the default json-file driver
 # instead), remove it right back out so that gate stays false. Runs on
-# every boot, so it also self-heals a VM whose enable_gcp_logging flipped
-# since the last provisioning.
-%{ if !enable_gcp_logging ~}
+# every boot, so the overlay itself self-heals on a VM whose log destination
+# flipped since the last provisioning. The Ops Agent PACKAGE does not: its
+# install block below is inside the cloud_logging guard, so a VM moving away
+# from Cloud Logging would keep an installed agent listening on 24224. That is
+# inert (the overlay is gone and the marker cleared, so nothing forwards to it)
+# and unreachable through the supported path anyway — a destination change is a
+# -replace onto a fresh boot disk.
+#
+# Removing it is also what makes the Datadog destination work: the containers
+# fall back to the daemon's default json-file driver, which is the one the
+# Datadog Agent's Docker API tailer is supported against. Under fluentd that
+# API serves Docker's dual-logging cache instead — it happens to work, but on
+# behaviour Datadog does not document.
+%{ if !cloud_logging_logs_active ~}
 rm -f "$APP_DIR/docker-compose.gcp-logging.yml"
 %{ endif ~}
 
-# Boot-time gcplogs driver probe — defense in depth for #1557. Docker
-# refuses to START a container whose log driver cannot initialize, so an
-# armed overlay on a VM whose service account cannot write to Cloud Logging
-# turns the next container recreate into a full outage (observed live:
-# app/scheduler stuck in `created`, 9 minutes of 502). The Terraform module
-# grants roles/logging.logWriter alongside enable_gcp_logging=true, but an
+%{ if cloud_logging_logs_active ~}
+# --- OPS AGENT (Cloud Logging collector) ---------------------------------
+# The overlay forwards container logs to a fluent_forward receiver on
+# loopback; this is what listens on it. Using the agent rather than Docker's
+# gcplogs driver is the whole reason the entries end up structured: it parses
+# the app's JSON line back into fields and lifts `severity` onto the entry.
+#
+# Every step is failure-tolerant. A logging add-on must never fail a boot,
+# and the overlay is probe-gated anyway — if the agent is not listening when
+# the probe runs, the overlay simply stays disarmed with a warning and the
+# next auto-upgrade tick re-probes. Installation is skipped when the agent
+# is already present, so a reboot costs nothing.
+if ! systemctl is-active --quiet google-cloud-ops-agent 2>/dev/null; then
+    echo "installing the Cloud Ops Agent..."
+    (
+        cd /tmp \
+        && curl -fsSL -o add-google-cloud-ops-agent-repo.sh \
+             https://dl.google.com/cloudagents/add-google-cloud-ops-agent-repo.sh \
+        && bash add-google-cloud-ops-agent-repo.sh --also-install
+    ) || echo "WARNING: Cloud Ops Agent install failed — container logs stay local for this boot; the Cloud Logging overlay will not arm" >&2
+fi
+
+# The receiver + parsers. Written on every boot so an edited config
+# self-heals, and so a VM provisioned before this existed picks it up.
+if [ -d /etc/google-cloud-ops-agent ]; then
+    echo "${ops_agent_config_b64}" | base64 -d > /etc/google-cloud-ops-agent/config.yaml \
+        && systemctl restart google-cloud-ops-agent \
+        || echo "WARNING: could not apply the Cloud Ops Agent config — the Cloud Logging overlay will not arm" >&2
+    # The probe below connects to the forward port; give the agent a moment
+    # to bind it rather than losing the overlay for a whole boot on a race.
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        if bash -c "exec 3<>/dev/tcp/127.0.0.1/24224" >/dev/null 2>&1; then break; fi
+        sleep 1
+    done
+fi
+%{ endif ~}
+
+%{ if enable_datadog ~}
+# --- DATADOG AGENT (opt-in host monitoring) --------------------------------
+# Deliberately here, beside the Ops Agent and BEFORE any docker work: the
+# compose section further down ends in `exit 1` when it cannot converge, so a
+# monitoring block placed after it would be skipped on exactly the boot that
+# needs monitoring most.
+#
+# Every step is failure-tolerant. Monitoring must never fail a boot — an
+# unmonitored VM is degraded, a VM that does not come up is an outage.
+#
+# The API key uses the SILENT form of `gcloud secrets versions access`. The
+# loud form used elsewhere in this script aborts the boot on a missing secret,
+# which is the right trade for the app's own credentials and the wrong one for
+# an add-on. The value is written only into /etc/datadog-agent/datadog.yaml and
+# is unset again before the `.env` heredoc further down can ever see it.
+DD_KEYRING=/usr/share/keyrings/datadog-archive-keyring.gpg
+DD_API_KEY_VALUE=$(gcloud secrets versions access latest --secret=${datadog_api_key_secret} 2>/dev/null || echo "")
+
+_dd_write_keyring() {
+    if command -v gpg >/dev/null 2>&1; then
+        gpg --dearmor --yes -o "$DD_KEYRING" < "$1"
+    else
+        # apt >= 1.4 reads a concatenated ASCII-armored keyring directly, so a
+        # host image without gnupg is not a blocker.
+        DD_KEYRING=/usr/share/keyrings/datadog-archive-keyring.asc
+        install -m 0644 "$1" "$DD_KEYRING"
+    fi
+}
+
+# Decodes one module-shipped artifact to its place on the host. An EMPTY
+# payload means "remove it": a VM that stops terminating TLS must stop
+# reporting on a certificate that is no longer its concern, rather than
+# keeping a stale check config around forever.
+#
+# The API key is substituted through bash parameter expansion on a value read
+# from a variable — never `sed -e "s/…/$KEY/"`, which would put it on argv and
+# from there into /proc and into this script's own log on any error.
+#
+# Called with a trailing `|| echo WARNING`, which is load-bearing under this
+# script's errexit: bash suppresses it inside a command that is part of an ||
+# list, so no step in here — not a failed write on a full disk, not a chmod on a
+# read-only mount — can abort a boot. The guards inside are belt to that braces.
+_dd_install_artifact() {
+    _dd_rel="$1"
+    _dd_b64="$2"
+    case "$_dd_rel" in
+        datadog.yaml)
+            _dd_target=/etc/datadog-agent/datadog.yaml; _dd_owner=root; _dd_group=dd-agent; _dd_mode=0640 ;;
+        conf.d/*.yaml)
+            _dd_check=$(basename "$_dd_rel" .yaml)
+            _dd_target="/etc/datadog-agent/conf.d/$_dd_check.d/conf.yaml"; _dd_owner=dd-agent; _dd_group=dd-agent; _dd_mode=0640 ;;
+        postgres.yaml.tpl)
+            _dd_target=/etc/datadog-agent/agnes-postgres.yaml.tpl; _dd_owner=root; _dd_group=root; _dd_mode=0600 ;;
+        *.sh)
+            _dd_target="/usr/local/bin/$_dd_rel"; _dd_owner=root; _dd_group=root; _dd_mode=0755 ;;
+        *.service | *.timer)
+            _dd_target="/etc/systemd/system/$_dd_rel"; _dd_owner=root; _dd_group=root; _dd_mode=0644 ;;
+        *)
+            echo "WARNING: unknown Datadog artifact '$_dd_rel' — not installed" >&2
+            return 0 ;;
+    esac
+
+    if [ -z "$_dd_b64" ]; then
+        rm -f "$_dd_target" || true
+        return 0
+    fi
+
+    _dd_content=$(printf '%s' "$_dd_b64" | base64 -d 2>/dev/null) || {
+        echo "WARNING: could not decode the Datadog artifact '$_dd_rel'" >&2
+        return 0
+    }
+    if [ "$_dd_rel" = "datadog.yaml" ]; then
+        _dd_content=$${_dd_content//@@DD_API_KEY@@/$DD_API_KEY_VALUE}
+    fi
+
+    _dd_tmp=$(mktemp) || return 0
+    chmod 0600 "$_dd_tmp" || true
+    if ! printf '%s\n' "$_dd_content" > "$_dd_tmp"; then
+        unset _dd_content
+        rm -f "$_dd_tmp" || true
+        echo "WARNING: could not stage the Datadog artifact '$_dd_rel'" >&2
+        return 0
+    fi
+    unset _dd_content
+    mkdir -p "$(dirname "$_dd_target")" \
+        && install -o "$_dd_owner" -g "$_dd_group" -m "$_dd_mode" "$_dd_tmp" "$_dd_target" \
+        || echo "WARNING: could not install the Datadog artifact '$_dd_rel'" >&2
+    rm -f "$_dd_tmp" || true
+    return 0
+}
+
+if [ -z "$DD_API_KEY_VALUE" ]; then
+    echo "WARNING: Datadog API key secret '${datadog_api_key_secret}' is unreadable or empty — the agent is not configured this boot" >&2
+else
+    # Pin dd-agent to its own fixed uid BEFORE the apt install below can
+    # create it unpinned. Section 0 (top of this script) already reserves
+    # $AGNES_APPLIER_UID first, which is enough on its own to fix the uid
+    # collision this guards against — this is the second, order-independent
+    # half: even if a future edit moved this block ahead of section 0 again,
+    # dd-agent still could not land on $AGNES_APPLIER_UID, because it is
+    # pinned to a different fixed number instead of "whatever the system
+    # allocates next". apt's postinst honours an existing dd-agent user/group
+    # and skips creating its own. Idempotent; the unpinned fallback only
+    # fires if $DATADOG_DD_AGENT_UID is itself somehow already taken, in
+    # which case allocation behaves exactly as it did before this fix.
+    DATADOG_DD_AGENT_UID=998
+    if ! id -u dd-agent >/dev/null 2>&1; then
+        useradd --system --no-create-home --home-dir /opt/datadog-agent \
+                --shell /usr/sbin/nologin --uid "$DATADOG_DD_AGENT_UID" --user-group dd-agent 2>/dev/null \
+        || useradd --system --no-create-home --home-dir /opt/datadog-agent \
+                --shell /usr/sbin/nologin --user-group dd-agent 2>/dev/null \
+        || echo "WARNING: could not pre-create the dd-agent user — the Datadog package's own postinst will create it instead, unpinned" >&2
+    fi
+
+    # datadog-agent.service Wants datadog-agent-installer.service (Fleet
+    # Automation's remote-upgrade daemon), which cannot run here: it exits 255
+    # with "remote config is required to create the updater", because the
+    # rendered datadog.yaml turns remote configuration off. Datadog confirm
+    # that failure is expected once those features are disabled, and their
+    # graceful-exit bug is open (DataDog/datadog-agent#43052). A soft
+    # dependency, so masking does not stop the agent; unmasked it leaves every
+    # consumer a permanently failed unit, which pins a "failed systemd units"
+    # monitor to alert until nobody reads it.
+    #
+    # Before apt, not after: the deb's postinst starts the agent, which is what
+    # pulls this unit in, so a mask applied afterwards arrives one failure too
+    # late. A symlink to /dev/null is exactly what `systemctl mask` writes, and
+    # unlike the subcommand it does not need the unit file to exist yet.
+    ln -sf /dev/null /etc/systemd/system/datadog-agent-installer.service \
+        || echo "WARNING: could not mask datadog-agent-installer.service — expect a permanently failed unit" >&2
+
+    if [ "$(dpkg-query -W -f='$${Version}' datadog-agent 2>/dev/null || true)" != "1:${datadog_agent_version}-1" ]; then
+        echo "installing the Datadog Agent ${datadog_agent_version}..."
+        (
+            mkdir -p /usr/share/keyrings \
+            && : > /tmp/datadog-apt-keys.asc \
+            && curl -fsSL https://keys.datadoghq.com/DATADOG_APT_KEY_CURRENT.public >> /tmp/datadog-apt-keys.asc \
+            && curl -fsSL https://keys.datadoghq.com/DATADOG_APT_KEY_06462314.public >> /tmp/datadog-apt-keys.asc \
+            && curl -fsSL https://keys.datadoghq.com/DATADOG_APT_KEY_C0962C7D.public >> /tmp/datadog-apt-keys.asc \
+            && curl -fsSL https://keys.datadoghq.com/DATADOG_APT_KEY_F14F620E.public >> /tmp/datadog-apt-keys.asc \
+            && curl -fsSL https://keys.datadoghq.com/DATADOG_APT_KEY_382E94DE.public >> /tmp/datadog-apt-keys.asc \
+            && _dd_write_keyring /tmp/datadog-apt-keys.asc \
+            && rm -f /tmp/datadog-apt-keys.asc \
+            && echo "deb [signed-by=$DD_KEYRING] https://apt.datadoghq.com/ stable 7" > /etc/apt/sources.list.d/datadog.list \
+            && apt-get update -qq \
+            && { apt-mark unhold datadog-agent >/dev/null 2>&1 || true; } \
+            && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --allow-downgrades "datadog-agent=1:${datadog_agent_version}-1" datadog-signing-keys \
+            && apt-mark hold datadog-agent >/dev/null
+        ) || echo "WARNING: Datadog Agent ${datadog_agent_version} install failed — host monitoring unavailable this boot" >&2
+    fi
+
+    if id dd-agent >/dev/null 2>&1; then
+        # Root-equivalent on this host, and the only way to read the daemon's
+        # container metrics. The rendered datadog.yaml turns off everything
+        # that could make that membership remotely reachable — see the module's
+        # enable_datadog description.
+        usermod -aG docker dd-agent \
+            || echo "WARNING: could not add dd-agent to the docker group — Docker and container metrics will be missing" >&2
+        # The artifact loop must stay AFTER the apt step above: the deb's
+        # postinst (the embedded fleet installer) recursively chowns
+        # /etc/datadog-agent to dd-agent on install and on every version
+        # change, so an artifact installed before it would lose the root
+        # ownership the datadog.yaml case below sets on purpose.
+%{ for dd_path, dd_content in datadog_files_b64 ~}
+        _dd_install_artifact "${dd_path}" "${dd_content}" \
+            || echo "WARNING: could not install the Datadog artifact '${dd_path}'" >&2
+%{ endfor ~}
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        # Masking (above the apt step) stops the unit failing from here on, but
+        # it does not clear a failure a PREVIOUS boot already recorded — and a
+        # failed unit is remembered until something resets it.
+        systemctl reset-failed datadog-agent-installer.service >/dev/null 2>&1 || true
+        systemctl enable datadog-agent >/dev/null 2>&1 || true
+        systemctl restart datadog-agent >/dev/null 2>&1 \
+            || echo "WARNING: the Datadog Agent did not start — inspect 'systemctl status datadog-agent'" >&2
+    else
+        echo "WARNING: the dd-agent user does not exist — skipping Datadog configuration this boot" >&2
+    fi
+fi
+# Out of scope before anything writes /opt/agnes/.env, whose heredoc is
+# unquoted and whose contents every container reads through env_file.
+unset DD_API_KEY_VALUE
+%{ endif ~}
+
+%{ if !enable_datadog ~}
+# Self-heal the opposite direction: a recreated VM whose module call turned
+# monitoring OFF must stop shipping under a key nobody rotates any more. The
+# package is left installed — removing it would fight apt over a transient
+# toggle — but the service does not run.
+if systemctl is-enabled --quiet datadog-agent 2>/dev/null; then
+    systemctl disable --now datadog-agent >/dev/null 2>&1 || true
+fi
+if systemctl is-enabled --quiet agnes-datadog-pg-role.timer 2>/dev/null; then
+    systemctl disable --now agnes-datadog-pg-role.timer >/dev/null 2>&1 || true
+fi
+%{ endif ~}
+
+# Boot-time collector probe — what is left of the defense in depth for
+# #1557. The driver is async now, so an armed overlay can no longer keep a
+# container in `created`; what it CAN do is buffer every line into a socket
+# nobody reads. So the probe asks the question that remains: is anything
+# listening on the Ops Agent's forward port? The Terraform module grants
+# roles/logging.logWriter alongside enable_gcp_logging=true, but an
 # out-of-band deployment — or a caller whose deploying identity could not
-# create project-IAM bindings — may still lack it. Probe the driver once
-# per boot with a no-op container; only success arms the shared marker
+# create project-IAM bindings — may still lack it, and the agent then
+# starts and fails every flush. One TCP connect per boot; only success arms
+# the shared marker
 # ($APP_DIR/.gcp-logging-ok) that EVERY COMPOSE_FILE builder requires
 # (section 4 below, agnes-auto-upgrade.sh, agnes-state-applier.sh — all
 # through agnes_gcp_logging_active), so boot and the recurring ticks can
@@ -321,9 +795,9 @@ rm -f "$APP_DIR/docker-compose.gcp-logging.yml"
 if [ -f "$APP_DIR/scripts/ops/agnes-compose-file.sh" ]; then
     . "$APP_DIR/scripts/ops/agnes-compose-file.sh"
     if agnes_gcp_logging_probe "$APP_DIR" "$${IMAGE_REPO}:$${IMAGE_TAG}"; then
-        echo "gcplogs driver probe OK — Cloud Logging overlay armed"
+        echo "Cloud Ops Agent is receiving on 127.0.0.1:24224 — Cloud Logging overlay armed"
     elif [ -f "$APP_DIR/docker-compose.gcp-logging.yml" ]; then
-        echo "WARNING: docker-compose.gcp-logging.yml is present but the gcplogs log driver failed its probe (is roles/logging.logWriter granted to the VM service account?) — DISABLING the Cloud Logging overlay for this boot instead of letting container starts fail; grant the role and the next auto-upgrade tick re-arms it" >&2
+        echo "WARNING: docker-compose.gcp-logging.yml is present but nothing is listening on 127.0.0.1:24224 (did the Cloud Ops Agent install or start fail? is roles/logging.logWriter granted to the VM service account?) — leaving the Cloud Logging overlay DISARMED rather than buffering every log line into a socket nobody reads; fix the agent and the next auto-upgrade tick re-arms it" >&2
     fi
 else
     rm -f "$APP_DIR/.gcp-logging-ok"
@@ -352,6 +826,12 @@ fi
 # there on today's image by allocation rather than by intent — so pin it,
 # and let the chmod below check the pin took.
 #
+# Section 0 (top of this script) already creates this user, pinned, before
+# Docker or Datadog can take the uid — so in the normal boot order this `if`
+# is always false. Kept as belt-and-braces anyway, same reasoning as the
+# B3-NEW block further down: a reorder or a partial run should not silently
+# reintroduce an unpinned user via the one copy that lost the pin (#1217).
+#
 # This `if` only guards user CREATION, not the uid check — an
 # agnes-applier that already exists (e.g. a VM provisioned before this pin
 # existed, or one where uid $AGNES_APPLIER_UID was taken by something else at
@@ -362,14 +842,11 @@ fi
 # the pre-existing case, since it re-reads whatever uid the name resolves to
 # right now instead of trusting this block succeeded.
 if ! id -u agnes-applier >/dev/null 2>&1; then
-    # Only the UID is pinned. `--gid` and `--user-group` are mutually
-    # exclusive, so a form passing both always fails — and the gid does not
-    # matter here anyway: instance.yaml is 0600, so the group bits grant
-    # nothing and only the owner's uid decides who can read it.
+    getent group agnes-applier >/dev/null 2>&1 || groupadd --system agnes-applier
     useradd --system --no-create-home --shell /usr/sbin/nologin \
-            --uid "$AGNES_APPLIER_UID" --user-group agnes-applier 2>/dev/null \
+            --uid "$AGNES_APPLIER_UID" --gid agnes-applier agnes-applier 2>/dev/null \
     || useradd --system --no-create-home --shell /usr/sbin/nologin \
-            --user-group agnes-applier
+            --gid agnes-applier agnes-applier
 fi
 usermod -aG docker agnes-applier
 mkdir -p /data/state /data/postgres
@@ -387,20 +864,38 @@ chown -R agnes-applier:agnes-applier /data/state
 # time, the pin above fell through to an allocated id, the app cannot read a
 # 0600 file it does not own, and — with the fail-closed read this change
 # also introduces — the instance refuses to start. A full outage in place
-# of a silent degradation. Where the pin did not take, the mode stays as it
-# was and the reason is on the console; the hardening applies exactly where
-# its precondition is met.
+# of a silent degradation. Where the pin did not take, the hardening applies
+# exactly where its precondition is met.
 #
 # Covers both non-happy paths from #1217: (a) the uid was taken at THIS
 # boot's provisioning (the `if` above fell through to the unpinned form) and
 # (b) agnes-applier already existed from before the pin with some other uid
 # (an in-place upgrade) — the `if` above skipped creation entirely, so this
 # readback is the only place either shape is caught.
+#
+# "Leave the mode as it was" — this branch's original shape — is exactly the
+# outage the Datadog uid collision (section 0, top of this script) produced:
+# the recursive /data/state chown just above already re-owns instance.yaml
+# to the mismatched agnes-applier regardless of this check, so an existing
+# file that was 0600 from a PREVIOUS good boot stayed 0600 under a uid the
+# app is not. So the mismatch branch now applies the same degraded-but-
+# readable policy scripts/ops/agnes-state-applier.sh's own writer already
+# established for this exact class of problem (#1298,
+# docs/postgres-cutover-runbook.md): 0640 with the app's own gid
+# ($AGNES_APPLIER_UID, numeric — a group entry need not exist by that name
+# for chown to accept it) as a fallback read grant, or 0644 if even that
+# fails, rather than trusting whatever mode happened to be on disk.
 APPLIER_UID=$(id -u agnes-applier 2>/dev/null || echo "")
 if [ "$APPLIER_UID" = "$AGNES_APPLIER_UID" ]; then
     chmod 600 "$INSTANCE_YAML" 2>/dev/null || true
 else
-    echo "WARN: agnes-applier is uid $APPLIER_UID, not $AGNES_APPLIER_UID — leaving $INSTANCE_YAML at its current mode. 0600 would make it unreadable by the app container (uid $AGNES_APPLIER_UID), which owns neither the file nor this user. Remediation: free uid $AGNES_APPLIER_UID (check what holds it with 'getent passwd $AGNES_APPLIER_UID') and either 'userdel'+re-run this script to recreate agnes-applier pinned, or 'usermod -u $AGNES_APPLIER_UID agnes-applier' followed by 'chown -R agnes-applier:agnes-applier /data/state /opt/agnes/.env' to re-home its existing files onto the new uid. Until then this VM runs in the pre-#1217 degraded mode: instance.yaml stays at its current, looser permissions." >&2
+    echo "ERROR: agnes-applier is uid $APPLIER_UID, not $AGNES_APPLIER_UID — uid $AGNES_APPLIER_UID is held by $(getent passwd "$AGNES_APPLIER_UID" 2>/dev/null | cut -d: -f1 || echo 'nothing (system uid allocation exhausted?)'). Remediation: free uid $AGNES_APPLIER_UID (see above) and either 'userdel agnes-applier'+re-run this script to recreate it pinned, or 'usermod -u $AGNES_APPLIER_UID agnes-applier' followed by 'chown -R agnes-applier:agnes-applier /data/state /opt/agnes/.env' to re-home its existing files onto the new uid. Until then this VM runs $INSTANCE_YAML at 0640/0644 instead of owner-only — see docs/postgres-cutover-runbook.md." >&2
+    if chown ":$AGNES_APPLIER_UID" "$INSTANCE_YAML" 2>/dev/null; then
+        chmod 640 "$INSTANCE_YAML" 2>/dev/null || true
+    else
+        chmod 644 "$INSTANCE_YAML" 2>/dev/null || true
+        echo "WARNING: could not hand $INSTANCE_YAML to group $AGNES_APPLIER_UID — leaving it at 0644 (world-readable) so the app container can still read its own config" >&2
+    fi
 fi
 # /data/postgres must stay 70:70 (postgres image uid) — applier just
 # runs docker exec against the container, doesn't touch the volume.
@@ -416,9 +911,9 @@ install -m 0644 "$APP_DIR/agnes-state-applier.timer" /etc/systemd/system/agnes-s
 # agnes-applier user + chowns /data/state on first boot. The main
 # applier unit ``Requires=`` it so by the time systemd resolves
 # ``User=agnes-applier`` for the applier, the user definitely exists.
-# The eager useradd block above (lines ~108-117) is now belt-and-
-# braces; customer infras that don't ship matching provisioning logic
-# get the bootstrap for free via this unit.
+# The eager useradd (the uid-reservation block at the top of this
+# script) is now belt-and-braces; customer infras that don't ship
+# matching provisioning logic get the bootstrap for free via this unit.
 install -m 0644 "$APP_DIR/agnes-state-applier-bootstrap.service" /etc/systemd/system/agnes-state-applier-bootstrap.service
 systemctl daemon-reload
 systemctl enable --now agnes-state-applier-bootstrap.service
@@ -605,6 +1100,23 @@ ${env_name}_QUOTED=$(printf '%s' "$${${env_name}}" | sed -e 's/[\\"$`]/\\&/g' ||
 %{ for secret_name, env_name in runtime_secret_env_multiline ~}
 ${env_name}=$(gcloud secrets versions access latest --secret=${secret_name} 2>/dev/null | base64 -w0 || echo "")
 %{ endfor ~}
+
+# Opt-in OTLP export (per-VM otlp_* fields): the headers value is the
+# collector's credential, fetched here exactly like a runtime_secret_env
+# value and written double-quoted with the same escape set. Missing/403 →
+# empty string: the exporter then sends no auth header and the collector's
+# refusal shows up in the app log, never in a broken boot.
+# --- otlp-headers begin (rendered + executed by tests/test_infra_otlp_export.py) ---
+%{ if otlp_headers_secret != "" ~}
+OTLP_HEADERS=$(gcloud secrets versions access latest --secret=${otlp_headers_secret} 2>/dev/null || echo "")
+case "$OTLP_HEADERS" in *$'\n'*)
+    echo "WARNING: secret '${otlp_headers_secret}' has a multiline value; refusing to write OTEL_EXPORTER_OTLP_HEADERS into .env" >&2
+    OTLP_HEADERS=""
+    ;;
+esac
+OTLP_HEADERS_QUOTED=$(printf '%s' "$OTLP_HEADERS" | sed -e 's/[\\"$`]/\\&/g' || true)
+%{ endif ~}
+# --- otlp-headers end ---
 
 # AGNES_VERSION, RELEASE_CHANNEL, AGNES_COMMIT_SHA are baked into the image
 # itself as ENV (see Dockerfile ARG/ENV + release.yml build-args). We do NOT
@@ -826,10 +1338,11 @@ fi
 # append the very first boot ran the stack on the json-file driver, and the
 # first auto-upgrade tick lazily initializes its config marker to the status
 # quo (no drift detected) — so logs didn't reach Cloud Logging until some
-# unrelated recreate. Section 3 above removed the extracted file when
-# enable_gcp_logging=false and armed $APP_DIR/.gcp-logging-ok only when the
-# gcplogs driver passed its probe, so file presence + marker is the single
-# switch, exactly as the resolver sees it (#1557, #1558). Appended before
+# unrelated recreate. Section 3 above removed the extracted file whenever
+# Cloud Logging is not the chosen destination (container_logs_destination)
+# and armed $APP_DIR/.gcp-logging-ok only when something answered on the
+# collector's forward port, so file presence + marker is the single switch,
+# exactly as the resolver sees it (#1557, #1558). Appended before
 # the deploy-layer overlays (dispatcher/kai-agent) to match the resolver's
 # managed-first ordering and keep kai-agent last for the strict-boot strip
 # below.
@@ -988,17 +1501,22 @@ APPS_RUNNER_IMAGE_PREFIX="$${DATA_APPS_RUNTIME_IMAGE%:*}"
 #      and the job queue itself lives in Postgres — nothing here belongs on
 #      the data disk.
 #
-#   2. The `extraction-worker` service re-pinned to the producer-bundled
-#      image. The base docker-compose.yml hides the service behind the
-#      `extraction-worker` compose profile; `profiles: !reset []` in the
-#      overlay clears that, so the OVERLAY's presence in COMPOSE_FILE is the
-#      entire switch — no --profile plumbing through the startup/upgrade/
-#      applier scripts, all of which disagree about profile handling.
-#      docker-compose.prod.yml pins the service to the plain app image
-#      (source-less VMs can't `build:`), which is built without the
-#      `extraction` optional extra — the re-pin to
-#      $${AGNES_EXTRACTION_WORKER_IMAGE} (below, via .env) is what actually
-#      puts a document converter on the lane.
+#   2. The `extraction-worker` service turned always-on. The base
+#      docker-compose.yml hides the service behind the `extraction-worker`
+#      compose profile; `profiles: !reset []` in the overlay clears that, so
+#      the OVERLAY's presence in COMPOSE_FILE is the entire switch — no
+#      --profile plumbing through the startup/upgrade/applier scripts, all
+#      of which disagree about profile handling. Image: by DEFAULT (no
+#      extraction_worker_image) the overlay sets no `image:` key at all and
+#      the service falls through to docker-compose.prod.yml's own pin — the
+#      same AGNES_IMAGE_REPO/AGNES_TAG as app/scheduler, since the built-in
+#      extraction pipeline needs nothing bundled that image does not already
+#      carry. This is what keeps the worker from drifting behind the app's
+#      own image as the fleet auto-upgrades. extraction_worker_image (below,
+#      via .env) is an OPTIONAL, deliberate override for the rare case an
+#      operator genuinely wants the worker on a different tag than the app
+#      (a canary, holding the worker back mid-rollout) — see that variable's
+#      own description for why a pin left in place risks a crash loop.
 #
 # The coordination declaration rides .env (AGNES_COORDINATION_BACKEND +
 # AGNES_REDIS_URL, written into the .env heredoc below) and NOT
@@ -1025,12 +1543,19 @@ APPS_RUNNER_IMAGE_PREFIX="$${DATA_APPS_RUNTIME_IMAGE%:*}"
 # already in .env here). On an instance still running the frozen DuckDB
 # app-state backend the app will refuse to start with a named error —
 # migrate the backend first, then enable this flag.
+# Registry auth only matters here when extraction_worker_image deliberately
+# points the worker at a DIFFERENT registry than the app's own (same
+# best-effort posture as IMAGE_HOST further up this script). Unset (the
+# default), the worker pulls the same image as app/scheduler, already
+# authenticated above.
+%{ if extraction_worker_image != "" ~}
 EXTRACTION_IMAGE="${extraction_worker_image}"
 EXTRACTION_IMAGE_HOST="$${EXTRACTION_IMAGE%%/*}"
 case "$EXTRACTION_IMAGE_HOST" in
     *-docker.pkg.dev) gcloud auth configure-docker "$EXTRACTION_IMAGE_HOST" --quiet \
         || echo "WARN: gcloud auth configure-docker $EXTRACTION_IMAGE_HOST failed — the extraction-worker image pull will likely fail below" >&2 ;;
 esac
+%{ endif ~}
 
 # Quoted heredoc: the $${...} below are resolved by docker compose from
 # /opt/agnes/.env at `compose up` time, not by this shell.
@@ -1049,12 +1574,53 @@ services:
       timeout: 3s
       retries: 12
   extraction-worker:
-    image: $${AGNES_EXTRACTION_WORKER_IMAGE}
     # Clears the base compose's `profiles: ["extraction-worker"]` so the
     # service is always-on whenever this overlay is in COMPOSE_FILE. No
     # mem_limit/cpus here — the base service already interpolates
-    # AGNES_EXTRACTION_WORKER_MEM_LIMIT / _CPUS from .env.
+    # AGNES_EXTRACTION_WORKER_MEM_LIMIT / _CPUS from .env. Default (no
+    # extraction_worker_image set) is no `image:` key at all here either, so
+    # the service inherits docker-compose.prod.yml's own AGNES_IMAGE_REPO/
+    # AGNES_TAG pin, the SAME ref app/scheduler run — this is what stops the
+    # worker drifting behind the database's migrations as the fleet
+    # auto-upgrades.
+%{ if extraction_worker_image != "" ~}
+    image: $${AGNES_EXTRACTION_WORKER_IMAGE}
+%{ endif ~}
     profiles: !reset []
+    # Live finding: numpy's OpenBLAS backend sizes its per-thread scratch
+    # buffers by the HOST's CPU count at import time, not by anything the
+    # process asks for. Document conversion runs each file inside a forked
+    # child capped at ~1.5 GiB of virtual address space
+    # (connectors/sharepoint/crawler.py's RLIMIT_AS) — on a 64-vCPU host,
+    # OpenBLAS tried to size 64 threads' worth of buffers inside that child
+    # and blew through it: `import markitdown` died with "OpenBLAS error:
+    # Memory allocation still failed after 10 retries", which read as
+    # "markitdown is not installed" before the error message learned to
+    # carry its cause. A single-document child never benefits from more
+    # than one BLAS thread on any host size. Additive merge with the base
+    # service's own `environment:` (compose merges this key by name, not by
+    # replacing the list) — mirrors the same `os.environ.setdefault` guard
+    # in app/worker/runtime.py, which covers every OTHER worker role that
+    # never runs through this overlay at all.
+    environment:
+      - OPENBLAS_NUM_THREADS=1
+      - OMP_NUM_THREADS=1
+      - MKL_NUM_THREADS=1
+      - NUMEXPR_NUM_THREADS=1
+%{ if extraction_worker_replicas > 1 ~}
+      # More than one replica means the runtime's per-process pool-size HINT
+      # (src/db_pg.py::_extraction_worker_pool_size_hint, designed for ONE
+      # replica) would apply IDENTICALLY to every replica and multiply the
+      # Postgres connection load by N — the exact shape that exhausted the
+      # side-car's max_connections on a live 6-replica instance (TCRD-296
+      # gap #76). Pin the pool explicitly instead, to the SAME conservative
+      # per-replica budget agnes_pg_max_connections (above) reserved room
+      # for. Additive merge with the base service's own `environment:` (see
+      # the comment above) — app/scheduler never carry these two lines and
+      # keep their own defaults.
+      - AGNES_PG_POOL_SIZE=$${AGNES_EXTRACTION_WORKER_PG_POOL_SIZE}
+      - AGNES_PG_MAX_OVERFLOW=$${AGNES_EXTRACTION_WORKER_PG_MAX_OVERFLOW}
+%{ endif ~}
     # Additive merge on top of the base service's `app: service_healthy`.
     depends_on:
       redis:
@@ -1214,6 +1780,9 @@ HOST_WORKSPACE_URL=http://app:8000/api/kai/workspace
 %{ if kai_agent_broker_mcp_enabled ~}
 HOST_BROKER_MCP_URL=$SERVER_URL/api/kai/mcp
 %{ endif ~}
+%{ if kai_agent_broker_otlp_enabled ~}
+HOST_BROKER_OTLP_URL=$SERVER_URL/api/broker/otlp
+%{ endif ~}
 POSTGRES_URL=postgresql://kai:$KAI_AGENT_PG_PASSWORD@kai-agent-pg:5432/kai_agent
 E2B_API_KEY=$KAI_E2B_API_KEY
 KAIENVEOF
@@ -1303,11 +1872,19 @@ SEED_ADMIN_PASSWORD=$SEED_ADMIN_PASSWORD
 SCHEDULER_API_TOKEN=$SCHEDULER_API_TOKEN
 AGNES_VAULT_KEY=$AGNES_VAULT_KEY
 LOG_LEVEL=info
+AGNES_DEPLOYMENT_ENV=${deployment_env}
+%{ if otlp_endpoint != "" ~}
+OTEL_EXPORTER_OTLP_ENDPOINT=${otlp_endpoint}
+%{ if otlp_headers_secret != "" ~}
+OTEL_EXPORTER_OTLP_HEADERS="$OTLP_HEADERS_QUOTED"
+%{ endif ~}
+AGNES_OTEL_CAPTURE_CONTENT=${otlp_capture_content}
+%{ endif ~}
 DOMAIN=$DOMAIN
 AGNES_TAG=$EFFECTIVE_AGNES_TAG
 AGNES_IMAGE_REPO=$IMAGE_REPO
-AGNES_APP_MEM_LIMIT=${app_mem_limit}
-AGNES_SCHEDULER_MEM_LIMIT=${scheduler_mem_limit}
+AGNES_APP_MEM_LIMIT=$RESOLVED_APP_MEM_LIMIT
+AGNES_SCHEDULER_MEM_LIMIT=$RESOLVED_SCHEDULER_MEM_LIMIT
 AGNES_APP_CPUS=${app_cpus}
 AGNES_SCHEDULER_CPUS=${scheduler_cpus}
 # home_route / studio_enabled / theme / experience / data_source.type do NOT
@@ -1336,6 +1913,27 @@ ${env_name}=$${${env_name}}
 %{ endfor ~}
 POSTGRES_PASSWORD=$POSTGRES_PASSWORD
 DATABASE_URL=postgresql+psycopg://agnes:$POSTGRES_PASSWORD@postgres:5432/agnes
+# Postgres side-car tuning (TCRD-296), derived from this VM's own RAM/vCPU —
+# see the "VM-derived sizing" block near the top of this script. Consumed by
+# docker-compose.postgres-host-mount.yml's `command:`/`shm_size:` on the
+# `postgres` service; the fixed knobs (wal_compression, random_page_cost,
+# jit, max_wal_size) are literals in that overlay, not env lines, since they
+# don't vary with VM size.
+AGNES_PG_SHARED_BUFFERS=$AGNES_PG_SHARED_BUFFERS
+AGNES_PG_EFFECTIVE_CACHE_SIZE=$AGNES_PG_EFFECTIVE_CACHE_SIZE
+AGNES_PG_WORK_MEM=$AGNES_PG_WORK_MEM
+AGNES_PG_MAINTENANCE_WORK_MEM=$AGNES_PG_MAINTENANCE_WORK_MEM
+AGNES_PG_MAX_PARALLEL_WORKERS_PER_GATHER=$AGNES_PG_MAX_PARALLEL_WORKERS_PER_GATHER
+AGNES_PG_SHM_SIZE=$AGNES_PG_SHM_SIZE
+# Sized from extraction_worker_replicas, not RAM — see agnes_pg_max_connections
+# in the "VM-derived sizing" block (TCRD-296 gap #76). Consumed by the same
+# postgres-host-mount overlay's `command:`.
+AGNES_PG_MAX_CONNECTIONS=$AGNES_PG_MAX_CONNECTIONS
+# Number of extraction-worker replicas this VM runs — read back by
+# agnes-auto-upgrade.sh so a recreate threads the same `--scale
+# extraction-worker=N` the boot sequence below uses, instead of silently
+# collapsing to one replica on the next tick.
+AGNES_EXTRACTION_WORKER_REPLICAS=$RESOLVED_EXTRACTION_WORKER_REPLICAS
 %{ if dispatcher_enabled ~}
 DISPATCHER_IMAGE=${dispatcher_image}
 DISPATCHER_PG_PASSWORD=$DISPATCHER_PG_PASSWORD
@@ -1356,21 +1954,26 @@ KAI_BROKER_MCP_ENABLED=true
 %{ if extraction_worker_enabled ~}
 AGNES_COORDINATION_BACKEND=redis
 AGNES_REDIS_URL=redis://redis:6379/0
-AGNES_EXTRACTION_WORKER_IMAGE=${extraction_worker_image}
-AGNES_EXTRACTION_WORKER_MEM_LIMIT=${extraction_worker_mem_limit}
+AGNES_EXTRACTION_WORKER_MEM_LIMIT=$RESOLVED_EXTRACTION_WORKER_MEM_LIMIT
 AGNES_EXTRACTION_WORKER_CPUS=${extraction_worker_cpus}
-# The app-side gates for the `corpus-extraction` job kind
-# (app/instance_config.py::feature_enabled, app/worker/kinds.py::
-# _extraction_producer_argv) both check an env override before
-# instance.yaml — the SAME env-overrides-yaml posture as
-# AGNES_COORDINATION_BACKEND/AGNES_REDIS_URL above — so these two lines are
-# what makes this flag alone activate the lane end to end, with no
-# applier-owned instance.yaml edit on the VM's data disk. The whole
-# SharePoint connector — not just extraction — shares the ONE `sharepoint`
-# switch (2026-09-01 flag consolidation), so this line also turns on the
-# connect wizard, admin routes, and ACL mirroring on this VM.
+%{ if extraction_worker_image != "" ~}
+# A deliberate, TEMPORARY divergence from the app's own image/tag (a
+# canary, holding the worker back during an app rollout) — see the
+# extraction_worker_image variable's own description for the crash-loop
+# risk of leaving this set once the app has migrated the database past
+# what this pin's image can run.
+AGNES_EXTRACTION_WORKER_IMAGE=${extraction_worker_image}
+%{ endif ~}
+# The app-side gate for the `corpus-extraction` job kind is the single
+# `sharepoint` switch (app/instance_config.py::feature_enabled) — env
+# overrides instance.yaml, the SAME posture as AGNES_COORDINATION_BACKEND/
+# AGNES_REDIS_URL above — so this line is what makes this flag alone
+# activate the lane end to end, with no applier-owned instance.yaml edit on
+# the VM's data disk. The whole SharePoint connector — not just extraction —
+# shares this ONE `sharepoint` switch (2026-09-01 flag consolidation), so it
+# also turns on the connect wizard, admin routes, and ACL mirroring on this
+# VM.
 AGNES_SHAREPOINT_ENABLED=1
-AGNES_EXTRACTION_PRODUCER_COMMAND=${extraction_producer_command}
 %{ endif ~}
 COMPOSE_FILE=$COMPOSE_FILE_VALUE
 %{ if data_apps_enabled ~}
@@ -1406,16 +2009,18 @@ chmod 600 "$APP_DIR/.env"
 # already source the file. The bootstrap unit's ExecStart re-asserts
 # this every boot in case an operator (or agnes-auto-upgrade) rewrites
 # .env later.
-# In the normal boot order this `if` is always false — section 3 above
-# already created agnes-applier, pinned to $AGNES_APPLIER_UID. Kept pinned
-# here too (same fallback shape) so a reordering of the two blocks can't
-# quietly reintroduce an unpinned user via this path — #1217 was exactly
-# this kind of duplicate that only one of two copies got fixed.
+# In the normal boot order this `if` is always false — the uid-reservation
+# block at the top of this script already created agnes-applier, pinned to
+# $AGNES_APPLIER_UID. Kept pinned here too (same fallback shape) so a
+# reordering of the two blocks can't quietly reintroduce an unpinned user
+# via this path — #1217 was exactly this kind of duplicate that only one of
+# two copies got fixed.
 if ! id -u agnes-applier >/dev/null 2>&1; then
+    getent group agnes-applier >/dev/null 2>&1 || groupadd --system agnes-applier
     useradd --system --no-create-home --shell /usr/sbin/nologin \
-            --uid "$AGNES_APPLIER_UID" --user-group agnes-applier 2>/dev/null \
+            --uid "$AGNES_APPLIER_UID" --gid agnes-applier agnes-applier 2>/dev/null \
     || useradd --system --no-create-home --shell /usr/sbin/nologin \
-            --user-group agnes-applier
+            --gid agnes-applier agnes-applier
 fi
 chown agnes-applier:agnes-applier /opt/agnes/.env
 chmod 0600 /opt/agnes/.env
@@ -1602,18 +2207,44 @@ fi
 # pull is where a private-registry failure would land; on failure the .env
 # keeps the FULL list, so the next auto-upgrade tick (and any operator
 # `docker compose up -d`) retries with no state to repair.
+#
+# --scale threads RESOLVED_EXTRACTION_WORKER_REPLICAS through so a VM whose
+# operator raised extraction_worker_replicas boots with that many containers
+# from the start, not one recreate later (TCRD-296 gap #76). The recurring
+# agnes-auto-upgrade tick reads the SAME AGNES_EXTRACTION_WORKER_REPLICAS
+# back from .env and applies its own --scale, so a routine recreate never
+# silently collapses it back to one.
 export COMPOSE_FILE="$EXTRACTION_FULL_COMPOSE_FILE"
 if ! docker compose $COMPOSE_PROFILES_ARG pull redis \
     || ! docker compose $COMPOSE_PROFILES_ARG up -d redis; then
     echo "WARN: redis coordination backend failed to pull or start; the app runs with degraded coordination until it appears — re-run docker compose up -d redis (or wait for the auto-upgrade tick)" >&2
 fi
 if ! docker compose $COMPOSE_PROFILES_ARG pull extraction-worker \
-    || ! docker compose $COMPOSE_PROFILES_ARG up -d extraction-worker; then
+    || ! docker compose $COMPOSE_PROFILES_ARG up -d --scale "extraction-worker=$RESOLVED_EXTRACTION_WORKER_REPLICAS" extraction-worker; then
     echo "WARN: extraction-worker failed to pull or start; base stack is up — check the image ref/registry access and re-run docker compose up -d (or wait for the auto-upgrade tick)" >&2
 fi
 %{ endif ~}
 
+%{ if enable_datadog ~}
+# --- DATADOG: Postgres side-car monitoring role ----------------------------
+# The unit files landed with the agent block above, which runs before compose;
+# the timer is started HERE, after compose has converged, so its first run
+# finds the side-cars up. The 15-minute cadence then re-converges the role
+# after a side-car volume is recreated, which a boot-time step never would.
+if [ -x /usr/local/bin/agnes-datadog-pg-role.sh ]; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl enable --now agnes-datadog-pg-role.timer >/dev/null 2>&1 \
+        || echo "WARNING: could not enable agnes-datadog-pg-role.timer — the Postgres side-car check stays unconfigured" >&2
+    systemctl start agnes-datadog-pg-role.service >/dev/null 2>&1 || true
+fi
+%{ endif ~}
+
 # --- 6. Auto-upgrade via cron (pulls new image digest on $UPGRADE_SCHEDULE) ---
+# Unconditional: /var/lib/agnes holds the auto-upgrade heartbeat below, and an
+# external monitor reading a file age needs the directory to exist even on a
+# VM pinned to manual upgrades (where a missing tick file is the answer, not an
+# error).
+mkdir -p /var/lib/agnes
 if [ "$UPGRADE_MODE" = "auto" ]; then
     # agnes-auto-upgrade.sh was already extracted to /usr/local/bin/ in
     # section 3 alongside the compose files — the host artifacts ship
@@ -1621,7 +2252,15 @@ if [ "$UPGRADE_MODE" = "auto" ]; then
     :
 
     # Install cron entry idempotently: remove any prior agnes-auto-upgrade line, then append ours.
-    CRON_LINE="$UPGRADE_SCHEDULE /usr/local/bin/agnes-auto-upgrade.sh >> /var/log/agnes-auto-upgrade.log 2>&1"
+    # The trailing touch is a plain heartbeat: it records that the cron fired,
+    # separately from whether the tick found a new image. Any external monitor
+    # can read its age; nothing on the VM depends on it.
+    #
+    # `touch`, not `date +%s`: cron turns an unescaped % in the command field
+    # into a newline and feeds everything after it to the command as stdin, so
+    # `date +%s > file` would run as `date +` and never write anything. The
+    # probe reads the mtime, so the contents were never the point.
+    CRON_LINE="$UPGRADE_SCHEDULE /usr/local/bin/agnes-auto-upgrade.sh >> /var/log/agnes-auto-upgrade.log 2>&1; touch /var/lib/agnes/auto-upgrade.tick"
     (crontab -l 2>/dev/null | grep -v agnes-auto-upgrade || true; echo "$CRON_LINE") | crontab -
 fi
 

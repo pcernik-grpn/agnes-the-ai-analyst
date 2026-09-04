@@ -1,17 +1,17 @@
-"""Shared caller-scoped access computation for artefacts (``file_corpora``).
+"""Shared caller-scoped access computation for artifacts (``file_corpora``).
 
 Three surfaces need the exact same "which collections can I see, and how
 are they shared" computation:
 
   - ``GET /artefacts``            (app/web/router.py::artefacts_page)
-  - ``GET /stack``'s Artefacts tab (app/web/router.py::my_stack_page)
-  - ``GET /api/stack/artefacts/candidates`` (the "Add artefacts" picker)
+  - ``GET /stack``'s Artifacts tab (app/web/router.py::my_stack_page)
+  - ``GET /api/stack/artefacts/candidates`` (the "Add artifacts" picker)
 
 This module is the single place that computes it, instead of three copies
 of the ``resource_grants`` + ``file_corpora`` joins. Permission model is
 ownership/sharing, NOT the admin-RBAC-grant tier ``StackResolver`` models
 for data packages/memory domains — there is no "required" concept for
-artefacts, so this deliberately does not route through ``StackResolver``.
+artifacts, so this deliberately does not route through ``StackResolver``.
 """
 
 from __future__ import annotations
@@ -133,7 +133,7 @@ def collection_visibility(ctx: ArtefactAccessContext, collection_id: str) -> Tup
 
 
 def owner_label_for(ctx: ArtefactAccessContext, col: dict) -> str:
-    """ "You" for the caller's own artefacts, else the owner's display name."""
+    """ "You" for the caller's own artifacts, else the owner's display name."""
     created_by = col.get("created_by")
     if created_by == ctx.uid:
         return "You"
@@ -151,14 +151,14 @@ def _artefact_type_label(file_count: int) -> str:
 
 
 def list_candidate_collections(user_id: str) -> Tuple[List[dict], int]:
-    """Candidates for the "Add artefacts to Stack" picker.
+    """Candidates for the "Add artifacts to Stack" picker.
 
     Returns ``(candidates, total_accessible)``: ``candidates`` are
     collections accessible to the caller (owned ∪ granted to one of their
     groups) that are NOT already in the caller's Stack, shaped for the
     picker row. ``total_accessible`` counts every accessible collection
     regardless of Stack membership, so the caller can distinguish "no
-    artefacts exist at all" from "all accessible artefacts are already
+    artifacts exist at all" from "all accessible artifacts are already
     added" (both render a picker empty state, but with different copy).
     """
     from src.repositories import (
@@ -178,22 +178,25 @@ def list_candidate_collections(user_id: str) -> Tuple[List[dict], int]:
 
     accessible = [col for col in fc_repo.list() if is_owned_or_shared_with_me(ctx, col)]
 
+    # One grouped count for every corpus, rather than reading every row of
+    # every accessible collection to arrive at a per-collection number.
+    try:
+        file_counts = cf_repo.count_by_corpus()
+    except Exception:
+        file_counts = {}
+
     candidates: List[dict] = []
     for col in accessible:
         if col["id"] in in_stack:
             continue
-        candidates.append(_candidate_shape(col, ctx, cf_repo))
+        candidates.append(_candidate_shape(col, ctx, file_counts.get(col["id"], 0)))
 
     return candidates, len(accessible)
 
 
-def _candidate_shape(col: dict, ctx: ArtefactAccessContext, cf_repo) -> dict:
+def _candidate_shape(col: dict, ctx: ArtefactAccessContext, file_count: int) -> dict:
     visibility, visibility_label = collection_visibility(ctx, col["id"])
     owned = col.get("created_by") == ctx.uid
-    try:
-        file_count = len(cf_repo.list_for_corpus(col["id"]))
-    except Exception:
-        file_count = 0
     updated = col.get("updated_at") or col.get("created_at")
     return {
         "id": col["id"],

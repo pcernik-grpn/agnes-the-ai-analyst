@@ -661,6 +661,32 @@ so this is a deployment-correctness requirement rather than a browser-reachable
 bypass; when `subdomain_base` is unset the marker is never set regardless of
 `Host`.
 
+**Deploy-time exposure check** (#1946, warn-first): `POST
+/api/data-apps/{slug}/deploy` runs a pure, best-effort static scan
+(`src/data_apps/deploy_check.py`) over the target commit's tree before
+fast-forwarding `agnes-live` — a signal, not a gate, unless the operator
+opts into `data_apps.deploy_checks: block` (default `warn`; `off` disables
+it entirely). It flags, line by line: <a id="da001"></a>`DA001` and <a
+id="da002"></a>`DA002` a static-file server root that isn't scoped to a
+named subdirectory (Node `express.static`/`serveStatic`/fastify-static;
+Python `StaticFiles`/`send_from_directory`/`app.static_folder`); <a
+id="da003"></a>`DA003` an nginx `root`/`alias` serving `/`, `/app`, or a
+bare top-level mount, or `autoindex on`; <a id="da004"></a>`DA004` the whole
+process environment serialized into a response; <a id="da005"></a>`DA005`
+the injected `AGNES_TOKEN` echoed back on a response line (v1 checks that
+name only — arbitrary per-app secret names are noisier to match safely and
+are tracked for a v2); and <a id="da006"></a>`DA006` (informational) debug
+mode left on. `agnes app deploy` prints any findings under the `State:`
+line; `POST .../deploy`'s response carries them as an additive
+`deploy_check` key whenever the scan ran. An externally-hosted repo
+(`repo_mode=external`) can't be scanned — its source never reaches Agnes —
+so `warn`/`off` surface `deploy_check: {"status": "skipped", "skipped":
+"external_repo"}` instead, while `block` refuses the deploy outright
+(`deploy_check_unavailable_external_repo`) rather than silently exempting
+an unscannable app from the operator's own policy. No findings are
+persisted and there is no admin UI for them in v1 — each one lives for
+exactly the one deploy request's response and audit row.
+
 **Network egress** (GCP metadata): a data-app container sits on the `agnes-apps`
 bridge with normal egress (its runtime image installs dependencies from PyPI/npm
 at boot). On a cloud VM that reach includes the instance **metadata server**
@@ -755,11 +781,21 @@ vault-first then the server's `SHAREPOINT_CERT_PRIVATE_KEY` env var) and
 never reach a command line, because there is none. The run is bounded by
 `extraction.timeout_s` — checked between files and between delta pages,
 and on expiry the crawl persists its resumable state and fails the job
-with `interrupted_reason: "timeout"`; that is the only deliberate stop
-mechanism v1 has. An exhausted 429 budget stops a run the same way, as
-`interrupted_reason: "throttled"` — those two reasons, and only those two,
-mean the persisted state describes exactly what was ingested, so a reader
-may promise that the next run resumes. Off by default (`sharepoint.enabled` — a registered switch,
+with `interrupted_reason: "timeout"`. An exhausted 429 budget stops a run
+the same way, as `interrupted_reason: "throttled"`. So does an admin
+cooperative stop (`POST .../extraction/stop`,
+`connectors.sharepoint.crawler.request_stop`) — a signal written to the
+connection row's own `config.extraction.stop_requested_at`, which works on
+both app-state backends, and polled by the crawl at the SAME two points the
+timeout already checks (unconditionally between delta pages, every 10
+completed items between files), recording `interrupted_reason: "stopped"`.
+A stale flag left over from a previous run is cleared at the START of the
+next one, so a stop can never reach forward past the run it was meant for.
+Those three reasons, and only those three, mean the persisted state
+describes exactly what was ingested, so a reader may promise that the next
+run resumes. The live checkpoint also carries an `activity` block (current
+in-flight path, last 5 completed items) so a running crawl is no longer a
+black box between checkpoints. Off by default (`sharepoint.enabled` — a registered switch,
 `AGNES_SHAREPOINT_ENABLED`) and additive: an instance that never sets
 `sharepoint.enabled`/`AGNES_WORKER_LANES` is unaffected. The converter
 backends ship as the `extraction` optional extra; the admin trigger
@@ -924,6 +960,69 @@ optional and gate the relevant connectors/providers.
 ```
 
 ---
+
+## Unstructured-document extraction: engine vs. connector
+
+The document pipeline (crawl → convert → anonymize → ingest → facts) is
+built in-process, and SharePoint is its first — currently only — file
+source. The seams between what is SOURCE-AGNOSTIC and what is
+SharePoint's are deliberate, and they are the map for the next file
+connector (OneDrive, S3, GCS, …). Today's packaging does not fully match
+those seams — the converter now lives under `src/ingest/` and is shared with
+Collections uploads, but the facts-extraction stage still sits under
+`connectors/sharepoint/` for historical reasons — so this section records
+which is which, before a second connector makes the distinction
+load-bearing.
+
+**Engine (source-agnostic — a new file connector reuses ALL of this):**
+
+| Concern | Where | Contract |
+|---|---|---|
+| Convert to markdown | `src/ingest/convert.py`, `pdf_structure.py`, `scan_ocr.py` | bytes + filename → markdown; knows nothing about the source. The same call reads a Collections upload (`src/ingest/text_extract.py`), so a format one path can read, both can |
+| Anonymize | `src/anonymization*.py` | markdown → redacted markdown, fail-closed; per-scope flag decided by the caller |
+| Ingest | `POST /api/collections/{id}/files` internals, `corpus_files` repos | collection + stable_id + markdown; source-neutral idempotence |
+| Facts extraction | `connectors/sharepoint/facts_extraction.py`, `facts_prompt.py` | reads ingested markdown from collections; no source types anywhere |
+| Run observability | `extraction_runs` (PG), `app/api/admin_extraction.py` | keyed by `connection_id` only — any connector's runs land here |
+| Cooperative stop | `config.extraction.stop_requested_at` on `source_connections` | generic column, generic endpoint mechanics |
+| Configuration | instance-wide `extraction.*` (timeouts, concurrency, LLM stages) | not namespaced per source |
+| Cost accounting | stage-keyed `usage` (`ner`/`ocr`/`facts`), `src/llm_pricing.py` | per run, source-blind |
+| UI | the data-sources card's Run / Run history / activity / preview panels | render the generic endpoints above |
+
+**Connector (SharePoint-specific — a new source writes its own):**
+
+- `graph_client.py` — transport, auth, throttling detection.
+- `crawler.py`'s enumeration half — Graph delta, deltaLink/cTag resume,
+  scope walking, zone routing inputs.
+- `acl_sync.py`, `subscriptions.py`, `settings.py` — ACL mirroring,
+  webhook lifecycle, tenant settings.
+- The connect wizard (tenant, certificate, scope picking) — connector
+  UX is inherently per-source, exactly like Keboola's or Databricks's.
+
+**What a second file connector costs.** OneDrive: nearly nothing — it IS
+Microsoft Graph drives (same delta API; scopes select users/groups
+instead of sites). S3/GCS: a new enumerator (LIST + ETag in the cTag
+role, no ACLs or webhooks in v1) and nothing else — convert onward is
+untouched.
+
+**The refactor that waits for the second connector.** When one arrives,
+extract in this order — not before (an interface designed against one
+implementation gets the seams wrong):
+
+1. Move the engine modules above out of `connectors/sharepoint/` into
+   `src/extraction/` (mechanical; imports only).
+2. Lift `crawler.py`'s orchestration (bounded thread pool, run recorder,
+   stop checks, activity tracking, AIMD governor) over a small
+   `FileSource` interface: `enumerate/delta`, `download`, `stable_id`,
+   `path` — the four things the SharePoint crawler actually consumes
+   from Graph.
+3. Re-home the generic endpoints under `/api/admin/extraction/*`,
+   keeping the `/api/admin/sharepoint/*` paths as aliases.
+
+Until then, the one rule that keeps the door open: **new
+extraction-engine work must not take a SharePoint dependency** — no
+Graph types in convert/facts/run-recording signatures, no
+`sharepoint.`-namespaced config for engine concerns, and run state stays
+keyed on `connection_id` alone.
 
 ## Extending the Platform
 

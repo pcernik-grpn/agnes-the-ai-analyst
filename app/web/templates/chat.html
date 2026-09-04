@@ -23,13 +23,13 @@
   {# Pre-conversation dashboard styles (.rdb-* — greeting, activity panels,
      task starters). #}
   <link rel="stylesheet" href="{{ static_url('css/chat_dashboard.css') }}" />
-  <link rel="stylesheet" href="/static/vendor/highlight.min.css" />
+  <link rel="stylesheet" href="{{ static_url('vendor/highlight.min.css') }}" />
   {# The shared file-preview modal (.fp-*) — the same surface the Library
      uses, reused by the session-files drawer so a deck the agent just built
      can be read without downloading it first. #}
   <link rel="stylesheet" href="{{ static_url('css/file_preview.css') }}" />
-  <script src="/static/vendor/marked.min.js"></script>
-  <script src="/static/vendor/highlight.min.js"></script>
+  <script src="{{ static_url('vendor/marked.min.js') }}"></script>
+  <script src="{{ static_url('vendor/highlight.min.js') }}"></script>
   {# The anti-FOUC pre-paint for the chat sidebar's mini state was here. It
      stamped `data-chat-sidebar="mini"` on <html> before first render, and
      already skipped the rail — "rail has no mini-collapse; a stored flag from
@@ -108,6 +108,15 @@
        as markdown. #}
     <header id="chat-thread-header" class="cloud-chat-thread-header" hidden>
       <h2 id="chat-thread-title" class="cloud-chat-thread-title">Untitled chat</h2>
+      {# WHO this conversation runs as, for the life of the thread. Empty and
+         hidden for the default agent: the plain chat is the unmarked case, and
+         badging every conversation with the brand name teaches the reader to
+         stop reading the badge — which is exactly what happened to the muted
+         label this replaces, down under the send button where nobody looked.
+
+         Populated by chat.js (_syncAgentIdentity) from the agent bound at
+         session creation; textContent, because the name is user-authored. #}
+      <span id="chat-thread-agent" class="cloud-chat-thread-agent" hidden></span>
       {# "Files" — the way OUT for files the agent generated in the session
          workspace (#1611): a skill renders a .docx/.pptx into the sandbox and
          without this the browser has no route to it. Opens an overlay listing
@@ -251,6 +260,43 @@
           </a>
         </div>
       {% endset %}
+      {# WHO you are talking to, when it is not the plain chat.
+
+         Hidden and empty for everyone arriving at /chat normally. It fills in
+         for exactly one case: the session runs as a NON-DEFAULT agent, because
+         you came through that agent's own front door (the Chat button on its
+         card, or a starter chip below). That path used to announce itself
+         nowhere except a pill in the composer that looked like a settings
+         switch, so arriving somewhere specific was indistinguishable from
+         arriving nowhere in particular.
+
+         It REPLACES the generic intro rather than joining it — chat.js puts
+         `has-agent-intro` on the aside and the CSS hides the greeting, heading
+         and lede that would otherwise be making a different, competing claim
+         about what this page is. The default agent never triggers any of it.
+
+         Name and role are user-authored: chat.js writes them with textContent.
+         The heading reuses `rdb-ask-heading` so an agent's name lands at the
+         same size and weight the generic heading had — this is the same slot,
+         saying something more specific. #}
+      <div id="chat-agent-intro" class="cld-agent-intro" hidden>
+        <p class="cld-agent-intro-eyebrow">You&rsquo;re chatting with</p>
+        {# "Delivery Health agent", not "Delivery Health". The name alone left
+           the reader to infer what KIND of thing they had landed on — an agent,
+           a workspace, a mode — from an eyebrow two lines up. The common noun
+           carries that, and it is markup rather than something chat.js appends
+           so the name element stays the one thing written from the API.
+
+           Same type as the name, deliberately: this is one phrase, and it
+           should read as one. The gap is a CSS margin rather than a space in
+           the markup — an ordinary space between the two spans collapses into
+           the heading's own indentation on a reformat and silently glues the
+           words together. #}
+        <h2 class="rdb-ask-heading">
+          <span id="chat-agent-intro-name"></span><span class="cld-agent-intro-kind">agent</span>
+        </h2>
+        <p id="chat-agent-intro-role" class="cld-agent-intro-role"></p>
+      </div>
       {% if admin_notice %}
       {# ZERO STATE, admin. The ordinary heading, "Ask {brand} anything", invites
          the one thing this instance cannot yet do well — answer about the
@@ -609,6 +655,22 @@
            role="listbox" aria-label="Skills and commands">
         <ul id="chat-slash-menu-results" class="cloud-chat-slash-menu-results"></ul>
       </div>
+      {# Jump to latest — the way back down. A turn that is still writing stops
+         following the moment the reader scrolls up (chat.js → the smart
+         auto-scroll section), which is what makes reading a long answer while
+         it streams possible at all; this is what tells them the turn moved on
+         without them, and puts them back on it.
+
+         Inside the form because the form is the one element that is
+         position: relative in BOTH layouts (it anchors the slash menu above),
+         so `bottom: 100%` seats the button over the composer in each. It is
+         absolutely positioned, so it is not a grid item and cannot disturb the
+         default layout's two-column composer row. Hidden until it has
+         something to fix; chat.js owns the toggle. #}
+      <button type="button" id="chat-jump-latest" class="cloud-chat-jump" hidden>
+        <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 5v14M6 13l6 6 6-6" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <span>Jump to latest</span>
+      </button>
       {# Pasted attachments — a strip ABOVE the pill, inside the form.
 
          It cannot live inside .cloud-chat-composer: that pill is a fixed-height
@@ -672,47 +734,26 @@
          itself. #}
       <textarea id="chat-input" class="cloud-chat-input" rows="1"
         placeholder="{% if admin_notice %}Ask how to get {{ instance_brand_short or 'Agnes' }} set up…{% else %}Ask {{ instance_brand_short or 'Agnes' }} anything... (try: summarize revenue trends){% endif %}"></textarea>
-      {# Agent picker — which of the caller's agents this conversation runs AS,
-         INSIDE the composer, at the trailing end beside Send.
+      {# No agent picker in the composer.
 
-         It belongs in the composer because choosing an agent is part of
-         composing: the agent is bound at session creation, so this control sets
-         a property of the message about to be sent, not of the page.
+         It lived here — a "Default" pill beside Send — and it was wrong in a
+         way renaming the pill could not fix. Choosing an agent does not set a
+         property of the message being composed: it calls newChat(slug), which
+         POSTs a NEW session and abandons the one on screen. And the binding is
+         permanent (scope, memory notebook, pinned model and token budget are
+         fixed at session creation), so the one promise a control inside the
+         input makes — that it adjusts what you are about to send, and that you
+         can change your mind — is the one thing it could not keep. It also
+         showed unconditionally, so a caller with a single agent got a dropdown
+         holding one row labelled with the least informative word on the page.
 
-         It belongs on the RIGHT, and that is the load-bearing part. Ahead of the
-         "+" it was in front of the textarea, so a longer agent name moved where
-         the placeholder began — a measured 58px jump between "Agnes" and
-         "Finance Proposals", which reflowed any draft already typed. After the
-         textarea, a wider pill shrinks the field from its trailing edge instead:
-         the text origin is fixed, and the give comes out of the end of a line
-         nobody is looking at. It also puts it in the right cluster with Send,
-         which is the "about to send" group — who answers and the act of asking.
-
-         TWO elements, one at a time. An agent is bound at session CREATION
-         (scope, memory notebook, pinned model and token budget are fixed for
-         the session's life), so mid-conversation there is nothing to choose and
-         the control becomes a plain label — not a greyed-out button, which
-         still announces itself as a button to a screen reader and still invites
-         the click it will refuse. chat.js swaps them on the first turn and back
-         on "+ New chat".
-
-         The popover escapes the pill because the pill does not clip: this wrap
-         is `position: relative` with an absolutely-positioned menu, the same
-         pattern `.cloud-chat-plus-wrap` already uses. #}
-      <span class="cloud-chat-agent-wrap">
-        <button type="button" id="chat-agent-btn"
-                class="cloud-chat-agent-btn"
-                aria-haspopup="menu"
-                aria-expanded="false"
-                aria-controls="chat-agent-menu">
-          <span class="cloud-chat-agent-btn-label" id="chat-agent-btn-label">Default</span>
-          <svg class="cloud-chat-agent-btn-caret" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M6 9l6 6 6-6" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
-        </button>
-        {# The in-conversation form: says who, offers nothing. #}
-        <span id="chat-agent-label" class="cloud-chat-agent-label" hidden></span>
-        <ul id="chat-agent-menu" class="cloud-chat-agent-menu" hidden
-            role="menu" aria-label="Choose an agent"></ul>
-      </span>
+         The two jobs it was doing are split, each to a place that can do it:
+         CHOOSING is #chat-agent-select below the composer — one small
+         selector, constant footprint, stating who and opening to change it —
+         and SAYING WHO, once the conversation is under way and the selector is
+         gone, is #chat-thread-agent (see chat.js _syncAgentIdentity). The
+         thread badge is withheld for the default agent: that is the plain
+         chat, and badging the ordinary case is how a badge stops being read. #}
       <div class="cloud-chat-form-actions">
         <button type="button" id="cancel-btn"
                 class="btn btn-danger cloud-chat-stop-btn" hidden>Stop</button>
@@ -745,6 +786,52 @@
          on, and its whole row now belongs to the suggestions that follow. The
          Stack itself is one click away from the rail and from the Library. #}
     </form>
+
+    {# ── The agent selector — BELOW the composer ────────────────────────────
+       ONE small control, stating who this conversation will run as and opening
+       to change it. Empty state only: an agent is bound at session creation, so
+       once there are turns there is nothing to choose and #chat-thread-agent
+       carries the fact instead.
+
+       Why a select and not a row of chips. The chips shipped first and were the
+       right shape for three agents and the wrong one for fifteen: the row grew
+       with the list, wrapped over the composer it was meant to sit under, and
+       had to be capped at four with a "+11 more" link — which is a list
+       apologising for being a list. A selector's footprint is constant. It also
+       does BOTH jobs with one element, where the row needed the hero to say who
+       and the chips to change it.
+
+       Why it is not the control that was removed from inside the composer.
+       That one sat in the pill beside Send, so it read as something that
+       adjusted the message about to be sent, and it was labelled "Default" —
+       the mechanism's name for a row, not an identity. This one is outside the
+       input, under it, carrying the agent's real name and the same glyph as the
+       rail's Agents row; choosing from it starts a new session, which is the
+       only thing choosing an agent has ever done.
+
+       `data-brand` names the default agent: its row is literally called
+       "Default", and it is seeded lazily so it may not exist at all yet. #}
+    <div id="chat-agent-select" class="cloud-chat-agent-select" hidden
+         data-brand="{{ instance_brand_short or 'Agnes' }}">
+      <button type="button" id="chat-agent-select-btn"
+              class="cloud-chat-agent-select-btn"
+              aria-haspopup="listbox" aria-expanded="false"
+              aria-controls="chat-agent-select-menu">
+        <svg class="cloud-chat-agent-select-ico" viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="4" y="8" width="16" height="12" rx="3.5" stroke="currentColor" stroke-width="1.7"/><path d="M12 4.2v3.8M8.5 20v1.5M15.5 20v1.5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/><circle cx="9.3" cy="13.5" r="1.1" fill="currentColor"/><circle cx="14.7" cy="13.5" r="1.1" fill="currentColor"/></svg>
+        <span id="chat-agent-select-label" class="cloud-chat-agent-select-label">{{ instance_brand_short or 'Agnes' }}</span>
+        <svg class="cloud-chat-agent-select-caret" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M6 9l6 6 6-6" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button>
+      {# The panel. A filter appears only once the list is long enough to need
+         one — a search box over five rows is furniture. #}
+      <div id="chat-agent-select-menu" class="cloud-chat-agent-select-menu" hidden>
+        <input type="text" id="chat-agent-select-filter"
+               class="cloud-chat-agent-select-filter"
+               placeholder="Filter agents" aria-label="Filter agents" hidden>
+        <ul id="chat-agent-select-list" class="cloud-chat-agent-select-list"
+            role="listbox" aria-label="Choose an agent"></ul>
+        <a class="cloud-chat-agent-select-foot" href="/agents">Manage agents</a>
+      </div>
+    </div>
 
     {# ── Upload dialogs ─────────────────────────────────────────────────────
        Three lightweight modal overlays — one per upload action. They sit

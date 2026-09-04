@@ -44,7 +44,12 @@ from cli.config import get_server_url, get_token
 from cli.query_hints import missing_table, remote_table_hint
 from cli.v2_client import V2ClientError, api_delete, api_get_json, api_patch_json, api_post_json
 from src.duckdb_conn import _open_duckdb
-from src.mcp_tooling import ensure_output_size, ensure_query_output_size, progressive_tool
+from src.mcp_tooling import (
+    compact_search_results,
+    ensure_output_size,
+    ensure_query_output_size,
+    progressive_tool,
+)
 from src.remote_engines import strip_one_trailing_semicolon
 
 mcp = FastMCP(
@@ -134,14 +139,36 @@ def collections_list() -> dict:
 
 
 @tool(read_only=True)
-def collection_get(collection_id: str) -> dict:
-    """Show one Collection's detail plus its files and per-file status.
+def collection_get(collection_id: str, limit: int = 25, offset: int = 0, q: str = "") -> dict:
+    """Show one Collection's detail plus a PAGE of its files with per-file status.
+
+    The file list is paginated, not exhaustive — a crawled collection can
+    hold thousands of files, far more than fits in a model's context. This
+    returns at most ``limit`` files starting at ``offset``; read
+    ``files_total`` (the true count, after any ``q`` filter) and
+    ``files_truncated`` (``files_total`` greater than the files returned)
+    before treating ``files`` as the whole collection. When
+    ``files_truncated`` is true, call again with ``offset=<this call's offset
+    + len(files)>`` (or a larger ``limit``, capped at 200 server-side) to
+    reach the rest — ``files_limit`` and ``files_offset`` on the response say
+    exactly what page you just saw.
+
+    ``q`` filters files by a case-insensitive SUBSTRING match over the
+    filename OR path — this is NOT the whole-word content search
+    ``collections_search`` performs inside file text. Use ``q`` to find a
+    file by name, use ``collections_search`` to find a passage inside one.
 
     Args:
         collection_id: Collection id from ``collections_list`` (``col_...``).
+        limit: Max files to return in this page (default 25; server clamps to 1-200).
+        offset: Files to skip before this page (default 0).
+        q: Filter files by a substring of the filename or path (default: no filter).
     """
+    params: dict = {"limit": limit, "offset": offset}
+    if q:
+        params["q"] = q
     try:
-        return api_get_json(f"/api/collections/{collection_id}")
+        return api_get_json(f"/api/collections/{collection_id}", **params)
     except V2ClientError as exc:
         raise ValueError(_mcp_error("collection_get", exc)) from exc
 
@@ -174,12 +201,30 @@ def collections_search(query: str, k: int = 10, collection_id: str = "") -> dict
     response carries ``searched_collections`` and a ``hint`` saying which
     case you are in; read them before concluding anything about
     permissions.
+
+    Long passages are shortened to fit the tool output budget rather than
+    failing the call. When the response carries ``truncated: true``, each hit
+    whose ``truncated_fields`` names a field holds a PREFIX of it (ending in
+    ``…``) — never summarise a prefix as the whole passage. Read the document
+    in full with ``collection_file_read(collection_id=<corpus_id>,
+    file_id=<file_id>)`` (a chunk hit carries both), or narrow the query /
+    lower ``k``; ``truncated_note`` says exactly what was cut.
+
+    A large collection set (#2151) can ALSO set ``truncated: true`` for a
+    different reason: the server ranked over a bounded, query-matched subset
+    of the corpus rather than every accessible chunk. That case carries its
+    own ``truncated_cap`` (the chunk limit applied) alongside
+    ``truncated_note`` — narrow with ``collection_id`` or a more specific
+    query to reach what was excluded. A query too generic to narrow the
+    corpus by (e.g. only common words) is refused outright rather than
+    silently ranking an arbitrary slice; the tool call raises with the
+    server's ``search_query_too_broad`` detail in that case.
     """
     params: dict = {"q": query, "k": k}
     if collection_id:
         params["corpus_id"] = collection_id
     try:
-        return api_get_json("/api/collections/search", **params)
+        return compact_search_results(api_get_json("/api/collections/search", **params), "collections_search")
     except V2ClientError as exc:
         raise ValueError(_mcp_error("collections_search", exc)) from exc
 
@@ -190,7 +235,8 @@ def knowledge_search(query: str, k: int = 10) -> dict:
 
     Fans out server-side over Collections chunks (hybrid lexical+vector),
     corporate-memory knowledge items (fulltext), and table catalog cards —
-    all RBAC-filtered. Results are typed ``chunk | knowledge | table``;
+    all RBAC-filtered. Results are typed
+    ``chunk | knowledge | table | metric | glossary | plugin``;
     a ``table`` hit means structured data: pivot to SQL via the ``query``
     tool with the hit's ``table_id`` instead of reading text chunks.
 
@@ -210,9 +256,17 @@ def knowledge_search(query: str, k: int = 10) -> dict:
     carries ``source: "local"`` and a ``note`` explaining the degradation.
     An HTTP error from a reachable server (``V2ClientError``) is NOT a
     fallback trigger — the server answered, its error is the truth.
+
+    Long passages are shortened to fit the tool output budget rather than
+    failing the call. When the response carries ``truncated: true``, each hit
+    whose ``truncated_fields`` names a field holds a PREFIX of it (ending in
+    ``…``) — never summarise a prefix as the whole passage. Read the document
+    in full with ``collection_file_read(collection_id=<corpus_id>,
+    file_id=<file_id>)`` (a chunk hit carries both), or narrow the query /
+    lower ``k``; ``truncated_note`` says exactly what was cut.
     """
     try:
-        return api_get_json("/api/knowledge/search", q=query, k=k)
+        return compact_search_results(api_get_json("/api/knowledge/search", q=query, k=k), "knowledge_search")
     except V2ClientError as exc:
         raise ValueError(_mcp_error("knowledge_search", exc)) from exc
     except httpx.TransportError as exc:
@@ -231,15 +285,20 @@ def knowledge_search(query: str, k: int = 10) -> dict:
         from src.ingest.retrieval import retrieval_mode
 
         results = local_search(query, workspace=Path(ws), k=k)
-        return {
-            "query": query,
-            "results": results,
-            # Mode of the LOCAL ranking that just ran — the laptop may lack
-            # the embeddings extra even when the server has it.
-            "retrieval": retrieval_mode(),
-            "source": "local",
-            "note": "server unreachable — searched local knowledge artifacts (documents only)",
-        }
+        # Same budget as the server path: a local artifact holds the same
+        # 3.2k-char chunks, and the model reading this is the same model.
+        return compact_search_results(
+            {
+                "query": query,
+                "results": results,
+                # Mode of the LOCAL ranking that just ran — the laptop may lack
+                # the embeddings extra even when the server has it.
+                "retrieval": retrieval_mode(),
+                "source": "local",
+                "note": "server unreachable — searched local knowledge artifacts (documents only)",
+            },
+            "knowledge_search",
+        )
 
 
 @tool(read_only=True)

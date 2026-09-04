@@ -116,11 +116,11 @@
 <div class="ss-page">
   <div class="ss-toolbar">
     <span></span>
-    {{ ds.button('+ Add source', variant='primary', id='open-create-btn') }}
+    {{ ds.button('+ Add semantic source', variant='primary', id='open-create-btn') }}
   </div>
 
   <div class="data-table-wrap">
-    <table class="data-table" id="ss-table">
+    <table class="data-table data-table--pinned-actions" id="ss-table">
       <thead>
         <tr>
           <th>Name</th>
@@ -137,7 +137,7 @@
     <div id="ss-loading" class="ss-loading">Loading semantic sources…</div>
     <div id="ss-empty" class="ss-empty" style="display:none;">
       <div class="big">No semantic sources registered</div>
-      <div>Click <strong>Add source</strong> to pull semantic-layer documents from a git repo, an upload, or a data-source connection (Snowflake, Databricks, Keboola).</div>
+      <div>Click <strong>Add semantic source</strong> to pull semantic-layer documents from a git repo, an upload, or a data-source connection (Snowflake, Databricks, Keboola).</div>
     </div>
   </div>
 </div>

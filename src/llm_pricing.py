@@ -38,6 +38,12 @@ from dataclasses import dataclass
 CACHE_WRITE_MULTIPLIER = 1.25
 CACHE_READ_MULTIPLIER = 0.1
 
+#: The Anthropic Batches API prices every token term (input, output, cache
+#: read, cache write) at 50% of the synchronous rate — one flat multiplier
+#: applied to the SAME price table, never a second table: a batch call and
+#: a sync call for the same model differ only in this factor.
+BATCH_PRICE_MULTIPLIER = 0.5
+
 
 @dataclass(frozen=True)
 class ModelPrice:
@@ -117,20 +123,28 @@ def cost_usd(
     output_tokens: int = 0,
     cache_read_tokens: int = 0,
     cache_creation_tokens: int = 0,
+    batch: bool = False,
 ) -> float:
     """USD cost of one call (or a summed set of calls) on ``model``.
 
     ``input_tokens`` is the UNCACHED input, matching the Anthropic usage
     field of the same name — cached tokens are reported separately and
     priced separately here, never double-counted.
+
+    ``batch=True`` prices the SAME token terms at :data:`BATCH_PRICE_
+    MULTIPLIER` instead of forking a second price table — a caller mixing
+    synchronous and Batches-API calls for one run (e.g. a fact-extraction
+    pass whose corrective retry fell back to a sync call) prices each
+    portion of its usage separately and sums the two costs.
     """
     p = resolve_price(model)
-    return (
+    cost = (
         input_tokens * p.input_per_mtok
         + output_tokens * p.output_per_mtok
         + cache_read_tokens * p.cache_read_per_mtok
         + cache_creation_tokens * p.cache_write_per_mtok
     ) / 1_000_000
+    return cost * BATCH_PRICE_MULTIPLIER if batch else cost
 
 
 def budget_tokens(

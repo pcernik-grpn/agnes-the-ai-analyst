@@ -84,35 +84,56 @@ agnes_gcp_logging_active() {
 
 # agnes_gcp_logging_probe <compose_dir> <image>
 #
-# Verifies the gcplogs docker log driver can actually initialize on this
-# host by starting a no-op container with `--log-driver=gcplogs` (the
-# driver authenticates against the GCE metadata server at container start,
-# which is exactly where an unauthorized production container failed).
+# Verifies something is actually receiving the logs: the Ops Agent's
+# fluent_forward port on loopback. The overlay forwards asynchronously
+# (fluentd-async), so unlike the old gcplogs pipeline a missing collector
+# can no longer stop a container from starting — which is exactly why the
+# probe has to ask a different question than "does the driver initialize".
+# What it prevents now is the quiet failure: an armed overlay buffering
+# every line into a socket nobody is listening on.
 # Arms or clears the shared marker (<compose_dir>/.gcp-logging-ok) that
 # agnes_gcp_logging_active requires, and returns the probe's verdict.
 # With the overlay file absent there is nothing to arm: the marker is
-# cleared without running docker at all, so a deliberately removed overlay
-# (enable_gcp_logging=false) also disarms the gate. The probe is cheap
-# (`/bin/true` in the already-pulled app image, which is Debian-based) but
-# not free — callers run it at boot and on ticks where the marker is
-# missing, not on every resolve.
+# cleared without probing at all, so a deliberately removed overlay
+# (enable_gcp_logging=false) also disarms the gate. Cheap — one TCP
+# connect — but callers still run it at boot and on ticks where the marker
+# is missing, not on every resolve.
 agnes_gcp_logging_probe() {
     _acf_cdir=$1
-    _acf_image=$2
+    # $2 (the app image) is no longer needed — kept in the signature so the
+    # three call sites, which may run from an older image than this file,
+    # keep working unchanged.
     if [ ! -f "$_acf_cdir/docker-compose.gcp-logging.yml" ]; then
         rm -f "$_acf_cdir/.gcp-logging-ok"
         return 1
     fi
-    # Cap the probe so an unreachable metadata endpoint hangs a boot/tick
-    # for at most a minute instead of indefinitely. `timeout` ships with
-    # coreutils on every supported VM image; fall back to an uncapped run
-    # where it is missing (dev laptops) rather than failing the probe.
-    _acf_probe="docker run --rm --log-driver=gcplogs --entrypoint /bin/true"
+    # One TCP connect to the collector's forward port, capped so a boot or
+    # tick cannot hang on it. bash's /dev/tcp is the portable-enough probe
+    # here (the VM images run bash); `nc` is the fallback where it is not,
+    # and where neither exists the probe fails closed — no marker, no
+    # overlay, a warning from the caller.
+    _acf_port=24224
     if command -v timeout >/dev/null 2>&1; then
-        _acf_probe="timeout 60 $_acf_probe"
+        _acf_timeout="timeout 5"
+    else
+        _acf_timeout=""
     fi
-    if $_acf_probe "$_acf_image" >/dev/null 2>&1; then
-        touch "$_acf_cdir/.gcp-logging-ok"
+    if $_acf_timeout bash -c "exec 3<>/dev/tcp/127.0.0.1/$_acf_port" >/dev/null 2>&1 \
+        || $_acf_timeout nc -z 127.0.0.1 "$_acf_port" >/dev/null 2>&1; then
+        # Stamp the marker with the overlay this verdict is ABOUT, rather
+        # than touching it empty. A verdict belongs to one pipeline: when
+        # the overlay's content changes the old verdict is stale, and the
+        # caller can only see that if the marker says what it was armed
+        # for. Detecting the change by comparing the file before and after
+        # a refresh cannot work on the rollout that introduces the check —
+        # the auto-upgrade script replaces ITSELF at the end of a tick, so
+        # the previous version does the refresh and the new one's first
+        # run already sees before == after (Devin Review on #2057).
+        # An empty marker written by an older image simply fails to match
+        # and costs one re-probe, which is the right answer for a verdict
+        # whose pipeline is unknown.
+        sha256sum "$_acf_cdir/docker-compose.gcp-logging.yml" 2>/dev/null | cut -d" " -f1 \
+            > "$_acf_cdir/.gcp-logging-ok" || touch "$_acf_cdir/.gcp-logging-ok"
         return 0
     fi
     rm -f "$_acf_cdir/.gcp-logging-ok"

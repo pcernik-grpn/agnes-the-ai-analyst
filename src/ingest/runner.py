@@ -13,7 +13,7 @@ from typing import Optional
 
 from src.ingest.chunking import chunk_text
 from src.ingest.tabular import EmptyExtraction, UnsupportedTabular, ingest_tabular
-from src.ingest.text_extract import UnsupportedDocument, extract_text
+from src.ingest.text_extract import _PLAIN_EXTS, ExtractResult, UnsupportedDocument, extract_text
 from src.repositories import corpus_chunks_repo, corpus_files_repo, file_corpora_repo
 
 logger = logging.getLogger(__name__)
@@ -69,8 +69,22 @@ def _chunk_embed_store(corpus_id: str, file_id: str, source) -> tuple[int, bool]
     return n, embedded
 
 
-def ingest_file(file_id: str) -> str:
-    """Ingest one uploaded file. Returns the final ``processing_status``."""
+def ingest_file(file_id: str, *, preloaded_text: Optional[str] = None) -> str:
+    """Ingest one uploaded file. Returns the final ``processing_status``.
+
+    ``preloaded_text`` lets a caller that already holds the document's TEXT
+    in memory (the SharePoint crawl: ``_prepare_document`` converts a source
+    file to markdown, then ``_Ingestor.ingest`` writes it and calls this
+    function) skip the redundant ``extract_text`` read of the SAME content
+    back off disk — a real, measured contributor to that crawl's
+    parent-process memory pressure: a second full-size copy of the
+    converted markdown on top of every copy convert/anonymize/encode/store
+    already held. Only used for the plain-text branch below (the one
+    ``extract_text`` itself would read verbatim, no transform) — a
+    caller's preloaded text for any other extension is ignored and the
+    normal disk read runs, since e.g. the HTML branch still needs
+    ``_strip_html`` applied.
+    """
     cf_repo = corpus_files_repo()
     row = cf_repo.get(file_id)
     if not row:
@@ -147,8 +161,16 @@ def ingest_file(file_id: str) -> str:
             )
             return "indexed"
 
-        # Prose document → extract + chunk → corpus_chunks.
-        result = extract_text(storage_path, file_type)
+        # Prose document → extract + chunk → corpus_chunks. A preloaded text
+        # is only trusted for the plain-text branch `extract_text` itself
+        # would take (`_PLAIN_EXTS` — see this function's docstring): any
+        # other extension still needs its real transform (e.g. HTML's
+        # `_strip_html`), so a mismatched `preloaded_text` there is ignored
+        # rather than risking un-transformed content reaching storage.
+        if preloaded_text is not None and (ext in _PLAIN_EXTS or ext == ""):
+            result: "ExtractResult | str" = ExtractResult(full_text=preloaded_text)
+        else:
+            result = extract_text(storage_path, file_type)
         n, embedded = _chunk_embed_store(corpus_id, file_id, result)
         if n == 0:
             cf_repo.set_status(

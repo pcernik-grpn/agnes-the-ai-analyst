@@ -739,3 +739,58 @@ def test_plain_pat_rejected_on_management_api(mgmt_env):
     )
     r = mgmt_env["client"].post("/api/v1/agents", json={"name": "A", "slug": "pat-blocked"}, headers=_auth(jwt_token))
     assert r.status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# memory-curator system-owned profile (#1971 Part 1) — a narrow admin-edit
+# carve-out over an otherwise-ordinary ownership gate. A regular user's
+# agent stays covered by test_admin_cannot_mutate_foreign_agent above; this
+# is scoped ONLY to the one profile owned by the memory-curator system user.
+# ---------------------------------------------------------------------------
+
+
+def test_non_admin_cannot_edit_the_seeded_memory_curator_profile(mgmt_env):
+    """Ownership rules alone already guarantee this — a non-owner, non-admin
+    caller 404s on any {id} route, system-owned or not. No new gate needed
+    to prove it; this just pins the property for this specific profile."""
+    from app.services.memory_curator_profile import ensure_memory_curator_agent_profile
+
+    agent = ensure_memory_curator_agent_profile()
+    r = mgmt_env["client"].put(
+        f"/api/v1/agents/{agent['id']}",
+        json={"instructions": "up to no good"},
+        headers=_auth(mgmt_env["owner"]["token"]),
+    )
+    assert r.status_code == 404
+
+
+def test_admin_can_edit_the_seeded_memory_curator_profile(mgmt_env):
+    """The narrow carve-out in `_load_agent`: an admin CAN mutate this one
+    system-owned profile, unlike any regular user's agent (see
+    test_admin_cannot_mutate_foreign_agent)."""
+    from app.services.memory_curator_profile import ensure_memory_curator_agent_profile
+
+    agent = ensure_memory_curator_agent_profile()
+    r = mgmt_env["client"].put(
+        f"/api/v1/agents/{agent['id']}",
+        json={"instructions": "a retuned detection policy"},
+        headers=_auth(mgmt_env["admin"]["token"]),
+    )
+    assert r.status_code == 200
+    assert r.json()["instructions"] == "a retuned detection policy"
+
+    from app.services.memory_curator_profile import get_memory_curator_policy_text
+
+    assert get_memory_curator_policy_text() == "a retuned detection policy"
+
+
+def test_admin_can_get_the_seeded_memory_curator_profile(mgmt_env):
+    from app.services.memory_curator_profile import ensure_memory_curator_agent_profile
+
+    agent = ensure_memory_curator_agent_profile()
+    r = mgmt_env["client"].get(
+        f"/api/v1/agents/{agent['id']}",
+        headers=_auth(mgmt_env["admin"]["token"]),
+    )
+    assert r.status_code == 200
+    assert r.json()["slug"] == "memory-curator"

@@ -1,6 +1,6 @@
 # Collections or a data package? — choosing how knowledge enters Agnes
 
-Both surface under **Library**, which is why they get confused. Library is not a thing you choose *instead of* a data package — it is the shelf that holds every artefact type: data packages, Collections (files), memory domains, skills, agents, plugins, and recipes, each as a `?section=` band.
+Both surface under **Library**, which is why they get confused. Library is not a thing you choose *instead of* a data package — it is the shelf that holds every artifact type: data packages, Collections (files), memory domains, skills, agents, plugins, and recipes, each as a `?section=` band.
 
 The real choice is between two ways of getting content in:
 

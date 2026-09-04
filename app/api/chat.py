@@ -15,7 +15,7 @@ from sqlalchemy import exc as sa_exc
 from app.auth.access import require_resource_access
 from app.auth.dependencies import _get_db
 from app.chat.frame_seq import stamp_frame
-from app.chat.manager import ChatManager, ConcurrencyCapHit, SessionNotFound
+from app.chat.manager import SENDER_LIMIT_REASONS, ChatManager, ConcurrencyCapHit, SessionNotFound
 from app.chat.persistence import ChatRepository
 from app.chat.profiles import get_profile
 from app.chat.replay import GapReplayGate, replay_since
@@ -25,6 +25,7 @@ from app.chat.skills_catalog import (
     merged_commands,
     merged_skills,
 )
+from app.chat.message_parts import parts_to_tool_results
 from app.chat.sources import verdict as sources_verdict
 from app.chat.types import Surface
 from app.coordination.base import CoordinationUnavailable
@@ -306,12 +307,27 @@ async def set_session_pinned(
     used to probe for other users' session ids. Idempotent — pinning an already
     pinned session just re-stamps ``pinned_at``, which re-orders it to the front
     of the Pinned group.
+
+    Pinning an ARCHIVED conversation is refused (409): a pin means "keep this at
+    the top of my list" and archiving means "this is not in my list", so the two
+    states contradict each other — ``archive_session`` clears the pin for the
+    same reason. Restore it first if you want it back on the shelf. UNpinning is
+    always allowed, so a row pinned before this invariant existed can still be
+    tidied up.
     """
     _reject_restricted_principal(user, "pin a conversation")
     repo = _get_repo(request)
     s = repo.get_session(chat_id)
     if s is None or s.user_email != user["email"]:
         raise HTTPException(404)
+    if body.pinned and s.archived:
+        raise HTTPException(
+            409,
+            detail={
+                "error": "session_archived",
+                "message": "This conversation is archived. Restore it before pinning it.",
+            },
+        )
     repo.set_pinned(chat_id, body.pinned)
     return {"id": chat_id, "pinned": body.pinned}
 
@@ -361,6 +377,16 @@ async def rename_session(
     if s is None or s.user_email != user["email"]:
         raise HTTPException(404)
     repo.set_title(chat_id, title)
+    # Tell every sink of the live session about the new name — the caller's
+    # own tab updates from this response, a co-driver's or a second tab's
+    # sidebar does not. Local-process only (see ChatManager.announce_title)
+    # and never a reason to fail the rename itself.
+    mgr = getattr(request.app.state, "chat_manager", None)
+    if mgr is not None:
+        try:
+            await mgr.announce_title(chat_id)
+        except Exception:
+            logger.debug("rename: session_renamed broadcast failed for %s (non-fatal)", chat_id, exc_info=True)
     return {"id": chat_id, "title": title}
 
 
@@ -585,10 +611,21 @@ async def reissue_ticket(
         raise HTTPException(404)
     ticket = _issue_ticket(chat_id, user["email"])
     log_safe(user_id=user["id"], action="chat.session.ticket", resource=f"session:{chat_id}")
+    # #1973: whether an answer is being written RIGHT NOW. A browser that
+    # reloaded mid-answer reloads history that ends on its own question (the
+    # reply is persisted only when the turn ends) and then waits on a socket
+    # whose attach can take seconds — for that window the page looked idle,
+    # which is what invited the second reload that produced duplicate
+    # questions and stuck sessions. Read straight off the manager, and
+    # deliberately not fatal: a replica with no ChatManager (api role) still
+    # mints tickets, it just reports False and the client behaves as before.
+    mgr = getattr(request.app.state, "chat_manager", None)
+    turn_in_flight = bool(mgr is not None and mgr.is_turn_in_flight(chat_id))
     return {
         "id": chat_id,
         "ws_ticket": ticket,
         "ws_url": f"/api/chat/sessions/{chat_id}/stream?ticket={ticket}",
+        "turn_in_flight": turn_in_flight,
     }
 
 
@@ -634,7 +671,11 @@ async def list_messages(
             # the pair it needs is already here, so this costs no column, no
             # migration step and no DuckDB/Postgres parity surface — and a
             # better matcher improves history instead of only new answers.
-            **({"sources": sources_verdict(m.content or "", m.tool_calls).to_dict()} if m.role == "assistant" else {}),
+            **(
+                {"sources": sources_verdict(m.content or "", m.tool_calls, parts_to_tool_results(m.parts)).to_dict()}
+                if m.role == "assistant"
+                else {}
+            ),
         }
         for m in msgs
     ]
@@ -747,14 +788,38 @@ async def ws_stream(ws: WebSocket, chat_id: str, ticket: str, last_seq: int = 0)
                     # ws_stream closes the WS with 4404, and the user sees
                     # "Disconnected" before the runner has a chance to boot.
                     text = frame.get("text", "")
+                    # #1973: an opaque per-submit id from the client. The
+                    # manager records it only once the message is persisted, so
+                    # the retry below still covers a booting sandbox while a
+                    # genuine re-delivery of the same submit can never land a
+                    # second copy of the question in the transcript. Absent on
+                    # an older client — the manager treats that as today.
+                    raw_cmid = frame.get("client_msg_id")
+                    client_msg_id = raw_cmid[:128] if isinstance(raw_cmid, str) and raw_cmid else None
                     for _ in range(60):  # up to 30 s total at 0.5 s ticks
                         try:
                             # Thread sender_email so per-sender budgets (SR-10)
                             # and departed-participant replay-skip (SR-11) work.
-                            await mgr.send_user_message(chat_id_v, text, sender_email=user_email)
+                            await mgr.send_user_message(
+                                chat_id_v, text, sender_email=user_email, client_msg_id=client_msg_id
+                            )
                             break
                         except SessionNotFound:
                             await asyncio.sleep(0.5)
+                        except RuntimeError as exc:
+                            if str(exc) not in SENDER_LIMIT_REASONS:
+                                raise
+                            # A sender-limit refusal (daily spend, conversation
+                            # token budget, message rate). The manager already
+                            # broadcast the ``error`` frame to this socket
+                            # before raising; letting the exception unwind the
+                            # handler closed the socket right behind it, so the
+                            # reader saw the refusal for an instant and then
+                            # "Disconnected — click the conversation again"
+                            # (TCRD-291). Nothing was sent, nothing is broken:
+                            # stay attached so the copy can be read and a
+                            # rate-limited sender can simply try again.
+                            break
                     else:
                         # Sent directly on the WS before any LiveSession
                         # exists (so it can't go through
@@ -865,14 +930,27 @@ async def ws_join(ws: WebSocket, session_id: str, ticket: str, last_seq: int = 0
                 kind = frame.get("type")
                 if kind == "user_msg":
                     text = frame.get("text", "")
+                    # Same per-submit idempotency key as ws_stream (#1973) — a
+                    # co-driver's client reloads and reconnects exactly like the
+                    # owner's does.
+                    raw_cmid = frame.get("client_msg_id")
+                    client_msg_id = raw_cmid[:128] if isinstance(raw_cmid, str) and raw_cmid else None
                     for _ in range(60):
                         try:
                             # Thread sender_email so per-sender budgets (SR-10)
                             # and departed-participant replay-skip (SR-11) work.
-                            await mgr.send_user_message(session_id, text, sender_email=participant_email)
+                            await mgr.send_user_message(
+                                session_id, text, sender_email=participant_email, client_msg_id=client_msg_id
+                            )
                             break
                         except SessionNotFound:
                             await asyncio.sleep(0.5)
+                        except RuntimeError as exc:
+                            if str(exc) not in SENDER_LIMIT_REASONS:
+                                raise
+                            # Same as ws_stream's branch above: the refusal
+                            # frame is already on the socket, keep it open.
+                            break
                     else:
                         # See ws_stream's identical branch above — stamp for
                         # the same reason (wave-2F task 2).

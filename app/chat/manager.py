@@ -23,7 +23,7 @@ from app.chat import agent_profile, inbound, routing, runner
 from app.chat.audit import hash_args, write_audit
 from app.chat.config import ChatConfig
 from app.chat.frame_seq import stamp_frame
-from app.chat.message_parts import build_message_parts, parts_to_tool_calls
+from app.chat.message_parts import build_message_parts, parts_to_tool_calls, parts_to_tool_results
 from app.chat.persistence import ChatRepository
 from app.chat.profiles import get_profile
 from app.chat.provider import SandboxCapacityError, SandboxHandle, SandboxProvider
@@ -156,6 +156,85 @@ _ROUTING_LEASE_TTL_SEC = 180
 # starts trimming once tens of thousands of distinct chat_ids have ever
 # been attached here.
 _SESSION_LOCKS_MAX_ENTRIES = 10_000
+
+# Upper bound on ChatManager._accepted_msg_ids — the per-process record of
+# ``client_msg_id``s already accepted, which makes one submit idempotent at
+# the manager's single user-message ingress (#1973). Sized for "recent
+# enough that a re-delivery of the same submit is still plausible", not for
+# a session's whole history: a duplicate arrives within one turn (a retry, a
+# reconnect, a double submit), never thousands of messages later.
+_ACCEPTED_MSG_IDS_MAX_ENTRIES = 2_048
+
+# How long a ``client_msg_id`` claim is remembered in the coordination
+# backend (see ``claim_user_message``). A duplicate submit arrives within one
+# turn — a retry, a reconnect, a double submit — so this only has to outlive
+# the longest turn, not the conversation. Long enough that the window can
+# never be the reason a duplicate slips through; short enough that a
+# coordination backend does not accumulate claims for sessions long gone.
+_MSG_CLAIM_TTL_SEC = 3600
+
+# The one holder id every message claim is written under. This lease is used
+# as an atomic set-if-absent, not as a lease anybody renews or owns: the
+# question it answers is "has this submit already been accepted", so who
+# claimed it is not information any reader needs.
+_MSG_CLAIM_HOLDER = "accepted"
+
+
+def _msg_claim_key(chat_id: str, client_msg_id: str) -> str:
+    return f"chat-msg-claim:{chat_id}:{client_msg_id}"
+
+
+async def claim_user_message(chat_id: str, client_msg_id: Optional[str]) -> bool:
+    """Claim the right to PERSIST one submit. ``True`` = go ahead (#1973).
+
+    ``lease_acquire`` is an atomic set-if-absent on both backends (redis
+    ``SET NX PX``; the in-memory backend's own exclusive acquire), so exactly
+    one caller can ever win a given ``(chat_id, client_msg_id)`` — which is
+    what makes this correct where a check-then-act on a process-local set is
+    not: two coroutines racing the same submit (a client re-sending on a
+    reconnect while the original frame is still being processed), and two
+    replicas of a role-split deployment both reaching a persist path for it.
+
+    Callers MUST make the claim immediately before the persist and nowhere
+    earlier: a claim burned by a path that then raises (``SessionNotFound``
+    while a sandbox is still booting) would defeat the retry that exists for
+    exactly that case. Release it with ``release_user_message_claim`` if the
+    persist itself fails.
+
+    Fails OPEN — an unreachable coordination backend returns ``True``. A
+    duplicate question is a visible annoyance; a silently dropped question is
+    a lost one, and this guard is not the only thing standing between the
+    reported bug and the user (see ``ChatManager._accepted_msg_ids``).
+    """
+    if not client_msg_id:
+        return True
+    key = _msg_claim_key(chat_id, client_msg_id)
+    try:
+        return await asyncio.to_thread(coordination().lease_acquire, key, _MSG_CLAIM_HOLDER, ttl_s=_MSG_CLAIM_TTL_SEC)
+    except Exception:
+        logger.warning(
+            "message-claim backend unavailable for %s (client_msg_id=%s) — accepting the send",
+            chat_id,
+            client_msg_id,
+            exc_info=True,
+        )
+        return True
+
+
+async def release_user_message_claim(chat_id: str, client_msg_id: Optional[str]) -> None:
+    """Give a won claim back, for a persist that then failed.
+
+    Without this, an ``append_message`` that raises would leave the submit
+    claimed for the whole TTL and the client's retry would be dropped as a
+    duplicate of a message that was never stored.
+    """
+    if not client_msg_id:
+        return
+    try:
+        await asyncio.to_thread(coordination().lease_release, _msg_claim_key(chat_id, client_msg_id), _MSG_CLAIM_HOLDER)
+    except Exception:
+        logger.warning("could not release message claim for %s (client_msg_id=%s)", chat_id, client_msg_id)
+
 
 # Poll-fallback cadence for ChatManager._inbound_consumer_loop (wave-2F
 # task 4). The coordination-backend pub/sub notify (app.chat.inbound.
@@ -379,6 +458,9 @@ class LiveSession:
     # single-flow case, so this has no observable effect on memory-mode
     # tests.
     _broadcast_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    #: Orders "read the persisted title, then broadcast it" (``announce_title``)
+    #: so two overlapping renames can never deliver the older name last.
+    _title_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     # Live participant emails for co-sessions. Populated by attach() from
     # chat_session_participants WHERE left_at IS NULL; updated by leave_session()
     # when a participant leaves. Empty for non-co sessions.
@@ -410,6 +492,40 @@ class LiveSession:
     # trades that for a narrow at-most-once window across an ownership
     # change — see _inbound_consumer_loop's seeding comment.
     inbound_last_seq: int = 0
+
+
+#: ``approval_resolved`` decisions worth keeping on the tool row. ``cancelled``
+#: is not one: it means the turn ended before anyone answered, which the
+#: card's own retirement already says and the tool row has nothing to add to.
+_RECORDED_APPROVAL_DECISIONS = frozenset({"allow", "allow_session", "deny", "timeout", runner.UNATTENDED})
+
+
+def _record_approval_on_tool_call(turn_buffer: list, frame: dict) -> None:
+    """Stamp a resolved approval's decision onto the buffered ``tool_call`` it
+    was about, so the transcript keeps a trace of it.
+
+    Approval cards are deliberately NOT persisted (they live outside the turn
+    buffer — see ``LiveSession.pending_approvals``), so until now a reload
+    showed a turn's tool rows with no sign that a human had approved or denied
+    any of them; only the audit log knew (issue #2161). The engine provider's
+    ``request_id`` IS the tool call's id, so the pairing is exact: the buffered
+    ``tool_call`` frame gains ``approval``, ``build_message_parts`` copies it
+    onto the persisted part, and the web client draws the same
+    "approved by you" note live and on reload. A call the provider let through
+    on an earlier "Allow for session" arrives the same way (its resolution is
+    marked ``remembered``), so those rows say so too instead of looking
+    ungated. A ``request_id`` that matches no buffered call (the native
+    runner's ``appr-…`` ids are unrelated to tool ids) records nothing — the
+    row cannot claim a decision it cannot pair.
+    """
+    request_id = str(frame.get("request_id") or "")
+    decision = frame.get("decision")
+    if not request_id or decision not in _RECORDED_APPROVAL_DECISIONS:
+        return
+    for buffered in reversed(turn_buffer):
+        if buffered.get("type") == "tool_call" and str(buffered.get("tool_use_id") or "") == request_id:
+            buffered["approval"] = decision
+            return
 
 
 def _approval_attended(live: "LiveSession") -> bool:
@@ -548,6 +664,14 @@ class ChatManager:
         # which bounds worst-case memory instead of chasing full
         # eviction-time safety with no clean way to prove it.
         self._session_locks: "OrderedDict[str, asyncio.Lock]" = OrderedDict()
+        # #1973: (chat_id, client_msg_id) pairs already ACCEPTED (persisted)
+        # by send_user_message, oldest-first, trimmed at
+        # `_ACCEPTED_MSG_IDS_MAX_ENTRIES`. An entry is written only after the
+        # `chat_messages` row exists, which is what lets the WS route keep
+        # retrying a send that raised while the sandbox was still booting
+        # while still making a genuine re-delivery of the same submit a no-op.
+        # Process-local by design — see send_user_message's docstring.
+        self._accepted_msg_ids: "OrderedDict[tuple[str, str], None]" = OrderedDict()
         # Track C7 (@delegation MVP): chat_id -> delegation_depth for a
         # child session `handle_delegation` has just created via
         # `create_session` but not yet `attach()`ed. Consumed (popped) by
@@ -1158,7 +1282,15 @@ class ChatManager:
         # Sent directly to this one sink (not _broadcast — every other sink
         # already has its own connection, no fan-out needed here), so it
         # needs its own stamp (wave-2F task 2).
-        await ws.send_json(stamp_frame(live.chat_id, {"type": "ready"}))
+        #
+        # `turn_in_flight` (#1973) is the authoritative answer to "is an answer
+        # being written right now", from the process that hosts the runner. The
+        # ticket response carries the same flag so the client can paint the
+        # working state before the socket exists; this is what lets it CORRECT
+        # that guess — a turn that finished in between (or a ticket minted by a
+        # replica with no manager, which always reports False) is reconciled
+        # here instead of leaving a spinner nothing will ever clear.
+        await ws.send_json(stamp_frame(live.chat_id, {"type": "ready", "turn_in_flight": live.turn_in_flight}))
 
     def _load_agent_row(self, agent_id: Optional[str]) -> Optional[dict]:
         """Best-effort load of an `agents` row for spawn-time profile
@@ -1386,6 +1518,41 @@ class ChatManager:
         if not live.sinks:
             self._on_all_sinks_gone(live)
 
+    def _already_accepted(self, chat_id: str, client_msg_id: str) -> bool:
+        """Whether ``client_msg_id`` was already accepted for ``chat_id``."""
+        return (chat_id, client_msg_id) in self._accepted_msg_ids
+
+    def _note_accepted(self, chat_id: str, client_msg_id: Optional[str]) -> None:
+        """Record an accepted submit so a re-delivery of it is dropped.
+
+        No-op without an id — every pre-#1973 caller (Slack, headless, the
+        agent runtime) keeps today's exactly-as-delivered behavior.
+        """
+        if not client_msg_id:
+            return
+        self._accepted_msg_ids[(chat_id, client_msg_id)] = None
+        self._accepted_msg_ids.move_to_end((chat_id, client_msg_id))
+        while len(self._accepted_msg_ids) > _ACCEPTED_MSG_IDS_MAX_ENTRIES:
+            self._accepted_msg_ids.popitem(last=False)
+
+    def is_turn_in_flight(self, chat_id: str) -> bool:
+        """Whether ``chat_id`` has a turn running right now.
+
+        #1973: a browser that reloads mid-answer has no way to know a turn is
+        still running — it reloads persisted history (which ends on the user's
+        own question, because the answer is not persisted until the turn ends)
+        and then waits on a WebSocket whose attach can take seconds to resume
+        a sandbox. For that whole window the page looked idle: no spinner, no
+        Stop button, nothing. ``POST /sessions/{id}/ticket`` reports this so
+        the client can paint the working state before the socket is up.
+
+        False for a session this process does not host — an api-role replica
+        has no ChatManager at all (the endpoint degrades to False there), and
+        a session owned by another gateway answers over its own socket.
+        """
+        live = self._live.get(chat_id)
+        return bool(live is not None and live.turn_in_flight)
+
     def turn_buffer_min_seq(self, chat_id: str) -> Optional[int]:
         """Lowest ``seq`` currently held in ``chat_id``'s in-flight turn
         buffer (see ``LiveSession.turn_buffer`` / ``_seat_sink``), or
@@ -1593,6 +1760,11 @@ class ChatManager:
             live.current_pump = pump_task
             live.current_wait = wait_task
             self._repo.set_sandbox_paused_at(live.chat_id, None)
+            # The pause cancelled every task in live.tasks — a title task still
+            # awaiting the model included, which re-armed the flag on its way
+            # out (TCRD-290). Retry now: nothing else would, since a finished
+            # turn is not replayed.
+            self._retry_auto_title_if_untitled(live)
 
     async def _destroy_old_sandbox(self, session: "ChatSession") -> None:
         """Best-effort teardown of a session's paused sandbox before its
@@ -2164,6 +2336,12 @@ class ChatManager:
             "AGNES_LLM_PROVIDER": getattr(self._config, "llm_provider", "anthropic"),
             "AGNES_VERTEX_PROJECT_ID": getattr(self._config, "vertex_project_id", ""),
             "AGNES_VERTEX_REGION": getattr(self._config, "vertex_region", ""),
+            # Docker-provider egress policy (chat.docker_egress_mode), forwarded
+            # so the runner's boot-time skill-dependency warm-up (#1977) can
+            # tell there is no route to PyPI under `none` without importing
+            # app.chat.config — this file runs standalone inside the sandbox.
+            # Inert on kai-agent: that provider never runs runner.py at all.
+            "AGNES_DOCKER_EGRESS_MODE": getattr(self._config, "docker_egress_mode", "none"),
             # No ANTHROPIC_API_KEY / AGNES_TOKEN here (chat sandbox secret
             # broker hardening, 2026-07-14): the real Anthropic key never
             # enters the sandbox env. The runner's own ``_start_relay``
@@ -2404,7 +2582,16 @@ class ChatManager:
                 # haystack) and for rows written before schema v123.
                 frame["parts"] = build_message_parts(live.turn_buffer)
                 frame["tool_calls"] = parts_to_tool_calls(frame["parts"])
-                frame["sources"] = sources_verdict(frame.get("content", "") or "", frame.get("tool_calls")).to_dict()
+                # Results as well as calls: a document's name only ever
+                # appears in what a tool RETURNED (see `verify`), so a
+                # citation judged on `tool_calls` alone could never verify.
+                # They ride the verdict, not the row — `parts` already
+                # persists them once.
+                frame["sources"] = sources_verdict(
+                    frame.get("content", "") or "",
+                    frame.get("tool_calls"),
+                    parts_to_tool_results(frame.get("parts")),
+                ).to_dict()
             await self._broadcast(live, frame)
             ftype = frame.get("type")
             # Accumulate in-flight turn frames for mid-turn replay and partial
@@ -2422,6 +2609,7 @@ class ChatManager:
                     live.pending_approvals[rid] = frame
             elif ftype == "approval_resolved":
                 live.pending_approvals.pop(frame.get("request_id"), None)
+                _record_approval_on_tool_call(live.turn_buffer, frame)
             elif ftype == "question_request":
                 rid = frame.get("request_id")
                 if rid:
@@ -2483,13 +2671,16 @@ class ChatManager:
                 self._record_turn_usage(live, frame)
                 live.turn_buffer.clear()
                 live.turn_in_flight = False
-                # Auto-title: the first assistant_message in a session
-                # is the trigger to ask Haiku for a short title. We
-                # check the per-session flag (not just the persisted
-                # title) so two rapid-fire assistant frames during
-                # crash-respawn replay don't both fire the call.
+                # Auto-title backstop: the primary trigger is the first
+                # user message (``_deliver_local_user_message``); the first
+                # assistant_message re-arms it for a session whose title
+                # task never landed (a restart cancelled it mid-flight, or
+                # the user row was not yet visible when it ran). We check
+                # the per-session flag (not just the persisted title) so two
+                # rapid-fire assistant frames during crash-respawn replay
+                # don't both fire the call.
                 if not live.auto_title_started:
-                    self._maybe_start_auto_title(live)
+                    self._retry_auto_title_if_untitled(live)
             elif ftype == "done":
                 live.turn_buffer.clear()
                 live.turn_in_flight = False
@@ -2733,7 +2924,20 @@ class ChatManager:
         if live is not None:
 
             async def _notify(frame: dict) -> None:
-                await self._broadcast(live, frame)
+                # To the SENDER's own sinks only, never a broadcast: in a
+                # co-driven conversation the other participants sent nothing
+                # and must not read "you've reached your daily spend cap"
+                # (review finding on #2050). Unstamped and not appended to
+                # the replay stream on purpose — it is a notice to one
+                # person about one refused submit, not a turn frame every
+                # client should replay on reconnect. A sender with no local
+                # sink (a Slack mention forwarded from another gateway) is
+                # explained by that surface's own handler instead.
+                for entry in [e for e in list(live.sinks) if e.participant_email == sender]:
+                    try:
+                        await entry.sink.send_json(frame)
+                    except Exception:
+                        logger.warning("sender-limit notice: sink send failed for %s", chat_id)
 
             on_limit = _notify
         await enforce_sender_limits(self._repo, self._config, sender, chat_id, on_limit=on_limit)
@@ -2759,6 +2963,22 @@ class ChatManager:
         live.state = SessionState.ACTIVE
         # Track C7: a fresh turn gets its own one-delegation budget.
         live.delegated_this_turn = False
+        # Auto-title: the FIRST user message is the trigger (TCRD-290). Every
+        # path that delivers one funnels through here with the row already
+        # persisted — send_user_message and produce_inbound_user_message both
+        # append before delivering, the post-restart replay re-sends a row
+        # that already exists — so the title lands while the answer is still
+        # streaming, and a session whose turn is then refused, capped or lost
+        # to a restart is titled all the same. Never lets a scheduling error
+        # fail the send: the title is cosmetic, the message is not.
+        if not live.auto_title_started:
+            try:
+                self._maybe_start_auto_title(live)
+            except Exception:
+                # Leave the session re-armed: a flag stuck at True here would
+                # silence the assistant_message backstop for its whole live span.
+                live.auto_title_started = False
+                logger.exception("auto-title scheduling failed for %s (non-fatal)", live.chat_id)
 
     async def deliver_approval_decision(
         self,
@@ -3303,7 +3523,13 @@ class ChatManager:
         await self._replay_pending_approvals_to(live, sink)
 
     async def _forward_inbound_message(
-        self, chat_id: str, text: str, *, sender_email: Optional[str], slack_origin: Optional[dict] = None
+        self,
+        chat_id: str,
+        text: str,
+        *,
+        sender_email: Optional[str],
+        slack_origin: Optional[dict] = None,
+        client_msg_id: Optional[str] = None,
     ) -> None:
         """Hand a user message to whichever gateway actually owns
         ``chat_id`` (wave-2F task 4) instead of delivering it locally.
@@ -3333,7 +3559,13 @@ class ChatManager:
         thin-producer path (wave-2F final review F1).
         """
         await produce_inbound_user_message(
-            self._repo, self._config, chat_id, text, sender_email=sender_email, slack_origin=slack_origin
+            self._repo,
+            self._config,
+            chat_id,
+            text,
+            sender_email=sender_email,
+            slack_origin=slack_origin,
+            client_msg_id=client_msg_id,
         )
 
     async def _inbound_consumer_loop(self, live: "LiveSession") -> None:
@@ -3513,9 +3745,27 @@ class ChatManager:
         *,
         sender_email: Optional[str] = None,
         slack_origin: Optional[dict] = None,
+        client_msg_id: Optional[str] = None,
     ) -> None:
         """Deliver ``text`` to ``chat_id``'s runner, forwarding to the owning
         gateway if this process doesn't host the session (wave-2F task 4).
+
+        ``client_msg_id`` (#1973) makes one submit idempotent at this single
+        ingress: whoever wins the ATOMIC claim immediately before the persist
+        (``claim_user_message`` — a set-if-absent in the coordination backend,
+        so it holds across coroutines AND across replicas) writes the row; a
+        later call carrying an already-claimed id is dropped whole — no second
+        ``chat_messages`` row, no second turn. The reported symptom was a
+        session holding the same question twice with no answer at all, and
+        this closes it for every re-delivery of one submit regardless of which
+        path re-delivered it: the web WS route's wait-for-runner retry, a
+        client that re-sends after a dropped socket, a double submit, or a
+        forward to the owning gateway (the id rides that path too, and the
+        thin producer claims through the same helper). A claim is taken only
+        at the persist, never before, so a method that raises on the way there
+        (``SessionNotFound`` while the sandbox is still booting) leaves the
+        retry that exists for exactly that case working. ``_accepted_msg_ids``
+        is a process-local fast path in front of it, not the guard itself.
 
         ``slack_origin`` (``{"channel": ..., "thread_ts": ...}``) marks a
         message that entered via a Slack webhook on a replica that does NOT
@@ -3565,6 +3815,17 @@ class ChatManager:
         inside ``_resume_live``, never the reverse), matching ``attach()``'s
         existing order, so no new deadlock is introduced.
         """
+        # Fast path only: a duplicate this process already accepted is dropped
+        # before it can spawn a sandbox. The authoritative check is the atomic
+        # claim at the persist below — this one is a check-then-act and cannot
+        # be relied on alone.
+        if client_msg_id and self._already_accepted(chat_id, client_msg_id):
+            logger.info(
+                "dropping duplicate user_msg for %s (client_msg_id=%s already accepted)",
+                chat_id,
+                client_msg_id,
+            )
+            return
         live = self._live.get(chat_id)
         if live is None:
             async with self._get_session_lock(chat_id):
@@ -3595,9 +3856,19 @@ class ChatManager:
                     this_gw = routing.this_gateway_id()
                     owner = await asyncio.to_thread(routing.owner_of, chat_id)
                     if owner is not None and owner != this_gw:
+                        # The forwarded path persists inside
+                        # produce_inbound_user_message, which makes its own
+                        # claim — pass the id rather than claiming here, or the
+                        # two would fight over the same key and the message
+                        # would be dropped by its own forward.
                         await self._forward_inbound_message(
-                            chat_id, text, sender_email=sender_email, slack_origin=slack_origin
+                            chat_id,
+                            text,
+                            sender_email=sender_email,
+                            slack_origin=slack_origin,
+                            client_msg_id=client_msg_id,
                         )
+                        self._note_accepted(chat_id, client_msg_id)
                         return
                     # Post-restart: no LiveSession in memory, but repo row may have sandbox refs.
                     session = self._repo.get_session(chat_id)
@@ -3619,12 +3890,29 @@ class ChatManager:
         # not the session owner — each co-driver has their own daily/rate window.
         sender = sender_email or live.user_email
         await self._enforce_sender_limits(sender, chat_id, live)
-        self._repo.append_message(
-            session_id=chat_id,
-            role="user",
-            content=text,
-            sender_email=sender_email or live.user_email,
-        )
+        # The one authoritative gate. Taken HERE — after the limit checks and
+        # every path that can still raise, immediately before the row is
+        # written — so it is never burned by a send that did not persist.
+        if not await claim_user_message(chat_id, client_msg_id):
+            logger.info(
+                "dropping duplicate user_msg for %s (client_msg_id=%s claimed elsewhere)",
+                chat_id,
+                client_msg_id,
+            )
+            return
+        try:
+            self._repo.append_message(
+                session_id=chat_id,
+                role="user",
+                content=text,
+                sender_email=sender_email or live.user_email,
+            )
+        except Exception:
+            # Hand the claim back: the row does not exist, so the client's
+            # retry must not be mistaken for a duplicate of it.
+            await release_user_message_claim(chat_id, client_msg_id)
+            raise
+        self._note_accepted(chat_id, client_msg_id)
         # F2d (audit-full-coverage plan, Task 6): the manager's single user_msg
         # ingress point — every surface (web WS, Slack, agent runtime, headless)
         # funnels through send_user_message, so one write here covers them all.
@@ -3809,6 +4097,49 @@ class ChatManager:
         async with self._get_session_lock(chat_id):
             await self._kill_locked(chat_id, reason=reason)
 
+    def _partial_save(self, live: "LiveSession", *, reason: str) -> None:
+        """Persist an interrupted turn so a torn-down session never dead-ends.
+
+        #1973: a turn killed mid-flight used to be saved only when it had
+        already emitted TEXT tokens — an answer interrupted while its first
+        tool call was still running left the session with the user's question
+        and nothing else, which is indistinguishable from "Agnes never
+        replied" and is not recoverable by any later reload. A turn that was
+        in flight now ALWAYS leaves a row: whatever text arrived (possibly
+        empty), the ordered ``parts`` of the tool calls that did run, and the
+        ``interrupted`` marker the web client renders as "this answer was
+        interrupted".
+
+        Keyed on ``turn_in_flight`` rather than on a non-empty
+        ``turn_buffer``: a turn suspended on an approval, or one killed
+        between delivery and its first frame, has an empty buffer and is
+        exactly the case that used to vanish.
+        """
+        if not live.turn_in_flight and not live.turn_buffer:
+            return
+        partial = "".join(f.get("text", "") for f in live.turn_buffer if f.get("type") == "token").strip()
+        parts = build_message_parts(live.turn_buffer) if live.turn_buffer else None
+        tool_calls: list[dict] = [{"interrupted": True, "reason": reason}]
+        if parts:
+            tool_calls.extend(parts_to_tool_calls(parts) or [])
+        try:
+            self._repo.append_message(
+                session_id=live.chat_id,
+                role="assistant",
+                content=partial,
+                tool_calls=tool_calls,
+                parts=parts,
+                tokens_in=None,
+                tokens_out=None,
+                model=None,
+            )
+        except Exception:
+            # Teardown is best-effort throughout — a failed partial-save must
+            # not abort the rest of the kill (sandbox destroy, lease release).
+            logger.exception("partial-save failed for %s", live.chat_id)
+        live.turn_buffer.clear()
+        live.turn_in_flight = False
+
     async def _kill_locked(self, chat_id: str, *, reason: str) -> None:
         # Spawn-time profile is no longer needed once the session is torn down;
         # drop it so the map doesn't grow unboundedly with studio usage.
@@ -3882,20 +4213,7 @@ class ChatManager:
             return
         await self._release_routing_lease(chat_id)
         live.state = SessionState.DEAD
-        # Partial-save: if a turn was in flight, persist the accumulated token
-        # text as an interrupted assistant message so it's not lost.
-        if live.turn_buffer:
-            partial = "".join(f.get("text", "") for f in live.turn_buffer if f.get("type") == "token").strip()
-            if partial:
-                self._repo.append_message(
-                    session_id=chat_id,
-                    role="assistant",
-                    content=partial,
-                    tool_calls=[{"interrupted": True, "reason": reason}],
-                    tokens_in=None,
-                    tokens_out=None,
-                    model=None,
-                )
+        self._partial_save(live, reason=reason)
         if live.handle is not None:
             await live.handle.kill()
         for t in live.tasks:
@@ -3929,13 +4247,15 @@ class ChatManager:
     def _maybe_start_auto_title(self, live: LiveSession) -> None:
         """Schedule a Haiku call to generate a session title if it
         doesn't have one yet. Idempotent per live session — sets
-        ``auto_title_started`` before returning so a second
-        ``assistant_message`` for the same session is a no-op.
+        ``auto_title_started`` before returning so the second trigger
+        (the first ``assistant_message``, after the first user message
+        already fired it) is a no-op.
 
         Best-effort: any failure is swallowed inside the task so the
         chat session never breaks because Haiku is down or
-        ``ANTHROPIC_API_KEY`` is missing. The task itself is appended
-        to ``live.tasks`` so :meth:`kill` cancels it on shutdown.
+        ``ANTHROPIC_API_KEY`` is missing — the task falls back to a title
+        cut from the user's own message instead. The task itself is
+        appended to ``live.tasks`` so :meth:`kill` cancels it on shutdown.
         """
         session = self._repo.get_session(live.chat_id)
         if session is None or session.title:
@@ -3944,56 +4264,134 @@ class ChatManager:
             # flag was reset by a respawn) or the session vanished.
             live.auto_title_started = True
             return
-        live.auto_title_started = True
+        # Schedule first, flag second: a create_task that raises (loop already
+        # shutting down) must not leave the flag set with no task behind it.
+        # The task cannot run before this method returns, so the order is safe.
         task = asyncio.create_task(self._run_auto_title(live))
+        live.auto_title_started = True
         live.tasks.append(task)
 
+    def _retry_auto_title_if_untitled(self, live: LiveSession) -> None:
+        """Guarded ``_maybe_start_auto_title``: a scheduling failure (repo
+        hiccup, loop shutting down) is logged, never raised into the caller
+        — the WS pump and the resume path must not die for a cosmetic task —
+        and leaves the session re-armed for the next trigger."""
+        if live.auto_title_started:
+            return
+        try:
+            self._maybe_start_auto_title(live)
+        except Exception:
+            live.auto_title_started = False
+            logger.exception("auto-title scheduling failed for %s (non-fatal)", live.chat_id)
+
+    async def announce_title(self, chat_id: str) -> bool:
+        """Push the session's PERSISTED title as a ``session_renamed`` frame to
+        every sink of its live session hosted in THIS process. Returns
+        ``False`` (and does nothing) when the session is not live here or has
+        no title. After a rename the initiating browser updates itself from
+        the HTTP response; this is what keeps a co-driver's or a second tab's
+        sidebar current.
+
+        Callers pass no title on purpose: the row is re-read under the
+        session's ``_title_lock`` and broadcast before the lock is released, so
+        two overlapping renames (or a rename racing the auto-title task) are
+        announced in persistence order — the later announcement always reads
+        the later value, and can never be overtaken by an older frame.
+
+        Local-only by design: in a role-split deployment the sinks live on the
+        owning gateway, and an api-role process has no LiveSession to reach.
+        Best-effort — a dropped socket is handled inside ``_broadcast``.
+        """
+        live = self._live.get(chat_id)
+        if live is None:
+            return False
+        async with live._title_lock:
+            session = self._repo.get_session(chat_id)
+            title = (session.title or "").strip() if session is not None else ""
+            if not title:
+                return False
+            await self._broadcast(live, {"type": "session_renamed", "chat_id": chat_id, "title": title})
+        return True
+
     async def _run_auto_title(self, live: LiveSession) -> None:
-        """Task body: fetch the first user message, call Haiku, persist
-        the title, broadcast a ``session_renamed`` frame.
+        """Task body: fetch the first user message, ask the model for a
+        title — falling back to a cut of the message itself when the model
+        path yields nothing — persist it, broadcast a ``session_renamed``
+        frame.
 
         All errors are caught and logged — title generation is a
         cosmetic enhancement, not a load-bearing piece of the chat
-        pipeline."""
-        from app.chat.auto_title import generate_title
+        pipeline. Best-effort, but with a floor: when the model path yields
+        nothing the fallback title is used, so a session with a message ends
+        up titled unless persisting the title itself fails or the task is
+        cancelled mid-flight (TCRD-290)."""
+        from app.chat.auto_title import fallback_title, generate_title
 
         try:
             first_user = self._repo.get_first_user_message(live.chat_id)
             if not first_user:
-                # The runner emitted an assistant_message before any
-                # user_msg was persisted — shouldn't happen in normal
-                # flow, but bail cleanly if it does.
+                # Fired before any user_msg row was visible (shouldn't
+                # happen — every trigger path persists first). Re-arm so
+                # the next trigger for this session tries again instead of
+                # leaving it untitled for the rest of its live span.
+                live.auto_title_started = False
                 return
-            title = await generate_title(
-                first_user,
-                llm_auth=self._config.llm_auth,
-                llm_provider=getattr(self._config, "llm_provider", "anthropic"),
-                vertex=(
-                    getattr(self._config, "vertex_project_id", ""),
-                    getattr(self._config, "vertex_region", ""),
-                ),
-            )
-            if not title:
-                return
-            self._repo.set_title(live.chat_id, title)
-            # Push the new title to the live WS so the sidebar +
-            # thread header update without a refresh. _broadcast may
-            # raise if the socket has dropped — swallow it; the
-            # persisted title will surface on the next sidebar load.
+            title: Optional[str] = None
             try:
-                await self._broadcast(
-                    live,
-                    {
-                        "type": "session_renamed",
-                        "chat_id": live.chat_id,
-                        "title": title,
-                    },
+                title = await generate_title(
+                    first_user,
+                    llm_auth=self._config.llm_auth,
+                    llm_provider=getattr(self._config, "llm_provider", "anthropic"),
+                    vertex=(
+                        getattr(self._config, "vertex_project_id", ""),
+                        getattr(self._config, "vertex_region", ""),
+                    ),
                 )
+            except asyncio.CancelledError:
+                # A pause or a kill cancels every task in ``live.tasks``, this
+                # one included. Stop here — never fall through to the fallback
+                # + persist below — but leave the session re-armed: a paused
+                # session is resumed with the same LiveSession, and
+                # ``_resume_live`` retries an untitled one right away instead
+                # of waiting for a message the user may never send.
+                # CancelledError is a BaseException so ``except Exception``
+                # would not catch it anyway — this makes the intent explicit.
+                live.auto_title_started = False
+                raise
             except Exception:
-                logger.debug(
-                    "auto-title: ws.send_json failed for %s; title still persisted",
+                logger.exception(
+                    "auto-title model call crashed for %s; falling back to the first message",
                     live.chat_id,
                 )
+            if not title:
+                title = fallback_title(first_user)
+                if title:
+                    # DEBUG, not INFO: on a keyless instance this is every
+                    # session, and the once-per-process WARNING in auto_title
+                    # already carries the operator-facing signal.
+                    logger.debug("auto-title: no usable model title for %s; using first-message fallback", live.chat_id)
+            if not title:
+                return
+            # Conditional write: the user may have renamed the chat while we
+            # were awaiting the model, and their name wins.
+            if not self._repo.set_title_if_unset(live.chat_id, title):
+                logger.debug("auto-title: %s was titled meanwhile (user rename); keeping it", live.chat_id)
+            # Either way, announce whatever is persisted NOW — ours, or the
+            # user's — through the same ordered path the rename endpoint uses,
+            # so the sidebar + thread header update without a refresh and a
+            # co-driver never sees the model's title over the user's.
+            # announce_title may raise if a socket dropped — swallow it; the
+            # persisted title surfaces on the next sidebar load.
+            try:
+                await self.announce_title(live.chat_id)
+            except Exception:
+                logger.debug(
+                    "auto-title: session_renamed broadcast failed for %s; title still persisted",
+                    live.chat_id,
+                )
+        except asyncio.CancelledError:
+            live.auto_title_started = False
+            raise
         except Exception:
             logger.exception("auto-title task crashed for %s", live.chat_id)
 
@@ -4368,13 +4766,28 @@ class ChatManager:
                 continue
             # Idle TTL: last_activity recency check.
             if (now - live.last_activity).total_seconds() > idle_cutoff:
-                if self._config.on_detach == "pause":
-                    to_pause.append(chat_id)
-                else:
+                if self._config.on_detach != "pause":
                     to_kill.append((chat_id, "idle_ttl"))
-                continue
-            # Keepalive heartbeat for ACTIVE sessions with at least one sink.
-            if live.state == SessionState.ACTIVE and live.sinks and live.handle is not None:
+                    continue
+                # #1973: pausing mid-turn discards the in-flight answer —
+                # _pause_live cancels the pump, so the assistant_message that
+                # would have been persisted never arrives. The detach path
+                # (_linger_then_pause) has always waited for the turn to finish
+                # first; the reaper must agree, or a turn whose client
+                # disconnected loses its reply on the next sweep. The
+                # max_session_seconds ceiling above still ALWAYS kills, so a
+                # turn whose in-flight flag never clears cannot leak. An
+                # in-flight turn falls THROUGH to the keepalive below rather
+                # than skipping the sweep: it is the case that most needs the
+                # sandbox kept alive.
+                if not live.turn_in_flight:
+                    to_pause.append(chat_id)
+                    continue
+            # Keepalive heartbeat for ACTIVE sessions with at least one sink —
+            # or with a turn still running, which is the case a mid-answer
+            # browser reload creates: no sink, but an answer being written that
+            # must outlive the sandbox's external timeout (#1973).
+            if live.state == SessionState.ACTIVE and (live.sinks or live.turn_in_flight) and live.handle is not None:
                 try:
                     await self._provider.keepalive(
                         live.handle,
@@ -4629,6 +5042,35 @@ def _seed_daily_tokens_from_db_if_needed(
             pass
 
 
+#: The ``RuntimeError`` reasons ``enforce_sender_limits`` raises — one per
+#: guardrail the send gate enforces: the sender's daily spend, the
+#: conversation's token budget, the sender's message rate. Every surface that
+#: catches a refusal keys on these strings (the Slack bot's
+#: ``_SENDER_LIMIT_MESSAGES``, the WebSocket reader loops in app/api/chat.py),
+#: so they are named here rather than re-typed.
+SENDER_LIMIT_REASONS = frozenset({"daily_budget_exhausted", "max_session_tokens_exhausted", "rate_limit_exceeded"})
+#: The ``kind`` of the ``error`` frame ``enforce_sender_limits`` broadcasts for
+#: each of those refusals, in the same order. A sink that shares its delivery
+#: channel with a handler that already explains the refusal (the Slack
+#: slash command's ``EphemeralCommandSink``) uses this to post it once.
+SENDER_LIMIT_FRAME_KINDS = frozenset({"daily_budget", "max_session_tokens", "rate_limit"})
+
+
+def session_token_budget_message(used: int, cap: int) -> str:
+    """Copy for the ``max_session_tokens`` refusal frame.
+
+    Names what was exhausted — a budget of tokens billed across every turn —
+    and the next step, in words a reader who never heard of a context window
+    can act on. It is Agnes's own guardrail, so it must not be worded (or,
+    downstream, presented) as something the engine reported.
+    """
+    return (
+        f"This conversation has reached its token budget ({used:,} of {cap:,} tokens billed "
+        "across all its turns). Start a new conversation to continue, or ask an admin to "
+        "raise chat.max_session_tokens."
+    )
+
+
 async def enforce_sender_limits(
     repo: ChatRepository,
     config: ChatConfig,
@@ -4647,58 +5089,62 @@ async def enforce_sender_limits(
     api-role thin producer passes nothing (no local socket to put it on).
     The raised ``RuntimeError`` reasons are unchanged either way.
     """
-    # Enforce daily Anthropic spend cap — see daily_token_totals.
-    tokens_in, tokens_out = daily_token_totals(repo, sender)
-    # `model=None` resolves to llm_pricing.DEFAULT_PRICE — the most
-    # expensive general-purpose tier. Deliberate: the day's spend arrives here
-    # as a two-bucket token counter with no model attached (a session's model
-    # is whatever the sandbox's CLI resolved, recorded per message, and one
-    # day can mix several), so a cap that must guess guesses in the direction
-    # that stops sooner. It previously guessed Sonnet 4.6's $3/$15 and let an
-    # Opus-running instance spend ~3x its configured cap. Exact, per-model
-    # cost is the measured readout's job (`cost_breakdown` + this module),
-    # not this guardrail's.
-    #
-    # `tokens_in` already carries the day's cache-write tokens (see
-    # ChatManager._record_daily_tokens), priced here at the plain input rate
-    # rather than 1.25x: the counter keeps one in-bucket, so the small
-    # under-price is stated rather than hidden.
-    spent_usd = cost_usd(
-        model=None,
-        input_tokens=tokens_in,
-        output_tokens=tokens_out,
-    )
-    if spent_usd >= config.daily_anthropic_spend_usd:
-        if on_limit is not None:
-            await on_limit(
-                {
-                    "type": "error",
-                    "kind": "daily_budget",
-                    "message": (
-                        f"Daily spend cap of ${config.daily_anthropic_spend_usd:.2f} reached. Try again tomorrow."
-                    ),
-                }
-            )
-        raise RuntimeError("daily_budget_exhausted")
-    # Per-session token cap — operators set max_session_tokens in
-    # instance.yaml; previously the knob was dead config. Tokens already
-    # spent in this session are summed from chat_messages on every send;
-    # the session row itself is never UPDATEd (DuckDB 1.5.3 FK+index bug
-    # documented in persistence.py).
-    session_tokens = repo.session_total_tokens(chat_id)
-    if session_tokens >= config.max_session_tokens:
-        if on_limit is not None:
-            await on_limit(
-                {
-                    "type": "error",
-                    "kind": "max_session_tokens",
-                    "message": (
-                        f"Per-session token cap of {config.max_session_tokens} reached "
-                        f"(used {session_tokens}). Start a new chat session."
-                    ),
-                }
-            )
-        raise RuntimeError("max_session_tokens_exhausted")
+    # Enforce daily Anthropic spend cap — see daily_token_totals. ``0``
+    # disables it, and then the day's counters are not even read (no
+    # coordination round trip, no DB re-seed).
+    if config.daily_anthropic_spend_usd > 0:
+        tokens_in, tokens_out = daily_token_totals(repo, sender)
+        # `model=None` resolves to llm_pricing.DEFAULT_PRICE — the most
+        # expensive general-purpose tier. Deliberate: the day's spend arrives here
+        # as a two-bucket token counter with no model attached (a session's model
+        # is whatever the sandbox's CLI resolved, recorded per message, and one
+        # day can mix several), so a cap that must guess guesses in the direction
+        # that stops sooner. It previously guessed Sonnet 4.6's $3/$15 and let an
+        # Opus-running instance spend ~3x its configured cap. Exact, per-model
+        # cost is the measured readout's job (`cost_breakdown` + this module),
+        # not this guardrail's.
+        #
+        # `tokens_in` already carries the day's cache-write tokens (see
+        # ChatManager._record_daily_tokens), priced here at the plain input rate
+        # rather than 1.25x: the counter keeps one in-bucket, so the small
+        # under-price is stated rather than hidden.
+        spent_usd = cost_usd(
+            model=None,
+            input_tokens=tokens_in,
+            output_tokens=tokens_out,
+        )
+        if spent_usd >= config.daily_anthropic_spend_usd:
+            if on_limit is not None:
+                await on_limit(
+                    {
+                        "type": "error",
+                        "kind": "daily_budget",
+                        "message": (
+                            f"Daily spend cap of ${config.daily_anthropic_spend_usd:.2f} reached. Try again tomorrow."
+                        ),
+                    }
+                )
+            raise RuntimeError("daily_budget_exhausted")
+    # Per-conversation token budget — the CUMULATIVE tokens billed over the
+    # whole conversation (chat_messages tokens_in + tokens_out + cache
+    # writes, summed on every send; the session row itself is never UPDATEd
+    # — DuckDB 1.5.3 FK+index bug documented in persistence.py). This is not
+    # the context window: compaction bounds what the engine re-sends per
+    # call, and nothing but this knob bounds the sum, so the refusal must
+    # say "budget", never read as a context overflow the engine should have
+    # compacted away (TCRD-291). ``0`` disables the cap.
+    if config.max_session_tokens > 0:
+        session_tokens = repo.session_total_tokens(chat_id)
+        if session_tokens >= config.max_session_tokens:
+            if on_limit is not None:
+                await on_limit(
+                    {
+                        "type": "error",
+                        "kind": "max_session_tokens",
+                        "message": session_token_budget_message(session_tokens, config.max_session_tokens),
+                    }
+                )
+            raise RuntimeError("max_session_tokens_exhausted")
     # Per-user message-rate cap keyed on the SENDER (SR-10), enforced via
     # a coordination-backend fixed-window counter (see _msg_window_key) —
     # atomic incr-then-compare: this attempt is unconditionally counted
@@ -4839,24 +5285,42 @@ async def produce_inbound_user_message(
     *,
     sender_email: Optional[str] = None,
     slack_origin: Optional[dict] = None,
+    client_msg_id: Optional[str] = None,
 ) -> None:
     """Thin-producer forward: enforce limits, persist the user message, emit
     telemetry, and publish to the ``chat-in:{chat_id}`` stream — the
     module-level implementation behind
     ``ChatManager._forward_inbound_message`` (see that method's docstring
     for the raise contract), callable from processes with no ChatManager.
+
+    ``client_msg_id`` (#1973) goes through the SAME atomic claim as the
+    direct-owner path, which is what makes the guard hold across a role-split
+    deployment: this function is the persist for a message that arrived on a
+    replica which does not host the session, so a claim made only in the
+    manager's process-local set would not have covered it.
     """
     session = repo.get_session(chat_id)
     if session is None:
         raise SessionNotFound(chat_id)
     sender = sender_email or session.user_email
     await enforce_sender_limits(repo, config, sender, chat_id)
-    repo.append_message(
-        session_id=chat_id,
-        role="user",
-        content=text,
-        sender_email=sender,
-    )
+    if not await claim_user_message(chat_id, client_msg_id):
+        logger.info(
+            "dropping duplicate inbound user_msg for %s (client_msg_id=%s claimed elsewhere)",
+            chat_id,
+            client_msg_id,
+        )
+        return
+    try:
+        repo.append_message(
+            session_id=chat_id,
+            role="user",
+            content=text,
+            sender_email=sender,
+        )
+    except Exception:
+        await release_user_message_claim(chat_id, client_msg_id)
+        raise
     # F2d (audit-full-coverage plan, Task 6): the thin-producer twin of
     # ChatManager.send_user_message's ingress write below — an api-role
     # replica with no local ChatManager (or a cross-gateway forward) reaches

@@ -11,11 +11,16 @@
 # stdout clean without hiding warnings from any other package.
 import warnings as _warnings
 from src.repositories import (
+    PoliciedRowDistributionError,
     RequiresPostgresBackend,
     memory_domains_repo,
     user_group_members_repo,
     user_groups_repo,
     users_repo,
+)
+from src.service_accounts import (
+    ServiceAccountAdminGroupForbidden,
+    ServiceAccountInteractiveLoginError,
 )
 
 try:
@@ -53,7 +58,6 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
-from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.gzip import GZipMiddleware
 from starlette.middleware.sessions import SessionMiddleware
@@ -494,6 +498,7 @@ from app.api.query_hybrid import router as query_hybrid_router
 from app.api.cli_artifacts import router as cli_artifacts_router
 from app.api.cli_auth import router as cli_auth_router
 from app.api.tokens import router as tokens_router, admin_router as tokens_admin_router
+from app.api.admin_service_accounts import router as admin_service_accounts_router
 from app.api.agents_admin import router as agents_admin_router
 from app.api.agent_runtime import router as agent_runtime_router  # noqa: E402
 from app.api.agent_sessions import router as agent_sessions_router  # noqa: E402
@@ -514,6 +519,7 @@ from app.api.admin_datasource_secrets import router as admin_datasource_secrets_
 from app.api.admin_sharepoint import router as admin_sharepoint_router
 from app.api.sharepoint_webhooks import router as sharepoint_webhooks_router
 from app.api.admin_extraction import router as admin_extraction_router
+from app.api.admin_facts import router as admin_facts_router
 from app.api.admin_slack_secrets import router as admin_slack_secrets_router
 from app.api.admin_sso import router as admin_sso_router
 from app.api.admin_source_connections import router as source_connections_admin_router
@@ -550,6 +556,7 @@ from app.api.agent_builder import router as agent_builder_router  # builder assi
 from app.api.entity_builder import router as entity_builder_router  # /skills builder turns
 from app.api.package_builder import router as package_builder_router  # data-package builder turns
 from app.api.mcp_builder import router as mcp_builder_router  # MCP-source builder turns
+from app.api.semantic_model_builder import router as semantic_model_builder_router  # semantic-model builder turns
 from app.api.facts import router as facts_router  # fact graph over Collections read surface
 from app.api.ontology import router as ontology_router  # ontology builder (fact-graph §13.2)
 from app.api.sharing import router as sharing_router  # owner-initiated Library sharing
@@ -959,6 +966,13 @@ async def lifespan(app):
 
     validate_deployment()
 
+    # Opt-in OTLP trace export (docs/observability.md → "OpenTelemetry
+    # export"). Idempotent: setup_logging already tried at import; this
+    # repeat catches an endpoint that only reached the environment later.
+    from src.observability.otel import configure_otel
+
+    configure_otel(role=os.environ.get("AGNES_ROLE") or "app")
+
     # Surface an unsafe/no-op data-apps posture at startup: enabled, but
     # same-origin serving off and no isolated origin configured, so no hosted
     # app can actually be served (see data_apps_proxy._same_origin_serving_refused).
@@ -1235,7 +1249,7 @@ async def lifespan(app):
     # BG-task / scheduler paths that bypass the per-mutation hook.
     # Soft-failure — logs WARNING and the repo falls back to ILIKE.
     #
-    # DuckDB-only: the BM25 index is a DuckDB FTS-extension artefact built on
+    # DuckDB-only: the BM25 index is a DuckDB FTS-extension artifact built on
     # the system DuckDB. On Postgres there is no system DuckDB (and opening one
     # is forbidden), so skip entirely — memory search there uses the PG path.
     from src.repositories import use_pg as _use_pg
@@ -1390,6 +1404,40 @@ async def lifespan(app):
                 )
         except Exception as e:
             logger.warning("Could not seed canonical memory domains: %s", e)
+
+        # Seed the dedicated engagement-scoped memory domain (issue #1971
+        # Part 5) — same idempotent mechanism as the six canonical domains
+        # above, tracked as its own seed since it's an RBAC/distribution
+        # bucket, not a content-taxonomy value. Nobody is granted access to
+        # it by default: that absence of a grant IS the RBAC scoping the
+        # design relies on (agnes-side callers gate memory-domain bundle/
+        # manifest access on resource_grants; see app/api/sync.py's
+        # _build_memory_domains_section and app/api/memory.py's
+        # _build_per_domain_markdown).
+        try:
+            from src.db import ENGAGEMENT_SCOPED_DOMAIN_SEED
+
+            _esd_id, _esd_slug, _esd_name, _esd_icon, _esd_color = ENGAGEMENT_SCOPED_DOMAIN_SEED
+            memory_domains_repo().ensure_seed(
+                domain_id=_esd_id,
+                slug=_esd_slug,
+                name=_esd_name,
+                icon=_esd_icon,
+                color=_esd_color,
+            )
+        except Exception as e:
+            logger.warning("Could not seed engagement-scoped memory domain: %s", e)
+
+        # Seed the memory-curator agent profile (issue #1971) — config +
+        # identity for the corporate-memory detectors' editable detection
+        # policy. Insert-if-absent (see ensure_memory_curator_agent_profile),
+        # so an admin's edited policy text is never reset on reboot.
+        try:
+            from app.services.memory_curator_profile import ensure_memory_curator_agent_profile
+
+            ensure_memory_curator_agent_profile()
+        except Exception as e:
+            logger.warning("Could not seed memory-curator agent profile: %s", e)
 
         # Seed (or re-bake) the built-in marketplace from the wheel bundle. Runs
         # after system-groups are ensured so the RBAC seed can look up Admin/Everyone.
@@ -1608,23 +1656,6 @@ async def lifespan(app):
                     conn.close()
         except Exception:
             pass  # never block startup on a logging convenience
-
-    # Construct the PostHog client up front so its background flush thread
-    # starts before the first request — and so a missing/invalid key fails
-    # loud at boot rather than on first capture. No-op when disabled.
-    try:
-        from src.observability import get_posthog
-
-        pc = get_posthog()
-        if pc.enabled:
-            logger.info(
-                "PostHog observability enabled (host=%s, identify=%s, replay=%s)",
-                pc.host,
-                pc.identify_mode,
-                pc.replay_enabled,
-            )
-    except Exception:
-        logger.exception("PostHog init at startup failed")
 
     # --- CHAT-INIT -----------------------------------------------------------
     # Always create chat_repo + chat_config regardless of chat.enabled so that
@@ -1934,21 +1965,10 @@ async def lifespan(app):
                     # into the runner frame protocol. Gated above on
                     # KAI_HOST_JWT_SECRET (_chat_kai_agent_ok).
                     provider = KaiEngineProvider(base_url=app.state.chat_config.kai_agent_url)
-                    # Two cost caps read chat_messages.tokens_in/out, which only
-                    # a usage-carrying frame writes; the engine's stream carries
-                    # none. Both ship LIVE defaults ($20/day, 200k/session), so
-                    # this provider silently removes two budgets instance-wide.
-                    # Say so at boot rather than let it surface as a bill —
-                    # `/api/chat/readiness` reports the same list as
-                    # `unmetered_caps` so /admin can show it too.
-                    for _cap in ("daily_anthropic_spend_usd", "max_session_tokens"):
-                        if getattr(app.state.chat_config, _cap, None):
-                            logger.warning(
-                                "chat provider 'kai-agent': %s is configured but NOT enforced — the engine "
-                                "stream carries no token usage, so nothing accrues against it. Cap engine "
-                                "spend per agent with token_budget_monthly instead.",
-                                _cap,
-                            )
+                    # `daily_anthropic_spend_usd` and `max_session_tokens` are
+                    # metered on this provider too, from the usage the broker
+                    # observes while forwarding the engine's LLM calls
+                    # (app/chat/turn_usage.py) — no "not enforced" warning here.
                 mgr = ChatManager(
                     provider=provider,
                     workdir_mgr=workdir_mgr,
@@ -2133,12 +2153,6 @@ async def lifespan(app):
                 _env_overlay_unsubscribe()
             except Exception:
                 logger.exception("env-overlay-changed unsubscribe failed (non-fatal)")
-        try:
-            from src.observability import get_posthog
-
-            get_posthog().shutdown()
-        except Exception:
-            logger.exception("PostHog shutdown failed")
         # Flush any buffered llm_usage rows (broker Task 8 — batched ledger
         # writes) BEFORE the system DB closes, so a graceful shutdown doesn't
         # drop the tail of usage the accumulator hadn't hit a size/age
@@ -2159,6 +2173,15 @@ async def lifespan(app):
             await close_mcp_sessions()
         except Exception:
             logger.exception("MCP session pool close failed during shutdown (non-fatal)")
+        # Flush buffered OTLP spans while the loop is still up (no-op when
+        # export is off) — a BatchSpanProcessor's own atexit hook would run
+        # too late for a graceful compose stop.
+        try:
+            from src.observability.otel import shutdown_otel
+
+            shutdown_otel()
+        except Exception:
+            logger.exception("otel shutdown failed (non-fatal)")
         from src.db import close_analytics_db, close_operational_db, close_system_db
 
         close_system_db()
@@ -2451,18 +2474,6 @@ def create_app() -> FastAPI:
                 "DEBUG=1 but fastapi-debug-toolbar not installed; toolbar disabled",
             )
 
-    # PostHog HTML snippet injection — must run INSIDE the GZip layer so it
-    # sees uncompressed HTML before compression. Starlette runs middleware
-    # in reverse-registration order on the response, so registering this
-    # before _SelectiveGZipMiddleware places it deeper in the stack and
-    # therefore earlier in the response chain. Many of this app's templates
-    # are standalone (their own <!DOCTYPE>) and never extend base.html, so
-    # a per-template include would miss them; the middleware covers
-    # everything in one place. No-op when POSTHOG_API_KEY is unset.
-    from app.middleware.posthog_inject import PosthogInjectionMiddleware
-
-    app.add_middleware(PosthogInjectionMiddleware)
-
     # Compress JSON / HTML responses on the wire. Parquet downloads are
     # excluded — they're already columnar-compressed and re-gzipping them
     # just burns CPU with no size win. minimum_size=1024 keeps tiny
@@ -2493,6 +2504,9 @@ def create_app() -> FastAPI:
             "/cli/wheel/",
             "/cli/download",
             "/marketplace.git",  # git smart-HTTP is self-chunked; double-gzip bloats
+            # Cover images (WebP/PNG/JPEG) are already compressed; same
+            # rationale as the parquet/attachments exclusions above.
+            "/uploads/",
         ),
     )
 
@@ -2632,6 +2646,21 @@ def create_app() -> FastAPI:
     from app.data_apps_subdomain import DataAppSubdomainMiddleware
 
     app.add_middleware(DataAppSubdomainMiddleware)
+
+    # Read-only "view this page as another user" (app/auth/view_as.py): stamp
+    # the request-scoped ticket, and refuse every non-GET/HEAD request (and
+    # every WebSocket handshake) while one is active. Pure ASGI, so it covers
+    # the "websocket" scope too — an http-only middleware would leave the one
+    # bidirectional channel in the app outside a read-only mode.
+    #
+    # Position is not load-bearing beyond "outside routing": the guard refuses
+    # by METHOD before the handler runs, and the two authorization guards it
+    # feeds (app.auth.access.is_user_admin, app.auth.elevation.elevation_paused)
+    # read a contextvar, not middleware order. Registered here so the refusal
+    # still gets security headers and a request id.
+    from app.middleware.view_as_readonly import ViewAsReadOnlyMiddleware
+
+    app.add_middleware(ViewAsReadOnlyMiddleware)
 
     # Baseline security response headers (non-breaking CSP subset,
     # X-Frame-Options, nosniff, Referrer-Policy, HSTS on https) — set at the app
@@ -2872,10 +2901,17 @@ def create_app() -> FastAPI:
     except Exception:
         logger.exception("guardrails readiness probe failed at boot")
 
-    # Static files
+    # Static files. VersionedStaticFiles (app/web/cover_files.py) stamps a
+    # 1-year immutable Cache-Control only when the request carries the ?v=
+    # cache-buster. Most references get it from _static_url; the handful
+    # that can't run Jinja (external <script src>, a JS-side fetch/import)
+    # get it from a window._ag* URL stamped once in _app_scripts.html
+    # instead (see app/web/templates/_app_scripts.html).
+    from app.web.cover_files import VersionedStaticFiles
+
     static_dir = Path(__file__).parent / "web" / "static"
     if static_dir.exists():
-        app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+        app.mount("/static", VersionedStaticFiles(directory=str(static_dir)), name="static")
 
     # v50 admin-uploaded cover images. Lives under ${DATA_DIR}/uploads so
     # it survives across deploys (the app/web/static dir gets bundled into
@@ -2952,6 +2988,7 @@ def create_app() -> FastAPI:
     app.include_router(cli_auth_router)
     app.include_router(tokens_router)
     app.include_router(tokens_admin_router)
+    app.include_router(admin_service_accounts_router)
     app.include_router(agents_admin_router)
     app.include_router(agent_runtime_router)
     app.include_router(agent_sessions_router)
@@ -2974,6 +3011,7 @@ def create_app() -> FastAPI:
     app.include_router(admin_sharepoint_router)
     app.include_router(sharepoint_webhooks_router)
     app.include_router(admin_extraction_router)
+    app.include_router(admin_facts_router)
     app.include_router(source_discovery_admin_router)
     app.include_router(mcp_passthrough_router)
     app.include_router(mcp_user_secrets_router)
@@ -2995,6 +3033,7 @@ def create_app() -> FastAPI:
     app.include_router(entity_builder_router)
     app.include_router(package_builder_router)
     app.include_router(mcp_builder_router)
+    app.include_router(semantic_model_builder_router)
     app.include_router(facts_router)
     app.include_router(ontology_router)
     app.include_router(sharing_router)
@@ -3189,6 +3228,14 @@ def create_app() -> FastAPI:
 
     # Paths served as API responses (JSON / ZIP / git smart-HTTP) — never
     # redirect a 401 here to the HTML login page; clients expect the raw 401.
+    #
+    # Under ``/marketplace/`` only the two machine-facing routes are listed
+    # (``/marketplace/info`` diagnostics, ``/marketplace/cowork/*.zip``
+    # bundles); the detail / guide pages beneath the same prefix are HTML and
+    # must send a signed-out browser to /login like every other page. A bare
+    # ``"/marketplace/"`` entry once covered the whole subtree and turned
+    # every shared plugin deep link into a raw JSON 401 for anyone not
+    # signed in.
     _API_PATH_PREFIXES: tuple[str, ...] = (
         "/api/",
         "/auth/",
@@ -3197,25 +3244,82 @@ def create_app() -> FastAPI:
         "/webhooks/",
         "/marketplace.zip",
         "/marketplace.git",
-        "/marketplace/",
+        "/marketplace/info",
+        "/marketplace/cowork/",
         "/admin/chat",
     )
 
-    _ERROR_TITLES = {
-        400: "Bad request",
-        401: "Sign-in required",
-        403: "Forbidden",
-        404: "Page not found",
-        405: "Method not allowed",
-        408: "Request timeout",
-        413: "Payload too large",
-        422: "Unprocessable entity",
-        429: "Too many requests",
-        500: "Server error",
-        502: "Bad gateway",
-        503: "Service unavailable",
-        504: "Gateway timeout",
+    # Reader-facing copy for every status the error page can render, keyed by
+    # code: (headline, explanation, tone).
+    #
+    # The headline is a sentence about the situation, not the RFC's name for
+    # the status — "Forbidden" and "Too many requests" are protocol vocabulary,
+    # and a reader who hits one needs to know what to do, not what the spec
+    # calls it. The explanation is written HERE rather than taken from the
+    # raise site's ``detail``: half the raise sites pass a machine token
+    # (``access_denied``, ``csrf_check_failed``) and the page printed it
+    # verbatim, so the reader got the same fact twice in two vocabularies,
+    # neither of them theirs.
+    #
+    # `tone` drives the mark and the one colour decision. Only ``broken``
+    # (5xx — we failed) is coloured; ``wait``, ``locked`` and ``gone`` render
+    # in muted ink, because "come back in a minute", "ask your admin" and
+    # "that link is stale" are ordinary situations, and painting them like
+    # emergencies is what made a rate limit read as a crash.
+    _ERROR_COPY: dict[int, tuple[str, str, str]] = {
+        400: (
+            "That link isn’t valid",
+            "Part of the address is malformed. Check it, or start again from the Library.",
+            "gone",
+        ),
+        # Never rendered in practice — a 401 GET redirects to /login below —
+        # but a HEAD/POST can still land here, so it gets real copy too.
+        401: ("You need to sign in", "Sign in to continue where you left off.", "locked"),
+        403: (
+            "You don’t have access to this",
+            "It’s limited to a group you’re not in. Your workspace admins can add you — it takes one grant.",
+            "locked",
+        ),
+        404: (
+            "This page doesn’t exist",
+            "The link may be old, or whatever it pointed to was renamed or deleted.",
+            "gone",
+        ),
+        405: (
+            "That isn’t how this page opens",
+            "The address is right but the action isn’t. Start from the Library instead.",
+            "gone",
+        ),
+        408: ("That took too long", "The request timed out before it finished. Try again.", "wait"),
+        413: (
+            "That’s too large to accept",
+            "The upload is bigger than this instance allows. Try a smaller file.",
+            "gone",
+        ),
+        422: (
+            "Agnes couldn’t read that request",
+            "Something in it wasn’t in the expected shape. Check the address, or start again from the Library.",
+            "gone",
+        ),
+        429: (
+            "Too many requests in a row",
+            "You’ve hit a rate limit. It clears on its own in about a minute — nothing is broken.",
+            "wait",
+        ),
+        500: (
+            "Something broke on our side",
+            "This one isn’t you. It’s already been logged — quote the reference below if you report it.",
+            "broken",
+        ),
+        502: ("Agnes is briefly unavailable", "A service is restarting. Try again in a minute.", "wait"),
+        503: ("Agnes is briefly unavailable", "A service is restarting. Try again in a minute.", "wait"),
+        504: ("That took too long", "The request timed out upstream. Try again in a moment.", "wait"),
     }
+    _ERROR_COPY_FALLBACK = (
+        "Something went wrong",
+        "Try again, or quote the reference below if it keeps happening.",
+        "broken",
+    )
 
     def _wants_html(request) -> bool:
         """True when the client looks like a browser (non-API path, explicit html).
@@ -3279,9 +3383,9 @@ def create_app() -> FastAPI:
         ``url_for`` helpers — without these, base.html + _app_rail.html
         silently render empty header/stylesheets."""
         from app.logging_config import request_id_var
-        from app.web.router import templates as _web_templates, _build_context
+        from app.web.router import templates as _web_templates, _build_context, _is_debug
 
-        title = _ERROR_TITLES.get(code, "Error")
+        title, explain, tone = _ERROR_COPY.get(code, _ERROR_COPY_FALLBACK)
         user = await _resolve_error_user(request)
         # A non-admin opening an admin entity URL (a teammate copied their
         # own address bar) used to dead-end on a generic 403 — but the
@@ -3312,6 +3416,19 @@ def create_app() -> FastAPI:
             user=user,
             code=code,
             title=title,
+            # `explain` is what the page PRINTS; `message` is the raise site's
+            # own detail, kept in the context because several branches in the
+            # template switch on the token it carries (`not_shared:…`,
+            # `admin_elevation_paused`, `view_as_self`) — but it is never
+            # rendered, which is what stopped `access_denied` reaching readers.
+            explain=explain,
+            tone=tone,
+            # Same source as the /_debug/* route guard, so the developer
+            # disclosure on this page appears exactly when those routes are
+            # mounted. `config.DEBUG` does not exist on ConfigProxy — reading
+            # it would silently render Undefined (falsy) and hide the path
+            # from developers too.
+            debug=_is_debug(),
             message=message,
             path=request.url.path,
             bridge=bridge,
@@ -3373,6 +3490,51 @@ def create_app() -> FastAPI:
             },
         )
 
+    @app.exception_handler(PoliciedRowDistributionError)
+    async def _policied_row_distribution_handler(request, exc: PoliciedRowDistributionError):
+        """A repository-level upsert would have left a table that carries an
+        access policy distributable (``docs/table-access-policies.md`` ->
+        "Scope: only tables that never leave the server"). Every HTTP path
+        that can reach ``table_registry.register()`` — the admin register /
+        edit endpoints, a connector's auto-discovery, an ingest re-register —
+        gets the SAME typed 422 the admin endpoints raise for the equivalent
+        API-level violation, never an unhandled 500."""
+        return JSONResponse(
+            status_code=422,
+            content={
+                "detail": str(exc),
+                "error": "access_policy_requires_undistributed",
+                "table_id": exc.table_id,
+            },
+        )
+
+    @app.exception_handler(ServiceAccountAdminGroupForbidden)
+    async def _service_account_admin_group_forbidden_handler(request, exc: ServiceAccountAdminGroupForbidden):
+        """Guard 2 (issue #1534): a kind='service' user may never join the
+        system Admin group — same translate-a-typed-exception-to-a-clean-
+        response pattern as RequiresPostgresBackend -> 501 above."""
+        return JSONResponse(
+            status_code=409,
+            content={
+                "detail": str(exc),
+                "error": "service_account_admin_forbidden",
+            },
+        )
+
+    @app.exception_handler(ServiceAccountInteractiveLoginError)
+    async def _service_account_interactive_login_handler(request, exc: ServiceAccountInteractiveLoginError):
+        """Guard 1 (issue #1534): a kind='service' user may never hold an
+        interactive (typ="session") credential — refused once, at the
+        single JWT-mint choke point every login provider shares
+        (app.auth.jwt.create_access_token)."""
+        return JSONResponse(
+            status_code=403,
+            content={
+                "detail": str(exc),
+                "error": "service_account_no_interactive_session",
+            },
+        )
+
     def _main_host_base_url(request) -> str:
         """Absolute ``scheme://host`` of the MAIN Agnes origin, for redirecting
         a caller off a data-app subdomain.
@@ -3402,8 +3564,9 @@ def create_app() -> FastAPI:
           ``_catch_all_404`` route at the end of ``app.web.router`` provides a
           matched route for unrouted paths).
         - API prefixes (``/api/``, ``/auth/``, ``/marketplace.zip``,
-          ``/marketplace.git``, ``/marketplace/``) and non-HTML clients → JSON
-          ``{"detail": "..."}`` per the existing contract.
+          ``/marketplace.git``, ``/marketplace/info``, ``/marketplace/cowork/``)
+          and non-HTML clients → JSON ``{"detail": "..."}`` per the existing
+          contract.
         """
         path_is_api = request.url.path.startswith(_API_PATH_PREFIXES)
 
@@ -3450,26 +3613,6 @@ def create_app() -> FastAPI:
         import traceback as _tb
 
         logger.exception("Unhandled exception on %s %s", request.method, request.url.path)
-
-        # Best-effort: forward the exception to PostHog before rendering the
-        # error page. Disabled state is a cheap no-op. Wrapped because a
-        # tracing failure must never replace the user-visible 500 with a
-        # second exception.
-        try:
-            from src.observability import get_posthog
-            from app.logging_config import request_id_var as _rid_var
-
-            get_posthog().capture_exception(
-                exc,
-                request=request,
-                properties={
-                    "request_id": _rid_var.get(),
-                    "path": request.url.path,
-                    "method": request.method,
-                },
-            )
-        except Exception:
-            logger.exception("PostHog capture_exception failed in 500 handler")
 
         path_is_api = request.url.path.startswith(_API_PATH_PREFIXES)
         debug_on = _os.environ.get("DEBUG", "").lower() in ("1", "true", "yes")

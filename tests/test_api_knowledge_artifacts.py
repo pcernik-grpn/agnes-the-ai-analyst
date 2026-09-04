@@ -42,7 +42,10 @@ def _seed_artifact(corpus_id: str, name: str = "Handbook") -> dict:
         },
     ]
     with (
-        patch("src.knowledge_packaging._list_chunks", lambda cid: list(chunks)),
+        patch(
+            "src.knowledge_packaging._list_chunk_batch",
+            lambda cid, *, after_id, limit: list(chunks) if after_id is None else [],
+        ),
         patch("src.knowledge_packaging._list_files", lambda cid: [{"id": "f1", "filename": "billing.md"}]),
         patch("src.knowledge_packaging._list_corpora", lambda: [{"id": corpus_id, "name": name}]),
     ):

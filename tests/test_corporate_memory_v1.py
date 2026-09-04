@@ -2115,3 +2115,282 @@ class TestExponentialDecayWithLinearFallback:
         finally:
             cm._DECAY_CONFIG.clear()
             cm._DECAY_CONFIG.update(orig)
+
+
+def _write_corporate_memory_config(tmp_path, cm_config: dict) -> None:
+    """Write a `corporate_memory` overlay to DATA_DIR/state/instance.yaml and
+    drop the in-process instance.yaml cache so the next
+    ``get_corporate_memory_config()`` call sees it. Mirrors
+    ``tests/test_admin_server_config_corp_memory.py``'s own setup."""
+    import yaml as _yaml
+
+    state = tmp_path / "state"
+    state.mkdir(parents=True, exist_ok=True)
+    (state / "instance.yaml").write_text(_yaml.dump({"corporate_memory": cm_config}))
+
+    import app.instance_config as ic
+
+    ic._instance_config = None
+
+
+class TestSessionTranscriptsKillSwitches:
+    """#1957 interim hotfix: corporate_memory.sources.session_transcripts.
+    {enabled,detection_types} were documented in the schema and
+    config/instance.yaml.example but VerificationProcessor.process_session
+    never read either. Both are now live-read per run (no restart)."""
+
+    def test_disabled_skips_extraction_entirely(self, tmp_path, monkeypatch):
+        conn = _fresh_db(tmp_path, monkeypatch)
+        _write_corporate_memory_config(tmp_path, {"sources": {"session_transcripts": {"enabled": False}}})
+        from src.repositories.knowledge import KnowledgeRepository
+
+        golden = {
+            "verifications": [
+                {
+                    "detection_type": "correction",
+                    "title": "Should never be extracted",
+                    "content": "x",
+                    "user_quote": "no, it's actually x",
+                    "domain": "engineering",
+                    "entities": [],
+                }
+            ]
+        }
+        extractor = _mock_extractor(golden)
+
+        session_dir = tmp_path / "user_sessions" / "someone"
+        session_dir.mkdir(parents=True)
+        (session_dir / "s.jsonl").write_text(json.dumps({"role": "user", "content": "hi"}) + "\n")
+
+        _run_verification_processor(conn, extractor, session_data_dir=tmp_path / "user_sessions")
+
+        # The LLM call itself (the "extraction") must never fire.
+        extractor.extract_json.assert_not_called()
+        repo = KnowledgeRepository(conn)
+        assert repo.list_items(source_type="user_verification") == []
+        conn.close()
+
+    def test_detection_types_filters_before_insert(self, tmp_path, monkeypatch):
+        conn = _fresh_db(tmp_path, monkeypatch)
+        _write_corporate_memory_config(
+            tmp_path, {"sources": {"session_transcripts": {"detection_types": ["correction"]}}}
+        )
+        from src.repositories.knowledge import KnowledgeRepository
+
+        golden = {
+            "verifications": [
+                {
+                    "detection_type": "correction",
+                    "title": "Kept",
+                    "content": "kept content",
+                    "user_quote": "no, it's actually x",
+                    "domain": "engineering",
+                    "entities": [],
+                },
+                {
+                    "detection_type": "confirmation",
+                    "title": "Dropped",
+                    "content": "dropped content",
+                    "user_quote": "yes exactly",
+                    "domain": "engineering",
+                    "entities": [],
+                },
+            ]
+        }
+        extractor = _mock_extractor(golden)
+
+        session_dir = tmp_path / "user_sessions" / "someone"
+        session_dir.mkdir(parents=True)
+        (session_dir / "s.jsonl").write_text(json.dumps({"role": "user", "content": "hi"}) + "\n")
+
+        _run_verification_processor(conn, extractor, session_data_dir=tmp_path / "user_sessions")
+
+        repo = KnowledgeRepository(conn)
+        items = repo.list_items(source_type="user_verification")
+        assert [i["title"] for i in items] == ["Kept"]
+        conn.close()
+
+    def test_default_config_extracts_every_detection_type(self, tmp_path, monkeypatch):
+        """No corporate_memory config at all (legacy mode) must keep every
+        detection_type the LLM can return — unchanged from before this knob
+        was wired."""
+        conn = _fresh_db(tmp_path, monkeypatch)
+        from src.repositories.knowledge import KnowledgeRepository
+
+        golden = {
+            "verifications": [
+                {
+                    "detection_type": dt,
+                    "title": f"item-{dt}",
+                    "content": f"content-{dt}",
+                    "user_quote": "q",
+                    "domain": "engineering",
+                    "entities": [],
+                }
+                for dt in ("correction", "confirmation", "unprompted_definition")
+            ]
+        }
+        extractor = _mock_extractor(golden)
+
+        session_dir = tmp_path / "user_sessions" / "someone"
+        session_dir.mkdir(parents=True)
+        (session_dir / "s.jsonl").write_text(json.dumps({"role": "user", "content": "hi"}) + "\n")
+
+        _run_verification_processor(conn, extractor, session_data_dir=tmp_path / "user_sessions")
+
+        repo = KnowledgeRepository(conn)
+        items = repo.list_items(source_type="user_verification")
+        assert len(items) == 3
+        conn.close()
+
+
+class TestMaxTurnsPerSessionKnob:
+    """issue #1971 Part 6: corporate_memory.sources.session_transcripts.
+    max_turns_per_session was documented but never read — the truncation
+    window stayed pinned to the hardcoded MAX_TURNS_PER_SESSION constant
+    regardless of what an operator set here."""
+
+    def test_config_value_is_passed_through_to_extract_verifications(self, tmp_path, monkeypatch):
+        conn = _fresh_db(tmp_path, monkeypatch)
+        monkeypatch.setattr(
+            "app.instance_config.get_corporate_memory_config",
+            lambda: {"sources": {"session_transcripts": {"max_turns_per_session": 3}}},
+        )
+
+        captured = {}
+        import services.session_processors.verification as verification_module
+
+        def _fake_extract_verifications(extractor, username, session_id, turns, max_turns=100):
+            captured["max_turns"] = max_turns
+            return []
+
+        monkeypatch.setattr(verification_module, "extract_verifications", _fake_extract_verifications)
+
+        session_dir = tmp_path / "user_sessions" / "eve"
+        session_dir.mkdir(parents=True)
+        (session_dir / "s.jsonl").write_text(json.dumps({"role": "user", "content": "hi"}) + "\n")
+
+        _run_verification_processor(
+            conn, _mock_extractor({"verifications": []}), session_data_dir=tmp_path / "user_sessions"
+        )
+
+        assert captured["max_turns"] == 3
+        conn.close()
+
+    def test_unset_keeps_the_built_in_default(self, tmp_path, monkeypatch):
+        conn = _fresh_db(tmp_path, monkeypatch)
+        monkeypatch.setattr("app.instance_config.get_corporate_memory_config", lambda: {})
+
+        captured = {}
+        import services.session_processors.verification as verification_module
+        from services.verification_detector.detector import MAX_TURNS_PER_SESSION
+
+        def _fake_extract_verifications(extractor, username, session_id, turns, max_turns=100):
+            captured["max_turns"] = max_turns
+            return []
+
+        monkeypatch.setattr(verification_module, "extract_verifications", _fake_extract_verifications)
+
+        session_dir = tmp_path / "user_sessions" / "eve"
+        session_dir.mkdir(parents=True)
+        (session_dir / "s.jsonl").write_text(json.dumps({"role": "user", "content": "hi"}) + "\n")
+
+        _run_verification_processor(
+            conn, _mock_extractor({"verifications": []}), session_data_dir=tmp_path / "user_sessions"
+        )
+
+        assert captured["max_turns"] == MAX_TURNS_PER_SESSION
+        conn.close()
+
+
+class TestBuildVerificationProcessorModelOverride:
+    """issue #1971 Part 6: corporate_memory.extraction.model applies to
+    BOTH extraction paths — mirrors TestExtractionModelOverrideKnob in
+    tests/test_corporate_memory_collector.py for the collector side."""
+
+    def test_corporate_memory_extraction_model_overrides_the_global_ai_model(self, monkeypatch):
+        from services.session_processors import verification as verification_module
+
+        monkeypatch.setattr(
+            "app.instance_config.load_instance_config",
+            lambda: {
+                "ai": {"model": "global-model", "provider": "anthropic"},
+                "corporate_memory": {"extraction": {"model": "cm-override-model"}},
+            },
+        )
+        captured = []
+        monkeypatch.setattr(
+            "connectors.llm.create_extractor_from_env_or_config",
+            lambda ai_config=None, **kw: captured.append(ai_config) or object(),
+        )
+
+        verification_module.build_verification_processor()
+
+        assert captured[0]["model"] == "cm-override-model"
+        assert captured[0]["provider"] == "anthropic"
+
+    def test_no_override_leaves_the_global_ai_config_untouched(self, monkeypatch):
+        from services.session_processors import verification as verification_module
+
+        monkeypatch.setattr(
+            "app.instance_config.load_instance_config",
+            lambda: {"ai": {"model": "global-model"}},
+        )
+        captured = []
+        monkeypatch.setattr(
+            "connectors.llm.create_extractor_from_env_or_config",
+            lambda ai_config=None, **kw: captured.append(ai_config) or object(),
+        )
+
+        verification_module.build_verification_processor()
+
+        assert captured[0]["model"] == "global-model"
+
+
+class TestVerificationPromptExcludesEngagementScopedFacts:
+    """#1957: the LLM prompt over-collected one-off facts scoped to a single
+    client engagement (a one-off date, price, or correction that belongs on
+    that engagement's own record) because nothing told it to exclude them,
+    and its confirmation guidance ("domain-specific (not generic)") could be
+    misread as "specific to one engagement" rather than "not trivially
+    generic". Both are static prompt-text fixes; pin them so they can't
+    silently regress.
+
+    #1971 Part 2 relocated this text from the old monolithic
+    ``VERIFICATION_EXTRACT_PROMPT`` constant into
+    ``DEFAULT_DETECTION_POLICY`` — the seed value for the editable
+    ``memory-curator`` agent profile and the fallback
+    ``render_verification_prompt`` uses when that profile is missing/empty.
+    Same assertions, new home; #1957's fix is the "engagement" bullet these
+    tests pin, now phrased as "route, don't drop" (issue #1971 Part 5) rather
+    than a silent exclusion — see the updated assertion below.
+    """
+
+    def test_prompt_excludes_engagement_scoped_facts(self):
+        from services.verification_detector.prompts import DEFAULT_DETECTION_POLICY
+
+        # Whitespace-normalized so line-wrapping inside the policy text can't
+        # split a phrase across a fixed-column substring check.
+        normalized = " ".join(DEFAULT_DETECTION_POLICY.lower().split())
+        assert "engagement" in normalized
+        assert "outside this one engagement" in normalized
+
+    def test_prompt_no_longer_conflates_domain_specific_with_generic(self):
+        from services.verification_detector.prompts import DEFAULT_DETECTION_POLICY
+
+        normalized = " ".join(DEFAULT_DETECTION_POLICY.lower().split())
+        assert "trivially generic" in normalized
+        # Old wording could be misread as "specific to one client/engagement"
+        # rather than the intended "not trivially generic".
+        assert "domain-specific (not generic)" not in normalized
+
+    def test_prompt_routes_engagement_scoped_facts_instead_of_dropping_them(self):
+        """#1971 Part 5: an engagement-scoped fact is no longer silently
+        excluded — the model must still return it (scope="engagement") so
+        deterministic code can route it, never drop it."""
+        from services.verification_detector.prompts import DEFAULT_DETECTION_POLICY
+
+        normalized = " ".join(DEFAULT_DETECTION_POLICY.lower().split())
+        assert 'scope="engagement"' in normalized
+        assert "still return it" in normalized
+        assert "still return it" in normalized

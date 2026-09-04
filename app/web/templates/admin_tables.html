@@ -502,7 +502,12 @@
            padding, which is a second table in a product that had agreed on
            one. What is left here is only what belongs to THIS table: its
            column behaviour and its cells. */
-        #adminTablesFlat { table-layout: fixed; }
+        /* With a FLOOR — nine columns divided by fixed layout crush rather
+           than scroll, and a crushed table has no scrollbar to tell anyone
+           (the same measurement that put one under /admin/users' eight).
+           Below this the wrap scrolls and the pinned Actions column stays
+           reachable. */
+        #adminTablesFlat { table-layout: fixed; min-width: 1120px; }
         /* Explicit, not left to the UA rule: `[hidden]` is a low-specificity
            author-overridable default, and the shared `.data-table` block is one
            `display` declaration away from silently winning it. The toolbar hides
@@ -643,6 +648,32 @@
             border-style: dashed;
         }
 
+        /* Eligible, no policy yet. Muted, but LABELLED: the state used to
+           render as a bare "—" that was clickable and looked inert, so the
+           one row where an admin can still act read as the one row with
+           nothing to do. Same weight as the ineligible chip, one shade
+           closer to the foreground because this one leads somewhere. */
+        .access-chip--none {
+            color: var(--ds-text-secondary);
+            border-style: dashed;
+        }
+
+        /* Secondary hint under the "+ Add policy" chip — a link, not a second
+           banner: a policy on a table no package carries guards data nobody
+           can reach. */
+        .access-chip-hint {
+            display: block;
+            margin-top: 2px;
+            font-size: 10px;
+            font-weight: 500;
+            color: var(--ds-text-link);
+            text-decoration: none;
+        }
+
+        .access-chip-hint:hover {
+            text-decoration: underline;
+        }
+
         .access-chip--active {
             color: var(--ds-accent-success-ink);
             background: var(--ds-accent-success-bg);
@@ -713,6 +744,34 @@
             margin-right: 4px;
         }
 
+        /* K1-sweep finding 3 (#1979): a remote table on a transpiling
+           engine (BigQuery, Databricks) does not run the DuckDB text in
+           #apSql on a live read -- it runs this TRANSPILED form. Collapsed
+           by default (secondary to the row/column preview above), plain
+           read-only text -- same idiom as admin_data_sources.html's
+           `.ds-errdetail`. */
+        .ap-preview-transpiled {
+            margin-top: 10px;
+        }
+
+        .ap-preview-transpiled summary {
+            cursor: pointer;
+            font-size: 12px;
+            color: var(--ds-text-muted);
+        }
+
+        .ap-preview-transpiled pre {
+            margin: 6px 0 0;
+            padding: 8px 10px;
+            overflow-x: auto;
+            background: var(--ds-surface-dim);
+            border: 1px solid var(--ds-border-light);
+            border-radius: 6px;
+            font-size: 11.5px;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+
         .ap-history-row {
             padding: 6px 0;
             border-bottom: 1px solid var(--ds-border);
@@ -721,6 +780,96 @@
 
         .ap-history-row:last-child {
             border-bottom: none;
+        }
+
+        /* #1979 — a history row is now a chooser, not a sentence: who/when/
+           note, a peek at the stored body so two edits can be told apart,
+           and the action that loads it back into the editor. */
+        .ap-history-meta {
+            color: var(--ds-text-secondary);
+        }
+
+        .ap-history-sql {
+            margin: 4px 0 0;
+            padding: 6px 8px;
+            background: var(--ds-surface-dim);
+            border: 1px solid var(--ds-border);
+            border-radius: 4px;
+            font-size: 11px;
+            white-space: pre-wrap;
+            word-break: break-word;
+            color: var(--ds-text-muted);
+        }
+
+        .ap-history-restore {
+            margin-top: 6px;
+        }
+
+        .ap-history-more {
+            margin-top: 8px;
+        }
+
+        /* Per-revision diff (#1979 K1-sweep follow-up: a history list with
+           only Restore on top of it still can't say WHAT changed). Same
+           collapsed-<details> idiom as `.ap-preview-transpiled` above --
+           secondary to the row itself, opened only when the peek isn't
+           enough to tell two edits apart. */
+        .ap-history-diff-details {
+            margin-top: 8px;
+        }
+
+        .ap-history-diff-details summary {
+            cursor: pointer;
+            font-size: 12px;
+            color: var(--ds-text-muted);
+        }
+
+        .ap-history-diff {
+            margin: 6px 0 0;
+            padding: 8px 10px;
+            overflow-x: auto;
+            background: var(--ds-surface-dim);
+            border: 1px solid var(--ds-border-light);
+            border-radius: 6px;
+            font-size: 11px;
+            font-family: var(--font-mono);
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+
+        .ap-diff-add {
+            display: block;
+            color: var(--ds-accent-success-ink);
+            background: var(--ds-accent-success-bg);
+        }
+
+        .ap-diff-del {
+            display: block;
+            color: var(--ds-accent-danger-ink);
+            background: var(--ds-accent-danger-bg);
+        }
+
+        .ap-diff-same {
+            display: block;
+            color: var(--ds-text-muted);
+        }
+
+        .ap-history-mapping-change {
+            margin-top: 4px;
+            font-size: 11px;
+            color: var(--ds-text-secondary);
+        }
+
+        .ap-history-diffblock {
+            margin-top: 4px;
+        }
+
+        .ap-history-first {
+            margin-top: 4px;
+        }
+
+        .ap-history-nodiff {
+            margin-bottom: 8px;
         }
 
         /* ── Access Policy builder tabs + column list (access-policy-builder-ux
@@ -766,6 +915,30 @@
             align-items: center;
             gap: 10px;
             margin-bottom: 14px;
+        }
+
+        /* #1979 follow-up (admin setup-flow review, item 4): the register-
+           table wizard's "Filter tables…" box (_register_table_form.html
+           #rtfSearch), generalized to the column picker — a flat
+           alphabetical list becomes unusable by hand-scrolling once a table
+           has 100+ columns. */
+        .ap-col-filter,
+        .ap-rr-col-filter {
+            padding: 6px 10px;
+            border: 1px solid var(--ds-border);
+            border-radius: var(--ds-radius-btn);
+            background: var(--ds-surface);
+            color: var(--ds-text-primary);
+            font: inherit;
+            font-size: 12px;
+        }
+
+        .ap-col-filter-row {
+            margin-bottom: 8px;
+        }
+
+        .ap-col-filter {
+            width: 100%;
         }
 
         .ap-col-list {
@@ -853,9 +1026,69 @@
             padding: 3px 6px;
         }
 
-        .ap-unmask-group {
+        .ap-mask-groups-label {
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+            margin: 0;
+        }
+
+        .ap-mask-groups {
             min-height: 28px;
             padding: 3px 6px;
+        }
+
+        /* issue #2147: the tiered-mask editor -- an ordered chain of
+           (groups, reveal) rows plus a default. Placed on its own line via
+           flex-basis so it never squeezes into the name/type/mask row above
+           it, which is exactly the flex-wrap the column row already has. */
+        .ap-tier-editor {
+            flex-basis: 100%;
+            border-top: 1px dashed var(--ds-border);
+            margin-top: 8px;
+            padding-top: 8px;
+        }
+
+        .ap-tier-list {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            margin-bottom: 8px;
+        }
+
+        .ap-tier-row {
+            display: flex;
+            gap: 6px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+
+        .ap-tier-groups {
+            flex: 1 1 40%;
+            min-width: 160px;
+            min-height: 28px;
+            padding: 3px 6px;
+        }
+
+        .ap-tier-reveal {
+            flex: 1 1 26%;
+            min-width: 150px;
+            min-height: 28px;
+            padding: 3px 6px;
+        }
+
+        .ap-tier-move,
+        .ap-tier-remove {
+            flex: 0 0 auto;
+            padding: 2px 8px;
+            line-height: 1;
+        }
+
+        .ap-tier-default {
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+            max-width: 260px;
         }
 
         /* Task A (access-policy-builder-ux Slice 2): row-rule repeater —
@@ -876,6 +1109,19 @@
             margin-bottom: 8px;
             align-items: center;
             flex-wrap: wrap;
+        }
+
+        .ap-rr-col-wrap {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+            flex: 1 1 26%;
+            min-width: 130px;
+        }
+
+        .ap-rr-col-filter {
+            font-size: 11px;
+            padding: 4px 8px;
         }
 
         .ap-rr-col {
@@ -1894,39 +2140,24 @@
                             <label class="form-label" for="editKbProjectSelect">Keboola project</label>
                             <select class="form-select ds-dropdown-native" id="editKbProjectSelect"></select>
                             {{ ds.dropdown(id='editKbProjectSelect-dd', target='editKbProjectSelect', aria_label='Keboola project', options=[]) }}
-                            <div class="form-hint">Discover, List tables and Use table as base run against this project. Not sent on save — it only steers where these buttons look.</div>
+                            <div class="form-hint">Discover and List tables run against this project. Not sent on save — it only steers where these buttons look.</div>
                         </div>
 
-                        {# Three sync-mode radios (mirror of Register). #}
+                        {# The access-mode picker is NOT authored here (#1979).
+                           Register and Edit used to keep two hand-written option
+                           lists, which is how the same materialized-with-a-filter
+                           row came to be called "Filtered export (Storage API)" in
+                           one modal and "Custom SQL" in the other — the latter
+                           offering a raw-SQL textarea the server refuses outright.
+                           Both modals now render `CONNECTORS.keboola.modes`
+                           (register_table_form.js) through the shared
+                           `RegisterTableForm.renderModeCards`, so the four labels,
+                           their order and the `→ query_mode:` line under each are
+                           one definition. Filled by `_renderEditKbSyncModes`. #}
                         <div class="form-group">
-                            <label class="form-label">What to sync?</label>
-                            <div class="bq-sync-radio-group" style="display:flex; gap:12px; margin-top:6px; flex-wrap:wrap;">
-                                <label class="sync-option-card" style="flex:1; min-width:200px; padding:10px; border:1px solid var(--border); border-radius:8px; cursor:pointer;">
-                                    <input type="radio" name="editKbSyncMode" value="whole"
-                                           onchange="onEditKbSyncModeChange()">
-                                    <strong>Whole table (extension)</strong>
-                                    <div style="font-size:12px; color:var(--text-secondary); margin-top:4px;">
-                                        DuckDB Keboola extension; full overwrite each tick.
-                                    </div>
-                                </label>
-                                <label class="sync-option-card" style="flex:1; min-width:200px; padding:10px; border:1px solid var(--border); border-radius:8px; cursor:pointer;">
-                                    <input type="radio" name="editKbSyncMode" value="direct"
-                                           onchange="onEditKbSyncModeChange()">
-                                    <strong>Direct extract (Storage API)</strong>
-                                    <div style="font-size:12px; color:var(--text-secondary); margin-top:4px;">
-                                        Storage API SDK. Supports incremental, partitioned,
-                                        <code>where_filters</code>.
-                                    </div>
-                                </label>
-                                <label class="sync-option-card" style="flex:1; min-width:200px; padding:10px; border:1px solid var(--border); border-radius:8px; cursor:pointer;">
-                                    <input type="radio" name="editKbSyncMode" value="custom"
-                                           onchange="onEditKbSyncModeChange()">
-                                    <strong>Custom SQL</strong>
-                                    <div style="font-size:12px; color:var(--text-secondary); margin-top:4px;">
-                                        Pre-aggregate or filter with your own SELECT.
-                                    </div>
-                                </label>
-                            </div>
+                            <label class="form-label">How should analysts access this data?</label>
+                            <div class="form-hint" id="editKbCurrentMode"></div>
+                            <div class="ds-drawer__mode-group" id="editKbSyncModeGroup"></div>
                         </div>
 
                         {# Discover/List tables backend routes by instance's data_source.type, ignoring
@@ -1957,20 +2188,53 @@
                                    list="editKbTableList" placeholder="e.g. orders">
                             <datalist id="editKbTableList"></datalist>
                         </div>
+                        {# "Filtered export (Storage API)" — the same structured
+                           where_filters builder the Register wizard uses for this
+                           mode (#408 / #1979), writing into the hidden
+                           #editKbCustomFilters textarea; the save path wraps its
+                           array as the `{"where_filters": [...]}` object
+                           `ExportFilter.from_dict` expects.
+
+                           The escape hatch below is deliberately JSON, not SQL.
+                           A Keboola *materialized* row is exported through the
+                           Storage API, whose filter is a structured spec — the
+                           server 422s any source_query starting with SELECT/WITH
+                           (app/api/admin.py) and the extractor raises on the same
+                           shape at sync time — so a "raw SQL" advanced editor could
+                           not produce a saveable row at all. What it exposes is the
+                           exact JSON spec the server accepts. #}
                         <div class="form-group editkb-source-custom" style="display:none;">
-                            <label class="form-label" for="editKbSourceQuery">
-                                SQL
-                                <button type="button" class="btn btn-secondary btn-sm"
-                                        {% if 'keboola' in (connected_sources or []) %}onclick="prefillFromKeboolaTable('editKbSourceQuery')"
-                                        title="Prefill SELECT * FROM kbc.bucket.table so you only edit the WHERE / projection"{% else %}disabled data-tooltip="Keboola not connected — connect a project in Data sources"{% endif %}
-                                        style="float:right; margin-top:-3px;">
-                                    Use table as base
-                                </button>
-                            </label>
-                            <textarea class="form-textarea" id="editKbSourceQuery" rows="8"></textarea>
+                            <label class="form-label">Storage API filter
+                                <span class="optional">(optional)</span></label>
+                            <div id="editKbCustomFiltersBuilder" class="where-filters-builder"></div>
+                            <textarea class="wfb-raw" id="editKbCustomFilters" rows="3" style="display:none;"></textarea>
+                            <div class="form-hint">
+                                Server-side row filter run by the Keboola Storage API export.
+                                Leave empty for a full-table export. Operators:
+                                <code>eq, ne, gt, ge, lt, le</code>. Date placeholders
+                                (<code>{{ '{{today}}' }}</code>, <code>{{ '{{last_3_months}}' }}</code>, etc.)
+                                resolved at sync time.
+                                <a href="#" class="wfb-raw-toggle"
+                                   onclick="toggleEditKbFilterSpecRaw(event)">Advanced: raw filter (JSON)</a>
+                            </div>
+                            <div class="alert-v2 alert-warning-v2" id="editKbFilterSpecWarning" hidden
+                                 style="font-size:13px; margin-top:8px;"></div>
+                            <div id="editKbFilterSpecRaw" style="display:none; margin-top:8px;">
+                                <textarea class="form-textarea" id="editKbSourceQuery" rows="6"
+                                          placeholder='{"where_filters": [{"column": "date", "operator": "ge", "values": ["{{ '{{last_3_months}}' }}"]}]}'></textarea>
+                                <div class="form-hint">The stored <code>source_query</code>, verbatim.
+                                    Keys: <code>where_filters</code>, <code>columns</code>,
+                                    <code>changed_since</code>, <code>changed_until</code>,
+                                    <code>limit</code>, <code>file_type</code>. SQL is not accepted
+                                    here — a Keboola materialized row is a Storage API export, not a
+                                    query; use <strong>Direct extract</strong> for DuckDB-SQL pulls.</div>
+                            </div>
                         </div>
 
-                        <div class="form-group">
+                        {# Live (remote) never syncs, so the schedule is hidden for it
+                           (mirror of the Register wizard, whose `modeShape` drops the
+                           whole schedule row for `remote`). #}
+                        <div class="form-group editkb-synced-only">
                             <label class="form-label" for="editKbSyncSchedule">Sync Schedule
                                 <span class="optional">(optional)</span></label>
                             <input type="text" class="form-input" id="editKbSyncSchedule" placeholder="every 6h">
@@ -2804,13 +3068,6 @@
           );
         }
       }
-      // Auto-derive a url-safe slug from a Name string. Mirrors the
-      // server-side normalisation used by the seed step in _v48_to_v49.
-      function _deriveSlug(name) {
-        return (name || '').toLowerCase()
-          .replace(/[^a-z0-9]+/g, '-')
-          .replace(/^-|-$/g, '');
-      }
 
       // Hook: chip-input on this page fires `chip-create` when the user
       // selects the "+ Create new" tail row in the dropdown.
@@ -3024,9 +3281,12 @@
           return { id: p.id, name: p.name, member_table_ids: ids };
         });
         // Inline "+ Create new package…" as a sentinel value. The change
-        // handler below intercepts __create__ and runs a tiny prompt-based
-        // flow (name → POST → re-list → re-select) so the user can spawn
-        // a target without leaving the bulk-assign workflow.
+        // handler below intercepts __create__ and opens the SAME shared
+        // drawer (js/components/package_drawer.js) the chip-input's own
+        // "+ Create new" tail row uses — name/slug/description/color, not
+        // a single-field prompt — so the user can spawn a target without
+        // leaving the bulk-assign workflow and without a second, thinner
+        // copy of the create form.
         //
         // v55 — also annotate each option with "(N of M tables already in)"
         // so the admin sees the existing distribution before picking a
@@ -3048,44 +3308,31 @@
               return '<option value="' + escapeHtmlAttr(p.id) + '">'
                 + escapeHtml(p.name) + escapeHtml(distHint) + '</option>';
             }).join('');
-        sel.onchange = async function() {
+        sel.onchange = function() {
           if (sel.value !== '__create__') { refreshBulkAssignAvailability(); return; }
-          const name = await promptModal('Name for the new Data Package:');
-          if (!name || !name.trim()) { sel.value = ''; _syncDropdownRebuild(sel); return; }
-          const slug = _deriveSlug(name.trim());
-          const r = await fetch('/api/admin/data-packages', {
-            method: 'POST',
-            credentials: 'same-origin',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              name: name.trim(),
-              slug,
-              description: null,
-              icon: null,
-              color: '#e0f2fe',
-            }),
-          });
-          if (!r.ok) {
-            const detail = await r.json().catch(function() { return {}; });
-            await alertModal('Create failed: ' + (detail.detail || r.statusText));
-            sel.value = '';
-            _syncDropdownRebuild(sel);
-            return;
-          }
-          const created = await r.json();
-          // Append to the in-memory list + the <select>; preserve any
-          // already-checked table rows by NOT re-rendering the list.
-          _bulkAssignPackages.push({
-            id: created.id, name: name.trim(),
-            member_table_ids: new Set(),
-          });
-          const opt = document.createElement('option');
-          opt.value = created.id;
-          opt.textContent = name.trim();
-          sel.appendChild(opt);
-          sel.value = created.id;
+          // The drawer has no cancel callback of its own to hook, so drop
+          // the sentinel back to "— Choose a package —" the moment it
+          // opens rather than leaving it stuck on __create__ if the admin
+          // backs out without creating anything.
+          sel.value = '';
           _syncDropdownRebuild(sel);
-          refreshBulkAssignAvailability();
+          window.AgnesPackageDrawer.open({
+            onCreated: function (pkg) {
+              // Append to the in-memory list + the <select>; preserve any
+              // already-checked table rows by NOT re-rendering the list.
+              _bulkAssignPackages.push({
+                id: pkg.id, name: pkg.name,
+                member_table_ids: new Set(),
+              });
+              const opt = document.createElement('option');
+              opt.value = pkg.id;
+              opt.textContent = pkg.name;
+              sel.appendChild(opt);
+              sel.value = pkg.id;
+              _syncDropdownRebuild(sel);
+              refreshBulkAssignAvailability();
+            },
+          });
         };
         if (preselectPkgId && _bulkAssignPackages.some(function(p) { return p.id === preselectPkgId; })) {
           sel.value = preselectPkgId;
@@ -3534,6 +3781,22 @@
                 </button>
             </div>
             <div class="modal-body">
+                {% if not access_policies_enabled %}
+                <!-- K1-sweep finding 4 (#1979): the flag only gates ATTACHING
+                     a policy (PUT /registry/{id}'s access_policy_sql setter,
+                     app/api/admin.py) -- enforcement of an existing one keeps
+                     running. Server-rendered (like facts_enabled/
+                     studio_enabled elsewhere on this page), so ON renders
+                     neither this div nor the Save button's disabled
+                     attribute below -- zero visual change. -->
+                <div class="form-hint form-hint--warn" id="apFlagDisabledNotice">
+                    Table access policies are off on this instance — attaching or editing a policy is disabled,
+                    but enforcement of any already-saved policy keeps running. Enable
+                    <code>access_policies.enabled</code> in
+                    <a href="/admin/server-config">/admin/server-config</a> (or set <code>AGNES_ACCESS_POLICIES_ENABLED=1</code>)
+                    to make changes.
+                </div>
+                {% endif %}
                 <div class="form-hint form-hint--warn" id="apInterlockWarning" style="display:none;">
                     <!-- Filled by _apRenderInterlockWarning() — mirrors the
                          onEditBqAccessModeChange() pattern: computed and
@@ -3544,17 +3807,28 @@
 
                 <!-- Task 5: table-level "referenceable from other policies"
                      switch — reuses the existing PUT's policy_mapping field
-                     (today CLI-only via `agnes admin table set-policy-mapping`). -->
-                <div class="ap-mapping-row">
-                    <label class="toggle-switch">
-                        <input type="checkbox" id="apMappingToggle" onchange="apToggleMapping(this.checked)">
-                        <span class="toggle-slider"></span>
-                    </label>
-                    <div>
-                        <div class="form-label" style="margin-bottom:2px;">Allow other policies to reference this table</div>
-                        <div class="form-hint" style="margin:0;">Referenceable from any policy — not a grant.</div>
+                     (today CLI-only via `agnes admin table set-policy-mapping`).
+                     Deliberately set apart (own label + divider) from the
+                     row/column scope below: this answers "can OTHER tables'
+                     policies read through this one" (a mapping-table
+                     allowance), not "who sees which rows of THIS table" —
+                     the two read as one setting when styled identically and
+                     stacked directly above the row-rule section. -->
+                <div class="ap-mapping-section">
+                    <div class="form-label" style="margin-bottom:2px;">Use as input for other tables' policies</div>
+                    <div class="ap-mapping-row">
+                        <label class="toggle-switch">
+                            <input type="checkbox" id="apMappingToggle" onchange="apToggleMapping(this.checked)">
+                            <span class="toggle-slider"></span>
+                        </label>
+                        <div class="form-hint" style="margin:0;">
+                            Lets another table's policy SQL join against this table (e.g. a person →
+                            cost-centre mapping) — not a grant, and it does not change who sees which
+                            rows of THIS table below.
+                        </div>
                     </div>
                 </div>
+                <hr style="border:0; border-top:1px solid var(--ds-border); margin:14px 0;">
 
                 <!-- Task 4: Builder (default) + Advanced SQL tabs. Builder
                      never writes SQL directly — every mask change re-POSTs
@@ -3569,6 +3843,15 @@
                 </div>
 
                 <div data-ap-panel="builder" id="apBuilder">
+                    <!-- #1979 (reviewer finding 1): the Builder has no
+                         reverse-compiler from stored SQL back into rules, so
+                         a policy authored on the Advanced SQL tab used to
+                         render below as "No row rules -- every caller sees
+                         every row" while a real restrictive policy was being
+                         enforced. Filled by _apRenderRepresentationNotice()
+                         -- same warn block as #apInterlockWarning above. -->
+                    <div class="form-hint form-hint--warn" id="apNotRepresentableNotice"
+                         style="display:none;" role="status"></div>
                     <!-- Task A (access-policy-builder-ux Slice 2): repeatable row rules,
                          ABOVE the column list — the flagship no-SQL row scope. Every
                          change re-assembles row_rules/row_combine and feeds them into the
@@ -3606,6 +3889,11 @@
                         Pick a mask for any column that needs to change for some callers — everything
                         else passes through unchanged.
                     </div>
+                    <div class="ap-col-filter-row">
+                        <input type="text" class="ap-col-filter" id="apColFilter"
+                               placeholder="Filter columns…" aria-label="Filter columns"
+                               oninput="_apRenderColList()">
+                    </div>
                     <div id="apColList" class="ap-col-list">
                         <div class="form-hint" style="margin:0; padding:10px;">Loading columns…</div>
                     </div>
@@ -3640,6 +3928,12 @@
                     <div class="form-hint">The next admin who finds this policy needs to know whether it's safe to change.</div>
                 </div>
 
+                <!-- #1979: what a Restore click loaded, and the fact that
+                     nothing is saved until the admin presses Save policy.
+                     Deliberately a separate slot from #apSaveError — one is a
+                     rejection, the other is a state the admin has to act on. -->
+                <div class="form-hint form-hint--warn" id="apRestoreNotice" style="display:none;" role="status"></div>
+
                 <div class="form-hint form-hint--danger" id="apSaveError" style="display:none;"></div>
 
                 <div class="form-group">
@@ -3657,6 +3951,18 @@
                         (or, left blank, the stored policy) without saving anything.
                     </div>
                     <div id="apPreviewResult" style="display:none;"></div>
+
+                    <!-- review-plan P1.4: sweeps every REAL user_groups row
+                         through the same policy in one call — catches a
+                         CASE with a missing/wrong ELSE branch (every group
+                         not explicitly named silently seeing everything)
+                         without the admin manually re-running the
+                         single-persona preview above once per group. -->
+                    <div style="margin-top:10px;">
+                        <button type="button" class="btn btn-secondary btn-sm" onclick="apRunPreviewAllGroups()">Preview all groups</button>
+                        <span class="form-hint" style="margin:0;">Runs the SQL above (or the stored policy) once per real group — a quick way to catch a group that unexpectedly sees everything.</span>
+                    </div>
+                    <div id="apPreviewGroupsResult" style="display:none;"></div>
                 </div>
 
                 <div class="form-group" id="apHistorySection" style="display:none;">
@@ -3668,7 +3974,7 @@
                 <button class="btn btn-danger btn-sm" id="apClearBtn" onclick="apClearPolicy()" style="display:none;">Clear policy</button>
                 <div style="display:flex; gap:10px;">
                     <button class="btn btn-secondary" onclick="closeAccessPolicyModal()">Cancel</button>
-                    <button class="btn btn-primary" id="apSaveBtn" onclick="apSavePolicy()">Save policy</button>
+                    <button class="btn btn-primary" id="apSaveBtn" onclick="apSavePolicy()"{% if not access_policies_enabled %} disabled{% endif %}>Save policy</button>
                 </div>
             </div>
         </div>
@@ -3989,7 +4295,6 @@
     // a BigQuery service account in the vault.
     var CONNECTED_SOURCE_TYPES = (document.body.dataset.connectedSourceTypes || '')
         .split(',').map(function (s) { return s.trim(); }).filter(Boolean);
-
     // The end of each table's chain: which package carries it and how many
     // people that reaches ({table_id: {packages: [{id, name}], people}}).
     // Server-rendered because reach is a grants x group-membership join that
@@ -4061,6 +4366,12 @@
         // into the shared _register_table_form.html drawer (D4) —
         // register_table_form.js attaches it lazily on open, not here.
         _initWhereFiltersBuilder('editKbWhereFiltersBuilder', 'editKbWhereFilters');
+        // Second instance of the SAME builder for the Keboola edit modal's
+        // "Filtered export (Storage API)" mode (#1979) — the wizard already
+        // reused it there; the edit modal used to offer a raw-SQL textarea
+        // the server refuses. Its array is wrapped as {"where_filters": [...]}
+        // on save (see _editKbFilterSourceQuery).
+        _initWhereFiltersBuilder('editKbCustomFiltersBuilder', 'editKbCustomFilters');
     });
 
     // ── Keboola test connection (#402) — verify the instance's Keboola
@@ -4433,6 +4744,208 @@
     // discover/prefill helpers (which hit the keboola-typed
     // /api/admin/discover-tables endpoint) stay gated above + below.
 
+    // ── #1979 pure edit-modal helpers — node-tested slice start ──
+    // No DOM and no page globals in here (only the shared Keboola contract
+    // published by register_table_form.js), so
+    // tests/test_keboola_edit_modal_access_modes.py can slice the source
+    // between these two markers and run the SHIPPED functions under plain
+    // `node` — the same "exercise the real code, don't copy it" pattern
+    // tests/test_register_table_form.py uses for the selection helpers.
+
+    /** The access mode a registry row IS — what the picker must open on.
+     *
+     *  Pre-#1979 this fell through to 'whole' for anything that wasn't
+     *  local-with-SQL, so a `query_mode='remote'` Keboola row opened on
+     *  "Whole table" and Save silently rewrote it to materialized, and a
+     *  materialized row carrying a JSON filter opened in a textarea labelled
+     *  SQL.
+     *
+     *  The one deliberate fall-through that stays: a row whose source_query
+     *  is the legacy auto-synthesized `SELECT * FROM kbc."b"."t"` still opens
+     *  on "Whole table", whose Save posts an explicit null — that is the only
+     *  way to clear a shape the server now refuses. */
+    function _editKbModeForRow(table) {
+        table = table || {};
+        var queryMode = table.query_mode || 'materialized';
+        if (queryMode === 'remote') return 'remote';
+        if (queryMode === 'local') return 'direct';
+        var sourceQuery = (table.source_query || '').trim();
+        if (!sourceQuery) return 'whole';
+        var bucket = table.bucket || '';
+        var sourceTable = table.source_table || '';
+        if (bucket && sourceTable) {
+            var auto = 'SELECT * FROM kbc."' + bucket + '"."' + sourceTable + '"';
+            if (sourceQuery.replace(/\s+/g, ' ').trim() === auto) return 'whole';
+        }
+        return 'custom';
+    }
+
+    /** How to present a stored `source_query` in the Filtered-export widget.
+     *
+     *  Returns {raw, value, filters, warning}: `filters` is the JSON array the
+     *  structured builder hydrates from, `value` the verbatim text for the
+     *  advanced editor, and `raw` true when the spec is something the builder
+     *  cannot draw losslessly — a legacy non-JSON string, a key the builder
+     *  doesn't own, or a comma-bearing value its CSV row editor would split.
+     *  Such a spec is SHOWN with a warning, never silently dropped. */
+    function _editKbFilterSpecShape(sourceQuery) {
+        var raw = (sourceQuery == null ? '' : String(sourceQuery)).trim();
+        var out = { raw: false, value: raw, filters: '', warning: '' };
+        if (!raw) return out;
+        var parsed;
+        try { parsed = JSON.parse(raw); } catch (e) { parsed = undefined; }
+        if (parsed === undefined || parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+            out.raw = true;
+            out.warning = 'This table\u2019s saved filter is not a JSON spec \u2014 most likely SQL left by the '
+                + 'old "Custom SQL" editor. It is shown below unchanged; a Keboola export takes a JSON '
+                + 'filter, so saving it as is will be refused.';
+            return out;
+        }
+        var keys = Object.keys(parsed);
+        var list = parsed.where_filters;
+        var onlyWhereFilters = keys.every(function (k) { return k === 'where_filters'; });
+        if (onlyWhereFilters && (list === undefined || Array.isArray(list))) {
+            var rows = list || [];
+            var lossy = rows.some(function (f) {
+                return f && Array.isArray(f.values) && f.values.some(function (v) {
+                    return typeof v === 'string' && v.indexOf(',') !== -1;
+                });
+            });
+            if (!lossy) {
+                out.filters = JSON.stringify(rows);
+                return out;
+            }
+            out.raw = true;
+            out.warning = 'A filter value contains a comma, which the structured editor cannot represent. '
+                + 'Edit this filter as raw JSON below.';
+            return out;
+        }
+        out.raw = true;
+        out.warning = 'This filter uses keys the structured editor cannot draw (' + keys.join(', ')
+            + '). Edit it as raw JSON below.';
+        return out;
+    }
+
+    /** The `source_query` the Filtered-export mode saves.
+     *
+     *  `useRaw` picks the advanced JSON editor over the structured builder.
+     *  Empty means NULL — a full-table export, same as "Whole table". Throws
+     *  with the server's OWN message when the advanced editor holds SQL, so
+     *  the operator meets one wording rather than two. */
+    function _editKbFilterSourceQuery(useRaw, rawText, builderRowsJSON) {
+        if (useRaw) {
+            var raw = (rawText || '').trim();
+            if (!raw) return null;
+            if (/^(SELECT|WITH)\b/i.test(raw)) {
+                throw new Error(window.RegisterTableForm.KEBOOLA_FILTER_NOT_SQL_MESSAGE);
+            }
+            var parsed;
+            try {
+                parsed = JSON.parse(raw);
+            } catch (e) {
+                throw new Error('Storage API filter must be valid JSON \u2014 ' + e.message);
+            }
+            if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+                throw new Error('Storage API filter must be a JSON object, e.g. {"where_filters": [ ... ]}.');
+            }
+            // A key the exporter does not read is refused, never ignored: the
+            // server used to drop it and export the WHOLE table (#1979). Same
+            // key list and same wording as the API answers with.
+            var unknown = window.RegisterTableForm.keboolaFilterUnknownKeys(parsed);
+            if (unknown.length) {
+                throw new Error(window.RegisterTableForm.KEBOOLA_FILTER_UNKNOWN_KEYS_MESSAGE(unknown));
+            }
+            return raw;
+        }
+        var rows = [];
+        try { rows = JSON.parse(builderRowsJSON || '[]'); } catch (e) { rows = []; }
+        if (!Array.isArray(rows) || !rows.length) return null;
+        return JSON.stringify({ where_filters: rows });
+    }
+    // ── #1979 pure edit-modal helpers — node-tested slice end ──
+
+    // True when the advanced JSON editor owns the filter (the structured
+    // builder cannot represent what is stored) — see _editKbFilterSpecShape.
+    var _editKbFilterRawOwned = false;
+
+    function _editKbShowFilterSpecRaw(show) {
+        document.getElementById('editKbFilterSpecRaw').style.display = show ? '' : 'none';
+        document.getElementById('editKbCustomFiltersBuilder').style.display =
+            _editKbFilterRawOwned ? 'none' : '';
+    }
+
+    function _editKbApplyFilterSpecShape(shape) {
+        _editKbFilterRawOwned = !!shape.raw;
+        document.getElementById('editKbSourceQuery').value = shape.value;
+        document.getElementById('editKbCustomFilters').value = shape.filters || '';
+        _rebuildWhereFiltersBuilder('editKbCustomFiltersBuilder');
+        var warn = document.getElementById('editKbFilterSpecWarning');
+        warn.textContent = shape.warning || '';
+        warn.hidden = !shape.warning;
+        _editKbShowFilterSpecRaw(_editKbFilterRawOwned);
+    }
+
+    // "Advanced: raw filter (JSON)" — the escape hatch. Deliberately JSON and
+    // not SQL: a Keboola materialized row exports through the Storage API,
+    // whose filter is a structured spec, and the server 422s a source_query
+    // starting with SELECT/WITH, so a raw-SQL editor here could only produce
+    // unsaveable rows.
+    function toggleEditKbFilterSpecRaw(ev) {
+        if (ev) ev.preventDefault();
+        var showing = document.getElementById('editKbFilterSpecRaw').style.display !== 'none';
+        if (showing) {
+            // Closing: re-derive the structured rows from what was typed so the
+            // two views can never disagree. A spec the builder can't draw keeps
+            // the raw editor open, with the warning saying why.
+            _editKbApplyFilterSpecShape(
+                _editKbFilterSpecShape(document.getElementById('editKbSourceQuery').value)
+            );
+            return;
+        }
+        if (!_editKbFilterRawOwned) {
+            // Opening: seed it from the builder, so the operator edits what is
+            // actually about to be saved rather than a stale string.
+            var sq = null;
+            try {
+                sq = _editKbFilterSourceQuery(false, '', document.getElementById('editKbCustomFilters').value);
+            } catch (e) { sq = null; }
+            document.getElementById('editKbSourceQuery').value = sq || '';
+        }
+        _editKbShowFilterSpecRaw(true);
+        document.getElementById('editKbSourceQuery').focus();
+    }
+
+    function _editKbCollectFilterSourceQuery() {
+        var rawVisible = document.getElementById('editKbFilterSpecRaw').style.display !== 'none';
+        return _editKbFilterSourceQuery(
+            _editKbFilterRawOwned || rawVisible,
+            document.getElementById('editKbSourceQuery').value,
+            document.getElementById('editKbCustomFilters').value
+        );
+    }
+
+    /** Render the four access-mode cards from the ONE shared definition
+     *  (`CONNECTORS.keboola.modes` in register_table_form.js) and name the
+     *  row's current mode above them. Both modals therefore print the same
+     *  labels, the same order and the same `→ query_mode:` outcome. */
+    function _renderEditKbSyncModes(current) {
+        if (!window.RegisterTableForm) return;
+        var modes = window.RegisterTableForm.CONNECTORS.keboola.modes;
+        window.RegisterTableForm.renderModeCards({
+            host: document.getElementById('editKbSyncModeGroup'),
+            modes: modes,
+            radioName: 'editKbSyncMode',
+            current: current,
+            onSelect: onEditKbSyncModeChange,
+        });
+        var line = document.getElementById('editKbCurrentMode');
+        if (!line) return;
+        var m = modes.filter(function (x) { return x.value === current; })[0];
+        line.textContent = m
+            ? ('Currently: ' + m.title + ' ' + window.RegisterTableForm.modeOutcome(m))
+            : '';
+    }
+
     function _getEditKbSyncMode() {
         var el = document.querySelector('input[name="editKbSyncMode"]:checked');
         return el ? el.value : 'whole';
@@ -4440,15 +4953,25 @@
 
     function onEditKbSyncModeChange() {
         var mode = _getEditKbSyncMode();
-        document.querySelectorAll('.editkb-source-table').forEach(function(el) {
-            el.style.display = (mode === 'custom') ? 'none' : '';
-        });
+        // Bucket + source table stay visible for every mode: the filtered
+        // export needs them beside its JSON filter (materialize_query exports
+        // a physical table), and Live (remote) ATTACHes exactly that pair.
         document.querySelectorAll('.editkb-source-custom').forEach(function(el) {
             el.style.display = (mode === 'custom') ? '' : 'none';
         });
         document.querySelectorAll('.editkb-direct-only').forEach(function(el) {
             el.style.display = (mode === 'direct') ? '' : 'none';
         });
+        document.querySelectorAll('.editkb-synced-only').forEach(function(el) {
+            el.style.display = (mode === 'remote') ? 'none' : '';
+        });
+        // The server refuses server_only=true on a remote row (422) — mirror
+        // the wizard, which drops the control entirely for Live.
+        var serverOnly = document.getElementById('editKbServerOnly');
+        if (serverOnly) {
+            serverOnly.disabled = (mode === 'remote');
+            if (mode === 'remote') serverOnly.checked = false;
+        }
         if (mode === 'direct') onEditKbStrategyChange();
     }
 
@@ -4475,20 +4998,15 @@
         });
     }
 
-    function _setEditKbRadio(value) {
-        var el = document.querySelector('input[name="editKbSyncMode"][value="' + value + '"]');
-        if (el) el.checked = true;
-    }
-
     function openEditKeboolaModal(table) {
-        // Populate fields from a registry row. Mode detection:
-        //   - query_mode='local' → 'direct' (v26 sync-strategy path)
-        //   - query_mode='materialized' + auto SELECT * → 'whole'
-        //   - query_mode='materialized' + custom SQL  → 'custom'
+        // Populate fields from a registry row. Mode detection lives in the
+        // pure `_editKbModeForRow` above — see its comment for the shapes and
+        // for the two bugs it fixes (a remote row opening on "Whole table",
+        // a JSON filter opening in a SQL textarea).
         table = table || {};
         document.getElementById('editKbTableId').value = table.id || '';
-        // Preselect the row's own project so Discover/List/Use-as-base look
-        // at the project this table actually came from, not whichever the
+        // Preselect the row's own project so Discover / List tables look at
+        // the project this table actually came from, not whichever the
         // picker happened to default to. Informational only — saving does
         // not change a row's connection_id: `UpdateTableRequest` accepts the
         // field (an admin can re-pin a row via `agnes admin update-table
@@ -4498,35 +5016,25 @@
         var bucket = table.bucket || '';
         var sourceTable = table.source_table || '';
         var sourceQuery = table.source_query || '';
-        var queryMode = table.query_mode || 'materialized';
-        var isAutoSelectStar = false;
-        if (sourceQuery && bucket && sourceTable) {
-            var auto = 'SELECT * FROM kbc."' + bucket + '"."' + sourceTable + '"';
-            isAutoSelectStar = sourceQuery.replace(/\s+/g, ' ').trim() === auto;
-        }
-        var mode;
-        if (queryMode === 'local') {
-            mode = 'direct';
-        } else if (sourceQuery && !isAutoSelectStar) {
-            mode = 'custom';
-        } else {
-            mode = 'whole';
-        }
-        _setEditKbRadio(mode);
+        var mode = _editKbModeForRow(table);
+        _renderEditKbSyncModes(mode);
+        // Only a Filtered-export row's source_query belongs in the filter
+        // widget. A "Whole table" row's legacy synthesized SELECT does not —
+        // its Save clears the field, and pre-filling the editor with SQL that
+        // is about to be dropped would only look like a pending edit.
+        _editKbApplyFilterSpecShape(_editKbFilterSpecShape(mode === 'custom' ? sourceQuery : ''));
         document.getElementById('editKbBucket').value = bucket;
         document.getElementById('editKbSourceTable').value = sourceTable;
-        document.getElementById('editKbSourceQuery').value = sourceQuery;
         document.getElementById('editKbSyncSchedule').value = table.sync_schedule || '';
         document.getElementById('editKbDescription').value = table.description || '';
         document.getElementById('editKbFolder').value = table.folder || '';
         document.getElementById('editKbPrimaryKey').value = (table.primary_key || []).join(', ');
-        // #607 — server_only checkbox. Disabled for live (remote) rows since
-        // the flag is meaningless there (backend rejects true + remote).
+        // #607 — server_only checkbox. Disabling it for Live (remote) rows,
+        // where the flag is meaningless (the backend rejects true + remote),
+        // is onEditKbSyncModeChange's job now: it has to follow the picker,
+        // not just the mode the row arrived in.
         var editServerOnlyEl = document.getElementById('editKbServerOnly');
-        if (editServerOnlyEl) {
-            editServerOnlyEl.checked = !!table.server_only;
-            editServerOnlyEl.disabled = (queryMode === 'remote');
-        }
+        if (editServerOnlyEl) editServerOnlyEl.checked = !!table.server_only;
 
         // v26 fields
         document.getElementById('editKbStrategy').value = table.sync_strategy || 'full_refresh';
@@ -4595,10 +5103,27 @@
         var primaryKey = pk
             ? pk.split(',').map(function(s) { return s.trim(); }).filter(Boolean)
             : [];
-        // #607 — both edit branches map to synced (local/materialized) modes,
-        // so server_only is always valid here.
         var editServerOnlyEl = document.getElementById('editKbServerOnly');
         var serverOnly = !!(editServerOnlyEl && editServerOnlyEl.checked);
+
+        if (mode === 'remote') {
+            // Live (remote) — the wizard's remote branch, on the PUT shape
+            // (#1979). `server_only` must be sent as an EXPLICIT false: it is
+            // validated against the MERGED record, so omitting it on a row
+            // that is currently server-only keeps the stored `true` and the
+            // update 422s. `source_query` needs no null here — update_table
+            // clears it itself for any non-materialized merged record — and
+            // the sync schedule is left untouched because nothing syncs.
+            return {
+                query_mode: 'remote',
+                bucket: bucket,
+                source_table: sourceTable,
+                primary_key: primaryKey,
+                server_only: false,
+                description: (document.getElementById('editKbDescription').value || '').trim() || null,
+                folder: (document.getElementById('editKbFolder').value || '').trim() || null,
+            };
+        }
 
         if (mode === 'direct') {
             var strategy = _getEditKbStrategy();
@@ -4646,8 +5171,16 @@
             folder: (document.getElementById('editKbFolder').value || '').trim() || null,
         };
         if (mode === 'custom') {
+            // Filtered export (Storage API) — a JSON filter spec, never SQL
+            // (the server 422s a SELECT/WITH source_query on a Keboola
+            // materialized row). `bucket`/`source_table` ride along because
+            // `materialize_query` exports a physical table and the filter only
+            // narrows it; an empty filter is an explicit null, i.e. the same
+            // full-table export "Whole table" performs.
             return Object.assign({}, common, {
-                source_query: (document.getElementById('editKbSourceQuery').value || '').trim(),
+                bucket: bucket,
+                source_table: sourceTable,
+                source_query: _editKbCollectFilterSourceQuery(),
             });
         }
         // Whole — an EXPLICIT null, not an omitted key. Keboola materialized
@@ -4719,31 +5252,15 @@
         })();
     }
 
-    // prefillFromKeboolaTable is defined here, OUTSIDE the discover-helpers
-    // Jinja guard above ('keboola' in connected_sources) — it must exist
-    // whenever the Register or Edit modal is open, on ANY instance, because
-    // Edit is per-row and not gated by the instance's connectedness. What
-    // IS gated is the button's onclick attribute that calls it (see the
-    // Register/Edit button guards above) — a disconnected instance never
-    // wires up the onclick, so this definition existing unconditionally is
-    // harmless dead code for it, not a live call path.
-    async function prefillFromKeboolaTable(textareaId) {
-        // Edit-modal callers may pass an editKbBucket / editKbSourceTable
-        // pair instead of the Register modal's kbBucket / kbSourceTable.
-        // Detect the modal via the textarea id prefix.
-        var prefix = textareaId.indexOf('editKb') === 0 ? 'editKb' : 'kb';
-        var bucket = (document.getElementById(prefix + 'Bucket').value || '').trim();
-        var sourceTable = (document.getElementById(prefix + 'SourceTable').value || '').trim();
-        if (!bucket || !sourceTable) {
-            showToast('Fill bucket + source table first', 'error');
-            return;
-        }
-        var ta = document.getElementById(textareaId);
-        if (ta.value.trim()) {
-            if (!(await confirmModal('Replace existing SQL?'))) return;
-        }
-        ta.value = 'SELECT *\nFROM kbc."' + bucket + '"."' + sourceTable + '"\nWHERE -- your filter here';
-    }
+    // #1979 removed `prefillFromKeboolaTable`. Its only caller was the Keboola
+    // Edit modal's "Use table as base" button, next to a SQL textarea that no
+    // longer exists: it seeded `SELECT * FROM kbc."b"."t" WHERE …` into
+    // `source_query`, which is precisely the payload the server refuses on a
+    // Keboola materialized row ("must be a JSON filter spec …, not SQL"). The
+    // mode it belonged to is now "Filtered export (Storage API)", whose editor
+    // is the structured filter builder plus a raw-JSON hatch, so there is no
+    // SQL left to prefill. BigQuery's equivalent (`prefillFromTable`, above)
+    // is untouched — BQ materialized rows really do take SQL.
 
     // C3: removed dead helper _buildKeboolaLegacyPayload — the Phase F
     // _buildKeboolaPayload (above) replaced it.
@@ -5493,8 +6010,14 @@
     //       (internal tables already row-scope via
     //       connectors/internal/access.py — layering a second SQL policy
     //       on top is out of scope here and would be actively confusing).
-    //   (2) no policy on an eligible table -> a plain "—" button that
-    //       opens the editor to attach one.
+    //   (2) no policy on an eligible table -> a muted, dashed
+    //       "+ Add policy" button that opens the editor to attach one.
+    //       Labelled, not a bare "—": the affordance an admin is most
+    //       likely to want next must not be the one glyph on the row that
+    //       reads as "nothing here". When no data package carries the
+    //       table it also trails a quiet "not in any package yet →" link
+    //       into the same assign flow /admin/data-packages offers — a
+    //       policy over data nobody can reach protects nothing.
     //   (3) no policy on a table that is still distributed -> a muted
     //       "not available — distributed" button; still opens the SAME
     //       modal, which explains the fix inline (§13: "visible but
@@ -5531,9 +6054,26 @@
                  + 'title="Only a server_only or query_mode=&#39;remote&#39; table can carry an access policy — click to see the fix." '
                  + "onclick='" + openCall + "'>not available — distributed</button>";
         }
+        // Package membership is already on the page: TABLE_DELIVERY is
+        // server-rendered as {table_id: {packages, people}} for exactly this
+        // kind of "does it reach anyone" question, so the hint needs no new
+        // field and no new endpoint. The fold matches the unpackaged tray on
+        // /admin/data-packages (app/web/router.py): `remote` rows answer
+        // server-side without a package and are not part of that flow, so
+        // only distributable rows can honestly be told they are in none.
+        var apDelivery = (typeof TABLE_DELIVERY === 'object' && TABLE_DELIVERY)
+            ? TABLE_DELIVERY[String(t.id || '')] : null;
+        var apPkgs = (apDelivery && apDelivery.packages) || [];
+        var apMode = String(t.query_mode || '').toLowerCase();
+        var apDistributable = (apMode === '' || apMode === 'local' || apMode === 'materialized');
+        var apHint = (!apPkgs.length && apDistributable)
+            ? '<a class="access-chip-hint" href="/admin/tables?unpackaged=1" '
+              + 'title="A policy filters what a reader sees — but no data package carries this table, so nobody reads it yet. Assign it to one.">'
+              + 'not in any package yet &rarr;</a>'
+            : '';
         return '<button type="button" class="access-chip access-chip--none" '
-             + 'title="No access policy — click to add one" '
-             + "onclick='" + openCall + "'>—</button>";
+             + 'title="This table is eligible for a row-level access policy — click to add one" '
+             + "onclick='" + openCall + "'>+ Add policy</button>" + apHint;
     }
 
     // Deep-link from a table row into the grant editor, scoped to this
@@ -5582,6 +6122,11 @@
         document.getElementById('apNote').value = table.access_policy_note || '';
         document.getElementById('apPreviewUser').value = '';
         document.getElementById('apPreviewGroups').value = '';
+        // #1979 follow-up: the column-filter box is a static element, not
+        // rebuilt per open like #apColList itself — clear it so a filter
+        // typed for the previous table doesn't hide columns on this one.
+        var colFilterEl = document.getElementById('apColFilter');
+        if (colFilterEl) colFilterEl.value = '';
         var previewEl = document.getElementById('apPreviewResult');
         previewEl.style.display = 'none';
         previewEl.innerHTML = '';
@@ -5595,11 +6140,17 @@
         // The stored artifact is always SQL (never a structured spec, per
         // policy/compile's own docstring), so there is nothing to reverse-
         // compile a saved policy's row filter back into — the row-rule
-        // builder always starts empty, same as _apMaskState above.
+        // builder always starts empty, same as _apMaskState above. Which is
+        // exactly why a stored policy is, by construction, NOT what the rules
+        // on screen describe (#1979): the builder says so rather than
+        // reporting its own empty state as the policy.
         _apRowRules = [];
         _apRowCombine = 'and';
+        _apStoredSqlAtOpen = String(table.access_policy_sql || '').trim();
+        _apSqlFromBuilder = !_apStoredSqlAtOpen;
         _apRenderCompileWarnings([]);
         _apRenderRowRules();
+        _apRenderRepresentationNotice();
         _apRenderInterlockWarning();
         _apLoadHistory(table.id);
         apSwitchTab('builder');
@@ -5736,10 +6287,45 @@
            still protects against saving unchanged stale output from the box. */
         if (tab === 'sql') {
             _apFlushPendingCompile();
+        } else {
+            // #1979: the Advanced tab may have been hand-edited since the
+            // Builder was last on screen.
+            _apRenderRepresentationNotice();
         }
     }
 
-    var _AP_MASK_LABELS = { show: 'Show', hide: 'Hide', nullify: 'Nullify', hash: 'Pseudonymize', unmask: 'Unmask for groups' };
+    // issue #2147: the four masks `src/access_policy_compile.py` grew
+    // beyond the original five (`last4`, `email_partial`,
+    // `pseudonymize_keyed`, `tiered`) plus the `groups` modifier any
+    // value-producing mask can now carry -- see that module's own docstring
+    // for the spec shape this picker has to emit.
+    var _AP_MASK_LABELS = {
+        show: 'Show', hide: 'Hide', nullify: 'Nullify', hash: 'Pseudonymize (hash)',
+        unmask: 'Unmask for groups', last4: 'Last 4', email_partial: 'Email (partial)',
+        pseudonymize_keyed: 'Pseudonymize (keyed)', tiered: 'Tiered by group',
+    };
+    // One-line help, shown as the <option>'s title on hover -- overridden by
+    // a disabled-reason string (below) when the option cannot be picked for
+    // this column.
+    var _AP_MASK_HELP = {
+        show: 'No masking — the column is returned as-is.',
+        hide: 'The column is omitted from the result entirely.',
+        nullify: 'The value is replaced with NULL; the column stays in the schema.',
+        hash: 'md5, unsalted — prefer keyed pseudonym on a server-only table.',
+        unmask: 'Verbatim for the listed groups, redacted/NULL for everyone else.',
+        last4: 'Keeps the last 4 characters, masks the rest with a fixed-width run. Text columns only.',
+        email_partial: 'Keeps the domain, redacts the local part (j*****@example.com). Text columns only.',
+        pseudonymize_keyed: "Keyed HMAC pseudonym under this instance's own key — stable and joinable, "
+            + "DuckDB-only (not on a query_mode='remote' table).",
+        tiered: 'Reveals a different value per group, in order, with a default for everyone else.',
+    };
+    // Mirrors `_TEXT_ONLY_MASKS` in src/access_policy_compile.py -- string
+    // surgery / a VARCHAR -> VARCHAR function, so only valid on a text column.
+    var _AP_TEXT_ONLY_MASKS = ['last4', 'email_partial', 'pseudonymize_keyed'];
+    // The masks a tiered chain's tier/default can reveal -- everything
+    // `_mask_value_expr` accepts (`hide` and `unmask` are refused server-side:
+    // a column cannot be conditionally absent, and unmask IS the modifier).
+    var _AP_TIER_REVEAL_MASKS = ['nullify', 'hash', 'last4', 'email_partial', 'pseudonymize_keyed'];
     let _apColumns = [];
     let _apMaskState = {};
     let _apCompileTimer = null;
@@ -5747,6 +6333,68 @@
     let _apCompileError = null;
     let _apSchemaAvailable = true;
     let _apCompileSeq = 0;
+
+    // Mirrors `_is_text_type` in src/access_policy_compile.py: anchor on the
+    // whole base type name (stripping a `(255)`-style size suffix) so
+    // `VARCHAR[]`/`STRUCT(...)`/`MAP(...)`/`LIST(...)` -- which merely mention
+    // a text keyword -- are never treated as scalar text.
+    function _apIsTextColumnType(colType) {
+        var upper = String(colType || '').trim().toUpperCase();
+        if (!upper) return false;
+        if (upper.indexOf('[') !== -1 || upper.indexOf('<') !== -1
+            || upper.indexOf('STRUCT') === 0 || upper.indexOf('MAP') === 0
+            || upper.indexOf('LIST') === 0 || upper.indexOf('ARRAY') === 0) {
+            return false;
+        }
+        var base = upper.split('(')[0].trim();
+        return base === 'VARCHAR' || base === 'TEXT' || base === 'STRING';
+    }
+
+    // `pseudonymize_keyed` calls `agnes_hmac()`, which only exists on this
+    // instance's own DuckDB connection -- the save-time validator refuses it
+    // on a query_mode='remote' table (`policy_function_duckdb_only`). Disabled
+    // here up front rather than only after a 422 on Save.
+    function _apIsRemoteTable(t) {
+        return !!t && String(t.query_mode || '').toLowerCase() === 'remote';
+    }
+
+    // One {value, label, disabled, title} per mask option for a given column
+    // -- shared by the main per-column picker and the tiered editor's own
+    // reveal/default selects, so the two never disagree about which choice is
+    // legal for a column.
+    function _apMaskOptionMeta(choice, isText, isRemote) {
+        var help = _AP_MASK_HELP[choice] || '';
+        var reason = '';
+        if (_AP_TEXT_ONLY_MASKS.indexOf(choice) !== -1 && !isText) {
+            reason = 'Text columns only — this column is not text.';
+        } else if (choice === 'pseudonymize_keyed' && isRemote) {
+            reason = "Not available on a query_mode='remote' table — pseudonymize_keyed runs only "
+                + "on this instance's own DuckDB connection (policy_function_duckdb_only).";
+        }
+        return { disabled: !!reason, title: reason || help };
+    }
+
+    function _apMaskOptionHtml(opt, selected) {
+        return '<option value="' + opt.value + '"'
+            + (opt.value === selected ? ' selected' : '')
+            + (opt.disabled ? ' disabled' : '')
+            + (opt.title ? ' title="' + escapeHtmlAttr(opt.title) + '"' : '')
+            + '>' + escapeHtml(opt.label) + '</option>';
+    }
+
+    // The `groups` modifier (design doc: any value-producing mask, never
+    // `show`/`hide`/`tiered` -- a tiered chain has its own per-tier groups).
+    function _apGroupsCapableMask(choice) {
+        return choice !== 'show' && choice !== 'hide' && choice !== 'tiered';
+    }
+
+    function _apExtractGroups(entry) {
+        if (entry && typeof entry === 'object') {
+            if (Array.isArray(entry.groups)) return entry.groups;
+            if (entry.group) return [entry.group];
+        }
+        return [];
+    }
 
     // Task A (access-policy-builder-ux Slice 2) — the row-rule repeater's
     // state. Every op here is one the compiler (src/access_policy_compile.py)
@@ -5763,6 +6411,17 @@
     var _AP_ROW_OPS_NO_VALUE = ['in_caller_groups', 'eq_caller_email', 'eq_caller_id'];
     let _apRowRules = [];
     let _apRowCombine = 'and';
+
+    /* #1979: is what sits in #apSql right now what these rules describe?
+       TRACKED, never re-derived -- reverse-parsing arbitrary policy SQL back
+       into builder rules is a general SQL parser this modal deliberately does
+       not have. The box is builder-authored only while a compile put it
+       there; a stored policy loaded on open, a restored revision, or hand-
+       typed SQL is not. `_apStoredSqlAtOpen` is what the table already
+       enforced when the modal opened, which is what "re-saving it unchanged"
+       and "replacing it with rules" are both measured against. */
+    let _apSqlFromBuilder = true;
+    let _apStoredSqlAtOpen = '';
 
     // Real schema + samples for the builder (Task 2's endpoint) — fetched
     // once per modal open, independent of which tab is showing.
@@ -5793,6 +6452,22 @@
         }
     }
 
+    /* #1979 follow-up: case-insensitive substring match on column name and
+       (when known) type — the same predicate shape as the register-table
+       wizard's `_matchesSearch` (register_table_form.js), reused here for
+       the column-mask list and the row-rule column picker below. */
+    function _apMatchesColumnFilter(name, type, search) {
+        if (!search) return true;
+        var n = (name || '').toLowerCase();
+        var t = (type || '').toLowerCase();
+        return n.indexOf(search) !== -1 || (!!t && t.indexOf(search) !== -1);
+    }
+
+    function _apColumnFilterValue() {
+        var el = document.getElementById('apColFilter');
+        return ((el && el.value) || '').trim().toLowerCase();
+    }
+
     function _apRenderColList() {
         var list = document.getElementById('apColList');
         if (!_apColumns.length) {
@@ -5804,10 +6479,20 @@
                   + 'one, once it has been synced. Write the policy on the Advanced SQL tab instead.</div>';
             return;
         }
+        var search = _apColumnFilterValue();
+        var visibleColumns = _apColumns.filter(function(col) {
+            return _apMatchesColumnFilter(col.name, col.type, search);
+        });
+        if (!visibleColumns.length) {
+            list.innerHTML = '<div class="form-hint" style="margin:0; padding:10px;">No columns match your filter.</div>';
+            return;
+        }
         var disabled = !_apTable || !_apIsEligible(_apTable);
-        list.innerHTML = _apColumns.map(function(col, i) {
+        var isRemoteTable = _apIsRemoteTable(_apTable);
+        list.innerHTML = visibleColumns.map(function(col, i) {
             var maskEntry = _apMaskState[col.name];
             var maskChoice = (maskEntry && typeof maskEntry === 'object') ? maskEntry.choice : (maskEntry || 'show');
+            var isText = _apIsTextColumnType(col.type);
             var samples = (col.samples || []).slice(0, 3).map(function(s) {
                 return '<span class="ap-sample-chip">' + escapeHtml(s) + '</span>';
             }).join('');
@@ -5815,17 +6500,35 @@
             var pii = col.pii ? '<span class="ap-col-pii">PII</span>' : '';
             var colArg = escapeHtmlAttr(JSON.stringify(col.name));
             var maskId = 'ap-col-mask-' + i;
-            var maskDropdownOptions = ['show', 'hide', 'nullify', 'hash', 'unmask'].map(function(m) {
-                return { value: m, label: _AP_MASK_LABELS[m] };
+            var maskChoices = ['show', 'hide', 'nullify', 'hash', 'unmask', 'last4', 'email_partial', 'pseudonymize_keyed', 'tiered'];
+            var maskDropdownOptions = maskChoices.map(function(m) {
+                var meta = _apMaskOptionMeta(m, isText, isRemoteTable);
+                return { value: m, label: _AP_MASK_LABELS[m], disabled: meta.disabled, title: meta.title };
             });
             var options = maskDropdownOptions.map(function(o) {
-                return '<option value="' + o.value + '"' + (o.value === maskChoice ? ' selected' : '') + '>' + o.label + '</option>';
+                return _apMaskOptionHtml(o, maskChoice);
             }).join('');
-            var groupInput = (maskChoice === 'unmask')
-                ? '<input type="text" class="form-input ap-unmask-group" placeholder="group names, comma-separated" '
+            // The custom `.ds-dropdown` widget (ds_dropdown.js) has no concept
+            // of a disabled menu item -- pairing it with a `<select>` that DOES
+            // carry disabled options here would let the admin pick a mask
+            // through the pretty widget that the native control (and the
+            // server) both refuse. Falling back to the plain native select
+            // when any option is disabled keeps the refusal real; most
+            // text/PII columns carry no disabled option and keep the
+            // enhanced widget unchanged.
+            var anyOptionDisabled = maskDropdownOptions.some(function(o) { return o.disabled; });
+            var useEnhancedDropdown = !disabled && !anyOptionDisabled;
+            var groupsCapable = _apGroupsCapableMask(maskChoice);
+            var currentGroups = _apExtractGroups(maskEntry);
+            var groupInput = groupsCapable
+                ? '<label class="ap-mask-groups-label form-hint" style="margin:0;">Reveal to groups'
+                  + '<input type="text" class="form-input ap-mask-groups" placeholder="group names, comma-separated" '
                   + (disabled ? 'disabled ' : '')
-                  + 'value="' + escapeHtmlAttr((maskEntry && Array.isArray(maskEntry.groups) ? maskEntry.groups.join(', ') : '')) + '" '
-                  + 'oninput="_apOnUnmaskGroupChange(' + colArg + ', this.value)">'
+                  + 'value="' + escapeHtmlAttr(currentGroups.join(', ')) + '" '
+                  + 'oninput="_apOnMaskGroupsChange(' + colArg + ', this.value)"></label>'
+                : '';
+            var tierEditor = (maskChoice === 'tiered')
+                ? _apRenderTierEditor(col.name, colArg, _apTierEntry(col.name), isText, isRemoteTable, disabled)
                 : '';
             return ''
                 + '<div class="ap-col-row">'
@@ -5842,12 +6545,13 @@
                 // none} in paper-skin.css doesn't check `disabled`, so adding
                 // the class without a paired dropdown would hide the control
                 // with nothing to replace it.
-                +       '<select id="' + maskId + '" class="form-input' + (disabled ? '' : ' ds-dropdown-native') + '" ' + (disabled ? 'disabled ' : '')
+                +       '<select id="' + maskId + '" class="form-input' + (useEnhancedDropdown ? ' ds-dropdown-native' : '') + '" ' + (disabled ? 'disabled ' : '')
                 +         'onchange="_apOnMaskChange(' + colArg + ', this.value)">' + options + '</select>'
-                +       (disabled ? '' : _dropdownMarkupHtml(maskId + '-dd', maskId, col.name + ' mask', maskDropdownOptions, maskChoice))
+                +       (useEnhancedDropdown ? _dropdownMarkupHtml(maskId + '-dd', maskId, col.name + ' mask', maskDropdownOptions, maskChoice) : '')
                 +     '</span>'
                 +     groupInput
                 +   '</div>'
+                +   tierEditor
                 + '</div>';
         }).join('');
         if (window.dsDropdownInit) list.querySelectorAll('.ds-dropdown').forEach(window.dsDropdownInit);
@@ -5856,29 +6560,154 @@
     function _apOnMaskChange(colName, maskValue) {
         if (maskValue === 'show') {
             delete _apMaskState[colName];
-        } else if (maskValue === 'unmask') {
-            var prev = _apMaskState[colName];
-            var prevGroups = [];
-            if (prev && typeof prev === 'object') {
-                if (Array.isArray(prev.groups)) {
-                    prevGroups = prev.groups;
-                } else if (prev.group) {
-                    prevGroups = [prev.group];
-                }
-            }
-            _apMaskState[colName] = { choice: 'unmask', groups: prevGroups };
+        } else if (maskValue === 'tiered') {
+            var prevTiered = _apTierEntry(colName);
+            _apMaskState[colName] = prevTiered || {
+                choice: 'tiered',
+                tiers: [{ groups: [], reveal: 'show' }],
+                default: 'nullify',
+            };
         } else {
-            _apMaskState[colName] = maskValue;
+            var prevGroups = _apExtractGroups(_apMaskState[colName]);
+            _apMaskState[colName] = prevGroups.length ? { choice: maskValue, groups: prevGroups } : maskValue;
         }
         _apRenderColList();
         _apScheduleCompile();
     }
 
-    function _apOnUnmaskGroupChange(colName, groupValue) {
+    // The `groups` modifier -- any value-producing mask, `unmask` included
+    // (kept as its own spelling server-side, same shape here).
+    function _apOnMaskGroupsChange(colName, groupValue) {
+        var groups = groupValue.split(',').map(function(g) { return g.trim(); }).filter(Boolean);
         var entry = _apMaskState[colName];
-        if (entry && typeof entry === 'object') {
-            entry.groups = groupValue.split(',').map(function(g) { return g.trim(); }).filter(Boolean);
+        var choice = (entry && typeof entry === 'object') ? entry.choice : (entry || 'show');
+        _apMaskState[colName] = { choice: choice, groups: groups };
+        _apScheduleCompile();
+    }
+
+    // ── Tiered mask editor ── an ordered chain of (groups, reveal) tiers plus
+    // a default, compiled server-side into one CASE chain
+    // (src/access_policy_compile.py::_tiered_expr). Validation messages below
+    // mirror that compiler's own refusals, so the admin sees them before the
+    // 422 a save-time compile would otherwise be the first to report.
+    function _apTierEntry(colName) {
+        var e = _apMaskState[colName];
+        return (e && typeof e === 'object' && e.choice === 'tiered') ? e : null;
+    }
+
+    function _apTierValidationMessage(entry) {
+        if (!entry || entry.choice !== 'tiered') return '';
+        if (!entry.tiers || !entry.tiers.length) {
+            return 'Add at least one tier — a tiered mask needs at least one group/reveal pair.';
         }
+        for (var i = 0; i < entry.tiers.length; i++) {
+            if (!entry.tiers[i].groups || !entry.tiers[i].groups.length) {
+                return 'Every tier needs at least one group — an empty group list matches nobody.';
+            }
+        }
+        if (!entry.default || entry.default === 'show' || entry.default === 'hide') {
+            return "Choose a default mask other than 'Show'/'Hide' — the default is what everyone "
+                + 'outside the tiers sees, and a no-op or an absent column cannot be conditional.';
+        }
+        return '';
+    }
+
+    function _apRenderTierEditor(colName, colArg, entry, isText, isRemoteTable, disabled) {
+        var tiers = (entry && entry.tiers) || [];
+        var revealOptions = ['show'].concat(_AP_TIER_REVEAL_MASKS).map(function(m) {
+            var meta = _apMaskOptionMeta(m, isText, isRemoteTable);
+            return { value: m, label: m === 'show' ? 'Show (verbatim)' : _AP_MASK_LABELS[m], disabled: meta.disabled, title: meta.title };
+        });
+        var defaultOptions = _AP_TIER_REVEAL_MASKS.map(function(m) {
+            var meta = _apMaskOptionMeta(m, isText, isRemoteTable);
+            return { value: m, label: _AP_MASK_LABELS[m], disabled: meta.disabled, title: meta.title };
+        });
+        var rows = tiers.map(function(tier, idx) {
+            var revealSelect = revealOptions.map(function(o) { return _apMaskOptionHtml(o, tier.reveal || 'show'); }).join('');
+            return ''
+                + '<div class="ap-tier-row">'
+                +   '<input type="text" class="form-input ap-tier-groups" placeholder="group names, comma-separated" '
+                +     (disabled ? 'disabled ' : '')
+                +     'value="' + escapeHtmlAttr((tier.groups || []).join(', ')) + '" '
+                +     'oninput="_apOnTierGroupsChange(' + colArg + ', ' + idx + ', this.value)">'
+                +   '<select class="form-input ap-tier-reveal" ' + (disabled ? 'disabled ' : '')
+                +     'onchange="_apOnTierRevealChange(' + colArg + ', ' + idx + ', this.value)">' + revealSelect + '</select>'
+                +   '<button type="button" class="btn btn-secondary btn-sm ap-tier-move" ' + (disabled ? 'disabled ' : '')
+                +     'onclick="_apMoveTier(' + colArg + ', ' + idx + ', -1)" aria-label="Move tier up">&uarr;</button>'
+                +   '<button type="button" class="btn btn-secondary btn-sm ap-tier-move" ' + (disabled ? 'disabled ' : '')
+                +     'onclick="_apMoveTier(' + colArg + ', ' + idx + ', 1)" aria-label="Move tier down">&darr;</button>'
+                +   '<button type="button" class="btn btn-secondary btn-sm ap-tier-remove" ' + (disabled ? 'disabled ' : '')
+                +     'onclick="_apRemoveTier(' + colArg + ', ' + idx + ')" aria-label="Remove tier">&times;</button>'
+                + '</div>';
+        }).join('');
+        var defaultSelect = defaultOptions.map(function(o) { return _apMaskOptionHtml(o, (entry && entry.default) || ''); }).join('');
+        var message = _apTierValidationMessage(entry);
+        return ''
+            + '<div class="ap-tier-editor">'
+            +   '<div class="form-hint" style="margin:4px 0;">Tiered reveal -- first matching tier wins, top to bottom.</div>'
+            +   '<div class="ap-tier-list">' + rows + '</div>'
+            +   '<button type="button" class="btn btn-secondary btn-sm" ' + (disabled ? 'disabled ' : '')
+            +     'onclick="_apAddTier(' + colArg + ')">Add tier</button>'
+            +   '<label class="ap-tier-default form-hint" style="margin:8px 0 0;">Default (everyone else)'
+            +     '<select class="form-input" ' + (disabled ? 'disabled ' : '')
+            +       'onchange="_apOnTierDefaultChange(' + colArg + ', this.value)">'
+            +       '<option value="" disabled' + (!entry || !entry.default ? ' selected' : '') + '>Choose a default…</option>'
+            +       defaultSelect
+            +     '</select>'
+            +   '</label>'
+            +   '<div class="form-hint form-hint--warn ap-tier-validation"' + (message ? '' : ' style="display:none;"') + '>'
+            +     escapeHtml(message) + '</div>'
+            + '</div>';
+    }
+
+    function _apAddTier(colName) {
+        var e = _apTierEntry(colName);
+        if (!e) return;
+        e.tiers.push({ groups: [], reveal: 'show' });
+        _apRenderColList();
+        _apScheduleCompile();
+    }
+
+    function _apRemoveTier(colName, idx) {
+        var e = _apTierEntry(colName);
+        if (!e) return;
+        e.tiers.splice(idx, 1);
+        _apRenderColList();
+        _apScheduleCompile();
+    }
+
+    function _apMoveTier(colName, idx, dir) {
+        var e = _apTierEntry(colName);
+        if (!e) return;
+        var j = idx + dir;
+        if (j < 0 || j >= e.tiers.length) return;
+        var tmp = e.tiers[idx];
+        e.tiers[idx] = e.tiers[j];
+        e.tiers[j] = tmp;
+        _apRenderColList();
+        _apScheduleCompile();
+    }
+
+    function _apOnTierGroupsChange(colName, idx, value) {
+        var e = _apTierEntry(colName);
+        if (!e || !e.tiers[idx]) return;
+        e.tiers[idx].groups = value.split(',').map(function(g) { return g.trim(); }).filter(Boolean);
+        _apScheduleCompile();
+    }
+
+    function _apOnTierRevealChange(colName, idx, value) {
+        var e = _apTierEntry(colName);
+        if (!e || !e.tiers[idx]) return;
+        e.tiers[idx].reveal = value;
+        _apRenderColList();
+        _apScheduleCompile();
+    }
+
+    function _apOnTierDefaultChange(colName, value) {
+        var e = _apTierEntry(colName);
+        if (!e) return;
+        e.default = value;
+        _apRenderColList();
         _apScheduleCompile();
     }
 
@@ -5892,8 +6721,13 @@
         var combineSelect = document.getElementById('apRowCombine');
         var disabled = !_apTable || !_apIsEligible(_apTable);
         if (!_apRowRules.length) {
-            list.innerHTML = '<div class="form-hint" style="margin:0 0 8px; padding:0;">'
-                + 'No row rules — every caller sees every row.</div>';
+            // #1979: never claim "every caller sees every row" while a policy
+            // this builder cannot represent is what would actually be saved.
+            // #apNotRepresentableNotice above carries that state instead.
+            list.innerHTML = _apBuilderDescribesSql()
+                ? '<div class="form-hint" style="margin:0 0 8px; padding:0;">'
+                  + 'No row rules — every caller sees every row.</div>'
+                : '';
         } else {
             list.innerHTML = _apRowRules.map(function(rule, i) {
                 var colId = 'ap-rr-col-' + i;
@@ -5930,6 +6764,13 @@
                 return ''
                     + '<div class="ap-rr-row">'
                     +   '<span class="ap-rr-col-wrap">'
+                    // #1979 follow-up: type-to-filter for the column dropdown's
+                    // menu items, matching the register-table wizard's "Filter
+                    // tables…" box. Skipped alongside the dropdown itself when
+                    // disabled — same reasoning as the comment above.
+                    +     (disabled ? '' : '<input type="text" class="ap-rr-col-filter" id="' + colId + '-filter" '
+                          + 'placeholder="Filter columns…" aria-label="Filter columns for rule ' + (i + 1) + '" '
+                          + 'oninput="_apFilterRowRuleColumnMenu(this)">')
                     +     '<select id="' + colId + '" class="form-input ap-rr-col' + (disabled ? '' : ' ds-dropdown-native') + '" ' + (disabled ? 'disabled ' : '')
                     +       'onchange="_apOnRowRuleColumnChange(' + i + ', this.value)">' + colOptions + '</select>'
                     +     (disabled ? '' : _dropdownMarkupHtml(colId + '-dd', colId, 'Column', colDropdownOptions, rule.column))
@@ -5959,6 +6800,70 @@
         if (addBtn) addBtn.disabled = disabled;
     }
 
+    /* #1979 — does the builder describe what is in the SQL box? An empty
+       box (a table with no policy) is described by an empty rule set; anything
+       else only when a compile put it there. No SQL is parsed: authorship is
+       recorded at the two moments it can change (a compile lands, the admin
+       types). */
+    function _apBuilderDescribesSql() {
+        return !_apCurrentSql() || _apSqlFromBuilder;
+    }
+
+    function _apCurrentSql() {
+        var el = document.getElementById('apSql');
+        return el ? String(el.value || '').trim() : '';
+    }
+
+    /* Save would re-store, verbatim, the policy this table already enforces
+       and that the builder never authored — nothing about it is the admin's
+       edit, so #1430's "this filters nothing" nudge has no authored body to
+       judge and must not fire on it. */
+    function _apSqlIsUntouchedStoredPolicy() {
+        return !!_apStoredSqlAtOpen && !_apSqlFromBuilder && _apCurrentSql() === _apStoredSqlAtOpen;
+    }
+
+    /* The one destructive path in this modal: builder-authored SQL is about
+       to overwrite a stored policy the builder did not write. */
+    function _apBuilderWouldReplaceStoredSql() {
+        return !!_apStoredSqlAtOpen && _apSqlFromBuilder && _apCurrentSql() !== _apStoredSqlAtOpen;
+    }
+
+    /* The Builder tab's honesty block. Static strings only — no policy text
+       is ever interpolated in here, so innerHTML carries nothing off the wire.
+       Re-renders the row list only when it is EMPTY (its "no row rules" copy
+       flips with this state); an empty list holds no focusable input, so this
+       can never steal focus from a value the admin is typing. */
+    function _apRenderRepresentationNotice() {
+        var el = document.getElementById('apNotRepresentableNotice');
+        if (!el) return;
+        if (_apBuilderWouldReplaceStoredSql()) {
+            el.innerHTML = 'These rules will REPLACE the SQL policy currently saved on this table when you '
+                + 'press Save policy — the stored SQL is overwritten, not merged. '
+                + '<button type="button" class="btn btn-secondary btn-sm" id="apShowPolicySql" '
+                + 'onclick="apSwitchTab(\'sql\')">Show the SQL</button>';
+            el.style.display = '';
+        } else if (_apBuilderDescribesSql()) {
+            el.innerHTML = '';
+            el.style.display = 'none';
+        } else if (_apSqlIsUntouchedStoredPolicy()) {
+            el.innerHTML = 'This policy was written as SQL and cannot be shown as rules. It is enforced as '
+                + 'written — view or edit it on the Advanced SQL tab. Adding a rule here replaces it. '
+                + '<button type="button" class="btn btn-secondary btn-sm" id="apShowPolicySql" '
+                + 'onclick="apSwitchTab(\'sql\')">Open Advanced SQL</button>';
+            el.style.display = '';
+        } else {
+            // Hand-written (or restored) SQL that is not yet saved: same
+            // honesty, but it is not "enforced as written" — nothing is
+            // enforced until Save policy.
+            el.innerHTML = 'The SQL on the Advanced SQL tab was written by hand and cannot be shown as rules. '
+                + 'It is what Save policy will store — view or edit it there. Adding a rule here replaces it. '
+                + '<button type="button" class="btn btn-secondary btn-sm" id="apShowPolicySql" '
+                + 'onclick="apSwitchTab(\'sql\')">Open Advanced SQL</button>';
+            el.style.display = '';
+        }
+        if (!_apRowRules.length) _apRenderRowRules();
+    }
+
     function _apAddRowRule() {
         _apRowRules.push({ column: (_apColumns[0] && _apColumns[0].name) || '', op: 'eq', value: '' });
         _apRenderRowRules();
@@ -5974,6 +6879,40 @@
     function _apOnRowRuleColumnChange(index, value) {
         if (_apRowRules[index]) _apRowRules[index].column = value;
         _apScheduleCompile();
+    }
+
+    /* #1979 follow-up: the type-to-filter box above the column dropdown only
+       ever hides/shows `.ds-dropdown-menu-item`s in place — it never touches
+       `_apRowRules`, `_apColumns`, or the paired `<select>`'s value, so the
+       rule's compiled-SQL contract is unaffected by whatever the admin
+       happened to type while picking a column. */
+    function _apFilterRowRuleColumnMenu(inputEl) {
+        var wrap = inputEl.closest('.ap-rr-col-wrap');
+        if (!wrap) return;
+        var menu = wrap.querySelector('.ds-dropdown-menu');
+        if (!menu) return;
+        var search = inputEl.value.trim().toLowerCase();
+        var items = Array.prototype.slice.call(menu.querySelectorAll('.ds-dropdown-menu-item'));
+        var anyVisible = false;
+        items.forEach(function (item) {
+            var name = item.getAttribute('data-value') || item.textContent || '';
+            var match = _apMatchesColumnFilter(name, '', search);
+            item.hidden = !match;
+            if (match) anyVisible = true;
+        });
+        var empty = menu.querySelector('.ap-rr-col-filter-empty');
+        if (!anyVisible) {
+            if (!empty) {
+                empty = document.createElement('li');
+                empty.className = 'ap-rr-col-filter-empty';
+                empty.setAttribute('role', 'presentation');
+                empty.textContent = 'No columns match your filter.';
+                menu.appendChild(empty);
+            }
+            empty.hidden = false;
+        } else if (empty) {
+            empty.hidden = true;
+        }
     }
 
     function _apOnRowRuleOpChange(index, value) {
@@ -6074,6 +7013,10 @@
             var body = await r.json();
             if (mySeq !== _apCompileSeq) return;
             document.getElementById('apSql').value = body.sql || '';
+            // #1979: the box now holds what these rules describe — until the
+            // admin types over it (apSqlEdited) or the modal reopens.
+            _apSqlFromBuilder = true;
+            _apRenderRepresentationNotice();
             _apRenderCompileWarnings(body.warnings);
             _apHideSaveError();
         } catch (err) {
@@ -6138,9 +7081,25 @@
         // The admin is taking over the SQL; any queued or in-flight builder
         // compile is now stale and must not overwrite their edits.
         _apCancelPendingCompile();
+        // #1979: and the rules on the Builder tab no longer describe the body
+        // that would be saved, so that tab has to stop implying they do.
+        _apSqlFromBuilder = false;
+        _apRenderRepresentationNotice();
         if (!_apCompileError) return;
         _apCompileError = null;
         _apHideSaveError();
+    }
+
+    // Cheap client-side mirror of compile_policy()'s own no-op warning
+    // ("not rules and not excluded and not derived") — WHERE/EXCLUDE/CASE
+    // cover every shape the Builder itself can emit, and a hand-written
+    // Advanced SQL body gets the same nudge. This never blocks a save (a
+    // mask-only or row-only policy is legitimate) — it only makes a policy
+    // that quietly does nothing impossible to save without a second click,
+    // instead of silently landing as a "Policy" chip that filters nothing.
+    function _apSqlFiltersOrMasksNothing(sql) {
+        var upper = sql.toUpperCase();
+        return !/\bWHERE\b/.test(upper) && !/\bEXCLUDE\b/.test(upper) && !/\bCASE\b/.test(upper);
     }
 
     async function apSavePolicy() {
@@ -6161,6 +7120,34 @@
             _apShowSaveError('access_policy_note is required whenever a policy is attached -- explain why '
                 + 'this policy exists so the next admin to find it knows whether it is safe to change.');
             return;
+        }
+
+        // #1979: the one destructive path — builder rules overwriting a SQL
+        // policy the builder never authored. Asked BEFORE the no-op nudge
+        // below: losing a hand-written policy is the bigger surprise. (Both
+        // can fire on the same save; replacing a real policy with one that
+        // filters nothing is exactly the case that earns two questions.)
+        if (sql && _apBuilderWouldReplaceStoredSql()) {
+            var replace = await confirmModal({
+                message: 'The rules in the Builder will REPLACE the SQL policy currently saved on this '
+                    + 'table. The stored SQL is overwritten, not merged — the previous version stays '
+                    + 'in this table\'s policy history. Continue?',
+                confirmText: 'Replace policy',
+            });
+            if (!replace) return;
+        }
+
+        // #1979: skipped while the box still holds, verbatim, the stored
+        // policy the builder never authored — re-saving what is already
+        // enforced (to fix its note, say) is not the admin authoring a no-op
+        // policy, and this heuristic would be judging a body they never wrote.
+        if (sql && !_apSqlIsUntouchedStoredPolicy() && _apSqlFiltersOrMasksNothing(sql)) {
+            var proceed = await confirmModal({
+                message: 'This policy does not filter any rows or mask any columns — everyone with '
+                    + 'access to this table will see everything. Save anyway?',
+                confirmText: 'Save anyway',
+            });
+            if (!proceed) return;
         }
 
         var btn = document.getElementById('apSaveBtn');
@@ -6293,6 +7280,61 @@
         }
     }
 
+    // review-plan P1.4 — sweeps the policy above (or the stored one, when
+    // the textarea is blank) across every REAL user_groups row in one call,
+    // so a CASE with a missing/wrong ELSE branch shows up as an unexpected
+    // group seeing the whole table instead of requiring the admin to run
+    // apRunPreview() once per group by hand.
+    async function apRunPreviewAllGroups() {
+        if (!_apTable) return;
+        var sql = document.getElementById('apSql').value.trim();
+        var resultEl = document.getElementById('apPreviewGroupsResult');
+        var payload = sql ? { sql: sql } : {};
+
+        resultEl.style.display = '';
+        resultEl.innerHTML = '<div class="form-hint">Running preview for every group…</div>';
+        try {
+            var r = await fetch('/api/admin/registry/' + encodeURIComponent(_apTable.id) + '/policy/preview-groups', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload),
+            });
+            var body = await r.json().catch(function() { return {}; });
+            if (!r.ok) {
+                resultEl.innerHTML = '<div class="form-hint form-hint--danger" style="margin-bottom:0;">'
+                    + escapeHtml(typeof body.detail === 'string' ? body.detail : (body.detail || body.error || ('HTTP ' + r.status)))
+                    + '</div>';
+                return;
+            }
+            resultEl.innerHTML = _apRenderPreviewGroupsResult(body);
+        } catch (err) {
+            resultEl.innerHTML = '<div class="form-hint form-hint--danger" style="margin-bottom:0;">'
+                + 'Network error: ' + escapeHtml(err.message) + '</div>';
+        }
+    }
+
+    function _apRenderPreviewGroupsResult(body) {
+        if (body.mapping_warning) {
+            return '<div class="form-hint form-hint--warn" style="margin:8px 0 0;">'
+                + escapeHtml(body.mapping_warning) + '</div>';
+        }
+        var rowsTotal = body.rows_total;
+        var groups = body.groups || [];
+        var html = '<div style="margin-top:8px; max-height:220px; overflow:auto; '
+                 + 'border:1px solid var(--ds-border); border-radius:6px;">';
+        html += '<table class="data-table"><thead><tr><th>Group</th><th>Rows visible</th></tr></thead><tbody>';
+        groups.forEach(function(g) {
+            var everything = g.rows_visible !== null && rowsTotal > 0 && g.rows_visible === rowsTotal;
+            var cell = g.error
+                ? '<span class="form-hint form-hint--danger" style="margin:0;">' + escapeHtml(g.error) + '</span>'
+                : formatNumber(g.rows_visible) + ' / ' + formatNumber(rowsTotal);
+            html += '<tr' + (everything ? ' style="color:var(--ds-accent-warn-ink);"' : '') + '>'
+                + '<td>' + escapeHtml(g.group) + '</td><td>' + cell + '</td></tr>';
+        });
+        html += '</tbody></table></div>';
+        return html;
+    }
+
     // Task B (access-policy-builder-ux Slice 2) — best-effort before/after
     // matching. There is no guaranteed PK (design doc §13.1), so this is a
     // heuristic, not an exact join: for each raw row, pick the not-yet-
@@ -6357,6 +7399,10 @@
     }
 
     function _apRenderPreviewResult(body) {
+        if (body.mapping_warning) {
+            return '<div class="form-hint form-hint--warn" style="margin:0;">'
+                + escapeHtml(body.mapping_warning) + '</div>';
+        }
         var cols = body.columns || [];
         var hiddenCols = cols.filter(function(c) { return c.hidden; }).map(function(c) { return c.name; });
         var visibleColNames = cols.filter(function(c) { return !c.hidden; }).map(function(c) { return c.name; });
@@ -6374,6 +7420,17 @@
         if (hiddenCols.length) {
             html += '<div class="form-hint" style="margin-top:6px;">Hidden columns: '
                  + escapeHtml(hiddenCols.join(', ')) + '</div>';
+        }
+        // K1-sweep finding 3 (#1979): a remote table on a transpiling engine
+        // (BigQuery, Databricks) runs THIS form on a live read, not the
+        // DuckDB text in #apSql above -- `null` for local/materialized
+        // tables and for remote Snowflake (see `_policy_preview_dialect`
+        // server-side). Collapsed by default: secondary to the row/column
+        // preview above, useful mainly when something looks off.
+        if (body.transpiled) {
+            html += '<details class="ap-preview-transpiled"><summary>Transpiled for '
+                 + escapeHtml(body.transpiled.dialect) + '</summary><pre>'
+                 + escapeHtml(body.transpiled.relation_sql) + '</pre></details>';
         }
         if (!comparable && policiedRows.length) {
             html += '<div class="form-hint ap-preview-note">Showing what this persona sees. A '
@@ -6427,42 +7484,348 @@
     }
 
     // Recent policy edits (design doc §13: "History inline: the last N
-    // audit_log rows with the note"). Reads the existing Activity Center
-    // API (GET /api/admin/activity, resource + action_prefix filters) —
-    // zero new backend surface — rather than
-    // templates/macros/_detail.html's version_timeline(): that macro
-    // renders server-side from a Jinja-built `versions` list, but this
-    // page's rows (and which table's modal is open) are chosen entirely at
-    // runtime by the operator, so there is no per-table `versions` list to
-    // pass at template-render time. `since_minutes` is capped at 30 days
-    // (the endpoint's own max) — an edit older than that won't show here.
+    // rows with the note"), from two sources in preference order:
+    //
+    //   1. GET /api/admin/registry/{id}/policy/revisions — the revision
+    //      store (#1979). One row per saved state, carrying the SQL BODY,
+    //      which is what a "Restore" button needs to put back.
+    //   2. GET /api/admin/activity — the audit-derived history this panel
+    //      originally used, kept as the fallback. It can say who edited
+    //      the policy and when, but never WHAT it was: #1979 redacted
+    //      `access_policy_sql` out of `update_table` params (content never
+    //      enters the audit trail), so its rows are read-only by
+    //      construction and carry no Restore action.
+    //
+    // (2) covers a DuckDB-backed instance, where `access_policy_revisions`
+    // is a Postgres-only table and the endpoint answers a typed 501 — and
+    // a table whose policy predates this store and has not been edited
+    // since, which has audit rows but no revisions yet. Falling back beats
+    // an empty section, which would read as "never edited".
+    var _apRevisions = [];
+
     async function _apLoadHistory(tableId) {
         var section = document.getElementById('apHistorySection');
         var list = document.getElementById('apHistoryList');
         section.style.display = 'none';
         list.innerHTML = '';
+        _apRevisions = [];
+        _apHideRestoreNotice();
+        // Whether the revisions store answered a typed 501 (DuckDB backend,
+        // #1979) rather than "no revisions yet" — the fallback below uses
+        // this to say, in one line, WHY it can only list edits and not diff
+        // them: the audit trail never carried a body to diff from.
+        var revisionsUnavailable = false;
+        try {
+            var rr = await fetch('/api/admin/registry/' + encodeURIComponent(tableId)
+                + '/policy/revisions?limit=10', { credentials: 'same-origin' });
+            if (rr.ok && _apRenderRevisions(await rr.json())) return;
+            revisionsUnavailable = rr.status === 501;
+        } catch (e) {
+            // Fall through to the audit-derived history below.
+        }
+        await _apLoadHistoryFromActivity(tableId, revisionsUnavailable);
+    }
+
+    // The first ~240 characters of a stored policy body. The panel is a
+    // CHOOSER — enough to tell two edits apart — not a viewer; restoring
+    // puts the full body in the editor, which is where it is read.
+    function _apSqlPeek(sql) {
+        var text = String(sql || '').replace(/\s+/g, ' ').trim();
+        return text.length > 240 ? text.slice(0, 240) + '…' : text;
+    }
+
+    // ── Per-revision diff (MonikaFeigler's finding on #1979: a history
+    // panel with restore-on-top-of-a-blind-list still cannot say WHAT
+    // changed between two saves). A small, self-contained LCS line diff —
+    // no library, because a policy body is a handful of SQL lines, not a
+    // file worth Myers' bookkeeping. Bounded at `_AP_DIFF_MAX_LINES` per
+    // side: the DP table is O(n*m) time AND space, and a policy pasted from
+    // somewhere unbounded (not this editor's own textarea) must not turn
+    // "open the history panel" into a multi-second hang.
+    var _AP_DIFF_MAX_LINES = 400;
+
+    // Returns an array of {type: 'same'|'add'|'del', text} describing how
+    // `newText` differs from `oldText`, one line at a time, or `null` when
+    // either side exceeds the bound above (the caller renders a "too large"
+    // note instead of paying for the table).
+    function _apDiffLines(oldText, newText) {
+        // An empty string is ZERO lines, not one empty line -- '' would
+        // otherwise split() into [''] and show as a spurious "+ " (an added
+        // blank line) on top of every genuinely removed line, e.g. when
+        // diffing a cleared policy against its predecessor.
+        var a = oldText ? String(oldText).split('\n') : [];
+        var b = newText ? String(newText).split('\n') : [];
+        if (a.length > _AP_DIFF_MAX_LINES || b.length > _AP_DIFF_MAX_LINES) return null;
+        var n = a.length, m = b.length, i, j;
+        // Classic LCS length table, walked backwards so the greedy trace
+        // below always has both neighbours computed.
+        var lcs = new Array(n + 1);
+        for (i = 0; i <= n; i++) lcs[i] = new Array(m + 1).fill(0);
+        for (i = n - 1; i >= 0; i--) {
+            for (j = m - 1; j >= 0; j--) {
+                lcs[i][j] = (a[i] === b[j])
+                    ? lcs[i + 1][j + 1] + 1
+                    : Math.max(lcs[i + 1][j], lcs[i][j + 1]);
+            }
+        }
+        var ops = [];
+        i = 0; j = 0;
+        while (i < n && j < m) {
+            if (a[i] === b[j]) {
+                ops.push({ type: 'same', text: a[i] });
+                i++; j++;
+            } else if (lcs[i + 1][j] >= lcs[i][j + 1]) {
+                ops.push({ type: 'del', text: a[i] });
+                i++;
+            } else {
+                ops.push({ type: 'add', text: b[j] });
+                j++;
+            }
+        }
+        while (i < n) { ops.push({ type: 'del', text: a[i] }); i++; }
+        while (j < m) { ops.push({ type: 'add', text: b[j] }); j++; }
+        return ops;
+    }
+
+    // Renders the line-diff `<pre>` body. Every line goes through
+    // `escapeHtml` before insertion — a policy body is admin-authored SQL,
+    // not trusted markup.
+    function _apRenderDiffBody(oldText, newText) {
+        var ops = _apDiffLines(oldText, newText);
+        if (!ops) {
+            return '<div class="form-hint">Diff too large to render here — use Restore to load '
+                + 'and inspect the full body instead.</div>';
+        }
+        var lines = ops.map(function(op) {
+            var cls = op.type === 'add' ? 'ap-diff-add' : (op.type === 'del' ? 'ap-diff-del' : 'ap-diff-same');
+            var prefix = op.type === 'add' ? '+ ' : (op.type === 'del' ? '- ' : '  ');
+            return '<span class="' + cls + '">' + escapeHtml(prefix + op.text) + '</span>';
+        }).join('');
+        return '<pre class="ap-history-diff">' + lines + '</pre>';
+    }
+
+    function _apMappingLabel(on) {
+        return on ? 'row/column mapping ON' : 'row/column mapping OFF';
+    }
+
+    // One always-visible line when the `policy_mapping` flag flipped between
+    // the two states being compared — a boolean toggle has no line-level
+    // diff, so it earns its own sentence rather than hiding inside the SQL
+    // block.
+    function _apMappingChangeLine(oldMapping, newMapping) {
+        if (!!oldMapping === !!newMapping) return '';
+        return '<div class="ap-history-mapping-change">Policy mapping: '
+            + escapeHtml(_apMappingLabel(oldMapping)) + ' → ' + escapeHtml(_apMappingLabel(newMapping))
+            + '</div>';
+    }
+
+    // One diff block comparing two saved states, `older` -> `newer` (both
+    // `{policy_sql, policy_note, policy_mapping, cleared}`-shaped, or
+    // `null`/`undefined` for "nothing recorded yet"). `label` is the
+    // `<summary>` text ("Diff vs previous" / "Diff vs current"). Returns
+    // '' when the two states are identical in every field this panel can
+    // compare — nothing to show.
+    function _apRenderRevisionDiff(older, newer, label) {
+        var oldSql = (older && !older.cleared) ? (older.policy_sql || '') : '';
+        var newSql = (newer && !newer.cleared) ? (newer.policy_sql || '') : '';
+        var oldNote = (older && older.policy_note) || '';
+        var newNote = (newer && newer.policy_note) || '';
+        var mappingLine = _apMappingChangeLine(older && older.policy_mapping, newer && newer.policy_mapping);
+        if (oldSql === newSql) {
+            if (oldNote === newNote && !mappingLine) return '';
+            // The most common "nothing to diff" shape: an admin re-saved
+            // the same body with a clarifying note. An empty diff block
+            // would read as a bug, not as "no SQL change".
+            var noteLine = oldNote === newNote ? '' : '<div class="form-hint">SQL unchanged — note changed.</div>';
+            return '<div class="ap-history-diffblock">' + noteLine + mappingLine + '</div>';
+        }
+        return '<details class="ap-history-diff-details"><summary>' + escapeHtml(label) + '</summary>'
+            + mappingLine + _apRenderDiffBody(oldSql, newSql) + '</details>';
+    }
+
+    // Renders the revision store's rows. Returns false when there is
+    // nothing to render, so the caller can fall back to the audit-derived
+    // history rather than showing an empty panel.
+    function _apRenderRevisions(body) {
+        var revisions = (body && body.revisions) || [];
+        if (!revisions.length) return false;
+        _apRevisions = revisions;
+        var list = document.getElementById('apHistoryList');
+        var html = revisions.map(function(rev, idx) {
+            var when = String(rev.saved_at || '').slice(0, 16).replace('T', ' ');
+            var who = rev.saved_by || 'unknown';
+            // `cleared` comes from the server (the revision's SQL is NULL),
+            // never from a falsiness check here — the same rule the API and
+            // the repository already agree on.
+            var summary = rev.cleared
+                ? 'cleared the policy'
+                : (rev.policy_note ? escapeHtml(rev.policy_note) : 'saved a policy (no note recorded)');
+            var row = '<div class="ap-history-row">'
+                + '<div class="ap-history-meta"><strong>' + escapeHtml(when) + '</strong> — '
+                + escapeHtml(who) + ': ' + summary + '</div>';
+            if (!rev.cleared) {
+                row += '<pre class="ap-history-sql">' + escapeHtml(_apSqlPeek(rev.policy_sql)) + '</pre>'
+                    + '<button type="button" class="btn btn-secondary btn-sm ap-history-restore" '
+                    + 'onclick="apRestoreRevision(' + idx + ')">Restore</button>';
+            }
+            // The newest row (idx 0) additionally diffs against the policy
+            // as it stands RIGHT NOW (`_apTable`, the row this modal was
+            // opened with) — the two are usually identical (a save both
+            // updates the registry row and appends a revision in the same
+            // transaction), so this block renders only when they diverge.
+            if (idx === 0 && _apTable) {
+                var current = {
+                    policy_sql: _apTable.access_policy_sql,
+                    policy_note: _apTable.access_policy_note,
+                    policy_mapping: _apTable.policy_mapping,
+                    cleared: !_apTable.access_policy_sql,
+                };
+                row += _apRenderRevisionDiff(rev, current, 'Diff vs current');
+            }
+            // Every other row diffs against the OLDER neighbour next to it
+            // in this newest-first list. The oldest row fetched has no
+            // older neighbour here: if the store truly holds nothing before
+            // it, say so; if `count` says there is more history than this
+            // capped page shows, diff against an empty baseline instead of
+            // silently omitting the block.
+            if (idx < revisions.length - 1) {
+                row += _apRenderRevisionDiff(revisions[idx + 1], rev, 'Diff vs previous');
+            } else if (body.count > revisions.length) {
+                row += _apRenderRevisionDiff(null, rev, 'Diff vs previous');
+            } else {
+                row += '<div class="form-hint ap-history-first">First recorded version.</div>';
+            }
+            return row + '</div>';
+        }).join('');
+        // `count` is the untruncated total: ten of thirty-four must never
+        // render as the whole history.
+        if (body.count > revisions.length) {
+            html += '<div class="form-hint ap-history-more">Showing the ' + revisions.length
+                + ' most recent of ' + body.count + ' saved versions.</div>';
+        }
+        list.innerHTML = html;
+        document.getElementById('apHistorySection').style.display = '';
+        return true;
+    }
+
+    // Restore is NOT a write. It loads the chosen version into the editor
+    // and stops there, so applying it goes through the ordinary Save: the
+    // §3.1 distribution interlock, the mandatory note, the static
+    // validator and the live LIMIT 0 probe all judge a restored body
+    // exactly as they judge a freshly typed one. A policy that was valid
+    // when it was saved is not necessarily valid now — the table may have
+    // become distributable, or lost a column the policy names — and a
+    // one-click reattach would be precisely the shape that skips the
+    // checks it most needs.
+    function apRestoreRevision(index) {
+        var rev = _apRevisions[index];
+        if (!rev) return;
+        document.getElementById('apSql').value = rev.policy_sql || '';
+        document.getElementById('apNote').value = rev.policy_note || '';
+        // Same bookkeeping a hand edit does: cancel any queued builder
+        // compile and clear the stale-compile guard, so the restored body
+        // is not overwritten by (or blocked behind) builder output.
+        apSqlEdited();
+        apSwitchTab('sql');
+        _apShowRestoreNotice(rev);
+        document.getElementById('apSql').focus();
+    }
+
+    function _apShowRestoreNotice(rev) {
+        var el = document.getElementById('apRestoreNotice');
+        var when = String(rev.saved_at || '').slice(0, 16).replace('T', ' ');
+        var who = rev.saved_by || 'unknown';
+        // textContent, not innerHTML: `saved_by` is free text off the wire.
+        el.textContent = 'Loaded the version saved ' + when + ' by ' + who
+            + '. Nothing has changed yet — review it and press Save policy to apply, '
+            + 'which re-runs every check a new policy goes through.';
+        el.style.display = '';
+    }
+
+    function _apHideRestoreNotice() {
+        var el = document.getElementById('apRestoreNotice');
+        if (!el) return;
+        el.style.display = 'none';
+        el.textContent = '';
+    }
+
+    // One /api/admin/activity page for a given action prefix, narrowed to
+    // this table and to the rows `keep` accepts. `since_minutes` is capped
+    // at 30 days (the endpoint's own max) — an edit older than that won't
+    // show. Returns [] on any failure: history is a convenience surface.
+    async function _apPolicyAuditRows(tableId, actionPrefix, keep) {
         try {
             var r = await fetch('/api/admin/activity?resource=' + encodeURIComponent(tableId)
-                + '&action_prefix=update_table&since_minutes=43200&limit=50', { credentials: 'same-origin' });
-            if (!r.ok) return;
+                + '&action_prefix=' + encodeURIComponent(actionPrefix)
+                + '&since_minutes=43200&limit=50', { credentials: 'same-origin' });
+            if (!r.ok) return [];
             var body = await r.json();
-            var rows = (body.rows || []).filter(function(row) {
-                var params = _apParseAuditParams(row);
-                var fields = (params && params.updated_fields) || [];
-                return fields.indexOf('access_policy_sql') !== -1 || fields.indexOf('access_policy_note') !== -1;
-            }).slice(0, 5);
+            return (body.rows || []).filter(keep).slice(0, 5);
+        } catch (e) {
+            return [];
+        }
+    }
+
+    // The audit-derived fallback (design doc §13's original "the last N
+    // audit_log rows with the note"). Read-only: `audit_log.params` masks
+    // the SQL body, so there is nothing here to restore FROM and these rows
+    // deliberately carry no Restore button — and, for the same reason,
+    // nothing to diff FROM either. `since_minutes` is capped at 30 days
+    // (the endpoint's own max) — an edit older than that won't show.
+    // `revisionsUnavailable` is true when the revision store answered a
+    // typed 501 (DuckDB backend) rather than "no revisions yet" — the one
+    // case worth a note, since it means diffing is unavailable on this
+    // instance for every table, not just one without history yet.
+    async function _apLoadHistoryFromActivity(tableId, revisionsUnavailable) {
+        var section = document.getElementById('apHistorySection');
+        var list = document.getElementById('apHistoryList');
+        try {
+            // Preferred source: the dedicated `access_policy.set` /
+            // `access_policy.clear` actions a policy write emits. A row
+            // written before those actions existed only carries the generic
+            // `update_table`, so that scan stays as the second pass — never
+            // unioned with the first, since ONE policy change writes both
+            // rows and merging them would double every recent entry.
+            var rows = await _apPolicyAuditRows(tableId, 'access_policy.', function(row) {
+                return row.action === 'access_policy.set' || row.action === 'access_policy.clear';
+            });
+            if (!rows.length) {
+                rows = await _apPolicyAuditRows(tableId, 'update_table', function(row) {
+                    var params = _apParseAuditParams(row);
+                    var fields = (params && params.updated_fields) || [];
+                    return fields.indexOf('access_policy_sql') !== -1 || fields.indexOf('access_policy_note') !== -1;
+                });
+            }
             if (!rows.length) return;
-            list.innerHTML = rows.map(function(row) {
+            var rowsHtml = rows.map(function(row) {
                 var params = _apParseAuditParams(row) || {};
                 var who = row.user_email || row.user_name || row.user_id || 'unknown';
                 var when = String(row.timestamp || '').slice(0, 16).replace('T', ' ');
-                var cleared = ('access_policy_sql' in params) && !params.access_policy_sql;
+                // #1979: audit_log.params masks `access_policy_sql` (it's
+                // SQL content, never audit content — see
+                // `app/api/admin.py::_SECRET_FIELDS`), so the value here is
+                // always the literal '***' (set) or '<empty>' (cleared),
+                // never null/''. A falsiness check would treat '<empty>' as
+                // truthy and misreport every clear as an update. A row from
+                // the dedicated actions says so in the action name itself.
+                var cleared = row.action === 'access_policy.clear' || params.access_policy_sql === '<empty>';
                 var summary = cleared
                     ? 'cleared the policy'
                     : (params.access_policy_note ? escapeHtml(params.access_policy_note) : 'updated the policy (no note recorded)');
-                return '<div class="ap-history-row"><strong>' + escapeHtml(when) + '</strong> — '
-                     + escapeHtml(who) + ': ' + summary + '</div>';
+                return '<div class="ap-history-row"><div class="ap-history-meta"><strong>'
+                     + escapeHtml(when) + '</strong> — ' + escapeHtml(who) + ': ' + summary
+                     + '</div></div>';
             }).join('');
+            // The revision store — the only source with bodies to diff — is
+            // unavailable on this backend, not merely empty for this table.
+            // Say so once, above the read-only list, rather than leaving an
+            // admin wondering why there's no "Diff vs previous" here.
+            if (revisionsUnavailable) {
+                rowsHtml = '<div class="form-hint ap-history-nodiff">This instance cannot store '
+                    + 'per-edit policy bodies, so these entries are read-only and cannot be diffed.</div>'
+                    + rowsHtml;
+            }
+            list.innerHTML = rowsHtml;
             section.style.display = '';
         } catch (e) {
             // History is a convenience surface — a failed fetch just leaves
@@ -6839,7 +8202,7 @@
     // filters and sorts against those without re-fetching.
     function _renderFlatTableRows(tables) {
         var html = ''
-          + '<table class="data-table" id="adminTablesFlat">'
+          + '<table class="data-table data-table--pinned-actions" id="adminTablesFlat">'
           + '<colgroup>'
           +   '<col style="width: 4%">'
           +   '<col style="width: 20%">'

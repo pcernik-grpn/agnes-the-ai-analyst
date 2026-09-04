@@ -304,7 +304,7 @@ def test_facts_neighbors_logs_audit_row(seeded_app, monkeypatch):
     import app.api.facts as facts_mod
 
     class _FakeRepo:
-        def neighbors(self, user, subject_id, edge_types=None, depth=1, fanout=100, limit=500):
+        def neighbors(self, user, subject_id, edge_types=None, depth=1, fanout=100, limit=500, include_claims=0):
             return {"nodes": [{"id": subject_id}], "edges": [], "truncated": {}}
 
     monkeypatch.setattr(facts_mod, "facts_repo", lambda: _FakeRepo())
@@ -320,13 +320,44 @@ def test_facts_neighbors_logs_audit_row(seeded_app, monkeypatch):
     assert _as_dict(rows[0]["params"])["node_count"] == 1
 
 
+def test_facts_edges_logs_audit_row(seeded_app, monkeypatch):
+    """TCRD-295: the relationship-shaped read logs like its siblings —
+    cataloged action, the requested type and the counts, never a quote."""
+    monkeypatch.setenv("AGNES_FACTS_ENABLED", "1")
+    import app.api.facts as facts_mod
+
+    class _FakeRepo:
+        def edges(self, user, *, edge_type, **kwargs):
+            return {
+                "nodes": [{"id": "a"}, {"id": "b"}],
+                "edges": [{"id": "e1", "src": "a", "dst": "b", "type": edge_type, "attrs": {}}],
+                "truncated": {"result": False, "extension": False, "claims": False},
+            }
+
+    monkeypatch.setattr(facts_mod, "facts_repo", lambda: _FakeRepo())
+
+    r = seeded_app["client"].post(
+        "/api/facts/edges", json={"edge_type": "knows", "include_claims": 1}, headers=_facts_headers(seeded_app)
+    )
+    assert r.status_code == 200, r.text
+
+    from src.repositories import audit_repo
+
+    rows, _ = audit_repo().query(action="facts.edges", limit=5)
+    assert rows
+    params = _as_dict(rows[0]["params"])
+    assert params["edge_type"] == "knows"
+    assert params["edge_count"] == 1 and params["node_count"] == 2
+    assert params["include_claims"] == 1
+
+
 def test_facts_claims_logs_audit_row(seeded_app, monkeypatch):
     monkeypatch.setenv("AGNES_FACTS_ENABLED", "1")
     import app.api.facts as facts_mod
 
     class _FakeRepo:
-        def claims(self, user, subject_id):
-            return {"claims": [{"id": "c1"}], "revealed": False}
+        def claims(self, user, subject_id, limit=25):
+            return {"claims": [{"id": "c1"}], "revealed": False, "limit_applied": False}
 
     monkeypatch.setattr(facts_mod, "facts_repo", lambda: _FakeRepo())
 
@@ -346,7 +377,7 @@ def test_facts_ingest_logs_audit_row(seeded_app, monkeypatch):
     import app.api.facts as facts_mod
 
     class _FakeRepo:
-        def ingest_batch(self, documents, full_documents, nodes, edges):
+        def ingest_batch(self, documents, full_documents, nodes, edges, run_orphan_sweep=True):
             return {
                 "claims_written": 3,
                 "claims_rejected": [],

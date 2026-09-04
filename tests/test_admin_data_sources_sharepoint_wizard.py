@@ -72,7 +72,15 @@ class TestThreeStepDrawer:
 
     def test_step2_has_anonymize_column_and_the_verbatim_note(self, seeded_app):
         body = _page(seeded_app)
-        assert "anonymize" in body
+        # The column is rendered by the wizard's externalized script, never
+        # by the template. Asserting "anonymize" on the response text alone
+        # used to pass off a COMMENT inside the page's inline <style>, which
+        # said nothing about the column existing; the styles now live in
+        # css/ds_page.css, so that accident is gone. Assert the script that
+        # actually draws it.
+        assert "anonymize" in Path("app/web/static/js/admin/data_sources_sharepoint_wizard.js").read_text(
+            encoding="utf-8"
+        )
         # The exact note text the spec requires (§13.2).
         assert "original file is not copied" in body
         assert "stores the extracted markdown" in body
@@ -82,11 +90,6 @@ class TestThreeStepDrawer:
         body = _page(seeded_app)
         assert "indexed but invisible" in body
         assert 'id="spw-share-rows"' in body
-
-    def test_step3_has_corpus_map_download(self, seeded_app):
-        body = _page(seeded_app)
-        assert 'id="spw-corpus-map-link"' in body
-        assert "corpus-map" in body
 
 
 class TestStep2MarkupTCRD240:
@@ -113,7 +116,45 @@ class TestStep2MarkupTCRD240:
             assert opt in body
 
 
-TEMPLATE = Path(__file__).resolve().parents[1] / "app" / "web" / "templates" / "admin_data_sources.html"
+class TestStep2SavedScopesAndGuidanceMarkup:
+    """Page-shell markers for the two 2026-09-01 fixes below: the "Saved
+    scopes" panel (`TestSavedScopesPanel`) and the discovery-forbidden
+    guidance box (`TestSavedSiteScopeVisibleOnReopen.
+    test_saved_site_renders_when_discovery_is_forbidden`)."""
+
+    def test_saved_scopes_panel_present_above_the_search_box(self, seeded_app):
+        body = _page(seeded_app)
+        pane2 = body.split('data-spw-pane="2"', 1)[1].split('data-spw-pane="3"', 1)[0]
+        assert 'id="spw-saved-scopes"' in pane2
+        assert pane2.index('id="spw-saved-scopes"') < pane2.index('id="spw-search-q"'), (
+            "reopening the wizard must not look like a blank slate — the saved-scope "
+            "panel has to be visible before anything else on the step"
+        )
+
+    def test_discovery_guidance_lives_inside_the_by_url_box(self, seeded_app):
+        body = _page(seeded_app)
+        wrap_idx = body.index('id="spw-site-by-url-wrap"')
+        guidance_idx = body.index('id="spw-discovery-guidance"', wrap_idx)
+        input_idx = body.index('id="spw-site-by-url"', guidance_idx)
+        assert wrap_idx < guidance_idx < input_idx, "guidance sits inside the by-URL box, above the input"
+        # It must never share the drawer's generic failure styling.
+        guidance_tag = body[guidance_idx - 60 : guidance_idx + 40]
+        assert "ds-wizard-error" not in guidance_tag
+
+
+#: The wizard's own script moved into a dedicated static file wholesale
+#: (perf follow-up, 2026-09-03) — the comment on `_sp_step2_slice` below
+#: explains why that made the old "slice up to the enclosing `</script>`"
+#: technique both unnecessary and unsafe (this file has none of its own).
+SHAREPOINT_WIZARD_JS = (
+    Path(__file__).resolve().parents[1]
+    / "app"
+    / "web"
+    / "static"
+    / "js"
+    / "admin"
+    / "data_sources_sharepoint_wizard.js"
+)
 
 
 def _node_run(script: str) -> str:
@@ -127,20 +168,22 @@ def _node_run(script: str) -> str:
 
 def _sp_step2_slice() -> str:
     """The shipped SharePoint wizard JS (state, step-1 wiring, step-2 tree
-    render/filter/server search, and step-3 share-preview render), sliced
-    from the template so these tests run the REAL shipped functions rather
-    than a copy that can drift. The slice runs through the END of the
-    wizard's own ``<script>`` block — step 1 and step 3 wiring ride along
-    even for a test that only exercises step 2 (it's all one contiguous
-    block) but every DOM id any of it reaches for resolves to a safe no-op
-    stub (see ``_HARNESS_PREAMBLE``), so it costs nothing to include and
-    keeps the slice a single honest contiguous range rather than a
-    hand-picked patchwork.
+    render/filter/server search, and step-3 share-preview render) — the
+    REAL shipped functions, not a copy that can drift.
+
+    Was a slice from the template up to the enclosing `</script>` — the
+    wizard's script is now its own dedicated static file (perf follow-up,
+    2026-09-03: `app/web/static/js/admin/data_sources_sharepoint_wizard.js`,
+    extracted wholesale since the wizard was ALREADY self-contained, per this
+    file's own module docstring), so the whole file IS the slice: no
+    `</script>` marker to hunt for, and no risk of accidentally running past
+    it into whatever static asset happens to load next. Step 1 and step 3
+    wiring ride along even for a test that only exercises step 2 (it's all
+    one contiguous file) but every DOM id any of it reaches for resolves to
+    a safe no-op stub (see ``_HARNESS_PREAMBLE``), so it costs nothing to
+    include.
     """
-    html = TEMPLATE.read_text(encoding="utf-8")
-    start = html.index('const SP_CONN_API = "/api/admin/source-connections";')
-    end = html.index("</script>", start)
-    return html[start:end]
+    return SHAREPOINT_WIZARD_JS.read_text(encoding="utf-8")
 
 
 #: Stubs for everything the sliced block reaches out to. Any DOM id NOT
@@ -150,10 +193,22 @@ def _sp_step2_slice() -> str:
 #: `tests/test_chat_files_drawer_ui.py`'s `_HARNESS_PREAMBLE`.
 _HARNESS_PREAMBLE = """
 function genericEl() {
+  // Real (not no-op) class tracking — `sp-search--emphasis` (the
+  // discovery-forbidden guidance) needs a `contains` check a test can
+  // assert on, not a stub that silently drops every call.
+  const _classes = new Set();
   const el = {
     value: "", disabled: false, checked: false, textContent: "",
     dataset: {}, style: {},
-    classList: { add(){}, remove(){}, toggle(){} },
+    classList: {
+      add(...cls) { cls.forEach((c) => _classes.add(c)); },
+      remove(...cls) { cls.forEach((c) => _classes.delete(c)); },
+      toggle(c, force) {
+        const on = force === undefined ? !_classes.has(c) : !!force;
+        if (on) _classes.add(c); else _classes.delete(c);
+      },
+      contains(c) { return _classes.has(c); },
+    },
     _handlers: {},
     addEventListener(evt, fn) { (el._handlers[evt] = el._handlers[evt] || []).push(fn); },
     dispatchEvent(e) {
@@ -183,6 +238,18 @@ const document = {
   querySelectorAll() { return []; },
 };
 
+// The page-level connection cache `spSeedManualSitesFromConnectionConfig`
+// reads (`loadConnections()` populates it, in an EARLIER <script> block not
+// part of this slice) — declared here, empty by default, so a test that
+// wants to exercise the seeding just assigns to it before calling
+// `spLoadScopesThenTree`.
+let _connections = [];
+// Same story for the page-level refresh functions the "Share & finish"
+// success path calls (`refreshSourcePipelines().then(loadConnections)`) —
+// defined in an EARLIER <script> block, not part of this slice.
+global.refreshSourcePipelines = async () => {};
+global.loadConnections = async () => {};
+
 let _fetchCalls = [];
 let _nextSearchResponse = null;
 global.fetch = async (url, opts) => {
@@ -200,6 +267,11 @@ global.fetch = async (url, opts) => {
     // spRenderTree(body.level); })` never throws or dangles an unhandled
     // rejection.
     return { ok: true, status: 200, json: async () => ({ level: "items", items: [] }) };
+  }
+  if (String(url).indexOf("/manual-sites") !== -1) {
+    const reqBody = JSON.parse(opts.body);
+    const site = { id: "site-" + reqBody.site_url, name: reqBody.site_url, web_url: reqBody.site_url };
+    return { ok: true, status: 201, json: async () => site };
   }
   const reqBody = JSON.parse(opts.body);
   const scope = {
@@ -603,7 +675,7 @@ class TestSavedSiteScopeVisibleOnReopen:
     cannot include it — under ``Sites.Selected`` discovery is 403-forbidden,
     and ``list_sites`` is first-page-only anyway. A site scope's
     ``source_scope_id`` IS the Graph site id ("host,siteCol,web" — the only
-    scope id with commas, see ``connectors/sharepoint/corpus_map._map_key``)
+    scope id with commas)
     and its ``display_path`` IS the site name, so the row is rebuildable
     from the scope alone. Regression: the row only rendered when live
     discovery happened to list it, so a reopened wizard showed
@@ -631,7 +703,10 @@ class TestSavedSiteScopeVisibleOnReopen:
             await _settle();
             process.stdout.write(JSON.stringify({
               html: document.getElementById("spw-tree").innerHTML,
-              errText: document.getElementById("spw-tree-error").textContent,
+              errShown: document.getElementById("spw-tree-error").style.display === "block",
+              guidanceText: document.getElementById("spw-discovery-guidance").textContent,
+              guidanceShown: document.getElementById("spw-discovery-guidance").style.display === "block",
+              emphasis: el("spw-site-by-url-wrap").classList.contains("sp-search--emphasis"),
             }));
             """
             % self._SITE_SCOPE
@@ -641,9 +716,13 @@ class TestSavedSiteScopeVisibleOnReopen:
         assert "checked" in html, "the saved site's checkbox must reflect its confirmed state"
         assert "data-spw-drill" in html, "the rebuilt site row must stay navigable (id IS the site id)"
         assert "my-site" in html, "the scope's collection badge must ride along"
-        # The discovery notice still shows — the row is real, the listing is
-        # still forbidden, both facts stand.
-        assert "403" in result["errText"]
+        # A Sites.Selected 403 is the intended least-privilege posture, not
+        # a fault: it must read as guidance toward "Add a site by URL",
+        # never as `.ds-wizard-error`'s red failure banner.
+        assert result["errShown"] is False, "discovery-forbidden must never use the failure banner"
+        assert "403" in result["guidanceText"]
+        assert result["guidanceShown"] is True
+        assert result["emphasis"] is True, "the by-URL box is the primary action in this state"
 
     def test_saved_site_merges_into_a_listing_that_omits_it(self):
         result = _run(
@@ -792,6 +871,550 @@ class TestSavedSiteScopeVisibleOnReopen:
         assert "data-spw-item=" not in result["html"]
 
 
+class TestSavedScopesPanel:
+    """Live report, 2026-09-01: a confirmed FOLDER scope several levels
+    deep in a site is invisible to every tree-rescue above — a folder
+    scope's id names no site, so `spSeedManualSitesFromScopes` cannot
+    rebuild a row for it (`test_folder_scope_never_fabricates_a_site_row`),
+    and under `Sites.Selected` the live listing cannot reach it either. An
+    operator who wanted to change its `anonymize` flag had to know the site
+    URL from elsewhere, re-paste it, and re-walk the whole tree back down
+    to the same folder. `spw-saved-scopes` renders every confirmed scope
+    from the scope rows alone — independent of tree navigation entirely —
+    with an anonymize checkbox wired to the same idempotent confirm path."""
+
+    _FOLDER_SCOPE = (
+        '{ source_scope_id: "01ABCDEF123", display_path: "Site / Docs / Contracts / 2026",'
+        " anonymize: true, anonymization_declared: false,"
+        ' collection: { id: "c1", slug: "contracts-2026", name: "Contracts 2026" }, group_ids: [] }'
+    )
+
+    def test_renders_a_folder_scope_the_tree_cannot_show_at_all(self):
+        result = _run(
+            """
+            spConnId = "conn-1";
+            global.fetch = async (url) => {
+              if (String(url).indexOf("/scopes") !== -1) {
+                return { ok: true, status: 200, json: async () => ({ items: [%s] }) };
+              }
+              return { ok: false, status: 502, json: async () => ({
+                detail: { error: "sharepoint_discovery_forbidden",
+                          message: "Graph refused to list sites (HTTP 403)." } }) };
+            };
+            spLoadScopesThenTree();
+            await _settle();
+            process.stdout.write(JSON.stringify({
+              html: document.getElementById("spw-saved-scopes").innerHTML,
+              shown: document.getElementById("spw-saved-scopes").style.display === "block",
+              treeHtml: document.getElementById("spw-tree").innerHTML,
+            }));
+            """
+            % self._FOLDER_SCOPE
+        )
+        assert result["shown"] is True
+        html = result["html"]
+        assert "Site / Docs / Contracts / 2026" in html, "the saved path must be visible without navigating the tree"
+        assert "contracts-2026" in html, "the collection it maps to must ride along"
+        assert "checked" in html, "the anonymize checkbox must reflect the saved state"
+        # The tree itself still cannot show it (unchanged, pinned by
+        # test_folder_scope_never_fabricates_a_site_row) — the panel is an
+        # ADDITION, not a replacement for that honesty.
+        assert "01ABCDEF123" not in result["treeHtml"]
+
+    def test_hidden_when_the_connection_has_no_saved_scopes(self):
+        result = _run(
+            """
+            spConnId = "conn-1";
+            global.fetch = async (url) => {
+              if (String(url).indexOf("/scopes") !== -1) {
+                return { ok: true, status: 200, json: async () => ({ items: [] }) };
+              }
+              return { ok: true, status: 200, json: async () => ({ level: "sites", items: [] }) };
+            };
+            spLoadScopesThenTree();
+            await _settle();
+            process.stdout.write(JSON.stringify({
+              shown: document.getElementById("spw-saved-scopes").style.display === "block",
+              html: document.getElementById("spw-saved-scopes").innerHTML,
+            }));
+            """
+        )
+        assert result["shown"] is False
+        assert result["html"] == ""
+
+    def test_toggling_the_saved_anonymize_checkbox_confirms_without_group_ids(self):
+        """Same idempotent path the tree's own anonymize checkbox uses
+        (`spConfirmScope`, source_scope_id-keyed) — and the same contract:
+        `group_ids` is never sent, so editing anonymize here can never
+        silently revoke this scope's collection grants."""
+        result = _run(
+            """
+            spConnId = "conn-1";
+            spScopes = { "01ABCDEF123": %s };
+
+            global.fetch = async (url, opts) => {
+              _fetchCalls.push({ url: String(url), opts });
+              const body = JSON.parse(opts.body);
+              return { ok: true, status: 201, json: async () => (
+                { source_scope_id: body.source_scope_id, display_path: body.display_path,
+                  anonymize: !!body.anonymize, collection: null, group_ids: [] }
+              ) };
+            };
+
+            spOnSavedAnonToggle({ dataset: { spwSavedAnon: "01ABCDEF123" }, checked: true });
+            await _settle();
+            process.stdout.write(JSON.stringify({ call: _fetchCalls[_fetchCalls.length - 1] }));
+            """
+            % self._FOLDER_SCOPE
+        )
+        call = result["call"]
+        assert call["url"].endswith("/connections/conn-1/scopes")
+        assert call["opts"]["method"] == "POST"
+        body = json.loads(call["opts"]["body"])
+        assert body == {
+            "source_scope_id": "01ABCDEF123",
+            "display_path": "Site / Docs / Contracts / 2026",
+            "anonymize": True,
+            # Round-tripped from the scope's own last-known values (this
+            # fixture never set them, so they read as the server's own
+            # defaults) — see TestReconfirmRoundTripsAlwaysPersistedFields
+            # for the case where an existing drive_id must survive.
+            "access_mode": "manual",
+            "include_excluded_subtrees": False,
+        }
+        assert "group_ids" not in body, "an anonymize-only edit must never touch this scope's sharing"
+
+
+class TestReconfirmRoundTripsAlwaysPersistedFields:
+    """Live report, 2026-09-01: `ConfirmScopeBody`'s own docstring calls
+    `access_mode`/`drive_id`/`include_excluded_subtrees` "always persisted
+    on confirm" server-side — NOT "omitted means unchanged" like
+    `group_ids`/`audience_classes` — so a caller that omits them is telling
+    the server to blank them. The wizard's confirm calls only ever sent
+    `source_scope_id`/`display_path`/`anonymize`(/`group_ids`), which
+    silently wiped `drive_id` — and would have reverted a `mirrored` scope
+    to `manual` — on every anonymize toggle AND on every single "Share &
+    finish" click, not just the row an admin meant to touch. Without
+    `drive_id` the built-in crawler cannot address a folder scope on Graph
+    at all: the next crawl enumerated nothing for it while the run still
+    reported `done`, with no visible error."""
+
+    _EXISTING_FOLDER_SCOPE = (
+        '{ source_scope_id: "01ABCDEF123", display_path: "Site / Docs / Contracts / 2026",'
+        ' anonymize: false, access_mode: "manual", drive_id: "b!existingDriveId",'
+        " include_excluded_subtrees: false,"
+        ' collection: { id: "c1", slug: "contracts-2026", name: "Contracts 2026" }, group_ids: [] }'
+    )
+
+    def test_an_anonymize_only_edit_still_sends_the_scopes_existing_drive_id(self):
+        result = _run(
+            """
+            spConnId = "conn-1";
+            spScopes = { "01ABCDEF123": %s };
+
+            global.fetch = async (url, opts) => {
+              _fetchCalls.push({ url: String(url), opts });
+              // Mirrors the real handler's idempotent-update contract:
+              // echoes back exactly what was sent, plus the collection the
+              // server resolves from the (unchanged) source_scope_id —
+              // never taken from the request body at all.
+              const body = JSON.parse(opts.body);
+              return { ok: true, status: 201, json: async () => Object.assign(
+                {}, body, { collection: { id: "c1", slug: "contracts-2026", name: "Contracts 2026" } }
+              ) };
+            };
+
+            spConfirmScope("01ABCDEF123", "Site / Docs / Contracts / 2026", false);
+            await _settle();
+            process.stdout.write(JSON.stringify({
+              call: _fetchCalls[_fetchCalls.length - 1],
+              scopeAfter: spScopes["01ABCDEF123"],
+            }));
+            """
+            % self._EXISTING_FOLDER_SCOPE
+        )
+        body = json.loads(result["call"]["opts"]["body"])
+        assert body["drive_id"] == "b!existingDriveId", "an anonymize-only edit must not blank the scope's drive_id"
+        assert body["access_mode"] == "manual"
+        assert body["anonymize"] is False
+        assert "group_ids" not in body
+        # The server hands back a scope whose drive_id/access_mode/
+        # collection are exactly what they were before this edit.
+        after = result["scopeAfter"]
+        assert after["drive_id"] == "b!existingDriveId"
+        assert after["access_mode"] == "manual"
+        assert after["collection"]["id"] == "c1"
+
+    def test_share_and_finish_round_trips_every_scopes_own_drive_id(self):
+        """ "Share & finish" re-confirms EVERY scope on the connection in one
+        pass — the same round-trip must apply there too, or completing the
+        wizard silently blanks `drive_id` on scopes nobody touched."""
+        result = _run(
+            """
+            spConnId = "conn-1";
+            spScopes = { "01ABCDEF123": %s };
+            spPendingGroups = {};
+
+            global.fetch = async (url, opts) => {
+              _fetchCalls.push({ url: String(url), opts });
+              return { ok: true, status: 201, json: async () => JSON.parse(opts.body) };
+            };
+
+            el("spw-finish-btn").dispatchEvent({ type: "click" });
+            await _settle();
+            process.stdout.write(JSON.stringify({ call: _fetchCalls[_fetchCalls.length - 1] }));
+            """
+            % self._EXISTING_FOLDER_SCOPE
+        )
+        body = json.loads(result["call"]["opts"]["body"])
+        assert body["drive_id"] == "b!existingDriveId"
+        assert body["access_mode"] == "manual"
+
+    def test_a_brand_new_scope_omits_drive_id_and_access_mode(self):
+        """A first-time pick has no prior state to round-trip — the
+        server's own defaults (manual/null/false) still apply, exactly as
+        before this fix."""
+        result = _run(
+            """
+            spConnId = "conn-1";
+            spScopes = {};
+
+            global.fetch = async (url, opts) => {
+              _fetchCalls.push({ url: String(url), opts });
+              return { ok: true, status: 201, json: async () => JSON.parse(opts.body) };
+            };
+
+            spConfirmScope("new-item-id", "Site / Docs / New Folder", false);
+            await _settle();
+            process.stdout.write(JSON.stringify({ call: _fetchCalls[_fetchCalls.length - 1] }));
+            """
+        )
+        body = json.loads(result["call"]["opts"]["body"])
+        assert "drive_id" not in body
+        assert "access_mode" not in body
+        assert "include_excluded_subtrees" not in body
+
+
+#: Enough of a DOM for the step-1 code paths the other harness blocks never
+#: reach: `openSpWizard` writes `document.body.style`, and `spEnableStep`
+#: uses `querySelector`, neither of which the shared preamble stubs.
+_STEP1_DOM = """
+document.body = { style: {} };
+document.querySelector = (sel) => el("qs:" + sel);
+global._syncDropdownRebuild = () => {};
+const _CONN = {
+  id: "conn-1", name: "SharePoint — test tenant",
+  config: { tenant_id: "b6386aaa-b5c5-4d24-a9a9-337fb28d6d4f",
+            client_id: "66a7be5c-3664-4e3e-8649-e4779da0706e" },
+};
+global.fetch = async (url) => {
+  if (String(url).indexOf("/source-connections") !== -1) {
+    return { ok: true, status: 200, json: async () => [_CONN] };
+  }
+  if (String(url).indexOf("/scopes") !== -1) {
+    return { ok: true, status: 200, json: async () => ({ items: [] }) };
+  }
+  return { ok: true, status: 200, json: async () => ({ level: "sites", items: [] }) };
+};
+function step1State() {
+  return {
+    name: el("spw-name").value,
+    tenant: el("spw-tenant").value,
+    client: el("spw-client").value,
+    nameReadOnly: !!el("spw-name").readOnly,
+    tenantReadOnly: !!el("spw-tenant").readOnly,
+    clientReadOnly: !!el("spw-client").readOnly,
+    credentialShown: el("spw-credential-field").style.display !== "none",
+    connectBtnShown: el("spw-connect-btn").style.display !== "none",
+    pickerShown: el("spw-existing-picker").style.display !== "none",
+  };
+}
+"""
+
+
+class TestStep1ShowsTheBoundConnection:
+    """Opening the wizard on an EXISTING connection must load that
+    connection's saved values into step 1. Reported from a live instance
+    (2026-09-01): managing scopes and then looking at the Connect step
+    showed an empty new-tenant form — no connection name, no tenant, no
+    client id — so nothing on screen said which connection was being
+    edited. The values are already in the `/api/admin/source-connections`
+    payload the card renders from, so step 1 was simply never told.
+
+    They load read-only: the SharePoint card offers no connection editor,
+    and a prefilled form whose button POSTs would create a duplicate
+    rather than save an edit. Showing the truth is the fix; an editor is
+    a separate feature.
+    """
+
+    def test_bound_wizard_loads_the_saved_values(self):
+        result = _run(
+            _STEP1_DOM
+            + """
+            openSpWizardForConnection("conn-1");
+            await _settle();
+            process.stdout.write(JSON.stringify(step1State()));
+            """
+        )
+        assert result["name"] == "SharePoint — test tenant"
+        assert result["tenant"] == "b6386aaa-b5c5-4d24-a9a9-337fb28d6d4f"
+        assert result["client"] == "66a7be5c-3664-4e3e-8649-e4779da0706e"
+        assert result["nameReadOnly"] is True
+        assert result["tenantReadOnly"] is True
+        assert result["clientReadOnly"] is True
+        # The create-a-new-tenant affordances have no meaning here, and a
+        # prefilled form under a "Connect & validate" button is a trap.
+        assert result["credentialShown"] is False
+        assert result["connectBtnShown"] is False
+        # "Continue an existing connection" asks a question this drawer
+        # already answered by being opened from that connection.
+        assert result["pickerShown"] is False
+
+    def test_new_connection_flow_is_untouched(self):
+        result = _run(
+            _STEP1_DOM
+            + """
+            openSpWizard();
+            await _settle();
+            process.stdout.write(JSON.stringify(step1State()));
+            """
+        )
+        assert result["name"] == ""
+        assert result["tenant"] == ""
+        assert result["client"] == ""
+        assert result["nameReadOnly"] is False
+        assert result["credentialShown"] is True
+        assert result["connectBtnShown"] is True
+        assert result["pickerShown"] is True
+
+    def test_bound_continue_to_scope_uses_the_bound_connection(self):
+        """The picker is hidden while bound, so its value is whatever the
+        listing preselected — "Continue to scope" must follow spConnId, not
+        that. With several connections the preselection is another one
+        entirely, which would silently scope the wrong source."""
+        result = _run(
+            _STEP1_DOM
+            + """
+            openSpWizardForConnection("conn-1");
+            await _settle();
+            el("spw-existing-select").value = "some-other-connection";
+            const calls = [];
+            spLoadScopesThenTree = () => calls.push("loadScopes");
+            el("spw-existing-btn").dispatchEvent({ type: "click" });
+            await _settle();
+            process.stdout.write(JSON.stringify({ spConnId: spConnId, calls: calls }));
+            """
+        )
+        assert result["spConnId"] == "conn-1"
+        assert result["calls"] == ["loadScopes"]
+
+    def test_reopening_for_a_new_connection_clears_the_bound_state(self):
+        """The bound presentation must not leak into the next open — the
+        drawer is reused, so a stale read-only prefilled form would make
+        connecting a new tenant impossible."""
+        result = _run(
+            _STEP1_DOM
+            + """
+            openSpWizardForConnection("conn-1");
+            await _settle();
+            const bound = step1State();
+            openSpWizard();
+            await _settle();
+            process.stdout.write(JSON.stringify({ bound: bound, after: step1State() }));
+            """
+        )
+        assert result["bound"]["name"] == "SharePoint — test tenant"
+        after = result["after"]
+        assert after["name"] == ""
+        assert after["tenant"] == ""
+        assert after["nameReadOnly"] is False
+        assert after["credentialShown"] is True
+        assert after["connectBtnShown"] is True
+        assert after["pickerShown"] is True
+
+
+class TestManualSitePersistence:
+    """2026-09-01 bug fix: a site added by URL used to live ONLY in the
+    client-side `spManualSites` map (reset on every `openSpWizard()`),
+    forcing a re-paste on every reopen. `spAddSiteByUrl` now POSTs to the
+    persisting endpoint, and `spSeedManualSitesFromConnectionConfig` reads it
+    back from the connection's own `config.manual_sites` — the same
+    page-level `_connections` cache the rest of the page already fetches."""
+
+    def test_add_site_by_url_posts_to_the_persisting_endpoint(self):
+        result = _run(
+            """
+            spConnId = "conn-1";
+            document.getElementById("spw-site-by-url").value = "https://contoso.sharepoint.com/sites/ProjectHub";
+            spLevel = { site_id: null, drive_id: null, item_id: null };
+            spItems = [];
+            spScopes = {};
+
+            global.fetch = async (url, opts) => {
+              _fetchCalls.push({ url: String(url), opts });
+              const body = JSON.parse(opts.body);
+              return { ok: true, status: 201, json: async () => (
+                { id: "s-by-url", name: "Project Hub", web_url: "https://contoso/x" }
+              ) };
+            };
+
+            spAddSiteByUrl();
+            await _settle();
+            process.stdout.write(JSON.stringify({
+              call: _fetchCalls[_fetchCalls.length - 1],
+              manualSites: spManualSites,
+              html: document.getElementById("spw-tree").innerHTML,
+            }));
+            """
+        )
+        call = result["call"]
+        assert call["url"].endswith("/connections/conn-1/manual-sites")
+        assert call["opts"]["method"] == "POST"
+        assert json.loads(call["opts"]["body"]) == {"site_url": "https://contoso.sharepoint.com/sites/ProjectHub"}
+        assert result["manualSites"]["s-by-url"] == {
+            "id": "s-by-url",
+            "name": "Project Hub",
+            "web_url": "https://contoso/x",
+        }
+        assert "Project Hub" in result["html"]
+
+    def test_reopening_seeds_manual_sites_from_the_connections_cache(self):
+        """The persistence half: `_connections` (the SAME cache
+        `loadConnections()` populated before the wizard could have been
+        opened) carries `config.manual_sites` forward across a reopen — no
+        re-paste needed."""
+        result = _run(
+            """
+            spConnId = "conn-1";
+            _connections = [
+              { id: "conn-1", config: { manual_sites: [
+                { id: "s-persisted", name: "Persisted Site", web_url: "https://contoso/p" },
+              ] } },
+            ];
+            global.fetch = async (url) => {
+              if (String(url).indexOf("/scopes") !== -1) {
+                return { ok: true, status: 200, json: async () => ({ items: [] }) };
+              }
+              return { ok: true, status: 200, json: async () => ({ level: "sites", items: [] }) };
+            };
+
+            spLoadScopesThenTree();
+            await _settle();
+            process.stdout.write(JSON.stringify({
+              manualSites: spManualSites,
+              html: document.getElementById("spw-tree").innerHTML,
+            }));
+            """
+        )
+        assert result["manualSites"]["s-persisted"] == {
+            "id": "s-persisted",
+            "name": "Persisted Site",
+            "web_url": "https://contoso/p",
+        }
+        assert "Persisted Site" in result["html"]
+
+    def test_seeding_never_overwrites_a_row_already_placed_by_a_scope(self):
+        """`spSeedManualSitesFromScopes` runs first and owns any id it
+        placed — a stale `manual_sites` name for the SAME site id must never
+        clobber the live, scope-derived one."""
+        result = _run(
+            """
+            spConnId = "conn-1";
+            _connections = [
+              { id: "conn-1", config: { manual_sites: [
+                { id: "contoso.sharepoint.com,aaa,bbb", name: "Stale Name", web_url: "https://x" },
+              ] } },
+            ];
+            global.fetch = async (url) => {
+              if (String(url).indexOf("/scopes") !== -1) {
+                return { ok: true, status: 200, json: async () => ({ items: [
+                  { source_scope_id: "contoso.sharepoint.com,aaa,bbb", display_path: "Live Name",
+                    anonymize: false, collection: null, group_ids: [] },
+                ] }) };
+              }
+              return { ok: true, status: 200, json: async () => ({ level: "sites", items: [] }) };
+            };
+
+            spLoadScopesThenTree();
+            await _settle();
+            process.stdout.write(JSON.stringify({ manualSites: spManualSites }));
+            """
+        )
+        assert result["manualSites"]["contoso.sharepoint.com,aaa,bbb"]["name"] == "Live Name"
+
+    def test_a_manual_unconfirmed_site_shows_a_forget_control(self):
+        result = _run(
+            """
+            spItems = [{ id: "s1", name: "Manual Site" }];
+            spScopes = {};
+            spManualSites = { s1: { id: "s1", name: "Manual Site" } };
+            spRenderTree("sites");
+            process.stdout.write(JSON.stringify({ html: document.getElementById("spw-tree").innerHTML }));
+            """
+        )
+        assert 'data-spw-unlink="s1"' in result["html"]
+
+    def test_a_confirmed_scope_never_shows_the_forget_control(self):
+        """A confirmed scope already has its own removal path — unticking
+        the checkbox — so offering a second one here would only be
+        confusing about which one an admin just used."""
+        result = _run(
+            """
+            spItems = [{ id: "s1", name: "Confirmed Site" }];
+            spScopes = { s1: { source_scope_id: "s1", display_path: "Confirmed Site", anonymize: false,
+                               collection: { id: "c1", slug: "confirmed-site", name: "Confirmed Site" } } };
+            spManualSites = { s1: { id: "s1", name: "Confirmed Site" } };
+            spRenderTree("sites");
+            process.stdout.write(JSON.stringify({ html: document.getElementById("spw-tree").innerHTML }));
+            """
+        )
+        assert 'data-spw-unlink="s1"' not in result["html"]
+
+    def test_the_forget_control_is_never_shown_below_the_sites_level(self):
+        result = _run(
+            """
+            spItems = [{ id: "f1", name: "Folder", is_folder: true, child_count: 0 }];
+            spScopes = {};
+            spManualSites = { f1: { id: "f1", name: "Folder" } };
+            spLevel = { site_id: "s1", drive_id: "d1", item_id: null };
+            spCrumbs = [];
+            spRenderTree("items");
+            process.stdout.write(JSON.stringify({ html: document.getElementById("spw-tree").innerHTML }));
+            """
+        )
+        assert "data-spw-unlink" not in result["html"]
+
+    def test_clicking_forget_deletes_and_removes_the_row(self):
+        result = _run(
+            """
+            spConnId = "conn-1";
+            spItems = [{ id: "s1", name: "Manual Site" }];
+            spScopes = {};
+            spManualSites = { s1: { id: "s1", name: "Manual Site" } };
+
+            const unlinkBtn = genericEl();
+            unlinkBtn.dataset = { spwUnlink: "s1" };
+            const host = document.getElementById("spw-tree");
+            host.querySelectorAll = (sel) => (sel === "[data-spw-unlink]" ? [unlinkBtn] : []);
+
+            spRenderTree("sites");
+            unlinkBtn.dispatchEvent({ type: "click" });
+            await _settle();
+
+            process.stdout.write(JSON.stringify({
+              call: _fetchCalls[_fetchCalls.length - 1],
+              manualSites: spManualSites,
+              items: spItems,
+            }));
+            """
+        )
+        call = result["call"]
+        assert call["opts"]["method"] == "DELETE"
+        assert call["url"].endswith("/manual-sites?site_id=s1")
+        assert "s1" not in result["manualSites"]
+        assert result["items"] == []
+
+
 class TestUniquePermissionsBadgeUI:
     """ADVISORY-ONLY badge (Decision #2) rendered by the SHIPPED
     `spRenderTree` — present only for a bare `true`, absent for `false` AND
@@ -925,10 +1548,17 @@ class TestCertificateFileUploadMarkup:
         assert "Upload PEM file" in body
 
     def test_card_rotate_row_has_the_same_picker(self, seeded_app):
-        body = _page(seeded_app)
-        # The card is a JS template literal in the shipped page source.
-        assert "ds-sp-cert-file-" in body
-        card_js = body.split("ds-sp-cert-row-", 1)[1]
+        # The card is a JS template literal — in the shipped PAGE SCRIPT
+        # (perf follow-up, 2026-09-03: extracted to its own static asset),
+        # not the HTML response itself. Fetched through the same client, the
+        # way a browser loading the page would.
+        c = seeded_app["client"]
+        page_js = c.get(
+            "/static/js/admin/data_sources_page.js",
+            headers={"Authorization": f"Bearer {seeded_app['admin_token']}"},
+        ).text
+        assert "ds-sp-cert-file-" in page_js
+        card_js = page_js.split("ds-sp-cert-row-", 1)[1]
         assert "spCertFilePicked(" in card_js
 
 

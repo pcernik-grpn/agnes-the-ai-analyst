@@ -10,6 +10,7 @@ transports now register from the shared `app.api.mcp.foundation_tools` module.
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 
 import pytest
 
@@ -505,3 +506,76 @@ def test_stdio_and_http_agree_on_shared_tool_behaviour():
             f"{name} declares different behaviour on stdio vs HTTP"
         )
         assert h.title == s.title, f"{name} is titled differently on stdio vs HTTP"
+
+
+def test_collection_get_derives_truncation_from_the_offset_the_server_used():
+    """The server clamps a negative or out-of-range offset; the response
+    echoes the one it actually used.
+
+    Deriving `files_truncated` from the REQUESTED offset then miscounts what
+    has been seen — a clamped `-5` leaves `-5 + len(files)` below the true
+    position, so the tool reports more pages than exist and a paginating
+    agent walks off the end (Devin Review on #2062)."""
+    src = Path("app/api/mcp/foundation_tools.py").read_text(encoding="utf-8")
+    block = src.split('detail["files_total"] = total', 1)[1].split("return detail", 1)[0]
+    assert "offset + len(files)" not in block.replace("effective_offset + len(files)", ""), (
+        "truncation must be derived from the offset the server used, not the one asked for"
+    )
+    assert "effective_offset" in block
+
+
+def _tool_params(path: str) -> dict:
+    """`{tool name: [parameter names]}` for every `@tool`-decorated function
+    in a module, HTTP or stdio, nested or not."""
+    import ast
+
+    tree = ast.parse(Path(path).read_text(encoding="utf-8"))
+    out: dict = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        decorated = any(
+            (isinstance(d, ast.Name) and d.id == "tool")
+            or (isinstance(d, ast.Call) and isinstance(d.func, ast.Name) and d.func.id == "tool")
+            for d in node.decorator_list
+        )
+        if decorated:
+            out[node.name] = [a.arg for a in node.args.args if a.arg not in ("self", "cls")]
+    return out
+
+
+def test_a_shared_tool_takes_the_same_arguments_on_both_servers():
+    """Name parity is not contract parity.
+
+    Every guard above compares tool NAMES, so `collection_get` gaining
+    `limit`/`offset`/`q` on the HTTP foundation server while the stdio server
+    kept the one-argument version passed all of them — an agent on the CLI
+    server asked for a collection and got whatever the endpoint's own default
+    page happened to be, with no way to reach the rest and nothing saying so
+    (Devin Review on #2062). A tool present on both servers must accept the
+    same arguments on both.
+    """
+    http = _tool_params("app/api/mcp/foundation_tools.py")
+    stdio = _tool_params("cli/mcp/server.py")
+
+    shared = sorted(set(http) & set(stdio))
+    assert shared, "expected the two servers to share tools; the AST scan found none"
+
+    drift = {
+        name: {"http": http[name], "stdio": stdio[name]}
+        for name in shared
+        if set(http[name]) != set(stdio[name])
+    }
+    assert not drift, (
+        "these tools take different arguments on the HTTP and stdio MCP servers — "
+        f"the contract an agent reads depends on which server it reached: {drift}"
+    )
+
+
+def test_fact_edges_is_a_registered_foundation_tool():
+    """TCRD-295: the relationship-shaped read joins the five fact tools in
+    the registry, so `tests/test_mcp_tool_parity.py`'s subset guard covers
+    it on every transport."""
+    from app.api.mcp.foundation_tools import FOUNDATION_TOOL_NAMES
+
+    assert "fact_edges" in FOUNDATION_TOOL_NAMES

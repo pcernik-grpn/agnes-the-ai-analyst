@@ -6,11 +6,7 @@ Endpoints:
   GET    /api/collections                         auth (RBAC-filtered list)
   GET    /api/collections/{collection_id}         require_collection_access("{collection_id}")
   DELETE /api/collections/{collection_id}         owner or admin
-  POST   /api/collections/{collection_id}/files   require_collection_write_or_producer_access("{collection_id}")
-                                                  — also accepts a ProducerPrincipal scoped to
-                                                  this collection (the corpus-extraction
-                                                  producer's own upload callback,
-                                                  app.auth.producer_token)
+  POST   /api/collections/{collection_id}/files   require_collection_access("{collection_id}")
   GET    /api/collections/{collection_id}/files   require_collection_access("{collection_id}")
   DELETE /api/collections/{collection_id}/files/{file_id}
                                                   require_collection_access("{collection_id}")
@@ -49,11 +45,13 @@ unaffected.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, List, Optional
 
+import sqlalchemy as sa
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
@@ -62,10 +60,8 @@ from app.auth.access import (
     can_access_collection,
     is_user_admin,
     require_collection_access,
-    require_collection_write_or_producer_access,
 )
 from app.auth.dependencies import get_current_user
-from app.auth.session_principal import ProducerPrincipal
 from app.services.journey import mark_journey
 from src.audit_helpers import log_safe
 from src.corpus_allowlist import classify
@@ -95,6 +91,26 @@ router = APIRouter(prefix="/api/collections", tags=["collections"])
 # long-running ingests routinely exceed this window.
 REINGEST_STALE_PROCESSING_MINUTES = 15
 
+# Default/max page size for a collection's file listing — both the dedicated
+# GET .../files endpoint and the inline `files` preview on GET .../{id}.
+DEFAULT_FILE_LIST_LIMIT = 25
+MAX_FILE_LIST_LIMIT = 200
+
+
+def _clamp_file_list_limit(limit: int) -> int:
+    """Clamp to ``1..MAX_FILE_LIST_LIMIT`` — silently, never a 422.
+
+    A caller-visible page-size input (``limit=0``, an absurdly large value)
+    must not error: the web page constructs these query strings itself, and
+    a validation error there would break its own pagination links.
+    """
+    return max(1, min(limit, MAX_FILE_LIST_LIMIT))
+
+
+def _clamp_file_list_offset(offset: int) -> int:
+    """Clamp to ``>= 0`` — silently, same reasoning as the limit clamp above."""
+    return max(0, offset)
+
 
 # ---------------------------------------------------------------------------
 # Request / response models
@@ -103,6 +119,21 @@ REINGEST_STALE_PROCESSING_MINUTES = 15
 
 class CreateCollectionRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=255)
+    slug: Optional[str] = Field(None, max_length=100)
+    description: Optional[str] = None
+
+
+class UpdateCollectionRequest(BaseModel):
+    """The editable metadata of a collection — every field optional.
+
+    PRESENCE is the signal, not the value: ``{"description": null}`` clears
+    the description while a request that omits ``description`` leaves it
+    alone. The handler reads ``model_fields_set`` for exactly that reason, so
+    do NOT give these fields non-None defaults — that would erase the
+    distinction the repository layer was built to keep.
+    """
+
+    name: Optional[str] = Field(None, min_length=1, max_length=255)
     slug: Optional[str] = Field(None, max_length=100)
     description: Optional[str] = None
 
@@ -382,8 +413,26 @@ async def search_collections(
     conversation's permanent title. The count is what makes the difference
     checkable, and the hint names the three engine behaviours that make a
     reasonable query miss (see ``src.ingest.retrieval``).
+
+    Very large corpora are bounded server-side: candidate selection runs in
+    SQL under ``min(knowledge.retrieval.max_candidate_chunks,
+    collections.search_max_chunks)`` (P0 OOM fix 2026-09 × #2151 — see
+    ``src.ingest.retrieval``'s "Scale bounds"). When that bound is hit the
+    response carries ``truncated: true`` (plus ``truncated_cap`` and a
+    ``truncated_note``) and the additive ``candidates_capped: true`` —
+    the same event under both names — instead of ranking every accessible
+    chunk; narrow with ``corpus_id`` or a more specific query to search the
+    excluded rest. A query with no usable term to narrow BY that still hits
+    the bound is refused with a typed ``422 search_query_too_broad`` rather
+    than ranking an arbitrary slice. A search backend outage answers a
+    typed ``503 search_unavailable`` instead of an anonymous server error.
     """
-    from src.ingest.retrieval import retrieval_mode, search as _search
+    from src.ingest.retrieval import (
+        BROAD_CORPUS_HINT,
+        SearchQueryTooBroad,
+        retrieval_mode,
+        search_with_meta,
+    )
 
     allowed = _accessible_corpus_ids(user)
     # A BLANK `corpus_id` means "no filter", not "the collection whose id is
@@ -397,7 +446,43 @@ async def search_collections(
     if corpus_id is not None:
         allowed = [c for c in allowed if c == corpus_id]
     k = max(1, min(k, 50))
-    results = _search(allowed, q, k=k)
+    try:
+        # #2151: search_with_meta does a DB fetch + pure-Python IDF/cosine
+        # ranking over up to `collections.search_max_chunks` rows — real CPU
+        # + I/O work that must not run inline on the event loop and block
+        # every other request this process is serving. `asyncio.to_thread`
+        # is this codebase's established offload idiom for exactly this
+        # (e.g. `app/api/mcp/foundation_tools.py`'s
+        # `facts_repo().count_visible_facts_by_type` call).
+        meta = await asyncio.to_thread(search_with_meta, allowed, q, k=k)
+    except SearchQueryTooBroad as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "search_query_too_broad",
+                "hint": BROAD_CORPUS_HINT,
+                "cap": exc.cap,
+                "chunk_count": exc.chunk_count,
+            },
+        ) from exc
+    except (MemoryError, sa.exc.OperationalError, sa.exc.DBAPIError) as exc:
+        # #2151: a genuinely oversized candidate set (or a DB-side timeout/
+        # connection failure while fetching one) must fail typed and loud
+        # server-side, never as the anonymous 500 the app-wide catch-all
+        # would otherwise turn it into. Anything else (a real bug) still
+        # propagates unchanged.
+        logger.warning("collections search unavailable (corpora=%s): %s", allowed, exc)
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "search_unavailable",
+                "hint": (
+                    "Search is temporarily unavailable — retry shortly, or narrow with "
+                    "collection_id or a more specific query."
+                ),
+            },
+        ) from exc
+    results = meta["results"]
 
     # Chunks must not leak what claims withhold (spec §9): a tiered
     # collection's snippets are silently dropped for a caller below its top
@@ -416,6 +501,27 @@ async def search_collections(
 
     results = [r for r in results if _chunk_text_visible(r.get("corpus_id"))]
     payload: dict = {"results": results, "retrieval": retrieval_mode()}
+    if meta["truncated"]:
+        # The bounded candidate scan filled its cap — `min(knowledge.
+        # retrieval.max_candidate_chunks, collections.search_max_chunks)`,
+        # see `src.ingest.retrieval.search_with_meta` — so some matching
+        # chunk may have been left out; disclosed rather than silently
+        # ranking a partial corpus. One event, two additive field families:
+        # `truncated`/`truncated_cap`/`truncated_note` (#2151) and
+        # `candidates_capped` (the P0 OOM fix, 2026-09). `k` bounds
+        # `results` regardless, so this response is never large enough for
+        # the MCP tool-output budget compaction (src.mcp_tooling.
+        # compact_search_results, which reuses `truncated`/`truncated_note`
+        # for a DIFFERENT reason — wire-size shortening) to collide with
+        # this note in practice.
+        payload["truncated"] = True
+        payload["truncated_cap"] = meta["cap"]
+        payload["truncated_note"] = (
+            f"This collection set has more than {meta['cap']:,} chunks matching your query "
+            f"terms; the search ran over the {meta['cap']:,} best of them, not the full "
+            f"corpus. {BROAD_CORPUS_HINT}"
+        )
+        payload["candidates_capped"] = True
     if not results:
         payload["searched_collections"] = len(allowed)
         payload["hint"] = _empty_search_hint(len(allowed), corpus_id)
@@ -427,18 +533,31 @@ async def get_collection(
     collection_id: str,
     user=Depends(require_collection_access("{collection_id}")),
 ):
-    """Return a collection's metadata + file list.
+    """Return a collection's metadata + a bounded preview of its files.
 
     Requires the caller to hold a grant on this collection (admins exempt).
     Returns **404** (not 403) when the collection does not exist, so that
     unprivileged callers cannot probe for existence via the error code
     difference.
+
+    ``files`` is capped at ``DEFAULT_FILE_LIST_LIMIT`` (oldest-first, the
+    ordering this endpoint always used) — ``files_total`` is the collection's
+    real file count and ``files_truncated`` says whether ``files`` is the
+    whole thing or a preview of it. A caller that needs the rest, or wants to
+    search/paginate/filter, uses ``GET /{collection_id}/files``.
     """
     row = file_corpora_repo().get(collection_id)
     if not row:
         raise HTTPException(status_code=404, detail="collection_not_found")
-    files = corpus_files_repo().list_for_corpus(collection_id)
-    return {**_collection_out(row), "files": [_file_out(f) for f in files]}
+    cf_repo = corpus_files_repo()
+    files = cf_repo.list_for_corpus(collection_id, limit=DEFAULT_FILE_LIST_LIMIT)
+    files_total = cf_repo.count_for_corpus(collection_id)
+    return {
+        **_collection_out(row),
+        "files": [_file_out(f) for f in files],
+        "files_total": files_total,
+        "files_truncated": files_total > len(files),
+    }
 
 
 def _purge_derived_tabular_rows(corpus_id: str) -> None:
@@ -448,7 +567,7 @@ def _purge_derived_tabular_rows(corpus_id: str) -> None:
     table_id) and ``delete_collection`` (corpus-wide variant). After removing
     registry rows we call ``orchestrator.rebuild_source`` so the master views
     in ``analytics.duckdb`` no longer expose the deleted table(s). Best-effort:
-    a rebuild failure is logged but not raised — the durable artefacts (registry
+    a rebuild failure is logged but not raised — the durable artifacts (registry
     + parquet) are already gone.
     """
 
@@ -531,6 +650,61 @@ def _schedule_derived_purge(corpus_id: str, file_id: str | None = None) -> None:
     )
 
 
+def _policied_derived_rows_for_file(corpus_id: str, file_id: str) -> list[dict]:
+    """The derived ``table_registry`` rows for ``file_id`` that carry a SQL
+    access policy.
+
+    Matched exactly as ``_purge_derived_tabular_row_for_file`` matches the rows
+    it purges, so the refusal below can never disagree with what a purge would
+    actually destroy. An empty ``fid_suffix`` matches nothing (``endswith("")``
+    is true for every row — it would otherwise report the whole corpus).
+    """
+    fid_suffix = file_id.replace("cf_", "")[:8]
+    if not fid_suffix:
+        return []
+    rows = table_registry_repo().list_by_source("collection")
+    return [
+        r
+        for r in rows
+        if r.get("bucket") == corpus_id
+        and r.get("id", "").endswith(fid_suffix)
+        and (r.get("access_policy_sql") or "").strip()
+    ]
+
+
+def _refuse_reingest_of_policied_file(corpus_id: str, file_id: str) -> None:
+    """Fail closed before a RE-INGEST purges a policied derived table.
+
+    A derived collection table is an ordinary registered table, so an admin can
+    attach a SQL access policy to it (``docs/table-access-policies.md``). The
+    re-ingest doors — ``POST .../files/{id}/reingest`` and a changed-content
+    re-upload at the same logical path — purge that row and re-register the
+    SAME deterministic ``table_id`` as a fresh, unpolicied, distributable one.
+    Both are gated by ``require_collection_access``, not ``require_admin``: an
+    ordinary collection member could therefore strip an admin's policy and put
+    the table back into ``agnes pull``'s manifest.
+
+    The policy is NOT carried across the re-ingest instead: the replacement
+    file may have different columns, so the old policy could reference a column
+    that no longer exists — silently reinstating it would be a policy that
+    fails open at the first read. An admin clears it deliberately.
+
+    A plain file DELETE is untouched (the data goes with the row, so nothing is
+    disclosed) and so is an unchanged-content resync (it purges nothing).
+    """
+    policied = _policied_derived_rows_for_file(corpus_id, file_id)
+    if not policied:
+        return
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "reason": "access_policy_protected_row",
+            "table_id": policied[0]["id"],
+            "fix": "an admin must clear the table's access policy before the file can be re-ingested",
+        },
+    )
+
+
 def _purge_derived_tabular_row_for_file(corpus_id: str, file_id: str) -> None:
     """Variant of ``_purge_derived_tabular_rows`` for a single file deletion.
 
@@ -587,6 +761,131 @@ def _purge_derived_tabular_row_for_file(corpus_id: str, file_id: str) -> None:
         SyncOrchestrator().rebuild_source(source_name)
     except Exception as exc:
         logger.warning("rebuild_source(%s) after single-file purge failed: %s", source_name, exc)
+
+
+@router.patch("/{collection_id}")
+async def update_collection(
+    collection_id: str,
+    payload: UpdateCollectionRequest,
+    user: dict = Depends(get_current_user),
+):
+    """Rename a collection or change its description/slug (owner or admin).
+
+    The gate is deliberately OWNER-OR-ADMIN rather than
+    ``require_collection_access``: a group grant conveys READ access, and a
+    grantee renaming somebody else's collection out from under them is not a
+    read. Same predicate as ``delete_collection`` below, so the two
+    owner-level actions on a collection agree about who may take them.
+
+    Presence-based, per field: a field the request omits is untouched, and
+    ``description: null`` clears it. Editing NOTHING is a 400 rather than a
+    silent 200 — a client that meant to change something and named no known
+    field has a bug, and answering "fine" hides it.
+
+    ``slug`` is normalised the same way ``create_collection`` normalises it,
+    so a patched slug always resolves via ``/library/{slug}``; a collision on
+    the unique index returns **409**. Renaming does NOT move the slug on its
+    own: the slug is this collection's URL, and silently re-deriving it from
+    the new name would break every link and bookmark already pointing here.
+    Callers that want the URL to follow the name pass both.
+
+    A **source-managed** collection (fed by a connection's confirmed scope)
+    is refused with the same typed **409** the upload path uses: its name is
+    derived from the source scope, so a rename here would be silently
+    reverted by the next sync — the "a scheduled sync must not revert a
+    downstream edit" rule the semantic layer states as ``409 source_owned``.
+    """
+    from app.auth.session_principal import PRINCIPAL_TYPES
+
+    if isinstance(user, PRINCIPAL_TYPES):
+        # A restricted principal (co-session / agent-session) has no
+        # ownership identity to check — its authority is the intersection it
+        # was minted with, which conveys READ, never "rename the owner's
+        # collection". Explicit per the PRINCIPAL_TYPES seam contract; without
+        # it, `user["id"]` below would raise TypeError into a 500.
+        raise HTTPException(status_code=403, detail="collection_not_owned")
+
+    row = file_corpora_repo().get(collection_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="collection_not_found")
+    if not is_user_admin(user["id"]) and row.get("created_by") != user["id"]:
+        raise HTTPException(status_code=403, detail="collection_not_owned")
+
+    managing = source_managing_connection(collection_id)
+    if managing:
+        _refuse_source_managed(managing, operation="edit")
+
+    sent = payload.model_fields_set
+    fields: dict[str, Any] = {}
+
+    if "name" in sent:
+        name = (payload.name or "").strip()
+        if not name:
+            raise HTTPException(
+                status_code=400,
+                detail="collection_name_empty: a collection must keep a name — omit the field to leave it unchanged.",
+            )
+        fields["name"] = name
+
+    if "slug" in sent:
+        # Mirror create_collection: normalise to [a-z0-9-] so the result is
+        # always reachable at /library/{slug}, falling back to the (new or
+        # current) name when the caller's slug collapses to nothing.
+        raw = (payload.slug or "").strip()
+        fields["slug"] = _auto_slug(raw) if raw else _auto_slug(fields.get("name") or row["name"])
+
+    if "description" in sent:
+        desc = payload.description
+        if desc is not None:
+            desc = desc.strip() or None  # "" is how a form clears a textarea
+        fields["description"] = desc
+
+    if not fields:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "collection_nothing_to_update: send at least one of name, slug, description "
+                '— e.g. {"name": "Q3 contracts"}.'
+            ),
+        )
+
+    try:
+        changed = file_corpora_repo().update(collection_id, **fields)
+    except Exception as exc:
+        # DuckDB raises ConstraintException; PG raises IntegrityError. Same
+        # detection as create_collection, so both paths answer 409 alike.
+        err = str(exc).lower()
+        if "unique" in err or "duplicate" in err or "constraint" in err:
+            raise HTTPException(
+                status_code=409,
+                detail=f"collection_slug_conflict:{fields.get('slug')}",
+            ) from exc
+        raise
+    if not changed:
+        # Deleted between the read above and the write (or by a concurrent
+        # caller) — 404 matches every other entity-scoped read of a gone row.
+        raise HTTPException(status_code=404, detail="collection_not_found")
+
+    # Field NAMES, never their values: this row lands in the audit trail, and
+    # what an admin needs from it is "who changed what about this collection",
+    # not a second copy of the description.
+    log_safe(
+        action="collection.update",
+        resource=collection_id,
+        user_id=user.get("id"),
+        params={"fields": sorted(fields)},
+    )
+    logger.info(
+        "collection updated id=%s fields=%s by=%s",
+        collection_id,
+        sorted(fields),
+        user.get("email"),
+    )
+    fresh = file_corpora_repo().get(collection_id)
+    # A concurrent delete between the write and this read would make `fresh`
+    # None: the patch really did happen, so answer from what we know rather
+    # than 500 on a missing row.
+    return _collection_out(fresh or {**row, **fields})
 
 
 @router.delete("/{collection_id}", status_code=204)
@@ -680,6 +979,15 @@ def _sweep_facts_orphans_after_delete(*, trigger: str) -> None:
     is swallowed here (not surfaced as a 501) because a DuckDB-backed
     instance can never have facts claims to begin with — this is routine
     file-delete housekeeping, not a caller-facing facts API call.
+
+    ``grace_seconds=0``: unlike an `ingest_batch`-driven sweep (which
+    defaults to `sweep_orphans()`'s own grace period — see its
+    "Concurrency" section — because a concurrent pass may be mid-write on
+    the very subject it just orphaned), THIS caller just deleted the file
+    whose claim was the subject's only evidence itself; nothing else could
+    be concurrently minting fresh evidence for the same subject, so the
+    immediate-delete behavior an admin deleting a file expects is both safe
+    and correct here.
     """
     from app.instance_config import feature_enabled
 
@@ -688,14 +996,17 @@ def _sweep_facts_orphans_after_delete(*, trigger: str) -> None:
     try:
         from src.repositories import RequiresPostgresBackend, facts_repo
 
-        deleted = facts_repo().sweep_orphans()
+        result = facts_repo().sweep_orphans(grace_seconds=0)
     except RequiresPostgresBackend:
         return
     except Exception:
         logger.warning("facts orphan sweep failed after %s", trigger, exc_info=True)
         return
+    deleted = result["deleted"]
     if deleted:
         logger.info("facts orphan sweep trigger=%s subjects_deleted=%d", trigger, deleted)
+    if result["skipped"]:
+        logger.info("facts orphan sweep trigger=%s skipped (concurrent sweep in progress)", trigger)
 
 
 def _purge_facts_claims_for_replaced_file(file_id: str) -> int:
@@ -982,6 +1293,12 @@ def _upsert_corpus_file(
         content_changed = existing.get("sha256") != sha256
         old_blob = existing.get("storage_path")
         if content_changed:
+            # A changed-content match purges + re-registers the SAME derived
+            # table_id, so it is a re-ingest by another name: refuse it while
+            # an admin's access policy is attached (#2147). Checked before the
+            # purge, and only on the branch that actually purges — an
+            # unchanged-content resync stays a no-op.
+            _refuse_reingest_of_policied_file(collection_id, file_id)
             claims_purged = _purge_children_and_content(
                 collection_id, existing, new_filename=filename, defer_row_purge=defer_row_purge
             )
@@ -1145,9 +1462,9 @@ def source_managing_connection(collection_id: str) -> Optional[dict]:
     or ``None`` for an ordinary collection.
 
     A collection referenced by any connection's ``config.scopes[]
-    .collection_id`` gets its content from that source's pipeline (crawl →
-    convert → [anonymize] → upload under a ``ProducerPrincipal``), so
-    interactive writes into it are refused — a hand-added file would pollute
+    .collection_id`` gets its content from that source's in-process
+    pipeline (crawl → convert → [anonymize] → ingest), so
+    HTTP writes into it are refused — a hand-added file would pollute
     the mirrored corpus, and on an anonymize-marked scope it would bypass
     the anonymizer entirely (the facts-ingest declaration gate never sees
     plain file uploads). Derived from the scope reference on purpose, not
@@ -1164,16 +1481,30 @@ def source_managing_connection(collection_id: str) -> Optional[dict]:
     return None
 
 
-def _refuse_source_managed(connection: dict) -> None:
+def _refuse_source_managed(connection: dict, *, operation: str = "upload") -> None:
+    """Raise the typed 409 for a write into a source-managed collection.
+
+    ``operation`` picks the sentence, not the contract: the ``error`` and
+    ``connection`` keys are identical for every caller (clients branch on
+    those), while the message names the write that was actually refused —
+    "not manual upload" is the wrong explanation for a rename.
+    """
     name = connection.get("name") or connection.get("id") or "a source connection"
+    why = (
+        (
+            "Its name and description are derived from that source's scope, so an edit here "
+            "would be silently reverted by the next sync."
+        )
+        if operation == "edit"
+        else "Its content arrives through that source's pipeline, not manual upload."
+    )
     raise HTTPException(
         status_code=409,
         detail={
             "error": "collection_source_managed",
             "connection": name,
             "message": (
-                f"This collection is fed by the '{name}' source connection — its content "
-                "arrives through that source's pipeline, not manual upload. Unselect the "
+                f"This collection is fed by the '{name}' source connection. {why} Unselect the "
                 "scope in the connect wizard first if you really need to hand-manage it."
             ),
         },
@@ -1190,16 +1521,9 @@ async def upload_files(
     source_doc_ids: Optional[List[str]] = Form(None),
     source_sha256s: Optional[List[str]] = Form(None),
     document_dates: Optional[List[str]] = Form(None),
-    user=Depends(require_collection_write_or_producer_access("{collection_id}")),
+    user=Depends(require_collection_access("{collection_id}")),
 ):
     """Upload one or more files into a collection.
-
-    Also the corpus-extraction producer's own upload callback (TCRD-...):
-    a ``ProducerPrincipal`` scoped to THIS collection may call this too
-    (see ``require_collection_write_or_producer_access``) — every OTHER
-    collection route (read/delete/reingest/preview/raw) keeps
-    ``require_collection_access`` unchanged and still 403s that same
-    principal.
 
     Each file passes through the extension allowlist:
 
@@ -1278,25 +1602,11 @@ async def upload_files(
     if not corpus:
         raise HTTPException(status_code=404, detail="collection_not_found")
 
-    if not isinstance(user, ProducerPrincipal):
-        # Interactive callers — admins included: this is an integrity rule,
-        # not an access rule (see `source_managing_connection`).
-        managing = source_managing_connection(collection_id)
-        if managing is not None:
-            _refuse_source_managed(managing)
-
-    if isinstance(user, ProducerPrincipal):
-        # A restricted principal's identity is never stashed onto
-        # `request.state.user`, so the generic audit-fallback middleware
-        # sees no attributable caller for this mutating POST and writes
-        # nothing at all — self-audit explicitly instead, distinguishably
-        # (`client_kind="producer"`).
-        log_safe(
-            action="collection.file_add",
-            resource=collection_id,
-            client_kind="producer",
-            params={"file_count": len(files)},
-        )
+    # This is an integrity rule, not an access rule (see
+    # `source_managing_connection`).
+    managing = source_managing_connection(collection_id)
+    if managing is not None:
+        _refuse_source_managed(managing)
 
     # Positional pairing is only safe when the lists line up 1:1.
     if paths is not None and len(paths) != len(files):
@@ -1580,14 +1890,55 @@ async def upload_files(
 @router.get("/{collection_id}/files")
 async def list_files(
     collection_id: str,
+    limit: int = DEFAULT_FILE_LIST_LIMIT,
+    offset: int = 0,
+    q: Optional[str] = None,
+    status: Optional[str] = None,
+    order: str = "newest",
     user=Depends(require_collection_access("{collection_id}")),
 ):
-    """List all files in a collection (all processing statuses)."""
+    """List files in a collection (all processing statuses) — paginated,
+    optionally filtered by filename/path substring (``q``) and/or exact
+    ``processing_status`` (``status``), in ``order`` (``newest`` here by
+    default — the dashboard's most useful default; see
+    ``corpus_files_repo().list_for_corpus`` for the full set and its
+    ``, id ASC`` tie-break).
+
+    ``limit``/``offset`` are clamped, never rejected — see
+    ``_clamp_file_list_limit``/``_clamp_file_list_offset``. A blank ``q`` or
+    ``status`` (``?q=``, what every HTML form sends for an unset optional)
+    means "no filter", exactly like the ``corpus_id`` handling in
+    ``search_collections`` above.
+
+    ``total`` is the row count AFTER the ``q``/``status`` filters and BEFORE
+    ``limit``/``offset`` — the number of matches a caller paging through
+    ``q`` can trust, not the collection's whole file count.
+    """
     corpus = file_corpora_repo().get(collection_id)
     if not corpus:
         raise HTTPException(status_code=404, detail="collection_not_found")
-    files = corpus_files_repo().list_for_corpus(collection_id)
-    return {"files": [_file_out(f) for f in files]}
+
+    limit = _clamp_file_list_limit(limit)
+    offset = _clamp_file_list_offset(offset)
+    q = (q or "").strip() or None
+    status = (status or "").strip() or None
+
+    cf_repo = corpus_files_repo()
+    total = cf_repo.count_for_corpus(collection_id, q=q, status=status)
+    files = cf_repo.list_for_corpus(
+        collection_id,
+        limit=limit,
+        offset=offset,
+        q=q,
+        status=status,
+        order=order,
+    )
+    return {
+        "files": [_file_out(f) for f in files],
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
 
 
 class MoveFileBody(BaseModel):
@@ -1608,7 +1959,7 @@ async def move_file(
     someone else's collection).
 
     When the source collection is left empty it is soft-deleted: a single-file
-    artefact IS its file in the Library, so dragging that file into a folder
+    artifact IS its file in the Library, so dragging that file into a folder
     must not strand an empty husk in the listing.
     """
     target_id = payload.target_collection_id
@@ -1640,6 +1991,29 @@ async def move_file(
 
     if not cf_repo.move_to_corpus(file_id, target_id):
         raise HTTPException(status_code=404, detail="file_not_found")
+
+    # The file row has moved; its CLAIMS have not. `claims.corpus_id` is
+    # denormalized from `corpus_files` and is the column fact visibility is
+    # filtered on, so leaving it behind does not merely file the facts under
+    # the old collection in the graph facets — it leaves them readable to the
+    # collection the file just left. Best-effort by design: the fact graph is
+    # Postgres-only and optional, so an instance without it must still be able
+    # to move a file.
+    try:
+        from src.repositories import RequiresPostgresBackend, facts_repo
+
+        moved_claims = facts_repo().reassign_file_corpus(file_id, target_id)
+        if moved_claims:
+            logger.info(
+                "corpus_file move repointed %s claim(s) file_id=%s to=%s",
+                moved_claims,
+                file_id,
+                target_id,
+            )
+    except RequiresPostgresBackend:
+        pass  # no fact graph on this backend — nothing to repoint
+    except Exception as e:
+        logger.warning("move_file: could not repoint claims for %s: %s", file_id, e)
 
     source_emptied = False
     try:
@@ -1763,6 +2137,10 @@ async def reingest_file(
     # leave the row permanently stuck and permanently un-reingestable.
     if row.get("processing_status") == "processing" and not _is_stale_processing(row):
         raise HTTPException(status_code=409, detail="reingest_in_progress")
+
+    # Before anything is purged or enqueued: a derived table an admin has
+    # attached an access policy to is not re-ingestable from here (#2147).
+    _refuse_reingest_of_policied_file(collection_id, file_id)
 
     from app.roles import Role, role_enabled
 

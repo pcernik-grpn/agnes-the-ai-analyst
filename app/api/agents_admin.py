@@ -214,6 +214,34 @@ def _audit(actor: str, action: str, target: str, params: Optional[dict] = None) 
         pass
 
 
+def _policied_tables_disclosure(knowledge: List[str], owner_user_id: Optional[str]) -> List[Dict[str, Any]]:
+    """Tables in ``knowledge`` (this agent's attached data packages) that
+    carry an access policy, diagnosed for the agent's OWNER (design doc
+    §12). Bounded and cheap in the common case: an empty ``knowledge`` list
+    (most agents) short-circuits before any query, and a live per-table
+    check only runs for a package a caller has actually attached — the same
+    self-audit cost `/api/me/effective-access` already accepts, applied to
+    a strictly smaller set (this agent's own scope, not every table the
+    caller can reach).
+
+    A Slack channel bound to this agent, or a scheduled run, answers
+    EVERYONE with this OWNER's slice — never the person actually asking —
+    so the owner must see it here, on every read of their own agent,
+    whether that read lands on the `/agents` page or `agnes agent show`.
+    A direct caller (agent-as-API, chat, a delegated turn) is filtered by
+    ITS OWN identity instead (`src/access_policy.py::_resolve_identity`)
+    and is unaffected by what this reports.
+    """
+    if not knowledge or not owner_user_id:
+        return []
+    owner = users_repo().get_by_id(owner_user_id)
+    if not owner:
+        return []
+    from app.services.agent_ingredients import policy_disclosure_for_knowledge
+
+    return policy_disclosure_for_knowledge(knowledge, {"id": owner["id"], "email": owner.get("email")})
+
+
 def _serialize(
     row: Dict[str, Any],
     *,
@@ -264,6 +292,22 @@ def _serialize(
     out["knowledge"] = knowledge
     out["plugins"] = plugins
     out["surfaces"] = _decode(row.get("surfaces"), {})
+    # Design doc §12 disclosure — computed from the HYDRATED `knowledge`
+    # above (not the raw JSON column), so a governance-scoped agent whose
+    # declaration only lives in `agent_scope` rows is covered too.
+    #
+    # Surfaced to the OWNER (and an admin) only. `GET /api/v1/agents*` also
+    # admits a READ-only grantee (`_load_agent`'s auth matrix), and this
+    # block carries the owner's live `rows_visible` / `reason` / `note` on
+    # tables the grantee may hold no grant on at all — owner-private, the
+    # same way the memory notebook is (see `list_memories`). A grantee's
+    # own runs bind the grantee's identity, so the owner's slice is of no
+    # operational use to them either; they get an empty list, never a 404.
+    owner_id_for_disclosure = row.get("owner_user_id")
+    disclose = uid is not None and (uid == owner_id_for_disclosure or is_user_admin(uid))
+    policied = _policied_tables_disclosure(knowledge, owner_id_for_disclosure) if disclose else []
+    out["policied_tables"] = policied
+    out["policied_tables_in_scope"] = [t["table_id"] for t in policied]
     if uid is not None:
         mine = row.get("owner_user_id") == uid
         out["mine"] = mine
@@ -332,6 +376,39 @@ def _is_token_live(token: Dict[str, Any]) -> bool:
     return datetime.now(timezone.utc) <= expires_at
 
 
+def _is_admin_manageable_system_agent(row: Dict[str, Any]) -> bool:
+    """True iff ``row`` is owned by a recognized SYSTEM identity whose
+    profile is organizational configuration, not a human's personal agent.
+
+    Narrow, explicit allowlist (issue #1971 Part 1) — currently just the
+    seeded ``memory-curator`` profile. The blanket "admin may inspect but
+    not modify a foreign agent" rule in :func:`_load_agent` exists to
+    protect a HUMAN's own agent config from admin overreach; that privacy
+    rationale does not apply to a profile nobody personally owns, and
+    without this carve-out "admin-gated editing through the existing
+    agents UI/API" would be unreachable by anyone — the profile's owner is
+    a synthetic user nothing ever authenticates as, so ``is_owner`` is
+    always False for every real caller, admin included.
+
+    This does not touch the ownership rule for any other agent: a regular
+    user's row is unaffected (`row["owner_user_id"]` never matches the
+    memory-curator system user's id), so
+    `test_admin_cannot_mutate_foreign_agent` stays exactly as strict as
+    before. Only one extra query, and only on the branch that would
+    otherwise already 403.
+    """
+    owner_user_id = row.get("owner_user_id")
+    if not owner_user_id:
+        return False
+    try:
+        from app.auth.system_users import MEMORY_CURATOR_USER_EMAIL
+
+        owner = users_repo().get_by_email(MEMORY_CURATOR_USER_EMAIL)
+    except Exception:
+        return False
+    return bool(owner) and owner.get("id") == owner_user_id
+
+
 def _load_agent(
     agent_id: str,
     user: dict,
@@ -346,7 +423,11 @@ def _load_agent(
     C1.1) a grantee — existence of another user's agent is never leaked.
     Admins pass the existence check (so GET works for governance) but
     `require_owner=True` (every mutating route, including token issuance)
-    still 403s them on a foreign agent. A grantee (a `ResourceType.AGENT`
+    still 403s them on a foreign agent — UNLESS the agent is one of the
+    admin-manageable system profiles (`_is_admin_manageable_system_agent`,
+    issue #1971): those are organizational configuration owned by a
+    synthetic identity, not a human's personal agent, so an admin may
+    manage them through this same route. A grantee (a `ResourceType.AGENT`
     row via one of the caller's groups — the /agents builder's own sharing
     reach, `app.api.agents_builder_shared._granted_agent_ids`) may likewise
     only READ:
@@ -367,7 +448,7 @@ def _load_agent(
     is_owner = row["owner_user_id"] == user["id"]
     if not is_owner:
         if is_user_admin(user["id"], conn):
-            if require_owner:
+            if require_owner and not _is_admin_manageable_system_agent(row):
                 raise _err(403, "agent_not_owned", "Admins may inspect but not modify another user's agent")
         else:
             from app.api.agents_builder_shared import _granted_agent_ids

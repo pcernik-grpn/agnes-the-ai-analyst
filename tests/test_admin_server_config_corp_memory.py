@@ -78,16 +78,87 @@ def test_corp_memory_nested_sources_session_transcripts_detection_types(seeded_a
     assert "unprompted_definition" in dt["default"]
 
 
-def test_corp_memory_extraction_section_present(seeded_app):
+def test_corp_memory_session_transcripts_enabled_and_detection_types_are_live(seeded_app):
+    """#1957 interim hotfix: enabled + detection_types are now read on every
+    verification-processor run — the schema hint must say so (not "restart"),
+    so an admin doesn't bounce the server for nothing."""
+    c = seeded_app["client"]
+    token = seeded_app["admin_token"]
+    r = c.get("/api/admin/server-config", headers=_auth(token))
+    sess = r.json()["known_fields"]["corporate_memory"]["sources"]["fields"]["session_transcripts"]
+    assert sess["fields"]["enabled"]["kind"] == "bool"
+    assert sess["fields"]["enabled"]["default"] is True
+    assert "Live" in sess["fields"]["enabled"]["hint"]
+    assert "Live" in sess["fields"]["detection_types"]["hint"]
+
+
+def test_corp_memory_session_transcripts_confidence_base_removed_max_turns_now_live(seeded_app):
+    """issue #1971 Part 6: confidence_base was a dead duplicate of
+    confidence.base['user_verification.<detection_type>'] and never read —
+    removed rather than left as a misleading knob. max_turns_per_session
+    WAS wired in the same pass — its hint must say "Live", not "#1971"."""
+    c = seeded_app["client"]
+    token = seeded_app["admin_token"]
+    r = c.get("/api/admin/server-config", headers=_auth(token))
+    sess = r.json()["known_fields"]["corporate_memory"]["sources"]["fields"]["session_transcripts"]
+    assert "confidence_base" not in sess["fields"]
+    assert "Live" in sess["fields"]["max_turns_per_session"]["hint"]
+
+
+def test_corp_memory_claude_local_md_now_live(seeded_app):
+    """issue #1971 Part 6: sources.claude_local_md.enabled was documented
+    but never read — now wired (a False value skips the whole collector
+    run). confidence_base was a dead duplicate, removed."""
+    c = seeded_app["client"]
+    token = seeded_app["admin_token"]
+    r = c.get("/api/admin/server-config", headers=_auth(token))
+    claude_local_md = r.json()["known_fields"]["corporate_memory"]["sources"]["fields"]["claude_local_md"]
+    assert "confidence_base" not in claude_local_md["fields"]
+    assert "Live" in claude_local_md["hint"]
+    assert "Live" in claude_local_md["fields"]["enabled"]["hint"]
+
+
+def test_corp_memory_distribution_mode_hint_describes_real_enforcement(seeded_app):
+    """The hint used to say distribution_mode was NOT YET ENFORCED (#1573).
+    It has been enforced since select_distributable_items landed — the hint
+    must describe the real three-mode behavior, not the stale caveat."""
+    c = seeded_app["client"]
+    token = seeded_app["admin_token"]
+    r = c.get("/api/admin/server-config", headers=_auth(token))
+    hint = r.json()["known_fields"]["corporate_memory"]["distribution_mode"]["hint"]
+    assert "NOT YET ENFORCED" not in hint
+    assert "select_distributable_items" in hint
+
+
+def test_corp_memory_review_period_and_entity_resolution_still_marked_not_wired(seeded_app):
+    """The remaining known-inert corporate_memory knobs (#1971) must say so
+    rather than silently implying they already take effect."""
+    c = seeded_app["client"]
+    token = seeded_app["admin_token"]
+    r = c.get("/api/admin/server-config", headers=_auth(token))
+    fields = r.json()["known_fields"]["corporate_memory"]
+    assert "#1971" in fields["review_period_months"]["hint"]
+    assert "#1971" in fields["entity_resolution"]["hint"]
+    assert "#1971" in fields["extraction"]["fields"]["contradiction_check"]["hint"]
+    assert "#1971" in fields["contradiction_detection"]["hint"]
+
+
+def test_corp_memory_extraction_model_and_sensitivity_check_now_live(seeded_app):
+    """issue #1971 Part 6: extraction.model (a per-feature override of the
+    global ai.model, mirroring extraction.facts.model) and
+    extraction.sensitivity_check are now read; extraction.contradiction_check
+    stays unwired (see the dedicated 'still not wired' test above)."""
     c = seeded_app["client"]
     token = seeded_app["admin_token"]
     r = c.get("/api/admin/server-config", headers=_auth(token))
     extraction = r.json()["known_fields"]["corporate_memory"]["extraction"]
     assert extraction["kind"] == "object"
     assert "model" in extraction["fields"]
+    assert "Live" in extraction["fields"]["model"]["hint"]
     assert "sensitivity_check" in extraction["fields"]
     assert extraction["fields"]["sensitivity_check"]["kind"] == "bool"
     assert extraction["fields"]["sensitivity_check"]["default"] is True
+    assert "Live" in extraction["fields"]["sensitivity_check"]["hint"]
 
 
 def test_corp_memory_confidence_base_is_map_of_floats(seeded_app):

@@ -53,7 +53,7 @@ class _WriteCounter:
 
     Deliberately an OBJECT rather than a plain ``int`` in the ContextVar.
     Starlette's ``BaseHTTPMiddleware`` (several are mounted below this
-    middleware pair — posthog injection, version headers, metrics) runs the
+    middleware pair — version headers, metrics) runs the
     downstream app in its own asyncio task, and a new task gets a COPY of
     the context: a ``ContextVar.set(n + 1)`` performed inside the handler
     mutates only that copy and is invisible to the outer middleware once
@@ -138,6 +138,38 @@ def auto_audit_identity() -> "tuple[str | None, str | None]":
     request, or a non-HTTP context)."""
     identity = _audit_identity.get()
     return identity if identity is not None else (None, None)
+
+
+def apply_view_as_attribution(user_id: "str | None", params: "dict | None") -> "tuple[str | None, dict | None]":
+    """Re-attribute a row written during a read-only view-as to the VIEWER.
+
+    While an admin is viewing Agnes as someone else (``app/auth/view_as.py``),
+    ``get_current_user`` resolves to the TARGET — which is the whole point, and
+    also means a handler writing ``user_id=user["id"]`` would name a person who
+    did nothing. An audit trail that records a false statement about a user is
+    worse than a missing row, so the actor is corrected here rather than at 149
+    separate call sites, and ``params`` gains ``viewed_as`` so each row explains
+    itself instead of having to be correlated with the ``view_as.start`` row.
+
+    This is the same layer, and the same reasoning, as the ``client_ip`` /
+    ``correlation_id`` / ``client_kind`` autofills the repositories already do:
+    a request-scoped fact the caller cannot be expected to thread through.
+    Rewrites ONLY when the row names the target — a row a view-as request
+    writes about somebody else (rare, but possible) keeps its own subject.
+
+    No-op outside a view-as, which is every request on an instance that never
+    uses the feature.
+    """
+    from app.auth.view_as import active_ticket
+
+    ticket = active_ticket()
+    if ticket is None:
+        return user_id, params
+    if user_id is not None and user_id != ticket.target_user_id:
+        return user_id, params
+    enriched = dict(params or {})
+    enriched.setdefault("viewed_as", ticket.target_user_id)
+    return ticket.viewer_user_id, enriched
 
 
 def begin_request_write_tracking() -> None:

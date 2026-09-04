@@ -220,14 +220,16 @@ class TestModelList:
         assert r.status_code == 200
         body = r.text
         assert "retail" in body
-        # Object counts per type: 2 datasets, 1 metric, 1 constraint,
-        # 1 relationship, 1 glossary term — rendered through fbar_card()'s
-        # `tags` slot, which (like every other tag list in the product)
-        # shows the first 3 and collapses the rest to "+N".
-        assert "2 datasets" in body
-        assert "1 metric<" in body or "1 metric " in body
-        assert "1 constraint" in body
-        assert "+2" in body  # relationships + glossary terms collapse
+        # Object counts per type — 2 datasets, 1 metric, 1 constraint,
+        # 1 relationship, 1 glossary term — in the card's META line, not its
+        # `tags` slot. The slot shows three chips at 11ch each, so five counts
+        # came out as "2 datasets · 2 metrics · 2 constrai…" with the rest
+        # behind a "+2": counts are prose, and the SQL dialect (one short
+        # label) is what belongs in a chip.
+        meta = body.split('class="fbar-card__meta"', 1)[1].split("</p>", 1)[0]
+        for expect in ("2 datasets", "1 metric", "1 constraint", "1 relationship", "1 glossary term"):
+            assert expect in meta, (expect, meta)
+        assert "fbar-card__tag--more" not in body, "nothing hidden behind a +N any more"
         # Native (source='manual') carries no "Imported from" badge.
         assert "Imported from" not in body
 
@@ -906,7 +908,7 @@ class TestObjectDetail:
         r = c.get(f"/semantic-layer/{_SLUG}/dataset:orders", headers=_auth(seeded_app["admin_token"]))
         assert r.status_code == 200
         assert "Imported from" not in r.text
-        assert ">Native<" in r.text
+        assert ">Created in Agnes<" in r.text
 
     def test_unknown_object_type_is_404(self, seeded_app):
         _seed_model()
@@ -1006,12 +1008,12 @@ class TestObjectDetailScaffold:
         assert _side_row(r.text, "Source ref") is None
 
     def test_native_model_has_no_source_row(self, seeded_app):
-        """The hero badge already says Native; a rail row repeating it teaches
-        the reader that the rail restates the header."""
+        """The hero badge already states the provenance; a rail row repeating
+        it teaches the reader that the rail restates the header."""
         _seed_model()
         r = self._object(seeded_app, seeded_app["admin_token"])
         assert r.status_code == 200, r.text
-        assert ">Native<" in r.text  # the header still states it
+        assert ">Created in Agnes<" in r.text  # the header still states it
         assert _side_row(r.text, "Source") is None
 
     def test_detached_model_says_so_in_the_rail(self, seeded_app, monkeypatch):
@@ -1102,23 +1104,29 @@ class TestObjectDetailLegacyTheme:
 
 class TestLibraryEntryPoint:
     """Inbound-link guard, same bug class ``tests/test_web_nav_agents.py``
-    guards against: a route is not a shipped page until something links to
-    it. `/semantic-layer` is not a rail row (design-system.md's rail is
-    fixed rows; a new content surface reaches the caller through an existing
-    destination) — the Library's own "Semantic models" section is where it
-    hangs, for both admin and non-admin (this is a read-tier page, not
-    admin-only). Each readable model is a ROW linking to its own detail page
-    (#1707 N3), so a caller who can read none is offered no model link at all
-    and never dead-ends on the "No semantic model available" empty state
-    (Devin #1398)."""
+    guards against: a route is not a shipped page until something links to it.
+    `/semantic-layer` is not a rail row (design-system.md's rail is fixed rows;
+    a new content surface reaches the caller through an existing destination),
+    so the Library is where it hangs — for both admin and non-admin, since this
+    is a read-tier page and not admin-only.
+
+    WHERE it hangs changed. #1707 N3 hung it on per-model ROWS in a "Semantic
+    models" section, which meant a caller who could read no document was
+    offered no link at all (Devin #1398 — correct, given rows). The layer is
+    now a page-level Definitions row whose door is the flat registry, so the
+    link no longer depends on document readability: everyone with definitions
+    gets in, and the models are one tab away once they are there. The negative
+    guard survives in the form that still means something — no MODEL link for
+    a caller who cannot read that model."""
 
     def test_semantic_layer_linked_from_library_for_non_admin_with_a_grant(self, seeded_app):
         row = _seed_model()
         _grant_model(row["id"])
+        _seed_metric()
         c = seeded_app["client"]
         r = c.get("/library", headers=_auth(seeded_app["analyst_token"]))
         assert r.status_code == 200
-        assert 'href="/semantic-layer/retail"' in r.text
+        assert 'class="lib-defs__cta" href="/semantic-layer' in r.text
 
     def test_no_link_for_a_non_admin_who_can_read_no_model(self, seeded_app):
         """Devin #1398: the footer link is gated on readability, so a caller
@@ -1147,7 +1155,7 @@ class TestLibraryEntryPoint:
         c = seeded_app["client"]
         r = c.get("/library", headers=_auth(seeded_app["admin_token"]))
         assert r.status_code == 200
-        assert 'href="/semantic-layer/retail"' in r.text
+        assert 'class="lib-defs__cta" href="/semantic-layer' in r.text
 
 
 class TestRegistryBackLink:
@@ -1316,8 +1324,12 @@ class TestFlatProjectionTabsFold:
     def test_every_tab_offers_the_way_back_to_the_others(self, seeded_app):
         for tab in ("models", "all_metrics", "all_glossary"):
             body = self._get(seeded_app, f"/semantic-layer?tab={tab}").text
-            assert "All metrics" in body, tab
-            assert "All glossary" in body, tab
+            # The strip is a segmented control now — buckets of one filtered
+            # set — so the count rides its own badge instead of the label, and
+            # it moves as the reader narrows.
+            assert ">All metrics<" in body, tab
+            assert ">All glossary<" in body, tab
+            assert 'data-seg-count="all_metrics"' in body, tab
 
     def test_all_metrics_tab_lists_a_metric_with_no_document_behind_it(self, seeded_app):
         """The reason this could not be a deletion: ``metric_definitions``
@@ -1331,6 +1343,47 @@ class TestFlatProjectionTabsFold:
     def test_all_glossary_tab_renders_the_glossary_panel(self, seeded_app):
         body = self._get(seeded_app, "/semantic-layer?tab=all_glossary").text
         assert 'id="glossary-list"' in body
+
+    def test_the_glossary_source_sidebar_is_retired_for_the_shared_toolbar(self, seeded_app):
+        """#1956 item 1, second pass. #2003 shipped it as a sidebar bucketed by
+        the term's own `source`, and said so in its own comment: per-model
+        attribution was "a #1956 follow-up, not invented here".
+
+        This is that follow-up. The owning model is read from the DOCUMENT
+        (`model_glossary`) — the one place that knows — so `source` stops being
+        a stand-in for provenance and becomes one facet beside Model, in the
+        same toolbar the Library and /chats use. The sidebar goes with it.
+        """
+        from src.repositories import glossary_repo
+
+        glossary_repo().create(id="g1", term="ARR", definition="Annual recurring revenue.", source="manual")
+        glossary_repo().create(id="g2", term="MRR", definition="Monthly recurring revenue.", source="ossie_git")
+        glossary_repo().create(id="g3", term="NRR", definition="Net revenue retention.", source="ossie_git")
+
+        body = self._get(seeded_app, "/semantic-layer?tab=all_glossary").text
+        assert 'aria-label="Glossary sources"' not in body, "the bespoke sidebar is gone"
+        assert "sl-cat-nav" not in body
+        # …and Source is a real facet in the shared menu, with both values.
+        assert 'data-cat="source"' in body
+        assert 'data-facet="source"' in body
+        assert 'value="manual"' in body and 'value="ossie_git"' in body
+
+    def test_a_source_facet_offers_only_the_sources_present(self, seeded_app):
+        """The sidebar's rule survives the move: no option for a source no
+        stored term carries. In the shared engine it is stronger — a facet with
+        fewer than two values does not render at all, because every row would
+        match it."""
+        from src.repositories import glossary_repo
+
+        glossary_repo().create(id="g1", term="ARR", definition="Annual recurring revenue.", source="manual")
+
+        body = self._get(seeded_app, "/semantic-layer?tab=all_glossary").text
+        assert 'value="ossie_git"' not in body
+        assert 'value="keboola_metastore"' not in body
+        assert 'id="sl-filter-btn"' not in body, (
+            "one source and one model: every facet has a single value, so the "
+            "Filter button has nothing to open"
+        )
 
     def test_the_metrics_tab_consumes_the_deep_links_q(self, seeded_app):
         _seed_metric("arr")
@@ -1387,47 +1440,190 @@ class TestFlatProjectionTabsFold:
 
 
 class TestLibrarySemanticSection:
-    """N3 (issue #1707): the semantic layer is a NAMED Library section.
+    """The semantic layer is NOT a Library section any more — it is a row.
 
-    It used to be a footer aside below an unbounded list — the last thing on
-    the page, after every row, which is where a reader stops looking. It is
-    now one of the Library's own sections, in a fixed slot of the section
-    order, carrying the caller's readable models as rows and the two flat
-    projections as links into their tabs.
+    #1707 N3 made it one: a named section in a fixed slot, carrying the
+    caller's readable models as rows. That was right about the footer aside it
+    replaced (the last thing on an unbounded page, where a reader stops
+    looking) and wrong about the section, for a reason the section could not
+    express.
+
+    A semantic model is not opt-in. ``src/claude_md.py`` writes every model the
+    caller can read into the workspace document at session start, visibility
+    comes from Data Package grants, and there is no ``semantic_model`` type in
+    the Stack — so no "Add to my agents" exists for one. Every OTHER row in the
+    Library has that opt-in state, and it is the defining property of the
+    region. A block that is always on, sitting among rows whose whole point is
+    that you chose them, reads as a member of a set it is not in.
+
+    So it is stated once, above the toolbar, as a page-level row — and the
+    models are listed by ``/semantic-layer``'s own Models tab, which can show
+    their object counts, dialects and validation status. The tests below pin
+    that inversion, and the two #1955 description-fallback tests move with it:
+    the fallback still matters, it just has to be asserted where the model is
+    rendered now.
     """
 
-    def test_the_section_is_named_and_carries_its_models_as_rows(self, seeded_app):
+    def test_the_layer_is_not_a_section_and_carries_no_model_rows(self, seeded_app):
         row = _seed_model()
         _grant_model(row["id"])
         body = seeded_app["client"].get("/library", headers=_auth(seeded_app["analyst_token"])).text
-        assert 'data-lib-sec="semantic_model"' in body
-        assert "Semantic models" in body
-        assert 'href="/semantic-layer/retail"' in body
+        assert 'data-lib-sec="semantic_model"' not in body
+        assert 'href="/semantic-layer/retail"' not in body, (
+            "a model is listed by /semantic-layer's Models tab, not as a Library row"
+        )
 
-    def test_the_footer_aside_is_gone(self, seeded_app):
+    def test_the_definitions_row_is_there_instead(self, seeded_app):
         _seed_metric()
         _seed_model()
         body = seeded_app["client"].get("/library", headers=_auth(seeded_app["admin_token"])).text
-        assert 'class="lib-defs"' not in body, "the Definitions aside was promoted to a section"
+        assert 'id="lib-defs"' in body
+        # Above the toolbar, not among the rows: it has no opt-in state, so it
+        # cannot belong to the region whose rows are defined by having one.
+        assert body.index('id="lib-defs"') < body.index('id="lib-item-count"')
 
-    def test_the_section_links_at_the_folded_tabs_not_the_old_url(self, seeded_app):
+    def test_the_row_states_the_counts_and_opens_them(self, seeded_app):
+        """The counts are the only part of the block that is a fact about THIS
+        instance rather than about the product, so they stay visible; the door
+        lands on the tab they name."""
         _seed_metric()
         body = seeded_app["client"].get("/library", headers=_auth(seeded_app["admin_token"])).text
-        assert "/semantic-layer?tab=all_metrics" in body
-        assert "/semantic-layer?tab=all_glossary" in body
-        assert "/catalog/semantics" not in body
+        counts = body.split('class="lib-defs__counts"', 1)[1].split("</span>", 1)[0]
+        assert "metric" in counts
+        assert 'class="lib-defs__cta" href="/semantic-layer?tab=all_metrics"' in body
+        assert "/catalog/semantics" not in body, "the retired URL is a 308, never a link"
 
-    def test_a_model_the_caller_cannot_read_is_not_a_row(self, seeded_app):
-        _seed_model()  # no grant for this analyst
-        body = seeded_app["client"].get("/library", headers=_auth(seeded_app["analyst_token"])).text
-        assert 'href="/semantic-layer/retail"' not in body
-
-    def test_the_section_still_appears_with_definitions_but_no_readable_model(self, seeded_app):
+    def test_the_row_appears_with_definitions_but_no_readable_model(self, seeded_app):
         """A caller with visible metrics but no readable document still needs
         the door — the flat projection is what they can reach."""
         _seed_metric()
-        _seed_model()
+        _seed_model()  # no grant for this analyst
         body = seeded_app["client"].get("/library", headers=_auth(seeded_app["analyst_token"])).text
-        assert "Semantic models" in body
+        assert 'id="lib-defs"' in body
         assert "/semantic-layer?tab=all_metrics" in body
         assert 'href="/semantic-layer/retail"' not in body
+
+    def test_imported_model_with_a_blank_row_description_falls_back_to_the_document(self, seeded_app):
+        """#1955, asserted where the model is rendered now. A row whose own
+        ``description`` column is blank (every model a sync wrote before the
+        import-time projection existed) used to render with no subtitle even
+        though its document carries one."""
+        doc = {
+            "semantic_model": [
+                {
+                    "name": "kb_retail",
+                    "description": "Imported from Keboola: retail domain.",
+                    "datasets": [{"name": "orders", "fields": []}],
+                }
+            ]
+        }
+        _seed_document("kb_retail", doc, source="keboola_metastore")
+        body = seeded_app["client"].get("/semantic-layer", headers=_auth(seeded_app["admin_token"])).text
+        assert "Imported from Keboola: retail domain." in body
+
+    def test_a_rows_own_description_is_not_overridden_by_the_document(self, seeded_app):
+        """The row's own ``description`` column wins when both exist — the
+        fallback is only for a blank column, never a silent override."""
+        from src.repositories import semantic_model_repo
+
+        row = _seed_model()  # stored description: "Retail domain: orders and customers."
+        semantic_model_repo().update_document(
+            row["id"],
+            name=row["name"],
+            description="Hand-edited row description.",
+            document=row["document"],
+            document_json=row["document_json"],
+            spec_version=row["spec_version"],
+            content_hash=row["content_hash"],
+            validated_at=None,
+        )
+        body = seeded_app["client"].get("/semantic-layer", headers=_auth(seeded_app["admin_token"])).text
+        assert "Hand-edited row description." in body
+        assert "Retail domain: orders and customers." not in body
+
+
+class TestTheModelFilterAnswersAsYouType:
+    """It was the only search in the app that needed a button press.
+
+    The form is server-side, so the answer cost a page load — while every
+    other search on the platform (the Library, /chats, the Definitions page)
+    filters on input. The rows are all rendered already, so the answer is on
+    the page before the button is pressed.
+    """
+
+    def _get(self, seeded_app, path: str, token: str = "admin_token", **kw):
+        return seeded_app["client"].get(path, headers=_auth(seeded_app[token]), **kw)
+
+    def test_the_form_still_submits_without_js(self, seeded_app):
+        """Progressive enhancement, not a replacement: the GET form and the
+        server's `?q=` stay, so a deep link, a bookmark and a no-JS client
+        behave exactly as before. The button is HIDDEN by the script, not
+        removed from the markup — without JS it is the only way to submit."""
+        _seed_model()
+        body = self._get(seeded_app, f"/semantic-layer/{_SLUG}?tab=metrics").text
+        assert '<form class="slb-filter" method="get"' in body
+        assert 'id="slb-filter-submit"' in body, "the no-JS submit stays in the markup"
+        assert "if (submit) submit.hidden = true;" in body, "…and the script hides it"
+
+    def test_typing_filters_and_keeps_the_url_truthful(self, seeded_app):
+        _seed_model()
+        body = self._get(seeded_app, f"/semantic-layer/{_SLUG}?tab=metrics").text
+        js = body.split("function apply()", 1)[1].split("\n    }", 1)[0]
+        assert "r.hidden = !hit" in js
+        assert "history.replaceState" in js, "typing must not fill history"
+        assert "chip.hidden = !q" in js, (
+            "the chip states the ACTIVE filter — left alone it shows whatever the "
+            "last page load filtered on"
+        )
+
+    def test_enter_does_not_reload_the_page(self, seeded_app):
+        """Submitting would fetch a state already on screen."""
+        _seed_model()
+        body = self._get(seeded_app, f"/semantic-layer/{_SLUG}?tab=metrics").text
+        assert "form.addEventListener('submit', function (e) { e.preventDefault(); apply(); });" in body
+
+
+
+def _seed_model_declaring(slug: str, term: str) -> None:
+    """A stored model whose AGNES extension declares one glossary term."""
+    from src.repositories import semantic_model_repo
+
+    doc = _document_json(slug)
+    doc["semantic_model"][0].setdefault("custom_extensions", []).append(
+        {"vendor_name": "agnes", "data": json.dumps({"glossary": [{"term": term, "definition": "x"}]})}
+    )
+    semantic_model_repo().upsert(
+        id=f"manual/_/{slug}",
+        slug=slug,
+        name=slug,
+        description="Fixture.",
+        document="# fixture",
+        document_json=doc,
+        spec_version="0.2.0.dev0",
+        content_hash=f"hash-{slug}",
+        source="manual",
+        source_ref=None,
+        status="valid",
+        validation_errors=None,
+        validated_at=None,
+    )
+
+
+def test_a_term_two_models_declare_does_not_claim_one_of_them(seeded_app):
+    """`term_model[term] = slug` let the LAST model iterated win, so a term
+    declared by two documents was stamped with whichever one dict ordering
+    happened to reach last — a provenance claim decided by iteration order
+    (Devin Review on #2070). The badge now names one deterministically AND
+    says there are more."""
+    from src.repositories import glossary_repo
+
+    _seed_model_declaring("alpha-model", "Churn")
+    _seed_model_declaring("zulu-model", "Churn")
+    glossary_repo().create(id="g-churn", term="Churn", definition="Customers lost.")
+
+    c = seeded_app["client"]
+    r = c.get("/semantic-layer?tab=all_glossary", headers=_auth(seeded_app["admin_token"]))
+    assert r.status_code == 200
+    assert "+1 more" in r.text, (
+        "a term two documents declare must not be presented as belonging to one of them"
+    )

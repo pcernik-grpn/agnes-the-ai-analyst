@@ -27,7 +27,9 @@ because it names exactly the distinctions a renderer needs):
      "args": {...},
      "state": "input-available" | "output-available" | "output-error",
      "result": <any>,          # absent while input-available
-     "is_error": bool}         # absent while input-available
+     "is_error": bool,         # absent while input-available
+     "approval": "allow" | "allow_session" | "deny" | "timeout" | "unattended"}
+                               # only when a human decision gated this call
 
 ``state`` is what lets a reloaded tool card look like a live one. Without it
 the reload path could only render the tool's NAME — no status icon, no
@@ -105,6 +107,13 @@ def build_message_parts(frames: list[dict]) -> Optional[list[dict]]:
                 "args": frame.get("args") or {},
                 "state": STATE_INPUT_AVAILABLE,
             }
+            approval = frame.get("approval")
+            if isinstance(approval, str) and approval:
+                # The manager stamps the resolved approval decision onto the
+                # call it gated (`_record_approval_on_tool_call`); keeping it
+                # on the part is what lets a reloaded tool row still say
+                # "approved by you" (issue #2161).
+                part["approval"] = approval
             if tool_use_id:
                 tool_positions[tool_use_id] = len(parts)
             parts.append(part)
@@ -159,6 +168,32 @@ def parts_to_tool_calls(parts: Optional[list[dict]]) -> Optional[list[dict]]:
         if p.get("type") == "tool" and isinstance(p.get("tool"), str)
     ]
     return calls or None
+
+
+def parts_to_tool_results(parts: Optional[list[dict]]) -> Optional[list[Any]]:
+    """Project ``parts`` to just what the tools RETURNED, in call order.
+
+    The sibling of :func:`parts_to_tool_calls`, and deliberately a second
+    projection rather than a widening of the first: ``tool_calls`` is
+    persisted on every assistant message and is the shape
+    ``chat.js::formatToolCall`` expects, so folding results into it would put
+    a tool's whole output on every row forever.
+
+    The one reader is the sources verdict, which needs the results because a
+    document's name is an OUTPUT — no fact tool takes a filename argument, so
+    a citation checked against arguments alone could never verify (see
+    ``app/chat/sources.py::verify``). ``parts`` is where a result survives,
+    which is also what the reader sees rendered, so the badge and the
+    transcript are judged on the same turn.
+
+    ``None`` when the turn returned nothing, matching the other projections —
+    a turn whose tools all failed to report leaves the verdict exactly where
+    it was before results reached it.
+    """
+    if not parts:
+        return None
+    results = [p.get("result") for p in parts if p.get("type") == "tool" and p.get("result") is not None]
+    return results or None
 
 
 def parts_to_content(parts: Optional[list[dict]]) -> str:

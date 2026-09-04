@@ -189,6 +189,65 @@ SCENARIOS: dict[str, list[dict]] = {
         _text("\n\n**CZ leads** with 1204 sessions, ahead of DE at 998."),
         {"type": "finish"},
     ],
+    # The turn shape from #1974: a research question that opens with a RUN of
+    # six consecutive calls, THREE of them failing, before the answer's first
+    # sentence. Nothing else here reproduces it — every other scenario puts
+    # prose between its tool calls — and it is the shape the tool-call group
+    # exists for. The last failure carries the shape a REAL query error has
+    # now that `_raise_for_status_with_detail` no longer interpolates the
+    # request URL: status, then the DuckDB error the reader can act on. The
+    # `everything` scenario keeps a URL-bearing error so the renderer's
+    # never-a-link rule still has a subject to be tested against.
+    "wall": [
+        _tool_call("call_w1", "fact_search", {"q": "AI roadmap building products", "limit": 20}),
+        _tool_error("call_w1", "Error executing tool fact_search: 404: facts_disabled"),
+        _tool_call("call_w2", "fact_search", {"q": "rapid AI roadmap private equity", "limit": 20}),
+        _tool_error("call_w2", "Error executing tool fact_search: 404: facts_disabled"),
+        _tool_call("call_w3", "knowledge_search", {"query": "AI roadmap building products", "k": 10}),
+        _tool_output("call_w3", _mcp_envelope({"hits": 3})),
+        _tool_call("call_w4", "knowledge_search", {"query": "AI Value Backlog manufacturing", "k": 10}),
+        _tool_output("call_w4", _mcp_envelope({"hits": 5})),
+        _tool_call("call_w5", "Bash", {"command": 'agnes query "SELECT COUNT(*) FROM engagements"'}),
+        _tool_error(
+            "call_w5",
+            "Error executing tool query: 400 Bad Request — Query error: Binder Error: "
+            'Referenced column "engagement_count" not found in FROM clause!',
+        ),
+        _tool_call("call_w6", "Bash", {"command": "agnes catalog --json"}),
+        _tool_output("call_w6", {"columns": ["id", "rows"], "rows": [["engagements", 812]]}),
+        _text("The closest precedent is the 2025 building-products roadmap.\n\n"),
+        _text("```sources\ntable: engagements\nmetric: delivery/utilization\n```"),
+        {"type": "finish"},
+    ],
+    # A table the MODEL writes, streamed the way a model streams it — a few
+    # characters per delta, the header row and the delimiter row each split
+    # across several (TCRD-288). Marked renders a GFM table only once the
+    # delimiter row has one cell per header cell; until then the head is a
+    # paragraph of raw pipes, and a bare <table> carries none of the chat's
+    # table styling. `markdown` below puts a table in a TOOL RESULT, which
+    # arrives whole; this is the other case, and it is the one the reader
+    # sees on every answer with a table in it. Registered BEFORE `table`:
+    # `_pick_scenario` takes the first key found in the message, so a message
+    # naming both shapes gets this one.
+    "tabular": [
+        _text("Two engagements match, both closed won:\n\n"),
+        _text("| Client"),
+        _text(" | Sponsor"),
+        _text(" | Signed | Price"),
+        _text(" |\n|"),
+        _text("---|"),
+        _text("---|---"),
+        _text("|---|\n"),
+        _text("| **Northwind Parts**"),
+        _text(" | Alpine Capital | 2026"),
+        _text("-07-03 | $47,"),
+        _text("500 |\n| Harbor"),
+        _text(" Supply | Meridian Partners"),
+        _text(" | 2026-05-22 |"),
+        _text(" $125,000 |\n\n"),
+        _text("Both count as delivered work — executed SOW only."),
+        {"type": "finish"},
+    ],
     "table": [
         _text("Pulling the numbers.\n\n"),
         _tool_call("call_t", "Bash", {"command": 'agnes query "SELECT * FROM orders LIMIT 400"'}),
@@ -205,6 +264,24 @@ SCENARIOS: dict[str, list[dict]] = {
         _tool_error("call_bad", "Catalog Error: Table with name nope does not exist!"),
         _text("\n\nThat table does not exist — check `agnes catalog`."),
         {"type": "finish"},
+    ],
+    # The counterpart to `wall`: a run whose failures the agent never answered
+    # through. Nothing follows it but the engine dying, so the group keeps its
+    # alert — this is the case the alert is FOR, and the pair is what makes
+    # "recovered" a distinction rather than a way to hide every failure.
+    "broke": [
+        _text("Let me pull the numbers.\n\n"),
+        _tool_call("call_b1", "query", {"sql": "SELECT * FROM fct_revenue"}),
+        _tool_error(
+            "call_b1",
+            "Error executing tool query: 400 Bad Request — Query error: Catalog Error: Table with name fct_revenue does not exist!",
+        ),
+        _tool_call("call_b2", "query", {"sql": "SELECT * FROM revenue"}),
+        _tool_error(
+            "call_b2",
+            "Error executing tool query: 400 Bad Request — Query error: Catalog Error: Table with name revenue does not exist!",
+        ),
+        {"type": "error", "errorText": "upstream model overloaded"},
     ],
     "approval": [
         _text("This one needs your sign-off.\n\n"),
@@ -248,8 +325,183 @@ SCENARIOS: dict[str, list[dict]] = {
         _text("```\n\n"),
         _text("```sources\n"),
         _text("table: orders\n"),
-        _text("assumption: paid orders only\n"),
+        # Three assumption lines, one per shape the renderer distinguishes
+        # (TCRD-289): a stated origin from the closed vocabulary with its
+        # rationale, the origin the reader most needs to notice (the model's
+        # own judgment), and a legacy line with neither — which must render
+        # as "origin not stated", never be dropped.
+        _text(
+            "assumption: paid orders only | origin: user"
+            " | why: you asked about revenue, and an unpaid order is not revenue yet\n"
+        ),
+        _text(
+            "assumption: CZ market = shipping country | origin: judgment"
+            " | why: orders carry no market column, so the shipping address stood in\n"
+        ),
+        _text("assumption: refunds not subtracted\n"),
         _text("```"),
+        {"type": "finish"},
+    ],
+    # `agnes query` DEFAULTS to `--format table`, a rich box-drawing table, and
+    # `agnes catalog`/`describe` print the same way — so this, not JSON, is the
+    # shape most real tool results arrive in. Kept as a scenario because the
+    # renderer has to recognise it: the alignment IS the content, and run
+    # through markdown it collapses into one mangled paragraph.
+    #
+    # Written with the box characters literally (heavy header, light body —
+    # what rich actually emits) so a maintainer can see the table this is.
+    "console": [
+        _text("Listing what is registered.\n\n"),
+        _tool_call("call_console", "Bash", {"command": "agnes catalog"}),
+        _tool_output(
+            "call_console",
+            "\n".join(
+                [
+                    "┏━━━━━━━━━━━━━━━━┳━━━━━━━━━━━┳━━━━━━━━━━━━┓",
+                    "┃ id             ┃ rows      ┃ query_mode ┃",
+                    "┡━━━━━━━━━━━━━━━━╇━━━━━━━━━━━╇━━━━━━━━━━━━┩",
+                ]
+                + [f"│ table_{i:<8} │ {i * 137:<9} │ local      │" for i in range(1, 19)]
+                + ["└────────────────┴───────────┴────────────┘"]
+            ),
+        ),
+        _text("\n\n18 tables are registered."),
+        {"type": "finish"},
+    ],
+    # EVERY renderable shape in one turn, for eyeballing the chat surface as a
+    # whole rather than one piece at a time. Covers: a lone tool step; a run of
+    # consecutive steps folding into a group, with a failure in it; all four
+    # result renderers (console box table, real table from a JSON *string*,
+    # JSON object via an MCP envelope, markdown table); both language arg
+    # panels (a shell command and a SQL statement); an internal URL in an error
+    # that must stay text; the full markdown vocabulary; and the sources /
+    # next_actions trailers with all three chip kinds.
+    #
+    # Deliberately NOT here: `approval` blocks the turn on a human decision and
+    # `deliverable` needs the sandbox file store, so both stay their own
+    # scenarios — folding them in would make this one impossible to just watch.
+    "everything": [
+        _text("Here is **every shape** at once — prose with `inline code`, *emphasis*, "),
+        _text("and a [link](https://example.com).\n\n"),
+        # A LONE step: never wrapped in a group, and its result is the console
+        # box table `agnes catalog` really prints.
+        _tool_call("call_e1", "Bash", {"command": "agnes catalog"}),
+        _tool_output(
+            "call_e1",
+            "\n".join(
+                [
+                    "┏━━━━━━━━━━━━━━━━┳━━━━━━━━━━━┳━━━━━━━━━━━━┓",
+                    "┃ id             ┃ rows      ┃ query_mode ┃",
+                    "┡━━━━━━━━━━━━━━━━╇━━━━━━━━━━━╇━━━━━━━━━━━━┩",
+                ]
+                + [f"│ table_{i:<8} │ {i * 137:<9} │ local      │" for i in range(1, 16)]
+                + ["└────────────────┴───────────┴────────────┘"]
+            ),
+        ),
+        _text("\n\nNow a run of steps, which folds into one group:\n\n"),
+        # A RUN of four: consecutive, so they collapse behind one header, with
+        # a failure so the header reports it.
+        _tool_call("call_e2", "fact_search", {"query": "infra cost owners", "k": 10}),
+        _tool_error("call_e2", "Error executing tool fact_search: 404: facts_disabled"),
+        _tool_call("call_e3", "Read", {"file_path": "/workspace/notes/cost-review.md"}),
+        _tool_output("call_e3", "Reviewed 2026-08-30. Owner: platform team. No open actions."),
+        # A JSON *string* in a tabular shape — what `agnes query --json` over
+        # Bash actually returns, and what has to reach the table renderer.
+        _tool_call("call_e4", "Bash", {"command": 'agnes query --json "SELECT service, cost FROM infra_cost"'}),
+        _tool_output(
+            "call_e4",
+            json.dumps(
+                [
+                    {"service": "EC2", "cost": 441397},
+                    {"service": "SavingsPlans", "cost": 111963},
+                    {"service": "ECR", "cost": 53631},
+                    {"service": "RDS", "cost": 49108},
+                    {"service": "DataTransfer", "cost": 29493},
+                ]
+            ),
+        ),
+        # An internal endpoint inside an error: must render as TEXT, never a
+        # link the reader could follow (#1974).
+        _tool_call("call_e5", "Bash", {"command": 'agnes query "SELECT * FROM nope"'}),
+        _tool_error("call_e5", "Error executing tool query: 400 Bad Request for http://localhost:8000/api/query"),
+        _text("\n\nA SQL argument renders as SQL, not as escaped JSON:\n\n"),
+        _tool_call(
+            "call_e6",
+            "query",
+            {
+                "sql": "SELECT country, COUNT(*) AS sessions\nFROM web_sessions\nWHERE event_date >= CURRENT_DATE - 30\nGROUP BY 1 ORDER BY 2 DESC",
+                "limit": 100,
+            },
+        ),
+        _tool_output("call_e6", _mcp_envelope({"rows_returned": 6, "scanned_bytes": 41203, "cached": True})),
+        _text("\n\nAnd a tool whose output is markdown:\n\n"),
+        _tool_call("call_e7", "Bash", {"command": "agnes catalog --format md"}),
+        _tool_output("call_e7", "| table | rows |\n|---|---|\n| orders | 12043 |\n| users | 881 |"),
+        _text("\n\n# Infrastructure cost review\n\n"),
+        _text("The three findings below account for **82%** of the monthly bill.\n\n"),
+        _text("## 1. Compute dominates\n\n"),
+        _text("EC2 alone is `$441,397`, which is more than every other service combined.\n\n"),
+        _text("## 2. What to check first\n\n"),
+        _text("1. Reserved-instance coverage on the top five instance families\n"),
+        _text("2. Idle volumes older than 90 days\n"),
+        _text("3. Cross-AZ transfer between the two busiest subnets\n"),
+        _text("   - the staging mirror is the usual culprit\n"),
+        _text("   - it was last reviewed in June\n\n"),
+        _text("### The query behind it\n\n"),
+        _text(
+            "```sql\nSELECT service, SUM(cost) AS cost\nFROM infra_cost_aggregated\nWHERE month = DATE_TRUNC('month', CURRENT_DATE)\nGROUP BY 1 ORDER BY 2 DESC;\n```\n\n"
+        ),
+        _text("| Service | Cost | Share |\n|---|---|---|\n"),
+        _text("| EC2 | $441,397 | 63% |\n| SavingsPlans | $111,963 | 16% |\n| ECR | $53,631 | 8% |\n\n"),
+        _text("---\n\n"),
+        _text("> Figures are month-to-date and exclude committed-use discounts.\n\n"),
+        _text("```next_actions\n"),
+        _text("- Break the EC2 line down by instance family\n"),
+        _text("- Chart the last 90 days of DataTransfer\n"),
+        _text("```\n\n"),
+        # Six references on purpose: past _SOURCES_VISIBLE, so the row shows
+        # the cap and its "+N more" rather than wrapping to a second line.
+        _text("```sources\n"),
+        _text("table: infra_cost_aggregated\n"),
+        _text("metric: delivery/utilization\n"),
+        _text("table: aws_cost\n"),
+        _text("table: azure_cost\n"),
+        _text("table: gcp_cost\n"),
+        _text("metric: finops/unit_economics\n"),
+        _text("assumption: month-to-date, discounts excluded\n"),
+        _text("```"),
+        {"type": "finish"},
+    ],
+    # A DOCUMENT-shaped answer — headings, numbered steps, fenced code, a
+    # bullet list, a table, a rule. Nothing to do with tool calls: this is the
+    # message BODY, whose markdown had no styling of its own and fell through
+    # to browser defaults (a 2em h1 with 0.67em margins inside a chat bubble).
+    # Kept as a scenario because rhythm is only judgeable on a real document.
+    "doc": [
+        _text("# Minting a Personal Access Token (PAT)\n\n"),
+        _text("Based on the Agnes documentation:\n\n"),
+        _text("## 1. Open your Agnes instance in a browser\n\n"),
+        _text("```\nhttps://<your-instance>.example.com\n```\n\n"),
+        _text("## 2. Navigate to token management\n\n"),
+        _text(
+            'Log in, then go to **Settings → Personal Access Tokens** (or look for a "PAT" section in your profile).\n\n'
+        ),
+        _text("## 3. Create a new token\n\n"),
+        _text("- Click **Create** (or **New Token**)\n"),
+        _text("- Give it a descriptive name (e.g. `cli-laptop`)\n"),
+        _text("- Copy the token immediately — it is shown only once\n\n"),
+        _text("## 4. Use it with the CLI\n\n"),
+        _text(
+            "```bash\nagnes init --server-url https://<your-instance>.example.com --token <paste-token-here>\n```\n\n"
+        ),
+        _text("### Key things to know\n\n"),
+        _text("| Detail | Note |\n|---|---|\n"),
+        _text("| Scope | PATs are **per-instance** — a token from one deployment won't work on another |\n"),
+        _text("| Expiry | If you get `HTTP 401: unauthorized`, your PAT has expired — mint a new one |\n"),
+        _text("| Security | Treat it like a password — don't commit it to git or share it |\n\n"),
+        _text("---\n\n"),
+        _text('If you don\'t see a "Personal Access Tokens" section, your admin may need to grant you access.\n\n'),
+        _text("> Reach out to your instance administrator.\n"),
         {"type": "finish"},
     ],
     "markdown": [
@@ -274,7 +526,8 @@ SCENARIOS: dict[str, list[dict]] = {
         _tool_call("call_d", "server_info", {}),
         _tool_output("call_d", _mcp_envelope({"authenticated": True, "health": {"status": "ok"}})),
         _text(
-            "\n\nTry `interleaved`, `table`, `fail`, `approval`, `error`, `markdown`, `nextactions` or `deliverable`."
+            "\n\nTry `interleaved`, `wall`, `table`, `fail`, `approval`, `error`, `markdown`, "
+            "`tabular`, `nextactions` or `deliverable`."
         ),
         {"type": "finish"},
     ],

@@ -88,9 +88,12 @@ class TestRegisterAllKinds:
         "analytics-rebuild",
         "collections-purge",
         "webhook-deliver",
+        "knowledge-packaging",
         "corpus-extraction",
+        "corpus-extraction-shard",
         "sharepoint-acl-sync",
         "sharepoint-subtree-sweep",
+        "sharepoint-facts-extraction",
     }
 
     def test_registers_unconditional_kinds_without_chat_manager(self):
@@ -125,6 +128,10 @@ class TestRegisterAllKinds:
         assert JOB_KINDS["corpus-extraction"].lane == EXTRACTION_LANE
         assert JOB_KINDS["sharepoint-acl-sync"].lane == LIGHT_LANE
         assert JOB_KINDS["sharepoint-subtree-sweep"].lane == LIGHT_LANE
+        # Same lane as corpus-extraction: an LLM-calling document-processing
+        # stage, the same cost/resource class, sharing its concurrency
+        # ceiling rather than getting its own.
+        assert JOB_KINDS["sharepoint-facts-extraction"].lane == EXTRACTION_LANE
 
     def test_idempotent_reregistration(self):
         """Calling register_all_kinds() twice (e.g. test re-imports, or a
@@ -160,14 +167,89 @@ class TestRegisterAllKinds:
         assert JOB_KINDS["sharepoint-subtree-sweep"].lease_seconds == 600
 
     def test_sharepoint_subtree_sweep_lease_default(self):
-        """Default 4h (14400s) — a full probe pass over a large library is
-        multi-hour (spec §6.2)."""
+        """300s, same heartbeat-protected default as every other
+        long-running kind (data-refresh, corpus-extraction) — NOT sized to
+        the multi-hour probe pass (spec §6.2) itself. The sweep can
+        legitimately run for hours; the worker's heartbeat renews this
+        lease every ``lease_seconds/3`` for as long as the handler thread
+        is alive, so the lease only has to survive the gap between two
+        ticks, not the whole sweep. The old 4h (14400s) default meant a
+        worker that died mid-sweep left the job unreclaimable for up to 4
+        hours."""
         from app.worker.kinds import register_all_kinds
         from app.worker.registry import JOB_KINDS
 
         register_all_kinds()
 
-        assert JOB_KINDS["sharepoint-subtree-sweep"].lease_seconds == 14400
+        assert JOB_KINDS["sharepoint-subtree-sweep"].lease_seconds == 300
+
+    def test_data_refresh_lease_default_is_heartbeat_sized_not_duration_sized(self):
+        """300s, not the old 900s (15min) — a full Keboola extractor run +
+        orchestrator rebuild can legitimately take much longer than that;
+        the heartbeat (not the lease's own size) is what keeps a genuinely
+        running sync's lease alive. A worker that dies mid-sync must become
+        reclaimable in minutes, not up to 15."""
+        from app.worker.kinds import register_all_kinds
+        from app.worker.registry import JOB_KINDS
+
+        register_all_kinds()
+
+        assert JOB_KINDS["data-refresh"].lease_seconds == 300
+
+    def test_corpus_extraction_lease_is_independent_of_extraction_timeout(self, monkeypatch):
+        """The bug this PR fixes: the lease used to be
+        ``extraction.timeout_s`` (the crawl's own wall-clock bound) plus a
+        margin, so a worker killed mid-crawl left its job unreclaimable for
+        up to that whole ceiling (observed live, twice in one afternoon).
+        The crawl's timeout is still enforced entirely inside the crawl
+        (untouched by this test); the lease must no longer track it at
+        all — proven here by configuring a large ``extraction.timeout_s``
+        and asserting the registered lease stays at the small,
+        heartbeat-protected default regardless."""
+        from app.worker.kinds import register_all_kinds
+        from app.worker.registry import JOB_KINDS
+
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({"extraction": {"timeout_s": 7200}}))
+        register_all_kinds()
+
+        assert JOB_KINDS["corpus-extraction"].lease_seconds == 300
+
+    def test_dead_worker_lease_expiry_is_within_minutes_not_up_to_an_hour(self):
+        """End-to-end proof of the reclaim-latency win: claim a REAL
+        ``corpus-extraction``/``data-refresh`` job with the kind's own
+        REGISTERED ``lease_seconds`` (exactly what ``_lane_slot`` does in
+        production), then check how far in the future ``lease_expires_at``
+        lands. Under the old duration-sized defaults this was ~62 minutes
+        (corpus-extraction) / 15 minutes (data-refresh) out — a dead
+        worker's job stayed unreclaimable that whole time. Under the new
+        sizing it must land within a handful of minutes, regardless of how
+        long the underlying job may legitimately run (the heartbeat, not
+        this lease, covers that — see the module docstring's lease/retry
+        tuning note)."""
+        from datetime import datetime, timedelta, timezone
+
+        from app.worker.kinds import register_all_kinds
+        from app.worker.registry import JOB_KINDS
+        from src.db import close_system_db, get_system_db
+        from src.repositories import jobs_repo
+
+        register_all_kinds()
+        repo = jobs_repo()
+        for kind in ("corpus-extraction", "data-refresh"):
+            lease_seconds = JOB_KINDS[kind].lease_seconds
+            repo.enqueue(kind, {})
+            before = datetime.now(timezone.utc)
+            claimed = repo.claim_next(kinds=[kind], worker_id="dead-worker", lease_seconds=lease_seconds)
+            assert claimed is not None
+            lease_expires_at = claimed["lease_expires_at"]
+            if lease_expires_at.tzinfo is None:
+                lease_expires_at = lease_expires_at.replace(tzinfo=timezone.utc)
+            assert lease_expires_at - before <= timedelta(minutes=10), (
+                f"{kind}: lease_expires_at {lease_expires_at.isoformat()} is more than 10 minutes "
+                f"out — a dead worker's job would stay unreclaimable that long"
+            )
+        close_system_db()
+        get_system_db()  # keep the fixture's own teardown symmetric
 
 
 class TestAgentResponseRoleSplitRegistration:
@@ -394,10 +476,92 @@ class TestCorporateMemoryHandler:
             "services.corporate_memory.collector.collect_all",
             lambda dry_run=False: calls.append(dry_run) or {},
         )
+        monkeypatch.setattr("src.memory_detection_logging.record_detection_run", lambda **kwargs: None)
 
         JOB_KINDS["corporate-memory"].handler({})
 
         assert calls == [False]
+
+    def test_records_a_detection_run_from_the_collector_stats(self, monkeypatch):
+        """issue #1971 Part 3: the scheduled collector wrapper used to
+        discard collect_all()'s return value entirely. Now it must record a
+        memory_detection_runs row from those stats."""
+        from app.worker.kinds import register_all_kinds
+        from app.worker.registry import JOB_KINDS
+
+        register_all_kinds()
+
+        monkeypatch.setattr(
+            "services.corporate_memory.collector.collect_all",
+            lambda dry_run=False: {
+                "users_scanned": 4,
+                "items_extracted": 6,
+                "items_filtered": 2,
+                "items_db_inserted": 3,
+                "errors": [],
+            },
+        )
+        recorded = []
+        monkeypatch.setattr(
+            "src.memory_detection_logging.record_detection_run",
+            lambda **kwargs: recorded.append(kwargs) or "mdr_fake",
+        )
+
+        JOB_KINDS["corporate-memory"].handler({})
+
+        assert len(recorded) == 1
+        call = recorded[0]
+        assert call["source"] == "claude_local_md"
+        assert call["sessions_scanned"] == 4
+        assert call["items_proposed"] == 6
+        assert call["items_filtered"] == 2
+        assert call["items_inserted"] == 3
+        assert call["items_routed_side_domain"] == 0
+        assert call["dry_run"] is False
+        assert call["error"] is None
+        assert call["started_at"] is not None
+        assert call["finished_at"] is not None
+
+    def test_never_raises_when_collect_all_returns_an_empty_dict(self, monkeypatch):
+        """The pre-existing mock in test_delegates_to_collect_all returns
+        `{}` — the handler must degrade gracefully, never crash on a
+        missing key."""
+        from app.worker.kinds import register_all_kinds
+        from app.worker.registry import JOB_KINDS
+
+        register_all_kinds()
+
+        monkeypatch.setattr("services.corporate_memory.collector.collect_all", lambda dry_run=False: {})
+        recorded = []
+        monkeypatch.setattr(
+            "src.memory_detection_logging.record_detection_run",
+            lambda **kwargs: recorded.append(kwargs) or "mdr_fake",
+        )
+
+        JOB_KINDS["corporate-memory"].handler({})  # must not raise
+
+        assert recorded[0]["sessions_scanned"] == 0
+        assert recorded[0]["error"] is None
+
+    def test_records_errors_from_the_stats_dict(self, monkeypatch):
+        from app.worker.kinds import register_all_kinds
+        from app.worker.registry import JOB_KINDS
+
+        register_all_kinds()
+
+        monkeypatch.setattr(
+            "services.corporate_memory.collector.collect_all",
+            lambda dry_run=False: {"errors": ["LLM error: LLMTimeoutError"]},
+        )
+        recorded = []
+        monkeypatch.setattr(
+            "src.memory_detection_logging.record_detection_run",
+            lambda **kwargs: recorded.append(kwargs) or "mdr_fake",
+        )
+
+        JOB_KINDS["corporate-memory"].handler({})
+
+        assert recorded[0]["error"] == "LLM error: LLMTimeoutError"
 
 
 class TestJiraRefreshHandler:
@@ -534,6 +698,66 @@ class TestWebhookDeliverHandler:
         assert delivered == [
             ({"id": "w1", "active": True, "url": "https://h/x", "secret": "s"}, {"event": "job.completed"})
         ]
+
+
+class TestKnowledgePackagingHandler:
+    """``knowledge-packaging`` (TCRD-296 synthesis C.15) — a thin adapter
+    over ``src.knowledge_packaging.run_packaging_pass``, gated by the
+    non-blocking PG advisory lock (``src.db_pg.knowledge_packaging_lease``).
+    ``run_packaging_pass``'s own behavior (bounded reads, checkpointing,
+    the deadline contract) is covered in ``tests/test_knowledge_packaging.py``."""
+
+    def test_registered_in_light_lane(self):
+        from app.worker.kinds import register_all_kinds
+        from app.worker.registry import JOB_KINDS, LIGHT_LANE
+
+        register_all_kinds()
+
+        assert "knowledge-packaging" in JOB_KINDS
+        assert JOB_KINDS["knowledge-packaging"].lane == LIGHT_LANE
+
+    def test_delegates_to_run_packaging_pass_with_a_deadline(self, monkeypatch):
+        from app.worker.kinds import register_all_kinds
+        from app.worker.registry import JOB_KINDS
+
+        register_all_kinds()
+
+        captured = {}
+
+        def fake_pass(*, deadline=None, **kwargs):
+            captured["deadline"] = deadline
+            return {"built": ["col_a"], "skipped": [], "pruned": [], "errors": [], "interrupted_reason": None}
+
+        monkeypatch.setattr("src.knowledge_packaging.run_packaging_pass", fake_pass)
+
+        result = JOB_KINDS["knowledge-packaging"].handler({})
+
+        assert result["built"] == ["col_a"]
+        assert captured["deadline"] is not None  # a real time budget was passed through
+
+    def test_skips_when_advisory_lock_already_held(self, monkeypatch):
+        """Belt-and-braces on top of the jobs-repo idempotency-key dedupe:
+        a concurrent holder of the advisory lock means this call must skip,
+        never re-run the pass or block waiting."""
+        import contextlib
+
+        from app.worker.kinds import register_all_kinds
+        from app.worker.registry import JOB_KINDS
+
+        register_all_kinds()
+
+        @contextlib.contextmanager
+        def fake_lease():
+            yield False
+
+        monkeypatch.setattr("src.db_pg.knowledge_packaging_lease", fake_lease)
+        called = []
+        monkeypatch.setattr("src.knowledge_packaging.run_packaging_pass", lambda **kwargs: called.append(1) or {})
+
+        result = JOB_KINDS["knowledge-packaging"].handler({})
+
+        assert called == []
+        assert result == {"skipped": "lock_held"}
 
 
 class _FakeAgentWebhooksRepo:
@@ -673,6 +897,185 @@ class TestCorpusExtractionHandler:
         assert not hasattr(_kinds, "_extraction_producer_argv")
         assert not hasattr(_kinds, "_extraction_producer_mode")
         assert not hasattr(_kinds, "_agnes_producer_callback_env")
+
+
+class TestSharePointFactsExtractionHandler:
+    """``sharepoint-facts-extraction`` — run one fact-extraction pass over a
+    connection's ALREADY-INDEXED corpus, without a crawl (the answer to
+    "how do we get the fact graph populated with what we already have?").
+
+    A thin delegate to
+    ``connectors.sharepoint.facts_extraction.run_standalone_facts_extraction``
+    — mirrors ``TestCorpusExtractionHandler`` exactly: this handler owns
+    only the ``sharepoint.enabled`` gate, same posture as
+    ``corpus-extraction``. The stage's own two cost/surface gates
+    (``extraction.facts.enabled`` / ``facts.enabled``) are
+    ``run_standalone_facts_extraction``'s own job and are covered by
+    ``tests/test_facts_extraction.py``, not duplicated here.
+    """
+
+    _ENABLED_CONFIG = {"sharepoint": {"enabled": True}}
+
+    @pytest.fixture(autouse=True)
+    def _clear_extraction_env_var(self, monkeypatch):
+        monkeypatch.delenv("AGNES_SHAREPOINT_ENABLED", raising=False)
+
+    def _register(self):
+        from app.worker.kinds import register_all_kinds
+        from app.worker.registry import JOB_KINDS
+
+        register_all_kinds()
+        return JOB_KINDS["sharepoint-facts-extraction"].handler
+
+    def _stub_run(self, monkeypatch, *, report=None, boom=None):
+        calls: list = []
+
+        def _fake(connection_id, *, doc_ids=None, timeout_s=None, partition=None):
+            calls.append(
+                {"connection_id": connection_id, "doc_ids": doc_ids, "timeout_s": timeout_s, "partition": partition}
+            )
+            if boom is not None:
+                raise boom
+            return report if report is not None else {"docs_extracted": 0}
+
+        monkeypatch.setattr("connectors.sharepoint.facts_extraction.run_standalone_facts_extraction", _fake)
+        return calls
+
+    def test_disabled_by_default_refuses_to_run(self, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({}))
+        calls = self._stub_run(monkeypatch)
+        handler = self._register()
+
+        with pytest.raises(RuntimeError, match="sharepoint.enabled"):
+            handler({"connection_id": "conn1"})
+        # The gate fires BEFORE the pass — never a model call, never a
+        # partial run, when the connector itself is off.
+        assert calls == []
+
+    def test_enabled_delegates_connection_id_doc_ids_and_timeout_s(self, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        calls = self._stub_run(monkeypatch, report={"docs_extracted": 5})
+        handler = self._register()
+
+        result = handler({"connection_id": "conn1", "doc_ids": ["d1", "d2"], "timeout_s": 120})
+
+        assert calls == [{"connection_id": "conn1", "doc_ids": ["d1", "d2"], "timeout_s": 120, "partition": None}]
+        assert result == {"docs_extracted": 5}
+
+    def test_a_partition_in_the_payload_is_forwarded_as_a_tuple(self, monkeypatch):
+        """TCRD-296 gap #67: a fanned-out pass carries ``partition``
+        ``{"index", "count"}`` in its payload; the handler hands it to the
+        pass as an ``(index, count)`` pair so N jobs over one connection
+        each take a disjoint slice of the ledger."""
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        calls = self._stub_run(monkeypatch)
+        handler = self._register()
+
+        handler({"connection_id": "conn1", "partition": {"index": 2, "count": 4}})
+
+        assert calls[0]["partition"] == (2, 4)
+
+    def test_doc_ids_and_timeout_s_are_optional(self, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        calls = self._stub_run(monkeypatch)
+        handler = self._register()
+
+        handler({"connection_id": "conn1"})
+
+        assert calls == [{"connection_id": "conn1", "doc_ids": None, "timeout_s": None, "partition": None}]
+
+    def test_the_gate_from_run_standalone_facts_extraction_propagates(self, monkeypatch):
+        """`FactsExtractionDisabled` (either cost/surface switch off) is
+        this function's job, not re-checked here — proven by letting the
+        stub raise it and asserting it reaches the caller unchanged."""
+        from connectors.sharepoint.facts_extraction import FactsExtractionDisabled
+
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        self._stub_run(monkeypatch, boom=FactsExtractionDisabled("facts.enabled is off"))
+        handler = self._register()
+
+        with pytest.raises(FactsExtractionDisabled, match="facts.enabled"):
+            handler({"connection_id": "conn1"})
+
+    def test_lease_and_retry_posture_mirror_corpus_extraction(self):
+        from app.worker.kinds import _DEFAULT_EXTRACTION_LEASE_S, register_all_kinds
+        from app.worker.registry import JOB_KINDS
+
+        register_all_kinds()
+
+        kind = JOB_KINDS["sharepoint-facts-extraction"]
+        assert kind.lease_seconds == _DEFAULT_EXTRACTION_LEASE_S
+        # No automatic retry — same rationale as corpus-extraction: a
+        # failed pass needs an operator, and a resumed run already picks up
+        # from the persisted per-document state.
+        assert kind.retry_in_seconds is None
+
+
+class TestDispatchJobThreadsSharePointJobId:
+    """``extraction_runs.job_id`` was null in production because nothing
+    upstream of the crawl ever supplied it — the handler only ever sees
+    ``job["payload_json"]``, never the job row. ``dispatch_job`` (the ONE
+    place both are in scope) is where that gets fixed; the handler test
+    above (``test_enabled_delegates_the_whole_payload_to_the_builtin_crawl``)
+    deliberately calls the handler directly and stays unaffected."""
+
+    _ENABLED_CONFIG = {"sharepoint": {"enabled": True}, "extraction": {"timeout_s": 60}}
+
+    @pytest.fixture(autouse=True)
+    def _clear_extraction_env_var(self, monkeypatch):
+        monkeypatch.delenv("AGNES_SHAREPOINT_ENABLED", raising=False)
+
+    def _stub_crawl(self, monkeypatch):
+        calls: list = []
+
+        def _fake(payload):
+            calls.append(dict(payload))
+            return {"mode": "builtin", "new": 0}
+
+        monkeypatch.setattr("connectors.sharepoint.crawler.run_builtin_crawl", _fake)
+        return calls
+
+    def test_the_claimed_jobs_own_id_reaches_the_crawl_payload(self, jobs_db, monkeypatch):
+        from app.worker.kinds import dispatch_job, register_all_kinds
+
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        calls = self._stub_crawl(monkeypatch)
+        register_all_kinds()
+
+        job = {"id": "job-77", "kind": "corpus-extraction", "payload_json": {"connection_id": "conn1"}}
+        dispatch_job(job)
+
+        assert calls == [{"connection_id": "conn1", "job_id": "job-77"}]
+
+    def test_an_explicit_payload_job_id_is_never_overwritten(self, jobs_db, monkeypatch):
+        from app.worker.kinds import dispatch_job, register_all_kinds
+
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        calls = self._stub_crawl(monkeypatch)
+        register_all_kinds()
+
+        job = {
+            "id": "job-77",
+            "kind": "corpus-extraction",
+            "payload_json": {"connection_id": "conn1", "job_id": "explicit"},
+        }
+        dispatch_job(job)
+
+        assert calls == [{"connection_id": "conn1", "job_id": "explicit"}]
+
+    def test_a_different_kinds_payload_is_never_touched(self, jobs_db, monkeypatch):
+        """``_INJECT_JOB_ID_KINDS`` is a closed, named set — no other kind's
+        payload gains a key it never asked for."""
+        from app.worker.kinds import dispatch_job
+        from app.worker.registry import LIGHT_LANE, JobKind, register_kind
+
+        calls: list = []
+        register_kind(JobKind(name="trivial-kind", handler=calls.append, lane=LIGHT_LANE))
+
+        job = {"id": "job-1", "kind": "trivial-kind", "payload_json": {"foo": "bar"}}
+        dispatch_job(job)
+
+        assert calls == [{"foo": "bar"}]
 
 
 class TestAnonymizationKeyResolution:

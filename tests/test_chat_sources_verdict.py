@@ -119,12 +119,15 @@ def test_tool_call_shapes_do_not_break_verification(calls):
 
 
 def test_verdict_serializes_for_the_wire():
+    """A table/metric claim keeps the three-key shape it always had; the two
+    TCRD-289 keys ride on assumptions only, present even when unset so the
+    client reads one shape."""
     v = verdict(_answer("table: mrr\nassumption: x"), TOOL_CALLS)
     assert v.to_dict() == {
         "declared": True,
         "claims": [
             {"kind": "table", "ref": "mrr", "verified": True},
-            {"kind": "assumption", "ref": "x", "verified": None},
+            {"kind": "assumption", "ref": "x", "verified": None, "origin": None, "why": None},
         ],
     }
 
@@ -160,7 +163,12 @@ class TestTheManagerFeedsTheVerdictRealToolCalls:
     def _stamp_block(self) -> str:
         src = self.SOURCE.read_text(encoding="utf-8")
         i = src.index('if frame.get("type") == "assistant_message":')
-        return src[i : i + 4000]
+        # A READING window, not an assertion: it has to reach past the stamp
+        # into the buffer accumulation below it (`"tool_call"`), and the
+        # comments in between are load-bearing prose that grows. Sized with
+        # room rather than to the byte, so a paragraph added next to the
+        # stamp fails the invariant it breaks and not this slice.
+        return src[i : i + 6000]
 
     def test_the_verdict_is_fed_from_the_turn_buffer(self):
         block = self._stamp_block()
@@ -318,3 +326,472 @@ class TestTheBlockLocatorIsLinear:
         out = strip_block(two)
         assert "```sources" not in out
         assert "a" in out and "b" in out
+
+
+class TestAnAssumptionSaysWhereItCameFromAndWhy:
+    """TCRD-289: six `assumes …` chips under an answer, and the reader could
+    not tell where any of them originated or why it was made.
+
+    The statement alone cannot carry that — "signed date proxied by close
+    date" reads the same whether the user asked for it, a definition says so,
+    the CRM has no better column, or the model guessed. So the line grew two
+    keyed segments, `| origin: … | why: …`, and this is the parse: the origin
+    is a CLOSED vocabulary the badge copy is keyed on, the why is one
+    sentence, and a line with neither is still an assumption — shown as
+    "origin not stated", the block's own visible-absence rule applied to
+    itself.
+    """
+
+    def test_a_structured_line_splits_into_statement_origin_and_why(self):
+        (c,) = parse_claims('assumption: active employees only | origin: user | why: you asked about "the team"')
+        assert (c.kind, c.ref) == ("assumption", "active employees only")
+        assert c.origin == "user"
+        assert c.why == 'you asked about "the team"'
+
+    def test_a_legacy_line_is_still_an_assumption_with_nothing_stated(self):
+        """History written before this change, and a model that ignores the
+        two segments, must not lose the assumption — only its badge."""
+        (c,) = parse_claims("assumption: excludes contractors")
+        assert c.ref == "excludes contractors"
+        assert c.origin is None and c.why is None
+
+    def test_the_segments_may_come_in_either_order(self):
+        (c,) = parse_claims("assumption: proxied by close date | why: no SOW date in the CRM | origin: data")
+        assert (c.origin, c.why) == ("data", "no SOW date in the CRM")
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("user", "user"),
+            ("User", "user"),
+            ("question", "user"),
+            ("definition", "definition"),
+            ("semantic model", "definition"),
+            ("glossary", "definition"),
+            ("data", "data"),
+            ("missing data", "data"),
+            ("judgment", "judgment"),
+            ("judgement", "judgment"),
+            ("my own", "judgment"),
+            ("`data`", "data"),
+        ],
+    )
+    def test_the_origin_is_normalized_to_the_closed_vocabulary(self, raw, expected):
+        from app.chat.sources import ASSUMPTION_ORIGINS
+
+        (c,) = parse_claims(f"assumption: s | origin: {raw}")
+        assert c.origin == expected
+        assert c.origin in ASSUMPTION_ORIGINS
+
+    @pytest.mark.parametrize("raw", ["Salesforce", "the CRM", "", "n/a"])
+    def test_an_origin_outside_the_vocabulary_is_not_stated_rather_than_guessed(self, raw):
+        """The badge is a category with fixed copy. A model's free-text origin
+        goes nowhere near it — the reader is told the origin was not stated,
+        which is true of that line in the only sense the badge can express."""
+        (c,) = parse_claims(f"assumption: s | origin: {raw} | why: w")
+        assert c.origin is None
+        assert c.why == "w", "an off-vocabulary origin must not cost the reader the rationale"
+
+    def test_a_pipe_inside_the_statement_stays_in_the_statement(self):
+        """`|` is the segment separator, but only in front of a recognized key.
+        A pipe in prose — `A | B` naming two things — continues whatever it
+        was inside, never becomes a phantom segment and is never dropped."""
+        line = "assumption: shipping | billing country both count | origin: judgment | why: either | both mark CZ"
+        (c,) = parse_claims(line)
+        assert c.ref == "shipping | billing country both count"
+        assert c.origin == "judgment"
+        assert c.why == "either | both mark CZ"
+
+    def test_an_empty_why_is_no_rationale(self):
+        (c,) = parse_claims("assumption: s | origin: data | why:")
+        assert c.why is None
+
+    def test_duplicates_are_judged_on_the_statement(self):
+        """The same assumption written twice with two rationales is one
+        assumption; the reader gets the first."""
+        claims = parse_claims("assumption: s | origin: user | why: a\nassumption: s | origin: data | why: b")
+        assert len(claims) == 1
+        assert (claims[0].origin, claims[0].why) == ("user", "a")
+
+    def test_origin_and_why_survive_verification_and_reach_the_wire(self):
+        v = verdict(_answer("table: mrr\nassumption: s | origin: judgment | why: w"), TOOL_CALLS)
+        d = v.to_dict()
+        assert d["claims"][1] == {"kind": "assumption", "ref": "s", "verified": None, "origin": "judgment", "why": "w"}
+        assert set(d["claims"][0]) == {"kind", "ref", "verified"}, "table claims keep their wire shape"
+
+    def test_table_and_metric_lines_are_not_split(self):
+        """The segment grammar is the assumption line's alone — a `|` on a
+        table line is part of the (odd) ref and is compared as written."""
+        (c,) = parse_claims("table: a | origin: user")
+        assert c.ref == "a | origin: user"
+        assert c.origin is None
+
+    def test_the_prompt_teaches_exactly_the_vocabulary_the_parser_accepts(self):
+        """The parser's closed vocabulary and the prompt's list of allowed
+        words are the same contract written twice. Pinned so one cannot gain
+        a value the other never heard of."""
+        import pathlib
+        import re
+
+        from app.chat.sources import ASSUMPTION_ORIGINS
+
+        root = pathlib.Path(__file__).resolve().parents[1]
+        md = (root / "app" / "initial_workspace_default" / "CLAUDE.md").read_text(encoding="utf-8")
+        section = md[md.index("## Say where every number came from") :]
+        section = section[: section.index("\n## ", 1)]
+        assert "`origin:`" in section and "`why:`" in section
+        for word in ASSUMPTION_ORIGINS:
+            assert f"`{word}`" in section, f"the prompt does not offer {word!r}"
+        # The example the model imitates most is the fenced one — it must show
+        # the segments, not the bare legacy line.
+        fence = re.search(r"```sources\n(.*?)```", section, re.DOTALL)
+        assert fence and "| origin:" in fence.group(1) and "| why:" in fence.group(1)
+        assert "origin not stated" in section, "the model is told what an omitted origin looks like to the reader"
+
+    def test_the_persona_rail_teaches_the_same_vocabulary(self):
+        """A persona-backed named agent replaces the workspace template with
+        `build_profile`'s rails (Devin Review on #2047), so the contract has a
+        third carrier. Same pin: every origin the parser accepts is offered
+        there, and the example shows the segments."""
+        import re
+
+        from app.chat.agent_profile import PROVENANCE_RAILS
+        from app.chat.sources import ASSUMPTION_ORIGINS
+
+        for word in ASSUMPTION_ORIGINS:
+            assert f"`{word}`" in PROVENANCE_RAILS, f"the persona rail does not offer {word!r}"
+        fence = re.search(r"```sources\n(.*?)```", PROVENANCE_RAILS, re.DOTALL)
+        assert fence and "| origin:" in fence.group(1) and "| why:" in fence.group(1)
+        assert "origin not stated" in PROVENANCE_RAILS
+
+
+class TestADocumentIsProvenanceNotAnAssumption:
+    """A `document:` claim, and the misfiling it exists to stop.
+
+    The block's vocabulary was SQL-shaped — `table:` and `metric:` — while a
+    fact-graph answer rests on neither. Asked for the closest precedent to a
+    prospect, an agent reading the document graph had exactly one legal slot
+    left for "this came from `Acme_Week_2_Deliverable.pdf`", and used it: five
+    `assumption:` lines carrying filenames and engagement ids, every one of
+    them badged "origin not stated" because no origin in the vocabulary means
+    "a source document". The last line said so outright — `assumption: No SQL
+    tables queried, this answer is sourced entirely from the document fact
+    graph` — which is a model reporting a schema mismatch, rendered as a
+    caveat about method.
+
+    Meanwhile the row above it read "Sources — none declared", truthfully by
+    its own definition (provenance is judged on tables and metrics) and
+    absurdly to anyone looking at the five named PDFs underneath.
+
+    So `document:` is a first-class claim: it lands in the provenance row, it
+    is checked against the turn's tool calls like the other two, and it takes
+    the citations back out of the assumptions row — which shrinks to the
+    method caveats TCRD-289 built it for.
+    """
+
+    # Arguments and results, kept apart the way the projections keep them
+    # (`parts_to_tool_calls` / `parts_to_tool_results`). This fixture used to
+    # fold the filename into an `args["output"]` key — a shape no projection
+    # produces — so the happy path below passed on a haystack the live path
+    # could not build, and the feature shipped unable to verify a document
+    # cited by name. See `TestADocumentIsNamedByTheToolOutputNotTheCall`.
+    FACT_CALLS = [
+        {"tool": "Bash", "args": {"command": "agnes facts claims engagement:acme-rapid-roadmap"}},
+        {"tool": "Bash", "args": {"command": "agnes facts search engagement acme"}},
+    ]
+    FACT_RESULTS = ["1. Acme_Rapid_Roadmap_Week_2_Deliverable.pdf — engagement:acme-rapid-roadmap"]
+
+    def test_a_document_is_parsed_as_its_own_kind(self):
+        (c,) = parse_claims("document: Acme_Discovery_Synthesis.docx")
+        assert (c.kind, c.ref) == ("document", "Acme_Discovery_Synthesis.docx")
+
+    def test_a_document_the_turn_read_is_verified(self):
+        """Same contract as `table:`: the turn's tool calls are the record of
+        what was actually read, and a fact tool naming the file is that."""
+        v = verdict(
+            _answer("document: Acme_Rapid_Roadmap_Week_2_Deliverable.pdf"),
+            self.FACT_CALLS,
+            self.FACT_RESULTS,
+        )
+        assert v.claims[0].verified is True
+
+    def test_a_document_nothing_opened_is_reported_unverified(self):
+        """The point of the whole feature, on the new kind: a plausible
+        filename nothing ran on is exactly what a fabricated citation looks
+        like, and the reader is told."""
+        v = verdict(_answer("document: Never_Read_This.pdf"), self.FACT_CALLS, self.FACT_RESULTS)
+        assert [c.ref for c in v.unverified] == ["Never_Read_This.pdf"]
+
+    def test_a_fact_graph_subject_id_verifies_as_a_document(self):
+        """`agnes facts claims` is addressed by subject id, so that id — not a
+        filename — is often the most precise thing the answer can cite."""
+        v = verdict(_answer("document: engagement:acme-rapid-roadmap"), self.FACT_CALLS)
+        assert v.claims[0].verified is True
+
+    def test_a_path_or_extension_does_not_cost_a_correct_citation(self):
+        """The crude matcher errs toward accepting on purpose (see
+        `_tool_call_haystack`). A citation that names the same document with a
+        directory in front of it, or with the extension the tool output
+        omitted, must not read as unverified over punctuation — the same
+        latitude `metric:` already gets for `family/name`."""
+        calls = [{"args": {"command": "read Acme_Discovery_Synthesis"}}]
+        for ref in (
+            "collections/acme/Acme_Discovery_Synthesis.docx",
+            "Acme_Discovery_Synthesis.docx",
+            "Acme_Discovery_Synthesis",
+        ):
+            v = verdict(_answer(f"document: {ref}"), calls)
+            assert v.claims[0].verified is True, ref
+
+    def test_a_document_reaches_the_wire_in_the_reference_shape(self):
+        """Three keys, like a table or a metric — `origin`/`why` are the
+        assumption line's alone, and a document is something the answer READ,
+        never something it decided."""
+        v = verdict(_answer("document: a.pdf"), self.FACT_CALLS)
+        assert set(v.to_dict()["claims"][0]) == {"kind", "ref", "verified"}
+
+    def test_a_document_line_is_not_split_on_pipes(self):
+        (c,) = parse_claims("document: Q3 | Q4 review.pdf")
+        assert c.ref == "Q3 | Q4 review.pdf"
+        assert c.origin is None
+
+    def test_an_answer_citing_documents_has_declared_a_source(self):
+        """The bug as the reader met it: five cited PDFs above the words
+        "none declared". A document is provenance, so it counts."""
+        from app.chat.sources import VERIFIABLE_KINDS
+
+        assert "document" in VERIFIABLE_KINDS
+        v = verdict(_answer("document: a.pdf\ndocument: b.docx"), self.FACT_CALLS)
+        assert [c.kind for c in v.claims] == ["document", "document"]
+        assert not any(c.kind == "assumption" for c in v.claims)
+
+    def test_every_prompt_carrier_offers_the_document_kind(self):
+        """The parser's vocabulary and the text that teaches it are one
+        contract with three carriers (the bundled workspace CLAUDE.md, the
+        server-rendered template, and the persona rail). A kind the model is
+        never told about is a kind it will keep smuggling into `assumption:`,
+        which is the defect this fixes — so pin all three."""
+        import pathlib
+
+        from app.chat.agent_profile import PROVENANCE_RAILS
+
+        root = pathlib.Path(__file__).resolve().parents[1]
+        carriers = {
+            "workspace CLAUDE.md": (root / "app" / "initial_workspace_default" / "CLAUDE.md").read_text(
+                encoding="utf-8"
+            ),
+            "server template": (root / "config" / "claude_md_template.txt").read_text(encoding="utf-8"),
+            "persona rail": PROVENANCE_RAILS,
+        }
+        for name, text in carriers.items():
+            section = text[text.index("Say where every number came from") :]
+            assert "`document:`" in section, f"{name} does not offer the document kind"
+            fence = section[section.index("```sources") :]
+            fence = fence[: fence.index("```", 3)]
+            assert "document:" in fence, f"{name}'s example does not show a document line"
+            assert "assumption" in section.lower()
+
+    def test_a_derived_needle_can_never_be_short_enough_to_match_anything(self):
+        """The peeling above is latitude, not a rubber stamp.
+
+        Two degenerate refs turned the check into one, found by probing rather
+        than by review: `document: docs/` peels to a basename of `""`, and
+        `"" in haystack` is true of every haystack ever built — so a
+        trailing slash verified against tool calls that touched nothing.
+        `document: a.pdf` peels to the stem `"a"`, which appears in
+        essentially any serialized tool call, so it verified the same way.
+
+        Both are the one direction this module must not err in. A false
+        "unverified" leaves a careful answer looking sloppy; a false
+        "verified" is the badge lying about the only thing it exists to
+        assert. So a DERIVED needle below `_MIN_DERIVED_NEEDLE` is dropped —
+        the ref itself is always still matched in full, at any length.
+        """
+        calls = [{"args": {"command": "agnes catalog --json"}}]
+        for ref in ("docs/", "a.pdf", "a/", "x.y", "/"):
+            v = verdict(_answer(f"document: {ref}"), calls)
+            assert v.claims[0].verified is False, f"{ref!r} matched a tool call that never touched it"
+
+    def test_the_full_ref_is_matched_at_any_length(self):
+        """The floor applies only to what peeling INVENTS. A short document
+        genuinely named in a tool call still verifies on its own name."""
+        v = verdict(_answer("document: a.pdf"), [{"args": {"command": "read a.pdf"}}])
+        assert v.claims[0].verified is True
+
+    def test_peeling_still_works_for_a_real_filename(self):
+        """The regression guard for the fix: the latitude the peel exists for
+        must survive the floor that stops it lying."""
+        calls = [{"args": {"command": "read Acme_Discovery_Synthesis"}}]
+        for ref in ("collections/acme/Acme_Discovery_Synthesis.docx", "Acme_Discovery_Synthesis.docx"):
+            assert verdict(_answer(f"document: {ref}"), calls).claims[0].verified is True, ref
+
+
+class TestADocumentIsNamedByTheToolOutputNotTheCall:
+    """The half of `document:` that shipped broken: what the check can see.
+
+    Reported from a live instance — six document chips, six amber
+    UNVERIFIED badges, under a correct answer. The badge was not disagreeing
+    with the model; it was reading a record the filenames could not be in.
+
+    `verify()`'s haystack is built from the turn's tool CALLS, and the
+    positionless projection those come from keeps `{tool, args}` and drops
+    the result (`app/chat/message_parts.py::parts_to_tool_calls`). That is
+    the right record for a `table:` — a table name is an INPUT: it is in the
+    SQL the agent wrote. A document's name is an OUTPUT: no fact tool takes a
+    filename argument (`fact_search` takes a query, `fact_claims` a subject
+    id), so the file is named for the first time in the tool's own result.
+    Checked against arguments alone, a document cited by filename could not
+    verify on any turn, at any peeling.
+
+    So the results reach the check too — for `document:` claims only. A
+    result is a much weaker record of what a turn *did* than its arguments
+    (`agnes catalog` returns every table name the caller can see, which
+    would verify any `table:` the answer named), and the asymmetry is the
+    point: it is granted exactly where the name cannot be anywhere else.
+    """
+
+    # The production shape: what the model passed IN, with no output folded
+    # into it. The class above kept an `output` key inside `args` — where a
+    # projection never puts one — so its happy path passed on a haystack the
+    # live path could not build.
+    CALLS = [
+        {"tool": "Bash", "args": {"command": "agnes facts search engagement acme"}},
+        {"tool": "Bash", "args": {"command": "agnes facts claims engagement:acme-rapid-roadmap"}},
+    ]
+    RESULTS = [
+        "1. Acme_Rapid_Roadmap_Week_2_Deliverable.pdf — engagement:acme-rapid-roadmap",
+        "claim: 4-week roadmap delivered (source: Acme_Discovery_Synthesis.docx)",
+    ]
+
+    def test_a_document_named_only_in_a_result_verifies(self):
+        v = verdict(
+            _answer("document: Acme_Rapid_Roadmap_Week_2_Deliverable.pdf"),
+            self.CALLS,
+            self.RESULTS,
+        )
+        assert v.claims[0].verified is True
+
+    def test_without_the_results_the_same_citation_cannot_verify(self):
+        """The bug, pinned: this is what the reader saw six times."""
+        v = verdict(_answer("document: Acme_Rapid_Roadmap_Week_2_Deliverable.pdf"), self.CALLS)
+        assert v.claims[0].verified is False
+
+    def test_a_document_no_result_names_is_still_unverified(self):
+        """Widening the record must not turn the check into a rubber stamp."""
+        v = verdict(_answer("document: Never_Read_This.pdf"), self.CALLS, self.RESULTS)
+        assert [c.ref for c in v.unverified] == ["Never_Read_This.pdf"]
+
+    def test_a_table_named_only_in_a_result_does_not_verify(self):
+        """The asymmetry is deliberate, not an oversight: a table name is an
+        input, and a listing tool's OUTPUT names every table there is."""
+        v = verdict(
+            _answer("table: hr_headcount"),
+            [{"tool": "Bash", "args": {"command": "agnes catalog --json"}}],
+            ['[{"id": "hr_headcount"}, {"id": "mrr"}]'],
+        )
+        assert v.claims[0].verified is False
+
+    def test_a_citation_carrying_its_own_description_still_verifies(self):
+        """Observed in the same screenshot: the model writes the filename and
+        then says what it is. The whole line is the ref, so nothing matched —
+        a citation was penalised for being helpful."""
+        v = verdict(
+            _answer("document: Acme_Discovery_Synthesis.docx — 4-week AI Opportunity Assessment, week 1"),
+            self.CALLS,
+            self.RESULTS,
+        )
+        assert v.claims[0].verified is True
+
+    def test_an_uploaded_file_verifies_under_the_name_the_user_saw(self):
+        """`safeUploadName` in chat.js rewrites a dropped file's name before
+        it is stored — spaces to underscores, a stamp before the extension —
+        while the chat bubble, and therefore the model, keeps saying the name
+        the user dropped. Matching those two spellings is not latitude; the
+        rewrite is ours."""
+        stored = [{"tool": "Read", "args": {"file_path": "uploads/AI_Opportunity_Assessment-20260904T151500-1.pptx"}}]
+        v = verdict(_answer("document: AI Opportunity Assessment.pptx"), stored)
+        assert v.claims[0].verified is True
+
+    def test_a_degenerate_ref_does_not_survive_normalization(self):
+        """The floor of `_MIN_DERIVED_NEEDLE` holds on the normalized
+        spellings too — otherwise punctuation-insensitivity would hand back
+        exactly the rubber stamp the floor exists to stop."""
+        calls = [{"args": {"command": "agnes catalog --json"}}]
+        for ref in ("docs/", "a.pdf", "a/", "x.y", "/"):
+            v = verdict(_answer(f"document: {ref}"), calls, ['{"data": ["a", "b"]}'])
+            assert v.claims[0].verified is False, f"{ref!r} matched a turn that never touched it"
+
+
+class TestTheVerdictReadsTheSameTurnTheReaderSees:
+    """The projection that carries results to the check, and both call sites.
+
+    `parts` is the turn's ordered shape and the only place a result survives;
+    `tool_calls` is its positionless projection. A second projection keeps
+    the pair honest — the verdict must never be computed from a record the
+    rendered transcript does not have.
+    """
+
+    def test_results_project_out_of_parts_in_call_order(self):
+        from app.chat.message_parts import parts_to_tool_results
+
+        parts = [
+            {"type": "text", "text": "looking"},
+            {"type": "tool", "tool": "Bash", "args": {"command": "a"}, "result": "first"},
+            {"type": "tool", "tool": "Bash", "args": {"command": "b"}, "result": "second"},
+        ]
+        assert parts_to_tool_results(parts) == ["first", "second"]
+
+    def test_a_turn_with_no_results_projects_to_none(self):
+        from app.chat.message_parts import parts_to_tool_results
+
+        assert parts_to_tool_results(None) is None
+        assert parts_to_tool_results([{"type": "text", "text": "hi"}]) is None
+        assert parts_to_tool_results([{"type": "tool", "tool": "Bash", "args": {}}]) is None
+
+    def test_a_whole_turn_verifies_the_document_it_actually_read(self):
+        """End to end over the real frame shapes: the runner's `tool_call` and
+        `tool_result` frames, folded by `build_message_parts` exactly as the
+        manager folds them, then judged. The unit tests above feed `verify()`
+        the two lists directly; this is the seam where the filename either
+        survives the projection or does not."""
+        from app.chat.message_parts import build_message_parts, parts_to_tool_calls, parts_to_tool_results
+
+        frames = [
+            {"type": "token", "text": "Looking at the engagement documents.", "frame_seq": 1},
+            {
+                "type": "tool_call",
+                "tool_use_id": "c1",
+                "tool": "Bash",
+                "args": {"command": "agnes facts search engagement acme"},
+                "frame_seq": 2,
+            },
+            {
+                "type": "tool_result",
+                "tool_use_id": "c1",
+                "result": "1. Acme_Rapid_Roadmap_Week_2_Deliverable.pdf (engagement:acme-rapid-roadmap)",
+                "is_error": False,
+                "frame_seq": 3,
+            },
+        ]
+        parts = build_message_parts(frames)
+        v = verdict(
+            _answer("document: Acme_Rapid_Roadmap_Week_2_Deliverable.pdf\ndocument: Not_In_This_Turn.pdf"),
+            parts_to_tool_calls(parts),
+            parts_to_tool_results(parts),
+        )
+        assert [c.verified for c in v.claims] == [True, False]
+
+    def test_both_call_sites_pass_the_results(self):
+        """The live path (`assistant_message` in the manager) and the reload
+        path (`GET /sessions/{id}/messages`) must agree — a badge that
+        changes on refresh is worse than either verdict alone."""
+        import pathlib
+
+        root = pathlib.Path(__file__).resolve().parents[1]
+        for rel in ("app/chat/manager.py", "app/api/chat.py"):
+            text = (root / rel).read_text(encoding="utf-8")
+            i = text.index("sources_verdict(", text.index("import") + 1)
+            while text[i - 1 : i] not in ("", "\n"):  # back up to the start of the statement
+                i -= 1
+            call = text[i : i + 400]
+            assert "parts_to_tool_results" in call, f"{rel} computes the verdict without the results:\n{call}"

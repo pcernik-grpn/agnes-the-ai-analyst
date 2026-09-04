@@ -42,7 +42,10 @@ def workspace(tmp_path, monkeypatch):
     from src.knowledge_packaging import artifacts_dir, build_artifact
 
     with (
-        patch("src.knowledge_packaging._list_chunks", lambda cid: list(CHUNKS)),
+        patch(
+            "src.knowledge_packaging._list_chunk_batch",
+            lambda cid, *, after_id, limit: list(CHUNKS) if after_id is None else [],
+        ),
         patch("src.knowledge_packaging._list_files", lambda cid: [{"id": "f1", "filename": "handbook.md"}]),
         patch("src.knowledge_packaging._list_corpora", lambda: [{"id": "col_a", "name": "Handbook"}]),
     ):

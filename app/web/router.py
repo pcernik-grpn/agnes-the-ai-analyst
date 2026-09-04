@@ -6,55 +6,62 @@ Replicates all Flask webapp routes with DuckDB-backed data.
 import logging
 import os
 import secrets
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Final, Optional
+from typing import Any, Final
 from urllib.parse import quote, urlencode
 
+import duckdb
+import jinja2
 from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
-import duckdb
 
-import jinja2
-
+from app.api.me_debug import (
+    _decoded_claims,
+    _last_sync_summary,
+    _read_session_token,
+    _token_fingerprint,
+    require_debug_auth_enabled,
+)
 from app.auth.access import is_user_admin, require_admin
-from app.web import vocabulary
-from app.web.studio import STUDIO_DOMAINS, get_domain as get_studio_domain
-from app.auth.dependencies import get_current_user, get_optional_user, _get_db
+from app.auth.dependencies import _get_db, get_current_user, get_optional_user
 from app.instance_config import (
     FEATURE_FLAGS,
-    get_instance_name,
-    get_instance_subtitle,
-    get_theme_css_overrides,
-    get_home_route,
+    feature_enabled,
+    get_agent_profiles_enabled,
+    get_contribute_skill_enabled,
+    get_custom_scripts,
+    get_data_apps_config,
+    get_hidden_login_features,
     get_home_automode_visibility,
+    get_home_route,
     get_instance_brand,
     get_instance_brand_short,
     get_instance_copyright,
-    get_privacy_policy_url,
-    get_workspace_dir_name,
-    get_workspace_launcher_word,
+    get_instance_custom_preamble,
+    get_instance_favicon,
     get_instance_logo_mark_svg,
     get_instance_logo_svg,
-    get_instance_favicon,
+    get_instance_name,
     get_instance_overview,
+    get_instance_subtitle,
     get_instance_support,
-    get_hidden_login_features,
-    get_instance_custom_preamble,
     get_instance_theme,
-    get_ui_layout,
-    get_custom_scripts,
-    get_data_apps_config,
-    get_studio_enabled,
-    get_news_enabled,
     get_knowledge_digests_ui_enabled,
-    get_contribute_skill_enabled,
-    get_store_moderation_enabled,
-    get_agent_profiles_enabled,
     get_mcp_connector_ui_enabled,
-    feature_enabled,
+    get_news_enabled,
+    get_privacy_policy_url,
+    get_store_moderation_enabled,
+    get_studio_enabled,
+    get_theme_css_overrides,
+    get_ui_layout,
+    get_workspace_dir_name,
+    get_workspace_launcher_word,
 )
+from app.web import vocabulary
+from app.web.studio import STUDIO_DOMAINS
+from app.web.studio import get_domain as get_studio_domain
 from src.repositories import (
     audit_repo,
     corpus_files_repo,
@@ -83,13 +90,6 @@ from src.repositories import (
     users_repo,
 )
 from src.semantic.keboola_sources import KEBOOLA_SEMANTIC_LAYER_SOURCES
-from app.api.me_debug import (
-    require_debug_auth_enabled,
-    _read_session_token,
-    _decoded_claims,
-    _token_fingerprint,
-    _last_sync_summary,
-)
 
 
 def _resolved_home_route() -> str:
@@ -174,7 +174,7 @@ class _SilentUndefined(jinja2.Undefined):
 templates.env.undefined = _SilentUndefined
 
 # Add custom JSON filter that handles _SilentUndefined and _FlexDict
-import json as _json  # noqa: E402
+import json as _json
 
 
 class _SafeEncoder(_json.JSONEncoder):
@@ -270,74 +270,32 @@ templates.env.filters["cover_w"] = cover_variant_url
 templates.env.filters["has_cover_variant"] = has_cover_variant
 
 
-# ---- PostHog template wiring ----
-# Two Jinja globals injected into every render so the `_posthog.html` partial
-# (included from `base.html` and `base_login.html`) can render the browser
-# snippet — or render nothing when the integration is disabled.
-#
-#   posthog_config              process-level static config (host, project key,
-#                               replay flag, extra mask selector). Resolved
-#                               once on first access.
-#   posthog_user_block(request) per-request identify payload honoring the
-#                               operator-chosen identify mode. Returns None
-#                               for anonymous renders.
-def _posthog_config_global() -> dict:
-    from src.observability import get_posthog
+def _pager_href(qs: dict[str, Any], page_param: str, page: int) -> str:
+    """Query string for one pager link.
 
-    pc = get_posthog()
-    if not pc.enabled:
-        return {"enabled": False}
-    return {
-        "enabled": True,
-        "host": pc.host,
-        "api_key_public": pc.api_key_public,
-        "replay_enabled": pc.replay_enabled,
-        "replay_mask_selector_extra": pc.replay_mask_selector_extra,
-        "environment": pc.environment,
-        "release": pc.release,
-    }
+    Copies every key in ``qs``, overrides ``page_param`` with ``page``, and
+    drops keys that carry the "not filtering" default (``None``/``""``, or
+    a page number of 1). Shared by every paginated section on a detail page
+    (``macros/_detail.html``'s ``pager()`` macro) so a section's own "Next"
+    link can never silently reset another section's active page or search
+    term — the exact bug a bare ``?facts_page={{ n }}`` link had before this
+    existed: it dropped every OTHER query param, which was latent only
+    because there were none yet.
+    """
+    merged = dict(qs)
+    merged[page_param] = page
+    kept: dict[str, Any] = {}
+    for k, v in merged.items():
+        if v is None or v == "":
+            continue
+        if k.endswith("_page") and v == 1:
+            continue
+        kept[k] = v
+    return "?" + urlencode(kept)
 
 
-def _posthog_user_block(request: Optional[Request]) -> Optional[dict]:
-    from src.observability import get_posthog
+templates.env.globals["pager_href"] = _pager_href
 
-    pc = get_posthog()
-    if not pc.enabled:
-        return None
-    mode = pc.identify_mode
-    if mode == "none":
-        return None
-    user = None
-    if request is not None:
-        try:
-            user = getattr(request.state, "user", None)
-        except Exception:
-            user = None
-    if not user:
-        return None
-
-    def _get(attr: str):
-        if isinstance(user, dict):
-            return user.get(attr)
-        return getattr(user, attr, None)
-
-    distinct_id = _get("id") or _get("user_id") or _get("email")
-    if not distinct_id:
-        return None
-    props: dict = {}
-    if mode in ("email", "full"):
-        email = _get("email")
-        if email:
-            props["email"] = str(email)
-    if mode == "full":
-        name = _get("name") or _get("full_name")
-        if name:
-            props["name"] = str(name)
-    return {"distinct_id": str(distinct_id), "props": props}
-
-
-templates.env.globals["posthog_config"] = _posthog_config_global()
-templates.env.globals["posthog_user_block"] = _posthog_user_block
 # Stateless asset helper — register as a global so EVERY template resolves CSS/JS
 # URLs even on routes that build a minimal context (e.g. the studio pages).
 # Without this, base_ds.html emits <link href=""> and the page renders unstyled.
@@ -386,6 +344,30 @@ def _admin_setup_rail() -> object:
 
 
 templates.env.globals["admin_setup_rail"] = _admin_setup_rail
+
+
+def _journey_rail(user_id: object) -> object:
+    """The caller's onboarding-checklist progress for the rail's card, or None.
+
+    A Jinja global for the same reason `admin_setup_rail` above is: the card
+    renders on every rail page from a partial both context builders share,
+    and it has to paint in its RESOLVED state — retired at 6/6, otherwise the
+    real count — or the rows above it jump on every navigation while
+    chat_onboarding.js catches up (see `resolve_journey_rail`). Called from
+    the template only where the card renders (`can_chat and not
+    _admin_page`), so an admin page never spends the read. None on any
+    failure leaves the card blank for the script to resolve.
+    """
+    try:
+        from app.services.journey import resolve_journey_rail
+
+        return resolve_journey_rail(str(user_id) if user_id else None)
+    except Exception:
+        logger.warning("rail: onboarding journey unavailable", exc_info=True)
+        return None
+
+
+templates.env.globals["journey_rail"] = _journey_rail
 templates.env.globals["data_apps_enabled"] = _data_apps_nav_enabled
 
 
@@ -410,11 +392,53 @@ def _is_paper_theme() -> bool:
 templates.env.globals["is_paper"] = _is_paper_theme
 
 
+@jinja2.pass_context
+def _view_as_state(ctx) -> dict | None:
+    """Banner payload for a live read-only view-as, else ``None``.
+
+    A Jinja GLOBAL rather than a context key, for the reason the mode exists:
+    the banner has to appear on every page, and a key each route must remember
+    to pass is a key some route will not pass — the one page where the admin
+    then forgets which eyes they are looking through.
+
+    Reads the same request-scoped ticket the read-only guard enforces
+    (``app.auth.view_as.active_ticket``), so banner-visible and
+    mutations-refused are the same condition, not two that can drift.
+
+    ``pass_context`` for the request: the exit form needs the caller's own
+    ``web_csrf`` token (double-submit, read server-side because the cookie is
+    HttpOnly). It deliberately does NOT publish this page's path — the exit
+    form used to post it back as ``next``, which is exactly why leaving landed
+    the admin on whatever page they had wandered to instead of where they
+    started. Where to return is the ticket's business
+    (``app.auth.view_as.return_path``), and a banner rendered on page five of
+    a browse has no way to know it.
+    """
+    from app.auth.view_as import active_ticket
+
+    ticket = active_ticket()
+    if ticket is None:
+        return None
+    request = ctx.get("request")
+    csrf_token = ""
+    if isinstance(request, Request):
+        csrf_token = request.cookies.get(_WEB_CSRF_COOKIE, "")
+    return {
+        "viewer_email": ticket.viewer_email,
+        "target_email": ticket.target_email,
+        "target_user_id": ticket.target_user_id,
+        "csrf_token": csrf_token,
+    }
+
+
+templates.env.globals["view_as_state"] = _view_as_state
+
+
 # Grouped /admin sidebar (issue #896 follow-up mock) — data + active-state
 # resolver registered as globals (like `static_url`/`is_paper` above) so
 # `_admin_nav.html` (included from base_admin.html / base_admin_page.html)
 # resolves them regardless of which context builder the enclosing page uses.
-from app.web.admin_nav import (  # noqa: E402
+from app.web.admin_nav import (
     ADMIN_NAV_DOCS,
     ADMIN_NAV_HOME,
     ADMIN_NAV_SECTIONS,
@@ -509,19 +533,19 @@ _RAIL_DETAIL_BACK: dict[str, tuple[str, str]] = {
     "data_app": ("/library?section=files", "Library"),
     "plugin": ("/library?section=plugin", "All plugins"),
     "skill": ("/library?section=skill", "All skills"),
-    "agent": ("/library?section=agent", "All agents"),
+    # "All agents" pointed at the templates band — the one link most likely
+    # to be read as "the agents I run", which live at /agents.
+    "agent": ("/library?section=agent", "All agent templates"),
     "files": ("/library?section=files", "Library"),
     # The flat metric/glossary registries are not a `type_key`: they are a
-    # destination the Semantic models band links OUT to, not one of the
-    # Library's bands, so they have no `?section=` to open. They get the
-    # band's own anchor instead — without one the bare /library the fallback
-    # returns lands the reader at the top of the page, with the whole
-    # inventory between them and the section they clicked.
-    # `#lib-defs` exists exactly when that block rendered (library.html emits
-    # it under `if definitions_footer`, set only when the caller can see at
-    # least one metric or glossary term); when it did not, the anchor is inert
-    # and the browser stays at the top, which is what a bare /library did
-    # anyway.
+    # destination the Library links OUT to, not one of its bands, so they have
+    # no `?section=` to open. They get the Definitions strip's anchor instead.
+    # `#lib-defs` exists exactly when that strip rendered (library.html emits
+    # it under `if library_definitions`, set only when the caller can see at
+    # least one metric or glossary term, or can read a model); when it did
+    # not, the anchor is inert and the browser stays at the top, which is what
+    # a bare /library did anyway. The strip sits ABOVE the inventory now, so
+    # the anchor lands at the head of the page either way.
     "semantics": ("/library#lib-defs", "Library"),
 }
 
@@ -674,7 +698,7 @@ def _url_for_shim(endpoint: str, **kw) -> str:
     return _URL_MAP.get(endpoint, f"/{endpoint}")
 
 
-def _read_agnes_ca_pem() -> Optional[str]:
+def _read_agnes_ca_pem() -> str | None:
     """Read the Agnes server's TLS fullchain for inlining into the setup prompt.
 
     Returns the PEM string when the cert needs trust-bootstrapping —
@@ -757,7 +781,7 @@ def _read_agnes_ca_pem() -> Optional[str]:
 _CONN_UNSET: Any = object()
 
 
-def _compute_can_chat(request: Request, user: Optional[dict]) -> bool:
+def _compute_can_chat(request: Request, user: dict | None) -> bool:
     """Cloud-chat nav visibility, shared by every page-context builder.
 
     The /chat link is shown only when chat is enabled AND one of the viewer's
@@ -852,7 +876,7 @@ def _config_proxy() -> type:
 
 def _build_context(
     request: Request,
-    user: Optional[dict] = None,
+    user: dict | None = None,
     conn: Any = _CONN_UNSET,
     **extra,
 ) -> dict:
@@ -940,7 +964,7 @@ def _build_context(
 
 
 @router.get("/", response_class=HTMLResponse)
-async def index(request: Request, user: Optional[dict] = Depends(get_optional_user)):
+async def index(request: Request, user: dict | None = Depends(get_optional_user)):
     if user:
         from app.instance_config import get_home_route
 
@@ -994,7 +1018,7 @@ async def privacy_page(request: Request):
 
 @router.get("/login", response_class=HTMLResponse)
 async def login_page(request: Request):
-    from app.auth.dependencies import is_local_dev_mode, _get_local_dev_user
+    from app.auth.dependencies import _get_local_dev_user, is_local_dev_mode
 
     if is_local_dev_mode():
         # Only short-circuit to the home route if the dev user is actually
@@ -1750,7 +1774,7 @@ async def setup_advanced_page(
     return templates.TemplateResponse(request, "setup_advanced.html", ctx)
 
 
-def _resolve_in_stack_is_local(explicit: Optional[bool]) -> bool:
+def _resolve_in_stack_is_local(explicit: bool | None) -> bool:
     """Whether `in_stack` on these cards means "a local copy exists".
 
     True only under auto-membership, where membership follows from the grant
@@ -1773,9 +1797,9 @@ def _data_package_entry_dict(
     entry,
     drilldown_url: str,
     table_count: int = 0,
-    source_types: Optional[list] = None,
+    source_types: list | None = None,
     is_admin_view: bool = False,
-    in_stack_is_local: Optional[bool] = None,
+    in_stack_is_local: bool | None = None,
 ) -> dict:
     """Adapt a ResourceEntry → template entry dict for the _stack_card macro.
 
@@ -1865,7 +1889,7 @@ def _data_package_entry_dict(
     return out
 
 
-def _facts_repo_if_available() -> Optional[Any]:
+def _facts_repo_if_available() -> Any | None:
     """The facts repo when the ``facts`` feature flag is on AND the active
     backend is Postgres, else ``None`` — the single "is the facts UI even
     reachable" gate every facts-aware web surface uses (spec §13.2: "flag
@@ -1890,11 +1914,11 @@ def _facts_repo_if_available() -> Optional[Any]:
 # catalog_card() macro (templates/macros/_catalog_card.html) and its JS
 # twin. The data-package and memory adapters died with the /catalog browse
 # shell (folded into /library); the upload adapter below is the survivor
-# (the Library's Artefacts band renders through it).
+# (the Library's Artifacts band renders through it).
 
 
 def _catalog_card_upload(c: dict) -> dict:
-    """Private artefact → catalog_card `c`. An artefact is a `file_corpora`
+    """Private artifact → catalog_card `c`. An artifact is a `file_corpora`
     container, but its presentation ADAPTS to how many files it holds:
 
     - exactly one file → it reads as **that file** (title = filename, single-
@@ -1903,7 +1927,7 @@ def _catalog_card_upload(c: dict) -> dict:
     - two or more → it reads as a **Collection** (title = name, two-sheet glyph,
       ``N files`` meta, label "Collection").
 
-    Artefacts aren't stack-toggled (they're owned files); the action opens the
+    Artifacts aren't stack-toggled (they're owned files); the action opens the
     detail page, where adding a second file promotes a File into a Collection.
 
     ``fact_count`` (spec §13.2 "Library" — a collection card reads "N files ·
@@ -1918,8 +1942,8 @@ def _catalog_card_upload(c: dict) -> dict:
     if n == 1 and ff:
         size = _human_size(ff.get("size_bytes") or 0)
         fname = ff.get("filename")
-        # Title is the artefact's NAME (what the caller typed), not the
-        # filename — otherwise several single-file artefacts with distinct
+        # Title is the artifact's NAME (what the caller typed), not the
+        # filename — otherwise several single-file artifacts with distinct
         # names all render as the same filename. The filename + size move to
         # the meta line so the file's identity stays visible.
         meta = (f"{fname} · {size}" if fname else size) + fact_suffix
@@ -1964,11 +1988,11 @@ def _catalog_card_stack_artefact(
     """Artefact-in-My-Stack → catalog_card `c`. Modeled on
     `_catalog_card_upload` for the file-vs-collection title/glyph/meta_text
     logic, but the action is Remove-from-Stack (never Delete — removing a
-    Stack membership must never touch the underlying artefact) instead of a
+    Stack membership must never touch the underlying artifact) instead of a
     plain "Open" link, and it carries the visibility/owner metadata the
     `stack_row` macro's Source column needs.
 
-    ``accessible=False`` means the artefact is still IN the caller's Stack
+    ``accessible=False`` means the artifact is still IN the caller's Stack
     (a membership row is never dropped silently just because access
     changed — see requirement 7) but the caller can no longer reach the
     underlying collection; the row's description is overridden to explain
@@ -1993,7 +2017,7 @@ def _catalog_card_stack_artefact(
 
     description = col.get("description") or ""
     if not accessible:
-        description = "You no longer have access to this artefact."
+        description = "You no longer have access to this artifact."
 
     c: dict = {
         "kind": "library",
@@ -2079,9 +2103,9 @@ async def my_stack_page(user: dict = Depends(get_current_user)):
     return RedirectResponse(url="/library?stack=in_stack", status_code=302)
 
 
-# Artefact type facets for the /artefacts toolbar filter. A single-file
-# artefact filters by its file's kind (so "Images", "Spreadsheets" etc. group
-# naturally); a multi-file artefact is always a "Collection". Keys are stable
+# Artifact type facets for the /artefacts toolbar filter. A single-file
+# artifact filters by its file's kind (so "Images", "Spreadsheets" etc. group
+# naturally); a multi-file artifact is always a "Collection". Keys are stable
 # filter tokens (emitted as data-type); labels are what the dropdown shows.
 _ARTEFACT_TYPE_FACETS: dict[str, tuple[str, str]] = {
     "pdf": ("pdf", "PDF"),
@@ -2149,7 +2173,7 @@ def _artefact_format(first_file: dict | None) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Library — the caller's own things: artefacts (files/images/documents) and
+# Library — the caller's own things: artifacts (files/images/documents) and
 # skills. Agents live on /agents. See ``library_page``.
 # ---------------------------------------------------------------------------
 
@@ -2233,7 +2257,7 @@ def _library_row_base(
 ) -> dict:
     """Assemble one Library row.
 
-    Every kind (artefact / skill / agent) funnels through this so the table,
+    Every kind (artifact / skill / agent) funnels through this so the table,
     the grid projection and the toolbar facets read the same field names
     regardless of which registry the item came from.
 
@@ -2277,7 +2301,7 @@ def _library_row_base(
         # row from wearing the removable row's rest state.
         "stack_locked": False,
         # What Add/Remove writes to, and which of the two the caller may do.
-        # Artefacts and store entities have different membership APIs, so the row
+        # Artifacts and store entities have different membership APIs, so the row
         # carries its own endpoint rather than the template guessing from `kind`.
         "stack_endpoint": "",
         "stack_addable": False,
@@ -2339,7 +2363,7 @@ def _readable_semantic_model_rows(user: dict, conn, *, surface: str) -> list[dic
         return []
 
 
-def _has_readable_semantic_model(user: dict, conn, *, surface: str, rows: Optional[list[dict]] = None) -> bool:
+def _has_readable_semantic_model(user: dict, conn, *, surface: str, rows: list[dict] | None = None) -> bool:
     """Whether to offer this caller the ``/semantic-layer`` browse pages.
 
     The same ``_can_read_model`` gate those pages apply, so a caller who can
@@ -2353,7 +2377,7 @@ def _has_readable_semantic_model(user: dict, conn, *, surface: str, rows: Option
     ``semantic_models`` read failure must degrade to "no link" and leave the
     rest of the page intact rather than 500 it. ``surface`` only labels the log.
 
-    Shared by ``/library``'s Semantic models section and the model list's own
+    Shared by ``/library``'s Definitions strip and the model list's own
     empty states. One reader, because the two disagreeing is exactly how the
     flat page came to claim "no metrics registered yet" on an instance whose
     Library was already offering the document next door.
@@ -2384,34 +2408,239 @@ def _library_type_map(user: dict) -> list[dict]:
         from src.repositories import facts_repo
 
         counts = facts_repo().count_visible_facts_by_type(user)
-    except Exception:  # noqa: BLE001 - decoration must never break the page
+    except Exception:
         logger.debug("library: type map unavailable", exc_info=True)
         return []
     return [{"type": t, "count": n} for t, n in counts.items()]
 
 
-def _library_type_map(user: dict) -> list[dict]:
-    """Node types with caller-scoped counts for the Knowledge tab's head.
+#: The four entity types the Library's filter menu slices rows by, each
+#: mapped to the ``data-`` attribute its facet reads and the label the menu
+#: shows. The fact types come from ``app.api.facts.DEFAULT_FACET_TYPES``
+#: rather than being restated here, so the page and the API can never offer
+#: different vocabularies for the same question.
+#:
+#: This is what "filter by tags" should have meant on this page: the
+#: vocabulary the extraction pass already produces, instead of a `Tags`
+#: category that has been empty for every row since it shipped, because
+#: ``file_corpora`` has no tags column and nobody maintains hand-entered
+#: tags anyway (TCRD-250 piece 4).
+_ENTITY_FACET_LABELS = {
+    "client": ("client", "Client"),
+    "industry": ("industry", "Industry"),
+    "service_offering": ("offering", "Offering"),
+    "doc_type": ("doctype", "Document type"),
+}
 
-    Fails soft on every axis, because this is a decoration on a page that
-    must render without it: the `facts` feature can be off, the app-state
-    backend can be DuckDB (the facts repo is PG-only under the A3 ratchet),
-    and the graph can simply be empty. Any of those renders the Library
-    exactly as it does today, with no type map — never a 500 on the
-    caller's main inventory page.
+
+def _entity_facet_token(value: str) -> str:
+    """A graph label, made safe to carry in a multi-valued row attribute.
+
+    ``|`` is the filter engine's separator for a `multi` facet
+    (``data-client="a|b"``, see ``filter_toolbar.js``'s ``facetMatch``). A
+    label containing one would split into two junk values on the row while
+    the menu offered the label whole — a filter that matches nothing, on
+    data nobody controls, failing silently. Replacing it keeps the value
+    filterable and costs one character of fidelity; the menu reads the same
+    token, so the two can never disagree.
     """
+    return value.replace("|", " ")
+
+
+def _entity_facet_spec() -> list[tuple[str, str, str]]:
+    """``(fact_type, facet_key, label)`` for each entity facet, in menu order.
+
+    Reads the API's own default facet list so a type added there reaches the
+    Library too; a type with no label mapped here is skipped rather than
+    rendered under its raw key, which is the honest failure — a menu heading
+    reading ``service_offering`` is worse than one fewer heading.
+    """
+    from app.api.facts import DEFAULT_FACET_TYPES
+
+    out: list[tuple[str, str, str]] = []
+    for fact_type in DEFAULT_FACET_TYPES:
+        mapped = _ENTITY_FACET_LABELS.get(fact_type)
+        if mapped:
+            out.append((fact_type, mapped[0], mapped[1]))
+    return out
+
+
+def _has_connected_tools(user) -> bool:
+    """Whether this reader has already connected Agnes to a tool of theirs.
+
+    True when the connect page has been reached (``user_journey_state.
+    use_anywhere``) OR the caller holds a live personal access token — the
+    credential `agnes init` writes, so its existence is the connection.
+    "Live" means unrevoked AND unexpired: the repository filters only the
+    first, so expiry is asked separately through the resolver's own helper.
+    Best-effort: a bookkeeping read must never fail the Library, and a false
+    here only means the invitation is shown one more time.
+    """
+    uid = user.get("id") if isinstance(user, dict) else None
+    if not uid:
+        return False
+    # Imports inside the guard with the calls they serve. Outside it, a wrong
+    # name or a PG-only repo on a DuckDB instance raises past the handler and
+    # takes the whole Library down — over a banner.
     try:
-        from app.instance_config import feature_enabled
+        from src.repositories import user_journey_repo
 
-        if not feature_enabled("facts", "enabled", env_var="AGNES_FACTS_ENABLED", default=False):
-            return []
-        from src.repositories import facts_repo
+        if (user_journey_repo().get(uid) or {}).get("use_anywhere"):
+            return True
+    except Exception as e:
+        logger.warning("/library: could not read journey state: %s", e)
+    try:
+        from app.auth.pat_resolver import pat_is_expired
+        from src.repositories import access_token_repo
 
-        counts = facts_repo().count_visible_facts_by_type(user)
-    except Exception:  # noqa: BLE001 - decoration must never break the page
-        logger.debug("library: type map unavailable", exc_info=True)
-        return []
-    return [{"type": t, "count": n} for t, n in counts.items()]
+        # `include_revoked=False` filters revoked_at only — the repository has
+        # no expiry predicate — so an expired token would otherwise read as a
+        # connection and withhold the invitation from a user who has nothing
+        # usable (Devin Review on #1998). Expiry is asked through the same
+        # helper the PAT resolver uses, so "live" means one thing.
+        return any(not pat_is_expired(row) for row in access_token_repo().list_for_user(uid, include_revoked=False))
+    except Exception as e:
+        logger.warning("/library: could not read access tokens: %s", e)
+        return False
+
+
+def _library_child_row(
+    f: dict,
+    col: dict,
+    *,
+    origin: str,
+    owner_label: str,
+    ownership: str,
+    owner_key: str,
+    visibility: str,
+    stack_state: str,
+    stack_title: str,
+    stack_pill: str,
+) -> dict:
+    """One FILE row nested under its collection's folder row in the Library.
+
+    Extracted from ``library_page``'s own loop because a second caller needs
+    the identical dict: ``library_matching_file_rows`` renders the files a
+    live Library search matched but the folder's peek did not include
+    (#2141 item 2), and it renders them through the SAME ``library_row``
+    macro. Two builders would have meant two answers to "what does a file row
+    say about its sharing", which is not a question this page may answer
+    twice.
+
+    The collection-level facts (`origin`, owner, stack membership) are passed
+    in rather than re-derived: they belong to the FOLDER, and a file inside it
+    inherits them — Stack membership in particular is per collection, so a
+    file claiming an independent state would be wrong, not merely redundant.
+    ``visibility`` is the exception and is the file's OWN (per-file sharing is
+    real and independent of the folder's).
+    """
+    from app.resource_types import ResourceType
+    from app.services.artefact_access import VISIBILITY_LABELS
+
+    ftype_key, ftype_label = _artefact_type(1, f)
+    fsize = f.get("size_bytes")
+    slug = col.get("slug") or ""
+    created = f.get("created_at")
+    child = _library_row_base(
+        item_id=f["id"],
+        kind="artifact",
+        title=f.get("filename") or "Untitled file",
+        description="",
+        # Per-file detail page (files inside a folder had none). `?from=library`
+        # is what tells that page the reader arrived from THIS list, so its
+        # back arrow returns here (with the folder reopened) instead of to the
+        # collection page they have never seen — see the crumb block in
+        # library_file_detail.html.
+        href=f"/library/{slug}/f/{f['id']}?from=library",
+        glyph="doc",
+        type_key="files",
+        type_label=ftype_label,
+        origin=origin,
+        origin_label="Generated" if origin == "generated" else "Uploaded",
+        added_iso=(created.isoformat() if created is not None else None),
+        owner_label=owner_label,
+        ownership=ownership,
+        # A file's own sharing is independent of its folder's.
+        visibility=visibility,
+        visibility_label="",
+        meta_text=_human_size(fsize) if fsize else "",
+        share_type=ResourceType.CORPUS_FILE.value,
+        owner_key=owner_key,
+    )
+    child["file_kind"] = ftype_key
+    # A file inside a folder is titled by its FILENAME and carries no
+    # description at all, so before this its second line was blank. It gets
+    # the same format line as a loose file — the nested rows are files too,
+    # and the retired Type column is where their format used to show.
+    child["file_format"] = _artefact_format(f)
+    child["format_keys"] = [child["file_format"]] if child["file_format"] else []
+    # Whether the extraction pass actually got text out of this file. Only
+    # surfaced when it is NOT `indexed`: a healthy file saying "indexed" on
+    # every row is noise, but a file nobody can search is worth knowing about
+    # without opening the collection page to find it.
+    child["ingest_label"] = _ingest_label(f)
+    child["file_id"] = f["id"]
+    child["file_name"] = f.get("filename") or ""
+    child["slug"] = slug
+    child["is_folder"] = False
+    # Stack membership is per collection, so a file inherits its folder's
+    # state rather than claiming an independent one.
+    child["stack_state"] = stack_state
+    child["stack_title"] = stack_title
+    child["stack_pill"] = stack_pill
+    child["parent_id"] = col["id"]
+    # Same vocabulary as every other row — read off the shared map rather than
+    # restated here, which is how this slot came to hold a fourth spelling of
+    # the same three states.
+    child["visibility_label"] = VISIBILITY_LABELS.get(child["visibility"], VISIBILITY_LABELS["private"])
+    return child
+
+
+#: How many files a Library folder row reveals when it is expanded inline.
+#: Deliberately a PEEK: the expansion carries no search, filter or pager, so
+#: past a dozen rows it is a wall rather than an answer — and the collection
+#: page it links on to has all three (#2141 item 2). Round 2 (incident
+#: follow-up, 2026-09-03): a folder's peek rows are now fetched on first
+#: expand (`GET /library/{slug}/peek`) rather than pre-rendered hidden in the
+#: index response — see that route and `_library_child_row`. The FIRST cut
+#: of the peek (#2141) rendered it inline for every folder at or under a
+#: separate size cap, which fixed the everything-visible-at-once byte blowup
+#: but not the cost of listing (and embedding a `data-search` value built
+#: from) a folder's files at INDEX render time at all: on a live instance
+#: (~392 collections, active SharePoint crawls) that alone was 19.6 MB for a
+#: page whose live DOM, after the browser discarded the raw markup's
+#: indentation, was 1.09 MB — the index card is now the count/name/
+#: description alone (`_catalog_card_upload`, `_library_row_base`'s own
+#: `c.search`), never a per-file fetch, however small the folder.
+_LIBRARY_FOLDER_PEEK = 10
+
+#: How many collections `library_page` reads in its one flat
+#: `file_corpora_repo().list()` call. NOT a render cap — round 4 of the
+#: 2026-09-03 incident removed the render cap (`_LIBRARY_SECTION_PAGE_CAP`,
+#: `?files_limit=`, the "Show more collections" link) entirely: it applied
+#: to the RAW fetch, before the caller's owned-or-granted filter ran, so
+#: "Show more" appeared whenever the INSTANCE had more than the cap's worth
+#: of collections, never whether the CALLER could see more than that — on a
+#: live instance where one admin owned/was granted only 2 of 397
+#: collections, the link "led nowhere" no matter how far `?files_limit=` was
+#: raised, because raising it only fetched more of the same ~395 invisible
+#: rows. Every collection the caller may see now renders, in one list — no
+#: other Library section paginates either, and a collection's own render
+#: cost is bounded regardless of count now that its peek is fetched lazily
+#: (round 2) and its facet menu is capped server-side (round 3). This
+#: constant exists only so the ONE flat query has an explicit ceiling
+#: instead of `file_corpora_repo().list()`'s own default (200), which would
+#: otherwise silently truncate the visible-set computation on a large
+#: instance before ownership/grants are even checked.
+_LIBRARY_COLLECTIONS_FETCH_CAP = 5000
+
+#: How many values EACH entity facet (client/industry/offering/document
+#: type) offers in the Filter menu — round 3 of the 2026-09-03 incident.
+#: `facet_top_values_for_collections` picks the top this-many by document
+#: count, in SQL; `GET /library/facets/{facet}` (below) is the "search
+#: facets" typeahead for reaching a value past this cap without ever
+#: inlining the full vocabulary.
+_LIBRARY_ENTITY_FACET_LIMIT = 25
 
 
 @router.get("/library", response_class=HTMLResponse)
@@ -2420,13 +2649,13 @@ async def library_page(
     user: dict = Depends(get_current_user),
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
 ):
-    """Library — everything the caller has: artefacts, skills, and agents.
+    """Library — everything the caller has: artifacts, skills, and agents.
 
     This is the renamed and widened former ``/artefacts`` surface. It answers
     "what do I have?" across every kind Agnes governs — the caller's own things
     plus everything shared with them:
 
-      - **Artefacts** — ``file_corpora`` uploads: images, documents, data
+      - **Artifacts** — ``file_corpora`` uploads: images, documents, data
         files, and multi-file collections, whether *uploaded* by a person or
         *generated* by an agent (the Source facet).
       - **Skills** — the caller's own store entities of type ``skill``, i.e.
@@ -2444,9 +2673,21 @@ async def library_page(
 
     Scope is grant-aware: items you OWN plus anything shared into a group you
     belong to, tagged ``mine`` / ``shared_with_me`` / ``shared_by_me`` so the
-    toolbar can slice by ownership. Deliberately NOT admin god-mode — an admin
-    still sees their own Library, not every item in the instance (the audit
-    view is /admin/access).
+    toolbar can slice by ownership. The grant-backed kinds — data packages,
+    memory domains, recipes, marketplace plugins — stay grant-scoped even for
+    an admin: an admin's OWN Library still only lists what an admin (possibly
+    themselves) has granted a group of theirs, matching ``/admin/access``'s
+    grant model.
+
+    Artefacts are the one exception, matching ``can_access_collection``
+    (``app/auth/access.py``): an admin sees every live collection here, not
+    just the ones they own or were granted, so a live instance where 395 of
+    397 collections sat ungranted no longer reads as "1238 files" to the one
+    person who could actually reach all of them via URL. A collection an
+    admin can only see through admin authority — no ownership, no grant — is
+    tagged ``ownership="admin_visible"`` and carries a "Not shared with you"
+    note in its meta line, so the admin can tell at a glance what an ordinary
+    user in this same Library would NOT see.
 
     Every row carries its real visibility (Private / Shared / Workspace) and,
     for the grant-backed kinds, a Share action writing through
@@ -2462,7 +2703,6 @@ async def library_page(
 
     from app.resource_types import ResourceType
     from app.services.artefact_access import (
-        VISIBILITY_LABELS,
         build_artefact_access_context,
         collection_visibility,
     )
@@ -2471,6 +2711,10 @@ async def library_page(
 
     uid = user.get("id") or ""
     ct = ResourceType.COLLECTION.value
+    # Artefacts get admin god-mode (see the handler docstring); the
+    # grant-backed kinds below do not, so this is read ONCE here and reused
+    # everywhere the artefacts section needs it — never re-derived per row.
+    caller_is_admin = is_user_admin(uid, conn)
 
     # ── What could not be read ────────────────────────────────────────────
     # Every content block below is wrapped so one broken source cannot take the
@@ -2533,8 +2777,8 @@ async def library_page(
             return "workspace"
         return "shared"
 
-    # Artefacts already in the caller's Stack — drives the "Add to stack" vs
-    # quiet "In stack" badge on artefact rows.
+    # Artifacts already in the caller's Stack — drives the "Add to stack" vs
+    # quiet "In stack" badge on artifact rows.
     try:
         in_stack_ids = set(user_stack_subscriptions_repo().list_for_user(uid, ct))
     except Exception as e:
@@ -2543,7 +2787,7 @@ async def library_page(
 
     items: list = []
 
-    # ── Artefacts (file_corpora) ──────────────────────────────────────────
+    # ── Artifacts (file_corpora) ──────────────────────────────────────────
     # Resolving the repos and listing the collections sits INSIDE the guard
     # below, not above it: outside, a backend that cannot answer took the whole
     # page down with a 500, which is the one outcome this block's try/except
@@ -2560,7 +2804,14 @@ async def library_page(
     try:
         fc_repo = file_corpora_repo()
         cf_repo = corpus_files_repo()
-        _all_cols = fc_repo.list()
+        # Every collection up to `_LIBRARY_COLLECTIONS_FETCH_CAP`, in ONE
+        # flat query — round 4 of the 2026-09-03 incident removed the
+        # render cap that used to apply here (see that constant's
+        # docstring). The owned-or-granted filter below decides what
+        # actually renders; nothing here narrows the fetch by visibility,
+        # so there is nothing left that could turn the caller's OWN visible
+        # count into a truncated, misleading one.
+        _all_cols = fc_repo.list(limit=_LIBRARY_COLLECTIONS_FETCH_CAP)
     except Exception as e:
         _lost("files and collections", e)
     # One batch call for every card, not one call per card: each singular
@@ -2570,29 +2821,109 @@ async def library_page(
     # once — visibility still decided inside the repo, never here.
     _fact_counts: dict = {}
     if facts_repo_ is not None:
-        _visible_ids = [c["id"] for c in _all_cols if c.get("created_by") == uid or c["id"] in granted_to_me]
+        # Admin god-mode widens this to EVERY collection (not just owned or
+        # granted) so an admin-visible-only card's "N facts" is the real
+        # count, never a silent 0 from a set the card-visibility filter below
+        # no longer matches.
+        _visible_ids = [
+            c["id"] for c in _all_cols if caller_is_admin or c.get("created_by") == uid or c["id"] in granted_to_me
+        ]
         try:
-            _fact_counts = facts_repo_.count_visible_facts_for_collections(user, _visible_ids)
+            if caller_is_admin:
+                # `count_visible_facts_for_collections` is a Python-level batch
+                # over an exact, per-caller visibility CTE — but that CTE is
+                # still ONE STATEMENT PER COLLECTION (its own docstring says
+                # so), and on an admin Library that sees every collection
+                # (390 here) that alone cost minutes (incident, 2026-09-03).
+                # `approximate_counts_for_collections` is a single flat
+                # `GROUP BY corpus_id` and is scoped, by its own contract, to
+                # exactly this caller shape — `_readable_ids(caller) is None`
+                # — which `caller_is_admin` stands in for without importing the
+                # repo's private RBAC resolver here.
+                approx = facts_repo_.approximate_counts_for_collections(_visible_ids)
+                _fact_counts = {cid: counts.get("facts", 0) for cid, counts in approx.items()}
+            else:
+                _fact_counts = facts_repo_.count_visible_facts_for_collections(user, _visible_ids)
         except Exception as e:
             logger.warning("/library: fact counts failed: %s", e)
+    # `file_count` per collection, in ONE query — replaces the per-collection
+    # `list_for_corpus` fetch every card used to pay to learn its own count.
+    # The only per-collection file read the index still does is the single
+    # bounded `limit=1` fetch below, for the one-file "this card IS the file"
+    # case — a folder's own rows are never listed here at all now, however
+    # small (round 2 of the incident fix — see `_LIBRARY_FOLDER_PEEK`).
+    _file_counts: dict = {}
+    if cf_repo is not None:
+        try:
+            _file_counts = cf_repo.count_by_corpus()
+        except Exception as e:
+            logger.warning("/library: file counts failed: %s", e)
+    # What each collection is ABOUT — the values its entity facets slice on.
+    # Two bounded batch calls beside the counts above (round 3 of the
+    # 2026-09-03 incident: the exact per-caller `facet_values_for_collections`
+    # has no cap of its own, so tallying it across every rendered row built
+    # an 18 MB facet MENU and cost seconds even for a caller whose own visible
+    # set was small — the unbounded CANDIDATE SCAN, not the output size, was
+    # the expensive part). `facet_top_values_for_collections` picks the menu's
+    # own vocabulary — top `_LIBRARY_ENTITY_FACET_LIMIT` per type by document
+    # count, bounded IN SQL. `facet_membership_for_collections` then asks,
+    # for exactly those (already small) values, which of THIS page's rows
+    # carry one — a row only needs to declare membership in a value the menu
+    # can actually offer, so this is naturally as bounded as the menu is.
+    _entity_facets = _entity_facet_spec()
+    _entity_values: dict = {}
+    _entity_top: dict = {}
+    if facts_repo_ is not None and _entity_facets:
+        try:
+            _entity_top = facts_repo_.facet_top_values_for_collections(
+                _visible_ids,
+                types=[t for t, _k, _lbl in _entity_facets],
+                limit_per_type=_LIBRARY_ENTITY_FACET_LIMIT,
+            )
+            _menu_fact_ids = [v["fact_id"] for vals in _entity_top.values() for v in vals]
+            if _menu_fact_ids:
+                _entity_values = facts_repo_.facet_membership_for_collections(_visible_ids, _menu_fact_ids)
+        except Exception as e:
+            # Fails soft exactly as the type map does: the facets are a
+            # refinement on a page whose job is the inventory, so a graph
+            # that cannot answer costs the menu four categories, not the page.
+            logger.warning("/library: entity facets failed: %s", e)
     try:
         for col in _all_cols:
             owned = col.get("created_by") == uid
-            if not owned and col["id"] not in granted_to_me:
-                continue  # not yours and not shared with you -> invisible here
-            try:
-                files = cf_repo.list_for_corpus(col["id"])
-            except Exception:
-                files = []
-            file_count = len(files)
+            granted = col["id"] in granted_to_me
+            # Admin god-mode (see the handler docstring): a caller who is
+            # neither the owner nor granted access still sees the row when
+            # they are an admin. `admin_only` marks exactly that case, so the
+            # ownership tag and card meta below can label it rather than
+            # silently reading as an ordinary grant.
+            admin_only = False
+            if not owned and not granted:
+                if not caller_is_admin:
+                    continue  # not yours and not shared with you -> invisible here
+                admin_only = True
+            # `file_count` is the batched, exact count from `_file_counts` —
+            # never `len(files)`. `files` is fetched — one bounded row,
+            # `limit=1` — ONLY for the one-file case, to get that file's own
+            # filename/type/size (the card reads as "this IS the file", not
+            # "a folder holding one file"). A folder's rows are never listed
+            # at index-render time regardless of its size: its peek is
+            # fetched lazily on first expand (`GET /library/{slug}/peek`).
+            file_count = _file_counts.get(col["id"], 0)
+            files: list = []
             first_file = None
             if file_count == 1:
-                f0 = files[0]
-                first_file = {
-                    "filename": f0.get("filename"),
-                    "file_type": f0.get("file_type"),
-                    "size_bytes": f0.get("size_bytes"),
-                }
+                try:
+                    files = cf_repo.list_for_corpus(col["id"], limit=1)
+                except Exception:
+                    files = []
+                if files:
+                    f0 = files[0]
+                    first_file = {
+                        "filename": f0.get("filename"),
+                        "file_type": f0.get("file_type"),
+                        "size_bytes": f0.get("size_bytes"),
+                    }
             fact_count = _fact_counts.get(col["id"], 0)
             c = _catalog_card_upload(
                 {
@@ -2605,8 +2936,18 @@ async def library_page(
                     "fact_count": fact_count,
                 }
             )
+            if admin_only:
+                # A user in this same Library would not see this card at
+                # all — say so on the card itself, not just in an audit log
+                # somewhere else, so the admin can tell admin-only visibility
+                # apart from an ordinary grant at a glance.
+                _not_shared_note = "Not shared with you"
+                c["meta_text"] = f"{c['meta_text']} · {_not_shared_note}" if c.get("meta_text") else _not_shared_note
             shared = col["id"] in shared_ids
-            if not owned:
+            if admin_only:
+                ownership = "admin_visible"
+                owner_label = owner_name.get(col.get("created_by"), "Someone")
+            elif not owned:
                 ownership = "shared_with_me"
                 owner_label = owner_name.get(col.get("created_by"), "Someone")
             elif shared:
@@ -2620,20 +2961,19 @@ async def library_page(
             origin = col.get("origin") or "uploaded"
             created = col.get("created_at")
             is_folder = file_count != 1
-            # What this row can be FOUND by. Nobody searches for the folder —
-            # they search for the file inside it ("kpis"), and until now the
-            # engine saw only the folder's own name, so a file sitting visibly
-            # on screen answered "Nothing matches these filters". A folder is
-            # therefore searchable by every filename it holds; the client then
-            # opens it and hides the siblings, so the hit reads as the file.
-            fname = (
-                " ".join(f.get("filename") or "" for f in files)
-                if is_folder
-                else (first_file.get("filename") if first_file else "")
-            )
+            # What this row can be FOUND by, beyond its own name/description
+            # (`_library_row_base` folds those into `c.search` unconditionally
+            # — see there). A one-file card additionally carries that file's
+            # own filename, since the card reads as the file, not a folder
+            # holding one. A multi-file folder carries nothing further here —
+            # `files` is never fetched for it at index-render time (round 2 of
+            # the incident fix, `_LIBRARY_FOLDER_PEEK`) — so searching by a
+            # filename INSIDE a folder now means opening it, same as searching
+            # by anything else on its detail page.
+            fname = first_file.get("filename") if first_file else ""
             row = _library_row_base(
                 item_id=col["id"],
-                kind="artefact",
+                kind="artifact",
                 title=c.get("title") or "",
                 description=c.get("description") or "",
                 href=f"/library/{col.get('slug')}",
@@ -2659,11 +2999,21 @@ async def library_page(
                 extra_search=fname or "",
                 owner_key="me" if owned else (col.get("created_by") or ""),
             )
+            # What this collection is ABOUT, from the fact graph — the values
+            # its entity facets slice on. Empty lists, not absent keys:
+            # `_present_multi` and the row template both iterate these
+            # unconditionally, and a collection the graph says nothing about
+            # is the common case. Set on `row` (what reaches `items`), never on
+            # the intermediate card `c` — `_library_row_base` builds a fresh
+            # dict, so a key left on `c` is silently dropped.
+            _ent = _entity_values.get(col["id"]) or {}
+            for _ftype, _fkey, _flabel in _entity_facets:
+                row[f"entity_{_fkey}"] = [_entity_facet_token(v) for v in (_ent.get(_ftype) or [])]
             # Artefact-only affordances: Stack membership + file-count sort key.
             row["in_stack"] = col["id"] in in_stack_ids
             row["stack_state"] = "in_stack" if row["in_stack"] else "available"
             row["stack_title"] = _AGENT_HAS_TOOLTIP if row["in_stack"] else _AGENT_ADD_TOOLTIP
-            # An artefact is the one kind whose membership IS the caller's to
+            # An artifact is the one kind whose membership IS the caller's to
             # set (no admin grant tier exists for a personal upload), so its
             # pill is a real toggle and the template supplies the button copy.
             # This value is what the *child* rows fall back to — a file inside
@@ -2691,22 +3041,19 @@ async def library_page(
             row["ingest_label"] = "" if is_folder else _ingest_label(first_file)
             # `file_format` is what the row PRINTS (a folder prints its file
             # count instead, so it has none). `format_keys` is what the row can
-            # be FILTERED by, which for a folder is every format inside it —
-            # the same reason its search text holds every filename. Keeping the
-            # two apart is what lets a folder answer "show me PDFs" without
-            # claiming to be a PDF.
-            row["format_keys"] = (
-                sorted({fmt for f in files if (fmt := _artefact_format(f))})
-                if is_folder
-                else ([row["file_format"]] if row["file_format"] else [])
-            )
-            # A loose file's ROW id is its collection id (a single-file artefact
+            # be FILTERED by — for a one-file card, that one file's own format.
+            # A folder offers no format facet at the index any more: it would
+            # need every file's format, and `files` is never fetched for a
+            # folder here (round 2 of the incident fix). The format facet
+            # still works over a folder's OWN contents on its detail page.
+            row["format_keys"] = [row["file_format"]] if row["file_format"] else []
+            # A loose file's ROW id is its collection id (a single-file artifact
             # IS its collection), but moving it needs the corpus_files id — so
             # carry that separately rather than making the drag guess.
             row["file_id"] = files[0]["id"] if (not is_folder and files) else ""
             # The slug + the file's own name are what a client-side move needs to
             # rebuild the moved row (its per-file URL is /library/{slug}/f/{id},
-            # and as a child it is titled by its FILENAME, not the artefact name)
+            # and as a child it is titled by its FILENAME, not the artifact name)
             # without a round-trip to re-render the page.
             row["slug"] = col.get("slug") or ""
             row["file_name"] = fname or ""
@@ -2715,63 +3062,16 @@ async def library_page(
             # to travel separately for the client-side 1-file transition to restore
             # it (the file default differs from the collection default).
             row["own_description"] = col.get("description") or ""
+            # A folder's children are NEVER rendered here, however small —
+            # `GET /library/{slug}/peek` fetches them, lazily, the first time
+            # the reader expands the row (round 2 of the incident fix). This
+            # is pure arithmetic on the already-batched `file_count`, no
+            # per-collection query: what the peek WOULD leave out, so the
+            # "Browse all N files" row (`folder_more_row`) can render up
+            # front — 0 means a click reveals the whole folder and no such
+            # row is needed.
             row["children"] = []
-            if is_folder:
-                slug = col.get("slug")
-                for f in files:
-                    ftype_key, ftype_label = _artefact_type(1, f)
-                    fsize = f.get("size_bytes")
-                    child = _library_row_base(
-                        item_id=f["id"],
-                        kind="artefact",
-                        title=f.get("filename") or "Untitled file",
-                        description="",
-                        # Per-file detail page (files inside a folder had none).
-                        href=f"/library/{slug}/f/{f['id']}",
-                        glyph="doc",
-                        type_key="files",
-                        type_label=ftype_label,
-                        origin=origin,
-                        origin_label="Generated" if origin == "generated" else "Uploaded",
-                        added_iso=(f.get("created_at").isoformat() if f.get("created_at") is not None else None),
-                        owner_label=owner_label,
-                        ownership=ownership,
-                        # A file's own sharing is independent of its folder's.
-                        visibility=file_visibility(f["id"]),
-                        visibility_label="",
-                        meta_text=_human_size(fsize) if fsize else "",
-                        share_type=ResourceType.CORPUS_FILE.value,
-                        owner_key="me" if owned else (col.get("created_by") or ""),
-                    )
-                    child["file_kind"] = ftype_key
-                    # A file inside a folder is titled by its FILENAME and carries
-                    # no description at all, so before this its second line was
-                    # blank. It gets the same format line as a loose file — the
-                    # nested rows are files too, and the retired Type column is
-                    # where their format used to show.
-                    child["file_format"] = _artefact_format(f)
-                    child["format_keys"] = [child["file_format"]] if child["file_format"] else []
-                    # Whether the extraction pass actually got text out of this
-                    # file. Only surfaced when it is NOT `indexed`: a healthy
-                    # file saying "indexed" on every row is noise, but a file
-                    # nobody can search is worth knowing about without opening
-                    # the collection page to find it.
-                    child["ingest_label"] = _ingest_label(f)
-                    child["file_id"] = f["id"]
-                    child["file_name"] = f.get("filename") or ""
-                    child["slug"] = slug or ""
-                    child["is_folder"] = False
-                    # Stack membership is per collection, so a file inherits its
-                    # folder's state rather than claiming an independent one.
-                    child["stack_state"] = row["stack_state"]
-                    child["stack_title"] = row["stack_title"]
-                    child["stack_pill"] = row["stack_pill"]
-                    child["parent_id"] = col["id"]
-                    # Same vocabulary as every other row — read off the shared
-                    # map rather than restated here, which is how this slot came
-                    # to hold a fourth spelling of the same three states.
-                    child["visibility_label"] = VISIBILITY_LABELS.get(child["visibility"], VISIBILITY_LABELS["private"])
-                    row["children"].append(child)
+            row["children_hidden"] = max(0, file_count - _LIBRARY_FOLDER_PEEK) if is_folder else 0
             items.append(row)
     except Exception as e:
         _lost("files and collections", e)
@@ -2947,8 +3247,12 @@ async def library_page(
     # store entity is readable by every authenticated user, so listing all of
     # them would make every user's Library a copy of /marketplace rather than
     # "the things I have". Installed items are the honest subset.
+    # The kinds StackResolver does not serve (plugins, recipes) resolve through
+    # `app.services.library_grants` — the one definition the admin Simulate
+    # lens's Library preview reads too, so the preview OF this page and this
+    # page cannot answer the same question differently.
+    from app.services.library_grants import granted_plugins, granted_recipes
     from app.services.stack_resolver import StackResolver
-    from src.repositories import marketplace_plugins_repo
 
     resolver = StackResolver()
 
@@ -2975,6 +3279,19 @@ async def library_page(
                 _via_cache[rt] = {}
         return _via_cache[rt]
 
+    #: Row type key -> RBAC resource type, where the two vocabularies differ.
+    #: A row's `type_key` is the Library's own word: it drives `data-kind` in
+    #: the DOM and the toolbar facet, so it cannot simply be renamed to match.
+    #: For plugins the row says "plugin" while the grant is stored as
+    #: "marketplace_plugin", and passing the row's word straight into
+    #: `ResourceType()` raised `'plugin' is not a valid ResourceType` on EVERY
+    #: render — swallowed by `_granted_via`, so the only visible effect was
+    #: that plugin rows silently lost the "because you are in X" clause, the
+    #: one part of the tooltip a member can actually act on. Found by running
+    #: the page rather than by reading it: the warning is in the log of every
+    #: single Library render.
+    _GRANT_TYPE_FOR_ROW = {"plugin": ResourceType.MARKETPLACE_PLUGIN.value}
+
     def _because_of(type_key: str, item_id: str) -> str:
         """The trailing clause naming the caller's granting groups.
 
@@ -2984,7 +3301,7 @@ async def library_page(
         being a fact a person holds in their head and the count is the more
         useful shape.
         """
-        names = _granted_via(type_key).get(item_id) or []
+        names = _granted_via(_GRANT_TYPE_FOR_ROW.get(type_key, type_key)).get(item_id) or []
         if not names:
             return ""
         if len(names) == 1:
@@ -3205,140 +3522,124 @@ async def library_page(
         except Exception as e:
             _lost(_RT_LABELS.get(rt.value, rt.value), e)
 
-    # Recipes — granted, resolved straight off the repo (no _fetch_entries
-    # support for this type in StackResolver).
+    # Recipes — granted, resolved off `granted_recipes` (no _fetch_entries
+    # support for this type in StackResolver, so the grant rows are the
+    # projection; the shared helper is what keeps the Simulate preview of this
+    # band reading the same rows as the band).
     try:
-        recipe_ids = _granted_ids(ResourceType.RECIPE.value)
-        if recipe_ids:
-            for r in recipes_repo().list(limit=100000):
-                if r["id"] not in recipe_ids:
-                    continue
-                _add_shared_row(
-                    item_id=r["id"],
-                    title=r.get("title") or r.get("slug"),
-                    description=r.get("description"),
-                    href=f"/catalog/r/{r.get('slug') or r['id']}",
-                    glyph="doc",
-                    type_key="recipe",
-                    type_label="Recipe",
-                    origin="granted",
-                    origin_label="Shared with you",
-                    added=r.get("created_at"),
-                    meta_text="",
-                    owner_label="Your workspace",
-                )
+        for g in granted_recipes(uid):
+            _add_shared_row(
+                item_id=g.id,
+                title=g.name,
+                description=g.description,
+                href=g.href,
+                glyph="doc",
+                type_key="recipe",
+                type_label="Recipe",
+                origin="granted",
+                origin_label="Shared with you",
+                added=g.row.get("created_at"),
+                meta_text="",
+                owner_label="Your workspace",
+            )
     except Exception as e:
         _lost("recipes", e)
 
-    # Curated marketplace plugins — grant resource_id is the canonical
-    # "<marketplace_slug>/<plugin_name>" path, so match on that.
+    # Curated marketplace plugins.
+    #
+    # The grant's resource_id is the canonical "<marketplace_id>/<plugin_name>"
+    # path — the SAME key `require_resource_access(MARKETPLACE_PLUGIN,
+    # "{marketplace_id}/{plugin_name}")` gates the API with. Matching it (and
+    # dropping admin-disabled rows, which are instance-wide "does not exist"
+    # for every user-facing surface, grants notwithstanding) lives in
+    # `granted_plugins`; this loop renders what it returns.
+    #
+    # Plugins are the one granted kind whose membership is NOT automatic, so
+    # they override the stack fields `_add_shared_row` sets: for a plugin the
+    # grant is only ELIGIBILITY. Model B (v28+) has `resolve_user_marketplace`
+    # serve `subscriptions ∪ required-tier grants`, so a plugin granted at the
+    # `available` tier and never subscribed is genuinely absent from the
+    # caller's served set — its skills and commands are NOT loaded in their
+    # Claude Code. Treating the grant as membership (as this once did) made the
+    # Library claim a locked "In stack" for every eligible plugin: it
+    # contradicted both the /marketplace card and the agent's own
+    # `marketplace_search`, and — because the row rendered locked — it removed
+    # the only affordance that could have fixed the state. `granted_plugins`
+    # derives `in_stack` from `_curated_stack_sets`, the same helper
+    # `GET /api/marketplace/items` computes its `installed` flag from, which is
+    # what keeps those surfaces from drifting again.
     try:
-        plugin_paths = _granted_ids(ResourceType.MARKETPLACE_PLUGIN.value)
-        if plugin_paths:
-            # The grant's resource_id is "<marketplace_id>/<plugin_name>" — the
-            # SAME key `require_resource_access(MARKETPLACE_PLUGIN,
-            # "{marketplace_id}/{plugin_name}")` gates the API with, and
-            # `marketplace_plugins.marketplace_id` already IS that id. This
-            # used to indirect through a `{id: row["slug"]}` map, but
-            # `marketplace_registry` has no `slug` column (its PRIMARY KEY id
-            # *is* the slug), so every lookup produced None → "None/<plugin>",
-            # matched no grant, and silently dropped EVERY curated plugin from
-            # the Library — invisibly, because a non-matching path is not an
-            # exception the enclosing handler could report.
-            #
-            # Plugins are the one granted kind whose membership is NOT
-            # automatic, so they override the stack fields `_add_shared_row`
-            # sets: for a plugin the grant is only ELIGIBILITY. Model B (v28+)
-            # has `resolve_user_marketplace` serve `subscriptions ∪
-            # required-tier grants`, so a plugin granted at the `available`
-            # tier and never subscribed is genuinely absent from the caller's
-            # served set — its skills and commands are NOT loaded in their
-            # Claude Code. Treating the grant as membership (as this did) made
-            # the Library claim a locked "In stack" for every eligible plugin:
-            # it contradicted both the /marketplace card and the agent's own
-            # `marketplace_search`, and — because the row rendered locked — it
-            # removed the only affordance that could have fixed the state.
-            # Deriving it from `_curated_stack_sets`, the same helper
-            # `GET /api/marketplace/items` computes its `installed` flag from,
-            # is what keeps the two surfaces from drifting again.
-            from app.api.marketplace import _curated_stack_sets
-            from app.api.store import ORGANIZATION_PUBLISHER_LABEL
+        from app.api.store import ORGANIZATION_PUBLISHER_LABEL
 
-            plugin_in_stack, plugin_required = _curated_stack_sets(None, uid)
-            for pl in marketplace_plugins_repo().list_all():
-                # Admin-disabled is instance-wide "does not exist" for every
-                # user-facing surface, grants notwithstanding — same
-                # post-filter as the v2 /skills admin branch
-                # (app/api/v2_marketplace.py). Without it the Library kept
-                # rendering the card with a working "+ Add to stack" button.
-                if pl.get("admin_disabled"):
-                    continue
-                mid, pname = pl.get("marketplace_id"), pl.get("name")
-                path = f"{mid}/{pname}"
-                if path not in plugin_paths:
-                    continue
-                key = (mid, pname)
-                _add_shared_row(
-                    item_id=path,
-                    title=pl.get("display_name") or pl.get("name"),
-                    description=pl.get("description"),
-                    href=f"/marketplace/curated/{mid}/{pname}",
-                    glyph="plugins",
-                    type_key="plugin",
-                    type_label="Plugin",
-                    origin="granted",
-                    origin_label="Shared with you",
-                    added=None,
-                    meta_text=pl.get("category") or "",
-                    # A curated plugin is served off an admin-registered
-                    # marketplace: the organization stands behind it, exactly as
-                    # `/api/marketplace/items` reports it (`publisher_kind=
-                    # "organization"`, `publisher_name=ORGANIZATION_PUBLISHER_LABEL`).
-                    # The Library used to call the same item "Your workspace" and
-                    # emit no trust marker, so the one class of item that IS
-                    # organization-published was the one class showing no
-                    # Organization marker — the two surfaces contradicted each
-                    # other on the same row.
-                    owner_label=ORGANIZATION_PUBLISHER_LABEL,
-                    # The tier is real for plugins too, so the Optional/Required
-                    # facet slices them the way it slices data packages.
-                    requirement=("required" if key in plugin_required else "optional"),
-                )
-                row = items[-1]
-                # Same three fields the store-entity rows carry, so the trust
-                # marker macro reads one vocabulary across every Library row.
-                # A curated plugin has no per-item verification state — the
-                # organization publishing it outranks verification anyway (see
-                # `level_for()` in macros/_trustmark.html).
-                row["publisher_kind"] = "organization"
-                row["verified"] = False
-                row["trust_level"] = "org"
-                # Same endpoint both ways: POST subscribes, DELETE unsubscribes
-                # (`curated_install` / `curated_uninstall`). The Library's toggle
-                # is kind-agnostic — it POSTs/DELETEs whatever the row names.
-                row["stack_endpoint"] = f"/api/marketplace/curated/{mid}/{pname}/install"
-                # Same verb as a store entity, and for the same reason.
-                row["stack_action"] = "Install"
-                row["stack_undo"] = "Uninstall"
-                # Droppable unless an admin pinned it globally (`is_system`) or
-                # required-tier-granted it to one of the caller's groups. Those
-                # are precisely the two cases `curated_uninstall` answers 409
-                # to, so the lock promises exactly what the API enforces.
-                locked = bool(pl.get("is_system")) or key in plugin_required
-                row["stack_action"] = _AGENT_ADD
-                row["stack_undo"] = _AGENT_REMOVE
-                if key in plugin_in_stack:
-                    row["stack_state"] = "in_stack"
-                    row["stack_pill"] = _AGENT_HAS
-                    row["stack_locked"] = locked
-                    row["stack_removable"] = not locked
-                    row["stack_title"] = _LOCKED_STACK_TOOLTIP if locked else _AGENT_HAS_TOOLTIP
-                else:
-                    row["stack_state"] = "available"
-                    row["stack_pill"] = ""
-                    row["stack_locked"] = False
-                    row["stack_addable"] = True
-                    row["stack_title"] = _AGENT_ADD_TOOLTIP
+        for g in granted_plugins(uid):
+            pl = g.row
+            mid, pname = pl.get("marketplace_id"), pl.get("name")
+            _add_shared_row(
+                item_id=g.id,
+                title=g.name,
+                description=g.description,
+                href=g.href,
+                glyph="plugins",
+                type_key="plugin",
+                type_label="Plugin",
+                origin="granted",
+                origin_label="Shared with you",
+                added=None,
+                meta_text=pl.get("category") or "",
+                # A curated plugin is served off an admin-registered
+                # marketplace: the organization stands behind it, exactly as
+                # `/api/marketplace/items` reports it (`publisher_kind=
+                # "organization"`, `publisher_name=ORGANIZATION_PUBLISHER_LABEL`).
+                # The Library used to call the same item "Your workspace" and
+                # emit no trust marker, so the one class of item that IS
+                # organization-published was the one class showing no
+                # Organization marker — the two surfaces contradicted each
+                # other on the same row.
+                owner_label=ORGANIZATION_PUBLISHER_LABEL,
+                # The tier is real for plugins too, so the Optional/Required
+                # facet slices them the way it slices data packages.
+                requirement=("required" if g.requirement == "required" else "optional"),
+            )
+            row = items[-1]
+            # Same three fields the store-entity rows carry, so the trust
+            # marker macro reads one vocabulary across every Library row.
+            # A curated plugin has no per-item verification state — the
+            # organization publishing it outranks verification anyway (see
+            # `level_for()` in macros/_trustmark.html).
+            row["publisher_kind"] = "organization"
+            row["verified"] = False
+            row["trust_level"] = "org"
+            # Same endpoint both ways: POST subscribes, DELETE unsubscribes
+            # (`curated_install` / `curated_uninstall`). The Library's toggle
+            # is kind-agnostic — it POSTs/DELETEs whatever the row names.
+            row["stack_endpoint"] = f"/api/marketplace/curated/{mid}/{pname}/install"
+            # Droppable unless an admin pinned it globally (`is_system`) or
+            # required-tier-granted it to one of the caller's groups. Those
+            # are precisely the two cases `curated_uninstall` answers 409
+            # to, so the lock promises exactly what the API enforces.
+            locked = bool(pl.get("is_system")) or g.requirement == "required"
+            # Same verb as a store entity, and for the same reason.
+            row["stack_action"] = _AGENT_ADD
+            row["stack_undo"] = _AGENT_REMOVE
+            if g.in_stack:
+                row["stack_state"] = "in_stack"
+                row["stack_pill"] = _AGENT_HAS
+                row["stack_locked"] = locked
+                row["stack_removable"] = not locked
+                # `_add_shared_row` already composed a tooltip ending in the
+                # "because you are in X" clause; these two lines REPLACE it,
+                # so the clause has to be re-appended or a plugin row is the
+                # one granted kind that never says why the caller has it —
+                # the exact question the clause exists to answer, and the
+                # only part of the row a member can act on.
+                _why = _because_of("plugin", g.id)
+                row["stack_title"] = (_LOCKED_STACK_TOOLTIP if locked else _AGENT_HAS_TOOLTIP) + _why
+            else:
+                row["stack_state"] = "available"
+                row["stack_pill"] = ""
+                row["stack_locked"] = False
+                row["stack_addable"] = True
+                row["stack_title"] = _AGENT_ADD_TOOLTIP
     except Exception as e:
         _lost("plugins from your organization", e)
 
@@ -3366,7 +3667,14 @@ async def library_page(
                 href=f"/marketplace/flea/{inst['id']}?from=library",
                 glyph="doc",
                 type_key="agent",
-                type_label="Agent",
+                # "Agent" was the row's tag while the section above it said
+                # "Agent templates" and /agents held something else entirely
+                # (#1956 item 3). The two are different things: a template is
+                # a portable role DEFINITION, an agent is a running one with
+                # its own scope, budget and address. The `/agents` picker
+                # already spells this out for the same entity; the Library
+                # never got the fix.
+                type_label="Agent template",
                 origin="installed",
                 origin_label="From the marketplace",
                 added=inst.get("installed_at") or inst.get("created_at"),
@@ -3510,31 +3818,38 @@ async def library_page(
         except Exception as e:
             _lost("apps", e)
 
-    # ── The semantic layer — a SECTION, and its two flat projections ──────
-    # This closed the page as a footer aside for one good reason and one bad
-    # one. The good one still holds: a METRIC or a glossary term is not a row
-    # here — it is the organization's agreed vocabulary, which nobody owns,
-    # shares, installs or drops, so as a row it had to neuter all four of the
-    # table's columns at once (Owner / Sharing / Stack / Actions), and four
-    # special-cased columns is the table saying the object is not one of its
-    # rows.
+    # ── The semantic layer — a STRIP above the inventory, not a section ───
+    # Three placements, and each move was the page learning what the object
+    # is. A footer aside below an unbounded list (unreachable — after every
+    # row is where a reader stops looking), then a named SECTION whose band
+    # carried the two flat projections as links, and now a strip standing
+    # between the type map and the toolbar.
     #
-    # The bad one was treating the MODEL like the metric. A semantic model
-    # answers every one of those columns honestly — it has a source, it
-    # reaches you through a grant exactly as a Data Package does, your agents
-    # do read it, and it has a detail page — so the thing that could not be a
-    # row was never the document, only its projection. #1707 N3: the models
-    # are rows in a NAMED section at a fixed slot in the order above, and the
-    # two flat projections ride that section's band as links into their tabs
-    # on /semantic-layer (they were `/catalog/semantics#metrics` and
-    # `#glossary`; that page is now a 308 onto the same two tabs).
+    # What the section got right survives here: a METRIC or a glossary term
+    # is not a row — it is the organization's agreed vocabulary, which nobody
+    # owns, shares, installs or drops, so as a row it had to neuter all four
+    # of the table's columns at once (Owner / Sharing / Stack / Actions).
+    #
+    # What it got wrong is that the MODEL is not a peer of the rows either.
+    # A Data Package is data you can reach; a semantic model is a statement
+    # ABOUT that data and is useless without it — a dependent layer, not a
+    # sibling entry in the same inventory. The table's own affordances say so:
+    # Filter, sort and "Agents use it" are inventory controls, and none of the
+    # three means anything applied to three documents. So the whole layer
+    # leaves the table and becomes one destination above it, with the models,
+    # the metrics and the glossary as the three tabs of `/semantic-layer` —
+    # which is where a reader can act on all three at their own altitude.
+    #
+    # Stated in place rather than hidden behind the click: the counts ride the
+    # strip's own sentence, so a caller who never opens it still leaves
+    # knowing the vocabulary exists and roughly how much of it is defined.
     #
     # The counts are computed here — RBAC-filtered on the metric side by the
     # same `_first_inaccessible_table` predicate those tabs apply, so the
-    # section never advertises definitions the caller cannot open; the
-    # glossary is deliberately ungated (business vocabulary, not data), so its
-    # count is instance-wide.
-    definitions_footer: dict = {}
+    # strip never advertises definitions the caller cannot open; the glossary
+    # is deliberately ungated (business vocabulary, not data), so its count is
+    # instance-wide.
+    library_definitions: dict = {}
     try:
         from app.api.metrics import _first_inaccessible_table
         from src.rbac import get_accessible_tables
@@ -3542,103 +3857,92 @@ async def library_page(
         # No `conn` argument: /library takes no raw ``Depends(_get_db)``
         # connection, and passing one would be the backend-split bug class on a
         # Postgres instance. The default path reads through the repo factory.
-        _accessible = get_accessible_tables(user)
-        _allowed = None if _accessible is None else set(_accessible)
-        _visible_metrics = [m for m in metric_repo().list() if _first_inaccessible_table(m, _allowed) is None]
-        # 500 is GET /api/glossary's own max limit and the repo has no
-        # unbounded mode (it bounds a full-table scan) — above the scale this
-        # feature targets, so an exact count in practice.
-        _glossary_terms = glossary_repo().list(limit=500)
+        # One boundary per read, not one around all three. The comment below
+        # claimed the model read already had its own guard; it did not — a
+        # single `try` wrapped every read, so one failing table removed the
+        # whole Definitions row and the reader was told a populated semantic
+        # layer does not exist (Devin Review on #2069). A count that cannot be
+        # read now degrades to "none of those", and the row still states the
+        # two that could.
+        _visible_metrics: list = []
+        _glossary_count = 0
+        _has_readable_model = False
 
-        # What the page's search box matches the footer on. The reader types
-        # the TERM they want — "ARR", "active account" — not the word
-        # "definitions", so the block carries its contents' vocabulary: every
-        # metric name, display name and synonym (synonyms are what make "MRR"
-        # reach "Monthly Recurring Revenue"), and every glossary term.
-        #
-        # Names only, never the definition bodies. This ships in an attribute
-        # on every page load, and matching on prose would surface the block for
-        # words that merely appear inside some definition. The metric side
-        # inherits the RBAC filter above for free.
-        def _index_words(values) -> str:
-            seen: dict[str, None] = {}
-            for v in values:
-                for word in str(v or "").split():
-                    w = word.strip().lower()
-                    if w:
-                        seen.setdefault(w, None)
-            return " ".join(seen)
+        try:
+            _accessible = get_accessible_tables(user)
+            _allowed = None if _accessible is None else set(_accessible)
+            _visible_metrics = [m for m in metric_repo().list() if _first_inaccessible_table(m, _allowed) is None]
+        except Exception as e:  # noqa: BLE001 — one lost count, not the row
+            logger.warning("/library: could not count visible metrics: %s", e)
+        # Through the shared helper, not a second inline
+        # `glossary_repo().list(limit=500)`: this strip and the
+        # `/semantic-layer` tab strip show the SAME number to the same caller
+        # one click apart, and two call sites are two chances for that pair to
+        # drift. Only the count is wanted here — the strip states how much
+        # vocabulary exists and links out; the terms themselves are read and
+        # searched on the page that owns them.
+        try:
+            _glossary_count = _glossary_terms_count()
+        except Exception as e:  # noqa: BLE001 — one lost count, not the row
+            logger.warning("/library: could not count glossary terms: %s", e)
 
         # Whether to offer the "Browse the semantic layer" link below — a
         # readable-model check scoped to what THIS caller can reach, the same
         # `_can_read_model` gate the /semantic-layer browse pages apply. It
         # answers "does this caller have a semantic model to browse at all", so
-        # a caller who can read nothing gets neither the link nor a
-        # "0 metrics · 0 terms" footer pointing at an empty page. A model with
-        # no metrics/glossary projected yet (or a purely native, browse-only
-        # model) still counts — gating on the flat projection's counts would
-        # hide the one thing this UI exists to browse. Read in its own guard so
-        # a semantic_models failure leaves the metric/glossary footer already
-        # computed above intact instead of suppressing it.
+        # a caller who can read nothing is not pointed at an empty page. A
+        # model with no metrics/glossary projected yet (or a purely native,
+        # browse-only model) still counts — gating on the flat projection's
+        # counts would hide the one thing this UI exists to browse. Read in
+        # its own guard (see above) so a semantic_models failure leaves the
+        # metric and glossary counts intact instead of suppressing the strip
+        # entirely.
         #
-        # ONE `_can_read_model` sweep (the #1850 memo): the same list answers
-        # the browse gate below AND supplies the section's rows. The check
-        # resolves a model's Data Packages per row, so a second sweep would
-        # double this page's semantic-layer cost for an answer it already had.
-        _readable_models = _readable_semantic_model_rows(user, conn, surface="/library")
-        _has_readable_model = _has_readable_semantic_model(user, conn, surface="/library", rows=_readable_models)
+        # The models are no longer ROWS on this page — the whole layer is one
+        # destination now (see the note above), and `/semantic-layer`'s Models
+        # tab is where a model is listed, with its object counts, dialects and
+        # validation status. What survives here is the single question this
+        # page still has to answer: does this caller have a readable document
+        # at all, which decides where the strip's one link should land.
+        try:
+            _has_readable_model = _has_readable_semantic_model(user, conn, surface="/library")
+        except Exception as e:  # noqa: BLE001 — one lost count, not the row
+            logger.warning("/library: could not resolve a readable semantic model: %s", e)
 
-        # One row per SLUG — the newest readable row, matching what
-        # `/semantic-layer/{slug}` resolves to. Two models can share a slug
-        # (unique only per source/source_ref), and a second row would link to
-        # the same page as the first (Devin #1398).
-        _newest_by_slug: dict = {}
-        for _m in _readable_models:
-            _cur = _newest_by_slug.get(_m.get("slug"))
-            if _cur is None or str(_m.get("updated_at") or "") > str(_cur.get("updated_at") or ""):
-                _newest_by_slug[_m.get("slug")] = _m
-        for _slug, _m in sorted(_newest_by_slug.items(), key=lambda kv: str(kv[0])):
-            from app.web.semantic_layer_view import model_of, object_counts, source_label
-
-            try:
-                _counts = object_counts(model_of(_m))
-            except Exception:  # noqa: BLE001 - a stale document costs the meta line, not the row
-                _counts = {}
-            _meta = " · ".join(
-                f"{_counts[k]} {lbl}{'' if _counts[k] == 1 else 's'}"
-                for k, lbl in (("datasets", "dataset"), ("metrics", "metric"), ("glossary", "glossary term"))
-                if _counts.get(k)
-            )
-            _add_shared_row(
-                item_id=_m["id"],
-                title=_m.get("name") or _slug,
-                description=_m.get("description") or "",
-                href=f"/semantic-layer/{quote(str(_slug))}",
-                glyph="data",
-                type_key="semantic_model",
-                type_label="Semantic model",
-                origin="granted",
-                origin_label="Shared with you",
-                added=None,
-                meta_text=_meta,
-                owner_label=source_label(_m.get("source")),
-                owner_key=str(_m.get("source") or "manual"),
-            )
-
-        if _visible_metrics or _glossary_terms or _has_readable_model:
-            definitions_footer = {
+        if _visible_metrics or _glossary_count or _has_readable_model:
+            library_definitions = {
                 "metric_count": len(_visible_metrics),
-                "glossary_count": len(_glossary_terms),
-                # Only THIS gates the "Browse the semantic layer" link: the
-                # metric/glossary links ride the flat projection above, but the
-                # browse page needs a readable document, so a caller with
-                # visible metrics yet no readable model must not be sent there.
-                "has_semantic_models": _has_readable_model,
-                "search": _index_words(
-                    [m.get("display_name") for m in _visible_metrics]
-                    + [m.get("name") for m in _visible_metrics]
-                    + [s for m in _visible_metrics for s in (m.get("synonyms") or [])]
-                    + [g.get("term") for g in _glossary_terms]
+                "glossary_count": _glossary_count,
+                # The sentence says "N glossary terms"; N saturates at the
+                # read limit, so say so rather than stating a cap as a total.
+                "glossary_count_label": _glossary_count_label(_glossary_count),
+                # Where the strip's ONE link lands. The strip offers a single
+                # call to action by design — two competing links beside a
+                # sentence is the band this replaced — so the target has to
+                # carry what the two links used to say between them.
+                #
+                # Always the Metrics tab, for every caller. The fork this
+                # replaced sent a reader who could read a document to the bare
+                # `/semantic-layer` (its Models tab) and everyone else to the
+                # metrics — written before this card's own copy became "21
+                # metrics, 12 glossary terms". Against that sentence the Models
+                # tab shows NEITHER of the two things just counted: the reader
+                # clicks a promise about words and numbers and arrives at a list
+                # of documents. The tab strip carries them on to the models in
+                # one click, which is the right way round.
+                # ...with one exception the paragraph above did not consider:
+                # an instance that HAS a semantic layer but no metrics in it.
+                # Sending that reader to the metrics tab lands them on the one
+                # empty list on the page, having just been told the layer holds
+                # 40 glossary terms (Devin Review on #2069). Pick the first tab
+                # that actually holds something, in the order the card counts
+                # them; metrics stay the default whenever they exist.
+                "browse_href": (
+                    "/semantic-layer?tab=all_metrics"
+                    if _visible_metrics
+                    else "/semantic-layer?tab=all_glossary"
+                    if _glossary_count
+                    else "/semantic-layer"
                 ),
             }
     except Exception as e:
@@ -3699,9 +4003,10 @@ async def library_page(
     #: 30 days rather than a 23-day slice; the engine's `multi` mode does the
     #: containment test. A row with no date carries nothing and is simply never
     #: matched, which is honest — we do not know when it arrived.
-    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    from datetime import datetime as _dt
+    from datetime import timedelta as _td
 
-    _now = _dt.now(_tz.utc)
+    _now = _dt.now(UTC)
     _age_labels = [("7d", "Last 7 days", 7), ("30d", "Last 30 days", 30), ("90d", "Last 90 days", 90)]
     _age_counts: dict = {}
     for c in items:
@@ -3711,7 +4016,7 @@ async def library_page(
             try:
                 when = _dt.fromisoformat(iso)
                 if when.tzinfo is None:
-                    when = when.replace(tzinfo=_tz.utc)
+                    when = when.replace(tzinfo=UTC)
                 age = _now - when
                 buckets = [key for key, _lbl, days in _age_labels if age <= _td(days=days)]
             except ValueError:
@@ -3744,6 +4049,20 @@ async def library_page(
             tag_counts[tag] = tag_counts.get(tag, 0) + 1
     library_tags = sorted(((k, k, n) for k, n in tag_counts.items()), key=lambda x: x[1].lower())
 
+    #: Entity facets — Client / Industry / Offering / Document type, tallied
+    #: off the ROWS rather than fetched as a second list, so an option can
+    #: never offer a value no row carries and its count is what clicking it
+    #: leaves on screen. Same reason `library_tags` is built this way.
+    #:
+    #: Not subject to the "<2 values is dead weight" rule below, which is
+    #: about facets EVERY row carries: a lone client still splits the page
+    #: into "about them" and "everything else", because a skill or a data
+    #: package carries no client at all.
+    library_entity_cats = [
+        (facet_key, label, _present_multi(f"entity_{facet_key}")) for _fact_type, facet_key, label in _entity_facets
+    ]
+    library_entity_cats = [(k, lbl, opts) for k, lbl, opts in library_entity_cats if opts]
+
     # A single-valued facet is dead weight (every row matches), so drop it.
     if len(library_requirements) < 2:
         library_requirements = []
@@ -3764,13 +4083,6 @@ async def library_page(
     # Unlisted types fall to the end, alphabetically.
     _SECTION_ORDER = [
         "data_package",
-        # Directly under the governed data, because it is what that data
-        # MEANS: the reader who has just seen "Data packages" is one line away
-        # from the definitions those tables are queried through. A FIXED slot,
-        # never the tail of the page — this was a footer aside below an
-        # unbounded list, i.e. after every row, which is where a reader stops
-        # looking (#1707 N3).
-        "semantic_model",
         "plugin",
         "skill",
         "agent",
@@ -3778,7 +4090,7 @@ async def library_page(
         # Loose files + collections-as-folders.
         "files",
         # Apps read AFTER the caller's own files — the same reading order they
-        # had as a trailing block inside the Artefacts band, now carried by the
+        # had as a trailing block inside the Artifacts band, now carried by the
         # section order instead of by row order within one band.
         "data_app",
         "memory_domain",
@@ -3793,7 +4105,6 @@ async def library_page(
     _TAB_CAPABILITIES = "capabilities"
     _SECTION_TAB = {
         "data_package": _TAB_KNOWLEDGE,
-        "semantic_model": _TAB_KNOWLEDGE,
         "data_app": _TAB_KNOWLEDGE,
         "recipe": _TAB_KNOWLEDGE,
         "files": _TAB_KNOWLEDGE,
@@ -3803,7 +4114,7 @@ async def library_page(
         "agent": _TAB_CAPABILITIES,
     }
     #: Data apps used to land INSIDE the Files band (``_SECTION_OF``). They
-    #: have their own band now: an app is not an artefact the caller uploaded,
+    #: have their own band now: an app is not an artifact the caller uploaded,
     #: and the Files hint had to claim it was one. Their rows keep
     #: ``type_key="data_app"`` either way, so the Type facet and the row label
     #: are unaffected.
@@ -3830,7 +4141,7 @@ async def library_page(
         # collections nested inside it as folders — and hosted data apps as a
         # trailing block (_SECTION_OF): everything the caller or their agent
         # made, hence the umbrella name.
-        "files": "Artefacts",
+        "files": "Artifacts",
         "skill": "Skills",
         "plugin": "Plugins",
         "agent": "Agent templates",
@@ -3841,7 +4152,6 @@ async def library_page(
         # footer aside's name and is retired with it: it named the CONTENTS
         # (metrics, terms) while the section holds the documents those are
         # projected from.
-        "semantic_model": "Semantic models",
         "data_app": "Apps",
         "memory_domain": "Memory",
     }
@@ -3855,10 +4165,13 @@ async def library_page(
         "files": "Files you upload and the outputs your agent generates.",
         "skill": "Skills built here.",
         "plugin": "Bundles of skills and commands.",
-        "agent": "Assistants you installed.",
+        # NOT "assistants": these are definitions, and the thing they define
+        # is not running. Says both jobs, because installing one does both —
+        # every agent gains the specialist, and you can start an agent of your
+        # own from it (the row's second action).
+        "agent": "Reusable role definitions. Install one and your agents gain a ready-made specialist — or start an agent of your own from it.",
         "recipe": "Prepared analyses you can run.",
         "data_package": "Governed data you can query.",
-        "semantic_model": "What your data means — your agents answer with these.",
         "data_app": "Hosted apps running next to your data.",
         "memory_domain": "Curated organizational knowledge.",
     }
@@ -3886,11 +4199,6 @@ async def library_page(
         "agent": ("agent", "agent"),
         "recipe": ("recipe", "recipes"),
         "data_package": ("data", "data"),
-        # The `data` accent, deliberately shared with Data packages rather than
-        # given a `--ds-kind-semantic` of its own: a semantic model is a
-        # statement ABOUT the governed data, and the model cards on
-        # /semantic-layer already wear this kind (semantic_layer_list.html).
-        "semantic_model": ("data", "data"),
         "data_app": ("app", "app"),
         "memory_domain": ("memory", "memory"),
     }
@@ -3913,15 +4221,6 @@ async def library_page(
         loose = [r for r in rows if not r.get("is_folder")]
         return folders + loose
 
-    # The semantic layer is the one section that can exist with NO rows: a
-    # caller may have visible metrics and glossary terms yet no readable
-    # DOCUMENT, and the two flat projections are still theirs to open. Given
-    # its own empty band rather than dropped, because dropping it is how the
-    # footer aside's whole failure mode returns — the definitions become
-    # unreachable from the page that is supposed to inventory them.
-    if definitions_footer and "semantic_model" not in grouped:
-        grouped["semantic_model"] = []
-
     library_sections = []
     for key, rows in sorted(grouped.items(), key=lambda kv: _section_rank(kv[0])):
         kind, glyph = _SECTION_KINDS.get(key, ("library", "doc"))
@@ -3936,12 +4235,20 @@ async def library_page(
                 "rows": _section_rows(key, rows),
                 "kind": kind,
                 "glyph": glyph,
-                # Links carried by the section's own BAND rather than by any
-                # row — the flat metric/glossary projections are a destination,
-                # not inventory (see the note where `definitions_footer` is
-                # built). Only this section supplies them; every other renders
-                # its band exactly as before.
-                "defs": definitions_footer if key == "semantic_model" else None,
+                # One link across to the OTHER half of the story: the band
+                # explains what a template IS, and this is the one thing you do
+                # with it that does not happen here. It opens the builder's
+                # template picker directly, so the label is literally true
+                # rather than a signpost to a page you then have to work out.
+                #
+                # Band-level, not per row. A row already carries the act that
+                # belongs to it — adding the template to your agents — and a
+                # second link beside that one competed with it for a fixed
+                # 170px column while offering something true of every row in
+                # the band equally.
+                "band_link": (
+                    {"href": "/agents?from_template=1", "label": "Start from a template"} if key == "agent" else None
+                ),
                 # Top-level entries only — a folder counts once, not once per
                 # file inside it (its own count rides the folder row).
                 "count": len(rows),
@@ -3973,6 +4280,54 @@ async def library_page(
     else:
         library_active_tab = _TAB_KNOWLEDGE
 
+    # WHICH emptiness, when there is nothing to list. The grant-backed kinds
+    # this branch is about (data packages, memory, recipes, plugins) stay
+    # grant-scoped and deliberately NOT admin god-mode even for an admin
+    # (see the handler docstring — artefacts are the one exception), so a
+    # fully stocked workspace still renders nothing here for a caller no admin
+    # has granted anything to. The page had ONE empty state for both cases and
+    # it said "your library is empty — upload a file", i.e. it framed the
+    # surface as purely self-authored; an admin who had just connected a source
+    # and registered a marketplace read that as the product being broken. Same
+    # class of mistake `library_load_errors` exists to prevent one branch away:
+    # "empty" is a claim about the world, and the page may only make it when it
+    # knows the world is.
+    #
+    # Computed ONLY when the empty state can actually render — the template
+    # branches on `library_sections`, so a stocked Library pays nothing. Even
+    # then it is close to free: the package map and the domain item counts were
+    # already read above for the rows, and plugins come from a grouped COUNT,
+    # never a body read. Deliberately not exhaustive across every grantable
+    # kind — these are the three the copy names, and a miss only falls back to
+    # the copy the page shipped before, which is the safe direction. It is
+    # coarse the other way too: a package still in `draft` counts, so an
+    # instance whose only content is unpublished says "nothing shared with you
+    # yet". That reading is the useful one for both readers — an admin's next
+    # move really is publish-and-grant, and it is not a fresh instance.
+    #
+    # Memory counts on ITEMS, not on domains: every instance ships six empty
+    # starter domains, and an empty domain is hidden from the band even when
+    # granted (see `dom_counts` above), so counting domains would make the
+    # genuinely-empty state unreachable and the split meaningless. `dom_counts`
+    # has no entry for a domain with nothing in it, and is None when the count
+    # could not be read — both fall to False, which is the conservative side.
+    #
+    # What this discloses is an AGGREGATE — that the workspace holds grantable
+    # content at all — never a name, a count, or any kind's inventory. Naming a
+    # specific resource to a caller with no grant is the disclosure
+    # docs/superpowers/specs/2026-08-29-empty-blocked-forbidden-vocabulary-design.md
+    # rules out, and an aggregate stays on the right side of that line.
+    library_grantable_exists = False
+    if not library_sections:
+        library_grantable_exists = bool(pkg_slugs) or bool(dom_counts)
+        if not library_grantable_exists:
+            try:
+                from src.repositories import marketplace_plugins_repo
+
+                library_grantable_exists = bool(marketplace_plugins_repo().count_by_marketplace())
+            except Exception as e:  # noqa: BLE001 - a copy decision must never take the page down
+                logger.debug("/library: plugin existence check unavailable: %s", e)
+
     from app.instance_config import feature_enabled
 
     ctx = _build_context(
@@ -3982,7 +4337,13 @@ async def library_page(
         library_sections=library_sections,
         library_tabs=library_tabs,
         library_active_tab=library_active_tab,
-        definitions_footer=definitions_footer,
+        # The count the page's own `refreshItemCount` will compute on its first
+        # apply(): the ACTIVE tab's total, not the whole inventory. Rendered
+        # server-side so the line does not change its number a beat after
+        # first paint — the tabs are a partition, and "17 items" swapping to
+        # "10 items" reads as something the reader did (#2141 item 1).
+        library_active_count=_tab_counts.get(library_active_tab, 0),
+        library_definitions=library_definitions,
         library_origins=library_origins,
         library_requirements=library_requirements,
         library_in_stack_count=library_in_stack_count,
@@ -3990,6 +4351,7 @@ async def library_page(
         library_stack_toggle=library_stack_toggle,
         library_owners=library_owners,
         library_tags=library_tags,
+        library_entity_cats=library_entity_cats,
         #: The kind. Left out for a long time because "the list is already
         #: GROUPED by type into these very sections" — true of one flat list of
         #: eight kinds, but a tab now holds several and grouping is not
@@ -3999,9 +4361,20 @@ async def library_page(
         library_formats=_present_multi("format_keys"),
         library_ownerships=library_ownerships,
         library_load_errors=_load_errors,
+        # Which empty state is the honest one — see where this is computed.
+        # Read only by the `{% else %}` branch, and only after
+        # `library_load_errors`: a failed read outranks both claims.
+        library_grantable_exists=library_grantable_exists,
         library_ages=library_ages,
         # Highlight target after "Save to Library" (see the builders).
         library_new_id=request.query_params.get("new") or "",
+        # Folder to expand on arrival — `/library?open=<collection_id>`. Back
+        # from a file's own page returns here, and the row the reader clicked
+        # only exists inside an expanded folder, so without this "back" landed
+        # on a list that did not contain the thing they came from (#2141 item
+        # 3). Passed to the page as a JS string and only ever compared against
+        # ids already in the DOM, exactly like `library_new_id` above.
+        library_open_folder=request.query_params.get("open") or "",
         # Band to open on arrival — a detail page's back link returns here as
         # /library?section=<type_key> (router._detail_back) and the bands are
         # folded by default, so without this the caller lands on a closed
@@ -4042,11 +4415,76 @@ async def library_page(
             env_var="AGNES_LIBRARY_SHOW_UNVERIFIED_TRUST",
             default=_LIBRARY_TRUST_DEFAULT,
         ),
-        # TCRD-250: node types with live, caller-scoped counts at the head
-        # of the Knowledge tab. Empty list = render nothing, see helper.
-        library_type_map=_library_type_map(user),
+        # Has this reader already taken Agnes to their tools? The foot banner
+        # asked everyone forever, including the people who had finished
+        # (#1956 item 2). Two signals, because either one alone misses a real
+        # case: `use_anywhere` is set by ARRIVING at the connect page, which
+        # is the product's own model of that step but never fires for someone
+        # who set the CLI up without visiting it; a live PAT is what `agnes
+        # init` actually authenticates with, so holding one IS being
+        # connected, however they got there.
+        library_connected=_has_connected_tools(user),
     )
     return templates.TemplateResponse(request, "library.html", ctx)
+
+
+#: Result cap for the facet typeahead below — the caller-supplied `limit` is
+#: clamped into this range so a copy-pasted URL can never turn the route
+#: back into an unbounded dump.
+_LIBRARY_FACET_SEARCH_MAX = 200
+
+
+@router.get("/library/facets/{facet}")
+def library_facet_search(
+    facet: str,
+    q: str = "",
+    limit: int = 50,
+    user: dict = Depends(get_current_user),
+    conn: duckdb.DuckDBPyConnection = Depends(_get_db),
+):
+    """ "Search facets" typeahead for one entity facet (client / industry /
+    offering / document type) — the way to reach a value past the index's
+    own top-`_LIBRARY_ENTITY_FACET_LIMIT` menu (round 3 of the 2026-09-03
+    incident) without ever inlining the full vocabulary. Bounded, ranked by
+    document count exactly like the menu itself, through the SAME
+    `facet_top_values_for_collections` query.
+
+    RBAC: the same boundary `/library` itself uses — every value returned is
+    scoped to collections `accessible_collection_ids` says this caller can
+    see (`None` for an admin, meaning no filter), never the whole graph.
+    An unknown `facet` name is a 404: the four legal keys come from
+    `_entity_facet_spec()`, the same source the index's own menu columns do,
+    so this route can never offer a category the page does not have.
+
+    Plain ``def``, not ``async def`` — purely blocking `facts_pg` /
+    `accessible_collection_ids` DB work, zero ``await``s (Tier-1
+    convention, `tests/test_event_loop_offload_guard.py`).
+    """
+    facts_repo_ = _facts_repo_if_available()
+    if facts_repo_ is None:
+        return {"values": []}
+    _spec = {k: t for t, k, _lbl in _entity_facet_spec()}
+    fact_type = _spec.get(facet)
+    if fact_type is None:
+        raise HTTPException(status_code=404, detail="unknown_facet")
+
+    from app.auth.access import accessible_collection_ids
+
+    readable = accessible_collection_ids(user, conn)
+    corpus_ids = list(readable) if readable is not None else None
+    limit_norm = max(1, min(limit, _LIBRARY_FACET_SEARCH_MAX))
+    try:
+        top = facts_repo_.facet_top_values_for_collections(
+            corpus_ids, types=[fact_type], limit_per_type=limit_norm, q=q
+        )
+    except Exception as e:
+        logger.warning("/library/facets/%s: search failed: %s", facet, e)
+        return {"values": []}
+    return {
+        "values": [
+            {"value": v["label"], "label": v["label"], "count": v["document_count"]} for v in top.get(fact_type, [])
+        ]
+    }
 
 
 @router.get("/artefacts", include_in_schema=False)
@@ -4081,7 +4519,7 @@ async def agents_page(
 
     The builder's ingredient lists are REAL and RBAC-scoped:
     ``knowledge_sources_for`` resolves the caller's own data packages, memory
-    domains and artefact collections — the same list the builder assistant is
+    domains and artifact collections — the same list the builder assistant is
     given as its candidate set, so it can never offer access the picker does
     not — and capabilities hydrate client-side from
     ``/api/marketplace/items?tab=my`` (the caller's subscribed plugins)."""
@@ -4122,10 +4560,9 @@ async def skills_page(
     The route keeps its ``/skills`` path: it is the target of the Marketplace
     "submit" CTA, the ``?from=skills`` detail back-link and the tour anchors.
     ``?type=skill|plugin|agent`` deep-links past the picker."""
+    from app.instance_config import get_guardrails_enabled, get_guardrails_llm_provider_ready
     from src.store_categories import STORE_CATEGORIES
     from src.store_naming import sanitize_username
-
-    from app.instance_config import get_guardrails_enabled, get_guardrails_llm_provider_ready
 
     # The name an author types is not the name their item answers to — the
     # store appends `-by-<owner>`. /store/new has always shown that; the
@@ -4156,6 +4593,62 @@ async def skills_page(
         builder_llm_ready=_builder_llm_ready(),
     )
     return templates.TemplateResponse(request, "skills.html", ctx)
+
+
+#: The Model facet's value for a row no document declares. A real option, not
+#: an absence: "which of these did nobody write a model for" is a question a
+#: reader genuinely asks, and it is how the flat registries stay legible next
+#: to the documents.
+_DIRECT_KEY = "direct"
+_DIRECT_LABEL = "Defined directly"
+
+
+def _flat_facet(key: str, label: str, rows: list[dict], attr: str, labels: dict | None = None) -> tuple:
+    """One filter category for a flat registry, tallied off the ROWS.
+
+    Counting the rows rather than fetching a second list is what makes an
+    option's number the number of rows clicking it leaves on screen — the same
+    reason the Library builds its facets this way.
+
+    A row whose value is empty is in NO option: it is not a hidden "other"
+    bucket, it simply carries nothing on this axis (a metric declared by no
+    document has no Model, and one projected from a document has no Domain of
+    its own — its category IS the model's name).
+
+    Returns ``()`` for a facet with fewer than two values, because every row
+    then matches it and the control cannot change what is on screen. That rule
+    is why the glossary's provenance nav no longer renders on an instance where
+    no document declares a term: it was offering "All 12 / Defined directly 12".
+    """
+    counts: dict[str, int] = {}
+    for r in rows:
+        v = str(r.get(attr) or "")
+        if v:
+            counts[v] = counts.get(v, 0) + 1
+    if len(counts) < 2:
+        return ()
+    opts = sorted(
+        ((v, (labels or {}).get(v, v), n) for v, n in counts.items()),
+        key=lambda o: str(o[1]).lower(),
+    )
+    return (key, label, opts)
+
+
+def _definition_is_rich(html: str) -> bool:
+    """Whether a definition's rendered markdown carries markup its plain-text
+    preview cannot show — a link, emphasis, a list, code.
+
+    Tested by looking for residual markup, NOT by diffing the rendered text
+    against the plain projection: a link's visible text is identical either way
+    ("See the policy…"), so a diff would call the one case most worth expanding
+    — a definition imported verbatim from an external catalog, often rich HTML
+    — plain. Paragraph wrappers and line breaks do not count; they are how the
+    renderer returns a single sentence.
+    """
+    import re as _re
+
+    body = _re.sub(r"</?(?:p|br)\s*/?>", "", html or "", flags=_re.I)
+    return "<" in body
 
 
 def _document_metric_hrefs(readable_rows: list[dict]) -> dict[str, str]:
@@ -4208,7 +4701,7 @@ def _document_metric_hrefs(readable_rows: list[dict]) -> dict[str, str]:
         return {}
 
 
-def _registry_href_for_metric(row: dict, metric_name: str, user: dict, conn) -> Optional[str]:
+def _registry_href_for_metric(row: dict, metric_name: str, user: dict, conn) -> str | None:
     """The flat-registry URL that lands on this document metric's projected
     row — the model list's "All metrics" tab — or ``None`` when the metric
     has no row this caller would see there (#1707).
@@ -4321,7 +4814,7 @@ def _semantic_layer_tab_label(tab: str) -> str:
     }[tab]
 
 
-def _readable_model_by_slug(slug: str, user: dict, conn) -> Optional[dict]:
+def _readable_model_by_slug(slug: str, user: dict, conn) -> dict | None:
     """Resolve a slug to the newest ``semantic_models`` row the CALLER CAN READ.
 
     Slugs are unique only per ``(source, source_ref)`` (``upsert`` prunes only
@@ -4360,19 +4853,72 @@ def _readable_model_by_slug(slug: str, user: dict, conn) -> Optional[dict]:
 #: not be deleting it.
 _SEMANTIC_LAYER_LIST_TABS = ("models", "all_metrics", "all_glossary")
 
+#: The tab KEYS stay `models` / `all_metrics` / `all_glossary` — they are in
+#: bookmarks, in the 308 from the retired /catalog/semantics, and in skill
+#: references. Only the labels changed.
+#:
+#: "All" went because it did no work beside a count badge that already says how
+#: many, and read as a filter state on tabs that have none. "Models" became
+#: "Semantic models" for the opposite reason — it was too little, not too much:
+#: on a page called Definitions, a bare "Models" names no particular kind of
+#: thing, while "semantic model" is the actual name of the document type this
+#: tab lists and the one piece of the old vocabulary worth keeping.
 _SEMANTIC_LAYER_LIST_TAB_LABELS = {
-    "models": "Models",
+    "models": "Semantic models",
     "all_metrics": "All metrics",
     "all_glossary": "All glossary",
 }
 
 
+#: The bound every glossary count reads under — the `/semantic-layer` tab
+#: strip, the list it heads, and `/library`'s Definitions card. 500 is
+#: `GET /api/glossary`'s own max `limit` and the repo has no unbounded mode
+#: (it bounds a full-table scan), comfortably above the tens-to-low-hundreds
+#: scale this feature targets — so an exact count in practice rather than a
+#: true cap. Named because those numbers are shown to the same caller one
+#: click apart: two literals that agree today are two literals that can
+#: disagree later. "In practice" is not "always", which is what
+#: :func:`_glossary_count_label` is for: a registry at or past the limit
+#: renders ``500+`` rather than stating this cap as an exact total.
+_GLOSSARY_COUNT_LIMIT = 500
+
+
 def _glossary_terms_count() -> int:
-    """500 is ``GET /api/glossary``'s own max ``limit`` and the repo has no
-    unbounded mode (it bounds a full-table scan) — comfortably above the
-    tens-to-low-hundreds scale this feature targets, so an exact count in
-    practice rather than a true cap."""
-    return len(glossary_repo().list(limit=500))
+    return len(glossary_repo().list(limit=_GLOSSARY_COUNT_LIMIT))
+
+
+def _glossary_count_label(count: int) -> str:
+    """The count as the page should SAY it — ``500+`` once it saturates.
+
+    The number itself stays an int for every caller that does arithmetic or a
+    truthiness check on it; only the rendered label changes."""
+    return f"{_GLOSSARY_COUNT_LIMIT}+" if count >= _GLOSSARY_COUNT_LIMIT else str(count)
+
+
+def _can_author_semantic_model(user: dict, conn: duckdb.DuckDBPyConnection) -> bool:
+    """Whether authoring a semantic model can actually SUCCEED for this caller.
+
+    One flag behind three affordances — the **+ New model** card, the empty
+    state's authoring CTA, and the builder page itself — so they can never
+    disagree about who is invited. The list's own empty state already holds
+    this rule for its import CTA ("the CTA must be a path that can actually
+    succeed"); this extends it to the authoring door.
+
+    The asymmetry it encodes is `POST /api/semantic-models/apply`'s: the admin
+    branch is a plain admin write and always available, while the non-admin
+    branch queues an `authoring_suggestions` row and therefore answers
+    `403 studio_disabled` while the Studio surface is off — which it is by
+    default. So a non-admin on a default instance is not offered a door that
+    would 403 on Save.
+
+    The Studio dependency is worth calling out as a seam rather than a design:
+    a moderation queue is not conceptually part of the retired Studio surface,
+    and if that gate is ever moved off the Studio flag this function is the one
+    place that has to change.
+    """
+    if is_user_admin(user["id"], conn):
+        return True
+    return get_studio_enabled()
 
 
 @router.get("/semantic-layer", response_class=HTMLResponse)
@@ -4469,12 +5015,139 @@ async def semantic_layer_list(
     accessible_ids = get_accessible_tables(user, conn)
     allowed = None if accessible_ids is None else set(accessible_ids)
     visible_metrics = [m for m in metric_repo().list() if _first_inaccessible_table(m, allowed) is None]
-    glossary_count = _glossary_terms_count()
+    #: Read ONCE. `_glossary_terms_count()` fetched these rows and threw them
+    #: away to return a length; the cross-tab index below needs the rows, and
+    #: the glossary tab needs them again. One read, three uses.
+    glossary_all = glossary_repo().list(limit=_GLOSSARY_COUNT_LIMIT)
+    glossary_count = len(glossary_all)
+
+    #: Which document declares what — read ONCE, for both registries and for
+    #: the Model facet's labels. It used to be two passes over the same
+    #: documents, one inside each tab's block, which quietly disagreed: the
+    #: glossary pass titled a model from its DOCUMENT while the metrics pass
+    #: titled it from the stored row, so the same model could be labelled two
+    #: ways depending on which tab you were looking at.
+    from app.web.semantic_layer_view import model_glossary, model_of, projected_metric_ids
+
+    #: Every model that declares a term, not the last one to be seen. Two
+    #: models sharing a term used to overwrite each other here, so the row's
+    #: "defined in" badge named whichever document the iteration happened to
+    #: reach last — a provenance claim decided by dict ordering (Devin Review
+    #: on #2070). Collected as a list, sorted, and labelled honestly below.
+    term_models: dict[str, list[str]] = {}
+    metric_model: dict[str, str] = {}
+    model_titles: dict[str, str] = {}
+    for _row in newest_by_slug.values():
+        _slug = str(_row.get("slug") or "")
+        try:
+            _doc = model_of(_row)
+            model_titles[_slug] = _row.get("name") or _doc.get("name") or _slug
+            for _entry in model_glossary(_doc):
+                _term = str(_entry.get("term") or "").strip()
+                if _term:
+                    term_models.setdefault(_term.casefold(), []).append(_slug)
+            for _mid in projected_metric_ids(_row):
+                metric_model[_mid] = _slug
+        except Exception as e:  # noqa: BLE001 - one bad document costs its own provenance
+            logger.warning("/semantic-layer: provenance unavailable for %s: %s", _slug, e)
+
+    #: The glossary, SERVER-rendered like the metrics beside it. It used to be
+    #: fetched on tab-open and drawn by a JS card builder — which is why the two
+    #: halves of one registry looked like different products (cards vs rows) and
+    #: why the glossary sidebar could only ever hold a search box: the server did
+    #: not know the terms at render time, so it had nothing to build a nav from.
+    #: One shape, one filter, one place that knows what a source badge looks
+    #: like (#1956 item 1).
+    glossary_terms: list[dict] = []
+    #: Every registry, every time — the tabs are BUCKETS of one filtered set
+    #: now, not three separate pages, so one search has to be able to see all
+    #: of it. The metrics tab already rendered its whole (unbounded) list, so
+    #: the marginal cost is the glossary (capped at 500) and the model cards
+    #: beside it, not three times anything.
+    if True:
+        from app.markdown_render import render_plain, render_safe
+
+        # NOTE: `model_title` is the #1955 branch's resolver (display_name →
+        # document-declared title → identifier) and does not exist here yet.
+        # Same fallback chain this page already uses for its model cards, so
+        # the two agree until that branch lands.
+
+        #: Which model DECLARES each term. The glossary projector does not stamp
+        #: `model_uuid`, so the document is the only place that knows — the same
+        #: join the metrics side gets for free from `category`, which the
+        #: projector sets to the model name.
+
+        for t in glossary_all:
+            term = str(t.get("term") or "")
+            slugs = sorted(set(term_models.get(term.casefold(), [])))
+            slug = slugs[0] if slugs else None
+            glossary_terms.append(
+                {
+                    **t,
+                    "letter": (term[:1] or "?").upper(),
+                    "definition_html": render_safe(t.get("definition")),
+                    "definition_text": render_plain(t.get("definition")),
+                    "facet_model": slug or _DIRECT_KEY,
+                    "facet_source": str(t.get("source") or "manual"),
+                    #: Names the first model alphabetically and SAYS when there
+                    #: are more, rather than presenting one of several as the
+                    #: only answer. The facet value stays single (the toolbar
+                    #: facet is single-valued here) but is now deterministic.
+                    "defined_in_label": (
+                        _DIRECT_LABEL
+                        if not slug
+                        else model_titles.get(slug, slug)
+                        if len(slugs) == 1
+                        else f"{model_titles.get(slug, slug)} +{len(slugs) - 1} more"
+                    ),
+                    #: Whether the rendered definition shows anything its
+                    #: plain-text preview cannot — a link, emphasis, a list.
+                    #: This is the ONLY thing that puts the definition inside
+                    #: the expansion panel too, because the row above it
+                    #: already carries the same sentence, wrapped and
+                    #: unclipped. Repeating it there was the duplication a
+                    #: reader has no reason to click twice for.
+                    "definition_rich": _definition_is_rich(render_safe(t.get("definition"))),
+                }
+            )
+        glossary_terms.sort(key=lambda t: (t.get("term") or "").lower())
+
+        #: Resolve every cross-reference against BOTH registries before drawing
+        #: it. A `see_also` value names another definition, and a definition is
+        #: as often a metric as a term — "Credit note → Net revenue" points at a
+        #: metric, which lives on the other tab. Three outcomes, and the third
+        #: is why this is resolved at all:
+        #:   term   → filters this list, no page load
+        #:   metric → the metrics tab, carrying the name as `?q=`
+        #:   neither→ rendered as plain text, NOT a link. A reference to
+        #:            something that no longer exists must not look clickable;
+        #:            a dead link is worse than an unlinked word.
+        _term_names = {(t.get("term") or "").casefold() for t in glossary_terms}
+        _metric_names = {n.casefold() for m in visible_metrics for n in (m.get("display_name"), m.get("name")) if n}
+        for t in glossary_terms:
+            refs = []
+            for ref in t.get("see_also") or []:
+                label = str(ref).strip()
+                if not label:
+                    continue
+                key = label.casefold()
+                kind = "term" if key in _term_names else ("metric" if key in _metric_names else "")
+                refs.append({"label": label, "kind": kind})
+            t["see_also_refs"] = refs
+            #: A row opens only when opening adds something: cross-references
+            #: to follow, or markup the preview flattened away. LENGTH is
+            #: deliberately not a third reason — it was, and it meant a
+            #: definition two words too long for the row's clamp opened a panel
+            #: repeating that same sentence. The clamp was the bug; a term's
+            #: definition wraps on the row now. (A metric row keeps its
+            #: one-line preview: its panel holds SQL, grain and tables, so
+            #: there is always something behind it.)
+            t["has_more"] = bool(refs) or bool(t.get("definition_rich"))
 
     # The per-row rendering (markdown, SQL variants, document links) is paid
     # for only by the tab that shows the rows.
-    metric_categories: list[dict] = []
-    if active_tab == "all_metrics":
+    metric_rows: list[dict] = []
+    if True:  # see the note on the glossary block above
         from app.api.metrics import stores_html
         from app.markdown_render import render_plain, render_safe
 
@@ -4523,25 +5196,108 @@ async def semantic_layer_list(
             }
             for m in visible_metrics
         ]
-        by_category: dict[str, list[dict]] = {}
+        #: Which model DECLARES each metric, keyed on the id the PROJECTOR
+
+        #: The two axes `category` was carrying at once. A metric projected from
+        #: a document has `category` set to the MODEL's name; a hand-authored one
+        #: has it set to a business domain. One control offering
+        #: "commercial · delivery · finance · people · sales" therefore mixed
+        #: two kinds of thing under one unlabelled heading, and a reader could
+        #: not tell which was which. Split, each says one thing:
+        #:   Model  — which document declares it (or nothing)
+        #:   Domain — what its author filed it under, for the rows no document
+        #:            declares; a projected row has no domain of its own.
         for m in rendered:
-            by_category.setdefault(m.get("category") or "uncategorized", []).append(m)
-        metric_categories = [
-            {"name": cat, "metrics": sorted(items, key=lambda m: m.get("name") or "")}
-            for cat, items in sorted(by_category.items())
+            slug = metric_model.get(str(m.get("id") or ""))
+            m["facet_model"] = slug or _DIRECT_KEY
+            #: Stated on the ROW, not only filterable. The glossary rows beside
+            #: these have carried it since they were built; a metric row that
+            #: hid it meant you could narrow by Model and still not see the
+            #: answer without opening something. It also separates the pairs
+            #: that share a display name — the same concept defined once in a
+            #: document and once by hand is a real state, and the row was giving
+            #: a reader nothing to tell them apart with.
+            m["defined_in_label"] = model_titles.get(slug, "") if slug else _DIRECT_LABEL
+            m["facet_domain"] = "" if slug else str(m.get("category") or "")
+            m["facet_source"] = str(m.get("source") or "manual")
+
+        #: One flat, alphabetical list. It used to be grouped by `category`
+        #: into `.sl-cat-group` wrappers with no heading of their own — the
+        #: grouping was invisible, existing only so the sidebar could show and
+        #: hide whole blocks. With the sidebar replaced by facets there is
+        #: nothing left for a group to be, and a reader scanning for a name
+        #: gets one A-Z list instead of five.
+        metric_rows = sorted(rendered, key=lambda m: str(m.get("display_name") or m.get("name") or "").lower())
+
+    #: ONE set of facets over every row on the page, because the tabs are
+    #: buckets of one filtered set rather than three pages. A facet a whole
+    #: bucket has no value for simply never matches those rows — a model card
+    #: has no Domain, a metric projected from a document has no Domain of its
+    #: own — which is the engine's existing behaviour for an empty attribute,
+    #: not a special case.
+    #: A model contributes its OWN values here, not a placeholder row. Every
+    #: model used to be tallied as `_DIRECT_KEY` with an empty source, while
+    #: the card markup declared neither attribute — so the menu and the rows
+    #: disagreed in both directions at once: "Defined directly" counted every
+    #: model into a slice none of them could match, and selecting ANY model
+    #: emptied the Semantic models tab, including the option naming that very
+    #: model. A model IS its model on this axis, and its `source` is real,
+    #: which is why models were absent from the Source facet entirely. Keep in
+    #: step with the card's own `data-*` in semantic_layer_list.html.
+    _all_rows = (
+        [dict(m, facet_kind="metric") for m in metric_rows]
+        + [dict(t, facet_kind="term") for t in glossary_terms]
+        + [
+            {
+                "facet_model": str(m.get("slug") or ""),
+                "facet_domain": "",
+                "facet_source": str(m.get("source") or "manual"),
+                "facet_kind": "model",
+            }
+            for m in models
         ]
+    )
+    page_facets = [
+        f
+        for f in (
+            _flat_facet(
+                "model",
+                "Model",
+                _all_rows,
+                "facet_model",
+                {**model_titles, _DIRECT_KEY: _DIRECT_LABEL},
+            ),
+            _flat_facet("domain", "Domain", _all_rows, "facet_domain"),
+            _flat_facet("source", "Source", _all_rows, "facet_source"),
+        )
+        if f
+    ]
+
+    # NOTE (#1956 item 1): main's first pass at this bucketed the glossary by
+    # `source` and said so — "true per-model glossary attribution is tracked as
+    # a #1956 follow-up, not invented here". That follow-up is what the Model
+    # facet above now does: the term's owning model is read from the DOCUMENT
+    # (`model_glossary`), which is the one place that knows, rather than from a
+    # column the projector never stamps. So the source bucketing is gone with
+    # the sidebar it fed — `source` survives as its own facet, beside Model,
+    # where it is one axis rather than a stand-in for another.
 
     tab_counts = {
         "models": len(models),
         "all_metrics": len(visible_metrics),
         "all_glossary": glossary_count,
     }
+    #: Buckets, not pages. The label and the count are separate now because the
+    #: count MOVES: everything in the toolbar narrows the whole page, and each
+    #: tab's badge reports what it would hold under the current search and
+    #: filters (`refreshTabCounts` in the template). `active` seeds the engine's
+    #: opening segment, so `?tab=` deep links and the 308 from the retired
+    #: /catalog/semantics still land where they name.
     tabs = [
         {
-            "label": f"{_SEMANTIC_LAYER_LIST_TAB_LABELS[key]} ({tab_counts[key]})",
-            # The default tab keeps the BARE URL — one canonical address for
-            # the page, so a link to it and a click on its own tab agree.
-            "href": "/semantic-layer" if key == "models" else f"/semantic-layer?tab={key}",
+            "key": key,
+            "label": _SEMANTIC_LAYER_LIST_TAB_LABELS[key],
+            "count": tab_counts[key],
             "active": key == active_tab,
         }
         for key in _SEMANTIC_LAYER_LIST_TABS
@@ -4553,11 +5309,45 @@ async def semantic_layer_list(
         models=models,
         active_tab=active_tab,
         tabs=tabs,
-        metric_categories=metric_categories,
+        metric_rows=metric_rows,
+        page_facets=page_facets,
+        glossary_terms=glossary_terms,
         metric_count=len(visible_metrics),
         glossary_count=glossary_count,
+        glossary_count_label=_glossary_count_label(glossary_count),
+        can_author_model=_can_author_semantic_model(user, conn),
     )
     return templates.TemplateResponse(request, "semantic_layer_list.html", ctx)
+
+
+#: Registered BEFORE ``/semantic-layer/{slug}`` so the static ``new`` segment
+#: is not swallowed by the model-detail route — the same ordering
+#: ``/admin/studio/suggestions`` needs above, and
+#: ``tests/test_web_semantic_model_builder.py`` is what notices a reorder.
+@router.get("/semantic-layer/new", response_class=HTMLResponse)
+async def semantic_model_builder_page(
+    request: Request,
+    user: dict = Depends(get_current_user),
+    conn: duckdb.DuckDBPyConnection = Depends(_get_db),
+):
+    """Author one Ossie document — the Definitions page's **+ New model** card.
+
+    Not admin-only, because ``POST /api/semantic-models/apply`` is not: an
+    admin's document is published, anyone else's is queued for moderation.
+    What *is* conditional is whether authoring can succeed at all — see
+    :func:`_can_author_semantic_model` — and a caller for whom it cannot gets
+    this page explaining why rather than a 404 (the feature exists) or a
+    redirect home (which loses the reason). Same posture as ``/admin/ontology``
+    with the ``facts`` flag off.
+    """
+    ctx = _build_context(
+        request,
+        user=user,
+        conn=conn,
+        can_author_model=_can_author_semantic_model(user, conn),
+        is_admin=is_user_admin(user["id"], conn),
+    )
+    return templates.TemplateResponse(request, "semantic_model_builder.html", ctx)
 
 
 @router.get("/semantic-layer/{slug}", response_class=HTMLResponse)
@@ -4950,14 +5740,14 @@ async def catalog_package_detail(
     # the row like any other column, and rendered by the shared trust marker
     # every other surface uses (the amber `pkg-badge--curated` chip lived only
     # on the frozen pre-redesign page, retired with it).
-    from datetime import datetime, timedelta, timezone as _tz
+    from datetime import datetime, timedelta
 
     badges: list[str] = []
 
     created_at = pkg.get("created_at")
     if isinstance(created_at, datetime):
-        ts = created_at if created_at.tzinfo else created_at.replace(tzinfo=_tz.utc)
-        if (datetime.now(_tz.utc) - ts) < timedelta(days=30):
+        ts = created_at if created_at.tzinfo else created_at.replace(tzinfo=UTC)
+        if (datetime.now(UTC) - ts) < timedelta(days=30):
             badges.append("new")
 
     total_size = sum(t["size_bytes"] for t in tables)
@@ -4985,7 +5775,7 @@ async def library_file_detail(
 ):
     """One file inside a collection — its own detail page.
 
-    A single-file artefact IS its collection, so it keeps using
+    A single-file artifact IS its collection, so it keeps using
     ``/library/{slug}``; this route serves the files *inside* a folder, which
     previously had no page of their own. Reachable by anyone who can reach the
     parent collection OR who holds a grant on the file itself (per-file
@@ -5019,6 +5809,13 @@ async def library_file_detail(
         raise HTTPException(status_code=404, detail="file_not_found")
 
     size = row.get("size_bytes")
+    # A file inside a source-managed collection is a mirror of something at the
+    # source: deleting it here would be undone by the next crawl, so the page
+    # says who manages it instead of offering a control that cannot stick.
+    from app.api.collections import source_managing_connection
+
+    managing = source_managing_connection(col["id"])
+    managing_name = (managing.get("name") or managing.get("id")) if managing else None
     ctx = _build_context(
         request,
         user=user,
@@ -5030,6 +5827,14 @@ async def library_file_detail(
         file_visibility=visibility_for(ResourceType.CORPUS_FILE.value, file_id),
         # An owner (or admin) may change this one file's sharing from here.
         can_share=is_admin or col.get("created_by") == user["id"],
+        # …and remove the file. `DELETE /api/collections/{id}/files/{fid}`
+        # gates on collection ACCESS, which is wider than this: a page that
+        # offered the control to every grant-holder would invite one reader to
+        # delete another's upload, so the CONTROL is owner-or-admin even where
+        # the endpoint is more permissive. (Narrowing the endpoint itself is a
+        # separate change with its own callers — the producer path included.)
+        can_manage=is_admin or col.get("created_by") == user["id"],
+        source_managed_by=managing_name,
     )
     return templates.TemplateResponse(request, "library_file_detail.html", ctx)
 
@@ -5039,12 +5844,233 @@ async def library_file_detail(
 # page stays a state read-out, not a data dump.
 _FACTS_SECTION_PAGE_SIZE = 20
 
+# Files section page size. A collection with a bulk upload or a crawled
+# source can easily hold hundreds of rows; rendering (and animating) every
+# one of them made the page itself the slow part, not the query.
+_FILES_SECTION_PAGE_SIZE = 25
+
+# The five-state `processing_status` lifecycle (see `src/ingest/runner.py`),
+# in the order the status filter offers them — the order a file is most
+# likely to actually be in, not alphabetical.
+_CORPUS_FILE_STATUSES = ("indexed", "processing", "pending", "needs_review", "rejected")
+
+
+#: How many matched files one folder reveals inline under a Library search.
+#: Higher than the unfiltered peek: there the ten rows are an arbitrary
+#: sample, here every row is an answer to what the reader typed.
+_LIBRARY_MATCH_LIMIT = 25
+
+
+def _library_child_row_context(col: dict, uid: str) -> dict:
+    """The folder-level facts every child row of ``col`` inherits, resolved
+    once per fragment request — shared by ``library_folder_peek_rows`` and
+    ``library_matching_file_rows`` so the two child-row fragment endpoints
+    cannot derive ownership/sharing/stack state differently. Each failure
+    falls to the conservative value rather than taking the fragment down — a
+    row that says "Private" when it cannot prove otherwise is safe; the
+    opposite is not.
+
+    Returns ``owned``, ``ownership``, ``owner_label``, ``in_stack``, and a
+    ``visibility(file_id)`` callable for that file's OWN (independent)
+    sharing state.
+    """
+    from app.resource_types import ResourceType
+    from src.db import SYSTEM_EVERYONE_GROUP
+
+    owned = col.get("created_by") == uid
+    try:
+        shared_ids = set(resource_grants_repo().list_resource_ids_for_user(uid, ResourceType.COLLECTION.value))
+    except Exception:
+        shared_ids = set()
+    ownership = "mine" if owned and col["id"] not in shared_ids else ("shared_by_me" if owned else "shared_with_me")
+    owner_label = "You"
+    if not owned:
+        try:
+            from app.api.store import _resolve_owner_display
+
+            owner_label = _resolve_owner_display(col.get("created_by")) or "Someone"
+        except Exception:
+            owner_label = "Someone"
+    try:
+        in_stack = col["id"] in set(user_stack_subscriptions_repo().list_for_user(uid, ResourceType.COLLECTION.value))
+    except Exception:
+        in_stack = False
+
+    # Each file's OWN sharing, batched — one grant read for the whole
+    # fragment rather than one per row.
+    file_groups: dict[str, set] = {}
+    try:
+        for g in resource_grants_repo().list_all(resource_type=ResourceType.CORPUS_FILE.value):
+            file_groups.setdefault(g["resource_id"], set()).add(g["group_id"])
+    except Exception:
+        file_groups = {}
+    try:
+        _everyone = user_groups_repo().get_by_name(SYSTEM_EVERYONE_GROUP)
+        everyone_id = _everyone["id"] if _everyone else None
+    except Exception:
+        everyone_id = None
+
+    def visibility(file_id: str) -> str:
+        groups = file_groups.get(file_id)
+        if not groups:
+            return "private"
+        if everyone_id and everyone_id in groups:
+            return "workspace"
+        return "shared"
+
+    return {
+        "owned": owned,
+        "ownership": ownership,
+        "owner_label": owner_label,
+        "in_stack": in_stack,
+        "visibility": visibility,
+    }
+
+
+def _library_child_rows_response(request: Request, user: dict, conn, col: dict, files: list) -> HTMLResponse:
+    """``files`` (raw ``corpus_files`` rows) -> the rendered child-row
+    fragment, through the SAME ``library_row`` macro and ``_library_child_row``
+    dict the full page uses — one source for a file row's markup and sharing
+    vocabulary, never a second copy. Shared tail of both child-row fragment
+    routes below."""
+    uid = user["id"]
+    ctx_facts = _library_child_row_context(col, uid)
+    rows = [
+        _library_child_row(
+            f,
+            col,
+            origin=col.get("origin") or "uploaded",
+            owner_label=ctx_facts["owner_label"],
+            ownership=ctx_facts["ownership"],
+            owner_key="me" if ctx_facts["owned"] else (col.get("created_by") or ""),
+            visibility=ctx_facts["visibility"](f["id"]),
+            stack_state="in_stack" if ctx_facts["in_stack"] else "available",
+            stack_title=_AGENT_HAS_TOOLTIP if ctx_facts["in_stack"] else _AGENT_ADD_TOOLTIP,
+            stack_pill=_AGENT_HAS,
+        )
+        for f in files
+    ]
+    ctx = _build_context(
+        request,
+        user=user,
+        conn=conn,
+        is_admin=is_user_admin(uid, conn),
+        rows=rows,
+        # The page-level values `library_row` reads off the context. Empty
+        # here on purpose: the entity facets are a MENU the fragment has no
+        # part in, and a row carrying facet attributes the live menu never
+        # offered would be filtered out by a category it cannot satisfy.
+        library_entity_cats=[],
+        library_active_tab="knowledge",
+    )
+    return templates.TemplateResponse(request, "library_matching_file_rows.html", ctx)
+
+
+@router.get("/library/{slug}/peek", response_class=HTMLResponse)
+def library_folder_peek_rows(
+    slug: str,
+    request: Request,
+    user: dict = Depends(get_current_user),
+    conn: duckdb.DuckDBPyConnection = Depends(_get_db),
+):
+    """The first ``_LIBRARY_FOLDER_PEEK`` files of one collection, as Library
+    child rows — fetched lazily the first time the Library expands a folder
+    row.
+
+    Round 2 of the incident fix (2026-09-03): the index used to render this
+    same peek inline, hidden, for every folder at or under a size cap — which
+    bounded what RENDERED but not what the index FETCHED (a `list_for_corpus`
+    call per non-empty collection, however small) or embedded into the
+    folder's own row (a `data-search` value built from every one of those
+    filenames). On a live instance (~392 collections, active crawls) that
+    alone cost 19.6 MB of HTML whose live DOM, after the browser discarded
+    the markup's indentation, was 1.09 MB. The index card is now the
+    count/name/description alone (`library_page`); this route is the ONLY
+    place a folder's own files are read, and only on demand.
+
+    Same shape as `library_matching_file_rows` (renders through the same
+    macro and dict, same RBAC, same 404-for-missing-and-no-access contract)
+    — the two share `_library_child_row_context` and
+    `_library_child_rows_response` rather than a third copy of either.
+
+    Plain ``def``, not ``async def``: the body is purely blocking
+    ``file_corpora_repo``/`corpus_files_repo`` DB work with zero ``await``s,
+    so FastAPI dispatches it to the thread pool instead of running it on the
+    single event loop (Tier-1 convention, `tests/test_event_loop_offload_
+    guard.py`; Devin Review on #2173).
+    """
+    from app.auth.access import can_access_collection
+
+    col = file_corpora_repo().get_by_slug(slug)
+    if not col:
+        raise HTTPException(status_code=404, detail="collection_not_found")
+    is_admin = is_user_admin(user["id"], conn)
+    if not is_admin and not can_access_collection(user["id"], col["id"], conn):
+        raise HTTPException(status_code=404, detail="collection_not_found")
+
+    files = corpus_files_repo().list_for_corpus(col["id"], limit=_LIBRARY_FOLDER_PEEK)
+    if not files:
+        return HTMLResponse("")
+    return _library_child_rows_response(request, user, conn, col, files)
+
+
+@router.get("/library/{slug}/matching-files", response_class=HTMLResponse)
+async def library_matching_file_rows(
+    slug: str,
+    request: Request,
+    q: str = "",
+    user: dict = Depends(get_current_user),
+    conn: duckdb.DuckDBPyConnection = Depends(_get_db),
+):
+    """The file rows of one collection that match ``q`` — as Library child rows.
+
+    Why this exists: the Library expands a folder to a PEEK of its files
+    (``_LIBRARY_FOLDER_PEEK``, fetched by `library_folder_peek_rows` above),
+    and its search box is live and client-side. A capped folder's peek is not
+    its whole contents, so a search naming a file outside the peek would
+    otherwise find the folder (its name/description matched, or an earlier
+    peek fetch is already in the DOM) and show nothing for it — the reader
+    had named a file and was handed a folder with no sign of it (#2141 item 2,
+    review). This route asks the SERVER for the matching rows instead, so the
+    match is the answer rather than a signpost to it.
+
+    RBAC: collection access, admins exempt — the same gate as
+    ``/library/{slug}``, because that is what this lists. Deliberately NOT the
+    wider per-file rule ``library_file_detail`` uses: a caller holding a grant
+    on one file inside a folder may open that file, and must not be able to
+    enumerate its siblings. 404 for missing AND for no-access, matching the
+    collection contract.
+
+    An empty ``q`` returns nothing: this route answers a search, and a blank
+    search is what the peek endpoint already answers.
+    """
+    from app.auth.access import can_access_collection
+
+    q_norm = (q or "").strip()
+    if not q_norm:
+        return HTMLResponse("")
+
+    col = file_corpora_repo().get_by_slug(slug)
+    if not col:
+        raise HTTPException(status_code=404, detail="collection_not_found")
+    is_admin = is_user_admin(user["id"], conn)
+    if not is_admin and not can_access_collection(user["id"], col["id"], conn):
+        raise HTTPException(status_code=404, detail="collection_not_found")
+
+    files = corpus_files_repo().list_for_corpus(col["id"], limit=_LIBRARY_MATCH_LIMIT, q=q_norm, order="newest")
+    if not files:
+        return HTMLResponse("")
+    return _library_child_rows_response(request, user, conn, col, files)
+
 
 @router.get("/library/{slug}", response_class=HTMLResponse)
 async def library_detail(
     slug: str,
     request: Request,
     facts_page: int = 1,
+    files_page: int = 1,
+    q: str | None = None,
+    status: str | None = None,
     user: dict = Depends(get_current_user),
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
 ):
@@ -5064,9 +6090,55 @@ async def library_detail(
     # Owner-aware: the creator can open their private upload without a grant.
     if not is_admin and not can_access_collection(user["id"], col["id"], conn):
         raise HTTPException(status_code=404, detail="collection_not_found")
-    files = corpus_files_repo().list_for_corpus(col["id"])
+
+    cf_repo = corpus_files_repo()
+    q_norm = (q or "").strip() or None
+    status_norm = (status or "").strip() or None
+
+    # The collection's TRUE size, ignoring `q`/`status` — this is what drives
+    # the page's identity (one-file artifact vs. collection, the hero glyph,
+    # the noun, the "Searchable" fraction): a search that narrows the visible
+    # rows to one, or a page slice that happens to land on the last lone row,
+    # must never make a 26-file collection LOOK like a single file. Only the
+    # Files section itself — the count line and its own pager — reacts to the
+    # active filter (`files_total` below).
+    files_total_all = cf_repo.count_for_corpus(col["id"])
+    files_indexed_total = cf_repo.count_for_corpus(col["id"], status="indexed") if files_total_all else 0
+    single_file = None
+    if files_total_all == 1:
+        # Fetch the one true row directly, unfiltered and unpaginated: a
+        # `?q=`/`?status=`/`?files_page=` that happens to not match it must
+        # not turn a genuine one-file artifact into a blank single-file page.
+        _rows = cf_repo.list_for_corpus(col["id"], limit=1)
+        single_file = _rows[0] if _rows else None
+
+    # How many files carry each status, over the WHOLE collection — the
+    # filter chip row needs this to show counts, and it has to ignore the
+    # filter itself (a chip's own count must not change just because it is
+    # the one currently selected). Skipped entirely for an empty collection:
+    # five COUNT queries against nothing is five queries too many.
+    status_counts: dict[str, int] = {}
+    if files_total_all:
+        status_counts = {s: cf_repo.count_for_corpus(col["id"], status=s) for s in _CORPUS_FILE_STATUSES}
+
+    # The Files section's own total: matches `q`/`status`, drives its count
+    # line and its pager. Clamped the same way the Facts pager below always
+    # should have been — `?files_page=999` lands on the last real page
+    # instead of an empty list under a page number nothing links back from.
+    files_total = cf_repo.count_for_corpus(col["id"], q=q_norm, status=status_norm)
+    files_last_page = max(1, -(-files_total // _FILES_SECTION_PAGE_SIZE)) if files_total else 1
+    files_page_clamped = max(1, min(files_page, files_last_page))
+    files = cf_repo.list_for_corpus(
+        col["id"],
+        limit=_FILES_SECTION_PAGE_SIZE,
+        offset=(files_page_clamped - 1) * _FILES_SECTION_PAGE_SIZE,
+        q=q_norm,
+        status=status_norm,
+        order="newest",
+    )
+
     # Owner + sharing are rail facts on every resource detail page (see the page
-    # contract in macros/_detail.html); the collection page was the one artefact
+    # contract in macros/_detail.html); the collection page was the one artifact
     # surface that stated neither, so "who can see this folder?" was only
     # answerable from the Library table it was opened from.
     owner_id = col.get("created_by")
@@ -5078,18 +6150,32 @@ async def library_detail(
     # this page via a group grant must see exactly what their own grants
     # cover, not the owner's.
     facts_summary = None
+    facts_page_clamped = max(1, facts_page)
     facts_repo_ = _facts_repo_if_available()
     if facts_repo_ is not None:
         try:
-            page = max(1, facts_page)
             summary = facts_repo_.collection_facts_summary(
                 user,
                 col["id"],
                 limit=_FACTS_SECTION_PAGE_SIZE,
-                offset=(page - 1) * _FACTS_SECTION_PAGE_SIZE,
+                offset=(facts_page_clamped - 1) * _FACTS_SECTION_PAGE_SIZE,
             )
             if summary["total"] > 0:
-                facts_summary = {**summary, "page": page, "page_size": _FACTS_SECTION_PAGE_SIZE}
+                # `?facts_page=999` used to render an empty list under "Page
+                # 999 of 3" with no way back — the total (always computed in
+                # full by `collection_facts_summary`, independent of the
+                # requested offset) is what lets us catch that and re-fetch
+                # the real last page instead.
+                last_page = max(1, -(-summary["total"] // _FACTS_SECTION_PAGE_SIZE))
+                if facts_page_clamped > last_page:
+                    facts_page_clamped = last_page
+                    summary = facts_repo_.collection_facts_summary(
+                        user,
+                        col["id"],
+                        limit=_FACTS_SECTION_PAGE_SIZE,
+                        offset=(facts_page_clamped - 1) * _FACTS_SECTION_PAGE_SIZE,
+                    )
+                facts_summary = {**summary, "page": facts_page_clamped, "page_size": _FACTS_SECTION_PAGE_SIZE}
         except Exception as e:
             logger.warning("/library/%s: facts summary failed: %s", slug, e)
 
@@ -5100,6 +6186,51 @@ async def library_detail(
 
     managing = source_managing_connection(col["id"])
 
+    # SharePoint permissions captured as METADATA (TCRD-296 gap #79) — "in
+    # SharePoint, this folder is visible to: <names>", admin-only (Agnes's
+    # own access for this collection may differ — the Sharing rail fact
+    # above is the authority for that; this is purely informational). Fails
+    # SILENTLY closed on anything short of a full match — no snapshot, no
+    # backend, no scope row — the page must never break because a Graph
+    # read hasn't happened yet.
+    sharepoint_permissions_visible_to: list[str] | None = None
+    if is_admin and managing is not None and managing.get("source_type") == "sharepoint":
+        scope_row = next(
+            (
+                s
+                for s in (managing.get("config") or {}).get("scopes") or []
+                if isinstance(s, dict) and s.get("collection_id") == col["id"]
+            ),
+            None,
+        )
+        if scope_row is not None and scope_row.get("source_scope_id"):
+            from src.repositories import use_pg
+
+            if use_pg():
+                from connectors.sharepoint.acl_sync import acl_snapshot_kind
+                from src.repositories import sharepoint_state_repo
+
+                try:
+                    snap = sharepoint_state_repo().get(managing["id"], acl_snapshot_kind(scope_row["source_scope_id"]))
+                except Exception as e:  # noqa: BLE001 — informational only, never breaks the page
+                    logger.warning("/library/%s: ACL snapshot read failed: %s", slug, e)
+                    snap = None
+                if snap:
+                    names = [p.get("display_name") for p in (snap.get("principals") or []) if p.get("display_name")]
+                    if names:
+                        sharepoint_permissions_visible_to = names
+
+    # The one set of "other active query params" every paginated section's
+    # pager shares — see `_pager_href` above. Built once here so a Files
+    # "Next" link can never drop an active Facts page (or vice versa), and a
+    # new search never silently loses the reader's place in Facts.
+    pager_qs = {
+        "q": q_norm,
+        "status": status_norm,
+        "files_page": files_page_clamped,
+        "facts_page": facts_page_clamped,
+    }
+
     ctx = _build_context(
         request,
         user=user,
@@ -5107,11 +6238,30 @@ async def library_detail(
         is_admin=is_admin,
         collection=col,
         files=files,
+        files_total=files_total,
+        files_total_all=files_total_all,
+        files_indexed_total=files_indexed_total,
+        files_page=files_page_clamped,
+        files_page_size=_FILES_SECTION_PAGE_SIZE,
+        files_total_pages=files_last_page,
+        single_file=single_file,
+        files_q=q_norm or "",
+        files_status=status_norm or "",
+        files_status_counts=status_counts,
+        pager_qs=pager_qs,
         owner_name=(_resolve_owner_display(owner_id) if owner_id else None),
         collection_visibility=visibility_for(ResourceType.COLLECTION.value, col["id"]),
         can_share=is_admin or owner_id == user["id"],
+        # Same value as `can_share`, deliberately a SECOND name: sharing and
+        # editing/deleting are different authorities that happen to share a
+        # predicate today (owner-or-admin, exactly what PATCH and DELETE
+        # /api/collections/{id} enforce). A template gating a rename on
+        # `can_share` would silently follow sharing if that predicate ever
+        # widens — e.g. to a group an admin delegated re-sharing to.
+        can_manage=is_admin or owner_id == user["id"],
         facts_summary=facts_summary,
         source_managed_by=(managing.get("name") or managing.get("id")) if managing else None,
+        sharepoint_permissions_visible_to=sharepoint_permissions_visible_to,
     )
     return templates.TemplateResponse(request, "library_detail.html", ctx)
 
@@ -5133,9 +6283,9 @@ async def catalog_table_detail(
     table. Falls back to 403 otherwise — analysts only see tables that
     belong to packages they're granted on.
     """
-    from src.rbac import get_accessible_ids
-    from src.access_policy import effective_schema
     from app.resource_types import ResourceType
+    from src.access_policy import effective_schema
+    from src.rbac import get_accessible_ids
 
     table_repo = table_registry_repo()
     table = table_repo.get(table_id)
@@ -5273,8 +6423,10 @@ async def catalog_table_detail(
             columns = []
         else:
             if effective_cols is not None:
-                visible_names = {c["name"] for c in effective_cols if not c.get("hidden")}
-                columns = [c for c in columns if c["name"] in visible_names]
+                by_name = {c["name"]: c for c in effective_cols if not c.get("hidden")}
+                columns = [
+                    {**c, "masked": by_name[c["name"]].get("masked", False)} for c in columns if c["name"] in by_name
+                ]
 
     last_sync_state = sync_state_repo().get_table_state(table_id) or {}
 
@@ -5384,7 +6536,7 @@ def _memory_domain_entry_dict(
     drilldown_url: str,
     items_count: int = 0,
     required_count: int = 0,
-    in_stack_is_local: Optional[bool] = None,
+    in_stack_is_local: bool | None = None,
 ) -> dict:
     """Adapt a ResourceEntry (memory_domain) → template entry dict.
 
@@ -5458,8 +6610,8 @@ async def corporate_memory(
     (the pending-review banner) stay gated server-side: ``is_admin_view``
     zeroes ``pending_review_count`` for non-admins.
     """
-    from app.services.stack_resolver import StackResolver
     from app.resource_types import ResourceType
+    from app.services.stack_resolver import StackResolver
 
     # Rail: the Library's Memory band IS this page now (counts, add-to-stack,
     # the empty-domain rule all moved there — spec 2026-08-12). 302, not 308,
@@ -5530,7 +6682,9 @@ async def corporate_memory(
     # under auto-membership it applies to BOTH grids — see /catalog's
     # ``_req_first_key`` comment — while classic keeps the pre-redesign
     # contract (Browse only).
-    _req_first_key = lambda e: (0 if e.requirement == "required" else 1, e.name or "")  # noqa: E731
+    def _req_first_key(e):
+        return (0 if e.requirement == "required" else 1, e.name or "")
+
     browse_entries = sorted(browse_entries, key=_req_first_key)
     if auto_membership:
         stack_entries = sorted(stack_entries, key=_req_first_key)
@@ -5704,7 +6858,7 @@ def _dev_preview_enabled() -> bool:
     return is_local_dev_mode()
 
 
-def _resolve_dev_preview(request: Request) -> Optional[str]:
+def _resolve_dev_preview(request: Request) -> str | None:
     """Which audience this render is pretending to be for, or None.
 
     Changes only what is RENDERED. No authority, no grant and no repo read is
@@ -5717,7 +6871,7 @@ def _resolve_dev_preview(request: Request) -> Optional[str]:
     return value if value in DEV_PREVIEW_MODES else None
 
 
-def _chrome_ctx(request: Request, user: Optional[dict]) -> dict:
+def _chrome_ctx(request: Request, user: dict | None) -> dict:
     """Single owner of every chrome-level template-context key (#996).
 
     Routes that render ``base_ds.html``/``base_page.html`` MUST spread this
@@ -5873,7 +7027,7 @@ async def data_apps_list_page(
     from src.repositories import data_apps_repo, users_repo
 
     enabled = feature_enabled("data_apps", "enabled", env_var="AGNES_DATA_APPS_ENABLED", default=False)
-    # Rail: the apps inventory lives in the Library's Artefacts band now —
+    # Rail: the apps inventory lives in the Library's Artifacts band now —
     # data apps sit among the caller's artifacts (spec 2026-08-12, revised:
     # rows keep type_key=data_app for the Type facet, but Files is their
     # home). Redirect ONLY when the Library will actually show the caller an
@@ -6262,10 +7416,20 @@ async def corporate_memory_admin(
         Path(os.environ.get("DATA_DIR", "./data")) / "corporate-memory" / "knowledge.json"
     ).exists()
 
+    # "How detection works" panel (#1957 interim hotfix): read live so the
+    # panel names the two kill-switches' CURRENT state, the same
+    # corporate_memory.sources.session_transcripts config
+    # VerificationProcessor.process_session reads fresh on every run.
+    from app.instance_config import get_corporate_memory_config
+
+    _cm_config = get_corporate_memory_config() or {}
+    session_transcripts_config = (_cm_config.get("sources") or {}).get("session_transcripts") or {}
+
     ctx = _build_context(
         request,
         user=user,
         pending_items=pending,
+        session_transcripts_config=session_transcripts_config,
         stats={
             "total": len(all_items),
             "by_status": status_counts,
@@ -6313,7 +7477,7 @@ async def admin_activity(
 @router.get("/setup", response_class=HTMLResponse)
 async def setup_page(
     request: Request,
-    user: Optional[dict] = Depends(get_optional_user),
+    user: dict | None = Depends(get_optional_user),
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
 ):
     """Setup instructions for the local agent (CLI + Claude Code).
@@ -6329,10 +7493,10 @@ async def setup_page(
     override is set, the live default from
     setup_instructions.resolve_lines() is used.
     """
-    from src.welcome_template import compute_default_agent_prompt, _sanitize_banner_html
     from jinja2 import TemplateError
 
     from src.prompt_render import make_prompt_env
+    from src.welcome_template import _sanitize_banner_html, compute_default_agent_prompt
 
     base_url = str(request.base_url).rstrip("/")
 
@@ -6452,7 +7616,7 @@ def _web_csrf_ok(request: Request, supplied: str) -> bool:
 
 
 @router.get("/auth/logout", response_class=HTMLResponse)
-async def logout_page(request: Request, user: Optional[dict] = Depends(get_optional_user)):
+async def logout_page(request: Request, user: dict | None = Depends(get_optional_user)):
     """Logout CONFIRMATION page (no state change) — issue #1675.
 
     The Logout menu item used to be a plain ``GET`` link to ``/login``,
@@ -6482,7 +7646,7 @@ async def logout_page(request: Request, user: Optional[dict] = Depends(get_optio
 async def logout_submit(
     request: Request,
     csrf_token: str = Form(""),
-    user: Optional[dict] = Depends(get_optional_user),
+    user: dict | None = Depends(get_optional_user),
 ):
     """End the session — clear the cookie AND revoke it server-side.
 
@@ -6539,7 +7703,7 @@ _SLACK_BIND_CSRF_COOKIE = "slack_bind_csrf"
 async def slack_bind(
     request: Request,
     code: str = "",
-    user: Optional[dict] = Depends(get_optional_user),
+    user: dict | None = Depends(get_optional_user),
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
 ):
     """Render the Slack-identity binding CONFIRMATION page (no state change).
@@ -6593,7 +7757,7 @@ async def slack_bind_confirm(
     request: Request,
     code: str = Form(""),
     csrf_token: str = Form(""),
-    user: Optional[dict] = Depends(get_optional_user),
+    user: dict | None = Depends(get_optional_user),
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
 ):
     """Redeem a Slack binding code — the only state-changing bind path (F2).
@@ -6638,6 +7802,194 @@ async def slack_bind_confirm(
     resp = templates.TemplateResponse(request, "slack_bind.html", ctx)
     resp.delete_cookie(_SLACK_BIND_CSRF_COOKIE, path="/slack/bind")
     return resp
+
+
+# ---------------------------------------------------------------------------
+# Read-only view-as — see app/auth/view_as.py for the mechanism and its threat
+# model, and app/middleware/view_as_readonly.py for the read-only guard.
+#
+# Deliberately web routes, not `/api/*`: this is browser chrome that needs an
+# interactive session and a CSRF token, and the REST×CLI×MCP coverage rule
+# would otherwise push it toward an agent-invokable tool. An MCP tool that can
+# re-point whose eyes the caller is looking through is the same class of
+# privilege-escalation seam the standing exemptions in CONTRIBUTING.md name for
+# credential provisioning — so there is no CLI command and no MCP tool for it,
+# by design rather than by omission.
+# ---------------------------------------------------------------------------
+
+
+@router.post("/admin/view-as")
+async def view_as_enter(
+    request: Request,
+    user_id: str = Form(""),
+    csrf_token: str = Form(""),
+    next: str = Form(""),
+    return_to: str = Form(""),
+    user: dict = Depends(require_admin),
+):
+    """Begin a read-only view-as session for ``user_id``.
+
+    POST-only and CSRF-gated (``web_csrf`` double-submit, the
+    :func:`slack_bind_confirm` shape): a mode change reachable from a menu
+    item must not fire on ambient cookie auth alone — security playbook §10,
+    which this repo learned from a GET that bound an attacker's Slack identity
+    to a victim's account.
+
+    ``Depends(require_admin)`` is the gate. It also makes the mode
+    non-nestable for free: while a view-as is active the caller is not an
+    admin (``app.auth.access.is_user_admin`` answers False for the narrowed
+    subject), so re-entering requires exiting first — and the read-only guard
+    refuses this very POST anyway.
+    """
+    if not _web_csrf_ok(request, csrf_token):
+        raise HTTPException(status_code=403, detail="csrf_check_failed")
+
+    from app.auth.dependencies import non_interactive_credential_kind
+
+    credential = non_interactive_credential_kind(request)
+    if credential is not None:
+        # A PAT/service token has no browser to show a banner in and no
+        # cookie jar to exit with — the mode would be invisible state on an
+        # automation credential.
+        raise HTTPException(status_code=403, detail="view_as_requires_interactive_session")
+
+    from app.auth.view_as import binding_is_possible
+
+    if not binding_is_possible(request.cookies.get("access_token")):
+        # Every consumer binds the ticket to the caller's own credential, so a
+        # request with no bindable credential would get a cookie that is inert
+        # for its whole lifetime — and the mode's only exit control lives in
+        # the banner that inert cookie never renders. The failure mode was not
+        # "the mode does not start": it was a button that set a cookie,
+        # redirected to the Library, and left the admin looking at an ordinary
+        # page with no banner and no way back. Refuse before setting anything.
+        raise HTTPException(status_code=403, detail="view_as_requires_interactive_session")
+
+    target_id = (user_id or "").strip()
+    if not target_id:
+        raise HTTPException(status_code=400, detail="user_id is required")
+    if target_id == str(user["id"]):
+        raise HTTPException(status_code=400, detail="view_as_self")
+
+    target = users_repo().get_by_id(target_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    if not bool(target.get("active", True)):
+        raise HTTPException(status_code=400, detail="view_as_inactive_user")
+
+    from app.auth.public_url import cookie_secure
+    from app.auth.view_as import VIEW_AS_COOKIE, safe_internal_path, sign_ticket
+    from src.audit_helpers import log_safe
+
+    # `next` is where the mode OPENS (the page whose answer differs most
+    # between two people); `return_to` is where exiting comes BACK to. Two
+    # fields because they are two different pages, and collapsing them is the
+    # bug this pair replaced: the banner's exit form could only ever offer the
+    # page it was rendering on, so leaving dropped the admin wherever they had
+    # stopped browsing — as themselves, with the person they were
+    # investigating forgotten. The origin rides the signed ticket instead.
+    ticket = sign_ticket(
+        viewer_user_id=str(user["id"]),
+        viewer_email=str(user.get("email") or ""),
+        target_user_id=str(target["id"]),
+        target_email=str(target.get("email") or ""),
+        return_to=return_to,
+    )
+
+    log_safe(
+        user_id=str(user["id"]),
+        action="view_as.start",
+        resource=f"user:{target['id']}",
+        params={"target_user_id": str(target["id"])},
+        result="success",
+    )
+
+    destination = safe_internal_path(next, "/")
+    response = RedirectResponse(url=destination, status_code=303)
+    response.set_cookie(
+        VIEW_AS_COOKIE,
+        ticket,
+        httponly=True,
+        secure=cookie_secure(request),
+        samesite="strict",
+        path="/",
+        # No max_age/expires on purpose: the ticket dies with the browser
+        # session, and its own signed timestamp expires it well before that.
+    )
+    # Guarantee the banner's exit form has a token to submit even if the
+    # caller reached here without one in their jar.
+    _refresh_web_csrf_cookie(response, request, _get_or_mint_web_csrf(request))
+    return response
+
+
+@router.post("/admin/view-as/exit")
+async def view_as_exit(
+    request: Request,
+    csrf_token: str = Form(""),
+):
+    """End a read-only view-as session — clear the ticket cookie, nothing else.
+
+    The one path ``ViewAsReadOnlyMiddleware`` lets through as a non-GET while
+    the mode is active, so it is deliberately the smallest handler in the
+    file: it reads no target, writes no state, and touches exactly one cookie.
+
+    It mounts **no auth dependency**, and that is the point rather than an
+    oversight. ``get_current_user`` resolves to the TARGET while the mode is
+    on, so ``require_admin`` would 403 the very person trying to leave and
+    ``get_optional_user`` would hand back an identity that is not the actor's.
+    The caller is instead identified by the HttpOnly, server-signed ticket
+    itself, and the action is gated by the same ``web_csrf`` double-submit
+    token as every other state-changing web POST — a cross-site page can read
+    neither.
+    """
+    from app.auth.public_url import cookie_secure
+    from app.auth.view_as import (
+        VIEW_AS_COOKIE,
+        return_path,
+        session_matches_viewer,
+        verify_ticket,
+    )
+    from src.audit_helpers import log_safe
+
+    if not _web_csrf_ok(request, csrf_token):
+        raise HTTPException(status_code=403, detail="csrf_check_failed")
+
+    # The ticket alone is a BEARER string — `verify_ticket` checks signature
+    # and expiry, nothing about who is holding it. Writing the audit row off
+    # that alone let anyone with a leaked ticket value forge a `view_as.end`
+    # entry against the real admin: `active_ticket()` is never stamped for
+    # such a request (the middleware's own binding check refuses to engage),
+    # so `apply_view_as_attribution` sees no active ticket and leaves the
+    # forged `user_id` in place. Bind it to the caller's own session, the same
+    # check the middleware and the auth layer each already make — now one
+    # shared definition rather than a rule kept in three places.
+    ticket = verify_ticket(request.cookies.get(VIEW_AS_COOKIE))
+    if ticket is not None and session_matches_viewer(request.cookies.get("access_token"), ticket):
+        log_safe(
+            user_id=ticket.viewer_user_id,
+            action="view_as.end",
+            resource=f"user:{ticket.target_user_id}",
+            params={"target_user_id": ticket.target_user_id},
+            result="success",
+        )
+
+    # Back to where the admin STARTED, not to the page they happened to stop
+    # on: they left the Access page to answer a question about one person, so
+    # returning them to that page with that person still picked is the only
+    # landing that finishes the errand. The destination comes from the signed
+    # ticket (`return_path`), which is also why this route no longer takes a
+    # `next` field — it mounts no auth dependency, so a form-supplied redirect
+    # target was the one attacker-influenced value it had.
+    destination = return_path(ticket)
+    response = RedirectResponse(url=destination, status_code=303)
+    response.delete_cookie(
+        VIEW_AS_COOKIE,
+        path="/",
+        secure=cookie_secure(request),
+        httponly=True,
+        samesite="strict",
+    )
+    return response
 
 
 @router.get("/install", response_class=HTMLResponse)
@@ -7215,8 +8567,9 @@ async def marketplace_format_guide(
     # so no new pinning is needed. Commonmark preset + the table extension
     # gives us fenced code blocks (rendered as <pre><code class="language-X">)
     # and GFM-style tables — enough to render the format guide cleanly.
-    from markdown_it import MarkdownIt
     from pathlib import Path
+
+    from markdown_it import MarkdownIt
 
     md_path = Path(__file__).resolve().parent.parent.parent / "docs" / "curated-marketplace-format.md"
     try:
@@ -7251,8 +8604,9 @@ async def documentation_api(
     Freshness is enforced by tests/test_api_docs_coverage.py, which fails
     CI when a public /api/* route is missing from the document.
     """
-    from markdown_it import MarkdownIt
     from pathlib import Path
+
+    from markdown_it import MarkdownIt
 
     from app.version import APP_VERSION
 
@@ -7462,8 +8816,8 @@ async def admin_data_packages(
     whether an empty package needs table assignment) independent of their
     own group grants.
     """
-    from app.services.stack_resolver import StackResolver
     from app.resource_types import ResourceType
+    from app.services.stack_resolver import StackResolver
 
     resolver = StackResolver(conn)
     pkg_repo = data_packages_repo()
@@ -7657,7 +9011,7 @@ async def admin_package_detail(
     ``users.last_pull_at`` (stamped by app/api/sync.py on every human pull) is
     what turns "shared with 14 people" into "11 of them actually have it".
     """
-    from datetime import timedelta, timezone
+    from datetime import timedelta
 
     from src.repositories import (
         resource_grants_repo,
@@ -7673,14 +9027,14 @@ async def admin_package_detail(
     if pkg is None:
         raise HTTPException(status_code=404, detail="data_package_not_found")
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
 
     def _aware(ts):
         """Timestamps come back naive from DuckDB and aware from Postgres;
         comparing the two raises. Normalise to UTC at every read."""
         if ts is None:
             return None
-        return ts.replace(tzinfo=timezone.utc) if ts.tzinfo is None else ts
+        return ts.replace(tzinfo=UTC) if ts.tzinfo is None else ts
 
     # ── What is in it ────────────────────────────────────────────────────
     # `list_tables` returns only (id, name) — the registry row carries the
@@ -8148,7 +9502,7 @@ async def admin_tables(
     user: dict = Depends(require_admin),
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
 ):
-    from app.instance_config import get_data_source_type
+    from app.instance_config import feature_enabled, get_data_source_type
 
     # Branch the register-modal layout server-side so the JS doesn't have
     # to round-trip /api/admin/server-config to learn the source type.
@@ -8158,6 +9512,17 @@ async def admin_tables(
         request,
         user=user,
         data_source_type=data_source_type,
+        # K1-sweep finding 4 (#1979): the Access Policy modal opened
+        # regardless of this flag and only the server-side PUT 422'd —
+        # branched here (same pattern as `facts_enabled`/`studio_enabled`
+        # above) so the modal can show the notice + disable Save up front
+        # instead of after a rejected save. The flag only gates ATTACHING a
+        # policy; enforcement of an existing one always runs (see the
+        # switch's own description in app/switches.py). Drafting and
+        # previewing a policy stay fully usable either way.
+        access_policies_enabled=feature_enabled(
+            "access_policies", "enabled", env_var="AGNES_ACCESS_POLICIES_ENABLED", default=False
+        ),
         # The end of each table's chain — which package carries it and how
         # many people that reaches. The page hydrates its rows client-side
         # from /api/admin/registry, but reach is a grants × group-membership
@@ -8189,6 +9554,28 @@ async def admin_tables(
         studio_enabled=get_studio_enabled(),
     )
     return templates.TemplateResponse(request, "admin_tables.html", ctx)
+
+
+@router.get("/admin/extraction", response_class=HTMLResponse)
+async def admin_extraction_fleet_page(
+    request: Request,
+    user: dict = Depends(require_admin),
+):
+    """The SharePoint extraction fleet dashboard (2026-09-02): one screen for
+    an operator running several connections' crawl + facts passes at once —
+    is it on pace, is anything stuck, what is it costing.
+
+    Off-nav (see ``ADMIN_NAV_OFFNAV`` in ``app/web/admin_nav.py``), reached
+    from a source card's extraction status on ``/admin/data-sources`` — the
+    same posture ``/admin/sync`` and ``/admin/semantic-layer`` already take.
+    Shell-only: the table is fetched client-side from
+    ``GET /api/admin/sharepoint/extraction/runs`` (PG-only — a DuckDB-backed
+    instance gets the typed ``501`` explained inline rather than a page that
+    silently renders empty, the same posture ``/admin/semantic-layer`` takes
+    for its own PG-only report).
+    """
+    ctx = _build_context(request, user=user)
+    return templates.TemplateResponse(request, "admin_extraction.html", ctx)
 
 
 @router.get("/admin/sync", response_class=HTMLResponse)
@@ -8249,7 +9636,7 @@ async def admin_datasource_credentials_page(
 
 
 @router.get("/admin/data-sources", response_class=HTMLResponse)
-async def admin_data_sources_page(
+def admin_data_sources_page(
     request: Request,
     user: dict = Depends(require_admin),
 ):
@@ -8266,6 +9653,17 @@ async def admin_data_sources_page(
     render the same blocking banner as /admin/datasource-credentials when
     ``AGNES_VAULT_KEY`` is absent (the wizard can't store a secret without
     it).
+
+    Plain ``def`` (not ``async def``, zero ``await``s below): every call
+    this handler makes — ``_build_context``, ``_source_inventory`` and
+    everything it fans out to — is blocking, synchronous SQLAlchemy I/O, so
+    FastAPI dispatches it to the anyio thread pool instead of running it on
+    the single event loop (Tier-1 convention,
+    ``tests/test_event_loop_offload_guard.py``). On an instance with a large
+    SharePoint corpus this handler alone could run for over ten seconds; as
+    ``async def`` that monopolized the event loop for the whole duration,
+    stalling every OTHER concurrent request in the process — including
+    unrelated ones — for as long as it ran.
     """
     # `can_store_secrets()`, NOT `vault_key_configured()`: the write path
     # guards on the former (app/api/admin_source_connections.py), and the
@@ -8365,6 +9763,166 @@ _DERIVED_SOURCES: dict[str, dict] = {
 }
 
 
+#: `query_mode` values whose parquet reaches an analyst through a data package
+#: (`agnes pull`) — blank/NULL reads as `local`. The same fold `/admin`'s gap
+#: card (`admin_dashboard._DISTRIBUTABLE_QUERY_MODES`) and the unpackaged tray
+#: use, so they cannot disagree about which rows "reach nobody" applies to.
+#: `remote` rows answer server-side WITHOUT a package.
+_PACKAGEABLE_QUERY_MODES = ("", "local", "materialized")
+
+#: The verify step. The Access page's person lens previews a Library from the
+#: same `StackResolver.browse` projection `/library` runs, so it cannot drift
+#: from what they will really see. NOT the analyst page, which arrives as
+#: YOURSELF — a different question (admin_package_detail.html says so too).
+_SIMULATE_LENS_HREF = "/admin/access?lens=simulate"
+
+
+def _source_next_step(source_type: str, tables: dict, feeds: dict) -> dict | None:
+    """The ONE thing to do next so this source's data reaches a person — or
+    ``None`` when there is nothing honest to say.
+
+    A connected source shows its tables on /admin/data-sources and reaches
+    nobody until an admin has put them in a data package AND granted that
+    package to a group somebody is in. Connecting does neither, nothing said
+    so, and the reported symptom was an admin concluding the product was
+    broken because /library (grant-scoped, deliberately not admin god-mode)
+    read "Your library is empty". This is the missing bridge, on the card the
+    admin is already looking at. Derived from the strip's OWN cells rather
+    than a second read, so a card's counts and its next step cannot disagree.
+
+    The ladder, in the order the work happens: ``package`` (some distributable
+    table is in no package) → ``share`` (all bundled, no group holds those
+    packages) → ``people`` (granted to groups nobody is in) → ``None``.
+
+    Besides that finished chain, four situations answer ``None`` on purpose:
+
+    * **no tables at all** — the strip's Tables cell already renders "Add the
+      first tables →"; a second copy of that verb on the same card is noise;
+    * **nothing packageable** — a `remote`-only source (BigQuery live queries)
+      is reachable server-side without a package;
+    * **``people == -1``** — the strip's "granted to Everyone" sentinel, which
+      read as a falsy zero would nag the setup that reaches the most people;
+    * **a file source** — SharePoint delivers through collections + groups and
+      carries its own sharing rows on the same card; the package chain must
+      not speak over them.
+
+    The later rungs read ``feeds``, which counts packages holding ANY of this
+    source's tables — coarser than the first rung, which counts unpackaged
+    DISTRIBUTABLE rows exactly. A source whose remote rows are bundled while
+    its local ones are not is caught by ``package``, which fires first.
+    """
+    if source_type == "sharepoint":
+        return None
+    distributable = tables.get("distributable") or 0
+    if not distributable:
+        return None
+
+    unpackaged = tables.get("unpackaged") or 0
+    groups = feeds.get("groups") or 0
+    people = feeds.get("people") or 0
+
+    if unpackaged:
+        # "3 of this source's tables" only once some ARE bundled: on the
+        # common fresh-connection path every row is unpackaged, and "5 of 5"
+        # is a riddle where "This source's 5 tables" is a sentence. No
+        # denominator either way — it would be the DISTRIBUTABLE count, which
+        # is not the number in the Tables cell beside it on a source that also
+        # has remote rows.
+        subject = (
+            f"This source's {distributable} {_plural_word(distributable, 'table is', 'tables are')}"
+            if unpackaged >= distributable
+            else f"{unpackaged} of this source's tables {_plural_word(unpackaged, 'is', 'are')}"
+        )
+        step = {
+            "key": "package",
+            "text": (
+                f"{subject} in no data package, so nobody can see "
+                f"{_plural_word(unpackaged, 'it', 'them')} yet — a package is the unit you share, "
+                "and a table outside one reaches no analyst however it is granted."
+            ),
+            "cta": f"Put {_plural_word(unpackaged, 'it', 'them')} in a data package",
+            # The pile itself, pre-filtered: `?unpackaged=1` arms the Tables
+            # lens's "In no package" facet, so the reader lands on exactly the
+            # rows this sentence is about rather than on every table.
+            "href": "/admin/tables?unpackaged=1",
+        }
+    elif not groups:
+        packages = feeds.get("packages") or 0
+        step = {
+            "key": "share",
+            "text": (
+                f"Bundled into {packages} data {_plural_word(packages, 'package', 'packages')}, "
+                "shared with no group — a package reaches a person only through a group they are "
+                "in, so this data is still in nobody's Library."
+            ),
+            "cta": "Share it with a group",
+            "href": "/admin/data-packages",
+        }
+    elif people == 0:
+        step = {
+            "key": "people",
+            "text": (
+                f"Shared with {groups} {_plural_word(groups, 'group', 'groups')} that nobody is in "
+                "yet. Add people to the group and this data lands in their Library."
+            ),
+            "cta": "Add people to the group",
+            "href": "/admin/access",
+        }
+    else:
+        return None
+
+    step["verify_cta"] = "Preview someone's Library"
+    step["verify_href"] = _SIMULATE_LENS_HREF
+    return step
+
+
+def _plural_word(n: int, one: str, many: str) -> str:
+    return one if n == 1 else many
+
+
+def _marketplace_plugin_delivery() -> dict:
+    """Marketplace plugins that no group can reach — the same funnel gap as
+    `_source_next_step`, one page over.
+
+    `/admin/marketplaces` lists every plugin a synced repo produced, while the
+    served feed (`/marketplace.zip`, `/marketplace.git/*`) is filtered per
+    caller by joining `resource_grants ↔ marketplace_plugins` against their
+    groups. So a freshly-registered marketplace is fully present for the admin
+    who registered it and in nobody's Library, and the page never said so.
+
+    Admin-disabled plugins are excluded — hidden from every served surface
+    deliberately, so "nobody can see it" is the intended state, not a gap
+    (the same exclusion `resource_types._marketplace_plugin_blocks` makes).
+
+    Returns ``{"ungranted": int, "marketplaces": [slug, …], "total": int}``.
+    Never raises: this is chrome on a page an admin opens when something is
+    already wrong, so an unreadable repo means the strip says nothing.
+    """
+    empty: dict = {"ungranted": 0, "marketplaces": [], "total": 0}
+    try:
+        from src.repositories import marketplace_plugins_repo, resource_grants_repo
+
+        plugins = [p for p in marketplace_plugins_repo().list_all() if not p.get("admin_disabled")]
+        granted = {g["resource_id"] for g in resource_grants_repo().list_all(resource_type="marketplace_plugin")}
+    except Exception as e:  # noqa: BLE001 — a missing strip beats a 500
+        logger.warning("marketplace delivery: could not enumerate plugins or grants: %s", e)
+        return empty
+
+    ungranted_slugs: list[str] = []
+    ungranted = 0
+    for p in plugins:
+        mid = p.get("marketplace_id")
+        name = p.get("name")
+        if not mid or not name:
+            continue
+        if f"{mid}/{name}" in granted:
+            continue
+        ungranted += 1
+        if mid not in ungranted_slugs:
+            ungranted_slugs.append(mid)
+    return {"ungranted": ungranted, "marketplaces": ungranted_slugs, "total": len(plugins)}
+
+
 def _source_pipelines(user: dict | None = None) -> dict:
     """The pipeline strip for every source card, keyed by connection id.
 
@@ -8409,7 +9967,6 @@ def _source_inventory(user: dict | None = None) -> dict:
     resolvers: this page is where an admin lands when a source is already
     broken.
     """
-    from datetime import timezone
 
     from src.repositories import (
         data_packages_repo,
@@ -8515,6 +10072,14 @@ def _source_inventory(user: dict | None = None) -> dict:
         packages = {p["id"]: p for p in data_packages_repo().list()}
     except Exception:
         pkg_members, packages = {}, {}
+    # Every table any package carries — what the next-step row's first rung
+    # subtracts a source's distributable rows from. Same `pid in packages`
+    # filter `feeds` applies below, so a membership row pointing at a deleted
+    # package cannot make a table look delivered.
+    packaged_table_ids: set[str] = set()
+    for _pid, _tids in pkg_members.items():
+        if _pid in packages:
+            packaged_table_ids.update(_tids)
     try:
         pkg_grants: dict[str, list] = {}
         for g in resource_grants_repo().list_all(resource_type="data_package"):
@@ -8551,7 +10116,39 @@ def _source_inventory(user: dict | None = None) -> dict:
         except Exception:
             return False
 
-    now = datetime.now(timezone.utc)
+    # ── SharePoint batched precomputation, once for every connection on the
+    # page rather than once PER connection (which itself used to mean once
+    # PER SCOPE — up to ~180 on a real connection). See
+    # `_sharepoint_pipeline_cell`'s docstring for what each precomputed dict
+    # replaces.
+    sharepoint_conns = [c for c in connections if (c.get("source_type") or "") == "sharepoint"]
+    all_sp_scope_ids: set[str] = set()
+    for c in sharepoint_conns:
+        try:
+            raw_scopes = (c.get("config") or {}).get("scopes") or []
+            all_sp_scope_ids.update(
+                s["collection_id"] for s in raw_scopes if isinstance(s, dict) and s.get("collection_id")
+            )
+        except Exception as e:
+            logger.debug("data-sources pipelines: could not resolve scope collections for %s: %s", c.get("id"), e)
+    corpus_status_counts: dict[str, dict[str, int]] = {}
+    collection_grants_by_id: dict[str, set] = {}
+    if sharepoint_conns:
+        try:
+            from src.repositories import corpus_files_repo
+
+            corpus_status_counts = corpus_files_repo().status_counts_for_corpora(sorted(all_sp_scope_ids))
+        except Exception as e:
+            logger.warning("data-sources pipelines: corpus file status counts unavailable: %s", e)
+        try:
+            from src.repositories import resource_grants_repo
+
+            for g in resource_grants_repo().list_all(resource_type="collection"):
+                collection_grants_by_id.setdefault(g["resource_id"], set()).add(g["group_id"])
+        except Exception as e:
+            logger.warning("data-sources pipelines: collection grants unavailable: %s", e)
+
+    now = datetime.now(UTC)
     for conn in [*connections, *derived]:
         cid = conn["id"]
         cells: dict[str, dict] = {}
@@ -8568,7 +10165,17 @@ def _source_inventory(user: dict | None = None) -> dict:
             own += unlinked
             basis = "source_type"
             unlinked = []
-        cells["tables"] = {"count": len(own), "basis": basis, "unlinked": len(unlinked)}
+        # How many of this source's rows a package could carry to a laptop,
+        # and how many of those nobody has bundled. `_source_next_step` keys
+        # off THESE, not the raw count — see `_PACKAGEABLE_QUERY_MODES`.
+        distributable_rows = [t for t in own if (t.get("query_mode") or "") in _PACKAGEABLE_QUERY_MODES]
+        cells["tables"] = {
+            "count": len(own),
+            "basis": basis,
+            "unlinked": len(unlinked),
+            "distributable": len(distributable_rows),
+            "unpackaged": sum(1 for t in distributable_rows if t["id"] not in packaged_table_ids),
+        }
 
         # ── Sync: the freshest run across this source's tables, and how many
         # are currently in error. `internal`/remote rows have no sync state,
@@ -8582,7 +10189,7 @@ def _source_inventory(user: dict | None = None) -> dict:
             ts = st.get("last_sync")
             if ts is not None:
                 if ts.tzinfo is None:
-                    ts = ts.replace(tzinfo=timezone.utc)
+                    ts = ts.replace(tzinfo=UTC)
                 if latest is None or ts > latest:
                     latest = ts
         cells["sync"] = {
@@ -8648,7 +10255,12 @@ def _source_inventory(user: dict | None = None) -> dict:
         # `_sharepoint_pipeline_cell` for what each sub-block means and its
         # honesty notes (placeholder cost, interim scope heuristic).
         if stype == "sharepoint":
-            cells["file_source"] = _sharepoint_pipeline_cell(conn, user)
+            cells["file_source"] = _sharepoint_pipeline_cell(
+                conn,
+                user,
+                corpus_status_counts=corpus_status_counts,
+                collection_grants_by_id=collection_grants_by_id,
+            )
 
         # ── Feeds: packages holding this source's tables → groups granted →
         # people reached. The end of the chain the redesign cares about; a
@@ -8674,6 +10286,11 @@ def _source_inventory(user: dict | None = None) -> dict:
             "groups": len(granted_group_ids),
             "people": people,
         }
+        # …and, when that chain is unfinished, the one move that advances it.
+        # Folded from the two cells above, and carried in the same dict
+        # `/api/admin/source-pipelines` serves — so a mutation that finishes
+        # the chain drops the row without a page reload.
+        cells["feeds"]["next"] = _source_next_step(stype, cells["tables"], cells["feeds"])
 
         out[cid] = cells
     return {"pipelines": out, "derived": derived}
@@ -8694,64 +10311,70 @@ def _source_inventory(user: dict | None = None) -> dict:
 _VERBATIM_GATE_REASONS = frozenset({"verbatim_gate_failed", "quote_not_meaningful"})
 
 
-def _resolve_sharepoint_rejection_doc(doc_id: str) -> Optional[dict]:
-    """Resolve a "Last run" rejection row's ``doc_id`` (the crawler's
+def _resolve_sharepoint_rejection_doc_labels(doc_ids: list[str]) -> dict[str, dict]:
+    """Resolve "Last run" rejection rows' ``doc_id``s (the crawler's
     ``sha256[:16]`` citation key, e.g. ``6a8e0bc93c07c56a``) to the corpus
-    file name + collection name it belongs to, for the card's drawer — a
+    file name + collection name each belongs to, for the card's drawer — a
     bare hash "tells nobody anything" (live-use feedback, TCRD-240/241
     follow-up).
 
-    ``None`` for an id this instance has never seen (`corpus_file_sources`
-    carries no row for it) — the caller renders that as the honest
-    "not in any collection" fallback next to the raw sha16, never a guess.
-    Also ``None`` on any lookup failure (PG-only `corpus_file_sources` on a
-    DuckDB-backed instance, a deleted collection, …) — resolution is a
-    read-only display nicety, never worth a 500 for the card.
+    ONE batched call (:meth:`corpus_file_sources_repo().resolve_doc_labels`)
+    for every id at once — this used to be 3 round trips PER unique doc_id
+    (a mapping lookup, a corpus_files get, a file_corpora get), which on a
+    run with hundreds of rejected/deferred claims dominated this cell's own
+    query count. An id this instance has never seen, or any lookup failure
+    (PG-only ``corpus_file_sources`` on a DuckDB-backed instance, …), is
+    simply absent from the returned dict — the caller renders that as the
+    honest "not in any collection" fallback next to the raw sha16, never a
+    guess, and never a 500 for the card (resolution is a read-only display
+    nicety).
     """
+    if not doc_ids:
+        return {}
     try:
-        from src.repositories import corpus_file_sources_repo, corpus_files_repo, file_corpora_repo
+        from src.repositories import corpus_file_sources_repo
 
-        source_row = corpus_file_sources_repo().get_by_source_doc_id(doc_id)
-        if source_row is None:
-            return None
-        file_row = corpus_files_repo().get(source_row["corpus_file_id"])
-        if file_row is None:
-            return None
-        collection = file_corpora_repo().get(file_row["corpus_id"])
-        return {
-            "name": file_row.get("filename"),
-            "collection": collection.get("name") if collection else None,
-        }
+        return corpus_file_sources_repo().resolve_doc_labels(doc_ids)
     except Exception as e:
-        logger.debug("sharepoint pipeline cell: doc_id resolution failed for %s: %s", doc_id, e)
-        return None
+        logger.debug("sharepoint pipeline cell: doc_id resolution failed: %s", e)
+        return {}
 
 
-def _enrich_sharepoint_rejection_rows(rows: list[dict]) -> list[dict]:
+def _enrich_sharepoint_rejection_rows(rows: list[dict], doc_labels: dict[str, dict] | None = None) -> list[dict]:
     """Add a resolved ``doc`` key (``{name, collection}`` or ``None``) to
-    each "Last run" rejection/deferred row, memoizing the lookup per
-    ``doc_id`` so a run with many claims against the same document does not
-    re-resolve it once per row. Every original key (``row``, ``reason``,
-    ``doc_id``, …) is preserved untouched — this only adds information, it
-    never replaces the raw fields the drawer's category counts and any
-    other reader of this cell already depend on.
+    each "Last run" rejection/deferred row. Every original key (``row``,
+    ``reason``, ``doc_id``, …) is preserved untouched — this only adds
+    information, it never replaces the raw fields the drawer's category
+    counts and any other reader of this cell already depend on.
+
+    ``doc_labels``, when the caller precomputed it via ONE
+    :func:`_resolve_sharepoint_rejection_doc_labels` call spanning EVERY
+    rejection category for this run (not just this one list — the same
+    doc_id can recur across ``rejected_quotes``/``deferred``/…), is reused
+    as-is. ``None`` (a caller with just one list, e.g. a direct unit test)
+    resolves this list's own doc_ids in one batched call — the same shape,
+    at the one-list cost.
     """
-    doc_cache: dict[str, Optional[dict]] = {}
+    if doc_labels is None:
+        doc_labels = _resolve_sharepoint_rejection_doc_labels(
+            sorted({row.get("doc_id") for row in rows if row.get("doc_id")})
+        )
     enriched = []
     for row in rows:
         row = dict(row)
         doc_id = row.get("doc_id")
-        if doc_id:
-            if doc_id not in doc_cache:
-                doc_cache[doc_id] = _resolve_sharepoint_rejection_doc(doc_id)
-            row["doc"] = doc_cache[doc_id]
-        else:
-            row["doc"] = None
+        row["doc"] = doc_labels.get(doc_id) if doc_id else None
         enriched.append(row)
     return enriched
 
 
-def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
+def _sharepoint_pipeline_cell(
+    conn: dict,
+    user: dict | None,
+    *,
+    corpus_status_counts: dict[str, dict[str, int]] | None = None,
+    collection_grants_by_id: dict[str, set] | None = None,
+) -> dict:
     """The file-source pipeline strip + card rows for a SharePoint connection
     (spec §13.2 "Source card"): crawl → text extraction + scan transcription
     → facts → graph counts, a queue-cost PLACEHOLDER (see the constant
@@ -8760,14 +10383,28 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
     ingest run's error badges — each carrying its itemized detail for the
     admin's filtered drawer.
 
-    **"Scope collections" is an interim heuristic**
-    (`facts_ingest_runs_repo().distinct_corpus_ids()` — see that method's
-    own docstring): every collection this instance has EVER ingested facts
-    into, because there is no persisted connection → collection mapping yet
-    (the connect wizard's step 2 owns that; a sibling, independent effort).
-    Two sharepoint connections on one instance would not be told apart by
-    this alone — acceptable for a single-connection instance, named here so
-    it is not rediscovered as a surprise later.
+    `corpus_status_counts`/`collection_grants_by_id` are optional PRECOMPUTED
+    batched reads: `_source_inventory` builds each ONCE across every
+    SharePoint connection on the page (rather than once per connection, per
+    scope) and passes them down. Omitting either (any direct/isolated call,
+    e.g. a unit test) falls back to computing it for just this connection —
+    the same answer, at the one-connection cost this function used to pay
+    for every connection on the page.
+
+    **"Scope collections" is this connection's OWN scope mapping** — every
+    confirmed scope's `collection_id` off `conn["config"]["scopes"]`, the
+    same rows the crawl itself routes documents into (`connectors.
+    sharepoint.crawler._confirmed_scopes` reads the identical field). This
+    used to be `facts_ingest_runs_repo().distinct_corpus_ids()` — every
+    collection this INSTANCE had ever ingested FACTS into, a proxy that only
+    worked once a document reached the (opt-in, off-by-default) facts stage.
+    A crawl with `extraction.facts.enabled: false` — the common case — has
+    ALWAYS ingested documents, but the proxy returned `[]` for it, so
+    `cell["crawl"]["documents"]` and `cell["extract"]` read as zero/empty on
+    an instance that had already indexed real files (live symptom: "CRAWL —
+    0 documents", "EXTRACTION — Nothing yet" on a connection with 71
+    `indexed` files). The connection's own scopes are exact, not a proxy,
+    and read correctly whether or not the facts stage has ever run.
 
     **Error badge categories are a deliberate, narrower simplification** of
     spec §13.2's illustrative four (unsupported type / model error / deleted
@@ -8793,47 +10430,57 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
 
     scope_ids: list[str] = []
     try:
-        from src.repositories import facts_ingest_runs_repo
-
-        scope_ids = facts_ingest_runs_repo().distinct_corpus_ids()
-    except Exception as e:
+        raw_scopes = (conn.get("config") or {}).get("scopes") or []
+        scope_ids = sorted({s["collection_id"] for s in raw_scopes if isinstance(s, dict) and s.get("collection_id")})
+    except Exception as e:  # noqa: BLE001 — a malformed config degrades, never a 500
         logger.debug("sharepoint pipeline cell: could not resolve scope collections: %s", e)
 
     # ── crawl / extract: corpus_files across scope collections, bucketed by
     # processing_status (the five-state lifecycle: pending | processing |
     # indexed | needs_review | rejected).
+    #
+    # `corpus_status_counts`, when the caller (`_source_inventory`) already
+    # computed it for every SharePoint connection's scopes in one batched
+    # `corpus_files_repo().status_counts_for_corpora()` call, is reused
+    # as-is — this used to call `list_for_corpus(scope_id)` once PER SCOPE
+    # (up to ~180 on a real connection), which made this cell's query count
+    # scale with scope count instead of staying flat. `None` (a caller that
+    # hasn't precomputed it — e.g. a direct unit-test call) falls back to
+    # doing that one batched call itself, scoped to this connection alone.
     documents = 0
     extracted: dict[str, int] = {}
     if scope_ids:
         try:
-            from src.repositories import corpus_files_repo
+            if corpus_status_counts is None:
+                from src.repositories import corpus_files_repo
 
-            cf_repo = corpus_files_repo()
+                corpus_status_counts = corpus_files_repo().status_counts_for_corpora(scope_ids)
             for scope_id in scope_ids:
-                for f in cf_repo.list_for_corpus(scope_id):
-                    documents += 1
-                    status = f.get("processing_status") or "pending"
-                    extracted[status] = extracted.get(status, 0) + 1
+                for status, n in corpus_status_counts.get(scope_id, {}).items():
+                    documents += n
+                    extracted[status] = extracted.get(status, 0) + n
         except Exception as e:
             logger.warning("sharepoint pipeline cell: could not list corpus files: %s", e)
     cell["crawl"] = {"documents": documents}
     cell["extract"] = extracted
 
-    # ── facts / graph: caller-scoped (spec §5) — needs the real admin `user`
-    # this request authenticated as; with none supplied (a legacy call site)
-    # the numbers are simply unavailable, same "degrade, don't guess" rule.
-    facts_count = 0
-    edges_count = 0
-    if scope_ids and user is not None:
-        try:
-            from src.repositories import facts_repo
-
-            fr = facts_repo()
-            facts_count = sum(fr.count_visible_facts_for_collections(user, scope_ids).values())
-            edges_count = sum(fr.count_visible_edges_for_collections(user, scope_ids).values())
-        except Exception as e:
-            logger.debug("sharepoint pipeline cell: facts/edges counts unavailable: %s", e)
-    cell["graph"] = {"facts": facts_count, "edges": edges_count}
+    # ── facts / graph: NOT computed here (perf follow-up, 2026-09-03 live
+    # finding). `count_visible_facts_for_collections`/`count_visible_edges_
+    # for_collections` run one query EACH per corpus_id — correct and
+    # deliberate (see their own docstrings: the caller's readable set
+    # resolves once, but the per-collection COUNT is a genuinely separate,
+    # security-scoped read every time), but that means 2 statements per
+    # scope. Summed across every SharePoint connection's scopes on the page
+    # (up to ~180 each), that dominated the page's own render time on a live
+    # instance — 22 of ~28 samples of a page load's `pg_stat_activity` were
+    # exactly these two statements. This cell fold must cost ZERO
+    # `claims`-touching statements (`tests/test_admin_data_sources_page.py`'s
+    # bounded-queries guard), so `cell["graph"]` is `None` here — the strip
+    # fetches it lazily, per connection, via
+    # `GET /api/admin/sharepoint/connections/{id}/facts-graph-counts`
+    # (`app/api/admin_sharepoint.py::facts_graph_counts`) once the card has
+    # painted, never blocking the page response.
+    cell["graph"] = None
 
     # ── the last persisted run report (see facts_ingest_runs_pg.py) — the
     # error badges' source, and this cell's only input for the cost
@@ -8864,13 +10511,24 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
         # rendering arrives with operator-configured pricing (extraction
         # observability spec §5) — until then no `$` is shown here at all.
         cell["queue"] = {"items": queue_items}
+        # One doc_id resolution pass across ALL FOUR categories — a doc_id
+        # rejected on one claim and deferred on another otherwise resolves
+        # twice. See `_resolve_sharepoint_rejection_doc_labels`.
+        all_doc_ids = sorted(
+            {
+                row.get("doc_id")
+                for row in (*rejected_quotes, *deferred, *protocol_errors, *source_urls_rejected)
+                if row.get("doc_id")
+            }
+        )
+        doc_labels = _resolve_sharepoint_rejection_doc_labels(all_doc_ids)
         cell["last_run"] = {
             "id": last_run.get("id"),
             "created_at": last_run.get("created_at"),
-            "rejected_quotes": _enrich_sharepoint_rejection_rows(rejected_quotes),
-            "deferred": _enrich_sharepoint_rejection_rows(deferred),
-            "protocol_errors": _enrich_sharepoint_rejection_rows(protocol_errors),
-            "source_urls_rejected": _enrich_sharepoint_rejection_rows(source_urls_rejected),
+            "rejected_quotes": _enrich_sharepoint_rejection_rows(rejected_quotes, doc_labels),
+            "deferred": _enrich_sharepoint_rejection_rows(deferred, doc_labels),
+            "protocol_errors": _enrich_sharepoint_rejection_rows(protocol_errors, doc_labels),
+            "source_urls_rejected": _enrich_sharepoint_rejection_rows(source_urls_rejected, doc_labels),
         }
     else:
         cell["queue"] = {"items": 0}
@@ -8905,6 +10563,14 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
         # the block below never runs.
         "extraction_ready": False,
         "extraction_unready_reason": None,
+        # The "Extract facts now" gate — the standalone
+        # `sharepoint-facts-extraction` pass. Same posture as the two keys
+        # above: computed here so the card disables the button with the
+        # reason instead of letting the click land a 409 the server already
+        # knows about, and closed (not ready, no switch named) if the block
+        # below never runs.
+        "facts_extraction_ready": False,
+        "facts_extraction_unready_switch": None,
     }
     try:
         from app.instance_config import feature_enabled, get_value
@@ -8931,6 +10597,24 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
         usable, error = _extraction_readiness()
         in_agnes_schedule["extraction_ready"] = usable
         in_agnes_schedule["extraction_unready_reason"] = None if usable else (error or {}).get("error")
+
+        # The facts pass honours the connector switch first (router-level:
+        # the whole `/api/admin/sharepoint/*` surface answers `409
+        # feature_disabled` without it) and then its own two switches —
+        # `_facts_extraction_readiness`, the SAME check the trigger runs
+        # before enqueueing, whose refusal names the key that is off. It
+        # deliberately does NOT need the `extraction` dependency extra
+        # (`extraction_dependencies_missing` above): the pass reads
+        # already-converted markdown, never raw documents.
+        from app.api.admin_sharepoint import _facts_extraction_readiness
+
+        if not in_agnes_schedule["enabled"]:
+            facts_usable, facts_switch = False, "sharepoint.enabled"
+        else:
+            facts_usable, facts_error = _facts_extraction_readiness()
+            facts_switch = None if facts_usable else (facts_error or {}).get("switch")
+        in_agnes_schedule["facts_extraction_ready"] = facts_usable
+        in_agnes_schedule["facts_extraction_unready_switch"] = facts_switch
     except Exception as e:
         logger.debug("sharepoint pipeline cell: in-Agnes schedule state unavailable: %s", e)
 
@@ -8996,13 +10680,22 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
     collections_total = len(scope_ids)
     if scope_ids:
         try:
-            from src.repositories import resource_grants_repo
+            # `collection_grants_by_id`, when the caller precomputed it, is
+            # the FULL grants-by-collection map across every scope on the
+            # page — reused as-is rather than re-reading
+            # `resource_grants_repo().list_all()` (a full table scan) once
+            # per SharePoint connection. `None` (no caller-precomputed map)
+            # falls back to reading it here, scoped to nothing since a
+            # single read_all has no narrower form — same cost this always
+            # paid for a lone connection.
+            by_collection = collection_grants_by_id
+            if by_collection is None:
+                from src.repositories import resource_grants_repo
 
-            by_collection: dict[str, set] = {}
-            for g in resource_grants_repo().list_all(resource_type="collection"):
-                if g["resource_id"] in scope_ids:
+                by_collection = {}
+                for g in resource_grants_repo().list_all(resource_type="collection"):
                     by_collection.setdefault(g["resource_id"], set()).add(g["group_id"])
-            groups_matched = len({gid for gids in by_collection.values() for gid in gids})
+            groups_matched = len({gid for scope_id in scope_ids for gid in by_collection.get(scope_id, ())})
             collections_no_group = sum(1 for scope_id in scope_ids if not by_collection.get(scope_id))
         except Exception as e:
             logger.warning("sharepoint pipeline cell: grant lookup unavailable: %s", e)
@@ -9016,33 +10709,18 @@ def _sharepoint_pipeline_cell(conn: dict, user: dict | None) -> dict:
     # reused through `admin_sharepoint._scope_out` so the card renders
     # exactly the connect wizard's own step-3 "Share" shape — one source of
     # truth for what a scope row looks like, not a second projection that
-    # can drift from it. Each row degrades independently (a deleted
-    # collection, an unavailable grants repo) to its raw shape rather than
-    # dropping the row or failing the whole cell; a repo-wide failure
-    # (`resource_grants`/`file_corpora` unavailable) yields no scope rows at
-    # all rather than a 500 for the whole card — same posture as every
-    # other sub-block here. Unlike `scope_ids` above (a distinct-corpus
-    # heuristic over ingest history), this list is direct — every scope this
-    # CONNECTION has confirmed, whether or not it has ingested anything yet.
-    scopes: list[dict[str, Any]] = []
-    try:
-        from app.api.admin_sharepoint import _latest_run_anonymized_corpus_ids, _scope_out
-
-        declared_corpus_ids = _latest_run_anonymized_corpus_ids()
-        for raw_scope in (conn.get("config") or {}).get("scopes") or []:
-            if not isinstance(raw_scope, dict):
-                continue
-            try:
-                scopes.append(_scope_out(raw_scope, declared_corpus_ids, conn))
-            except Exception as e:
-                logger.debug(
-                    "sharepoint pipeline cell: scope row resolution failed for %s: %s",
-                    raw_scope.get("source_scope_id"),
-                    e,
-                )
-    except Exception as e:
-        logger.warning("sharepoint pipeline cell: scope rows unavailable: %s", e)
-    cell["scopes"] = scopes
+    # can drift from it — but NOT rendered here (perf follow-up, 2026-09-03,
+    # second finding on the same live instance): `cell["scopes"]` used to
+    # carry every confirmed scope's ENRICHED row (path, collection, group
+    # grants) for every SharePoint connection on the page at once — even
+    # capped at `_CARD_SCOPES_CAP`, 8 connections x 50 scopes each still
+    # inlined ~170 KB of JSON nothing on first paint reads (the identity
+    # cell above already carries the honest summary counts a card needs at a
+    # glance). The full, per-scope enriched list is now ALWAYS fetched
+    # lazily by the card — `GET .../scopes` (`admin_sharepoint.list_scopes`,
+    # the SAME `_scope_out` projection) — the instant it is expanded, never
+    # baked into the page response. Only the cheap count survives here.
+    cell["scopes_total"] = sum(1 for s in (conn.get("config") or {}).get("scopes") or [] if isinstance(s, dict))
 
     # ── anonymization (spec §9/§9.2/§13.2): "requested" (this connection's
     # own confirmed scopes marked anonymize=true, read straight off `conn` —
@@ -9394,6 +11072,14 @@ async def admin_ontology_page(
     ctx = _build_context(request, user=user)
     ctx["facts_enabled"] = feature_enabled("facts", "enabled", env_var="AGNES_FACTS_ENABLED", default=False)
     ctx["pg_backend"] = use_pg()
+    #: What the extraction pass actually produced, on the page of the person who
+    #: configured it. It used to head the Library, where it answered a question
+    #: no analyst was asking — a reader there wants their documents, and the
+    #: node-type counts describe what was pulled OUT of documents. Here it is
+    #: the answer to "did the crawl work, and what did it find", next to the
+    #: controls that would fix a bad number. Static chips: this page has no
+    #: filter for them to drive.
+    ctx["library_type_map"] = _library_type_map(user)
     return templates.TemplateResponse(request, "ontology_builder.html", ctx)
 
 
@@ -9649,7 +11335,19 @@ async def admin_access_page(request: Request, user: dict = Depends(require_admin
     from app.instance_config import get_allowed_domains
 
     ctx["invite_domains"] = get_allowed_domains() or []
-    return templates.TemplateResponse(request, "admin_access.html", ctx)
+    # Double-submit CSRF token for the person lens's "Open a page as them"
+    # POST (F2) — the same mint-and-set pair /me/profile and /auth/logout use.
+    csrf_token = _get_or_mint_web_csrf(request)
+    ctx["csrf_token"] = csrf_token
+    # Who is asking — so the person lens can decline to OFFER a view-as of the
+    # caller themselves. `view_as_self` is a real 400 at the entry route, and
+    # without this the page rendered the button for the caller's own row and
+    # sent them to a full-page error carrying a machine token and no way back
+    # to the lens they came from.
+    ctx["viewer_user_id"] = str(user["id"])
+    response = templates.TemplateResponse(request, "admin_access.html", ctx)
+    _set_web_csrf_cookie(response, request, csrf_token)
+    return response
 
 
 @router.get("/admin/grants", response_class=HTMLResponse)
@@ -9671,7 +11369,15 @@ async def admin_marketplaces_page(
     user: dict = Depends(require_admin),
 ):
     """Admin page for marketplace git repositories (register / sync / delete)."""
+    # NOTE: keep the docstring above to ONE line — FastAPI publishes it as this
+    # route's OpenAPI `description`, so prose here drifts tests/snapshots/openapi.json.
+    #
+    # `plugin_delivery` carries the one thing this page could not see about its
+    # own content: a synced plugin is listed here for the admin and served to
+    # nobody until a group is granted it. See `_marketplace_plugin_delivery`.
     ctx = _build_context(request, user=user)
+    ctx["plugin_delivery"] = _marketplace_plugin_delivery()
+    ctx["simulate_lens_href"] = _SIMULATE_LENS_HREF
     return templates.TemplateResponse(request, "admin_marketplaces.html", ctx)
 
 
@@ -9788,7 +11494,7 @@ def admin_contribute_skill_submit(
     except SkillContributionError as e:
         ctx["error"] = str(e)
         ctx["skill_md"] = skill_md
-    except Exception as e:  # noqa: BLE001 — surface any failure in the page
+    except Exception as e:
         logger.exception("contribute-skill failed")
         ctx["error"] = f"Unexpected error: {e}"
         ctx["skill_md"] = skill_md
@@ -9875,11 +11581,23 @@ async def admin_initial_workspace_page(
     request: Request,
     user: dict = Depends(require_admin),
 ):
-    """Admin page for the Initial Workspace Template repo (register / sync /
-    delete + per-file prompt provenance). Relocated from /admin/server-config
-    (#622 Slice 3 PR-B)."""
-    ctx = _build_context(request, user=user)
-    return templates.TemplateResponse(request, "admin_initial_workspace.html", ctx)
+    """Merged into /admin/prompts as its "Template repository" tab.
+
+    The repo and the prompts that bind to it were one job split across two
+    pages: this page's provenance table sent you to /admin/prompts to change a
+    binding, and that page could not offer git mode at all until this one had
+    registered a repo. 308 keeps every bookmark and in-page link alive — same
+    treatment /admin/agent-prompt and /admin/workspace-prompt got when #622
+    folded them into the same page.
+
+    KEEPS ``require_admin`` even though it only redirects — the two sibling
+    redirects below carry no gate, and a merge is the wrong moment to copy
+    that: this route answered 403 to a non-admin yesterday, and a refactor
+    that quietly turns a 403 into a 308 has changed who the endpoint answers,
+    not where it points. The target is admin-gated too, so the gate here is
+    belt-and-braces rather than the only check.
+    """
+    return RedirectResponse(url="/admin/prompts?tab=repo", status_code=308)
 
 
 # ── Inbound MCP source admin (RFC keboola/agnes-the-ai-analyst#461) ──
@@ -10083,13 +11801,13 @@ def _pending_agent_share_requests_for_admin() -> list:
 @router.get("/admin/store/submissions", response_class=HTMLResponse)
 async def admin_store_submissions_page(
     request: Request,
-    status: Optional[str] = None,
-    submitter: Optional[str] = None,
-    type: Optional[str] = None,  # noqa: A002 — FastAPI query-param name
-    name: Optional[str] = None,
-    version: Optional[str] = None,
-    sort: Optional[str] = None,
-    order: Optional[str] = None,
+    status: str | None = None,
+    submitter: str | None = None,
+    type: str | None = None,
+    name: str | None = None,
+    version: str | None = None,
+    sort: str | None = None,
+    order: str | None = None,
     limit: int = 50,
     skip: int = 0,
     user: dict = Depends(require_admin),
@@ -10361,10 +12079,24 @@ async def admin_prompts_page(
     editor mode, and a repo-path bind field for git mode. All dynamic state is
     fetched client-side from /api/admin/prompts/{kind}; the route only needs to
     know whether an IWT repo is registered so the git toggle can be disabled
-    when there's nothing to bind to."""
+    when there's nothing to bind to.
+
+    ``tab`` picks which of the two panes renders — the prompt cards, or the
+    Initial Workspace Template repo that used to be /admin/initial-workspace.
+    Resolved here rather than in the browser so each tab is a real URL and
+    only the active pane's markup and script reach the page (see the template's
+    `block page` comment). Anything other than ``repo`` is the prompt cards,
+    so a stale or hand-typed ``?tab=`` lands on the default rather than an
+    empty page.
+    """
     from src.initial_workspace import is_configured
 
-    ctx = _build_context(request, user=user, iwt_configured=is_configured())
+    ctx = _build_context(
+        request,
+        user=user,
+        iwt_configured=is_configured(),
+        tab="repo" if request.query_params.get("tab") == "repo" else "prompts",
+    )
     return templates.TemplateResponse(request, "admin_prompts.html", ctx)
 
 
@@ -10589,6 +12321,29 @@ async def profile_session_download(
     )
 
 
+@router.get("/_debug/error-surfaces", response_class=HTMLResponse, include_in_schema=False)
+async def _debug_error_surfaces(request: Request, user: dict = Depends(get_current_user)):
+    """Dev helper — the error surfaces that are NOT the error page.
+
+    Only mounted when DEBUG=1 (gated below), the same as the throw routes it
+    sits beside. Those cover the page side; a transcript note, an upload
+    dialog's error slot and a toast only appear when something upstream
+    actually fails, so they were the hardest surfaces to review and the
+    easiest to ship broken — a 429 during an upload rendered "[object
+    Object]" for as long as those dialogs existed.
+
+    The page renders by importing the shipped ``chat_errors.js`` and calling
+    it, so it cannot drift from what chat actually says.
+    """
+    if not _is_debug():
+        raise HTTPException(status_code=404, detail="Not found")
+    return templates.TemplateResponse(
+        request,
+        "debug_error_surfaces.html",
+        _build_context(request, user=user),
+    )
+
+
 @router.get("/_debug/throw/http/{code:int}", response_class=HTMLResponse, include_in_schema=False)
 async def _debug_throw_http(request: Request, code: int):
     """Dev helper — raise an HTTPException with the given status code.
@@ -10681,20 +12436,31 @@ def _chats_rows(request: Request, user: dict) -> tuple[list[dict], dict[str, int
         if s.id in seen:
             continue
         seen.add(s.id)
-        pinned = owned and s.pinned_at is not None
         archived = bool(s.archived)
+        # An archived conversation is never presented as pinned. `archive_session`
+        # clears `pinned_at` and the pin endpoint refuses a pin on an archived
+        # row, so the invariant holds at the source going forward — this is what
+        # makes it hold for rows written BEFORE it existed, on every instance, in
+        # place of a data migration the frozen DuckDB ladder could not carry.
+        pinned = owned and s.pinned_at is not None and not archived
         shared = bool(s.is_co_session) or not owned
-        # The segment set (see filter_toolbar.js `segments.multi`). `all` is a
-        # real token, not a wildcard, which is what keeps archived conversations
-        # out of every other view without a special case in the engine. Archived
-        # is deliberately exclusive: an archived chat is put away, so it should
-        # not also be sitting in Pinned.
-        buckets = ["archived"] if archived else ["all"]
-        if not archived:
-            if pinned:
-                buckets.append("pinned")
-            if shared:
-                buckets.append("shared")
+        # The LIFECYCLE STATE the page's `Show` radios filter on — one
+        # `exclusive` facet over `data-status` (filter_toolbar.js), so exactly
+        # one of Active / Archived / All is ever chosen. A set rather than a
+        # single value only so that `all` can be a token every row carries and
+        # the option of that name can mean what it says.
+        #
+        # `active` is the facet's `whenEmpty` value — what the list rests on
+        # before anything is chosen — which is how archived conversations stay
+        # out of the default view without a special case in the engine.
+        #
+        # Pinned and Shared are NOT in here. They are ATTRIBUTES, not states: a
+        # conversation carries them on either side of the archive, they are
+        # independent of each other, and they are independent toggle facets over
+        # the `data-pinned` / `data-shared` the row already carries. Mixing the
+        # two dimensions into one OR-group is what made combinations like
+        # "All + Shared" mean nothing.
+        status = ["all", "archived" if archived else "active"]
         agent_label = agent_names.get(s.agent_id or "", "Default agent")
         updated = s.last_message_at or s.started_at
         title = (s.title or "").strip() or "Untitled chat"
@@ -10715,7 +12481,7 @@ def _chats_rows(request: Request, user: dict) -> tuple[list[dict], dict[str, int
                 "archived": archived,
                 "shared": shared,
                 "owned": owned,
-                "buckets": "|".join(buckets),
+                "status": "|".join(status),
                 # What the page's search box matches on — lowercased here so the
                 # engine's own lowercased query is a plain substring test.
                 "search": " ".join([title, agent_label, SURFACE_LABELS.get(s.surface.value, "")]).lower(),
@@ -10729,11 +12495,20 @@ def _chats_rows(request: Request, user: dict) -> tuple[list[dict], dict[str, int
     # inside their own segment.
     rows.sort(key=lambda r: (r["pinned"], r["updated_iso"] or ""), reverse=True)
 
+    # The UNFILTERED tally per option — the same convention every other Filter
+    # menu in the app uses. `all` is the whole list, because that is what the
+    # option means now.
+    #
+    # `pinned` is live-only by construction (archiving unpins, and an archived
+    # row is never presented as pinned above), so the tally needs no `archived`
+    # clause. `shared` is genuinely orthogonal to the state — an archived
+    # co-session is coherent — so it spans the archive.
     counts = {
-        "all": sum(1 for r in rows if not r["archived"]),
-        "pinned": sum(1 for r in rows if r["pinned"] and not r["archived"]),
-        "shared": sum(1 for r in rows if r["shared"] and not r["archived"]),
+        "all": len(rows),
+        "active": sum(1 for r in rows if not r["archived"]),
         "archived": sum(1 for r in rows if r["archived"]),
+        "pinned": sum(1 for r in rows if r["pinned"]),
+        "shared": sum(1 for r in rows if r["shared"]),
     }
 
     # Facet options carry the UNFILTERED tally per value, matching how every
@@ -10764,9 +12539,10 @@ async def chats_page(
     grant; both failures bounce home rather than 403, matching the chat page (the
     rail hides the link for them too, so this guards a direct URL hit).
 
-    Rendering is server-side; search, the four segments (All / Pinned / Shared /
-    Archived), the Agent + Source facets, sort, the table ⇄ grid switch, the
-    row actions and the bulk bar are all client-side over those rows
+    Rendering is server-side; search, the Show controls (a lifecycle state —
+    Active / Archived / All, resting on Active — plus independent "Pinned only"
+    and "Shared only" toggles), the Agent + Source facets, sort, the row actions
+    and the bulk bar are all client-side over those rows
     (static/js/chats_page.js).
     """
     if not request.app.state.chat_config.enabled:
@@ -11048,9 +12824,9 @@ def _chat_capability_snapshot(conn: duckdb.DuckDBPyConnection, user: dict) -> di
     sync, and rendering becomes a single round-trip with no client-side
     fetch races. JSON gets embedded by the template via ``| tojson``.
     """
-    from src.rbac import get_accessible_tables
-    from src.marketplace_filter import resolve_allowed_plugins
     from app.api.marketplace import _curated_stack_sets
+    from src.marketplace_filter import resolve_allowed_plugins
+    from src.rbac import get_accessible_tables
 
     by_source: dict[str, int] = {}
     try:

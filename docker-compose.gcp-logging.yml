@@ -1,59 +1,123 @@
-# GCP Cloud Logging overlay — ships container stdout/stderr to Google Cloud
-# Logging via Docker's built-in `gcplogs` driver.
+# GCP Cloud Logging overlay — forwards container stdout/stderr to the Ops
+# Agent running on the host, which parses Agnes' JSON log lines and writes
+# them to Cloud Logging as structured entries.
+#
+# Why not Docker's built-in `gcplogs` driver: it parses nothing. Each line
+# arrives as an opaque string in `jsonPayload.data`, so every entry lands at
+# severity DEFAULT and the fields the app writes (severity, service, env,
+# request_id) are filterable by substring only — the same as having no
+# levels at all. The Ops Agent's fluent_forward receiver + parse_json
+# processor is what turns them back into fields (see
+# infra/modules/customer-instance/files/ops-agent-config.yaml).
+#
+# `fluentd-async: true` is load-bearing, not a tuning knob. Docker refuses to
+# START a container whose log driver cannot initialize; in async mode the
+# driver connects in the background, so a collector that is down, still
+# booting, or never installed costs log lines and nothing else. That is the
+# difference between this overlay and the 2026-08-25 outage (#1557), where an
+# armed synchronous driver left app/scheduler stuck in `created` for 9
+# minutes. The retry settings keep it reconnecting for the life of the
+# container rather than giving up on the collector's first restart.
 #
 # Activation is PLACEMENT + PROBE driven: this file is not in any default
 # COMPOSE_FILE / CONFIG_FILES list. Every COMPOSE_FILE builder (the boot
 # startup script and the runtime drivers agnes-auto-upgrade.sh /
 # agnes-state-applier.sh, all via the shared gate in
 # scripts/ops/agnes-compose-file.sh::agnes_gcp_logging_active) appends it
-# ONLY when the file physically exists on disk AND the gcplogs driver probe
-# has armed the .gcp-logging-ok marker next to it. The probe exists because
-# Docker refuses to START a container whose log driver cannot initialize —
-# an armed overlay on a VM that cannot authenticate to Cloud Logging turns
-# the next routine container recreate into a full outage (#1557).
+# ONLY when the file physically exists on disk AND the probe has armed the
+# .gcp-logging-ok marker next to it. Async forwarding means a missing
+# collector can no longer take the stack down, so the probe now answers the
+# question that is left: is anything actually receiving these logs?
 #
 # The real placement mechanism (`infra/modules/customer-instance/`, the
 # reusable Terraform module for GCE-hosted instances): this file is baked
 # into the app image at /opt/agnes-host/ (Dockerfile) alongside every other
 # host artifact, and startup-script.sh.tpl's existing recursive
 # `docker cp .../opt/agnes-host/. $APP_DIR/` extracts it onto the VM on every
-# boot. The module's `enable_gcp_logging` variable (default true) then
-# decides whether the script leaves the extracted file in place or removes
-# it again — removal is what turns the resolver's gate off for a VM that
-# opts out. The same variable gates the module's project-level
-# roles/logging.logWriter grant to the VM service account, which the driver
-# needs to authenticate (it is NOT part of any default SA setup).
+# boot. The module's `container_logs_destination` then decides whether the
+# script leaves the extracted file in place or removes it again — removal is
+# what turns the resolver's gate off for a VM whose logs go elsewhere, and it
+# is also what puts a Datadog-destination VM back on the json-file driver its
+# agent can read. `enable_gcp_logging` (default true) is the separate PERMIT
+# switch: it gates installing the Ops Agent and the module's project-level
+# roles/logging.logWriter grant to the VM service account, which the agent
+# needs to authenticate. Both must line up for this overlay to be armed.
 #
-# Why not default-on regardless of host: the gcplogs driver requires Google
-# ADC from the GCE metadata server, so on a non-GCP host the containers would
-# fail to start. `enable_gcp_logging=false` (or simply not using this module
-# at all — the file is only ever placed by it) keeps a deployment on the
-# default json-file driver, preserving the vendor-agnostic OSS deployment.
-#
-# The driver auto-detects the GCP project and the instance name/id/zone from the
-# metadata server, writes under resource `gce_instance` (next to the VM/system
-# logs) to logName `gcplogs-docker-driver`, and tags each entry with
-# `jsonPayload.container.name` (e.g. "/agnes-app-1") so services stay
-# distinguishable in the Logs Explorer. The VM service account must carry
-# roles/logging.logWriter — the module grants it when enable_gcp_logging is
-# true; without it the probe leaves this overlay disabled (loud warning in
-# the boot/tick logs) rather than letting container starts fail.
+# Why not default-on regardless of host: the agent authenticates with Google
+# ADC from the GCE metadata server, so on a non-GCP host there is nothing to
+# receive the logs. `enable_gcp_logging=false` (or simply not using this
+# module at all — the file is only ever placed by it) keeps a deployment on
+# the default json-file driver, preserving the vendor-agnostic OSS
+# deployment.
 #
 # `docker logs` / `docker compose logs` keep working via Docker's dual-logging
 # local cache (Docker >= 20.10).
+#
+# SCOPE: exactly the services `docker-compose.yml` defines — no more, no
+# less, pinned by tests/test_gcp_logging_overlay_placement.py.
+#
+# No less, because this list was written once (#679) against the compose
+# file of the day and then drifted: `extraction-worker`, `apps-runner`,
+# `egress-proxy` and `kai-agent-stub` were all added to the base compose
+# later and silently stayed on json-file. On a live customer VM that meant
+# the connector crawl logs — the ones an operator goes looking for — never
+# left the box and died with every auto-upgrade container recreate, while
+# app/scheduler/caddy shipped fine and made the setup look healthy. Note
+# `extract` and `extraction-worker` are two different services (a one-shot
+# extractor under the `extract` profile vs. the long-running extraction
+# lane); covering one is not covering the other.
+#
+# No more, because this overlay is engaged from file presence alone, so it
+# must stay loadable next to ANY combination of the other overlays. A
+# service named here but defined only in a conditional overlay — `redis`
+# and `extraction-worker`'s image in the module-written
+# docker-compose.extraction.yml, `postgres` on side-car backends,
+# `kai-agent` in docker-compose.kai-agent.yml — would appear to compose as
+# a service with no image/build on every instance that does not load that
+# overlay, and compose then refuses to parse the whole stack: every
+# `docker compose` call on the VM fails, which is the fleet-freeze shape of
+# #1557 through a different door. Those services take their log driver in
+# the overlay that defines them.
+#
+# Order below mirrors docker-compose.yml so a future addition there is
+# visibly missing here.
+x-gcp-logging: &gcp-logging
+  driver: fluentd
+  options:
+    # Loopback only: the collector is a host-local agent, and container logs
+    # must never be addressed off-host from here.
+    fluentd-address: "127.0.0.1:24224"
+    fluentd-async: "true"
+    fluentd-retry-wait: "1s"
+    # Keep reconnecting for the life of the container — an agent restart
+    # must not permanently detach a long-running service from logging.
+    # int32 max, not uint32 max: dockerd parses this option as a 32-bit int
+    # and refuses 4294967295 with "invalid fluentd-max-retries: value out of
+    # range" — which fails EVERY container create under this overlay (seen
+    # live on Docker 29.7: the first recreate after the overlay armed). At
+    # 1 s retry-wait, 2^31-1 retries is still ~68 years of reconnecting.
+    fluentd-max-retries: "2147483647"
+    fluentd-sub-second-precision: "true"
+    # Keeps services distinguishable in the Logs Explorer, the same job
+    # `jsonPayload.container.name` did under the gcplogs driver.
+    tag: "agnes.{{.Name}}"
+
 services:
   app:
-    logging:
-      driver: gcplogs
-  scheduler:
-    logging:
-      driver: gcplogs
-  caddy:
-    logging:
-      driver: gcplogs
-  telegram-bot:
-    logging:
-      driver: gcplogs
+    logging: *gcp-logging
   extract:
-    logging:
-      driver: gcplogs
+    logging: *gcp-logging
+  scheduler:
+    logging: *gcp-logging
+  extraction-worker:
+    logging: *gcp-logging
+  apps-runner:
+    logging: *gcp-logging
+  egress-proxy:
+    logging: *gcp-logging
+  kai-agent-stub:
+    logging: *gcp-logging
+  telegram-bot:
+    logging: *gcp-logging
+  caddy:
+    logging: *gcp-logging

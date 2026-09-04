@@ -20,10 +20,200 @@ Highlights:
 - Cron-based auto-upgrade (pulls `:stable` image digest every 5 min)
 - Caddy TLS with corporate-CA or self-managed certs mounted from `/data/state/certs`; daily auto-rotation from a URL (`TLS_FULLCHAIN_URL`) with zero-downtime `SIGUSR1` reload
 - Uptime check + alert policy per VM (wire a notification channel to be paged)
+- Opt-in Datadog host agent (`enable_datadog`) — see [Host monitoring with Datadog](#host-monitoring-with-datadog) below
 - CI/CD in the private repo: PR → `terraform plan`, merge to main → `apply-dev` auto, `apply-prod` gated by reviewer
 - First-boot bootstrap via `POST /auth/bootstrap`
 
 Target onboarding time: **< 1 hour** per customer.
+
+### Sizing from the VM
+
+`app_mem_limit`, `scheduler_mem_limit` and `extraction_worker_mem_limit`
+(per-VM fields on `prod_instance` / `dev_instances[*]`) default to `"auto"`:
+the startup script derives every container memory ceiling AND the Postgres
+side-car's tuning from the VM's own `/proc/meminfo` + `nproc` on every boot,
+instead of a fixed literal baked in at `terraform plan` time that never
+matches a bigger or smaller `machine_type`. Re-derived on EVERY boot
+(idempotent), so a VM recreate never regresses to a laptop-sized default.
+
+| Setting | Formula |
+|---|---|
+| `app_mem_limit` | `clamp(RAM / 8, 4 GiB, 32 GiB)` |
+| `scheduler_mem_limit` | fixed `2 GiB` |
+| `extraction_worker_mem_limit` | `RAM × 0.6`, capped so app + worker + an 8 GiB headroom (Postgres + host) never exceeds the VM's actual RAM, floored at 4 GiB |
+| Postgres `shared_buffers` | `25% of RAM`, capped at `32 GiB` |
+| Postgres `effective_cache_size` | `60% of RAM` |
+| Postgres `work_mem` | `clamp(RAM / 512, 16 MiB, 256 MiB)` |
+| Postgres `maintenance_work_mem` | `min(RAM / 16, 4 GiB)` |
+| Postgres `max_wal_size` | fixed `8GB` |
+| Postgres `wal_compression` | fixed `on` |
+| Postgres `random_page_cost` | fixed `1.1` (every data disk is `pd-ssd`) |
+| Postgres `max_parallel_workers_per_gather` | `min(4, vCPU / 8)` |
+| Postgres `jit` | fixed `off` (measured slower on this app's visibility CTEs) |
+| Postgres `shm_size` (Docker's `/dev/shm`) | `2% of RAM`, floored at `256 MiB` |
+| Postgres `max_connections` | `max(100, 15 + 15 + extraction_worker_replicas × 16 + 40)` — see *Sizing an extraction instance* below |
+
+Set an explicit value (e.g. `app_mem_limit = "8g"`) to override `"auto"`
+outright — a hand-set value always wins, same precedence as every other
+per-VM field. **Live finding (TCRD-296):** a fixed 4 GiB `app_mem_limit` and
+Postgres' stock defaults (`shared_buffers` 128-160 MiB, `work_mem` 4 MiB,
+`effective_cache_size` 5 GiB) plus Docker's default 64 MiB `/dev/shm` on a
+64-vCPU / 251 GiB VM OOM-killed the app four times serving DuckDB queries and
+made every Postgres parallel worker fail with "could not resize shared
+memory segment" (~2850 times in 30 minutes), killing a facts extraction job.
+
+The derivation is startup-script logic — see `agnes_auto_app_mem_limit_gb` /
+`agnes_pg_shared_buffers_mb` / etc. in `infra/modules/customer-instance/
+startup-script.sh.tpl` (unit-tested in `tests/test_startup_vm_sizing.py`) —
+so it applies to a Terraform-provisioned VM only; the plain `docker compose`
+path in the next section documents the equivalent manual step for a
+self-hosted install. See *Sizing the Postgres side-car* below for the
+`ALTER SYSTEM` precedence caveat and how new sizing reaches an EXISTING VM
+(a recreate, not a live retune).
+
+#### Sizing an extraction instance
+
+`extraction_worker_replicas` (per-VM field on `prod_instance` /
+`dev_instances[*]`, default `1`) runs more than one `extraction-worker`
+compose replica (`docker compose up -d --scale extraction-worker=N`) — the
+knob for pushing facts-extraction throughput past what a single container's
+`extraction.concurrency` lane count can do. **Live finding (TCRD-296 gap
+#76):** an operator ran six replicas by hand on a 64-vCPU / 252 GiB VM to
+keep up with a backlog. Nothing in Terraform remembered that scale — the
+next recreate silently dropped it back to one — and six replicas each sizing
+a Postgres connection pool from the SAME per-process runtime hint
+(`src/db_pg.py::_extraction_worker_pool_size_hint`, designed for exactly ONE
+replica) exhausted the side-car's stock 100-connection cap ("FATAL: sorry,
+too many clients already"), worked around by hand with `AGNES_PG_POOL_SIZE`/
+`AGNES_PG_MAX_OVERFLOW` in `.env` (which — set there — also shrank the
+`app`/`scheduler` pools, not just the worker's) and a manual `ALTER SYSTEM
+SET max_connections`.
+
+Raising `extraction_worker_replicas` now handles all three pieces from the
+module, together:
+
+1. **The scale itself** is threaded through every `docker compose up` that
+   could otherwise recreate the stack — the boot sequence's tolerant
+   extraction-worker bring-up AND the recurring `agnes-auto-upgrade` tick's
+   drift-gated recreate — from the ONE `AGNES_EXTRACTION_WORKER_REPLICAS`
+   value written into `.env`, so a routine recreate can never silently
+   collapse it back to one container.
+2. **`max_connections`** grows with it: `max(100, 15 + 15 + replicas × 16 +
+   40)` — 15 each for `app`/`scheduler` (their own unchanged
+   `pool_size(5) + max_overflow(10)` defaults from `src/db_pg.py`), 16 per
+   extraction-worker replica (a conservative constant, not derived from
+   `extraction.concurrency` — see point 3), 40 headroom for manual
+   `psql`/monitoring connections. At the default of 1 replica this clamps to
+   Postgres' OWN stock default (100), so nothing changes for an instance
+   that never touches the field.
+3. **The extraction-worker's own pool** is pinned explicitly — only when
+   `extraction_worker_replicas > 1` — to `AGNES_PG_POOL_SIZE=8` /
+   `AGNES_PG_MAX_OVERFLOW=8` (the same conservative constant `max_connections`
+   reserved room for: 2x the default per-process hint's own sizing for ONE
+   replica, `extraction.concurrency`(1) + `extraction.facts.concurrency`(3) =
+   4 lanes). This override reaches ONLY the `extraction-worker` compose
+   service (an additive `environment:` merge, the same mechanism the
+   OpenBLAS thread-count pins use) — `app` and `scheduler` are never touched
+   and keep sizing their own pools from `src/db_pg.py`'s plain defaults.
+
+Worked example, the live 6-replica / 252 GiB VM: `max_connections = 15 + 15
++ 6 × 16 + 40 = 166`; each replica gets `AGNES_PG_POOL_SIZE=8` +
+`AGNES_PG_MAX_OVERFLOW=8` (16 connections), for a worst-case total of `6 ×
+16 = 96` — comfortably inside the 166 the side-car now allows.
+
+If your own `extraction.concurrency` / `extraction.facts.concurrency`
+(`instance.yaml`, runtime-editable — see *Scaling the extraction lane*
+below) push a single replica's ACTUAL pool usage past 16 connections, raise
+`AGNES_PG_POOL_SIZE`/`AGNES_PG_MAX_OVERFLOW` and `max_connections` by hand to
+match (`ALTER SYSTEM SET max_connections = ...; SELECT pg_reload_conf();` —
+`max_connections` additionally needs a full Postgres restart, not just a
+reload) — the module's constant is a safe default for the common case, not a
+hard ceiling.
+
+### Host monitoring with Datadog
+
+Off by default. `enable_datadog = true` makes the module install a pinned
+Datadog Agent as a **host package** on every VM in the call and render its check
+configs on every boot.
+
+**Before enabling**, create one Secret Manager secret holding a Datadog API key
+for the agent, and pass its NAME (not its value):
+
+```hcl
+enable_datadog         = true
+datadog_api_key_secret = "<customer>-datadog-agent-api-key"
+datadog_site           = "datadoghq.com"   # must match the key's org
+datadog_extra_tags     = ["repo:<your-infra-repo>"]
+extra_labels           = { env = var.gcp_project_id }
+```
+
+The module grants the VM service account `secretAccessor` on exactly that
+secret. The key is fetched at boot and written only into
+`/etc/datadog-agent/datadog.yaml` (`root:dd-agent`, `0640`) — it never enters
+`/opt/agnes/.env`, a command line, or Terraform state. Rotate it with
+`gcloud secrets versions add` followed by a reboot of the VM.
+
+What runs on the host:
+
+| Check | What it answers |
+|---|---|
+| core (cpu, memory, load, uptime, io, network) | host parameters |
+| `disk` | `/` and `/data` usage + inodes; a read-only `/data` remount surfaces as a failed RW check |
+| `docker` + `container` | daemon up, containers running, per-compose-service uptime/cpu/memory/OOM |
+| `systemd` | failed units, incl. the daily backup oneshot named by unit |
+| `directory` | heartbeat ages: state applier, auto-upgrade tick, newest completed backup, watchdog signature markers |
+| `http_check` | `/readyz` (status code), `/api/health` (body — that endpoint is always 200), and the port-80 ACME redirect |
+| `tls` | certificate expiry for the domain and any alias |
+| `postgres` | both side-cars, via Autodiscovery on the `postgres` image: liveness, connection headroom, database size, XID wraparound |
+
+Three things to know:
+
+- **`dd-agent` joins the `docker` group**, which is root-equivalent on this
+  host — the same posture the module already accepts for `agnes-applier`. The
+  rendered `datadog.yaml` turns off everything that could make that membership
+  remotely reachable: remote configuration, APM, DogStatsD,
+  process/container/discovery collection, runtime security, compliance, SBOM,
+  image and lifecycle collection, and both inventory uploads. IPC binds to
+  loopback and container env vars never become tags.
+- **Container logs go to Datadog too, by default.** `container_logs_destination`
+  resolves to `datadog` whenever `enable_datadog` is on, which turns on log
+  collection in that same `datadog.yaml` and stops the Cloud Logging pipeline.
+  That is egress, not privilege — the agent could already read the logs through
+  the docker socket — but it is the setting that sends them off the host, so
+  read [`datadog-logging.md`](datadog-logging.md) before enabling either.
+- **It reaches a running VM only through a recreate.** The agent is installed by
+  the startup script, and `metadata_startup_script` is in `ignore_changes`, so
+  enabling this on a live fleet produces the IAM binding and the labels with no
+  agent and no diff to show for it. Recreate the instance:
+  `terraform apply -replace='module.<name>.google_compute_instance.vm["<vm>"]'`
+  (~5-10 min of downtime; `/data` and the static IP survive).
+- **No thresholds live on the VM.** The checks report; monitors, dashboards and
+  notification targets belong in the caller's own Datadog Terraform. The
+  catalogue this design assumes — which signals are paging and which are
+  dashboard-only — is in
+  [`superpowers/specs/2026-09-03-datadog-host-monitoring-design.md`](superpowers/specs/2026-09-03-datadog-host-monitoring-design.md).
+- **The `agnes-applier` uid is reserved before the agent installs.** The
+  Datadog apt package creates its own `dd-agent` system user, and on a fresh
+  image `useradd --system` allocates the next free system uid — the same uid
+  `agnes-applier` needs pinned so it can read `/data/state/instance.yaml`
+  (#1217). The startup script now reserves `agnes-applier`'s uid as its very
+  first action, before Docker or Datadog install, and Datadog's own
+  `dd-agent` user is additionally pre-created at a fixed uid as a second,
+  order-independent guard — so enabling this on a fresh VM cannot strand the
+  applier on an unpinned uid the way it could before. See the "Reserve the
+  state-applier's pinned uid" block in `startup-script.sh.tpl` and
+  [`docs/postgres-cutover-runbook.md`](postgres-cutover-runbook.md) for the
+  degraded-mode fallback if the uid is ever unavailable for some other
+  reason.
+
+The Postgres side-car check needs a monitoring role inside each container. A
+root-owned timer (`agnes-datadog-pg-role.timer`, every 15 min) creates a
+`datadog` role with `pg_monitor`, renders the check config with its password,
+and re-converges after a side-car volume is recreated. Verify a VM with
+`sudo datadog-agent status`. The check attributes its series to the side-car's
+container IP rather than the VM host, so the module renders `env:` and the
+VM's tag list into the check's instance tags — scope Postgres monitors by
+`env` and `compose_service`, never by `host`.
 
 ## 2. Docker Compose — OSS self-host
 
@@ -115,6 +305,57 @@ For running Agnes on your own VM / bare metal without Terraform. You're responsi
    don't set `POSTGRES_PASSWORD` — app-state runs on single-file DuckDB, as every
    instance did before A1. Not recommended for a new install (see
    [postgres-cutover-runbook.md](postgres-cutover-runbook.md) for why).
+
+### Sizing the Postgres side-car
+
+On a Terraform-provisioned VM (customer-instance module), the startup script
+derives Postgres tuning and container memory ceilings from the VM's own
+`/proc/meminfo` + `nproc` on every boot — see *Sizing from the VM* below.
+That derivation lives in the startup script, not in the compose files
+themselves, so a self-provisioned host following the steps above does not
+get it automatically: `docker-compose.postgres-host-mount.yml`'s
+`shared_buffers` / `effective_cache_size` / `work_mem` /
+`maintenance_work_mem` / `max_parallel_workers_per_gather` / `shm_size` all
+fall back to small, laptop-sized literals (`AGNES_PG_SHARED_BUFFERS:-256MB`
+and friends) when the `AGNES_PG_*` env vars are unset. Export them yourself
+in `.env` for a self-hosted install on real hardware, e.g.:
+
+```bash
+cat >> .env <<EOF
+AGNES_PG_SHARED_BUFFERS=8192MB
+AGNES_PG_EFFECTIVE_CACHE_SIZE=19660MB
+AGNES_PG_WORK_MEM=64MB
+AGNES_PG_MAINTENANCE_WORK_MEM=2048MB
+AGNES_PG_MAX_PARALLEL_WORKERS_PER_GATHER=1
+AGNES_PG_SHM_SIZE=655m
+AGNES_PG_MAX_CONNECTIONS=100
+EOF
+```
+
+Running more than one `extraction-worker` container by hand (`docker compose
+up -d --scale extraction-worker=N`)? Raise `AGNES_PG_MAX_CONNECTIONS`
+accordingly and pin `AGNES_PG_POOL_SIZE`/`AGNES_PG_MAX_OVERFLOW` on that
+service specifically (not via a top-level `.env` line, which would also
+shrink `app`/`scheduler`'s pools) — see *Sizing an extraction instance*
+above for the formula the Terraform module applies automatically.
+
+**`ALTER SYSTEM` wins over these flags.** An admin who ran `ALTER SYSTEM SET
+work_mem = '...'` (or any other tuning GUC) by hand on a running instance has
+a `postgresql.auto.conf` in the data directory that Postgres reads AFTER the
+`-c` command-line flags this overlay passes — the config-file value always
+loses that precedence fight. Clear a hand-set override with `ALTER SYSTEM
+RESET work_mem;` (or `RESET ALL;` to clear every hand-set GUC at once)
+followed by `SELECT pg_reload_conf();`, or delete the specific `SET` line
+from `postgresql.auto.conf` inside the container and reload/restart. Applies
+identically to a self-hosted install and a Terraform VM.
+
+**Existing instances only pick up new sizing at the next recreate or
+`compose up`** — nothing here retunes a running `postgres` container
+in-place. On a customer-instance VM, trigger it the same way as any other
+startup-script change: `terraform apply -replace='module.agnes.google_compute_
+instance.vm["<vm-name>"]'` (see `docs/RELEASING.md` → *Replacing a VM after a
+startup-script change*). On a self-hosted install, `docker compose up -d
+--force-recreate postgres` after updating `.env`.
 
 4. Bootstrap your admin password via `POST /auth/bootstrap`:
 
@@ -328,38 +569,39 @@ credential-bearing URL.
 
 #### Reverse-proxy access logs — MCP SSE `?token=`
 
-The MCP SSE transport accepts the bearer token as a `?token=` query parameter,
-a fallback for clients that cannot set an `Authorization` header on a GET. When
-a client uses it, the token — a long-lived PAT, not a single-use code — lands in
-the access log of every intermediary that records request URIs (CWE-598). Agnes
-logs a one-time warning naming this the first time the fallback is used, so
-check your logs for it.
+The MCP SSE transport can accept the bearer token as a `?token=` query
+parameter, a fallback for a client that cannot set an `Authorization` header
+on a GET. **Off by default since the #1656 audit follow-up** — a request that
+carries only `?token=` is refused exactly like an unauthenticated request
+(`401`) unless an operator opts back in. Most instances need no action: an
+upgrade from an older release that never wrote this setting picks up the new,
+safe default automatically. If you (or an earlier config export) ever
+explicitly saved `true` here, that value persists across upgrades and the
+fallback stays on until you flip it — check its `effective` value on
+`/admin/server-config`.
 
-Two ways to handle it, in order of preference:
+Every connection snippet Agnes hands out on the MCP connect page is
+header-based already — the `?token=` snippet was removed in the 2026-07-24
+audit follow-up — so nothing in a typical fleet needs the parameter.
 
-1. **Turn the fallback off.** Every connection snippet Agnes hands out on the
-   MCP connect page is header-based — the `?token=` snippet was removed in the
-   2026-07-24 audit follow-up — so unless you have a hand-rolled client, nothing
-   in your fleet needs the parameter. Set `mcp.allow_query_param_token: false`
-   in `/admin/server-config` (or `AGNES_MCP_ALLOW_QUERY_PARAM_TOKEN=false`); the
-   parameter is then ignored and such requests get a 401. This removes the
-   exposure rather than containing it. Default is `true` so an upgrade never
-   breaks a client that still relies on it — check for the one-time warning in
-   your logs before flipping it.
+Turn it on (`mcp.allow_query_param_token: true` in `/admin/server-config`, or
+`AGNES_MCP_ALLOW_QUERY_PARAM_TOKEN=true`) only for a documented client that
+genuinely cannot set the header. When enabled and a client actually uses it,
+the token — a long-lived PAT, not a single-use code — lands in the access log
+of every intermediary that records request URIs (CWE-598); Agnes logs a
+one-time warning naming this the first time the fallback fires, so check your
+logs for it. Prefer containing the exposure over carrying it indefinitely:
 
-   **Write `false`, `off`, `no`, or `0` — nothing else disables it.** Agnes's
-   flag parser treats every unrecognized string as truthy, so `disabled`,
-   `disable`, or `n` leave the fallback **on** with no error. That convention is
-   harmless for flags whose default is inert, but this one defaults to
-   permissive, so a typo silently keeps the exposure you were trying to remove.
-   Confirm the change took by reading the flag's `effective` value back from
-   `/admin/server-config` rather than trusting the save.
-2. **Keep it and redact.** If a client genuinely cannot set the header, add a
-   proxy rule that drops or masks the `token` query parameter for
-   `/api/mcp/*`, as above for the OAuth callback. Note this only covers *your*
-   proxy — the token still travels in the URL and can be captured anywhere else
-   on the path, so treat any PAT used this way as exposed and rotate it if the
-   log retention worries you.
+- Add a proxy rule that drops or masks the `token` query parameter for
+  `/api/mcp/*`, as above for the OAuth callback. This only covers *your*
+  proxy — the token still travels in the URL and can be captured anywhere else
+  on the path, so treat any PAT used this way as exposed and rotate it if the
+  log retention worries you.
+- **Write `true`/`false` (or `on`/`off`, `yes`/`no`, `1`/`0`) — Agnes's flag
+  parser treats every unrecognized string as truthy**, so a typo like
+  `disabled` or `n` when turning it back off leaves it **enabled** with no
+  error. Confirm any change took by reading the flag's `effective` value back
+  from `/admin/server-config` rather than trusting the save.
 
 #### VPN/intranet-only instances — MCP connector reachability
 
@@ -540,7 +782,7 @@ torch and together they add gigabytes to the image:
 
 | Extra | Without it | With it |
 |---|---|---|
-| `docling` | `.docx` / `.pptx` uploads are accepted and then **rejected** — there is no lightweight parser for them | office documents are parsed and indexed |
+| `docling` | `.docx` / `.pptx` are read by markitdown from the `extraction` extra the default image ships — text and headings, tables flattened | Docling's layout-aware parsing takes precedence for office documents: tables and reading order survive |
 | `embeddings` | retrieval is `lexical_only` — whole-word matching, weak on slide decks and prose | retrieval is `hybrid` (semantic + lexical) |
 
 The default image deliberately ships **without** them: every VM in a fleet
@@ -573,9 +815,10 @@ from src.ingest.text_extract import docling_capability; \
 print(retrieval_mode(), docling_capability())"
 ```
 
-`hybrid True` is the rich image; `lexical_only False` is the default one. On
-the default image a rejected office upload says so in its rejection reason
-rather than leaving the operator to guess.
+`hybrid True` is the rich image; `lexical_only False` is the default one. An
+office upload is rejected only on a build with neither parser — no
+`extraction` extra and no `docling` — and the rejection reason then names
+both rather than leaving the operator to guess.
 
 Every other allowlisted format is readable on **both** images: `.eml` and
 `.epub` are parsed by the standard library, with no extra. `.msg` (Outlook's
@@ -643,29 +886,35 @@ On a VM provisioned by the Terraform module
 (`infra/modules/customer-instance`), none of this is assembled by hand —
 the startup script owns `.env` and `COMPOSE_FILE`, so hand edits are
 reverted on the next recreate. Instead set the per-instance
-`extraction_worker_enabled = true` (default off) together with the
-module-level `extraction_worker_image` (an app image built with the
-`extraction` optional extra — the plain app image carries no document
-converter, and the module refuses the flag without an image at plan time). The module then
-renders the Redis coordination backend, the `.env` coordination
-declaration, an `AGNES_SHAREPOINT_ENABLED=1` line (the whole SharePoint
-connector, not just extraction — see the migration note in
-[`feature-flags.md`](feature-flags.md)), an
-`AGNES_EXTRACTION_PRODUCER_COMMAND` line (module-level
-`extraction_producer_command`, defaulting to the conventional in-image
-path `python /opt/producer/agnes_lane.py` — override only if your
-producer build installs somewhere else), and an always-on
-`extraction-worker` service into the boot path. Because these ride `.env`
-(env overrides `instance.yaml` — the same posture
-`app/coordination/factory.py` already uses for the coordination backend
-itself), the TF flag alone activates `corpus-extraction` end to end — no
-applier-owned edit of `instance.yaml` on the VM's data disk is needed for
-the ordinary case. The startup script is under `lifecycle.ignore_changes`,
-so flipping the flag on an existing VM takes effect only through a VM
-recreate (`terraform apply -replace=<vm address>`); the Postgres app-state
-and explicit-secrets prerequisites above remain yours to satisfy — on a
-DuckDB app-state instance the app still refuses to boot, naming the
-missing piece.
+`extraction_worker_enabled = true` (default off). The module then renders
+the Redis coordination backend, the `.env` coordination declaration, an
+`AGNES_SHAREPOINT_ENABLED=1` line (the whole SharePoint connector, not just
+extraction — see the migration note in
+[`feature-flags.md`](feature-flags.md)), and an always-on
+`extraction-worker` service into the boot path. By DEFAULT the service gets
+no `image:` override at all and inherits the SAME image/tag as
+`app`/`scheduler` (`AGNES_IMAGE_REPO`/`AGNES_TAG`), since the built-in
+extraction pipeline needs nothing bundled that image does not already
+carry — this is what keeps the worker from drifting behind the app as the
+fleet auto-upgrades. The module-level `extraction_worker_image` can still
+pin the worker to a DIFFERENT tag for a deliberate, temporary reason (a
+canary, holding the worker back mid-rollout); leaving such a pin in place
+risks the exact crash loop the default avoids once the app migrates the
+database past what the pinned image's Alembic head knows — see that
+variable's own description. Because these ride `.env` (env overrides
+`instance.yaml` — the same posture `app/coordination/factory.py` already
+uses for the coordination backend itself), the TF flag alone activates
+`corpus-extraction` end to end — no applier-owned edit of `instance.yaml`
+on the VM's data disk is needed for the ordinary case. The startup script
+is under `lifecycle.ignore_changes`, so flipping the flag on an existing VM
+takes effect only through a VM recreate (`terraform apply
+-replace=<vm address>`); the Postgres app-state and explicit-secrets
+prerequisites above remain yours to satisfy — on a DuckDB app-state
+instance the app still refuses to boot, naming the missing piece.
+
+(The module-level `extraction_producer_command` variable, from the retired
+external-producer design, is still accepted for tfvars compatibility but is
+no longer read — see its `variables.tf` description.)
 
 If any SharePoint scope is anonymize-marked, provision the per-instance
 pseudonym key **before the first run** — generation, `runtime_secret_env`

@@ -143,8 +143,11 @@ writes are audited like any other.
 
 Collections are private to their creator by default — without a grant, only
 the owner (and admins, via god-mode) can see an upload, in every surface at
-once: the Library, the chat agent's `collections_*`/`knowledge_search` tools,
-and the `agnes pull` knowledge artifacts. An instance whose expectation is
+once: the Library (both `/library`'s index and each collection's own
+`/library/{slug}` page — an admin-only-visible row on the index carries a
+"Not shared with you" note, so an admin can tell it apart from an ordinary
+grant at a glance), the chat agent's `collections_*`/`knowledge_search`
+tools, and the `agnes pull` knowledge artifacts. An instance whose expectation is
 "what an admin uploads is for the whole workspace" can opt into
 `library.auto_share_admin_uploads: true` (env
 `AGNES_LIBRARY_AUTO_SHARE_ADMIN_UPLOADS`; default false): a collection an
@@ -152,7 +155,7 @@ admin creates via the Library/API is then granted to `Everyone` at creation.
 The grant is an ordinary `resource_grants` row — visible in `/admin/access`
 and revocable per collection in the Share dialog. Scope is deliberately
 narrow: non-admin uploads stay private, and chat file drops (which create
-private one-file artefacts through a separate path) are never auto-shared.
+private one-file artifacts through a separate path) are never auto-shared.
 
 ---
 
@@ -278,11 +281,56 @@ No DB migration, no startup hook, no second wiring step in `access-overview` —
 Members are added to groups by four sources, distinguished by the `source` column:
 
 - **`google_sync`** — written by the OAuth callback on every login. The previous Google-sync set is wholesale replaced (DELETE + INSERT) so a removed Workspace membership disappears immediately.
-- **`microsoft_sync`** — same DELETE + INSERT mechanism, driven by Microsoft Graph `GET /me/memberOf` instead of the Workspace Admin SDK. Config-gated and off by default; see [`auth-microsoft-oauth.md`](auth-microsoft-oauth.md#entra-group-sync-off-by-default).
+- **`microsoft_sync`** — same DELETE + INSERT mechanism, driven by Microsoft Graph `GET /me/transitiveMemberOf/microsoft.graph.group` instead of the Workspace Admin SDK. Groups are keyed `entra:<object-id>` — the SAME key the SharePoint ACL mirror uses for the same Entra group (`src.entra_identity.entra_group_name`) — and read-only through `/admin/access` (`409 microsoft_managed_readonly`). Config-gated and off by default; see [`auth-microsoft-oauth.md`](auth-microsoft-oauth.md#entra-group-sync-off-by-default).
 - **`admin`** — written by admin actions in the UI (`/admin/groups/{id}` → Members), CLI (`agnes admin group add-member …`), or REST (`POST /api/admin/groups/{id}/members`). Survives either sync. Admin can only delete admin-source rows.
 - **`system_seed`** — written at deploy time (the `SEED_ADMIN_EMAIL` → Admin-group binding) **and** at every new-user creation (the Everyone auto-grant, issue #748 — every creation path: OAuth first sign-in (any provider), `POST /auth/bootstrap`, admin `POST /api/users`, marketplace import stubs — unless `AGNES_GROUP_EVERYONE_EMAIL` maps Everyone to a Workspace group instead, in which case Everyone comes exclusively from `google_sync`). The Everyone grant fires once, at creation time, and is never re-asserted afterward — an admin who later removes a user from Everyone stays removed on their next login/boot.
 
 Removing a user from a group via the admin path (UI/CLI/REST) only deletes admin-source rows. To revoke a synced membership, the operator must change the upstream directory group instead (Workspace or Entra ID) — Agnes will pick up the change on the user's next login.
+
+---
+
+## SharePoint ACL mirroring
+
+A `sharepoint` connection's mirrored scopes (`access_mode='mirrored'`, spec
+2026-08-28-sharepoint-acl-mirroring-design.md) grant a collection's
+`resource_grants` from the source's own Graph `permission` list — the same
+primitive every other grant uses, written and reconciled by the
+`sharepoint-acl-sync` job (`connectors/sharepoint/acl_sync.py`, sentinel
+`created_by='system:sharepoint-acl-sync'`, groups keyed `entra:<oid>` /
+`sp-direct:<scope>`). `classify_permissions` decides, per Graph grantee,
+whether it is **honored** (mirrored into an Agnes group) or **unhonored**
+(counted, never granted — fail-closed):
+
+| Grantee | Honored? | Notes |
+|---|---|---|
+| Entra security/M365 group | yes | Transitive membership (`transitiveMembers`), keyed `entra:<object-id>` — the SAME key the Microsoft login-time group sync uses for the same group (`src.entra_identity.entra_group_name`), so the two writers converge on one row. |
+| Direct user role assignment | yes | Resolvable `email`/`mail`/`userPrincipalName`, matched case-insensitively. |
+| `siteUser` | yes, if resolvable | `email`/`mail`, or the claims `loginName`'s trailing segment (`i:0#.f\|membership\|user@example.com`) when they're absent. A Windows-claims login name (`i:0#.w\|domain\user`) has no email and stays unhonored (`kind: "site_user_no_email"`). |
+| SharePoint site group (Owners/Members/Visitors, custom) | only if mapped | Not enumerable through the app-only Graph surface the connector uses. `config.acl_site_group_map` (`{"<displayName>": [agnes_group_id, ...]}`) grants the mapped Agnes group(s) directly — their OWN membership is never read from Graph, so keeping it in sync with the real site group stays the admin's job. `PATCH …/connections/{id}/acl-site-group-map` (`agnes admin sharepoint acl map-site-group <id> --site-group "<name>" --group <agnes_group_id> [--unmap]`, read-modify-write so mapping a second site group never clobbers the first), or the source card's **Map site group (ACL)…** action. An unmapped one is `kind: "site_group"` in the run's `unhonored` list. |
+| Sharing link ("specific people" / "people in your org"), anonymous link, external/guest (`#EXT#`), application principal, email-less user | no | Always fail-closed, no mapping mechanism. |
+
+**Roles are not read.** Every honored principal gets read access
+regardless of the Graph role (`read`/`write`/`owner`) the permission
+carries — Agnes is a read-only consumer of SharePoint content, so there is
+no write/owner distinction to mirror.
+
+A collection shared by more than one mirrored scope or permission zone
+(a bulk-add `collection_id` target, or a post-consolidation merge) is
+reconciled ONCE per sync run against the UNION of every scope/zone that
+routes to it — never per-scope, which would let one scope's own reconcile
+pass delete another's grant. `POST …/collections/consolidate` refuses
+(`409 mirrored_scope_in_sources`) to fold away a mirrored scope's own
+collection, since consolidation unions grants onto the target and that
+would silently turn a secure-folder's grant into a whole-site one.
+
+`PATCH …/connections/{id}/scopes/bulk` (`agnes admin sharepoint scope
+set-mode <id> --all|--scope <source_scope_id> --mode manual|mirrored`)
+flips `access_mode` on many already-confirmed scopes in one call — the fast
+path for turning mirroring on across a large site split into hundreds of
+bulk-added scopes; switching a scope to `manual` deletes the sync's own
+sentinel-owned grants for its collection.
+
+Full connector setup: [`sharepoint-extraction.md`](sharepoint-extraction.md).
 
 ---
 
@@ -300,11 +348,32 @@ Accounts and access are two sections:
 A group is one object with two sides — an audience, and a bundle of what that audience can use — so it has one editor. `/admin/access` is a two-pane workspace:
 
 - **Left** — every group, with its origin (system / custom / Google-synced), member count and grant count. Search matches name, description and Workspace address. `+ New group` opens the create drawer and selects the result here.
-- **Right** — the selected group. Its header carries the name, the Workspace address it is really stored under, the origin pill, the description, the created date, and **Rename** / **Delete** (hidden for system and Google-synced rows, which the API refuses to change).
+- **Right** — the selected group. Its header carries the name, the Workspace address it is really stored under, the origin pill, the description, the created date, and **Rename** / **Delete** (hidden for system rows and any sync-managed row — Google, Microsoft, or SharePoint ACL mirroring — which the API refuses to change, each with its own `409 …_managed_readonly` code).
   - **Who it reaches** — a member count stated as its consequence, avatars, and one search box that both adds someone and answers "is Maria in this group?". **Show all N** expands the full roster with each member's source (`added by admin` / `synced from Google` / `system-managed`) and a Remove button on admin-added rows only.
   - **What it can use** — the grant matrix, by resource type, with a filter matching name, `resource_id`, block, category and description. Backed by `/api/admin/access-overview` + `/api/admin/grants`.
 
 The second lens, **Simulate a person** (`/admin/access?lens=simulate`), walks one person's membership → grant → tier and names what is *not* shared with them.
+
+#### View a page as them (read-only)
+
+The Simulate lens explains a person's access; **View a page as them →** shows
+it. It opens Agnes with that person's effective access for the rest of the
+browser session — their Library, their catalog, their empty states — behind a
+persistent banner that names them and carries the exit button.
+
+It is a *view*, never a "become user". The rules, and where they live:
+
+| Rule | Where it is enforced |
+|---|---|
+| Entering requires an admin, an interactive browser session, and a `web_csrf` double-submit token on a POST | `POST /admin/view-as` (`app/web/router.py`) |
+| Every non-GET/HEAD request is refused with a typed `view_as_read_only` 403, WebSocket handshakes included — by method, never a route list | `app/middleware/view_as_readonly.py` |
+| The Admin god-mode short-circuit is suppressed for the viewed identity, so authority is that person's **explicit grants** and viewing as another admin confers nothing | `app.auth.access.is_user_admin` + `app.auth.elevation.elevation_paused` |
+| The ticket carries no authority, is signed and expires (30 min), dies with the browser session, and is bound to the admin who minted it | `app/auth/view_as.py` |
+| Entry and exit are audited (`view_as.start` / `view_as.end`), and every row written while viewing is attributed to the **viewer** with `params.viewed_as` naming the target | `src/audit_context.py::apply_view_as_attribution` |
+
+Deliberately browser-only: there is no CLI command and no MCP tool for it.
+Leaving is `POST /admin/view-as/exit` (the banner's button) — the one
+non-GET the read-only guard lets through, and all it does is clear the cookie.
 
 Retired URLs, all 308 onto the workspace: `/admin/grants` and `/admin/groups` → `/admin/access`; `/admin/groups/{id}` → `/admin/access?group=<id>` (unknown ids still 404). `/admin/tables`' per-row *Manage access* arrives as `/admin/access?resource=<type>:<id>`, which pre-filters the grant tree; the older `#table:<id>` fragment is rewritten to it.
 
@@ -379,6 +448,69 @@ prompting from the unattended SessionStart hook. Renewal is just
 
 No server change was needed for this: no new grant type, no PAT default
 TTL change. See [`docs/HEADLESS_USAGE.md`](./HEADLESS_USAGE.md#renewal-interactive-analysts).
+
+---
+
+## Service accounts
+
+A service account (issue #1534) is a `users` row flagged `kind='service'`
+(PG-only — `users.kind`, A3 ratchet) rather than a bespoke table: a headless
+caller (CI, an integration, a bot) that holds its OWN group grants and mints
+its OWN independently-revocable PATs. It is deliberately NOT a template for
+"give a machine admin" — the internal `scheduler@system.local` identity
+(`app/auth/scheduler_token.py`) predates this feature and stays a
+special-cased, Admin-group, shared-secret-authenticated exception; a service
+account is the opposite shape: scoped, admin-provisioned, and structurally
+incapable of reaching Admin.
+
+Admin-only, under `POST/GET /api/admin/service-accounts*`
+(`agnes admin service-account create|list|token|deactivate|activate|
+revoke-token`, or the "Service accounts" section on `/admin/users`):
+
+- **Create** — a display name + slug; the row gets a synthetic
+  `<slug>@service.local` address, `active=true`, and is never added to the
+  Admin group.
+- **Mint a token** — session-token-only (mirrors `POST /auth/tokens`): a
+  PAT-authenticated admin gets a typed 403, preserving the rule that durable
+  credentials are only ever minted from an interactive session. The minted
+  PAT authenticates on REST/CLI/MCP exactly like a human's, scoped by
+  whatever groups the service account itself belongs to.
+- **Deactivate / activate** — the identical `users.active` flip a human
+  account gets; `resolve_token_to_user`'s existing `active` check then kills
+  every one of its PATs with zero new code. Deactivating an unrelated human
+  has no effect on a service account's own tokens, and vice versa.
+- **Revoke a token** — the existing `DELETE /auth/admin/tokens/{token_id}`
+  (admin-on-behalf already works there).
+
+Three guards make the identity structurally safe, each enforced at a single
+shared choke point rather than copied per call site:
+
+1. **No interactive session.** `app.auth.jwt.create_access_token` — the one
+   function every login provider (Google, Microsoft, password, email
+   magic-link, Keboola, SSO, the legacy `/auth/token` endpoint, MCP-OAuth's
+   exchange/refresh) calls to mint the credential a completed login hands
+   back — refuses a `typ="session"` mint for a `kind='service'` row
+   (`ServiceAccountInteractiveLoginError` -> 403). Password reset and
+   setup-request initiation treat it exactly like "no such account" (same
+   anti-enumeration response, no token minted).
+2. **No Admin group.** `UserGroupMembers(Pg)Repository.add_member` refuses
+   (`ServiceAccountAdminGroupForbidden` -> 409
+   `service_account_admin_forbidden`) when the target group is the system
+   Admin group and the user is `kind='service'` — one check inside
+   `add_member` itself covers every one of its ~8 call sites (admin UI/CLI/
+   REST, directory-sync provisioning, the scheduler/bootstrap seeds). It
+   stays freely addable to any ordinary group — scoped grants are the point.
+3. **Visible where grants are managed, absent from human-only pickers.**
+   `GET /api/users` (`search_recent`) is BOTH the `/admin/users` listing AND
+   the only "add someone to a group" picker in the product
+   (`group_drawer.js`, `admin_access.html`'s member-add search) — it
+   deliberately INCLUDES service accounts on both, since granting one a
+   scoped membership is the entire point of the feature.
+
+DuckDB has no `kind` column at all (frozen post-A3 schema): every admin
+service-account endpoint answers a typed `501 requires_postgres_backend`
+there, and guards 1–2 are provable no-ops (a service account cannot exist to
+be refused).
 
 ---
 

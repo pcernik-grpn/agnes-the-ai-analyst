@@ -186,6 +186,36 @@ class TestGetServerConfigAPI:
         assert data["sections"]["email"]["smtp_host"] == "smtp.example.com"
         assert data["sections"]["auth"]["allowed_domain"] == "example.com"
 
+    def test_get_does_not_mask_the_chat_token_budget(self, seeded_app, monkeypatch, tmp_path):
+        """`chat.max_session_tokens` matches the "token" redactor substring by
+        naming coincidence. Masked, GET hands the panel `***` for a
+        `type=number` input, the browser shows it empty, and the next "Save
+        section" posts `null` — silently resetting the operator's budget to
+        the default. The registry declares it numeric, and a number is never
+        a credential, so the value must pass through verbatim — alongside the
+        spend cap, which the same card must show as a float field."""
+        monkeypatch.setenv("DATA_DIR", str(tmp_path))
+        state = tmp_path / "state"
+        state.mkdir(parents=True, exist_ok=True)
+        (state / "instance.yaml").write_text(
+            yaml.dump({"chat": {"max_session_tokens": 123456, "daily_anthropic_spend_usd": 100.0}})
+        )
+        import app.instance_config as ic
+
+        ic._instance_config = None
+
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        resp = c.get("/api/admin/server-config", headers=_auth(token))
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["sections"]["chat"]["max_session_tokens"] == 123456
+        assert data["sections"]["chat"]["daily_anthropic_spend_usd"] == 100.0
+        known = data["known_fields"]["chat"]
+        assert known["max_session_tokens"]["kind"] == "int"
+        assert known["daily_anthropic_spend_usd"]["kind"] == "float"
+        assert known["rate_messages_per_hour"]["kind"] == "int"
+
     def test_get_redacts_the_snowflake_credential_env_NAMES(self, seeded_app, monkeypatch, tmp_path):
         """`token_env` / `private_key_env` hold env-var NAMES, not values, but
         `_is_secret_key` matches them on "token"/"private" and `_redact` masks
@@ -1343,3 +1373,50 @@ class TestSectionMetadataHasNoPhantomSections:
             f"SECTION_GROUPS lists sections the API no longer accepts: {phantom}. "
             "Remove them from admin_server_config.html together with the server-side section."
         )
+
+
+def test_a_masked_name_is_never_also_declared_unmaskable_elsewhere():
+    """`_is_secret_key` carves booleans and numbers out of masking by LEAF
+    name, matched globally rather than per section.
+
+    That is fine today — the only carve-out a secret pattern would otherwise
+    catch is `max_session_tokens`, which carries "token" by naming
+    coincidence. It stops being fine the moment two sections share a leaf
+    name where one is a declared number or boolean and the other holds a
+    credential: the credential is then unmasked everywhere, silently, because
+    of a declaration made somewhere else entirely.
+
+    Cheap to prevent, invisible to find afterwards — the value would simply
+    start appearing in `GET /server-config`, the audit diff and
+    `agnes admin config export`.
+    """
+    from app.api.admin import (
+        _KNOWN_FIELDS,
+        _declared_boolean_fields,
+        _declared_numeric_fields,
+    )
+
+    unmaskable = _declared_numeric_fields() | _declared_boolean_fields()
+
+    def walk(fields: dict):
+        for name, spec in fields.items():
+            yield name, spec.get("kind")
+            if spec.get("kind") == "object" and isinstance(spec.get("fields"), dict):
+                yield from walk(spec["fields"])
+
+    declared: dict = {}
+    for section, fields in _KNOWN_FIELDS.items():
+        for name, kind in walk(fields):
+            declared.setdefault(name, set()).add((section, kind))
+
+    conflicts = {
+        name: sorted(where)
+        for name, where in declared.items()
+        if name in unmaskable and any(kind not in ("int", "float", "bool") for _s, kind in where)
+    }
+    assert not conflicts, (
+        "these leaf names are declared as a number/boolean in one section and as "
+        "something else in another, so the numeric/boolean carve-out in "
+        f"_is_secret_key unmasks BOTH: {conflicts}. Rename one, or make the "
+        "carve-out section-aware."
+    )

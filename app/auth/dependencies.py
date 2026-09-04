@@ -236,7 +236,7 @@ def _stash_chat_session_id_from_token(request: Optional[Request], token: str) ->
 def _stash_user(request: Optional[Request], user: dict) -> dict:
     """Park the resolved user on ``request.state.user``.
 
-    Read by response-phase middleware (e.g. the PostHog snippet injector
+    Read by response-phase middleware (e.g. the unhandled-exception handler
     and the 500 handler) so they can identify the actor without re-running
     the auth dependency. Tolerant of ``None`` requests (background paths
     that call this helper from non-HTTP contexts).
@@ -304,12 +304,28 @@ def get_current_user(
     if is_local_dev_mode():
         user = _get_local_dev_user(conn)
         if user:
+            # The same principal swap the cookie path performs below, for the
+            # same reason. Dev mode authenticates from configuration rather
+            # than from a session cookie, so this branch returns before the
+            # one down there — and without the swap here the mode engages by
+            # HALVES: the banner renders and the read-only guard refuses
+            # writes (both read the ticket directly), while every
+            # authorization read still answers for the admin. A page that
+            # says "Viewing as X — read-only" while `is_admin` is still true
+            # is worse than the mode not working, because it looks like it
+            # does. Gated identically to the cookie path: `_maybe_view_as`
+            # returns None unless the ticket is in force for this exact
+            # caller, so nothing changes when no ticket is active.
+            user = _maybe_view_as(user, conn) or user
             _attach_admin_flag(user, conn)
             return _stash_user(request, user)
         # Fall through to normal auth if seed missing — surfaces the bug
         # instead of hiding it.
 
     token = None
+    # Whether the credential came from the browser session cookie. Read-only
+    # view-as engages for THAT credential only — see _maybe_view_as.
+    token_from_cookie = False
 
     # Try Authorization header first
     if authorization and authorization.startswith("Bearer "):
@@ -318,6 +334,7 @@ def get_current_user(
     # Fallback to cookie (for web UI after OAuth redirect)
     if not token and request:
         token = request.cookies.get("access_token")
+        token_from_cookie = bool(token)
 
     if not token:
         # X-StorageApi-Token is consulted ONLY when no bearer credential and
@@ -363,22 +380,6 @@ def get_current_user(
             detail="Scheduler user not provisioned",
         )
 
-    # Producer-scoped callback credential (corpus-extraction): resolves to
-    # a RESTRICTED ProducerPrincipal, never a real user. Checked before
-    # pat_resolver for the same reason as the scheduler check above — this
-    # typ has no `sub` naming a real user row. May raise 403 itself (see
-    # docstring) when the token is genuinely a producer JWT but this
-    # request is off its fixed allowed surface — that must not fall
-    # through to pat_resolver's 401 chain.
-    from app.auth.producer_token import resolve_producer_principal
-
-    producer_principal = resolve_producer_principal(token, request)
-    if producer_principal is not None:
-        from src.audit_context import set_client_kind
-
-        set_client_kind("producer")
-        return producer_principal
-
     from app.auth.pat_resolver import resolve_token_to_user
     from app.auth.session_principal import PRINCIPAL_TYPES
 
@@ -397,6 +398,13 @@ def get_current_user(
         _stash_chat_session_id_from_token(request, token)
         return user
     if user:
+        if token_from_cookie:
+            # Read-only view-as: swap the principal for the target's own user
+            # row BEFORE the admin flag is computed, so every downstream
+            # authorization read keys off the target and nothing keeps the
+            # viewer's authority. Returns None (no swap) unless the mode is
+            # genuinely in force for this exact caller.
+            user = _maybe_view_as(user, conn) or user
         _attach_admin_flag(user, conn)
         # Propagate token kind so audit helpers can tag client_kind correctly.
         payload = verify_token(token) or {}
@@ -410,6 +418,53 @@ def get_current_user(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail=auth_detail_for_reason(reason),
     )
+
+
+def _maybe_view_as(user: dict, conn: duckdb.DuckDBPyConnection) -> Optional[dict]:
+    """The TARGET's user row when this request is a live read-only view-as,
+    else ``None`` (the caller keeps their own identity).
+
+    Four conditions, all re-evaluated on EVERY request — the ticket carries no
+    authority of its own (``app/auth/view_as.py``), exactly like an
+    ``AgentPrincipal``'s intersection is rebuilt per request rather than baked
+    into its token:
+
+    1. a ticket is in force (stamped by ``ViewAsReadOnlyMiddleware``, which has
+       already verified its signature, its age, and that it was minted for
+       whoever this request's session cookie names);
+    2. the caller IS that viewer — belt and braces over (1), because this is
+       the layer that actually swaps an identity;
+    3. the viewer is STILL an admin — demote them and the mode stops applying
+       on the next request, with no stale-replay window;
+    4. the target still exists and is active.
+
+    Any miss returns ``None``, which is a fail-closed answer in both
+    directions: the caller stays themselves (never impersonating) and the
+    read-only guard stays engaged until they exit (never silently regaining
+    write access under a banner that still says otherwise).
+
+    The returned dict is the target's LIVE row, never anything from the
+    ticket — so group membership, deactivation, and grants are all read fresh.
+    """
+    from app.auth.view_as import active_ticket
+
+    ticket = active_ticket()
+    if ticket is None:
+        return None
+    if str(user.get("id") or "") != ticket.viewer_user_id:
+        return None
+
+    from app.auth.access import is_user_admin
+
+    if not is_user_admin(ticket.viewer_user_id, conn):
+        return None
+
+    from src.repositories import users_repo
+
+    target = users_repo().get_by_id(ticket.target_user_id)
+    if not target or not bool(target.get("active", True)):
+        return None
+    return target
 
 
 def _attach_admin_flag(user: dict, conn: duckdb.DuckDBPyConnection) -> None:

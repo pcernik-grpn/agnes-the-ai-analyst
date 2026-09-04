@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import duckdb
@@ -26,8 +27,10 @@ from services.verification_detector.duplicates import (
 )
 from services.verification_detector.detector import (
     _generate_id,
+    _load_active_policy,
     extract_verifications,
 )
+from src.memory_detection_logging import record_detection_run
 
 from src.repositories import (
     knowledge_repo,
@@ -78,6 +81,24 @@ class VerificationProcessor:
         conn: duckdb.DuckDBPyConnection,
         **kwargs: object,
     ) -> ProcessorResult:
+        # Read corporate_memory.sources.session_transcripts.* fresh on every
+        # call (not cached at import/construction time) — same live-read
+        # contract as resolve_distribution_mode() / the collector's own
+        # governance_config lookup, so a save in /admin/server-config takes
+        # effect on the next scheduler tick, no restart required (#1957).
+        from app.instance_config import get_corporate_memory_config
+
+        cm_config = get_corporate_memory_config() or {}
+        session_transcripts_config = (cm_config.get("sources") or {}).get("session_transcripts") or {}
+
+        if session_transcripts_config.get("enabled", True) is False:
+            logger.info(
+                "Session-transcript extraction disabled via "
+                "corporate_memory.sources.session_transcripts.enabled — skipping %s",
+                session_key,
+            )
+            return ProcessorResult(items_count=0)
+
         repo = knowledge_repo()
         session_id = f"session-{session_path.stem}-{username}"
 
@@ -86,9 +107,66 @@ class VerificationProcessor:
             logger.info("Empty session: %s", session_key)
             return ProcessorResult(items_count=0)
 
-        verifications = extract_verifications(self.extractor, username, session_id, turns)
+        # issue #1971 Part 3: one memory_detection_runs row per session scan
+        # (never per-tick — a tick may scan zero-to-many sessions, and a
+        # per-session row is what lets an admin correlate a policy edit with
+        # the exact session it changed behavior on). run_started_at is
+        # captured here, not at the top of the method, so the disabled- and
+        # empty-session early returns above never log a run: no LLM call was
+        # made, so there is nothing to report.
+        run_started_at = datetime.now(timezone.utc)
+        # Same live policy lookup extract_verifications() makes internally —
+        # called again here (not plumbed through as a parameter) purely for
+        # the run-log's policy_fingerprint, so extract_verifications' public
+        # signature is untouched. Cheap: one repo lookup, once per session
+        # scan, not a hot path.
+        policy_text_for_fingerprint = _load_active_policy()
+
+        # issue #1971 Part 6: corporate_memory.sources.session_transcripts.
+        # max_turns_per_session was documented but never read — the
+        # truncation window stayed pinned to extract_verifications' own
+        # hardcoded default regardless of what an operator set here.
+        # Invalid/non-positive values fall back to that default rather than
+        # disabling truncation or raising.
+        configured_max_turns = session_transcripts_config.get("max_turns_per_session")
+        max_turns_kwargs = {}
+        if isinstance(configured_max_turns, int) and configured_max_turns > 0:
+            max_turns_kwargs["max_turns"] = configured_max_turns
+
+        verifications = extract_verifications(self.extractor, username, session_id, turns, **max_turns_kwargs)
+        items_proposed = len(verifications)
+        items_filtered = 0
+
+        # Deterministic post-filter on corporate_memory.sources.
+        # session_transcripts.detection_types, BEFORE dedup/insert below.
+        # Absent key (legacy/no corporate_memory config, or the section
+        # exists but doesn't set this key) keeps every detection_type the
+        # LLM can return — behavior is unchanged from before this knob was
+        # wired. An explicit empty list is a valid, if unusual, way to
+        # block every detection type without disabling the source outright.
+        allowed_detection_types = session_transcripts_config.get("detection_types")
+        if allowed_detection_types is not None:
+            allowed_set = set(allowed_detection_types)
+            before_count = len(verifications)
+            verifications = [v for v in verifications if v.get("detection_type") in allowed_set]
+            dropped_count = before_count - len(verifications)
+            items_filtered += dropped_count
+            if dropped_count:
+                logger.info(
+                    "detection_types filter dropped %d/%d extracted verification(s) for %s (allowed=%s)",
+                    dropped_count,
+                    before_count,
+                    session_key,
+                    sorted(allowed_set),
+                )
 
         items_created = 0
+        items_routed_side_domain = 0
+        # issue #1971 Part 5 — hoisted out of the loop below (it's the same
+        # value every iteration; `import` is cheap once cached, but there is
+        # no reason to re-resolve it per verification item).
+        from src.db import ENGAGEMENT_SCOPED_DOMAIN_SLUG
+
         loop_start = time.monotonic()
         for idx, v in enumerate(verifications):
             if time.monotonic() - loop_start > _TIME_BUDGET_SECONDS:
@@ -101,6 +179,18 @@ class VerificationProcessor:
                     idx,
                     len(verifications),
                     items_created,
+                )
+                record_detection_run(
+                    source="session_transcripts",
+                    started_at=run_started_at,
+                    finished_at=datetime.now(timezone.utc),
+                    sessions_scanned=1,
+                    items_proposed=items_proposed,
+                    items_filtered=items_filtered,
+                    items_inserted=items_created,
+                    items_routed_side_domain=items_routed_side_domain,
+                    policy_text=policy_text_for_fingerprint,
+                    error=f"time budget exceeded on {session_key} after {idx}/{len(verifications)} items",
                 )
                 raise TimeBudgetExceeded(
                     f"time budget exceeded on {session_key} after {idx}/{len(verifications)} items"
@@ -200,9 +290,10 @@ class VerificationProcessor:
                 )
                 continue
 
-            # Confidence is computed in code from (source_type, detection_type).
-            # The LLM is not trusted to set its own credibility — see Q3 in
-            # docs/archive/pd-ps-comments.md and the ADR.
+            # Confidence is computed in code from (source_type, detection_type),
+            # UNAFFECTED by scope — the LLM is not trusted to set its own
+            # credibility (Q3, docs/archive/pd-ps-comments.md) and routing is
+            # an orthogonal, separately-deterministic decision (below).
             detection_type = v.get("detection_type")
             try:
                 confidence_value = compute_confidence("user_verification", detection_type)
@@ -210,6 +301,21 @@ class VerificationProcessor:
                 # Unknown detection_type from the LLM; fall back to a
                 # lookup-keyed default rather than the LLM-supplied value.
                 confidence_value = compute_confidence("user_verification", "confirmation")
+
+            # issue #1971 Part 5: `scope` is a MODEL-PROPOSED label; the
+            # ROUTING it drives is deterministic code, never the model. An
+            # "engagement" item is still created (route, never drop) — it
+            # just lands in the dedicated engagement-scoped memory domain
+            # instead of whichever topic domain (finance/engineering/…) the
+            # model reported, so it never mixes into the general pool a
+            # domain grant (or the default per-domain bundle/manifest) would
+            # otherwise surface it through.
+
+            domain_slug = v.get("domain")
+            if v.get("scope") == "engagement":
+                domain_slug = ENGAGEMENT_SCOPED_DOMAIN_SLUG
+                items_routed_side_domain += 1
+
             repo.create(
                 id=item_id,
                 title=v["title"],
@@ -219,7 +325,7 @@ class VerificationProcessor:
                 tags=v.get("entities", []),
                 status="pending",
                 confidence=confidence_value,
-                domain=v.get("domain"),
+                domain=domain_slug,
                 entities=v.get("entities"),
                 source_type="user_verification",
                 source_ref=session_id,
@@ -272,6 +378,17 @@ class VerificationProcessor:
             len(verifications),
             items_created,
         )
+        record_detection_run(
+            source="session_transcripts",
+            started_at=run_started_at,
+            finished_at=datetime.now(timezone.utc),
+            sessions_scanned=1,
+            items_proposed=items_proposed,
+            items_filtered=items_filtered,
+            items_inserted=items_created,
+            items_routed_side_domain=items_routed_side_domain,
+            policy_text=policy_text_for_fingerprint,
+        )
         return ProcessorResult(items_count=items_created)
 
 
@@ -291,8 +408,149 @@ def build_verification_processor() -> VerificationProcessor:
         except (ValueError, FileNotFoundError):
             config = {}
         ai_config = config.get("ai") if config else None
+        # issue #1971 Part 6: corporate_memory.extraction.model was
+        # documented but never read on this path either — mirrors the
+        # collector's own override (services/corporate_memory/collector.py)
+        # and the extraction.facts.model precedent. A copy, never a
+        # mutation of the caller's own ai_config dict.
+        model_override = (
+            ((config.get("corporate_memory") or {}).get("extraction") or {}).get("model") if config else None
+        )
+        if model_override and ai_config:
+            ai_config = {**ai_config, "model": model_override}
     except Exception:
         ai_config = None
 
     extractor = create_extractor_from_env_or_config(ai_config)
     return VerificationProcessor(extractor=extractor)
+
+
+def dry_run_verification_detection(
+    extractor: StructuredExtractor,
+    *,
+    limit: int = 5,
+    session_data_dir: "Path | None" = None,
+) -> dict:
+    """Preview what the transcript detector WOULD do with the CURRENT saved
+    policy, over up to ``limit`` currently-queued sessions (issue #1971 Part
+    4, the body behind ``POST /api/memory/admin/detection-dry-run``).
+    Writes NOTHING to ``knowledge_items``/``verification_evidence`` — records
+    only a ``memory_detection_runs`` row (``dry_run=True``).
+
+    "Currently queued" = the same candidate set
+    ``services.session_pipeline.runner.run_processor`` would pick up on its
+    next tick (``session_processor_state_repo().scan_unprocessed_for(...)``)
+    — a preview of the NEXT real run, not an arbitrary "last N files on
+    disk" that might re-show sessions already processed.
+
+    Deliberately narrower than the real write path in
+    :meth:`VerificationProcessor.process_session`: no duplicate/fuzzy-
+    duplicate resolution and no contradiction detection run (both either
+    write rows or spend an extra LLM call, and both are refinement on top of
+    "would this land in the queue", not core to it) — so
+    ``items_would_insert`` is an UPPER BOUND (assumes no item collides with
+    one already in the review queue), not a guaranteed exact count.
+
+    ``session_data_dir`` mirrors ``run_processor``'s own parameter; when
+    omitted, ``SESSION_DATA_DIR`` is read fresh from the environment at call
+    time (not the runner module's import-time-bound constant), matching the
+    live-config-read convention ``process_session`` itself already uses.
+    """
+    import os
+
+    from app.instance_config import get_corporate_memory_config
+    from services.session_pipeline.runner import resolve_user_identity
+    from src.repositories import session_processor_state_repo
+
+    effective_dir = (
+        session_data_dir
+        if session_data_dir is not None
+        else Path(os.environ.get("SESSION_DATA_DIR", "/data/user_sessions"))
+    )
+    limit = max(1, min(int(limit or 5), 20))
+    run_started_at = datetime.now(timezone.utc)
+    policy_text = _load_active_policy()
+
+    cm_config = get_corporate_memory_config() or {}
+    session_transcripts_config = (cm_config.get("sources") or {}).get("session_transcripts") or {}
+
+    result: dict = {
+        "sessions_scanned": 0,
+        "items_proposed": 0,
+        "items_filtered": 0,
+        "items_would_insert": 0,
+        "items_routed_side_domain": 0,
+        "proposals": [],
+        "disabled": False,
+    }
+
+    if session_transcripts_config.get("enabled", True) is False:
+        result["disabled"] = True
+        record_detection_run(
+            source="session_transcripts",
+            started_at=run_started_at,
+            finished_at=datetime.now(timezone.utc),
+            dry_run=True,
+            policy_text=policy_text,
+        )
+        return result
+
+    allowed_detection_types = session_transcripts_config.get("detection_types")
+    allowed_set = set(allowed_detection_types) if allowed_detection_types is not None else None
+
+    state_repo = session_processor_state_repo()
+    candidates = state_repo.scan_unprocessed_for("verification", effective_dir, version=None)[:limit]
+
+    knowledge = knowledge_repo()
+
+    for dir_name, jsonl_path in candidates:
+        turns = parse_jsonl(jsonl_path)
+        if not turns:
+            continue
+        result["sessions_scanned"] += 1
+
+        _uid, email = resolve_user_identity(dir_name)
+        username = email or dir_name
+        session_key = f"{dir_name}/{jsonl_path.name}"
+        session_id = f"session-{jsonl_path.stem}-{username}"
+
+        verifications = extract_verifications(extractor, username, session_id, turns)
+        result["items_proposed"] += len(verifications)
+
+        if allowed_set is not None:
+            before = len(verifications)
+            verifications = [v for v in verifications if v.get("detection_type") in allowed_set]
+            result["items_filtered"] += before - len(verifications)
+
+        for v in verifications:
+            item_id = _generate_id(v.get("title", ""), v.get("content", ""))
+            scope = v.get("scope") or "general"
+            routed = scope == "engagement"
+            if routed:
+                result["items_routed_side_domain"] += 1
+            would_insert = knowledge.get_by_id(item_id) is None
+            if would_insert:
+                result["items_would_insert"] += 1
+            result["proposals"].append(
+                {
+                    "title": v.get("title"),
+                    "detection_type": v.get("detection_type"),
+                    "scope": scope,
+                    "would_insert": would_insert,
+                    "session": session_key,
+                }
+            )
+
+    record_detection_run(
+        source="session_transcripts",
+        started_at=run_started_at,
+        finished_at=datetime.now(timezone.utc),
+        sessions_scanned=result["sessions_scanned"],
+        items_proposed=result["items_proposed"],
+        items_filtered=result["items_filtered"],
+        items_inserted=0,  # dry run — nothing is ever actually inserted
+        items_routed_side_domain=result["items_routed_side_domain"],
+        dry_run=True,
+        policy_text=policy_text,
+    )
+    return result

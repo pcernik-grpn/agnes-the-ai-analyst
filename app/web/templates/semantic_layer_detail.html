@@ -1,28 +1,32 @@
 {% extends "base_page.html" %}
 {% import "macros/_state.html" as state %}
 
-{% block title %}{{ model_name }} — Semantic models — {{ config.INSTANCE_NAME }}{% endblock %}
+{% block title %}{{ model_name }} — Definitions — {{ config.INSTANCE_NAME }}{% endblock %}
 
 {% block head_extra %}
 <style>
+/* Matched to `.apg-back` (admin_page.css), the way-back every other content
+   page renders: it diverged on weight, spacing and hover colour — three
+   near-misses that make one page feel like a different product. Still its own
+   class; renaming it across these pages is a separate sweep. */
 .slb-back {
     display: inline-flex;
     align-items: center;
     gap: 6px;
-    padding: var(--space-6) 0 0;
+    margin: 0 0 10px;
     font-size: 13px;
-    font-weight: 500;
+    font-weight: 600;
     color: var(--ds-text-secondary);
     text-decoration: none;
 }
-.slb-back:hover { color: var(--ds-text-primary); }
+.slb-back:hover { color: var(--ds-primary); }
 
+/* The gap below the toolbar is `.page-toolbar`'s (components.css). */
 .slb-meta {
     display: flex;
     flex-wrap: wrap;
     align-items: center;
     gap: var(--space-3);
-    margin: 0 0 var(--space-5);
 }
 
 .slb-filter {
@@ -41,6 +45,11 @@
     padding: 6px 10px;
 }
 .slb-filter .btn { flex-shrink: 0; }
+/* The no-rows line the live filter shows in place of the table. Matches the
+   shared `nothing_found` panel's voice without pulling the panel in — this is
+   one line under a toolbar, not an empty state for the whole page. */
+.slb-filter-none { margin: 16px 2px; font-size: 13px; color: var(--ds-text-muted); }
+.slb-filter-none[hidden] { display: none; }
 
 .slb-cross-link {
     font-size: 11.5px;
@@ -128,10 +137,13 @@
 {% block body_attrs %}class="page-sheet"{% endblock %}
 
 {% block page_prehead %}
-<a class="slb-back" href="/semantic-layer">&larr; Semantic models</a>
+{# The arrow matches `.apg-back`, the way back every other page draws, and
+   is hidden from screen readers — "left arrow Definitions" is not a
+   label. The list page draws the same mark. #}
+<a class="slb-back" href="/semantic-layer"><span aria-hidden="true">&larr;</span> Definitions</a>
 {% endblock %}
 
-{% set page_hero_eyebrow = "Semantic models" %}
+{# No eyebrow: the back link two lines up already says "← Definitions". #}
 {% set page_hero_title = model_name %}
 {% set page_hero_plain = True %}
 {% set page_hero_subtitle = model_description %}
@@ -141,7 +153,11 @@
     {% if is_imported %}
     <span class="badge">Imported from {{ source_label }}</span>
     {% else %}
-    <span class="badge">Native</span>
+    {# "Native" said nothing to a reader who does not already know the import
+       machinery — it is the badge's own jargon for "nobody imported this". Its
+       opposite says "Imported from X", so the pair reads as a sentence now:
+       where the document came from, in the words a reader already has. #}
+    <span class="badge">Created in Agnes</span>
     {% endif %}
     {% if status == 'invalid' %}
     <span class="badge badge--danger">Invalid</span>
@@ -181,10 +197,17 @@
 </div>
 {% endif %}
 
-<form class="slb-filter" method="get" action="/semantic-layer/{{ slug }}">
+{# A GET form, enhanced to filter as you type. It stays a form on purpose:
+   the server still honours `?q=`, so a deep link, a bookmark and a no-JS
+   client all work exactly as before. What the script adds is that you no
+   longer have to press a button to see the answer — every other search on
+   this platform filters on input, and this one asking for a click was the
+   odd one out. The button is hidden by the script, not removed from the
+   markup: without JS it is the only way to submit. #}
+<form class="slb-filter" method="get" action="/semantic-layer/{{ slug }}" id="slb-filter-form">
     <input type="hidden" name="tab" value="{{ active_tab }}">
     <input type="search" name="q" value="{{ q }}" placeholder="Filter {{ active_tab }}&hellip;" aria-label="Filter {{ active_tab }}">
-    <button type="submit" class="btn btn-secondary btn-sm">Filter</button>
+    <button type="submit" class="btn btn-secondary btn-sm" id="slb-filter-submit">Filter</button>
 </form>
 
 {% if q %}
@@ -330,6 +353,87 @@
 {% endblock %}
 
 {% block scripts %}
+<script>
+// ── Filter as you type ───────────────────────────────────────────────────
+//    The form above is server-side, so this page used to need a button press
+//    to answer — the only search in the app that did. The rows are all here
+//    already, so the answer is too.
+//
+//    Progressive enhancement, not a replacement: the form still submits
+//    without JS, the server still honours `?q=`, and this keeps the URL in
+//    step (replaceState, so typing does not fill history) so a deep link and
+//    the chip below stay truthful.
+(function () {
+    var form = document.getElementById('slb-filter-form');
+    if (!form) return;
+    var box = form.querySelector('input[type="search"]');
+    var submit = document.getElementById('slb-filter-submit');
+    var tab = (form.querySelector('input[name="tab"]') || {}).value || '';
+    // Every tab renders the same `.data-table`, so one selector covers all
+    // five (datasets, metrics, constraints, relationships, glossary).
+    var rows = [].slice.call(document.querySelectorAll('.data-table tbody tr'));
+    if (!box) return;
+    // NOT `|| !rows.length`: bailing on an empty tab left the Filter button
+    // showing there while every other tab had lost it, so the page had two
+    // different search idioms depending on which tab you opened.
+
+    // Hidden, not removed: without JS it is the only way to submit, and this
+    // block is the proof that JS is running.
+    if (submit) submit.hidden = true;
+
+    // The row's own rendered text is the index — every tab on this page has a
+    // different table shape, and its text is what the reader is scanning.
+    rows.forEach(function (r) {
+        r.setAttribute('data-ft', (r.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase());
+    });
+
+    // By CLASS, not by the test id: a guard asserts that id is absent from the
+    // page when no filter is applied, and naming it here would put it in the
+    // HTML via this very script.
+    var chip = document.querySelector('.slb-filter-chip');
+    var chipValue = chip && chip.querySelector('.slb-filter-chip__value');
+    var chipX = chip && chip.querySelector('.slb-filter-chip__x');
+    var table = rows.length ? rows[0].closest('table') : null;
+    var empty = document.createElement('p');
+    empty.className = 'slb-filter-none';
+    empty.hidden = true;
+    (table || form).insertAdjacentElement('afterend', empty);
+
+    function apply() {
+        var q = (box.value || '').trim().toLowerCase();
+        var n = 0;
+        rows.forEach(function (r) {
+            var hit = !q || (r.getAttribute('data-ft') || '').indexOf(q) !== -1;
+            r.hidden = !hit;
+            if (hit) n++;
+        });
+        empty.textContent = 'No ' + tab + ' match \u201c' + box.value.trim() + '\u201d.';
+        // An empty tab already says "No constraints." on its own; a second
+        // line saying nothing matched would be the same news twice.
+        empty.hidden = !!n || !q || !rows.length;
+        if (table) table.hidden = !n;
+        // The chip states the ACTIVE filter, so it must follow the box — left
+        // alone it kept showing whatever the LAST PAGE LOAD filtered on, which
+        // is exactly the stale readout live filtering would otherwise create.
+        if (chip) {
+            chip.hidden = !q;
+            if (chipValue) chipValue.textContent = box.value.trim();
+        }
+        var p = new URLSearchParams();
+        if (tab) p.set('tab', tab);
+        if (box.value.trim()) p.set('q', box.value.trim());
+        history.replaceState(null, '', location.pathname + (p.toString() ? '?' + p : ''));
+    }
+
+    box.addEventListener('input', apply);
+    // Enter would otherwise reload the page to reach a state already on screen.
+    form.addEventListener('submit', function (e) { e.preventDefault(); apply(); });
+    if (chipX) chipX.addEventListener('click', function (e) {
+        e.preventDefault(); box.value = ''; apply(); box.focus();
+    });
+    apply();
+})();
+</script>
 <script>
 (function () {
   // F3: detach/re-attach — minimal danger-flow buttons, no new UI layer.

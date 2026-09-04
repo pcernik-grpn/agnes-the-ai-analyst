@@ -9,6 +9,7 @@ from ``src.db_pg`` and adds it to the ``__all__`` re-export below.
 
 from __future__ import annotations
 
+from src.models.access_policy_revisions import AccessPolicyRevision
 from src.models.agents import (
     Agent,
     AgentArtifact,
@@ -29,7 +30,10 @@ from src.models.connections import ConnectionSecret, SourceConnection
 from src.models.data_apps import DataApp
 from src.models.data_packages import DataPackage, DataPackageTable, DataPackageTool
 from src.models.extraction import ExtractionRun
+from src.models.extraction_conditions import ExtractionCondition
+from src.models.fact_collection_stats import EdgeCollectionMembership, FactCollectionMembership, FactCollectionStats
 from src.models.facts import Claim, Correction, Edge, Fact, FactAlias, FactAliasSource, IngestRun
+from src.models.facts_llm_cache import FactsLlmCache
 from src.models.jobs import Job
 from src.models.knowledge import (
     KnowledgeContradiction,
@@ -43,6 +47,7 @@ from src.models.knowledge import (
     VerificationEvidence,
 )
 from src.models.knowledge_digests import KnowledgeDigest
+from src.models.memory_detection_runs import MemoryDetectionRun
 from src.models.lookup import (
     BqMetadataCache,
     ColumnMetadata,
@@ -82,6 +87,7 @@ from src.models.semantic_coverage import ResourceSourceTag
 from src.models.semantic_feedback import SemanticFeedback
 from src.models.semantic_health_mutes import SemanticHealthMute
 from src.models.share_requests import ShareRequest
+from src.models.sharepoint_state import SharepointConnectionState
 from src.models.sso import SsoConfig, UserExternalIdentity
 from src.models.store import (
     MarketplacePlugin,
@@ -111,6 +117,7 @@ from src.models.user_journey import UserJourneyState
 from src.models.vault import SystemSecret
 
 __all__ = [
+    "AccessPolicyRevision",
     "Agent",
     "AgentArtifact",
     "AgentMemory",
@@ -137,10 +144,15 @@ __all__ = [
     "DataPackageTable",
     "DataPackageTool",
     "Edge",
+    "EdgeCollectionMembership",
+    "ExtractionCondition",
     "ExtractionRun",
     "Fact",
     "FactAlias",
     "FactAliasSource",
+    "FactCollectionMembership",
+    "FactCollectionStats",
+    "FactsLlmCache",
     "FileCorpus",
     "GlossaryTerm",
     "IdempotencyKey",
@@ -163,6 +175,7 @@ __all__ = [
     "MCPUserSecret",
     "MarketplacePlugin",
     "MarketplaceRegistry",
+    "MemoryDetectionRun",
     "MemoryDomain",
     "MemoryDomainSuggestion",
     "MetricDefinition",
@@ -183,6 +196,7 @@ __all__ = [
     "SemanticModel",
     "SemanticSource",
     "ShareRequest",
+    "SharepointConnectionState",
     "SessionProcessorState",
     "SetupToken",
     "SourceConnection",

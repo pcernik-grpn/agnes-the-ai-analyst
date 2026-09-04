@@ -14,6 +14,8 @@ no Stop control while the crawl has no cancel flag.
 
 from __future__ import annotations
 
+from tests import _ds_page_source
+
 import json
 import re
 import subprocess
@@ -22,6 +24,12 @@ from pathlib import Path
 
 import pytest
 
+from tests._admin_data_sources_source import read_admin_data_sources_source
+
+# Kept for any future caller that needs the template path itself (e.g.
+# existence checks) — content reads go through `read_admin_data_sources_source()`
+# (perf follow-up, 2026-09-03: most of this page's JS moved into extracted
+# static files, see tests/_admin_data_sources_source.py).
 TEMPLATE = Path(__file__).resolve().parents[1] / "app" / "web" / "templates" / "admin_data_sources.html"
 
 
@@ -53,25 +61,44 @@ _SIGNATURES = (
     "function _extTime(iso) {",
     "function _extDuration(seconds) {",
     "function _extNum(n) {",
+    "function _extTruncMiddle(path, max) {",
     "const EXT_DOT = {",
     "function _extDot(outcome) {",
+    "function _extIsFactsPhase(run) {",
+    "function _extPhaseCountText(run) {",
     "function _extRenderCrawlCell(connId, status) {",
+    "function _extScanOcrPausedLine(run) {",
     "function _extRunLine(run) {",
     "const EXT_STOP_REASON_TEXT = {",
     "function _extStopReasonText(reason) {",
     "function _extThrottleLine(run) {",
+    "function _extActivityHtml(activity) {",
+    "function _extErrorsSummaryHtml(connId, runId, errorCount) {",
+    "async function _extLoadErrorDetail(details) {",
+    "function _extErrorItemsHtml(runDetail) {",
+    "function _extFailedOrSkippedItemsHtml(items, truncated, heading) {",
+    "function _extShardCountText(run) {",
+    "function _extShardsHtml(shards) {",
     "function _extRunRowHtml(connId, st) {",
     "function _extConfigRowHtml(connId) {",
     "function _extPanelHtml(tone, title, body, connId, retry) {",
+    "function _extRenderInAgnesButton(connId, status) {",
+    "function _extFactsJobLine(job) {",
+    "function _extFactsPendingLine(status) {",
+    "function _extFactsEta(seconds) {",
+    "function _extFactsThroughputNote(status) {",
+    "function _extRenderFactsButton(connId, status) {",
     "function _extRender(connId) {",
-    "function _extRunsHtml(body) {",
+    "function _extRenderNextRun(connId, status) {",
+    "function _extRunsHtml(connId, body) {",
     "const EXT_ORIGIN_LABEL = {",
     "function _extConfigHtml(body) {",
+    "function _extMaybeFetchOnExpand(connId) {",
 )
 
 
 def _run_js(body: str, *, state: dict | None = None) -> dict:
-    tpl = TEMPLATE.read_text(encoding="utf-8")
+    tpl = _ds_page_source.page_source()
     fns = "\n".join(_extract_block(tpl, sig) for sig in _SIGNATURES)
     script = f"""
 const EXT_MAX_FAILURES = 3;
@@ -81,6 +108,8 @@ const _extState = {json.dumps(state or {})};
 const _elements = {{
   "ext-block-sp1": {{ hidden: true, innerHTML: "" }},
   "ext-crawl-live-sp1": {{ hidden: true, innerHTML: "" }},
+  "ext-inagnes-btn-sp1": {{ dataset: {{ extractionReady: "1" }}, disabled: false, title: "" }},
+  "ext-facts-btn-sp1": {{ dataset: {{ factsReady: "1" }}, disabled: false, title: "" }},
 }};
 const document = {{ getElementById: (id) => _elements[id] }};
 
@@ -137,12 +166,19 @@ class TestCardAnchors:
     be rendered entirely by its own script with no load-order coupling."""
 
     def test_template_carries_the_three_anchors(self):
-        tpl = TEMPLATE.read_text(encoding="utf-8")
+        tpl = _ds_page_source.page_source()
         assert 'id="ext-crawl-live-${row.id}"' in tpl
         assert 'id="ext-block-${row.id}" data-ext-conn="${row.id}"' in tpl
         assert 'id="ext-drawer-${row.id}"' in tpl
 
     def test_page_renders_for_an_admin(self, seeded_app):
+        """The extraction-observability script itself moved into a static,
+        cache-eligible asset (perf follow-up, 2026-09-03) — the HTML response
+        now only references it (`<script src="…data_sources_extraction_
+        observability.js…">`), it does not inline it. This still proves the
+        FULL chain an admin's browser walks: the page loads, and the asset it
+        references actually serves the extraction-observability code —
+        fetched through the SAME client, the way a browser would."""
         c = seeded_app["client"]
         c.cookies.set("access_token", seeded_app["admin_token"])
         try:
@@ -151,12 +187,139 @@ class TestCardAnchors:
             c.cookies.clear()
         assert resp.status_code == 200, resp.text
         body = resp.text
-        assert "ext-block-" in body
-        assert "toggleExtractionDrawer" in body
+        assert "data_sources_page.js" in body
+        assert "data_sources_extraction_observability.js" in body
+
+        # The card markup (incl. the anchor) lives in the page script;
+        # the poll/drawer behavior lives in the extraction-observability
+        # script — both fetched through the SAME client, the way a browser
+        # would, proving the full chain rather than just the reference.
+        page_js = c.get("/static/js/admin/data_sources_page.js")
+        assert page_js.status_code == 200, page_js.text
+        assert "ext-block-" in page_js.text
+
+        ext_js = c.get("/static/js/admin/data_sources_extraction_observability.js")
+        assert ext_js.status_code == 200, ext_js.text
+        assert "toggleExtractionDrawer" in ext_js.text
         # The poll cadence the design fixes (3 s active / 30 s idle) is in the
-        # page, not invented per render.
-        assert "EXT_POLL_ACTIVE_MS = 3000" in body
-        assert "EXT_POLL_IDLE_MS = 30000" in body
+        # shipped asset, not invented per render.
+        assert "EXT_POLL_ACTIVE_MS = 3000" in ext_js.text
+        assert "EXT_POLL_IDLE_MS = 30000" in ext_js.text
+
+
+# --------------------------------------------------------------------------
+# Expanding a card must show its extraction status immediately (2026-09 live
+# walkthrough, design gap 1): the block stayed empty behind "Run extraction
+# now" / "View configuration" until the poll's own idle cadence caught up —
+# up to 30s on a fresh page. `_extMaybeFetchOnExpand` is the poll's own
+# `_extFetchOne` reused (never a second fetch path), and `setSourceOpen` is
+# wrapped so every expand path on the page reaches it with no second
+# listener to keep in sync.
+# --------------------------------------------------------------------------
+
+
+class TestFetchOnExpandDecision:
+    """`_extMaybeFetchOnExpand`'s own guard: fetch once, only for a
+    SharePoint card, only when there is nothing live to show yet."""
+
+    def _run(self, *, cached_state=None):
+        return _run_js(
+            """
+const fetchCalls = [];
+async function _extFetchOne(connId) { fetchCalls.push(connId); }
+_extMaybeFetchOnExpand("sp1");
+console.log(JSON.stringify({ fetchCalls }));
+""",
+            state=_state(**(cached_state or {})),
+        )
+
+    def test_fetches_when_nothing_is_cached_yet(self):
+        out = self._run()
+        assert out["fetchCalls"] == ["sp1"]
+
+    def test_does_not_refetch_once_data_is_already_cached(self):
+        out = self._run(cached_state={"data": _RUNNING})
+        assert out["fetchCalls"] == []
+
+    def test_does_not_fetch_a_501_stopped_connection(self):
+        out = self._run(cached_state={"stopped": True})
+        assert out["fetchCalls"] == []
+
+    def test_a_non_sharepoint_card_with_no_ext_block_anchor_is_left_alone(self):
+        """`ext-block-<id>` only exists on a SharePoint card — a Keboola or
+        BigQuery card's expand must not go looking for extraction status
+        that was never going to exist."""
+        out = _run_js(
+            """
+const fetchCalls = [];
+async function _extFetchOne(connId) { fetchCalls.push(connId); }
+_extMaybeFetchOnExpand("kbc1");
+console.log(JSON.stringify({ fetchCalls }));
+"""
+        )
+        assert out["fetchCalls"] == []
+
+
+class TestSetSourceOpenWiring:
+    """`setSourceOpen` — every expand path on the page (the caret, a click
+    on the head, and every "open this card" helper elsewhere) — is wrapped,
+    not reimplemented, so the immediate fetch reaches all of them."""
+
+    def _run(self, body: str) -> dict:
+        tpl = read_admin_data_sources_source()
+        fns = "\n".join(
+            _extract_block(tpl, sig)
+            for sig in (
+                "function setSourceOpen(id, open) {",
+                'if (typeof setSourceOpen === "function") {',
+            )
+        )
+        script = f"""
+const CSS = {{ escape: (s) => s }};
+const _body = {{ hidden: true }};
+const _caret = {{ setAttribute: () => {{}} }};
+const document = {{
+  getElementById: () => _body,
+  querySelector: () => _caret,
+}};
+const calls = [];
+function _extMaybeFetchOnExpand(id) {{ calls.push(id); }}
+
+{fns}
+
+{body}
+"""
+        with tempfile.NamedTemporaryFile("w", suffix=".mjs", delete=False) as f:
+            f.write(script)
+            path = f.name
+        try:
+            proc = subprocess.run(["node", path], capture_output=True, text=True)
+        finally:
+            Path(path).unlink(missing_ok=True)
+        if proc.returncode == 127:
+            pytest.skip("node unavailable")
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        return json.loads(proc.stdout)
+
+    def test_expanding_calls_the_immediate_fetch_hook(self):
+        out = self._run('setSourceOpen("sp1", true); console.log(JSON.stringify({ calls }));')
+        assert out["calls"] == ["sp1"]
+
+    def test_collapsing_never_calls_it(self):
+        out = self._run('setSourceOpen("sp1", false); console.log(JSON.stringify({ calls }));')
+        assert out["calls"] == []
+
+    def test_the_original_behavior_still_runs(self):
+        """The wrap must not swallow what `setSourceOpen` already did —
+        the body's `hidden` flag and the caret's `aria-expanded` still
+        flip."""
+        out = self._run(
+            """
+setSourceOpen("sp1", true);
+console.log(JSON.stringify({ hidden: _body.hidden }));
+"""
+        )
+        assert out["hidden"] is False
 
 
 class TestRunRow:
@@ -173,6 +336,94 @@ class TestRunRow:
         assert "%" not in html
         assert "left" not in html.lower().replace("<", " ")
 
+    def test_a_scan_ocr_pause_shows_on_a_live_run(self):
+        """TCRD-296 gap #68 — a permanent provider refusal pauses scan OCR
+        for the rest of the run without failing the run itself, so it has
+        no `run.error` of its own; `run.scan_ocr.disabled_reason` is what
+        names it on the card."""
+        paused = json.loads(json.dumps(_RUNNING))
+        paused["running"]["scan_ocr"] = {"disabled_reason": "http_400"}
+        out = _run_js(
+            'console.log(JSON.stringify({html: _extRunRowHtml("sp1", _extState["sp1"])}));',
+            state=_state(data=paused),
+        )
+        html = out["html"]
+        assert "OCR: paused" in html
+        assert "http_400" in html
+
+    def test_no_scan_ocr_pause_note_when_nothing_is_disabled(self):
+        out = _run_js(
+            'console.log(JSON.stringify({html: _extRunRowHtml("sp1", _extState["sp1"])}));',
+            state=_state(data=_RUNNING),
+        )
+        assert "OCR: paused" not in out["html"]
+
+    def test_a_sharded_run_shows_the_shard_count_and_a_per_shard_breakdown(self):
+        """2026-09-03 auto-parallel-crawl design §4.7: a sharded site's Run
+        row names "k/K shards" in its head line and lists each shard —
+        label, outcome, absolute counters, a live (never exact) expected
+        count, and any error — never a fraction or percentage."""
+        sharded = json.loads(json.dumps(_RUNNING))
+        sharded["running"]["mode"] = "sharded"
+        sharded["running"]["shards_total"] = 3
+        sharded["running"]["shards_done"] = 1
+        sharded["running"]["shards"] = [
+            {
+                "index": 1,
+                "label": "part 1/3",
+                "outcome": "done",
+                "files_done": 400,
+                "files_seen": 400,
+                "expected": 400,
+                "checkpoint_at": "2026-08-31T14:08:00+00:00",
+                "error": None,
+                "stuck": False,
+            },
+            {
+                "index": 2,
+                "label": "part 2/3",
+                "outcome": "failed",
+                "files_done": 12,
+                "files_seen": 20,
+                "expected": None,
+                "checkpoint_at": "2026-08-31T14:07:00+00:00",
+                "error": "CrawlError: boom",
+                "stuck": False,
+            },
+            {
+                "index": 3,
+                "label": "remainder",
+                "outcome": "stalled",
+                "files_done": 0,
+                "files_seen": 0,
+                "expected": 0,
+                "checkpoint_at": "2026-08-31T13:00:00+00:00",
+                "error": None,
+                "stuck": True,
+            },
+        ]
+        out = _run_js(
+            'console.log(JSON.stringify({html: _extRunRowHtml("sp1", _extState["sp1"])}));',
+            state=_state(data=sharded),
+        )
+        html = out["html"]
+        assert "1/3 shards" in html
+        assert "part 1/3" in html
+        assert "≈ 400" in html
+        assert "part 2/3" in html
+        assert "CrawlError: boom" in html
+        assert "≈ ?" in html  # part 2's own missing plan — never a fabricated 0
+        assert "remainder" in html
+        assert "Stuck?" in html
+
+    def test_an_inline_run_shows_no_shard_count_or_breakdown(self):
+        out = _run_js(
+            'console.log(JSON.stringify({html: _extRunRowHtml("sp1", _extState["sp1"])}));',
+            state=_state(data=_RUNNING),
+        )
+        html = out["html"]
+        assert "shards" not in html
+
     def test_a_live_run_names_the_moment_its_numbers_were_true(self):
         out = _run_js(
             'console.log(JSON.stringify({html: _extRunRowHtml("sp1", _extState["sp1"])}));',
@@ -188,6 +439,25 @@ class TestRunRow:
         html = out["html"]
         assert "4× HTTP 429" in html
         assert "38s waited" in html
+
+    def test_a_live_run_shows_how_many_were_filtered_by_age(self):
+        """An operator watching `extraction.crawl.min_modified` must be able
+        to tell mid-run whether the cutoff is doing anything — not only
+        after the run finishes."""
+        running = json.loads(json.dumps(_RUNNING))
+        running["running"]["filtered_by_age"] = 40
+        out = _run_js(
+            'console.log(JSON.stringify({html: _extRunRowHtml("sp1", _extState["sp1"])}));',
+            state=_state(data=running),
+        )
+        assert "40 filtered by age" in out["html"]
+
+    def test_a_run_with_no_age_filtering_says_nothing_about_it(self):
+        out = _run_js(
+            'console.log(JSON.stringify({html: _extRunRowHtml("sp1", _extState["sp1"])}));',
+            state=_state(data=_RUNNING),
+        )
+        assert "filtered by age" not in out["html"]
 
     def test_no_stop_button_is_drawn_and_the_absence_is_explained(self):
         """v1 has no cooperative cancel flag; a button without a mechanism
@@ -214,6 +484,44 @@ class TestRunRow:
         assert "ext-dot--warn" in html
         assert "no longer reporting" in html
         assert "no checkpoint for 4200s" in html
+
+    def test_no_cancel_button_while_merely_running(self):
+        """Cancel is the force-close hammer — offered only once a run has
+        already proven Stop alone won't reach it. A merely `running` run
+        should try Stop first."""
+        out = _run_js(
+            'console.log(JSON.stringify({html: _extRunRowHtml("sp1", _extState["sp1"])}));',
+            state=_state(data=_RUNNING),
+        )
+        assert "Cancel run" not in out["html"]
+
+    def test_cancel_button_shown_once_stalled(self):
+        stalled = json.loads(json.dumps(_RUNNING))
+        stalled["running"]["outcome"] = "stalled"
+        stalled["running"]["stale_s"] = 4200.0
+        stalled["running"]["liveness_note"] = "no checkpoint for 4200s"
+        out = _run_js(
+            'console.log(JSON.stringify({html: _extRunRowHtml("sp1", _extState["sp1"])}));',
+            state=_state(data=stalled),
+        )
+        html = out["html"]
+        assert "Cancel run" in html
+        assert "extCancelRun('sp1', 'er_1')" in html
+
+    def test_the_run_row_carries_the_door_to_the_fleet_dashboard(self):
+        """`/admin/extraction` is off-nav (see `ADMIN_NAV_OFFNAV`): its ONLY
+        door is this row. Drawn for a live run and for a connection that
+        never ran — "how are all of them doing" is a fair question in every
+        state, and a door that exists only sometimes is a page that is
+        sometimes unreachable."""
+        never_ran = {"running": None, "last_completed": None, "runs_total": 0, "can_stop": False}
+        for state in (_state(data=_RUNNING), _state(data=never_ran)):
+            out = _run_js(
+                'console.log(JSON.stringify({html: _extRunRowHtml("sp1", _extState["sp1"])}));',
+                state=state,
+            )
+            assert 'href="/admin/extraction"' in out["html"]
+            assert "All connections" in out["html"]
 
     def test_never_run_says_so_instead_of_showing_zeros(self):
         out = _run_js(
@@ -256,6 +564,429 @@ class TestRunRow:
         assert "<input" not in html
         assert "<select" not in html
 
+    def test_a_last_run_that_erred_on_everything_reads_as_a_failure_not_green(self):
+        """The production incident this guards: a card that shows a green
+        dot and 'done' next to 1,263 silent failures is worse than showing
+        nothing — it actively reassures. `outcome`/`status` come from the
+        SERVER's recorded status (item 4's own guard); this only checks the
+        card renders whatever the server says, honestly."""
+        failed_last = {
+            "running": None,
+            "last_completed": {
+                "id": "er_9",
+                "outcome": "failed",
+                "finished_at": "2026-08-31T10:00:00+00:00",
+                "duration_s": 900.0,
+                "files_done": 1551,
+                "new": 0,
+                "changed": 0,
+                "unchanged": 0,
+                "errors": 1263,
+                "skips_total": 7,
+                "skips_listed": 7,
+                "usage": {},
+            },
+            "runs_total": 3,
+            "can_stop": False,
+        }
+        out = _run_js(
+            'console.log(JSON.stringify({html: _extRunRowHtml("sp1", _extState["sp1"])}));',
+            state=_state(data=failed_last),
+        )
+        html = out["html"]
+        assert "ext-dot--ok" not in html
+        assert "ext-dot--danger" in html
+        assert "failed" in html
+        assert "1,263 error" in html or "1263 error" in html
+        assert "ext-danger" in html
+
+    def test_a_last_run_with_unsupported_files_shows_a_neutral_not_a_warn_line(self):
+        """Never an error — nothing was attempted — so it must never read
+        alongside the danger-toned error/skip lines with the same tone."""
+        last = {
+            "running": None,
+            "last_completed": {
+                "id": "er_u1",
+                "outcome": "done",
+                "finished_at": "2026-08-31T10:00:00+00:00",
+                "duration_s": 30.0,
+                "files_done": 12,
+                "errors": 0,
+                "skipped_unsupported": 3,
+                "usage": {},
+            },
+            "runs_total": 1,
+            "can_stop": False,
+        }
+        out = _run_js(
+            'console.log(JSON.stringify({html: _extRunRowHtml("sp1", _extState["sp1"])}));',
+            state=_state(data=last),
+        )
+        html = out["html"]
+        assert "3 files skipped" in html
+        assert "not an error" in html
+        assert "ext-dot--danger" not in html
+
+    def test_a_last_run_with_doomed_skips_names_the_count_and_the_fix(self):
+        """2026-09-04 finding #66 item 5 — unlike `skipped_unsupported`,
+        this IS worth an operator's attention (something is actually wrong
+        with the file), so it gets the warn tone and names the way out."""
+        last = {
+            "running": None,
+            "last_completed": {
+                "id": "er_d1",
+                "outcome": "done",
+                "finished_at": "2026-08-31T10:00:00+00:00",
+                "duration_s": 30.0,
+                "files_done": 12,
+                "errors": 0,
+                "skipped_doomed": 42,
+                "usage": {},
+            },
+            "runs_total": 1,
+            "can_stop": False,
+        }
+        out = _run_js(
+            'console.log(JSON.stringify({html: _extRunRowHtml("sp1", _extState["sp1"])}));',
+            state=_state(data=last),
+        )
+        html = out["html"]
+        assert "42 doomed skipped" in html
+        assert "force reprocess to retry" in html
+        assert "ext-warn" in html
+
+    def test_no_doomed_skips_renders_nothing_extra(self):
+        last = {
+            "running": None,
+            "last_completed": {
+                "id": "er_d2",
+                "outcome": "done",
+                "finished_at": "2026-08-31T10:00:00+00:00",
+                "duration_s": 30.0,
+                "files_done": 12,
+                "errors": 0,
+                "usage": {},
+            },
+            "runs_total": 1,
+            "can_stop": False,
+        }
+        out = _run_js(
+            'console.log(JSON.stringify({html: _extRunRowHtml("sp1", _extState["sp1"])}));',
+            state=_state(data=last),
+        )
+        assert "doomed skipped" not in out["html"]
+
+    def test_a_clean_last_run_shows_no_error_line_and_a_green_dot(self):
+        clean_last = {
+            "running": None,
+            "last_completed": {
+                "id": "er_8",
+                "outcome": "done",
+                "finished_at": "2026-08-31T10:00:00+00:00",
+                "duration_s": 30.0,
+                "files_done": 5,
+                "new": 5,
+                "changed": 0,
+                "unchanged": 0,
+                "errors": 0,
+                "skips_total": 0,
+                "usage": {},
+            },
+            "runs_total": 1,
+            "can_stop": False,
+        }
+        out = _run_js(
+            'console.log(JSON.stringify({html: _extRunRowHtml("sp1", _extState["sp1"])}));',
+            state=_state(data=clean_last),
+        )
+        html = out["html"]
+        assert "ext-dot--ok" in html
+        assert "error" not in html.lower()
+
+    def test_an_exhausted_jobs_run_surfaces_as_last_failed_with_its_error(self):
+        """2026-09 incident: a job the worker itself marked 'failed' (an
+        exhausted attempts budget, or an unhandled exception past the last
+        retry) closes its own `extraction_runs` row — the source card must
+        show it, with the job's own error text, even though `last_completed`
+        deliberately excludes a 'failed' row."""
+        exhausted = {
+            "running": None,
+            "last_completed": None,
+            "last_failed": {
+                "id": "er_99",
+                "outcome": "failed",
+                "finished_at": "2026-09-02T03:00:00+00:00",
+                "files_done": 4200,
+                "new": 4000,
+                "changed": 200,
+                "error": "lease expired after max attempts",
+                "usage": {},
+            },
+            "runs_total": 5,
+            "can_stop": False,
+        }
+        out = _run_js(
+            'console.log(JSON.stringify({html: _extRunRowHtml("sp1", _extState["sp1"])}));',
+            state=_state(data=exhausted),
+        )
+        html = out["html"]
+        assert "ext-dot--danger" in html
+        assert "failed" in html
+        assert "lease expired after max attempts" in html
+        assert "ext-danger" in html
+
+    def test_last_failed_wins_over_last_completed_when_both_are_present(self):
+        """The server already gates `last_failed` to only exist when it is
+        the more recent terminal outcome — the card must prefer it."""
+        both = {
+            "running": None,
+            "last_completed": {
+                "id": "er_old_done",
+                "outcome": "done",
+                "finished_at": "2026-08-01T10:00:00+00:00",
+                "files_done": 10,
+                "new": 10,
+                "changed": 0,
+                "usage": {},
+            },
+            "last_failed": {
+                "id": "er_new_failed",
+                "outcome": "failed",
+                "finished_at": "2026-09-02T03:00:00+00:00",
+                "files_done": 3,
+                "new": 3,
+                "changed": 0,
+                "error": "boom",
+                "usage": {},
+            },
+            "runs_total": 2,
+            "can_stop": False,
+        }
+        out = _run_js(
+            'console.log(JSON.stringify({html: _extRunRowHtml("sp1", _extState["sp1"])}));',
+            state=_state(data=both),
+        )
+        html = out["html"]
+        assert "3 files" in html  # the FAILED run's own count
+        assert "10 files" not in html  # the older done run must not show
+        assert "boom" in html
+
+    def test_the_error_summary_carries_the_run_id_for_the_lazy_fetch(self):
+        """`ontoggle` fetches `.../extraction/runs/{run_id}` on first open —
+        the connection id and run id must be recoverable from the markup
+        alone, since nothing else threads them to the handler."""
+        failed_last = {
+            "running": None,
+            "last_completed": {
+                "id": "er_42",
+                "outcome": "failed",
+                "finished_at": "2026-08-31T10:00:00+00:00",
+                "duration_s": 10.0,
+                "files_done": 10,
+                "new": 0,
+                "changed": 0,
+                "errors": 10,
+                "usage": {},
+            },
+            "runs_total": 1,
+            "can_stop": False,
+        }
+        out = _run_js(
+            'console.log(JSON.stringify({html: _extRunRowHtml("sp1", _extState["sp1"])}));',
+            state=_state(data=failed_last),
+        )
+        html = out["html"]
+        assert 'data-conn="sp1"' in html
+        assert 'data-run="er_42"' in html
+        assert "_extLoadErrorDetail(this)" in html
+
+
+# --------------------------------------------------------------------------
+# Every reprocessing action an operator needed the shell for (TCRD-296):
+# "Retry failed (N)"/"Retry empty (N)" (the persisted crawl-state backlog
+# counts) and "Re-run" (for a run that did not finish cleanly). Rules, not
+# pixels: disabled while a run is live, N comes from the server never the
+# client, Re-run only offers itself when there is something to re-run FROM.
+# --------------------------------------------------------------------------
+
+
+class TestRetryAndRerunButtons:
+    def _html(self, data: dict) -> str:
+        out = _run_js(
+            'console.log(JSON.stringify({html: _extRunRowHtml("sp1", _extState["sp1"])}));',
+            state=_state(data=data),
+        )
+        return out["html"]
+
+    def test_never_run_shows_both_retry_buttons_disabled_at_zero_and_no_rerun(self):
+        html = self._html(
+            {
+                "running": None,
+                "last_completed": None,
+                "last_failed": None,
+                "runs_total": 0,
+                "can_stop": False,
+                "failed_items_count": 0,
+                "empty_items_count": 0,
+                "skipped_unsupported_count": None,
+            }
+        )
+        assert "Retry failed (0)" in html
+        assert "Retry empty (0)" in html
+        assert "Re-run" not in html
+        # both retry buttons carry `disabled` — a zero backlog has nothing
+        # to retry regardless of live/idle state.
+        assert re.search(r"onclick=\"extRetryFailed\('sp1'\)\"\s+disabled", html)
+        assert re.search(r"onclick=\"extRetryEmpty\('sp1'\)\"\s+disabled", html)
+
+    def test_a_live_run_disables_every_reprocessing_button_even_with_a_backlog(self):
+        """A live row's idempotency key may still hold the enqueue dedup
+        lock — the buttons must not invite a race the server would just
+        409 anyway."""
+        running = json.loads(json.dumps(_RUNNING))
+        running["failed_items_count"] = 5
+        running["empty_items_count"] = 2
+        html = self._html(running)
+        assert re.search(r"onclick=\"extRetryFailed\('sp1'\)\"\s+disabled", html)
+        assert re.search(r"onclick=\"extRetryEmpty\('sp1'\)\"\s+disabled", html)
+        assert "Re-run" not in html  # `live` — there is nothing to "re-run FROM", it's already running
+
+    def test_a_backlog_with_no_live_run_enables_both_retry_buttons_with_their_count(self):
+        html = self._html(
+            {
+                "running": None,
+                "last_completed": {
+                    "id": "er_1",
+                    "outcome": "done",
+                    "finished_at": "2026-09-02T10:00:00+00:00",
+                    "files_done": 100,
+                    "usage": {},
+                },
+                "last_failed": None,
+                "runs_total": 1,
+                "can_stop": False,
+                "failed_items_count": 3,
+                "empty_items_count": 9,
+                "skipped_unsupported_count": None,
+            }
+        )
+        assert "Retry failed (3)" in html
+        assert "Retry empty (9)" in html
+        assert not re.search(r"onclick=\"extRetryFailed\('sp1'\)\"\s+disabled", html)
+        assert not re.search(r"onclick=\"extRetryEmpty\('sp1'\)\"\s+disabled", html)
+        # a clean `done` last run has nothing to re-run FROM
+        assert "Re-run" not in html
+
+    def test_a_failed_last_run_offers_rerun_and_it_is_not_disabled(self):
+        failed_last = {
+            "running": None,
+            "last_completed": None,
+            "last_failed": {
+                "id": "er_9",
+                "outcome": "failed",
+                "finished_at": "2026-09-02T10:00:00+00:00",
+                "files_done": 40,
+                "error": "lease expired after max attempts",
+                "usage": {},
+            },
+            "runs_total": 2,
+            "can_stop": False,
+            "failed_items_count": 0,
+            "empty_items_count": 0,
+            "skipped_unsupported_count": None,
+        }
+        html = self._html(failed_last)
+        assert "Re-run" in html
+        assert re.search(r"onclick=\"extRerun\('sp1'\)\"\s+>Re-run", html) or "Re-run</button>" in html
+        assert not re.search(r"onclick=\"extRerun\('sp1'\)\"\s+disabled", html)
+
+    def test_an_interrupted_last_run_also_offers_rerun(self):
+        interrupted_last = {
+            "running": None,
+            "last_completed": {
+                "id": "er_int",
+                "outcome": "interrupted",
+                "finished_at": "2026-09-02T10:00:00+00:00",
+                "files_done": 40,
+                "usage": {},
+            },
+            "last_failed": None,
+            "runs_total": 1,
+            "can_stop": False,
+            "failed_items_count": 0,
+            "empty_items_count": 0,
+            "skipped_unsupported_count": None,
+        }
+        html = self._html(interrupted_last)
+        assert "Re-run" in html
+
+    def test_a_clean_done_last_run_never_offers_rerun(self):
+        clean_last = {
+            "running": None,
+            "last_completed": {
+                "id": "er_ok",
+                "outcome": "done",
+                "finished_at": "2026-09-02T10:00:00+00:00",
+                "files_done": 40,
+                "usage": {},
+            },
+            "last_failed": None,
+            "runs_total": 1,
+            "can_stop": False,
+            "failed_items_count": 0,
+            "empty_items_count": 0,
+            "skipped_unsupported_count": None,
+        }
+        html = self._html(clean_last)
+        assert "Re-run" not in html
+
+    def test_a_pending_retry_click_locks_its_own_button_with_a_progress_label(self):
+        out = _run_js(
+            'console.log(JSON.stringify({html: _extRunRowHtml("sp1", _extState["sp1"])}));',
+            state=_state(
+                data={
+                    "running": None,
+                    "last_completed": None,
+                    "last_failed": None,
+                    "runs_total": 0,
+                    "can_stop": False,
+                    "failed_items_count": 4,
+                    "empty_items_count": 0,
+                    "skipped_unsupported_count": None,
+                },
+                retryingFailed=True,
+            ),
+        )
+        html = out["html"]
+        assert "Retrying…" in html
+        assert re.search(r"onclick=\"extRetryFailed\('sp1'\)\"\s+disabled", html)
+
+    def test_a_pending_rerun_click_locks_the_button_with_a_progress_label(self):
+        failed_last = {
+            "running": None,
+            "last_completed": None,
+            "last_failed": {
+                "id": "er_9",
+                "outcome": "failed",
+                "finished_at": "2026-09-02T10:00:00+00:00",
+                "files_done": 40,
+                "error": "boom",
+                "usage": {},
+            },
+            "runs_total": 1,
+            "can_stop": False,
+            "failed_items_count": 0,
+            "empty_items_count": 0,
+            "skipped_unsupported_count": None,
+        }
+        out = _run_js(
+            'console.log(JSON.stringify({html: _extRunRowHtml("sp1", _extState["sp1"])}));',
+            state=_state(data=failed_last, rerunning=True),
+        )
+        html = out["html"]
+        assert "Starting…" in html
+        assert re.search(r"onclick=\"extRerun\('sp1'\)\"\s+disabled", html)
+
 
 class TestDegradation:
     def test_a_501_renders_once_and_explains_itself(self):
@@ -297,6 +1028,76 @@ class TestDegradation:
         assert "812 files" in out["html"]
 
 
+# --------------------------------------------------------------------------
+# The facts (LLM graph-extraction) phase — owner-frustration fix, 2026-09-02:
+# a healthy multi-hour facts pass never checkpointed at all, so the SAME
+# `files_done` the crawl froze at kept being shown next to a "stalled" chip
+# for the whole run. Once `_RunRecorder.checkpoint_facts` starts writing
+# again, the card must say WHICH phase is live and how far it has gotten,
+# not just keep repeating the crawl's own numbers.
+# --------------------------------------------------------------------------
+
+
+_FACTS_RUNNING = json.loads(json.dumps(_RUNNING))
+_FACTS_RUNNING["running"]["activity"] = {
+    "phase": "facts",
+    "current_path": "Engagements/northwind-rollout.docx",
+    "current_started_at": "2026-08-31T14:08:30+00:00",
+    "recent": [],
+}
+_FACTS_RUNNING["running"]["facts_progress"] = {"docs_done": 340, "docs_total": 1200}
+
+
+class TestFactsPhaseRendering:
+    def test_the_run_row_shows_document_progress_not_the_frozen_file_count(self):
+        out = _run_js(
+            'console.log(JSON.stringify({html: _extRunRowHtml("sp1", _extState["sp1"])}));',
+            state=_state(data=_FACTS_RUNNING),
+        )
+        html = out["html"]
+        assert "extracting facts" in html
+        assert "340/1,200 documents processed" in html or "340/1200 documents processed" in html
+        assert "812 files processed" not in html
+
+    def test_the_pipeline_strip_cell_also_reflects_the_facts_phase(self):
+        out = _run_js(
+            f"_extRenderCrawlCell('sp1', {json.dumps(_FACTS_RUNNING)});"
+            'console.log(JSON.stringify({html: _elements["ext-crawl-live-sp1"].innerHTML}));'
+        )
+        html = out["html"]
+        assert "extracting facts" in html
+        assert "documents" in html
+        assert "files" not in html
+
+    def test_a_stalled_facts_run_still_says_stalled_first(self):
+        """Outcome takes precedence over phase wording — `stalled` must
+        never be softened into "extracting facts" just because the phase
+        happens to be facts when the checkpoint went quiet."""
+        stalled = json.loads(json.dumps(_FACTS_RUNNING))
+        stalled["running"]["outcome"] = "stalled"
+        stalled["running"]["liveness_note"] = "no checkpoint for 4595s"
+        out = _run_js(
+            'console.log(JSON.stringify({html: _extRunRowHtml("sp1", _extState["sp1"])}));',
+            state=_state(data=stalled),
+        )
+        html = out["html"]
+        assert "no longer reporting" in html
+        assert "extracting facts" not in html
+
+    def test_a_facts_phase_run_with_no_progress_recorded_yet_falls_back_to_files(self):
+        """Defensive: `activity.phase` and `facts_progress` are written
+        together by `checkpoint_facts`, but a row missing one must not
+        crash the card or invent a document count from nothing."""
+        no_progress = json.loads(json.dumps(_FACTS_RUNNING))
+        no_progress["running"]["facts_progress"] = None
+        out = _run_js(
+            'console.log(JSON.stringify({html: _extRunRowHtml("sp1", _extState["sp1"])}));',
+            state=_state(data=no_progress),
+        )
+        html = out["html"]
+        assert "812 files processed" in html
+
+
 class TestRunsDrawer:
     _RUNS = {
         "runs": [
@@ -325,7 +1126,7 @@ class TestRunsDrawer:
     }
 
     def test_rows_render_outcome_duration_and_files(self):
-        out = _run_js(f"console.log(JSON.stringify({{html: _extRunsHtml({json.dumps(self._RUNS)})}}));")
+        out = _run_js(f"console.log(JSON.stringify({{html: _extRunsHtml('sp1', {json.dumps(self._RUNS)})}}));")
         html = out["html"]
         assert "interrupted" in html
         assert "failed" in html
@@ -333,20 +1134,20 @@ class TestRunsDrawer:
         assert "4m 12s" in html
 
     def test_a_failed_row_shows_its_refusal_verbatim(self):
-        out = _run_js(f"console.log(JSON.stringify({{html: _extRunsHtml({json.dumps(self._RUNS)})}}));")
+        out = _run_js(f"console.log(JSON.stringify({{html: _extRunsHtml('sp1', {json.dumps(self._RUNS)})}}));")
         assert "sharepoint.enabled is false" in out["html"]
 
     def test_only_the_interrupted_row_gets_the_resume_reassurance(self):
         """A crash must never carry copy telling an operator its work was
         kept and will resume."""
-        out = _run_js(f"console.log(JSON.stringify({{html: _extRunsHtml({json.dumps(self._RUNS)})}}));")
+        out = _run_js(f"console.log(JSON.stringify({{html: _extRunsHtml('sp1', {json.dumps(self._RUNS)})}}));")
         html = out["html"]
         assert html.count("the next run resumes") == 1
         # …and it sits in the interrupted row, above the failed one.
         assert html.index("the next run resumes") < html.index("sharepoint.enabled is false")
 
     def test_untruncated_history_is_named_not_silently_dropped(self):
-        out = _run_js(f"console.log(JSON.stringify({{html: _extRunsHtml({json.dumps(self._RUNS)})}}));")
+        out = _run_js(f"console.log(JSON.stringify({{html: _extRunsHtml('sp1', {json.dumps(self._RUNS)})}}));")
         assert "5 older runs not shown" in out["html"]
 
     def test_a_skip_list_shorter_than_the_skip_count_says_so(self):
@@ -364,7 +1165,7 @@ class TestRunsDrawer:
             ],
             "total": 1,
         }
-        out = _run_js(f"console.log(JSON.stringify({{html: _extRunsHtml({json.dumps(runs)})}}));")
+        out = _run_js(f"console.log(JSON.stringify({{html: _extRunsHtml('sp1', {json.dumps(runs)})}}));")
         assert "9 not indexed" in out["html"]
         assert "7 listed by name" in out["html"]
 
@@ -386,7 +1187,7 @@ class TestRunsDrawer:
             ],
             "total": 1,
         }
-        html = _run_js(f"console.log(JSON.stringify({{html: _extRunsHtml({json.dumps(runs)})}}));")["html"]
+        html = _run_js(f"console.log(JSON.stringify({{html: _extRunsHtml('sp1', {json.dumps(runs)})}}));")["html"]
         assert "stopped early — the run hit its time ceiling" in html
         # The reason line and the resume line are INDEPENDENT: this fixture
         # pins a server that did not vouch for resumability, and the drawer
@@ -412,7 +1213,7 @@ class TestRunsDrawer:
             ],
             "total": 1,
         }
-        html = _run_js(f"console.log(JSON.stringify({{html: _extRunsHtml({json.dumps(runs)})}}));")["html"]
+        html = _run_js(f"console.log(JSON.stringify({{html: _extRunsHtml('sp1', {json.dumps(runs)})}}));")["html"]
         assert "stopped early — the run hit its time ceiling" in html
         assert "the next run resumes from where it stopped" in html
 
@@ -432,7 +1233,7 @@ class TestRunsDrawer:
             ],
             "total": 1,
         }
-        html = _run_js(f"console.log(JSON.stringify({{html: _extRunsHtml({json.dumps(runs)})}}));")["html"]
+        html = _run_js(f"console.log(JSON.stringify({{html: _extRunsHtml('sp1', {json.dumps(runs)})}}));")["html"]
         assert "the next run resumes" not in html
         assert "graph exploded" in html
 
@@ -456,7 +1257,7 @@ class TestRunsDrawer:
             ],
             "total": 1,
         }
-        html = _run_js(f"console.log(JSON.stringify({{html: _extRunsHtml({json.dumps(runs)})}}));")["html"]
+        html = _run_js(f"console.log(JSON.stringify({{html: _extRunsHtml('sp1', {json.dumps(runs)})}}));")["html"]
         assert "throttling budget was exhausted" in html
         assert "the next run resumes from where it stopped" in html
 
@@ -476,7 +1277,7 @@ class TestRunsDrawer:
             ],
             "total": 1,
         }
-        html = _run_js(f"console.log(JSON.stringify({{html: _extRunsHtml({json.dumps(runs)})}}));")["html"]
+        html = _run_js(f"console.log(JSON.stringify({{html: _extRunsHtml('sp1', {json.dumps(runs)})}}));")["html"]
         assert "quota_exhausted" in html
         assert "the next run resumes" not in html
 
@@ -493,12 +1294,219 @@ class TestRunsDrawer:
             ],
             "total": 1,
         }
-        html = _run_js(f"console.log(JSON.stringify({{html: _extRunsHtml({json.dumps(runs)})}}));")["html"]
+        html = _run_js(f"console.log(JSON.stringify({{html: _extRunsHtml('sp1', {json.dumps(runs)})}}));")["html"]
         assert "stopped early" not in html
 
     def test_no_runs_is_an_empty_state_not_a_blank_drawer(self):
-        out = _run_js("console.log(JSON.stringify({html: _extRunsHtml({runs: [], total: 0})}));")
+        out = _run_js("console.log(JSON.stringify({html: _extRunsHtml('sp1', {runs: [], total: 0})}));")
         assert "No extraction runs recorded yet" in out["html"]
+
+    def test_a_row_with_errors_gets_the_same_treatment_the_last_run_block_does(self):
+        """`skips_total` already gets a warn line here — `errors` must too,
+        with the run's own id threaded through for the lazy fetch."""
+        runs = {
+            "runs": [
+                {
+                    "id": "er_bad",
+                    "outcome": "failed",
+                    "started_at": "2026-08-31T09:00:00+00:00",
+                    "duration_s": 900.0,
+                    "files_done": 1551,
+                    "new": 0,
+                    "changed": 0,
+                    "errors": 1263,
+                    "skips_total": 7,
+                    "skips_listed": 7,
+                }
+            ],
+            "total": 1,
+        }
+        html = _run_js(f"console.log(JSON.stringify({{html: _extRunsHtml('sp1', {json.dumps(runs)})}}));")["html"]
+        assert "1,263 error" in html or "1263 error" in html
+        assert 'data-conn="sp1"' in html
+        assert 'data-run="er_bad"' in html
+        assert "7 not indexed" in html  # the pre-existing skips line, unaffected
+
+    def test_a_row_with_no_errors_gets_no_error_line(self):
+        runs = {
+            "runs": [
+                {
+                    "id": "er_ok",
+                    "outcome": "done",
+                    "started_at": "2026-08-31T09:00:00+00:00",
+                    "duration_s": 12.0,
+                    "files_done": 5,
+                    "errors": 0,
+                }
+            ],
+            "total": 1,
+        }
+        html = _run_js(f"console.log(JSON.stringify({{html: _extRunsHtml('sp1', {json.dumps(runs)})}}));")["html"]
+        assert "ext-errors" not in html
+
+    def test_a_run_with_unsupported_files_shows_a_neutral_line_in_the_drawer(self):
+        runs = {
+            "runs": [
+                {
+                    "id": "er_u2",
+                    "outcome": "done",
+                    "started_at": "2026-08-31T09:00:00+00:00",
+                    "duration_s": 30.0,
+                    "files_done": 12,
+                    "errors": 0,
+                    "skipped_unsupported": 2,
+                }
+            ],
+            "total": 1,
+        }
+        html = _run_js(f"console.log(JSON.stringify({{html: _extRunsHtml('sp1', {json.dumps(runs)})}}));")["html"]
+        assert "2 files skipped" in html
+        assert "not an error" in html
+
+
+class TestErrorDetail:
+    """`_extErrorItemsHtml` — the itemized rows rendered once the per-run
+    fetch (`GET …/extraction/runs/{run_id}`, A3) resolves. Its shape mirrors
+    `report.errors_detail`, the same `{items, total, listed, truncated}`
+    envelope `skips` already uses server-side."""
+
+    def _html(self, report_errors_detail):
+        detail = {"report": {"errors_detail": report_errors_detail}}
+        out = _run_js(f"console.log(JSON.stringify({{html: _extErrorItemsHtml({json.dumps(detail)})}}));")
+        return out["html"]
+
+    def test_each_item_shows_path_reason_status_and_message(self):
+        html = self._html(
+            {
+                "items": [
+                    {"path": "Reports/Q3.docx", "reason": "download_failed", "detail": "HTTP 500", "status_code": 500}
+                ],
+                "total": 1,
+                "listed": 1,
+                "truncated": False,
+            }
+        )
+        assert "Reports/Q3.docx" in html
+        assert "download_failed" in html
+        assert "HTTP 500" in html
+        assert "500" in html
+
+    def test_a_status_less_error_shows_no_invented_status(self):
+        html = self._html(
+            {
+                "items": [
+                    {"path": "Reports/Q4.docx", "reason": "ingest_failed", "detail": "boom", "status_code": None}
+                ],
+                "total": 1,
+                "listed": 1,
+                "truncated": False,
+            }
+        )
+        assert "HTTP" not in html
+        assert "boom" in html
+
+    def test_truncation_is_named_not_silently_dropped(self):
+        items = [
+            {"path": f"Reports/f{i}.docx", "reason": "download_failed", "detail": "HTTP 500", "status_code": 500}
+            for i in range(2)
+        ]
+        html = self._html({"items": items, "total": 1263, "listed": 2, "truncated": True})
+        assert "1,263" in html or "1263" in html
+        assert "2" in html
+
+    def test_no_recorded_items_is_an_honest_empty_state(self):
+        html = self._html({"items": [], "total": 0, "listed": 0, "truncated": False})
+        assert "No per-file detail" in html
+
+    def _detail_html(self, **report):
+        out = _run_js(f"console.log(JSON.stringify({{html: _extErrorItemsHtml({json.dumps({'report': report})})}}));")
+        return out["html"]
+
+    def test_failed_items_are_rendered_alongside_errors_detail(self):
+        html = self._detail_html(
+            failed_items=[
+                {
+                    "path": "Reports/f1.docx",
+                    "item_id": "item1",
+                    "drive_id": "b!drive1",
+                    "reason_type": "convert_failed",
+                    "reason": "markitdown said no",
+                    "suffix": ".docx",
+                }
+            ],
+            failed_items_truncated=False,
+        )
+        assert "Reports/f1.docx" in html
+        assert "markitdown said no" in html
+        assert "retry_failed" in html
+
+    def test_a_failed_item_with_no_path_reads_as_redacted_not_blank(self):
+        """An anonymize-marked scope's item — see `CrawlStats.
+        note_failed_item`'s docstring."""
+        html = self._detail_html(
+            failed_items=[
+                {
+                    "path": None,
+                    "item_id": "item1",
+                    "drive_id": "b!drive1",
+                    "reason_type": "convert_failed",
+                    "reason": "UnsupportedFormatException",
+                    "suffix": ".xlsx",
+                }
+            ],
+        )
+        assert "redacted" in html
+        assert "UnsupportedFormatException" in html
+
+    def test_failed_items_truncation_is_named(self):
+        html = self._detail_html(
+            failed_items=[{"path": "a.docx", "reason": "boom"}],
+            failed_items_truncated=True,
+        )
+        assert "truncated" in html
+
+    def test_skipped_items_are_rendered_with_their_own_heading(self):
+        html = self._detail_html(
+            skipped_items=[
+                {
+                    "path": "Decks/q3.pbix",
+                    "item_id": "item9",
+                    "drive_id": "b!drive1",
+                    "reason_type": "unsupported_type",
+                    "reason": "no conversion backend recognizes this file type",
+                    "suffix": ".pbix",
+                }
+            ],
+        )
+        assert "Decks/q3.pbix" in html
+        assert "no conversion backend" in html
+        assert "not an error" in html
+
+    def test_doomed_items_are_rendered_with_their_own_heading(self):
+        """2026-09-04 finding #66 item 5 — an operator opening the per-run
+        detail can see WHICH documents were skipped as doomed, not only the
+        count."""
+        html = self._detail_html(
+            skipped_doomed_items=[
+                {
+                    "path": "Finance/broken.xlsx",
+                    "item_id": "item7",
+                    "drive_id": "b!drive1",
+                    "reason_type": "doomed",
+                    "reason": "markitdown_reject: failed 2 time(s), most recently: could not convert",
+                    "suffix": ".xlsx",
+                    "error_class": "markitdown_reject",
+                }
+            ],
+        )
+        assert "Finance/broken.xlsx" in html
+        assert "force reprocess" in html
+
+    def test_no_failed_or_skipped_items_adds_no_extra_section(self):
+        html = self._detail_html(errors_detail={"items": [], "total": 0, "listed": 0, "truncated": False})
+        assert "retry_failed" not in html
+        assert "not an error" not in html
+        assert "force reprocess" not in html
 
 
 class TestStopReasonVocabularyAgrees:
@@ -513,7 +1521,7 @@ class TestStopReasonVocabularyAgrees:
 
     @staticmethod
     def _js_reason_keys() -> set:
-        block = _extract_block(TEMPLATE.read_text(encoding="utf-8"), "const EXT_STOP_REASON_TEXT = {")
+        block = _extract_block(_ds_page_source.page_source(), "const EXT_STOP_REASON_TEXT = {")
         return set(re.findall(r"^\s*([a-z_]+):", block, re.M))
 
     def test_every_resumable_reason_has_a_human_phrase(self):
@@ -626,3 +1634,621 @@ class TestConfigDrawer:
 
     def test_the_section_lock_reason_is_stated_once(self):
         assert "not admin-writable" in self._html()
+
+
+_SCHEDULE_SIGNATURES = (
+    "function _extS(id) {",
+    "async function _extFetchOne(connId) {",
+    "function _extConnectionIds() {",
+    "function _extNextDelay() {",
+    "async function _extTick() {",
+    "function _extSchedule() {",
+    "function _extAfterCardsPainted() {",
+)
+
+
+def _run_schedule_js(body: str) -> dict:
+    """The poll's timing, on a fake clock.
+
+    Cards on this page arrive over fetch, so the harness starts with none —
+    which is exactly the state the script self-starts against in a browser.
+    """
+    tpl = _ds_page_source.page_source()
+    fns = "\n".join(_extract_block(tpl, sig) for sig in _SCHEDULE_SIGNATURES)
+    script = f"""
+const EXT_POLL_ACTIVE_MS = 3000;
+const EXT_POLL_IDLE_MS = 30000;
+const EXT_POLL_MAX_BACKOFF_MS = 60000;
+const EXT_MAX_FAILURES = 3;
+
+let NOW = 0;
+let CARDS = [];                 // no [data-ext-conn] until the cards paint
+const requests = [];
+const renders = [];
+const timers = [];
+
+const document = {{
+  visibilityState: "visible",
+  querySelectorAll: () => CARDS.map((id) => ({{ dataset: {{ extConn: id }} }})),
+  getElementById: () => null,
+}};
+function setTimeout(fn, ms) {{ timers.push({{ id: timers.length + 1, at: NOW + ms, fn }}); return timers.length; }}
+function clearTimeout(id) {{ const t = timers.find((x) => x.id === id); if (t) t.cancelled = true; }}
+async function fetch(url) {{
+  requests.push(NOW);
+  return {{ ok: true, status: 200, json: async () => ({{ connection_id: "sp1", runs_total: 0, as_of: null }}) }};
+}}
+function _extRender(connId) {{ renders.push({{ t: NOW, connId }}); }}
+
+const _extState = {{}};
+let _extTimer = null;
+let _extInFlight = false;
+
+{fns}
+
+async function runClock(untilMs) {{
+  for (let guard = 0; guard < 200; guard++) {{
+    const next = timers.filter((t) => !t.cancelled && !t.fired && t.at > NOW).sort((a, b) => a.at - b.at)[0];
+    if (next) next.fired = true;
+    if (!next || next.at > untilMs) break;
+    NOW = next.at;
+    await next.fn();
+  }}
+  NOW = untilMs;
+}}
+
+(async () => {{
+{body}
+}})();
+"""
+    with tempfile.NamedTemporaryFile("w", suffix=".mjs", delete=False) as f:
+        f.write(script)
+        path = f.name
+    try:
+        proc = subprocess.run(["node", path], capture_output=True, text=True)
+    finally:
+        Path(path).unlink(missing_ok=True)
+    if proc.returncode == 127:
+        pytest.skip("node unavailable")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    return json.loads(proc.stdout)
+
+
+class TestPollFollowsTheCards:
+    """The poll must be armed by the paint, not by the idle interval.
+
+    The script self-starts at parse time, when the connections fetch has not
+    resolved and the page carries no card. That first tick finds nothing to
+    ask about, and the scheduler — reading a still-empty state map — arms the
+    IDLE interval, so the run row used to appear 30 s (and, when a mutation
+    repainted over it mid-tick, 60 s) after the card it belongs to.
+    """
+
+    def test_the_first_request_follows_the_paint_not_the_idle_interval(self):
+        out = _run_schedule_js("""
+  await _extTick();                       // parse time: no cards on the page
+  _extSchedule();
+  await runClock(1500);                   // the connections fetch resolves
+  CARDS = ["sp1"];
+  await _extAfterCardsPainted();
+  await runClock(2000);
+  console.log(JSON.stringify({ first: requests.length ? requests[0] : null, count: requests.length }));
+""")
+        assert out["first"] == 1500, out
+        assert out["count"] == 1, out
+
+    def test_a_paint_with_nothing_known_yet_re_arms_the_cadence(self):
+        """The pending idle timer is not the schedule any more — a live run
+        must poll at the ACTIVE cadence from the paint, not inherit the 30 s
+        wheel the empty page armed."""
+        out = _run_schedule_js("""
+  await _extTick();
+  _extSchedule();
+  await runClock(1500);
+  CARDS = ["sp1"];
+  await _extAfterCardsPainted();
+  await runClock(40000);
+  console.log(JSON.stringify({ requests }));
+""")
+        # 1500 (the paint), then the re-armed idle wheel — never a first ask
+        # at 30 000 with the paint 28.5 s earlier.
+        assert out["requests"][0] == 1500, out
+        assert out["requests"][1] == 31500, out
+
+    def test_a_repaint_over_known_state_redraws_without_asking_again(self):
+        """A mutation's `loadConnections()` rebuilds the card and wipes the
+        block. Redrawing it from cache costs nothing; asking again would put
+        a request on every mutation."""
+        out = _run_schedule_js("""
+  CARDS = ["sp1"];
+  await _extTick();                       // one real read
+  const after = requests.length;
+  NOW = 5000;
+  _extAfterCardsPainted();                // the card was rebuilt underneath
+  console.log(JSON.stringify({
+    requests_before: after,
+    requests_after: requests.length,
+    repainted: renders.filter((r) => r.t === 5000).map((r) => r.connId),
+  }));
+""")
+        assert out["requests_before"] == 1, out
+        assert out["requests_after"] == 1, out
+        assert out["repainted"] == ["sp1"], out
+
+    def test_the_paint_hook_is_called_from_every_card_paint(self):
+        tpl = _ds_page_source.page_source()
+        # Guarded by `typeof`: the hook lives in a later script block than the
+        # renderers that call it, and the parser may run a fetch continuation
+        # between the two.
+        assert tpl.count('if (typeof _extAfterCardsPainted === "function") _extAfterCardsPainted();') == 2
+
+
+class TestFactsPassSurfacesOnTheCard:
+    """The standalone facts pass is a JOB (`sharepoint-facts-extraction`),
+    not a crawl run — it opens no `extraction_runs` row — so the status
+    poll carries it as `facts_job` off the job queue, and the card must
+    (a) say so in the Run row and (b) never keep offering "Extract facts
+    now" while one is queued or running: the server can only answer that
+    click with `409 facts_extraction_already_running`."""
+
+    _IDLE = {
+        "connection_id": "sp1",
+        "running": None,
+        "last_completed": None,
+        "runs_total": 0,
+        "can_stop": True,
+        "as_of": "2026-09-02T10:00:00+00:00",
+    }
+
+    def test_a_queued_facts_pass_is_named_in_the_run_row(self):
+        data = {
+            **self._IDLE,
+            "facts_job": {"id": "job-9", "status": "queued", "created_at": "2026-09-02T09:58:00+00:00"},
+        }
+        out = _run_js(
+            "console.log(JSON.stringify({ html: _extRunRowHtml('sp1', _extState.sp1) }));",
+            state=_state(data=data),
+        )
+        html = out["html"]
+        assert "facts pass" in html.lower()
+        assert "queued" in html
+        assert "job-9" in html
+
+    def test_a_running_facts_pass_reads_running_not_queued(self):
+        data = {
+            **self._IDLE,
+            "facts_job": {
+                "id": "job-10",
+                "status": "running",
+                "created_at": "2026-09-02T09:58:00+00:00",
+                "started_at": "2026-09-02T09:59:00+00:00",
+            },
+        }
+        out = _run_js(
+            "console.log(JSON.stringify({ html: _extRunRowHtml('sp1', _extState.sp1) }));",
+            state=_state(data=data),
+        )
+        html = out["html"]
+        assert "facts pass" in html.lower()
+        assert "running" in html
+        assert "queued" not in html
+
+    def test_no_facts_pass_draws_no_facts_line(self):
+        data = {**self._IDLE, "facts_job": None}
+        out = _run_js(
+            "console.log(JSON.stringify({ html: _extRunRowHtml('sp1', _extState.sp1) }));",
+            state=_state(data=data),
+        )
+        assert "facts pass" not in out["html"].lower()
+
+    def test_the_button_is_disabled_while_a_pass_is_in_flight_and_restored_after(self):
+        body = """
+_extRenderFactsButton('sp1', { facts_job: { id: 'job-9', status: 'queued' } });
+const during = { disabled: _elements['ext-facts-btn-sp1'].disabled, title: _elements['ext-facts-btn-sp1'].title };
+_extRenderFactsButton('sp1', { facts_job: null });
+const after = { disabled: _elements['ext-facts-btn-sp1'].disabled, title: _elements['ext-facts-btn-sp1'].title };
+console.log(JSON.stringify({ during, after }));
+"""
+        out = _run_js(body)
+        assert out["during"]["disabled"] is True
+        assert "already" in out["during"]["title"].lower()
+        assert out["after"]["disabled"] is False
+        assert out["after"]["title"] == ""
+
+    def test_a_pass_ending_never_re_enables_a_button_the_server_gated_off(self):
+        body = """
+_elements['ext-facts-btn-sp1'].dataset.factsReady = '0';
+_elements['ext-facts-btn-sp1'].disabled = true;
+_extRenderFactsButton('sp1', { facts_job: null });
+console.log(JSON.stringify({ disabled: _elements['ext-facts-btn-sp1'].disabled }));
+"""
+        assert _run_js(body)["disabled"] is True
+
+
+class TestFactsPendingLine:
+    """TCRD-296 gap #61: a pass that stopped on its own time budget with
+    documents still pending used to leave nothing visible once the crawl
+    that triggered it was long over. `facts_pending_documents`/
+    `facts_pass_running` on the status payload drive one extra line in the
+    Run row, distinct from `_extFactsJobLine` (which only ever shows a
+    SPECIFIC job's id/status)."""
+
+    _IDLE = {
+        "connection_id": "sp1",
+        "running": None,
+        "last_completed": None,
+        "facts_job": None,
+        "runs_total": 0,
+        "can_stop": True,
+        "as_of": "2026-09-02T10:00:00+00:00",
+    }
+
+    def test_a_pending_backlog_with_a_pass_running_says_continuing(self):
+        data = {**self._IDLE, "facts_pending_documents": 42, "facts_pass_running": True}
+        out = _run_js(
+            "console.log(JSON.stringify({ html: _extRunRowHtml('sp1', _extState.sp1) }));",
+            state=_state(data=data),
+        )
+        html = out["html"]
+        assert "42 documents pending facts extraction" in html
+        assert "continuing" in html
+        assert "not running" not in html
+
+    def test_a_pending_backlog_with_nothing_running_says_not_running(self):
+        data = {**self._IDLE, "facts_pending_documents": 7, "facts_pass_running": False}
+        out = _run_js(
+            "console.log(JSON.stringify({ html: _extRunRowHtml('sp1', _extState.sp1) }));",
+            state=_state(data=data),
+        )
+        html = out["html"]
+        assert "7 documents pending facts extraction" in html
+        assert "not running" in html
+
+    def test_zero_pending_says_nothing(self):
+        data = {**self._IDLE, "facts_pending_documents": 0, "facts_pass_running": False}
+        out = _run_js(
+            "console.log(JSON.stringify({ html: _extRunRowHtml('sp1', _extState.sp1) }));",
+            state=_state(data=data),
+        )
+        assert "pending facts extraction" not in out["html"]
+
+    def test_a_status_payload_with_no_field_at_all_says_nothing(self):
+        """Older code paths / a payload that never set the field — never a
+        false "0 pending"."""
+        out = _run_js(
+            "console.log(JSON.stringify({ html: _extRunRowHtml('sp1', _extState.sp1) }));",
+            state=_state(data=self._IDLE),
+        )
+        assert "pending facts extraction" not in out["html"]
+
+    def test_an_active_provider_limit_condition_wins_over_the_pending_line(self):
+        """TCRD-296 synthesis F.25 — an operator seeing a backlog needs to
+        know WHY nothing is chasing it, not just that nothing currently is
+        (which "not running" alone would also say for an unrelated reason,
+        e.g. the auto-continuation chain hitting its cap)."""
+        data = {
+            **self._IDLE,
+            "facts_pending_documents": 7,
+            "facts_pass_running": False,
+            "provider_limit": {"provider": "anthropic", "reason": "workspace_limit"},
+        }
+        out = _run_js(
+            "console.log(JSON.stringify({ html: _extRunRowHtml('sp1', _extState.sp1) }));",
+            state=_state(data=data),
+        )
+        html = out["html"]
+        assert "paused: provider limit" in html
+        assert "anthropic" in html
+        assert "pending facts extraction" not in html
+
+    def test_no_provider_limit_condition_falls_back_to_the_pending_line(self):
+        data = {
+            **self._IDLE,
+            "facts_pending_documents": 7,
+            "facts_pass_running": False,
+            "provider_limit": None,
+        }
+        out = _run_js(
+            "console.log(JSON.stringify({ html: _extRunRowHtml('sp1', _extState.sp1) }));",
+            state=_state(data=data),
+        )
+        assert "paused: provider limit" not in out["html"]
+        assert "7 documents pending facts extraction" in out["html"]
+
+
+# --------------------------------------------------------------------------
+# Facts policy control (retry_mode / transport / provider) — the admin-UI
+# control for `PATCH .../extraction/facts-config`
+# (`app/api/admin_extraction.py::patch_extraction_facts_config`), so an admin
+# without server or CLI access can set a per-connection override. Own render
+# helper (`_extRenderFactsPolicy`) and own save function (`saveSpFactsPolicy`)
+# so this control never entangles with the run-options row or the "Extract
+# facts now" button next to it.
+# --------------------------------------------------------------------------
+
+
+def _run_facts_policy_js(body: str) -> dict:
+    tpl = read_admin_data_sources_source()
+    fns = "\n".join(
+        _extract_block(tpl, sig)
+        for sig in (
+            "function _esc(s) {",
+            "function _extRenderFactsPolicy(row) {",
+            "function _extToggleVertexRegionInput(id) {",
+        )
+    )
+    script = f"""
+{fns}
+{body}
+"""
+    with tempfile.NamedTemporaryFile("w", suffix=".mjs", delete=False) as f:
+        f.write(script)
+        path = f.name
+    try:
+        proc = subprocess.run(["node", path], capture_output=True, text=True)
+    finally:
+        Path(path).unlink(missing_ok=True)
+    if proc.returncode == 127:
+        pytest.skip("node unavailable")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    return json.loads(proc.stdout)
+
+
+class TestFactsPolicyControlRendering:
+    def test_renders_all_three_selects_with_the_connection_override_preselected(self):
+        row = {
+            "id": "sp1",
+            "name": "Finance SharePoint",
+            "config": {
+                "extraction": {
+                    "facts": {
+                        "retry_mode": "always",
+                        "transport": "batch",
+                        "provider": "vertex",
+                        "vertex_region": "europe-west4",
+                    }
+                }
+            },
+        }
+        out = _run_facts_policy_js(f"console.log(JSON.stringify({{html: _extRenderFactsPolicy({json.dumps(row)})}}));")
+        html = out["html"]
+        assert 'id="ds-sp-factspolicy-retry-sp1"' in html
+        assert 'id="ds-sp-factspolicy-transport-sp1"' in html
+        assert 'id="ds-sp-factspolicy-provider-sp1"' in html
+        assert '<option value="always" selected>' in html
+        assert '<option value="batch" selected>' in html
+        assert '<option value="vertex" selected>' in html
+        assert "saveSpFactsPolicy('sp1')" in html
+        # The region input is present, pre-filled, and VISIBLE — the
+        # connection is pinned to provider=vertex, so the region actually
+        # matters here.
+        assert 'id="ds-sp-factspolicy-vertexregion-sp1"' in html
+        assert 'value="europe-west4"' in html
+        assert 'style="display:"' in html
+
+    def test_no_override_leaves_instance_default_selected(self):
+        row = {"id": "sp2", "name": "Ops SharePoint", "config": {}}
+        out = _run_facts_policy_js(f"console.log(JSON.stringify({{html: _extRenderFactsPolicy({json.dumps(row)})}}));")
+        html = out["html"]
+        # All three selects default to the empty "Instance default" option —
+        # once per select — never a value that reads as a chosen policy.
+        assert html.count('<option value="" selected>Instance default</option>') == 3
+        assert '<option value="off"' in html
+        assert '<option value="on_gate_fail"' in html
+        assert '<option value="sync"' in html
+        assert '<option value="inherit"' in html
+        assert '<option value="anthropic"' in html
+        # provider is not "vertex" — the region input starts hidden and empty.
+        assert 'style="display:none"' in html
+        assert 'value=""' in html
+
+    def test_toggle_shows_the_region_input_only_while_provider_is_vertex(self):
+        out = _run_facts_policy_js(
+            """
+const _elements = {
+  "ds-sp-factspolicy-provider-sp1": { value: "vertex" },
+  "ds-sp-factspolicy-vertexregion-sp1": { style: { display: "none" } },
+};
+const document = { getElementById: (id) => _elements[id] || null };
+_extToggleVertexRegionInput("sp1");
+const shownForVertex = _elements["ds-sp-factspolicy-vertexregion-sp1"].style.display;
+_elements["ds-sp-factspolicy-provider-sp1"].value = "anthropic";
+_extToggleVertexRegionInput("sp1");
+const hiddenForAnthropic = _elements["ds-sp-factspolicy-vertexregion-sp1"].style.display;
+console.log(JSON.stringify({ shownForVertex, hiddenForAnthropic }));
+"""
+        )
+        assert out["shownForVertex"] == ""
+        assert out["hiddenForAnthropic"] == "none"
+
+    def test_offers_exactly_the_three_retry_modes_two_transports_and_three_providers(self):
+        """Pinned against the API's own vocabulary
+        (`connectors.sharepoint.facts_extraction._VALID_RETRY_MODES` /
+        `_VALID_TRANSPORTS` / `_VALID_PROVIDERS`) — a fourth option here
+        would be a value the server refuses with 422."""
+        row = {"id": "sp3", "config": {}}
+        html = _run_facts_policy_js(
+            f"console.log(JSON.stringify({{html: _extRenderFactsPolicy({json.dumps(row)})}}));"
+        )["html"]
+        # "Instance default" + off/on_gate_fail/always (retry) = 4, plus
+        # "Instance default" + sync/batch (transport) = 3, plus
+        # "Instance default" + inherit/anthropic/vertex (provider) = 4.
+        assert html.count("<option") == 4 + 3 + 4
+
+    def test_an_untrusted_name_is_escaped_not_injected(self):
+        row = {"id": "sp4", "name": "<img src=x onerror=alert(1)>", "config": {}}
+        html = _run_facts_policy_js(
+            f"console.log(JSON.stringify({{html: _extRenderFactsPolicy({json.dumps(row)})}}));"
+        )["html"]
+        assert "<img" not in html
+        assert "&lt;img" in html
+
+
+class TestFactsPolicySave:
+    """`saveSpFactsPolicy` — the empty "Instance default" option must map to
+    `null` (clear the override), a chosen value must be sent verbatim, and
+    the response's resolved `{value, source}` pair must land in the status
+    line, never the raw request echoed back."""
+
+    def _run(
+        self,
+        *,
+        retry_value,
+        transport_value,
+        provider_value="",
+        vertex_region_value="",
+        response_status=200,
+        response_body=None,
+        prior_config=None,
+    ):
+        tpl = read_admin_data_sources_source()
+        fn = _extract_block(tpl, "async function saveSpFactsPolicy(id) {")
+        response_body = response_body if response_body is not None else {}
+        script = f"""
+const _elements = {{
+  "ds-sp-factspolicy-retry-sp1": {{ value: {json.dumps(retry_value)} }},
+  "ds-sp-factspolicy-transport-sp1": {{ value: {json.dumps(transport_value)} }},
+  "ds-sp-factspolicy-provider-sp1": {{ value: {json.dumps(provider_value)} }},
+  "ds-sp-factspolicy-vertexregion-sp1": {{ value: {json.dumps(vertex_region_value)} }},
+  "ds-sp-factspolicy-status-sp1": {{ textContent: "" }},
+}};
+const document = {{ getElementById: (id) => _elements[id] || null }};
+let _connections = [{{ id: "sp1", config: {json.dumps(prior_config or {})} }}];
+const requests = [];
+const toasts = [];
+function encodeURIComponent(s) {{ return s; }}
+function showToast(msg, ok) {{ toasts.push({{ msg, ok }}); }}
+function detailMessage(body, fallback) {{ return (body && body.detail) || fallback; }}
+async function fetch(url, opts) {{
+  requests.push({{ url, method: opts.method, body: JSON.parse(opts.body) }});
+  return {{
+    ok: {str(response_status < 400).lower()},
+    status: {response_status},
+    json: async () => ({json.dumps(response_body)}),
+  }};
+}}
+
+{fn}
+
+(async () => {{
+  await saveSpFactsPolicy("sp1");
+  console.log(JSON.stringify({{
+    requests,
+    toasts,
+    status: _elements["ds-sp-factspolicy-status-sp1"].textContent,
+    conn: _connections[0],
+  }}));
+}})();
+"""
+        with tempfile.NamedTemporaryFile("w", suffix=".mjs", delete=False) as f:
+            f.write(script)
+            path = f.name
+        try:
+            proc = subprocess.run(["node", path], capture_output=True, text=True)
+        finally:
+            Path(path).unlink(missing_ok=True)
+        if proc.returncode == 127:
+            pytest.skip("node unavailable")
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        return json.loads(proc.stdout)
+
+    def test_an_empty_selection_sends_null_for_all_four_fields(self):
+        out = self._run(retry_value="", transport_value="", provider_value="", vertex_region_value="")
+        assert out["requests"][0]["body"] == {
+            "retry_mode": None,
+            "transport": None,
+            "provider": None,
+            "vertex_region": None,
+        }
+
+    def test_a_chosen_value_is_sent_verbatim(self):
+        out = self._run(
+            retry_value="always", transport_value="batch", provider_value="vertex", vertex_region_value="europe-west4"
+        )
+        assert out["requests"][0]["body"] == {
+            "retry_mode": "always",
+            "transport": "batch",
+            "provider": "vertex",
+            "vertex_region": "europe-west4",
+        }
+
+    def test_a_whitespace_only_vertex_region_is_sent_as_null(self):
+        out = self._run(retry_value="off", transport_value="", vertex_region_value="   ")
+        assert out["requests"][0]["body"]["vertex_region"] is None
+
+    def test_the_vertex_region_is_sent_even_while_the_input_is_hidden(self):
+        """The region input stays hidden (never removed) while Provider is
+        not Vertex — its typed value must still ride the save, so switching
+        Provider back to Vertex later shows the same value rather than a
+        silently-lost one."""
+        out = self._run(
+            retry_value="off", transport_value="", provider_value="anthropic", vertex_region_value="us-east4"
+        )
+        assert out["requests"][0]["body"]["vertex_region"] == "us-east4"
+
+    def test_it_patches_the_facts_config_endpoint(self):
+        out = self._run(retry_value="off", transport_value="sync")
+        assert out["requests"][0]["url"] == "/api/admin/sharepoint/connections/sp1/extraction/facts-config"
+        assert out["requests"][0]["method"] == "PATCH"
+
+    def test_the_resolved_value_and_source_are_shown_after_save(self):
+        out = self._run(
+            retry_value="always",
+            transport_value="",
+            provider_value="vertex",
+            vertex_region_value="europe-west4",
+            response_body={
+                "retry_mode": {"value": "always", "source": "connection"},
+                "transport": {"value": "sync", "source": "instance"},
+                "provider": {"value": "vertex", "source": "connection", "effective": "vertex"},
+                "vertex_region": {"value": "europe-west4", "source": "connection"},
+            },
+        )
+        assert "always" in out["status"]
+        assert "connection" in out["status"]
+        assert "sync" in out["status"]
+        assert "instance" in out["status"]
+        assert "vertex" in out["status"]
+        assert "europe-west4" in out["status"]
+
+    def test_a_failed_save_toasts_the_servers_reason_and_clears_the_status(self):
+        out = self._run(
+            retry_value="off",
+            transport_value="",
+            response_status=422,
+            response_body={"detail": "retry_mode must be one of ..."},
+        )
+        assert out["status"] == ""
+        assert out["toasts"][0]["ok"] is False
+        assert "retry_mode must be one of" in out["toasts"][0]["msg"]
+
+    def test_a_successful_save_updates_the_in_memory_row_for_the_next_repaint(self):
+        out = self._run(
+            retry_value="always",
+            transport_value="",
+            provider_value="",
+            vertex_region_value="",
+            prior_config={
+                "extraction": {
+                    "facts": {
+                        "retry_mode": "off",
+                        "transport": "batch",
+                        "provider": "vertex",
+                        "vertex_region": "europe-west4",
+                    }
+                }
+            },
+            response_body={
+                "retry_mode": {"value": "always", "source": "connection"},
+                "transport": {"value": "sync", "source": "instance"},
+                "provider": {"value": "inherit", "source": "instance", "effective": "anthropic"},
+                "vertex_region": {"value": None, "source": "none"},
+            },
+        )
+        facts = out["conn"]["config"]["extraction"]["facts"]
+        assert facts["retry_mode"] == "always"
+        # transport, provider AND vertex_region were cleared (sent null) —
+        # every override is removed, not left at its stale prior value.
+        assert "transport" not in facts
+        assert "provider" not in facts
+        assert "vertex_region" not in facts

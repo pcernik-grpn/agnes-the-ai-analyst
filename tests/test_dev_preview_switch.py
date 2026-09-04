@@ -200,7 +200,24 @@ class TestTheCollapsedRailKeepsItsSearch:
         assert "flex: none" in rule.group(1)
 
     def test_the_peek_hands_back_the_full_box(self, rail_css):
-        assert re.search(r"rail-icon-mode:hover \.rail-search-input", rail_css)
+        """On the SHARED peek trigger, not a hand-rolled `:hover, :focus-within`
+        pair — which is what this rule was, and what broke it. A 42px input only
+        makes sense once the column is 240px wide, so the two have to be the same
+        event: on a rail whose hover peek is off (`.rail-strip-only`, the pages
+        carrying the admin secondary nav) the pair still fired and the box
+        reappeared inside the 40px strip, an empty pill with the magnifier shoved
+        against its left edge. The pair also predated `.rail-no-peek`, so a
+        pointer-driven collapse popped it open on the way down."""
+        reveals = re.findall(r"rail-icon-mode(.*?) \.rail-search-input \{\s*display: block;", rail_css)
+        assert reveals, "nothing hands the search box back when the column opens"
+        trigger = ":not(.rail-no-peek):where(:not(.rail-strip-only)):is(:hover, :focus-within)"
+        assert trigger in reveals, reveals
+        # The other `display: block` on this input is the invisible click target
+        # that makes the collapsed box reachable at all on a rail that cannot
+        # hover-peek — focus is what opens the column, so something has to take
+        # the click. It is hover-scoped away from the peek, never a second reveal.
+        for got in reveals:
+            assert got == trigger or got == ".rail-strip-only", got
 
 
 class TestTheWizardCanMakeAnAudience:
@@ -210,7 +227,11 @@ class TestTheWizardCanMakeAnAudience:
 
     @pytest.fixture(scope="class")
     def page(self) -> str:
-        return (ROOT / "app" / "web" / "templates" / "admin_data_sources.html").read_text(encoding="utf-8")
+        # The wizard's Share-step JS moved into an extracted static file
+        # (perf follow-up, 2026-09-03) — see tests/_admin_data_sources_source.py.
+        from tests._admin_data_sources_source import read_admin_data_sources_source
+
+        return read_admin_data_sources_source()
 
     def test_the_step_offers_a_new_group(self, page):
         assert 'id="ds-wizard-newgroup"' in page

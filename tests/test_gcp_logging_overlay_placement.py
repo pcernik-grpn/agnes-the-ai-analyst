@@ -35,7 +35,8 @@ the instance down for 9 minutes. Two additional contracts are pinned here:
   "logging off + loud warning" instead of an outage.
 """
 
-import os
+import contextlib
+import socket
 import re
 import subprocess
 from pathlib import Path
@@ -72,22 +73,27 @@ def test_variables_tf_declares_enable_gcp_logging_default_true():
     assert "description" in block
 
 
-def test_main_tf_forwards_enable_gcp_logging_into_templatefile():
+def test_main_tf_forwards_the_resolved_destination_into_templatefile():
+    """The template decides on the RESOLVED destination, not on the permit
+    switch. enable_gcp_logging grants the IAM roles and makes Cloud Logging
+    eligible; container_logs_destination is what picks it, so a VM can hold
+    the grants while shipping to Datadog."""
     body = (MODULE / "main.tf").read_text()
-    assert re.search(r"enable_gcp_logging\s*=\s*var\.enable_gcp_logging", body), (
-        "main.tf must forward var.enable_gcp_logging into templatefile(...)"
+    assert re.search(r"cloud_logging_logs_active\s*=\s*local\.cloud_logging_logs_active", body), (
+        "main.tf must forward local.cloud_logging_logs_active into templatefile(...)"
     )
 
 
 def test_tpl_gates_overlay_placement_on_the_tf_var():
     body = (MODULE / "startup-script.sh.tpl").read_text()
     assert OVERLAY in body, "startup-script.sh.tpl must reference the overlay filename"
-    assert "%{ if !enable_gcp_logging ~}" in body, (
-        "the overlay's placement must be gated on the enable_gcp_logging TF var "
-        "(the recursive docker cp extracts it unconditionally; disabling the "
-        "var must remove it again)"
+    assert "%{ if !cloud_logging_logs_active ~}" in body, (
+        "the overlay's placement must be gated on the resolved destination "
+        "(the recursive docker cp extracts it unconditionally; any destination "
+        "other than cloud_logging must remove it again — which is also what "
+        "puts a Datadog VM on the json-file driver its agent can read)"
     )
-    guard = body.index("%{ if !enable_gcp_logging ~}")
+    guard = body.index("%{ if !cloud_logging_logs_active ~}")
     endif = body.index("%{ endif ~}", guard)
     gated_block = body[guard:endif]
     assert OVERLAY in gated_block, "the gated block must act on the overlay file"
@@ -99,7 +105,7 @@ def test_tpl_placement_runs_after_the_extraction_that_ships_it():
     that actually puts the file on disk — gating before it would be a no-op."""
     body = (MODULE / "startup-script.sh.tpl").read_text()
     extract_idx = body.index('docker cp "$EXTRACT_CONTAINER:/opt/agnes-host/." "$APP_DIR/"')
-    gate_idx = body.index("%{ if !enable_gcp_logging ~}")
+    gate_idx = body.index("%{ if !cloud_logging_logs_active ~}")
     assert extract_idx < gate_idx
 
 
@@ -145,11 +151,43 @@ def test_main_tf_grants_log_writer_to_the_vm_sa_gated_on_the_flag():
     assert re.search(r"project\s*=\s*var\.gcp_project_id", block)
 
 
+def test_main_tf_grants_metric_writer_for_the_self_metrics_that_cannot_be_off():
+    body = (MODULE / "main.tf").read_text()
+    m = re.search(
+        r'resource\s+"google_project_iam_member"\s+"vm_metric_writer"\s*\{([^}]*)\}',
+        body,
+        re.DOTALL,
+    )
+    assert m, (
+        "main.tf must declare google_project_iam_member.vm_metric_writer — the "
+        "Ops Agent's OpenTelemetry sub-agent exports its own free "
+        "agent.googleapis.com/agent/* self-metrics whatever the config says, "
+        "and without roles/monitoring.metricWriter every export cycle fails "
+        "and floods the serial console with monitoring.timeSeries.create "
+        "PermissionDenied"
+    )
+    block = m.group(1)
+    assert "roles/monitoring.metricWriter" in block
+    assert "google_service_account.vm.email" in block, (
+        "the binding must target the dedicated VM SA the compute instance "
+        "actually runs as (service_account block in main.tf)"
+    )
+    assert re.search(r"count\s*=\s*var\.enable_gcp_logging\s*\?\s*1\s*:\s*0", block), (
+        "the binding must be gated on the same variable that installs the agent"
+    )
+    assert re.search(r"project\s*=\s*var\.gcp_project_id", block)
+
+
 def test_variables_tf_documents_the_iam_requirement():
     body = (MODULE / "variables.tf").read_text()
     m = re.search(r'variable\s+"enable_gcp_logging"\s*\{([^}]*)\}', body, re.DOTALL)
     assert m
     block = m.group(1)
+    assert "monitoring.metricWriter" in block, (
+        "enable_gcp_logging's description must state that the module also "
+        "grants the metric role — an operator granting IAM out-of-band needs "
+        "to know it is two roles, not one"
+    )
     assert "logging.logWriter" in block, (
         "enable_gcp_logging's description must state the IAM role the driver "
         "needs (and that the module grants it) — the missing-role failure "
@@ -187,18 +225,6 @@ def compose_dirs(tmp_path):
     return compose_dir, state_dir
 
 
-def _fake_docker(tmp_path: Path, exit_code: int) -> dict[str, str]:
-    """A PATH with a stub `docker` that records its argv and exits as told."""
-    bin_dir = tmp_path / "fake-bin"
-    bin_dir.mkdir(exist_ok=True)
-    stub = bin_dir / "docker"
-    stub.write_text(f'#!/bin/sh\necho "$@" >> "{tmp_path}/docker-calls.log"\nexit {exit_code}\n')
-    stub.chmod(0o755)
-    env = dict(os.environ)
-    env["PATH"] = f"{bin_dir}:{env['PATH']}"
-    return env
-
-
 class TestResolverGate:
     """`agnes_resolve_compose_file` requires the probe marker, not mere
     file presence — presence alone is what armed an unauthorized driver and
@@ -220,52 +246,72 @@ class TestResolverGate:
         assert OVERLAY not in _resolve(compose_dir, state_dir)
 
 
-class TestDriverProbe:
-    """`agnes_gcp_logging_probe` arms/clears the marker by actually starting
-    a no-op container on the gcplogs driver."""
+@contextlib.contextmanager
+def _collector_listening(port: int = 24224):
+    """A real listener on the Ops Agent's forward port, or a skip.
 
-    def test_probe_success_arms_the_marker_and_the_resolver_engages(self, compose_dirs, tmp_path):
+    The probe asks one question — is anything accepting these logs — so the
+    honest test is a socket, not a stubbed binary.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.bind(("127.0.0.1", port))
+    except OSError as exc:  # something already owns it on this machine
+        sock.close()
+        pytest.skip(f"127.0.0.1:{port} is not bindable here ({exc})")
+    sock.listen(1)
+    try:
+        yield
+    finally:
+        sock.close()
+
+
+class TestCollectorProbe:
+    """`agnes_gcp_logging_probe` arms/clears the marker by asking whether the
+    Ops Agent is actually receiving on its forward port.
+
+    It used to start a no-op container on the gcplogs driver, because that
+    driver refuses to initialize without credentials and Docker then refuses
+    to start the container (#1557). The overlay forwards asynchronously now,
+    so a missing collector can no longer stop a container — what is left to
+    catch is the quiet failure of buffering every line into a socket nobody
+    is listening on.
+    """
+
+    def test_probe_arms_the_marker_when_the_collector_is_up(self, compose_dirs):
         compose_dir, state_dir = compose_dirs
-        env = _fake_docker(tmp_path, exit_code=0)
-        result = _sh(
-            f'. "{RESOLVER.resolve()}" && agnes_gcp_logging_probe "{compose_dir}" "example/image:tag"',
-            env=env,
-        )
+        with _collector_listening():
+            result = _sh(f'. "{RESOLVER.resolve()}" && agnes_gcp_logging_probe "{compose_dir}" "example/image:tag"')
         assert result.returncode == 0, result.stderr
         assert (compose_dir / MARKER).exists()
-        calls = (tmp_path / "docker-calls.log").read_text()
-        assert "--log-driver=gcplogs" in calls, (
-            "the probe must exercise the actual gcplogs driver — that is where an unauthorized VM SA fails"
-        )
         assert OVERLAY in _resolve(compose_dir, state_dir)
 
-    def test_probe_failure_clears_a_stale_marker_and_the_overlay_drops(self, compose_dirs, tmp_path):
+    def test_probe_failure_clears_a_stale_marker_and_the_overlay_drops(self, compose_dirs):
         compose_dir, state_dir = compose_dirs
         (compose_dir / MARKER).touch()
-        env = _fake_docker(tmp_path, exit_code=1)
-        result = _sh(
-            f'. "{RESOLVER.resolve()}" && agnes_gcp_logging_probe "{compose_dir}" "example/image:tag"',
-            env=env,
-        )
+        # Nothing listening: whatever this host has on 24224, the probe must
+        # not arm on a stale marker alone.
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.settimeout(0.2)
+            if probe.connect_ex(("127.0.0.1", 24224)) == 0:
+                pytest.skip("something is listening on 127.0.0.1:24224 on this host")
+        result = _sh(f'. "{RESOLVER.resolve()}" && agnes_gcp_logging_probe "{compose_dir}" "example/image:tag"')
         assert result.returncode != 0
         assert not (compose_dir / MARKER).exists()
         assert OVERLAY not in _resolve(compose_dir, state_dir)
 
-    def test_probe_without_the_overlay_file_disarms_without_running_docker(self, compose_dirs, tmp_path):
+    def test_probe_without_the_overlay_file_disarms_without_probing(self, compose_dirs):
         compose_dir, _ = compose_dirs
         (compose_dir / OVERLAY).unlink()
         (compose_dir / MARKER).touch()
-        env = _fake_docker(tmp_path, exit_code=0)
-        result = _sh(
-            f'. "{RESOLVER.resolve()}" && agnes_gcp_logging_probe "{compose_dir}" "example/image:tag"',
-            env=env,
+        with _collector_listening():
+            result = _sh(f'. "{RESOLVER.resolve()}" && agnes_gcp_logging_probe "{compose_dir}" "example/image:tag"')
+        assert result.returncode != 0, (
+            "a deliberately removed overlay (enable_gcp_logging=false) must disarm "
+            "the gate even while the collector is up"
         )
-        assert result.returncode != 0
         assert not (compose_dir / MARKER).exists()
-        assert not (tmp_path / "docker-calls.log").exists(), (
-            "a deliberately removed overlay (enable_gcp_logging=false) must "
-            "disarm the gate without spending a docker run"
-        )
 
 
 class TestBootPathUsesTheSharedGate:
@@ -283,11 +329,11 @@ class TestBootPathUsesTheSharedGate:
             "fail the whole boot over a logging add-on"
         )
         extract_idx = body.index('docker cp "$EXTRACT_CONTAINER:/opt/agnes-host/." "$APP_DIR/"')
-        gate_idx = body.index("%{ if !enable_gcp_logging ~}")
+        gate_idx = body.index("%{ if !cloud_logging_logs_active ~}")
         probe_idx = body.index("agnes_gcp_logging_probe")
         assert extract_idx < gate_idx < probe_idx, (
             "the probe must run after the extraction that ships the overlay "
-            "AND after the enable_gcp_logging removal gate — probing a file "
+            "AND after the destination removal gate — probing a file "
             "the gate is about to remove would arm a marker for nothing"
         )
 
@@ -339,3 +385,182 @@ class TestAutoUpgradeTickConverges:
             "overlay so an arm/disarm transition triggers a recreate instead "
             "of waiting for an unrelated change"
         )
+
+
+class TestAProbeVerdictBelongsToOnePipeline:
+    """A refreshed overlay must invalidate the marker that armed the old one.
+
+    The live failure (2026-09-02): the tick refreshes
+    `docker-compose.gcp-logging.yml` in place from the pinned image, so a
+    running VM picked up the fluentd/Ops-Agent overlay within five minutes of
+    the switch landing in `:stable`. Its `.gcp-logging-ok` marker was still
+    the one the OLD gcplogs probe had written, and the tick re-probes only a
+    marker-LESS overlay — so the gate engaged a pipeline nothing had ever
+    verified. Async forwarding meant no outage; it meant every log line went
+    to a socket with no listener, on a VM whose Ops Agent arrives only with a
+    later Terraform apply. Silent total log loss, which is the failure mode
+    the marker exists to prevent.
+
+    A probe verdict is about one pipeline. Change the pipeline and the
+    verdict is stale, not inherited.
+    """
+
+    def test_a_refreshed_overlay_clears_the_marker(self):
+        body = AUTO_UPGRADE.read_text()
+        refresh_idx = body.index("extract_host_artifact docker-compose.gcp-logging.yml")
+        probe_idx = body.index("agnes_gcp_logging_probe /opt/agnes")
+        window = body[refresh_idx:probe_idx]
+        assert f"rm -f /opt/agnes/{MARKER}" in window, (
+            "refreshing the overlay must drop the marker that armed the "
+            "previous one, so the marker-less probe below re-runs against "
+            "the pipeline that is now actually on disk"
+        )
+
+    def test_the_marker_is_cleared_only_when_the_overlay_really_changed(self):
+        """Not on every tick — an unconditional clear would re-probe forever
+        and, because the marker is hashed, churn a recreate every five
+        minutes."""
+        body = AUTO_UPGRADE.read_text()
+        refresh_idx = body.index("extract_host_artifact docker-compose.gcp-logging.yml")
+        probe_idx = body.index("agnes_gcp_logging_probe /opt/agnes")
+        window = body[refresh_idx:probe_idx]
+        assert "sha256sum" in window or "cmp -s" in window, (
+            "the clear must be conditional on the overlay's content actually "
+            "changing, not fire on every refresh"
+        )
+
+
+class TestTheTickNamesTheRightCause:
+    """A guard that misreports its own cause sends the operator to the wrong
+    fix. The tick's messages described the gcplogs driver and pointed at
+    roles/logging.logWriter; the probe now asks whether the Ops Agent is
+    accepting on its forward port, which that role has nothing to do with."""
+
+    def test_no_message_blames_the_log_writer_role(self):
+        body = AUTO_UPGRADE.read_text()
+        for line in body.splitlines():
+            if "logger -t agnes-auto-upgrade" in line and "logging.logWriter" in line:
+                raise AssertionError(f"message names a cause the probe no longer tests: {line.strip()}")
+
+    def test_the_probe_messages_name_the_collector(self):
+        body = AUTO_UPGRADE.read_text()
+        probe_idx = body.index("agnes_gcp_logging_probe /opt/agnes")
+        window = body[probe_idx : probe_idx + 900]
+        assert "24224" in window or "Ops Agent" in window, (
+            "the arm/disarm messages must name what was actually probed"
+        )
+
+
+class TestTheTickCanAlwaysDeliverItsOwnFix:
+    """The self-update must not sit behind an early exit.
+
+    Observed on the fleet 2026-09-02: a long-running data refresh made every
+    tick take the `sync/refresh in flight — deferring recreate` branch, which
+    `exit 0`s. Host artifacts are refreshed well before that point, so the VM
+    took the new Cloud Logging overlay; the script's own self-update sits
+    after it, so the fix for that overlay could not arrive — for over four
+    hours, and for as long as the refresh kept running. The first tick that
+    finally gets through then recreates containers on the un-fixed logic and
+    only self-updates afterwards.
+
+    That is the "self-perpetuating old script" problem the self-update block
+    exists to prevent, reintroduced by ordering. A tick must be able to
+    deliver its own replacement on any path that reached the image.
+    """
+
+    def test_self_update_precedes_the_deferral_exit(self):
+        body = AUTO_UPGRADE.read_text()
+        self_update = body.index("agnes-auto-upgrade.sh.new")
+        defer_exit = body.index("deferring recreate")
+        assert self_update < defer_exit, (
+            "the self-update must run before the deferral's `exit 0` — behind "
+            "it, a VM that defers every tick can never receive a fixed script"
+        )
+
+    def test_self_update_follows_the_artifact_extraction(self):
+        """It needs the extract container the refresh block creates."""
+        body = AUTO_UPGRADE.read_text()
+        extract = body.index("EXTRACT_CID=")
+        self_update = body.index("agnes-auto-upgrade.sh.new")
+        assert extract < self_update
+
+
+class TestOverlayCoversEveryBaseComposeService:
+    """The overlay's service list must track `docker-compose.yml`, both ways.
+
+    It did not. The list was written in #679 against the compose file of the
+    day and never revisited; `extraction-worker` (added later by the
+    three-plane wave-1 topology), `apps-runner`, `egress-proxy` and
+    `kai-agent-stub` all arrived afterwards and silently stayed on
+    `json-file`. Verified live on a customer VM: `app`, `scheduler` and
+    `caddy` shipped to Cloud Logging while `agnes-extraction-worker-1` —
+    the process that runs the connector crawls, i.e. the logs an operator
+    actually goes looking for — did not, and its history died with every
+    auto-upgrade container recreate.
+
+    The near-miss in the same list is `extract` vs `extraction-worker`:
+    two different services (a one-shot Keboola extractor under the
+    `extract` profile, and the long-running extraction lane), one of which
+    was present and not running while the other ran and was absent.
+
+    The reverse direction is the safety half, and it is the sharper of the
+    two. A compose file that names a service without an `image:`/`build:`
+    is invalid, and this overlay is engaged from file presence alone —
+    independently of which OTHER overlays a given VM loads. Naming
+    `redis` / `postgres` / `kai-agent` here (each defined only in an
+    overlay that some instances do not load: the module-written
+    `docker-compose.extraction.yml`, `docker-compose.postgres.yml` on
+    side-car backends only, `docker-compose.kai-agent.yml`) would make
+    every `docker compose` call on the instances that lack it fail to
+    parse — the fleet-freeze shape of #1557 arriving through a different
+    door. Those services need their log driver set in the overlay that
+    defines them, not here.
+    """
+
+    @staticmethod
+    def _services(path: str) -> dict:
+        import yaml
+
+        doc = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+        return doc["services"]
+
+    def test_base_compose_services_are_discovered(self):
+        """Guard the guard: an empty base set would pass the check below."""
+        base = self._services("docker-compose.yml")
+        assert len(base) >= 8, f"expected the full base service list, got {sorted(base)}"
+        assert "extraction-worker" in base
+
+    def test_every_base_service_ships_to_cloud_logging(self):
+        base = set(self._services("docker-compose.yml"))
+        overlay = set(self._services(OVERLAY))
+        missing = sorted(base - overlay)
+        assert not missing, (
+            f"{OVERLAY} does not cover {missing} — these services are defined in "
+            "docker-compose.yml but keep the default json-file driver, so their "
+            "logs never leave the VM and do not survive a container recreate. "
+            "Add a `logging: driver: gcplogs` entry for each."
+        )
+
+    def test_overlay_names_no_service_the_base_compose_lacks(self):
+        base = set(self._services("docker-compose.yml"))
+        overlay = set(self._services(OVERLAY))
+        extra = sorted(overlay - base)
+        assert not extra, (
+            f"{OVERLAY} names {extra}, which docker-compose.yml does not define. "
+            "This overlay is engaged from file presence alone, so on any instance "
+            "whose COMPOSE_FILE lacks the overlay that DOES define such a service, "
+            "compose sees a service with no image/build and refuses to parse the "
+            "whole stack — every docker compose call on that VM fails. Set the log "
+            "driver in the overlay that defines the service instead."
+        )
+
+    def test_every_overlay_entry_only_sets_the_log_driver(self):
+        for name, spec in self._services(OVERLAY).items():
+            assert set(spec) == {"logging"}, (
+                f"{OVERLAY}: service {name!r} must carry a logging block and "
+                f"nothing else, got {sorted(spec)} — this file is a log-driver "
+                "overlay, not a place to override service config"
+            )
+            assert spec["logging"]["driver"] == "fluentd", (
+                f"{OVERLAY}: service {name!r} is not forwarding to the Ops Agent"
+            )

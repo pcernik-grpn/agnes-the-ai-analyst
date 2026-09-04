@@ -70,13 +70,14 @@ from src.db import get_analytics_db, get_system_db
 # and several test harnesses ``importlib.reload`` this module, which would mint
 # a new class and silently unbind the app-wide 501 handler. See
 # ``src/repository_errors.py``.
-from src.repository_errors import RequiresPostgresBackend
+from src.repository_errors import PoliciedRowDistributionError, RequiresPostgresBackend
 
 __all__ = [
     "get_system_db",
     "get_analytics_db",
     "use_pg",
     "RequiresPostgresBackend",
+    "PoliciedRowDistributionError",
     # Core user / RBAC cluster
     "users_repo",
     "user_groups_repo",
@@ -166,6 +167,10 @@ __all__ = [
     "facts_prompt_repo",
     # Built-in extraction run observability (2026-08-31 design §7.1)
     "extraction_runs_repo",
+    # Fleet-level provider-refusal conditions (TCRD-296 synthesis F.25)
+    "extraction_conditions_repo",
+    # Table access-policy revision history (#1979)
+    "access_policy_revisions_repo",
     # External SSO login (design 2026-08-28)
     "sso_config_repo",
     "user_external_identities_repo",
@@ -195,6 +200,16 @@ __all__ = [
     "semantic_feedback_repo",
     # Muted semantic-layer health checks (F4.3) — Postgres-only
     "semantic_health_mutes_repo",
+    # Corporate-memory detection run logs (issue #1971 Part 3) — Postgres-only
+    "memory_detection_runs_repo",
+    # SharePoint crawl/facts per-connection state — Postgres-only
+    "sharepoint_state_repo",
+    # Fact-extraction LLM response cache (cost-levers spec 2026-09-02, lever B) — Postgres-only
+    "facts_llm_cache_repo",
+    # SharePoint collection consolidation — Postgres-only
+    "sharepoint_collection_consolidation_repo",
+    # SharePoint split-merge (crawl/facts state union) — Postgres-only
+    "sharepoint_connection_merge_repo",
 ]
 
 
@@ -584,6 +599,20 @@ _REGISTRY: dict[str, dict[str, tuple[str, str]]] = {
     "extraction_runs": {
         PG: ("src.repositories.extraction_runs_pg", "ExtractionRunsPgRepository"),
     },
+    # Fleet-level provider-refusal conditions the facts-extraction stage
+    # cannot retry its way past (TCRD-296 synthesis F.25) — PG-only, A3
+    # ratchet: no DuckDB backend.
+    "extraction_conditions": {
+        PG: ("src.repositories.extraction_conditions_pg", "ExtractionConditionsPgRepository"),
+    },
+    # Table access-policy revision history (#1979 K1-sweep finding 1) —
+    # PG-only, A3 ratchet: no DuckDB backend. Deliberately NOT audit_log:
+    # `audit_log.params` redacts `access_policy_sql`, so the trail records
+    # that a policy changed but never what it was, and "restore this
+    # version" needs the body.
+    "access_policy_revisions": {
+        PG: ("src.repositories.access_policy_revisions_pg", "AccessPolicyRevisionsPgRepository"),
+    },
     # External SSO login (design 2026-08-28) — PG-only, A3 ratchet: no
     # DuckDB backend. The singleton runtime config for the `sso` provider
     # slot and the per-user external identity bindings it captures.
@@ -675,6 +704,47 @@ _REGISTRY: dict[str, dict[str, tuple[str, str]]] = {
     # a separate, finer-grained table, not a second backend for it.
     "usage_turns": {
         PG: ("src.repositories.usage_turns_pg", "UsageTurnsPgRepository"),
+    },
+    # Corporate-memory detection run logs (issue #1971 Part 3) — POSTGRES-ONLY,
+    # A3 ratchet: no DuckDB backend. Resolving this key on a DuckDB-backed
+    # instance raises RequiresPostgresBackend (translated to a typed 501 by
+    # app/main.py) — the run-log WRITE path (src.memory_detection_logging)
+    # catches that and degrades to one warning log line so a DuckDB instance
+    # never fails detection itself over a missing observability table.
+    "memory_detection_runs": {
+        PG: ("src.repositories.memory_detection_runs_pg", "MemoryDetectionRunsPgRepository"),
+    },
+    # SharePoint crawl/facts per-connection state (horizontal-scale
+    # extraction workers) — POSTGRES-ONLY, A3 ratchet: no DuckDB backend.
+    # Never resolved directly on a DuckDB-backed instance — the caller
+    # (``connectors.sharepoint.state_store``) checks ``use_pg()`` itself and
+    # falls back to the pre-existing per-connection JSON file instead, so a
+    # crawl in flight keeps working unchanged rather than hitting the typed
+    # 501 a route would get.
+    "sharepoint_state": {
+        PG: ("src.repositories.sharepoint_state_pg", "SharepointStatePgRepository"),
+    },
+    "facts_llm_cache": {
+        PG: ("src.repositories.facts_llm_cache_pg", "FactsLlmCachePgRepository"),
+    },
+    # SharePoint collection consolidation (fold several per-scope
+    # collections into one) — POSTGRES-ONLY, A3 ratchet: the tables it
+    # touches beyond the frozen file_corpora/corpus_files/corpus_chunks
+    # pair (corpus_file_sources, corpus_file_events, claims,
+    # fact_alias_sources) are themselves PG-only, so the whole operation
+    # can never run on a DuckDB-backed instance.
+    "sharepoint_collection_consolidation": {
+        PG: (
+            "src.repositories.sharepoint_collection_consolidation_pg",
+            "SharePointCollectionConsolidationPgRepository",
+        ),
+    },
+    # SharePoint split-merge (fold several sibling connections' crawl/facts
+    # state back onto one target) — POSTGRES-ONLY, A3 ratchet:
+    # `sharepoint_connection_state` (the table this reads/writes) has no
+    # DuckDB sibling itself.
+    "sharepoint_connection_merge": {
+        PG: ("src.repositories.sharepoint_connection_merge_pg", "SharePointConnectionMergePgRepository"),
     },
 }
 
@@ -1034,6 +1104,26 @@ def extraction_runs_repo() -> Any:
     return _build("extraction_runs")
 
 
+def extraction_conditions_repo() -> Any:
+    """Fleet-level provider-refusal conditions (workspace/usage-limit
+    exhaustion, a saturated region×model quota bucket, billing disabled)
+    that suppress further facts-extraction enqueues until they clear
+    (TCRD-296 synthesis F.25). PG-only — raises ``RequiresPostgresBackend``
+    on a DuckDB-backed instance; every caller in
+    ``connectors.sharepoint.facts_extraction`` treats that as "no
+    condition tracked here", never a hard failure."""
+    return _build("extraction_conditions")
+
+
+def access_policy_revisions_repo() -> Any:
+    """Saved states of a table's access policy (#1979) — what the history
+    panel lists and what "restore this version" prefills the editor from.
+    PG-only — raises ``RequiresPostgresBackend`` on a DuckDB-backed
+    instance, which every caller treats as "no revision history here" (the
+    modal falls back to the audit-derived, read-only history)."""
+    return _build("access_policy_revisions")
+
+
 def sso_config_repo() -> Any:
     """Singleton runtime config for the external SSO login (design
     2026-08-28). PG-only — raises ``RequiresPostgresBackend`` on a
@@ -1117,3 +1207,41 @@ def semantic_feedback_repo() -> Any:
 # RequiresPostgresBackend on a DuckDB-backed instance; let it propagate.
 def semantic_health_mutes_repo() -> Any:
     return _build("semantic_health_mutes")
+
+
+# Corporate-memory detection run logs (issue #1971 Part 3) — POSTGRES-ONLY.
+# Raises RequiresPostgresBackend on a DuckDB-backed instance; callers write
+# through src.memory_detection_logging.record_detection_run, which catches
+# that (and any other error) and degrades to one warning log line rather
+# than letting a missing observability table fail detection itself.
+def memory_detection_runs_repo() -> Any:
+    return _build("memory_detection_runs")
+
+
+# SharePoint crawl/facts per-connection state — POSTGRES-ONLY. Callers go
+# through connectors.sharepoint.state_store, which checks use_pg() itself
+# before ever calling this factory, so RequiresPostgresBackend never reaches
+# a crawl in flight on a DuckDB-backed instance.
+def sharepoint_state_repo() -> Any:
+    return _build("sharepoint_state")
+
+
+# Fact-extraction LLM response cache (cost-levers spec 2026-09-02, lever B)
+# — POSTGRES-ONLY. Raises RequiresPostgresBackend on a DuckDB-backed
+# instance; the sole caller, connectors.sharepoint.facts_extraction
+# ._resolve_llm_cache, catches that and runs the pass with caching off
+# (one log line) rather than letting a missing cache table fail extraction.
+def facts_llm_cache_repo() -> Any:
+    return _build("facts_llm_cache")
+
+
+# SharePoint collection consolidation (fold several per-scope collections
+# into one) — POSTGRES-ONLY. Raises RequiresPostgresBackend on a
+# DuckDB-backed instance; the route (app/api/admin_sharepoint.py's
+# consolidate_collections) lets it propagate to the app-wide 501 handler.
+def sharepoint_collection_consolidation_repo() -> Any:
+    return _build("sharepoint_collection_consolidation")
+
+
+def sharepoint_connection_merge_repo() -> Any:
+    return _build("sharepoint_connection_merge")

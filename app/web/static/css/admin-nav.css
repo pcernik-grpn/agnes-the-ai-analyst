@@ -85,6 +85,33 @@
     align-items: start;
 }
 
+/* ── The column widens where the space is not contested ───────────────────
+   200px cramps this column's own content: with every section expanded, one
+   gloss ("MCP servers whose tools — and apps — analysts can use") needs three
+   lines in a box clamped to two, so it truncates. 220px clears every one of
+   the 37 rows — but 240px is the number, because it is the primary sidebar's
+   own width (rail.css `width: 240px`). This column is the second tier of that
+   chrome, and since #2074 a pinned sidebar pushes it across rather than
+   covering it, so the two tiers stand side by side and should agree.
+
+   Why it is behind a breakpoint rather than simply 240px. The 40px comes
+   straight out of the content column, and at the low end that column is
+   already short: at a 1024px viewport it is 788px while the Marketplaces
+   table wants 791px, so it is overflowing to its internal scrollbar BEFORE
+   anything is taken away. Above 1732px the widening is free — the content is
+   capped at `--width-wide` either way, so the 40px comes out of the centring
+   band instead. 1440 is the compromise: it covers the laptop widths where the
+   truncation is actually read, and the content column there is 1108px, still
+   far above what these tables need.
+
+   Below 1440 nothing changes, including the 820px rule further down that
+   hides the column outright. */
+@media (min-width: 1440px) {
+    .admin-split {
+        grid-template-columns: 240px minmax(0, 1fr);
+    }
+}
+
 /* ── The split must span every scrollable pixel ───────────────────────────
    `.admin-nav` sticks within its GRID AREA, so anything the page puts BELOW
    `.admin-split` is scroll the column cannot stick through: at the end of the
@@ -322,12 +349,44 @@ html[data-ui-layout="rail"] .admin-nav .admin-nav__group-hd {
     color: var(--ds-text-muted);
 }
 
-/* Content beside the column takes its own comfortable measure. The container is
-   `--full` on admin pages (see the note in base_admin.html) so this column can
-   hug the rail instead of drifting with the page's centring — without this cap
-   the page body would then sprawl to whatever width the monitor happens to be. */
+/* ── The content column: the app's measure, centred in what chrome leaves ──
+   The container is `--full` on admin pages (see the note in base_admin.html)
+   so the nav column can hug the rail instead of drifting with the page's
+   centring. That removes the page's own measure too, hence a cap here — or the
+   body sprawls to whatever width the monitor happens to be.
+
+   All three declarations are `.idx-head` in style-custom.css, verbatim: it is
+   `width: 100%; max-width: var(--width-wide); margin: 0 auto` and it is the
+   header zone of every index page (Library, My Stack, Catalog, Definitions).
+   Those centre 1400px inside the region the primary sidebar leaves; this
+   centres the same 1400px inside the region the primary sidebar AND this nav
+   leave, both being chrome. So admin joins the platform's pattern rather than
+   inventing one — which is what #1956 item 7's "every other page centers it"
+   actually asks for. It was previously `--width-app` (1280px) and left-pinned,
+   differing from those pages in both measure and axis.
+
+   `width: 100%` is load-bearing, and `.idx-head` carries it for the same
+   reason: auto inline margins take a grid item out of `stretch` and size it
+   shrink-to-fit, so the cap alone left this column as wide as its content
+   happened to be — 834px of a 1628px cell on a 1920 monitor, NARROWER than
+   before and against the "use the available width" fix these tables had just
+   been given (#1989). 100% fills the cell, the cap trims it, the auto margins
+   split what is left. The nav never moves: auto margins can only absorb the
+   cell's own free space.
+
+   Be honest about the reach. The column is `viewport − 292` (56px collapsed
+   rail + 16px gutter + 200px nav + 20px gap), so the cap binds only from a
+   1572px viewport up — at 1440 and 1536 the column is 1148px and 1244px and
+   never touched even the old 1280. It closes the dead band between roughly
+   1572 and 1692, and above that splits the remainder instead of dropping it
+   all on the right (1920: 114px each side, not 228px on one). Below 1572px it
+   is a no-op by construction, and that is right rather than short — a content
+   column beside a 200px secondary nav is what an admin console looks like at
+   laptop widths. */
 .admin-main {
-    max-width: var(--width-app, 1280px);
+    width: 100%;
+    max-width: var(--width-wide, 1400px);
+    margin-inline: auto;
 }
 
 /* ── Section list ────────────────────────────────────────────────────── */

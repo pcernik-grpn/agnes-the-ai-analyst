@@ -513,8 +513,12 @@ class TestRailOptIn:
         assert 'class="pnote"' not in text
         assert "Content being prepared" not in text
         assert "lib-status" not in text
-        assert 'class="lib-count-note"' in text
-        assert ">More coming soon<" in text
+        # …and nothing at all above the inventory now: the "More coming soon"
+        # note went with the panels. It described the product's roadmap, not
+        # the list in front of the reader, and it had already been moved three
+        # times looking for a home it never had.
+        assert 'class="lib-count-note"' not in text
+        assert "More coming soon" not in text
         assert "lib-strip" not in text
         # The Data apps badge is NOT asserted here, and its absence is correct:
         # this instance has no files, so there is no Files band to carry it. The
@@ -764,11 +768,18 @@ class TestRailChatHistory:
         # Row anatomy: the ring (icon) + title + progress sentence.
         assert 'id="rail-getstarted-ring-fill"' in text
         assert 'id="rail-getstarted-title"' in text
-        assert ">Set up Agnes<" in text
+        # "Continue setup", not "Set up Agnes": opening /library IS the
+        # "Explore your Library" step, landed before the page renders, and the
+        # title and count are the caller's REAL state now rather than a static
+        # placeholder for chat_onboarding.js to overwrite.
+        assert ">Continue setup<" in text
         assert 'id="rail-getstarted-count"' in text
-        # The progress line renders EMPTY — a static "0 of 5" would flash the
-        # wrong number at anyone mid-way through.
-        assert '<span class="rail-getstarted-sub" id="rail-getstarted-count"></span>' in text
+        # The progress line used to render empty, on the reasoning that a
+        # static "0 of 5" would flash the wrong number at anyone mid-way; the
+        # real number is what removes the flash instead, since an empty line
+        # that fills in a beat later grew the row and moved every row above it
+        # (tests/test_rail_onboarding_first_paint.py).
+        assert '<span class="rail-getstarted-sub" id="rail-getstarted-count">1 of 6 steps complete</span>' in text
         # Retired anatomy: the horizontal bar and the chevron are gone — the
         # ring carries progress now, and this row navigates via the same
         # click as always rather than "expanding".
@@ -1340,13 +1351,13 @@ class TestRailBrandMark:
         # show the lockup AND the mark at once.
         peek_sel = (
             'html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek)'
-            ":is(:hover, :focus-within) .rail-logo-mark {"
+            ":where(:not(.rail-strip-only)):is(:hover, :focus-within) .rail-logo-mark {"
         )
         peek = css.split(peek_sel, 1)[1].split("}", 1)[0]
         assert "visibility: hidden" in peek
         assert (
             'html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek)'
-            ":is(:hover, :focus-within) .rail-logo-full," in css
+            ":where(:not(.rail-strip-only)):is(:hover, :focus-within) .rail-logo-full," in css
         )
 
     def test_the_swap_is_stepped_when_motion_is_reduced(self, web_client):
@@ -1466,7 +1477,7 @@ class TestRailChatsDestination:
         # A peeked rail is showing the lists, so the stand-in folds again.
         peek = css.split(
             'html[data-ui-layout="rail"] .rail.rail-icon-mode:not(.rail-no-peek)'
-            ":is(:hover, :focus-within) .rail-i--collapsed-only {",
+            ":where(:not(.rail-strip-only)):is(:hover, :focus-within) .rail-i--collapsed-only {",
             1,
         )[1].split("}", 1)[0]
         assert "height: 0" in peek

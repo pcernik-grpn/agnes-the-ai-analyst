@@ -431,15 +431,17 @@ SWITCHES: tuple[Switch, ...] = (
         config_keys=("mcp", "allow_query_param_token"),
         env_var="AGNES_MCP_ALLOW_QUERY_PARAM_TOKEN",
         kind="bool",
-        default=True,
+        default=False,
         effect="live",
         category="product",
         editable=True,
         description=(
             "Accept the MCP bearer token as a ?token= query param on SSE GET, for clients "
-            "that cannot set headers. On by default (grandfathered). The token lands in every "
-            "request log when used (CWE-598) — turn this off if all your MCP clients send the "
-            "Authorization header."
+            "that cannot set headers. OFF by default since the #1656 audit follow-up (was "
+            "grandfathered on) — the token lands in every request log when used (CWE-598), "
+            "plus browser history and proxy access logs. Turn this on only for a documented "
+            "client that genuinely cannot send the Authorization header; every connection "
+            "snippet Agnes hands out (/mcp-connect) is header-based already."
         ),
     ),
     Switch(
@@ -570,7 +572,8 @@ SWITCHES: tuple[Switch, ...] = (
         editable=True,
         description=(
             "Mirror the signed-in user's Entra ID group memberships (Microsoft Graph "
-            "GET /me/memberOf) into user_group_members (source='microsoft_sync') on every "
+            "GET /me/transitiveMemberOf/microsoft.graph.group) into user_group_members "
+            "(source='microsoft_sync') on every "
             "Microsoft sign-in — the same mechanism auth.keboola.* uses for Keboola, and "
             "google_sync uses for Google Workspace. Off by default: turning it on for the "
             "first time also widens the OAuth consent scope requested at "
@@ -735,9 +738,9 @@ SWITCHES: tuple[Switch, ...] = (
             "facts, shipped through the same POST /api/facts/ingest contract an external "
             "producer would use. A COST switch, which is why it is off by default and "
             "separate from `sharepoint.enabled`: this is the only stage that spends model "
-            "tokens per document — measured $0.011 for a typical ~5k-token document on the default "
-            "Haiku-class model, $0.020 when the corrective verbatim retry fires, roughly 3x "
-            "those figures on Sonnet (see "
+            "tokens per document — a live 187-document pass measured $0.0542/document on the "
+            "default Haiku-class model, roughly 3x on Sonnet; re-measure rather than trust "
+            "either figure blindly (see "
             "config/instance.yaml.example next to this key). Needs `facts.enabled` too: with "
             "the fact-graph surface off the pass is skipped rather than writing claims no "
             "endpoint would serve. Spreadsheets and CSVs are never sent (deterministic "

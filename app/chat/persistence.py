@@ -14,6 +14,7 @@ back to plain ``SELECT … FROM chat_sessions WHERE …``.
 
 from __future__ import annotations
 
+import logging
 import json
 import secrets
 from datetime import datetime, timezone
@@ -29,6 +30,9 @@ from app.chat.types import (
     Surface,
     UserWorkdir,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 def _gen_id(prefix: str) -> str:
@@ -241,10 +245,29 @@ class ChatRepository:
         return _row_to_session(row) if row else None
 
     def archive_session(self, chat_id: str) -> None:
+        """Put a conversation away — and UNPIN it, because the two states
+        contradict each other.
+
+        A pin means "keep this at the top of my list"; archiving means "this is
+        not in my list". A row that is both is a state nothing can act on
+        coherently: the rail (the only surface a pin positions anything on) lists
+        no archived rows, so the pin has no effect there, while /chats would show
+        a pinned row wearing an ARCHIVED badge and offer a "Pinned only" filter
+        that returns it. Clearing the pin here is what keeps the invariant true
+        at the source rather than papering over it per surface.
+
+        `restore_session` deliberately does NOT put the pin back: the pin is
+        gone, and re-pinning a restored conversation is one click for whoever
+        wants it — guessing on their behalf would resurrect a position they may
+        have long stopped wanting.
+        """
         if self._sessions_pg is not None:
             self._sessions_pg.archive_session(chat_id)
             return
-        self._conn.execute("UPDATE chat_sessions SET archived = TRUE WHERE id = ?", [chat_id])
+        self._conn.execute(
+            "UPDATE chat_sessions SET archived = TRUE, pinned_at = NULL WHERE id = ?",
+            [chat_id],
+        )
 
     def restore_session(self, chat_id: str) -> None:
         """Un-archive a session — the way back from the Chats page's Archived
@@ -302,6 +325,36 @@ class ChatRepository:
             self._sessions_pg.set_title(chat_id, title)
             return
         self._conn.execute("UPDATE chat_sessions SET title = ? WHERE id = ?", [title, chat_id])
+
+    def set_title_if_unset(self, chat_id: str, title: str) -> bool:
+        """Set ``title`` only while the session still has none. Returns
+        ``True`` if this call wrote it, ``False`` if a title was already there
+        (or the session is gone).
+
+        The auto-title task's write: it checks for a title before scheduling,
+        then awaits the model for up to several seconds — during which the
+        user may rename the chat (``PUT /api/chat/sessions/{id}/title``). A
+        plain ``set_title`` afterwards would replace the user's choice with
+        the model's; the conditional UPDATE makes "fill only if still empty"
+        atomic on both backends."""
+        if self._sessions_pg is not None:
+            return self._sessions_pg.set_title_if_unset(chat_id, title)
+        # No RETURNING: on DuckDB 1.5.x an UPDATE ... RETURNING on a row that
+        # chat_messages already references trips the FK+index limitation the
+        # docstring of set_title describes (the plain UPDATE does not). DuckDB
+        # answers a bare UPDATE with one row holding the affected-row count.
+        try:
+            row = self._conn.execute(
+                "UPDATE chat_sessions SET title = ? WHERE id = ? AND (title IS NULL OR title = '')",
+                [title, chat_id],
+            ).fetchone()
+        except Exception:
+            # Never let the count read take the auto-title task down. Decide
+            # by re-reading the row: the UPDATE may well have landed.
+            logger.debug("set_title_if_unset: affected-row read failed for %s; re-reading", chat_id, exc_info=True)
+            current = self.get_session(chat_id)
+            return current is not None and current.title == title
+        return bool(row and row[0])
 
     def set_pinned(self, chat_id: str, pinned: bool) -> None:
         """Pin (or unpin) a conversation so the history panel keeps it on top.

@@ -39,12 +39,28 @@
 .obs-filter-grow { flex: 1; min-width: 200px; }
 .obs-filter label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px;
   color: var(--text-secondary, #6b7280); }
-.obs-select, .obs-filter input[type=search] { padding: 6px 8px;
+/* One height for every control in this row. The row holds three kinds — a
+   `ds.dropdown` (38px, `.ds-dropdown-btn`, which is what the paper skin
+   actually renders in place of the native select), a search box, and a
+   checkbox — and they disagreed: 38 / 35 / whatever a checkbox is. Aligning
+   the checkbox to the search box left it off the dropdowns; aligning it to
+   the dropdowns left it off the search box. Naming ONE height is the only
+   version that is right for all three, and right in every theme rather than
+   in whichever one the author happened to be looking at. */
+.obs-select, .obs-filter input[type=search] { padding: 6px 8px; min-height: 38px;
   border: 1px solid var(--border, #e5e7eb); border-radius: 6px;
   background: var(--surface, #fff); font: inherit; }
+/* The row aligns on `flex-end`, so every filter's control must end on the
+   same line. A dropdown's cell is `label + gap + control`; this one has no
+   label above it, so it stood the height of a bare checkbox and sat below
+   the selects it filters alongside (#1956 item 10). `padding-top: 14px` was
+   the old attempt at the difference — it guessed at the LABEL's height when
+   what has to match is the CONTROL's, which is why it still landed short.
+   38px is the row's one control height, set on the selects and the search box
+   right above. */
 .obs-checkbox { display: flex; align-items: center; gap: 6px;
   text-transform: none; letter-spacing: 0; font-size: 13px;
-  color: var(--text-primary, #111827); cursor: pointer; padding-top: 14px; }
+  color: var(--text-primary, #111827); cursor: pointer; min-height: 38px; }
 .obs-filter-actions { display: flex; align-items: flex-end; }
 .obs-table-wrap { border: 1px solid var(--border, #e5e7eb); border-radius: 8px;
   overflow: hidden; background: var(--surface, #fff); }
@@ -61,8 +77,6 @@
 .obs-table tbody td { padding: 8px 12px; border-bottom: 1px solid var(--border-light, #f3f4f6); vertical-align: top; }
 .obs-table tbody tr { cursor: pointer; }
 .obs-table tbody tr:hover { background: var(--border-light, #f3f4f6); }
-.obs-table tbody tr.has-errors { background: var(--ds-accent-danger-bg); }
-.obs-table tbody tr.has-errors:hover { background: color-mix(in srgb, var(--ds-accent-danger-bg) 85%, transparent); }
 .obs-num { text-align: right; font-variant-numeric: tabular-nums; }
 .obs-empty { padding: 40px 16px; text-align: center; color: var(--text-secondary, #6b7280); font-size: 13px; }
 .obs-table-footer { display: flex; justify-content: space-between; align-items: center;
@@ -389,16 +403,34 @@
     tbody.innerHTML = '';
     d.rows.forEach(r => {
       const tr = document.createElement('tr');
-      if (r.tool_errors > 0) tr.classList.add('has-errors');
+      // NO row tint. This used to be `if (r.tool_errors > 0)` → paint the
+      // whole row with the danger background, which said "this session
+      // failed" about a session that merely retried a tool call. One bad path
+      // in a 300-call run is ordinary agent behaviour, so most long sessions
+      // came up red and the strongest signal on the page stopped carrying
+      // information. It was redundant as well as alarming: the Errors column
+      // beside it already shows the exact count as a chip, and that column is
+      // sortable and has its own "errors only" filter.
+      //
+      // TODO(future): red is now free to mean something, and the thing worth
+      // spending it on is SESSION OUTCOME — "did this session end badly" —
+      // which is a different question from "did any tool call error" and one
+      // the listing row cannot currently answer. It needs an outcome field
+      // from the collector/UsageProcessor first (see `_session_tool_stats` in
+      // app/api/admin_sessions.py, which counts calls and errors and nothing
+      // about how the run ended). Deliberately NOT approximated with an error
+      // RATE in the meantime: both `tool_calls` and `tool_errors` are on the
+      // row so a ratio is computable, but any threshold would be picked by eye
+      // and would still be a guess wearing the clothes of a measurement.
       const errCell = r.tool_errors > 0
         ? '<span class="obs-err-chip">' + fmtN(r.tool_errors) + '</span>'
         : '<span style="color:var(--text-secondary, #6b7280)">0</span>';
       // URL `{username}` segment is the on-disk directory name (UUID for
       // upload-API sessions, OS-username for the legacy collector), NOT
-      // r.username — that's now the display email (v60 collapse, #458)
-      // which the `_safe_session_path` regex on the server rejects. The
-      // listing API returns `session_dir` derived from `session_file`
-      // explicitly so the UI doesn't have to re-derive it.
+      // r.username — that's the display email (v60 collapse, #458). The
+      // server accepts the email too since #2266, but resolving it costs a
+      // user lookup per request; the listing API returns `session_dir`
+      // derived from `session_file` so the UI can address the file directly.
       const sessionDir = r.session_dir || '_';
       const viewerHref = '/admin/sessions/' + encodeURIComponent(sessionDir)
                        + '/' + encodeURIComponent(r.session_file.split('/').pop());

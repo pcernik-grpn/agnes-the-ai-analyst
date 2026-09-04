@@ -179,26 +179,45 @@ settings:
 
 ## Cost & limits
 
-Per-user defaults (configurable in `/admin/server-config`):
+Per-user defaults (the three per-sender limits are editable under
+"Chat access" in `/admin/server-config`; they are read once at startup, so a
+save applies after the app process restarts):
 
 | Setting | Default |
 |---|---|
 | Concurrent sessions per user | 3 |
 | Idle TTL | 30 min |
-| Anthropic spend cap | $20 / day |
-| Cumulative tokens per session | 200 k |
+| LLM spend cap per person, per UTC day (`chat.daily_anthropic_spend_usd`) | $20 / day (`0` disables) |
+| Tokens billed per conversation, cumulative (`chat.max_session_tokens`) | 2 M (`0` disables) |
+| Messages per sender per hour (`chat.rate_messages_per_hour`) | 100 |
 | Per-tool-call wall clock | 90 s |
 | BigQuery scan per session | 20 GiB |
 | Sandbox pause after disconnect linger | 60 s (`chat.detach_linger_seconds`) |
 | Paused sandbox GC TTL | 7 days (`chat.paused_ttl_seconds`) |
 | On-detach policy | `pause` (`chat.on_detach`) |
 
-Token-derived caps (the spend cap and per-session token cap) are metered
-on both providers. The kai-agent engine's stream carries no usage numbers,
-so engine turns are metered from broker-observed usage instead: the broker
-accumulates each session's provider-reported usage and the manager folds it
-into the turn at persist (see the provider notes below). Message-rate and
-concurrency caps apply everywhere.
+Token-derived caps (the spend cap and per-conversation token budget) are
+metered on both providers. The kai-agent engine's stream carries no usage
+numbers, so engine turns are metered from broker-observed usage instead: the
+broker accumulates each session's provider-reported usage and the manager
+folds it into the turn at persist (see the provider notes below).
+Message-rate and concurrency caps apply everywhere. `0` disables either
+token-derived cap.
+
+**`chat.max_session_tokens` is a budget, not a context window.** It sums
+the tokens *billed* over a conversation's whole life — input, output and
+cache writes of every LLM call, across every turn (cache reads are
+excluded). An agentic turn re-sends the conversation to the model on every
+tool call, so a single turn with a dozen tool calls bills several hundred
+thousand tokens while the context itself stays far below the model's limit.
+Compaction is the engine's job and bounds that context; it cannot lower a
+cumulative sum. Set this knob near a context window (the old 200 k default)
+and it trips a few turns into any real conversation with a refusal that
+reads as "compaction does not work". The default is sized as a
+runaway-conversation guard — ten context windows of re-sent input; the
+per-sender daily spend cap is the cost control. When it trips, the user is
+told the conversation has reached its token budget and to start a new one;
+the reason string surfaces to operators as `max_session_tokens_exhausted`.
 
 **Session lifecycle.** What a session holds depends on the provider:
 under `docker` it is a per-session container; under `kai-agent` it is a
@@ -389,6 +408,24 @@ same `supports_approvals` sink capability, same pending-card replay to a
 late-attaching browser, same Slack Continue-on-web nudge, and the same
 immediate actionable deny on `Surface.API`.
 
+On the **`kai-agent` provider** there is no in-sandbox runner to hold a
+`can_use_tool` callback, so the same round-trip rides the engine's own
+approval channel: the engine parks the `AskUserQuestion` call and merges
+whatever `answers` the approval decision carries into the SDK's
+`updatedInput`. The provider translates that request into the identical
+`question_request` card and posts the picked `{question: label}` map back
+as the decision's `answers` (`_raise_question` in
+`app/chat/kai_engine_provider.py`) — so an approval answered `allow` with
+no answers is not "the user let the agent ask", it is "the user was asked
+and said nothing", and the tool returns *The user did not answer the
+questions.* The four outcomes carry the gate's own wording, shared from
+`app/chat/runner.py` so both runtimes read identically to the model. The
+timeout is enforced Agnes-side here because the engine never auto-denies an
+interactive approval (its sandbox waits ~24 h), and the
+`chat.approvals_enabled` kill-switch does not reach a question on either
+provider: it exists so tool calls do not wait on a human who is not there,
+and this one waits on the person the answer is for.
+
 **Warehouse data is sent to Anthropic by design** — do not store data
 the operator does not want Anthropic to process.
 
@@ -553,6 +590,18 @@ needs unrestricted internet access and you accept that trade-off; prefer
 | `open` | normal bridge — the sandbox can reach the internet, so in-sandbox `pip install` / `npm install` work. **Unrestricted egress; explicit operator opt-in only.** |
 | `allowlist` | the `none` internal network **plus** the `services/egress_proxy` sidecar dual-homed onto it (compose profile `chat-docker-egress`). Sandboxes get `HTTP(S)_PROXY` pointed at the proxy and may reach exactly `chat.docker_egress_allow_hosts` (exact names or `*.suffix` wildcards) — each connection is re-checked **after DNS resolution** against link-local/metadata/private ranges and connects to the vetted address, closing the DNS-rebinding gap; cloud metadata endpoints stay blocked even if listed. The proxy env is cooperative, but ignoring it is not a bypass: the internal network has no other route out. **Requires the rails URL to be internally reachable** — the sandbox's `NO_PROXY` carries whatever host `AGNES_SERVER` resolves to, so a public `SERVER_URL` would be forced onto a direct connection the no-route-out network cannot make. Use `AGNES_INTERNAL_URL` (e.g. `http://app:8000` under compose), as the rest of this page already instructs. |
 
+A curated skill's own `requirements.txt` is subject to the same rule: under
+`none` it can never install at runtime — there is no route to PyPI, at spawn
+or mid-turn. Its packages must be baked into the sandbox image (the
+Dockerfile's hand-maintained pip list) or shipped some other way. Under
+`open`/`allowlist` (with `chat.docker_egress_allow_hosts` covering
+`pypi.org`/`*.pypi.org`/`files.pythonhosted.org`), the runner best-effort
+warms up any skill `requirements.txt` it finds in one detached `pip install
+-r` right after installing the caller's marketplace plugins — fire-and-forget,
+so a slow or failed install never delays `runner_ready` or surfaces to the
+user; it is a convenience, not a guarantee, and it is skipped outright (one
+debug log) under `none`.
+
 To enable `allowlist` mode under Compose: set `chat.docker_egress_mode:
 allowlist` + `chat.docker_egress_allow_hosts` in `instance.yaml`, export
 `EGRESS_ALLOW_HOSTS` (the same list, comma-separated — the compose-owned
@@ -638,10 +687,28 @@ Requirements and semantics:
   new conversation.
 - **Tool approvals round-trip.** The engine raises approval-requiring tool
   calls as events; they render as the normal web approval card, and the
-  decision is delivered to the engine's approval endpoint. `allow_session`
-  collapses to a plain allow (the engine has no per-session grant), and
-  `chat.approvals_enabled: false` auto-denies each request instantly — the
-  same kill-switch semantics as the native gate.
+  decision is delivered to the engine's approval endpoint. Which calls ask is
+  the engine's rule: its sandbox auto-approves an MCP tool whose `tools/list`
+  entry carries `annotations.readOnlyHint: true` and asks for everything
+  else. Foundation tools get the hint from `@tool(read_only=…)`; passthrough
+  tools (admin-registered MCP sources) get it from `tool_registry.mutating` —
+  a read-only row runs unasked, a mutating one asks — so an admin who wants a
+  passthrough tool gated marks it mutating (which also puts it behind the
+  `allow_mutating` grant). The card's reason line says exactly that ("not
+  marked read-only"), so a reader can tell a search from a write.
+  `allow_session` is honoured by the provider, not the engine (whose
+  endpoint knows only allow/deny per call): the handle remembers the approved
+  call — tool **and** arguments, the same key the native gate uses — for the
+  life of the live session on this gateway and answers the engine's next
+  request for that identical call itself, with no card; a pause/resume or a
+  respawn starts over. The decision (allowed, allowed for the session,
+  denied, timed out) is also recorded on the tool line it gated and
+  persisted with the message — including on the later calls the session
+  grant let through, which would otherwise look ungated — so a reloaded
+  transcript still shows which calls a human let through; the approval card
+  itself is never persisted. `chat.approvals_enabled: false`
+  auto-denies each request instantly — the same kill-switch semantics as the
+  native gate.
 - **Pause/resume is bookkeeping only.** There is no Agnes-side sandbox to
   snapshot; a paused session simply drops its engine connection and a resume
   re-attaches by chat id — the transcript and agent state live in the engine.
@@ -829,8 +896,9 @@ Model ids: operators may write either spelling of a dated snapshot —
 `claude-…-YYYYMMDD` (first-party) or `claude-…@YYYYMMDD` (Vertex) — in
 `agents.model` and `chat.agent_api_utility_models`; the broker compares them
 canonically. Cost note: `daily_anthropic_spend_usd` estimates spend with the
-hard-coded Sonnet prices in `app/chat/manager.py` — under Vertex this stays
-the same approximation it is on the first-party API.
+price table in `src/llm_pricing.py`, at the most expensive general-purpose
+tier when a message carries no model — under Vertex this stays the same
+approximation it is on the first-party API.
 
 ## Operator setup details
 
@@ -863,14 +931,15 @@ example) is **two independent rollouts**:
 ### Keep the sandbox image fresh (docker provider)
 
 **A stale image silently loses features, it does not fail.** The sandbox
-image ships `matplotlib` so the agent can draw a chart; an image built
-before that was added may have no way to obtain it at runtime
-(`docker_egress_mode: none`, or an allowlist without PyPI, puts package
-installs out of reach), so the agent falls back to prose or a markdown
-table instead of a chart, with nothing in the logs to say why. After
-upgrading Agnes, rebuild the image —
+image ships `matplotlib` so the agent can draw a chart, and `python-pptx` /
+`python-docx` / `openpyxl` so a curated skill can author a deck, document or
+workbook (#1977); an image built before one of those was added has no way to
+obtain it at runtime (`docker_egress_mode: none`, or an allowlist without
+PyPI, puts package installs out of reach), so the agent either falls back to
+prose or a markdown table, or the skill simply fails, with nothing in the
+logs to say why. After upgrading Agnes, rebuild the image —
 `docker build -t agnes-chat-sandbox:latest app/initial_workspace_default/docker-sandbox`
-— and confirm the contract label reads `2`:
+— and confirm the contract label reads `3`:
 `docker inspect -f '{{ index .Config.Labels "agnes.chat-sandbox.contract" }}'`.
 
 ### Per-user workspace size

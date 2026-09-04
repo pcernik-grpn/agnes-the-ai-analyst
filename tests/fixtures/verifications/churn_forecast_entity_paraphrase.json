@@ -6,8 +6,12 @@
       "content": "We track forecasted churn monthly by summing up projected cancellations across active subscriptions and dividing by active subscriptions at the period's start.",
       "user_quote": "Yep, that's how we forecast churn: we track it monthly by summing up projected cancellations across active subscriptions and dividing by active subscriptions at the period's start.",
       "domain": "finance",
-      "entities": ["churn", "forecast"],
-      "base_confidence": 0.90
+      "entities": [
+        "churn",
+        "forecast"
+      ],
+      "base_confidence": 0.9,
+      "scope": "general"
     }
   ]
 }

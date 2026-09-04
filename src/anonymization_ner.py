@@ -34,12 +34,27 @@ Three properties are load-bearing, in descending order of importance:
 
 Which LLM path this reuses
 --------------------------
-Credential resolution follows the established server-side convention exactly
-— ``ANTHROPIC_API_KEY`` → ``LLM_API_KEY`` → Vertex ADC — as implemented by
-``src/store_guardrails/runner.py::default_api_key_loader`` and
-``src/ingest/vision.py``, with the Vertex client built by
-``connectors.llm.vertex_provider.create_vertex_client`` and the model id
-translated by ``to_vertex_model_id``. The model default comes from the same
+:func:`build_client` resolves WHICH PROVIDER (Anthropic direct, or Google
+Vertex AI) builds the client via :func:`resolve_llm_provider` — the SAME
+ladder ``connectors.sharepoint.facts_extraction.resolve_effective_provider``
+uses for its own default: an explicit per-stage setting
+(``extraction.anonymization.provider`` for this module, ``extraction.
+scan_ocr.provider`` for :mod:`src.ingest.scan_ocr`) wins outright;
+otherwise ``extraction.facts.provider`` (when it itself names a concrete
+provider rather than its own default ``inherit``); otherwise this instance's
+own ``ai.provider`` (``connectors.llm.factory.vertex_config_or_none``); and
+only once none of those resolve to Vertex does a static
+``ANTHROPIC_API_KEY``/``LLM_API_KEY`` apply. This fixes a live incident
+(TCRD-296 gap #68): scan OCR and NER previously resolved "static key wins,
+Vertex ADC is the keyless fallback" — the OPPOSITE precedence — so a stale
+``ANTHROPIC_API_KEY`` left in the environment (an exhausted workspace) kept
+winning over an instance that had migrated everything else to Vertex. A
+Vertex resolution builds the client through
+``connectors.llm.vertex_provider.create_vertex_client`` with the model id
+translated by ``to_vertex_model_id``, using this instance's own
+``ai.vertex.project_id``/``ai.vertex.region``
+(``connectors.llm.factory.vertex_config_or_none``) — neither module adds a
+region override of its own. The model default comes from the same
 ``extraction.model`` knob corporate-memory extraction uses, resolved through
 ``connectors.llm.factory.resolve_model_tier`` so ``haiku``/``sonnet``/``opus``
 also work.
@@ -62,9 +77,11 @@ import json
 import logging
 import os
 import re
+import threading
 import time
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
-from typing import Any, Callable, Iterable, Literal, Sequence
+from typing import Any, Literal
 
 logger = logging.getLogger(__name__)
 
@@ -91,7 +108,27 @@ DEFAULT_BACKOFF_S = 2.0
 
 # Output budget. Entity lists are small objects (~15 tokens each); 4k tokens
 # holds a few hundred distinct surface forms from one chunk.
+#
+# Overridable per instance (`extraction.anonymization.llm.max_output_tokens`,
+# read by `configured_max_output_tokens`) because the adequate value belongs
+# to the deployed model, not to this code. A model with a reasoning channel
+# spends this same budget on thinking first and can hit the ceiling before
+# emitting any JSON — which arrives here as an empty reply, indistinguishable
+# from a broken endpoint. Measured on a 20B reasoning model: ~8k output tokens
+# per document at concurrency 1, rising past 16k under batching. A model with
+# no reasoning channel answers the same documents in ~200.
 DEFAULT_MAX_OUTPUT_TOKENS = 4096
+
+# Bounds for the configurable ceiling. The floor keeps a typo'd `10` from
+# truncating every reply; the cap keeps one from pinning a GPU for minutes per
+# document. Anything outside falls back to the default.
+_MIN_OUTPUT_TOKENS = 256
+_MAX_OUTPUT_TOKENS = 65_536
+
+# Env var NAME holding the bearer token for a self-hosted endpoint. The name
+# is allowlisted in `src/orchestrator_security.py`; this is only the default
+# an operator gets without configuring `api_key_env` at all.
+DEFAULT_LLM_API_KEY_ENV = "AGNES_ANONYMIZATION_LLM_API_KEY"
 
 # A single surface form longer than this is not a name — it is the model
 # echoing a sentence. Dropped before the verbatim check so a pathological
@@ -435,12 +472,25 @@ def parse_entities(reply: str, chunk: str) -> tuple[list[Any], int]:
 def default_model() -> str:
     """Resolve the detector's model from instance config.
 
-    ``corporate_memory.extraction.model`` (where corporate-memory extraction
-    reads its own) wins, then a top-level ``extraction.model``, then
-    :data:`FALLBACK_MODEL`. Tier names (``haiku``/``sonnet``/``opus``) are
-    resolved to concrete ids by the shared factory, and a typo raises there
-    rather than at first call.
+    A configured self-hosted endpoint wins outright and its model id is used
+    VERBATIM: ``resolve_model_tier`` deliberately refuses anything that is
+    not a tier name or a ``claude-*`` id, which is the right guard for the
+    Anthropic path (it turns a typo into a startup error instead of a failed
+    call) and exactly the wrong one for an endpoint serving ``qwen3.5-9b``.
+    Rather than weakening that shared guard for every caller, the self-hosted
+    branch simply does not go through it — the endpoint is the authority on
+    what it serves.
+
+    Otherwise: ``corporate_memory.extraction.model`` (where corporate-memory
+    extraction reads its own) wins, then a top-level ``extraction.model``,
+    then :data:`FALLBACK_MODEL`. Tier names (``haiku``/``sonnet``/``opus``)
+    are resolved to concrete ids by the shared factory, and a typo raises
+    there rather than at first call.
     """
+    endpoint = self_hosted_endpoint()
+    if endpoint is not None:
+        return endpoint.model
+
     raw = ""
     try:
         from app.instance_config import get_value
@@ -457,6 +507,134 @@ def default_model() -> str:
     from connectors.llm.factory import resolve_model_tier
 
     return resolve_model_tier(raw)
+
+
+@dataclass(frozen=True)
+class SelfHostedEndpoint:
+    """A validated self-hosted detector endpoint from instance config.
+
+    Only ever constructed by :func:`self_hosted_endpoint`, which is where
+    both allowlist gates run — so holding one of these is proof the host was
+    approved and the key variable was nameable, not merely that an admin
+    typed something into the config editor.
+    """
+
+    base_url: str
+    model: str
+    api_key: str
+
+
+def self_hosted_endpoint() -> SelfHostedEndpoint | None:
+    """The configured self-hosted endpoint, or ``None`` for the Anthropic path.
+
+    Reads ``extraction.anonymization.llm.{base_url,model,api_key_env}``. All
+    of it is admin-writable server config (`extraction` is in
+    ``_STATIC_EDITABLE_SECTIONS``), so nothing here is trusted:
+
+    * ``api_key_env`` is checked against
+      :func:`~src.orchestrator_security.is_anonymization_llm_key_env_allowed`
+      BEFORE the value is read, so the config cannot name the vault key, the
+      anonymization HMAC key, or a connector certificate and have it sent as
+      a bearer token.
+    * ``base_url``'s host is checked against
+      :func:`~src.orchestrator_security.is_anonymization_llm_host_allowed`,
+      which is default-closed. The payload here is not just the token — the
+      detector sends PRE-anonymization document text, so an unapproved host
+      is a document-exfiltration channel, not merely a credential one.
+
+    A misconfiguration raises :class:`DetectionUnavailable` rather than
+    falling back to the Anthropic path: an operator who asked for a local
+    model must not silently start billing a cloud one, and (worse) must not
+    silently ship documents somewhere they did not intend.
+    """
+    try:
+        from app.instance_config import get_value
+    except Exception:  # noqa: BLE001 — no config package means no self-hosted endpoint
+        return None
+
+    def _cfg(name: str) -> str:
+        value = get_value("extraction", "anonymization", "llm", name, default="")
+        return value.strip() if isinstance(value, str) else ""
+
+    base_url = _cfg("base_url")
+    if not base_url:
+        return None
+
+    from src.orchestrator_security import (
+        is_anonymization_llm_host_allowed,
+        is_anonymization_llm_key_env_allowed,
+    )
+
+    if not is_anonymization_llm_host_allowed(base_url):
+        raise DetectionUnavailable(
+            "extraction.anonymization.llm.base_url names a host that is not on "
+            "AGNES_ANONYMIZATION_LLM_HOST_ALLOWLIST. Add the host (comma-separated "
+            "host or host:port) to that environment variable on the server. It is "
+            "deliberately default-closed: this endpoint receives document text "
+            "before anonymization."
+        )
+
+    key_env = _cfg("api_key_env") or DEFAULT_LLM_API_KEY_ENV
+    if not is_anonymization_llm_key_env_allowed(key_env):
+        raise DetectionUnavailable(
+            f"extraction.anonymization.llm.api_key_env={key_env!r} is not an allowed "
+            f"variable for this endpoint's token. Use {DEFAULT_LLM_API_KEY_ENV}, or "
+            "leave api_key_env empty."
+        )
+
+    model = _cfg("model")
+    if not model:
+        raise DetectionUnavailable(
+            "extraction.anonymization.llm.base_url is set but "
+            "extraction.anonymization.llm.model is empty — a self-hosted endpoint "
+            "serves whatever model id it was started with, and Agnes will not guess it."
+        )
+
+    # An endpoint that wants no auth is legitimate (the API contract makes the
+    # bearer optional), so an empty value is not an error — but the NAME still
+    # had to pass the allowlist above before we looked.
+    return SelfHostedEndpoint(base_url=base_url, model=model, api_key=os.environ.get(key_env, "").strip())
+
+
+def configured_max_output_tokens() -> int:
+    """``extraction.anonymization.llm.max_output_tokens``, or the default.
+
+    Made configurable because the right value is a property of the deployed
+    model, not of Agnes: a model with a reasoning channel shares this budget
+    between thinking and answering and can exhaust it before emitting any
+    JSON, which this module can only observe as an empty reply. Out-of-range
+    or unparseable values fall back to the default rather than crashing a
+    crawl — the ceiling is a guardrail, not a correctness input.
+    """
+    try:
+        from app.instance_config import get_value
+
+        raw = get_value("extraction", "anonymization", "llm", "max_output_tokens", default=0)
+        value = int(raw)
+    except Exception:  # noqa: BLE001 — no config, wrong type, non-numeric string
+        return DEFAULT_MAX_OUTPUT_TOKENS
+    if value == 0:
+        # `0` is what `instance.yaml.example` tells operators to write for
+        # "use the built-in default", and an unset key resolves to it too.
+        # Warning about the value the documentation prescribes would fire on
+        # every detector construction on every default instance — noise that
+        # trains readers to ignore the line that matters below.
+        return DEFAULT_MAX_OUTPUT_TOKENS
+    if value < _MIN_OUTPUT_TOKENS or value > _MAX_OUTPUT_TOKENS:
+        # WARNING, not silence. Falling back keeps a crawl running rather than
+        # crashing it on a guardrail, but a value an operator typed and Agnes
+        # ignored must say so — otherwise a too-small ceiling reads downstream
+        # as unexplained `anonymize_failed` counts with nothing pointing at
+        # the config that caused them.
+        logger.warning(
+            "extraction.anonymization.llm.max_output_tokens=%r is outside [%d, %d]; using the default %d instead",
+            raw,
+            _MIN_OUTPUT_TOKENS,
+            _MAX_OUTPUT_TOKENS,
+            DEFAULT_MAX_OUTPUT_TOKENS,
+        )
+        return DEFAULT_MAX_OUTPUT_TOKENS
+    return value
 
 
 def _static_key() -> str:
@@ -478,18 +656,139 @@ def _vertex_config() -> tuple[str, str] | None:
         return None
 
 
-def build_client(model: str, timeout_s: float) -> tuple[Any, str]:
-    """Build the Anthropic client for ``model``; returns ``(client, model)``.
+#: The closed vocabulary a provider-selection knob accepts — mirrors
+#: ``connectors.sharepoint.facts_extraction._VALID_PROVIDERS`` exactly (this
+#: module intentionally does not import that one: it is a private name in a
+#: different module, and the vocabulary is small and stable enough that a
+#: copy pinned by :func:`resolve_llm_provider`'s own tests is preferable to a
+#: cross-module private dependency).
+_VALID_PROVIDER_SETTINGS = frozenset({"inherit", "anthropic", "vertex"})
 
-    Static key wins; Vertex ADC is the keyless fallback (and rewrites the
-    model id to the Vertex spelling) — the same precedence every other
-    server-side call-site in this repo uses. Raises
-    :class:`DetectionUnavailable` when neither credential path is configured,
-    because "no credential" must fail the document, not empty it.
+
+def _provider_config_value(*path: str) -> str:
+    """One provider-selection knob from ``instance.yaml``, normalized and
+    validated against :data:`_VALID_PROVIDER_SETTINGS` — ``""`` when unset,
+    unreadable (no config package / no ``instance.yaml`` at all), or not one
+    of the closed set. A recognized-but-wrong value is warned about and
+    still treated as unset (the same loudly-named, quietly-corrected posture
+    ``connectors.sharepoint.facts_extraction._provider_setting`` takes for
+    its own knob) — a typo in config must not crash a crawl.
     """
+    try:
+        from app.instance_config import get_value
+
+        raw = get_value(*path, default="")
+    except Exception:  # noqa: BLE001 — no config package / no instance.yaml is fine
+        return ""
+    value = str(raw or "").strip().lower()
+    if value in _VALID_PROVIDER_SETTINGS:
+        return value
+    if value:
+        logger.warning(
+            "%s=%r is not one of %s — ignoring",
+            ".".join(path),
+            raw,
+            sorted(_VALID_PROVIDER_SETTINGS),
+        )
+    return ""
+
+
+def resolve_llm_provider(*own_setting_path: str) -> tuple[str, str]:
+    """``(provider, source)`` — ALWAYS a concrete ``"anthropic"``/``"vertex"``,
+    the provider :func:`build_client` builds its client against.
+
+    The SAME ladder ``connectors.sharepoint.facts_extraction.
+    resolve_effective_provider`` uses for its own ``inherit`` default,
+    generalized so a caller can name its own provider-selection knob:
+
+    1. ``own_setting_path`` (this STAGE's own knob — e.g.
+       ``extraction.scan_ocr.provider`` for scan OCR,
+       ``extraction.anonymization.provider`` for the NER detector). An
+       explicit ``anthropic``/``vertex`` there wins outright; ``inherit`` (or
+       absent) falls through. Pass ``()`` (no path) to skip this level
+       entirely — the shared batches-API client
+       (``connectors.sharepoint.facts_extraction._ensure_batch_client``) has
+       no per-stage knob of its own and relies on levels 2/3 alone.
+    2. ``extraction.facts.provider`` — an explicit value there wins next, so
+       a stage with no override of its own follows whatever the facts pass
+       is pinned to (a single operator decision, "this instance's LLM
+       traffic goes through Vertex", should not need restating per stage).
+    3. This instance's own ``ai.provider`` — read the SAME way every other
+       server-side call site does (:func:`connectors.llm.factory.
+       vertex_config_or_none`): ``"vertex"`` when configured, else
+       ``"anthropic"``.
+
+    Never "a static ``ANTHROPIC_API_KEY``/``LLM_API_KEY`` wins over Vertex" —
+    that was this ladder's PREVIOUS precedence and is the live incident this
+    function exists to fix (TCRD-296 gap #68): a stale key left in the
+    environment (an exhausted workspace, or used by something unrelated)
+    kept outranking an instance that had migrated everything else to
+    Vertex. The static key is consulted only by :func:`build_client` itself,
+    once this function has already said the resolved provider is
+    ``"anthropic"``.
+
+    ``source`` is ``"own"``, ``"facts"``, or ``"ai.provider"`` — which level
+    decided, for the one-line startup log a caller may want to emit.
+    """
+    if own_setting_path:
+        own = _provider_config_value(*own_setting_path)
+        if own and own != "inherit":
+            return own, "own"
+    facts = _provider_config_value("extraction", "facts", "provider")
+    if facts and facts != "inherit":
+        return facts, "facts"
+    if _vertex_config() is not None:
+        return "vertex", "ai.provider"
+    return "anthropic", "ai.provider"
+
+
+def build_client(model: str, timeout_s: float, *, own_setting_path: tuple[str, ...] = ()) -> tuple[Any, str]:
+    """Build the Anthropic (direct or Vertex) client for ``model``; returns
+    ``(client, model)``.
+
+    Provider selection goes through :func:`resolve_llm_provider` —
+    ``own_setting_path`` names this CALLER's own provider knob (see that
+    function's docstring); the default ``()`` skips straight to
+    ``extraction.facts.provider``/``ai.provider``, which is what a caller
+    with no per-stage knob of its own (the Batches-API client) wants.
+    Raises :class:`DetectionUnavailable` when the resolved provider has no
+    usable credential — a missing Vertex configuration when resolved to
+    ``"vertex"``, or no static key when resolved to ``"anthropic"`` —
+    because "no credential" must fail the document, not empty it.
+
+    **This is the shared ladder, and it stays model-transparent.** Scan OCR
+    (`src/ingest/scan_ocr.py`) and fact extraction
+    (`connectors/sharepoint/facts_extraction.py`) both delegate here and both
+    rely on getting a client for the model THEY asked for — a vision model and
+    `extraction.facts.model` respectively. The anonymization detector's
+    self-hosted endpoint therefore lives in
+    :func:`build_detector_client`, not here: routing those two stages to a
+    text-only endpoint under the detector's model id would send page images
+    somewhere that cannot read them and silently override an operator's
+    explicit per-stage model choice.
+    """
+    provider, _source = resolve_llm_provider(*own_setting_path)
+
+    if provider == "vertex":
+        vertex = _vertex_config()
+        if vertex is None:
+            raise DetectionUnavailable(
+                "the LLM provider resolved to 'vertex' but this instance has no usable Vertex "
+                "configuration — set ai.provider: vertex and ai.vertex.project_id (optionally "
+                "ai.vertex.region) in instance.yaml, or the ANTHROPIC_VERTEX_PROJECT_ID env var"
+            )
+        try:
+            import anthropic  # noqa: F401 — presence probe, same posture as the anthropic branch below
+        except ImportError as exc:  # pragma: no cover - SDK is a server dependency
+            raise DetectionUnavailable("the anthropic SDK is not installed") from exc
+        from connectors.llm.vertex_provider import create_vertex_client, to_vertex_model_id
+
+        return create_vertex_client(project_id=vertex[0], region=vertex[1], timeout=timeout_s), to_vertex_model_id(
+            model
+        )
+
     key = _static_key()
-    vertex = _vertex_config() if not key else None
-    if not key and vertex is None:
+    if not key:
         raise DetectionUnavailable(
             "LLM entity detection requires ANTHROPIC_API_KEY (or LLM_API_KEY) in the "
             "environment, or ai.provider: vertex in instance.yaml"
@@ -498,14 +797,51 @@ def build_client(model: str, timeout_s: float) -> tuple[Any, str]:
         import anthropic
     except ImportError as exc:  # pragma: no cover - SDK is a server dependency
         raise DetectionUnavailable("the anthropic SDK is not installed") from exc
-
-    if vertex is not None:
-        from connectors.llm.vertex_provider import create_vertex_client, to_vertex_model_id
-
-        return create_vertex_client(project_id=vertex[0], region=vertex[1], timeout=timeout_s), to_vertex_model_id(
-            model
-        )
     return anthropic.Anthropic(api_key=key, timeout=timeout_s), model
+
+
+def build_detector_client(model: str, timeout_s: float) -> tuple[Any, str]:
+    """The entity detector's client — a self-hosted endpoint if one is
+    configured, otherwise :func:`build_client` resolved through THIS
+    detector's own ``extraction.anonymization.provider`` knob.
+
+    Deliberately a separate entry point rather than a branch inside the shared
+    ladder: `extraction.anonymization.llm.*` configures THIS tier, and two
+    other stages share `build_client` for their own models (see its docstring).
+
+    A configured endpoint wins over both cloud paths — an operator who pointed
+    this tier at their own GPU must never have a crawl quietly fall back to a
+    billed cloud model, and (the sharper half) must never have
+    pre-anonymization documents quietly leave their network. The two allowlist
+    gates already ran in :func:`self_hosted_endpoint`, whose failures raise
+    rather than return ``None``, so a misconfiguration cannot reach the
+    fallback.
+
+    The endpoint only has to speak the Anthropic Messages shape; the SDK aims
+    at it via ``base_url``. That is not a shortcut — this module needs per-call
+    ``usage`` and a ``cache_control`` breakpoint, which the OpenAI
+    chat-completions surface does not carry, and every proxy that fronts a
+    local model (LiteLLM, vLLM's own Anthropic route) exposes ``/v1/messages``.
+    """
+    endpoint = self_hosted_endpoint()
+    if endpoint is None:
+        return build_client(model, timeout_s, own_setting_path=("extraction", "anonymization", "provider"))
+    try:
+        import anthropic
+    except ImportError as exc:  # pragma: no cover - SDK is a server dependency
+        raise DetectionUnavailable("the anthropic SDK is not installed") from exc
+    # An endpoint that wants no auth is legitimate; the SDK requires SOME
+    # api_key, so a placeholder stands in. The real value — when there is one
+    # — is passed here and nowhere else: never on argv, never in a URL, never
+    # logged (security playbook §7).
+    return (
+        anthropic.Anthropic(
+            api_key=endpoint.api_key or "not-required",
+            base_url=endpoint.base_url,
+            timeout=timeout_s,
+        ),
+        endpoint.model,
+    )
 
 
 def _is_retryable(exc: BaseException) -> bool:
@@ -598,7 +934,7 @@ class LLMDetector:
         timeout_s: float = DEFAULT_TIMEOUT_S,
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
         backoff_s: float = DEFAULT_BACKOFF_S,
-        max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
+        max_output_tokens: int | None = None,
         client: Any | None = None,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
@@ -608,9 +944,25 @@ class LLMDetector:
         self.timeout_s = float(timeout_s)
         self.max_attempts = max(1, int(max_attempts))
         self.backoff_s = float(backoff_s)
-        self.max_output_tokens = max(1, int(max_output_tokens))
+        # None means "ask the instance", so a caller that pins a value (tests,
+        # the preview panel) still wins and nothing reads config behind its back.
+        self.max_output_tokens = max(
+            1, int(configured_max_output_tokens() if max_output_tokens is None else max_output_tokens)
+        )
         self.last_usage: dict[str, int | str] = dict(_empty_usage(), model=self.model)
         self.total_usage: dict[str, int] = _empty_usage()
+        # One detector is built per crawl and shared by the worker threads
+        # that run convert -> anonymize -> ingest (`extraction.crawler.
+        # concurrency`), so every read-modify-write on the CUMULATIVE counters
+        # races. `+=` on a dict value is not atomic, and a lost update here
+        # understates the run report's token and entity totals — the numbers
+        # an operator prices a corpus from.
+        #
+        # `last_usage` is deliberately NOT covered: it describes "the most
+        # recent document", which has no single meaning while several are in
+        # flight. Under concurrency read `total_usage`; that is what
+        # `connectors/sharepoint/crawler.py::_detector_usage` reports.
+        self._usage_lock = threading.Lock()
         self._client = client
         self._call_model = self.model if client is not None else None
         self._sleep = sleep
@@ -624,7 +976,7 @@ class LLMDetector:
 
     def _ensure_client(self) -> tuple[Any, str]:
         if self._client is None:
-            self._client, self._call_model = build_client(self.model, self.timeout_s)
+            self._client, self._call_model = build_detector_client(self.model, self.timeout_s)
         return self._client, (self._call_model or self.model)
 
     # -- one call ----------------------------------------------------------
@@ -656,7 +1008,8 @@ class LLMDetector:
             kwargs["temperature"] = 0
         try:
             return client.messages.create(**kwargs)
-        except Exception as exc:  # noqa: BLE001 — re-raised or retried below
+        # Broad on purpose: re-raised or retried below, never swallowed.
+        except Exception as exc:
             if self._send_temperature and _mentions_temperature(exc) and not _is_retryable(exc):
                 logger.info(
                     "model %s rejected temperature; retrying without it for the rest of this run",
@@ -669,17 +1022,22 @@ class LLMDetector:
 
     def _record(self, response: Any) -> None:
         usage = getattr(response, "usage", None)
-        for field in (
-            "input_tokens",
-            "output_tokens",
-            "cache_creation_input_tokens",
-            "cache_read_input_tokens",
-        ):
-            value = _usage_value(usage, field)
+        values = {
+            field: _usage_value(usage, field)
+            for field in (
+                "input_tokens",
+                "output_tokens",
+                "cache_creation_input_tokens",
+                "cache_read_input_tokens",
+            )
+        }
+        for field, value in values.items():
             self.last_usage[field] = int(self.last_usage[field]) + value  # type: ignore[arg-type]
-            self.total_usage[field] += value
         self.last_usage["calls"] = int(self.last_usage["calls"]) + 1  # type: ignore[arg-type]
-        self.total_usage["calls"] += 1
+        with self._usage_lock:
+            for field, value in values.items():
+                self.total_usage[field] += value
+            self.total_usage["calls"] += 1
 
     def _detect_chunk(self, chunk: str) -> list[Any]:
         """One chunk, with bounded retry. Raises on exhaustion — never ``[]``."""
@@ -722,7 +1080,8 @@ class LLMDetector:
                 # persistently high count means the prompt or model is drifting.
                 logger.info("entity detection dropped %d non-verbatim span(s)", dropped)
                 self.last_usage["dropped_not_verbatim"] = int(self.last_usage["dropped_not_verbatim"]) + dropped  # type: ignore[arg-type]
-                self.total_usage["dropped_not_verbatim"] += dropped
+                with self._usage_lock:
+                    self.total_usage["dropped_not_verbatim"] += dropped
             return entities
 
         raise DetectionUnavailable(
@@ -740,17 +1099,62 @@ class LLMDetector:
             overlap=self.overlap_chars,
         )
         self.last_usage["chunks"] = len(chunks)
-        self.total_usage["chunks"] += len(chunks)
+        with self._usage_lock:
+            self.total_usage["chunks"] += len(chunks)
         if not chunks:
             return []
 
         found: list[Any] = []
-        for chunk in chunks:
-            found.extend(self._detect_chunk(chunk))
-        entities = dedupe(found)
-        self.last_usage["entities"] = len(entities)
-        self.total_usage["entities"] += len(entities)
-        return entities
+        for _chunk, entities in self._detect_by_chunk(chunks):
+            found.extend(entities)
+        deduped = dedupe(found)
+        self.last_usage["entities"] = len(deduped)
+        with self._usage_lock:
+            self.total_usage["entities"] += len(deduped)
+        return deduped
+
+    # NOTE: `__call__` above does its own chunking rather than calling
+    # `detect_by_chunk`, so the two never double-count a document.
+
+    def detect_by_chunk(self, markdown: str) -> list[tuple[str, list[Any]]]:
+        """Every chunk paired with the entities the model reported FOR IT.
+
+        :meth:`__call__` unions these and is what the anonymizer consumes.
+        A caller that needs to judge an EMPTY answer needs them apart: over a
+        document large enough to split, one chunk's names make the union
+        non-empty and hide a refusal in another, so a document-level "the
+        model found something" is not evidence that it read every chunk.
+        :func:`hybrid_detector` corroborates per chunk for exactly that reason.
+
+        Usage accounting, retries and the verbatim filter are unchanged — this
+        is the same work :meth:`__call__` does, reported one level finer.
+        """
+        self.last_usage = dict(_empty_usage(), model=self.model)
+        chunks = split_document(
+            markdown or "",
+            max_chars=self.max_chars_per_call,
+            overlap=self.overlap_chars,
+        )
+        self.last_usage["chunks"] = len(chunks)
+        with self._usage_lock:
+            self.total_usage["chunks"] += len(chunks)
+        if not chunks:
+            return []
+        by_chunk = self._detect_by_chunk(chunks)
+        # Counted HERE, not only in `__call__`: the hybrid path consumes this
+        # method and would otherwise report zero entities for every document
+        # it redacted. Deduplicated across chunks so the number matches what
+        # the anonymizer substitutes — an overlap-replayed name is one entity,
+        # not two — and counted once per document either way, because
+        # `__call__` delegates here rather than repeating the work.
+        deduped = dedupe([entity for _chunk, entities in by_chunk for entity in entities])
+        self.last_usage["entities"] = len(deduped)
+        with self._usage_lock:
+            self.total_usage["entities"] += len(deduped)
+        return by_chunk
+
+    def _detect_by_chunk(self, chunks: Sequence[str]) -> list[tuple[str, list[Any]]]:
+        return [(chunk, self._detect_chunk(chunk)) for chunk in chunks]
 
 
 # --------------------------------------------------------------------------
@@ -776,12 +1180,82 @@ def hybrid_detector(llm: LLMDetector) -> Callable[[str], list[Any]]:
     a hybrid run that quietly degraded to regex-only would report a redaction
     it did not perform. If the regex tier is genuinely absent (the anonymizer
     module has not landed), the union is simply the LLM's own output.
+
+    **The corroboration gate.** An empty LLM result is refused when the
+    deterministic tier found a HIGH-CONFIDENCE name — an honorific-introduced
+    person, or a company carrying a legal-form marker
+    (:meth:`RegexDetector.high_confidence`). The module docstring's promise
+    that "an empty list always means the model read this text and found
+    nothing" is a property of a cooperative model, not of the transport, and
+    it does not survive contact with every model: one 20B-class model,
+    measured on this corpus, reproducibly answered ``[]`` for a document
+    headed "Performance Review — Confidential" and returned all its names
+    once that one word was removed. That is a refusal wearing the costume of
+    a valid answer.
+
+    The distinction matters because the two failures point opposite ways. A
+    model that errors raises :class:`DetectionUnavailable`, the crawl counts
+    ``anonymize_failed`` and DROPS the document — fail-closed, safe. A model
+    that answers ``[]`` is believed and the document is ingested, so whatever
+    only a reader could have found enters the corpus unredacted (the regex
+    tier's own hits are still substituted — the union is not lost, only the
+    LLM's contribution). It also skews toward exactly the documents that most
+    deserve redaction.
+
+    **Why the high-confidence subset and not the whole tier.** The obvious
+    corroborator — "regex found anything" — is unusable on Markdown, and
+    dangerously so. Pass 2 fires on any two adjacent capitalized tokens, so
+    every Title-Cased heading is a ``person`` hit: a release note, a policy
+    document and a meeting agenda each produce several while containing no
+    names at all. Gating on that dropped 3 of 4 name-free documents in
+    testing — turning a fail-open bug into a fail-closed one that eats the
+    corpus. Over-detection is harmless where the tier is USED (an
+    over-redacted heading costs nothing) and fatal to anyone reasoning
+    backwards from it, which is exactly what this gate does.
+
+    **What it therefore does not catch, stated plainly.** A refusal on a
+    document whose only names are bare full names ("Sarah Mitchell", no
+    honorific) raises nothing — the measured `05_hr_review_en.md` above is
+    itself such a document. This gate is a partial net with no collateral
+    damage, not a proof of redaction. The un-gated case is logged instead
+    (below) so it is visible in the run rather than silent.
     """
     regex = _resolve_regex_detector()
 
     def detect(markdown: str) -> list[Any]:
         deterministic: list[Any] = list(regex(markdown)) if regex is not None else []
         # LLM second: its DetectionUnavailable must reach the caller.
-        return dedupe([*deterministic, *llm(markdown)])
+        #
+        # PER CHUNK, not over the union. A document past `max_chars_per_call`
+        # is split, and the union is non-empty as soon as ANY chunk reports a
+        # name — so a refusal in one chunk hides behind a neighbour's names,
+        # which is the same fail-open this gate exists to close, one level
+        # down. No `getattr` fallback to whole-document: an object that cannot
+        # report per chunk would silently reinstate that hole.
+        from_llm: list[Any] = []
+        for chunk, entities in llm.detect_by_chunk(markdown):
+            from_llm.extend(entities)
+            if entities or regex is None:
+                continue
+            corroborated = list(regex.high_confidence(chunk))
+            if corroborated:
+                raise DetectionUnavailable(
+                    f"entity detection returned no entities for a chunk where the "
+                    f"deterministic tier found {len(corroborated)} high-confidence name(s) "
+                    "(honorific-introduced person, or company with a legal-form marker); "
+                    "refusing to treat that as 'no names present' — the model may have "
+                    "declined to answer. Failed closed rather than ingested under a "
+                    "redaction that did not happen."
+                )
+            if regex(chunk):
+                # Not fatal — the low-precision hits (Title-Cased headings and
+                # the like) are far more often a heading than a refusal. Worth
+                # one line so a corpus where it fires constantly is visible
+                # rather than silent.
+                logger.info(
+                    "entity detection returned no entities for a chunk carrying "
+                    "low-confidence regex hits; it was ingested"
+                )
+        return dedupe([*deterministic, *from_llm])
 
     return detect

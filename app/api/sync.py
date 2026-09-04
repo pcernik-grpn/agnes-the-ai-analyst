@@ -1930,7 +1930,7 @@ def _compute_manifest_policy_fingerprint(reg: dict, principal) -> "str | None":
     (table access policies §3.4, §10.3; plan Task 18) — what a local
     ``agnes pull`` compares a snapshot's stored ``SnapshotMeta.
     policy_fingerprint`` against to detect that the policy (or the
-    puller's own group membership) drifted since ``agnes snapshot
+    puller's own email / group membership) drifted since ``agnes snapshot
     create``/``refresh`` ran, and withhold that snapshot's view via the
     same ``snapshot_views_blocked`` mechanism #1129 already built for a
     de-authorized or newly-``server_only`` table.
@@ -2516,14 +2516,36 @@ def sync_manifest(
     homepage card.
     """
     from app.auth.session_principal import PRINCIPAL_TYPES
+    from app.auth.view_as import active_ticket
 
     # ``last_pull_at`` / the audit row belong to a HUMAN pull. A restricted
     # principal (co-session or agent-session sandbox) has no user row to
     # stamp — and an agent pulling on its own schedule must not masquerade
     # as its owner in the /home "last pulled" card.
+    #
+    # A read-only view-as session must not write either, and it does NOT fall
+    # out of the check above: the swapped identity is deliberately a plain
+    # dict (the target's live user row) so that every `get_current_user` call
+    # site treats it as an ordinary user — exactly what sails past an
+    # `isinstance(user, PRINCIPAL_TYPES)` test. The read-only middleware
+    # cannot catch it either: it refuses by METHOD, and this is a GET. Both
+    # nets miss this shape. Left unguarded, an admin merely LOOKING at someone
+    # bumps that person's real `last_pull_at` and emits a `sync.pull_started`
+    # event under their name; worse, an admin who opened view-as to
+    # investigate a stale pull would overwrite the evidence they came to read.
+    #
+    # The AUDIT ROW is deliberately still written: it is not a breach but the
+    # record of what the viewer looked at, and `src/audit_context.py` already
+    # re-attributes it to them. Suppressing it would make view-as the one way
+    # to read a sensitive surface and leave no trace — the opposite of what
+    # this mode owes. Only the two writes with no such interception are
+    # skipped: the stamp on the target's row, and the usage event under their
+    # name.
+    viewing_as = active_ticket() is not None
     if not isinstance(user, PRINCIPAL_TYPES):
         try:
-            users_repo().update(user["id"], last_pull_at=datetime.now(timezone.utc))
+            if not viewing_as:
+                users_repo().update(user["id"], last_pull_at=datetime.now(timezone.utc))
             # Also emit an audit_log row so /me/stats Sync activity has a
             # timeline of pulls (the column UPDATE only retains the most
             # recent one). Action `manifest.fetch` covers both `agnes pull`
@@ -2543,13 +2565,18 @@ def sync_manifest(
             pass
         # v49 Section 9.2 — emit a server-side ``sync.pull_started`` event so
         # /admin/telemetry can count distinct pulls per user per day. Best-effort.
+        # Skipped under view-as for the same reason as the stamp above: the
+        # event carries the TARGET's id and email, and telemetry counting
+        # "distinct pulls per user" must not count somebody being looked at as
+        # a pull they made.
         try:
-            usage_repo().emit_server_event(
-                event_type="sync.pull_started",
-                user_id=user["id"],
-                username=user.get("email") or user["id"],
-                props={"client_kind": client_kind_from_user(user)},
-            )
+            if not viewing_as:
+                usage_repo().emit_server_event(
+                    event_type="sync.pull_started",
+                    user_id=user["id"],
+                    username=user.get("email") or user["id"],
+                    props={"client_kind": client_kind_from_user(user)},
+                )
         except Exception:
             pass
     return _build_manifest_for_user(conn, user)

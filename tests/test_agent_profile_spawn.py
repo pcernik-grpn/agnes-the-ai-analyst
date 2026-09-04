@@ -206,6 +206,83 @@ def test_build_profile_appends_facts_rails_when_the_switch_is_on(monkeypatch):
     assert md.index(agent_profile.DATA_ACCESS_RAILS) < md.index("fact_search")
 
 
+def test_build_profile_appends_file_delivery_rails(monkeypatch):
+    """#1975: the same shape as the facts gap, one section over. The
+    "Files you produce" section that names `outputs/` — the ONE directory a
+    deliverable can reach the user from — lives in the default Workspace
+    Prompt (`config/claude_md_template.txt`), and a persona REPLACES that
+    template wholesale. So a persona'd agent asked for a `.docx` had no text
+    saying where to write one, and none of the never-disclaim rule either: the
+    observed behavior was an agent writing to `/tmp` and then telling the user
+    there is no download channel in this chat, while the chat's Files panel
+    sat beside the conversation waiting for a file written where it could
+    never see it."""
+    monkeypatch.delenv("AGNES_FACTS_ENABLED", raising=False)
+    row = _agent_row(system_prompt="You write poems.")
+    md = agent_profile.build_profile(row).claude_md
+    assert "outputs/" in md
+    # The refusal the issue quotes is what this rule exists to stop.
+    assert "Never disclaim the handover" in md
+    # ...and the mirror-image bug: an agent that knows a panel exists must not
+    # start promising buttons it cannot see. Only web chat draws the file
+    # beside the reply; Slack and an `api` session (`agnes chat`, the one-shot
+    # agent API) collect it their own way, so the rails may say where to WRITE
+    # and must not say how the reader will get it.
+    assert "do not promise a download button" in md
+    assert "do not claim it is already in front of them" in md
+    # Additive, never a replacement — the data rails still have to be there.
+    assert agent_profile.DATA_ACCESS_RAILS in md
+
+
+def test_build_profile_file_delivery_rails_are_not_feature_gated(monkeypatch):
+    """Unlike the facts rails, `outputs/` is not a switch: it is the delivery
+    convention the chat files channel and the agent API's artifact harvest
+    (`app/chat/artifact_harvest.py`, which scans exactly `{workdir}/outputs`)
+    both already honor. There is no instance where omitting this would be the
+    honest answer."""
+    monkeypatch.delenv("AGNES_FACTS_ENABLED", raising=False)
+    row = _agent_row(system_prompt="You write poems.")
+    assert agent_profile.FILE_DELIVERY_RAILS in agent_profile.build_profile(row).claude_md
+
+
+def test_build_profile_appends_provenance_rails(monkeypatch):
+    """Devin Review on #2047 (TCRD-289): third instance of the persona gap.
+    The ```sources trailer — `table:` claims the server verifies, and
+    `assumption:` lines whose `origin:`/`why:` the chat renders as badges —
+    is asked for only by the workspace template's "Say where every number
+    came from" section, which a persona replaces. So a persona'd agent's
+    figures rendered as "none declared" and its assumptions never reached
+    the reader, while the default agent was held to the promise on every
+    answer."""
+    from app.chat.sources import ASSUMPTION_ORIGINS
+
+    monkeypatch.delenv("AGNES_FACTS_ENABLED", raising=False)
+    row = _agent_row(system_prompt="You write poems.")
+    md = agent_profile.build_profile(row).claude_md
+    assert agent_profile.PROVENANCE_RAILS in md
+    assert "```sources" in md
+    assert "table:" in md and "assumption:" in md
+    # The assumption contract, exactly as the parser reads it.
+    assert "| origin:" in md and "| why:" in md
+    for origin in ASSUMPTION_ORIGINS:
+        assert f"`{origin}`" in agent_profile.PROVENANCE_RAILS, f"the rail does not offer {origin!r}"
+    assert "origin not stated" in md
+    # Additive, never a replacement — the data rails still have to be there,
+    # and the persona itself comes first.
+    assert agent_profile.DATA_ACCESS_RAILS in md
+    assert md.index("You write poems.") < md.index(agent_profile.PROVENANCE_RAILS)
+
+
+def test_build_profile_provenance_rails_are_not_feature_gated(monkeypatch):
+    """The renderer, the verdict and the push-sink strip (`app/chat/sources.py`)
+    run on every surface a persona'd agent answers from; there is no instance
+    where omitting the contract would be the honest answer."""
+    monkeypatch.delenv("AGNES_FACTS_ENABLED", raising=False)
+    monkeypatch.setenv("AGNES_FACTS_ENABLED", "0")
+    row = _agent_row(system_prompt="You write poems.")
+    assert agent_profile.PROVENANCE_RAILS in agent_profile.build_profile(row).claude_md
+
+
 def test_build_profile_omits_facts_rails_when_the_switch_is_off(monkeypatch):
     """An instance with `facts` off must not steer a persona toward tools
     that would all 404 (`app.auth.access.require_facts_enabled`)."""

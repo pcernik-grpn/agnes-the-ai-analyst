@@ -133,8 +133,9 @@ distribution mirror, and the api-role write conversions) map onto:
   mirrored scope's folder tree, probing ``hasUniqueRoleAssignments`` per
   folder, to find and exclude broken-inheritance subtrees (spec §3(b),
   §6.2) — a full pass over a large library is MULTI-HOUR (§6.2's cost
-  model), so this gets a much longer lease
-  (``AGNES_SP_SWEEP_LEASE_S``, default 4h) than every other LIGHT kind and
+  model), but that bounds the SWEEP, not its lease (see the "Lease/retry
+  tuning" note below): it gets the same small, heartbeat-protected lease
+  (``AGNES_SP_SWEEP_LEASE_S``) as every other long-running kind, plus
   NO automatic retry, same "an operator looks at a failed multi-hour run"
   rationale as ``corpus-extraction`` above. The walk/probe/persist body
   lives entirely in ``connectors.sharepoint.acl_sync.run_subtree_sweep``
@@ -144,6 +145,25 @@ distribution mirror, and the api-role write conversions) map onto:
   output (each mirrored scope's ``excluded_subtrees``) is read straight off
   the connection's scope rows by the built-in crawler, which HONORS the
   exclusions itself.
+- ``sharepoint-facts-extraction`` (EXTRACTION — shares ``corpus-extraction``'s
+  lane) — run one fact-extraction pass over a connection's ALREADY-INDEXED
+  corpus, without a crawl. Before this kind existed, ``maybe_run_after_crawl``
+  chained onto a crawl's tail was the ONLY way this pass ever ran — so an
+  operator wanting to (re)build the graph over documents already sitting in
+  ``corpus_files`` had no answer but "re-run the whole crawl", and a crawl
+  that ran long could leave the chained pass with none of its own time
+  (observed live: a 900s crawl left it an already-expired deadline, stopping
+  it after 3 documents). This kind gives the pass its own trigger (``POST
+  …/connections/{id}/facts-extract``, ``agnes admin sharepoint
+  facts-extract``) and its own wall-clock budget
+  (``extraction.facts.run_timeout_s``, independent of the crawl's
+  ``extraction.timeout_s``). A thin delegate to
+  ``connectors.sharepoint.facts_extraction.run_standalone_facts_extraction``
+  — same posture as every other kind here: this handler owns only the
+  ``sharepoint.enabled`` gate, the two facts-specific switches
+  (``extraction.facts.enabled`` / ``facts.enabled``) are that function's own
+  job. Registered UNCONDITIONALLY, same no-op posture as
+  ``sharepoint-acl-sync`` above.
 
 Every handler below is a THIN ADAPTER — it imports and calls the existing
 function/method and does not reimplement any of its logic. Each import is
@@ -162,15 +182,30 @@ is created (see the comment there) — registration is idempotent
 (``register_kind`` replaces any existing entry by name), so calling it
 more than once (e.g. across re-imports in a test process) is harmless.
 
-Lease/retry tuning:
+Lease/retry tuning: a job kind's lease is a LIVENESS ceiling, not a
+DURATION ceiling. ``app/worker/runtime.py``'s heartbeat renews it every
+``lease_seconds/3`` for as long as the handler thread is alive, so the
+lease only has to survive the GAP BETWEEN TWO HEARTBEAT TICKS, never the
+whole run. ``data-refresh``, ``corpus-extraction`` and
+``sharepoint-subtree-sweep`` used to be sized to their own expected
+DURATION instead (900s / timeout_s+margin / 14400s respectively) — that
+buys a live run nothing the heartbeat wasn't already doing, and costs a
+dead one everything: a worker killed mid-job (observed live — a native
+crash in a converter backend, twice in one afternoon) leaves its job
+``status='running'`` with a dead ``leased_by`` until ``lease_expires_at``
+passes, so a duration-sized lease is a duration-sized wait before
+``claim_next()``'s crash-recovery reclaim can even see it. All three now
+share ``_DEFAULT_HEARTBEAT_PROTECTED_LEASE_S`` (300s, the same value the
+LIGHT kinds below already run at) regardless of how long their own work
+may legitimately take:
 
-- ``data-refresh`` gets the longest lease (``AGNES_DATA_REFRESH_LEASE_S``,
-  default 900s / 15min) — a full Keboola extractor subprocess run +
-  materialized pass + orchestrator rebuild can legitimately take that
-  long on a large registry; the worker's heartbeat keeps the lease alive
-  every ``lease_seconds/3`` while the handler thread runs, so this is a
-  ceiling on "how long before a crashed/stuck run is reclaimed", not a
-  hard timeout on the sync itself.
+- ``data-refresh`` (``AGNES_DATA_REFRESH_LEASE_S``, default 300s — also
+  the lease ``analytics-migrate``/``analytics-rebuild`` reuse via
+  ``_data_refresh_lease_seconds()``) — a full Keboola extractor subprocess
+  run + materialized pass + orchestrator rebuild can legitimately take
+  much longer than 300s on a large registry; that's fine, the heartbeat
+  is what keeps a genuinely running sync's lease alive, not the lease's
+  own size.
 - ``jira-refresh`` is also HEAVY (shares the lane with ``data-refresh``,
   and both run through ``_sweep_stale_scratch()`` before every HEAVY
   claim — see ``app/worker/runtime.py``) but is a plain orchestrator
@@ -180,16 +215,28 @@ Lease/retry tuning:
   ``corporate-memory``) default to 300s — bulk git clones / LLM catalog
   refresh / filesystem walks, but bounded by their own internal
   timeouts, not multi-minute by design.
-- ``corpus-extraction``'s lease tracks its own ``extraction.timeout_s``
-  config (default 3600s) plus a margin — same "generous ceiling, not the
-  actual bound" reasoning as ``data-refresh`` above: the worker's
-  heartbeat keeps the lease alive for as long as the crawl thread runs, so
-  this is a ceiling on "how long before a crashed/stuck run is reclaimed",
-  not a hard timeout on the crawl. No retry by default: a failed run (bad
-  credentials, a crawl error, an exhausted throttle budget) usually needs
-  an operator to look at it, not an automatic re-run against the same
-  corpus a few minutes later — and a resumed run picks up from the
-  persisted crawl state anyway.
+- ``corpus-extraction`` (``_DEFAULT_EXTRACTION_LEASE_S``, 300s, no env
+  override) — the run's own wall-clock bound is ``extraction.timeout_s``
+  (default 3600s), enforced INSIDE the crawl between files and between
+  delta pages; the lease no longer tracks it at all (it used to, plus a
+  margin — the exact "long job = long lease" mistake this note warns
+  against: a crashed crawl's job stayed unreclaimable for up to an hour).
+  No retry by default: a failed run (bad credentials, a crawl
+  error, an exhausted throttle budget) usually needs an operator to look
+  at it, not an automatic re-run against the same corpus a few minutes
+  later — and a resumed run picks up from the persisted crawl state
+  anyway.
+- ``sharepoint-subtree-sweep`` (``AGNES_SP_SWEEP_LEASE_S``, default
+  300s) — a full probe pass over a large library is multi-hour (spec
+  §6.2), which used to size the lease itself (4h, i.e. the same mistake
+  as ``corpus-extraction`` above); same fix, same no-retry rationale (an
+  operator looks at a failed multi-hour sweep, not an unattended re-run).
+
+Two kinds still size their lease off their own expected duration
+(``jira-org-refresh``'s ``_DEFAULT_JIRA_ORG_REFRESH_LEASE_S`` and
+``ducklake-maintenance``'s ``_DEFAULT_DUCKLAKE_MAINTENANCE_LEASE_S``) —
+same shape of issue, deliberately left alone here rather than folded into
+this fix (out of this change's declared scope; a good follow-up).
 """
 
 from __future__ import annotations
@@ -207,36 +254,67 @@ from src.audit_helpers import log_safe
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_DATA_REFRESH_LEASE_S = 900
+# Shared default for every kind whose OWN work can legitimately run long
+# but is protected by the worker's heartbeat rather than by this lease's
+# size — see the module docstring's "Lease/retry tuning" note for the full
+# reasoning. 300s is not a new number: it's the value marketplaces-sync/
+# session-collector/corporate-memory (_DEFAULT_LIGHT_LEASE_S below) already
+# run at, so reusing it here is the conservative choice, not an invented
+# one. A 300s lease gives a 100s heartbeat cadence (lease_seconds/3): a
+# dead worker's job is reclaimable within minutes, and a live one has three
+# full ticks of slack before the lease could ever lapse out from under it.
+_DEFAULT_HEARTBEAT_PROTECTED_LEASE_S = 300
+_DEFAULT_DATA_REFRESH_LEASE_S = _DEFAULT_HEARTBEAT_PROTECTED_LEASE_S
 _DEFAULT_JIRA_REFRESH_LEASE_S = 300
 # One API request per organization, gently paced — a few-hundred-organization site
 # takes minutes, so the lease has to outlast the whole sweep or the job would be
 # reclaimed mid-run and start over. At ~0.2s pacing plus request latency this covers
 # roughly 3,500 organizations; an estate materially larger than that wants a
 # size-derived lease rather than a bigger constant, or it will reclaim in a loop.
+#
+# NOTE: this sizing shares the same shape of issue _DEFAULT_HEARTBEAT_PROTECTED_LEASE_S
+# above exists to fix (the heartbeat, not this constant, is what actually keeps a live
+# sweep's lease alive) — left as-is here, out of this change's declared scope; a good
+# follow-up.
 _DEFAULT_JIRA_ORG_REFRESH_LEASE_S = 1800
 _DEFAULT_LIGHT_LEASE_S = 300
 # merge_adjacent_files/expire_snapshots/cleanup_old_files/VACUUM can each
-# take a while over a large lake — same "generous ceiling, not a hard
-# timeout" reasoning as _DEFAULT_DATA_REFRESH_LEASE_S (the worker's
-# heartbeat keeps the lease alive every lease_seconds/3 while the handler
-# thread runs).
+# take a while over a large lake — same shape of issue
+# _DEFAULT_HEARTBEAT_PROTECTED_LEASE_S above exists to fix; left as-is here,
+# out of this change's declared scope, same follow-up note as
+# _DEFAULT_JIRA_ORG_REFRESH_LEASE_S above.
 _DEFAULT_DUCKLAKE_MAINTENANCE_LEASE_S = 900
 # Expected ceiling on one extraction run (extraction.timeout_s in
 # instance.yaml overrides this) — a full crawl+convert+anonymize+ingest
-# pass over a real SharePoint site can legitimately run for a while.
+# pass over a real SharePoint site can legitimately run for a while. This
+# is the run's own wall-clock bound, enforced INSIDE the crawl (between
+# files and between delta pages) — unrelated to the job's lease below.
 _DEFAULT_EXTRACTION_TIMEOUT_S = 3600
-# The job's own lease outlives that ceiling by a margin so a heartbeat tick
-# never expires the lease out from under a still-running crawl — same
-# pattern as _agent_response_job_timeout_seconds()'s lease_seconds below.
-_EXTRACTION_LEASE_MARGIN_S = 120
+# corpus-extraction's lease used to be _extraction_timeout_seconds() plus a
+# margin — tying crash-recovery speed to the run's own expected duration,
+# the defect the module docstring's "Lease/retry tuning" note describes.
+# It is now the same heartbeat-protected default as every other
+# long-running kind, entirely independent of extraction.timeout_s.
+_DEFAULT_EXTRACTION_LEASE_S = _DEFAULT_HEARTBEAT_PROTECTED_LEASE_S
+# TCRD-296 C.11 — the extraction kinds' JobKind.transient_retry_in_seconds:
+# a raised handler exception that `src.db_transient.is_transient_db_error`
+# classifies as a connection-pool/deadlock/serialization hiccup requeues
+# after this delay instead of finalizing on its first attempt (see
+# `app/worker/runtime.py::_run_one`). Short relative to `retry_in_seconds`
+# elsewhere in this module (300s) on purpose: this is a DB-layer blip, not a
+# tenant-throttle or an outage worth minutes of backoff — long enough for
+# connection-pool pressure to plausibly subside before the whole run
+# restarts from its persisted per-document/per-item state.
+_TRANSIENT_INGEST_RETRY_S = 60
 # 2026-08-30 plan, Task 7: a full sharepoint-subtree-sweep pass (probing
 # hasUniqueRoleAssignments over every folder in a mirrored scope) is
-# multi-hour on a large library (spec §6.2's ~98k-folder reference) — same
-# "generous ceiling, not a hard timeout" reasoning as
-# _DEFAULT_DATA_REFRESH_LEASE_S, just a much larger default since this job's
-# own cost model is an order of magnitude bigger than any other LIGHT kind.
-_DEFAULT_SP_SWEEP_LEASE_S = 14400  # 4h
+# multi-hour on a large library (spec §6.2's ~98k-folder reference) — that
+# used to size the lease itself (4h), same "long job = long lease" mistake
+# as corpus-extraction's old formula above. The heartbeat, not this lease,
+# is what keeps a genuinely multi-hour sweep's lease alive, so this now
+# gets the same small heartbeat-protected default as every other
+# long-running kind too.
+_DEFAULT_SP_SWEEP_LEASE_S = _DEFAULT_HEARTBEAT_PROTECTED_LEASE_S
 
 
 def _data_refresh_lease_seconds() -> int:
@@ -366,12 +444,26 @@ def _run_collections_purge(payload: dict) -> None:
     ``_run_analytics_rebuild``.
     """
     from app.api.collections import (
+        _policied_derived_rows_for_file,
         _purge_derived_tabular_row_for_file,
         _purge_derived_tabular_rows,
     )
 
     corpus_id = payload["corpus_id"]
     file_id = payload.get("file_id")
+    # Backstop for the api-plane refusal (#2147): the enqueueing route already
+    # refuses a re-ingest whose derived table carries an access policy, but a
+    # job enqueued BEFORE the policy was attached would still land here and
+    # purge it. Fail the job loudly instead — the file stays 'pending' and an
+    # admin decides, rather than the policy quietly disappearing. Only the
+    # re-ingest shape is refused; a plain delete's purge takes the data with
+    # the row and discloses nothing.
+    if file_id and payload.get("reingest_after_purge") and _policied_derived_rows_for_file(corpus_id, file_id):
+        raise RuntimeError(
+            f"access_policy_protected_row: derived table for file {file_id} in collection "
+            f"{corpus_id} carries an access policy; an admin must clear it before the file "
+            "can be re-ingested"
+        )
     if file_id:
         _purge_derived_tabular_row_for_file(corpus_id, file_id)
     else:
@@ -430,10 +522,41 @@ def _run_session_collector(payload: dict) -> None:
 def _run_corporate_memory(payload: dict) -> None:
     """Wrap ``services.corporate_memory.collector.collect_all`` — the
     body behind ``POST /api/admin/run-corporate-memory``. Called with
-    the same ``dry_run=False`` default as that endpoint."""
-    from services.corporate_memory.collector import collect_all
+    the same ``dry_run=False`` default as that endpoint.
 
-    collect_all(dry_run=False)
+    issue #1971 Part 3: ``collect_all``'s return value used to be discarded
+    entirely here — the scheduled collector ran every night with no durable
+    trace of what it did. Now its stats feed one ``memory_detection_runs``
+    row via the best-effort writer (never raises; degrades to a warning log
+    line on a DuckDB-backed instance, where the table doesn't exist). The
+    collector consults no editable policy (issue #1971 Part 2 left its
+    structurally different prompt on the built-in default), so
+    ``policy_text`` is omitted — the row's ``policy_fingerprint`` is
+    ``NULL``, distinct from an empty-but-real policy.
+    """
+    from datetime import datetime
+
+    from services.corporate_memory.collector import collect_all
+    from src.memory_detection_logging import record_detection_run
+
+    started_at = datetime.now(UTC)
+    stats = collect_all(dry_run=False) or {}
+    errors = stats.get("errors") or []
+    record_detection_run(
+        source="claude_local_md",
+        started_at=started_at,
+        finished_at=datetime.now(UTC),
+        sessions_scanned=stats.get("users_scanned", 0),
+        items_proposed=stats.get("items_extracted", 0),
+        items_filtered=stats.get("items_filtered", 0),
+        items_inserted=stats.get("items_db_inserted", 0),
+        # The collector's LLM path proposes no scope label — Part 2 left it
+        # on its built-in prompt (structurally incompatible output schema),
+        # so nothing here is ever routed to the engagement-scoped domain.
+        items_routed_side_domain=0,
+        dry_run=False,
+        error="; ".join(str(e) for e in errors) if errors else None,
+    )
 
 
 def _run_jira_refresh(payload: dict) -> None:
@@ -1152,6 +1275,67 @@ def _run_webhook_deliver(payload: dict) -> None:
         raise RuntimeError(f"webhook-deliver: POST to webhook {webhook_id} failed")
 
 
+#: Wall-clock budget for one ``knowledge-packaging`` run (TCRD-296 synthesis
+#: C.15). A plain constant, not an env knob — the live incident this fixes
+#: was an UNBOUNDED in-request run (the scheduler's 600s CLIENT timeout was
+#: the only limit, and it didn't stop the server-side work), not a value
+#: that needed tuning; ``run_packaging_pass``'s checkpoint-per-collection
+#: means a run that hits this budget resumes cleanly next tick rather than
+#: needing a bigger number. 20 minutes comfortably covers a full sweep of a
+#: real instance's Collections while still leaving the LIGHT lane's other
+#: kinds (``webhook-deliver``, ``agent_response``) a bounded wait behind it.
+_DEFAULT_KNOWLEDGE_PACKAGING_TIMEOUT_S = 20 * 60
+
+
+def _run_knowledge_packaging(payload: dict) -> dict:
+    """``knowledge-packaging`` — rebuild per-collection ``knowledge.duckdb``
+    artifacts whose chunk content changed (K3, #798; TCRD-296 synthesis
+    C.15).
+
+    Used to run INLINE inside ``POST /api/admin/run-knowledge-packaging``,
+    HTTP-called by the scheduler on a 600s client timeout shorter than a
+    real pass could take — a slow pass outlived that timeout, the next
+    scheduler tick fired a SECOND overlapping call before the first
+    finished, and the two collided (a shared per-corpus tmp DuckDB path —
+    see ``src.knowledge_packaging``'s module docstring) hard enough to OOM
+    the app process. This handler is now the only thing that runs the
+    pass; the endpoint (``app/api/admin.py::run_knowledge_packaging``) is a
+    thin enqueue.
+
+    Single-run is enforced two ways: the idempotency-keyed enqueue (the
+    endpoint's job) means a second scheduler tick while one run is still
+    ``'queued'``/``'running'`` is a no-op, and — belt-and-braces, for a path
+    that bypasses that dedupe (a manual ``POST /api/jobs``, or two workers
+    racing to claim two different rows) — a non-blocking Postgres advisory
+    lock (:func:`src.db_pg.knowledge_packaging_lease`). Skipping (not
+    failing) when the lock is already held is the correct outcome: the
+    other run is doing the exact same work.
+
+    ``run_packaging_pass``'s own ``deadline`` argument bounds this run's
+    wall-clock cost at :data:`_DEFAULT_KNOWLEDGE_PACKAGING_TIMEOUT_S` —
+    see that function's docstring for the checkpoint-per-collection
+    contract that makes a mid-sweep interruption resumable rather than a
+    lost pass. Returns the pass's summary dict (built/skipped/pruned/
+    errors/interrupted_reason/duration_s/collections_total/
+    collections_processed) as the job's result
+    (``GET /api/jobs/{id}``'s ``payload_json["result"]``) — this is what
+    makes ``GET /api/admin/knowledge-packaging/status`` a measurement of
+    the last real run rather than a guess.
+    """
+    from src.db_pg import knowledge_packaging_lease
+    from src.knowledge_packaging import run_packaging_pass
+
+    with knowledge_packaging_lease() as acquired:
+        if not acquired:
+            logger.info(
+                "knowledge-packaging: advisory lock already held by another run — skipping "
+                "(belt-and-braces on top of the idempotency-key dedupe; the other run covers this work)"
+            )
+            return {"skipped": "lock_held"}
+        deadline = time.monotonic() + _DEFAULT_KNOWLEDGE_PACKAGING_TIMEOUT_S
+        return run_packaging_pass(deadline=deadline)
+
+
 def _extraction_timeout_seconds() -> int:
     from app.instance_config import get_value
 
@@ -1225,15 +1409,33 @@ def _run_corpus_extraction(payload: dict) -> dict:
         every confirmed scope otherwise.
       - ``timeout_s`` (optional) — overrides ``extraction.timeout_s`` for
         this one run (0 = unbounded). The crawl enforces it itself, between
-        files and between delta pages; this handler's own lease is derived
-        from the CONFIGURED value, so a payload override far above it would
-        outlive the lease and be reclaimed mid-run.
+        files and between delta pages; this handler's own lease is a fixed,
+        heartbeat-protected constant (``_DEFAULT_EXTRACTION_LEASE_S`` — see
+        the module docstring's lease/retry tuning note) that does not track
+        ``extraction.timeout_s`` at all, so a payload override — in either
+        direction — has no bearing on how quickly a crashed run's job is
+        reclaimed.
       - ``concurrency`` (optional) — overrides
         ``extraction.crawler.concurrency`` for this one run, clamped to
         ``[1, 16]``: how many files of ONE delta page the crawl pipelines at
         a time (``1`` = the sequential pre-parallel behaviour). NOT the same
         knob as ``extraction.concurrency``, which sizes how many extraction
         JOBS this worker runs at once — the two multiply against one tenant.
+      - ``resync`` (optional, truthy) — drops this connection's persisted
+        deltaLinks and item-failure queue before crawling, so every drive
+        re-enumerates from scratch (cTags are kept, so unchanged files are
+        not re-downloaded). The supported recovery path for a connection
+        whose delta cursor ran past documents it never actually ingested —
+        see ``connectors.sharepoint.crawler._apply_resync``.
+      - ``force_reprocess`` (optional, truthy) — ignores BOTH the persisted
+        deltaLinks and cTags for this one run, so every item is
+        re-downloaded, re-converted and re-ingested even when it looks
+        unchanged. The operator control for "re-process everything" — e.g.
+        a converter or anonymizer setting changed and the content on disk
+        did not. Unlike ``resync``, never written to the state file up
+        front: a run interrupted mid-way leaves the connection exactly as
+        resumable as it was before — see
+        ``connectors.sharepoint.crawler._crawl_drive``.
 
     Returns the crawl report (the same dict persisted as ``last_run`` in the
     connection's crawl state, so the job result and the state file can never
@@ -1253,6 +1455,32 @@ def _run_corpus_extraction(payload: dict) -> dict:
     from connectors.sharepoint.crawler import run_builtin_crawl
 
     return run_builtin_crawl(payload)
+
+
+def _run_corpus_extraction_shard(payload: dict) -> dict:
+    """``corpus-extraction-shard`` (2026-09-03 auto-parallel-crawl design
+    §4.3) — one shard child's own crawl, enqueued by a ``corpus-extraction``
+    run that decided to plan rather than crawl inline
+    (``connectors.sharepoint.crawler._plan_or_run_inline``).
+
+    A thin delegate, exactly like ``_run_corpus_extraction`` above: the
+    shard's own targets, its per-delta-unit state rows, its own
+    ``extraction_runs`` row, and the finalize-on-last-child coordination all
+    live in ``connectors.sharepoint.crawler.run_shard_crawl``. This handler
+    owns exactly the same one thing ``_run_corpus_extraction`` does: the
+    ``sharepoint.enabled`` gate.
+
+    ``payload``: ``connection_id``, ``parent_run_id``, ``shard_index``,
+    ``shard`` — see ``run_shard_crawl``'s own docstring for the full shape.
+    """
+    from app.instance_config import feature_enabled
+
+    if not feature_enabled("sharepoint", "enabled", env_var="AGNES_SHAREPOINT_ENABLED", default=False):
+        raise RuntimeError("corpus-extraction-shard: sharepoint.enabled is false — refusing to run")
+
+    from connectors.sharepoint.crawler import run_shard_crawl
+
+    return run_shard_crawl(payload)
 
 
 def _run_sharepoint_acl_sync(payload: dict) -> dict:
@@ -1278,6 +1506,115 @@ def _run_sharepoint_subtree_sweep(payload: dict) -> dict:
     return run_subtree_sweep(payload)
 
 
+def _run_sharepoint_facts_extraction(payload: dict) -> dict:
+    """``sharepoint-facts-extraction`` — run ONE fact-extraction pass over a
+    SharePoint connection's ALREADY-INDEXED corpus, without running a crawl
+    first. The operator's own trigger — "how do we get the fact graph
+    populated with what we already have?" required re-running an entire
+    crawl before this kind existed, which is absurd for a corpus already
+    sitting in ``corpus_files``.
+
+    A thin delegate, exactly like ``_run_corpus_extraction`` above: the
+    walk, the model calls, the verbatim gate, the ingest batching and the
+    per-document state all live in
+    ``connectors.sharepoint.facts_extraction.run_standalone_facts_extraction``
+    — which ALSO enforces the stage's own two cost/surface gates
+    (``extraction.facts.enabled`` / ``facts.enabled``), loudly, via
+    ``FactsExtractionDisabled``, rather than this handler duplicating that
+    check. This handler owns exactly one thing that function does not: the
+    ``sharepoint.enabled`` gate, same posture as ``corpus-extraction``.
+
+    ``payload``:
+      - ``connection_id`` (required)
+      - ``doc_ids`` (optional list[str]) — narrow the pass to specific
+        documents (``corpus_file_sources.source_doc_id``) — the "test one
+        document" path already supported by ``run_facts_extraction`` and
+        threaded straight through here.
+      - ``timeout_s`` (optional) — overrides ``extraction.facts.run_timeout_s``
+        for this one run (0 = unbounded). Its OWN budget, never the crawl's
+        ``extraction.timeout_s`` — see
+        ``run_standalone_facts_extraction``'s docstring for why a
+        crawl-chained pass sharing the crawl's own deadline is exactly the
+        problem a standalone trigger with its own budget avoids (observed
+        live: a 900s crawl left the chained pass an already-expired
+        deadline, stopping it after 3 documents).
+      - ``partition`` (optional ``{"index": int, "count": int}``, TCRD-296
+        gap #67) — this job is one PARTITION of a fanned-out pass
+        (``connectors.sharepoint.facts_extraction
+        .enqueue_facts_extraction_passes``); absent (every job enqueued
+        before this feature existed, or a fan-out that resolved to a
+        single partition) runs exactly today's whole-connection pass.
+
+    Returns the pass report (see
+    ``connectors.sharepoint.facts_extraction._Report.render``). When this
+    report says ``interrupted: timeout`` and the connection's ledger still
+    has documents pending, the worker automatically chains the next pass
+    onto this one (TCRD-296 gap #61) — that decision runs from ``app/
+    worker/runtime.py``'s post-``complete()`` hook
+    (``_maybe_continue_facts_extraction`` ->
+    ``connectors.sharepoint.facts_extraction.maybe_continue_pass``), NEVER
+    from inside this handler: the continuation reuses this job's own
+    idempotency key, and enqueuing it before THIS job leaves ``'running'``
+    would self-collide against its own still-live row.
+
+    No-op guard: raises (so the job fails cleanly) when ``sharepoint.enabled``
+    is false — same "this job only ever exists because something explicitly
+    enqueued it" rationale as ``corpus-extraction`` above.
+    """
+    from app.instance_config import feature_enabled
+
+    if not feature_enabled("sharepoint", "enabled", env_var="AGNES_SHAREPOINT_ENABLED", default=False):
+        raise RuntimeError("sharepoint-facts-extraction: sharepoint.enabled is false — refusing to run")
+
+    from connectors.sharepoint.facts_extraction import run_standalone_facts_extraction
+
+    connection_id = str(payload["connection_id"])
+    doc_ids = payload.get("doc_ids")
+    timeout_s = payload.get("timeout_s")
+    partition_field = payload.get("partition") or {}
+    partition = (
+        (int(partition_field.get("index") or 0), int(partition_field["count"]))
+        if partition_field.get("count")
+        else None
+    )
+    return run_standalone_facts_extraction(connection_id, doc_ids=doc_ids, timeout_s=timeout_s, partition=partition)
+
+
+#: Kinds whose payload gets this claimed job's own ``id`` merged in before
+#: the handler runs — see :func:`_payload_for_handler`. A plain set, not a
+#: per-kind flag on ``JobKind``: ``corpus-extraction`` and
+#: ``corpus-extraction-shard`` (2026-09-03 auto-parallel-crawl design §4.3)
+#: are the only two with anywhere to put it (``extraction_runs.job_id``,
+#: on the run each one opens for itself), and a third consumer can add
+#: itself here without a registry shape change.
+_INJECT_JOB_ID_KINDS = frozenset({"corpus-extraction", "corpus-extraction-shard"})
+
+
+def _payload_for_handler(job: dict) -> dict:
+    """The payload a handler runs with — ``job["payload_json"]`` unchanged,
+    except for :data:`_INJECT_JOB_ID_KINDS`, which get this claimed job's own
+    ``id`` merged in as ``job_id`` when the payload does not already carry
+    one.
+
+    ``kind.handler`` (the ``JobKind`` contract, ``app/worker/registry.py``)
+    only ever receives the payload dict — never the job row — so this is the
+    one seam that can hand a handler its own job's id without widening that
+    contract for every kind. ``connectors.sharepoint.crawler.run_builtin_
+    crawl`` records it on the ``extraction_runs`` row it opens
+    (``job_id``), which is what makes a run traceable back to the job that
+    spawned it; before this it was always null, because nothing upstream of
+    here ever supplied it (see that function's own docstring).
+
+    Never mutates ``job["payload_json"]`` in place: a copy, so a payload
+    that started with no ``job_id`` does not gain one behind the caller's
+    back if it is inspected again after dispatch.
+    """
+    payload = job.get("payload_json") or {}
+    if job.get("kind") in _INJECT_JOB_ID_KINDS and isinstance(payload, dict) and not payload.get("job_id"):
+        return {**payload, "job_id": job.get("id")}
+    return payload
+
+
 def dispatch_job(job: dict) -> dict | None:
     """THE single dispatch-level entry point for running one claimed job's
     handler (F2b — audit-full-coverage plan, Task 4). Looks ``job["kind"]``
@@ -1291,7 +1628,10 @@ def dispatch_job(job: dict) -> dict | None:
     ``asyncio.to_thread``) INSTEAD OF ``kind.handler(job["payload_json"])``
     directly — the one place in the whole worker that actually executes a
     claimed job, so this is also the one place audit coverage needs to
-    live (one dispatch-level wrapper, not one per kind).
+    live (one dispatch-level wrapper, not one per kind), and (see
+    :func:`_payload_for_handler`) the one place a handler's payload can be
+    enriched with the job's own id without widening ``JobKind.handler``'s
+    contract for every kind.
 
     Runs outside any HTTP request — there is no ASGI scope for
     ``src.audit_context``'s autofill to read, so ``duration_ms`` is
@@ -1302,7 +1642,7 @@ def dispatch_job(job: dict) -> dict | None:
     kind = JOB_KINDS[job["kind"]]
     t0 = time.monotonic()
     try:
-        result = kind.handler(job["payload_json"])
+        result = kind.handler(_payload_for_handler(job))
     except Exception as exc:
         log_safe(
             user_id=None,
@@ -1478,6 +1818,20 @@ def register_all_kinds() -> None:
     )
     register_kind(
         JobKind(
+            name="knowledge-packaging",
+            handler=_run_knowledge_packaging,
+            lane=LIGHT_LANE,
+            # Heartbeat-protected, same default as the other LIGHT kinds —
+            # NOT sized to the pass's own duration (bounded separately, by
+            # _DEFAULT_KNOWLEDGE_PACKAGING_TIMEOUT_S, enforced inside
+            # run_packaging_pass via `deadline`). See the module docstring's
+            # lease/retry tuning note.
+            lease_seconds=_DEFAULT_LIGHT_LEASE_S,
+            retry_in_seconds=300,
+        )
+    )
+    register_kind(
+        JobKind(
             name="analytics-rebuild",
             handler=_run_analytics_rebuild,
             lane=HEAVY_LANE,
@@ -1503,14 +1857,36 @@ def register_all_kinds() -> None:
             name="corpus-extraction",
             handler=_run_corpus_extraction,
             lane=EXTRACTION_LANE,
-            # Tracks the run's own expected ceiling (extraction.timeout_s,
-            # default 3600s) plus a margin — see the module docstring's
-            # lease/retry tuning note.
-            lease_seconds=_extraction_timeout_seconds() + _EXTRACTION_LEASE_MARGIN_S,
+            # Heartbeat-protected, NOT tied to extraction.timeout_s (the
+            # crawl's own wall-clock bound, enforced separately, inside the
+            # crawl) — see the module docstring's lease/retry tuning note.
+            lease_seconds=_DEFAULT_EXTRACTION_LEASE_S,
             # No automatic retry: a failed run (bad credentials, a crawl
             # error, an exhausted throttle budget) needs an operator to look
             # at it, not an unattended re-run a few minutes later.
             retry_in_seconds=None,
+            # ...UNLESS the raised exception is a TRANSIENT infrastructure
+            # fault (TCRD-296 C.11) — see `_TRANSIENT_INGEST_RETRY_S`.
+            transient_retry_in_seconds=_TRANSIENT_INGEST_RETRY_S,
+        )
+    )
+    register_kind(
+        JobKind(
+            name="corpus-extraction-shard",
+            handler=_run_corpus_extraction_shard,
+            # Same lane as corpus-extraction — a shard child IS a crawl,
+            # just over a narrower set of targets.
+            lane=EXTRACTION_LANE,
+            # Same lease shape as corpus-extraction above.
+            lease_seconds=_DEFAULT_EXTRACTION_LEASE_S,
+            # No automatic retry — same rationale as corpus-extraction: a
+            # failed shard needs an operator to look at it, not an
+            # unattended re-run. (Re-running just this shard is still
+            # possible via `POST …/extract` with `shards: [index]` —
+            # app/api/admin_sharepoint.py, Task 5.)
+            retry_in_seconds=None,
+            # Same TCRD-296 C.11 opt-in as corpus-extraction above.
+            transient_retry_in_seconds=_TRANSIENT_INGEST_RETRY_S,
         )
     )
     register_kind(
@@ -1527,15 +1903,39 @@ def register_all_kinds() -> None:
             name="sharepoint-subtree-sweep",
             handler=_run_sharepoint_subtree_sweep,
             lane=LIGHT_LANE,
-            # Tracks the module docstring's lease/retry tuning note — a full
-            # probe pass over a large library is multi-hour (spec §6.2), so
-            # this gets its own, much longer lease than the default LIGHT
-            # kind.
+            # Heartbeat-protected, same default LIGHT-kind lease as every
+            # other kind here — NOT sized to the probe pass's own multi-hour
+            # duration (spec §6.2). See the module docstring's lease/retry
+            # tuning note.
             lease_seconds=_sp_sweep_lease_seconds(),
             # No automatic retry — same rationale as corpus-extraction: a
             # failed multi-hour sweep (throttling, a Graph outage mid-walk)
             # needs an operator to look at it, not an unattended re-run.
             retry_in_seconds=None,
+        )
+    )
+    register_kind(
+        JobKind(
+            name="sharepoint-facts-extraction",
+            handler=_run_sharepoint_facts_extraction,
+            # Same lane as corpus-extraction: an LLM-calling document-
+            # processing stage, the same cost/resource class — shares its
+            # concurrency ceiling rather than getting its own.
+            lane=EXTRACTION_LANE,
+            # Heartbeat-protected, NOT tied to the pass's own
+            # extraction.facts.run_timeout_s (its wall-clock bound, enforced
+            # separately inside run_standalone_facts_extraction, between
+            # documents) — same shape as corpus-extraction's own lease
+            # above. See the module docstring's lease/retry tuning note.
+            lease_seconds=_DEFAULT_EXTRACTION_LEASE_S,
+            # No automatic retry: a failed pass (no model credential, an
+            # exhausted retry budget) needs an operator to look at it, not
+            # an unattended re-run — and a resumed run already picks up
+            # from the persisted per-document state anyway, same rationale
+            # as corpus-extraction above.
+            retry_in_seconds=None,
+            # Same TCRD-296 C.11 opt-in as corpus-extraction above.
+            transient_retry_in_seconds=_TRANSIENT_INGEST_RETRY_S,
         )
     )
     from app.chat.manager import get_current_chat_manager

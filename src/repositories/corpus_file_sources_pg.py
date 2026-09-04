@@ -85,6 +85,97 @@ class CorpusFileSourcesPgRepository:
             )
         return dict(row) if row else None
 
+    def resolve_doc_labels(self, source_doc_ids: list[str]) -> Dict[str, Dict[str, Any]]:
+        """``source_doc_id -> {"name": filename, "collection": collection_name
+        | None}`` for every resolvable id, in ONE query.
+
+        The batched sibling of :meth:`get_by_source_doc_id` + a
+        ``corpus_files``/``file_corpora`` lookup per id — the card's "Last
+        run" drawer (``app.web.router._resolve_sharepoint_rejection_doc_labels``)
+        used to spend 3 round trips PER unique rejected/deferred doc_id in a
+        run report, which on a run with hundreds of rejections dominated the
+        page's query count. An id this instance has never seen is simply
+        absent (same "None" contract as the single-id lookup); when a
+        ``source_doc_id`` maps to more than one row (schema allows it, see
+        :meth:`get_by_source_doc_id`'s docstring) an arbitrary one wins, same
+        as the single-id lookup's unordered ``LIMIT 1``.
+        """
+        if not source_doc_ids:
+            return {}
+        with self._engine.connect() as conn:
+            rows = (
+                conn.execute(
+                    sa.text(
+                        "SELECT cfs.source_doc_id AS doc_id, cf.filename AS name, fc.name AS collection_name "
+                        "FROM corpus_file_sources cfs "
+                        "JOIN corpus_files cf ON cf.id = cfs.corpus_file_id "
+                        "LEFT JOIN file_corpora fc ON fc.id = cf.corpus_id "
+                        "WHERE cfs.source_doc_id = ANY(:ids)"
+                    ),
+                    {"ids": list(source_doc_ids)},
+                )
+                .mappings()
+                .all()
+            )
+        out: Dict[str, Dict[str, Any]] = {}
+        for r in rows:
+            out.setdefault(r["doc_id"], {"name": r["name"], "collection": r["collection_name"]})
+        return out
+
+    def files_for_doc(self, corpus_id: str, source_doc_id: str) -> list[str]:
+        """Every ``corpus_file_id`` anchored to ``(corpus_id, source_doc_id)``
+        — more than one row can legally match (TCRD-241: a byte-identical
+        copy shares its sha-derived doc_id with every other copy). Mirrors
+        the scope of ``FactsPgRepository.ingest_batch``'s own internal
+        ``_copies_for`` (that closure resolves the ingest-time WRITE
+        winner; this is the public, read-only "who are the copies"
+        equivalent for a caller outside the ingest path — e.g. the facts
+        ledger's reset-no-claims recovery, TCRD-296 gap #62)."""
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                sa.text(
+                    "SELECT corpus_file_id FROM corpus_file_sources "
+                    "WHERE corpus_id = :corpus_id AND source_doc_id = :doc_id"
+                ),
+                {"corpus_id": corpus_id, "doc_id": source_doc_id},
+            ).all()
+        return [r[0] for r in rows]
+
+    def pending_extraction_candidates(self, corpus_ids: list[str]) -> list[Dict[str, Any]]:
+        """Every indexed, source-anchored file across ``corpus_ids``,
+        projected to ``{file_id, sha256}`` — ONE query, regardless of how
+        many files the corpora hold (TCRD-296 gap #72).
+
+        This is the candidate set ``connectors.sharepoint.facts_extraction
+        .count_pending_documents`` used to assemble with a ``list_for_corpus``
+        call per collection PLUS a ``get(file_id)`` call PER FILE (282k round
+        trips on the connection that surfaced this) — replaced by the same
+        ``indexed`` + ``source_doc_id IS NOT NULL`` pre-filter that loop
+        applied, pushed into the join instead of Python. The caller still
+        finishes the per-file decision itself (the ledger's ``docs_state``
+        is a JSON blob, not a joinable table), but over this single,
+        already-narrow result set rather than one query per row.
+        """
+        if not corpus_ids:
+            return []
+        with self._engine.connect() as conn:
+            rows = (
+                conn.execute(
+                    sa.text(
+                        "SELECT cf.id AS file_id, cf.sha256 AS sha256 "
+                        "FROM corpus_files cf "
+                        "JOIN corpus_file_sources cfs ON cfs.corpus_file_id = cf.id "
+                        "WHERE cf.corpus_id = ANY(:corpus_ids) "
+                        "AND cf.processing_status = 'indexed' "
+                        "AND cfs.source_doc_id IS NOT NULL"
+                    ),
+                    {"corpus_ids": list(corpus_ids)},
+                )
+                .mappings()
+                .all()
+            )
+        return [dict(r) for r in rows]
+
     def upsert(
         self,
         *,

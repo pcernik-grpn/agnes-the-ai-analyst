@@ -139,9 +139,10 @@
               back_href='/catalog', back_label='Back', panel='', glyph=None,
               compact=False, type_label=None, menu=None,
               trust=None, trust_own=False, cls='', panels=True,
-              name_id=None, body_slot='', back_id=None, icon_id=None) %}
+              name_id=None, body_slot='', back_id=None, icon_id=None,
+              crumbs=None) %}
 {# `kind` sets the accent color + data-kind; `glyph` optionally overrides just
-   the icon shape (e.g. a one-file artefact keeps the library color but draws
+   the icon shape (e.g. a one-file artifact keeps the library color but draws
    the single-document glyph). Defaults to kind, so existing callers are
    unaffected. `compact=True` drops the dark gradient + deco layers for a light
    header — use it on utility pages (upload / collection) whose primary content
@@ -166,7 +167,37 @@
    page owns (pill rows, telemetry chips, <template> holders). #}
 <div class="detail{% if redesign and panels %} detail--panels{% endif %}{% if cls %} {{ cls }}{% endif %}" data-kind="{{ kind }}"
      style="--kind: var(--ds-kind-{{ kind }}); --kind-soft: var(--ds-kind-{{ kind }}-soft);">
+{# The lone back link, or a TRAIL when a page passes `crumbs` — a list of
+   `{href, label}`, outermost first. The distinction is load-bearing on a page
+   nested two levels deep, and getting it wrong is a real reported bug (#2141
+   item 3): a file inside a collection had the COLLECTION as its back
+   affordance, so "back" from a file opened out of the Library list landed
+   somewhere the reader had never been.
+
+   So exactly ONE crumb carries the arrow and is the back action — the place
+   the reader actually came from — and the rest are plain breadcrumbs: places
+   to go, not the way back. Mark it with `'back': True`; the FIRST crumb takes
+   it when none is marked, which is the common case and the original
+   behaviour. A page that passes no crumbs at all is unchanged. #}
+{% if crumbs %}
+{# Which crumb is the back action: the one marked `back`, else the first. #}
+{% set _ns = namespace(back_i=0) %}
+{% for cr in crumbs %}{% if cr.back %}{% set _ns.back_i = loop.index0 %}{% endif %}{% endfor %}
+<nav class="detail-back detail-crumbs" aria-label="Breadcrumb">
+  {%- for cr in crumbs %}
+  {%- if not loop.first %}
+  <span class="detail-crumbs__sep" aria-hidden="true">/</span>
+  {%- endif %}
+  {%- if loop.index0 == _ns.back_i %}
+  <a class="detail-crumbs__here" href="{{ cr.href }}"{% if back_id %} id="{{ back_id }}"{% endif %}>{{ ico('back') }}{{ cr.label }}</a>
+  {%- else %}
+  <a class="detail-crumbs__up" href="{{ cr.href }}">{{ cr.label }}</a>
+  {%- endif %}
+  {%- endfor %}
+</nav>
+{% else %}
 <a class="detail-back" href="{{ back_href }}"{% if back_id %} id="{{ back_id }}"{% endif %}>{{ ico('back') }}{{ back_label }}</a>
+{% endif %}
 
 <div class="detail-hero{% if panel %} detail-hero--paneled{% endif %}{% if compact %} detail-hero--compact{% endif %}">
   {% if not compact %}{{ hero_deco() }}{% endif %}
@@ -468,6 +499,46 @@
    always spelled out, so the tone is decoration and never the signal. #}
 {% macro status(label, tone='') %}
 <span class="detail-status{% if tone %} detail-status--{{ tone }}{% endif %}">{{ label }}</span>
+{% endmacro %}
+
+{# ── Pager ─────────────────────────────────────────────────────────────
+   ONE control for every paginated section on a detail page (a collection's
+   Files list, its Facts list, …): Previous / "Page X of Y · N items" / Next.
+   Renders nothing when there is only one page.
+
+   Both directions are ALWAYS drawn — the unavailable one gets
+   `detail-pager__btn--disabled` rather than being omitted, so the control
+   never changes width as the reader pages back and forth.
+
+   `qs` is the page's full set of OTHER active query params (built once by
+   the route and shared across every section's pager call — see
+   `_pager_href` in app/web/router.py); `page_param` is the ONE key this
+   particular control varies. `pager_href` is a Jinja GLOBAL the route
+   registers, not a macro import, so it copies `qs`, overrides `page_param`
+   and drops defaults without this macro having to know the route's other
+   page keys.
+
+   `anchor_id`, when given, targets the link at the section's own fragment
+   (`#anchor_id`) so paging one section does not jump the reader back to the
+   top of a long page — the OTHER section-scroll bug the bare `?facts_page=`
+   links had alongside dropping every other param. #}
+{% macro pager(current, total_pages, total_items, page_param, qs, anchor_id=None, item_noun='item') %}
+{% if total_pages > 1 %}
+{% set _frag = ('#' ~ anchor_id) if anchor_id else '' %}
+<nav class="detail-pager" aria-label="Pagination">
+  {% if current > 1 %}
+  <a class="detail-pager__btn" href="{{ pager_href(qs, page_param, current - 1) }}{{ _frag }}" rel="prev">{{ ico('back') }}Previous</a>
+  {% else %}
+  <span class="detail-pager__btn detail-pager__btn--disabled" aria-disabled="true">{{ ico('back') }}Previous</span>
+  {% endif %}
+  <span class="detail-pager__status">Page {{ current }} of {{ total_pages }} &middot; {{ total_items }} {{ item_noun }}{{ 's' if total_items != 1 else '' }}</span>
+  {% if current < total_pages %}
+  <a class="detail-pager__btn detail-pager__btn--next" href="{{ pager_href(qs, page_param, current + 1) }}{{ _frag }}" rel="next">Next{{ ico('back') }}</a>
+  {% else %}
+  <span class="detail-pager__btn detail-pager__btn--next detail-pager__btn--disabled" aria-disabled="true">Next{{ ico('back') }}</span>
+  {% endif %}
+</nav>
+{% endif %}
 {% endmacro %}
 
 {# ── Activity timeline ────────────────────────────────────────────────
@@ -872,6 +943,16 @@
   }
   .detail-back:hover { color: var(--kind); }
   .detail-back svg { width: 15px; height: 15px; }
+
+  /* The multi-level variant (`hero(crumbs=…)`). Same type and colour as the
+     single back link — it is the same affordance, one level deeper — with the
+     arrow on the FIRST crumb, which is the actual back action (the list the
+     reader came from); the levels after it are breadcrumbs. */
+  .detail-crumbs { gap: 5px; flex-wrap: wrap; }
+  .detail-crumbs a { color: inherit; text-decoration: none; }
+  .detail-crumbs a:hover { color: var(--kind); text-decoration: underline; }
+  .detail-crumbs__here { display: inline-flex; align-items: center; gap: 6px; }
+  .detail-crumbs__sep { color: var(--ds-text-muted); }
 
   /* ── Hero ── */
   /* Ambient branding behind the content, composed as three independent,
@@ -1293,6 +1374,29 @@
   .detail-status--warn   { background: var(--ds-accent-warn-bg);    border-color: var(--ds-accent-warn-line);    color: var(--ds-accent-warn-ink); }
   .detail-status--danger { background: var(--ds-accent-danger-bg);  border-color: var(--ds-accent-danger-line);  color: var(--ds-accent-danger-ink); }
   .detail-status--info   { background: var(--ds-accent-info-bg);    border-color: var(--ds-accent-info-line);    color: var(--ds-accent-info-ink); }
+
+  /* ── Pager — shared control for every paginated section (Files, Facts, …).
+     Both directions always render; the unavailable one is disabled rather
+     than absent, so the control never changes width as the reader pages. */
+  .detail-pager {
+    display: flex; align-items: center; justify-content: center; gap: 14px;
+    margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--ds-border-light);
+    font-size: 12.5px; color: var(--ds-text-secondary);
+  }
+  .detail-pager__btn {
+    display: inline-flex; align-items: center; gap: 5px;
+    padding: 5px 12px; border-radius: 999px; border: 1px solid var(--ds-border);
+    background: var(--ds-surface); color: var(--kind); text-decoration: none;
+    font-weight: 600; white-space: nowrap;
+  }
+  .detail-pager__btn svg { width: 13px; height: 13px; }
+  .detail-pager__btn--next svg { transform: rotate(180deg); }
+  .detail-pager__btn:hover { background: var(--kind-soft); border-color: var(--kind); }
+  .detail-pager__btn--disabled {
+    color: var(--ds-text-muted); background: var(--ds-surface-dim); border-color: var(--ds-border-light);
+    cursor: default; pointer-events: none;
+  }
+  .detail-pager__status { flex: none; white-space: nowrap; }
 
   .detail-timeline { margin: 0; padding: 0 0 0 20px; list-style: none; border-left: 1px solid var(--ds-border); }
   .detail-timeline__item { position: relative; padding-bottom: 18px; }

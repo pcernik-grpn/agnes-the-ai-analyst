@@ -145,11 +145,14 @@ class TestRegistration:
             "analytics-migrate",
             "distribution-mirror",
             "webhook-deliver",
+            "knowledge-packaging",
             "analytics-rebuild",
             "collections-purge",
             "corpus-extraction",
+            "corpus-extraction-shard",
             "sharepoint-acl-sync",
             "sharepoint-subtree-sweep",
+            "sharepoint-facts-extraction",
         }
 
 

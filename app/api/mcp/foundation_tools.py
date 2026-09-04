@@ -19,6 +19,7 @@ transports.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from pathlib import Path
 from typing import Annotated, Any, Callable, Literal
@@ -28,7 +29,12 @@ from pydantic import Field
 import httpx
 from mcp.server.fastmcp import FastMCP
 
-from src.mcp_tooling import ensure_output_size, ensure_query_output_size, progressive_tool
+from src.mcp_tooling import (
+    compact_search_results,
+    ensure_output_size,
+    ensure_query_output_size,
+    progressive_tool,
+)
 
 
 def _raise_for_status_with_detail(r: httpx.Response) -> None:
@@ -40,6 +46,14 @@ def _raise_for_status_with_detail(r: httpx.Response) -> None:
     values), is discarded, so the model cannot self-correct and the user
     sees a dead-end error card. Same ``httpx.HTTPStatusError`` raised, with
     the detail appended.
+
+    The URL is deliberately NOT in the message. This helper's output is read
+    by two audiences and helps neither with it: the model called a named tool
+    and cannot act on ``http://localhost:8000/api/query``, and the user reads
+    the same string on the failed tool card, where an internal endpoint makes
+    a mistyped column name look like a server outage (#1974). It is also the
+    longest part of the line, and the card's header has room for about one.
+    The request stays on the exception, so logs and handlers still have it.
     """
     if r.status_code < 400:
         return
@@ -55,7 +69,7 @@ def _raise_for_status_with_detail(r: httpx.Response) -> None:
         body = json.dumps(detail, ensure_ascii=False)
     suffix = f" — {body[:600]}" if body.strip() else ""
     raise httpx.HTTPStatusError(
-        f"{r.status_code} {r.reason_phrase} for {r.request.url}{suffix}",
+        f"{r.status_code} {r.reason_phrase}{suffix}",
         request=r.request,
         response=r,
     )
@@ -100,6 +114,12 @@ FOUNDATION_TOOL_NAMES: tuple[str, ...] = (
     "collection_get",
     "collections_search",
     "collection_file_read",
+    # The ONE collection WRITE tool (editable metadata only). Triple-surface
+    # with PATCH /api/collections/{id} + `agnes collections edit`. Deliberately
+    # narrow: create/upload/delete stay off the agent surface — a renamed
+    # collection is reversible and audited, a deleted one is neither, and a
+    # prompt-injected turn must not be able to reach the destructive half.
+    "collection_update",
     "knowledge_search",
     "glossary_search",
     # Open semantic-layer contract (Task 12) — read-only search + get over
@@ -139,9 +159,17 @@ FOUNDATION_TOOL_NAMES: tuple[str, ...] = (
     "fact_facets",
     "fact_neighbors",
     "fact_claims",
+    "fact_edges",
     "schema",
     "describe",
     "query",
+    # Self-service policy diagnosis (issue #2147, backlog item 12: "MCP:
+    # read-only policy observability") — "why does this table look empty/
+    # masked to me". Triple-surface with GET /api/me/effective-access; no
+    # CLI verb (that endpoint is grandfathered REST-only, see
+    # tests/test_documentation_api_triple_surface.py) and no admin variant
+    # (see the tool's own docstring for why).
+    "effective_access",
     "skills",
     "chat_skills",
     "stack_browse",
@@ -263,6 +291,13 @@ FOUNDATION_TOOL_NAMES: tuple[str, ...] = (
     # DuckLake analytics-backend migration (wave-2G Task 6), triple-surface
     # with /api/admin/analytics/migrate + `agnes admin analytics migrate`.
     "admin_analytics_migrate",
+    # Knowledge-artifact packaging (K3, #798; TCRD-296 synthesis C.15),
+    # triple-surface with /api/admin/run-knowledge-packaging +
+    # `agnes admin knowledge packaging run` and
+    # /api/admin/knowledge-packaging/status + `agnes admin knowledge
+    # packaging status`.
+    "admin_knowledge_packaging_run",
+    "admin_knowledge_packaging_status",
     # Agent profiles (agent-api V1a, Task 12) — triple-surface with
     # /api/v1/agents + `agnes agent list` (management, session-token only)
     # and /api/v1/agents/{slug}/responses + `agnes agent ask` (runtime,
@@ -279,7 +314,7 @@ FOUNDATION_TOOL_NAMES: tuple[str, ...] = (
     "data_app_get",
     "data_app_deploy",
     "data_app_logs",
-    # "Add artefacts to My Stack" — triple-surface with
+    # "Add artifacts to My Stack" — triple-surface with
     # /api/stack/artefacts* + `agnes stack artefacts list/add/remove`. Adds
     # Stack MEMBERSHIP data only (see the module note on stack_subscribe) —
     # NOT a retrieval gate: knowledge_search/collections_search below still
@@ -358,6 +393,19 @@ _FACTS_NOT_FOUND_HINT = (
     "admin about the `facts` feature flag."
 )
 
+# Registry 404 (command-ux.md's "not found" convention) — mirrors `schema` /
+# `describe`'s hint at `agnes catalog` on the CLI side by pointing at this
+# transport's own `catalog` tool instead. Deliberately indistinguishable
+# between "no such table" and "not RBAC-visible to you" — `effective_access`
+# already only ever lists what the caller can see (§10.2), so there is
+# nothing narrower to report without turning a diagnostic tool into an
+# existence oracle for tables the caller cannot reach.
+_EFFECTIVE_ACCESS_NOT_FOUND_HINT = (
+    "No effective-access entry for table {table!r}. This means one of: the id "
+    "(or name) is wrong, or you cannot access this table at all. Use the "
+    "`catalog` tool to list tables you can see, then retry with its `id`."
+)
+
 
 def _facts_caller(headers_fn: Callable[[], dict[str, str]]) -> Any:
     """Resolve the MCP session's caller into the SAME user/Principal object
@@ -400,6 +448,31 @@ def _facts_caller(headers_fn: Callable[[], dict[str, str]]) -> Any:
     if caller is None:
         raise PermissionError(f"facts: could not authenticate this MCP session ({reason})")
     return caller
+
+
+#: The fact-graph query tools — every one of them 404s (``facts_disabled``)
+#: while the ``facts`` feature switch is off, so ``tools/list`` must not offer
+#: them then: each tool's own description tells the agent to reach for it
+#: FIRST on who/what questions, and an instance with the switch off saw the
+#: first tool call of a turn fail with ``404: facts_disabled`` (issue #2161).
+FACT_TOOL_NAMES: frozenset[str] = frozenset(
+    {"fact_search", "fact_type_map", "fact_facets", "fact_neighbors", "fact_claims", "fact_edges"}
+)
+
+
+def feature_hidden_tool_names() -> frozenset[str]:
+    """Foundation tools ``tools/list`` must hide on THIS instance right now.
+
+    Evaluated per listing, not at registration — the switches live in the
+    ``/admin/server-config`` overlay and can flip without a restart. Hidden
+    only, never unregistered: a call to a hidden tool still runs its own
+    gate (``require_facts_enabled``), so the two cannot disagree.
+    """
+    from app.instance_config import feature_enabled
+
+    if feature_enabled("facts", "enabled", env_var="AGNES_FACTS_ENABLED", default=False):
+        return frozenset()
+    return FACT_TOOL_NAMES
 
 
 def register_foundation_tools(
@@ -474,20 +547,67 @@ def register_foundation_tools(
             return r.json()
 
     @tool(read_only=True)
-    async def collection_get(collection_id: str) -> dict:
-        """Show one Collection's detail plus its files and per-file status.
+    async def collection_get(collection_id: str, limit: int = 25, offset: int = 0, q: str = "") -> dict:
+        """Show one Collection's detail plus a PAGE of its files with per-file status.
+
+        The file list is paginated, not exhaustive — a crawled collection can
+        hold thousands of files, far more than fits in a model's context.
+        This returns at most ``limit`` files starting at ``offset``; read
+        ``files_total`` (the true count, after any ``q`` filter) and
+        ``files_truncated`` (``files_total`` greater than the files returned)
+        before treating ``files`` as the whole collection. When
+        ``files_truncated`` is true, call again with
+        ``offset=<this call's offset + len(files)>`` (or a larger ``limit``,
+        capped at 200 server-side) to reach the rest — ``files_limit`` and
+        ``files_offset`` on the response say exactly what page you just saw.
+
+        ``q`` filters files by a case-insensitive SUBSTRING match over the
+        filename OR path — this is NOT the whole-word content search
+        ``collections_search`` performs inside file text. Use ``q`` to find a
+        file by name, use ``collections_search`` to find a passage inside one.
 
         Args:
             collection_id: Collection id from ``collections_list`` (``col_...``).
+            limit: Max files to return in this page (default 25; server clamps to 1-200).
+            offset: Files to skip before this page (default 0).
+            q: Optional filename/path substring filter. Empty string (default) means no filter.
         """
+        params: dict = {"limit": limit, "offset": offset}
+        if q:
+            params["q"] = q
         async with httpx.AsyncClient() as c:
-            r = await c.get(
+            detail_r = await c.get(
                 f"{base_url}/api/collections/{collection_id}",
                 headers=headers_fn(),
                 timeout=30,
             )
-            _raise_for_status_with_detail(r)
-            return r.json()
+            _raise_for_status_with_detail(detail_r)
+            detail = detail_r.json()
+
+            files_r = await c.get(
+                f"{base_url}/api/collections/{collection_id}/files",
+                headers=headers_fn(),
+                params=params,
+                timeout=30,
+            )
+            _raise_for_status_with_detail(files_r)
+            page = files_r.json()
+
+        files = page.get("files", [])
+        total = page.get("total", len(files))
+        # The offset the SERVER used, which is not always the one asked for —
+        # it clamps a negative or out-of-range value. Deriving `truncated`
+        # from the requested offset then miscounts what has been seen: a
+        # clamped -5 leaves `-5 + len(files)` below the true position, so the
+        # tool reports more pages than exist and a paginating agent walks off
+        # the end (Devin Review on #2062). Everything below reads this one.
+        effective_offset = page.get("offset", offset)
+        detail["files"] = files
+        detail["files_total"] = total
+        detail["files_truncated"] = total > (effective_offset + len(files))
+        detail["files_limit"] = page.get("limit", limit)
+        detail["files_offset"] = effective_offset
+        return detail
 
     @tool(read_only=True)
     async def collections_search(query: str, k: int = 10, collection_id: str = "") -> dict:
@@ -517,13 +637,31 @@ def register_foundation_tools(
         case you are in; read them before concluding anything about
         permissions.
 
-        NOTE (deferred follow-up, "Add artefacts to My Stack" spec): this
+        NOTE (deferred follow-up, "Add artifacts to My Stack" spec): this
         fans out over every RBAC-accessible collection — it does NOT gate by
         the caller's Stack membership (``user_stack_subscriptions``,
         ``stack_artefacts_candidates``/``stack_artefact_add``). Wiring that
         gate here (and in ``knowledge_search``) is an intentionally separate,
         higher-risk change since other features (e.g. the /agents knowledge
         picker) share this endpoint.
+
+        Long passages are shortened to fit the tool output budget rather than
+        failing the call. When the response carries ``truncated: true``, each hit
+        whose ``truncated_fields`` names a field holds a PREFIX of it (ending in
+        ``…``) — never summarise a prefix as the whole passage. Read the document
+        in full with ``collection_file_read(collection_id=<corpus_id>,
+        file_id=<file_id>)`` (a chunk hit carries both), or narrow the query /
+        lower ``k``; ``truncated_note`` says exactly what was cut.
+
+        A large collection set (#2151) can ALSO set ``truncated: true`` for a
+        different reason: the server ranked over a bounded, query-matched
+        subset of the corpus rather than every accessible chunk. That case
+        carries its own ``truncated_cap`` (the chunk limit applied) alongside
+        ``truncated_note`` — narrow with ``collection_id`` or a more specific
+        query to reach what was excluded. A query too generic to narrow the
+        corpus by (e.g. only common words) is refused outright rather than
+        silently ranking an arbitrary slice; the tool call raises with the
+        server's ``search_query_too_broad`` detail in that case.
 
         Args:
             query: Natural-language or keyword query.
@@ -541,7 +679,7 @@ def register_foundation_tools(
                 timeout=60,
             )
             _raise_for_status_with_detail(r)
-            return r.json()
+            return compact_search_results(r.json(), "collections_search")
 
     @tool(read_only=True)
     async def knowledge_search(query: str, k: int = 10) -> dict:
@@ -550,7 +688,7 @@ def register_foundation_tools(
         Fans out server-side over Collections chunks (hybrid lexical+vector),
         corporate-memory knowledge items (fulltext), table catalog cards,
         business metrics, and the glossary — all RBAC-filtered (glossary is
-        public). Results are typed ``chunk | knowledge | table | metric | glossary``;
+        public). Results are typed ``chunk | knowledge | table | metric | glossary | plugin``;
         a ``table`` hit means structured data: pivot to SQL via the ``query``
         tool with the hit's ``table_id`` instead of reading text chunks.
         A ``metric`` hit links to /semantic-layer?tab=all_metrics; a ``glossary``
@@ -559,7 +697,7 @@ def register_foundation_tools(
         ``hybrid`` (lexical + semantic) or ``lexical_only`` — the degraded
         mode when the server has no embedding model installed.
 
-        NOTE (deferred follow-up, "Add artefacts to My Stack" spec): the
+        NOTE (deferred follow-up, "Add artifacts to My Stack" spec): the
         Collections leg of this fan-out is not gated by Stack membership
         either — see ``collections_search``'s note.
 
@@ -569,6 +707,14 @@ def register_foundation_tools(
         you lack access — it carries ``searched_collections``,
         ``searched_tables`` and a ``hint`` saying which of the two it is;
         read the hint before telling anyone they have no access.
+
+        Long passages are shortened to fit the tool output budget rather than
+        failing the call. When the response carries ``truncated: true``, each hit
+        whose ``truncated_fields`` names a field holds a PREFIX of it (ending in
+        ``…``) — never summarise a prefix as the whole passage. Read the document
+        in full with ``collection_file_read(collection_id=<corpus_id>,
+        file_id=<file_id>)`` (a chunk hit carries both), or narrow the query /
+        lower ``k``; ``truncated_note`` says exactly what was cut.
 
         Args:
             query: Natural-language or keyword query.
@@ -582,7 +728,7 @@ def register_foundation_tools(
                 timeout=60,
             )
             _raise_for_status_with_detail(r)
-            return r.json()
+            return compact_search_results(r.json(), "knowledge_search")
 
     @tool(read_only=True)
     async def glossary_search(query: str, k: int = 10) -> dict:
@@ -639,6 +785,17 @@ def register_foundation_tools(
         not admin-only. Use `semantic_model_search` first if you don't
         already know the slug.
 
+        The response also carries `content_hash` — sha256 of `document`,
+        the same value every other semantic-layer surface calls
+        `content_hash` — so a caller that must pin *which* revision it read
+        (a skill citing provenance, an agent comparing against a cached
+        copy) doesn't need to hash the document itself. Read from the
+        export endpoint's `ETag` response header (issue #2153); falls back
+        to hashing the response body when an older server sends no `ETag`
+        (export is byte-for-byte, so the two are always equal). `updated_at`
+        (ISO-8601) is included only when the server's `X-Semantic-Model-
+        Updated-At` header is present.
+
         Args:
             slug: Model slug, e.g. from a `semantic_model_search` result.
         """
@@ -649,7 +806,18 @@ def register_foundation_tools(
                 timeout=30,
             )
             _raise_for_status_with_detail(r)
-            return {"slug": slug, "document": r.text}
+            result: dict[str, Any] = {"slug": slug, "document": r.text}
+            etag = r.headers.get("etag")
+            if etag:
+                # Strip the RFC 7232 quoting, tolerating a weak validator
+                # (`W/"..."`) even though the export endpoint never emits one.
+                result["content_hash"] = etag.removeprefix("W/").strip('"')
+            else:
+                result["content_hash"] = hashlib.sha256(r.content).hexdigest()
+            updated_at = r.headers.get("x-semantic-model-updated-at")
+            if updated_at:
+                result["updated_at"] = updated_at
+            return result
 
     @tool(read_only=True)
     async def validate_semantic_query(
@@ -921,12 +1089,57 @@ def register_foundation_tools(
             _raise_for_status_with_detail(r)
             return r.json()
 
+    @tool(read_only=False)
+    async def collection_update(
+        collection_id: str,
+        name: str | None = None,
+        description: str | None = None,
+    ) -> dict:
+        """Rename a Collection or rewrite its description (owner or admin only).
+
+        For tidying a library from chat: a collection created from a file drop
+        is named after the file, and "call this one Q3 supplier contracts and
+        describe what is in it" is the fix. Only metadata changes — the files
+        inside are untouched, and there is deliberately no tool here that
+        creates, uploads into or deletes a collection (use the Library UI or
+        `agnes collections`).
+
+        Omit an argument to leave that field alone; pass ``description=""`` to
+        clear the description. Answers 403 unless you OWN the collection (a
+        group grant conveys reading, not renaming), 409 when the collection is
+        fed by a source connection, and 400 when neither field is given.
+
+        The collection keeps its URL slug — renaming does not move
+        ``/library/{slug}`` — so links already handed to somebody keep working.
+
+        Args:
+            collection_id: Collection id from ``collections_list`` (``col_...``).
+            name: New display name. Omit to keep the current one.
+            description: New description; ``""`` clears it. Omit to keep it.
+        """
+        body: dict[str, Any] = {}
+        if name is not None:
+            body["name"] = name
+        if description is not None:
+            # "" is a deliberate clear; the REST layer maps it to NULL.
+            body["description"] = description
+        async with httpx.AsyncClient() as c:
+            r = await c.patch(
+                f"{base_url}/api/collections/{collection_id}",
+                json=body,
+                headers=headers_fn(),
+                timeout=30,
+            )
+            _raise_for_status_with_detail(r)
+            return r.json()
+
     @tool(read_only=True)
     async def fact_search(
         type: str | None = None,
         filters: dict[str, Any] | None = None,
         q: str | None = None,
         limit: Annotated[int, Field(ge=1, le=100)] = 20,
+        include_claims: Annotated[int, Field(ge=0, le=3)] = 0,
     ) -> dict:
         """Search typed facts extracted from documents — entities (people,
         clients, organizations) and their attributes. Use this FIRST for
@@ -958,37 +1171,56 @@ def register_foundation_tools(
                 matched against alias names only, never claim text. An
                 exact or prefix match ranks first.
             limit: Max results (server caps at 100).
+            include_claims: 0 (default) or 1-3 — attach that many of each
+                subject's NEWEST readable quotes inline as `claims`, so you
+                can cite without a `fact_claims` call per result. Use 1 when
+                you will cite several results; leave 0 when you only need
+                ids.
 
         Returns ``{"subjects": [{"id", "type", "aliases", "attrs",
-        "claim_count", "quote_count", "revealed"}], "limit_applied"}`` —
-        `limit_applied` is true only when YOUR OWN readable results exceed
-        `limit`, never a signal that grants hid additional matches.
+        "claim_count", "quote_count", "revealed", "claims"?}],
+        "limit_applied", "claims_truncated"?}`` — `limit_applied` is true
+        only when YOUR OWN readable results exceed `limit`, never a signal
+        that grants hid additional matches; `claims_truncated` (only with
+        `include_claims`) means the inline budget ran out part-way.
         """
         from app.auth.access import require_facts_enabled
         from src.repositories import facts_repo
 
         require_facts_enabled()
         caller = _facts_caller(headers_fn)
-        return await asyncio.to_thread(facts_repo().search, caller, type=type, filters=filters or {}, q=q, limit=limit)
+        return await asyncio.to_thread(
+            facts_repo().search,
+            caller,
+            type=type,
+            filters=filters or {},
+            q=q,
+            limit=limit,
+            include_claims=include_claims,
+        )
 
     @tool(read_only=True)
     async def fact_type_map() -> dict:
-        """List every fact type in the graph with a live count of the
-        subjects YOU can see. Use this to orient BEFORE `fact_search` when
-        you do not yet know what types exist — each row's `type` is a valid
-        `fact_search(type=...)` argument, and its `count` tells you whether
-        searching it is worth a call.
+        """List every fact (node) type AND every edge (relationship) type
+        with a live count of what YOU can see — orient here BEFORE
+        `fact_search` (node types) and BEFORE `fact_neighbors` on a
+        well-connected subject (edge types, e.g. `in_industry` for
+        `fact_neighbors(edge_types=[...])`): learning the name here is one
+        small call, versus an unfiltered traversal returning every
+        relationship type a hub node has.
 
-        Counted through the same visibility gate `fact_search` applies, so a
-        number is what you could actually reach and never a total inflated
-        by evidence you cannot read. A type with no subjects visible to you
-        is omitted entirely rather than returned with a count of 0 — absence
-        here means "nothing you can see", which is deliberately
-        indistinguishable from "no such type". Behind the `facts` feature
-        flag (off by default); requires the Postgres app-state backend.
-        Mirrors `GET /api/facts/type-map` and `agnes facts type-map`.
+        Counted through the same visibility gate `fact_search`/
+        `fact_neighbors` apply, so a number is what you could actually
+        reach and never a total inflated by evidence you cannot read. A
+        type with nothing visible to you is omitted entirely rather than
+        returned with a count of 0 — absence here means "nothing you can
+        see", which is deliberately indistinguishable from "no such type".
+        Behind the `facts` feature flag (off by default); requires the
+        Postgres app-state backend. Mirrors `GET /api/facts/type-map` and
+        `agnes facts type-map`.
 
-        Returns ``{"types": [{"type", "count"}], "total"}``, ordered by type.
+        Returns ``{"types": [{"type", "count"}], "total",
+        "edge_types": [{"type", "count"}]}``, both lists ordered by type.
         """
         from app.auth.access import require_facts_enabled
         from src.repositories import facts_repo
@@ -996,9 +1228,11 @@ def register_foundation_tools(
         require_facts_enabled()
         caller = _facts_caller(headers_fn)
         counts = await asyncio.to_thread(facts_repo().count_visible_facts_by_type, caller)
+        edge_counts = await asyncio.to_thread(facts_repo().count_visible_edges_by_type, caller)
         return {
             "types": [{"type": t, "count": n} for t, n in counts.items()],
             "total": sum(counts.values()),
+            "edge_types": [{"type": t, "count": n} for t, n in edge_counts.items()],
         }
 
     @tool(read_only=True)
@@ -1045,13 +1279,24 @@ def register_foundation_tools(
         depth: Annotated[int, Field(ge=1, le=2)] = 1,
         fanout: Annotated[int, Field(ge=1, le=100)] = 100,
         limit: Annotated[int, Field(ge=1, le=500)] = 500,
+        include_claims: Annotated[int, Field(ge=0, le=3)] = 0,
     ) -> dict:
-        """Traverse relationships between facts — use for connection/chain
-        questions ("how are X and Y connected", "who does X report to",
-        "which team owns this client") once you have a starting
-        `subject_id` from `fact_search`; prefer this over inferring
-        structure from a SQL join or a document search. Depth <= 2, capped
-        fanout (design doc §12).
+        """Traverse relationships from ONE starting fact — connection/chain
+        questions ("how are X and Y connected", "who does X report to") once
+        you have a `subject_id` from `fact_search`; prefer it over inferring
+        structure from SQL or document search. For ALL relationships of one
+        type, call `fact_edges` once instead of walking every root. Depth
+        <= 2, capped fanout (design doc §12).
+
+        PASS `edge_types` WHEN YOU KNOW IT — a well-connected node (a hub
+        client, a busy person) can carry many relationship types at once;
+        omitting `edge_types` returns ALL of them, which costs far more
+        context than the one relationship your question needs. If you do
+        not yet know the exact edge type name (e.g. `in_industry`,
+        `owned_by`), call `fact_type_map` FIRST — its `edge_types` list is
+        a one-call, low-cost primer naming every relationship type you can
+        see, with a count each. Do not discover it the expensive way by
+        reading an unfiltered `fact_neighbors` result.
 
         Re-checks visibility at EVERY hop — an edge into a subject whose
         claims you cannot read is dropped silently, never revealed as
@@ -1061,16 +1306,24 @@ def register_foundation_tools(
 
         Args:
             subject_id: Fact id to traverse from (from `fact_search`).
-            edge_types: Restrict traversal to these edge types. Omit for all.
+            edge_types: Restrict traversal to these edge types (see
+                `fact_type_map`'s `edge_types` list for valid names). Omit
+                for all — expensive on a well-connected node, so only omit
+                when you are still exploring what relationships exist.
             depth: Traversal depth, 1 (default) or 2.
             fanout: Max edges expanded per node (server caps at 100).
             limit: Max total nodes+edges returned (server caps at 500).
+            include_claims: 0 (default) or 1-3 — attach that many of each
+                EDGE's newest readable quotes inline as `claims`, so the
+                relationships you report are already cited without a
+                `fact_claims` call per edge.
 
-        Returns ``{"nodes": [...], "edges": [...], "truncated": {"depth",
-        "fanout", "result"}}``. Errors for a `subject_id` that does not
-        exist OR has no readable claim — indistinguishable from your point
-        of view on purpose (design doc §5 rule 2); re-check the id with
-        `fact_search` rather than treating this as a permission signal.
+        Returns ``{"nodes": [...], "edges": [{..., "claims"?}], "truncated":
+        {"depth", "fanout", "result", "claims"?}}``. Errors for a
+        `subject_id` that does not exist OR has no readable claim —
+        indistinguishable from your point of view on purpose (design doc §5
+        rule 2); re-check the id with `fact_search` rather than treating
+        this as a permission signal.
         """
         from app.auth.access import require_facts_enabled
         from src.repositories import facts_repo
@@ -1087,29 +1340,124 @@ def register_foundation_tools(
                 depth=depth,
                 fanout=fanout,
                 limit=limit,
+                include_claims=include_claims,
             )
         except FactNotFound:
             raise ValueError(_FACTS_NOT_FOUND_HINT.format(subject_id=subject_id)) from None
 
     @tool(read_only=True)
-    async def fact_claims(subject_id: str) -> dict:
-        """Your readable evidence for one fact or edge — the exact quote,
-        source document and date backing a result from `fact_search` or
-        `fact_neighbors`. Call this before reporting a fact in your answer:
-        a fact you cannot cite this way is not one you should state as
-        given.
+    async def fact_edges(
+        edge_type: str,
+        src_type: str | None = None,
+        dst_type: str | None = None,
+        src_id: str | None = None,
+        dst_id: str | None = None,
+        extend_edge_type: str | None = None,
+        extend_from: Annotated[str, Field(pattern="^(src|dst)$")] = "dst",
+        include_claims: Annotated[int, Field(ge=0, le=3)] = 0,
+        limit: Annotated[int, Field(ge=1, le=100)] = 100,
+    ) -> dict:
+        """List EVERY relationship of one type you can see, with both ends
+        as full subjects, in ONE call — the tool for aggregation and
+        comparison questions over a relationship ("which clients does each
+        sponsor own", "which industries are our clients in"). Read the type
+        names from `fact_type_map`'s `edge_types`, then call this once; do
+        not call `fact_neighbors` per root. Use `fact_neighbors` only when
+        the question starts from ONE known entity.
 
-        Mirrors `GET /api/facts/{subject_id}/claims` and `agnes facts claims`.
+        Per root, `fact_neighbors` + `fact_claims` is one call per entity
+        plus one per citation; this returns the same edges, both endpoints
+        projected, and (with `include_claims`) the quotes to cite, in a
+        single round trip.
+
+        Two hops in one call: `extend_edge_type` follows a second
+        relationship type from every listed edge's `extend_from` endpoint
+        (e.g. list `owned_by` edges, then from each `src` follow
+        `in_industry`) — the shape of "which sponsor's clients are in which
+        industries".
+
+        Every edge and both its endpoints are filtered to what YOU can read
+        (design doc §5): an edge whose evidence you cannot read, or whose
+        endpoint you may not see, is simply absent — never reported as
+        "hidden". An unknown or unreadable `edge_type` returns an empty
+        page, not an error. Behind the `facts` feature flag; requires the
+        Postgres app-state backend. Mirrors `POST /api/facts/edges` and
+        `agnes facts edges`.
 
         Args:
-            subject_id: Fact or edge id (from `fact_search` / `fact_neighbors`).
+            edge_type: Relationship type to list (a name from
+                `fact_type_map`'s `edge_types`). Required.
+            src_type: Only edges whose source fact has this type.
+            dst_type: Only edges whose destination fact has this type.
+            src_id: Only edges out of this fact id.
+            dst_id: Only edges into this fact id.
+            extend_edge_type: Second relationship type to follow one hop
+                from each listed edge's `extend_from` endpoint.
+            extend_from: Which endpoint the extension starts from, "src"
+                or "dst" (default).
+            include_claims: 0 (default) or 1-3 — attach that many of each
+                edge's newest readable quotes inline as `claims`. Use 1 for
+                a cited table; it saves a `fact_claims` call per row.
+            limit: Max edges per hop (server caps at 100).
+
+        Returns ``{"nodes": [<subject: id, type, aliases, attrs,
+        claim_count, quote_count, revealed>], "edges": [{"id", "src",
+        "dst", "type", "attrs", "claims"?}], "truncated": {"result",
+        "extension", "claims"}}`` — each `truncated` flag is true only when
+        YOUR OWN visible set exceeded the cap, never a hint at hidden
+        matches. When `truncated.result` is true, narrow with `src_type`/
+        `dst_type`/`src_id`/`dst_id` rather than assuming you saw
+        everything.
+        """
+        from app.auth.access import require_facts_enabled
+        from src.repositories import facts_repo
+
+        require_facts_enabled()
+        caller = _facts_caller(headers_fn)
+        return await asyncio.to_thread(
+            facts_repo().edges,
+            caller,
+            edge_type=edge_type,
+            src_type=src_type,
+            dst_type=dst_type,
+            src_id=src_id,
+            dst_id=dst_id,
+            limit=limit,
+            extend_edge_type=extend_edge_type,
+            extend_from=extend_from,
+            include_claims=include_claims,
+        )
+
+    @tool(read_only=True)
+    async def fact_claims(
+        subject_id: str,
+        limit: Annotated[int, Field(ge=1, le=200)] = 25,
+    ) -> dict:
+        """Your readable evidence for one fact or edge — the exact quote,
+        source document and date backing a result from `fact_search`,
+        `fact_neighbors` or `fact_edges`. Call this before reporting a fact
+        in your answer when you did not already get its quotes inline via
+        `include_claims`: a fact you cannot cite this way is not one you
+        should state as given.
+
+        Returns the NEWEST `limit` claims (default 25, max 200); a hub
+        subject can carry hundreds, and pulling them all costs more context
+        than the answer needs. `limit_applied: true` means more readable
+        claims exist beyond this page — raise `limit` only if you actually
+        need older evidence. Mirrors `GET /api/facts/{subject_id}/claims`
+        and `agnes facts claims`.
+
+        Args:
+            subject_id: Fact or edge id (from `fact_search` /
+                `fact_neighbors` / `fact_edges`).
+            limit: Max claims returned, newest first (server caps at 200).
 
         Returns ``{"claims": [{"id", "corpus_id", "corpus_file_id",
         "document": {"name", "path", "source_url"?}, "quote", "attrs",
-        "document_date"}], "revealed"}``. A subject under an admin
-        `revealed` correction is served to every authenticated caller with
-        every `quote` suppressed to an empty string. Errors for a
-        `subject_id` that does not exist OR has no readable claim — same
+        "document_date"}], "revealed", "limit_applied"}``. A subject under
+        an admin `revealed` correction is served to every authenticated
+        caller with every `quote` suppressed to an empty string. Errors for
+        a `subject_id` that does not exist OR has no readable claim — same
         failure either way, on purpose (design doc §5 rule 2).
         """
         from app.auth.access import require_facts_enabled
@@ -1119,7 +1467,7 @@ def register_foundation_tools(
         require_facts_enabled()
         caller = _facts_caller(headers_fn)
         try:
-            return await asyncio.to_thread(facts_repo().claims, caller, subject_id)
+            return await asyncio.to_thread(facts_repo().claims, caller, subject_id, limit=limit)
         except FactNotFound:
             raise ValueError(_FACTS_NOT_FOUND_HINT.format(subject_id=subject_id)) from None
 
@@ -1210,6 +1558,92 @@ def register_foundation_tools(
             )
             _raise_for_status_with_detail(r)
             return ensure_query_output_size(r.json())
+
+    @tool(read_only=True, idempotent=True)
+    async def effective_access(table: str = "") -> dict:
+        """Diagnose YOUR OWN table-access-policy visibility — "why does this
+        table look empty, small, or masked to me". Read-only self-service;
+        no admin variant is exposed here (see below).
+
+        Call this BEFORE reporting an unexpectedly empty or suspiciously
+        small result from a table, and before stating any aggregate (count,
+        sum, average) computed from one — a filtered table can make a real
+        number look wrong, or a genuinely empty answer look like a bug.
+
+        Mirrors ``GET /api/me/effective-access``. Returns the full payload
+        (``is_admin``, ``items`` — legacy per-resource grants, mostly empty
+        for stack-based access — and ``tables``, one entry per table you can
+        actually read) when ``table`` is omitted.
+
+        Args:
+            table: Optional registered table id or name. When given, returns
+                ONLY that table's ``{"table_id": ..., "policy": {...}}``
+                entry instead of the full list.
+
+        Each table's ``policy`` block:
+        - ``applies``: true means an access policy is attached to this
+          table's REGISTRATION — independent of whether it currently
+          narrows what you see (an admin-bypass identity still reports
+          ``applies=true`` with the unfiltered count). false means no
+          policy exists at all; ``rows_visible``/``reason``/``note`` are
+          meaningless in that case.
+        - ``rows_visible``: the row count YOU would see through the policy
+          right now, or null when not computed (see ``reason``).
+        - ``reason`` — act on it:
+          - ``ok``: the policy resolved and the count above is trustworthy.
+          - ``empty_slice``: the policy resolved to ZERO rows for you. This
+            is the single most common cause of "the table looks empty" —
+            report it as a scoping fact, not as missing data.
+          - ``mapping_empty``: the policy depends on a mapping table that
+            has never synced or is currently empty, so nobody sees any rows
+            through it yet — a data-freshness problem, not your access.
+          - ``policy_error``: the policy SQL itself failed to resolve or
+            execute. Never silently falls back to the unfiltered table —
+            tell the caller the count is unavailable, not zero.
+          - ``identity_unresolvable``: no single identity to bind the policy
+            to (e.g. a shared/co-drive session) — a solo session would
+            resolve it.
+        - ``note``: extra human-readable context for the ``reason`` above
+          (e.g. the mapping table's name and last-sync time).
+
+        Never present a count or aggregate over a policied table's sample or
+        query result as an organisation-wide figure — qualify it as YOUR
+        visible slice whenever ``policy.applies`` is true.
+
+        No admin variant: ``GET /api/admin/users/{id}/effective-access``
+        (auditing SOMEONE ELSE's access) is deliberately not exposed as a
+        tool here — an agent has no legitimate reason to probe another
+        person's grant graph.
+        """
+        async with httpx.AsyncClient() as c:
+            r = await c.get(f"{base_url}/api/me/effective-access", headers=headers_fn(), timeout=30)
+            _raise_for_status_with_detail(r)
+            payload = r.json()
+
+        if not table:
+            return payload
+
+        tables = payload.get("tables") or []
+        for entry in tables:
+            if entry.get("table_id") == table:
+                return entry
+
+        # Not a direct id match — the caller may have passed a human name
+        # (`catalog`'s ``name`` field) instead of the registry ``id`` this
+        # endpoint keys tables by. Resolve it through the same RBAC-filtered
+        # catalog an agent would already have called, then retry by id.
+        async with httpx.AsyncClient() as c:
+            cr = await c.get(f"{base_url}/api/v2/catalog", headers=headers_fn(), timeout=30)
+        if cr.status_code < 400:
+            for row in cr.json().get("tables") or []:
+                if (row.get("name") or "").lower() == table.lower():
+                    resolved_id = row.get("id")
+                    for entry in tables:
+                        if entry.get("table_id") == resolved_id:
+                            return entry
+                    break
+
+        raise ValueError(_EFFECTIVE_ACCESS_NOT_FOUND_HINT.format(table=table))
 
     @tool(read_only=True)
     async def skills() -> dict:
@@ -3140,6 +3574,56 @@ def register_foundation_tools(
             params["q"] = q
         async with httpx.AsyncClient() as c:
             r = await c.get(f"{base_url}/api/admin/activity", headers=headers_fn(), params=params, timeout=30)
+            _raise_for_status_with_detail(r)
+            return r.json()
+
+    @tool(read_only=False)
+    async def admin_knowledge_packaging_run() -> dict:
+        """Enqueue a knowledge-packaging run (admin only) — rebuilds any
+        Collection's ``knowledge.duckdb`` artifact whose chunk content
+        changed since the last pass (K3, #798; TCRD-296 synthesis C.15).
+
+        Runs as a worker job, not synchronously — poll ``admin_job_get``
+        with the returned ``job_id`` for the result, or call
+        ``admin_knowledge_packaging_status`` for a summary of the last run.
+
+        Returns ``{"status": "queued", "job_id": ...}`` on a fresh enqueue.
+        Mirrors ``POST /api/admin/run-knowledge-packaging`` and
+        ``agnes admin knowledge packaging run``. Requires an admin PAT.
+        Raises on a 409 (a run is already in flight — the error body
+        carries the in-flight ``job_id``) or a 501 (this process/instance
+        has no worker role, so nothing would ever claim the job).
+        """
+        async with httpx.AsyncClient() as c:
+            r = await c.post(
+                f"{base_url}/api/admin/run-knowledge-packaging",
+                headers=headers_fn(),
+                timeout=30,
+            )
+            _raise_for_status_with_detail(r)
+            return r.json()
+
+    @tool(read_only=True)
+    async def admin_knowledge_packaging_status() -> dict:
+        """Observability summary for knowledge-artifact packaging (admin
+        only): the last run's outcome, whether one is running right now,
+        and a best-effort estimate of when the next scheduled run is due.
+
+        Returns ``{"last_run": {"job_id", "status", "created_at",
+        "finished_at", "result"} | null, "running": bool,
+        "next_due": iso-timestamp | null}`` where ``result`` (once the run
+        completes) carries ``built``/``skipped``/``pruned``/``errors``/
+        ``interrupted_reason``/``duration_s``/``collections_total``/
+        ``collections_processed``. Mirrors
+        ``GET /api/admin/knowledge-packaging/status`` and
+        ``agnes admin knowledge packaging status``. Requires an admin PAT.
+        """
+        async with httpx.AsyncClient() as c:
+            r = await c.get(
+                f"{base_url}/api/admin/knowledge-packaging/status",
+                headers=headers_fn(),
+                timeout=30,
+            )
             _raise_for_status_with_detail(r)
             return r.json()
 

@@ -89,6 +89,10 @@ CHAT_PROVIDER="$(_env_get AGNES_CHAT_PROVIDER)"
 # deploy on this host isn't a 1.3 GB fetch inside the runner's request.
 DATA_APPS_RUNTIME_IMAGE="$(_env_get AGNES_DATA_APPS_RUNTIME_IMAGE)"
 AGNES_IMAGE_REPO="$(_env_get AGNES_IMAGE_REPO)"
+# extraction-worker replica count (TCRD-296 gap #76) — written by
+# startup-script.sh.tpl from the module's `extraction_worker_replicas`.
+# Default 1 when unset (an older release's .env, or the lane disabled).
+EXTRACTION_WORKER_REPLICAS="$(_env_get AGNES_EXTRACTION_WORKER_REPLICAS)"
 export AGNES_TAG STATE_DIR COMPOSE_FILE SCHEDULER_API_TOKEN COMPOSE_PROFILES AGNES_IMAGE_REPO
 
 STATE_DIR="${STATE_DIR:-/data/state}"
@@ -407,14 +411,64 @@ fi
 if [ -f /opt/agnes/docker-compose.gcp-logging.yml ]; then
   extract_host_artifact docker-compose.gcp-logging.yml /opt/agnes/docker-compose.gcp-logging.yml \
     || logger -t agnes-auto-upgrade "WARN: failed to refresh docker-compose.gcp-logging.yml from $IMAGE -- keeping existing"
+  GCP_OVERLAY_AFTER=$(sha256sum /opt/agnes/docker-compose.gcp-logging.yml 2>/dev/null | cut -d" " -f1)
+  # A probe verdict is about ONE pipeline. When the overlay's content
+  # changes under a marker armed for the previous one, that verdict is
+  # stale, not inherited — and the tick below re-probes only a marker-LESS
+  # overlay, so without this the gate engages a pipeline nothing verified.
+  # Exactly how the fleet ended up forwarding to an Ops Agent that was not
+  # installed yet: no outage (the fluentd driver connects asynchronously),
+  # just every log line into a socket with no listener. Conditional on the
+  # content really changing — clearing unconditionally would re-probe every
+  # tick and, because the marker is hashed as config, churn a recreate
+  # every five minutes.
+  # Compare the marker's OWN stamp against the overlay on disk, not this
+  # tick's before/after. The before/after form cannot fire on the rollout
+  # that introduces it: this script replaces itself at the END of a tick,
+  # so the PREVIOUS version refreshes the overlay (keeping the marker) and
+  # this version's first run five minutes later already sees
+  # before == after — the stale verdict survives exactly the upgrade it
+  # was meant to catch (Devin Review on #2057). Stamped markers are
+  # written by agnes_gcp_logging_probe; an empty one from an older image
+  # never matches, so such a VM re-probes once and is stamped from then on.
+  if [ -n "$GCP_OVERLAY_AFTER" ] && [ -f /opt/agnes/.gcp-logging-ok ] \
+     && [ "$(cat /opt/agnes/.gcp-logging-ok 2>/dev/null)" != "$GCP_OVERLAY_AFTER" ]; then
+    rm -f /opt/agnes/.gcp-logging-ok
+    logger -t agnes-auto-upgrade "the probe marker was armed for a different docker-compose.gcp-logging.yml — clearing it so the current pipeline is verified before it is engaged"
+  fi
+fi
+
+# Self-update: extract *this* script too (shipped at the TOP level of
+# /opt/agnes-host/, unlike its scripts/ops/ home in the repo — see the
+# Dockerfile's chmod 0755 list). Without this, the very fix that lets
+# auto-upgrade track host artifacts would itself never land on running
+# VMs — a self-perpetuating "old script" problem. Atomic via .new + mv
+# (the running bash keeps reading its old inode); chmod before the
+# rename. The next tick (5 min later) runs the new logic. Any failure —
+# no extract container, an image predating the artifact — leaves the
+# existing script in place.
+if [ -n "$EXTRACT_CID" ] && \
+   docker cp "$EXTRACT_CID:/opt/agnes-host/agnes-auto-upgrade.sh" \
+     /usr/local/bin/agnes-auto-upgrade.sh.new >/dev/null 2>&1; then
+  if ! cmp -s /usr/local/bin/agnes-auto-upgrade.sh.new \
+                /usr/local/bin/agnes-auto-upgrade.sh; then
+    chmod +x /usr/local/bin/agnes-auto-upgrade.sh.new
+    mv -f /usr/local/bin/agnes-auto-upgrade.sh.new \
+          /usr/local/bin/agnes-auto-upgrade.sh
+    logger -t agnes-auto-upgrade "self-update: replaced /usr/local/bin/agnes-auto-upgrade.sh"
+  else
+    rm -f /usr/local/bin/agnes-auto-upgrade.sh.new
+  fi
+else
+  rm -f /usr/local/bin/agnes-auto-upgrade.sh.new
 fi
 
 # Source the single shared resolver (scripts/ops/agnes-compose-file.sh —
 # just refreshed above as part of CONFIG_FILES) here, AFTER the artifact
 # refresh so a Caddyfile or gcp-logging overlay that just landed THIS tick
 # is reflected immediately, not on the next one, and BEFORE
-# hash_config_files so the gcplogs probe below can arm its marker inside
-# this tick's drift window.
+# hash_config_files so the probe below can arm its marker inside this
+# tick's drift window.
 #
 # Sourced by absolute path, and its absence ends the tick rather than
 # being worked around. Two situations produce an absent resolver: the
@@ -432,16 +486,18 @@ fi
 # shellcheck source=./agnes-compose-file.sh
 . "$RESOLVER"
 
-# Defense in depth for #1557: the overlay is engaged only after the gcplogs
-# driver has proven it can initialize. Docker refuses to START a container
-# whose log driver cannot authenticate, so a recreate with an unauthorized
-# gcplogs driver takes the whole instance down (observed live:
-# app/scheduler stuck in `created`, 9 minutes of 502). The resolver's
+# Defense in depth, in two generations. #1557: an unauthorized gcplogs
+# driver could not initialize and Docker refuses to START a container whose
+# log driver fails — app/scheduler stuck in `created`, 9 minutes of 502.
+# The pipeline forwards asynchronously now, so that failure mode is gone;
+# what the marker still prevents is the quiet one, engaging an overlay whose
+# collector is not there and losing every line. The resolver's
 # agnes_gcp_logging_active gate requires the shared probe marker
 # (/opt/agnes/.gcp-logging-ok) next to the overlay file; the boot startup
 # script writes it after its own probe, and this tick re-probes whenever
-# the overlay sits there marker-less (fresh IAM grant, an overlay that
-# materialized mid-life, a boot from a build predating the marker) so the
+# the overlay sits there marker-less (a collector that has just come up, an
+# overlay that materialized mid-life, an overlay whose content changed
+# under an older verdict — see the refresh above) so the
 # VM converges within 5 minutes and without a reboot. An existing marker is
 # trusted for the life of the boot disk — re-probing every tick would let a
 # single metadata-server blip disarm the overlay and churn two recreates.
@@ -450,9 +506,9 @@ fi
 # drivers happens now, not after some unrelated change.
 if [ -f /opt/agnes/docker-compose.gcp-logging.yml ] && [ ! -f /opt/agnes/.gcp-logging-ok ]; then
   if agnes_gcp_logging_probe /opt/agnes "$IMAGE"; then
-    logger -t agnes-auto-upgrade "gcplogs driver probe OK — arming the Cloud Logging overlay"
+    logger -t agnes-auto-upgrade "Cloud Ops Agent is receiving on 127.0.0.1:24224 — arming the Cloud Logging overlay"
   else
-    logger -t agnes-auto-upgrade "WARN: docker-compose.gcp-logging.yml is present but the gcplogs driver failed its probe (is roles/logging.logWriter granted to the VM service account?) — leaving the Cloud Logging overlay disabled"
+    logger -t agnes-auto-upgrade "WARN: docker-compose.gcp-logging.yml is present but nothing is listening on 127.0.0.1:24224 (is the Cloud Ops Agent installed and running? it is installed by the boot startup script, so a VM that has not rebooted since enable_gcp_logging landed will not have it) — leaving the Cloud Logging overlay disabled rather than forwarding every line into a socket nobody reads"
   fi
 fi
 
@@ -512,6 +568,19 @@ esac
 # above, so a VM carrying `apps` there would otherwise get it twice.
 if [ "$APPS_PROFILE_WANTED" = "1" ] && [[ " ${PROFILE_ARGS[*]-} " != *" apps "* ]]; then
     PROFILE_ARGS+=( --profile apps )
+fi
+
+# --scale extraction-worker=N (TCRD-296 gap #76): threaded through every
+# BARE `docker compose up -d` below (the ones that recreate the whole
+# resolved stack, not a single named service) so a routine recreate never
+# silently collapses a multi-replica extraction lane back to one container
+# — `up -d` with no `--scale` re-asserts a service's default replica count.
+# Gated on the FINAL, reconciled COMPOSE_FILE (set above) actually carrying
+# the overlay: passing --scale for a service the resolved compose config
+# doesn't define errors "no such service".
+SCALE_ARGS=()
+if [[ ":$COMPOSE_FILE:" == *":docker-compose.extraction.yml:"* ]]; then
+    SCALE_ARGS=( --scale "extraction-worker=${EXTRACTION_WORKER_REPLICAS:-1}" )
 fi
 
 # gcplogs overlay — ships container stdout/stderr to GCP Cloud Logging.
@@ -876,13 +945,13 @@ if [ "$IMAGE_DRIFT" = "1" ] || [ "$CONFIG_DRIFT" = "1" ]; then
         COMPOSE_FILE=$(printf '%s' "$COMPOSE_FILE" | tr ':' '\n' \
             | grep -vx 'docker-compose.kai-agent.yml' | paste -sd: -)
         export COMPOSE_FILE
-        docker compose ${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"} up -d
+        docker compose ${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"} up -d ${SCALE_ARGS[@]+"${SCALE_ARGS[@]}"}
         COMPOSE_FILE="$_kai_full_compose_file"
         export COMPOSE_FILE
-        docker compose ${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"} up -d \
+        docker compose ${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"} up -d ${SCALE_ARGS[@]+"${SCALE_ARGS[@]}"} \
             || logger -t agnes-auto-upgrade "WARN: kai-agent engine sidecar failed to start; base stack recreated — next tick retries"
     else
-        docker compose ${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"} up -d
+        docker compose ${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"} up -d ${SCALE_ARGS[@]+"${SCALE_ARGS[@]}"}
     fi
     # Record the config hash that is now in effect — config drift is
     # declared against this marker on subsequent ticks.
@@ -892,27 +961,3 @@ if [ "$IMAGE_DRIFT" = "1" ] || [ "$CONFIG_DRIFT" = "1" ]; then
     # drifting. See the prune block above the pull.)
 fi
 
-# Self-update: extract *this* script too (shipped at the TOP level of
-# /opt/agnes-host/, unlike its scripts/ops/ home in the repo — see the
-# Dockerfile's chmod 0755 list). Without this, the very fix that lets
-# auto-upgrade track host artifacts would itself never land on running
-# VMs — a self-perpetuating "old script" problem. Atomic via .new + mv
-# (the running bash keeps reading its old inode); chmod before the
-# rename. The next tick (5 min later) runs the new logic. Any failure —
-# no extract container, an image predating the artifact — leaves the
-# existing script in place.
-if [ -n "$EXTRACT_CID" ] && \
-   docker cp "$EXTRACT_CID:/opt/agnes-host/agnes-auto-upgrade.sh" \
-     /usr/local/bin/agnes-auto-upgrade.sh.new >/dev/null 2>&1; then
-  if ! cmp -s /usr/local/bin/agnes-auto-upgrade.sh.new \
-                /usr/local/bin/agnes-auto-upgrade.sh; then
-    chmod +x /usr/local/bin/agnes-auto-upgrade.sh.new
-    mv -f /usr/local/bin/agnes-auto-upgrade.sh.new \
-          /usr/local/bin/agnes-auto-upgrade.sh
-    logger -t agnes-auto-upgrade "self-update: replaced /usr/local/bin/agnes-auto-upgrade.sh"
-  else
-    rm -f /usr/local/bin/agnes-auto-upgrade.sh.new
-  fi
-else
-  rm -f /usr/local/bin/agnes-auto-upgrade.sh.new
-fi

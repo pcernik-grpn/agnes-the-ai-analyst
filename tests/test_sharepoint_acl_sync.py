@@ -202,6 +202,31 @@ def _group_perm(oid: str) -> dict:
     return {"id": f"perm-{oid}", "roles": ["read"], "grantedToV2": {"group": {"id": oid}}}
 
 
+def _site_group_perm(display_name: str) -> dict:
+    return {
+        "id": f"perm-sg-{display_name}",
+        "roles": ["read"],
+        "grantedToV2": {"siteGroup": {"id": f"sg-{display_name}", "displayName": display_name}},
+    }
+
+
+def _site_user_perm(login_name: str) -> dict:
+    return {
+        "id": "perm-site-user",
+        "roles": ["read"],
+        "grantedToV2": {"siteUser": {"id": "su-1", "loginName": login_name}},
+    }
+
+
+def _set_acl_site_group_map(connection_id: str, mapping: dict) -> None:
+    from src.repositories import source_connections_repo
+
+    repo = source_connections_repo()
+    row = repo.get(connection_id)
+    config = {**(row.get("config") or {}), "acl_site_group_map": mapping}
+    repo.update(connection_id, config=config)
+
+
 # ---------------------------------------------------------------------------
 # tests
 # ---------------------------------------------------------------------------
@@ -624,3 +649,223 @@ class TestZoneAclSync:
 
         assert _grants_for_collection(col_parent) == []
         assert _grants_for_collection(col_zone) == []
+
+
+class TestSharedCollectionReconciledOnce:
+    """Two mirrored scopes routing to the SAME collection (a bulk-add
+    ``collection_id`` target, or a post-consolidation shared collection)
+    must be reconciled against the UNION of both scopes' honored groups —
+    not flip-flopped, where the second scope's own reconcile pass deletes
+    the first scope's grant because it isn't in ITS target set."""
+
+    def test_two_mirrored_scopes_sharing_a_collection_are_unioned(self, acl_env, monkeypatch):
+        conn_id = _make_connection()
+        col_id = _make_collection("Shared Col")
+        _add_scope(conn_id, source_scope_id="scope-a", collection_id=col_id, access_mode="mirrored")
+        _add_scope(conn_id, source_scope_id="scope-b", collection_id=col_id, access_mode="mirrored")
+        _make_user("u-a", "a@example.com")
+        _make_user("u-b", "b@example.com")
+
+        monkeypatch.setattr(graph_client, "get_app_token", _fake_get_app_token)
+        monkeypatch.setattr(
+            graph_client,
+            "list_item_permissions",
+            _perms_fake(
+                {
+                    ("drive-1", "scope-a"): [_group_perm("g-a")],
+                    ("drive-1", "scope-b"): [_group_perm("g-b")],
+                }
+            ),
+        )
+        monkeypatch.setattr(
+            graph_client,
+            "list_group_transitive_members",
+            _members_fake(
+                {
+                    "g-a": [{"mail": "a@example.com", "userPrincipalName": "a@example.com"}],
+                    "g-b": [{"mail": "b@example.com", "userPrincipalName": "b@example.com"}],
+                }
+            ),
+        )
+
+        acl_sync.run_acl_sync({"connection_id": conn_id})
+
+        group_a = _group_by_name("entra:g-a")
+        group_b = _group_by_name("entra:g-b")
+        assert group_a is not None and group_b is not None
+
+        current_group_ids = {g["group_id"] for g in _grants_for_collection(col_id)}
+        assert current_group_ids == {group_a["id"], group_b["id"]}, (
+            "both scopes routing to the same collection must be unioned, not flip-flopped"
+        )
+
+    def test_removing_one_shared_scopes_grant_keeps_the_others(self, acl_env, monkeypatch):
+        conn_id = _make_connection()
+        col_id = _make_collection("Shared Col 2")
+        _add_scope(conn_id, source_scope_id="scope-a", collection_id=col_id, access_mode="mirrored")
+        _add_scope(conn_id, source_scope_id="scope-b", collection_id=col_id, access_mode="mirrored")
+        _make_user("u-a2", "a2@example.com")
+        _make_user("u-b2", "b2@example.com")
+
+        monkeypatch.setattr(graph_client, "get_app_token", _fake_get_app_token)
+        monkeypatch.setattr(
+            graph_client,
+            "list_item_permissions",
+            _perms_fake(
+                {
+                    ("drive-1", "scope-a"): [_group_perm("g-a2")],
+                    ("drive-1", "scope-b"): [_group_perm("g-b2")],
+                }
+            ),
+        )
+        monkeypatch.setattr(
+            graph_client,
+            "list_group_transitive_members",
+            _members_fake(
+                {
+                    "g-a2": [{"mail": "a2@example.com", "userPrincipalName": "a2@example.com"}],
+                    "g-b2": [{"mail": "b2@example.com", "userPrincipalName": "b2@example.com"}],
+                }
+            ),
+        )
+        acl_sync.run_acl_sync({"connection_id": conn_id})
+
+        # scope-a's root permission is revoked on the source; scope-b's is
+        # unchanged — must remove ONLY g-a2's grant, keep g-b2's.
+        monkeypatch.setattr(
+            graph_client,
+            "list_item_permissions",
+            _perms_fake({("drive-1", "scope-a"): [], ("drive-1", "scope-b"): [_group_perm("g-b2")]}),
+        )
+        acl_sync.run_acl_sync({"connection_id": conn_id})
+
+        group_b2 = _group_by_name("entra:g-b2")
+        current_group_ids = {g["group_id"] for g in _grants_for_collection(col_id)}
+        assert current_group_ids == {group_b2["id"]}
+
+    def test_one_scope_erroring_leaves_the_shared_collections_grants_untouched(self, acl_env, monkeypatch):
+        """A collection shared by two scopes, ONE of which fails this run,
+        is left entirely alone (fail-closed) rather than reconciled against
+        only the succeeding scope's (incomplete) contribution."""
+        conn_id = _make_connection()
+        col_id = _make_collection("Shared Col 3")
+        _add_scope(conn_id, source_scope_id="scope-a", collection_id=col_id, access_mode="mirrored")
+        _add_scope(conn_id, source_scope_id="scope-b", collection_id=col_id, access_mode="mirrored")
+        _make_user("u-a3", "a3@example.com")
+        _make_user("u-b3", "b3@example.com")
+
+        monkeypatch.setattr(graph_client, "get_app_token", _fake_get_app_token)
+        monkeypatch.setattr(
+            graph_client,
+            "list_item_permissions",
+            _perms_fake(
+                {
+                    ("drive-1", "scope-a"): [_group_perm("g-a3")],
+                    ("drive-1", "scope-b"): [_group_perm("g-b3")],
+                }
+            ),
+        )
+        monkeypatch.setattr(
+            graph_client,
+            "list_group_transitive_members",
+            _members_fake(
+                {
+                    "g-a3": [{"mail": "a3@example.com", "userPrincipalName": "a3@example.com"}],
+                    "g-b3": [{"mail": "b3@example.com", "userPrincipalName": "b3@example.com"}],
+                }
+            ),
+        )
+        acl_sync.run_acl_sync({"connection_id": conn_id})
+        grants_before = {g["group_id"] for g in _grants_for_collection(col_id)}
+        assert len(grants_before) == 2
+
+        async def _fail_scope_a(token, drive_id, item_id):
+            if item_id == "scope-a":
+                raise SharePointGraphError("transient graph error", status_code=503)
+            return [_group_perm("g-b3")]
+
+        monkeypatch.setattr(graph_client, "list_item_permissions", _fail_scope_a)
+
+        result = acl_sync.run_acl_sync({"connection_id": conn_id})
+
+        assert result["errors"], "the connection's run must record scope-a's error"
+        grants_after = {g["group_id"] for g in _grants_for_collection(col_id)}
+        assert grants_after == grants_before, "an uncertain collection must not be reconciled at all this run"
+
+
+class TestSiteGroupMapping:
+    def test_mapped_site_group_is_honored_and_granted(self, acl_env, monkeypatch):
+        from src.repositories import user_groups_repo
+
+        conn_id = _make_connection()
+        col_id = _make_collection("Site Group Col")
+        _add_scope(conn_id, source_scope_id="scope-1", collection_id=col_id, access_mode="mirrored")
+
+        mapped_group = user_groups_repo().create(name="finance-team", description=None, created_by="admin")
+        _set_acl_site_group_map(conn_id, {"Members": [mapped_group["id"]]})
+
+        monkeypatch.setattr(graph_client, "get_app_token", _fake_get_app_token)
+        monkeypatch.setattr(
+            graph_client,
+            "list_item_permissions",
+            _perms_fake({("drive-1", "scope-1"): [_site_group_perm("Members")]}),
+        )
+
+        result = acl_sync.run_acl_sync({"connection_id": conn_id})
+
+        grants = _grants_for_collection(col_id)
+        assert {g["group_id"] for g in grants} == {mapped_group["id"]}
+        assert grants[0]["assigned_by"] == ACL_SYNC_SENTINEL
+        # No unhonored row for a MAPPED site group.
+        assert result["errors"] == []
+        assert _last_run(conn_id)["unhonored"] == []
+
+    def test_unmapped_site_group_stays_unhonored_and_ungranted(self, acl_env, monkeypatch):
+        conn_id = _make_connection()
+        col_id = _make_collection("Site Group Col 2")
+        _add_scope(conn_id, source_scope_id="scope-1", collection_id=col_id, access_mode="mirrored")
+        # A map exists, but for a DIFFERENT site group name.
+        from src.repositories import user_groups_repo
+
+        other_group = user_groups_repo().create(name="other-team", description=None, created_by="admin")
+        _set_acl_site_group_map(conn_id, {"Owners": [other_group["id"]]})
+
+        monkeypatch.setattr(graph_client, "get_app_token", _fake_get_app_token)
+        monkeypatch.setattr(
+            graph_client,
+            "list_item_permissions",
+            _perms_fake({("drive-1", "scope-1"): [_site_group_perm("Members")]}),
+        )
+
+        acl_sync.run_acl_sync({"connection_id": conn_id})
+
+        assert _grants_for_collection(col_id) == []
+        unhonored = _last_run(conn_id)["unhonored"]
+        assert unhonored == [{"kind": "site_group", "detail": "Members", "scope": "scope-1"}]
+
+
+class TestSiteUserHonored:
+    def test_site_user_with_claims_login_name_is_granted(self, acl_env, monkeypatch):
+        conn_id = _make_connection()
+        col_id = _make_collection("Site User Col")
+        _add_scope(conn_id, source_scope_id="scope-1", collection_id=col_id, access_mode="mirrored")
+        _make_user("u-site", "siteuser@example.com")
+
+        monkeypatch.setattr(graph_client, "get_app_token", _fake_get_app_token)
+        monkeypatch.setattr(
+            graph_client,
+            "list_item_permissions",
+            _perms_fake({("drive-1", "scope-1"): [_site_user_perm("i:0#.f|membership|siteuser@example.com")]}),
+        )
+
+        result = acl_sync.run_acl_sync({"connection_id": conn_id})
+
+        assert result["matched"] == 1
+        group = _group_by_name("sp-direct:scope-1")
+        assert group is not None
+
+        from src.repositories import user_group_members_repo
+
+        members = user_group_members_repo().list_members_for_group(group["id"])
+        assert {m["id"] for m in members} == {"u-site"}
+        assert _grants_for_collection(col_id)[0]["group_id"] == group["id"]
