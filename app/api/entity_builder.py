@@ -369,9 +369,9 @@ def _stub_turn(message: str, entity_type: str, draft: Dict[str, Any]) -> Dict[st
         first = _open_slot_label(entity_type, draft)
         return {
             "reply": (
-                f"[stub] Let's build a {entity_type}. First thing I need: {first}."
+                f"Let's build a {entity_type}. First thing I need: {first}."
                 if first
-                else f"[stub] Let's build a {entity_type}. Tell me what it should do."
+                else f"Let's build a {entity_type}. Tell me what it should do."
             ),
             "patch": {},
             "suggestions": [],

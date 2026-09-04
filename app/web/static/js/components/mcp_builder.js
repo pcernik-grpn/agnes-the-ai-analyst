@@ -61,7 +61,13 @@
     try {
       var keep = JSON.parse(JSON.stringify(draft));
       delete keep.secret_value;   // a credential does not belong in localStorage
-      window.localStorage.setItem(DRAFT_KEY, JSON.stringify({ draft: keep, conv: conv }));
+      /* The ENGINE travels with the transcript it produced. Without it a
+         restored conversation came back with `convEngine = null`, so a
+         transcript of canned replies rendered with no scripted-stand-in
+         notice above it at all — the one state the notice exists to prevent,
+         reached by nothing more exotic than reloading the page. */
+      window.localStorage.setItem(DRAFT_KEY,
+        JSON.stringify({ draft: keep, conv: conv, engine: convEngine }));
     } catch (e) { /* quota or private mode — soft-fail, same as /skills */ }
   }
   function restoreDraft() {
@@ -950,11 +956,22 @@
     if (!slots.length) return '';
     var known = slots.filter(function (s) { return s.known; }).length;
     var open = slots.filter(function (s) { return !s.known; });
-    return '<div class="ag-prog">' +
-      '<span class="ag-prog-n">' + known + ' of ' + slots.length + '</span>' +
-      '<span class="ag-prog-t">' + (open.length
-        ? 'still to settle: ' + open.map(function (s) { return esc(s.label); }).join(', ')
-        : 'nothing missing — ready to save') + '</span>' +
+    /* The NEXT thing, not every open thing. Spelled out in full this line
+       read "still to settle: where it lives, how it authenticates, a name,
+       which tools to expose" — which does not fit the pane, so it truncated
+       mid-word and lost the sentence. The full list is the tooltip. And DONE
+       gets its own state: a count that has run out is not the same claim as
+       "this is ready to register". */
+    var done = !open.length;
+    var full = open.length
+      ? 'Still open: ' + open.map(function (s) { return s.label; }).join(', ')
+      : 'Nothing left to settle.';
+    return '<div class="ag-prog' + (done ? ' ag-prog--done' : '') + '" title="' + esc(full) + '">' +
+      (done ? window.BuilderShell.TICK_SVG : '') +
+      '<span class="ag-prog-n">' + (done ? 'Ready' : known + ' of ' + slots.length) + '</span>' +
+      '<span class="ag-prog-t">' + (done
+        ? 'nothing left to settle'
+        : 'next: ' + esc(open[0].label)) + '</span>' +
     '</div>';
   }
 
@@ -1004,6 +1021,27 @@
       }) : '');
   }
 
+  /* What an MCP source IS, at the head of the transcript — the same block in
+     the same position as /skills, /agents and the package builder. It was a
+     four-line paragraph in the configuration header, under a title, a
+     subtitle and a progress line. */
+  /* `tools` from the canonical set (macros/_icon.html) — the glyph this UI
+     already uses for the tool-server idea, in the rail's "Take Agnes to your
+     tools" and on /profile. Transcribed rather than imported because this is
+     a JS component; keep it byte-equal to the macro. */
+  var ABOUT_ICO = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" ' +
+    'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+    '<path d="M14.7 6.3a4 4 0 0 0-5.4 5.4L3 18l3 3 6.3-6.3a4 4 0 0 0 5.4-5.4l-2.6 2.6-2.4-.6-.6-2.4z"/></svg>';
+
+  function aboutHtml() {
+    return window.BuilderShell.about({
+      iconSvg: ABOUT_ICO,
+      html: '<p>An <strong>MCP source</strong> is an outside tool server Agnes dials on your behalf — a CRM, ' +
+        'a ticket tracker, a docs search. The tools you approve become callable by agents, and by analysts ' +
+        'in Claude Code, for the groups you grant.</p>',
+    });
+  }
+
   function leftHtml() {
     var opening = editing
       // Editing: the four things are already answered, and repeating the
@@ -1017,14 +1055,14 @@
        error under it, and a live composer + chips — every one of which failed
        identically. One standing notice instead. */
     var notice = llmUnavailable
-      ? '<div class="ag-note ag-note--warn">No AI credential is configured on this instance, so the ' +
-        'assistant cannot draft anything. The configuration on the right is editable by hand and ' +
-        'Register source works normally — or ask an admin to set a model up.</div>'
+      ? '<div class="ag-note ag-note--warn">No AI credential is configured, so the assistant cannot ' +
+        'draft anything. Fill the configuration on the right by hand — Register source works normally.</div>'
       : window.BuilderShell.engineNotice(convEngine);
     return notice +
       window.BuilderShell.conversation({
         id: 'mcp-conv', rows: llmUnavailable && !conv.length ? [] : rows, busy: convBusy,
         busyText: conv.length ? 'Thinking…' : 'Getting started…',
+        about: aboutHtml(),
         err: llmUnavailable ? null : convErr,
       }) +
       (convPatchNote && !convBusy ? '<p class="sk-patch-note">' + esc(convPatchNote) + '</p>' : '') +
@@ -1042,6 +1080,9 @@
 
   function render() {
     if (!mount) return;
+    /* See BuilderShell.keepCfgScroll — a full rebuild would otherwise send
+       the configuration column back to the top on every re-render. */
+    window.BuilderShell.keepCfgScroll('mcp-steps', function () {
     mount.innerHTML =
       window.BuilderShell.head({
         backLabel: 'Library',
@@ -1068,18 +1109,15 @@
         left: leftHtml(),
         cfgTitle: 'Configuration',
         cfgSub: 'everything this source is, editable by hand',
-        /* The durable definition. The only orientation was inside the
-           conversation — which disappears entirely on an instance with no
-           model, leaving a title, a warning, and no statement of what an MCP
-           source IS or what registering one does to this instance. */
-        cfgAside: '<div id="mcp-prog-host">' + progressHtml() + '</div>' +
-          '<p class="ag-cfg-blurb">An MCP source is an outside tool server — a CRM, a ticket tracker, a docs ' +
-          'search — that Agnes dials on your behalf. Register one and the tools you approve become callable by ' +
-          'agents, and by analysts in Claude Code, for the groups you grant.</p>',
+        /* How much of the source is still unsettled. The definition that
+           used to sit under it is at the head of the transcript now — see
+           aboutHtml. */
+        cfgAside: '<div id="mcp-prog-host">' + progressHtml() + '</div>',
         cfgBodyId: 'mcp-steps',
         cfg: panelHtml(),
       }) +
       '<div id="mcp-picker"></div>';
+    });
     renderPicker();
     document.body.classList.add('ag-building');
   }
@@ -1268,6 +1306,8 @@
       var saved = restoreDraft();
       draft = saved ? Object.assign(newDraft(), saved.draft) : newDraft();
       conv = (saved && Array.isArray(saved.conv)) ? saved.conv : [];
+      // Restore the transcript's provenance with it — see persistDraft.
+      if (saved && saved.engine) convEngine = saved.engine;
       wire();
       render();
       /* Greet only a blank page. A resumed draft already answers "what are you
