@@ -83,19 +83,10 @@ class TestTheSyncStampsAndAdoptsItsOwnRows:
 
         assert ACL_SYNC_SENTINEL != ACL_SYNC_GRANT_SOURCE
 
-    def test_new_grants_are_written_with_the_source(self):
-        from pathlib import Path
-
-        src = Path("connectors/sharepoint/acl_sync.py").read_text(encoding="utf-8")
-        block = src[src.index("for group_id in target_set - current_group_ids:") :][:900]
-        assert "source=ACL_SYNC_GRANT_SOURCE" in block
-
-    def test_existing_grants_are_adopted_rather_than_left_wrong(self):
-        """Without this the fix reaches only grants created from here on,
-        and every mirrored collection already on an instance keeps drawing a
-        Revoke the next sync undoes."""
-        from pathlib import Path
-
-        src = Path("connectors/sharepoint/acl_sync.py").read_text(encoding="utf-8")
-        assert "adopt_source(g[\"id\"], ACL_SYNC_GRANT_SOURCE)" in src
-        assert 'if not g.get("source")' in src
+    # `test_new_grants_are_written_with_the_source` and
+    # `test_existing_grants_are_adopted_rather_than_left_wrong` stood here as
+    # string scans of `acl_sync.py`. They proved the lines were WRITTEN, not
+    # that they run — the same weakness this effort spent its time removing
+    # from /admin/access, reintroduced by their own author. They are replaced
+    # by `tests/db_pg/test_sharepoint_acl_sync_stamps_source.py`, which runs
+    # `_reconcile_grants` against a real Postgres and reads the rows back.
