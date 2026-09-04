@@ -2572,20 +2572,55 @@ def _under_prefix(path: str, prefixes: Sequence[str]) -> bool:
 #: cutoff is inherently connection-specific (a fresh site vs. a decade-old
 #: archive), so there is nothing sensible to fall back TO; absent or
 #: invalid simply means "no filter", i.e. the crawl behaves exactly as it
-#: always has.
+#: always has. Kept as the DEFAULT once a scope may carry its own override
+#: (see :data:`SCOPE_MIN_MODIFIED_KEY` below, TCRD-296 gap #80) — a scope
+#: that never sets one still gets exactly this behavior.
 MIN_MODIFIED_KEY = "min_modified"
 
+#: The per-SCOPE age filter (TCRD-296 gap #80 — "the modified-since filter
+#: belongs to the scope, not the connection's extraction-config drawer"):
+#: ``scope["min_modified"]``, an ISO ``YYYY-MM-DD`` string or absent/``None``.
+#: A scope that does not set this falls back to the connection-wide
+#: :data:`MIN_MODIFIED_KEY` default — the old, only-ever-possible behavior,
+#: pinned by a test so existing instances keep crawling exactly as they did
+#: before this field existed.
+SCOPE_MIN_MODIFIED_KEY = "min_modified"
 
-def resolve_min_modified(connection: Optional[Dict[str, Any]] = None) -> Tuple[Optional[date], str]:
-    """``(cutoff, source)`` for this connection's age filter —
-    ``connection.config.extraction.crawl.min_modified``, an ISO
-    ``YYYY-MM-DD`` string, or absent for no filter.
 
-    ``source`` is ``"connection"`` when a valid cutoff is set, ``"none"``
-    when it is absent OR present but not a parseable ISO date (logged and
-    ignored — never a crash: a malformed override must not abort a crawl,
-    it just runs unfiltered, exactly as if nothing were set at all).
+def resolve_min_modified(
+    connection: Optional[Dict[str, Any]] = None,
+    *,
+    scope: Optional[Dict[str, Any]] = None,
+) -> Tuple[Optional[date], str]:
+    """``(cutoff, source)`` for the effective age filter — a SCOPE's own
+    override first, the connection-wide default second, absent means no
+    filter.
+
+    ``scope["min_modified"]`` (an ISO ``YYYY-MM-DD`` string) wins when
+    present and valid — ``source: "scope"``. Otherwise falls back to
+    ``connection.config.extraction.crawl.min_modified`` — ``source:
+    "connection"`` when that is set and valid. ``source: "none"`` when
+    neither is set, OR when whichever ONE the callsite supplied is present
+    but not a parseable ISO date (logged and ignored — never a crash: a
+    malformed override must not abort a crawl, it just runs unfiltered,
+    exactly as if nothing were set at all). ``scope=None`` (every pre-TCRD-296
+    callsite that only cares about the connection-wide default, e.g. the
+    ``…/extraction/crawl-config`` drawer endpoint) skips the scope check
+    entirely and behaves byte-for-byte as before this parameter existed.
     """
+    if scope:
+        raw_scope = scope.get(SCOPE_MIN_MODIFIED_KEY)
+        if isinstance(raw_scope, str) and raw_scope.strip():
+            candidate = raw_scope.strip()
+            try:
+                return date.fromisoformat(candidate), "scope"
+            except ValueError:
+                logger.warning(
+                    "sharepoint crawl: scope %s min_modified=%r is not an ISO YYYY-MM-DD date — "
+                    "ignoring, falling back to the connection default",
+                    scope.get("source_scope_id"),
+                    raw_scope,
+                )
     if connection:
         raw = (((connection.get("config") or {}).get("extraction") or {}).get("crawl") or {}).get(MIN_MODIFIED_KEY)
         if isinstance(raw, str) and raw.strip():
@@ -2732,10 +2767,10 @@ class _ScopeContext:
     anonymize: bool
     exclusions: _ExclusionIndex
     zone_routes_by_drive: Dict[str, List[Tuple[str, str]]] = field(default_factory=dict)
-    #: This connection's resolved :func:`resolve_min_modified` cutoff, or
-    #: ``None`` for no filter. Connection-wide, not per-scope, but carried
-    #: on the scope context because that is what every per-item pipeline
-    #: already has in hand.
+    #: This SCOPE's resolved :func:`resolve_min_modified` cutoff (its own
+    #: override, or the connection default it falls back to), or ``None``
+    #: for no filter at all (TCRD-296 gap #80). Resolved once per scope by
+    #: the caller — every per-item pipeline reads it straight off here.
     min_modified: Optional[date] = None
     #: ``stable_id -> cTag`` seed from the CONNECTION-level ``crawl`` state
     #: row, consulted read-only when a shard's own per-delta-unit state row
@@ -6379,9 +6414,9 @@ async def _run_crawl_async(
         )
 
     settings = resolve_sharepoint_settings(connection)
-    # Resolved ONCE for the whole run — a connection-wide lever, not a
-    # per-scope one (see `resolve_min_modified`'s own docstring).
-    min_modified, _min_modified_source = resolve_min_modified(connection)
+    # `min_modified` is resolved PER SCOPE, inside the loop below (TCRD-296
+    # gap #80 — a scope's own filter, falling back to the connection-wide
+    # default) — see `resolve_min_modified`'s own docstring.
     anonymization_key = _resolve_anonymization_key(scopes)
     # Built once per run, and only when something in this run will actually
     # anonymize — an instance on the regex tier never imports the LLM stack,
@@ -6464,6 +6499,7 @@ async def _run_crawl_async(
                     stats.add(errors=1)
                     continue
 
+                min_modified, _min_modified_source = resolve_min_modified(connection, scope=scope)
                 ctx = _ScopeContext(
                     source_scope_id=source_scope_id,
                     collection_id=str(scope["collection_id"]),
@@ -7269,6 +7305,12 @@ async def _plan_or_run_inline(connection: Dict[str, Any], payload: dict) -> Dict
                 return await _inline()
 
     settings = resolve_sharepoint_settings(connection)
+    # Connection-wide default ONLY — this feeds `compute_shard_plan`'s doc-COUNT
+    # estimate across every scope in the plan, not the actual per-item filter a
+    # scope's own override enforces at crawl time (`_run_shard_crawl_async`
+    # re-resolves per scope, correctly, above). A scope-level override not
+    # reflected here can only skew the shard-size estimate/"expected" display,
+    # never drop a document the real crawl would have kept (TCRD-296 gap #80).
     min_modified, _min_modified_source = resolve_min_modified(connection)
     plan_stats = CrawlStats()
     auth = GraphAuth(
@@ -7542,7 +7584,10 @@ async def _run_shard_crawl_async(
 
     stop_watcher = _StopWatcher(connection_id)
     settings = resolve_sharepoint_settings(connection)
-    min_modified, _min_modified_source = resolve_min_modified(connection)
+    # This scope's own override, falling back to the connection default
+    # (TCRD-296 gap #80) — a shard child crawls exactly ONE scope, so this
+    # is the same per-scope resolution the inline path's loop does.
+    min_modified, _min_modified_source = resolve_min_modified(connection, scope=scope)
     anonymization_key = _resolve_anonymization_key([scope])
     detector = _entity_detector() if anonymization_key is not None else None
     max_file_mb = _max_file_mb()
@@ -7966,9 +8011,13 @@ async def preview_shard_plan(
     or later, for THIS preview call only — the exact "what if I backfilled
     from here" question ``GET …/split-plan?min_modified=`` already answers
     for the manual planner. ``None`` (the default) resolves the
-    connection's own configured cutoff (:func:`resolve_min_modified`) —
-    the SAME value an actual triggered run would use, so a preview with no
-    override still matches reality.
+    connection's own configured DEFAULT cutoff (:func:`resolve_min_modified`,
+    no ``scope=``) uniformly across every scope in the plan — a scope with
+    its OWN override (TCRD-296 gap #80) is undercounted/overcounted here the
+    same bounded, display-only way :func:`_plan_or_run_inline`'s own shard
+    planning is (see its comment) — the actual triggered run still applies
+    each scope's correct effective filter regardless of what this preview
+    estimated.
     """
     target_docs = _shard_target_docs()
 

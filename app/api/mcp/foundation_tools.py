@@ -163,6 +163,13 @@ FOUNDATION_TOOL_NAMES: tuple[str, ...] = (
     "schema",
     "describe",
     "query",
+    # Self-service policy diagnosis (issue #2147, backlog item 12: "MCP:
+    # read-only policy observability") — "why does this table look empty/
+    # masked to me". Triple-surface with GET /api/me/effective-access; no
+    # CLI verb (that endpoint is grandfathered REST-only, see
+    # tests/test_documentation_api_triple_surface.py) and no admin variant
+    # (see the tool's own docstring for why).
+    "effective_access",
     "skills",
     "chat_skills",
     "stack_browse",
@@ -384,6 +391,19 @@ _FACTS_NOT_FOUND_HINT = (
     "you don't have access to any of its evidence, or the `facts` feature isn't "
     "enabled on this instance. Use `fact_search` to find a valid id, or ask an "
     "admin about the `facts` feature flag."
+)
+
+# Registry 404 (command-ux.md's "not found" convention) — mirrors `schema` /
+# `describe`'s hint at `agnes catalog` on the CLI side by pointing at this
+# transport's own `catalog` tool instead. Deliberately indistinguishable
+# between "no such table" and "not RBAC-visible to you" — `effective_access`
+# already only ever lists what the caller can see (§10.2), so there is
+# nothing narrower to report without turning a diagnostic tool into an
+# existence oracle for tables the caller cannot reach.
+_EFFECTIVE_ACCESS_NOT_FOUND_HINT = (
+    "No effective-access entry for table {table!r}. This means one of: the id "
+    "(or name) is wrong, or you cannot access this table at all. Use the "
+    "`catalog` tool to list tables you can see, then retry with its `id`."
 )
 
 
@@ -1538,6 +1558,92 @@ def register_foundation_tools(
             )
             _raise_for_status_with_detail(r)
             return ensure_query_output_size(r.json())
+
+    @tool(read_only=True, idempotent=True)
+    async def effective_access(table: str = "") -> dict:
+        """Diagnose YOUR OWN table-access-policy visibility — "why does this
+        table look empty, small, or masked to me". Read-only self-service;
+        no admin variant is exposed here (see below).
+
+        Call this BEFORE reporting an unexpectedly empty or suspiciously
+        small result from a table, and before stating any aggregate (count,
+        sum, average) computed from one — a filtered table can make a real
+        number look wrong, or a genuinely empty answer look like a bug.
+
+        Mirrors ``GET /api/me/effective-access``. Returns the full payload
+        (``is_admin``, ``items`` — legacy per-resource grants, mostly empty
+        for stack-based access — and ``tables``, one entry per table you can
+        actually read) when ``table`` is omitted.
+
+        Args:
+            table: Optional registered table id or name. When given, returns
+                ONLY that table's ``{"table_id": ..., "policy": {...}}``
+                entry instead of the full list.
+
+        Each table's ``policy`` block:
+        - ``applies``: true means an access policy is attached to this
+          table's REGISTRATION — independent of whether it currently
+          narrows what you see (an admin-bypass identity still reports
+          ``applies=true`` with the unfiltered count). false means no
+          policy exists at all; ``rows_visible``/``reason``/``note`` are
+          meaningless in that case.
+        - ``rows_visible``: the row count YOU would see through the policy
+          right now, or null when not computed (see ``reason``).
+        - ``reason`` — act on it:
+          - ``ok``: the policy resolved and the count above is trustworthy.
+          - ``empty_slice``: the policy resolved to ZERO rows for you. This
+            is the single most common cause of "the table looks empty" —
+            report it as a scoping fact, not as missing data.
+          - ``mapping_empty``: the policy depends on a mapping table that
+            has never synced or is currently empty, so nobody sees any rows
+            through it yet — a data-freshness problem, not your access.
+          - ``policy_error``: the policy SQL itself failed to resolve or
+            execute. Never silently falls back to the unfiltered table —
+            tell the caller the count is unavailable, not zero.
+          - ``identity_unresolvable``: no single identity to bind the policy
+            to (e.g. a shared/co-drive session) — a solo session would
+            resolve it.
+        - ``note``: extra human-readable context for the ``reason`` above
+          (e.g. the mapping table's name and last-sync time).
+
+        Never present a count or aggregate over a policied table's sample or
+        query result as an organisation-wide figure — qualify it as YOUR
+        visible slice whenever ``policy.applies`` is true.
+
+        No admin variant: ``GET /api/admin/users/{id}/effective-access``
+        (auditing SOMEONE ELSE's access) is deliberately not exposed as a
+        tool here — an agent has no legitimate reason to probe another
+        person's grant graph.
+        """
+        async with httpx.AsyncClient() as c:
+            r = await c.get(f"{base_url}/api/me/effective-access", headers=headers_fn(), timeout=30)
+            _raise_for_status_with_detail(r)
+            payload = r.json()
+
+        if not table:
+            return payload
+
+        tables = payload.get("tables") or []
+        for entry in tables:
+            if entry.get("table_id") == table:
+                return entry
+
+        # Not a direct id match — the caller may have passed a human name
+        # (`catalog`'s ``name`` field) instead of the registry ``id`` this
+        # endpoint keys tables by. Resolve it through the same RBAC-filtered
+        # catalog an agent would already have called, then retry by id.
+        async with httpx.AsyncClient() as c:
+            cr = await c.get(f"{base_url}/api/v2/catalog", headers=headers_fn(), timeout=30)
+        if cr.status_code < 400:
+            for row in cr.json().get("tables") or []:
+                if (row.get("name") or "").lower() == table.lower():
+                    resolved_id = row.get("id")
+                    for entry in tables:
+                        if entry.get("table_id") == resolved_id:
+                            return entry
+                    break
+
+        raise ValueError(_EFFECTIVE_ACCESS_NOT_FOUND_HINT.format(table=table))
 
     @tool(read_only=True)
     async def skills() -> dict:

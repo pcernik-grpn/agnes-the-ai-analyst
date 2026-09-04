@@ -155,8 +155,14 @@ agnes_pg_effective_cache_size_mb() {
 }
 
 agnes_pg_work_mem_mb() {
+    # Was capped at 128 MiB until TCRD-296 gap #76: a live 14M-row FTS
+    # bitmap on a 252 GiB VM needed 256 MiB to avoid spilling to disk. The
+    # divisor is unchanged (RAM/512), so the floor and the ratio for smaller
+    # hosts are identical to before — only the ceiling moved, and it takes a
+    # 128 GiB+ host to reach it (65536 MiB / 512 = 128, already the OLD cap,
+    # so every host under 128 GiB sees no change at all).
     local ram_mb="$1"
-    agnes_clamp $(( ram_mb / 512 )) 16 128
+    agnes_clamp $(( ram_mb / 512 )) 16 256
 }
 
 agnes_pg_maintenance_work_mem_mb() {
@@ -172,6 +178,44 @@ agnes_pg_max_parallel_workers_per_gather() {
 agnes_pg_shm_size_mb() {
     local ram_mb="$1"
     agnes_clamp $(( ram_mb * 2 / 100 )) 256 999999
+}
+
+# Per-replica Postgres connection budget for the `extraction-worker` service
+# (TCRD-296 gap #76). A conservative CONSTANT, not derived from
+# `extraction.concurrency`/`extraction.facts.concurrency` (instance.yaml,
+# runtime-editable, unreachable from a boot-time shell): 2x the DEFAULT
+# per-process pool-size hint `src/db_pg.py::_extraction_worker_pool_size_hint`
+# computes for a SINGLE replica when both knobs are left at their own
+# defaults (extraction.concurrency=1 + extraction.facts.concurrency=3 = 4
+# lanes) — headroom for an operator who raises either knob without also
+# raising these two by hand. Only rendered onto the extraction-worker
+# service (never app/scheduler) when extraction_worker_replicas > 1 — see
+# the EXTRYAML overlay below — so a single-replica VM keeps today's
+# per-process dynamic sizing untouched.
+agnes_pg_extraction_worker_pool_size() {
+    echo 8
+}
+
+agnes_pg_extraction_worker_max_overflow() {
+    echo 8
+}
+
+# Postgres side-car `max_connections` — sized to comfortably hold app +
+# scheduler (each at their own unchanged pool_size(5) + max_overflow(10)
+# defaults from src/db_pg.py = 15 connections apiece) plus every
+# extraction-worker replica's own pool budget above, plus headroom for
+# manual psql/pg_isready/monitoring connections. $1 = extraction-worker
+# replica count (1 when the lane is off or unset — see
+# extraction_worker_replicas in variables.tf). At the default of 1 replica
+# this clamps to Postgres' OWN stock default (100), so rendering it
+# explicitly changes nothing for an instance that never touches the field —
+# see docs/DEPLOYMENT.md#sizing-an-extraction-instance for the worked
+# example on a 6-replica VM.
+agnes_pg_max_connections() {
+    local replicas="$1" pool overflow app_budget=15 scheduler_budget=15 headroom=40
+    pool=$(agnes_pg_extraction_worker_pool_size)
+    overflow=$(agnes_pg_extraction_worker_max_overflow)
+    agnes_clamp $(( app_budget + scheduler_budget + (pool + overflow) * replicas + headroom )) 100 999999
 }
 # --- vm-sizing end ---
 
@@ -190,6 +234,11 @@ RESOLVED_EXTRACTION_WORKER_MEM_LIMIT="${extraction_worker_mem_limit}"
 if [ "$RESOLVED_EXTRACTION_WORKER_MEM_LIMIT" = "auto" ]; then
     RESOLVED_EXTRACTION_WORKER_MEM_LIMIT="$(agnes_auto_worker_mem_limit_gb "$AGNES_TOTAL_MEM_MB")g"
 fi
+# Plain integer, no "auto" — an operator sets the replica count directly
+# (default 1, TCRD-296 gap #76). Threaded through every `docker compose up`
+# that could otherwise recreate the stack back to one replica — see the
+# `--scale extraction-worker=` sites below and in agnes-auto-upgrade.sh.
+RESOLVED_EXTRACTION_WORKER_REPLICAS="${extraction_worker_replicas}"
 
 # Postgres side-car tuning — computed unconditionally (day-zero seeds
 # database.backend=side_car, see section 2 below) and written into .env
@@ -202,6 +251,10 @@ AGNES_PG_WORK_MEM="$(agnes_pg_work_mem_mb "$AGNES_TOTAL_MEM_MB")MB"
 AGNES_PG_MAINTENANCE_WORK_MEM="$(agnes_pg_maintenance_work_mem_mb "$AGNES_TOTAL_MEM_MB")MB"
 AGNES_PG_MAX_PARALLEL_WORKERS_PER_GATHER="$(agnes_pg_max_parallel_workers_per_gather "$AGNES_NPROC")"
 AGNES_PG_SHM_SIZE="$(agnes_pg_shm_size_mb "$AGNES_TOTAL_MEM_MB")m"
+# Sized from the replica count, not RAM — see agnes_pg_max_connections above.
+AGNES_PG_MAX_CONNECTIONS="$(agnes_pg_max_connections "$RESOLVED_EXTRACTION_WORKER_REPLICAS")"
+AGNES_EXTRACTION_WORKER_PG_POOL_SIZE="$(agnes_pg_extraction_worker_pool_size)"
+AGNES_EXTRACTION_WORKER_PG_MAX_OVERFLOW="$(agnes_pg_extraction_worker_max_overflow)"
 
 # --- 1. Docker (install if missing) ---
 if ! command -v docker &>/dev/null; then
@@ -1554,6 +1607,20 @@ services:
       - OMP_NUM_THREADS=1
       - MKL_NUM_THREADS=1
       - NUMEXPR_NUM_THREADS=1
+%{ if extraction_worker_replicas > 1 ~}
+      # More than one replica means the runtime's per-process pool-size HINT
+      # (src/db_pg.py::_extraction_worker_pool_size_hint, designed for ONE
+      # replica) would apply IDENTICALLY to every replica and multiply the
+      # Postgres connection load by N — the exact shape that exhausted the
+      # side-car's max_connections on a live 6-replica instance (TCRD-296
+      # gap #76). Pin the pool explicitly instead, to the SAME conservative
+      # per-replica budget agnes_pg_max_connections (above) reserved room
+      # for. Additive merge with the base service's own `environment:` (see
+      # the comment above) — app/scheduler never carry these two lines and
+      # keep their own defaults.
+      - AGNES_PG_POOL_SIZE=$${AGNES_EXTRACTION_WORKER_PG_POOL_SIZE}
+      - AGNES_PG_MAX_OVERFLOW=$${AGNES_EXTRACTION_WORKER_PG_MAX_OVERFLOW}
+%{ endif ~}
     # Additive merge on top of the base service's `app: service_healthy`.
     depends_on:
       redis:
@@ -1713,6 +1780,9 @@ HOST_WORKSPACE_URL=http://app:8000/api/kai/workspace
 %{ if kai_agent_broker_mcp_enabled ~}
 HOST_BROKER_MCP_URL=$SERVER_URL/api/kai/mcp
 %{ endif ~}
+%{ if kai_agent_broker_otlp_enabled ~}
+HOST_BROKER_OTLP_URL=$SERVER_URL/api/broker/otlp
+%{ endif ~}
 POSTGRES_URL=postgresql://kai:$KAI_AGENT_PG_PASSWORD@kai-agent-pg:5432/kai_agent
 E2B_API_KEY=$KAI_E2B_API_KEY
 KAIENVEOF
@@ -1855,6 +1925,15 @@ AGNES_PG_WORK_MEM=$AGNES_PG_WORK_MEM
 AGNES_PG_MAINTENANCE_WORK_MEM=$AGNES_PG_MAINTENANCE_WORK_MEM
 AGNES_PG_MAX_PARALLEL_WORKERS_PER_GATHER=$AGNES_PG_MAX_PARALLEL_WORKERS_PER_GATHER
 AGNES_PG_SHM_SIZE=$AGNES_PG_SHM_SIZE
+# Sized from extraction_worker_replicas, not RAM — see agnes_pg_max_connections
+# in the "VM-derived sizing" block (TCRD-296 gap #76). Consumed by the same
+# postgres-host-mount overlay's `command:`.
+AGNES_PG_MAX_CONNECTIONS=$AGNES_PG_MAX_CONNECTIONS
+# Number of extraction-worker replicas this VM runs — read back by
+# agnes-auto-upgrade.sh so a recreate threads the same `--scale
+# extraction-worker=N` the boot sequence below uses, instead of silently
+# collapsing to one replica on the next tick.
+AGNES_EXTRACTION_WORKER_REPLICAS=$RESOLVED_EXTRACTION_WORKER_REPLICAS
 %{ if dispatcher_enabled ~}
 DISPATCHER_IMAGE=${dispatcher_image}
 DISPATCHER_PG_PASSWORD=$DISPATCHER_PG_PASSWORD
@@ -2128,13 +2207,20 @@ fi
 # pull is where a private-registry failure would land; on failure the .env
 # keeps the FULL list, so the next auto-upgrade tick (and any operator
 # `docker compose up -d`) retries with no state to repair.
+#
+# --scale threads RESOLVED_EXTRACTION_WORKER_REPLICAS through so a VM whose
+# operator raised extraction_worker_replicas boots with that many containers
+# from the start, not one recreate later (TCRD-296 gap #76). The recurring
+# agnes-auto-upgrade tick reads the SAME AGNES_EXTRACTION_WORKER_REPLICAS
+# back from .env and applies its own --scale, so a routine recreate never
+# silently collapses it back to one.
 export COMPOSE_FILE="$EXTRACTION_FULL_COMPOSE_FILE"
 if ! docker compose $COMPOSE_PROFILES_ARG pull redis \
     || ! docker compose $COMPOSE_PROFILES_ARG up -d redis; then
     echo "WARN: redis coordination backend failed to pull or start; the app runs with degraded coordination until it appears — re-run docker compose up -d redis (or wait for the auto-upgrade tick)" >&2
 fi
 if ! docker compose $COMPOSE_PROFILES_ARG pull extraction-worker \
-    || ! docker compose $COMPOSE_PROFILES_ARG up -d extraction-worker; then
+    || ! docker compose $COMPOSE_PROFILES_ARG up -d --scale "extraction-worker=$RESOLVED_EXTRACTION_WORKER_REPLICAS" extraction-worker; then
     echo "WARN: extraction-worker failed to pull or start; base stack is up — check the image ref/registry access and re-run docker compose up -d (or wait for the auto-upgrade tick)" >&2
 fi
 %{ endif ~}

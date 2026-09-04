@@ -1615,6 +1615,17 @@
             ],
             "title": "Drive Id"
           },
+          "min_modified": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Min Modified"
+          },
           "paths": {
             "items": {
               "type": "string"
@@ -2189,6 +2200,17 @@
             "default": false,
             "title": "Include Excluded Subtrees",
             "type": "boolean"
+          },
+          "min_modified": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Min Modified"
           },
           "source_scope_id": {
             "minLength": 1,
@@ -4205,6 +4227,65 @@
           "enabled"
         ],
         "title": "CuratedPlugin",
+        "type": "object"
+      },
+      "DatasetDraft": {
+        "properties": {
+          "description": {
+            "default": "",
+            "title": "Description",
+            "type": "string"
+          },
+          "fields": {
+            "items": {
+              "$ref": "#/components/schemas/DatasetFieldDraft"
+            },
+            "title": "Fields",
+            "type": "array"
+          },
+          "name": {
+            "default": "",
+            "title": "Name",
+            "type": "string"
+          },
+          "source": {
+            "default": "",
+            "title": "Source",
+            "type": "string"
+          }
+        },
+        "title": "DatasetDraft",
+        "type": "object"
+      },
+      "DatasetFieldDraft": {
+        "properties": {
+          "datatype": {
+            "default": "",
+            "title": "Datatype",
+            "type": "string"
+          },
+          "description": {
+            "default": "",
+            "title": "Description",
+            "type": "string"
+          },
+          "is_primary_key": {
+            "default": false,
+            "title": "Is Primary Key",
+            "type": "boolean"
+          },
+          "is_time": {
+            "default": false,
+            "title": "Is Time",
+            "type": "boolean"
+          },
+          "name": {
+            "default": "",
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "title": "DatasetFieldDraft",
         "type": "object"
       },
       "DatasetSettingRequest": {
@@ -7575,6 +7656,32 @@
         "title": "MetricCreate",
         "type": "object"
       },
+      "MetricDraft": {
+        "properties": {
+          "description": {
+            "default": "",
+            "title": "Description",
+            "type": "string"
+          },
+          "dialect": {
+            "default": "duckdb",
+            "title": "Dialect",
+            "type": "string"
+          },
+          "expression": {
+            "default": "",
+            "title": "Expression",
+            "type": "string"
+          },
+          "name": {
+            "default": "",
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "title": "MetricDraft",
+        "type": "object"
+      },
       "MigrateRequest": {
         "description": "Body for ``POST /api/admin/db/migrate``.",
         "properties": {
@@ -8821,6 +8928,45 @@
           }
         },
         "title": "PolicyPreviewGroupsRequest",
+        "type": "object"
+      },
+      "PolicyPreviewMatrixRequest": {
+        "description": "Body for ``POST /registry/{table_id}/policy/preview-matrix`` (design\ndoc \u00a713.1 \"The preview is a matrix, not a run\"; issue #2147, backlog\nitem 18). ``sql`` is optional, same meaning as :class:`PolicyPreviewRequest`\n-- omitted previews the stored policy, given previews a candidate body\nfirst.\n\n``personas`` picks which persona families populate the matrix:\n``group_sets`` (the distinct group-sets real users who can reach this\ntable actually hold), ``policy_groups`` (each group literal the policy\nbody itself names, plus the empty group set), or ``both`` (default).\n\n``limit`` bounds how many distinct ``group_sets`` personas are\nenumerated -- see ``_POLICY_PREVIEW_MATRIX_MAX_GROUP_SETS`` for the\nabsolute ceiling a caller can never raise past.",
+        "properties": {
+          "limit": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Limit"
+          },
+          "personas": {
+            "default": "both",
+            "enum": [
+              "group_sets",
+              "policy_groups",
+              "both"
+            ],
+            "title": "Personas",
+            "type": "string"
+          },
+          "sql": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sql"
+          }
+        },
+        "title": "PolicyPreviewMatrixRequest",
         "type": "object"
       },
       "PolicyPreviewRequest": {
@@ -10230,6 +10376,39 @@
         "title": "SemanticModelCreate",
         "type": "object"
       },
+      "SemanticModelDraft": {
+        "description": "The builder panel's unsaved state, as the page currently has it.\n\nUntrusted, used only to build the prompt \u2014 nothing here is written\nanywhere, and everything that comes back is re-validated on the way out.",
+        "properties": {
+          "datasets": {
+            "items": {
+              "$ref": "#/components/schemas/DatasetDraft"
+            },
+            "title": "Datasets",
+            "type": "array"
+          },
+          "description": {
+            "default": "",
+            "maxLength": 4000,
+            "title": "Description",
+            "type": "string"
+          },
+          "metrics": {
+            "items": {
+              "$ref": "#/components/schemas/MetricDraft"
+            },
+            "title": "Metrics",
+            "type": "array"
+          },
+          "name": {
+            "default": "",
+            "maxLength": 120,
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "title": "SemanticModelDraft",
+        "type": "object"
+      },
       "SemanticModelPackageIds": {
         "properties": {
           "package_ids": {
@@ -10257,6 +10436,37 @@
           "package_id"
         ],
         "title": "SemanticModelPackageLink",
+        "type": "object"
+      },
+      "SemanticModelTurnRequest": {
+        "properties": {
+          "draft": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SemanticModelDraft"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "history": {
+            "items": {
+              "$ref": "#/components/schemas/BuilderMessage"
+            },
+            "title": "History",
+            "type": "array"
+          },
+          "message": {
+            "maxLength": 4000,
+            "title": "Message",
+            "type": "string"
+          }
+        },
+        "required": [
+          "message"
+        ],
+        "title": "SemanticModelTurnRequest",
         "type": "object"
       },
       "SemanticModelUpdate": {
@@ -28654,7 +28864,7 @@
     },
     "/api/admin/registry": {
       "get": {
-        "description": "Get full table registry.\n\nEach table row is enriched with its `sync_state` counterpart (#754) so\nthe admin dashboard (`admin_sync.html`) and `agnes admin list-tables`\ncan explain a \"N total, 0 synced\" run without trawling scheduler logs:\n\n  - `last_sync_status`: 'ok' | 'error' | 'skipped' | 'pending' (never\n    synced). Mirrors `sync_state.status`, defaulted to 'pending' when\n    no sync_state row exists yet.\n  - `last_sync_error`: the persisted error/skip-reason string when\n    `last_sync_status` is 'error' or 'skipped'; None otherwise.\n  - `last_sync`: full ISO timestamp of the last successful sync, or\n    None if never synced. (`last_sync_display` below is the\n    pre-existing truncated \"YYYY-MM-DD HH:MM\" form, kept for backward\n    compatibility with any existing consumer.)\n  - `rows` / `file_size_bytes`: the last successful sync's row count /\n    parquet size, so the dashboard's \"Rows\" / \"Size\" columns aren't\n    silently blank for tables that DID sync.\n  - `packaged`: is this table in ANY data package. A table in no package\n    reaches nobody \u2014 the product's central distribution rule \u2014 so it is\n    the one condition worth filtering a registry by, and the package\n    builder's picker offers it as a toggle. One batched membership read,\n    like the sync_state join above; False for every row if that read\n    fails, since a filter that silently claims everything is unpackaged\n    is worse than one that offers nothing.",
+        "description": "Get full table registry.\n\nEach table row is enriched with its `sync_state` counterpart (#754) so\nthe admin dashboard (`admin_sync.html`) and `agnes admin list-tables`\ncan explain a \"N total, 0 synced\" run without trawling scheduler logs:\n\n  - `last_sync_status`: 'ok' | 'error' | 'skipped' | 'pending' (never\n    synced). Mirrors `sync_state.status`, defaulted to 'pending' when\n    no sync_state row exists yet.\n  - `last_sync_error`: the persisted error/skip-reason string when\n    `last_sync_status` is 'error' or 'skipped'; None otherwise.\n  - `last_sync`: full ISO timestamp of the last successful sync, or\n    None if never synced. (`last_sync_display` below is the\n    pre-existing truncated \"YYYY-MM-DD HH:MM\" form, kept for backward\n    compatibility with any existing consumer.)\n  - `rows` / `file_size_bytes`: the last successful sync's row count /\n    parquet size, so the dashboard's \"Rows\" / \"Size\" columns aren't\n    silently blank for tables that DID sync.\n  - `packaged`: is this table in ANY data package. A table in no package\n    reaches nobody \u2014 the product's central distribution rule \u2014 so it is\n    the one condition worth filtering a registry by, and the package\n    builder's picker offers it as a toggle. One batched membership read,\n    like the sync_state join above; False for every row if that read\n    fails, since a filter that silently claims everything is unpackaged\n    is worse than one that offers nothing.\n  - `policy_mapping_status` (#2147): present only on a row with a\n    policy attached (`access_policy_sql`). A list of\n    `{\"mapping_table\": <id>, \"state\": \"ok\"|\"empty\"|\"never_synced\"|\n    \"remote_unknown\", \"last_sync\": ...}`, one entry per\n    `policy_mapping=true` table the policy body joins (excluding the\n    row's own mandatory self-reference) \u2014 the same read-only,\n    `sync_state`-derived state `src.access_policy.policy_mapping_\n    statuses` computes for the live-read fail-closed check\n    (`raise_if_policy_mapping_empty`), never a live `COUNT(*)`, so this\n    never disagrees with (or is more expensive than) what a real query\n    through the policy would do. Absent entirely on an unpolicied row.",
         "operationId": "list_registry_api_admin_registry_get",
         "parameters": [
           {
@@ -29245,6 +29455,79 @@
           }
         },
         "summary": "Preview Table Policy All Groups",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/api/admin/registry/{table_id}/policy/preview-matrix": {
+      "post": {
+        "description": "The persona MATRIX (design doc \u00a713.1 \"The preview is a matrix, not a\nrun\"; issue #2147, backlog item 18) -- built from the SAME single-\npersona primitive ``preview_table_policy`` uses (``_policy_preview_run_\npersona``), run once per persona in the matrix instead of once for a\nsingle admin-chosen persona.\n\nA single-persona preview with a row count against the unfiltered total\ncatches only the extremes -- 0 rows and all rows. The dangerous middle\nis invisible, and the permissive bug that actually happens (a ``CASE``\non ``$user_groups`` with a missing branch falling through to the open\narm) cannot be seen by previewing one persona. This enumerates the\ndistinct group-sets among users who can actually reach the table\n(``_policy_preview_group_set_personas``) plus every group literal the\npolicy body itself names (``_policy_preview_referenced_group_literals``,\nplus the empty group set) and reports, per persona, rows/columns, then\ntwo derived numbers: ``union_coverage`` (rows visible to >=1 persona vs\nthe bounded sample -- 100% for every persona AND the union means the\npolicy is a no-op) and ``pairwise_overlap`` (a non-zero overlap where a\npartitioning policy should show zero is the permissive bug, rendered).\n\nRow identity for both is BEST-EFFORT: no stable row key exists on this\ncodebase's server side (the modal-side row-matcher \u00a713.1 names is not\nimplemented yet), so identity is the full tuple of a row's UNMASKED,\nUNHIDDEN (\"visible\") column values -- two rows with identical values in\nevery visible column are indistinguishable here, and a column whose mask\nitself varies by persona (rare, but the allowlist does not forbid it)\ncan under-count overlap for a row that is genuinely the same one. This\nnever affects the row FILTERING result (``rows_visible``), only the\nunion/overlap math layered on top of the bounded sample.\n\nGated by ``require_admin_all_surface`` and audited\n(``access_policy.preview_matrix``), same reasoning as\n``preview_table_policy``/``preview_table_policy_all_groups`` above: this\nhands back real row content for every enumerated persona with no\nper-table grant check and no policy rewrite standing behind it.",
+        "operationId": "preview_table_policy_matrix_api_admin_registry__table_id__policy_preview_matrix_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "table_id",
+            "required": true,
+            "schema": {
+              "title": "Table Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PolicyPreviewMatrixRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Preview Table Policy Matrix",
         "tags": [
           "admin"
         ]
@@ -33232,6 +33515,81 @@
         ]
       }
     },
+    "/api/admin/sharepoint/connections/{connection_id}/acl-snapshot": {
+      "get": {
+        "description": "SharePoint permissions captured as METADATA (TCRD-296 gap #79) \u2014 who\nSharePoint itself says can see each of this connection's scopes,\nindependent of ``access_mode``. Distinct from the RBAC layer entirely:\nthis never changes what Agnes grants; it only reports what SharePoint's\nown permission list says, for every scope (manual scopes included) \u2014\nonly a ``mirrored`` scope's Agnes access is actually derived from it (see\n``docs/sharepoint-extraction.md`` -> \"SharePoint permissions as metadata\nvs. mirrored access\").\n\nCaptured by the ``sharepoint-acl-sync`` job (every few hours, and on the\nadmin \"sync now\" trigger) into ``sharepoint_connection_state`` rows\n(``connectors/sharepoint/acl_sync.py::_store_acl_snapshot`` /\n:func:`connectors.sharepoint.acl_sync.snapshot_principals`) \u2014 this route\nonly reads what is already stored, never calls Graph itself.\n\nAlways returns ``aggregate`` \u2014 the connection-wide rollup\n(:func:`connectors.sharepoint.acl_sync.aggregate_acl_snapshot`): distinct\nEntra groups, distinct site groups, how many scopes have an\n\"organization\" sharing link, how many name an individual person\ndirectly, how many scopes have been captured at all, and the latest\ncapture time. ``?scopes=true`` additionally returns ``scopes`` \u2014 every\ncaptured scope's own ``{source_scope_id, display_path, captured_at,\nprincipals, summary}`` \u2014 heavier, so it is opt-in (the source card's\ncompact summary line never needs it; its \"View\" disclosure does).\n\nPG-only (A3 ratchet \u2014 ``sharepoint_connection_state`` postdates the\nfreeze): a DuckDB-backed instance gets the typed ``501`` from\n``sharepoint_state_repo()`` via the app-wide handler in ``app/main.py``,\nsame as every other route reaching an A3-ratchet PG-only repo.",
+        "operationId": "read_acl_snapshot_api_admin_sharepoint_connections__connection_id__acl_snapshot_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connection_id",
+            "required": true,
+            "schema": {
+              "title": "Connection Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Include every scope's own captured principal list",
+            "in": "query",
+            "name": "scopes",
+            "required": false,
+            "schema": {
+              "default": false,
+              "description": "Include every scope's own captured principal list",
+              "title": "Scopes",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Read Acl Snapshot",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
     "/api/admin/sharepoint/connections/{connection_id}/acl-sync": {
       "post": {
         "description": "Admin-triggered one-off run of the ``sharepoint-acl-sync`` job for\nthis connection (spec \u00a75.1's \"sync now\" action; 2026-08-30 plan, Task\n5) \u2014 enqueues ``connectors.sharepoint.acl_sync.run_acl_sync`` (via\n``app/worker/kinds.py::_run_sharepoint_acl_sync``) with\n``{\"connection_id\": connection_id}``, the SAME mechanics as\n:func:`trigger_extraction`.\n\n404 on an unknown/non-sharepoint connection BEFORE any other work. The\nrouter-level ``sharepoint.enabled`` gate (``_require_sharepoint_enabled``\nabove) already refuses the whole surface with ``409 feature_disabled``\nwhen the connector is off, so there is no separate per-route check here.\n\nDeduped on a STABLE per-connection idempotency key\n(:func:`_acl_sync_idempotency_key`) \u2014 a second trigger while one is\nalready queued/running for this connection gets ``409\nacl_sync_already_running`` instead of a second job.",
@@ -34845,7 +35203,7 @@
         ]
       },
       "post": {
-        "description": "Confirm one selected site/library/folder as a scope.\n\nCreates its collection on first confirmation \u2014 unless the same\n``source_scope_id`` was unticked earlier on this connection, in which\ncase its previous collection is re-adopted via :func:`remove_scope`'s\ntombstone (see :func:`_readopted_scope_collection_id`) rather than a\nduplicate minted. Re-confirming a LIVE scope (same\n``source_scope_id``) reuses that same collection (idempotent) and updates\n``display_path``/``anonymize``/``access_mode``/``drive_id`` in place \u2014 a\nrename or move in the source does not fork a second collection (\u00a76\napplied to the wizard's own bookkeeping). ``group_ids``, **if the field\nis present**, is the complete set of groups for this collection (step\n3): listed groups are granted, and any other group's grant on this\ncollection is revoked \u2014 EXCEPT a mirrored (sentinel-owned) grant, which\nthis checkbox can never touch (see the revoke loop below); \"stop\nmirroring\" is ``access_mode``, not a checkbox. The wizard's checkboxes\nare pre-checked from the grants that exist and its row warns the moment\nthe last one is unticked, so the screen already promises that unticking\nremoves access \u2014 making the handler additive-only meant the admin was\nshown a revocation that never happened. Omitting the field touches no\ngrant at all, which is what keeps a rename or an anonymize toggle from\nstripping access as a side effect.\n\n``access_mode='mirrored'`` (spec \u00a72.5) opts this scope into the\n``sharepoint-acl-sync`` job's reconciliation and REQUIRES ``drive_id``\n(``400 missing_drive_id`` otherwise \u2014 the sync needs both a drive id and\nan item id to address the scope root on Graph). Switching an already-\nmirrored scope back to ``manual`` deletes the sync's own sentinel-owned\ngrants for this collection and converts nothing \u2014 the admin re-grants\nmanually, same as any other scope that was never mirrored.\n\n``include_excluded_subtrees=true`` (2026-08-30 plan, Task 7) asks to\n\"include anyway\" a broken-inheritance subtree the\n``sharepoint-subtree-sweep`` job detected on this scope and excluded from\nthe crawl by default (spec \u00a73(b)). Refused with ``409\nmust_not_forbids_subtree_override`` under the ``must_not`` guarantee mode\n(the fail-closed default \u2014 \u00a71.2 disqualifies this override outright);\naccepted and audited (``sharepoint_acl.subtree_override``) under\n``should_not``. This handler writes that ONE audit row INSTEAD of\nrelying on the route's declared fallback action\n(``sharepoint_connection.scope_confirm``) for a request that turns the\noverride on \u2014 see the audit playbook's \"never write both for the same\nevent\" rule; every other confirm (no override transition) is still\ncovered by the fallback, unchanged.",
+        "description": "Confirm one selected site/library/folder as a scope.\n\nCreates its collection on first confirmation \u2014 unless the same\n``source_scope_id`` was unticked earlier on this connection, in which\ncase its previous collection is re-adopted via :func:`remove_scope`'s\ntombstone (see :func:`_readopted_scope_collection_id`) rather than a\nduplicate minted. Re-confirming a LIVE scope (same\n``source_scope_id``) reuses that same collection (idempotent) and updates\n``display_path``/``anonymize``/``access_mode``/``drive_id`` in place \u2014 a\nrename or move in the source does not fork a second collection (\u00a76\napplied to the wizard's own bookkeeping). ``group_ids``, **if the field\nis present**, is the complete set of groups for this collection (step\n3): listed groups are granted, and any other group's grant on this\ncollection is revoked \u2014 EXCEPT a mirrored (sentinel-owned) grant, which\nthis checkbox can never touch (see the revoke loop below); \"stop\nmirroring\" is ``access_mode``, not a checkbox. The wizard's checkboxes\nare pre-checked from the grants that exist and its row warns the moment\nthe last one is unticked, so the screen already promises that unticking\nremoves access \u2014 making the handler additive-only meant the admin was\nshown a revocation that never happened. Omitting the field touches no\ngrant at all, which is what keeps a rename or an anonymize toggle from\nstripping access as a side effect.\n\n``access_mode='mirrored'`` (spec \u00a72.5) opts this scope into the\n``sharepoint-acl-sync`` job's reconciliation and REQUIRES ``drive_id``\n(``400 missing_drive_id`` otherwise \u2014 the sync needs both a drive id and\nan item id to address the scope root on Graph). Switching an already-\nmirrored scope back to ``manual`` deletes the sync's own sentinel-owned\ngrants for this collection and converts nothing \u2014 the admin re-grants\nmanually, same as any other scope that was never mirrored.\n\n``include_excluded_subtrees=true`` (2026-08-30 plan, Task 7) asks to\n\"include anyway\" a broken-inheritance subtree the\n``sharepoint-subtree-sweep`` job detected on this scope and excluded from\nthe crawl by default (spec \u00a73(b)). Refused with ``409\nmust_not_forbids_subtree_override`` under the ``must_not`` guarantee mode\n(the fail-closed default \u2014 \u00a71.2 disqualifies this override outright);\naccepted and audited (``sharepoint_acl.subtree_override``) under\n``should_not``. This handler writes that ONE audit row INSTEAD of\nrelying on the route's declared fallback action\n(``sharepoint_connection.scope_confirm``) for a request that turns the\noverride on \u2014 see the audit playbook's \"never write both for the same\nevent\" rule; every other confirm (no override transition) is still\ncovered by the fallback, unchanged.\n\n``min_modified`` (TCRD-296 gap #80) sets THIS scope's own \"modified\nsince\" crawl filter \u2014 ``None`` (the default) has it inherit the\nconnection-wide ``PATCH \u2026/extraction/crawl-config`` default, same as\nevery scope before this field existed. ``400 invalid_min_modified`` for\nanything that is not a parseable ISO ``YYYY-MM-DD`` date.",
         "operationId": "confirm_scope_api_admin_sharepoint_connections__connection_id__scopes_post",
         "parameters": [
           {
@@ -34989,7 +35347,7 @@
         ]
       },
       "post": {
-        "description": "Confirm many site/library/folder paths as scopes in one call \u2014 the\nfast path for splitting one large SharePoint site across several\nconnections (each with its own crawl and facts jobs, so they run in\nparallel): resolve each admin-typed ``paths`` entry to a Graph drive\nitem (:func:`connectors.sharepoint.graph_client.get_item_by_path`) and\nwrite a scope row for it, same shape :func:`confirm_scope` writes\n(``access_mode=body.access_mode`` \u2014 ``\"manual\"`` unless the caller\npasses ``\"mirrored\"`` (2026-09 fix; every scope this call creates gets\nthe SAME mode, never a per-path choice) \u2014 and\n``include_excluded_subtrees=False``, the same default a single manual\nconfirm gets; #2032 made these round-trip through list/confirm and this\nendpoint honours the same contract) \u2014 minus the wizard's own\ngroup-grant step (``group_ids``), which stays a separate, deliberate\naction on each created scope. ``drive_id`` is always resolved before\nany scope is created (see below), so ``access_mode=\"mirrored\"`` never\nhits the ``400 missing_drive_id`` a single :func:`confirm_scope` call\ncan.\n\nNever all-or-nothing: every path is resolved and reported independently\nin the response, ``{\"created\": [...], \"skipped\": [...], \"failed\":\n[{\"path\", \"reason\"}]}`` \u2014\n\n* **created** \u2014 a fresh scope, collection minted (or re-adopted from a\n  matching untick tombstone, same as :func:`confirm_scope`) \u2014 UNLESS\n  ``body.collection_id``/``body.collection`` names a shared target, in\n  which case every scope this call creates routes there instead (no\n  per-path mint, no tombstone re-adoption); each entry is `{\"path\",\n  **scope}` (the same projection ``GET \u2026/scopes`` returns).\n* **skipped** \u2014 the path resolved to a ``source_scope_id`` ALREADY\n  present among this connection's scopes (the idempotency key\n  :func:`confirm_scope` itself uses) \u2014 ``{\"path\", \"source_scope_id\",\n  \"reason\": \"already_present\"}``.\n* **failed** \u2014 Graph could not resolve the path: ``{\"path\", \"reason\"}``\n  with ``reason`` one of ``\"not_found\"`` (404) or ``\"forbidden\"``\n  (403) \u2014 the same routine-permissions-fact classification\n  :func:`connectors.sharepoint.graph_client.search_folders` already\n  uses, never surfaced as a whole-request failure.\n\nAny OTHER Graph failure (401/429/5xx, a network fault) is not a\nper-path fact \u2014 it means the whole call is broken, same rule\n:func:`connectors.sharepoint.graph_client.search_folders` documents \u2014\nand aborts the remaining, unprocessed paths with a typed ``502\nsharepoint_graph_error``; whatever was already resolved and created\nbefore that point is still persisted (already-report paths are not\nrolled back by a later path's outage).\n\n``drive_id`` is required unless this connection already has at least\none scope with one set (reused from the first match) \u2014 a brand-new\nconnection with zero scopes (:func:`clone_connection`'s own starting\npoint) must supply it explicitly (``400 drive_id_required``\notherwise); a malformed one is a typed ``422`` (see\n:func:`_validate_graph_id`), same as ``POST \u2026/scopes``'s own\n``drive_id``.\n\n``collection_id``/``collection`` (mutually exclusive \u2014 ``400\nboth_collection_id_and_collection``) route every scope THIS call\ncreates to ONE shared collection instead of minting one per path \u2014 the\nfix for a large site otherwise forking across as many collections as\nthere are confirmed scopes across the split's several connections.\n``collection_id`` must name an existing, live collection\n(``404 collection_not_found`` otherwise); ``collection`` mints a new\none, by name. A path already ``skipped`` (already present) keeps\nwhatever collection it already owns \u2014 the shared target never moves an\nexisting scope.",
+        "description": "Confirm many site/library/folder paths as scopes in one call \u2014 the\nfast path for splitting one large SharePoint site across several\nconnections (each with its own crawl and facts jobs, so they run in\nparallel): resolve each admin-typed ``paths`` entry to a Graph drive\nitem (:func:`connectors.sharepoint.graph_client.get_item_by_path`) and\nwrite a scope row for it, same shape :func:`confirm_scope` writes\n(``access_mode=body.access_mode`` \u2014 ``\"manual\"`` unless the caller\npasses ``\"mirrored\"`` (2026-09 fix; every scope this call creates gets\nthe SAME mode, never a per-path choice) \u2014 and\n``include_excluded_subtrees=False``, the same default a single manual\nconfirm gets; #2032 made these round-trip through list/confirm and this\nendpoint honours the same contract) \u2014 minus the wizard's own\ngroup-grant step (``group_ids``), which stays a separate, deliberate\naction on each created scope. ``drive_id`` is always resolved before\nany scope is created (see below), so ``access_mode=\"mirrored\"`` never\nhits the ``400 missing_drive_id`` a single :func:`confirm_scope` call\ncan.\n\n``min_modified`` (TCRD-296 gap #80), when given, is stored as every\nscope THIS call creates' OWN \"modified since\" filter \u2014 a bulk default,\nnot a per-path choice (same one-shape-for-the-whole-batch rule\n``access_mode`` already applies). ``400 invalid_min_modified`` for\nanything that is not a parseable ISO ``YYYY-MM-DD`` date.\n\nNever all-or-nothing: every path is resolved and reported independently\nin the response, ``{\"created\": [...], \"skipped\": [...], \"failed\":\n[{\"path\", \"reason\"}]}`` \u2014\n\n* **created** \u2014 a fresh scope, collection minted (or re-adopted from a\n  matching untick tombstone, same as :func:`confirm_scope`) \u2014 UNLESS\n  ``body.collection_id``/``body.collection`` names a shared target, in\n  which case every scope this call creates routes there instead (no\n  per-path mint, no tombstone re-adoption); each entry is `{\"path\",\n  **scope}` (the same projection ``GET \u2026/scopes`` returns).\n* **skipped** \u2014 the path resolved to a ``source_scope_id`` ALREADY\n  present among this connection's scopes (the idempotency key\n  :func:`confirm_scope` itself uses) \u2014 ``{\"path\", \"source_scope_id\",\n  \"reason\": \"already_present\"}``.\n* **failed** \u2014 Graph could not resolve the path: ``{\"path\", \"reason\"}``\n  with ``reason`` one of ``\"not_found\"`` (404) or ``\"forbidden\"``\n  (403) \u2014 the same routine-permissions-fact classification\n  :func:`connectors.sharepoint.graph_client.search_folders` already\n  uses, never surfaced as a whole-request failure.\n\nAny OTHER Graph failure (401/429/5xx, a network fault) is not a\nper-path fact \u2014 it means the whole call is broken, same rule\n:func:`connectors.sharepoint.graph_client.search_folders` documents \u2014\nand aborts the remaining, unprocessed paths with a typed ``502\nsharepoint_graph_error``; whatever was already resolved and created\nbefore that point is still persisted (already-report paths are not\nrolled back by a later path's outage).\n\n``drive_id`` is required unless this connection already has at least\none scope with one set (reused from the first match) \u2014 a brand-new\nconnection with zero scopes (:func:`clone_connection`'s own starting\npoint) must supply it explicitly (``400 drive_id_required``\notherwise); a malformed one is a typed ``422`` (see\n:func:`_validate_graph_id`), same as ``POST \u2026/scopes``'s own\n``drive_id``.\n\n``collection_id``/``collection`` (mutually exclusive \u2014 ``400\nboth_collection_id_and_collection``) route every scope THIS call\ncreates to ONE shared collection instead of minting one per path \u2014 the\nfix for a large site otherwise forking across as many collections as\nthere are confirmed scopes across the split's several connections.\n``collection_id`` must name an existing, live collection\n(``404 collection_not_found`` otherwise); ``collection`` mints a new\none, by name. A path already ``skipped`` (already present) keeps\nwhatever collection it already owns \u2014 the shared target never moves an\nexisting scope.",
         "operationId": "bulk_add_scopes_api_admin_sharepoint_connections__connection_id__scopes_bulk_post",
         "parameters": [
           {
@@ -54681,6 +55039,70 @@
         ]
       }
     },
+    "/api/semantic-models/builder/turn": {
+      "post": {
+        "description": "Run one turn of the semantic-model builder. Proposes; never writes.\n\nStateless like ``entity_builder`` \u2014 a model has no row until *Save*\n(``POST /api/semantic-models/apply``), so the draft travels in the\nrequest and nothing here reads or writes ``semantic_models``. Open to\nanyone signed in: an admin's eventual Save publishes, anyone else's\nqueues for review, but drafting is not itself gated on that.",
+        "operationId": "semantic_model_builder_turn_api_semantic_models_builder_turn_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SemanticModelTurnRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Semantic Model Builder Turn",
+        "tags": [
+          "semantic-models"
+        ]
+      }
+    },
     "/api/semantic-models/bundle": {
       "get": {
         "description": "RBAC-scoped bundle of every accessible ``status='valid'`` semantic\nmodel, consumed by ``agnes pull`` to render the read-only local cache\nunder ``<workspace>/semantic/<slug>/\u2026`` (F\u00e1ze 1 \u2014 \"distribuce jako\nfyzick\u00e1 cache s TTL\"; ``src/semantic/cache_render.py`` does the actual\nrendering, client-side, from this response).\n\nSame delivery-channel shape and same non-interactive posture as\n``/api/memory/bundle`` and ``/api/knowledge/digests/{digest_id}/\ncontent`` \u2014 one GET the CLI calls on every pull, never an agent tool\n(see the triple-surface ``_EXEMPT`` entry). Same RBAC tier as search/\nexport/context (``_can_read_model``): admin, a grant on the model\nitself, or a grant on a Data Package it's linked to.\n\nEach model entry carries its own ``content_hash`` (the same\n``semantic_models.content_hash`` every other surface reads \u2014 never\nrecomputed) and the full ``document_json`` the renderer needs; the\ntop-level ``ttl_seconds`` is the value the CLI stamps into every\nrendered file's header and the TTL an agent's local-cache trust policy\n(``config/claude_md_template.txt``) is written against.",
@@ -67533,6 +67955,56 @@
           }
         },
         "summary": "Semantic Layer List",
+        "tags": [
+          "web"
+        ]
+      }
+    },
+    "/semantic-layer/new": {
+      "get": {
+        "description": "Author one Ossie document \u2014 the Definitions page's **+ New model** card.\n\nNot admin-only, because ``POST /api/semantic-models/apply`` is not: an\nadmin's document is published, anyone else's is queued for moderation.\nWhat *is* conditional is whether authoring can succeed at all \u2014 see\n:func:`_can_author_semantic_model` \u2014 and a caller for whom it cannot gets\nthis page explaining why rather than a 404 (the feature exists) or a\nredirect home (which loses the reason). Same posture as ``/admin/ontology``\nwith the ``facts`` flag off.",
+        "operationId": "semantic_model_builder_page_semantic_layer_new_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Semantic Model Builder Page",
         "tags": [
           "web"
         ]

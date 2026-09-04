@@ -90,6 +90,9 @@ def test_overlay_command_sets_every_derived_and_fixed_knob():
     assert flags["work_mem"] == "${AGNES_PG_WORK_MEM:-16MB}"
     assert flags["maintenance_work_mem"] == "${AGNES_PG_MAINTENANCE_WORK_MEM:-256MB}"
     assert flags["max_parallel_workers_per_gather"] == "${AGNES_PG_MAX_PARALLEL_WORKERS_PER_GATHER:-2}"
+    # Derived from extraction_worker_replicas, not RAM (TCRD-296 gap #76);
+    # :-100 matches Postgres' own stock default.
+    assert flags["max_connections"] == "${AGNES_PG_MAX_CONNECTIONS:-100}"
     # Fixed knobs — literals, not env-var indirected, because they never vary
     # with VM size.
     assert flags["max_wal_size"] == "8GB"

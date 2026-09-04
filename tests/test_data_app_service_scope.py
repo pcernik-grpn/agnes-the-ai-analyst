@@ -298,6 +298,57 @@ def test_no_request_fails_closed(client):
 
 
 # --------------------------------------------------------------------------
+# The admin bypass (§12) must not follow the service token
+# --------------------------------------------------------------------------
+#
+# The scope allowlist above governs WHICH paths the token can reach; it says
+# nothing about WHAT the token sees once there. A data app owned by an Admin
+# is a second, independent way that Admin-ness could leak through: if the
+# token is minted with the repository's default `surface="all"`, every table
+# access policy is skipped outright on every read the app makes (see
+# `src/access_policy.py::_is_admin_bypass` and
+# `docs/table-access-policies.md` -- "The admin bypass"), even though a
+# non-admin can be granted the very same app via `_can_view`.
+
+
+def test_mint_service_token_uses_the_stack_surface(client):
+    """`_mint_service_token` must mint with `surface="stack"`, not the
+    repository's `surface="all"` default -- otherwise an Admin-owned app
+    reads with the admin bypass instead of the owner's filtered view."""
+    from app.api.data_apps import _mint_service_token
+    from src.repositories import access_token_repo
+
+    owner = {"id": "u1", "email": "owner@test.com"}
+    token_id, _jwt = _mint_service_token("demo", owner)
+
+    record = access_token_repo().get_by_id(token_id)
+    assert record is not None, "the token row must exist after minting"
+    assert record["surface"] == "stack", (
+        "a service token minted without surface='stack' lets an admin-owned data app bypass every table access policy"
+    )
+
+
+def test_admin_owned_service_token_does_not_bypass_access_policies(client):
+    """Model exactly what `pat_resolver.resolve_token_to_user` stashes on the
+    user dict once a service token is minted with `surface="stack"`: an Admin
+    owner must still be filtered by `_is_admin_bypass`, the same way a
+    `surface='stack'` PAT from `agnes init` is (§12)."""
+    from src.access_policy import _is_admin_bypass
+    from src.db import SYSTEM_ADMIN_GROUP, get_system_db
+    from src.repositories.user_group_members import UserGroupMembersRepository
+
+    conn = get_system_db()
+    admin_gid = conn.execute("SELECT id FROM user_groups WHERE name = ?", [SYSTEM_ADMIN_GROUP]).fetchone()[0]
+    UserGroupMembersRepository(conn).add_member("u1", admin_gid, source="system_seed")
+    conn.close()
+
+    principal = {"id": "u1", "email": "owner@test.com", "credential_surface": "stack"}
+    assert _is_admin_bypass(principal) is False, (
+        "an admin-owned data app's service token must be filtered by access policies, not admin-bypass them"
+    )
+
+
+# --------------------------------------------------------------------------
 # The structural guard
 # --------------------------------------------------------------------------
 
@@ -312,7 +363,6 @@ def test_documented_allowlist_names_exist():
     guard whose message names the wrong fix.
     """
     import re
-
     from pathlib import Path
 
     import app.auth.pat_resolver as mod

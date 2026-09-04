@@ -43,7 +43,7 @@ matches a bigger or smaller `machine_type`. Re-derived on EVERY boot
 | `extraction_worker_mem_limit` | `RAM × 0.6`, capped so app + worker + an 8 GiB headroom (Postgres + host) never exceeds the VM's actual RAM, floored at 4 GiB |
 | Postgres `shared_buffers` | `25% of RAM`, capped at `32 GiB` |
 | Postgres `effective_cache_size` | `60% of RAM` |
-| Postgres `work_mem` | `clamp(RAM / 512, 16 MiB, 128 MiB)` |
+| Postgres `work_mem` | `clamp(RAM / 512, 16 MiB, 256 MiB)` |
 | Postgres `maintenance_work_mem` | `min(RAM / 16, 4 GiB)` |
 | Postgres `max_wal_size` | fixed `8GB` |
 | Postgres `wal_compression` | fixed `on` |
@@ -51,6 +51,7 @@ matches a bigger or smaller `machine_type`. Re-derived on EVERY boot
 | Postgres `max_parallel_workers_per_gather` | `min(4, vCPU / 8)` |
 | Postgres `jit` | fixed `off` (measured slower on this app's visibility CTEs) |
 | Postgres `shm_size` (Docker's `/dev/shm`) | `2% of RAM`, floored at `256 MiB` |
+| Postgres `max_connections` | `max(100, 15 + 15 + extraction_worker_replicas × 16 + 40)` — see *Sizing an extraction instance* below |
 
 Set an explicit value (e.g. `app_mem_limit = "8g"`) to override `"auto"`
 outright — a hand-set value always wins, same precedence as every other
@@ -69,6 +70,65 @@ path in the next section documents the equivalent manual step for a
 self-hosted install. See *Sizing the Postgres side-car* below for the
 `ALTER SYSTEM` precedence caveat and how new sizing reaches an EXISTING VM
 (a recreate, not a live retune).
+
+#### Sizing an extraction instance
+
+`extraction_worker_replicas` (per-VM field on `prod_instance` /
+`dev_instances[*]`, default `1`) runs more than one `extraction-worker`
+compose replica (`docker compose up -d --scale extraction-worker=N`) — the
+knob for pushing facts-extraction throughput past what a single container's
+`extraction.concurrency` lane count can do. **Live finding (TCRD-296 gap
+#76):** an operator ran six replicas by hand on a 64-vCPU / 252 GiB VM to
+keep up with a backlog. Nothing in Terraform remembered that scale — the
+next recreate silently dropped it back to one — and six replicas each sizing
+a Postgres connection pool from the SAME per-process runtime hint
+(`src/db_pg.py::_extraction_worker_pool_size_hint`, designed for exactly ONE
+replica) exhausted the side-car's stock 100-connection cap ("FATAL: sorry,
+too many clients already"), worked around by hand with `AGNES_PG_POOL_SIZE`/
+`AGNES_PG_MAX_OVERFLOW` in `.env` (which — set there — also shrank the
+`app`/`scheduler` pools, not just the worker's) and a manual `ALTER SYSTEM
+SET max_connections`.
+
+Raising `extraction_worker_replicas` now handles all three pieces from the
+module, together:
+
+1. **The scale itself** is threaded through every `docker compose up` that
+   could otherwise recreate the stack — the boot sequence's tolerant
+   extraction-worker bring-up AND the recurring `agnes-auto-upgrade` tick's
+   drift-gated recreate — from the ONE `AGNES_EXTRACTION_WORKER_REPLICAS`
+   value written into `.env`, so a routine recreate can never silently
+   collapse it back to one container.
+2. **`max_connections`** grows with it: `max(100, 15 + 15 + replicas × 16 +
+   40)` — 15 each for `app`/`scheduler` (their own unchanged
+   `pool_size(5) + max_overflow(10)` defaults from `src/db_pg.py`), 16 per
+   extraction-worker replica (a conservative constant, not derived from
+   `extraction.concurrency` — see point 3), 40 headroom for manual
+   `psql`/monitoring connections. At the default of 1 replica this clamps to
+   Postgres' OWN stock default (100), so nothing changes for an instance
+   that never touches the field.
+3. **The extraction-worker's own pool** is pinned explicitly — only when
+   `extraction_worker_replicas > 1` — to `AGNES_PG_POOL_SIZE=8` /
+   `AGNES_PG_MAX_OVERFLOW=8` (the same conservative constant `max_connections`
+   reserved room for: 2x the default per-process hint's own sizing for ONE
+   replica, `extraction.concurrency`(1) + `extraction.facts.concurrency`(3) =
+   4 lanes). This override reaches ONLY the `extraction-worker` compose
+   service (an additive `environment:` merge, the same mechanism the
+   OpenBLAS thread-count pins use) — `app` and `scheduler` are never touched
+   and keep sizing their own pools from `src/db_pg.py`'s plain defaults.
+
+Worked example, the live 6-replica / 252 GiB VM: `max_connections = 15 + 15
++ 6 × 16 + 40 = 166`; each replica gets `AGNES_PG_POOL_SIZE=8` +
+`AGNES_PG_MAX_OVERFLOW=8` (16 connections), for a worst-case total of `6 ×
+16 = 96` — comfortably inside the 166 the side-car now allows.
+
+If your own `extraction.concurrency` / `extraction.facts.concurrency`
+(`instance.yaml`, runtime-editable — see *Scaling the extraction lane*
+below) push a single replica's ACTUAL pool usage past 16 connections, raise
+`AGNES_PG_POOL_SIZE`/`AGNES_PG_MAX_OVERFLOW` and `max_connections` by hand to
+match (`ALTER SYSTEM SET max_connections = ...; SELECT pg_reload_conf();` —
+`max_connections` additionally needs a full Postgres restart, not just a
+reload) — the module's constant is a safe default for the common case, not a
+hard ceiling.
 
 ### Host monitoring with Datadog
 
@@ -268,8 +328,16 @@ AGNES_PG_WORK_MEM=64MB
 AGNES_PG_MAINTENANCE_WORK_MEM=2048MB
 AGNES_PG_MAX_PARALLEL_WORKERS_PER_GATHER=1
 AGNES_PG_SHM_SIZE=655m
+AGNES_PG_MAX_CONNECTIONS=100
 EOF
 ```
+
+Running more than one `extraction-worker` container by hand (`docker compose
+up -d --scale extraction-worker=N`)? Raise `AGNES_PG_MAX_CONNECTIONS`
+accordingly and pin `AGNES_PG_POOL_SIZE`/`AGNES_PG_MAX_OVERFLOW` on that
+service specifically (not via a top-level `.env` line, which would also
+shrink `app`/`scheduler`'s pools) — see *Sizing an extraction instance*
+above for the formula the Terraform module applies automatically.
 
 **`ALTER SYSTEM` wins over these flags.** An admin who ran `ALTER SYSTEM SET
 work_mem = '...'` (or any other tuning GUC) by hand on a running instance has

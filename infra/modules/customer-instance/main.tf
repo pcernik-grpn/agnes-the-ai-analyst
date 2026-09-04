@@ -809,28 +809,29 @@ resource "google_compute_instance" "vm" {
     # home_route / studio_enabled are likewise NOT forwarded as separate
     # template vars (D1, 2026-08) — see the theme/experience note above; both
     # ride instance_branding_b64 now.
-    data_apps_enabled            = each.value.data_apps_enabled
-    data_apps_subdomain_base     = each.value.data_apps_subdomain_base
-    data_apps_runtime_image      = var.data_apps_runtime_image
-    enable_watchdog              = var.enable_watchdog
-    cloud_logging_logs_active    = local.cloud_logging_logs_active
-    alert_webhook_url            = var.alert_webhook_url
-    watchdog_files_b64           = local.watchdog_files_b64
-    ops_agent_config_b64         = local.ops_agent_config_b64
-    enable_datadog               = var.enable_datadog
-    datadog_api_key_secret       = var.datadog_api_key_secret
-    datadog_agent_version        = var.datadog_agent_version
-    datadog_files_b64            = local.datadog_files_b64[each.value.name]
-    dispatcher_enabled           = each.value.dispatcher_enabled
-    dispatcher_image             = var.dispatcher_image
-    dispatcher_key_secret        = var.dispatcher_key_secret
-    dispatcher_vertex_sa_secret  = var.dispatcher_vertex_sa_secret
-    dispatcher_policies_b64      = base64encode(var.dispatcher_policies)
-    kai_agent_enabled            = each.value.kai_agent_enabled
-    kai_agent_mem_limit          = each.value.kai_agent_mem_limit
-    kai_agent_cpus               = each.value.kai_agent_cpus
-    kai_agent_pg_mem_limit       = each.value.kai_agent_pg_mem_limit
-    kai_agent_broker_mcp_enabled = each.value.kai_agent_broker_mcp_enabled
+    data_apps_enabled             = each.value.data_apps_enabled
+    data_apps_subdomain_base      = each.value.data_apps_subdomain_base
+    data_apps_runtime_image       = var.data_apps_runtime_image
+    enable_watchdog               = var.enable_watchdog
+    cloud_logging_logs_active     = local.cloud_logging_logs_active
+    alert_webhook_url             = var.alert_webhook_url
+    watchdog_files_b64            = local.watchdog_files_b64
+    ops_agent_config_b64          = local.ops_agent_config_b64
+    enable_datadog                = var.enable_datadog
+    datadog_api_key_secret        = var.datadog_api_key_secret
+    datadog_agent_version         = var.datadog_agent_version
+    datadog_files_b64             = local.datadog_files_b64[each.value.name]
+    dispatcher_enabled            = each.value.dispatcher_enabled
+    dispatcher_image              = var.dispatcher_image
+    dispatcher_key_secret         = var.dispatcher_key_secret
+    dispatcher_vertex_sa_secret   = var.dispatcher_vertex_sa_secret
+    dispatcher_policies_b64       = base64encode(var.dispatcher_policies)
+    kai_agent_enabled             = each.value.kai_agent_enabled
+    kai_agent_mem_limit           = each.value.kai_agent_mem_limit
+    kai_agent_cpus                = each.value.kai_agent_cpus
+    kai_agent_pg_mem_limit        = each.value.kai_agent_pg_mem_limit
+    kai_agent_broker_mcp_enabled  = each.value.kai_agent_broker_mcp_enabled
+    kai_agent_broker_otlp_enabled = each.value.kai_agent_broker_otlp_enabled
     # Opt-in OTLP export (per-VM) + the deployment label. Only the SECRET
     # NAME reaches the template; the startup script fetches the value.
     otlp_endpoint               = each.value.otlp_endpoint
@@ -844,6 +845,7 @@ resource "google_compute_instance" "vm" {
     extraction_worker_image     = var.extraction_worker_image
     extraction_worker_mem_limit = each.value.extraction_worker_mem_limit
     extraction_worker_cpus      = each.value.extraction_worker_cpus
+    extraction_worker_replicas  = each.value.extraction_worker_replicas
     # Rendered to KEY=VALUE lines, base64'd like dispatcher_policies so no
     # value can break the template or the shell heredoc quoting.
     kai_agent_env_b64 = base64encode(join("\n", [

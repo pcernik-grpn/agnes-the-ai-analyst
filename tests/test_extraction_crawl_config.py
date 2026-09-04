@@ -474,7 +474,7 @@ const row = {json.dumps(row)};
         out = self._run("console.log(JSON.stringify({ html: _extRenderCrawlFilter(row) }));")
         html = out["html"]
         assert 'value=""' in html
-        assert "no filter — every file is crawled" in html
+        assert "no default filter" in html
 
     def test_save_and_clear_are_wired_to_this_connection(self):
         out = self._run(
@@ -590,7 +590,7 @@ async function fetch(url, opts) {{
             response_body={"min_modified": {"value": "2026-02-01", "source": "connection"}},
         )
         assert "2026-02-01" in out["status"]
-        assert "connection" in out["status"]
+        assert "default" in out["status"]
 
     def test_a_cleared_filter_reads_as_no_filter(self):
         out = self._run(
@@ -598,7 +598,7 @@ async function fetch(url, opts) {{
             input_value="2026-02-01",
             response_body={"min_modified": {"value": None, "source": "none"}},
         )
-        assert out["status"] == "Currently: no filter — every file is crawled."
+        assert out["status"] == "Currently: no default filter — a scope without its own filter is crawled unfiltered."
 
     def test_a_failed_save_toasts_the_servers_reason_and_clears_the_status(self):
         out = self._run(

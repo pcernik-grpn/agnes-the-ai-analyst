@@ -72,7 +72,15 @@ class TestThreeStepDrawer:
 
     def test_step2_has_anonymize_column_and_the_verbatim_note(self, seeded_app):
         body = _page(seeded_app)
-        assert "anonymize" in body
+        # The column is rendered by the wizard's externalized script, never
+        # by the template. Asserting "anonymize" on the response text alone
+        # used to pass off a COMMENT inside the page's inline <style>, which
+        # said nothing about the column existing; the styles now live in
+        # css/ds_page.css, so that accident is gone. Assert the script that
+        # actually draws it.
+        assert "anonymize" in Path("app/web/static/js/admin/data_sources_sharepoint_wizard.js").read_text(
+            encoding="utf-8"
+        )
         # The exact note text the spec requires (§13.2).
         assert "original file is not copied" in body
         assert "stores the extracted markdown" in body

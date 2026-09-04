@@ -2921,3 +2921,161 @@ class TestGetCollectionFilesPreview:
         assert body["files"] == []
         assert body["files_total"] == 0
         assert body["files_truncated"] is False
+
+
+# ---------------------------------------------------------------------------
+# Access-policy protection of derived tabular rows (#2147)
+#
+# A derived collection table is a normal `table_registry` row, so an admin can
+# attach a SQL access policy to it. Re-ingesting the file behind it PURGES that
+# row (policy included) and re-registers a fresh, unpolicied, distributable one
+# -- from `require_collection_access`, i.e. an ORDINARY collection member.
+# These tests pin that the re-ingest doors fail closed instead.
+# ---------------------------------------------------------------------------
+
+_DERIVED_POLICY = "SELECT * EXCLUDE (b) FROM t"
+
+
+def _upload_csv(seeded_app, corpus_id: str, name: str, content: bytes, *, token_key="analyst_token", **form):
+    c = seeded_app["client"]
+    return c.post(
+        f"/api/collections/{corpus_id}/files",
+        files={"files": (name, io.BytesIO(content), "text/csv")},
+        data=form or None,
+        headers=_auth(seeded_app[token_key]),
+    )
+
+
+def _derived_row(corpus_id: str) -> dict:
+    from src.repositories import table_registry_repo
+
+    rows = [r for r in table_registry_repo().list_by_source("collection") if r.get("bucket") == corpus_id]
+    assert len(rows) == 1, f"expected exactly one derived row, got {[r['id'] for r in rows]}"
+    return rows[0]
+
+
+def _policy_the_derived_row(corpus_id: str) -> str:
+    """Make the collection's derived table undistributed + policied, exactly
+    as an admin would through /admin/tables."""
+    from src.repositories import table_registry_repo
+
+    repo = table_registry_repo()
+    row = _derived_row(corpus_id)
+    repo.register(
+        id=row["id"],
+        name=row["name"],
+        source_type="collection",
+        bucket=corpus_id,
+        source_table=row["source_table"],
+        query_mode="local",
+        server_only=True,
+    )
+    repo.set_access_policy(row["id"], sql=_DERIVED_POLICY, note="pii", updated_by="admin@example.com")
+    return row["id"]
+
+
+def test_reingest_refused_while_derived_row_carries_an_access_policy(seeded_app):
+    """The escalation: an ordinary collection member re-ingests the file and
+    the admin's access policy is stripped off the derived table (and the table
+    becomes `agnes pull`-distributable again). Must be refused."""
+    from src.repositories import corpus_files_repo, table_registry_repo
+
+    c = seeded_app["client"]
+    corpus_id = c.post(
+        "/api/collections",
+        json={"name": "Policied Derived Reingest"},
+        headers=_auth(seeded_app["admin_token"]),
+    ).json()["id"]
+    _seed_collection_grant(corpus_id, "analyst1")
+
+    up = _upload_csv(seeded_app, corpus_id, "sales.csv", b"a,b\n1,2\n")
+    assert up.status_code == 201, up.text
+    file_id = up.json()[0]["file_id"]
+    table_id = _policy_the_derived_row(corpus_id)
+
+    r = c.post(
+        f"/api/collections/{corpus_id}/files/{file_id}/reingest",
+        headers=_auth(seeded_app["analyst_token"]),
+    )
+    assert r.status_code == 409, r.text
+    detail = r.json()["detail"]
+    assert detail["reason"] == "access_policy_protected_row"
+    assert detail["table_id"] == table_id
+    assert detail["fix"]
+
+    # Nothing was purged, nothing was reset.
+    row = table_registry_repo().get(table_id)
+    assert row is not None
+    assert row["access_policy_sql"] == _DERIVED_POLICY
+    assert bool(row["server_only"]) is True
+    assert corpus_files_repo().get(file_id)["processing_status"] == "indexed"
+
+
+def test_reingest_of_an_unpolicied_derived_row_still_works(seeded_app):
+    """Control: same shape, no policy -- the re-ingest path is untouched."""
+    from src.repositories import corpus_files_repo
+
+    c = seeded_app["client"]
+    corpus_id = c.post(
+        "/api/collections",
+        json={"name": "Plain Derived Reingest"},
+        headers=_auth(seeded_app["admin_token"]),
+    ).json()["id"]
+    _seed_collection_grant(corpus_id, "analyst1")
+
+    up = _upload_csv(seeded_app, corpus_id, "sales.csv", b"a,b\n1,2\n")
+    assert up.status_code == 201, up.text
+    file_id = up.json()[0]["file_id"]
+
+    r = c.post(
+        f"/api/collections/{corpus_id}/files/{file_id}/reingest",
+        headers=_auth(seeded_app["analyst_token"]),
+    )
+    assert r.status_code == 202, r.text
+    assert corpus_files_repo().get(file_id)["processing_status"] == "indexed"
+    assert _derived_row(corpus_id)["id"]  # rebuilt
+
+
+def test_reupload_over_a_policied_derived_row_is_refused(seeded_app):
+    """The same strip, through the other door: re-uploading changed content at
+    the same logical `path` updates the row IN PLACE, purging + re-registering
+    the very same deterministic table_id."""
+    from src.repositories import table_registry_repo
+
+    c = seeded_app["client"]
+    corpus_id = c.post(
+        "/api/collections",
+        json={"name": "Policied Derived Reupload"},
+        headers=_auth(seeded_app["admin_token"]),
+    ).json()["id"]
+    _seed_collection_grant(corpus_id, "analyst1")
+
+    up = _upload_csv(seeded_app, corpus_id, "sales.csv", b"a,b\n1,2\n", paths="data/sales.csv")
+    assert up.status_code == 201, up.text
+    table_id = _policy_the_derived_row(corpus_id)
+
+    again = _upload_csv(seeded_app, corpus_id, "sales.csv", b"a,b\n9,9\n", paths="data/sales.csv")
+    assert again.status_code == 409, again.text
+    assert again.json()["detail"]["reason"] == "access_policy_protected_row"
+
+    row = table_registry_repo().get(table_id)
+    assert row is not None and row["access_policy_sql"] == _DERIVED_POLICY
+
+
+def test_reupload_of_unchanged_content_over_a_policied_row_is_allowed(seeded_app):
+    """Byte-identical re-upload of an already-indexed file purges nothing, so
+    there is nothing to refuse -- the guard must not turn a no-op resync into
+    an error."""
+    c = seeded_app["client"]
+    corpus_id = c.post(
+        "/api/collections",
+        json={"name": "Policied Derived Resync"},
+        headers=_auth(seeded_app["admin_token"]),
+    ).json()["id"]
+    _seed_collection_grant(corpus_id, "analyst1")
+
+    assert _upload_csv(seeded_app, corpus_id, "sales.csv", b"a,b\n1,2\n", paths="data/sales.csv").status_code == 201
+    _policy_the_derived_row(corpus_id)
+
+    again = _upload_csv(seeded_app, corpus_id, "sales.csv", b"a,b\n1,2\n", paths="data/sales.csv")
+    assert again.status_code == 201, again.text

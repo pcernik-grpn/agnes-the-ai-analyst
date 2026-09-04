@@ -307,6 +307,81 @@ class TestScopeBulkAdd:
         assert result.exit_code == 1
         assert "drive_id was not supplied" in result.output
 
+    def test_min_modified_rides_the_payload(self):
+        """TCRD-296 gap #80 — a bulk default: every scope this call creates
+        gets its OWN `min_modified` filter, stored via the SAME PATCH-like
+        `POST .../scopes/bulk` confirm this command already sends."""
+        body = {"created": [{"path": "A"}], "skipped": [], "failed": []}
+        with patch("cli.commands.admin_sharepoint.api_post", return_value=_resp(200, body)) as mock_post:
+            result = runner.invoke(
+                app,
+                ["admin", "sharepoint", "scope", "bulk-add", "conn1", "--path", "A", "--min-modified", "2024-03-01"],
+            )
+        assert result.exit_code == 0, result.output
+        _, kwargs = mock_post.call_args
+        assert kwargs["json"] == {"paths": ["A"], "min_modified": "2024-03-01"}
+
+    def test_an_invalid_min_modified_is_a_clean_local_error(self):
+        result = runner.invoke(
+            app,
+            ["admin", "sharepoint", "scope", "bulk-add", "conn1", "--path", "A", "--min-modified", "not-a-date"],
+        )
+        assert result.exit_code == 1
+        assert "ISO YYYY-MM-DD date" in result.output
+
+
+class TestScopeList:
+    """`agnes admin sharepoint scope list` — CLI counterpart to
+    `GET /api/admin/sharepoint/connections/{connection_id}/scopes` (TCRD-296
+    gap #80: shows each scope's effective "modified since" crawl filter)."""
+
+    def test_prints_a_table_with_the_effective_filter_per_scope(self):
+        body = {
+            "items": [
+                {
+                    "source_scope_id": "drv:a",
+                    "display_path": "Site / Docs",
+                    "collection": {"id": "c1", "slug": "docs", "name": "Docs"},
+                    "min_modified": {"value": "2024-01-01", "source": "scope", "own_value": "2024-01-01"},
+                },
+                {
+                    "source_scope_id": "drv:b",
+                    "display_path": "Site / Reports",
+                    "collection": {"id": "c2", "slug": "reports", "name": "Reports"},
+                    "min_modified": {"value": "2023-01-01", "source": "connection", "own_value": None},
+                },
+                {
+                    "source_scope_id": "drv:c",
+                    "display_path": "Site / Misc",
+                    "collection": None,
+                    "min_modified": {"value": None, "source": "none", "own_value": None},
+                },
+            ],
+            "zones": [],
+        }
+        with patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(200, body)) as mock_get:
+            result = runner.invoke(app, ["admin", "sharepoint", "scope", "list", "conn1"])
+        assert result.exit_code == 0, result.output
+        mock_get.assert_called_once_with("/api/admin/sharepoint/connections/conn1/scopes")
+        assert "since 2024-01-01" in result.output
+        assert "since 2023-01-01 (default)" in result.output
+        assert "drv:a" in result.output and "drv:b" in result.output and "drv:c" in result.output
+
+    def test_json_output_is_the_raw_response(self):
+        body = {"items": [{"source_scope_id": "drv:a"}], "zones": []}
+        with patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(200, body)):
+            result = runner.invoke(app, ["admin", "sharepoint", "scope", "list", "conn1", "--json"])
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.output) == body
+
+    def test_404_is_reported_and_exits_nonzero(self):
+        with patch(
+            "cli.commands.admin_sharepoint.api_get",
+            return_value=_resp(404, {"detail": {"error": "connection_not_found"}}),
+        ):
+            result = runner.invoke(app, ["admin", "sharepoint", "scope", "list", "does-not-exist"])
+        assert result.exit_code == 1
+
 
 class TestConnectionClone:
     """`agnes admin sharepoint connection clone` — CLI counterpart to
@@ -791,6 +866,95 @@ class TestShardPlanCmd:
             result = runner.invoke(app, ["admin", "sharepoint", "shard-plan", "conn1"])
         assert result.exit_code == 1
         assert "no certificate configured" in result.output
+
+
+class TestAclSnapshotCmd:
+    """`agnes admin sharepoint acl-snapshot` — CLI counterpart to
+    `GET /api/admin/sharepoint/connections/{connection_id}/acl-snapshot`
+    (TCRD-296 gap #79)."""
+
+    def _body(self):
+        return {
+            "aggregate": {
+                "entra_groups": 2,
+                "site_groups": 1,
+                "folders_with_org_links": 1,
+                "folders_with_individual_users": 3,
+                "scopes_captured": 4,
+                "captured_at": "2026-09-04T00:00:00+00:00",
+            }
+        }
+
+    def test_bare_call_prints_the_aggregate_and_no_scopes_param(self):
+        with patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(200, self._body())) as mock_get:
+            result = runner.invoke(app, ["admin", "sharepoint", "acl-snapshot", "conn1"])
+        assert result.exit_code == 0, result.output
+        assert "2 Entra group(s)" in result.output
+        assert "1 site group(s)" in result.output
+        assert "4 scope(s) captured" in result.output
+        args, kwargs = mock_get.call_args
+        assert args[0] == "/api/admin/sharepoint/connections/conn1/acl-snapshot"
+        assert kwargs["params"] == {}
+
+    def test_nothing_captured_yet_is_named_honestly(self):
+        body = {
+            "aggregate": {
+                "entra_groups": 0,
+                "site_groups": 0,
+                "folders_with_org_links": 0,
+                "folders_with_individual_users": 0,
+                "scopes_captured": 0,
+                "captured_at": None,
+            }
+        }
+        with patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(200, body)):
+            result = runner.invoke(app, ["admin", "sharepoint", "acl-snapshot", "conn1"])
+        assert result.exit_code == 0, result.output
+        assert "nothing captured yet" in result.output
+
+    def test_scopes_flag_rides_the_query_and_prints_per_scope_rows(self):
+        body = {
+            **self._body(),
+            "scopes": [
+                {
+                    "source_scope_id": "s1",
+                    "display_path": "Site / Docs / Finance",
+                    "principals": [
+                        {"principal_kind": "entra_group", "display_name": "Finance Team"},
+                        {"principal_kind": "user", "display_name": "Alice"},
+                    ],
+                }
+            ],
+        }
+        with patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(200, body)) as mock_get:
+            result = runner.invoke(app, ["admin", "sharepoint", "acl-snapshot", "conn1", "--scopes"])
+        assert result.exit_code == 0, result.output
+        _, kwargs = mock_get.call_args
+        assert kwargs["params"] == {"scopes": "true"}
+        assert "Site / Docs / Finance" in result.output
+        assert "Finance Team (entra_group)" in result.output
+        assert "Alice (user)" in result.output
+
+    def test_json_output(self):
+        body = self._body()
+        with patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(200, body)):
+            result = runner.invoke(app, ["admin", "sharepoint", "acl-snapshot", "conn1", "--json"])
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.output) == body
+
+    def test_duckdb_typed_501_is_reported(self):
+        # The app-wide RequiresPostgresBackend handler (app/main.py) sends
+        # `detail` as a plain STRING, not a nested object — see
+        # src/repository_errors.py::RequiresPostgresBackend.
+        body = {
+            "detail": "'sharepoint_state' requires the Postgres app-state backend.",
+            "error": "requires_postgres_backend",
+            "feature": "sharepoint_state",
+        }
+        with patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(501, body)):
+            result = runner.invoke(app, ["admin", "sharepoint", "acl-snapshot", "conn1"])
+        assert result.exit_code == 1
+        assert "requires the Postgres app-state backend" in result.output
 
 
 class TestSplitPlanCmd:

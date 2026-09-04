@@ -94,6 +94,11 @@ CATALOG: dict[str, AuditEvent] = {
         "read",
         "An admin previewed a table access policy's effect across every group.",
     ),
+    "access_policy.preview_matrix": AuditEvent(
+        "access_policy.preview_matrix",
+        "read",
+        "An admin previewed a table access policy's effect across a persona matrix.",
+    ),
     "attachment.download": AuditEvent("attachment.download", "read", "A chat attachment was downloaded."),
     "catalog.list": AuditEvent("catalog.list", "read", "The table/dataset catalog was listed."),
     "catalog.sample": AuditEvent("catalog.sample", "read", "A table sample was fetched via the catalog."),
@@ -602,6 +607,12 @@ CATALOG: dict[str, AuditEvent] = {
         "semantic_model.unlink_package",
         "mutation",
         "An admin unlinked a semantic model from a Data Package.",
+    ),
+    "semantic_model.builder_turn": AuditEvent(
+        "semantic_model.builder_turn",
+        "mutation",
+        "A caller exchanged one turn with the semantic-model builder assistant. Writes nothing itself — "
+        "the draft lives in the browser until Save (semantic_model.create / authoring_suggestion.submit).",
     ),
     # The coverage-tag pair writes no row of its own; these two exist so the
     # fallback middleware emits a real domain action for it, since Wave 2 —
@@ -1115,6 +1126,13 @@ CATALOG: dict[str, AuditEvent] = {
     ),
     "memory.admin_audit_read": AuditEvent(
         "memory.admin_audit_read", "read", "An admin read the corporate-memory governance audit trail."
+    ),
+    "sharepoint_connection.acl_snapshot_read": AuditEvent(
+        "sharepoint_connection.acl_snapshot_read",
+        "read",
+        "An admin read a SharePoint connection's captured ACL-permissions snapshot "
+        "(who SharePoint itself says can see each scope) — informational metadata, "
+        "independent of access_mode.",
     ),
     "sharepoint_connection.certificate_read": AuditEvent(
         "sharepoint_connection.certificate_read",

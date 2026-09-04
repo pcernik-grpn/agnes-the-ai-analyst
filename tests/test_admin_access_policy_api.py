@@ -1924,3 +1924,469 @@ class TestPreviewFailuresCarryNoEngineDetail:
             assert "brittle_tbl" in group["error"]
         assert "secret_dropped_column" not in resp.text
         assert "Binder Error" not in resp.text
+
+
+# ── POST /policy/preview-matrix (design doc §13.1, issue #2147) ───────
+
+
+@pytest.fixture
+def policied_invoices_with_granted_groups(seeded_app, mock_extract_factory, monkeypatch):
+    """A ``server_only`` table, a policy that partitions rows by
+    ``$user_groups``, and two REAL groups (``Finance``/``Ops``) each with
+    one real user AND a data-package grant of their own — so
+    ``_policy_preview_group_set_personas`` finds exactly the two disjoint
+    group-sets ``{Finance}`` / ``{Ops}`` (not the wider set a shared
+    ``analyst-pkg-grants`` wrapper group would introduce, which is why this
+    grants the package directly to the SAME two groups the policy checks,
+    rather than reusing ``grant_table_via_package``'s own auto-named group).
+    """
+    from src.db import get_system_db
+    from src.orchestrator import SyncOrchestrator
+    from src.repositories.data_packages import DataPackagesRepository
+    from src.repositories.resource_grants import ResourceGrantsRepository
+    from src.repositories.table_registry import TableRegistryRepository
+    from src.repositories.user_group_members import UserGroupMembersRepository
+    from src.repositories.user_groups import UserGroupsRepository
+    from src.repositories.users import UserRepository
+
+    monkeypatch.setenv("AGNES_ACCESS_POLICIES_ENABLED", "1")
+
+    env = seeded_app["env"]
+    mock_extract_factory(
+        "keboola",
+        [
+            {
+                "name": "matrix_invoices",
+                "data": [
+                    {"id": "1", "unit": "Finance", "amount": "100"},
+                    {"id": "2", "unit": "Finance", "amount": "150"},
+                    {"id": "3", "unit": "Ops", "amount": "300"},
+                ],
+            }
+        ],
+    )
+    SyncOrchestrator(analytics_db_path=env["analytics_db"]).rebuild()
+
+    conn = get_system_db()
+    try:
+        TableRegistryRepository(conn).register(
+            id="matrix_invoices",
+            name="matrix_invoices",
+            source_type="keboola",
+            query_mode="local",
+            server_only=True,
+        )
+        TableRegistryRepository(conn).set_access_policy(
+            "matrix_invoices",
+            sql="SELECT * FROM matrix_invoices WHERE list_contains($user_groups, unit)",
+            note="restrict to the caller's unit",
+            updated_by="admin",
+        )
+
+        groups = UserGroupsRepository(conn)
+        finance_gid = groups.create(name="Finance", created_by="test")["id"]
+        ops_gid = groups.create(name="Ops", created_by="test")["id"]
+
+        users = UserRepository(conn)
+        users.create(id="u_matrix_finance", email="matrix-finance@example.com", name="Finance")
+        users.create(id="u_matrix_ops", email="matrix-ops@example.com", name="Ops")
+
+        members = UserGroupMembersRepository(conn)
+        members.add_member("u_matrix_finance", finance_gid, source="admin")
+        members.add_member("u_matrix_ops", ops_gid, source="admin")
+
+        pkgs = DataPackagesRepository(conn)
+        pkg_id = pkgs.create(
+            name="Matrix test pkg",
+            slug="_test-pkg-matrix-invoices",
+            description=None,
+            icon=None,
+            color=None,
+            created_by="test",
+        )
+        pkgs.add_table(pkg_id, "matrix_invoices", added_by="test")
+
+        grants = ResourceGrantsRepository(conn)
+        grants.create(group_id=finance_gid, resource_type="data_package", resource_id=pkg_id, requirement="required")
+        grants.create(group_id=ops_gid, resource_type="data_package", resource_id=pkg_id, requirement="required")
+    finally:
+        conn.close()
+
+    return seeded_app
+
+
+@pytest.mark.journey
+class TestPolicyPreviewMatrix:
+    """``POST .../policy/preview-matrix`` (design doc §13.1, issue #2147) --
+    the persona MATRIX built from the same single-persona primitive
+    ``.../policy/preview`` uses, run once per persona instead of once for a
+    single admin-chosen one.
+    """
+
+    def test_matrix_partitioning_policy_shows_zero_overlap_and_full_union(
+        self, policied_invoices_with_granted_groups
+    ):
+        c = policied_invoices_with_granted_groups["client"]
+        token = policied_invoices_with_granted_groups["admin_token"]
+
+        resp = c.post(
+            "/api/admin/registry/matrix_invoices/policy/preview-matrix",
+            json={"personas": "group_sets"},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+
+        assert body["rows_total"] == 3
+        labels = {p["label"] for p in body["personas"]}
+        assert labels == {"Finance", "Ops"}
+
+        by_label = {p["label"]: p for p in body["personas"]}
+        assert by_label["Finance"]["rows_visible"] == 2
+        assert by_label["Ops"]["rows_visible"] == 1
+
+        # The two personas partition the table: their bounded samples never
+        # overlap, and together they cover every sampled row.
+        assert body["union_coverage"] == 1.0
+        assert body["no_op"] is False
+        assert body["pairwise_overlap"], "two personas must produce one pairwise entry"
+        for pair in body["pairwise_overlap"]:
+            assert pair["overlap_rows"] == 0
+            assert pair["overlap_fraction"] == 0.0
+
+    def test_matrix_never_includes_an_admin_persona(self, policied_invoices_with_granted_groups):
+        """The admin token's own account is a member of the system ``Admin``
+        group, which the god-mode bypass makes irrelevant to preview as a
+        persona (§13.1 task instructions) — it must never appear."""
+        c = policied_invoices_with_granted_groups["client"]
+        token = policied_invoices_with_granted_groups["admin_token"]
+
+        resp = c.post(
+            "/api/admin/registry/matrix_invoices/policy/preview-matrix",
+            json={"personas": "group_sets"},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200, resp.text
+        for persona in resp.json()["personas"]:
+            assert "Admin" not in persona["groups"]
+
+    def test_matrix_excludes_a_group_set_held_only_by_an_inactive_user(
+        self, policied_invoices_with_granted_groups
+    ):
+        """``_policy_preview_group_set_personas`` skips ``active is False``
+        users (app/api/admin.py's ``if u.get("active") is False: continue``)
+        -- a deactivated account's own, otherwise table-accessible group must
+        never seed a persona, even though ``can_access_table`` itself does
+        not check ``active`` (only stack/package membership). The fixture's
+        already-active Finance/Ops personas must be unaffected."""
+        from src.db import get_system_db
+        from src.repositories.data_packages import DataPackagesRepository
+        from src.repositories.resource_grants import ResourceGrantsRepository
+        from src.repositories.user_group_members import UserGroupMembersRepository
+        from src.repositories.user_groups import UserGroupsRepository
+        from src.repositories.users import UserRepository
+
+        conn = get_system_db()
+        try:
+            groups = UserGroupsRepository(conn)
+            legal_gid = groups.create(name="Legal", created_by="test")["id"]
+
+            users = UserRepository(conn)
+            users.create(id="u_matrix_legal", email="matrix-legal@example.com", name="Legal")
+            users.update(id="u_matrix_legal", active=False)
+
+            members = UserGroupMembersRepository(conn)
+            members.add_member("u_matrix_legal", legal_gid, source="admin")
+
+            pkgs = DataPackagesRepository(conn)
+            pkg_id = pkgs.create(
+                name="Matrix legal pkg",
+                slug="_test-pkg-matrix-legal",
+                description=None,
+                icon=None,
+                color=None,
+                created_by="test",
+            )
+            pkgs.add_table(pkg_id, "matrix_invoices", added_by="test")
+
+            grants = ResourceGrantsRepository(conn)
+            grants.create(
+                group_id=legal_gid,
+                resource_type="data_package",
+                resource_id=pkg_id,
+                requirement="required",
+            )
+        finally:
+            conn.close()
+
+        c = policied_invoices_with_granted_groups["client"]
+        token = policied_invoices_with_granted_groups["admin_token"]
+
+        resp = c.post(
+            "/api/admin/registry/matrix_invoices/policy/preview-matrix",
+            json={"personas": "group_sets"},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200, resp.text
+        group_sets = {tuple(p["groups"]) for p in resp.json()["personas"]}
+        assert ("Legal",) not in group_sets, "an inactive user's own group must never seed a persona"
+        assert ("Finance",) in group_sets
+        assert ("Ops",) in group_sets
+
+    def test_matrix_flags_a_no_op_policy(self, policied_invoices_with_granted_groups):
+        """A policy every persona sees 100% of, with a 100% union, is a
+        no-op (§13.1) -- the case a single-persona preview cannot itself
+        distinguish from "this persona happens to see everything"."""
+        from src.repositories import table_registry_repo
+
+        table_registry_repo().set_access_policy(
+            "matrix_invoices",
+            sql="SELECT * FROM matrix_invoices WHERE TRUE",
+            note="no-op: filters nothing",
+            updated_by="admin",
+        )
+
+        c = policied_invoices_with_granted_groups["client"]
+        token = policied_invoices_with_granted_groups["admin_token"]
+        resp = c.post(
+            "/api/admin/registry/matrix_invoices/policy/preview-matrix",
+            json={"personas": "group_sets"},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        by_label = {p["label"]: p for p in body["personas"]}
+        assert by_label["Finance"]["rows_visible"] == 3
+        assert by_label["Ops"]["rows_visible"] == 3
+        assert body["union_coverage"] == 1.0
+        assert body["no_op"] is True
+
+    def test_matrix_pairwise_overlap_catches_a_missing_else_branch(self, policied_invoices_with_granted_groups):
+        """The permissive bug §13.1 exists to catch: a `CASE` with a missing
+        branch falling through to the open arm means a group NOT explicitly
+        enumerated (``Ops``) sees the whole table, including the ``Finance``
+        persona's own rows -- a non-zero overlap where a partitioning policy
+        should show zero, rendered by ``pairwise_overlap`` even though
+        ``Finance`` itself does not see 100% (so this is not flagged
+        ``no_op`` -- see the dedicated no-op test above for that shape)."""
+        from src.repositories import table_registry_repo
+
+        table_registry_repo().set_access_policy(
+            "matrix_invoices",
+            sql=(
+                "SELECT * FROM matrix_invoices WHERE CASE "
+                "WHEN list_contains($user_groups, 'Finance') THEN unit = 'Finance' "
+                "ELSE TRUE END"
+            ),
+            note="buggy: should be ELSE FALSE",
+            updated_by="admin",
+        )
+
+        c = policied_invoices_with_granted_groups["client"]
+        token = policied_invoices_with_granted_groups["admin_token"]
+        resp = c.post(
+            "/api/admin/registry/matrix_invoices/policy/preview-matrix",
+            json={"personas": "group_sets"},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        by_label = {p["label"]: p for p in body["personas"]}
+        assert by_label["Finance"]["rows_visible"] == 2
+        assert by_label["Ops"]["rows_visible"] == 3
+        # The union still reaches 100% (Ops alone covers everything), but
+        # Finance's own coverage is only 2/3 -- not every persona sees 100%,
+        # so this is NOT the no_op shape.
+        assert body["union_coverage"] == 1.0
+        assert body["no_op"] is False
+        assert len(body["pairwise_overlap"]) == 1
+        pair = body["pairwise_overlap"][0]
+        assert pair["overlap_rows"] == 2
+        assert pair["overlap_fraction"] == 1.0
+
+    def test_matrix_extracts_policy_group_literals_from_a_case_body(self, policied_invoices_with_granted_groups):
+        c = policied_invoices_with_granted_groups["client"]
+        token = policied_invoices_with_granted_groups["admin_token"]
+
+        resp = c.post(
+            "/api/admin/registry/matrix_invoices/policy/preview-matrix",
+            json={
+                "sql": (
+                    "SELECT * FROM matrix_invoices WHERE CASE "
+                    "WHEN list_contains($user_groups, 'Finance') THEN unit = 'Finance' "
+                    "WHEN list_contains($user_groups, 'Ops') THEN unit = 'Ops' "
+                    "ELSE FALSE END"
+                ),
+                "personas": "policy_groups",
+            },
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        labels = {p["label"] for p in body["personas"]}
+        assert {"Finance", "Ops", "(no groups)"} <= labels
+
+        by_label = {p["label"]: p for p in body["personas"]}
+        assert by_label["Finance"]["rows_visible"] == 2
+        assert by_label["Ops"]["rows_visible"] == 1
+        assert by_label["(no groups)"]["rows_visible"] == 0
+
+    def test_matrix_extracts_the_unnest_in_form_and_ignores_an_unrelated_in_list(
+        self, policied_invoices_with_granted_groups
+    ):
+        """``_policy_preview_referenced_group_literals`` covers the
+        ``'x' IN (SELECT unnest($user_groups))`` idiom the docs name
+        alongside plain ``list_contains($user_groups, 'x')`` in the SAME
+        policy body, and must NOT mistake an unrelated ``col IN (...)``
+        literal list (no ``$user_groups`` anywhere on its right-hand side)
+        for a group-membership check."""
+        c = policied_invoices_with_granted_groups["client"]
+        token = policied_invoices_with_granted_groups["admin_token"]
+
+        resp = c.post(
+            "/api/admin/registry/matrix_invoices/policy/preview-matrix",
+            json={
+                "sql": (
+                    "SELECT * FROM matrix_invoices WHERE ("
+                    "'finance' IN (SELECT unnest($user_groups)) "
+                    "OR list_contains($user_groups, 'ops') "
+                    "OR id IN ('a', 'b'))"
+                ),
+                "personas": "policy_groups",
+            },
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200, resp.text
+        labels = {p["label"] for p in resp.json()["personas"]}
+        assert {"finance", "ops", "(no groups)"} <= labels
+        assert "a" not in labels
+        assert "b" not in labels
+
+    def test_matrix_truncates_at_the_configured_group_set_cap(self, policied_invoices_with_granted_groups):
+        from src.db import get_system_db
+        from src.repositories.data_packages import DataPackagesRepository
+        from src.repositories.resource_grants import ResourceGrantsRepository
+        from src.repositories.user_group_members import UserGroupMembersRepository
+        from src.repositories.user_groups import UserGroupsRepository
+        from src.repositories.users import UserRepository
+
+        conn = get_system_db()
+        try:
+            groups = UserGroupsRepository(conn)
+            users = UserRepository(conn)
+            members = UserGroupMembersRepository(conn)
+            pkgs = DataPackagesRepository(conn)
+            grants = ResourceGrantsRepository(conn)
+            pkg_id = pkgs.get_by_slug("_test-pkg-matrix-invoices")["id"]
+
+            # One extra distinct real group (each with its own single-user
+            # membership) is enough to push the total past a `limit: 1` cap.
+            gid = groups.create(name="Overflow", created_by="test")["id"]
+            users.create(id="u_matrix_overflow", email="matrix-overflow@example.com", name="Overflow")
+            members.add_member("u_matrix_overflow", gid, source="admin")
+            grants.create(group_id=gid, resource_type="data_package", resource_id=pkg_id, requirement="required")
+        finally:
+            conn.close()
+
+        c = policied_invoices_with_granted_groups["client"]
+        token = policied_invoices_with_granted_groups["admin_token"]
+        resp = c.post(
+            "/api/admin/registry/matrix_invoices/policy/preview-matrix",
+            json={"personas": "group_sets", "limit": 1},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert len(body["personas"]) == 1
+        assert body["truncated"] is True
+
+    def test_matrix_limit_out_of_range_is_rejected(self, policied_invoices_with_granted_groups):
+        c = policied_invoices_with_granted_groups["client"]
+        token = policied_invoices_with_granted_groups["admin_token"]
+        resp = c.post(
+            "/api/admin/registry/matrix_invoices/policy/preview-matrix",
+            json={"limit": 0},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 422, resp.text
+        assert "policy_preview_matrix_limit_out_of_range" in resp.text
+
+    def test_matrix_404_for_unknown_table(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("AGNES_ACCESS_POLICIES_ENABLED", "1")
+        resp = seeded_app["client"].post(
+            "/api/admin/registry/does-not-exist/policy/preview-matrix",
+            json={},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert resp.status_code == 404, resp.text
+
+    def test_matrix_422_when_no_stored_policy_and_no_candidate_sql(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("AGNES_ACCESS_POLICIES_ENABLED", "1")
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        table_id = _register(c, token, name="no_policy_tbl_matrix")
+
+        resp = c.post(
+            f"/api/admin/registry/{table_id}/policy/preview-matrix",
+            json={},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 422, resp.text
+        assert "policy_preview_no_policy" in resp.text
+
+    def test_matrix_requires_full_surface_admin(self, policied_invoices_with_granted_groups):
+        """A `surface='stack'` admin PAT (the `agnes init` default) must be
+        refused — same F2 rule as the single-persona and all-groups preview
+        surfaces right above (#1979); the full parametrized ratchet across
+        all four policy-CONTENT routes (incl. this one) lives in
+        ``tests/test_rls_pilot_e2e.py::TestPolicyContentSurfacesRequireFullSurface``.
+        """
+        import hashlib
+        import uuid
+
+        from app.auth.jwt import create_access_token
+        from src.repositories import access_token_repo
+
+        seeded = policied_invoices_with_granted_groups
+
+        token_id = str(uuid.uuid4())
+        jwt_token = create_access_token(user_id="admin1", email="admin@test.com", token_id=token_id, typ="pat")
+        access_token_repo().create(
+            id=token_id,
+            user_id="admin1",
+            name="stack-surface-pat",
+            token_hash=hashlib.sha256(jwt_token.encode()).hexdigest(),
+            prefix=token_id.replace("-", "")[:8],
+            surface="stack",
+        )
+
+        resp = seeded["client"].post(
+            "/api/admin/registry/matrix_invoices/policy/preview-matrix",
+            json={"personas": "group_sets"},
+            headers=_auth(jwt_token),
+        )
+        assert resp.status_code == 403, resp.text
+        assert "surface" in resp.json()["detail"]
+
+    def test_matrix_is_analyst_forbidden(self, policied_invoices_with_granted_groups):
+        c = policied_invoices_with_granted_groups["client"]
+        token = policied_invoices_with_granted_groups["analyst_token"]
+        resp = c.post(
+            "/api/admin/registry/matrix_invoices/policy/preview-matrix",
+            json={},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 403, resp.text
+
+    def test_matrix_writes_an_audit_row(self, policied_invoices_with_granted_groups):
+        c = policied_invoices_with_granted_groups["client"]
+        token = policied_invoices_with_granted_groups["admin_token"]
+        resp = c.post(
+            "/api/admin/registry/matrix_invoices/policy/preview-matrix",
+            json={"personas": "group_sets"},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200, resp.text
+
+        rows = _audit_rows(action="access_policy.preview_matrix", resource="matrix_invoices")
+        assert rows, "the matrix preview left no audit trail -- §13.1 requires it be audited"
