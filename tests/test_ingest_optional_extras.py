@@ -1,11 +1,14 @@
 """What the optional extras change, and what the absence of them must say.
 
 Two capabilities ship as opt-in extras because both pull torch:
-``[docling]`` (office-document parsing) and ``[embeddings]`` (hybrid
-retrieval). A deployment built without them still ACCEPTS docx/pptx uploads
-— they are on the upload allowlist — and then cannot index them, and ranks
-search results lexically only. Neither degradation is wrong; both are
-invisible, which is the problem this suite pins:
+``[docling]`` (layout-aware office/PDF parsing) and ``[embeddings]`` (hybrid
+retrieval). Office documents do NOT depend on the first: the shared converter
+(``src/ingest/convert.py``) reads ``.docx``/``.pptx`` through markitdown from
+the ``[extraction]`` extra the default image ships, and prefers Docling only
+when it is installed. A deployment with NEITHER parser still ACCEPTS those
+uploads — they are on the upload allowlist — and then cannot index them; one
+without ``[embeddings]`` ranks search results lexically only. Neither
+degradation is wrong; both are invisible, which is the problem this suite pins:
 
 * the rejection names the missing extra, so "why was my file rejected"
   has an answer that is not "your file is broken"
@@ -19,6 +22,7 @@ docx parses.
 
 from __future__ import annotations
 
+import importlib.util
 import zipfile
 
 import pytest
@@ -26,6 +30,7 @@ import pytest
 from src.ingest.text_extract import UnsupportedDocument, docling_capability, extract_text
 
 _HAS_DOCLING = docling_capability()
+_HAS_MARKITDOWN = importlib.util.find_spec("markitdown") is not None
 
 
 def _minimal_docx(tmp_path, name="doc.docx") -> str:
@@ -50,6 +55,27 @@ def _minimal_docx(tmp_path, name="doc.docx") -> str:
             '<?xml version="1.0"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
             "<w:body><w:p><w:r><w:t>Quarterly staffing plan for Northwind</w:t></w:r></w:p></w:body></w:document>",
         )
+    return str(path)
+
+
+def _minimal_pptx(tmp_path, name="deck.pptx") -> str:
+    """A real one-slide deck, authored with python-pptx.
+
+    python-pptx arrives with ``markitdown[all]`` (the ``[extraction]`` extra),
+    so where the markitdown route can run the author library is there too. A
+    hand-written OOXML presentation needs a dozen interlocking parts to open
+    at all, which is more fixture than test.
+    """
+    pptx = pytest.importorskip("pptx", reason="python-pptx ships with markitdown[all] (the extraction extra)")
+    from pptx.util import Inches
+
+    deck = pptx.Presentation()
+    slide = deck.slides.add_slide(deck.slide_layouts[5])  # title only
+    slide.shapes.title.text = "Engagement type breakdown"
+    box = slide.shapes.add_textbox(Inches(1), Inches(2), Inches(6), Inches(1))
+    box.text_frame.text = "Fixed-fee engagements grew in the third quarter"
+    path = tmp_path / name
+    deck.save(str(path))
     return str(path)
 
 
@@ -115,24 +141,68 @@ def _minimal_epub(tmp_path, name="book.epub", *, spine=True, chapters=None) -> s
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(_HAS_DOCLING, reason="docling IS installed — this pins the degraded deployment")
+@pytest.mark.skipif(not _HAS_MARKITDOWN, reason="needs the [extraction] extra (default image, every default CI job)")
 @pytest.mark.parametrize("ext", ["docx", "pptx"])
-def test_docling_only_formats_name_the_missing_extra(tmp_path, ext):
+def test_office_documents_index_through_markitdown_on_the_default_image(tmp_path, ext):
+    """The bug this pins: a ``.pptx`` uploaded to a collection was stored and
+    then rejected with "needs the 'docling' extra" — on an image that already
+    carried markitdown for the SharePoint crawl, which converts the very same
+    file type fine. Office documents must index wherever the ``[extraction]``
+    extra is, and the default image ships it."""
+    if ext == "docx":
+        path, expected = _minimal_docx(tmp_path), "Northwind"
+    else:
+        path, expected = _minimal_pptx(tmp_path), "Engagement type breakdown"
+
+    res = extract_text(path, ext)
+
+    assert expected in res.full_text, f"a valid .{ext} yielded no text on an image with markitdown installed"
+
+
+@pytest.mark.parametrize("ext", ["docx", "pptx"])
+def test_office_formats_name_both_extras_when_neither_parser_is_installed(tmp_path, monkeypatch, ext):
     """These formats are on the upload allowlist (``TIER1_EXTENSIONS``) and
-    have no lightweight fallback, so on an image without the extra a user
+    have no stdlib fallback, so on an image with neither parser a user
     uploads successfully and the file is rejected afterwards. A bare "no text
     extractor for '.docx'" reads as "your file is broken" and invites the one
-    action that cannot help — uploading it again."""
+    action that cannot help — uploading it again. Simulated, because the
+    default install HAS markitdown: this pins the degraded deployment."""
+    import sys
+
+    from src.ingest import convert
+
+    monkeypatch.setitem(sys.modules, "markitdown", None)
+    monkeypatch.setattr(convert, "docling_capability", lambda: False)
     path = tmp_path / f"a.{ext}"
-    path.write_bytes(b"PK\x03\x04not-really-an-office-file")
+    with zipfile.ZipFile(path, "w") as package:  # a zip, so the archive guard is not what refuses it
+        package.writestr("[Content_Types].xml", "<Types/>")
 
     with pytest.raises(UnsupportedDocument) as exc:
         extract_text(str(path), ext)
 
     msg = str(exc.value)
-    assert "docling" in msg, "the rejection must name the extra that is missing"
+    assert "extraction" in msg and "docling" in msg, "the rejection must name BOTH extras that could read it"
     assert "built without" in msg, "…and say it is the deployment's shape, not the file's"
     assert "-rich" in msg and "DEPLOYMENT.md" in msg, "…and point an operator at the fix"
+
+
+@pytest.mark.skipif(not _HAS_MARKITDOWN, reason="needs the [extraction] extra (default image, every default CI job)")
+def test_corrupt_office_file_rejects_without_blaming_a_missing_extra(tmp_path):
+    """A truncated archive is the file's problem. Naming an extra would send
+    an operator to rebuild an image that changes nothing.
+
+    The bytes carry NULs on purpose: markitdown sniffs content, and a
+    "corrupt" archive that is really ASCII prose is read as prose — which is
+    the right outcome for that file, and not the case under test."""
+    path = tmp_path / "a.docx"
+    path.write_bytes(b"PK\x03\x04\x00\x00truncated archive")
+
+    with pytest.raises(UnsupportedDocument) as exc:
+        extract_text(str(path), "docx")
+
+    msg = str(exc.value)
+    assert "built without" not in msg and "-rich" not in msg
+    assert "docx" in msg
 
 
 def test_allowlisted_formats_without_a_reader_are_exactly_the_ones_we_name():
@@ -143,8 +213,8 @@ def test_allowlisted_formats_without_a_reader_are_exactly_the_ones_we_name():
     from src.corpus_allowlist import TIER1_EXTENSIONS
     from src.ingest.runner import TABULAR_EXTS
     from src.ingest.text_extract import (
-        _DOCLING_ONLY_EXTS,
         _HTML_EXTS,
+        _OFFICE_EXTS,
         _PLAIN_EXTS,
         _UNREADABLE_TIER1,
     )
@@ -153,15 +223,16 @@ def test_allowlisted_formats_without_a_reader_are_exactly_the_ones_we_name():
         set(_PLAIN_EXTS)
         | set(_HTML_EXTS)
         | set(TABULAR_EXTS)
-        | set(_DOCLING_ONLY_EXTS)
+        | set(_OFFICE_EXTS)
         | set(_UNREADABLE_TIER1)
         | {"pdf", "eml", "epub"}
     )
     unexplained = set(TIER1_EXTENSIONS) - covered
     assert unexplained == set(), (
         f"tier-1 uploads with no reader and no named reason: {sorted(unexplained)} — either add a "
-        "fallback, add them to _DOCLING_ONLY_EXTS so the rejection names the missing extra, or "
-        "record them in _UNREADABLE_TIER1 (with the reason) if nothing can read them"
+        "fallback, add them to _OFFICE_EXTS so the shared converter reads them and the rejection "
+        "names the missing extras, or record them in _UNREADABLE_TIER1 (with the reason) if nothing "
+        "can read them"
     )
 
 
