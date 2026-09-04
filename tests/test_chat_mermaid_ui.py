@@ -249,12 +249,78 @@ def test_a_theme_switch_redraws_the_diagrams_on_screen():
     )
 
 
+def test_every_initialize_and_render_happens_in_one_serialized_place():
+    """`mermaid.initialize()` sets a GLOBAL config and `render` is awaited, so
+    an initialize from one path landing between another's initialize and its
+    render makes the second draw with the first's settings — an export with
+    `<foreignObject>` labels back in it, or a live diagram drawn with the
+    export's. Every path runs several times per turn (seal, finalize, history
+    reload, theme switch), so the overlap is ordinary.
+
+    The guard is structural rather than behavioural: there is exactly ONE
+    call site for each, both inside `_renderMermaid`'s critical section, so a
+    new render path cannot reintroduce the race without moving them."""
+    js = _read(CHAT_JS)
+    code = _code_only(js)
+    assert code.count("mermaid.initialize(") == 1, "one initialize, inside the lock"
+    assert code.count("mermaid.render(") == 1, "one render, inside the lock"
+    fn = js[js.index("function _renderMermaid") : js.index("// Rendered SVG, keyed by theme")]
+    assert "mermaid.initialize(cfg);" in fn and "await mermaid.render(" in fn
+    assert "_mermaidLock.then(" in fn, "each pair queues behind the previous one"
+    assert "_mermaidLock = run.then(" in fn, "the chain must survive a rejected render"
+
+
+def test_a_render_is_cached_under_the_theme_it_was_actually_drawn_in():
+    """The theme was sampled before the await. A switch while a render was in
+    flight filed a NEW-palette SVG under the OLD theme's key — and served it
+    back the next time the user returned to that theme."""
+    js = _read(CHAT_JS)
+    fn = js[js.index("function _renderMermaid") : js.index("// Rendered SVG, keyed by theme")]
+    assert "const themeKey = _mermaidThemeKey();" in fn, "read inside the lock, not by the caller"
+    assert "return { svg: makeResponsiveSvg(out.svg), themeKey };" in fn
+    for path in ("function renderMermaidBlocks", "function rerenderMermaidForTheme"):
+        body = js[js.index(path) :][:2600]
+        assert r'_mermaidCacheSet(out.themeKey + "\n" + source' in body, (
+            f"{path} must key the cache on the theme the render reports, not one it sampled"
+        )
+
+
+def test_diagrams_finishing_after_a_theme_switch_are_caught_up():
+    """The switch's redraw walks the figures in the DOM at that moment. A
+    diagram still rendering is not one of them, so without this it stays an
+    island in the old palette until the next switch or a reload."""
+    js = _read(CHAT_JS)
+    body = js[js.index("function renderMermaidBlocks") : js.index("/** Redraw every diagram")]
+    assert "if (_mermaidThemeKey() !== lastTheme) rerenderMermaidForTheme();" in body
+
+
+def test_a_diagram_removed_mid_render_is_not_written_back():
+    """Renders are serialized and awaited, so a bubble can be re-rendered or
+    dropped while its diagram is still queued."""
+    js = _read(CHAT_JS)
+    body = js[js.index("function renderMermaidBlocks") : js.index("/** Redraw every diagram")]
+    assert body.count("if (!host.isConnected) continue;") >= 2, (
+        "checked before the await and again before touching the DOM"
+    )
+
+
+def test_the_export_needs_no_restore_step():
+    """The old export set htmlLabels:false, rendered, then put the config back
+    — a restore that a concurrent render could land in front of. Serializing
+    removes the need for it: each render sets its own config immediately
+    before using it, so nothing depends on the config mermaid currently has."""
+    js = _read(CHAT_JS)
+    dl = js[js.index("function downloadMermaidSvg") : js.index("function openMermaidLightbox")]
+    assert "_renderMermaid(source, (cfg) => {" in dl
+    assert "mermaid.initialize" not in _code_only(dl), "the export must not touch global config itself"
+
+
 def test_the_render_cache_is_keyed_by_theme_and_bounded():
     js = _read(CHAT_JS)
-    assert 'const key = themeKey + "\\n" + source;' in js, (
-        "the palette is baked in, so the same source under another theme is a different SVG"
+    assert js.count('_mermaidCacheGet(_mermaidThemeKey() + "\\n" + source)') == 2, (
+        "the palette is baked in, so the same source under another theme is a different SVG — "
+        "and render and redraw must agree on the key"
     )
-    assert js.count('const key = themeKey + "\\n" + source;') == 2, "render and redraw must agree on the key"
     assert "_MERMAID_CACHE_MAX" in js, "a long-lived tab must not accumulate every diagram it ever showed"
 
 
@@ -285,10 +351,9 @@ def test_the_saved_svg_does_not_depend_on_a_browser_to_show_its_labels():
     dl = js[js.index("function downloadMermaidSvg") : js.index("function openMermaidLightbox")]
     assert "cfg.htmlLabels = false;" in dl
     assert "htmlLabels: false" in dl, "flowchart carries its own htmlLabels switch"
-    assert "mermaid.initialize(_mermaidConfig());" in dl, (
-        "the renderer must be restored, or the next diagram inherits the export settings"
-    )
     assert ".catch(fallback)" in dl, "a failed re-render saves the on-screen markup rather than nothing"
+    # The config no longer has to be restored afterwards — see
+    # test_the_export_needs_no_restore_step for why serializing removed it.
 
 
 def test_the_lightbox_is_dismissable_and_leaves_the_message_intact():

@@ -698,6 +698,49 @@ function loadMermaid() {
 
 let _mermaidSeq = 0;
 
+// `mermaid.initialize()` sets a GLOBAL config, and the render paths here do not
+// want the same one — a live diagram takes the page palette, an export takes
+// that palette plus `htmlLabels: false`. Since `render` is awaited, an
+// `initialize` from one path can land between another's `initialize` and its
+// render, and the second draws with the first's settings: an export with
+// `<foreignObject>` labels back in it, or a live diagram drawn with the
+// export's. Both paths also run several times per turn (seal, finalize,
+// history reload, theme switch), so the overlap is ordinary, not exotic.
+//
+// So every initialize+render pair runs as one critical section, and each sets
+// the config it is about to use immediately before using it. Nothing depends
+// on "the config mermaid currently has", which is what makes the export need
+// no restore step.
+let _mermaidLock = Promise.resolve();
+
+/** Render one diagram under its own config, serialized against every other
+ *  render.
+ *
+ *  Returns the theme it was ACTUALLY drawn in, read inside the lock. The caller
+ *  keys its cache on that rather than on a value sampled before the await:
+ *  a theme switch while a render is in flight would otherwise file a
+ *  new-palette SVG under the old theme's key, and serve it back the next time
+ *  the user returned to that theme. */
+function _renderMermaid(source, tweak) {
+  const run = _mermaidLock.then(() =>
+    loadMermaid().then(async (mermaid) => {
+      const themeKey = _mermaidThemeKey();
+      const cfg = _mermaidConfig();
+      if (tweak) tweak(cfg);
+      mermaid.initialize(cfg);
+      const out = await mermaid.render(`ag-mmd-${++_mermaidSeq}`, source);
+      return { svg: makeResponsiveSvg(out.svg), themeKey };
+    }),
+  );
+  // The chain must survive a rejection, or one bad diagram stops every render
+  // queued behind it. Callers see the real error through `run`.
+  _mermaidLock = run.then(
+    () => {},
+    () => {},
+  );
+  return run;
+}
+
 // Rendered SVG, keyed by theme + source. Survives the re-render passes a turn
 // makes over the same bubble (seal, finalize, history reload) and the redraw a
 // theme switch triggers, so a diagram is laid out once per appearance rather
@@ -815,21 +858,14 @@ function downloadMermaidSvg(fig) {
   const source = fig.dataset.mermaidSrc || "";
   const fallback = () => _saveSvgFile(onScreen.outerHTML);
   if (!source.trim()) return fallback();
-  loadMermaid()
-    .then(async (mermaid) => {
-      const cfg = _mermaidConfig();
-      cfg.htmlLabels = false;
-      cfg.flowchart = Object.assign({}, cfg.flowchart, { htmlLabels: false });
-      mermaid.initialize(cfg);
-      try {
-        const out = await mermaid.render(`ag-mmd-dl-${++_mermaidSeq}`, source);
-        _saveSvgFile(makeResponsiveSvg(out.svg));
-      } finally {
-        // Put the renderer back the way the page expects it, or the next
-        // diagram rendered in this session inherits the export settings.
-        mermaid.initialize(_mermaidConfig());
-      }
-    })
+  // No restore step: `_renderMermaid` serializes this against the live render
+  // paths and each of them sets its own config immediately before rendering,
+  // so the export's `htmlLabels: false` cannot outlive its own render.
+  _renderMermaid(source, (cfg) => {
+    cfg.htmlLabels = false;
+    cfg.flowchart = Object.assign({}, cfg.flowchart, { htmlLabels: false });
+  })
+    .then((out) => _saveSvgFile(out.svg))
     .catch(fallback);
 }
 
@@ -937,41 +973,47 @@ function renderMermaidBlocks(root) {
   if (!root) return;
   const blocks = root.querySelectorAll("code.language-mermaid");
   if (!blocks.length) return;
-  const themeKey = _mermaidThemeKey();
-  loadMermaid()
-    .then(async (mermaid) => {
-      mermaid.initialize(_mermaidConfig());
-      for (const code of blocks) {
-        const host = code.closest("pre") || code;
-        if (!host.isConnected) continue;
-        const source = code.textContent || "";
-        if (!source.trim()) continue;
-        const key = themeKey + "\n" + source;
-        try {
-          let svg = _mermaidCacheGet(key);
-          if (svg === undefined) {
-            const out = await mermaid.render(`ag-mmd-${++_mermaidSeq}`, source);
-            svg = makeResponsiveSvg(out.svg);
-            if (!hasDrawnContent(svg)) throw new Error("mermaid produced an empty diagram");
-            _mermaidCacheSet(key, svg);
-          }
-          host.replaceWith(_buildMermaidFigure(svg, source));
-        } catch (err) {
-          if (isTruncatedDiagram(err)) continue;
-          if (host.previousElementSibling && host.previousElementSibling.classList.contains("msg-mermaid-error")) {
-            continue;
-          }
-          const note = document.createElement("div");
-          note.className = "msg-mermaid-error";
-          note.textContent = "This diagram could not be drawn; its source is below.";
-          host.parentNode && host.parentNode.insertBefore(note, host);
+  (async () => {
+    // The theme is read per diagram, not once for the batch: a switch part-way
+    // through a long turn must not file the rest of it under the old palette.
+    let lastTheme = _mermaidThemeKey();
+    for (const code of blocks) {
+      const host = code.closest("pre") || code;
+      if (!host.isConnected) continue;
+      const source = code.textContent || "";
+      if (!source.trim()) continue;
+      try {
+        const cached = _mermaidCacheGet(_mermaidThemeKey() + "\n" + source);
+        let svg = cached;
+        if (svg === undefined) {
+          const out = await _renderMermaid(source);
+          svg = out.svg;
+          lastTheme = out.themeKey;
+          if (!hasDrawnContent(svg)) throw new Error("mermaid produced an empty diagram");
+          _mermaidCacheSet(out.themeKey + "\n" + source, svg);
         }
+        if (!host.isConnected) continue;
+        host.replaceWith(_buildMermaidFigure(svg, source));
+      } catch (err) {
+        if (isTruncatedDiagram(err)) continue;
+        if (!host.isConnected) continue;
+        if (host.previousElementSibling && host.previousElementSibling.classList.contains("msg-mermaid-error")) {
+          continue;
+        }
+        const note = document.createElement("div");
+        note.className = "msg-mermaid-error";
+        note.textContent = "This diagram could not be drawn; its source is below.";
+        host.parentNode && host.parentNode.insertBefore(note, host);
       }
-      maybeScrollToBottom();
-    })
-    .catch(() => {
-      /* Diagrams are additive: the fenced source stays readable. */
-    });
+    }
+    // A theme switch that fired while these were still rendering ran its
+    // redraw over the figures that were in the DOM at the time — which is not
+    // these. Catch them up rather than leaving an island until the next switch.
+    if (_mermaidThemeKey() !== lastTheme) rerenderMermaidForTheme();
+    maybeScrollToBottom();
+  })().catch(() => {
+    /* Diagrams are additive: the fenced source stays readable. */
+  });
 }
 
 /** Redraw every diagram on screen in the current palette. Mermaid bakes its
@@ -982,31 +1024,27 @@ function renderMermaidBlocks(root) {
 function rerenderMermaidForTheme() {
   const figs = document.querySelectorAll(".msg-mermaid[data-mermaid-src]");
   if (!figs.length) return;
-  const themeKey = _mermaidThemeKey();
-  loadMermaid()
-    .then(async (mermaid) => {
-      mermaid.initialize(_mermaidConfig());
-      for (const fig of figs) {
-        const source = fig.dataset.mermaidSrc || "";
-        if (!source.trim()) continue;
-        const key = themeKey + "\n" + source;
-        try {
-          let svg = _mermaidCacheGet(key);
-          if (svg === undefined) {
-            const out = await mermaid.render(`ag-mmd-${++_mermaidSeq}`, source);
-            svg = makeResponsiveSvg(out.svg);
-            if (!hasDrawnContent(svg)) continue;
-            _mermaidCacheSet(key, svg);
-          }
-          const stage = fig.querySelector(".msg-mermaid-stage");
-          if (stage) stage.innerHTML = svg;
-        } catch (err) {
-          /* Keep the diagram that is already on screen — a palette that no
-             longer matches beats an empty space. */
+  (async () => {
+    for (const fig of figs) {
+      const source = fig.dataset.mermaidSrc || "";
+      if (!source.trim()) continue;
+      try {
+        const cached = _mermaidCacheGet(_mermaidThemeKey() + "\n" + source);
+        let svg = cached;
+        if (svg === undefined) {
+          const out = await _renderMermaid(source);
+          if (!hasDrawnContent(out.svg)) continue;
+          _mermaidCacheSet(out.themeKey + "\n" + source, out.svg);
+          svg = out.svg;
         }
+        const stage = fig.querySelector(".msg-mermaid-stage");
+        if (stage) stage.innerHTML = svg;
+      } catch (err) {
+        /* Keep the diagram that is already on screen — a palette that no
+           longer matches beats an empty space. */
       }
-    })
-    .catch(() => {});
+    }
+  })().catch(() => {});
 }
 
 // The theme is switched by mutating <html data-theme> (see
