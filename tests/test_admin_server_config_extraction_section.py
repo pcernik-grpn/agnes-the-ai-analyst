@@ -42,6 +42,8 @@ DATA_DIR/cache plumbing needed here.
 
 from __future__ import annotations
 
+import pytest
+
 import yaml
 
 
@@ -51,6 +53,13 @@ def _auth(token: str) -> dict:
 
 def _clear_extraction_env(monkeypatch):
     monkeypatch.delenv("AGNES_SHAREPOINT_ENABLED", raising=False)
+
+
+def _client(seeded_app, monkeypatch):
+    """(client, admin token) with the extraction env cleared — the shape the
+    run-knob tests below share."""
+    _clear_extraction_env(monkeypatch)
+    return seeded_app["client"], seeded_app["admin_token"]
 
 
 # ---------------------------------------------------------------------------
@@ -85,6 +94,8 @@ def test_get_returns_extraction_known_fields(seeded_app, monkeypatch):
     assert fields["schedule"]["kind"] == "string"
     assert fields["timeout_s"]["kind"] == "int"
     assert fields["timeout_s"]["default"] == 3600
+    assert fields["stall_after_s"]["kind"] == "int"
+    assert fields["stall_after_s"]["default"] == 900
 
 
 def test_sharepoint_switch_is_editable(seeded_app, monkeypatch):
@@ -220,6 +231,60 @@ def test_timeout_s_boundaries_accepted(seeded_app, monkeypatch):
             headers=_auth(seeded_app["admin_token"]),
         )
         assert resp.status_code == 200, resp.text
+
+
+def test_stall_after_s_below_min_rejected(seeded_app, monkeypatch):
+    _clear_extraction_env(monkeypatch)
+    client = seeded_app["client"]
+    resp = client.post(
+        "/api/admin/server-config",
+        json={"sections": {"extraction": {"stall_after_s": 59}}},
+        headers=_auth(seeded_app["admin_token"]),
+    )
+    assert resp.status_code == 422, resp.text
+
+
+def test_stall_after_s_above_max_rejected(seeded_app, monkeypatch):
+    _clear_extraction_env(monkeypatch)
+    client = seeded_app["client"]
+    resp = client.post(
+        "/api/admin/server-config",
+        json={"sections": {"extraction": {"stall_after_s": 86401}}},
+        headers=_auth(seeded_app["admin_token"]),
+    )
+    assert resp.status_code == 422, resp.text
+
+
+def test_stall_after_s_boundaries_accepted(seeded_app, monkeypatch):
+    _clear_extraction_env(monkeypatch)
+    client = seeded_app["client"]
+    for value in (60, 86400):
+        resp = client.post(
+            "/api/admin/server-config",
+            json={"sections": {"extraction": {"stall_after_s": value}}},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert resp.status_code == 200, resp.text
+
+
+def test_post_updates_stall_after_s_and_get_reflects_it(seeded_app, monkeypatch):
+    _clear_extraction_env(monkeypatch)
+    client = seeded_app["client"]
+    headers = _auth(seeded_app["admin_token"])
+    resp = client.post(
+        "/api/admin/server-config",
+        json={"sections": {"extraction": {"stall_after_s": 300}}},
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+
+    from app.secrets import _state_dir
+
+    loaded = yaml.safe_load((_state_dir() / "instance.yaml").read_text())
+    assert loaded["extraction"]["stall_after_s"] == 300
+
+    resp2 = client.get("/api/admin/server-config", headers=headers)
+    assert resp2.json()["sections"]["extraction"]["stall_after_s"] == 300
 
 
 # ---------------------------------------------------------------------------
@@ -383,7 +448,7 @@ def test_crawler_concurrency_bounds_match_the_crawlers_clamp():
     from connectors.sharepoint.crawler import _MAX_CONCURRENCY
 
     assert _CRAWLER_CONCURRENCY_MIN == 1
-    assert _CRAWLER_CONCURRENCY_MAX == _MAX_CONCURRENCY == 32
+    assert _CRAWLER_CONCURRENCY_MAX == _MAX_CONCURRENCY == 64
 
 
 def test_post_crawler_concurrency_persists_and_get_reflects_it(seeded_app, monkeypatch):
@@ -436,7 +501,7 @@ def test_post_crawler_concurrency_keeps_sibling_crawler_keys(seeded_app, monkeyp
 def test_crawler_concurrency_out_of_range_is_refused_not_reclamped(seeded_app, monkeypatch):
     _clear_extraction_env(monkeypatch)
     client = seeded_app["client"]
-    for value in (0, 33, -1):
+    for value in (0, 65, -1):
         resp = client.post(
             "/api/admin/server-config",
             json={"sections": {"extraction": {"crawler": {"concurrency": value}}}},
@@ -504,3 +569,499 @@ def test_saved_crawler_concurrency_is_what_the_next_crawl_run_reads(seeded_app, 
     assert _crawl_concurrency() == 2
     # A run with no per-run override uses the configured value, and says so.
     assert _resolve_concurrency(None) == (2, 2, "config")
+
+
+# ---------------------------------------------------------------------------
+# extraction.crawler.convert_child_memory_limit_mb — the conversion child's
+# RLIMIT_AS HEADROOM, admin-editable (2026-09-02 live-deployment follow-up).
+#
+# The key already existed and was already read by the crawler
+# (`_convert_child_memory_limit_bytes`) — only the server-config declaration
+# and its range validation are new here, matching how `concurrency` above
+# was surfaced.
+# ---------------------------------------------------------------------------
+
+
+def test_convert_child_memory_limit_is_a_known_field_with_the_crawlers_own_default(seeded_app, monkeypatch):
+    _clear_extraction_env(monkeypatch)
+    client = seeded_app["client"]
+    resp = client.get("/api/admin/server-config", headers=_auth(seeded_app["admin_token"]))
+    spec = resp.json()["known_fields"]["extraction"]["crawler"]["fields"]["convert_child_memory_limit_mb"]
+    assert spec["kind"] == "int"
+
+    from connectors.sharepoint.crawler import _DEFAULT_CONVERT_CHILD_MEMORY_LIMIT_MB
+
+    assert spec["default"] == _DEFAULT_CONVERT_CHILD_MEMORY_LIMIT_MB == 1536
+    # The hint must say this is HEADROOM, not an absolute ceiling — the
+    # exact live-deployment bug this field's own validation follow-up fixed.
+    assert "headroom" in spec["hint"].lower()
+
+
+def test_post_convert_child_memory_limit_persists_and_get_reflects_it(seeded_app, monkeypatch):
+    _clear_extraction_env(monkeypatch)
+    client = seeded_app["client"]
+    headers = _auth(seeded_app["admin_token"])
+    resp = client.post(
+        "/api/admin/server-config",
+        json={"sections": {"extraction": {"crawler": {"convert_child_memory_limit_mb": 3072}}}},
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+
+    from app.secrets import _state_dir
+
+    loaded = yaml.safe_load((_state_dir() / "instance.yaml").read_text())
+    assert loaded["extraction"]["crawler"]["convert_child_memory_limit_mb"] == 3072
+
+    resp2 = client.get("/api/admin/server-config", headers=headers)
+    assert resp2.json()["sections"]["extraction"]["crawler"]["convert_child_memory_limit_mb"] == 3072
+
+
+def test_convert_child_memory_limit_zero_disables_the_cap_and_is_accepted(seeded_app, monkeypatch):
+    _clear_extraction_env(monkeypatch)
+    client = seeded_app["client"]
+    resp = client.post(
+        "/api/admin/server-config",
+        json={"sections": {"extraction": {"crawler": {"convert_child_memory_limit_mb": 0}}}},
+        headers=_auth(seeded_app["admin_token"]),
+    )
+    assert resp.status_code == 200, resp.text
+
+
+def test_convert_child_memory_limit_out_of_range_is_refused(seeded_app, monkeypatch):
+    _clear_extraction_env(monkeypatch)
+    client = seeded_app["client"]
+    for value in (-1, 65537):
+        resp = client.post(
+            "/api/admin/server-config",
+            json={"sections": {"extraction": {"crawler": {"convert_child_memory_limit_mb": value}}}},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert resp.status_code == 422, (value, resp.text)
+        assert "extraction.crawler.convert_child_memory_limit_mb" in resp.text
+
+
+def test_convert_child_memory_limit_must_be_an_integer(seeded_app, monkeypatch):
+    _clear_extraction_env(monkeypatch)
+    client = seeded_app["client"]
+    for value in ("1536", 1536.5, True):
+        resp = client.post(
+            "/api/admin/server-config",
+            json={"sections": {"extraction": {"crawler": {"convert_child_memory_limit_mb": value}}}},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert resp.status_code == 422, (value, resp.text)
+
+
+def test_post_convert_child_memory_limit_keeps_sibling_crawler_keys(seeded_app, monkeypatch):
+    """Same deep-merge contract `concurrency` already has — saving this one
+    leaf must not wipe the crawler keys the panel does not render yet."""
+    _clear_extraction_env(monkeypatch)
+    client = seeded_app["client"]
+    headers = _auth(seeded_app["admin_token"])
+    first = client.post(
+        "/api/admin/server-config",
+        json={"sections": {"extraction": {"crawler": {"concurrency": 2}}}},
+        headers=headers,
+    )
+    assert first.status_code == 200, first.text
+    second = client.post(
+        "/api/admin/server-config",
+        json={"sections": {"extraction": {"crawler": {"convert_child_memory_limit_mb": 2048}}}},
+        headers=headers,
+    )
+    assert second.status_code == 200, second.text
+
+    from app.secrets import _state_dir
+
+    loaded = yaml.safe_load((_state_dir() / "instance.yaml").read_text())
+    assert loaded["extraction"]["crawler"] == {"concurrency": 2, "convert_child_memory_limit_mb": 2048}
+
+
+def test_saved_convert_child_memory_limit_is_what_the_next_crawl_run_reads(seeded_app, monkeypatch):
+    """End to end through the real save path — no restart, no monkeypatch
+    of get_value."""
+    _clear_extraction_env(monkeypatch)
+    client = seeded_app["client"]
+
+    from connectors.sharepoint.crawler import _convert_child_memory_limit_bytes
+
+    assert _convert_child_memory_limit_bytes() == 1536 * 1024 * 1024  # the crawler's own default before any save
+
+    resp = client.post(
+        "/api/admin/server-config",
+        json={"sections": {"extraction": {"crawler": {"convert_child_memory_limit_mb": 256}}}},
+        headers=_auth(seeded_app["admin_token"]),
+    )
+    assert resp.status_code == 200, resp.text
+    assert _convert_child_memory_limit_bytes() == 256 * 1024 * 1024
+
+
+# ---------------------------------------------------------------------------
+# extraction.crawler.convert_child_max_rss_mb / convert_spares_per_slot —
+# the two knobs behind the RSS watchdog + N-spares fix (2026-09-03 live-
+# deployment follow-up): the parent-polled ABSOLUTE RSS ceiling, separate
+# from convert_child_memory_limit_mb's own HEADROOM cap, and how many
+# pre-forked standbys each conversion slot keeps ready.
+# ---------------------------------------------------------------------------
+
+
+def test_convert_child_max_rss_is_a_known_field_with_the_crawlers_own_default(seeded_app, monkeypatch):
+    _clear_extraction_env(monkeypatch)
+    client = seeded_app["client"]
+    resp = client.get("/api/admin/server-config", headers=_auth(seeded_app["admin_token"]))
+    spec = resp.json()["known_fields"]["extraction"]["crawler"]["fields"]["convert_child_max_rss_mb"]
+    assert spec["kind"] == "int"
+
+    from connectors.sharepoint.crawler import _DEFAULT_CONVERT_CHILD_MAX_RSS_MB
+
+    assert spec["default"] == _DEFAULT_CONVERT_CHILD_MAX_RSS_MB == 4096
+    assert "rss" in spec["hint"].lower()
+
+
+def test_convert_child_max_rss_bounds_match_the_crawlers_sanity_ceiling():
+    from app.api.admin import _CONVERT_CHILD_MAX_RSS_MAX_MB, _CONVERT_CHILD_MAX_RSS_MIN_MB
+
+    assert _CONVERT_CHILD_MAX_RSS_MIN_MB == 0
+    assert _CONVERT_CHILD_MAX_RSS_MAX_MB == 65536
+
+
+def test_post_convert_child_max_rss_persists_and_get_reflects_it(seeded_app, monkeypatch):
+    _clear_extraction_env(monkeypatch)
+    client = seeded_app["client"]
+    headers = _auth(seeded_app["admin_token"])
+    resp = client.post(
+        "/api/admin/server-config",
+        json={"sections": {"extraction": {"crawler": {"convert_child_max_rss_mb": 8192}}}},
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+
+    from app.secrets import _state_dir
+
+    loaded = yaml.safe_load((_state_dir() / "instance.yaml").read_text())
+    assert loaded["extraction"]["crawler"]["convert_child_max_rss_mb"] == 8192
+
+    resp2 = client.get("/api/admin/server-config", headers=headers)
+    assert resp2.json()["sections"]["extraction"]["crawler"]["convert_child_max_rss_mb"] == 8192
+
+
+def test_convert_child_max_rss_zero_disables_the_watchdog_and_is_accepted(seeded_app, monkeypatch):
+    _clear_extraction_env(monkeypatch)
+    client = seeded_app["client"]
+    resp = client.post(
+        "/api/admin/server-config",
+        json={"sections": {"extraction": {"crawler": {"convert_child_max_rss_mb": 0}}}},
+        headers=_auth(seeded_app["admin_token"]),
+    )
+    assert resp.status_code == 200, resp.text
+
+
+def test_convert_child_max_rss_out_of_range_is_refused(seeded_app, monkeypatch):
+    _clear_extraction_env(monkeypatch)
+    client = seeded_app["client"]
+    for value in (-1, 65537):
+        resp = client.post(
+            "/api/admin/server-config",
+            json={"sections": {"extraction": {"crawler": {"convert_child_max_rss_mb": value}}}},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert resp.status_code == 422, (value, resp.text)
+        assert "extraction.crawler.convert_child_max_rss_mb" in resp.text
+
+
+def test_convert_child_max_rss_must_be_an_integer(seeded_app, monkeypatch):
+    _clear_extraction_env(monkeypatch)
+    client = seeded_app["client"]
+    for value in ("4096", 4096.5, True):
+        resp = client.post(
+            "/api/admin/server-config",
+            json={"sections": {"extraction": {"crawler": {"convert_child_max_rss_mb": value}}}},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert resp.status_code == 422, (value, resp.text)
+
+
+def test_saved_convert_child_max_rss_is_what_the_next_crawl_run_reads(seeded_app, monkeypatch):
+    _clear_extraction_env(monkeypatch)
+    client = seeded_app["client"]
+
+    from connectors.sharepoint.crawler import _convert_child_max_rss_bytes
+
+    assert _convert_child_max_rss_bytes() == 4096 * 1024 * 1024  # the crawler's own default before any save
+
+    resp = client.post(
+        "/api/admin/server-config",
+        json={"sections": {"extraction": {"crawler": {"convert_child_max_rss_mb": 1024}}}},
+        headers=_auth(seeded_app["admin_token"]),
+    )
+    assert resp.status_code == 200, resp.text
+    assert _convert_child_max_rss_bytes() == 1024 * 1024 * 1024
+
+
+def test_convert_spares_per_slot_is_a_known_field_with_the_crawlers_own_default(seeded_app, monkeypatch):
+    _clear_extraction_env(monkeypatch)
+    client = seeded_app["client"]
+    resp = client.get("/api/admin/server-config", headers=_auth(seeded_app["admin_token"]))
+    spec = resp.json()["known_fields"]["extraction"]["crawler"]["fields"]["convert_spares_per_slot"]
+    assert spec["kind"] == "int"
+
+    from connectors.sharepoint.crawler import _DEFAULT_CONVERT_SPARES_PER_SLOT
+
+    assert spec["default"] == _DEFAULT_CONVERT_SPARES_PER_SLOT == 2
+    assert "spare" in spec["hint"].lower()
+
+
+def test_convert_spares_per_slot_bounds_match_the_crawlers_sanity_ceiling():
+    from app.api.admin import _CONVERT_SPARES_PER_SLOT_MAX, _CONVERT_SPARES_PER_SLOT_MIN
+    from connectors.sharepoint.crawler import _MAX_CONVERT_SPARES_PER_SLOT
+
+    assert _CONVERT_SPARES_PER_SLOT_MIN == 0
+    assert _CONVERT_SPARES_PER_SLOT_MAX == _MAX_CONVERT_SPARES_PER_SLOT == 8
+
+
+def test_post_convert_spares_per_slot_persists_and_get_reflects_it(seeded_app, monkeypatch):
+    _clear_extraction_env(monkeypatch)
+    client = seeded_app["client"]
+    headers = _auth(seeded_app["admin_token"])
+    resp = client.post(
+        "/api/admin/server-config",
+        json={"sections": {"extraction": {"crawler": {"convert_spares_per_slot": 4}}}},
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+
+    from app.secrets import _state_dir
+
+    loaded = yaml.safe_load((_state_dir() / "instance.yaml").read_text())
+    assert loaded["extraction"]["crawler"]["convert_spares_per_slot"] == 4
+
+    resp2 = client.get("/api/admin/server-config", headers=headers)
+    assert resp2.json()["sections"]["extraction"]["crawler"]["convert_spares_per_slot"] == 4
+
+
+def test_convert_spares_per_slot_zero_disables_spares_and_is_accepted(seeded_app, monkeypatch):
+    _clear_extraction_env(monkeypatch)
+    client = seeded_app["client"]
+    resp = client.post(
+        "/api/admin/server-config",
+        json={"sections": {"extraction": {"crawler": {"convert_spares_per_slot": 0}}}},
+        headers=_auth(seeded_app["admin_token"]),
+    )
+    assert resp.status_code == 200, resp.text
+
+
+def test_convert_spares_per_slot_out_of_range_is_refused(seeded_app, monkeypatch):
+    _clear_extraction_env(monkeypatch)
+    client = seeded_app["client"]
+    for value in (-1, 9):
+        resp = client.post(
+            "/api/admin/server-config",
+            json={"sections": {"extraction": {"crawler": {"convert_spares_per_slot": value}}}},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert resp.status_code == 422, (value, resp.text)
+        assert "extraction.crawler.convert_spares_per_slot" in resp.text
+
+
+def test_convert_spares_per_slot_must_be_an_integer(seeded_app, monkeypatch):
+    _clear_extraction_env(monkeypatch)
+    client = seeded_app["client"]
+    for value in ("2", 2.5, True):
+        resp = client.post(
+            "/api/admin/server-config",
+            json={"sections": {"extraction": {"crawler": {"convert_spares_per_slot": value}}}},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert resp.status_code == 422, (value, resp.text)
+
+
+def test_saved_convert_spares_per_slot_is_what_the_next_crawl_run_reads(seeded_app, monkeypatch):
+    _clear_extraction_env(monkeypatch)
+    client = seeded_app["client"]
+
+    from connectors.sharepoint.crawler import _convert_spares_per_slot
+
+    assert _convert_spares_per_slot() == 2  # the crawler's own default before any save
+
+    resp = client.post(
+        "/api/admin/server-config",
+        json={"sections": {"extraction": {"crawler": {"convert_spares_per_slot": 5}}}},
+        headers=_auth(seeded_app["admin_token"]),
+    )
+    assert resp.status_code == 200, resp.text
+    assert _convert_spares_per_slot() == 5
+
+
+# ---------------------------------------------------------------------------
+# Run knobs an admin needs without server access (2026-09-02): lane
+# concurrency, and the facts stage's stream_every / run_timeout_s / transport /
+# retry_mode / provider instance defaults — declared, validated, persisted.
+# `provider` (2026-09-03, the Vertex-incident fix) is the odd one out: its
+# three values are a provider NAME, not a knob the stage clamps, so it has
+# no sibling entry in `test_caps_match_the_stages_own_clamps` below.
+# ---------------------------------------------------------------------------
+
+
+def test_run_knobs_are_known_fields_with_the_stages_own_defaults(seeded_app, monkeypatch):
+    client, token = _client(seeded_app, monkeypatch)
+    fields = client.get("/api/admin/server-config", headers=_auth(token)).json()["known_fields"]["extraction"]
+    from app.worker.runtime import _DEFAULT_EXTRACTION_CONCURRENCY
+    from connectors.sharepoint.facts_extraction import DEFAULT_STANDALONE_TIMEOUT_S
+
+    assert fields["concurrency"]["kind"] == "int"
+    assert fields["concurrency"]["default"] == _DEFAULT_EXTRACTION_CONCURRENCY
+    facts = fields["facts"]["fields"]
+    assert facts["stream_every"] == {**facts["stream_every"], "kind": "int", "default": 0}
+    assert facts["run_timeout_s"]["default"] == DEFAULT_STANDALONE_TIMEOUT_S
+    assert facts["concurrency_passes"] == {**facts["concurrency_passes"], "kind": "int", "default": 4}
+    assert facts["transport"]["default"] == "sync"
+    assert facts["retry_mode"]["default"] == "on_gate_fail"
+    assert facts["provider"] == {**facts["provider"], "kind": "string", "default": "inherit"}
+    assert facts["vertex_region"] == {**facts["vertex_region"], "kind": "string", "default": ""}
+
+
+def test_caps_match_the_stages_own_clamps():
+    """`extraction.concurrency` (the LANE cap) must equal the worker
+    runtime's own clamp — a live run posted 12, the runtime silently
+    re-clamped it to 8 and logged a warning nobody saw until after the
+    fact. `extraction.facts.concurrency` is a different stage (document
+    concurrency inside one facts pass) with its own, unrelated ceiling."""
+    from app.api.admin import _FACTS_CONCURRENCY_MAX, _LANE_CONCURRENCY_MAX
+    from app.worker.runtime import _MAX_EXTRACTION_CONCURRENCY
+    from connectors.sharepoint.facts_extraction import MAX_CONCURRENCY
+
+    assert _FACTS_CONCURRENCY_MAX == MAX_CONCURRENCY == 64
+    assert _LANE_CONCURRENCY_MAX == _MAX_EXTRACTION_CONCURRENCY == 24
+
+
+def test_post_run_knobs_persist_and_get_reflects_them(seeded_app, monkeypatch):
+    client, token = _client(seeded_app, monkeypatch)
+    resp = client.post(
+        "/api/admin/server-config",
+        json={
+            "sections": {
+                "extraction": {
+                    "concurrency": 6,
+                    "facts": {
+                        "stream_every": 300,
+                        "transport": "batch",
+                        "retry_mode": "off",
+                        "run_timeout_s": 7200,
+                        "concurrency_passes": 2,
+                        "provider": "vertex",
+                        # A documented bucket for the default (Haiku) model
+                        # — see `VERTEX_REGION_MODEL_MATRIX` (TCRD-296
+                        # synthesis F.25); an undocumented region×model
+                        # pairing is refused with a 422 (see
+                        # `test_an_undocumented_vertex_region_model_pairing_is_refused`
+                        # below).
+                        "vertex_region": "europe-west1",
+                    },
+                }
+            }
+        },
+        headers=_auth(token),
+    )
+    assert resp.status_code == 200, resp.text
+    got = client.get("/api/admin/server-config", headers=_auth(token)).json()["sections"]["extraction"]
+    assert got["concurrency"] == 6
+    assert got["facts"]["stream_every"] == 300
+    assert got["facts"]["transport"] == "batch"
+    assert got["facts"]["retry_mode"] == "off"
+    assert got["facts"]["run_timeout_s"] == 7200
+    assert got["facts"]["concurrency_passes"] == 2
+    assert got["facts"]["provider"] == "vertex"
+    assert got["facts"]["vertex_region"] == "europe-west1"
+
+
+@pytest.mark.parametrize(
+    "patch",
+    [
+        {"concurrency": 0},
+        {"concurrency": 25},
+        {"facts": {"concurrency": 65}},
+        {"facts": {"stream_every": -1}},
+        {"facts": {"run_timeout_s": 5}},
+        {"facts": {"concurrency_passes": 0}},
+        {"facts": {"concurrency_passes": 65}},
+        {"facts": {"transport": "carrier-pigeon"}},
+        {"facts": {"retry_mode": "sometimes"}},
+        {"facts": {"stream_every": "300"}},
+        {"facts": {"provider": "openai"}},
+        {"facts": {"vertex_region": "US-East4!"}},
+        {"facts": {"vertex_region": 4}},
+    ],
+)
+def test_run_knobs_out_of_range_or_wrong_type_are_refused(seeded_app, monkeypatch, patch):
+    client, token = _client(seeded_app, monkeypatch)
+    resp = client.post("/api/admin/server-config", json={"sections": {"extraction": patch}}, headers=_auth(token))
+    assert resp.status_code == 422, resp.text
+
+
+def test_vertex_region_global_is_accepted(seeded_app, monkeypatch):
+    client, token = _client(seeded_app, monkeypatch)
+    resp = client.post(
+        "/api/admin/server-config",
+        json={"sections": {"extraction": {"facts": {"vertex_region": "global"}}}},
+        headers=_auth(token),
+    )
+    assert resp.status_code == 200, resp.text
+    got = client.get("/api/admin/server-config", headers=_auth(token)).json()["sections"]["extraction"]
+    assert got["facts"]["vertex_region"] == "global"
+
+
+class TestVertexRegionModelMatrix:
+    """TCRD-296 synthesis F.25, live finding (b): a Vertex Claude quota
+    bucket that does not exist for a given region×model pairing answers
+    429 on EVERY call, even a 5-token one — refused here with a 422
+    instead of letting every pass discover it live."""
+
+    def test_sonnet_outside_global_is_refused(self, seeded_app, monkeypatch):
+        client, token = _client(seeded_app, monkeypatch)
+        resp = client.post(
+            "/api/admin/server-config",
+            json={
+                "sections": {
+                    "extraction": {"facts": {"model": "sonnet", "provider": "vertex", "vertex_region": "us-east5"}}
+                }
+            },
+            headers=_auth(token),
+        )
+        assert resp.status_code == 422, resp.text
+        assert "no documented Claude-on-Vertex quota bucket" in resp.json()["detail"]
+
+    def test_sonnet_in_global_is_accepted(self, seeded_app, monkeypatch):
+        client, token = _client(seeded_app, monkeypatch)
+        resp = client.post(
+            "/api/admin/server-config",
+            json={
+                "sections": {
+                    "extraction": {"facts": {"model": "sonnet", "provider": "vertex", "vertex_region": "global"}}
+                }
+            },
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200, resp.text
+
+    def test_haiku_is_accepted_in_every_documented_region(self, seeded_app, monkeypatch):
+        client, token = _client(seeded_app, monkeypatch)
+        for region in ("global", "us-east5", "europe-west1"):
+            resp = client.post(
+                "/api/admin/server-config",
+                json={"sections": {"extraction": {"facts": {"model": "haiku", "vertex_region": region}}}},
+                headers=_auth(token),
+            )
+            assert resp.status_code == 200, resp.text
+
+    def test_an_unlisted_tier_is_unconstrained(self, seeded_app, monkeypatch):
+        """Opus (or a future tier this table does not name) is not in the
+        matrix — treated as unconstrained rather than refused on a stale
+        table."""
+        client, token = _client(seeded_app, monkeypatch)
+        resp = client.post(
+            "/api/admin/server-config",
+            json={"sections": {"extraction": {"facts": {"model": "opus", "vertex_region": "us-east5"}}}},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200, resp.text

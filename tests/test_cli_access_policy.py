@@ -398,3 +398,27 @@ class TestTablePolicyPreview:
             result = runner.invoke(app, ["admin", "table-policy", "preview", "orders", "--as-groups", "X"])
         assert result.exit_code == 1
         assert "policy_preview_no_policy" in result.output
+
+
+class TestTablePolicyPreviewSurfaceRefusal:
+    """F2 (#1979, security review): the preview endpoint is gated by
+    ``require_admin_all_surface``, so an admin running it from an
+    ``agnes init``-ed workspace (a ``surface='stack'`` PAT) gets a 403 whose
+    detail names the fix. The CLI must show that detail rather than a bare
+    "Failed" -- the credential, not the policy, is what needs changing."""
+
+    def test_the_403_detail_reaches_the_terminal(self):
+        detail = (
+            "This endpoint requires an admin credential with the full "
+            "('all') data-read surface — a surface='stack' PAT (the "
+            "`agnes init` default) is filtered like an analyst here. "
+            "Use a browser session, a regular PAT, or "
+            "`agnes init --as-admin`."
+        )
+
+        with patch("cli.commands.admin.api_post", side_effect=lambda *a, **k: _resp(403, {"detail": detail})):
+            result = runner.invoke(app, ["admin", "table-policy", "preview", "invoices", "--as-groups", "Finance"])
+
+        assert result.exit_code == 1, result.output
+        assert "agnes init --as-admin" in result.output
+        assert "data-read surface" in result.output

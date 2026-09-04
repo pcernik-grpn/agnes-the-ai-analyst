@@ -613,6 +613,16 @@ def _slack_channel_blocks() -> list[Block]:
 # ---------------------------------------------------------------------------
 
 
+#: Cap on how many files of one collection ride along in the /admin/access
+#: overview payload. Past this, browsing switches to
+#: ``GET /api/admin/access/resources/corpus_file/search`` (the picker's
+#: search-as-you-type) instead of scrolling a preloaded list — see the
+#: `#2158`-class regression this bounds: an instance with ~216k files
+#: across ~390 collections made the unbounded projection a 37 MB payload
+#: that froze the admin's browser tab rendering it.
+_CORPUS_FILE_PREVIEW_LIMIT = 10
+
+
 def _corpus_file_blocks() -> list[Block]:
     """Project ``corpus_files`` into the (block → items) shape the admin
     /access page renders — one block per parent collection.
@@ -631,20 +641,73 @@ def _corpus_file_blocks() -> list[Block]:
     and who can reach it". An inventory with a silent hole is worse than a
     slightly redundant one. Filenames and sizes only — never content, and
     never a link that would serve it.
-    """
-    from src.repositories import corpus_files_repo, file_corpora_repo
 
-    blocks: list[Block] = []
+    ``items`` is BOUNDED to :data:`_CORPUS_FILE_PREVIEW_LIMIT` files per
+    collection, in filename order — this projection used to list every file
+    of every collection (see the module-level cap docstring above for the
+    payload it produced). Two things stay unbounded on purpose:
+
+    - ``items_total`` / ``items_truncated`` so the UI can say "25 of 6,204
+      shown" rather than silently look complete.
+    - a file that ALREADY carries its own grant is always included, even
+      past the cap — the ``/admin/access`` "By group" tab resolves a
+      group's held resources by looking the resource id up in this
+      projection, and a per-file grant that quietly fell out of the preview
+      window would be a group holding something an admin can no longer see
+      or revoke. Per-file grants are a narrow, manual feature (the Library's
+      "share one file" action), so this set is expected to stay small even
+      on a large instance — nothing like the file count itself.
+    """
+    from src.repositories import corpus_files_repo, file_corpora_repo, resource_grants_repo
+
     cf_repo = corpus_files_repo()
     cols = file_corpora_repo().list(limit=_GRANT_PROJECTION_LIMIT)
+    if not cols:
+        return []
     owners = _owner_emails(c.get("created_by") for c in cols)
-    for col in cols:
+
+    # One grouped count for the whole page (see `count_by_corpus`) instead of
+    # a second per-collection query — `items_total` reuses it rather than
+    # `len(list_for_corpus(col_id))`, which would re-fetch every row just to
+    # count them.
+    try:
+        counts: dict[str, int] = cf_repo.count_by_corpus()
+    except Exception:
+        logger.exception("corpus-file count projection failed; listing collections without counts")
+        counts = {}
+
+    # Files that already carry a grant, grouped by their parent collection —
+    # see the "always included" note above. One bulk grants read plus one
+    # `get()` per granted file (bounded by how many per-file grants exist on
+    # the instance, not by how many files it has).
+    granted_by_corpus: dict[str, list[dict]] = {}
+    try:
+        granted_ids = {
+            g["resource_id"] for g in resource_grants_repo().list_all(resource_type=ResourceType.CORPUS_FILE.value)
+        }
+    except Exception:
+        logger.exception("corpus-file grant lookup failed; previewing without the always-included set")
+        granted_ids = set()
+    for fid in granted_ids:
         try:
-            files = cf_repo.list_for_corpus(col["id"])
+            f = cf_repo.get(fid)
+        except Exception:
+            f = None
+        if f:
+            granted_by_corpus.setdefault(f["corpus_id"], []).append(f)
+
+    blocks: list[Block] = []
+    for col in cols:
+        total = counts.get(col["id"], 0)
+        if not total:
+            continue  # nothing to list, and an empty block renders as noise
+        try:
+            preview = cf_repo.list_for_corpus(col["id"], limit=_CORPUS_FILE_PREVIEW_LIMIT)
         except Exception:
             continue
-        if not files:
-            continue  # nothing to list, and an empty block renders as noise
+        preview_ids = {f["id"] for f in preview}
+        always_included = [f for f in granted_by_corpus.get(col["id"], []) if f["id"] not in preview_ids]
+        files = preview + always_included
         owner = owners.get(col.get("created_by") or "")
         name = col.get("name") or col.get("slug")
         blocks.append(
@@ -664,6 +727,8 @@ def _corpus_file_blocks() -> list[Block]:
                     }
                     for f in files
                 ],
+                "items_total": total,
+                "items_truncated": total > len(preview),
             }
         )
     return blocks

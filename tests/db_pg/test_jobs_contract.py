@@ -234,6 +234,46 @@ def test_list_respects_limit(repo):
     assert len(repo.list(kind="bulk", limit=50)) == 5
 
 
+def test_counts_by_kind_groups_queued_and_running_per_kind(repo):
+    repo.enqueue("corpus-extraction", {})
+    repo.enqueue("corpus-extraction", {})
+    running = repo.enqueue("corpus-extraction", {})
+    repo.claim_next(kinds=["corpus-extraction"], worker_id="w1")
+    assert repo.get(running["id"]) is not None  # sanity: at least one job exists
+    repo.enqueue("sharepoint-facts-extraction", {})
+
+    counts = repo.counts_by_kind(["corpus-extraction", "sharepoint-facts-extraction"])
+    assert counts["corpus-extraction"]["queued"] == 2
+    assert counts["corpus-extraction"]["running"] == 1
+    assert counts["sharepoint-facts-extraction"]["queued"] == 1
+    assert counts["sharepoint-facts-extraction"]["running"] == 0
+
+
+def test_counts_by_kind_zero_fills_a_kind_with_no_rows(repo):
+    counts = repo.counts_by_kind(["nothing-queued-here"])
+    assert counts == {"nothing-queued-here": {"queued": 0, "running": 0}}
+
+
+def test_counts_by_kind_ignores_kinds_outside_the_requested_set(repo):
+    repo.enqueue("other-kind", {})
+    counts = repo.counts_by_kind(["corpus-extraction"])
+    assert counts == {"corpus-extraction": {"queued": 0, "running": 0}}
+
+
+def test_counts_by_kind_ignores_done_and_failed_jobs(repo):
+    done = repo.enqueue("corpus-extraction", {})
+    claimed = repo.claim_next(kinds=["corpus-extraction"], worker_id="w1")
+    assert claimed["id"] == done["id"]
+    repo.complete(claimed["id"], "w1", claimed["lease_token"])
+
+    counts = repo.counts_by_kind(["corpus-extraction"])
+    assert counts["corpus-extraction"] == {"queued": 0, "running": 0}
+
+
+def test_counts_by_kind_empty_kinds_list_returns_empty_dict(repo):
+    assert repo.counts_by_kind([]) == {}
+
+
 # ---------------------------------------------------------------------------
 # claim / lease / complete / fail lifecycle
 # ---------------------------------------------------------------------------
@@ -303,6 +343,25 @@ def test_claim_next_orders_by_priority_then_fifo(repo):
     third = repo.claim_next(kinds=["ordered"], worker_id="w1")
 
     assert [first["id"], second["id"], third["id"]] == [high1["id"], high2["id"], low["id"]]
+
+
+def test_claim_next_prefers_a_queued_facts_pass_over_a_queued_shard(repo):
+    """2026-09-03 auto-parallel-crawl design §4.6/Task 7: a shard child
+    (``corpus-extraction-shard``, priority -1 — see ``connectors.
+    sharepoint.crawler._SHARD_JOB_PRIORITY``) is enqueued at the DEFAULT
+    priority BELOW a queued ``sharepoint-facts-extraction`` pass (priority
+    0), so a run's tail (the connection-keyed facts pass a streaming
+    threshold — or the finalizer — enqueues) is never starved behind a
+    fresh site's initial K-shard fan-out."""
+    shard = repo.enqueue("corpus-extraction-shard", {"connection_id": "conn-1"}, priority=-1)
+    time.sleep(0.02)
+    facts = repo.enqueue("sharepoint-facts-extraction", {"connection_id": "conn-1"}, priority=0)
+
+    first = repo.claim_next(kinds=["corpus-extraction-shard", "sharepoint-facts-extraction"], worker_id="w1")
+    second = repo.claim_next(kinds=["corpus-extraction-shard", "sharepoint-facts-extraction"], worker_id="w1")
+
+    assert first["id"] == facts["id"]
+    assert second["id"] == shard["id"]
 
 
 def test_claim_next_does_not_reclaim_before_lease_expires(repo):
@@ -417,6 +476,33 @@ def test_complete_with_result_is_noop_for_wrong_token(repo):
     row = repo.get(claimed["id"])
     assert row["status"] == "running"
     assert "result" not in row["payload_json"]
+
+
+def test_record_continuation_stamps_continued_by_job_id_onto_result(repo):
+    """The sharepoint-facts-extraction auto-continuation flow: `complete()`
+    persists a report under `result`, and once the CONTINUATION job's id
+    is known (only after this job left 'running'), `record_continuation`
+    patches it in — see `JobsRepository.record_continuation`'s docstring."""
+    repo.enqueue("sharepoint-facts-extraction", {"connection_id": "c1"})
+    claimed = repo.claim_next(kinds=["sharepoint-facts-extraction"], worker_id="w1")
+    repo.complete(claimed["id"], "w1", claimed["lease_token"], {"interrupted": True, "interrupted_reason": "timeout"})
+    stamped = repo.record_continuation(claimed["id"], "next-job-id")
+    assert stamped is True
+    row = repo.get(claimed["id"])
+    assert row["payload_json"]["result"]["interrupted_reason"] == "timeout"
+    assert row["payload_json"]["result"]["continued_by_job_id"] == "next-job-id"
+
+
+def test_record_continuation_is_noop_for_unknown_job(repo):
+    assert repo.record_continuation("does-not-exist", "next-job-id") is False
+
+
+def test_record_continuation_is_noop_when_job_has_no_stored_result(repo):
+    """A job whose handler returned `None` (every non-`agent_response`/
+    `sharepoint-facts-extraction` kind, and this one before `complete()`
+    is even called) has no `result` to annotate."""
+    job = repo.enqueue("plain_kind", {})
+    assert repo.record_continuation(job["id"], "next-job-id") is False
 
 
 def test_fail_with_retry_requeues(repo):
@@ -534,6 +620,89 @@ def test_reap_exhausted_returns_rows_across_multiple_stuck_jobs(repo):
     assert {r["id"] for r in reaped} == {job_a["id"], job_b["id"]}
     assert repo.get(job_a["id"])["status"] == "failed"
     assert repo.get(job_b["id"])["status"] == "failed"
+
+
+# ---------------------------------------------------------------------------
+# cancel — admin-initiated force-finalize (no lease token needed)
+# ---------------------------------------------------------------------------
+
+
+def test_cancel_finalizes_a_running_job_without_a_lease_token(repo):
+    repo.enqueue("stuck_kind", {})
+    claimed = repo.claim_next(kinds=["stuck_kind"], worker_id="w1", lease_seconds=120)
+    # The admin caller never claimed this job and has no lease_token — cancel()
+    # must not need one.
+    mutated = repo.cancel(claimed["id"])
+    assert mutated is True
+    row = repo.get(claimed["id"])
+    assert row["status"] == "failed"
+    assert row["error"] == "cancelled_by_admin"
+    assert row["finished_at"] is not None
+    assert row["lease_expires_at"] is None
+    assert row["leased_by"] is None
+    assert row["lease_token"] is None
+
+
+def test_cancel_finalizes_a_queued_job_too(repo):
+    """A run whose job never got claimed at all (still queued) is still
+    cancellable — an admin should not have to wait for a worker to pick it
+    up first."""
+    job = repo.enqueue("never_claimed", {})
+    mutated = repo.cancel(job["id"])
+    assert mutated is True
+    row = repo.get(job["id"])
+    assert row["status"] == "failed"
+
+
+def test_cancel_accepts_a_custom_error_message(repo):
+    repo.enqueue("custom_err", {})
+    claimed = repo.claim_next(kinds=["custom_err"], worker_id="w1")
+    repo.cancel(claimed["id"], error="cancelled by admin zdenek")
+    row = repo.get(claimed["id"])
+    assert row["error"] == "cancelled by admin zdenek"
+
+
+def test_cancel_is_noop_for_unknown_job(repo):
+    assert repo.cancel("does-not-exist") is False
+
+
+def test_cancel_is_noop_for_already_terminal_job(repo):
+    repo.enqueue("already_done", {})
+    claimed = repo.claim_next(kinds=["already_done"], worker_id="w1")
+    repo.complete(claimed["id"], "w1", claimed["lease_token"])
+    mutated = repo.cancel(claimed["id"])
+    assert mutated is False
+    row = repo.get(claimed["id"])
+    assert row["status"] == "done"  # untouched
+
+
+def test_cancel_then_heartbeat_returns_false_stopping_the_lease_extension(repo):
+    """This is the mechanism that stops a stuck worker's lease-extension
+    loop: cancel() clears the lease and flips status away from 'running',
+    so the NEXT heartbeat() call (using the worker's now-stale lease_token)
+    finds `status = 'running'` no longer true and reports False — see
+    `app/worker/runtime.py::_heartbeat_loop`, which stops extending the
+    first time heartbeat() returns False."""
+    repo.enqueue("heartbeat_vs_cancel", {})
+    claimed = repo.claim_next(kinds=["heartbeat_vs_cancel"], worker_id="w1", lease_seconds=120)
+    assert repo.cancel(claimed["id"]) is True
+    ok = repo.heartbeat(claimed["id"], "w1", claimed["lease_token"], lease_seconds=9999)
+    assert ok is False
+
+
+def test_cancel_then_late_complete_from_the_stuck_worker_is_a_noop(repo):
+    """A zombie handler thread that eventually finishes (or errors) after
+    being cancelled must not resurrect the job — its complete()/fail() call
+    still carries the OLD lease_token, which no longer matches a 'running'
+    row."""
+    repo.enqueue("late_complete_vs_cancel", {})
+    claimed = repo.claim_next(kinds=["late_complete_vs_cancel"], worker_id="w1")
+    repo.cancel(claimed["id"])
+    mutated = repo.complete(claimed["id"], "w1", claimed["lease_token"])
+    assert mutated is False
+    row = repo.get(claimed["id"])
+    assert row["status"] == "failed"
+    assert row["error"] == "cancelled_by_admin"
 
 
 # ---------------------------------------------------------------------------

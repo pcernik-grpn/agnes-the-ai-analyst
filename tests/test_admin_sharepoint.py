@@ -21,6 +21,8 @@ drives the flag through the mocked ``get_value`` config instead.
 from __future__ import annotations
 
 import datetime
+import json
+import re
 import sys
 
 import httpx
@@ -46,7 +48,6 @@ def _audit_params(row: dict) -> dict:
     """``audit_repo().query()`` returns ``params`` as the raw stored JSON
     string, not a parsed dict — decode it here so tests can assert on the
     structured fields (same helper as ``tests/test_agent_memory_write_api.py``)."""
-    import json
 
     v = row.get("params")
     return json.loads(v) if isinstance(v, str) else (v or {})
@@ -1331,6 +1332,138 @@ class TestScopeRemoval:
         assert len(remaining) == 1
         assert remaining[0]["group_id"] == admin_group_id
 
+    def test_removing_a_scope_that_shares_a_collection_keeps_it_even_when_empty(self, seeded_app, monkeypatch):
+        """Two scopes sharing ONE collection (bulk-add's `collection` option)
+        — unticking one must not soft-delete (or tombstone as solely-owned)
+        the collection while the OTHER scope still routes to it, even
+        though the collection holds zero files."""
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        _install_item_resolver(
+            monkeypatch,
+            {"Folder A": _folder_item("item-a", "Folder A"), "Folder B": _folder_item("item-b", "Folder B")},
+        )
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="remove-shared-conn")
+
+        bulk = c.post(
+            f"{BASE}/{conn_id}/scopes/bulk",
+            json={"paths": ["Folder A", "Folder B"], "drive_id": "drv1", "collection": {"name": "Shared Site"}},
+            headers=_auth(token),
+        )
+        assert bulk.status_code == 200, bulk.text
+        created = bulk.json()["created"]
+        shared_collection_id = created[0]["collection_id"]
+        assert created[1]["collection_id"] == shared_collection_id
+
+        r = c.delete(f"{BASE}/{conn_id}/scopes", params={"source_scope_id": "item-a"}, headers=_auth(token))
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["collection_kept"] is True
+        assert body["collection"]["id"] == shared_collection_id
+
+        # The collection is still live and the OTHER scope still resolves it.
+        coll = c.get(f"/api/collections/{shared_collection_id}", headers=_auth(token))
+        assert coll.status_code == 200
+
+        listed = c.get(f"{BASE}/{conn_id}/scopes", headers=_auth(token)).json()["items"]
+        assert [i["source_scope_id"] for i in listed] == ["item-b"]
+        assert listed[0]["collection_id"] == shared_collection_id
+
+    def test_removing_a_scope_that_shares_a_collection_with_another_connection_keeps_it(self, seeded_app, monkeypatch):
+        """The shared collection can be referenced from a DIFFERENT
+        connection too (a second bulk-add call reusing ``collection_id``, or
+        post-consolidation) — untick must scan every SharePoint connection,
+        not just this one, and only clean up once the LAST reference is
+        gone."""
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn1 = _create_connection(c, token, name="remove-shared-conn-1")
+        conn2 = _create_connection(c, token, name="remove-shared-conn-2")
+
+        _install_item_resolver(monkeypatch, {"Folder A": _folder_item("item-a", "Folder A")})
+        bulk1 = c.post(
+            f"{BASE}/{conn1}/scopes/bulk",
+            json={"paths": ["Folder A"], "drive_id": "drv1", "collection": {"name": "Cross-conn Site"}},
+            headers=_auth(token),
+        )
+        assert bulk1.status_code == 200, bulk1.text
+        shared_collection_id = bulk1.json()["created"][0]["collection_id"]
+
+        _install_item_resolver(monkeypatch, {"Folder B": _folder_item("item-b", "Folder B")})
+        bulk2 = c.post(
+            f"{BASE}/{conn2}/scopes/bulk",
+            json={"paths": ["Folder B"], "drive_id": "drv1", "collection_id": shared_collection_id},
+            headers=_auth(token),
+        )
+        assert bulk2.status_code == 200, bulk2.text
+        assert bulk2.json()["created"][0]["collection_id"] == shared_collection_id
+
+        r = c.delete(f"{BASE}/{conn1}/scopes", params={"source_scope_id": "item-a"}, headers=_auth(token))
+        assert r.status_code == 200, r.text
+        assert r.json()["collection_kept"] is True
+
+        coll = c.get(f"/api/collections/{shared_collection_id}", headers=_auth(token))
+        assert coll.status_code == 200
+
+        # Now remove the LAST reference (conn2's scope) — nothing shares it
+        # any more, so the empty collection is finally cleaned up.
+        r2 = c.delete(f"{BASE}/{conn2}/scopes", params={"source_scope_id": "item-b"}, headers=_auth(token))
+        assert r2.status_code == 200, r2.text
+        assert r2.json()["collection_kept"] is False
+
+        coll2 = c.get(f"/api/collections/{shared_collection_id}", headers=_auth(token))
+        assert coll2.status_code == 404
+
+    def test_removing_a_scope_that_shares_a_collection_keeps_the_sentinel_grant(self, seeded_app, monkeypatch):
+        """Untick of ONE scope sharing a collection must not purge the
+        OTHER, still-live scope's sharepoint-acl-sync sentinel grant — the
+        sync will keep reconciling that collection on its own schedule."""
+        from app.resource_types import ResourceType
+        from connectors.sharepoint.acl_sync import ACL_SYNC_SENTINEL
+        from src.repositories import resource_grants_repo, user_groups_repo
+
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        _install_item_resolver(
+            monkeypatch,
+            {"Folder A": _folder_item("item-a", "Folder A"), "Folder B": _folder_item("item-b", "Folder B")},
+        )
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="remove-shared-sentinel")
+
+        bulk = c.post(
+            f"{BASE}/{conn_id}/scopes/bulk",
+            json={
+                "paths": ["Folder A", "Folder B"],
+                "drive_id": "drv1",
+                "collection": {"name": "Shared Sentinel Site"},
+            },
+            headers=_auth(token),
+        )
+        assert bulk.status_code == 200, bulk.text
+        shared_collection_id = bulk.json()["created"][0]["collection_id"]
+
+        sentinel_group = user_groups_repo().ensure(
+            name="entra:remove-shared-sentinel-oid", created_by=ACL_SYNC_SENTINEL
+        )
+        resource_grants_repo().ensure_grant(
+            sentinel_group["id"], ResourceType.COLLECTION.value, shared_collection_id, assigned_by=ACL_SYNC_SENTINEL
+        )
+
+        r = c.delete(f"{BASE}/{conn_id}/scopes", params={"source_scope_id": "item-a"}, headers=_auth(token))
+        assert r.status_code == 200, r.text
+        assert r.json()["collection_kept"] is True
+
+        remaining = [
+            g
+            for g in resource_grants_repo().list_all(resource_type=ResourceType.COLLECTION.value)
+            if g["resource_id"] == shared_collection_id
+        ]
+        assert len(remaining) == 1
+        assert remaining[0]["group_id"] == sentinel_group["id"]
+
 
 class TestUntickRetickLifecycle:
     """Tick → untick → re-tick must never breed a duplicate collection.
@@ -2033,6 +2166,38 @@ class TestFactsExtractionTrigger:
         assert facts.status_code == 202, facts.text
         assert facts.json()["job_id"] != crawl_job["id"]
 
+    def test_a_large_backlog_fans_out_into_several_partition_jobs(self, seeded_app, monkeypatch):
+        """TCRD-296 gap #67: a backlog large enough to justify more than
+        one partition enqueues several jobs, additively reported
+        (``jobs``/``partitions_total``) alongside the SAME ``job_id``/
+        ``status`` keys (the first partition's) an existing caller reads."""
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(_ENABLED_FACTS_CONFIG))
+        monkeypatch.setattr(
+            "connectors.sharepoint.facts_extraction.count_pending_documents", lambda connection_id: 9000
+        )
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="facts-fanout")
+
+        r = c.post(self.FACTS_EXTRACT.format(base=BASE, cid=conn_id), headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 202, r.text
+        body = r.json()
+        assert body["partitions_total"] == 4  # default extraction.facts.concurrency_passes
+        assert len(body["jobs"]) == 4
+        assert body["job_id"] == body["jobs"][0]["job_id"]
+
+        from src.repositories import jobs_repo
+
+        live = jobs_repo().list(kind="sharepoint-facts-extraction", status="queued", limit=10)
+        assert len(live) == 4
+        assert sorted(j["payload_json"]["partition"]["index"] for j in live) == [0, 1, 2, 3]
+
+        # An identical second trigger is a pure no-op — 409, never a
+        # partial 202.
+        second = c.post(self.FACTS_EXTRACT.format(base=BASE, cid=conn_id), headers=_auth(seeded_app["admin_token"]))
+        assert second.status_code == 409, second.text
+        assert second.json()["detail"]["error"] == "facts_extraction_already_running"
+        assert len(second.json()["detail"]["job_ids"]) == 4
+
 
 class TestCertificateMetadata:
     """`GET /connections/{id}/certificate` — read-only certificate metadata
@@ -2182,6 +2347,116 @@ class TestChangesFeedFailsCleanOnDuckDB:
             headers=_auth(token),
         )
         r = c.get(f"{BASE}/{conn_id}/changes", headers=_auth(token))
+        assert r.status_code == 501
+        assert r.json()["error"] == "requires_postgres_backend"
+
+
+class TestConsolidateCollectionsFailsCleanOnDuckDB:
+    """Collection consolidation (`POST .../collections/consolidate`) is
+    PG-only by construction — it touches `corpus_file_sources` / `claims` /
+    `fact_alias_sources`, themselves PG-only (A3 ratchet). The happy path
+    (preview counts, the real merge, grants union, soft-delete) lives in
+    tests/db_pg/test_sharepoint_collection_consolidate_route_pg.py; this
+    suite (the DuckDB-backed default here) only proves the typed 501 —
+    never a raw 500 — for both the dry-run and the real-merge shape."""
+
+    @pytest.fixture(autouse=True)
+    def _pin_duckdb_backend(self, duckdb_backend_pinned):
+        """Resolve DuckDB regardless of a `tests/db_pg/` test having run
+        earlier in this worker process (issue #1658)."""
+
+    def _connection_with_two_scopes(self, c, token, name):
+        conn_id = _create_connection(c, token, name=name)
+        c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "drive:a", "display_path": "A"},
+            headers=_auth(token),
+        )
+        c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "drive:b", "display_path": "B"},
+            headers=_auth(token),
+        )
+        return conn_id
+
+    def test_dry_run_501_on_duckdb_backend(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = self._connection_with_two_scopes(c, token, "consolidate-duckdb-dry")
+        r = c.post(
+            f"{BASE}/{conn_id}/collections/consolidate",
+            json={"target": {"name": "Merged"}},
+            headers=_auth(token),
+        )
+        assert r.status_code == 501
+        assert r.json()["error"] == "requires_postgres_backend"
+
+    def test_real_merge_501_on_duckdb_backend(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = self._connection_with_two_scopes(c, token, "consolidate-duckdb-real")
+        r = c.post(
+            f"{BASE}/{conn_id}/collections/consolidate",
+            json={"target": {"name": "Merged"}, "dry_run": False},
+            headers=_auth(token),
+        )
+        assert r.status_code == 501
+        assert r.json()["error"] == "requires_postgres_backend"
+
+    def test_include_split_siblings_still_501s_on_duckdb_backend(self, seeded_app):
+        """`include_split_siblings` widens which collections are folded but
+        never changes WHICH repo does the folding — still typed 501, never
+        a raw 500, on a DuckDB-backed instance."""
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = self._connection_with_two_scopes(c, token, "consolidate-duckdb-siblings")
+        r = c.post(
+            f"{BASE}/{conn_id}/collections/consolidate",
+            json={"target": {"name": "Merged"}, "include_split_siblings": True},
+            headers=_auth(token),
+        )
+        assert r.status_code == 501
+        assert r.json()["error"] == "requires_postgres_backend"
+
+
+class TestSplitMergeFailsCleanOnDuckDB:
+    """Split-merge (``POST .../splits/merge``) is PG-only by construction —
+    it touches ``sharepoint_connection_state`` (crawl/facts bookkeeping) and
+    ``extraction_runs``, both PG-only (A3 ratchet), on top of the same
+    PG-only collection consolidation ``TestConsolidateCollectionsFailsCleanOnDuckDB``
+    above already covers. The happy path lives in
+    tests/db_pg/test_sharepoint_connection_split_merge_route_pg.py; this
+    suite (the DuckDB-backed default here) only proves the typed 501 —
+    never a raw 500 — for both the dry-run and the real-merge shape."""
+
+    @pytest.fixture(autouse=True)
+    def _pin_duckdb_backend(self, duckdb_backend_pinned):
+        """Resolve DuckDB regardless of a ``tests/db_pg/`` test having run
+        earlier in this worker process (issue #1658)."""
+
+    def test_dry_run_501_on_duckdb_backend(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        target = _create_connection(c, token, name="split-merge-duckdb-target")
+        sib = _create_connection(c, token, name="split-merge-duckdb-sib")
+        r = c.post(
+            f"{BASE}/{target}/splits/merge",
+            json={"sibling_ids": [sib], "target": {"name": "Merged"}},
+            headers=_auth(token),
+        )
+        assert r.status_code == 501
+        assert r.json()["error"] == "requires_postgres_backend"
+
+    def test_real_merge_501_on_duckdb_backend(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        target = _create_connection(c, token, name="split-merge-duckdb-real-target")
+        sib = _create_connection(c, token, name="split-merge-duckdb-real-sib")
+        r = c.post(
+            f"{BASE}/{target}/splits/merge",
+            json={"sibling_ids": [sib], "target": {"name": "Merged"}, "dry_run": False},
+            headers=_auth(token),
+        )
         assert r.status_code == 501
         assert r.json()["error"] == "requires_postgres_backend"
 
@@ -2382,6 +2657,25 @@ class TestExtractionTrigger:
         job = jobs_repo().get(r.json()["job_id"])
         assert job["payload_json"] == {"connection_id": conn_id, "resync": True}
 
+    def test_force_replan_option_rides_in_the_payload(self, seeded_app, monkeypatch):
+        """2026-09-04 finding #65 item 2 — re-balance a large site's shards
+        without touching any cursor (unlike `resync`): no key when unset,
+        `force_replan: true` when the admin asks for one."""
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(_ENABLED_EXTRACTION_CONFIG))
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="ex-options-replan")
+        r = c.post(
+            self.EXTRACT.format(base=BASE, cid=conn_id),
+            json={"force_replan": True},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 202, r.text
+
+        from src.repositories import jobs_repo
+
+        job = jobs_repo().get(r.json()["job_id"])
+        assert job["payload_json"] == {"connection_id": conn_id, "force_replan": True}
+
     def test_force_reprocess_option_rides_in_the_payload(self, seeded_app, monkeypatch):
         """The stronger 're-process everything' control (unlike `resync`,
         also ignores cTags — see `connectors.sharepoint.crawler._process_
@@ -2402,6 +2696,75 @@ class TestExtractionTrigger:
 
         job = jobs_repo().get(r.json()["job_id"])
         assert job["payload_json"] == {"connection_id": conn_id, "force_reprocess": True}
+
+    def test_retry_failed_option_rides_in_the_payload(self, seeded_app, monkeypatch):
+        """The targeted alternative to `resync` (see
+        `connectors.sharepoint.crawler._retry_failed_items`'s
+        `include_given_up`): no key when unset, `retry_failed: true` when
+        the admin ticks the box — and nothing else rides along uninvited."""
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(_ENABLED_EXTRACTION_CONFIG))
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="ex-options-retry-failed")
+        r = c.post(
+            self.EXTRACT.format(base=BASE, cid=conn_id),
+            json={"retry_failed": True},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 202, r.text
+
+        from src.repositories import jobs_repo
+
+        job = jobs_repo().get(r.json()["job_id"])
+        assert job["payload_json"] == {"connection_id": conn_id, "retry_failed": True}
+
+    def test_retry_failed_response_carries_queued_count_from_the_backlog(self, seeded_app, monkeypatch):
+        """The toast the button shows after clicking must say the same
+        count the button already promised — read from the SAME persisted
+        backlog `GET .../extraction/status` counts."""
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(_ENABLED_EXTRACTION_CONFIG))
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="ex-retry-failed-count")
+
+        from connectors.sharepoint.crawler import save_state
+
+        save_state(
+            conn_id,
+            {
+                "delta_links": {},
+                "ctags": {},
+                "failed_items": {
+                    "graph:item1": {
+                        "state_key": "b!drive1",
+                        "item": {"id": "item1", "name": "a.pdf"},
+                        "path": "Reports/a.pdf",
+                    },
+                    "graph:item2": {
+                        "state_key": "b!drive1",
+                        "item": {"id": "item2", "name": "b.pdf"},
+                        "path": "Reports/b.pdf",
+                    },
+                },
+                "empty_items": {},
+            },
+        )
+
+        r = c.post(
+            self.EXTRACT.format(base=BASE, cid=conn_id),
+            json={"retry_failed": True},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 202, r.text
+        assert r.json()["queued_count"] == 2
+
+    def test_a_plain_trigger_never_carries_a_queued_count(self, seeded_app, monkeypatch):
+        """`queued_count` is meaningless without `retry_failed` — an ordinary
+        trigger's response shape must stay exactly what it always was."""
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(_ENABLED_EXTRACTION_CONFIG))
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="ex-no-queued-count")
+        r = c.post(self.EXTRACT.format(base=BASE, cid=conn_id), headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 202, r.text
+        assert "queued_count" not in r.json()
 
     def test_out_of_range_run_options_are_refused_not_reclamped(self, seeded_app, monkeypatch):
         """The crawler would clamp these silently; the endpoint refuses them
@@ -2446,6 +2809,349 @@ class TestExtractionTrigger:
         extraction_state = (row.get("config") or {}).get("extraction") or {}
         assert extraction_state.get("last_job_id") == r.json()["job_id"]
         assert extraction_state.get("last_run_at")
+
+    def test_duckdb_backend_ignores_the_run_liveness_check(self, seeded_app, monkeypatch):
+        """`extraction_runs_repo()` is PG-only (A3) — on this DuckDB-backed
+        test app it raises `RequiresPostgresBackend`, which the new
+        top-level-run-liveness gate must swallow rather than let escape as
+        a 501; the existing job-idempotency-key dedup is what still governs
+        this backend (see `test_duplicate_run_is_409` above)."""
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(_ENABLED_EXTRACTION_CONFIG))
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="ex-duckdb-liveness")
+        r = c.post(self.EXTRACT.format(base=BASE, cid=conn_id), headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 202, r.text
+
+    def test_409_when_a_top_level_run_is_already_running(self, seeded_app, monkeypatch):
+        """2026-09-03 auto-parallel-crawl design §4.4: a sharded site's
+        PARENT run can still be `running` long after its OWN enqueueing
+        `jobs` row already finished (the planner returns fast) — the
+        job-level idempotency dedup alone can no longer catch a second
+        trigger in that window, so this checks `extraction_runs_repo()
+        .get_running()` directly."""
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(_ENABLED_EXTRACTION_CONFIG))
+
+        class FakeRunningExtractionRunsRepo:
+            def get_running(self, connection_id):
+                return {"id": "er_parent1", "connection_id": connection_id}
+
+        monkeypatch.setattr("src.repositories.extraction_runs_repo", lambda: FakeRunningExtractionRunsRepo())
+
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="ex-run-liveness")
+        r = c.post(self.EXTRACT.format(base=BASE, cid=conn_id), headers=_auth(seeded_app["admin_token"]))
+
+        assert r.status_code == 409, r.text
+        assert r.json()["detail"]["error"] == "extraction_already_running"
+        assert r.json()["detail"]["run_id"] == "er_parent1"
+
+    def test_no_running_run_lets_the_trigger_through(self, seeded_app, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(_ENABLED_EXTRACTION_CONFIG))
+
+        class FakeIdleExtractionRunsRepo:
+            def get_running(self, connection_id):
+                return None
+
+        monkeypatch.setattr("src.repositories.extraction_runs_repo", lambda: FakeIdleExtractionRunsRepo())
+
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="ex-run-liveness-idle")
+        r = c.post(self.EXTRACT.format(base=BASE, cid=conn_id), headers=_auth(seeded_app["admin_token"]))
+
+        assert r.status_code == 202, r.text
+
+
+class TestExtractionTriggerShardRerun:
+    """``POST .../extract`` with ``{"shards": [...]}`` — re-run named
+    shards from the connection's last persisted plan (2026-09-03
+    auto-parallel-crawl design §4.4), bypassing the planner entirely."""
+
+    EXTRACT = "{base}/{cid}/extract"
+
+    @staticmethod
+    def _idle_running_repo(monkeypatch):
+        class FakeIdleExtractionRunsRepo:
+            def get_running(self, connection_id):
+                return None
+
+        monkeypatch.setattr("src.repositories.extraction_runs_repo", lambda: FakeIdleExtractionRunsRepo())
+
+    def test_404_no_shard_plan_when_the_connection_never_sharded(self, seeded_app, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(_ENABLED_EXTRACTION_CONFIG))
+        self._idle_running_repo(monkeypatch)
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="ex-shards-none")
+
+        r = c.post(
+            self.EXTRACT.format(base=BASE, cid=conn_id),
+            json={"shards": [1]},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+
+        assert r.status_code == 404, r.text
+        assert r.json()["detail"]["error"] == "no_shard_plan"
+
+    def test_400_unknown_shard_index(self, seeded_app, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(_ENABLED_EXTRACTION_CONFIG))
+        self._idle_running_repo(monkeypatch)
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="ex-shards-unknown")
+
+        from connectors.sharepoint.crawler import save_state
+
+        save_state(
+            conn_id,
+            {
+                "delta_links": {},
+                "ctags": {},
+                "failed_items": {},
+                "empty_items": {},
+                "shard_plan": {
+                    "parent_run_id": "er_old_parent",
+                    "shards_total": 2,
+                    "shards": [
+                        {
+                            "scope_id": "b!drive1",
+                            "label": "part 1/2",
+                            "expected": 10,
+                            "exclude_prefixes": [],
+                            "targets": [
+                                {"drive_id": "b!drive1", "root_item_id": "f1", "state_key": "b!drive1:f1", "path": "A"}
+                            ],
+                        },
+                        {
+                            "scope_id": "b!drive1",
+                            "label": "remainder",
+                            "expected": 0,
+                            "exclude_prefixes": ["A"],
+                            "targets": [
+                                {"drive_id": "b!drive1", "root_item_id": None, "state_key": "b!drive1", "path": ""}
+                            ],
+                        },
+                    ],
+                },
+            },
+        )
+
+        r = c.post(
+            self.EXTRACT.format(base=BASE, cid=conn_id),
+            json={"shards": [5]},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+
+        assert r.status_code == 400, r.text
+        assert r.json()["detail"]["error"] == "unknown_shard_index"
+        assert r.json()["detail"]["unknown"] == [5]
+        assert r.json()["detail"]["shards_total"] == 2
+
+    def test_named_shards_are_enqueued_as_a_fresh_parent_run(self, seeded_app, monkeypatch):
+        # NOTE: `use_pg()` is deliberately left at this test app's default
+        # (DuckDB) -- `_trigger_shard_rerun` bypasses `_plan_or_run_inline`
+        # (the only place that decision gates anything) and calls
+        # `_enqueue_shard_plan` directly, which only ever touches the
+        # connection-level `crawl` state row (never a per-shard `crawl:<key>`
+        # one -- that happens later, inside the child jobs this test never
+        # runs), so the DuckDB fallback state store works unmodified here.
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(_ENABLED_EXTRACTION_CONFIG))
+
+        class FakeExtractionRunsRepo:
+            def __init__(self):
+                self.started = []
+
+            def get_running(self, connection_id):
+                return None
+
+            def abandon_stale_running(self, connection_id):
+                return []
+
+            def start(self, *, connection_id, job_id=None, phase="crawl", **shard_kwargs):
+                self.started.append({"connection_id": connection_id, **shard_kwargs})
+                return "er_new_parent"
+
+        runs = FakeExtractionRunsRepo()
+        monkeypatch.setattr("src.repositories.extraction_runs_repo", lambda: runs)
+
+        class FakeJobsRepo:
+            def __init__(self):
+                self.enqueued = []
+
+            def enqueue(self, kind, payload, *, priority=0, run_after=None, max_attempts=3, idempotency_key=None):
+                row = {
+                    "id": f"job-{len(self.enqueued) + 1}",
+                    "kind": kind,
+                    "payload_json": payload,
+                    "priority": priority,
+                    "idempotency_key": idempotency_key,
+                    "deduped": False,
+                }
+                self.enqueued.append(row)
+                return row
+
+        jobs = FakeJobsRepo()
+        monkeypatch.setattr("src.repositories.jobs_repo", lambda: jobs)
+
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="ex-shards-rerun")
+
+        from connectors.sharepoint.crawler import save_state
+
+        shard_a = {
+            "scope_id": "b!drive1",
+            "label": "part 1/2",
+            "expected": 10,
+            "exclude_prefixes": [],
+            "targets": [{"drive_id": "b!drive1", "root_item_id": "f1", "state_key": "b!drive1:f1", "path": "A"}],
+        }
+        shard_b = {
+            "scope_id": "b!drive1",
+            "label": "remainder",
+            "expected": 0,
+            "exclude_prefixes": ["A"],
+            "targets": [{"drive_id": "b!drive1", "root_item_id": None, "state_key": "b!drive1", "path": ""}],
+        }
+        save_state(
+            conn_id,
+            {
+                "delta_links": {},
+                "ctags": {},
+                "failed_items": {},
+                "empty_items": {},
+                "shard_plan": {
+                    "parent_run_id": "er_old_parent",
+                    "shards_total": 2,
+                    "shards": [shard_a, shard_b],
+                },
+            },
+        )
+
+        r = c.post(
+            self.EXTRACT.format(base=BASE, cid=conn_id),
+            json={"shards": [2]},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+
+        assert r.status_code == 202, r.text
+        body = r.json()
+        assert body["mode"] == "sharded"
+        assert body["shards_total"] == 1
+        assert body["parent_run_id"] == "er_new_parent"
+
+        assert len(jobs.enqueued) == 1
+        assert jobs.enqueued[0]["kind"] == "corpus-extraction-shard"
+        assert jobs.enqueued[0]["payload_json"]["shard"]["label"] == "remainder"
+        assert len(runs.started) == 1
+        assert runs.started[0]["connection_id"] == conn_id
+        assert runs.started[0]["shards_total"] == 1
+        assert runs.started[0]["parent_run_id"] is None  # a fresh top-level parent, not chained to the old one
+
+
+class TestRetryEmptyExtraction:
+    """``POST /connections/{connection_id}/extraction/retry-empty`` —
+    re-queues a connection's ``convert_empty`` backlog. Same job/readiness
+    machinery as ``TestExtractionTrigger`` above; this class covers what is
+    DIFFERENT about it (the payload's ``retry_empty`` flag, and
+    ``queued_count`` reflecting the persisted backlog)."""
+
+    RETRY_EMPTY = "{base}/{cid}/extraction/retry-empty"
+
+    def test_requires_admin(self, seeded_app):
+        r = seeded_app["client"].post(
+            self.RETRY_EMPTY.format(base=BASE, cid="nope"), headers=_auth(seeded_app["analyst_token"])
+        )
+        assert r.status_code == 403
+
+    def test_requires_auth(self, seeded_app):
+        r = seeded_app["client"].post(self.RETRY_EMPTY.format(base=BASE, cid="nope"))
+        assert r.status_code == 401
+
+    def test_404_for_unknown_connection(self, seeded_app, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(_ENABLED_EXTRACTION_CONFIG))
+        r = seeded_app["client"].post(
+            self.RETRY_EMPTY.format(base=BASE, cid="does-not-exist"), headers=_auth(seeded_app["admin_token"])
+        )
+        assert r.status_code == 404
+
+    def test_409_when_sharepoint_disabled(self, seeded_app, monkeypatch):
+        monkeypatch.delenv("AGNES_SHAREPOINT_ENABLED", raising=False)
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value({}))
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="retry-empty-off")
+        # The router-level gate refuses first, so this never even reaches
+        # the connection lookup for an existing connection either.
+        r = c.post(self.RETRY_EMPTY.format(base=BASE, cid=conn_id), headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 409, r.text
+        assert r.json()["detail"]["error"] == "feature_disabled"
+
+    def test_an_empty_backlog_still_succeeds_with_a_zero_count(self, seeded_app, monkeypatch):
+        """No `convert_empty` items ever recorded is a normal, successful
+        answer, not an error — the run still completes (its ordinary
+        incremental walk is harmless), it just has nothing to replay."""
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(_ENABLED_EXTRACTION_CONFIG))
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="retry-empty-none")
+        r = c.post(self.RETRY_EMPTY.format(base=BASE, cid=conn_id), headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 202, r.text
+        assert r.json()["queued_count"] == 0
+
+    def test_queued_count_reflects_the_persisted_empty_items_backlog(self, seeded_app, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(_ENABLED_EXTRACTION_CONFIG))
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="retry-empty-count")
+
+        from connectors.sharepoint.crawler import save_state
+
+        save_state(
+            conn_id,
+            {
+                "delta_links": {},
+                "ctags": {},
+                "failed_items": {},
+                "empty_items": {
+                    "graph:item1": {
+                        "state_key": "b!drive1",
+                        "item": {"id": "item1", "name": "a.pdf"},
+                        "path": "Reports/a.pdf",
+                        "first_seen_at": "2026-09-01T00:00:00+00:00",
+                    },
+                    "graph:item2": {
+                        "state_key": "b!drive1",
+                        "item": {"id": "item2", "name": "b.pdf"},
+                        "path": "Reports/b.pdf",
+                        "first_seen_at": "2026-09-01T00:00:00+00:00",
+                    },
+                },
+            },
+        )
+
+        r = c.post(self.RETRY_EMPTY.format(base=BASE, cid=conn_id), headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 202, r.text
+        assert r.json()["queued_count"] == 2
+
+    def test_the_job_payload_carries_retry_empty_true(self, seeded_app, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(_ENABLED_EXTRACTION_CONFIG))
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="retry-empty-payload")
+        r = c.post(self.RETRY_EMPTY.format(base=BASE, cid=conn_id), headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 202, r.text
+
+        from src.repositories import jobs_repo
+
+        job = jobs_repo().get(r.json()["job_id"])
+        assert job["kind"] == "corpus-extraction"
+        assert job["payload_json"] == {"connection_id": conn_id, "retry_empty": True}
+
+    def test_duplicate_run_is_409_and_shares_the_ordinary_trigger_dedup_key(self, seeded_app, monkeypatch):
+        """A retry-empty run and a plain trigger for the SAME connection
+        must never overlap either — both mutate the same crawl state file."""
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(_ENABLED_EXTRACTION_CONFIG))
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="retry-empty-dup")
+        first = c.post("{base}/{cid}/extract".format(base=BASE, cid=conn_id), headers=_auth(seeded_app["admin_token"]))
+        assert first.status_code == 202, first.text
+
+        second = c.post(self.RETRY_EMPTY.format(base=BASE, cid=conn_id), headers=_auth(seeded_app["admin_token"]))
+        assert second.status_code == 409, second.text
+        assert second.json()["detail"]["error"] == "extraction_already_running"
 
 
 class TestExtractionRunDue:
@@ -2548,6 +3254,63 @@ class TestExtractionRunDue:
         r = c.post(self.RUN_DUE, headers=_auth(seeded_app["admin_token"]))
         assert r.status_code == 200, r.text
         assert r.json()["dispatched"] == []
+
+    def test_a_connection_with_schedule_off_is_never_dispatched(self, seeded_app, monkeypatch):
+        """D.16: ``off`` is never picked up by the sweep, no matter how
+        often it runs or how long the connection has never crawled — the
+        one case that would otherwise ALWAYS dispatch (never-run-before, see
+        ``test_dispatches_a_connection_never_run_before`` above)."""
+        config = {
+            "sharepoint": {"enabled": True},
+            "extraction": {**_ENABLED_EXTRACTION_CONFIG["extraction"], "schedule": "every 15m"},
+        }
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(config))
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="due-schedule-off")
+        c.patch(
+            f"/api/admin/sharepoint/connections/{conn_id}/extraction/crawl-config",
+            json={"schedule": "off"},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+
+        r = c.post(self.RUN_DUE, headers=_auth(seeded_app["admin_token"]))
+
+        assert r.status_code == 200, r.text
+        assert r.json()["dispatched"] == []
+
+    def test_a_connections_own_interval_overrides_the_instance_cadence(self, seeded_app, monkeypatch):
+        """D.16: a connection with its own interval is due by ITS OWN
+        clock, not the instance-wide one — deterministic without freezing
+        time: the instance cadence (``every 24h``) is nowhere near due right
+        after the first dispatch, but the connection's own ``every 0m``
+        (``src.scheduler.is_table_due``: "always due") fires anyway."""
+        config = {
+            "sharepoint": {"enabled": True},
+            "extraction": {**_ENABLED_EXTRACTION_CONFIG["extraction"], "schedule": "every 24h"},
+        }
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(config))
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="due-own-interval")
+
+        first = c.post(self.RUN_DUE, headers=_auth(seeded_app["admin_token"]))
+        assert first.json()["dispatched"] == [conn_id]
+
+        # Without an override, the SAME connection would now be skipped —
+        # the instance's `every 24h` just fired and is nowhere near due
+        # again. Confirms the control case before proving the override.
+        control = c.post(self.RUN_DUE, headers=_auth(seeded_app["admin_token"]))
+        assert control.json()["dispatched"] == []
+
+        c.patch(
+            f"/api/admin/sharepoint/connections/{conn_id}/extraction/crawl-config",
+            json={"schedule": "every 0m"},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+
+        r = c.post(self.RUN_DUE, headers=_auth(seeded_app["admin_token"]))
+
+        assert r.status_code == 200, r.text
+        assert r.json()["dispatched"] == [conn_id]
 
 
 class TestExcludedSubtreeAdvisory:
@@ -3016,6 +3779,1684 @@ class TestAudienceClassMap:
         assert collection_id not in tiered_collection_ids()
 
 
+def _install_item_resolver(monkeypatch, items: dict, *, drive_id: str = "drv1"):
+    """Mock the Graph token exchange plus ``/drives/{drive_id}/root:/{path}``
+    item-by-path lookups for :func:`connectors.sharepoint.graph_client.
+    get_item_by_path`. ``items`` maps a folder path (as the admin would type
+    it) to either an item dict (200) or an int HTTP status (403/404/500...);
+    a path absent from ``items`` answers 404."""
+    from connectors.sharepoint import graph_client as gc
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/oauth2/v2.0/token"):
+            return httpx.Response(200, json={"access_token": "tok-bulk"})
+        prefix = f"/v1.0/drives/{drive_id}/root:/"
+        assert request.url.path.startswith(prefix), request.url.path
+        path = request.url.path[len(prefix) :]
+        entry = items.get(path)
+        if entry is None:
+            return httpx.Response(404, json={"error": {"code": "itemNotFound"}})
+        if isinstance(entry, int):
+            return httpx.Response(entry, json={"error": {"code": "x"}})
+        return httpx.Response(200, json=entry)
+
+    monkeypatch.setattr(
+        gc, "_http_client", lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler), timeout=10)
+    )
+
+
+def _folder_item(item_id: str, name: str) -> dict:
+    return {"id": item_id, "name": name, "folder": {"childCount": 0}}
+
+
+class TestBulkScopeAdd:
+    """``POST …/scopes/bulk`` — resolve many admin-typed folder paths to
+    Graph items and confirm one scope each, in a single call (the fast path
+    for splitting a large SharePoint site across several connections)."""
+
+    def test_requires_admin(self, seeded_app):
+        r = seeded_app["client"].post(
+            f"{BASE}/nope/scopes/bulk",
+            json={"paths": ["A"], "drive_id": "drv1"},
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert r.status_code == 403
+
+    def test_404_for_unknown_connection(self, seeded_app):
+        r = seeded_app["client"].post(
+            f"{BASE}/does-not-exist/scopes/bulk",
+            json={"paths": ["A"], "drive_id": "drv1"},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 404
+
+    def test_creates_a_scope_per_resolved_path(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        _install_item_resolver(
+            monkeypatch,
+            {"Folder A": _folder_item("item-a", "Folder A"), "Folder B/Sub": _folder_item("item-b", "Sub")},
+        )
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="bulk-create")
+
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes/bulk",
+            json={"paths": ["Folder A", "Folder B/Sub"], "drive_id": "drv1"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["skipped"] == []
+        assert body["failed"] == []
+        assert len(body["created"]) == 2
+        for entry in body["created"]:
+            assert entry["access_mode"] == "manual"
+            assert entry["drive_id"] == "drv1"
+            assert entry["include_excluded_subtrees"] is False
+
+        listed = c.get(f"{BASE}/{conn_id}/scopes", headers=_auth(token)).json()["items"]
+        assert {i["source_scope_id"] for i in listed} == {"item-a", "item-b"}
+        # each path minted its own collection
+        assert len({i["collection_id"] for i in listed}) == 2
+
+    def test_skips_a_path_already_present(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        _install_item_resolver(monkeypatch, {"Folder A": _folder_item("item-a", "Folder A")})
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="bulk-skip")
+
+        confirmed = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "item-a", "display_path": "Folder A", "drive_id": "drv1"},
+            headers=_auth(token),
+        )
+        assert confirmed.status_code == 201, confirmed.text
+
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes/bulk",
+            json={"paths": ["Folder A"], "drive_id": "drv1"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["created"] == []
+        assert body["skipped"] == [{"path": "Folder A", "source_scope_id": "item-a", "reason": "already_present"}]
+        assert body["failed"] == []
+
+    def test_unknown_path_is_reported_failed_not_found(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        _install_item_resolver(monkeypatch, {"Folder A": _folder_item("item-a", "Folder A")})
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="bulk-notfound")
+
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes/bulk",
+            json={"paths": ["Folder A", "Ghost Folder"], "drive_id": "drv1"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert len(body["created"]) == 1
+        assert body["failed"] == [{"path": "Ghost Folder", "reason": "not_found"}]
+
+    def test_forbidden_path_is_reported_failed_forbidden(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        _install_item_resolver(monkeypatch, {"Locked Folder": 403})
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="bulk-forbidden")
+
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes/bulk",
+            json={"paths": ["Locked Folder"], "drive_id": "drv1"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["failed"] == [{"path": "Locked Folder", "reason": "forbidden"}]
+
+    def test_upstream_outage_aborts_remaining_paths_but_keeps_already_created(self, seeded_app, monkeypatch):
+        """A non-403/404 Graph failure (network fault, 5xx, ...) is not a
+        per-path fact — it means the whole call is broken and aborts the
+        rest of the batch with a typed 502, but whatever was already
+        resolved and created before that point is still persisted."""
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        _install_item_resolver(
+            monkeypatch,
+            {"Folder A": _folder_item("item-a", "Folder A"), "Folder B": 500},
+        )
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="bulk-outage")
+
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes/bulk",
+            json={"paths": ["Folder A", "Folder B", "Folder C"], "drive_id": "drv1"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 502, r.text
+        assert r.json()["detail"]["error"] == "sharepoint_graph_error"
+
+        listed = c.get(f"{BASE}/{conn_id}/scopes", headers=_auth(token)).json()["items"]
+        assert [i["source_scope_id"] for i in listed] == ["item-a"]
+
+    def test_drive_id_required_without_an_existing_scope(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="bulk-no-drive")
+
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes/bulk",
+            json={"paths": ["Folder A"]},
+            headers=_auth(token),
+        )
+        assert r.status_code == 400, r.text
+        assert r.json()["detail"]["error"] == "drive_id_required"
+
+    def test_drive_id_inferred_from_an_existing_scope(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        _install_item_resolver(monkeypatch, {"Folder A": _folder_item("item-a", "Folder A")}, drive_id="drive-known")
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="bulk-infer-drive")
+
+        confirmed = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "prior", "display_path": "Prior", "drive_id": "drive-known"},
+            headers=_auth(token),
+        )
+        assert confirmed.status_code == 201, confirmed.text
+
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes/bulk",
+            json={"paths": ["Folder A"]},
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+        assert len(r.json()["created"]) == 1
+
+    def test_malformed_drive_id_is_422(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="bulk-bad-drive")
+
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes/bulk",
+            json={"paths": ["Folder A"], "drive_id": "not/a-valid-id"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 422, r.text
+
+    def test_empty_paths_is_422(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="bulk-empty-paths")
+
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes/bulk",
+            json={"paths": ["   "], "drive_id": "drv1"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 422, r.text
+
+    def test_writes_an_audit_row(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        _install_item_resolver(monkeypatch, {"Folder A": _folder_item("item-a", "Folder A")})
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="bulk-audit")
+
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes/bulk",
+            json={"paths": ["Folder A"], "drive_id": "drv1"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+
+        from src.repositories import audit_repo
+
+        rows, _ = audit_repo().query(action="sharepoint_connection.scope_bulk_add", limit=10)
+        assert len(rows) == 1
+        params = _audit_params(rows[0])
+        assert params == {"requested": 1, "created": 1, "skipped": 0, "failed": 0, "access_mode": "manual"}
+
+    def test_readopts_a_tombstoned_collection_instead_of_minting_a_duplicate(self, seeded_app, monkeypatch):
+        """Tick -> untick -> bulk re-add of the same folder must re-adopt the
+        SAME collection (never fork a slug-suffixed duplicate) and clear the
+        tombstone — the same contract a singular re-confirm gets
+        (TestUntickRetickLifecycle)."""
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        _install_item_resolver(monkeypatch, {"Folder A": _folder_item("item-a", "Folder A")})
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="bulk-readopt")
+
+        first = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "item-a", "display_path": "Folder A", "drive_id": "drv1"},
+            headers=_auth(token),
+        )
+        assert first.status_code == 201, first.text
+        collection_id = first.json()["collection_id"]
+
+        untick = c.delete(f"{BASE}/{conn_id}/scopes", params={"source_scope_id": "item-a"}, headers=_auth(token))
+        assert untick.status_code == 200, untick.text
+
+        detail = c.get(f"/api/admin/source-connections/{conn_id}", headers=_auth(token)).json()
+        assert "item-a" in (detail["config"].get("retired_scope_collections") or {})
+
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes/bulk",
+            json={"paths": ["Folder A"], "drive_id": "drv1"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+        assert len(r.json()["created"]) == 1
+        assert r.json()["created"][0]["collection_id"] == collection_id
+
+        detail = c.get(f"/api/admin/source-connections/{conn_id}", headers=_auth(token)).json()
+        assert "item-a" not in (detail["config"].get("retired_scope_collections") or {})
+
+    def test_collection_name_mints_one_shared_collection_for_every_created_path(self, seeded_app, monkeypatch):
+        """``collection: {"name": ...}`` mints ONE new collection and routes
+        every scope THIS call creates into it — the split-a-big-site fix:
+        without it, every path forks its own collection (see
+        ``test_creates_a_scope_per_resolved_path`` above)."""
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        _install_item_resolver(
+            monkeypatch,
+            {"Folder A": _folder_item("item-a", "Folder A"), "Folder B/Sub": _folder_item("item-b", "Sub")},
+        )
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="bulk-shared-name")
+
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes/bulk",
+            json={
+                "paths": ["Folder A", "Folder B/Sub"],
+                "drive_id": "drv1",
+                "collection": {"name": "One Big Site"},
+            },
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert len(body["created"]) == 2
+        collection_ids = {e["collection_id"] for e in body["created"]}
+        assert len(collection_ids) == 1
+
+        coll = c.get(f"/api/collections/{next(iter(collection_ids))}", headers=_auth(token))
+        assert coll.status_code == 200
+        assert coll.json()["name"] == "One Big Site"
+
+    def test_collection_id_routes_to_an_existing_collection(self, seeded_app, monkeypatch):
+        """``collection_id`` reuses an existing, live collection instead of
+        minting one — the option a SECOND bulk-add call (a different
+        connection in the split, or later paths on the same one) uses to
+        keep growing the SAME site collection."""
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="bulk-shared-id")
+
+        from src.repositories import file_corpora_repo
+
+        existing_id = file_corpora_repo().create(
+            name="Pre-existing Site", slug="pre-existing-site-bulk", description=None, created_by="admin"
+        )
+
+        _install_item_resolver(monkeypatch, {"Folder A": _folder_item("item-a", "Folder A")})
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes/bulk",
+            json={"paths": ["Folder A"], "drive_id": "drv1", "collection_id": existing_id},
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["created"][0]["collection_id"] == existing_id
+
+    def test_collection_id_unknown_is_404(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="bulk-shared-404")
+
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes/bulk",
+            json={"paths": ["Folder A"], "drive_id": "drv1", "collection_id": "col_doesnotexist"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 404, r.text
+        assert r.json()["detail"]["error"] == "collection_not_found"
+
+    def test_collection_id_and_collection_are_mutually_exclusive(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="bulk-shared-both")
+
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes/bulk",
+            json={
+                "paths": ["Folder A"],
+                "drive_id": "drv1",
+                "collection_id": "col_x",
+                "collection": {"name": "Y"},
+            },
+            headers=_auth(token),
+        )
+        assert r.status_code == 400, r.text
+        assert r.json()["detail"]["error"] == "both_collection_id_and_collection"
+
+    def test_a_path_already_present_keeps_its_own_collection_not_the_shared_target(self, seeded_app, monkeypatch):
+        """A ``skipped`` path (already a scope on this connection) must keep
+        whatever collection it already owns — the shared target only ever
+        applies to scopes THIS call newly creates."""
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        _install_item_resolver(monkeypatch, {"Folder A": _folder_item("item-a", "Folder A")})
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="bulk-shared-skip-keeps-own")
+
+        confirmed = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "item-a", "display_path": "Folder A", "drive_id": "drv1"},
+            headers=_auth(token),
+        )
+        assert confirmed.status_code == 201, confirmed.text
+        own_collection_id = confirmed.json()["collection_id"]
+
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes/bulk",
+            json={"paths": ["Folder A"], "drive_id": "drv1", "collection": {"name": "Shared, not for item-a"}},
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["created"] == []
+        assert r.json()["skipped"] == [{"path": "Folder A", "source_scope_id": "item-a", "reason": "already_present"}]
+
+        listed = c.get(f"{BASE}/{conn_id}/scopes", headers=_auth(token)).json()["items"]
+        assert listed[0]["collection_id"] == own_collection_id
+
+
+class TestBulkScopeAccessMode:
+    """``POST …/scopes/bulk``'s ``access_mode`` field (2026-09 fix) — every
+    scope a bulk-add call creates gets the same mode."""
+
+    def test_defaults_to_manual(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        _install_item_resolver(monkeypatch, {"Folder A": _folder_item("item-a", "Folder A")})
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="bulk-mode-default")
+
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes/bulk",
+            json={"paths": ["Folder A"], "drive_id": "drv1"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["created"][0]["access_mode"] == "manual"
+
+    def test_mirrored_is_persisted_on_every_created_scope(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        _install_item_resolver(
+            monkeypatch,
+            {"Folder A": _folder_item("item-a", "Folder A"), "Folder B": _folder_item("item-b", "Folder B")},
+        )
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="bulk-mode-mirrored")
+
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes/bulk",
+            json={"paths": ["Folder A", "Folder B"], "drive_id": "drv1", "access_mode": "mirrored"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert len(body["created"]) == 2
+        for entry in body["created"]:
+            assert entry["access_mode"] == "mirrored"
+            assert entry["drive_id"] == "drv1"
+
+        listed = c.get(f"{BASE}/{conn_id}/scopes", headers=_auth(token)).json()["items"]
+        assert {i["access_mode"] for i in listed} == {"mirrored"}
+
+
+class TestSetScopesMode:
+    """``PATCH …/scopes/bulk`` — flip ``access_mode`` on many EXISTING
+    scopes in one call (2026-09 fix)."""
+
+    def test_requires_admin(self, seeded_app):
+        r = seeded_app["client"].patch(
+            f"{BASE}/nope/scopes/bulk",
+            json={"all": True, "access_mode": "manual"},
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert r.status_code == 403
+
+    def test_404_for_unknown_connection(self, seeded_app):
+        r = seeded_app["client"].patch(
+            f"{BASE}/does-not-exist/scopes/bulk",
+            json={"all": True, "access_mode": "manual"},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 404
+
+    def test_both_source_scope_ids_and_all_is_400(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="mode-both")
+        r = c.patch(
+            f"{BASE}/{conn_id}/scopes/bulk",
+            json={"source_scope_ids": ["s1"], "all": True, "access_mode": "manual"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 400, r.text
+        assert r.json()["detail"]["error"] == "both_source_scope_ids_and_all"
+
+    def test_neither_source_scope_ids_nor_all_is_400(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="mode-neither")
+        r = c.patch(
+            f"{BASE}/{conn_id}/scopes/bulk",
+            json={"access_mode": "manual"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 400, r.text
+        assert r.json()["detail"]["error"] == "source_scope_ids_or_all_required"
+
+    def _confirm_manual(self, c, token, conn_id, source_scope_id, *, drive_id="drive-x"):
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": source_scope_id, "display_path": source_scope_id, "drive_id": drive_id},
+            headers=_auth(token),
+        )
+        assert r.status_code == 201, r.text
+        return r.json()
+
+    def test_all_true_switches_every_scope_to_mirrored(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="mode-all")
+        self._confirm_manual(c, token, conn_id, "s1")
+        self._confirm_manual(c, token, conn_id, "s2")
+
+        r = c.patch(
+            f"{BASE}/{conn_id}/scopes/bulk",
+            json={"all": True, "access_mode": "mirrored"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert sorted(body["updated"]) == ["s1", "s2"]
+        assert body["failed"] == []
+
+        listed = c.get(f"{BASE}/{conn_id}/scopes", headers=_auth(token)).json()["items"]
+        assert {i["access_mode"] for i in listed} == {"mirrored"}
+
+    def test_specific_ids_switch_only_those(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="mode-specific")
+        self._confirm_manual(c, token, conn_id, "s1")
+        self._confirm_manual(c, token, conn_id, "s2")
+
+        r = c.patch(
+            f"{BASE}/{conn_id}/scopes/bulk",
+            json={"source_scope_ids": ["s1"], "access_mode": "mirrored"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["updated"] == ["s1"]
+
+        listed = {
+            i["source_scope_id"]: i["access_mode"]
+            for i in c.get(f"{BASE}/{conn_id}/scopes", headers=_auth(token)).json()["items"]
+        }
+        assert listed == {"s1": "mirrored", "s2": "manual"}
+
+    def test_unknown_source_scope_id_is_reported_failed_not_found(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="mode-not-found")
+        self._confirm_manual(c, token, conn_id, "s1")
+
+        r = c.patch(
+            f"{BASE}/{conn_id}/scopes/bulk",
+            json={"source_scope_ids": ["s1", "ghost"], "access_mode": "mirrored"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["updated"] == ["s1"]
+        assert body["failed"] == [{"source_scope_id": "ghost", "reason": "not_found"}]
+
+    def test_switching_to_mirrored_without_drive_id_is_reported_failed(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="mode-no-drive")
+        r = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "s-no-drive", "display_path": "No Drive"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 201, r.text
+        assert r.json()["drive_id"] is None
+
+        r = c.patch(
+            f"{BASE}/{conn_id}/scopes/bulk",
+            json={"source_scope_ids": ["s-no-drive"], "access_mode": "mirrored"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["updated"] == []
+        assert body["failed"] == [{"source_scope_id": "s-no-drive", "reason": "missing_drive_id"}]
+
+        listed = c.get(f"{BASE}/{conn_id}/scopes", headers=_auth(token)).json()["items"][0]
+        assert listed["access_mode"] == "manual", "a failed switch must leave the scope untouched"
+
+    def test_switching_to_manual_deletes_the_sentinel_grant(self, seeded_app):
+        from app.resource_types import ResourceType
+        from connectors.sharepoint.acl_sync import ACL_SYNC_SENTINEL
+        from src.repositories import resource_grants_repo, user_groups_repo
+
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="mode-to-manual")
+        confirmed = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={
+                "source_scope_id": "s-mirrored",
+                "display_path": "Mirrored",
+                "access_mode": "mirrored",
+                "drive_id": "drive-y",
+            },
+            headers=_auth(token),
+        )
+        assert confirmed.status_code == 201, confirmed.text
+        collection_id = confirmed.json()["collection_id"]
+
+        sentinel_group = user_groups_repo().ensure(name="entra:bulk-mode-oid", created_by=ACL_SYNC_SENTINEL)
+        resource_grants_repo().ensure_grant(
+            sentinel_group["id"], ResourceType.COLLECTION.value, collection_id, assigned_by=ACL_SYNC_SENTINEL
+        )
+
+        r = c.patch(
+            f"{BASE}/{conn_id}/scopes/bulk",
+            json={"source_scope_ids": ["s-mirrored"], "access_mode": "manual"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["updated"] == ["s-mirrored"]
+
+        remaining = [
+            g
+            for g in resource_grants_repo().list_all(resource_type=ResourceType.COLLECTION.value)
+            if g["resource_id"] == collection_id
+        ]
+        assert remaining == []
+
+    def test_writes_an_audit_row(self, seeded_app):
+        from src.repositories import audit_repo
+
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="mode-audit")
+        self._confirm_manual(c, token, conn_id, "s1")
+
+        r = c.patch(
+            f"{BASE}/{conn_id}/scopes/bulk",
+            json={"all": True, "access_mode": "mirrored"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+
+        rows, _ = audit_repo().query(action="sharepoint_connection.scope_bulk_mode_set", limit=10)
+        assert len(rows) == 1
+        assert _audit_params(rows[0]) == {"access_mode": "mirrored", "requested": 1, "updated": 1, "failed": 0}
+
+
+class TestAclSiteGroupMap:
+    """``PATCH …/acl-site-group-map`` — map a SharePoint site group's
+    ``displayName`` to one or more existing Agnes groups (2026-09 fix)."""
+
+    def test_requires_admin(self, seeded_app):
+        r = seeded_app["client"].patch(
+            f"{BASE}/nope/acl-site-group-map",
+            json={"mapping": {}},
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert r.status_code == 403
+
+    def test_404_for_unknown_connection(self, seeded_app):
+        r = seeded_app["client"].patch(
+            f"{BASE}/does-not-exist/acl-site-group-map",
+            json={"mapping": {}},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 404
+
+    def test_unknown_group_id_is_400(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="sgmap-unknown-group")
+
+        r = c.patch(
+            f"{BASE}/{conn_id}/acl-site-group-map",
+            json={"mapping": {"Members": ["does-not-exist"]}},
+            headers=_auth(token),
+        )
+        assert r.status_code == 400, r.text
+        assert r.json()["detail"]["error"] == "invalid_group_id"
+        assert r.json()["detail"]["group_ids"] == ["does-not-exist"]
+
+    def test_sets_and_persists_the_map(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="sgmap-set")
+        group_id = c.post("/api/admin/groups", json={"name": "finance-team"}, headers=_auth(token)).json()["id"]
+
+        r = c.patch(
+            f"{BASE}/{conn_id}/acl-site-group-map",
+            json={"mapping": {"Members": [group_id]}},
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+        assert r.json() == {"acl_site_group_map": {"Members": [group_id]}}
+
+        from src.repositories import source_connections_repo
+
+        row = source_connections_repo().get(conn_id)
+        assert row["config"]["acl_site_group_map"] == {"Members": [group_id]}
+
+    def test_replaces_wholesale_not_merge(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="sgmap-replace")
+        group_a = c.post("/api/admin/groups", json={"name": "sgmap-group-a"}, headers=_auth(token)).json()["id"]
+        group_b = c.post("/api/admin/groups", json={"name": "sgmap-group-b"}, headers=_auth(token)).json()["id"]
+
+        first = c.patch(
+            f"{BASE}/{conn_id}/acl-site-group-map",
+            json={"mapping": {"Members": [group_a]}},
+            headers=_auth(token),
+        )
+        assert first.status_code == 200, first.text
+
+        second = c.patch(
+            f"{BASE}/{conn_id}/acl-site-group-map",
+            json={"mapping": {"Owners": [group_b]}},
+            headers=_auth(token),
+        )
+        assert second.status_code == 200, second.text
+
+        from src.repositories import source_connections_repo
+
+        row = source_connections_repo().get(conn_id)
+        assert row["config"]["acl_site_group_map"] == {"Owners": [group_b]}, (
+            "a second call must replace the whole map, not merge into it"
+        )
+
+    def test_survives_a_generic_connection_edit(self, seeded_app):
+        """The carry-forward ratchet's whole point: an unrelated PUT through
+        the generic connection editor must not silently erase this key."""
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="sgmap-carry-forward")
+        group_id = c.post("/api/admin/groups", json={"name": "sgmap-carry-group"}, headers=_auth(token)).json()["id"]
+
+        c.patch(
+            f"{BASE}/{conn_id}/acl-site-group-map",
+            json={"mapping": {"Members": [group_id]}},
+            headers=_auth(token),
+        )
+
+        edit = c.put(
+            f"/api/admin/source-connections/{conn_id}",
+            json={"name": "sgmap-carry-forward-renamed", "config": {"tenant_id": "tenant-1", "client_id": "client-1"}},
+            headers=_auth(token),
+        )
+        assert edit.status_code == 200, edit.text
+
+        from src.repositories import source_connections_repo
+
+        row = source_connections_repo().get(conn_id)
+        assert row["config"]["acl_site_group_map"] == {"Members": [group_id]}
+
+    def test_writes_an_audit_row(self, seeded_app):
+        from src.repositories import audit_repo
+
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="sgmap-audit")
+        group_id = c.post("/api/admin/groups", json={"name": "sgmap-audit-group"}, headers=_auth(token)).json()["id"]
+
+        r = c.patch(
+            f"{BASE}/{conn_id}/acl-site-group-map",
+            json={"mapping": {"Members": [group_id]}},
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+
+        rows, _ = audit_repo().query(action="sharepoint_connection.acl_site_group_map_set", limit=10)
+        assert len(rows) == 1
+        assert _audit_params(rows[0]) == {"site_groups": 1, "group_ids": [group_id]}
+
+
+class TestConnectionClone:
+    """``POST …/clone`` — a sibling SharePoint connection wired to the same
+    credential material, no scopes, feeding the same split-a-large-site
+    workflow as bulk scope-add above."""
+
+    def test_requires_admin(self, seeded_app):
+        r = seeded_app["client"].post(
+            f"{BASE}/nope/clone",
+            json={"name": "x"},
+            headers=_auth(seeded_app["analyst_token"]),
+        )
+        assert r.status_code == 403
+
+    def test_404_for_unknown_connection(self, seeded_app):
+        r = seeded_app["client"].post(
+            f"{BASE}/does-not-exist/clone",
+            json={"name": "x"},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 404
+
+    def test_clone_copies_identity_and_starts_with_zero_scopes(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="clone-source", tenant_id="tenant-x", client_id="client-y")
+
+        confirmed = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "item-a", "display_path": "Folder A"},
+            headers=_auth(token),
+        )
+        assert confirmed.status_code == 201, confirmed.text
+
+        r = c.post(f"{BASE}/{conn_id}/clone", json={"name": "clone-target"}, headers=_auth(token))
+        assert r.status_code == 201, r.text
+        new_id = r.json()["id"]
+        assert new_id != conn_id
+
+        detail = c.get(f"/api/admin/source-connections/{new_id}", headers=_auth(token)).json()
+        assert detail["source_type"] == "sharepoint"
+        assert detail["config"]["tenant_id"] == "tenant-x"
+        assert detail["config"]["client_id"] == "client-y"
+        assert "scopes" not in detail["config"]
+
+        listed = c.get(f"{BASE}/{new_id}/scopes", headers=_auth(token)).json()["items"]
+        assert listed == []
+
+    def test_clone_keeps_manual_sites_for_a_sites_selected_connection(self, seeded_app, monkeypatch):
+        """Under Sites.Selected, `/sites` enumeration 403s and the ONLY way to
+        reach a granted site is a bookmarked `manual_sites` entry
+        (get_site_by_path) — a clone that lost this could not resolve the
+        site it exists to split, at all. `extraction` (dispatch bookkeeping)
+        stays excluded: a fresh clone has never run."""
+        from connectors.sharepoint import graph_client as gc
+
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/oauth2/v2.0/token"):
+                return httpx.Response(200, json={"access_token": "tok-manual"})
+            assert request.url.path == "/v1.0/sites/contoso.sharepoint.com:/sites/ProjectHub"
+            return httpx.Response(
+                200, json={"id": "s-manual", "displayName": "Project Hub", "webUrl": "https://contoso/x"}
+            )
+
+        monkeypatch.setattr(
+            gc, "_http_client", lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler), timeout=10)
+        )
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="clone-manual-sites-source")
+
+        add_site = c.post(
+            f"{BASE}/{conn_id}/manual-sites",
+            json={"site_url": "https://contoso.sharepoint.com/sites/ProjectHub"},
+            headers=_auth(token),
+        )
+        assert add_site.status_code == 201, add_site.text
+
+        confirmed = c.post(
+            f"{BASE}/{conn_id}/scopes",
+            json={"source_scope_id": "item-manual", "display_path": "Folder A"},
+            headers=_auth(token),
+        )
+        assert confirmed.status_code == 201, confirmed.text
+
+        r = c.post(f"{BASE}/{conn_id}/clone", json={"name": "clone-manual-sites-target"}, headers=_auth(token))
+        assert r.status_code == 201, r.text
+        new_id = r.json()["id"]
+
+        detail = c.get(f"/api/admin/source-connections/{new_id}", headers=_auth(token)).json()
+        assert detail["config"]["manual_sites"] == [
+            {"id": "s-manual", "name": "Project Hub", "web_url": "https://contoso/x"}
+        ]
+        assert "scopes" not in detail["config"]
+        assert "extraction" not in detail["config"]
+
+    def test_clone_copies_a_vault_secret_so_the_clone_resolves_without_reupload(self, seeded_app, monkeypatch):
+        """The clone's whole point is a working sibling with zero scopes —
+        when the source's certificate lives in its OWN vault slot (rather
+        than a deployment env var), a clone with no row of its own could
+        never resolve settings and every Graph call 409ed
+        ``sharepoint_cert_unresolved``. The fix copies the encrypted row
+        verbatim (never decrypts) so the clone is immediately ready."""
+        from cryptography.fernet import Fernet
+
+        from app.secrets_vault import _reset_ephemeral_key_for_tests
+
+        monkeypatch.setenv("AGNES_VAULT_KEY", Fernet.generate_key().decode())
+        _reset_ephemeral_key_for_tests()
+        try:
+            c = seeded_app["client"]
+            token = seeded_app["admin_token"]
+            conn_id = _create_connection(c, token, name="clone-vault-source")
+            secret_resp = c.put(
+                f"/api/admin/source-connections/{conn_id}/secret",
+                json={"value": PEM},
+                headers=_auth(token),
+            )
+            assert secret_resp.status_code == 204, secret_resp.text
+
+            r = c.post(f"{BASE}/{conn_id}/clone", json={"name": "clone-vault-target"}, headers=_auth(token))
+            assert r.status_code == 201, r.text
+            new_id = r.json()["id"]
+            assert r.json()["secret_copied"] is True
+
+            from src.repositories import connection_secrets_repo
+
+            secrets = connection_secrets_repo()
+            assert secrets.has(conn_id) is True
+            assert secrets.has(new_id) is True
+            # Same plaintext, and — since a clone is created fresh, never
+            # decrypted/re-encrypted along the way — the exact same ciphertext.
+            assert secrets.get(new_id) == secrets.get(conn_id) == PEM
+
+            from connectors.sharepoint.settings import resolve_sharepoint_settings
+
+            cloned_row = c.get(f"/api/admin/source-connections/{new_id}", headers=_auth(token)).json()
+            settings = resolve_sharepoint_settings({"id": new_id, "config": cloned_row["config"]})
+            assert settings.credential_source == "vault"
+            assert settings.private_key == PEM
+        finally:
+            _reset_ephemeral_key_for_tests()
+
+    def test_clone_reports_no_secret_copied_when_source_uses_env_var(self, seeded_app):
+        """A source whose certificate resolves from a deployment env var
+        (``config.cert_private_key_env`` / no vault row at all) has nothing
+        to copy — ``secret_copied: False`` is not an error, it just means
+        every clone already resolves that same env var on its own."""
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="clone-no-vault-source")
+
+        r = c.post(f"{BASE}/{conn_id}/clone", json={"name": "clone-no-vault-target"}, headers=_auth(token))
+        assert r.status_code == 201, r.text
+        new_id = r.json()["id"]
+        assert r.json()["secret_copied"] is False
+
+        from src.repositories import connection_secrets_repo
+
+        assert connection_secrets_repo().has(new_id) is False
+
+    def test_name_conflict_is_409(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="clone-dup-source")
+        other = _create_connection(c, token, name="clone-dup-existing")
+
+        r = c.post(f"{BASE}/{conn_id}/clone", json={"name": "clone-dup-existing"}, headers=_auth(token))
+        assert r.status_code == 409, r.text
+        assert r.json()["detail"] == "connection_name_exists"
+        assert other  # keep the fixture referenced
+
+    def test_writes_an_audit_row(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="clone-audit-source")
+
+        r = c.post(f"{BASE}/{conn_id}/clone", json={"name": "clone-audit-target"}, headers=_auth(token))
+        assert r.status_code == 201, r.text
+        new_id = r.json()["id"]
+
+        from src.repositories import audit_repo
+
+        rows, _ = audit_repo().query(action="sharepoint_connection.clone", limit=10)
+        assert len(rows) == 1
+        params = _audit_params(rows[0])
+        assert params == {"source_connection_id": conn_id, "name": "clone-audit-target", "secret_copied": False}
+        assert rows[0]["resource"] == f"source_connection:{new_id}"
+
+
+def _split_folder(item_id: str, name: str, web_url: str | None = None) -> dict:
+    return {
+        "id": item_id,
+        "name": name,
+        "folder": {"childCount": 0},
+        "webUrl": web_url or f"https://example.sharepoint.com/sites/s/Docs/{name}",
+    }
+
+
+def _split_file(item_id: str, name: str, web_url: str | None = None) -> dict:
+    return {
+        "id": item_id,
+        "name": name,
+        "file": {},
+        "webUrl": web_url or f"https://example.sharepoint.com/sites/s/Docs/{name}",
+    }
+
+
+def _install_split_mock(monkeypatch, *, drive_id: str = "drv1", root_children: list, counts: dict | None = None):
+    """Mock the Graph token exchange, drive-root children listing (with
+    ``webUrl``) and the Search-based document count for the site-split
+    planner (:func:`connectors.sharepoint.graph_client.
+    list_root_children_with_url` / :func:`search_document_count`).
+    ``counts`` maps a folder's ``webUrl`` to the total
+    :func:`search_document_count` should answer for it; an omitted url
+    answers 0 — the same "unreadable count still balances as 0" contract
+    the endpoint itself documents."""
+    from connectors.sharepoint import graph_client as gc
+
+    counts = counts or {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/oauth2/v2.0/token"):
+            return httpx.Response(200, json={"access_token": "tok-split"})
+        if request.url.path == f"/v1.0/drives/{drive_id}/root/children":
+            return httpx.Response(200, json={"value": root_children})
+        if request.url.path == "/v1.0/search/query":
+            body = json.loads(request.content)
+            query = body["requests"][0]["query"]["queryString"]
+            m = re.search(r'path:"([^"]+)"', query)
+            web_url = m.group(1) if m else None
+            return httpx.Response(200, json={"value": [{"hitsContainers": [{"total": counts.get(web_url, 0)}]}]})
+        raise AssertionError(f"unexpected sharepoint split mock path {request.url.path}")
+
+    monkeypatch.setattr(
+        gc, "_http_client", lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler), timeout=10)
+    )
+
+
+def _confirm_scope_with_drive(client, token, conn_id, *, source_scope_id="seed", display_path="Seed", drive_id="drv1"):
+    r = client.post(
+        f"{BASE}/{conn_id}/scopes",
+        json={"source_scope_id": source_scope_id, "display_path": display_path, "drive_id": drive_id},
+        headers=_auth(token),
+    )
+    assert r.status_code == 201, r.text
+
+
+class TestSplitPlan:
+    """``GET …/split-plan`` — read-only preview of splitting a connection's
+    site into N sibling connections."""
+
+    def test_requires_admin(self, seeded_app):
+        r = seeded_app["client"].get(f"{BASE}/nope/split-plan?n=2", headers=_auth(seeded_app["analyst_token"]))
+        assert r.status_code == 403
+
+    def test_requires_auth(self, seeded_app):
+        r = seeded_app["client"].get(f"{BASE}/nope/split-plan?n=2")
+        assert r.status_code == 401
+
+    def test_404_for_unknown_connection(self, seeded_app):
+        r = seeded_app["client"].get(f"{BASE}/does-not-exist/split-plan?n=2", headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 404
+
+    def test_drive_id_required_without_an_existing_scope(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="split-plan-no-drive")
+
+        r = c.get(f"{BASE}/{conn_id}/split-plan?n=2", headers=_auth(token))
+        assert r.status_code == 400, r.text
+        assert r.json()["detail"]["error"] == "drive_id_required"
+
+    def test_invalid_min_modified_is_400(self, seeded_app, monkeypatch):
+        # Same status/error shape as `PATCH …/extraction/crawl-config`'s own
+        # validation of this identical config key — see
+        # `_validate_min_modified`'s docstring.
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="split-plan-bad-date")
+        _confirm_scope_with_drive(c, token, conn_id)
+
+        r = c.get(f"{BASE}/{conn_id}/split-plan?n=2&min_modified=not-a-date", headers=_auth(token))
+        assert r.status_code == 400, r.text
+        assert r.json()["detail"]["error"] == "invalid_min_modified"
+
+    def test_n_out_of_range_is_422(self, seeded_app):
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        r = c.get(f"{BASE}/nope/split-plan?n=0", headers=_auth(token))
+        assert r.status_code == 422, r.text
+        r = c.get(f"{BASE}/nope/split-plan?n=51", headers=_auth(token))
+        assert r.status_code == 422, r.text
+
+    def test_packs_folders_and_reports_loose_files(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="split-plan-happy")
+        _confirm_scope_with_drive(c, token, conn_id)
+
+        root_children = [
+            _split_folder("f-big", "Big"),
+            _split_folder("f-small", "Small"),
+            _split_file("file-1", "readme.txt"),
+        ]
+        counts = {
+            "https://example.sharepoint.com/sites/s/Docs/Big": 100,
+            "https://example.sharepoint.com/sites/s/Docs/Small": 10,
+        }
+        _install_split_mock(monkeypatch, root_children=root_children, counts=counts)
+
+        r = c.get(f"{BASE}/{conn_id}/split-plan?n=2", headers=_auth(token))
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["drive_id"] == "drv1"
+        assert body["loose_root_files"] == ["readme.txt"]
+        assert sorted(body["folders"], key=lambda f: f["name"]) == [
+            {"name": "Big", "documents": 100},
+            {"name": "Small", "documents": 10},
+        ]
+        assert body["total_documents"] == 110
+        assert len(body["groups"]) == 2
+        # The bigger folder and the smaller one must not share a group —
+        # greedy-by-largest-first puts each in its own bucket here.
+        group_docs = sorted(g["documents"] for g in body["groups"])
+        assert group_docs == [10, 100]
+        assert body["groups"][0]["name"] == "split-plan-happy — part 1/2"
+        assert body["groups"][1]["name"] == "split-plan-happy — part 2/2"
+        # Public folder shape never leaks the Graph item id.
+        for group in body["groups"]:
+            for folder in group["folders"]:
+                assert set(folder.keys()) == {"name", "documents"}
+
+    def test_a_folder_whose_count_fails_is_still_assigned(self, seeded_app, monkeypatch):
+        """search_document_count() never raises — a 500 from Graph Search
+        degrades to documents=0, and the folder is still packed into a
+        group, never dropped from the plan."""
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="split-plan-count-fails")
+        _confirm_scope_with_drive(c, token, conn_id)
+
+        from connectors.sharepoint import graph_client as gc
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/oauth2/v2.0/token"):
+                return httpx.Response(200, json={"access_token": "tok"})
+            if request.url.path == "/v1.0/drives/drv1/root/children":
+                return httpx.Response(200, json={"value": [_split_folder("f1", "Flaky")]})
+            if request.url.path == "/v1.0/search/query":
+                return httpx.Response(500, text="boom")
+            raise AssertionError(request.url.path)
+
+        monkeypatch.setattr(
+            gc, "_http_client", lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler), timeout=10)
+        )
+
+        r = c.get(f"{BASE}/{conn_id}/split-plan?n=1", headers=_auth(token))
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["folders"] == [{"name": "Flaky", "documents": 0}]
+        assert len(body["groups"][0]["folders"]) == 1
+
+    def test_collection_defaults_to_the_source_single_existing_scope(self, seeded_app, monkeypatch):
+        """The default shared-collection resolution reuses the source's OWN
+        collection when it has exactly one confirmed scope carrying a
+        `collection_id` — the common "one root scope, not yet split" shape
+        `_confirm_scope_with_drive` produces."""
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="split-plan-collection-default")
+        _confirm_scope_with_drive(c, token, conn_id)
+        scopes = c.get(f"{BASE}/{conn_id}/scopes", headers=_auth(token)).json()["items"]
+        existing_collection_id = scopes[0]["collection_id"]
+
+        _install_split_mock(monkeypatch, root_children=[_split_folder("f1", "A")], counts={})
+
+        r = c.get(f"{BASE}/{conn_id}/split-plan?n=1", headers=_auth(token))
+        assert r.status_code == 200, r.text
+        assert r.json()["collection"]["id"] == existing_collection_id
+
+    def test_collection_defaults_to_a_new_name_when_no_single_scope(self, seeded_app, monkeypatch):
+        """No confirmed scope at all (nothing to reuse) falls back to
+        minting one collection named after the source connection — not yet
+        minted during a read-only preview, so `id`/`slug` stay `None`."""
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="split-plan-collection-noscope")
+
+        _install_split_mock(monkeypatch, root_children=[_split_folder("f1", "A")], counts={})
+
+        r = c.get(f"{BASE}/{conn_id}/split-plan?n=1&drive_id=drv1", headers=_auth(token))
+        assert r.status_code == 200, r.text
+        assert r.json()["collection"] == {"id": None, "name": "split-plan-collection-noscope", "slug": None}
+
+    def test_per_folder_collections_reports_null_collection(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="split-plan-per-folder")
+        _confirm_scope_with_drive(c, token, conn_id)
+        _install_split_mock(monkeypatch, root_children=[_split_folder("f1", "A")], counts={})
+
+        r = c.get(f"{BASE}/{conn_id}/split-plan?n=1&per_folder_collections=true", headers=_auth(token))
+        assert r.status_code == 200, r.text
+        assert r.json()["collection"] is None
+
+    def test_explicit_target_collection_id_is_previewed(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="split-plan-explicit-target")
+        _confirm_scope_with_drive(c, token, conn_id)
+        scopes = c.get(f"{BASE}/{conn_id}/scopes", headers=_auth(token)).json()["items"]
+        target_id = scopes[0]["collection_id"]
+        _install_split_mock(monkeypatch, root_children=[_split_folder("f1", "A")], counts={})
+
+        r = c.get(
+            f"{BASE}/{conn_id}/split-plan?n=1&target_collection_id={target_id}",
+            headers=_auth(token),
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["collection"]["id"] == target_id
+
+    def test_unknown_target_collection_id_is_404(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="split-plan-404-target")
+        _confirm_scope_with_drive(c, token, conn_id)
+
+        r = c.get(
+            f"{BASE}/{conn_id}/split-plan?n=1&target_collection_id=does-not-exist",
+            headers=_auth(token),
+        )
+        assert r.status_code == 404, r.text
+        assert r.json()["detail"]["error"] == "collection_not_found"
+
+    def test_both_target_fields_is_400(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="split-plan-both-target")
+        _confirm_scope_with_drive(c, token, conn_id)
+
+        r = c.get(
+            f"{BASE}/{conn_id}/split-plan?n=1&target_collection_id=x&target_name=y",
+            headers=_auth(token),
+        )
+        assert r.status_code == 400, r.text
+        assert r.json()["detail"]["error"] == "both_target_collection_id_and_target"
+
+    def test_per_folder_collections_and_target_is_400(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="split-plan-per-folder-and-target")
+        _confirm_scope_with_drive(c, token, conn_id)
+
+        r = c.get(
+            f"{BASE}/{conn_id}/split-plan?n=1&per_folder_collections=true&target_name=y",
+            headers=_auth(token),
+        )
+        assert r.status_code == 400, r.text
+        assert r.json()["detail"]["error"] == "per_folder_collections_and_target"
+
+    def test_response_gains_an_additive_mode_hint(self, seeded_app, monkeypatch):
+        """2026-09-03 auto-parallel-crawl design — `split-plan`'s response is
+        unchanged except for this one additive field. A DuckDB-backed
+        instance (the seeded_app default) always resolves `"inline"` — the
+        automatic planner is PG-only by construction (A3 ratchet)."""
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="split-plan-mode-hint")
+        _confirm_scope_with_drive(c, token, conn_id)
+        _install_split_mock(monkeypatch, root_children=[_split_folder("f1", "A")], counts={})
+
+        r = c.get(f"{BASE}/{conn_id}/split-plan?n=1", headers=_auth(token))
+        assert r.status_code == 200, r.text
+        assert r.json()["mode"] == "inline"
+
+
+class TestShardPlan:
+    """``GET …/shard-plan`` — read-only preview of the AUTOMATIC parallel
+    crawl (2026-09-03 auto-parallel-crawl design §4.7, plan Task 9). The
+    real sharded-plan happy path needs Postgres (the planner is PG-only by
+    construction) — see ``tests/db_pg/test_sharepoint_shard_plan_route_pg.py``.
+    This class covers what is backend-independent: auth, 404, validation,
+    and the DuckDB fail-clean-to-inline posture (never a 501 — unlike the
+    PG-only ``extraction_runs`` surface, this route touches no PG-only
+    table; it fails clean by construction, the same posture ``connectors.
+    sharepoint.state_store`` already takes for a `crawl:` state kind)."""
+
+    def test_requires_admin(self, seeded_app):
+        r = seeded_app["client"].get(f"{BASE}/nope/shard-plan", headers=_auth(seeded_app["analyst_token"]))
+        assert r.status_code == 403
+
+    def test_requires_auth(self, seeded_app):
+        r = seeded_app["client"].get(f"{BASE}/nope/shard-plan")
+        assert r.status_code == 401
+
+    def test_404_for_unknown_connection(self, seeded_app):
+        r = seeded_app["client"].get(f"{BASE}/does-not-exist/shard-plan", headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 404
+
+    def test_invalid_min_modified_is_400(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="shard-plan-bad-date")
+
+        r = c.get(f"{BASE}/{conn_id}/shard-plan?min_modified=not-a-date", headers=_auth(token))
+        assert r.status_code == 400, r.text
+        assert r.json()["detail"]["error"] == "invalid_min_modified"
+
+    def test_a_duckdb_backed_instance_previews_inline_without_reaching_graph(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="shard-plan-duckdb")
+        _confirm_scope_with_drive(c, token, conn_id)
+
+        from connectors.sharepoint import graph_client as gc
+
+        def _boom(request: httpx.Request) -> httpx.Response:
+            raise AssertionError("no Graph call expected on a DuckDB-backed instance")
+
+        monkeypatch.setattr(
+            gc, "_http_client", lambda: httpx.AsyncClient(transport=httpx.MockTransport(_boom), timeout=10)
+        )
+
+        r = c.get(f"{BASE}/{conn_id}/shard-plan", headers=_auth(token))
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["mode"] == "inline"
+        assert body["shards"] == []
+
+
+class TestSplitApply:
+    """``POST …/splits`` — create N sibling connections from a split plan."""
+
+    def test_requires_admin(self, seeded_app):
+        r = seeded_app["client"].post(f"{BASE}/nope/splits", json={"n": 2}, headers=_auth(seeded_app["analyst_token"]))
+        assert r.status_code == 403
+
+    def test_404_for_unknown_connection(self, seeded_app):
+        r = seeded_app["client"].post(
+            f"{BASE}/does-not-exist/splits", json={"n": 2}, headers=_auth(seeded_app["admin_token"])
+        )
+        assert r.status_code == 404
+
+    def test_invalid_retry_mode_is_422(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="split-apply-bad-retry")
+        _confirm_scope_with_drive(c, token, conn_id)
+
+        r = c.post(
+            f"{BASE}/{conn_id}/splits",
+            json={"n": 1, "retry_mode": "not-a-mode"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 422, r.text
+        assert r.json()["detail"]["error"] == "invalid_retry_mode"
+
+    def test_creates_n_clones_with_scopes_and_config(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="split-apply-happy", tenant_id="tenant-z", client_id="client-z")
+        _confirm_scope_with_drive(c, token, conn_id, source_scope_id="seed", display_path="Seed")
+
+        root_children = [
+            _split_folder("f-big", "Big"),
+            _split_folder("f-small", "Small"),
+            _split_file("file-1", "readme.txt"),
+        ]
+        counts = {
+            "https://example.sharepoint.com/sites/s/Docs/Big": 100,
+            "https://example.sharepoint.com/sites/s/Docs/Small": 10,
+        }
+        _install_split_mock(monkeypatch, root_children=root_children, counts=counts)
+
+        r = c.post(
+            f"{BASE}/{conn_id}/splits",
+            json={"n": 2, "min_modified": "2023-12-31", "transport": "batch", "retry_mode": "off"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 201, r.text
+        # Deprecated (2026-09-03 auto-parallel-crawl design): a scripted
+        # caller can detect this without parsing prose (RFC 8594).
+        assert r.headers.get("deprecation") == "true"
+        body = r.json()
+        created = body["connections"]
+        assert len(created) == 2
+        names = {c_["name"] for c_ in created}
+        assert names == {"split-apply-happy — part 1/2", "split-apply-happy — part 2/2"}
+
+        total_folders = sum(len(c_["folders"]) for c_ in created)
+        assert total_folders == 2  # Big + Small, split across the two clones
+
+        for entry in created:
+            detail = c.get(f"/api/admin/source-connections/{entry['id']}", headers=_auth(token)).json()
+            assert detail["config"]["tenant_id"] == "tenant-z"
+            assert detail["config"]["client_id"] == "client-z"
+            assert detail["config"]["extraction"]["crawl"]["min_modified"] == "2023-12-31"
+            assert detail["config"]["extraction"]["facts"] == {"transport": "batch", "retry_mode": "off"}
+            # Never the source's own seed scope — each clone gets ONLY its
+            # own group's folders.
+            scope_paths = {s["display_path"] for s in detail["config"]["scopes"]}
+            assert "Seed" not in scope_paths
+            assert scope_paths <= {"Big", "Small"}
+            for scope in detail["config"]["scopes"]:
+                assert scope["drive_id"] == "drv1"
+                assert scope["access_mode"] == "manual"
+
+    def test_refuses_when_a_repeat_split_would_collide(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="split-apply-repeat")
+        _confirm_scope_with_drive(c, token, conn_id)
+
+        root_children = [_split_folder("f1", "OnlyFolder")]
+        _install_split_mock(monkeypatch, root_children=root_children, counts={})
+
+        first = c.post(f"{BASE}/{conn_id}/splits", json={"n": 1}, headers=_auth(token))
+        assert first.status_code == 201, first.text
+
+        second = c.post(f"{BASE}/{conn_id}/splits", json={"n": 1}, headers=_auth(token))
+        assert second.status_code == 409, second.text
+        assert second.json()["detail"]["error"] == "split_exists"
+
+    def test_start_enqueues_a_crawl_per_clone(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="split-apply-start")
+        _confirm_scope_with_drive(c, token, conn_id)
+
+        root_children = [_split_folder("f1", "A"), _split_folder("f2", "B")]
+        _install_split_mock(monkeypatch, root_children=root_children, counts={})
+
+        r = c.post(f"{BASE}/{conn_id}/splits", json={"n": 2, "start": True}, headers=_auth(token))
+        assert r.status_code == 201, r.text
+        created = r.json()["connections"]
+
+        from src.repositories import jobs_repo
+
+        jobs = jobs_repo().list(kind="corpus-extraction", limit=50)
+        for entry in created:
+            matching = [j for j in jobs if (j.get("payload_json") or {}).get("connection_id") == entry["id"]]
+            assert len(matching) == 1, f"expected a corpus-extraction job for {entry['id']}"
+
+    def test_writes_an_audit_row(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="split-apply-audit")
+        _confirm_scope_with_drive(c, token, conn_id)
+
+        root_children = [_split_folder("f1", "A")]
+        _install_split_mock(monkeypatch, root_children=root_children, counts={})
+
+        r = c.post(f"{BASE}/{conn_id}/splits", json={"n": 1}, headers=_auth(token))
+        assert r.status_code == 201, r.text
+        created_ids = [entry["id"] for entry in r.json()["connections"]]
+
+        from src.repositories import audit_repo
+
+        rows, _ = audit_repo().query(action="sharepoint_connection.split_apply", limit=10)
+        assert len(rows) == 1
+        params = _audit_params(rows[0])
+        assert params["n"] == 1
+        assert params["created_ids"] == created_ids
+        assert rows[0]["resource"] == f"source_connection:{conn_id}"
+
+    def test_default_shares_one_collection_across_every_part_reusing_the_source_single_scope(
+        self, seeded_app, monkeypatch
+    ):
+        """A site of 400 folders must not become 400 collections nobody has
+        a grant to — the DEFAULT routes every part's scopes to ONE shared
+        collection. When the source has exactly one confirmed scope
+        carrying a `collection_id` (the common "one root scope" shape),
+        that IS the shared collection — reused, not re-minted."""
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="split-apply-shared-default")
+        _confirm_scope_with_drive(c, token, conn_id)
+        scopes = c.get(f"{BASE}/{conn_id}/scopes", headers=_auth(token)).json()["items"]
+        existing_collection_id = scopes[0]["collection_id"]
+
+        root_children = [_split_folder("f-big", "Big"), _split_folder("f-small", "Small")]
+        counts = {
+            "https://example.sharepoint.com/sites/s/Docs/Big": 100,
+            "https://example.sharepoint.com/sites/s/Docs/Small": 10,
+        }
+        _install_split_mock(monkeypatch, root_children=root_children, counts=counts)
+
+        r = c.post(f"{BASE}/{conn_id}/splits", json={"n": 2}, headers=_auth(token))
+        assert r.status_code == 201, r.text
+        body = r.json()
+        assert body["collection"]["id"] == existing_collection_id
+
+        all_collection_ids = set()
+        for entry in body["connections"]:
+            detail = c.get(f"/api/admin/source-connections/{entry['id']}", headers=_auth(token)).json()
+            for scope in detail["config"]["scopes"]:
+                all_collection_ids.add(scope["collection_id"])
+        assert all_collection_ids == {existing_collection_id}
+
+    def test_default_mints_one_new_collection_when_source_has_no_single_scope(self, seeded_app, monkeypatch):
+        """`apply_split` always infers its drive from an EXISTING scope
+        (`_compute_split_plan(..., drive_id=None)`), so the "no single
+        scope" case that falls through to minting a NEW collection is not
+        "zero scopes" (that 400s on `drive_id_required` before reaching
+        collection resolution at all) but "more than one" — two confirmed
+        scopes here, each with its OWN `collection_id`, so neither is
+        reused; a fresh, source-named collection is minted for the split
+        instead."""
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="split-apply-mint-default")
+        _confirm_scope_with_drive(c, token, conn_id, source_scope_id="seed-1", display_path="Seed1")
+        _confirm_scope_with_drive(c, token, conn_id, source_scope_id="seed-2", display_path="Seed2")
+
+        root_children = [_split_folder("f-big", "Big"), _split_folder("f-small", "Small")]
+        _install_split_mock(monkeypatch, root_children=root_children, counts={})
+
+        r = c.post(f"{BASE}/{conn_id}/splits", json={"n": 2}, headers=_auth(token))
+        assert r.status_code == 201, r.text
+        body = r.json()
+        assert body["collection"] == {
+            "id": body["collection"]["id"],
+            "name": "split-apply-mint-default",
+            "slug": body["collection"]["slug"],
+        }
+        minted_id = body["collection"]["id"]
+        assert minted_id is not None
+
+        scopes = c.get(f"{BASE}/{conn_id}/scopes", headers=_auth(token)).json()["items"]
+        existing_ids = {s["collection_id"] for s in scopes}
+        assert minted_id not in existing_ids  # a genuinely NEW collection, not one of the source's own two
+
+        for entry in body["connections"]:
+            detail = c.get(f"/api/admin/source-connections/{entry['id']}", headers=_auth(token)).json()
+            assert all(scope["collection_id"] == minted_id for scope in detail["config"]["scopes"])
+
+    def test_explicit_target_collection_id_routes_every_part(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="split-apply-explicit-target-id")
+        _confirm_scope_with_drive(c, token, conn_id)
+        scopes = c.get(f"{BASE}/{conn_id}/scopes", headers=_auth(token)).json()["items"]
+        target_id = scopes[0]["collection_id"]
+
+        root_children = [_split_folder("f1", "A"), _split_folder("f2", "B")]
+        _install_split_mock(monkeypatch, root_children=root_children, counts={})
+
+        r = c.post(
+            f"{BASE}/{conn_id}/splits",
+            json={"n": 2, "target_collection_id": target_id},
+            headers=_auth(token),
+        )
+        assert r.status_code == 201, r.text
+        body = r.json()
+        assert body["collection"]["id"] == target_id
+        for entry in body["connections"]:
+            detail = c.get(f"/api/admin/source-connections/{entry['id']}", headers=_auth(token)).json()
+            assert all(scope["collection_id"] == target_id for scope in detail["config"]["scopes"])
+
+    def test_explicit_target_name_mints_exactly_one_collection_for_the_whole_split(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="split-apply-explicit-target-name")
+        _confirm_scope_with_drive(c, token, conn_id)
+
+        root_children = [_split_folder("f1", "A"), _split_folder("f2", "B")]
+        _install_split_mock(monkeypatch, root_children=root_children, counts={})
+
+        r = c.post(
+            f"{BASE}/{conn_id}/splits",
+            json={"n": 2, "target": {"name": "Whole Site"}},
+            headers=_auth(token),
+        )
+        assert r.status_code == 201, r.text
+        body = r.json()
+        assert body["collection"]["name"] == "Whole Site"
+        minted_id = body["collection"]["id"]
+        assert minted_id is not None
+
+        for entry in body["connections"]:
+            detail = c.get(f"/api/admin/source-connections/{entry['id']}", headers=_auth(token)).json()
+            assert all(scope["collection_id"] == minted_id for scope in detail["config"]["scopes"])
+
+    def test_per_folder_collections_restores_the_old_one_per_folder_behavior(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="split-apply-per-folder")
+        _confirm_scope_with_drive(c, token, conn_id)
+
+        root_children = [_split_folder("f1", "A"), _split_folder("f2", "B")]
+        _install_split_mock(monkeypatch, root_children=root_children, counts={})
+
+        r = c.post(
+            f"{BASE}/{conn_id}/splits",
+            json={"n": 2, "per_folder_collections": True},
+            headers=_auth(token),
+        )
+        assert r.status_code == 201, r.text
+        body = r.json()
+        assert body["collection"] is None
+
+        all_collection_ids = set()
+        for entry in body["connections"]:
+            detail = c.get(f"/api/admin/source-connections/{entry['id']}", headers=_auth(token)).json()
+            for scope in detail["config"]["scopes"]:
+                all_collection_ids.add(scope["collection_id"])
+        # Two folders (A, B), each split into its OWN part (n=2) — two
+        # distinct, freshly minted collections, never shared.
+        assert len(all_collection_ids) == 2
+
+    def test_both_target_fields_is_400(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="split-apply-both-target")
+        _confirm_scope_with_drive(c, token, conn_id)
+
+        r = c.post(
+            f"{BASE}/{conn_id}/splits",
+            json={"n": 1, "target_collection_id": "x", "target": {"name": "y"}},
+            headers=_auth(token),
+        )
+        assert r.status_code == 400, r.text
+        assert r.json()["detail"]["error"] == "both_target_collection_id_and_target"
+
+    def test_per_folder_collections_and_target_is_400(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="split-apply-per-folder-and-target")
+        _confirm_scope_with_drive(c, token, conn_id)
+
+        r = c.post(
+            f"{BASE}/{conn_id}/splits",
+            json={"n": 1, "per_folder_collections": True, "target": {"name": "y"}},
+            headers=_auth(token),
+        )
+        assert r.status_code == 400, r.text
+        assert r.json()["detail"]["error"] == "per_folder_collections_and_target"
+
+    def test_unknown_target_collection_id_is_404(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="split-apply-404-target")
+        _confirm_scope_with_drive(c, token, conn_id)
+
+        r = c.post(
+            f"{BASE}/{conn_id}/splits",
+            json={"n": 1, "target_collection_id": "does-not-exist"},
+            headers=_auth(token),
+        )
+        assert r.status_code == 404, r.text
+        assert r.json()["detail"]["error"] == "collection_not_found"
+
+    def test_records_split_lineage_on_every_part(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        conn_id = _create_connection(c, token, name="split-apply-lineage")
+        _confirm_scope_with_drive(c, token, conn_id)
+
+        root_children = [_split_folder("f1", "A"), _split_folder("f2", "B")]
+        _install_split_mock(monkeypatch, root_children=root_children, counts={})
+
+        r = c.post(f"{BASE}/{conn_id}/splits", json={"n": 2}, headers=_auth(token))
+        assert r.status_code == 201, r.text
+        created = r.json()["connections"]
+        assert len(created) == 2
+
+        for part, entry in enumerate(created, start=1):
+            detail = c.get(f"/api/admin/source-connections/{entry['id']}", headers=_auth(token)).json()
+            split = detail["config"]["split"]
+            assert split["parent_connection_id"] == conn_id
+            assert split["part"] == part
+            assert split["n"] == 2
+            assert split["created_at"]
+
+
 class TestFactsExtractionRefusalNamesTheSwitch:
     """The ``409 facts_extraction_disabled`` body names WHICH of the two
     switches is off in a machine-readable ``switch`` key (additive to the
@@ -3050,3 +5491,208 @@ class TestFactsExtractionRefusalNamesTheSwitch:
         detail = r.json()["detail"]
         assert detail["error"] == "facts_extraction_disabled"
         assert detail["switch"] == "facts.enabled"
+
+
+class TestDispatchBookkeepingKeepsSiblings:
+    """`_record_extraction_dispatch` must merge `last_run_at`/`last_job_id`
+    into `config.extraction`, never replace the sub-object — the per-
+    connection overrides (`facts.*`, `crawl.min_modified`) live there too."""
+
+    def test_trigger_keeps_facts_and_crawl_overrides(self):
+        from app.api.admin_sharepoint import _record_extraction_dispatch
+
+        written = {}
+
+        class _Repo:
+            def update(self, cid, config=None):
+                written["config"] = config
+
+        import app.api.admin_sharepoint as mod
+
+        orig = mod.source_connections_repo
+        mod.source_connections_repo = lambda: _Repo()
+        try:
+            row = {
+                "id": "c1",
+                "config": {
+                    "tenant_id": "t",
+                    "extraction": {
+                        "facts": {"retry_mode": "off", "transport": "batch"},
+                        "crawl": {"min_modified": "2023-12-31"},
+                        "stop_requested_at": None,
+                    },
+                },
+            }
+            _record_extraction_dispatch(row, "job-1")
+        finally:
+            mod.source_connections_repo = orig
+
+        ext = written["config"]["extraction"]
+        assert ext["last_job_id"] == "job-1"
+        assert ext["last_run_at"]
+        assert ext["facts"] == {"retry_mode": "off", "transport": "batch"}
+        assert ext["crawl"] == {"min_modified": "2023-12-31"}
+        assert written["config"]["tenant_id"] == "t"
+
+
+class TestFactsGraphCountsDoesNotBlockTheEventLoop:
+    """Production incident, 2026-09-03: on a live instance with ~390
+    collections and a busy Postgres, a SINGLE `GET .../facts-graph-counts`
+    whose visibility CTE ran 250-316s made the whole app stop answering
+    ANY request — including `/healthz`, which does zero I/O — for as long
+    as that one query ran. `pg_cancel_backend`ing the one active statement
+    fixed it immediately.
+
+    `facts_graph_counts` is a plain `def` (not `async def`) specifically so
+    FastAPI dispatches it to the anyio thread pool instead of the event
+    loop (Tier-1 convention, `tests/test_event_loop_offload_guard.py`) —
+    and so are its dependencies (`require_admin`, the router-level
+    `_require_sharepoint_enabled`). This test proves that dispatch actually
+    holds under a slow repo call, rather than just asserting the function
+    is not a coroutine: a concurrent `/healthz` must answer in well under a
+    second regardless of how long the OTHER request's DB call takes. If
+    this test ever fails, the regression is a NEW blocking call reached
+    from the dependency chain on the event loop thread, not in the
+    endpoint's own body — the guard above only proves the entry points are
+    synchronous, not that everything they transitively call stays off the
+    loop.
+    """
+
+    def test_a_slow_repo_call_does_not_delay_a_concurrent_healthz(self, seeded_app, monkeypatch):
+        import threading
+        import time
+
+        from src.repositories import source_connections_repo
+
+        conn_id = "sp-evloop-perf"
+        source_connections_repo().create(
+            id=conn_id,
+            name="Event Loop Perf Test",
+            source_type="sharepoint",
+            config={
+                "tenant_id": "t1",
+                "client_id": "c1",
+                "scopes": [{"source_scope_id": "s1", "display_path": "A", "collection_id": "col_a"}],
+            },
+        )
+
+        class _SlowFactsRepo:
+            def approximate_counts_for_collections(self, corpus_ids):
+                time.sleep(2)
+                return {cid: {"facts": 0, "edges": 0} for cid in corpus_ids}
+
+        # Patched where `facts_graph_counts` resolves it from — a fresh
+        # `from src.repositories import facts_repo` on every call, so
+        # patching the factory function itself is enough.
+        monkeypatch.setattr("src.repositories.facts_repo", lambda: _SlowFactsRepo())
+
+        client = seeded_app["client"]
+        token = seeded_app["admin_token"]
+
+        results: dict[str, tuple[int, float]] = {}
+        start_barrier = threading.Barrier(2, timeout=5)
+
+        def _slow_request():
+            start_barrier.wait()
+            t0 = time.monotonic()
+            r = client.get(f"{BASE}/{conn_id}/facts-graph-counts", headers=_auth(token))
+            results["slow"] = (r.status_code, time.monotonic() - t0)
+
+        def _healthz_request():
+            start_barrier.wait()
+            time.sleep(0.2)  # let the slow request's DB call actually start first
+            t0 = time.monotonic()
+            r = client.get("/healthz")
+            results["healthz"] = (r.status_code, time.monotonic() - t0)
+
+        t_slow = threading.Thread(target=_slow_request)
+        t_health = threading.Thread(target=_healthz_request)
+        t_slow.start()
+        t_health.start()
+        t_slow.join(timeout=10)
+        t_health.join(timeout=10)
+
+        assert "slow" in results, "the slow request never completed"
+        assert "healthz" in results, "the healthz request never completed"
+        assert results["slow"][0] == 200, results["slow"]
+        assert results["healthz"][0] == 200, results["healthz"]
+        # The whole point: healthz must not queue up behind the slow
+        # request's DB call. A generous ceiling (well under the slow
+        # request's own 2s sleep) — if `facts_graph_counts` (or a
+        # dependency) were blocking the event loop, healthz would take
+        # close to 2s too, not ~0s.
+        assert results["healthz"][1] < 1.0, (
+            f"GET /healthz took {results['healthz'][1]:.2f}s while a slow "
+            f"facts-graph-counts request was in flight — something in that "
+            f"request's dependency chain is running on the event loop "
+            f"instead of the thread pool"
+        )
+
+    def test_eight_concurrent_slow_requests_still_leave_healthz_responsive(self, seeded_app, monkeypatch):
+        """The production trigger was not really "a single request" — the
+        card fires one `facts-graph-counts` fetch PER SharePoint connection
+        on page load (`_fetchSharepointGraphCounts` in
+        app/web/static/js/admin/data_sources_page.js), so a live page with 8
+        connections fires 8 concurrent slow requests at once. Each is
+        individually well-dispatched (see the test above); this proves 8 of
+        them AT ONCE still leave the thread pool (200 tokens,
+        AGNES_THREADPOOL_SIZE) with headroom for an unrelated `/healthz`."""
+        import threading
+        import time
+
+        from src.repositories import source_connections_repo
+
+        conn_ids = []
+        for i in range(8):
+            cid = f"sp-evloop-perf-{i}"
+            source_connections_repo().create(
+                id=cid,
+                name=f"Event Loop Perf Test {i}",
+                source_type="sharepoint",
+                config={
+                    "tenant_id": "t1",
+                    "client_id": "c1",
+                    "scopes": [{"source_scope_id": "s1", "display_path": "A", "collection_id": f"col_{i}"}],
+                },
+            )
+            conn_ids.append(cid)
+
+        class _SlowFactsRepo:
+            def approximate_counts_for_collections(self, corpus_ids):
+                time.sleep(2)
+                return {cid: {"facts": 0, "edges": 0} for cid in corpus_ids}
+
+        monkeypatch.setattr("src.repositories.facts_repo", lambda: _SlowFactsRepo())
+
+        client = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        results: dict[str, tuple[int, float]] = {}
+        start_barrier = threading.Barrier(9, timeout=5)
+
+        def _slow_request(cid):
+            start_barrier.wait()
+            r = client.get(f"{BASE}/{cid}/facts-graph-counts", headers=_auth(token))
+            results[cid] = (r.status_code, 0.0)
+
+        def _healthz_request():
+            start_barrier.wait()
+            time.sleep(0.3)  # let the 8 slow requests' DB calls actually start first
+            t0 = time.monotonic()
+            r = client.get("/healthz")
+            results["healthz"] = (r.status_code, time.monotonic() - t0)
+
+        threads = [threading.Thread(target=_slow_request, args=(cid,)) for cid in conn_ids]
+        threads.append(threading.Thread(target=_healthz_request))
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+
+        assert "healthz" in results, "the healthz request never completed"
+        assert results["healthz"][0] == 200, results["healthz"]
+        assert results["healthz"][1] < 1.0, (
+            f"GET /healthz took {results['healthz'][1]:.2f}s with 8 concurrent slow "
+            f"facts-graph-counts requests in flight"
+        )
+        for cid in conn_ids:
+            assert results.get(cid, (None,))[0] == 200, f"{cid}: {results.get(cid)}"

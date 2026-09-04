@@ -336,9 +336,9 @@ def _stub_turn(message: str, draft: Dict[str, Any], tables: List[Dict[str, Any]]
         first = still_open[0].label if still_open else None
         return {
             "reply": (
-                f"[stub] Let's build a data package. First thing I need: {first}."
+                f"Let's build a data package. First thing I need: {first}."
                 if first
-                else "[stub] Let's build a data package. Tell me what it should carry."
+                else "Let's build a data package. Tell me what it should carry."
             ),
             "patch": {},
             "suggestions": [],

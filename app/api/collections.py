@@ -425,15 +425,18 @@ async def search_collections(
     checkable, and the hint names the three engine behaviours that make a
     reasonable query miss (see ``src.ingest.retrieval``).
 
-    Very large corpora (#2151) are bounded server-side by
-    ``collections.search_max_chunks``: over the cap, the response carries
-    ``truncated: true`` (plus ``truncated_cap`` and a ``truncated_note``)
-    instead of ranking every accessible chunk — narrow with ``corpus_id`` or
-    a more specific query to search the excluded rest. A query with no
-    usable term to narrow BY, over the cap, is refused with a typed
-    ``422 search_query_too_broad`` rather than ranking an arbitrary slice.
-    A search backend outage answers a typed ``503 search_unavailable``
-    instead of an anonymous server error.
+    Very large corpora are bounded server-side: candidate selection runs in
+    SQL under ``min(knowledge.retrieval.max_candidate_chunks,
+    collections.search_max_chunks)`` (P0 OOM fix 2026-09 × #2151 — see
+    ``src.ingest.retrieval``'s "Scale bounds"). When that bound is hit the
+    response carries ``truncated: true`` (plus ``truncated_cap`` and a
+    ``truncated_note``) and the additive ``candidates_capped: true`` —
+    the same event under both names — instead of ranking every accessible
+    chunk; narrow with ``corpus_id`` or a more specific query to search the
+    excluded rest. A query with no usable term to narrow BY that still hits
+    the bound is refused with a typed ``422 search_query_too_broad`` rather
+    than ranking an arbitrary slice. A search backend outage answers a
+    typed ``503 search_unavailable`` instead of an anonymous server error.
     """
     from src.ingest.retrieval import (
         BROAD_CORPUS_HINT,
@@ -510,20 +513,26 @@ async def search_collections(
     results = [r for r in results if _chunk_text_visible(r.get("corpus_id"))]
     payload: dict = {"results": results, "retrieval": retrieval_mode()}
     if meta["truncated"]:
-        # #2151: the candidate set was capped server-side (collections.
-        # search_max_chunks) — disclosed rather than silently ranking a
-        # partial corpus. `k` bounds `results` regardless, so this response
-        # is never large enough for the MCP tool-output budget compaction
-        # (src.mcp_tooling.compact_search_results, which reuses `truncated`/
-        # `truncated_note` for a DIFFERENT reason — wire-size shortening) to
-        # collide with this note in practice.
+        # The bounded candidate scan filled its cap — `min(knowledge.
+        # retrieval.max_candidate_chunks, collections.search_max_chunks)`,
+        # see `src.ingest.retrieval.search_with_meta` — so some matching
+        # chunk may have been left out; disclosed rather than silently
+        # ranking a partial corpus. One event, two additive field families:
+        # `truncated`/`truncated_cap`/`truncated_note` (#2151) and
+        # `candidates_capped` (the P0 OOM fix, 2026-09). `k` bounds
+        # `results` regardless, so this response is never large enough for
+        # the MCP tool-output budget compaction (src.mcp_tooling.
+        # compact_search_results, which reuses `truncated`/`truncated_note`
+        # for a DIFFERENT reason — wire-size shortening) to collide with
+        # this note in practice.
         payload["truncated"] = True
         payload["truncated_cap"] = meta["cap"]
         payload["truncated_note"] = (
-            f"This collection set has more than {meta['cap']:,} chunks; the search ran "
-            f"over the {meta['cap']:,} chunks matching your query terms, not the full "
+            f"This collection set has more than {meta['cap']:,} chunks matching your query "
+            f"terms; the search ran over the {meta['cap']:,} best of them, not the full "
             f"corpus. {BROAD_CORPUS_HINT}"
         )
+        payload["candidates_capped"] = True
     if not results:
         payload["searched_collections"] = len(allowed)
         payload["hint"] = _empty_search_hint(len(allowed), corpus_id)
@@ -926,6 +935,15 @@ def _sweep_facts_orphans_after_delete(*, trigger: str) -> None:
     is swallowed here (not surfaced as a 501) because a DuckDB-backed
     instance can never have facts claims to begin with — this is routine
     file-delete housekeeping, not a caller-facing facts API call.
+
+    ``grace_seconds=0``: unlike an `ingest_batch`-driven sweep (which
+    defaults to `sweep_orphans()`'s own grace period — see its
+    "Concurrency" section — because a concurrent pass may be mid-write on
+    the very subject it just orphaned), THIS caller just deleted the file
+    whose claim was the subject's only evidence itself; nothing else could
+    be concurrently minting fresh evidence for the same subject, so the
+    immediate-delete behavior an admin deleting a file expects is both safe
+    and correct here.
     """
     from app.instance_config import feature_enabled
 
@@ -934,14 +952,17 @@ def _sweep_facts_orphans_after_delete(*, trigger: str) -> None:
     try:
         from src.repositories import RequiresPostgresBackend, facts_repo
 
-        deleted = facts_repo().sweep_orphans()
+        result = facts_repo().sweep_orphans(grace_seconds=0)
     except RequiresPostgresBackend:
         return
     except Exception:
         logger.warning("facts orphan sweep failed after %s", trigger, exc_info=True)
         return
+    deleted = result["deleted"]
     if deleted:
         logger.info("facts orphan sweep trigger=%s subjects_deleted=%d", trigger, deleted)
+    if result["skipped"]:
+        logger.info("facts orphan sweep trigger=%s skipped (concurrent sweep in progress)", trigger)
 
 
 def _purge_facts_claims_for_replaced_file(file_id: str) -> int:

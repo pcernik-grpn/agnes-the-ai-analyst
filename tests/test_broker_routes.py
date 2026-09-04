@@ -673,6 +673,67 @@ def test_anthropic_proxy_success_clears_diagnostic(broker_app, monkeypatch):
     assert get_llm_runtime_diagnostic(broker_app.state) is None
 
 
+class _ConnectFailClient:
+    """Fake httpx.AsyncClient whose outbound forward never gets a response at
+    all — the upstream host refused the connection (or never answered), the
+    class of failure the broker's own try/except used to just re-raise as an
+    opaque 500 with no Retry-After. Same delegation trick as
+    ``_StubResponseClient``: a real client when constructed with the
+    harness's own ``transport`` kwarg, the fake otherwise."""
+
+    _real_cls = httpx.AsyncClient
+
+    def __init__(self, *a, **k):
+        self._real = self._real_cls(*a, **k) if "transport" in k else None
+
+    async def __aenter__(self):
+        return await self._real.__aenter__() if self._real else self
+
+    async def __aexit__(self, *a):
+        return await self._real.__aexit__(*a) if self._real else False
+
+    def build_request(self, *a, **k):
+        return self._real.build_request(*a, **k) if self._real else {}
+
+    async def send(self, *a, **k):
+        if self._real:
+            return await self._real.send(*a, **k)
+        raise httpx.ConnectError("[Errno 61] Connection refused")
+
+    async def aclose(self):
+        if self._real:
+            await self._real.aclose()
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def test_anthropic_proxy_upstream_unreachable_returns_typed_503(broker_app, monkeypatch):
+    """A raw connection failure to the LLM upstream (Anthropic host down or
+    unreachable — the class of failure a restarting app or a network blip
+    produces) must not reach the sandbox as an opaque, retry-hostile 500: it
+    gets a typed 503 with Retry-After, and the SAME runtime-diagnostic
+    mechanism #884 built for 401/403/400 records it for the admin readiness
+    banner too — "never got a response at all" is just another LLM-health
+    signal, not a special case."""
+    import app.api.broker as broker_mod
+    from app.chat.readiness import LLM_REASON_PROVIDER, get_llm_runtime_diagnostic
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-static")
+    monkeypatch.setattr(broker_mod.httpx, "AsyncClient", _ConnectFailClient)
+    tok = ticket_repo().mint("chat_unreachable", "main", ttl_seconds=60)
+
+    r = _forward_anthropic(broker_app, tok)
+    assert r.status_code == 503
+    assert r.headers.get("retry-after") == "30"
+    body = r.json()["detail"]
+    assert body["code"] == "llm_upstream_unreachable"
+    assert "restarting or temporarily unavailable" in body["message"]
+
+    diag = get_llm_runtime_diagnostic(broker_app.state)
+    assert diag is not None and diag["reason"] == LLM_REASON_PROVIDER
+
+
 def test_normalize_broker_path_rejects_smuggling():
     """Unit: the path canonicalizer returns the EXACT URL the ASGI dispatch
     routes on (percent-decoded, dot-segments collapsed) and rejects authority

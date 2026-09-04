@@ -12,13 +12,16 @@ fetch, the SQL prefilter, the config resolver — have their own tests in
 contract.py`` and ``tests/test_collections_search_config.py``):
 
 - Fault injection: a ``MemoryError``/``OperationalError`` from the repo's
-  candidate fetch is a typed ``503`` on ``/api/collections/search``, and
-  degrades to an empty, disclosed chunk leg (other legs unaffected) on
-  ``/api/knowledge/search``.
-- The server-side chunk cap: over it, a 200 with ``truncated: true`` (not a
-  crash or a silent partial answer); at/under it, unchanged.
-- A query with no usable term to narrow an over-cap corpus by is a typed
-  ``422``, never an arbitrary slice of the corpus.
+  candidate fetch (``search_candidates`` — the SQL-side bounded fetch the
+  search path runs since the P0 OOM fix, 2026-09) is a typed ``503`` on
+  ``/api/collections/search``, and degrades to an empty, disclosed chunk
+  leg (other legs unaffected) on ``/api/knowledge/search``.
+- The server-side chunk cap (``min(knowledge.retrieval.max_candidate_chunks,
+  collections.search_max_chunks)``): when the bounded candidate fetch fills
+  it, a 200 with ``truncated: true`` + ``candidates_capped: true`` (not a
+  crash or a silent partial answer); under it, unchanged.
+- A query with no usable term that still fills the cap is a typed ``422``,
+  never an arbitrary slice of the corpus.
 - A query-time embedding failure degrades the response's ``retrieval``
   label to ``"lexical_only"`` instead of a 500.
 """
@@ -59,7 +62,7 @@ class TestFaultInjection:
         _seed_corpus(seeded_app, "Fault Mem", ["the magic keyword appears here"])
         monkeypatch.setattr(
             CorpusChunksRepository,
-            "list_for_corpora",
+            "search_candidates",
             lambda self, *a, **kw: (_ for _ in ()).throw(MemoryError("simulated OOM")),
         )
         c = seeded_app["client"]
@@ -77,7 +80,7 @@ class TestFaultInjection:
         def _boom(self, *a, **kw):
             raise sa.exc.OperationalError("SELECT 1", {}, Exception("simulated"))
 
-        monkeypatch.setattr(CorpusChunksRepository, "list_for_corpora", _boom)
+        monkeypatch.setattr(CorpusChunksRepository, "search_candidates", _boom)
         c = seeded_app["client"]
         resp = c.get(
             "/api/collections/search",
@@ -104,7 +107,7 @@ class TestFaultInjection:
         def _boom(self, *a, **kw):
             raise RuntimeError("a genuine bug, not a capacity problem")
 
-        monkeypatch.setattr(CorpusChunksRepository, "list_for_corpora", _boom)
+        monkeypatch.setattr(CorpusChunksRepository, "search_candidates", _boom)
         c = TestClient(seeded_app["client"].app, raise_server_exceptions=False)
         resp = c.get(
             "/api/collections/search",
@@ -131,7 +134,7 @@ class TestFaultInjection:
 
         monkeypatch.setattr(
             CorpusChunksRepository,
-            "list_for_corpora",
+            "search_candidates",
             lambda self, *a, **kw: (_ for _ in ()).throw(MemoryError("simulated OOM")),
         )
         c = seeded_app["client"]
@@ -156,6 +159,10 @@ class TestFaultInjection:
 
 class TestChunkCap:
     def test_over_cap_returns_200_with_truncated_and_hint(self, seeded_app, monkeypatch):
+        """Three chunks match the query, the cap admits two: the bounded
+        candidate fetch fills its LIMIT, so the response says so under
+        BOTH names (#2151's ``truncated`` family and the P0 fix's
+        ``candidates_capped``)."""
         import src.ingest.retrieval as retrieval
 
         monkeypatch.setattr(retrieval, "_search_max_chunks", lambda: 2)
@@ -164,8 +171,8 @@ class TestChunkCap:
             "Cap Over",
             [
                 "kubernetes cluster guide",
-                "totally unrelated weather report",
-                "another unrelated row about nothing",
+                "kubernetes weather report",
+                "another kubernetes row about nothing",
             ],
         )
         c = seeded_app["client"]
@@ -178,12 +185,43 @@ class TestChunkCap:
         body = resp.json()
         assert body["truncated"] is True
         assert body["truncated_cap"] == 2
+        assert body["candidates_capped"] is True
         assert "truncated_note" in body and body["truncated_note"]
         assert any("kubernetes" in (r.get("text") or "") for r in body["results"])
 
+    def test_cap_is_the_smaller_of_the_two_config_keys(self, seeded_app, monkeypatch):
+        """``knowledge.retrieval.max_candidate_chunks`` (the P0 SQL-side
+        candidate cap) and ``collections.search_max_chunks`` (#2151) compose
+        as ``min``: whichever is smaller is the cap the response reports."""
+        import src.ingest.retrieval as retrieval
+
+        _seed_corpus(seeded_app, "Cap Min", ["kubernetes one", "kubernetes two", "kubernetes three"])
+        c = seeded_app["client"]
+
+        monkeypatch.setattr(retrieval, "_max_candidate_chunks", lambda: 1)
+        monkeypatch.setattr(retrieval, "_search_max_chunks", lambda: 100)
+        body = c.get(
+            "/api/collections/search", params={"q": "kubernetes"}, headers=_auth(seeded_app["admin_token"])
+        ).json()
+        assert body["truncated"] is True and body["truncated_cap"] == 1
+
+        monkeypatch.setattr(retrieval, "_max_candidate_chunks", lambda: 100)
+        monkeypatch.setattr(retrieval, "_search_max_chunks", lambda: 2)
+        body = c.get(
+            "/api/collections/search", params={"q": "kubernetes"}, headers=_auth(seeded_app["admin_token"])
+        ).json()
+        assert body["truncated"] is True and body["truncated_cap"] == 2
+
+        monkeypatch.setattr(retrieval, "_max_candidate_chunks", lambda: 100)
+        monkeypatch.setattr(retrieval, "_search_max_chunks", lambda: 100)
+        body = c.get(
+            "/api/collections/search", params={"q": "kubernetes"}, headers=_auth(seeded_app["admin_token"])
+        ).json()
+        assert "truncated" not in body and "candidates_capped" not in body
+
     def test_at_cap_is_not_truncated_and_matches_unbounded_search(self, seeded_app, monkeypatch):
-        """Regression pin: identical results to the pre-#2151 unconditional
-        fetch when the corpus is at/under the cap — no prefilter, no cap."""
+        """Regression pin: when the bounded candidate fetch does not fill
+        the cap, nothing is disclosed and the ranking is the ordinary one."""
         import src.ingest.retrieval as retrieval
 
         monkeypatch.setattr(retrieval, "_search_max_chunks", lambda: 10_000)
@@ -201,17 +239,20 @@ class TestChunkCap:
         assert resp.status_code == 200, resp.text
         body = resp.json()
         assert "truncated" not in body
+        assert "candidates_capped" not in body
         assert body["results"]
         assert body["results"][0]["text"].startswith("the quick brown fox")
 
     def test_over_cap_stopword_only_query_is_typed_422(self, seeded_app, monkeypatch):
+        """A stopword-only query whose (stopword) matches still fill the
+        cap is an arbitrary slice of the corpus, not a search — refused."""
         import src.ingest.retrieval as retrieval
 
         monkeypatch.setattr(retrieval, "_search_max_chunks", lambda: 1)
         _seed_corpus(
             seeded_app,
             "Cap Broad",
-            ["kubernetes cluster guide", "totally unrelated weather report"],
+            ["the kubernetes cluster guide is here and there", "the weather report is unrelated and long"],
         )
         c = seeded_app["client"]
         resp = c.get(

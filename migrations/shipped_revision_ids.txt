@@ -32,8 +32,8 @@
 # id that has already shipped, even if it never reached production; if two
 # branches collide on the same number, keep both authors' original ids and
 # rebase the down_revision (a merge revision if both are heads), as later
-# entries below (0045/0049/0051/0057/0059/0085/0086/0087/0088/0094 each have
-# more than one id sharing a numeric prefix) already do.
+# entries below (0045/0049/0051/0057/0059/0085/0086/0087/0088/0094/0096 each
+# have more than one id sharing a numeric prefix) already do.
 #
 # Comment lines (like this one) and blank lines are ignored. One revision id
 # per line otherwise. Order is chain order (oldest first) for readability
@@ -141,7 +141,21 @@
 0094_usage_turns
 0094_extraction_runs
 0095_memory_detection_runs
+0096_sharepoint_connection_state
+0097_facts_llm_cache
+0098_corpus_chunks_file_id_index
+0099_ingest_runs_edges_skipped
+0100_facts_created_at
+0101_corpus_chunks_fts_index
 0096_users_kind
+0102_merge_users_kind_fts
+0103_crawl_shards
+0104_extraction_conditions
+0105_fact_collection_stats
+0106_hot_path_indexes
+0097_access_policy_revisions
+0107_merge_access_policy_revs
 0096_resource_grants_source
+0108_merge_grants_source
 0097_resource_grants_scope
 0098_everyone_becomes_a_scope

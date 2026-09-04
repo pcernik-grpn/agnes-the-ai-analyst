@@ -570,7 +570,6 @@ def test_the_data_sources_page_shows_both_mismatch_codes():
     stops the sync outright — and the message tells the admin to go to this
     page, which then did not show it.
     """
-    import pathlib
 
     src = _ds_page_source.page_source()
     assert 'w.code === "master_token_project_mismatch"' in src

@@ -47,6 +47,17 @@ export const SAY = {
   upstreamRateLimit:
     "The AI model is busy right now — nothing is wrong on your side. " +
     "Try again in a moment.",
+  // The sandbox's own client (or the broker's own outbound call) could not
+  // reach its target AT ALL — connection refused, DNS failure, an abort
+  // mid-connect, or a 502/503 a reverse proxy answers while the app
+  // container is mid-restart. A real report read "Cannot reach sandbox
+  // egress upstream at https://<host>/api/broker/anthropic: This operation
+  // was aborted" verbatim — a host and an abort name nothing a reader can
+  // act on. "restarting" (matched by `_TRANSIENT_RE` below) keeps this a
+  // warn, not an error: nothing is broken, the reader just waits it out.
+  // "workspace", not "instance" — a deployment word this module's own
+  // vocabulary already avoids (see monthlyBudget above).
+  instanceUnavailable: "This workspace is restarting or temporarily unavailable — try again in a minute.",
   noAccess: "You don't have access to do that.",
   serverFault: "Agnes couldn't process that. Try again in a moment.",
 };
@@ -118,9 +129,15 @@ export async function requestErrorCopy(res, fallback) {
  */
 
 // Transient or self-resolving: the reader waits, or the system is mid-restart.
-// Nothing is broken and nothing needs deciding.
+// Nothing is broken and nothing needs deciding. The connection-refused/
+// aborted-connect markers are the SAME family `instanceUnavailable` above
+// matches on — a raw ``5\d\d`` NUMBER is deliberately left OUT of this list
+// (it stays in `_FAULT_RE` below): a bare 502/503 elsewhere in a message is
+// still exactly the "genuinely broken" case that regex exists for, and
+// widening this one to any 5xx would repaint those red-for-a-reason
+// messages too, not just a failed connection ATTEMPT.
 const _TRANSIENT_RE =
-  /(^|\D)429(\D|$)|rate.?limit|resource_exhausted|quota|concurrency_cap|budget|server_restarting|restarting|timeout|timed out|max_session_tokens/i;
+  /(^|\D)429(\D|$)|rate.?limit|resource_exhausted|quota|concurrency_cap|budget|server_restarting|restarting|timeout|timed out|max_session_tokens|cannot reach|econnrefused|connection refused|operation was aborted|enotfound|getaddrinfo|network is unreachable|socket hang up/i;
 // The reader's own next step, or somebody's: a smaller file, a different
 // type, fewer attachments, a grant to ask for, a setting an admin has not
 // filled in yet. A caution, not a fault — `not_configured` in particular is
@@ -218,6 +235,12 @@ export function chatErrorCopy(raw, kind) {
     return "The chat engine did not start in time. The first conversation after a restart " +
       "is the slow one, so trying again usually works — if it keeps failing, ask an admin " +
       "to check the chat engine.";
+  }
+  // Distinct from the generic "took too long" family right after this one,
+  // which is about an ANSWER stalling mid-turn, not a failed connection
+  // attempt — order matters here.
+  if (/cannot reach|econnrefused|connection refused|operation was aborted|enotfound|getaddrinfo|network is unreachable|socket hang up|\b50[23]\b/i.test(both)) {
+    return SAY.instanceUnavailable;
   }
   if (/timeout|timed out/i.test(both)) {
     return "That took too long and was stopped. Try a narrower question, or ask again.";
