@@ -381,31 +381,33 @@ class TestThePickerKeptWhatTheRetiredDrawerHad:
     """
 
     def test_the_picker_filters_by_source_and_by_query_mode(self) -> None:
+        """Same questions, answered by the product's shared filter engine now
+        rather than by a private strip — multi-select and un-choosing come
+        with it, so what this pins is that the facets are declared and read
+        off the rows."""
         src = COMPONENT.read_text(encoding="utf-8")
-        assert "pickerFacets" in src
-        assert "'source_type'" in src and "'query_mode'" in src
-        # Multi-select: "the Keboola tables AND the BigQuery ones" is one
-        # question, not two visits.
-        assert "matchesFilters" in src
-        assert "flist.splice(fat, 1)" in src, "a chosen facet must be un-choosable"
+        assert "window.FilterToolbar.init(" in src
+        cfg = src.split("window.FilterToolbar.init(", 1)[1].split("});", 1)[0]
+        for key, attr in (("source", "data-source"), ("mode", "data-mode"),
+                          ("project", "data-project-name"), ("packaged", "data-packaged")):
+            assert f"key: '{key}'" in cfg, f"the {key} facet must be declared"
+            assert f"attr: '{attr}'" in cfg, f"the {key} facet must read {attr}"
+        # A facet the engine cannot read off a row filters nothing.
+        rows = src.split("function pickerRowsHtml()", 1)[1].split("function renderPicker", 1)[0]
+        for attr in ("data-source=", "data-mode=", "data-packaged=", "data-project-name="):
+            assert attr in rows, f"rows must carry {attr}"
 
     def test_a_facet_group_says_what_it_is_a_group_of(self) -> None:
         """`internal` is a value of BOTH vocabularies — a source_type and a
-        query_mode — so an unlabelled list renders the same option twice,
-        meaning two different things.
-
-        The filter is the Library's now (a Filter button, a faceted menu, a
-        chip row) rather than a flat strip of pills, so the heading is the
-        shared `.fbar-menu__title` and the chip names its category. The rule is
-        unchanged: neither surface may show a bare value.
-        """
+        query_mode — so an unlabelled control renders the same value twice
+        meaning two different things. The shared engine answers this
+        structurally: each category is its own submenu under its own label,
+        and a chip reads "Query mode: internal"."""
         src = COMPONENT.read_text(encoding="utf-8")
-        assert "fbar-menu__title" in src
-        assert "facetGroupHtml('source_type', 'Source')" in src
-        assert "facetGroupHtml('query_mode', 'Query mode')" in src
-        # The chip carries the category too — "Source: keboola, jira".
-        assert "'Source', pickerFacets.source_type.join" in src
-        assert "'Query mode', pickerFacets.query_mode.join" in src
+        cats = src.split("var FACET_CATS = [", 1)[1].split("];", 1)[0]
+        for label in ("'Source'", "'Query mode'", "'Project'"):
+            assert label in cats, f"{label} must be a named category"
+        assert "fbar-cat__label" in src, "each category renders its own label"
 
     def test_the_in_no_package_toggle_reads_a_server_flag(self) -> None:
         """Membership spans every OTHER package, so the client cannot derive
@@ -413,7 +415,9 @@ class TestThePickerKeptWhatTheRetiredDrawerHad:
         worse than no filter."""
         src = COMPONENT.read_text(encoding="utf-8")
         assert "packaged: !!t.packaged" in src
-        assert "pickerUnpackagedOnly" in src
+        # Rendered onto the row as the value the engine filters on.
+        assert "var packaged = t.packaged ? 'packaged' : 'unpackaged';" in src
+        assert "value=\"unpackaged\"" in src, "the menu must offer the unpackaged half"
 
     def test_the_registry_endpoint_supplies_that_flag(self, seeded_app) -> None:
         c = seeded_app["client"]
@@ -434,7 +438,10 @@ class TestThePickerKeptWhatTheRetiredDrawerHad:
         """On a fresh instance every row is unpackaged, and a control that
         hides nothing is a control that lies."""
         src = COMPONENT.read_text(encoding="utf-8")
-        assert "un < (st ? st.registry.length : 0)" in src
+        assert "unpackagedN > 0 && unpackagedN < total" in src
+        # …and the same rule for the categories: fewer than two values is a
+        # control that cannot change the list.
+        assert "return c.options.length > 1;" in src
 
     def test_the_sorts_came_across_including_the_stale_first_one(self) -> None:
         src = COMPONENT.read_text(encoding="utf-8")
@@ -442,11 +449,16 @@ class TestThePickerKeptWhatTheRetiredDrawerHad:
             assert f"'{value}'" in src, value
 
     def test_a_second_open_starts_unfiltered(self) -> None:
-        """Same reasoning the query already followed: inheriting the last
-        visit's narrowing hides rows for a reason nobody remembers."""
+        """Inheriting the last visit's narrowing hides rows for a reason
+        nobody remembers. There is no reset call to make any more: the bar is
+        built from scratch on every open and the engine is re-mounted with it,
+        so last visit's search and facets cannot survive into this one."""
         src = COMPONENT.read_text(encoding="utf-8")
         opener = src[src.index("function openPicker()") : src.index("function closePicker()")]
-        assert "resetPickerFilters()" in opener
+        assert "renderPicker();" in opener
+        render = src[src.index("function renderPicker()") : src.index("function renderPickerRows")]
+        assert "els.picker.innerHTML = pickerHtml();" in render, "the bar is rebuilt per open"
+        assert "mountFbar();" in render, "and the engine re-mounted with it"
 
     def test_the_strip_is_an_opt_in_slot_on_the_shared_shell(self) -> None:
         """Every other builder's picker must render exactly as before."""

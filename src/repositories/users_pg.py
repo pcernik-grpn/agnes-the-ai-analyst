@@ -165,8 +165,13 @@ class UsersPgRepository:
         optionally narrowed by ``search`` (email OR name, case-insensitive)
         and/or ``group_id`` membership. Mirrors DuckDB
         ``UserRepository.search_recent``."""
-        clauses: List[str] = []
-        params: Dict[str, Any] = {"limit": limit}
+        from src.service_accounts import SYSTEM_IDENTITY_KIND
+
+        # A service account belongs here — the picker is how an admin grants
+        # it anything (issue #1534). A seeded system identity does not: it is
+        # plumbing, and adding it to a group is only ever a mistake (#2256).
+        clauses: List[str] = ["u.kind IS DISTINCT FROM :system_kind"]
+        params: Dict[str, Any] = {"limit": limit, "system_kind": SYSTEM_IDENTITY_KIND}
         if search:
             clauses.append("(u.email ILIKE :search OR u.name ILIKE :search)")
             params["search"] = f"%{search}%"
@@ -192,6 +197,26 @@ class UsersPgRepository:
     def count_all(self) -> int:
         with self._engine.connect() as conn:
             return conn.execute(sa.text("SELECT COUNT(*) FROM users")).scalar() or 0
+
+    def count_people(self) -> int:
+        """Accounts a person signs in as — the size of the everyone audience.
+
+        NOT ``count_all``: that counts service accounts and the identities
+        Agnes seeds for itself, neither of which an everyone-scoped grant
+        reaches (issue #2256). The Access page prints this number next to
+        "Everyone", so counting a CI token as a colleague makes the page
+        lie about the reach of a share.
+        """
+        from src.service_accounts import HUMAN_KIND
+
+        with self._engine.connect() as conn:
+            return (
+                conn.execute(
+                    sa.text("SELECT COUNT(*) FROM users WHERE kind = :k"),
+                    {"k": HUMAN_KIND},
+                ).scalar()
+                or 0
+            )
 
     def any_password_holder(self, exclude_email: Optional[str] = None) -> bool:
         """PG sibling of the DuckDB ``any_password_holder`` — a
@@ -348,6 +373,24 @@ class UsersPgRepository:
     # documented no-op, since "create an identity flagged with a column that
     # does not exist" has no sensible do-nothing answer.
     # -----------------------------------------------------------------
+
+    def mark_system_identity(self, user_id: str) -> None:
+        """Flag a seeded internal identity `kind='system'` (issue #2256).
+
+        Called by the three ``ensure_*_user`` seeds right after they create
+        their row, so a fresh instance is correct without waiting for 0098's
+        backfill. Idempotent, and deliberately NOT `kind='service'`: that
+        kind refuses an interactive token (which `semantic-drafter` mints
+        through the broker) and refuses Admin membership (which `scheduler`
+        holds).
+        """
+        from src.service_accounts import SYSTEM_IDENTITY_KIND
+
+        with self._engine.begin() as conn:
+            conn.execute(
+                sa.text("UPDATE users SET kind = :k WHERE id = :id"),
+                {"k": SYSTEM_IDENTITY_KIND, "id": user_id},
+            )
 
     def create_service_account(self, id: str, email: str, name: str) -> None:
         """Create a `kind='service'` row. Never a password holder — a

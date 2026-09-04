@@ -180,9 +180,15 @@ def _fetch_real(email: str) -> List[str]:
 # Env vars driving prefix filter + system-group mapping. Read per-call so
 # operators can flip them via env without restarting the process; matches
 # the OAuth callback's historical behavior.
+#
+# `AGNES_GROUP_EVERYONE_EMAIL` was the third one, mapping a Workspace group
+# into the seeded `Everyone` row. Migration 0098 converted every instance
+# that had it set into an ordinary synced group named after the email, so
+# nothing reads the variable at runtime any more — it is inert if still set.
+# `AGNES_GROUP_ADMIN_EMAIL` is unaffected: `Admin` is a capability, not an
+# audience, and mapping it to a Workspace group narrows nothing.
 PREFIX_ENV = "AGNES_GOOGLE_GROUP_PREFIX"
 ADMIN_EMAIL_ENV = "AGNES_GROUP_ADMIN_EMAIL"
-EVERYONE_EMAIL_ENV = "AGNES_GROUP_EVERYONE_EMAIL"
 
 
 @dataclass
@@ -250,7 +256,7 @@ def apply_user_groups(user_id: str, email: str, conn) -> SyncResult:
     assumes ``user_id`` already exists.
     """
     del conn  # unused — see docstring (backend selection via repo factories)
-    from src.db import SYSTEM_ADMIN_GROUP, SYSTEM_EVERYONE_GROUP
+    from src.db import SYSTEM_ADMIN_GROUP
     from src.repositories import (
         user_group_members_repo,
         user_groups_repo,
@@ -260,7 +266,6 @@ def apply_user_groups(user_id: str, email: str, conn) -> SyncResult:
 
     prefix = os.environ.get(PREFIX_ENV, "").strip().lower()
     admin_email = os.environ.get(ADMIN_EMAIL_ENV, "").strip().lower()
-    everyone_email = os.environ.get(EVERYONE_EMAIL_ENV, "").strip().lower()
 
     try:
         group_emails = fetch_user_groups(email)
@@ -328,11 +333,15 @@ def apply_user_groups(user_id: str, email: str, conn) -> SyncResult:
                 if sys_admin:
                     group_ids.append(sys_admin["id"])
                 continue
-            if everyone_email and email_addr == everyone_email:
-                sys_everyone = ug_repo.get_by_name(SYSTEM_EVERYONE_GROUP)
-                if sys_everyone:
-                    group_ids.append(sys_everyone["id"])
-                continue
+            # `AGNES_GROUP_EVERYONE_EMAIL` used to have a branch here,
+            # routing its Workspace group's members into the seeded
+            # `Everyone` row. That is what made "everyone" mean a SUBSET of
+            # the instance on a mirrored deployment, while the marketplace's
+            # own everyone meant all of it. Migration 0098 converts the
+            # mapping to an ordinary group named after the Workspace email,
+            # which is exactly what the fall-through below creates and keeps
+            # in sync — so the mapping survives as a real audience and
+            # "everyone" now always means every account.
             # Regular synced group: name = full email. ``ensure()`` is
             # get-or-create-by-name and stamps created_by='system:google-sync'
             # on first create.
@@ -367,17 +376,13 @@ _everyone_missing_warned = False
 def ensure_everyone_membership(user_id: str, added_by: str) -> bool:
     """Grant ``user_id`` a ``source='system_seed'`` row in the Everyone group.
 
-    Dual-mode with ``EVERYONE_EMAIL_ENV`` (issue #748):
-
-    - **Env unset/empty** (the common case) — Everyone is a plain local
-      broadcast group. Every user-creation path calls this so new users
-      land in Everyone by default, restoring the pre-PR#131 behavior
-      while keeping every row traceable to a real source (here,
-      ``system_seed`` + ``added_by``).
-    - **Env set** — Everyone is mirrored from a Workspace group via
-      ``apply_user_groups`` (``source='google_sync'``); this helper
-      becomes a no-op so it doesn't fight the Workspace-authoritative
-      membership set with a stray local row.
+    Unconditional since 0098. It used to no-op whenever
+    ``AGNES_GROUP_EVERYONE_EMAIL`` was set, because on those instances the
+    seeded ``Everyone`` row was mirrored from a Workspace group and a stray
+    local membership would have fought the Workspace-authoritative set.
+    The mapping is now an ordinary group of its own (see
+    ``apply_user_groups``), so nothing mirrors ``Everyone`` any more and it
+    can go back to meaning what it says on every instance.
 
     Called at CREATION time only, never re-asserted at login/boot — an
     admin who manually removes a member via the admin path stays removed.
@@ -386,11 +391,10 @@ def ensure_everyone_membership(user_id: str, added_by: str) -> bool:
 
     Returns ``True`` iff a membership write was attempted (the group
     existed and ``add_member`` ran) — not "row was newly inserted";
-    ``add_member`` is itself idempotent. Returns ``False`` when the env
-    var routes Everyone to Workspace, or when the Everyone system group
-    is missing (unhealthy install / a test fixture that never seeded
-    system groups) — logged once at warning level so repeated calls
-    during a single unhealthy run don't spam.
+    ``add_member`` is itself idempotent. Returns ``False`` when the
+    Everyone system group is missing (unhealthy install / a test fixture
+    that never seeded system groups) — logged once at warning level so
+    repeated calls during a single unhealthy run don't spam.
 
     Routes through the ``src.repositories`` factory functions exclusively
     (never the raw DuckDB system-connection getter, never direct repo
@@ -399,15 +403,6 @@ def ensure_everyone_membership(user_id: str, added_by: str) -> bool:
     ``tests/test_backend_split_guard.py``.
     """
     global _everyone_missing_warned
-
-    if os.environ.get(EVERYONE_EMAIL_ENV, "").strip():
-        logger.debug(
-            "ensure_everyone_membership: %s is set — Everyone is "
-            "Workspace-controlled, skipping local auto-grant for %s",
-            EVERYONE_EMAIL_ENV,
-            user_id,
-        )
-        return False
 
     from src.db import SYSTEM_EVERYONE_GROUP
     from src.repositories import user_group_members_repo, user_groups_repo

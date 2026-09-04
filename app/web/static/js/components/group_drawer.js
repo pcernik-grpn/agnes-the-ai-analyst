@@ -302,6 +302,8 @@
      of the fetch here is exactly the kind of duplication that drifts. */
   var findTimer = null;
   var findSeq = 0;
+  //: A browse is a sample, not a directory — /admin/users is the directory.
+  var BROWSE_LIMIT = 12;
 
   function closeFound() {
     if (!els) return;
@@ -311,6 +313,11 @@
   }
 
   function bindFind() {
+    // Focus offers the roster straight away — the whole point is not having
+    // to guess a name to see that there is anyone to add.
+    els.find.addEventListener('focus', function () {
+      if (!els.find.value.trim()) runBrowse();
+    });
     els.find.addEventListener('input', function () {
       clearTimeout(findTimer);
       var q = els.find.value;
@@ -331,7 +338,7 @@
 
   function runFind(raw) {
     var q = String(raw || '').trim();
-    if (!q) { closeFound(); return; }
+    if (!q) { runBrowse(); return; }
     var seq = ++findSeq;
     window.AgnesPeopleSearch.search(q, FIND_LIMIT)
       .then(function (result) {
@@ -346,23 +353,55 @@
           els.find.setAttribute('aria-expanded', 'true');
           return;
         }
-        var people = result.people;
-        var taken = {};
-        (st.picked || []).forEach(function (m) { taken[m.email] = true; });
-        var rows = people.filter(function (u) { return !taken[u.email]; }).map(function (u) {
-          return '<button type="button" class="gdw-found__row" role="option"' +
-                 ' data-gdw-pick data-email="' + esc(u.email || '') + '"' +
-                 ' data-name="' + esc(u.name || '') + '">' +
-                 '<span class="gdw-found__who">' + esc(u.name || u.email || '') + '</span>' +
-                 (u.name ? '<span class="gdw-found__mail">' + esc(u.email || '') + '</span>' : '') +
-                 '</button>';
-        }).join('');
-        els.found.innerHTML = rows ||
-          '<p class="gdw-found__none">No account matches that. People without an account' +
-          ' are invited on the Access page once this group exists.</p>';
+        paintFound(result.people, false);
+      });
+  }
+
+  //: Rows for the accounts on offer. `browsing` distinguishes the roster an
+  //: empty box shows from the answer to a typed query: the empty case means
+  //: "nobody left to offer" in one and "nobody matched" in the other, and
+  //: only the second should send the reader to the invite route.
+  function paintFound(people, browsing) {
+    var taken = {};
+    (st.picked || []).forEach(function (m) { taken[m.email] = true; });
+    var rows = (people || []).filter(function (u) { return !taken[u.email]; }).map(function (u) {
+      return '<button type="button" class="gdw-found__row" role="option"' +
+             ' data-gdw-pick data-email="' + esc(u.email || '') + '"' +
+             ' data-name="' + esc(u.name || '') + '">' +
+             '<span class="gdw-found__who">' + esc(u.name || u.email || '') + '</span>' +
+             (u.name ? '<span class="gdw-found__mail">' + esc(u.email || '') + '</span>' : '') +
+             '</button>';
+    }).join('');
+    var head = browsing && rows
+      ? '<p class="gdw-found__hd">Anyone on this instance — or type to search</p>'
+      : '';
+    var empty = browsing
+      ? '<p class="gdw-found__none">Everyone with an account is already in this group.</p>'
+      : '<p class="gdw-found__none">No account matches that. People without an account' +
+        ' are invited on the Access page once this group exists.</p>';
+    els.found.innerHTML = head + (rows || empty);
+    els.found.hidden = false;
+    els.find.setAttribute('aria-expanded', 'true');
+  }
+
+  /* The roster an empty box offers. A field that shows nothing until you can
+     spell a colleague's name is only usable by someone who already knows the
+     answer — and the admin creating a group very often does not, which is
+     the same reason By person grew a roster instead of demanding a name. */
+  function runBrowse() {
+    var seq = ++findSeq;
+    window.AgnesPeopleSearch.recent(BROWSE_LIMIT).then(function (result) {
+      if (seq !== findSeq || !st) return;
+      if (els.find.value.trim()) return;   // they started typing meanwhile
+      if (result.error) {
+        els.found.innerHTML = '<p class="gdw-found__none gdw-found__error">' +
+          'Could not list accounts: ' + esc(result.error) + '</p>';
         els.found.hidden = false;
         els.find.setAttribute('aria-expanded', 'true');
-      });
+        return;
+      }
+      paintFound(result.people, true);
+    });
   }
 
   function renderChips() {

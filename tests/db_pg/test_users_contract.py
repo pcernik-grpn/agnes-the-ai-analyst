@@ -991,3 +991,54 @@ def test_grouping_survives_rows_whose_folded_addresses_interleave(users_repo):
     assert set(groups) == {"mia@example.com", "mid@example.com"}
     assert {u["id"] for u in groups["mid@example.com"]["users"]} == {"user-a1", "user-a2"}
     assert {u["id"] for u in groups["mia@example.com"]["users"]} == {"user-b", "user-b2"}
+
+
+# ---------------------------------------------------------------------------
+# count_people — the everyone audience, not every row (issue #2256)
+# ---------------------------------------------------------------------------
+
+
+def test_count_people_excludes_seeded_system_identities(users_repo):
+    """Both backends reach the same number by different means: PG reads the
+    ``kind`` column, DuckDB has none and matches the address."""
+    repo, _conn, _backend = users_repo
+    from src.service_accounts import SYSTEM_IDENTITY_EMAILS
+
+    _make_user(repo, id="p1", email="person@example.com")
+    for i, email in enumerate(SYSTEM_IDENTITY_EMAILS):
+        _make_user(repo, id=f"sys{i}", email=email, name="System")
+        repo.mark_system_identity(f"sys{i}")
+
+    assert repo.count_all() == 1 + len(SYSTEM_IDENTITY_EMAILS)
+    assert repo.count_people() == 1
+
+
+def test_count_people_excludes_service_accounts(users_repo):
+    repo, _conn, backend = users_repo
+    _make_user(repo, id="p1", email="person@example.com")
+    if backend != "pg":
+        # `create_service_account` is PG-only, so no such row can exist here
+        # — the two backends agree by construction, not by a filter.
+        assert repo.count_people() == 1
+        return
+    repo.create_service_account(id="svc1", email="ci-bot@service.local", name="CI")
+    assert repo.count_all() == 2
+    assert repo.count_people() == 1
+
+
+def test_the_people_picker_offers_service_accounts_and_hides_system_identities(users_repo):
+    """A group is the only way a service account acquires any authority, so
+    it has to stay pickable (#1534). A system identity is plumbing and
+    adding it to a group is only ever a mistake (#2256)."""
+    repo, _conn, backend = users_repo
+    _make_user(repo, id="p1", email="person@example.com")
+    _make_user(repo, id="sys1", email="memory-curator@system.local", name="Curator")
+    repo.mark_system_identity("sys1")
+    if backend == "pg":
+        repo.create_service_account(id="svc1", email="ci-bot@service.local", name="CI")
+
+    emails = {r["email"] for r in repo.search_recent(limit=50)}
+    assert "person@example.com" in emails
+    assert "memory-curator@system.local" not in emails
+    if backend == "pg":
+        assert "ci-bot@service.local" in emails

@@ -1,0 +1,275 @@
+"""Where a `resource_grants` row came from — the closed set, once.
+
+A grant records WHO wrote it (``assigned_by``). It did not record WHAT wrote
+it, and those are different questions with different answers: marking a plugin
+Required on /admin/marketplaces fans a grant out to every group and stamps each
+one with the admin who clicked, so N machine-written rows are indistinguishable
+from N an admin typed on /admin/access. The page then offers a Revoke that
+either fails (a Required plugin) or succeeds and is undone by the next sync.
+
+This module is the vocabulary for the missing half. A CLOSED set rather than
+free text, for three reasons: it is greppable, a display label can be attached
+to it without parsing prose, and a writer that forgets to declare itself shows
+up as ``None`` — visibly unknown — rather than as a plausible sentence nobody
+wrote.
+
+``revocable`` is the part that keeps this honest. Not every non-page writer
+owns its grants: several SEED a default an admin is expected to override
+(``mcp_source_default``, ``chat_seed``), and refusing a revoke there would be
+worse than saying nothing. Only sources that genuinely re-assert their grants,
+or that another surface controls, are marked non-revocable.
+
+Postgres-only, like the column it describes — see the note on
+``resource_grants.source``.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Dict, Optional
+
+
+@dataclass(frozen=True)
+class GrantSource:
+    """One writer, as the Access page needs to talk about it."""
+
+    #: Stored in `resource_grants.source`. Never rendered.
+    key: str
+    #: What the reader is told this grant IS ("Required plugin").
+    label: str
+    #: The surface that owns it, named as the admin nav names it.
+    surface: str
+    #: Where to go to change it. Empty when this page is the owner.
+    href: str
+    #: False when revoking here cannot stick — the control is elsewhere, or
+    #: the writer re-asserts on its next run.
+    revocable: bool = True
+    #: One sentence explaining the above, shown on hover.
+    reason: str = ""
+
+
+#: The Access page itself. The default for anything an admin does by hand.
+ACCESS_PAGE = "access_page"
+
+#: Written once, by migration 0098, for each plugin that carried
+#: ``marketplace_plugins.is_system``. Not a surface — but an admin meeting a
+#: required everyone-grant nobody typed deserves to be told where it came
+#: from, and a source-less row could only shrug.
+SYSTEM_PLUGIN_MIGRATION = "system_plugin_migration"
+
+GRANT_SOURCES: Dict[str, GrantSource] = {
+    ACCESS_PAGE: GrantSource(
+        key=ACCESS_PAGE,
+        label="Granted here",
+        surface="Access",
+        href="",
+        revocable=True,
+    ),
+    # `marketplace_required` lived here until 0098. It named the grant a
+    # switch on /admin/marketplaces produced, and said "not revocable here,
+    # go there instead". Both halves are gone: Marketplaces controls whether
+    # a plugin EXISTS on the instance, Access controls who gets it, and there
+    # is one writer of grants again. A stale row carrying the old key
+    # degrades to no badge through `describe`'s unknown-key path.
+    SYSTEM_PLUGIN_MIGRATION: GrantSource(
+        key=SYSTEM_PLUGIN_MIGRATION,
+        label="Was a system plugin",
+        surface="Access",
+        href="",
+        revocable=True,
+        reason=(
+            "Converted from the old system-plugin mark when Everyone became "
+            "a scope. It reaches every account automatically, and unlike the "
+            "mark it did replace, you can change it here."
+        ),
+    ),
+    "marketplace_sync": GrantSource(
+        key="marketplace_sync",
+        label="From a marketplace sync",
+        surface="Marketplaces",
+        href="/admin/marketplaces",
+        revocable=False,
+        reason="Written by the nightly marketplace sync, which re-asserts it on its next run.",
+    ),
+    "sharepoint_wizard": GrantSource(
+        key="sharepoint_wizard",
+        label="From the SharePoint wizard",
+        surface="Data sources",
+        href="/admin/data-sources",
+        # REVOCABLE, and the correction matters: this was marked False on the
+        # reasoning that "the wizard rewrites them on the next run". It does
+        # not. `confirm_scope` rewrites a scope's collection grants only when
+        # an admin RE-SUBMITS that scope's form with a group list — there is
+        # no scheduled pass behind it. So an admin's revoke here stands until
+        # someone deliberately reopens the wizard, which is ordinary
+        # last-writer-wins, not a control that cannot act.
+        #
+        # The genuinely self-restoring case is the ACL sync below, which is
+        # what `revocable=False` was reaching for and did not name.
+        revocable=True,
+        reason=(
+            "Written by the connect wizard. You can change it here; "
+            "re-submitting that scope in the wizard will overwrite it."
+        ),
+    ),
+    "sharepoint_acl_sync": GrantSource(
+        key="sharepoint_acl_sync",
+        label="Mirrored from SharePoint permissions",
+        surface="Data sources",
+        href="/admin/data-sources",
+        # THIS is the one a revoke cannot hold. A mirrored-mode scope has its
+        # collection grants recomputed from SharePoint's own ACLs on every
+        # sync (`connectors/sharepoint/acl_sync.py::reconcile_collection_grants`),
+        # so a row removed here returns on the next run. Until this key
+        # existed those grants carried no source at all, which filed them
+        # under "change here" and drew a Revoke that silently undid itself —
+        # the exact failure this registry exists to prevent.
+        #
+        # Stopping the mirroring is `access_mode`, on the scope, not a revoke
+        # on one row (spec §2.3).
+        revocable=False,
+        reason=(
+            "Mirrored from SharePoint's own permissions on every sync. "
+            "Change who is in the SharePoint scope, or switch the scope off "
+            "mirrored mode, in Data sources."
+        ),
+    ),
+    "share_request": GrantSource(
+        key="share_request",
+        label="Approved share request",
+        surface="Submissions",
+        href="/admin/store-submissions",
+        revocable=True,
+        reason="Created when an admin approved a share request. Revoking here is final.",
+    ),
+    "library_share": GrantSource(
+        key="library_share",
+        label="Shared by its owner",
+        surface="Library",
+        href="/library",
+        revocable=True,
+        reason="The item's owner shared it from the Library. Revoking here overrides that.",
+    ),
+    "collection_create": GrantSource(
+        key="collection_create",
+        label="Set when created",
+        surface="Library",
+        href="/library",
+        revocable=True,
+        reason="Written when the collection was created. Change it here.",
+    ),
+    "mcp_source_default": GrantSource(
+        key="mcp_source_default",
+        label="Default visibility",
+        surface="MCP sources",
+        href="/admin/mcp-sources",
+        revocable=True,
+        reason="A default written when the source was registered — an admin is expected to narrow it.",
+    ),
+    "skill_contribution": GrantSource(
+        key="skill_contribution",
+        label="Published skill",
+        surface="Library",
+        href="/library",
+        revocable=True,
+        reason="Written when a contributed skill was published.",
+    ),
+    "chat_seed": GrantSource(
+        key="chat_seed",
+        label="Seeded default",
+        surface="Access",
+        href="",
+        revocable=True,
+        reason="A one-time default so Everyone can use chat. Change it here.",
+    ),
+}
+
+
+#: The two sections `/admin/access` groups grant rows into (the effort's
+#: ticket 10). Both names say where the ACTION lives, not who owns the row —
+#: which is the axis that answer picked.
+#: Writers that identify themselves in ``assigned_by`` rather than in
+#: ``source``, mapped to the source they mean.
+#:
+#: `resource_grants.source` arrived in Alembic 0096, which is Postgres-only
+#: under the A3 ratchet — so on the frozen DuckDB app-state backend the column
+#: does not exist and NO grant can record its writer. Classifying on `source`
+#: alone therefore worked on exactly one of the two supported backends, and
+#: silently gave DuckDB instances the old behaviour: a Revoke on a mirrored
+#: SharePoint collection that the next sync undoes.
+#:
+#: `assigned_by` exists on both. The ACL sync has always written its own
+#: sentinel there, so the writer is already recorded on every instance — it
+#: just was not being read. This also covers Postgres rows written before the
+#: stamping existed, which is most of them on any live instance.
+SENTINEL_SOURCES: Dict[str, str] = {
+    "system:sharepoint-acl-sync": "sharepoint_acl_sync",
+}
+
+
+def resolve_source(source: Optional[str], assigned_by: Optional[str] = None) -> Optional[str]:
+    """The writer of a grant, from whichever column recorded it.
+
+    An explicit ``source`` always wins: it is what the writer declared, and
+    a sentinel is only ever a fallback for rows that could not carry one.
+    """
+    if source:
+        return source
+    return SENTINEL_SOURCES.get(assigned_by or "")
+
+
+SECTION_CHANGE_HERE = "change_here"
+SECTION_SET_ELSEWHERE = "set_elsewhere"
+
+
+def section_for(source: Optional[str]) -> str:
+    """Which section a grant row belongs in.
+
+    Keyed on :attr:`GrantSource.revocable`, so a future writer picks its own
+    side by declaring one field and the page needs no list to maintain.
+
+    The axis is **can the admin act on this row**, not **who wrote it**. Nine
+    writers are not the admin, but only two produce rows a revoke cannot
+    remove (``marketplace_sync`` re-asserts nightly; ``sharepoint_wizard``
+    rewrites its scope's collection grants). Grouping by authorship would
+    file seven revocable kinds under "not yours" — including the Library
+    shares an admin most often opens this page to check.
+
+    Everything unrecognised lands in ``change_here``, deliberately: a row
+    with no recorded source (every grant predating the column, and every
+    grant on a DuckDB instance, where the column does not exist), a row this
+    page itself wrote, and a stale key from a writer removed in a later
+    release. All three are revocable and nothing re-asserts them, so the
+    actionable section is the correct home rather than a fallback.
+    """
+    spec = GRANT_SOURCES.get(source or "")
+    if spec is not None and not spec.revocable:
+        return SECTION_SET_ELSEWHERE
+    return SECTION_CHANGE_HERE
+
+
+def describe(source: Optional[str]) -> Optional[dict]:
+    """The row's provenance as the API sends it, or ``None``.
+
+    ``None`` for a grant with no source (every row written before the column
+    existed) and for one written on the Access page itself: neither needs the
+    page to explain where it came from, and a badge on every row would be
+    noise on the common case.
+
+    An UNKNOWN key also returns ``None`` rather than raising. A stale value —
+    a writer removed in a later release, a hand-edited row — must not take the
+    Access overview down; the grant simply renders as an ordinary one.
+    """
+    if not source or source == ACCESS_PAGE:
+        return None
+    spec = GRANT_SOURCES.get(source)
+    if spec is None:
+        return None
+    return {
+        "key": spec.key,
+        "label": spec.label,
+        "surface": spec.surface,
+        "href": spec.href,
+        "revocable": spec.revocable,
+        "reason": spec.reason,
+    }

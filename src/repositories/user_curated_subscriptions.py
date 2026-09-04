@@ -148,49 +148,16 @@ class UserCuratedSubscriptionsRepository:
         ).fetchone()[0]
         return max(0, int(after) - int(before))
 
-    def fanout_system_for_plugin(
-        self,
-        marketplace_id: str,
-        plugin_name: str,
-    ) -> int:
-        """Subscribe every existing user to ``(marketplace_id, plugin_name)``.
-
-        Counterpart to ``fanout_system_for_user`` — this side picks one
-        plugin and walks every user, that side picks one user and walks
-        every system plugin. Both go through the same
-        ``user_plugin_optouts`` PK + ``ON CONFLICT DO NOTHING`` so they
-        compose freely with the user/group-create hooks.
-
-        Returns the count of NEW subscriptions written (delta of
-        before/after row counts) so the admin endpoint can report
-        ``affected_users`` honestly — re-running on an already-marked
-        plugin returns 0 instead of misleadingly reporting "every user".
-        """
-        before = self.conn.execute(
-            "SELECT COUNT(*) FROM user_plugin_optouts WHERE marketplace_id = ? AND plugin_name = ?",
-            [marketplace_id, plugin_name],
-        ).fetchone()[0]
-        self.conn.execute(
-            """INSERT INTO user_plugin_optouts
-               (user_id, marketplace_id, plugin_name)
-               SELECT id, ?, ? FROM users
-               ON CONFLICT (user_id, marketplace_id, plugin_name) DO NOTHING""",
-            [marketplace_id, plugin_name],
-        )
-        after = self.conn.execute(
-            "SELECT COUNT(*) FROM user_plugin_optouts WHERE marketplace_id = ? AND plugin_name = ?",
-            [marketplace_id, plugin_name],
-        ).fetchone()[0]
-        return max(0, int(after) - int(before))
 
     def stack_counts(self) -> Dict[Tuple[str, str], int]:
         """Return ``{(marketplace_id, plugin_name): subscriber_count}`` for
         every curated plugin with at least one subscriber.
 
         Post-v28, row PRESENCE in ``user_plugin_optouts`` means the user is
-        subscribed; ``fanout_system_for_user`` materialises rows for every
-        ``is_system`` plugin × user pair, so the COUNT naturally includes
-        system plugins without a separate code path. Backs the marketplace
+        subscribed. A plugin granted to everyone at the
+        required tier has NO rows here — nothing subscribes anyone to it —
+        so it counts 0 and the caller overlays the total user count (see
+        ``app.api.marketplace._load_curated_stack_counts``). Backs the marketplace
         listing/detail pages' subscriber-count badge
         (``app.api.marketplace._load_curated_stack_counts``) — one query per
         page render, avoiding N+1.
@@ -204,30 +171,3 @@ class UserCuratedSubscriptionsRepository:
         ).fetchall()
         return {(r[0], r[1]): int(r[2]) for r in rows}
 
-    def fanout_system_for_user(self, user_id: str) -> None:
-        """Subscribe ``user_id`` to every active system marketplace_plugin.
-
-        Only plugins with ``is_system=TRUE`` and ``admin_disabled=FALSE`` are
-        selected — a disabled plugin stays hidden from new-user fanout even if
-        a row somehow still carries the system flag. Symmetric with
-        ``ResourceGrants.fanout_system_for_group``.
-
-        Idempotent — the table's PRIMARY KEY ``(user_id, marketplace_id,
-        plugin_name)`` plus ``ON CONFLICT … DO NOTHING`` keeps existing
-        subscriptions untouched.
-
-        Called from the user-create hooks (Google OAuth, magic-link,
-        admin-create, scheduler token) so a new user lands in the mandatory
-        tier without an admin reconcile — it subscribes *one* user to *every*
-        active system plugin. (The admin ``mark_system`` endpoint fans a single
-        plugin out to all users via ``fanout_system_for_plugin``, not this
-        helper.)
-        """
-        self.conn.execute(
-            """INSERT INTO user_plugin_optouts
-               (user_id, marketplace_id, plugin_name)
-               SELECT ?, marketplace_id, name
-               FROM marketplace_plugins WHERE is_system = TRUE AND admin_disabled = FALSE
-               ON CONFLICT (user_id, marketplace_id, plugin_name) DO NOTHING""",
-            [user_id],
-        )

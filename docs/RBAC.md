@@ -36,13 +36,26 @@ compute_agent_intersection`) and **co-session** grant intersection
 both read `app.auth.access._allowed_ids_for_user(owner_id, 'table')`, a raw
 `resource_grants` lookup that never expands through a Data Package.
 
-Practical consequence: to let a scoped agent (or a co-drive session) reach a
-table, an admin must grant that table to the owner's group **in addition
-to** — never instead of — putting it in a Data Package the owner has access
-to. Granting only the package leaves the agent's/session's effective table
-set empty for that table, regardless of the owner's own query access to it
-via `agnes query`/`agnes pull`. If nobody in the instance uses agent scoping
-or co-sessions, a `TABLE` grant has no live effect at all.
+**Corrected 2026-09-02.** This section used to say a scoped agent could
+reach a table ONLY via a direct `TABLE` grant, so an admin had to grant the
+table "in addition to — never instead of" the package. That stopped being
+true with the one-agent-model change (`docs/superpowers/plans/
+2026-08-26-one-agent-model.md`), and the claim outlived it.
+
+What is true: the data axis resolves to `raw TABLE grants ∪ tables in the
+identity's data packages` (`src/agent_scope_intersection.py`
+`_axis_allowed_ids`, the `base | _package_table_ids(pkgs)` branch). A
+declared `data_package` scope row stands for its member tables and is
+expanded LIVE per request, so a package edit reaches every agent scoped to
+it without a re-save. The `/agents` builder only ever declares packages,
+memory domains and collections — never bare table ids.
+
+Practical consequence, restated: putting a table in a Data Package the
+owner holds is normally sufficient for a scoped agent to reach it. A direct
+`TABLE` grant is only needed to ADD a table beyond the owner's packages —
+and since analyst visibility is package-mediated too, such a grant reaches
+nobody except through this one union. If nobody in the instance uses agent
+scoping or co-sessions, a `TABLE` grant has no live effect at all.
 
 ### Internal usage tables: the `agnes-usage` package
 
@@ -100,9 +113,57 @@ Grants and agent scopes both answer "can this group/agent reach the table at all
 
 | Table | Purpose |
 |---|---|
-| `user_groups` | Named groups. Two rows seeded as `is_system=TRUE`: **Admin** (god mode) and **Everyone** (auto-membership at creation for every new user by default; Workspace-mirrored instead when `AGNES_GROUP_EVERYONE_EMAIL` is set — see [Group membership sources](#group-membership-sources)). |
+| `user_groups` | Named groups. Two rows seeded as `is_system=TRUE`: **Admin** (god mode) and **Everyone** (auto-membership at creation for every new user; it also carries every everyone-scoped grant — see `scope` below). |
 | `user_group_members` | `(user_id, group_id, source)`. `source ∈ {admin, google_sync, microsoft_sync, system_seed}` so each writer only manipulates its own rows — a sync's DELETE+INSERT never clobbers admin-added members or another provider's synced rows. `microsoft_sync` is config-gated and off by default — see [`auth-microsoft-oauth.md`](auth-microsoft-oauth.md#entra-group-sync-off-by-default). **v14**: FK constraint on `group_id` referencing `user_groups.id` (cascade delete). |
-| `resource_grants` | `(group_id, resource_type, resource_id)`. The grant table the resolver hits when Admin short-circuit doesn't apply. **v14**: FK constraint on `group_id` referencing `user_groups.id` (cascade delete). |
+| `resource_grants` | `(group_id, resource_type, resource_id)`. The grant table the resolver hits when Admin short-circuit doesn't apply. **v14**: FK constraint on `group_id` referencing `user_groups.id` (cascade delete). **`0098`**: nullable `scope` — see below. |
+
+### `scope` — who a grant reaches (Postgres only, `0097`)
+
+- **NULL** — the members of `group_id`. Every grant written before `0098`.
+- **`'everyone'`** — every account on the instance, including one that
+  belongs to no group at all.
+
+An everyone-scoped row keeps a `group_id` (the column is NOT NULL) pointed at
+the **carrier**: the seeded `Everyone` group, resolved by
+`src.grant_scopes.carrier_group_id`. The carrier is forced by the writer, not
+chosen by the caller — `POST /api/admin/grants` overrides whatever `group_id`
+was sent when `scope` is given. Two reasons: `UNIQUE (group_id,
+resource_type, resource_id)` is what stops a resource collecting two
+everyone-grants, and identifying "reaches everyone" by the carrier is the one
+spelling that works on both backends.
+
+"Give this to everyone" is **withheld** — absent from the choice, and a 422
+if sent — for the four types where it is not a coherent audience
+(`grant_scopes.SCOPE_WITHHELD_TYPES`): `slack_channel`, `table`,
+`memory_domain`, `memory_item`. Each has its own reason; the constant
+documents them.
+
+**Postgres only**, like `resource_grants.source`. The DuckDB app-state ladder
+is frozen (A3), so that backend accepts `scope=` and drops it: the row is an
+ordinary grant on the carrier group, and reaching it there DOES require
+membership. Reads that are ABOUT the column (`count_everyone_scoped`,
+`list_everyone_scoped`) raise `RequiresPostgresBackend` → 501 rather than
+answering "nobody".
+
+So the two backends do not mean quite the same thing by "everyone", and the
+gap is closed by data rather than by the column:
+`src/system_plugin_reconcile.py` runs at boot on DuckDB only and is that
+ladder's stand-in for `0098` — it converts the Workspace narrowing, then
+makes the carrier group genuinely hold every account (in that order; the
+reverse hands the narrowed group's grants to the whole instance), then turns
+each `is_system` plugin into a required grant on it. After it has run,
+"everyone" means every account on both backends.
+
+What still differs: an account created on DuckDB and then removed from the
+carrier group stops receiving everyone-scoped grants, where on Postgres it
+would keep them. In practice no admin path can do that — `remove_member`
+takes `require_source='admin'` and cannot strip the `system_seed` auto-join
+(see [Group membership sources](#group-membership-sources)) — so it takes
+direct SQL. It is a real difference, not a reassuring one; it is just not
+one an operator can reach by accident.
+
+`count_for_group` excludes everyone-scoped rows: the carrier holds them but
+does not decide their reach.
 
 `resource_type` is a string from the `app.resource_types.ResourceType` `StrEnum`. `resource_id` is a path string whose format is owned by the registering module — for `marketplace_plugin` it's `<marketplace_slug>/<plugin_name>`.
 
@@ -283,7 +344,7 @@ Members are added to groups by four sources, distinguished by the `source` colum
 - **`google_sync`** — written by the OAuth callback on every login. The previous Google-sync set is wholesale replaced (DELETE + INSERT) so a removed Workspace membership disappears immediately.
 - **`microsoft_sync`** — same DELETE + INSERT mechanism, driven by Microsoft Graph `GET /me/transitiveMemberOf/microsoft.graph.group` instead of the Workspace Admin SDK. Groups are keyed `entra:<object-id>` — the SAME key the SharePoint ACL mirror uses for the same Entra group (`src.entra_identity.entra_group_name`) — and read-only through `/admin/access` (`409 microsoft_managed_readonly`). Config-gated and off by default; see [`auth-microsoft-oauth.md`](auth-microsoft-oauth.md#entra-group-sync-off-by-default).
 - **`admin`** — written by admin actions in the UI (`/admin/groups/{id}` → Members), CLI (`agnes admin group add-member …`), or REST (`POST /api/admin/groups/{id}/members`). Survives either sync. Admin can only delete admin-source rows.
-- **`system_seed`** — written at deploy time (the `SEED_ADMIN_EMAIL` → Admin-group binding) **and** at every new-user creation (the Everyone auto-grant, issue #748 — every creation path: OAuth first sign-in (any provider), `POST /auth/bootstrap`, admin `POST /api/users`, marketplace import stubs — unless `AGNES_GROUP_EVERYONE_EMAIL` maps Everyone to a Workspace group instead, in which case Everyone comes exclusively from `google_sync`). The Everyone grant fires once, at creation time, and is never re-asserted afterward — an admin who later removes a user from Everyone stays removed on their next login/boot.
+- **`system_seed`** — written at deploy time (the `SEED_ADMIN_EMAIL` → Admin-group binding) **and** at every new-user creation (the Everyone auto-grant, issue #748 — every creation path: OAuth first sign-in (any provider), `POST /auth/bootstrap`, admin `POST /api/users`, marketplace import stubs). Unconditional since `0098`: `AGNES_GROUP_EVERYONE_EMAIL` used to suppress it, and that mapping is now an ordinary group. The Everyone grant fires once, at creation time, and is never re-asserted afterward. Note that no admin path can undo it — `remove_member` takes `require_source='admin'`, so a `system_seed` row is not deletable through the UI/CLI/REST.
 
 Removing a user from a group via the admin path (UI/CLI/REST) only deletes admin-source rows. To revoke a synced membership, the operator must change the upstream directory group instead (Workspace or Entra ID) — Agnes will pick up the change on the user's next login.
 
@@ -550,7 +611,7 @@ Schema v49 (unified Browse + My Stack for Data Packages and Memory):
   - `DATA_PACKAGE` — admin-curated bundle of tables (`data_packages` table; M:N to `table_registry` via `data_package_tables`). At v49 the effective `TABLE` set for a user was `(direct TABLE grants) ∪ (tables in DATA_PACKAGE grants the user has)`. This was later hardened: analyst table visibility now flows through Data Packages **only** (`src/rbac.py::can_access_table` / `get_accessible_tables`) — a direct `TABLE` grant no longer contributes to it at all. See [Table grants: agent-scope and co-session ceilings](#table-grants-agent-scope-and-co-session-ceilings) for what a direct `TABLE` grant is still for.
   - `MEMORY_ITEM` — per-group item-level Required override. Default for an item comes from `knowledge_items.is_required` flag; a `MEMORY_ITEM` grant flips that for the specified group.
 - `MEMORY_DOMAIN` grants migrated from slug strings to `memory_domains.id` references. Orphan grants (pointing at non-existent domains) preserved for admin cleanup.
-- Marketplace plugins: v49 originally left them out (`marketplace_plugins.is_system` was the only mandatory path), but the tier now applies to `marketplace_plugin` grants too — `resolve_user_marketplace` serves `granted ∩ (subscribed ∪ required)`, so a required grant puts the plugin in every group member's served set without a subscription row (unsubscribe/uninstall return 409). `is_system` remains the *global* (all-users) mandatory flag; `requirement='required'` is the *group-scoped* one.
+- Marketplace plugins: v49 originally left them out (`marketplace_plugins.is_system` was the only mandatory path), but the tier now applies to `marketplace_plugin` grants too — `resolve_user_marketplace` serves `granted ∩ (subscribed ∪ required)`, so a required grant puts the plugin in every group member's served set without a subscription row (unsubscribe/uninstall return 409). There is no longer a second mandatory path: `marketplace_plugins.is_system` was the *global* (all-users) flag beside this *group-scoped* tier, and since `0098` "all users" is the same tier at `scope='everyone'`. The column survives, dead and unread, until the contract half of the expand/contract pair drops it in a later release.
 
 Effective Required = OR across grants. Any grant with `requirement='required'` wins for the user.
 

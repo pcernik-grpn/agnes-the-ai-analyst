@@ -429,26 +429,33 @@ class ReportsRepository:
     # effectively `subscribed_at`. Read it as an install ledger, not an opt-out
     # one.
     #
-    # A row whose plugin is flagged `marketplace_plugins.is_system` got there by
-    # platform action (a system plugin lands in every stack), so it is
-    # provisioning rather than adoption and is reported separately. The check is
-    # NOT EXISTS rather than a join so an install whose plugin row is missing
-    # entirely still counts as a real install instead of silently vanishing.
+    # A row whose plugin reaches EVERY account automatically got there by
+    # platform action rather than by anyone choosing it, so it is
+    # provisioning rather than adoption and is reported separately. That used
+    # to be the `marketplace_plugins.is_system` flag; since 0098 it is a
+    # required grant at `scope='everyone'`. This backend has no `scope`
+    # column (the ladder is frozen, A3), so the same statement is spelled as
+    # a required grant held by the carrier group — see
+    # `src/repositories/resource_grants.py`. NOT EXISTS rather than a join so
+    # an install whose plugin row is missing entirely still counts as a real
+    # install instead of silently vanishing.
     #
-    # Caveat: classification uses the plugin's CURRENT `is_system` flag, so it
-    # describes what a plugin is now, not what it was when the row was written.
-    # Clearing the flag (admin-disabling a plugin does this) or deleting the
-    # registry row moves historical rollout rows back into the opt-in figures.
-    # Fixing that properly needs provenance stamped on the subscription row at
-    # subscribe time — a migration, deliberately not taken here. Blast radius is
-    # limited: published reports are static HTML, so only a re-generated report
-    # for a past window can shift.
+    # Caveat: classification uses the grant as it stands NOW, so it describes
+    # what a plugin is today, not what it was when the row was written.
+    # Revoking the grant moves historical rollout rows back into the opt-in
+    # figures. Fixing that properly needs provenance stamped on the
+    # subscription row at subscribe time — a migration, deliberately not taken
+    # here. Blast radius is limited: published reports are static HTML, so only
+    # a re-generated report for a past window can shift.
     _NOT_SYSTEM = """
         NOT EXISTS (
-            SELECT 1 FROM marketplace_plugins mp
-            WHERE mp.marketplace_id = o.marketplace_id
-              AND mp.name = o.plugin_name
-              AND mp.is_system = TRUE
+            SELECT 1 FROM resource_grants rg
+            WHERE rg.resource_type = 'marketplace_plugin'
+              AND rg.resource_id = o.marketplace_id || '/' || o.plugin_name
+              AND rg.requirement = 'required'
+              AND rg.group_id IN (
+                  SELECT id FROM user_groups WHERE name = 'Everyone' AND is_system
+              )
         )
     """
 

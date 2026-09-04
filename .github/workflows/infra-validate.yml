@@ -1,0 +1,44 @@
+# Parse + validate the reusable Terraform module on every PR that touches it.
+#
+# Why: a train merge once dropped two closing braces in
+# infra/modules/customer-instance/variables.tf and the break reached main
+# unnoticed — no job here ever parsed the module, so the first `terraform
+# init` that saw it was a consumer's plan against a freshly cut infra-v* tag.
+# `terraform validate` needs no cloud credentials and no backend; it catches
+# exactly that class of defect at PR time, before a tag can carry it.
+name: infra-validate
+
+on:
+  pull_request:
+    paths:
+      - "infra/modules/customer-instance/**"
+      - ".github/workflows/infra-validate.yml"
+  push:
+    branches: [main]
+    paths:
+      - "infra/modules/customer-instance/**"
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: infra/modules/customer-instance
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.5"
+
+      - name: terraform fmt -check
+        run: terraform fmt -check -recursive -diff
+
+      - name: terraform init (no backend)
+        run: terraform init -backend=false -input=false
+
+      - name: terraform validate
+        run: terraform validate -no-color

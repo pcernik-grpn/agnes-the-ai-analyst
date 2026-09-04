@@ -178,8 +178,16 @@ def test_admin_system_group_is_sso_when_env_mapped(fresh_db, monkeypatch):
     assert payload["is_sso_user"] is True
 
 
-def test_everyone_system_group_is_sso_when_env_mapped(fresh_db, monkeypatch):
-    """AGNES_GROUP_EVERYONE_EMAIL set → Everyone membership counts as SSO."""
+def test_everyone_membership_is_never_sso_even_with_the_legacy_env_set(fresh_db, monkeypatch):
+    """The Everyone branch of ``_is_sso_user`` is gone with the mapping.
+
+    Setting ``AGNES_GROUP_EVERYONE_EMAIL`` used to make a ``google_sync``
+    membership in the seeded ``Everyone`` row count as SSO-managed, because
+    that row WAS the Workspace group. 0098 gave the Workspace group a group
+    of its own, whose ``created_by='system:google-sync'`` triggers the first
+    and broader branch — so the same accounts are still detected, and a
+    stale env value can no longer lock an admin out of managing a local one.
+    """
     from app.main import app
     from src.db import SYSTEM_EVERYONE_GROUP
 
@@ -191,7 +199,7 @@ def test_everyone_system_group_is_sso_when_env_mapped(fresh_db, monkeypatch):
     _add_to_group(uid, _system_group_id(SYSTEM_EVERYONE_GROUP), source="google_sync")
 
     payload = _user_payload(client, token, uid)
-    assert payload["is_sso_user"] is True
+    assert payload["is_sso_user"] is False
 
 
 def test_everyone_system_group_alone_is_not_sso_without_env_mapping(fresh_db):

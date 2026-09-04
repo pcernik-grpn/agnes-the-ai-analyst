@@ -595,49 +595,96 @@ def test_both_modals_read_the_sync_schedule_from_one_helper():
     assert "syncScheduleFacts(m)" in open_details, "openDetails must read the shared helper"
 
 
-def test_plugin_control_presents_as_enabled_toggle_checked_when_not_disabled():
-    """#1956 item 14b: the old "Disabled" toggle was semantically inverted —
-    checked meant admin_disabled=true, so switching it ON looked like it
-    should turn something *on* while it actually hid the plugin. #1913's
-    reporter mistook a checked (= hidden) toggle for "still active". The
-    control now presents as "Enabled": checked means the plugin is available
-    to users (admin_disabled=false); the underlying admin_disabled write is
-    unchanged, only the rendered semantics flip."""
+# `test_plugin_control_presents_as_enabled_toggle_checked_when_not_disabled`
+# stood here on main and is deliberately NOT carried across this merge.
+# Checked against the merged template rather than assumed: it asserts
+# `>Enabled<` and `${isDisabled ? "" : "checked"}`, and both are absent
+# here — this branch's control is Off / Available, since `is_system` is
+# deleted and distribution moved to /admin/access. The behaviour it
+# protected (the caption is not the inverted 'Disabled') is asserted by
+# the availability test below, which also pins `>Disabled<` absent.
+#
+# Recorded because the merge would have dropped it either way: git
+# aligned the two function signatures and let this branch's body serve as
+# the continuation for both, so main's assertions never reached the
+# merge output for any resolution to choose.
+
+def test_plugin_availability_is_one_control_with_two_positions():
+    """This page answers ONE question, and it is not "who gets it".
+
+    The control had three positions — Off / By group / Everyone — of which
+    two were not controls: "By group" set nothing (it was a signpost to
+    /admin/access) and "Everyone" wrote a distribution decision from the page
+    that owns availability. Two writers of reach is how the flag and the
+    grants drifted apart in the first place, so both are gone with
+    ``marketplace_plugins.is_system``; Off / Available is the honest name for
+    what the switch has always done.
+
+    Before that it was two switches drawing FOUR combinations for three real
+    states, which is the defect #1956 items 13 + 14 reported.
+    """
     template = Path("app/web/templates/admin_marketplaces.html").read_text(encoding="utf-8")
-    assert "plugin-enabled-toggle" in template, "toggle wrapper class must be renamed off the inverted 'disable' name"
-    assert ">Enabled<" in template
-    assert ">Disabled<" not in template, "the inverted 'Disabled' caption must not remain anywhere in the markup"
-    assert '${isDisabled ? "" : "checked"}' in template, (
-        "checkbox must be checked when isDisabled is false (Enabled == ON)"
-    )
-    assert '${isDisabled ? "checked" : ""}' not in template, "the old inverted checked-binding must be gone"
+
+    assert "plugin-reach" in template
+    for position in ('data-reach="off"', 'data-reach="available"'):
+        assert position in template, f"missing position: {position}"
+    assert ">Off<" in template and ">Available<" in template
+
+    # ONE derivation, off one flag.
+    assert 'const reach = isDisabled ? "off" : "available";' in template
+
+    # The retired positions and the flag behind them.
+    assert 'data-reach="group"' not in template, "the signpost position must not return"
+    assert 'data-reach="all"' not in template, "distribution is not decided on this page"
+    assert "p.is_system" not in template
+
+    # The retired widgets and their inverted caption are gone.
+    assert 'data-action="toggle-disabled"' not in template
+    assert ">Disabled<" not in template, "the inverted 'Disabled' caption must not remain"
+    assert ".plugin-system-btn {" not in template
 
 
-def test_plugin_controls_share_one_wrapper_for_visual_consistency():
-    """#1956 item 14c: the Enabled toggle and the system-mark control used to
-    sit loose in the row as two unrelated widgets (toggle vs. bare button).
-    They now share a common flex wrapper so they read as a matched pair of
-    controls rather than a random mix, and the system button wears the same
-    --ds-radius-btn every other labelled button in the app uses (it
-    previously hardcoded a bespoke 6px)."""
+def test_no_user_facing_control_says_system():
+    """The word was the defect: /admin/access has said Optional / Automatic
+    about a grant since v49, and `is_system` is that same Automatic tier with
+    its scope fixed to everyone. Two names for one idea is what sent an admin
+    looking for a second concept that does not exist. The column keeps its
+    name; the UI does not."""
+    import re
+
     template = Path("app/web/templates/admin_marketplaces.html").read_text(encoding="utf-8")
-    assert "plugin-controls" in template
-    assert "border-radius: var(--ds-radius-btn)" in template.split(".plugin-system-btn {")[1].split("}")[0]
+    # Comments are stripped first: this asserts on what a READER can see, and
+    # the history of a retired control is exactly the thing worth keeping in
+    # the source. A guard that cannot tell copy from commentary would push the
+    # next author to delete the explanation instead of the string.
+    visible = re.sub(r"<!--.*?-->|\{#.*?#\}|/\*.*?\*/", "", template, flags=re.S)
+    visible = re.sub(r"^\s*//.*$", "", visible, flags=re.M)
+    for banned in ("Mark as system", "Unmark system", ">SYSTEM<"):
+        assert banned not in visible, f"user-facing copy still says: {banned}"
 
 
-def test_plugin_system_control_carries_a_discoverable_explanation():
-    """#1956 item 14a (reporter kbcMichal): "Unmark system" had no
-    explanation of what system-marking actually does. A hover-only `title`
-    on the button was already there and evidently was not enough — this adds
-    a persistent, always-visible help affordance next to the control whose
-    tooltip explains the *concept* (mandatory-for-everyone fanout) rather
-    than only the next click's side effect, and it reads the same regardless
-    of the plugin's current is_system value."""
+def test_availability_control_carries_a_discoverable_explanation():
+    """#1956 item 14a (reporter kbcMichal): the control had no explanation of
+    what it actually does. A persistent, always-visible help affordance sits
+    next to it, explaining the CONCEPT rather than the next click's side
+    effect, and reading the same regardless of the plugin's current state.
+
+    What it explains changed with the control. It must say what Off and
+    Available mean, say that Off wins over a grant (the one thing an admin
+    could otherwise be surprised by), and point at the page that decides who
+    gets an available plugin — without claiming to decide that here.
+    """
     template = Path("app/web/templates/admin_marketplaces.html").read_text(encoding="utf-8")
     assert "plugin-help-icon" in template
-    help_text = template.split("sysHelpText =")[1].split(";")[0]
-    assert "mandatory" in help_text
-    assert "every" in help_text
+    help_text = template.split("reachHelpText =")[1].split(";")[0]
+    assert "this instance" in help_text
+    assert "even from groups granted it" in help_text, (
+        "an admin must be told Off overrides a grant — it is the only way this "
+        "switch can surprise them"
+    )
+    assert "Access" in help_text, "it must name the page that decides who gets it"
+    # And it must NOT reintroduce the retired word.
+    assert "system" not in help_text.lower()
 
 
 def test_disabled_pill_tooltip_calls_out_deprecation_auto_hide():

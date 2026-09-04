@@ -237,19 +237,17 @@ def _resolve_ungranted_plugins() -> Optional[Signal]:
     Ingesting content and granting it to nobody has no legitimate steady
     state: every non-admin sees an absence, and nothing anywhere says why
     (TCRD-221 — this exact silence ate ~50 minutes of a live walkthrough).
-    Admin-disabled plugins don't count (deliberately hidden, not a mistake)
-    and neither do system plugins (``mark_system`` materializes their grant
-    for every group, so they cannot be orphaned without also tripping the
-    disabled path)."""
+    Admin-disabled plugins don't count (deliberately hidden, not a mistake).
+    System plugins used to be excluded too, because the flag reached every
+    group without a grant row and every one of them would have read as an
+    orphan. 0098 gave them a real grant, so they are simply not orphans."""
     from src.repositories import marketplace_plugins_repo, resource_grants_repo
 
     granted = {g["resource_id"] for g in resource_grants_repo().list_all(resource_type="marketplace_plugin")}
     orphans = [
         p
         for p in marketplace_plugins_repo().list_all()
-        if not p.get("admin_disabled")
-        and not p.get("is_system")
-        and f"{p['marketplace_id']}/{p['name']}" not in granted
+        if not p.get("admin_disabled") and f"{p['marketplace_id']}/{p['name']}" not in granted
     ]
     if not orphans:
         return None

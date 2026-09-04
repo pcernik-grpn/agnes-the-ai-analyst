@@ -23,6 +23,7 @@ What these tests pin:
 from __future__ import annotations
 
 from pathlib import Path
+from tests.helpers.access_page import access_page_source, with_module
 
 STATIC = Path("app/web/static")
 
@@ -44,7 +45,7 @@ class TestOneSharedComponent:
 
     def test_access_page_loads_the_drawer(self, seeded_app):
         c = seeded_app["client"]
-        body = c.get("/admin/access", headers=_auth(seeded_app["admin_token"])).text
+        body = with_module(c.get("/admin/access", headers=_auth(seeded_app["admin_token"])).text)
         assert "css/drawer.css" in body
         assert "css/group_drawer.css" in body
         assert "js/components/group_drawer.js" in body
@@ -53,7 +54,7 @@ class TestOneSharedComponent:
         """Not merely bypassed — removed. A dormant second dialog on the page
         is one stray `openModal("group-modal")` away from coming back."""
         c = seeded_app["client"]
-        body = c.get("/admin/access", headers=_auth(seeded_app["admin_token"])).text
+        body = with_module(c.get("/admin/access", headers=_auth(seeded_app["admin_token"])).text)
         assert 'id="group-modal"' not in body
         assert 'id="group-save-btn"' not in body
         # Deleting a group is a genuine one-decision dialog and stays — as the
@@ -68,7 +69,7 @@ class TestAccessCanCreateInPlace:
 
     def test_group_list_carries_a_create_control(self, seeded_app):
         c = seeded_app["client"]
-        body = c.get("/admin/access", headers=_auth(seeded_app["admin_token"])).text
+        body = with_module(c.get("/admin/access", headers=_auth(seeded_app["admin_token"])).text)
         # The control is the list's own first row now, not a toolbar button
         # with an id: `#ax-groups` is rewritten on every repaint, so it is
         # addressed by attribute and bound by delegation.
@@ -79,7 +80,7 @@ class TestAccessCanCreateInPlace:
         """A link to /admin/groups loses the selection and the scroll — the
         whole reason this page is a workspace."""
         c = seeded_app["client"]
-        body = c.get("/admin/access", headers=_auth(seeded_app["admin_token"])).text
+        body = with_module(c.get("/admin/access", headers=_auth(seeded_app["admin_token"])).text)
         assert "AgnesGroupDrawer.open" in body
         assert '<a href="/admin/access">Create one' not in body
 
@@ -244,13 +245,55 @@ class TestPeopleSearchIsOneImplementation:
         assert "?search=" not in js
 
     def test_group_detail_search_calls_the_shared_lookup_not_its_own_fetch(self):
-        html = (self.TEMPLATES / "admin_access.html").read_text(encoding="utf-8")
-        assert "window.AgnesPeopleSearch.search(" in html
+        # The page, not the template: /admin/access's script is a static
+        # asset (`js/admin_access.js`), so a scan of the rendered template
+        # finds only the `<script src>` tag. `access_page_source()`
+        # concatenates both halves for exactly this reason — a string that
+        # moves between markup and script does not stop being checked.
+        src = access_page_source()
+        assert "window.AgnesPeopleSearch.search(" in src
         # The ax-find "add someone" box's OWN runFind must not still build
         # its own `/api/users?search=` URL — the shared helper is the only
         # thing allowed to.
-        assert "USERS_LIST_API}?search=" not in html
+        assert "USERS_LIST_API}?search=" not in src
 
+
+
+class TestThePeopleFieldOffersARosterBeforeAnyoneTypes:
+    """A field that shows nothing until you can spell a colleague's name is
+    only usable by someone who already knows the answer — and the admin
+    creating a group very often does not, which is the same reason By person
+    grew a roster instead of demanding a name.
+    """
+
+    def test_the_shared_lookup_can_list_without_a_term(self):
+        """`search('')` resolves empty on purpose (an empty box is not a
+        query), so browsing needs its own entry point — on the SHARED helper,
+        not a second fetch in the drawer."""
+        js = (STATIC / "js" / "people_search.js").read_text(encoding="utf-8")
+        assert "recent(limit)" in js
+        # One fetch + shape handler behind both, or they drift the way the two
+        # hand-rolled copies of `search` once did.
+        assert "_get(url)" in js
+        assert js.count("credentials: 'include'") == 1
+
+    def test_focus_and_an_emptied_box_both_offer_the_roster(self):
+        js = (STATIC / "js" / "components" / "group_drawer.js").read_text(encoding="utf-8")
+        assert "addEventListener('focus'" in js
+        assert "runBrowse()" in js
+        # Clearing the box returns to the roster rather than closing it.
+        assert "if (!q) { runBrowse(); return; }" in js
+        # Still no second copy of the URL in the drawer.
+        assert "?search=" not in js
+
+    def test_the_roster_says_which_list_it_is(self):
+        """A sample of twelve otherwise reads as twelve matches — and its
+        empty case means "nobody left to add", not "nobody matched"."""
+        js = (STATIC / "js" / "components" / "group_drawer.js").read_text(encoding="utf-8")
+        assert "Anyone on this instance" in js
+        assert "Everyone with an account is already in this group." in js
+        css = (STATIC / "css" / "group_drawer.css").read_text(encoding="utf-8")
+        assert ".gdw-found__hd" in css
 
 
 class TestPeopleSearchDistinguishesErrorFromEmpty:
@@ -295,12 +338,14 @@ class TestPeopleSearchDistinguishesErrorFromEmpty:
         assert "var(--ds-" in css.split(".gdw-found__error", 1)[1].split("}", 1)[0]
 
     def test_group_detail_search_renders_the_failure_distinctly_from_no_match(self):
-        html = (self.TEMPLATES / "admin_access.html").read_text(encoding="utf-8")
-        assert "const { people, error } = await window.AgnesPeopleSearch.search(" in html
-        assert "ax-res__msg--error" in html
+        # Both halves of the page: the error CSS lives in the template, the
+        # branch that uses it in the extracted script.
+        src = access_page_source()
+        assert "const { people, error } = await window.AgnesPeopleSearch.search(" in src
+        assert "ax-res__msg--error" in src
         # The no-match / invite copy must still exist, and only reached
         # when the lookup succeeded with zero results.
-        assert "No account for" in html or "No account matches" in html
+        assert "No account for" in src or "No account matches" in src
 
     def test_admin_access_error_css_uses_design_system_tokens(self):
         html = (self.TEMPLATES / "admin_access.html").read_text(encoding="utf-8")

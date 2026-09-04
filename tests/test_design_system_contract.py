@@ -1455,7 +1455,10 @@ _NATIVE_DIALOG_ALLOWLIST: set[str] = {
     "_app_scripts.html",
     "admin_chat.html",
     "admin_data_sources.html",
-    "admin_marketplaces.html",
+    # `admin_marketplaces.html` came off this list when the three-position
+    # reach control collapsed to Off / Available: the native dialog it was
+    # grandfathered for lived in the Off-to-Everyone transition, which went
+    # with `marketplace_plugins.is_system`.
     "admin_mcp_source_detail.html",
     "admin_tables.html",
     "agents.html",

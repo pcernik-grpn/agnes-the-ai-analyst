@@ -7,6 +7,28 @@ owned by the module that registered the resource type (see
 
 The resolver in ``app.auth.access`` reads this table on every authorization
 check that isn't satisfied by Admin short-circuit.
+
+Two columns the Postgres sibling has and this one does not, because the
+DuckDB app-state ladder is frozen (A3): ``source`` (0096) and ``scope``
+(0097). Both are ACCEPTED and DROPPED by the write methods, so a caller
+never has to ask which backend is active.
+
+``scope`` being dropped here IS a loss of meaning, and it is made up for
+with data rather than pretended away. An everyone-grant lands as an
+ordinary grant on the carrier group (``src.grant_scopes.carrier_group_id``
+— the seeded ``Everyone``), so reaching it here requires membership.
+``src.system_plugin_reconcile`` runs at boot on this backend and is the
+frozen ladder's stand-in for migration 0098: it makes that group genuinely
+hold every account, which is what makes the per-group reads below reach
+everyone. Until it has run — or if it soft-fails — they do not.
+
+What still differs afterwards: an account removed from the carrier group
+keeps everyone-scoped grants on Postgres and loses them here. No admin path
+can do that (``remove_member`` takes ``require_source='admin'`` and cannot
+strip a ``system_seed`` auto-join), so it takes direct SQL.
+
+Reads that are ABOUT the column rather than merely carrying it raise
+``RequiresPostgresBackend`` instead of guessing.
 """
 
 from __future__ import annotations
@@ -15,6 +37,8 @@ from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 import duckdb
+
+from src.repository_errors import RequiresPostgresBackend
 
 
 # Maps resource_type string to the per-type column name (schema v60 / PG
@@ -67,12 +91,19 @@ class ResourceGrantsRepository:
         self,
         group_ids: List[str],
         resource_type: Optional[str] = None,
+        include_everyone: bool = True,
     ) -> List[Dict[str, Any]]:
         """All grants held by any of the given groups, optionally type-scoped.
 
         Used by the marketplace filter to materialize a user's allowed plugins
         in one round trip — caller passes the user's full group set.
+
+        ``include_everyone`` is accepted for signature parity and has no
+        effect here: with no ``scope`` column an everyone-grant is a grant on
+        the carrier group, so it is already in the answer whenever the caller
+        is a member of it. See the module docstring.
         """
+        del include_everyone
         if not group_ids:
             return []
         placeholders = ",".join(["?"] * len(group_ids))
@@ -94,6 +125,7 @@ class ResourceGrantsRepository:
         self,
         user_id: str,
         resource_type: str,
+        include_everyone: bool = True,
     ) -> List[str]:
         """Distinct ``resource_id`` values of ``resource_type`` granted to
         any group the user belongs to.
@@ -103,7 +135,11 @@ class ResourceGrantsRepository:
         user's group ids) — the caller-granted-domains helper in
         ``app.api.memory`` used to run this as a raw ``conn.execute`` on the
         always-DuckDB connection; this is its repo-routed equivalent.
+
+        ``include_everyone`` is accepted for signature parity and has no
+        effect — see :meth:`list_for_groups`.
         """
+        del include_everyone
         rows = self.conn.execute(
             """SELECT DISTINCT rg.resource_id
                FROM resource_grants rg
@@ -129,13 +165,18 @@ class ResourceGrantsRepository:
         group_ids: List[str],
         resource_type: str,
         resource_id: str,
+        include_everyone: bool = True,
     ) -> bool:
         """Single-purpose existence check used by ``can_access``.
+
+        ``include_everyone`` is accepted for signature parity and has no
+        effect — see :meth:`list_for_groups`.
 
         Returns True iff any of the given groups has a grant for the
         (resource_type, resource_id) pair. One DB hit, indexed on the
         UNIQUE (group_id, resource_type, resource_id) constraint.
         """
+        del include_everyone
         if not group_ids:
             return False
         placeholders = ",".join(["?"] * len(group_ids))
@@ -156,17 +197,33 @@ class ResourceGrantsRepository:
         resource_id: str,
         assigned_by: Optional[str] = None,
         requirement: Optional[str] = None,
+        source: Optional[str] = None,
+        scope: Optional[str] = None,
     ) -> str:
         """Insert a new grant. Returns the assigned id.
+
+        ``source`` names the SURFACE that wrote this grant
+        (``src.grant_sources``). Accepted and DROPPED here: the column is
+        Postgres-only (migration 0096_resource_grants_source) because the
+        DuckDB ladder is frozen (A3), so this backend simply does not gain
+        provenance and the API reports ``None`` — which the Access page
+        already renders as an ordinary grant. The parameter exists so every
+        caller can pass it without asking which backend is active.
 
         ``requirement`` defaults to the column default (``'available'``)
         when ``None``. Pass ``'required'`` to create a Required-tier
         grant in a single round-trip. Rejected by the column CHECK if
         the string is anything other than the two enum values.
 
+        ``scope`` names WHO the grant reaches (``src.grant_scopes``).
+        Accepted and DROPPED for the same frozen-ladder reason as ``source``
+        — see the module docstring for why an everyone-grant still reaches
+        everyone here, and for the one account it does not.
+
         Raises ``duckdb.ConstraintException`` on duplicate
         (group_id, resource_type, resource_id) — caller surfaces as 409.
         """
+        del scope  # accepted and dropped — see docstring
         grant_id = str(uuid4())
         per_type_col = _PER_TYPE_COLUMN.get(resource_type)
         if requirement is None:
@@ -236,6 +293,8 @@ class ResourceGrantsRepository:
         resource_type: str,
         resource_id: str,
         assigned_by: Optional[str] = None,
+        source: Optional[str] = None,
+        scope: Optional[str] = None,
     ) -> bool:
         """Create a grant if it does not already exist. Returns True iff the
         grant row exists after the call (whether newly inserted or already
@@ -245,7 +304,18 @@ class ResourceGrantsRepository:
 
         Uses INSERT OR IGNORE so repeated calls (e.g. on every boot from the
         built-in marketplace seeder) are idempotent and cheap.
+
+        ``source`` names the SURFACE that wrote this grant
+        (``src.grant_sources``). Accepted and DROPPED here: the column is
+        Postgres-only (migration 0096_resource_grants_source) because the
+        DuckDB ladder is frozen (A3), so this backend simply does not gain
+        provenance and the API reports ``None`` — which the Access page
+        already renders as an ordinary grant. The parameter exists so every
+        caller can pass it without asking which backend is active. ``scope``
+        is accepted and dropped for the same reason — see the module
+        docstring.
         """
+        del scope  # accepted and dropped — see docstring
         grant_id = str(uuid4())
         per_type_col = _PER_TYPE_COLUMN.get(resource_type)
         if per_type_col:
@@ -268,6 +338,60 @@ class ResourceGrantsRepository:
             [group_id, resource_type, resource_id],
         ).fetchone()
         return row is not None
+
+    def repoint_group(
+        self,
+        from_group_id: str,
+        to_group_id: str,
+        exclude_types: Optional[List[str]] = None,
+    ) -> int:
+        """Move every grant from one group to another, except ``exclude_types``.
+
+        The frozen DuckDB ladder's half of migration 0098's step 2: an
+        instance that pointed ``Everyone`` at a Workspace group gets that
+        subset its own group, and the grants written against the pseudo-group
+        move with the members.
+
+        ``exclude_types`` is not a convenience. A ``slack_channel`` grant on
+        the seeded group is not an audience grant — it marks a channel open,
+        and ``services.slack_bot.binding`` reads it off that exact group id —
+        so repointing it switches Agnes off in every channel an admin
+        enabled.
+
+        Collisions: where the target already holds the same
+        (resource_type, resource_id), the source row is dropped rather than
+        moved, but the survivor is first upgraded to ``required`` if either
+        side was — or a Required grant would silently become Optional and
+        stop landing in those people's workspaces. Returns rows moved.
+        """
+        excl = list(exclude_types or [])
+        ph = ",".join(["?"] * len(excl)) if excl else "NULL"
+        self.conn.execute(
+            f"""UPDATE resource_grants SET requirement = 'required'
+                WHERE group_id = ? AND resource_type NOT IN ({ph}) AND EXISTS (
+                    SELECT 1 FROM resource_grants s
+                    WHERE s.group_id = ?
+                      AND s.resource_type = resource_grants.resource_type
+                      AND s.resource_id = resource_grants.resource_id
+                      AND s.requirement = 'required')""",
+            [to_group_id, *excl, from_group_id],
+        )
+        self.conn.execute(
+            f"""DELETE FROM resource_grants
+                WHERE group_id = ? AND resource_type NOT IN ({ph}) AND EXISTS (
+                    SELECT 1 FROM resource_grants t
+                    WHERE t.group_id = ?
+                      AND t.resource_type = resource_grants.resource_type
+                      AND t.resource_id = resource_grants.resource_id)""",
+            [from_group_id, *excl, to_group_id],
+        )
+        rows = self.conn.execute(
+            f"""UPDATE resource_grants SET group_id = ?
+                WHERE group_id = ? AND resource_type NOT IN ({ph})
+                RETURNING 1""",
+            [to_group_id, from_group_id, *excl],
+        ).fetchall()
+        return len(rows)
 
     def delete(self, grant_id: str) -> bool:
         """Remove a grant by id. Returns True iff a row was removed."""
@@ -327,54 +451,27 @@ class ResourceGrantsRepository:
         return len(rows)
 
     def count_for_group(self, group_id: str) -> int:
+        """Grants this group confers. No ``scope`` column here, so every row
+        for the group is one it confers — the Postgres sibling has to exclude
+        everyone-scoped rows explicitly."""
         row = self.conn.execute(
             "SELECT COUNT(*) FROM resource_grants WHERE group_id = ?",
             [group_id],
         ).fetchone()
         return int(row[0]) if row else 0
 
-    def fanout_system_for_group(
+    def count_everyone_scoped(self) -> int:
+        """Postgres-only. ``scope`` does not exist on this ladder, and
+        answering ``0`` would state that no grant reaches everyone on an
+        instance where several do (as carrier-group rows)."""
+        raise RequiresPostgresBackend("resource_grants.scope")
+
+    def list_everyone_scoped(
         self,
-        group_id: str,
-        assigned_by: Optional[str] = None,
-    ) -> int:
-        """Grant every active system marketplace_plugin to ``group_id``.
+        resource_type: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Postgres-only, for the same reason as
+        :meth:`count_everyone_scoped`."""
+        del resource_type
+        raise RequiresPostgresBackend("resource_grants.scope")
 
-        Only plugins with ``is_system=TRUE`` and ``admin_disabled=FALSE`` are
-        granted — a disabled plugin stays hidden instance-wide, so a new group
-        must not inherit a grant that would activate the moment it is
-        re-enabled. Symmetric with ``UserCuratedSubscriptions.fanout_system_for_user``.
-
-        Idempotent — pre-existing grants for the same plugin survive
-        unchanged (ON CONFLICT against the UNIQUE
-        ``(group_id, resource_type, resource_id)`` index). Returns the
-        number of grant rows newly inserted (diagnostic / audit only).
-
-        Called from the group-create hooks (admin POST + Google sync) so a new
-        group inherits the mandatory tier without an admin reconcile — it grants
-        *every* active system plugin to *one* group. (The admin ``mark_system``
-        endpoint does its own inline per-group ``ensure_grant`` fan-out for the
-        single plugin being marked and does NOT route through this helper.)
-        """
-        rows = self.conn.execute(
-            "SELECT marketplace_id, name FROM marketplace_plugins "
-            "WHERE is_system = TRUE AND admin_disabled = FALSE",
-        ).fetchall()
-        inserted = 0
-        for marketplace_id, plugin_name in rows:
-            resource_id = f"{marketplace_id}/{plugin_name}"
-            try:
-                self.conn.execute(
-                    """INSERT INTO resource_grants
-                       (id, group_id, resource_type, resource_id, assigned_by)
-                       VALUES (?, ?, 'marketplace_plugin', ?, ?)""",
-                    [str(uuid4()), group_id, resource_id, assigned_by],
-                )
-                inserted += 1
-            except duckdb.ConstraintException:
-                # Pre-existing grant for this (group, plugin) — fine, leave
-                # the original assigned_by/assigned_at in place. Mirrors the
-                # ON CONFLICT DO NOTHING semantic without DuckDB needing
-                # multi-target conflict resolution.
-                continue
-        return inserted
