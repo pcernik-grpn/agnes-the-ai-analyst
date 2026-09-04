@@ -24,6 +24,7 @@ _SIGNATURES = (
     "function esc(s) {",
     "function detailMessage(body, fallback) {",
     "function fmtAgo(seconds) {",
+    "function fmtNextRun(iso) {",
     "function fmtRate(rate) {",
     "function fmtCost(usd) {",
     "function tokenTotals(usage) {",
