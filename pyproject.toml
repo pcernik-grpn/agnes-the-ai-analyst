@@ -1,6 +1,6 @@
 [project]
 name = "agnes-the-ai-analyst"
-version = "0.98.0"
+version = "0.99.0"
 description = "Agnes — self-hosted AI harness for organizations: governed data access, agents as an API, skills marketplace, corporate memory, hosted data apps, and agent surfaces (web chat, Slack, MCP, CLI)"
 requires-python = ">=3.11,<3.14"
 license = {file = "LICENSE"}
@@ -167,7 +167,28 @@ server = [
     # tuples instead of expression nodes, which would silently bypass the
     # WHERE-validator structural checks (isinstance(tuple, exp.Subquery)
     # is always False). 30.x yields nodes directly.
-    "sqlglot>=30.0.0",
+    #
+    # N4 (RLS review, issue #1979): bounded to the tested 30.x line, not
+    # just a floor. The access-policy Databricks/Snowflake binding modules
+    # (connectors/databricks/policy_params.py, connectors/snowflake/
+    # policy_params.py) rest on TWO specific, unpinned-by-sqlglot-itself
+    # behaviours of its dialect generator/parser: writing DuckDB `$name` as
+    # `:name` for those dialects, and parsing `:name` back as an
+    # `exp.Placeholder` whose `.name` is the bare variable. sqlglot does not
+    # promise dialect-generation stability across versions the way it
+    # promises a stable public AST API, and this repo bumps dependencies
+    # routinely — an untested jump (a bare `>=30.0.0` floor lets a resolver
+    # or Dependabot land ANY future 30.x/31.x/… release with no review) that
+    # silently changes either direction denies every group-based policy on
+    # both engines (fail-closed — `TestSqlglotCoupling` in each module's
+    # test file catches it in CI — but a wide, unannounced-until-caught
+    # outage all the same, not a leak). `<31.0.0` keeps the resolver on the
+    # major line this behaviour was last verified against (30.17.0, the
+    # version both modules' docstrings cite); a jump to 31 is a deliberate
+    # dependency-bump PR that re-verifies `TestSqlglotCoupling` for both
+    # engines and updates the pin explicitly, not something that lands
+    # unreviewed on the next `uv lock --upgrade`.
+    "sqlglot>=30.17.0,<31.0.0",
     # Data source connectors
     "google-cloud-bigquery>=3.0.0",
     "google-cloud-bigquery-storage>=2.0.0",
@@ -457,4 +478,4 @@ dev-dependencies = [
 override-dependencies = ["urllib3>=2.7.0"]
 
 [tool.agnes]
-released_changelog_sha256 = "87117cc9460344b7e8379046c5e95159e7de504d68a5ecd72ceed7115ea9c8fd"
+released_changelog_sha256 = "42a5653d140dd6e64d97ccfc0edaac3da690110eb7e5ace020b0592da3217bd3"

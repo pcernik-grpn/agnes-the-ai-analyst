@@ -521,3 +521,55 @@ def test_mcp_query_table_with_shaped_policy_user_sees_only_their_unit_and_not_th
     assert "secret" not in body["columns"]
     assert {row["id"] for row in body["rows"]} == {"1", "2"}
     assert all("secret" not in row for row in body["rows"])
+
+
+# ── every surface answers a REFUSAL the same way (§16/§17) ──────────────
+
+
+@pytest.fixture
+def broken_policy_orders(policied_orders):
+    """The same fixture, with ``orders``' stored policy replaced by a body
+    that no longer parses — the shape a hand-edited registry row (or one
+    written by an older authoring path) takes. ``policied_relation`` raises
+    ``PolicyError`` for it on every surface."""
+    from src.db import get_system_db
+    from src.repositories.table_registry import TableRegistryRepository
+
+    conn = get_system_db()
+    try:
+        TableRegistryRepository(conn).set_access_policy(
+            "orders",
+            sql="SELECT * FROM orders WHERE (((",
+            note="hand-edited, no longer parses",
+            updated_by="admin",
+        )
+    finally:
+        conn.close()
+    return policied_orders
+
+
+def test_v2_scan_reports_a_policy_refusal_as_a_structured_policy_error(broken_policy_orders):
+    """#1979: ``/api/v2/scan`` let ``PolicyError`` escape uncaught — its
+    ``except`` tuple never listed it — so a refusal surfaced as an
+    unstructured 500 traceback while ``/api/v2/sample`` and
+    ``/api/mcp/query-table`` returned ``{"reason": "policy_error"}``. Same
+    refusal, same shape, on every surface: fail-closed either way, but only
+    one of them is something a CLI or an agent can render (§16)."""
+    c = broken_policy_orders["client"]
+    r = c.post("/api/v2/scan", json={"table_id": "orders"}, headers=_auth(broken_policy_orders["team_a_token"]))
+    assert r.status_code == 500, r.text
+    assert r.json()["detail"] == {"reason": "policy_error", "table": "orders"}
+    assert "s1" not in r.text and "TeamA" not in r.text
+
+
+def test_v2_sample_reports_the_same_refusal_the_same_way(broken_policy_orders):
+    c = broken_policy_orders["client"]
+    r = c.get("/api/v2/sample/orders", headers=_auth(broken_policy_orders["team_a_token"]))
+    assert r.status_code == 500, r.text
+    assert r.json()["detail"] == {"reason": "policy_error", "table": "orders"}
+
+
+def test_v2_scan_of_the_unpolicied_sibling_is_unaffected(broken_policy_orders):
+    c = broken_policy_orders["client"]
+    r = c.post("/api/v2/scan", json={"table_id": "products"}, headers=_auth(broken_policy_orders["team_a_token"]))
+    assert r.status_code == 200, r.text

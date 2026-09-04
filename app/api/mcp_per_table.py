@@ -41,6 +41,7 @@ from src.access_policy import (
     assert_unique_output_columns,
     policied_from_sql,
     policied_relation,
+    row_scope_payload,
 )
 from src.repositories import table_registry_repo
 from src.sql_ident import quote_ident
@@ -64,6 +65,13 @@ class TableQueryResponse(BaseModel):
     row_count: int
     columns: List[str]
     truncated: bool
+    # N1 (RLS review, #1979): the same `row_scope` disclosure envelope
+    # `POST /api/query` and `POST /api/v2/sample` already carry (table
+    # access policies design doc §10) — built by the shared
+    # `src.access_policy.row_scope_payload`, so the wording never drifts
+    # between surfaces. `None` (never an empty-but-present envelope) unless
+    # this call actually read through a policied table.
+    row_scope: dict | None = None
 
 
 def _column_names(analytics_conn: duckdb.DuckDBPyConnection, table_view_name: str) -> List[str]:
@@ -245,6 +253,7 @@ def query_table(
             row_count=len(result_records),
             columns=columns,
             truncated=truncated,
+            row_scope=row_scope_payload([relation.table_id] if relation.policied else None),
         )
     finally:
         analytics_conn.close()

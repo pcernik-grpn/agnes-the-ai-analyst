@@ -68,3 +68,14 @@ def resolve_sync_state_key(name: str) -> str:
     from src.repositories import table_registry_repo
 
     return resolve_sync_state_key_for_row(name, table_registry_repo().get_by_name(name))
+
+
+#: The phrase `src/orchestrator.py` puts into ``sync_state.error`` when a
+#: connector's own ``_meta.rows`` came back NULL (#1364): the ``rows=0`` it
+#: publishes next to it is a placeholder, NOT a verified empty table. Kept
+#: here (a leaf module) because two writers/readers must agree on it: the
+#: orchestrator writes it into BOTH of the errors it can record for that
+#: pass (the count one, and the corrupt-parts one that would otherwise
+#: replace it), and the access-policy empty-mapping guard reads it to tell
+#: "could not count" apart from "counted zero".
+COUNT_UNAVAILABLE_MARKER = "Row count unavailable"

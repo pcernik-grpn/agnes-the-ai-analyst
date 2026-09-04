@@ -31,7 +31,11 @@
  * written. Storage is the existing admin API — no endpoint is new here:
  *   POST /api/admin/groups                    (create)
  *   PATCH /api/admin/groups/{id}              (rename / describe)
- *   GET  /api/users?search=                   (find someone to seed)
+ *   window.AgnesPeopleSearch.search(q)        (find someone to seed —
+ *                                               js/people_search.js, the
+ *                                               same lookup the group
+ *                                               detail pane's own "add
+ *                                               someone" search uses)
  *   POST /api/admin/groups/{id}/members       (seed them)
  *
  * Chrome: css/drawer.css (shared) + css/group_drawer.css. Every control
@@ -41,7 +45,6 @@
   'use strict';
 
   var GROUPS_API = '/api/admin/groups';
-  var USERS_API = '/api/users';
   var FIND_LIMIT = 8;
 
   var els = null;          // built lazily on first open
@@ -291,10 +294,12 @@
   }
 
   /* ── Finding someone to seed ───────────────────────────────────────
-     The query goes to the server, like the Access page's own person
-     search, for the same reason: a prefetched copy of the org silently
-     stops finding people at whatever limit it was given, which reads as
-     "that person has no account". */
+     The query goes to the server via window.AgnesPeopleSearch — the SAME
+     lookup the Access page's own "add someone" search uses
+     (js/people_search.js) — for two reasons: a prefetched copy of the org
+     silently stops finding people at whatever limit it was given, which
+     reads as "that person has no account"; and a second, hand-rolled copy
+     of the fetch here is exactly the kind of duplication that drifts. */
   var findTimer = null;
   var findSeq = 0;
 
@@ -328,11 +333,20 @@
     var q = String(raw || '').trim();
     if (!q) { closeFound(); return; }
     var seq = ++findSeq;
-    api(USERS_API + '?search=' + encodeURIComponent(q) + '&limit=' + FIND_LIMIT)
-      .catch(function () { return []; })
-      .then(function (people) {
+    window.AgnesPeopleSearch.search(q, FIND_LIMIT)
+      .then(function (result) {
         if (seq !== findSeq || !st) return;
-        if (!Array.isArray(people)) people = (people && people.users) || [];
+        // A failed lookup (403/500/501, network error) is NOT "no account
+        // matches" — collapsing the two used to make an outage read as "that
+        // person doesn't exist". Say which one happened.
+        if (result.error) {
+          els.found.innerHTML = '<p class="gdw-found__none gdw-found__error">' +
+            'Could not search accounts: ' + esc(result.error) + '</p>';
+          els.found.hidden = false;
+          els.find.setAttribute('aria-expanded', 'true');
+          return;
+        }
+        var people = result.people;
         var taken = {};
         (st.picked || []).forEach(function (m) { taken[m.email] = true; });
         var rows = people.filter(function (u) { return !taken[u.email]; }).map(function (u) {
