@@ -342,7 +342,13 @@ class TestAdminNavActiveState:
         assert resolve_active_href("/admin/store") == "/admin/store"
         assert resolve_active_href("/admin/store/submissions") == "/admin/store/submissions"
         assert resolve_active_href("/admin/store/submissions/sub-1") == "/admin/store/submissions"
-        assert resolve_active_href("/admin/store/lint") == "/admin/store/lint"
+        # Lint no longer has a row of its own (ADMIN_NAV_OFFNAV — it is reached
+        # from the Submissions toolbar), so longest-prefix correctly falls back
+        # to its parent instead of lighting nothing. That is the fallback
+        # working, not the confusion this test guards against: the rule is that
+        # a sub-page must not leave its parent lit ON TOP of its own row, and
+        # lint has no own row to compete with.
+        assert resolve_active_href("/admin/store/lint") == "/admin/store"
 
     def test_hub_page_has_no_active_section(self) -> None:
         assert resolve_active_href("/admin") is None

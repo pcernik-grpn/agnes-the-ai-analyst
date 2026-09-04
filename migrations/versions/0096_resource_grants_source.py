@@ -19,12 +19,14 @@ genuinely of unknown origin, and ``NULL`` says so; inventing ``access_page``
 for them would assert something nobody checked. ``src.grant_sources.describe``
 maps both NULL and an unknown key to "no badge".
 
-Re-parented onto ``0095_memory_detection_runs`` rather than
-``0094_extraction_runs``: that sibling landed on main first and claimed the
-same parent, and two revisions sharing one ``down_revision`` is a branched
-script directory — ``ensure_pg_at_head`` then refuses to start the app with
-"multiple heads". Chaining behind it keeps the ladder linear, which is what
-that check is protecting.
+Re-parented onto ``0096_users_kind`` (and before that onto
+``0095_memory_detection_runs``): each time a sibling landed on main first and
+claimed the same parent, and two revisions sharing one ``down_revision`` is a
+branched script directory — ``ensure_pg_at_head`` then refuses to start the
+app with "multiple heads". Chaining behind the sibling keeps the ladder
+linear, which is what that check is protecting. The shared ``0096`` prefix is
+cosmetic and has precedent (``0094_usage_turns`` -> ``0094_extraction_runs``);
+the revision id is what the chain is keyed on.
 """
 
 from typing import Sequence, Union
@@ -33,7 +35,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "0096_resource_grants_source"
-down_revision: Union[str, None] = "0095_memory_detection_runs"
+down_revision: Union[str, None] = "0096_users_kind"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

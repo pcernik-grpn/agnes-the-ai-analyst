@@ -15,10 +15,12 @@ empty state tables there (the backend-split bug class).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
 import duckdb
+import sqlalchemy as sa
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import FileResponse, Response
 
@@ -27,9 +29,22 @@ from app.auth.dependencies import _get_db, get_current_user
 from app.auth.session_principal import PRINCIPAL_TYPES
 from app.resource_types import ResourceType
 from src.audit_helpers import client_kind_from_user
+from src.ingest.retrieval import SearchQueryTooBroad, retrieval_mode, search_with_meta
 from src.rbac import get_accessible_tables
 from src.repositories import audit_repo, resource_grants_repo, table_registry_repo, user_group_members_repo
 from src.search.unified import unified_search
+
+#: The chunk leg's degraded-request note (#2151) — shared by both failure
+#: reasons folded into the same disclosure (an outage and "the query was too
+#: broad to search this corpus safely" both reduce, from this combined
+#: endpoint's point of view, to "this one leg found nothing; the rest of the
+#: response is unaffected"). Per-leg-only, unlike collections_search's own
+#: dedicated 503/422 — a normal multi-source query should not fail outright
+#: over one leg's cap situation when the other legs can still answer.
+_CHUNK_LEG_DEGRADED_NOTE = (
+    "Document search is temporarily unavailable for this query; other results below "
+    "are unaffected. Retry shortly, or narrow with a specific collection."
+)
 
 logger = logging.getLogger(__name__)
 
@@ -93,9 +108,7 @@ def _accessible_plugins(user) -> List[Dict[str, Any]]:
             return []
         if is_user_admin(user_id):
             return _live(marketplace_plugins_repo().list_all())
-        granted = set(
-            resource_grants_repo().list_resource_ids_for_user(user_id, ResourceType.MARKETPLACE_PLUGIN.value)
-        )
+        granted = set(resource_grants_repo().list_resource_ids_for_user(user_id, ResourceType.MARKETPLACE_PLUGIN.value))
         if not granted:
             return []
         return [
@@ -189,11 +202,42 @@ async def knowledge_search(
     anything reachable is a wording one. The glossary is excluded from that
     judgement on purpose: it has no RBAC, so it runs for everyone and its
     presence would make every caller look like they had access.
+
+    The chunk leg (#2151) is bounded the same way ``/api/collections/search``
+    is (``collections.search_max_chunks``), but a failure or an over-broad
+    query there degrades that ONE leg to empty rather than failing this
+    combined endpoint outright: the response then carries ``degraded:
+    {"chunk": "search_unavailable"}`` and a ``degraded_note``, while
+    knowledge/table/metric/glossary hits still answer normally.
     """
     from app.api.collections import _accessible_corpus_ids
-    from src.ingest.retrieval import retrieval_mode
 
     corpus_ids = _accessible_corpus_ids(user)
+
+    # #2151: resolve the chunk leg OURSELVES (rather than letting
+    # unified_search fetch it internally) so a chunk-engine failure can
+    # degrade that ONE leg to empty without losing the knowledge/table/
+    # metric/glossary legs computed below — the same protective wrapper
+    # collections_search uses around search_with_meta, offloaded to a
+    # worker thread for the same reason (real CPU + I/O work that must not
+    # block the event loop).
+    chunk_hits: List[Dict[str, Any]] = []
+    chunk_degraded = False
+    if corpus_ids:
+        try:
+            chunk_meta = await asyncio.to_thread(search_with_meta, corpus_ids, q, k=k)
+            chunk_hits = chunk_meta["results"]
+        except SearchQueryTooBroad:
+            # A stopword-only query over an oversized corpus is refused
+            # OUTRIGHT by collections_search (a dedicated, chunk-only
+            # endpoint, where a 422 is actionable); here it is one leg among
+            # several, and failing the WHOLE combined search over it would
+            # reintroduce exactly the surprise this fix removes elsewhere.
+            chunk_degraded = True
+        except (MemoryError, sa.exc.OperationalError, sa.exc.DBAPIError) as exc:
+            logger.warning("knowledge search: chunk leg unavailable, degrading to empty: %s", exc)
+            chunk_degraded = True
+
     groups, domains = _resolve_knowledge_grants(user)
     # Resolve the caller's accessible table-id set ONCE per request instead of
     # calling `can_access_table` per row (FAI-132 N+1 collapse: ~115 stack
@@ -241,9 +285,13 @@ async def knowledge_search(
         tables=tables,
         metrics=metrics,
         plugins=plugins,
+        chunk_hits=chunk_hits,
         k=k,
     )
     payload: dict = {"query": q, "results": results, "retrieval": retrieval_mode()}
+    if chunk_degraded:
+        payload["degraded"] = {"chunk": "search_unavailable"}
+        payload["degraded_note"] = _CHUNK_LEG_DEGRADED_NOTE
     if not results:
         payload["searched_collections"] = len(corpus_ids)
         payload["searched_tables"] = len(tables)

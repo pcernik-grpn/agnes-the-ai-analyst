@@ -1,7 +1,7 @@
 """add file_corpora.origin (uploaded | generated)
 
-Mirrors DuckDB ``_v109_to_v110``. ``origin`` records artefact provenance for
-the Artefacts toolbar's Source facet: every existing artefact is
+Mirrors DuckDB ``_v109_to_v110``. ``origin`` records artifact provenance for
+the Artifacts toolbar's Source facet: every existing artifact is
 user-uploaded, so the column defaults to ``'uploaded'``; the future
 agent-generated-artefact writer sets ``'generated'``.
 

@@ -27,6 +27,7 @@ from cli.commands.admin_semantic_source import admin_semantic_source_app
 from cli.commands.admin_sessions import sessions_app as admin_sessions_app
 from cli.commands.admin_sharepoint import admin_sharepoint_app
 from cli.commands.admin_skills import admin_skills_app
+from cli.commands.admin_service_account import service_account_app as admin_service_account_app
 from cli.commands.admin_sso import admin_sso_app
 from cli.commands.admin_store import admin_store_app
 from cli.commands.admin_usage import app as admin_usage_app
@@ -60,6 +61,11 @@ admin_app.add_typer(admin_memory_domain_app, name="memory-domain", help="Memory 
 admin_app.add_typer(admin_digest_app, name="digest", help="Maintained digest CRUD (K4)")
 admin_app.add_typer(admin_db_app, name="db", help="Manage app-state DB backend (DuckDB / Postgres)")
 admin_app.add_typer(admin_sso_app, name="sso", help="External SSO login (Entra ID OIDC) runtime config")
+admin_app.add_typer(
+    admin_service_account_app,
+    name="service-account",
+    help="Service-account identities (headless, own grants, own PATs) — issue #1534",
+)
 admin_app.add_typer(admin_sharepoint_app, name="sharepoint", help="SharePoint connector maintenance triggers")
 admin_app.add_typer(
     admin_doctor_app, name="doctor", help="Deployment-gate diagnostics (`agnes admin doctor --new-instance`)"

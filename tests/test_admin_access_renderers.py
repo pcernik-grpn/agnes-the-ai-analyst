@@ -72,6 +72,9 @@ _EXPORTS = (
     "ACT_WORD",
     "manageCell",
     "whoGranted",
+    "addScopeFor",
+    "addableAtScope",
+    "SCOPE_WITHHELD_TYPES",
     "TIERED",
     "facets",
     "rowPassesFacets",
@@ -486,3 +489,66 @@ class TestTheFiltersAreFacets:
         assert 'kind: [...facets.get("kind")].join(",")' in js, (
             "?kind=agent — the single-value shape in existing links — must read back as the one-element case"
         )
+
+
+class TestAnAddStartedOnEveryoneReachesEveryAccount:
+    """The Everyone audience is selected by the CARRIER group's id, so the
+    picker's "which audience is this" question cannot be answered from its
+    mode. It was: `asScope` keyed on `bundleMode`, so the Everyone block's own
+    `+ Add for everyone` wrote a grant with no scope — reach is the carrier's
+    members, under a heading that says every account, and an account in no
+    group (the case the scope exists for) was left out.
+
+    Run rather than scanned: the decision is a pure function now precisely so
+    a guard can call it.
+    """
+
+    GROUPS = "[{ id: 'ev1', is_everyone: true }, { id: 'g1' }, { id: 'g2' }]"
+
+    def test_the_everyone_carrier_resolves_to_the_scope(self):
+        assert _run(f"OUT = api.addScopeFor('ev1', {self.GROUPS});") == "everyone"
+
+    def test_an_ordinary_group_does_not(self):
+        assert _run(f"OUT = api.addScopeFor('g1', {self.GROUPS});") is None
+
+    def test_no_audience_at_all_does_not(self):
+        assert _run(f"OUT = api.addScopeFor(null, {self.GROUPS});") is None
+        assert _run("OUT = api.addScopeFor('ev1', []);") is None
+
+    def test_an_instance_with_no_carrier_falls_back_to_the_group(self):
+        """A grant on a group is always writable; a scope with no carrier is
+        not (the API answers 409 `everyone_carrier_group_missing`). Guessing
+        the scope here would turn every add on such an instance into a
+        failure."""
+        assert _run("OUT = api.addScopeFor('g1', [{ id: 'g1' }, { id: 'g2' }]);") is None
+
+
+class TestAScopeModePickerOffersOnlyWhatTheApiAccepts:
+    """`SCOPE_WITHHELD_TYPES` mirrors `src.grant_scopes.SCOPE_WITHHELD_TYPES`:
+    four kinds for which "give this to everyone" is not a coherent choice, and
+    which the API refuses with a 422. The scope-mode picker listed them, so the
+    fix for the silent wrong write would have produced a visible batch failure
+    instead."""
+
+    def test_a_withheld_kind_is_not_addable_at_the_everyone_scope(self):
+        got = _run("OUT = [...api.SCOPE_WITHHELD_TYPES].map((k) => api.addableAtScope(k, 'everyone'));")
+        assert got == [False] * len(got) and got, got
+
+    def test_the_same_kinds_stay_addable_to_a_group(self):
+        got = _run("OUT = [...api.SCOPE_WITHHELD_TYPES].map((k) => api.addableAtScope(k, null));")
+        assert got == [True] * len(got) and got, got
+
+    def test_a_kind_that_takes_the_scope_is_addable_either_way(self):
+        got = _run(
+            "OUT = ['marketplace_plugin', 'data_package', 'agent', 'chat', 'collection']"
+            ".map((k) => [api.addableAtScope(k, 'everyone'), api.addableAtScope(k, null)]);"
+        )
+        assert got == [[True, True]] * 5, got
+
+    def test_the_mirror_still_matches_the_server(self):
+        """Two copies of one list, so the drift is worth a guard: the page's
+        set is the reason a choice is not offered, the server's is the reason
+        it is refused."""
+        from src.grant_scopes import SCOPE_WITHHELD_TYPES
+
+        assert set(_run("OUT = [...api.SCOPE_WITHHELD_TYPES];")) == set(SCOPE_WITHHELD_TYPES)
