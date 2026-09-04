@@ -88,6 +88,24 @@ class TestCostUsd:
         assert cost_usd(model="claude-haiku-4-5", **usage) < cost_usd(model="claude-sonnet-5", **usage)
         assert cost_usd(model="claude-sonnet-5", **usage) < cost_usd(model="claude-opus-5", **usage)
 
+    def test_batch_is_half_the_synchronous_price(self):
+        """The Anthropic Batches API prices every token term at 50% —
+        `batch=True` must not fork the price table, only halve its result."""
+        usage = dict(
+            input_tokens=1_000_000,
+            output_tokens=1_000_000,
+            cache_read_tokens=1_000_000,
+            cache_creation_tokens=1_000_000,
+        )
+        sync = cost_usd(model="claude-sonnet-5", **usage)
+        batch = cost_usd(model="claude-sonnet-5", batch=True, **usage)
+        assert batch == sync * 0.5
+
+    def test_batch_defaults_to_false(self):
+        assert cost_usd(model="claude-sonnet-5", input_tokens=1_000_000) == cost_usd(
+            model="claude-sonnet-5", input_tokens=1_000_000, batch=False
+        )
+
 
 class TestBudgetTokens:
     def test_excludes_cache_reads_and_includes_cache_writes(self):

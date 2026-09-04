@@ -1285,9 +1285,12 @@ data_apps:
 collections:
   # Server-side cap (#2151) on how many chunks a single GET
   # /api/collections/search (or the /api/knowledge/search chunk leg)
-  # request may rank. Above this, the server applies a SQL-side lexical
-  # prefilter + LIMIT instead of fetching every accessible chunk, and the
-  # response carries `truncated: true`. 25000 is the point
+  # request may rank. Composes with `knowledge.retrieval.max_candidate_chunks`
+  # below: candidate selection always runs in SQL under
+  # `min(max_candidate_chunks, search_max_chunks)` — the P0 candidate cap
+  # first, this as a second ceiling — and when that bound is hit the
+  # response carries `truncated: true` (+ `candidates_capped: true`). With
+  # the defaults (5000 / 25000) this one never binds. 25000 is the point
   # scripts/bench_retrieval.py measured at ~371MB peak RSS per query,
   # comfortably under the API container's default 4g mem_limit even with
   # a few concurrent searches. 0 has no "unlimited" meaning here.
@@ -1306,6 +1309,23 @@ facts:
   # A second distinct dst becomes a `single_valued_conflict` review item on
   # the collection detail page instead of silently picking one.
   single_valued_edges: ["owned_by", "for_client"]
+
+
+# --- Knowledge search over Collections (src/ingest/retrieval.py) ---
+# `max_candidate_chunks` bounds how many candidate chunk rows a single
+# `GET /api/knowledge/search` / `GET /api/collections/search` call may load
+# before ranking — a caller with a wide grant (an admin, or a group with
+# many collections) previously loaded EVERY chunk in every accessible
+# collection, which OOM-killed the process on a large corpus (P0, 2026-09).
+# Candidate SELECTION runs in SQL (Postgres full-text search, ranked) under
+# this LIMIT; the response carries `candidates_capped: true` when the cap
+# was actually hit. `collections.search_max_chunks` above is a second
+# ceiling on the same candidate set (the SQL LIMIT is the smaller of the
+# two). Not a switch — plain instance data, read directly via get_value,
+# same pattern as `facts.single_valued_edges` above.
+knowledge:
+  retrieval:
+    # max_candidate_chunks: 5000
 
 
 # --- SharePoint connector (optional, off by default) ---
@@ -1448,6 +1468,25 @@ extraction:
     # multiply: two concurrent crawls at 6 = twelve files in flight against
     # the same tenant.
     concurrency: 6
+    # A large site shards itself into parallel background jobs instead of
+    # crawling sequentially on one worker slot (2026-09-03 auto-parallel-
+    # crawl design), PG-only (A3 ratchet — a DuckDB-backed instance always
+    # crawls sequentially, this knob has no effect there). When a
+    # connection's estimated total document count is over this many
+    # documents, `POST …/extract` becomes a short PLANNER that packs the
+    # site into up to 32 shards (a live Graph Search document count per
+    # top-level folder, balancing load) and enqueues one
+    # `corpus-extraction-shard` job per shard instead of crawling inline —
+    # each shard writes into the SAME collection the connection already
+    # uses, so no manual split into sibling connections and no
+    # `POST …/collections/consolidate` fold-back is ever needed. `0`
+    # disables sharding entirely — every site crawls sequentially,
+    # unconditionally, the pre-2026-09 behaviour. Preview what a trigger
+    # would plan right now, without triggering anything:
+    # `GET …/connections/{id}/shard-plan` (`agnes admin sharepoint
+    # shard-plan <id>`), or the source card's "Parallel crawl — preview
+    # shards…" control. See docs/sharepoint-extraction.md → "Scale up".
+    shard_target_docs: 5000
     # A conversion worker process is recycled (replaced) after converting
     # this many documents, whichever concurrency slot it is. Insurance
     # against a real, observed failure: markitdown/pypdfium2 hold onto
@@ -1515,6 +1554,20 @@ extraction:
     # At 8 MiB an ordinary document passes untouched and the multi-byte
     # ones that really do reach double-digit megabytes are refused.
     max_converted_mb: 8
+    # Suffixes (no leading dot; case-insensitive) skipped BEFORE any
+    # download or conversion attempt — a live crawl's built-in defaults
+    # (audio/video containers, notebooks/code, subtitles, Power BI/Visio,
+    # SVG, fonts, executables) already cover the formats markitdown fails
+    # on every single time, so this list is ADDITIVE to those defaults, not
+    # a replacement: it lets an operator add a format specific to their own
+    # estate without losing the built-in set. Skipped files are counted in
+    # the run report's `skipped_unsupported` (+ per-extension breakdown),
+    # never `errors`/`convert_failed`, and never enter the retry backlog —
+    # unlike a format markitdown itself discovers mid-conversion it cannot
+    # handle, an extension listed here is never even downloaded. Adding
+    # `.zip` here is a mistake, not just discouraged: markitdown converts a
+    # zip's members and this override is not validated against it.
+    unsupported_extensions: []
   # The LLM stage — turn ingested documents into knowledge-graph facts
   # (connectors/sharepoint/facts_extraction.py). Runs after a successful
   # crawl, over the documents that crawl just ingested and indexed.
@@ -1533,7 +1586,10 @@ extraction:
     # on the order of several hundred dollars for a first pass. Sonnet is
     # roughly 3x. Re-runs are far cheaper: a document is re-extracted only
     # when its content, the model, or the effective prompt changed.
-    # Spreadsheets and CSVs are never sent to the model at all.
+    # Spreadsheets and CSVs are sent like any other document (their
+    # converted markdown tables carry facts too) — see `max_doc_chars` /
+    # `max_prompt_tokens` below for how a dense/tabular or oversized one is
+    # bounded.
     # Needs `facts.enabled` (the fact-graph surface) as well — with that
     # off, the pass is skipped rather than writing claims nothing can read.
     # AGNES_EXTRACTION_FACTS_ENABLED overrides this at the environment level.
@@ -1548,6 +1604,28 @@ extraction:
     # anonymizer's). Accepts a tier name (haiku/sonnet/opus) or a concrete
     # model id. Empty falls back to `extraction.model`, then Haiku.
     model: ""
+    # Flat character pre-cap on the document text sent in one call. Above
+    # this the tail is truncated and the document is counted in
+    # `docs_truncated` — never silently shortened. This is a cheap FIRST
+    # cut; `max_prompt_tokens` below applies a second, token-aware bound on
+    # top of it, since a dense (tabular/numeric) document well under this
+    # character cap can still overflow the model's real token ceiling.
+    max_doc_chars: 120000
+    # SOFT token budget the whole request (system prompt + ontology +
+    # metadata + document text — and, separately, the corrective retry's
+    # failing-quote listing) is kept under. Hard-ceilinged at 190000
+    # regardless of what is configured here: a live incident (2026-09) had
+    # a single oversized/dense document push a request to 316295 tokens
+    # against the model's real 200000-token limit, killing the whole pass
+    # — this bound truncates (and counts, `docs_truncated`) or, for a
+    # binary/decode-garbage or severely oversized dense document, skips it
+    # outright (`docs_skipped_garbled_text` /
+    # `docs_skipped_too_large_tabular`) rather than send a request that
+    # would be rejected. A model call that still fails PERMANENTLY for one
+    # document's own request (e.g. this bound proving too generous for an
+    # unusually dense document) fails only that document
+    # (`facts_failed`/`facts_failed_reasons`), never the whole pass.
+    max_prompt_tokens: 150000
     # Wall-clock budget (seconds) for a STANDALONE run — POST
     # /connections/{id}/facts-extract, `agnes admin sharepoint
     # facts-extract`, the `sharepoint-facts-extraction` job kind. Its OWN
@@ -1558,6 +1636,133 @@ extraction:
     # crawl for time, so it gets a budget of its own. 0 disables the bound
     # (unbounded), same convention as `extraction.timeout_s`.
     run_timeout_s: 3600
+    # Let fact extraction run WHILE a crawl is still going, without an
+    # external script: after every N successfully ingested files (and once
+    # more when enumeration finishes), the built-in crawler enqueues a
+    # standalone `sharepoint-facts-extraction` job for the connection — the
+    # SAME job kind and idempotency key `POST …/connections/{id}/facts-
+    # extract` uses, so a fast crawl crossing several thresholds before a
+    # prior pass finishes collapses onto one queued job rather than piling
+    # up. 0 (the default) disables this — only the chained tail pass runs,
+    # after the crawl finishes, exactly as before this knob existed. Needs
+    # the worker's EXTRACTION lane (`extraction.concurrency` above) sized
+    # to at least 2 for a streamed pass to actually OVERLAP the crawl still
+    # running; at the default of 1 it simply queues behind it.
+    stream_every: 0
+    # How many PARTITIONS one facts-extraction trigger (the manual
+    # `POST …/facts-extract`, the streamed enqueue above, and a timed-out
+    # generation's own self-continuation) fans out into at most — each
+    # partition is its own `sharepoint-facts-extraction` job, processing a
+    # disjoint slice of the connection's pending documents
+    # (`hash(corpus_file_id) % count`) in parallel, on its own lock and its
+    # own worker-lane slot. The ACTUAL count is also capped by the backlog
+    # itself (never more than `ceil(pending / 2000)` partitions, so a small
+    # backlog never gets split into more jobs than it has work) — this is
+    # only the CEILING. Default 4: a live finding measured seven
+    # connections running facts extraction in parallel giving ~11,800
+    # documents/hour against the SAME provider account, versus ~1,400
+    # documents/hour once those connections were merged into one (one
+    # lock, one job) — throughput scales with concurrent PASSES, not
+    # corpus size, because the bottleneck is per-document ingest latency
+    # under load, not the model call itself (mostly cache hits). 4 stays
+    # safely under that 7-wide figure while leaving lane headroom
+    # (`extraction.concurrency` above) for this connection's own crawl and
+    # every other connection's jobs, so the common case needs no tuning;
+    # a fleet with more lane headroom (and a single very large connection)
+    # can raise it. 1 disables fan-out entirely — every trigger behaves
+    # exactly as it did before this knob existed.
+    concurrency_passes: 4
+    # Cost-levers lever A (docs/superpowers/specs/2026-09-02-fact-
+    # extraction-cost-levers.md §2): when the corrective retry fires,
+    # after the zero-token deterministic quote repair has had its chance
+    # to fix a failure for free. `on_gate_fail` (the default, and TODAY'S
+    # unmodified behaviour) retries a document only when the verbatim gate
+    # still rejects part of the output after repair. `off` disables the
+    # retry outright — a still-failing quote is dropped and counted
+    # immediately, cheapest and lowest recall. `always` retries whenever
+    # the FIRST-pass output had any verbatim failure at all, even one the
+    # repair already fixed for free — the model re-confirms its own
+    # original mistake instead of the byte-level snap being trusted alone;
+    # the most expensive setting, and rarely risks losing an already-good
+    # fact if the retry does not reproduce it. A single connection can
+    # override this — see `config.extraction.facts.retry_mode` on the
+    # connection row, PATCH /api/admin/sharepoint/connections/{id}/
+    # extraction/facts-config or `agnes admin sharepoint facts-config` —
+    # for a high-value connection that should always keep the retry ON
+    # while the rest of the fleet runs cheaper.
+    retry_mode: on_gate_fail
+    # Cost-levers lever B: a content-hash cache of successful LLM
+    # responses, keyed on (document sha256, model, effective prompt/
+    # ontology fingerprint — the same three-way identity `is_up_to_date`
+    # already uses to decide whether a document needs re-extraction) plus
+    # a call-kind suffix that keeps the ONE corrective retry's reply in
+    # its own row. A byte-identical document — a consultancy's v1/v2/final
+    # copies scattered across several folders, or the SAME document synced
+    # into more than one connection — costs the model call exactly ONCE.
+    # A cache hit is accounted as 0 API tokens, with a `cache_hits` counter
+    # in `facts_usage` and the run report. On by default; the cache TABLE
+    # is Postgres-only (A3 ratchet) — a DuckDB-backed instance simply runs
+    # without one, with a one-time log line, never a crash.
+    # AGNES_EXTRACTION_FACTS_LLM_CACHE overrides this at the environment level.
+    llm_cache: true
+    # Which LLM provider carries this stage's calls. `inherit` (default)
+    # follows this instance's own `ai.provider` above — vertex when chat/LLM
+    # traffic already runs through Google Vertex AI, anthropic otherwise.
+    # `anthropic` / `vertex` pin this stage to one provider REGARDLESS of
+    # ai.provider — e.g. an instance that migrated chat to Vertex but wants
+    # facts extraction to keep spending against a still-working Anthropic
+    # key, or the reverse: a connection pinned to `vertex` once its
+    # Anthropic workspace hit its monthly usage cap, without waiting for
+    # ai.provider to change instance-wide. A single connection can override
+    # this too — see `config.extraction.facts.provider` on the connection
+    # row, PATCH /api/admin/sharepoint/connections/{id}/extraction/
+    # facts-config or `agnes admin sharepoint facts-config --provider`.
+    # The Anthropic Batches API has no Vertex equivalent: a pass resolved to
+    # `vertex` always runs the `sync` transport below, regardless of this
+    # instance's `transport` setting — one warning log line, never an error.
+    provider: inherit
+    # WHICH Vertex AI region a `provider: vertex` pass's client talks to, on
+    # top of `ai.vertex.region` above — only meaningful when the resolved
+    # provider is `vertex`, resolved and reported unconditionally (harmless,
+    # simply unused otherwise). Google enforces Claude-on-Vertex quotas PER
+    # REGION: a project running every connection's facts pass against the
+    # same (default) region hits that region's requests-per-minute ceiling
+    # well before its account-level spend limit — regions have independent
+    # quotas, so pinning different connections to different regions
+    # multiplies effective throughput at the same per-call price. Empty
+    # (default) falls back to `ai.vertex.region`. A single connection can
+    # override this too — see `config.extraction.facts.vertex_region` on the
+    # connection row, PATCH /api/admin/sharepoint/connections/{id}/
+    # extraction/facts-config or `agnes admin sharepoint facts-config
+    # --vertex-region`.
+    vertex_region: ""
+    # Which API carries each document's extraction call. `sync` (default)
+    # is the synchronous Messages API, bound by the model account's
+    # tokens-per-minute limit — measured on a live instance at ~13k input +
+    # ~4.3k output tokens/document, a 285 documents/min pace needs ~1.2M
+    # output tokens/min, above what most accounts allow. `batch` uses the
+    # Anthropic Batches API instead: no per-minute ceiling and 50% the
+    # price, at the cost of latency (usually under an hour, up to 24h per
+    # batch) — the right trade for a bulk pass over an existing corpus, the
+    # wrong one for "extract this one document now". A batch-mode pass is
+    # resumable: a batch still in flight when the run's deadline expires
+    # stays recorded in the per-connection state file, and the NEXT pass
+    # collects it before submitting anything new.
+    transport: sync
+    # Documents per Batches-API submission. Hard-capped at the API's own
+    # per-batch ceilings (100,000 requests, 256 MB payload) regardless of
+    # this value.
+    batch_size: 500
+    # How often (seconds) an in-flight batch's status is re-checked while
+    # the run's deadline allows it.
+    batch_poll_s: 60
+    # Which transport carries the ONE corrective verbatim retry when the
+    # initial completion came from a batch. `batch` (default) keeps the
+    # retry off the model account's per-minute budget, at the cost of a
+    # second batch round-trip; `sync` trades that latency for an immediate
+    # per-document retry. Ignored in `transport: sync` — that retry is
+    # always sync, there is no other client to use.
+    retry_transport: batch
   # Anonymize-in-front (design spec §9/§9.2 — see docs/anonymization.md):
   # the connect wizard's per-scope "anonymize" checkbox (step 2) marks WHICH
   # scopes are pseudonymized before they are ingested. The crawl fails
@@ -1725,6 +1930,26 @@ extraction:
     # must be vision-capable; a model that is not fails every page, which
     # fails the document loudly rather than emptying it.
     model: ""
+    # Which LLM provider carries this stage's calls — the SAME ladder
+    # `extraction.facts.provider` uses. `inherit` (default) checks
+    # `extraction.facts.provider` next, then falls back to this instance's
+    # own `ai.provider` — vertex when chat/LLM traffic already runs through
+    # Google Vertex AI, anthropic otherwise. `anthropic` / `vertex` pin this
+    # stage to one provider regardless of either of those. Fixes an
+    # incident where an instance running everything else on Vertex still
+    # had a stale ANTHROPIC_API_KEY in the environment (an exhausted
+    # workspace) and scan OCR kept building an Anthropic client against it —
+    # a static key wins ONLY once neither this setting, `extraction.facts.
+    # provider`, nor `ai.provider` resolves to vertex.
+    provider: inherit
+    # A provider refusal Agnes recognizes as PERMANENT (a 400/401/403, or a
+    # workspace-limit/quota/billing-disabled refusal) is never retried per
+    # page; after the first one in a run, scan OCR pauses itself for every
+    # document that follows — no further render, no further call — so the
+    # documents land in the ordinary `convert_empty` backlog
+    # (`extraction/retry-empty` replays them once the provider is fixed)
+    # instead of burning a bounded set of failed attempts per document.
+    # See `docs/sharepoint-extraction.md` → *Provider limits*.
     # Pages transcribed per document. A 500-page scan must not burn the
     # budget silently: past this cap the first N pages are transcribed and a
     # truncation marker naming the cap is appended to the markdown. Clamped
@@ -1733,6 +1958,41 @@ extraction:
     max_pages: 50
     # Pages transcribed in parallel; clamped to [1, 8], 1 = one at a time.
     concurrency: 3
+    # Triage: before paying to transcribe a scan up to max_pages, transcribe
+    # just a short preview and let a cheap classification call decide
+    # whether the rest is worth it. ON by default once scan_ocr.enabled is
+    # true — set `enabled: false` here to go back to the old "transcribe
+    # everything up to max_pages" behaviour, byte-for-byte.
+    triage:
+      enabled: true
+      # Pages transcribed (and classified) before the continue/stop
+      # decision. A stopped document still keeps these pages, so it stays
+      # searchable/identifiable — set to 0 to skip even the preview for a
+      # document a rule below decided to skip (the pre-triage "empty"
+      # outcome).
+      preview_pages: 5
+      # Case-insensitive substring or glob patterns matched against the
+      # document's path. A `full_path_patterns` match always wins (transcribe
+      # in full, no preview, no classify call) even over a `skip_path_
+      # patterns` match on the same document. Both empty by default —
+      # operator-owned, no built-in guesses about a customer's folder names.
+      skip_path_patterns: []
+      # - "Tax Returns"
+      # - "Archive"
+      full_path_patterns: []
+      # - "Data Room/*Contract*"
+      # - "Financials"
+      # A document over this many MB skips full transcription outright
+      # (still gets a preview). 0 disables the guard.
+      max_size_mb: 0
+      # A document with this many pages OR FEWER just gets transcribed in
+      # full directly — skipping it would cost about the same as preview +
+      # classify, so triaging it is not worth it. 0 disables the guard.
+      min_pages: 0
+      # A document with MORE pages than this skips full transcription
+      # outright (still gets a preview) — the page-count analogue of
+      # max_size_mb. 0 disables the guard.
+      max_pages_for_preview: 0
 
 
 # Microsoft Graph change-notification receiver for SharePoint connections —

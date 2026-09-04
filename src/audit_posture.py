@@ -146,6 +146,24 @@ POSTURE: dict[str, str] = {
     # action, carrying `connection_id` only (no run content, no document
     # paths).
     "POST /api/admin/sharepoint/connections/{connection_id}/extraction/stop": "extraction.stop_requested",
+    # Force-close a run the cooperative stop above cannot reach (a crawl
+    # loop genuinely stuck, never observing the flag). The handler writes
+    # its OWN row (log_safe) carrying the connection id, the job id and
+    # whether a job was actually force-finalized — more than the fallback
+    # middleware could say (it never sees the response body's job details).
+    "POST /api/admin/sharepoint/extraction/runs/{run_id}/cancel": "sharepoint_extraction_run.cancel",
+    # Per-connection override for extraction.facts.retry_mode (cost-levers
+    # task, lever A). The handler writes its OWN row (log_safe) carrying the
+    # requested value, the resolved value and its source — more than the
+    # fallback middleware could say (it never sees the body), so the
+    # middleware's own write is a no-op here.
+    "PATCH /api/admin/sharepoint/connections/{connection_id}/extraction/facts-config": (
+        "extraction.facts_retry_mode_set"
+    ),
+    # Per-connection age filter for a crawl backfill — same shape/reasoning
+    # as the facts-config entry directly above: the handler writes its OWN
+    # row carrying the requested value, the resolved cutoff and its source.
+    "PATCH /api/admin/sharepoint/connections/{connection_id}/extraction/crawl-config": ("extraction.min_modified_set"),
     # A POST that mutates NOTHING — it runs the anonymizer over a pasted
     # sample and returns the result. Cataloged rather than `exempt:` all the
     # same, on the `access_policy.preview` precedent: an admin pastes real
@@ -154,6 +172,11 @@ POSTURE: dict[str, str] = {
     # its own row (`log_safe`) carrying the sample's LENGTH and the redaction
     # counts — never the text.
     "POST /api/admin/sharepoint/anonymization/preview": "anonymization.preview",
+    # -- app.api.admin_facts -----------------------------------------------------
+    # Handler writes its OWN row (log_safe) carrying how many collections
+    # were rebuilt and whether the call was scoped — more than the fallback
+    # middleware could say (it never sees the response body).
+    "POST /api/admin/facts/stats/rebuild": "facts.stats.rebuild",
     # -- app.api.admin_sharepoint ----------------------------------------------
     "DELETE /api/admin/sharepoint/connections/{connection_id}/scopes": "sharepoint_connection.scope_remove",
     # Landed on `integration` in parallel with this wave, declared "fallback"
@@ -162,7 +185,60 @@ POSTURE: dict[str, str] = {
     # these; `run_` keeps the run-due sweep inside SCHEDULER_ACTION_SQL's
     # liveness predicate, same reasoning as the other scheduler endpoints.
     "POST /api/admin/sharepoint/connections/{connection_id}/extract": "sharepoint_connection.extract",
+    # Same handler shape as `extract` right above — the fallback middleware
+    # emits this one too; nothing in the handler says more than "job id N,
+    # M items queued", which the fallback's own params already carry via
+    # the response body it captures.
+    "POST /api/admin/sharepoint/connections/{connection_id}/extraction/retry-empty": (
+        "sharepoint_connection.retry_empty"
+    ),
+    # The reset-no-claims recovery handler writes its own row EVERY call —
+    # dry_run included — with the per-outcome counts the fallback could not
+    # derive from the response body alone.
+    "POST /api/admin/sharepoint/connections/{connection_id}/facts/reset-no-claims": (
+        "sharepoint_connection.facts_reset_no_claims"
+    ),
     "POST /api/admin/sharepoint/connections/{connection_id}/scopes": "sharepoint_connection.scope_confirm",
+    # Bulk scope-add (split-a-large-site workflow) and connection clone both
+    # write their own row with richer params than the fallback could derive
+    # (per-path created/skipped/failed counts; the new connection id) —
+    # declared here as a cross-check on the handler's own log_safe call, not
+    # a fallback-emitted action.
+    "POST /api/admin/sharepoint/connections/{connection_id}/scopes/bulk": "sharepoint_connection.scope_bulk_add",
+    # Flips access_mode on many EXISTING scopes in one call (2026-09 fix) —
+    # handler writes its own row (log_safe) with the access_mode/requested/
+    # updated/failed counts, same posture as scope_bulk_add right above.
+    "PATCH /api/admin/sharepoint/connections/{connection_id}/scopes/bulk": (
+        "sharepoint_connection.scope_bulk_mode_set"
+    ),
+    # Replaces the whole SharePoint site-group -> Agnes-group ACL mirroring
+    # map (2026-09 fix) — handler writes its own row (log_safe) with the
+    # mapped group ids, same posture as the other admin_sharepoint writers.
+    "PATCH /api/admin/sharepoint/connections/{connection_id}/acl-site-group-map": (
+        "sharepoint_connection.acl_site_group_map_set"
+    ),
+    "POST /api/admin/sharepoint/connections/{connection_id}/clone": "sharepoint_connection.clone",
+    # Collection consolidation writes its own row EVERY call, dry-run
+    # included (`params.dry_run` distinguishes a preview from the real
+    # merge) — richer than the fallback could derive (source/target ids,
+    # the per-table moved-row summary), same posture as bulk scope-add
+    # above.
+    "POST /api/admin/sharepoint/connections/{connection_id}/collections/consolidate": (
+        "sharepoint_connection.collections_consolidate"
+    ),
+    # Split one large site into N sibling connections in one call — combines
+    # clone + scope_bulk_add's own primitives under one admin action, so the
+    # handler writes its own row (log_safe) with the created ids/n/
+    # min_modified, a cross-check on the fallback rather than a fallback
+    # emission (same reasoning as scope_bulk_add/clone right above).
+    "POST /api/admin/sharepoint/connections/{connection_id}/splits": "sharepoint_connection.split_apply",
+    # The reverse of `splits` above — folds several sibling connections back
+    # into one. Writes its own row EVERY call, dry-run included
+    # (`params.dry_run` distinguishes a preview from the real merge),
+    # richer than the fallback could derive (sibling/target ids, the
+    # per-table consolidation summary) — same posture as `splits`/
+    # `collections/consolidate` above.
+    "POST /api/admin/sharepoint/connections/{connection_id}/splits/merge": "sharepoint_connection.split_merge",
     "POST /api/admin/sharepoint/extraction/run-due": "run_sharepoint_extraction",
     # Persistence for a site added by URL (2026-09-01 bug report): the
     # ``Sites.Selected`` escape hatch used to resolve a site without ever
@@ -719,6 +795,7 @@ EXEMPT_REASONS: frozenset[str] = frozenset(
 READ_POSTURE: dict[str, str] = {
     # -- app.api.access --
     "GET /api/admin/access-overview": "exempt:ui_support",
+    "GET /api/admin/access/resources/{resource_type}/search": "exempt:ui_support",
     "GET /api/admin/grants": "exempt:ui_support",
     "GET /api/admin/groups": "exempt:ui_support",
     "GET /api/admin/groups/{group_id}": "exempt:ui_support",
@@ -734,6 +811,11 @@ READ_POSTURE: dict[str, str] = {
     "GET /api/admin/activity/sync": "activity.read",
     # -- app.api.admin --
     "GET /api/admin/discover-tables": "table_registry.discover_preview",
+    # Operational status only (last run outcome, running flag, next-due
+    # estimate) — no data content, secrets, or other users' data. Same
+    # posture as GET /api/jobs/{job_id} and
+    # GET /api/admin/sharepoint/extraction/runs below.
+    "GET /api/admin/knowledge-packaging/status": "exempt:noise",
     "GET /api/admin/registry": "exempt:ui_support",
     # RBAC-reviewer finding on #1979 (was `exempt:ui_support`): the response
     # carries profiler-derived `samples` — real row values, potentially PII
@@ -808,12 +890,40 @@ READ_POSTURE: dict[str, str] = {
     "GET /api/admin/sharepoint/connections/{connection_id}/extraction/config": (
         "sharepoint_connection.extraction_config_read"
     ),
+    # A6 — "did we really get everything?" (TCRD-296 B.9). Cataloged (not
+    # exempt), same reasoning as `split-plan` below: it discloses folder
+    # names and per-scope/per-folder document counts, never document
+    # content or secrets.
+    "GET /api/admin/sharepoint/connections/{connection_id}/extraction/completeness": (
+        "sharepoint_connection.completeness_read"
+    ),
+    # The fleet dashboard's own poll (`/admin/extraction`, 5s while any run
+    # is active) — one row per connection of the SAME run counters A1
+    # already exempts, plus a derived rate and a derived "stuck" flag. Same
+    # noise class as A1: nothing here is document content, a secret, or
+    # another user's data.
+    "GET /api/admin/sharepoint/extraction/runs": "exempt:noise",
     # -- app.api.admin_sharepoint --
     "GET /api/admin/sharepoint/connections/{connection_id}/certificate": "sharepoint_connection.certificate_read",
     "GET /api/admin/sharepoint/connections/{connection_id}/changes": "sharepoint_connection.changes_read",
+    # The source card's "Facts → graph" cell, fetched lazily per connection
+    # (perf follow-up, 2026-09-03) — a fact/edge COUNT, no document content,
+    # no secrets, no other user's data. Same class as the extraction
+    # observability counters exempted above.
+    "GET /api/admin/sharepoint/connections/{connection_id}/facts-graph-counts": "exempt:ui_support",
     "GET /api/admin/sharepoint/connections/{connection_id}/scopes": "sharepoint_connection.scopes_read",
     "GET /api/admin/sharepoint/connections/{connection_id}/tree": "sharepoint_connection.tree_browse",
     "GET /api/admin/sharepoint/connections/{connection_id}/tree/search": "sharepoint_connection.tree_search",
+    # Read-only preview of a site split — live Graph reads (root children +
+    # per-folder search counts), nothing persisted. Cataloged (not exempt):
+    # discloses folder names and per-folder document counts, same
+    # disclosure class as tree_browse right above.
+    "GET /api/admin/sharepoint/connections/{connection_id}/split-plan": "sharepoint_connection.split_plan_read",
+    # Read-only preview of the AUTOMATIC parallel crawl (2026-09-03
+    # auto-parallel-crawl design §4.7, plan Task 9) — the successor to
+    # `split-plan` above; same disclosure class (folder counts, never
+    # document content).
+    "GET /api/admin/sharepoint/connections/{connection_id}/shard-plan": "sharepoint_connection.shard_plan_read",
     # -- app.api.admin_slack_secrets --
     "GET /api/admin/slack-secrets": "slack.secret.read",
     # -- app.api.admin_source_connections --
@@ -1218,6 +1328,10 @@ READ_POSTURE: dict[str, str] = {
     "GET /admin/data-sources": "exempt:ui_support",
     "GET /admin/database": "exempt:ui_support",
     "GET /admin/datasource-credentials": "exempt:ui_support",
+    # The SharePoint extraction fleet dashboard shell (2026-09-02) — the
+    # table itself is fetched client-side from the already-exempt
+    # `GET /api/admin/sharepoint/extraction/runs` above.
+    "GET /admin/extraction": "exempt:ui_support",
     "GET /admin/grants": "exempt:ui_support",
     "GET /admin/groups": "exempt:ui_support",
     "GET /admin/groups/{group_id}": "exempt:ui_support",
@@ -1277,6 +1391,12 @@ READ_POSTURE: dict[str, str] = {
     "GET /how-it-works": "exempt:ui_support",
     "GET /install": "exempt:ui_support",
     "GET /library": "exempt:ui_support",
+    # The "search facets" typeahead JSON endpoint (round 3 of the 2026-09-03
+    # incident) — reads the same entity-facet vocabulary the index's own
+    # Filter menu renders (`_entity_facet_spec`), scoped to collections the
+    # caller can already see. No content beyond facet label/count, same
+    # posture as the index it extends.
+    "GET /library/facets/{facet}": "exempt:ui_support",
     "GET /library/{slug}": "exempt:ui_support",
     "GET /library/{slug}/f/{file_id}": "exempt:ui_support",
     # An HTML FRAGMENT of the collection page's own file rows, fetched by the
@@ -1284,6 +1404,11 @@ READ_POSTURE: dict[str, str] = {
     # for the same reason — it renders rows the caller can already read on
     # `GET /library/{slug}`, and it is gated on that same collection access.
     "GET /library/{slug}/matching-files": "exempt:ui_support",
+    # An HTML FRAGMENT of a folder's own peek rows, fetched by the Library
+    # when a folder row is expanded (round 2 of the 2026-09-03 incident fix
+    # — a folder's files are no longer read at all at index-render time).
+    # Same posture and the same reason as the row above.
+    "GET /library/{slug}/peek": "exempt:ui_support",
     "GET /login": "exempt:ui_support",
     "GET /login/email": "exempt:ui_support",
     "GET /login/password": "exempt:ui_support",
@@ -1504,9 +1629,14 @@ JOB_POSTURE: dict[str, str] = {
     "analytics-migrate": "job.run",
     "distribution-mirror": "job.run",
     "webhook-deliver": "job.run",
+    "knowledge-packaging": "job.run",
     "analytics-rebuild": "job.run",
     "collections-purge": "job.run",
     "corpus-extraction": "job.run",
+    # A shard child (2026-09-03 auto-parallel-crawl design §4.3) is the SAME
+    # crawl pipeline `corpus-extraction` runs, just planner-enqueued over a
+    # narrower set of targets -- same posture, same reasoning.
+    "corpus-extraction-shard": "job.run",
     # Both of these ALSO write their own more-specific rows internally
     # (connectors/sharepoint/acl_sync.py -- e.g. sharepoint_acl.sync_completed/
     # sync_failed for the sync job; the sweep job persists state without a
@@ -1639,6 +1769,8 @@ MCP_TOOL_POSTURE: dict[str, str] = {
     "admin_job_get": "exempt:noise",
     "admin_job_enqueue": "job.enqueue",
     "activity": "activity.read",
+    "admin_knowledge_packaging_run": "run_knowledge_packaging",
+    "admin_knowledge_packaging_status": "exempt:noise",
     "admin_analytics_migrate": "analytics.migrate",
     "agent_list": "exempt:self",
     "agent_ask": "agent.invoke",

@@ -572,7 +572,8 @@ SWITCHES: tuple[Switch, ...] = (
         editable=True,
         description=(
             "Mirror the signed-in user's Entra ID group memberships (Microsoft Graph "
-            "GET /me/memberOf) into user_group_members (source='microsoft_sync') on every "
+            "GET /me/transitiveMemberOf/microsoft.graph.group) into user_group_members "
+            "(source='microsoft_sync') on every "
             "Microsoft sign-in — the same mechanism auth.keboola.* uses for Keboola, and "
             "google_sync uses for Google Workspace. Off by default: turning it on for the "
             "first time also widens the OAuth consent scope requested at "

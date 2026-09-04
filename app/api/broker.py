@@ -1257,6 +1257,44 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
                 params=request.query_params,
             )
             resp = await client.send(upstream_req, stream=True)
+        except httpx.TransportError as exc:
+            # The upstream (Anthropic / dispatcher / Vertex) could not be
+            # reached AT ALL — connection refused, DNS failure, or a connect
+            # that timed out — never a completed call the provider itself
+            # rejected (that path forwards the real status above/below and is
+            # classified separately by `_record_llm_health`). Left unhandled,
+            # this reached the sandbox's own HTTP client as an opaque,
+            # retry-hostile 500 with no signal beyond a raw transport-error
+            # string — the chat surface's `chatErrorCopy` classifies THAT
+            # text defensively, but the honest fix is a typed response here:
+            # a 503 with `Retry-After` and a cataloged health signal, exactly
+            # like the 401/403/400 branch below gives the admin readiness
+            # banner (#884's own precedent, extended to "never got a response
+            # at all"). Not retried by this loop — a genuine connection
+            # failure rarely clears within the loop's own short backoff, and
+            # the typed 503 already tells the caller to retry on its own.
+            await client.aclose()
+            from app.chat.readiness import record_llm_runtime_failure
+
+            diag = record_llm_runtime_failure(request.app.state, None, str(exc))
+            try:
+                audit_repo().log(
+                    action="broker_llm_unreachable",
+                    params={"reason": diag.get("reason"), "detail": diag.get("detail")},
+                    result="error",
+                    client_kind="broker",
+                )
+            except Exception:
+                # Audit logging must never break the deny path itself.
+                pass
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "llm_upstream_unreachable",
+                    "message": "The instance is restarting or temporarily unavailable — try again in a minute.",
+                },
+                headers={"Retry-After": "30"},
+            ) from exc
         except BaseException as _exc:
             await client.aclose()
             if otel_span is not None:

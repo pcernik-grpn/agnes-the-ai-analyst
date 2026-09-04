@@ -32,6 +32,11 @@ from pathlib import Path
 
 import pytest
 
+
+# Kept for any future caller that needs the template path itself — content
+# reads go through `_ds_page_source.page_source()` (perf follow-up,
+# 2026-09-03: most of this page's JS moved into extracted static files, see
+# tests/_ds_page_source.py).
 TEMPLATE = Path(__file__).resolve().parents[1] / "app" / "web" / "templates" / "admin_data_sources.html"
 
 
@@ -70,13 +75,20 @@ _SIGNATURES = (
     "function _extStopReasonText(reason) {",
     "function _extThrottleLine(run) {",
     "function _extActivityHtml(activity) {",
+    "function _extShardCountText(run) {",
+    "function _extShardsHtml(shards) {",
     "function _extFactsJobLine(job) {",
+    "function _extFactsPendingLine(status) {",
+    "function _extScanOcrPausedLine(run) {",
+    "function _extFactsEta(seconds) {",
+    "function _extFactsThroughputNote(status) {",
     "function _extRunRowHtml(connId, st) {",
     "function _extConfigRowHtml(connId) {",
     "function _extPanelHtml(tone, title, body, connId, retry) {",
     "function _extRenderInAgnesButton(connId, status) {",
     "function _extRenderFactsButton(connId, status) {",
     "function _extRender(connId) {",
+    "function _extRenderNextRun(connId, status) {",
 )
 
 # The network-touching functions, pulled in only for the tests that click

@@ -531,6 +531,25 @@ class ConnectionSecretsRepository:
     def delete(self, connection_id: str) -> None:
         self.conn.execute("DELETE FROM connection_secrets WHERE connection_id = ?", [connection_id])
 
+    def has_many(self, connection_ids: list[str]) -> set[str]:
+        """The subset of ``connection_ids`` that have a stored vault secret,
+        in ONE query.
+
+        The batched sibling of :meth:`has`: a caller listing N connections
+        that checked ``has()`` per row (twice — once for the token slot,
+        once for the master-token slot) made the list endpoint's query count
+        grow with N (``app.api.admin_source_connections._with_secret_status``).
+        Never decrypts — same write-only-to-callers contract as ``has()``.
+        """
+        if not connection_ids:
+            return set()
+        placeholders = ", ".join("?" for _ in connection_ids)
+        rows = self.conn.execute(
+            f"SELECT DISTINCT connection_id FROM connection_secrets WHERE connection_id IN ({placeholders})",
+            list(connection_ids),
+        ).fetchall()
+        return {r[0] for r in rows}
+
     def has(self, connection_id: str) -> bool:
         row = self.conn.execute("SELECT 1 FROM connection_secrets WHERE connection_id = ?", [connection_id]).fetchone()
         return row is not None
@@ -545,3 +564,37 @@ class ConnectionSecretsRepository:
             [connection_id],
         ).fetchone()
         return str(row[0]) if row and row[0] is not None else None
+
+    def copy_secret(self, source_connection_id: str, target_connection_id: str) -> bool:
+        """Duplicate ``source_connection_id``'s encrypted row verbatim under
+        ``target_connection_id`` — a read-and-reinsert of ``ciphertext``,
+        NEVER a decrypt/re-encrypt round trip. Safe because ``encrypt_secret``
+        binds the ciphertext to no AAD / connection id (it is just
+        ``Fernet(key).encrypt(value)``) — the exact same token decrypts
+        identically under either connection id.
+
+        Used by SharePoint's ``POST …/clone`` (see
+        ``app/api/admin_sharepoint.py::clone_connection``) so a clone whose
+        source certificate lives in this vault, rather than a deployment env
+        var, resolves settings immediately — no admin re-upload.
+
+        Returns ``True`` iff the source had a row (and one was written under
+        ``target_connection_id``, replacing any prior row there); ``False``
+        when there is nothing to copy — callers must NOT clear an existing
+        target row in that case.
+        """
+        row = self.conn.execute(
+            "SELECT ciphertext FROM connection_secrets WHERE connection_id = ?",
+            [source_connection_id],
+        ).fetchone()
+        if row is None:
+            return False
+        self.conn.execute(
+            """INSERT INTO connection_secrets (connection_id, ciphertext, updated_at)
+               VALUES (?, ?, current_timestamp)
+               ON CONFLICT (connection_id) DO UPDATE SET
+                   ciphertext = excluded.ciphertext,
+                   updated_at = excluded.updated_at""",
+            [target_connection_id, row[0]],
+        )
+        return True

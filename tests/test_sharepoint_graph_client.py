@@ -248,6 +248,57 @@ class TestListItemChildren:
             asyncio.run(gc.list_item_children("tok", "drv1", "missing"))
 
 
+class TestGetItemByPath:
+    """`get_item_by_path` — the drive-item-level complement to
+    `get_site_by_path`: Graph's by-path addressing
+    (``/drives/{drive_id}/root:/{path}``) resolves an admin-typed folder
+    path directly to its item id, no interactive tree walk required."""
+
+    def test_resolves_folder_by_path(self, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.url.path == "/v1.0/drives/drv1/root:/FolderA/Sub"
+            return httpx.Response(200, json={"id": "item123", "name": "Sub", "folder": {"childCount": 3}})
+
+        _install_transport(monkeypatch, handler)
+        item = asyncio.run(gc.get_item_by_path("tok", "drv1", "FolderA/Sub"))
+        assert item == {"id": "item123", "name": "Sub", "is_folder": True, "child_count": 3}
+
+    def test_empty_path_addresses_the_drive_root(self, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.url.path == "/v1.0/drives/drv1/root"
+            return httpx.Response(200, json={"id": "root-item", "name": "root", "folder": {"childCount": 5}})
+
+        _install_transport(monkeypatch, handler)
+        item = asyncio.run(gc.get_item_by_path("tok", "drv1", ""))
+        assert item["id"] == "root-item"
+
+    def test_path_segments_are_url_quoted(self, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert b"/drives/drv1/root:/Team%20Site/Contracts" in request.url.raw_path
+            return httpx.Response(200, json={"id": "item456", "name": "Contracts", "folder": {"childCount": 0}})
+
+        _install_transport(monkeypatch, handler)
+        item = asyncio.run(gc.get_item_by_path("tok", "drv1", "Team Site/Contracts"))
+        assert item["id"] == "item456"
+
+    def test_file_path_is_not_marked_a_folder(self, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"id": "doc1", "name": "report.pdf", "file": {}})
+
+        _install_transport(monkeypatch, handler)
+        item = asyncio.run(gc.get_item_by_path("tok", "drv1", "report.pdf"))
+        assert item == {"id": "doc1", "name": "report.pdf", "is_folder": False, "child_count": None}
+
+    def test_non_200_error_carries_the_status_code(self, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(404, json={"error": {"code": "itemNotFound"}})
+
+        _install_transport(monkeypatch, handler)
+        with pytest.raises(gc.SharePointGraphError) as exc_info:
+            asyncio.run(gc.get_item_by_path("tok", "drv1", "NoSuchFolder"))
+        assert exc_info.value.status_code == 404
+
+
 class TestGetSiteByPath:
     """`get_site_by_path` — the discovery-free, `Sites.Selected`-compatible
     way to reach one site: Graph's by-path addressing
@@ -892,3 +943,229 @@ class TestGetAppTokenClientSecret:
         _install_transport(monkeypatch, lambda request: httpx.Response(200, json={"access_token": "x"}))
         with pytest.raises(gc.SharePointGraphError):
             asyncio.run(gc.get_app_token("tenant-1", "client-1", "", client_secret=""))
+
+
+class TestListRootChildrenWithUrl:
+    """``list_root_children_with_url`` — the site-split planner's own read of
+    the drive root, carrying each item's ``webUrl`` so the planner can
+    compose a Graph Search KQL ``path:`` filter per folder without a second
+    round trip (``list_root_children`` deliberately omits it — see that
+    function's own tests above, which pin an exact dict shape without it)."""
+
+    def test_maps_folders_and_files_with_web_url(self, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.url.path == "/v1.0/drives/drv1/root/children"
+            return httpx.Response(
+                200,
+                json={
+                    "value": [
+                        {
+                            "id": "f1",
+                            "name": "Contracts",
+                            "folder": {"childCount": 5},
+                            "webUrl": "https://example.sharepoint.com/sites/s/Shared Documents/Contracts",
+                        },
+                        {
+                            "id": "f2",
+                            "name": "notes.txt",
+                            "file": {},
+                            "webUrl": "https://example.sharepoint.com/sites/s/Shared Documents/notes.txt",
+                        },
+                    ]
+                },
+            )
+
+        _install_transport(monkeypatch, handler)
+        items = asyncio.run(gc.list_root_children_with_url("tok", "drv1"))
+        assert items == [
+            {
+                "id": "f1",
+                "name": "Contracts",
+                "is_folder": True,
+                "web_url": "https://example.sharepoint.com/sites/s/Shared Documents/Contracts",
+                "child_count": 5,
+            },
+            {
+                "id": "f2",
+                "name": "notes.txt",
+                "is_folder": False,
+                "web_url": "https://example.sharepoint.com/sites/s/Shared Documents/notes.txt",
+                "child_count": None,
+            },
+        ]
+
+    def test_pages_the_full_nextlink_chain(self, monkeypatch):
+        calls = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(str(request.url))
+            if "skip" not in str(request.url):
+                return httpx.Response(
+                    200,
+                    json={
+                        "value": [{"id": "f1", "name": "A", "folder": {}, "webUrl": "https://x/A"}],
+                        "@odata.nextLink": "https://graph.microsoft.com/v1.0/drives/drv1/root/children?skip=1",
+                    },
+                )
+            return httpx.Response(
+                200, json={"value": [{"id": "f2", "name": "B", "folder": {}, "webUrl": "https://x/B"}]}
+            )
+
+        _install_transport(monkeypatch, handler)
+        items = asyncio.run(gc.list_root_children_with_url("tok", "drv1"))
+        assert [i["id"] for i in items] == ["f1", "f2"]
+        assert len(calls) == 2
+
+
+class TestListItemChildrenWithUrl:
+    """``list_item_children_with_url`` — the shard planner's one-level-deeper
+    fold (2026-09-04 finding #65): same ``webUrl``/``child_count`` pair as
+    :func:`list_root_children_with_url`, generalized past the drive root."""
+
+    def test_maps_folders_and_files_with_web_url_and_child_count(self, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.url.path == "/v1.0/drives/drv1/items/f1/children"
+            return httpx.Response(
+                200,
+                json={
+                    "value": [
+                        {"id": "s1", "name": "Sub1", "folder": {"childCount": 3}, "webUrl": "https://x/f1/Sub1"},
+                        {"id": "s2", "name": "doc.pdf", "file": {}, "webUrl": "https://x/f1/doc.pdf"},
+                    ]
+                },
+            )
+
+        _install_transport(monkeypatch, handler)
+        items = asyncio.run(gc.list_item_children_with_url("tok", "drv1", "f1"))
+        assert items == [
+            {"id": "s1", "name": "Sub1", "is_folder": True, "web_url": "https://x/f1/Sub1", "child_count": 3},
+            {"id": "s2", "name": "doc.pdf", "is_folder": False, "web_url": "https://x/f1/doc.pdf", "child_count": None},
+        ]
+
+
+class TestGetItemWebUrl:
+    """``get_item_web_url`` — the completeness check's own resolver from
+    ``(drive_id, item_id)`` to a ``web_url`` :func:`search_document_count`
+    can filter on."""
+
+    def test_drive_root_when_item_id_omitted(self, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.url.path == "/v1.0/drives/drv1/root"
+            return httpx.Response(200, json={"webUrl": "https://example.sharepoint.com/sites/s/Shared Documents"})
+
+        _install_transport(monkeypatch, handler)
+        web_url = asyncio.run(gc.get_item_web_url("tok", "drv1"))
+        assert web_url == "https://example.sharepoint.com/sites/s/Shared Documents"
+
+    def test_specific_item_when_item_id_given(self, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.url.path == "/v1.0/drives/drv1/items/item-42"
+            return httpx.Response(200, json={"webUrl": "https://example.sharepoint.com/sites/s/Docs/Reports"})
+
+        _install_transport(monkeypatch, handler)
+        web_url = asyncio.run(gc.get_item_web_url("tok", "drv1", "item-42"))
+        assert web_url == "https://example.sharepoint.com/sites/s/Docs/Reports"
+
+    def test_never_raises_on_non_200(self, monkeypatch):
+        _install_transport(monkeypatch, lambda request: httpx.Response(404, text="not found"))
+        web_url = asyncio.run(gc.get_item_web_url("tok", "drv1", "item-42"))
+        assert web_url is None
+
+    def test_never_raises_on_transport_error(self, monkeypatch):
+        def _client() -> httpx.AsyncClient:
+            def handler(request: httpx.Request) -> httpx.Response:
+                raise httpx.ConnectError("boom", request=request)
+
+            return httpx.AsyncClient(transport=httpx.MockTransport(handler), timeout=10)
+
+        monkeypatch.setattr(gc, "_http_client", _client)
+        web_url = asyncio.run(gc.get_item_web_url("tok", "drv1", "item-42"))
+        assert web_url is None
+
+
+class TestSearchDocumentCount:
+    """``search_document_count`` — Graph Search-backed, best-effort document
+    count for one folder path (site-split planner). NEVER a delta walk; NEVER
+    raises."""
+
+    def test_returns_total_from_hits_containers(self, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.url.path == "/v1.0/search/query"
+            body = json.loads(request.content)
+            req = body["requests"][0]
+            assert req["entityTypes"] == ["driveItem"]
+            assert req["region"] == "NAM"
+            assert 'path:"https://example.sharepoint.com/sites/s/Docs/A"' in req["query"]["queryString"]
+            assert "IsDocument:1" in req["query"]["queryString"]
+            return httpx.Response(
+                200,
+                json={"value": [{"hitsContainers": [{"total": 42, "hits": []}]}]},
+            )
+
+        _install_transport(monkeypatch, handler)
+        total = asyncio.run(gc.search_document_count("tok", "https://example.sharepoint.com/sites/s/Docs/A"))
+        assert total == 42
+
+    def test_min_modified_narrows_the_query(self, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content)
+            query = body["requests"][0]["query"]["queryString"]
+            assert "LastModifiedTime>=2023-12-31" in query
+            return httpx.Response(200, json={"value": [{"hitsContainers": [{"total": 5}]}]})
+
+        _install_transport(monkeypatch, handler)
+        total = asyncio.run(
+            gc.search_document_count("tok", "https://example.sharepoint.com/sites/s/Docs/A", min_modified="2023-12-31")
+        )
+        assert total == 5
+
+    def test_exclude_extensions_narrows_the_query(self, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content)
+            query = body["requests"][0]["query"]["queryString"]
+            assert "NOT (" in query
+            assert "fileextension:mp4" in query
+            assert "fileextension:zip" in query
+            return httpx.Response(200, json={"value": [{"hitsContainers": [{"total": 3}]}]})
+
+        _install_transport(monkeypatch, handler)
+        total = asyncio.run(
+            gc.search_document_count(
+                "tok",
+                "https://example.sharepoint.com/sites/s/Docs/A",
+                exclude_extensions=frozenset({"mp4", "zip"}),
+            )
+        )
+        assert total == 3
+
+    def test_no_exclude_extensions_omits_the_not_clause(self, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content)
+            query = body["requests"][0]["query"]["queryString"]
+            assert "NOT (" not in query
+            return httpx.Response(200, json={"value": [{"hitsContainers": [{"total": 1}]}]})
+
+        _install_transport(monkeypatch, handler)
+        total = asyncio.run(gc.search_document_count("tok", "https://example.sharepoint.com/sites/s/Docs/A"))
+        assert total == 1
+
+    def test_never_raises_on_non_200(self, monkeypatch):
+        _install_transport(monkeypatch, lambda request: httpx.Response(500, text="boom"))
+        total = asyncio.run(gc.search_document_count("tok", "https://example.sharepoint.com/sites/s/Docs/A"))
+        assert total == 0
+
+    def test_never_raises_on_malformed_body(self, monkeypatch):
+        _install_transport(monkeypatch, lambda request: httpx.Response(200, json={"value": []}))
+        total = asyncio.run(gc.search_document_count("tok", "https://example.sharepoint.com/sites/s/Docs/A"))
+        assert total == 0
+
+    def test_never_raises_on_transport_error(self, monkeypatch):
+        def _client() -> httpx.AsyncClient:
+            def handler(request: httpx.Request) -> httpx.Response:
+                raise httpx.ConnectError("boom", request=request)
+
+            return httpx.AsyncClient(transport=httpx.MockTransport(handler), timeout=10)
+
+        monkeypatch.setattr(gc, "_http_client", _client)
+        total = asyncio.run(gc.search_document_count("tok", "https://example.sharepoint.com/sites/s/Docs/A"))
+        assert total == 0

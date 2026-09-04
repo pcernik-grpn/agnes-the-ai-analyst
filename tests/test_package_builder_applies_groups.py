@@ -174,9 +174,14 @@ def test_a_group_id_holding_a_quote_cannot_break_the_lookup() -> None:
     )
 
 
-def test_the_shipped_branch_ticks_the_proposed_group_and_opens_the_disclosure() -> None:
+def test_the_shipped_branch_ticks_the_proposed_group_and_says_so() -> None:
     """The behaviour, on the real bytes: a patch proposing a group ends with
-    that group's checkbox checked and the access disclosure open.
+    that group's checkbox checked and the access summary restated.
+
+    Access used to be an inline `<details>`, and the signal was opening it.
+    It is a modal now, so the closed row's summary is the only place an admin
+    who does not open it will read what the turn just granted — same rule,
+    same test, one seam over.
 
     `hydrateGroups` is the seam — it stands in for the fetch + render, and
     installs the rows the server would have rendered AFTER the patch arrives,
@@ -207,6 +212,8 @@ const els = {
   groups: el({ querySelectorAll: (sel) => (sel === '[data-group-id]' ? rows : []) }),
   access: el({ open: false }),
 };
+let summarySynced = 0;
+function syncAccessSummary() { summarySynced += 1; }
 // Lazy on purpose: no rows exist when the patch arrives, as in create mode.
 let hydrated = 0;
 function hydrateGroups() {
@@ -224,7 +231,7 @@ const patch = { groups: ['g-sales', 'g-sales'] };  // duplicate: must tick once
   process.stdout.write(JSON.stringify({
     hydrated,
     checked: rows.filter((r) => r._box.checked).map((r) => r.getAttribute('data-group-id')),
-    disclosureOpen: els.access.open,
+    summarySynced,
   }));
 })();
 """
@@ -232,13 +239,13 @@ const patch = { groups: ['g-sales', 'g-sales'] };  // duplicate: must tick once
     res = _run(script)
     assert res["hydrated"] == 1, "the rows were never fetched — the patch had nothing to tick"
     assert res["checked"] == ["g-sales"], f"the proposed group was not ticked (or the wrong one was): {res['checked']}"
-    assert res["disclosureOpen"] is True, "ticked silently inside a collapsed disclosure"
+    assert res["summarySynced"] == 1, "ticked a group without restating what the panel says about access"
 
 
-def test_a_patch_proposing_nothing_new_leaves_the_disclosure_shut() -> None:
-    """The other half of the same rule: opening the access section is how the
-    panel says "who can reach this just changed". A patch that changes nothing
-    must not say it."""
+def test_a_patch_proposing_nothing_new_says_nothing() -> None:
+    """The other half of the same rule: restating the access summary is how
+    the panel says "who can reach this just changed". A patch that changes
+    nothing must not say it."""
     branch = _groups_branch(DRAWER.read_text(encoding="utf-8"))
     script = (
         r"""
@@ -260,14 +267,16 @@ const els = {
   access: el({ open: false }),
 };
 function hydrateGroups() { return Promise.resolve(); }
+let summarySynced = 0;
+function syncAccessSummary() { summarySynced += 1; }
 const patch = { groups: ['g-sales'] };
 (async () => {
 """
         + branch
         + r"""
   for (let i = 0; i < 6; i++) await new Promise((r) => setTimeout(r, 0));
-  process.stdout.write(JSON.stringify({ disclosureOpen: els.access.open }));
+  process.stdout.write(JSON.stringify({ summarySynced }));
 })();
 """
     )
-    assert _run(script)["disclosureOpen"] is False, "the disclosure opened for a patch that ticked nothing"
+    assert _run(script)["summarySynced"] == 0, "the panel announced an access change for a patch that ticked nothing"

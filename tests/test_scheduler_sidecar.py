@@ -56,14 +56,14 @@ def test_build_jobs_honors_bq_metadata_env_override(monkeypatch):
 
 def test_build_jobs_honors_knowledge_packaging_env_override(monkeypatch):
     monkeypatch.setenv("SCHEDULER_KNOWLEDGE_PACKAGING_INTERVAL", "1800")  # 30m
-    from services.scheduler.__main__ import build_jobs
+    from services.scheduler.__main__ import _ENQUEUE_TIMEOUT_SEC, build_jobs
 
     target = next(j for j in build_jobs() if j[0] == "knowledge-packaging")
     _, schedule, endpoint, method, timeout = target
     assert schedule == "every 30m"
     assert endpoint == "/api/admin/run-knowledge-packaging"
     assert method == "POST"
-    assert timeout == 600
+    assert timeout == _ENQUEUE_TIMEOUT_SEC
 
 
 def test_build_jobs_honors_knowledge_digests_env_override(monkeypatch):

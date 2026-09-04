@@ -91,6 +91,13 @@
         'is the slow one (it fetches the sandbox), so trying again usually works — ' +
         'if it keeps failing, an admin should check the chat engine.';
     }
+    // Same family as chat.js's chatErrorCopy (see its own comment): the
+    // sandbox's client, or the broker's own outbound call, could not reach
+    // its target at all — connection refused, DNS failure, an abort
+    // mid-connect, or a 502/503 while the app container is mid-restart.
+    if (/cannot reach|econnrefused|connection refused|operation was aborted|enotfound|getaddrinfo|network is unreachable|socket hang up|\b50[23]\b/i.test(both)) {
+      return 'The instance is restarting or temporarily unavailable — try the preview again in a minute.';
+    }
     var detail = unwrapDetail(msg) || k;
     if (!detail) return 'The preview could not answer, and the engine gave no reason.';
     // Both halves when they differ, so a kind-only frame and a message-only

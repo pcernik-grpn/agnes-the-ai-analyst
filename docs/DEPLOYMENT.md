@@ -26,6 +26,50 @@ Highlights:
 
 Target onboarding time: **< 1 hour** per customer.
 
+### Sizing from the VM
+
+`app_mem_limit`, `scheduler_mem_limit` and `extraction_worker_mem_limit`
+(per-VM fields on `prod_instance` / `dev_instances[*]`) default to `"auto"`:
+the startup script derives every container memory ceiling AND the Postgres
+side-car's tuning from the VM's own `/proc/meminfo` + `nproc` on every boot,
+instead of a fixed literal baked in at `terraform plan` time that never
+matches a bigger or smaller `machine_type`. Re-derived on EVERY boot
+(idempotent), so a VM recreate never regresses to a laptop-sized default.
+
+| Setting | Formula |
+|---|---|
+| `app_mem_limit` | `clamp(RAM / 8, 4 GiB, 32 GiB)` |
+| `scheduler_mem_limit` | fixed `2 GiB` |
+| `extraction_worker_mem_limit` | `RAM × 0.6`, capped so app + worker + an 8 GiB headroom (Postgres + host) never exceeds the VM's actual RAM, floored at 4 GiB |
+| Postgres `shared_buffers` | `25% of RAM`, capped at `32 GiB` |
+| Postgres `effective_cache_size` | `60% of RAM` |
+| Postgres `work_mem` | `clamp(RAM / 512, 16 MiB, 128 MiB)` |
+| Postgres `maintenance_work_mem` | `min(RAM / 16, 4 GiB)` |
+| Postgres `max_wal_size` | fixed `8GB` |
+| Postgres `wal_compression` | fixed `on` |
+| Postgres `random_page_cost` | fixed `1.1` (every data disk is `pd-ssd`) |
+| Postgres `max_parallel_workers_per_gather` | `min(4, vCPU / 8)` |
+| Postgres `jit` | fixed `off` (measured slower on this app's visibility CTEs) |
+| Postgres `shm_size` (Docker's `/dev/shm`) | `2% of RAM`, floored at `256 MiB` |
+
+Set an explicit value (e.g. `app_mem_limit = "8g"`) to override `"auto"`
+outright — a hand-set value always wins, same precedence as every other
+per-VM field. **Live finding (TCRD-296):** a fixed 4 GiB `app_mem_limit` and
+Postgres' stock defaults (`shared_buffers` 128-160 MiB, `work_mem` 4 MiB,
+`effective_cache_size` 5 GiB) plus Docker's default 64 MiB `/dev/shm` on a
+64-vCPU / 251 GiB VM OOM-killed the app four times serving DuckDB queries and
+made every Postgres parallel worker fail with "could not resize shared
+memory segment" (~2850 times in 30 minutes), killing a facts extraction job.
+
+The derivation is startup-script logic — see `agnes_auto_app_mem_limit_gb` /
+`agnes_pg_shared_buffers_mb` / etc. in `infra/modules/customer-instance/
+startup-script.sh.tpl` (unit-tested in `tests/test_startup_vm_sizing.py`) —
+so it applies to a Terraform-provisioned VM only; the plain `docker compose`
+path in the next section documents the equivalent manual step for a
+self-hosted install. See *Sizing the Postgres side-car* below for the
+`ALTER SYSTEM` precedence caveat and how new sizing reaches an EXISTING VM
+(a recreate, not a live retune).
+
 ### Host monitoring with Datadog
 
 Off by default. `enable_datadog = true` makes the module install a pinned
@@ -195,6 +239,49 @@ For running Agnes on your own VM / bare metal without Terraform. You're responsi
    don't set `POSTGRES_PASSWORD` — app-state runs on single-file DuckDB, as every
    instance did before A1. Not recommended for a new install (see
    [postgres-cutover-runbook.md](postgres-cutover-runbook.md) for why).
+
+### Sizing the Postgres side-car
+
+On a Terraform-provisioned VM (customer-instance module), the startup script
+derives Postgres tuning and container memory ceilings from the VM's own
+`/proc/meminfo` + `nproc` on every boot — see *Sizing from the VM* below.
+That derivation lives in the startup script, not in the compose files
+themselves, so a self-provisioned host following the steps above does not
+get it automatically: `docker-compose.postgres-host-mount.yml`'s
+`shared_buffers` / `effective_cache_size` / `work_mem` /
+`maintenance_work_mem` / `max_parallel_workers_per_gather` / `shm_size` all
+fall back to small, laptop-sized literals (`AGNES_PG_SHARED_BUFFERS:-256MB`
+and friends) when the `AGNES_PG_*` env vars are unset. Export them yourself
+in `.env` for a self-hosted install on real hardware, e.g.:
+
+```bash
+cat >> .env <<EOF
+AGNES_PG_SHARED_BUFFERS=8192MB
+AGNES_PG_EFFECTIVE_CACHE_SIZE=19660MB
+AGNES_PG_WORK_MEM=64MB
+AGNES_PG_MAINTENANCE_WORK_MEM=2048MB
+AGNES_PG_MAX_PARALLEL_WORKERS_PER_GATHER=1
+AGNES_PG_SHM_SIZE=655m
+EOF
+```
+
+**`ALTER SYSTEM` wins over these flags.** An admin who ran `ALTER SYSTEM SET
+work_mem = '...'` (or any other tuning GUC) by hand on a running instance has
+a `postgresql.auto.conf` in the data directory that Postgres reads AFTER the
+`-c` command-line flags this overlay passes — the config-file value always
+loses that precedence fight. Clear a hand-set override with `ALTER SYSTEM
+RESET work_mem;` (or `RESET ALL;` to clear every hand-set GUC at once)
+followed by `SELECT pg_reload_conf();`, or delete the specific `SET` line
+from `postgresql.auto.conf` inside the container and reload/restart. Applies
+identically to a self-hosted install and a Terraform VM.
+
+**Existing instances only pick up new sizing at the next recreate or
+`compose up`** — nothing here retunes a running `postgres` container
+in-place. On a customer-instance VM, trigger it the same way as any other
+startup-script change: `terraform apply -replace='module.agnes.google_compute_
+instance.vm["<vm-name>"]'` (see `docs/RELEASING.md` → *Replacing a VM after a
+startup-script change*). On a self-hosted install, `docker compose up -d
+--force-recreate postgres` after updating `.env`.
 
 4. Bootstrap your admin password via `POST /auth/bootstrap`:
 

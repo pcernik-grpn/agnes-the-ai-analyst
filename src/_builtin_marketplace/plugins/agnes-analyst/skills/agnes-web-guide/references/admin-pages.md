@@ -37,6 +37,13 @@ who receives it:
   remove one.
 - `/admin/sync` — sync status dashboard: per-table extraction state and a
   manual trigger (reached from the SYNC cell on `/admin/data-sources`).
+- `/admin/extraction` — the SharePoint extraction FLEET dashboard: one row
+  per connection's crawl + facts pass — phase, files done/seen, a derived
+  files/min, facts done/pending, token spend, estimated cost, and a "stuck?"
+  flag on a checkpoint stale past 10 minutes. Defaults to connections with a
+  run active right now; `?all=1` shows every connection (reached from the
+  *All connections* button in a SharePoint source card's Run row on
+  `/admin/data-sources`).
 
 ### Access
 
