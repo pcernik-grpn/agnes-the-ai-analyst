@@ -56,7 +56,14 @@ class FactAlias(Base):
     """
 
     __tablename__ = "fact_aliases"
-    __table_args__ = (sa.Index("idx_fact_aliases_fact_id", "fact_id"),)
+    __table_args__ = (
+        sa.Index("idx_fact_aliases_fact_id", "fact_id"),
+        # Ingest resolution looks up by natural_key alone, but the primary
+        # key (type, natural_key) doesn't lead with it — hand-built on a
+        # live instance before this shipped — migration
+        # ``0106_hot_path_indexes``, TCRD-296 gap #44.
+        sa.Index("idx_fact_aliases_natural_key", "natural_key"),
+    )
 
     type: Mapped[str] = mapped_column(String, primary_key=True)
     natural_key: Mapped[str] = mapped_column(String, primary_key=True)

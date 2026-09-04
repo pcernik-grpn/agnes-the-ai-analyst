@@ -120,6 +120,14 @@ class CorpusChunk(Base):
             sa.text("to_tsvector('simple', text)"),
             postgresql_using="gin",
         ),
+        # Backs every per-collection chunk read and the retrieval candidate
+        # query's ``WHERE corpus_id = ANY(...)`` (hand-built on a live
+        # instance before this shipped — migration
+        # ``0106_hot_path_indexes``, TCRD-296 gap #43). May be absent on an
+        # instance whose table was too large to build it in-place at
+        # migration time — see that migration's docstring for the operator
+        # follow-up; the query it backs still works without it.
+        sa.Index("idx_corpus_chunks_corpus_id", "corpus_id"),
     )
 
     id: Mapped[str] = mapped_column(String, primary_key=True)
