@@ -1274,6 +1274,137 @@ def _table_resolves_to_cte(table: exp.Table) -> bool:
     return False
 
 
+def _referenced_mapping_rows(
+    policy_sql: str,
+    *,
+    table_name: str | None = None,
+    table_id: str | None = None,
+) -> list[dict]:
+    """The ``policy_mapping=true`` registry rows ``policy_sql`` references,
+    excluding the protected table's own mandatory self-reference -- the
+    parse-and-filter step shared by :func:`raise_if_policy_mapping_empty`
+    (fail-closed enforcement) and :func:`policy_mapping_statuses` (read-only
+    admin observability, #2147), so the two can never disagree about WHICH
+    tables are in scope for this check.
+
+    ``[]`` (never raises) when ``policy_sql`` fails to parse, or when the
+    body references no ``policy_mapping`` table at all -- the common case.
+    """
+    from src.repositories import table_registry_repo
+
+    try:
+        statement = sqlglot.parse_one(policy_sql, read="duckdb")
+    except Exception:
+        return []
+    # DuckDB identifiers are case-insensitive, so the match below must be
+    # too -- lower-case both sides. Without this, a policy body joining
+    # `Cost_Centres` while the registry row is named `cost_centres` (or vice
+    # versa) silently misses the mapping row, and this whole check no-ops
+    # (PR #2023 review, finding 1).
+    # A CTE alias is not a physical dependency: `WITH cost_centres AS (...)
+    # SELECT ... FROM cost_centres` reads the CTE, never the registry row
+    # that happens to share its name. But the exclusion must be SCOPED, not
+    # a global name subtraction: `WITH cost_centres AS (SELECT * FROM
+    # main.cost_centres) ...` and `WITH a AS (SELECT * FROM cost_centres),
+    # cost_centres AS (...) ...` both still read the physical table -- a
+    # qualified reference, a reference inside the CTE's own (non-recursive)
+    # body, or one made before the alias is declared never resolves to the
+    # CTE (PR #2023 review follow-up, two rounds).
+    referenced_names = {
+        t.name.lower() for t in statement.find_all(exp.Table) if t.name and not _table_resolves_to_cte(t)
+    }
+    referenced_names -= _protected_table_self_names(table_name=table_name, table_id=table_id)
+    if not referenced_names:
+        return []
+
+    return [
+        r
+        for r in table_registry_repo().list_all()
+        if r.get("policy_mapping") and (r.get("name") or "").lower() in referenced_names
+    ]
+
+
+def _mapping_table_state(mapping_row: dict) -> tuple[str, Any]:
+    """``(state, last_sync)`` for ONE ``policy_mapping=true`` registry row --
+    the single place both :func:`raise_if_policy_mapping_empty` (fail-closed
+    enforcement) and :func:`policy_mapping_statuses` (admin observability,
+    #2147) derive "is this mapping dependency healthy" from, so the two can
+    never disagree.
+
+    ``state`` is one of:
+
+    - ``"remote_unknown"`` -- a ``query_mode='remote'`` mapping table has no
+      local materialization: its rows live upstream and the policy's JOIN
+      reads them live, so whatever ``sync_state.rows`` says about it is
+      metadata, not a count (remote connectors publish 0 / NULL -> 0).
+      Treating that as empty turned every policy joining a populated remote
+      mapping table into a false refusal (#1979, review follow-up) -- the
+      same reason this state is never "empty" here either.
+    - ``"never_synced"`` -- no ``sync_state`` row exists under either the
+      registry ``id`` or the (pre-B1 legacy) ``name`` key.
+    - ``"empty"`` -- a ``sync_state`` row exists and its last verified row
+      count is zero -- the trap this check exists for.
+    - ``"ok"`` -- a ``sync_state`` row exists with a nonzero row count, OR a
+      #1364 "count unavailable" placeholder zero (the extractor could not
+      COUNT the table this pass, but the previously synced data is still
+      served -- an operational hiccup, not a verified empty table, so it
+      must not read as "empty" here any more than it may trip the
+      fail-closed raise below).
+
+    ``last_sync`` is the resolved ``sync_state`` row's timestamp, or
+    ``None`` when no such row exists (``"never_synced"`` / ``"remote_unknown"``).
+
+    Cheap by design (#2147's registry-list requirement): reads
+    ``sync_state`` -- the row count already recorded by the last successful
+    sync -- never a live ``COUNT(*)``.
+    """
+    from src.repositories import sync_state_repo
+    from src.sync_state_key import COUNT_UNAVAILABLE_MARKER
+
+    if (mapping_row.get("query_mode") or "").lower() == "remote":
+        return "remote_unknown", None
+
+    # ID first, NAME only as a fallback. Every current writer keys
+    # `sync_state.table_id` by the registry `id` (B1,
+    # `src.sync_state_key`), so the id-keyed row is the one that stays
+    # current; a name-keyed row is the pre-B1 convention, kept working
+    # here because a populated-but-name-keyed mapping table otherwise
+    # read as "never synced" and refused every query a policy joins it
+    # from. The order matters because the two can COEXIST: migration
+    # `0072_sync_state_id_backfill_v124` deliberately leaves a legacy
+    # name-keyed row in place when a row already occupies the target id
+    # (`table_id` is the primary key -- backfilling would drop one row's
+    # history). Trusting the name-keyed row first then meant the stale
+    # legacy one always won: zero rows on it vetoed a healthy mapping
+    # table, and rows on it hid a mapping table that is genuinely empty
+    # now (#1979, review follow-up).
+    state = None
+    for key in dict.fromkeys((mapping_row.get("id"), mapping_row.get("name"))):
+        if not key:
+            continue
+        state = sync_state_repo().get_table_state(key)
+        if state:
+            break
+
+    if not state:
+        return "never_synced", None
+
+    last_sync = state.get("last_sync")
+    rows = state.get("rows")
+    # #1364: when the extractor could not COUNT a table this pass the
+    # orchestrator still publishes `rows=0` (the column stays numeric)
+    # but flags the row with a dedicated error, because that 0 is not a
+    # verified empty table -- the previously synced data is still on
+    # disk and still served. Treat that as "unknown", not "empty": the
+    # operator-facing signal is the sync error, and refusing every read
+    # here would turn a counting hiccup into an outage.
+    if rows == 0 and COUNT_UNAVAILABLE_MARKER in str(state.get("error") or ""):
+        return "ok", last_sync
+    if not rows:
+        return "empty", last_sync
+    return "ok", last_sync
+
+
 def raise_if_policy_mapping_empty(
     policy_sql: str,
     *,
@@ -1317,82 +1448,43 @@ def raise_if_policy_mapping_empty(
     references no ``policy_mapping`` table at all, which is the common case
     and must stay a no-op.
     """
-    from src.repositories import sync_state_repo, table_registry_repo
-    from src.sync_state_key import COUNT_UNAVAILABLE_MARKER
-
-    try:
-        statement = sqlglot.parse_one(policy_sql, read="duckdb")
-    except Exception:
-        return
-    # DuckDB identifiers are case-insensitive, so the match below must be
-    # too -- lower-case both sides. Without this, a policy body joining
-    # `Cost_Centres` while the registry row is named `cost_centres` (or vice
-    # versa) silently misses the mapping row, and this whole check no-ops
-    # (PR #2023 review, finding 1).
-    # A CTE alias is not a physical dependency: `WITH cost_centres AS (...)
-    # SELECT ... FROM cost_centres` reads the CTE, never the registry row
-    # that happens to share its name. But the exclusion must be SCOPED, not
-    # a global name subtraction: `WITH cost_centres AS (SELECT * FROM
-    # main.cost_centres) ...` and `WITH a AS (SELECT * FROM cost_centres),
-    # cost_centres AS (...) ...` both still read the physical table -- a
-    # qualified reference, a reference inside the CTE's own (non-recursive)
-    # body, or one made before the alias is declared never resolves to the
-    # CTE (PR #2023 review follow-up, two rounds).
-    referenced_names = {
-        t.name.lower() for t in statement.find_all(exp.Table) if t.name and not _table_resolves_to_cte(t)
-    }
-    referenced_names -= _protected_table_self_names(table_name=table_name, table_id=table_id)
-    if not referenced_names:
-        return
-
-    mapping_rows = [
-        r
-        for r in table_registry_repo().list_all()
-        if r.get("policy_mapping") and (r.get("name") or "").lower() in referenced_names
-    ]
+    mapping_rows = _referenced_mapping_rows(policy_sql, table_name=table_name, table_id=table_id)
     for mapping_row in mapping_rows:
-        # A `query_mode='remote'` mapping table has NO local materialization:
-        # its rows live upstream and the policy's JOIN reads them live, so
-        # whatever `sync_state.rows` says about it is metadata, not a count
-        # (remote connectors publish 0 / NULL -> 0). Refusing on that number
-        # turned every policy joining a populated remote mapping table into
-        # `policy_mapping_empty`; the guard exists to name a broken LOCAL
-        # sync, which a remote row cannot have (#1979, review follow-up).
-        if (mapping_row.get("query_mode") or "").lower() == "remote":
-            continue
-        # ID first, NAME only as a fallback. Every current writer keys
-        # `sync_state.table_id` by the registry `id` (B1,
-        # `src.sync_state_key`), so the id-keyed row is the one that stays
-        # current; a name-keyed row is the pre-B1 convention, kept working
-        # here because a populated-but-name-keyed mapping table otherwise
-        # read as "never synced" and refused every query a policy joins it
-        # from. The order matters because the two can COEXIST: migration
-        # `0072_sync_state_id_backfill_v124` deliberately leaves a legacy
-        # name-keyed row in place when a row already occupies the target id
-        # (`table_id` is the primary key -- backfilling would drop one row's
-        # history). Trusting the name-keyed row first then meant the stale
-        # legacy one always won: zero rows on it vetoed a healthy mapping
-        # table, and rows on it hid a mapping table that is genuinely empty
-        # now (#1979, review follow-up).
-        state = None
-        for key in dict.fromkeys((mapping_row.get("id"), mapping_row.get("name"))):
-            if not key:
-                continue
-            state = sync_state_repo().get_table_state(key)
-            if state:
-                break
-        rows = state.get("rows") if state else None
-        # #1364: when the extractor could not COUNT a table this pass the
-        # orchestrator still publishes `rows=0` (the column stays numeric)
-        # but flags the row with a dedicated error, because that 0 is not a
-        # verified empty table -- the previously synced data is still on
-        # disk and still served. Treat that as "unknown", not "empty": the
-        # operator-facing signal is the sync error, and refusing every read
-        # here would turn a counting hiccup into an outage.
-        if state and rows == 0 and COUNT_UNAVAILABLE_MARKER in str(state.get("error") or ""):
-            continue
-        if not rows:
-            raise PolicyMappingEmpty(mapping_row["name"], state.get("last_sync") if state else None)
+        state, last_sync = _mapping_table_state(mapping_row)
+        if state in ("empty", "never_synced"):
+            raise PolicyMappingEmpty(mapping_row["name"], last_sync)
+
+
+def policy_mapping_statuses(
+    policy_sql: str,
+    *,
+    table_name: str | None = None,
+    table_id: str | None = None,
+) -> list[dict]:
+    """Read-only admin observability (#2147) counterpart of
+    :func:`raise_if_policy_mapping_empty`: one entry per ``policy_mapping``
+    table ``policy_sql`` references (excluding the protected table's own
+    self-reference, the same exclusion rule), each
+    ``{"mapping_table": <id>, "state": ..., "last_sync": ...}`` -- never
+    raises, so ``GET /api/admin/registry`` can surface it on every policied
+    row without turning a broken mapping dependency into a 500 on a LIST
+    endpoint.
+
+    ``state`` is exactly :func:`_mapping_table_state`'s vocabulary
+    (``"ok"`` / ``"empty"`` / ``"never_synced"`` / ``"remote_unknown"``) --
+    the SAME derivation the fail-closed check uses, so an admin reading this
+    field and a caller hitting ``policy_mapping_empty`` on a live read can
+    never disagree about which mapping table is broken or why.
+
+    ``[]`` when the policy body references no ``policy_mapping`` table at
+    all (the common case) or fails to parse.
+    """
+    mapping_rows = _referenced_mapping_rows(policy_sql, table_name=table_name, table_id=table_id)
+    statuses: list[dict] = []
+    for mapping_row in mapping_rows:
+        state, last_sync = _mapping_table_state(mapping_row)
+        statuses.append({"mapping_table": mapping_row["id"], "state": state, "last_sync": last_sync})
+    return statuses
 
 
 # ---------------------------------------------------------------------------

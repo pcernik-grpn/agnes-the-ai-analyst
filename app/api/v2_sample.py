@@ -7,6 +7,7 @@ import time
 from fastapi import APIRouter, Depends, HTTPException, Query
 import duckdb
 
+from app.api.access_policy_http import assert_no_empty_policy_mapping
 from app.auth.dependencies import get_current_user, _get_db
 from src.access_policy_udf import register_policy_udfs
 from src.db import _open_duckdb
@@ -466,6 +467,13 @@ def build_sample(
         except PolicyError as exc:
             raise HTTPException(status_code=500, detail={"reason": "policy_error", "table": exc.table_id})
 
+        # #2147: an empty/never-synced `policy_mapping` dependency (§15.1)
+        # must fail closed here too, not just on `POST /api/query` — before
+        # ANY cache lookup or read, so a broken mapping table's slice is
+        # never cached under the caller's identity key.
+        if relation.policied:
+            assert_no_empty_policy_mapping(table_id=relation.table_id, row=row)
+
         if has_access_policy:
             # Task 12 (§9): re-key on the caller's identity now that
             # identity resolution has actually run — covers BOTH the
@@ -567,6 +575,29 @@ def sample(
         except Exception:
             logger.exception("audit_log write failed for catalog.sample; continuing")
         return result
+    except HTTPException as exc:
+        # `build_sample` raises `HTTPException` directly for policy
+        # refusals (`policy_error`, `policy_identity_unresolvable`, and, as
+        # of #2147, `policy_mapping_empty`) — none of those are in the
+        # typed tuple below, and this route is listed in
+        # `src.audit_posture.READ_SELF_AUDITING` (it writes its OWN
+        # `catalog.sample` row on success above), so `AuditFallbackMiddleware`
+        # skips it unconditionally on the read path and this refusal would
+        # otherwise go completely unaudited. Log, then re-raise unchanged so
+        # the client still sees the original status + structured detail —
+        # same shape `/api/query`'s own generic `except HTTPException` uses.
+        try:
+            audit_repo().log(
+                user_id=identity_for_audit(user)[0],
+                action="catalog.sample",
+                resource=resource,
+                params={"duration_ms": int((time.monotonic() - t0) * 1000), "error": str(exc.detail)[:200]},
+                result=f"error.{exc.status_code}",
+                client_kind=client_kind_from_user(user),
+            )
+        except Exception:
+            logger.exception("audit_log write failed on http_exc path for catalog.sample; continuing")
+        raise
     except (FileNotFoundError, PermissionError, ValueError, BqAccessError) as exc:
         try:
             if isinstance(exc, FileNotFoundError):

@@ -13,6 +13,7 @@ from fastapi.responses import Response
 from pydantic import BaseModel, Field
 import duckdb
 
+from app.api.access_policy_http import assert_no_empty_policy_mapping
 from app.auth.dependencies import get_current_user, _get_db
 from src.db import _open_duckdb
 from app.instance_config import get_value
@@ -937,6 +938,11 @@ def run_scan(
                 raise HTTPException(status_code=403, detail={"reason": "policy_identity_unresolvable"})
             except PolicyError as exc:
                 raise HTTPException(status_code=500, detail={"reason": "policy_error", "table": exc.table_id})
+            # #2147: an empty/never-synced `policy_mapping` dependency
+            # (§15.1) must fail closed here too -- before the parquet is
+            # even read -- the same guard `POST /api/query` applies.
+            if relation.policied:
+                assert_no_empty_policy_mapping(table_id=relation.table_id, row=row)
             # Task 11 (§10): report through job_info, the same out-param
             # _run_bq_scan already uses for BQ job metadata, so scan_endpoint
             # builds the X-Agnes-Row-Scope header from one place regardless

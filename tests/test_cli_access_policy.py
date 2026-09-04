@@ -265,6 +265,92 @@ class TestTablePolicyShow:
         assert result.exit_code == 1
 
 
+class TestTablePolicyShowMappingStatus:
+    """#2147: `policy_mapping_status` -- the read-only, per-mapping-table
+    health `GET /api/admin/registry` now attaches to a policied row -- is
+    rendered by `table-policy show`, both human and `--json`."""
+
+    def test_broken_mapping_table_is_flagged(self):
+        tables = [
+            {
+                "id": "invoices",
+                "name": "invoices",
+                "access_policy_sql": "SELECT * FROM invoices WHERE unit IN (SELECT unit FROM user_access)",
+                "access_policy_note": "restrict to unit",
+                "access_policy_updated_by": "admin@x.com",
+                "access_policy_updated_at": "2026-08-11T00:00:00",
+                "policy_mapping": False,
+                "policy_mapping_status": [{"mapping_table": "user_access", "state": "never_synced", "last_sync": None}],
+            }
+        ]
+        with patch("cli.commands.admin.api_get", return_value=_registry_resp(tables)):
+            result = runner.invoke(app, ["admin", "table-policy", "show", "invoices"])
+        assert result.exit_code == 0, result.output
+        assert "mapping status" in result.output.lower()
+        assert "user_access: never_synced" in result.output
+        assert "last_sync: never" in result.output
+
+    def test_healthy_mapping_table_is_shown_without_a_broken_flag(self):
+        tables = [
+            {
+                "id": "invoices",
+                "name": "invoices",
+                "access_policy_sql": "SELECT * FROM invoices",
+                "access_policy_note": "note",
+                "access_policy_updated_by": "admin@x.com",
+                "access_policy_updated_at": "2026-08-11T00:00:00",
+                "policy_mapping": False,
+                "policy_mapping_status": [
+                    {"mapping_table": "user_access2", "state": "ok", "last_sync": "2026-08-11T00:00:00"}
+                ],
+            }
+        ]
+        with patch("cli.commands.admin.api_get", return_value=_registry_resp(tables)):
+            result = runner.invoke(app, ["admin", "table-policy", "show", "invoices"])
+        assert result.exit_code == 0, result.output
+        assert "user_access2: ok" in result.output
+        assert "broken" not in result.output.lower()
+
+    def test_json_carries_the_field(self):
+        tables = [
+            {
+                "id": "invoices",
+                "name": "invoices",
+                "access_policy_sql": "SELECT 1",
+                "access_policy_note": "note",
+                "access_policy_updated_by": "admin@x.com",
+                "access_policy_updated_at": "2026-08-11T00:00:00",
+                "policy_mapping": False,
+                "policy_mapping_status": [{"mapping_table": "user_access", "state": "empty", "last_sync": None}],
+            }
+        ]
+        with patch("cli.commands.admin.api_get", return_value=_registry_resp(tables)):
+            result = runner.invoke(app, ["admin", "table-policy", "show", "invoices", "--json"])
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert data["policy_mapping_status"] == [{"mapping_table": "user_access", "state": "empty", "last_sync": None}]
+
+    def test_no_status_field_when_the_table_has_no_dependency(self):
+        """A policied row with no `policy_mapping` dependency at all carries
+        no `policy_mapping_status` key (`GET /api/admin/registry` only adds
+        it for a policied row)."""
+        tables = [
+            {
+                "id": "invoices",
+                "name": "invoices",
+                "access_policy_sql": "SELECT * FROM invoices",
+                "access_policy_note": "note",
+                "access_policy_updated_by": "admin@x.com",
+                "access_policy_updated_at": "2026-08-11T00:00:00",
+                "policy_mapping": False,
+            }
+        ]
+        with patch("cli.commands.admin.api_get", return_value=_registry_resp(tables)):
+            result = runner.invoke(app, ["admin", "table-policy", "show", "invoices"])
+        assert result.exit_code == 0, result.output
+        assert "mapping status" not in result.output.lower()
+
+
 class TestTablePolicyPreview:
     def test_preview_as_groups_prints_row_counts(self):
         captured = {}

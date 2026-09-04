@@ -5157,6 +5157,17 @@ async def list_registry(
         like the sync_state join above; False for every row if that read
         fails, since a filter that silently claims everything is unpackaged
         is worse than one that offers nothing.
+      - `policy_mapping_status` (#2147): present only on a row with a
+        policy attached (`access_policy_sql`). A list of
+        `{"mapping_table": <id>, "state": "ok"|"empty"|"never_synced"|
+        "remote_unknown", "last_sync": ...}`, one entry per
+        `policy_mapping=true` table the policy body joins (excluding the
+        row's own mandatory self-reference) — the same read-only,
+        `sync_state`-derived state `src.access_policy.policy_mapping_
+        statuses` computes for the live-read fail-closed check
+        (`raise_if_policy_mapping_empty`), never a live `COUNT(*)`, so this
+        never disagrees with (or is more expensive than) what a real query
+        through the policy would do. Absent entirely on an unpolicied row.
     """
     repo = table_registry_repo()
     tables = repo.list_all()
@@ -5205,6 +5216,29 @@ async def list_registry(
         logger.exception("Failed to read data-package membership for registry")
     for t in tables:
         t["packaged"] = t.get("id") in packaged
+
+    # #2147: `policy_mapping_status` — read-only, sync_state-derived
+    # observability for a policied row's `policy_mapping` dependencies (see
+    # docstring above). Absent entirely on an unpolicied row rather than an
+    # empty list, matching this endpoint's own field-presence convention
+    # elsewhere (e.g. `row_scope` on the query surfaces).
+    if any(t.get("access_policy_sql") for t in tables):
+        from src.access_policy import policy_mapping_statuses
+
+        for t in tables:
+            if not t.get("access_policy_sql"):
+                continue
+            try:
+                statuses = policy_mapping_statuses(
+                    t["access_policy_sql"], table_id=t.get("id"), table_name=t.get("name")
+                )
+            except Exception:
+                logger.exception("Failed to compute policy_mapping_status for %s", t.get("id"))
+                continue
+            for s in statuses:
+                ls = s.get("last_sync")
+                s["last_sync"] = ls.isoformat() if hasattr(ls, "isoformat") else ls
+            t["policy_mapping_status"] = statuses
 
     return {"tables": tables, "count": len(tables)}
 

@@ -943,6 +943,10 @@ def table_policy_show(
         raise typer.Exit(1)
 
     sql = row.get("access_policy_sql")
+    # #2147: read-only, per-mapping-table health -- present only on a
+    # policied row (`GET /api/admin/registry`'s own presence rule; see
+    # `app/api/admin.py::list_registry`'s docstring).
+    mapping_status = row.get("policy_mapping_status")
     if as_json:
         typer.echo(
             json.dumps(
@@ -953,6 +957,7 @@ def table_policy_show(
                     "access_policy_updated_at": row.get("access_policy_updated_at"),
                     "access_policy_updated_by": row.get("access_policy_updated_by"),
                     "policy_mapping": bool(row.get("policy_mapping")),
+                    "policy_mapping_status": mapping_status,
                 },
                 indent=2,
             )
@@ -970,6 +975,15 @@ def table_policy_show(
     typer.echo(f"  updated_by:     {row.get('access_policy_updated_by') or ''}")
     typer.echo(f"  updated_at:     {row.get('access_policy_updated_at') or ''}")
     typer.echo(f"  policy_mapping: {bool(row.get('policy_mapping'))}")
+    if mapping_status:
+        typer.echo("  mapping status:")
+        for entry in mapping_status:
+            state = entry.get("state")
+            flag = "  <-- broken, see docs/table-access-policies.md" if state in ("empty", "never_synced") else ""
+            typer.echo(
+                f"    {entry.get('mapping_table')}: {state} "
+                f"(last_sync: {entry.get('last_sync') or 'never'}){flag}"
+            )
     typer.echo("  sql:")
     for line in sql.splitlines():
         typer.echo(f"    {line}")
