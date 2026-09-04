@@ -182,6 +182,19 @@ variable "prod_instance" {
     # without the URL simply never registers the tool server. Inert unless
     # kai_agent_enabled is also true on this VM.
     kai_agent_broker_mcp_enabled = optional(bool, false)
+    # Opt-in: let the engine's sandbox export its OWN spans (turn → step →
+    # tool) through this instance's OTLP broker route. Derives
+    # HOST_BROKER_OTLP_URL=<origin>/api/broker/otlp into the engine env, the
+    # same way kai_agent_broker_mcp_enabled derives the MCP URL. A deliberate
+    # flag rather than a side effect of otlp_endpoint, because the URL is a
+    # two-sided switch on the engine: its presence makes the sandbox
+    # initialize OTel AND makes `otlp` an active relay scope every turn needs
+    # a ticket for — set against an app older than the route that mints it
+    # (app >= 0.100, `POST /api/broker/otlp/v1/{signal}`) every turn fails
+    # before the prompt is sent. So: app first, then this flag. Requires
+    # kai_agent_enabled and otlp_endpoint on the same VM (validated below);
+    # startup-script-owned, lands on VM recreate.
+    kai_agent_broker_otlp_enabled = optional(bool, false)
     # Opt-in OpenTelemetry (OTLP/HTTP) export of this VM's LLM completions
     # (docs/observability.md → "OpenTelemetry export"; app >= 0.98).
     # `otlp_endpoint` is the collector's BASE URL — the SDK appends
@@ -391,6 +404,12 @@ variable "prod_instance" {
     error_message = "prod_instance.otlp_endpoint must be an http(s) URL — the collector's BASE URL, without the /v1/traces suffix the SDK appends itself."
   }
 
+
+  validation {
+    condition     = !var.prod_instance.kai_agent_broker_otlp_enabled || (var.prod_instance.kai_agent_enabled && var.prod_instance.otlp_endpoint != "")
+    error_message = "prod_instance.kai_agent_broker_otlp_enabled requires kai_agent_enabled = true and a non-empty otlp_endpoint on the same VM — the engine would arm an otlp relay scope against a broker route with no collector to forward to."
+  }
+
 }
 
 variable "dev_instances" {
@@ -473,6 +492,10 @@ variable "dev_instances" {
     # Engine → instance MCP tool surface — see prod_instance for the
     # rationale; same default, inert without kai_agent_enabled.
     kai_agent_broker_mcp_enabled = optional(bool, false)
+    # Engine sandbox → this instance's OTLP broker route — see prod_instance
+    # for the ordering contract; same default, inert without kai_agent_enabled
+    # and otlp_endpoint.
+    kai_agent_broker_otlp_enabled = optional(bool, false)
     # Per-VM opt-in OTLP export + deployment label — see prod_instance for
     # the contract; same defaults, same "must be on the type" rule.
     otlp_endpoint        = optional(string, "")
@@ -586,6 +609,12 @@ variable "dev_instances" {
   validation {
     condition     = alltrue([for d in var.dev_instances : try(d.otlp_endpoint, "") == "" || can(regex("^https?://", d.otlp_endpoint))])
     error_message = "dev_instances[*].otlp_endpoint must be an http(s) URL — the collector's BASE URL, without the /v1/traces suffix the SDK appends itself."
+  }
+
+
+  validation {
+    condition     = alltrue([for d in var.dev_instances : !try(d.kai_agent_broker_otlp_enabled, false) || (try(d.kai_agent_enabled, false) && try(d.otlp_endpoint, "") != "")])
+    error_message = "dev_instances[*].kai_agent_broker_otlp_enabled requires kai_agent_enabled = true and a non-empty otlp_endpoint on the same VM — the engine would arm an otlp relay scope against a broker route with no collector to forward to."
   }
 
 }
