@@ -316,7 +316,11 @@ class TestEveryStepCarriesTheHonestCheck:
 
 class TestTheCardRendersIt:
     def _page(self, seeded_app) -> str:
-        return (
+        """The page as the browser assembles it — the response plus the classic
+        scripts it loads. The renderer this class guards moved into one of those
+        files, and asserting on the response alone would read as "the function is
+        gone" rather than "it is in the other half of the same page"."""
+        html = (
             seeded_app["client"]
             .get(
                 "/admin/data-sources",
@@ -324,11 +328,15 @@ class TestTheCardRendersIt:
             )
             .text
         )
+        return _ds_page_source.rendered_with_scripts(html)
 
     def test_the_page_ships_the_renderer_and_its_style(self, seeded_app, source):
         body = self._page(seeded_app)
         assert "_nextStepHtml" in body
-        assert ".ds-next" in body
+        # The style moved out with the rest of the page's CSS. Read it from the
+        # stylesheet, not from `body` — the same selector appears there as a
+        # string inside the script, which would pass while the rule was gone.
+        assert ".ds-next" in _ds_page_source.styles_only()
         assert SIMULATE_HREF in body
 
     def test_the_repaint_keeps_the_row_true(self, seeded_app):

@@ -2460,7 +2460,6 @@ def test_the_add_project_wizard_reuses_its_connection_on_retry():
     project" per attempt, leaving the admin to clean them up.
     """
     import pathlib
-    import re
     import subprocess
     import tempfile
 
@@ -2483,12 +2482,13 @@ def test_the_add_project_wizard_reuses_its_connection_on_retry():
         else True
     )
 
-    # The restructure moved a `return` inside a new block — parse the page's
-    # script to be sure it is still valid JS, since nothing else here would.
-    blocks = re.findall(r"<script(?![^>]*src=)[^>]*>(.*?)</script>", src, re.DOTALL)
-    assert blocks, "no inline script found — re-point this guard"
-    js = re.sub(r"\{%.*?%\}", "", "\n".join(blocks), flags=re.DOTALL)
-    js = re.sub(r"\{\{.*?\}\}", '"JINJA"', js, flags=re.DOTALL)
+    # The restructure moved a `return` inside a new block — parse the script to
+    # be sure it is still valid JS, since nothing else here would. The code now
+    # lives in the files the page loads, so check those: harvesting inline
+    # <script> blocks out of the assembled source would parse the template
+    # markup left between them, not JavaScript.
+    js = _ds_page_source.scripts_only()
+    assert js.strip(), "no loaded script found — re-point this guard"
     with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as f:
         f.write(js)
         path = f.name

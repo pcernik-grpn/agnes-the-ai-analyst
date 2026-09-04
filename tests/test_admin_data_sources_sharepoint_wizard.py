@@ -1528,8 +1528,10 @@ class TestCertificateFileUploadMarkup:
         assert "Upload PEM file" in body
 
     def test_card_rotate_row_has_the_same_picker(self, seeded_app):
-        body = _page(seeded_app)
-        # The card is a JS template literal in the shipped page source.
+        # The card is a JS template literal, and that script now lives in a file
+        # the page loads rather than inline — so read the page as the browser
+        # assembles it, not the response alone.
+        body = _ds_page_source.rendered_with_scripts(_page(seeded_app))
         assert "ds-sp-cert-file-" in body
         card_js = body.split("ds-sp-cert-row-", 1)[1]
         assert "spCertFilePicked(" in card_js
