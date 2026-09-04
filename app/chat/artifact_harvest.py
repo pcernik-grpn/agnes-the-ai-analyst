@@ -37,9 +37,15 @@ value.
   the pause/linger countdown).
 - ``app.api.agent_sessions`` — on ``DELETE /api/v1/sessions/{id}``, before
   ``manager.kill()`` tears the sandbox down.
-
-Deliberately NOT hooked into every turn of a live multi-turn session (only
-one-shot completion + explicit teardown) — see the V1b Task 5 design notes.
+- ``app.chat.manager`` — at the end of EVERY interactive chat turn (#2268),
+  as a background task off the ``done`` frame. A chat deliverable used to
+  exist only inside the engine's ephemeral sandbox, so ~30 min after the
+  last turn the idle reaper paused the session, the sandbox went, and the
+  Files panel answered "No files here yet" for a conversation that had just
+  produced a document. Harvesting per turn is what decouples the Files panel
+  from a live sandbox; it is affordable because an already-harvested file
+  costs one directory listing and is never re-read (see the dedupe below),
+  and it is bounded per session by :func:`chat_session_budget`.
 
 **Best-effort, always.** ``object_store()`` returning ``None`` (signed-URL
 distribution not configured), a missing/absent outputs dir, or a single
@@ -50,6 +56,7 @@ than were actually written; it never blocks or crashes the caller.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import mimetypes
@@ -75,6 +82,16 @@ OUTPUTS_SUBDIR = "outputs"
 #: configured values explicitly.
 DEFAULT_ARTIFACT_MAX_BYTES = 25 * 1024 * 1024
 DEFAULT_ARTIFACT_MAX_FILES = 20
+
+#: Caps for an INTERACTIVE chat session (#2268), deliberately its own pair
+#: rather than the agent-API numbers above: a chat is long-lived and harvests
+#: at the end of every turn, where the agent API harvests once at the end of a
+#: one-shot run, so the same 25 MB / 20 files would start refusing a normal
+#: working conversation's deliverables. Plain module constants, not config
+#: knobs — there is no `chat.artifact_*` surface these would obviously join,
+#: and a speculative knob is a maintenance cost with no asked-for use.
+CHAT_ARTIFACT_MAX_BYTES = 100 * 1024 * 1024
+CHAT_ARTIFACT_MAX_FILES = 100
 
 #: Object-store key prefix every harvested artifact is written under —
 #: `agent-artifacts/{session_id}/{safe_filename}`. This is the REAL prefix
@@ -152,6 +169,51 @@ def caps_from_manager(manager: Any) -> dict:
     if max_files is not None:
         kwargs["max_files"] = max_files
     return kwargs
+
+
+def chat_session_budget(session_id: str) -> Optional[tuple[int, int]]:
+    """``(max_bytes, max_files)`` still available to an interactive chat
+    session's harvest, or ``None`` when the session is already at its cap.
+
+    ``harvest_session_artifacts``'s own caps are PER CALL. A chat harvests at
+    the end of every turn, so passing the session cap straight in would let
+    one conversation harvest ``CHAT_ARTIFACT_MAX_FILES`` files per turn,
+    forever. The already-harvested rows are what make the cap a per-SESSION
+    budget: this subtracts them, and the caller passes the remainder.
+
+    Overflow policy (deliberate, #2268): at the cap the harvest STOPS and
+    logs. Nothing already harvested is ever deleted, evicted or rolled — a
+    deliverable the user can see in the Files panel must not disappear
+    because a later turn wrote something else.
+
+    Never raises: a failed budget read degrades to the full caps (the harvest
+    itself then dedupes against whatever it can read) rather than dropping a
+    turn's deliverables on the floor.
+    """
+    try:
+        rows = agent_artifacts_repo().list_for_session(session_id)
+    except Exception:
+        logger.exception(
+            "chat_session_budget: list_for_session failed for session %s — assuming a full budget",
+            session_id,
+        )
+        return (CHAT_ARTIFACT_MAX_BYTES, CHAT_ARTIFACT_MAX_FILES)
+
+    used_bytes = sum(int(row.get("size_bytes") or 0) for row in rows)
+    remaining_bytes = CHAT_ARTIFACT_MAX_BYTES - used_bytes
+    remaining_files = CHAT_ARTIFACT_MAX_FILES - len(rows)
+    if remaining_bytes <= 0 or remaining_files <= 0:
+        logger.warning(
+            "chat artifact harvest: session %s is at its cap (%d/%d files, %d/%d bytes) — "
+            "not harvesting anything further; already-harvested artifacts are kept",
+            session_id,
+            len(rows),
+            CHAT_ARTIFACT_MAX_FILES,
+            used_bytes,
+            CHAT_ARTIFACT_MAX_BYTES,
+        )
+        return None
+    return (remaining_bytes, remaining_files)
 
 
 async def harvest_session_artifacts(
@@ -292,7 +354,11 @@ async def harvest_session_artifacts(
         content_type = mimetypes.guess_type(safe_name)[0] or "application/octet-stream"
 
         try:
-            store.put_bytes(object_key, data, md5)
+            # Off the event loop: this is a network round trip to the object
+            # store, and the turn-end chat harvest (#2268) runs it on the
+            # gateway loop that every live session's frames share — a
+            # multi-megabyte upload inline would stall all of them.
+            await asyncio.to_thread(store.put_bytes, object_key, data, md5)
         except Exception:
             logger.exception(
                 "harvest_session_artifacts: put_bytes failed for %s (session %s) — skipping",

@@ -42435,7 +42435,7 @@
     },
     "/api/chat/sessions/{chat_id}/files": {
       "get": {
-        "description": "List files in this chat session's workspace, newest-first.\n\nWalks the session dir (including the ``.claude``/``snapshots``/\u2026 links\ninto your workspace, where skills write their deliverables), skipping\nmachine noise (``.git``, ``__pycache__``, \u2026) and anything resolving\noutside your own session/workspace. Returns at most 300 entries sorted\nby modification time; ``truncated`` reports when more existed. Sessions\non an engine-sandbox provider (``kai-agent``) never walk the host dir \u2014\nsee the module docstring; they report ``source=\"engine\"``.",
+        "description": "List files in this chat session's workspace, newest-first.\n\nAnswers from two sources, harvested first (#2268): every file this\nsession's turns wrote to ``outputs/`` was copied out of the sandbox as it\nwas produced, so it is listed whether or not the sandbox still exists.\nThe live sandbox is merged on top \u2014 it wins for a file it still holds\n(fresher bytes, real mtime) and contributes everything outside\n``outputs/``, which is never harvested.\n\nThe live half walks the session dir (including the\n``.claude``/``snapshots``/\u2026 links into your workspace, where skills write\ntheir deliverables), skipping machine noise (``.git``, ``__pycache__``,\n\u2026) and anything resolving outside your own session/workspace. Returns at\nmost 300 entries, deliverables first; ``truncated`` reports when more\nexisted. Sessions on an engine-sandbox provider (``kai-agent``) never\nwalk the host dir \u2014 see the module docstring; they report\n``source=\"engine\"``.",
         "operationId": "list_session_files_api_chat_sessions__chat_id__files_get",
         "parameters": [
           {
@@ -42500,7 +42500,7 @@
     },
     "/api/chat/sessions/{chat_id}/files/download": {
       "get": {
-        "description": "Download one file from this chat session's workspace.\n\nAlways served as an attachment with ``nosniff``; HTML/SVG/XML bodies are\nadditionally pinned to ``application/octet-stream`` so a generated file\ncan never render as same-origin active content. 404 for a missing path\nand for anything resolving outside your session dir / workspace alike.",
+        "description": "Download one file from this chat session's workspace.\n\nServed from the live sandbox when it still has the file, and from the\nharvested copy otherwise (#2268) \u2014 a deliverable stays downloadable long\nafter the sandbox that produced it is gone. Always an attachment with\n``nosniff`` either way; HTML/SVG/XML bodies are additionally pinned to\n``application/octet-stream`` so a generated file can never render as\nsame-origin active content. 404 for a missing path and for anything\nresolving outside your session dir / workspace alike.",
         "operationId": "download_session_file_api_chat_sessions__chat_id__files_download_get",
         "parameters": [
           {
