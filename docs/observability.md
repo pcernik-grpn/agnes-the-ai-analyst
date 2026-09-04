@@ -335,8 +335,10 @@ is what the host-side operator scripts (`agnes-watchdog.sh`,
 ### Shipping the logs somewhere
 
 Nothing in Agnes decides this — it writes to stdout and stops. On the
-GCE-hosted deployments the Terraform module wires it up; see
-[`gcp-logging.md`](gcp-logging.md).
+GCE-hosted deployments the Terraform module wires it up, to one of two
+destinations (a VM has exactly one, because Docker allows one log driver per
+container): Google Cloud Logging, see [`gcp-logging.md`](gcp-logging.md), or
+Datadog, see [`datadog-logging.md`](datadog-logging.md).
 
 ### Verifying the wiring
 

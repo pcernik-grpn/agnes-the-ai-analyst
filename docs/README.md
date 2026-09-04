@@ -52,6 +52,8 @@ Deploying, configuring, and running an Agnes instance.
 - [`initial-workspace-override.md`](initial-workspace-override.md) — per-instance analyst-workspace skeleton override
 - [`curated-marketplace-format.md`](curated-marketplace-format.md) — authoring `marketplace-metadata.json` for curated marketplaces
 - [`observability.md`](observability.md) — structured logs, metrics, and what each carries
+- [`gcp-logging.md`](gcp-logging.md) — shipping container logs to Google Cloud Logging (fluentd driver + Ops Agent)
+- [`datadog-logging.md`](datadog-logging.md) — shipping container logs to Datadog instead (json-file driver + host agent)
 - [`load-testing.md`](load-testing.md) — measuring a live instance under concurrent load: throwaway identities, a journey driven over the web-chat WebSocket, and the server-side capture the dashboards cannot see
 - [`operator/news-content-guide.md`](operator/news-content-guide.md) — editorial guidelines for in-app news content
 - [Cloud-hosted Claude Code](cloud-chat.md) — zero-install web + Slack

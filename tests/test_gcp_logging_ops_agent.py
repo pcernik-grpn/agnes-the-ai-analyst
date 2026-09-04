@@ -126,7 +126,7 @@ def test_the_agent_ships_no_host_metrics_because_datadog_collects_those():
 def test_the_agent_is_installed_only_when_the_feature_is_on():
     tpl = STARTUP.read_text()
     assert "ops-agent" in tpl or "ops_agent" in tpl, "nothing installs the collector"
-    assert "enable_gcp_logging" in tpl
+    assert "cloud_logging_logs_active" in tpl
 
 
 def test_installing_the_agent_can_never_fail_the_boot():
