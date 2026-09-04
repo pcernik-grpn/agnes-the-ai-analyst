@@ -144,7 +144,10 @@ The Postgres side-car check needs a monitoring role inside each container. A
 root-owned timer (`agnes-datadog-pg-role.timer`, every 15 min) creates a
 `datadog` role with `pg_monitor`, renders the check config with its password,
 and re-converges after a side-car volume is recreated. Verify a VM with
-`sudo datadog-agent status`.
+`sudo datadog-agent status`. The check attributes its series to the side-car's
+container IP rather than the VM host, so the module renders `env:` and the
+VM's tag list into the check's instance tags — scope Postgres monitors by
+`env` and `compose_service`, never by `host`.
 
 ## 2. Docker Compose — OSS self-host
 
