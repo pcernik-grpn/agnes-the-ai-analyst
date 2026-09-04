@@ -14,6 +14,7 @@ import os
 import re
 import threading
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, NamedTuple, Optional
 
@@ -6070,6 +6071,215 @@ def register_table_precheck(
     }
 
 
+# Which query engine a registry ``source_type`` speaks — the namespace every
+# canonical physical identifier below is scoped by, so two engines that
+# coincidentally reuse a schema/bucket label never collide.
+_TWIN_ENGINE_BY_SOURCE_TYPE = {
+    "bigquery": "bq",
+    "databricks": "dbx",
+    "keboola": "kbc",
+    "snowflake": "sf",
+}
+
+# The sqlglot dialect a materialized row's ``source_query`` is written in, per
+# engine. Keboola is deliberately absent: its ``source_query`` is a JSON filter
+# spec layered on bucket/source_table, not SQL, and the row's own
+# bucket/source_table already give the identifier.
+_TWIN_SQL_DIALECT_BY_ENGINE = {
+    "bq": "bigquery",
+    "dbx": "databricks",
+    "sf": "snowflake",
+}
+
+# The DuckDB alias the Snowflake extractor ATTACHes the account under, which is
+# what a generated Snowflake ``source_query`` names instead of the database.
+_SF_ATTACH_ALIAS = "sf"
+
+
+@lru_cache(maxsize=512)
+def _parse_sql_table_refs(sql: str, dialect: str) -> Optional[tuple]:
+    """Every PHYSICAL table ``sql`` reads, as ``(catalog, db, name)`` triples
+    lowercased — or ``None`` when ``sql`` does not parse as ``dialect``.
+
+    Parsing, never substring matching: the whole point of this signal is that
+    an alias, a comment, a column list, a backtick or a project qualifier must
+    not change the answer. CTE names are dropped (``WITH s AS (…) SELECT * FROM
+    s`` reads whatever the CTE body reads, not a table called ``s``), and so is
+    any reference the dialect resolves to something other than ``exp.Table``.
+
+    ``None`` (unparseable) is a distinct, load-bearing answer, not an error to
+    swallow — see the ``phys_unknown`` signal in
+    ``_policy_physical_source_signal_provenance``.
+
+    Cached because the twin scan re-derives signals for every registry row on
+    every registry write, and the same handful of statements repeat.
+    """
+    import sqlglot
+    from sqlglot import exp
+
+    try:
+        statements = sqlglot.parse(sql, read=dialect)
+    except Exception:
+        return None
+    refs: list = []
+    for statement in statements:
+        if statement is None:
+            continue
+        cte_names = {(cte.alias_or_name or "").lower() for cte in statement.find_all(exp.CTE)}
+        for table in statement.find_all(exp.Table):
+            name = (table.name or "").strip().lower()
+            if not name:
+                continue
+            db = (table.text("db") or "").strip().lower()
+            catalog = (table.text("catalog") or "").strip().lower()
+            if not db and not catalog and name in cte_names:
+                continue
+            refs.append((catalog, db, name))
+    return tuple(dict.fromkeys(refs))
+
+
+def _canonical_physical_identifiers(row: Dict[str, Any]) -> tuple:
+    """``({identifier: provenance}, unknown_signal_or_None)`` for ``row``.
+
+    An identifier is ``(engine, connection_id, namespace, container, table)``,
+    all lowercased — the CANONICAL name of a physical table, derived from
+    whichever representation the row happens to use:
+
+    * BigQuery — ``bq_fqn`` gives ``(project, dataset, table)`` directly;
+      ``bucket``+``source_table`` gives ``(<configured project>, bucket,
+      source_table)``. That is what makes the two representations of ONE table
+      intersect (they were disjoint signals before). When the project cannot be
+      resolved at all (no ``data_source.bigquery.project``) the namespace stays
+      blank, which matches ANY project for this check — a deliberately weaker,
+      fail-closed match.
+    * Databricks — ``split_bucket`` resolves ``bucket`` to ``(catalog,
+      schema)`` exactly as the extractor does, so ``sales`` (schema in the
+      configured default catalog) and ``main.sales`` are one identifier.
+    * Snowflake — ``split_bucket`` against the configured database.
+    * Keboola — ``("", bucket, source_table)``; the connection is the only
+      namespace Keboola has, and it is already the identifier's own component.
+
+    For a ``query_mode='materialized'`` row the SAME identifiers are ALSO
+    derived from every table its ``source_query`` reads, parsed in the engine's
+    dialect. That is the difference between "these two rows spell the same
+    pointer" and "this row's SQL reads that row's table" — the second is how a
+    materialization writes a policied table's unfiltered rows to a parquet
+    ``agnes pull`` distributes.
+
+    The second element is the ``("phys_unknown", engine, connection_id)``
+    signal, emitted when a materialized ``source_query`` did not parse AND the
+    row carries no policy of its own. Unknown means "could read anything", so
+    it collides with every identifier of the same engine — fail closed. It is
+    emitted only for the UNPOLICIED side on purpose: a policied row's own reads
+    go through its policy, and emitting it there would turn one unparseable
+    policied row into a blanket refusal of every later registration on that
+    engine.
+    """
+    from app.instance_config import get_value
+
+    source_type = (row.get("source_type") or "").strip().lower()
+    engine = _TWIN_ENGINE_BY_SOURCE_TYPE.get(source_type)
+    if not engine:
+        return {}, None
+    connection_id = (row.get("connection_id") or "").strip().lower()
+    identifiers: Dict[tuple, str] = {}
+
+    def _add(namespace: str, container: str, table: str, provenance: str) -> None:
+        table_l = (table or "").strip().lower()
+        if not table_l:
+            return
+        identifiers.setdefault(
+            (
+                engine,
+                connection_id,
+                (namespace or "").strip().lower(),
+                (container or "").strip().lower(),
+                table_l,
+            ),
+            provenance,
+        )
+
+    bucket = (row.get("bucket") or "").strip()
+    source_table = (row.get("source_table") or "").strip()
+    default_namespace = ""
+
+    if engine == "bq":
+        default_namespace = (get_value("data_source", "bigquery", "project", default="") or "").strip()
+        bq_fqn = (row.get("bq_fqn") or "").strip()
+        if bq_fqn:
+            parts = bq_fqn.split(".")
+            if len(parts) == 3 and all(part.strip() for part in parts):
+                _add(parts[0], parts[1], parts[2], "bq_fqn")
+        if bucket and source_table:
+            _add(default_namespace, bucket, source_table, "bucket/source_table")
+    elif engine == "dbx":
+        from connectors.databricks.extractor import split_bucket as _dbx_split_bucket
+
+        default_namespace = (get_value("data_source", "databricks", "catalog", default="") or "").strip()
+        if bucket and source_table:
+            catalog, schema = _dbx_split_bucket(bucket, default_namespace)
+            _add(catalog, schema, source_table, "bucket/source_table")
+    elif engine == "sf":
+        from connectors.snowflake.extractor import split_bucket as _sf_split_bucket
+
+        default_namespace = (get_value("data_source", "snowflake", "database", default="") or "").strip()
+        if bucket and source_table:
+            try:
+                database, schema = _sf_split_bucket(bucket, default_namespace)
+            except ValueError:
+                # An unsafe/unresolvable bucket never reaches the registry
+                # through the validator; if one is already there, fall back to
+                # the raw bucket as the container with a blank (wildcard)
+                # database rather than dropping the row's identifier entirely.
+                database, schema = "", bucket
+            _add(database, schema, source_table, "bucket/source_table")
+    else:  # kbc
+        if bucket and source_table:
+            _add("", bucket, source_table, "bucket/source_table")
+
+    unknown = None
+    dialect = _TWIN_SQL_DIALECT_BY_ENGINE.get(engine)
+    source_query = (row.get("source_query") or "").strip()
+    is_materialized = (str(row.get("query_mode") or "").strip().lower()) == "materialized"
+    if dialect and source_query and is_materialized:
+        # Parsed RAW, never whitespace-collapsed: a leading `-- comment` line
+        # swallows the whole statement once its newline is gone, which is the
+        # opposite of what this signal is for.
+        refs = _parse_sql_table_refs(source_query, dialect)
+        if refs is None:
+            if not row.get("access_policy_sql"):
+                unknown = ("phys_unknown", engine, connection_id)
+        else:
+            for catalog, db, name in refs:
+                namespace = catalog
+                if engine == "sf" and (not namespace or namespace == _SF_ATTACH_ALIAS):
+                    namespace = default_namespace
+                elif not namespace:
+                    namespace = default_namespace
+                _add(namespace, db, name, "source_query")
+    return identifiers, unknown
+
+
+def _policy_physical_source_signal_provenance(row: Dict[str, Any]) -> Dict[tuple, str]:
+    """``_policy_physical_source_signals`` plus, per signal, the field it came
+    from — the one extra fact the rejection message needs to name WHY two rows
+    were judged the same physical source ("bq_fqn", "bucket/source_table",
+    "source_query", "unparseable source_query")."""
+    signals: Dict[tuple, str] = {}
+    for signal in _policy_physical_source_signals_legacy(row):
+        signals[signal] = {
+            "bq_fqn": "bq_fqn",
+            "bucket_table": "bucket/source_table",
+            "source_query": "source_query",
+        }.get(signal[0], "registry fields")
+    identifiers, unknown = _canonical_physical_identifiers(row)
+    for identifier, provenance in identifiers.items():
+        signals.setdefault(("phys",) + identifier, provenance)
+    if unknown is not None:
+        signals[unknown] = "unparseable source_query"
+    return signals
+
+
 def _policy_physical_source_signals(row: Dict[str, Any]) -> set:
     """Every physical-source signal ``row`` (a ``table_registry`` record)
     carries — the ways a DIFFERENT registry row could resolve to the exact
@@ -6078,9 +6288,27 @@ def _policy_physical_source_signals(row: Dict[str, Any]) -> set:
     (e.g. a BigQuery row with both ``bq_fqn`` and ``bucket``/``source_table``
     set); two rows collide when their signal sets intersect at all — through
     ``_physical_signals_conflict`` below, never a bare ``&``, because the
-    ``bucket_table`` signal's ``connection_id`` component needs wildcard
-    matching that a plain set intersection can't express (see there).
+    ``bucket_table`` and ``phys`` signals have wildcard components that a
+    plain set intersection can't express (see there).
+
+    Four signal kinds. The first three are REPRESENTATIONS — the literal
+    strings a row spells its pointer with — and are kept because they still
+    catch exactly what they always caught. The fourth, ``phys``, is the
+    CANONICAL physical identifier the row resolves to
+    (``_canonical_physical_identifiers``), which is what makes two rows naming
+    one table in two different representations — a ``bq_fqn`` beside a
+    ``bucket``+``source_table``, a Databricks ``sales`` beside ``main.sales``,
+    a materialized ``SELECT`` beside the table it reads — intersect at all.
     """
+    return set(_policy_physical_source_signal_provenance(row))
+
+
+def _policy_physical_source_signals_legacy(row: Dict[str, Any]) -> set:
+    """The three representation signals (``bq_fqn``, ``bucket_table``,
+    verbatim ``source_query``) this check shipped with. Still emitted: they
+    cost nothing and cover shapes the canonical identifier deliberately does
+    not model (an unrecognized ``source_type``, two rows with byte-identical
+    custom SQL that no dialect parses)."""
     signals: set = set()
     bq_fqn = (row.get("bq_fqn") or "").strip().lower()
     if bq_fqn:
@@ -6138,26 +6366,126 @@ def _bucket_table_signals_conflict(a: tuple, b: tuple) -> bool:
     return a_conn == b_conn or not a_conn or not b_conn
 
 
-def _physical_signals_conflict(signals_a: set, signals_b: set) -> bool:
-    """Whether two physical-source signal sets (``_policy_physical_source_
-    signals``) resolve to the same underlying data. Exact-match for
-    ``bq_fqn``/``source_query`` signals; ``bucket_table`` signals go
-    through ``_bucket_table_signals_conflict``'s wildcard ``connection_id``
-    rule. Every twin-check call site MUST go through this — a bare ``&``
-    only catches the exact-pin and both-unpinned cases, missing the
-    pinned/unpinned mix a live instance actually hit.
+def _wildcard_component_match(a: str, b: str) -> bool:
+    """Two components of a canonical identifier match when they are equal or
+    either is blank. Blank means "not resolvable from this row" (an
+    unconfigured BigQuery project, a Databricks bucket with no default
+    catalog, an unpinned connection), and an unresolved component must not be
+    what lets a twin through — the same wildcard rule
+    ``_bucket_table_signals_conflict`` already applies to ``connection_id``."""
+    return a == b or not a or not b
+
+
+def _phys_signals_conflict(a: tuple, b: tuple) -> bool:
+    """Whether two canonical-identifier signals (``phys`` /
+    ``phys_unknown``) name the same physical table.
+
+    ``phys`` ↔ ``phys``: same engine and table name, with namespace
+    (project / catalog / database), container (dataset / schema / bucket) and
+    ``connection_id`` each matched through ``_wildcard_component_match``.
+
+    ``phys_unknown`` ↔ anything of the same engine: an unparseable
+    materialized ``source_query`` could read any table on that engine, so it
+    collides with all of them. Fail closed — the admin's escapes (clear the
+    policy, make the row ``server_only`` with a policy of its own, or spell
+    the SQL so it parses) are named in the rejection.
+    """
+    if a[0] == "phys_unknown" or b[0] == "phys_unknown":
+        unknown, other = (a, b) if a[0] == "phys_unknown" else (b, a)
+        if other[0] not in ("phys", "phys_unknown"):
+            return False
+        return unknown[1] == other[1] and _wildcard_component_match(unknown[2], other[2])
+    _, a_engine, a_conn, a_ns, a_container, a_table = a
+    _, b_engine, b_conn, b_ns, b_container, b_table = b
+    if a_engine != b_engine or a_table != b_table:
+        return False
+    return (
+        _wildcard_component_match(a_container, b_container)
+        and _wildcard_component_match(a_ns, b_ns)
+        and _wildcard_component_match(a_conn, b_conn)
+    )
+
+
+def _physical_signal_match(signals_a, signals_b) -> Optional[tuple]:
+    """The first ``(signal_a, signal_b)`` pair from the two sets that resolves
+    to the same underlying data, or ``None``. Exact-match for
+    ``bq_fqn``/``source_query`` signals; ``bucket_table`` signals go through
+    ``_bucket_table_signals_conflict``'s wildcard ``connection_id`` rule;
+    ``phys``/``phys_unknown`` through ``_phys_signals_conflict``. Every
+    twin-check call site MUST go through this — a bare ``&`` only catches the
+    exact-pin and both-unpinned cases, missing the pinned/unpinned mix a live
+    instance actually hit, and misses every cross-representation match
+    outright.
+
+    Returning the matching PAIR rather than a bool is what lets the rejection
+    name the physical table (or the parse failure) that matched, instead of
+    telling the admin only that "something" did.
     """
     for sig_a in signals_a:
         for sig_b in signals_b:
             if sig_a == sig_b:
-                return True
+                return (sig_a, sig_b)
             if (
                 sig_a[0] == "bucket_table"
                 and sig_b[0] == "bucket_table"
                 and _bucket_table_signals_conflict(sig_a, sig_b)
             ):
-                return True
-    return False
+                return (sig_a, sig_b)
+            if sig_a[0] in ("phys", "phys_unknown") and sig_b[0] in ("phys", "phys_unknown"):
+                if _phys_signals_conflict(sig_a, sig_b):
+                    return (sig_a, sig_b)
+    return None
+
+
+def _physical_signals_conflict(signals_a: set, signals_b: set) -> bool:
+    """Whether two physical-source signal sets (``_policy_physical_source_
+    signals``) resolve to the same underlying data — the boolean face of
+    ``_physical_signal_match``."""
+    return _physical_signal_match(signals_a, signals_b) is not None
+
+
+def _format_physical_signal(signal: tuple) -> str:
+    """One matched signal, as an admin-readable pointer for the rejection."""
+    kind = signal[0]
+    if kind == "phys":
+        _, engine, _conn, namespace, container, table = signal
+        path = ".".join(part for part in (namespace, container, table) if part)
+        return f"{engine}:{path}"
+    if kind == "phys_unknown":
+        return f"a materialized source_query that could not be parsed as {signal[1]} SQL"
+    if kind == "bq_fqn":
+        return f"bq_fqn {signal[1]}"
+    if kind == "bucket_table":
+        return f"{signal[1]}:{signal[3]}.{signal[4]}"
+    if kind == "source_query":
+        return "an identical source_query"
+    return str(signal)
+
+
+def _describe_physical_match(
+    match: tuple,
+    mine: Dict[tuple, str],
+    theirs: Dict[tuple, str],
+    *,
+    other_id: Any,
+) -> str:
+    """Why these two rows were judged the same physical source — the matched
+    pointer plus, on each side, the field it came from."""
+    sig_mine, sig_theirs = match
+    if sig_mine[0] == "phys_unknown" or sig_theirs[0] == "phys_unknown":
+        unparsed_is_mine = sig_mine[0] == "phys_unknown"
+        which = "this row" if unparsed_is_mine else f"table {other_id!r}"
+        engine = sig_mine[1] if unparsed_is_mine else sig_theirs[1]
+        return (
+            f"matched because {which} carries a materialized source_query that "
+            f"could not be parsed as {engine} SQL, so Agnes cannot prove it does "
+            "not read the other row's physical source (this check fails closed)"
+        )
+    return (
+        f"matched on physical source {_format_physical_signal(sig_mine)} "
+        f"(this row: {mine.get(sig_mine, 'registry fields')}; "
+        f"table {other_id!r}: {theirs.get(sig_theirs, 'registry fields')})"
+    )
 
 
 def _is_distributable_registry_row(row: Dict[str, Any]) -> bool:
@@ -6173,34 +6501,41 @@ def _is_distributable_registry_row(row: Dict[str, Any]) -> bool:
 
 
 def _find_policied_physical_source_twin(
-    my_signals: set,
+    my_signals: Dict[tuple, str],
     *,
     exclude_id: Optional[str],
-) -> Optional[Dict[str, Any]]:
-    """The first existing registry row that carries ``access_policy_sql``
-    and whose physical-source signals intersect ``my_signals`` — i.e. the
-    policied table a row with these signals would be a distributable twin
-    of. ``None`` when there is no such row.
+) -> tuple:
+    """``(row, note)`` for the first existing registry row that carries
+    ``access_policy_sql`` and whose physical-source signals intersect
+    ``my_signals`` — i.e. the policied table a row with these signals would be
+    a twin of. ``(None, None)`` when there is no such row.
+
+    ``my_signals`` is the signal→provenance mapping from
+    ``_policy_physical_source_signal_provenance``; ``note`` is the
+    human-readable reason the two were judged the same source, which the
+    caller splices into the rejection.
     """
     if not my_signals:
-        return None
+        return None, None
     for other in table_registry_repo().list_all():
         if other.get("id") == exclude_id or not other.get("access_policy_sql"):
             continue
-        if _physical_signals_conflict(my_signals, _policy_physical_source_signals(other)):
-            return other
-    return None
+        theirs = _policy_physical_source_signal_provenance(other)
+        match = _physical_signal_match(my_signals, theirs)
+        if match is not None:
+            return other, _describe_physical_match(match, my_signals, theirs, other_id=other.get("id"))
+    return None, None
 
 
 def _find_unpolicied_physical_source_twin(
-    my_signals: set,
+    my_signals: Dict[tuple, str],
     *,
     exclude_id: Optional[str],
-) -> Optional[Dict[str, Any]]:
-    """The first existing registry row that carries NO policy and whose
-    physical-source signals intersect ``my_signals`` — the row a caller
-    granted it reads the raw data through, no matter what policy protects
-    the other name.
+) -> tuple:
+    """``(row, note)`` for the first existing registry row that carries NO
+    policy and whose physical-source signals intersect ``my_signals`` — the
+    row a caller granted it reads the raw data through, no matter what policy
+    protects the other name. ``(None, None)`` when there is no such row.
 
     Supersedes the distributable-only scan this file shipped first. That
     one keyed on ``agnes pull``: a twin that never leaves the server was
@@ -6215,13 +6550,15 @@ def _find_unpolicied_physical_source_twin(
     wants where is their call.
     """
     if not my_signals:
-        return None
+        return None, None
     for other in table_registry_repo().list_all():
         if other.get("id") == exclude_id or other.get("access_policy_sql"):
             continue
-        if _physical_signals_conflict(my_signals, _policy_physical_source_signals(other)):
-            return other
-    return None
+        theirs = _policy_physical_source_signal_provenance(other)
+        match = _physical_signal_match(my_signals, theirs)
+        if match is not None:
+            return other, _describe_physical_match(match, my_signals, theirs, other_id=other.get("id"))
+    return None, None
 
 
 def _check_access_policy_physical_source_conflict(
@@ -6289,7 +6626,7 @@ def _check_access_policy_physical_source_conflict(
     """
     if has_access_policy:
         return
-    my_signals = _policy_physical_source_signals(
+    my_signals = _policy_physical_source_signal_provenance(
         {
             "source_type": source_type,
             "connection_id": connection_id,
@@ -6297,9 +6634,10 @@ def _check_access_policy_physical_source_conflict(
             "source_table": source_table,
             "bq_fqn": bq_fqn,
             "source_query": source_query,
+            "query_mode": query_mode,
         }
     )
-    other = _find_policied_physical_source_twin(my_signals, exclude_id=exclude_id)
+    other, note = _find_policied_physical_source_twin(my_signals, exclude_id=exclude_id)
     if other is not None:
         if clearing_policy:
             raise HTTPException(
@@ -6310,10 +6648,10 @@ def _check_access_policy_physical_source_conflict(
                     "over the same physical source as table "
                     f"{other.get('id')!r} ({other.get('name')!r}), which still "
                     "carries one -- and an unpolicied name returns the "
-                    "unfiltered rows to anyone granted it. Point this row at a "
-                    "different physical source first (its policy travels with "
-                    "it, so the clear then succeeds), or unregister one of the "
-                    "two rows"
+                    f"unfiltered rows to anyone granted it ({note}). Point this "
+                    "row at a different physical source first (its policy "
+                    "travels with it, so the clear then succeeds), or "
+                    "unregister one of the two rows"
                 ),
             )
         raise HTTPException(
@@ -6322,7 +6660,7 @@ def _check_access_policy_physical_source_conflict(
                 "access_policy_physical_source_conflict: this table's "
                 f"physical source matches table {other.get('id')!r} "
                 f"({other.get('name')!r}), which has an access policy "
-                "attached -- a second, unpolicied name over the same "
+                f"attached ({note}) -- a second, unpolicied name over the same "
                 "source returns the unfiltered rows to anyone granted it, "
                 "so attach a policy to this row too, point it at a "
                 "different physical source, unregister one of the two rows, "
@@ -6370,8 +6708,8 @@ def _check_policied_row_has_no_unpolicied_twin(merged: Dict[str, Any], *, table_
     """
     if not merged.get("access_policy_sql"):
         return
-    my_signals = _policy_physical_source_signals(merged)
-    other = _find_unpolicied_physical_source_twin(my_signals, exclude_id=table_id)
+    my_signals = _policy_physical_source_signal_provenance(merged)
+    other, note = _find_unpolicied_physical_source_twin(my_signals, exclude_id=table_id)
     if other is not None:
         distributable = _is_distributable_registry_row(other)
         reach = (
@@ -6388,7 +6726,8 @@ def _check_policied_row_has_no_unpolicied_twin(merged: Dict[str, Any], *, table_
                 f"{other.get('id')!r} ({other.get('name')!r}) points at this "
                 "table's physical source and carries no policy of its own "
                 f"(query_mode={str(other.get('query_mode') or 'local')!r}, "
-                f"server_only={bool(other.get('server_only'))}), so {reach} "
+                f"server_only={bool(other.get('server_only'))}; {note}), so "
+                f"{reach} "
                 "-- attach a policy to that row, unregister it, or point it "
                 "at a different physical source, then attach this policy. "
                 "If this is genuinely a different source connection reusing "
@@ -9063,8 +9402,17 @@ def _build_keboola_discovery_plan(
     # lookup still catches a policied row that pins one, matching the
     # register/update interlocks' wildcard semantics rather than requiring
     # an exact, unreachable `connection_id` match.
+    #
+    # `policied_by_physical` is the same idea over the CANONICAL identifier
+    # (`_canonical_physical_identifiers`), keyed on (engine, container, table)
+    # with the connection and namespace components dropped for the same
+    # wildcard reason. For Keboola the two indexes agree by construction, but
+    # keying discovery on the canonical identifier is what keeps this plan and
+    # the register/update interlocks from drifting apart as new
+    # representations are added.
     policied_by_signal: dict = {}
     policied_by_bucket_table: dict = {}
+    policied_by_physical: dict = {}
     for row in registry_rows:
         if not row.get("access_policy_sql"):
             continue
@@ -9073,6 +9421,9 @@ def _build_keboola_discovery_plan(
             if signal[0] == "bucket_table":
                 _, sig_type, _sig_conn, sig_bucket, sig_table = signal
                 policied_by_bucket_table.setdefault((sig_type, sig_bucket, sig_table), row)
+            elif signal[0] == "phys":
+                _, sig_engine, _sig_conn, _sig_ns, sig_container, sig_table = signal
+                policied_by_physical.setdefault((sig_engine, sig_container, sig_table), row)
 
     plan = {"new": [], "existing_match": [], "existing_drift": [], "invalid": []}
     for table in discovered:
@@ -9174,6 +9525,20 @@ def _build_keboola_discovery_plan(
                     policied_by_bucket_table[(s[1], s[3], s[4])]
                     for s in my_signals
                     if s[0] == "bucket_table" and (s[1], s[3], s[4]) in policied_by_bucket_table
+                ),
+                None,
+            )
+        if policied_twin is None:
+            # Canonical-identifier direction — the index the register/update
+            # interlocks resolve a twin through, so a policied row that spells
+            # its pointer differently (today: nothing extra for Keboola;
+            # tomorrow: whatever representation is added next) is caught here
+            # too rather than only on the hand-registration path.
+            policied_twin = next(
+                (
+                    policied_by_physical[(s[1], s[4], s[5])]
+                    for s in my_signals
+                    if s[0] == "phys" and (s[1], s[4], s[5]) in policied_by_physical
                 ),
                 None,
             )

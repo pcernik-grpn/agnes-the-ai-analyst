@@ -2803,10 +2803,12 @@ def _policied_row_over_physical_source(
     already resolve a path with. A BigQuery row registered with ONLY
     ``bq_fqn`` and no bucket/source_table is invisible here — but also to
     ``find_by_bq_path``, so such a path is refused one step earlier as
-    unregistered. The uncovered shape is a policied ``bq_fqn``-only row
-    beside an unpolicied bucket/source_table row for the same table; that
-    pair already escapes ``_policy_physical_source_signals`` (the two
-    signals never intersect), so closing it belongs there, not here.
+    unregistered. The shape this cannot see — a policied ``bq_fqn``-only row
+    beside an unpolicied bucket/source_table row for the same table — is now
+    refused where it is created rather than where it is read: the twin check
+    resolves both rows to one canonical physical identifier (issue #2147,
+    ``admin._canonical_physical_identifiers``), so the pair can no longer be
+    registered.
     """
     bucket_l = (bucket or "").lower()
     table_l = (source_table or "").lower()

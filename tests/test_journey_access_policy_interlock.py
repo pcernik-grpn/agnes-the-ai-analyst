@@ -927,3 +927,587 @@ class TestClearAndDistributeInOnePut:
         assert row["access_policy_note"] is None
         assert row["access_policy_updated_by"] is None
         assert bool(row["server_only"]) is True
+
+
+# ---------------------------------------------------------------------------
+# Issue #2147, backlog item 4 — the canonical physical-identifier signal.
+#
+# The first three twin signals (`bq_fqn`, `(source_type, connection_id,
+# bucket, source_table)`, verbatim `source_query`) are all *representations*
+# of a physical table, and two rows naming ONE table in two different
+# representations produced disjoint signal sets: a materialized row whose SQL
+# reads the policied table, a `bq_fqn` row beside a `bucket`+`source_table`
+# row, a Databricks `sales` bucket beside `main.sales`. Each of those was
+# accepted at registration, and for a materialized row the next sync tick
+# writes the unfiltered rows to a parquet `agnes pull` distributes.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def dbx_instance(monkeypatch):
+    """An instance whose Databricks default catalog is ``main`` — what makes
+    the bucket ``sales`` and the bucket ``main.sales`` the same table."""
+    fake_cfg = {
+        "data_source": {
+            "type": "local",
+            "databricks": {"catalog": "main", "workspace_host": "https://example.cloud.databricks.com"},
+        },
+    }
+    monkeypatch.setattr(
+        "app.instance_config.load_instance_config",
+        lambda: fake_cfg,
+        raising=False,
+    )
+    from app.instance_config import reset_cache
+
+    reset_cache()
+    yield fake_cfg
+    reset_cache()
+
+
+def _register_bq(c, token, **payload):
+    payload.setdefault("source_type", "bigquery")
+    return c.post("/api/admin/register-table", json=payload, headers=_auth(token))
+
+
+def _bq_policied_remote_row(c, token, *, name, dataset, table):
+    """A policied BigQuery row over ``dataset.table``, registered the ordinary
+    way (a live BQ registration is coerced to ``query_mode='remote'``, which
+    satisfies §3.1 on its own) and given a policy."""
+    resp = _register_bq(c, token, name=name, bucket=dataset, source_table=table)
+    assert resp.status_code in (200, 201, 202), resp.text
+    table_id = resp.json()["id"]
+    attach = c.put(
+        f"/api/admin/registry/{table_id}",
+        json={"access_policy_sql": _policy_sql(name), "access_policy_note": "pii masking"},
+        headers=_auth(token),
+    )
+    assert attach.status_code == 200, attach.text
+    return table_id
+
+
+@pytest.mark.journey
+class TestMaterializedSqlOverAPoliciedSource:
+    """Gap 1 — a ``query_mode='materialized'`` row whose ``source_query``
+    READS the policied table's physical source. Its only pre-fix signal was
+    the verbatim SQL text, which by construction never intersects the
+    policied row's ``bq_fqn`` / ``bucket_table`` signals."""
+
+    @pytest.mark.parametrize(
+        "sql",
+        [
+            "SELECT * FROM `my-test-project.analytics.sales`",
+            "SELECT * FROM my-test-project.analytics.sales",
+            "SELECT * FROM `my-test-project`.`analytics`.`sales`",
+            "SELECT * FROM analytics.sales",
+            "SELECT * FROM `analytics.sales`",
+            "-- nightly dump\nSELECT s.id, s.amount\nFROM `analytics.sales` AS s\nWHERE s.amount > 0",
+        ],
+    )
+    def test_materialized_row_reading_the_policied_table_is_rejected_at_register(
+        self, seeded_app, monkeypatch, bq_instance, stub_bq_extractor, sql
+    ):
+        monkeypatch.setenv("AGNES_ACCESS_POLICIES_ENABLED", "1")
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        policied_id = _bq_policied_remote_row(c, token, name="sqltwin_src", dataset="analytics", table="sales")
+
+        resp = _register_bq(
+            c,
+            token,
+            name="sqltwin_mat",
+            query_mode="materialized",
+            source_query=sql,
+        )
+        assert resp.status_code == 422, resp.text
+        assert "access_policy_physical_source_conflict" in resp.text
+        assert policied_id in resp.text
+        # The note names the physical table reference that matched.
+        assert "analytics.sales" in resp.text
+
+        from src.repositories import table_registry_repo
+
+        assert table_registry_repo().get("sqltwin_mat") is None
+
+    def test_put_moving_a_materialized_row_onto_the_policied_table_is_rejected(
+        self, seeded_app, monkeypatch, bq_instance, stub_bq_extractor
+    ):
+        """The update direction: a row registered over a harmless table is
+        repointed at the policied one by a later PUT."""
+        monkeypatch.setenv("AGNES_ACCESS_POLICIES_ENABLED", "1")
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        policied_id = _bq_policied_remote_row(c, token, name="sqlput_src", dataset="analytics", table="sales")
+
+        created = _register_bq(
+            c,
+            token,
+            name="sqlput_mat",
+            query_mode="materialized",
+            source_query="SELECT * FROM `my-test-project.analytics.harmless`",
+        )
+        assert created.status_code in (200, 201, 202), created.text
+
+        resp = c.put(
+            "/api/admin/registry/sqlput_mat",
+            json={
+                "query_mode": "materialized",
+                "source_query": "SELECT * FROM `my-test-project.analytics.sales`",
+            },
+            headers=_auth(token),
+        )
+        assert resp.status_code == 422, resp.text
+        assert "access_policy_physical_source_conflict" in resp.text
+        assert policied_id in resp.text
+
+        from src.repositories import table_registry_repo
+
+        assert "harmless" in table_registry_repo().get("sqlput_mat")["source_query"]
+
+    def test_attaching_a_policy_while_a_materialized_reader_exists_is_rejected(
+        self, seeded_app, monkeypatch, bq_instance, stub_bq_extractor
+    ):
+        """The ATTACH direction — the materialized reader was registered
+        FIRST, so nothing ever PUTs it again and only the mirror scan can
+        catch it."""
+        monkeypatch.setenv("AGNES_ACCESS_POLICIES_ENABLED", "1")
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+
+        reader = _register_bq(
+            c,
+            token,
+            name="sqlattach_mat",
+            query_mode="materialized",
+            source_query="SELECT * FROM `my-test-project.analytics.sales`",
+        )
+        assert reader.status_code in (200, 201, 202), reader.text
+
+        src = _register_bq(c, token, name="sqlattach_src", bucket="analytics", source_table="sales")
+        assert src.status_code in (200, 201, 202), src.text
+
+        resp = c.put(
+            "/api/admin/registry/sqlattach_src",
+            json={"access_policy_sql": _policy_sql("sqlattach_src"), "access_policy_note": "pii masking"},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 422, resp.text
+        assert "access_policy_physical_source_conflict" in resp.text
+        assert "sqlattach_mat" in resp.text
+
+        from src.repositories import table_registry_repo
+
+        assert table_registry_repo().get("sqlattach_src")["access_policy_sql"] is None
+
+    def test_refusal_lands_before_the_row_can_ever_be_materialized(
+        self, seeded_app, monkeypatch, bq_instance, stub_bq_extractor
+    ):
+        """A materialized row is picked up by the sync trigger pass FROM THE
+        REGISTRY — so "not scheduled" means "never persisted". Assert the row
+        is absent, no rebuild ran, and no register_table audit entry landed."""
+        monkeypatch.setenv("AGNES_ACCESS_POLICIES_ENABLED", "1")
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        _bq_policied_remote_row(c, token, name="presched_src", dataset="analytics", table="sales")
+        stub_bq_extractor.reset_mock()
+
+        resp = _register_bq(
+            c,
+            token,
+            name="presched_mat",
+            query_mode="materialized",
+            source_query="SELECT * FROM `my-test-project.analytics.sales`",
+        )
+        assert resp.status_code == 422, resp.text
+
+        from src.repositories import audit_repo, table_registry_repo
+
+        assert table_registry_repo().get("presched_mat") is None
+        assert stub_bq_extractor.call_count == 0
+        entries, _cursor = audit_repo().query(action="register_table", resource="presched_mat", limit=50)
+        assert entries == []
+
+    def test_a_materialized_row_over_a_different_table_is_accepted(
+        self, seeded_app, monkeypatch, bq_instance, stub_bq_extractor
+    ):
+        monkeypatch.setenv("AGNES_ACCESS_POLICIES_ENABLED", "1")
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        _bq_policied_remote_row(c, token, name="negsql_src", dataset="analytics", table="sales")
+
+        resp = _register_bq(
+            c,
+            token,
+            name="negsql_mat",
+            query_mode="materialized",
+            source_query="SELECT * FROM `my-test-project.analytics.returns`",
+        )
+        assert resp.status_code in (200, 201, 202), resp.text
+
+        from src.repositories import table_registry_repo
+
+        assert table_registry_repo().get("negsql_mat") is not None
+
+    def test_a_policied_materialized_row_over_its_own_source_stays_legal(
+        self, seeded_app, monkeypatch, bq_instance, stub_bq_extractor
+    ):
+        """A materialized row reads its own physical source by definition;
+        the check must never fire against the row's own signals."""
+        monkeypatch.setenv("AGNES_ACCESS_POLICIES_ENABLED", "1")
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+
+        created = _register_bq(
+            c,
+            token,
+            name="selfmat",
+            query_mode="materialized",
+            bucket="analytics",
+            source_table="sales",
+            server_only=True,
+        )
+        assert created.status_code in (200, 201, 202), created.text
+
+        resp = c.put(
+            "/api/admin/registry/selfmat",
+            json={"access_policy_sql": _policy_sql("selfmat"), "access_policy_note": "pii masking"},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200, resp.text
+
+        from src.repositories import table_registry_repo
+
+        assert table_registry_repo().get("selfmat")["access_policy_sql"] is not None
+
+
+@pytest.mark.journey
+class TestBigQueryCrossRepresentationTwin:
+    """Gap 2 — ``bq_fqn='project.dataset.table'`` on one row and
+    ``bucket``+``source_table`` on the other are the same physical table,
+    and their raw signals never intersect."""
+
+    def _fqn_only_policied_row(self, c, token, *, name, fqn):
+        """A policied row that carries ONLY ``bq_fqn`` as its pointer — its
+        ``source_query`` (``SELECT 1``) deliberately references no table, so
+        nothing but the fqn↔bucket/source_table match can fire."""
+        resp = _register_bq(
+            c,
+            token,
+            name=name,
+            query_mode="materialized",
+            source_query="SELECT 1",
+            bq_fqn=fqn,
+            server_only=True,
+        )
+        assert resp.status_code in (200, 201, 202), resp.text
+        attach = c.put(
+            f"/api/admin/registry/{name}",
+            json={"access_policy_sql": _policy_sql(name), "access_policy_note": "pii masking"},
+            headers=_auth(token),
+        )
+        assert attach.status_code == 200, attach.text
+        return resp.json()["id"]
+
+    def test_bucket_source_table_twin_of_a_policied_bq_fqn_row_is_rejected(
+        self, seeded_app, monkeypatch, bq_instance, stub_bq_extractor
+    ):
+        monkeypatch.setenv("AGNES_ACCESS_POLICIES_ENABLED", "1")
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        policied_id = self._fqn_only_policied_row(
+            c, token, name="fqn_src", fqn="my-test-project.analytics.sales"
+        )
+
+        resp = _register_bq(c, token, name="fqn_twin", bucket="analytics", source_table="sales")
+        assert resp.status_code == 422, resp.text
+        assert "access_policy_physical_source_conflict" in resp.text
+        assert policied_id in resp.text
+
+        from src.repositories import table_registry_repo
+
+        assert table_registry_repo().get("fqn_twin") is None
+
+    def test_bq_fqn_twin_of_a_policied_bucket_row_is_rejected(
+        self, seeded_app, monkeypatch, bq_instance, stub_bq_extractor
+    ):
+        """The mirror representation: the POLICIED row uses bucket +
+        source_table, the twin arrives as a bq_fqn."""
+        monkeypatch.setenv("AGNES_ACCESS_POLICIES_ENABLED", "1")
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        policied_id = _bq_policied_remote_row(c, token, name="fqnrev_src", dataset="analytics", table="sales")
+
+        resp = _register_bq(
+            c,
+            token,
+            name="fqnrev_twin",
+            query_mode="materialized",
+            source_query="SELECT 1",
+            bq_fqn="my-test-project.analytics.sales",
+        )
+        assert resp.status_code == 422, resp.text
+        assert "access_policy_physical_source_conflict" in resp.text
+        assert policied_id in resp.text
+
+    def test_a_bq_fqn_in_a_different_project_does_not_conflict(
+        self, seeded_app, monkeypatch, bq_instance, stub_bq_extractor
+    ):
+        """Same dataset + table, a DIFFERENT project — genuinely another
+        physical table, and both projects are known, so no wildcard."""
+        monkeypatch.setenv("AGNES_ACCESS_POLICIES_ENABLED", "1")
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        _bq_policied_remote_row(c, token, name="fqnproj_src", dataset="analytics", table="sales")
+
+        resp = _register_bq(
+            c,
+            token,
+            name="fqnproj_twin",
+            query_mode="materialized",
+            source_query="SELECT 1",
+            bq_fqn="other-test-project.analytics.sales",
+        )
+        assert resp.status_code in (200, 201, 202), resp.text
+
+
+@pytest.mark.journey
+class TestDatabricksDefaultCatalogTwin:
+    """Gap 3 — ``bucket='sales'`` (schema in the configured default catalog)
+    and ``bucket='main.sales'`` are one physical table; as raw strings they
+    are two different ``bucket_table`` signals."""
+
+    def _policied_dbx_row(self, c, token, *, name, bucket, source_table):
+        resp = c.post(
+            "/api/admin/register-table",
+            json={
+                "name": name,
+                "source_type": "databricks",
+                "query_mode": "remote",
+                "bucket": bucket,
+                "source_table": source_table,
+            },
+            headers=_auth(token),
+        )
+        assert resp.status_code in (200, 201, 202), resp.text
+        attach = c.put(
+            f"/api/admin/registry/{name}",
+            json={"access_policy_sql": _policy_sql(name), "access_policy_note": "pii masking"},
+            headers=_auth(token),
+        )
+        assert attach.status_code == 200, attach.text
+        return resp.json()["id"]
+
+    def test_bare_schema_twin_of_a_catalog_qualified_policied_row_is_rejected(
+        self, seeded_app, monkeypatch, dbx_instance
+    ):
+        monkeypatch.setenv("AGNES_ACCESS_POLICIES_ENABLED", "1")
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        policied_id = self._policied_dbx_row(c, token, name="dbx_src", bucket="main.sales", source_table="orders")
+
+        resp = c.post(
+            "/api/admin/register-table",
+            json={
+                "name": "dbx_twin",
+                "source_type": "databricks",
+                "query_mode": "remote",
+                "bucket": "sales",
+                "source_table": "orders",
+            },
+            headers=_auth(token),
+        )
+        assert resp.status_code == 422, resp.text
+        assert "access_policy_physical_source_conflict" in resp.text
+        assert policied_id in resp.text
+
+        from src.repositories import table_registry_repo
+
+        assert table_registry_repo().get("dbx_twin") is None
+
+    def test_catalog_qualified_twin_of_a_bare_schema_policied_row_is_rejected(
+        self, seeded_app, monkeypatch, dbx_instance
+    ):
+        monkeypatch.setenv("AGNES_ACCESS_POLICIES_ENABLED", "1")
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        policied_id = self._policied_dbx_row(c, token, name="dbxrev_src", bucket="sales", source_table="orders")
+
+        resp = c.post(
+            "/api/admin/register-table",
+            json={
+                "name": "dbxrev_twin",
+                "source_type": "databricks",
+                "query_mode": "remote",
+                "bucket": "main.sales",
+                "source_table": "orders",
+            },
+            headers=_auth(token),
+        )
+        assert resp.status_code == 422, resp.text
+        assert policied_id in resp.text
+
+    def test_a_materialized_row_reading_the_policied_databricks_table_is_rejected(
+        self, seeded_app, monkeypatch, dbx_instance
+    ):
+        monkeypatch.setenv("AGNES_ACCESS_POLICIES_ENABLED", "1")
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        policied_id = self._policied_dbx_row(c, token, name="dbxmat_src", bucket="sales", source_table="orders")
+
+        resp = c.post(
+            "/api/admin/register-table",
+            json={
+                "name": "dbxmat_twin",
+                "source_type": "databricks",
+                "query_mode": "materialized",
+                "source_query": "SELECT o_date, SUM(amount) FROM `main`.`sales`.`orders` GROUP BY o_date",
+            },
+            headers=_auth(token),
+        )
+        assert resp.status_code == 422, resp.text
+        assert policied_id in resp.text
+
+        from src.repositories import table_registry_repo
+
+        assert table_registry_repo().get("dbxmat_twin") is None
+
+    def test_a_different_schema_in_the_same_catalog_is_accepted(self, seeded_app, monkeypatch, dbx_instance):
+        monkeypatch.setenv("AGNES_ACCESS_POLICIES_ENABLED", "1")
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        self._policied_dbx_row(c, token, name="dbxneg_src", bucket="sales", source_table="orders")
+
+        resp = c.post(
+            "/api/admin/register-table",
+            json={
+                "name": "dbxneg_twin",
+                "source_type": "databricks",
+                "query_mode": "remote",
+                "bucket": "main.finance",
+                "source_table": "orders",
+            },
+            headers=_auth(token),
+        )
+        assert resp.status_code in (200, 201, 202), resp.text
+
+
+@pytest.mark.journey
+class TestUnparseableMaterializedSql:
+    """Fail closed: a materialized ``source_query`` Agnes cannot parse could
+    read anything, so beside a policied row of the same engine it is refused
+    — with the parse failure named, so the admin knows which escape applies."""
+
+    def test_unparseable_sql_next_to_a_policied_row_is_rejected(
+        self, seeded_app, monkeypatch, bq_instance, stub_bq_extractor
+    ):
+        monkeypatch.setenv("AGNES_ACCESS_POLICIES_ENABLED", "1")
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        policied_id = _bq_policied_remote_row(c, token, name="unparse_src", dataset="analytics", table="sales")
+
+        resp = _register_bq(
+            c,
+            token,
+            name="unparse_mat",
+            query_mode="materialized",
+            source_query="SELECT * FROM ((( not really sql",
+        )
+        assert resp.status_code == 422, resp.text
+        assert "access_policy_physical_source_conflict" in resp.text
+        assert policied_id in resp.text
+        assert "could not be parsed" in resp.text
+
+        from src.repositories import table_registry_repo
+
+        assert table_registry_repo().get("unparse_mat") is None
+
+    def test_unparseable_sql_with_no_policied_row_anywhere_is_accepted(
+        self, seeded_app, monkeypatch, bq_instance, stub_bq_extractor
+    ):
+        """The fail-closed rule must not become a general SQL validator —
+        with no policy on the instance there is nothing to route around."""
+        monkeypatch.setenv("AGNES_ACCESS_POLICIES_ENABLED", "1")
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+
+        resp = _register_bq(
+            c,
+            token,
+            name="unparse_free",
+            query_mode="materialized",
+            source_query="SELECT * FROM ((( not really sql",
+        )
+        assert resp.status_code in (200, 201, 202), resp.text
+
+    def test_a_policied_row_with_unparseable_sql_does_not_block_unrelated_rows(
+        self, seeded_app, monkeypatch, bq_instance, stub_bq_extractor
+    ):
+        """The unknown signal is emitted only for the UNPOLICIED side. A
+        policied row whose own SQL is unparseable protects itself through its
+        policy; it must not turn every later registration into a 422."""
+        monkeypatch.setenv("AGNES_ACCESS_POLICIES_ENABLED", "1")
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+
+        created = _register_bq(
+            c,
+            token,
+            name="unparse_policied",
+            query_mode="materialized",
+            source_query="SELECT * FROM ((( not really sql",
+            server_only=True,
+        )
+        assert created.status_code in (200, 201, 202), created.text
+        attach = c.put(
+            "/api/admin/registry/unparse_policied",
+            json={
+                "access_policy_sql": _policy_sql("unparse_policied"),
+                "access_policy_note": "pii masking",
+            },
+            headers=_auth(token),
+        )
+        assert attach.status_code == 200, attach.text
+
+        resp = _register_bq(c, token, name="unrelated_bq", bucket="analytics", source_table="returns")
+        assert resp.status_code in (200, 201, 202), resp.text
+
+
+@pytest.mark.journey
+class TestCanonicalSignalsLeaveUnrelatedRowsAlone:
+    def test_a_keboola_row_is_untouched_by_a_policied_databricks_table(self, seeded_app, monkeypatch, dbx_instance):
+        """Identifiers are engine-scoped: a Keboola bucket that happens to
+        share a Databricks schema's name is not the same physical table."""
+        monkeypatch.setenv("AGNES_ACCESS_POLICIES_ENABLED", "1")
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        dbx = c.post(
+            "/api/admin/register-table",
+            json={
+                "name": "xengine_dbx",
+                "source_type": "databricks",
+                "query_mode": "remote",
+                "bucket": "sales",
+                "source_table": "orders",
+            },
+            headers=_auth(token),
+        )
+        assert dbx.status_code in (200, 201, 202), dbx.text
+        attach = c.put(
+            "/api/admin/registry/xengine_dbx",
+            json={"access_policy_sql": _policy_sql("xengine_dbx"), "access_policy_note": "pii masking"},
+            headers=_auth(token),
+        )
+        assert attach.status_code == 200, attach.text
+
+        resp = c.post(
+            "/api/admin/register-table",
+            json={
+                "name": "xengine_kbc",
+                "source_type": "keboola",
+                "query_mode": "local",
+                "bucket": "sales",
+                "source_table": "orders",
+            },
+            headers=_auth(token),
+        )
+        assert resp.status_code == 201, resp.text
