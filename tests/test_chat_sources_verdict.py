@@ -795,3 +795,143 @@ class TestTheVerdictReadsTheSameTurnTheReaderSees:
                 i -= 1
             call = text[i : i + 400]
             assert "parts_to_tool_results" in call, f"{rel} computes the verdict without the results:\n{call}"
+class TestAGlossaryTermIsEvidenceNotAnAssumption:
+    """A `glossary:` claim, and the misfiling it exists to stop (#2258).
+
+    The vocabulary offered `table:`, `metric:` and `document:`, so a governed
+    business term the answer leaned on had exactly one legal slot left:
+    `assumption: … | origin: definition`. That files a citation as a caveat
+    about method — the same category error the prompt already warns about for
+    a file ("the reader sees your evidence listed among your guesses"), and
+    the reader meets a definition they could have opened among the answer's
+    guesses instead of among its sources.
+
+    A term is evidence. So `glossary:` is a first-class claim: it lands in the
+    provenance row and is checked against the turn's tool calls like the other
+    three.
+
+    Its READ rule is its own, and deliberately not the metric's. `GET
+    /api/glossary*` is any authenticated caller with no per-resource grant
+    (business vocabulary, not data — see `app/api/glossary.py` and the same
+    note on the semantic layer's glossary tab), while `GET /api/metrics` drops
+    every metric bound to a table outside the caller's stack. Nothing in this
+    module reads either registry, which is what keeps the verdict out of that
+    split entirely; the chip's destination is where the client honours it (see
+    `tests/test_chat_sources_ui.py`).
+    """
+
+    GLOSSARY_CALLS = [
+        {"tool": "Bash", "args": {"command": 'agnes glossary search "full-time equivalent"'}},
+        {
+            "tool": "Bash",
+            "args": {
+                "command": "agnes glossary show full_time_equivalent",
+                "output": "Term: Full-time equivalent\nDefinition: headcount normalised to a 40h week",
+            },
+        },
+    ]
+
+    def test_a_glossary_term_is_parsed_as_its_own_kind(self):
+        (c,) = parse_claims("glossary: Full-time equivalent")
+        assert (c.kind, c.ref) == ("glossary", "Full-time equivalent")
+
+    def test_a_term_the_turn_looked_up_is_verified(self):
+        """Same contract as the other three kinds: the turn's tool calls are
+        the record of what was actually read, and `agnes glossary` naming the
+        term is that."""
+        v = verdict(_answer("glossary: Full-time equivalent"), self.GLOSSARY_CALLS)
+        assert v.claims[0].verified is True
+
+    def test_a_term_nothing_looked_up_is_reported_unverified(self):
+        """A plausible-sounding term nothing ran on is what an invented
+        definition looks like, and the reader is told."""
+        v = verdict(_answer("glossary: Fully burdened cost"), self.GLOSSARY_CALLS)
+        assert [c.ref for c in v.unverified] == ["Fully burdened cost"]
+
+    def test_the_ref_is_matched_case_insensitively(self):
+        """The term is prose the model retypes; the catalog's capitalisation is
+        not a claim about provenance."""
+        v = verdict(_answer("glossary: FULL-TIME EQUIVALENT"), self.GLOSSARY_CALLS)
+        assert v.claims[0].verified is True
+
+    def test_a_term_is_never_split_the_way_a_metric_id_is(self):
+        """The one place the metric path must NOT be copied.
+
+        A metric id is a namespaced `family/name`, so its tail is the same
+        identifier written shorter, and accepting it costs nothing. A glossary
+        term is prose, where a slash is punctuation INSIDE the term — so
+        matching the tail would verify "bookings/billings" against a turn that
+        looked up something else entirely, and the badge would be asserting a
+        check that never happened.
+        """
+        calls = [{"args": {"command": 'agnes glossary search "billings"'}}]
+        v = verdict(_answer("glossary: bookings/billings"), calls)
+        assert v.claims[0].verified is False
+        # And the metric it is NOT: the same haystack, the same slash, verified.
+        assert verdict(_answer("metric: bookings/billings"), calls).claims[0].verified is True
+
+    def test_a_glossary_line_is_not_split_on_pipes(self):
+        (c,) = parse_claims("glossary: Bookings | net of cancellations")
+        assert c.ref == "Bookings | net of cancellations"
+        assert c.origin is None
+
+    def test_a_glossary_term_reaches_the_wire_in_the_reference_shape(self):
+        """Three keys, like a table, a metric or a document — `origin`/`why`
+        belong to the assumption line alone."""
+        v = verdict(_answer("glossary: Full-time equivalent"), self.GLOSSARY_CALLS)
+        assert set(v.to_dict()["claims"][0]) == {"kind", "ref", "verified"}
+
+    def test_an_answer_citing_only_terms_has_declared_a_source(self):
+        """The defect as the reader met it: a governed definition could only
+        arrive as a caveat. A term is provenance, so it counts."""
+        from app.chat.sources import VERIFIABLE_KINDS
+
+        assert "glossary" in VERIFIABLE_KINDS
+        v = verdict(_answer("glossary: Full-time equivalent\nglossary: Attrition"), self.GLOSSARY_CALLS)
+        assert [c.kind for c in v.claims] == ["glossary", "glossary"]
+        assert not any(c.kind == "assumption" for c in v.claims)
+
+    def test_the_verdict_reads_no_registry(self):
+        """The glossary's read rule is honoured by not importing it.
+
+        A later "improvement" that resolved the ref against `glossary_repo()`
+        would put a registry read behind every rendered message and tie the
+        badge to instance state — and, worse, invite the metric-shaped read
+        next to it, which IS per-caller filtered. The check is text over the
+        turn's own tool calls and nothing else, so blowing the repository up
+        changes no verdict.
+        """
+        import src.repositories as repos
+
+        def _boom(*a, **k):  # pragma: no cover - only runs if the rule breaks
+            raise AssertionError("the sources verdict must not read the glossary registry")
+
+        original = repos.glossary_repo
+        repos.glossary_repo = _boom
+        try:
+            v = verdict(_answer("glossary: Full-time equivalent"), self.GLOSSARY_CALLS)
+        finally:
+            repos.glossary_repo = original
+        assert v.claims[0].verified is True
+
+    def test_every_prompt_carrier_offers_the_glossary_kind(self):
+        """Same three carriers as `document:`, same reason: a kind the model is
+        never told about is a kind it will keep smuggling into `assumption:`."""
+        import pathlib
+
+        from app.chat.agent_profile import PROVENANCE_RAILS
+
+        root = pathlib.Path(__file__).resolve().parents[1]
+        carriers = {
+            "workspace CLAUDE.md": (root / "app" / "initial_workspace_default" / "CLAUDE.md").read_text(
+                encoding="utf-8"
+            ),
+            "server template": (root / "config" / "claude_md_template.txt").read_text(encoding="utf-8"),
+            "persona rail": PROVENANCE_RAILS,
+        }
+        for name, text in carriers.items():
+            section = text[text.index("Say where every number came from") :]
+            assert "`glossary:`" in section, f"{name} does not offer the glossary kind"
+            fence = section[section.index("```sources") :]
+            fence = fence[: fence.index("```", 3)]
+            assert "glossary:" in fence, f"{name}'s example does not show a glossary line"

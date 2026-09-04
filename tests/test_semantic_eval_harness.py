@@ -111,10 +111,22 @@ def test_the_semantic_arm_prompt_carries_the_section_and_the_ask_dont_guess_rule
 def test_the_baseline_arm_prompt_carries_neither():
     """The baseline is an instance with no registered model — not the same
     instance with one sentence deleted. If this ever renders the section, the
-    two arms stop being a comparison of anything."""
+    two arms stop being a comparison of anything.
+
+    Asserted on the section and on its rule, not on the bare word "glossary".
+    That word was the proxy, and it stopped standing for "the section
+    rendered" when `glossary:` became a citable kind in the `sources` block
+    (#2258): the provenance rules are shared by BOTH arms by design (see
+    `test_both_arms_still_share_the_provenance_rule`), so they name the word
+    in the baseline too — truthfully, and with nothing to do with the layer
+    under test.
+    """
     prompt = render_workspace_prompt(has_models=False)
     assert "## Semantic layer" not in prompt
-    assert "glossary" not in prompt.lower()
+    assert "no dataset, metric, or glossary" not in " ".join(prompt.split()), (
+        "the ask-don't-guess rule belongs to the semantic arm alone"
+    )
+    assert "agnes semantic-model" not in prompt, "the layer's own tooling must not be taught to the baseline"
 
 
 def test_both_arms_still_share_the_provenance_rule():

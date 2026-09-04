@@ -549,9 +549,24 @@ class TestSemanticLayerSection:
 
     def test_the_ask_dont_guess_rule_is_gated_with_the_rest_of_the_section(self, conn):
         """The rule names this instance's semantic layer, so it must not reach
-        a user who has no readable model — same gate as the section it lives in."""
+        a user who has no readable model — same gate as the section it lives in.
+
+        Asserted on the RULE, not on the word "glossary". The bare word was the
+        proxy this used, and it stopped meaning "the gated section rendered"
+        the moment `glossary:` became a citable kind in the ungated `sources`
+        block (#2258) — the provenance rules name it on every render, for every
+        user, by design. A guard whose needle can be satisfied by an unrelated
+        section is one that will next fail on a true statement, so it now looks
+        for the sentence it is actually about (the positive case above matches
+        the same shape).
+        """
         out = render_claude_md(conn, user=_admin_user(conn), server_url="https://example.com")
-        assert "glossary" not in out.lower()
+        assert "## Semantic layer" not in out
+        assert not re.search(
+            r"no dataset, metric,? or glossary (entry|term).{0,120}(ask|not defined)",
+            _collapse_ws(out),
+            re.IGNORECASE,
+        ), "the ask-don't-guess rule reached a user with no readable model"
 
     def test_models_catalog_carries_slug_name_and_description(self, conn):
         """Fáze 1 physical-distribution plan, item 4 — a one-line model
