@@ -456,6 +456,38 @@ _MAX_ITEM_RETRY_ATTEMPTS = 5
 #: five tries to be trusted, only enough to rule out a one-off (a partial
 #: download corrupting the file that one time).
 _DOOMED_SKIP_MIN_ATTEMPTS = 2
+#: TCRD-296 gap #74 (live finding 2026-09-04 09:20-10:00Z): a resync of a
+#: 282k-document site spent its first hours replaying 253 previously-failed
+#: documents in one folder — 162 `worker_crash` (the same workbook SIGKILLed
+#: by the memory guard on every replay), 71 `timeout` (the same files hit
+#: the time budget every run), 16 `libreoffice_no_output` — at roughly 5
+#: documents per 10 minutes, because each replay pays the FULL rescue chain
+#: again for nothing, and because these files never get a cTag, EVERY
+#: future crawl/resync re-downloads and re-converts them too.
+#: `timeout`/`memory_kill`/`worker_crash` are deliberately excluded from
+#: `DETERMINISTIC_ERROR_CLASSES` (they are environmental — a busy host, a
+#: transient resource ceiling — not a property of the document), but the
+#: SAME file crashing or timing out the converter three times running, on
+#: UNCHANGED bytes, is doomed for this product's purposes too: what actually
+#: changes the outcome is an operator fix (raise the memory ceiling, split
+#: the workbook), never a fourth automatic retry. See
+#: `_REPEATED_FAILURE_ERROR_CLASSES` and `_doomed_skip_reason`. Higher than
+#: `_DOOMED_SKIP_MIN_ATTEMPTS` above: a crash or timeout is more plausibly a
+#: one-off (a noisy neighbour on the host, not a byte pattern) than a
+#: deterministic reject, so it earns one extra attempt before this module
+#: stops trying automatically.
+_DOOMED_SKIP_MIN_ATTEMPTS_REPEATED = 3
+#: The three environmental classes eligible for the repeated-failure doomed
+#: rule above — string literals, not an import of `connectors.sharepoint.
+#: convert.ERROR_CLASS_*`, mirroring how `DETERMINISTIC_ERROR_CLASSES` is
+#: reached elsewhere in this module: via a LOCAL import inside the function
+#: that needs it, never a module-level one. Deliberately NOT merged into
+#: `DETERMINISTIC_ERROR_CLASSES` — a repeated environmental failure is
+#: trusted at a higher attempt count and reported under its own reason
+#: (`doomed_after_repeated_<class>`, see `_doomed_skip_reason`) so the run
+#: report and the fleet view can tell "the bytes are rejected" apart from
+#: "this keeps crashing or timing out the converter".
+_REPEATED_FAILURE_ERROR_CLASSES = frozenset({"timeout", "memory_kill", "worker_crash"})
 #: How often `_RunRecorder.maybe_checkpoint` is allowed to write PROGRESS
 #: (never the resume state above) between delta-page boundaries: at most
 #: once per this many seconds, or once per `_PROGRESS_CHECKPOINT_EVERY_
@@ -1232,23 +1264,25 @@ def _retry_backlog_snapshot(state: Dict[str, Any]) -> Dict[str, Any]:
     retried after :data:`_MAX_ITEM_RETRY_ATTEMPTS` failures and needs a
     human (fix the file, or force a ``resync`` — see :func:`_apply_resync`).
 
-    ``doomed`` (2026-09-04 finding #66 item 2) is the STANDING count of
-    entries :func:`_doomed_skip_reason` would skip on the very next run — a
-    SUBSET of ``pending`` (a doomed item is never given up on; it is simply
-    not attempted), so an operator sees "N are stuck AND M of those are not
-    even being tried" rather than a single conflated number.
+    ``doomed`` (2026-09-04 finding #66 item 2; extended by TCRD-296 gap #74 to
+    a document that has repeatedly crashed or timed out the converter, not
+    just one it deterministically rejects — see :func:`_doomed_classification`)
+    is the STANDING count of entries :func:`_doomed_skip_reason` would skip
+    on the very next run — a SUBSET of ``pending`` (a doomed item is never
+    given up on; it is simply not attempted), so an operator sees "N are
+    stuck AND M of those are not even being tried" rather than a single
+    conflated number. ``doomed_sample``'s ``reason_type`` distinguishes a
+    deterministic reject (``"doomed"``) from a repeated crash/timeout
+    (``"doomed_after_repeated_<class>"``) per entry.
     """
-    from src.ingest.convert import DETERMINISTIC_ERROR_CLASSES
-
     failed_items = state.get("failed_items") or {}
     given_up = [entry for entry in failed_items.values() if isinstance(entry, dict) and entry.get("given_up")]
     pending = len(failed_items) - len(given_up)
     doomed = [
-        entry
+        (entry, reason_type)
         for entry in failed_items.values()
         if isinstance(entry, dict)
-        and entry.get("error_class") in DETERMINISTIC_ERROR_CLASSES
-        and int(entry.get("attempts", 0)) >= _DOOMED_SKIP_MIN_ATTEMPTS
+        and (reason_type := _doomed_classification(entry.get("error_class"), int(entry.get("attempts", 0)))) is not None
     ]
     return {
         "pending": pending,
@@ -1258,8 +1292,13 @@ def _retry_backlog_snapshot(state: Dict[str, Any]) -> Dict[str, Any]:
         ],
         "doomed": len(doomed),
         "doomed_sample": [
-            {"path": entry.get("path"), "attempts": entry.get("attempts"), "error_class": entry.get("error_class")}
-            for entry in doomed[:_OVERSIZE_SAMPLE]
+            {
+                "path": entry.get("path"),
+                "attempts": entry.get("attempts"),
+                "error_class": entry.get("error_class"),
+                "reason_type": reason_type,
+            }
+            for entry, reason_type in doomed[:_OVERSIZE_SAMPLE]
         ],
     }
 
@@ -1691,11 +1730,20 @@ class CrawlStats:
         reason: str,
         suffix: str,
         error_class: str,
+        reason_type: str = "doomed",
     ) -> None:
         """One document skipped WITHOUT a download because its recorded
         failure history says it is doomed — see :attr:`skipped_doomed`'s
         docstring. Same anonymize rule as :meth:`note_failed_item`: ``path``
-        is ``None`` when the caller's scope is anonymize-marked."""
+        is ``None`` when the caller's scope is anonymize-marked.
+
+        ``reason_type`` (TCRD-296 gap #74) is ``"doomed"`` for a
+        deterministic-reject skip, or ``"doomed_after_repeated_<class>"`` for
+        a document that has repeatedly crashed or timed out the converter
+        instead — see :func:`_doomed_classification` — so a reader of the
+        run report or the fleet view can tell the two apart without parsing
+        ``reason``'s free-form text.
+        """
         with self._lock:
             self.skipped_doomed += 1
             self._skipped_doomed_seen += 1
@@ -1704,7 +1752,7 @@ class CrawlStats:
                     "path": path,
                     "item_id": item_id,
                     "drive_id": drive_id,
-                    "reason_type": "doomed",
+                    "reason_type": reason_type,
                     "reason": (reason or "")[:200],
                     "suffix": suffix,
                     "error_class": error_class,
@@ -4392,24 +4440,58 @@ def _clear_empty(state: Dict[str, Any], stable_id: str) -> bool:
         return empty_items.pop(stable_id, None) is not None
 
 
+def _doomed_classification(error_class: Optional[str], attempts: int) -> Optional[str]:
+    """Whether ``(error_class, attempts)`` ALONE — no cTag, no
+    ``force_reprocess`` — is trusted doomed, and under which rule.
+
+    Returns a ``reason_type`` (``"doomed"`` for a
+    ``src.ingest.convert.DETERMINISTIC_ERROR_CLASSES`` member at
+    :data:`_DOOMED_SKIP_MIN_ATTEMPTS`, or ``"doomed_after_repeated_<class>"``
+    for a :data:`_REPEATED_FAILURE_ERROR_CLASSES` member — ``timeout``,
+    ``memory_kill``, ``worker_crash`` — at
+    :data:`_DOOMED_SKIP_MIN_ATTEMPTS_REPEATED`, TCRD-296 gap #74), or
+    ``None`` when neither threshold is met yet.
+
+    Shared by :func:`_doomed_skip_reason` (which adds the cTag and
+    ``force_reprocess`` gate before turning this into a live skip decision)
+    and :func:`_retry_backlog_snapshot` (the STANDING backlog view, which is
+    deliberately cTag-blind — see its own docstring): one place decides
+    "is this entry's history enough to trust", so the live skip and the
+    reported backlog count can never silently drift apart.
+    """
+    from src.ingest.convert import DETERMINISTIC_ERROR_CLASSES
+
+    if error_class in DETERMINISTIC_ERROR_CLASSES:
+        return "doomed" if attempts >= _DOOMED_SKIP_MIN_ATTEMPTS else None
+    if error_class in _REPEATED_FAILURE_ERROR_CLASSES:
+        return f"doomed_after_repeated_{error_class}" if attempts >= _DOOMED_SKIP_MIN_ATTEMPTS_REPEATED else None
+    return None
+
+
 def _doomed_skip_reason(
     state: Dict[str, Any], stable_id: str, *, item: Dict[str, Any], force_reprocess: bool
-) -> Optional[str]:
+) -> Optional[Tuple[str, str]]:
     """Whether ``stable_id`` should be skipped WITHOUT a download this run —
     2026-09-04 finding #66 item 2 (see :data:`_DOOMED_SKIP_MIN_ATTEMPTS`'s
-    docstring for the live finding this fixes).
+    docstring), extended by TCRD-296 gap #74 (see
+    :data:`_DOOMED_SKIP_MIN_ATTEMPTS_REPEATED`'s docstring) to a document
+    that keeps crashing or timing out the converter, not just one the
+    converter deterministically rejects.
 
-    Returns the skip reason (for :meth:`CrawlStats.note_skipped_doomed`), or
-    ``None`` when the item should be attempted normally. Never skips when:
+    Returns ``(reason_type, reason)`` (for :meth:`CrawlStats.
+    note_skipped_doomed`), or ``None`` when the item should be attempted
+    normally. Never skips when:
 
     * ``force_reprocess`` is set — the operator's explicit "re-process
       everything regardless" override, the same escape hatch every other
       cTag-based skip in this module honors;
-    * fewer than :data:`_DOOMED_SKIP_MIN_ATTEMPTS` attempts are recorded, or
-      the MOST RECENT recorded ``error_class`` is not one of
-      ``src.ingest.convert.DETERMINISTIC_ERROR_CLASSES``
-      (timeouts, memory kills, worker crashes and download errors are
-      environmental and stay retryable forever);
+    * :func:`_doomed_classification` says the recorded ``(error_class,
+      attempts)`` does not clear either threshold yet — a
+      ``DETERMINISTIC_ERROR_CLASSES`` member below
+      :data:`_DOOMED_SKIP_MIN_ATTEMPTS`, a ``_REPEATED_FAILURE_ERROR_CLASSES``
+      member below :data:`_DOOMED_SKIP_MIN_ATTEMPTS_REPEATED`, or an
+      ``error_class`` in neither set (``download_error``/``other`` stay
+      retryable forever — never a property of the document);
     * the item's cTag/eTag no longer matches what was recorded at the last
       failed attempt — new content deserves fresh attempts, and this is the
       SAME pre-download "did it change" signal :func:`_process_item`'s own
@@ -4426,12 +4508,10 @@ def _doomed_skip_reason(
     entry = failed_items.get(stable_id)
     if not isinstance(entry, dict):
         return None
-    from src.ingest.convert import DETERMINISTIC_ERROR_CLASSES
-
     error_class = entry.get("error_class")
-    if error_class not in DETERMINISTIC_ERROR_CLASSES:
-        return None
-    if int(entry.get("attempts", 0)) < _DOOMED_SKIP_MIN_ATTEMPTS:
+    attempts = int(entry.get("attempts", 0))
+    reason_type = _doomed_classification(error_class, attempts)
+    if reason_type is None:
         return None
     recorded_item = entry.get("item") or {}
     recorded_ctag = recorded_item.get("cTag") or recorded_item.get("eTag")
@@ -4439,7 +4519,8 @@ def _doomed_skip_reason(
     if not recorded_ctag or recorded_ctag != current_ctag:
         return None
     last_error = (entry.get("last_error") or "")[:200]
-    return f"{error_class}: failed {entry.get('attempts')} time(s), most recently: {last_error}".strip()
+    reason = f"{error_class}: failed {attempts} time(s), most recently: {last_error}".strip()
+    return reason_type, reason
 
 
 async def _process_item(
@@ -4596,13 +4677,15 @@ async def _process_item(
     # DETERMINISTICALLY enough times is skipped right here, before the
     # download this whole function exists to pay for. See
     # `_doomed_skip_reason`'s own docstring for the exact conditions.
-    doomed_reason = _doomed_skip_reason(state, stable_id, item=item, force_reprocess=force_reprocess)
-    if doomed_reason is not None:
+    doomed = _doomed_skip_reason(state, stable_id, item=item, force_reprocess=force_reprocess)
+    if doomed is not None:
+        doomed_reason_type, doomed_reason = doomed
         stats.note_skipped_doomed(
             path=None if ctx.anonymize else path,
             item_id=str(item.get("id") or ""),
             drive_id=target.drive_id,
             reason=doomed_reason,
+            reason_type=doomed_reason_type,
             suffix=Path(name).suffix.lower(),
             error_class=str((state.get("failed_items") or {}).get(stable_id, {}).get("error_class") or ""),
         )
@@ -5241,8 +5324,10 @@ async def _retry_failed_items(
     ``force_reprocess`` (this run's own operator override) is threaded
     straight through to every :func:`_process_item` call below — the only
     thing it does INSIDE that function that a backlog-replay item could ever
-    reach is bypass the doomed-item skip (2026-09-04 finding #66 item 2); a
-    failed item never had a matching ``ctags`` entry in the first place, so
+    reach is bypass the doomed-item skip (2026-09-04 finding #66 item 2, and
+    its TCRD-296 gap #74 extension to a repeated crash/timeout — see
+    :func:`_doomed_skip_reason`); a failed item never had a matching
+    ``ctags`` entry in the first place, so
     the cTag-equality "already ingested" skip it also bypasses was never
     reachable from here regardless.
     """
@@ -6814,8 +6899,14 @@ def run_builtin_crawl(payload: dict) -> dict:
     unchanged, including the ordinary incremental delta walk that follows
     the backlog replay. The cheap, targeted alternative to ``resync`` for a
     connection with a handful of permanently-stuck documents — see
-    :func:`_retry_failed_items`'s ``include_given_up`` for the mechanism),
-    and ``retry_empty`` (truthy — replays every item this connection last
+    :func:`_retry_failed_items`'s ``include_given_up`` for the mechanism.
+    Does NOT, on its own, replay a DOOMED item (:func:`_doomed_skip_reason`
+    — a deterministic reject, or TCRD-296 gap #74's repeated crash/timeout):
+    that skip is gated on ``force_reprocess`` alone, so ``retry_failed``
+    without it still gives a permanently-stuck-but-not-yet-doomed item one
+    more chance while leaving an already-doomed one out of the replay cost —
+    combine with ``force_reprocess`` to force those too), and ``retry_empty``
+    (truthy — replays every item this connection last
     converted to ``convert_empty`` — see :func:`_retry_empty_items`. Unlike
     ``retry_failed`` this NEVER runs implicitly: an ordinary crawl leaves
     the empty-document backlog alone, since replaying it changes nothing

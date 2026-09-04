@@ -335,8 +335,10 @@ is what the host-side operator scripts (`agnes-watchdog.sh`,
 ### Shipping the logs somewhere
 
 Nothing in Agnes decides this — it writes to stdout and stops. On the
-GCE-hosted deployments the Terraform module wires it up; see
-[`gcp-logging.md`](gcp-logging.md).
+GCE-hosted deployments the Terraform module wires it up, to one of two
+destinations (a VM has exactly one, because Docker allows one log driver per
+container): Google Cloud Logging, see [`gcp-logging.md`](gcp-logging.md), or
+Datadog, see [`datadog-logging.md`](datadog-logging.md).
 
 ### Verifying the wiring
 
@@ -452,7 +454,9 @@ that refuses the batches shows up as the SDK's own
 | `gen_ai.response.finish_reasons` | broker | the stop reason |
 | `agnes.session_id`, `agnes.user_email`, `agnes.user_id`, `agnes.agent_id`, `agnes.ticket_scope` | broker | which session, who ran it, under which agent; `llm` is the embedded turn engine, `main` the native sandbox |
 | `agnes.upstream`, `agnes.stream`, `http.response.status_code`, `error.type` | broker | where the call went and how it ended |
-| `agnes.prompt_chars`, `agnes.completion_chars` | generation | sizes, never text |
+| `agnes.response_bytes`, `agnes.stream_complete` | broker | how much of the response came back, and for a stream whether the model reached its stop reason — a client that walks away mid-turn leaves a span with no answer and no final usage, and this is what tells it apart from a lost export |
+| `agnes.prompt_chars`, `agnes.completion_chars` | both | sizes of the exchange, never text |
+| `agnes.kind` | both | `completion` (the broker) or `generation` (a server-side call) |
 
 The resource on every span is `service.name=agnes`, `service.version`,
 `deployment.environment` and `service.instance.id` (`hostname:pid`) —
@@ -465,13 +469,28 @@ any of them.
 
 Prompt and completion text is **not** exported by default, for the same
 reason the logs never carry it: in this product it routinely holds customer
-data. `AGNES_OTEL_CAPTURE_CONTENT=1` adds `gen_ai.input.messages` (system
-prompt and conversation, tool calls and tool results included, binary
-blocks reduced to their type) and `gen_ai.output.messages` (the answer,
-re-assembled from the stream) in the OpenTelemetry GenAI message shape.
-Each attribute is capped (`MAX_CONTENT_CHARS`, 256 KiB) and a cut is flagged
-as `agnes.content_truncated`. Turn it on only where the collector is
-allowed to hold that data.
+data. `AGNES_OTEL_CAPTURE_CONTENT=1` adds two **span events** — never span
+attributes — in the OpenTelemetry GenAI message shape (`[{role, parts}]`
+as JSON):
+
+| event | attribute | carries |
+|---|---|---|
+| `gen_ai.content.prompt` | `gen_ai.prompt` | system prompt and conversation, tool calls and tool results included, binary blocks reduced to their type |
+| `gen_ai.content.completion` | `gen_ai.completion` | the answer, re-assembled from the stream |
+
+Events rather than attributes on purpose: a collector stores a span's
+attributes as one JSON object with keys in alphabetical order, and an
+agent turn's prompt runs to hundreds of KiB, so anything sorting after
+`gen_ai.input…` — the answer, the usage — fell past every preview or size
+cap downstream. With the text on events the attribute object stays small
+and parseable however long the conversation is, and each side of the
+exchange is its own record the collector can map, cap or drop
+independently (in a Data-Streams style sink that means mapping the
+`events` field to a column). Each event's text is capped
+(`MAX_CONTENT_CHARS`, 256 KiB) and a cut is flagged on the span as
+`agnes.content_truncated`; the sizes (`agnes.prompt_chars` /
+`agnes.completion_chars`) are on the span whether capture is on or not.
+Turn it on only where the collector is allowed to hold that data.
 
 ### What is not exported
 

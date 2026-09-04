@@ -43,12 +43,25 @@ synchronous driver on a VM whose service account lacked
 `fluentd-async: true` the driver connects in the background: a collector that
 is down, still booting, or never installed costs log lines and nothing else.
 
+## Or Datadog instead
+
+Cloud Logging is one of two destinations, and a VM has exactly one — Docker
+allows a single log driver per container, and the Datadog Agent needs the
+default `json-file` where this pipeline needs `fluentd`. Which one a VM uses is
+`container_logs_destination`; see [`datadog-logging.md`](datadog-logging.md) for
+the other side and for why the two cannot run together.
+
 ## Enabling and disabling
 
-`enable_gcp_logging` on the module (default **true**) gates four things
-together: installing and configuring the Ops Agent, leaving the overlay file
-on disk, and two project-level IAM grants to the VM service account —
-`roles/logging.logWriter` and `roles/monitoring.metricWriter`. Set it to
+`enable_gcp_logging` on the module (default **true**) is the **permit** switch:
+it makes Cloud Logging an eligible destination and grants the VM service account
+two project-level IAM roles — `roles/logging.logWriter` and
+`roles/monitoring.metricWriter`. Whether it is the destination actually chosen
+is `container_logs_destination`, which defaults to Datadog on a VM that has
+`enable_datadog` on.
+
+When Cloud Logging *is* the destination, the module also installs and configures
+the Ops Agent and leaves the overlay file on disk. Set `enable_gcp_logging` to
 `false` and the VM stays on Docker's default `json-file` driver.
 
 The metric grant is not there for metrics this module wants. The Ops Agent

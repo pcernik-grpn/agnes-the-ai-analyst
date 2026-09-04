@@ -13,11 +13,13 @@
 //
 // Loaded from _app_scripts.html (both base layouts). Idempotent; the sprite
 // is a trusted same-origin static asset, which is what makes the innerHTML
-// injection below safe.
+// injection below safe. window._agLucideSpriteUrl (stamped in the same
+// partial) carries the ?v= cache-buster so this fetch gets the same
+// long-lived immutable caching as template-rendered /static references.
 (function () {
   var ID = "agnes-icon-sprite";
   if (document.getElementById(ID)) return;
-  fetch("/static/vendor/lucide-sprite.svg")
+  fetch(window._agLucideSpriteUrl || "/static/vendor/lucide-sprite.svg")
     .then(function (r) { return r.ok ? r.text() : Promise.reject(new Error("HTTP " + r.status)); })
     .then(function (svg) {
       if (document.getElementById(ID)) return;
