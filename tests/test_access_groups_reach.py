@@ -189,3 +189,18 @@ class TestTheHeadcountIsPeople:
         ]
         got = self._call(monkeypatch, members, people_total=3, ids="grp-1")
         assert got == {"count": 3, "account_total": 3}
+
+
+def test_the_everyone_block_names_who_is_not_an_account(monkeypatch):
+    """Issue #2256's copy half. "Every account" stays — in this product an
+    account is one a person signs in as (`HUMAN_KIND`), which is why the
+    count is `count_people()` on both this endpoint and the overview. What
+    was missing is that the page never said so, and the two identities it
+    excludes are ones an admin can see on /admin/users. Named in the
+    audience's own explainer rather than in a tooltip."""
+    from tests.helpers.access_page import access_js
+
+    js = access_js()
+    assert "Not a group — a scope. Anything here reaches every" in js
+    assert "Service accounts and Agnes's own" in js
+    assert "identities are not accounts in this sense." in js

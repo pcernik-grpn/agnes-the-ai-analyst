@@ -938,7 +938,8 @@
               <span class="ax-gs__reach">every account · ${grants} granted</span>
             </span>
             <span class="ax-gs__desc">Not a group — a scope. Anything here reaches every
-              account, including anyone who joins later.</span>
+              account, including anyone who joins later. Service accounts and Agnes's own
+              identities are not accounts in this sense.</span>
           </span>
         </summary>
         <div class="ax-gs__body" data-gsbody="${esc(cid)}"></div>
