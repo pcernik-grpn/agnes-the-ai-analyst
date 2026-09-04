@@ -333,8 +333,41 @@ function renderJobsStrip(jobs) {
     .join("");
 }
 
+/* Fleet-level provider-refusal banner (TCRD-296 synthesis F.25, gaps
+   #25/#48) — one strip per active condition, e.g. a workspace usage-limit
+   exhaustion or a saturated Vertex region×model quota bucket. Additive:
+   `conditions` is `[]` on every instance before this shipped and forever
+   on a DuckDB-backed one, so the strip simply stays hidden. This is the
+   SAME condition list the crawl's own streamed trigger
+   (`crawler._enqueue_streamed_facts_pass`) checks before enqueueing — the
+   banner is the operator-facing signal, never the enforcement itself. */
+function renderProviderLimitBanner(conditions) {
+  const el = document.getElementById("ext-provider-limit-banner");
+  if (!el) return;
+  const list = conditions || [];
+  if (!list.length) {
+    el.hidden = true;
+    el.innerHTML = "";
+    return;
+  }
+  el.hidden = false;
+  el.innerHTML = list
+    .map((c) => {
+      const scope = [c.model, c.region].filter(Boolean).join(" in ") || "";
+      const retryHint = c.retry_after_s
+        ? `retrying in ${Math.max(1, Math.round(c.retry_after_s / 60))}m`
+        : "retrying automatically once the condition clears";
+      return (
+        `<div>Facts extraction paused: ${esc(c.provider || "provider")}` +
+        `${scope ? " " + esc(scope) : ""} — ${esc(c.message || c.reason || "provider limit")}; ${esc(retryHint)}.</div>`
+      );
+    })
+    .join("");
+}
+
 function renderTable(body) {
   extLastBody = body;
+  renderProviderLimitBanner(body.conditions);
   const tbody = document.getElementById("ext-tbody");
   const rows = body.connections || [];
   if (!rows.length) {
@@ -387,6 +420,8 @@ async function extTick() {
       document.getElementById("ext-tbody").innerHTML = "";
       const strip = document.getElementById("ext-jobs-strip");
       if (strip) strip.hidden = true;
+      const banner = document.getElementById("ext-provider-limit-banner");
+      if (banner) banner.hidden = true;
       return;
     }
     if (!r.ok) throw new Error("HTTP " + r.status);

@@ -445,6 +445,264 @@ def _classify_permanent_error(exc: BaseException) -> Optional[str]:
 
 
 # --------------------------------------------------------------------------
+# Provider-limit classification (TCRD-296 synthesis F.25, gaps #25/#48)
+# --------------------------------------------------------------------------
+#
+# A live incident (2026-09) hit two DIFFERENT shapes of "the provider will
+# refuse every call, not just this one": an Anthropic workspace exhausting
+# its on-demand usage limit (a 400 `invalid_request_error` whose message
+# names a reset date), and a Vertex AI Claude quota bucket with NO
+# allocation at all for a region×model pair (a 429 that retrying the SAME
+# region reproduces identically). Before this classification existed, both
+# reached `run_facts_extraction` as an undifferentiated
+# `FactsExtractionUnavailable` — which FAILS THE JOB — while the crawl's
+# `extraction.facts.stream_every` trigger kept enqueueing a fresh pass every
+# threshold, 161 failed job rows overnight with no single place saying
+# "facts are paused because the provider refuses".
+
+#: The closed set of :func:`classify_provider_limit_error` outcomes. A
+#: pass that hits one of these stops itself cleanly
+#: (``interrupted_reason: "provider_limit"``) instead of failing the job,
+#: and records a fleet-level condition (``extraction_conditions_repo()``)
+#: that suppresses further STREAMED enqueues until it clears — see
+#: :func:`streamed_pass_suppressed_by_provider_limit`. Deliberately NOT the
+#: same thing as an ordinary transient 429/5xx: those are exactly what
+#: :func:`src.anonymization_ner._is_retryable`'s AIMD/backoff already
+#: absorbs, and retrying THEM usually succeeds on the next attempt.
+PROVIDER_LIMIT_REASONS = ("workspace_limit", "quota_exceeded", "billing_disabled")
+
+
+class ProviderLimitHit(RuntimeError):
+    """A provider refusal classified as one of :data:`PROVIDER_LIMIT_REASONS`
+    — see the module section docstring above. Carries what
+    :func:`record_provider_limit_condition` needs to persist the fleet-level
+    condition; ``provider``/``model``/``region`` are filled in by the
+    CALLER (this exception is raised from deep inside a model-call helper
+    that does not always know the pass's own resolved provider), never by
+    the classifier itself.
+    """
+
+    def __init__(self, message: str, *, reason: str, retry_after_s: Optional[int] = None) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.retry_after_s = retry_after_s
+
+
+def _retry_after_seconds(exc: BaseException) -> Optional[int]:
+    """Best-effort ``Retry-After`` (seconds) off a provider error — ``None``
+    when absent or unparseable, in which case
+    :data:`PROVIDER_LIMIT_COOLDOWN_S` applies instead. Checked structurally
+    (an attribute, then an HTTP response header) so this never depends on a
+    specific SDK exception type being importable.
+    """
+    retry_after = getattr(exc, "retry_after", None)
+    if isinstance(retry_after, (int, float)) and retry_after > 0:
+        return int(retry_after)
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None)
+    if headers is not None:
+        try:
+            raw = headers.get("retry-after")
+            if raw is not None:
+                value = int(float(raw))
+                return value if value > 0 else None
+        except (TypeError, ValueError, AttributeError):
+            pass
+    return None
+
+
+def classify_provider_limit_error(exc: BaseException) -> Optional[str]:
+    """One of :data:`PROVIDER_LIMIT_REASONS` when ``exc`` is a provider
+    refusal this module treats as a FLEET-LEVEL condition, or ``None`` for
+    everything else — including an ordinary transient 429/5xx
+    (``_is_retryable`` already retries those) and a per-document
+    ``invalid_request_error`` like "prompt is too long"
+    (:func:`_classify_permanent_error` already handles that).
+
+    Message-based, deliberately: neither provider exposes a distinct
+    exception TYPE or status code for "the whole account/workspace/region
+    is out of usage" versus "this one request was malformed" (both are a
+    400 ``invalid_request_error`` on Anthropic) or "temporarily rate
+    limited" versus "this bucket has zero allocation" (both are a 429 on
+    Vertex) — status code and SDK type are checked first where they help,
+    but the message is the only signal that actually distinguishes them.
+    Kept to phrases observed live (TCRD-296 synthesis F.25):
+
+    - ``"workspace_limit"``: message mentions BOTH "workspace" and "usage
+      limit(s)" — the exact shape hit live, "Your workspace has hit the
+      API usage limits for on-demand daily spend ... You'll regain access
+      on 2026-10-01".
+    - ``"billing_disabled"``: message mentions "billing" together with
+      "disabled"/"inactive"/"not enabled" — grouped with the other two
+      rather than dropped because it is the same "nothing will succeed
+      until an operator acts" shape.
+    - ``"quota_exceeded"``: message mentions "quota" — Vertex's own
+      ``ResourceExhausted`` messages name the exhausted quota metric by
+      id ("Quota exceeded for quota metric ... and limit ... for consumer
+      ..."), which a genuinely transient rate-limit 429 does not (those
+      say "rate limit" / "too many requests", not "quota").
+    """
+    message = str(exc)
+    lowered = message.lower()
+    if "billing" in lowered and any(word in lowered for word in ("disabled", "inactive", "not enabled")):
+        return "billing_disabled"
+    if "workspace" in lowered and "usage limit" in lowered:
+        return "workspace_limit"
+    if "quota" in lowered:
+        return "quota_exceeded"
+    return None
+
+
+#: How long an active ``provider_limit`` condition suppresses a STREAMED
+#: pass (``crawler._enqueue_streamed_facts_pass``) after it last fired —
+#: see :func:`streamed_pass_suppressed_by_provider_limit`. A provider-given
+#: ``retry_after`` (seconds, :func:`_retry_after_seconds`) wins over this
+#: constant when present. The MANUAL trigger (``POST …/facts-extract``) is
+#: deliberately NEVER gated by this — an operator who just fixed the
+#: underlying limit should not have to wait out a cooldown to prove it, and
+#: a successful manual pass is exactly what clears the condition for
+#: everyone else (:func:`clear_provider_limit_conditions`).
+PROVIDER_LIMIT_COOLDOWN_S = 1800
+
+
+def record_provider_limit_condition(
+    *,
+    reason: str,
+    provider: str,
+    model: str,
+    region: Optional[str],
+    message: str,
+    retry_after_s: Optional[int],
+) -> None:
+    """Persist (or refresh) the fleet-level condition a
+    :class:`ProviderLimitHit` produced. Best-effort — a broken write here
+    must never turn an already-gracefully-stopped pass into a failed job,
+    and ``extraction_conditions`` is PG-only (A3 ratchet): on a DuckDB-
+    backed instance this silently no-ops (logged at debug), the same "fail
+    clean, never a 500" posture every other PG-only surface in this
+    pipeline takes.
+    """
+    try:
+        from src.repositories import extraction_conditions_repo
+
+        extraction_conditions_repo().record(
+            reason=reason, provider=provider, model=model, region=region, message=message, retry_after_s=retry_after_s
+        )
+    except Exception as exc:  # noqa: BLE001 — observability, never load-bearing
+        logger.debug("facts extraction: could not persist the provider_limit condition (%s) — continuing", exc)
+
+
+def clear_provider_limit_conditions(provider: str) -> None:
+    """Clear every active ``provider_limit`` condition for ``provider`` —
+    called once a pass for that provider completes WITHOUT hitting one,
+    the signal the provider is answering again. Same best-effort, fail-
+    clean posture as :func:`record_provider_limit_condition`.
+    """
+    try:
+        from src.repositories import extraction_conditions_repo
+
+        extraction_conditions_repo().clear_for_provider(provider)
+    except Exception as exc:  # noqa: BLE001 — observability, never load-bearing
+        logger.debug(
+            "facts extraction: could not clear provider_limit conditions for %s (%s) — continuing", provider, exc
+        )
+
+
+def active_provider_limit_conditions() -> List[Dict[str, Any]]:
+    """Every currently-active ``provider_limit`` condition, fleet-wide
+    (never per-connection — the underlying refusal is account/workspace/
+    region-scoped, not tied to one SharePoint connection). ``[]`` on a
+    DuckDB-backed instance (PG-only, A3 ratchet) or on any other repo
+    hiccup: a broken READ here must never itself block a pass, only an
+    actually-persisted condition should.
+    """
+    try:
+        from src.repositories import extraction_conditions_repo
+
+        return list(extraction_conditions_repo().list_active())
+    except Exception:  # noqa: BLE001 — RequiresPostgresBackend or any repo hiccup
+        return []
+
+
+def _condition_still_cooling_down(condition: Dict[str, Any], *, now: Optional[datetime] = None) -> bool:
+    """Whether ``condition`` (one row from :func:`active_provider_limit_conditions`)
+    is still within its cooldown window — its own ``retry_after_s`` past
+    ``last_seen`` when the provider gave one, else :data:`PROVIDER_LIMIT_COOLDOWN_S`.
+    An unparseable ``last_seen`` is treated as still cooling down — the
+    safer default when the stored row cannot say otherwise.
+    """
+    now = now or datetime.now(timezone.utc)
+    last_seen = condition.get("last_seen")
+    if not isinstance(last_seen, datetime):
+        try:
+            last_seen = datetime.fromisoformat(str(last_seen))
+        except (TypeError, ValueError):
+            return True
+    if last_seen.tzinfo is None:
+        last_seen = last_seen.replace(tzinfo=timezone.utc)
+    retry_after = condition.get("retry_after_s")
+    cooldown = (
+        int(retry_after) if isinstance(retry_after, (int, float)) and retry_after > 0 else PROVIDER_LIMIT_COOLDOWN_S
+    )
+    return (now - last_seen).total_seconds() < cooldown
+
+
+def streamed_pass_suppressed_by_provider_limit() -> Optional[Dict[str, Any]]:
+    """The active, still-cooling-down ``provider_limit`` condition that
+    should stop a STREAMED pass from being enqueued, or ``None`` when none
+    applies. Called ONLY from ``crawler._enqueue_streamed_facts_pass`` — the
+    self-continuation chain (``maybe_continue_pass``) never needs its own
+    call to this: it already only fires on ``interrupted_reason ==
+    "timeout"``, and a provider-limit stop always reports
+    ``"provider_limit"`` instead, so the chain simply resets and stops on
+    its own (see that function's docstring). The MANUAL trigger
+    (``POST …/facts-extract``) never calls this either — see
+    :data:`PROVIDER_LIMIT_COOLDOWN_S`.
+    """
+    for condition in active_provider_limit_conditions():
+        if _condition_still_cooling_down(condition):
+            return condition
+    return None
+
+
+# --------------------------------------------------------------------------
+# Vertex region × model quota matrix (live finding (b), TCRD-296 synthesis F.25)
+# --------------------------------------------------------------------------
+
+#: Vertex Claude quota buckets that actually exist, keyed by the model
+#: TIER substring found in a resolved model id (``"haiku"``/``"sonnet"``),
+#: not the exact dated id — a model bump within a tier must not silently
+#: invalidate this table. A region NOT listed for a tier has NO quota
+#: allocation for it at all: a pass pinned there answers 429 on every call,
+#: even a 5-token one — observed live for Sonnet outside ``global`` (the
+#: project had no regional bucket at all) and for Haiku at peak load
+#: (region buckets saturated). A model tier this table does not name
+#: (``opus``, or a future tier) is treated as unconstrained — this is a
+#: known-bad-combination guardrail, not a closed allowlist, so an unlisted
+#: tier is never refused on a stale table.
+VERTEX_REGION_MODEL_MATRIX: Dict[str, Tuple[str, ...]] = {
+    "haiku": ("global", "us-east5", "europe-west1"),
+    "sonnet": ("global",),
+}
+
+
+def vertex_region_supports_model(region: str, model: str) -> bool:
+    """Whether ``region`` has a documented Claude-on-Vertex quota bucket for
+    ``model`` per :data:`VERTEX_REGION_MODEL_MATRIX`. ``True`` for an empty
+    region/model (nothing to refuse yet) and for a model tier the matrix
+    does not name.
+    """
+    region_norm = (region or "").strip().lower()
+    model_lower = (model or "").lower()
+    if not region_norm or not model_lower:
+        return True
+    for tier, regions in VERTEX_REGION_MODEL_MATRIX.items():
+        if tier in model_lower:
+            return region_norm in regions
+    return True
+
+
+# --------------------------------------------------------------------------
 # Config
 # --------------------------------------------------------------------------
 
@@ -2070,15 +2328,27 @@ class _Extractor:
     def call(self, user_message: str) -> str:
         """One bounded-retry call.
 
-        Raises :class:`FactsDocumentError` IMMEDIATELY (no retry, no
+        Raises :class:`ProviderLimitHit` IMMEDIATELY (no retry, no backoff
+        sleep) for an error :func:`classify_provider_limit_error` recognizes
+        as a closed-set provider refusal that is NOT document-specific
+        (workspace/usage-limit exhaustion, billing disabled — checked
+        before the per-document classification below, since a workspace-
+        limit 400 would otherwise be misread as "this document's prompt is
+        too long"). :class:`FactsDocumentError` IMMEDIATELY (no retry, no
         backoff sleep) for an error :func:`_classify_permanent_error`
         recognizes as PER-DOCUMENT permanent (an ``invalid_request_error``
         — most commonly "prompt is too long") — burning the retry budget on
-        an identical resend would only reproduce the same rejection.
-        :class:`FactsExtractionUnavailable` on exhaustion of a genuinely
-        transient failure, or on a non-retryable failure that is NOT
-        document-specific (credentials, permissions...) — never returns an
-        empty reply to be mistaken for an empty document.
+        an identical resend would only reproduce the same rejection. A
+        genuinely transient failure (429/5xx) is retried up to
+        ``max_attempts``; on exhaustion, :func:`classify_provider_limit_error`
+        is checked ONE more time against the LAST error — a Vertex quota
+        bucket with zero allocation answers 429 (retryable-shaped) on every
+        attempt, so this is where that structural refusal is finally told
+        apart from an ordinary saturated-but-recoverable rate limit.
+        :class:`FactsExtractionUnavailable` for everything else that
+        exhausts retries, or a non-retryable failure that is neither of the
+        above (credentials, permissions...) — never returns an empty reply
+        to be mistaken for an empty document.
         """
         from src.anonymization_ner import _is_retryable, _reply_text
 
@@ -2093,6 +2363,13 @@ class _Extractor:
             except Exception as exc:  # noqa: BLE001 — classified below
                 last_error = exc
                 if not _is_retryable(exc):
+                    limit_reason = classify_provider_limit_error(exc)
+                    if limit_reason is not None:
+                        raise ProviderLimitHit(
+                            f"fact extraction: provider refused ({limit_reason}): {type(exc).__name__}: {exc}",
+                            reason=limit_reason,
+                            retry_after_s=_retry_after_seconds(exc),
+                        ) from exc
                     reason = _classify_permanent_error(exc)
                     if reason is not None:
                         raise FactsDocumentError(
@@ -2114,6 +2391,15 @@ class _Extractor:
                 continue
             self._record(response)
             return _reply_text(response)
+        if last_error is not None:
+            limit_reason = classify_provider_limit_error(last_error)
+            if limit_reason is not None:
+                raise ProviderLimitHit(
+                    f"fact extraction: provider refused ({limit_reason}) after {attempts_made} attempt(s): "
+                    f"{type(last_error).__name__}: {last_error}",
+                    reason=limit_reason,
+                    retry_after_s=_retry_after_seconds(last_error),
+                ) from last_error
         raise FactsExtractionUnavailable(
             f"fact extraction failed after {attempts_made} attempt(s): {type(last_error).__name__}: {last_error}"
         ) from last_error
@@ -3400,9 +3686,19 @@ def _submit_batch(
     ]
     try:
         batch = client.messages.batches.create(requests=requests)
-    except FactsExtractionUnavailable:
+    except (FactsExtractionUnavailable, ProviderLimitHit):
         raise
     except Exception as exc:  # noqa: BLE001 — the model account is unreachable, not one document's failure
+        limit_reason = classify_provider_limit_error(exc)
+        if limit_reason is not None:
+            # The live incident this classification exists for: a workspace
+            # usage-limit exhaustion surfaces AT SUBMISSION, not per
+            # document — every subsequent batch would fail identically.
+            raise ProviderLimitHit(
+                f"facts extraction: batch submission refused ({limit_reason}): {type(exc).__name__}: {exc}",
+                reason=limit_reason,
+                retry_after_s=_retry_after_seconds(exc),
+            ) from exc
         raise FactsExtractionUnavailable(
             f"facts extraction: batch submission failed: {type(exc).__name__}: {exc}"
         ) from exc
@@ -3422,9 +3718,16 @@ def _poll_batch_until_ended(
     while True:
         try:
             batch = client.messages.batches.retrieve(batch_id)
-        except FactsExtractionUnavailable:
+        except (FactsExtractionUnavailable, ProviderLimitHit):
             raise
         except Exception as exc:  # noqa: BLE001 — the model account is unreachable
+            limit_reason = classify_provider_limit_error(exc)
+            if limit_reason is not None:
+                raise ProviderLimitHit(
+                    f"facts extraction: batch status check refused ({limit_reason}): {type(exc).__name__}: {exc}",
+                    reason=limit_reason,
+                    retry_after_s=_retry_after_seconds(exc),
+                ) from exc
             raise FactsExtractionUnavailable(
                 f"facts extraction: batch status check failed: {type(exc).__name__}: {exc}"
             ) from exc
@@ -3443,9 +3746,16 @@ def _collect_batch_results(client: Any, batch_id: str) -> Dict[str, Any]:
     """
     try:
         return {item.custom_id: item.result for item in client.messages.batches.results(batch_id)}
-    except FactsExtractionUnavailable:
+    except (FactsExtractionUnavailable, ProviderLimitHit):
         raise
     except Exception as exc:  # noqa: BLE001 — the model account is unreachable
+        limit_reason = classify_provider_limit_error(exc)
+        if limit_reason is not None:
+            raise ProviderLimitHit(
+                f"facts extraction: batch result collection refused ({limit_reason}): {type(exc).__name__}: {exc}",
+                reason=limit_reason,
+                retry_after_s=_retry_after_seconds(exc),
+            ) from exc
         raise FactsExtractionUnavailable(
             f"facts extraction: batch result collection failed: {type(exc).__name__}: {exc}"
         ) from exc
@@ -3969,9 +4279,10 @@ def run_facts_extraction(
 
         A per-document failure is COUNTED and the pass continues — one
         document's bad reply must never cost the documents beside it their
-        results. A :class:`FactsExtractionUnavailable` is remembered
-        instead of raised here, so the remaining in-flight calls (already
-        paid for) still get drained before the pass stops.
+        results. A :class:`FactsExtractionUnavailable` (or
+        :class:`ProviderLimitHit`) is remembered instead of raised here, so
+        the remaining in-flight calls (already paid for) still get drained
+        before the pass stops.
         """
         nonlocal hard_stop, docs_unavailable
         future, work = inflight.popleft()
@@ -3990,6 +4301,15 @@ def run_facts_extraction(
                 work.doc_id,
                 exc.reason,
             )
+        except ProviderLimitHit as exc:
+            # A closed-set provider refusal (workspace/usage-limit,
+            # region×model quota, billing) — remembered like
+            # `FactsExtractionUnavailable` below, but turned into a CLEAN
+            # `interrupted_reason: "provider_limit"` stop after the drain
+            # rather than a failed job (see the `hard_stop` handling below).
+            docs_unavailable += 1
+            if hard_stop is None:
+                hard_stop = exc
         except FactsExtractionUnavailable as exc:
             docs_unavailable += 1
             if hard_stop is None:
@@ -4072,10 +4392,33 @@ def run_facts_extraction(
         # this pass's own bookkeeping" reasoning as the `_flush()` above.
         _run_end_of_pass_orphan_sweep(report)
 
+    resolved_provider_for_report = getattr(extractor, "provider", effective_provider)
     if hard_stop is not None:
-        # Loud, after the drain: the pass cannot be trusted, and "0 facts"
-        # would be indistinguishable from a corpus that has none.
-        raise hard_stop
+        if isinstance(hard_stop, ProviderLimitHit):
+            # A closed-set provider refusal ends the pass CLEANLY —
+            # `interrupted_reason: "provider_limit"`, never a failed job
+            # (see the module's provider-limit classification section) —
+            # and persists the fleet-level condition that suppresses
+            # further STREAMED enqueues until it clears.
+            report.interrupted = True
+            report.interrupted_reason = "provider_limit"
+            record_provider_limit_condition(
+                reason=hard_stop.reason,
+                provider=resolved_provider_for_report,
+                model=model,
+                region=getattr(extractor, "vertex_region", resolved_vertex_region),
+                message=str(hard_stop),
+                retry_after_s=hard_stop.retry_after_s,
+            )
+        else:
+            # Loud, after the drain: the pass cannot be trusted, and "0
+            # facts" would be indistinguishable from a corpus that has none.
+            raise hard_stop
+    else:
+        # No provider refusal this pass — the signal the provider is
+        # answering again, for whichever fleet-level condition (if any)
+        # this provider still has active.
+        clear_provider_limit_conditions(resolved_provider_for_report)
 
     usage = _usage()
     usage["documents"] = report.docs_extracted
@@ -4089,7 +4432,7 @@ def run_facts_extraction(
         prompt_origin=prompt_origin,
         ontology=_ontology_report(ontology_models),
         usage=usage,
-        provider=getattr(extractor, "provider", effective_provider),
+        provider=resolved_provider_for_report,
         provider_source=provider_source,
         transport=mode,
         vertex_region=getattr(extractor, "vertex_region", resolved_vertex_region),
@@ -4473,121 +4816,157 @@ def _run_batch_pass(
     for batch_id in resumed_ids:
         queue.append(batch_id)
 
-    # -- Phase 1: submit fresh batches for whatever is still pending -------
-    pending_works = list(
-        _plan_documents(
-            connection=connection,
-            docs_state=docs_state,
-            report=report,
-            files_repo=files_repo,
-            sources_repo=sources_repo,
-            wanted_doc_ids=wanted_doc_ids,
-            model=model,
-            fingerprint=fingerprint,
-            max_doc_chars=max_doc_chars,
-            system_prompt_tokens=system_prompt_tokens,
-            max_prompt_tokens=resolved_max_prompt_tokens,
+    def _drive_batches() -> None:
+        """Phase 1 (submit fresh batches for whatever :func:`_plan_documents`
+        still finds pending) + Phase 2 (drain the queue — poll, collect,
+        finalize; collecting a batch may enqueue MORE ids, a follow-up
+        retry batch). A single function so a :class:`ProviderLimitHit` from
+        ANY provider call inside either phase (:func:`_submit_and_track`,
+        :func:`_poll_batch_until_ended`, :func:`_collect_batch` via
+        :func:`_collect_batch_results`, or the retry submission's own
+        :func:`_submit_batch`) propagates to ONE `try`/`except` at the call
+        site instead of four separate ones — the caller converts it into a
+        clean ``interrupted_reason: "provider_limit"`` stop rather than a
+        failed job. Whatever is left un-drained (still ``batch-submitted``
+        in state, or an initial batch collected but its follow-up retry
+        never submitted) simply resumes next pass — this transport's own
+        documented resumability, unchanged.
+        """
+        nonlocal docs_planned
+        pending_works = list(
+            _plan_documents(
+                connection=connection,
+                docs_state=docs_state,
+                report=report,
+                files_repo=files_repo,
+                sources_repo=sources_repo,
+                wanted_doc_ids=wanted_doc_ids,
+                model=model,
+                fingerprint=fingerprint,
+                max_doc_chars=max_doc_chars,
+                system_prompt_tokens=system_prompt_tokens,
+                max_prompt_tokens=resolved_max_prompt_tokens,
+            )
         )
-    )
-    docs_planned += len(pending_works)
-    _report_progress()
-    groups = _group_pending_into_batches(
-        pending_works, system_prompt=system_prompt, batch_size=batch_size, max_output_tokens=max_output_tokens
-    )
-    for group in groups:
-        if _deadline_expired(deadline):
-            report.interrupted = True
-            report.interrupted_reason = "timeout"
-            break
-        batch_id = _submit_and_track(group, {w.file_id: w.user_message for w in group}, phase="initial")
-        queue.append(batch_id)
-
-    # -- Phase 2: drain the queue — poll, collect, finalize; collecting a
-    #             batch may enqueue MORE ids (a follow-up retry batch) ----
-    while queue:
-        batch_id = queue.popleft()
-        stale = [
-            fid
-            for fid, e in list(docs_state.items())
-            if isinstance(e, dict)
-            and e.get("batch_id") == batch_id
-            and e.get("status") == "batch-submitted"
-            and _batch_is_expired_by_age(e.get("submitted_at"))
-        ]
-        if stale:
-            for file_id in stale:
-                _requeue(file_id, reason="expired (past the 29-day results window)", permanent=False)
-            continue
-        ended = _poll_batch_until_ended(client, batch_id, poll_s=poll_s, deadline=deadline)
-        if ended is None:
-            report.interrupted = True
-            report.interrupted_reason = "timeout"
-            break
-        _collect_batch(batch_id)
-        if pending_retries:
+        docs_planned += len(pending_works)
+        _report_progress()
+        groups = _group_pending_into_batches(
+            pending_works, system_prompt=system_prompt, batch_size=batch_size, max_output_tokens=max_output_tokens
+        )
+        for group in groups:
             if _deadline_expired(deadline):
                 report.interrupted = True
                 report.interrupted_reason = "timeout"
-                # The failures that never got their retry are counted as
-                # dropped now — their INITIAL reply already shipped what
-                # passed the gate, and no more budget remains this pass to
-                # ship a follow-up batch for the rest.
-                for work, kept_nodes, kept_edges, failures, parse_errors in pending_retries:
-                    _accept(work, kept_nodes, kept_edges, len(failures), False, 0, parse_errors)
-                pending_retries.clear()
                 break
-            retry_works = [w for w, *_ in pending_retries]
-            # Bound each retry's failing-quote listing to the SAME token
-            # budget the document text itself was bounded to — see
-            # `_bound_failures_for_retry`'s docstring. `failures` (the FULL
-            # set) is still what `docs_state[...]["failed_count"]` below
-            # records, so `_merge_retry_reply`'s dropped-accounting at
-            # collection time is unaffected by the bound.
-            messages_by_file = {
-                w.file_id: _retry_message(
-                    w.user_message,
-                    _bound_failures_for_retry(
-                        failures,
-                        char_budget=max(
-                            0,
-                            _token_char_budget(system_prompt_tokens, resolved_max_prompt_tokens, tabular=w.tabular)
-                            - len(w.user_message),
-                        ),
-                    )[0],
-                )
-                for w, _, _, failures, _ in pending_retries
-            }
-            retry_batch_id = _submit_batch(
-                client,
-                model=resolved_model,
-                system_prompt=system_prompt,
-                works=retry_works,
-                messages_by_file=messages_by_file,
-                max_output_tokens=max_output_tokens,
-            )
-            submitted_at = _now_iso()
-            for w, kept_nodes, kept_edges, failures, parse_errors in pending_retries:
-                docs_state[w.file_id] = {
-                    "status": "batch-submitted",
-                    "batch_id": retry_batch_id,
-                    "custom_id": w.file_id,
-                    "submitted_at": submitted_at,
-                    "phase": "retry",
-                    "kept_nodes": kept_nodes,
-                    "kept_edges": kept_edges,
-                    "failed_count": len(failures),
-                    "parse_errors": parse_errors,
+            batch_id = _submit_and_track(group, {w.file_id: w.user_message for w in group}, phase="initial")
+            queue.append(batch_id)
+
+        while queue:
+            batch_id = queue.popleft()
+            stale = [
+                fid
+                for fid, e in list(docs_state.items())
+                if isinstance(e, dict)
+                and e.get("batch_id") == batch_id
+                and e.get("status") == "batch-submitted"
+                and _batch_is_expired_by_age(e.get("submitted_at"))
+            ]
+            if stale:
+                for file_id in stale:
+                    _requeue(file_id, reason="expired (past the 29-day results window)", permanent=False)
+                continue
+            ended = _poll_batch_until_ended(client, batch_id, poll_s=poll_s, deadline=deadline)
+            if ended is None:
+                report.interrupted = True
+                report.interrupted_reason = "timeout"
+                break
+            _collect_batch(batch_id)
+            if pending_retries:
+                if _deadline_expired(deadline):
+                    report.interrupted = True
+                    report.interrupted_reason = "timeout"
+                    # The failures that never got their retry are counted as
+                    # dropped now — their INITIAL reply already shipped what
+                    # passed the gate, and no more budget remains this pass to
+                    # ship a follow-up batch for the rest.
+                    for work, kept_nodes, kept_edges, failures, parse_errors in pending_retries:
+                        _accept(work, kept_nodes, kept_edges, len(failures), False, 0, parse_errors)
+                    pending_retries.clear()
+                    break
+                retry_works = [w for w, *_ in pending_retries]
+                # Bound each retry's failing-quote listing to the SAME token
+                # budget the document text itself was bounded to — see
+                # `_bound_failures_for_retry`'s docstring. `failures` (the FULL
+                # set) is still what `docs_state[...]["failed_count"]` below
+                # records, so `_merge_retry_reply`'s dropped-accounting at
+                # collection time is unaffected by the bound.
+                messages_by_file = {
+                    w.file_id: _retry_message(
+                        w.user_message,
+                        _bound_failures_for_retry(
+                            failures,
+                            char_budget=max(
+                                0,
+                                _token_char_budget(system_prompt_tokens, resolved_max_prompt_tokens, tabular=w.tabular)
+                                - len(w.user_message),
+                            ),
+                        )[0],
+                    )
+                    for w, _, _, failures, _ in pending_retries
                 }
-            save_state(connection_id, state)
-            docs_planned += len(pending_retries)
-            logger.info(
-                "facts extraction: connection %s — batch %s submitted (retry, %d document(s))",
-                connection_id,
-                retry_batch_id,
-                len(pending_retries),
-            )
-            pending_retries.clear()
-            queue.append(retry_batch_id)
+                retry_batch_id = _submit_batch(
+                    client,
+                    model=resolved_model,
+                    system_prompt=system_prompt,
+                    works=retry_works,
+                    messages_by_file=messages_by_file,
+                    max_output_tokens=max_output_tokens,
+                )
+                submitted_at = _now_iso()
+                for w, kept_nodes, kept_edges, failures, parse_errors in pending_retries:
+                    docs_state[w.file_id] = {
+                        "status": "batch-submitted",
+                        "batch_id": retry_batch_id,
+                        "custom_id": w.file_id,
+                        "submitted_at": submitted_at,
+                        "phase": "retry",
+                        "kept_nodes": kept_nodes,
+                        "kept_edges": kept_edges,
+                        "failed_count": len(failures),
+                        "parse_errors": parse_errors,
+                    }
+                save_state(connection_id, state)
+                docs_planned += len(pending_retries)
+                logger.info(
+                    "facts extraction: connection %s — batch %s submitted (retry, %d document(s))",
+                    connection_id,
+                    retry_batch_id,
+                    len(pending_retries),
+                )
+                pending_retries.clear()
+                queue.append(retry_batch_id)
+
+    try:
+        _drive_batches()
+    except ProviderLimitHit as exc:
+        # A closed-set provider refusal ends the pass CLEANLY, same posture
+        # as the sync transport's own `hard_stop` handling above — never a
+        # failed job. Whatever `_drive_batches` already collected/accepted
+        # before the refusal is kept; the flush below ships it.
+        report.interrupted = True
+        report.interrupted_reason = "provider_limit"
+        record_provider_limit_condition(
+            reason=exc.reason,
+            provider=provider,
+            model=model,
+            region=None,  # the Batches API is Anthropic-only — no Vertex region applies
+            message=str(exc),
+            retry_after_s=exc.retry_after_s,
+        )
+    else:
+        # No provider refusal this pass — the signal the provider is
+        # answering again.
+        clear_provider_limit_conditions(provider)
 
     _flush()
     # TCRD-296 C.12 — same single end-of-pass sweep as the sync transport's
@@ -4912,15 +5291,20 @@ def maybe_continue_pass(
     Continues when ALL of:
 
     - ``report["interrupted"]`` is true and ``report["interrupted_reason"]
-      == "timeout"`` — the ONLY non-terminal reason this module currently
-      produces (see :meth:`_Report.render`). A stop/cancel or a permanent
-      provider-limit error either leaves a different reason or never
-      reaches this function at all: :class:`FactsExtractionUnavailable`
-      is RAISED (see :func:`run_facts_extraction`'s ``hard_stop``
-      handling), which fails the job rather than completing it, so this
-      function is simply never called for that case. A future per-run
-      DOCUMENT budget (none exists today) would need its own distinct
-      reason value to auto-continue the same way.
+      == "timeout"`` — the ONLY reason this module auto-continues on (see
+      :meth:`_Report.render`). A stop/cancel leaves a different reason (or
+      the pass simply never finishes to report one), and a closed-set
+      provider refusal — TCRD-296 synthesis F.25 — completes the job with
+      ``interrupted_reason: "provider_limit"`` instead of ``"timeout"``, so
+      this check alone already keeps the auto-continuation chain from
+      re-enqueueing into a fleet-level condition
+      (:func:`streamed_pass_suppressed_by_provider_limit` is what gates the
+      OTHER re-enqueue point, the crawl's own streamed trigger). A genuinely
+      unrecoverable failure (credentials, permissions...) still raises
+      :class:`FactsExtractionUnavailable`, which fails the job rather than
+      completing it, so this function is simply never called for that
+      case. A future per-run DOCUMENT budget (none exists today) would
+      need its own distinct reason value to auto-continue the same way.
     - :func:`count_pending_documents` reports more than 0 remaining — a
       pass that timed out exactly as the corpus was exhausted has no more
       work, and chaining onto it would only spend a worker slot

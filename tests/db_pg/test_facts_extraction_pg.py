@@ -755,6 +755,67 @@ def test_an_unreachable_model_stops_the_pass_loudly(pg_env):
         _run(StubExtractor([FactsExtractionUnavailable("no credential")]))
 
 
+def test_a_provider_limit_hit_ends_the_sync_pass_cleanly_instead_of_failing_the_job(pg_env):
+    """A closed-set provider refusal (TCRD-296 synthesis F.25) is NOT the
+    same failure posture as an unreachable model above: the pass completes
+    with ``interrupted_reason: "provider_limit"`` rather than raising —
+    the whole point is that this ends up a `done` job, not a `failed` one,
+    so the crawl's streamed trigger has a condition to check instead of a
+    failed-job row to retry blindly."""
+    from connectors.sharepoint.facts_extraction import ProviderLimitHit
+    from src.repositories import extraction_conditions_repo
+
+    _seed_collection()
+    _seed_connection()
+    _seed_ontology()
+    _seed_document(file_id="cf_1", doc_id="doc1", text="Some text.")
+
+    report = _run(
+        StubExtractor([ProviderLimitHit("workspace usage limit hit", reason="workspace_limit", retry_after_s=None)])
+    )
+    assert report["interrupted"] is True
+    assert report["interrupted_reason"] == "provider_limit"
+
+    conditions = extraction_conditions_repo().list_active()
+    assert len(conditions) == 1
+    assert conditions[0]["reason"] == "workspace_limit"
+    assert conditions[0]["provider"] == "anthropic"
+
+
+def test_a_successful_sync_pass_clears_an_active_provider_limit_condition(pg_env):
+    """The signal the provider is answering again: once a pass for a
+    provider completes WITHOUT hitting a refusal, whatever condition that
+    provider had active is cleared — this is what makes the manual trigger
+    (``POST …/facts-extract``) a real "clear" action rather than a no-op."""
+    from src.repositories import extraction_conditions_repo
+
+    _seed_collection()
+    _seed_connection()
+    _seed_ontology()
+    _seed_document(file_id="cf_1", doc_id="doc1", text="The Northwind rollout began in March.")
+
+    extraction_conditions_repo().record(
+        reason="workspace_limit",
+        provider="anthropic",
+        model="claude-haiku-4-5",
+        region=None,
+        message="stale condition from an earlier pass",
+        retry_after_s=None,
+    )
+    assert extraction_conditions_repo().list_active() != []
+
+    node = {
+        "id": "engagement:northwind-rollout",
+        "type": "engagement",
+        "attrs": {"name": "Northwind rollout"},
+        "evidence": [{"doc_id": "doc1", "quote": "rollout began in March"}],
+    }
+    report = _run(StubExtractor([_stream(node)]))
+    assert report["interrupted"] is False
+
+    assert extraction_conditions_repo().list_active() == []
+
+
 # ---------------------------------------------------------------------------
 # Anonymization declaration — the fail-closed ingest gate
 # ---------------------------------------------------------------------------
@@ -1432,6 +1493,44 @@ def _run_batch(batch_client, **kwargs):
     return run_facts_extraction(CONNECTION_ID, transport="batch", batch_client=batch_client, **kwargs)
 
 
+class _RefusingBatchesAPI:
+    """A ``client.messages.batches`` double whose ``create()`` raises
+    immediately — the live incident's own failure point ("every facts pass
+    failed at batch submission")."""
+
+    def __init__(self, exc: BaseException) -> None:
+        self._exc = exc
+
+    def create(self, *, requests):
+        raise self._exc
+
+
+def test_a_provider_limit_hit_at_batch_submission_ends_the_pass_cleanly(pg_env):
+    """The batch transport's own version of the sync-transport test above —
+    the live incident's exact shape: a workspace usage-limit exhaustion
+    surfaces AT SUBMISSION, before any document-level result exists."""
+    from connectors.sharepoint.facts_extraction import ProviderLimitHit
+    from src.repositories import extraction_conditions_repo
+
+    _seed_collection()
+    _seed_connection()
+    _seed_ontology()
+    _seed_document(file_id="cf_1", doc_id="doc1", text="Some text.")
+
+    api = _RefusingBatchesAPI(
+        ProviderLimitHit("batch submission refused (workspace_limit)", reason="workspace_limit", retry_after_s=None)
+    )
+    report = _run_batch(FakeBatchClient(api))
+
+    assert report["interrupted"] is True
+    assert report["interrupted_reason"] == "provider_limit"
+    conditions = extraction_conditions_repo().list_active()
+    assert len(conditions) == 1
+    assert conditions[0]["reason"] == "workspace_limit"
+    # The Batches API is Anthropic-only — no Vertex region applies.
+    assert conditions[0]["region"] == ""
+
+
 def test_batch_pass_writes_claims_through_the_real_ingest_chokepoint(pg_env):
     _seed_collection()
     _seed_connection()
@@ -1940,6 +2039,28 @@ def test_maybe_continue_pass_does_nothing_for_a_non_timeout_reason(pg_env):
         CONNECTION_ID,
         payload={"connection_id": CONNECTION_ID},
         report={"interrupted": False, "interrupted_reason": None},
+        original_job_id="orig-job-1",
+    )
+    assert result is None
+    assert jobs_repo().list(kind="sharepoint-facts-extraction", status="queued", limit=10) == []
+
+
+def test_maybe_continue_pass_does_not_chain_onto_a_provider_limit_stop(pg_env):
+    """A provider refusal (TCRD-296 synthesis F.25) reports
+    ``interrupted_reason: "provider_limit"``, never ``"timeout"`` — the
+    self-continuation chain must not re-enqueue into the SAME condition
+    that just stopped the pass; the crawl's OWN streamed trigger is what
+    stays suppressed while the condition is active
+    (``streamed_pass_suppressed_by_provider_limit``, exercised in
+    ``tests/db_pg/test_extraction_conditions_pg.py``)."""
+    from connectors.sharepoint.facts_extraction import maybe_continue_pass
+    from src.repositories import jobs_repo
+
+    _seed_four_documents()
+    result = maybe_continue_pass(
+        CONNECTION_ID,
+        payload={"connection_id": CONNECTION_ID},
+        report={"interrupted": True, "interrupted_reason": "provider_limit"},
         original_job_id="orig-job-1",
     )
     assert result is None

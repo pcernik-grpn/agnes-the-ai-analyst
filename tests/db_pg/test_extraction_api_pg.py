@@ -55,6 +55,31 @@ def test_status_reads_never_run_as_null_not_as_zeros(tmp_path, monkeypatch, pg_e
     assert body["last_failed"] is None
     assert body["runs_total"] == 0
     assert body["as_of"]
+    assert body["provider_limit"] is None
+
+
+def test_status_surfaces_an_active_provider_limit_condition_for_this_connections_provider(
+    tmp_path, monkeypatch, pg_engine
+):
+    """TCRD-296 synthesis F.25 — the source card's own facts line reads this
+    to render "paused: provider limit" without polling the fleet endpoint."""
+    from src.repositories import extraction_conditions_repo
+
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token)
+
+    extraction_conditions_repo().record(
+        reason="quota_exceeded",
+        provider="anthropic",  # the instance default a connection with no override resolves to
+        model="claude-haiku-4-5-20251001",
+        region=None,
+        message="Quota exceeded",
+        retry_after_s=None,
+    )
+
+    body = client.get(f"{BASE}/{conn_id}/extraction/status", headers=_auth(token)).json()
+    assert body["provider_limit"] is not None
+    assert body["provider_limit"]["reason"] == "quota_exceeded"
 
 
 def test_status_surfaces_an_exhausted_jobs_run_as_last_failed(tmp_path, monkeypatch, pg_engine):
@@ -402,6 +427,48 @@ def test_fleet_row_carries_the_facts_stage_from_the_same_run(tmp_path, monkeypat
     assert row["facts"]["phase_active"] is True
     assert row["facts"]["docs_done"] == 12
     assert row["facts"]["docs_total"] == 340
+
+
+def test_fleet_payload_carries_an_active_provider_limit_condition(tmp_path, monkeypatch, pg_engine):
+    """TCRD-296 synthesis F.25 — the fleet's own top-level ``conditions``
+    list (the banner's read) AND the per-connection ``facts.provider_limit``
+    field (the source card's "paused: provider limit" line), both fed by
+    the SAME condition row so the two can never disagree."""
+    from src.repositories import extraction_conditions_repo
+
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token, name="sp-paused")
+
+    extraction_conditions_repo().record(
+        reason="workspace_limit",
+        provider="anthropic",
+        model="claude-haiku-4-5-20251001",
+        region=None,
+        message="Your workspace has hit the API usage limits ... regain access on 2026-10-01",
+        retry_after_s=None,
+    )
+
+    body = client.get(f"{FLEET_URL}?all=1", headers=_auth(token)).json()
+    assert len(body["conditions"]) == 1
+    condition = body["conditions"][0]
+    assert condition["reason"] == "workspace_limit"
+    assert condition["provider"] == "anthropic"
+
+    row = next(r for r in body["connections"] if r["connection_id"] == conn_id)
+    # The connection's own resolved facts provider (no override set — the
+    # instance default is "anthropic") matches the active condition.
+    assert row["facts"]["provider_limit"] is not None
+    assert row["facts"]["provider_limit"]["reason"] == "workspace_limit"
+
+
+def test_fleet_payload_has_no_conditions_when_none_are_active(tmp_path, monkeypatch, pg_engine):
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    _connection(client, token, name="sp-healthy")
+
+    body = client.get(f"{FLEET_URL}?all=1", headers=_auth(token)).json()
+    assert body["conditions"] == []
+    row = body["connections"][0]
+    assert row["facts"]["provider_limit"] is None
 
 
 def test_fleet_row_carries_the_age_filter_counters_from_the_same_run(tmp_path, monkeypatch, pg_engine):

@@ -674,10 +674,52 @@ _EMPTY_FLEET_FACTS: Dict[str, Any] = {
     # in this shape.
     "facts_pending_documents": None,
     "facts_pass_running": False,
+    # TCRD-296 synthesis F.25 — always overwritten by `_fleet_facts`'s own
+    # final assignment; listed here purely so this dict documents the
+    # complete shape of one row's `facts` object.
+    "provider_limit": None,
 }
 
 
-def _fleet_facts(run: Optional[Dict[str, Any]], connection_id: str) -> Dict[str, Any]:
+def _active_provider_limit_conditions() -> List[Dict[str, Any]]:
+    """Every currently-active ``provider_limit`` condition (TCRD-296
+    synthesis F.25) — best-effort: a broken read here must never break the
+    whole fleet view, only omit the banner. Delegates to
+    ``connectors.sharepoint.facts_extraction`` (which already fails clean
+    to ``[]`` on a DuckDB-backed instance), never
+    ``extraction_conditions_repo()`` directly — same layering as every
+    other cross-module read in this file.
+    """
+    try:
+        from connectors.sharepoint.facts_extraction import active_provider_limit_conditions
+
+        return active_provider_limit_conditions()
+    except Exception:  # noqa: BLE001 — observability, never load-bearing
+        return []
+
+
+def _matching_provider_limit_condition(connection: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The active ``provider_limit`` condition (if any) matching
+    ``connection``'s own RESOLVED facts provider — the per-connection
+    counterpart of ``_active_provider_limit_conditions``' fleet-wide list,
+    used by the source card's status endpoint. Best-effort, same posture:
+    a resolution failure means "nothing to report", never a broken card.
+    """
+    try:
+        from connectors.sharepoint.facts_extraction import resolve_effective_provider
+
+        effective_provider, _source = resolve_effective_provider(connection)
+    except Exception:  # noqa: BLE001 — observability, never load-bearing
+        return None
+    for condition in _active_provider_limit_conditions():
+        if condition.get("provider") == effective_provider:
+            return condition
+    return None
+
+
+def _fleet_facts(
+    run: Optional[Dict[str, Any]], connection_id: str, *, provider_limit: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
     """The facts stage's own numbers for one connection's latest run — read
     off the SAME row the crawl side already reads, never a second
     per-connection query or a re-read of the per-document idempotency state
@@ -705,6 +747,13 @@ def _fleet_facts(run: Optional[Dict[str, Any]], connection_id: str) -> Dict[str,
     ``run`` — the exact "three connections sat idle for hours" case
     TCRD-296 gap #61 reported, which a run-keyed field would have stayed
     blind to.
+
+    ``provider_limit`` (TCRD-296 synthesis F.25) is the caller's own
+    lookup — the active condition (if any) matching THIS connection's
+    resolved facts provider, or ``None`` — passed in rather than resolved
+    here so a fleet page rendering N connections looks the active
+    conditions up ONCE, not once per row. The source card renders it as
+    "paused: provider limit".
     """
     out = dict(_EMPTY_FLEET_FACTS)
     if run:
@@ -735,6 +784,7 @@ def _fleet_facts(run: Optional[Dict[str, Any]], connection_id: str) -> Dict[str,
         out["usage"] = (run.get("usage") or {}).get("facts") or {}
     out["facts_pending_documents"] = _facts_pending_documents(connection_id)
     out["facts_pass_running"] = _facts_job_in_flight(connection_id) is not None
+    out["provider_limit"] = provider_limit
     return out
 
 
@@ -827,6 +877,14 @@ def fleet_extraction_runs(
     parent_ids = [str(run["id"]) for run in latest.values() if run.get("shards_total") is not None]
     children_by_parent = repo.children_for(parent_ids) if parent_ids else {}
 
+    # Fleet-level provider-refusal conditions (TCRD-296 synthesis F.25) —
+    # ONE read for the whole page (never one query per connection), keyed
+    # by provider so each connection's row can look up whether ITS
+    # resolved facts provider is the one currently refusing.
+    from connectors.sharepoint.facts_extraction import resolve_effective_provider
+
+    conditions_by_provider = {str(c["provider"]): c for c in _active_provider_limit_conditions()}
+
     now = datetime.now(timezone.utc)
     rows: List[Dict[str, Any]] = []
     totals: Dict[str, Any] = {
@@ -862,7 +920,9 @@ def fleet_extraction_runs(
             run_out
             and (run_out.get("outcome") == "stalled" or any(s.get("stuck") for s in (run_out.get("shards") or [])))
         )
-        facts = _fleet_facts(run, connection_id)
+
+        effective_provider, _provider_source = resolve_effective_provider(connection)
+        facts = _fleet_facts(run, connection_id, provider_limit=conditions_by_provider.get(effective_provider))
         cost = _run_total_cost_usd(run)
         backlog = sharepoint_state_repo().backlog_counts(connection_id, "crawl")
 
@@ -917,6 +977,16 @@ def fleet_extraction_runs(
         "totals": totals,
         "jobs": jobs,
         "as_of": now.isoformat(),
+        # Fleet-level provider-refusal conditions (TCRD-296 synthesis
+        # F.25) — additive: `[]` on every instance before this shipped,
+        # and forever on a DuckDB-backed one (`extraction_conditions` is
+        # PG-only, A3 ratchet; the whole rest of THIS route already is
+        # too, so no extra guard is needed here). The fleet page renders
+        # this as a banner and the crawl's own streamed trigger
+        # (`crawler._enqueue_streamed_facts_pass`) is what actually stops
+        # re-enqueueing while one is active — this list is the operator
+        # SIGNAL, not the enforcement.
+        "conditions": _active_provider_limit_conditions(),
     }
 
 
@@ -1214,6 +1284,11 @@ async def extraction_status(
         # normally keeps the second one true whenever the first is > 0.
         "facts_pending_documents": _facts_pending_documents(connection_id),
         "facts_pass_running": facts_job is not None,
+        # TCRD-296 synthesis F.25 — the active `provider_limit` condition
+        # matching THIS connection's resolved facts provider, or `null`.
+        # The source card renders it as "paused: provider limit" on the
+        # same line as the pending-documents count above.
+        "provider_limit": _matching_provider_limit_condition(connection),
         # `POST …/extraction/stop` (below) always exists and always works —
         # the flag lives on `source_connections`, not on this PG-only table
         # — so there is now an honest Stop control to draw whenever a run is
@@ -1425,6 +1500,32 @@ async def patch_extraction_facts_config(
                 "(to clear the override)"
             ),
         )
+    if vertex_region_given and body.vertex_region is not None:
+        # Live finding (b), TCRD-296 synthesis F.25: Sonnet outside
+        # `global` (no regional quota bucket at all) answers 429 on
+        # every call. A connection has no per-connection model override,
+        # so this checks against the INSTANCE's currently configured
+        # model — the one a pass for THIS connection would actually use.
+        from connectors.sharepoint.facts_extraction import (
+            VERTEX_REGION_MODEL_MATRIX,
+            _model,
+            vertex_region_supports_model,
+        )
+
+        region_norm = body.vertex_region.strip().lower()
+        model = _model()
+        if not vertex_region_supports_model(region_norm, model):
+            matrix_hint = "; ".join(
+                f"{tier}: {', '.join(regions)}" for tier, regions in VERTEX_REGION_MODEL_MATRIX.items()
+            )
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"vertex_region={region_norm!r} has no documented Claude-on-Vertex quota bucket for the "
+                    f"instance's configured model ({model!r}) — every call would answer 429. Supported "
+                    f"region×model matrix: {matrix_hint}."
+                ),
+            )
 
     from src.repositories import source_connections_repo
 

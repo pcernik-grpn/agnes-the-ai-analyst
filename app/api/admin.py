@@ -592,6 +592,49 @@ def _leaf_touched(patch: Any, path: tuple[str, ...]) -> bool:
     return True
 
 
+def _validate_vertex_region_model_matrix(region: str, model_in_patch: Any) -> None:
+    """Refuse a ``vertex_region`` this save would pair with a model that has
+    NO documented Claude-on-Vertex quota bucket for it (live finding (b),
+    TCRD-296 synthesis F.25) — a project running Sonnet outside ``global``
+    answers 429 on every call, even a 5-token one, because it has no
+    regional bucket at all; a saturated Haiku region-bucket at peak is the
+    OTHER shape (a real, if temporary, capacity limit — not this guard's
+    job to refuse). Better a ``422`` naming the mismatch here than an
+    operator discovering it one paused pass at a time.
+
+    ``model_in_patch`` is the SAME save's own ``extraction.facts.model``
+    leaf when set (resolved through the same tier table a pass itself
+    would use); otherwise this instance's CURRENTLY configured model
+    (:func:`connectors.sharepoint.facts_extraction._model`) — the model
+    ``vertex_region`` would actually be paired with if this save touches
+    only the region.
+    """
+    from connectors.sharepoint.facts_extraction import VERTEX_REGION_MODEL_MATRIX, vertex_region_supports_model
+
+    if isinstance(model_in_patch, str) and model_in_patch.strip():
+        from connectors.llm.factory import resolve_model_tier
+
+        try:
+            model = resolve_model_tier(model_in_patch.strip())
+        except ValueError:
+            return  # an invalid model tier is a different validator's job
+    else:
+        from connectors.sharepoint.facts_extraction import _model
+
+        model = _model()
+
+    if vertex_region_supports_model(region, model):
+        return
+    matrix_hint = "; ".join(f"{tier}: {', '.join(regions)}" for tier, regions in VERTEX_REGION_MODEL_MATRIX.items())
+    raise HTTPException(
+        status_code=422,
+        detail=(
+            f"extraction.facts.vertex_region={region!r} has no documented Claude-on-Vertex quota bucket for "
+            f"model {model!r} — every call would answer 429. Supported region×model matrix: {matrix_hint}."
+        ),
+    )
+
+
 def _validate_extraction_section(sections: Dict[str, Dict[str, Any]]) -> None:
     """Field-level constraints + the env-lock refusal for `extraction.*`
     (T3: admin-editable producer config).
@@ -713,7 +756,8 @@ def _validate_extraction_section(sections: Dict[str, Dict[str, Any]]) -> None:
             if vertex_region.strip():
                 from connectors.sharepoint.facts_extraction import _region_looks_valid
 
-                if not _region_looks_valid(vertex_region.strip().lower()):
+                region_norm = vertex_region.strip().lower()
+                if not _region_looks_valid(region_norm):
                     raise HTTPException(
                         status_code=422,
                         detail=(
@@ -721,6 +765,7 @@ def _validate_extraction_section(sections: Dict[str, Dict[str, Any]]) -> None:
                             f"('global' allowed), or empty (got {vertex_region!r})"
                         ),
                     )
+                _validate_vertex_region_model_matrix(region_norm, facts.get("model"))
 
     crawler = patch.get("crawler")
     if crawler is not None:

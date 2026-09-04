@@ -1225,7 +1225,15 @@ def _fmt_facts_backlog_suffix(facts: Dict[str, Any]) -> str:
     can be nonzero even when no run is active at all — the "three
     connections sat idle for hours" case this column previously had no
     way to show. Empty when there is no backlog (`0`/`None`), matching
-    `_fmt_facts`'s own "say nothing" convention for an empty case."""
+    `_fmt_facts`'s own "say nothing" convention for an empty case.
+
+    A ``provider_limit`` condition (TCRD-296 synthesis F.25) wins over the
+    ordinary continuing/not-running wording — same precedence the fleet
+    web page's own facts line takes, so the terminal and the browser can
+    never disagree about WHY nothing is chasing the backlog."""
+    limit = facts.get("provider_limit")
+    if limit:
+        return f" · [bold yellow]paused: provider limit ({limit.get('provider')})[/bold yellow]"
     n = facts.get("facts_pending_documents")
     if not n:
         return ""
@@ -1274,7 +1282,24 @@ def _print_jobs_strip(jobs: Optional[Dict[str, Any]]) -> None:
     _console.print("Jobs — " + ", ".join(parts))
 
 
+def _print_provider_limit_conditions(conditions: Optional[List[Dict[str, Any]]]) -> None:
+    """The fleet-level provider-refusal banner (TCRD-296 synthesis F.25),
+    from the terminal — one line per active condition. `conditions` is
+    `[]`/absent on every instance before this shipped and forever on a
+    DuckDB-backed one, so this prints nothing in the common case."""
+    for condition in conditions or []:
+        scope_bits = [b for b in (condition.get("model"), condition.get("region")) if b]
+        scope = " " + " in ".join(scope_bits) if scope_bits else ""
+        retry_after = condition.get("retry_after_s")
+        retry_hint = f"retrying in {max(1, round(retry_after / 60))}m" if retry_after else "retrying automatically"
+        _console.print(
+            f"[bold yellow]Facts extraction paused:[/bold yellow] {condition.get('provider')}{scope} — "
+            f"{condition.get('message') or condition.get('reason')}; {retry_hint}."
+        )
+
+
 def _print_fleet_table(body: Dict[str, Any], *, show_all: bool) -> None:
+    _print_provider_limit_conditions(body.get("conditions"))
     rows = body.get("connections") or []
     totals = body.get("totals") or {}
     scope = "all connections" if show_all else "active"
