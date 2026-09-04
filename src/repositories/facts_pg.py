@@ -2849,7 +2849,37 @@ class FactsPgRepository:
         unchanged. Falls back to the original `claims` scan, unconditionally,
         whenever `fact_collection_stats` is still empty (nothing has been
         rebuilt since the migration that created these tables) — see
-        `rebuild_collection_stats`'s docstring."""
+        `rebuild_collection_stats`'s docstring.
+
+        **Admin fast path (TCRD-296 gap #70).** When `is_admin` is True and
+        `all_evidence` is False, `visible` collapses to `candidates` verbatim
+        (plus the `is_revealed` flag) instead of re-verifying every candidate
+        against `vis`/`vis_ec` via `EXISTS` — the per-candidate probe over
+        532k rows that cost 9.5s on a live graph (`count_visible_facts_by_
+        type`, TCRD-296 gap #70). This is a SPECIALISATION of the same gate,
+        never a relaxation of it: `_visibility_predicate` returns
+        unconditional `TRUE` for an admin, so the `NOT all_evidence` disjunct
+        collapses to `EXISTS (SELECT 1 FROM claims c2 WHERE c2.fact_id =
+        cand.subject_id)` — and every row already in `candidates` satisfies
+        that BY CONSTRUCTION, whichever half of `candidate_ids` produced it:
+        a membership-sourced candidate exists in `fact_collection_membership`
+        only because `_bump_collection_stats_impl`/`_rebuild_one_collection_
+        stats` insert/rebuild that table FROM a `GROUP BY` over `claims` on
+        the same `fact_id` — the membership row is itself proof a matching
+        `claims` row exists (see those methods' bodies). A fallback-sourced
+        candidate (stats table still empty) is read directly off `claims c`
+        (`SELECT DISTINCT c.fact_id`), so it IS such a row. Either way the
+        `EXISTS` is trivially true, `endpoint_claims` never needs building
+        (skipped entirely in this branch — one more join this path no longer
+        pays for), and `visible` reduces to `candidates` MINUS NOTHING
+        FURTHER: `wrong`/`restricted` subjects are already excluded upstream
+        in `candidates`, and a `revealed` correction adds no subject an admin
+        could not already see, so ORing `revealed_ids` back in is a no-op.
+        Deliberately scoped to `all_evidence=False` only — the
+        `all_evidence=True` branch keeps its own `NOT EXISTS` checks
+        unchanged below, out of caution, even though the same admin
+        short-circuit makes them vacuous too. The non-fast-path SQL text
+        below (non-admin, or `all_evidence=True`) is unchanged."""
         vis = self._visibility_predicate("c2.corpus_id", is_admin)
         vis3 = self._visibility_predicate("c3.corpus_id", is_admin)
         vis_ec = self._visibility_predicate("ec.corpus_id", is_admin)
@@ -2858,7 +2888,7 @@ class FactsPgRepository:
             "c.fact_id IS NOT NULL" if all_collections else "c.corpus_id = :corpus_id AND c.fact_id IS NOT NULL"
         )
         membership_where = "TRUE" if all_collections else "corpus_id = :corpus_id"
-        return f"""
+        candidates_sql = f"""
             candidate_ids AS (
                 SELECT fact_id AS subject_id FROM fact_collection_membership
                 WHERE {membership_where} AND EXISTS (SELECT 1 FROM fact_collection_stats)
@@ -2878,7 +2908,21 @@ class FactsPgRepository:
             ),
             revealed_ids AS (
                 SELECT subject_id FROM corrections WHERE subject_kind = 'fact' AND verdict = 'revealed'
-            ),
+            )"""
+        if is_admin and not all_evidence:
+            return (
+                candidates_sql
+                + """,
+            visible AS (
+                SELECT cand.subject_id,
+                       (cand.subject_id IN (SELECT subject_id FROM revealed_ids)) AS is_revealed
+                FROM candidates cand
+            )
+            """
+            )
+        return (
+            candidates_sql
+            + f""",
             endpoint_claims AS (
                 -- `audience` selected alongside `corpus_id` so `vis_ec`
                 -- (Task 10's audience selector) has a column to read off
@@ -2921,6 +2965,7 @@ class FactsPgRepository:
                    )
             )
             """
+        )
 
     def count_visible_facts_by_type(self, caller) -> Dict[str, int]:
         """Caller-scoped ``{type: count}`` over every visible fact — the
@@ -3185,6 +3230,82 @@ class FactsPgRepository:
                 out.setdefault(r["corpus_id"], {}).setdefault(r["type"], []).append(r["label"])
         return out
 
+    @staticmethod
+    def _facet_top_values_sql(*, q_present: bool, label_where: str) -> str:
+        """The tail of :meth:`facet_top_values_for_collections`'s query —
+        everything after the shared ``counted`` CTE — as a pure string
+        builder (no DB access), so its shape is unit-testable without a
+        live Postgres.
+
+        Two shapes, chosen by whether ``q`` (the typeahead route) is
+        present:
+
+        * ``q_present=False`` (the Library's default facet-menu request,
+          TCRD-296 gap #70): rank FIRST — `ROW_NUMBER() ... <= :limit_
+          per_type` straight over ``counted`` — then join `fact_aliases`
+          only for the surviving, already-bounded winners (at most
+          ``limit_per_type * len(types)`` rows). EXPLAIN ANALYZE on a live
+          graph showed the label-then-rank order below scanning EVERY
+          counted fact of the requested types (408k rows) into an
+          `aliased` HashAggregate and a 48 MB `Sort`, only to discard all
+          but the top `limit_per_type` per type — the alias join is now
+          bounded by the SAME cut the caller asked for, not by the size of
+          the graph.
+        * ``q_present=True``: unchanged from before this optimisation — the
+          label is needed BEFORE ranking, since ``q`` filters on it, so
+          `fact_aliases` is still joined for every counted fact first, then
+          filtered by ``label_where``, then ranked.
+
+        Both shapes return the same columns (``type, fact_id, label, n``)
+        in the same order (``type, n DESC, fact_id``) — the caller cannot
+        tell which branch ran from the result shape."""
+        if q_present:
+            return f"""
+            aliased AS (
+                SELECT fact_id, MIN(natural_key) AS label
+                FROM fact_aliases
+                WHERE fact_id IN (SELECT fact_id FROM counted)
+                GROUP BY fact_id
+            ),
+            labeled AS (
+                SELECT counted.type, counted.fact_id,
+                       COALESCE(aliased.label, counted.fact_id) AS label, counted.n
+                FROM counted
+                LEFT JOIN aliased ON aliased.fact_id = counted.fact_id
+            ),
+            filtered AS (
+                SELECT * FROM labeled {label_where}
+            ),
+            ranked AS (
+                SELECT *, ROW_NUMBER() OVER (PARTITION BY type ORDER BY n DESC, fact_id) AS rn
+                FROM filtered
+            )
+            SELECT type, fact_id, label, n
+            FROM ranked
+            WHERE rn <= :limit_per_type
+            ORDER BY type, n DESC, fact_id
+            """
+        return """
+            ranked AS (
+                SELECT *, ROW_NUMBER() OVER (PARTITION BY type ORDER BY n DESC, fact_id) AS rn
+                FROM counted
+            ),
+            top AS (
+                SELECT type, fact_id, n FROM ranked WHERE rn <= :limit_per_type
+            ),
+            aliased AS (
+                SELECT fact_id, MIN(natural_key) AS label
+                FROM fact_aliases
+                WHERE fact_id IN (SELECT fact_id FROM top)
+                GROUP BY fact_id
+            )
+            SELECT top.type AS type, top.fact_id AS fact_id,
+                   COALESCE(aliased.label, top.fact_id) AS label, top.n AS n
+            FROM top
+            LEFT JOIN aliased ON aliased.fact_id = top.fact_id
+            ORDER BY type, n DESC, fact_id
+            """
+
     def facet_top_values_for_collections(
         self,
         corpus_ids: Optional[List[str]],
@@ -3243,6 +3364,16 @@ class FactsPgRepository:
         count sums cleanly across collections). Falls back to the original
         `claims` scan, unconditionally, whenever `fact_collection_stats` is
         still empty — see `rebuild_collection_stats`'s docstring.
+
+        **Rank first, label last (TCRD-296 gap #70).** Without ``q`` (the
+        Library's default facet-menu request), :meth:`_facet_top_values_sql`
+        applies the ``ROW_NUMBER() ... <= limit_per_type`` cut BEFORE joining
+        `fact_aliases`, rather than after — EXPLAIN ANALYZE on a live graph
+        showed the old order labeling and sorting EVERY counted fact of the
+        requested types (408k rows, a 48 MB `Sort`) only to discard all but
+        the top `limit_per_type` per type. `q` (the typeahead route) needs
+        the label to filter ON, so that branch keeps the original label-
+        then-rank order — see that method's own docstring.
         """
         if not types:
             return {}
@@ -3286,29 +3417,7 @@ class FactsPgRepository:
                 JOIN facts f ON f.id = m.fact_id
                 WHERE f.type = ANY(:types)
             ),
-            aliased AS (
-                SELECT fact_id, MIN(natural_key) AS label
-                FROM fact_aliases
-                WHERE fact_id IN (SELECT fact_id FROM counted)
-                GROUP BY fact_id
-            ),
-            labeled AS (
-                SELECT counted.type, counted.fact_id,
-                       COALESCE(aliased.label, counted.fact_id) AS label, counted.n
-                FROM counted
-                LEFT JOIN aliased ON aliased.fact_id = counted.fact_id
-            ),
-            filtered AS (
-                SELECT * FROM labeled {label_where}
-            ),
-            ranked AS (
-                SELECT *, ROW_NUMBER() OVER (PARTITION BY type ORDER BY n DESC, fact_id) AS rn
-                FROM filtered
-            )
-            SELECT type, fact_id, label, n
-            FROM ranked
-            WHERE rn <= :limit_per_type
-            ORDER BY type, n DESC, fact_id
+            {self._facet_top_values_sql(q_present=bool(q_norm), label_where=label_where)}
             """
         )
         out: Dict[str, List[Dict[str, Any]]] = {t: [] for t in types}
@@ -3440,13 +3549,29 @@ class FactsPgRepository:
         `edge_collection_membership` instead of scanning `claims`, falling
         back unconditionally when `fact_collection_stats` is still empty.
         The visibility gate (`vis`, via `_visibility_predicate`) is
-        unchanged."""
+        unchanged.
+
+        **Admin fast path (TCRD-296 gap #70).** When `is_admin` is True,
+        `edge_visible` collapses to `edge_candidates` verbatim instead of
+        re-verifying every candidate against `vis` via `EXISTS` — the same
+        specialisation :meth:`_visible_facts_for_corpus_cte` documents in
+        full, applied here without an `all_evidence` fork because edges have
+        only the one (any-evidence) rule: `_visibility_predicate` is
+        unconditional `TRUE` for an admin, so `EXISTS (SELECT 1 FROM claims
+        c2 WHERE c2.edge_id = cand.subject_id AND TRUE)` is trivially true
+        for every `edge_candidates` row by the SAME construction argument
+        (an `edge_collection_membership` row, or a fallback row read
+        straight off `claims`, is itself proof a matching claim exists) —
+        see that method's docstring for the full proof. `wrong`/`restricted`
+        edges are already excluded upstream in `edge_candidates`, and ORing
+        `edge_revealed_ids` back in adds nothing an admin could not already
+        see. The non-admin SQL text below is unchanged."""
         vis = self._visibility_predicate("c2.corpus_id", is_admin)
         candidate_where = (
             "c.edge_id IS NOT NULL" if all_collections else "c.corpus_id = :corpus_id AND c.edge_id IS NOT NULL"
         )
         membership_where = "TRUE" if all_collections else "corpus_id = :corpus_id"
-        return f"""
+        candidates_sql = f"""
             edge_candidate_ids AS (
                 SELECT edge_id AS subject_id FROM edge_collection_membership
                 WHERE {membership_where} AND EXISTS (SELECT 1 FROM fact_collection_stats)
@@ -3466,7 +3591,25 @@ class FactsPgRepository:
             ),
             edge_revealed_ids AS (
                 SELECT subject_id FROM corrections WHERE subject_kind = 'edge' AND verdict = 'revealed'
-            ),
+            )"""
+        # `edge_revealed_ids` stays defined in BOTH branches above — some
+        # callers (e.g. `_edge_rows`) reference it directly in their own
+        # SELECT (a "revealed" display flag) alongside this fragment's
+        # `edge_visible`, admin or not, so only the EXISTS(vis) re-check
+        # inside `edge_visible` itself is fast-pathed below.
+        if is_admin:
+            return (
+                candidates_sql
+                + """,
+            edge_visible AS (
+                SELECT cand.subject_id
+                FROM edge_candidates cand
+            )
+            """
+            )
+        return (
+            candidates_sql
+            + f""",
             edge_visible AS (
                 SELECT cand.subject_id
                 FROM edge_candidates cand
@@ -3474,6 +3617,7 @@ class FactsPgRepository:
                    OR EXISTS (SELECT 1 FROM claims c2 WHERE c2.edge_id = cand.subject_id AND {vis})
             )
             """
+        )
 
     def count_visible_edges_for_collections(self, caller, corpus_ids: List[str]) -> Dict[str, int]:
         """Caller-scoped edge count per collection — added alongside

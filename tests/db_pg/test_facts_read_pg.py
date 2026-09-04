@@ -101,6 +101,16 @@ def _make_group_with_grant(pg_engine, *, group_name: str, collection_id: str, me
     resource_grants_repo().create(grp["id"], "collection", collection_id, "test-fixture", "required")
 
 
+def _make_admin(user_id: str) -> None:
+    """Seed ``user_id`` as a member of the (system-seeded) ``Admin`` group —
+    the god-mode short-circuit :func:`_dict_user` alone does not give."""
+    from src.repositories import user_group_members_repo, user_groups_repo, users_repo
+
+    users_repo().create(id=user_id, email=f"{user_id}@test.com", name=user_id)
+    admin_gid = user_groups_repo().get_by_name("Admin")["id"]
+    user_group_members_repo().add_member(user_id, admin_gid, source="test-fixture")
+
+
 def _seed_uploader(user_id: str) -> None:
     """Fixtures must be uploaded by an account that is NOT the probed
     caller (spec §5) — ownership unions into a dict user's readable set, so
@@ -2409,6 +2419,82 @@ def test_type_map_agrees_with_search_for_the_same_caller(pg_env, repo):
     assert mapped["engagement"] == len(searched["subjects"])
 
 
+def test_type_map_admin_still_excludes_wrong_and_restricted(pg_env, repo):
+    """Fast-path regression guard (TCRD-296 gap #70):
+    `_visible_facts_for_corpus_cte`'s admin/`all_evidence=False` branch
+    collapses `visible` to `candidates` directly, skipping the per-candidate
+    `EXISTS` re-check — but `candidates` itself still excludes `wrong`/
+    `restricted` subjects, so an admin caller must never see either. A
+    positive-control sibling of `test_type_map_counts_what_the_caller_can_
+    see` (non-admin, primary assertion) per CONTRIBUTING's testing
+    convention, kept because this is exactly the branch the fast path
+    touches."""
+    _seed_full_fixture()
+
+    plain_id = repo.create_fact(type="engagement")
+    repo.add_alias(fact_id=plain_id, type="engagement", natural_key="engagement:plain")
+    repo.add_claim(
+        fact_id=plain_id, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="Plain engagement."
+    )
+
+    wrong_id = repo.create_fact(type="engagement")
+    repo.add_claim(
+        fact_id=wrong_id, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="Wrong engagement."
+    )
+    repo.upsert_correction(
+        subject_kind="fact",
+        subject_id=wrong_id,
+        natural_keys={"aliases": []},
+        verdict="wrong",
+        reason="hallucinated",
+        decided_by="admin1",
+    )
+
+    restricted_id = repo.create_fact(type="engagement")
+    repo.add_claim(
+        fact_id=restricted_id,
+        corpus_file_id="cf_a1",
+        corpus_id=CORPUS_A,
+        file_sha256="sha1",
+        quote="Restricted engagement.",
+    )
+    repo.upsert_correction(
+        subject_kind="fact",
+        subject_id=restricted_id,
+        natural_keys={"aliases": []},
+        verdict="restricted",
+        reason="legal hold",
+        decided_by="admin1",
+    )
+
+    _make_admin("admin1")
+    assert repo.count_visible_facts_by_type(_dict_user("admin1")) == {"engagement": 1}
+
+
+def test_type_map_admin_matches_non_admin_on_a_fully_readable_graph(pg_env, repo):
+    """Before/after equivalence: on a graph the caller can read in full, the
+    admin fast path must count exactly what the ordinary (non-fast-path)
+    caller-scoped query counts for the same caller — the fast path is a
+    specialisation of the same gate, never a different answer."""
+    _seed_full_fixture()
+    for slug in ("alpha", "beta"):
+        fact_id = repo.create_fact(type="engagement")
+        repo.add_alias(fact_id=fact_id, type="engagement", natural_key=f"engagement:{slug}")
+        repo.add_claim(
+            fact_id=fact_id,
+            corpus_file_id="cf_a1",
+            corpus_id=CORPUS_A,
+            file_sha256="sha1",
+            quote=f"{slug} kicked off in March.",
+            attrs={},
+        )
+
+    _make_admin("admin1")
+    uploader_counts = repo.count_visible_facts_by_type(_dict_user("uploader1"))
+    admin_counts = repo.count_visible_facts_by_type(_dict_user("admin1"))
+    assert admin_counts == uploader_counts == {"engagement": 2}
+
+
 # ---------------------------------------------------------------------------
 # Edge type map — the `fact_neighbors(edge_types=...)` discovery row: an
 # agent should be able to learn a valid edge type name (e.g. "in_industry")
@@ -2487,6 +2573,60 @@ def test_edge_type_map_agrees_with_neighbors_for_the_same_caller(pg_env, repo):
     mapped = repo.count_visible_edges_by_type(caller)
     neighbors = repo.neighbors(caller, hub, edge_types=["in_industry"])
     assert mapped["in_industry"] == len([e for e in neighbors["edges"] if e["type"] == "in_industry"])
+
+
+def test_edge_type_map_admin_still_excludes_wrong_and_restricted(pg_env, repo):
+    """Fast-path regression guard (TCRD-296 gap #70), edge sibling:
+    `_visible_edges_for_corpus_cte`'s admin branch collapses `edge_visible`
+    to `edge_candidates` directly, skipping the per-candidate `EXISTS`
+    re-check — but `edge_candidates` itself still excludes the edge's OWN
+    `wrong`/`restricted` correction, so an admin caller must never see it.
+    Positive-control sibling of `test_edge_type_map_counts_what_the_caller_
+    can_see` (non-admin, primary assertion)."""
+    _seed_full_fixture()
+    src = repo.create_fact(type="client")
+    good_dst = repo.create_fact(type="industry")
+    wrong_dst = repo.create_fact(type="sponsor")
+
+    good_edge = repo.create_edge(src=src, type="in_industry", dst=good_dst)
+    repo.add_claim(
+        edge_id=good_edge, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="In manufacturing."
+    )
+    wrong_edge = repo.create_edge(src=src, type="owned_by", dst=wrong_dst)
+    repo.add_claim(
+        edge_id=wrong_edge, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote="Owned by nobody."
+    )
+    repo.upsert_correction(
+        subject_kind="edge",
+        subject_id=wrong_edge,
+        natural_keys={"aliases": []},
+        verdict="wrong",
+        reason="hallucinated",
+        decided_by="admin1",
+    )
+
+    _make_admin("admin1")
+    assert repo.count_visible_edges_by_type(_dict_user("admin1")) == {"in_industry": 1}
+
+
+def test_edge_type_map_admin_matches_non_admin_on_a_fully_readable_graph(pg_env, repo):
+    """Before/after equivalence for the edge fast path: on a graph the
+    caller can read in full, the admin fast path must count exactly what the
+    ordinary caller-scoped query counts for the same caller."""
+    _seed_full_fixture()
+    src = repo.create_fact(type="client")
+    for dst_type, edge_type, quote in (
+        ("industry", "in_industry", "Acme operates in manufacturing."),
+        ("sponsor", "owned_by", "Acme is owned by Summit Partners."),
+    ):
+        dst = repo.create_fact(type=dst_type)
+        edge_id = repo.create_edge(src=src, type=edge_type, dst=dst)
+        repo.add_claim(edge_id=edge_id, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="sha1", quote=quote)
+
+    _make_admin("admin1")
+    uploader_counts = repo.count_visible_edges_by_type(_dict_user("uploader1"))
+    admin_counts = repo.count_visible_edges_by_type(_dict_user("admin1"))
+    assert admin_counts == uploader_counts == {"in_industry": 1, "owned_by": 1}
 
 
 # ---------------------------------------------------------------------------
@@ -2863,6 +3003,57 @@ def test_facet_top_values_q_narrows_to_matching_labels(pg_env, repo):
 
     out = repo.facet_top_values_for_collections([CORPUS_A], types=["client"], limit_per_type=10, q="parts")
     assert [v["label"] for v in out["client"]] == ["Parts Authority"]
+
+
+def test_facet_top_values_q_ranks_and_bounds_matching_labels(pg_env, repo):
+    """TCRD-296 gap #70: the `q` branch's rank-after-label order is
+    unchanged by the rank-first optimisation of the `q=None` branch — still
+    ranked by document count and still cut at `limit_per_type`, with more
+    matches present than the cap allows."""
+    _seed_collection(collection_id=CORPUS_A, created_by="uploader1")
+    for i, n_docs in enumerate([1, 4, 2, 3]):
+        fact_id = repo.create_fact(type="client")
+        repo.add_alias(fact_id=fact_id, type="client", natural_key=f"widget-client-{i}")
+        for d in range(n_docs):
+            file_id = f"cf_{i}_{d}"
+            _seed_corpus_file(corpus_id=CORPUS_A, file_id=file_id, sha256=f"sha_{i}_{d}")
+            repo.add_claim(
+                fact_id=fact_id,
+                corpus_file_id=file_id,
+                corpus_id=CORPUS_A,
+                file_sha256=f"sha_{i}_{d}",
+                quote=f"widget-client-{i} appears in {file_id}.",
+            )
+    # a non-matching client, present so the SQL has to actually filter.
+    _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_extra", sha256="sha_extra")
+    _seed_client(repo, corpus_id=CORPUS_A, file_id="cf_extra", sha="sha_extra", natural_key="Unrelated Client")
+
+    out = repo.facet_top_values_for_collections([CORPUS_A], types=["client"], limit_per_type=2, q="widget")
+    assert [v["label"] for v in out["client"]] == ["widget-client-1", "widget-client-3"]
+    assert [v["document_count"] for v in out["client"]] == [4, 3]
+
+
+def test_facet_top_values_sql_q_none_ranks_before_joining_aliases():
+    """Static regression guard for the TCRD-296 gap #70 fix: the `q=None`
+    (Library) branch must rank (the `ROW_NUMBER()` window) BEFORE joining
+    `fact_aliases`, never after — the exact ordering inversion that made the
+    live query label and sort every candidate fact before keeping only the
+    top `limit_per_type`. No DB needed — :meth:`FactsPgRepository._facet_
+    top_values_sql` is a pure string builder. Regex on the generated SQL
+    text since the actual PG plan isn't asserted here (see the EXPLAIN
+    ANALYZE evidence in the TCRD-296 gap #70 report)."""
+    from src.repositories.facts_pg import FactsPgRepository
+
+    sql = FactsPgRepository._facet_top_values_sql(q_present=False, label_where="")
+    rank_pos = sql.index("ROW_NUMBER()")
+    alias_pos = sql.index("fact_aliases")
+    assert rank_pos < alias_pos, "fact_aliases must be joined only for already-ranked rows"
+
+    # The `q` branch is the OPPOSITE order, deliberately (it needs the label
+    # to filter on before it can rank) — pin that too so a future edit
+    # cannot accidentally unify the two branches the wrong way.
+    q_sql = FactsPgRepository._facet_top_values_sql(q_present=True, label_where="WHERE label ILIKE :q")
+    assert q_sql.index("fact_aliases") < q_sql.index("ROW_NUMBER()")
 
 
 def test_facet_top_values_empty_corpus_ids_list_is_empty_not_unscoped(pg_env, repo):
