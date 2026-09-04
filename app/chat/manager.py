@@ -311,6 +311,21 @@ def engine_session_id(config) -> Optional[str]:
     return str(uuid.uuid4())
 
 
+def _mint_engine_files_token(user_email: str, chat_id: str) -> str:
+    """Engine session JWT for the turn-end harvest's file reads (#2268).
+
+    Late import, mirroring ``kai_engine_provider._default_mint``:
+    ``app.api.kai`` pulls FastAPI and the repo factories, none of which this
+    module needs at import time (tests inject a fake mint). Synchronous — it
+    signs and writes a credential row — so event-loop callers go through
+    ``asyncio.to_thread``.
+    """
+    from app.api.kai import mint_engine_session_token
+
+    token, _expires = mint_engine_session_token(user_email, chat_id)
+    return token
+
+
 class ConcurrencyCapHit(Exception):
     """Raised when a user already has the maximum allowed active sessions."""
 
@@ -683,6 +698,16 @@ class ChatManager:
         # MVP where a delegation is resolved entirely within one gateway's
         # process.
         self._pending_child_delegation_depth: dict[str, int] = {}
+        # #2268: in-flight turn-end artifact harvest per chat_id. One at a
+        # time per session (a turn ending while the previous harvest still
+        # runs is skipped, not queued — see _schedule_artifact_harvest), and
+        # the entry is dropped by the task's own done-callback, so this never
+        # grows past the number of sessions harvesting right now.
+        self._harvest_tasks: dict[str, asyncio.Task] = {}
+        # Sessions whose turn ended while their previous harvest was still
+        # running: one more harvest is due once that one finishes (a set, so
+        # any number of deferrals collapse into a single re-run).
+        self._harvest_rerun: set[str] = set()
 
     @staticmethod
     def _daily_token_keys(user_email: str) -> tuple[str, str]:
@@ -2675,6 +2700,10 @@ class ChatManager:
             elif ftype == "done":
                 live.turn_buffer.clear()
                 live.turn_in_flight = False
+                # #2268: copy this turn's deliverables OUT of the sandbox
+                # while it is still there. Best-effort and off this task —
+                # see _schedule_artifact_harvest.
+                self._schedule_artifact_harvest(live)
             if ftype == "tool_call":
                 write_audit(
                     user_email=live.user_email,
@@ -2685,6 +2714,158 @@ class ChatManager:
                         "args_hash": hash_args(frame.get("args", {})),
                     },
                 )
+
+    # ------------------------------------------------------------------
+    # Turn-end artifact harvest (#2268)
+    # ------------------------------------------------------------------
+
+    def _schedule_artifact_harvest(self, live: "LiveSession") -> None:
+        """Fire this turn's artifact harvest as a background task.
+
+        OFF the pump task on purpose: the pump is what drains the runner's
+        stdout, and the harvest reads files back out of the sandbox (for an
+        engine-backed session, over HTTP). Awaiting a multi-megabyte
+        deliverable inline would park every subsequent frame behind a file
+        download.
+
+        One harvest per session at a time, never two concurrently: both would
+        list the same directory before either had written its rows, see no
+        existing ``object_key``, and insert a duplicate artifact for every
+        file. A turn ending while the previous harvest still runs is
+        therefore deferred rather than run — but NOT dropped: that in-flight
+        harvest started before this turn's files existed and cannot see them,
+        so it is re-run once when it finishes. Deferrals collapse (a flag,
+        not a queue), so a chatty session can never build a backlog.
+        """
+        existing = self._harvest_tasks.get(live.chat_id)
+        if existing is not None and not existing.done():
+            self._harvest_rerun.add(live.chat_id)
+            return
+        task = asyncio.create_task(self._harvest_turn_artifacts(live))
+        self._harvest_tasks[live.chat_id] = task
+
+        def _forget(done_task: asyncio.Task, chat_id: str = live.chat_id) -> None:
+            # Identity-checked: a later turn may already have registered a
+            # newer task under this chat_id.
+            if self._harvest_tasks.get(chat_id) is done_task:
+                self._harvest_tasks.pop(chat_id, None)
+            if chat_id in self._harvest_rerun:
+                self._harvest_rerun.discard(chat_id)
+                self._schedule_artifact_harvest(live)
+
+        task.add_done_callback(_forget)
+
+    async def _harvest_turn_artifacts(self, live: "LiveSession") -> None:
+        """Copy the files this session wrote to ``outputs/`` out of the
+        sandbox and into the object store + ``agent_artifacts`` (#2268).
+
+        A chat deliverable used to live only inside the sandbox, so once the
+        idle reaper paused the session its files were gone — for
+        ``provider: kai-agent`` irrecoverably, since the engine rebuilds a
+        resumed sandbox from the workspace tarball and a produced file was
+        never a tarball member. Harvesting at the end of every turn is what
+        makes the Files panel independent of a live sandbox.
+
+        Cheap by construction: one directory listing per turn, and an
+        already-harvested file is skipped by ``object_key`` BEFORE its bytes
+        are read (``harvest_session_artifacts``), so an unchanged
+        ``outputs/`` costs exactly that listing.
+
+        Never raises: this hangs off a completed chat turn, and no failure
+        here — object store down, system DB unreachable, engine timeout —
+        may turn a delivered answer into an error.
+        """
+        try:
+            from app.chat import artifact_harvest
+
+            if artifact_harvest.object_store() is None:
+                # Nowhere to put the bytes (signed-URL distribution not
+                # configured). Checked FIRST so an instance without an object
+                # store spends nothing per turn — no user lookup, no engine
+                # token mint, no listing round trip.
+                logger.debug(
+                    "artifact harvest: object store not configured — skipping session %s",
+                    live.chat_id,
+                )
+                return
+
+            owner_user_id = (users_repo().get_by_email(live.user_email) or {}).get("id")
+            if not owner_user_id:
+                logger.debug(
+                    "artifact harvest: no user row for %s — skipping session %s",
+                    live.user_email,
+                    live.chat_id,
+                )
+                return
+
+            from app.chat.artifact_harvest import chat_session_budget, harvest_session_artifacts
+
+            budget = chat_session_budget(live.chat_id)
+            if budget is None:
+                # At the session cap. chat_session_budget already logged it;
+                # nothing already harvested is touched.
+                return
+            max_bytes, max_files = budget
+
+            handle = await self._artifact_files_handle(live)
+            if handle is None:
+                return
+            session = self._repo.get_session(live.chat_id)
+            await harvest_session_artifacts(
+                live.chat_id,
+                getattr(session, "agent_id", None),
+                owner_user_id,
+                handle,
+                max_bytes=max_bytes,
+                max_files=max_files,
+            )
+        except Exception:
+            logger.exception("artifact harvest failed for %s — the turn is unaffected", live.chat_id)
+
+    async def _artifact_files_handle(self, live: "LiveSession"):
+        """The sandbox file API the harvest reads ``outputs/`` through, or
+        ``None`` when this session has none.
+
+        Two shapes behind one seam:
+
+        - native sandbox providers (``docker``) — the live handle's own file
+          API (``handle.files``), exactly what the agent-API call sites pass;
+        - engine-backed providers (``kai-agent``) — an ``EngineFilesHandle``
+          over the engine's sandbox file routes, because the engine handle
+          speaks turns, not files. Without it the harvest would silently skip
+          the one provider whose sandbox lifetime Agnes does not control.
+        """
+        from app.chat.kai_engine_files import EngineFilesHandle, is_engine_sandbox
+
+        if not is_engine_sandbox(self._config):
+            handle = live.handle
+            if handle is None or getattr(handle, "files", None) is None:
+                return None
+            return handle
+
+        base_url = str(getattr(self._config, "kai_agent_url", "") or "").strip()
+        if not base_url:
+            return None
+        try:
+            token = await asyncio.to_thread(_mint_engine_files_token, live.user_email, live.chat_id)
+        except Exception:
+            # Almost always an unset KAI_HOST_JWT_SECRET (the mint's own
+            # 503) — an operator problem the engine provider reports far
+            # more loudly than a harvest can.
+            logger.warning(
+                "artifact harvest: could not mint an engine session token for %s — skipping",
+                live.chat_id,
+                exc_info=True,
+            )
+            return None
+        from app.chat.artifact_harvest import CHAT_ARTIFACT_MAX_BYTES
+
+        return EngineFilesHandle(
+            base_url=base_url,
+            chat_id=live.chat_id,
+            token=token,
+            max_read_bytes=CHAT_ARTIFACT_MAX_BYTES,
+        )
 
     async def _broadcast(self, live: LiveSession, frame: dict) -> None:
         """Send a frame to every sink, snapshotting the list first so a
