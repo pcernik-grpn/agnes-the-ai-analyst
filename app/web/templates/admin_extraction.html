@@ -142,8 +142,19 @@
     <div class="value" id="ext-stat-stuck">—</div>
   </div>
   <div class="ext-card">
-    <div class="label">Est. cost</div>
+    <div class="label">Est. cost (this view)</div>
     <div class="value" id="ext-stat-cost">—</div>
+  </div>
+  {# Cost-truth fix — the SAME instance-wide cumulative rollup GET
+     /api/facts/ingest-runs already exposes (`llm_usage_totals`), now also
+     carried on this page's own response. Deliberately its own, distinctly
+     labelled tile: "this view" above totals only the rows this scope is
+     currently rendering, while this one is everything the instance has
+     EVER spent on fact extraction — the two must never be read as the
+     same number. #}
+  <div class="ext-card" title="Every facts_ingest_runs LLM usage this instance has ever persisted — independent of the table's own scope/filter above.">
+    <div class="label">LLM spend (cumulative, all connections)</div>
+    <div class="value" id="ext-stat-cumulative-cost">—</div>
   </div>
 </div>
 

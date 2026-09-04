@@ -351,3 +351,163 @@ def test_documents_done_since_no_matching_runs_is_zero(pg_engine, monkeypatch):
 
     repo = _make_repo(pg_engine, monkeypatch)
     assert repo.documents_done_since(["col_never_seen"], datetime.now(timezone.utc) - timedelta(minutes=10)) == 0
+
+
+# ---------------------------------------------------------------------------
+# llm_usage_rollup_by_corpus_ids — the BATCHED, per-connection sibling of
+# llm_usage_rollup(), attributed by corpus_ids overlap (fleet cost fix).
+# ---------------------------------------------------------------------------
+
+
+def test_llm_usage_rollup_by_corpus_ids_returns_a_full_entry_for_every_requested_key(pg_engine, monkeypatch):
+    """A key with no matching run — including one with an empty corpus_ids
+    list — still gets a zeroed-out entry, never a missing dict key, so a
+    caller can index every connection it asked about without a membership
+    check first."""
+    repo = _make_repo(pg_engine, monkeypatch)
+    out = repo.llm_usage_rollup_by_corpus_ids({"conn_a": ["col_a"], "conn_none": []})
+    assert set(out) == {"conn_a", "conn_none"}
+    for key in ("conn_a", "conn_none"):
+        assert out[key]["runs_with_usage"] == 0
+        assert out[key]["input_tokens"] == 0
+        assert out[key]["estimated_cost_usd"] is None
+        assert out[key]["models"] == []
+
+
+def test_llm_usage_rollup_by_corpus_ids_attributes_by_overlap(pg_engine, monkeypatch):
+    repo = _make_repo(pg_engine, monkeypatch)
+    _create(
+        repo,
+        corpus_ids=["col_a"],
+        llm_usage={
+            "input_tokens": 1000,
+            "output_tokens": 200,
+            "models": ["claude-haiku-4-5"],
+            "documents": 5,
+        },
+    )
+    _create(
+        repo,
+        corpus_ids=["col_b"],
+        llm_usage={
+            "input_tokens": 2000,
+            "output_tokens": 400,
+            "models": ["claude-haiku-4-5"],
+            "documents": 8,
+        },
+    )
+
+    out = repo.llm_usage_rollup_by_corpus_ids({"conn_a": ["col_a"], "conn_b": ["col_b"]})
+    assert out["conn_a"]["runs_with_usage"] == 1
+    assert out["conn_a"]["input_tokens"] == 1000
+    assert out["conn_a"]["documents"] == 5
+    assert out["conn_a"]["estimated_cost_usd"] is not None
+    assert out["conn_a"]["estimated_cost_usd"] > 0
+    assert out["conn_a"]["models"] == ["claude-haiku-4-5"]
+
+    assert out["conn_b"]["runs_with_usage"] == 1
+    assert out["conn_b"]["input_tokens"] == 2000
+    # conn_a's own total must not have picked up conn_b's run.
+    assert out["conn_a"]["input_tokens"] != out["conn_b"]["input_tokens"]
+
+
+def test_llm_usage_rollup_by_corpus_ids_never_double_counts_a_run_touching_two_of_the_same_keys_collections(
+    pg_engine, monkeypatch
+):
+    """A run whose corpus_ids overlaps TWO collections that both belong to
+    the same connection must contribute its usage ONCE to that connection,
+    not twice."""
+    repo = _make_repo(pg_engine, monkeypatch)
+    _create(
+        repo,
+        corpus_ids=["col_a", "col_a2"],
+        llm_usage={"input_tokens": 1000, "output_tokens": 200, "models": ["claude-haiku-4-5"]},
+    )
+
+    out = repo.llm_usage_rollup_by_corpus_ids({"conn_a": ["col_a", "col_a2"]})
+    assert out["conn_a"]["runs_with_usage"] == 1
+    assert out["conn_a"]["input_tokens"] == 1000
+
+
+def test_llm_usage_rollup_by_corpus_ids_a_run_overlapping_two_keys_counts_toward_both(pg_engine, monkeypatch):
+    """Two connections sharing one collection each see the run that touched
+    it — the same "did THIS caller's collections see this run" question
+    documents_done_since already answers per-key, extended to every key."""
+    repo = _make_repo(pg_engine, monkeypatch)
+    _create(
+        repo,
+        corpus_ids=["col_shared"],
+        llm_usage={"input_tokens": 1000, "output_tokens": 200, "models": ["claude-haiku-4-5"]},
+    )
+
+    out = repo.llm_usage_rollup_by_corpus_ids({"conn_a": ["col_shared"], "conn_b": ["col_shared"]})
+    assert out["conn_a"]["input_tokens"] == 1000
+    assert out["conn_b"]["input_tokens"] == 1000
+
+
+def test_llm_usage_rollup_by_corpus_ids_ignores_runs_with_no_usage(pg_engine, monkeypatch):
+    repo = _make_repo(pg_engine, monkeypatch)
+    _create(repo, corpus_ids=["col_a"])  # no llm_usage at all
+
+    out = repo.llm_usage_rollup_by_corpus_ids({"conn_a": ["col_a"]})
+    assert out["conn_a"]["runs_with_usage"] == 0
+    assert out["conn_a"]["estimated_cost_usd"] is None
+
+
+def test_llm_usage_rollup_by_corpus_ids_leaves_unpriceable_runs_out_of_the_cost_but_counts_tokens(
+    pg_engine, monkeypatch
+):
+    """A run naming zero or more than one model cannot be honestly split by
+    model, so it is left OUT of estimated_cost_usd while still counting
+    toward the token/document totals — same disclosure contract as
+    llm_usage_rollup()."""
+    repo = _make_repo(pg_engine, monkeypatch)
+    _create(repo, corpus_ids=["col_a"], llm_usage={"input_tokens": 1000, "output_tokens": 100})  # no model named
+    _create(
+        repo,
+        corpus_ids=["col_a"],
+        llm_usage={"input_tokens": 500, "output_tokens": 50, "models": ["m1", "m2"]},
+    )
+
+    out = repo.llm_usage_rollup_by_corpus_ids({"conn_a": ["col_a"]})
+    assert out["conn_a"]["runs_with_usage"] == 2
+    assert out["conn_a"]["input_tokens"] == 1500
+    assert out["conn_a"]["priced_runs"] == 0
+    assert out["conn_a"]["estimated_cost_usd"] is None
+
+
+def test_llm_usage_rollup_by_corpus_ids_prices_via_src_llm_pricing_not_a_hand_rolled_rate_card(pg_engine, monkeypatch):
+    """Unlike llm_usage_rollup()'s sampled rate card, the per-connection
+    rollup prices through src.llm_pricing.cost_usd — the same model-aware,
+    cache-aware table GET /api/admin/telemetry/chat-cost uses — so a cache
+    read/write is priced at its real discount/premium rather than folded
+    into the plain input rate."""
+    from src.llm_pricing import cost_usd
+
+    repo = _make_repo(pg_engine, monkeypatch)
+    _create(
+        repo,
+        corpus_ids=["col_a"],
+        llm_usage={
+            "input_tokens": 1000,
+            "output_tokens": 200,
+            "cache_read_input_tokens": 900,
+            "cache_creation_input_tokens": 50,
+            "models": ["claude-sonnet-4-6"],
+        },
+    )
+
+    out = repo.llm_usage_rollup_by_corpus_ids({"conn_a": ["col_a"]})
+    expected = cost_usd(
+        model="claude-sonnet-4-6",
+        input_tokens=1000,
+        output_tokens=200,
+        cache_read_tokens=900,
+        cache_creation_tokens=50,
+    )
+    assert out["conn_a"]["estimated_cost_usd"] == round(expected, 4)
+
+
+def test_llm_usage_rollup_by_corpus_ids_empty_map_short_circuits_without_a_query(pg_engine, monkeypatch):
+    repo = _make_repo(pg_engine, monkeypatch)
+    assert repo.llm_usage_rollup_by_corpus_ids({}) == {}

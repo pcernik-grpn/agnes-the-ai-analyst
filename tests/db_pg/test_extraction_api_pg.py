@@ -612,6 +612,236 @@ def test_fleet_totals_sum_across_connections(tmp_path, monkeypatch, pg_engine):
     assert body["totals"]["files_seen"] == 150
 
 
+# ---------------------------------------------------------------------------
+# Fleet cost tile — attributing `facts_ingest_runs` spend to a connection
+# (the standalone `sharepoint-facts-extraction` job's own persisted ledger,
+# distinct from the crawl run's own inline `usage` block).
+# ---------------------------------------------------------------------------
+
+
+def test_fleet_row_cost_includes_facts_ingest_runs_attributable_spend(tmp_path, monkeypatch, pg_engine):
+    """A connection whose facts stage runs as a SEPARATE
+    `sharepoint-facts-extraction` job never touches its own `extraction_runs`
+    row's `usage` block — it spends through `facts_ingest_runs.llm_usage`
+    instead, attributed back to the connection by `corpus_ids` overlap with
+    its own scope collections. Before this fix the fleet's cost figure read
+    only the crawl run's own (empty) usage, so a connection that had
+    genuinely spent real money showed $0."""
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token, name="sp-facts-ledger-cost")
+
+    from src.repositories import facts_ingest_runs_repo, source_connections_repo
+
+    source_connections_repo().update(
+        conn_id, config={"scopes": [{"source_scope_id": "s1", "collection_id": "col_ledger"}]}
+    )
+
+    repo = _repo()
+    run_id = repo.start(connection_id=conn_id)
+    repo.finish(run_id, status="done", report={"new": 3})  # facts NEVER ran inline for this run
+
+    facts_ingest_runs_repo().create(
+        corpus_ids=["col_ledger"],
+        caller="scheduler@system.local",
+        documents_seen=500,
+        claims_written=10,
+        claims_rejected=[],
+        deferred=[],
+        subjects_created=0,
+        subjects_deleted=0,
+        review_items=[],
+        llm_usage={"input_tokens": 1_000_000, "output_tokens": 200_000, "models": ["claude-haiku-4-5"]},
+    )
+
+    body = client.get(f"{FLEET_URL}?all=1", headers=_auth(token)).json()
+    row = next(r for r in body["connections"] if r["connection_id"] == conn_id)
+    assert row["run"]["usage"] == {}, "the crawl run itself never reported usage — this pins the bug's premise"
+    assert row["estimated_cost_usd"] is not None
+    assert row["estimated_cost_usd"] > 0
+    assert row["cost_status"] == "priced"
+    assert "claude-haiku-4-5" in row["cost_models"]
+
+
+def test_fleet_row_cost_is_none_not_a_fabricated_zero_when_nothing_is_recorded(tmp_path, monkeypatch, pg_engine):
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token, name="sp-no-usage-anywhere")
+    repo = _repo()
+    run_id = repo.start(connection_id=conn_id)
+    repo.finish(run_id, status="done", report={"new": 3})
+
+    body = client.get(f"{FLEET_URL}?all=1", headers=_auth(token)).json()
+    row = next(r for r in body["connections"] if r["connection_id"] == conn_id)
+    assert row["estimated_cost_usd"] is None
+    assert row["cost_status"] == "no_usage"
+
+
+def test_fleet_row_cost_status_is_unpriced_when_facts_ledger_tokens_have_no_priceable_model(
+    tmp_path, monkeypatch, pg_engine
+):
+    """Tokens are known (the producer reported usage) but no single named
+    model means the figure cannot be honestly priced — a different claim
+    from both "priced" and "no usage at all", and the payload must say so."""
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token, name="sp-unpriceable")
+
+    from src.repositories import facts_ingest_runs_repo, source_connections_repo
+
+    source_connections_repo().update(
+        conn_id, config={"scopes": [{"source_scope_id": "s1", "collection_id": "col_unpriced"}]}
+    )
+    facts_ingest_runs_repo().create(
+        corpus_ids=["col_unpriced"],
+        caller="scheduler@system.local",
+        documents_seen=5,
+        claims_written=0,
+        claims_rejected=[],
+        deferred=[],
+        subjects_created=0,
+        subjects_deleted=0,
+        review_items=[],
+        llm_usage={"input_tokens": 1000, "output_tokens": 100},  # no model named
+    )
+
+    body = client.get(f"{FLEET_URL}?all=1", headers=_auth(token)).json()
+    row = next(r for r in body["connections"] if r["connection_id"] == conn_id)
+    assert row["estimated_cost_usd"] is None
+    assert row["cost_status"] == "unpriced"
+    assert row["token_totals"]["input_tokens"] == 1000
+
+
+def test_fleet_row_cost_sums_crawl_run_and_facts_ingest_without_double_counting(tmp_path, monkeypatch, pg_engine):
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token, name="sp-both-sources")
+
+    from src.repositories import facts_ingest_runs_repo, source_connections_repo
+
+    source_connections_repo().update(
+        conn_id, config={"scopes": [{"source_scope_id": "s1", "collection_id": "col_both"}]}
+    )
+
+    repo = _repo()
+    run_id = repo.start(connection_id=conn_id)
+    repo.finish(
+        run_id,
+        status="done",
+        report={"new": 3},
+        usage={
+            "facts": {"estimated_cost_usd": 2.0, "input_tokens": 100, "output_tokens": 20, "model": "claude-haiku-4-5"}
+        },
+    )
+    facts_ingest_runs_repo().create(
+        corpus_ids=["col_both"],
+        caller="scheduler@system.local",
+        documents_seen=10,
+        claims_written=0,
+        claims_rejected=[],
+        deferred=[],
+        subjects_created=0,
+        subjects_deleted=0,
+        review_items=[],
+        llm_usage={"input_tokens": 1000, "output_tokens": 200, "models": ["claude-haiku-4-5"]},
+    )
+
+    body = client.get(f"{FLEET_URL}?all=1", headers=_auth(token)).json()
+    row = next(r for r in body["connections"] if r["connection_id"] == conn_id)
+    from src.llm_pricing import cost_usd
+
+    expected_facts_ledger_cost = cost_usd(model="claude-haiku-4-5", input_tokens=1000, output_tokens=200)
+    assert round(row["estimated_cost_usd"], 4) == round(2.0 + expected_facts_ledger_cost, 4)
+    assert row["cost_status"] == "priced"
+
+
+def test_fleet_response_carries_the_instance_wide_cumulative_llm_usage_totals(tmp_path, monkeypatch, pg_engine):
+    """The SAME cumulative rollup GET /api/facts/ingest-runs already exposes
+    (`llm_usage_totals`) must also ride on the fleet response, so the
+    summary strip can show an instance-wide total distinct from any one
+    connection's own attributed figure."""
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    _connection(client, token, name="sp-cumulative")
+
+    from src.repositories import facts_ingest_runs_repo
+
+    facts_ingest_runs_repo().create(
+        corpus_ids=["col_x"],
+        caller="scheduler@system.local",
+        documents_seen=1,
+        claims_written=0,
+        claims_rejected=[],
+        deferred=[],
+        subjects_created=0,
+        subjects_deleted=0,
+        review_items=[],
+        # `llm_usage_rollup()` (the instance-wide rollup this tile reuses
+        # unchanged) prices via its own sampled rate card, which knows
+        # "claude-sonnet-4" but not the newer "claude-haiku-4-5" id the
+        # per-connection rollup's `src.llm_pricing` table carries — either
+        # is fine here since this test only pins that the CUMULATIVE tile
+        # rides on the fleet response, not which model it names.
+        llm_usage={"input_tokens": 1000, "output_tokens": 100, "models": ["claude-sonnet-4"]},
+    )
+
+    body = client.get(f"{FLEET_URL}?all=1", headers=_auth(token)).json()
+    assert "llm_usage_totals" in body
+    assert body["llm_usage_totals"]["runs_with_usage"] == 1
+    assert body["llm_usage_totals"]["estimated_cost_usd"] is not None
+
+
+def test_fleet_facts_ingest_cost_lookup_is_batched_not_one_query_per_connection(tmp_path, monkeypatch, pg_engine):
+    """The facts-ingest cost attribution must be ONE grouped query for the
+    whole page, never one round trip per connection — the same batching
+    discipline `children_for` already uses for shard rollups."""
+    import sqlalchemy as sa
+
+    import src.db_pg as db_pg
+
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+
+    from src.repositories import facts_ingest_runs_repo, source_connections_repo
+
+    for i in range(8):
+        conn_id = _connection(client, token, name=f"sp-cost-batch-{i}")
+        source_connections_repo().update(
+            conn_id, config={"scopes": [{"source_scope_id": "s1", "collection_id": f"col_batch_{i}"}]}
+        )
+        facts_ingest_runs_repo().create(
+            corpus_ids=[f"col_batch_{i}"],
+            caller="scheduler@system.local",
+            documents_seen=1,
+            claims_written=0,
+            claims_rejected=[],
+            deferred=[],
+            subjects_created=0,
+            subjects_deleted=0,
+            review_items=[],
+            llm_usage={"input_tokens": 100, "output_tokens": 10, "models": ["claude-haiku-4-5"]},
+        )
+
+    statements: list = []
+
+    def _capture(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    engine = db_pg.get_engine()
+    sa.event.listen(engine, "before_cursor_execute", _capture)
+    try:
+        body = client.get(f"{FLEET_URL}?all=1", headers=_auth(token)).json()
+    finally:
+        sa.event.remove(engine, "before_cursor_execute", _capture)
+
+    assert len(body["connections"]) == 8
+    # `llm_usage IS NOT NULL` is the distinguishing clause of the two
+    # constant-count queries this feature adds (the per-connection batched
+    # rollup, and the instance-wide cumulative one) — deliberately NOT a
+    # bare "facts_ingest_runs" substring match, which would also catch the
+    # pre-existing, unrelated per-connection `documents_done_since` calls
+    # `_facts_throughput_and_eta` already makes for the throughput/ETA line.
+    usage_queries = [s for s in statements if "llm_usage IS NOT NULL" in s]
+    assert len(usage_queries) <= 2, (
+        f"expected the facts-ingest cost lookup to be a CONSTANT number of queries "
+        f"regardless of connection count (8 connections here), got {len(usage_queries)}: {usage_queries}"
+    )
+
+
 def test_fleet_ignores_non_sharepoint_connections(tmp_path, monkeypatch, pg_engine):
     client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
     r = client.post(

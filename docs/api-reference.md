@@ -2132,6 +2132,21 @@ Each row also carries `next_run_at` (D.16) — the same best-effort "next
 sweep" hint the crawl-config PATCH response and `…/extraction/status`
 carry, pure computation, no extra query per row.
 
+Each row's `estimated_cost_usd`/`cost_status`/`cost_models`/`token_totals`
+(cost-truth fix) sum TWO cost sources: the crawl run's own inline `usage`
+block, and this connection's own attributable slice of `facts_ingest_runs`
+— the SEPARATE ledger a standalone `sharepoint-facts-extraction` job writes
+to instead of the crawl's row, resolved for the WHOLE page in one batched
+query keyed by each connection's scope collections. `cost_status` is
+`"no_usage"` (nothing recorded anywhere — `estimated_cost_usd: null`, never
+a fabricated `0`), `"unpriced"` (tokens known, no single named model to
+honestly price — also `null`) or `"priced"` (a real figure); `cost_models`
+names what a `"priced"` figure was actually priced at. The top-level
+`llm_usage_totals` is the SAME instance-wide cumulative rollup `GET
+/api/facts/ingest-runs` already returns — every `facts_ingest_runs` row this
+instance has EVER persisted, not scoped to the page's own rows or `active`/
+`all` filter, rendered as its own distinctly-labelled summary tile.
+
 The response also carries a top-level `jobs` block — `{kind: {queued,
 running}}` for `corpus-extraction` and `sharepoint-facts-extraction`, read
 in one grouped query off the jobs table independent of `active`/`all` scope

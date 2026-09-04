@@ -31,6 +31,10 @@ class TestExtractionFleetPageAuth:
         assert 'id="ext-scope-active"' in body
         assert 'id="ext-scope-all"' in body
         assert 'id="ext-jobs-strip"' in body
+        # Cost-truth fix — the instance-wide cumulative LLM-spend tile,
+        # distinct from the per-page "Est. cost (this view)" one.
+        assert 'id="ext-stat-cost"' in body
+        assert 'id="ext-stat-cumulative-cost"' in body
         assert "admin_extraction.js" in body
 
         # …and the referenced asset actually serves the poll/render code,
