@@ -158,6 +158,22 @@ class ResourceTypeSpec:
             per parent entity (e.g. marketplace), one item per grantable
             resource (e.g. plugin). Items must carry ``resource_id`` that
             matches the path string written into ``resource_grants``.
+        offered_on_access: Whether /admin/access OFFERS this type when an
+            admin goes to grant something. False hides it from the picker
+            without touching the type, its enforcement, or grants that
+            already exist — an existing row still renders and still
+            revokes, so an admin can clean up what was written before.
+
+            False for ``table`` only, and observed rather than reasoned:
+            the picker offered every registered table among 239 grantable
+            "knowledge" items, and a production group's own list showed
+            page after page of table rows inherited from ``Everyone``, each
+            labelled "reached through a package". Ticking one grants no
+            analyst access at all
+            (``src/rbac.py::can_access_table`` intersects the caller's
+            data packages with the packages containing the table and never
+            reads a table grant), so the picker was writing rows nothing
+            reads. See the effort's ticket 11, reopened on that evidence.
     """
 
     key: ResourceType
@@ -166,6 +182,7 @@ class ResourceTypeSpec:
     description: str
     id_format: str
     list_blocks: ListBlocksFn
+    offered_on_access: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -212,12 +229,11 @@ def _marketplace_plugin_blocks() -> list[Block]:
                 "category": p.get("category"),
                 "description": p.get("description"),
                 "source_type": p.get("source_type"),
-                # v39: drives the SYSTEM pill + disabled checkbox in
-                # /admin/access. The grant row exists for every group on a
-                # system plugin (materialized by mark_system) — we just
-                # prevent admins from revoking it via the UI to keep the
-                # mandatory-tier semantic honest.
-                "is_system": bool(p.get("is_system")),
+                # `is_system` rode this projection until 0098, driving a
+                # SYSTEM pill and a disabled checkbox on /admin/access. The
+                # flag is now an ordinary everyone-scoped required grant, so
+                # the page reads reach from the grant like it does for every
+                # other resource type instead of from a per-item flag.
             }
         )
     return list(blocks.values())
@@ -751,6 +767,13 @@ def _agent_blocks() -> list[Block]:
     rows = agents_repo().list(limit=_GRANT_PROJECTION_LIMIT)
     if not rows:
         return []
+    # The owner, by email, in one batched read — the same projection the
+    # collection block already makes. Without it an agent someone shared from
+    # the Library had no ownership on its row at all: the only signal was the
+    # grey "shared by" at the end of the detail line, and /admin/access has no
+    # agent page of its own to send an admin to. The owner IS where the agent
+    # lives, so the row needs to be able to say who that is.
+    owners = _owner_emails(r.get("owner_user_id") for r in rows)
     return [
         {
             "id": "agents",
@@ -761,6 +784,8 @@ def _agent_blocks() -> list[Block]:
                     "name": r["name"],
                     "slug": r.get("slug"),
                     "description": r.get("role") or r.get("instructions") or "",
+                    "owner_user_id": r.get("owner_user_id"),
+                    "owner_email": owners.get(str(r.get("owner_user_id") or "")),
                 }
                 for r in rows
             ],
@@ -916,6 +941,10 @@ def _collection_blocks() -> list[Block]:
                     # see these files?" became unanswerable from the one page
                     # that exists to answer it.
                     "owner_email": owners.get(r.get("created_by") or ""),
+                    # The owner's id too, so a row can tell "the sharer IS the
+                    # owner" by comparison rather than by guessing from names
+                    # (audit U7) — and stop saying the same person twice.
+                    "owner_user_id": r.get("created_by"),
                     "file_count": counts.get(r["id"], 0) if counts is not None else None,
                 }
                 for r in rows
@@ -1035,16 +1064,26 @@ RESOURCE_TYPES: dict[ResourceType, ResourceTypeSpec] = {
         family=ResourceFamily.KNOWLEDGE,
         display_name="Tables",
         description=(
-            "Does NOT grant analyst visibility — the unified-stack design routes "
-            "all analyst table access through Data Packages instead (grant the "
-            "package, not the table). This grant only sets the ceiling agent "
-            "scoping (`tables_mode='selected'`) and co-session grant intersection "
-            "narrow against; a table absent here can never appear in a scoped "
-            "agent's or co-session's effective table set, regardless of package "
-            "membership."
+            "Grants nobody anything on its own. Analyst table access is entirely "
+            "Data-Package-mediated (`src/rbac.py::can_access_table`), so a row "
+            "here is never read for it — grant the package, not the table. Its "
+            "one remaining reader is agent scoping, and even there a data "
+            "package the owner holds is normally sufficient: the data axis "
+            "resolves to `raw TABLE grants UNION the identity's package tables` "
+            "(`src/agent_scope_intersection.py`), and the /agents builder "
+            "declares packages, never bare table ids. Not offered on "
+            "/admin/access for that reason."
         ),
         id_format="<table_id>",
         list_blocks=_table_blocks,
+        # Not offered on /admin/access. The picker listed every registered
+        # table among 239 grantable "knowledge" items, and a production
+        # group's list showed page after page of table rows inherited from
+        # `Everyone`, each labelled "reached through a package" — rows an
+        # admin ticked believing they granted data, and which grant no
+        # analyst anything. Existing rows still render and still revoke, so
+        # what was already written can be cleaned up.
+        offered_on_access=False,
     ),
     ResourceType.DATA_PACKAGE: ResourceTypeSpec(
         key=ResourceType.DATA_PACKAGE,

@@ -22,6 +22,9 @@ What matters, and so what is pinned here:
 from __future__ import annotations
 
 import re
+import pytest
+
+from tests.helpers.access_page import access_js, with_module
 
 
 def _auth(token: str) -> dict:
@@ -47,13 +50,11 @@ class TestAccessPage:
         assert 'class="admin-tabs"' not in body
         # The lens URL still lands on the person view — links into Simulate
         # outnumber the tab that used to point at it.
-        assert c.get("/admin/access?lens=simulate",
-                     headers=_auth(seeded_app["admin_token"])).status_code == 200
+        assert c.get("/admin/access?lens=simulate", headers=_auth(seeded_app["admin_token"])).status_code == 200
         # `?by=bundle` was the old name for this lens and stays readable, for
         # the same reason: it is in shared links and bookmarks. Everything the
         # page WRITES is `resource`.
-        assert c.get("/admin/access?by=bundle",
-                     headers=_auth(seeded_app["admin_token"])).status_code == 200
+        assert c.get("/admin/access?by=bundle", headers=_auth(seeded_app["admin_token"])).status_code == 200
 
     def test_non_admin_is_refused(self, seeded_app):
         c = seeded_app["client"]
@@ -65,7 +66,7 @@ class TestAccessPage:
         (or its own table) is how the group tab and this view would start
         disagreeing about who can use what."""
         c = seeded_app["client"]
-        body = c.get("/admin/access", headers=_auth(seeded_app["admin_token"])).text
+        body = with_module(c.get("/admin/access", headers=_auth(seeded_app["admin_token"])).text)
         assert "/api/admin/access-overview" in body
         assert "/api/admin/grants" in body
 
@@ -116,7 +117,7 @@ class TestAccessPage:
         only the word.
         """
         c = seeded_app["client"]
-        body = c.get("/admin/access", headers=_auth(seeded_app["admin_token"])).text
+        body = with_module(c.get("/admin/access", headers=_auth(seeded_app["admin_token"])).text)
         assert ">Automatic<" in body and ">Optional<" in body
         assert '"available"' in body and '"required"' in body
         assert ">Available<" not in body
@@ -126,7 +127,7 @@ class TestAccessPage:
         already exposes, not recomputed in the page — recomputing it is how a
         debugging view starts disagreeing with enforcement."""
         c = seeded_app["client"]
-        body = c.get("/admin/access", headers=_auth(seeded_app["admin_token"])).text
+        body = with_module(c.get("/admin/access", headers=_auth(seeded_app["admin_token"])).text)
         assert "effective-access" in body
         assert "memberships" in body
 
@@ -135,7 +136,7 @@ class TestAccessPage:
         short-circuits every check). A page about access that does not say so
         invites an admin to conclude their grants are what let them in."""
         c = seeded_app["client"]
-        body = c.get("/admin/access", headers=_auth(seeded_app["admin_token"])).text
+        body = with_module(c.get("/admin/access", headers=_auth(seeded_app["admin_token"])).text)
         assert "Admins can always reach everything" in body
 
 
@@ -213,7 +214,7 @@ class TestAccessIsInTheNav:
 
     def test_the_page_renders_the_nav_row_as_active(self, seeded_app):
         c = seeded_app["client"]
-        body = c.get("/admin/access", headers=_auth(seeded_app["admin_token"])).text
+        body = with_module(c.get("/admin/access", headers=_auth(seeded_app["admin_token"])).text)
         nav = body.split('<aside class="admin-nav"', 1)[1].split("</aside>", 1)[0]
         # The sidebar's active row is the Access DESTINATION, and only it — no
         # item row anywhere else in the column is lit.
@@ -269,7 +270,7 @@ class TestMembersInContext:
 
     def _body(self, seeded_app) -> str:
         c = seeded_app["client"]
-        return c.get("/admin/access", headers=_auth(seeded_app["admin_token"])).text
+        return with_module(c.get("/admin/access", headers=_auth(seeded_app["admin_token"])).text)
 
     def test_the_members_pane_exists_above_the_grants(self, seeded_app):
         body = self._body(seeded_app)
@@ -345,14 +346,13 @@ class TestTheGroupItself:
 
     def _body(self, seeded_app) -> str:
         c = seeded_app["client"]
-        return c.get("/admin/access", headers=_auth(seeded_app["admin_token"])).text
+        return with_module(c.get("/admin/access", headers=_auth(seeded_app["admin_token"])).text)
 
     def test_identity_lives_in_the_pane_header(self, seeded_app):
         """Name, upstream address, origin pill, description, created date —
         the detail page's header, which is most of why it existed."""
         body = self._body(seeded_app)
-        for el_id in ("ax-what-title", "ax-what-idsub", "ax-what-origin",
-                      "ax-what-meta", "ax-what-managed"):
+        for el_id in ("ax-what-title", "ax-what-idsub", "ax-what-origin", "ax-what-meta", "ax-what-managed"):
             assert f'id="{el_id}"' in body, f"lost {el_id}"
 
     def test_rename_and_delete_are_here(self, seeded_app):
@@ -441,9 +441,9 @@ class TestTheGroupItself:
         that is missed, it belongs in the picker, not in a second tree.
         """
         body = self._body(seeded_app)
-        assert "data-add-grant" in body          # the one way in, per group
-        assert "openPicker" in body              # …opens the picker
-        assert "data-share-bundle" in body       # and the same act by bundle
+        assert "data-add-grant" in body  # the one way in, per group
+        assert "openPicker" in body  # …opens the picker
+        assert "data-share-bundle" in body  # and the same act by bundle
         assert "openBundlePicker" in body
         # The tree and its bulk control are gone, not hidden.
         assert "data-bucket=" not in body
@@ -460,8 +460,8 @@ class TestTheGroupItself:
         not yet granted.
         """
         body = self._body(seeded_app)
-        assert 'id="ax-group-find"' in body       # the one page-level search
-        assert "Search everything grantable" in body   # the picker's own
+        assert 'id="ax-group-find"' in body  # the one page-level search
+        assert "Search everything grantable" in body  # the picker's own
         # The per-group input is gone: two search boxes on one surface, one
         # of them hidden, was the ambiguity this collapse removed.
         assert 'id="ax-rfind"' not in body
@@ -481,3 +481,130 @@ class TestTheGroupItself:
         body = self._body(seeded_app)
         assert "ax-orig--" in body
         assert "grant_count" in body and "member_count" in body
+
+
+class TestTheRowIsOneLineAndTheGroupOpensOnItsGrants:
+    """The By-group list carried four things per row — name and reach, then a
+    description, a `created` stamp to the minute, and three per-family counts
+    down the right. Opening a row then landed on two more closed sections, so
+    the first fact was three clicks in.
+
+    What survives is what an admin reads before deciding to open a group:
+    the name, where it comes from, and "N people · N granted".
+    """
+
+    @pytest.fixture(scope="class")
+    def js(self):
+        return access_js()
+
+    @pytest.fixture(scope="class")
+    def tpl(self):
+        from tests.helpers.access_page import access_template
+
+        return access_template()
+
+    def test_the_row_no_longer_stamps_a_creation_time(self, js):
+        row = js[js.index("      const open = selectedGroup === g.id;") :]
+        row = row[: row.index("    // Only label the halves")]
+        assert "created ${" not in row and "g.created_at" not in row
+
+    def test_the_per_family_counts_are_gone_from_every_row(self, js):
+        assert "familyCounts" not in js or "`familyCounts()` stood here" in js
+        assert 'class="ax-gs__counts"' not in js, (
+            "three numbers on every row, most of them zero, none of them the one that decides whether to open a group"
+        )
+
+    def test_the_description_moved_rather_than_went(self, js):
+        """It is the only text on the page saying what a group is FOR."""
+        head = js[js.index("function setPeopleHead(text, sub, faces)") :]
+        head = head[: head.index("async function renderMembers()")]
+        assert "g.description" in head
+        assert 'sub || own || "Who this group reaches."' in head, (
+            "a state beats the description, the description beats the "
+            "generic line, and a group without one still says something"
+        )
+
+    def test_an_explicit_state_still_outranks_the_description(self, js):
+        """Loading, and a failed read, are about right now — a standing
+        sentence about the group would be the wrong thing to show."""
+        assert 'setPeopleHead("Loading…", "Reading who is in this group…")' in js
+
+    def test_people_is_a_strip_that_reads_as_a_disclosure(self, tpl):
+        """The strip IS the control: the whole row opens the roster, with a
+        caret in the same place the group rows put theirs. It was a line of
+        text with a "Manage" link at the far right — the one word that said
+        it opened sat in the corner a page keeps for its least important
+        control."""
+        assert '<button type="button" class="ax-who" id="ax-sec-people"' in tpl
+        assert '<details class="dsec" id="ax-sec-people"' not in tpl
+        assert 'class="ax-gs__car ax-who__car"' in tpl, "the page's own caret"
+        assert 'aria-controls="ax-members"' in tpl
+
+    def test_the_grants_have_no_heading_shutter_or_subtitle(self, tpl):
+        """All three went in one pass, for one reason: each answered a
+        question the reader had already answered by getting here. Expanding
+        a group IS the request to see its grants, the heading named the only
+        thing on screen, and "What everyone above can use" restated the strip
+        directly above it — in a full row of height."""
+        assert '<div id="ax-sec-access"' in tpl
+        assert '<details class="dsec" id="ax-sec-access"' not in tpl
+        assert "What everyone above can use." not in tpl
+        assert "<h3>Access</h3>" not in tpl
+
+    def test_the_tier_key_survives_beside_the_control_it_explains(self, tpl, js):
+        """It is not obvious what Optional and Automatic do, so the one
+        sentence of reference stays — on the ACCESS TIER column header."""
+        assert 'id="ax-tierkey-body"' in tpl, "the body outlives the header"
+        assert 'aria-describedby="ax-tierkey-body"' in js
+        assert "ax-colhd__key" in js
+
+    def test_the_elevation_sentence_survived_the_head_it_lived_in(self, tpl, js):
+        """Ticket 14's whole resolution: the page's only statement that the
+        mode exists and that Admin's grants apply only inside it."""
+        assert 'id="ax-access-sub" hidden' in tpl
+        assert "god-mode reaches everything" in js
+        assert "subEl.hidden = !adminSelected" in js, "an ordinary group must pay no height for it"
+
+    def test_the_roster_keeps_a_disclosure_because_it_is_a_list(self, tpl):
+        """The strip is the control, so the id it is addressed by is the
+        strip's own — one element, not a row with a button on the end."""
+        assert 'id="ax-sec-people"' in tpl
+        assert 'id="ax-members" hidden' in tpl
+
+    def test_the_disclosure_claims_nothing_about_what_you_may_do_inside(self, js):
+        """It carried "Manage" / "Show" / "Hide" — a word that had to be
+        chosen per group (`Everyone` and a Workspace-synced group are
+        read-only) and kept in step with the open state, from 900px away. A
+        caret says "this opens" and makes no claim that needs checking."""
+        assert '"Manage" : "Show"' not in js
+        assert '.textContent = open ? "Hide"' not in js
+
+    def test_a_member_row_does_not_state_where_it_came_from_at_all(self, js):
+        """It was printed three times on one row: the strip's "from
+        mock_seed", a source column, and "managed by mock_seed" where the
+        Remove button would be. Then once. Then not at all — even alone it
+        answered a question this page is not about, where the ACCOUNT is
+        administered. A row that offers no Remove has already said the
+        membership is not the admin's to change, and WHY is stated once for
+        the whole group in the caption above the table."""
+        import re
+
+        roster = js[js.index("function rosterHtml(members)") :]
+        roster = roster[: roster.index("Member search")]
+        # Comments stripped: the note has to keep NAMING the retired string
+        # to explain why it went. What must not survive is a rendered one.
+        code = re.sub(r"/\*.*?\*/", "", roster, flags=re.S)
+        code = re.sub(r"(?m)^\s*//.*$", "", code)
+        assert "SOURCE_LABEL" not in code
+        assert "managed by ${esc(m.source" not in code
+        assert "managed elsewhere" not in code
+        # The caption is where the fact lives now, at the level it is true.
+        assert "Membership ${line}." in js
+
+    def test_a_group_name_in_the_resource_lens_is_a_way_into_the_group(self, js):
+        """By resource named a group and stopped there — an admin reading
+        "Data has this" could not see who is in Data, and there is no group
+        detail page to send them to (/admin/groups/<id> is a 308 back
+        here). The name is the link, because the name is what the reader is
+        looking at when the question occurs to them."""
+        assert 'class="ax-r__glink" href="?by=group&group=' in js

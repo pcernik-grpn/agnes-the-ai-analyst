@@ -8,8 +8,10 @@ revocable PATs, never to sign in interactively. This module is the ONE place
 that constant and the "is this row a service account" question live, so the
 guards scattered across ``app/auth/jwt.py`` (no interactive session),
 ``src/repositories/user_group_members(_pg).py`` (no Admin-group membership)
-and ``src/repositories/users(_pg).py`` (excluded from ``search_recent``, the
-people-picker feed) all agree on the same definition by construction.
+and ``src/repositories/users(_pg).py`` all agree on the same definition by
+construction. Note that ``search_recent`` deliberately does NOT exclude a
+service account: adding one to a group through the people picker is the only
+way it acquires any authority at all.
 
 Kept free of any DB/FastAPI import so every one of those modules — including
 the low-level, framework-agnostic ``app/auth/jwt.py`` — can import it without
@@ -26,6 +28,24 @@ from typing import Any, Mapping, Optional
 HUMAN_KIND = "human"
 SERVICE_ACCOUNT_KIND = "service"
 
+# A third kind, for the identities Agnes seeds for ITSELF (issue #2256).
+# Distinct from 'service': a service account is admin-provisioned and
+# user-visible, while these are plumbing nobody creates, manages or sees.
+# They are NOT flagged 'service' because that kind carries two behaviours
+# they cannot survive — `semantic-drafter` mints an interactive token through
+# the broker, and `scheduler` is a member of the Admin group.
+SYSTEM_IDENTITY_KIND = "system"
+
+#: The seeded identities that carry :data:`SYSTEM_IDENTITY_KIND`. Canonical
+#: here rather than in the two `app.auth` modules that create them, because
+#: the repositories and migration 0098 need the list without importing app
+#: code. `tests/test_service_accounts.py` asserts the two sides agree.
+SYSTEM_IDENTITY_EMAILS = (
+    "scheduler@system.local",
+    "semantic-drafter@system.local",
+    "memory-curator@system.local",
+)
+
 
 def is_service_account(user: Optional[Mapping[str, Any]]) -> bool:
     """Whether *user* (a ``users`` row dict, or ``None``) is a service account.
@@ -40,6 +60,37 @@ def is_service_account(user: Optional[Mapping[str, Any]]) -> bool:
     if not user:
         return False
     return user.get("kind") == SERVICE_ACCOUNT_KIND
+
+
+def is_system_identity(user: Optional[Mapping[str, Any]]) -> bool:
+    """Whether *user* is an identity Agnes seeded for itself.
+
+    Reads the ``kind`` column first and falls back to the email, so the
+    answer is right on a DuckDB-backed row (no ``kind`` column at all, the
+    frozen post-A3 schema) and on a Postgres row that predates the 0098
+    backfill.
+    """
+    if not user:
+        return False
+    if user.get("kind") == SYSTEM_IDENTITY_KIND:
+        return True
+    return (user.get("email") or "").strip().lower() in SYSTEM_IDENTITY_EMAILS
+
+
+def is_person(user: Optional[Mapping[str, Any]]) -> bool:
+    """Whether *user* is an account a person signs in as — the population
+    ``scope='everyone'`` reaches, and the one "every account" counts.
+
+    A service account is out because its authority is exactly the groups an
+    admin put it in (issue #1534); an everyone-scoped grant would widen a
+    long-lived PAT every time somebody shared something company-wide. A
+    seeded system identity is out because nobody is behind it. Everything
+    else is in, including an account in no group at all — which is the case
+    the old Everyone-group model could not express.
+    """
+    if not user:
+        return False
+    return not is_service_account(user) and not is_system_identity(user)
 
 
 class ServiceAccountInteractiveLoginError(RuntimeError):

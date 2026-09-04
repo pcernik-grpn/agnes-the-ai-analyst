@@ -267,10 +267,13 @@ def marketplace_digest(
 
     zero_usage = []
     for p in all_plugins:
-        # System (mandatory) and admin-disabled plugins can't meaningfully be
-        # "not landing": disabled ones are hidden from served surfaces and
-        # cannot receive usage at all (mirrors the served-surface filters).
-        if p.get("is_system") or p.get("admin_disabled"):
+        # Admin-disabled plugins can't meaningfully be "not landing": they
+        # are hidden from served surfaces and cannot receive usage at all
+        # (mirrors the served-surface filters). `is_system` was checked here
+        # too, for the same reason a mandatory plugin cannot be "not
+        # landing"; 0098 made that an ordinary required grant, and a granted
+        # plugin with no usage IS a report-worthy finding.
+        if p.get("admin_disabled"):
             continue
         reg = reg_by_id.get(p["marketplace_id"]) or {}
         # "Not landing" is about admin-curated department content. Built-in

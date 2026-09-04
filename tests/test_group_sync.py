@@ -273,14 +273,25 @@ class TestEnsureEveryoneMembership:
         assert len(matching) == 1
         assert matching[0]["source"] == "system_seed"
 
-    def test_env_set_is_a_noop(self, db_env, monkeypatch):
+    def test_the_legacy_env_var_no_longer_suppresses_it(self, db_env, monkeypatch):
+        """It used to no-op whenever ``AGNES_GROUP_EVERYONE_EMAIL`` was set,
+        because on those instances the seeded row was mirrored from a
+        Workspace group and a local membership would have fought the
+        Workspace-authoritative set.
+
+        0098 converted that mapping into an ordinary synced group, so nothing
+        mirrors ``Everyone`` any more and it goes back to meaning what it
+        says — on every instance, whether or not the (now inert) variable is
+        still set in someone's env.
+        """
         monkeypatch.setenv("AGNES_GROUP_EVERYONE_EMAIL", "everyone@workspace.test")
         from app.auth.group_sync import ensure_everyone_membership
         from src.repositories import user_group_members_repo
 
-        result = ensure_everyone_membership("u1", added_by="test:caller")
-        assert result is False
-        assert user_group_members_repo().list_groups_with_meta_for_user("u1") == []
+        assert ensure_everyone_membership("u1", added_by="test:caller") is True
+        rows = user_group_members_repo().list_groups_with_meta_for_user("u1")
+        assert [r["name"] for r in rows] == ["Everyone"]
+        assert rows[0]["source"] == "system_seed"
 
     def test_idempotent_on_second_call(self, db_env, monkeypatch):
         monkeypatch.delenv("AGNES_GROUP_EVERYONE_EMAIL", raising=False)

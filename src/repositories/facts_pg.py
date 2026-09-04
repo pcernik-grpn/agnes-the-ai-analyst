@@ -48,6 +48,7 @@ import json
 import logging
 import re
 import secrets
+import threading
 from collections import defaultdict
 from datetime import date, datetime
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Set, Tuple
@@ -195,6 +196,41 @@ _SWEEP_LOCK_ID = 0x46414353  # "FACS" packed as an int32
 # must BOTH eventually run (a caller awaiting the result), so this one
 # queues rather than no-ops.
 _COLLECTION_STATS_LOCK_CLASS_ID = 0x53544154  # "STAT" packed as an int32
+
+# TCRD-296 gap #78 follow-up (Devin Review on #2273): a cheap, in-memory
+# "this corpus's fact graph changed" signal for `app/web/router.py`'s
+# `collection_facts_summary` TTL cache. Bumped by every write path below
+# that can change what that method returns for a corpus — a new/deleted
+# claim, a reassigned file, a rebuild, a correction, a merge/split — so a
+# write is visible on the very next read regardless of the cache's TTL: the
+# TTL only smooths repeated reads of UNCHANGED data (the Files section's
+# own pager), never a stale answer after a real write. Process-local, never
+# persisted — a restart naturally invalidates everything, which is correct
+# (nothing cached to invalidate). NOT bumped by a write that bypasses this
+# repository entirely (raw SQL against `claims`/`edges`/`corrections`, e.g.
+# a test fixture or an out-of-band data fix) — there is no application-level
+# write path to hook in that case, the same limitation `fact_collection_
+# stats` itself already has; such a caller must invalidate explicitly via
+# `FactsPgRepository.invalidate_corpus_facts_cache`.
+_corpus_facts_version_lock = threading.Lock()
+_corpus_facts_version: Dict[str, int] = {}
+
+
+def _bump_corpus_facts_version(*corpus_ids: Optional[str]) -> None:
+    with _corpus_facts_version_lock:
+        for cid in corpus_ids:
+            if cid:
+                _corpus_facts_version[cid] = _corpus_facts_version.get(cid, 0) + 1
+
+
+def _clear_all_corpus_facts_versions() -> None:
+    """Coarse invalidation for a write whose affected corpora are not
+    cheaply known here — a correction is scoped by subject id, not corpus,
+    and a subject's claims can span more than one. Corrections are a rare,
+    admin-triggered path, so invalidating every corpus's cache entry rather
+    than tracing the exact affected set is the correct, simple trade-off."""
+    with _corpus_facts_version_lock:
+        _corpus_facts_version.clear()
 
 
 class FactNotFound(RuntimeError):
@@ -993,6 +1029,12 @@ class FactsPgRepository:
         original `claims` scan when it is missing/stale (see
         `rebuild_collection_stats`'s docstring), so degrading silently here
         is the correct failure mode, not a swallowed bug."""
+        # Gap #78 follow-up: bumped unconditionally, BEFORE the try below —
+        # the claim itself is already written by the time this runs
+        # (`add_claim` only calls this after a genuinely new row), so the
+        # cache-invalidation signal must not depend on whether the stats
+        # bookkeeping savepoint below happens to succeed.
+        _bump_corpus_facts_version(corpus_id)
         try:
             with conn.begin_nested():
                 self._bump_collection_stats_impl(
@@ -1114,6 +1156,10 @@ class FactsPgRepository:
         `rebuild_collection_stats`'s docstring)."""
         if not deleted_rows:
             return
+        # Gap #78 follow-up: same "bump before the savepoint, regardless of
+        # its outcome" reasoning as `_bump_collection_stats_on_new_claim` —
+        # the DELETE is already committed by the time this runs.
+        _bump_corpus_facts_version(*{r["corpus_id"] for r in deleted_rows})
         try:
             with conn.begin_nested():
                 self._decrement_collection_stats_impl(conn, deleted_rows)
@@ -1374,6 +1420,11 @@ class FactsPgRepository:
            serializes that case instead — a second rebuild of this same
            `corpus_id` blocks until this transaction commits or rolls back.
         """
+        # Gap #78 follow-up: a rebuild is the RECOMPUTE path every bulk
+        # claims mutation (reassign, merge, split, consolidation) and the
+        # admin repair tool route through — bumping here transitively
+        # covers all of them without a separate hook at each call site.
+        _bump_corpus_facts_version(corpus_id)
         conn.execute(
             sa.text("SELECT pg_advisory_xact_lock(:class_id, hashtext(:cid))"),
             {"class_id": _COLLECTION_STATS_LOCK_CLASS_ID, "cid": corpus_id},
@@ -1543,6 +1594,13 @@ class FactsPgRepository:
                     "by": decided_by,
                 },
             )
+        # Gap #78 follow-up: a correction changes VISIBILITY, never
+        # claims/edges counts, so none of the three stats hooks above see
+        # it — and it is scoped by subject id, not corpus, so the cheap
+        # per-corpus bump those use is not available here. A blanket clear
+        # is the correct, simple trade-off for this rare, admin-triggered
+        # write (see `_clear_all_corpus_facts_versions`'s own docstring).
+        _clear_all_corpus_facts_versions()
 
     def delete_correction(self, *, subject_kind: str, subject_id: str) -> None:
         with self._engine.begin() as conn:
@@ -1550,6 +1608,8 @@ class FactsPgRepository:
                 sa.text("DELETE FROM corrections WHERE subject_kind = :kind AND subject_id = :id"),
                 {"kind": subject_kind, "id": subject_id},
             )
+        # Gap #78 follow-up: same reasoning as `upsert_correction` above.
+        _clear_all_corpus_facts_versions()
 
     def list_wrong_corrections(self) -> List[Dict[str, Any]]:
         """The producer export (spec §7.4): every ``wrong`` subject with its
@@ -4030,6 +4090,24 @@ class FactsPgRepository:
             out[r["corpus_file_id"]] = int(r["n"])
         return out
 
+    def corpus_facts_version(self, corpus_id: str) -> int:
+        """Current write-version for ``corpus_id`` (see the module-level
+        registry above `FactNotFound`) — 0 if this process has never
+        bumped it. A cheap in-memory read, no DB round trip;
+        `app/web/router.py`'s `collection_facts_summary` TTL cache folds
+        this into its cache key so a write through this repository is
+        visible on the very next read regardless of the cache's TTL."""
+        with _corpus_facts_version_lock:
+            return _corpus_facts_version.get(corpus_id, 0)
+
+    def invalidate_corpus_facts_cache(self, corpus_id: str) -> None:
+        """Escape hatch for a caller that changed ``corpus_id``'s
+        claims/edges/corrections OUTSIDE this repository (raw SQL — a
+        migration data fix, a test fixture) and needs the next
+        `collection_facts_summary` read to reflect it immediately, the
+        same way a write made THROUGH this repository already does."""
+        _bump_corpus_facts_version(corpus_id)
+
     def collection_facts_summary(self, caller, corpus_id: str, *, limit: int = 20, offset: int = 0) -> Dict[str, Any]:
         """Caller-scoped facts section for one collection's detail page
         (spec §13.2 "Collection detail"): fact count by type, a paged list of
@@ -4054,6 +4132,30 @@ class FactsPgRepository:
         value a caller can read for one attribute key is a conflict, because
         this surface's job is showing a reader the disagreement, not picking
         a winner. It intentionally surfaces more than the projection would.
+
+        **TCRD-296 gap #78.** Used to run FOUR separate statements against
+        `_visible_facts_for_corpus_cte` — one each for the type breakdown,
+        the page, the `possible_duplicate_of` candidates and the
+        single-valued-conflict candidates — every one re-deriving the SAME
+        per-caller candidate set from scratch (production measurement,
+        2026-09-04: ~1s per statement on a 552k-fact/2.4M-claim collection,
+        called on this route TWICE per render). A non-recursive CTE
+        referenced more than once in ONE statement is materialized by
+        Postgres exactly once and shared by every reference (proven in
+        `tests/db_pg/test_fact_collection_stats_pg.py`'s admin-fast-path
+        EXPLAIN assertions), so the four are now downstream CTEs of the
+        SAME `{cte}` inside a SINGLE combined statement below — `visible`/
+        `candidates` is derived once per call, not four times, whichever
+        branch of `_visible_facts_for_corpus_cte` (the indexed admin fast
+        path or the full audience-gated one) applies. `total` additionally
+        prefers `approximate_counts_for_collections` for an admin caller —
+        the same O(1) `fact_collection_stats` lookup the Library index
+        already uses (gap #70's "admin sees all") — falling back to the
+        exact `sum(type_counts)` whenever the corpus has no stats row yet;
+        the two can differ by the same small `wrong`/`restricted` margin
+        `approximate_counts_for_collections`'s own docstring already
+        documents. There is no per-type stats table, so `type_counts`
+        itself always comes from the (now single-execution) exact CTE.
         """
         limit = max(1, min(limit, 100))
         offset = max(0, offset)
@@ -4067,26 +4169,84 @@ class FactsPgRepository:
             vis_params["tiered_hidden"] = tiered_hidden
             vis_params["audience_pairs"] = audience_pairs
         cte = self._visible_facts_for_corpus_cte(is_admin, all_evidence)
+        sv_types = list(_single_valued_edge_types())
 
-        with self._engine.connect() as conn:
-            type_sql = sa.text(
-                f"WITH {cte} "
-                "SELECT f.type, COUNT(*) AS n FROM visible v JOIN facts f ON f.id = v.subject_id "
-                "GROUP BY f.type ORDER BY f.type"
+        # One round trip for everything `visible`-derived. Each of the four
+        # pieces below is its own CTE off the shared `visible`/`candidates`
+        # chain, JSON-aggregated into one row so `visible` is computed
+        # exactly once regardless of how many of the four read it. Order is
+        # applied INSIDE each `json_agg` (never relied on from scan order),
+        # so a parallel or reordered plan can never scramble a section.
+        combined_sql = sa.text(
+            f"""
+            WITH {cte},
+            type_counts_cte AS (
+                SELECT f.type AS type, COUNT(*) AS n
+                FROM visible v JOIN facts f ON f.id = v.subject_id
+                GROUP BY f.type
+            ),
+            page_cte AS (
+                SELECT v.subject_id AS subject_id, v.is_revealed AS is_revealed, f.type AS type
+                FROM visible v JOIN facts f ON f.id = v.subject_id
+                ORDER BY f.type, v.subject_id
+                LIMIT :limit_plus_one OFFSET :offset
+            ),
+            dup_edges_cte AS (
+                SELECT DISTINCT e.id AS id, e.src AS src, e.dst AS dst
+                FROM edges e
+                WHERE e.type = 'possible_duplicate_of'
+                  AND (e.src IN (SELECT subject_id FROM visible) OR e.dst IN (SELECT subject_id FROM visible))
+                ORDER BY e.id
+                LIMIT 50
+            ),
+            sv_candidates_cte AS (
+                SELECT e.src AS src, e.type AS type
+                FROM edges e
+                WHERE e.type = ANY(:sv_types)
+                  AND e.src IN (SELECT subject_id FROM visible)
+                  AND EXISTS (SELECT 1 FROM claims c WHERE c.edge_id = e.id)
+                GROUP BY e.src, e.type
+                HAVING COUNT(DISTINCT e.dst) > 1
+                ORDER BY e.src, e.type
+                LIMIT 50
             )
-            type_rows = conn.execute(type_sql, vis_params).mappings().all()
-            type_counts = {r["type"]: int(r["n"]) for r in type_rows}
-            total = sum(type_counts.values())
+            SELECT
+                COALESCE(
+                    (SELECT json_agg(json_build_object('type', type, 'n', n) ORDER BY type) FROM type_counts_cte),
+                    '[]'
+                ) AS type_counts,
+                COALESCE(
+                    (SELECT json_agg(
+                        json_build_object('subject_id', subject_id, 'is_revealed', is_revealed, 'type', type)
+                        ORDER BY type, subject_id
+                    ) FROM page_cte),
+                    '[]'
+                ) AS page,
+                COALESCE(
+                    (SELECT json_agg(json_build_object('id', id, 'src', src, 'dst', dst) ORDER BY id)
+                     FROM dup_edges_cte),
+                    '[]'
+                ) AS dup_edges,
+                COALESCE(
+                    (SELECT json_agg(json_build_object('src', src, 'type', type) ORDER BY src, type)
+                     FROM sv_candidates_cte),
+                    '[]'
+                ) AS sv_candidates
+            """
+        )
+        combined_params = dict(vis_params)
+        combined_params["limit_plus_one"] = limit + 1
+        combined_params["offset"] = offset
+        combined_params["sv_types"] = sv_types
 
-            page_sql = sa.text(
-                f"WITH {cte} "
-                "SELECT v.subject_id, v.is_revealed, f.type FROM visible v JOIN facts f ON f.id = v.subject_id "
-                "ORDER BY f.type, v.subject_id LIMIT :limit_plus_one OFFSET :offset"
-            )
-            page_params = dict(vis_params)
-            page_params["limit_plus_one"] = limit + 1
-            page_params["offset"] = offset
-            page_rows = conn.execute(page_sql, page_params).mappings().all()
+        with self._engine.begin() as conn:
+            conn.execute(sa.text(f"SET LOCAL statement_timeout = {_STATEMENT_TIMEOUT_MS}"))
+            combined_row = conn.execute(combined_sql, combined_params).mappings().first()
+            assert combined_row is not None
+
+            type_counts = {r["type"]: int(r["n"]) for r in (_decode_jsonb(combined_row["type_counts"]) or [])}
+
+            page_rows = _decode_jsonb(combined_row["page"]) or []
             limit_applied = len(page_rows) > limit
             page_rows = page_rows[:limit]
             page_ids = [r["subject_id"] for r in page_rows]
@@ -4187,24 +4347,41 @@ class FactsPgRepository:
                         }
                     )
 
+                dup_edge_rows = _decode_jsonb(combined_row["dup_edges"]) or []
                 review_items = self._review_items_for_corpus(
                     conn,
-                    corpus_id=corpus_id,
+                    edge_rows=dup_edge_rows,
                     is_admin=is_admin,
                     all_evidence=all_evidence,
                     readable=readable,
                     tiered_hidden=tiered_hidden,
                     audience_pairs=audience_pairs,
                 )
+                sv_candidate_rows = _decode_jsonb(combined_row["sv_candidates"]) or []
                 review_items += self._single_valued_review_items_for_corpus(
                     conn,
-                    corpus_id=corpus_id,
+                    candidates=sv_candidate_rows,
                     is_admin=is_admin,
                     all_evidence=all_evidence,
                     readable=readable,
                     tiered_hidden=tiered_hidden,
                     audience_pairs=audience_pairs,
                 )
+
+        total = sum(type_counts.values())
+        if is_admin:
+            # Gap #78's other half: on a corpus large enough for the exact
+            # breakdown above to matter, the O(1) `fact_collection_stats`
+            # lookup the Library index already trusts for "how big is this"
+            # (`approximate_counts_for_collections`, gap #70) is a strictly
+            # cheaper number to page against than one that took a full scan
+            # to produce — same "admin sees all" scope, no per-caller
+            # narrowing lost. Never substituted for `type_counts` itself (no
+            # per-type stats table exists) and left as `sum(type_counts)`
+            # whenever the corpus has no stats row yet (pre-rebuild, or a
+            # corpus with zero facts).
+            approx = self.approximate_counts_for_collections([corpus_id])
+            total = approx.get(corpus_id, {}).get("facts", total)
 
         return {
             "total": total,
@@ -4218,39 +4395,28 @@ class FactsPgRepository:
         self,
         conn,
         *,
-        corpus_id: str,
+        edge_rows: List[Mapping[str, Any]],
         is_admin: bool,
         all_evidence: bool,
         readable: Optional[frozenset],
         tiered_hidden: Optional[List[str]] = None,
         audience_pairs: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
-        """`possible_duplicate_of` edges touching a fact evidenced by
-        ``corpus_id`` — spec §7.2's entity-resolution review items, surfaced
-        as rows with both subjects named rather than a detached queue. Every
-        edge is independently visibility-checked (its OWN claim, never
-        inferred from its endpoints — the same rule S3/S4 pin for
-        `neighbors()`), and both endpoints must be independently visible too,
-        so this can never announce a fact the caller cannot otherwise see.
-        Capped at 50 candidate edges — a review surface, not a full scan."""
-        cte = self._visible_facts_for_corpus_cte(is_admin, all_evidence)
-        vis_params: Dict[str, Any] = {"corpus_id": corpus_id}
-        if not is_admin:
-            vis_params["readable"] = list(readable)
-            vis_params["tiered_hidden"] = tiered_hidden or []
-            vis_params["audience_pairs"] = audience_pairs or []
-        edge_sql = sa.text(
-            f"""
-            WITH {cte}
-            SELECT DISTINCT e.id, e.src, e.dst
-            FROM edges e
-            WHERE e.type = 'possible_duplicate_of'
-              AND (e.src IN (SELECT subject_id FROM visible) OR e.dst IN (SELECT subject_id FROM visible))
-            ORDER BY e.id
-            LIMIT 50
-            """
-        )
-        edge_rows = conn.execute(edge_sql, vis_params).mappings().all()
+        """`possible_duplicate_of` edges touching a fact evidenced by the
+        caller's collection — spec §7.2's entity-resolution review items,
+        surfaced as rows with both subjects named rather than a detached
+        queue. Every edge is independently visibility-checked (its OWN
+        claim, never inferred from its endpoints — the same rule S3/S4 pin
+        for `neighbors()`), and both endpoints must be independently
+        visible too, so this can never announce a fact the caller cannot
+        otherwise see.
+
+        ``edge_rows`` — ``{"id", "src", "dst"}`` mappings, already capped at
+        50 — is pre-fetched by the caller (TCRD-296 gap #78:
+        `collection_facts_summary`'s combined statement now runs this
+        candidate query as one of its CTEs, so this method only does the
+        per-edge visibility walk below — never a second, redundant
+        derivation of the same candidate set)."""
         out: List[Dict[str, Any]] = []
         for erow in edge_rows:
             eid, src, dst = erow["id"], erow["src"], erow["dst"]
@@ -4306,7 +4472,7 @@ class FactsPgRepository:
         self,
         conn,
         *,
-        corpus_id: str,
+        candidates: List[Mapping[str, Any]],
         is_admin: bool,
         all_evidence: bool,
         readable: Optional[frozenset],
@@ -4314,8 +4480,8 @@ class FactsPgRepository:
         audience_pairs: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         """Functionally single-valued edges (spec §7.3) whose src fact is
-        evidenced by ``corpus_id``: >1 distinct dst, each carrying its OWN
-        independently-visible claim (the exact discipline
+        evidenced by the caller's collection: >1 distinct dst, each carrying
+        its OWN independently-visible claim (the exact discipline
         `_review_items_for_corpus` applies to `possible_duplicate_of` — an
         edge's own claim AND its dst endpoint must each pass
         `_subject_status`/`_is_visible`), for an edge type this instance
@@ -4325,35 +4491,16 @@ class FactsPgRepository:
         group back to <=1 visible dst, the item disappears entirely (never
         announces a conflict whose second edge the caller cannot read).
         Recomputed on every call from live edges/claims, nothing persisted,
-        so it clears the moment a dst's claims are gone. Candidate (src,
-        type) pairs capped at 50 — a review surface, not a full scan."""
-        types = _single_valued_edge_types()
-        if not types:
-            return []
-        cte = self._visible_facts_for_corpus_cte(is_admin, all_evidence)
-        vis_params: Dict[str, Any] = {"corpus_id": corpus_id, "types": list(types)}
-        if not is_admin:
-            vis_params["readable"] = list(readable)
-            vis_params["tiered_hidden"] = tiered_hidden or []
-            vis_params["audience_pairs"] = audience_pairs or []
-        # Step 1: candidate (src, type) pairs with RAW distinct-dst count >1
-        # among live (>=1 claim) edges — cheap pre-filter before the
-        # per-edge visibility walk below.
-        candidate_sql = sa.text(
-            f"""
-            WITH {cte}
-            SELECT e.src, e.type
-            FROM edges e
-            WHERE e.type = ANY(:types)
-              AND e.src IN (SELECT subject_id FROM visible)
-              AND EXISTS (SELECT 1 FROM claims c WHERE c.edge_id = e.id)
-            GROUP BY e.src, e.type
-            HAVING COUNT(DISTINCT e.dst) > 1
-            ORDER BY e.src, e.type
-            LIMIT 50
-            """
-        )
-        candidates = conn.execute(candidate_sql, vis_params).mappings().all()
+        so it clears the moment a dst's claims are gone.
+
+        ``candidates`` — ``{"src", "type"}`` mappings, RAW distinct-dst
+        count >1 among live (>=1 claim) edges, already capped at 50 — is
+        pre-fetched by the caller, the sibling of `_review_items_for_corpus`'s
+        ``edge_rows`` (TCRD-296 gap #78: same "candidate query moved into
+        `collection_facts_summary`'s combined statement" change). An empty
+        ``candidates`` list (no `facts.single_valued_edges` configured, or
+        none evidenced here) is simply a no-op loop, same result as the old
+        early ``if not types: return []``."""
         out: List[Dict[str, Any]] = []
         for cand in candidates:
             src, etype = cand["src"], cand["type"]

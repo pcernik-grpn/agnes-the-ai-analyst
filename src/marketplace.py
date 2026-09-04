@@ -25,6 +25,10 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 from app.utils import get_marketplace_cache_dir, get_marketplaces_dir
+from src.grant_scopes import EVERYONE as SCOPE_EVERYONE
+
+#: What this module is, to `resource_grants.source` (src/grant_sources.py).
+GRANT_SOURCE = "marketplace_sync"
 
 logger = logging.getLogger(__name__)
 
@@ -951,9 +955,16 @@ _BUILTIN_CONTENT_DIR = Path(__file__).parent / "_builtin_marketplace"
 _BUILTIN_SENTINEL_URL = "builtin://agnes-builtin"
 
 #: RBAC seed: (group_name, plugin_name) pairs that must always exist.
+#: ``(group_name, plugin_name, scope)``. ``scope`` is
+#: ``grant_scopes.EVERYONE`` where the seed genuinely means every account —
+#: the analyst plugin — and ``None`` where it means the members of a group.
+#: The two used to be spelled the same way (a grant on the seeded
+#: ``Everyone`` group), which meant the analyst plugin reached a SUBSET on
+#: any instance where that group was narrowed to a Workspace group. The
+#: group name stays as the carrier: see ``grant_scopes.carrier_group_id``.
 _BUILTIN_RBAC_SEEDS = [
-    ("Everyone", "agnes-analyst"),
-    ("Admin", "agnes-operator"),
+    ("Everyone", "agnes-analyst", SCOPE_EVERYONE),
+    ("Admin", "agnes-operator", None),
 ]
 
 
@@ -1024,7 +1035,7 @@ def seed_builtin_marketplace() -> None:
     # 4. Seed RBAC grants.
     groups_repo = user_groups_repo()
     grants_repo = resource_grants_repo()
-    for group_name, plugin_name in _BUILTIN_RBAC_SEEDS:
+    for group_name, plugin_name, scope in _BUILTIN_RBAC_SEEDS:
         group = groups_repo.get_by_name(group_name)
         if not group:
             logger.warning(
@@ -1038,6 +1049,8 @@ def seed_builtin_marketplace() -> None:
             group_id=group["id"],
             resource_type="marketplace_plugin",
             resource_id=resource_id,
+            source=GRANT_SOURCE,
+            scope=scope,
         )
         logger.info(
             "built-in marketplace: RBAC grant seeded: %s -> %s",
