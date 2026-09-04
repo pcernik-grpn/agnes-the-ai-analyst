@@ -515,3 +515,41 @@ def test_admin_tables_runs_the_shared_toolbar_engine(seeded_app):
     # engine listening on `document`.
     assert "destroy: destroy," in js
     assert "function syncCatCounts" in js
+
+
+def test_bulk_assign_create_package_opens_the_shared_drawer_not_a_prompt(seeded_app):
+    """"+ Create new package…" in the bulk-assign Target Data Package dropdown
+    used to run a tiny `promptModal()`-based flow — a single Name field, no
+    description/color/slug, no relation to the styled create form the
+    chip-input's own "+ Create new" tail row already opens. It must now open
+    the SAME shared component (`js/components/package_drawer.js`), and the
+    page must not run a raw `prompt(`/`confirm(`/native `alert(` anywhere in
+    this flow (#1979)."""
+    c = seeded_app["client"]
+    token = seeded_app["admin_token"]
+    html = c.get("/admin/tables", headers=_auth(token)).text
+    # No native browser dialogs anywhere on the page.
+    assert "window.prompt(" not in html
+    assert "window.confirm(" not in html
+    assert "window.alert(" not in html
+    # The old quick-and-dirty flow is gone...
+    assert "promptModal('Name for the new Data Package:')" not in html
+    assert "_deriveSlug" not in html
+    # ...replaced by the shared drawer, opened with its own onCreated so the
+    # newly-created package lands selected in the dropdown.
+    onchange = html[html.index("sel.onchange = function()") : html.index("if (preselectPkgId")]
+    assert "window.AgnesPackageDrawer.open(" in onchange
+    assert "onCreated: function (pkg)" in onchange
+    assert "sel.value = pkg.id;" in onchange
+
+
+def test_bulk_assign_and_chip_input_share_one_create_component(seeded_app):
+    """Both entry points to "create a package without leaving the page" —
+    the chip-input's tail row and the bulk-assign dropdown's sentinel —
+    delegate to the one component, rather than each carrying its own copy of
+    the create form."""
+    c = seeded_app["client"]
+    token = seeded_app["admin_token"]
+    html = c.get("/admin/tables", headers=_auth(token)).text
+    assert "js/components/package_drawer.js" in html
+    assert html.count("window.AgnesPackageDrawer.open(") == 2

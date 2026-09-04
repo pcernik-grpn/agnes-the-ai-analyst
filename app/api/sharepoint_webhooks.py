@@ -209,6 +209,7 @@ def _dispatch_extraction(connection_id: str, row: Dict[str, Any], *, verified_co
     if not usable:
         return
 
+    from app.worker.registry import job_max_attempts
     from src.repositories import jobs_repo
 
     job = jobs_repo().enqueue(
@@ -216,6 +217,7 @@ def _dispatch_extraction(connection_id: str, row: Dict[str, Any], *, verified_co
         {"connection_id": connection_id},
         idempotency_key=_extraction_idempotency_key(connection_id),
         run_after=datetime.now(timezone.utc) + timedelta(seconds=_WEBHOOK_DEBOUNCE_SECONDS),
+        max_attempts=job_max_attempts("corpus-extraction"),
     )
     log_safe(
         user_id=None,

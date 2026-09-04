@@ -177,6 +177,7 @@ def _seed_second_doc(*, file_id: str, doc_id: str, text: str) -> str:
     _seed_source_mapping(file_id=file_id, source_doc_id=doc_id)
     return doc_id
 
+
 # ---------------------------------------------------------------------------
 # EQ1 — the verbatim gate rejects fabrication, non-zero rejection count.
 # ---------------------------------------------------------------------------
@@ -696,12 +697,19 @@ def test_c2_full_documents_replace_drops_a_subject_the_reextraction_no_longer_me
 
     # Re-extraction drops "beta" entirely; full_documents replace must
     # remove its stale claim so the subject is orphaned and swept.
+    # `orphan_sweep_grace_seconds=0`: this batch's own end-of-ingest sweep
+    # must delete "beta" in the SAME call — its default grace period would
+    # otherwise spare it (it was minted only moments ago, by the batch
+    # above), which is right for the concurrent-pass race this default
+    # defends against but wrong for what this test is asserting.
     report = repo.ingest_batch(
         documents=[],
         full_documents=[doc_id],
         nodes=[_node("engagement:acme", doc_id, "Acme Corp is the client.")],
+        orphan_sweep_grace_seconds=0,
     )
     assert report["subjects_deleted"] >= 1
+    assert report["sweep_skipped"] is False
     remaining = repo.search(_admin(), type="engagement")
     ids = {s["id"] for s in remaining["subjects"]}
     assert len(ids) == 1
@@ -744,6 +752,94 @@ def test_replaying_the_same_batch_is_a_no_op(pg_env, repo):
     result = repo.search(_admin(), type="engagement")
     assert len(result["subjects"]) == 1
     assert result["subjects"][0]["claim_count"] == 1  # not duplicated
+
+
+# ---------------------------------------------------------------------------
+# Atomicity + edge-endpoint-missing race (pool-starved-replica production
+# finding, 2026-09): a node's fact/alias creation and its own evidence claim
+# now commit or roll back TOGETHER, and an edge whose endpoint fact is
+# genuinely gone by INSERT time (a race with a concurrent pass's own
+# sweep_orphans, or a merge/dedup) is skipped — counted, never crashing the
+# whole batch.
+# ---------------------------------------------------------------------------
+
+
+def test_a_claim_write_failure_rolls_back_the_fact_it_would_have_evidenced(pg_env, repo, monkeypatch):
+    """Before this fix, `create_fact` committed in its OWN transaction — a
+    fact/alias would persist even if the SAME node's claim write failed
+    moments later, leaving a fact with zero claims for a concurrent pass's
+    `sweep_orphans()` to race against (the production FK-violation finding
+    on `edges`). Now the node's fact + its own evidence are one
+    transaction: a failure between them leaves nothing of that node
+    written at all."""
+    doc_id = _seed_ready_doc(pg_env)
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("simulated pool exhaustion mid-claim-write")
+
+    monkeypatch.setattr(repo, "add_claim", _boom)
+
+    with pytest.raises(RuntimeError, match="simulated pool exhaustion"):
+        repo.ingest_batch(nodes=[_node("engagement:acme-rollout", doc_id, "engagement is underway")])
+
+    from src.db_pg import get_engine
+
+    with get_engine().connect() as conn:
+        facts = conn.execute(sa.text("SELECT COUNT(*) FROM facts")).scalar()
+        aliases = conn.execute(sa.text("SELECT COUNT(*) FROM fact_aliases")).scalar()
+        claims = conn.execute(sa.text("SELECT COUNT(*) FROM claims")).scalar()
+    assert (facts, aliases, claims) == (0, 0, 0)
+
+
+def test_edge_whose_endpoint_fact_vanished_before_insert_is_skipped_and_counted(pg_env, repo, monkeypatch):
+    """Live finding: an `edges` INSERT hit `ForeignKeyViolation` when its
+    `src`/`dst` fact — resolved fine moments earlier — was deleted by a
+    concurrent pass before the INSERT ran. `ingest_batch` must skip only
+    that ONE edge (counted via `edges_skipped_missing_endpoint`), never
+    fail the whole batch or the sibling node sharing it."""
+    doc_id = _seed_ready_doc(pg_env)
+    # Pre-existing endpoint, resolved via a FRESH db read in the edge loop
+    # (not this batch's own node_fact_ids cache) — matches the production
+    # shape: the endpoint existed at resolution time.
+    existing_fact_id = repo.create_fact(type="engagement", natural_key="engagement:acme-rollout")
+
+    from src.repositories.facts_pg import FactsPgRepository
+
+    original_create_edge = FactsPgRepository.create_edge
+
+    def _create_edge_after_concurrent_delete(self, **kwargs):
+        # Simulate another concurrent ingest_batch's own sweep_orphans() —
+        # or an admin merge/dedup — deleting the endpoint fact between this
+        # edge's endpoint resolution (above) and its INSERT (below).
+        with self._engine.begin() as conn:
+            conn.execute(sa.text("DELETE FROM facts WHERE id = :id"), {"id": existing_fact_id})
+        return original_create_edge(self, **kwargs)
+
+    monkeypatch.setattr(FactsPgRepository, "create_edge", _create_edge_after_concurrent_delete)
+
+    report = repo.ingest_batch(
+        nodes=[_node("person:jane-doe", doc_id, "engagement is underway")],
+        edges=[
+            {
+                "src": "engagement:acme-rollout",
+                "type": "staffed_by",
+                "dst": "person:jane-doe",
+                "attrs": {},
+                "evidence": [{"doc_id": doc_id, "quote": "engagement is underway"}],
+            }
+        ],
+    )
+
+    assert report["edges_skipped_missing_endpoint"] == 1
+    # The sibling node's own claim is unaffected by the edge's race.
+    assert report["claims_written"] == 1
+    assert report["claims_rejected"] == []
+
+    from src.db_pg import get_engine
+
+    with get_engine().connect() as conn:
+        edge_count = conn.execute(sa.text("SELECT COUNT(*) FROM edges WHERE type = 'staffed_by'")).scalar()
+    assert edge_count == 0
 
 
 # ---------------------------------------------------------------------------
@@ -981,7 +1077,10 @@ def test_wrong_correction_reattaches_after_the_subject_is_deleted_and_recreated(
     )
 
     # Full delete: replace mode with an empty node set orphans the subject.
-    repo.ingest_batch(documents=[], full_documents=[doc_id], nodes=[])
+    # orphan_sweep_grace_seconds=0 — this batch's own sweep must delete it
+    # in the SAME call; the subject was minted moments ago (report1, just
+    # above), well inside the default grace period.
+    repo.ingest_batch(documents=[], full_documents=[doc_id], nodes=[], orphan_sweep_grace_seconds=0)
     assert report1["subjects_created"] == 1
 
     # Re-create the SAME alias under a fresh surrogate id.
@@ -1105,8 +1204,8 @@ def test_c5_orphan_sweep_counts_and_spares_a_subject_with_a_surviving_claim(pg_e
     with pg_env.begin() as conn:
         conn.execute(sa.text("DELETE FROM corpus_files WHERE id = 'cf_a1'"))
 
-    deleted = repo.sweep_orphans()
-    assert deleted == 0  # the fact still has its cf_a2 claim
+    result = repo.sweep_orphans(grace_seconds=0)
+    assert result == {"deleted": 0, "skipped": False}  # the fact still has its cf_a2 claim
     assert len(repo.claims(_admin(), fact_id)["claims"]) == 1
 
 
@@ -1117,8 +1216,8 @@ def test_c5_orphan_sweep_deletes_a_subject_with_zero_remaining_claims(pg_env, re
     with pg_env.begin() as conn:
         conn.execute(sa.text("DELETE FROM corpus_files WHERE id = 'cf_a1'"))
 
-    deleted = repo.sweep_orphans()
-    assert deleted == 1
+    result = repo.sweep_orphans(grace_seconds=0)
+    assert result == {"deleted": 1, "skipped": False}
     assert repo.search(_admin(), type="engagement")["subjects"] == []
 
 
@@ -1148,8 +1247,8 @@ def test_c5_orphan_sweep_spares_a_fact_with_only_a_claimed_incident_edge(pg_env,
         quote="Acme is a SaaS company.",
     )
 
-    deleted = repo.sweep_orphans()
-    assert deleted == 0
+    result = repo.sweep_orphans(grace_seconds=0)
+    assert result == {"deleted": 0, "skipped": False}
     assert repo.claims(_admin(), dst) == {"claims": [], "revealed": False, "limit_applied": False}
 
 
@@ -1166,13 +1265,195 @@ def test_c5_orphan_sweep_deletes_a_fact_when_its_incident_edges_are_also_claimle
     dst = repo.create_fact(type="industry")
     repo.create_edge(src=src, type="works_in_industry", dst=dst)  # no claim ever added
 
-    deleted = repo.sweep_orphans()
-    assert deleted == 2  # the claimless edge AND the now-orphaned dst fact
+    result = repo.sweep_orphans(grace_seconds=0)
+    assert result == {"deleted": 2, "skipped": False}  # the claimless edge AND the now-orphaned dst fact
 
     from src.repositories.facts_pg import FactNotFound
 
     with pytest.raises(FactNotFound):
         repo.claims(_admin(), dst)
+
+
+# ---------------------------------------------------------------------------
+# Orphan sweep concurrency (live finding, 2026-09): several facts-extraction
+# passes racing their own end-of-batch sweep_orphans() against one shared
+# fact graph deleted a sibling pass's just-minted, not-yet-evidenced
+# subject — 75 447 subjects deleted against 10 784 created in 30 minutes on
+# one instance, ~13% of documents failing with ForeignKeyViolation. Two
+# guards close it: a grace period (a subject younger than it is never
+# swept) and a transaction-scoped advisory lock serializing the sweep
+# itself across passes.
+# ---------------------------------------------------------------------------
+
+
+def test_orphan_sweep_grace_period_spares_a_freshly_created_orphan(pg_env, repo):
+    """A fact minted moments ago — by this call or, in production, by a
+    concurrent pass still mid-write — must survive `sweep_orphans()`'s
+    default grace period, however orphaned (zero claims, zero incident
+    edges) it looks right now."""
+    _seed_collection(collection_id=CORPUS_A)
+    fact_id = repo.create_fact(type="engagement", natural_key="engagement:freshly-minted")
+
+    result = repo.sweep_orphans()  # default grace period — the production call shape
+    assert result == {"deleted": 0, "skipped": False}
+
+    with repo._engine.connect() as conn:
+        still_there = conn.execute(sa.text("SELECT 1 FROM facts WHERE id = :id"), {"id": fact_id}).scalar()
+    assert still_there == 1
+
+
+def test_orphan_sweep_deletes_a_subject_older_than_the_grace_period(pg_env, repo):
+    """A genuinely stale orphan — backdated well past the grace period — is
+    still deleted exactly as before; the grace period narrows the sweep, it
+    does not disable it."""
+    _seed_collection(collection_id=CORPUS_A)
+    fact_id = repo.create_fact(type="engagement", natural_key="engagement:stale-orphan")
+    with repo._engine.begin() as conn:
+        conn.execute(
+            sa.text("UPDATE facts SET created_at = now() - interval '1 hour' WHERE id = :id"),
+            {"id": fact_id},
+        )
+
+    result = repo.sweep_orphans()  # default grace period (15 min) — this fact is an hour old
+    assert result == {"deleted": 1, "skipped": False}
+
+    with repo._engine.connect() as conn:
+        still_there = conn.execute(sa.text("SELECT 1 FROM facts WHERE id = :id"), {"id": fact_id}).scalar()
+    assert still_there is None
+
+
+def test_orphan_sweep_skips_when_a_concurrent_pass_holds_the_lock(pg_env, repo):
+    """Another pass's sweep already running is simulated by holding the SAME
+    transaction-scoped advisory lock on a second connection. This call must
+    back off immediately rather than block — deleting nothing, not even a
+    genuinely stale orphan — and report `skipped: True` so the caller knows
+    the next pass's sweep will cover it."""
+    from src.repositories.facts_pg import _SWEEP_LOCK_ID
+
+    fact_id = repo.create_fact(type="engagement", natural_key="engagement:locked-out")
+    with repo._engine.begin() as conn:
+        conn.execute(
+            sa.text("UPDATE facts SET created_at = now() - interval '1 hour' WHERE id = :id"),
+            {"id": fact_id},
+        )
+
+    holder_conn = repo._engine.connect()
+    holder_trans = holder_conn.begin()
+    try:
+        acquired = holder_conn.execute(
+            sa.text("SELECT pg_try_advisory_xact_lock(:key)"), {"key": _SWEEP_LOCK_ID}
+        ).scalar()
+        assert acquired is True
+
+        result = repo.sweep_orphans()
+        assert result == {"deleted": 0, "skipped": True}
+    finally:
+        holder_trans.rollback()
+        holder_conn.close()
+
+    with repo._engine.connect() as conn:
+        still_there = conn.execute(sa.text("SELECT 1 FROM facts WHERE id = :id"), {"id": fact_id}).scalar()
+    assert still_there == 1  # untouched — the sweep never even attempted the DELETE
+
+    # The lock is released once the holder's transaction ends — a later,
+    # unblocked sweep now reaps the same stale orphan.
+    result = repo.sweep_orphans()
+    assert result == {"deleted": 1, "skipped": False}
+
+
+def test_freshly_created_edge_endpoint_survives_a_concurrent_sweep(pg_env, repo, monkeypatch):
+    """The production race itself, exercised with a REAL `sweep_orphans()`
+    call rather than a faked delete (contrast
+    `test_edge_whose_endpoint_fact_vanished_before_insert_is_skipped_and_
+    counted` above, which simulates a concurrent pass via a raw ``DELETE``):
+    a fact minted purely as an edge endpoint (`_endpoint()`'s fallback,
+    `engagement:acme-rollout` below — never listed in `nodes[]`) commits in
+    its OWN transaction, zero claims, before the edge that anchors it. That
+    is a real, if brief, window (`EdgeEndpointMissing`'s docstring) in which
+    a CONCURRENT pass's own end-of-batch sweep could delete it. The grace
+    period closes this without touching any transaction boundary: its
+    default (15 minutes) is far longer than the gap between this batch's
+    own endpoint-resolution commit and its edge's own commit, so a sweep run
+    for real in that exact gap finds nothing to delete, and `create_edge`
+    never sees a missing endpoint."""
+    doc_id = _seed_ready_doc(pg_env)
+
+    from src.repositories.facts_pg import FactsPgRepository
+
+    original_create_edge = FactsPgRepository.create_edge
+
+    def _create_edge_after_concurrent_sweep(self, **kwargs):
+        # Simulate another concurrent ingest_batch's own end-of-batch
+        # sweep_orphans() running in the gap between this edge's endpoint
+        # resolution (already committed, just above) and its own INSERT.
+        result = self.sweep_orphans()
+        assert result == {"deleted": 0, "skipped": False}
+        return original_create_edge(self, **kwargs)
+
+    monkeypatch.setattr(FactsPgRepository, "create_edge", _create_edge_after_concurrent_sweep)
+
+    report = repo.ingest_batch(
+        nodes=[_node("person:jane-doe", doc_id, "engagement is underway")],
+        edges=[
+            {
+                "src": "engagement:acme-rollout",
+                "type": "staffed_by",
+                "dst": "person:jane-doe",
+                "evidence": [{"doc_id": doc_id, "quote": "engagement is underway"}],
+            }
+        ],
+    )
+
+    assert report["edges_skipped_missing_endpoint"] == 0
+    assert report["claims_written"] == 2  # the node's own claim + the edge's own claim
+
+    from src.db_pg import get_engine
+
+    with get_engine().connect() as conn:
+        edge_count = conn.execute(sa.text("SELECT COUNT(*) FROM edges WHERE type = 'staffed_by'")).scalar()
+    assert edge_count == 1
+
+
+def test_run_orphan_sweep_false_skips_the_per_batch_sweep(pg_env, repo, monkeypatch):
+    """TCRD-296 C.12: a multi-batch pass
+    (``connectors.sharepoint.facts_extraction._BatchShipper``) opts every
+    batch OUT of the per-call sweep — ``ingest_batch(run_orphan_sweep=
+    False)`` must not touch ``sweep_orphans()`` at all, leaving even a
+    genuinely stale orphan alone for the pass's own single end-of-pass
+    sweep to reap later."""
+    from src.repositories.facts_pg import FactsPgRepository
+
+    doc_id = _seed_ready_doc(pg_env)
+    stale_id = repo.create_fact(type="engagement", natural_key="engagement:stale-before-batch")
+    from src.db_pg import get_engine
+
+    with get_engine().begin() as conn:
+        conn.execute(
+            sa.text("UPDATE facts SET created_at = now() - interval '1 hour' WHERE id = :id"),
+            {"id": stale_id},
+        )
+
+    calls = {"n": 0}
+    real_sweep = FactsPgRepository.sweep_orphans
+
+    def _counting_sweep(self, **kwargs):
+        calls["n"] += 1
+        return real_sweep(self, **kwargs)
+
+    monkeypatch.setattr(FactsPgRepository, "sweep_orphans", _counting_sweep)
+
+    report = repo.ingest_batch(
+        nodes=[_node("person:jane-doe", doc_id, "engagement is underway")],
+        run_orphan_sweep=False,
+    )
+
+    assert calls["n"] == 0, "run_orphan_sweep=False must skip sweep_orphans() entirely"
+    assert report["subjects_deleted"] == 0
+    assert report["sweep_skipped"] is False
+
+    with get_engine().connect() as conn:
+        still_there = conn.execute(sa.text("SELECT 1 FROM facts WHERE id = :id"), {"id": stale_id}).scalar()
+    assert still_there == 1, "the stale orphan must survive — no sweep ran at all"
 
 
 # ---------------------------------------------------------------------------
@@ -1640,6 +1921,54 @@ def test_dup_doc_id_two_copies_one_corpus_one_batch_is_deterministic_across_repl
     result = repo.search(_admin(), type="engagement")
     assert len(result["subjects"]) == 1
     assert result["subjects"][0]["claim_count"] == 1  # not doubled across the two copies
+
+
+def test_ingest_batch_reports_claims_written_and_resolved_file_per_doc_id(pg_env, repo):
+    """TCRD-296 gap #62: a caller correcting its own per-document ledger
+    needs BOTH — how many claims THIS doc_id's evidence actually wrote
+    (``claims_written_by_doc``), and which `corpus_file_id` it resolved to
+    (``resolved_file_by_doc``). Two copies of one doc_id in one corpus
+    collapse onto ONE deterministic winner (TCRD-241) — the report names
+    that winner under the shared doc_id, never under either copy's own
+    file_id."""
+    _seed_collection(collection_id=CORPUS_A)
+    _seed_corpus_file(file_id="cf_1", status="indexed")
+    _seed_corpus_file(file_id="cf_2", status="indexed")
+    text = "Acme Corp is the client of record."
+    _seed_chunk(file_id="cf_1", text=text)
+    _seed_chunk(file_id="cf_2", text=text)
+    _seed_source_mapping(file_id="cf_1", source_doc_id="dupdoc5", stable_id="path1")
+    _seed_source_mapping(file_id="cf_2", source_doc_id="dupdoc5", stable_id="path2")
+
+    report = repo.ingest_batch(
+        documents=[
+            {"doc_id": "dupdoc5", "corpus_id": CORPUS_A, "stable_id": "path1"},
+            {"doc_id": "dupdoc5", "corpus_id": CORPUS_A, "stable_id": "path2"},
+        ],
+        nodes=[_node("engagement:dup5", "dupdoc5", text)],
+    )
+    assert report["claims_written"] == 1
+    assert report["claims_written_by_doc"] == {"dupdoc5": 1}
+    assert report["resolved_file_by_doc"]["dupdoc5"] in ("cf_1", "cf_2")
+
+
+def test_ingest_batch_resolved_file_by_doc_names_the_file_even_when_the_claim_is_rejected(pg_env, repo):
+    """A rejected evidence item (here: not verbatim) still resolves its
+    doc_id — the mapping answers "where does this doc_id live", not "did
+    this citation succeed" — but contributes nothing to
+    ``claims_written_by_doc``."""
+    _seed_collection(collection_id=CORPUS_A)
+    _seed_corpus_file(file_id="cf_reject", status="indexed")
+    _seed_chunk(file_id="cf_reject", text="Acme Corp signed the deal.")
+    _seed_source_mapping(file_id="cf_reject", source_doc_id="docreject", stable_id="pathreject")
+
+    report = repo.ingest_batch(
+        documents=[{"doc_id": "docreject", "corpus_id": CORPUS_A, "stable_id": "pathreject"}],
+        nodes=[_node("engagement:reject", "docreject", "This sentence is not in the document.")],
+    )
+    assert report["claims_written"] == 0
+    assert report["claims_written_by_doc"] == {}
+    assert report["resolved_file_by_doc"] == {"docreject": "cf_reject"}
 
 
 def test_dup_doc_id_replace_mode_purges_claims_on_every_anchored_copy(pg_env, repo):
@@ -2653,9 +2982,7 @@ def test_the_document_is_rebuilt_once_per_file_not_once_per_failed_quote(pg_env,
             _CountingSeparator.calls += 1
             return str.join(self, parts)
 
-    monkeypatch.setattr(
-        facts_pg, "CHUNK_JOIN_SEPARATOR", _CountingSeparator(facts_pg.CHUNK_JOIN_SEPARATOR)
-    )
+    monkeypatch.setattr(facts_pg, "CHUNK_JOIN_SEPARATOR", _CountingSeparator(facts_pg.CHUNK_JOIN_SEPARATOR))
 
     file_id = "cf_joinonce"
     doc_id = "doc_joinonce"
@@ -2673,9 +3000,7 @@ def test_the_document_is_rebuilt_once_per_file_not_once_per_failed_quote(pg_env,
                 "id": f"engagement:joinonce{i}",
                 "type": "engagement",
                 "attrs": {},
-                "evidence": [
-                    {"doc_id": doc_id, "quote": "began in March\n\nand concluded successfully"}
-                ],
+                "evidence": [{"doc_id": doc_id, "quote": "began in March\n\nand concluded successfully"}],
             }
             for i in range(5)
         ]
@@ -2702,9 +3027,7 @@ def test_an_automatic_candidate_survives_the_ingest_that_minted_it(pg_env, repo)
     doc_a = _seed_ready_doc(pg_env, text="Norwood Farms signed in March.", file_id="cf_dupa", doc_id="doc_dupa")
     repo.ingest_batch(nodes=[_node("engagement:norwood-farms", doc_a, "Norwood Farms signed in March.")])
 
-    doc_b = _seed_second_doc(
-        text="Norwood Farms Group signed in April.", file_id="cf_dupb", doc_id="doc_dupb"
-    )
+    doc_b = _seed_second_doc(text="Norwood Farms Group signed in April.", file_id="cf_dupb", doc_id="doc_dupb")
     report = repo.ingest_batch(
         nodes=[_node("engagement:norwood-farms-group", doc_b, "Norwood Farms Group signed in April.")]
     )
@@ -2718,8 +3041,7 @@ def test_an_automatic_candidate_survives_the_ingest_that_minted_it(pg_env, repo)
             sa.text("SELECT count(*) FROM edges WHERE type = 'possible_duplicate_of'")
         ).scalar_one()
     assert surviving == 1, (
-        "the candidate must outlive the ingest that proposed it — a claimless "
-        "proposal is not an orphan"
+        "the candidate must outlive the ingest that proposed it — a claimless proposal is not an orphan"
     )
 
 
@@ -2738,18 +3060,15 @@ def test_a_candidate_does_not_keep_an_unevidenced_fact_alive(pg_env, repo):
 
     doc_a = _seed_ready_doc(pg_env, text="Norwood Farms signed in March.", file_id="cf_dupc", doc_id="doc_dupc")
     repo.ingest_batch(nodes=[_node("engagement:norwood-farms", doc_a, "Norwood Farms signed in March.")])
-    doc_b = _seed_second_doc(
-        text="Norwood Farms Group signed in April.", file_id="cf_dupd", doc_id="doc_dupd"
-    )
-    repo.ingest_batch(
-        nodes=[_node("engagement:norwood-farms-group", doc_b, "Norwood Farms Group signed in April.")]
-    )
+    doc_b = _seed_second_doc(text="Norwood Farms Group signed in April.", file_id="cf_dupd", doc_id="doc_dupd")
+    repo.ingest_batch(nodes=[_node("engagement:norwood-farms-group", doc_b, "Norwood Farms Group signed in April.")])
 
     # Every claim gone — both facts are now unevidenced, and the only thing
-    # touching them is the proposal.
+    # touching them is the proposal. grace_seconds=0: both facts were minted
+    # moments ago by this same test, well inside the default grace window.
     with repo._engine.begin() as conn:
         conn.execute(sa.text("DELETE FROM claims"))
-    repo.sweep_orphans()
+    repo.sweep_orphans(grace_seconds=0)
 
     with repo._engine.connect() as conn:
         facts_left = conn.execute(sa.text("SELECT count(*) FROM facts")).scalar_one()

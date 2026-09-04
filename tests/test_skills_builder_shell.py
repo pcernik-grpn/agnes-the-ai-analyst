@@ -49,23 +49,33 @@ class TestItRendersTheSharedShell:
         assert "var esc = BuilderShell.esc;" in markup
         assert "function esc(s)" not in markup
 
-    def test_only_the_type_step_keeps_bespoke_section_markup(self, markup):
+    def test_no_section_markup_is_hand_rolled(self, markup):
         """`sk-sec-head` was this page's private copy of the section
-        component. The three real configuration sections use the shared one
-        now; Type is deliberately left alone, because it is not an editable
-        section — it is a decision already made, showing a ✓ and a Change
-        button, and it has no collapsed/expanded pair to model.
+        component. Every section uses the shared one.
 
-        Scoped to `typeSectionHtml` rather than deleted outright so the guard
-        still fires if the fork spreads back into the other sections.
+        The exemption this guard used to carry is gone with the thing it
+        exempted: the Type step was the one hand-rolled section, and it was
+        the body of a picker nothing linked to — bare /skills redirects to the
+        Library now. So the rule is unconditional, which is the stronger form
+        of the same guard.
         """
-        block = re.search(r"function typeSectionHtml\(\) \{(.*?)\n  \}", markup, re.S)
-        assert block, "typeSectionHtml not found"
-        outside = markup.replace(block.group(1), "")
         for dead in ('class="sk-sec-head"', 'class="sk-sec-no"'):
-            assert dead not in outside, (
-                f"{dead} is back outside the Type step — the section component has been re-forked"
+            assert dead not in markup, (
+                f"{dead} is back — the shared section component has been re-forked"
             )
+
+    def test_bare_skills_does_not_ask_which_type(self, markup):
+        """Nothing in the product links to a type picker: every route in names
+        a type (`?type=`), and switching goes through the title menu. Arriving
+        with no type and no single resumable draft is a dead end, so it goes
+        to the Library, where the three options live next to your drafts.
+
+        Client-side on purpose — the drafts are in localStorage, so a
+        server-side redirect could not see the one-draft resume beside it.
+        """
+        assert "window.location.replace('/library')" in markup
+        assert "function typeSectionHtml" not in markup
+        assert "function typeCardsHtml" not in markup
 
 
 class TestItBehavesLikeTheOtherBuilder:

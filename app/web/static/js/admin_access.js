@@ -1891,14 +1891,20 @@
     findActive = -1;
     if (!q) { out.innerHTML = ""; closeFind(); return; }
     const seq = ++findSeq;
-    let people = [];
-    try {
-      const r = await fetch(`${USERS_LIST_API}?search=${encodeURIComponent(q)}&limit=${FIND_LIMIT}`,
-                            { credentials: "include" });
-      people = r.ok ? await r.json() : [];
-      if (!Array.isArray(people)) people = people.users || [];
-    } catch (e) { people = []; }
+    // window.AgnesPeopleSearch (js/people_search.js, loaded for every page by
+    // `_app_scripts.html`) — the SAME lookup the group drawer's own People
+    // field uses, so the two "find an account" boxes on this page can never
+    // answer a query differently.
+    const { people, error } = await window.AgnesPeopleSearch.search(q, FIND_LIMIT);
     if (seq !== findSeq) return; // a later keystroke already answered
+    // A failed lookup (403/500/501, network error) is NOT "no account
+    // matches" — the two used to render identically, which is exactly what
+    // hid a real outage behind a wrong "no such person" reading.
+    if (error) {
+      out.innerHTML = `<p class="ax-res__msg ax-res__msg--error">Could not search accounts: ${esc(error)}</p>`;
+      openFind();
+      return;
+    }
 
     if (!people.length) {
       // (the seeded field is focused below, once it is in the DOM)
@@ -2664,10 +2670,17 @@
     // `BUNDLE_LEAD`). The rest are reachable in the group view; leading with
     // 600 tables would bury the four rows that carry the decision.
     const rows = [];
+    let filesTruncated = false;
     for (const t of (overview.resources || [])) {
       if (!BUNDLE_LEAD.has(t.type_key)) continue;
       if (listKind && t.type_key !== listKind) continue;
       for (const b of (t.blocks || [])) {
+        // `items_truncated` (only ever true for `corpus_file`, see
+        // `app.resource_types._corpus_file_blocks`): this list is a bounded
+        // preview PLUS every file that already carries a grant, never the
+        // whole collection — said once below rather than the reader
+        // wondering why a file they remember uploading is not in the list.
+        if (t.type_key === "corpus_file" && b.items_truncated) filesTruncated = true;
         for (const i of (b.items || [])) {
           const hay = `${i.name || ""} ${i.slug || ""} ${i.resource_id || ""} ${i.owner_email || ""} ${b.name || ""} ${t.type_display || ""}`.toLowerCase();
           if (q && !hay.includes(q)) continue;
@@ -2677,6 +2690,11 @@
         }
       }
     }
+    const truncatedNote = filesTruncated
+      ? `<div class="ax-empty">Files: showing granted files plus a preview of the rest — not
+           every file on the instance. Use a group's <b>+ Add</b> and search by name to find one
+           that is not listed here.</div>`
+      : "";
     if (!rows.length) {
       /* "Every bundle on the instance was searched" is the best sentence on
          this page when it is TRUE — it pre-empts exactly the doubt a miss
@@ -2687,7 +2705,7 @@
       const kindName = listKind
         ? ((overview.resources || []).find((t) => t.type_key === listKind) || {}).type_display
         : "";
-      host.innerHTML = `<div class="ax-empty">Nothing here is called “${esc(groupFilter)}”.
+      host.innerHTML = truncatedNote + `<div class="ax-empty">Nothing here is called “${esc(groupFilter)}”.
         ${listKind
           ? `Only ${esc(String(kindName || listKind).toLowerCase())} were searched —
              <button type="button" class="ax-linkbtn" data-chip-clear>search every kind</button>.`
@@ -2941,7 +2959,7 @@
     const noneGrantedMsg = (groupFilter.trim() || listKind)
       ? "Nothing matching this is granted to any group."
       : "Nothing on this instance is granted to anyone yet.";
-    host.innerHTML = (painted
+    host.innerHTML = truncatedNote + (painted
       || `<div class="ax-empty">${noneGrantedMsg}</div>`) + nobodyLine;
   }
 
@@ -3531,7 +3549,14 @@
         paintPicker();
       }
     });
-    pickerEls.q.addEventListener("input", (e) => { pickerState.q = e.target.value; paintPicker(); });
+    pickerEls.q.addEventListener("input", (e) => {
+      pickerState.q = e.target.value;
+      // Files are the one kind the server has to answer for (see
+      // `fetchCorpusFileCandidates`); every other kind filters the payload
+      // already in hand, so the local repaint stays instant either way.
+      if (pickerState.mode !== "bundle") scheduleCorpusFileSearch(pickerState.q);
+      paintPicker();
+    });
     document.addEventListener("keydown", (e) => {
       if (e.key === "Escape" && !root.hidden) closePicker();
     });
@@ -3568,10 +3593,54 @@
     return offerScope ? [EVERYONE_AUDIENCE, ...groups] : groups;
   }
 
+  /* `corpus_file` is the one kind the picker cannot answer from `overview`
+     — that projection caps how many files of one collection it lists
+     (`app.resource_types._corpus_file_blocks`, 10 per collection plus every
+     already-granted file), so past the cap the picker has to ASK the server
+     instead of filtering a preloaded array. `q`/`token` guard against a slow
+     response for an earlier keystroke clobbering a faster one for a later
+     keystroke. */
+  let pickerRemoteFiles = { q: "", items: [], token: 0 };
+
+  async function fetchCorpusFileCandidates(q) {
+    const term = q.trim();
+    const token = ++pickerRemoteFiles.token;
+    if (term.length < 2) {
+      pickerRemoteFiles = { q: "", items: [], token };
+      paintPicker();
+      return;
+    }
+    let items = [];
+    try {
+      const r = await fetch(
+        `/api/admin/access/resources/corpus_file/search?q=${encodeURIComponent(term)}&limit=50`,
+        { credentials: "include" },
+      );
+      if (r.ok) items = await r.json();
+    } catch (err) {
+      items = [];
+    }
+    if (token !== pickerRemoteFiles.token) return; // a newer keystroke already superseded this fetch
+    pickerRemoteFiles = { q: term, items, token };
+    paintPicker();
+  }
+
+  let pickerRemoteDebounce = null;
+  function scheduleCorpusFileSearch(q) {
+    if (pickerRemoteDebounce) clearTimeout(pickerRemoteDebounce);
+    pickerRemoteDebounce = setTimeout(() => fetchCorpusFileCandidates(q), 200);
+  }
+
   //: Everything grantable the group does not already hold, by family.
+  //: `corpus_file` also mixes in the server-side search results — the
+  //: overview projection only ever carries a capped preview of each
+  //: collection's files, so most files are reachable only through
+  //: `pickerRemoteFiles`.
   function pickerCandidates() {
     const q = pickerState.q.trim().toLowerCase();
     const out = new Map();
+    const seenCorpusFileIds = new Set();
+    const corpusFileType = (overview.resources || []).find((t) => t.type_key === "corpus_file");
     for (const t of (overview.resources || [])) {
       for (const b of (t.blocks || [])) {
         for (const i of (b.items || [])) {
@@ -3580,10 +3649,23 @@
           const hay = `${i.name || ""} ${i.slug || ""} ${i.resource_id || ""} ${i.owner_email || ""} ${b.name || ""} ${t.type_display || ""}`.toLowerCase();
           if (q && !hay.includes(q)) continue;
           if (pickerState.kind && t.type_key !== pickerState.kind) continue;
+          if (t.type_key === "corpus_file") seenCorpusFileIds.add(i.resource_id);
           const fam = t.family || "knowledge";
           if (!out.has(fam)) out.set(fam, []);
           out.get(fam).push({ t, i, block: (b.name && b.name !== t.type_display) ? b.name : "" });
         }
+      }
+    }
+    const kindAllowsFiles = !pickerState.kind || pickerState.kind === "corpus_file";
+    if (corpusFileType && kindAllowsFiles && addableAtScope("corpus_file", pickerState.scope)
+        && pickerRemoteFiles.q.toLowerCase() === q && q) {
+      const fam = corpusFileType.family || "knowledge";
+      if (!out.has(fam)) out.set(fam, []);
+      for (const i of pickerRemoteFiles.items) {
+        if (seenCorpusFileIds.has(i.resource_id)) continue;
+        if (grantOf(pickerState.group, "corpus_file", i.resource_id)) continue;
+        seenCorpusFileIds.add(i.resource_id);
+        out.get(fam).push({ t: corpusFileType, i, block: i.block_name || "" });
       }
     }
     return out;
@@ -3805,6 +3887,17 @@
     els.sub.textContent = scope === "everyone"
       ? "Everything every account does not already get."
       : (g ? `Everything ${titleOf(g)} does not have yet.` : "");
+    // `items_truncated` is how the (capped) overview says "this is a preview,
+    // not the whole list" — said once, here, rather than the reader
+    // discovering it by counting rows against a total they cannot see. Only
+    // files ever truncate; every other kind's projection is listed in full.
+    const filesTruncated = ((overview.resources || []).find((t) => t.type_key === "corpus_file")?.blocks || [])
+      .some((b) => b.items_truncated);
+    if (filesTruncated) {
+      els.sub.textContent += (els.sub.textContent ? " " : "")
+        + "Files: only a preview is listed — type 2+ characters to search every file by name.";
+    }
+    pickerRemoteFiles = { q: "", items: [], token: pickerRemoteFiles.token };
     paintPicker();
     // `.ds-drawer` is display:none until `.is-open` — the same two-step the
     // group drawer uses (`group_drawer.js`), because the overlay animates in
@@ -3819,6 +3912,7 @@
     if (!pickerEls) return;
     pickerEls.root.classList.remove("is-open");
     pickerEls.root.hidden = true;
+    if (pickerRemoteDebounce) { clearTimeout(pickerRemoteDebounce); pickerRemoteDebounce = null; }
   }
 
   /* Apply writes every choice, then says what happened — including what did

@@ -16,12 +16,14 @@ executing the script.
 
 from __future__ import annotations
 
-from pathlib import Path
+from tests._admin_data_sources_source import read_admin_data_sources_source
 
 
 def _template_text() -> str:
-    tpl = Path(__file__).resolve().parents[1] / "app" / "web" / "templates" / "admin_data_sources.html"
-    return tpl.read_text(encoding="utf-8")
+    # The banner/wizard JS this file asserts on lives in the extracted
+    # static file now (perf follow-up, 2026-09-03) — see
+    # tests/_admin_data_sources_source.py.
+    return read_admin_data_sources_source()
 
 
 def _function_body(tpl: str, signature: str) -> str:

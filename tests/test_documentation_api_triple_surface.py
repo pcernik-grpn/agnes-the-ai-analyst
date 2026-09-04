@@ -245,6 +245,15 @@ _COHORT: dict[str, tuple[str, str]] = {
     "/api/jobs/{job_id}": ("admin jobs show", "admin_job_get"),
     # DuckLake analytics-backend migration (wave-2G Task 6).
     "/api/admin/analytics/migrate": ("admin analytics migrate", "admin_analytics_migrate"),
+    # Knowledge-artifact packaging (K3, #798). TCRD-296 synthesis C.15
+    # converted this endpoint from a synchronous run to a thin enqueue and
+    # gave it a real CLI + MCP surface for the first time — it used to be
+    # _EXEMPT ("no analyst CLI/MCP analogue"), which stopped being true.
+    "/api/admin/run-knowledge-packaging": ("admin knowledge packaging run", "admin_knowledge_packaging_run"),
+    "/api/admin/knowledge-packaging/status": (
+        "admin knowledge packaging status",
+        "admin_knowledge_packaging_status",
+    ),
     # Agent profiles (agent-api V1a, Task 12) — management list surface.
     # CLI `agnes agent list` + MCP `agent_list` both map to this GET.
     "/api/v1/agents": ("agent list", "agent_list"),
@@ -825,6 +834,14 @@ _EXEMPT: dict[str, str] = {
         "against every group's full roster shipped in the overview payload "
         "(audit S2), which is why the roster no longer ships."
     ),
+    "/api/admin/access/resources/{resource_type}/search": (
+        "browser-only admin UI support for the /admin/access per-file grant "
+        "picker — the search counterpart to the grandfathered, equally "
+        "REST-only GET /api/admin/access-overview it complements (see "
+        "app.resource_types._corpus_file_blocks). Granting per-file access "
+        "is an admin-console action; there is no analyst/agent workflow "
+        "that browses individual file grant candidates by name"
+    ),
     "/api/knowledge/digests": (
         "enumerating maintained digests for a WEB surface (TCRD-250). Both "
         "other surfaces already RECEIVE digests by a better route than a "
@@ -1099,6 +1116,21 @@ _EXEMPT: dict[str, str] = {
         "diagnostic action (§13.1), not an agent-facing data operation, the "
         "same posture as _AGENT_MEMORY_ADMIN_REASON/_AGENT_SCOPE_REASON above."
     ),
+    # review plan P1.4: sweeps the same single-persona preview above across
+    # every REAL user_groups row in one call, to catch a CASE-on-$user_groups
+    # policy with a missing/wrong ELSE branch. Same posture as the
+    # policy/preview exemption right above -- it too runs the policy AS EACH
+    # GROUP and hands back rows_visible/rows_total, an audited
+    # (access_policy.preview_groups), human-witnessed diagnostic action, not
+    # an agent-facing data operation. No CLI/MCP surface planned yet; the web
+    # UI's "Preview all groups" button is the only caller.
+    "/api/admin/registry/{table_id}/policy/preview-groups": (
+        "admin-only access-policy preview across every real group (review "
+        "plan P1.4) -- same reasoning as the policy/preview exemption above: "
+        "runs the policy AS EACH GROUP and returns rows_visible/rows_total, "
+        "an audited, human-witnessed diagnostic action, not an agent-facing "
+        "data operation. No CLI/MCP surface planned yet."
+    ),
     # access-policy-builder-ux plan, Tasks 2/3: the no-SQL builder's
     # columns+samples list and structured-spec-to-SQL compile. Same posture
     # as the policy/preview exemption right above (admin-only authoring
@@ -1116,6 +1148,18 @@ _EXEMPT: dict[str, str] = {
         "the no-SQL builder (plan Task 2). No MCP analogue by design, same "
         "reasoning as the policy/preview exemption above; no CLI planned for "
         "this web-UI-only builder slice."
+    ),
+    "/api/admin/registry/{table_id}/policy/revisions": (
+        "admin-only access-policy revision history (#1979): the saved states "
+        "the editor modal's history panel lists and its Restore button "
+        "prefills from. No MCP analogue by design, same reasoning as the "
+        "policy/preview exemption above — the response carries policy SQL "
+        "bodies, i.e. a map of what each policy is filtering and masking, "
+        "which is not something an agent tool call should be able to read on "
+        "an admin's behalf. No CLI planned for this web-UI-only slice: the "
+        "history exists to feed the editor, and restoring is just the "
+        "already-CLI-reachable PUT /api/admin/registry/{id} with an older "
+        "body."
     ),
     "/api/admin/registry/{table_id}/policy/compile": (
         "admin-only access-policy builder: structured spec -> validated SQL "
@@ -1249,6 +1293,116 @@ _EXEMPT: dict[str, str] = {
         "confirm/list/unselect a scope (site/library/folder -> collection) for the "
         "wizard's step 2/3 — admin-only wizard bookkeeping, no analyst CLI/MCP analogue"
     ),
+    # The source card's "Facts → graph" pipeline-strip cell (perf follow-up,
+    # 2026-09-03) — fetched lazily per connection once its card paints,
+    # instead of computed for every connection during /admin/data-sources's
+    # own render (which is what made those two counts dominate a live
+    # instance's page-load time). Same admin-display-primitive class as the
+    # extraction observability reads above: a caller-scoped COUNT, no
+    # analyst CLI/MCP analogue.
+    "/api/admin/sharepoint/connections/{connection_id}/facts-graph-counts": (
+        "caller-scoped fact/edge counts for the source card's pipeline strip — "
+        "admin display primitive, no analyst CLI/MCP analogue"
+    ),
+    # Bulk scope-add — same admin-only wizard-bookkeeping class as its
+    # singular sibling right above, EXCEPT this one IS CLI-reachable (`agnes
+    # admin sharepoint scope bulk-add`), same carve-out shape as
+    # facts-extract below: an ops engineer scripting a large-site split from
+    # a JSON file without opening the browser wizard. Deliberately still not
+    # MCP-exposed: it creates a collection (+ later, group grants) per
+    # admin-picked SharePoint path, the same collection/visibility side
+    # effects `.../scopes` itself is never agent-invokable for.
+    "/api/admin/sharepoint/connections/{connection_id}/scopes/bulk": (
+        "bulk-confirm many folder paths as scopes in one call — CLI-reachable "
+        "(agnes admin sharepoint scope bulk-add) but deliberately not MCP-exposed: "
+        "mirrors the facts-extract admin/ops exemption, an operator scripting a "
+        "large-site split, not an analyst query surface"
+    ),
+    # Connection clone — creates a new source_connections row wired to the
+    # SAME credential material as an existing one (a vault-stored secret is
+    # copied verbatim, never decrypted; see the endpoint's own docstring).
+    # CLI-reachable, but never MCP-exposed: the same "admin
+    # credential-provisioning writes" standing exemption (CONTRIBUTING.md)
+    # as the generic connection-create/secret routes — an agent-invokable
+    # tool that can mint a new connection inheriting an existing
+    # credential's trust is a privilege-escalation seam, not a convenience.
+    "/api/admin/sharepoint/connections/{connection_id}/clone": (
+        "clone a SharePoint connection (same tenant/client identity and "
+        "certificate/client-secret material, zero scopes) — CLI-reachable "
+        "(agnes admin sharepoint connection clone) but deliberately not MCP-exposed: "
+        "the standing admin credential-provisioning exemption (CONTRIBUTING.md), same "
+        "reasoning as POST /api/admin/source-connections' own credential-adjacent writes"
+    ),
+    # Collection consolidation — folds several of a connection's per-scope
+    # collections into one target, re-pointing scopes/files/chunks/claims
+    # and merging resource grants. CLI-reachable (`agnes admin sharepoint
+    # collections consolidate`) for the same ops-scripting-a-large-site
+    # reason as clone/bulk-add above, but deliberately not MCP-exposed:
+    # reassigning which collection a scope's content (and its grants) lives
+    # under is the same visibility-shaping write bulk-add's own collection
+    # option is never agent-invokable for.
+    "/api/admin/sharepoint/connections/{connection_id}/collections/consolidate": (
+        "fold several per-scope SharePoint collections into one target (dry-run preview "
+        "or the real merge) — CLI-reachable (agnes admin sharepoint collections "
+        "consolidate) but deliberately not MCP-exposed: mirrors the connection-clone "
+        "credential/visibility-write exemption right above"
+    ),
+    # Split-plan / splits — the AUTOMATED version of clone + scopes/bulk
+    # right above (greedy-pack the site's top-level folders into N groups,
+    # then create all N clones+scopes in one call). Same CLI-reachable /
+    # not-MCP-exposed shape as its two manual primitives: split-plan is a
+    # read-only preview (admin-only display primitive over live Graph
+    # data), and splits carries clone's own credential-provisioning +
+    # scopes/bulk's own collection-minting side effects, neither of which
+    # is agent-invokable today.
+    # Shard-plan (2026-09-03 auto-parallel-crawl design §4.7) — the
+    # automatic successor to split-plan right below: same shape (read-only
+    # preview over live Graph data), same exemption reasoning.
+    "/api/admin/sharepoint/connections/{connection_id}/shard-plan": (
+        "read-only preview of the automatic parallel crawl's shard plan — CLI-reachable "
+        "(agnes admin sharepoint shard-plan) but deliberately not MCP-exposed: an admin/ops "
+        "display primitive over live Graph data, not an analyst query surface, same "
+        "reasoning as split-plan below"
+    ),
+    "/api/admin/sharepoint/connections/{connection_id}/split-plan": (
+        "read-only preview of a folder-based site split (greedy-packed groups + "
+        "per-folder Graph Search document counts) — CLI-reachable (agnes admin "
+        "sharepoint split-plan) but deliberately not MCP-exposed: an admin/ops "
+        "display primitive over live Graph data, not an analyst query surface"
+    ),
+    "/api/admin/sharepoint/connections/{connection_id}/splits": (
+        "create N sibling SharePoint connections from a split plan, each with its "
+        "own confirmed scopes — CLI-reachable (agnes admin sharepoint split) but "
+        "deliberately not MCP-exposed: combines clone's credential-provisioning "
+        "exemption with scopes/bulk's collection-minting exemption, both already "
+        "carved out above"
+    ),
+    # The reverse of `splits` above — folds several sibling connections'
+    # scopes, crawl/facts state, collections and run history back into one.
+    # Same CLI-reachable / not-MCP-exposed shape: an ops-scripting-a-large-
+    # site action combining collection-consolidate's own visibility-write
+    # exemption with clone/splits' connection-lifecycle one, neither
+    # agent-invokable today.
+    "/api/admin/sharepoint/connections/{connection_id}/splits/merge": (
+        "fold several sibling SharePoint connections (a manually split site) back into "
+        "one, carrying over crawl/facts state and folding scope collections — "
+        "CLI-reachable (agnes admin sharepoint split-merge) but deliberately not "
+        "MCP-exposed: combines collections/consolidate's visibility-write exemption "
+        "with clone/splits' connection-lifecycle one, both already carved out above"
+    ),
+    # Site-group -> Agnes-group ACL mirroring map (2026-09 fix) — grants
+    # access to whoever the mapped Agnes group(s) already contain, the same
+    # visibility-shaping write class as scopes/scopes-bulk's own group_ids
+    # checkbox. CLI-reachable (`agnes admin sharepoint acl map-site-group`)
+    # but deliberately not MCP-exposed: an agent-invokable tool that can
+    # widen a collection's grantee set is a privilege-escalation seam, not
+    # a query surface — same standing exemption class as the other
+    # SharePoint admin writers above.
+    "/api/admin/sharepoint/connections/{connection_id}/acl-site-group-map": (
+        "replace a connection's SharePoint site-group -> Agnes-group ACL mirroring map — "
+        "CLI-reachable (agnes admin sharepoint acl map-site-group) but deliberately not "
+        "MCP-exposed: mirrors scopes/scopes-bulk's own group-grant/visibility-write exemption"
+    ),
     "/api/admin/sharepoint/connections/{connection_id}/manual-sites": (
         "persist/forget a site the admin resolved by URL — the Sites.Selected escape "
         "hatch's other half, keeping the wizard's step-2 sites level populated across "
@@ -1336,6 +1490,33 @@ _EXEMPT: dict[str, str] = {
         "one run's stored report/skip list for the source card's run drawer — admin "
         "display primitive, no analyst CLI/MCP analogue"
     ),
+    # The extraction FLEET dashboard (/admin/extraction, 2026-09-02) — one
+    # row per connection of the SAME run counters the per-connection rows
+    # above already exempt, plus a derived rate and a derived "stuck" flag.
+    # Same admin-display-primitive class, EXCEPT this one IS CLI-reachable
+    # (`agnes admin sharepoint runs`) for an operator watching a multi-hour,
+    # multi-connection extraction over SSH with no browser open — the
+    # triple-surface mechanism only gates MCP + REST classification, so a
+    # CLI command can exist on an _EXEMPT row (see the facts-extract
+    # exemption below for the same pattern). Deliberately not MCP-exposed:
+    # it is a fleet-wide operational status read, not a bounded analyst
+    # query — an agent has no legitimate reason to poll every connection's
+    # live run state at once.
+    "/api/admin/sharepoint/extraction/runs": (
+        "one row per SharePoint connection's latest run for the extraction fleet "
+        "dashboard — admin display primitive, CLI-reachable (agnes admin sharepoint "
+        "runs) but deliberately not MCP-exposed"
+    ),
+    # Force-close a run the cooperative stop above cannot reach (2026-09-03,
+    # TCRD-296 gap 32) — same admin-display-primitive class as the fleet
+    # dashboard right above, CLI-reachable (`agnes admin sharepoint runs
+    # cancel <run_id>`) but deliberately not MCP-exposed: force-terminating
+    # a crawl is an operator decision made from the fleet/card UI or a
+    # support runbook, not a tool call an agent should ever reach for.
+    "/api/admin/sharepoint/extraction/runs/{run_id}/cancel": (
+        "admin 'force-cancel this run' control, for a run the cooperative stop cannot reach — "
+        "CLI-reachable (agnes admin sharepoint runs cancel) but deliberately not MCP-exposed"
+    ),
     # issue #1971 Part 3/4 — corporate-memory detection observability. Same
     # exemption class as the SharePoint extraction run-history rows above:
     # an admin panel's own data (run counters, a policy fingerprint) and an
@@ -1352,12 +1533,57 @@ _EXEMPT: dict[str, str] = {
         "read-only effective extraction configuration with per-leaf origins for the "
         "source card's config drawer — admin display primitive, no analyst CLI/MCP analogue"
     ),
+    # Completeness check (TCRD-296 B.9) — "did we really get everything?":
+    # per-scope/per-folder Graph Search document counts vs. what actually
+    # landed in the corpus. Same class as split-plan above: CLI-reachable
+    # (`agnes admin sharepoint completeness`) for an operator scripting the
+    # same check over SSH, but deliberately not MCP-exposed — an admin/ops
+    # display primitive over live Graph data, not an analyst query surface.
+    "/api/admin/sharepoint/connections/{connection_id}/extraction/completeness": (
+        "per-scope/per-folder expected-vs-indexed document counts (Graph Search fan-out) "
+        "for the completeness drawer — CLI-reachable (agnes admin sharepoint completeness) "
+        "but deliberately not MCP-exposed, same reasoning as split-plan above"
+    ),
     # Cooperative stop for the same card's Stop button (owner-frustration fix,
     # 2026-09-01) — an admin-only control over the SAME crawl the trigger
     # above starts, no analyst CLI/MCP analogue.
     "/api/admin/sharepoint/connections/{connection_id}/extraction/stop": (
         "admin 'stop this run' control for the source card's Run row — admin display "
         "primitive, no analyst CLI/MCP analogue"
+    ),
+    # Re-queue the last crawls' convert_empty documents for a scan-OCR pass —
+    # same class as the facts-extract trigger below: CLI-reachable
+    # (`agnes admin sharepoint retry-empty`) for an operator who just enabled
+    # OCR, but deliberately not MCP-exposed — it spends the instance's
+    # vision-model budget over a whole backlog with one call.
+    "/api/admin/sharepoint/connections/{connection_id}/extraction/retry-empty": (
+        "admin/ops trigger re-queuing convert_empty documents for scan OCR — "
+        "CLI-reachable (agnes admin sharepoint retry-empty) but deliberately not "
+        "MCP-exposed: an agent should not be able to spend the vision-model budget "
+        "over a whole backlog with one tool call"
+    ),
+    # Per-connection override for extraction.facts.retry_mode (cost-levers
+    # task, lever A) — same class as the facts-extract trigger above:
+    # CLI-reachable (`agnes admin sharepoint facts-config`) for an operator
+    # scripting a per-connection cost/recall tradeoff, but deliberately not
+    # MCP-exposed — a connection's retry policy is a deploy-time cost
+    # decision, not a query surface any analyst tool needs.
+    "/api/admin/sharepoint/connections/{connection_id}/extraction/facts-config": (
+        "per-connection extraction.facts.retry_mode override — CLI-reachable "
+        "(agnes admin sharepoint facts-config) but deliberately not MCP-exposed: a "
+        "connection's retry/cost policy is an operator decision, not something an "
+        "agent should be able to flip on a whim"
+    ),
+    # Per-connection age filter for a crawl backfill — same class as the
+    # facts-config exemption directly above: CLI-reachable (`agnes admin
+    # sharepoint crawl-config`) for an operator scripting a backfill cutoff,
+    # but deliberately not MCP-exposed — a crawl's scope is an operator
+    # decision, not something an agent should be able to narrow on a whim.
+    "/api/admin/sharepoint/connections/{connection_id}/extraction/crawl-config": (
+        "per-connection extraction.crawl.min_modified override — CLI-reachable "
+        "(agnes admin sharepoint crawl-config) but deliberately not MCP-exposed: a "
+        "connection's crawl scope is an operator decision, not something an agent "
+        "should be able to narrow on a whim"
     ),
     "/api/admin/sharepoint/connections/{connection_id}/subtree-sweep": (
         "admin 're-check subtrees now' trigger for the sharepoint-subtree-sweep "
@@ -1381,6 +1607,35 @@ _EXEMPT: dict[str, str] = {
         "(agnes admin sharepoint facts-extract) but deliberately not MCP-exposed: "
         "an agent should not be able to spend the instance's LLM budget over an "
         "entire corpus with one tool call"
+    ),
+    # TCRD-296 synthesis E.21: the collection-stats summary rebuild — same
+    # admin/ops maintenance-op class as facts-extract above. CLI-reachable
+    # (`agnes admin facts stats rebuild`) for an operator repairing a stale
+    # summary or backfilling it after the migration that creates the
+    # tables, but deliberately not MCP-exposed: an unscoped call recomputes
+    # every collection in the graph, an operator decision no analyst query
+    # needs.
+    "/api/admin/facts/stats/rebuild": (
+        "admin/ops maintenance trigger for the fact-graph collection-stats "
+        "summary — CLI-reachable (agnes admin facts stats rebuild) but "
+        "deliberately not MCP-exposed: an unscoped call recomputes every "
+        "collection in the graph, an operator decision no analyst query needs"
+    ),
+    # TCRD-296 gap #62's recovery surface: one-time backlog fix for a facts
+    # ledger entry a PRE-fix pass wrote as done despite carrying no claims —
+    # same admin/ops maintenance-op class as facts-extract right above.
+    # CLI-reachable (`agnes admin sharepoint facts reset --no-claims`) for an
+    # ops engineer clearing the backlog without opening the admin UI, but
+    # deliberately not MCP-exposed: it mutates per-document extraction state
+    # (and, indirectly, triggers a re-extraction spend on the NEXT pass) —
+    # an operator decision, not something an agent should reach for on a
+    # whim, same reasoning as the facts-extract exemption above.
+    "/api/admin/sharepoint/connections/{connection_id}/facts/reset-no-claims": (
+        "admin/ops recovery action for the facts ledger's historical no-claims "
+        "backlog — CLI-reachable (agnes admin sharepoint facts reset --no-claims) "
+        "but deliberately not MCP-exposed: it mutates per-document extraction "
+        "state and can trigger a re-extraction spend on the next pass, an "
+        "operator decision no analyst query needs"
     ),
     # The config drawer's "Preview redaction" panel: paste a sample, see what
     # the anonymizer would do to it before a crawl runs over thousands of
@@ -1446,15 +1701,12 @@ _EXEMPT: dict[str, str] = {
         "`agnes pull` (hash-verified, atomic promotion, pruned on de-authorization); "
         "no MCP/JSON analogue, mirrors the parquet /api/data/{table_id}/download channel"
     ),
-    "/api/admin/run-knowledge-packaging": (
-        "scheduler-driven knowledge-artifact rebuild trigger (K3, #798) — "
-        "admin/scheduler maintenance op, mirrors the run-corporate-memory "
-        "exemption; no analyst CLI/MCP analogue"
-    ),
     "/api/admin/run-knowledge-digests": (
         "scheduler-driven digest regeneration trigger (K4, #799) — admin/scheduler "
-        "maintenance op, mirrors the run-knowledge-packaging / run-corporate-memory "
-        "exemptions; no analyst CLI/MCP analogue"
+        "maintenance op, mirrors the run-corporate-memory exemption; no analyst "
+        "CLI/MCP analogue. Unlike its knowledge-packaging sibling (moved to "
+        "_COHORT by TCRD-296 synthesis C.15), this one still runs synchronously "
+        "and has not (yet) gained a CLI/MCP surface."
     ),
     "/api/knowledge/digests/{digest_id}/content": (
         "K4 maintained digests (#799) — digest markdown consumed by `agnes pull` "

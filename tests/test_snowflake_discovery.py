@@ -538,9 +538,9 @@ def test_the_snowflake_picker_prepares_its_status_lines_before_registering():
     prepared first. `registerSelected` already does this for the Keboola
     picker; `_registerSfRows` did not.
     """
-    from pathlib import Path
+    from tests._admin_data_sources_source import read_admin_data_sources_source
 
-    html = Path("app/web/templates/admin_data_sources.html").read_text()
+    html = read_admin_data_sources_source()
     fn = html[html.index("async function _registerSfRows()") :]
     fn = fn[: fn.index("\n}\n")]
     assert "_setBucketOpen(group, true)" in fn, "checked groups must be opened before the status writes"

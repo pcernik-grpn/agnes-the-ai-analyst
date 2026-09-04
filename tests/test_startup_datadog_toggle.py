@@ -94,6 +94,10 @@ BASE_VARS: dict = {
     "kai_agent_cpus": "1.0",
     "kai_agent_pg_mem_limit": "1g",
     "kai_agent_broker_mcp_enabled": False,
+    "otlp_endpoint": "",
+    "otlp_headers_secret": "",
+    "otlp_capture_content": "0",
+    "deployment_env": "agnes-test",
     "kai_agent_image": "",
     "kai_agent_jwt_secret": "",
     "kai_agent_e2b_key_secret": "",
@@ -260,6 +264,41 @@ def test_the_agent_joins_the_docker_group_and_the_service_is_enabled(on: str):
     assert "id dd-agent >/dev/null 2>&1" in on, (
         "every ownership flag below needs the group to exist; a failed apt step must not turn into a failed boot"
     )
+
+
+def test_the_fleet_installer_unit_is_masked_before_the_agent_can_start(on: str):
+    """The mask has to beat the apt step, not merely the `systemctl enable`.
+
+    datadog-agent-installer.service is a soft dependency of
+    datadog-agent.service and exits 255 without remote configuration, which
+    this module deliberately disables (DataDog/datadog-agent#43052). The deb's
+    postinst STARTS the agent — see the artifact-ordering test above, whose
+    whole subject is what that postinst does — so the first pull-in happens
+    during `apt-get install`, long before anything here enables the service.
+    A mask applied after that point arrives one failure too late, and masking
+    does not clear a failed state that is already recorded.
+    """
+    mask_cmd = "ln -sf /dev/null /etc/systemd/system/datadog-agent-installer.service"
+    assert mask_cmd in on
+
+    mask = on.index(mask_cmd)
+    apt = on.index('apt-get install -y -qq --allow-downgrades "datadog-agent=')
+    assert mask < apt, (
+        "mask before the package install: its postinst starts the agent, which is what pulls the installer unit in"
+    )
+
+    # `systemctl mask` is not used on purpose: it can refuse a unit whose file
+    # does not exist yet, which is precisely the state before apt runs.
+    assert "systemctl mask datadog-agent-installer.service" not in on
+
+    # A failure a previous boot recorded outlives the mask, so it is cleared too.
+    reset = on.index("systemctl reset-failed datadog-agent-installer.service")
+    assert reset > apt, "reset-failed only helps after the install that could have failed it"
+
+    # Guarded, like every other step in this block — and asserted on the mask's
+    # OWN line, so an unguarded mask cannot be excused by a neighbour's `|| true`.
+    mask_line = on[mask : on.index("\n", on.index("|| echo", mask))]
+    assert '|| echo "WARNING: could not mask' in mask_line, "the mask step is unguarded"
 
 
 def test_every_artifact_is_installed_and_an_empty_payload_removes_its_target(on: str):

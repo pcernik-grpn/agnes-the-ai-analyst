@@ -102,6 +102,12 @@
     border-radius: var(--ds-radius-lg, 12px);
     box-shadow: var(--ds-shadow-md);
     padding: 6px;
+    /* A menu is never taller than the room it has. Unbounded, the Skill
+       builder's eight-item Category list rendered a 395px panel that ran past
+       the bottom of the card it opened in; a menu that outgrows its context is
+       a bug on any surface, so the cap belongs on the component. */
+    max-height: min(320px, 60vh);
+    overflow-y: auto;
     list-style: none;
     margin: 0;
 }

@@ -82,11 +82,12 @@ def _seed_corpus_file(corpus_id: str, file_id: str, status: str = "indexed", sha
         )
 
 
-def _fixture(pg_env):
+def _fixture(pg_env) -> str:
     """Two collections (A, B), files in each with varied processing_status,
     one fact + one edge claimed in A, an ingest run touching both, and a
     grant on A only (B is left ungranted — the "collections with no group"
-    case)."""
+    case). Returns the fact's own id, for a caller that needs to act on it
+    directly (e.g. a correction)."""
     from src.repositories import resource_grants_repo, user_group_members_repo, user_groups_repo, users_repo
 
     users_repo().create(id="uploader1", email="uploader1@test.com", name="Uploader")
@@ -126,15 +127,22 @@ def _fixture(pg_env):
     grp = user_groups_repo().create(name="sp-group", description="test", created_by="test-fixture")
     user_group_members_repo().add_member("admin1", grp["id"], source="test-fixture")
     resource_grants_repo().create(grp["id"], "collection", CORPUS_A, "test-fixture", "required")
+    return subj
 
 
-def _create_sharepoint_connection(**config_overrides) -> str:
+def _create_sharepoint_connection_named(conn_id: str, **config_overrides) -> str:
     from src.repositories import source_connections_repo
 
     config = {"tenant_id": "tenant-1", "client_id": "client-1"}
     config.update(config_overrides)
-    source_connections_repo().create(id="sp-conn-1", name="Corp SharePoint", source_type="sharepoint", config=config)
-    return "sp-conn-1"
+    source_connections_repo().create(
+        id=conn_id, name=f"Corp SharePoint {conn_id}", source_type="sharepoint", config=config
+    )
+    return conn_id
+
+
+def _create_sharepoint_connection(**config_overrides) -> str:
+    return _create_sharepoint_connection_named("sp-conn-1", **config_overrides)
 
 
 def test_pipeline_strip_counts_documents_extract_facts_edges(tmp_path, monkeypatch, pg_engine):
@@ -153,7 +161,103 @@ def test_pipeline_strip_counts_documents_extract_facts_edges(tmp_path, monkeypat
 
     assert fs["crawl"]["documents"] == 3
     assert fs["extract"] == {"indexed": 1, "processing": 1, "needs_review": 1}
-    assert fs["graph"] == {"facts": 1, "edges": 1}
+    # NOT computed here (perf follow-up, 2026-09-03) — see
+    # `test_facts_graph_counts_endpoint_matches_the_old_page_numbers` below
+    # for the same fixture's facts/edges count, now served by the lazy
+    # `GET .../facts-graph-counts` endpoint instead.
+    assert fs["graph"] is None
+
+
+def test_facts_graph_counts_endpoint_matches_the_old_page_numbers(tmp_path, monkeypatch, pg_engine):
+    """`GET .../facts-graph-counts` (`app.api.admin_sharepoint.facts_graph_
+    counts`) now serves the SAME {facts, edges} numbers the page's own
+    pipeline strip used to compute inline — same fixture as the test above,
+    minus the page-render call."""
+    pg_env = pg_env_setup(tmp_path, monkeypatch, pg_engine)
+    _fixture(pg_env)
+    conn_id = _create_sharepoint_connection(
+        cert_private_key_env="SHAREPOINT_CERT_PRIVATE_KEY",
+        scopes=_TWO_SCOPES,
+    )
+    monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", "-----BEGIN PRIVATE KEY-----\nx\n-----END PRIVATE KEY-----")
+
+    from app.api.admin_sharepoint import facts_graph_counts
+
+    counts = facts_graph_counts(conn_id, _user=_admin_user())
+    # Approximate (perf incident follow-up, 2026-09-03): a flat GROUP BY
+    # over `claims`, not the row-visibility-filtered count — but with no
+    # corrections in this fixture, the numbers agree exactly.
+    assert counts == {"facts": 1, "edges": 1, "graph_counts_kind": "approximate"}
+
+
+def test_facts_graph_counts_endpoint_is_zero_with_no_scopes(tmp_path, monkeypatch, pg_engine):
+    pg_env_setup(tmp_path, monkeypatch, pg_engine)
+    conn_id = _create_sharepoint_connection()
+
+    from app.api.admin_sharepoint import facts_graph_counts
+
+    assert facts_graph_counts(conn_id, _user=_admin_user()) == {
+        "facts": 0,
+        "edges": 0,
+        "graph_counts_kind": "approximate",
+    }
+
+
+def test_facts_graph_counts_endpoint_404s_for_a_non_sharepoint_connection(tmp_path, monkeypatch, pg_engine):
+    from fastapi import HTTPException
+
+    pg_env_setup(tmp_path, monkeypatch, pg_engine)
+    from src.repositories import source_connections_repo
+
+    source_connections_repo().create(id="not-sp", name="Snowflake", source_type="snowflake", config={})
+
+    from app.api.admin_sharepoint import facts_graph_counts
+
+    import pytest
+
+    with pytest.raises(HTTPException) as exc:
+        facts_graph_counts("not-sp", _user=_admin_user())
+    assert exc.value.status_code == 404
+
+
+def test_facts_graph_counts_endpoint_excludes_a_withheld_correction(tmp_path, monkeypatch, pg_engine):
+    """The one thing `approximate_counts_for_collections` is honestly NOT
+    the same as: a `wrong`/`restricted` correction still withholds a fact
+    for every caller (a content-moderation concept, not RBAC) under the
+    exact `count_visible_facts_for_collections`, but the flat `GROUP BY`
+    counts every claim regardless. Pinned so a future change to the
+    correction semantics does not silently widen the gap without anyone
+    noticing — the response is labeled `graph_counts_kind: "approximate"`
+    precisely because of gaps like this one."""
+    pg_env = pg_env_setup(tmp_path, monkeypatch, pg_engine)
+    fact_id = _fixture(pg_env)
+    conn_id = _create_sharepoint_connection(
+        cert_private_key_env="SHAREPOINT_CERT_PRIVATE_KEY",
+        scopes=_TWO_SCOPES,
+    )
+    monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", "-----BEGIN PRIVATE KEY-----\nx\n-----END PRIVATE KEY-----")
+
+    from src.repositories.facts_pg import FactsPgRepository
+    import src.db_pg as db_pg
+
+    facts_repo_ = FactsPgRepository(db_pg.get_engine())
+    # Withhold the fixture's one fact claim (CORPUS_A).
+    facts_repo_.upsert_correction(
+        subject_kind="fact",
+        subject_id=fact_id,
+        natural_keys={"aliases": []},
+        verdict="wrong",
+        reason="test",
+        decided_by="admin1",
+    )
+
+    from app.api.admin_sharepoint import facts_graph_counts
+
+    exact = facts_repo_.count_visible_facts_for_collections(_admin_user(), [CORPUS_A, CORPUS_B])
+    approx = facts_graph_counts(conn_id, _user=_admin_user())
+    assert sum(exact.values()) == 0  # withheld -> zero, for every caller including admin
+    assert approx["facts"] == 1  # the approximate count still sees the withheld claim
+    assert approx["graph_counts_kind"] == "approximate"
 
 
 def test_pipeline_strip_counts_documents_with_no_facts_ingest_run_at_all(tmp_path, monkeypatch, pg_engine):
@@ -400,7 +504,16 @@ def test_scopes_cell_lists_each_confirmed_scope_with_its_resolved_collection_and
     """`scopes` is the connection's own `config.scopes`, reused through
     `admin_sharepoint._scope_out` — the exact shape the connect wizard's own
     step-3 "Share" preview reads, so clicking a scope row on the card can
-    open the wizard straight onto that same row."""
+    open the wizard straight onto that same row.
+
+    NOT server-rendered into the page any more (perf follow-up,
+    2026-09-03, second finding) — `_sharepoint_pipeline_cell` keeps only
+    the cheap `scopes_total` count; the enriched rows this test pins are
+    now served exclusively by `GET .../scopes`
+    (`admin_sharepoint.list_scopes`), fetched by the card on expand.
+    """
+    import asyncio
+
     pg_env = pg_env_setup(tmp_path, monkeypatch, pg_engine)
     _fixture(pg_env)
 
@@ -416,7 +529,12 @@ def test_scopes_cell_lists_each_confirmed_scope_with_its_resolved_collection_and
     from app.web.router import _source_pipelines
 
     fs = _source_pipelines(user=_admin_user())[conn_id]["file_source"]
-    by_id = {s["source_scope_id"]: s for s in fs["scopes"]}
+    assert fs["scopes_total"] == 2
+
+    from app.api.admin_sharepoint import list_scopes
+
+    body = asyncio.run(list_scopes(conn_id, user=_admin_user()))
+    by_id = {s["source_scope_id"]: s for s in body["items"]}
     assert set(by_id) == {"s-a", "s-b"}
     # CORPUS_A is granted a group in `_fixture` -> no warning, group present.
     assert by_id["s-a"]["collection"]["name"] == CORPUS_A
@@ -465,3 +583,362 @@ def test_no_sharepoint_connection_renders_no_file_source_cell(tmp_path, monkeypa
     cells = _source_pipelines(user=_admin_user())
     for row in cells.values():
         assert "file_source" not in row
+
+
+# ---------------------------------------------------------------------------
+# Perf regression: /admin/data-sources page (bounded queries, bounded payload)
+#
+# A real SharePoint connection can carry 50-180 confirmed scopes; the page
+# renders every SharePoint connection's pipeline strip in one server-side
+# fold (`_source_inventory`). Before this fix, both the query count AND the
+# inlined JSON payload scaled with total scope count across every
+# connection on the page — see CHANGELOG / PR description for the
+# before/after numbers.
+# ---------------------------------------------------------------------------
+
+
+def _many_scopes(n: int, *, prefix: str = "col") -> list[dict]:
+    """Synthetic confirmed-scope config rows — no backing `file_corpora`/
+    `corpus_files` rows needed: every code path under test degrades a
+    missing collection to `None`/absent rather than raising, so this stays
+    cheap to seed even at n=180."""
+    return [
+        {"source_scope_id": f"s-{prefix}-{i}", "display_path": f"/{prefix}/{i}", "collection_id": f"{prefix}_{i}"}
+        for i in range(n)
+    ]
+
+
+def test_scopes_total_is_exact_and_not_capped(tmp_path, monkeypatch, pg_engine):
+    """`cell["scopes"]` (the enriched, per-scope row list) is gone entirely
+    from the page fold (perf follow-up, 2026-09-03, second finding) — the
+    card fetches it lazily, unbounded, from `GET .../scopes` instead. Only
+    the cheap `scopes_total` count survives here, and it is exact at any
+    scope count — nothing to cap when nothing is inlined."""
+    pg_env_setup(tmp_path, monkeypatch, pg_engine)
+    conn_id = _create_sharepoint_connection(scopes=_many_scopes(60))
+
+    from app.web.router import _source_pipelines
+
+    fs = _source_pipelines(user=_admin_user())[conn_id]["file_source"]
+    assert "scopes" not in fs
+    assert "scopes_truncated" not in fs
+    assert fs["scopes_total"] == 60
+
+
+def test_scopes_total_is_exact_for_a_small_connection(tmp_path, monkeypatch, pg_engine):
+    pg_env_setup(tmp_path, monkeypatch, pg_engine)
+    conn_id = _create_sharepoint_connection(scopes=_many_scopes(3))
+
+    from app.web.router import _source_pipelines
+
+    fs = _source_pipelines(user=_admin_user())[conn_id]["file_source"]
+    assert fs["scopes_total"] == 3
+
+
+def test_source_pipelines_payload_size_does_not_scale_with_scope_count(tmp_path, monkeypatch, pg_engine):
+    """The bug this guards: `cell["scopes"]` used to carry EVERY confirmed
+    scope (path, collection, badges) for EVERY SharePoint connection on the
+    page — the exact structure `{{ source_pipelines | tojson }}` inlines
+    into the HTML response verbatim. A connection with 180 scopes made that
+    inline payload roughly proportional to 180. `cell["scopes"]` is gone
+    entirely now (perf follow-up, 2026-09-03, second finding — the enriched
+    rows are fetched lazily instead, `GET .../scopes`), so the payload
+    should not grow AT ALL between 60 and 180 scopes beyond the (tiny)
+    `scopes_total` integer."""
+    import json
+
+    pg_env_setup(tmp_path, monkeypatch, pg_engine)
+    conn_id = _create_sharepoint_connection(scopes=_many_scopes(60))
+
+    from app.web.router import _source_pipelines
+
+    small = _source_pipelines(user=_admin_user())
+    small_bytes = len(json.dumps(small))
+
+    from src.repositories import source_connections_repo
+
+    source_connections_repo().update(conn_id, config={"tenant_id": "tenant-1", "scopes": _many_scopes(180)})
+    large = _source_pipelines(user=_admin_user())
+    large_bytes = len(json.dumps(large))
+
+    # 60 -> 180 scopes is a 3x growth in the underlying config; the payload
+    # should differ only by the (tiny) `scopes_total` integer, never by
+    # anything proportional to scope count.
+    assert large_bytes < small_bytes * 1.05, (
+        f"source_pipelines payload grew {small_bytes} -> {large_bytes} bytes for a 3x scope-count "
+        f"increase — scope rows must never be inlined again"
+    )
+
+
+def test_source_inventory_query_count_is_bounded_at_high_scope_count(tmp_path, monkeypatch, pg_engine):
+    """Before the first perf fix: `_sharepoint_pipeline_cell` issued one
+    `corpus_files.list_for_corpus` call PER SCOPE, one full-table
+    `resource_grants` scan PER SCOPE (via `_scope_out` -> `_group_ids_for_
+    collection`), and a `file_corpora.get` PER SCOPE — a 180-scope
+    connection cost roughly 540 round trips on those three alone.
+
+    Before the follow-up fix (perf follow-up, 2026-09-03, two more live
+    findings on the same instance): `facts_repo().count_visible_facts_for_
+    collections`/`count_visible_edges_for_collections` — the caller-scoped
+    fact/edge counts feeding `cell["graph"]` — ran one query per corpus_id
+    (~2 per scope, ~360 for 180 scopes), which is what a live instance's
+    `pg_stat_activity` showed dominating the page's own render time (22 of
+    ~28 samples over one page load were exactly these two statements); and
+    `_scope_out` (the enriched per-scope rows for `cell["scopes"]`, capped
+    at 50 in the FIRST fix) still cost a `file_corpora.get` per scope shown.
+    Neither is computed at page-render time at all any more — `cell["graph"]`
+    moved to the lazy `GET .../facts-graph-counts` endpoint, and
+    `cell["scopes"]` is gone entirely in favor of `GET .../scopes`, both
+    fetched by the card only once painted — so this connection's
+    contribution to the page's query count is now flat regardless of scope
+    count, independent of the 50-scope cap that used to bound it.
+    """
+    import sqlalchemy as sa
+
+    pg_env_setup(tmp_path, monkeypatch, pg_engine)
+    _create_sharepoint_connection(scopes=_many_scopes(180))
+
+    import src.db_pg as db_pg
+    from app.web.router import _source_pipelines
+
+    statements: list = []
+
+    def _capture(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    engine = db_pg.get_engine()
+    sa.event.listen(engine, "before_cursor_execute", _capture)
+    try:
+        _source_pipelines(user=_admin_user())
+    finally:
+        sa.event.remove(engine, "before_cursor_execute", _capture)
+
+    assert len(statements) < 30, (
+        f"_source_pipelines issued {len(statements)} statements for a single 180-scope connection "
+        f"— expected a small, scope-count-independent number now that facts/edges counts and scope "
+        f"rows are both lazy"
+    )
+    assert not any("claims" in s for s in statements), (
+        "_source_pipelines touched the `claims` table — the page render must never scan it; "
+        "fact/edge counts are computed lazily by GET .../facts-graph-counts instead"
+    )
+
+
+def test_admin_data_sources_page_route_issues_no_claims_statements(tmp_path, monkeypatch, pg_engine):
+    """The literal live regression: `GET /admin/data-sources`, driven through
+    a real `TestClient` (not just the inner `_source_pipelines()` function),
+    must never touch `claims` — the table the fact/edge visibility CTEs scan
+    — regardless of how many SharePoint connections or scopes exist. Eight
+    connections x 50 scopes each is the shape of the live instance that
+    surfaced this."""
+    import sqlalchemy as sa
+    from fastapi.testclient import TestClient
+
+    pg_env_setup(tmp_path, monkeypatch, pg_engine)
+    for i in range(8):
+        _create_sharepoint_connection_named(f"sp-conn-many-{i}", scopes=_many_scopes(50, prefix=f"c{i}"))
+
+    import src.db_pg as db_pg
+    from app.main import create_app
+
+    app = create_app()
+    client = TestClient(app)
+    from app.auth.jwt import create_access_token
+
+    token = create_access_token("admin1", "admin1@test.com")
+    client.cookies.set("access_token", token)
+
+    statements: list = []
+
+    def _capture(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    engine = db_pg.get_engine()
+    sa.event.listen(engine, "before_cursor_execute", _capture)
+    try:
+        resp = client.get("/admin/data-sources", headers={"Accept": "text/html"})
+    finally:
+        sa.event.remove(engine, "before_cursor_execute", _capture)
+
+    assert resp.status_code == 200, resp.text
+    claims_statements = [s for s in statements if "claims" in s]
+    assert not claims_statements, (
+        f"GET /admin/data-sources issued {len(claims_statements)} statement(s) touching `claims` "
+        f"across 8 connections x 50 scopes — the page route must issue ZERO: {claims_statements[:3]!r}"
+    )
+
+
+def test_admin_data_sources_page_response_size_is_bounded(tmp_path, monkeypatch, pg_engine):
+    """The other half of the same live regression: the raw HTML response for
+    `GET /admin/data-sources` must stay small regardless of scope count.
+
+    Before this fix (measured on the deployed merge commit of the FIRST
+    perf PR, already carrying the 50-scope cap): 8 connections x 50 scopes
+    rendered ~343 KB — ~171 KB of it the inlined `SOURCE_PIPELINES` JSON's
+    per-scope enriched rows (path, collection, group grants), which nothing
+    on first paint reads (`app.web.router._sharepoint_pipeline_cell` only
+    keeps the cheap `scopes_total` count now; the enriched list is fetched
+    lazily by the card on expand, `GET .../scopes`). Target (coordinator,
+    2026-09-03): well under 200 KB.
+    """
+    from fastapi.testclient import TestClient
+
+    pg_env_setup(tmp_path, monkeypatch, pg_engine)
+    for i in range(8):
+        _create_sharepoint_connection_named(f"sp-conn-many-{i}", scopes=_many_scopes(50, prefix=f"c{i}"))
+
+    from app.main import create_app
+    from app.auth.jwt import create_access_token
+
+    app = create_app()
+    client = TestClient(app)
+    token = create_access_token("admin1", "admin1@test.com")
+    client.cookies.set("access_token", token)
+
+    resp = client.get("/admin/data-sources", headers={"Accept": "text/html"})
+    assert resp.status_code == 200, resp.text
+    size = len(resp.content)
+    assert size < 200_000, (
+        f"GET /admin/data-sources returned {size} bytes for 8 connections x 50 scopes — "
+        f"expected well under 200 000 (200 KB)"
+    )
+    # The enriched per-scope rows (path, collection badges) must not be
+    # baked into the response at all — only fetched on expand. A specific
+    # scope's own `display_path` (`_many_scopes`: `/c0/0`, `/c0/1`, …) is a
+    # precise negative — `.ds-sp-scope-row__path` alone would also match
+    # the (legitimate, static) CSS rule that styles it once fetched.
+    assert "no collection yet" not in resp.text
+    assert "/c0/0" not in resp.text
+    assert "/c3/25" not in resp.text
+
+
+def test_approximate_counts_for_collections_is_fast_at_200_collections(tmp_path, monkeypatch, pg_engine):
+    """The literal fix for the production incident (2026-09-03): the exact
+    per-caller visibility CTE ran 250-316s for a SINGLE connection's scopes
+    on a live instance with ~390 collections. `approximate_counts_for_
+    collections` — a flat, indexed `GROUP BY` over `claims`, no per-caller
+    CTE — must stay well under a second even at 200 QUERIED collections x
+    500 claims each (100 000 claims), with another 200 collections'
+    worth (100 000 more claims, 200 000 total) as background data the
+    query does NOT touch — a live instance's `claims` holds every
+    connection's collections, not just the one being asked about, so a
+    dataset where the WHERE clause matches 100% of the table (every row
+    ever inserted) tests something artificially easier than production.
+    Whether Postgres picks a sequential scan or an index scan
+    (`idx_claims_corpus_id`, or the composite `idx_claims_corpus_audience`
+    which also leads with `corpus_id`) is a cost-based call that depends on
+    selectivity — see the comment above the EXPLAIN below for measurements
+    at both ends. Either is fine; the timing assertion is what matters."""
+    import time
+
+    import sqlalchemy as sa
+
+    pg_env_setup(tmp_path, monkeypatch, pg_engine)
+
+    import src.db_pg as db_pg
+
+    engine = db_pg.get_engine()
+    n_collections = 200
+    claims_per_collection = 500
+    n_facts = 2000
+    with engine.begin() as conn:
+        # 400 collections total — 200 queried, 200 background noise.
+        conn.execute(
+            sa.text(
+                "INSERT INTO file_corpora (id, slug, name, created_by) "
+                "SELECT 'col_' || i, 'col-' || i, 'Col ' || i, 'test' "
+                "FROM generate_series(0, :n_minus_1) AS i"
+            ),
+            {"n_minus_1": 2 * n_collections - 1},
+        )
+        conn.execute(
+            sa.text(
+                "INSERT INTO corpus_files (id, corpus_id, filename, sha256, processing_status) "
+                "SELECT 'cf_' || i, 'col_' || i, 'f' || i || '.md', 'sha_' || i, 'indexed' "
+                "FROM generate_series(0, :n_minus_1) AS i"
+            ),
+            {"n_minus_1": 2 * n_collections - 1},
+        )
+        conn.execute(
+            sa.text(
+                "INSERT INTO facts (id, type) SELECT 'fact_' || i, 'engagement' "
+                "FROM generate_series(0, :n_minus_1) AS i"
+            ),
+            {"n_minus_1": n_facts - 1},
+        )
+        conn.execute(
+            sa.text(
+                "INSERT INTO edges (id, src, type, dst) "
+                "SELECT 'edge_' || i, 'fact_' || i, 'related_to', 'fact_' || ((i + 1) % :n_facts) "
+                "FROM generate_series(0, :n_minus_1) AS i"
+            ),
+            {"n_minus_1": n_facts - 1, "n_facts": n_facts},
+        )
+        # 400 collections x 500 claims = 200 000 rows; only the first 200
+        # collections are ever passed to the method under test below.
+        conn.execute(
+            sa.text(
+                """
+                INSERT INTO claims (id, fact_id, edge_id, corpus_file_id, corpus_id, file_sha256, quote, quote_hash)
+                SELECT
+                    'claim_' || col || '_' || n,
+                    CASE WHEN n % 2 = 0 THEN 'fact_' || ((col * :per_col + n) % :n_facts) ELSE NULL END,
+                    CASE WHEN n % 2 = 1 THEN 'edge_' || ((col * :per_col + n) % :n_facts) ELSE NULL END,
+                    'cf_' || col,
+                    'col_' || col,
+                    'sha_' || col,
+                    'quote text',
+                    'qh_' || col || '_' || n
+                FROM generate_series(0, :n_col_minus_1) AS col, generate_series(0, :per_col_minus_1) AS n
+                """
+            ),
+            {
+                "per_col": claims_per_collection,
+                "n_facts": n_facts,
+                "n_col_minus_1": 2 * n_collections - 1,
+                "per_col_minus_1": claims_per_collection - 1,
+            },
+        )
+        conn.execute(sa.text("ANALYZE claims"))
+
+    from src.repositories.facts_pg import FactsPgRepository
+
+    repo = FactsPgRepository(engine)
+    queried_ids = [f"col_{i}" for i in range(n_collections)]  # the other 200 are background noise
+
+    # EXPLAIN first — captured for the record, not asserted on the specific
+    # node type: at 50% selectivity (200 of 400 collections queried) the
+    # planner correctly prefers ONE sequential pass over the matching
+    # table (cost-based — a seq scan beats ~100 000 individual index
+    # probes here) over an index scan; a real connection's own scope
+    # count relative to the instance's total collections decides which
+    # one it gets, and either is fine — the timing assertion below is
+    # what actually matters. See the PR body for both EXPLAIN outputs
+    # (this 50%-selectivity one and a low-selectivity one that DOES pick
+    # `idx_claims_corpus_audience`, the composite index that also leads
+    # with `corpus_id`).
+    explain_sql = (
+        "EXPLAIN SELECT corpus_id, COUNT(DISTINCT fact_id) AS facts, COUNT(DISTINCT edge_id) AS edges "
+        "FROM claims WHERE corpus_id = ANY(:ids) GROUP BY corpus_id"
+    )
+    with engine.connect() as conn:
+        plan_lines = [r[0] for r in conn.execute(sa.text(explain_sql), {"ids": queried_ids}).all()]
+    plan_text = "\n".join(plan_lines)
+    assert "claims" in plan_text  # sanity: the plan is actually over this table
+
+    t0 = time.monotonic()
+    counts = repo.approximate_counts_for_collections(queried_ids)
+    elapsed = time.monotonic() - t0
+
+    assert elapsed < 1.0, (
+        f"approximate_counts_for_collections took {elapsed:.3f}s for {n_collections} of "
+        f"{2 * n_collections} total collections ({claims_per_collection} claims each) — expected well under 1s"
+    )
+    assert len(counts) == n_collections
+    # 250 fact claims + 250 edge claims per collection (n % 2 split).
+    assert counts["col_0"] == {"facts": 250, "edges": 250}
+    assert counts["col_199"] == {"facts": 250, "edges": 250}
+    assert sum(c["facts"] for c in counts.values()) == n_collections * 250
+    assert sum(c["edges"] for c in counts.values()) == n_collections * 250
+    # The background noise (col_200..col_399) must never leak in.
+    assert "col_200" not in counts

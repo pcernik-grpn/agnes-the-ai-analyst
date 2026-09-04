@@ -85,7 +85,12 @@ def test_the_semantic_layer_token_is_referred_to_by_its_real_label():
     where it is actually shown. The ban stays on both pages, so the retired
     label cannot come back on either.
     """
-    rendered = "\n".join(_rendered_lines(_read("admin_data_sources.html")))
+    # The source card is drawn by the page's externalized script (the inline
+    # JS left the template), so the label lives there; the template itself
+    # only loads it. Read both, comment lines dropped from the script too.
+    page_js = Path("app/web/static/js/admin/data_sources_page.js").read_text(encoding="utf-8")
+    js_lines = [ln for ln in page_js.splitlines() if not ln.strip().startswith("//")]
+    rendered = "\n".join([*_rendered_lines(_read("admin_data_sources.html")), *js_lines])
     assert "Master token (semantic layer)" not in rendered
     assert "Semantic-layer token" in rendered
     assert "Master token (semantic layer)" not in _read("admin_semantic_layer.html")

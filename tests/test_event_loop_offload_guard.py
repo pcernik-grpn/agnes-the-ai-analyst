@@ -20,6 +20,19 @@ import inspect
 
 import pytest
 
+from app.api.admin_extraction import (
+    extraction_config,
+    extraction_run_detail,
+    extraction_runs,
+    extraction_status,
+    fleet_extraction_runs,
+    patch_extraction_crawl_config,
+    patch_extraction_facts_config,
+    preview_anonymization,
+    request_extraction_stop,
+)
+from app.api.admin_sharepoint import facts_graph_counts
+from app.api.admin_source_connections import list_connections
 from app.api.broker import require_broker_ticket
 from app.api.catalog import (
     get_metric,
@@ -62,6 +75,7 @@ from app.marketplace_server.router import (
     marketplace_zip,
 )
 from app.resource_types import ResourceType
+from app.web.router import admin_data_sources_page, library_facet_search, library_folder_peek_rows
 
 
 def test_get_current_user_is_not_a_coroutine_function():
@@ -128,6 +142,42 @@ _OFFLOADED_API_HANDLERS = [
     list_setup_tokens,
     revoke_setup_token,
     exchange_setup_token,
+    # /admin/data-sources perf fix: on an instance with a large SharePoint
+    # corpus this trio's own synchronous work could run for 10+ seconds —
+    # as ``async def`` that monopolized the event loop for the whole
+    # duration, and every OTHER concurrent request (including unrelated
+    # ones) queued behind it and looked slow too, even though its own
+    # queries were fast in isolation.
+    admin_data_sources_page,
+    list_connections,
+    fleet_extraction_runs,
+    # /admin/data-sources perf follow-up: the lazy per-connection graph-
+    # counts endpoint the card fetches after painting — same reasoning,
+    # zero awaits, purely blocking PG I/O.
+    facts_graph_counts,
+    # /library index round 2: the folder-peek fragment a row's twisty fetches
+    # on first expand — zero awaits, purely blocking corpus_files/collection
+    # reads (Devin Review on #2173).
+    library_folder_peek_rows,
+    # /library index round 3: the "search facets" typeahead — zero awaits,
+    # purely blocking facts_pg/accessible_collection_ids DB work.
+    library_facet_search,
+    # TCRD-296 gap #72: every OTHER `async def` route in admin_extraction.py
+    # had zero awaits — pure blocking `extraction_runs`/jobs/facts-ledger
+    # reads and writes run directly on the event loop. `extraction_status`
+    # (polled by every open source card) and `fleet_extraction_runs`'s own
+    # `_facts_pending_documents` call chain were the ones a live py-spy
+    # capture caught mid-request; the rest of the module shared the exact
+    # same "async def, no await" shape and are fixed alongside it rather
+    # than left for the next incident to find one at a time.
+    extraction_status,
+    request_extraction_stop,
+    patch_extraction_facts_config,
+    patch_extraction_crawl_config,
+    extraction_runs,
+    extraction_run_detail,
+    extraction_config,
+    preview_anonymization,
 ]
 
 

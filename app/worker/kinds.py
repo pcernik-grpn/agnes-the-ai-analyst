@@ -296,6 +296,16 @@ _DEFAULT_EXTRACTION_TIMEOUT_S = 3600
 # It is now the same heartbeat-protected default as every other
 # long-running kind, entirely independent of extraction.timeout_s.
 _DEFAULT_EXTRACTION_LEASE_S = _DEFAULT_HEARTBEAT_PROTECTED_LEASE_S
+# TCRD-296 C.11 — the extraction kinds' JobKind.transient_retry_in_seconds:
+# a raised handler exception that `src.db_transient.is_transient_db_error`
+# classifies as a connection-pool/deadlock/serialization hiccup requeues
+# after this delay instead of finalizing on its first attempt (see
+# `app/worker/runtime.py::_run_one`). Short relative to `retry_in_seconds`
+# elsewhere in this module (300s) on purpose: this is a DB-layer blip, not a
+# tenant-throttle or an outage worth minutes of backoff — long enough for
+# connection-pool pressure to plausibly subside before the whole run
+# restarts from its persisted per-document/per-item state.
+_TRANSIENT_INGEST_RETRY_S = 60
 # 2026-08-30 plan, Task 7: a full sharepoint-subtree-sweep pass (probing
 # hasUniqueRoleAssignments over every folder in a mirrored scope) is
 # multi-hour on a large library (spec §6.2's ~98k-folder reference) — that
@@ -1251,6 +1261,67 @@ def _run_webhook_deliver(payload: dict) -> None:
         raise RuntimeError(f"webhook-deliver: POST to webhook {webhook_id} failed")
 
 
+#: Wall-clock budget for one ``knowledge-packaging`` run (TCRD-296 synthesis
+#: C.15). A plain constant, not an env knob — the live incident this fixes
+#: was an UNBOUNDED in-request run (the scheduler's 600s CLIENT timeout was
+#: the only limit, and it didn't stop the server-side work), not a value
+#: that needed tuning; ``run_packaging_pass``'s checkpoint-per-collection
+#: means a run that hits this budget resumes cleanly next tick rather than
+#: needing a bigger number. 20 minutes comfortably covers a full sweep of a
+#: real instance's Collections while still leaving the LIGHT lane's other
+#: kinds (``webhook-deliver``, ``agent_response``) a bounded wait behind it.
+_DEFAULT_KNOWLEDGE_PACKAGING_TIMEOUT_S = 20 * 60
+
+
+def _run_knowledge_packaging(payload: dict) -> dict:
+    """``knowledge-packaging`` — rebuild per-collection ``knowledge.duckdb``
+    artifacts whose chunk content changed (K3, #798; TCRD-296 synthesis
+    C.15).
+
+    Used to run INLINE inside ``POST /api/admin/run-knowledge-packaging``,
+    HTTP-called by the scheduler on a 600s client timeout shorter than a
+    real pass could take — a slow pass outlived that timeout, the next
+    scheduler tick fired a SECOND overlapping call before the first
+    finished, and the two collided (a shared per-corpus tmp DuckDB path —
+    see ``src.knowledge_packaging``'s module docstring) hard enough to OOM
+    the app process. This handler is now the only thing that runs the
+    pass; the endpoint (``app/api/admin.py::run_knowledge_packaging``) is a
+    thin enqueue.
+
+    Single-run is enforced two ways: the idempotency-keyed enqueue (the
+    endpoint's job) means a second scheduler tick while one run is still
+    ``'queued'``/``'running'`` is a no-op, and — belt-and-braces, for a path
+    that bypasses that dedupe (a manual ``POST /api/jobs``, or two workers
+    racing to claim two different rows) — a non-blocking Postgres advisory
+    lock (:func:`src.db_pg.knowledge_packaging_lease`). Skipping (not
+    failing) when the lock is already held is the correct outcome: the
+    other run is doing the exact same work.
+
+    ``run_packaging_pass``'s own ``deadline`` argument bounds this run's
+    wall-clock cost at :data:`_DEFAULT_KNOWLEDGE_PACKAGING_TIMEOUT_S` —
+    see that function's docstring for the checkpoint-per-collection
+    contract that makes a mid-sweep interruption resumable rather than a
+    lost pass. Returns the pass's summary dict (built/skipped/pruned/
+    errors/interrupted_reason/duration_s/collections_total/
+    collections_processed) as the job's result
+    (``GET /api/jobs/{id}``'s ``payload_json["result"]``) — this is what
+    makes ``GET /api/admin/knowledge-packaging/status`` a measurement of
+    the last real run rather than a guess.
+    """
+    from src.db_pg import knowledge_packaging_lease
+    from src.knowledge_packaging import run_packaging_pass
+
+    with knowledge_packaging_lease() as acquired:
+        if not acquired:
+            logger.info(
+                "knowledge-packaging: advisory lock already held by another run — skipping "
+                "(belt-and-braces on top of the idempotency-key dedupe; the other run covers this work)"
+            )
+            return {"skipped": "lock_held"}
+        deadline = time.monotonic() + _DEFAULT_KNOWLEDGE_PACKAGING_TIMEOUT_S
+        return run_packaging_pass(deadline=deadline)
+
+
 def _extraction_timeout_seconds() -> int:
     from app.instance_config import get_value
 
@@ -1372,6 +1443,32 @@ def _run_corpus_extraction(payload: dict) -> dict:
     return run_builtin_crawl(payload)
 
 
+def _run_corpus_extraction_shard(payload: dict) -> dict:
+    """``corpus-extraction-shard`` (2026-09-03 auto-parallel-crawl design
+    §4.3) — one shard child's own crawl, enqueued by a ``corpus-extraction``
+    run that decided to plan rather than crawl inline
+    (``connectors.sharepoint.crawler._plan_or_run_inline``).
+
+    A thin delegate, exactly like ``_run_corpus_extraction`` above: the
+    shard's own targets, its per-delta-unit state rows, its own
+    ``extraction_runs`` row, and the finalize-on-last-child coordination all
+    live in ``connectors.sharepoint.crawler.run_shard_crawl``. This handler
+    owns exactly the same one thing ``_run_corpus_extraction`` does: the
+    ``sharepoint.enabled`` gate.
+
+    ``payload``: ``connection_id``, ``parent_run_id``, ``shard_index``,
+    ``shard`` — see ``run_shard_crawl``'s own docstring for the full shape.
+    """
+    from app.instance_config import feature_enabled
+
+    if not feature_enabled("sharepoint", "enabled", env_var="AGNES_SHAREPOINT_ENABLED", default=False):
+        raise RuntimeError("corpus-extraction-shard: sharepoint.enabled is false — refusing to run")
+
+    from connectors.sharepoint.crawler import run_shard_crawl
+
+    return run_shard_crawl(payload)
+
+
 def _run_sharepoint_acl_sync(payload: dict) -> dict:
     """Thin delegate to ``connectors.sharepoint.acl_sync.run_acl_sync`` — the
     sync body (read → classify → resolve → diff → write, per-connection
@@ -1427,9 +1524,24 @@ def _run_sharepoint_facts_extraction(payload: dict) -> dict:
         problem a standalone trigger with its own budget avoids (observed
         live: a 900s crawl left the chained pass an already-expired
         deadline, stopping it after 3 documents).
+      - ``partition`` (optional ``{"index": int, "count": int}``, TCRD-296
+        gap #67) — this job is one PARTITION of a fanned-out pass
+        (``connectors.sharepoint.facts_extraction
+        .enqueue_facts_extraction_passes``); absent (every job enqueued
+        before this feature existed, or a fan-out that resolved to a
+        single partition) runs exactly today's whole-connection pass.
 
     Returns the pass report (see
-    ``connectors.sharepoint.facts_extraction._Report.render``).
+    ``connectors.sharepoint.facts_extraction._Report.render``). When this
+    report says ``interrupted: timeout`` and the connection's ledger still
+    has documents pending, the worker automatically chains the next pass
+    onto this one (TCRD-296 gap #61) — that decision runs from ``app/
+    worker/runtime.py``'s post-``complete()`` hook
+    (``_maybe_continue_facts_extraction`` ->
+    ``connectors.sharepoint.facts_extraction.maybe_continue_pass``), NEVER
+    from inside this handler: the continuation reuses this job's own
+    idempotency key, and enqueuing it before THIS job leaves ``'running'``
+    would self-collide against its own still-live row.
 
     No-op guard: raises (so the job fails cleanly) when ``sharepoint.enabled``
     is false — same "this job only ever exists because something explicitly
@@ -1445,15 +1557,23 @@ def _run_sharepoint_facts_extraction(payload: dict) -> dict:
     connection_id = str(payload["connection_id"])
     doc_ids = payload.get("doc_ids")
     timeout_s = payload.get("timeout_s")
-    return run_standalone_facts_extraction(connection_id, doc_ids=doc_ids, timeout_s=timeout_s)
+    partition_field = payload.get("partition") or {}
+    partition = (
+        (int(partition_field.get("index") or 0), int(partition_field["count"]))
+        if partition_field.get("count")
+        else None
+    )
+    return run_standalone_facts_extraction(connection_id, doc_ids=doc_ids, timeout_s=timeout_s, partition=partition)
 
 
 #: Kinds whose payload gets this claimed job's own ``id`` merged in before
 #: the handler runs — see :func:`_payload_for_handler`. A plain set, not a
-#: per-kind flag on ``JobKind``: only ``corpus-extraction`` has anywhere to
-#: put it today (``extraction_runs.job_id``), and a second consumer can add
+#: per-kind flag on ``JobKind``: ``corpus-extraction`` and
+#: ``corpus-extraction-shard`` (2026-09-03 auto-parallel-crawl design §4.3)
+#: are the only two with anywhere to put it (``extraction_runs.job_id``,
+#: on the run each one opens for itself), and a third consumer can add
 #: itself here without a registry shape change.
-_INJECT_JOB_ID_KINDS = frozenset({"corpus-extraction"})
+_INJECT_JOB_ID_KINDS = frozenset({"corpus-extraction", "corpus-extraction-shard"})
 
 
 def _payload_for_handler(job: dict) -> dict:
@@ -1684,6 +1804,20 @@ def register_all_kinds() -> None:
     )
     register_kind(
         JobKind(
+            name="knowledge-packaging",
+            handler=_run_knowledge_packaging,
+            lane=LIGHT_LANE,
+            # Heartbeat-protected, same default as the other LIGHT kinds —
+            # NOT sized to the pass's own duration (bounded separately, by
+            # _DEFAULT_KNOWLEDGE_PACKAGING_TIMEOUT_S, enforced inside
+            # run_packaging_pass via `deadline`). See the module docstring's
+            # lease/retry tuning note.
+            lease_seconds=_DEFAULT_LIGHT_LEASE_S,
+            retry_in_seconds=300,
+        )
+    )
+    register_kind(
+        JobKind(
             name="analytics-rebuild",
             handler=_run_analytics_rebuild,
             lane=HEAVY_LANE,
@@ -1717,6 +1851,28 @@ def register_all_kinds() -> None:
             # error, an exhausted throttle budget) needs an operator to look
             # at it, not an unattended re-run a few minutes later.
             retry_in_seconds=None,
+            # ...UNLESS the raised exception is a TRANSIENT infrastructure
+            # fault (TCRD-296 C.11) — see `_TRANSIENT_INGEST_RETRY_S`.
+            transient_retry_in_seconds=_TRANSIENT_INGEST_RETRY_S,
+        )
+    )
+    register_kind(
+        JobKind(
+            name="corpus-extraction-shard",
+            handler=_run_corpus_extraction_shard,
+            # Same lane as corpus-extraction — a shard child IS a crawl,
+            # just over a narrower set of targets.
+            lane=EXTRACTION_LANE,
+            # Same lease shape as corpus-extraction above.
+            lease_seconds=_DEFAULT_EXTRACTION_LEASE_S,
+            # No automatic retry — same rationale as corpus-extraction: a
+            # failed shard needs an operator to look at it, not an
+            # unattended re-run. (Re-running just this shard is still
+            # possible via `POST …/extract` with `shards: [index]` —
+            # app/api/admin_sharepoint.py, Task 5.)
+            retry_in_seconds=None,
+            # Same TCRD-296 C.11 opt-in as corpus-extraction above.
+            transient_retry_in_seconds=_TRANSIENT_INGEST_RETRY_S,
         )
     )
     register_kind(
@@ -1764,6 +1920,8 @@ def register_all_kinds() -> None:
             # from the persisted per-document state anyway, same rationale
             # as corpus-extraction above.
             retry_in_seconds=None,
+            # Same TCRD-296 C.11 opt-in as corpus-extraction above.
+            transient_retry_in_seconds=_TRANSIENT_INGEST_RETRY_S,
         )
     )
     from app.chat.manager import get_current_chat_manager

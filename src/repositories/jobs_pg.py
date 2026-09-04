@@ -248,6 +248,30 @@ class JobsPgRepository:
             rows = conn.execute(sa.text(sql), params).mappings().all()
         return [self._decode(dict(r)) for r in rows]
 
+    def counts_by_kind(self, kinds: List[str]) -> Dict[str, Dict[str, int]]:
+        """``{kind: {"queued": n, "running": n}}`` for each of ``kinds``, in
+        ONE grouped query — the extraction fleet header's lane-starvation
+        strip (``GET /api/admin/sharepoint/extraction/runs``'s ``jobs``
+        block), so an operator can see a queued backlog without SQL. Every
+        requested kind is present with ``0``s rather than omitted when it
+        has no queued/running rows — an absent kind and a caught-up kind
+        must read differently to a caller that only checked ``in``.
+        """
+        out: Dict[str, Dict[str, int]] = {kind: {"queued": 0, "running": 0} for kind in kinds}
+        if not kinds:
+            return out
+        stmt = sa.text(
+            "SELECT kind, status, COUNT(*) AS n FROM jobs "
+            "WHERE kind IN :kinds AND status IN ('queued', 'running') "
+            "GROUP BY kind, status"
+        ).bindparams(sa.bindparam("kinds", expanding=True))
+        with self._engine.connect() as conn:
+            rows = conn.execute(stmt, {"kinds": list(kinds)}).all()
+        for kind, status, n in rows:
+            if kind in out and status in out[kind]:
+                out[kind][status] = int(n)
+        return out
+
     def claim_next(
         self,
         *,
@@ -401,6 +425,26 @@ class JobsPgRepository:
                 ).first()
         return mutated is not None
 
+    def record_continuation(self, job_id: str, continued_by_job_id: str) -> bool:
+        """Mirrors ``JobsRepository.record_continuation`` — see that
+        method's docstring for why this exists (the auto-continuation's
+        own id is only known once ``complete()`` already persisted this
+        job's report) and why it carries no status/lease guard."""
+        with self._engine.begin() as conn:
+            row = conn.execute(sa.text("SELECT payload_json FROM jobs WHERE id = :id"), {"id": job_id}).first()
+            if not row or not row[0]:
+                return False
+            raw = row[0]
+            payload = raw if isinstance(raw, dict) else json.loads(raw)
+            if not isinstance(payload, dict) or not isinstance(payload.get("result"), dict):
+                return False
+            payload["result"]["continued_by_job_id"] = continued_by_job_id
+            conn.execute(
+                sa.text("UPDATE jobs SET payload_json = :payload_json WHERE id = :id"),
+                {"payload_json": json.dumps(payload), "id": job_id},
+            )
+            return True
+
     def fail(
         self,
         job_id: str,
@@ -469,6 +513,34 @@ class JobsPgRepository:
                        RETURNING id"""
                 ),
                 {"now": now, "error": error, "id": job_id, "lease_token": lease_token},
+            ).first()
+        return mutated is not None
+
+    def cancel(self, job_id: str, *, error: str = "cancelled_by_admin") -> bool:
+        """Force-finalize a ``queued``/``running`` job to ``'failed'``.
+        Mirrors ``JobsRepository.cancel`` — see that module's docstring for
+        the full rationale (admin override with no lease token, same
+        lease-agnostic guard shape as ``reap_exhausted``, why clearing the
+        lease is what stops the heartbeat loop on its own).
+
+        Returns ``True`` if a row was actually mutated, ``False`` for an
+        unknown job id or one already in a terminal state.
+        """
+        now = datetime.now(timezone.utc)
+        with self._engine.begin() as conn:
+            mutated = conn.execute(
+                sa.text(
+                    """UPDATE jobs
+                       SET status = 'failed',
+                           finished_at = :now,
+                           lease_expires_at = NULL,
+                           leased_by = NULL,
+                           lease_token = NULL,
+                           error = :error
+                       WHERE id = :id AND status IN ('queued', 'running')
+                       RETURNING id"""
+                ),
+                {"now": now, "error": error, "id": job_id},
             ).first()
         return mutated is not None
 

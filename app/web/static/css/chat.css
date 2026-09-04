@@ -991,15 +991,121 @@ a.msg-source-chip.is-link:focus-visible {
 /* Mermaid output. Inserted WITHOUT the markdown sanitizer (its <style> block
    carries every colour it has — see renderMermaidBlocks), so the container is
    what bounds it: a diagram sizes itself from its content and would otherwise
-   push the bubble wider than the column. */
+   push the bubble wider than the column.
+
+   makeResponsiveSvg has already replaced the root <svg>'s fixed width with
+   100% + a max-width from the viewBox, so a diagram now SHRINKS to the column
+   instead of being clipped and scrolled. overflow-x stays as the backstop for
+   a diagram whose natural minimum still exceeds the width. */
 .msg-mermaid {
   margin: 10px 0;
+  position: relative;
+}
+.msg-mermaid-stage {
   overflow-x: auto;
 }
 .msg-mermaid svg {
   max-width: 100%;
   height: auto;
 }
+
+/* Toolbar. Quiet until the diagram is hovered or something inside it has
+   focus — the diagram is the content, the controls are not. Kept visible
+   whenever focus is inside so it stays reachable from the keyboard. */
+.msg-mermaid-bar {
+  display: flex;
+  gap: 4px;
+  justify-content: flex-end;
+  margin-top: 4px;
+  opacity: 0;
+  transition: opacity .12s ease;
+}
+.msg-mermaid:hover .msg-mermaid-bar,
+.msg-mermaid:focus-within .msg-mermaid-bar {
+  opacity: 1;
+}
+.msg-mermaid-btn {
+  font-family: var(--ds-font);
+  font-size: var(--text-xs);
+  color: var(--ds-text-secondary);
+  background: var(--ds-surface);
+  border: 1px solid var(--ds-border);
+  border-radius: 6px;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+.msg-mermaid-btn:hover {
+  color: var(--ds-text-primary);
+  background: var(--ds-surface-dim);
+}
+.msg-mermaid-btn:focus-visible {
+  outline: 2px solid var(--ds-primary);
+  outline-offset: 1px;
+}
+@media (prefers-reduced-motion: reduce) {
+  .msg-mermaid-bar { transition: none; }
+}
+
+/* Full-screen view. The point of the whole toolbar: a diagram worth drawing
+   usually has more structure than a chat column can show. */
+.msg-mermaid-lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 3000;
+  /* A fixed dark scrim, matching .cloud-chat-upload-overlay. NOT the
+     color-mix-on-`--ds-text-primary` scrim used elsewhere: that token inverts
+     with the theme, so on a dark instance it mixes a near-WHITE wash and the
+     page reads straight through the dialog. */
+  background: rgba(0, 0, 0, 0.66);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  touch-action: none;
+  cursor: grab;
+}
+.msg-mermaid-lightbox:active { cursor: grabbing; }
+/* The diagram's own ground. Fixed: pan/zoom transforms the canvas INSIDE it,
+   so the surface stays put and clips rather than sliding away with the
+   diagram. */
+.msg-mermaid-panel {
+  width: 88vw;
+  height: 84vh;
+  overflow: hidden;
+  background: var(--ds-surface);
+  border: 1px solid var(--ds-border);
+  border-radius: 12px;
+  box-shadow: var(--ds-shadow-lg);
+}
+.msg-mermaid-canvas {
+  width: 100%;
+  height: 100%;
+  transform-origin: center center;
+  pointer-events: none;
+}
+.msg-mermaid-canvas svg {
+  width: 100%;
+  height: 100%;
+  max-width: none;
+}
+.msg-mermaid-close {
+  position: absolute;
+  top: 16px;
+  right: 18px;
+  font-family: var(--ds-font);
+  font-size: var(--text-sm);
+  color: var(--ds-text-primary);
+  background: var(--ds-surface);
+  border: 1px solid var(--ds-border);
+  border-radius: 8px;
+  padding: 6px 14px;
+  cursor: pointer;
+}
+.msg-mermaid-close:focus-visible {
+  outline: 2px solid var(--ds-primary);
+  outline-offset: 2px;
+}
+
 .msg-mermaid-error {
   font-size: var(--text-xs);
   color: var(--ds-accent-warn-ink);
@@ -2103,6 +2209,35 @@ summary.cloud-chat-tool-head::-webkit-details-marker { display: none; }
 .cloud-chat-jump:focus-visible {
   outline: var(--ds-focus-outline);
   outline-offset: var(--ds-focus-outline-offset);
+}
+
+/* The turn is still running, and this reader scrolled up and so cannot see the
+   indicator at the foot of the transcript (#2156). A pulsing dot on the way
+   back is the whole signal: the button's job and its label do not change, and
+   the dot is generated content so the accessible name stays "Jump to latest".
+   Toggled from setTurnInFlight off the same `_turnInFlight` the Stop button
+   reads, which is what keeps the two from ever disagreeing — and toggled
+   there rather than in syncJumpToLatest, so the class rides the element even
+   while the button is hidden and scrolling up mid-turn reveals one already
+   carrying it. */
+.cloud-chat-jump.is-working::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  flex: 0 0 auto;
+  border-radius: var(--ds-radius-pill);
+  background: var(--ds-primary);
+  animation: cloudchat-jump-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes cloudchat-jump-pulse {
+  50% { opacity: 0.25; }
+}
+
+/* Reduced motion keeps the DOT (it is the signal) and drops only the pulse —
+   the same trade the thinking dots and the "Finishing…" pill already make. */
+@media (prefers-reduced-motion: reduce) {
+  .cloud-chat-jump.is-working::before { animation: none; }
 }
 
 /* ============================================================ slash menu

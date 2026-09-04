@@ -324,6 +324,66 @@ def test_direct_bq_path_all_surface_admin_keeps_bypass(monkeypatch):
         assert blocked is None
 
 
+# ---------------------------------------------------------------------------
+# require_admin_all_surface (app/auth/access.py) -- the POST /api/query/hybrid
+# gate (K2, RLS review #1979). This endpoint has no per-table grant check and
+# no policy rewrite of its own, so its "is this caller allowed to run raw,
+# unfiltered SQL" gate must apply the SAME is_user_admin(...) and
+# _credential_surface(user) == 'all' predicate the direct-path guardrails
+# above (`_bq_guardrail_inputs` et al. in app/api/query.py, and
+# get_accessible_tables/can_access_table in src/rbac.py) already use --
+# mirrored here rather than invented fresh, per docs/table-access-
+# policies.md's "The admin bypass" section.
+# ---------------------------------------------------------------------------
+
+
+def test_require_admin_all_surface_denies_stack_surface_admin(monkeypatch):
+    import app.auth.access as access_mod
+    from fastapi import HTTPException
+
+    monkeypatch.setattr(access_mod, "is_user_admin", lambda uid, conn=None: True)
+
+    user = {"id": "admin1", "credential_surface": "stack"}
+    with pytest.raises(HTTPException) as exc_info:
+        access_mod.require_admin_all_surface(user=user, conn=None)
+    assert exc_info.value.status_code == 403
+    # Distinct from require_admin's own "Admin access required" -- the
+    # caller IS an admin here, just on too narrow a credential surface.
+    assert exc_info.value.detail != "Admin access required"
+
+
+def test_require_admin_all_surface_allows_all_surface_admin(monkeypatch):
+    import app.auth.access as access_mod
+
+    monkeypatch.setattr(access_mod, "is_user_admin", lambda uid, conn=None: True)
+
+    user = {"id": "admin1", "credential_surface": "all"}
+    assert access_mod.require_admin_all_surface(user=user, conn=None) == user
+
+
+def test_require_admin_all_surface_allows_admin_without_surface_key(monkeypatch):
+    """Legacy dict / session JWT credential -- no key reads as 'all', same
+    convention as _credential_surface everywhere else -- unaffected."""
+    import app.auth.access as access_mod
+
+    monkeypatch.setattr(access_mod, "is_user_admin", lambda uid, conn=None: True)
+
+    user = {"id": "admin1"}
+    assert access_mod.require_admin_all_surface(user=user, conn=None) == user
+
+
+def test_require_admin_all_surface_denies_non_admin_regardless_of_surface(monkeypatch):
+    import app.auth.access as access_mod
+    from fastapi import HTTPException
+
+    monkeypatch.setattr(access_mod, "is_user_admin", lambda uid, conn=None: False)
+
+    user = {"id": "analyst1", "credential_surface": "all"}
+    with pytest.raises(HTTPException) as exc_info:
+        access_mod.require_admin_all_surface(user=user, conn=None)
+    assert exc_info.value.status_code == 403
+
+
 def test_chat_scope_mint_sites_carry_the_claim():
     """Every session-JWT mint site that should be stack-narrowed carries the
     scope claim the resolver keys on. Guards against a silent revert in any

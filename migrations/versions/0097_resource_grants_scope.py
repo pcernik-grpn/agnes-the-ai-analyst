@@ -32,7 +32,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "0097_resource_grants_scope"
-down_revision: Union[str, None] = "0096_resource_grants_source"
+down_revision: Union[str, None] = "0108_merge_grants_source"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

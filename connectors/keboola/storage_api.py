@@ -39,6 +39,7 @@ import os
 import re
 import shutil
 import tempfile
+import threading
 import time
 from urllib.parse import urlsplit
 from dataclasses import dataclass, field
@@ -468,6 +469,88 @@ def _write_empty_parquet_export(dest_path: Path, columns: List[str]) -> None:
         pq.write_table(schema.empty_table(), tmp)
 
 
+# ── the filter spec vocabulary, in one place (#1979) ────────────────────────
+#
+# `from_dict` used to tolerate unknown keys, so a misspelled row filter
+# (`where_filter`, `whereFilters`, `changedSince`, …) parsed into a DEFAULT
+# ExportFilter — "export the whole table". The admin saw a saved filter and
+# every sync distributed every row. These sets are what the parser, the
+# register/update validator (`app/api/admin.py`) and the /admin/tables
+# advanced JSON editor all refuse against, so the operator meets ONE
+# vocabulary and ONE wording wherever the typo is made.
+EXPORT_FILTER_DOC_KEYS = (
+    "where_filters",
+    "columns",
+    "changed_since",
+    "changed_until",
+    "limit",
+    "file_type",
+)
+# `fileType` is a deliberate alias (the Storage API wire name) — accepted,
+# but not advertised as a spec key.
+EXPORT_FILTER_KEYS = frozenset(EXPORT_FILTER_DOC_KEYS) | {"fileType"}
+WHERE_FILTER_ENTRY_KEYS = ("column", "operator", "values")
+
+
+def unknown_filter_keys_message(
+    unknown,
+    accepted=EXPORT_FILTER_DOC_KEYS,
+    subject: str = "Storage API filter",
+) -> str:
+    """The ONE wording for "this filter spec has a key nobody honors".
+
+    Shared by `ExportFilter.from_dict`, the `RegisterTableRequest`
+    validator and the advanced JSON editor in `admin_tables.html`, so an
+    operator who hits it in the UI can search for the same string in the
+    API's response.
+    """
+    return (
+        f"{subject} has unknown key(s) {', '.join(sorted(unknown))}; accepted keys are "
+        f"{', '.join(accepted)}. A misspelled key would silently export the full table."
+    )
+
+
+def _validated_where_filters(raw) -> List[dict]:
+    """Normalize a `where_filters` list, refusing anything unhonored.
+
+    An entry's keys are `{column, operator, values}` and nothing else — a
+    misspelled one (`colum`) would otherwise be dropped and the filter would
+    widen rather than narrow. `operator` stays optional and materializes as
+    `eq`, matching `connectors/keboola/where_filters.py:parse_filters`, so a
+    spec that worked before this guard still works.
+    """
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ValueError(f"where_filters must be a list, got {type(raw).__name__}")
+    out: List[dict] = []
+    for i, entry in enumerate(raw):
+        if not isinstance(entry, dict):
+            raise ValueError(f"where_filters[{i}] must be a dict, got {type(entry).__name__}")
+        unknown = set(entry) - set(WHERE_FILTER_ENTRY_KEYS)
+        if unknown:
+            raise ValueError(
+                unknown_filter_keys_message(
+                    unknown,
+                    accepted=WHERE_FILTER_ENTRY_KEYS,
+                    subject=f"Storage API filter where_filters[{i}]",
+                )
+            )
+        missing = [k for k in ("column", "values") if k not in entry]
+        if missing:
+            raise ValueError(f"where_filters[{i}] missing fields: {missing}")
+        if not isinstance(entry["values"], list):
+            raise ValueError(f"where_filters[{i}].values must be a list")
+        out.append(
+            {
+                "column": entry["column"],
+                "operator": entry.get("operator", "eq"),
+                "values": list(entry["values"]),
+            }
+        )
+    return out
+
+
 @dataclass
 class ExportFilter:
     """Structured Keboola Storage API filter spec.
@@ -485,8 +568,10 @@ class ExportFilter:
     Keboola serves the parquet directly (UNLOADed from Snowflake), the
     extractor renames it into place — no CSV intermediate, no DuckDB
     COPY, no peak-memory load. Falls back to CSV when an admin pins
-    `{"file_type":"csv"}` in source_query (e.g. for projects whose
-    backend can't UNLOAD parquet, or legacy debugging).
+    `{"file_type":"csv"}` in source_query (legacy debugging), and
+    automatically for projects whose backend refuses parquet export —
+    see `is_parquet_file_type_rejected` and the materialized path in
+    `connectors/keboola/extractor.py:materialize_query`.
     """
 
     where_filters: List[dict] = field(default_factory=list)
@@ -502,19 +587,33 @@ class ExportFilter:
 
     @classmethod
     def from_dict(cls, data: Optional[dict]) -> "ExportFilter":
-        """Parse from `table_registry.source_query` JSON. Tolerates None /
-        empty / unknown keys (registry stores admin input that may be sparse)."""
+        """Parse from `table_registry.source_query` JSON.
+
+        Tolerates None / empty / sparse input (the registry stores admin
+        input that may set nothing at all — that is a full-table export).
+        It does NOT tolerate an unknown key: dropping one silently turned a
+        misspelled row filter into "export the whole table" (#1979), so any
+        key outside `EXPORT_FILTER_KEYS` — and any key outside
+        `WHERE_FILTER_ENTRY_KEYS` inside a `where_filters` entry — raises
+        `ValueError` here, at parse time, before an export is prepared.
+        """
         if not data:
             return cls()
         if not isinstance(data, dict):
             raise ValueError(f"ExportFilter.from_dict expects a dict, got {type(data).__name__}")
+        unknown = set(data) - EXPORT_FILTER_KEYS
+        if unknown:
+            raise ValueError(unknown_filter_keys_message(unknown))
+        columns = data.get("columns") or []
+        if not isinstance(columns, list):
+            raise ValueError(f"columns must be a list, got {type(columns).__name__}")
         # Accept both `file_type` (preferred, matches the rest of the
         # snake_case API) and `fileType` (matches Storage API wire name)
         # so an admin who copies an example from Apiary docs doesn't trip.
         ft = data.get("file_type") or data.get("fileType") or FILE_TYPE_CSV
         return cls(
-            where_filters=list(data.get("where_filters") or []),
-            columns=list(data.get("columns") or []),
+            where_filters=_validated_where_filters(data.get("where_filters")),
+            columns=list(columns),
             changed_since=data.get("changed_since"),
             changed_until=data.get("changed_until"),
             limit=data.get("limit"),
@@ -608,6 +707,72 @@ def is_upstream_client_error(exc: Exception) -> bool:
     """
     status = getattr(exc, "status", None)
     return isinstance(status, int) and 400 <= status < 500
+
+
+# ---- parquet-export capability, per stack ---------------------------------
+#
+# `fileType=parquet` on export-async is not universally available: some
+# Keboola stacks/projects reject it outright with a 400 naming `fileType` as
+# an invalid choice (#1979, seen on a `us-east4.gcp` project). It is a
+# property of the project's backend, not of the request, so the answer is
+# worth remembering: the materialized path probes parquet once per stack and
+# thereafter goes straight to CSV, which keeps the cost at one refused POST
+# per process instead of one per registered table per sync.
+#
+# Deliberately process-scoped rather than persisted: a project that gains
+# parquet support (or an operator who repoints a stack) recovers on the next
+# restart, with no stale row to hunt down. The classifier below is narrow on
+# purpose — only a 400 that names `fileType` counts, so an unrelated 400
+# (missing table, bad filter) still propagates untouched.
+
+_PARQUET_UNSUPPORTED_STACKS: set[str] = set()
+_PARQUET_CAPABILITY_LOCK = threading.Lock()
+
+
+def is_parquet_file_type_rejected(exc: Exception) -> bool:
+    """True when ``exc`` is Storage API refusing ``fileType=parquet`` itself.
+
+    The live body is::
+
+        {'error': 'Invalid request:\n - fileType: "The value you selected
+                   is not a valid choice."', ...}
+
+    Matching on the `fileType` field name (plus the 400) rather than the
+    sentence keeps this working across stack versions that word the
+    validation error differently, while still not swallowing a 400 about
+    some other field — `whereFilters`, a missing table, an expired token.
+    """
+    if not isinstance(getattr(exc, "status", None), int) or exc.status != 400:  # type: ignore[attr-defined]
+        return False
+    text = f"{exc} {getattr(exc, 'body', '')}".lower()
+    return "filetype" in text
+
+
+def parquet_export_supported(stack: str) -> bool:
+    """False once ``stack`` has refused ``fileType=parquet`` in this process."""
+    with _PARQUET_CAPABILITY_LOCK:
+        return stack not in _PARQUET_UNSUPPORTED_STACKS
+
+
+def note_parquet_export_unsupported(stack: str) -> bool:
+    """Record that ``stack`` refuses parquet export.
+
+    Returns True only for the FIRST caller to record a given stack, which is
+    what lets the caller log one WARNING for the project rather than one per
+    table.
+    """
+    with _PARQUET_CAPABILITY_LOCK:
+        if stack in _PARQUET_UNSUPPORTED_STACKS:
+            return False
+        _PARQUET_UNSUPPORTED_STACKS.add(stack)
+        return True
+
+
+def reset_parquet_export_capability() -> None:
+    """Forget every recorded rejection. Test hook — the memo is module state,
+    so without this a fallback test would leak into the rest of the run."""
+    with _PARQUET_CAPABILITY_LOCK:
+        _PARQUET_UNSUPPORTED_STACKS.clear()
 
 
 def normalize_source_table(bucket: str, source_table: str) -> str:
