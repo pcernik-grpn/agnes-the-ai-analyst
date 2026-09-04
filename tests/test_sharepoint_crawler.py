@@ -370,6 +370,7 @@ def _run(
     retry_empty: bool = False,
     resync: bool = False,
     force_replan: bool = False,
+    job_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     monkeypatch.setattr(
         "src.repositories.source_connections_repo",
@@ -388,6 +389,8 @@ def _run(
         payload["resync"] = True
     if force_replan:
         payload["force_replan"] = True
+    if job_id is not None:
+        payload["job_id"] = job_id
     return crawler.run_builtin_crawl(payload)
 
 
@@ -1182,6 +1185,251 @@ class TestFailureRetryQueue:
         assert "graph:item1" not in _state(crawl_env)["failed_items"]
         assert second["retry_backlog"]["given_up"] == 1  # sanity: it really was stuck before the retry
 
+    def test_retry_failed_extra_replay_is_consumed_once_per_job(self, crawl_env, monkeypatch):
+        """2026-09-04 finding #66 item 4: a crash-recovery RECLAIM of the
+        SAME ``retry_failed`` job must not redo the EXTRA given-up replay a
+        second time — only the ordinary pending backlog (which a
+        permanently-failing, given-up item is no longer part of) runs
+        again. A genuinely fresh trigger (a different ``job_id``) fires the
+        extra replay again."""
+        monkeypatch.setattr(crawler, "_MAX_ITEM_RETRY_ATTEMPTS", 2)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if url.endswith("/content"):
+                return httpx.Response(404, json={})
+            if "t=1" in url:
+                return httpx.Response(200, json={"value": [], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        _install_graph(monkeypatch, handler)
+        connection = _connection([_drive_scope()])
+
+        _run(connection, monkeypatch)
+        _run(connection, monkeypatch)
+        assert _state(crawl_env)["failed_items"]["graph:item1"]["given_up"] is True
+        assert _state(crawl_env)["failed_items"]["graph:item1"]["attempts"] == 2
+
+        _run(connection, monkeypatch, retry_failed=True, job_id="job-A")
+        assert _state(crawl_env)["failed_items"]["graph:item1"]["attempts"] == 3
+
+        # Reclaim — same job_id.
+        _run(connection, monkeypatch, retry_failed=True, job_id="job-A")
+        assert _state(crawl_env)["failed_items"]["graph:item1"]["attempts"] == 3
+
+        # A fresh trigger (a different job_id) fires the extra replay again.
+        _run(connection, monkeypatch, retry_failed=True, job_id="job-B")
+        assert _state(crawl_env)["failed_items"]["graph:item1"]["attempts"] == 4
+
+
+class TestConsumeReplayFlagOnce:
+    """Unit coverage for ``_consume_replay_flag_once`` — the primitive
+    behind the ``retry_failed``/``retry_empty`` "consume once per job"
+    contract (2026-09-04 finding #66 item 4)."""
+
+    def test_a_false_flag_never_consumes(self):
+        state: Dict[str, Any] = {}
+        target = crawler.DriveTarget(drive_id="b!drive1", drive_name="Drive")
+        assert (
+            crawler._consume_replay_flag_once(state, target=target, job_id="job-A", flag=False, marker_key="m") is False
+        )
+        assert "m" not in state
+
+    def test_no_job_id_always_consumes(self):
+        state: Dict[str, Any] = {}
+        target = crawler.DriveTarget(drive_id="b!drive1", drive_name="Drive")
+        assert crawler._consume_replay_flag_once(state, target=target, job_id=None, flag=True, marker_key="m") is True
+        assert crawler._consume_replay_flag_once(state, target=target, job_id=None, flag=True, marker_key="m") is True
+
+    def test_the_same_job_id_consumes_exactly_once(self):
+        state: Dict[str, Any] = {}
+        target = crawler.DriveTarget(drive_id="b!drive1", drive_name="Drive")
+        assert (
+            crawler._consume_replay_flag_once(state, target=target, job_id="job-A", flag=True, marker_key="m") is True
+        )
+        assert (
+            crawler._consume_replay_flag_once(state, target=target, job_id="job-A", flag=True, marker_key="m") is False
+        )
+
+    def test_two_drives_in_the_same_job_each_get_their_own_first_pass(self):
+        """A scalar marker would wrongly suppress the SECOND drive's own
+        first pass in the same job — this must not happen."""
+        state: Dict[str, Any] = {}
+        t1 = crawler.DriveTarget(drive_id="b!drive1", drive_name="Drive1")
+        t2 = crawler.DriveTarget(drive_id="b!drive2", drive_name="Drive2")
+        assert crawler._consume_replay_flag_once(state, target=t1, job_id="job-A", flag=True, marker_key="m") is True
+        assert crawler._consume_replay_flag_once(state, target=t2, job_id="job-A", flag=True, marker_key="m") is True
+
+    def test_a_different_job_id_consumes_again(self):
+        state: Dict[str, Any] = {}
+        target = crawler.DriveTarget(drive_id="b!drive1", drive_name="Drive")
+        assert (
+            crawler._consume_replay_flag_once(state, target=target, job_id="job-A", flag=True, marker_key="m") is True
+        )
+        assert (
+            crawler._consume_replay_flag_once(state, target=target, job_id="job-B", flag=True, marker_key="m") is True
+        )
+
+
+# --------------------------------------------------------------------------
+# Doomed items — a document whose recorded failure is DETERMINISTIC is
+# skipped WITHOUT a download once it has failed enough times (2026-09-04
+# finding #66 item 2).
+# --------------------------------------------------------------------------
+
+
+class TestDoomedItemSkip:
+    @staticmethod
+    def _handler(recovered: Dict[str, bool]):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            if "t=1" in str(request.url):
+                return httpx.Response(200, json={"value": [], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        return handler
+
+    def test_a_deterministic_failure_is_skipped_without_download_after_two_attempts(self, crawl_env, monkeypatch):
+        from connectors.sharepoint.convert import ConversionError
+
+        def _boom(path, mime, **_kw):
+            raise ConversionError("f1.docx", "could not convert", engine="markitdown", error_class="markitdown_reject")
+
+        monkeypatch.setattr(crawler, "convert_to_markdown", _boom)
+        seen = _install_graph(monkeypatch, self._handler({}))
+        connection = _connection([_drive_scope()])
+
+        first = _run(connection, monkeypatch)
+        assert first["convert_failed"] == 1
+        assert first.get("skipped_doomed", 0) == 0
+        entry = _state(crawl_env)["failed_items"]["graph:item1"]
+        assert entry["attempts"] == 1
+        assert entry["error_class"] == "markitdown_reject"
+        downloads_after_first = sum(1 for u in seen if u.endswith("/content"))
+
+        # Second attempt (via the ordinary pending-backlog replay) — still
+        # below the doomed-skip threshold, still attempted normally.
+        second = _run(connection, monkeypatch)
+        assert second["convert_failed"] == 1
+        assert second.get("skipped_doomed", 0) == 0
+        assert _state(crawl_env)["failed_items"]["graph:item1"]["attempts"] == 2
+        assert sum(1 for u in seen if u.endswith("/content")) > downloads_after_first
+        downloads_after_second = sum(1 for u in seen if u.endswith("/content"))
+
+        # Third attempt — deterministic, 2 attempts, same cTag: doomed.
+        third = _run(connection, monkeypatch)
+        assert third["skipped_doomed"] == 1
+        assert third["convert_failed"] == 0
+        assert third["errors"] == 0
+        assert sum(1 for u in seen if u.endswith("/content")) == downloads_after_second, (
+            "a doomed item must not be downloaded again"
+        )
+        assert third["skipped_doomed_items"][0]["error_class"] == "markitdown_reject"
+        # The attempt count is unchanged by a doomed skip — nothing was tried.
+        assert _state(crawl_env)["failed_items"]["graph:item1"]["attempts"] == 2
+
+    def test_force_reprocess_still_attempts_a_doomed_item(self, crawl_env, monkeypatch):
+        from connectors.sharepoint.convert import ConversionError
+
+        def _boom(path, mime, **_kw):
+            raise ConversionError("f1.docx", "could not convert", engine="markitdown", error_class="markitdown_reject")
+
+        monkeypatch.setattr(crawler, "convert_to_markdown", _boom)
+        seen = _install_graph(monkeypatch, self._handler({}))
+        connection = _connection([_drive_scope()])
+
+        _run(connection, monkeypatch)
+        _run(connection, monkeypatch)
+        assert _state(crawl_env)["failed_items"]["graph:item1"]["attempts"] == 2
+        downloads_before = sum(1 for u in seen if u.endswith("/content"))
+
+        forced = _run(connection, monkeypatch, force_reprocess=True)
+
+        # `force_reprocess` restarts the WHOLE drive from a bare delta base,
+        # so item1 is offered twice this run — once via the backlog replay
+        # (now un-skipped) and once via the ordinary page walk — and BOTH
+        # attempt it rather than skip it.
+        assert forced.get("skipped_doomed", 0) == 0
+        assert forced["convert_failed"] == 2
+        assert sum(1 for u in seen if u.endswith("/content")) > downloads_before
+
+    def test_a_new_ctag_gets_fresh_attempts_even_after_it_was_doomed(self, crawl_env, monkeypatch):
+        from connectors.sharepoint.convert import ConversionError
+
+        def _boom(path, mime, **_kw):
+            raise ConversionError("f1.docx", "could not convert", engine="markitdown", error_class="markitdown_reject")
+
+        monkeypatch.setattr(crawler, "convert_to_markdown", _boom)
+
+        state_box = {"ctag": "ctag-1"}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            if "t=1" in str(request.url):
+                return httpx.Response(200, json={"value": [], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+            return httpx.Response(
+                200,
+                json={"value": [_file_item(ctag=state_box["ctag"])], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"},
+            )
+
+        seen = _install_graph(monkeypatch, handler)
+        connection = _connection([_drive_scope()])
+
+        _run(connection, monkeypatch)
+        _run(connection, monkeypatch)
+        third = _run(connection, monkeypatch)
+        assert third["skipped_doomed"] == 1
+        downloads_before = sum(1 for u in seen if u.endswith("/content"))
+
+        # New content (a different cTag). Reset the delta cursor so the next
+        # run re-walks the page instead of finding nothing new via its
+        # resumed (empty) deltaLink.
+        state_box["ctag"] = "ctag-2"
+        state = _state(crawl_env)
+        state["delta_links"] = {}
+        crawler.save_state(connection["id"], state)
+
+        fourth = _run(connection, monkeypatch)
+
+        # The BACKLOG replay runs first, still holding the STALE recorded
+        # cTag (ctag-1) from the last real attempt — it is skipped as
+        # doomed against that stale record, cheaply (no download). The
+        # ORDINARY delta walk that follows in the SAME run then offers the
+        # item with its NEW cTag (ctag-2), which does not match what is
+        # recorded, so it is attempted fresh — proving a content change
+        # still reaches the pipeline even though the backlog entry has not
+        # caught up to it yet.
+        assert fourth["skipped_doomed"] == 1
+        assert fourth["convert_failed"] == 1
+        assert sum(1 for u in seen if u.endswith("/content")) > downloads_before
+        assert _state(crawl_env)["failed_items"]["graph:item1"]["item"]["cTag"] == "ctag-2"
+
+    def test_an_environmental_failure_stays_retryable_forever(self, crawl_env, monkeypatch):
+        """A download failure (``download_error`` — never in the
+        deterministic set) must still be attempted every run, however many
+        times it has already failed — it is not a property of the file."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return httpx.Response(404, json={})
+            if "t=1" in str(request.url):
+                return httpx.Response(200, json={"value": [], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        seen = _install_graph(monkeypatch, handler)
+        connection = _connection([_drive_scope()])
+
+        for _ in range(4):
+            report = _run(connection, monkeypatch)
+            assert report.get("skipped_doomed", 0) == 0
+
+        assert _state(crawl_env)["failed_items"]["graph:item1"]["error_class"] == "download_error"
+        assert _state(crawl_env)["failed_items"]["graph:item1"]["attempts"] == 4
+        # A download attempt (a hit against `/content`) happened on EVERY run.
+        assert sum(1 for u in seen if u.endswith("/content")) == 4
+
 
 class TestEmptyItemBacklog:
     """``state["empty_items"]`` — the persisted backlog of documents that
@@ -1350,6 +1598,82 @@ class TestForcedResync:
         assert state["delta_links"]["b!drive1"] == f"{DRIVE_DELTA}?t=fresh"
         assert state["failed_items"] == {}
         assert state["ctags"]["graph:item1"] == "ctag-1"
+
+    def test_resync_is_not_reapplied_on_a_reclaimed_attempt_of_the_same_job(self, crawl_env):
+        """2026-09-04 finding #66 item 4 (live finding: a worker recreated
+        mid-run reclaimed the job, which called ``run_builtin_crawl`` again
+        with the identical ``resync: true`` payload — dropping the delta
+        links and failure queue the interrupted first attempt had already
+        progressed past, restarting the whole enumeration from zero). A
+        SECOND ``_apply_resync`` call naming the SAME ``job_id`` must be a
+        no-op — the interrupted attempt's own progress (recorded here as a
+        ``failed_items`` entry and an advanced ``delta_links`` cursor) must
+        survive."""
+        crawler.save_state(
+            "conn1",
+            {
+                "delta_links": {"b!drive1": f"{DRIVE_DELTA}?t=partway"},
+                "ctags": {},
+                "failed_items": {
+                    "graph:item2": {
+                        "attempts": 1,
+                        "state_key": "b!drive1",
+                        "item": {"id": "item2"},
+                        "path": "x",
+                    }
+                },
+            },
+        )
+
+        crawler._apply_resync("conn1", job_id="job-A")
+        assert _state(crawl_env)["delta_links"] == {}
+        assert _state(crawl_env)["failed_items"] == {}
+        assert _state(crawl_env)["resync_applied_for_job"] == "job-A"
+
+        # Simulate the interrupted first attempt's OWN progress after the
+        # resync it already applied — a fresh delta cursor and a new
+        # failure, exactly what a checkpoint mid-crawl would persist.
+        progressed = _state(crawl_env)
+        progressed["delta_links"] = {"b!drive1": f"{DRIVE_DELTA}?t=progressed"}
+        progressed["failed_items"] = {"graph:item3": {"attempts": 1, "state_key": "b!drive1"}}
+        crawler.save_state("conn1", progressed)
+
+        # The RECLAIM — same job_id, called again.
+        crawler._apply_resync("conn1", job_id="job-A")
+
+        state = _state(crawl_env)
+        assert state["delta_links"] == {"b!drive1": f"{DRIVE_DELTA}?t=progressed"}, (
+            "a reclaim of the SAME job must not drop the interrupted attempt's own progress"
+        )
+        assert state["failed_items"] == {"graph:item3": {"attempts": 1, "state_key": "b!drive1"}}
+
+    def test_resync_reapplies_on_a_fresh_job_id(self, crawl_env):
+        """A genuinely NEW trigger (a different ``job_id``) always
+        re-applies — only a reclaim of the SAME job is suppressed."""
+        crawler.save_state(
+            "conn1",
+            {
+                "delta_links": {"b!drive1": f"{DRIVE_DELTA}?t=stale"},
+                "ctags": {},
+                "failed_items": {"graph:item1": {"attempts": 1, "state_key": "b!drive1"}},
+            },
+        )
+
+        crawler._apply_resync("conn1", job_id="job-A")
+        assert _state(crawl_env)["resync_applied_for_job"] == "job-A"
+
+        # A later, independent trigger — put something back to drop.
+        state = _state(crawl_env)
+        state["delta_links"] = {"b!drive1": f"{DRIVE_DELTA}?t=later"}
+        state["failed_items"] = {"graph:item9": {"attempts": 1, "state_key": "b!drive1"}}
+        crawler.save_state("conn1", state)
+
+        crawler._apply_resync("conn1", job_id="job-B")
+
+        state = _state(crawl_env)
+        assert state["delta_links"] == {}
+        assert state["failed_items"] == {}
+        assert state["resync_applied_for_job"] == "job-B"
 
 
 # --------------------------------------------------------------------------

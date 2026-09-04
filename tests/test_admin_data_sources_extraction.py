@@ -602,6 +602,55 @@ class TestRunRow:
         assert "not an error" in html
         assert "ext-dot--danger" not in html
 
+    def test_a_last_run_with_doomed_skips_names_the_count_and_the_fix(self):
+        """2026-09-04 finding #66 item 5 — unlike `skipped_unsupported`,
+        this IS worth an operator's attention (something is actually wrong
+        with the file), so it gets the warn tone and names the way out."""
+        last = {
+            "running": None,
+            "last_completed": {
+                "id": "er_d1",
+                "outcome": "done",
+                "finished_at": "2026-08-31T10:00:00+00:00",
+                "duration_s": 30.0,
+                "files_done": 12,
+                "errors": 0,
+                "skipped_doomed": 42,
+                "usage": {},
+            },
+            "runs_total": 1,
+            "can_stop": False,
+        }
+        out = _run_js(
+            'console.log(JSON.stringify({html: _extRunRowHtml("sp1", _extState["sp1"])}));',
+            state=_state(data=last),
+        )
+        html = out["html"]
+        assert "42 doomed skipped" in html
+        assert "force reprocess to retry" in html
+        assert "ext-warn" in html
+
+    def test_no_doomed_skips_renders_nothing_extra(self):
+        last = {
+            "running": None,
+            "last_completed": {
+                "id": "er_d2",
+                "outcome": "done",
+                "finished_at": "2026-08-31T10:00:00+00:00",
+                "duration_s": 30.0,
+                "files_done": 12,
+                "errors": 0,
+                "usage": {},
+            },
+            "runs_total": 1,
+            "can_stop": False,
+        }
+        out = _run_js(
+            'console.log(JSON.stringify({html: _extRunRowHtml("sp1", _extState["sp1"])}));',
+            state=_state(data=last),
+        )
+        assert "doomed skipped" not in out["html"]
+
     def test_a_clean_last_run_shows_no_error_line_and_a_green_dot(self):
         clean_last = {
             "running": None,
@@ -1408,10 +1457,31 @@ class TestErrorDetail:
         assert "no conversion backend" in html
         assert "not an error" in html
 
+    def test_doomed_items_are_rendered_with_their_own_heading(self):
+        """2026-09-04 finding #66 item 5 — an operator opening the per-run
+        detail can see WHICH documents were skipped as doomed, not only the
+        count."""
+        html = self._detail_html(
+            skipped_doomed_items=[
+                {
+                    "path": "Finance/broken.xlsx",
+                    "item_id": "item7",
+                    "drive_id": "b!drive1",
+                    "reason_type": "doomed",
+                    "reason": "markitdown_reject: failed 2 time(s), most recently: could not convert",
+                    "suffix": ".xlsx",
+                    "error_class": "markitdown_reject",
+                }
+            ],
+        )
+        assert "Finance/broken.xlsx" in html
+        assert "force reprocess" in html
+
     def test_no_failed_or_skipped_items_adds_no_extra_section(self):
         html = self._detail_html(errors_detail={"items": [], "total": 0, "listed": 0, "truncated": False})
         assert "retry_failed" not in html
         assert "not an error" not in html
+        assert "force reprocess" not in html
 
 
 class TestStopReasonVocabularyAgrees:

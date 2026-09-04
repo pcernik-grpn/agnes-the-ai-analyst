@@ -349,6 +349,11 @@ function _extErrorItemsHtml(runDetail) {
     report.skipped_items_truncated,
     "Skipped — no conversion backend for this file type (not an error)"
   );
+  html += _extFailedOrSkippedItemsHtml(
+    report.skipped_doomed_items,
+    report.skipped_doomed_items_truncated,
+    "Doomed — skipped without a download; force reprocess to retry"
+  );
   return html;
 }
 
@@ -450,6 +455,14 @@ function _extRunRowHtml(connId, st) {
       // Never an error — nothing was attempted, so this reads as a neutral
       // fact, not a warning, distinct from the danger-toned line above.
       sub += `<div class="ext-sub">${_extNum(last.skipped_unsupported)} file${last.skipped_unsupported === 1 ? "" : "s"} skipped — unsupported type, not an error</div>`;
+    }
+    // Skipped WITHOUT a download because the document's own failure
+    // history says it is doomed (2026-09-04 finding #66 item 2) —
+    // warn-toned (unlike `skipped_unsupported` above): something IS
+    // wrong with this file, an operator just does not need to watch it
+    // fail again every run. `force_reprocess` is the named way out.
+    if (last.skipped_doomed) {
+      sub += `<div class="ext-sub ext-warn">${_extNum(last.skipped_doomed)} doomed skipped (force reprocess to retry)</div>`;
     }
     // The JOB-level error (2026-09 incident: an attempts-exhausted job's
     // own error text, e.g. "lease expired after max attempts") — distinct

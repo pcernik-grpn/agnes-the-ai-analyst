@@ -1719,6 +1719,20 @@ class TestRuns:
         mock_get.assert_called_once_with("/api/admin/sharepoint/extraction/runs?active=1")
         assert "corp-sharepoint" in result.output
         assert "Totals" in result.output
+        # No fleet row has skipped a doomed document — say nothing extra,
+        # matching every other "absence is the honest answer" totals field.
+        assert "doomed skipped" not in result.output
+
+    def test_doomed_skips_are_shown_in_the_totals_line(self):
+        """2026-09-04 finding #66 item 5 — `agnes admin sharepoint runs`
+        surfaces the fleet-wide standing count of documents skipped without
+        a download because their failure history says they are doomed."""
+        body = json.loads(json.dumps(_FLEET_BODY))
+        body["totals"]["skipped_doomed"] = 7
+        with patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(200, body)):
+            result = runner.invoke(app, ["admin", "sharepoint", "runs"])
+        assert result.exit_code == 0, result.output
+        assert "doomed skipped: 7" in result.output
 
     def test_a_pending_backlog_with_no_pass_running_is_shown(self):
         connection = dict(_FLEET_BODY["connections"][0])

@@ -758,15 +758,50 @@ def test_xlsm_already_resaved_skips_rung_one_and_reuses_the_same_file_for_csv_fa
     assert len(calls) == 1
 
 
-def test_rescue_chain_reports_every_rungs_last_error_when_all_fail(tmp_path, monkeypatch):
-    """When every rung fails, the raised `ConversionError` must name EACH
-    rung's own last error — not just markitdown's — so the next
+def test_rescue_chain_reports_every_rungs_last_error_when_both_are_reached(tmp_path, monkeypatch):
+    """When rung 1's OWN re-save succeeds but markitdown still rejects the
+    resaved copy, rung 2 is reached and the raised `ConversionError` names
+    EACH rung's own last error — not just markitdown's — so the next
     reconciliation pass can tell WHICH step to fix."""
     import connectors.sharepoint.convert as convert_module
 
     path = tmp_path / "report.xlsx"
     path.write_bytes(b"xlsx bytes")
-    _stub_soffice(monkeypatch, convert_module, returncode=1, produce_output=False)
+    # Every soffice invocation SUCCEEDS (exit 0, produces a file) — a
+    # resave-itself failure is a DIFFERENT scenario (see the "unopenable"
+    # test below) that stops the chain before rung 2 is even reached. Here
+    # both soffice calls succeed structurally; it is the SUBSEQUENT
+    # markitdown/openpyxl parse of what they produced that fails each time,
+    # which is what lets BOTH rungs actually run.
+    _stub_soffice(monkeypatch, convert_module, output_bytes=b"not a real xlsx")
+
+    def _always_fails(p, filename):
+        raise ConversionError(filename, "FileConversionException: bad zip", engine="markitdown")
+
+    monkeypatch.setattr(convert_module, "_convert_markitdown", _always_fails)
+
+    with pytest.raises(ConversionError) as excinfo:
+        convert_to_markdown(path, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+    message = str(excinfo.value)
+    assert "markitdown: " in message and "bad zip" in message
+    assert "libreoffice resave+retry: " in message
+    assert "csv fallback: " in message
+    assert excinfo.value.filename == "report.xlsx"
+
+
+def test_rescue_chain_stops_after_rung_one_when_the_resave_itself_is_unopenable(tmp_path, monkeypatch):
+    """2026-09-04 finding #66 item 3 (live finding: hundreds of doomed
+    spreadsheets held 16-22 conversion children for minutes each). When
+    rung 1's OWN LibreOffice re-save fails because the SOURCE file itself is
+    corrupt/unopenable (a non-zero, non-signal exit), rung 2's CSV/PDF
+    fallback — which would reach the IDENTICAL LibreOffice mechanism on the
+    IDENTICAL bytes — is skipped rather than retried."""
+    import connectors.sharepoint.convert as convert_module
+
+    path = tmp_path / "report.xlsx"
+    path.write_bytes(b"xlsx bytes")
+    calls = _stub_soffice(monkeypatch, convert_module, returncode=1, produce_output=False)
 
     def _always_fails(p, filename):
         raise ConversionError(filename, "FileConversionException: bad zip", engine="markitdown")
@@ -779,9 +814,73 @@ def test_rescue_chain_reports_every_rungs_last_error_when_all_fail(tmp_path, mon
     message = str(excinfo.value)
     assert "markitdown: " in message and "bad zip" in message
     assert "libreoffice resave: " in message
-    assert "csv fallback: " in message
-    assert message.count("exited with status 1") == 2  # rung 1's resave AND rung 2's own
+    assert "skipped" in message
+    assert message.count("exited with status 1") == 1  # rung 1's resave only — rung 2 never ran
     assert excinfo.value.filename == "report.xlsx"
+    assert excinfo.value.error_class == convert_module.ERROR_CLASS_LIBREOFFICE_NO_OUTPUT
+    # exactly ONE soffice call — the failed resave; rung 2 never shells out again
+    assert len(calls) == 1
+
+
+def test_rescue_chain_stops_after_rung_one_on_a_libreoffice_timeout(tmp_path, monkeypatch):
+    """A timeout on rung 1's own re-save also stops the chain — retrying a
+    slower rung after LibreOffice already timed out on this file would only
+    time out again (2026-09-04 finding #66 item 3)."""
+    import subprocess
+
+    import connectors.sharepoint.convert as convert_module
+
+    path = tmp_path / "report.xlsx"
+    path.write_bytes(b"xlsx bytes")
+    _stub_soffice(monkeypatch, convert_module, side_effect=subprocess.TimeoutExpired(cmd="soffice", timeout=120))
+    run_count = 0
+    real_run = convert_module.subprocess.run
+
+    def _counting_run(*args, **kwargs):
+        nonlocal run_count
+        run_count += 1
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(convert_module.subprocess, "run", _counting_run)
+
+    def _always_fails(p, filename):
+        raise ConversionError(filename, "FileConversionException", engine="markitdown")
+
+    monkeypatch.setattr(convert_module, "_convert_markitdown", _always_fails)
+
+    with pytest.raises(ConversionError) as excinfo:
+        convert_to_markdown(path, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+    assert excinfo.value.error_class == convert_module.ERROR_CLASS_TIMEOUT
+    assert run_count == 1
+
+
+@pytest.mark.parametrize(
+    "returncode, expected_class",
+    [(-9, "memory_kill"), (-11, "worker_crash")],
+)
+def test_rescue_chain_stops_after_rung_one_on_a_signal_killed_resave(tmp_path, monkeypatch, returncode, expected_class):
+    """A resave killed by a SIGNAL (the LibreOffice subprocess itself was
+    killed — by a memory guard/OOM killer for SIGKILL, or crashed for any
+    other signal) is environmental, not a property of the file — but it
+    STILL stops the chain: retrying the identical subprocess mechanism on
+    the identical bytes right away is not a rescue."""
+    import connectors.sharepoint.convert as convert_module
+
+    path = tmp_path / "report.xlsx"
+    path.write_bytes(b"xlsx bytes")
+    calls = _stub_soffice(monkeypatch, convert_module, returncode=returncode, produce_output=False)
+
+    def _always_fails(p, filename):
+        raise ConversionError(filename, "FileConversionException", engine="markitdown")
+
+    monkeypatch.setattr(convert_module, "_convert_markitdown", _always_fails)
+
+    with pytest.raises(ConversionError) as excinfo:
+        convert_to_markdown(path, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+    assert excinfo.value.error_class == expected_class
+    assert len(calls) == 1
 
 
 def test_rescue_chain_never_fires_for_a_non_rescuable_suffix(tmp_path, monkeypatch):
