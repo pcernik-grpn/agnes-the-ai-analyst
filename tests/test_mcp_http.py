@@ -590,7 +590,7 @@ class TestToolRegistration:
             "data_app_get",
             "data_app_deploy",
             "data_app_logs",
-            # "Add artefacts to My Stack" — triple-surface with
+            # "Add artifacts to My Stack" — triple-surface with
             # /api/stack/artefacts* + `agnes stack artefacts list/add/remove`.
             "stack_artefacts_candidates",
             "stack_artefact_add",

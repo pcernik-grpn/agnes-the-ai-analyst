@@ -81,7 +81,7 @@ DIR_PREPARED = "prepared"
 DIR_UNRELATED = "unrelated"
 DIR_MISSING = "missing"
 
-# Artefacts a *prepared* workspace folder may already hold. Anything else is
+# Artifacts a *prepared* workspace folder may already hold. Anything else is
 # unrelated content and needs an explicit `--accept-dir`. `bash.exe.stackdump`
 # is Git-Bash-on-Windows litter that lands in a freshly created folder through
 # no fault of the user; `.gitignore` alone only ever discriminates an empty

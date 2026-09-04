@@ -964,6 +964,13 @@ async def lifespan(app):
 
     validate_deployment()
 
+    # Opt-in OTLP trace export (docs/observability.md → "OpenTelemetry
+    # export"). Idempotent: setup_logging already tried at import; this
+    # repeat catches an endpoint that only reached the environment later.
+    from src.observability.otel import configure_otel
+
+    configure_otel(role=os.environ.get("AGNES_ROLE") or "app")
+
     # Surface an unsafe/no-op data-apps posture at startup: enabled, but
     # same-origin serving off and no isolated origin configured, so no hosted
     # app can actually be served (see data_apps_proxy._same_origin_serving_refused).
@@ -1240,7 +1247,7 @@ async def lifespan(app):
     # BG-task / scheduler paths that bypass the per-mutation hook.
     # Soft-failure — logs WARNING and the repo falls back to ILIKE.
     #
-    # DuckDB-only: the BM25 index is a DuckDB FTS-extension artefact built on
+    # DuckDB-only: the BM25 index is a DuckDB FTS-extension artifact built on
     # the system DuckDB. On Postgres there is no system DuckDB (and opening one
     # is forbidden), so skip entirely — memory search there uses the PG path.
     from src.repositories import use_pg as _use_pg
@@ -2164,6 +2171,15 @@ async def lifespan(app):
             await close_mcp_sessions()
         except Exception:
             logger.exception("MCP session pool close failed during shutdown (non-fatal)")
+        # Flush buffered OTLP spans while the loop is still up (no-op when
+        # export is off) — a BatchSpanProcessor's own atexit hook would run
+        # too late for a graceful compose stop.
+        try:
+            from src.observability.otel import shutdown_otel
+
+            shutdown_otel()
+        except Exception:
+            logger.exception("otel shutdown failed (non-fatal)")
         from src.db import close_analytics_db, close_operational_db, close_system_db
 
         close_system_db()

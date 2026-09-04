@@ -999,6 +999,7 @@ class TestAdminRegistrySmoke:
         "PUT /api/admin/registry/{table_id}",
         "DELETE /api/admin/registry/{table_id}",
         "POST /api/admin/registry/{table_id}/policy/preview",
+        "POST /api/admin/registry/{table_id}/policy/preview-groups",
         "GET /api/admin/discover-tables",
         "POST /api/admin/configure",
         "GET /api/admin/metadata/{table_id}",
@@ -1101,6 +1102,35 @@ class TestAdminRegistrySmoke:
         r = seeded_app_both["client"].post(
             f"/api/admin/registry/{table_id}/policy/preview",
             json={"sql": "SELECT * FROM policy_preview_smoke", "as_groups": ["Everyone"]},
+            headers=h,
+        )
+        assert r.status_code in (200, 422), r.text
+
+    def test_registry_policy_preview_groups(self, seeded_app_both):
+        """review plan P1.4 -- same tolerance as `test_registry_policy_preview`
+        right above: the table is never synced, so the route's own live
+        analytics-DB reads legitimately fail; the smoke assertion only cares
+        that the route is reachable and behaves identically on DuckDB and
+        Postgres, since it reads through the same factory-backed repos
+        (table_registry_repo/user_groups_repo/audit_repo)."""
+        h = _admin_headers(seeded_app_both)
+        rc = seeded_app_both["client"].post(
+            "/api/admin/register-table",
+            json={
+                "name": "policy_preview_groups_smoke",
+                "source_type": "keboola",
+                "bucket": "in.c-smoke",
+                "source_table": "orders",
+                "query_mode": "local",
+            },
+            headers=h,
+        )
+        assert rc.status_code == 201
+        table_id = rc.json()["id"]
+
+        r = seeded_app_both["client"].post(
+            f"/api/admin/registry/{table_id}/policy/preview-groups",
+            json={"sql": "SELECT * FROM policy_preview_groups_smoke"},
             headers=h,
         )
         assert r.status_code in (200, 422), r.text
@@ -2772,7 +2802,7 @@ KNOWN_UNTESTED = {
     # Agent builder (rail-layout WIP surface) — rendering covered by
     # tests/test_ui_layout_theme.py::TestRailOptIn.
     "GET /agents",
-    # Personal artefacts page (rail-layout IA) — rendering covered by
+    # Personal artifacts page (rail-layout IA) — rendering covered by
     # tests/test_ui_layout_theme.py::TestRailOptIn.
     "GET /artefacts",
     # Knowledge-search chat landing (#896) — rendering covered by
@@ -3076,6 +3106,14 @@ KNOWN_UNTESTED = {
     # duplicated in this parameter-free smoke sweep.
     "GET /api/admin/registry/{table_id}/policy/columns",
     "POST /api/admin/registry/{table_id}/policy/compile",
+    # Access-policy revision history (#1979) — backed by the PG-only
+    # `access_policy_revisions` table, so its per-backend behaviour IS the
+    # point and is asserted directly (200 + shape and the write/restore
+    # round-trip on PG by tests/db_pg/test_access_policy_revisions_api_pg.py;
+    # typed 501, 403 for a non-admin, and 404-before-any-repo-work on DuckDB
+    # by tests/test_admin_access_policy_revisions_api.py). Takes a path
+    # param, so it is out of this parameter-free sweep either way.
+    "GET /api/admin/registry/{table_id}/policy/revisions",
     "PATCH /api/admin/registry/{table_id}/docs",
     "POST /api/admin/bigquery/test-connection",
     "POST /api/admin/discover-and-register",
@@ -3152,10 +3190,10 @@ KNOWN_UNTESTED = {
     "DELETE /api/chat/sessions/{chat_id}/permanent",
     # Session-workspace file delivery (#1611) — owner-scoped reads over the
     # caller's own session dir plus the save-to-Library bridge. No new repo
-    # methods/migration (ownership rides chat_repo.get_session, the artefact
+    # methods/migration (ownership rides chat_repo.get_session, the artifact
     # path reuses create_single_file_artefact — both already parity-proven);
     # behaviour (ownership 404s, traversal/symlink containment, download
-    # headers, artefact creation) covered in tests/test_chat_session_files.py.
+    # headers, artifact creation) covered in tests/test_chat_session_files.py.
     # The preview pair joins them on the same grounds: `…/preview` reads the
     # caller's own session file and describes it, `…/raw` streams the closed
     # image/PDF allowlist inline for the modal to draw — same ownership and
@@ -3304,7 +3342,7 @@ KNOWN_UNTESTED = {
     # component in page mode. No PG-specific behaviour of its own; the
     # package writes it performs are the /api/admin/data-packages routes.
     "GET /admin/data-packages/new",
-    # Add artefacts to My Stack — covered by tests/test_web_stack_artefacts.py
+    # Add artifacts to My Stack — covered by tests/test_web_stack_artefacts.py
     # (DuckDB) + tests/test_cli_api_parity.py (add/remove parity); no
     # dedicated PG smoke class yet, same convention as the stack rows above.
     "DELETE /api/stack/artefacts/{corpus_id}",
