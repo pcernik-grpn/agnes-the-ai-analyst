@@ -60,6 +60,16 @@ function fmtRate(rate) {
   return rate == null ? "—" : rate.toFixed(1);
 }
 
+// D.16 — `row.next_run_at` (`app/api/admin_extraction.py::
+// _crawl_schedule_next_run_at`, best-effort display only): `null` means
+// this connection is `off`, OR the instance-wide sweep itself has no
+// cadence configured at all (the instance switch is what turns the sweep
+// on — see that function's own docstring). Either way "not scheduled" is
+// the honest read, not a blank cell.
+function fmtNextRun(iso) {
+  return iso ? new Date(iso).toLocaleString() : "not scheduled";
+}
+
 function fmtCost(usd) {
   return usd == null || usd === 0 ? "—" : "$" + usd.toFixed(4);
 }
@@ -91,7 +101,16 @@ function factsCell(facts) {
     // pending FROM THIS PASS. Skipped/failed documents are their own
     // counts, not represented as "pending" (they were looked at, not
     // deferred).
-    return `${done} <span class="ext-sub">(0 pending)</span>`;
+    // `orphans_swept` (TCRD-296 C.12) — the pass's own single end-of-pass
+    // sweep count. Shown only when non-null and non-zero, so an ordinary
+    // finished pass with nothing to sweep reads exactly as it did before
+    // this field existed.
+    const swept = facts.orphans_swept;
+    const sweptNote =
+      swept != null && swept > 0
+        ? ` <span class="ext-sub">(${swept} orphan${swept === 1 ? "" : "s"} swept)</span>`
+        : "";
+    return `${done} <span class="ext-sub">(0 pending)</span>${sweptNote}`;
   }
   return "—";
 }
@@ -213,7 +232,7 @@ function renderShardDisclosureRow(row) {
   tr.className = "ext-shard-disclosure";
   tr.hidden = true;
   tr.innerHTML = `
-    <td colspan="11">
+    <td colspan="12">
       <table class="data-table ext-shard-table">
         <thead>
           <tr><th>Shard</th><th>Outcome</th><th>Files done/seen</th><th>Expected</th><th>Checkpoint</th><th>Error</th></tr>
@@ -256,6 +275,7 @@ function renderRow(row) {
     <td class="ext-num">${tokenTotals(usage)}</td>
     <td class="ext-num">${fmtCost(cost)}</td>
     <td class="ext-sub">${fmtAgo(row.checkpoint_age_s)}</td>
+    <td class="ext-sub">${fmtNextRun(row.next_run_at)}</td>
     <td>${run && run.error ? `<span class="ext-error-cell" title="${esc(run.error)}">${esc(run.error)}</span>` : ""}</td>
     <td>${actionsCell(row)}</td>
     <td><button type="button" class="btn btn-sm btn-secondary" onclick="openFleetCompleteness('${row.connection_id}')">Completeness</button></td>
@@ -313,15 +333,48 @@ function renderJobsStrip(jobs) {
     .join("");
 }
 
+/* Fleet-level provider-refusal banner (TCRD-296 synthesis F.25, gaps
+   #25/#48) — one strip per active condition, e.g. a workspace usage-limit
+   exhaustion or a saturated Vertex region×model quota bucket. Additive:
+   `conditions` is `[]` on every instance before this shipped and forever
+   on a DuckDB-backed one, so the strip simply stays hidden. This is the
+   SAME condition list the crawl's own streamed trigger
+   (`crawler._enqueue_streamed_facts_pass`) checks before enqueueing — the
+   banner is the operator-facing signal, never the enforcement itself. */
+function renderProviderLimitBanner(conditions) {
+  const el = document.getElementById("ext-provider-limit-banner");
+  if (!el) return;
+  const list = conditions || [];
+  if (!list.length) {
+    el.hidden = true;
+    el.innerHTML = "";
+    return;
+  }
+  el.hidden = false;
+  el.innerHTML = list
+    .map((c) => {
+      const scope = [c.model, c.region].filter(Boolean).join(" in ") || "";
+      const retryHint = c.retry_after_s
+        ? `retrying in ${Math.max(1, Math.round(c.retry_after_s / 60))}m`
+        : "retrying automatically once the condition clears";
+      return (
+        `<div>Facts extraction paused: ${esc(c.provider || "provider")}` +
+        `${scope ? " " + esc(scope) : ""} — ${esc(c.message || c.reason || "provider limit")}; ${esc(retryHint)}.</div>`
+      );
+    })
+    .join("");
+}
+
 function renderTable(body) {
   extLastBody = body;
+  renderProviderLimitBanner(body.conditions);
   const tbody = document.getElementById("ext-tbody");
   const rows = body.connections || [];
   if (!rows.length) {
     const msg = extScope === "active"
       ? "No SharePoint connection currently has a run in progress."
       : "No SharePoint connections are registered.";
-    tbody.innerHTML = `<tr><td colspan="11" class="ext-blank">${msg}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="12" class="ext-blank">${msg}</td></tr>`;
   } else {
     tbody.innerHTML = "";
     for (const row of rows) {
@@ -367,6 +420,8 @@ async function extTick() {
       document.getElementById("ext-tbody").innerHTML = "";
       const strip = document.getElementById("ext-jobs-strip");
       if (strip) strip.hidden = true;
+      const banner = document.getElementById("ext-provider-limit-banner");
+      if (banner) banner.hidden = true;
       return;
     }
     if (!r.ok) throw new Error("HTTP " + r.status);

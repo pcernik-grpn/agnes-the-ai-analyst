@@ -1922,7 +1922,10 @@ row already ended comes back as `failed` — the stored `running` is reported
 separately as `stored_status`, so the two can never be confused. A `stalled`
 run can be force-cancelled — see `POST …/extraction/runs/{run_id}/cancel`
 below. Counters are **absolute**
-(files processed, new/changed/unchanged, bytes, elapsed, 429 count and wait):
+(files processed, new/changed/unchanged/renamed, bytes, elapsed, 429 count and
+wait; `renamed` — D.18 — is the subset of what would otherwise be
+`unchanged` whose content matched but whose name/path moved, updated in
+place with no re-download):
 there is no fraction, no progress bar and no ETA, because the crawl enumerates
 and processes in lockstep per delta page and `files_per_s` counts only
 new+changed documents. `can_stop` is `true` — a running (or `stalled`) run
@@ -1951,7 +1954,11 @@ that has never crawled. `skipped_unsupported_count` has no persisted
 backlog to count (no retry mechanism replays it — see `CrawlStats.
 skipped_unsupported`'s docstring), so it is read off whichever of
 `running`/`last_failed`/`last_completed` above is most recent, and `null`
-when none of the three exist.
+when none of the three exist. `next_run_at` (D.16) is the same best-effort
+"when will this connection's own crawl cadence next fire the sweep" hint
+`…/extraction/crawl-config`'s PATCH response and the fleet endpoint carry —
+`null` for an `off` connection or whenever the instance-wide sweep has no
+cadence configured at all.
 
 `GET …/extraction/runs` (`?limit=`, ≤100) lists runs newest-first with a
 `total` covering every recorded run; `GET …/extraction/runs/{run_id}` adds the
@@ -1978,12 +1985,15 @@ and "Facts transport" — show the CONNECTION-RESOLVED value
 (`resolve_effective_provider`/`resolve_transport`), not just the instance-wide
 setting: an operator debugging why a pass spent against one provider instead
 of another needs the resolved answer for THIS connection. The response also
-carries `min_modified: {value, source}` — the SAME resolved shape `…/extraction/
-crawl-config`'s own PATCH response returns. The card's own Crawl filter
-control (a date input plus Save/Clear, next to "Facts policy") reads this
-straight off the connection row it already has rather than calling this
-endpoint, since there is no instance-level default `min_modified` could
-resolve against — see the PATCH entry below.
+carries `min_modified: {value, source}` and, since D.16, `schedule: {value,
+source, next_run_at}` — the SAME resolved shapes `…/extraction/
+crawl-config`'s own PATCH response returns. The card's own "Crawl schedule &
+filter" control (a cadence select plus a date input, next to "Facts
+policy") reads its PRE-FILL straight off the connection row it already has
+rather than calling this endpoint (there is no instance-level default
+`min_modified` could resolve against, and a stored `schedule` string reads
+back identically), but polls `…/extraction/status` for the live
+`next_run_at` hint — see the PATCH entry below for both fields' contracts.
 
 `POST …/extraction/stop` sets `config.extraction.stop_requested_at` on the
 connection row (`connectors.sharepoint.crawler.request_stop`) — the same JSON
@@ -2026,6 +2036,10 @@ to `"facts"` mid-run). Each row also carries `failed_items_count`/
 `…/extraction/status` returns, one cheap query per row, backing the table's
 own "Retry failed (N)"/"Retry empty (N)" buttons so an operator does not
 need to open a source card just to see whether there is anything to retry.
+Each row also carries `next_run_at` (D.16) — the same best-effort "next
+sweep" hint the crawl-config PATCH response and `…/extraction/status`
+carry, pure computation, no extra query per row.
+
 The response also carries a top-level `jobs` block — `{kind: {queued,
 running}}` for `corpus-extraction` and `sharepoint-facts-extraction`, read
 in one grouped query off the jobs table independent of `active`/`all` scope
@@ -2107,25 +2121,72 @@ error — and the run report (`…/extraction/runs/{run_id}`) names the ACTUAL
 configured. All three overrides are also settable from the SharePoint source
 card on `/admin/data-sources`, for an admin with no server or CLI access.
 
-`PATCH …/extraction/crawl-config` sets or clears a per-connection age filter
-for the crawl — `config.extraction.crawl.min_modified`, another sibling on
-the same JSON column. A backfill run can crawl only files modified on/after
-a cutoff date instead of re-walking a whole multi-year corpus. Body:
-`{"min_modified": "YYYY-MM-DD" | null}` — `null` (or the field omitted)
-clears the override; there is no instance-level fallback (the cutoff is
-inherently connection-specific). Returns `{connection_id, min_modified:
-{value, source}}`, `source` being `"connection"` or `"none"`. `400
-invalid_min_modified` for a value that is not a parseable ISO date; `404`
-for an unknown or non-SharePoint connection. Works on both app-state
-backends, same as `…/extraction/stop`. Audited as `extraction.
-min_modified_set` — the handler writes its own row, same shape as
-`facts-config`'s above. CLI: `agnes admin sharepoint crawl-config
-<connection_id> --min-modified <date>` / `--clear`. The crawler gate itself
-keeps items on/after 00:00:00 UTC of the cutoff date, skips strictly-before
-ones (counted as `filtered_by_age` in the run report), and always keeps an
-item whose modified timestamp cannot be read at all (counted separately as
+`PATCH …/extraction/crawl-config` sets or clears TWO independent
+per-connection levers on the same JSON column — `config.extraction.crawl.
+min_modified` (a backfill age filter) and, since D.16,
+`config.extraction.crawl.schedule` (this connection's own scheduled-sweep
+cadence — see `docs/sharepoint-extraction.md` → *Keeping a site current*
+for the full interplay with the instance-wide `extraction.schedule`
+switch). Body: `{"min_modified": "YYYY-MM-DD" | null, "schedule": "off" |
+"instance" | "<cadence>" | null}`, both optional.
+
+`min_modified` keeps its ORIGINAL contract: `null` **or the field
+omitted** clears the override (there is no instance-level fallback — the
+cutoff is inherently connection-specific). `schedule` has a DIFFERENT
+contract, because it now shares this endpoint with an independent field
+that must never be silently reset by a call that only means to touch the
+other: the field **omitted** leaves the stored `schedule` untouched
+(checked via `"schedule" in body.model_fields_set`, the same pattern
+`facts-config`'s `transport`/`provider`/`vertex_region` already use);
+`null` **given explicitly** clears it back to `"instance"` (follow the
+instance-wide cadence); any other value must be `"off"`, `"instance"`, or a
+cadence string in the SAME grammar `extraction.schedule` itself uses
+(`"every 6h"`, `"daily 03:00"`, `"cron 0 3 * * *"`), refused otherwise with
+`400 invalid_crawl_schedule`. **A caller that wants to change one field
+without disturbing the other must resend the OTHER field's current value
+explicitly** — the endpoint itself does not protect against a bare
+single-field body clobbering `min_modified`'s "omitted == cleared"
+contract; the CLI (a `GET` of the connection first) and the source-card
+panel both do this for you.
+
+Returns `{connection_id, min_modified: {value, source}, schedule: {value,
+source, next_run_at}}` — `min_modified.source` is `"connection"` or
+`"none"`; `schedule.source` is `"connection"` or `"default"`;
+`schedule.next_run_at` is a best-effort display estimate (`null` when this
+connection is `off`, or when the instance-wide switch itself has no
+cadence configured — the sweep never runs at all regardless of this
+override, see `POST …/extraction/run-due` below). `400
+invalid_min_modified` for a `min_modified` value that is not a parseable
+ISO date; `404` for an unknown or non-SharePoint connection. Works on both
+app-state backends, same as `…/extraction/stop`. Audited as `extraction.
+min_modified_set` — the handler writes its own row (covering both fields'
+values and resolutions), same shape as `facts-config`'s above. CLI: `agnes
+admin sharepoint crawl-config <connection_id> --min-modified <date>` /
+`--clear` / `--schedule <off|instance|cadence>` (any combination; the CLI
+GETs the connection first to resend whichever field the call is not
+explicitly touching). `GET …/extraction/config` and `GET …/extraction/
+status` also carry the resolved `schedule`/`next_run_at` (the drawer's and
+the source card's own reads), and the fleet endpoint's rows carry
+`next_run_at` too.
+
+The crawler's age-filter gate keeps items on/after 00:00:00 UTC of the
+`min_modified` cutoff date, skips strictly-before ones (counted as
+`filtered_by_age` in the run report), and always keeps an item whose
+modified timestamp cannot be read at all (counted separately as
 `age_unknown`) — an unfilterable item is never silently dropped. A deleted
 item is still processed for deletion regardless of the filter.
+
+`POST /api/admin/sharepoint/extraction/run-due` (the scheduler-driven sweep
+behind `extraction.schedule`) evaluates each SharePoint connection's OWN
+`config.extraction.crawl.schedule` (D.16) against its own last-run stamp —
+`"off"` is skipped unconditionally, `"instance"` (the default) follows the
+sweep's own instance-wide cadence, and any other value REPLACES that
+cadence for this one connection's due-check. The instance-wide
+`extraction.schedule` switch remains what turns the sweep on AT ALL: with
+it unset, this route is a clean no-op (`{"dispatched": [], "skipped":
+true, "reason": "no_schedule_configured"}`) regardless of any per-connection
+override — a per-connection cadence only narrows WHEN a running sweep picks
+up a connection, it cannot make the sweep run on its own.
 
 The four `GET`/stop routes above are admin-only display primitives with no
 analyst CLI/MCP analogue. The fleet endpoint, `cancel`, `facts-config` and
@@ -2691,13 +2752,45 @@ delivery channels; an agent's live read path is `get_semantic_context`/
 - /api/admin/run-jira-sla-poll
 - /api/admin/run-knowledge-digests
 - /api/admin/run-knowledge-migration
-- /api/admin/run-knowledge-packaging
+- /api/admin/run-knowledge-packaging — see the dedicated section below (thin enqueue, not synchronous)
 - /api/admin/run-reap-stuck-reviews
 - /api/admin/run-retention-prune
 - /api/admin/run-semantic-sources-refresh
 - /api/admin/upgrade-freeze — per-instance auto-upgrade freeze (GET status, POST set for 1–72 h, DELETE lift); writes the state-disk marker the VM's upgrade tick honors
 - /api/admin/run-session-collector
 - /api/admin/run-session-processor
+
+### `/api/admin/run-knowledge-packaging` + `/api/admin/knowledge-packaging/status` — Knowledge-artifact packaging (K3, #798)
+
+- /api/admin/run-knowledge-packaging
+- /api/admin/knowledge-packaging/status
+
+TCRD-296 synthesis C.15: `POST /api/admin/run-knowledge-packaging` used to
+run the packaging pass (rebuild any Collection's `knowledge.duckdb`
+artifact whose chunk content changed) INLINE, synchronously, inside the
+request — the scheduler's own 600s client timeout was the only bound on
+it, and a slower pass let the next scheduler tick fire a second,
+overlapping call that raced the first hard enough to OOM the app. It is
+now a thin enqueue of the `knowledge-packaging` worker job kind (LIGHT
+lane, `app/worker/kinds.py::_run_knowledge_packaging`), which supplies a
+belt-and-braces Postgres advisory lock and a 20-minute wall-clock budget
+(checkpointed per collection, so an interrupted run resumes cleanly on the
+next tick rather than losing its progress). Returns 202 with `{"status":
+"queued", "job_id"}` on a fresh enqueue, 409 with the in-flight `job_id`
+when a run is already `queued`/`running` (the idempotency-keyed dedupe —
+expected under a fast scheduler cadence, not an error), and 501 (typed
+`requires_worker_role`) when this process/instance has no worker role, so
+enqueueing would leave the job unclaimed forever.
+
+`GET /api/admin/knowledge-packaging/status` reports the last run's outcome
+(`{"job_id", "status", "created_at", "finished_at", "result"}`, where
+`result` carries `built`/`skipped`/`pruned`/`errors`/`interrupted_reason`/
+`duration_s`/`collections_total`/`collections_processed`), whether a run
+is currently `queued`/`running`, and a best-effort `next_due` estimate
+read from the scheduler's durable last-run marker.
+
+CLI: `agnes admin knowledge packaging run|status`. MCP:
+`admin_knowledge_packaging_run`, `admin_knowledge_packaging_status`.
 
 ### `/api/auth` — Authentication
 

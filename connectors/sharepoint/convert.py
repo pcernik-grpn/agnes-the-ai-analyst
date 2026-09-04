@@ -64,6 +64,35 @@ this module never calls a model and the empty result above is byte-identical
 to what it always was; with it on, a scan comes back as ``engine="ocr"`` and a
 transcription that could not be produced at all is a :class:`ConversionError`,
 never a silently empty document.
+
+Rescue chain (live finding 2026-09, wave 2)
+--------------------------------------------
+``.xlsx``/``.pptx``/``.docx`` need no LibreOffice pre-convert at all — markitdown
+reads OOXML directly — but a real share of them still fail outright: 723 of
+1 162 markitdown "could not convert" failures on one site's crawl were plain
+``.xlsx``. Rather than counting those as an immediate ``convert_failed``, this
+module escalates through a RESCUE CHAIN (:func:`_convert_markitdown_with_rescue`,
+:data:`RESCUE_RESAVE_TARGETS`, :data:`RESCUE_FALLBACK_KIND`): re-save the file
+through the SAME LibreOffice mechanism the legacy-format route already uses and
+retry markitdown once on the re-saved copy, and if that still fails, fall back
+to a LibreOffice-produced CSV (one block per sheet, spreadsheets) or a
+LibreOffice-produced PDF run through this module's own PDF route (decks and
+documents) — never a competing reader. ``.xlsm``/``.xlsb``/``.xls``/``.ods`` and
+the other :data:`LEGACY_OFFICE_SUFFIXES` already go through one LibreOffice
+resave before markitdown ever sees them; if THAT markitdown attempt also fails,
+they join the same fallback rung (never a second, redundant resave-and-retry —
+they already had their one resave). Which rung succeeded, if any, is reported
+on :attr:`ConvertResult.rescue` (``""`` when no rescue was needed). A rescue is
+NEVER attempted for :class:`UnsupportedConversionFormat` (no backend was even
+tried) or :class:`MissingConversionDependency` (installing LibreOffice cannot
+fix a missing markitdown) — only for a genuine backend failure on a rescuable
+suffix.
+
+A large ``.xlsx`` (above :data:`LARGE_XLSX_STREAMING_THRESHOLD_BYTES`) skips
+markitdown's full in-memory parse entirely and is read directly with openpyxl
+in ``read_only=True`` streaming mode (:func:`_read_xlsx_as_text`, the same
+reader the CSV rescue rung reuses) — see that function's docstring for why a
+221-file, 15 MB-average live finding motivated it.
 """
 
 from __future__ import annotations
@@ -147,6 +176,71 @@ LEGACY_OFFICE_SUFFIXES = frozenset(LEGACY_OFFICE_TARGETS)
 #: a crawl's conversion pool.
 LIBREOFFICE_TIMEOUT_SECONDS = 120
 
+#: OOXML suffixes markitdown reads DIRECTLY (no LibreOffice pre-convert
+#: needed to make markitdown accept the format at all) but which still fail
+#: outright on a meaningful share of real files — live finding 2026-09,
+#: wave 2: 723 of 1 162 markitdown "could not convert" failures on one
+#: site's crawl were plain ``.xlsx``, plus 117 ``.pptx``. Maps a suffix to
+#: the LibreOffice ``--convert-to`` target used for the rescue chain's rung
+#: 1 (resave the SAME format and retry markitdown once) — see
+#: :func:`_convert_markitdown_with_rescue`.
+RESCUE_RESAVE_TARGETS: dict[str, str] = {".xlsx": "xlsx", ".pptx": "pptx", ".docx": "docx"}
+
+#: Rung 2 of the rescue chain (reached when rung 1 also fails, or was
+#: skipped because the file already went through ONE LibreOffice resave via
+#: :data:`LEGACY_OFFICE_TARGETS`): spreadsheets fall back to a
+#: LibreOffice-produced CSV (:func:`_read_xlsx_as_text`, one block per
+#: sheet), decks and documents fall back to a LibreOffice-produced PDF run
+#: through this module's own PDF route (:func:`_convert_pdf`). Covers every
+#: suffix either :data:`RESCUE_RESAVE_TARGETS` or :data:`LEGACY_OFFICE_
+#: TARGETS` can reach — a document that fails markitdown even after its one
+#: resave has nowhere left to go but this same fallback.
+RESCUE_FALLBACK_KIND: dict[str, str] = {
+    ".xlsx": "csv",
+    ".xlsm": "csv",
+    ".xlsb": "csv",
+    ".xls": "csv",
+    ".ods": "csv",
+    ".pptx": "pdf",
+    ".ppt": "pdf",
+    ".docx": "pdf",
+    ".doc": "pdf",
+    ".rtf": "pdf",
+    ".odt": "pdf",
+    ".odp": "pdf",
+}
+
+#: Above this size, a plain ``.xlsx`` skips markitdown's full in-memory
+#: parse entirely and is read directly with openpyxl in streaming
+#: (``read_only=True``) mode — see :func:`_read_xlsx_as_text`. Live finding
+#: 2026-09: 221 large xlsx/xlsm files (average 15 MB) hit the (then-flat)
+#: 300s per-document conversion budget on one site's crawl; set below that
+#: average so most of that population takes the cheap streaming path
+#: instead of the slower, size-scaled markitdown route.
+LARGE_XLSX_STREAMING_THRESHOLD_BYTES = 10 * 1024 * 1024
+
+#: Base per-document conversion time budget, in seconds — the flat ceiling
+#: this module's live finding (see :data:`CONVERSION_BUDGET_PER_MB_SECONDS`)
+#: showed was not enough on its own. Mirrors the crawler's own
+#: ``extraction.crawler.item_timeout_s`` default
+#: (``connectors.sharepoint.crawler._DEFAULT_ITEM_TIMEOUT_S``); kept as a
+#: separate constant here because this module must not import the crawler
+#: (the crawler already imports this module).
+CONVERSION_BUDGET_BASE_SECONDS = 300.0
+
+#: Extra seconds of budget granted per MB of input size, on top of
+#: :data:`CONVERSION_BUDGET_BASE_SECONDS`. Live finding 2026-09: 221 large
+#: xlsx/xlsm files (average 15 MB) hit the flat 300s budget on one site's
+#: crawl — at 20s/MB a 15 MB file gets 300 + 15*20 = 600s, comfortably past
+#: what those failures needed.
+CONVERSION_BUDGET_PER_MB_SECONDS = 20.0
+
+#: Absolute ceiling on the size-scaled budget, regardless of input size — a
+#: module constant, not an ``instance.yaml`` knob (no speculative config
+#: surface for a value nobody has needed to tune): even a pathological
+#: file must not stall a crawl's conversion pool indefinitely.
+CONVERSION_BUDGET_MAX_SECONDS = 1_800.0
+
 ENGINE_MARKITDOWN = "markitdown"
 ENGINE_PYPDFIUM2 = "pypdfium2"
 ENGINE_PASSTHROUGH = "passthrough"
@@ -162,6 +256,52 @@ ENGINE_LIBREOFFICE_MARKITDOWN = "libreoffice+markitdown"
 #: ``"pypdfium2"``: a downstream reader must be able to tell text that was read
 #: off the page from text a model produced from a bitmap.
 ENGINE_OCR = "ocr"
+#: Rescue chain rung 1: a rescuable OOXML file (see
+#: :data:`RESCUE_RESAVE_TARGETS`) whose FIRST markitdown attempt failed, then
+#: succeeded after a LibreOffice resave into the same format. Distinct from
+#: ``ENGINE_LIBREOFFICE_MARKITDOWN`` (the legacy-format route, which ALWAYS
+#: resaves, never as a rescue) so a downstream reader can tell "this format
+#: always needs LibreOffice" from "markitdown could not read this ONE file
+#: directly".
+ENGINE_LIBREOFFICE_RESCUE = "libreoffice_resave+markitdown"
+#: Rescue chain rung 2, spreadsheets: a LibreOffice-produced CSV (one block
+#: per sheet) read after both the direct markitdown attempt and (when
+#: applicable) rung 1 failed. See :func:`_read_xlsx_as_text`.
+ENGINE_CSV_FALLBACK = "libreoffice_csv_fallback"
+#: Rescue chain rung 2, decks/documents: a LibreOffice-produced PDF run
+#: through this module's own PDF route (:func:`_convert_pdf`).
+ENGINE_PDF_FALLBACK = "libreoffice_pdf_fallback"
+#: A large ``.xlsx`` (see :data:`LARGE_XLSX_STREAMING_THRESHOLD_BYTES`) read
+#: directly with openpyxl in streaming mode, never through markitdown's full
+#: in-memory parse. See :func:`_read_xlsx_as_text`.
+ENGINE_XLSX_STREAMING = "openpyxl_streaming"
+
+
+def conversion_budget_seconds(size_bytes: int, *, base_seconds: float = CONVERSION_BUDGET_BASE_SECONDS) -> float:
+    """Size-scaled per-document conversion time budget.
+
+    ``base_seconds`` + :data:`CONVERSION_BUDGET_PER_MB_SECONDS` per MB of
+    ``size_bytes``, capped at :data:`CONVERSION_BUDGET_MAX_SECONDS`. Used by
+    the crawler's conversion process pool
+    (``connectors.sharepoint.crawler._ConvertProcessPool``) to size EACH
+    file's own per-item timeout instead of applying one flat ceiling to
+    every document regardless of size — see :data:`CONVERSION_BUDGET_PER_MB_
+    SECONDS`'s docstring for the live finding this fixes.
+
+    ``base_seconds`` defaults to this module's own constant but accepts an
+    override so a caller can pass through an admin's configured
+    ``extraction.crawler.item_timeout_s`` instead of silently ignoring it.
+    ``base_seconds <= 0`` disables the budget entirely (returns ``0.0``) —
+    the same "0 means unbounded" convention ``item_timeout_s`` already uses,
+    preserved rather than silently turning an explicit "no bound" into a
+    scaled, nonzero one.
+    """
+    if base_seconds <= 0:
+        return 0.0
+    if size_bytes <= 0:
+        return base_seconds
+    size_mb = size_bytes / (1024 * 1024)
+    return min(CONVERSION_BUDGET_MAX_SECONDS, base_seconds + CONVERSION_BUDGET_PER_MB_SECONDS * size_mb)
 
 
 class ConversionError(RuntimeError):
@@ -242,13 +382,22 @@ class ConvertResult:
     """The converted document and which engine produced it.
 
     ``engine`` is one of ``"markitdown"``, ``"pypdfium2"``, ``"passthrough"``,
-    ``"libreoffice+markitdown"`` or ``"empty"``. ``"empty"`` means conversion
-    succeeded and found no text — a scanned PDF, a blank document — and
-    ``markdown`` is then ``""``.
+    ``"libreoffice+markitdown"``, ``"empty"``, or one of the rescue-chain /
+    streaming engines above (``ENGINE_LIBREOFFICE_RESCUE``, ``ENGINE_CSV_
+    FALLBACK``, ``ENGINE_PDF_FALLBACK``, ``ENGINE_XLSX_STREAMING``).
+    ``"empty"`` means conversion succeeded and found no text — a scanned
+    PDF, a blank document — and ``markdown`` is then ``""``.
+
+    ``rescue`` names which rung of the rescue chain succeeded, when one was
+    needed: ``""`` (no rescue — the ordinary case), ``"libreoffice_resave"``,
+    ``"csv_fallback"``, or ``"pdf_fallback"``. Empty for every route that
+    never goes through the rescue chain (passthrough, PDF, plain markitdown,
+    the ordinary legacy-office resave, the streaming route's happy path).
     """
 
     markdown: str
     engine: str
+    rescue: str = ""
 
 
 def convert_to_markdown(
@@ -301,14 +450,20 @@ def convert_to_markdown(
     except OSError as exc:  # unreadable parent dir, broken symlink, ...
         raise ConversionError(filename, f"cannot stat file: {exc}") from exc
 
+    rescue = ""
     if suffix in PASSTHROUGH_SUFFIXES or (not suffix and declared in _PASSTHROUGH_MIMES):
         text = _read_text(path, filename, max_chars)
         engine = ENGINE_PASSTHROUGH
     elif suffix == ".pdf" or (not suffix and declared in _PDF_MIMES):
         text, engine = _convert_pdf(path, filename, source_path=source_path)
+    elif suffix == ".xlsx" and _file_size(path) > LARGE_XLSX_STREAMING_THRESHOLD_BYTES:
+        text, engine, rescue = _convert_large_xlsx(path, filename, max_chars)
     elif suffix in LEGACY_OFFICE_SUFFIXES:
-        text = _convert_legacy_office(path, filename, suffix)
-        engine = ENGINE_LIBREOFFICE_MARKITDOWN
+        text, engine, rescue = _convert_legacy_office(path, filename, suffix, max_chars=max_chars)
+    elif suffix in RESCUE_RESAVE_TARGETS:
+        text, engine, rescue = _convert_markitdown_with_rescue(
+            path, filename, suffix, max_chars=max_chars, pre_resaved=False
+        )
     else:
         text = _convert_markitdown(path, filename)
         engine = ENGINE_MARKITDOWN
@@ -318,9 +473,9 @@ def convert_to_markdown(
         # scanned PDF and a blank .txt are both legitimate crawl outcomes, and
         # the caller decides whether to route them to a vision transcription
         # pass. This module never calls a model.
-        return ConvertResult(markdown="", engine=ENGINE_EMPTY)
+        return ConvertResult(markdown="", engine=ENGINE_EMPTY, rescue=rescue)
 
-    return ConvertResult(markdown=_truncate(text, max_chars), engine=engine)
+    return ConvertResult(markdown=_truncate(text, max_chars), engine=engine, rescue=rescue)
 
 
 # --------------------------------------------------------------- passthrough
@@ -420,26 +575,31 @@ def _libreoffice_profile_dir() -> str:
     return profile
 
 
-def _convert_legacy_office(path: Path, filename: str, suffix: str) -> str:
-    """Legacy Office / OpenDocument formats markitdown cannot read directly.
+def _run_libreoffice_convert(path: Path, filename: str, target_format: str, *, engine: str) -> Path:
+    """Shell out to headless LibreOffice (``soffice --headless --convert-to
+    <target> --outdir <tmpdir> <file>``) and return the path to the
+    converted file, inside a throwaway temp directory.
 
-    Shells out to headless LibreOffice (``soffice --headless --convert-to
-    <target> --outdir <tmpdir> <file>``) to re-save the file into the OOXML
-    sibling markitdown already handles — ``.doc/.rtf/.odt`` → docx,
-    ``.ppt/.odp`` → pptx, ``.xls/.ods/.xlsb/.xlsm`` → xlsx — in a throwaway
-    temp dir that is ALWAYS removed, success or failure. ``soffice`` missing
-    from ``PATH``
-    raises the same typed :class:`MissingConversionDependency` a missing
-    Python backend would, naming ``"libreoffice"``, so the file is COUNTED as
-    a named conversion failure exactly like a missing markitdown today —
-    never silently skipped. A non-zero exit or a timeout raises
-    :class:`ConversionError`, the same class :func:`_convert_markitdown`
-    raises for a backend failure.
+    On FAILURE the temp directory is already removed before this function
+    raises. On SUCCESS it is left in place — the CALLER owns the returned
+    path's parent directory and must remove it once done reading from it
+    (typically in a ``finally``). This is the core :func:`_convert_legacy_
+    office` used to shell out to LibreOffice before the rescue chain existed
+    — factored out so BOTH the legacy-format route (always resaves) and the
+    rescue chain's rung 1 (resave-and-retry) and CSV/PDF fallback rung reuse
+    the identical mechanism rather than three copies of the same subprocess
+    plumbing.
+
+    ``soffice`` missing from ``PATH`` raises the same typed
+    :class:`MissingConversionDependency` a missing Python backend would,
+    naming ``"libreoffice"``, so the file is COUNTED as a named conversion
+    failure exactly like a missing markitdown today — never silently
+    skipped. A non-zero exit or a timeout raises :class:`ConversionError`,
+    the same class :func:`_convert_markitdown` raises for a backend
+    failure.
     """
-    target_format = LEGACY_OFFICE_TARGETS[suffix]
-
     if shutil.which("soffice") is None:
-        raise MissingConversionDependency(filename, "libreoffice", engine=ENGINE_LIBREOFFICE_MARKITDOWN)
+        raise MissingConversionDependency(filename, "libreoffice", engine=engine)
 
     tmpdir = tempfile.mkdtemp(prefix="agnes-libreoffice-")
     try:
@@ -472,27 +632,248 @@ def _convert_legacy_office(path: Path, filename: str, suffix: str) -> str:
             raise ConversionError(
                 filename,
                 f"libreoffice conversion timed out after {LIBREOFFICE_TIMEOUT_SECONDS}s",
-                engine=ENGINE_LIBREOFFICE_MARKITDOWN,
+                engine=engine,
             ) from exc
 
         if completed.returncode != 0:
             raise ConversionError(
                 filename,
                 f"libreoffice exited with status {completed.returncode}",
-                engine=ENGINE_LIBREOFFICE_MARKITDOWN,
+                engine=engine,
             )
 
         converted = sorted(Path(tmpdir).glob(f"*.{target_format}"))
         if not converted:
+            raise ConversionError(filename, "libreoffice produced no output file", engine=engine)
+        return converted[0]
+    except BaseException:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        raise
+
+
+def _convert_legacy_office(path: Path, filename: str, suffix: str, *, max_chars: int) -> tuple[str, str, str]:
+    """Legacy Office / OpenDocument formats markitdown cannot read directly.
+
+    Re-saves the file into the OOXML sibling markitdown already handles —
+    ``.doc/.rtf/.odt`` → docx, ``.ppt/.odp`` → pptx, ``.xls/.ods/.xlsb/
+    .xlsm`` → xlsx (:func:`_run_libreoffice_convert`) — and hands the
+    result to :func:`_convert_markitdown_with_rescue` with ``pre_resaved=
+    True``: this suffix already had its ONE LibreOffice resave, so a
+    markitdown failure here goes straight to the rescue chain's rung 2
+    (CSV/PDF fallback), never a second, redundant resave-and-retry.
+
+    Returns ``(markdown, engine, rescue)`` — see :class:`ConvertResult`'s
+    docstring for what ``rescue`` may hold. The temp directory
+    :func:`_run_libreoffice_convert` created is ALWAYS removed, success or
+    failure.
+    """
+    target_format = LEGACY_OFFICE_TARGETS[suffix]
+    converted_path = _run_libreoffice_convert(path, filename, target_format, engine=ENGINE_LIBREOFFICE_MARKITDOWN)
+    try:
+        return _convert_markitdown_with_rescue(converted_path, filename, suffix, max_chars=max_chars, pre_resaved=True)
+    finally:
+        shutil.rmtree(converted_path.parent, ignore_errors=True)
+
+
+# --------------------------------------------------------------- rescue chain
+
+
+def _read_xlsx_as_text(path: Path, filename: str, max_chars: int, *, engine: str) -> str:
+    """Read an ``.xlsx``-shaped file directly with openpyxl in
+    ``read_only=True`` streaming mode — never through markitdown's full
+    in-memory parse.
+
+    ``read_only`` mode iterates rows off the zip's XML stream instead of
+    materializing the whole worksheet, which is what keeps a huge workbook's
+    memory flat — and, because ``iter_rows`` is a genuine generator over
+    that stream, breaking out of the loop below genuinely stops reading
+    rather than merely stopping the caller from seeing more. One block per
+    sheet, headed by ``## <sheet name>``, rows joined as a comma-separated
+    line (``None`` cells rendered empty).
+
+    Stops emitting the moment the RUNNING TOTAL across every sheet so far
+    would reach ``max_chars`` (the caller's document-wide cap) — a live
+    finding 3M-character workbook stops early, mid-sheet, instead of ever
+    materializing the whole thing only to have :func:`_truncate` cut it
+    down afterward. Shared across every sheet on purpose: a workbook with
+    several huge sheets still stops at the SAME total ceiling
+    :func:`convert_to_markdown` would have applied regardless of how many
+    sheets it took to get there.
+
+    Used both by the large-``.xlsx`` streaming route
+    (:func:`_convert_large_xlsx`) and the rescue chain's CSV fallback rung
+    (:func:`_rescue_fallback`) — the same reader, two different reasons to
+    reach it.
+    """
+    try:
+        import openpyxl
+    except Exception as exc:
+        raise MissingConversionDependency(filename, "openpyxl", engine=engine, cause=exc) from exc
+
+    try:
+        workbook = openpyxl.load_workbook(str(path), read_only=True, data_only=True)
+    except Exception as exc:
+        raise ConversionError(
+            filename, f"openpyxl could not open this file ({type(exc).__name__})", engine=engine
+        ) from exc
+
+    parts: list[str] = []
+    total = 0
+    try:
+        for sheet in workbook.worksheets:
+            if total >= max_chars:
+                break
+            header = f"## {sheet.title}\n\n"
+            parts.append(header)
+            total += len(header)
+            for row in sheet.iter_rows(values_only=True):
+                if total >= max_chars:
+                    break
+                line = ",".join("" if cell is None else str(cell) for cell in row) + "\n"
+                parts.append(line)
+                total += len(line)
+    except Exception as exc:
+        raise ConversionError(
+            filename, f"openpyxl could not read this file's rows ({type(exc).__name__})", engine=engine
+        ) from exc
+    finally:
+        workbook.close()
+    return _normalize_newlines("".join(parts))
+
+
+def _convert_large_xlsx(path: Path, filename: str, max_chars: int) -> tuple[str, str, str]:
+    """The size-based cheap route for a large ``.xlsx`` (see :data:`LARGE_
+    XLSX_STREAMING_THRESHOLD_BYTES`): read it directly with openpyxl
+    streaming (:func:`_read_xlsx_as_text`), skipping markitdown's full
+    in-memory parse entirely.
+
+    If even THAT fails, falls back to a fresh LibreOffice resave (a clean,
+    LibreOffice-normalized copy can succeed where reading the original
+    raw file did not) and streams the resaved copy the same way — the same
+    CSV-fallback mechanism :func:`_rescue_fallback` uses, reached directly
+    here since markitdown was never attempted on this route to retry.
+    """
+    try:
+        text = _read_xlsx_as_text(path, filename, max_chars, engine=ENGINE_XLSX_STREAMING)
+        return text, ENGINE_XLSX_STREAMING, ""
+    except (UnsupportedConversionFormat, MissingConversionDependency):
+        raise
+    except ConversionError as exc:
+        converted_path = _run_libreoffice_convert(path, filename, "xlsx", engine=ENGINE_CSV_FALLBACK)
+        try:
+            text = _read_xlsx_as_text(converted_path, filename, max_chars, engine=ENGINE_CSV_FALLBACK)
+        except ConversionError as exc2:
             raise ConversionError(
                 filename,
-                "libreoffice produced no output file",
-                engine=ENGINE_LIBREOFFICE_MARKITDOWN,
-            )
+                f"openpyxl streaming: {exc} | libreoffice resave+streaming: {exc2}",
+                engine=ENGINE_XLSX_STREAMING,
+            ) from exc2
+        finally:
+            shutil.rmtree(converted_path.parent, ignore_errors=True)
+        return text, ENGINE_CSV_FALLBACK, "csv_fallback"
 
-        return _convert_markitdown(converted[0], filename)
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+
+def _rescue_fallback(path: Path, filename: str, suffix: str, *, max_chars: int, pre_resaved: bool) -> tuple[str, str]:
+    """Rescue chain rung 2 — the last resort once markitdown (and, for a
+    direct-route suffix, rung 1's resave-and-retry) have both failed.
+
+    Spreadsheets (:data:`RESCUE_FALLBACK_KIND` ``"csv"``) fall back to a
+    LibreOffice-produced ``.xlsx`` read through :func:`_read_xlsx_as_text` —
+    NOT ``soffice --convert-to csv`` directly: that only ever exports the
+    ACTIVE sheet, and this rung's whole point is every sheet, headed by its
+    own name. Decks/documents (``"pdf"``) fall back to a LibreOffice-produced
+    PDF run through this module's own PDF route (:func:`_convert_pdf`) —
+    reusing the one PDF pipeline rather than a second text extractor.
+
+    ``pre_resaved`` mirrors :func:`_convert_markitdown_with_rescue`'s own
+    parameter: when the caller already handed this function a LibreOffice-
+    produced ``.xlsx`` (the legacy-office route's one resave), the csv
+    branch reads it directly instead of paying for a redundant xlsx-to-xlsx
+    LibreOffice round trip.
+
+    Returns ``(markdown, engine)``.
+    """
+    kind = RESCUE_FALLBACK_KIND.get(suffix)
+    if kind == "csv":
+        if pre_resaved:
+            return _read_xlsx_as_text(path, filename, max_chars, engine=ENGINE_CSV_FALLBACK), ENGINE_CSV_FALLBACK
+        converted_path = _run_libreoffice_convert(path, filename, "xlsx", engine=ENGINE_CSV_FALLBACK)
+        try:
+            return (
+                _read_xlsx_as_text(converted_path, filename, max_chars, engine=ENGINE_CSV_FALLBACK),
+                ENGINE_CSV_FALLBACK,
+            )
+        finally:
+            shutil.rmtree(converted_path.parent, ignore_errors=True)
+    if kind == "pdf":
+        converted_path = _run_libreoffice_convert(path, filename, "pdf", engine=ENGINE_PDF_FALLBACK)
+        try:
+            text, _pdf_engine = _convert_pdf(converted_path, filename)
+            return text, ENGINE_PDF_FALLBACK
+        finally:
+            shutil.rmtree(converted_path.parent, ignore_errors=True)
+    raise ConversionError(filename, "no rescue fallback available for this file type", engine=ENGINE_MARKITDOWN)
+
+
+def _convert_markitdown_with_rescue(
+    path: Path, filename: str, suffix: str, *, max_chars: int, pre_resaved: bool
+) -> tuple[str, str, str]:
+    """Try markitdown; on a genuine backend failure for a rescuable suffix,
+    escalate through the rescue chain instead of failing outright.
+
+    ``pre_resaved`` is ``True`` only when the caller (:func:`_convert_legacy
+    _office`) already ran this exact file through ONE LibreOffice resave
+    before calling here — in that case rung 1 (a SECOND resave-and-retry,
+    into the SAME already-resaved format) is skipped as redundant and a
+    failure escalates straight to rung 2. For the direct route (``.xlsx``/
+    ``.pptx``/``.docx``, ``pre_resaved=False``) both rungs are tried in
+    order.
+
+    Never rescues :class:`UnsupportedConversionFormat` (no backend was even
+    attempted — see that class's docstring) or :class:`MissingConversion
+    Dependency` for markitdown itself (installing LibreOffice cannot fix a
+    missing markitdown): both propagate immediately, unrescued.
+
+    Returns ``(markdown, engine, rescue)``. When every rung fails, raises a
+    single :class:`ConversionError` whose message concatenates EACH rung's
+    own last error text (not just the first failure) — see
+    ``docs/sharepoint-extraction.md`` for why: the next reconciliation pass
+    needs to name the reason, and "could not convert" alone does not.
+    """
+    base_engine = ENGINE_LIBREOFFICE_MARKITDOWN if pre_resaved else ENGINE_MARKITDOWN
+    try:
+        text = _convert_markitdown(path, filename)
+        return text, base_engine, ""
+    except (UnsupportedConversionFormat, MissingConversionDependency):
+        raise
+    except ConversionError as first_exc:
+        if suffix not in RESCUE_FALLBACK_KIND:
+            raise
+        errors = [f"markitdown: {first_exc}"]
+
+        if not pre_resaved and suffix in RESCUE_RESAVE_TARGETS:
+            try:
+                resaved_path = _run_libreoffice_convert(
+                    path, filename, RESCUE_RESAVE_TARGETS[suffix], engine=ENGINE_LIBREOFFICE_RESCUE
+                )
+            except ConversionError as resave_exc:
+                errors.append(f"libreoffice resave: {resave_exc}")
+            else:
+                try:
+                    text = _convert_markitdown(resaved_path, filename)
+                    return text, ENGINE_LIBREOFFICE_RESCUE, "libreoffice_resave"
+                except ConversionError as retry_exc:
+                    errors.append(f"libreoffice resave+retry: {retry_exc}")
+                finally:
+                    shutil.rmtree(resaved_path.parent, ignore_errors=True)
+
+        try:
+            text, engine = _rescue_fallback(path, filename, suffix, max_chars=max_chars, pre_resaved=pre_resaved)
+        except ConversionError as fallback_exc:
+            errors.append(f"{RESCUE_FALLBACK_KIND[suffix]} fallback: {fallback_exc}")
+            raise ConversionError(filename, " | ".join(errors), engine=base_engine) from first_exc
+        rescue = "csv_fallback" if engine == ENGINE_CSV_FALLBACK else "pdf_fallback"
+        return text, engine, rescue
 
 
 # ---------------------------------------------------------------------- pdf
@@ -566,6 +947,17 @@ def _convert_pdf(path: Path, filename: str, *, source_path: str | None = None) -
 # ------------------------------------------------------------------ helpers
 
 
+def _file_size(path: Path) -> int:
+    """Best-effort file size in bytes — ``0`` on any ``OSError`` (a file the
+    earlier ``path.is_file()`` check already proved exists ought never fail
+    here, but this is a routing decision, not the conversion itself, so it
+    must never be where a crawl's error surfaces)."""
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
 def _normalize_newlines(text: str) -> str:
     """PDFium hands back CRLF; markdown downstream assumes LF."""
     return text.replace("\r\n", "\n").replace("\r", "\n")
@@ -591,10 +983,17 @@ __all__ = [
     "MissingConversionDependency",
     "UnsupportedConversionFormat",
     "convert_to_markdown",
+    "conversion_budget_seconds",
     "DEFAULT_MAX_CHARS",
     "PAGE_BREAK",
     "PASSTHROUGH_SUFFIXES",
     "LEGACY_OFFICE_SUFFIXES",
     "LEGACY_OFFICE_TARGETS",
     "LIBREOFFICE_TIMEOUT_SECONDS",
+    "RESCUE_RESAVE_TARGETS",
+    "RESCUE_FALLBACK_KIND",
+    "LARGE_XLSX_STREAMING_THRESHOLD_BYTES",
+    "CONVERSION_BUDGET_BASE_SECONDS",
+    "CONVERSION_BUDGET_PER_MB_SECONDS",
+    "CONVERSION_BUDGET_MAX_SECONDS",
 ]

@@ -119,15 +119,22 @@ class FakeIngestor:
 
     instances: List["FakeIngestor"] = []
     _collection_of: Dict[str, str] = {}
+    #: stable_id -> (collection_id, path, filename) as last recorded by
+    #: `ingest()` — what `rename()` compares an "already unchanged" item's
+    #: CURRENT path/filename against, mirroring the real `_Ingestor.rename`'s
+    #: read of the persisted `corpus_files` row.
+    _location_of: Dict[str, tuple] = {}
 
     @classmethod
     def reset(cls) -> None:
         cls.instances.clear()
         cls._collection_of.clear()
+        cls._location_of.clear()
 
     def __init__(self) -> None:
         self.ingested: List[Dict[str, Any]] = []
         self.deleted: List[str] = []
+        self.renamed: List[Dict[str, Any]] = []
         FakeIngestor.instances.append(self)
 
     def ingest(
@@ -152,13 +159,30 @@ class FakeIngestor:
         )
         was_new = stable_id not in FakeIngestor._collection_of
         FakeIngestor._collection_of[stable_id] = collection_id
+        FakeIngestor._location_of[stable_id] = (collection_id, path, filename)
         return f"file-{len(FakeIngestor._collection_of)}", was_new
 
     def delete(self, collection_id: str, stable_id: str) -> bool:
         if FakeIngestor._collection_of.get(stable_id) != collection_id:
             return False
         del FakeIngestor._collection_of[stable_id]
+        FakeIngestor._location_of.pop(stable_id, None)
         self.deleted.append(stable_id)
+        return True
+
+    def rename(self, *, collection_id: str, stable_id: str, path: str, filename: str) -> bool:
+        """Stands in for the real ``_Ingestor.rename`` — same contract:
+        False when nothing is resolved yet or the stored location already
+        matches, True (and the stored location updated) otherwise."""
+        current = FakeIngestor._location_of.get(stable_id)
+        if current is None or current[0] != collection_id:
+            return False
+        if current[1] == path and current[2] == filename:
+            return False
+        FakeIngestor._location_of[stable_id] = (collection_id, path, filename)
+        self.renamed.append(
+            {"collection_id": collection_id, "stable_id": stable_id, "path": path, "filename": filename}
+        )
         return True
 
 
@@ -514,6 +538,76 @@ class TestResume:
         assert FakeIngestor.instances[-1].ingested == []
         assert sum(1 for url in seen if url.endswith("/content")) == downloads_after_first
 
+    def test_a_renamed_item_with_unchanged_ctag_updates_the_path_without_downloading(self, crawl_env, monkeypatch):
+        """D.18: a rename/move keeps Graph's cTag stable, so the item still
+        counts as `already` — but its `name`/`parentReference.path` no
+        longer match the stored `corpus_files` row. The crawl must update
+        the row's path in place, count it as `renamed` (not `unchanged`),
+        and never re-download/re-convert/re-ingest it."""
+        item = {"name": "brief.docx", "parent_path": "/drives/b!drive1/root:/Reports"}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(
+                200,
+                json={
+                    "value": [_file_item(name=item["name"], parent_path=item["parent_path"])],
+                    "@odata.deltaLink": f"{DRIVE_DELTA}?t=1",
+                },
+            )
+
+        connection = _connection([_drive_scope()])
+        seen = _install_graph(monkeypatch, handler)
+        first = _run(connection, monkeypatch)
+        assert first["new"] == 1
+        downloads_after_first = sum(1 for url in seen if url.endswith("/content"))
+
+        # Same cTag (unchanged content), but moved to a new folder AND
+        # renamed — both `name` and `parentReference.path` differ.
+        item["name"] = "brief-renamed.docx"
+        item["parent_path"] = "/drives/b!drive1/root:/Reports/Archive"
+        second = _run(connection, monkeypatch)
+
+        assert second.get("renamed") == 1
+        assert second["unchanged"] == 0
+        assert second["new"] == 0 and second["changed"] == 0
+        # Never re-downloaded, converted, or re-ingested.
+        assert FakeIngestor.instances[-1].ingested == []
+        assert sum(1 for url in seen if url.endswith("/content")) == downloads_after_first
+        # `filename` is the SAME `<stem>.md` shape a fresh ingest would have
+        # stored (see `_prepare_document`'s "ok" branch) — never the raw
+        # source extension.
+        assert FakeIngestor.instances[-1].renamed == [
+            {
+                "collection_id": "col1",
+                "stable_id": "graph:item1",
+                "path": "Reports/Archive/brief-renamed.docx",
+                "filename": "brief-renamed.md",
+            }
+        ]
+
+    def test_an_unrenamed_item_with_unchanged_ctag_writes_nothing(self, crawl_env, monkeypatch):
+        """The counterpart to the rename test above: an item whose cTag AND
+        path/name are both unchanged must stay a plain `unchanged` — no
+        rename write, no download."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        connection = _connection([_drive_scope()])
+        _install_graph(monkeypatch, handler)
+        first = _run(connection, monkeypatch)
+        assert first["new"] == 1
+
+        second = _run(connection, monkeypatch)
+
+        assert second.get("renamed") == 0
+        assert second["unchanged"] == 1
+        assert FakeIngestor.instances[-1].renamed == []
+
     def test_a_changed_ctag_re_ingests_the_same_stable_id(self, crawl_env, monkeypatch):
         ctag = {"value": "ctag-1"}
 
@@ -670,6 +764,132 @@ class TestIngestorRejectedRaisesInsteadOfStranding:
         )
         assert file_id == "cf_1"
         assert was_new is True
+
+
+class TestIngestTransientRetry:
+    """``_ingest_with_retry`` (TCRD-296 C.11) — a bounded retry around
+    ``_Ingestor.ingest`` for a TRANSIENT infrastructure fault (a
+    connection-pool timeout, a dropped connection, a deadlock) only. Every
+    test here monkeypatches ``crawler._ingest_retry_sleep`` to a no-op so
+    the retry BOUNDS are asserted without spending real seconds.
+    """
+
+    def test_a_transient_error_is_retried_then_succeeds(self, monkeypatch):
+        import sqlalchemy as sa
+
+        calls = {"n": 0}
+
+        class FlakyIngestor(FakeIngestor):
+            def ingest(self, **kwargs):
+                calls["n"] += 1
+                if calls["n"] < 3:
+                    raise sa.exc.TimeoutError("QueuePool limit of size 5 reached, connection timed out")
+                return super().ingest(**kwargs)
+
+        sleeps: List[float] = []
+        monkeypatch.setattr(crawler, "_ingest_retry_sleep", sleeps.append)
+
+        ingestor = FlakyIngestor()
+        file_id, was_new = crawler._ingest_with_retry(
+            ingestor,
+            collection_id="col1",
+            stable_id="graph:item1",
+            path="Reports/doc.md",
+            filename="doc.md",
+            markdown="body",
+            source_sha256="deadbeef",
+        )
+
+        assert calls["n"] == 3
+        assert was_new is True
+        assert file_id
+        # Two retries before the third (successful) attempt — bounded
+        # backoff, never a fixed sleep.
+        assert len(sleeps) == 2
+        assert all(0 <= s <= crawler._INGEST_RETRY_MAX_S + 1 for s in sleeps)
+
+    def test_a_non_transient_error_raises_on_the_first_attempt(self, monkeypatch):
+        calls = {"n": 0}
+
+        class BrokenIngestor(FakeIngestor):
+            def ingest(self, **kwargs):
+                calls["n"] += 1
+                raise RuntimeError("ingest_file rejected doc.docx: NUL byte")
+
+        sleeps: List[float] = []
+        monkeypatch.setattr(crawler, "_ingest_retry_sleep", sleeps.append)
+
+        with pytest.raises(RuntimeError, match="NUL byte"):
+            crawler._ingest_with_retry(
+                BrokenIngestor(),
+                collection_id="col1",
+                stable_id="graph:item1",
+                path="Reports/doc.md",
+                filename="doc.md",
+                markdown="body",
+                source_sha256="deadbeef",
+            )
+
+        assert calls["n"] == 1
+        assert sleeps == []
+
+    def test_a_transient_error_that_never_clears_is_raised_after_exhausting_attempts(self, monkeypatch):
+        import sqlalchemy as sa
+
+        calls = {"n": 0}
+
+        class AlwaysFlakyIngestor(FakeIngestor):
+            def ingest(self, **kwargs):
+                calls["n"] += 1
+                raise sa.exc.TimeoutError("QueuePool limit of size 5 reached, connection timed out")
+
+        sleeps: List[float] = []
+        monkeypatch.setattr(crawler, "_ingest_retry_sleep", sleeps.append)
+
+        with pytest.raises(sa.exc.TimeoutError):
+            crawler._ingest_with_retry(
+                AlwaysFlakyIngestor(),
+                collection_id="col1",
+                stable_id="graph:item1",
+                path="Reports/doc.md",
+                filename="doc.md",
+                markdown="body",
+                source_sha256="deadbeef",
+            )
+
+        assert calls["n"] == crawler._INGEST_RETRY_ATTEMPTS
+        assert len(sleeps) == crawler._INGEST_RETRY_ATTEMPTS - 1
+
+    def test_full_crawl_survives_a_transient_pool_hiccup(self, crawl_env, monkeypatch):
+        """End-to-end: a crawl whose ingest step hits a transient error
+        TWICE still lands the document as ``new`` — never `ingest_failed` —
+        because the retry absorbs it before `_process_item`'s own
+        exception handler ever sees it."""
+        import sqlalchemy as sa
+
+        calls = {"n": 0}
+
+        class FlakyIngestor(FakeIngestor):
+            def ingest(self, **kwargs):
+                calls["n"] += 1
+                if calls["n"] <= 2:
+                    raise sa.exc.TimeoutError("QueuePool limit of size 5 reached, connection timed out")
+                return super().ingest(**kwargs)
+
+        monkeypatch.setattr(crawler, "_Ingestor", FlakyIngestor)
+        monkeypatch.setattr(crawler, "_ingest_retry_sleep", lambda seconds: None)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        _install_graph(monkeypatch, handler)
+        report = _run(_connection([_drive_scope()]), monkeypatch)
+
+        assert report["new"] == 1
+        assert report["errors"] == 0
+        assert calls["n"] == 3
 
 
 # --------------------------------------------------------------------------
@@ -1188,6 +1408,56 @@ class TestAnonymizeFailClosed:
             "REDACTED[Client Files]/REDACTED[Northwind Deal]/REDACTED[Northwind Logistics Merger Brief].docx"
         )
         assert row["filename"] == "REDACTED[Northwind Logistics Merger Brief].md"
+
+    def test_a_renamed_item_on_an_anonymized_scope_updates_the_redacted_path_too(self, crawl_env, monkeypatch):
+        """D.18's rename gate runs `_anonymize_identity` on an anonymize-
+        marked scope's unchanged item — same deterministic stub as the test
+        above, so a real rename (new raw name/path) produces a DIFFERENT
+        redacted identity, proving the gate re-derives it rather than
+        reusing whatever was stored the first time (which would leave the
+        OLD redacted path stale, defeating the whole point of D.18 on an
+        anonymized scope)."""
+        monkeypatch.setattr(
+            crawler,
+            "anonymize_markdown",
+            lambda text, *, key, detector=None: AnonymizeResult(f"REDACTED[{text}]"),
+        )
+        item = {"name": "brief.docx", "parent_path": "/drives/b!drive1/root:/Reports"}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(
+                200,
+                json={
+                    "value": [_file_item(name=item["name"], parent_path=item["parent_path"])],
+                    "@odata.deltaLink": f"{DRIVE_DELTA}?t=1",
+                },
+            )
+
+        connection = _connection([_drive_scope(anonymize=True)])
+        seen = _install_graph(monkeypatch, handler)
+        first = _run(connection, monkeypatch)
+        assert first["new"] == 1
+        downloads_after_first = sum(1 for url in seen if url.endswith("/content"))
+        first_row = FakeIngestor.instances[-1].ingested[0]
+        assert first_row["path"] == "REDACTED[Reports]/REDACTED[brief].docx"
+
+        item["name"] = "brief-renamed.docx"
+        second = _run(connection, monkeypatch)
+
+        assert second.get("renamed") == 1
+        assert second["unchanged"] == 0
+        assert FakeIngestor.instances[-1].ingested == []  # no re-download/re-convert/re-ingest
+        assert sum(1 for url in seen if url.endswith("/content")) == downloads_after_first
+        assert FakeIngestor.instances[-1].renamed == [
+            {
+                "collection_id": "col1",
+                "stable_id": "graph:item1",
+                "path": "REDACTED[Reports]/REDACTED[brief-renamed].docx",
+                "filename": "REDACTED[brief-renamed].md",
+            }
+        ]
 
     def test_an_anonymized_scope_leaks_no_fragment_of_the_real_name_through_the_real_anonymizer(
         self, crawl_env, monkeypatch
@@ -3158,6 +3428,56 @@ class TestResolveMinModified:
     def test_a_blank_connection_override_is_unfiltered(self):
         connection = {"id": "conn1", "config": {"extraction": {"crawl": {"min_modified": ""}}}}
         assert crawler.resolve_min_modified(connection) == (None, "none")
+
+
+class TestIsValidCrawlSchedule:
+    """``crawler.is_valid_crawl_schedule`` — D.16's per-connection sweep
+    cadence, sharing its grammar with ``src.scheduler.is_valid_schedule``
+    (the SAME syntax ``extraction.schedule`` uses instance-wide) plus the
+    two sentinels ``off``/``instance``."""
+
+    @pytest.mark.parametrize(
+        "value",
+        ["off", "instance", "every 15m", "every 6h", "daily 03:00", "daily 07:00,13:00", "cron 0 3 * * *"],
+    )
+    def test_accepts_the_sentinels_and_every_scheduler_grammar_form(self, value):
+        assert crawler.is_valid_crawl_schedule(value) is True
+
+    @pytest.mark.parametrize("value", [None, "", "  ", "sometimes", "every 6 hours", "daily 25:00", "OFF"])
+    def test_rejects_anything_else(self, value):
+        assert crawler.is_valid_crawl_schedule(value) is False
+
+
+class TestResolveCrawlSchedule:
+    """``crawler.resolve_crawl_schedule`` — unlike ``resolve_min_modified``
+    this ALWAYS resolves to something usable: absent/invalid falls back to
+    ``CRAWL_SCHEDULE_INSTANCE``, the "follow the instance-wide sweep" default,
+    never to "no schedule at all"."""
+
+    def test_no_connection_follows_the_instance_default(self):
+        assert crawler.resolve_crawl_schedule(None) == ("instance", "default")
+
+    def test_a_connection_that_sets_nothing_follows_the_instance_default(self):
+        connection = {"id": "conn1", "config": {}}
+        assert crawler.resolve_crawl_schedule(connection) == ("instance", "default")
+
+    def test_a_connection_override_off_is_honored(self):
+        connection = {"id": "conn1", "config": {"extraction": {"crawl": {"schedule": "off"}}}}
+        assert crawler.resolve_crawl_schedule(connection) == ("off", "connection")
+
+    def test_a_connection_override_interval_is_honored(self):
+        connection = {"id": "conn1", "config": {"extraction": {"crawl": {"schedule": "every 6h"}}}}
+        assert crawler.resolve_crawl_schedule(connection) == ("every 6h", "connection")
+
+    def test_an_invalid_connection_override_falls_back_to_instance_default_and_is_logged(self, caplog):
+        connection = {"id": "conn1", "config": {"extraction": {"crawl": {"schedule": "sometimes"}}}}
+        with caplog.at_level(logging.WARNING):
+            assert crawler.resolve_crawl_schedule(connection) == ("instance", "default")
+        assert "schedule" in caplog.text
+
+    def test_a_blank_connection_override_follows_the_instance_default(self):
+        connection = {"id": "conn1", "config": {"extraction": {"crawl": {"schedule": ""}}}}
+        assert crawler.resolve_crawl_schedule(connection) == ("instance", "default")
 
 
 class TestMinModifiedFilter:
@@ -5842,6 +6162,38 @@ class TestFactsStreaming:
         assert jobs[0]["id"] == existing["id"]
         assert any("not piling up" in r.getMessage() for r in caplog.records)
 
+    def test_an_active_provider_limit_condition_suppresses_the_streamed_enqueue(self, crawl_env, monkeypatch, caplog):
+        """TCRD-296 synthesis F.25, gaps #25/#48: before this check, a long
+        crawl crossing many ``stream_every`` thresholds while the provider
+        refuses every call kept enqueueing a fresh (doomed) pass at every
+        threshold — 161 failed job rows overnight in the live incident this
+        closes."""
+        self._enable_facts_switches(monkeypatch)
+        monkeypatch.setattr(
+            "connectors.sharepoint.facts_extraction.streamed_pass_suppressed_by_provider_limit",
+            lambda: {"reason": "workspace_limit", "provider": "anthropic"},
+        )
+
+        with caplog.at_level(logging.INFO, logger="connectors.sharepoint.crawler"):
+            crawler._enqueue_streamed_facts_pass("conn1")  # must not raise
+
+        from src.repositories import jobs_repo
+
+        assert jobs_repo().list(kind="sharepoint-facts-extraction") == []
+        assert any("provider_limit condition" in r.getMessage() for r in caplog.records)
+
+    def test_a_cleared_provider_limit_condition_lets_the_streamed_enqueue_through_again(self, crawl_env, monkeypatch):
+        self._enable_facts_switches(monkeypatch)
+        monkeypatch.setattr(
+            "connectors.sharepoint.facts_extraction.streamed_pass_suppressed_by_provider_limit", lambda: None
+        )
+
+        crawler._enqueue_streamed_facts_pass("conn1")
+
+        from src.repositories import jobs_repo
+
+        assert len(jobs_repo().list(kind="sharepoint-facts-extraction")) == 1
+
     def test_chained_tail_pass_skips_when_a_standalone_job_is_in_flight(self, crawl_env, monkeypatch, caplog):
         """Independent of ``stream_every``: an ALREADY in-flight standalone
         pass (a streamed enqueue or a manual trigger) makes the crawl's own
@@ -6209,7 +6561,7 @@ class TestActivityBookkeeping:
         stats.exit_item_activity(token, "Reports/a.docx", "new")
         snap = stats.activity_snapshot(phase="crawl")
         assert snap["current_path"] is None
-        assert snap["recent"] == [{"path": "Reports/a.docx", "outcome": "new"}]
+        assert snap["recent"] == [{"path": "Reports/a.docx", "outcome": "new", "rescue": ""}]
 
     def test_recent_is_capped_and_newest_first(self):
         stats = crawler.CrawlStats()

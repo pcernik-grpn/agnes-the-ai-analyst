@@ -1414,6 +1414,48 @@ def test_freshly_created_edge_endpoint_survives_a_concurrent_sweep(pg_env, repo,
     assert edge_count == 1
 
 
+def test_run_orphan_sweep_false_skips_the_per_batch_sweep(pg_env, repo, monkeypatch):
+    """TCRD-296 C.12: a multi-batch pass
+    (``connectors.sharepoint.facts_extraction._BatchShipper``) opts every
+    batch OUT of the per-call sweep — ``ingest_batch(run_orphan_sweep=
+    False)`` must not touch ``sweep_orphans()`` at all, leaving even a
+    genuinely stale orphan alone for the pass's own single end-of-pass
+    sweep to reap later."""
+    from src.repositories.facts_pg import FactsPgRepository
+
+    doc_id = _seed_ready_doc(pg_env)
+    stale_id = repo.create_fact(type="engagement", natural_key="engagement:stale-before-batch")
+    from src.db_pg import get_engine
+
+    with get_engine().begin() as conn:
+        conn.execute(
+            sa.text("UPDATE facts SET created_at = now() - interval '1 hour' WHERE id = :id"),
+            {"id": stale_id},
+        )
+
+    calls = {"n": 0}
+    real_sweep = FactsPgRepository.sweep_orphans
+
+    def _counting_sweep(self, **kwargs):
+        calls["n"] += 1
+        return real_sweep(self, **kwargs)
+
+    monkeypatch.setattr(FactsPgRepository, "sweep_orphans", _counting_sweep)
+
+    report = repo.ingest_batch(
+        nodes=[_node("person:jane-doe", doc_id, "engagement is underway")],
+        run_orphan_sweep=False,
+    )
+
+    assert calls["n"] == 0, "run_orphan_sweep=False must skip sweep_orphans() entirely"
+    assert report["subjects_deleted"] == 0
+    assert report["sweep_skipped"] is False
+
+    with get_engine().connect() as conn:
+        still_there = conn.execute(sa.text("SELECT 1 FROM facts WHERE id = :id"), {"id": stale_id}).scalar()
+    assert still_there == 1, "the stale orphan must survive — no sweep ran at all"
+
+
 # ---------------------------------------------------------------------------
 # Ingest E2E regression — shaped exactly like the live Run P failure: edges
 # whose dst is NEVER listed in nodes[] (endpoint-only, spec §7.0) must

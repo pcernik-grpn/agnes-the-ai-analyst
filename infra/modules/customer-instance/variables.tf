@@ -108,13 +108,18 @@ variable "prod_instance" {
     # `classic` is RETIRED and rejected below — same reasoning as ui_layout.
     experience = optional(string, "")
     # Container memory caps written to /opt/agnes/.env and read by
-    # docker-compose.yml (mem_limit: $${AGNES_APP_MEM_LIMIT:-4g}). Defaults
-    # match the compose defaults; raise on a larger VM together with the
-    # app's per-connection DuckDB budgets (DuckDB sizes a fresh connection
-    # to ~80% of the cgroup limit, so an under-sized cap OOM-kills uvicorn
-    # mid-WAL-write).
-    app_mem_limit       = optional(string, "4g")
-    scheduler_mem_limit = optional(string, "2g")
+    # docker-compose.yml (mem_limit: $${AGNES_APP_MEM_LIMIT:-4g}). "auto"
+    # (the default, TCRD-296) defers sizing to the box the startup script
+    # actually boots on: app = clamp(RAM/8, 4 GiB, 32 GiB), scheduler =
+    # 2 GiB fixed — re-derived from /proc/meminfo on EVERY boot, so a VM
+    # recreate never regresses to a laptop-sized literal. A live 64-vCPU/
+    # 251GB VM ran a fixed 4g app cap and was OOM-killed four times serving
+    # DuckDB queries before this existed. Set an explicit value ("8g") to
+    # override "auto" outright; do so together with the app's per-connection
+    # DuckDB budgets (DuckDB sizes a fresh connection to ~80% of the cgroup
+    # limit, so an under-sized cap OOM-kills uvicorn mid-WAL-write).
+    app_mem_limit       = optional(string, "auto")
+    scheduler_mem_limit = optional(string, "auto")
     # Container CPU caps written to /opt/agnes/.env and read by
     # docker-compose.yml (cpus: $${AGNES_APP_CPUS:-2.0}). Raise app_cpus on
     # hosts with more cores (e.g. "3.0" on a 4-core VM) for headroom under
@@ -206,14 +211,15 @@ variable "prod_instance" {
     # already run the Postgres app-state backend and boots refuse loudly on a
     # DuckDB instance — deliberate: migrate the backend first, then flip this.
     extraction_worker_enabled = optional(bool, false)
-    # Worker container resource ceilings, written to /opt/agnes/.env like
-    # kai_agent_mem_limit above (TF fields, not .env hand-edits — the startup
-    # script rewrites .env from scratch on every boot). Defaults mirror the
-    # base compose's own AGNES_EXTRACTION_WORKER_MEM_LIMIT/_CPUS fallbacks
-    # (docker-compose.yml) — the worker runs the extraction pipeline
-    # in-process (document download + conversion + LLM calls), hence beefier
-    # than the kai engine's.
-    extraction_worker_mem_limit = optional(string, "4g")
+    # Worker container resource ceiling, written to /opt/agnes/.env like
+    # kai_agent_mem_limit above (TF field, not a .env hand-edit — the startup
+    # script rewrites .env from scratch on every boot). "auto" (the default,
+    # TCRD-296) derives RAM * 0.6, capped so app + worker + an 8 GiB
+    # headroom (Postgres + host) never exceeds the VM's actual RAM, floored
+    # at 4 GiB — the worker runs the extraction pipeline in-process (document
+    # download + conversion + LLM calls), hence beefier than the kai
+    # engine's. Set an explicit value ("8g") to override outright.
+    extraction_worker_mem_limit = optional(string, "auto")
     extraction_worker_cpus      = optional(string, "2.0")
     # Web-chat provider pin, written as AGNES_CHAT_PROVIDER into the app .env
     # (app >= 0.85: env > instance.yaml > default; "kai-agent" since 0.88).
@@ -403,9 +409,9 @@ variable "dev_instances" {
     # caller-supplied `role = "stage"` would never reach the merge() below
     # if the type omits it.
     role = optional(string, "dev")
-    # See prod_instance for the rationale; same defaults.
-    app_mem_limit       = optional(string, "4g")
-    scheduler_mem_limit = optional(string, "2g")
+    # See prod_instance for the rationale; same defaults ("auto").
+    app_mem_limit       = optional(string, "auto")
+    scheduler_mem_limit = optional(string, "auto")
     app_cpus            = optional(string, "2.0")
     scheduler_cpus      = optional(string, "1.0")
     dispatcher_enabled  = optional(bool, false)
@@ -426,10 +432,10 @@ variable "dev_instances" {
     # rationale; same default, inert without kai_agent_enabled.
     kai_agent_broker_mcp_enabled = optional(bool, false)
     # Opt-in extraction lane (Redis coordination + extraction-worker) — see
-    # prod_instance for the full contract; same defaults, OFF by default so
-    # a module bump alone never moves existing VMs.
+    # prod_instance for the full contract; same defaults ("auto" mem limit),
+    # OFF by default so a module bump alone never moves existing VMs.
     extraction_worker_enabled   = optional(bool, false)
-    extraction_worker_mem_limit = optional(string, "4g")
+    extraction_worker_mem_limit = optional(string, "auto")
     extraction_worker_cpus      = optional(string, "2.0")
     # Web-chat provider pin (AGNES_CHAT_PROVIDER) — see prod_instance for the
     # rationale; same default (empty = no env line), same validations below.

@@ -150,4 +150,5 @@
 0096_users_kind
 0102_merge_users_kind_fts
 0103_crawl_shards
-0104_fact_collection_stats
+0104_extraction_conditions
+0105_fact_collection_stats

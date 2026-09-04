@@ -3204,6 +3204,63 @@ class TestExtractionRunDue:
         assert r.status_code == 200, r.text
         assert r.json()["dispatched"] == []
 
+    def test_a_connection_with_schedule_off_is_never_dispatched(self, seeded_app, monkeypatch):
+        """D.16: ``off`` is never picked up by the sweep, no matter how
+        often it runs or how long the connection has never crawled — the
+        one case that would otherwise ALWAYS dispatch (never-run-before, see
+        ``test_dispatches_a_connection_never_run_before`` above)."""
+        config = {
+            "sharepoint": {"enabled": True},
+            "extraction": {**_ENABLED_EXTRACTION_CONFIG["extraction"], "schedule": "every 15m"},
+        }
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(config))
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="due-schedule-off")
+        c.patch(
+            f"/api/admin/sharepoint/connections/{conn_id}/extraction/crawl-config",
+            json={"schedule": "off"},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+
+        r = c.post(self.RUN_DUE, headers=_auth(seeded_app["admin_token"]))
+
+        assert r.status_code == 200, r.text
+        assert r.json()["dispatched"] == []
+
+    def test_a_connections_own_interval_overrides_the_instance_cadence(self, seeded_app, monkeypatch):
+        """D.16: a connection with its own interval is due by ITS OWN
+        clock, not the instance-wide one — deterministic without freezing
+        time: the instance cadence (``every 24h``) is nowhere near due right
+        after the first dispatch, but the connection's own ``every 0m``
+        (``src.scheduler.is_table_due``: "always due") fires anyway."""
+        config = {
+            "sharepoint": {"enabled": True},
+            "extraction": {**_ENABLED_EXTRACTION_CONFIG["extraction"], "schedule": "every 24h"},
+        }
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(config))
+        c = seeded_app["client"]
+        conn_id = _create_connection(c, seeded_app["admin_token"], name="due-own-interval")
+
+        first = c.post(self.RUN_DUE, headers=_auth(seeded_app["admin_token"]))
+        assert first.json()["dispatched"] == [conn_id]
+
+        # Without an override, the SAME connection would now be skipped —
+        # the instance's `every 24h` just fired and is nowhere near due
+        # again. Confirms the control case before proving the override.
+        control = c.post(self.RUN_DUE, headers=_auth(seeded_app["admin_token"]))
+        assert control.json()["dispatched"] == []
+
+        c.patch(
+            f"/api/admin/sharepoint/connections/{conn_id}/extraction/crawl-config",
+            json={"schedule": "every 0m"},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+
+        r = c.post(self.RUN_DUE, headers=_auth(seeded_app["admin_token"]))
+
+        assert r.status_code == 200, r.text
+        assert r.json()["dispatched"] == [conn_id]
+
 
 class TestExcludedSubtreeAdvisory:
     """``_scope_out``'s advisory surface for the ``sharepoint-subtree-sweep``

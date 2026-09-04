@@ -316,33 +316,40 @@ class TestVertexRegionOverride:
     for the same reason: a retry-mode-only call must not silently pin (or
     unpin) a connection's Vertex region. Google enforces Claude-on-Vertex
     quotas PER REGION, so pinning different connections to different
-    regions raises the account's effective throughput."""
+    regions raises the account's effective throughput.
+
+    Every region literal here is one of the DOCUMENTED buckets in
+    `connectors.sharepoint.facts_extraction.VERTEX_REGION_MODEL_MATRIX` for
+    the instance's default (Haiku) model — TCRD-296 synthesis F.25 refuses
+    an undocumented region×model pairing with a 422, so a syntactically
+    valid but unlisted region (e.g. "europe-west4") is no longer accepted
+    here regardless of what this class is actually testing."""
 
     def test_setting_a_region_is_written_and_resolved_from_the_connection(self, seeded_app):
         client, token = seeded_app["client"], seeded_app["admin_token"]
         conn_id = _create_connection(client, token, name="corp-sharepoint-vertex-region-set")
 
         r = client.patch(
-            f"{BASE}/{conn_id}/extraction/facts-config", json={"vertex_region": "europe-west4"}, headers=_auth(token)
+            f"{BASE}/{conn_id}/extraction/facts-config", json={"vertex_region": "europe-west1"}, headers=_auth(token)
         )
 
         assert r.status_code == 200, r.text
-        assert r.json()["vertex_region"] == {"value": "europe-west4", "source": "connection"}
+        assert r.json()["vertex_region"] == {"value": "europe-west1", "source": "connection"}
         from src.repositories import source_connections_repo
 
         row = source_connections_repo().get(conn_id)
-        assert row["config"]["extraction"]["facts"]["vertex_region"] == "europe-west4"
+        assert row["config"]["extraction"]["facts"]["vertex_region"] == "europe-west1"
 
     def test_a_region_is_lowercased(self, seeded_app):
         client, token = seeded_app["client"], seeded_app["admin_token"]
         conn_id = _create_connection(client, token, name="corp-sharepoint-vertex-region-lowercase")
 
         r = client.patch(
-            f"{BASE}/{conn_id}/extraction/facts-config", json={"vertex_region": "US-EAST4"}, headers=_auth(token)
+            f"{BASE}/{conn_id}/extraction/facts-config", json={"vertex_region": "US-EAST5"}, headers=_auth(token)
         )
 
         assert r.status_code == 200, r.text
-        assert r.json()["vertex_region"] == {"value": "us-east4", "source": "connection"}
+        assert r.json()["vertex_region"] == {"value": "us-east5", "source": "connection"}
 
     def test_global_is_a_valid_region(self, seeded_app):
         client, token = seeded_app["client"], seeded_app["admin_token"]
@@ -358,23 +365,25 @@ class TestVertexRegionOverride:
     def test_a_retry_mode_only_patch_leaves_the_vertex_region_alone(self, seeded_app):
         client, token = seeded_app["client"], seeded_app["admin_token"]
         conn_id = _create_connection(client, token, name="corp-sharepoint-vertex-region-untouched")
-        client.patch(
-            f"{BASE}/{conn_id}/extraction/facts-config", json={"vertex_region": "asia-northeast1"}, headers=_auth(token)
+        set_resp = client.patch(
+            f"{BASE}/{conn_id}/extraction/facts-config", json={"vertex_region": "us-east5"}, headers=_auth(token)
         )
+        assert set_resp.status_code == 200, set_resp.text
 
         r = client.patch(f"{BASE}/{conn_id}/extraction/facts-config", json={"retry_mode": "off"}, headers=_auth(token))
 
         assert r.status_code == 200, r.text
         assert r.json()["retry_mode"] == {"value": "off", "source": "connection"}
-        assert r.json()["vertex_region"] == {"value": "asia-northeast1", "source": "connection"}
+        assert r.json()["vertex_region"] == {"value": "us-east5", "source": "connection"}
 
     def test_an_explicit_null_clears_the_vertex_region_override(self, seeded_app, monkeypatch):
         monkeypatch.setattr("connectors.llm.factory.vertex_config_or_none", lambda *a, **k: None)
         client, token = seeded_app["client"], seeded_app["admin_token"]
         conn_id = _create_connection(client, token, name="corp-sharepoint-vertex-region-clear")
-        client.patch(
-            f"{BASE}/{conn_id}/extraction/facts-config", json={"vertex_region": "asia-northeast1"}, headers=_auth(token)
+        set_resp = client.patch(
+            f"{BASE}/{conn_id}/extraction/facts-config", json={"vertex_region": "us-east5"}, headers=_auth(token)
         )
+        assert set_resp.status_code == 200, set_resp.text
 
         r = client.patch(
             f"{BASE}/{conn_id}/extraction/facts-config", json={"vertex_region": None}, headers=_auth(token)
@@ -408,3 +417,18 @@ class TestVertexRegionOverride:
         )
 
         assert r.status_code == 422
+
+    def test_a_region_with_no_quota_bucket_for_the_instances_model_is_refused(self, seeded_app):
+        """TCRD-296 synthesis F.25, live finding (b): a syntactically valid
+        region with no documented Claude-on-Vertex quota bucket for the
+        instance's configured (default: Haiku) model answers 429 on every
+        call — refused here instead of on the first live pass."""
+        client, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = _create_connection(client, token, name="corp-sharepoint-vertex-region-no-bucket")
+
+        r = client.patch(
+            f"{BASE}/{conn_id}/extraction/facts-config", json={"vertex_region": "asia-northeast1"}, headers=_auth(token)
+        )
+
+        assert r.status_code == 422
+        assert "no documented Claude-on-Vertex quota bucket" in r.json()["detail"]

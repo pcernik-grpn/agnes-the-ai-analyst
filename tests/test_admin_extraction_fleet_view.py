@@ -24,6 +24,7 @@ _SIGNATURES = (
     "function esc(s) {",
     "function detailMessage(body, fallback) {",
     "function fmtAgo(seconds) {",
+    "function fmtNextRun(iso) {",
     "function fmtRate(rate) {",
     "function fmtCost(usd) {",
     "function tokenTotals(usage) {",
@@ -38,6 +39,7 @@ _SIGNATURES = (
     "function actionsCell(row) {",
     "function renderRow(row) {",
     "function renderJobsStrip(jobs) {",
+    "function renderProviderLimitBanner(conditions) {",
 )
 
 
@@ -105,6 +107,16 @@ class FakeEl {
     return out["html"]
 
 
+def _run_facts_cell_js(facts: dict) -> str:
+    out = _run_node(
+        f"""
+const facts = {json.dumps(facts)};
+console.log(JSON.stringify({{ html: factsCell(facts) }}));
+"""
+    )
+    return out["html"]
+
+
 _ROW = {
     "connection_id": "sp1",
     "connection_name": "Legal SharePoint",
@@ -147,6 +159,42 @@ def test_no_run_at_all_renders_no_age_filter_note():
     row["run"] = None
     html = _run_row_js(row)
     assert "filtered by age" not in html
+
+
+# ---------------------------------------------------------------------------
+# factsCell — orphans_swept (TCRD-296 C.12): the pass's own single
+# end-of-pass sweep count, surfaced only for a FINISHED pass and only when
+# there was something to report.
+# ---------------------------------------------------------------------------
+
+
+def test_facts_cell_shows_orphans_swept_for_a_finished_pass():
+    html = _run_facts_cell_js({"docs_done": 40, "docs_total": 40, "phase_active": False, "orphans_swept": 3})
+    assert "3 orphans swept" in html
+
+
+def test_facts_cell_uses_singular_for_one_orphan_swept():
+    html = _run_facts_cell_js({"docs_done": 40, "docs_total": 40, "phase_active": False, "orphans_swept": 1})
+    assert "1 orphan swept" in html
+    assert "1 orphans swept" not in html
+
+
+def test_facts_cell_omits_the_swept_note_when_nothing_was_swept():
+    html = _run_facts_cell_js({"docs_done": 40, "docs_total": 40, "phase_active": False, "orphans_swept": 0})
+    assert "swept" not in html
+
+
+def test_facts_cell_omits_the_swept_note_when_the_field_is_unset():
+    """A run report from BEFORE this field existed (or a connection that
+    never reached facts) must render exactly as it did before — no
+    `undefined`/`null` leaking into the cell."""
+    html = _run_facts_cell_js({"docs_done": 40, "docs_total": 40, "phase_active": False})
+    assert "swept" not in html
+
+
+def test_facts_cell_omits_the_swept_note_while_the_pass_is_still_running():
+    html = _run_facts_cell_js({"docs_done": 10, "docs_total": 40, "phase_active": True, "orphans_swept": 5})
+    assert "swept" not in html
 
 
 # ---------------------------------------------------------------------------
@@ -319,6 +367,88 @@ console.log(JSON.stringify({ html: _el.innerHTML }));
 """
     )
     assert "starved" not in out["html"]
+
+
+# ---------------------------------------------------------------------------
+# Fleet-level provider-refusal banner (TCRD-296 synthesis F.25, gaps
+# #25/#48) — one strip per active `provider_limit` condition off the
+# fleet payload's own `conditions` list.
+# ---------------------------------------------------------------------------
+
+
+def test_provider_limit_banner_hides_itself_when_there_are_no_conditions():
+    out = _run_node(
+        """
+const _el = { hidden: false, innerHTML: "x" };
+const document = {
+  getElementById: () => _el,
+  createElement: () => ({ _t: "", set textContent(v) { this._t = v == null ? "" : String(v); }, get innerHTML() { return this._t; } }),
+};
+renderProviderLimitBanner([]);
+console.log(JSON.stringify({ hidden: _el.hidden, html: _el.innerHTML }));
+"""
+    )
+    assert out["hidden"] is True
+    assert out["html"] == ""
+
+
+def test_provider_limit_banner_names_the_provider_and_message():
+    out = _run_node(
+        """
+const _el = { hidden: true, innerHTML: "" };
+const document = {
+  getElementById: () => _el,
+  createElement: () => ({ _t: "", set textContent(v) { this._t = v == null ? "" : String(v); }, get innerHTML() { return this._t; } }),
+};
+renderProviderLimitBanner([
+  { provider: "anthropic", reason: "workspace_limit", message: "workspace usage limit hit", retry_after_s: null },
+]);
+console.log(JSON.stringify({ hidden: _el.hidden, html: _el.innerHTML }));
+"""
+    )
+    assert out["hidden"] is False
+    assert "Facts extraction paused" in out["html"]
+    assert "anthropic" in out["html"]
+    assert "workspace usage limit hit" in out["html"]
+
+
+def test_provider_limit_banner_names_model_and_region_when_present():
+    out = _run_node(
+        """
+const _el = { hidden: true, innerHTML: "" };
+const document = {
+  getElementById: () => _el,
+  createElement: () => ({ _t: "", set textContent(v) { this._t = v == null ? "" : String(v); }, get innerHTML() { return this._t; } }),
+};
+renderProviderLimitBanner([
+  { provider: "vertex", model: "claude-sonnet-4-6", region: "us-east5", reason: "quota_exceeded",
+    message: "Quota exceeded", retry_after_s: 120 },
+]);
+console.log(JSON.stringify({ html: _el.innerHTML }));
+"""
+    )
+    assert "claude-sonnet-4-6" in out["html"]
+    assert "us-east5" in out["html"]
+    assert "retrying in 2m" in out["html"]
+
+
+def test_provider_limit_banner_renders_one_line_per_condition():
+    out = _run_node(
+        """
+const _el = { hidden: true, innerHTML: "" };
+const document = {
+  getElementById: () => _el,
+  createElement: () => ({ _t: "", set textContent(v) { this._t = v == null ? "" : String(v); }, get innerHTML() { return this._t; } }),
+};
+renderProviderLimitBanner([
+  { provider: "anthropic", reason: "workspace_limit", message: "m1", retry_after_s: null },
+  { provider: "vertex", reason: "quota_exceeded", message: "m2", retry_after_s: null },
+]);
+console.log(JSON.stringify({ html: _el.innerHTML }));
+"""
+    )
+    assert "m1" in out["html"]
+    assert "m2" in out["html"]
 
 
 # ---------------------------------------------------------------------------

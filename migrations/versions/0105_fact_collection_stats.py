@@ -11,8 +11,8 @@ collection" and "how big is this collection" — kept current incrementally
 by ``FactsPgRepository.add_claim`` on the hot ingest path, and by a scoped
 ``rebuild_collection_stats()`` recompute on the bulk delete/reassign/merge/
 consolidation paths. See ``src/repositories/facts_pg.py``'s "Collection
-stats summary" section and ``docs/architecture.md`` -> "Fact graph
-collection-stats summary".
+stats summary" section and ``docs/api-reference.md`` -> "Collection-stats
+summary rebuild".
 
 This migration only CREATES the tables — it does not backfill existing
 claims. Backfilling ~2M rows grouped by collection inside a migration's own
@@ -27,8 +27,8 @@ to the pre-existing full-scan query (logged once) until that first rebuild
 populates them, so a delayed rebuild degrades to the old behavior rather
 than serving wrong answers.
 
-Revision ID: 0104_fact_collection_stats
-Revises: 0103_crawl_shards
+Revision ID: 0105_fact_collection_stats
+Revises: 0104_extraction_conditions
 Create Date: 2026-09-04
 """
 
@@ -39,8 +39,8 @@ from typing import Sequence, Union
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0104_fact_collection_stats"
-down_revision: Union[str, None] = "0103_crawl_shards"
+revision: str = "0105_fact_collection_stats"
+down_revision: Union[str, None] = "0104_extraction_conditions"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

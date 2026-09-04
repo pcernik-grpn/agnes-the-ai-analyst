@@ -482,7 +482,44 @@ function _extRenderCrawlFilter(row) {
     ? `Currently: files modified on/after ${value} (connection).`
     : "Currently: no filter — every file is crawled.";
   const label = _esc(row.name || row.id || "");
+
+  // D.16 — this connection's own scheduled-sweep cadence: "off" | "instance"
+  // (the default — follow extraction.schedule) | any other stored string is
+  // a CUSTOM cadence in the SAME grammar extraction.schedule itself uses
+  // ("every 6h", "daily 03:00", "cron 0 3 * * *"). Pre-filled straight off
+  // `row.config.extraction.crawl.schedule` — same "no extra round trip"
+  // reasoning `min_modified` above already uses; the server-resolved
+  // `next_run_at` hint is filled in lazily by the polling status fetch
+  // (`data_sources_extraction_observability.js::_extRenderNextRun`), not
+  // computable client-side (it needs the instance-wide cadence + "now").
+  const rawSchedule = typeof crawl.schedule === "string" ? crawl.schedule : "";
+  const scheduleSelectValue =
+    rawSchedule === "off" || rawSchedule === "" || rawSchedule === "instance" ? rawSchedule || "instance" : "custom";
+  const customSchedule = scheduleSelectValue === "custom" ? rawSchedule : "";
+  const scheduleStatusText =
+    rawSchedule && rawSchedule !== "instance"
+      ? `Currently: ${rawSchedule} (connection).`
+      : "Currently: following the instance-wide cadence.";
+
   return `
+  <div class="ds-src__fact">
+    <span class="ds-src__fact-k" title="This connection's own scheduled-sweep cadence (D.16). 'Off' is never picked up by the sweep, however often it runs. The instance-wide switch (extraction.schedule) still has to be configured for the sweep to run AT ALL — this only narrows which connections a running sweep picks and when.">Crawl schedule & filter</span>
+    <span class="ds-src__fact-v">
+      <select class="ds-dropdown-native" id="ds-sp-crawlschedule-select-${row.id}"
+              onchange="_extToggleCrawlScheduleInput('${row.id}')" aria-label="Crawl schedule for ${label}">
+        <option value="instance" ${scheduleSelectValue === "instance" ? "selected" : ""}>Follow instance cadence (default)</option>
+        <option value="off" ${scheduleSelectValue === "off" ? "selected" : ""}>Off — manual trigger only</option>
+        <option value="custom" ${scheduleSelectValue === "custom" ? "selected" : ""}>Custom cadence…</option>
+      </select>
+      <input type="text" class="ds-dropdown-native" id="ds-sp-crawlschedule-custom-${row.id}"
+             placeholder="every 6h, daily 03:00, cron 0 3 * * *" value="${_esc(customSchedule)}"
+             style="display:${scheduleSelectValue === "custom" ? "" : "none"}"
+             aria-label="Custom crawl cadence for ${label}">
+      <span class="field-hint" id="ds-sp-crawlschedule-status-${row.id}">${_esc(scheduleStatusText)}</span>
+      <span class="field-hint" id="ds-sp-crawlschedule-nextrun-${row.id}">Next run: —.</span>
+    </span>
+    <span class="ds-src__fact-a"><button type="button" class="btn btn-secondary" onclick="crawlScheduleSave('${row.id}')">Save schedule</button></span>
+  </div>
   <div class="ds-src__fact">
     <span class="ds-src__fact-k" title="Crawl only files modified on or after a date instead of the whole corpus — useful for a backfill. Sets extraction.crawl.min_modified for this connection; clearing it removes the filter, there is no instance-level default to fall back to.">Crawl filter</span>
     <span class="ds-src__fact-v">
@@ -1986,51 +2023,87 @@ async function saveSpFactsPolicy(id) {
   }
 }
 
-/* Saves/clears the "Crawl filter" control (`_extRenderCrawlFilter` above)
-   via `PATCH .../extraction/crawl-config`
-   (`app/api/admin_extraction.py::patch_extraction_crawl_config`). Moved
-   here from the "View configuration" drawer, not duplicated — same
-   endpoint, same request shape, only the DOM ids changed to match this
-   control's own home on the card. An empty Save is refused client-side
-   (Clear is the explicit way to remove a filter, never an implicit blank
-   Save); the response's resolved `{value, source}` lands in the status
-   line, never guessed beforehand, mirroring `saveSpFactsPolicy` above. */
-async function _crawlFilterPatch(id, minModified) {
-  const statusEl = document.getElementById(`ds-sp-crawlfilter-status-${id}`);
-  if (statusEl) statusEl.textContent = "Saving…";
+/* Saves/clears the "Crawl schedule & filter" panel's TWO independent
+   controls (`_extRenderCrawlFilter` above) via ONE shared `PATCH
+   .../extraction/crawl-config` (`app/api/admin_extraction.py::
+   patch_extraction_crawl_config`). Moved here from the "View
+   configuration" drawer, not duplicated — same endpoint, same request
+   shape, only the DOM ids changed to match this control's own home on the
+   card.
+
+   The endpoint's `min_modified` keeps its ORIGINAL "omitted == cleared"
+   contract even now that `schedule` (D.16) rides the same body — see that
+   handler's own docstring. So EVERY call here always sends BOTH fields:
+   whichever one the caller is actually changing, and the OTHER's current
+   value read straight off the in-memory `_connections` cache (never
+   omitted), exactly the way `cli/commands/admin_sharepoint.py::
+   crawl_config`'s GET-then-resend does for the same reason. Neither
+   control can silently clobber the other. */
+async function _crawlConfigPatch(id, { minModified, schedule } = {}) {
+  const conn = _connections.find((c) => c.id === id);
+  const crawlNow = ((conn && conn.config && conn.config.extraction) || {}).crawl || {};
+  const body = {
+    min_modified: minModified !== undefined ? minModified : (typeof crawlNow.min_modified === "string" ? crawlNow.min_modified : null),
+    schedule: schedule !== undefined ? schedule : (typeof crawlNow.schedule === "string" ? crawlNow.schedule : null),
+  };
+  const filterStatusEl = document.getElementById(`ds-sp-crawlfilter-status-${id}`);
+  const scheduleStatusEl = document.getElementById(`ds-sp-crawlschedule-status-${id}`);
+  const nextRunEl = document.getElementById(`ds-sp-crawlschedule-nextrun-${id}`);
+  const touchedFilter = minModified !== undefined;
+  const touchedSchedule = schedule !== undefined;
+  if (touchedFilter && filterStatusEl) filterStatusEl.textContent = "Saving…";
+  if (touchedSchedule && scheduleStatusEl) scheduleStatusEl.textContent = "Saving…";
   try {
     const r = await fetch(`/api/admin/sharepoint/connections/${encodeURIComponent(id)}/extraction/crawl-config`, {
       method: "PATCH",
       credentials: "include",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ min_modified: minModified }),
+      body: JSON.stringify(body),
     });
-    const body = await r.json().catch(() => ({}));
+    const respBody = await r.json().catch(() => ({}));
     if (r.ok) {
-      const mm = body.min_modified || {};
-      if (statusEl) {
-        statusEl.textContent = mm.value
+      const mm = respBody.min_modified || {};
+      const sched = respBody.schedule || {};
+      if (filterStatusEl) {
+        filterStatusEl.textContent = mm.value
           ? `Currently: files modified on/after ${mm.value} (${mm.source}).`
           : "Currently: no filter — every file is crawled.";
       }
-      showToast(mm.value ? `Crawl filter set to ${mm.value}.` : "Crawl filter cleared.", true);
+      if (scheduleStatusEl) {
+        scheduleStatusEl.textContent = sched.value && sched.value !== "instance"
+          ? `Currently: ${sched.value} (${sched.source}).`
+          : "Currently: following the instance-wide cadence.";
+      }
+      if (nextRunEl) {
+        nextRunEl.textContent = sched.next_run_at
+          ? `Next run: ${new Date(sched.next_run_at).toLocaleString()}.`
+          : "Next run: not scheduled.";
+      }
+      if (touchedFilter) {
+        showToast(mm.value ? `Crawl filter set to ${mm.value}.` : "Crawl filter cleared.", true);
+      }
+      if (touchedSchedule) {
+        showToast(`Crawl schedule set to ${sched.value}.`, true);
+      }
       // Keep the in-memory row current — a later `renderConnList()` (e.g.
-      // after `loadConnections()`) must redraw the just-saved override, not
-      // the value the page loaded with.
-      const conn = _connections.find((c) => c.id === id);
+      // after `loadConnections()`) must redraw the just-saved overrides,
+      // not the values the page loaded with.
       if (conn) {
         conn.config = conn.config || {};
         conn.config.extraction = conn.config.extraction || {};
         const crawl = { ...(conn.config.extraction.crawl || {}) };
-        if (minModified === null) delete crawl.min_modified; else crawl.min_modified = minModified;
+        if (body.min_modified === null) delete crawl.min_modified; else crawl.min_modified = body.min_modified;
+        if (body.schedule === null) delete crawl.schedule; else crawl.schedule = body.schedule;
         conn.config.extraction.crawl = crawl;
       }
     } else {
-      if (statusEl) statusEl.textContent = "";
-      showToast(detailMessage(body, "couldn't save the crawl filter"), false);
+      if (touchedFilter && filterStatusEl) filterStatusEl.textContent = "";
+      if (touchedSchedule && scheduleStatusEl) scheduleStatusEl.textContent = "";
+      showToast(detailMessage(respBody, "couldn't save the crawl schedule/filter"), false);
     }
   } catch (e) {
-    if (statusEl) statusEl.textContent = "";
+    if (touchedFilter && filterStatusEl) filterStatusEl.textContent = "";
+    if (touchedSchedule && scheduleStatusEl) scheduleStatusEl.textContent = "";
     showToast("Request failed.", false);
   }
 }
@@ -2042,13 +2115,38 @@ function crawlFilterSave(id) {
     showToast("Pick a date first, or use Clear to remove the filter.", false);
     return;
   }
-  _crawlFilterPatch(id, value);
+  _crawlConfigPatch(id, { minModified: value });
 }
 
 function crawlFilterClear(id) {
   const input = document.getElementById(`ds-sp-crawlfilter-date-${id}`);
   if (input) input.value = "";
-  _crawlFilterPatch(id, null);
+  _crawlConfigPatch(id, { minModified: null });
+}
+
+/* Shows/hides the free-text cadence input next to the "Crawl schedule"
+   select — only meaningful when "Custom cadence…" is picked, same pattern
+   `_extToggleVertexRegionInput` above uses for its own conditional field. */
+function _extToggleCrawlScheduleInput(id) {
+  const select = document.getElementById(`ds-sp-crawlschedule-select-${id}`);
+  const custom = document.getElementById(`ds-sp-crawlschedule-custom-${id}`);
+  if (!select || !custom) return;
+  custom.style.display = select.value === "custom" ? "" : "none";
+}
+
+function crawlScheduleSave(id) {
+  const select = document.getElementById(`ds-sp-crawlschedule-select-${id}`);
+  const custom = document.getElementById(`ds-sp-crawlschedule-custom-${id}`);
+  const picked = select && select.value;
+  let value = picked;
+  if (picked === "custom") {
+    value = (custom && custom.value || "").trim();
+    if (!value) {
+      showToast("Enter a cadence (e.g. 'every 6h', 'daily 03:00'), or pick a different option.", false);
+      return;
+    }
+  }
+  _crawlConfigPatch(id, { schedule: value });
 }
 
 function toggleSpCertRow(id) {

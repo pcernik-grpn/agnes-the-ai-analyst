@@ -29,6 +29,7 @@ from src.models.connections import ConnectionSecret, SourceConnection
 from src.models.data_apps import DataApp
 from src.models.data_packages import DataPackage, DataPackageTable, DataPackageTool
 from src.models.extraction import ExtractionRun
+from src.models.extraction_conditions import ExtractionCondition
 from src.models.fact_collection_stats import EdgeCollectionMembership, FactCollectionMembership, FactCollectionStats
 from src.models.facts import Claim, Correction, Edge, Fact, FactAlias, FactAliasSource, IngestRun
 from src.models.facts_llm_cache import FactsLlmCache
@@ -142,6 +143,7 @@ __all__ = [
     "DataPackageTool",
     "Edge",
     "EdgeCollectionMembership",
+    "ExtractionCondition",
     "ExtractionRun",
     "Fact",
     "FactAlias",

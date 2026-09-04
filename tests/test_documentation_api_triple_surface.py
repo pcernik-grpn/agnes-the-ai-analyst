@@ -245,6 +245,15 @@ _COHORT: dict[str, tuple[str, str]] = {
     "/api/jobs/{job_id}": ("admin jobs show", "admin_job_get"),
     # DuckLake analytics-backend migration (wave-2G Task 6).
     "/api/admin/analytics/migrate": ("admin analytics migrate", "admin_analytics_migrate"),
+    # Knowledge-artifact packaging (K3, #798). TCRD-296 synthesis C.15
+    # converted this endpoint from a synchronous run to a thin enqueue and
+    # gave it a real CLI + MCP surface for the first time — it used to be
+    # _EXEMPT ("no analyst CLI/MCP analogue"), which stopped being true.
+    "/api/admin/run-knowledge-packaging": ("admin knowledge packaging run", "admin_knowledge_packaging_run"),
+    "/api/admin/knowledge-packaging/status": (
+        "admin knowledge packaging status",
+        "admin_knowledge_packaging_status",
+    ),
     # Agent profiles (agent-api V1a, Task 12) — management list surface.
     # CLI `agnes agent list` + MCP `agent_list` both map to this GET.
     "/api/v1/agents": ("agent list", "agent_list"),
@@ -1643,15 +1652,12 @@ _EXEMPT: dict[str, str] = {
         "`agnes pull` (hash-verified, atomic promotion, pruned on de-authorization); "
         "no MCP/JSON analogue, mirrors the parquet /api/data/{table_id}/download channel"
     ),
-    "/api/admin/run-knowledge-packaging": (
-        "scheduler-driven knowledge-artifact rebuild trigger (K3, #798) — "
-        "admin/scheduler maintenance op, mirrors the run-corporate-memory "
-        "exemption; no analyst CLI/MCP analogue"
-    ),
     "/api/admin/run-knowledge-digests": (
         "scheduler-driven digest regeneration trigger (K4, #799) — admin/scheduler "
-        "maintenance op, mirrors the run-knowledge-packaging / run-corporate-memory "
-        "exemptions; no analyst CLI/MCP analogue"
+        "maintenance op, mirrors the run-corporate-memory exemption; no analyst "
+        "CLI/MCP analogue. Unlike its knowledge-packaging sibling (moved to "
+        "_COHORT by TCRD-296 synthesis C.15), this one still runs synchronously "
+        "and has not (yet) gained a CLI/MCP surface."
     ),
     "/api/knowledge/digests/{digest_id}/content": (
         "K4 maintained digests (#799) — digest markdown consumed by `agnes pull` "

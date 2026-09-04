@@ -145,6 +145,7 @@ class TestRegistration:
             "analytics-migrate",
             "distribution-mirror",
             "webhook-deliver",
+            "knowledge-packaging",
             "analytics-rebuild",
             "collections-purge",
             "corpus-extraction",

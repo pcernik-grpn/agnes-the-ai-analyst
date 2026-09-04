@@ -108,6 +108,13 @@
   Migrate it to see live extraction runs: <a href="/admin/database">Database backend</a>.
 </div>
 
+{# Fleet-level provider-refusal banner (TCRD-296 synthesis F.25) — one
+   strip per active `provider_limit` condition, rendered by
+   `renderProviderLimitBanner` in admin_extraction.js. Hidden whenever the
+   fleet payload's `conditions` list is empty (every instance before this
+   shipped, and forever on a DuckDB-backed one). #}
+<div id="ext-provider-limit-banner" class="apg-strip apg-strip--warn" role="status" hidden></div>
+
 <div class="fbar apg-bar" id="ext-toolbar" role="group" aria-label="Extraction fleet scope">
   <div class="ext-scope" role="group" aria-label="Scope">
     <a href="#" id="ext-scope-active" data-scope="active">Active</a>
@@ -158,13 +165,14 @@
         <th>Tokens in / out</th>
         <th>Est. cost</th>
         <th>Last checkpoint</th>
+        <th>Next run</th>
         <th>Error</th>
         <th>Actions</th>
         <th></th>
       </tr>
     </thead>
     <tbody id="ext-tbody">
-      <tr><td colspan="11" class="ext-blank">Loading…</td></tr>
+      <tr><td colspan="12" class="ext-blank">Loading…</td></tr>
     </tbody>
   </table>
 </div>

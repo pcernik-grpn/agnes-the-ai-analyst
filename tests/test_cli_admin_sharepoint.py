@@ -1480,7 +1480,7 @@ class TestCrawlConfig:
     def test_neither_flag_is_a_usage_error(self):
         result = runner.invoke(app, ["admin", "sharepoint", "crawl-config", "conn1"])
         assert result.exit_code == 1
-        assert "--min-modified or --clear" in result.output
+        assert "--min-modified" in result.output and "--schedule" in result.output
 
     def test_both_flags_is_a_usage_error(self):
         result = runner.invoke(
@@ -1524,6 +1524,75 @@ class TestCrawlConfig:
             )
         assert result.exit_code == 1
         assert "connection_not_found" in result.output
+
+    def test_schedule_alone_first_reads_the_current_min_modified_and_resends_it(self):
+        """D.16 — a ``--schedule``-only call must not silently clear an
+        already-set ``min_modified`` (the endpoint's own "omitted ==
+        cleared" contract, unchanged) — the CLI reads the connection's
+        current value first and resends it explicitly."""
+        get_body = {"id": "conn1", "config": {"extraction": {"crawl": {"min_modified": "2023-12-31"}}}}
+        patch_body = {
+            "connection_id": "conn1",
+            "min_modified": {"value": "2023-12-31", "source": "connection"},
+            "schedule": {"value": "every 6h", "source": "connection", "next_run_at": "2026-09-04T00:00:00+00:00"},
+        }
+        with (
+            patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(200, get_body)),
+            patch("cli.commands.admin_sharepoint.api_patch", return_value=_resp(200, patch_body)) as mock_patch,
+        ):
+            result = runner.invoke(app, ["admin", "sharepoint", "crawl-config", "conn1", "--schedule", "every 6h"])
+        assert result.exit_code == 0, result.output
+        assert "every 6h" in result.output and "next run" in result.output
+        _, kwargs = mock_patch.call_args
+        assert kwargs["json"] == {"min_modified": "2023-12-31", "schedule": "every 6h"}
+
+    def test_schedule_combined_with_min_modified_sends_both_in_one_call(self):
+        body = {
+            "connection_id": "conn1",
+            "min_modified": {"value": "2024-01-01", "source": "connection"},
+            "schedule": {"value": "off", "source": "connection", "next_run_at": None},
+        }
+        with patch("cli.commands.admin_sharepoint.api_patch", return_value=_resp(200, body)) as mock_patch:
+            result = runner.invoke(
+                app,
+                [
+                    "admin",
+                    "sharepoint",
+                    "crawl-config",
+                    "conn1",
+                    "--min-modified",
+                    "2024-01-01",
+                    "--schedule",
+                    "off",
+                ],
+            )
+        assert result.exit_code == 0, result.output
+        assert "not scheduled" in result.output
+        _, kwargs = mock_patch.call_args
+        assert kwargs["json"] == {"min_modified": "2024-01-01", "schedule": "off"}
+
+    def test_clear_combined_with_schedule_sends_a_null_min_modified(self):
+        body = {
+            "connection_id": "conn1",
+            "min_modified": {"value": None, "source": "none"},
+            "schedule": {"value": "instance", "source": "default", "next_run_at": None},
+        }
+        with patch("cli.commands.admin_sharepoint.api_patch", return_value=_resp(200, body)) as mock_patch:
+            result = runner.invoke(
+                app, ["admin", "sharepoint", "crawl-config", "conn1", "--clear", "--schedule", "instance"]
+            )
+        assert result.exit_code == 0, result.output
+        _, kwargs = mock_patch.call_args
+        assert kwargs["json"] == {"min_modified": None, "schedule": "instance"}
+
+    def test_an_invalid_schedule_server_side_400_is_reported(self):
+        with patch(
+            "cli.commands.admin_sharepoint.api_patch",
+            return_value=_resp(400, {"detail": "invalid_crawl_schedule"}),
+        ):
+            result = runner.invoke(app, ["admin", "sharepoint", "crawl-config", "conn1", "--schedule", "sometimes"])
+        assert result.exit_code == 1
+        assert "invalid_crawl_schedule" in result.output
 
 
 _FLEET_BODY = {
@@ -1601,6 +1670,21 @@ class TestFmtFactsBacklogSuffix:
 
         assert _fmt_facts(None) == "—"
 
+    def test_a_provider_limit_condition_wins_over_the_backlog_wording(self):
+        """TCRD-296 synthesis F.25 — same precedence the web fleet page's
+        own facts line takes."""
+        from cli.commands.admin_sharepoint import _fmt_facts
+
+        facts = {
+            "docs_done": None,
+            "facts_pending_documents": 12,
+            "facts_pass_running": False,
+            "provider_limit": {"provider": "anthropic", "reason": "workspace_limit"},
+        }
+        rendered = _fmt_facts(facts)
+        assert "paused: provider limit (anthropic)" in rendered
+        assert "backlog, not running" not in rendered
+
 
 class TestRuns:
     """`agnes admin sharepoint runs` — CLI counterpart to
@@ -1671,6 +1755,37 @@ class TestRuns:
             result = runner.invoke(app, ["admin", "sharepoint", "runs"])
         assert result.exit_code == 0, result.output
         assert "starved" in result.output
+
+    def test_an_active_provider_limit_condition_is_printed(self):
+        """TCRD-296 synthesis F.25 — the terminal counterpart to the fleet
+        web page's own banner."""
+        body = json.loads(json.dumps(_FLEET_BODY))
+        body["conditions"] = [
+            {
+                "provider": "anthropic",
+                "model": "claude-haiku-4-5-20251001",
+                "region": None,
+                "reason": "workspace_limit",
+                "message": "workspace usage limit hit",
+                "retry_after_s": None,
+            }
+        ]
+        with patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(200, body)):
+            result = runner.invoke(app, ["admin", "sharepoint", "runs"])
+        assert result.exit_code == 0, result.output
+        assert "Facts extraction paused" in result.output
+        assert "anthropic" in result.output
+        assert "workspace usage limit hit" in result.output
+
+    def test_a_body_with_no_conditions_key_prints_nothing_extra(self):
+        """An older server that has not shipped `conditions` yet must not
+        crash the command — the banner is simply absent."""
+        body = json.loads(json.dumps(_FLEET_BODY))
+        assert "conditions" not in body
+        with patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(200, body)):
+            result = runner.invoke(app, ["admin", "sharepoint", "runs"])
+        assert result.exit_code == 0, result.output
+        assert "Facts extraction paused" not in result.output
 
     def test_a_body_with_no_jobs_key_prints_no_strip(self):
         """An older server that has not shipped `jobs` yet must not crash

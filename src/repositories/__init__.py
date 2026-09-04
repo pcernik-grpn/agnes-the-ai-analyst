@@ -166,6 +166,8 @@ __all__ = [
     "facts_prompt_repo",
     # Built-in extraction run observability (2026-08-31 design §7.1)
     "extraction_runs_repo",
+    # Fleet-level provider-refusal conditions (TCRD-296 synthesis F.25)
+    "extraction_conditions_repo",
     # External SSO login (design 2026-08-28)
     "sso_config_repo",
     "user_external_identities_repo",
@@ -593,6 +595,12 @@ _REGISTRY: dict[str, dict[str, tuple[str, str]]] = {
     # cannot grow a mutable progress column); `job_id` joins the two.
     "extraction_runs": {
         PG: ("src.repositories.extraction_runs_pg", "ExtractionRunsPgRepository"),
+    },
+    # Fleet-level provider-refusal conditions the facts-extraction stage
+    # cannot retry its way past (TCRD-296 synthesis F.25) — PG-only, A3
+    # ratchet: no DuckDB backend.
+    "extraction_conditions": {
+        PG: ("src.repositories.extraction_conditions_pg", "ExtractionConditionsPgRepository"),
     },
     # External SSO login (design 2026-08-28) — PG-only, A3 ratchet: no
     # DuckDB backend. The singleton runtime config for the `sso` provider
@@ -1083,6 +1091,17 @@ def extraction_runs_repo() -> Any:
     last N runs' outcomes. PG-only — raises ``RequiresPostgresBackend`` on a
     DuckDB-backed instance."""
     return _build("extraction_runs")
+
+
+def extraction_conditions_repo() -> Any:
+    """Fleet-level provider-refusal conditions (workspace/usage-limit
+    exhaustion, a saturated region×model quota bucket, billing disabled)
+    that suppress further facts-extraction enqueues until they clear
+    (TCRD-296 synthesis F.25). PG-only — raises ``RequiresPostgresBackend``
+    on a DuckDB-backed instance; every caller in
+    ``connectors.sharepoint.facts_extraction`` treats that as "no
+    condition tracked here", never a hard failure."""
+    return _build("extraction_conditions")
 
 
 def sso_config_repo() -> Any:

@@ -225,13 +225,16 @@ class TestExtractionConfig:
     def test_vertex_region_row_reflects_a_connection_override(self, seeded_app):
         client, token = seeded_app["client"], seeded_app["admin_token"]
         conn_id = _create_connection(client, token, name="sp-config-vertex-region-override")
-        client.patch(
-            f"{BASE}/{conn_id}/extraction/facts-config", json={"vertex_region": "europe-west4"}, headers=_auth(token)
+        # A documented bucket for the instance's default (Haiku) model —
+        # see VERTEX_REGION_MODEL_MATRIX (TCRD-296 synthesis F.25).
+        patch_resp = client.patch(
+            f"{BASE}/{conn_id}/extraction/facts-config", json={"vertex_region": "europe-west1"}, headers=_auth(token)
         )
+        assert patch_resp.status_code == 200, patch_resp.text
         rows = client.get(f"{BASE}/{conn_id}/extraction/config", headers=_auth(token)).json()["effective"]
         by_key = {r["key"]: r for r in rows if r["key"]}
         region = by_key["extraction.facts.vertex_region"]
-        assert region["value"] == "europe-west4"
+        assert region["value"] == "europe-west1"
 
     def test_detector_defaults_to_regex_and_says_no_tokens_are_spent(self, seeded_app):
         client, token = seeded_app["client"], seeded_app["admin_token"]

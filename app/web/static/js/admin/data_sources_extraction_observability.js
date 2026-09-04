@@ -166,6 +166,16 @@ function _extFactsJobLine(job) {
    pending document (`0`/`null` say nothing, matching every other line's
    "absence is the honest answer" convention here). */
 function _extFactsPendingLine(status) {
+  // TCRD-296 synthesis F.25 — a fleet-level provider refusal wins over the
+  // ordinary "continuing"/"not running" wording: an operator seeing this
+  // needs to know WHY nothing is chasing the backlog, not just that
+  // nothing currently is (which "not running" alone would also say for an
+  // unrelated reason, e.g. the continuation chain hit its cap).
+  const limit = status && status.provider_limit;
+  if (limit) {
+    const provider = _extEsc(limit.provider || "provider");
+    return `<div class="ext-sub ext-warn">paused: provider limit (${provider} — ${_extEsc(limit.reason || "")})</div>`;
+  }
   const n = status && status.facts_pending_documents;
   if (n === null || n === undefined || n <= 0) return "";
   const continuing = !!status.facts_pass_running;
@@ -179,6 +189,7 @@ function _extRunLine(run) {
   if (run.new != null) bits.push(`${_extNum(run.new)} new`);
   if (run.changed != null) bits.push(`${_extNum(run.changed)} changed`);
   if (run.unchanged != null) bits.push(`${_extNum(run.unchanged)} unchanged`);
+  if (run.renamed) bits.push(`${_extNum(run.renamed)} renamed`);
   if (run.deleted) bits.push(`${_extNum(run.deleted)} deleted`);
   // `extraction.crawl.min_modified` age filter — so an operator can tell
   // mid-run whether the cutoff is doing anything, not only after the run
@@ -610,6 +621,7 @@ function _extRender(connId) {
     _extRenderCrawlCell(connId, null);
     _extRenderInAgnesButton(connId, null);
     _extRenderFactsButton(connId, null);
+    _extRenderNextRun(connId, null);
     return;
   }
 
@@ -632,6 +644,19 @@ function _extRender(connId) {
   _extRenderCrawlCell(connId, st.data);
   _extRenderInAgnesButton(connId, st.data);
   _extRenderFactsButton(connId, st.data);
+  _extRenderNextRun(connId, st.data);
+}
+
+/* D.16 — the "Crawl schedule & filter" panel's "next run" line
+   (`ds-sp-crawlschedule-nextrun-<connId>`, `data_sources_page.js::
+   _extRenderCrawlFilter`), refreshed on the SAME poll that already fetches
+   `extraction/status` (`_extFetchOne` below) — no extra request. A no-op
+   when the panel isn't in the DOM yet (a card not yet expanded/rendered). */
+function _extRenderNextRun(connId, status) {
+  const el = document.getElementById(`ds-sp-crawlschedule-nextrun-${connId}`);
+  if (!el) return;
+  const nextRunAt = status && status.next_run_at;
+  el.textContent = nextRunAt ? `Next run: ${new Date(nextRunAt).toLocaleString()}.` : "Next run: not scheduled.";
 }
 
 async function _extFetchOne(connId) {
