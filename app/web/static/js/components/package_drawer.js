@@ -362,100 +362,27 @@
         });
       }
     });
-    // The search lives in the picker now, so it is delegated: the modal is
-    // re-rendered on every tick and a listener bound to the input would die
-    // with it.
-    els.picker.addEventListener('input', function (e) {
-      if (!st) return;
-      if (e.target.getAttribute && e.target.getAttribute('data-ag-search') === 'pdw-tables') {
-        pickerQuery = e.target.value;
-        renderPickerRows();
-      }
-    });
+    /* The ACCESS picker keeps its own substring search: it is a flat list
+       of groups, not the registry tree, and the shared engine was never
+       mounted over it. Only the TABLE picker's private strip is retired
+       below. */
     els.picker.addEventListener('input', function (e) {
       var k = e.target.getAttribute && e.target.getAttribute('data-ag-search');
       if (k === 'pdw-access') filterAccessRows(e.target.value);
     });
-    els.picker.addEventListener('click', function (e) {
-      if (!st) return;
-      /* The Filter popover. Opened here rather than by FilterToolbar: the
-         engine does not drive this picker (see pickerControlsHtml), so the
-         one behaviour we do want from it is reimplemented, including the
-         click-outside close — a popover you can only shut with the button
-         that opened it is a trap. */
-      var fb = e.target.closest('[data-picker-filterbtn]');
-      var menu = els.picker.querySelector('#pdw-picker-menu');
-      if (fb) {
-        if (menu) {
-          menu.hidden = !menu.hidden;
-          fb.setAttribute('aria-expanded', menu.hidden ? 'false' : 'true');
-        }
-        return;
-      }
-      if (menu && !menu.hidden && !e.target.closest('#pdw-picker-menu')) {
-        menu.hidden = true;
-        var btn = els.picker.querySelector('[data-picker-filterbtn]');
-        if (btn) btn.setAttribute('aria-expanded', 'false');
-      }
-      var drop = e.target.closest('[data-picker-dropfacet]');
-      if (drop) {
-        var hook = drop.getAttribute('data-picker-dropfacet');
-        if (hook === 'unpackaged') pickerUnpackagedOnly = false;
-        else if (hook === 'selected') pickerSelectedOnly = false;
-        else pickerFacets[hook] = [];
-        renderPickerFiltered();
-        return;
-      }
-      if (e.target.closest('[data-picker-clear]')) {
-        resetPickerFilters();
-        renderPickerFiltered();
-        return;
-      }
-    });
+
+    /* No search or facet handlers here any more: the shared engine owns the
+       whole bar (see mountFbar). What used to live in this block — a
+       substring match, a row of pressed toggles and a Clear — was the fourth
+       private copy of it in the product. */
     els.picker.addEventListener('change', function (e) {
       if (!st) return;
-      /* Facet boxes first. They are `input[type=checkbox]` like the tree's own
-         boxes, and the branches below would read a table id or a group class
-         off them and find neither. */
-      var fbox = e.target.closest('[data-facet]');
-      if (fbox) {
-        var fkey = fbox.getAttribute('data-facet');
-        var fval = fbox.value;
-        var flist = pickerFacets[fkey] || [];
-        var fat = flist.indexOf(fval);
-        if (fat === -1) flist.push(fval); else flist.splice(fat, 1);
-        pickerFacets[fkey] = flist;
-        renderPickerFiltered();
-        return;
-      }
-      if (e.target.closest('[data-unpackaged]')) {
-        pickerUnpackagedOnly = !pickerUnpackagedOnly;
-        renderPickerFiltered();
-        return;
-      }
-      if (e.target.closest('[data-selected]')) {
-        pickerSelectedOnly = !pickerSelectedOnly;
-        renderPickerFiltered();
-        return;
-      }
-      var sortSel = e.target.closest('[data-picker-sort]');
-      if (sortSel) {
-        pickerSort = sortSel.value;
-        renderPickerRows();   // order only — the strip is unchanged
-        return;
-      }
       var box = e.target.closest('input[type="checkbox"]');
       if (!box) return;
       var id = box.getAttribute('data-table-id');
       if (id) {
         if (box.checked) st.tablesSelected.add(id); else st.tablesSelected.delete(id);
-        // Re-render so the group boxes above it re-tally — a bucket that reads
-        // "all" after one of its tables was unticked is worse than no summary.
-        renderPickerRows();
-        // …and the strip, whose "In this package" count just changed. Without
-        // this the toggle does not appear until something else redraws it, so
-        // the first tick looked like it did nothing.
-        renderPickerStrip();
+        absorbTick();
         return;
       }
       if (!box.classList.contains('pdw-grp__box')) return;
@@ -463,11 +390,20 @@
       // reads as unchecked to `.checked` — so a click on a partly-selected
       // group means "select the rest", never "clear it".
       var want = box.checked;
-      tablesUnder(box.getAttribute('data-project'), box.getAttribute('data-bucket')).forEach(function (t) {
-        if (want) st.tablesSelected.add(t.id); else st.tablesSelected.delete(t.id);
-      });
-      renderPickerRows();
-      renderPickerStrip();
+      /* Only what is VISIBLE. Under a filter the group's box means "the rows
+         I can see", not "everything this bucket holds" — ticking a Keboola
+         group while filtered to live-query tables must not silently add the
+         synced ones you had just filtered away. */
+      tablesUnder(box.getAttribute('data-project'), box.getAttribute('data-bucket'))
+        .filter(function (t) {
+          var el = els.picker.querySelector('[data-table-id="' + cssEscape(t.id) + '"]');
+          var row = el && el.closest('.pdw-tables__row');
+          return !row || !row.hidden;
+        })
+        .forEach(function (t) {
+          if (want) st.tablesSelected.add(t.id); else st.tablesSelected.delete(t.id);
+        });
+      absorbTick();
     });
     els.picker.addEventListener('click', function (e) {
       // A click on the group's checkbox must not also open/close the <details>
@@ -553,13 +489,13 @@
      is unticked. */
 
   function tableGroups() {
-    var q = (pickerQuery || '').trim().toLowerCase();
+    /* The WHOLE tree, always. Filtering used to happen here — rebuilding the
+       groups from a filtered set — and it belongs to the engine now: it hides
+       rows and empties sections in the DOM, which is also what keeps a ticked
+       box on a row you have filtered away. */
     var projects = [];
     var byProject = {};
     st.registry.forEach(function (t) {
-      if (q && (t.id + ' ' + (t.name || '') + ' ' + (t.bucket || '') + ' ' + (t.project || ''))
-                 .toLowerCase().indexOf(q) === -1) return;
-      if (!matchesFilters(t)) return;
       var pk = t.project || 'Other';
       if (!byProject[pk]) {
         byProject[pk] = { key: pk, label: pk, buckets: {}, order: [] };
@@ -574,7 +510,8 @@
     });
     projects.forEach(function (p) {
       p.order.sort();
-      p.order.forEach(function (bk) { sortTables(p.buckets[bk].tables); });
+      // Row order inside a bucket is the engine's sort; the bucket ORDER is
+      // structural and stays here.
     });
     projects.sort(function (a, b) { return a.label.localeCompare(b.label); });
     return projects;
@@ -591,77 +528,33 @@
   }
 
   /* Panel state: only what is in the package. */
-  var pickerQuery = '', pickerOpen = false, pickerKind = 'tables';
+  var pickerOpen = false, pickerKind = 'tables';
 
-  /* Picker state beyond the search box.
-
-     A substring match is not a way to work three hundred registered tables.
-     These four controls came from the add-tables drawer on the package's own
-     page, which was retired when writing a package moved to one surface — the
-     drawer's picker was the better one, so it moved here rather than dying
-     with it. What an admin actually slices by:
+  /* What an admin slices a registry by — the vocabulary, not the machinery.
+     The machinery is the product's shared engine now (filter_toolbar.js), so
+     none of this file holds filter state any more:
 
        · SOURCE and QUERY MODE — "the Keboola tables", "the live-query ones".
-         The tree's top level is the PROJECT (a source connection), so "every
-         BigQuery table across three projects" is not expressible by browsing.
+         The tree's top level is the PROJECT, so "every BigQuery table across
+         three projects" is not expressible by browsing alone.
+       · PROJECT — the same cut the tree makes, available as a filter so it
+         combines with the two above instead of forcing a scroll.
        · IN NO PACKAGE — the pile the product cares about most: a table in no
-         package reaches nobody. Server flag (`packaged` on the registry
-         response), because membership spans every OTHER package.
-       · SORT — within each bucket. The tree's grouping is the structure; this
-         is the order inside it, and "least recently synced first" is how you
-         find the rows that are quietly stale.
+         package reaches nobody. A server flag, because membership spans every
+         OTHER package.
+       · IN THIS PACKAGE — what is already ticked, which is the only one that
+         narrows on every instance.
+       · SORT — the order inside the grouping, where "least recently synced"
+         finds the rows that are quietly stale.
 
-     All four narrow what the tree SHOWS. A selection survives them (the box
-     stays ticked on a row that is filtered away), which is what makes
-     "Keboola, tick four, then BigQuery, tick two" add six. */
-  var pickerFacets = { source_type: [], query_mode: [] };
-  var pickerUnpackagedOnly = false;
-  /* "Show me what I have picked" — the only filter that narrows on EVERY
-     instance, because it is about the package rather than about the
-     registry's shape. In a three-hundred-row tree the tables you have ticked
-     are scattered through collapsed groups, and reviewing them meant
-     scrolling the whole thing. */
-  var pickerSelectedOnly = false;
-  var pickerSort = 'name_asc';
-
-  function facetsActive() {
-    if (pickerSelectedOnly) return true;
-    return pickerFacets.source_type.length + pickerFacets.query_mode.length +
-      (pickerUnpackagedOnly ? 1 : 0);
-  }
-
-  function resetPickerFilters() {
-    pickerSelectedOnly = false;
-    pickerFacets = { source_type: [], query_mode: [] };
-    pickerUnpackagedOnly = false;
-    pickerSort = 'name_asc';
-  }
+     A selection survives all of them: the box stays ticked on a row filtered
+     away, which is what makes "Keboola, tick four, then BigQuery, tick two"
+     add six. */
 
   /* The vocabularies, built from the registry itself so a filter can never
      offer a value that matches nothing. Counted over EVERY row, not the
      filtered set: a count that shrinks as you tick it tells you nothing about
      what ticking the next one would do. */
-  function facetOptions(key) {
-    var counts = {};
-    (st ? st.registry : []).forEach(function (t) {
-      var v = t[key] || '';
-      if (v) counts[v] = (counts[v] || 0) + 1;
-    });
-    return Object.keys(counts).sort().map(function (v) {
-      return { value: v, n: counts[v] };
-    });
-  }
-
-  function matchesFilters(t) {
-    if (pickerSelectedOnly && !st.tablesSelected.has(t.id)) return false;
-    if (pickerUnpackagedOnly && t.packaged) return false;
-    var src = pickerFacets.source_type;
-    if (src.length && src.indexOf(t.source_type || '') === -1) return false;
-    var mode = pickerFacets.query_mode;
-    if (mode.length && mode.indexOf(t.query_mode || '') === -1) return false;
-    return true;
-  }
-
   var SORTS = [
     { value: 'name_asc', label: 'Name A–Z' },
     { value: 'name_desc', label: 'Name Z–A' },
@@ -669,25 +562,6 @@
     { value: 'synced_desc', label: 'Recently synced' },
     { value: 'rows_desc', label: 'Most rows first' },
   ];
-
-  function sortTables(rows) {
-    function name(t) { return String(t.name || t.id).toLowerCase(); }
-    // `last_sync` is an ISO string, so it compares lexicographically without
-    // a parse. A never-synced row has none — and it sorts FIRST under
-    // "least recently synced", because "never" is the extreme case of stale,
-    // not a missing value to tuck away at the end.
-    function synced(t) { return t.last_sync || ''; }
-    rows.sort(function (a, b) {
-      switch (pickerSort) {
-        case 'name_desc': return name(b).localeCompare(name(a));
-        case 'synced_asc': return synced(a).localeCompare(synced(b)) || name(a).localeCompare(name(b));
-        case 'synced_desc': return synced(b).localeCompare(synced(a)) || name(a).localeCompare(name(b));
-        case 'rows_desc': return (Number(b.rows) || 0) - (Number(a.rows) || 0) || name(a).localeCompare(name(b));
-        default: return name(a).localeCompare(name(b));
-      }
-    });
-    return rows;
-  }
 
   function selectedTables() {
     if (!st) return [];
@@ -907,7 +781,11 @@
         : 'No data source is connected, so there is nothing to add. ') +
         '<button type="button" class="pdw-connect" data-pdw-connect>connect a source</button>.</p>';
     }
-    var searching = !!(pickerQuery || '').trim();
+    /* A collapsed group must never swallow a match, and the engine does not
+       open sections — it only hides empty ones. So the resting state is
+       structural (a group that contributes to the package, or the only
+       project) and an active SEARCH opens everything, wired in mountFbar. */
+    var searching = false;
     var html = projects.map(function (p) {
       var pTables = [];
       p.order.forEach(function (bk) { pTables = pTables.concat(p.buckets[bk].tables); });
@@ -946,7 +824,28 @@
             seenSub[k] = 1;
             return true;
           }).map(esc).join(' · ');
-          return '<label class="pdw-tables__row">' +
+          /* The engine reads every facet off the row, so the row states
+             them: `data-search` is what the search box matches (id, name,
+             bucket and project, exactly the four the old substring match
+             covered), and the rest are the categories in the Filter menu.
+             `data-selected` is what makes "In this package" possible — it is
+             about the package rather than the registry, so it is the one
+             facet that narrows on every instance. */
+          var packaged = t.packaged ? 'packaged' : 'unpackaged';
+          return '<label class="pdw-tables__row"' +
+            ' data-search="' + esc([t.id, t.name, t.bucket, t.project].filter(Boolean).join(' ')) + '"' +
+            ' data-source="' + esc(t.source_type || 'unknown') + '"' +
+            ' data-mode="' + esc(t.query_mode || 'unknown') + '"' +
+            ' data-packaged="' + packaged + '"' +
+            // The Project facet reads this. It was declared in the engine
+            // config before the row carried it, which renders a category in
+            // the menu that filters nothing — a dead control, and the exact
+            // thing the "no dead filters" rule exists to prevent.
+            ' data-project-name="' + esc(t.project || '') + '"' +
+            ' data-selected="' + (on ? 'yes' : 'no') + '"' +
+            ' data-name="' + esc((t.name || t.id).toLowerCase()) + '"' +
+            ' data-rows="' + esc(String(t.rows || 0)) + '"' +
+            ' data-sync="' + esc(t.last_sync || '') + '">' +
             '<input type="checkbox" data-table-id="' + esc(t.id) + '"' + (on ? ' checked' : '') +
             ' aria-label="' + esc(t.name || t.id) + '">' +
             '<span class="pdw-tables__g"><span class="pdw-tables__n">' + esc(t.name || t.id) + '</span>' +
@@ -959,7 +858,10 @@
           ' data-project="' + esc(p.key) + '" data-bucket="' + esc(b.key) + '"' + boxAttrs(bState) +
           ' aria-label="All tables in ' + esc(b.label) + '">' +
           '<span class="pdw-grp__name">' + esc(b.label) + '</span>' +
-          '<span class="pdw-grp__n">' + b.tables.length + '</span>' +
+          // `data-sec-count` is the engine's: it rewrites this to the number
+          // still VISIBLE under a filter, and hides the section at zero, so a
+          // heading can never sit over an empty list or lie about its size.
+          '<span class="pdw-grp__n" data-sec-count>' + b.tables.length + '</span>' +
           '</summary>' + rows + '</details>';
       }).join('');
       return '<details class="pdw-grp pdw-grp--project"' + (pOpen ? ' open' : '') + '>' +
@@ -968,7 +870,7 @@
         ' data-project="' + esc(p.key) + '"' + boxAttrs(pState) +
         ' aria-label="All tables in ' + esc(p.label) + '">' +
         '<span class="pdw-grp__name">' + esc(p.label) + '</span>' +
-        '<span class="pdw-grp__n">' + pTables.length + '</span>' +
+        '<span class="pdw-grp__n" data-sec-count>' + pTables.length + '</span>' +
         '</summary>' + buckets + '</details>';
     }).join('');
     return html;
@@ -979,113 +881,126 @@
      it). Pressed-state toggles rather than a filter MENU: there are two
      vocabularies and both are short, and a menu one level deep is a filter
      you set once and abandon. */
-  /* The Library's filter, in the table picker: a Filter button on the search
-     row, a faceted menu behind it, and one removable chip per applied
-     category. It was a flat strip of `fbar-toggle` pills — the right classes
-     but the wrong shape, and with SOURCE and QUERY MODE both spelled out it
-     ran to two full rows of chrome above the tree before a single table.
+  /* ── The toolbar: the product's shared one ─────────────────────────────
+     This picker browses a registry, and it had a private strip — a substring
+     box, a row of pressed-state toggles built from `facetOptions`, and a
+     sort <select> — which is the fourth hand-rolled copy of a thing the
+     Library, /chats and three admin pages all drive from one engine
+     (filter_toolbar.js). Same markup, same interaction, so a reader who has
+     filtered the Library already knows this: search, a Filter button whose
+     menu groups the categories, one chip per applied category, sort inline.
 
-     The filtering itself stays this page's own: the rows are a project →
-     bucket → table TREE with parent checkboxes and per-node counts, which is
-     not the flat row set `FilterToolbar` drives. So this borrows the shape and
-     keeps the engine out — the alternative is teaching the engine about trees
-     to save a hundred lines here. */
-  function facetGroupHtml(key, label) {
-    var opts = facetOptions(key);
-    if (opts.length < 2) return '';   // one value filters nothing
-    var chosen = pickerFacets[key];
-    return '<div class="fbar-menu__group"><p class="fbar-menu__title">' + esc(label) + '</p>' +
-      opts.map(function (o) {
-        return '<label class="fbar-menu__opt">' +
-          '<input type="checkbox" data-facet="' + esc(key) + '" value="' + esc(o.value) + '"' +
-          (chosen.indexOf(o.value) !== -1 ? ' checked' : '') + '>' +
-          '<span class="fbar-menu__opt-text">' + esc(o.value) + '</span>' +
-          '<span class="fbar-menu__opt-n">' + o.n + '</span></label>';
-      }).join('') + '</div>';
+     Categories are resolved from the registry and a category with fewer than
+     two values does not render — the house rule about dead filters. With
+     nothing to slice the button renders disabled rather than opening an
+     empty popover, exactly as /library's does. */
+  var FACET_CATS = [
+    { key: 'source', label: 'Source', of: 'source_type' },
+    { key: 'mode', label: 'Query mode', of: 'query_mode' },
+    { key: 'project', label: 'Project', of: 'project' },
+  ];
+
+  function facetValues(field) {
+    var counts = {};
+    (st ? st.registry : []).forEach(function (t) {
+      var v = t[field] || '';
+      if (v) counts[v] = (counts[v] || 0) + 1;
+    });
+    return Object.keys(counts).sort().map(function (v) {
+      return { value: v, label: v, n: counts[v] };
+    });
   }
 
-  function unpackagedCount() {
-    return (st ? st.registry : []).filter(function (t) { return !t.packaged; }).length;
-  }
+  function pickerBarHtml() {
+    var cats = FACET_CATS.map(function (c) {
+      return { cfg: c, options: facetValues(c.of) };
+    }).filter(function (c) { return c.options.length > 1; });
+    var unpackagedN = (st ? st.registry : []).filter(function (t) { return !t.packaged; }).length;
+    var total = st ? st.registry.length : 0;
+    // Offered only when it narrows: on an instance where every row is
+    // unpackaged it hides nothing, and a filter that hides nothing lies.
+    var offerUnpackaged = unpackagedN > 0 && unpackagedN < total;
+    var hasFacets = cats.length || offerUnpackaged;
 
-  /* Rides the search row: the Filter button, its menu, and the sort control. */
-  function pickerControlsHtml() {
-    var groups = facetGroupHtml('source_type', 'Source') + facetGroupHtml('query_mode', 'Query mode');
-    var un = unpackagedCount();
-    // Offered only when it narrows something: on a fresh instance every row is
-    // unpackaged, and a filter that hides nothing is a control that lies.
-    if (un && un < (st ? st.registry.length : 0)) {
-      groups += '<div class="fbar-menu__group"><p class="fbar-menu__title">Reach</p>' +
-        '<label class="fbar-menu__opt">' +
-        '<input type="checkbox" data-unpackaged="1"' + (pickerUnpackagedOnly ? ' checked' : '') + '>' +
-        '<span class="fbar-menu__opt-text">In no package</span>' +
-        '<span class="fbar-menu__opt-n">' + un + '</span></label></div>';
+    var menu = '';
+    if (hasFacets) {
+      menu = '<div class="fbar-menu fbar-menu--cats" id="pdw-filter-menu" role="menu"' +
+        ' aria-label="Filter tables" hidden>' +
+        (offerUnpackaged
+          ? '<label class="fbar-menu__opt"><input type="checkbox" data-facet="packaged" value="unpackaged">' +
+            '<span class="fbar-menu__opt-text">In no package yet</span>' +
+            '<span class="fbar-menu__opt-n">' + unpackagedN + '</span></label>'
+          : '') +
+        cats.map(function (c) {
+          return '<div class="fbar-cat" data-cat="' + esc(c.cfg.key) + '">' +
+            '<button type="button" class="fbar-cat__btn" aria-haspopup="true" aria-expanded="false">' +
+              '<span class="fbar-cat__label">' + esc(c.cfg.label) + '</span>' +
+              '<span class="fbar-cat__end">' +
+                '<span class="fbar-cat__n" data-cat-count="' + esc(c.cfg.key) + '" hidden>0</span>' +
+                '<svg class="fbar-cat__caret" viewBox="0 0 24 24" fill="none" aria-hidden="true">' +
+                '<path d="m9 6 6 6-6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>' +
+              '</span>' +
+            '</button>' +
+            '<div class="fbar-cat__pop" hidden>' +
+              c.options.map(function (o) {
+                return '<label class="fbar-menu__opt"><input type="checkbox" data-facet="' +
+                  esc(c.cfg.key) + '" value="' + esc(o.value) + '">' +
+                  '<span class="fbar-menu__opt-text">' + esc(o.label) + '</span>' +
+                  '<span class="fbar-menu__opt-n">' + o.n + '</span></label>';
+              }).join('') +
+            '</div>' +
+          '</div>';
+        }).join('') +
+        '<div class="fbar-menu__foot">' +
+          '<button type="button" data-fbar-clear>Clear</button>' +
+          '<button type="button" data-fbar-done>Done</button>' +
+        '</div>' +
+      '</div>';
     }
-    /* “In this package” is the same question from the other side, so it is an
-       option in the same menu rather than a button of its own. Offered only
-       once something is ticked: with nothing selected it can only ever
-       return an empty list. */
+
     var pickedN = st ? st.tablesSelected.size : 0;
-    if (pickedN) {
-      groups += '<div class="fbar-menu__group"><p class="fbar-menu__title">In this package</p>' +
-        '<label class="fbar-menu__opt">' +
-        '<input type="checkbox" data-selected="1"' + (pickerSelectedOnly ? ' checked' : '') + '>' +
-        '<span class="fbar-menu__opt-text">Only what I have ticked</span>' +
-        '<span class="fbar-menu__opt-n">' + pickedN + '</span></label></div>';
-    }
-    // The label travels with the control it names, not to the far side of the row.
-    var sort = '<span class="pdw-pickctl__k pdw-pickctl__k--sort">Sort</span>' +
+    return '<div class="fbar" role="group" aria-label="Search, filter and sort tables">' +
+      '<div class="fbar__search" role="search">' +
+        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+        '<circle cx="11" cy="11" r="7"></circle><path d="M21 21l-4.3-4.3"></path></svg>' +
+        '<input type="search" id="pdw-search" placeholder="Search tables…" autocomplete="off" aria-label="Search tables">' +
+      '</div>' +
+      '<div class="fbar-filter">' +
+        (hasFacets
+          ? '<button type="button" class="fbar-filter__btn" id="pdw-filter-btn" aria-haspopup="true" aria-expanded="false">' +
+            '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+            '<path d="M4 5h16M7 12h10M10 19h4"></path></svg>Filter' +
+            '<span class="fbar-filter__n" hidden>0</span></button>'
+          // Disabled rather than absent: the bar keeps its shape, and a
+          // visibly unavailable control answers "where is the filter".
+          : '<button type="button" class="fbar-filter__btn" id="pdw-filter-btn" disabled aria-disabled="true"' +
+            ' title="Nothing to filter yet — one source with one query mode has nothing to slice">' +
+            '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+            '<path d="M4 5h16M7 12h10M10 19h4"></path></svg>Filter</button>') +
+        menu +
+      '</div>' +
+      /* "In this package" rides the BAR as a pressed-state button rather than
+         living in the menu — the design system's own pattern for the one
+         refinement worth seeing at rest. It is also the only one that narrows
+         on every instance: source and mode need an instance to have two of
+         them, while "what have I already ticked" is exactly what you cannot
+         see in a long tree whose groups are collapsed. */
+      /* Always rendered, `hidden` until something is ticked. It used to be
+         built on the first tick, which meant rebuilding the whole bar — and
+         rebuilding the bar re-mounts the engine, which silently threw away
+         the reader's active filter and search. Nothing on this bar is built
+         by a tick any more. */
+      '<button type="button" class="fbar-toggle" id="pdw-picked-toggle"' +
+        ' data-facet-value="yes" aria-pressed="false"' + (pickedN ? '' : ' hidden') +
+        '>In this package <span class="fbar-toggle__n">' + pickedN + '</span></button>' +
       '<span class="fbar-select pdw-pickctl__sort">' +
-      '<select data-picker-sort aria-label="Sort tables">' +
-      SORTS.map(function (o) {
-        return '<option value="' + esc(o.value) + '"' +
-          (pickerSort === o.value ? ' selected' : '') + '>' + esc(o.label) + '</option>';
-      }).join('') + '</select></span>';
-    /* The BUTTON is conditional, the ROW is not. With no facet to offer the
-       menu behind it would be empty, so the button stays away; but a row that
-       disappears entirely gave an instance whose tables share one source and
-       one mode a bare search box and no visible way to narrow anything, which
-       reads as "this modal has no filters" — and a lone right-aligned
-       dropdown over three rows reads as a stray control rather than a panel. */
-    var filter = groups
-      ? '<div class="fbar-filter">' +
-          '<button type="button" class="fbar-filter__btn' + (facetsActive() ? ' is-active' : '') + '"' +
-            ' data-picker-filterbtn aria-haspopup="menu" aria-expanded="false">' +
-            '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" ' +
-            'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
-            '<path d="M3 5h18M6 12h12M10 19h4"/></svg>Filter' +
-            (facetsActive() ? '<span class="fbar-filter__n">' + facetsActive() + '</span>' : '') +
-          '</button>' +
-          '<div class="fbar-menu" id="pdw-picker-menu" role="menu" aria-label="Filter tables" hidden>' +
-            groups +
-            '<div class="fbar-menu__foot"><button type="button" data-picker-clear>Clear all</button></div>' +
-          '</div>' +
-        '</div>'
-      : '';
-    return '<div class="pdw-pickctl">' + filter + sort + '</div>';
-  }
-
-  /* Row two: one chip per applied CATEGORY, reading "Source: keboola, jira".
-     Its × drops that category; the row disappears when nothing is applied. */
-  function pickerChipsHtml() {
-    function chip(hook, label, vals) {
-      return '<span class="fbar-chip">' +
-        '<span class="fbar-chip__edit">' +
-          '<span class="fbar-chip__label">' + esc(label) + (vals ? ':' : '') + '</span>' +
-          (vals ? '<span class="fbar-chip__vals">' + esc(vals) + '</span>' : '') +
-        '</span>' +
-        '<button type="button" class="fbar-chip__x" data-picker-dropfacet="' + esc(hook) + '" ' +
-          'aria-label="Remove ' + esc(label) + ' filter">×</button>' +
-      '</span>';
-    }
-    var out = [];
-    if (pickerFacets.source_type.length) out.push(chip('source_type', 'Source', pickerFacets.source_type.join(', ')));
-    if (pickerFacets.query_mode.length) out.push(chip('query_mode', 'Query mode', pickerFacets.query_mode.join(', ')));
-    if (pickerUnpackagedOnly) out.push(chip('unpackaged', 'In no package', ''));
-    if (pickerSelectedOnly) out.push(chip('selected', 'In this package', ''));
-    if (!out.length) return '<div class="fbar-chips ag-pick-chips" hidden></div>';
-    return '<div class="fbar-chips ag-pick-chips">' + out.join('') +
-      '<button type="button" class="pdw-pickctl__clear" data-picker-clear>Clear all</button></div>';
+        '<select id="pdw-sort" aria-label="Sort tables">' +
+        SORTS.map(function (o) {
+          return '<option value="' + esc(o.value) + '">' + esc(o.label) + '</option>';
+        }).join('') + '</select></span>' +
+      '<span class="ag-toolcount" id="pdw-count"></span>' +
+    '</div>' +
+    '<div class="fbar-chips" id="pdw-chips" hidden></div>';
   }
 
   function pickerHtml() {
@@ -1115,12 +1030,15 @@
       title: 'Add tables to this package',
       sub: 'Everything registered on this instance. A bucket or a project ticks everything under it.',
       searchPlaceholder: 'Search tables…',
-      query: pickerQuery,
       shown: shown,
       total: total,
       rows: pickerRowsHtml(),
-      toolbarExtra: pickerControlsHtml(),
-      controls: pickerChipsHtml(),
+      bar: pickerBarHtml(),
+      /* Two different "not here" causes, so two answers, and both are
+         ACTIONS. They were a sentence with two links buried in it — which is
+         the wrong shape for the thing you reach for at the exact moment the
+         list has failed you, and it is now the only place the connect route
+         lives (the panel's standing line is gone). */
       foot: '<p class="pdw-pickfoot__q">Can\u2019t find the table you need?</p>' +
         '<div class="pdw-pickfoot__opts">' +
           '<a class="pdw-pickfoot__opt" href="/admin/tables">' +
@@ -1137,6 +1055,64 @@
     });
   }
 
+  var fbar = null;   // the live FilterToolbar handle, if any
+
+  /* The engine, re-attached on every paint.
+
+     `destroy()` first is not optional: the rows AND the menu are both built
+     from the registry here, so a repaint replaces the very elements the last
+     instance bound — filter_toolbar.js documents this exact case. Without it
+     each repaint leaves another engine holding a detached menu and filtering
+     the same rows against stale state. */
+  function mountFbar() {
+    if (fbar && fbar.destroy) { try { fbar.destroy(); } catch (e) { /* already gone */ } }
+    fbar = null;
+    if (!window.FilterToolbar || !els.picker.querySelector('#pdw-search')) return;
+    fbar = window.FilterToolbar.init({
+      rows: '#pdw-picker .pdw-tables__row',
+      // Both tiers: a project CONTAINS its buckets' rows, so one selector
+      // hides an emptied bucket and an emptied project, each with its count
+      // corrected rather than left claiming the unfiltered total.
+      sections: '#pdw-picker .pdw-grp',
+      search: { el: '#pdw-search', attr: 'data-search' },
+      facets: [
+        { key: 'source', attr: 'data-source', label: 'Source' },
+        { key: 'mode', attr: 'data-mode', label: 'Query mode' },
+        { key: 'project', attr: 'data-project-name', label: 'Project' },
+        { key: 'packaged', attr: 'data-packaged', label: 'Packaging' },
+        // Rides the bar as its own button, so it is deliberately outside the
+        // Filter badge and grows no chip — the control already shows its state.
+        { key: 'selected', attr: 'data-selected', label: 'In this package',
+          toggle: true, control: '#pdw-picked-toggle' },
+      ],
+      filterBtn: '#pdw-filter-btn',
+      menu: '#pdw-filter-menu',
+      chips: '#pdw-chips',
+      /* Keyed by the KEY, not by the option value: the engine parses a
+         value as `<key>_<dir>` and splits on the last underscore, so
+         "name_desc" looks up `name` and carries `desc` itself. Mapping the
+         whole value here meant nothing ever matched and the control silently
+         did nothing — Name Z–A left the list in A–Z. */
+      sort: { el: '#pdw-sort',
+              keys: { name: 'data-name', rows: 'data-rows', synced: 'data-sync' } },
+      count: { el: '#pdw-count', noun: 'table' },
+    });
+    /* Searching opens the tree. Filtering does not need it — a facet narrows
+       a list you are already reading — but a search is a request for one
+       named thing, and finding it inside a collapsed <details> is the same as
+       not finding it. Restores the resting state when the box is emptied. */
+    var box = els.picker.querySelector('#pdw-search');
+    if (box) {
+      box.addEventListener('input', function () {
+        var open = !!box.value.trim();
+        els.picker.querySelectorAll('.pdw-grp').forEach(function (g) {
+          if (open) { g.dataset.wasOpen = g.open ? '1' : '0'; g.open = true; }
+          else if (g.dataset.wasOpen !== undefined) { g.open = g.dataset.wasOpen === '1'; }
+        });
+      });
+    }
+  }
+
   function renderPicker() {
     if (!els || !els.picker) return;
     els.picker.innerHTML = pickerHtml();
@@ -1145,51 +1121,59 @@
     els.picker.querySelectorAll('[data-indeterminate]').forEach(function (b) {
       b.indeterminate = true;
     });
+    mountFbar();
   }
 
   /* Rows, count AND the controls strip — a facet click changes the pressed
      state and whether "Clear filters" exists. Separate from
      `renderPickerRows` because the search box must keep its focus and caret,
      and this never touches it. */
-  /* Repaint the rows, the Filter button's applied-count and the chip row —
-     never the whole modal, which would take the search box's caret with it. */
-  function renderPickerFiltered() {
-    renderPickerRows();
-    renderPickerStrip();
+  /* A tick, absorbed WITHOUT re-rendering anything.
+
+     This is the whole reason the picker survives being filtered. Replacing
+     the rows leaves the engine holding detached nodes, so its next filter
+     does nothing; rebuilding the bar re-mounts the engine, which starts with
+     no facets selected. Either one silently drops the reader's filter and
+     search the moment they tick a box — filter to two of nine, tick one, and
+     all nine come back with the badge cleared.
+
+     So nothing is re-rendered. Three things are updated in place: the row's
+     own `data-selected` (what the toggle filters on), every ancestor group's
+     tri-state box (a bucket reading "all" after one of its tables was
+     unticked is worse than no summary), and the toggle's count. */
+  function absorbTick() {
+    if (!els || !els.picker) return;
+    els.picker.querySelectorAll('.pdw-tables__row').forEach(function (row) {
+      var box = row.querySelector('input[data-table-id]');
+      if (!box) return;
+      var on = st.tablesSelected.has(box.getAttribute('data-table-id'));
+      box.checked = on;
+      row.setAttribute('data-selected', on ? 'yes' : 'no');
+    });
+    els.picker.querySelectorAll('.pdw-grp__box').forEach(function (b) {
+      var state = tallyState(tablesUnder(b.getAttribute('data-project'),
+                                         b.getAttribute('data-bucket')));
+      b.checked = state === 'all';
+      b.indeterminate = state === 'some';
+    });
+    var n = st.tablesSelected.size;
+    var toggle = els.picker.querySelector('#pdw-picked-toggle');
+    if (toggle) {
+      toggle.hidden = !n;
+      var badge = toggle.querySelector('.fbar-toggle__n');
+      if (badge) badge.textContent = String(n);
+    }
+    // The engine re-reads `data-selected` and re-counts; its own control is
+    // already in sync because we only changed the badge inside it.
+    if (fbar && fbar.apply) fbar.apply();
   }
 
-  /* The filter control ALONE. Its "In this package" option carries a count of
-     what is ticked, so it goes stale on every tick — and re-rendering the
-     rows to refresh a count would throw away the tree's open/closed state
-     under the admin mid-selection. So the button, its menu and the chip row
-     are replaced in place, and an open menu is reopened after the swap. */
-  function renderPickerStrip() {
-    if (!els || !els.picker) return;
-    var wasOpen = !!els.picker.querySelector('#pdw-picker-menu:not([hidden])');
-    var host = document.createElement('div');
-    host.innerHTML = pickerControlsHtml();
-    var next = host.firstElementChild;
-    var row = els.picker.querySelector('.pdw-pickctl');
-    if (row && next) row.replaceWith(next);
-    else if (next) {
-      // The row is always supposed to be here; put it back if it went missing.
-      var anchor = els.picker.querySelector('.ag-pick-rows');
-      if (anchor) anchor.insertAdjacentElement('beforebegin', next);
-    }
-    // The popover stays open across a tick: closing it on every choice would
-    // make a multi-select facet a one-select facet in practice.
-    if (wasOpen && next) {
-      var m = next.querySelector('#pdw-picker-menu');
-      if (m) m.hidden = false;
-      var b = next.querySelector('[data-picker-filterbtn]');
-      if (b) b.setAttribute('aria-expanded', 'true');
-    }
-    var chips = els.picker.querySelector('.ag-pick-chips');
-    if (chips) {
-      var ch = document.createElement('div');
-      ch.innerHTML = pickerChipsHtml();
-      chips.replaceWith(ch.firstElementChild);
-    }
+  /* `CSS.escape` where the browser has it, and enough of it where it does
+     not: a table id is server-authored and can carry a dot or a colon, which
+     a bare attribute selector would read as syntax. */
+  function cssEscape(v) {
+    if (window.CSS && window.CSS.escape) return window.CSS.escape(String(v));
+    return String(v).replace(/[^a-zA-Z0-9_-]/g, function (c) { return '\\' + c; });
   }
 
   /* Rows + count only, so the search box keeps its focus and caret. */
@@ -1262,12 +1246,12 @@
   function openPicker() {
     pickerKind = 'tables';
     pickerOpen = true;
-    pickerQuery = '';
-    // Same reasoning as the query: a second open must not inherit the last
-    // visit's narrowing, which would hide rows for a reason nobody remembers.
-    resetPickerFilters();
+    // Nothing to reset: the bar is rebuilt from scratch on every open, so the
+    // last visit's search and filters cannot survive into this one — which is
+    // the point, since narrowing nobody remembers setting hides rows for no
+    // visible reason.
     renderPicker();
-    var box = els.picker.querySelector('[data-ag-search="pdw-tables"]');
+    var box = els.picker.querySelector('#pdw-search');
     if (box) box.focus();
   }
 
@@ -1748,8 +1732,8 @@
     }
     els.body.scrollTop = 0;
     // The picker's own state belongs to the drawer session, not the page: a
-    // second open must not inherit the last search or a left-open modal.
-    pickerQuery = '';
+    // second open must not inherit a left-open modal. (The search and filters
+    // live in the bar, which is rebuilt per open.)
     pickerOpen = false;
     if (els.picker) els.picker.innerHTML = '';
     els.tables.innerHTML = '<p class="ds-drawer__hint">Loading…</p>';

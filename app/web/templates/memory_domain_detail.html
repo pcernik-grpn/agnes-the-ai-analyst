@@ -71,7 +71,7 @@
 {% set _fallback = detail_back('memory_domain', '/corporate-memory', 'All memory domains') %}
 {% set _back = '/library' if _from_library else _fallback.href %}
 {% set _back_label = 'Back to library' if _from_library else _fallback.label %}
-{% set _meta = [{'icon': 'brain', 'text': (items|length|string) ~ ' item' ~ ('s' if items|length != 1 else '')}] %}
+{% set _meta = [{'icon': 'memory', 'text': (items|length|string) ~ ' item' ~ ('s' if items|length != 1 else '')}] %}
 {% if required_count %}{% set _ = _meta.append({'icon': 'check', 'text': (required_count|string) ~ ' required'}) %}{% endif %}
 
 {% set _menu %}
@@ -111,7 +111,7 @@
 
 {{ detail.cols_open() }}
 
-{{ detail.section_open('Items in this domain', icon='brain') }}
+{{ detail.section_open('Items in this domain', icon='memory') }}
 {% if items %}
 <div class="memory-items">
   {% for it in items %}
@@ -178,7 +178,7 @@
   {% endfor %}
 </div>
 {% else %}
-{{ detail.empty('No items in this domain yet. Items show up here once an admin adds them to this domain.', icon='brain') }}
+{{ detail.empty('No items in this domain yet. Items show up here once an admin adds them to this domain.', icon='memory') }}
 {% endif %}
 {{ detail.section_close() }}
 
