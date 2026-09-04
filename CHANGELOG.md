@@ -18,6 +18,8 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 
 ### Fixed
 
+- `config/instance.yaml.example`'s commented `acl_sync` block described a weekly subtree sweep with `sweep_interval_days: 7`, where the scheduler row fires `daily 07:00` and the registered switch defaults to 1 day, and it omitted `interval_hours` (default 4) — the key that actually bounds the source-side revocation window. Corrected, and a stray `<<<<<<< HEAD` conflict marker left inside the `[Unreleased]` section removed.
+
 ### Removed
 
 ### Internal
@@ -178,8 +180,6 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   decode.
 
 ### Fixed
-- `config/instance.yaml.example`'s commented `acl_sync` block described a weekly subtree sweep with `sweep_interval_days: 7`, where the scheduler row fires `daily 07:00` and the registered switch defaults to 1 day, and it omitted `interval_hours` (default 4) — the key that actually bounds the source-side revocation window. Corrected, and a stray `<<<<<<< HEAD` conflict marker left inside the `[Unreleased]` section removed.
-
 - **The reusable Terraform module (`infra/modules/customer-instance`) parses again.** The train merge that landed the extraction-worker replica and broker-OTLP validations dropped the closing brace of the `extraction_worker_replicas` validation in both `prod_instance` and `dev_instances`, so every consumer pinning a tag cut from that `main` failed at `terraform init` with "Unsupported block type". A new `infra-validate` workflow runs `terraform fmt -check` + `terraform validate` on every PR that touches the module, so a parse error can no longer reach a tag.
 - **The access-policy builder no longer compiles a row rule on a missing column away into a policy that returns everything.** A `row_rules` entry naming a column the table does not have was dropped with a warning, alongside masks on unknown columns — but the two fail in opposite directions. A dropped mask is harmless (the projection is assembled from the table's real columns, so there was never a plaintext copy to cover), while a dropped row rule is fail-open: a spec whose only rule referenced a since-renamed column compiled to a WHERE-less body handing every caller the whole table, and a dropped rule beside a surviving one quietly widened the row set instead — both behind a `200` and a warning nobody had to read. `compile_policy` now refuses, naming the column and the operator, and `POST /api/admin/registry/{table_id}/policy/compile` returns `422 policy_compile_invalid_spec`. Masks on unknown columns keep the warning, since that path really is fail-closed.
 - **BREAKING for admin-owned hosted data apps: a data app owned by an Admin no longer bypasses table access policies.** Its service token (`app/api/data_apps.py::_mint_service_token`) is now minted with `surface='stack'` instead of the repository's `surface='all'` default, so it reads as the owner's filtered view — the same rule an `agnes init` PAT already follows — rather than skipping every attached policy outright.
