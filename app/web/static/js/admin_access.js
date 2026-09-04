@@ -348,6 +348,78 @@
   const EVERYONE_AUDIENCE = { id: "everyone", is_scope: true, name: "Everyone",
                               description: "Every account, and anyone who joins." };
 
+  /* How a selection of audiences reads in the share drawer's footer.
+
+     "2 groups · 10 people" over a selection of `Everyone` + one group counted
+     the scope as a group, in the one control where the group/scope choice is
+     actually made and inches from the page's own words for the distinction
+     (#2257). The scope is counted BESIDE the groups, never among them.
+
+     The people figure is passed in rather than derived: the footer paints a
+     local estimate first and repaints with the server's answer, and both go
+     through this one sentence. */
+  function sharePickerCount(chosenIds, reach) {
+    const ids = chosenIds || [];
+    if (!ids.length) return "No group selected";
+    const scoped = ids.includes(EVERYONE_AUDIENCE.id);
+    const groups = ids.length - (scoped ? 1 : 0);
+    const groupWord = `${groups} ${groups === 1 ? "group" : "groups"}`;
+    const who = scoped ? (groups ? `Everyone + ${groupWord}` : "Everyone") : groupWord;
+    return `${who} · ${reach} ${reach === 1 ? "person" : "people"}`;
+  }
+
+  /* The act, named the same way the count above is. Sharing with everyone is
+     not sharing "with 1 group", and a button that says it is describes a
+     different write from the one it makes. */
+  function sharePickerApply(chosenIds) {
+    const ids = chosenIds || [];
+    if (!ids.length) return "Apply";
+    const scoped = ids.includes(EVERYONE_AUDIENCE.id);
+    const groups = ids.length - (scoped ? 1 : 0);
+    const groupWord = `${groups} ${groups === 1 ? "group" : "groups"}`;
+    if (!scoped) return `Share with ${groupWord}`;
+    return groups ? `Share with everyone and ${groupWord}` : "Share with everyone";
+  }
+
+  /* What is NOT shared with a person — the gap band of the By-person lens.
+
+     Subtracts TWO things, and the second is the fix for #2255: the things the
+     person reaches (the grant read), and the things the panel above already
+     lists as being in their Library. The panel resolves the everyone scope
+     through `library-preview`; the grant read did not, so one package was
+     rendered as "In their Library" and "Not shared with them · No group of
+     theirs" in one viewport. The reader is fixed (#2254) — this makes the two
+     lists unable to disagree again, whatever a future reader answers.
+
+     Keyed on `resource_id`, so a resource listed in two blocks is one row and
+     one unit of the band's "N of M": that denominator is `shown + these`, and
+     an instance with ONE package and two grants on it printed "1 of 2". */
+  function notSharedWith(allItems, reachedIds, shownIds) {
+    const seen = new Set();
+    const out = [];
+    for (const it of allItems || []) {
+      const rid = it && it.resource_id;
+      if (!rid || seen.has(rid)) continue;
+      seen.add(rid);
+      if ((reachedIds && reachedIds.has(rid)) || (shownIds && shownIds.has(rid))) continue;
+      out.push(it);
+    }
+    return out;
+  }
+
+  /* Does the group's holding table have GRANT ROWS for its column header to
+     head?
+
+     The header — Kind / What the group gets / Access tier / Manage — labels
+     the columns of grant rows. A group that holds nothing of its own still
+     renders the one-line "and everything Everyone has" summary, and that is a
+     SENTENCE, not a row of those four columns: it has no kind, no tier and
+     nothing to revoke. The header then sat over a band label and nothing
+     else, i.e. over an empty table (#2257 item 3). */
+  function holdingHeadsRows(ownRows, setElsewhereRows) {
+    return Boolean(ownRows || setElsewhereRows);
+  }
+
   /* Mirrors `src.grant_scopes.SCOPE_WITHHELD_TYPES` (decision 07). Kept as a
      literal rather than read off the payload because the server enforces it
      with a 422 either way; this only stops the page offering the choice. */
@@ -1388,7 +1460,11 @@
           <span class="ax-r__rd ax-r__manage"><a class="ax-inherit" href="?by=group&group=${esc(everyoneGroupId() || "")}">Everyone →</a></span>
         </div>`
       : "";
-    const setElsewhere = inSection("set_elsewhere") + inheritedLine;
+    /* Kept apart from the summary line below it: the ROWS are what the
+       column header heads, and the summary is a sentence (see
+       `holdingHeadsRows`). */
+    const setElsewhereRows = inSection("set_elsewhere");
+    const setElsewhere = setElsewhereRows + inheritedLine;
     const sectionLabel = (t, hint) =>
       `<div class="ax-glist__label ax-gsect">${esc(t)}${
         hint ? `<span class="ax-gsect__hint">${esc(hint)}</span>` : ""}</div>`;
@@ -1432,7 +1508,7 @@
        surface that owns this grant when it is not this page (a Required
        plugin, or an inherited Everyone grant). Those were previously crowded
        into the same cell as the tier pair. */
-    const colhd = sections ? `
+    const colhd = holdingHeadsRows(changeHere, setElsewhereRows) ? `
       <div class="ax-colhd">
         <span>Kind</span><span>${scopeSelected ? "What every account gets" : "What the group gets"}</span>
         <span>Access tier <span class="ax-tip ax-colhd__key"><span class="ax-tip__btn" tabindex="0" role="img" aria-label="What Automatic and Optional mean" aria-describedby="ax-tierkey-body">i</span></span></span><span class="ax-colhd__u">Manage</span>
@@ -3896,7 +3972,16 @@
           ? `No longer revealed to this group — nothing was hidden from anyone else`
           : `Revoked — grant it again from this page whenever you like`, true);
       } catch (err) {
-        toast((reveals ? "Could not change: " : "Could not revoke: ") + err.message, false);
+        /* The sentinel means the row was already gone and `changedElsewhere`
+           has refetched the model and said so IN WORDS. Printing the token
+           over that sentence is how an admin was shown "Could not change:
+           changed_elsewhere" (#2257) — a machine key on the page whose whole
+           premise is that the wording is the product. Guarded rather than
+           returned, unlike the two handlers above: the repaint and the focus
+           restore below this catch are still owed either way. */
+        if (err.message !== "changed_elsewhere") {
+          toast((reveals ? "Could not change: " : "Could not revoke: ") + err.message, false);
+        }
       }
       repaintView();
       focusRestore(memo);
@@ -4376,8 +4461,10 @@
     const chosen = [...pickerState.chosen];
     // The count says PEOPLE, not groups. "3 groups" hides whether this is a
     // share with four people or four hundred, which is the thing worth
-    // knowing before pressing Apply.
-    const line = (reach) => `${n} ${n === 1 ? "group" : "groups"} · ${reach} ${reach === 1 ? "person" : "people"}`;
+    // knowing before pressing Apply. And it says GROUPS AND THE SCOPE apart:
+    // `sharePickerCount` counts the everyone audience beside the groups
+    // rather than as one of them (#2257).
+    const line = (reach) => sharePickerCount(chosen, reach);
     /* Painted twice on purpose. The local estimate lands instantly so the
        footer never blanks while a request is in flight; the server's answer
        replaces it when it arrives, and only if the selection is still the
@@ -4385,7 +4472,7 @@
        person in two groups whose rosters the payload did not carry — which
        is why it does not get the last word at the moment of deciding.
        (Audit E3.) */
-    els.count.textContent = n ? line(reachOf(chosen)) : "No group selected";
+    els.count.textContent = line(reachOf(chosen));
     if (n) {
       const asked = chosen.slice().sort().join(",");
       fetchReach(chosen).then((count) => {
@@ -4396,7 +4483,7 @@
     }
     paintPickerTier();
     els.apply.disabled = !n;
-    els.apply.textContent = n ? `Share with ${n} ${n === 1 ? "group" : "groups"}` : "Apply";
+    els.apply.textContent = sharePickerApply(chosen);
   }
 
   function openBundlePicker(typeKey, resourceId, label) {
@@ -4815,7 +4902,12 @@
          is where those 2 are listed, so the two numbers are the same two
          arrays and cannot disagree. The old chips claimed a count of their
          own from a third source and capped it at six, which is how the
-         screen came to show 6 above a list of 8. */
+         screen came to show 6 above a list of 8.
+
+         The denominator counts RESOURCES: `missing` is deduped on
+         `resource_id` and is disjoint from these rows by construction
+         (`notSharedWith`), so one package carrying two grants counts once.
+         It read "1 of 2" on an instance with exactly one package (#2255). */
       const items = sec.items || [];
       const total = sec.kind === "data_package" && missing.length
         ? `${items.length} of ${items.length + missing.length}`
@@ -4864,7 +4956,11 @@
     if (dangling.length) {
       const rows = dangling.map((p) => {
         const g0 = (p.via_groups || [])[0];
-        const gid = g0 && g0.group_id;
+        /* `?group=` selects a group, and the everyone audience is not one —
+           its id on the wire is a sentinel. This page keys its own selection
+           of that audience on the carrier, so that is what the link carries;
+           the sentinel never leaves the payload it arrived in. */
+        const gid = g0 && (g0.kind === "scope" ? everyoneGroupId() : g0.group_id);
         const href = gid ? `/admin/access?group=${encodeURIComponent(gid)}` : "/admin/access";
         // No name to print: nothing this page can list answers to the id,
         // which is the finding. Deliberately "deleted OR unlisted" and not
@@ -4929,11 +5025,23 @@
 
     // What is NOT shared with them — the half a grant list cannot show, and
     // the reason someone opens this page at all.
+    //
+    // Two subtractions, not one (#2255). The grant read says what they reach;
+    // the LIBRARY PANEL below says what it is about to render as theirs, and
+    // the two used to be able to disagree — a package reached by an
+    // everyone-scoped grant appeared as "In their Library" and, an inch
+    // lower, as "Not shared with them · No group of theirs". Both readers
+    // resolve the scope now; subtracting the panel's own rows as well is what
+    // makes a repeat of that contradiction unrenderable rather than merely
+    // fixed.
     const allPackages = ((overview && overview.resources) || [])
       .filter((t) => t.type_key === "data_package")
       .flatMap((t) => (t.blocks || []).flatMap((b) => b.items || []));
     const has = new Set(packages.map((p) => p.resource_id));
-    const missing = allPackages.filter((p) => !has.has(p.resource_id));
+    const inLibrary = new Set(((preview && preview.sections) || [])
+      .filter((sec) => sec.kind === "data_package")
+      .flatMap((sec) => (sec.items || []).map((i) => i.id)));
+    const missing = notSharedWith(allPackages, has, inLibrary);
 
     const groupNames = memberships.map((g) => g.name || g.group_name || g.id).filter(Boolean);
 

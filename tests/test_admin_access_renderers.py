@@ -75,6 +75,10 @@ _EXPORTS = (
     "addScopeFor",
     "addableAtScope",
     "SCOPE_WITHHELD_TYPES",
+    "notSharedWith",
+    "holdingHeadsRows",
+    "sharePickerCount",
+    "sharePickerApply",
     "TIERED",
     "facets",
     "rowPassesFacets",
@@ -552,3 +556,91 @@ class TestAScopeModePickerOffersOnlyWhatTheApiAccepts:
         from src.grant_scopes import SCOPE_WITHHELD_TYPES
 
         assert set(_run("OUT = [...api.SCOPE_WITHHELD_TYPES];")) == set(SCOPE_WITHHELD_TYPES)
+
+
+class TestOneAnswerPerResourceInThePersonLens:
+    """#2255. The By-person lens rendered one package twice, in two sections
+    that contradicted each other: "In their Library" (the library preview,
+    which resolves the everyone scope) AND "Not shared with them · No group of
+    theirs" (this list, which asked which of the person's GROUPS grants it).
+
+    The reader's fix is #2254 — effective-access now resolves the scope too —
+    but the two lists must not be able to disagree again, so the gap list is
+    derived by SUBTRACTING both what the person reaches and what the panel
+    above it already shows. It also dedupes: the band's "N of M" denominator
+    is `shown + not-shared`, and an instance with one package and two grants
+    on it read "1 of 2".
+    """
+
+    ALL = "[{ resource_id: 'p1', name: 'One' }, { resource_id: 'p2', name: 'Two' }]"
+
+    def test_a_package_reached_by_a_grant_is_not_also_not_shared(self):
+        got = _run(f"OUT = api.notSharedWith({self.ALL}, new Set(['p1']), new Set()).map((p) => p.resource_id);")
+        assert got == ["p2"]
+
+    def test_a_package_the_library_panel_shows_is_not_also_not_shared(self):
+        """The panel resolves the everyone scope through `library-preview`. A
+        row it lists is shared with them by definition, whatever the grant
+        read says — this is the belt to #2254's braces."""
+        got = _run(f"OUT = api.notSharedWith({self.ALL}, new Set(), new Set(['p1'])).map((p) => p.resource_id);")
+        assert got == ["p2"]
+
+    def test_the_denominator_counts_resources_not_grants(self):
+        """Two grants on one package is one package. The list is keyed on
+        `resource_id`, so a projection that lists the same package in two
+        blocks cannot inflate the count the band prints."""
+        dupes = "[{ resource_id: 'p1' }, { resource_id: 'p1' }, { resource_id: 'p2' }]"
+        got = _run(f"OUT = api.notSharedWith({dupes}, new Set(), new Set()).map((p) => p.resource_id);")
+        assert got == ["p1", "p2"]
+
+    def test_nothing_reached_leaves_every_resource_in_the_gap(self):
+        got = _run(f"OUT = api.notSharedWith({self.ALL}, new Set(), new Set()).length;")
+        assert got == 2
+
+
+class TestThePickerCountsTheScopeAsAScope:
+    """#2257 item 1. Selecting `Everyone` plus one group read "2 groups · 10
+    people" and offered "Share with 2 groups" — in the one control where the
+    group/scope choice is actually made, and a few hundred pixels from the
+    page's own words for the distinction ("Not a group — a scope")."""
+
+    def test_the_scope_is_counted_beside_the_groups_not_among_them(self):
+        got = _run("OUT = api.sharePickerCount(['everyone', 'g1'], 10);")
+        assert got == "Everyone + 1 group · 10 people"
+
+    def test_the_scope_alone_is_not_a_group_count(self):
+        got = _run("OUT = api.sharePickerCount(['everyone'], 10);")
+        assert got == "Everyone · 10 people"
+
+    def test_groups_alone_read_exactly_as_before(self):
+        assert _run("OUT = api.sharePickerCount(['g1', 'g2'], 10);") == "2 groups · 10 people"
+        assert _run("OUT = api.sharePickerCount(['g1'], 1);") == "1 group · 1 person"
+
+    def test_nothing_selected_says_so(self):
+        assert _run("OUT = api.sharePickerCount([], 0);") == "No group selected"
+
+    def test_the_apply_button_names_the_same_two_things(self):
+        assert _run("OUT = api.sharePickerApply(['everyone', 'g1']);") == "Share with everyone and 1 group"
+        assert _run("OUT = api.sharePickerApply(['everyone', 'g1', 'g2']);") == "Share with everyone and 2 groups"
+        assert _run("OUT = api.sharePickerApply(['everyone']);") == "Share with everyone"
+        assert _run("OUT = api.sharePickerApply(['g1', 'g2']);") == "Share with 2 groups"
+        assert _run("OUT = api.sharePickerApply([]);") == "Apply"
+
+
+class TestTheColumnHeaderHasRowsToHead:
+    """#2257 item 3. The holding table's column header — Kind / What the group
+    gets / Access tier / Manage — labels the columns of GRANT ROWS. A group
+    with no grants of its own still renders the one-line "and everything
+    Everyone has" summary, which is a sentence rather than a row of those
+    columns, and the header sat over a band label and nothing else."""
+
+    def test_a_group_holding_nothing_of_its_own_gets_no_header(self):
+        assert _run('OUT = api.holdingHeadsRows("", "");') is False
+
+    def test_its_own_rows_earn_the_header(self):
+        assert _run('OUT = api.holdingHeadsRows("<div class=\\"ax-r\\"></div>", "");') is True
+
+    def test_rows_set_elsewhere_earn_it_too(self):
+        """The `Admin` case: every row is unactionable here, and each is still
+        a row with a kind, a tier and a Manage cell."""
+        assert _run('OUT = api.holdingHeadsRows("", "<div class=\\"ax-r\\"></div>");') is True
