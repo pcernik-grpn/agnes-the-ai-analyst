@@ -494,6 +494,43 @@ def test_update_in_place_does_not_touch_processing_status(repo):
     assert repo.get(file_id)["processing_status"] == "indexed"
 
 
+def test_update_path_changes_path_and_filename_only(repo):
+    """Rename/move with UNCHANGED content (SharePoint crawl rename gate,
+    ``connectors.sharepoint.crawler._Ingestor.rename``) — no sha256/
+    storage_path/size write, unlike ``update_in_place``."""
+    file_id = repo.add(
+        corpus_id=CORPUS_ID,
+        filename="a.md",
+        sha256="s1",
+        file_type="md",
+        size_bytes=5,
+        storage_path="/blobs/s1.md",
+        path="old/a.md",
+    )
+    repo.update_path(file_id, path="new/b.md", filename="b.md")
+    row = repo.get(file_id)
+    assert row["path"] == "new/b.md"
+    assert row["filename"] == "b.md"
+    assert row["sha256"] == "s1"
+    assert row["storage_path"] == "/blobs/s1.md"
+    assert row["size_bytes"] == 5
+
+
+def test_update_path_does_not_touch_processing_status(repo):
+    file_id = repo.add(
+        corpus_id=CORPUS_ID,
+        filename="a.md",
+        sha256="s1",
+        file_type="md",
+        size_bytes=5,
+        storage_path="/blobs/s1.md",
+    )
+    repo.set_status(file_id, status="indexed")
+    repo.update_path(file_id, path=None, filename="a-renamed.md")
+    assert repo.get(file_id)["processing_status"] == "indexed"
+    assert repo.get(file_id)["filename"] == "a-renamed.md"
+
+
 def test_count_by_corpus_groups_every_corpus_in_one_read(repo):
     """The admin /access projection needs a count per collection; doing that
     with `list_for_corpus` per collection made the page's query count grow with

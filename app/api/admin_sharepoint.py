@@ -1226,17 +1226,34 @@ def _dispatch_extraction_if_due(row: Dict[str, Any], schedule: str, now: datetim
     """Evaluate one SharePoint connection against the extraction cadence
     and, if due, enqueue ``corpus-extraction`` for it.
 
-    Due-ness reuses :func:`src.scheduler.is_table_due` against THIS
-    connection's own ``config.extraction.last_run_at`` — the same primitive
-    every other cadence in this codebase is evaluated with (no second
-    scheduling mechanism). Returns ``True`` iff this call actually
-    consumed the tick (a fresh enqueue OR a dedup against an already
-    in-flight job for this connection — the "backlog" case, mirroring
-    ``app/api/agent_schedules.py::_dispatch_if_due``'s same-shape guard so
-    a stuck previous run doesn't get re-logged every tick); ``False`` when
-    not due yet.
+    ``schedule`` is the instance-wide cadence the SWEEP is running on (what
+    made ``run_due_extraction`` fire at all — see its own docstring: the
+    sweep is a no-op with nothing configured there, regardless of any
+    per-connection override below). D.16: THIS connection may narrow that
+    with its own ``config.extraction.crawl.schedule``
+    (:func:`connectors.sharepoint.crawler.resolve_crawl_schedule`) —
+    ``"off"`` is never picked up by the sweep no matter how often it runs,
+    ``"instance"`` (the default) follows ``schedule`` exactly as before this
+    override existed, and any other valid cadence string REPLACES it for
+    this connection's own due-check. Either way the due-check itself is the
+    same primitive every other cadence in this codebase uses
+    (:func:`src.scheduler.is_table_due`) against THIS connection's own
+    ``config.extraction.last_run_at`` — no second scheduling mechanism.
+
+    Returns ``True`` iff this call actually consumed the tick (a fresh
+    enqueue OR a dedup against an already in-flight job for this connection
+    — the "backlog" case, mirroring ``app/api/agent_schedules.py::
+    _dispatch_if_due``'s same-shape guard so a stuck previous run doesn't
+    get re-logged every tick); ``False`` when off, or not due yet.
     """
+    from connectors.sharepoint.crawler import CRAWL_SCHEDULE_INSTANCE, CRAWL_SCHEDULE_OFF, resolve_crawl_schedule
     from src.scheduler import is_table_due
+
+    own_schedule, _source = resolve_crawl_schedule(row)
+    if own_schedule == CRAWL_SCHEDULE_OFF:
+        return False
+    if own_schedule != CRAWL_SCHEDULE_INSTANCE:
+        schedule = own_schedule
 
     extraction_state = (row.get("config") or {}).get("extraction") or {}
     last_run_at = extraction_state.get("last_run_at")

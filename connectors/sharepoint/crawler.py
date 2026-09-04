@@ -1071,6 +1071,7 @@ def _progress_snapshot(stats: "CrawlStats") -> Dict[str, Any]:
         "new": stats.new,
         "changed": stats.changed,
         "unchanged": stats.unchanged,
+        "renamed": stats.renamed,
         "deleted": stats.deleted,
         "downloads": stats.downloads,
         "bytes_downloaded": stats.bytes_downloaded,
@@ -1251,6 +1252,14 @@ class CrawlStats:
     new: int = 0
     changed: int = 0
     unchanged: int = 0
+    #: A subset of what would otherwise have been counted ``unchanged`` —
+    #: the item's cTag/eTag still matches (content unchanged), but its
+    #: ``name``/``parentReference.path`` no longer matches the stored
+    #: ``corpus_files`` row (a rename or a move within the same drive). The
+    #: row's ``path``/``filename`` are updated in place, no download, no
+    #: convert, no re-ingest — see ``_Ingestor.rename`` and the gate in
+    #: ``_process_item``.
+    renamed: int = 0
     deleted: int = 0
     errors: int = 0
     convert_failed: int = 0
@@ -1606,6 +1615,7 @@ class CrawlStats:
             "new": self.new,
             "changed": self.changed,
             "unchanged": self.unchanged,
+            "renamed": self.renamed,
             "deleted": self.deleted,
             "errors": self.errors,
             "convert_failed": self.convert_failed,
@@ -2352,6 +2362,68 @@ def resolve_min_modified(connection: Optional[Dict[str, Any]] = None) -> Tuple[O
     return None, "none"
 
 
+#: Sibling of :data:`MIN_MODIFIED_KEY` above — another per-connection crawl
+#: lever living on ``connection.config.extraction.crawl.<leaf>`` (D.16, "keep
+#: a site current without an operator"). Unlike ``min_modified`` this one
+#: DOES have a sensible instance-level fallback (:data:`CRAWL_SCHEDULE_
+#: INSTANCE`, the default): most connections should just follow the one
+#: instance-wide sweep cadence (``extraction.schedule``), and only a site
+#: with its own change-tempo needs an override.
+CRAWL_SCHEDULE_KEY = "schedule"
+#: Never picked up by the scheduled sweep, regardless of the instance-wide
+#: cadence — the connection is crawled only via a manual trigger.
+CRAWL_SCHEDULE_OFF = "off"
+#: The default: follow the instance-wide ``extraction.schedule`` cadence,
+#: exactly as every connection did before this per-connection override
+#: existed.
+CRAWL_SCHEDULE_INSTANCE = "instance"
+
+
+def is_valid_crawl_schedule(value: Any) -> bool:
+    """True for :data:`CRAWL_SCHEDULE_OFF`, :data:`CRAWL_SCHEDULE_INSTANCE`,
+    or any cadence string :func:`src.scheduler.is_valid_schedule` itself
+    accepts (``"every Nm"``/``"every Nh"``, ``"daily HH:MM[,HH:MM,...]"``,
+    ``"cron <5-field expr>"``) — the SAME grammar ``extraction.schedule``
+    already uses instance-wide, so this codebase has exactly one cadence
+    syntax, not two. Anything else (``None``, empty, malformed) is False.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return False
+    candidate = value.strip()
+    if candidate in (CRAWL_SCHEDULE_OFF, CRAWL_SCHEDULE_INSTANCE):
+        return True
+    from src.scheduler import is_valid_schedule
+
+    return is_valid_schedule(candidate)
+
+
+def resolve_crawl_schedule(connection: Optional[Dict[str, Any]] = None) -> Tuple[str, str]:
+    """``(schedule, source)`` for this connection's own crawl cadence —
+    ``connection.config.extraction.crawl.schedule``, defaulting to
+    :data:`CRAWL_SCHEDULE_INSTANCE` (follow the instance-wide
+    ``extraction.schedule`` sweep) when absent or invalid.
+
+    ``source`` is ``"connection"`` for a valid stored override, ``"default"``
+    when absent OR present but not a value :func:`is_valid_crawl_schedule`
+    accepts (logged and ignored — a malformed override must not abort the
+    sweep's due-check, it just falls back to the instance cadence, exactly
+    as if nothing were set at all).
+    """
+    if connection:
+        raw = (((connection.get("config") or {}).get("extraction") or {}).get("crawl") or {}).get(CRAWL_SCHEDULE_KEY)
+        if isinstance(raw, str) and raw.strip():
+            candidate = raw.strip()
+            if is_valid_crawl_schedule(candidate):
+                return candidate, "connection"
+            logger.warning(
+                "sharepoint crawl: connection %s config.extraction.crawl.schedule=%r is not a valid "
+                "cadence — ignoring, following the instance-wide schedule",
+                connection.get("id"),
+                raw,
+            )
+    return CRAWL_SCHEDULE_INSTANCE, "default"
+
+
 def _item_modified_at(item: Dict[str, Any]) -> Optional[datetime]:
     """This item's last-modified timestamp for the ``min_modified`` gate —
     Graph's own ``lastModifiedDateTime`` first, the ``fileSystemInfo``
@@ -2560,6 +2632,36 @@ class _Ingestor:
                 reason = ((row or {}).get("processing_detail") or {}).get("reason", "unknown reason")
                 raise RuntimeError(f"ingest_file rejected {filename}: {reason}")
         return file_id, not existed
+
+    def rename(self, *, collection_id: str, stable_id: str, path: str, filename: str) -> bool:
+        """A rename/move whose CONTENT is unchanged — the caller
+        (:func:`_process_item`) already proved that via the cTag/eTag
+        equality gate before calling this. Updates ONLY ``corpus_files.
+        path``/``filename`` for the row this stable id already resolves to
+        (:meth:`CorpusFilesRepository.update_path`) — no download, no
+        convert, no re-ingest, no chunk/claim churn.
+
+        Returns ``True`` iff a row was found AND its stored path/filename
+        actually differed (the caller counts this as ``renamed``).
+        ``False`` — never raises — when this stable id has no resolved row
+        yet (a crawl-state/corpus inconsistency a future content change
+        self-heals) or the stored path/filename already match (nothing to
+        do); the caller then counts the item ``unchanged``, exactly as it
+        would have before this rename gate existed.
+        """
+        file_id = self._sources_repo.resolve(collection_id, stable_id)
+        if not file_id:
+            return False
+        from src.repositories import corpus_files_repo
+
+        repo = corpus_files_repo()
+        row = repo.get(file_id)
+        if row is None:
+            return False
+        if row.get("path") == path and row.get("filename") == filename:
+            return False
+        repo.update_path(file_id, path=path, filename=filename)
+        return True
 
     def delete(self, collection_id: str, stable_id: str) -> bool:
         """Remove the file a deleted source item anchors, if any.
@@ -4028,7 +4130,48 @@ async def _process_item(
         seen_ctag = ctags.get(stable_id) or ctx.legacy_ctags.get(stable_id)
         already = bool(ctag) and seen_ctag == ctag and not force_reprocess
     if already:
-        stats.add(unchanged=1)
+        # Content is unchanged (the cTag/eTag still matches), but the item
+        # may have been RENAMED or MOVED within the same drive since we last
+        # saw it — Graph keeps the cTag stable across a rename, so without
+        # this check the stored `corpus_files.path`/`filename` would go
+        # stale forever (D.18). One indexed lookup against the already-
+        # ingested row, never a download/convert/re-ingest — see
+        # `_Ingestor.rename`. Compares against the SAME `(path, filename)`
+        # shape `_prepare_document`'s "ok" branch would have stored: the raw
+        # drive-relative path + `<stem>.md` for a plain scope, or the
+        # anonymized equivalent (`_anonymize_identity` — cheap and
+        # size-independent, not a re-convert) for an anonymize-marked one.
+        try:
+            if ctx.anonymize:
+                rename_path, rename_filename = (
+                    _anonymize_identity(path, name, key=anonymization_key, detector=detector)
+                    if anonymization_key is not None
+                    else (None, None)
+                )
+            else:
+                rename_path, rename_filename = path, f"{Path(name).stem or name}.md"
+            renamed = (
+                await _run_blocking(
+                    pool,
+                    ingestor.rename,
+                    collection_id=collection_id,
+                    stable_id=stable_id,
+                    path=rename_path,
+                    filename=rename_filename,
+                )
+                if rename_path is not None
+                else False
+            )
+        except Exception as exc:  # noqa: BLE001 — a rename-detection fault must never break an
+            # otherwise-fine item: its cTag/state is untouched here, so it is
+            # simply re-checked next run. Falling through to "unchanged"
+            # costs nothing but one skipped rename this run.
+            logger.warning("sharepoint crawl: rename check failed for %s: %s", path, exc)
+            renamed = False
+        if renamed:
+            stats.add(renamed=1)
+        else:
+            stats.add(unchanged=1)
         return
 
     size = int(item.get("size") or 0)
@@ -6705,6 +6848,7 @@ _AGGREGATE_COUNTER_FIELDS = (
     "new",
     "changed",
     "unchanged",
+    "renamed",
     "deleted",
     "errors",
     "drives",

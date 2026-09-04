@@ -1480,7 +1480,7 @@ class TestCrawlConfig:
     def test_neither_flag_is_a_usage_error(self):
         result = runner.invoke(app, ["admin", "sharepoint", "crawl-config", "conn1"])
         assert result.exit_code == 1
-        assert "--min-modified or --clear" in result.output
+        assert "--min-modified" in result.output and "--schedule" in result.output
 
     def test_both_flags_is_a_usage_error(self):
         result = runner.invoke(
@@ -1524,6 +1524,75 @@ class TestCrawlConfig:
             )
         assert result.exit_code == 1
         assert "connection_not_found" in result.output
+
+    def test_schedule_alone_first_reads_the_current_min_modified_and_resends_it(self):
+        """D.16 — a ``--schedule``-only call must not silently clear an
+        already-set ``min_modified`` (the endpoint's own "omitted ==
+        cleared" contract, unchanged) — the CLI reads the connection's
+        current value first and resends it explicitly."""
+        get_body = {"id": "conn1", "config": {"extraction": {"crawl": {"min_modified": "2023-12-31"}}}}
+        patch_body = {
+            "connection_id": "conn1",
+            "min_modified": {"value": "2023-12-31", "source": "connection"},
+            "schedule": {"value": "every 6h", "source": "connection", "next_run_at": "2026-09-04T00:00:00+00:00"},
+        }
+        with (
+            patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(200, get_body)),
+            patch("cli.commands.admin_sharepoint.api_patch", return_value=_resp(200, patch_body)) as mock_patch,
+        ):
+            result = runner.invoke(app, ["admin", "sharepoint", "crawl-config", "conn1", "--schedule", "every 6h"])
+        assert result.exit_code == 0, result.output
+        assert "every 6h" in result.output and "next run" in result.output
+        _, kwargs = mock_patch.call_args
+        assert kwargs["json"] == {"min_modified": "2023-12-31", "schedule": "every 6h"}
+
+    def test_schedule_combined_with_min_modified_sends_both_in_one_call(self):
+        body = {
+            "connection_id": "conn1",
+            "min_modified": {"value": "2024-01-01", "source": "connection"},
+            "schedule": {"value": "off", "source": "connection", "next_run_at": None},
+        }
+        with patch("cli.commands.admin_sharepoint.api_patch", return_value=_resp(200, body)) as mock_patch:
+            result = runner.invoke(
+                app,
+                [
+                    "admin",
+                    "sharepoint",
+                    "crawl-config",
+                    "conn1",
+                    "--min-modified",
+                    "2024-01-01",
+                    "--schedule",
+                    "off",
+                ],
+            )
+        assert result.exit_code == 0, result.output
+        assert "not scheduled" in result.output
+        _, kwargs = mock_patch.call_args
+        assert kwargs["json"] == {"min_modified": "2024-01-01", "schedule": "off"}
+
+    def test_clear_combined_with_schedule_sends_a_null_min_modified(self):
+        body = {
+            "connection_id": "conn1",
+            "min_modified": {"value": None, "source": "none"},
+            "schedule": {"value": "instance", "source": "default", "next_run_at": None},
+        }
+        with patch("cli.commands.admin_sharepoint.api_patch", return_value=_resp(200, body)) as mock_patch:
+            result = runner.invoke(
+                app, ["admin", "sharepoint", "crawl-config", "conn1", "--clear", "--schedule", "instance"]
+            )
+        assert result.exit_code == 0, result.output
+        _, kwargs = mock_patch.call_args
+        assert kwargs["json"] == {"min_modified": None, "schedule": "instance"}
+
+    def test_an_invalid_schedule_server_side_400_is_reported(self):
+        with patch(
+            "cli.commands.admin_sharepoint.api_patch",
+            return_value=_resp(400, {"detail": "invalid_crawl_schedule"}),
+        ):
+            result = runner.invoke(app, ["admin", "sharepoint", "crawl-config", "conn1", "--schedule", "sometimes"])
+        assert result.exit_code == 1
+        assert "invalid_crawl_schedule" in result.output
 
 
 _FLEET_BODY = {

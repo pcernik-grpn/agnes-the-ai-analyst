@@ -2512,6 +2512,70 @@ console.log(JSON.stringify({{ html: _spScopeRowHtml("sp-conn-1", {json.dumps(sco
         assert "sharepoint.enabled" in html
 
 
+class TestExtRenderCrawlScheduleAndFilter:
+    """D.16 — the "Crawl schedule & filter" panel
+    (`_extRenderCrawlFilter`, ``app/web/static/js/admin/
+    data_sources_page.js``): the schedule select's pre-filled selection,
+    the custom-cadence input's conditional visibility, and the status
+    text — all pure string-building, no DOM calls, so it renders straight
+    off ``row.config.extraction.crawl`` with no server round trip."""
+
+    def _run_crawl_filter(self, crawl: dict) -> str:
+        import json
+        import subprocess
+        import tempfile
+        from pathlib import Path
+
+        tpl = _ds_page_source.page_source()
+        fns = "\n".join(
+            TestSharePointSourceCardRendering._extract_function(tpl, sig)
+            for sig in ("function _esc(s) {", "function _extRenderCrawlFilter(row) {")
+        )
+        row = {"id": "sp-conn-1", "name": "Corp SharePoint", "config": {"extraction": {"crawl": crawl}}}
+        script = f"""
+{fns}
+
+const row = {json.dumps(row)};
+console.log(JSON.stringify({{ html: _extRenderCrawlFilter(row) }}));
+"""
+        with tempfile.NamedTemporaryFile("w", suffix=".mjs", delete=False) as f:
+            f.write(script)
+            path = f.name
+        try:
+            proc = subprocess.run(["node", path], capture_output=True, text=True)
+        finally:
+            Path(path).unlink(missing_ok=True)
+        if proc.returncode == 127:
+            pytest.skip("node unavailable")
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        return json.loads(proc.stdout)["html"]
+
+    def test_default_selects_instance_and_shows_no_custom_input(self):
+        html = self._run_crawl_filter({})
+        assert 'value="instance" selected' in html
+        assert "Crawl schedule &amp; filter" in html or "Crawl schedule & filter" in html
+        assert 'style="display:none"' in html  # the custom-cadence text input, hidden by default
+        assert "following the instance-wide cadence" in html
+
+    def test_off_is_pre_selected_and_the_status_line_names_it(self):
+        html = self._run_crawl_filter({"schedule": "off"})
+        assert 'value="off" selected' in html
+        assert "Currently: off (connection)." in html
+
+    def test_a_custom_cadence_is_pre_selected_and_the_input_is_shown_and_prefilled(self):
+        html = self._run_crawl_filter({"schedule": "every 6h"})
+        assert 'value="custom" selected' in html
+        assert 'value="every 6h"' in html
+        assert 'style="display:"' in html  # the custom-cadence input, now visible
+        assert "Currently: every 6h (connection)." in html
+
+    def test_min_modified_still_renders_the_date_filter_panel(self):
+        html = self._run_crawl_filter({"min_modified": "2023-12-31"})
+        assert 'id="ds-sp-crawlfilter-date-sp-conn-1"' in html
+        assert 'value="2023-12-31"' in html
+        assert "Currently: files modified on/after 2023-12-31" in html
+
+
 class TestSourceTypeAwareActionsMenu:
     """`_sourceMenuItems(row)` — a SharePoint connection gets its OWN verb
     set (spec follow-up, TCRD-240/241 live-use feedback: the Keboola-only

@@ -249,14 +249,68 @@ spot-check shows pseudonyms, not names.
   (`agnes admin sharepoint crawl-config <connection_id> --min-modified
   YYYY-MM-DD` / `--clear`) sets or clears it; an item with no modified
   timestamp is always kept. On the source card, the same control ("Crawl
-  filter", next to "Facts policy") sets it directly — widening the date
-  later needs a "Re-enumerate from scratch" run afterwards, since the
-  delta cursor has already moved past whatever the old cutoff skipped.
+  schedule & filter", next to "Facts policy") sets it directly — widening
+  the date later needs a "Re-enumerate from scratch" run afterwards, since
+  the delta cursor has already moved past whatever the old cutoff skipped.
 - Webhooks for near-real-time updates: mint the secret
   (`POST …/webhook`), then `POST …/subscriptions/ensure` — Agnes owns the
   Graph subscription lifecycle including renewals
   ([`api-reference.md`](api-reference.md) → *Graph subscription
   lifecycle*). Requires a public HTTPS origin (`AGNES_BASE_URL`).
+
+### Keeping a site current
+
+Two independent switches decide whether — and how often — a connection is
+swept automatically:
+
+1. **The instance-wide switch, `extraction.schedule`, turns the sweep ON at
+   all.** Empty (the default) means manual-only: `POST …/extraction/run-due`
+   never fires, because the scheduler never registers the row that would call
+   it (`services/scheduler/__main__.py`). Set it to any cadence in this
+   grammar — `"every 15m"`/`"every 1h"`, `"daily HH:MM[,HH:MM,...]"` (UTC), or
+   `"cron <5-field expr>"` (UTC) — and the sweep starts polling every
+   SharePoint connection on that cadence, checked independently against each
+   connection's own last-run stamp.
+2. **A connection's own `extraction.crawl.schedule` (D.16) narrows —  it
+   never widens — what the sweep does for THAT connection**, once the
+   instance-wide switch above has turned the sweep on at all:
+   - `"instance"` (the default, same as leaving it unset) — follow
+     `extraction.schedule` exactly as every connection did before this
+     override existed.
+   - `"off"` — never picked up by the sweep, however often it polls; the
+     connection is only crawled by an explicit `POST …/extract` (or a manual
+     "Run extraction now" on the card).
+   - Any other value — the SAME cadence grammar `extraction.schedule` itself
+     uses (`"every 6h"`, `"daily 03:00"`, `"cron 0 3 * * *"`, …) — REPLACES
+     the instance-wide cadence for this one connection's own due-check. A
+     connection with its own interval is evaluated against its own clock,
+     independent of every other connection's cadence.
+
+   Set (or clear) it with `PATCH …/extraction/crawl-config`
+   (`agnes admin sharepoint crawl-config <connection_id> --schedule
+   {off|instance|<cadence>}`) — the SAME endpoint and the SAME source-card
+   control ("Crawl schedule & filter") the `min_modified` age filter above
+   lives on; the two fields are independent (setting one does not disturb
+   the other, as long as the caller re-sends the other's current value —
+   both the CLI and the card panel already do this for you).
+
+**The catch: a per-connection interval is only as fine-grained as the sweep's
+own poll cadence.** If the instance-wide switch polls once a day (`"daily
+03:00"`) but one connection sets its own `"every 6h"`, that connection is
+still only actually EVALUATED when the sweep runs — once a day — so it fires
+at most once a day in practice, not every 6 hours. For a connection that
+genuinely needs a tighter cadence than its siblings, set the instance-wide
+switch to the TIGHTEST cadence any connection needs and let the coarser
+connections either follow it (`"instance"`) or set their own wider interval
+(which is honored exactly, since polling more often than needed is free —
+`is_table_due` just says "not yet").
+
+Both the source card and the fleet dashboard (`/admin/extraction`) show a
+best-effort **"Next run"** hint per connection — `None`/"not scheduled" for
+an `"off"` connection or whenever the instance-wide switch itself has no
+cadence configured (the sweep is not running at all, so there is nothing to
+estimate). It is a display estimate only; the actual due-check re-evaluates
+fresh on every sweep tick.
 
 ## 6. Optional LLM stages (each a cost switch, default off)
 
@@ -531,3 +585,4 @@ checkpoint is kept and counted resumable, exactly like a normal stop.
 | run history says "needs a Postgres backend" | `extraction_runs` is PG-only | run state needs Postgres app-state; config/preview still work |
 | a facts pass fails with "prompt is too long" | one document's request exceeded the model's context window | fixed automatically going forward (token-safe bound + per-document failure); a still-oversized/garbled document is skipped and counted, never retried |
 | run shows `outcome: "stalled"` and Stop doesn't help | crawl loop stuck, never polling the stop flag | **Cancel run** on the fleet table / source card (or `agnes admin sharepoint runs cancel <run_id>`) force-closes it |
+| a renamed/moved file's path went stale in Collections | fixed — a rename/move with unchanged content (same cTag/eTag) now updates the stored path in place, counted `renamed` in the run report, no re-download | nothing to do; visible from the next crawl onward |

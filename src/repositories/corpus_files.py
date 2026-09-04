@@ -374,3 +374,19 @@ class CorpusFilesRepository:
             "WHERE id = ?",
             [filename, sha256, file_type, size_bytes, storage_path, path, file_id],
         )
+
+    def update_path(self, file_id: str, *, path: Optional[str], filename: str) -> None:
+        """Narrower sibling of :meth:`update_in_place`: a rename/move whose
+        CONTENT is unchanged (the caller already proved that — e.g. a
+        SharePoint crawl item whose cTag still matches, see
+        ``connectors.sharepoint.crawler._Ingestor.rename``), so only the
+        LOCATION fields move. No ``sha256``/``storage_path``/``size_bytes``
+        write, no read of the row's current values first — the whole point
+        is to cost one indexed lookup plus one targeted UPDATE, never a
+        re-download/re-convert/re-ingest. Leaves ``processing_status``
+        untouched, same discipline as ``update_in_place``.
+        """
+        self.conn.execute(
+            "UPDATE corpus_files SET filename = ?, path = ?, updated_at = current_timestamp WHERE id = ?",
+            [filename, path, file_id],
+        )

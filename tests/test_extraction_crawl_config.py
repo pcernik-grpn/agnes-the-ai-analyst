@@ -191,6 +191,149 @@ class TestPatch:
         assert r.status_code == 200
 
 
+class TestCrawlSchedulePatch:
+    """D.16 — ``schedule`` on the SAME PATCH endpoint, with a DIFFERENT
+    omitted-vs-null contract than ``min_modified`` (``model_fields_set``,
+    the ``…/facts-config`` pattern): omitted leaves ``schedule`` untouched,
+    ``null`` clears it back to the instance default. ``min_modified`` itself
+    keeps its ORIGINAL "omitted == cleared" contract unchanged — a caller
+    that wants to touch one field without disturbing the other must resend
+    the OTHER field's current value explicitly (the CLI and the source-card
+    panel both do); this endpoint itself does not protect against a bare
+    single-field body clobbering the sibling, same posture ``…/facts-
+    config``'s own ``retry_mode``/``transport`` pair already has."""
+
+    def test_setting_off_returns_it_resolved_with_no_next_run(self, seeded_app):
+        client, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = _create_connection(client, token, name="corp-sharepoint-crawl-schedule-off")
+
+        r = client.patch(f"{BASE}/{conn_id}/extraction/crawl-config", json={"schedule": "off"}, headers=_auth(token))
+
+        assert r.status_code == 200, r.text
+        assert r.json()["schedule"] == {"value": "off", "source": "connection", "next_run_at": None}
+
+    def test_setting_an_interval_is_written_and_resolved(self, seeded_app):
+        client, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = _create_connection(client, token, name="corp-sharepoint-crawl-schedule-interval")
+
+        r = client.patch(
+            f"{BASE}/{conn_id}/extraction/crawl-config", json={"schedule": "every 6h"}, headers=_auth(token)
+        )
+
+        assert r.status_code == 200, r.text
+        schedule = r.json()["schedule"]
+        assert schedule["value"] == "every 6h"
+        assert schedule["source"] == "connection"
+        # Never run before -> due immediately, so `next_due_at` resolves to
+        # "now" rather than None (see `src.scheduler.next_due_at`).
+        assert schedule["next_run_at"] is not None
+
+        from src.repositories import source_connections_repo
+
+        row = source_connections_repo().get(conn_id)
+        assert row["config"]["extraction"]["crawl"]["schedule"] == "every 6h"
+
+    def test_an_invalid_schedule_is_refused_with_400(self, seeded_app):
+        client, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = _create_connection(client, token, name="corp-sharepoint-crawl-schedule-invalid")
+
+        r = client.patch(
+            f"{BASE}/{conn_id}/extraction/crawl-config", json={"schedule": "sometimes"}, headers=_auth(token)
+        )
+
+        assert r.status_code == 400
+        assert r.json()["detail"] == "invalid_crawl_schedule"
+
+    def test_omitted_schedule_leaves_a_previously_set_one_untouched(self, seeded_app):
+        """A ``min_modified``-only Save (the existing date-filter control)
+        must not reset an already-configured ``schedule`` back to
+        ``instance`` — the footgun the ``model_fields_set`` contract exists
+        to avoid."""
+        client, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = _create_connection(client, token, name="corp-sharepoint-crawl-schedule-persists")
+        client.patch(f"{BASE}/{conn_id}/extraction/crawl-config", json={"schedule": "off"}, headers=_auth(token))
+
+        r = client.patch(
+            f"{BASE}/{conn_id}/extraction/crawl-config", json={"min_modified": "2023-12-31"}, headers=_auth(token)
+        )
+
+        assert r.status_code == 200, r.text
+        assert r.json()["schedule"]["value"] == "off"
+
+        from src.repositories import source_connections_repo
+
+        row = source_connections_repo().get(conn_id)
+        assert row["config"]["extraction"]["crawl"]["schedule"] == "off"
+
+    def test_a_bare_schedule_only_body_still_clears_min_modified(self, seeded_app):
+        """``min_modified`` keeps its ORIGINAL "omitted == cleared" contract
+        even now that this endpoint has a second, independent field — same
+        posture ``…/facts-config``'s own ``retry_mode`` keeps regardless of
+        ``transport``/``provider`` (see that endpoint's docstring). A caller
+        that wants to touch `schedule` alone WITHOUT wiping an existing date
+        filter must resend the current `min_modified` value explicitly —
+        that is the CLI's (`agnes admin sharepoint crawl-config`) and the
+        source-card panel's job, not this endpoint's."""
+        client, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = _create_connection(client, token, name="corp-sharepoint-crawl-schedule-bare")
+        client.patch(
+            f"{BASE}/{conn_id}/extraction/crawl-config", json={"min_modified": "2023-12-31"}, headers=_auth(token)
+        )
+
+        r = client.patch(
+            f"{BASE}/{conn_id}/extraction/crawl-config", json={"schedule": "every 6h"}, headers=_auth(token)
+        )
+
+        assert r.status_code == 200, r.text
+        assert r.json()["min_modified"] == {"value": None, "source": "none"}
+        assert r.json()["schedule"]["value"] == "every 6h"
+
+    def test_resending_the_current_min_modified_alongside_schedule_preserves_it(self, seeded_app):
+        """The safe form of the call above — the way the source card panel
+        and the CLI actually issue a schedule-only-intent save."""
+        client, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = _create_connection(client, token, name="corp-sharepoint-crawl-schedule-preserves-mm")
+        client.patch(
+            f"{BASE}/{conn_id}/extraction/crawl-config", json={"min_modified": "2023-12-31"}, headers=_auth(token)
+        )
+
+        r = client.patch(
+            f"{BASE}/{conn_id}/extraction/crawl-config",
+            json={"min_modified": "2023-12-31", "schedule": "every 6h"},
+            headers=_auth(token),
+        )
+
+        assert r.status_code == 200, r.text
+        assert r.json()["min_modified"] == {"value": "2023-12-31", "source": "connection"}
+        assert r.json()["schedule"]["value"] == "every 6h"
+
+    def test_a_null_schedule_clears_it_back_to_the_instance_default(self, seeded_app):
+        client, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = _create_connection(client, token, name="corp-sharepoint-crawl-schedule-clear")
+        client.patch(f"{BASE}/{conn_id}/extraction/crawl-config", json={"schedule": "every 6h"}, headers=_auth(token))
+
+        r = client.patch(f"{BASE}/{conn_id}/extraction/crawl-config", json={"schedule": None}, headers=_auth(token))
+
+        assert r.status_code == 200, r.text
+        assert r.json()["schedule"]["value"] == "instance"
+
+        from src.repositories import source_connections_repo
+
+        row = source_connections_repo().get(conn_id)
+        assert "schedule" not in (row["config"]["extraction"].get("crawl") or {})
+
+    def test_unset_schedule_defaults_to_instance(self, seeded_app):
+        client, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = _create_connection(client, token, name="corp-sharepoint-crawl-schedule-default")
+
+        r = client.patch(
+            f"{BASE}/{conn_id}/extraction/crawl-config", json={"min_modified": "2023-12-31"}, headers=_auth(token)
+        )
+
+        assert r.status_code == 200, r.text
+        assert r.json()["schedule"] == {"value": "instance", "source": "default", "next_run_at": None}
+
+
 class TestAudit:
     def test_the_patch_is_audited_with_the_value_and_its_resolution(self, seeded_app):
         client, token = seeded_app["client"], seeded_app["admin_token"]
@@ -237,6 +380,23 @@ class TestConfigDrawerResolvedValue:
         )
         r = client.get(f"{BASE}/{conn_id}/extraction/config", headers=_auth(token))
         assert r.json()["min_modified"] == {"value": "2023-12-31", "source": "connection"}
+
+    def test_schedule_defaults_to_instance(self, seeded_app):
+        client, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = _create_connection(client, token, name="corp-sharepoint-crawl-schedule-drawer-default")
+        r = client.get(f"{BASE}/{conn_id}/extraction/config", headers=_auth(token))
+        assert r.status_code == 200, r.text
+        assert r.json()["schedule"] == {"value": "instance", "source": "default", "next_run_at": None}
+
+    def test_schedule_reflects_a_set_override(self, seeded_app):
+        client, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = _create_connection(client, token, name="corp-sharepoint-crawl-schedule-drawer-set")
+        client.patch(f"{BASE}/{conn_id}/extraction/crawl-config", json={"schedule": "every 6h"}, headers=_auth(token))
+        r = client.get(f"{BASE}/{conn_id}/extraction/config", headers=_auth(token))
+        body = r.json()["schedule"]
+        assert body["value"] == "every 6h"
+        assert body["source"] == "connection"
+        assert body["next_run_at"] is not None
 
 
 class TestAdminUiWiring:

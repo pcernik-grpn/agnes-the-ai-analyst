@@ -410,7 +410,9 @@ def _rollup_children(
         report = child.get("report") or {}
         progress = child.get("progress") or {}
         live = report or progress
-        seen_documents += sum(int(live.get(k) or 0) for k in ("new", "changed", "unchanged", "filtered_by_age"))
+        seen_documents += sum(
+            int(live.get(k) or 0) for k in ("new", "changed", "unchanged", "renamed", "filtered_by_age")
+        )
         shards_out.append(
             {
                 "index": index,
@@ -493,6 +495,11 @@ def _run_out(
         "new": live.get("new"),
         "changed": live.get("changed"),
         "unchanged": live.get("unchanged"),
+        # A rename/move within the same drive: content unchanged (same
+        # cTag/eTag), only `corpus_files.path`/`filename` moved — a subset
+        # of what would otherwise be `unchanged` (D.18). See
+        # `connectors.sharepoint.crawler._Ingestor.rename`.
+        "renamed": live.get("renamed"),
         "deleted": live.get("deleted"),
         "bytes_downloaded": live.get("bytes_downloaded"),
         "bytes_downloaded_human": live.get("bytes_downloaded_human"),
@@ -781,6 +788,11 @@ def fleet_extraction_runs(
     scope would otherwise never see, since a starved connection's job has
     no ``extraction_runs`` row yet to show up as a table row at all.
 
+    ``next_run_at`` (D.16) on each row is the same best-effort "when next
+    swept" hint the crawl-config PATCH response and ``extraction/status``
+    carry (:func:`_crawl_schedule_next_run_at`) — pure computation, no extra
+    query per row.
+
     Plain ``def`` (not ``async def``, zero ``await``s below): blocking,
     synchronous SQLAlchemy I/O, so FastAPI dispatches it to the anyio thread
     pool rather than the single event loop (Tier-1 convention,
@@ -875,6 +887,12 @@ def fleet_extraction_runs(
                 # source card just to see whether there is anything to retry.
                 "failed_items_count": backlog["failed_items_count"],
                 "empty_items_count": backlog["empty_items_count"],
+                # D.16 — same best-effort display hint the crawl-config
+                # PATCH response and `extraction/status` use
+                # (`_crawl_schedule_next_run_at`), so an operator scanning
+                # `?all=1` can see which idle connections are about to be
+                # swept without opening each source card.
+                "next_run_at": _crawl_schedule_next_run_at(connection, now=now),
             }
         )
 
@@ -1087,6 +1105,13 @@ async def extraction_status(
     ``checkpoint_at``, which is when its numbers were last true. The card
     prints the run's, not this one, wherever it shows a counter.
 
+    ``next_run_at`` (D.16) is when this connection's own crawl cadence
+    (``config.extraction.crawl.schedule`` — off / follow-the-instance-
+    cadence / its own interval) next fires the scheduled sweep, best-effort
+    and DISPLAY ONLY (:func:`_crawl_schedule_next_run_at`) — ``None`` when
+    this connection is ``off`` or the instance-wide sweep has no cadence
+    configured at all.
+
     ``facts_job`` is the queued/running standalone facts pass for this
     connection (:func:`_facts_job_in_flight`) or ``null`` — a job, never a
     run: it is what lets the card say "a facts pass is running" and lock
@@ -1118,7 +1143,7 @@ async def extraction_status(
     ``last_completed`` above is most recent, in that order, and is ``null``
     when none of the three exist.
     """
-    _sharepoint_connection_or_404(connection_id)
+    connection = _sharepoint_connection_or_404(connection_id)
     from src.repositories import extraction_runs_repo, sharepoint_state_repo
 
     repo = extraction_runs_repo()
@@ -1188,6 +1213,12 @@ async def extraction_status(
         "failed_items_count": backlog["failed_items_count"],
         "empty_items_count": backlog["empty_items_count"],
         "skipped_unsupported_count": skipped_unsupported_count,
+        # D.16 — best-effort "when will this connection next be swept",
+        # same computation the crawl-config PATCH response and the fleet
+        # view use (`_crawl_schedule_next_run_at`). `None` when this
+        # connection is `off` or the instance-wide sweep has no cadence
+        # configured at all.
+        "next_run_at": _crawl_schedule_next_run_at(connection, now=now),
         "as_of": now.isoformat(),
     }
 
@@ -1464,6 +1495,44 @@ class CrawlConfigPatch(BaseModel):
     #: reading as `FactsConfigPatch.retry_mode` above. An ISO `YYYY-MM-DD`
     #: string, validated below; anything else is a 400.
     min_modified: Optional[str] = None
+    #: D.16 — this connection's own crawl cadence. UNLIKE `min_modified`
+    #: above, "not provided" and "clear" are DIFFERENT here (checked via
+    #: `model_fields_set`, the same discipline `FactsConfigPatch.transport`
+    #: uses): a caller touching only `min_modified` must not silently reset
+    #: an already-set `schedule` back to the instance default, and vice
+    #: versa — see the handler's own docstring. `None` (given explicitly)
+    #: clears the override back to `CRAWL_SCHEDULE_INSTANCE`; omitted
+    #: leaves it untouched.
+    schedule: Optional[str] = None
+
+
+def _crawl_schedule_next_run_at(connection: Dict[str, Any], *, now: datetime) -> Optional[str]:
+    """The Crawl schedule panel's "next run" hint (D.16) — best-effort,
+    DISPLAY ONLY, mirroring :func:`src.scheduler.next_due_at`'s own "not the
+    source of truth" posture. ``None`` when this connection's own cadence
+    resolves to ``off``, when the INSTANCE-WIDE sweep itself has no schedule
+    configured (the sweep never runs at all, regardless of any per-
+    connection override — see ``app/api/admin_sharepoint.py::
+    run_due_extraction``), or when neither cadence has a well-defined next
+    occurrence (a ``cron`` schedule — see ``next_due_at``).
+    """
+    from connectors.sharepoint.crawler import CRAWL_SCHEDULE_INSTANCE, CRAWL_SCHEDULE_OFF, resolve_crawl_schedule
+    from src.scheduler import next_due_at
+
+    own_schedule, _source = resolve_crawl_schedule(connection)
+    if own_schedule == CRAWL_SCHEDULE_OFF:
+        return None
+    if own_schedule == CRAWL_SCHEDULE_INSTANCE:
+        from app.api.admin_sharepoint import _extraction_schedule_config
+
+        effective_schedule = _extraction_schedule_config()
+    else:
+        effective_schedule = own_schedule
+    if not effective_schedule:
+        return None
+    last_run_at = ((connection.get("config") or {}).get("extraction") or {}).get("last_run_at")
+    due_at = next_due_at(effective_schedule, last_run_at, now=now)
+    return due_at.isoformat() if due_at else None
 
 
 @router.patch("/connections/{connection_id}/extraction/crawl-config")
@@ -1472,34 +1541,60 @@ async def patch_extraction_crawl_config(
     body: CrawlConfigPatch,
     _user: dict = Depends(require_admin),
 ):
-    """Per-connection age filter for the crawl (a backfill lever): a
-    connection can crawl only files modified on/after a cutoff date instead
-    of re-walking a whole multi-year corpus.
+    """Per-connection crawl levers: the ``min_modified`` age filter (a
+    backfill lever — crawl only files modified on/after a cutoff date
+    instead of re-walking a whole multi-year corpus) and, since D.16, this
+    connection's own sweep cadence (``schedule``) — "keeping a site current
+    without an operator" needs more than the one instance-wide cadence
+    ``extraction.schedule`` offers.
 
-    Writes ``config.extraction.crawl.min_modified`` on the connection row —
-    a sibling of ``config.extraction.facts.retry_mode`` (the facts-config
-    endpoint above) and ``config.extraction.stop_requested_at`` (the Stop
-    control): the established home for per-connection extraction state,
-    carried forward on every generic connection edit. ``min_modified: null``
-    (or the field simply omitted) CLEARS the override — there is no
-    instance-level fallback to fall back to (see
+    Writes ``config.extraction.crawl.min_modified``/``config.extraction.
+    crawl.schedule`` on the connection row — a sibling of ``config.
+    extraction.facts.retry_mode`` (the facts-config endpoint above) and
+    ``config.extraction.stop_requested_at`` (the Stop control): the
+    established home for per-connection extraction state, carried forward
+    on every generic connection edit.
+
+    ``min_modified: null`` (or the field simply OMITTED) CLEARS the
+    override — there is no instance-level fallback to fall back to (see
     :func:`connectors.sharepoint.crawler.resolve_min_modified`'s own
-    docstring for why). A value that is not a parseable ISO ``YYYY-MM-DD``
-    date is refused with a plain ``400`` (``invalid_min_modified``) rather
-    than silently ignored — a caller setting a value expects it to take
-    effect.
+    docstring for why); a value that is not a parseable ISO ``YYYY-MM-DD``
+    date is refused with a plain ``400`` (``invalid_min_modified``).
+
+    ``schedule`` follows a DIFFERENT omitted-vs-null contract, because this
+    endpoint now sets two independent knobs and neither may silently reset
+    the other: omitted leaves the stored ``schedule`` untouched (checked via
+    ``"schedule" in body.model_fields_set``, the SAME pattern ``…/facts-
+    config``'s ``transport``/``provider``/``vertex_region`` already use for
+    this exact reason), ``null`` (given explicitly) CLEARS the override back
+    to ``CRAWL_SCHEDULE_INSTANCE`` (follow the instance-wide cadence — see
+    :func:`connectors.sharepoint.crawler.resolve_crawl_schedule`), and any
+    other value must be ``"off"``, ``"instance"``, or a cadence string
+    :func:`connectors.sharepoint.crawler.is_valid_crawl_schedule` accepts
+    (the SAME grammar ``extraction.schedule`` itself uses instance-wide) —
+    refused with ``400 invalid_crawl_schedule`` otherwise. The response's
+    ``schedule.next_run_at`` is a best-effort display hint
+    (:func:`_crawl_schedule_next_run_at`), ``None`` when this connection is
+    ``off`` or the instance-wide sweep has no cadence configured at all (see
+    ``app/api/admin_sharepoint.py::run_due_extraction`` — the instance
+    switch is still what turns the sweep ON, regardless of any per-
+    connection override).
 
     Works on BOTH app-state backends, like its siblings above: this touches
     only ``source_connections``, never a PG-only table.
     """
     connection = _sharepoint_connection_or_404(connection_id)
-    from connectors.sharepoint.crawler import resolve_min_modified
+    from connectors.sharepoint.crawler import is_valid_crawl_schedule, resolve_crawl_schedule, resolve_min_modified
 
     if body.min_modified is not None:
         try:
             date.fromisoformat(body.min_modified)
         except ValueError:
             raise HTTPException(status_code=400, detail="invalid_min_modified") from None
+
+    schedule_given = "schedule" in body.model_fields_set
+    if schedule_given and body.schedule is not None and not is_valid_crawl_schedule(body.schedule):
+        raise HTTPException(status_code=400, detail="invalid_crawl_schedule")
 
     from src.repositories import source_connections_repo
 
@@ -1510,13 +1605,20 @@ async def patch_extraction_crawl_config(
         crawl_cfg.pop("min_modified", None)
     else:
         crawl_cfg["min_modified"] = body.min_modified
+    if schedule_given:
+        if body.schedule is None:
+            crawl_cfg.pop("schedule", None)
+        else:
+            crawl_cfg["schedule"] = body.schedule
     if crawl_cfg:
         extraction["crawl"] = crawl_cfg
     else:
         extraction.pop("crawl", None)
     updated = repo.config_patch(connection_id, {"extraction": extraction})
 
-    cutoff, source = resolve_min_modified(updated)
+    cutoff, mm_source = resolve_min_modified(updated)
+    schedule_value, schedule_source = resolve_crawl_schedule(updated)
+    next_run_at = _crawl_schedule_next_run_at(updated, now=datetime.now(timezone.utc))
 
     # More than the fallback middleware can say (it never sees the body) —
     # same reasoning as the facts-config endpoint's own log_safe above.
@@ -1527,13 +1629,17 @@ async def patch_extraction_crawl_config(
         params={
             "min_modified": body.min_modified,
             "resolved": cutoff.isoformat() if cutoff else None,
-            "source": source,
+            "source": mm_source,
+            "schedule": body.schedule if schedule_given else "(untouched)",
+            "schedule_resolved": schedule_value,
+            "schedule_source": schedule_source,
         },
     )
 
     return {
         "connection_id": connection_id,
-        "min_modified": {"value": cutoff.isoformat() if cutoff else None, "source": source},
+        "min_modified": {"value": cutoff.isoformat() if cutoff else None, "source": mm_source},
+        "schedule": {"value": schedule_value, "source": schedule_source, "next_run_at": next_run_at},
     }
 
 
@@ -2050,12 +2156,17 @@ async def extraction_config(
     ``{value, source}`` shape the ``…/extraction/crawl-config`` PATCH
     response returns) — the drawer's Crawl filter panel needs the CURRENT
     override to pre-fill its date input, not just a place to write a new one.
+    ``schedule`` (D.16) is this connection's own sweep cadence, same shape
+    plus a ``next_run_at`` display hint (:func:`_crawl_schedule_next_run_at`)
+    — the panel's "Crawl schedule" control needs the same round trip.
     """
     connection = _sharepoint_connection_or_404(connection_id)
 
-    from connectors.sharepoint.crawler import resolve_min_modified
+    from connectors.sharepoint.crawler import resolve_crawl_schedule, resolve_min_modified
 
     cutoff, min_modified_source = resolve_min_modified(connection)
+    schedule_value, schedule_source = resolve_crawl_schedule(connection)
+    now = datetime.now(timezone.utc)
 
     scopes: List[Dict[str, Any]] = []
     try:
@@ -2086,7 +2197,12 @@ async def extraction_config(
         if section_editable
         else "The `extraction` section is not admin-writable on this instance.",
         "min_modified": {"value": cutoff.isoformat() if cutoff else None, "source": min_modified_source},
-        "as_of": datetime.now(timezone.utc).isoformat(),
+        "schedule": {
+            "value": schedule_value,
+            "source": schedule_source,
+            "next_run_at": _crawl_schedule_next_run_at(connection, now=now),
+        },
+        "as_of": now.isoformat(),
     }
 
 

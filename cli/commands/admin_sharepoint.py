@@ -68,9 +68,12 @@ Thirteen surfaces:
     CLI counterpart to
     ``PATCH /api/admin/sharepoint/connections/{connection_id}/extraction/
     facts-config``.
-  - ``crawl-config`` — a per-connection age filter: a backfill run can crawl
+  - ``crawl-config`` — a per-connection age filter (a backfill run can crawl
     only what changed on/after a cutoff date instead of re-walking a whole
-    multi-year corpus. CLI counterpart to
+    multi-year corpus) AND, since D.16, this connection's own scheduled-
+    sweep cadence (``off``/``instance``/a cadence string — see
+    ``docs/sharepoint-extraction.md`` → *Keeping a site current*). CLI
+    counterpart to
     ``PATCH /api/admin/sharepoint/connections/{connection_id}/extraction/
     crawl-config``.
   - ``completeness`` — "did we really get everything?" (TCRD-296 B.9):
@@ -1580,21 +1583,35 @@ def crawl_config(
         "an item with no modified timestamp is always kept.",
     ),
     clear: bool = typer.Option(False, "--clear", help="Remove the override — the connection crawls unfiltered."),
+    schedule: Optional[str] = typer.Option(
+        None,
+        "--schedule",
+        help="This connection's own crawl cadence (D.16): 'off' (never picked up by the scheduled sweep, "
+        "regardless of the instance-wide cadence), 'instance' (follow extraction.schedule — the default), "
+        "or a cadence string in the SAME grammar extraction.schedule itself uses ('every 15m'/'every 6h', "
+        "'daily 03:00', 'daily 07:00,13:00', 'cron 0 3 * * *'). Requires the instance-wide sweep to be "
+        "configured at all (docs/sharepoint-extraction.md) — this only narrows WHEN a running sweep picks "
+        "this connection, it does not turn the sweep on by itself.",
+    ),
     as_json: bool = typer.Option(False, "--json"),
 ):
     """Set (or clear) this connection's own ``extraction.crawl.min_modified``
-    age filter — a 190k-document connection can crawl only what changed
-    since a cutoff date instead of re-walking the whole corpus.
+    age filter and/or its own ``extraction.crawl.schedule`` cadence (D.16).
 
-    Exactly one of ``--min-modified`` / ``--clear`` is required. Prints the
-    RESOLVED value and where it came from (``connection`` or ``none``) — the
+    Exactly one of ``--min-modified`` / ``--clear`` is required UNLESS
+    ``--schedule`` is given on its own. ``--schedule`` keeps its OWN value
+    untouched when omitted (this call then only reports its currently
+    resolved value); passing it on a call that also sets/clears
+    ``min_modified`` sets both in the SAME request. Prints the RESOLVED
+    values and where they came from (``connection``/``none`` for
+    ``min_modified``; ``connection``/``default`` for ``schedule``) — the
     same shape the admin config drawer would show.
     """
     if clear and min_modified is not None:
         typer.echo("Error: pass either --min-modified or --clear, not both", err=True)
         raise typer.Exit(1)
-    if not clear and min_modified is None:
-        typer.echo("Error: one of --min-modified or --clear is required", err=True)
+    if not clear and min_modified is None and schedule is None:
+        typer.echo("Error: pass at least one of --min-modified, --clear, or --schedule", err=True)
         raise typer.Exit(1)
     if min_modified is not None:
         try:
@@ -1603,9 +1620,26 @@ def crawl_config(
             typer.echo(f"Error: --min-modified must be an ISO YYYY-MM-DD date, got {min_modified!r}", err=True)
             raise typer.Exit(1) from None
 
+    # `min_modified` keeps its ORIGINAL "omitted == cleared" contract on the
+    # endpoint (same posture `facts_config`'s own `retry_mode` keeps
+    # regardless of `transport`/`provider` — see that command's comment
+    # above) — a `--schedule`-only call must re-send the connection's
+    # CURRENT `min_modified` explicitly, or it would silently wipe it.
+    touching_min_modified = clear or min_modified is not None
+    payload: dict = {}
+    if touching_min_modified:
+        payload["min_modified"] = None if clear else min_modified
+    elif schedule is not None:
+        current = api_get(f"/api/admin/sharepoint/connections/{connection_id}")
+        if current.status_code == 200:
+            crawl_now = (((current.json().get("config") or {}).get("extraction") or {}).get("crawl")) or {}
+            payload["min_modified"] = crawl_now.get("min_modified")
+    if schedule is not None:
+        payload["schedule"] = schedule
+
     resp = api_patch(
         f"/api/admin/sharepoint/connections/{connection_id}/extraction/crawl-config",
-        json={"min_modified": min_modified},
+        json=payload,
     )
     if resp.status_code != 200:
         _fail(resp)
@@ -1615,6 +1649,13 @@ def crawl_config(
         return
     resolved = body.get("min_modified") or {}
     typer.echo(f"min_modified: {resolved.get('value')} (source: {resolved.get('source')})")
+    resolved_schedule = body.get("schedule") or {}
+    if resolved_schedule:
+        next_run = resolved_schedule.get("next_run_at")
+        typer.echo(
+            f"schedule: {resolved_schedule.get('value')} (source: {resolved_schedule.get('source')}) "
+            f"— next run: {next_run or 'not scheduled'}"
+        )
 
 
 @scope_app.command("set-mode")
