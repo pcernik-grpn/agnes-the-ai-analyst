@@ -30,6 +30,15 @@ _SELECT_CC_NO_EMBED = ", ".join(f"cc.{c}" for c in _SELECT_NO_EMBED.split(", "))
 # private constant.
 _STATEMENT_TIMEOUT_MS = 5_000
 
+# Ranking cap for ``search_candidates`` (P1 perf fix, 2026-09 — see that
+# method's docstring for the live finding). A plain multiplier + floor, not
+# a config knob (project rule: defaults live in code, not a speculative new
+# setting) — the candidate set fed to ``ts_rank_cd`` is capped at
+# ``max(limit * _RANK_CANDIDATE_MULTIPLIER, _RANK_CANDIDATE_FLOOR)`` rows
+# regardless of how many rows match the ``tsquery``.
+_RANK_CANDIDATE_MULTIPLIER = 4
+_RANK_CANDIDATE_FLOOR = 20_000
+
 
 class CorpusChunksPgRepository:
     """Postgres twin of ``CorpusChunksRepository``."""
@@ -309,25 +318,55 @@ class CorpusChunksPgRepository:
         ``SET LOCAL statement_timeout`` the ILIKE-driven methods above do:
         on exactly the instance this fix exists for (index not yet built),
         a 5s budget would turn every search into a typed 503 rather than a
-        slow-but-correct answer. The row ``LIMIT`` is the bound here.
+        slow-but-correct answer.
+
+        The bound here is NOT the row ``LIMIT`` — a common single term (a
+        production instance measured ~1.07M matches for ``contract`` out of
+        14.5M chunks) still matches far more rows than any sane ``limit``,
+        and ``ORDER BY ts_rank_cd(...)`` forces Postgres to heap-fetch AND
+        re-tokenize (``to_tsvector``) every matching row before ``LIMIT``
+        can drop any of them — the GIN index bounds the WHERE clause, not
+        the ranking. Measured on that instance: 395s for a 20-row result.
+        The actual bound is ``rank_cap`` (``max(limit *
+        _RANK_CANDIDATE_MULTIPLIER, _RANK_CANDIDATE_FLOOR)``): an inner
+        subquery selects at most ``rank_cap`` matching rows (a real
+        optimization fence in Postgres — a subquery with a ``LIMIT`` cannot
+        be flattened into the outer query), and only THAT bounded set is
+        ranked. Expected on the same instance: well under 2s.
+
+        Trade-off, by construction: when a term matches more than
+        ``rank_cap`` chunks, this ranks an arbitrary ``rank_cap``-sized
+        subset of the matches, not the globally top-ranked ones — the
+        subquery has no ``ORDER BY``, so which rows land in the subset is
+        whatever order the planner's scan happens to produce. Accepted
+        because (a) ``plainto_tsquery`` is AND-semantics, so a multi-term
+        query is already selective enough to stay well under the cap in
+        practice, and (b) a single term common enough to blow through
+        ``rank_cap`` alone (like "contract" above) carries almost no
+        ranking signal to begin with — it appears in a large, roughly
+        uniform slice of the corpus, so which slice gets ranked barely
+        changes the top results.
 
         Empty ``corpus_ids`` → ``[]`` without querying, matching
         ``list_for_corpora``.
         """
         if not corpus_ids:
             return []
+        rank_cap = max(limit * _RANK_CANDIDATE_MULTIPLIER, _RANK_CANDIDATE_FLOOR)
         with self._engine.connect() as conn:
             rows = (
                 conn.execute(
                     sa.text(
-                        f"SELECT {_SELECT_NO_EMBED} "
-                        "FROM corpus_chunks "
-                        "WHERE corpus_id = ANY(:corpus_ids) "
-                        "  AND to_tsvector('simple', text) @@ plainto_tsquery('simple', :query) "
-                        "ORDER BY ts_rank_cd(to_tsvector('simple', text), plainto_tsquery('simple', :query)) DESC "
+                        f"SELECT {_SELECT_NO_EMBED} FROM ("
+                        f"  SELECT {_SELECT_NO_EMBED} FROM corpus_chunks "
+                        "   WHERE corpus_id = ANY(:corpus_ids) "
+                        "     AND to_tsvector('simple', text) @@ plainto_tsquery('simple', :query) "
+                        "   LIMIT :rank_cap"
+                        ") c "
+                        "ORDER BY ts_rank_cd(to_tsvector('simple', c.text), plainto_tsquery('simple', :query)) DESC "
                         "LIMIT :limit"
                     ),
-                    {"corpus_ids": list(corpus_ids), "query": query, "limit": limit},
+                    {"corpus_ids": list(corpus_ids), "query": query, "limit": limit, "rank_cap": rank_cap},
                 )
                 .mappings()
                 .all()
