@@ -216,6 +216,6 @@
     fields: [{% for f in domain.fields %}"{{ f.key }}"{% if not loop.last %}, {% endif %}{% endfor %}],
   };
 </script>
-<script type="module" src="/static/js/studio.js"></script>
+<script type="module" src="{{ static_url('js/studio.js') }}"></script>
 <script src="{{ static_url('js/components/ds_dropdown.js') }}" defer></script>
 {% endblock %}

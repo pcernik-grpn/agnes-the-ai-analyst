@@ -6791,7 +6791,7 @@ details.section-card > summary {
 }
 .cld-door-orb {
     display: block;
-    /* The PNG is 256x256, so it stays crisp at this size on retina. */
+    /* The PNG is 192x192, still crisp at this size up to DPR 3. */
     width: 32px; height: 32px;
 }
 

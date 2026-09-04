@@ -651,9 +651,11 @@ function setThreadTitle(title) {
 //    the page.
 // 2. It is 3.5 MB. Loaded once, on demand, the first time a diagram actually
 //    appears in a thread — a user who never sees one never pays for it, which
-//    is the only reason a dependency this size is tolerable here.
-const _MERMAID_URL = "/static/vendor/mermaid.min.js";
-
+//    is the only reason a dependency this size is tolerable here. Sized like
+//    that, it must hit the immutable /static cache and never a bare no-cache
+//    revalidation — window._agMermaidUrl (stamped in _app_scripts.html)
+//    carries the ?v= cache-buster for exactly that.
+const _MERMAID_URL = window._agMermaidUrl || "/static/vendor/mermaid.min.js";
 // ── pure helpers ─────────────────────────────────────────────────────────
 // Self-contained on purpose: tests/test_chat_mermaid_ui.py slices this block
 // out of the file and runs it under node, so it must not reach for the DOM.
