@@ -74,25 +74,45 @@ their own usage with `agnes query` instead of an admin page:
 | `agnes_telemetry` | `usage_events` | own rows (non-admin) / all (admin) |
 | `agnes_audit` | `audit_log` | own rows (non-admin) / all (admin) |
 | `agnes_turns` | `usage_turns` | own rows (non-admin) / all (admin) |
+| `agnes_extraction_runs` | `extraction_runs` | **admin-only** — zero rows for any non-admin |
+| `agnes_facts_ingest_runs` | `facts_ingest_runs` | **admin-only** — zero rows for any non-admin |
 
 `agnes_turns` (token usage per assistant turn, including prompt-cache reads
-and writes, across Claude Code and every chat surface) exists **only on
-Postgres-backed instances** — its source table has no DuckDB counterpart. On a
-DuckDB-backed instance the id is not registered at all: it never appears in
-`agnes catalog`, and a `SELECT` against it says the table is unavailable here
-rather than pointing at a package grant that could not surface it.
+and writes, across Claude Code and every chat surface), `agnes_extraction_runs`
+(one row per built-in extraction/crawl run) and `agnes_facts_ingest_runs`
+(one row per fact-graph ingest batch) exist **only on Postgres-backed
+instances** — their source tables have no DuckDB counterpart. On a
+DuckDB-backed instance none of the three ids is registered at all: they never
+appear in `agnes catalog`, and a `SELECT` against any of them says the table
+is unavailable here rather than pointing at a package grant that could not
+surface it.
+
+The first four tables are filtered to the caller's own rows (admins see
+everyone). `agnes_extraction_runs` and `agnes_facts_ingest_runs` are
+**admin/operator data, not per-user data**: a crawl run belongs to a
+data-source connection and an ingest batch belongs to a set of collections —
+neither belongs to a person, so there is no "own rows" for a non-admin to
+see. Granting the package still decides whether the TABLE is visible
+(`agnes catalog` lists it, a query gets past the 403), but every non-admin
+caller's query against either one succeeds with zero rows, never someone
+else's data and never a wider grant than the four own-rows tables get. This
+is what makes the real LLM spend ledger (`agnes_extraction_runs.usage`,
+`agnes_facts_ingest_runs.llm_usage`) safely queryable at all: an admin can
+ask `agnes query "SELECT json_extract(llm_usage, '$.input_tokens') FROM
+agnes_facts_ingest_runs"` instead of trusting one dashboard's arithmetic,
+without opening that ledger to every grantee of the package.
 
 They are server-side only — `agnes pull` never downloads them — and they are
 **members of a seeded data package with the slug `agnes-usage`**, so who may
 query usage data at all is an admin decision like any other table grant.
 Grant the package to a group (`/admin/access`, or `agnes admin grant create
-<group> data_package <pkg-id>`) and its members can read the tables, still
-filtered to their own rows; without the grant the tables are absent from
-`agnes catalog` and a `SELECT` against them returns 403 naming the package.
-Admins are unaffected (god-mode) and keep the unscoped view. Agents and
-co-sessions also keep access without the grant — their authority is already
-owner grants ∩ scope. Full model:
-[`RBAC.md`](RBAC.md#internal-usage-tables-the-agnes-usage-package).
+<group> data_package <pkg-id>`) and its members can read the four own-rows
+tables, still filtered to their own rows; without the grant every table in
+the package is absent from `agnes catalog` and a `SELECT` against any of them
+returns 403 naming the package. Admins are unaffected (god-mode) and keep the
+unscoped view on all six tables. Agents and co-sessions also keep access
+without the grant — their authority is already owner grants ∩ scope. Full
+model: [`RBAC.md`](RBAC.md#internal-usage-tables-the-agnes-usage-package).
 
 **Operator step after upgrading** to the release that introduced this
 (previously every authenticated user had implicit access): grant
