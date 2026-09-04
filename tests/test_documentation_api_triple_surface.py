@@ -1595,6 +1595,20 @@ _EXEMPT: dict[str, str] = {
         "for the completeness drawer — CLI-reachable (agnes admin sharepoint completeness) "
         "but deliberately not MCP-exposed, same reasoning as split-plan above"
     ),
+    # "how many documents did we get, how many did we not, by file type and
+    # by reason" (2026-09-04) — read entirely from persisted run/corpus
+    # data, no Graph calls. Same class as `completeness` above: CLI-reachable
+    # (`agnes admin sharepoint breakdown`) for an operator finishing a large
+    # crawl over SSH with no browser open — the endpoint's own docstring
+    # says this is otherwise only reachable by hand-writing SQL against
+    # Postgres on the box — but deliberately not MCP-exposed: an aggregate
+    # operational diagnostic, not a bounded analyst query.
+    "/api/admin/sharepoint/connections/{connection_id}/extraction/breakdown": (
+        "documents/failures/skips grouped by file extension and normalized failure reason, plus "
+        "run-level reconciliation scalars, for the extraction breakdown panel — admin display "
+        "primitive, CLI-reachable (agnes admin sharepoint breakdown) but deliberately not "
+        "MCP-exposed, same reasoning as completeness above"
+    ),
     # Cooperative stop for the same card's Stop button (owner-frustration fix,
     # 2026-09-01) — an admin-only control over the SAME crawl the trigger
     # above starts, no analyst CLI/MCP analogue.

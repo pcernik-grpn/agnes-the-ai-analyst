@@ -48,6 +48,17 @@ def remote_table_hint(table: str, *, surface: str = "cli") -> str:
     )
 
 
+def sharepoint_connection_not_found_hint(connection_id: str) -> str:
+    """Hint for a `404 connection_not_found` from an `agnes admin sharepoint
+    <connection_id> ...` subcommand — the id is wrong, or it names a
+    connection that isn't a SharePoint one (see `_sharepoint_connection_or_
+    404`, `app/api/admin_extraction.py`)."""
+    return (
+        f"No SharePoint connection '{connection_id}'. Check the id with "
+        "`agnes admin connection list --source-type sharepoint`."
+    )
+
+
 def facts_not_found_hint(subject_id: str, *, surface: str = "cli") -> str:
     """Hint for a `404` from `agnes facts neighbors|claims` (or the
     `fact_neighbors`/`fact_claims` MCP tools).

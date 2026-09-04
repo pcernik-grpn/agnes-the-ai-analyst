@@ -746,6 +746,97 @@ def test_top_folder_status_counts_unknown_corpus_returns_empty_dict(repo):
     assert repo.top_folder_status_counts("col_absent") == {}
 
 
+def test_extension_status_counts_groups_by_extension_from_path_not_filename(repo):
+    """The trap this method exists to avoid: `filename`/`file_type` name the
+    STORED artifact (always markdown for a converted document), never the
+    original file type. Two files whose `filename`/`file_type` both say
+    "md" but whose real `path` extensions differ must bucket separately."""
+    a = repo.add(
+        corpus_id="col_a",
+        filename="report.md",
+        sha256="sha_a",
+        file_type="md",
+        size_bytes=100,
+        storage_path="/tmp/a.md",
+        path="Reports/2024/report.pdf",
+    )
+    repo.set_status(a, status="indexed")
+    b = repo.add(
+        corpus_id="col_a",
+        filename="deck.md",
+        sha256="sha_b",
+        file_type="md",
+        size_bytes=50,
+        storage_path="/tmp/b.md",
+        path="Slides/deck.pptx",
+    )
+    repo.set_status(b, status="rejected")
+    counts = repo.extension_status_counts(["col_a"])
+    assert counts["pdf"] == {"indexed": {"count": 1, "bytes": 100}}
+    assert counts["pptx"] == {"rejected": {"count": 1, "bytes": 50}}
+
+
+def test_extension_status_counts_buckets_extensionless_and_null_path_under_blank(repo):
+    repo.add(
+        corpus_id="col_a",
+        filename="README.md",
+        sha256="sha_a",
+        file_type="md",
+        size_bytes=5,
+        storage_path="/tmp/a.md",
+        path="README",
+    )
+    repo.add(
+        corpus_id="col_a",
+        filename="no-path.md",
+        sha256="sha_b",
+        file_type="md",
+        size_bytes=7,
+        storage_path="/tmp/b.md",
+    )
+    counts = repo.extension_status_counts(["col_a"])
+    assert counts[""]["pending"]["count"] == 2
+    assert counts[""]["pending"]["bytes"] == 12
+
+
+def test_extension_status_counts_is_case_insensitive_and_scoped_across_ids(repo):
+    a = repo.add(
+        corpus_id="col_a",
+        filename="a.md",
+        sha256="sha_a",
+        file_type="md",
+        size_bytes=10,
+        storage_path="/tmp/a.md",
+        path="doc.PDF",
+    )
+    repo.set_status(a, status="indexed")
+    b = repo.add(
+        corpus_id="col_b",
+        filename="b.md",
+        sha256="sha_b",
+        file_type="md",
+        size_bytes=20,
+        storage_path="/tmp/b.md",
+        path="other.pdf",
+    )
+    repo.set_status(b, status="indexed")
+    repo.add(
+        corpus_id="col_unrequested",
+        filename="c.md",
+        sha256="sha_c",
+        file_type="md",
+        size_bytes=30,
+        storage_path="/tmp/c.md",
+        path="skip.pdf",
+    )
+    counts = repo.extension_status_counts(["col_a", "col_b"])
+    assert counts["pdf"] == {"indexed": {"count": 2, "bytes": 30}}
+
+
+def test_extension_status_counts_empty_ids_returns_empty_dict(repo):
+    assert repo.extension_status_counts([]) == {}
+
+
 # ---------------------------------------------------------------------------
 # list_for_corpus / count_for_corpus — pagination + search (contract §1)
 # ---------------------------------------------------------------------------

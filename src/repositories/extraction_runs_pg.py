@@ -665,6 +665,54 @@ class ExtractionRunsPgRepository:
             )
         return _decode_row(dict(row)) if row else None
 
+    def list_full_for_connection(
+        self,
+        connection_id: str,
+        *,
+        since: Optional[datetime] = None,
+        until: Optional[datetime] = None,
+        limit: int = 500,
+    ) -> List[Dict[str, Any]]:
+        """Every run row for this connection whose ``started_at`` falls in
+        ``[since, until)`` — PARENT rows AND shard children alike, unlike
+        :meth:`list_for_connection`/:meth:`list_latest_for_connections`
+        (which both scope to ``parent_run_id IS NULL`` for the fleet/history
+        views). The extraction breakdown surface (``GET …/extraction/
+        breakdown``) aggregates a whole "run family" — every restart of one
+        crawl, and every shard of a sharded one — and a shard child's own
+        row is where the substantive ``report.failed_items``/``skips`` for
+        that shard actually live; the parent (planner) row's own report is
+        near-empty by construction.
+
+        Returns the FULL row (unlike the two list methods above, whose
+        ``_RUN_LIST_COLUMNS`` projection strips ``report.failed_items``/
+        ``report.skipped_items`` to keep a fleet/history read cheap) —
+        this is the one reader that actually needs those itemized lists.
+
+        ``limit`` is a defensive ceiling, not a pagination contract: newest
+        ``started_at`` first, capped at 2000. A "run family" can run to
+        hundreds of rows on a long-lived connection, each carrying up to
+        5000 ``failed_items`` — without a cap, one aggregation call could
+        pull tens of megabytes of JSON for a connection nobody asked to see
+        that far back. Since/until narrow the SAME way; the default (both
+        ``None``) is "everywhere", per the command-UX default-to-auto rule —
+        the caller is expected to pass a window for a connection with a
+        long history rather than lean on the cap silently truncating it.
+        """
+        limit = max(1, min(int(limit or 500), 2000))
+        sql = "SELECT * FROM extraction_runs WHERE connection_id = :cid"
+        params: Dict[str, Any] = {"cid": connection_id, "limit": limit}
+        if since is not None:
+            sql += " AND started_at >= :since"
+            params["since"] = since
+        if until is not None:
+            sql += " AND started_at < :until"
+            params["until"] = until
+        sql += " ORDER BY started_at DESC LIMIT :limit"
+        with self._engine.connect() as conn:
+            rows = conn.execute(sa.text(sql), params).mappings().all()
+        return [_decode_row(dict(r)) for r in rows]
+
     def list_for_connection(
         self,
         connection_id: str,

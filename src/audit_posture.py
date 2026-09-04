@@ -901,6 +901,20 @@ READ_POSTURE: dict[str, str] = {
     "GET /api/admin/sharepoint/connections/{connection_id}/extraction/completeness": (
         "sharepoint_connection.completeness_read"
     ),
+    # "How many documents did we get, how many did we not, by file type and
+    # by reason" (2026-09-04) — aggregated counts by extension and by
+    # NORMALIZED failure reason, plus run-level scalars. Unlike A3's
+    # `extraction/runs/{run_id}` (itself only `exempt:ui_support`), this
+    # never carries a `path`/`item_id`/`drive_id` — only extensions, reason
+    # strings and counts. One caveat on "reason strings": a `convert_failed`
+    # reason can itself quote a short fragment of the document a converter
+    # just failed on (`_convert_failure_detail`, `connectors/sharepoint/
+    # crawler.py`) whenever the owning scope is not anonymize-marked — the
+    # same exposure A3's own `report.failed_items`/`errors_detail` already
+    # carry (and A3 additionally names the real path/item_id, which this
+    # endpoint never does), so this sits at or below A3's own disclosure
+    # level, not above it.
+    "GET /api/admin/sharepoint/connections/{connection_id}/extraction/breakdown": "exempt:ui_support",
     # The fleet dashboard's own poll (`/admin/extraction`, 5s while any run
     # is active) — one row per connection of the SAME run counters A1
     # already exempts, plus a derived rate and a derived "stuck" flag. Same

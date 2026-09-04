@@ -3711,6 +3711,14 @@ KNOWN_UNTESTED = {
     "GET /api/admin/sharepoint/connections/{connection_id}/extraction/status",
     "GET /api/admin/sharepoint/connections/{connection_id}/extraction/runs",
     "GET /api/admin/sharepoint/connections/{connection_id}/extraction/runs/{run_id}",
+    # Extraction breakdown (2026-09-04) — documents/failures/skips grouped
+    # by file extension and normalized reason. Same reasoning as the trio
+    # above: reads the PG-only `extraction_runs` table (plus `corpus_files`,
+    # a frozen pair present on both backends), so its per-backend behaviour
+    # IS the point (200 + shape on PG, typed 501 on DuckDB, 403/404) —
+    # asserted directly by tests/test_admin_extraction.py and
+    # tests/db_pg/test_extraction_api_pg.py; not duplicated in this sweep.
+    "GET /api/admin/sharepoint/connections/{connection_id}/extraction/breakdown",
     # Corporate-memory detection observability (issue #1971 Part 3/4) — same
     # shape as the extraction-observability trio above: read-only run
     # history backed by a PG-only table (`memory_detection_runs`), so its

@@ -86,3 +86,36 @@ class TestExtractionFleetPageNav:
         from app.web.admin_nav import resolve_active_section_key
 
         assert resolve_active_section_key("/admin/extraction") == "data"
+
+
+class TestExtractionBreakdownSection:
+    """The breakdown panel (2026-09-04) — its own toolbar/tables, fetched
+    independently of the fleet table above from
+    ``GET .../extraction/breakdown``."""
+
+    def test_page_carries_the_breakdown_section_and_its_script(self, seeded_app):
+        client, token = seeded_app["client"], seeded_app["admin_token"]
+        resp = client.get("/admin/extraction", headers=_auth(token))
+        assert resp.status_code == 200, resp.text
+        body = resp.text
+        assert 'id="extbd-section"' in body
+        assert 'id="extbd-conn"' in body
+        assert 'id="extbd-since"' in body
+        assert 'id="extbd-until"' in body
+        assert 'id="extbd-apply"' in body
+        assert 'id="extbd-ext-tbody"' in body
+        assert 'id="extbd-reason-tbody"' in body
+        assert "extraction_breakdown.js" in body
+
+        script = client.get("/static/js/admin/extraction_breakdown.js")
+        assert script.status_code == 200, script.text
+        assert "/extraction/breakdown" in script.text
+        assert "FilterToolbar" in script.text
+
+    def test_breakdown_section_does_not_touch_the_fleet_summary_tiles(self, seeded_app):
+        """Scope guard: the new section must not rename/duplicate the
+        sibling-owned `ext-summary` tiles or the fleet table's cost column."""
+        client, token = seeded_app["client"], seeded_app["admin_token"]
+        body = client.get("/admin/extraction", headers=_auth(token)).text
+        assert body.count('id="ext-summary"') == 1
+        assert body.count('id="ext-stat-cost"') == 1
