@@ -126,6 +126,23 @@
     if (!g) return "";
     return g.mapped_email || (g.is_google_managed ? g.name : "");
   }
+
+  /* How many accounts a group holds, said in the noun that is true of them.
+
+     `member_count` counts MEMBERSHIPS. A group may legitimately hold a
+     service account — its authority is exactly the groups an admin put it
+     in (issue #1534) — or a seeded system identity, and `is_person` counts
+     neither. So this number is not a headcount, and the page printed it as
+     "3 people" beside `/api/admin/groups/reach`'s people-only "2 people",
+     two words apart, both right and one mislabelled.
+
+     ONE function because seven renderers printed this, each written at a
+     different time and none aware of the others: the group row, the panel
+     header above it, the group's row and the collapsed line in By resource,
+     the picker's rows, and the delete-group and revoke confirmations. The
+     word drifting back in one of them is the regression to design out, not
+     to guard against — a guard can only notice it afterwards. */
+  const memberLabel = (n) => `${n} ${n === 1 ? "member" : "members"}`;
   // System seeds and Google-synced rows are renamed and deleted where they
   // are owned — in the seed, or in Workspace. The retired pages hid both
   // controls on exactly this predicate.
@@ -754,7 +771,7 @@
          and is right on both app-state backends. */
       const meta = g.is_everyone
         ? `every account · ${grants} granted`
-        : `${members} ${members === 1 ? "person" : "people"} · ${grants} granted`;
+        : `${memberLabel(members)} · ${grants} granted`;
       /* The kebab is a SIBLING of the row button, positioned over its right
          edge — not a child. A <button> inside a <button> is invalid markup
          and the browser resolves it by breaking one of them; the wrapper
@@ -922,13 +939,13 @@
     if (!group) {
       meta.innerHTML = "";
     } else {
-      const people = group.member_count ?? 0;
+      const members = group.member_count ?? 0;
       const grants = grantCountOf(group.id);
       const when = fmtDate(group.created_at);
       const reach = everyone
         ? `<b>Every account</b> on this instance`
-        : people
-          ? `<b>${people} ${people === 1 ? "person" : "people"}</b>`
+        : members
+          ? `<b>${memberLabel(members)}</b>`
           : `<span class="warn">Nobody</span>`;
       /* Empty by design. Reach and grants are on the group's own row, two
          words to the left of where this used to print them, and the purpose
@@ -1617,7 +1634,7 @@
     const inactive = members.filter((m) => m.active === false).length;
     const active = members.length - inactive;
     setPeopleHead(
-      members.length ? `${members.length} ${members.length === 1 ? "member" : "members"}` : "Nobody",
+      members.length ? memberLabel(members.length) : "Nobody",
       "Who this group reaches.", peopleFaces(members));
 
     // The find box comes FIRST in the body: at any real group size, "is
@@ -2172,11 +2189,11 @@
   async function deleteGroup(groupId) {
     const group = (overview.groups || []).find((g) => g.id === groupId);
     if (!isEditable(group)) return;
-    const people = group.member_count ?? 0;
+    const members = group.member_count ?? 0;
     const grants = grantCountOf(group.id);
     const ok = await window.confirmModal({
       title: `Delete “${titleOf(group)}”?`,
-      message: `${people} ${people === 1 ? "person" : "people"} lose the ${grants} `
+      message: `${memberLabel(members)} lose the ${grants} `
         + `${grants === 1 ? "thing" : "things"} granted through this group. `
         + `Their accounts and anything granted to them by another group are untouched. This cannot be undone.`,
       confirmText: "Delete group",
@@ -2445,10 +2462,14 @@
       const ids = g.member_ids;
       // Rosters no longer ship (audit S2), so this branch is now the rule
       // rather than the exception: the local figure is a sum of counts, an
-      // ESTIMATE that overshoots when a person is in two groups. Where the
-      // number decides something — the picker footer — `fetchReach` paints
-      // the server's answer over it. Elsewhere it is a summary and says so
-      // by its clamp to the account total.
+      // ESTIMATE that overshoots two ways — a person in two groups, and a
+      // membership that is not a person at all, since `member_count`
+      // counts a service account (#1534) or a system identity that
+      // `is_person` does not. Where the number decides something — the
+      // picker footer — `fetchReach` paints the server's people-only
+      // answer over it. Elsewhere it is a summary and says so by its clamp
+      // to the account total, and every renderer that cannot be corrected
+      // says "members" rather than wearing a word it has not earned.
       if (!Array.isArray(ids)) { unknown += g.member_count ?? 0; continue; }
       for (const id of ids) seen.add(id);
     }
@@ -2710,7 +2731,7 @@
          smaller claim than the truth. */
       const detail = isEveryone
         ? "every account, and anyone who joins"
-        : `${g.member_count ?? 0} ${(g.member_count ?? 0) === 1 ? "person" : "people"}`;
+        : memberLabel(g.member_count ?? 0);
       return `
       <div class="ax-r${isEveryone ? " ax-r--scope" : ""}" data-kind="${esc(kindToken(r.t))}" data-type="${esc(r.t.type_key)}" data-rid="${esc(r.i.resource_id)}" data-gid="${esc(gid)}">
         <span class="ax-r__nm ax-r__nm--g">${AgnesKindGlyph.groupTile()}<span>${esc(label)}</span></span>
@@ -2728,7 +2749,7 @@
        open block with a table under it. They share the row component now,
        so the switch changes what the list is ABOUT, not what a list IS. */
     const section = (r) => {
-      const reach = reachOf(r.held.map((g) => g.group_id));
+      const heldMembers = reachOf(r.held.map((g) => g.group_id));
       const nobody = !r.held.length;
       // NAME the groups, don't just count them. "1 group · 1 person" made the
       // reader expand every row to learn the one thing the lens exists to
@@ -2751,15 +2772,16 @@
       /* An everyone-scoped grant DOMINATES: naming the groups and counting
          their members is not merely mis-attributed here, it is the wrong
          quantity — the audience is not a roster, and no other group on the
-         line adds anyone to it. `reach` is a count of today's accounts, and
-         printing it invites the reader to believe that number is the answer.
-         Straight from the server's `audience`, so it is right on DuckDB too. */
+         line adds anyone to it. `heldMembers` is a count of today's
+         MEMBERSHIPS, and printing it invites the reader to believe that
+         number is the answer. Straight from the server's `audience`, so it
+         is right on DuckDB too. */
       const reachesAll = (r.held || []).some((g) => g.audience === "everyone");
       const reachLine = nobody
         ? "granted to nobody"
         : reachesAll
           ? "everyone, and anyone who joins"
-          : `${who} · ${reach} ${reach === 1 ? "person" : "people"}`;
+          : `${who} · ${memberLabel(heldMembers)}`;
       const meta = prov ? `${reachLine} · ${prov}` : reachLine;
       const bkey = `${r.t.type_key}:${r.i.resource_id}`;
       return `
@@ -3314,12 +3336,12 @@
          The delete-group flow already sets the standard: quantify the blast
          radius rather than ask "are you sure?". */
       const g = (overview.groups || []).find((x) => x.id === rowGroup);
-      const people = g ? (g.member_count ?? 0) : 0;
+      const members = g ? (g.member_count ?? 0) : 0;
       const reveals = type === "memory_domain";
       const okRevoke = await window.confirmModal(reveals ? {
         // Nobody "loses" a memory domain: the grant only revealed it to this
-        // group, and it hides nothing from anyone else. Saying "N people lose
-        // it" here would be the false claim the relabel exists to stop.
+        // group, and it hides nothing from anyone else. Saying "N members
+        // lose it" here would be the false claim the relabel exists to stop.
         title: `Stop revealing “${revokeLabel(type, rid)}” to ${g ? titleOf(g) : "this group"}?`,
         message: `This group stops seeing items from this memory domain. `
           + `It hides nothing from anyone else — a memory-domain grant only reveals; it never restricts. `
@@ -3327,7 +3349,7 @@
         confirmText: "Stop revealing",
       } : {
         title: `Revoke “${revokeLabel(type, rid)}”?`,
-        message: `${people} ${people === 1 ? "person" : "people"} in ${g ? titleOf(g) : "this group"} `
+        message: `${memberLabel(members)} in ${g ? titleOf(g) : "this group"} `
           + `lose it, unless another group also grants it to them. `
           + `You can grant it again from this page.`,
         confirmText: "Revoke",
@@ -3677,7 +3699,7 @@
            than I meant" and the choice gets abandoned. */
         const detail = g.is_scope
           ? esc(g.description)
-          : `${n} ${n === 1 ? "person" : "people"}${g.description ? ` · ${esc(g.description)}` : ""}`;
+          : `${memberLabel(n)}${g.description ? ` · ${esc(g.description)}` : ""}`;
         return `
         <button type="button" class="ax-pk-r ax-pk-r--g ${g.is_scope ? "ax-pk-r--scope " : ""}${on ? "is-on" : ""}" data-pk-item="${esc(key)}" aria-pressed="${on}">
           <span class="ax-pk-r__box" aria-hidden="true">${on ? "✓" : ""}</span>
