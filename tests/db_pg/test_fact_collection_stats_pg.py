@@ -470,6 +470,245 @@ def test_ingest_batch_full_documents_replace_reconciles_stats(pg_env, repo):
     assert _stats_row(pg_env, CORPUS_A) is None
 
 
+def test_ingest_batch_replace_never_runs_a_full_collection_regroup(pg_env, repo):
+    """Regression (TCRD-296 gap #73b, live-Postgres finding 2026-09-04):
+    `ingest_batch`'s `full_documents` replace path used to call
+    `rebuild_collection_stats` — a full `GROUP BY corpus_id, fact_id` /
+    `GROUP BY corpus_id, edge_id` regroup of the WHOLE collection — on
+    EVERY batch of a re-extraction pass. Four concurrent passes over one
+    2.4M-claim collection turned that into 30+ unique-constraint
+    violations and a detected deadlock in 15 minutes, each one a document
+    whose claims had already been deleted and were then never
+    reconciled. Proven the same way #2238 proved it for
+    `delete_claims_for_file`: capture every statement the replace batch
+    issues and assert that full-collection regroup signature never
+    appears, then confirm the incrementally-maintained counters still
+    match a from-scratch recompute (what a rebuild would compute)."""
+    from sqlalchemy import event
+
+    from src.repositories import corpus_file_sources_repo
+
+    _seed_uploader("uploader1")
+    _seed_collection(collection_id=CORPUS_A, created_by="uploader1")
+    _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_a1")
+    with pg_env.begin() as conn:
+        conn.execute(sa.text("UPDATE corpus_files SET processing_status = 'indexed' WHERE id = 'cf_a1'"))
+        conn.execute(
+            sa.text(
+                "INSERT INTO corpus_chunks (id, corpus_id, file_id, ordinal, text) "
+                "VALUES ('ck1', :c, 'cf_a1', 0, 'Acme Corp operates in the SaaS industry.')"
+            ),
+            {"c": CORPUS_A},
+        )
+    corpus_file_sources_repo().upsert(
+        corpus_file_id="cf_a1", corpus_id=CORPUS_A, source_stable_id="cf_a1", source_doc_id="doc1"
+    )
+    repo.ingest_batch(
+        nodes=[
+            {
+                "id": "engagement:acme",
+                "type": "engagement",
+                "evidence": [{"doc_id": "doc1", "quote": "Acme Corp operates in the SaaS industry."}],
+            }
+        ]
+    )
+
+    statements: list = []
+
+    def _capture(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    event.listen(repo._engine, "before_cursor_execute", _capture)
+    try:
+        # Re-extraction of the SAME document, replace mode — the exact
+        # shape a facts-extraction pass ships every ~25 documents.
+        report = repo.ingest_batch(
+            full_documents=["doc1"],
+            nodes=[
+                {
+                    "id": "engagement:acme",
+                    "type": "engagement",
+                    "evidence": [{"doc_id": "doc1", "quote": "Acme Corp operates in the SaaS industry."}],
+                }
+            ],
+        )
+    finally:
+        event.remove(repo._engine, "before_cursor_execute", _capture)
+
+    assert report["claims_written"] == 1
+    # The regroup signature unique to `_rebuild_one_collection_stats` — an
+    # UNRELATED query legitimately shares "FROM claims" (`add_claim`'s own
+    # attribute-conflict check) or "GROUP BY" (grouping by something else
+    # entirely) on their own, so the two must be checked as ONE exact
+    # phrase, not two independent substrings.
+    assert not any("GROUP BY corpus_id, fact_id" in s for s in statements), statements
+    assert not any("GROUP BY corpus_id, edge_id" in s for s in statements), statements
+
+    check = repo.collection_stats_consistency_check(CORPUS_A)
+    assert check["consistent"], check
+
+
+def test_concurrent_ingest_batch_bumps_on_the_same_fact_do_not_raise(pg_env, repo, monkeypatch):
+    """Two concurrent `ingest_batch` calls, each for a DIFFERENT document,
+    both evidencing the SAME (PRE-EXISTING) fact — real threads, real
+    Postgres. A `threading.Barrier` forces both calls' own
+    `_bump_collection_stats_impl` to reach the database at (as near as
+    possible) the same moment, exercising the `INSERT ... ON CONFLICT DO
+    UPDATE` this depends on for correctness rather than hoping OS thread
+    scheduling happens to create the overlap on its own. The fact/alias
+    is seeded BEFORE the concurrent pair runs (a separate, unrelated race
+    on `_resolve_alias`'s own fact-creation path — not what this test is
+    about — would otherwise make one thread block on a DB lock the OTHER
+    holds while it is itself parked at the barrier, deadlocking the test
+    against itself)."""
+    import threading
+
+    from src.repositories import corpus_file_sources_repo
+    from src.repositories.facts_pg import FactsPgRepository
+
+    _seed_uploader("uploader1")
+    _seed_collection(collection_id=CORPUS_A, created_by="uploader1")
+    for fid in ("cf_a0", "cf_a1", "cf_a2"):
+        _seed_corpus_file(corpus_id=CORPUS_A, file_id=fid)
+    with pg_env.begin() as conn:
+        for fid, text in (
+            ("cf_a0", "Seed document about Acme Corp."),
+            ("cf_a1", "First document about Acme Corp."),
+            ("cf_a2", "Second document about Acme Corp."),
+        ):
+            conn.execute(sa.text("UPDATE corpus_files SET processing_status = 'indexed' WHERE id = :fid"), {"fid": fid})
+            conn.execute(
+                sa.text(
+                    "INSERT INTO corpus_chunks (id, corpus_id, file_id, ordinal, text) VALUES (:id, :c, :fid, 0, :text)"
+                ),
+                {"id": f"ck_{fid}", "c": CORPUS_A, "fid": fid, "text": text},
+            )
+    corpus_file_sources_repo().upsert(
+        corpus_file_id="cf_a0", corpus_id=CORPUS_A, source_stable_id="cf_a0", source_doc_id="doc0"
+    )
+    corpus_file_sources_repo().upsert(
+        corpus_file_id="cf_a1", corpus_id=CORPUS_A, source_stable_id="cf_a1", source_doc_id="doc1"
+    )
+    corpus_file_sources_repo().upsert(
+        corpus_file_id="cf_a2", corpus_id=CORPUS_A, source_stable_id="cf_a2", source_doc_id="doc2"
+    )
+    # Seed the fact/alias up front — the concurrent pair below only ever
+    # ADDS a claim to an alias that already resolves, never races to
+    # MINT it.
+    repo.ingest_batch(
+        nodes=[
+            {
+                "id": "engagement:acme",
+                "type": "engagement",
+                "evidence": [{"doc_id": "doc0", "quote": "Seed document about Acme Corp."}],
+            }
+        ]
+    )
+
+    barrier = threading.Barrier(2)
+    original_bump = FactsPgRepository._bump_collection_stats_impl
+
+    def _barriered_bump(self, conn, **kwargs):
+        barrier.wait(timeout=5)
+        return original_bump(self, conn, **kwargs)
+
+    monkeypatch.setattr(FactsPgRepository, "_bump_collection_stats_impl", _barriered_bump)
+
+    errors: list = []
+
+    def _run(doc_id: str, quote: str) -> None:
+        try:
+            repo.ingest_batch(
+                nodes=[
+                    {
+                        "id": "engagement:acme",
+                        "type": "engagement",
+                        "evidence": [{"doc_id": doc_id, "quote": quote}],
+                    }
+                ]
+            )
+        except Exception as exc:  # noqa: BLE001 — asserted below, never swallowed
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=_run, args=("doc1", "First document about Acme Corp.")),
+        threading.Thread(target=_run, args=("doc2", "Second document about Acme Corp.")),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert not errors, errors
+    check = repo.collection_stats_consistency_check(CORPUS_A)
+    assert check["consistent"], check
+    assert check["computed"]["stats"]["claims_count"] == 3  # seed + the two concurrent claims
+
+
+def test_rebuild_while_a_bump_runs_does_not_raise(pg_env, repo, monkeypatch):
+    """TCRD-296 gap #73b: `_rebuild_one_collection_stats`'s DELETE + plain
+    `INSERT ... SELECT` used to be able to violate `fact_collection_
+    membership`'s primary key when a CONCURRENT `add_claim` ->
+    `_bump_collection_stats_impl` (`INSERT ... ON CONFLICT DO UPDATE`)
+    landed a row for the same `(corpus_id, fact_id)` between the
+    rebuild's DELETE and its own INSERT. Both INSERTs now use `ON
+    CONFLICT DO UPDATE` — a real, barrier-synchronized concurrent run
+    must not raise."""
+    import threading
+
+    from src.repositories.facts_pg import FactsPgRepository
+
+    _seed_uploader("uploader1")
+    _seed_collection(collection_id=CORPUS_A, created_by="uploader1")
+    _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_a1")
+    _seed_corpus_file(corpus_id=CORPUS_A, file_id="cf_a2")
+    fact_id = repo.create_fact(type="engagement")
+    repo.add_claim(fact_id=fact_id, corpus_file_id="cf_a1", corpus_id=CORPUS_A, file_sha256="s", quote="First quote.")
+
+    barrier = threading.Barrier(2)
+    original_bump = FactsPgRepository._bump_collection_stats_impl
+    original_rebuild = FactsPgRepository._rebuild_one_collection_stats
+
+    def _barriered_bump(self, conn, **kwargs):
+        barrier.wait(timeout=5)
+        return original_bump(self, conn, **kwargs)
+
+    def _barriered_rebuild(self, conn, corpus_id):
+        barrier.wait(timeout=5)
+        return original_rebuild(self, conn, corpus_id)
+
+    monkeypatch.setattr(FactsPgRepository, "_bump_collection_stats_impl", _barriered_bump)
+    monkeypatch.setattr(FactsPgRepository, "_rebuild_one_collection_stats", _barriered_rebuild)
+
+    errors: list = []
+
+    def _rebuild() -> None:
+        try:
+            repo.rebuild_collection_stats(corpus_ids=[CORPUS_A])
+        except Exception as exc:  # noqa: BLE001 — asserted below, never swallowed
+            errors.append(exc)
+
+    def _bump() -> None:
+        try:
+            repo.add_claim(
+                fact_id=fact_id, corpus_file_id="cf_a2", corpus_id=CORPUS_A, file_sha256="s", quote="Second quote."
+            )
+        except Exception as exc:  # noqa: BLE001 — asserted below, never swallowed
+            errors.append(exc)
+
+    t1 = threading.Thread(target=_rebuild)
+    t2 = threading.Thread(target=_bump)
+    t1.start()
+    t2.start()
+    t1.join(timeout=10)
+    t2.join(timeout=10)
+
+    assert not errors, errors
+    check = repo.collection_stats_consistency_check(CORPUS_A)
+    assert check["consistent"], check
+    assert check["computed"]["stats"]["claims_count"] == 2
+
+
 def test_merge_facts_reconciles_stats(pg_env, repo):
     _seed_uploader("uploader1")
     _seed_collection(collection_id=CORPUS_A, created_by="uploader1")

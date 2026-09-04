@@ -1332,6 +1332,33 @@ def test_flush_reverts_ledger_entries_when_ingest_is_refused(monkeypatch):
     assert docs_state["cf_1"]["retry_count"] == 1
 
 
+def test_flush_reverts_ledger_entries_when_ingest_raises_a_database_error(monkeypatch):
+    """TCRD-296 gap #73b: an unexpected DATABASE error raised out of
+    `ingest_batch` itself (a deadlock, say) — as opposed to a well-formed
+    refusal the route translates to an `HTTPException` — used to
+    propagate straight past BOTH `_revert_ledger`/`_correct_ledger`. A
+    `full_documents` replace-mode batch whose old claims were already
+    deleted before such a failure would then sit at `done` forever, with
+    neither its old claims nor any new ones. The error must still stop the
+    pass (re-raised), but the ledger entry must be downgraded first."""
+    from sqlalchemy.exc import DBAPIError
+
+    docs_state = {"cf_1": {"status": "done", "nodes": 1}}
+    shipper = _shipper(docs_state)
+    shipper.add(file_id="cf_1", document=_shipper_document(), nodes=[], edges=[], claim_count=0)
+
+    def _raise(body, *, user, run_orphan_sweep=True):
+        raise DBAPIError("INSERT ...", {}, Exception("deadlock detected"))
+
+    monkeypatch.setattr("app.api.facts._facts_ingest_core", _raise)
+
+    with pytest.raises(DBAPIError):
+        shipper.flush(usage={}, model="claude-haiku-4-5")
+
+    assert docs_state["cf_1"]["status"] == "ingest_db_error"
+    assert docs_state["cf_1"]["retry_count"] == 1
+
+
 def test_flush_corrects_the_ledger_after_a_successful_zero_claim_ingest(monkeypatch):
     docs_state = {"cf_1": {"status": "done", "nodes": 1}}
     shipper = _shipper(docs_state)

@@ -2970,7 +2970,13 @@ class _BatchShipper:
     (:meth:`_revert_ledger`, so :func:`is_up_to_date` — which only ever
     treats ``status == "done"`` as current — retries it next pass) or, on a
     successful flush, reconciles each document against what the ingest
-    response says it actually wrote (:meth:`_correct_ledger`).
+    response says it actually wrote (:meth:`_correct_ledger`). A batch that
+    raises an unexpected database error (TCRD-296 gap #73b — a transient
+    deadlock/serialization failure inside ``ingest_batch`` itself, as
+    opposed to a well-formed refusal) gets the SAME ``_revert_ledger``
+    treatment before the error is re-raised — a replace-mode batch whose
+    old claims were already deleted before the failure must never sit at
+    ``done`` with neither its old claims nor any new ones.
     """
 
     def __init__(self, *, report: _Report, anonymize_marked: set, user: Any, docs_state: Dict[str, Any]) -> None:
@@ -3035,6 +3041,7 @@ class _BatchShipper:
         if not self._documents:
             return
         from fastapi import HTTPException
+        from sqlalchemy.exc import DBAPIError
 
         from app.api.facts import (
             FactsIngestAnonymizationReport,
@@ -3089,6 +3096,30 @@ class _BatchShipper:
             self._revert_ledger(pending_file_ids)
             self._reset()
             raise _IngestRefused(exc) from exc
+        except DBAPIError:
+            # TCRD-296 gap #73b: an unexpected DATABASE failure inside
+            # `ingest_batch` itself (as opposed to a well-formed refusal
+            # the route already translates to an `HTTPException` above) —
+            # a transient deadlock/serialization failure, say — used to
+            # propagate straight out of this method uncaught, past
+            # `_revert_ledger`/`_correct_ledger` both. If this batch's
+            # `full_documents` had already replaced (deleted) their old
+            # claims before the failure, this batch's `docs_state` entries
+            # stayed optimistically "done" with NEITHER their old claims
+            # NOR any new ones — silently losing them until whatever next
+            # touches this document happens to re-extract it, unbounded.
+            # Same remedy as a refused batch: downgrade the ledger, log,
+            # then RE-RAISE — a genuine unexpected database error still
+            # stops the pass (this is a "never lose the retry" fix, not a
+            # "swallow and continue" one).
+            logger.warning(
+                "facts extraction: ingest raised a database error for a batch of %d document(s)",
+                len(self._documents),
+                exc_info=True,
+            )
+            self._revert_ledger(pending_file_ids, reason="ingest_db_error")
+            self._reset()
+            raise
         self._report.ingest_batches += 1
         self._report.claims_written += int(result.get("claims_written") or 0)
         self._report.claims_rejected += len(result.get("claims_rejected") or [])
@@ -3096,16 +3127,17 @@ class _BatchShipper:
         self._correct_ledger(result)
         self._reset()
 
-    def _revert_ledger(self, file_ids: Sequence[str]) -> None:
-        """A refused batch's documents were folded into ``docs_state`` as
-        ``done`` before this call ran (see the class docstring) — that
-        optimism was wrong. Downgrade each to a bounded-retry status so
-        :func:`is_up_to_date` does not skip it on the next pass.
+    def _revert_ledger(self, file_ids: Sequence[str], *, reason: str = "ingest_refused") -> None:
+        """A refused (or DB-error-raising) batch's documents were folded
+        into ``docs_state`` as ``done`` before this call ran (see the class
+        docstring) — that optimism was wrong. Downgrade each to a
+        bounded-retry status so :func:`is_up_to_date` does not skip it on
+        the next pass.
         """
         for file_id in file_ids:
             entry = self._docs_state.get(file_id)
             if isinstance(entry, dict) and entry.get("status") == "done":
-                self._mark_retry(file_id, entry, reason="ingest_refused")
+                self._mark_retry(file_id, entry, reason=reason)
 
     def _correct_ledger(self, result: Dict[str, Any]) -> None:
         """Reconcile every document THIS successful flush shipped against

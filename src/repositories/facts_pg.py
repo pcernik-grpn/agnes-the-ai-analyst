@@ -180,6 +180,22 @@ _ORPHAN_SWEEP_GRACE_S = 15 * 60
 # 32 bits, this constant's does not).
 _SWEEP_LOCK_ID = 0x46414353  # "FACS" packed as an int32
 
+# Transaction-scoped advisory-lock CLASS id serializing
+# `_rebuild_one_collection_stats` against a SECOND concurrent rebuild of the
+# SAME collection (TCRD-296 gap #73b) — paired two-int form,
+# `(_COLLECTION_STATS_LOCK_CLASS_ID, hashtext(corpus_id))`, matching
+# `_FACTS_LOCK_CLASS_ID` (src/repositories/sharepoint_state_pg.py)'s own
+# reasoning: a bare single-bigint key hashed only from `corpus_id` could in
+# principle collide with some OTHER single-bigint advisory lock this
+# repository takes (`_SWEEP_LOCK_ID` included); pairing it with a class id
+# of its own keeps this lock's namespace disjoint from every other advisory
+# lock here, at the cost of nothing. BLOCKING (`pg_advisory_xact_lock`, not
+# `pg_try_advisory_xact_lock`) — unlike `sweep_orphans`, where a pass that
+# loses the race simply skips its own sweep, two rebuilds of one collection
+# must BOTH eventually run (a caller awaiting the result), so this one
+# queues rather than no-ops.
+_COLLECTION_STATS_LOCK_CLASS_ID = 0x53544154  # "STAT" packed as an int32
+
 
 class FactNotFound(RuntimeError):
     """A subject that does not exist OR has no readable claim (spec §5 rule
@@ -1335,14 +1351,42 @@ class FactsPgRepository:
     def _rebuild_one_collection_stats(self, conn: Connection, corpus_id: str) -> None:
         """The scoped recompute for ONE collection — see
         :meth:`rebuild_collection_stats`. `conn` is the caller's own open
-        transaction."""
+        transaction.
+
+        TCRD-296 gap #73b (live finding, 2026-09-04): a rebuild's own
+        DELETE-then-INSERT is not safe against a concurrent WRITER of the
+        same rows. Two guards, for two different concurrent writers:
+
+        1. **A concurrent bump** (`_bump_collection_stats_impl`, still
+           running on the ingest path for every OTHER collection's claims,
+           and even this SAME collection's between this method's DELETE and
+           its own INSERT) uses `INSERT ... ON CONFLICT DO UPDATE` — this
+           method's own membership INSERTs below now use the identical
+           `ON CONFLICT (corpus_id, fact_id|edge_id) DO UPDATE SET
+           ... = EXCLUDED...` form so the two can never violate each
+           other's primary key, whichever commits first.
+        2. **A second concurrent rebuild of the SAME collection** — the
+           `ON CONFLICT` above only makes ONE writer's INSERT safe against
+           the OTHER's single-row bump; it does nothing to stop two
+           rebuilds interleaving their own DELETE/INSERT pairs against each
+           other (a plain DELETE has no ON CONFLICT to fall back on). The
+           advisory lock below (`_COLLECTION_STATS_LOCK_CLASS_ID`) fully
+           serializes that case instead — a second rebuild of this same
+           `corpus_id` blocks until this transaction commits or rolls back.
+        """
+        conn.execute(
+            sa.text("SELECT pg_advisory_xact_lock(:class_id, hashtext(:cid))"),
+            {"class_id": _COLLECTION_STATS_LOCK_CLASS_ID, "cid": corpus_id},
+        )
         conn.execute(sa.text("DELETE FROM fact_collection_membership WHERE corpus_id = :cid"), {"cid": corpus_id})
         conn.execute(sa.text("DELETE FROM edge_collection_membership WHERE corpus_id = :cid"), {"cid": corpus_id})
         conn.execute(
             sa.text(
                 "INSERT INTO fact_collection_membership (corpus_id, fact_id, claims_count, documents_count) "
                 "SELECT corpus_id, fact_id, COUNT(*), COUNT(DISTINCT corpus_file_id) FROM claims "
-                "WHERE corpus_id = :cid AND fact_id IS NOT NULL GROUP BY corpus_id, fact_id"
+                "WHERE corpus_id = :cid AND fact_id IS NOT NULL GROUP BY corpus_id, fact_id "
+                "ON CONFLICT (corpus_id, fact_id) DO UPDATE SET "
+                "claims_count = EXCLUDED.claims_count, documents_count = EXCLUDED.documents_count"
             ),
             {"cid": corpus_id},
         )
@@ -1350,7 +1394,8 @@ class FactsPgRepository:
             sa.text(
                 "INSERT INTO edge_collection_membership (corpus_id, edge_id, claims_count) "
                 "SELECT corpus_id, edge_id, COUNT(*) FROM claims "
-                "WHERE corpus_id = :cid AND edge_id IS NOT NULL GROUP BY corpus_id, edge_id"
+                "WHERE corpus_id = :cid AND edge_id IS NOT NULL GROUP BY corpus_id, edge_id "
+                "ON CONFLICT (corpus_id, edge_id) DO UPDATE SET claims_count = EXCLUDED.claims_count"
             ),
             {"cid": corpus_id},
         )
@@ -5118,7 +5163,6 @@ class FactsPgRepository:
         # over from before indexed-preference picked a different winner)
         # never survives a replace either (TCRD-241).
         replaced_file_ids: Set[str] = set()
-        replaced_corpus_ids: Set[str] = set()
         if full_documents:
             with self._engine.connect() as conn:
                 for d in full_documents:
@@ -5127,18 +5171,39 @@ class FactsPgRepository:
                         continue
                     for copy in _copies_for(corpus_id, d, conn):
                         replaced_file_ids.add(copy["corpus_file_id"])
-                        replaced_corpus_ids.add(corpus_id)
         if replaced_file_ids:
+            # TCRD-296 gap #73b (live finding, 2026-09-04): this used to
+            # DELETE, then call `rebuild_collection_stats` on the affected
+            # corpora — "rebuilding now sets an accurate baseline that
+            # add_claim's incremental hook then keeps current as this
+            # batch's own writes land" (TCRD-296 E.21). That baseline is
+            # itself the expensive, racy part on a hot path: replace mode
+            # runs once per ~25-document batch, so four concurrent
+            # facts-extraction passes over one 2.4M-claim collection turned
+            # EVERY batch into a full per-collection DELETE + plain
+            # `INSERT ... SELECT ... GROUP BY` racing every other pass's
+            # incremental `_bump_collection_stats_impl` (`INSERT ... ON
+            # CONFLICT DO UPDATE`) — 30+ unique-constraint violations and a
+            # detected deadlock in 15 minutes, each one a document whose
+            # claims had ALREADY been deleted here and were then never
+            # reconciled (net claim loss). `_decrement_collection_stats_
+            # for_deleted_claims` is the exact inverse of the bump, bounded
+            # by THIS delete's own returned rows — the same mechanism
+            # `delete_claims_for_file` already uses for the identical
+            # reason, run inside the SAME transaction as the delete it
+            # reconciles so the two can never drift apart.
             with self._engine.begin() as conn:
-                conn.execute(
-                    sa.text("DELETE FROM claims WHERE corpus_file_id = ANY(:ids)"),
-                    {"ids": list(replaced_file_ids)},
+                deleted_rows = (
+                    conn.execute(
+                        sa.text(
+                            "DELETE FROM claims WHERE corpus_file_id = ANY(:ids) RETURNING corpus_id, fact_id, edge_id"
+                        ),
+                        {"ids": list(replaced_file_ids)},
+                    )
+                    .mappings()
+                    .all()
                 )
-            # TCRD-296 E.21: the replace-mode delete runs BEFORE this same
-            # batch's own fresh evidence is written below — rebuilding now
-            # sets an accurate baseline that `add_claim`'s incremental hook
-            # then keeps current as this batch's own writes land.
-            self.rebuild_collection_stats(corpus_ids=list(replaced_corpus_ids))
+                self._decrement_collection_stats_for_deleted_claims(conn, deleted_rows)
 
         file_row_cache: Dict[str, Optional[dict]] = {}
 
