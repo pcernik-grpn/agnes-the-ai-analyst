@@ -5,7 +5,7 @@
 # Installed and placed at /etc/google-cloud-ops-agent/config.yaml by
 # startup-script.sh.tpl when enable_gcp_logging is true. The agent
 # authenticates as the VM service account, which the module grants
-# roles/logging.logWriter.
+# roles/logging.logWriter and roles/monitoring.metricWriter.
 #
 # The two processors are the whole point of using the agent instead of
 # Docker's gcplogs driver: parse_json turns the app's log line back into
@@ -49,3 +49,20 @@ logging:
       agnes:
         receivers: [agnes_containers]
         processors: [agnes_json, agnes_severity]
+
+# Host metrics are not this agent's job: Cloud Monitoring bills the
+# agent.googleapis.com host metrics by ingested bytes, and on a VM with
+# enable_datadog those are collected twice over. Emptying the default
+# pipeline is Google's documented way to turn collection off.
+#
+# What it does NOT stop is the collector's own agent.googleapis.com/agent/*
+# self-metrics: they are free, they have no off switch, and the
+# OpenTelemetry sub-agent exports them whatever this file says. That is what
+# roles/monitoring.metricWriter is for — without it every export cycle fails
+# and the serial console fills with monitoring.timeSeries.create
+# PermissionDenied.
+metrics:
+  service:
+    pipelines:
+      default_pipeline:
+        receivers: []

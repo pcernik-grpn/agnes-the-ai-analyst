@@ -5,8 +5,8 @@
 laptop, bypassing every live-read enforcement point the rest of this
 feature built (Tasks 5-12) -- the parquet keeps answering from whatever
 slice was current at fetch time even after the policy tightens. This closes
-that gap: `/api/v2/scan` stamps a fingerprint of (policy SQL, caller's live
-groups) onto the `X-Agnes-Policy-Fingerprint` response header;
+that gap: `/api/v2/scan` stamps a fingerprint of (policy SQL, caller's email,
+caller's live groups) onto the `X-Agnes-Policy-Fingerprint` response header;
 `SnapshotMeta` stores it; `agnes pull` recomputes the CURRENT fingerprint
 from the manifest's per-table `access_policy_fingerprint`
 (`app/api/sync.py::_table_manifest_entry`) and withholds a mismatched
@@ -91,7 +91,7 @@ class TestPolicyFingerprintFormula:
         from src.access_policy import policy_fingerprint
 
         fp = policy_fingerprint("orders", TEAM_A_PRINCIPAL)
-        expected = hashlib.sha256(f"{POLICY_SQL}|{sorted(['TeamA'])!r}".encode()).hexdigest()
+        expected = hashlib.sha256(f"{POLICY_SQL}|{'team-a@example.com'!r}|{sorted(['TeamA'])!r}".encode()).hexdigest()
         assert fp == expected
 
     def test_none_for_a_table_with_no_policy(self, policied_orders):
@@ -135,6 +135,42 @@ class TestPolicyFingerprintFormula:
         from src.access_policy import policy_fingerprint
 
         assert policy_fingerprint("orders", TEAM_A_PRINCIPAL) == policy_fingerprint("orders", TEAM_A_PRINCIPAL)
+
+    def test_changes_when_only_the_callers_email_changes(self, policied_orders):
+        """A policy may bind ``$user_email``, so a snapshot taken under an
+        account's PREVIOUS email must stop being honoured once an admin
+        renames it -- same reasoning as the group set, which the
+        fingerprint has always folded in."""
+        from src.access_policy import policy_fingerprint
+
+        before = policy_fingerprint("orders", TEAM_A_PRINCIPAL)
+        after = policy_fingerprint("orders", {"id": "u_team_a", "email": "renamed@example.com"})
+
+        assert before != after
+
+    def test_agent_principal_keys_on_the_callers_email_not_the_owners(self, policied_orders):
+        """C2.3: ``$user_email`` binds to whoever drives the turn, so a
+        shared agent's fingerprint must follow the CALLER's email."""
+        from app.auth.session_principal import AgentPrincipal
+        from src.access_policy import policy_fingerprint
+
+        def _agent(caller_email):
+            return AgentPrincipal(
+                session_id="agent-sess-1",
+                agent_id="agent-1",
+                owner_user_id="u_team_a",
+                owner_email="team-a@example.com",
+                intersection={},
+                caller_user_id="u_team_a",
+                caller_email=caller_email,
+            )
+
+        assert policy_fingerprint("orders", _agent("team-a@example.com")) == policy_fingerprint(
+            "orders", TEAM_A_PRINCIPAL
+        )
+        assert policy_fingerprint("orders", _agent("grantee@example.com")) != policy_fingerprint(
+            "orders", TEAM_A_PRINCIPAL
+        )
 
 
 # ── /api/v2/scan: X-Agnes-Policy-Fingerprint header ──────────────────────

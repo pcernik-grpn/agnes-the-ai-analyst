@@ -194,3 +194,67 @@ class TestRunRemoteSelectToArrowSharesTheSameEnforcement:
         assert exc_info.value.status_code == 400
         assert exc_info.value.detail["reason"] == "policy_name_collision"
         assert exc_info.value.detail["table"] == "tbl_orders"
+
+
+BROKEN_POLICY_SQL = "SELECT * FROM orders WHERE ((("
+
+
+class TestAResolutionRefusalFailsClosed:
+    """#1979: a policy that FAILS TO RESOLVE must deny, not disappear.
+
+    ``rewrite_sql`` swallowed every ``PolicyError`` its per-name ``resolve``
+    raised, because that one type also carried the registry's benign "no
+    such table" signal. A refusal on a table that IS registered and IS
+    policied therefore left the reference unsubstituted and served the raw
+    base view with a 200 -- the fail-OPEN shape §17 forbids.
+
+    Reproduced here through the resolver's real failure path rather than a
+    monkeypatch: an ``access_policy_sql`` that no longer parses (a
+    hand-edited registry row, or a body saved by an older, laxer validator)
+    makes ``policied_relation`` raise ``PolicyError`` from
+    ``_referenced_variables`` -- a genuine refusal that is NOT
+    ``PolicyUnknownTable``.
+    """
+
+    @pytest.fixture
+    def broken_policy(self, policied_orders):
+        from src.db import get_system_db
+        from src.repositories.table_registry import TableRegistryRepository
+
+        conn = get_system_db()
+        try:
+            TableRegistryRepository(conn).set_access_policy(
+                "tbl_orders",
+                sql=BROKEN_POLICY_SQL,
+                note="hand-edited, no longer parses",
+                updated_by="admin",
+            )
+        finally:
+            conn.close()
+        return policied_orders
+
+    def test_query_returns_structured_policy_error_and_no_rows(self, broken_policy):
+        c = broken_policy["client"]
+        r = c.post("/api/query", json={"sql": "SELECT * FROM orders"}, headers=_auth(broken_policy["team_a_token"]))
+        assert r.status_code == 500, r.text
+        assert r.json()["detail"] == {"reason": "policy_error", "table": "tbl_orders"}
+        assert "unit" not in r.text and "secret" not in r.text
+
+    def test_the_admin_bypass_is_unaffected(self, broken_policy):
+        # §12: the bypass is decided before the policy body is ever parsed,
+        # so a broken policy must not lock an admin out of their own table.
+        c = broken_policy["client"]
+        r = c.post("/api/query", json={"sql": "SELECT * FROM orders"}, headers=_auth(broken_policy["admin_token"]))
+        assert r.status_code == 200, r.text
+        assert r.json()["row_count"] == 3
+
+    def test_a_query_that_never_touches_the_broken_table_still_runs(self, broken_policy):
+        # The swallow existed to keep unrelated queries working; narrowing it
+        # must not turn an unregistered name into a failure.
+        c = broken_policy["client"]
+        r = c.post(
+            "/api/query",
+            json={"sql": "SELECT 1 AS n"},
+            headers=_auth(broken_policy["team_a_token"]),
+        )
+        assert r.status_code == 200, r.text

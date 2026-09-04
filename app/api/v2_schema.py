@@ -192,8 +192,9 @@ def build_schema(
     # surface. `_schema_cache` keyed on `table_id` alone would hand one
     # caller's (or the admin's raw) schema to the next caller regardless of
     # identity, so a policied table's key carries the caller's identity
-    # tuple instead (`policy_cache_identity`, §9) -- never the bare
-    # `table_id` a non-policied table's cache entry lives under.
+    # tuple instead -- id, email and live groups (`policy_cache_identity`,
+    # §9) -- never the bare `table_id` a non-policied table's cache entry
+    # lives under.
     # `build_schema_uncached` mirrors the plain-`table_id` write for the
     # non-policied case below; the identity-keyed write for the policied
     # case happens here, after `_apply_effective_schema`, because

@@ -99,6 +99,30 @@ def test_the_agent_config_parses_the_json_and_lifts_the_severity():
     assert set(pipeline["processors"]) <= set(processors)
 
 
+def test_the_agent_ships_no_host_metrics_because_datadog_collects_those():
+    """Emptying the default metrics pipeline is Google's documented way to
+    stop host-metric collection. Cloud Monitoring bills those by ingested
+    bytes, and on a VM with `enable_datadog` they are collected twice over.
+
+    This does NOT stop the collector's own agent.googleapis.com/agent/*
+    self-metrics — free, and with no off switch — which is what the module
+    grants roles/monitoring.metricWriter for; that half is pinned next to the
+    logWriter grant in tests/test_gcp_logging_overlay_placement.py.
+    """
+    metrics_cfg = yaml.safe_load(AGENT_CONFIG.read_text()).get("metrics")
+    assert metrics_cfg, "nothing overrides the built-in metrics pipeline"
+
+    pipelines = metrics_cfg["service"]["pipelines"]
+    assert "default_pipeline" in pipelines, (
+        "the built-in pipeline is only disarmed by redefining it under its own "
+        "id — any other id leaves the hostmetrics receiver collecting"
+    )
+    for name, pipeline in pipelines.items():
+        assert pipeline.get("receivers") == [], (
+            f"metrics pipeline {name} ships host metrics Datadog already collects"
+        )
+
+
 def test_the_agent_is_installed_only_when_the_feature_is_on():
     tpl = STARTUP.read_text()
     assert "ops-agent" in tpl or "ops_agent" in tpl, "nothing installs the collector"

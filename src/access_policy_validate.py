@@ -413,6 +413,22 @@ def _is_identifier_position(node: exp.Placeholder) -> bool:
     return False
 
 
+def variables_in_pattern_position(statement: exp.Expression) -> set[str]:
+    """Names of the ``$variable`` placeholders in ``statement`` that stand on
+    the PATTERN side of a LIKE-family or regex node -- rule 5's own question,
+    exported so the READ path can ask it too.
+
+    ``src/access_policy.py`` re-derives this from the stored policy text on
+    every resolve and refuses the table when a bound identity variable would
+    be matched as a pattern (§6.3). That is the same rule this module
+    enforces at save time; it lives here, in one implementation, so the two
+    can never drift into disagreeing about what "pattern position" means --
+    a drift that would make read-time defense in depth quietly cover less
+    than the save-time rule it is backing up.
+    """
+    return {p.name for p in statement.find_all(exp.Placeholder) if _is_pattern_position(p)}
+
+
 def _is_pattern_position(node: exp.Placeholder) -> bool:
     """True if ``node`` is anywhere inside the pattern (``expression``) side
     of a LIKE-family or regex node -- walking up the ancestor chain instead
@@ -433,14 +449,15 @@ def _reject_untranspilable(sql: str) -> None:
     engine's SQL without error (§7.2) -- the admin authors DuckDB SQL once,
     and sqlglot produces the form actually run against the source.
 
-    Checked for BOTH remote engines at save time, not just the one this
+    Checked for EVERY remote engine at save time, not just the one this
     particular table happens to sit on. A policy that transpiles to BigQuery
-    but not to Databricks would save clean and then fail at read time on a
-    Databricks table -- and a policy read that fails, correctly, denies (§17),
-    so the admin would have shipped an outage instead of an access rule. The
-    save-time check is the only moment where the feedback is cheap.
+    but not to Databricks (or Snowflake, S2 -- RLS review issue #1979) would
+    save clean and then fail at read time on that engine's table -- and a
+    policy read that fails, correctly, denies (§17), so the admin would have
+    shipped an outage instead of an access rule. The save-time check is the
+    only moment where the feedback is cheap.
     """
-    for engine in ("bigquery", "databricks"):
+    for engine in ("bigquery", "databricks", "snowflake"):
         try:
             sqlglot.transpile(sql, read="duckdb", write=engine)
         except Exception as exc:
