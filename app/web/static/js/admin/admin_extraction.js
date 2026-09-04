@@ -33,10 +33,23 @@ function _extPendingFor(connId) {
 // full table rebuild (~5s), same lifetime a toast would have had.
 const extActionMsg = {};
 
+/* &, < and > are what a text node needs; the three attribute call sites below
+   (`title="${esc(...)}"` twice, `id="ext-drawer-${esc(...)}"`) need both quote
+   forms as well, and a `"` one character short of escaped is an attribute
+   break-out — `run.error` carries the crawl's own failure text, which quotes
+   the Graph path or response it choked on, so `" onmouseover="…` in a stored
+   error would run for the next admin who opens this page (the dashboard CSP
+   does not block inline handlers). One helper correct in both contexts rather
+   than two an author has to choose between: the entities render back as `"`
+   and `'` in text position, so the escaping costs the text sites nothing.
+   Same call the equivalent helper in `admin_marketplaces.html` already makes
+   after the same finding; written as the pure-regex form `builder_shell.js`,
+   `chat.js` and `chat_onboarding.js` use, which needs no DOM and so is
+   directly node-executable by its test. */
+const ESC_ENTITIES = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
+
 function esc(s) {
-  const d = document.createElement("div");
-  d.textContent = s == null ? "" : String(s);
-  return d.innerHTML;
+  return String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ESC_ENTITIES[c]);
 }
 
 /* A FastAPI `detail` is a string on some paths and a structured object on
@@ -186,6 +199,16 @@ function phaseCell(run) {
    for a `running`/`stalled` row (never a finished one — there is nothing to
    cancel), it is a FORCE-close rather than a queue action, and it is never
    disabled by `live` — force-closing a live run is the entire point. */
+/* NOTE on the `onclick="fn('${id}')"` handlers below (and in
+   `shardBadgeHtml` / `renderRow`): do NOT "fix" these by wrapping the id in
+   `esc()`. An attribute value is HTML-decoded BEFORE it is parsed as JS, so
+   `&#39;` arrives at the parser as a real `'` and closes the string exactly
+   as a bare quote would — escaping there buys nothing and reads as safety.
+   What holds is the value: every id here is server-generated (`str(uuid4())`
+   for a connection, `"er_" + secrets.token_hex(8)` for a run), so it cannot
+   contain a quote. Interpolating anything else — a connection NAME, a label,
+   an error — means moving it to a `data-` attribute read by a delegated
+   listener. `tests/test_admin_extraction_escaping.py` pins both halves. */
 function actionsCell(row) {
   const run = row.run;
   const live = !!(run && run.stored_status === "running");
