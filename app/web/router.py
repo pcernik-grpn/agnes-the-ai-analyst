@@ -10022,6 +10022,7 @@ def _source_inventory(user: dict | None = None) -> dict:
             logger.debug("data-sources pipelines: could not resolve scope collections for %s: %s", c.get("id"), e)
     corpus_status_counts: dict[str, dict[str, int]] = {}
     collection_grants_by_id: dict[str, set] = {}
+    group_names_by_id: dict[str, str] = {}
     if sharepoint_conns:
         try:
             from src.repositories import corpus_files_repo
@@ -10036,6 +10037,10 @@ def _source_inventory(user: dict | None = None) -> dict:
                 collection_grants_by_id.setdefault(g["resource_id"], set()).add(g["group_id"])
         except Exception as e:
             logger.warning("data-sources pipelines: collection grants unavailable: %s", e)
+        try:
+            group_names_by_id = {g["id"]: g["name"] for g in user_groups_repo().list_all()}
+        except Exception as e:
+            logger.warning("data-sources pipelines: group names unavailable: %s", e)
 
     now = datetime.now(UTC)
     for conn in [*connections, *derived]:
@@ -10149,6 +10154,7 @@ def _source_inventory(user: dict | None = None) -> dict:
                 user,
                 corpus_status_counts=corpus_status_counts,
                 collection_grants_by_id=collection_grants_by_id,
+                group_names_by_id=group_names_by_id,
             )
 
         # ── Feeds: packages holding this source's tables → groups granted →
@@ -10263,6 +10269,7 @@ def _sharepoint_pipeline_cell(
     *,
     corpus_status_counts: dict[str, dict[str, int]] | None = None,
     collection_grants_by_id: dict[str, set] | None = None,
+    group_names_by_id: dict[str, str] | None = None,
 ) -> dict:
     """The file-source pipeline strip + card rows for a SharePoint connection
     (spec §13.2 "Source card"): crawl → text extraction + scan transcription
@@ -10272,13 +10279,17 @@ def _sharepoint_pipeline_cell(
     ingest run's error badges — each carrying its itemized detail for the
     admin's filtered drawer.
 
-    `corpus_status_counts`/`collection_grants_by_id` are optional PRECOMPUTED
-    batched reads: `_source_inventory` builds each ONCE across every
-    SharePoint connection on the page (rather than once per connection, per
-    scope) and passes them down. Omitting either (any direct/isolated call,
-    e.g. a unit test) falls back to computing it for just this connection —
-    the same answer, at the one-connection cost this function used to pay
-    for every connection on the page.
+    `corpus_status_counts`/`collection_grants_by_id`/`group_names_by_id` are
+    optional PRECOMPUTED batched reads: `_source_inventory` builds each ONCE
+    across every SharePoint connection on the page (rather than once per
+    connection, per scope) and passes them down. Omitting any (any direct/
+    isolated call, e.g. a unit test) falls back to computing it for just this
+    connection — the same answer, at the one-connection cost this function
+    used to pay for every connection on the page. `group_names_by_id` (id →
+    name, `user_groups_repo().list_all()`) is what lets `identity.
+    group_names` name the matched groups without a second round-trip once
+    the card is expanded (source-card redesign §8 — the head's `Shared
+    with` tile).
 
     **"Scope collections" is this connection's OWN scope mapping** — every
     confirmed scope's `collection_id` off `conn["config"]["scopes"]`, the
@@ -10564,7 +10575,7 @@ def _sharepoint_pipeline_cell(
     # sharing-state sentence — "all scope collections have a group" needs to
     # know what "all" is) is `len(scope_ids)` regardless of whether the
     # grants lookup below succeeds — it costs no extra query.
-    groups_matched = 0
+    matched_group_ids: set[str] = set()
     collections_no_group = 0
     collections_total = len(scope_ids)
     if scope_ids:
@@ -10584,14 +10595,34 @@ def _sharepoint_pipeline_cell(
                 by_collection = {}
                 for g in resource_grants_repo().list_all(resource_type="collection"):
                     by_collection.setdefault(g["resource_id"], set()).add(g["group_id"])
-            groups_matched = len({gid for scope_id in scope_ids for gid in by_collection.get(scope_id, ())})
+            matched_group_ids = {gid for scope_id in scope_ids for gid in by_collection.get(scope_id, ())}
             collections_no_group = sum(1 for scope_id in scope_ids if not by_collection.get(scope_id))
         except Exception as e:
             logger.warning("sharepoint pipeline cell: grant lookup unavailable: %s", e)
+
+    # Names for the matched group ids above — the source card's `Shared
+    # with` tile (source-card redesign §2.1) renders `{groups} can search`
+    # rather than a bare count, without a second fetch once the card
+    # expands. Same "caller-precomputed map, else read it here" fallback as
+    # `collection_grants_by_id`. Sorted so the tile's text is stable across
+    # renders regardless of dict/set iteration order.
+    group_names: list[str] = []
+    if matched_group_ids:
+        try:
+            names_by_id = group_names_by_id
+            if names_by_id is None:
+                from src.repositories import user_groups_repo
+
+                names_by_id = {g["id"]: g["name"] for g in user_groups_repo().list_all()}
+            group_names = sorted(names_by_id[gid] for gid in matched_group_ids if gid in names_by_id)
+        except Exception as e:
+            logger.warning("sharepoint pipeline cell: group name lookup unavailable: %s", e)
+
     cell["identity"] = {
-        "groups_matched": groups_matched,
+        "groups_matched": len(matched_group_ids),
         "collections_no_group": collections_no_group,
         "collections_total": collections_total,
+        "group_names": group_names,
     }
 
     # ── scopes: the connection's OWN confirmed scope rows (`config.scopes`),

@@ -1170,6 +1170,13 @@ def cancel_extraction_run(
 _FACTS_JOB_KIND = "sharepoint-facts-extraction"
 _FACTS_JOB_LIVE_STATUSES = ("running", "queued")
 
+#: The crawl trigger's own job kind and "in flight" statuses — the same
+#: pair :func:`_crawl_job_in_flight` below reasons about, mirroring
+#: :data:`_FACTS_JOB_KIND` / :data:`_FACTS_JOB_LIVE_STATUSES` for
+#: `corpus-extraction` instead of the standalone facts pass.
+_CRAWL_JOB_KIND = "corpus-extraction"
+_CRAWL_JOB_LIVE_STATUSES = ("running", "queued")
+
 
 def _iso_or_none(value: Any) -> Optional[str]:
     if value is None:
@@ -1210,6 +1217,40 @@ def _facts_job_in_flight(connection_id: str) -> Optional[Dict[str, Any]]:
     repo = jobs_repo()
     for status in _FACTS_JOB_LIVE_STATUSES:
         for job in repo.list(status=status, kind=_FACTS_JOB_KIND, limit=200):
+            if job.get("idempotency_key") != key:
+                continue
+            return {
+                "id": job["id"],
+                "status": job["status"],
+                "created_at": _iso_or_none(job.get("created_at")),
+                "started_at": _iso_or_none(job.get("started_at")),
+            }
+    return None
+
+
+def _crawl_job_in_flight(connection_id: str) -> Optional[Dict[str, Any]]:
+    """The queued-or-running ``corpus-extraction`` job for this connection,
+    projected to ``{id, status, created_at, started_at}`` — or ``None`` when
+    there is none. Mirrors :func:`_facts_job_in_flight` exactly, for the
+    crawl trigger's own job kind instead of the standalone facts pass.
+
+    Fills the state-chip's ``Queued`` rung (§2.1 of the source-card
+    redesign): a job can sit ``queued`` for a while before a worker claims
+    it and opens the first ``extraction_runs`` row, and until then
+    ``running``/``last_completed``/``last_failed`` are all ``null`` — the
+    card would otherwise show "never run" for a connection that in fact has
+    work waiting. Matched on the trigger's own idempotency key
+    (:func:`app.api.admin_sharepoint._extraction_idempotency_key`), same
+    reasoning as the facts lookup: a second copy of that key's format here
+    would be a silent-drift hazard.
+    """
+    from app.api.admin_sharepoint import _extraction_idempotency_key
+    from src.repositories import jobs_repo
+
+    key = _extraction_idempotency_key(connection_id)
+    repo = jobs_repo()
+    for status in _CRAWL_JOB_LIVE_STATUSES:
+        for job in repo.list(status=status, kind=_CRAWL_JOB_KIND, limit=200):
             if job.get("idempotency_key") != key:
                 continue
             return {
@@ -1413,6 +1454,20 @@ def extraction_status(
     docstring), so it is read off whichever of ``running``/``last_failed``/
     ``last_completed`` above is most recent, in that order, and is ``null``
     when none of the three exist.
+
+    ``files_per_min`` is :func:`_files_per_min` over ``running`` (``null``
+    when nothing is running or the rate is not yet computable) — the source
+    card's live line (source-card redesign §2.1) reads this rather than
+    dividing absolute counters itself, the same windowed-rate computation
+    the fleet view's own ``files_per_min`` column already uses.
+
+    ``crawl_job`` is the queued/running ``corpus-extraction`` job for this
+    connection (:func:`_crawl_job_in_flight`) or ``null`` — mirrors
+    ``facts_job`` above, for the crawl trigger's own job kind. Fills the
+    window between a trigger enqueueing a job and a worker claiming it and
+    opening the first ``extraction_runs`` row, where ``running`` is still
+    ``null`` but the connection is not truly idle — the state chip's
+    ``Queued`` rung.
     """
     connection = _sharepoint_connection_or_404(connection_id)
     from src.repositories import extraction_runs_repo, sharepoint_state_repo
@@ -1462,6 +1517,8 @@ def extraction_status(
         "last_completed": last_completed_out,
         "last_failed": last_failed_out,
         "runs_total": repo.count_for_connection(connection_id),
+        "files_per_min": _files_per_min(running) if running else None,
+        "crawl_job": _crawl_job_in_flight(connection_id),
         "facts_job": facts_job,
         # TCRD-296 gap #61: a pass that stopped on its own time budget left
         # nothing visible once the crawl that triggered it was long over —

@@ -221,6 +221,15 @@ def extract(
         "documents (a conversion crash, a transient download error). This run's ordinary "
         "incremental delta walk still runs afterward, unaffected.",
     ),
+    retry_empty: bool = typer.Option(
+        False,
+        "--retry-empty",
+        help="Re-queue this connection's convert_empty backlog for conversion — the same "
+        "replay `agnes admin sharepoint retry-empty` triggers, offered here so one command "
+        "can combine it with the other options above. Useful right after turning scan OCR "
+        "on: a file that converted fine but carried no text otherwise stays skipped forever, "
+        "since Graph's delta feed never re-offers an unchanged item.",
+    ),
     force_replan: bool = typer.Option(
         False,
         "--replan",
@@ -259,6 +268,8 @@ def extract(
         payload["force_reprocess"] = True
     if retry_failed:
         payload["retry_failed"] = True
+    if retry_empty:
+        payload["retry_empty"] = True
 
     resp = api_post(
         f"/api/admin/sharepoint/connections/{connection_id}/extract",
@@ -270,10 +281,11 @@ def extract(
     if as_json:
         typer.echo(json.dumps(body, indent=2))
         return
-    # `queued_count` only rides the response with `--retry-failed` — the
-    # size of the failure backlog this run is about to replay, read from
-    # the persisted crawl state before the job was enqueued. Absent for a
-    # plain trigger, `--resync`, or `--force-reprocess`, same as the API.
+    # `queued_count` only rides the response with `--retry-failed` and/or
+    # `--retry-empty` — the combined size of the failure/empty backlogs this
+    # run is about to replay, read from the persisted crawl state before the
+    # job was enqueued. Absent for a plain trigger, `--resync`, or
+    # `--force-reprocess`, same as the API.
     suffix = f", queued_count: {body['queued_count']}" if "queued_count" in body else ""
     typer.echo(f"Enqueued corpus-extraction job {body.get('job_id')} (status: {body.get('status')}{suffix})")
 

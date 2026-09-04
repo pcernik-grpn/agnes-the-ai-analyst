@@ -4022,6 +4022,22 @@ class ExtractionRunOptions(BaseModel):
             "`state_key`."
         ),
     )
+    retry_empty: Optional[bool] = Field(
+        None,
+        description=(
+            "Re-queue this connection's `convert_empty` backlog for conversion — the same "
+            "replay `POST …/extraction/retry-empty` triggers, offered here so one popover "
+            "submission can combine it with the other options above instead of firing a "
+            "second request. A document that converted fine but carried no text (a scan "
+            "with no text layer, most commonly) is otherwise a dead end: Graph's delta "
+            "feed never re-offers an unchanged item, so the ordinary incremental walk "
+            "would skip it forever even after scan OCR starts being able to read it — see "
+            "`connectors.sharepoint.crawler._retry_empty_items`. On a sharded site each "
+            "shard replays its OWN `convert_empty` backlog, same as `retry_failed`. The "
+            "standalone `POST …/extraction/retry-empty` route is unchanged and still works "
+            "on its own."
+        ),
+    )
     shards: Optional[List[int]] = Field(
         None,
         description=(
@@ -4030,8 +4046,8 @@ class ExtractionRunOptions(BaseModel):
             "retry a shard that failed without re-planning or re-crawling the whole site "
             "(design §4.4, replaces the retired manual-split 're-run one clone' escape "
             "hatch). Opens a fresh parent run covering only the named shards. Every other "
-            "field above (except `resync`/`force_reprocess`/`retry_failed`, which still "
-            "fan out to the re-run shards) is ignored when this is set. 404 "
+            "field above (except `resync`/`force_reprocess`/`retry_failed`/`retry_empty`, "
+            "which still fan out to the re-run shards) is ignored when this is set. 404 "
             "`no_shard_plan` when the connection has never sharded; 400 "
             "`unknown_shard_index` for an index the last plan doesn't have."
         ),
@@ -4279,6 +4295,8 @@ def _trigger_shard_rerun(
         rerun_payload["force_reprocess"] = True
     if options.retry_failed:
         rerun_payload["retry_failed"] = True
+    if options.retry_empty:
+        rerun_payload["retry_empty"] = True
     if options.concurrency is not None:
         rerun_payload["concurrency"] = options.concurrency
     if options.timeout_s is not None:
@@ -4314,22 +4332,25 @@ async def trigger_extraction(
     ingested (see ``connectors.sharepoint.crawler._apply_resync``), and
     ``force_reprocess``, the stronger "re-process everything" control that
     additionally ignores cTags so already-unchanged documents are
-    re-downloaded and re-ingested too, and ``retry_failed``, the targeted
+    re-downloaded and re-ingested too, ``retry_failed``, the targeted
     alternative to ``resync`` that gives every item this connection's own
     failure queue already knows about — including ones already given up on
     — one more chance (see
     ``connectors.sharepoint.crawler._retry_failed_items``'s
-    ``include_given_up``) — never persisted beyond this one run.
+    ``include_given_up``), and ``retry_empty``, the SAME replay
+    ``POST …/extraction/retry-empty`` triggers, offered here so the
+    ``Run now`` popover (source-card redesign §2.3) can combine it with the
+    other options in one submission — never persisted beyond this one run.
 
     2026-09-03 auto-parallel-crawl design: on a site large enough to
     auto-shard (``extraction.crawler.shard_target_docs``, PG-only), a
     ``corpus-extraction`` job is a short PLANNER — it packs the site into
     shards, opens a parent run, enqueues one ``corpus-extraction-shard``
     child per shard and returns; ``resync``/``force_reprocess``/
-    ``retry_failed`` fan out unchanged to every child, and ``timeout_s``
-    bounds each child independently, not the run as a whole. ``options.
-    shards`` (a list of 1-based indices) skips planning entirely and
-    re-runs only the named shards from the connection's LAST persisted
+    ``retry_failed``/``retry_empty`` fan out unchanged to every child, and
+    ``timeout_s`` bounds each child independently, not the run as a whole.
+    ``options.shards`` (a list of 1-based indices) skips planning entirely
+    and re-runs only the named shards from the connection's LAST persisted
     plan — the supported replacement for the retired manual-split "re-run
     one clone" escape hatch — see :func:`_trigger_shard_rerun`.
 
@@ -4338,13 +4359,15 @@ async def trigger_extraction(
     nothing in this endpoint ever writes an option's value anywhere an
     admin could re-read it as the new default.
 
-    When ``retry_failed`` is set, the response also carries ``queued_count``
-    — the size of this connection's persisted ``failed_items`` backlog at
-    the moment this call reads it, before the job is enqueued — mirroring
-    :func:`retry_empty_extraction`'s ``queued_count``: the source card's
-    "Retry failed (N)" button reads the SAME number off the status poll,
-    and the toast after clicking it should say the same thing the button
-    already promised, not a different count read moments later.
+    When ``retry_failed`` and/or ``retry_empty`` is set, the response also
+    carries ``queued_count`` — the combined size of this connection's
+    persisted ``failed_items``/``empty_items`` backlogs at the moment this
+    call reads them, before the job is enqueued — mirroring
+    :func:`retry_empty_extraction`'s own ``queued_count``: the source
+    card's "Retry failed (N)" / "Retry empty (N)" popover options read the
+    SAME numbers off the status poll, and the toast after clicking Start
+    should say the same thing the popover already promised, not a
+    different count read moments later.
 
     404 on an unknown/non-sharepoint connection BEFORE any other work.
     Then refuses cleanly (never a job that fails 30 minutes later in a
@@ -4404,12 +4427,17 @@ async def trigger_extraction(
             payload["force_replan"] = True
         if options.force_reprocess:
             payload["force_reprocess"] = True
-        if options.retry_failed:
-            payload["retry_failed"] = True
+        if options.retry_failed or options.retry_empty:
             from connectors.sharepoint.crawler import load_state
 
             state = load_state(connection_id)
-            queued_count = len(state.get("failed_items") or {})
+            queued_count = 0
+            if options.retry_failed:
+                payload["retry_failed"] = True
+                queued_count += len(state.get("failed_items") or {})
+            if options.retry_empty:
+                payload["retry_empty"] = True
+                queued_count += len(state.get("empty_items") or {})
 
     job = jobs_repo().enqueue(
         "corpus-extraction",

@@ -952,6 +952,64 @@ def test_status_reports_facts_pending_documents_and_pass_running(tmp_path, monke
     assert body["facts_pass_running"] is True
 
 
+def test_status_files_per_min_is_none_with_nothing_running(tmp_path, monkeypatch, pg_engine):
+    """`files_per_min` (source-card redesign §8) is the live line's rate —
+    absent (`null`), never `0`, when no run is currently active."""
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token)
+
+    body = client.get(f"{BASE}/{conn_id}/extraction/status", headers=_auth(token)).json()
+    assert body["files_per_min"] is None
+
+
+def test_status_files_per_min_is_derived_from_a_live_run(tmp_path, monkeypatch, pg_engine):
+    """A running connection's `files_per_min` reuses the exact windowed-rate
+    computation (`_files_per_min`) the fleet view's own column already
+    uses — here via the single-observation fallback (average since
+    `started_at`), the same one `TestFilesPerMin.test_falls_back_to_the_
+    since_started_average_on_first_observation` pins at the unit level."""
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token)
+
+    repo = _repo()
+    repo.start(connection_id=conn_id)
+    repo.checkpoint(repo.get_running(conn_id)["id"], files_seen=60, files_done=60, progress={})
+
+    body = client.get(f"{BASE}/{conn_id}/extraction/status", headers=_auth(token)).json()
+    assert body["files_per_min"] is not None
+    assert body["files_per_min"] > 0
+
+
+def test_status_crawl_job_is_null_with_nothing_queued(tmp_path, monkeypatch, pg_engine):
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token)
+
+    body = client.get(f"{BASE}/{conn_id}/extraction/status", headers=_auth(token)).json()
+    assert body["crawl_job"] is None
+
+
+def test_status_crawl_job_reports_a_queued_trigger_before_any_run_exists(tmp_path, monkeypatch, pg_engine):
+    """The state chip's `Queued` rung: a `corpus-extraction` job can sit
+    queued before a worker claims it and opens the first `extraction_runs`
+    row — `running` stays null the whole time, but `crawl_job` is not."""
+    client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
+    conn_id = _connection(client, token)
+
+    from src.repositories import jobs_repo
+
+    job = jobs_repo().enqueue(
+        "corpus-extraction",
+        {"connection_id": conn_id},
+        idempotency_key=f"corpus-extraction:{conn_id}",
+    )
+
+    body = client.get(f"{BASE}/{conn_id}/extraction/status", headers=_auth(token)).json()
+    assert body["running"] is None
+    assert body["crawl_job"] is not None
+    assert body["crawl_job"]["id"] == job["id"]
+    assert body["crawl_job"]["status"] == "queued"
+
+
 def test_fleet_row_carries_facts_pending_documents_and_pass_running(tmp_path, monkeypatch, pg_engine):
     client, token = _pg_client(tmp_path, monkeypatch, pg_engine)
     conn_id = _connection(client, token)

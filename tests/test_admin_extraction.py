@@ -1420,3 +1420,80 @@ class TestFactsJobsInFlight:
         self._enqueue("sp-other", index=0, count=2)
         self._enqueue("sp-other", index=1, count=2)
         assert _facts_jobs_in_flight("sp-mine") == []
+
+
+class TestCrawlJobInFlight:
+    """``_crawl_job_in_flight`` (source-card redesign §8, `status.crawl_job`)
+    — the crawl trigger's own mirror of ``_facts_job_in_flight``, for the
+    ``corpus-extraction`` job kind. Fills the state chip's ``Queued`` rung:
+    a job can sit queued before a worker claims it and opens the first
+    ``extraction_runs`` row, where ``running`` is still null."""
+
+    KIND = "corpus-extraction"
+
+    @staticmethod
+    def _enqueue(connection_id: str):
+        from src.repositories import jobs_repo
+
+        return jobs_repo().enqueue(
+            "corpus-extraction",
+            {"connection_id": connection_id},
+            idempotency_key=f"corpus-extraction:{connection_id}",
+        )
+
+    def test_nothing_in_flight_is_none(self, seeded_app):
+        from app.api.admin_extraction import _crawl_job_in_flight
+
+        assert _crawl_job_in_flight("sp-none") is None
+
+    def test_a_queued_job_is_reported_with_its_id_and_status(self, seeded_app):
+        from app.api.admin_extraction import _crawl_job_in_flight
+
+        job = self._enqueue("sp-queued")
+        found = _crawl_job_in_flight("sp-queued")
+        assert found is not None
+        assert found["id"] == job["id"]
+        assert found["status"] == "queued"
+        assert found["created_at"]
+
+    def test_another_connections_job_is_not_this_ones(self, seeded_app):
+        from app.api.admin_extraction import _crawl_job_in_flight
+
+        self._enqueue("sp-other")
+        assert _crawl_job_in_flight("sp-mine") is None
+
+    def test_a_running_job_is_reported_running_and_a_finished_one_is_gone(self, seeded_app):
+        from app.api.admin_extraction import _crawl_job_in_flight
+        from src.repositories import jobs_repo
+
+        job = self._enqueue("sp-running")
+        claimed = jobs_repo().claim_next(kinds=[self.KIND], worker_id="w1", lease_seconds=60)
+        assert claimed and claimed["id"] == job["id"]
+        found = _crawl_job_in_flight("sp-running")
+        assert found is not None and found["status"] == "running"
+
+        assert jobs_repo().complete(job["id"], "w1", claimed["lease_token"], result={})
+        assert _crawl_job_in_flight("sp-running") is None
+
+    def test_the_lookup_follows_the_triggers_own_key_and_kind(self, seeded_app):
+        """Same contract as `TestFactsJobInFlight::test_the_lookup_follows_
+        the_triggers_own_key_and_kind`: enqueue through the producer's OWN
+        key builder and kind constant, so a change on that side fails here
+        instead of leaving the card silently blind."""
+        from app.api.admin_extraction import _CRAWL_JOB_KIND, _crawl_job_in_flight
+        from app.api.admin_sharepoint import _extraction_idempotency_key
+        from src.repositories import jobs_repo
+
+        assert _extraction_idempotency_key("sp-contract") == f"{_CRAWL_JOB_KIND}:sp-contract"
+
+        job = jobs_repo().enqueue(
+            _CRAWL_JOB_KIND,
+            {"connection_id": "sp-contract"},
+            idempotency_key=_extraction_idempotency_key("sp-contract"),
+        )
+        found = _crawl_job_in_flight("sp-contract")
+        assert found is not None, (
+            "the status reader did not find a job enqueued with the trigger's own "
+            "idempotency key + kind — the two surfaces have drifted apart"
+        )
+        assert found["id"] == job["id"]
