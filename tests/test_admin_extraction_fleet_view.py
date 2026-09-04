@@ -28,6 +28,8 @@ _SIGNATURES = (
     "function fmtRate(rate) {",
     "function fmtCost(usd) {",
     "function fmtErrorCell(run) {",
+    "function fmtEta(seconds) {",
+    "function factsThroughputNote(facts) {",
     "function tokenTotals(usage) {",
     "function factsCell(facts) {",
     "function phaseCell(run) {",

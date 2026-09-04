@@ -85,6 +85,8 @@ _SIGNATURES = (
     "function _extRenderInAgnesButton(connId, status) {",
     "function _extFactsJobLine(job) {",
     "function _extFactsPendingLine(status) {",
+    "function _extFactsEta(seconds) {",
+    "function _extFactsThroughputNote(status) {",
     "function _extRenderFactsButton(connId, status) {",
     "function _extRender(connId) {",
     "function _extRenderNextRun(connId, status) {",
