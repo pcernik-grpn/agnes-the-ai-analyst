@@ -1700,6 +1700,7 @@ _EXEMPT: dict[str, str] = {
     "/api/broker/anthropic/{subpath}": _BROKER_REASON,
     "/api/broker/agnes-api": _BROKER_REASON,
     "/api/broker/agnes-mcp": _BROKER_REASON,
+    "/api/broker/otlp/v1/{signal}": _BROKER_REASON,
     # Embedded kai-agent turn engine host wiring (app/api/kai.py). Both routes
     # are handshake/credential surfaces for the engine, not analyst features:
     # /sessions mints the engine's own session token for the calling user
