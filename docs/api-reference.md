@@ -471,6 +471,70 @@ read. `.../policy/columns` returns real profiler sample values, so it additional
 requires the full (`all`) credential surface described in §3.7; `.../policy/compile`
 does not.
 
+### 3.10 Finish the everyone-scope conversion — `POST /api/admin/grants/reconcile-everyone-scope`
+
+Admin-only. Converts the grants on the seeded `Everyone` group to
+`scope='everyone'` — the conversion migration `0098_everyone_becomes_a_scope`
+performs, and **declines** whenever doing so would change who can see what.
+
+`0098`'s step 3 is guarded in two directions:
+
+| guard | condition | why it refuses |
+|---|---|---|
+| widening | a person is not a member of `Everyone` | converting hands them everything the group holds |
+| narrowing | a non-person (service account, seeded system identity) *is* a member | the scope reaches people only, so converting takes access away |
+
+When either fires, the migration leaves the rows as ordinary group grants and
+logs that a later release will convert them. This endpoint is that release: it
+applies the same two guards and can be re-run whenever the membership the
+guard named has been tidied. Without it the instance stays half-converted
+indefinitely — new grants use the column, the pre-`0098` rows do not — because
+a stamped revision never runs again.
+
+Query parameters:
+
+| name | default | meaning |
+|---|---|---|
+| `dry_run` | `false` | report what would convert and write nothing |
+
+Response (`200`):
+
+```json
+{
+  "status": "blocked",
+  "converted": 0,
+  "would_convert": 0,
+  "blocked_by": "people_outside_group",
+  "people_outside_group": 3,
+  "non_people_inside_group": 0,
+  "withheld_types": ["memory_domain", "memory_item", "slack_channel", "table"],
+  "dry_run": false
+}
+```
+
+`status` is `converted`, `nothing_to_do`, or `blocked`. Both guard counts are
+always reported, so an operator who fixes one arm is not surprised by the
+other on the next run. A blocked run writes nothing — calling this on a
+still-inconsistent instance is safe and merely reports.
+
+`withheld_types` are the resource types for which "everyone" is not a coherent
+audience and which are never converted (same four `0098` withholds).
+
+Audited on every call, including blocked and no-op ones
+(`resource_grant.everyone_scope_reconciled`): *"an admin asked whether the
+conversion could complete and it could not"* is the trail an operator works
+from.
+
+**Postgres only.** The frozen DuckDB app-state ladder has no `scope` column —
+an everyone-grant there is an ordinary grant on the carrier group — so there
+is no half-converted state to close, and the endpoint answers `501`
+(`requires_postgres_backend`) rather than a misleading "nothing to do".
+
+CLI: `agnes admin grant reconcile-everyone [--dry-run] [--json]`. Deliberately
+no MCP tool — see `tests/test_documentation_api_triple_surface.py`'s exemption
+reason: a tool that flips grant scopes would hand an agent a lever on access
+control whose whole design is that a human decides.
+
 ### 3.9 Access-policy history — `GET /api/admin/registry/{table_id}/policy/revisions`
 
 Every policy write through `PUT /api/admin/registry/{table_id}` (attach, edit, clear)
@@ -1000,6 +1064,7 @@ the three guards (no interactive session, no Admin group, PAT-only minting).
 
 - /api/admin/grants
 - /api/admin/grants/{grant_id}
+- /api/admin/grants/reconcile-everyone-scope
 
 ### `/api/admin/access-overview` — Access overview
 
