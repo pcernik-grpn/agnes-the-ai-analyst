@@ -9,7 +9,7 @@ own contract is "what does the crawl do with a Graph response", not "does
 Postgres accept the row".
 
 The two seams written in parallel with this module
-(``connectors.sharepoint.convert`` / ``src.anonymization``) are substituted
+(``src.ingest.convert`` / ``src.anonymization``) are substituted
 at their wrapper functions, which is exactly the substitution point those
 wrappers exist to provide.
 """
@@ -4560,8 +4560,7 @@ class TestRetryUsesTheConversionPool:
         )
         assert "convert_pool=convert_pool" in body, "the pool must reach _process_item"
         assert "convert_slot=0" in body, (
-            "the retry loop is sequential, so it owns slot 0 — the same slot "
-            "the sequential page path uses"
+            "the retry loop is sequential, so it owns slot 0 — the same slot the sequential page path uses"
         )
 
     def test_the_retry_loop_repairs_the_pool_before_each_item(self):
@@ -4572,8 +4571,7 @@ class TestRetryUsesTheConversionPool:
         can hold a lock a fork would copy."""
         body = self._retry_source()
         assert "convert_pool.repair()" in body, (
-            "a crashed conversion worker would otherwise carry into the next "
-            "retried item"
+            "a crashed conversion worker would otherwise carry into the next retried item"
         )
 
     def test_the_caller_threads_the_pool_in(self):
@@ -4583,9 +4581,9 @@ class TestRetryUsesTheConversionPool:
         src = Path("connectors/sharepoint/crawler.py").read_text(encoding="utf-8")
         i = src.index("await _retry_failed_items(")
         call = src[i : src.index("\n    )", i)]
-        assert "convert_pool=convert_pool" in call, (
-            "_crawl_drive must pass its run's pool into the backlog replay"
-        )
+        assert "convert_pool=convert_pool" in call, "_crawl_drive must pass its run's pool into the backlog replay"
+
+
 def test_the_converted_size_cap_is_reachable_by_the_converter():
     """A byte ceiling above what the converter can emit guards nothing.
 
@@ -4600,7 +4598,7 @@ def test_the_converted_size_cap_is_reachable_by_the_converter():
     has to stay reachable, and it has to stay above an ordinary single-byte
     document so the common case is never refused.
     """
-    from connectors.sharepoint.convert import DEFAULT_MAX_CHARS
+    from src.ingest.convert import DEFAULT_MAX_CHARS
     from connectors.sharepoint.crawler import _DEFAULT_MAX_CONVERTED_MB
 
     cap_bytes = _DEFAULT_MAX_CONVERTED_MB * 1024 * 1024

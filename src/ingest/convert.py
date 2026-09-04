@@ -1,8 +1,15 @@
-"""Document → Markdown conversion for the SharePoint connector.
+"""Document → Markdown conversion — the one converter behind every ingest path.
 
-A crawled document is worthless to the fact-graph pipeline until it is text.
-This module is the one place that turns a downloaded file into markdown, and
-the single reason it exists in-tree rather than as a dependency is
+A document is worthless to search and to the fact-graph pipeline until it is
+text. This module is the one place that turns a file on disk into markdown,
+whoever brought the file: the SharePoint crawl
+(``connectors/sharepoint/crawler.py``) and a Collections upload
+(``src/ingest/text_extract.py``) both call :func:`convert_to_markdown`, so a
+format either of them can read, both can. It lived under the SharePoint
+connector first, which is why some of the vocabulary below still speaks of
+"the crawl"; nothing in it knows the source.
+
+The single reason it exists in-tree rather than as a dependency is
 **licensing**: the reference converter is AGPL-3.0 for exactly one reason — its
 PDF route uses PyMuPDF. Agnes ships under PolyForm Small Business 1.0.0, which
 cannot vendor AGPL code, so the design constraint from the fact-graph spec
@@ -20,10 +27,17 @@ Routing
 ``.md/.txt/.csv/.json/.yaml/.yml`` pass through verbatim (UTF-8,
 ``errors="replace"``) — matching the crawler's historical ``TEXT_SUFFIXES``
 behaviour, so a re-crawl produces byte-identical extractions. ``.pdf`` goes to
-pypdfium2. Everything else goes to markitdown. The declared ``mime`` is only
-consulted when the filename carries no suffix we recognise; it is untrusted
-metadata from a remote drive and is never used for anything but choosing a
-route.
+pypdfium2. Everything else goes to markitdown — except that ``.docx``/``.pptx``
+first get **Docling** (the ``[docling]`` extra, MIT) when it is installed,
+because its layout-aware parsing keeps tables and reading order that
+markitdown flattens; Docling refusing a document is not a failure, markitdown
+gets it next. Docling is deliberately NOT offered the PDF route: the structure
+pass below is the one PDF pipeline on every image (owner decision
+2026-08-31). The declared ``mime`` is only consulted when the filename carries
+no suffix we recognise; it is untrusted metadata from a remote drive and is
+never used for anything but choosing a route. A caller that stores files under
+content-addressed names and keeps the declared type elsewhere passes it as
+``suffix``, which then drives routing instead of the path.
 
 Failure model
 -------------
@@ -35,7 +49,7 @@ subclass, so a caller that only catches ``ConversionError`` still survives) and
 names the extra to install; the imports are lazy so importing this module on a
 server that never converts anything costs nothing and cannot fail.
 
-The PDF route is :mod:`connectors.sharepoint.pdf_structure` and nothing else
+The PDF route is :mod:`src.ingest.pdf_structure` and nothing else
 (owner decision 2026-08-31 — one pipeline, no dual modes). It reconstructs
 headings and tables from glyph positions and degrades *per page*, inside
 itself, to that page's plain reading-order text whenever the block structure
@@ -45,7 +59,7 @@ Pages are separated by ``\\n\\n---\\n\\n``.
 
 A PDF with no text layer at all (a scan) is **not** an error: it returns
 ``engine="empty"`` with empty markdown. Transcribing such a scan is a separate
-feature with its own cost surface — :mod:`connectors.sharepoint.scan_ocr`,
+feature with its own cost surface — :mod:`src.ingest.scan_ocr`,
 **off by default** behind ``extraction.scan_ocr.enabled``. While it is off
 this module never calls a model and the empty result above is byte-identical
 to what it always was; with it on, a scan comes back as ``engine="ocr"`` and a
@@ -55,8 +69,12 @@ never a silently empty document.
 
 from __future__ import annotations
 
+import logging
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 #: Suffixes read straight off disk. Kept identical to the crawler's historical
@@ -81,6 +99,18 @@ _PASSTHROUGH_MIMES = frozenset(
 
 _PDF_MIMES = frozenset({"application/pdf", "application/x-pdf"})
 
+#: Office formats Docling is offered before markitdown when it is installed.
+#: Exactly the formats it reads better than markitdown — never ``.pdf`` (the
+#: structure pass is the one PDF route) and never the passthrough set.
+DOCLING_SUFFIXES = frozenset({".docx", ".pptx"})
+
+#: Office formats that are, by definition, a zip (an OOXML package). Checked
+#: before any engine sees the bytes: markitdown sniffs content and reads a
+#: non-archive behind one of these suffixes as prose — ASCII garbage comes
+#: back as UTF-16 mojibake — and a silently indexed wrong document is worse
+#: than a refusal naming the file.
+_OOXML_SUFFIXES = frozenset({".docx", ".pptx", ".xlsx"})
+
 #: Separator written between PDF pages.
 PAGE_BREAK = "\n\n---\n\n"
 
@@ -96,10 +126,14 @@ MIN_PDF_TEXT_CHARS = 16
 
 ENGINE_MARKITDOWN = "markitdown"
 ENGINE_PYPDFIUM2 = "pypdfium2"
+#: Office documents parsed by the ``[docling]`` extra — layout-aware, heavy,
+#: opt-in. Its own engine name so a reader can tell a Docling table from
+#: markitdown's flattened rendering of the same page.
+ENGINE_DOCLING = "docling"
 ENGINE_PASSTHROUGH = "passthrough"
 ENGINE_EMPTY = "empty"
 #: A PDF with no text layer, transcribed by the vision model
-#: (:mod:`connectors.sharepoint.scan_ocr`). Its own engine name, never
+#: (:mod:`src.ingest.scan_ocr`). Its own engine name, never
 #: ``"pypdfium2"``: a downstream reader must be able to tell text that was read
 #: off the page from text a model produced from a bitmap.
 ENGINE_OCR = "ocr"
@@ -143,13 +177,51 @@ class MissingConversionDependency(ConversionError):
 class ConvertResult:
     """The converted document and which engine produced it.
 
-    ``engine`` is one of ``"markitdown"``, ``"pypdfium2"``, ``"passthrough"``
-    or ``"empty"``. ``"empty"`` means conversion succeeded and found no text —
-    a scanned PDF, a blank document — and ``markdown`` is then ``""``.
+    ``engine`` is one of ``"docling"``, ``"markitdown"``, ``"pypdfium2"``,
+    ``"ocr"``, ``"passthrough"`` or ``"empty"``. ``"empty"`` means conversion
+    succeeded and found no text — a scanned PDF, a blank document — and
+    ``markdown`` is then ``""``.
     """
 
     markdown: str
     engine: str
+
+
+def docling_capability() -> bool:
+    """Whether the ``docling`` extra is importable in this deployment.
+
+    An import-spec probe, never an import: Docling pulls torch, and a
+    capability question asked while composing an error message (or a
+    readiness payload) must not pay that cost. Mirrors
+    ``src/ingest/embeddings.py::embedding_capability``, which separates a
+    hybrid deployment from a lexical-only one the same way.
+    """
+    import importlib.util
+
+    return importlib.util.find_spec("docling") is not None
+
+
+def docling_markdown(path: Path) -> str | None:
+    """Docling → markdown, or ``None`` when Docling is absent or refuses the file.
+
+    ``None`` is the signal to try the next engine; an empty string is a
+    successful conversion of a document with nothing in it. Docling is present
+    but failing on THIS document is logged, never raised: the whole point of
+    a second engine is that the caller does not have to care which one read
+    the file.
+    """
+    if not docling_capability():
+        return None
+    try:
+        from docling.document_converter import DocumentConverter  # type: ignore[import-not-found]
+    except Exception:
+        return None
+    try:
+        result = DocumentConverter().convert(str(path))
+        return _normalize_newlines(result.document.export_to_markdown() or "")
+    except Exception as exc:  # noqa: BLE001 — any backend failure means "not this engine"
+        logger.warning("docling could not convert %s (%s); trying the next engine", path.name, type(exc).__name__)
+        return None
 
 
 def convert_to_markdown(
@@ -157,6 +229,7 @@ def convert_to_markdown(
     mime: str,
     *,
     max_chars: int = DEFAULT_MAX_CHARS,
+    suffix: str | None = None,
 ) -> ConvertResult:
     """Convert one file to markdown.
 
@@ -167,6 +240,11 @@ def convert_to_markdown(
             used only when the suffix is unrecognised.
         max_chars: ceiling on returned characters. Output longer than this is
             cut at the limit and a truncation marker appended.
+        suffix: the file's declared type (``".pptx"``), for a caller whose
+            storage names carry none — Collections keep an upload as
+            ``<sha256><ext>`` and the type as a column. When given it replaces
+            the path's own suffix for routing and is handed to markitdown as
+            the extension to convert as.
 
     Returns:
         :class:`ConvertResult` — never ``None``, never a partially-written file.
@@ -184,7 +262,8 @@ def convert_to_markdown(
 
     path = Path(path)
     filename = path.name or str(path)
-    suffix = path.suffix.lower()
+    hint = suffix.lower() if suffix else None
+    suffix = hint or path.suffix.lower()
     declared = (mime or "").split(";", 1)[0].strip().lower()
 
     try:
@@ -199,8 +278,7 @@ def convert_to_markdown(
     elif suffix == ".pdf" or (not suffix and declared in _PDF_MIMES):
         text, engine = _convert_pdf(path, filename)
     else:
-        text = _convert_markitdown(path, filename)
-        engine = ENGINE_MARKITDOWN
+        text, engine = _convert_document(path, filename, suffix, hint)
 
     if not text.strip():
         # Conversion succeeded and there was nothing in it. Not an error: a
@@ -231,16 +309,51 @@ def _read_text(path: Path, filename: str, max_chars: int) -> str:
         raise ConversionError(filename, f"cannot read file: {exc}", engine=ENGINE_PASSTHROUGH) from exc
 
 
-# --------------------------------------------------------------- markitdown
+# ------------------------------------------------------ docling + markitdown
 
 
-def _convert_markitdown(path: Path, filename: str) -> str:
+def _convert_document(path: Path, filename: str, suffix: str, hint: str | None) -> tuple[str, str]:
+    """Everything that is neither passthrough nor PDF: Docling first for the
+    office formats it reads better, markitdown for the rest and as the second
+    reader when Docling refuses a document.
+
+    Returns ``(markdown, engine)``. The one subtle case is Docling present,
+    failing, and markitdown NOT installed (a rich image built without the
+    ``[extraction]`` extra): that is the file's problem, not a missing extra —
+    ``MissingConversionDependency`` would send an operator to install a
+    reader for a document Docling already could not read — so it surfaces as
+    a plain :class:`ConversionError` attributed to Docling.
+    """
+    if suffix in _OOXML_SUFFIXES and not zipfile.is_zipfile(path):
+        raise ConversionError(filename, f"not an OOXML archive — a '{suffix}' must be a zip package")
+
+    docling_refused = False
+    if suffix in DOCLING_SUFFIXES and docling_capability():
+        text = docling_markdown(path)
+        if text is not None:
+            return text, ENGINE_DOCLING
+        docling_refused = True
+    try:
+        return _convert_markitdown(path, filename, file_extension=hint), ENGINE_MARKITDOWN
+    except MissingConversionDependency as exc:
+        if docling_refused:
+            raise ConversionError(
+                filename,
+                "docling could not convert this file, and no second reader is installed",
+                engine=ENGINE_DOCLING,
+            ) from exc
+        raise
+
+
+def _convert_markitdown(path: Path, filename: str, *, file_extension: str | None = None) -> str:
     """Office and everything else → markitdown (MIT).
 
     Imported lazily so this module stays importable without the extraction
     extra, and constructed with ``enable_plugins=False``: markitdown's plugin
     mechanism auto-loads third-party entry points, which would let any package
     that happens to be installed execute code inside the crawl.
+    ``file_extension`` is the caller's suffix hint, passed on only when given
+    so a path that carries its own extension converts exactly as before.
     """
     try:
         from markitdown import MarkItDown
@@ -248,7 +361,11 @@ def _convert_markitdown(path: Path, filename: str) -> str:
         raise MissingConversionDependency(filename, "markitdown", engine=ENGINE_MARKITDOWN) from exc
 
     try:
-        result = MarkItDown(enable_plugins=False).convert(str(path))
+        converter = MarkItDown(enable_plugins=False)
+        if file_extension:
+            result = converter.convert_local(str(path), file_extension=file_extension)
+        else:
+            result = converter.convert(str(path))
     except Exception as exc:
         # markitdown surfaces backend failures as many different exception
         # types (its own UnsupportedFormatException, zipfile.BadZipFile,
@@ -272,7 +389,7 @@ def _convert_markitdown(path: Path, filename: str) -> str:
 def _convert_pdf(path: Path, filename: str) -> tuple[str, str]:
     """PDF → markdown through the structure pass, and only through it.
 
-    :func:`connectors.sharepoint.pdf_structure.reconstruct_pdf` is the ONE
+    :func:`src.ingest.pdf_structure.reconstruct_pdf` is the ONE
     PDF route (owner decision 2026-08-31 — one pipeline, no dual modes). It
     already degrades *internally*, per page: a page whose blocks are
     ambiguous falls back to that page's plain reading-order text and is
@@ -298,7 +415,7 @@ def _convert_pdf(path: Path, filename: str) -> tuple[str, str]:
     except ImportError as exc:
         raise MissingConversionDependency(filename, "pypdfium2", engine=ENGINE_PYPDFIUM2) from exc
 
-    from connectors.sharepoint.pdf_structure import reconstruct_pdf
+    from src.ingest.pdf_structure import reconstruct_pdf
 
     try:
         structured = str(reconstruct_pdf(path)).strip()
@@ -320,7 +437,7 @@ def _convert_pdf(path: Path, filename: str) -> tuple[str, str]:
     # the document comes back as engine="ocr" — and a transcription that could
     # not be produced at all raises, because a caller who turned OCR on must
     # never receive a silently empty document.
-    from connectors.sharepoint import scan_ocr
+    from src.ingest import scan_ocr
 
     if not scan_ocr.scan_ocr_enabled():
         return "", ENGINE_PYPDFIUM2
@@ -357,7 +474,16 @@ __all__ = [
     "ConvertResult",
     "MissingConversionDependency",
     "convert_to_markdown",
+    "docling_capability",
+    "docling_markdown",
     "DEFAULT_MAX_CHARS",
+    "DOCLING_SUFFIXES",
+    "ENGINE_DOCLING",
+    "ENGINE_EMPTY",
+    "ENGINE_MARKITDOWN",
+    "ENGINE_OCR",
+    "ENGINE_PASSTHROUGH",
+    "ENGINE_PYPDFIUM2",
     "PAGE_BREAK",
     "PASSTHROUGH_SUFFIXES",
 ]

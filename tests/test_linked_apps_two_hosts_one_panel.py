@@ -68,7 +68,7 @@ def test_only_servers_that_can_answer_are_offered_as_a_choice():
     """A server with no lister tool cannot answer "what apps do you have", so
     CHOOSING it would be a row whose only outcome is a failure two clicks on."""
     src = PAGE.read_text(encoding="utf-8")
-    assert "LinkedAppsPanel.isLister" in src, "every connected server is offered, listers or not"
+    assert "LinkedAppsPanel.listerCandidates" in src, "every connected server is offered, listers or not"
     # Choosable rows carry `data-la-src` (the click handler's only hook); the
     # reference rows must not, or "not offered as a choice" is only a visual
     # claim.
