@@ -32,7 +32,13 @@ TEMPLATE = _WEB / "templates" / "admin_data_sources.html"
 #: slice of the inline block moves out — that is the whole maintenance cost.
 _LOADED = (
     _WEB / "static" / "js" / "ds_helpers.js",
-    _WEB / "static" / "js" / "ds_page.js",
+    _WEB / "static" / "js" / "ds_add_data_wizard.js",
+    # The page's own script, then the three subsystems split out of it (perf
+    # follow-up, 2026-09-03) — all `defer`, all classic, one global scope.
+    _WEB / "static" / "js" / "admin" / "data_sources_page.js",
+    _WEB / "static" / "js" / "admin" / "data_sources_sharepoint_wizard.js",
+    _WEB / "static" / "js" / "admin" / "data_sources_extraction_observability.js",
+    _WEB / "static" / "js" / "admin" / "data_sources_anon_preview.js",
 )
 
 #: Markup the page pulls in with `{% include %}`. Tests assert on the wizard's

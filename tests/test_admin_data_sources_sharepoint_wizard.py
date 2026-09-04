@@ -14,8 +14,6 @@ not simulated pixels)."""
 
 from __future__ import annotations
 
-from tests import _ds_page_source
-
 import json
 import shutil
 import subprocess
@@ -74,7 +72,15 @@ class TestThreeStepDrawer:
 
     def test_step2_has_anonymize_column_and_the_verbatim_note(self, seeded_app):
         body = _page(seeded_app)
-        assert "anonymize" in body
+        # The column is rendered by the wizard's externalized script, never
+        # by the template. Asserting "anonymize" on the response text alone
+        # used to pass off a COMMENT inside the page's inline <style>, which
+        # said nothing about the column existing; the styles now live in
+        # css/ds_page.css, so that accident is gone. Assert the script that
+        # actually draws it.
+        assert "anonymize" in Path("app/web/static/js/admin/data_sources_sharepoint_wizard.js").read_text(
+            encoding="utf-8"
+        )
         # The exact note text the spec requires (§13.2).
         assert "original file is not copied" in body
         assert "stores the extracted markdown" in body
@@ -136,7 +142,19 @@ class TestStep2SavedScopesAndGuidanceMarkup:
         assert "ds-wizard-error" not in guidance_tag
 
 
-TEMPLATE = _ds_page_source.TEMPLATE
+#: The wizard's own script moved into a dedicated static file wholesale
+#: (perf follow-up, 2026-09-03) — the comment on `_sp_step2_slice` below
+#: explains why that made the old "slice up to the enclosing `</script>`"
+#: technique both unnecessary and unsafe (this file has none of its own).
+SHAREPOINT_WIZARD_JS = (
+    Path(__file__).resolve().parents[1]
+    / "app"
+    / "web"
+    / "static"
+    / "js"
+    / "admin"
+    / "data_sources_sharepoint_wizard.js"
+)
 
 
 def _node_run(script: str) -> str:
@@ -150,20 +168,22 @@ def _node_run(script: str) -> str:
 
 def _sp_step2_slice() -> str:
     """The shipped SharePoint wizard JS (state, step-1 wiring, step-2 tree
-    render/filter/server search, and step-3 share-preview render), sliced
-    from the template so these tests run the REAL shipped functions rather
-    than a copy that can drift. The slice runs through the END of the
-    wizard's own ``<script>`` block — step 1 and step 3 wiring ride along
-    even for a test that only exercises step 2 (it's all one contiguous
-    block) but every DOM id any of it reaches for resolves to a safe no-op
-    stub (see ``_HARNESS_PREAMBLE``), so it costs nothing to include and
-    keeps the slice a single honest contiguous range rather than a
-    hand-picked patchwork.
+    render/filter/server search, and step-3 share-preview render) — the
+    REAL shipped functions, not a copy that can drift.
+
+    Was a slice from the template up to the enclosing `</script>` — the
+    wizard's script is now its own dedicated static file (perf follow-up,
+    2026-09-03: `app/web/static/js/admin/data_sources_sharepoint_wizard.js`,
+    extracted wholesale since the wizard was ALREADY self-contained, per this
+    file's own module docstring), so the whole file IS the slice: no
+    `</script>` marker to hunt for, and no risk of accidentally running past
+    it into whatever static asset happens to load next. Step 1 and step 3
+    wiring ride along even for a test that only exercises step 2 (it's all
+    one contiguous file) but every DOM id any of it reaches for resolves to
+    a safe no-op stub (see ``_HARNESS_PREAMBLE``), so it costs nothing to
+    include.
     """
-    html = _ds_page_source.page_source()
-    start = html.index('const SP_CONN_API = "/api/admin/source-connections";')
-    end = html.index("</script>", start)
-    return html[start:end]
+    return SHAREPOINT_WIZARD_JS.read_text(encoding="utf-8")
 
 
 #: Stubs for everything the sliced block reaches out to. Any DOM id NOT
@@ -1528,12 +1548,17 @@ class TestCertificateFileUploadMarkup:
         assert "Upload PEM file" in body
 
     def test_card_rotate_row_has_the_same_picker(self, seeded_app):
-        # The card is a JS template literal, and that script now lives in a file
-        # the page loads rather than inline — so read the page as the browser
-        # assembles it, not the response alone.
-        body = _ds_page_source.rendered_with_scripts(_page(seeded_app))
-        assert "ds-sp-cert-file-" in body
-        card_js = body.split("ds-sp-cert-row-", 1)[1]
+        # The card is a JS template literal — in the shipped PAGE SCRIPT
+        # (perf follow-up, 2026-09-03: extracted to its own static asset),
+        # not the HTML response itself. Fetched through the same client, the
+        # way a browser loading the page would.
+        c = seeded_app["client"]
+        page_js = c.get(
+            "/static/js/admin/data_sources_page.js",
+            headers={"Authorization": f"Bearer {seeded_app['admin_token']}"},
+        ).text
+        assert "ds-sp-cert-file-" in page_js
+        card_js = page_js.split("ds-sp-cert-row-", 1)[1]
         assert "spCertFilePicked(" in card_js
 
 

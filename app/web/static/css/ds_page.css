@@ -1,16 +1,21 @@
-/* The Data section's own stylesheet: source cards, the Add-data wizard
- * drawer, the SharePoint drawer, the extraction panel.
+/* The /admin/data-sources page's own styles, in a file rather than three
+ * inline <style> blocks in admin_data_sources.html.
  *
- * Moved out of admin_data_sources.html's three inline <style> blocks
- * verbatim, and shared with the data-package builder — which loads it for
- * the wizard drawer alone. Of the 144 ds-/so- classes that drawer uses, 118
- * were defined only inside that page, so the markup and the script could
- * move out and still arrive somewhere else unstyled.
+ * Why a file: the data-package builder mounts this page's "Add data" wizard
+ * as a drawer over the package being written, and a second page cannot load
+ * styles that live inside another template's markup. The four
+ * js/admin/data_sources_*.js files were already loadable; this was the one
+ * half that was not.
  *
- * Design-system rules are unchanged and still apply: --ds-* tokens only, no
- * raw hex, theming via [data-theme]. Nothing here was rewritten; if a rule
- * looks wrong, it looked that way in the template too.
+ * Concatenated in document order, so the cascade among these rules is
+ * unchanged. The third block used to sit in admin_content -- after the
+ * base's admin-nav.css / admin_page.css, which base_admin.html deliberately
+ * loads from its own content block -- and now travels in head_extra with the
+ * rest. Safe because it is entirely the .anonprev* component namespace: 12
+ * selectors that collide with neither of those sheets, every value a --ds-*
+ * token. Nothing it could lose a specificity tie against.
  */
+
   .ds-page {
     font-family: var(--font-primary, 'Inter', system-ui, -apple-system, BlinkMacSystemFont, sans-serif);
   }
@@ -267,6 +272,21 @@
     font-size: 12px; font-family: var(--font-mono, ui-monospace, monospace);
   }
   .ds-rotate-row textarea:focus { outline: 2px solid var(--ds-primary, var(--ds-primary)); outline-offset: -1px; }
+  /* "Split this site" panel's number/date/select inputs — not free-text
+     tokens, so no monospace and no flex:1 stretch (the generic `input`
+     rule above assumes both). */
+  .ds-rotate-row input[type="number"], .ds-rotate-row input[type="date"], .ds-rotate-row select {
+    flex: 0 0 auto; padding: 7px 10px; font-family: inherit; font-size: 12px;
+    border-radius: 8px; border: 1px solid var(--ds-border);
+    background: var(--ds-surface); color: var(--ds-text-primary);
+  }
+  .ds-sp-split-result { flex-basis: 100%; display: flex; flex-wrap: wrap; gap: 8px; margin-top: 4px; }
+  .ds-sp-split-table { border-collapse: collapse; font-size: 12.5px; }
+  .ds-sp-split-table th, .ds-sp-split-table td {
+    padding: 4px 10px; text-align: left; border-bottom: 1px solid var(--ds-border);
+  }
+  .ds-sp-split-table th { color: var(--ds-text-muted); font-weight: 600; }
+  .ds-sp-split-table td { color: var(--ds-text-primary); }
 
   /* SharePoint card: "Scope collections" — clickable rows into the connect
      wizard, bound to this connection (spec follow-up, TCRD-240/241: "make
@@ -1085,12 +1105,17 @@
   .sp-share-row__badges { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
   .sp-share-row__groups { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
   .sp-share-row__groups label { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--ds-text-secondary); }
+  /* TCRD-296 gap #80 — this scope's own "modified since" crawl filter,
+     step-3 Share & finish. Same `field-hint` class the connection-level
+     "Crawl filter (default)" panel on the source card uses for its own
+     status/caveat lines, so the two controls read as one family. */
+  .sp-share-row__minmod { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 8px; }
+  .sp-share-row__minmod label { font-size: 12px; color: var(--ds-text-secondary); }
   .sp-warn {
     display: inline-flex; align-items: center; gap: 5px; font-size: 11px; font-weight: 600;
     padding: 2px 8px; border-radius: var(--ds-radius-pill);
     background: var(--ds-accent-danger-bg); color: var(--ds-accent-danger-ink);
   }
-
   /* ── Extraction observability (2026-08-31 design §4/§6) ───────────────
      A self-contained block: every selector is `.ext-*`, every colour is a
      `--ds-*` token, and nothing here restyles an existing card element.
@@ -1139,6 +1164,18 @@
   }
   .ext-run__head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: 12.5px; }
   .ext-run__when { color: var(--ds-text-muted); }
+  /* Shard roll-up (2026-09-03 auto-parallel-crawl design §4.7) — one line
+     per shard, same list vocabulary `.ext-errors__list` already uses. */
+  .ext-shards {
+    list-style: none; margin: 4px 0 0; padding: 0; display: flex; flex-direction: column;
+    gap: 4px;
+  }
+  .ext-shards li {
+    font-size: 11px; color: var(--ds-text-muted); padding: 4px 8px;
+    border: 1px solid var(--ds-border); border-radius: var(--ds-radius-btn);
+    background: var(--ds-surface);
+  }
+  .ext-shards li strong { color: var(--ds-text-primary); }
   /* Per-file error detail (`<details>`, lazy-fetched on first open — see
      `_extErrorsSummaryHtml`). The marker is hidden so the summary line reads
      like every other `.ext-sub` line until it is clicked. */
@@ -1163,7 +1200,11 @@
   .ext-cfg th { font-weight: 600; color: var(--ds-text-secondary); white-space: nowrap; }
   .ext-cfg td code { font-size: 11.5px; color: var(--ds-text-muted); }
   .ext-cfg__note { display: block; margin-top: 3px; font-size: 11px; color: var(--ds-text-muted); line-height: 1.45; }
-
+  /* Completeness drawer (TCRD-296 B.9) — reuses `.ext-cfg`'s table chrome;
+     `.ext-num` right-aligns the count columns (admin_extraction.html's page
+     table defines the same class for its own — separate — table). */
+  .ext-num { text-align: right; font-variant-numeric: tabular-nums; }
+  .ext-completeness__total td { font-weight: 600; border-top: 2px solid var(--ds-border); }
   .anonprev { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--ds-border-light); }
   .anonprev__head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
   .anonprev__title { font-size: 12.5px; font-weight: 600; color: var(--ds-text-primary); }

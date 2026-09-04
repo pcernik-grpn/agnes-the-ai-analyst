@@ -602,3 +602,135 @@ class TestPolicyBuilderCompile:
         )
         assert resp.status_code == 422, resp.text
         assert "select no columns" in resp.json()["detail"], resp.text
+
+    def test_compile_endpoint_refuses_an_unknown_row_rule_column(self, policy_builder_table):
+        """A row rule naming a column the table does not have used to be
+        DROPPED with a warning — so a spec whose only rule referenced a
+        since-renamed column compiled to a WHERE-less policy handing the whole
+        table to everyone, at authoring time, behind a 200 and a warning nobody
+        had to read. It is a refused compile now."""
+        c = policy_builder_table["client"]
+        token = policy_builder_table["admin_token"]
+
+        resp = c.post(
+            "/api/admin/registry/policy_builder_invoices/policy/compile",
+            json={
+                "row_rules": [{"column": "renamed_away", "op": "in_caller_groups"}],
+                "column_masks": {},
+            },
+            headers=_auth(token),
+        )
+        assert resp.status_code == 422, resp.text
+        detail = resp.json()["detail"]
+        assert detail.startswith("policy_compile_invalid_spec:"), resp.text
+        assert "renamed_away" in detail, resp.text
+
+    def test_compile_endpoint_supports_the_partial_masks(self, policy_builder_table):
+        c = policy_builder_table["client"]
+        token = policy_builder_table["admin_token"]
+
+        resp = c.post(
+            "/api/admin/registry/policy_builder_invoices/policy/compile",
+            json={
+                "row_rules": [],
+                "column_masks": {"email": "email_partial", "national_id": "last4"},
+            },
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200, resp.text
+        sql = resp.json()["sql"]
+        assert "SELECT *" not in sql
+        assert "EXCLUDE" not in sql
+        # Each masked column is projected exactly once — never beside a
+        # plaintext sibling under the same output name.
+        assert sql.count('AS "email"') == 1
+        assert sql.count('AS "national_id"') == 1
+        assert "REGEXP_REPLACE(\"email\", '^[^@]*', '')" in sql
+        assert "CONCAT('****', SUBSTRING(\"national_id\", -4))" in sql
+        # The compiled body must survive the gate every save runs, remote
+        # transpiles included — the builder may not hand an admin SQL the PUT
+        # would then refuse.
+        from src.access_policy_validate import validate_policy_sql
+
+        validate_policy_sql(
+            sql,
+            table_id="policy_builder_invoices",
+            table_name="policy_builder_invoices",
+            mapping_table_names=set(),
+            for_remote=True,
+        )
+
+    def test_compile_endpoint_refuses_a_partial_mask_on_a_non_text_column(self, policy_builder_table):
+        """`last4`/`email_partial` are string surgery; on a DOUBLE column the
+        only options are silently changing the output column's type or emitting
+        nonsense, so the compiler refuses and the endpoint 422s."""
+        c = policy_builder_table["client"]
+        token = policy_builder_table["admin_token"]
+
+        resp = c.post(
+            "/api/admin/registry/policy_builder_invoices/policy/compile",
+            json={"row_rules": [], "column_masks": {"amount_eur": "last4"}},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 422, resp.text
+        detail = resp.json()["detail"]
+        assert detail.startswith("policy_compile_invalid_spec:"), resp.text
+        assert "amount_eur" in detail, resp.text
+
+    def test_compile_endpoint_builds_a_tiered_mask_chain(self, policy_builder_table):
+        """A multi-tier spec is compiled server-side into ONE ordered CASE
+        chain -- the endpoint stays a pure generator, so the stored artifact
+        is still SQL, never the tier structure."""
+        c = policy_builder_table["client"]
+        token = policy_builder_table["admin_token"]
+
+        resp = c.post(
+            "/api/admin/registry/policy_builder_invoices/policy/compile",
+            json={
+                "row_rules": [],
+                "column_masks": {
+                    "national_id": {
+                        "choice": "tiered",
+                        "tiers": [
+                            {"groups": ["Compliance"], "reveal": "show"},
+                            {"groups": ["Finance"], "reveal": "last4"},
+                        ],
+                        "default": "nullify",
+                    }
+                },
+            },
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200, resp.text
+        sql = resp.json()["sql"]
+        assert "SELECT *" not in sql
+        # One output column for the masked column, in tier order.
+        assert sql.count('AS "national_id"') == 1
+        assert sql.index("'Compliance'") < sql.index("'Finance'")
+        assert "list_contains($user_groups, 'Compliance')" in sql
+        assert "CAST(NULL AS VARCHAR) END" in sql
+
+    def test_compile_endpoint_rejects_a_tiered_spec_that_masks_nothing(self, policy_builder_table):
+        """A tier chain whose default is ``show`` reveals the column to
+        everyone the tiers do not name -- a no-op policy that reads like a
+        restriction. ``compile_policy`` refuses it; the endpoint must surface
+        that as a 4xx the builder can render, never a 500."""
+        c = policy_builder_table["client"]
+        token = policy_builder_table["admin_token"]
+
+        resp = c.post(
+            "/api/admin/registry/policy_builder_invoices/policy/compile",
+            json={
+                "row_rules": [],
+                "column_masks": {
+                    "national_id": {
+                        "choice": "tiered",
+                        "tiers": [{"groups": ["Compliance"], "reveal": "show"}],
+                        "default": "show",
+                    }
+                },
+            },
+            headers=_auth(token),
+        )
+        assert resp.status_code == 422, resp.text
+        assert "default" in resp.json()["detail"]

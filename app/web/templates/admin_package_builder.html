@@ -66,13 +66,19 @@
 <script src="{{ static_url('js/components/ds_dropdown.js') }}"></script>
 {# The wizard's behaviour. `DS_BOOT` is the handover for the values that
    page renders server-side; the builder has no connections list or source
-   strip of its own, so it hands over empty ones and ds_page.js skips the
-   connections-page boot it guards on those. #}
+   strip of its own, so it hands over empty ones and data_sources_page.js
+   skips the connections-page boot it guards on those. #}
 <script>
   window.DS_BOOT = { sourcePipelines: {}, derivedSources: [], warnIcon: "" };
 </script>
 <script src="{{ static_url('js/ds_helpers.js') }}"></script>
-<script src="{{ static_url('js/ds_page.js') }}"></script>
+{# main's split of that page's script, by subsystem, in load order — the
+   builder needs the same globals the page does, and loading the four is
+   exactly as good as loading one. #}
+<script src="{{ static_url('js/admin/data_sources_page.js') }}"></script>
+<script src="{{ static_url('js/admin/data_sources_sharepoint_wizard.js') }}"></script>
+<script src="{{ static_url('js/admin/data_sources_extraction_observability.js') }}"></script>
+<script src="{{ static_url('js/admin/data_sources_anon_preview.js') }}"></script>
 <script src="{{ static_url('js/components/package_drawer.js') }}"></script>
 <script>
   (function () {

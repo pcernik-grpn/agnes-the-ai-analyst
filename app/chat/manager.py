@@ -23,7 +23,7 @@ from app.chat import agent_profile, inbound, routing, runner
 from app.chat.audit import hash_args, write_audit
 from app.chat.config import ChatConfig
 from app.chat.frame_seq import stamp_frame
-from app.chat.message_parts import build_message_parts, parts_to_tool_calls
+from app.chat.message_parts import build_message_parts, parts_to_tool_calls, parts_to_tool_results
 from app.chat.persistence import ChatRepository
 from app.chat.profiles import get_profile
 from app.chat.provider import SandboxCapacityError, SandboxHandle, SandboxProvider
@@ -2582,7 +2582,16 @@ class ChatManager:
                 # haystack) and for rows written before schema v123.
                 frame["parts"] = build_message_parts(live.turn_buffer)
                 frame["tool_calls"] = parts_to_tool_calls(frame["parts"])
-                frame["sources"] = sources_verdict(frame.get("content", "") or "", frame.get("tool_calls")).to_dict()
+                # Results as well as calls: a document's name only ever
+                # appears in what a tool RETURNED (see `verify`), so a
+                # citation judged on `tool_calls` alone could never verify.
+                # They ride the verdict, not the row — `parts` already
+                # persists them once.
+                frame["sources"] = sources_verdict(
+                    frame.get("content", "") or "",
+                    frame.get("tool_calls"),
+                    parts_to_tool_results(frame.get("parts")),
+                ).to_dict()
             await self._broadcast(live, frame)
             ftype = frame.get("type")
             # Accumulate in-flight turn frames for mid-turn replay and partial

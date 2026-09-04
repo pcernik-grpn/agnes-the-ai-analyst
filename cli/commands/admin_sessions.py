@@ -4,8 +4,11 @@ Three subcommands mirroring the new /api/admin/sessions/* endpoints:
 
     agnes admin sessions list                       # all sessions, table view
     agnes admin sessions list --errors --since 7d   # only sessions with tool errors
-    agnes admin sessions show <username> <file>     # transcript dump (chronological)
-    agnes admin sessions download <username> <file> # save the raw .jsonl
+    agnes admin sessions show <user> <file>         # transcript dump (chronological)
+    agnes admin sessions download <user> <file>     # save the raw .jsonl
+
+`<user>` is the e-mail the listing prints in its User column (the server
+resolves it to the on-disk session directory) or that directory name itself.
 
 All require admin auth.
 """
@@ -15,6 +18,7 @@ from __future__ import annotations
 import json as json_lib
 from pathlib import Path
 from typing import Optional
+from urllib.parse import quote
 
 import typer
 
@@ -22,6 +26,13 @@ from cli.client import api_get
 from cli.commands.admin_activity import _parse_since, _handle_error
 
 sessions_app = typer.Typer(help="Browse Claude Code sessions across all users")
+
+
+#: `{username}` / `{session_file}` are URL path SEGMENTS — percent-encode
+#: them so an e-mail (`@`, `+`) or any other unexpected character reaches the
+#: server as one segment instead of silently re-shaping the request path.
+def _seg(value: str) -> str:
+    return quote(value, safe="")
 
 
 def _fmt_duration(s: Optional[int]) -> str:
@@ -57,7 +68,7 @@ def list_sessions(
         None,
         "--user",
         "-u",
-        help="Filter to a single username (the local-part of the email — same string as in the sessions table)",
+        help="Filter to a single user — the e-mail shown in the User column (exact match)",
     ),
     errors_only: bool = typer.Option(
         False,
@@ -148,7 +159,10 @@ def list_sessions(
 
 @sessions_app.command("show")
 def show_transcript(
-    username: str = typer.Argument(..., help="Filesystem username (local-part of email)"),
+    username: str = typer.Argument(
+        ...,
+        help="User e-mail as printed by `agnes admin sessions list`, or the on-disk session directory",
+    ),
     session_file: str = typer.Argument(..., help="Session filename, e.g. abc-123-def.jsonl"),
     errors_only: bool = typer.Option(False, "--errors", help="Print only tool-result events flagged as errors"),
     as_json: bool = typer.Option(False, "--json", help="Raw JSON instead of pretty transcript"),
@@ -159,7 +173,7 @@ def show_transcript(
     flattened text output. Errored tool results are marked with [ERROR].
     Use `--errors` to grep to just the failures.
     """
-    resp = api_get(f"/api/admin/sessions/{username}/{session_file}/transcript")
+    resp = api_get(f"/api/admin/sessions/{_seg(username)}/{_seg(session_file)}/transcript")
     _handle_error(resp, "sessions show")
     data = resp.json()
 
@@ -217,8 +231,11 @@ def show_transcript(
 
 @sessions_app.command("download")
 def download(
-    username: str = typer.Argument(...),
-    session_file: str = typer.Argument(...),
+    username: str = typer.Argument(
+        ...,
+        help="User e-mail as printed by `agnes admin sessions list`, or the on-disk session directory",
+    ),
+    session_file: str = typer.Argument(..., help="Session filename, e.g. abc-123-def.jsonl"),
     output: Optional[Path] = typer.Option(
         None,
         "--output",
@@ -234,7 +251,7 @@ def download(
     # No stream=True: httpx.Client.get has no such kwarg (passing it raised
     # TypeError before the request ever left), and api_get buffers the
     # response body regardless. Session JSONLs are small; buffering is fine.
-    resp = api_get(f"/api/admin/sessions/{username}/{session_file}/download")
+    resp = api_get(f"/api/admin/sessions/{_seg(username)}/{_seg(session_file)}/download")
     _handle_error(resp, "sessions download")
 
     target = output or Path(session_file)

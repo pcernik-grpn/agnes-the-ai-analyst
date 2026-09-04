@@ -31,6 +31,7 @@ import duckdb
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
+from app.api.access_policy_http import assert_no_empty_policy_mapping
 from app.auth.dependencies import _get_db, get_current_user
 from src.audit_helpers import identity_for_audit, log_safe
 from src.db import get_analytics_db_readonly
@@ -177,6 +178,12 @@ def query_table(
         raise HTTPException(status_code=403, detail={"reason": "policy_identity_unresolvable"})
     except PolicyError as exc:
         raise HTTPException(status_code=500, detail={"reason": "policy_error", "table": exc.table_id})
+
+    # #2147: an empty/never-synced `policy_mapping` dependency (§15.1) must
+    # fail closed here too, before any SQL runs — the same guard
+    # `POST /api/query` applies.
+    if relation.policied:
+        assert_no_empty_policy_mapping(table_id=relation.table_id, row=table)
 
     # A transient, per-call read-only connection — the same helper
     # `/api/query` and `/api/query/hybrid` use — not the process-wide

@@ -73,22 +73,27 @@ def test_variables_tf_declares_enable_gcp_logging_default_true():
     assert "description" in block
 
 
-def test_main_tf_forwards_enable_gcp_logging_into_templatefile():
+def test_main_tf_forwards_the_resolved_destination_into_templatefile():
+    """The template decides on the RESOLVED destination, not on the permit
+    switch. enable_gcp_logging grants the IAM roles and makes Cloud Logging
+    eligible; container_logs_destination is what picks it, so a VM can hold
+    the grants while shipping to Datadog."""
     body = (MODULE / "main.tf").read_text()
-    assert re.search(r"enable_gcp_logging\s*=\s*var\.enable_gcp_logging", body), (
-        "main.tf must forward var.enable_gcp_logging into templatefile(...)"
+    assert re.search(r"cloud_logging_logs_active\s*=\s*local\.cloud_logging_logs_active", body), (
+        "main.tf must forward local.cloud_logging_logs_active into templatefile(...)"
     )
 
 
 def test_tpl_gates_overlay_placement_on_the_tf_var():
     body = (MODULE / "startup-script.sh.tpl").read_text()
     assert OVERLAY in body, "startup-script.sh.tpl must reference the overlay filename"
-    assert "%{ if !enable_gcp_logging ~}" in body, (
-        "the overlay's placement must be gated on the enable_gcp_logging TF var "
-        "(the recursive docker cp extracts it unconditionally; disabling the "
-        "var must remove it again)"
+    assert "%{ if !cloud_logging_logs_active ~}" in body, (
+        "the overlay's placement must be gated on the resolved destination "
+        "(the recursive docker cp extracts it unconditionally; any destination "
+        "other than cloud_logging must remove it again — which is also what "
+        "puts a Datadog VM on the json-file driver its agent can read)"
     )
-    guard = body.index("%{ if !enable_gcp_logging ~}")
+    guard = body.index("%{ if !cloud_logging_logs_active ~}")
     endif = body.index("%{ endif ~}", guard)
     gated_block = body[guard:endif]
     assert OVERLAY in gated_block, "the gated block must act on the overlay file"
@@ -100,7 +105,7 @@ def test_tpl_placement_runs_after_the_extraction_that_ships_it():
     that actually puts the file on disk — gating before it would be a no-op."""
     body = (MODULE / "startup-script.sh.tpl").read_text()
     extract_idx = body.index('docker cp "$EXTRACT_CONTAINER:/opt/agnes-host/." "$APP_DIR/"')
-    gate_idx = body.index("%{ if !enable_gcp_logging ~}")
+    gate_idx = body.index("%{ if !cloud_logging_logs_active ~}")
     assert extract_idx < gate_idx
 
 
@@ -324,11 +329,11 @@ class TestBootPathUsesTheSharedGate:
             "fail the whole boot over a logging add-on"
         )
         extract_idx = body.index('docker cp "$EXTRACT_CONTAINER:/opt/agnes-host/." "$APP_DIR/"')
-        gate_idx = body.index("%{ if !enable_gcp_logging ~}")
+        gate_idx = body.index("%{ if !cloud_logging_logs_active ~}")
         probe_idx = body.index("agnes_gcp_logging_probe")
         assert extract_idx < gate_idx < probe_idx, (
             "the probe must run after the extraction that ships the overlay "
-            "AND after the enable_gcp_logging removal gate — probing a file "
+            "AND after the destination removal gate — probing a file "
             "the gate is about to remove would arm a marker for nothing"
         )
 

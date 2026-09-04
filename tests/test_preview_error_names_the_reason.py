@@ -98,6 +98,19 @@ class TestTheRecognisedCasesStillReadAsProse:
     def test_a_busy_instance_says_to_wait(self):
         assert "in a moment" in _copy("concurrency_cap", "")
 
+    def test_a_broker_connectivity_failure_reads_as_a_restart(self):
+        """Same family as chat.js's chatErrorCopy: the sandbox's own client
+        couldn't reach the broker at all — a real report read "Cannot reach
+        sandbox egress upstream at https://<host>/api/broker/anthropic: This
+        operation was aborted" verbatim before this family existed."""
+        copy = _copy(
+            "Cannot reach sandbox egress upstream at https://example.com/api/broker/anthropic: "
+            "This operation was aborted",
+            "engine_error",
+        )
+        assert "restarting or temporarily unavailable" in copy
+        assert "This operation was aborted" not in copy
+
 
 class TestTheEdges:
     def test_a_kind_only_frame_still_says_something(self):

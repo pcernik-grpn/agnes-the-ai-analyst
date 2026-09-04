@@ -1,5 +1,3 @@
-
-from tests import _ds_page_source
 """Snowflake table discovery — the browse half of "add a Snowflake table".
 
 Snowflake was the only source type whose wizard step had no discovery: two
@@ -540,9 +538,9 @@ def test_the_snowflake_picker_prepares_its_status_lines_before_registering():
     prepared first. `registerSelected` already does this for the Keboola
     picker; `_registerSfRows` did not.
     """
-    from pathlib import Path
+    from tests._admin_data_sources_source import read_admin_data_sources_source
 
-    html = _ds_page_source.page_source()
+    html = read_admin_data_sources_source()
     fn = html[html.index("async function _registerSfRows()") :]
     fn = fn[: fn.index("\n}\n")]
     assert "_setBucketOpen(group, true)" in fn, "checked groups must be opened before the status writes"

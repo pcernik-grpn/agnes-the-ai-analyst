@@ -1499,6 +1499,26 @@ def test_no_native_dialog_calls_in_templates() -> None:
     )
 
 
+def _native_dialog_check_text(name: str, path: "Path") -> str:
+    """The text this guard checks a grandfathered template against.
+
+    Almost always just the template's own content — except
+    ``admin_data_sources.html``, most of whose inline JS (including its
+    pre-existing native-dialog debt) moved into extracted static files
+    (perf follow-up, 2026-09-03; see ``tests/_admin_data_sources_source.py``).
+    Checking the template alone would read as "converted" and silently drop
+    the allowlist entry while the SAME native calls still live in the
+    extracted files, unaudited by ``test_no_native_dialog_calls_in_templates``
+    (which only walks ``_all_html()``) — exactly the masked-regression this
+    guard exists to prevent.
+    """
+    if name == "admin_data_sources.html":
+        from tests._admin_data_sources_source import read_admin_data_sources_source
+
+        return read_admin_data_sources_source()
+    return path.read_text(encoding="utf-8")
+
+
 def test_native_dialog_allowlist_has_no_stale_entries() -> None:
     """Every allowlist entry must still exist AND still carry a native call.
     A file deleted by a concurrent change is tolerated (skipped, not
@@ -1511,7 +1531,7 @@ def test_native_dialog_allowlist_has_no_stale_entries() -> None:
         path = TEMPLATES / name
         if not path.exists():
             continue
-        if not _native_dialog_offenders(path.read_text(encoding="utf-8")):
+        if not _native_dialog_offenders(_native_dialog_check_text(name, path)):
             stale.append(name)
     assert not stale, (
         f"stale _NATIVE_DIALOG_ALLOWLIST entr(ies) — no native dialog call left, drop from the allowlist: {stale}"
@@ -1810,7 +1830,7 @@ def test_admin_templates_have_no_inline_text_align_on_table_header() -> None:
         if found:
             offenders[path.name] = found
     assert not offenders, (
-        "inline `style=\"text-align:...\"` found on a <th> — use the `.num` class "
+        'inline `style="text-align:..."` found on a <th> — use the `.num` class '
         "instead (#1707 A6):\n" + "\n".join(f"  {name}: {vals}" for name, vals in offenders.items())
     )
 
@@ -1840,8 +1860,7 @@ def test_a_table_wrap_gives_firefox_a_scrollbar_it_can_see():
     assert "::-webkit-scrollbar" in css, "the webkit affordance must stay"
     gate = "@supports not selector(::-webkit-scrollbar)"
     assert gate in css, (
-        "Firefox needs scrollbar-width/scrollbar-color, gated so Chrome never "
-        "sees them and keeps its ::-webkit-* rules"
+        "Firefox needs scrollbar-width/scrollbar-color, gated so Chrome never sees them and keeps its ::-webkit-* rules"
     )
     body = css.split(gate, 1)[1].split("}\n}", 1)[0]
     assert "scrollbar-width" in body and "scrollbar-color" in body, body[:200]

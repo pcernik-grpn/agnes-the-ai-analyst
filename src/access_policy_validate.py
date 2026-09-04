@@ -33,6 +33,8 @@ import logging
 import sqlglot
 from sqlglot import exp
 
+from src.access_policy_udf import POLICY_HMAC_FUNCTION, POLICY_UDF_NAMES
+
 logger = logging.getLogger(__name__)
 
 
@@ -153,6 +155,15 @@ _ALLOWED_FUNCTION_NAMES: frozenset[str] = frozenset(
         # masking / pseudonymization (§1, §21 -- md5 is a pseudonym, not a
         # mask, but it is the design doc's own documented example).
         "MD5",
+        # The KEYED pseudonym (`src/access_policy_udf.py`). Agnes registers
+        # this function itself on the analytics connection, so unlike every
+        # other name here it is not "a thing DuckDB can already do that we
+        # allow" -- it is ours, and it is DuckDB-ONLY: `_reject_duckdb_only_
+        # functions` below refuses it for a remote table, because the
+        # instance's HMAC key must never travel to BigQuery/Databricks and a
+        # same-named remote function would pseudonymize under a key Agnes does
+        # not control.
+        POLICY_HMAC_FUNCTION.upper(),
         # group-membership idiom (§6.5) -- list_contains() parses to ArrayContains.
         "ARRAY_CONTAINS",
         # the discouraged-but-still-valid unnest idiom (§6.5), warned about
@@ -220,6 +231,7 @@ def validate_policy_sql(
     _reject_bad_table_references(statement, table_name=table_name, mapping_table_names=mapping_table_names)
     _reject_bad_variables(statement)
     if for_remote:
+        _reject_duckdb_only_functions(statement)
         _reject_untranspilable(sql)
         _warn_group_membership_idiom(statement, table_id=table_id)
 
@@ -442,6 +454,36 @@ def _is_pattern_position(node: exp.Placeholder) -> bool:
             return True
         child, parent = parent, parent.parent
     return False
+
+
+def _reject_duckdb_only_functions(statement: exp.Select) -> None:
+    """Rule 6, part 0: a remote-table policy may not call a function Agnes
+    registers on its OWN DuckDB connection (today: ``agnes_hmac``).
+
+    The transpile check below cannot stand in for this one, and that is the
+    whole reason this exists: sqlglot does not know the function, so it carries
+    it across verbatim -- ``AGNES_HMAC(email)`` is valid output for every
+    dialect. The policy would save clean and then, at read time on the remote
+    engine, either fail (denying every caller -- an outage wearing an access
+    rule's clothes, §7.2's own worry) or, far worse, resolve to a same-named
+    UDF somebody defined in that warehouse and pseudonymize under a key this
+    instance does not control.
+
+    Refused at save time, in the one moment where the feedback is cheap and the
+    admin can pick `md5()` (transpiles everywhere) or make the table
+    ``server_only`` instead.
+    """
+    for node in statement.find_all(exp.Func):
+        raw = node.args.get("this")
+        name = raw if isinstance(raw, str) else (getattr(raw, "name", "") or "")
+        if isinstance(name, str) and name.lower() in POLICY_UDF_NAMES:
+            raise PolicyValidationError(
+                "policy_function_duckdb_only",
+                f"{name.lower()}() runs only on Agnes's own DuckDB connection and cannot be "
+                "transpiled to BigQuery or Databricks, so it may not be used in a policy on a "
+                "query_mode='remote' table. Use md5() for a pseudonym that works on every engine, "
+                "or make the table server_only if you need the keyed one.",
+            )
 
 
 def _reject_untranspilable(sql: str) -> None:

@@ -88,7 +88,9 @@ class TestRegisterAllKinds:
         "analytics-rebuild",
         "collections-purge",
         "webhook-deliver",
+        "knowledge-packaging",
         "corpus-extraction",
+        "corpus-extraction-shard",
         "sharepoint-acl-sync",
         "sharepoint-subtree-sweep",
         "sharepoint-facts-extraction",
@@ -698,6 +700,66 @@ class TestWebhookDeliverHandler:
         ]
 
 
+class TestKnowledgePackagingHandler:
+    """``knowledge-packaging`` (TCRD-296 synthesis C.15) — a thin adapter
+    over ``src.knowledge_packaging.run_packaging_pass``, gated by the
+    non-blocking PG advisory lock (``src.db_pg.knowledge_packaging_lease``).
+    ``run_packaging_pass``'s own behavior (bounded reads, checkpointing,
+    the deadline contract) is covered in ``tests/test_knowledge_packaging.py``."""
+
+    def test_registered_in_light_lane(self):
+        from app.worker.kinds import register_all_kinds
+        from app.worker.registry import JOB_KINDS, LIGHT_LANE
+
+        register_all_kinds()
+
+        assert "knowledge-packaging" in JOB_KINDS
+        assert JOB_KINDS["knowledge-packaging"].lane == LIGHT_LANE
+
+    def test_delegates_to_run_packaging_pass_with_a_deadline(self, monkeypatch):
+        from app.worker.kinds import register_all_kinds
+        from app.worker.registry import JOB_KINDS
+
+        register_all_kinds()
+
+        captured = {}
+
+        def fake_pass(*, deadline=None, **kwargs):
+            captured["deadline"] = deadline
+            return {"built": ["col_a"], "skipped": [], "pruned": [], "errors": [], "interrupted_reason": None}
+
+        monkeypatch.setattr("src.knowledge_packaging.run_packaging_pass", fake_pass)
+
+        result = JOB_KINDS["knowledge-packaging"].handler({})
+
+        assert result["built"] == ["col_a"]
+        assert captured["deadline"] is not None  # a real time budget was passed through
+
+    def test_skips_when_advisory_lock_already_held(self, monkeypatch):
+        """Belt-and-braces on top of the jobs-repo idempotency-key dedupe:
+        a concurrent holder of the advisory lock means this call must skip,
+        never re-run the pass or block waiting."""
+        import contextlib
+
+        from app.worker.kinds import register_all_kinds
+        from app.worker.registry import JOB_KINDS
+
+        register_all_kinds()
+
+        @contextlib.contextmanager
+        def fake_lease():
+            yield False
+
+        monkeypatch.setattr("src.db_pg.knowledge_packaging_lease", fake_lease)
+        called = []
+        monkeypatch.setattr("src.knowledge_packaging.run_packaging_pass", lambda **kwargs: called.append(1) or {})
+
+        result = JOB_KINDS["knowledge-packaging"].handler({})
+
+        assert called == []
+        assert result == {"skipped": "lock_held"}
+
+
 class _FakeAgentWebhooksRepo:
     def __init__(self, row):
         self._row = row
@@ -868,8 +930,10 @@ class TestSharePointFactsExtractionHandler:
     def _stub_run(self, monkeypatch, *, report=None, boom=None):
         calls: list = []
 
-        def _fake(connection_id, *, doc_ids=None, timeout_s=None):
-            calls.append({"connection_id": connection_id, "doc_ids": doc_ids, "timeout_s": timeout_s})
+        def _fake(connection_id, *, doc_ids=None, timeout_s=None, partition=None):
+            calls.append(
+                {"connection_id": connection_id, "doc_ids": doc_ids, "timeout_s": timeout_s, "partition": partition}
+            )
             if boom is not None:
                 raise boom
             return report if report is not None else {"docs_extracted": 0}
@@ -895,8 +959,21 @@ class TestSharePointFactsExtractionHandler:
 
         result = handler({"connection_id": "conn1", "doc_ids": ["d1", "d2"], "timeout_s": 120})
 
-        assert calls == [{"connection_id": "conn1", "doc_ids": ["d1", "d2"], "timeout_s": 120}]
+        assert calls == [{"connection_id": "conn1", "doc_ids": ["d1", "d2"], "timeout_s": 120, "partition": None}]
         assert result == {"docs_extracted": 5}
+
+    def test_a_partition_in_the_payload_is_forwarded_as_a_tuple(self, monkeypatch):
+        """TCRD-296 gap #67: a fanned-out pass carries ``partition``
+        ``{"index", "count"}`` in its payload; the handler hands it to the
+        pass as an ``(index, count)`` pair so N jobs over one connection
+        each take a disjoint slice of the ledger."""
+        monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
+        calls = self._stub_run(monkeypatch)
+        handler = self._register()
+
+        handler({"connection_id": "conn1", "partition": {"index": 2, "count": 4}})
+
+        assert calls[0]["partition"] == (2, 4)
 
     def test_doc_ids_and_timeout_s_are_optional(self, monkeypatch):
         monkeypatch.setattr("app.instance_config.get_value", _config_get_value(self._ENABLED_CONFIG))
@@ -905,7 +982,7 @@ class TestSharePointFactsExtractionHandler:
 
         handler({"connection_id": "conn1"})
 
-        assert calls == [{"connection_id": "conn1", "doc_ids": None, "timeout_s": None}]
+        assert calls == [{"connection_id": "conn1", "doc_ids": None, "timeout_s": None, "partition": None}]
 
     def test_the_gate_from_run_standalone_facts_extraction_propagates(self, monkeypatch):
         """`FactsExtractionDisabled` (either cost/surface switch off) is

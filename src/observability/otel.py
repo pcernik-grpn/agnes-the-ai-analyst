@@ -17,7 +17,12 @@ What is exported, and why it lives here:
   scope). Prompt and completion content is exported ONLY when
   ``AGNES_OTEL_CAPTURE_CONTENT`` is set: in this product it routinely
   carries customer data, so the default is the same as for logs — sizes and
-  counts, never the text.
+  counts, never the text. When it is on, the text rides two span EVENTS
+  (``gen_ai.content.prompt`` / ``gen_ai.content.completion``), never span
+  attributes: a collector stores attributes as one JSON object with keys in
+  alphabetical order, and a prompt that is hundreds of KiB pushes every key
+  after ``gen_ai.input…`` past any preview or size cap — the answer was the
+  first casualty. Events keep the attribute object small and parseable.
 - One span per server-side generation wrapped in
   :func:`src.observability.llm_tracing.trace_generation` (summaries,
   extraction, semantic layer) — the same tracer, so both kinds land in one
@@ -44,6 +49,7 @@ import threading
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
 from typing import Any, Mapping, Optional
+from urllib.parse import unquote
 
 try:
     from opentelemetry import trace
@@ -63,6 +69,12 @@ TRACES_ENDPOINT_VAR = "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"
 CAPTURE_CONTENT_VAR = "AGNES_OTEL_CAPTURE_CONTENT"
 TRACER_NAME = "agnes"
 SERVICE_NAME = "agnes"
+#: Span events carrying the exchange's text when content capture is on —
+#: the GenAI semantic-convention event names, each with the matching
+#: ``gen_ai.prompt`` / ``gen_ai.completion`` attribute holding the messages
+#: as JSON in the ``[{role, parts}]`` shape.
+PROMPT_EVENT = "gen_ai.content.prompt"
+COMPLETION_EVENT = "gen_ai.content.completion"
 
 #: Per-attribute cap on exported message content. A long agent session
 #: re-sends its whole history on every completion, so an uncapped input
@@ -118,7 +130,44 @@ def _build_resource(role: Optional[str]) -> Any:
 
 
 def endpoint_configured() -> bool:
+    """Whether this process's OWN exporter has somewhere to send: the base
+    endpoint or the per-signal traces override, either of which the SDK's
+    OTLP exporter honours."""
     return bool(os.environ.get(ENDPOINT_VAR, "").strip() or os.environ.get(TRACES_ENDPOINT_VAR, "").strip())
+
+
+def parse_otlp_headers(raw: str) -> dict[str, str]:
+    """``OTEL_EXPORTER_OTLP_HEADERS`` — ``k1=v1,k2=v2`` with W3C-baggage
+    (percent-)encoded values — as a header dict. Blank keys are dropped so a
+    stray trailing comma cannot blank a real header."""
+    out: dict[str, str] = {}
+    for pair in (raw or "").split(","):
+        key, sep, value = pair.partition("=")
+        key = key.strip()
+        if not sep or not key:
+            continue
+        out[key] = unquote(value.strip())
+    return out
+
+
+def collector() -> Optional[tuple[str, dict[str, str]]]:
+    """The collector a broker route can forward a sandbox's batches to: the
+    BASE endpoint (``/v1/<signal>`` appended per call) plus the operator's
+    headers — or ``None``.
+
+    Deliberately narrower than :func:`endpoint_configured`: a per-signal
+    ``OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`` alone lets this process's own
+    exporter run, but gives a relay nothing to append ``/v1/metrics`` or
+    ``/v1/logs`` to, so it is not a collector in this sense. The ticket that
+    admits a sandbox to the broker route is minted from THIS function, so a
+    ticket can never exist for a route that would answer 503. Read per call,
+    like the exporter itself, so a rolled-forward ``.env`` is honoured on the
+    next batch.
+    """
+    endpoint = os.environ.get(ENDPOINT_VAR, "").strip().rstrip("/")
+    if not endpoint:
+        return None
+    return endpoint, parse_otlp_headers(os.environ.get("OTEL_EXPORTER_OTLP_HEADERS", ""))
 
 
 def configure_otel(*, role: Optional[str] = None, exporter: Any = None) -> bool:  # noqa: C901
@@ -185,6 +234,9 @@ class _NoopSpan:
         return None
 
     def set_status(self, status: Any, description: Optional[str] = None) -> None:
+        return None
+
+    def add_event(self, name: str, attributes: Optional[Mapping[str, Any]] = None) -> None:
         return None
 
     def end(self, end_time: Optional[int] = None) -> None:
@@ -255,6 +307,7 @@ def start_completion_span(
             "gen_ai.operation.name": "chat",
             "gen_ai.system": system,
             "gen_ai.request.model": model,
+            "agnes.kind": "completion",
             "agnes.upstream": upstream,
             "agnes.stream": stream,
             "agnes.session_id": session_id,
@@ -282,7 +335,14 @@ def _open_span(name: str, attrs: Mapping[str, Any]) -> Any:
 
 def start_generation_span(*, provider: str, model: str) -> Any:
     """Open the span for one server-side generation (``trace_generation``)."""
-    attrs = _clean({"gen_ai.operation.name": "chat", "gen_ai.system": provider, "gen_ai.request.model": model})
+    attrs = _clean(
+        {
+            "gen_ai.operation.name": "chat",
+            "gen_ai.system": provider,
+            "gen_ai.request.model": model,
+            "agnes.kind": "generation",
+        }
+    )
     return _open_span(f"chat {model}" if model else "chat", attrs)
 
 
@@ -367,25 +427,47 @@ def end_completion_span(  # noqa: C901
             span.set_attribute("http.response.status_code", int(status_code))
         set_usage_attributes(span, usage)
         summary: dict[str, Any] = {}
+        if response_body is not None:
+            # A completion the client walked away from (or that never got
+            # past the headers) leaves an empty or partial body: no usage,
+            # no answer. Say so on the span, so an analysis can tell a turn
+            # the model never finished from one it did — the two look the
+            # same otherwise, and a burst of them is a broken engine, not a
+            # gap in the export.
+            span.set_attribute("agnes.response_bytes", len(response_body))
         if response_body is not None and not response_truncated:
             summary = summarize_completion(response_body, content_type)
+            if "text/event-stream" in (content_type or "").lower():
+                span.set_attribute("agnes.stream_complete", bool(summary.get("stop_reason")))
             if summary.get("model") and not (usage and usage.get("model")):
                 span.set_attribute("gen_ai.response.model", str(summary["model"]))
             if summary.get("stop_reason"):
                 span.set_attribute("gen_ai.response.finish_reasons", [str(summary["stop_reason"])])
         if response_truncated:
             span.set_attribute("agnes.response_truncated", True)
+        prompt_json: Optional[str] = None
+        completion_json: Optional[str] = None
+        if request_body is not None:
+            prompt_json = json.dumps(input_messages_from_request(request_body), ensure_ascii=False)
+            span.set_attribute("agnes.prompt_chars", len(prompt_json))
+        if summary.get("blocks") is not None:
+            out = [{"role": "assistant", "parts": _parts_from_content(summary["blocks"])}]
+            completion_json = json.dumps(out, ensure_ascii=False)
+            span.set_attribute("agnes.completion_chars", len(completion_json))
         if capture_content_enabled():
+            # Content goes on EVENTS (see the module docstring): the span's
+            # attribute object stays small and parseable however long the
+            # conversation is, and each side of the exchange is its own
+            # record a collector can map, cap or drop independently.
             truncated = False
-            if request_body is not None:
-                text, cut = truncate_content(json.dumps(input_messages_from_request(request_body), ensure_ascii=False))
+            if prompt_json is not None:
+                text, cut = truncate_content(prompt_json)
                 truncated = truncated or cut
-                span.set_attribute("gen_ai.input.messages", text)
-            if summary.get("blocks") is not None:
-                out = [{"role": "assistant", "parts": _parts_from_content(summary["blocks"])}]
-                text, cut = truncate_content(json.dumps(out, ensure_ascii=False))
+                span.add_event(PROMPT_EVENT, {"gen_ai.prompt": text})
+            if completion_json is not None:
+                text, cut = truncate_content(completion_json)
                 truncated = truncated or cut
-                span.set_attribute("gen_ai.output.messages", text)
+                span.add_event(COMPLETION_EVENT, {"gen_ai.completion": text})
             if truncated:
                 span.set_attribute("agnes.content_truncated", True)
         if error is not None:
@@ -575,15 +657,19 @@ def _summarize_sse(body: bytes) -> dict[str, Any]:
 
 __all__ = [
     "CAPTURE_CONTENT_VAR",
+    "COMPLETION_EVENT",
+    "PROMPT_EVENT",
     "ENDPOINT_VAR",
     "MAX_CONTENT_CHARS",
     "capture_content_enabled",
+    "collector",
     "configure_otel",
     "end_completion_span",
     "end_generation_span",
     "endpoint_configured",
     "input_messages_from_request",
     "is_enabled",
+    "parse_otlp_headers",
     "set_usage_attributes",
     "shutdown_otel",
     "start_completion_span",

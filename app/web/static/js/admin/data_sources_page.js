@@ -1,25 +1,4 @@
-/* The Data section's page script: source connections, the Add-data wizard,
- * the SharePoint drawer and the extraction-observability panel.
- *
- * Moved out of admin_data_sources.html VERBATIM, and shared with the
- * data-package builder, which needs the Add-data wizard to open over the
- * package being written instead of sending the admin to another page for it.
- *
- * Why the whole block and not just the wizard: the wizard's step-1/2 closure
- * is 29 functions, and every one of the 16 mutable bindings it needs is also
- * read by the connections cards or the credentials section beside it. Cutting
- * a component out means either duplicating that state — the drift this was
- * meant to prevent — or untangling sixteen shared bindings by hand, which is
- * the riskiest way to spend the change. One shared file gives ONE
- * implementation, which was the point; a later pass can split it with the
- * seam already mapped.
- *
- * A classic script, so its top-level declarations stay globals exactly as
- * they were inside the inline block, which is what makes this movement
- * rather than a rewrite. Three Jinja expressions could not come along and are
- * handed over in `DS_BOOT` (see both templates). Three load-time statements
- * touch elements only the connections page has, and are guarded in place.
- */
+/* Extracted from admin_data_sources.html (perf follow-up, 2026-09-03) — was inlined on every page load (uncacheable); now a normal cached static asset, versioned by static_url()'s ?v=<mtime> cache-buster. */
 const API_CONNECTIONS = "/api/admin/source-connections";
 
 /* Set when the package builder sent us here (?from=package-builder). It
@@ -29,62 +8,17 @@ const API_CONNECTIONS = "/api/admin/source-connections";
    half-way through building one is the duplication that made this trip feel
    broken in the first place. Read near the foot of this script, where the
    deep-link block parses the query string. */
-/* The package-builder handoff. Two entries share it: arriving at
-   /admin/data-sources?from=package-builder (the navigation, kept for anyone
-   who lands there directly) and the builder opening this same wizard as a
-   drawer over the package being written. `onRegistered` is what makes the
-   second one possible — with it the flow never leaves the page; without it
-   the wizard navigates back as before. */
-let _pkgBuilder = null;   // {onRegistered?: (tables) => void}
-function _dsWizardForPackageBuilder(opts) {
-  _pkgBuilder = opts || {};
-  const strip = document.getElementById("ds-from-package");
-  if (strip) strip.hidden = false;
-  /* Say what the flow actually is on this entry: two steps, and the primary
-     names where the tables are going. A strip advertising Bundle and Share
-     that this entry never reaches is a map of somewhere else. */
-  document.querySelectorAll("#ds-wizard-overlay .ds-drawer__step").forEach((el) => {
-    if (Number(el.dataset.wstep) > 2) el.hidden = true;
-  });
-  const reg = document.getElementById("ds-wizard-register-btn");
-  if (reg) reg.textContent = "Add selected tables to your package";
-  const early = document.getElementById("ds-wizard-finish-early-btn");
-  if (early) {
-    early.textContent = "Register only";
-    early.title = "Register the selected tables and stay here — your package keeps waiting.";
-  }
-}
-window.AgnesAddDataWizard = {
-  open: function (opts) {
-    _dsWizardForPackageBuilder(opts);
-    openWizard((opts && opts.connector) || undefined);
-  },
-  close: function () { closeWizard(); },
-};
+let _fromPackageBuilder = false;
 const API_REGISTER_TABLE = "/api/admin/register-table";
-
-
-
-
-
-
 
 // Server-rendered by the shared icon macro, read once and interpolated into
 // the JS-built cards. Trusted markup by construction — it never touches user
 // input — and it keeps this page from growing a private copy of two glyphs.
-// Read from the boot object rather than off two sprite elements: those live
-// only on the connections page, and this file is loaded by the data-package
-// builder too, where the lookup returned null and threw before any of the
-// wizard below it was defined.
-const ICO_CHEVRON = DS_BOOT.icoChevron || "";
-const ICO_CARET = DS_BOOT.icoCaret || "";
+const ICO_CHEVRON = document.getElementById("ds-ico-chevron").innerHTML;
+const ICO_CARET = document.getElementById("ds-ico-caret").innerHTML;
 
 function showToast(msg, ok) {
   const el = document.getElementById("ds-toast");
-  // The builder loads this file for the wizard and has no toast of its own.
-  // Nothing here is the only report of anything — every caller also renders
-  // its outcome in place — so a missing toast is silence, not a failure.
-  if (!el) return;
   el.textContent = msg;
   el.className = "ds-toast show " + (ok ? "toast-ok" : "toast-fail");
   clearTimeout(el._t);
@@ -144,22 +78,6 @@ function _masterTokenFactHtml(row) {
   <div class="ds-token-mismatch" id="ds-mismatch-${id}" hidden></div>`;
 }
 
-/* ── Pipeline strip ────────────────────────────────────────────────────────
-   Server-computed per connection (`_source_pipelines()` in
-   app/web/router.py) so a card needs no extra round-trips. Each cell links
-   to the page that owns that stage, and every value is worded as a state an
-   admin can act on: "no tables yet", "never synced", "token not set",
-   "0 packages — nobody can pull this". A missing cell (BigQuery has no
-   semantic layer) simply is not rendered — the strip is per-connector. */
-let SOURCE_PIPELINES = DS_BOOT.sourcePipelines;
-
-/* Connectors that produce tables but keep no `source_connections` row —
-   BigQuery (credentialed once, at instance level), Jira (webhooks), uploaded
-   files. Server-synthesized into rows of the SAME shape as a real connection
-   (`_source_inventory()` in app/web/router.py) so exactly one renderer draws
-   every card. Without them "Sources" was a Keboola-only list on a page whose
-   Add button offered four connectors. */
-const DERIVED_SOURCES = DS_BOOT.derivedSources;
 
 /* The connector's identity: the tile's two letters and its palette class.
    A source whose type this build has never heard of still gets a card — it
@@ -190,7 +108,6 @@ const CONNECTOR = {
   sharepoint: { abbr: "SP", cls: "local",     wizard: "sharepoint" },
 };
 
-
 /* A file source's pipeline is a DIFFERENT shape entirely — crawl → text
    extraction + scan transcription → facts → graph (spec §13.2 "Source
    card"), not tables/sync/feeds. Cells are plain (not links): there is no
@@ -216,9 +133,16 @@ function _sharepointPipelineStripHtml(row) {
        <span class="ds-pipe__k">Extraction</span>
        <span class="ds-pipe__v ${extractedTotal ? "" : "is-warn"}">${extractedTotal ? `${extract.indexed || 0} indexed` : "Nothing yet"}</span>
      </div>`,
-    `<div class="ds-pipe__cell">
+    // `fs.graph` is never server-rendered (perf follow-up, 2026-09-03): the
+    // fact/edge counts behind it cost 2 SQL statements PER SCOPE, so
+    // computing them for every SharePoint connection on the page at once
+    // was what dominated the page's own load time on a live instance. This
+    // cell starts as a loading placeholder and `_fetchSharepointGraphCounts`
+    // (called once cards are painted) fills it in per connection, from
+    // `GET .../facts-graph-counts` — a separate, non-blocking request.
+    `<div class="ds-pipe__cell" id="ds-sp-graph-${row.id}">
        <span class="ds-pipe__k">Facts → graph</span>
-       <span class="ds-pipe__v">${fs.graph.facts} fact${fs.graph.facts === 1 ? "" : "s"} · ${fs.graph.edges} edge${fs.graph.edges === 1 ? "" : "s"}</span>
+       <span class="ds-pipe__v" style="color:var(--ds-text-muted)">loading…</span>
      </div>`,
     `<div class="ds-pipe__cell" title="Rejected/deferred items from the last ingest run awaiting review — a count, not a price; nothing here invents a dollar figure.">
        <span class="ds-pipe__k">Review queue</span>
@@ -467,6 +391,154 @@ function _sharepointIdentityLine(config) {
   return bits.join(" · ");
 }
 
+/* Per-connection facts-extraction policy override (retry_mode / transport /
+   provider) — `PATCH .../extraction/facts-config`
+   (`app/api/admin_extraction.py::patch_extraction_facts_config`). Its own
+   render helper, its own save function (`saveSpFactsPolicy` below), so this
+   control never entangles with the run-options row or the "Extract facts
+   now" button it sits next to. The three selects read the CONNECTION-level
+   override straight off `row.config.extraction.facts` — the same rows
+   payload `loadConnections()` already fetched, no extra round trip — and an
+   empty selection ("Instance default") means "no override", exactly what
+   the PATCH body's `null` clears. The resolved value and its source
+   ("connection"/"instance") are shown only after Save, from the endpoint's
+   own response — there is no resolver on this side to guess it beforehand.
+   `provider` exists so a connection whose Anthropic key has hit its
+   workspace usage cap can be pinned to `vertex` without an instance-wide
+   `ai.provider` change. */
+function _extRenderFactsPolicy(row) {
+  const facts = ((row.config || {}).extraction || {}).facts || {};
+  const retryMode = typeof facts.retry_mode === "string" ? facts.retry_mode : "";
+  const transport = typeof facts.transport === "string" ? facts.transport : "";
+  const provider = typeof facts.provider === "string" ? facts.provider : "";
+  const vertexRegion = typeof facts.vertex_region === "string" ? facts.vertex_region : "";
+  const opt = (current, value, label) =>
+    `<option value="${_esc(value)}"${current === value ? " selected" : ""}>${_esc(label)}</option>`;
+  const label = _esc(row.name || row.id || "");
+  return `
+  <div class="ds-src__fact">
+    <span class="ds-src__fact-k" title="Per-connection override for the facts-extraction retry policy, API transport, LLM provider and (provider=vertex only) Vertex region (cost levers). Leave all on 'Instance default' to inherit extraction.facts.* from instance.yaml.">Facts policy</span>
+    <span class="ds-src__fact-v">
+      <select id="ds-sp-factspolicy-retry-${row.id}" class="ds-dropdown-native" aria-label="Facts retry mode for ${label}">
+        ${opt(retryMode, "", "Instance default")}
+        ${opt(retryMode, "off", "Off")}
+        ${opt(retryMode, "on_gate_fail", "On gate fail")}
+        ${opt(retryMode, "always", "Always")}
+      </select>
+      <select id="ds-sp-factspolicy-transport-${row.id}" class="ds-dropdown-native" aria-label="Facts transport for ${label}">
+        ${opt(transport, "", "Instance default")}
+        ${opt(transport, "sync", "Sync")}
+        ${opt(transport, "batch", "Batch")}
+      </select>
+      <select id="ds-sp-factspolicy-provider-${row.id}" class="ds-dropdown-native" aria-label="Facts provider for ${label}" onchange="_extToggleVertexRegionInput('${row.id}')">
+        ${opt(provider, "", "Instance default")}
+        ${opt(provider, "inherit", "Inherit (ai.provider)")}
+        ${opt(provider, "anthropic", "Anthropic")}
+        ${opt(provider, "vertex", "Vertex")}
+      </select>
+      <input type="text" id="ds-sp-factspolicy-vertexregion-${row.id}" class="ds-dropdown-native"
+             placeholder="Instance default" value="${_esc(vertexRegion)}"
+             style="display:${provider === "vertex" ? "" : "none"}"
+             title="Vertex region override — only used when Provider above is Vertex. Google enforces Claude-on-Vertex quotas per region, so pinning connections to different regions raises effective throughput."
+             aria-label="Vertex region override for ${label}">
+      <span class="field-hint" id="ds-sp-factspolicy-status-${row.id}"></span>
+    </span>
+    <span class="ds-src__fact-a"><button type="button" class="btn btn-secondary" onclick="saveSpFactsPolicy('${row.id}')">Save</button></span>
+  </div>`;
+}
+
+/* Shows/hides the Vertex region text input next to the "Facts policy"
+   provider select — the region only means anything for a pass resolved to
+   provider=vertex, so it stays hidden (but its value is preserved, never
+   cleared) for every other selection. Fired on the provider select's own
+   `onchange` (`_extRenderFactsPolicy` above). */
+function _extToggleVertexRegionInput(id) {
+  const providerSel = document.getElementById(`ds-sp-factspolicy-provider-${id}`);
+  const regionInput = document.getElementById(`ds-sp-factspolicy-vertexregion-${id}`);
+  if (!providerSel || !regionInput) return;
+  regionInput.style.display = providerSel.value === "vertex" ? "" : "none";
+}
+
+/* Crawl filter (backfill lever) — `extraction.crawl.min_modified`,
+   `PATCH .../extraction/crawl-config`
+   (`app/api/admin_extraction.py::patch_extraction_crawl_config`). Lived only
+   inside the "View configuration" drawer until a live walkthrough found
+   nothing on the collapsed card hinting it existed (2026-09 gap 2) — moved
+   here, next to its sibling "Facts policy" override, rather than
+   duplicated: one place to set it from is what keeps the drawer's old
+   read-out and the card from ever disagreeing. Pre-filled straight off
+   `row.config.extraction.crawl.min_modified` — the SAME string
+   `resolve_min_modified` reads server-side, and (per its own docstring)
+   there is no instance-level default it could resolve against instead, so
+   the raw stored value already IS the resolved one; no extra round trip
+   needed just to prefill this input. The PATCH response's `{value,
+   source}` — the same shape `GET …/extraction/config` returns — is shown
+   after Save/Clear, never guessed beforehand, same discipline
+   `_extRenderFactsPolicy` above uses for its own resolved read-out. */
+function _extRenderCrawlFilter(row) {
+  const crawl = ((row.config || {}).extraction || {}).crawl || {};
+  const value = typeof crawl.min_modified === "string" ? crawl.min_modified : "";
+  // TCRD-296 gap #80: this is now the DEFAULT — a scope's OWN filter (set
+  // in the connect wizard, `agnes admin sharepoint scope bulk-add
+  // --min-modified`, or shown per-row in the "Scope collections" drawer,
+  // `_spScopeRowHtml` below) wins over this one when it has one.
+  const statusText = value
+    ? `Currently: files modified on/after ${value} (default — applies to scopes without their own filter).`
+    : "Currently: no default filter — a scope without its own filter is crawled unfiltered.";
+  const label = _esc(row.name || row.id || "");
+
+  // D.16 — this connection's own scheduled-sweep cadence: "off" | "instance"
+  // (the default — follow extraction.schedule) | any other stored string is
+  // a CUSTOM cadence in the SAME grammar extraction.schedule itself uses
+  // ("every 6h", "daily 03:00", "cron 0 3 * * *"). Pre-filled straight off
+  // `row.config.extraction.crawl.schedule` — same "no extra round trip"
+  // reasoning `min_modified` above already uses; the server-resolved
+  // `next_run_at` hint is filled in lazily by the polling status fetch
+  // (`data_sources_extraction_observability.js::_extRenderNextRun`), not
+  // computable client-side (it needs the instance-wide cadence + "now").
+  const rawSchedule = typeof crawl.schedule === "string" ? crawl.schedule : "";
+  const scheduleSelectValue =
+    rawSchedule === "off" || rawSchedule === "" || rawSchedule === "instance" ? rawSchedule || "instance" : "custom";
+  const customSchedule = scheduleSelectValue === "custom" ? rawSchedule : "";
+  const scheduleStatusText =
+    rawSchedule && rawSchedule !== "instance"
+      ? `Currently: ${rawSchedule} (connection).`
+      : "Currently: following the instance-wide cadence.";
+
+  return `
+  <div class="ds-src__fact">
+    <span class="ds-src__fact-k" title="This connection's own scheduled-sweep cadence (D.16). 'Off' is never picked up by the sweep, however often it runs. The instance-wide switch (extraction.schedule) still has to be configured for the sweep to run AT ALL — this only narrows which connections a running sweep picks and when.">Crawl schedule & filter</span>
+    <span class="ds-src__fact-v">
+      <select class="ds-dropdown-native" id="ds-sp-crawlschedule-select-${row.id}"
+              onchange="_extToggleCrawlScheduleInput('${row.id}')" aria-label="Crawl schedule for ${label}">
+        <option value="instance" ${scheduleSelectValue === "instance" ? "selected" : ""}>Follow instance cadence (default)</option>
+        <option value="off" ${scheduleSelectValue === "off" ? "selected" : ""}>Off — manual trigger only</option>
+        <option value="custom" ${scheduleSelectValue === "custom" ? "selected" : ""}>Custom cadence…</option>
+      </select>
+      <input type="text" class="ds-dropdown-native" id="ds-sp-crawlschedule-custom-${row.id}"
+             placeholder="every 6h, daily 03:00, cron 0 3 * * *" value="${_esc(customSchedule)}"
+             style="display:${scheduleSelectValue === "custom" ? "" : "none"}"
+             aria-label="Custom crawl cadence for ${label}">
+      <span class="field-hint" id="ds-sp-crawlschedule-status-${row.id}">${_esc(scheduleStatusText)}</span>
+      <span class="field-hint" id="ds-sp-crawlschedule-nextrun-${row.id}">Next run: —.</span>
+    </span>
+    <span class="ds-src__fact-a"><button type="button" class="btn btn-secondary" onclick="crawlScheduleSave('${row.id}')">Save schedule</button></span>
+  </div>
+  <div class="ds-src__fact">
+    <span class="ds-src__fact-k" title="The DEFAULT crawl filter for scopes that don't set their own — applies only to files modified on or after a date instead of the whole corpus, useful for a backfill. Sets extraction.crawl.min_modified for this connection; clearing it removes the default, there is no instance-level fallback beyond it. Set a scope's own filter in the connect wizard's Share step, or per-row below.">Crawl filter (default)</span>
+    <span class="ds-src__fact-v">
+      <input type="date" class="ds-dropdown-native" id="ds-sp-crawlfilter-date-${row.id}"
+             value="${_esc(value)}" aria-label="Crawl only files modified on/after this date for ${label}">
+      <span class="field-hint" id="ds-sp-crawlfilter-status-${row.id}">${_esc(statusText)}</span>
+      <span class="field-hint">Widening this date later needs "Re-enumerate from scratch" on the next run — the delta cursor has already moved past older items.</span>
+    </span>
+    <span class="ds-src__fact-a">
+      <button type="button" class="btn btn-secondary" onclick="crawlFilterSave('${row.id}')">Save</button>
+      <button type="button" class="btn btn-secondary" onclick="crawlFilterClear('${row.id}')">Clear</button>
+    </span>
+  </div>`;
+}
+
 /* File-source card body (spec §13.2 "Source card"): schedule (static text —
    the crawl runs externally), certificate (origin + set-date, NEVER the
    value), identity matching (fail-closed grant coverage), and error badges
@@ -560,24 +632,27 @@ function _sharepointFactsHtml(row) {
   // one opens that wizard bound to this connection with the row
   // highlighted, rather than the wizard-only path the owner called "a
   // dumb path, make it clickable".
-  const scopes = fs.scopes || [];
-  const scopesHtml = scopes.length
+  //
+  // NOT server-rendered (perf follow-up, 2026-09-03, second finding on the
+  // same live instance): the enriched per-scope rows used to be capped at
+  // 50 and STILL inlined ~170 KB of JSON across 8 connections — none of it
+  // needed for first paint, since the "Sharing" row above already carries
+  // the honest summary. `fs.scopes_total` (a cheap count) draws the
+  // collapsed row; expanding it fetches the full, unbounded list from
+  // `GET .../scopes` (`toggleSpScopesDrawer`, below) — the exact
+  // fetch-on-expand shape the extraction card's drawer already uses.
+  const scopesHtml = fs.scopes_total
     ? `
   <div class="ds-src__fact">
     <span class="ds-src__fact-k">Scope collections</span>
     <span class="ds-src__fact-v">
-      <ul class="ds-sp-scopes">
-        ${scopes.map((s) => `
-        <li>
-          <button type="button" class="ds-sp-scope-row" onclick="openSpWizardForConnection('${row.id}', { highlightScopeId: '${_esc(s.source_scope_id)}' })">
-            <span class="ds-sp-scope-row__path">${_esc(s.display_path || s.source_scope_id || "")}</span>
-            ${s.collection ? `<span class="ds-badge badge-env">${_esc(s.collection.name)}</span>` : `<span class="ds-badge badge-unset">no collection yet</span>`}
-            ${s.no_group_warning ? `<span class="ds-badge badge-warn">no group</span>` : ""}
-          </button>
-        </li>`).join("")}
-      </ul>
+      ${fs.scopes_total} scope${fs.scopes_total === 1 ? "" : "s"}
     </span>
-  </div>`
+    <span class="ds-src__fact-a">
+      <button type="button" class="btn btn-secondary" onclick="toggleSpScopesDrawer('${row.id}')">View</button>
+    </span>
+  </div>
+  <div class="ds-sp-scopes-drawer" id="ds-sp-scopes-drawer-${row.id}" hidden></div>`
     : "";
 
   // Anonymization (spec §9.2/§13.2): "requested" is the connect wizard's
@@ -692,6 +767,16 @@ function _sharepointFactsHtml(row) {
       Re-process everything (ignore the delta cursor)
     </label>
     <span class="field-hint" style="flex-basis:100%;">${_esc(forceReprocessHelp)}</span>
+    <label class="field-hint" for="ds-sp-runopts-resync-${row.id}" style="flex-basis:100%;display:flex;align-items:center;gap:6px;">
+      <input type="checkbox" id="ds-sp-runopts-resync-${row.id}">
+      Re-enumerate from scratch (drop the change cursor, keep already-ingested files)
+    </label>
+    <span class="field-hint" style="flex-basis:100%;">Use after widening a crawl filter or when the change cursor ran past files it never ingested: every folder is listed again, but a file whose content is unchanged is not re-downloaded.</span>
+    <label class="field-hint" for="ds-sp-runopts-retry-${row.id}" style="flex-basis:100%;display:flex;align-items:center;gap:6px;">
+      <input type="checkbox" id="ds-sp-runopts-retry-${row.id}">
+      Retry failed items
+    </label>
+    <span class="field-hint" style="flex-basis:100%;">Gives every document already known to have failed (including ones given up on after repeated failures) one more chance — no full re-enumeration, just this connection's own failure queue. A document already judged doomed (rejected deterministically, or repeatedly crashing/timing out the converter on unchanged content) stays skipped — check "Re-process everything" too to force those.</span>
     <button type="button" class="btn btn-primary" onclick="runSpExtraction('${row.id}')">Start run</button>
     <button type="button" class="btn btn-secondary" onclick="toggleSpRunOptsRow('${row.id}')">Cancel</button>
   </div>
@@ -700,6 +785,8 @@ function _sharepointFactsHtml(row) {
     <span class="ds-src__fact-v">${factsParts.join(" · ")}</span>
     <span class="ds-src__fact-a"><button type="button" id="ext-facts-btn-${row.id}" class="btn btn-secondary" data-facts-ready="${factsReady ? "1" : "0"}" ${factsReady ? "" : "disabled"} title="${_esc(factsUnreadyText)}" onclick="runSpFactsExtraction('${row.id}')">Extract facts now</button></span>
   </div>
+  ${_extRenderFactsPolicy(row)}
+  ${_extRenderCrawlFilter(row)}
   <div class="ds-src__fact">
     <span class="ds-src__fact-k">${isSecretAuth ? "Client secret" : "Certificate"}</span>
     <span class="ds-src__fact-v">${certBadge} <span style="color:var(--ds-text-muted)">${certDetail}</span></span>
@@ -715,10 +802,79 @@ function _sharepointFactsHtml(row) {
     <button type="button" class="btn btn-secondary" onclick="toggleSpCertRow('${row.id}')">Cancel</button>
   </div>
   <div class="ds-src__fact">
+    <span class="ds-src__fact-k" title="A site too large for one crawl to finish in reasonable time shards itself automatically the next time extraction runs — no admin action needed. This previews what that plan would look like right now.">Parallel crawl</span>
+    <span class="ds-src__fact-v">Large sites shard themselves automatically when extraction runs.</span>
+    <span class="ds-src__fact-a"><button type="button" class="btn btn-secondary" onclick="toggleSpShardPlanRow('${row.id}')">Preview shards&hellip;</button></span>
+  </div>
+  <div class="ds-rotate-row" id="ds-sp-shardplan-row-${row.id}">
+    <label class="field-hint" for="ds-sp-shardplan-min-modified-${row.id}">Only count documents modified on/after (optional)</label>
+    <input type="date" id="ds-sp-shardplan-min-modified-${row.id}" style="max-width:11rem;">
+    <button type="button" class="btn btn-primary" onclick="previewShardPlan('${row.id}')">Preview shards</button>
+    <button type="button" class="btn btn-secondary" onclick="toggleSpShardPlanRow('${row.id}')">Cancel</button>
+    <div class="ds-sp-shardplan-result" id="ds-sp-shardplan-result-${row.id}"></div>
+    <p class="field-hint" style="flex-basis:100%;">
+      <a href="#" onclick="toggleSpSplitRow('${row.id}'); return false;">Legacy: create N connections manually (deprecated)&hellip;</a>
+    </p>
+  </div>
+  <div class="ds-rotate-row" id="ds-sp-split-row-${row.id}">
+    <label class="field-hint" for="ds-sp-split-n-${row.id}">Number of parts</label>
+    <input type="number" id="ds-sp-split-n-${row.id}" min="1" max="50" step="1" value="4" style="max-width:7rem;">
+    <label class="field-hint" for="ds-sp-split-min-modified-${row.id}">Only count/crawl documents modified on/after (optional)</label>
+    <input type="date" id="ds-sp-split-min-modified-${row.id}" style="max-width:11rem;">
+    <label class="field-hint" for="ds-sp-split-transport-${row.id}">Facts transport for every part (optional)</label>
+    <select id="ds-sp-split-transport-${row.id}" style="max-width:9rem;">
+      <option value="">unchanged</option>
+      <option value="sync">sync</option>
+      <option value="batch">batch</option>
+    </select>
+    <label class="field-hint" for="ds-sp-split-retry-${row.id}">Retry mode for every part (optional)</label>
+    <select id="ds-sp-split-retry-${row.id}" style="max-width:9rem;">
+      <option value="">unchanged</option>
+      <option value="off">off</option>
+      <option value="on_gate_fail">on_gate_fail</option>
+      <option value="always">always</option>
+    </select>
+    <label class="field-hint" for="ds-sp-split-collection-id-${row.id}">Route to an EXISTING collection (optional — overrides the default)</label>
+    <input type="text" id="ds-sp-split-collection-id-${row.id}" placeholder="collection id" style="max-width:16rem;">
+    <label class="field-hint" for="ds-sp-split-collection-name-${row.id}">...or mint a NEW collection with this name (optional)</label>
+    <input type="text" id="ds-sp-split-collection-name-${row.id}" placeholder="e.g. Contracts Site" style="max-width:16rem;">
+    <label class="field-hint" for="ds-sp-split-per-folder-${row.id}" style="flex-basis:100%;display:flex;align-items:center;gap:6px;">
+      <input type="checkbox" id="ds-sp-split-per-folder-${row.id}">
+      One collection per folder instead (old default) — forks the site across as many collections as there are folders
+    </label>
+    <button type="button" class="btn btn-primary" onclick="previewSpSplit('${row.id}')">Preview split</button>
+    <button type="button" class="btn btn-secondary" onclick="toggleSpSplitRow('${row.id}')">Cancel</button>
+    <div class="ds-sp-split-result" id="ds-sp-split-result-${row.id}"></div>
+  </div>
+  <div class="ds-src__fact">
+    <span class="ds-src__fact-k" title="Fold this connection's (and, optionally, its site-split siblings') per-scope collections into ONE target.">Consolidate collections</span>
+    <span class="ds-src__fact-v">The after-the-fact fix for a site already split across many per-scope collections.</span>
+    <span class="ds-src__fact-a"><button type="button" class="btn btn-secondary" onclick="toggleSpConsolidateRow('${row.id}')">Consolidate&hellip;</button></span>
+  </div>
+  <div class="ds-rotate-row" id="ds-sp-consolidate-row-${row.id}">
+    <label class="field-hint" for="ds-sp-consolidate-name-${row.id}">New collection name</label>
+    <input type="text" id="ds-sp-consolidate-name-${row.id}" placeholder="e.g. Contracts Site" style="max-width:16rem;">
+    <label class="field-hint" for="ds-sp-consolidate-target-id-${row.id}">...or fold into an EXISTING collection id</label>
+    <input type="text" id="ds-sp-consolidate-target-id-${row.id}" placeholder="collection id" style="max-width:16rem;">
+    <label class="field-hint" for="ds-sp-consolidate-siblings-${row.id}" style="flex-basis:100%;display:flex;align-items:center;gap:6px;">
+      <input type="checkbox" id="ds-sp-consolidate-siblings-${row.id}">
+      Also fold every OTHER connection from the same site split into this target
+    </label>
+    <button type="button" class="btn btn-primary" onclick="previewSpConsolidate('${row.id}')">Preview</button>
+    <button type="button" class="btn btn-secondary" onclick="toggleSpConsolidateRow('${row.id}')">Cancel</button>
+    <div class="ds-sp-consolidate-result" id="ds-sp-consolidate-result-${row.id}"></div>
+  </div>
+  <div class="ds-src__fact">
     <span class="ds-src__fact-k" title="An ungranted collection is invisible to everyone — fail closed.">Sharing</span>
     <span class="ds-src__fact-v ${identityTone}">${identityText}</span>
   </div>
   ${scopesHtml}
+  <div class="ds-src__fact" id="ds-sp-acl-${row.id}">
+    <span class="ds-src__fact-k" title="Who can see this content in SharePoint itself — informational metadata, independent of Agnes access (the Sharing row above). Only a scope confirmed with access mode 'mirrored' actually derives Agnes access from this; see docs/sharepoint-extraction.md.">SharePoint permissions</span>
+    <span class="ds-src__fact-v" style="color:var(--ds-text-muted)">loading…</span>
+    <span class="ds-src__fact-a"><button type="button" class="btn btn-secondary" onclick="toggleSpAclSnapshotDrawer('${row.id}')">View</button></span>
+  </div>
+  <div class="ds-sp-scopes-drawer" id="ds-sp-acl-drawer-${row.id}" hidden></div>
   ${anonRowHtml}
   <div class="ds-src__fact">
     <span class="ds-src__fact-k">Last run</span>
@@ -864,6 +1020,117 @@ function toggleFileSourceDrawer(connId, category) {
   el.innerHTML = rows.length
     ? `<ul class="ds-filesource-drawer__list">${_spGroupRejectionRows(rows).map(_spRejectionRowHtml).join("")}</ul>`
     : `<div class="ds-empty">Nothing in this category in the last run.</div>`;
+}
+
+/* One scope row, in the SAME shape the wizard's step-3 "Share" preview
+   renders (server shape: `admin_sharepoint._scope_out`) — clicking it opens
+   that wizard bound to this connection with the row highlighted.
+
+   `_spScopeMinModifiedBadge` (TCRD-296 gap #80) reads `s.min_modified`
+   (`{value, source, own_value}` — `_scope_out`'s own projection): a badge
+   ONLY when there is an effective filter at all (`value` truthy) — "since
+   DATE" when it's this scope's OWN override (`source: "scope"`, bold-ish
+   via a distinct badge class so it reads differently from an inherited
+   one), "since DATE (default)" when it's inheriting the connection-wide
+   one. No badge at all when neither is set — the common case, unfiltered. */
+function _spScopeMinModifiedBadge(s) {
+  const mm = s.min_modified || {};
+  if (!mm.value) return "";
+  const title =
+    mm.source === "scope"
+      ? "This scope's own crawl filter — set in the connect wizard or `scope bulk-add --min-modified`."
+      : "Inherited from the connection's default crawl filter (“Crawl filter (default)” on the source card).";
+  const cls = mm.source === "scope" ? "badge-env" : "badge-unset";
+  const label = mm.source === "scope" ? `since ${_esc(mm.value)}` : `since ${_esc(mm.value)} (default)`;
+  return `<span class="ds-badge ${cls}" title="${title}">${label}</span>`;
+}
+
+function _spScopeRowHtml(connId, s) {
+  return `<li>
+    <button type="button" class="ds-sp-scope-row" onclick="openSpWizardForConnection('${connId}', { highlightScopeId: '${_esc(s.source_scope_id)}' })">
+      <span class="ds-sp-scope-row__path">${_esc(s.display_path || s.source_scope_id || "")}</span>
+      ${s.collection ? `<span class="ds-badge badge-env">${_esc(s.collection.name)}</span>` : `<span class="ds-badge badge-unset">no collection yet</span>`}
+      ${_spScopeMinModifiedBadge(s)}
+      ${s.no_group_warning ? `<span class="ds-badge badge-warn">no group</span>` : ""}
+    </button>
+  </li>`;
+}
+
+/* Fetch-on-expand for the "Scope collections" row (perf follow-up,
+   2026-09-03) — same shape as `toggleFileSourceDrawer` above and the
+   extraction card's `toggleExtractionDrawer`: nothing server-rendered,
+   the full unbounded list fetched from `GET .../scopes` only once the
+   admin actually asks for it, and a second click closes it again without
+   re-fetching. */
+async function toggleSpScopesDrawer(connId) {
+  const el = document.getElementById(`ds-sp-scopes-drawer-${connId}`);
+  if (!el) return;
+  if (!el.hidden) {
+    el.hidden = true;
+    return;
+  }
+  el.hidden = false;
+  el.innerHTML = `<div class="ds-empty">Loading…</div>`;
+  try {
+    const r = await fetch(`/api/admin/sharepoint/connections/${encodeURIComponent(connId)}/scopes`, {
+      credentials: "include",
+    });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const body = await r.json();
+    const scopes = body.items || [];
+    el.innerHTML = scopes.length
+      ? `<ul class="ds-sp-scopes">${scopes.map((s) => _spScopeRowHtml(connId, s)).join("")}</ul>`
+      : `<div class="ds-empty">No confirmed scopes yet.</div>`;
+  } catch (e) {
+    el.innerHTML = `<div class="ds-empty">Couldn't load scopes — ${_esc(e && e.message)}.</div>`;
+  }
+}
+
+/* SharePoint permissions captured as METADATA (TCRD-296 gap #79) — who
+   SharePoint itself says can see each scope, fetched-on-expand exactly like
+   `toggleSpScopesDrawer` above (its own per-scope principal list is never
+   needed until an admin actually asks for it). PG-only: a DuckDB-backed
+   instance's `GET .../acl-snapshot` answers a typed 501, rendered as an
+   honest one-liner rather than the generic "Couldn't load" error. */
+function _spAclSnapshotScopeRowHtml(scope) {
+  const principals = scope.principals || [];
+  const names = principals.length
+    ? principals
+        .map(
+          (p) =>
+            `${_esc(p.display_name || p.principal_kind || "unknown")} <span style="color:var(--ds-text-muted)">(${_esc(p.principal_kind || "unknown")})</span>`
+        )
+        .join(", ")
+    : `<span style="color:var(--ds-text-muted)">no principals</span>`;
+  return `<li><b>${_esc(scope.display_path || scope.source_scope_id || "")}</b><br>${names}</li>`;
+}
+
+async function toggleSpAclSnapshotDrawer(connId) {
+  const el = document.getElementById(`ds-sp-acl-drawer-${connId}`);
+  if (!el) return;
+  if (!el.hidden) {
+    el.hidden = true;
+    return;
+  }
+  el.hidden = false;
+  el.innerHTML = `<div class="ds-empty">Loading…</div>`;
+  try {
+    const r = await fetch(`/api/admin/sharepoint/connections/${encodeURIComponent(connId)}/acl-snapshot?scopes=true`, {
+      credentials: "include",
+    });
+    if (r.status === 501) {
+      el.innerHTML = `<div class="ds-empty">SharePoint permissions metadata needs a Postgres backend.</div>`;
+      return;
+    }
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const body = await r.json();
+    const scopes = body.scopes || [];
+    el.innerHTML = scopes.length
+      ? `<ul class="ds-sp-scopes">${scopes.map(_spAclSnapshotScopeRowHtml).join("")}</ul>`
+      : `<div class="ds-empty">No permissions captured yet — the next sharepoint-acl-sync run (every few hours) will capture them.</div>`;
+  } catch (e) {
+    el.innerHTML = `<div class="ds-empty">Couldn't load permissions — ${_esc(e && e.message)}.</div>`;
+  }
 }
 
 function _connectionCardHtml(row) {
@@ -1066,6 +1333,83 @@ function setConnCount(n) {
   if (c) c.textContent = n === null ? "" : `${n} source${n === 1 ? "" : "s"}`;
 }
 
+// The "Facts → graph" strip cell's data, per SharePoint connection, fetched
+// AFTER the cards are on screen — never blocking `loadConnections()` itself
+// (perf follow-up, 2026-09-03: computing this for every SharePoint
+// connection during the page's own server-side render is what dominated a
+// live instance's load time — see `app.web.router._sharepoint_pipeline_
+// cell`'s docstring). Each connection's request is independent and can
+// fail on its own without affecting the others or the rest of the card.
+function _fetchSharepointGraphCounts() {
+  for (const row of _connections) {
+    if (row.source_type !== "sharepoint") continue;
+    const cell = document.getElementById(`ds-sp-graph-${row.id}`);
+    if (!cell) continue;
+    fetch(`/api/admin/sharepoint/connections/${encodeURIComponent(row.id)}/facts-graph-counts`, {
+      credentials: "include",
+    })
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
+      .then((counts) => {
+        const v = cell.querySelector(".ds-pipe__v");
+        if (!v) return;
+        const facts = counts.facts || 0;
+        const edges = counts.edges || 0;
+        v.style.color = "";
+        v.textContent = `${facts} fact${facts === 1 ? "" : "s"} · ${edges} edge${edges === 1 ? "" : "s"}`;
+      })
+      .catch(() => {
+        const v = cell.querySelector(".ds-pipe__v");
+        if (v) v.textContent = "unavailable";
+      });
+  }
+}
+
+// SharePoint permissions captured as METADATA (TCRD-296 gap #79) — the
+// connection-wide aggregate, fetched per SharePoint connection AFTER the
+// cards are on screen, same lazy shape as `_fetchSharepointGraphCounts`
+// above (this reads the PG-only `sharepoint_connection_state` table, so it
+// is never part of first paint). The per-scope detail is fetched only when
+// the "View" disclosure is opened (`toggleSpAclSnapshotDrawer`).
+function _fetchSharepointAclSnapshot() {
+  for (const row of _connections) {
+    if (row.source_type !== "sharepoint") continue;
+    const cell = document.getElementById(`ds-sp-acl-${row.id}`);
+    if (!cell) continue;
+    const v = cell.querySelector(".ds-src__fact-v");
+    fetch(`/api/admin/sharepoint/connections/${encodeURIComponent(row.id)}/acl-snapshot`, {
+      credentials: "include",
+    })
+      .then((r) => {
+        if (r.status === 501) return { _unavailable: true };
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.json();
+      })
+      .then((body) => {
+        if (!v) return;
+        if (body._unavailable) {
+          v.textContent = "needs a Postgres backend";
+          return;
+        }
+        const agg = body.aggregate || {};
+        if (!agg.scopes_captured) {
+          v.textContent = "not captured yet";
+          return;
+        }
+        const ago = agg.captured_at
+          ? _relAge(Math.round((Date.now() - new Date(agg.captured_at).getTime()) / 60000))
+          : "unknown";
+        v.textContent =
+          `${agg.entra_groups || 0} Entra group${agg.entra_groups === 1 ? "" : "s"} · ` +
+          `${agg.site_groups || 0} site group${agg.site_groups === 1 ? "" : "s"} · ` +
+          `${agg.folders_with_org_links || 0} folder${agg.folders_with_org_links === 1 ? "" : "s"} with org links · ` +
+          `captured ${ago}`;
+      })
+      .catch(() => {
+        if (v) v.textContent = "unavailable";
+      });
+  }
+}
+
 function renderConnList() {
   const list = document.getElementById("ds-conn-list");
   setConnCount(_connections.length);
@@ -1081,6 +1425,11 @@ function renderConnList() {
   // this function belongs to a LATER script block, and the parser is free to
   // run this fetch's continuation between the two.
   if (typeof _extAfterCardsPainted === "function") _extAfterCardsPainted();
+  // Same defensive `typeof` guard, for the same reason it protects tests
+  // that extract a curated function subset (e.g. `TestRefreshSourcePipelines
+  // Behavior`) rather than the whole script.
+  if (typeof _fetchSharepointGraphCounts === "function") _fetchSharepointGraphCounts();
+  if (typeof _fetchSharepointAclSnapshot === "function") _fetchSharepointAclSnapshot();
 }
 
 /* ── Keeping the strip true after a mutation ───────────────────────────────
@@ -1182,6 +1531,11 @@ function _repaintSourceCards() {
   // what the poll already knows, or a mutation blanks a running crawl until
   // the next tick.
   if (typeof _extAfterCardsPainted === "function") _extAfterCardsPainted();
+  // Same reason: `_pipelineStripHtml` rebuilt the graph cell back to its
+  // "loading…" placeholder (the server-side fold never carries the real
+  // numbers — see `_fetchSharepointGraphCounts`), so a mutation-triggered
+  // repaint needs to re-fetch it too, or the strip is stuck loading forever.
+  if (typeof _fetchSharepointGraphCounts === "function") _fetchSharepointGraphCounts();
 }
 
 // A connection whose storage token and master token resolve to DIFFERENT
@@ -1328,10 +1682,16 @@ async function runSpExtraction(id) {
   }
   const forceEl = document.getElementById(`ds-sp-runopts-force-${id}`);
   const forceReprocess = !!(forceEl && forceEl.checked);
+  const resyncEl = document.getElementById(`ds-sp-runopts-resync-${id}`);
+  const resync = !!(resyncEl && resyncEl.checked);
+  const retryEl = document.getElementById(`ds-sp-runopts-retry-${id}`);
+  const retryFailed = !!(retryEl && retryEl.checked);
   const overrides = {};
   if (conc !== null) overrides.concurrency = conc;
   if (timeout !== null) overrides.timeout_s = timeout;
   if (forceReprocess) overrides.force_reprocess = true;
+  if (resync) overrides.resync = true;
+  if (retryFailed) overrides.retry_failed = true;
   resultEl.className = "ds-conn-test-result show";
   resultEl.textContent = "Starting extraction…";
   try {
@@ -1353,6 +1713,7 @@ async function runSpExtraction(id) {
       // row and clicking "Start run" again does not silently re-process
       // everything a second time.
       if (forceEl) forceEl.checked = false;
+      if (retryEl) retryEl.checked = false;
       // The dispatch stamps `config.extraction.last_run_at` on the connection
       // row, and the body's "In-Agnes extraction" line reads it — so this
       // needs the rows re-read too, not just the strip.
@@ -1415,6 +1776,504 @@ async function runSpFactsExtraction(id) {
   }
 }
 
+/* "Consolidate collections…" — folds this connection's per-scope
+   collections (one per bulk-added scope; the common outcome of splitting a
+   large site across many scopes before bulk-add grew its own
+   shared-collection option) into ONE target. `POST .../collections/
+   consolidate` — see app/api/admin_sharepoint.py::consolidate_collections.
+
+   An inline drawer row (mirrors the "Split this site…" row above), not a
+   `window.prompt` flow — the "fold every sibling from the same site split
+   too" option is a real checkbox here, not a second confirm dialog.
+   Dry-run-first, always: Preview always sends `dry_run: true` (a pure
+   preview — the server never mints anything on that call, see the route's
+   own docstring), rendering the sources/file counts/target for the admin
+   to read BEFORE anything is touched, plus any `blocking` (still shared
+   with another, unrelated connection) or `running` (a sibling's crawl is
+   still in flight) reasons the real merge would be refused for; only
+   Execute sends the second, real (`dry_run: false`) call. */
+function toggleSpConsolidateRow(id) {
+  const row = document.getElementById(`ds-sp-consolidate-row-${id}`);
+  setSourceOpen(id, true);
+  if (row.classList.contains("show")) {
+    row.classList.remove("show");
+    const resultEl = document.getElementById(`ds-sp-consolidate-result-${id}`);
+    if (resultEl) resultEl.innerHTML = "";
+  } else {
+    row.classList.add("show");
+    document.getElementById(`ds-sp-consolidate-name-${id}`).focus();
+  }
+}
+
+/* Reads the target fields — `null` on an obvious client-side conflict
+   (both a target id and a target name typed), same 400
+   `both_target_collection_id_and_target` the server would otherwise
+   refuse with. */
+function _spConsolidateTarget(id) {
+  const targetId = (document.getElementById(`ds-sp-consolidate-target-id-${id}`).value || "").trim();
+  const targetName = (document.getElementById(`ds-sp-consolidate-name-${id}`).value || "").trim();
+  if (targetId && targetName) {
+    showToast("Target collection id and target name are mutually exclusive — pick one.", false);
+    return null;
+  }
+  if (!targetId && !targetName) {
+    showToast("Enter a target collection id, or a name for a new one.", false);
+    return null;
+  }
+  const siblingsEl = document.getElementById(`ds-sp-consolidate-siblings-${id}`);
+  const includeSiblings = !!(siblingsEl && siblingsEl.checked);
+  return targetId
+    ? { target_collection_id: targetId, include_split_siblings: includeSiblings }
+    : { target: { name: targetName }, include_split_siblings: includeSiblings };
+}
+
+async function previewSpConsolidate(id) {
+  const target = _spConsolidateTarget(id);
+  if (target === null) return;
+  const resultEl = document.getElementById(`ds-sp-consolidate-result-${id}`);
+  resultEl.innerHTML = `<p class="field-hint">Checking what would be consolidated…</p>`;
+  try {
+    const r = await fetch(`/api/admin/sharepoint/connections/${encodeURIComponent(id)}/collections/consolidate`, {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...target, dry_run: true }),
+    });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      resultEl.innerHTML = `<p class="ds-conn-test-result show fail">✗ ${_esc(detailMessage(body, "failed to preview consolidation"))}</p>`;
+      return;
+    }
+    _renderSpConsolidatePreview(id, body);
+  } catch (e) {
+    resultEl.innerHTML = `<p class="ds-conn-test-result show fail">✗ Request failed</p>`;
+  }
+}
+
+function _renderSpConsolidatePreview(id, preview) {
+  const resultEl = document.getElementById(`ds-sp-consolidate-result-${id}`);
+  const sources = preview.sources || [];
+  const totalFiles = sources.reduce((sum, s) => sum + (s.file_count || 0), 0);
+  const targetLabel = preview.target.id
+    ? `${_esc(preview.target.name)} (existing, id ${_esc(preview.target.id)})`
+    : `${_esc(preview.target.name)} (new — created on Execute)`;
+  const connectionIds = preview.connection_ids || [];
+  const blocking = preview.blocking || [];
+  const running = preview.running || [];
+  const problems = [];
+  if (blocking.length) {
+    problems.push(
+      `${blocking.length} collection(s) are still shared with another, unrelated connection — Execute would be refused.`,
+    );
+  }
+  if (running.length) {
+    problems.push(
+      `${running.length} connection(s) in this family have a crawl queued/running (${running.map(_esc).join(", ")}) — Execute would be refused.`,
+    );
+  }
+  resultEl.innerHTML = `
+    <p class="field-hint" style="flex-basis:100%;">Would fold ${sources.length} collection(s) (${totalFiles} file(s) total)${connectionIds.length > 1 ? ` across ${connectionIds.length} connections` : ""} into ${targetLabel}.</p>
+    ${problems.map((p) => `<p class="ds-conn-test-result show fail" style="flex-basis:100%;">✗ ${_esc(p)}</p>`).join("")}
+    ${sources.length && !problems.length ? `<button type="button" class="btn btn-primary" onclick="applySpConsolidate('${id}')">Execute — fold ${sources.length} collection(s)</button>` : ""}
+  `;
+}
+
+async function applySpConsolidate(id) {
+  const target = _spConsolidateTarget(id);
+  if (target === null) return;
+  const resultEl = document.getElementById(`ds-sp-consolidate-result-${id}`);
+  const proceed = window.confirm("This will move files/chunks/claims and cannot be undone. Continue?");
+  if (!proceed) return;
+  resultEl.insertAdjacentHTML("beforeend", `<p class="field-hint" style="flex-basis:100%;">Consolidating…</p>`);
+  try {
+    const r = await fetch(`/api/admin/sharepoint/connections/${encodeURIComponent(id)}/collections/consolidate`, {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...target, dry_run: false }),
+    });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      showToast(detailMessage(body, "failed to consolidate collections"), false);
+      return;
+    }
+    showToast(
+      `Folded ${(body.sources || []).length} collection(s) into "${body.target.name}" (${body.files_moved} file(s)).`,
+      true,
+    );
+    toggleSpConsolidateRow(id);
+    await loadConnections();
+  } catch (e) {
+    showToast("Request failed.", false);
+  }
+}
+
+/* "Merge split parts back into this source…" — the REVERSE of "Split this
+   site…"/"Consolidate collections…" above: folds every OTHER connection
+   named like this one's own split family ("<base> — part i/n") back into
+   THIS connection, carrying over each sibling's crawl/facts progress so
+   the merged connection resumes incrementally. `POST .../splits/merge` —
+   see app/api/admin_sharepoint.py::merge_split_connections.
+
+   Dry-run-first, same discipline as `previewSpConsolidate`/
+   `applySpConsolidate` above: the FIRST call is always `dry_run: true`
+   (nothing is touched, a NAMED target is not even minted yet), rendering a
+   per-sibling summary for the admin to read before anything happens; only
+   an explicit confirm sends the second, real (`dry_run: false`) call. A
+   blocked precondition (a running crawl, ACL zones, a mismatched
+   mirrored-scope audience, or a still-shared collection) is surfaced and
+   the flow stops. */
+async function mergeSpSplitSiblings(id) {
+  const targetName = window.prompt(
+    "Merge every sibling connection from this site's split back into this connection.\n\n" +
+      "Name the target collection everything folds into (a new one is created):",
+  );
+  if (!targetName || !targetName.trim()) return;
+  const name = targetName.trim();
+  setSourceOpen(id, true);
+  const resultEl = document.getElementById(`ds-test-${id}`);
+  if (resultEl) {
+    resultEl.className = "ds-conn-test-result show";
+    resultEl.textContent = "Checking what would be merged…";
+  }
+  const url = `/api/admin/sharepoint/connections/${encodeURIComponent(id)}/splits/merge`;
+  const body = { all_split_siblings: true, target: { name } };
+  try {
+    const previewResp = await fetch(url, {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...body, dry_run: true }),
+    });
+    const preview = await previewResp.json().catch(() => ({}));
+    if (!previewResp.ok) {
+      const msg = detailMessage(preview, "failed to preview the merge");
+      if (resultEl) { resultEl.className = "ds-conn-test-result show fail"; resultEl.textContent = "✗ " + msg; }
+      showToast(msg, false);
+      return;
+    }
+    const siblings = preview.siblings || [];
+    if (!siblings.length) {
+      const msg = "no sibling connections found (named like this one's own split family) — nothing to merge.";
+      if (resultEl) { resultEl.className = "ds-conn-test-result show fail"; resultEl.textContent = "✗ " + msg; }
+      showToast(msg, false);
+      return;
+    }
+    const blocking = preview.blocking || [];
+    if (blocking.length) {
+      const msg = `${blocking.length} scope collection(s) are still shared with a connection outside this merge — merging would be refused.`;
+      if (resultEl) { resultEl.className = "ds-conn-test-result show fail"; resultEl.textContent = "✗ " + msg; }
+      showToast(msg, false);
+      return;
+    }
+    const scopesMoved = siblings.reduce((sum, s) => sum + (s.scopes_moved || 0), 0);
+    const proceed = window.confirm(
+      `This will fold ${siblings.length} sibling connection(s) (${scopesMoved} scope(s) total) into ` +
+        `"${name}", carrying over their crawl/facts progress. This cannot be undone. Continue?`,
+    );
+    if (!proceed) {
+      if (resultEl) { resultEl.className = "ds-conn-test-result show"; resultEl.textContent = ""; }
+      return;
+    }
+    if (resultEl) resultEl.textContent = "Merging…";
+    const execResp = await fetch(url, {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...body, dry_run: false }),
+    });
+    const execBody = await execResp.json().catch(() => ({}));
+    if (execResp.ok) {
+      if (resultEl) {
+        resultEl.className = "ds-conn-test-result show ok";
+        resultEl.textContent = `✓ Merged ${(execBody.siblings || []).length} sibling connection(s) into "${execBody.target.name}".`;
+      }
+      showToast("Split parts merged back.", true);
+      await loadConnections();
+    } else {
+      const msg = detailMessage(execBody, "failed to merge the split parts");
+      if (resultEl) { resultEl.className = "ds-conn-test-result show fail"; resultEl.textContent = "✗ " + msg; }
+      showToast(msg, false);
+    }
+  } catch (e) {
+    if (resultEl) { resultEl.className = "ds-conn-test-result show fail"; resultEl.textContent = "✗ Request failed"; }
+    showToast("Request failed.", false);
+  }
+}
+
+/* "Map site group (ACL)…" — maps ONE SharePoint site group (Owners/
+   Members/Visitors, or a custom one) to one or more Agnes user_groups ids
+   in this connection's `config.acl_site_group_map`. SharePoint site groups
+   are not enumerable through the app-only Graph surface this connector
+   uses (`connectors/sharepoint/acl_sync.py::classify_permissions`), so a
+   scope granting one classifies `unhonored: site_group` and grants nobody
+   until it is mapped here — an admin picks the site group's exact
+   displayName and one or more existing Agnes group ids; that group's own
+   members are then granted directly, same as any other ordinary grant.
+
+   `PATCH .../acl-site-group-map` replaces the WHOLE map in one call, so
+   this reads the connection's CURRENT map first (`GET .../connections`
+   already loaded via `loadConnections()` — `row.config` carries it) and
+   only changes the one entry being edited, mirroring the CLI's own
+   read-modify-write (`agnes admin sharepoint acl map-site-group`). Leaving
+   the group-ids prompt blank unmaps that site group entirely. */
+async function mapSpSiteGroup(id) {
+  const siteGroup = window.prompt(
+    "Map a SharePoint site group to Agnes group(s) for ACL mirroring.\n\n" +
+      'Site group name (exact, e.g. "Members", "Owners"):',
+  );
+  if (!siteGroup || !siteGroup.trim()) return;
+  const name = siteGroup.trim();
+
+  const row = (_connections || []).find((r) => r.id === id) || {};
+  const currentMap = (row.config && row.config.acl_site_group_map) || {};
+  const currentIds = (currentMap[name] || []).join(", ");
+  const groupsRaw = window.prompt(
+    `Agnes group id(s) for site group "${name}" (comma-separated).\n` +
+      "Leave blank to remove this mapping:",
+    currentIds,
+  );
+  if (groupsRaw === null) return; // cancelled
+  const groupIds = groupsRaw
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  const mapping = { ...currentMap };
+  if (groupIds.length) {
+    mapping[name] = groupIds;
+  } else {
+    delete mapping[name];
+  }
+
+  const resultEl = document.getElementById(`ds-test-${id}`);
+  try {
+    const r = await fetch(`/api/admin/sharepoint/connections/${encodeURIComponent(id)}/acl-site-group-map`, {
+      method: "PATCH",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mapping }),
+    });
+    const body = await r.json().catch(() => ({}));
+    if (r.ok) {
+      const msg = groupIds.length
+        ? `✓ Mapped "${name}" → ${groupIds.join(", ")}.`
+        : `✓ Unmapped "${name}".`;
+      if (resultEl) { resultEl.className = "ds-conn-test-result show ok"; resultEl.textContent = msg; }
+      showToast("Site group ACL mapping saved.", true);
+      await loadConnections();
+    } else {
+      const msg = detailMessage(body, "failed to save site group mapping");
+      if (resultEl) { resultEl.className = "ds-conn-test-result show fail"; resultEl.textContent = "✗ " + msg; }
+      showToast(msg, false);
+    }
+  } catch (e) {
+    if (resultEl) { resultEl.className = "ds-conn-test-result show fail"; resultEl.textContent = "✗ Request failed"; }
+    showToast("Request failed.", false);
+  }
+}
+
+/* Saves the "Facts policy" control (`_extRenderFactsPolicy` above) via
+   `PATCH .../extraction/facts-config`
+   (`app/api/admin_extraction.py::patch_extraction_facts_config`). All four
+   fields are always sent — the empty "Instance default" option/input maps
+   to `null`, which the endpoint reads as "clear the override", the same
+   least-surprise reading the endpoint's own docstring describes.
+   `vertex_region` is sent regardless of whether it is currently VISIBLE
+   (only shown while Provider is Vertex): its typed value survives a
+   provider switch on this page, so flipping the select back to Vertex
+   later does not silently lose it, and saving is what actually persists
+   or clears it either way. The response carries the RESOLVED value and its
+   source ("connection" once an override is set, "instance"/"none"
+   otherwise) — shown here rather than guessed, since this page has no copy
+   of the instance-level default to resolve against itself. `provider` also
+   carries an `effective` field (always a concrete "anthropic"/"vertex",
+   never "inherit") — shown too, since that is what a pass actually spends
+   against. */
+async function saveSpFactsPolicy(id) {
+  const retrySel = document.getElementById(`ds-sp-factspolicy-retry-${id}`);
+  const transportSel = document.getElementById(`ds-sp-factspolicy-transport-${id}`);
+  const providerSel = document.getElementById(`ds-sp-factspolicy-provider-${id}`);
+  const regionInput = document.getElementById(`ds-sp-factspolicy-vertexregion-${id}`);
+  const statusEl = document.getElementById(`ds-sp-factspolicy-status-${id}`);
+  if (!retrySel || !transportSel || !providerSel || !regionInput) return;
+  const body = {
+    retry_mode: retrySel.value || null,
+    transport: transportSel.value || null,
+    provider: providerSel.value || null,
+    vertex_region: regionInput.value.trim() || null,
+  };
+  if (statusEl) statusEl.textContent = "Saving…";
+  try {
+    const r = await fetch(`/api/admin/sharepoint/connections/${encodeURIComponent(id)}/extraction/facts-config`, {
+      method: "PATCH",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const respBody = await r.json().catch(() => ({}));
+    if (r.ok) {
+      const rm = respBody.retry_mode || {};
+      const tr = respBody.transport || {};
+      const pr = respBody.provider || {};
+      const vr = respBody.vertex_region || {};
+      if (statusEl) {
+        statusEl.textContent =
+          `Retry: ${rm.value} (${rm.source}) · Transport: ${tr.value} (${tr.source}) · ` +
+          `Provider: ${pr.value} (${pr.source}) — effective: ${pr.effective} · ` +
+          `Vertex region: ${vr.value} (${vr.source})`;
+      }
+      showToast("Facts policy saved.", true);
+      // Keep the in-memory row current — a later `renderConnList()` (e.g.
+      // after `loadConnections()`) must redraw the just-saved override, not
+      // the value the page loaded with.
+      const conn = _connections.find((c) => c.id === id);
+      if (conn) {
+        conn.config = conn.config || {};
+        conn.config.extraction = conn.config.extraction || {};
+        const facts = { ...(conn.config.extraction.facts || {}) };
+        if (body.retry_mode === null) delete facts.retry_mode; else facts.retry_mode = body.retry_mode;
+        if (body.transport === null) delete facts.transport; else facts.transport = body.transport;
+        if (body.provider === null) delete facts.provider; else facts.provider = body.provider;
+        if (body.vertex_region === null) delete facts.vertex_region; else facts.vertex_region = body.vertex_region;
+        conn.config.extraction.facts = facts;
+      }
+    } else {
+      if (statusEl) statusEl.textContent = "";
+      showToast(detailMessage(respBody, "failed to save the facts policy"), false);
+    }
+  } catch (e) {
+    if (statusEl) statusEl.textContent = "";
+    showToast("Request failed", false);
+  }
+}
+
+/* Saves/clears the "Crawl schedule & filter" panel's TWO independent
+   controls (`_extRenderCrawlFilter` above) via ONE shared `PATCH
+   .../extraction/crawl-config` (`app/api/admin_extraction.py::
+   patch_extraction_crawl_config`). Moved here from the "View
+   configuration" drawer, not duplicated — same endpoint, same request
+   shape, only the DOM ids changed to match this control's own home on the
+   card.
+
+   The endpoint's `min_modified` keeps its ORIGINAL "omitted == cleared"
+   contract even now that `schedule` (D.16) rides the same body — see that
+   handler's own docstring. So EVERY call here always sends BOTH fields:
+   whichever one the caller is actually changing, and the OTHER's current
+   value read straight off the in-memory `_connections` cache (never
+   omitted), exactly the way `cli/commands/admin_sharepoint.py::
+   crawl_config`'s GET-then-resend does for the same reason. Neither
+   control can silently clobber the other. */
+async function _crawlConfigPatch(id, { minModified, schedule } = {}) {
+  const conn = _connections.find((c) => c.id === id);
+  const crawlNow = ((conn && conn.config && conn.config.extraction) || {}).crawl || {};
+  const body = {
+    min_modified: minModified !== undefined ? minModified : (typeof crawlNow.min_modified === "string" ? crawlNow.min_modified : null),
+    schedule: schedule !== undefined ? schedule : (typeof crawlNow.schedule === "string" ? crawlNow.schedule : null),
+  };
+  const filterStatusEl = document.getElementById(`ds-sp-crawlfilter-status-${id}`);
+  const scheduleStatusEl = document.getElementById(`ds-sp-crawlschedule-status-${id}`);
+  const nextRunEl = document.getElementById(`ds-sp-crawlschedule-nextrun-${id}`);
+  const touchedFilter = minModified !== undefined;
+  const touchedSchedule = schedule !== undefined;
+  if (touchedFilter && filterStatusEl) filterStatusEl.textContent = "Saving…";
+  if (touchedSchedule && scheduleStatusEl) scheduleStatusEl.textContent = "Saving…";
+  try {
+    const r = await fetch(`/api/admin/sharepoint/connections/${encodeURIComponent(id)}/extraction/crawl-config`, {
+      method: "PATCH",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const respBody = await r.json().catch(() => ({}));
+    if (r.ok) {
+      const mm = respBody.min_modified || {};
+      const sched = respBody.schedule || {};
+      if (filterStatusEl) {
+        filterStatusEl.textContent = mm.value
+          ? `Currently: files modified on/after ${mm.value} (default — applies to scopes without their own filter).`
+          : "Currently: no default filter — a scope without its own filter is crawled unfiltered.";
+      }
+      if (scheduleStatusEl) {
+        scheduleStatusEl.textContent = sched.value && sched.value !== "instance"
+          ? `Currently: ${sched.value} (${sched.source}).`
+          : "Currently: following the instance-wide cadence.";
+      }
+      if (nextRunEl) {
+        nextRunEl.textContent = sched.next_run_at
+          ? `Next run: ${new Date(sched.next_run_at).toLocaleString()}.`
+          : "Next run: not scheduled.";
+      }
+      if (touchedFilter) {
+        showToast(mm.value ? `Crawl filter set to ${mm.value}.` : "Crawl filter cleared.", true);
+      }
+      if (touchedSchedule) {
+        showToast(`Crawl schedule set to ${sched.value}.`, true);
+      }
+      // Keep the in-memory row current — a later `renderConnList()` (e.g.
+      // after `loadConnections()`) must redraw the just-saved overrides,
+      // not the values the page loaded with.
+      if (conn) {
+        conn.config = conn.config || {};
+        conn.config.extraction = conn.config.extraction || {};
+        const crawl = { ...(conn.config.extraction.crawl || {}) };
+        if (body.min_modified === null) delete crawl.min_modified; else crawl.min_modified = body.min_modified;
+        if (body.schedule === null) delete crawl.schedule; else crawl.schedule = body.schedule;
+        conn.config.extraction.crawl = crawl;
+      }
+    } else {
+      if (touchedFilter && filterStatusEl) filterStatusEl.textContent = "";
+      if (touchedSchedule && scheduleStatusEl) scheduleStatusEl.textContent = "";
+      showToast(detailMessage(respBody, "couldn't save the crawl schedule/filter"), false);
+    }
+  } catch (e) {
+    if (touchedFilter && filterStatusEl) filterStatusEl.textContent = "";
+    if (touchedSchedule && scheduleStatusEl) scheduleStatusEl.textContent = "";
+    showToast("Request failed.", false);
+  }
+}
+
+function crawlFilterSave(id) {
+  const input = document.getElementById(`ds-sp-crawlfilter-date-${id}`);
+  const value = (input && input.value || "").trim();
+  if (!value) {
+    showToast("Pick a date first, or use Clear to remove the filter.", false);
+    return;
+  }
+  _crawlConfigPatch(id, { minModified: value });
+}
+
+function crawlFilterClear(id) {
+  const input = document.getElementById(`ds-sp-crawlfilter-date-${id}`);
+  if (input) input.value = "";
+  _crawlConfigPatch(id, { minModified: null });
+}
+
+/* Shows/hides the free-text cadence input next to the "Crawl schedule"
+   select — only meaningful when "Custom cadence…" is picked, same pattern
+   `_extToggleVertexRegionInput` above uses for its own conditional field. */
+function _extToggleCrawlScheduleInput(id) {
+  const select = document.getElementById(`ds-sp-crawlschedule-select-${id}`);
+  const custom = document.getElementById(`ds-sp-crawlschedule-custom-${id}`);
+  if (!select || !custom) return;
+  custom.style.display = select.value === "custom" ? "" : "none";
+}
+
+function crawlScheduleSave(id) {
+  const select = document.getElementById(`ds-sp-crawlschedule-select-${id}`);
+  const custom = document.getElementById(`ds-sp-crawlschedule-custom-${id}`);
+  const picked = select && select.value;
+  let value = picked;
+  if (picked === "custom") {
+    value = (custom && custom.value || "").trim();
+    if (!value) {
+      showToast("Enter a cadence (e.g. 'every 6h', 'daily 03:00'), or pick a different option.", false);
+      return;
+    }
+  }
+  _crawlConfigPatch(id, { schedule: value });
+}
+
 function toggleSpCertRow(id) {
   const row = document.getElementById(`ds-sp-cert-row-${id}`);
   setSourceOpen(id, true);
@@ -1455,6 +2314,250 @@ async function saveSpCertificate(id) {
       showToast(msg, false);
     }
   } catch (_) {
+    showToast("Request failed.", false);
+  }
+}
+
+/* "Parallel crawl — preview shards" (2026-09-03 auto-parallel-crawl
+   design §4.7) — the read-only front end for GET .../shard-plan
+   (app/api/admin_sharepoint.py): what the automatic planner would do for
+   this site right now, nothing to apply. Same "show" toggle / clear-on-
+   close shape as toggleSpSplitRow below (which this control replaces as
+   the primary control — that one now lives behind the "Legacy" link this
+   row's own markup renders). */
+function toggleSpShardPlanRow(id) {
+  const row = document.getElementById(`ds-sp-shardplan-row-${id}`);
+  setSourceOpen(id, true);
+  if (row.classList.contains("show")) {
+    row.classList.remove("show");
+    const resultEl = document.getElementById(`ds-sp-shardplan-result-${id}`);
+    if (resultEl) resultEl.innerHTML = "";
+  } else {
+    row.classList.add("show");
+  }
+}
+
+async function previewShardPlan(id) {
+  const resultEl = document.getElementById(`ds-sp-shardplan-result-${id}`);
+  const minModified = document.getElementById(`ds-sp-shardplan-min-modified-${id}`).value || "";
+  resultEl.innerHTML = `<p class="field-hint">Computing plan — reads live document counts, this can take a few seconds…</p>`;
+  const params = new URLSearchParams();
+  if (minModified) params.set("min_modified", minModified);
+  const qs = params.toString();
+  try {
+    const r = await fetch(
+      `/api/admin/sharepoint/connections/${encodeURIComponent(id)}/shard-plan${qs ? `?${qs}` : ""}`,
+      { credentials: "include" }
+    );
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      resultEl.innerHTML = `<p class="ds-conn-test-result show fail">✗ ${_esc(detailMessage(body, "failed to compute the shard plan"))}</p>`;
+      return;
+    }
+    _renderShardPlan(id, body);
+  } catch (e) {
+    resultEl.innerHTML = `<p class="ds-conn-test-result show fail">✗ Request failed</p>`;
+  }
+}
+
+/* `plan.mode === "inline"` means the site would stay a single ordinary
+   crawl — nothing to shard, so no table (a table with one "whole site" row
+   would just be noise). Otherwise one row per shard: label, a live (never
+   exact — index lag) expected document count, and how many delta units it
+   packs, reusing the SAME `.ds-sp-split-table` styling the legacy split
+   preview already uses (one shared table vocabulary, not a second one). */
+function _renderShardPlan(id, plan) {
+  const resultEl = document.getElementById(`ds-sp-shardplan-result-${id}`);
+  if (plan.mode === "inline") {
+    resultEl.innerHTML = `<p class="field-hint" style="flex-basis:100%;">This site would stay a single ordinary crawl — no sharding needed (target ${plan.target_docs || 0} docs/shard).</p>`;
+    return;
+  }
+  const shards = plan.shards || [];
+  const rows = shards
+    .map((s) => `<tr><td>${_esc(s.label)}</td><td>${s.expected ?? 0}</td><td>${s.targets_count ?? 0}</td></tr>`)
+    .join("");
+  const totalExpected = shards.reduce((sum, s) => sum + (s.expected || 0), 0);
+  const loose = plan.loose_root_files || [];
+  const shown = loose.slice(0, 10).map(_esc).join(", ");
+  const looseHtml = loose.length
+    ? `<p class="field-hint" style="flex-basis:100%;">⚠ ${loose.length} file${loose.length === 1 ? "" : "s"} sit directly at a drive root — covered by the remainder shard at crawl time: ${shown}${loose.length > 10 ? ", …" : ""}</p>`
+    : "";
+  resultEl.innerHTML = `
+    <table class="ds-sp-split-table" style="flex-basis:100%;width:100%;">
+      <thead><tr><th>Shard</th><th>Expected (≈)</th><th>Units</th></tr></thead>
+      <tbody>${rows || `<tr><td colspan="3">No shards.</td></tr>`}</tbody>
+    </table>
+    <p class="field-hint" style="flex-basis:100%;">Total expected documents across shards (≈, never exact): ${totalExpected}</p>
+    ${looseHtml}
+    <p class="field-hint" style="flex-basis:100%;">This runs automatically the next time extraction is triggered — nothing to create or apply here.</p>
+  `;
+}
+
+/* "Split this site" (legacy, deprecated) — the product-shaped front end for
+   GET/POST .../split-plan and .../splits (app/api/admin_sharepoint.py):
+   preview a greedy-packed folder split, then create the sibling
+   connections from it. Reachable only via the "Legacy: create N
+   connections manually (deprecated)…" link the shard-plan row above
+   renders — never deleted, the endpoints it calls still exist. The panel
+   row's own "show" toggle mirrors toggleSpCertRow above; unlike that one,
+   closing it also clears any preview result so reopening it never shows a
+   stale plan next to fresh inputs. */
+function toggleSpSplitRow(id) {
+  const row = document.getElementById(`ds-sp-split-row-${id}`);
+  setSourceOpen(id, true);
+  if (row.classList.contains("show")) {
+    row.classList.remove("show");
+    const resultEl = document.getElementById(`ds-sp-split-result-${id}`);
+    if (resultEl) resultEl.innerHTML = "";
+  } else {
+    row.classList.add("show");
+    document.getElementById(`ds-sp-split-n-${id}`).focus();
+  }
+}
+
+function _spSplitN(id) {
+  const el = document.getElementById(`ds-sp-split-n-${id}`);
+  const n = Number(el.value);
+  return Number.isInteger(n) && n >= 1 && n <= 50 ? n : null;
+}
+
+/* The collection-routing controls (`ds-sp-split-collection-id-`/`-name-`/
+   `-per-folder-`) are shared, read as-is, between the preview
+   (`GET .../split-plan`, query params) and the apply
+   (`POST .../splits`, body) — same three mutually-exclusive options
+   `SplitApplyBody` accepts server-side, so what an admin previews is
+   exactly what the apply call would do. Returns `null` on a
+   client-side-obvious conflict (both an id and a name typed, or
+   per-folder combined with either) — the server would 400
+   `both_target_collection_id_and_target`/`per_folder_collections_and_target`
+   for the exact same combination, but catching it here avoids a round
+   trip for a mistake the form already knows about. */
+function _spSplitCollectionOptions(id) {
+  const collectionId = (document.getElementById(`ds-sp-split-collection-id-${id}`).value || "").trim();
+  const collectionName = (document.getElementById(`ds-sp-split-collection-name-${id}`).value || "").trim();
+  const perFolderEl = document.getElementById(`ds-sp-split-per-folder-${id}`);
+  const perFolder = !!(perFolderEl && perFolderEl.checked);
+  if (collectionId && collectionName) {
+    showToast("Collection id and collection name are mutually exclusive — pick one.", false);
+    return null;
+  }
+  if (perFolder && (collectionId || collectionName)) {
+    showToast("One-collection-per-folder and an explicit collection are mutually exclusive — pick one.", false);
+    return null;
+  }
+  return { collectionId, collectionName, perFolder };
+}
+
+async function previewSpSplit(id) {
+  const resultEl = document.getElementById(`ds-sp-split-result-${id}`);
+  const n = _spSplitN(id);
+  if (!n) {
+    showToast("Number of parts must be a whole number between 1 and 50.", false);
+    return;
+  }
+  const collectionOpts = _spSplitCollectionOptions(id);
+  if (collectionOpts === null) return;
+  const minModified = document.getElementById(`ds-sp-split-min-modified-${id}`).value || "";
+  resultEl.innerHTML = `<p class="field-hint">Computing plan — reads the drive root and counts each folder's documents live, this can take a few seconds…</p>`;
+  const params = new URLSearchParams({ n: String(n) });
+  if (minModified) params.set("min_modified", minModified);
+  if (collectionOpts.collectionId) params.set("target_collection_id", collectionOpts.collectionId);
+  if (collectionOpts.collectionName) params.set("target_name", collectionOpts.collectionName);
+  if (collectionOpts.perFolder) params.set("per_folder_collections", "true");
+  try {
+    const r = await fetch(
+      `/api/admin/sharepoint/connections/${encodeURIComponent(id)}/split-plan?${params.toString()}`,
+      { credentials: "include" }
+    );
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      resultEl.innerHTML = `<p class="ds-conn-test-result show fail">✗ ${_esc(detailMessage(body, "failed to compute the split plan"))}</p>`;
+      return;
+    }
+    _renderSpSplitPlan(id, body);
+  } catch (e) {
+    resultEl.innerHTML = `<p class="ds-conn-test-result show fail">✗ Request failed</p>`;
+  }
+}
+
+/* `plan.collection` — the resolved (never yet minted) shared target every
+   part's scopes would route to, `null` only for the per-folder opt-in —
+   see `app.api.admin_sharepoint._resolve_split_target_collection_ref`. */
+function _spSplitCollectionLineHtml(collection) {
+  if (collection === undefined) return "";
+  if (collection === null) {
+    return `<p class="field-hint" style="flex-basis:100%;">Every folder will mint its OWN collection.</p>`;
+  }
+  const label = collection.id
+    ? `${_esc(collection.name)} (existing, id ${_esc(collection.id)})`
+    : `${_esc(collection.name)} (new — created when you create the connections)`;
+  return `<p class="field-hint" style="flex-basis:100%;">Every part's scopes will route to ONE shared collection: ${label}</p>`;
+}
+
+function _renderSpSplitPlan(id, plan) {
+  const resultEl = document.getElementById(`ds-sp-split-result-${id}`);
+  const groups = plan.groups || [];
+  const rows = groups.map((g) => `
+    <tr><td>${_esc(g.name)}</td><td>${(g.folders || []).length}</td><td>${g.documents || 0}</td></tr>
+  `).join("");
+  const loose = plan.loose_root_files || [];
+  const shown = loose.slice(0, 10).map(_esc).join(", ");
+  const looseHtml = loose.length
+    ? `<p class="field-hint" style="flex-basis:100%;">⚠ ${loose.length} file${loose.length === 1 ? "" : "s"} sit directly at the drive root and will NOT be covered by any part: ${shown}${loose.length > 10 ? ", …" : ""}</p>`
+    : "";
+  resultEl.innerHTML = `
+    <table class="ds-sp-split-table" style="flex-basis:100%;width:100%;">
+      <thead><tr><th>Part</th><th>Folders</th><th>Documents</th></tr></thead>
+      <tbody>${rows || `<tr><td colspan="3">No folders found at the drive root.</td></tr>`}</tbody>
+    </table>
+    <p class="field-hint" style="flex-basis:100%;">Total documents across all folders: ${plan.total_documents || 0}</p>
+    ${_spSplitCollectionLineHtml(plan.collection)}
+    ${looseHtml}
+    <label class="field-hint" style="flex-basis:100%;display:flex;align-items:center;gap:6px;">
+      <input type="checkbox" id="ds-sp-split-start-${id}">
+      Start each part's crawl immediately after creating it
+    </label>
+    ${groups.length ? `<button type="button" class="btn btn-primary" onclick="applySpSplit('${id}')">Create ${groups.length} connection${groups.length === 1 ? "" : "s"}</button>` : ""}
+  `;
+}
+
+async function applySpSplit(id) {
+  const resultEl = document.getElementById(`ds-sp-split-result-${id}`);
+  const n = _spSplitN(id);
+  if (!n) return;
+  const collectionOpts = _spSplitCollectionOptions(id);
+  if (collectionOpts === null) return;
+  const minModified = document.getElementById(`ds-sp-split-min-modified-${id}`).value || null;
+  const transport = document.getElementById(`ds-sp-split-transport-${id}`).value || null;
+  const retryMode = document.getElementById(`ds-sp-split-retry-${id}`).value || null;
+  const startEl = document.getElementById(`ds-sp-split-start-${id}`);
+  const start = !!(startEl && startEl.checked);
+  const payload = { n, start };
+  if (minModified) payload.min_modified = minModified;
+  if (transport) payload.transport = transport;
+  if (retryMode) payload.retry_mode = retryMode;
+  if (collectionOpts.collectionId) payload.target_collection_id = collectionOpts.collectionId;
+  if (collectionOpts.collectionName) payload.target = { name: collectionOpts.collectionName };
+  if (collectionOpts.perFolder) payload.per_folder_collections = true;
+  resultEl.insertAdjacentHTML("beforeend", `<p class="field-hint" style="flex-basis:100%;">Creating connections…</p>`);
+  try {
+    const r = await fetch(`/api/admin/sharepoint/connections/${encodeURIComponent(id)}/splits`, {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      showToast(detailMessage(body, "failed to create the split"), false);
+      return;
+    }
+    const created = body.connections || [];
+    showToast(`Created ${created.length} connection${created.length === 1 ? "" : "s"}.`, true);
+    toggleSpSplitRow(id);
+    await refreshSourcePipelines();
+    await loadConnections();
+  } catch (e) {
     showToast("Request failed.", false);
   }
 }
@@ -1719,7 +2822,6 @@ function _syncGrantPickerDropdown(sel) {
   if (window.dsDropdownInit) window.dsDropdownInit(host);
 }
 
-
 async function _fillGrantPickers() {
   const groups = await _loadGroups();
   document.querySelectorAll('select[id^="ds-grant-group-"]').forEach((sel) => {
@@ -1831,7 +2933,6 @@ async function toggleBrowse(id) {
     panel.innerHTML = `<div class="ds-browse-error">Request failed.</div>`;
   }
 }
-
 
 /* Buckets render CLOSED. On a real project this list is dozens of buckets and
    hundreds of tables; open, it is a wall nobody can navigate, and the one
@@ -3264,7 +4365,7 @@ function _renderSfRowsEditor() {
     "Pick the Snowflake tables to register — or name one by hand if it is not listed.";
   body.innerHTML = `
     <div class="ds-sf-conn-error" id="ds-sf-conn-error" role="alert">
-      <span class="ds-sf-conn-error__icon" aria-hidden="true">${DS_BOOT.warnIcon}</span>
+      <span class="ds-sf-conn-error__icon" aria-hidden="true"><svg class="ui-ico " width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><path d="M12 9v4M12 17h.01"/></svg></span>
       <span class="ds-sf-conn-error__msg"></span>
       <button type="button" class="btn btn-secondary" id="ds-sf-conn-error-fix">Fix connection</button>
     </div>
@@ -3981,10 +5082,6 @@ function isSourceOpen(id) {
   return !!body && !body.hidden;
 }
 
-/* Guarded: this element belongs to the connections page. The data-package
-   builder loads this same file for the Add-data wizard and has no such list,
-   and a null here would throw before every listener below it was bound. */
-if (document.getElementById("ds-conn-list")) {
 document.getElementById("ds-conn-list").addEventListener("click", (e) => {
   const caret = e.target.closest("[data-disclose]");
   if (caret) {
@@ -3999,7 +5096,6 @@ document.getElementById("ds-conn-list").addEventListener("click", (e) => {
     setSourceOpen(head.dataset.srcHead, !isSourceOpen(head.dataset.srcHead));
   }
 });
-}
 
 /* ── The Actions menu ──────────────────────────────────────────────────────
    ONE popover node for the whole list, refilled and repositioned per card.
@@ -4045,7 +5141,11 @@ function _sourceMenuItems(row) {
     <button type="button" class="apg-menu__item" role="menuitem" data-role="test" onclick="closeSourceMenu(); testSpConn('${id}')">Test connection</button>
     <button type="button" class="apg-menu__item" role="menuitem" onclick="closeSourceMenu(); runSpExtraction('${id}')">Run extraction now</button>
     <button type="button" class="apg-menu__item" role="menuitem" onclick="closeSourceMenu(); runSpFactsExtraction('${id}')">Extract facts now</button>
+    <button type="button" class="apg-menu__item" role="menuitem" onclick="closeSourceMenu(); toggleSpShardPlanRow('${id}')">Parallel crawl — preview shards…</button>
     <div class="apg-menu__sep"></div>
+    <button type="button" class="apg-menu__item" role="menuitem" onclick="closeSourceMenu(); toggleSpConsolidateRow('${id}')">Consolidate collections…</button>
+    <button type="button" class="apg-menu__item" role="menuitem" onclick="closeSourceMenu(); mergeSpSplitSiblings('${id}')">Merge split parts back into this source…</button>
+    <button type="button" class="apg-menu__item" role="menuitem" onclick="closeSourceMenu(); mapSpSiteGroup('${id}')">Map site group (ACL)…</button>
     <button type="button" class="apg-menu__item" role="menuitem" onclick="closeSourceMenu(); toggleSpCertRow('${id}')">Update certificate…</button>
     <div class="apg-menu__sep"></div>
     <button type="button" class="apg-menu__item apg-menu__item--danger" role="menuitem" onclick="closeSourceMenu(); deleteConn('${id}')">Delete source</button>`;
@@ -4102,10 +5202,7 @@ window.addEventListener("resize", closeSourceMenu);
 
 /* ── Event wiring ────────────────────────────────────────────────────────── */
 
-// Also the connections page's own button — see the guard note above.
-if (document.getElementById("ds-add-btn")) {
-  document.getElementById("ds-add-btn").addEventListener("click", () => openWizard());
-}
+document.getElementById("ds-add-btn").addEventListener("click", () => openWizard());
 document.getElementById("ds-wizard-close").addEventListener("click", closeWizard);
 document.getElementById("ds-wizard-cancel").addEventListener("click", closeWizard);
 
@@ -4191,22 +5288,12 @@ document.getElementById("ds-wizard-register-btn").addEventListener("click", asyn
   try {
     const result = await _registerStepTwo();
     if (!result || !result.ok.length) return; // per-row statuses say why
-    /* Came from the package builder: registering the tables is all it
-       needed, so hand back rather than walking on into Bundle and Share —
-       those build a data package, which is not a thing to offer someone
-       already building one.
-
-       Two ways back. Opened as a drawer OVER the builder, `onRegistered`
-       hands the rows over and the flow never leaves the page. Arrived by
-       navigation, there is nothing to call, so return to the builder — it
-       works out what is new by diffing the registry against what it saw
-       before it left, which is why nothing has to travel in the URL. */
-    if (_pkgBuilder) {
-      if (typeof _pkgBuilder.onRegistered === "function") {
-        closeWizard();
-        _pkgBuilder.onRegistered(result.ok);
-        return;
-      }
+    /* Came from the package builder: the tables are registered, which is all
+       it needed, so go back to it. It works out which ones are new by
+       diffing the registry against what it saw before it left, so there is
+       nothing to hand over in the URL and nothing here to keep in step with
+       it. */
+    if (_fromPackageBuilder) {
       window.location.href = "/admin/data-packages/new";
       return;
     }
@@ -4373,10 +5460,6 @@ document.addEventListener("keydown", function (e) {
 // waits for the connections list — openWizard reads it to offer the
 // "already connected" shortcut, and racing it hid the strip on exactly the
 // entry path that needs it most.
-/* Booting the CONNECTIONS page. The builder loads this file for the wizard
-   alone, so it must not fetch and repaint a list that is not on the page —
-   its own boot lives in admin_package_builder.html. */
-if (document.getElementById("ds-conn-list")) {
 loadConnections().then(() => {
   // Honour the same precondition as `#ds-add-btn`, which is `disabled` when
   // no vault key is configured. This deep link is the Overview checklist's
@@ -4387,10 +5470,24 @@ loadConnections().then(() => {
   const _params = new URLSearchParams(window.location.search);
   // The builder's round trip. Equality against a literal, so the param
   // decides only whether a constant-href strip is shown.
-  // The navigation entry, for anyone who lands here directly rather than
-  // through the builder's own drawer. No `onRegistered`, so it hands back by
-  // returning to the builder.
-  if (_params.get("from") === "package-builder") _dsWizardForPackageBuilder({});
+  if (_params.get("from") === "package-builder") {
+    _fromPackageBuilder = true;
+    const back = document.getElementById("ds-from-package");
+    if (back) back.hidden = false;
+    /* Say what the flow actually is on this entry: two steps, and the
+       primary names where the tables are going. A strip advertising Bundle
+       and Share that this entry never reaches is a map of somewhere else. */
+    document.querySelectorAll("#ds-wizard-overlay .ds-drawer__step").forEach((el) => {
+      if (Number(el.dataset.wstep) > 2) el.hidden = true;
+    });
+    const reg = document.getElementById("ds-wizard-register-btn");
+    if (reg) reg.textContent = "Add selected tables to your package";
+    const early = document.getElementById("ds-wizard-finish-early-btn");
+    if (early) {
+      early.textContent = "Register only";
+      early.title = "Register the selected tables and stay here — your package keeps waiting.";
+    }
+  }
   if (_params.has("add")) {
     const addBtn = document.getElementById("ds-add-btn");
     if (addBtn && addBtn.disabled) {
@@ -4401,4 +5498,3 @@ loadConnections().then(() => {
     }
   }
 });
-}

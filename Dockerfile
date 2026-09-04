@@ -8,7 +8,19 @@
 # default, so it costs nothing to every existing deployment.
 FROM python:3.13-slim AS base
 
-RUN apt-get update && apt-get install -y --no-install-recommends curl git && rm -rf /var/lib/apt/lists/*
+# libreoffice-{core,writer,calc,impress} (headless, --no-install-recommends
+# keeps out the GUI/help-browser/Java deps) + fonts-liberation (metric-
+# compatible with the common Office fonts, so a headless conversion doesn't
+# fall back to box glyphs) back the legacy Office/OpenDocument pre-converter
+# in src/ingest/convert.py (.doc/.rtf/.odt/.ppt/.odp/.xls/.ods →
+# docx/pptx/xlsx via `soffice --headless`, then the existing markitdown
+# route). Same apt layer as curl/git so the image gains one cache-friendly
+# layer, not two.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl git \
+        libreoffice-core libreoffice-writer libreoffice-calc libreoffice-impress \
+        fonts-liberation \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
@@ -63,8 +75,9 @@ COPY . .
 #   - post-deploy-smoke-test.sh — deploy gate (docs/ONBOARDING.md step 8):
 #     public API + new-instance doctor + host-side consistency checks
 #   - docker-compose.{yml,prod.yml,host-mount.yml,tls.yml} — host runtime
-#   - docker-compose.gcp-logging.yml — opt-out gcplogs overlay (removed by
-#     startup-script.sh.tpl when enable_gcp_logging=false; see its own header)
+#   - docker-compose.gcp-logging.yml — Cloud Logging overlay, fluentd driver
+#     into a host Ops Agent (removed by startup-script.sh.tpl whenever
+#     container_logs_destination is not cloud_logging; see its own header)
 #   - Caddyfile — TLS reverse proxy config
 #   - static/maintenance.html — Caddy's handle_errors 502/503 fallback page
 #
@@ -181,8 +194,10 @@ CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-
 # The converter backends the lane needs (markitdown, pypdfium2) come from
 # the `extraction` optional extra, which the default install above now
 # bakes in — every image built from this file can convert documents. The
-# typed "not installed" refusal (`409 extraction_dependencies_missing`)
-# remains for bare-metal installs that skipped the extra.
+# `libreoffice-*` packages above cover the legacy Office/OpenDocument
+# pre-conversion step the same way. The typed "not installed" refusal
+# (`409 extraction_dependencies_missing` / `MissingConversionDependency`)
+# remains for bare-metal installs that skipped the extra or the apt packages.
 FROM base AS worker
 
 EXPOSE 8000

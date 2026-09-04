@@ -79,6 +79,7 @@ are the unit of curation and user-facing discovery.
 | `DELETE` | `/api/admin/registry/{table_id}` | — | Unregister |
 | `POST` | `/api/admin/registry/{table_id}/policy/preview` | see §3.7 | Preview a stored or candidate access policy as a chosen persona |
 | `POST` | `/api/admin/registry/{table_id}/policy/preview-groups` | see §3.7 | Preview a stored or candidate access policy across every real group in one call |
+| `POST` | `/api/admin/registry/{table_id}/policy/preview-matrix` | see §3.7 | Preview a stored or candidate access policy across a persona matrix (union coverage, pairwise overlap) |
 | `GET` | `/api/admin/registry/{table_id}/policy/columns` | — | No-SQL policy builder: real column schema + sample values (see §3.8) |
 | `POST` | `/api/admin/registry/{table_id}/policy/compile` | see §3.8 | No-SQL policy builder: structured spec → validated SQL (never persisted) |
 | `GET` | `/api/admin/registry/{table_id}/policy/revisions` | — | Saved states of a table's access policy, newest first (see §3.9) |
@@ -255,8 +256,9 @@ attached/replaced/cleared via `PUT /api/admin/registry/{table_id}` (`access_poli
 Every call is recorded to the audit log (`access_policy.preview`) — it shows one admin
 another person's data slice.
 
-These four policy-content routes (`.../policy/preview`, `.../policy/preview-groups`,
-`.../policy/columns`, `.../policy/revisions`) need an admin credential whose data-read
+These five policy-content routes (`.../policy/preview`, `.../policy/preview-groups`,
+`.../policy/preview-matrix`, `.../policy/columns`, `.../policy/revisions`) need an
+admin credential whose data-read
 **surface** is `all` — a browser session, a regular PAT, or `agnes init --as-admin`.
 A `surface='stack'` PAT (the `agnes init` default, filtered like an analyst everywhere
 else) gets `403` with a detail naming the fix: they return real table content with no
@@ -322,6 +324,54 @@ curl -s -X POST \
 #  "mapping_warning": null}
 ```
 
+#### `POST /api/admin/registry/{table_id}/policy/preview-matrix`
+
+The persona **matrix** (design doc §13.1 "The preview is a matrix, not a run";
+issue #2147) — runs the SAME single-persona primitive `.../policy/preview` uses
+once per enumerated persona, instead of once for a single admin-chosen one, and
+derives two numbers a single-persona run cannot show: whether the policy is a
+no-op, and whether two personas meant to partition the table actually overlap.
+
+| Field | Type | Notes |
+|---|---|---|
+| `sql` | string, optional | Same meaning as `.../policy/preview` — omit to preview the stored policy. |
+| `personas` | string, optional | `"group_sets"` \| `"policy_groups"` \| `"both"` (default). `group_sets` enumerates the distinct sets of live group names held by real users who can reach the table; `policy_groups` enumerates every group literal the policy body itself compares `$user_groups` against, plus the empty group set. An admin persona never appears. |
+| `limit` | integer, optional | Bounds how many distinct `group_sets` personas are enumerated — `1..50`; `422 policy_preview_matrix_limit_out_of_range` outside that range. |
+
+```bash
+curl -s -X POST \
+  "https://{your-instance}/api/admin/registry/orders_daily/policy/preview-matrix" \
+  -H "Authorization: Bearer $PAT" \
+  -H "Content-Type: application/json" \
+  -d '{"personas": "group_sets"}'
+# {"rows_total": 4200,
+#  "personas": [
+#    {"kind": "group_set", "label": "Finance", "groups": ["Finance"],
+#     "rows_visible": 1200, "rows_total": 4200,
+#     "hidden_columns": ["secret"], "masked_columns": []},
+#    {"kind": "group_set", "label": "Ops", "groups": ["Ops"],
+#     "rows_visible": 900, "rows_total": 4200,
+#     "hidden_columns": ["secret"], "masked_columns": []}
+#  ],
+#  "union_coverage": 0.7, "no_op": false,
+#  "pairwise_overlap": [{"persona_a": "Finance", "persona_b": "Ops",
+#                        "overlap_rows": 0, "overlap_fraction": 0.0}],
+#  "identity_columns": ["id"], "truncated": false,
+#  "transpiled": null, "mapping_warning": null}
+```
+
+`union_coverage` is the fraction of the SAME bounded sample `.../policy/preview`
+uses that is visible to at least one persona — `1.0` together with every
+persona individually at `1.0` sets `no_op: true`. `pairwise_overlap` reports,
+for every pair of personas, how many of their visible sampled rows coincide —
+a non-zero overlap between two personas a partitioning policy should keep
+disjoint is the permissive `CASE`-with-a-missing-branch bug, rendered
+directly. Row identity across personas (`identity_columns`) is best-effort:
+the columns that survive from base to policied output unchanged (never
+hidden, never masked). With no stored policy at all and no candidate `sql`
+given, this 422s the same way `.../policy/preview` does
+(`policy_preview_no_policy`).
+
 ### 3.8 No-SQL policy builder — `GET .../policy/columns`, `POST .../policy/compile`
 
 Lets an admin author a policy by picking columns and masks instead of writing SQL by
@@ -360,7 +410,35 @@ duplicated here:
 |---|---|---|
 | `row_rules` | array, optional | `[{"column", "op", "value"}]` — `op` is one of `in_caller_groups`, `eq_caller_email`, `eq_caller_id`, `eq`, `in` |
 | `row_combine` | string, optional | `"and"` (default) or `"or"` |
-| `column_masks` | object, optional | `{column: "show"\|"hide"\|"nullify"\|"hash"\|"unmask"}` — `"unmask"` takes `{"choice": "unmask", "groups": ["..."]}` (single-group `"group"` is still accepted) |
+| `column_masks` | object, optional | `{column: "show"\|"hide"\|"nullify"\|"hash"\|"unmask"\|"last4"\|"email_partial"\|"pseudonymize_keyed"}` — any of them may be written as `{"choice": <mask>, "groups": ["..."]}`, which reveals the column verbatim to those groups and applies the mask to everyone else (`"unmask"` is that shape with the built-in `'*****'`/`NULL` fallback; single-group `"group"` is still accepted). `{"choice": "tiered", "tiers": [{"groups": ["..."], "reveal": "show"\|<mask>}, ...], "default": <mask>}` is the ordered form |
+
+A `groups` list is a modifier, not a mask of its own: an empty or missing list falls back
+to the plain mask, never to "everyone sees it". `hide` cannot take one (a column cannot be
+conditionally absent from a fixed projection, so the output schema would depend on the
+caller) and neither can `show`; both are refused with `422 policy_compile_invalid_spec`.
+
+`tiered` compiles the tiers into **one ordered `CASE` chain** — evaluated top-down, first
+matching tier wins, `default` for everyone else — so what a caller in several groups sees
+is decided by the admin's order. At least one tier is required, every tier needs at least
+one group, `reveal` is `show` or any non-`hide` mask, and `default` must be a mask that
+actually masks (`show` would make the chain a no-op; `hide` cannot be conditional). Each
+of those is a refusal, not a silent normalization.
+
+`pseudonymize_keyed` compiles to `agnes_hmac(col) AS col` — a hex HMAC-SHA256 of the value
+under this instance's own anonymization key, so the pseudonym still joins across tables here
+but cannot be reversed by dictionary the way `hash`'s unsalted md5 can. Text-only, and
+DuckDB-only: attaching a policy that calls it to a `query_mode='remote'` table is rejected
+with `422 policy_function_duckdb_only`. See
+[`table-access-policies.md`](table-access-policies.md#column-masking) — key rotation is
+deliberately not supported.
+
+`last4` (`****6789`) and `email_partial` (`j*****@example.com`) are **text-only** partial
+masks: same output column name, same `VARCHAR` type, a fixed-width asterisk run (one that
+tracked the value's length would publish that length). Both fail closed at the edges — a
+value of four characters or fewer, or an address with no `@`, is redacted whole rather
+than half-revealed, and `NULL` stays `NULL`. On a non-text column the compile is refused
+(`422 policy_compile_invalid_spec`) rather than silently casting the output to text; use
+`nullify`, `hash` or `hide` there.
 
 ```bash
 curl -s -X POST \
@@ -375,9 +453,12 @@ curl -s -X POST \
 #  "warnings": []}
 ```
 
-`warnings` carries what the compiler had to say about the spec — a column it did not
-recognize and dropped, or a spec that filters and masks nothing at all. A spec it cannot
-understand (an unknown `op` or mask) returns `422 policy_compile_invalid_spec`.
+`warnings` carries what the compiler had to say about the spec — a **mask** on a column it
+did not recognize and dropped, or a spec that filters and masks nothing at all. A spec it
+cannot understand (an unknown `op` or mask) returns `422 policy_compile_invalid_spec`, and
+so does a **row rule** on an unrecognized column: dropping that one is fail-open (the
+policy would lose its `WHERE` clause, or quietly widen beside a surviving rule) where
+dropping a mask is not, so it is refused with the column and operator named.
 
 This endpoint never persists anything — it only returns SQL text. Save it the same way
 as any hand-written policy: `PUT /api/admin/registry/{table_id}` with the returned `sql`
@@ -817,6 +898,7 @@ checks against.
 - /api/admin/registry/{table_id}/docs
 - /api/admin/registry/{table_id}/policy/preview
 - /api/admin/registry/{table_id}/policy/preview-groups
+- /api/admin/registry/{table_id}/policy/preview-matrix
 - /api/admin/registry/{table_id}/policy/columns
 - /api/admin/registry/{table_id}/policy/compile
 - /api/admin/registry/{table_id}/policy/revisions
@@ -924,6 +1006,10 @@ the three guards (no interactive session, no Admin group, PAT-only minting).
 ### `/api/admin/resource-types` — Resource type registry
 
 - /api/admin/resource-types
+
+### `/api/admin/access/resources/{resource_type}/search` — Bounded grantable-resource search
+
+- /api/admin/access/resources/{resource_type}/search
 
 ### `/api/admin/knowledge-digests` — Maintained digests CRUD (admin, K4)
 
@@ -1315,10 +1401,40 @@ forgot it on every reopen. The POST resolves and persists it on the
 connection (`config.manual_sites`, idempotent on the resolved site id), the
 DELETE (`?site_id=`) forgets it again.
 
+`PATCH …/scopes/bulk` (2026-09 fix) flips `access_mode` (manual/mirrored) on
+many of a connection's EXISTING scopes in one call — either
+`source_scope_ids` (a list) or `all: true`. Never all-or-nothing: each
+targeted scope is switched or reported `{"source_scope_id", "reason"}` in
+`failed` independently (`missing_drive_id` when switching to `mirrored` a
+scope with no `drive_id`). Switching mirrored -> manual deletes the ACL
+sync's own sentinel-owned grants for that scope's collection, same as
+`POST …/scopes`'s own `access_mode` transition. CLI:
+`agnes admin sharepoint scope set-mode <id> --all|--scope <source_scope_id> --mode manual|mirrored`.
+
+`PATCH …/acl-site-group-map` (2026-09 fix) replaces a connection's whole
+SharePoint site-group (Owners/Members/Visitors, or custom) -> Agnes-group
+mapping. SharePoint site groups are not enumerable through the app-only
+Graph surface the connector uses, so ACL mirroring classifies them
+`unhonored: site_group` and grants nobody unless mapped here — the mapped
+Agnes group(s) are granted directly, never enumerated against the real
+site group's membership. `400 invalid_group_id` for an unknown target
+group. CLI: `agnes admin sharepoint acl map-site-group <id> --site-group
+"<name>" --group <agnes_group_id> [--unmap]` (read-modify-write against the
+whole map, so mapping a second site group never clobbers the first).
+
 - /api/admin/sharepoint/connections/{connection_id}/tree
 - /api/admin/sharepoint/connections/{connection_id}/tree/search
 - /api/admin/sharepoint/connections/{connection_id}/manual-sites
 - /api/admin/sharepoint/connections/{connection_id}/scopes
+- /api/admin/sharepoint/connections/{connection_id}/scopes/bulk
+- /api/admin/sharepoint/connections/{connection_id}/acl-site-group-map
+- /api/admin/sharepoint/connections/{connection_id}/facts-graph-counts
+- /api/admin/sharepoint/connections/{connection_id}/clone
+- /api/admin/sharepoint/connections/{connection_id}/collections/consolidate
+- /api/admin/sharepoint/connections/{connection_id}/shard-plan
+- /api/admin/sharepoint/connections/{connection_id}/split-plan (deprecated)
+- /api/admin/sharepoint/connections/{connection_id}/splits (deprecated)
+- /api/admin/sharepoint/connections/{connection_id}/splits/merge
 - /api/admin/sharepoint/connections/{connection_id}/certificate
 - /api/admin/sharepoint/connections/{connection_id}/extract
 - /api/admin/sharepoint/extraction/run-due
@@ -1328,9 +1444,11 @@ DELETE (`?site_id=`) forgets it again.
 - /api/admin/sharepoint/subscriptions/run-due
 - /api/admin/sharepoint/anonymization/preview
 - /api/admin/sharepoint/connections/{connection_id}/changes
+- /api/admin/sharepoint/connections/{connection_id}/acl-snapshot
 - /api/admin/sharepoint/connections/{connection_id}/acl-sync
 - /api/admin/sharepoint/connections/{connection_id}/subtree-sweep
 - /api/admin/sharepoint/connections/{connection_id}/facts-extract
+- /api/admin/sharepoint/connections/{connection_id}/facts/reset-no-claims
 
 `GET …/tree` browses the live Microsoft Graph folder tree one level per call
 (no `site_id`/`drive_id` → sites; `site_id` alone → that site's document
@@ -1380,15 +1498,30 @@ search to a site or folder, or narrow the pattern") when `truncated` is
 
 `GET/POST/DELETE …/scopes` manage the wizard's scope rows — each a selected
 site/library/folder, stored as `{source_scope_id, display_path, anonymize,
-access_mode, drive_id, collection_id}` inside the connection's own
-`config.scopes` (no new table). `POST` confirms a scope: creates its
+access_mode, drive_id, collection_id, min_modified}` inside the connection's
+own `config.scopes` (no new table). `POST` confirms a scope: creates its
 collection on first confirmation and reuses the same collection on every
 re-confirmation of the same `source_scope_id` (idempotent — a rename/move in
 the source updates `display_path` in place rather than forking a second
 collection), and optionally applies group grants (ordinary `resource_grants`
 rows on the collection — never duplicated onto the scope row itself). The
 response's `no_group_warning` flags a collection with no granted group
-("indexed but invisible"). `DELETE` (`?source_scope_id=`) unselects a scope —
+("indexed but invisible").
+
+`min_modified` (TCRD-296 gap #80) is this scope's OWN "modified since" crawl
+filter — an ISO `YYYY-MM-DD` date, or `null` (the default, "not omitted
+means unchanged" like `access_mode`/`anonymize`/`include_excluded_subtrees`:
+a re-confirm that leaves it out CLEARS a previously-set override) to inherit
+`extraction.crawl.min_modified`, the connection-wide default set via `PATCH
+…/extraction/crawl-config` below. `400 invalid_min_modified` for anything
+that is not a parseable ISO date. Every scope row in a `GET`/`POST` response
+projects it as `{value, source, own_value}` — `value`/`source` are the
+EFFECTIVE, resolved filter this scope's next crawl would apply (`source` one
+of `"scope"`, `"connection"`, `"none"`), `own_value` is this scope's raw
+stored override (`null` when it has none). `POST …/scopes/bulk`'s own
+`min_modified`, when given, is stored as a BULK DEFAULT on every scope that
+call creates (one value for the whole batch, not a per-path choice — same
+validation). `DELETE` (`?source_scope_id=`) unselects a scope —
 an explicit exclusion — without touching its already-created collection, but
 DOES delete any `sharepoint-acl-sync`-owned (sentinel-assigned) grants on
 that collection (2026-08-31 plan, Task 8) — with the scope row gone, the
@@ -1412,6 +1545,292 @@ probing and `rel_path`). `include_excluded_subtrees: true` on `POST` asks to
 must_not_forbids_subtree_override` under the `must_not` guarantee mode
 (`acl_sync.guarantee_mode`, default), accepted and audited
 (`sharepoint_acl.subtree_override`) under `should_not`.
+
+`POST …/scopes/bulk` — CLI: `agnes admin sharepoint scope bulk-add
+<connection_id>` — confirms many admin-typed folder paths as scopes in one
+call: the fast path for splitting one large SharePoint site across several
+connections, each with its own crawl and facts jobs, so they run in
+parallel. Body `{"paths": [...], "drive_id"?}`; each path is resolved to a
+Graph drive item (`/drives/{drive_id}/root:/{path}`) and written as a scope
+with the same defaults a single manual confirm gets
+(`access_mode="manual"`, `include_excluded_subtrees=false` — #2032's
+round-trip contract). `drive_id` is required unless the connection already
+has a scope with one set (reused from the first match) — `400
+drive_id_required` otherwise. Never all-or-nothing: the response reports
+every path independently, `{"created": [...], "skipped": [...], "failed":
+[{"path", "reason"}]}` — `created` entries are `{"path", ...scope}`
+(the same projection `GET …/scopes` returns); `skipped` is a path whose
+resolved `source_scope_id` is already a scope on this connection
+(`{"path", "source_scope_id", "reason": "already_present"}`); `failed` is a
+Graph 404/403 on that one path (`{"path", "reason": "not_found"|
+"forbidden"}`). Any OTHER Graph failure (401/429/5xx, a network fault)
+aborts the remaining unprocessed paths with a typed `502
+sharepoint_graph_error` — whatever was already created before that point
+stays persisted. Optional `collection_id` (an existing, live collection) or
+`collection: {"name"}` (mint one new) routes every scope THIS call creates
+to ONE shared target instead of minting one per path — mutually exclusive
+(`400 both_collection_id_and_collection`); an unknown `collection_id` is
+`404 collection_not_found`.
+
+`GET …/facts-graph-counts` — perf follow-up (2026-09-03): the source card's
+"Facts → graph" pipeline-strip cell, fetched by the card ONCE it has painted
+rather than computed for every SharePoint connection during
+`/admin/data-sources`'s own render. Production incident, same day: the
+first cut of this endpoint called `facts_repo().count_visible_facts_for_
+collections`/`count_visible_edges_for_collections` — correct, per-caller
+visibility CTEs that are deliberately one query PER confirmed scope — which
+on a live ~390-collection instance cost 250-316s for a single connection's
+worth of scopes and starved the shared Postgres connection pool for
+minutes. The endpoint now calls `facts_repo().approximate_counts_for_
+collections` instead — one flat, indexed `GROUP BY corpus_id` statement
+over `claims` for the whole connection at once, capped at a 5s
+`statement_timeout`. Returns `{"facts": int, "edges": int, "graph_counts_
+kind": "approximate"}` summed across this connection's own confirmed
+scopes; the `"approximate"` label names the tradeoff — the number is not
+correction-aware (a `wrong`/`restricted` correction, which withholds a
+fact/edge for every caller, is not excluded) — since the endpoint is
+`require_admin`-gated, the RBAC narrowing the old CTE also did is a no-op
+for every real caller anyway. `{"facts": 0, "edges": 0, "graph_counts_
+kind": "approximate"}` with no scopes. `404` for a non-SharePoint or
+missing connection id; typed `501` on a DuckDB-backed instance (the fact
+graph is PG-only, A3 ratchet). Admin display primitive, no analyst
+CLI/MCP analogue.
+
+`POST …/clone` — CLI: `agnes admin sharepoint connection clone
+<connection_id>` — the other half of the split-a-large-site workflow: body
+`{"name"}` creates a sibling `source_type=sharepoint` connection wired to
+the SAME credential material (`tenant_id`, `client_id`, `auth_method`,
+`cert_private_key_env`/`client_secret_env` config REFERENCES) with zero
+scopes and no extraction-dispatch history, so no scheduled crawl/ACL-sync/
+subtree-sweep/facts-extraction sweep touches it until an admin confirms
+scopes on it (e.g. via `POST …/scopes/bulk` above). Every OTHER config key
+carries over, notably `manual_sites` — under `Sites.Selected` (`/sites`
+enumeration 403-forbidden) a bookmarked site is how the clone can resolve
+the site AT ALL, so leaving it behind would leave the clone unable to
+browse the very site it exists to split. When the source's certificate
+lives in a deployment env var, the clone resolves the identical value with
+no further action; when it was instead uploaded to the source's own vault
+slot, that row's ciphertext is duplicated verbatim under the clone's id
+(never decrypted/re-encrypted) so the clone is immediately ready to
+crawl — no re-upload. `409 connection_name_exists` if `name` is taken (same
+rule as `POST /api/admin/source-connections`). Returns `{"id", "name",
+"secret_copied"}` — `secret_copied` is `true` iff a vault row existed to
+copy (`false` just means the source's credential comes from an env var,
+which the clone already resolves on its own).
+
+`POST …/collections/consolidate` — CLI: `agnes admin sharepoint collections
+consolidate <connection_id>`; UI: the source card's overflow menu
+("Consolidate collections…", an inline drawer row) — the after-the-fact fix
+for a site that ALREADY ended up split across many per-scope collections (a
+large split predating the shared-collection default below, or several
+bulk-add calls without it). Body `{"target_collection_id"|"target":
+{"name"}, "dry_run"?, "include_split_siblings"?}` — exactly one of
+`target_collection_id` (an existing, live collection — not necessarily one
+of this connection's own) or `target` (mint a new one) is required (`400
+target_required` / `400 both_target_collection_id_and_target`); an unknown
+`target_collection_id` is `404 collection_not_found`; no OTHER scope
+collection on this connection (or its family, with
+`include_split_siblings`) is `400 nothing_to_consolidate`. `dry_run`
+defaults to `true` — a pure preview (`{"dry_run", "target", "sources":
+[{"id", "name", "slug", "file_count"}], "blocking", "connection_ids",
+"running"}`; a NAMED `target` is not minted during a preview, so `target.id`
+is `null` there) that touches nothing. Set `dry_run: false` to perform the
+real merge: every row carrying a `corpus_id` for a source collection
+(`corpus_files`, `corpus_chunks`, `corpus_file_sources`,
+`corpus_file_events`, `claims`, `fact_alias_sources`) is re-pointed to the
+target in ONE transaction, every scope (across the whole fold) that routed
+to a source now routes to the target, the sources' `resource_grants` are
+unioned onto the target (ties go to the target's own pre-existing grant),
+and the emptied sources are soft-deleted. Refused with `409
+collection_referenced_by_other_connection` (nothing touched) when a source
+is still routed to by a connection OUTSIDE the fold, and `409
+consolidation_conflict` (nothing touched) when the merge would collide on a
+duplicate `corpus_files.path` or `corpus_file_sources.source_stable_id`
+across the collections being folded. PG-only (A3 ratchet) — `501
+requires_postgres_backend` on a DuckDB-backed instance. ACL-mirroring
+permission zones (`config.acl_zones`) are NOT touched — only scope-level
+collections.
+
+`include_split_siblings: true` (CLI `--site`) widens the fold from THIS
+connection alone to its whole site-split family — every OTHER connection
+`POST …/splits` created together with it (sharing its `config.split
+.parent_connection_id`), plus the connection it split FROM — folded into
+ONE target in ONE call instead of N repeats with the same target
+(`connection_ids` in the response lists the whole family). A sibling's own
+scope routing to a source is never "foreign" (that guard is only for a
+connection genuinely OUTSIDE the fold). Refused with `409
+sibling_crawl_running` (nothing touched, checked before the real merge —
+`running` in the preview response reports it ahead of time) when a family
+member currently has a `corpus-extraction` job queued/running.
+
+`GET …/shard-plan` (2026-09-03 auto-parallel-crawl design §4.7) — CLI:
+`agnes admin sharepoint shard-plan <connection_id> [--min-modified
+YYYY-MM-DD] [--json]` — read-only preview of the AUTOMATIC parallel crawl
+`POST …/extract` runs on its own for a large site: no `n` to choose, no
+connections created — one connection, one site, planned into shards behind
+the scenes on trigger. Response: `{mode: "inline"|"sharded", target_docs,
+signal: "search"|"child_count"|"none", shards: [{drive_id, index, label,
+expected, targets_count}], loose_root_files}`. `mode == "inline"` (`shards`
+empty) exactly when the site would stay a single ordinary crawl: the active
+backend is DuckDB (this feature is PG-only, A3 ratchet),
+`extraction.crawler.shard_target_docs` is `0`, there is no confirmed scope
+to plan against, or the site's summed document count stays at or under the
+target. `expected` is a live Graph Search count per shard — `≈`, never
+exact (index lag). `min_modified` narrows every count to that date or later
+for THIS preview call only; omitted, the plan resolves the connection's own
+configured `extraction.crawl.min_modified` uniformly across every scope in
+the plan — a scope with its OWN filter (TCRD-296 gap #80) is not yet
+reflected in this estimate, only in what its actual crawl applies (see
+`docs/sharepoint-extraction.md`'s completeness "known gap" note for the
+same caveat on `…/extraction/completeness`). `409 sharepoint_cert_unresolved` /
+`502 sharepoint_graph_error` on a credential/Graph failure — unlike
+`split-plan` below, a shard-plan failure is surfaced rather than silently
+degrading to a small-looking site. See `docs/sharepoint-extraction.md` for
+the full per-site semantics (`resync`, `retry_failed`, `shards: [i]`, …).
+
+**Deprecated** — `GET …/split-plan` / `POST …/splits` (superseded by the
+automatic behavior above; kept as a migration-window escape hatch, slated
+for removal after one release — `POST …/splits` answers with a
+`Deprecation: true` response header). `split-plan`'s response gains one
+ADDITIVE field, `mode` — the SAME `"inline"|"sharded"` verdict `shard-plan`
+would give this connection right now (an informational hint; `null` if it
+could not be computed, which never fails the manual preview below). CLI:
+`agnes admin sharepoint
+split-plan <connection_id> --n <n>` / `agnes admin sharepoint split
+<connection_id> --n <n>` — the MANUAL, admin-chosen-`n` version of the
+`clone` +
+`scopes/bulk` recipe above: greedy-packs (longest-processing-time-first) the
+drive root's top-level folders into `n` groups of roughly equal document
+count, using a live per-folder Graph Search count (`POST /search/query`,
+`entityTypes: ["driveItem"]`, `path:"<folder web url>" AND IsDocument:1`,
+optionally `AND LastModifiedTime>=<min_modified>`) — never a delta walk,
+which throttles under repetition and biases its own first pages. A folder
+whose count could not be read is still packed into a group at `documents:
+0`, never dropped from the plan.
+
+**Collection routing (both endpoints, same options and validation)**:
+every part's scopes route to ONE shared collection by DEFAULT — this
+connection's own, when it has exactly one confirmed scope carrying a
+`collection_id` (the common "one root scope, not yet split" shape),
+otherwise a new collection minted named after the source connection — using
+the SAME "assign the precomputed `collection_id` directly" mechanism
+`scopes/bulk`'s own `collection_id` option already uses, never a second one.
+`target_collection_id`/`target: {"name"}` (query params on `split-plan`:
+`target_collection_id`/`target_name`) name an explicit shared target
+instead — mutually exclusive with each other (`400
+both_target_collection_id_and_target`) and with `per_folder_collections`
+(`400 per_folder_collections_and_target`); an unknown/soft-deleted
+`target_collection_id` is `404 collection_not_found`.
+`per_folder_collections: true` restores the OLD default: every folder
+mints its own collection (`agnes admin sharepoint scope bulk-add`'s
+un-shared shape), forking the site across as many collections as there are
+folders. Every part created by `POST …/splits` also records
+`config.split = {parent_connection_id, part, n, created_at}` — the lineage
+`POST …/collections/consolidate {include_split_siblings: true}` reads to
+find every part of the split without guessing off name patterns; carried
+forward across an ordinary connection edit the same way every other
+server-written SharePoint config key is
+(`connectors.sharepoint.site_split.SPLIT_SERVER_WRITTEN_CONFIG_KEYS`).
+
+`GET …/split-plan?n=<n>[&min_modified=YYYY-MM-DD][&drive_id=<id>]
+[&target_collection_id=<id>|&target_name=<name>][&per_folder_collections=true]`
+is read-only — no state written, no collection minted even for a named
+target (the response's `collection.id` is `null` for a not-yet-minted one).
+`drive_id` is optional, same inference as `scopes/bulk` (reused from the
+connection's first existing scope; `400 drive_id_required` if neither is
+available). Response: `{drive_id, folders: [{name, documents}],
+loose_root_files: [names], groups: [{name, folders: [{name, documents}],
+documents}], total_documents, collection}` — `loose_root_files` lists
+drive-root items that are FILES, not folders, so a folder-based split can
+never cover them; `groups[].name` (`"<source name> — part i/n"`) is the
+exact name `POST …/splits` will give the corresponding clone; `collection`
+is `{id, name, slug}` (the shared target this split would use — `id`/`slug`
+`null` if not minted yet) or `null` only when `per_folder_collections=true`.
+
+`POST …/splits` body `{"n", "min_modified"?, "transport"?: "sync"|"batch",
+"retry_mode"?, "start"?: bool, "target_collection_id"?, "target"?: {"name"},
+"per_folder_collections"?: bool}` creates all `n` clones AND their scopes in
+one call (the same `clone` + `scopes/bulk` primitives above, run
+automatically): `409 split_exists` if connections named like this split
+already exist, checked BEFORE creating anything — a repeat call never
+double-creates. `min_modified`, when given, is written onto EACH clone's
+`config.extraction.crawl.min_modified` — the same key the built-in crawl
+reads (`resolve_min_modified`) and `PATCH …/extraction/crawl-config`
+writes; `transport`/`retry_mode` land on each clone's
+`config.extraction.facts`, the same keys `PATCH …/extraction
+/facts-config` writes. `start: true` enqueues each clone's
+`corpus-extraction` job immediately after creating it, in creation order —
+skipped silently, never a failed apply, when extraction readiness
+(`sharepoint.enabled` / the `extraction` extra) is not currently satisfied.
+Returns `{"connections": [{id, name, folders: [{name, documents}],
+documents}], "collection"}`, one connection entry per created clone plus the
+resolved/minted shared target (`null` only for `per_folder_collections`).
+
+`POST …/splits/merge` — CLI: `agnes admin sharepoint split-merge
+<target_id> --sibling <id>... | --all-siblings --target-collection-id <id>
+| --target-name <name> [--execute]`; UI: the source card's overflow menu
+("Merge split parts back into this source…") — the REVERSE of `splits`
+above: folds several sibling SharePoint connections (a large site manually
+split across them, each with its own folder scopes) back into ONE, carrying
+over every sibling's crawl/facts progress so the merged connection resumes
+INCREMENTALLY instead of re-downloading the site. Body
+`{"sibling_ids"|"all_split_siblings", "target": {"collection_id"|"name"},
+"dry_run"?}` — exactly one of `sibling_ids` (explicit connection ids) or
+`all_split_siblings` (every OTHER connection named like this one's own
+split family, `"<base> — part i/n"`, the same convention `POST …/splits`
+establishes) is required, and exactly one of `target.collection_id`/
+`target.name`. `dry_run` defaults to `true`.
+
+Refused BEFORE anything is touched: `404 connection_not_found` (target or
+an explicit sibling); `400 sibling_ids_includes_target` /
+`400 duplicate_sibling_ids`; `409 target_already_merged` /
+`409 sibling_already_merged` (a `config.merged_into` marker from an earlier
+merge); `409 crawl_or_facts_running` (any involved connection has a
+queued/running `corpus-extraction`/`sharepoint-facts-extraction` job);
+`409 acl_zones_present` (a sibling or the target carries `config.acl_zones`
+— permission-zone reconciliation is its own surface and is not folded
+here); `409 audience_class_conflict` (a sibling's `access_mode='mirrored'`
+scopes use a different audience-class vocabulary than the target's own —
+fail closed rather than silently mis-mirror); `409
+collection_referenced_by_other_connection` / `409 consolidation_conflict`
+(the collection fold itself, via the SAME repository `POST …/collections
+/consolidate` uses).
+
+`dry_run: false` performs the real merge, per-step idempotent so a retried
+call after a partial failure converges: folds every involved scope
+collection into the target collection (delegated wholesale to
+`SharePointCollectionConsolidationPgRepository.consolidate` — not
+reimplemented); unions every sibling's crawl/facts state
+(`sharepoint_connection_state`: `delta_links`/`ctags`/`failed_items`/
+`empty_items` for `kind='crawl'`, `docs` for `kind='facts'`) onto the
+target's own — disjoint keys are simply carried over, a genuine collision
+keeps the target's own `delta_links`/`ctags` entry (no per-entry freshness
+signal exists for either) or the newer entry by timestamp for
+`failed_items`/`empty_items`/`docs` (`status='done'` beats any other status
+regardless of timestamp for `docs`); re-points every sibling's
+`extraction_runs` history onto the target, marking each moved run's
+`progress.merged_from`; writes the merged, deduped (by `(source_scope_id,
+drive_id)`) scope list onto the target; marks every sibling
+`config.merged_into` with its scopes cleared — siblings are NEVER deleted,
+only marked merged-away, and their `connection_secrets` vault rows (if any)
+are left completely untouched (an admin who wants to fully remove one can
+still use the generic `DELETE /api/admin/source-connections/{id}`).
+PG-only (A3 ratchet) — `501 requires_postgres_backend` on a DuckDB-backed
+instance.
+
+`GET …/acl-snapshot` (TCRD-296 gap #79) reads the SharePoint permissions
+snapshot the `sharepoint-acl-sync` job captures for EVERY scope, regardless
+of `access_mode` — who SharePoint itself says can see each scope, purely
+informational (only a `mirrored` scope also derives real Agnes access from
+the same read). Always returns `{aggregate: {entra_groups, site_groups,
+folders_with_org_links, folders_with_individual_users, scopes_captured,
+captured_at}}`; `?scopes=true` additionally returns `scopes: [{source_
+scope_id, display_path, captured_at, principals: [{principal_kind,
+principal_id, display_name, roles, via}], summary}]`. CLI: `agnes admin
+sharepoint acl-snapshot <id> [--scopes] [--json]`. PG-only (A3 ratchet —
+`sharepoint_connection_state`) — `501 requires_postgres_backend` on a
+DuckDB-backed instance; see [`sharepoint-extraction.md`](sharepoint-
+extraction.md) → "SharePoint permissions as metadata vs. mirrored access".
 
 `POST …/acl-sync` is the admin "sync now" trigger for the
 `sharepoint-acl-sync` job (spec §5.1) — enqueues
@@ -1453,6 +1872,37 @@ CLI: `agnes admin sharepoint facts-extract <connection_id>`; UI: the source
 card's **Extract facts now** button (next to **Run extraction now**), which
 renders disabled with that same reason while either switch is off.
 
+**Facts ledger reset-no-claims (TCRD-296 gap #62).** `POST
+…/facts/reset-no-claims` is the recovery surface for a facts-ledger entry a
+PRE-fix pass wrote as `status: "done"` with facts extracted (`nodes > 0`)
+that never landed a single claim in the fact graph — an ingest refusal, or a
+rejected/deferred citation, that happened AFTER the ledger's optimistic
+write. Left alone, the ledger's own `is_up_to_date` check treats `"done"` as
+current forever, so the document is invisible to every later pass — a live
+sweep found roughly 6 400 such documents. A fresh pass now corrects its own
+ledger entries as it runs; this endpoint is the one-time fix for entries an
+older pass already wrote. Every candidate is checked against the REAL claims
+table (the ledger itself never recorded a claim count) and sorted into three
+outcomes: already has a claim (left untouched); a TCRD-241 duplicate copy
+whose SIBLING (same `corpus_id` + `source_doc_id`) carries the claim
+(backfilled with `claims_on_file_id` on the entry, never reset — it already
+has a graph presence via its winner copy); or genuinely missing (the ledger
+entry is removed so the next pass re-derives and re-extracts it — cache-served
+after the evidence doc_id-normalization fix above, so this costs no
+additional model call once the original extraction already produced a usable
+reply). Optional JSON body `{"dry_run": false}` (the default) — `true`
+computes and returns the same counts without writing anything. Response:
+`{dry_run, candidates, reset: [file_id, ...], duplicates_recorded: {file_id:
+winner_file_id, ...}, already_had_claims, unmapped: [file_id, ...]}`. `404`
+on an unknown/non-SharePoint connection; `409 facts_extraction_running` when
+a facts-extraction pass — chained or standalone — currently holds this
+connection's per-connection facts-pass lock (that pass upserts the whole
+ledger payload on its own schedule). CLI: `agnes admin sharepoint facts reset
+--no-claims <connection_id> [--dry-run]`. Deliberately NOT MCP-exposed, same
+reasoning as `extract`/`facts-extract`/`retry-empty` above — it mutates
+per-document extraction state and can trigger a re-extraction spend on the
+next pass, an operator decision no analyst query needs.
+
 The exclusion
 handoff (`AGNES_SP_EXCLUDED_SUBTREE_IDS`, carried by the `corpus-extraction`
 job) may also contain unique-permission FILE item ids, riding the same
@@ -1485,7 +1935,35 @@ unknown/non-sharepoint connection before any other work; refuses cleanly
 `409 extraction_dependencies_missing` (the `extraction` optional dependency
 extra is not installed); a run already queued/running for the same
 connection is `409 extraction_already_running` — deduped on a stable
-per-connection idempotency key shared with the sweep below.
+per-connection idempotency key shared with the sweep below. When the body
+sets `retry_failed: true` (TCRD-296 synthesis — the source card's "Retry
+failed (N)" button and `agnes admin sharepoint extract --retry-failed`),
+the response also carries `queued_count` — the size of this connection's
+persisted `failed_items` backlog at the moment this call reads it, before
+the job is enqueued, mirroring `…/extraction/retry-empty`'s own
+`queued_count` below. Absent for a plain trigger, `--resync`, or
+`--force-reprocess`.
+
+`POST …/extraction/retry-empty` re-queues this connection's `convert_empty`
+backlog — documents that converted fine but carried no text (a scan with no
+text layer, most commonly). Graph's delta feed never re-offers an unchanged
+item, so an ordinary crawl would otherwise never revisit one of these even
+after `extraction.scan_ocr.enabled` (and its `triage` block, see
+[`sharepoint-extraction.md`](sharepoint-extraction.md) § 6) turns on and
+becomes able to read it. Enqueues the SAME `corpus-extraction` job `POST
+…/extract` does, with `{"retry_empty": true}` added, which replays the
+backlog BEFORE the run's ordinary incremental delta walk. Returns `202
+{"job_id", "status", "queued_count"}` — `queued_count` is read from the
+connection's persisted crawl state before the job is enqueued, so an admin
+learns how much work this triggered without waiting for the run to finish;
+`0` is a normal, successful answer, not an error. Same 404/409 preconditions
+as `POST …/extract`, and the SAME per-connection idempotency key — a
+retry-empty run can never overlap an ordinary trigger (or another
+retry-empty run) for the same connection, since both mutate the same crawl
+state. CLI: `agnes admin sharepoint retry-empty <connection_id>`. Deliberately
+NOT MCP-exposed, same reasoning as `extract`/`facts-extract` — an
+agent-invokable trigger for a re-conversion pass over an entire corpus is a
+cost surface no analyst query needs.
 
 `POST /api/admin/sharepoint/anonymization/preview` is the config drawer's
 dry-run: an admin pastes a sample (≤50 000 chars) and gets back what the
@@ -1625,21 +2103,36 @@ analogue — Graph is the only caller.
 Mostly read-only surface (`app/api/admin_extraction.py`) behind the SharePoint
 source card's live crawl cell, its run-history drawer and its configuration
 drawer — plus one write, the cooperative stop below. No new page and no new
-nav entry — the card is the only client.
+nav entry for the per-connection routes below — the card is the only client.
+The fleet endpoint two paragraphs down (`.../extraction/runs` with no
+`{connection_id}`) is the one exception: it backs its own page,
+`/admin/extraction`.
 
 - /api/admin/sharepoint/connections/{connection_id}/extraction/status
 - /api/admin/sharepoint/connections/{connection_id}/extraction/runs
 - /api/admin/sharepoint/connections/{connection_id}/extraction/runs/{run_id}
 - /api/admin/sharepoint/connections/{connection_id}/extraction/config
 - /api/admin/sharepoint/connections/{connection_id}/extraction/stop
+- /api/admin/sharepoint/connections/{connection_id}/extraction/facts-config
+- /api/admin/sharepoint/connections/{connection_id}/extraction/crawl-config
+- /api/admin/sharepoint/connections/{connection_id}/extraction/retry-empty
+- /api/admin/sharepoint/connections/{connection_id}/extraction/completeness
+- /api/admin/sharepoint/extraction/runs/{run_id}/cancel
 
 `GET …/extraction/status` returns the live run (if any) and the last completed
 one. Liveness is **derived, never trusted**: a worker killed outright finalizes
-nothing, so a run whose last checkpoint is older than 30 minutes comes back as
-`outcome: "stalled"` with its `stale_s`, and a run whose `jobs` row already
-ended comes back as `failed` — the stored `running` is reported separately as
-`stored_status`, so the two can never be confused. Counters are **absolute**
-(files processed, new/changed/unchanged, bytes, elapsed, 429 count and wait):
+nothing, so a run whose last checkpoint is older than `extraction.stall_after_s`
+(default 900s/15min, admin-editable — `/admin/server-config` → Extraction →
+Stall threshold, same knob the fleet endpoint's own `stuck` flag reads below)
+comes back as `outcome: "stalled"` with its `stale_s`, and a run whose `jobs`
+row already ended comes back as `failed` — the stored `running` is reported
+separately as `stored_status`, so the two can never be confused. A `stalled`
+run can be force-cancelled — see `POST …/extraction/runs/{run_id}/cancel`
+below. Counters are **absolute**
+(files processed, new/changed/unchanged/renamed, bytes, elapsed, 429 count and
+wait; `renamed` — D.18 — is the subset of what would otherwise be
+`unchanged` whose content matched but whose name/path moved, updated in
+place with no re-download):
 there is no fraction, no progress bar and no ETA, because the crawl enumerates
 and processes in lockstep per delta page and `files_per_s` counts only
 new+changed documents. `can_stop` is `true` — a running (or `stalled`) run
@@ -1658,7 +2151,21 @@ queued/running standalone facts pass for this connection
 read off the job queue (matched on the same idempotency key the trigger
 dedups on) and never appears in `running`/`last_completed`. The card shows
 it as a "facts pass queued/running" line in the Run row and locks its own
-"Extract facts now" button while one is in flight.
+"Extract facts now" button while one is in flight. `failed_items_count` /
+`empty_items_count` (TCRD-296 synthesis) are the SIZE of this connection's
+persisted `failed_items`/`empty_items` backlogs (a cheap `jsonb_object_keys`
+count, never a decode of the — potentially huge — payload on this
+polled-every-few-seconds path) — what the Run row's "Retry failed (N)" /
+"Retry empty (N)" buttons show as `N`, `0` (never `null`) for a connection
+that has never crawled. `skipped_unsupported_count` has no persisted
+backlog to count (no retry mechanism replays it — see `CrawlStats.
+skipped_unsupported`'s docstring), so it is read off whichever of
+`running`/`last_failed`/`last_completed` above is most recent, and `null`
+when none of the three exist. `next_run_at` (D.16) is the same best-effort
+"when will this connection's own crawl cadence next fire the sweep" hint
+`…/extraction/crawl-config`'s PATCH response and the fleet endpoint carry —
+`null` for an `off` connection or whenever the instance-wide sweep has no
+cadence configured at all.
 
 `GET …/extraction/runs` (`?limit=`, ≤100) lists runs newest-first with a
 `total` covering every recorded run; `GET …/extraction/runs/{run_id}` adds the
@@ -1680,7 +2187,20 @@ environment overrides. The whole `extraction` section stays out of
 section name and then deep-merges, so one editable key would make the section
 that holds a producer command line admin-writable. This endpoint reads no run
 rows and therefore answers on both backends. Audited as
-`sharepoint_connection.extraction_config_read`.
+`sharepoint_connection.extraction_config_read`. Two rows — "Facts provider"
+and "Facts transport" — show the CONNECTION-RESOLVED value
+(`resolve_effective_provider`/`resolve_transport`), not just the instance-wide
+setting: an operator debugging why a pass spent against one provider instead
+of another needs the resolved answer for THIS connection. The response also
+carries `min_modified: {value, source}` and, since D.16, `schedule: {value,
+source, next_run_at}` — the SAME resolved shapes `…/extraction/
+crawl-config`'s own PATCH response returns. The card's own "Crawl schedule &
+filter" control (a cadence select plus a date input, next to "Facts
+policy") reads its PRE-FILL straight off the connection row it already has
+rather than calling this endpoint (there is no instance-level default
+`min_modified` could resolve against, and a stored `schedule` string reads
+back identically), but polls `…/extraction/status` for the live
+`next_run_at` hint — see the PATCH entry below for both fields' contracts.
 
 `POST …/extraction/stop` sets `config.extraction.stop_requested_at` on the
 connection row (`connectors.sharepoint.crawler.request_stop`) — the same JSON
@@ -1701,7 +2221,241 @@ tell no run is currently active. `404` for an unknown or non-SharePoint
 connection. Audited as `extraction.stop_requested` (emitted by the fallback
 middleware — the handler writes no row of its own).
 
-Admin-only display primitives with no analyst CLI/MCP analogue.
+`GET /api/admin/sharepoint/extraction/runs` (no `{connection_id}` — one row
+per SharePoint CONNECTION, not one route per connection) is the extraction
+FLEET dashboard's own endpoint, behind `/admin/extraction`: an operator
+running several connections' crawl + facts passes at once needs one screen
+that answers "is it on pace, is anything stuck, what is it costing" rather
+than opening N source cards. Default scope (and `?active=1`) is connections
+with a run CURRENTLY `running`; `?all=1` broadens to every SharePoint
+connection, idle ones included, each with its own latest run or `null`.
+Every row reuses the SAME per-run projection the routes above render, plus
+two fleet-only fields: `files_per_min` (derived from consecutive checkpoints
+this endpoint itself has observed across repeated polls — the table is
+stored, never a history, so there is nothing to read back) and `stuck`
+(`true` exactly when that same row's `run.outcome` is `"stalled"` — ONE rule,
+read twice, so the fleet's "Stuck?" badge and the per-run outcome word can
+never disagree; before 2026-09-03 this was its own, independent, tighter
+threshold). `facts` carries the facts stage's own counters, read off the SAME
+run row (crawl and facts are literally one row; `phase` flips from `"crawl"`
+to `"facts"` mid-run). Each row also carries `failed_items_count`/
+`empty_items_count` (TCRD-296 synthesis) — the SAME persisted-backlog counts
+`…/extraction/status` returns, one cheap query per row, backing the table's
+own "Retry failed (N)"/"Retry empty (N)" buttons so an operator does not
+need to open a source card just to see whether there is anything to retry.
+Each row also carries `next_run_at` (D.16) — the same best-effort "next
+sweep" hint the crawl-config PATCH response and `…/extraction/status`
+carry, pure computation, no extra query per row.
+
+The response also carries a top-level `jobs` block — `{kind: {queued,
+running}}` for `corpus-extraction` and `sharepoint-facts-extraction`, read
+in one grouped query off the jobs table independent of `active`/`all` scope
+— the queued-vs-running lane-starvation strip above the table: a starved
+job (queued, never yet claimed) has no `extraction_runs` row and so no
+table row of its own to show it otherwise. CLI: `agnes admin sharepoint
+runs [--all] [--json] [--watch]` (`--watch` refreshes every 10s; the
+human-readable table also prints a `Jobs — …` line for the same `jobs`
+block, flagging a starved lane).
+
+`POST /api/admin/sharepoint/extraction/runs/{run_id}/cancel` (no
+`{connection_id}` — a run id is enough) force-closes a run the cooperative
+Stop above cannot reach: a crawl loop that is genuinely stuck (never yielding,
+never reaching a checkpoint) never observes `stop_requested_at` either, so it
+stays `running` with an ever-extending lease until someone intervenes by
+hand. Cancel = stop + force-close, reusing rather than duplicating the
+cooperative path: it (1) sets the SAME `stop_requested_at` flag `…/extraction
+/stop` does — a merely slow (not truly stuck) run still exits cleanly at its
+next checkpoint; (2) force-finalizes the owning job to `failed`
+(`error: "cancelled_by_admin"`) with no lease token needed (an admin never
+claimed the job) — clearing the lease is what stops the worker's heartbeat
+loop on its own, the next `heartbeat()` call re-checks `status = 'running'`,
+finds it false, and stops extending, no separate worker-side mechanism
+required; (3) closes the `extraction_runs` row immediately as `interrupted`
+with `interrupted_reason: "cancelled"` — never waiting on the crawl to
+notice. A zombie handler thread may keep running a while longer (Python
+cannot force-kill a thread), but its eventual `complete()`/`fail()` call
+carries the now-stale lease token and is a guaranteed no-op, so it can never
+resurrect the state this call just wrote. Returns `{connection_id, ...}` —
+the rest is the run's new projection, same shape as every other run read in
+this module, so the caller repaints without a second fetch. `404
+run_not_found` for an unknown run id; `409 run_not_active` when the run's
+stored status is not `running` (already finished, or already cancelled).
+Audited as `sharepoint_extraction_run.cancel` — the handler writes its own
+row (the connection id, the job id, whether a job was actually
+force-finalized). CLI: `agnes admin sharepoint runs cancel <run_id> [--json]`.
+Web: a "Cancel run" button on `/admin/extraction`'s fleet table for every
+`running`/`stalled` row, and on the SharePoint source card's Run row once a
+run reads `stalled` (a merely `running` one offers Stop first) — both behind
+a confirm dialog.
+
+`PATCH …/extraction/facts-config` (cost-levers task, lever A) sets or clears
+per-connection overrides for the corrective-retry policy, transport and LLM
+provider — `config.extraction.facts.{retry_mode,transport,provider}`, siblings
+of `config.extraction.stop_requested_at` above on the same JSON column. A
+single high-value connection can keep the retry ON (a dropped quote there is
+a lost citation on stage) while a long-tail connection runs with it OFF,
+without an `instance.yaml` edit that would flip every connection at once;
+`provider` is the same lever for the incident it was added for — a connection
+whose Anthropic key hit its workspace usage cap can be pinned to `vertex`
+without waiting for the instance-wide `ai.provider` to change. Body:
+`{"retry_mode": "off" | "on_gate_fail" | "always" | null, "transport": "sync"
+| "batch" | null, "provider": "inherit" | "anthropic" | "vertex" | null}`.
+`retry_mode` is always touched (omitted behaves like `null`); `transport` and
+`provider` are touched ONLY when present in the body — so a retry-mode-only
+call can never silently move a connection off the Batches API or off (or
+onto) Vertex. `null` (or the field omitted, for `transport`/`provider`) clears
+the override and falls back to the instance-level default. Returns
+`{connection_id, retry_mode: {value, source}, transport: {value, source},
+provider: {value, source, effective, effective_source}}` — `source` is
+`"connection"` or `"instance"`; `provider.value` can be `"inherit"` itself
+(the RAW setting), while `provider.effective` is ALWAYS a concrete
+`"anthropic"`/`"vertex"` (the provider a pass actually builds a client from —
+see `connectors.sharepoint.facts_extraction.resolve_effective_provider`), with
+`effective_source` carrying an `:inherit` suffix when it resolved through
+`ai.provider` rather than an explicit setting. `422` for a value outside the
+three enums above; `404` for an unknown or non-SharePoint connection. Works on
+both app-state backends, same as `…/extraction/stop`. Audited as
+`extraction.facts_retry_mode_set` — the handler writes its own row (more than
+the fallback middleware could say: the requested values, their resolved
+values and sources). CLI: `agnes admin sharepoint facts-config <connection_id>
+--retry-mode <mode>` / `--clear` / `--transport <sync|batch>` /
+`--clear-transport` / `--provider <inherit|anthropic|vertex>` /
+`--clear-provider`. The Anthropic Batches API has no Vertex equivalent: a
+pass resolved to `provider: vertex` always runs the `sync` transport
+regardless of its own `transport` setting — one warning log line, never an
+error — and the run report (`…/extraction/runs/{run_id}`) names the ACTUAL
+`provider`/`transport` a pass used, which can differ from what was
+configured. All three overrides are also settable from the SharePoint source
+card on `/admin/data-sources`, for an admin with no server or CLI access.
+
+`PATCH …/extraction/crawl-config` sets or clears TWO independent
+per-connection levers on the same JSON column — `config.extraction.crawl.
+min_modified` (a backfill age filter, and since TCRD-296 gap #80 the
+DEFAULT for any confirmed scope that does not set its own — see `POST
+…/scopes`'s `min_modified` above) and, since D.16,
+`config.extraction.crawl.schedule` (this connection's own scheduled-sweep
+cadence — see `docs/sharepoint-extraction.md` → *Keeping a site current*
+for the full interplay with the instance-wide `extraction.schedule`
+switch). Body: `{"min_modified": "YYYY-MM-DD" | null, "schedule": "off" |
+"instance" | "<cadence>" | null}`, both optional.
+
+`min_modified` keeps its ORIGINAL contract: `null` **or the field
+omitted** clears the override (there is no instance-level fallback — the
+cutoff is inherently connection-specific). `schedule` has a DIFFERENT
+contract, because it now shares this endpoint with an independent field
+that must never be silently reset by a call that only means to touch the
+other: the field **omitted** leaves the stored `schedule` untouched
+(checked via `"schedule" in body.model_fields_set`, the same pattern
+`facts-config`'s `transport`/`provider`/`vertex_region` already use);
+`null` **given explicitly** clears it back to `"instance"` (follow the
+instance-wide cadence); any other value must be `"off"`, `"instance"`, or a
+cadence string in the SAME grammar `extraction.schedule` itself uses
+(`"every 6h"`, `"daily 03:00"`, `"cron 0 3 * * *"`), refused otherwise with
+`400 invalid_crawl_schedule`. **A caller that wants to change one field
+without disturbing the other must resend the OTHER field's current value
+explicitly** — the endpoint itself does not protect against a bare
+single-field body clobbering `min_modified`'s "omitted == cleared"
+contract; the CLI (a `GET` of the connection first) and the source-card
+panel both do this for you.
+
+Returns `{connection_id, min_modified: {value, source}, schedule: {value,
+source, next_run_at}}` — `min_modified.source` is `"connection"` or
+`"none"`; `schedule.source` is `"connection"` or `"default"`;
+`schedule.next_run_at` is a best-effort display estimate (`null` when this
+connection is `off`, or when the instance-wide switch itself has no
+cadence configured — the sweep never runs at all regardless of this
+override, see `POST …/extraction/run-due` below). `400
+invalid_min_modified` for a `min_modified` value that is not a parseable
+ISO date; `404` for an unknown or non-SharePoint connection. Works on both
+app-state backends, same as `…/extraction/stop`. Audited as `extraction.
+min_modified_set` — the handler writes its own row (covering both fields'
+values and resolutions), same shape as `facts-config`'s above. CLI: `agnes
+admin sharepoint crawl-config <connection_id> --min-modified <date>` /
+`--clear` / `--schedule <off|instance|cadence>` (any combination; the CLI
+GETs the connection first to resend whichever field the call is not
+explicitly touching). `GET …/extraction/config` and `GET …/extraction/
+status` also carry the resolved `schedule`/`next_run_at` (the drawer's and
+the source card's own reads), and the fleet endpoint's rows carry
+`next_run_at` too.
+
+The crawler's age-filter gate keeps items on/after 00:00:00 UTC of the
+`min_modified` cutoff date, skips strictly-before ones (counted as
+`filtered_by_age` in the run report), and always keeps an item whose
+modified timestamp cannot be read at all (counted separately as
+`age_unknown`) — an unfilterable item is never silently dropped. A deleted
+item is still processed for deletion regardless of the filter.
+
+`POST /api/admin/sharepoint/extraction/run-due` (the scheduler-driven sweep
+behind `extraction.schedule`) evaluates each SharePoint connection's OWN
+`config.extraction.crawl.schedule` (D.16) against its own last-run stamp —
+`"off"` is skipped unconditionally, `"instance"` (the default) follows the
+sweep's own instance-wide cadence, and any other value REPLACES that
+cadence for this one connection's due-check. The instance-wide
+`extraction.schedule` switch remains what turns the sweep on AT ALL: with
+it unset, this route is a clean no-op (`{"dispatched": [], "skipped":
+true, "reason": "no_schedule_configured"}`) regardless of any per-connection
+override — a per-connection cadence only narrows WHEN a running sweep picks
+up a connection, it cannot make the sweep run on its own.
+
+The four `GET`/stop routes above are admin-only display primitives with no
+analyst CLI/MCP analogue. The fleet endpoint, `cancel`, `facts-config` and
+`crawl-config` are all CLI-reachable — an operator watching the fleet, force-
+closing a stuck run, or scripting a per-connection cost/recall/scope
+tradeoff — but deliberately not MCP-exposed: a fleet-wide operational status
+read, force-terminating a crawl, and a connection's retry/crawl policy are
+all operator decisions, not query surfaces any agent needs.
+
+`GET …/extraction/completeness` (TCRD-296 synthesis item B.9) answers "did we
+really get everything?" — the same question an operator's ad hoc script
+answered once by hand, promoted to a read-only surface. One row per confirmed
+scope (and, only when the connection has exactly one WHOLE-DRIVE scope and no
+others, one additional row per top-level folder under it — see
+`connectors.sharepoint.completeness`'s module docstring for the full
+attribution rules), plus a `total` row:
+
+```
+{expected, indexed, rejected, failed, empty, skipped_unsupported, oversize,
+ gap, status}
+```
+
+`expected` is a live Graph Search count (`IsDocument:1`, narrowed to
+convertible formats via the crawler's own unsupported-extension set) under
+the scope/folder's `web_url` — the SAME mechanism `…/split-plan` uses, never
+a delta walk. `indexed`/`rejected` come from `corpus_files.processing_status`
+in the scope's own collection. `failed`/`empty`/`skipped_unsupported`/
+`oversize` come from the persisted crawl state
+(`sharepoint_connection_state(kind="crawl")`) — exact for a single-scope
+connection, best-effort attributed for a multi-scope one (a "site" scope
+spanning several drives cannot resolve a single `expected` count at all,
+and reads `status: "unknown"` rather than a misleading 0). `gap = expected -
+indexed - failed - empty - skipped_unsupported - oversize`; `status` is
+`"complete"` (indexed already covers expected), `"accounted"` (a gap exists
+but every missing document has a recorded reason), `"missing"` (an
+unexplained gap), or `"unknown"` (expected itself could not be resolved).
+Any attribution shortcut taken for this particular connection is named in
+the response's own `caveats` list, never silent.
+
+`min_modified` (`YYYY-MM-DD`, `400 invalid_min_modified` otherwise) defaults
+to the connection's own resolved crawl cutoff (`resolve_min_modified` — same
+`{value, source}` shape as `…/extraction/config`) so "expected" matches the
+population the last crawl actually attempted; an explicit query param
+overrides it. Cached per `(connection_id, resolved min_modified)` for 10
+minutes (`cached: true/false` in the response) — one Graph Search call per
+scope/folder, so a repeat open of the drawer must not re-fan-out;
+`?refresh=true` bypasses and repopulates the cache. `provisional: true` when
+a `corpus-extraction` job is currently queued/running for this connection —
+the numbers are still returned, just flagged as a snapshot mid-crawl.
+Answers on BOTH app-state backends (no `extraction_runs` read — crawl state,
+`corpus_files` and the job queue are all backend-agnostic). `404` for an
+unknown/non-SharePoint connection; the same `409`/`502` `…/split-plan` raises
+when the connection's certificate is unresolved or Graph rejects the token
+exchange (skipped entirely for a connection with no confirmed scope — nothing
+to count against, so no token is ever requested). Audited as
+`sharepoint_connection.completeness_read`, same disclosure class as
+`split_plan_read`. CLI: `agnes admin sharepoint completeness <connection_id>
+[--min-modified <date>] [--refresh] [--json]`, rows sorted by `gap`
+descending. Deliberately not MCP-exposed — an admin/ops display primitive
+over live Graph data, same reasoning as `…/split-plan`.
 
 ### `/api/admin/ontology` — Ontology builder (spec 2026-08-27 §13.2)
 
@@ -2064,6 +2818,7 @@ so comments and key order survive.
 - /api/semantic-models/context
 - /api/semantic-models/schema
 - /api/semantic-models/apply
+- /api/semantic-models/builder/turn
 - /api/semantic-models/bundle
 
 `POST /api/admin/semantic-models` validates the pasted document against the
@@ -2144,6 +2899,24 @@ the same slug awaits review, and 403s `studio_disabled` when the Studio
 toggle is off. CLI: `agnes semantic-model apply`. MCP:
 `apply_semantic_model`.
 
+`POST /api/semantic-models/builder/turn` runs one turn of the `/semantic-
+layer/new` builder's conversation — the fifth adapter on the shared
+`app/api/builder_core.py` turn contract, alongside the agent, `/skills`,
+data-package and MCP-source builders above. It takes `{message, history,
+draft}` and returns `{reply, patch, suggestions}`, writing **nothing**: a
+model has no row until Save (`POST /api/semantic-models/apply` above), so
+the draft lives in the author's browser and the patch is merged there for
+review. Grounding is server-side and RBAC-filtered rather than trusted from
+the caller: a proposed dataset `source` must resolve to a registered table
+the caller can actually read, and once a dataset names one, its proposed
+`fields` are checked against that table's real columns (the same
+RBAC-enforcing `build_schema` `GET /api/v2/schema/{table_id}` uses) — the
+model can never invent a table path or a column name. Open to any
+authenticated caller, matching `apply`'s own asymmetry: drafting is not
+itself gated on Studio, only Save's non-admin branch is. With no AI
+credential configured it answers `503 builder_llm_unavailable` and the panel
+stays fully usable by hand.
+
 `POST /api/semantic-models/validate-query` validates a SQL statement against
 the caller's accessible `status='valid'` models (same RBAC tier as
 search/export) via the pure `src.semantic_validation.validate_query` engine:
@@ -2207,13 +2980,45 @@ delivery channels; an agent's live read path is `get_semantic_context`/
 - /api/admin/run-jira-sla-poll
 - /api/admin/run-knowledge-digests
 - /api/admin/run-knowledge-migration
-- /api/admin/run-knowledge-packaging
+- /api/admin/run-knowledge-packaging — see the dedicated section below (thin enqueue, not synchronous)
 - /api/admin/run-reap-stuck-reviews
 - /api/admin/run-retention-prune
 - /api/admin/run-semantic-sources-refresh
 - /api/admin/upgrade-freeze — per-instance auto-upgrade freeze (GET status, POST set for 1–72 h, DELETE lift); writes the state-disk marker the VM's upgrade tick honors
 - /api/admin/run-session-collector
 - /api/admin/run-session-processor
+
+### `/api/admin/run-knowledge-packaging` + `/api/admin/knowledge-packaging/status` — Knowledge-artifact packaging (K3, #798)
+
+- /api/admin/run-knowledge-packaging
+- /api/admin/knowledge-packaging/status
+
+TCRD-296 synthesis C.15: `POST /api/admin/run-knowledge-packaging` used to
+run the packaging pass (rebuild any Collection's `knowledge.duckdb`
+artifact whose chunk content changed) INLINE, synchronously, inside the
+request — the scheduler's own 600s client timeout was the only bound on
+it, and a slower pass let the next scheduler tick fire a second,
+overlapping call that raced the first hard enough to OOM the app. It is
+now a thin enqueue of the `knowledge-packaging` worker job kind (LIGHT
+lane, `app/worker/kinds.py::_run_knowledge_packaging`), which supplies a
+belt-and-braces Postgres advisory lock and a 20-minute wall-clock budget
+(checkpointed per collection, so an interrupted run resumes cleanly on the
+next tick rather than losing its progress). Returns 202 with `{"status":
+"queued", "job_id"}` on a fresh enqueue, 409 with the in-flight `job_id`
+when a run is already `queued`/`running` (the idempotency-keyed dedupe —
+expected under a fast scheduler cadence, not an error), and 501 (typed
+`requires_worker_role`) when this process/instance has no worker role, so
+enqueueing would leave the job unclaimed forever.
+
+`GET /api/admin/knowledge-packaging/status` reports the last run's outcome
+(`{"job_id", "status", "created_at", "finished_at", "result"}`, where
+`result` carries `built`/`skipped`/`pruned`/`errors`/`interrupted_reason`/
+`duration_s`/`collections_total`/`collections_processed`), whether a run
+is currently `queued`/`running`, and a best-effort `next_due` estimate
+read from the scheduler's durable last-run marker.
+
+CLI: `agnes admin knowledge packaging run|status`. MCP:
+`admin_knowledge_packaging_run`, `admin_knowledge_packaging_status`.
 
 ### `/api/auth` — Authentication
 
@@ -2409,14 +3214,17 @@ and without it a page boundary would repeat or skip rows.
 **`GET /api/collections/search`** ranks chunks with a server-side cap
 (`collections.search_max_chunks`, default 25000) on how many chunks of the
 caller's accessible collections a single request may rank — the point
-`scripts/bench_retrieval.py` measured at ~371 MB peak RSS. At/under the cap,
-behavior is unchanged. Over it, the server prefilters candidates by the
-query's own terms before ranking and the response carries `truncated: true`
-plus `truncated_cap`; a query with no usable (non-stopword) term to narrow
-by, over the cap, is refused with a typed `422 search_query_too_broad`
-rather than ranking an arbitrary slice of the corpus. A search-backend
-outage (a database-side memory or operational failure) answers a typed
-`503 search_unavailable` instead of an anonymous server error.
+`scripts/bench_retrieval.py` measured at ~371 MB peak RSS. It composes with
+`knowledge.retrieval.max_candidate_chunks` (below): candidate selection
+always runs in SQL under the smaller of the two, so with the defaults this
+cap never binds. When the bounded candidate fetch fills its cap the response
+carries `truncated: true` plus `truncated_cap` (and the additive
+`candidates_capped: true` — the same event under both names); a query with
+no usable (non-stopword) term to narrow by that still fills the cap is
+refused with a typed `422 search_query_too_broad` rather than ranking an
+arbitrary slice of the corpus. A search-backend outage (a database-side
+memory or operational failure) answers a typed `503 search_unavailable`
+instead of an anonymous server error.
 
 **Editing a collection** (`PATCH /api/collections/{collection_id}`) changes
 its `name`, `slug` and `description` — the files inside are untouched. The
@@ -2435,6 +3243,29 @@ from the source scope, so an edit here would be reverted by the next sync.
 CLI: `agnes collections edit <id> [--name] [--description] [--slug]`. MCP:
 `collection_update` (metadata only — creating, uploading into and deleting a
 collection are deliberately absent from the agent surface).
+
+**Search over large corpora is bounded** (P0 OOM fix, 2026-09):
+`GET /api/collections/search` and `GET /api/knowledge/search` never load
+more than `knowledge.retrieval.max_candidate_chunks` (default 5000)
+candidate chunk rows before ranking — a caller with a wide grant (an admin,
+or a group spanning many collections) used to load every chunk in every
+accessible collection first, which OOM-killed the process on a large corpus.
+Candidate selection now runs in SQL: Postgres full-text search
+(`to_tsvector`/`plainto_tsquery`, `'simple'` config), ranked and `LIMIT`-ed;
+the DuckDB app-state backend (frozen, never reaches this scale) uses a
+plain `ILIKE` prefilter instead. The response carries an additive
+`candidates_capped: true` when the bound was actually hit — read/write
+semantics and RBAC are otherwise unchanged; see
+`src.ingest.retrieval.search`'s docstring for the full design and its
+documented trade-off (a query with literally no shared vocabulary in any
+candidate's body text can no longer be found by embedding similarity alone
+once a corpus exceeds the cap — the filename fallback has its own,
+separate bounded path and is unaffected). The backing GIN index
+(migration `0101_corpus_chunks_fts_index`) is skipped at migration time on
+a table over 1,000,000 rows to avoid a long lock during startup; see that
+migration's docstring for the `CREATE INDEX CONCURRENTLY` statement an
+operator must then run out-of-band. Full-text search works without the
+index either way, just via a slower sequential scan.
 
 - /api/collections
 - /api/collections/search
@@ -2607,6 +3438,25 @@ not an analyst query (no CLI/MCP analogue).
 - /api/facts/ingest-runs
 - /api/facts/corrections
 - /api/facts/corrections/{subject_kind}/{subject_id}
+
+**Collection-stats summary rebuild (TCRD-296 synthesis E.21).** `search`/
+`type-map`/`facets`, the Library index's per-collection counts, and the
+admin graph-counts card all read candidacy from a maintained summary
+(`fact_collection_stats`/`fact_collection_membership`/
+`edge_collection_membership`) instead of scanning `claims` per request —
+kept current incrementally on ingest, and by a scoped recompute on the
+delete/reassign/merge/split/consolidation paths (see
+`src/repositories/facts_pg.py`'s "Collection stats summary" section).
+`POST /api/admin/facts/stats/rebuild` (admin) recomputes it from `claims` —
+`{"corpus_ids": [...]}` scopes the rebuild to those collections, an absent/
+`null` body rebuilds every collection that currently carries a claim (the
+one-time backfill an operator runs once after this feature's migration,
+which creates the tables but does not backfill them). Response:
+`{"collections_rebuilt": n}`. CLI: `agnes admin facts stats rebuild
+[--corpus-id ...]`; deliberately not MCP-exposed — an unscoped call
+recomputes the whole graph, an operator decision no analyst query needs.
+
+- /api/admin/facts/stats/rebuild
 
 ### `/api/connectors` — Connector manifest
 
@@ -2830,6 +3680,19 @@ the engine exposes nothing.
   mints. A co-session is refused (`403 mcp_not_available_to_co_session`)
   rather than resolved to its stored owner. Point the engine's
   `HOST_BROKER_MCP_URL` here and set `KAI_BROKER_MCP_ENABLED`.
+- /api/broker/otlp/v1/{signal} — `POST`, authenticated by a **`kai_otlp`-scoped
+  broker ticket** — the one `/api/kai/tickets` returns under the `otlp` key,
+  and only while this instance's own OTLP export is configured
+  (`OTEL_EXPORTER_OTLP_ENDPOINT`; without it the key is absent and the route
+  answers `503 otlp_export_not_configured`). `signal` is exactly `traces`,
+  `metrics` or `logs` (anything else is `404 otlp_signal_not_supported`). The
+  body is the sandbox SDK's OTLP protobuf batch, forwarded byte-for-byte to
+  `<endpoint>/v1/<signal>` with the operator's `OTEL_EXPORTER_OTLP_HEADERS`
+  injected server-side; the collector's 2xx response comes back as-is, an
+  error only as its status code plus `Retry-After`. Batches above 8 MiB are
+  refused with `413`. This is how the embedded engine's own spans (turn →
+  step → tool) reach the same collector as the broker's completion spans —
+  see `docs/observability.md`.
 - /api/kai/workspace — `GET`, authenticated by the session credential (the
   engine's *server* calls it once per SDK process spawn; the sandbox never
   sees it). Returns `200` with a gzipped tar of the caller's workspace tree,

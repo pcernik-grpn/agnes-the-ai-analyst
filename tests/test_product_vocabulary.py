@@ -13,8 +13,6 @@ vocabulary is legitimate and where nobody is reading.
 
 from __future__ import annotations
 
-from tests import _ds_page_source
-
 import re
 from pathlib import Path
 
@@ -87,10 +85,12 @@ def test_the_semantic_layer_token_is_referred_to_by_its_real_label():
     where it is actually shown. The ban stays on both pages, so the retired
     label cannot come back on either.
     """
-    # The page as the browser assembles it — the label is rendered by the
-    # wizard's markup partial and its script, both of which moved out of the
-    # template so the data-package builder could load them too.
-    rendered = "\n".join(_rendered_lines(_ds_page_source.page_source()))
+    # The source card is drawn by the page's externalized script (the inline
+    # JS left the template), so the label lives there; the template itself
+    # only loads it. Read both, comment lines dropped from the script too.
+    page_js = Path("app/web/static/js/admin/data_sources_page.js").read_text(encoding="utf-8")
+    js_lines = [ln for ln in page_js.splitlines() if not ln.strip().startswith("//")]
+    rendered = "\n".join([*_rendered_lines(_read("admin_data_sources.html")), *js_lines])
     assert "Master token (semantic layer)" not in rendered
     assert "Semantic-layer token" in rendered
     assert "Master token (semantic layer)" not in _read("admin_semantic_layer.html")

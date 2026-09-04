@@ -22,6 +22,75 @@ from typing import Any, Dict, List
 logger = logging.getLogger(__name__)
 
 
+def policy_disclosure_for_knowledge(item_ids: List[str], owner: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Tables reachable through ``item_ids`` (an agent's declared/candidate
+    ``knowledge`` ids) that carry an access policy, each diagnosed for
+    ``owner`` — the same self-audit machinery ``/api/me/effective-access``
+    already trusts (§10.2), reused here for §12: an agent surface bound to
+    the OWNER's identity — a Slack channel bound to the agent, a scheduled
+    run — answers with the OWNER's slice regardless of who is actually
+    asking, so the owner must see that slice on their own agent's builder
+    page before it ever reaches either surface. A direct caller
+    (agent-as-API, chat, a delegated turn) is filtered by ITS OWN identity
+    instead (``src/access_policy.py::_resolve_identity``) and is unaffected
+    by what this reports.
+
+    Only ``data_package`` ids expand to member tables today — the
+    ``knowledge`` axis never carries a bare table id (the builder's Data &
+    resources section offers packages, memory domains and file collections,
+    never a raw table — see ``agents_builder_shared._KNOWLEDGE_ITEM_TYPES``).
+    A memory-domain or collection id simply resolves to zero member tables
+    (``list_tables`` returns an empty join), so passing every ``knowledge``
+    id through unconditionally is correct and needs no extra branching.
+
+    Each output row is ``{table_id, name, access_policy: True, policy: {...}}``
+    — only policied tables appear, matching the "always applies=True" shape
+    of :class:`app.api.access.TablePolicyDiagnosis` at the entry level (an
+    unpolicied table is simply absent rather than reported with
+    ``access_policy=False``).
+    """
+    if not item_ids:
+        return []
+
+    from app.api.access import table_policy_diagnosis
+    from src.repositories import data_packages_repo, table_registry_repo
+
+    pkg_repo = data_packages_repo()
+    tr_repo = table_registry_repo()
+    seen: set = set()
+    out: List[Dict[str, Any]] = []
+    for raw_id in item_ids or []:
+        item_id = (raw_id or "").strip()
+        if not item_id:
+            continue
+        try:
+            member_tables = pkg_repo.list_tables(item_id)
+        except Exception as e:
+            logger.warning("agent ingredients: could not list tables for %s: %s", item_id, e)
+            continue
+        for member in member_tables:
+            table_id = member["id"]
+            if table_id in seen:
+                continue
+            seen.add(table_id)
+            try:
+                row = tr_repo.get(table_id)
+            except Exception as e:
+                logger.warning("agent ingredients: could not load table %s: %s", table_id, e)
+                continue
+            if not row or not row.get("access_policy_sql"):
+                continue
+            out.append(
+                {
+                    "table_id": table_id,
+                    "name": row.get("name") or table_id,
+                    "access_policy": True,
+                    "policy": table_policy_diagnosis(row, owner),
+                }
+            )
+    return out
+
+
 def knowledge_sources_for(user: dict) -> List[Dict[str, Any]]:
     """Data packages, memory domains and artifact collections ``user`` reaches.
 
@@ -50,6 +119,14 @@ def knowledge_sources_for(user: dict) -> List[Dict[str, Any]]:
                 tables = len(pkg_repo.list_tables(entry.id))
             except Exception:
                 tables = 0
+            # Design doc §12 — a candidate the picker offers ("selectable
+            # for" an agent's scope) is shown with the SAME warning an
+            # already-attached one would carry, computed for the caller
+            # (who, on this page, is always the agent's OWNER — only an
+            # owner may edit their own agent's builder): the owner should
+            # see the caveat before grounding the agent in the package, not
+            # only after.
+            policied_tables = policy_disclosure_for_knowledge([entry.id], user)
             sources.append(
                 {
                     "id": entry.id,
@@ -57,6 +134,8 @@ def knowledge_sources_for(user: dict) -> List[Dict[str, Any]]:
                     "name": entry.name,
                     "description": entry.description or "",
                     "meta": f"{tables} table{'' if tables == 1 else 's'}",
+                    "access_policy": bool(policied_tables),
+                    "policied_tables": policied_tables,
                 }
             )
     except Exception as e:

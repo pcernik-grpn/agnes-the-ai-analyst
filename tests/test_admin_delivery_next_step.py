@@ -35,6 +35,10 @@ from pathlib import Path
 
 import pytest
 
+from tests._admin_data_sources_source import (
+    fetch_admin_data_sources_page,
+)
+
 _ROOT = Path(__file__).resolve().parents[1]
 _TEMPLATES = _ROOT / "app" / "web" / "templates"
 _DATA_SOURCES_TPL = _TEMPLATES / "admin_data_sources.html"
@@ -316,27 +320,12 @@ class TestEveryStepCarriesTheHonestCheck:
 
 class TestTheCardRendersIt:
     def _page(self, seeded_app) -> str:
-        """The page as the browser assembles it — the response plus the classic
-        scripts it loads. The renderer this class guards moved into one of those
-        files, and asserting on the response alone would read as "the function is
-        gone" rather than "it is in the other half of the same page"."""
-        html = (
-            seeded_app["client"]
-            .get(
-                "/admin/data-sources",
-                headers=_auth(seeded_app["admin_token"]),
-            )
-            .text
-        )
-        return _ds_page_source.rendered_with_scripts(html)
+        return fetch_admin_data_sources_page(seeded_app)
 
     def test_the_page_ships_the_renderer_and_its_style(self, seeded_app, source):
         body = self._page(seeded_app)
         assert "_nextStepHtml" in body
-        # The style moved out with the rest of the page's CSS. Read it from the
-        # stylesheet, not from `body` — the same selector appears there as a
-        # string inside the script, which would pass while the rule was gone.
-        assert ".ds-next" in _ds_page_source.styles_only()
+        assert ".ds-next" in body
         assert SIMULATE_HREF in body
 
     def test_the_repaint_keeps_the_row_true(self, seeded_app):

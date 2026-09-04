@@ -637,6 +637,14 @@ def _validate_evidence_audience(body: "FactsIngestRequest") -> None:
 def facts_ingest(body: FactsIngestRequest, user=Depends(require_admin)) -> Dict[str, Any]:
     """Ingest one facts batch (spec §7.2) — scheduler token or admin PAT.
 
+    Thin wrapper over :func:`_facts_ingest_core`, kept separate so this
+    route's signature (and OpenAPI contract) never grows an internal-only
+    parameter: :func:`connectors.sharepoint.facts_extraction._BatchShipper.
+    flush` calls :func:`_facts_ingest_core` directly, in-process, with
+    ``run_orphan_sweep=False`` (TCRD-296 C.12 — a multi-batch pass sweeps
+    ONCE, at the end, rather than once per batch) — never through this HTTP
+    surface, and never with the ability to suppress the sweep from outside.
+
     Batch caps (≤500 documents, ≤5000 claims/request) 413; a single
     document's evidence alone exceeding the claim cap is a distinct 422
     protocol error (never split across requests, per §7.2). ``documents``
@@ -663,14 +671,32 @@ def facts_ingest(body: FactsIngestRequest, user=Depends(require_admin)) -> Dict[
     Response IS the run report: ``{claims_written,
     claims_accepted_via_identity, claims_rejected: [{row, reason}],
     source_urls_rejected: [{doc_id, reason}], deferred: [...],
-    subjects_created, subjects_deleted, corrections_active: [...],
-    review_items: [...]}``.
+    subjects_created, subjects_deleted, sweep_skipped,
+    corrections_active: [...], review_items: [...],
+    edges_skipped_missing_endpoint}``.
+
+    ``sweep_skipped`` (live finding, 2026-09) is True when this batch's own
+    end-of-ingest orphan sweep backed off because a CONCURRENT facts-
+    extraction pass already held its serializing advisory lock — never an
+    error, and ``subjects_deleted`` stays accurate either way, since the
+    next pass's sweep covers whatever this one skipped rather than double-
+    counting or under-counting. See
+    :meth:`FactsPgRepository.sweep_orphans`'s "Concurrency" section.
 
     ``claims_accepted_via_identity`` (spec §8) is the subset of
     ``claims_written`` whose quote passed the verbatim gate ONLY via the
     document's own SERVER-STORED ``filename``/``path`` — never a chunk of
     its extracted text — so an operator can see how much evidence is
     filename-grounded rather than content-grounded.
+
+    ``edges_skipped_missing_endpoint`` counts an edge whose ``src``/``dst``
+    fact resolved fine but no longer existed by the time
+    :meth:`FactsPgRepository.create_edge`'s INSERT ran — a race between
+    concurrent facts-extraction passes sharing one fact graph (a
+    not-yet-evidenced fact swept as orphan by another in-flight call, or two
+    passes merging/deduplicating the same entity), never a producer mistake.
+    That one edge is skipped, never the whole batch; see
+    ``EdgeEndpointMissing`` in ``src/repositories/facts_pg.py``.
 
     ``source_urls_rejected`` (O7 follow-up) is a document's ``source_url``
     the validator dropped as invalid (``too_long`` / ``unparseable`` /
@@ -729,6 +755,14 @@ def facts_ingest(body: FactsIngestRequest, user=Depends(require_admin)) -> Dict[
     honored the crawl-time exclusion list. See
     :func:`_refuse_source_acl_excluded_documents`.
     """
+    return _facts_ingest_core(body, user)
+
+
+def _facts_ingest_core(body: FactsIngestRequest, user, *, run_orphan_sweep: bool = True) -> Dict[str, Any]:
+    """The implementation :func:`facts_ingest` (the HTTP route) wraps —
+    see ITS docstring for the full producer contract (batch caps, gates,
+    response shape). The ONLY behavior this adds is ``run_orphan_sweep``
+    (TCRD-296 C.12), never reachable from the route itself."""
     _validate_evidence_audience(body)
     _refuse_undeclared_anonymize_marked_corpora(body)
     _refuse_source_acl_excluded_documents(body)
@@ -738,6 +772,7 @@ def facts_ingest(body: FactsIngestRequest, user=Depends(require_admin)) -> Dict[
             full_documents=body.full_documents,
             nodes=body.nodes,
             edges=body.edges,
+            run_orphan_sweep=run_orphan_sweep,
         )
     except IngestBatchTooLarge as exc:
         raise HTTPException(status_code=413, detail=exc.detail)
@@ -781,6 +816,7 @@ def facts_ingest(body: FactsIngestRequest, user=Depends(require_admin)) -> Dict[
             review_items=report.get("review_items", []),
             anonymization=body.anonymization.model_dump() if body.anonymization else None,
             llm_usage=body.llm_usage.model_dump(exclude_none=True) if body.llm_usage else None,
+            edges_skipped_missing_endpoint=report.get("edges_skipped_missing_endpoint", 0),
         )
     except Exception:  # noqa: BLE001 — never let a report-write failure look like an ingest failure
         logger.warning("facts.ingest: failed to persist the run report (ingest itself succeeded)", exc_info=True)

@@ -1,5 +1,3 @@
-
-from tests import _ds_page_source
 """POST /api/admin/server-config refuses an unconfirmed connection repoint.
 
 Changing a connection coordinate under ``data_source.<source>`` — Snowflake's
@@ -275,9 +273,7 @@ class TestConfigureWizardIsGuardedToo:
         )
         assert resp.status_code == 200, resp.text
 
-    def test_wizard_repoint_applies_when_confirmed(
-        self, seeded_app, bigquery_overlay, registered_bq_table
-    ):
+    def test_wizard_repoint_applies_when_confirmed(self, seeded_app, bigquery_overlay, registered_bq_table):
         c = seeded_app["client"]
         resp = c.post(
             "/api/admin/configure",
@@ -323,17 +319,16 @@ class TestEveryConnectionSaveSurfaceIsWired:
 
     @staticmethod
     def _surface_text(template: str) -> str:
-        """A surface as the browser assembles it, not just its template.
-
-        `/admin/data-sources` keeps its script in a file it loads
-        (`js/ds_page.js`) so the data-package builder can load the same
-        wizard, so reading the template alone finds half the page — and this
-        guard would report a wired surface as unwired.
-        """
+        """The surface's own source — except `admin_data_sources.html`, most
+        of whose inline JS (including the Snowflake/Databricks wizard code
+        this guard checks) moved into extracted static files (perf
+        follow-up, 2026-09-03; see tests/_admin_data_sources_source.py)."""
         from pathlib import Path
 
         if template.endswith("admin_data_sources.html"):
-            return _ds_page_source.page_source()
+            from tests._admin_data_sources_source import read_admin_data_sources_source
+
+            return read_admin_data_sources_source()
         return Path(template).read_text()
 
     @pytest.mark.parametrize("template", SURFACES)

@@ -11,6 +11,7 @@
 # stdout clean without hiding warnings from any other package.
 import warnings as _warnings
 from src.repositories import (
+    PoliciedRowDistributionError,
     RequiresPostgresBackend,
     memory_domains_repo,
     user_group_members_repo,
@@ -57,7 +58,6 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
-from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.gzip import GZipMiddleware
 from starlette.middleware.sessions import SessionMiddleware
@@ -519,6 +519,7 @@ from app.api.admin_datasource_secrets import router as admin_datasource_secrets_
 from app.api.admin_sharepoint import router as admin_sharepoint_router
 from app.api.sharepoint_webhooks import router as sharepoint_webhooks_router
 from app.api.admin_extraction import router as admin_extraction_router
+from app.api.admin_facts import router as admin_facts_router
 from app.api.admin_slack_secrets import router as admin_slack_secrets_router
 from app.api.admin_sso import router as admin_sso_router
 from app.api.admin_source_connections import router as source_connections_admin_router
@@ -555,6 +556,7 @@ from app.api.agent_builder import router as agent_builder_router  # builder assi
 from app.api.entity_builder import router as entity_builder_router  # /skills builder turns
 from app.api.package_builder import router as package_builder_router  # data-package builder turns
 from app.api.mcp_builder import router as mcp_builder_router  # MCP-source builder turns
+from app.api.semantic_model_builder import router as semantic_model_builder_router  # semantic-model builder turns
 from app.api.facts import router as facts_router  # fact graph over Collections read surface
 from app.api.ontology import router as ontology_router  # ontology builder (fact-graph §13.2)
 from app.api.sharing import router as sharing_router  # owner-initiated Library sharing
@@ -2502,6 +2504,9 @@ def create_app() -> FastAPI:
             "/cli/wheel/",
             "/cli/download",
             "/marketplace.git",  # git smart-HTTP is self-chunked; double-gzip bloats
+            # Cover images (WebP/PNG/JPEG) are already compressed; same
+            # rationale as the parquet/attachments exclusions above.
+            "/uploads/",
         ),
     )
 
@@ -2896,10 +2901,17 @@ def create_app() -> FastAPI:
     except Exception:
         logger.exception("guardrails readiness probe failed at boot")
 
-    # Static files
+    # Static files. VersionedStaticFiles (app/web/cover_files.py) stamps a
+    # 1-year immutable Cache-Control only when the request carries the ?v=
+    # cache-buster. Most references get it from _static_url; the handful
+    # that can't run Jinja (external <script src>, a JS-side fetch/import)
+    # get it from a window._ag* URL stamped once in _app_scripts.html
+    # instead (see app/web/templates/_app_scripts.html).
+    from app.web.cover_files import VersionedStaticFiles
+
     static_dir = Path(__file__).parent / "web" / "static"
     if static_dir.exists():
-        app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+        app.mount("/static", VersionedStaticFiles(directory=str(static_dir)), name="static")
 
     # v50 admin-uploaded cover images. Lives under ${DATA_DIR}/uploads so
     # it survives across deploys (the app/web/static dir gets bundled into
@@ -2999,6 +3011,7 @@ def create_app() -> FastAPI:
     app.include_router(admin_sharepoint_router)
     app.include_router(sharepoint_webhooks_router)
     app.include_router(admin_extraction_router)
+    app.include_router(admin_facts_router)
     app.include_router(source_discovery_admin_router)
     app.include_router(mcp_passthrough_router)
     app.include_router(mcp_user_secrets_router)
@@ -3020,6 +3033,7 @@ def create_app() -> FastAPI:
     app.include_router(entity_builder_router)
     app.include_router(package_builder_router)
     app.include_router(mcp_builder_router)
+    app.include_router(semantic_model_builder_router)
     app.include_router(facts_router)
     app.include_router(ontology_router)
     app.include_router(sharing_router)
@@ -3473,6 +3487,24 @@ def create_app() -> FastAPI:
                 "detail": str(exc),
                 "error": "requires_postgres_backend",
                 "feature": exc.feature,
+            },
+        )
+
+    @app.exception_handler(PoliciedRowDistributionError)
+    async def _policied_row_distribution_handler(request, exc: PoliciedRowDistributionError):
+        """A repository-level upsert would have left a table that carries an
+        access policy distributable (``docs/table-access-policies.md`` ->
+        "Scope: only tables that never leave the server"). Every HTTP path
+        that can reach ``table_registry.register()`` — the admin register /
+        edit endpoints, a connector's auto-discovery, an ingest re-register —
+        gets the SAME typed 422 the admin endpoints raise for the equivalent
+        API-level violation, never an unhandled 500."""
+        return JSONResponse(
+            status_code=422,
+            content={
+                "detail": str(exc),
+                "error": "access_policy_requires_undistributed",
+                "table_id": exc.table_id,
             },
         )
 

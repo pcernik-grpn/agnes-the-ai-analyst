@@ -79,51 +79,63 @@
 <link rel="stylesheet" href="{{ static_url('css/builder.css') }}">
 <style>
   .sk-no-review {
-    margin-bottom: var(--space-4);
-    padding: 10px 12px;
-    border-radius: 10px;
-    font-size: 13px;
-    line-height: 1.45;
+    /* The builder's own gutter (`.ag-alerts`, builder.css), so the banner
+       lines up with the back link and title above it instead of running to
+       the window edges while they sit 28px in. */
+    margin: 0 28px 14px;
+    /* One compact line. It is a standing instance condition, not something
+       to act on now — as a two-line block with the headline on its own row it
+       was the largest thing between the page title and the workspace. */
+    padding: 7px 12px;
+    border-radius: 9px;
+    font-size: 12.5px;
+    line-height: 1.5;
     background: var(--ds-accent-warn-bg);
     color: var(--ds-accent-warn-ink);
     border: 1px solid var(--ds-accent-warn-line);
   }
-  .sk-no-review strong { display: block; margin-bottom: 2px; }
+  .sk-no-review { display: flex; align-items: baseline; gap: 12px; }
+  .sk-no-review-body { flex: 1; min-width: 0; }
+  .sk-no-review strong { margin-right: 4px; }
+  .sk-no-review-x { flex-shrink: 0; border: 1px solid var(--ds-accent-warn-line); background: none;
+    color: inherit; font: inherit; font-size: 12px; font-weight: 600; padding: 3px 10px;
+    border-radius: var(--ds-radius-pill); cursor: pointer; }
+  .sk-no-review-x:hover { background: var(--ds-surface); }
+  /* The dismissed form. Focusable, so the tooltip is reachable without a
+     mouse — it carries the only remaining copy of the sentence. */
+  .sk-no-review-mark { display: inline-flex; align-items: center; color: var(--ds-accent-warn-ink);
+    padding: 4px; border-radius: 8px; cursor: help; }
+  .sk-no-review-mark svg { width: 17px; height: 17px; display: block; }
+  .sk-no-review-mark:hover, .sk-no-review-mark:focus-visible { background: var(--ds-accent-warn-bg); }
+  .sk-no-review-mark { position: relative; }
+  .sk-tip {
+    position: absolute; top: calc(100% + 8px); left: 0; z-index: 40;
+    width: max-content; max-width: 300px;
+    padding: 8px 11px; border-radius: 9px;
+    background: var(--ds-text-primary); color: var(--ds-surface);
+    font-size: 12.5px; font-weight: 400; line-height: 1.5; text-align: left;
+    opacity: 0; visibility: hidden;
+    /* Instant in, unhurried out — a tooltip you have to wait for is a tooltip
+       nobody discovers, and one that vanishes the moment the pointer drifts
+       cannot be read to the end. */
+    transition: opacity 90ms var(--ds-ease-standard), visibility 0s linear 90ms;
+  }
+  .sk-no-review-mark:hover .sk-tip,
+  .sk-no-review-mark:focus-visible .sk-tip { opacity: 1; visibility: visible; transition-delay: 0s; }
   /* Page chrome only — all colors ride --ds-* tokens. Each type carries its
      own categorical accent (--ds-kind-skill / -plugin / -agent) on the avatar,
      kicker and preview; actions stay on --ds-primary so the primary action
      never changes colour as you switch type. */
 
-  /* ── Step 1: type picker ── */
   .sk-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 14px; flex-wrap: wrap; margin: 2px 0 0; padding-bottom: 24px; }
   .sk-head h1 { display: flex; align-items: center; gap: 10px; }
 
-  .sk-types { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; margin: 14px 0 0; }
-  .sk-type { background: var(--ds-surface); border: 1px solid var(--ds-border); border-radius: 14px; padding: 18px; text-align: left; font: inherit; color: inherit; cursor: pointer; display: flex; flex-direction: column; gap: 10px; transition: border-color var(--ds-motion-fast) var(--ds-ease-standard), box-shadow var(--ds-motion-fast) var(--ds-ease-standard); }
-  .sk-type:hover { border-color: var(--ds-primary); box-shadow: var(--ds-shadow-md); }
-  .sk-type:focus-visible { outline: 2px solid var(--ds-primary); outline-offset: 2px; }
-  /* The current type when the step is re-opened. Carried by aria-current too,
-     so the state is not colour-only. */
-  .sk-type.is-on { border-color: var(--ds-primary); background: var(--ds-primary-light); }
-  .sk-type h3 { font-size: 16px; margin: 0; }
-  .sk-type-what { font-size: 13.5px; color: var(--ds-text-secondary); line-height: 1.5; margin: 0; flex: 1; }
-  .sk-type-takes { font-size: 12.5px; color: var(--ds-text-muted); margin: 0; border-top: 1px solid var(--ds-border); padding-top: 10px; }
-  .sk-type-takes strong { color: var(--ds-text-secondary); font-weight: 650; }
-  .sk-type-draft { font-size: 12px; font-weight: 600; color: var(--ds-primary); margin: 0; }
-  .sk-types-note { margin-top: 12px; }
-
-  /* Step 1 once answered: a one-line summary that keeps the choice visible
-     and revisable without spending the room the three cards need. */
-  .sk-sec--done .sk-sec-head { padding: 12px 18px; }
-  .sk-sec-no--done { background: var(--ds-accent-success-bg); border-color: var(--ds-accent-success-line); color: var(--ds-accent-success-ink); }
-  .sk-sec-collapsed { display: flex; align-items: center; gap: 11px; }
-  .sk-sec-collapsed .sk-ava { width: 30px; height: 30px; border-radius: 9px; }
-  .sk-sec-collapsed .sk-ava svg { width: 17px; height: 17px; }
-  .sk-sec-collapsed-txt { min-width: 0; }
-  /* 9px, not pill: it is a secondary action sitting a few centimetres from the
-     .cc-btn row, and two button shapes in one band read as two systems. */
-  .sk-sec-change { border: 1px solid var(--ds-border); background: var(--ds-surface); color: var(--ds-text-secondary); font: inherit; font-size: 13px; font-weight: 600; cursor: pointer; padding: 5px 12px; border-radius: 9px; flex-shrink: 0; }
-  .sk-sec-change:hover { border-color: var(--ds-primary); color: var(--ds-primary); }
+  /* Step 1 — Type — is gone, and with it the three cards, the answered
+     one-line summary and its "Change" control (`.sk-type*`, `.sk-sec--done`,
+     `.sk-sec-collapsed*`, `.sk-sec-change`). Nothing rendered them once bare
+     /skills started redirecting to the Library: a type now arrives in the URL
+     and is changed from the title menu, which sets another one directly. The
+     step numbers below start at 1 = Identity because there is no step 0. */
 
   /* Type avatar — the accent is set per type via a modifier class so the
      picker, the builder head and the preview all read the same colour. */
@@ -237,7 +249,9 @@
      column of cards, which is the same mistake inverted. */
   .sk-sec { background: var(--ds-surface); border: 1px solid var(--ds-border); border-radius: 14px; margin-bottom: 14px; overflow: hidden; }
   .sk-sec-head { display: flex; align-items: center; gap: 12px; padding: 14px 18px; }
-  .sk-sec-no { width: 26px; height: 26px; border-radius: 50%; background: var(--ds-surface-sunken); border: 1px solid var(--ds-border); color: var(--ds-text-secondary); font-size: 12.5px; font-weight: 700; display: grid; place-items: center; flex-shrink: 0; }
+  .sk-sec-no { width: 24px; height: 24px; border-radius: 50%; background: var(--ds-primary-light);
+    color: var(--ds-primary); font-size: 12px; font-weight: 700; font-variant-numeric: tabular-nums;
+    display: grid; place-items: center; flex-shrink: 0; }
   .sk-sec-head h3 { font-size: 15px; margin: 0; }
   .sk-sec-head h3 .sk-sec-note { font-weight: 400; color: var(--ds-text-muted); font-size: 13px; margin-left: 4px; }
   .sk-sec-sub { margin: 2px 0 0; font-size: 12.5px; color: var(--ds-text-secondary); }
@@ -245,12 +259,26 @@
   .sk-sec-body { padding: 4px 18px 18px; border-top: 1px solid var(--ds-border); }
 
   /* Fields. */
-  .sk-field { display: block; margin: 14px 0 0; }
-  .sk-field > span { display: block; font-size: 13px; font-weight: 600; margin-bottom: 6px; color: var(--ds-text-primary); }
-  .sk-field > span em { font-weight: 400; color: var(--ds-text-muted); font-style: normal; }
-  .sk-field input[type=text], .sk-field textarea, .sk-field select { width: 100%; padding: 9px 12px; border: 1px solid var(--ds-border); border-radius: 9px; font: inherit; font-size: 14px; background: var(--ds-surface); color: var(--ds-text-primary); resize: vertical; }
+  .sk-field { display: block; margin: 18px 0 0; }
+  /* `:first-child` — the field's LABEL, not every span in it. Unscoped this
+     rule is one point more specific than `.sk-hint`, so the character-count
+     hints under Description and Body came out as a second bold 13px label
+     instead of the quiet line they are. Every `.sk-field` opens with its
+     label, so scoping it here is what lets the hints style themselves. */
+  .sk-field > span:first-child { display: block; font-size: 13px; font-weight: 600; margin-bottom: 6px; color: var(--ds-text-primary); }
+  .sk-field > span:first-child em { font-weight: 400; color: var(--ds-text-muted); font-style: normal; }
+  /* Same treatment as `.ag-field` in builder.css — softer rule, more room,
+     rounder — so the two field families on one panel stay one family. */
+  .sk-field input[type=text], .sk-field textarea, .sk-field select { width: 100%; padding: 10px 13px;
+    border: 1px solid color-mix(in srgb, var(--ds-border) 78%, transparent);
+    border-radius: 10px; font: inherit; font-size: 14px; background: var(--ds-surface);
+    color: var(--ds-text-primary); resize: vertical;
+    transition: border-color var(--ds-motion-fast) var(--ds-ease-standard),
+                box-shadow var(--ds-motion-fast) var(--ds-ease-standard); }
+  .sk-field input[type=text]:hover, .sk-field textarea:hover { border-color: var(--ds-border); }
   .sk-field textarea.mono { font-family: var(--ds-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace); font-size: 13px; line-height: 1.55; }
-  .sk-field input:focus, .sk-field textarea:focus, .sk-field select:focus { outline: 2px solid var(--ds-primary); outline-offset: -1px; }
+  .sk-field input:focus, .sk-field textarea:focus, .sk-field select:focus { outline: none;
+    border-color: var(--ds-primary); box-shadow: 0 0 0 3px var(--ds-primary-light); }
   /* Category dropdown. The border/background above already applied, but the
      control kept the platform's own appearance — OS chevron, OS metrics, OS
      colours in dark theme — so it read as a foreign widget next to the app's
@@ -293,10 +321,10 @@
   /* Callout explaining what an agent template is and is not. Uses the
      agent accent as a left rule so it reads as "about agents" without
      competing with the danger/warn semantics. */
-  .sk-callout { display: flex; gap: 11px; align-items: flex-start; border: 1px solid var(--ds-border); border-left: 3px solid var(--ds-kind-agent); border-radius: 10px; background: var(--ds-surface-sunken); padding: 12px 14px; margin: 0 0 14px; }
-  .sk-callout-body { font-size: 12.5px; color: var(--ds-text-secondary); line-height: 1.5; min-width: 0; }
-  .sk-callout-body strong { color: var(--ds-text-primary); font-weight: 650; }
-  .sk-callout-body a { color: var(--ds-primary); }
+  /* The type avatar, at lede size. 38px is the picker-card and builder-head
+     size; beside a paragraph it is a graphic with a caption rather than a
+     mark on a sentence. (`.sk-callout`, the bordered band this replaced, is
+     gone — see typeLedeHtml.) */
 
   /* ── Content input: write ⇄ upload ──
      A markdown type can be authored in the textarea OR handed over as a file,
@@ -473,13 +501,12 @@
    Guardrails off entirely is a DIFFERENT state: publication runs on the
    inline tier alone and nothing is parked, so this warning would be false
    there — gate on both. #}
-{% if guardrails_enabled and not guardrails_llm_ready %}
-<div class="sk-no-review" role="alert">
-  <strong>Automated review is not available on this instance.</strong>
-  You can publish, but your submission stays hidden from everyone until an
-  administrator runs the review manually.
-</div>
-{% endif %}
+{# The notice itself is rendered by the script below, not here: this block sits
+   ABOVE #sk-builder-view and the builder's header is drawn INSIDE it, so a
+   banner emitted here landed above the page's own back link and title — a
+   page-level warning introducing the page instead of following it. Only the
+   condition crosses over. #}
+<script type="application/json" id="sk-no-review">{{ (guardrails_enabled and not guardrails_llm_ready) | tojson }}</script>
 <script type="application/json" id="sk-categories">{{ store_categories | tojson }}</script>
 
 <div id="sk-builder-view"></div>
@@ -496,6 +523,7 @@
   'use strict';
 
   var CATEGORIES = JSON.parse(document.getElementById('sk-categories').textContent || '[]');
+  var NO_REVIEW = JSON.parse(document.getElementById('sk-no-review').textContent || 'false');
   var USER_ID = "{{ session.user.id }}";
   // What the store appends to every name, and the floors it enforces.
   var OWNER_SUFFIX = "{{ owner_username or '' }}";
@@ -962,57 +990,7 @@
     '</div>';
   }
 
-  /* ── Section 1 — Type.
-     Expanded until a type is chosen (it IS the old picker screen, so the
-     taxonomy still gets a proper moment on first arrival), then collapsed to
-     a one-line summary with a Change affordance. Sections 2 and 3 render only
-     once a type exists, so the page grows downward instead of swapping. ── */
-  function typeCardsHtml() {
-    return TYPE_ORDER.map(function (k) {
-      var t = TYPES[k];
-      var on = (k === type) ? ' is-on' : '';
-      var d = drafts[k];
-      // Surface a saved draft on its own type's card. This is what makes
-      // switching safe to try: you can see your other work is still there.
-      // relativeSavedAt() already returns "saved …", so the prefix is just
-      // "Draft ·" — not "Draft saved ·", which read "Draft saved · saved now".
-      var note = d
-        ? '<p class="sk-type-draft">Draft · ' + esc(relativeSavedAt(d.saved_at)) + '</p>'
-        : '';
-      return '<button type="button" class="sk-type' + on + '" data-sk-type="' + k + '"' +
-        (on ? ' aria-current="true"' : '') + '>' +
-        '<span class="sk-ava sk-ava--' + k + '">' + ICONS[k] + '</span>' +
-        '<h3>' + esc(t.label) + '</h3>' +
-        '<p class="sk-type-what">' + esc(t.what) + '</p>' +
-        '<p class="sk-type-takes"><strong>Takes:</strong> ' + esc(t.takes) + '</p>' +
-        note +
-      '</button>';
-    }).join('');
-  }
 
-  /* The picker. Only ever rendered with no type chosen (see render()), so
-     there is no collapsed form: the three cards. */
-  function typeSectionHtml() {
-    // The three cards. The "keeps your work" promise is stated
-    // BEFORE the click, not after — that is the whole point of saying it.
-    var switchNote = (type && !isBlank())
-      ? '<p class="sk-hint sk-types-note">Picking another type keeps your ' + esc(cfg().label.toLowerCase()) +
-        ' work — each type holds its own draft, and you can switch back.</p>'
-      : '';
-    return '<div class="sk-sec">' +
-      '<div class="sk-sec-head"><span class="sk-sec-no">1</span>' +
-        '<div class="sk-sec-grow"><h3>Type</h3>' +
-        '<p class="sk-sec-sub">What are you building? All three land in your Library and can be shared with everyone here.</p></div>' +
-      '</div>' +
-      '<div class="sk-sec-body">' +
-        // No role="list": the children are buttons, not listitems, and a list
-        // role with non-listitem children is worse for a screen reader than
-        // no role at all. The section heading already names the group.
-        '<div class="sk-types">' + typeCardsHtml() + '</div>' +
-        switchNote +
-      '</div>' +
-    '</div>';
-  }
 
   /* ── The builder shell ── */
   /* What you are building, permanently on screen.
@@ -1023,29 +1001,91 @@
      is the type least likely to be chosen blind. */
   var TYPE_BLURB = {
     skill:
-      'This is a <strong>Skill</strong> — a step-by-step recipe an agent loads when it needs one: how to run a ' +
-      'report, how to shape a query, how your team does a thing. You write it as Markdown here; agents read it later.',
+      'A <strong>Skill</strong> is a recipe an agent loads when it needs one — how to run a report, how your ' +
+      'team does a thing. You write it as Markdown.',
     plugin:
-      'This is a <strong>Plugin</strong> — one install that hands someone several things at once. Its contents are ' +
-      'items already in your Library, or a .zip packaged elsewhere. A skill installs on its own; a plugin is for ' +
-      'handing over a set.',
+      'A <strong>Plugin</strong> hands someone several things at once: items already in your Library, or a ' +
+      '.zip packaged elsewhere.',
+    agent:
+      /* "nothing you write here inherits yours" is load-bearing, not padding:
+         an author who believes their own access ships with the template will
+         write one that assumes data it will never see. Pinned by
+         tests/test_web_studio.py::test_builder_separates_agent_templates_from_agents. */
+      'An <strong>Agent Template</strong> is a starting point others build their own <a href="/agents">agent</a> ' +
+      'from. Behaviour only — whoever uses it brings their own data, so nothing you write here inherits yours.',
   };
 
-  function agentCalloutHtml() {
-    if (type !== 'agent') {
-      var blurb = TYPE_BLURB[type];
-      if (!blurb) return '';
-      return '<div class="sk-callout">' +
-        '<span class="sk-ava sk-ava--' + type + '">' + ICONS[type] + '</span>' +
-        '<span class="sk-callout-body">' + blurb + '</span>' +
-      '</div>';
-    }
-    return '<div class="sk-callout">' +
-      '<span class="sk-ava sk-ava--agent">' + ICONS.agent + '</span>' +
-      '<span class="sk-callout-body">This is an <strong>Agent Template</strong> — a shareable starting point that others build their own ' +
-      '<a href="/agents">agent</a> from. It carries behaviour only: the role, the tone, the instructions. ' +
-      'Whoever uses it picks their own data and access, so nothing you write here inherits yours.</span>' +
+  /* One `BuilderShell.about` at the head of the transcript — the same block,
+     in the same place, as every other builder. It was a full-bleed
+     `.sk-callout` band spanning the whole workspace: a bordered, tinted box
+     around a sentence nobody has to act on, stacked under two other banners
+     before the first field.
+
+     "Takes: …" came off the retired type cards. It is the one thing they said
+     that the sentence does not — what you actually have to supply — so it
+     moves here rather than being lost with them. */
+  function aboutHtml() {
+    var blurb = TYPE_BLURB[type];
+    if (!blurb) return '';
+    return BuilderShell.about({
+      iconSvg: ICONS[type],
+      accent: type,
+      html: '<p>' + blurb + '</p>' +
+        '<p class="ag-about-takes"><strong>Takes:</strong> ' + esc(TYPES[type].takes) + '</p>',
+    });
+  }
+
+  /* Standing instance condition, not a per-save alert: guardrails are on but
+     no model can run the review, so anything published parks hidden. Rendered
+     under the builder head with the other page-level messages. */
+  var NO_REVIEW_TEXT = 'Automated review is not available on this instance. You can publish, but your ' +
+    'submission stays hidden from everyone until an administrator runs the review manually.';
+  var NO_REVIEW_SEEN_KEY = 'agnes_sk_no_review_seen_v1_' + USER_ID;
+
+  function noReviewSeen() {
+    try { return window.localStorage.getItem(NO_REVIEW_SEEN_KEY) === '1'; } catch (e) { return false; }
+  }
+  function markNoReviewSeen() {
+    try { window.localStorage.setItem(NO_REVIEW_SEEN_KEY, '1'); } catch (e) { /* private mode */ }
+  }
+
+  /* Said in full ONCE, then kept as a mark you can still reach.
+
+     It is a standing instance condition, not news: it is true on every visit
+     and there is nothing an author can do about it, so a full-width banner
+     over the workspace on every single arrival spends the top of the screen
+     on something already read. Dismissed, it becomes the warning glyph beside
+     the actions it actually qualifies — the ones that publish — carrying the
+     same sentence as its tooltip. The state is per-reader (localStorage),
+     because "I have read this" is not a property of the instance. */
+  function noReviewHtml() {
+    if (!NO_REVIEW || noReviewSeen()) return '';
+    return '<div class="sk-no-review" role="alert">' +
+      '<span class="sk-no-review-body"><strong>Automated review is not available on this instance.</strong> ' +
+      'You can publish, but your submission stays hidden from everyone until an ' +
+      'administrator runs the review manually.</span>' +
+      '<button type="button" class="sk-no-review-x" data-sk-noreview-dismiss ' +
+        'aria-label="Got it — keep this as an icon">Got it</button>' +
     '</div>';
+  }
+
+  /* The dismissed form: the canonical `warning` glyph (macros/_icon.html) at
+     the head of the action row, so the condition sits with the buttons it
+     qualifies rather than nowhere. */
+  function noReviewMarkHtml() {
+    if (!NO_REVIEW || !noReviewSeen()) return '';
+    /* Our own tooltip, not the native `title`: the browser waits about a
+       second before drawing that one, and this is the ONLY remaining copy of
+       a sentence the reader dismissed — a hover that appears to do nothing
+       reads as a dead icon. `aria-label` still carries it for assistive tech,
+       and the bubble is `aria-hidden` so it is not announced twice. */
+    return '<span class="sk-no-review-mark" tabindex="0" role="img" ' +
+      'aria-label="' + esc(NO_REVIEW_TEXT) + '">' +
+      '<span class="sk-tip" aria-hidden="true">' + esc(NO_REVIEW_TEXT) + '</span>' +
+      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" ' +
+      'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+      '<path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/>' +
+      '<path d="M12 9v4M12 17h.01"/></svg></span>';
   }
 
   /* The file input is `hidden` (never a visible, unstyleable control) and is
@@ -1163,7 +1203,7 @@
       : dropZoneHtml('Drop the plugin <strong>.zip</strong> here', '', '.zip · up to ' + fmtSize(MAX_BUNDLE_BYTES));
     return attached + fileInputHtml('.zip,application/zip') +
       '<div class="sk-note">The archive must contain <code>.claude-plugin/plugin.json</code>. ' +
-      '<strong>Check bundle</strong> validates the layout and lists every command, hook and agent the server finds inside — run it before saving.</div>';
+      'Run <strong>Check bundle</strong> before saving to see what is inside it.</div>';
   }
 
   function bodySectionHtml() {
@@ -1189,8 +1229,8 @@
           // and re-uploading is a trap — the file is already just text in the
           // draft, so editing it costs nothing and changes nothing on disk.
           '<div class="sk-note">This is the ' + esc(c.bodyLabel.toLowerCase()) + ' that will be saved. ' +
-          'Need to change something? <button type="button" class="sk-browse sk-browse--link" data-sk-mode="write">Edit as text</button> — ' +
-          'your copy on disk is left alone.</div>';
+          '<button type="button" class="sk-browse sk-browse--link" data-sk-mode="write">Edit as text</button> ' +
+          'to change it — your file on disk is left alone.</div>';
       } else {
         panel = dropZoneHtml('Drop your <strong>.md</strong> file here',
                              'A <code>name</code> / <code>description</code> frontmatter block fills in step 2 for you.',
@@ -1202,8 +1242,8 @@
         '<span class="sk-hint" id="sk-body-count">' + bodyCountHtml() + '</span>' +
           '<textarea rows="14" class="mono" data-sk-field="body" placeholder="' + esc(c.bodyPlaceholder) + '">' + esc(draft.body) + '</textarea></label>' +
         (src ? '<p class="sk-hint">From <strong>' + esc(src.name) + '</strong>. Editing here does not touch the file on your computer.</p>' : '') +
-        '<div class="sk-note">Write at least a couple of paragraphs: explain what it does, when to use it, and what inputs it expects. Under ' + MIN_BODY_CHARS + ' characters is refused at save. ' +
-        'A YAML frontmatter block (<code>name</code>, <code>description</code>) is added for you if you don’t write one.</div>' +
+        '<div class="sk-note">Explain what it does, when to use it, and what inputs it expects. ' +
+        'Under ' + MIN_BODY_CHARS + ' characters is refused at save.</div>' +
         fileInputHtml(MD_ACCEPT);
     }
     // The body's fault lands under whichever input is showing — in upload mode
@@ -1352,19 +1392,25 @@
        column. Cleared on the type picker, which IS a document. */
     document.body.classList.toggle('ag-building', !!type);
 
+
     if (!type) {
-      /* The alerts host belongs here too. Without it, a failure that happens
-         BEFORE a type exists — an `?edit=` id that is gone, or an entity with
-         no document behind it — set its reason and then rendered a type
-         picker with nothing above it, which reads as "your click did
-         nothing". */
+      /* `?edit=<id that is gone>`: openEdit failed before a type was ever
+         chosen, and the type picker that used to catch this state is gone
+         (bare /skills redirects to the Library now). Without this the render
+         falls through to `cfg()` on a null type and paints nothing at all,
+         which is exactly the "your click did nothing" the alerts host exists
+         to prevent. */
       view.innerHTML = '<div class="sk-bgrid sk-bgrid--solo"><div>' +
+        noReviewHtml() +
         '<div id="sk-alerts">' + alertsHtml() + '</div>' +
-        typeSectionHtml() + '</div></div>';
+        '<p class="ag-note"><a href="/library">Back to the Library</a></p>' +
+      '</div></div>';
       return;
     }
-
     var c = cfg(), ns = nameState();
+    /* See BuilderShell.keepCfgScroll — a full rebuild would otherwise send
+       the configuration column back to the top on every re-render. */
+    BuilderShell.keepCfgScroll('sk-steps', function () {
     view.innerHTML =
       BuilderShell.head({
         backLabel: 'Library',
@@ -1374,10 +1420,10 @@
         actionsId: 'sk-build-actions',
         actions: headActionsHtml(),
       }) +
+      noReviewHtml() +
       // The save verdict, below the action row and above the form it is about.
       // Empty on a good day; it never reserves space.
       '<div id="sk-alerts">' + alertsHtml() + '</div>' +
-      agentCalloutHtml() +
       BuilderShell.workspace({
         /* Left is where the conversation will go (phase 3 of the builder
            spec). Until then it carries the one thing that already belongs
@@ -1393,6 +1439,7 @@
       // Modal host. Always in the DOM so opening the picker never has to wait
       // for a re-render, and empty whenever it is closed.
       '<div id="sk-picker"></div>';
+    });
     afterRender();
   }
 
@@ -1462,6 +1509,7 @@
         rows: rows,
         busy: convBusy,
         busyText: conv().length ? 'Thinking…' : 'Getting started…',
+        about: aboutHtml(),
         // The standing banner already says it, once.
         err: llmUnavailable ? null : convErr,
       }) +
@@ -1613,14 +1661,21 @@
        out — sitting under a title and a subtitle, four stacked lines of
        chrome above the first field. What an author wants from it is how far
        along they are and what to do next; the rest is a tooltip. */
+    /* DONE is a state of its own, not a count that ran out: "3 of 3" and
+       "you can save this now" are different claims, and the header is where
+       an author looks to find out which one they are in. `canPublish()` is
+       the real gate — a plugin can settle every slot while Save stays
+       disabled for want of contents. */
+    var done = canPublish() && !open.length;
     var tail;
     if (!canPublish()) tail = 'next: ' + esc(open.length ? open[0].label : (publishBlocker() || 'finish this item'));
     else if (open.length) tail = 'ready to save · optional: ' + esc(open[0].label);
     else tail = 'ready to save';
     var full = open.length ? 'Still open: ' + open.map(function (s) { return s.label; }).join(', ') : 'Nothing left to settle.';
-    return '<div class="ag-prog" title="' + esc(full) + '">' +
-      '<span class="ag-prog-n">' + known + ' of ' + slots.length + '</span>' +
-      '<span class="ag-prog-t">' + tail + '</span>' +
+    return '<div class="ag-prog' + (done ? ' ag-prog--done' : '') + '" title="' + esc(full) + '">' +
+      (done ? BuilderShell.TICK_SVG : '') +
+      '<span class="ag-prog-n">' + (done ? 'Ready' : known + ' of ' + slots.length) + '</span>' +
+      '<span class="ag-prog-t">' + (done ? 'nothing left to settle' : tail) + '</span>' +
     '</div>';
   }
 
@@ -1857,6 +1912,7 @@
 
   function headActionsHtml() {
     var c = cfg();
+    var mark = noReviewMarkHtml();
     // No status line lives in this row. Receipts go to the toast and the save
     // verdict goes to #sk-alerts below, so nothing here can grow and push the
     // buttons off the line the author is aiming at.
@@ -1876,7 +1932,8 @@
        writes nothing, and Save would only mint a duplicate name. Offer the one
        move that makes sense instead. */
     if (justSaved) {
-      return '<a class="cc-btn" href="/library?new=' + encodeURIComponent(justSaved.id) + '">Open in Library</a>' +
+      return mark +
+        '<a class="cc-btn" href="/library?new=' + encodeURIComponent(justSaved.id) + '">Open in Library</a>' +
         '<button type="button" class="cc-btn cc-btn--primary" id="sk-again">Build another ' + esc(justSaved.label) + '</button>';
     }
     /* Editing something saved: no draft controls (there is no draft), and the
@@ -1884,11 +1941,13 @@
     if (editing) {
       var why = editing.blockedReason || blocked;
       var eattrs = why ? ' disabled title="' + esc(why) + '" aria-label="Save changes — ' + esc(why) + '"' : '';
-      return '<a class="cc-btn" href="/library?new=' + encodeURIComponent(editing.id) + '">Cancel</a>' +
+      return mark +
+        '<a class="cc-btn" href="/library?new=' + encodeURIComponent(editing.id) + '">Cancel</a>' +
         '<button type="button" class="cc-btn" id="sk-check"' + attrs + '>' + esc(c.checkLabel) + '</button>' +
         '<button type="button" class="cc-btn cc-btn--primary" id="sk-save"' + eattrs + '>Save changes</button>';
     }
-    return (drafts[type] ? '<button type="button" class="sk-draft-discard" id="sk-discard">Discard draft</button>' : '') +
+    return mark +
+      (drafts[type] ? '<button type="button" class="sk-draft-discard" id="sk-discard">Discard draft</button>' : '') +
           '<button type="button" class="cc-btn" id="sk-draft">Save draft</button>' +
           '<button type="button" class="cc-btn" id="sk-check"' + attrs + '>' + esc(c.checkLabel) + '</button>' +
       '<button type="button" class="cc-btn cc-btn--primary" id="sk-save"' +
@@ -1948,7 +2007,8 @@
         summary: accessSummary(),
         body: accessBody(c),
       }) +
-      '<div class="sk-note">Your work is kept in this browser as you type. <strong>Save to Library</strong> makes it real — it lands in your Library with the access you chose above, and you can edit or archive it from there afterwards.</div>';
+      '<div class="sk-note">Your work is kept in this browser as you type. ' +
+      '<strong>Save to Library</strong> publishes it with the access you chose above.</div>';
   }
 
   /* ── Access ──
@@ -3308,7 +3368,7 @@
                              '[data-sk-psrc],[data-sk-openpick],[data-sk-pick],[data-sk-unpick],' +
                              '[data-sk-groups],[data-sk-group],[data-sk-ungroup],' +
                              '[data-ag-pick-close],' +
-                             '[data-ag-back],[data-ag-toggle-sec],' +
+                             '[data-ag-back],[data-ag-toggle-sec],[data-sk-noreview-dismiss],' +
                              '[data-ag-tab],[data-ag-send],[data-ag-chip],' +
                              '#sk-check,#sk-save,#sk-draft,#sk-discard');
     if (!t) {
@@ -3360,6 +3420,10 @@
       } else { render(); }
     }
     else if (t.hasAttribute('data-sk-type')) { chooseType(t.getAttribute('data-sk-type')); }
+    else if (t.hasAttribute('data-sk-noreview-dismiss')) {
+      markNoReviewSeen();
+      render();   // banner out, mark into the action row
+    }
     else if (t.hasAttribute('data-sk-typemenu')) {
       persist();          // park what is on screen before offering the switch
       typeMenuOpen = !typeMenuOpen;
@@ -3673,10 +3737,26 @@
   } else {
     // No type yet: if exactly one draft is in flight, resume it — the author
     // has one obvious piece of unfinished work and making them re-pick its
-    // type would be busywork. More than one, and only they can say which.
+    // type would be busywork.
     var resumable = TYPE_ORDER.filter(function (k) { return drafts[k]; });
     if (resumable.length === 1) chooseType(resumable[0]);
-    else render();
+    /* Otherwise there is nothing to show. This page used to answer a bare
+       /skills with a three-card type picker, but nothing in the product has
+       linked to it for a while: every route in — the Library's "+ New" menu
+       and its draft rows — names a type, and switching type once you are here
+       goes through the title menu, which sets another one rather than
+       returning to a picker. It was reachable only by typing the URL.
+
+       The Library is where the choice belongs: the same three options,
+       described, next to the drafts you already have — which is also the
+       right answer for the two-or-more-drafts case, since only the author can
+       say which one they meant. `replace`, not `assign`: a redirect you can
+       press Back into is a loop.
+
+       Kept CLIENT-side deliberately. The drafts are in localStorage, so a
+       server-side redirect on a missing `?type=` could not see the one-draft
+       resume above and would strand it. */
+    else window.location.replace('/library');
   }
   maybeSpotlightNew();
 

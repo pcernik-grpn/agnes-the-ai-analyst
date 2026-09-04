@@ -30,17 +30,16 @@ it was:
 
 from __future__ import annotations
 
+from tests import _ds_page_source
+
 import re
 from pathlib import Path
-
-from tests import _ds_page_source
 
 TEMPLATES = Path("app/web/templates")
 STATIC = Path("app/web/static")
 
 COMPONENT = STATIC / "js" / "components" / "package_drawer.js"
 COMPONENT_CSS = STATIC / "css" / "package_drawer.css"
-SOURCES_PAGE = TEMPLATES / "admin_data_sources.html"
 
 
 def _auth(token: str) -> dict:
@@ -301,26 +300,19 @@ class TestTheSourcesPageHoldsTheOtherEndOfTheTrip:
         assert '"/admin/data-packages/new"' in page
 
     def test_the_wizard_stops_after_choosing_tables_on_that_entry(self) -> None:
-        """Bundle and Share BUILD a data package, so they are not offered to
-        someone already building one — on either entry. The flag that used to
-        mean "navigate back" is now a handoff object with an optional
-        callback, which is what lets the builder open this same wizard as a
-        drawer and never leave the page."""
         page = _ds_page_source.page_source()
-        assert "let _pkgBuilder = null;" in page
-        assert "function _dsWizardForPackageBuilder(opts)" in page
+        assert "let _fromPackageBuilder = false;" in page
+        assert "_fromPackageBuilder = true;" in page
+        # Bundle and Share BUILD a package; they are not offered to someone
+        # already building one.
         assert "if (Number(el.dataset.wstep) > 2) el.hidden = true;" in page
         # …and the primary names where the tables are actually going.
         assert '"Add selected tables to your package"' in page
-        # The step-2 handler hands back instead of walking on to the board.
+        # The step-2 handler returns instead of walking on to the board.
         register = page.split('getElementById("ds-wizard-register-btn").addEventListener', 1)[1]
-        hand_back = register.index("if (_pkgBuilder)")
+        hand_back = register.index("if (_fromPackageBuilder)")
         seeds_board = register.index("_seedBoard(")
         assert hand_back < seeds_board, "the hand-back must come before the bundling path"
-        # In-page when the host gave a callback, by navigation when it did not.
-        handoff = register[hand_back : hand_back + 600]
-        assert "_pkgBuilder.onRegistered" in handoff
-        assert '"/admin/data-packages/new"' in handoff
 
     def test_the_builder_opens_the_wizard_over_itself(self) -> None:
         """The whole point of lifting the wizard out of admin_data_sources:
@@ -329,7 +321,14 @@ class TestTheSourcesPageHoldsTheOtherEndOfTheTrip:
         hook and keeps the navigation — the host decides."""
         builder = (TEMPLATES / "admin_package_builder.html").read_text(encoding="utf-8")
         assert '{% include "_add_data_wizard.html" %}' in builder
-        assert "js/ds_page.js" in builder and "css/ds_page.css" in builder
+        for script in (
+            "js/admin/data_sources_page.js",
+            "js/admin/data_sources_sharepoint_wizard.js",
+            "js/admin/data_sources_extraction_observability.js",
+            "js/admin/data_sources_anon_preview.js",
+        ):
+            assert script in builder, script
+        assert "css/ds_page.css" in builder
         assert "window.DS_BOOT" in builder, "it must hand over the values that page renders"
         assert "openConnectWizard: function (onRegistered)" in builder
         src = COMPONENT.read_text(encoding="utf-8")

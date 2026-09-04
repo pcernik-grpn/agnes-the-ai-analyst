@@ -43,12 +43,12 @@ def test_an_unannotated_tool_counts_as_a_write_here_too():
     src = MCP.read_text(encoding="utf-8")
     assert "read_only: (t && typeof t.read_only === 'boolean') ? t.read_only : null," in src
     # `=== true` is the whole point: null must not pass.
-    assert "t.read_only === true" in src
+    assert "draft.enabled[t.name] = t.read_only === true;" in src
 
 
 def test_the_section_no_longer_describes_a_review_nobody_performs():
     src = MCP.read_text(encoding="utf-8")
-    assert "Read-only tools are on; anything " in src and "is off until you turn it on" in src, (
+    assert "read-only are on" in src and "are off until " in src, (
         "the Tools section still tells the admin to turn things off that are already off"
     )
 
@@ -75,8 +75,16 @@ def test_the_primary_names_what_registering_will_grant():
             ["Everyone"],
             "Register and give Everyone 2 tools (1 can write)",
         ),
-        # Unannotated counts as a write in the label too.
-        ([("search", True), ("sync", None)], ["Everyone"], "Register and give Everyone 2 tools (1 can write)"),
+        # Unannotated is counted, but as itself (#2155). The button used to
+        # fold it into "can write" and so asserted a write the server never
+        # declared, at the moment of committing to it.
+        ([("search", True), ("sync", None)], ["Everyone"], "Register and give Everyone 2 tools (1 unmarked)"),
+        # Both kinds present: two counts, not one merged one.
+        (
+            [("search", True), ("write_row", False), ("sync", None), ("push", None)],
+            ["Everyone"],
+            "Register and give Everyone 4 tools (1 can write, 2 unmarked)",
+        ),
         ([("a", True), ("b", True)], ["X", "Y"], "Register and give 2 groups 2 tools"),
     ],
 )

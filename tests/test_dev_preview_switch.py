@@ -13,8 +13,6 @@ role-switcher. It changes what RENDERS. It grants nothing.
 
 from __future__ import annotations
 
-from tests import _ds_page_source
-
 import re
 from pathlib import Path
 
@@ -229,9 +227,11 @@ class TestTheWizardCanMakeAnAudience:
 
     @pytest.fixture(scope="class")
     def page(self) -> str:
-        # The page as the browser assembles it: this surface's script now
-        # lives in js/ds_page.js, so the template alone holds half of it.
-        return _ds_page_source.page_source()
+        # The wizard's Share-step JS moved into an extracted static file
+        # (perf follow-up, 2026-09-03) — see tests/_admin_data_sources_source.py.
+        from tests._admin_data_sources_source import read_admin_data_sources_source
+
+        return read_admin_data_sources_source()
 
     def test_the_step_offers_a_new_group(self, page):
         assert 'id="ds-wizard-newgroup"' in page

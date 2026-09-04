@@ -58,7 +58,10 @@ def _seed_chunk_artifact(seeded_app, corpus_id: str, name: str = "Handbook") -> 
         },
     ]
     with (
-        patch("src.knowledge_packaging._list_chunks", lambda cid: list(chunks)),
+        patch(
+            "src.knowledge_packaging._list_chunk_batch",
+            lambda cid, *, after_id, limit: list(chunks) if after_id is None else [],
+        ),
         patch("src.knowledge_packaging._list_files", lambda cid: [{"id": "f1", "filename": "billing.md"}]),
         patch("src.knowledge_packaging._list_corpora", lambda: [{"id": corpus_id, "name": name}]),
     ):
@@ -355,9 +358,7 @@ class TestAnalystDigestList:
         headers = _auth(seeded_app["analyst_token"])
         listed = {d["slug"] for d in c.get("/api/knowledge/digests", headers=headers).json()["digests"]}
         manifest = c.get("/api/sync/manifest", headers=headers).json()
-        in_manifest = {
-            e["slug"] for e in manifest.get("knowledge_artifacts", []) if e.get("kind") == "digest"
-        }
+        in_manifest = {e["slug"] for e in manifest.get("knowledge_artifacts", []) if e.get("kind") == "digest"}
         assert listed == in_manifest == {"granted-one"}
 
     def test_staleness_travels_so_a_stale_digest_is_visibly_stale(self, seeded_app):

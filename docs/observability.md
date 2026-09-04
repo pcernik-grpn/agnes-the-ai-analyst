@@ -144,6 +144,59 @@ model attached — a guardrail that must guess should guess in the direction
 that stops sooner. It is a soft guardrail, not a billing ledger; this
 endpoint is the ledger.
 
+## Knowledge packaging — worker job, single-run, checkpointed
+
+```bash
+agnes admin knowledge packaging run                # enqueue a pass
+agnes admin knowledge packaging status              # last run, running?, next due
+agnes admin knowledge packaging status --json
+```
+
+Per-collection `knowledge.duckdb` artifacts (K3, #798) are rebuilt by the
+`knowledge-packaging` worker job kind (LIGHT lane,
+`app/worker/kinds.py::_run_knowledge_packaging`), not inline inside an HTTP
+request. TCRD-296 synthesis C.15: it used to run synchronously behind
+`POST /api/admin/run-knowledge-packaging`, bounded only by the scheduler's
+own client timeout — a pass slower than that timeout let the next scheduler
+tick fire a second, overlapping call, and two overlapping in-process runs
+raced hard enough to OOM the app.
+
+**Single-run.** The scheduler's tick (`SCHEDULER_KNOWLEDGE_PACKAGING_INTERVAL`,
+default 15 min) still calls `POST /api/admin/run-knowledge-packaging`, but the
+endpoint is now a thin, idempotency-keyed enqueue: a second tick while one run
+is still `queued`/`running` gets back the SAME job id as a `409` (expected
+under a fast cadence, not an error to page on) instead of starting a redundant
+run. Belt-and-braces on top of that dedupe, the job handler also takes a
+non-blocking Postgres advisory lock (`src.db_pg.knowledge_packaging_lease`,
+no-op on the frozen DuckDB app-state backend, which is single-process by
+construction) before running — a stray manual `POST /api/jobs` enqueue with a
+different idempotency key skips cleanly instead of racing the in-flight run.
+
+**Bounded and resumable.** One run is capped at a 20-minute wall-clock budget
+(`_DEFAULT_KNOWLEDGE_PACKAGING_TIMEOUT_S`, a plain constant — the incident was
+an *unbounded* run, not a mistuned number). `run_packaging_pass` checkpoints
+`state.json` after every collection it finishes, so hitting the deadline
+mid-sweep loses progress on at most the ONE collection in flight; the result
+carries `interrupted_reason: "timeout"` and the next scheduled run picks up
+where it left off (an already-recorded, unchanged fingerprint is a skip, not a
+rebuild). Reads are bounded too: `build_artifact`/`corpus_fingerprint` page
+through a corpus's chunks (`CorpusChunksRepository.list_for_corpus_batch`,
+keyset-paginated by id) rather than materializing the whole corpus's rows —
+including every 384-dim embedding — in one call.
+
+**No worker role, no silent black hole.** `POST /api/admin/run-knowledge-packaging`
+checks `role_enabled(Role.WORKER)` before enqueueing — a process/instance with
+no worker role has no loop that will ever claim the job, and enqueueing anyway
+would leave it `queued` forever with no visible error. That case answers a
+typed `501` (`{"error": "requires_worker_role"}`) instead.
+
+`GET /api/admin/knowledge-packaging/status` (`agnes admin knowledge packaging
+status`) reports the last run's outcome — including
+`built`/`skipped`/`pruned`/`errors`/`interrupted_reason`/`duration_s`/
+`collections_total`/`collections_processed` — whether one is running right
+now, and a best-effort `next_due` estimate read from the scheduler's own
+durable last-run marker.
+
 ## Audit log volume — how much does audit logging cost you
 
 The audit-coverage work (wave 1 + wave 2 of the audit-full-coverage plan)
@@ -282,8 +335,10 @@ is what the host-side operator scripts (`agnes-watchdog.sh`,
 ### Shipping the logs somewhere
 
 Nothing in Agnes decides this — it writes to stdout and stops. On the
-GCE-hosted deployments the Terraform module wires it up; see
-[`gcp-logging.md`](gcp-logging.md).
+GCE-hosted deployments the Terraform module wires it up, to one of two
+destinations (a VM has exactly one, because Docker allows one log driver per
+container): Google Cloud Logging, see [`gcp-logging.md`](gcp-logging.md), or
+Datadog, see [`datadog-logging.md`](datadog-logging.md).
 
 ### Verifying the wiring
 
@@ -399,7 +454,9 @@ that refuses the batches shows up as the SDK's own
 | `gen_ai.response.finish_reasons` | broker | the stop reason |
 | `agnes.session_id`, `agnes.user_email`, `agnes.user_id`, `agnes.agent_id`, `agnes.ticket_scope` | broker | which session, who ran it, under which agent; `llm` is the embedded turn engine, `main` the native sandbox |
 | `agnes.upstream`, `agnes.stream`, `http.response.status_code`, `error.type` | broker | where the call went and how it ended |
-| `agnes.prompt_chars`, `agnes.completion_chars` | generation | sizes, never text |
+| `agnes.response_bytes`, `agnes.stream_complete` | broker | how much of the response came back, and for a stream whether the model reached its stop reason — a client that walks away mid-turn leaves a span with no answer and no final usage, and this is what tells it apart from a lost export |
+| `agnes.prompt_chars`, `agnes.completion_chars` | both | sizes of the exchange, never text |
+| `agnes.kind` | both | `completion` (the broker) or `generation` (a server-side call) |
 
 The resource on every span is `service.name=agnes`, `service.version`,
 `deployment.environment` and `service.instance.id` (`hostname:pid`) —
@@ -412,20 +469,49 @@ any of them.
 
 Prompt and completion text is **not** exported by default, for the same
 reason the logs never carry it: in this product it routinely holds customer
-data. `AGNES_OTEL_CAPTURE_CONTENT=1` adds `gen_ai.input.messages` (system
-prompt and conversation, tool calls and tool results included, binary
-blocks reduced to their type) and `gen_ai.output.messages` (the answer,
-re-assembled from the stream) in the OpenTelemetry GenAI message shape.
-Each attribute is capped (`MAX_CONTENT_CHARS`, 256 KiB) and a cut is flagged
-as `agnes.content_truncated`. Turn it on only where the collector is
-allowed to hold that data.
+data. `AGNES_OTEL_CAPTURE_CONTENT=1` adds two **span events** — never span
+attributes — in the OpenTelemetry GenAI message shape (`[{role, parts}]`
+as JSON):
 
-### What is not exported
+| event | attribute | carries |
+|---|---|---|
+| `gen_ai.content.prompt` | `gen_ai.prompt` | system prompt and conversation, tool calls and tool results included, binary blocks reduced to their type |
+| `gen_ai.content.completion` | `gen_ai.completion` | the answer, re-assembled from the stream |
 
-HTTP request spans, database calls and the sandbox's own per-tool spans. The
-broker sees a completion, not the agent loop around it; an engine that
-traces its own turns needs its host to broker an `otlp` egress scope for
-that, which this route does not yet do.
+Events rather than attributes on purpose: a collector stores a span's
+attributes as one JSON object with keys in alphabetical order, and an
+agent turn's prompt runs to hundreds of KiB, so anything sorting after
+`gen_ai.input…` — the answer, the usage — fell past every preview or size
+cap downstream. With the text on events the attribute object stays small
+and parseable however long the conversation is, and each side of the
+exchange is its own record the collector can map, cap or drop
+independently (in a Data-Streams style sink that means mapping the
+`events` field to a column). Each event's text is capped
+(`MAX_CONTENT_CHARS`, 256 KiB) and a cut is flagged on the span as
+`agnes.content_truncated`; the sizes (`agnes.prompt_chars` /
+`agnes.completion_chars`) are on the span whether capture is on or not.
+Turn it on only where the collector is allowed to hold that data.
+
+### The embedded engine's own spans
+
+The broker sees a completion, not the agent loop around it. The embedded
+turn engine's sandbox traces that loop itself — one span per turn, per
+model step and per tool call, properly nested — and exports it through its
+in-sandbox relay's `otlp` scope to `POST /api/broker/otlp/v1/{signal}` on
+this instance, which swaps the per-turn `kai_otlp` ticket for the same
+collector credential the app's own export uses and forwards the batch. The
+scope is minted by `/api/kai/tickets` exactly when `OTEL_EXPORTER_OTLP_ENDPOINT`
+is set, so the sandbox's traces land wherever the broker's do, and nowhere
+when the instance exports nothing.
+
+Two halves, in this order: the app version carrying the route first, the
+engine's `HOST_BROKER_OTLP_URL` second. The URL is what makes the sandbox
+initialize OTel at all, and it also makes `otlp` an *active* relay scope
+that every turn needs a ticket for — set it against an app that does not
+mint one and every turn fails before the prompt is sent. Rolling back is
+the reverse: clear the URL, then the app.
+
+Not exported by anything: HTTP request spans and database calls.
 
 ## No telemetry vendor
 

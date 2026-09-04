@@ -261,6 +261,38 @@ def test_zero_chunk_document_is_needs_review(e2e_env, tmp_path, monkeypatch):
     assert row["processing_detail"]["reason"] == "extraction produced no text chunks"
 
 
+def test_ingest_preloaded_text_with_a_nul_byte_is_indexed_and_searchable(e2e_env, tmp_path):
+    """A NUL byte mid-word in converted text (a SharePoint crawl's own path:
+    `preloaded_text`) must not reject the document — PostgreSQL `text`
+    columns refuse to store `0x00` outright, which surfaced live as 261
+    rejected documents (an Oracle table export, several ordinary
+    SharePoint files) before `src.ingest.chunking._sanitize_control_chars`
+    started stripping it at the ingest boundary. Proven end to end: the
+    document indexes (not rejects) and a term either side of the stripped
+    byte finds it back through `src.ingest.retrieval.search`.
+    """
+    from src.ingest.retrieval import search
+    from src.ingest.runner import ingest_file
+    from src.repositories import corpus_chunks_repo, corpus_files_repo
+
+    corpus_id = _new_corpus("ing-nul")
+    missing_path = str(tmp_path / "does-not-exist.md")
+    file_id = _add_file(corpus_id, "ap_suppliers.md", "md", missing_path)
+
+    status = ingest_file(file_id, preloaded_text="in.c_keboola_ex_db_or\x00acle_ap_suppliers table export")
+    assert status == "indexed"
+    row = corpus_files_repo().get(file_id)
+    assert row["processing_status"] == "indexed"
+
+    chunks = corpus_chunks_repo().list_for_file(file_id)
+    assert len(chunks) == 1
+    assert "\x00" not in chunks[0]["text"]
+    assert chunks[0]["text"] == "in.c_keboola_ex_db_oracle_ap_suppliers table export"
+
+    results = search([corpus_id], "oracle_ap_suppliers")
+    assert any(r["file_id"] == file_id for r in results)
+
+
 def test_ingest_file_routes_zip_to_bundle(e2e_env, tmp_path, monkeypatch):
     """A zip row delegates to ingest_bundle (K1) instead of the prose path."""
     import src.ingest.bundle as bundle_mod
