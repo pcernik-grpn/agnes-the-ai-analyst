@@ -62,6 +62,35 @@ from tests.db_pg._parity_sweep_util import build_seeded_client
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
+
+def _timed_get(client, token: str, *, samples: int = 3):
+    """``(response, seconds)`` for ``GET /library`` — the FASTEST of
+    ``samples`` back-to-back requests, so the render-time assertions below
+    bound the page's own cost rather than one runner's momentary luck.
+
+    A single sample conflates that cost with two things the Library's query
+    shape has nothing to do with: the first request's one-off warm-up
+    (template compilation, lazy imports) and scheduling noise on a shared
+    CI runner (the PG shard runs ``-n auto`` workers next to an embedded
+    Postgres on a 4-vCPU box). Measured 2026-09-04: the analyst request
+    below is ~50 ms steady-state locally and was clocked at 1.43 s by one
+    CI sample, on a day the pre- and post-`fact_collection_stats` query
+    implementations benchmarked within 2 ms of each other on identical
+    data. The regressions this file guards (rounds 1-3: a per-collection
+    fetch, an unbounded candidate scan) are slow on EVERY sample, so the
+    fastest one still catches them; only the noise is discarded.
+    """
+    best: float | None = None
+    resp = None
+    for _ in range(samples):
+        t0 = time.monotonic()
+        resp = client.get("/library", headers={"Authorization": f"Bearer {token}"})
+        elapsed = time.monotonic() - t0
+        best = elapsed if best is None else min(best, elapsed)
+    assert resp is not None and best is not None
+    return resp, best
+
+
 N_COLLECTIONS = 400
 N_FILES_PER_COLLECTION = 100
 
@@ -195,9 +224,7 @@ def test_library_index_renders_under_a_second(tmp_path, monkeypatch, pg_engine):
     client, admin_token = build_seeded_client("pg", tmp_path, monkeypatch, pg_engine)
     _seed_production_shaped_corpus(pg_engine)
 
-    t0 = time.monotonic()
-    resp = client.get("/library", headers={"Authorization": f"Bearer {admin_token}"})
-    elapsed = time.monotonic() - t0
+    resp, elapsed = _timed_get(client, admin_token)
 
     assert resp.status_code == 200, resp.text
     assert elapsed < 1.0, f"GET /library took {elapsed:.2f}s for {N_COLLECTIONS} collections — expected under 1s"
@@ -345,9 +372,7 @@ def test_library_index_admin_sees_every_collection_including_admin_only(tmp_path
     client, admin_token = build_seeded_client("pg", tmp_path, monkeypatch, pg_engine)
     _seed_mixed_visibility_collections(pg_engine, visible_owner="admin1")
 
-    t0 = time.monotonic()
-    resp = client.get("/library", headers={"Authorization": f"Bearer {admin_token}"})
-    elapsed = time.monotonic() - t0
+    resp, elapsed = _timed_get(client, admin_token)
     assert resp.status_code == 200, resp.text
     assert elapsed < 1.0, f"admin GET /library (400 collections, all visible) took {elapsed:.2f}s — expected < 1s"
     body = resp.text
@@ -635,15 +660,11 @@ def test_library_index_renders_fast_for_a_large_admin_and_a_small_user(tmp_path,
     _seed_facet_graph(pg_engine)
     analyst_token = create_access_token("analyst1", "analyst@test.com")
 
-    t0 = time.monotonic()
-    resp_admin = client.get("/library", headers={"Authorization": f"Bearer {admin_token}"})
-    elapsed_admin = time.monotonic() - t0
+    resp_admin, elapsed_admin = _timed_get(client, admin_token)
     assert resp_admin.status_code == 200, resp_admin.text
     assert elapsed_admin < 1.0, f"admin (400 collections) GET /library took {elapsed_admin:.2f}s — expected < 1s"
 
-    t0 = time.monotonic()
-    resp_analyst = client.get("/library", headers={"Authorization": f"Bearer {analyst_token}"})
-    elapsed_analyst = time.monotonic() - t0
+    resp_analyst, elapsed_analyst = _timed_get(client, analyst_token)
     assert resp_analyst.status_code == 200, resp_analyst.text
     assert elapsed_analyst < 1.0, (
         f"analyst (5 collections, {N_FACET_VALUES}-fact graph) GET /library took {elapsed_analyst:.2f}s — expected < 1s"

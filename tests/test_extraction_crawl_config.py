@@ -33,11 +33,15 @@ def _auth(token: str) -> dict:
 
 def _extract_block(text: str, opener: str) -> str:
     """The brace-balanced body of one declaration, from its signature —
-    same helper `test_admin_data_sources_extraction.py` uses."""
+    same helper `test_admin_data_sources_extraction.py` uses, except that the
+    braces INSIDE the opener are netted out before the scan continues past
+    it: a signature with a destructured parameter (`({ a, b } = {}) {`)
+    closes a brace pair of its own before the body even opens, and counting
+    from the opener's first character would stop right there."""
     start = text.index(opener)
-    depth = 0
-    started = False
-    for i in range(start, len(text)):
+    depth = opener.count("{") - opener.count("}")
+    started = depth > 0
+    for i in range(start + len(opener), len(text)):
         ch = text[i]
         if ch == "{":
             depth += 1
@@ -502,7 +506,7 @@ class TestCrawlFilterCardSave:
         fns = "\n".join(
             _extract_block(tpl, sig)
             for sig in (
-                "async function _crawlFilterPatch(id, minModified) {",
+                "async function _crawlConfigPatch(id, { minModified, schedule } = {}) {",
                 "function crawlFilterSave(id) {",
                 "function crawlFilterClear(id) {",
             )
@@ -556,11 +560,27 @@ async function fetch(url, opts) {{
         out = self._run(action="save", input_value="2026-02-01")
         assert out["requests"][0]["url"] == "/api/admin/sharepoint/connections/sp1/extraction/crawl-config"
         assert out["requests"][0]["method"] == "PATCH"
-        assert out["requests"][0]["body"] == {"min_modified": "2026-02-01"}
+        # The schedule control (D.16) shares this PATCH; an untouched control
+        # is re-sent as its current value (here: none) — never omitted, since
+        # the endpoint reads an omitted `min_modified` as "cleared".
+        assert out["requests"][0]["body"] == {"min_modified": "2026-02-01", "schedule": None}
+
+    def test_a_filter_save_resends_the_connections_own_schedule_untouched(self):
+        out = self._run(
+            action="save",
+            input_value="2026-02-01",
+            prior_config={"extraction": {"crawl": {"schedule": "every 6h"}}},
+            response_body={
+                "min_modified": {"value": "2026-02-01", "source": "connection"},
+                "schedule": {"value": "every 6h", "source": "connection", "next_run_at": None},
+            },
+        )
+        assert out["requests"][0]["body"] == {"min_modified": "2026-02-01", "schedule": "every 6h"}
+        assert out["conn"]["config"]["extraction"]["crawl"] == {"min_modified": "2026-02-01", "schedule": "every 6h"}
 
     def test_clear_blanks_the_input_and_sends_null(self):
         out = self._run(action="clear", input_value="2026-02-01")
-        assert out["requests"][0]["body"] == {"min_modified": None}
+        assert out["requests"][0]["body"] == {"min_modified": None, "schedule": None}
         assert out["inputValue"] == ""
 
     def test_the_resolved_value_and_source_are_shown_after_save(self):

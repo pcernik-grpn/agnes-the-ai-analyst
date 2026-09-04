@@ -149,6 +149,13 @@ _PK_COLUMNS: Dict[str, List[str]] = {
     # SharePoint crawl/facts per-connection state (0096) — PG-only with no
     # DuckDB source; PK is (connection_id, kind), not "id".
     "sharepoint_connection_state": ["connection_id", "kind"],
+    # per-collection fact stats (0105) — PG-only with no DuckDB source; the
+    # summary row is keyed by the collection alone, the two membership
+    # tables by (collection, fact) / (collection, edge). `extraction_
+    # conditions` (0104) keeps a plain "id" PK and needs no entry.
+    "fact_collection_stats": ["corpus_id"],
+    "fact_collection_membership": ["corpus_id", "fact_id"],
+    "edge_collection_membership": ["corpus_id", "edge_id"],
 }
 
 

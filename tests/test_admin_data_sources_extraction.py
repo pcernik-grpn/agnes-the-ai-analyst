@@ -86,6 +86,7 @@ _SIGNATURES = (
     "function _extFactsPendingLine(status) {",
     "function _extRenderFactsButton(connId, status) {",
     "function _extRender(connId) {",
+    "function _extRenderNextRun(connId, status) {",
     "function _extRunsHtml(connId, body) {",
     "const EXT_ORIGIN_LABEL = {",
     "function _extConfigHtml(body) {",

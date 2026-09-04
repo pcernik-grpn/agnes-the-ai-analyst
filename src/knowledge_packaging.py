@@ -199,8 +199,8 @@ def build_artifact(corpus_id: str, *, batch_size: int = _DEFAULT_CHUNK_BATCH_SIZ
     of corpus size.
 
     The build happens under a per-call, randomly-suffixed tmp path rather
-    than a fixed ``<corpus_id>.duckdb.build.tmp`` — TWO ``duckdb.connect()``
-    calls to the SAME path in the SAME process share one underlying
+    than a fixed ``<corpus_id>.duckdb.build.tmp`` — two DuckDB handles
+    opened on the SAME path in the SAME process share one underlying
     database instance, so two overlapping builds of the same corpus used to
     collide on each other's ``CREATE TABLE chunks`` (the live incident this
     fix addresses; see the module docstring). Any stale tmp file left behind

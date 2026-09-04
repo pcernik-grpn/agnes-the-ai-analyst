@@ -1656,9 +1656,13 @@ def crawl_config(
         payload["min_modified"] = None if clear else min_modified
     elif schedule is not None:
         current = api_get(f"/api/admin/sharepoint/connections/{connection_id}")
-        if current.status_code == 200:
-            crawl_now = (((current.json().get("config") or {}).get("extraction") or {}).get("crawl")) or {}
-            payload["min_modified"] = crawl_now.get("min_modified")
+        if current.status_code != 200:
+            # A pre-read that fails is a hard stop, never a shrug: sending
+            # the PATCH without `min_modified` would let that "omitted ==
+            # cleared" contract wipe a filter this call never meant to touch.
+            _fail(current)
+        crawl_now = (((current.json().get("config") or {}).get("extraction") or {}).get("crawl")) or {}
+        payload["min_modified"] = crawl_now.get("min_modified")
     if schedule is not None:
         payload["schedule"] = schedule
 

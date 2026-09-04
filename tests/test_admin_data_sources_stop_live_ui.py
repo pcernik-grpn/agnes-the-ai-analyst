@@ -85,6 +85,7 @@ _SIGNATURES = (
     "function _extRenderInAgnesButton(connId, status) {",
     "function _extRenderFactsButton(connId, status) {",
     "function _extRender(connId) {",
+    "function _extRenderNextRun(connId, status) {",
 )
 
 # The network-touching functions, pulled in only for the tests that click

@@ -1586,13 +1586,35 @@ class TestCrawlConfig:
         assert kwargs["json"] == {"min_modified": None, "schedule": "instance"}
 
     def test_an_invalid_schedule_server_side_400_is_reported(self):
-        with patch(
-            "cli.commands.admin_sharepoint.api_patch",
-            return_value=_resp(400, {"detail": "invalid_crawl_schedule"}),
+        # `--schedule` alone pre-reads the connection (see the test above),
+        # so that GET must be answered too — otherwise the CLI never reaches
+        # the PATCH whose 400 this test is about.
+        get_body = {"id": "conn1", "config": {"extraction": {"crawl": {}}}}
+        with (
+            patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(200, get_body)),
+            patch(
+                "cli.commands.admin_sharepoint.api_patch",
+                return_value=_resp(400, {"detail": "invalid_crawl_schedule"}),
+            ) as mock_patch,
         ):
             result = runner.invoke(app, ["admin", "sharepoint", "crawl-config", "conn1", "--schedule", "sometimes"])
         assert result.exit_code == 1
         assert "invalid_crawl_schedule" in result.output
+        _, kwargs = mock_patch.call_args
+        assert kwargs["json"] == {"min_modified": None, "schedule": "sometimes"}
+
+    def test_schedule_alone_refuses_when_the_pre_read_fails(self):
+        """The pre-read exists so `min_modified` is re-sent explicitly; if it
+        cannot be read, sending the PATCH anyway would let the endpoint's
+        "omitted == cleared" contract wipe it — so the CLI stops instead."""
+        with (
+            patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(404, {"detail": "connection_not_found"})),
+            patch("cli.commands.admin_sharepoint.api_patch") as mock_patch,
+        ):
+            result = runner.invoke(app, ["admin", "sharepoint", "crawl-config", "conn1", "--schedule", "every 6h"])
+        assert result.exit_code == 1
+        assert "connection_not_found" in result.output
+        mock_patch.assert_not_called()
 
 
 _FLEET_BODY = {
