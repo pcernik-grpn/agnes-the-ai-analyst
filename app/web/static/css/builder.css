@@ -349,7 +349,15 @@ a.ag-addrow { display: block; box-sizing: border-box; text-align: center; text-d
 .ag-chip:hover { border-color: var(--ds-primary); color: var(--ds-primary); }
 .ag-comp-box { display: flex; align-items: flex-end; gap: 8px; border: 1.5px solid var(--ds-primary); border-radius: 12px; background: var(--ds-surface); padding: 7px 7px 7px 14px; }
 .ag-comp-box:focus-within { box-shadow: 0 0 0 3px var(--ds-primary-light); }
-.ag-comp-box textarea { flex: 1; border: none; background: none; resize: none; font-family: inherit; font-size: 14.5px; color: var(--ds-text-primary); padding: 6px 0; max-height: 140px; }
+/* `rows="1"` on the markup gives the textarea a single-line intrinsic height;
+   nothing repaints that until the `input` listener fires on the first
+   keystroke (see the composer's `oninput` wiring in each builder page). Before
+   that — on mount, or while only the placeholder is showing — a two-line
+   placeholder like the semantic-model builder's overflowed that one line and
+   forced the browser's own scrollbar inside the box. `min-height` covers the
+   gap the JS resize doesn't run for yet, without touching the JS grow-on-type
+   behavior (`max-height` below still caps it at 140px). */
+.ag-comp-box textarea { flex: 1; border: none; background: none; resize: none; font-family: inherit; font-size: 14.5px; line-height: 1.4; color: var(--ds-text-primary); padding: 6px 0; min-height: 56px; max-height: 140px; }
 .ag-comp-box textarea:focus { outline: none; }
 .ag-send { border: none; background: var(--ds-primary); color: var(--ds-text-inverse); font-family: inherit; font-size: 13.5px; font-weight: 600; border-radius: 9px; padding: 8px 16px; cursor: pointer; display: inline-flex; align-items: center; gap: 7px; }
 .ag-send[disabled] { opacity: 0.55; cursor: not-allowed; }
