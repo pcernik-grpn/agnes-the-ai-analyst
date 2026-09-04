@@ -169,6 +169,42 @@
    path or a dialect and wrong for five facts. */
 .sl-grid .fbar-card__meta { white-space: normal; overflow: visible; text-overflow: clip; line-height: 1.45; }
 
+/* "New model" — the FIRST CELL of the collection, not a button in a toolbar
+   above it, which is the shape /agents settled on (`.ag-new`) and the reason
+   is the same: the affordance to make one belongs among the ones that exist.
+   Deliberately the same metrics as that card so the two pages read as one
+   product; `min-height` matches `.fbar-card`'s reserved body so the first row
+   does not sit shorter than the rest.
+
+   It is an <a>, not a <button>: the builder is a page, so the browser's own
+   middle-click / new-tab / back behaviour should work rather than be
+   reimplemented. It carries NEITHER `data-ft` NOR `data-tab`, and is not a
+   `.fbar-card` — see the filter engine's `refreshCount`, which counts
+   `.fbar-card` in the active bucket and hides what does not match. Wearing
+   either hook would make the card inflate "3 of 12 models" and disappear
+   mid-search. */
+.sl-new {
+  border: 1.5px dashed var(--ds-border);
+  background: var(--ds-surface-sunken);
+  color: var(--ds-text-secondary);
+  border-radius: 14px;
+  padding: 16px 18px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  font-size: 14px;
+  font-weight: 600;
+  text-decoration: none;
+  min-height: 158px;
+  transition: color var(--ds-motion-fast) var(--ds-ease-standard), border-color var(--ds-motion-fast) var(--ds-ease-standard);
+}
+.sl-new:hover { border-color: var(--ds-primary); color: var(--ds-primary); background: var(--ds-primary-light); }
+.sl-new:focus-visible { outline: var(--ds-focus-outline); outline-offset: var(--ds-focus-outline-offset); }
+/* The plus at the weight of the cards' icon tile, so the first cell has a mark
+   where its neighbours have one and the row's rhythm survives. */
+.sl-new__plus { font-size: 19px; font-weight: 500; line-height: 1; }
+
 /* An invalid document is still a real card, flagged rather than styled
    away — an attribute selector rather than a second class on the `<article>`
    `fbar_card()` already stamps with `class="fbar-card"` (a caller-supplied
@@ -494,6 +530,18 @@
 <div class="sl-bucket" data-bucket="models"{% if active_tab != 'models' %} hidden{% endif %}>
 {% if models %}
 <div class="fbar-grid sl-grid" id="models-list">
+    {# The authoring door, first in the grid. `can_author_model` is the server's
+       one answer to "can this caller's Save actually succeed" — an admin
+       publishes, anyone else queues a proposal, and the flag is false when
+       neither is available (see router::_can_author_semantic_model). The empty
+       collection cannot use this card, because the grid it lives in is inside
+       `{% if models %}`; the empty panel below carries the same door. #}
+    {% if can_author_model %}
+    <a class="sl-new" href="/semantic-layer/new">
+      <span class="sl-new__plus" aria-hidden="true">+</span>
+      <span>New model</span>
+    </a>
+    {% endif %}
     {% for m in models %}
     {% set _is_invalid = m.status == 'invalid' %}
     {# The card's `tags` carry only what the model HAS. A zero spent one of the
@@ -575,10 +623,26 @@
    chrome gates admin actions; a non-admin (or a page that somehow doesn't
    know the caller) gets a neutral body line instead, never a CTA that
    dead-ends. #}
+{# UPDATE to the rule above, not a departure from it: "author a model" used to
+   be a path only the API and the hidden Studio page could walk, so the body
+   named it and nothing offered it. It is now a page, so the offer follows the
+   same test as the import CTA — one door per caller, and only one that works.
+
+   The admin keeps IMPORTING as the primary action. On a fresh instance a
+   source usually carries a whole metastore where hand-authoring carries one
+   model, so the bulk path stays the button and authoring sits beside it as a
+   link. A non-admin who can author gets it as their button: before the
+   builder they were told to go ask someone, which was the only true thing the
+   page could say and is no longer. #}
 {% if session.user.is_admin %}
 {{ state.panel('empty', 'No semantic model available',
-               body='Import or author a semantic model to get started.',
+               body='Import a semantic model from a source, or author one by hand.',
                cta_label='Add a semantic source', cta_href='/admin/semantic-sources') }}
+<p class="sl-empty-related-link">Or <a href="/semantic-layer/new">author a model by hand</a> — datasets, metrics and the context an agent needs to read them.</p>
+{% elif can_author_model %}
+{{ state.panel('empty', 'No semantic model available',
+               body='Author one and an admin will review it, or ask for access to an existing model.',
+               cta_label='Author a model', cta_href='/semantic-layer/new') }}
 {% else %}
 {{ state.panel('empty', 'No semantic model available',
                body='Ask an admin to import or author one, or to grant you access to an existing one.') }}

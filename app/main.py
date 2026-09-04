@@ -556,6 +556,7 @@ from app.api.agent_builder import router as agent_builder_router  # builder assi
 from app.api.entity_builder import router as entity_builder_router  # /skills builder turns
 from app.api.package_builder import router as package_builder_router  # data-package builder turns
 from app.api.mcp_builder import router as mcp_builder_router  # MCP-source builder turns
+from app.api.semantic_model_builder import router as semantic_model_builder_router  # semantic-model builder turns
 from app.api.facts import router as facts_router  # fact graph over Collections read surface
 from app.api.ontology import router as ontology_router  # ontology builder (fact-graph §13.2)
 from app.api.sharing import router as sharing_router  # owner-initiated Library sharing
@@ -3021,6 +3022,7 @@ def create_app() -> FastAPI:
     app.include_router(entity_builder_router)
     app.include_router(package_builder_router)
     app.include_router(mcp_builder_router)
+    app.include_router(semantic_model_builder_router)
     app.include_router(facts_router)
     app.include_router(ontology_router)
     app.include_router(sharing_router)

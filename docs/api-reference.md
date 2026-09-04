@@ -2095,6 +2095,7 @@ so comments and key order survive.
 - /api/semantic-models/context
 - /api/semantic-models/schema
 - /api/semantic-models/apply
+- /api/semantic-models/builder/turn
 - /api/semantic-models/bundle
 
 `POST /api/admin/semantic-models` validates the pasted document against the
@@ -2174,6 +2175,24 @@ non-admin branch also 409s `duplicate_pending` while an earlier proposal for
 the same slug awaits review, and 403s `studio_disabled` when the Studio
 toggle is off. CLI: `agnes semantic-model apply`. MCP:
 `apply_semantic_model`.
+
+`POST /api/semantic-models/builder/turn` runs one turn of the `/semantic-
+layer/new` builder's conversation — the fifth adapter on the shared
+`app/api/builder_core.py` turn contract, alongside the agent, `/skills`,
+data-package and MCP-source builders above. It takes `{message, history,
+draft}` and returns `{reply, patch, suggestions}`, writing **nothing**: a
+model has no row until Save (`POST /api/semantic-models/apply` above), so
+the draft lives in the author's browser and the patch is merged there for
+review. Grounding is server-side and RBAC-filtered rather than trusted from
+the caller: a proposed dataset `source` must resolve to a registered table
+the caller can actually read, and once a dataset names one, its proposed
+`fields` are checked against that table's real columns (the same
+RBAC-enforcing `build_schema` `GET /api/v2/schema/{table_id}` uses) — the
+model can never invent a table path or a column name. Open to any
+authenticated caller, matching `apply`'s own asymmetry: drafting is not
+itself gated on Studio, only Save's non-admin branch is. With no AI
+credential configured it answers `503 builder_llm_unavailable` and the panel
+stays fully usable by hand.
 
 `POST /api/semantic-models/validate-query` validates a SQL statement against
 the caller's accessible `status='valid'` models (same RBAC tier as

@@ -387,16 +387,26 @@ class TestThePickerKeptWhatTheRetiredDrawerHad:
         # Multi-select: "the Keboola tables AND the BigQuery ones" is one
         # question, not two visits.
         assert "matchesFilters" in src
-        assert "list.splice(at, 1)" in src, "a chosen facet must be un-choosable"
+        assert "flist.splice(fat, 1)" in src, "a chosen facet must be un-choosable"
 
     def test_a_facet_group_says_what_it_is_a_group_of(self) -> None:
         """`internal` is a value of BOTH vocabularies — a source_type and a
-        query_mode — so an unlabelled strip renders the same chip twice, a line
-        apart, meaning two different things."""
+        query_mode — so an unlabelled list renders the same option twice,
+        meaning two different things.
+
+        PR #2187 paired an equivalent redesign (a Filter button, a faceted
+        menu, a chip row, `.fbar-menu__title`) with this page, but that half
+        of the PR's "One filter" section is explicitly superseded again by
+        #2196 and was not adopted here — this page keeps its own always-
+        visible toggle strip (`pdw-pickctl__grp`), which already labels each
+        group via `aria-label`. The rule the two designs share is unchanged:
+        neither surface may show a bare, unlabelled value.
+        """
         src = COMPONENT.read_text(encoding="utf-8")
-        assert "pdw-pickctl__k" in src
-        css = (STATIC / "css" / "package_drawer.css").read_text(encoding="utf-8")
-        assert ".pdw-pickctl__k" in css
+        assert "pdw-pickctl__grp" in src
+        assert 'aria-label="Filter by \' + esc(label) + \'"' in src
+        assert "toggles('source_type', 'source')" in src
+        assert "toggles('query_mode', 'query mode')" in src
 
     def test_the_in_no_package_toggle_reads_a_server_flag(self) -> None:
         """Membership spans every OTHER package, so the client cannot derive
