@@ -46,12 +46,21 @@ _LOADED = (
 #: together, so both have to come back together.
 _INCLUDED = (_WEB / "templates" / "_add_data_wizard.html",)
 
+#: Stylesheets the page loads that used to be inline <style> blocks in the
+#: template. Same reason `_LOADED` exists: a test that string-searches the
+#: "page" for a CSS rule must keep finding it after the rule moved into a
+#: file. Appended AFTER the scripts, which costs nothing — every caller
+#: either searches the whole string or lifts a JS function by name, and a
+#: CSS rule cannot be mistaken for either.
+_STYLES = (_WEB / "static" / "css" / "ds_page.css",)
+
 
 def page_source() -> str:
-    """Template text with every classic script it loads appended."""
+    """Template text with every classic script and stylesheet it loads appended."""
     parts = [TEMPLATE.read_text(encoding="utf-8")]
     parts.extend(p.read_text(encoding="utf-8") for p in _INCLUDED if p.exists())
     parts.extend(p.read_text(encoding="utf-8") for p in _LOADED if p.exists())
+    parts.extend(p.read_text(encoding="utf-8") for p in _STYLES if p.exists())
     return "\n".join(parts)
 
 

@@ -48,7 +48,7 @@ def read_admin_data_sources_source() -> str:
 
 def fetch_admin_data_sources_page(seeded_app) -> str:
     """``GET /admin/data-sources`` (a REAL round trip through the app —
-    exercises auth same as before) with the loaded static JS appended, so
+    exercises auth same as before) with the loaded static JS and CSS appended, so
     a test that string-searches the "page" for a JS fragment still finds it
     regardless of which physical file it now lives in (perf follow-up,
     2026-09-03). Reads the static files from disk rather than issuing more
@@ -60,4 +60,10 @@ def fetch_admin_data_sources_page(seeded_app) -> str:
         headers={"Authorization": f"Bearer {seeded_app['admin_token']}"},
     )
     static_js = "\n".join(p.read_text(encoding="utf-8") for p in _ds_page_source._LOADED if p.exists())
-    return resp.text + "\n" + static_js
+    # Same for the stylesheets: the page's own CSS moved out of three inline
+    # <style> blocks into `css/ds_page.css` so the data-package builder can
+    # load it too, and a test that searches this "page" for a rule (a class
+    # name, a token) must keep finding it. Appended for exactly the reason
+    # the scripts are.
+    static_css = "\n".join(p.read_text(encoding="utf-8") for p in _ds_page_source._STYLES if p.exists())
+    return resp.text + "\n" + static_js + "\n" + static_css
