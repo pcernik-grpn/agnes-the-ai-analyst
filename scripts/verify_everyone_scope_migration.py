@@ -120,13 +120,15 @@ SELECT user_id, rtype, rid, req FROM (
 
     UNION ALL
 
-    -- An everyone-scoped grant reaches every account. `group_id` is a
+    -- An everyone-scoped grant reaches every person. `group_id` is a
     -- carrier and is deliberately NOT joined on: an account in no group at
     -- all is reached, which is what the old group model could not say.
+    -- `kind` is: the audience is people, never a service account or one of
+    -- the identities Agnes seeds for itself (#2256).
     SELECT u.id, rg.resource_type, rg.resource_id, rg.requirement
     FROM resource_grants rg
     CROSS JOIN users u
-    WHERE rg.scope = 'everyone'
+    WHERE rg.scope = 'everyone' AND u.kind = 'human'
 ) reach(user_id, rtype, rid, req)
 WHERE {_MARKER_EXCLUSION} AND {_DISABLED_PLUGIN_EXCLUSION}
 """
