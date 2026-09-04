@@ -23,13 +23,13 @@
   {# Pre-conversation dashboard styles (.rdb-* — greeting, activity panels,
      task starters). #}
   <link rel="stylesheet" href="{{ static_url('css/chat_dashboard.css') }}" />
-  <link rel="stylesheet" href="/static/vendor/highlight.min.css" />
+  <link rel="stylesheet" href="{{ static_url('vendor/highlight.min.css') }}" />
   {# The shared file-preview modal (.fp-*) — the same surface the Library
      uses, reused by the session-files drawer so a deck the agent just built
      can be read without downloading it first. #}
   <link rel="stylesheet" href="{{ static_url('css/file_preview.css') }}" />
-  <script src="/static/vendor/marked.min.js"></script>
-  <script src="/static/vendor/highlight.min.js"></script>
+  <script src="{{ static_url('vendor/marked.min.js') }}"></script>
+  <script src="{{ static_url('vendor/highlight.min.js') }}"></script>
   {# The anti-FOUC pre-paint for the chat sidebar's mini state was here. It
      stamped `data-chat-sidebar="mini"` on <html> before first render, and
      already skipped the rail — "rail has no mini-collapse; a stored flag from

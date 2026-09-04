@@ -171,10 +171,16 @@ Three things to know:
 - **`dd-agent` joins the `docker` group**, which is root-equivalent on this
   host — the same posture the module already accepts for `agnes-applier`. The
   rendered `datadog.yaml` turns off everything that could make that membership
-  remotely reachable: remote configuration, APM, logs, DogStatsD,
+  remotely reachable: remote configuration, APM, DogStatsD,
   process/container/discovery collection, runtime security, compliance, SBOM,
   image and lifecycle collection, and both inventory uploads. IPC binds to
   loopback and container env vars never become tags.
+- **Container logs go to Datadog too, by default.** `container_logs_destination`
+  resolves to `datadog` whenever `enable_datadog` is on, which turns on log
+  collection in that same `datadog.yaml` and stops the Cloud Logging pipeline.
+  That is egress, not privilege — the agent could already read the logs through
+  the docker socket — but it is the setting that sends them off the host, so
+  read [`datadog-logging.md`](datadog-logging.md) before enabling either.
 - **It reaches a running VM only through a recreate.** The agent is installed by
   the startup script, and `metadata_startup_script` is in `ignore_changes`, so
   enabling this on a live fleet produces the IAM binding and the labels with no

@@ -80,7 +80,7 @@ BASE_VARS: dict = {
     "data_apps_subdomain_base": "",
     "data_apps_runtime_image": "example/runtime:1",
     "enable_watchdog": True,
-    "enable_gcp_logging": True,
+    "cloud_logging_logs_active": True,
     "alert_webhook_url": "",
     "watchdog_files_b64": {"agnes-watchdog.sh": _b64("#!/bin/bash\n")},
     "ops_agent_config_b64": _b64("logging: {}\n"),
@@ -204,7 +204,7 @@ def test_the_key_never_reaches_argv_or_the_startup_log(on: str):
     assert "set -x" not in on, "a trace would print the key"
     # Substitution is bash parameter expansion on a variable, never sed/argv.
     assert "${_dd_content//@@DD_API_KEY@@/$DD_API_KEY_VALUE}" in on
-    block = on[on.index("--- DATADOG AGENT") : on.index("# Boot-time gcplogs driver probe")]
+    block = on[on.index("--- DATADOG AGENT") : on.index("# Boot-time collector probe")]
     assert not re.search(r"\bsed\b[^\n]*DD_API_KEY", block), (
         "a sed substitution would put the key on argv, and from there into /proc "
         "and into this script's own log on any error"
@@ -341,7 +341,7 @@ def test_the_artifact_installer_cannot_abort_the_boot(on: str):
 
 
 def test_no_step_of_the_agent_block_can_fail_the_boot(on: str):
-    block = on[on.index("--- DATADOG AGENT") : on.index("# Boot-time gcplogs driver probe")]
+    block = on[on.index("--- DATADOG AGENT") : on.index("# Boot-time collector probe")]
     # Code, not comments — the block explains WHY errexit matters here, which is
     # not the same as re-arming it.
     code = "\n".join(ln for ln in block.splitlines() if not ln.lstrip().startswith("#"))

@@ -289,8 +289,12 @@ fi
 # rotates — a routinely-recreated container (agnes-auto-upgrade ticks every
 # 5 min) can accumulate unbounded log files on the boot disk, on top of the
 # recreate itself already destroying the previous container's log history.
-# This is the fallback for VMs that don't run docker-compose.gcp-logging.yml
-# (enable_gcp_logging=false, or any non-GCE deployment of this module).
+# This is the driver for every VM that does not run
+# docker-compose.gcp-logging.yml — any destination other than cloud_logging
+# (container_logs_destination), or any non-GCE deployment of this module. On a
+# VM shipping to Datadog it is not a fallback but the primary log store the
+# agent reads through the Docker API, so the rotation bound below is what caps
+# what a burst can cost the boot disk.
 # Placed here — BEFORE the data disk mount and well before any `docker
 # compose up` — because a daemon restart is safe with no containers running
 # and unsafe once they are. Written ONLY when the file is absent: an
@@ -515,13 +519,24 @@ chmod +x /usr/local/bin/agnes-auto-upgrade.sh
 # script's own first `up -d` engages it too. On a non-GCE / non-GCP
 # deployment (or an operator who wants the default json-file driver
 # instead), remove it right back out so that gate stays false. Runs on
-# every boot, so it also self-heals a VM whose enable_gcp_logging flipped
-# since the last provisioning.
-%{ if !enable_gcp_logging ~}
+# every boot, so the overlay itself self-heals on a VM whose log destination
+# flipped since the last provisioning. The Ops Agent PACKAGE does not: its
+# install block below is inside the cloud_logging guard, so a VM moving away
+# from Cloud Logging would keep an installed agent listening on 24224. That is
+# inert (the overlay is gone and the marker cleared, so nothing forwards to it)
+# and unreachable through the supported path anyway — a destination change is a
+# -replace onto a fresh boot disk.
+#
+# Removing it is also what makes the Datadog destination work: the containers
+# fall back to the daemon's default json-file driver, which is the one the
+# Datadog Agent's Docker API tailer is supported against. Under fluentd that
+# API serves Docker's dual-logging cache instead — it happens to work, but on
+# behaviour Datadog does not document.
+%{ if !cloud_logging_logs_active ~}
 rm -f "$APP_DIR/docker-compose.gcp-logging.yml"
 %{ endif ~}
 
-%{ if enable_gcp_logging ~}
+%{ if cloud_logging_logs_active ~}
 # --- OPS AGENT (Cloud Logging collector) ---------------------------------
 # The overlay forwards container logs to a fluent_forward receiver on
 # loopback; this is what listens on it. Using the agent rather than Docker's
@@ -755,15 +770,16 @@ if systemctl is-enabled --quiet agnes-datadog-pg-role.timer 2>/dev/null; then
 fi
 %{ endif ~}
 
-# Boot-time gcplogs driver probe — defense in depth for #1557. Docker
-# refuses to START a container whose log driver cannot initialize, so an
-# armed overlay on a VM whose service account cannot write to Cloud Logging
-# turns the next container recreate into a full outage (observed live:
-# app/scheduler stuck in `created`, 9 minutes of 502). The Terraform module
-# grants roles/logging.logWriter alongside enable_gcp_logging=true, but an
+# Boot-time collector probe — what is left of the defense in depth for
+# #1557. The driver is async now, so an armed overlay can no longer keep a
+# container in `created`; what it CAN do is buffer every line into a socket
+# nobody reads. So the probe asks the question that remains: is anything
+# listening on the Ops Agent's forward port? The Terraform module grants
+# roles/logging.logWriter alongside enable_gcp_logging=true, but an
 # out-of-band deployment — or a caller whose deploying identity could not
-# create project-IAM bindings — may still lack it. Probe the driver once
-# per boot with a no-op container; only success arms the shared marker
+# create project-IAM bindings — may still lack it, and the agent then
+# starts and fails every flush. One TCP connect per boot; only success arms
+# the shared marker
 # ($APP_DIR/.gcp-logging-ok) that EVERY COMPOSE_FILE builder requires
 # (section 4 below, agnes-auto-upgrade.sh, agnes-state-applier.sh — all
 # through agnes_gcp_logging_active), so boot and the recurring ticks can
@@ -1322,10 +1338,11 @@ fi
 # append the very first boot ran the stack on the json-file driver, and the
 # first auto-upgrade tick lazily initializes its config marker to the status
 # quo (no drift detected) — so logs didn't reach Cloud Logging until some
-# unrelated recreate. Section 3 above removed the extracted file when
-# enable_gcp_logging=false and armed $APP_DIR/.gcp-logging-ok only when the
-# gcplogs driver passed its probe, so file presence + marker is the single
-# switch, exactly as the resolver sees it (#1557, #1558). Appended before
+# unrelated recreate. Section 3 above removed the extracted file whenever
+# Cloud Logging is not the chosen destination (container_logs_destination)
+# and armed $APP_DIR/.gcp-logging-ok only when something answered on the
+# collector's forward port, so file presence + marker is the single switch,
+# exactly as the resolver sees it (#1557, #1558). Appended before
 # the deploy-layer overlays (dispatcher/kai-agent) to match the resolver's
 # managed-first ordering and keep kai-agent last for the strict-boot strip
 # below.

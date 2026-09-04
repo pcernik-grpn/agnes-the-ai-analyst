@@ -1,3 +1,15 @@
+    <!-- Cache-buster URLs for /static assets that a plain <script src> or
+         hardcoded fetch() can't run through static_url() (external file, or
+         a lazy runtime fetch/import) — so VersionedStaticFiles' immutable
+         cache still applies to them instead of falling back to no-cache on
+         every load. Non-deferred: must run before icon_sprite.js (deferred)
+         fetches the sprite below. Included from both base.html and
+         base_ds.html, so every page gets these regardless of layout. -->
+    <script>
+      window._agLucideSpriteUrl = "{{ static_url('vendor/lucide-sprite.svg') }}";
+      window._agMermaidUrl = "{{ static_url('vendor/mermaid.min.js') }}";
+      window._agTourUrl = "{{ static_url('js/tour.js') }}";
+    </script>
     <!-- Lucide sprite loader (#1503) — injects vendor/lucide-sprite.svg inline
          so `ds.icon()` / `iconEl()` can use SAME-DOCUMENT <use href="#name">
          references (external-document <use> only works in Safari 17.1+).

@@ -47,6 +47,27 @@ locals {
   # app image tag a VM happens to be pinned to.
   ops_agent_config_b64 = filebase64("${path.module}/files/ops-agent-config.yaml")
 
+  # --- Which collector gets the container logs (var.container_logs_destination) ---
+  #
+  # Exactly one, because Docker allows exactly one log driver per container:
+  # Cloud Logging needs `fluentd` (the Ops Agent is what re-parses the JSON
+  # line), Datadog needs the default `json-file`. Empty resolves to Datadog
+  # when it is on, because an operator who has the metrics and the monitors in
+  # Datadog wants the logs next to them; "auto" is accepted as an explicit
+  # spelling of the same thing.
+  #
+  # enable_gcp_logging stays the PERMIT switch (it is what grants the two IAM
+  # roles), and these locals are the SELECT. A VM can therefore hold the grants
+  # while shipping to Datadog, which makes flipping back a recreate rather than
+  # an IAM change.
+  container_logs_destination = (
+    contains(["cloud_logging", "datadog", "none"], var.container_logs_destination)
+    ? var.container_logs_destination
+    : var.enable_datadog ? "datadog" : var.enable_gcp_logging ? "cloud_logging" : "none"
+  )
+  cloud_logging_logs_active = local.container_logs_destination == "cloud_logging"
+  datadog_logs_active       = local.container_logs_destination == "datadog"
+
   # --- Opt-in Datadog host monitoring (var.enable_datadog) ---
   #
   # `env` is the single dimension every caller-side monitor scopes on. It
@@ -110,9 +131,10 @@ locals {
       { for f in local.datadog_static_files : f => filebase64("${path.module}/files/datadog/${f}") },
       {
         "datadog.yaml" = base64encode(templatefile("${path.module}/files/datadog/datadog.yaml.tpl", {
-          site = var.datadog_site
-          env  = local.datadog_env
-          tags = local.datadog_tags[inst.name]
+          site        = var.datadog_site
+          env         = local.datadog_env
+          tags        = local.datadog_tags[inst.name]
+          enable_logs = local.datadog_logs_active
         }))
 
         # Terraform renders the deployment identity (env + the tag list) into
@@ -511,17 +533,16 @@ resource "google_secret_manager_secret_iam_member" "vm_datadog" {
   member    = "serviceAccount:${google_service_account.vm.email}"
 }
 
-# Cloud Logging writer for Docker's gcplogs log driver
-# (docker-compose.gcp-logging.yml, gated by var.enable_gcp_logging). The
-# driver authenticates as the VM's service account — the dedicated SA above,
-# attached to every instance below — and without this role it cannot
-# initialize. Docker refuses to START a container whose log driver fails to
-# initialize, so a VM running the overlay without the role goes fully down
-# on its next routine container recreate (the auto-upgrade cron), not at
-# provisioning time. The startup script's boot-time driver probe keeps such
-# a VM alive by disabling the overlay with a loud warning, but logs then
-# never reach Cloud Logging; this binding is what makes the default-on
-# feature actually work. Unlike the secret grants above this one is
+# Cloud Logging writer for the Ops Agent that receives the containers' logs
+# over Docker's fluentd driver (docker-compose.gcp-logging.yml, permitted by
+# var.enable_gcp_logging). The agent authenticates as the VM's service
+# account — the dedicated SA above, attached to every instance below — and
+# without this role every flush fails. It no longer takes the instance down:
+# the driver is async, so a collector that cannot authenticate costs log
+# lines and nothing else (it used to, which is what #1557 was). The startup
+# script's boot-time probe then leaves the overlay disarmed with a loud
+# warning and the logs stay local; this binding is what makes the
+# default-on feature actually work. Unlike the secret grants above this one is
 # project-level: roles/logging.logWriter only permits writing log entries,
 # and the driver's log target has no narrower resource to bind on. The
 # identity running `terraform apply` must be able to modify project IAM
@@ -792,7 +813,7 @@ resource "google_compute_instance" "vm" {
     data_apps_subdomain_base     = each.value.data_apps_subdomain_base
     data_apps_runtime_image      = var.data_apps_runtime_image
     enable_watchdog              = var.enable_watchdog
-    enable_gcp_logging           = var.enable_gcp_logging
+    cloud_logging_logs_active    = local.cloud_logging_logs_active
     alert_webhook_url            = var.alert_webhook_url
     watchdog_files_b64           = local.watchdog_files_b64
     ops_agent_config_b64         = local.ops_agent_config_b64
@@ -871,6 +892,20 @@ resource "google_compute_instance" "vm" {
     precondition {
       condition     = !var.enable_datadog || var.datadog_api_key_secret != ""
       error_message = "enable_datadog = true requires datadog_api_key_secret (the Secret Manager secret NAME holding the agent's API key)."
+    }
+
+    # Asking for a destination whose collector was never provisioned is the
+    # silent-failure shape again: the VM boots, the agent reports healthy, and
+    # nothing ships. Terraform's variable validation cannot see a second
+    # variable, so the cross-check lives here with the module's others.
+    precondition {
+      condition     = local.container_logs_destination != "datadog" || var.enable_datadog
+      error_message = "container_logs_destination = \"datadog\" requires enable_datadog = true — the log collector is the host agent that variable installs, not a separate component."
+    }
+
+    precondition {
+      condition     = local.container_logs_destination != "cloud_logging" || var.enable_gcp_logging
+      error_message = "container_logs_destination = \"cloud_logging\" requires enable_gcp_logging = true — that variable is what grants the VM service account roles/logging.logWriter and installs the Ops Agent."
     }
 
     # Same plan-time catch for the kai-agent engine: an enabled VM without

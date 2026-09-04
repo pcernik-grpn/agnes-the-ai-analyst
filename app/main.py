@@ -57,7 +57,6 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
-from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.gzip import GZipMiddleware
 from starlette.middleware.sessions import SessionMiddleware
@@ -2503,6 +2502,9 @@ def create_app() -> FastAPI:
             "/cli/wheel/",
             "/cli/download",
             "/marketplace.git",  # git smart-HTTP is self-chunked; double-gzip bloats
+            # Cover images (WebP/PNG/JPEG) are already compressed; same
+            # rationale as the parquet/attachments exclusions above.
+            "/uploads/",
         ),
     )
 
@@ -2897,10 +2899,17 @@ def create_app() -> FastAPI:
     except Exception:
         logger.exception("guardrails readiness probe failed at boot")
 
-    # Static files
+    # Static files. VersionedStaticFiles (app/web/cover_files.py) stamps a
+    # 1-year immutable Cache-Control only when the request carries the ?v=
+    # cache-buster. Most references get it from _static_url; the handful
+    # that can't run Jinja (external <script src>, a JS-side fetch/import)
+    # get it from a window._ag* URL stamped once in _app_scripts.html
+    # instead (see app/web/templates/_app_scripts.html).
+    from app.web.cover_files import VersionedStaticFiles
+
     static_dir = Path(__file__).parent / "web" / "static"
     if static_dir.exists():
-        app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+        app.mount("/static", VersionedStaticFiles(directory=str(static_dir)), name="static")
 
     # v50 admin-uploaded cover images. Lives under ${DATA_DIR}/uploads so
     # it survives across deploys (the app/web/static dir gets bundled into
