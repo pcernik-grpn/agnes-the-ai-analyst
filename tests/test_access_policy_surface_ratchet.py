@@ -237,6 +237,21 @@ COVERED: frozenset[str] = frozenset(
         # shape as `src/access_policy.py::policied_from_sql` itself.
         "app/api/access.py::_table_access_diagnoses",
         "app/api/access.py::_count_through_relation",
+        # K3 (RLS review #1979) -- an attachment binary belongs to exactly
+        # one row of its catalogue table, and table-level RBAC
+        # (`can_access_table`) only answers "can this caller read the
+        # table at all", not "is this specific row in their policied
+        # slice". `download_attachment` now calls the same-file
+        # `_row_visible_under_access_policy` before any catalogue/
+        # filesystem work, which itself calls `policied_relation` directly
+        # (and, only for a policied table, runs a bound existence check
+        # through the resolved relation) -- mirroring the
+        # `_count_through_relation` shape above: operates on an
+        # already-resolved `PoliciedRelation`, executed against the SAME
+        # analytics connection the table's master view already lives on
+        # under its own registry name, no `policied_from_sql` wrap needed.
+        "app/api/attachments.py::download_attachment",
+        "app/api/attachments.py::_row_visible_under_access_policy",
     }
 )
 
@@ -267,14 +282,33 @@ EXEMPT: frozenset[str] = frozenset(
         # here -- the whole point is to run the policy as the CHOSEN
         # persona regardless of who is asking, so it binds that persona's
         # identity/groups directly and reads through `probe_policy` +
-        # `get_analytics_db_readonly()` instead.
+        # `get_analytics_db_readonly()` instead. What the credential surface
+        # DOES still decide is who may ask at all: since the #1979 security
+        # review (F2) this route is gated by `require_admin_all_surface`, so
+        # a `surface='stack'` admin PAT never reaches its raw
+        # `base_sample_rows`.
         "app/api/admin.py::preview_table_policy",
+        # review plan P1.4 -- POST .../policy/preview-groups. Same exemption
+        # reasoning as `preview_table_policy` immediately above: it exists
+        # BECAUSE it deliberately bypasses the resolver's admin-bypass path,
+        # sweeping every real `user_groups` row through the SAME policy via
+        # `get_analytics_db_readonly()` directly, so a `CASE`-on-`$user_groups`
+        # policy with a missing `ELSE` branch can be checked before anyone
+        # trusts it. Audited (`access_policy.preview_groups`) and, since the
+        # #1979 security review (F2), gated by `require_admin_all_surface`
+        # rather than plain `require_admin`: like every other policy-CONTENT
+        # route in this section, its admin gate is the only check between the
+        # caller and unpolicied data, so a `surface='stack'` admin PAT is
+        # refused (same reasoning as `query_hybrid.py::hybrid_query` below).
+        "app/api/admin.py::preview_table_policy_all_groups",
         # access-policy-builder-ux plan, Tasks 2/3 -- GET .../policy/columns
         # and its shared `_policy_builder_describe` DESCRIBE helper. Same
         # admin-authoring posture as `preview_table_policy` right above:
-        # require_admin-gated, reads the table's OWN schema/profile so an
-        # admin can pick columns to mask BEFORE any policy exists, never a
-        # caller-facing content read. `policy_builder_compile` (the
+        # reads the table's OWN schema/profile so an admin can pick columns
+        # to mask BEFORE any policy exists, never a caller-facing content
+        # read -- and, like that route, gated by `require_admin_all_surface`
+        # since the #1979 security review (F2), because the profiler SAMPLE
+        # VALUES it returns are real cell content. `policy_builder_compile` (the
         # POST .../policy/compile handler) calls this same helper but is not
         # itself a scanned node -- it never calls a target primitive
         # directly, only through this already-classified helper.
@@ -288,7 +322,26 @@ EXEMPT: frozenset[str] = frozenset(
         # non-admin caller once a policy IS attached).
         "app/api/admin.py::policy_builder_columns",
         # POST /api/query/hybrid -- spec §8 names this one explicitly: "out
-        # of scope by §12's admin bypass, not by omission".
+        # of scope by §12's admin bypass, not by omission". K2 (RLS review
+        # #1979) sharpened what that admin bypass means here: this
+        # endpoint runs the caller's raw SQL directly, with no registered-
+        # table-name resolution -- so, unlike every other exempt entry in
+        # this section, it never has a `table_id` or table NAME to run
+        # `can_access_table`/`policied_relation` against in the first
+        # place, not merely "an admin authoring/previewing a policy". Its
+        # gate used to be plain `require_admin`, which (per docs/table-
+        # access-policies.md's "The admin bypass") wrongly handed the
+        # unrestricted bypass to a `surface='stack'` PAT (the `agnes init`
+        # default, deliberately filtered like an analyst everywhere else).
+        # It is now `require_admin_all_surface`
+        # (`app/auth/access.py::require_admin_all_surface`) -- the same
+        # `is_user_admin(...) and _credential_surface(user) == 'all'`
+        # predicate `_caller_is_unrestricted_admin` applies to a direct
+        # `bq.`/`sf.`/`kbc.` path reference elsewhere, applied here to the
+        # endpoint's entire body since its entire body IS a direct path.
+        # Still EXEMPT, not COVERED: it still never calls the resolver's
+        # four functions -- but the admin bypass this exemption rests on
+        # is now genuinely surface-gated instead of merely assumed.
         "app/api/query_hybrid.py::hybrid_query",
         # Live sample for a non-BQ `query_mode='remote'` row -- the exact
         # twin of `_fetch_bq_sample` (which the scanner never sees only
@@ -398,22 +451,14 @@ EXEMPT: frozenset[str] = frozenset(
         # structurally, independent of RBAC. ────────────────────────────
         "app/api/data.py::check_access",
         "app/api/data.py::download_table",
-        # ── attachment binaries: the SAME server_only interlock as data.py's
-        # parquet route, one indirection removed. `_lookup_stored_path` reads
-        # `local_path` from the catalogue view, but its ONLY caller is
-        # `download_attachment`, which 403s a `server_only` table BEFORE the
-        # lookup runs (the "these bytes do not leave the server" gate at the
-        # `reg_row.get("server_only")` check, mirroring `_distribution_refusal`).
-        # A policy attaches only to `server_only=true` or `query_mode='remote'`
-        # (the Task 4 interlock): the former is refused before
-        # `_lookup_stored_path` is ever reached, and the latter can never be an
-        # attachment source — the declared sources
-        # (`src/attachment_sources.py::_SOURCES`) are a fixed dict whose only
-        # entry is Jira's local `attachments` table, so `get_attachment_source`
-        # returns None for a remote-policied table long before any catalogue
-        # read. Neither node can therefore reach a policied table's rows. ────
+        # `_lookup_stored_path` reads `local_path`/the filename column from
+        # the RAW catalogue view (never a policied one) -- it is not itself
+        # the row-visibility gate. By the time it runs, `download_attachment`
+        # (COVERED below) has already confirmed the row is visible in the
+        # caller's policied view via `_row_visible_under_access_policy`, so
+        # this lookup only ever runs for a row already cleared; it stays
+        # EXEMPT rather than duplicating that check.
         "app/api/attachments.py::_lookup_stored_path",
-        "app/api/attachments.py::download_attachment",
         # ── writes-only / not a registry-table read at all ──────────────
         # Scheduler/background sync job (POST /api/sync/trigger or the
         # cron tick) -- writes the RAW profile to storage (needed so the

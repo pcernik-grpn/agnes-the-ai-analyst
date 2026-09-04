@@ -108,22 +108,21 @@ class TestExportFilter:
         assert "%27column%27" not in body  # no url-encoded "'column'"
 
     def test_where_filter_missing_keys_raises_with_context(self):
-        f = ExportFilter.from_dict(
-            {
-                "where_filters": [{"column": "x", "operator": "eq"}],  # no values
-            }
-        )
+        # Caught at parse time now (#1979) — a spec the export cannot honor
+        # must never reach the Storage API as "no filter".
+        with pytest.raises(ValueError, match=r"missing fields.*\['values'\]"):
+            ExportFilter.from_dict({"where_filters": [{"column": "x", "operator": "eq"}]})
+
+    def test_where_filter_missing_keys_still_caught_at_export_time(self):
+        # Direct construction bypasses from_dict (the direct-extract path
+        # builds ExportFilter itself) — the late guard stays.
+        f = ExportFilter(where_filters=[{"column": "x", "operator": "eq"}])
         with pytest.raises(ValueError, match=r"missing fields.*\['values'\]"):
             f.to_export_params()
 
     def test_where_filter_values_must_be_list(self):
-        f = ExportFilter.from_dict(
-            {
-                "where_filters": [{"column": "x", "operator": "eq", "values": "open"}],
-            }
-        )
         with pytest.raises(ValueError, match="values must be a list"):
-            f.to_export_params()
+            ExportFilter.from_dict({"where_filters": [{"column": "x", "operator": "eq", "values": "open"}]})
 
     def test_default_file_type_is_csv_and_omits_param(self):
         # Wire-side default is csv — preserve old behavior for callers
@@ -148,6 +147,65 @@ class TestExportFilter:
     def test_from_dict_invalid_file_type_raises(self):
         with pytest.raises(ValueError, match="file_type"):
             ExportFilter.from_dict({"file_type": "orc"})
+
+    # ── unknown keys are refused, never ignored (#1979) ──────────────────
+    #
+    # A filter spec whose row-filter key is misspelled used to parse into a
+    # DEFAULT ExportFilter — i.e. "export the whole table". The admin sees a
+    # saved filter; every sync distributes every row. Unknown keys are a hard
+    # error at every entry point instead.
+
+    def test_from_dict_rejects_a_misspelled_row_filter_key(self):
+        with pytest.raises(ValueError) as e:
+            ExportFilter.from_dict({"where_filter": [{"column": "x", "operator": "eq", "values": ["1"]}]})
+        msg = str(e.value)
+        assert "unknown key" in msg
+        assert "where_filter" in msg
+        assert "where_filters" in msg, "the message must name the accepted keys"
+        assert "full table" in msg, "the message must say what the typo would have cost"
+
+    def test_from_dict_rejects_the_camel_case_wire_names(self):
+        # `whereFilters`/`changedSince` are the Storage API wire names; the
+        # registry spec takes snake_case. Silently ignoring them is the bug.
+        for key in ("whereFilters", "changedSince", "changedUntil"):
+            with pytest.raises(ValueError, match="unknown key"):
+                ExportFilter.from_dict({key: "whatever"})
+
+    def test_from_dict_names_every_unknown_key_at_once(self):
+        with pytest.raises(ValueError) as e:
+            ExportFilter.from_dict({"where_filter": [], "colums": ["id"]})
+        assert "colums" in str(e.value) and "where_filter" in str(e.value)
+
+    def test_from_dict_still_accepts_every_documented_key(self):
+        f = ExportFilter.from_dict(
+            {
+                "where_filters": [{"column": "x", "operator": "eq", "values": ["1"]}],
+                "columns": ["x"],
+                "changed_since": "2026-01-01",
+                "changed_until": "2026-02-01",
+                "limit": 5,
+                "file_type": "parquet",
+            }
+        )
+        assert f.limit == 5 and f.file_type == "parquet"
+
+    def test_from_dict_rejects_a_misspelled_key_inside_a_where_filter_entry(self):
+        with pytest.raises(ValueError) as e:
+            ExportFilter.from_dict({"where_filters": [{"colum": "x", "operator": "eq", "values": ["1"]}]})
+        msg = str(e.value)
+        assert "colum" in msg
+        assert "where_filters[0]" in msg
+
+    def test_from_dict_defaults_an_omitted_operator_to_eq(self):
+        # `operator` stays optional (parse_filters has always defaulted it),
+        # so a spec that worked before the unknown-key guard still works —
+        # the default is materialized here rather than left ambiguous.
+        f = ExportFilter.from_dict({"where_filters": [{"column": "x", "values": ["1"]}]})
+        assert f.where_filters == [{"column": "x", "operator": "eq", "values": ["1"]}]
+
+    def test_from_dict_rejects_a_non_dict_where_filter_entry(self):
+        with pytest.raises(ValueError, match=r"where_filters\[0\] must be a dict"):
+            ExportFilter.from_dict({"where_filters": ["column = 1"]})
 
 
 # ---- HTTP client low-level -------------------------------------------------

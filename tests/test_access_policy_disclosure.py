@@ -361,6 +361,49 @@ class TestV2ScanRowScopeHeader:
         assert "x-agnes-row-scope" not in r.headers
 
 
+# ── POST /api/mcp/query-table/{id} (N1, RLS review #1979) ──────────────────
+# `app/api/mcp_per_table.py`'s `query_table` filters correctly through
+# `policied_relation` but, before this test, never attached the same
+# `row_scope` envelope every other read surface above carries -- an MCP
+# client reading a policied table through this "fast path" had no way to
+# know it got a slice. Mirrors `TestV2SampleRowScope`'s shape exactly.
+
+
+class TestMcpQueryTableRowScope:
+    def test_row_scope_present_for_policied_table(self, policied_orders):
+        c = policied_orders["client"]
+        r = c.post(
+            "/api/mcp/query-table/orders",
+            json={"filter": {}, "limit": 10},
+            headers=_auth(policied_orders["team_a_token"]),
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["row_scope"] is not None
+        assert body["row_scope"]["policied_tables"] == ["orders"]
+        assert "orders" in body["row_scope"]["note"]
+
+    def test_row_scope_absent_for_non_policied_table(self, policied_orders):
+        c = policied_orders["client"]
+        r = c.post(
+            "/api/mcp/query-table/line_items",
+            json={"filter": {}, "limit": 10},
+            headers=_auth(policied_orders["team_a_token"]),
+        )
+        assert r.status_code == 200, r.text
+        assert r.json().get("row_scope") is None
+
+    def test_row_scope_absent_for_admin_bypass(self, policied_orders):
+        c = policied_orders["client"]
+        r = c.post(
+            "/api/mcp/query-table/orders",
+            json={"filter": {}, "limit": 10},
+            headers=_auth(policied_orders["admin_token"]),
+        )
+        assert r.status_code == 200, r.text
+        assert r.json().get("row_scope") is None
+
+
 # ── manifest carries the policied flag (consumed by `agnes pull` below) ────
 
 

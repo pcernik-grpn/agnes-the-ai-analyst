@@ -344,6 +344,79 @@ def _retype_parquet_streaming(tmp_parquet: Path, target_schema) -> None:
         _warn_on_coerced_nulls(tmp_parquet, str(typed_tmp), casts)
 
 
+def _retype_best_effort(tmp_parquet: Path, storage_client, full_table_id: str) -> None:
+    """Best-effort typed-parquet retype, shared by every ``materialize_query``
+    export branch (native parquet *and* the CSV fallback/pin) so they cannot
+    drift the way the CSV branch once did (#1979): Storage API's CSV export
+    is read with ``all_varchar=true`` (same as the native parquet export's
+    Snowflake UNLOAD, which also serves everything as VARCHAR), so both need
+    the exact same schema-fetch + retype step to end up typed.
+
+    Fetches the source table's real schema via
+    ``KeboolaClient.get_pyarrow_schema()`` and applies it with
+    ``_retype_parquet_streaming``. Degrades gracefully in two independent
+    ways, matching the legacy CSV extraction path
+    (``_extract_via_legacy`` + ``apply_schema_to_table``, the original
+    "v27 typed-parquet fix"):
+
+    - Schema unavailable (metadata API unreachable, mock credentials, etc.)
+      → keep the native (often all-VARCHAR) types, log once.
+    - Schema available but the retype itself fails (bad cast, disk full,
+      etc.) → keep the native (untyped) parquet, log once.
+
+    Never raises — a typing problem must not turn an otherwise-successful
+    materialize into a hard failure.
+
+    ``isinstance(..., str)`` guards against a test double / unusual caller
+    whose ``.token``/``.base`` aren't real strings (e.g. a MagicMock, which
+    is truthy but not a str) — skip typing rather than attempt a
+    KeboolaClient call with garbage credentials. Real
+    ``KeboolaStorageClient`` instances always have string ``.token``/
+    ``.base``, so this is a no-op in production. ``storage_client.base``
+    always has the form ``<url>/v2/storage`` (see
+    ``KeboolaStorageClient.__init__``), so stripping that known suffix
+    recovers the plain Keboola URL without depending on the
+    keboola_url/token kwargs being set — sync.py's preferred call shape
+    passes a pre-built storage_client and may leave those unset.
+    """
+    pyarrow_schema = None
+    if isinstance(getattr(storage_client, "token", None), str) and isinstance(
+        getattr(storage_client, "base", None), str
+    ):
+        from connectors.keboola.client import KeboolaClient
+
+        try:
+            metadata_client = KeboolaClient(
+                token=storage_client.token,
+                url=storage_client.base.removesuffix("/v2/storage"),
+            )
+            pyarrow_schema = metadata_client.get_pyarrow_schema(full_table_id)
+        except Exception as e:
+            logger.warning(
+                "Keboola schema unavailable for %s (%s); materialized parquet "
+                "keeps Storage API's native (often all-VARCHAR) types",
+                full_table_id,
+                e,
+            )
+            pyarrow_schema = None
+
+    if pyarrow_schema is not None:
+        # Streaming retype (sibling temp + atomic replace inside the
+        # helper): peak memory is bounded by the consolidation cap
+        # regardless of table size. Degrade gracefully — a retype failure
+        # must not turn an otherwise-successful materialize into a hard
+        # failure; keep the native (untyped) parquet, matching the
+        # schema-fetch fallback above.
+        try:
+            _retype_parquet_streaming(tmp_parquet, pyarrow_schema)
+        except Exception as e:
+            logger.warning(
+                "Keboola typed-parquet retype failed for %s (%s); keeping native (untyped) parquet",
+                full_table_id,
+                e,
+            )
+
+
 def materialize_query(
     table_id: str,
     *,
@@ -397,10 +470,15 @@ def materialize_query(
     # Lazy import to avoid pulling `requests` at module import time when only
     # the sync trigger imports `extractor` for `run()`.
     from connectors.keboola.storage_api import (
+        FILE_TYPE_CSV,
         FILE_TYPE_PARQUET,
         ExportFilter,
         KeboolaStorageClient,
+        StorageApiError,
+        is_parquet_file_type_rejected,
         normalize_source_table,
+        note_parquet_export_unsupported,
+        parquet_export_supported,
     )
 
     if storage_client is None:
@@ -466,11 +544,22 @@ def materialize_query(
     # via native Snowflake UNLOAD, the extractor renames it into place,
     # no CSV intermediate, no DuckDB COPY, no peak-memory load. Admin
     # can pin `{"file_type":"csv"}` in source_query to fall back (legacy
-    # debugging, or projects whose backend can't UNLOAD parquet — none
-    # known today, but the escape hatch costs nothing). Only override
-    # when the admin spec didn't *explicitly* set a file_type.
+    # debugging). Only override when the admin spec didn't *explicitly*
+    # set a file_type.
     if "file_type" not in payload and "fileType" not in payload:
         export_filter.file_type = FILE_TYPE_PARQUET
+
+    # Not every project's backend can UNLOAD parquet: some stacks answer
+    # export-async with `400 fileType: "The value you selected is not a
+    # valid choice."` (#1979). We can't ask ahead — there is no capability
+    # endpoint — so the first materialized row of the process probes, and
+    # every row after it reads the remembered answer instead of paying for
+    # another refused POST. This is what makes a plain `register-table`
+    # materialized row work with no `source_query` on such a project,
+    # exactly as a wizard-registered one does.
+    stack_key = str(getattr(storage_client, "base", "") or "")
+    if export_filter.file_type == FILE_TYPE_PARQUET and not parquet_export_supported(stack_key):
+        export_filter.file_type = FILE_TYPE_CSV
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -508,6 +597,40 @@ def materialize_query(
         with _tmp_ctx as tmpdir:
             full_table_id = f"{bucket}.{source_table}"
 
+            # The parquet probe. It has to happen here rather than as a
+            # `try/except` wrapped around the whole parquet branch below,
+            # because the branch is chosen from `file_type` and a rejection
+            # has to be able to change that choice before we commit to it.
+            # Costs nothing extra on the happy path: the export-async call
+            # would be the branch's first statement anyway, so `prepared` is
+            # simply handed to it. Nothing has been written or downloaded at
+            # this point — the 400 comes back from the POST that *starts* the
+            # export job — so the CSV branch below runs as the first real
+            # export, not as a redo of one.
+            prepared = None
+            if export_filter.file_type == FILE_TYPE_PARQUET:
+                try:
+                    prepared = storage_client.prepare_export(
+                        full_table_id,
+                        export_filter=export_filter,
+                    )
+                except StorageApiError as e:
+                    if not is_parquet_file_type_rejected(e):
+                        raise
+                    # Downgrade, and say so once for the whole project. Per-row
+                    # logging here would put one line per registered table in
+                    # every sync, forever, for a fact that does not change.
+                    if note_parquet_export_unsupported(stack_key):
+                        logger.warning(
+                            "Keboola project at %s refuses parquet export (fileType=parquet rejected by "
+                            "export-async); falling back to CSV for materialized tables on this stack. "
+                            "Columns are retyped from the table's schema the same as on the parquet "
+                            "path; the CSV path is just slower and more memory-hungry. "
+                            'Pin `{"file_type":"csv"}` in the table\'s source_query to make this explicit.',
+                            stack_key or "<unknown stack>",
+                        )
+                    export_filter.file_type = FILE_TYPE_CSV
+
             if export_filter.file_type == FILE_TYPE_PARQUET:
                 # Native parquet path. Storage API serves Snowflake UNLOAD
                 # output directly. Two shapes to handle:
@@ -528,10 +651,7 @@ def materialize_query(
                 #    gigabytes, which is what used to OOM this COPY. Hence the
                 #    explicit `ROW_GROUP_SIZE_BYTES` bound below; see
                 #    `_ROW_GROUP_TARGET_BYTES`.
-                stats = storage_client.prepare_export(
-                    full_table_id,
-                    export_filter=export_filter,
-                )
+                stats = prepared
                 file_info = stats["file_info"]
                 if file_info.get("isSliced"):
                     slice_dir = Path(tmpdir) / "slices"
@@ -586,64 +706,19 @@ def materialize_query(
                     # KeboolaClient.get_pyarrow_schema() + apply_schema_to_table
                     # (parquet_io.py, the "v27 typed-parquet fix") — that
                     # mechanism operates on a generic pyarrow.Table with no
-                    # CSV-specific coupling, so it's reused here rather than
-                    # reimplemented. `storage_client.base` always has the form
-                    # `<url>/v2/storage` (see KeboolaStorageClient.__init__),
-                    # so stripping that known suffix recovers the plain
-                    # Keboola URL without depending on the keboola_url/token
-                    # kwargs being set — sync.py's preferred call shape passes
-                    # a pre-built storage_client and may leave those unset.
-                    #
-                    # `isinstance(..., str)` guards against a test double /
-                    # unusual caller whose `.token`/`.base` aren't real strings
-                    # (e.g. a MagicMock, which is truthy but not a str) — skip
-                    # typing rather than attempt a KeboolaClient call with
-                    # garbage credentials. Real `KeboolaStorageClient` instances
-                    # always have string `.token`/`.base`, so this is a no-op
-                    # in production.
-                    pyarrow_schema = None
-                    if isinstance(getattr(storage_client, "token", None), str) and isinstance(
-                        getattr(storage_client, "base", None), str
-                    ):
-                        from connectors.keboola.client import KeboolaClient
-
-                        try:
-                            metadata_client = KeboolaClient(
-                                token=storage_client.token,
-                                url=storage_client.base.removesuffix("/v2/storage"),
-                            )
-                            pyarrow_schema = metadata_client.get_pyarrow_schema(full_table_id)
-                        except Exception as e:
-                            logger.warning(
-                                "Keboola schema unavailable for %s (%s); materialized parquet "
-                                "keeps Storage API's native (often all-VARCHAR) types",
-                                full_table_id,
-                                e,
-                            )
-                            pyarrow_schema = None
-
-                    if pyarrow_schema is not None:
-                        # Streaming retype (sibling temp + atomic replace inside
-                        # the helper): peak memory is bounded by the consolidation
-                        # cap regardless of table size. Degrade gracefully — a
-                        # retype failure must not turn an otherwise-successful
-                        # materialize into a hard failure; keep the native
-                        # (untyped) parquet, matching the schema-fetch fallback
-                        # above.
-                        try:
-                            _retype_parquet_streaming(tmp_parquet, pyarrow_schema)
-                        except Exception as e:
-                            logger.warning(
-                                "Keboola typed-parquet retype failed for %s (%s); keeping native (untyped) parquet",
-                                full_table_id,
-                                e,
-                            )
+                    # CSV-specific coupling, so it's reused here (via
+                    # `_retype_best_effort`, shared with the CSV branch below
+                    # so the two cannot drift the way they did in #1979)
+                    # rather than reimplemented.
+                    _retype_best_effort(tmp_parquet, storage_client, full_table_id)
             else:
-                # Legacy CSV path. Kept for the explicit `{"file_type":"csv"}`
-                # opt-in. Slower (CSV parse + parquet rewrite) and
-                # memory-heavier (DuckDB pulls the CSV into a buffer with
-                # max_line_size headroom), but doesn't depend on Storage
-                # API parquet support if a future project backend lacks it.
+                # CSV path. Reached two ways: the explicit
+                # `{"file_type":"csv"}` opt-in, and the automatic downgrade
+                # above for a project whose backend refuses parquet export.
+                # Slower (CSV parse + parquet rewrite) and memory-heavier
+                # (DuckDB pulls the CSV into a buffer with max_line_size
+                # headroom), but it depends on nothing beyond plain
+                # export-async, which every project has.
                 csv_path = Path(tmpdir) / f"{table_id}.csv"
                 stats = storage_client.export_table(
                     full_table_id,
@@ -694,6 +769,15 @@ def materialize_query(
                         )
                     finally:
                         conv.close()
+
+                    # `all_varchar=true` above is deliberate for the CSV
+                    # *parse* (see the comment above it), but it means every
+                    # column lands VARCHAR in `tmp_parquet` — the same
+                    # untyped shape the native-parquet branch's Snowflake
+                    # UNLOAD produces, and the same fix applies: retype from
+                    # the source table's real schema (#1979 gap — this branch
+                    # used to skip typing entirely).
+                    _retype_best_effort(tmp_parquet, storage_client, full_table_id)
     except BaseException:
         # Cleanup belongs on the failure path only — see
         # `src.parquet_publish`'s module docstring for why (not a `finally`,

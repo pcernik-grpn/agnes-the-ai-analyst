@@ -17,6 +17,11 @@
          the user circle renders identically across /admin/users, /admin/adoption,
          etc. See app/web/static/js/identity.js. -->
     <script src="{{ static_url('js/identity.js') }}" defer></script>
+    <!-- window.AgnesPeopleSearch — the one "find an account by name or
+         email" client lookup, so the group drawer's People field and the
+         group detail pane's "add someone" search can never drift onto two
+         different endpoints again. See app/web/static/js/people_search.js. -->
+    <script src="{{ static_url('js/people_search.js') }}" defer></script>
     <!-- Fast `[data-tip]` tooltip (v113). Shared because the trust markers are
          icon-only, so the tooltip IS their label, and the native `title` delay
          (600ms+, OS-controlled) is far too slow for that. Delegated on document,
