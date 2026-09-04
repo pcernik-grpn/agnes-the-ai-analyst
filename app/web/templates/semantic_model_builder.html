@@ -224,7 +224,7 @@
             var field = {
               name: f.name,
               datatype: f.datatype || 'String',
-              expression: { dialects: [{ dialect: 'duckdb', expression: f.name }] }
+              expression: { dialects: [{ dialect: 'ANSI_SQL', expression: f.name }] }
             };
             if (f.description) field.description = f.description;
             if (f.is_time) field.dimension = { is_time: true };
@@ -242,7 +242,7 @@
       .map(function (m) {
         var out = {
           name: m.name,
-          expression: { dialects: [{ dialect: m.dialect || 'duckdb', expression: m.expression }] }
+          expression: { dialects: [{ dialect: m.dialect || 'ANSI_SQL', expression: m.expression }] }
         };
         if (m.description) out.description = m.description;
         return out;
@@ -463,7 +463,7 @@
         '<label class="smb-field"><span>Expression</span>' +
           '<input type="text" ' + p + ' data-smb-f="expression" value="' + esc(item.expression) + '" placeholder="SUM(amount)"></label>' +
         '<label class="smb-field"><span>Dialect</span>' +
-          '<input type="text" ' + p + ' data-smb-f="dialect" value="' + esc(item.dialect) + '" placeholder="duckdb"></label>' +
+          '<input type="text" ' + p + ' data-smb-f="dialect" value="' + esc(item.dialect) + '" placeholder="ANSI_SQL"></label>' +
         '<label class="smb-field"><span>What it measures</span>' +
           '<textarea ' + p + ' data-smb-f="description" placeholder="Total order revenue, net of refunds.">' + esc(item.description) + '</textarea></label>';
     }

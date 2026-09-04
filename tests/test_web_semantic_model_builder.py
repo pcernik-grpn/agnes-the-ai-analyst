@@ -184,3 +184,18 @@ class TestTheBuilderConversation:
         c = seeded_app["client"]
         r = c.get("/semantic-layer/new", headers=_auth(seeded_app["admin_token"]))
         assert "BuilderShell.engineNotice(" in r.text
+
+    def test_a_manually_added_field_or_metric_gets_a_publishable_dialect(self, seeded_app, studio_off):
+        """`'duckdb'` is not in the vendored Ossie schema's Dialect enum
+        (`ANSI_SQL`, `SNOWFLAKE`, `MDX`, `TABLEAU`, `DATABRICKS`, `MAQL`,
+        `BIGQUERY`) — a field added via the "+ Add column" path, and a metric
+        saved without an explicit dialect, both used to stamp
+        `dialect: 'duckdb'` onto their expression, so Publish failed
+        `The document does not validate` for anyone who hand-edited a field
+        before saving."""
+        c = seeded_app["client"]
+        r = c.get("/semantic-layer/new", headers=_auth(seeded_app["admin_token"]))
+        assert r.status_code == 200
+        assert "dialect: 'duckdb'" not in r.text
+        assert "dialect: 'ANSI_SQL'" in r.text
+        assert "|| 'ANSI_SQL'" in r.text
