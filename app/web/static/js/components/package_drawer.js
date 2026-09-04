@@ -97,6 +97,57 @@
   }
 
   /* URL-safe identifier, same normalisation the server's seed step uses. */
+  /* ── The draft, for the connect detour ────────────────────────────────
+     A package does not exist until Create, and this component has never had
+     anywhere to park one — the comment on `bindConversation`'s back button
+     still says "there is no draft store here to preserve". That was true
+     while leaving was always a decision to abandon. It stops being true the
+     moment the builder itself sends you somewhere: connecting a source is a
+     trip the admin does not choose so much as discover they need, and it can
+     stall for a day on credentials somebody else owns.
+
+     Same shape as mcp_builder.js's draft (`agnes_mcp_builder_draft_v1`):
+     localStorage, create-mode only, soft-fail on quota. */
+  var DRAFT_KEY = 'agnes_pkg_builder_draft_v1';
+
+  function persistDraft(reason) {
+    if (!st || st.mode !== 'create' || !els) return;
+    try {
+      window.localStorage.setItem(DRAFT_KEY, JSON.stringify({
+        reason: reason,
+        name: els.name.value,
+        slug: els.slug.value,
+        desc: els.desc.value,
+        status: els.status.value,
+        category: els.category.value,
+        tables: Array.from(st.tablesSelected),
+        /* Every table id the registry held when we left. Diffing it on the
+           way back is what lets the trip's registrations come back ALREADY
+           TICKED without this component knowing anything about the wizard
+           that did the registering. */
+        knownTables: (st.registry || []).map(function (t) { return t.id; }),
+        conv: conv,
+      }));
+    } catch (e) { /* quota or private mode — the trip just costs the draft */ }
+  }
+
+  function readDraft() {
+    try {
+      var raw = window.localStorage.getItem(DRAFT_KEY);
+      if (!raw) return null;
+      var d = JSON.parse(raw);
+      /* ONLY a draft parked by the connect detour comes back. A builder
+         abandoned last week resurrecting itself over a fresh start is a
+         surprise, not a convenience — and it would quietly re-propose tables
+         someone had decided against. */
+      return (d && d.reason === 'connect') ? d : null;
+    } catch (e) { return null; }
+  }
+
+  function discardDraft() {
+    try { window.localStorage.removeItem(DRAFT_KEY); } catch (e) { /* ignore */ }
+  }
+
   function slugify(name) {
     return (name || '').toLowerCase()
       .replace(/[^a-z0-9]+/g, '-')
@@ -177,14 +228,19 @@
       '        <div id="pdw-tables" class="pdw-tables"></div>' +
       '        <p class="ds-drawer__hint" id="pdw-tables-reach" hidden></p>' +
       '      </div>' +
-      '      <details class="ds-drawer__disclose" id="pdw-access">' +
-      '        <summary>Access <span class="ds-drawer__opt">— nobody until you add a group</span></summary>' +
-      '        <p class="ds-drawer__hint" style="margin:8px 0 12px;">' +
-      '          <strong>Optional</strong> shows the package in that group’s Library for members to add;' +
-      '          <strong>Automatic</strong> puts it in their workspace on the next sync.' +
-      '          Leave this closed and the package is private until you share it.</p>' +
-      '        <div id="pdw-groups"></div>' +
-      '      </details>' +
+      /* Access opens in the picker modal, the way every other "choose from a
+         list" in these builders does — it was the one inline disclosure among
+         them, and a <details> that hides the whole access model behind a
+         twisty is easy to publish past without ever opening.
+         `#pdw-groups` stays in the DOM, parked and hidden: the renderer and
+         its two listeners bind to that node once at build time, so the modal
+         MOVES it rather than re-creating it. */
+      '      <div class="ds-drawer__field" id="pdw-access">' +
+      '        <label>Access</label>' +
+      '        <p class="ds-drawer__hint" id="pdw-access-sum">Nobody until you add a group.</p>' +
+      '        <button type="button" class="ag-addrow" data-pdw-openaccess>+ Choose who gets it</button>' +
+      '        <div id="pdw-groups" hidden></div>' +
+      '      </div>' +
       // Naming comes LAST (TCRD-205). It is the least interesting decision
       // and the hardest to make first — you do not know what to call a thing
       // you have not described yet, and the slug derives from the name as you
@@ -266,8 +322,12 @@
     els.name.addEventListener('keydown', function (e) {
       if (e.key === 'Enter') { e.preventDefault(); els.submit.click(); }
     });
-    els.access.addEventListener('toggle', function () {
-      if (els.access.open) hydrateGroups();
+    /* Access is a modal now, so there is no `toggle` to hang the fetch on;
+       `openAccess` hydrates instead. The button sits outside `#pdw-tables`,
+       which is where the panel's other click handler is bound, so it needs
+       its own listener here. */
+    els.access.addEventListener('click', function (e) {
+      if (e.target.closest('[data-pdw-openaccess]')) openAccess();
     });
     // Tier segments inside the group list: a group is granted when it is
     // ticked, and ticking it defaults to Optional — the safe tier, since
@@ -284,9 +344,13 @@
       });
     });
     els.groups.addEventListener('change', function (e) {
+      // Whatever else this change means, the closed summary now says
+      // something different — keep it true while the modal is still open.
+      window.setTimeout(syncAccessSummary, 0);
       var box = e.target.closest('input[type="checkbox"]');
       if (!box) return;
       var row = box.closest('[data-group-id]');
+      if (!row) return;
       var segs = row.querySelectorAll('.fbar-seg__btn');
       if (box.checked && !row.querySelector('.fbar-seg__btn.is-active')) {
         segs[0].classList.add('is-active');
@@ -308,21 +372,37 @@
         renderPickerRows();
       }
     });
+    els.picker.addEventListener('input', function (e) {
+      var k = e.target.getAttribute && e.target.getAttribute('data-ag-search');
+      if (k === 'pdw-access') filterAccessRows(e.target.value);
+    });
     els.picker.addEventListener('click', function (e) {
       if (!st) return;
-      var facet = e.target.closest('[data-facet]');
-      if (facet) {
-        var key = facet.getAttribute('data-facet');
-        var val = facet.getAttribute('data-value');
-        var list = pickerFacets[key] || [];
-        var at = list.indexOf(val);
-        if (at === -1) list.push(val); else list.splice(at, 1);
-        pickerFacets[key] = list;
-        renderPickerFiltered();
+      /* The Filter popover. Opened here rather than by FilterToolbar: the
+         engine does not drive this picker (see pickerControlsHtml), so the
+         one behaviour we do want from it is reimplemented, including the
+         click-outside close — a popover you can only shut with the button
+         that opened it is a trap. */
+      var fb = e.target.closest('[data-picker-filterbtn]');
+      var menu = els.picker.querySelector('#pdw-picker-menu');
+      if (fb) {
+        if (menu) {
+          menu.hidden = !menu.hidden;
+          fb.setAttribute('aria-expanded', menu.hidden ? 'false' : 'true');
+        }
         return;
       }
-      if (e.target.closest('[data-unpackaged]')) {
-        pickerUnpackagedOnly = !pickerUnpackagedOnly;
+      if (menu && !menu.hidden && !e.target.closest('#pdw-picker-menu')) {
+        menu.hidden = true;
+        var btn = els.picker.querySelector('[data-picker-filterbtn]');
+        if (btn) btn.setAttribute('aria-expanded', 'false');
+      }
+      var drop = e.target.closest('[data-picker-dropfacet]');
+      if (drop) {
+        var hook = drop.getAttribute('data-picker-dropfacet');
+        if (hook === 'unpackaged') pickerUnpackagedOnly = false;
+        else if (hook === 'selected') pickerSelectedOnly = false;
+        else pickerFacets[hook] = [];
         renderPickerFiltered();
         return;
       }
@@ -334,6 +414,30 @@
     });
     els.picker.addEventListener('change', function (e) {
       if (!st) return;
+      /* Facet boxes first. They are `input[type=checkbox]` like the tree's own
+         boxes, and the branches below would read a table id or a group class
+         off them and find neither. */
+      var fbox = e.target.closest('[data-facet]');
+      if (fbox) {
+        var fkey = fbox.getAttribute('data-facet');
+        var fval = fbox.value;
+        var flist = pickerFacets[fkey] || [];
+        var fat = flist.indexOf(fval);
+        if (fat === -1) flist.push(fval); else flist.splice(fat, 1);
+        pickerFacets[fkey] = flist;
+        renderPickerFiltered();
+        return;
+      }
+      if (e.target.closest('[data-unpackaged]')) {
+        pickerUnpackagedOnly = !pickerUnpackagedOnly;
+        renderPickerFiltered();
+        return;
+      }
+      if (e.target.closest('[data-selected]')) {
+        pickerSelectedOnly = !pickerSelectedOnly;
+        renderPickerFiltered();
+        return;
+      }
       var sortSel = e.target.closest('[data-picker-sort]');
       if (sortSel) {
         pickerSort = sortSel.value;
@@ -348,6 +452,10 @@
         // Re-render so the group boxes above it re-tally — a bucket that reads
         // "all" after one of its tables was unticked is worse than no summary.
         renderPickerRows();
+        // …and the strip, whose "In this package" count just changed. Without
+        // this the toggle does not appear until something else redraws it, so
+        // the first tick looked like it did nothing.
+        renderPickerStrip();
         return;
       }
       if (!box.classList.contains('pdw-grp__box')) return;
@@ -359,11 +467,16 @@
         if (want) st.tablesSelected.add(t.id); else st.tablesSelected.delete(t.id);
       });
       renderPickerRows();
+      renderPickerStrip();
     });
     els.picker.addEventListener('click', function (e) {
       // A click on the group's checkbox must not also open/close the <details>
       // it lives in the <summary> of.
       if (e.target.closest('.pdw-grp__box')) { e.stopPropagation(); return; }
+      // The picker's own connect route — its empty state and its foot both
+      // offer one. Checked before the close handlers so the navigation is
+      // not swallowed by the backdrop test below.
+      if (e.target.closest('[data-pdw-connect]')) { leaveToConnect(); return; }
       if (e.target.closest('[data-ag-pick-close]')) { closePicker(); return; }
       // Outside the card but inside the overlay — the standard way out.
       if (e.target.hasAttribute && e.target.hasAttribute('data-ag-pick-backdrop')) closePicker();
@@ -372,6 +485,8 @@
     els.tables.addEventListener('click', function (e) {
       if (!st) return;
       if (e.target.closest('[data-pdw-openpick]')) { openPicker(); return; }
+      if (e.target.closest('[data-pdw-connect]')) { leaveToConnect(); return; }
+      if (e.target.closest('[data-pdw-openaccess]')) { openAccess(); return; }
       var rm = e.target.closest('[data-pdw-unpick]');
       if (rm) {
         st.tablesSelected.delete(rm.getAttribute('data-pdw-unpick'));
@@ -476,7 +591,7 @@
   }
 
   /* Panel state: only what is in the package. */
-  var pickerQuery = '', pickerOpen = false;
+  var pickerQuery = '', pickerOpen = false, pickerKind = 'tables';
 
   /* Picker state beyond the search box.
 
@@ -501,14 +616,22 @@
      "Keboola, tick four, then BigQuery, tick two" add six. */
   var pickerFacets = { source_type: [], query_mode: [] };
   var pickerUnpackagedOnly = false;
+  /* "Show me what I have picked" — the only filter that narrows on EVERY
+     instance, because it is about the package rather than about the
+     registry's shape. In a three-hundred-row tree the tables you have ticked
+     are scattered through collapsed groups, and reviewing them meant
+     scrolling the whole thing. */
+  var pickerSelectedOnly = false;
   var pickerSort = 'name_asc';
 
   function facetsActive() {
+    if (pickerSelectedOnly) return true;
     return pickerFacets.source_type.length + pickerFacets.query_mode.length +
       (pickerUnpackagedOnly ? 1 : 0);
   }
 
   function resetPickerFilters() {
+    pickerSelectedOnly = false;
     pickerFacets = { source_type: [], query_mode: [] };
     pickerUnpackagedOnly = false;
     pickerSort = 'name_asc';
@@ -530,6 +653,7 @@
   }
 
   function matchesFilters(t) {
+    if (pickerSelectedOnly && !st.tablesSelected.has(t.id)) return false;
     if (pickerUnpackagedOnly && t.packaged) return false;
     var src = pickerFacets.source_type;
     if (src.length && src.indexOf(t.source_type || '') === -1) return false;
@@ -586,6 +710,93 @@
     }).length;
   }
 
+  /* Back from the connect trip. The fields return verbatim; the TABLES
+     return with whatever the trip registered already ticked, worked out by
+     diffing the live registry against the ids that existed when we left. So
+     the hand-back needs nothing from the connect flow and cannot drift with
+     it — a connector added later is carried for free. */
+  function applyDraft(d) {
+    els.name.value = d.name || '';
+    els.slug.value = d.slug || '';
+    els.desc.value = d.desc || '';
+    if (d.status) els.status.value = d.status;
+    els.category.value = d.category || '';
+    // A slug that no longer follows the name was edited by hand; keep it off
+    // the auto-derive path, exactly as `applyMode('edit')` does.
+    st.slugTouched = !!(d.slug && d.slug !== slugify(d.name || ''));
+    (d.tables || []).forEach(function (id) { st.tablesSelected.add(id); });
+
+    var known = {};
+    (d.knownTables || []).forEach(function (id) { known[id] = 1; });
+    var fresh = (st.registry || []).filter(function (t) { return !known[t.id]; });
+    fresh.forEach(function (t) { st.tablesSelected.add(t.id); });
+
+    if (Array.isArray(d.conv) && d.conv.length) { conv = d.conv; renderConv(); }
+
+    st.returnNote = fresh.length
+      ? 'Back in your package, and the ' + (fresh.length === 1 ? 'table' : fresh.length + ' tables') +
+        ' you just registered ' + (fresh.length === 1 ? 'is' : 'are') + ' added below.'
+      : 'Back in your package — nothing you typed was lost. Nothing new was registered, ' +
+        'so there is nothing to add yet.';
+    syncSubmitGate();
+    renderTables();
+  }
+
+  /* "Connect a source", two ways.
+
+     Where the host can open the Add-data wizard over us — the builder PAGE,
+     which loads it — nothing is left: the drawer opens on top, and when it
+     has registered tables it hands the rows straight back. That is the whole
+     reason the wizard was lifted out of admin_data_sources.
+
+     Where it cannot — the compact drawer on /admin/tables, which is already
+     an overlay over a lens and cannot stack another — we navigate, and the
+     draft is what makes coming back free. Parked BEFORE the navigation,
+     never after. */
+  function leaveToConnect() {
+    if (st && typeof st.openConnectWizard === 'function') {
+      if (st.openConnectWizard(function (tables) { adoptRegistered(tables); })) {
+        closePicker();
+        return;
+      }
+    }
+    persistDraft('connect');
+    window.location.href = '/admin/data-sources?add=1&from=package-builder';
+  }
+
+  /* Rows handed back by the wizard, adopted without a reload.
+
+     The registry is re-read rather than trusted from the payload: the wizard
+     reports what it registered, but the picker's tree needs each row's
+     project, bucket and query mode as the REGISTRY has them, and inventing
+     that here is how the two drift. The ids are what the hand-off is for. */
+  function adoptRegistered(tables) {
+    var ids = (tables || []).map(function (t) { return t && t.id; }).filter(Boolean);
+    if (!ids.length) return;
+    ids.forEach(function (id) { st.tablesSelected.add(id); });
+    st.returnNote = 'Added ' + (ids.length === 1 ? 'the table' : ids.length + ' tables') +
+      ' you just registered.';
+    hydrateTables(st.mode === 'edit' ? st.pkgId : null, true);
+  }
+
+  /* The one case the panel still has to speak up about: the package cannot
+     be filled AT ALL, because nothing is registered and nothing is
+     connected. That is the state of the page, not a footnote on a list, so
+     it is said where the list would be. Every other "I need a source"
+     moment is answered in the picker's foot.
+
+     Both conditions, not just the connection count: an instance with no
+     source connected still has its internal tables (audit, sessions,
+     telemetry) registered and perfectly packageable, and keying on
+     connections alone told those instances there was nothing to carry. */
+  function emptyRegistryNoteHtml() {
+    if (!st) return '';
+    if ((st.registry || []).length || (st.connections || []).length) return '';
+    return '<p class="ag-note">No data source is connected, so there is nothing a package ' +
+      'can carry yet. <button type="button" class="pdw-connect" data-pdw-connect>Connect a ' +
+      'source</button></p>';
+  }
+
   function renderTables() {
     if (!st) return;
     var rows = selectedTables();
@@ -595,11 +806,25 @@
       // agents.html → .ag-slot): a bold line naming the state, one sentence
       // on how to leave it, then the add row. A one-line grey sentence reads
       // as a caption on a broken list rather than as an invitation.
-      body = '<div class="ag-slot">' +
-        '<p class="ag-slot-head">Nothing in it yet.</p>' +
-        '<p class="ag-slot-body">Say what it should carry — “our sales pipeline tables” — ' +
-        'and the builder proposes them. Or add them by hand.</p>' +
-      '</div>';
+      /* Two states, and they are not the same problem. With tables registered
+         the package is simply empty, and the heading says so on its own: the
+         sentence that used to sit under it repeated the opening line of the
+         conversation two panes to the left (“Tell me what this package should
+         carry…”) and the button directly below it (“Add tables”) — three
+         statements of one instruction, stacked. With NOTHING registered there
+         is nothing to propose from, so the invitation would be a promise the
+         instance cannot keep; name the actual state and offer the way out of
+         it. The test is the REGISTRY, not the connection count: internal
+         tables are registered on every instance and are perfectly
+         packageable. */
+      body = (st.registry || []).length
+        ? '<div class="ag-slot"><p class="ag-slot-head">Nothing in it yet.</p></div>'
+        : '<div class="ag-slot">' +
+            '<p class="ag-slot-head">No source to draw from yet.</p>' +
+            '<p class="ag-slot-body">A package carries registered tables, and this instance has ' +
+            'no data source connected. Connect one and its tables become available here — ' +
+            'the name and description you have written are kept while you do.</p>' +
+          '</div>';
     } else {
       body = '<div class="ag-rows">' + rows.map(function (t) {
         // Dedupe: for an internal table the project, the source type and the
@@ -621,8 +846,16 @@
         '</div>';
       }).join('') + '</div>';
     }
-    els.tables.innerHTML = body +
-      '<button type="button" class="ag-addrow" data-pdw-openpick>+ Add tables</button>';
+    els.tables.innerHTML =
+      (st.returnNote ? '<p class="ag-note">' + esc(st.returnNote) + '</p>' : '') +
+      body +
+      '<button type="button" class="ag-addrow" data-pdw-openpick>+ Add tables</button>' +
+      // The strong "nothing is connected" state only. The standing "Missing a
+      // table? Connect a source" line that used to sit here is gone: under a
+      // list the admin is happy with it was a permanent footnote for a
+      // once-a-quarter errand, and the picker — where you go the moment a
+      // table is actually missing — is where the route belongs.
+      emptyRegistryNoteHtml();
     if (els.tablesLabel) {
       var count = els.tablesLabel.querySelector('.pdw-count');
       if (!count) {
@@ -630,9 +863,13 @@
         count.className = 'pdw-count';
         els.tablesLabel.appendChild(count);
       }
+      /* Empty says itself, once. The slot directly below the label already
+         opens with "Nothing in it yet.", so a "none yet" counter on the label
+         was the same sentence twice, two lines apart. The counter earns its
+         place only when there is something to count. */
       count.textContent = rows.length
         ? rows.length + (rows.length === 1 ? ' table' : ' tables')
-        : 'none yet';
+        : '';
     }
     if (els.tablesReach) {
       var reach = reachCount(rows);
@@ -655,7 +892,20 @@
   function pickerRowsHtml() {
     var projects = tableGroups();
     if (!projects.length) {
-      return '<p class="ag-emptyrows">No table matches that.</p>';
+      /* Three different states used to share one sentence. "No table matches
+         that" over an instance with an EMPTY registry reads as a broken
+         search — the admin never searched, and the message sends them looking
+         for a filter to clear that does not exist. */
+      if (st && st.registry && st.registry.length) {
+        return '<p class="ag-emptyrows">No table matches that.</p>';
+      }
+      var n = (st && st.connections ? st.connections.length : 0);
+      return '<p class="ag-emptyrows">' + (n
+        ? 'No tables are registered yet from the ' +
+          (n === 1 ? 'connected source' : n + ' connected sources') +
+          '. Register them in <a href="/admin/tables">Tables</a>, or '
+        : 'No data source is connected, so there is nothing to add. ') +
+        '<button type="button" class="pdw-connect" data-pdw-connect>connect a source</button>.</p>';
     }
     var searching = !!(pickerQuery || '').trim();
     var html = projects.map(function (p) {
@@ -668,6 +918,15 @@
       // the tree lives behind a `+`, an instance with one source would open
       // the picker onto a single collapsed heading and nothing to add.
       var pOpen = searching || pState !== 'none' || projects.length === 1;
+      /* One bucket whose name only repeats the project's is a tier that
+         costs a click and a line and carries nothing: the internal source
+         rendered as "Agnes internal › Agnes Internal › 3 tables", which
+         reads as a duplication bug. Collapsed only when the labels are the
+         same word — a single bucket with a name of its own (project "crm",
+         bucket "in.c-crm") is real information and keeps its row. */
+      var flat = p.order.length === 1 &&
+        String(p.buckets[p.order[0]].label || '').replace(/\s+/g, '').toLowerCase() ===
+        String(p.label || '').replace(/\s+/g, '').toLowerCase();
       var buckets = p.order.map(function (bk) {
         var b = p.buckets[bk];
         var bState = tallyState(b.tables);
@@ -676,13 +935,24 @@
         var bOpen = searching || bState !== 'none' || (projects.length === 1 && p.order.length === 1);
         var rows = b.tables.map(function (t) {
           var on = st.tablesSelected.has(t.id);
-          var sub = [t.source_type, t.query_mode].filter(Boolean).map(esc).join(' · ');
+          /* Dedupe, for the reason renderTables already does it: for an
+             internal table the source type and the query mode are the same
+             word, and "internal · internal" reads as a rendering bug. The
+             panel fixed this; the picker kept showing it. */
+          var seenSub = {};
+          var sub = [t.source_type, t.query_mode].filter(function (v) {
+            var k = String(v || '').toLowerCase();
+            if (!k || seenSub[k]) return false;
+            seenSub[k] = 1;
+            return true;
+          }).map(esc).join(' · ');
           return '<label class="pdw-tables__row">' +
             '<input type="checkbox" data-table-id="' + esc(t.id) + '"' + (on ? ' checked' : '') +
             ' aria-label="' + esc(t.name || t.id) + '">' +
             '<span class="pdw-tables__g"><span class="pdw-tables__n">' + esc(t.name || t.id) + '</span>' +
             (sub ? '<span class="pdw-tables__s">' + sub + '</span>' : '') + '</span></label>';
         }).join('');
+        if (flat) return rows;
         return '<details class="pdw-grp pdw-grp--bucket"' + (bOpen ? ' open' : '') + '>' +
           '<summary class="pdw-grp__sum">' +
           '<input type="checkbox" class="pdw-grp__box" data-group="bucket"' +
@@ -709,55 +979,132 @@
      it). Pressed-state toggles rather than a filter MENU: there are two
      vocabularies and both are short, and a menu one level deep is a filter
      you set once and abandon. */
+  /* The Library's filter, in the table picker: a Filter button on the search
+     row, a faceted menu behind it, and one removable chip per applied
+     category. It was a flat strip of `fbar-toggle` pills — the right classes
+     but the wrong shape, and with SOURCE and QUERY MODE both spelled out it
+     ran to two full rows of chrome above the tree before a single table.
+
+     The filtering itself stays this page's own: the rows are a project →
+     bucket → table TREE with parent checkboxes and per-node counts, which is
+     not the flat row set `FilterToolbar` drives. So this borrows the shape and
+     keeps the engine out — the alternative is teaching the engine about trees
+     to save a hundred lines here. */
+  function facetGroupHtml(key, label) {
+    var opts = facetOptions(key);
+    if (opts.length < 2) return '';   // one value filters nothing
+    var chosen = pickerFacets[key];
+    return '<div class="fbar-menu__group"><p class="fbar-menu__title">' + esc(label) + '</p>' +
+      opts.map(function (o) {
+        return '<label class="fbar-menu__opt">' +
+          '<input type="checkbox" data-facet="' + esc(key) + '" value="' + esc(o.value) + '"' +
+          (chosen.indexOf(o.value) !== -1 ? ' checked' : '') + '>' +
+          '<span class="fbar-menu__opt-text">' + esc(o.value) + '</span>' +
+          '<span class="fbar-menu__opt-n">' + o.n + '</span></label>';
+      }).join('') + '</div>';
+  }
+
+  function unpackagedCount() {
+    return (st ? st.registry : []).filter(function (t) { return !t.packaged; }).length;
+  }
+
+  /* Rides the search row: the Filter button, its menu, and the sort control. */
   function pickerControlsHtml() {
-    function toggles(key, label) {
-      var opts = facetOptions(key);
-      if (opts.length < 2) return '';   // one value filters nothing
-      var chosen = pickerFacets[key];
-      // The label is not decoration: `internal` is a value of BOTH
-      // vocabularies (a source_type and a query_mode) and the strip put the
-      // two identical-looking chips one line apart, each meaning something
-      // else. A group is unreadable without saying what it is a group OF.
-      return '<span class="pdw-pickctl__grp" role="group" aria-label="Filter by ' + esc(label) + '">' +
-        '<span class="pdw-pickctl__k">' + esc(label) + '</span>' +
-        opts.map(function (o) {
-          var on = chosen.indexOf(o.value) !== -1;
-          // ONE class attribute — `is-active` is what filter_toolbar.css
-          // paints, `aria-pressed` is what a screen reader reads, and both
-          // have to agree.
-          return '<button type="button" class="fbar-toggle' + (on ? ' is-active' : '') + '"' +
-            ' data-facet="' + esc(key) + '" data-value="' + esc(o.value) + '"' +
-            ' aria-pressed="' + (on ? 'true' : 'false') + '">' +
-            '<span>' + esc(o.value) + '</span>' +
-            '<span class="fbar-toggle__n">' + o.n + '</span></button>';
-        }).join('') + '</span>';
-    }
-    var unpackagedN = (st ? st.registry : []).filter(function (t) { return !t.packaged; }).length;
+    var groups = facetGroupHtml('source_type', 'Source') + facetGroupHtml('query_mode', 'Query mode');
+    var un = unpackagedCount();
     // Offered only when it narrows something: on a fresh instance every row is
     // unpackaged, and a filter that hides nothing is a control that lies.
-    var unpackaged = (unpackagedN && unpackagedN < (st ? st.registry.length : 0))
-      ? '<button type="button" class="fbar-toggle' + (pickerUnpackagedOnly ? ' is-active' : '') + '"' +
-        ' data-unpackaged="1" aria-pressed="' + (pickerUnpackagedOnly ? 'true' : 'false') + '"' +
-        ' aria-label="In no package — tables no analyst can pull yet">' +
-        '<span>In no package</span><span class="fbar-toggle__n">' + unpackagedN + '</span></button>'
-      : '';
-    var sort = '<span class="fbar-select pdw-pickctl__sort">' +
+    if (un && un < (st ? st.registry.length : 0)) {
+      groups += '<div class="fbar-menu__group"><p class="fbar-menu__title">Reach</p>' +
+        '<label class="fbar-menu__opt">' +
+        '<input type="checkbox" data-unpackaged="1"' + (pickerUnpackagedOnly ? ' checked' : '') + '>' +
+        '<span class="fbar-menu__opt-text">In no package</span>' +
+        '<span class="fbar-menu__opt-n">' + un + '</span></label></div>';
+    }
+    /* “In this package” is the same question from the other side, so it is an
+       option in the same menu rather than a button of its own. Offered only
+       once something is ticked: with nothing selected it can only ever
+       return an empty list. */
+    var pickedN = st ? st.tablesSelected.size : 0;
+    if (pickedN) {
+      groups += '<div class="fbar-menu__group"><p class="fbar-menu__title">In this package</p>' +
+        '<label class="fbar-menu__opt">' +
+        '<input type="checkbox" data-selected="1"' + (pickerSelectedOnly ? ' checked' : '') + '>' +
+        '<span class="fbar-menu__opt-text">Only what I have ticked</span>' +
+        '<span class="fbar-menu__opt-n">' + pickedN + '</span></label></div>';
+    }
+    // The label travels with the control it names, not to the far side of the row.
+    var sort = '<span class="pdw-pickctl__k pdw-pickctl__k--sort">Sort</span>' +
+      '<span class="fbar-select pdw-pickctl__sort">' +
       '<select data-picker-sort aria-label="Sort tables">' +
       SORTS.map(function (o) {
         return '<option value="' + esc(o.value) + '"' +
           (pickerSort === o.value ? ' selected' : '') + '>' + esc(o.label) + '</option>';
       }).join('') + '</select></span>';
-    var clear = facetsActive()
-      ? '<button type="button" class="pdw-pickctl__clear" data-picker-clear>Clear filters</button>'
+    /* The BUTTON is conditional, the ROW is not. With no facet to offer the
+       menu behind it would be empty, so the button stays away; but a row that
+       disappears entirely gave an instance whose tables share one source and
+       one mode a bare search box and no visible way to narrow anything, which
+       reads as "this modal has no filters" — and a lone right-aligned
+       dropdown over three rows reads as a stray control rather than a panel. */
+    var filter = groups
+      ? '<div class="fbar-filter">' +
+          '<button type="button" class="fbar-filter__btn' + (facetsActive() ? ' is-active' : '') + '"' +
+            ' data-picker-filterbtn aria-haspopup="menu" aria-expanded="false">' +
+            '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" ' +
+            'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+            '<path d="M3 5h18M6 12h12M10 19h4"/></svg>Filter' +
+            (facetsActive() ? '<span class="fbar-filter__n">' + facetsActive() + '</span>' : '') +
+          '</button>' +
+          '<div class="fbar-menu" id="pdw-picker-menu" role="menu" aria-label="Filter tables" hidden>' +
+            groups +
+            '<div class="fbar-menu__foot"><button type="button" data-picker-clear>Clear all</button></div>' +
+          '</div>' +
+        '</div>'
       : '';
-    var body = toggles('source_type', 'source') + toggles('query_mode', 'query mode') +
-      unpackaged + sort + clear;
-    if (!body) return '';
-    return '<div class="pdw-pickctl">' + body + '</div>';
+    return '<div class="pdw-pickctl">' + filter + sort + '</div>';
+  }
+
+  /* Row two: one chip per applied CATEGORY, reading "Source: keboola, jira".
+     Its × drops that category; the row disappears when nothing is applied. */
+  function pickerChipsHtml() {
+    function chip(hook, label, vals) {
+      return '<span class="fbar-chip">' +
+        '<span class="fbar-chip__edit">' +
+          '<span class="fbar-chip__label">' + esc(label) + (vals ? ':' : '') + '</span>' +
+          (vals ? '<span class="fbar-chip__vals">' + esc(vals) + '</span>' : '') +
+        '</span>' +
+        '<button type="button" class="fbar-chip__x" data-picker-dropfacet="' + esc(hook) + '" ' +
+          'aria-label="Remove ' + esc(label) + ' filter">×</button>' +
+      '</span>';
+    }
+    var out = [];
+    if (pickerFacets.source_type.length) out.push(chip('source_type', 'Source', pickerFacets.source_type.join(', ')));
+    if (pickerFacets.query_mode.length) out.push(chip('query_mode', 'Query mode', pickerFacets.query_mode.join(', ')));
+    if (pickerUnpackagedOnly) out.push(chip('unpackaged', 'In no package', ''));
+    if (pickerSelectedOnly) out.push(chip('selected', 'In this package', ''));
+    if (!out.length) return '<div class="fbar-chips ag-pick-chips" hidden></div>';
+    return '<div class="fbar-chips ag-pick-chips">' + out.join('') +
+      '<button type="button" class="pdw-pickctl__clear" data-picker-clear>Clear all</button></div>';
   }
 
   function pickerHtml() {
     if (!pickerOpen) return '';
+    if (pickerKind === 'access') {
+      /* Rows are empty here on purpose — `#pdw-groups` is moved in after the
+         paint (see openAccess), because it is a live node with listeners. */
+      return BuilderShell.picker({
+        key: 'pdw-access',
+        title: 'Who gets this package',
+        sub: 'Optional shows it in that group’s Library for members to add. Automatic puts it in their ' +
+             'workspace on the next sync.',
+        searchPlaceholder: 'Search groups…',
+        query: '',
+        shown: groupCount(), total: groupCount(),
+        rows: '',
+        foot: 'Add nobody and the package stays private until you share it.',
+      });
+    }
     var shown = 0, total = 0;
     (st ? st.registry : []).forEach(function () { total++; });
     tableGroups().forEach(function (p) {
@@ -772,8 +1119,21 @@
       shown: shown,
       total: total,
       rows: pickerRowsHtml(),
-      controls: pickerControlsHtml(),
-      foot: 'Not here? Register it in <a href="/admin/tables">Tables</a> first.',
+      toolbarExtra: pickerControlsHtml(),
+      controls: pickerChipsHtml(),
+      foot: '<p class="pdw-pickfoot__q">Can\u2019t find the table you need?</p>' +
+        '<div class="pdw-pickfoot__opts">' +
+          '<a class="pdw-pickfoot__opt" href="/admin/tables">' +
+            '<span class="pdw-pickfoot__label">Register a table</span>' +
+            '<span class="pdw-pickfoot__hint">It is in a source you have already connected, ' +
+            'but nothing has catalogued it yet.</span>' +
+          '</a>' +
+          '<button type="button" class="pdw-pickfoot__opt" data-pdw-connect>' +
+            '<span class="pdw-pickfoot__label">Connect a source</span>' +
+            '<span class="pdw-pickfoot__hint">Its warehouse or project is not connected at all. ' +
+            'Your draft is kept while you do it.</span>' +
+          '</button>' +
+        '</div>',
     });
   }
 
@@ -791,14 +1151,45 @@
      state and whether "Clear filters" exists. Separate from
      `renderPickerRows` because the search box must keep its focus and caret,
      and this never touches it. */
+  /* Repaint the rows, the Filter button's applied-count and the chip row —
+     never the whole modal, which would take the search box's caret with it. */
   function renderPickerFiltered() {
     renderPickerRows();
+    renderPickerStrip();
+  }
+
+  /* The filter control ALONE. Its "In this package" option carries a count of
+     what is ticked, so it goes stale on every tick — and re-rendering the
+     rows to refresh a count would throw away the tree's open/closed state
+     under the admin mid-selection. So the button, its menu and the chip row
+     are replaced in place, and an open menu is reopened after the swap. */
+  function renderPickerStrip() {
     if (!els || !els.picker) return;
-    var strip = els.picker.querySelector('.pdw-pickctl');
-    if (!strip) return;
-    var next = pickerControlsHtml();
-    if (!next) { strip.remove(); return; }
-    strip.outerHTML = next;
+    var wasOpen = !!els.picker.querySelector('#pdw-picker-menu:not([hidden])');
+    var host = document.createElement('div');
+    host.innerHTML = pickerControlsHtml();
+    var next = host.firstElementChild;
+    var row = els.picker.querySelector('.pdw-pickctl');
+    if (row && next) row.replaceWith(next);
+    else if (next) {
+      // The row is always supposed to be here; put it back if it went missing.
+      var anchor = els.picker.querySelector('.ag-pick-rows');
+      if (anchor) anchor.insertAdjacentElement('beforebegin', next);
+    }
+    // The popover stays open across a tick: closing it on every choice would
+    // make a multi-select facet a one-select facet in practice.
+    if (wasOpen && next) {
+      var m = next.querySelector('#pdw-picker-menu');
+      if (m) m.hidden = false;
+      var b = next.querySelector('[data-picker-filterbtn]');
+      if (b) b.setAttribute('aria-expanded', 'true');
+    }
+    var chips = els.picker.querySelector('.ag-pick-chips');
+    if (chips) {
+      var ch = document.createElement('div');
+      ch.innerHTML = pickerChipsHtml();
+      chips.replaceWith(ch.firstElementChild);
+    }
   }
 
   /* Rows + count only, so the search box keeps its focus and caret. */
@@ -816,7 +1207,60 @@
     if (cnt) cnt.textContent = shown + ' of ' + (st ? st.registry.length : 0);
   }
 
+  function groupCount() {
+    return els && els.groups ? els.groups.querySelectorAll('[data-group-id]').length : 0;
+  }
+
+  /* The access list, in the modal. The node is MOVED, not rebuilt: it carries
+     the click and change listeners bound at build time, and the per-group
+     Optional/Automatic state lives in its own DOM. */
+  function openAccess() {
+    pickerKind = 'access';
+    pickerOpen = true;
+    hydrateGroups();            // was the <details> toggle's job
+    renderPicker();
+    var host = els.picker.querySelector('.ag-pick-rows');
+    if (host && els.groups) { els.groups.hidden = false; host.appendChild(els.groups); }
+    var box = els.picker.querySelector('[data-ag-search="pdw-access"]');
+    if (box) box.focus();
+    syncAccessCount();
+  }
+
+  /* The rows are a live node the modal borrowed, so the search hides and
+     shows them in place rather than re-rendering — re-rendering would drop
+     the tier state and the listeners along with it. */
+  function filterAccessRows(q) {
+    if (!els || !els.groups) return;
+    var needle = String(q || '').trim().toLowerCase();
+    els.groups.querySelectorAll('[data-group-id]').forEach(function (row) {
+      var name = row.querySelector('.pdw-pick__name');
+      var hay = (name ? name.textContent : '').toLowerCase();
+      row.hidden = !!needle && hay.indexOf(needle) < 0;
+    });
+    syncAccessCount();
+  }
+
+  function syncAccessCount() {
+    var cnt = els && els.picker && els.picker.querySelector('[data-count="pdw-access"]');
+    if (!cnt || !els.groups) return;
+    var all = els.groups.querySelectorAll('[data-group-id]');
+    var shown = [...all].filter(function (r) { return !r.hidden; }).length;
+    cnt.textContent = shown + ' of ' + all.length;
+  }
+
+  /* Put it back where it lives before the modal host is emptied, or the node
+     — and every listener on it — is destroyed with the modal. */
+  function parkGroups() {
+    if (!els || !els.groups) return;
+    var slot = els.root.querySelector('#pdw-access');
+    if (slot && els.groups.parentElement !== slot) {
+      els.groups.hidden = true;
+      slot.appendChild(els.groups);
+    }
+  }
+
   function openPicker() {
+    pickerKind = 'tables';
     pickerOpen = true;
     pickerQuery = '';
     // Same reasoning as the query: a second open must not inherit the last
@@ -829,10 +1273,30 @@
 
   function closePicker() {
     if (!pickerOpen) return;
+    var wasAccess = pickerKind === 'access';
+    parkGroups();               // before anything empties the modal host
     pickerOpen = false;
+    if (wasAccess) { renderPicker(); syncAccessSummary(); return; }
     // renderTables repaints the panel with whatever was picked and clears the
     // modal host on its way through renderPicker.
     renderTables();
+  }
+
+  /* What the closed row says. The summary IS the access model for anyone who
+     never opens the modal, so it names the groups rather than counting them. */
+  function syncAccessSummary() {
+    var el = els && els.root && els.root.querySelector('#pdw-access-sum');
+    if (!el || !els.groups) return;
+    var on = [...els.groups.querySelectorAll('[data-group-id]')].filter(function (row) {
+      var cb = row.querySelector('input[type="checkbox"]');
+      return cb && cb.checked;
+    }).map(function (row) {
+      var n = row.querySelector('.pdw-pick__name');
+      return n ? n.textContent.trim() : '';
+    }).filter(Boolean);
+    el.textContent = on.length
+      ? on.join(', ')
+      : 'Nobody until you add a group.';
   }
 
   /* Every table under a group, honouring the current search — ticking a group
@@ -851,7 +1315,7 @@
 
   /* `pkgId` is null on a create: the registry and the project names are
      fetched exactly the same way, and the member set is simply empty. */
-  function hydrateTables(pkgId) {
+  function hydrateTables(pkgId, keepSelected) {
     Promise.all([
       pkgId ? api(PKG_API + '/' + encodeURIComponent(pkgId))
             : Promise.resolve({ tables: [] }),
@@ -867,9 +1331,11 @@
       var reg = res[1];
       var conns = res[2];
       var connName = {};
-      (Array.isArray(conns) ? conns : (conns.connections || conns.items || [])).forEach(function (c) {
+      var connList = Array.isArray(conns) ? conns : (conns.connections || conns.items || []);
+      connList.forEach(function (c) {
         if (c && c.id) connName[c.id] = c.name || c.id;
       });
+      st.connections = connList.filter(function (c) { return c && c.id; });
       st.registry = (Array.isArray(reg) ? reg : (reg.tables || [])).map(function (t) {
         return {
           id: t.id, name: t.name || t.id, bucket: t.bucket || '',
@@ -890,7 +1356,12 @@
       });
       var members = (pkg.tables || []).map(function (t) { return t.id; });
       st.tablesOriginal = new Set(members);
-      st.tablesSelected = new Set(members);
+      /* On OPEN the selection is the package's membership. On a re-read
+         mid-edit (the wizard just registered rows and handed them back) it
+         is whatever is ticked right now, plus them — rebuilding from
+         membership there would silently drop every tick the admin had made
+         before they went to connect a source. */
+      if (!keepSelected) st.tablesSelected = new Set(members);
       // A member the registry no longer lists still has to be shown — a row
       // you cannot see is a row you cannot remove.
       var known = new Set(st.registry.map(function (t) { return t.id; }));
@@ -904,6 +1375,13 @@
                              packaged: true, rows: 0, last_sync: '' });
         }
       });
+      if (st.pendingDraft) {
+        var d = st.pendingDraft;
+        st.pendingDraft = null;
+        discardDraft();
+        applyDraft(d);
+        return;
+      }
       renderTables();
     }).catch(function (e) {
       els.tables.innerHTML = '<p class="ds-drawer__hint">Could not load tables: ' + esc(e.message) + '</p>';
@@ -999,6 +1477,38 @@
     else if (els.foot) els.foot.appendChild(els.submit);
   }
 
+  /* What a data package IS, at the head of the transcript — the same block in
+     the same position as /skills, /agents and the MCP builder. It was a bare
+     paragraph above the transcript with its own class and its own metrics,
+     which is three looks for one sentence across four builders. (The
+     sentence itself existed only in the drawer header before that, which
+     builder.css hides in builder mode — so the full-page builder, the one
+     the Library's "+ Add" reaches, explained least.) */
+  /* `package` from the canonical set (macros/_icon.html) — the glyph this UI
+     already uses for a package, on /admin/tables, /profile and the store
+     pages. Transcribed rather than imported because this is a JS component;
+     keep it byte-equal to the macro. */
+  var ABOUT_ICO = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" ' +
+    'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+    '<path d="M21 16V8a2 2 0 0 0-1-1.7l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.7l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/>' +
+    '<path d="M3.3 7 12 12l8.7-5M12 22V12"/></svg>';
+
+  function aboutHtml() {
+    return BuilderShell.about({
+      iconSvg: ABOUT_ICO,
+      accent: 'data',
+      html: '<p>A <strong>data package</strong> is how governed tables reach an analyst. Registered tables ' +
+        'reach nobody on their own: a package bundles them, you grant it to a group, and its members pull ' +
+        'those tables to their laptop. ' +
+        // Name the button that is actually on screen. In edit mode it reads
+        // "Save changes", and telling the admin to press Create was the page
+        // describing a different page.
+        (st && st.mode === 'edit'
+          ? 'Nothing is written until you press Save changes.'
+          : 'Nothing is written until you press Create.') + '</p>',
+    });
+  }
+
   function renderConv() {
     if (!els || !els.convHost) return;
     els.convHost.innerHTML =
@@ -1008,23 +1518,12 @@
       (llmUnavailable
         ? BuilderShell.noModelNotice('form on the right')
         : BuilderShell.engineNotice(convEngine)) +
-      /* What a data package IS. The sentence existed — in the drawer header,
-         which builder.css hides in builder mode, so the full-page builder
-         (the one the Library's "+ Add" reaches) explained least. */
-      '<p class="ag-cfg-blurb pdw-blurb">A data package is how governed tables reach an analyst. Tables are ' +
-      'registered on this instance but reach nobody on their own: a package bundles them, you grant the package ' +
-      'to a group, and its members pull those tables to their laptop. ' +
-      // Name the button that is actually on screen. In edit mode it reads
-      // "Save changes", and telling the admin to press Create was the page
-      // describing a different page.
-      (st && st.mode === 'edit'
-        ? 'Nothing is written until you press Save changes.'
-        : 'Nothing is written until you press Create.') + '</p>' +
       BuilderShell.conversation({
         id: 'pdw-conv-scroll',
         // With no model the opening line promises drafting that cannot happen.
         rows: llmUnavailable ? conv : [{ role: 'assistant', text: opening() }].concat(conv),
         busy: convBusy,
+        about: aboutHtml(),
         err: llmUnavailable ? null : convErr,
       }) +
       BuilderShell.composer({
@@ -1151,7 +1650,9 @@
           var box = row.querySelector('input[type="checkbox"]');
           if (box && !box.checked) { box.checked = true; ticked += 1; }
         });
-        if (ticked && els.access && !els.access.open) els.access.open = true;
+        // Nothing to open any more — but the summary is the only place an
+        // admin who never opens the modal will see what the turn just granted.
+        if (ticked) syncAccessSummary();
       });
     }
   }
@@ -1172,6 +1673,10 @@
       pkgId: opts.pkgId || null,
       chipHost: opts.chipHost || null,
       onCreated: opts.onCreated || function () {},
+      /* Host hook: open the Add-data wizard over this builder and call back
+         with what it registered. Absent on the compact /admin/tables drawer,
+         which navigates instead — see leaveToConnect(). */
+      openConnectWizard: opts.openConnectWizard || null,
       onSaved: opts.onSaved || function () {},
       slugTouched: mode === 'edit',
       groupsLoaded: false,
@@ -1181,6 +1686,16 @@
       skipShareWarning: false,
       grantsOriginal: new Map(),
       registry: [],
+      // The instance's source connections, already on the wire for the
+      // project headings (see hydrateTables). Kept because "how many sources
+      // exist" is the difference between "register the table you want" and
+      // "nothing can go in a package yet", and the panel has to say which.
+      connections: [],
+      // Restored on the way back from connecting a source; applied once the
+      // registry lands, since the tick-what-is-new diff needs it.
+      pendingDraft: mode === 'create' ? readDraft() : null,
+      // What to say about that return trip, rendered above the table list.
+      returnNote: '',
       tablesOriginal: new Set(),
       tablesSelected: new Set(),
       restoreFocus: document.activeElement,
@@ -1203,7 +1718,6 @@
     els.desc.value = '';
     els.status.value = 'prod';
     els.category.value = '';
-    els.access.open = false;
     els.groups.innerHTML = '';
     els.err.hidden = true;
     syncSubmitGate();
@@ -1242,10 +1756,9 @@
     if (mode === 'edit') {
       hydratePackage(opts.pkgId);
       hydrateTables(opts.pkgId);
-      // Sharing is part of the edit form: open the disclose so the current
-      // grants are visible without a click, and hydrate rows + grants (the
-      // paint runs when the LATER of the two fetches lands).
-      els.access.open = true;
+      // Sharing is part of the edit form: fetch the rows and grants up front
+      // so the summary states the current access without a click (the paint
+      // runs when the LATER of the two fetches lands).
       hydrateGroups();
       hydrateGrants(opts.pkgId);
     } else {
@@ -1278,9 +1791,12 @@
      collide with a builder page underneath. */
   function bindConversation(root) {
     root.addEventListener('click', function (e) {
-      /* The shell's back button is this drawer's close. Nothing is lost by
-         leaving — the package does not exist until Create, and there is no
-         draft store here to preserve — so it does not confirm. */
+      /* The shell's back button is this drawer's close, and it still does
+         not confirm. There IS a draft store now (see DRAFT_KEY), but it is
+         deliberately not consulted here: parking a draft is for a detour the
+         builder sent you on, while Back is the admin saying they are done
+         with this package. Restoring one over an explicit Cancel is how a
+         builder starts arguing with the person using it. */
       if (e.target.closest('[data-ag-back]')) {
         // On a page there is nothing to close — leaving means navigating.
         if (st && st.backHref) window.location.href = st.backHref;
@@ -1343,6 +1859,7 @@
           + '<a href="/admin/groups">Access</a>, then share this from the package’s page.</p>';
         return;
       }
+      window.setTimeout(syncAccessCount, 0);
       els.groups.innerHTML = groups.map(function (g) {
         var gid = String(g.id || g.name || '');
         var gname = String(g.name || gid);
@@ -1616,6 +2133,10 @@
         Promise.allSettled(grantCalls),
         Promise.allSettled(tableCalls),
       ]).then(function (settled) {
+        // The package exists from here on, whatever the grant/table calls
+        // did. A draft that outlived its own create would offer to build a
+        // duplicate on the next visit.
+        discardDraft();
         function rejected(r) { return r.status === 'rejected'; }
         var failures = settled[0].filter(rejected).length;
         var tableFailures = settled[1].filter(rejected).length;

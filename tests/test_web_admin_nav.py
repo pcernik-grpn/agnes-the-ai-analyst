@@ -260,6 +260,32 @@ class TestAdminNavInventoryCoverage:
             assert entry.get("reached_from"), entry
             assert entry["href"].startswith("/admin/"), entry
 
+    def test_offnav_pages_have_a_literal_door_in_some_template(self) -> None:
+        """`reached_from` is prose; this checks the door is real. An off-nav
+        page's href must appear as a literal `href` in at least one template
+        or static script — the one place a click can actually start from.
+
+        The gap this closes: `/admin/extraction` shipped with
+        ``reached_from: "… — pending"`` and no link anywhere, and the prose
+        check above was satisfied. A page whose only door is a promise is a
+        page reachable by typed URL, which is the exact failure this
+        inventory exists to make impossible."""
+        corpus = "\n".join(
+            path.read_text(encoding="utf-8")
+            for root in (Path("app/web/templates"), Path("app/web/static/js"))
+            for path in root.rglob("*")
+            if path.suffix in (".html", ".js")
+        )
+        doorless = [
+            entry["href"]
+            for entry in ADMIN_NAV_OFFNAV
+            if f'href="{entry["href"]}"' not in corpus and f"href='{entry['href']}'" not in corpus
+        ]
+        assert not doorless, (
+            "off-nav page(s) with no literal href in any template/script — "
+            f"the recorded door is a promise, not a link: {doorless}"
+        )
+
     def test_exactly_the_decided_sections_in_order(self) -> None:
         """The IA is a decision, not a projection — pin the section
         keys/labels and their order so a future edit that reshuffles them
@@ -342,7 +368,13 @@ class TestAdminNavActiveState:
         assert resolve_active_href("/admin/store") == "/admin/store"
         assert resolve_active_href("/admin/store/submissions") == "/admin/store/submissions"
         assert resolve_active_href("/admin/store/submissions/sub-1") == "/admin/store/submissions"
-        assert resolve_active_href("/admin/store/lint") == "/admin/store/lint"
+        # Lint no longer has a row of its own (ADMIN_NAV_OFFNAV — it is reached
+        # from the Submissions toolbar), so longest-prefix correctly falls back
+        # to its parent instead of lighting nothing. That is the fallback
+        # working, not the confusion this test guards against: the rule is that
+        # a sub-page must not leave its parent lit ON TOP of its own row, and
+        # lint has no own row to compete with.
+        assert resolve_active_href("/admin/store/lint") == "/admin/store"
 
     def test_hub_page_has_no_active_section(self) -> None:
         assert resolve_active_href("/admin") is None

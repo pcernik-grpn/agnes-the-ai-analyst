@@ -32,6 +32,7 @@ BUILDERS = {
     "agents": ROOT / "app" / "web" / "templates" / "agents.html",
     "data packages": ROOT / "app" / "web" / "static" / "js" / "components" / "package_drawer.js",
     "MCP sources": ROOT / "app" / "web" / "static" / "js" / "components" / "mcp_builder.js",
+    "semantic model": ROOT / "app" / "web" / "templates" / "semantic_model_builder.html",
 }
 
 TURN_ENDPOINTS = {
@@ -39,6 +40,7 @@ TURN_ENDPOINTS = {
     "agent": ROOT / "app" / "api" / "agent_builder.py",
     "package": ROOT / "app" / "api" / "package_builder.py",
     "mcp": ROOT / "app" / "api" / "mcp_builder.py",
+    "semantic_model": ROOT / "app" / "api" / "semantic_model_builder.py",
 }
 
 

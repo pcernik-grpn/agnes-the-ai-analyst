@@ -32,6 +32,10 @@
    inlined here. What stays in the <style> below is this page's own: the
    agent LIST (cards, bands, template picker) and its page head. #}
 <link rel="stylesheet" href="{{ static_url('css/builder.css') }}">
+{# The Library's faceted filter, unmodified — the picker's pool is the same
+   kind of thing the Library lists, and a second filter idiom in one product is
+   one too many. See the FilterToolbar.init call in the script below. #}
+<link rel="stylesheet" href="{{ static_url('css/filter_toolbar.css') }}">
 <style>
   /* Non-interactive group heading inside the skill picker's branded menu —
      mirrors the native <optgroup label> the select itself still carries
@@ -143,6 +147,7 @@
 {% block scripts %}
 {# NOT deferred: the builder renders on boot, so BuilderShell has to exist
    before the page script below runs. Same reason modal.js loads eagerly. #}
+<script src="{{ static_url('js/filter_toolbar.js') }}"></script>
 <script src="{{ static_url('js/components/builder_shell.js') }}"></script>
 <script src="{{ static_url('js/components/builder_preview.js') }}"></script>
 <script src="{{ static_url('js/components/ds_dropdown.js') }}" defer></script>
@@ -612,12 +617,13 @@
          says so and adds that the builder "shows it nowhere". It does now. */
       (a.slug
         ? '<div class="ag-field"><span>Address <em>— how scripts and the CLI reach it</em></span>' +
-            '<div class="ag-bnd"><div class="ag-bnd-row"><span class="ag-bnd-k">' + esc(a.slug) + '</span>' +
-            '<span class="ag-bnd-v">' + (a.status === 'ready'
-              ? 'Fixed — marking ready froze it'
-              : 'Still follows the name, until you mark it ready') + '</span></div></div></div>'
+            '<div class="ag-readonly">' + esc(a.slug) + '</div>' +
+            '<span class="ag-hint">' + (a.status === 'ready'
+              ? 'Fixed — marking ready froze it.'
+              : 'Still follows the name, until you mark it ready.') + '</span></div>'
         : '') +
-      '<div class="ag-note">Instructions replace the default analyst prompt. Agnes still appends its data-access rails (<code>agnes catalog</code> → <code>schema</code> → <code>query</code>), so you don’t need to restate them — write the persona and its task.</div>';
+      '<div class="ag-note">Instructions replace the default analyst prompt. Agnes still appends its ' +
+      'data-access rails, so write the persona and its task, not those.</div>';
   }
 
   /* A searchable ingredient list = toolbar (search + live count) + a rows
@@ -670,6 +676,11 @@
   }
 
   var KIND_LABEL = { data: 'Data', memory: 'Memory', file: 'File' };
+  /* The picker's filter engine, while the picker is open. It is the Library's
+     — the pool here is the same kind of thing the Library lists, and a second
+     filter idiom in one product is one too many. Held so `closePicker` can
+     release the document/window listeners it binds. */
+  var pickerFilter = null;
   /* Store `type` is a wire value ('plugin' | 'skill' | 'agent'); the tag beside
      a capability's name is read by a person. Rendering the raw value put the
      bare word "agent" on a row in THIS page's picker — the one place it is
@@ -683,8 +694,20 @@
      handler — the underlying operation is identical, only the label differs. */
   function knowledgeRow(a, k, mode) {
     var on = a.knowledge.indexOf(k.id) >= 0;
-    var label = mode === 'pick' ? (on ? '✓ Grounded' : '+ Ground') : 'Remove';
-    return '<div class="ag-row">' +
+    /* "Add", not "Ground". Grounding is the word for what the agent does with
+       the thing once it has it; on a button in a list it is jargon, and the
+       three other pickers in these builders all say Add. */
+    var label = mode === 'pick' ? (on ? '✓ Added' : 'Add') : 'Remove';
+    /* In the picker the row carries what FilterToolbar slices on: a haystack
+       for the search box and one attribute per facet. The engine hides and
+       shows rows in the DOM, so every row is rendered once and none of this
+       page's own filtering runs there any more. */
+    var facets = mode === 'pick'
+      ? ' data-search="' + esc((k.name + ' ' + (k.description || '') + ' ' + (KIND_LABEL[k.kind] || '')).toLowerCase()) + '"' +
+        ' data-kind="' + esc(k.kind || 'data') + '"' +
+        ' data-added="' + (on ? 'yes' : 'no') + '"'
+      : '';
+    return '<div class="ag-row"' + facets + '>' +
       '<div class="ag-row-body">' +
         '<div class="ag-row-name">' + esc(k.name) +
           '<span class="ag-kind ag-kind--' + esc(k.kind) + '">' + (KIND_LABEL[k.kind] || 'Data') + '</span>' +
@@ -697,15 +720,57 @@
   }
 
   /* Picker rows — the full RBAC-scoped pool, filtered by the modal's search. */
-  function knowledgeRows(a) {
-    var q = query.knowledge;
-    var list = KNOWLEDGE.filter(function (k) { return matchesQuery(q, [k.name, k.description, KIND_LABEL[k.kind]]); });
-    if (!list.length) {
-      return '<p class="ag-emptyrows">' + (KNOWLEDGE.length
-        ? 'No data, memory, or files match “' + esc(q) + '”.'
-        : 'Nothing you can access yet — add data or memory from the <a href="/catalog">Catalog</a>, or upload files in <a href="/artefacts">Artefacts</a>.') + '</p>';
+  /* The Library's Filter button + faceted menu + chip row, verbatim markup —
+     `.fbar-filter`, `.fbar-menu`, `.fbar-chips` (filter_toolbar.css) — so the
+     picker filters the way the Library does rather than with a bespoke strip
+     of toggles. The engine owns the behaviour; this only declares the options.
+     A facet with fewer than two values is not rendered: a filter that cannot
+     change the result is a dead control. */
+  function kindControlsHtml() {
+    var counts = {};
+    KNOWLEDGE.forEach(function (k) { counts[k.kind] = (counts[k.kind] || 0) + 1; });
+    var kinds = Object.keys(KIND_LABEL).filter(function (k) { return counts[k]; });
+    var groups = '';
+    if (kinds.length > 1) {
+      groups += '<div class="fbar-menu__group"><p class="fbar-menu__title">Kind</p>' +
+        kinds.map(function (k) {
+          return '<label class="fbar-menu__opt"><input type="checkbox" data-facet="kind" ' +
+            'value="' + esc(k) + '"><span class="fbar-menu__opt-text">' + esc(KIND_LABEL[k]) + '</span>' +
+            '<span class="fbar-menu__opt-n">' + counts[k] + '</span></label>';
+        }).join('') + '</div>';
     }
-    return list.map(function (k) { return knowledgeRow(a, k, 'pick'); }).join('');
+    groups += '<div class="fbar-menu__group"><p class="fbar-menu__title">In this agent</p>' +
+      /* `.fbar-menu__opt-text` is the component's contract, not decoration:
+         the engine reads the chip's label off that span, and falls back to the
+         whole row — count included — when it is missing. */
+      '<label class="fbar-menu__opt"><input type="checkbox" data-facet="added" value="yes">' +
+      '<span class="fbar-menu__opt-text">Already added</span></label></div>';
+    /* The button and its menu ride the SEARCH row (`toolbarExtra`); the chips
+       are row two (`controls`) — the Library's own two-row shape. */
+    return '<div class="fbar-filter">' +
+      '<button type="button" class="fbar-filter__btn" id="ag-kn-filter-btn" ' +
+        'aria-haspopup="menu" aria-expanded="false">' +
+        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" ' +
+        'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+        '<path d="M3 5h18M6 12h12M10 19h4"/></svg>Filter</button>' +
+      '<div class="fbar-menu" id="ag-kn-filter-menu" role="menu" aria-label="Filter the pool" hidden>' +
+        groups +
+        '<div class="fbar-menu__foot"><button type="button" data-fbar-clear>Clear all</button></div>' +
+      '</div>' +
+    '</div>';
+  }
+
+  function kindChipsHtml() {
+    return '<div class="fbar-chips ag-pick-chips" id="ag-kn-chips" hidden></div>';
+  }
+
+  function knowledgeRows(a) {
+    if (!KNOWLEDGE.length) {
+      return '<p class="ag-emptyrows">Nothing you can access yet — add data or memory from the ' +
+        '<a href="/catalog">Catalog</a>, or upload files in <a href="/artefacts">Artifacts</a>.</p>';
+    }
+    return KNOWLEDGE.map(function (k) { return knowledgeRow(a, k, 'pick'); }).join('') +
+      '<p class="ag-emptyrows" id="ag-kn-noresults" hidden>Nothing here matches that.</p>';
   }
 
   /* The panel is a statement of what this agent IS, not a catalogue of what it
@@ -763,7 +828,7 @@
   }
 
   function capabilitiesBody(a) {
-    if (pluginsErr) return '<div class="ag-note">Could not load the marketplace right now — try reloading the page.</div>';
+    if (pluginsErr) return '<div class="ag-note ag-note--err">Could not load the marketplace right now — try reloading the page.</div>';
     /* Enabled ids are the agent's own state and render immediately; only the
        NAMES come from the marketplace. While that is still in flight an
        enabled capability shows as its id rather than vanishing, so the panel
@@ -800,9 +865,9 @@
   var PICKERS = {
     knowledge: {
       title: 'Add data, memory or files',
-      sub: 'Everything you can reach. Grounding an agent never widens what the person talking to it may see.',
+      sub: 'Everything you can reach. Adding it here never widens what the person talking to the agent may see.',
       search: 'Search data, memory & files…',
-      foot: 'Discover more in the <a href="/catalog">Catalog</a>, or upload files in <a href="/artefacts">Artefacts</a>.'
+      foot: 'Discover more in the <a href="/catalog">Catalog</a>, or upload files in <a href="/artefacts">Artifacts</a>.'
     },
     capabilities: {
       title: 'Add a plugin or skill',
@@ -817,7 +882,7 @@
     var def = PICKERS[picker];
     var pool = picker === 'knowledge' ? KNOWLEDGE : (plugins || []);
     var shown = picker === 'knowledge'
-      ? KNOWLEDGE.filter(function (k) { return matchesQuery(query.knowledge, [k.name, k.description, KIND_LABEL[k.kind]]); }).length
+      ? KNOWLEDGE.length            // the engine narrows this after the paint
       : pool.filter(function (p) { return matchesQuery(query.capabilities, [p.name, p.description, p.category, p.type]); }).length;
     return BuilderShell.picker({
       key: picker,
@@ -827,6 +892,8 @@
       query: query[picker],
       shown: shown,
       total: pool.length,
+      toolbarExtra: picker === 'knowledge' ? kindControlsHtml() : '',
+      controls: picker === 'knowledge' ? kindChipsHtml() : '',
       rows: picker === 'knowledge' ? knowledgeRows(a) : capabilityRows(a),
       // Pre-built: the footer carries links to the Catalog.
       foot: def.foot,
@@ -837,12 +904,40 @@
     picker = key;
     query[key] = '';
     renderPicker();
+    if (key === 'knowledge') initPickerFilter();
     var s = document.querySelector('[data-ag-search="' + key + '"]');
     if (s) s.focus();
   }
 
+  /* The engine binds to `document` and `window` as well as to the menu, and
+     those outlive the modal — so it is destroyed on the way out, not left to
+     accumulate one more copy per open. */
+  function initPickerFilter() {
+    if (!window.FilterToolbar) return;
+    if (pickerFilter) { pickerFilter.destroy(); pickerFilter = null; }
+    if (!document.querySelector('#ag-kn-filter-btn')) return;
+    pickerFilter = window.FilterToolbar.init({
+      rows: '#ag-picker .ag-pick-rows .ag-row',
+      search: { el: '[data-ag-search="knowledge"]', attr: 'data-search' },
+      facets: [
+        { key: 'kind', attr: 'data-kind', label: 'Kind', multi: true },
+        { key: 'added', attr: 'data-added', label: 'Already added', toggle: true },
+      ],
+      filterBtn: '#ag-kn-filter-btn', menu: '#ag-kn-filter-menu', chips: '#ag-kn-chips',
+      count: { el: '.ag-toolcount[data-count="knowledge"]', noun: 'item' },
+      noResults: '#ag-kn-noresults',
+    });
+  }
+
+  function destroyPickerFilter() {
+    if (!pickerFilter) return;
+    pickerFilter.destroy();
+    pickerFilter = null;
+  }
+
   function closePicker() {
     if (!picker) return;
+    destroyPickerFilter();
     picker = null;
     renderPicker();
   }
@@ -868,8 +963,31 @@
      modal down under the pointer mid-selection. */
   function afterIngredientChange() {
     touch();
-    if (picker) { renderPickerRows(); renderCfgPane(); }
+    if (picker) { syncPickerRow(); renderCfgPane(); }
     else renderBuilder();
+  }
+
+  /* In place, never a rebuild. `renderPickerRows()` replaced the whole list,
+     which is fine on its own but not while FilterToolbar is driving it: the
+     engine captured those row elements at init, so a fresh set is a list it is
+     no longer filtering — the search box and the chips would go on narrowing
+     rows that are no longer in the document. Only two things change when a
+     row is toggled anyway: its button, and whether "Already added" still
+     matches it. */
+  function syncPickerRow() {
+    var a = current(); if (!a) return;
+    document.querySelectorAll('#ag-picker .ag-pick-rows .ag-row').forEach(function (row) {
+      var btn = row.querySelector('[data-ag-kn], [data-ag-cap]');
+      if (!btn) return;
+      var id = btn.getAttribute('data-ag-kn') || btn.getAttribute('data-ag-cap');
+      var list = btn.hasAttribute('data-ag-kn') ? a.knowledge : a.plugins;
+      var on = list.indexOf(id) >= 0;
+      btn.classList.toggle('on', on);
+      btn.textContent = on ? '✓ Added' : 'Add';
+      row.setAttribute('data-added', on ? 'yes' : 'no');
+    });
+    // The "Already added" facet slices on an attribute that just changed.
+    if (pickerFilter && pickerFilter.apply) pickerFilter.apply();
   }
 
   function surfacesBody(a) {
@@ -1078,15 +1196,16 @@
   }
 
   function schedulesBody(a) {
-    if (!a.slug) return '<div class="ag-note">This agent has no address yet — reload the page and try again.</div>';
+    if (!a.slug) return '<div class="ag-note ag-note--err">This agent has no address yet — reload the page and try again.</div>';
     if (schedulesErr === 'disabled') {
       return '<div class="ag-note">Scheduled runs are turned off on this instance (agents are disabled) — ask an admin to enable them.</div>';
     }
-    if (schedulesErr) return '<div class="ag-note">Could not load this agent’s schedules right now — try reloading the page.</div>';
+    if (schedulesErr) return '<div class="ag-note ag-note--err">Could not load this agent’s schedules right now — try reloading the page.</div>';
     if (schedules === null) return '<p class="ag-row-desc" style="padding:12px 0">Loading schedules…</p>';
     return '<div class="ag-rows" data-rows="schedules">' + scheduleRows() + '</div>' +
       scheduleFormHtml(a) +
-      '<div class="ag-note">Each run sends the schedule’s prompt to this agent as a fresh background job, with your identity and the agent’s usual scope and budget. Results land in the agent’s job history and webhooks.</div>';
+      '<div class="ag-note">Each run sends the prompt as a fresh background job, on your identity and ' +
+      'the agent’s usual scope. Results land in its job history and webhooks.</div>';
   }
 
   function scheduleSummary() {
@@ -1238,17 +1357,32 @@
       ' as you had ' + (w.length > 1 ? 'them' : 'it') + '.</p>';
   }
 
+  /* What an agent IS, at the head of the transcript — the same block in the
+     same position as /skills, the MCP builder and the package builder. This
+     page had no such statement at all: the opening line jumps straight to
+     "what would you like it to do?", which assumes you already know what
+     "it" is. */
+  function aboutHtml() {
+    return BuilderShell.about({
+      iconSvg: AVA_SVG,
+      accent: 'agent',
+      html: '<p>An <strong>agent</strong> is a focused assistant built from your own stack — what it knows, ' +
+        'what it can do, and where your team reaches it. It runs on your permissions, never anyone else\u2019s.</p>',
+    });
+  }
+
   function convHtml() {
     /* With no model configured the pane used to show a greeting, a red error
        under it, and a live composer — all of which fail identically. */
     if (llmUnavailable) {
       return BuilderShell.noModelNotice('configuration on the right') +
-        BuilderShell.conversation({ id: 'ag-conv', rows: conv, busy: false, err: null });
+        BuilderShell.conversation({ id: 'ag-conv', rows: conv, busy: false, err: null, about: aboutHtml() });
     }
     return BuilderShell.conversation({
       id: 'ag-conv',
       rows: [{ role: 'assistant', text: openingMessage() }].concat(conv),
       busy: convBusy,
+      about: aboutHtml(),
       err: convErr,
     }) + keptNote();
   }
@@ -1311,8 +1445,12 @@
 
   function cfgBodyHtml(a) {
     var sn = Object.keys(a.surfaces).filter(function (k) { return a.surfaces[k]; }).length;
-    return '<div class="ag-cfg-ava"><span>' + AVA_SVG + '</span></div>' +
-      section('identity', 1, 'Identity', '', 'Who it is and how it behaves.',
+    /* No avatar slot here. It was a 74px dashed ring around the same glyph
+       the list cards already carry, and nothing ever filled it — dashes mean
+       "empty slot" everywhere else in this codebase, so the first thing in
+       the configuration read as a failed image and cost ~96px before the
+       first field. */
+    return section('identity', 1, 'Identity', '', 'Who it is and how it behaves.',
         (a.name || 'Unnamed') + ' · ' + a.tone, identityBody(a)) +
       section('knowledge', 2, 'Data & resources', 'what it knows',
         'What this agent is allowed to reach. Outside of this it says it cannot help, rather than guessing.',
@@ -1397,6 +1535,10 @@
     setPageHead(false);
     listView.hidden = true;
     builderView.hidden = false;
+    /* A full rebuild replaces the panel node, so the reader's place in the
+       configuration column is restored around it — otherwise picking a tone
+       two thirds of the way down throws you back to the top. */
+    BuilderShell.keepCfgScroll('ag-cfg-body', function () {
     builderView.innerHTML =
       BuilderShell.head({
         backLabel: 'All agents',
@@ -1417,6 +1559,7 @@
         cfg: cfgBodyHtml(a),
       }) +
       '<div id="ag-picker"></div>';
+    });
     syncSkillDropdown();
     flagTouchedFields();
     scrollConvToEnd();
@@ -1933,6 +2076,12 @@
     // keeps focus and caret while typing (a full renderBuilder would not).
     var sk = e.target.getAttribute && e.target.getAttribute('data-ag-search');
     if (sk) {
+      /* The knowledge picker's search belongs to FilterToolbar now, and this
+         handler actively undid it: it rebuilt every row from scratch on each
+         keystroke, which restored the rows the engine had just hidden and
+         left the engine holding references to nodes no longer in the
+         document. The engine also owns that picker's count. */
+      if (sk === 'knowledge' && pickerFilter) return;
       query[sk] = e.target.value;
       var a2 = current(); if (!a2) return;
       renderPickerRows();

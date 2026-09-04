@@ -31,6 +31,7 @@ import duckdb
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
+from app.api.access_policy_http import assert_no_empty_policy_mapping
 from app.auth.dependencies import _get_db, get_current_user
 from src.audit_helpers import identity_for_audit, log_safe
 from src.db import get_analytics_db_readonly
@@ -41,6 +42,7 @@ from src.access_policy import (
     assert_unique_output_columns,
     policied_from_sql,
     policied_relation,
+    row_scope_payload,
 )
 from src.repositories import table_registry_repo
 from src.sql_ident import quote_ident
@@ -64,6 +66,13 @@ class TableQueryResponse(BaseModel):
     row_count: int
     columns: List[str]
     truncated: bool
+    # N1 (RLS review, #1979): the same `row_scope` disclosure envelope
+    # `POST /api/query` and `POST /api/v2/sample` already carry (table
+    # access policies design doc §10) — built by the shared
+    # `src.access_policy.row_scope_payload`, so the wording never drifts
+    # between surfaces. `None` (never an empty-but-present envelope) unless
+    # this call actually read through a policied table.
+    row_scope: dict | None = None
 
 
 def _column_names(analytics_conn: duckdb.DuckDBPyConnection, table_view_name: str) -> List[str]:
@@ -170,6 +179,12 @@ def query_table(
     except PolicyError as exc:
         raise HTTPException(status_code=500, detail={"reason": "policy_error", "table": exc.table_id})
 
+    # #2147: an empty/never-synced `policy_mapping` dependency (§15.1) must
+    # fail closed here too, before any SQL runs — the same guard
+    # `POST /api/query` applies.
+    if relation.policied:
+        assert_no_empty_policy_mapping(table_id=relation.table_id, row=table)
+
     # A transient, per-call read-only connection — the same helper
     # `/api/query` and `/api/query/hybrid` use — not the process-wide
     # read-write singleton (`get_analytics_db()`). This endpoint used to
@@ -245,6 +260,7 @@ def query_table(
             row_count=len(result_records),
             columns=columns,
             truncated=truncated,
+            row_scope=row_scope_payload([relation.table_id] if relation.policied else None),
         )
     finally:
         analytics_conn.close()

@@ -13,9 +13,27 @@ modal's DOM, and the inline-error wiring. A full click-through needs a
 headless browser this suite doesn't run.
 """
 
+from __future__ import annotations
+
+import json
+import shutil
+import subprocess
+from pathlib import Path
+
+import pytest
+
+TEMPLATE_PATH = Path(__file__).resolve().parents[1] / "app" / "web" / "templates" / "admin_tables.html"
+
 
 def _auth(token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}
+
+
+def _template_text() -> str:
+    """The template carries a couple of stray NUL bytes (pre-existing,
+    unrelated to this change) that trip a plain ``read_text`` — strip them
+    the same way the diff-panel review that found this used ``grep -a``."""
+    return TEMPLATE_PATH.read_bytes().replace(b"\x00", b"").decode("utf-8")
 
 
 def test_access_column_header_present(seeded_app):
@@ -27,10 +45,11 @@ def test_access_column_header_present(seeded_app):
 
 
 def test_access_column_renders_three_states(seeded_app):
-    """``renderAccessPolicyChip`` emits: (1) a plain "—" for a table that
-    could carry a policy but doesn't, (2) a muted "not available —
-    distributed" for a table that isn't eligible (not remote/server_only),
-    and (3) a tinted "Policy" chip for a table that carries one."""
+    """``renderAccessPolicyChip`` emits: (1) a muted "+ Add policy" chip for
+    a table that could carry a policy but doesn't, (2) a muted "not
+    available — distributed" for a table that isn't eligible (not
+    remote/server_only), and (3) a tinted "Policy" chip for a table that
+    carries one."""
     c = seeded_app["client"]
     token = seeded_app["admin_token"]
     r = c.get("/admin/tables", headers=_auth(token))
@@ -41,6 +60,51 @@ def test_access_column_renders_three_states(seeded_app):
     assert "access-chip--active" in body
     assert "not available — distributed" in body
     assert ">Policy</button>" in body
+
+
+def test_eligible_table_without_a_policy_gets_a_labelled_affordance(seeded_app):
+    """Item 1 of the #1979 setup-flow review: the eligible-but-no-policy
+    state used to render as a bare, unlabelled "—" that was clickable and
+    looked inert. It now carries a label and an explanatory title, and it
+    still opens the SAME editor (``openAccessPolicyModal``)."""
+    c = seeded_app["client"]
+    token = seeded_app["admin_token"]
+    r = c.get("/admin/tables", headers=_auth(token))
+    body = r.text
+    assert ">+ Add policy</button>" in body
+    assert "This table is eligible for a row-level access policy — click to add one" in body
+    # The bare dash is gone as a BUTTON label (the internal-table "—" stays
+    # a non-interactive <span>, which is a different, correct state).
+    assert ">—</button>" not in body
+    # Still the one modal all four states open.
+    assert "openAccessPolicyModal" in body
+
+
+def test_eligible_no_policy_chip_hints_at_an_unpackaged_table(seeded_app):
+    """Item 6: a policy on a table no data package carries guards data
+    nobody can reach, so the chip trails a quiet link into the same
+    ``?unpackaged=1`` assign flow the /admin/data-packages banner opens."""
+    c = seeded_app["client"]
+    token = seeded_app["admin_token"]
+    r = c.get("/admin/tables", headers=_auth(token))
+    body = r.text
+    assert "access-chip-hint" in body
+    assert "not in any package yet" in body
+    assert "/admin/tables?unpackaged=1" in body
+    # Membership comes from the already-server-rendered delivery map — no
+    # new field and no new endpoint.
+    assert "TABLE_DELIVERY[String(t.id || '')]" in body
+
+
+def test_ineligible_access_chip_label_is_unchanged(seeded_app):
+    """The labelled eligible state must not have disturbed the ineligible
+    one: same label, same explanatory title, same modal."""
+    c = seeded_app["client"]
+    token = seeded_app["admin_token"]
+    r = c.get("/admin/tables", headers=_auth(token))
+    body = r.text
+    assert ">not available — distributed</button>" in body
+    assert "table can carry an access policy — click to see the fix." in body
 
 
 def test_access_column_omits_the_unwired_mapping_warn_state(seeded_app):
@@ -182,7 +246,28 @@ def test_access_policy_history_reads_the_existing_activity_endpoint(seeded_app):
     assert "async function _apLoadHistory" in body
     assert 'id="apHistorySection"' in body
     assert "/api/admin/activity?resource=" in body
-    assert "action_prefix=update_table" in body
+    # #1430 gave a policy write its own audit actions, so the fallback asks
+    # for those first and only then re-scans the generic `update_table`
+    # rows an instance wrote before they existed.
+    assert "'access_policy.'" in body
+    assert "row.action === 'access_policy.set'" in body
+    assert "'update_table'" in body
+
+
+def test_access_policy_history_cleared_detection_survives_audit_redaction(seeded_app):
+    """#1979 redacted ``access_policy_sql`` out of ``update_table`` audit
+    params (`app/api/admin.py::_SECRET_FIELDS`) — the value is now always
+    the literal string ``"***"`` (set) or ``"<empty>"`` (cleared/absent),
+    never ``null``/``""``. A JS falsiness check (``!params.access_policy_sql``)
+    would treat ``"<empty>"`` as truthy and misreport every clear as an
+    update, so the "cleared the policy" row must key off that literal
+    sentinel instead."""
+    c = seeded_app["client"]
+    token = seeded_app["admin_token"]
+    r = c.get("/admin/tables", headers=_auth(token))
+    body = r.text
+    assert "params.access_policy_sql === '<empty>'" in body
+    assert "!params.access_policy_sql" not in body
 
 
 def test_builder_scaffold_renders_when_flag_on(seeded_app):
@@ -210,6 +295,25 @@ def test_inline_eligibility_and_mapping_controls_render(seeded_app):
     body = r.text
     assert 'id="apMakeServerOnly"' in body
     assert 'id="apMappingToggle"' in body
+
+
+def test_mapping_toggle_is_visually_separated_from_the_row_scope_section(seeded_app):
+    """The mapping toggle answers a different question ("can other tables'
+    policies read through this one") than the row-rule/mask builder right
+    below it ("who sees which rows of THIS table") — stacked with identical
+    styling and no separator, it reads as one setting. It must carry its
+    own heading, a divider before the Builder tabs, and copy that says it
+    does not change this table's own row visibility."""
+    c = seeded_app["client"]
+    token = seeded_app["admin_token"]
+    r = c.get("/admin/tables", headers=_auth(token))
+    body = r.text
+    assert "Use as input for other tables' policies" in body
+    assert "does not change who sees which" in body
+    mapping_idx = body.index("ap-mapping-section")
+    divider_idx = body.index('<hr style="border:0; border-top:1px solid var(--ds-border)')
+    tabs_idx = body.index('data-ap-tab="builder"')
+    assert mapping_idx < divider_idx < tabs_idx
 
 
 def test_registered_table_row_wires_the_access_chip_to_the_modal(seeded_app):
@@ -292,6 +396,84 @@ def test_row_rule_controls_respect_the_eligibility_interlock(seeded_app):
     assert body.count("!_apIsEligible(_apTable)") >= 2
 
 
+def test_row_rule_column_picker_has_a_filter_input(seeded_app):
+    """#1979 follow-up (admin setup-flow review, item 4): the row rule's
+    column dropdown is a flat alphabetical list with no type-to-filter — on
+    a table with 100+ columns the admin scrolls by hand. Matches the
+    register-table wizard's "Filter tables…" box (``_register_table_form.
+    html`` / ``register_table_form.js``): a text input, filtered live, that
+    never changes the picker's selected value."""
+    c = seeded_app["client"]
+    token = seeded_app["admin_token"]
+    r = c.get("/admin/tables", headers=_auth(token))
+    body = r.text
+    assert 'class="ap-rr-col-filter"' in body
+    assert "Filter columns…" in body
+    assert 'oninput="_apFilterRowRuleColumnMenu(this)"' in body
+    assert "function _apFilterRowRuleColumnMenu" in body
+    # Skipped alongside the paired custom dropdown for a disabled (ineligible)
+    # row — same interlock the column/operator dropdowns already respect.
+    assert "(disabled ? '' : '<input type=\"text\" class=\"ap-rr-col-filter\"" in body
+
+
+def test_row_rule_column_filter_matches_case_insensitively_and_never_writes_state(seeded_app):
+    """The filter function only toggles ``.ds-dropdown-menu-item`` visibility
+    — it must never touch ``_apRowRules``, ``_apColumns``, or set a
+    ``<select>``'s value, or the picker's value contract with the compiler
+    would drift out from under a keystroke."""
+    c = seeded_app["client"]
+    token = seeded_app["admin_token"]
+    r = c.get("/admin/tables", headers=_auth(token))
+    body = r.text
+    start = body.index("function _apFilterRowRuleColumnMenu")
+    end = body.index("\n    }\n", start)
+    fn = body[start : end + len("\n    }\n")]
+    assert ".toLowerCase()" in fn
+    assert "_apMatchesColumnFilter" in fn
+    assert "_apRowRules" not in fn
+    assert ".value =" not in fn
+    assert "hidden" in fn  # hides/shows menu items and the empty-state message
+
+
+def test_column_mask_list_has_a_matching_filter_input(seeded_app):
+    """The mask/column list below the row rules is sourced from the same
+    ``_apColumns`` fetch — give it the same "Filter columns…" box rather
+    than leaving one of the two column pickers unfiltered."""
+    c = seeded_app["client"]
+    token = seeded_app["admin_token"]
+    r = c.get("/admin/tables", headers=_auth(token))
+    body = r.text
+    assert 'id="apColFilter"' in body
+    assert 'class="ap-col-filter"' in body
+    assert "Filter columns…" in body
+    assert 'oninput="_apRenderColList()"' in body
+    assert "function _apMatchesColumnFilter" in body
+    # Case-insensitive substring on name and (when known) type.
+    fn = body[body.index("function _apMatchesColumnFilter") : body.index("function _apColumnFilterValue")]
+    assert ".toLowerCase()" in fn
+    assert "indexOf(search)" in fn
+    # An empty result set says so instead of silently rendering nothing.
+    assert "No columns match your filter." in body
+
+
+def test_column_filter_never_reaches_the_compiled_policy_spec(seeded_app):
+    """Filtering only narrows what ``_apRenderColList``/the row-rule menu
+    render — the compile request still walks the full, unfiltered state
+    (``_apMaskState`` and ``_apRowRules``), so a column hidden by an active
+    filter is never silently dropped from a saved policy."""
+    c = seeded_app["client"]
+    token = seeded_app["admin_token"]
+    r = c.get("/admin/tables", headers=_auth(token))
+    body = r.text
+    compile_start = body.index("async function _apCompileNow")
+    compile_end = body.index("\n    }\n", compile_start)
+    compile_fn = body[compile_start:compile_end]
+    assert "row_rules: _apAssembleRowRules()" in compile_fn
+    assert "column_masks: _apMaskState" in compile_fn
+    assert "apColFilter" not in compile_fn
+    assert "_apFilterRowRuleColumnMenu" not in compile_fn
+
+
 def test_preview_shows_before_after_on_the_raw_sample(seeded_app):
     """access-policy-builder-ux Slice 2, Task B: the preview renders every
     ``base_sample_rows`` row — struck-through when the policy drops it,
@@ -343,6 +525,89 @@ def test_builder_surfaces_compile_warnings(seeded_app):
     fn = body[body.index("function _apRenderCompileWarnings") : body.index("function _apShowSaveError")]
     assert "textContent" in fn
     assert "innerHTML" not in fn
+
+
+def test_save_confirms_before_storing_a_policy_that_filters_or_masks_nothing(seeded_app):
+    """A policy with no row rule and no column mask compiles to a bare
+    `SELECT * FROM t` — it saves successfully (masking-only or
+    filtering-only policies are legitimate, so this must never be a hard
+    block) but must not go through silently: `apSavePolicy()` asks for
+    explicit confirmation first, mirroring the same no-op condition
+    `compile_policy()` itself warns about (no WHERE, no EXCLUDE, no CASE)."""
+    c = seeded_app["client"]
+    token = seeded_app["admin_token"]
+    r = c.get("/admin/tables", headers=_auth(token))
+    body = r.text
+    assert "function _apSqlFiltersOrMasksNothing" in body
+    fn = body[body.index("async function apSavePolicy") : body.index("async function apClearPolicy")]
+    assert "_apSqlFiltersOrMasksNothing(sql)" in fn
+    assert "confirmModal(" in fn
+    assert "Save anyway" in fn
+
+
+def test_the_feature_flag_notice_has_exactly_one_implementation(seeded_app, monkeypatch):
+    """#1430 and #1979 both grew a "say the flag is off up front" notice and
+    they were reconciled onto ONE: the server-rendered ``{% if not
+    access_policies_enabled %}`` banner plus the ``disabled`` Save button
+    (pinned by ``test_flag_off_shows_a_notice_and_disables_save`` below).
+    The JS twin -- an ``ACCESS_POLICIES_ENABLED`` constant read from a
+    ``data-access-policies-enabled`` body attribute, feeding a second
+    ``#apFeatureDisabledWarning`` div and a client-side branch in
+    ``apSavePolicy()`` -- must not come back: two notices on one modal read
+    as two different rules, and the disabled button is the stronger gate
+    (the JS twin left Save clickable and only explained the refusal after
+    the click).
+    """
+    c = seeded_app["client"]
+    token = seeded_app["admin_token"]
+    body = c.get("/admin/tables", headers=_auth(token)).text
+
+    assert 'id="apFeatureDisabledWarning"' not in body
+    assert "_apRenderFeatureDisabledWarning" not in body
+    # (the notice's own prose names the env var, so pin the JS symbol)
+    assert "var ACCESS_POLICIES_ENABLED" not in body
+    assert "!ACCESS_POLICIES_ENABLED" not in body
+    assert "data-access-policies-enabled" not in body
+    # ... and the surviving one is still there, with the flag off.
+    assert 'id="apFlagDisabledNotice"' in body
+
+    monkeypatch.setenv("AGNES_ACCESS_POLICIES_ENABLED", "1")
+    assert 'id="apFlagDisabledNotice"' not in c.get("/admin/tables", headers=_auth(token)).text
+
+
+def test_preview_all_groups_button_is_wired_to_the_new_endpoint(seeded_app):
+    """review-plan P1.4: a "Preview all groups" action next to the
+    single-persona preview sweeps every real group through the same policy
+    in one call, so a CASE with a missing ELSE branch shows up as an
+    unexpected group seeing everything instead of requiring the admin to
+    run the single-persona preview once per group by hand."""
+    c = seeded_app["client"]
+    token = seeded_app["admin_token"]
+    r = c.get("/admin/tables", headers=_auth(token))
+    body = r.text
+    assert "async function apRunPreviewAllGroups" in body
+    assert "/policy/preview-groups" in body
+    assert 'id="apPreviewGroupsResult"' in body
+    assert "Preview all groups" in body
+    assert "function _apRenderPreviewGroupsResult" in body
+
+
+def test_preview_renderers_surface_the_mapping_warning(seeded_app):
+    """review plan P2.6: both preview renderers must check
+    ``body.mapping_warning`` and show it as text (server-supplied string,
+    so ``textContent``-safe rendering via ``escapeHtml``, never raw
+    ``innerHTML``) instead of rendering a misleading rows/columns result
+    when a referenced ``policy_mapping`` table is empty or never synced."""
+    c = seeded_app["client"]
+    token = seeded_app["admin_token"]
+    r = c.get("/admin/tables", headers=_auth(token))
+    body = r.text
+    single = body[body.index("function _apRenderPreviewResult") : body.index("async function _apLoadHistory")]
+    assert "body.mapping_warning" in single
+    assert "escapeHtml(body.mapping_warning)" in single
+    groups = body[body.index("function _apRenderPreviewGroupsResult") : body.index("function _apMatchPreviewRows")]
+    assert "body.mapping_warning" in groups
+    assert "escapeHtml(body.mapping_warning)" in groups
 
 
 def test_preview_only_diffs_samples_the_server_says_are_comparable(seeded_app):
@@ -448,3 +713,881 @@ def test_opening_the_sql_tab_runs_a_queued_compile_instead_of_dropping_it(seeded
     flush = flush[: flush.index("function _apScheduleCompile")]
     assert "clearTimeout(_apCompileTimer)" in flush
     assert "_apCompileNow();" in flush, "the queued compile must actually run"
+
+
+# ── K1-sweep finding 4 (#1979): surface access_policies.enabled in the modal ──
+#
+# The flag only gates ATTACHING a policy (``PUT /registry/{id}``'s
+# ``access_policy_sql`` setter) — enforcement of an already-saved policy
+# always runs, and the read-only authoring endpoints (``policy/columns``,
+# ``policy/compile``, ``policy/preview``) are never gated (see their own
+# docstrings in ``app/api/admin.py``). Before this, the modal opened
+# regardless and only the server-side save 422'd — friction, not a dead
+# end, but discoverable only after typing a policy. These tests pin the
+# notice + disabled Save button that make the flag state visible up front.
+
+
+def test_flag_off_shows_a_notice_and_disables_save(seeded_app):
+    """Default test env carries no ``AGNES_ACCESS_POLICIES_ENABLED`` — same
+    as this instance's own default (off) — so the notice must render and
+    the Save button must be disabled without any extra setup."""
+    c = seeded_app["client"]
+    token = seeded_app["admin_token"]
+    r = c.get("/admin/tables", headers=_auth(token))
+    body = r.text
+    assert 'id="apFlagDisabledNotice"' in body
+    assert "attaching or editing a policy is disabled" in body
+    assert "enforcement of any already-saved policy keeps running" in body
+    assert "/admin/server-config" in body
+    assert "AGNES_ACCESS_POLICIES_ENABLED" in body
+    assert 'id="apSaveBtn" onclick="apSavePolicy()" disabled' in body
+
+
+def test_flag_off_leaves_the_editor_and_preview_usable(seeded_app):
+    """Only Save is blocked — the textarea stays readable/editable (so an
+    admin can still view an existing policy) and the Preview button is not
+    disabled, matching the backend (``policy/preview`` is not gated)."""
+    c = seeded_app["client"]
+    token = seeded_app["admin_token"]
+    r = c.get("/admin/tables", headers=_auth(token))
+    body = r.text
+    assert '<textarea class="form-textarea" id="apSql"' in body
+    assert "apSql" in body and "disabled" not in body[body.index('id="apSql"') : body.index('id="apSql"') + 200]
+    assert 'onclick="apRunPreview()">Preview</button>' in body
+
+
+def test_flag_off_the_access_chip_still_opens_the_modal(seeded_app):
+    """The notice must be discoverable — the Access-column chip flow keeps
+    calling ``openAccessPolicyModal`` regardless of the flag; the modal
+    itself decides what to show, not the chip."""
+    c = seeded_app["client"]
+    token = seeded_app["admin_token"]
+    r = c.get("/admin/tables", headers=_auth(token))
+    body = r.text
+    assert "function renderAccessPolicyChip" in body
+    assert "openAccessPolicyModal(" in body
+
+
+def test_flag_on_is_zero_visual_change(seeded_app, monkeypatch):
+    """With the flag on, neither the notice nor the disabled attribute may
+    render — this is the "zero visual change" contract."""
+    monkeypatch.setenv("AGNES_ACCESS_POLICIES_ENABLED", "1")
+    c = seeded_app["client"]
+    token = seeded_app["admin_token"]
+    r = c.get("/admin/tables", headers=_auth(token))
+    body = r.text
+    assert 'id="apFlagDisabledNotice"' not in body
+    assert 'id="apSaveBtn" onclick="apSavePolicy()">Save policy</button>' in body
+
+
+def test_preview_renders_the_transpiled_block_when_present(seeded_app):
+    """K1-sweep finding 3 (#1979): a remote table on a transpiling engine
+    runs the TRANSPILED body on a live read, not the DuckDB text in
+    ``#apSql`` — ``_apRenderPreviewResult`` must show it, collapsed by
+    default (secondary to the row/column preview above), read-only."""
+    c = seeded_app["client"]
+    token = seeded_app["admin_token"]
+    r = c.get("/admin/tables", headers=_auth(token))
+    body = r.text
+
+    render = body[body.index("function _apRenderPreviewResult") :]
+    render = render[: render.index("function _apLoadHistory")]
+    assert "body.transpiled" in render
+    assert "ap-preview-transpiled" in render
+    assert "<details" in render and "<summary>" in render
+    assert "Transpiled for " in render
+    # Read-only text, escaped like every other server-controlled string
+    # rendered into this modal — never innerHTML'd raw.
+    assert "escapeHtml(body.transpiled.dialect)" in render
+    assert "escapeHtml(body.transpiled.relation_sql)" in render
+
+
+# ── #1979 K1-sweep finding 1: restore a policy version ────────────────
+
+
+def test_history_prefers_the_revision_store_over_the_audit_trail(seeded_app):
+    """The panel now reads ``GET .../policy/revisions`` first — the only
+    source that carries the SQL BODY of each saved state, which is what
+    "Restore" needs. The audit trail cannot serve it: #1979 redacted
+    ``access_policy_sql`` out of ``update_table`` params."""
+    c = seeded_app["client"]
+    body = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
+    assert "/policy/revisions?limit=" in body
+    assert "async function _apLoadHistory" in body
+    assert "function _apRenderRevisions" in body
+
+    loader = body[body.index("async function _apLoadHistory") :]
+    loader = loader[: loader.index("async function _apLoadHistoryFromActivity")]
+    assert "/policy/revisions" in loader
+    assert "_apLoadHistoryFromActivity" in loader, "the audit-derived history must remain the fallback"
+
+
+def test_history_falls_back_to_the_audit_trail_when_there_is_no_revision_store(seeded_app):
+    """``access_policy_revisions`` is PG-only (A3), so a DuckDB-backed
+    instance answers a typed 501. The panel must degrade to the read-only
+    audit-derived history it always had — not to an empty section, which
+    would read as "this policy was never edited"."""
+    c = seeded_app["client"]
+    body = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
+    assert "async function _apLoadHistoryFromActivity" in body
+    assert "/api/admin/activity?resource=" in body
+
+    fallback = body[body.index("async function _apLoadHistoryFromActivity") :]
+    fallback = fallback[: fallback.index("function _apParseAuditParams")]
+    # The fallback rows carry no Restore button: without a stored body there
+    # is nothing to restore, and a button that cannot work is worse than none.
+    assert "apRestoreRevision(" not in fallback
+
+
+def test_restore_button_fills_the_editor_and_never_saves_by_itself(seeded_app):
+    """Restore is not a write. It loads the revision into the SQL + note
+    boxes and hands it back to the admin, so the ordinary Save runs every
+    validation and interlock a fresh policy pays for (distribution
+    interlock, mandatory note, static validation, live probe)."""
+    c = seeded_app["client"]
+    body = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
+    assert "function apRestoreRevision" in body
+    assert ">Restore</button>" in body
+
+    fn = body[body.index("function apRestoreRevision") :]
+    fn = fn[: fn.index("function _apShowRestoreNotice")]
+    assert "document.getElementById('apSql').value" in fn
+    assert "document.getElementById('apNote').value" in fn
+    # No write of any kind from the restore path itself.
+    assert "fetch(" not in fn, "restore must not call the API — the admin's Save does"
+    assert "apSavePolicy(" not in fn, "restore must not auto-save; the editor/save flow is the point"
+    # The restored body lands on the tab that shows it, and the stale-builder
+    # guard is cleared the same way a hand edit clears it.
+    assert "apSwitchTab('sql')" in fn
+    assert "apSqlEdited()" in fn
+
+
+def test_restore_announces_that_nothing_is_saved_yet(seeded_app):
+    """An admin who clicks Restore and closes the modal must not believe the
+    old policy is back. The notice says the editor is loaded and nothing has
+    changed until Save."""
+    c = seeded_app["client"]
+    body = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
+    assert 'id="apRestoreNotice"' in body
+    assert "function _apShowRestoreNotice" in body
+    assert "function _apHideRestoreNotice" in body
+    assert "Nothing has changed yet" in body
+    assert "Save policy" in body
+
+
+def test_a_cleared_revision_renders_as_such_and_offers_no_restore(seeded_app):
+    """A revision whose SQL is NULL is the moment protection was REMOVED.
+    It belongs in the history (it is the most important row in it), but
+    "restore" on it would mean re-clearing — which the Clear button already
+    does, explicitly and with a confirmation."""
+    c = seeded_app["client"]
+    body = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
+    renderer = body[body.index("function _apRenderRevisions") :]
+    renderer = renderer[: renderer.index("function apRestoreRevision")]
+    assert "rev.cleared" in renderer
+    assert "cleared the policy" in renderer
+    assert "if (!rev.cleared)" in renderer, "the Restore button is conditional on a body existing"
+
+
+def test_history_rows_show_a_peek_at_the_stored_sql(seeded_app):
+    """Who/when/note alone cannot tell two edits apart. The row shows the
+    head of the stored body — truncated, because the panel is a chooser, not
+    a viewer; the editor is where the full body goes."""
+    c = seeded_app["client"]
+    body = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
+    assert "function _apSqlPeek" in body
+    assert "ap-history-sql" in body
+    # Every interpolation into the row HTML is escaped — saved_by and the
+    # note are admin-authored free text.
+    renderer = body[body.index("function _apRenderRevisions") :]
+    renderer = renderer[: renderer.index("function apRestoreRevision")]
+    assert "escapeHtml(_apSqlPeek(" in renderer
+    assert "escapeHtml(who)" in renderer
+
+
+def test_a_truncated_history_says_so(seeded_app):
+    """The endpoint returns an untruncated ``count`` alongside the capped
+    list, so ten of thirty-four never renders as the whole history."""
+    c = seeded_app["client"]
+    body = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
+    renderer = body[body.index("function _apRenderRevisions") :]
+    renderer = renderer[: renderer.index("function apRestoreRevision")]
+    assert "body.count" in renderer
+    assert "most recent of" in renderer
+
+
+def test_new_history_styles_are_tokenized_and_not_inline(seeded_app):
+    """Design-system contract: the new rows style through classes in the
+    page's CSS block using --ds-* tokens, never inline style attributes and
+    never raw colours."""
+    c = seeded_app["client"]
+    body = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
+    for cls in (".ap-history-sql", ".ap-history-restore", ".ap-history-meta"):
+        assert cls + " {" in body, f"missing CSS rule for {cls}"
+    block = body[body.index(".ap-history-sql {") :]
+    block = block[: block.index(".ap-history-restore {")]
+    assert "var(--ds-" in block
+    assert "#" not in block, "raw hex colour in the new history styles"
+
+    renderer = body[body.index("function _apRenderRevisions") :]
+    renderer = renderer[: renderer.index("function apRestoreRevision")]
+    assert "style=" not in renderer, "new history rows must not carry inline styles"
+
+
+# ── #1979 K1-sweep finding 2 (MonikaFeigler): a diff between revisions ────
+#
+# The panel already listed who/when/note + a body peek + Restore. That is a
+# CHOOSER, not a way to tell what actually changed between two saves — this
+# section adds a per-revision line diff so an admin doesn't have to load two
+# versions into the editor and eyeball them.
+
+
+def test_history_panel_ships_a_self_contained_line_diff(seeded_app):
+    """No external diff library — a policy body is a handful of SQL lines,
+    not a file worth Myers' bookkeeping. The functions live inline, next to
+    the renderer that calls them."""
+    c = seeded_app["client"]
+    body = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
+    assert "function _apDiffLines" in body
+    assert "function _apRenderDiffBody" in body
+    assert "function _apRenderRevisionDiff" in body
+    for lib in ("diff-match-patch", "jsdiff", "diff.js", "Diff.diffLines"):
+        assert lib not in body, f"unexpected external diff dependency: {lib}"
+
+
+def test_diff_is_bounded_so_a_pasted_wall_of_sql_cannot_hang_the_panel(seeded_app):
+    """The LCS table is O(n*m) time AND space — a per-side cap keeps opening
+    the history panel cheap even if a policy body is pasted from somewhere
+    unbounded."""
+    c = seeded_app["client"]
+    body = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
+    assert "_AP_DIFF_MAX_LINES" in body
+    diff_fn = body[body.index("function _apDiffLines") :]
+    diff_fn = diff_fn[: diff_fn.index("function _apRenderDiffBody")]
+    assert "_AP_DIFF_MAX_LINES" in diff_fn
+    assert "return null" in diff_fn
+
+
+def test_diff_renders_a_collapsed_details_block_like_the_transpiled_preview(seeded_app):
+    """Same idiom as ``.ap-preview-transpiled`` (f2fd242e6): collapsed by
+    default, opened only when the peek isn't enough to tell two edits apart."""
+    c = seeded_app["client"]
+    body = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
+    render_fn = body[body.index("function _apRenderRevisionDiff") :]
+    render_fn = render_fn[: render_fn.index("function _apRenderRevisions(body)")]
+    assert "<details" in render_fn and "<summary>" in render_fn
+    assert "ap-history-diff-details" in render_fn
+    assert "Diff vs previous" not in render_fn, "the label is a parameter, not hardcoded here"
+    assert "escapeHtml(label)" in render_fn
+
+
+def test_diff_escapes_both_the_removed_and_added_lines(seeded_app):
+    """Every line inserted into the diff body — from either side — goes
+    through ``escapeHtml`` before it reaches the page. A policy body is
+    admin-authored SQL, not trusted markup."""
+    c = seeded_app["client"]
+    body = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
+    diff_body_fn = body[body.index("function _apRenderDiffBody") :]
+    diff_body_fn = diff_body_fn[: diff_body_fn.index("function _apMappingLabel")]
+    assert "escapeHtml(prefix + op.text)" in diff_body_fn, (
+        "the single escapeHtml call must cover both add ('+') and del ('-') lines, "
+        "since op.text comes from either the old or the new side"
+    )
+
+
+def test_note_only_change_says_so_instead_of_an_empty_diff(seeded_app):
+    """Re-saving the same SQL with a clarifying note must not render an
+    empty diff block, which would read as a bug rather than as "no SQL
+    change"."""
+    c = seeded_app["client"]
+    body = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
+    render_fn = body[body.index("function _apRenderRevisionDiff") :]
+    render_fn = render_fn[: render_fn.index("function _apRenderRevisions(body)")]
+    assert "SQL unchanged" in render_fn and "note changed" in render_fn
+    assert "oldSql === newSql" in render_fn
+
+
+def test_cleared_revision_diffs_as_all_lines_removed(seeded_app):
+    """A cleared revision's SQL is NULL. Diffed against its predecessor it
+    must show as every line removed, not silently treated as unchanged."""
+    c = seeded_app["client"]
+    body = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
+    render_fn = body[body.index("function _apRenderRevisionDiff") :]
+    render_fn = render_fn[: render_fn.index("function _apRenderRevisions(body)")]
+    assert "!older.cleared" in render_fn
+    assert "!newer.cleared" in render_fn
+
+
+def test_oldest_revision_in_the_window_says_first_recorded_or_diffs_against_empty(seeded_app):
+    """The oldest revision the (capped) list carries has no older neighbour
+    IN THAT LIST. When the store truly holds nothing before it, say so
+    plainly rather than rendering a diff against nothing; when ``count``
+    says there is more history than this page shows, diff against an empty
+    baseline instead of silently dropping the block."""
+    c = seeded_app["client"]
+    body = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
+    renderer = body[body.index("function _apRenderRevisions(body)") :]
+    renderer = renderer[: renderer.index("function apRestoreRevision")]
+    assert "First recorded version." in renderer
+    assert "_apRenderRevisionDiff(null, rev, 'Diff vs previous')" in renderer
+    assert "body.count > revisions.length" in renderer
+
+
+def test_newest_revision_also_diffs_against_the_currently_stored_policy(seeded_app):
+    """The newest saved revision and the live registry row are USUALLY
+    identical (one save writes both in the same transaction) — this only
+    renders when they diverge, per idx === 0."""
+    c = seeded_app["client"]
+    body = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
+    renderer = body[body.index("function _apRenderRevisions(body)") :]
+    renderer = renderer[: renderer.index("function apRestoreRevision")]
+    assert "idx === 0" in renderer
+    assert "Diff vs current" in renderer
+    assert "_apTable.access_policy_sql" in renderer
+    assert "_apTable.policy_mapping" in renderer
+
+
+def test_policy_mapping_toggle_renders_as_a_one_line_flag_change(seeded_app):
+    """``policy_mapping`` is a boolean, not a line-diffable body — it earns
+    its own sentence rather than hiding inside (or being silently dropped
+    from) the SQL diff."""
+    c = seeded_app["client"]
+    body = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
+    assert "function _apMappingChangeLine" in body
+    mapping_fn = body[body.index("function _apMappingChangeLine") :]
+    mapping_fn = mapping_fn[: mapping_fn.index("function _apRenderRevisionDiff")]
+    assert "Policy mapping:" in mapping_fn
+    assert "ap-history-mapping-change" in mapping_fn
+    assert "escapeHtml(_apMappingLabel(" in mapping_fn
+
+
+def test_diff_styles_use_ds_tokens_not_raw_hex(seeded_app):
+    """Design-system contract, same shape as the existing history-row
+    styling test: classes only, --ds-* tokens only, no raw hex."""
+    c = seeded_app["client"]
+    body = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
+    for cls in (".ap-diff-add", ".ap-diff-del", ".ap-history-diff", ".ap-history-mapping-change"):
+        assert cls + " {" in body, f"missing CSS rule for {cls}"
+    block = body[body.index(".ap-history-diff-details {") :]
+    block = block[: block.index(".ap-history-first {")]
+    assert "var(--ds-" in block
+    assert "#" not in block, "raw hex colour in the new diff styles"
+    # The two semantic colours per the design-system playbook's status
+    # vocabulary — never a hand-picked green/red.
+    assert "--ds-accent-success" in block
+    assert "--ds-accent-danger" in block
+
+
+def test_audit_fallback_notes_diffing_is_unavailable_on_a_501(seeded_app):
+    """``access_policy_revisions`` is PG-only (A3). A DuckDB-backed instance
+    gets a typed 501 from the revisions endpoint, and the panel degrades to
+    the audit-derived, read-only list — which cannot diff, because
+    ``audit_log.params`` never carried a body. Say so once, not silently."""
+    c = seeded_app["client"]
+    body = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
+    loader = body[body.index("async function _apLoadHistory(") :]
+    loader = loader[: loader.index("function _apSqlPeek")]
+    assert "revisionsUnavailable" in loader
+    assert "rr.status === 501" in loader
+
+    fallback = body[body.index("async function _apLoadHistoryFromActivity") :]
+    fallback = fallback[: fallback.index("function _apParseAuditParams")]
+    assert "revisionsUnavailable" in fallback
+    assert "cannot store" in fallback
+    assert "ap-history-nodiff" in fallback
+    assert "apRestoreRevision(" not in fallback, "the fallback still carries no restore/diff action"
+
+
+class TestDiffAlgorithmUnderNode:
+    """Runs the SHIPPED ``_apDiffLines`` under node rather than restating
+    its rules in Python — a Python transcription would pass whatever the
+    rules happen to be, which is exactly the failure mode this class exists
+    to catch (same rationale as ``test_preview_error_names_the_reason.py``).
+    """
+
+    @staticmethod
+    def _extract_diff_snippet() -> str:
+        text = _template_text()
+        start = text.index("var _AP_DIFF_MAX_LINES")
+        end = text.index("function _apRenderRevisions(body)")
+        return text[start:end]
+
+    def _run(self, expression: str):
+        node = shutil.which("node")
+        if not node:
+            pytest.skip("node not available")
+        # `escapeHtml` in the shipped template goes through the DOM
+        # (`document.createElement('div').textContent = ...; .innerHTML`).
+        # This stub reproduces exactly what that round-trip does for plain
+        # text (escape &, <, >) — nothing about the DIFF LOGIC under test is
+        # reimplemented here, only the browser API it calls into.
+        shim = (
+            "var document = { createElement: function() { "
+            "  var v = ''; return { set textContent(s) { v = String(s)"
+            ".replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }, "
+            "  get innerHTML() { return v; } }; } };\n"
+        )
+        script = shim + self._extract_diff_snippet() + "\nprocess.stdout.write(JSON.stringify(" + expression + "));\n"
+        out = subprocess.run([node, "-e", script], capture_output=True, text=True, check=False)
+        assert out.returncode == 0, out.stderr
+        return json.loads(out.stdout)
+
+    def test_a_changed_line_is_one_del_and_one_add(self):
+        ops = self._run("_apDiffLines('SELECT 1', 'SELECT 2')")
+        assert ops == [{"type": "del", "text": "SELECT 1"}, {"type": "add", "text": "SELECT 2"}]
+
+    def test_a_shared_prefix_line_survives_as_same(self):
+        ops = self._run("_apDiffLines('A\\nB', 'A\\nC')")
+        assert ops[0] == {"type": "same", "text": "A"}
+        assert {"type": "del", "text": "B"} in ops
+        assert {"type": "add", "text": "C"} in ops
+
+    def test_identical_text_has_no_add_or_del(self):
+        ops = self._run("_apDiffLines('SAME', 'SAME')")
+        assert ops == [{"type": "same", "text": "SAME"}]
+
+    def test_clearing_a_policy_diffs_as_every_line_removed_with_no_stray_add(self):
+        """Regression: `''.split('\\n')` is `['']`, not `[]` — an earlier
+        version of this diffed a cleared policy as "every line removed PLUS
+        one blank line added", which is wrong."""
+        ops = self._run("_apDiffLines('SELECT 1\\nWHERE x = 1', '')")
+        assert all(op["type"] == "del" for op in ops)
+        assert [op["text"] for op in ops] == ["SELECT 1", "WHERE x = 1"]
+
+    def test_oversized_input_returns_null_rather_than_diffing(self):
+        big = "\\n".join(f"line{i}" for i in range(500))
+        result = self._run(f"_apDiffLines('{big}', '{big}x')")
+        assert result is None
+
+
+# ── #1979 reviewer finding 1: the Builder tab must not describe a policy it
+# cannot represent ────────────────────────────────────────────────────────
+#
+# The Builder starts empty on every open (there is no reverse-compiler from
+# stored SQL back into rules), so a policy authored on the Advanced SQL tab
+# used to render as "No row rules — every caller sees every row" while a real
+# restrictive policy was being enforced. Authorship is TRACKED
+# (`_apSqlFromBuilder`), never re-derived by parsing SQL.
+
+
+def test_builder_says_when_a_policy_cannot_be_shown_as_rules(seeded_app):
+    """A stored policy the builder did not author renders an explicit
+    "cannot be shown as rules" block in the Builder tab, with a control that
+    hands the admin to the Advanced SQL tab — not the empty-rules copy."""
+    c = seeded_app["client"]
+    body = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
+    assert 'id="apNotRepresentableNotice"' in body
+    assert "function _apRenderRepresentationNotice" in body
+    fn = body[body.index("function _apRenderRepresentationNotice") : body.index("function _apAddRowRule")]
+    assert "cannot be shown as rules" in fn
+    # A stored policy is "enforced as written"; SQL typed into the box but not
+    # saved yet is not enforced at all, and must not claim to be.
+    assert "It is enforced as" in fn
+    assert "It is what Save policy will store" in fn
+    assert "Advanced SQL" in fn
+    assert "apSwitchTab(\\'sql\\')" in fn or 'apSwitchTab(\\"sql\\")' in fn
+
+
+def test_the_not_representable_notice_uses_the_existing_warn_block(seeded_app):
+    """Mirrors #apFlagDisabledNotice / #apInterlockWarning — the same
+    design-system warn block, no inline colours, no new component."""
+    c = seeded_app["client"]
+    body = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
+    at = body.index('id="apNotRepresentableNotice"')
+    tag = body[body.rindex("<div", 0, at) : body.index(">", at) + 1]
+    assert 'class="form-hint form-hint--warn"' in tag, tag
+    assert "color" not in tag and "background" not in tag, f"the notice must style through the shared class: {tag}"
+
+    fn = body[body.index("function _apRenderRepresentationNotice") : body.index("function _apAddRowRule")]
+    assert "style=" not in fn, "the notice body must not carry inline styles"
+
+
+def test_builder_authorship_is_tracked_not_reparsed(seeded_app):
+    """No SQL→rules parser: the modal remembers whether a compile put the
+    current body in the box. Open-with-a-stored-policy = not authored here;
+    a successful compile = authored here; a hand edit = not authored here."""
+    c = seeded_app["client"]
+    body = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
+    assert "function _apBuilderDescribesSql" in body
+
+    opener = body[body.index("function openAccessPolicyModal") : body.index("function closeAccessPolicyModal")]
+    assert "_apStoredSqlAtOpen" in opener
+    assert "_apSqlFromBuilder = !_apStoredSqlAtOpen" in opener
+    assert "_apRenderRepresentationNotice()" in opener
+
+    compile_fn = body[body.index("async function _apCompileNow") : body.index("function _apRenderCompileWarnings")]
+    assert "_apSqlFromBuilder = true" in compile_fn
+
+    edited = body[body.index("function apSqlEdited") : body.index("function _apSqlFiltersOrMasksNothing")]
+    assert "_apSqlFromBuilder = false" in edited
+    assert "_apRenderRepresentationNotice()" in edited
+
+
+def test_empty_rules_copy_is_suppressed_when_the_builder_cannot_show_the_policy(seeded_app):
+    """"No row rules — every caller sees every row" is only true when these
+    rules ARE the policy; the notice replaces it otherwise."""
+    c = seeded_app["client"]
+    body = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
+    renderer = body[body.index("function _apRenderRowRules") : body.index("function _apAddRowRule")]
+    assert "No row rules — every caller sees every row." in renderer
+    head = renderer[: renderer.index("No row rules")]
+    assert "_apBuilderDescribesSql()" in head, "the empty-rules copy must be gated on the builder describing the body"
+
+
+def test_save_skips_the_filters_nothing_gate_when_re_saving_an_untouched_policy(seeded_app):
+    """#1430's "filters nothing → Save anyway?" gate judges what the admin
+    authored. Re-saving, verbatim, a stored policy the builder never authored
+    (the #1979 case) must not be second-guessed by it."""
+    c = seeded_app["client"]
+    body = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
+    assert "function _apSqlIsUntouchedStoredPolicy" in body
+    fn = body[body.index("async function apSavePolicy") : body.index("async function apClearPolicy")]
+    assert "if (sql && !_apSqlIsUntouchedStoredPolicy() && _apSqlFiltersOrMasksNothing(sql))" in fn
+
+
+def test_save_confirms_before_builder_rules_replace_a_hand_written_policy(seeded_app):
+    """The one destructive path: the admin adds a rule while a SQL-authored
+    policy is stored, and saving would overwrite that SQL with the rules."""
+    c = seeded_app["client"]
+    body = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
+    assert "function _apBuilderWouldReplaceStoredSql" in body
+    fn = body[body.index("async function apSavePolicy") : body.index("async function apClearPolicy")]
+    assert "_apBuilderWouldReplaceStoredSql()" in fn
+    assert "REPLACE the SQL policy" in fn
+    assert "confirmModal(" in fn
+    assert "Replace policy" in fn
+    # The replace question is asked BEFORE the no-op nudge: it is the
+    # destructive one.
+    assert fn.index("_apBuilderWouldReplaceStoredSql()") < fn.index("_apSqlFiltersOrMasksNothing(sql)")
+
+
+def test_builder_warns_inline_before_rules_replace_a_stored_sql_policy(seeded_app):
+    """Not only at save time — the Builder tab says so while the admin is
+    still editing, in the same warn block."""
+    c = seeded_app["client"]
+    body = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
+    fn = body[body.index("function _apRenderRepresentationNotice") : body.index("function _apAddRowRule")]
+    assert "_apBuilderWouldReplaceStoredSql()" in fn
+    assert "REPLACE the SQL policy" in fn
+
+
+def test_switching_back_to_the_builder_refreshes_the_representation_state(seeded_app):
+    c = seeded_app["client"]
+    body = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
+    fn = body[body.index("function apSwitchTab") : body.index("var _AP_MASK_LABELS")]
+    assert "_apRenderRepresentationNotice()" in fn
+
+
+# ── issue #2147: the Builder tab's mask picker grows the four masks
+# `src/access_policy_compile.py` shipped beyond the original five — `last4`,
+# `email_partial`, `pseudonymize_keyed`, `tiered` — plus the `groups`
+# modifier any value-producing mask can now carry. These tests run the
+# SHIPPED JS under node (same rationale as ``TestDiffAlgorithmUnderNode``
+# above: a Python transcription of the disabled-state/spec-assembly rules
+# would pass regardless of what those rules actually are).
+
+
+def test_mask_picker_lists_the_new_masks_and_help_text(seeded_app):
+    c = seeded_app["client"]
+    body = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
+    labels = body[body.index("var _AP_MASK_LABELS") : body.index("var _AP_MASK_HELP")]
+    for value in ("last4", "email_partial", "pseudonymize_keyed", "tiered"):
+        assert value + ":" in labels, f"missing mask label wiring: {value}"
+    help_block = body[body.index("var _AP_MASK_HELP") : body.index("_AP_TEXT_ONLY_MASKS =")]
+    # The hash option's help text is pinned verbatim (issue #2147 spec).
+    assert "md5, unsalted — prefer keyed pseudonym on a server-only table." in help_block
+    for value in ("last4", "email_partial", "pseudonymize_keyed", "tiered"):
+        assert value + ":" in help_block, f"missing mask help text: {value}"
+
+
+def test_mask_picker_options_cover_the_compiler_vocabulary(seeded_app):
+    """Every mask ``src/access_policy_compile.py`` understands must be
+    reachable from the picker — mirrors
+    ``test_row_rule_builder_ops_cover_the_compiler_vocabulary`` above."""
+    c = seeded_app["client"]
+    body = c.get("/admin/tables", headers=_auth(seeded_app["admin_token"])).text
+    render = body[body.index("function _apRenderColList") : body.index("function _apOnMaskChange")]
+    assert (
+        "var maskChoices = ['show', 'hide', 'nullify', 'hash', 'unmask', "
+        "'last4', 'email_partial', 'pseudonymize_keyed', 'tiered'];" in render
+    )
+
+
+class TestMaskBuilderUnderNode:
+    """Runs the SHIPPED mask-picker helpers under node."""
+
+    @staticmethod
+    def _extract_snippet() -> str:
+        text = _template_text()
+        esc_start = text.index("function escapeHtml(str)")
+        esc_end = text.index("function _dropdownMarkupHtml")
+        mask_start = text.index("var _AP_MASK_LABELS")
+        mask_end = text.index("function _apCancelPendingCompile")
+        return text[esc_start:esc_end] + text[mask_start:mask_end]
+
+    def _run(self, setup: str, expression: str):
+        node = shutil.which("node")
+        if not node:
+            pytest.skip("node not available")
+        # Same DOM shim as `TestDiffAlgorithmUnderNode` — only what
+        # `escapeHtml`'s textContent/innerHTML round-trip needs for plain
+        # text, nothing about the mask logic under test.
+        shim = (
+            "var document = { createElement: function() { "
+            "  var v = ''; return { set textContent(s) { v = String(s)"
+            ".replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }, "
+            "  get innerHTML() { return v; } }; } };\n"
+        )
+        # `_apRenderColList`/`_apScheduleCompile` touch the live DOM and a
+        # debounce timer this harness has neither — the state-mutation
+        # functions under test (`_apOnMaskChange`, the tier mutators) call
+        # them as side effects only, so a no-op override is enough to
+        # exercise the STATE change without dragging in a fake DOM tree.
+        overrides = "\nfunction _apRenderColList() {}\nfunction _apScheduleCompile() {}\n"
+        script = (
+            shim
+            + self._extract_snippet()
+            + overrides
+            + "\n"
+            + setup
+            + "\nprocess.stdout.write(JSON.stringify(" + expression + "));\n"
+        )
+        out = subprocess.run([node, "-e", script], capture_output=True, text=True, check=False)
+        assert out.returncode == 0, out.stderr
+        return json.loads(out.stdout)
+
+    # ── per-option disabled state ──
+
+    def test_last4_disabled_on_a_non_text_column(self):
+        meta = self._run("", "_apMaskOptionMeta('last4', false, false)")
+        assert meta["disabled"] is True
+        assert "text" in meta["title"].lower()
+
+    def test_last4_enabled_on_a_text_column(self):
+        meta = self._run("", "_apMaskOptionMeta('last4', true, false)")
+        assert meta["disabled"] is False
+
+    def test_email_partial_disabled_on_a_non_text_column(self):
+        meta = self._run("", "_apMaskOptionMeta('email_partial', false, false)")
+        assert meta["disabled"] is True
+
+    def test_pseudonymize_keyed_disabled_on_a_non_text_column(self):
+        meta = self._run("", "_apMaskOptionMeta('pseudonymize_keyed', false, false)")
+        assert meta["disabled"] is True
+
+    def test_pseudonymize_keyed_disabled_on_a_remote_table_even_when_text(self):
+        meta = self._run("", "_apMaskOptionMeta('pseudonymize_keyed', true, true)")
+        assert meta["disabled"] is True
+        assert "policy_function_duckdb_only" in meta["title"]
+
+    def test_pseudonymize_keyed_enabled_on_a_text_column_of_a_local_table(self):
+        meta = self._run("", "_apMaskOptionMeta('pseudonymize_keyed', true, false)")
+        assert meta["disabled"] is False
+
+    def test_disabled_masks_are_never_text_only_restrictions_for_hash_or_nullify(self):
+        """`hash`/`nullify`/`show`/`hide`/`unmask`/`tiered` apply to every
+        column type — only the three text-surgery masks (plus
+        `pseudonymize_keyed` on a remote table) are ever disabled."""
+        for choice in ("show", "hide", "nullify", "hash", "unmask", "tiered"):
+            meta = self._run("", f"_apMaskOptionMeta('{choice}', false, true)")
+            assert meta["disabled"] is False, f"{choice} must never be disabled by column type or remote mode"
+
+    # ── the `groups` modifier ──
+
+    def test_groups_modifier_hidden_for_show_and_hide(self):
+        assert self._run("", "_apGroupsCapableMask('show')") is False
+        assert self._run("", "_apGroupsCapableMask('hide')") is False
+
+    def test_groups_modifier_hidden_for_tiered(self):
+        """A tiered chain has its own per-tier groups — the flat modifier
+        would be a second, conflicting way to say the same thing."""
+        assert self._run("", "_apGroupsCapableMask('tiered')") is False
+
+    def test_groups_modifier_available_for_every_value_producing_mask(self):
+        for choice in ("nullify", "hash", "unmask", "last4", "email_partial", "pseudonymize_keyed"):
+            assert self._run("", f"_apGroupsCapableMask('{choice}')") is True, choice
+
+    def test_groups_change_emits_the_groups_modifier_on_a_plain_mask(self):
+        """Picking `hash` then typing groups must produce
+        ``{choice: 'hash', groups: [...]}`` — the exact shape
+        `compile_policy` reads via `_unmask_groups`."""
+        state = self._run(
+            "_apMaskState = {}; _apMaskState['email'] = 'hash'; "
+            "_apOnMaskGroupsChange('email', 'Finance, Legal');",
+            "_apMaskState['email']",
+        )
+        assert state == {"choice": "hash", "groups": ["Finance", "Legal"]}
+
+    def test_groups_change_on_unmask_keeps_its_own_spelling(self):
+        state = self._run(
+            "_apMaskState = {}; _apOnMaskChange('email', 'unmask'); "
+            "_apOnMaskGroupsChange('email', 'Compliance');",
+            "_apMaskState['email']",
+        )
+        assert state == {"choice": "unmask", "groups": ["Compliance"]}
+
+    def test_empty_groups_degrade_to_the_plain_mask_shape(self):
+        """Clearing the groups box must not leave a stray empty allowlist
+        the compiler would treat differently from a bare mask -- ``''``
+        parses to no groups, same as never having typed any."""
+        state = self._run(
+            "_apMaskState = {}; _apMaskState['email'] = 'hash'; "
+            "_apOnMaskGroupsChange('email', '');",
+            "_apMaskState['email']",
+        )
+        assert state == {"choice": "hash", "groups": []}
+
+    def test_switching_away_from_a_mask_with_groups_preserves_them(self):
+        """Switching the choice while groups are set (e.g. hash -> nullify)
+        keeps the allowlist rather than silently dropping it."""
+        state = self._run(
+            "_apMaskState = {}; _apMaskState['email'] = { choice: 'hash', groups: ['Finance'] }; "
+            "_apOnMaskChange('email', 'nullify');",
+            "_apMaskState['email']",
+        )
+        assert state == {"choice": "nullify", "groups": ["Finance"]}
+
+    # ── the tiered editor ──
+
+    def test_choosing_tiered_seeds_one_empty_tier_and_a_default(self):
+        state = self._run(
+            "_apMaskState = {}; _apOnMaskChange('nid', 'tiered');",
+            "_apMaskState['nid']",
+        )
+        assert state["choice"] == "tiered"
+        assert state["tiers"] == [{"groups": [], "reveal": "show"}]
+        assert state["default"] in ("nullify", "hash", "last4", "email_partial", "pseudonymize_keyed")
+
+    def test_add_tier_appends_in_order(self):
+        state = self._run(
+            "_apMaskState = {}; _apOnMaskChange('nid', 'tiered'); "
+            "_apMaskState['nid'].tiers[0].groups = ['Compliance']; "
+            "_apAddTier('nid'); "
+            "_apMaskState['nid'].tiers[1].groups = ['Finance']; "
+            "_apMaskState['nid'].tiers[1].reveal = 'last4';",
+            "_apMaskState['nid'].tiers",
+        )
+        assert state == [
+            {"groups": ["Compliance"], "reveal": "show"},
+            {"groups": ["Finance"], "reveal": "last4"},
+        ]
+
+    def test_move_tier_reorders_first_match_wins_order(self):
+        state = self._run(
+            "_apMaskState = {}; _apOnMaskChange('nid', 'tiered'); "
+            "_apMaskState['nid'].tiers[0].groups = ['Compliance']; "
+            "_apAddTier('nid'); "
+            "_apMaskState['nid'].tiers[1].groups = ['Finance']; "
+            "_apMoveTier('nid', 1, -1);",
+            "_apMaskState['nid'].tiers.map(function(t){return t.groups[0];})",
+        )
+        assert state == ["Finance", "Compliance"]
+
+    def test_remove_tier_drops_only_that_tier(self):
+        state = self._run(
+            "_apMaskState = {}; _apOnMaskChange('nid', 'tiered'); "
+            "_apMaskState['nid'].tiers[0].groups = ['Compliance']; "
+            "_apAddTier('nid'); "
+            "_apMaskState['nid'].tiers[1].groups = ['Finance']; "
+            "_apRemoveTier('nid', 0);",
+            "_apMaskState['nid'].tiers",
+        )
+        assert state == [{"groups": ["Finance"], "reveal": "show"}]
+
+    def test_tier_default_change_updates_state(self):
+        state = self._run(
+            "_apMaskState = {}; _apOnMaskChange('nid', 'tiered'); "
+            "_apOnTierDefaultChange('nid', 'hash');",
+            "_apMaskState['nid'].default",
+        )
+        assert state == "hash"
+
+    # ── validation, mirroring the compiler's own refusals ──
+
+    def test_validation_message_when_no_tiers(self):
+        msg = self._run("", "_apTierValidationMessage({choice: 'tiered', tiers: [], default: 'nullify'})")
+        assert "at least one tier" in msg
+
+    def test_validation_message_when_a_tier_has_no_groups(self):
+        msg = self._run(
+            "",
+            "_apTierValidationMessage({choice: 'tiered', "
+            "tiers: [{groups: [], reveal: 'show'}], default: 'nullify'})",
+        )
+        assert "at least one group" in msg
+
+    def test_validation_message_when_default_is_show_or_hide(self):
+        for bad_default in ("show", "hide", ""):
+            msg = self._run(
+                "",
+                "_apTierValidationMessage({choice: 'tiered', "
+                "tiers: [{groups: ['A'], reveal: 'show'}], default: '" + bad_default + "'})",
+            )
+            assert msg, f"default {bad_default!r} must be refused"
+            assert "default" in msg.lower()
+
+    def test_validation_message_empty_for_a_complete_spec(self):
+        msg = self._run(
+            "",
+            "_apTierValidationMessage({choice: 'tiered', "
+            "tiers: [{groups: ['A'], reveal: 'show'}], default: 'nullify'})",
+        )
+        assert msg == ""
+
+    def test_tier_editor_renders_ordered_rows_add_button_and_default_select(self):
+        html = self._run(
+            "_apMaskState = {}; _apOnMaskChange('nid', 'tiered'); "
+            "_apMaskState['nid'].tiers[0].groups = ['Compliance']; "
+            "_apAddTier('nid'); "
+            "_apMaskState['nid'].tiers[1].groups = ['Finance']; "
+            "_apMaskState['nid'].tiers[1].reveal = 'last4'; "
+            "_apOnTierDefaultChange('nid', 'nullify');",
+            "_apRenderTierEditor('nid', '\\'nid\\'', _apMaskState['nid'], true, false, false)",
+        )
+        assert html.index("Compliance") < html.index("Finance"), "tiers must render in the admin's own order"
+        assert "Add tier" in html
+        assert 'ap-tier-default' in html
+        assert "selected" in html  # the chosen reveal/default land as the selected <option>
+
+    def test_tier_editor_shows_the_validation_message_inline(self):
+        html = self._run(
+            "_apMaskState = {}; _apOnMaskChange('nid', 'tiered');",
+            "_apRenderTierEditor('nid', '\\'nid\\'', _apMaskState['nid'], true, false, false)",
+        )
+        assert "ap-tier-validation" in html
+        assert "at least one group" in html
+        assert 'style="display:none;"' not in html.split("ap-tier-validation")[1][:50]
+
+    def test_tier_editor_hides_the_validation_message_when_valid(self):
+        html = self._run(
+            "_apMaskState = {}; _apOnMaskChange('nid', 'tiered'); "
+            "_apMaskState['nid'].tiers[0].groups = ['Compliance']; "
+            "_apOnTierDefaultChange('nid', 'nullify');",
+            "_apRenderTierEditor('nid', '\\'nid\\'', _apMaskState['nid'], true, false, false)",
+        )
+        tail = html[html.index("ap-tier-validation") :]
+        assert 'style="display:none;"' in tail[:60]
+
+    def test_tier_reveal_options_disable_text_only_masks_on_a_non_text_column(self):
+        html = self._run(
+            "_apMaskState = {}; _apOnMaskChange('nid', 'tiered');",
+            "_apRenderTierEditor('nid', '\\'nid\\'', _apMaskState['nid'], false, false, false)",
+        )
+        assert '<option value="last4" disabled' in html
+        assert '<option value="email_partial" disabled' in html
+
+    def test_tier_default_options_disable_pseudonymize_keyed_on_a_remote_table(self):
+        html = self._run(
+            "_apMaskState = {}; _apOnMaskChange('nid', 'tiered');",
+            "_apRenderTierEditor('nid', '\\'nid\\'', _apMaskState['nid'], true, true, false)",
+        )
+        assert '<option value="pseudonymize_keyed" disabled' in html
+
+
+def test_docs_builder_paragraph_names_the_groups_modifier_and_tiered_mask(seeded_app):
+    """Sync-map: the Builder paragraph in docs/table-access-policies.md must
+    list every picker option, including the ones this issue adds."""
+    docs_path = Path(__file__).resolve().parents[1] / "docs" / "table-access-policies.md"
+    text = docs_path.read_text(encoding="utf-8")
+    assert "tiered" in text
+    assert "`groups`" in text

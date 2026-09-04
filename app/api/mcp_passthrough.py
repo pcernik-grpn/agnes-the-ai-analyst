@@ -70,6 +70,10 @@ class PassthroughToolDTO(BaseModel):
     exposed_name: str
     description: Optional[str] = None
     input_schema: Optional[Dict[str, Any]] = None
+    #: The row's recorded write flag — the stdio mirror turns it into the
+    #: tool's ``readOnlyHint`` (issue #2161), the same way the server
+    #: transports do at registration.
+    mutating: bool = False
 
 
 class InvokeRequest(BaseModel):
@@ -96,6 +100,7 @@ def _to_dto(tool: Dict[str, Any], source_name: str) -> PassthroughToolDTO:
         exposed_name=tool["exposed_name"],
         description=tool.get("description"),
         input_schema=input_schema,
+        mutating=bool(tool.get("mutating")),
     )
 
 

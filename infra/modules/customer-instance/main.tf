@@ -47,6 +47,27 @@ locals {
   # app image tag a VM happens to be pinned to.
   ops_agent_config_b64 = filebase64("${path.module}/files/ops-agent-config.yaml")
 
+  # --- Which collector gets the container logs (var.container_logs_destination) ---
+  #
+  # Exactly one, because Docker allows exactly one log driver per container:
+  # Cloud Logging needs `fluentd` (the Ops Agent is what re-parses the JSON
+  # line), Datadog needs the default `json-file`. Empty resolves to Datadog
+  # when it is on, because an operator who has the metrics and the monitors in
+  # Datadog wants the logs next to them; "auto" is accepted as an explicit
+  # spelling of the same thing.
+  #
+  # enable_gcp_logging stays the PERMIT switch (it is what grants the two IAM
+  # roles), and these locals are the SELECT. A VM can therefore hold the grants
+  # while shipping to Datadog, which makes flipping back a recreate rather than
+  # an IAM change.
+  container_logs_destination = (
+    contains(["cloud_logging", "datadog", "none"], var.container_logs_destination)
+    ? var.container_logs_destination
+    : var.enable_datadog ? "datadog" : var.enable_gcp_logging ? "cloud_logging" : "none"
+  )
+  cloud_logging_logs_active = local.container_logs_destination == "cloud_logging"
+  datadog_logs_active       = local.container_logs_destination == "datadog"
+
   # --- Opt-in Datadog host monitoring (var.enable_datadog) ---
   #
   # `env` is the single dimension every caller-side monitor scopes on. It
@@ -81,11 +102,26 @@ locals {
     "conf.d/docker.yaml",
     "conf.d/systemd.yaml",
     "conf.d/directory.yaml",
-    "postgres.yaml.tpl",
     "agnes-datadog-pg-role.sh",
     "agnes-datadog-pg-role.service",
     "agnes-datadog-pg-role.timer",
   ]
+
+  # One identity tag list per instance, shared by datadog.yaml and the
+  # postgres check template. The postgres check attributes its series to the
+  # resolved DB host (the side-car's container IP — a phantom host no host
+  # tag ever joins), so the check must carry these tags per instance; a
+  # second, diverging list would split the deployment's identity in two.
+  datadog_tags = {
+    for inst in local.all_instances : inst.name => concat([
+      "customer:${var.customer_name}",
+      "app:agnes",
+      "service:agnes",
+      "role:${inst.role}",
+      "agnes_instance:${inst.name}",
+      "managed:terraform",
+    ], var.datadog_extra_tags)
+  }
 
   # Unlike the flat watchdog map, this one is keyed BY INSTANCE: datadog.yaml
   # carries that VM's own tags and the HTTP/TLS checks its own hostnames. The
@@ -95,16 +131,20 @@ locals {
       { for f in local.datadog_static_files : f => filebase64("${path.module}/files/datadog/${f}") },
       {
         "datadog.yaml" = base64encode(templatefile("${path.module}/files/datadog/datadog.yaml.tpl", {
-          site = var.datadog_site
+          site        = var.datadog_site
+          env         = local.datadog_env
+          tags        = local.datadog_tags[inst.name]
+          enable_logs = local.datadog_logs_active
+        }))
+
+        # Terraform renders the deployment identity (env + the tag list) into
+        # the check template; @@DD_PG_PASSWORD@@ stays for the on-host role
+        # script, exactly like @@DD_API_KEY@@ in datadog.yaml above. Without
+        # the instance tags the check's series land on a phantom container-IP
+        # host that no agent-level env/host tag ever joins.
+        "postgres.yaml.tpl" = base64encode(templatefile("${path.module}/files/datadog/postgres.yaml.tpl", {
           env  = local.datadog_env
-          tags = concat([
-            "customer:${var.customer_name}",
-            "app:agnes",
-            "service:agnes",
-            "role:${inst.role}",
-            "agnes_instance:${inst.name}",
-            "managed:terraform",
-          ], var.datadog_extra_tags)
+          tags = local.datadog_tags[inst.name]
         }))
 
         # A TLS VM probes its own public URL, because that is the path its
@@ -178,6 +218,23 @@ locals {
     var.kai_agent_jwt_secret,
     var.kai_agent_e2b_key_secret,
   ])), setunion(toset(keys(var.runtime_secret_env)), toset(keys(var.runtime_secret_env_multiline)), toset(var.runtime_secrets))) : toset([])
+
+  # Opt-in OTLP export: the per-VM headers secret, granted only for the VMs
+  # that name one. Secrets already granted through the runtime maps,
+  # runtime_secrets, the dispatcher, the engine or the OAuth clients are
+  # subtracted — two identical (project, secret, role, member) bindings make
+  # the second apply fail with "already exists", the documented trap.
+  otlp_secrets = setsubtract(
+    toset(compact([for inst in local.all_instances : inst.otlp_headers_secret])),
+    setunion(
+      toset(keys(var.runtime_secret_env)),
+      toset(keys(var.runtime_secret_env_multiline)),
+      toset(var.runtime_secrets),
+      local.dispatcher_secrets,
+      local.kai_agent_secrets,
+      local.per_instance_oauth_secrets,
+    ),
+  )
 
   # --- Vendor-neutral per-instance branding -> /data/state/instance.yaml ---
   # The startup script seeds instance.yaml on FIRST boot only (it never clobbers
@@ -438,6 +495,16 @@ resource "google_secret_manager_secret_iam_member" "vm_kai_agent" {
   member    = "serviceAccount:${google_service_account.vm.email}"
 }
 
+# Per-VM OTLP headers secret (opt-in trace export) — read-only, only for the
+# VMs that set otlp_headers_secret, minus anything already granted above.
+resource "google_secret_manager_secret_iam_member" "vm_otlp" {
+  for_each  = local.otlp_secrets
+  project   = var.gcp_project_id
+  secret_id = each.value
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.vm.email}"
+}
+
 # Per-VM OAuth client secrets, expanded from var.oauth_secret_name_template.
 # Granted to the same shared VM SA (all VMs in this module call use one SA, so
 # every per-VM OAuth secret is technically readable from every VM — isolation
@@ -466,17 +533,16 @@ resource "google_secret_manager_secret_iam_member" "vm_datadog" {
   member    = "serviceAccount:${google_service_account.vm.email}"
 }
 
-# Cloud Logging writer for Docker's gcplogs log driver
-# (docker-compose.gcp-logging.yml, gated by var.enable_gcp_logging). The
-# driver authenticates as the VM's service account — the dedicated SA above,
-# attached to every instance below — and without this role it cannot
-# initialize. Docker refuses to START a container whose log driver fails to
-# initialize, so a VM running the overlay without the role goes fully down
-# on its next routine container recreate (the auto-upgrade cron), not at
-# provisioning time. The startup script's boot-time driver probe keeps such
-# a VM alive by disabling the overlay with a loud warning, but logs then
-# never reach Cloud Logging; this binding is what makes the default-on
-# feature actually work. Unlike the secret grants above this one is
+# Cloud Logging writer for the Ops Agent that receives the containers' logs
+# over Docker's fluentd driver (docker-compose.gcp-logging.yml, permitted by
+# var.enable_gcp_logging). The agent authenticates as the VM's service
+# account — the dedicated SA above, attached to every instance below — and
+# without this role every flush fails. It no longer takes the instance down:
+# the driver is async, so a collector that cannot authenticate costs log
+# lines and nothing else (it used to, which is what #1557 was). The startup
+# script's boot-time probe then leaves the overlay disarmed with a loud
+# warning and the logs stay local; this binding is what makes the
+# default-on feature actually work. Unlike the secret grants above this one is
 # project-level: roles/logging.logWriter only permits writing log entries,
 # and the driver's log target has no narrower resource to bind on. The
 # identity running `terraform apply` must be able to modify project IAM
@@ -487,6 +553,21 @@ resource "google_project_iam_member" "vm_log_writer" {
   count   = var.enable_gcp_logging ? 1 : 0
   project = var.gcp_project_id
   role    = "roles/logging.logWriter"
+  member  = "serviceAccount:${google_service_account.vm.email}"
+}
+
+# The Ops Agent the logging feature installs runs a second sub-agent, an
+# OpenTelemetry collector, which cannot be switched off — only emptied. With
+# no receivers on its metrics pipeline (files/ops-agent-config.yaml) it still
+# exports the agent's own agent.googleapis.com/agent/* self-metrics, and
+# without this role every export cycle fails and floods the serial console
+# with monitoring.timeSeries.create PermissionDenied. The role therefore buys
+# silence, not ingestion: the host metrics Cloud Monitoring would charge for
+# are off in the config, because enable_datadog is what collects those.
+resource "google_project_iam_member" "vm_metric_writer" {
+  count   = var.enable_gcp_logging ? 1 : 0
+  project = var.gcp_project_id
+  role    = "roles/monitoring.metricWriter"
   member  = "serviceAccount:${google_service_account.vm.email}"
 }
 
@@ -728,35 +809,43 @@ resource "google_compute_instance" "vm" {
     # home_route / studio_enabled are likewise NOT forwarded as separate
     # template vars (D1, 2026-08) — see the theme/experience note above; both
     # ride instance_branding_b64 now.
-    data_apps_enabled            = each.value.data_apps_enabled
-    data_apps_subdomain_base     = each.value.data_apps_subdomain_base
-    data_apps_runtime_image      = var.data_apps_runtime_image
-    enable_watchdog              = var.enable_watchdog
-    enable_gcp_logging           = var.enable_gcp_logging
-    alert_webhook_url            = var.alert_webhook_url
-    watchdog_files_b64           = local.watchdog_files_b64
-    ops_agent_config_b64         = local.ops_agent_config_b64
-    enable_datadog               = var.enable_datadog
-    datadog_api_key_secret       = var.datadog_api_key_secret
-    datadog_agent_version        = var.datadog_agent_version
-    datadog_files_b64            = local.datadog_files_b64[each.value.name]
-    dispatcher_enabled           = each.value.dispatcher_enabled
-    dispatcher_image             = var.dispatcher_image
-    dispatcher_key_secret        = var.dispatcher_key_secret
-    dispatcher_vertex_sa_secret  = var.dispatcher_vertex_sa_secret
-    dispatcher_policies_b64      = base64encode(var.dispatcher_policies)
-    kai_agent_enabled            = each.value.kai_agent_enabled
-    kai_agent_mem_limit          = each.value.kai_agent_mem_limit
-    kai_agent_cpus               = each.value.kai_agent_cpus
-    kai_agent_pg_mem_limit       = each.value.kai_agent_pg_mem_limit
-    kai_agent_broker_mcp_enabled = each.value.kai_agent_broker_mcp_enabled
-    kai_agent_image              = var.kai_agent_image
-    kai_agent_jwt_secret         = var.kai_agent_jwt_secret
-    kai_agent_e2b_key_secret     = var.kai_agent_e2b_key_secret
-    extraction_worker_enabled    = each.value.extraction_worker_enabled
-    extraction_worker_image      = var.extraction_worker_image
-    extraction_worker_mem_limit  = each.value.extraction_worker_mem_limit
-    extraction_worker_cpus       = each.value.extraction_worker_cpus
+    data_apps_enabled             = each.value.data_apps_enabled
+    data_apps_subdomain_base      = each.value.data_apps_subdomain_base
+    data_apps_runtime_image       = var.data_apps_runtime_image
+    enable_watchdog               = var.enable_watchdog
+    cloud_logging_logs_active     = local.cloud_logging_logs_active
+    alert_webhook_url             = var.alert_webhook_url
+    watchdog_files_b64            = local.watchdog_files_b64
+    ops_agent_config_b64          = local.ops_agent_config_b64
+    enable_datadog                = var.enable_datadog
+    datadog_api_key_secret        = var.datadog_api_key_secret
+    datadog_agent_version         = var.datadog_agent_version
+    datadog_files_b64             = local.datadog_files_b64[each.value.name]
+    dispatcher_enabled            = each.value.dispatcher_enabled
+    dispatcher_image              = var.dispatcher_image
+    dispatcher_key_secret         = var.dispatcher_key_secret
+    dispatcher_vertex_sa_secret   = var.dispatcher_vertex_sa_secret
+    dispatcher_policies_b64       = base64encode(var.dispatcher_policies)
+    kai_agent_enabled             = each.value.kai_agent_enabled
+    kai_agent_mem_limit           = each.value.kai_agent_mem_limit
+    kai_agent_cpus                = each.value.kai_agent_cpus
+    kai_agent_pg_mem_limit        = each.value.kai_agent_pg_mem_limit
+    kai_agent_broker_mcp_enabled  = each.value.kai_agent_broker_mcp_enabled
+    kai_agent_broker_otlp_enabled = each.value.kai_agent_broker_otlp_enabled
+    # Opt-in OTLP export (per-VM) + the deployment label. Only the SECRET
+    # NAME reaches the template; the startup script fetches the value.
+    otlp_endpoint               = each.value.otlp_endpoint
+    otlp_headers_secret         = each.value.otlp_headers_secret
+    otlp_capture_content        = each.value.otlp_capture_content ? "1" : "0"
+    deployment_env              = each.value.deployment_env != "" ? each.value.deployment_env : each.value.name
+    kai_agent_image             = var.kai_agent_image
+    kai_agent_jwt_secret        = var.kai_agent_jwt_secret
+    kai_agent_e2b_key_secret    = var.kai_agent_e2b_key_secret
+    extraction_worker_enabled   = each.value.extraction_worker_enabled
+    extraction_worker_image     = var.extraction_worker_image
+    extraction_worker_mem_limit = each.value.extraction_worker_mem_limit
+    extraction_worker_cpus      = each.value.extraction_worker_cpus
+    extraction_worker_replicas  = each.value.extraction_worker_replicas
     # Rendered to KEY=VALUE lines, base64'd like dispatcher_policies so no
     # value can break the template or the shell heredoc quoting.
     kai_agent_env_b64 = base64encode(join("\n", [
@@ -804,6 +893,20 @@ resource "google_compute_instance" "vm" {
     precondition {
       condition     = !var.enable_datadog || var.datadog_api_key_secret != ""
       error_message = "enable_datadog = true requires datadog_api_key_secret (the Secret Manager secret NAME holding the agent's API key)."
+    }
+
+    # Asking for a destination whose collector was never provisioned is the
+    # silent-failure shape again: the VM boots, the agent reports healthy, and
+    # nothing ships. Terraform's variable validation cannot see a second
+    # variable, so the cross-check lives here with the module's others.
+    precondition {
+      condition     = local.container_logs_destination != "datadog" || var.enable_datadog
+      error_message = "container_logs_destination = \"datadog\" requires enable_datadog = true — the log collector is the host agent that variable installs, not a separate component."
+    }
+
+    precondition {
+      condition     = local.container_logs_destination != "cloud_logging" || var.enable_gcp_logging
+      error_message = "container_logs_destination = \"cloud_logging\" requires enable_gcp_logging = true — that variable is what grants the VM service account roles/logging.logWriter and installs the Ops Agent."
     }
 
     # Same plan-time catch for the kai-agent engine: an enabled VM without

@@ -131,6 +131,15 @@ _VERB_PATH_ALLOWLIST = frozenset(
         "/api/admin/mcp-sources/{source_id}/oauth/register",
         "/api/admin/metadata/{table_id}/push",
         "/api/admin/metrics/import",
+        # `clone` is the action of creating a sibling connection from this one (same
+        # credential material, zero scopes) — an action on a sub-resource, the same
+        # shape as the allowlisted marketplace /sync; there is no noun that names it.
+        "/api/admin/sharepoint/connections/{connection_id}/clone",
+        # `bulk` = one-shot scope creation from a list of folder paths — the same
+        # action-on-a-sub-resource shape as /clone above; the noun form (`POST …/scopes`
+        # with a list body) is the interactive wizard's single-scope confirm and has a
+        # different contract.
+        "/api/admin/sharepoint/connections/{connection_id}/scopes/bulk",
         # Ontology builder draft state machine (spec §13.2): the draft is
         # filled by two RPC actions with no idiomatic REST noun — `import`
         # translates a pasted/uploaded ontology into the unsaved draft (mirrors
@@ -148,6 +157,11 @@ _VERB_PATH_ALLOWLIST = frozenset(
         # Registry rebuild — fire-and-forget; rebuilds the extract + master
         # views once. Companion to register-table's defer_rebuild (bulk onboarding).
         "/api/admin/registry/rebuild",
+        # Fact-graph collection-stats summary rebuild (TCRD-296 synthesis
+        # E.21) — same fire-and-forget recompute-in-place shape as the
+        # registry rebuild directly above; "rebuild" isn't a state change on
+        # a single addressable resource.
+        "/api/admin/facts/stats/rebuild",
         # Store submission rescan — re-runs guardrail scan on an existing submission
         "/api/admin/store/submissions/{submission_id}/rescan",
         # Telemetry export — GET because it streams a report, not a resource collection
@@ -412,15 +426,23 @@ def test_admin_mutating_endpoints_all_require_admin():
     it without explicit security sign-off.
     """
     from fastapi.routing import APIRoute
-    from app.auth.access import require_admin
+    from app.auth.access import require_admin, require_admin_all_surface
     from app.main import create_app
 
     app = create_app()
 
+    # `require_admin_all_surface` is the STRICTER sibling (admin AND a
+    # full-surface credential -- a `surface='stack'` admin PAT is refused);
+    # a route carrying it is at least as gated as one carrying
+    # `require_admin`, so it satisfies this rule (#1979, security review:
+    # the access-policy previews moved to it because they return raw,
+    # unpolicied rows).
+    _ADMIN_GATES = (require_admin, require_admin_all_surface)
+
     def _has_require_admin(dependant) -> bool:
-        """Recursively walk the FastAPI dependant tree for require_admin."""
+        """Recursively walk the FastAPI dependant tree for an admin gate."""
         for sub in dependant.dependencies:
-            if sub.call is require_admin:
+            if sub.call in _ADMIN_GATES:
                 return True
             if _has_require_admin(sub):
                 return True

@@ -13,8 +13,10 @@
 # on the container, which lives in the app image's compose file, not in this
 # module — so it is a documented limitation, not an oversight.
 #
-# @@DD_PG_PASSWORD@@ is substituted on the host by agnes-datadog-pg-role.sh,
-# which owns the credential; it is not a Terraform value.
+# The password placeholder below is substituted on the host by
+# agnes-datadog-pg-role.sh, which owns the credential; it is not a Terraform
+# value. The substitution is global, so the literal token must appear only in
+# the password field — in a comment it would carry the real credential too.
 #
 # dbm stays false: Database Monitoring is a separate, billed product and this
 # check only needs liveness, connection headroom, size and XID age.
@@ -35,3 +37,15 @@ instances:
     collect_activity_metrics: false
     collect_wal_metrics: false
     min_collection_interval: 60
+    # The check attributes every series and service check to the hostname it
+    # resolves for the instance — here the side-car's container IP, a phantom
+    # host nothing else reports for — so the agent-level env and host tags
+    # never join them. The deployment identity therefore rides on the
+    # instance: Terraform renders env and the VM's own tag list (the same
+    # list datadog.yaml carries), while the password above stays the role
+    # script's job.
+    tags:
+      - env:${env}
+%{ for t in tags ~}
+      - ${t}
+%{ endfor ~}

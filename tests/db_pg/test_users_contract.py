@@ -923,6 +923,60 @@ def test_tab_padded_duplicates_are_reported_like_space_padded_ones(users_repo):
     assert {u["id"] for u in g["users"] if u["unreachable_by_sign_in"]} == {"user-tab", "user-nl"}
 
 
+# ---------------------------------------------------------------------------
+# create_service_account / list_service_accounts — PG-only (A3 ratchet,
+# issue #1534). DuckDB has no `kind` column at all, so both methods are
+# documented `RequiresPostgresBackend` raises there rather than a no-op —
+# unlike `revoke_sessions`, there is no sensible "do nothing" answer for
+# "create an identity flagged with a column that does not exist".
+# ---------------------------------------------------------------------------
+
+
+def test_create_service_account_sets_kind_service_on_pg(users_repo):
+    repo, _, backend = users_repo
+    if backend != "pg":
+        pytest.skip("PG-only capability — see the RequiresPostgresBackend test below for the DuckDB side")
+    repo.create_service_account(id="svc-1", email="ci-bot@service.local", name="CI Bot")
+    row = repo.get_by_id("svc-1")
+    assert row is not None
+    assert row["kind"] == "service"
+    assert row["active"] is True
+    assert row["password_hash"] is None
+
+
+def test_create_service_account_never_sets_kind_human_rows(users_repo):
+    """A plain create() must keep defaulting to 'human' — the column exists
+    for every row, and only create_service_account ever writes 'service'."""
+    repo, _, backend = users_repo
+    if backend != "pg":
+        pytest.skip("kind column is PG-only")
+    _make_user(repo, id="human-1", email="human@example.com")
+    row = repo.get_by_id("human-1")
+    assert row["kind"] == "human"
+
+
+def test_list_service_accounts_excludes_human_rows_on_pg(users_repo):
+    repo, _, backend = users_repo
+    if backend != "pg":
+        pytest.skip("PG-only capability")
+    _make_user(repo, id="human-1", email="human@example.com")
+    repo.create_service_account(id="svc-1", email="svc@service.local", name="Svc One")
+    rows = repo.list_service_accounts()
+    assert [r["id"] for r in rows] == ["svc-1"]
+
+
+def test_create_and_list_service_account_raise_requires_postgres_on_duckdb(users_repo):
+    repo, _, backend = users_repo
+    if backend != "duckdb":
+        pytest.skip("DuckDB-only assertion")
+    from src.repositories import RequiresPostgresBackend
+
+    with pytest.raises(RequiresPostgresBackend):
+        repo.create_service_account(id="svc-1", email="svc@service.local", name="Svc")
+    with pytest.raises(RequiresPostgresBackend):
+        repo.list_service_accounts()
+
+
 def test_grouping_survives_rows_whose_folded_addresses_interleave(users_repo):
     """The fold no longer depends on SQL ordering putting colliding rows next to
     each other, so a third address sorting between two variants cannot split a

@@ -37,8 +37,10 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import logging
 import os
+import random
 import uuid
 from typing import Any, Dict, Optional
 from urllib.parse import unquote, urlsplit
@@ -68,6 +70,7 @@ from app.api.broker_vertex import (
 from app.auth.access import is_user_admin, mint_agent_session_jwt, mint_co_session_jwt, require_admin
 from app.auth.jwt import create_access_token
 from app.chat.turn_usage import add_turn_usage
+from src.observability import otel as _otel
 from src.agent_scope_intersection import agent_is_passthrough
 from src.repositories import (
     access_token_repo,
@@ -236,6 +239,62 @@ _ANTHROPIC_BASE_URL = "https://api.anthropic.com"
 # though isolation/auth are correct). Use a generous read timeout while keeping
 # connect/write/pool bounded so a dead upstream still fails fast.
 _ANTHROPIC_TIMEOUT = httpx.Timeout(connect=15.0, read=600.0, write=60.0, pool=15.0)
+
+# Upstream statuses worth one more attempt before the caller sees a failure.
+# ONLY 429: the provider rejected the request without processing it (a Vertex
+# per-minute token/request quota is the common one), so replaying it is safe
+# and usually succeeds within seconds. Agnes's OWN 429 — the per-agent
+# ``budget_exhausted`` refusal — is raised as an HTTPException far above this
+# point and deliberately carries no Retry-After so nothing auto-retries it; it
+# never reaches this forward, and must not be added here.
+_RETRYABLE_UPSTREAM_STATUSES = (429,)
+# Two retries = three attempts total. Bounded low on purpose: a chat turn is
+# interactive, and a quota that is still exhausted after ~3s of waiting is a
+# capacity problem the operator needs to see, not one to hide behind a longer
+# stall.
+_MAX_UPSTREAM_RETRIES = 2
+# Honour the provider's own Retry-After, but never stall an interactive turn
+# for longer than this — a 60s Retry-After is a signal to give up and say so,
+# not to freeze the UI for a minute.
+_RETRY_AFTER_CAP_SEC = 10.0
+_RETRY_BASE_DELAY_SEC = 0.5
+
+# Response headers worth forwarding back to the in-sandbox SDK. The SDK's own
+# retry logic reads Retry-After; without it, it backs off blind. The
+# anthropic-ratelimit-* family is what a client uses to pace itself before
+# hitting the wall at all. Everything else stays dropped — forwarding
+# content-length/content-encoding from a response we may have re-read would
+# corrupt the body, so this is an allowlist, never a copy-all.
+_FORWARDED_RESPONSE_HEADER_PREFIXES = ("anthropic-ratelimit-",)
+_FORWARDED_RESPONSE_HEADERS = ("retry-after",)
+
+
+def _passthrough_response_headers(resp: httpx.Response) -> Dict[str, str]:
+    """Rate-limit headers from ``resp`` that the caller should see verbatim."""
+    out: Dict[str, str] = {}
+    for key, value in resp.headers.items():
+        lowered = key.lower()
+        if lowered in _FORWARDED_RESPONSE_HEADERS or lowered.startswith(_FORWARDED_RESPONSE_HEADER_PREFIXES):
+            out[key] = value
+    return out
+
+
+def _retry_after_seconds(resp: httpx.Response, attempt: int) -> float:
+    """How long to wait before retrying ``resp``.
+
+    Prefers the provider's own ``Retry-After`` (delta-seconds form, which is
+    what Vertex and the Anthropic API both send), clamped to
+    ``_RETRY_AFTER_CAP_SEC``. Falls back to exponential backoff with jitter so
+    several sandboxes hitting the same quota ceiling don't retry in lockstep.
+    """
+    raw = resp.headers.get("retry-after", "")
+    try:
+        wait = float(raw)
+    except (TypeError, ValueError):
+        wait = -1.0
+    if wait < 0:
+        wait = _RETRY_BASE_DELAY_SEC * (2**attempt)
+    return min(max(wait, 0.0), _RETRY_AFTER_CAP_SEC) + random.uniform(0, 0.25)
 
 
 def _add_anthropic_beta(headers: Dict[str, str], beta: str) -> None:
@@ -468,6 +527,11 @@ def _to_response(resp: httpx.Response, extra_headers: Optional[Dict[str, str]] =
         status_code=resp.status_code,
         media_type=resp.headers.get("content-type"),
     )
+    # Retry-After / anthropic-ratelimit-* first, so an Agnes-issued header of
+    # the same name (budget_headers) still wins — the per-agent budget refusal
+    # deliberately controls its own Retry-After semantics.
+    for key, value in _passthrough_response_headers(resp).items():
+        response.headers[key] = value
     for key, value in (extra_headers or {}).items():
         response.headers[key] = value
     return response
@@ -799,6 +863,147 @@ async def data_apps_broker(request: Request, row: Dict[str, Any] = Depends(requi
     return _to_response(resp)
 
 
+def _completion_request_hints(raw_body: bytes, vertex_target: Any) -> "tuple[Optional[str], bool]":
+    """``(model, stream)`` as the request declares them — the model from the
+    Vertex path when the call is a native Vertex invocation, else from the
+    Messages body. Never raises: a malformed body is the upstream's 400."""
+    model: Optional[str] = getattr(vertex_target, "model", None) if vertex_target is not None else None
+    stream = False
+    try:
+        parsed = json.loads(raw_body)
+        if isinstance(parsed, dict):
+            model = model or (str(parsed["model"]) if parsed.get("model") else None)
+            stream = bool(parsed.get("stream"))
+    except (ValueError, TypeError):
+        pass
+    return model, stream
+
+
+async def _start_otel_completion_span(
+    *,
+    row: Dict[str, Any],
+    raw_body: bytes,
+    vertex_target: Any,
+    upstream: str,
+    agent_row: Optional[Dict[str, Any]],
+    caller_user_id: Optional[str],
+    session: Any,
+) -> Any:
+    """Open the broker's completion span. The session row is read only when
+    export is on (the caller checks) and not already in hand — one extra
+    read per completion, off the event loop, never on the path when tracing
+    is off. Identity is a label here, never a reason to fail the call."""
+    model, stream = _completion_request_hints(raw_body, vertex_target)
+    if session is None:
+        try:
+            session = await asyncio.to_thread(lambda: chat_session_repo().get_session(row["session_id"]))
+        except Exception:  # noqa: BLE001
+            session = None
+    return _otel.start_completion_span(
+        upstream=upstream,
+        model=model,
+        stream=stream,
+        session_id=row.get("session_id"),
+        ticket_scope=row.get("scope"),
+        user_email=getattr(session, "user_email", None),
+        user_id=caller_user_id,
+        agent_id=agent_row.get("id") if agent_row else None,
+    )
+
+
+# --- OTLP telemetry egress for the embedded engine's sandbox ----------------
+#
+# The engine's sandbox exports its own spans (turn → step → tool) through the
+# in-sandbox relay's ``otlp`` scope, which forwards ``/otlp/<rest>`` to this
+# instance's ``HOST_BROKER_OTLP_URL`` with a ``kai_otlp`` ticket and no other
+# credential (docs/observability.md → "OpenTelemetry export"). This route is
+# the broker half: it swaps the ticket for the collector credential the
+# instance's own export already holds (``OTEL_EXPORTER_OTLP_HEADERS``) and
+# forwards the batch to the same collector, so the sandbox's traces land in
+# the same place as the broker's completion spans.
+
+#: The three OTLP/HTTP signal paths an SDK exports to. Exact allowlist — the
+#: relay forwards whatever path the sandbox names, so anything else is refused
+#: here and never resolved against the collector.
+_OTLP_SIGNALS = frozenset({"traces", "metrics", "logs"})
+#: One OTLP export batch is bounded by the SDK's batch processor (hundreds of
+#: KiB at the very most); anything past this is not telemetry.
+_OTLP_MAX_BODY_BYTES = 8 * 1024 * 1024
+_OTLP_TIMEOUT = httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=10.0)
+#: Inbound headers worth forwarding: the wire format and its compression. The
+#: relay already dropped the credential/hop-by-hop sets; everything else is
+#: the sandbox's business, not the collector's.
+_OTLP_FORWARDED_REQUEST_HEADERS = frozenset({"content-type", "content-encoding"})
+
+
+# The collector (base endpoint + operator headers) comes from ONE place —
+# ``src.observability.otel.collector`` — which is also what
+# ``/api/kai/tickets`` mints the ``kai_otlp`` ticket from, so the ticket and
+# the route can never disagree about whether there is somewhere to forward to.
+_otlp_collector = _otel.collector
+_parse_otlp_headers = _otel.parse_otlp_headers
+
+
+@router.post("/otlp/v1/{signal}", name="otlp_proxy")
+async def otlp_proxy(signal: str, request: Request, row: Dict[str, Any] = Depends(require_broker_ticket)) -> Response:
+    """Forward one OTLP/HTTP export batch from the engine's sandbox to the
+    instance's collector, credential injected server-side.
+
+    Accepts ONLY the ``kai_otlp`` scope — the ticket ``/api/kai/tickets`` mints
+    for the relay's ``otlp`` scope, and only while this instance exports OTLP
+    itself (``OTEL_EXPORTER_OTLP_ENDPOINT``); an ``llm``/``main`` ticket is
+    refused with the usual scope-mismatch audit. Without a configured
+    collector the route answers ``503 otlp_export_not_configured`` so a
+    misordered rollout (engine env set before the export) fails loudly per
+    batch instead of silently swallowing telemetry — the turn itself is
+    unaffected, the SDK's exporter just logs the refusal.
+
+    The body is the SDK's protobuf batch, forwarded byte-for-byte with its
+    wire-format and compression headers; the collector's 2xx body comes back
+    as-is (the OTLP success response), its error text never does — the status
+    (and ``Retry-After``, which the exporter's retry honours) is enough.
+    """
+    _require_scope(row, "kai_otlp")
+    if signal not in _OTLP_SIGNALS:
+        raise HTTPException(status_code=404, detail={"code": "otlp_signal_not_supported"})
+    collector = _otlp_collector()
+    if collector is None:
+        raise HTTPException(status_code=503, detail={"code": "otlp_export_not_configured"})
+    base, operator_headers = collector
+    # Refuse a declared-oversized batch before buffering it; the post-read
+    # check below still catches an undeclared or lying length.
+    declared = request.headers.get("content-length", "")
+    if declared.isdigit() and int(declared) > _OTLP_MAX_BODY_BYTES:
+        raise HTTPException(status_code=413, detail={"code": "otlp_batch_too_large"})
+    body = await request.body()
+    if len(body) > _OTLP_MAX_BODY_BYTES:
+        raise HTTPException(status_code=413, detail={"code": "otlp_batch_too_large"})
+    headers = {k: v for k, v in request.headers.items() if k.lower() in _OTLP_FORWARDED_REQUEST_HEADERS}
+    headers.setdefault("content-type", "application/x-protobuf")
+    headers.update(operator_headers)
+    try:
+        async with httpx.AsyncClient(timeout=_OTLP_TIMEOUT) as client:
+            upstream = await client.post(f"{base}/v1/{signal}", content=body, headers=headers)
+    except httpx.HTTPError as exc:
+        # The collector's hostname/credential is operator config; the sandbox
+        # gets a typed 502 and the operator gets the class of failure.
+        logger.warning("broker: OTLP collector unreachable for %s batch: %s", signal, type(exc).__name__)
+        raise HTTPException(status_code=502, detail={"code": "otlp_collector_unreachable"}) from exc
+    passthrough: Dict[str, str] = {}
+    retry_after = upstream.headers.get("retry-after")
+    if retry_after:
+        passthrough["retry-after"] = retry_after
+    if 200 <= upstream.status_code < 300:
+        return Response(
+            content=upstream.content,
+            status_code=upstream.status_code,
+            media_type=upstream.headers.get("content-type"),
+            headers=passthrough or None,
+        )
+    logger.warning("broker: OTLP collector answered %s for a %s batch", upstream.status_code, signal)
+    return Response(status_code=upstream.status_code, headers=passthrough or None)
+
+
 @router.post("/anthropic", name="anthropic_proxy_bare")
 @router.post("/anthropic/{subpath:path}", name="anthropic_proxy_subpath")
 async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(require_broker_ticket)) -> Response:
@@ -843,8 +1048,10 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
     # traffic is the busy path, so it keeps paying nothing. Offloaded because a
     # synchronous DB read must not run on the event loop.
     # Found by Devin Review on this PR.
+    otel_session = None
     if row.get("scope") == "llm":
-        if await asyncio.to_thread(lambda: chat_session_repo().get_session(row["session_id"])) is None:
+        otel_session = await asyncio.to_thread(lambda: chat_session_repo().get_session(row["session_id"]))
+        if otel_session is None:
             raise HTTPException(status_code=401, detail="ticket_session_gone")
     raw_body = await request.body()
     headers = {
@@ -1099,24 +1306,113 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
     # turn end, so the user stared at silence and then got the entire text
     # at once. No ``async with``: the client must outlive this handler for
     # the streaming case; the pass-through iterator's ``finally`` closes it.
+    # Opt-in OTLP span per completion (src/observability/otel.py): opened
+    # here, after every gate that could refuse the call, and closed where
+    # the forward ends — in the stream's ``finally`` or after the buffered
+    # read below — so its duration is the upstream's, not the gates'.
+    otel_span = None
+    if is_completion and _otel.is_enabled():
+        try:
+            otel_span = await _start_otel_completion_span(
+                row=row,
+                raw_body=raw_body,
+                vertex_target=vertex_target,
+                upstream="dispatcher" if use_dispatcher else ("vertex" if vertex_mode else "anthropic"),
+                agent_row=agent_row,
+                caller_user_id=caller_user_id,
+                session=otel_session,
+            )
+        except Exception:  # noqa: BLE001 - a measurement must never cost a forward
+            logger.debug("broker: could not open the completion span", exc_info=True)
+            otel_span = None
     client = httpx.AsyncClient(timeout=_ANTHROPIC_TIMEOUT)
-    try:
-        upstream_req = client.build_request(
-            request.method,
-            # `outbound_path` — either the SAME canonical value the policy /
-            # budget / dispatcher gates classified on above, or (vertex mode)
-            # a path rebuilt from that value's parsed+validated groups — so
-            # the guard and the real destination can never disagree
-            # (dot-segments already refused, slashes already collapsed).
-            f"{upstream_base}{outbound_path}",
-            content=outbound_body,
-            headers=headers,
-            params=request.query_params,
+    # Retry loop for upstream rate limiting. A provider 429 (a Vertex
+    # per-minute token/request quota is the usual one) means the request was
+    # refused WITHOUT being processed, so replaying it is safe and normally
+    # succeeds within a second or two. Without this, one quota blip became a
+    # user-visible "Something went wrong" in the middle of a conversation —
+    # the request is rebuilt each attempt because a sent httpx request is not
+    # reusable, and the previous response is closed before the retry so the
+    # connection returns to the pool.
+    attempt = 0
+    while True:
+        try:
+            upstream_req = client.build_request(
+                request.method,
+                # `outbound_path` — either the SAME canonical value the policy /
+                # budget / dispatcher gates classified on above, or (vertex mode)
+                # a path rebuilt from that value's parsed+validated groups — so
+                # the guard and the real destination can never disagree
+                # (dot-segments already refused, slashes already collapsed).
+                f"{upstream_base}{outbound_path}",
+                content=outbound_body,
+                headers=headers,
+                params=request.query_params,
+            )
+            resp = await client.send(upstream_req, stream=True)
+        except httpx.TransportError as exc:
+            # The upstream (Anthropic / dispatcher / Vertex) could not be
+            # reached AT ALL — connection refused, DNS failure, or a connect
+            # that timed out — never a completed call the provider itself
+            # rejected (that path forwards the real status above/below and is
+            # classified separately by `_record_llm_health`). Left unhandled,
+            # this reached the sandbox's own HTTP client as an opaque,
+            # retry-hostile 500 with no signal beyond a raw transport-error
+            # string — the chat surface's `chatErrorCopy` classifies THAT
+            # text defensively, but the honest fix is a typed response here:
+            # a 503 with `Retry-After` and a cataloged health signal, exactly
+            # like the 401/403/400 branch below gives the admin readiness
+            # banner (#884's own precedent, extended to "never got a response
+            # at all"). Not retried by this loop — a genuine connection
+            # failure rarely clears within the loop's own short backoff, and
+            # the typed 503 already tells the caller to retry on its own.
+            await client.aclose()
+            from app.chat.readiness import record_llm_runtime_failure
+
+            diag = record_llm_runtime_failure(request.app.state, None, str(exc))
+            try:
+                audit_repo().log(
+                    action="broker_llm_unreachable",
+                    params={"reason": diag.get("reason"), "detail": diag.get("detail")},
+                    result="error",
+                    client_kind="broker",
+                )
+            except Exception:
+                # Audit logging must never break the deny path itself.
+                pass
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "llm_upstream_unreachable",
+                    "message": "The instance is restarting or temporarily unavailable — try again in a minute.",
+                },
+                headers={"Retry-After": "30"},
+            ) from exc
+        except BaseException as _exc:
+            await client.aclose()
+            if otel_span is not None:
+                _otel.end_completion_span(otel_span, error=_exc)
+            raise
+        if resp.status_code not in _RETRYABLE_UPSTREAM_STATUSES or attempt >= _MAX_UPSTREAM_RETRIES:
+            break
+        delay = _retry_after_seconds(resp, attempt)
+        await resp.aclose()
+        attempt += 1
+        logger.info(
+            "broker: upstream %s on %s — retry %s/%s in %.2fs",
+            resp.status_code,
+            outbound_path,
+            attempt,
+            _MAX_UPSTREAM_RETRIES,
+            delay,
         )
-        resp = await client.send(upstream_req, stream=True)
-    except BaseException:
-        await client.aclose()
-        raise
+        try:
+            await asyncio.sleep(delay)
+        except BaseException as _exc:
+            await client.aclose()
+            if otel_span is not None:
+                _otel.end_completion_span(otel_span, error=_exc)
+            raise
     # A 401 in vertex mode means the cached Google token was revoked before
     # its declared expiry — drop it so the next request re-resolves.
     if vertex_mode and resp.status_code == 401:
@@ -1167,7 +1463,7 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
         async def _passthrough():
             try:
                 async for chunk in resp.aiter_bytes():
-                    if collect_usage and not state["overflow"]:
+                    if (collect_usage or otel_span is not None) and not state["overflow"]:
                         if len(collected) + len(chunk) <= _SSE_USAGE_COLLECT_MAX_BYTES:
                             collected.extend(chunk)
                         else:
@@ -1205,11 +1501,22 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
                             "llm usage recording failed for agent %s (stream already forwarded)",
                             agent_row.get("id"),
                         )
+                if otel_span is not None:
+                    _otel.end_completion_span(
+                        otel_span,
+                        status_code=resp.status_code,
+                        usage=None if state["overflow"] else parse_usage(bytes(collected), ctype),
+                        request_body=raw_body,
+                        response_body=bytes(collected),
+                        content_type=ctype,
+                        response_truncated=state["overflow"],
+                    )
 
         return StreamingResponse(
             _passthrough(),
             status_code=resp.status_code,
             media_type=ctype,
+            headers=_passthrough_response_headers(resp) or None,
         )
 
     # Non-stream responses (JSON endpoints such as count_tokens, upstream
@@ -1256,14 +1563,26 @@ async def anthropic_proxy(request: Request, row: Dict[str, Any] = Depends(requir
             logger.exception(
                 "llm usage recording failed for agent %s (response already forwarded)", agent_row.get("id")
             )
+    if otel_span is not None:
+        _otel.end_completion_span(
+            otel_span,
+            status_code=resp.status_code,
+            usage=parse_usage(resp.content, ctype) if resp.status_code == 200 else None,
+            request_body=raw_body,
+            response_body=resp.content,
+            content_type=ctype,
+        )
 
     return _to_response(resp, budget_headers)
 
 
 # LLM-credential failure statuses worth an operator signal: auth (invalid /
-# expired / unfunded-permission key) and 400 (candidate "credit balance too
-# low"). Other 4xx/5xx are the agent's own request errors, not a credential fault.
-_LLM_DIAG_STATUSES = (400, 401, 403)
+# expired / unfunded-permission key), 400 (candidate "credit balance too low"),
+# and 429 — a rate limit that SURVIVED ``_MAX_UPSTREAM_RETRIES`` is no longer a
+# blip, it is sustained quota exhaustion, and without a signal here the only
+# person who learns about it is whoever's chat happens to be open at the time.
+# Other 4xx/5xx are the agent's own request errors, not a credential fault.
+_LLM_DIAG_STATUSES = (400, 401, 403, 429)
 
 
 def _anthropic_error_message(resp: httpx.Response) -> str:

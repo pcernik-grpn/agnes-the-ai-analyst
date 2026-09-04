@@ -51,7 +51,7 @@ PROMPT_KIND = "facts-extraction"
 #: the rendered ontology), so an admin override or an ontology edit
 #: invalidates it automatically — this constant exists so a default-prompt
 #: edit is legible in the state file rather than only as a hash change.
-PROMPT_VERSION = "1"
+PROMPT_VERSION = "2"
 
 DEFAULT_EXTRACTION_PROMPT = """\
 You are a knowledge-graph extraction agent. You read ONE document at a time
@@ -77,7 +77,11 @@ the streams. Emit the `NODES` header even when you have no nodes, and the
 
 1. **Verbatim quotes only.** Every `evidence.quote` is copied
    character-for-character from the document text (or from one whole
-   component of its path or filename). Never paraphrase, never summarize,
+   component of its path or filename). The document may be a markdown
+   table converted from a spreadsheet or workbook — a table cell or row can
+   state a fact (a budget line, a staffing assignment) exactly like a
+   sentence of prose, but the quote must still be the exact, verbatim cell
+   or row text, never a paraphrase. Never paraphrase, never summarize,
    never "clean up", never translate. If you cannot point to an exact
    substring supporting a fact, DO NOT emit the fact.
 2. **`doc_id` is always the document you are reading**, taken from its

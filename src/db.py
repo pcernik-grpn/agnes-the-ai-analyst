@@ -46,6 +46,11 @@ def _maybe_instrument(con, db_tag: str):
 # imports above.
 from src.duckdb_conn import _open_duckdb  # noqa: F401, E402  (re-export)
 
+# The access-policy scalar functions (`agnes_hmac`). Stdlib-only at import
+# time on purpose — see that module's closing note — so it costs this import
+# graph (which the CLI walks on every command) nothing.
+from src.access_policy_udf import register_policy_udfs  # noqa: E402
+
 
 _SAFE_IDENTIFIER = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]{0,63}$")
 
@@ -2776,6 +2781,12 @@ def get_analytics_db() -> duckdb.DuckDBPyConnection:
                 _ANALYTICS_DB_MEMORY_LIMIT,
                 label="get_analytics_db",
             )
+            # Access-policy scalar functions, once per singleton — cursors
+            # handed out below inherit them. Nothing outside this module opens
+            # a read-write analytics handle today, so this is defence in depth
+            # rather than a live enforcement path; a maintenance caller that
+            # evaluates a policy body must not silently lose `agnes_hmac`.
+            register_policy_udfs(_analytics_db_conn)
             _analytics_db_path = db_path
         return _maybe_instrument(_analytics_db_conn.cursor(), "analytics")
 
@@ -3149,6 +3160,9 @@ def get_analytics_db_readonly() -> duckdb.DuckDBPyConnection:
     if analytics_backend() == "ducklake":
         from src.ducklake_session import get_ducklake_read
 
+        # The policy UDFs are registered ONCE at DuckLake session open, under
+        # the reader's own lock (``src/ducklake_session.py``) -- the shared
+        # physical connection must not take a per-request ``CREATE FUNCTION``.
         return get_ducklake_read()
 
     db_path = _get_data_dir() / "analytics" / "server.duckdb"
@@ -3216,6 +3230,13 @@ def get_analytics_db_readonly() -> duckdb.DuckDBPyConnection:
                     pass
     # Re-attach remote extensions so BigQuery / other remote views resolve.
     _reattach_remote_extensions(conn, extracts_dir)
+    # Access-policy scalar functions (`agnes_hmac`). THE choke point: every
+    # surface that can execute a policy body against the analytics catalog —
+    # /api/query, /api/mcp/query-table, GET /api/me/effective-access, the
+    # catalog's profile restriction, and the save-time `probe_policy` /
+    # policy preview — reaches it through this function. Registration
+    # resolves no key and costs ~0.3 ms against this function's ~4 ms open.
+    register_policy_udfs(conn)
     # Note: external_access stays enabled because views use read_parquet() on local files.
     # File-path-based attacks are blocked by the SQL blocklist in app/api/query.py.
     return _maybe_instrument(conn, "analytics_ro")
@@ -7136,8 +7157,8 @@ def _v97_to_v98(conn: duckdb.DuckDBPyConnection) -> None:
 def _v109_to_v110(conn: duckdb.DuckDBPyConnection) -> None:
     """v109→v110: add ``file_corpora.origin`` (``uploaded`` | ``generated``).
 
-    Provenance for the Artefacts toolbar's Source facet. Every existing
-    artefact is user-uploaded, so the column defaults to ``'uploaded'``; the
+    Provenance for the Artifacts toolbar's Source facet. Every existing
+    artifact is user-uploaded, so the column defaults to ``'uploaded'``; the
     future agent-generated-artefact writer sets ``'generated'``. Idempotent
     ``ADD COLUMN IF NOT EXISTS`` guarded on table existence — a no-op on fresh
     installs (``_SYSTEM_SCHEMA`` already declares the column).

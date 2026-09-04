@@ -405,3 +405,58 @@ def test_replace_group_members_for_source_segregation(repos):
     )
     member_ids = {r["id"] for r in members.list_members_for_group(group["id"])}
     assert member_ids == {"u-sp-1", "u-sp-3"}
+
+
+# ---------------------------------------------------------------------------
+# add_member — service-account Admin-group refusal (issue #1534, Guard 2).
+#
+# One shared choke point inside add_member itself. `kind='service'` is a
+# PG-only column (A3 ratchet) — DuckDB cannot hold such a row at all
+# (create_service_account is PG-only there too), so the DuckDB half of this
+# pair is asserted as "always falls through unchanged", not skipped: the
+# guard's code is identical on both sides, and this pins that it is a
+# structural no-op on DuckDB rather than an assumption.
+# ---------------------------------------------------------------------------
+
+
+def test_add_member_admin_group_refuses_a_service_account_on_pg_only(repos):
+    from src.db import SYSTEM_ADMIN_GROUP
+
+    ug, members, users, _, backend = repos
+    admin = ug.ensure(SYSTEM_ADMIN_GROUP)
+
+    if backend != "pg":
+        # No `kind` column exists here — a plain human row must still be
+        # addable to a group literally named "Admin" (this is not the
+        # seeded system group in this bare-repo fixture, just a same-named
+        # row), proving the guard's code is a no-op rather than an
+        # accidental blanket refusal.
+        users.create(id="u-human", email="human@example.com", name="Human")
+        members.add_member("u-human", admin["id"], source="admin")
+        assert members.has_membership("u-human", admin["id"]) is True
+        return
+
+    from src.repositories.users_pg import UsersPgRepository
+    from src.service_accounts import ServiceAccountAdminGroupForbidden
+
+    assert isinstance(users, UsersPgRepository)
+    users.create_service_account(id="svc-1", email="svc@service.local", name="Svc")
+
+    with pytest.raises(ServiceAccountAdminGroupForbidden):
+        members.add_member("svc-1", admin["id"], source="admin")
+    assert members.has_membership("svc-1", admin["id"]) is False
+
+
+def test_add_member_non_admin_group_still_works_for_a_service_account_on_pg(repos):
+    """The guard is scoped to the Admin group by name — a service account
+    must remain addable to any ordinary group on the backend where it can
+    exist at all."""
+    ug, members, users, _, backend = repos
+    if backend != "pg":
+        pytest.skip("service accounts are PG-only (A3 ratchet)")
+
+    users.create_service_account(id="svc-2", email="svc2@service.local", name="Svc2")
+    group = ug.ensure("data-team")
+
+    members.add_member("svc-2", group["id"], source="admin")
+    assert members.has_membership("svc-2", group["id"]) is True

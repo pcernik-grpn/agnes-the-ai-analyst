@@ -9,7 +9,7 @@ own contract is "what does the crawl do with a Graph response", not "does
 Postgres accept the row".
 
 The two seams written in parallel with this module
-(``connectors.sharepoint.convert`` / ``src.anonymization``) are substituted
+(``src.ingest.convert`` / ``src.anonymization``) are substituted
 at their wrapper functions, which is exactly the substitution point those
 wrappers exist to provide.
 """
@@ -24,6 +24,7 @@ import signal
 import sys
 import threading
 import time
+from datetime import date
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -40,6 +41,82 @@ DRIVE_DELTA = f"{GRAPH}/drives/b!drive1/root/delta"
 # --------------------------------------------------------------------------
 # Fixtures / fakes
 # --------------------------------------------------------------------------
+
+
+_FACTORY_HOST_PREFIXES = ("app.", "connectors.", "src.", "services.", "cli.")
+
+
+@pytest.fixture(autouse=True)
+def _no_repo_factory_captured_by_a_late_import(monkeypatch):
+    """Fail, AT THE TEST THAT CAUSED IT, the one cross-test leak this
+    module's patching style can produce.
+
+    ``_run`` / ``_install_runs_repo`` swap a ``src.repositories`` factory
+    (``source_connections_repo``, ``extraction_runs_repo``, …) by string
+    path, and ``monkeypatch`` restores THAT attribute — but a module that is
+    imported for the first time while the swap is active and binds the
+    factory at import time (``from src.repositories import
+    source_connections_repo``, as ``app/api/admin_sharepoint.py`` and
+    ``app/api/collections.py`` do) keeps the fake for the rest of the
+    process. Nothing restores it, the fake only knows this test's
+    ``conn1``, and every later test on the same xdist worker that goes
+    through that module answers ``404 connection_not_found`` — 52 failures
+    across ``tests/test_admin_sharepoint.py`` and
+    ``tests/test_admin_extraction.py`` when this file happened to run
+    first on a worker, none otherwise. (The instance: ``crawler.
+    _enqueue_streamed_facts_pass`` lazily importing ``app.api.
+    admin_sharepoint`` from inside a crawl.)
+
+    Requesting ``monkeypatch`` orders this teardown BEFORE its undo, so
+    "factories still swapped at teardown" is exactly the set a late import
+    could have captured; only when that set is non-empty does it scan the
+    imported first-party modules, so the cost is nil for tests that never
+    swap one. A test in this module must therefore never swap a factory on
+    an ``app.*`` module directly — swap it on ``src.repositories``, which
+    is what every helper here does.
+
+    "Captured" means the module holds an object that is NOT a genuine
+    ``src.repositories`` factory — never merely "is not the object this
+    fixture saw at setup". ``importlib.reload(src.repositories)`` (the PG
+    parity sweeps, ``tests/test_requires_postgres_backend.py``) re-mints
+    every factory function, so on a worker where such a test ran earlier
+    every module that imported a factory BEFORE the reload holds the
+    previous — still real — function object, and an identity check against
+    this fixture's post-reload snapshot flagged all of them (``acl_sync``,
+    ``ingest_gate``, ``app.api.*`` — 14 teardown errors on one CI shard
+    from a test that captured nothing). A real factory is a plain
+    module-level ``def`` in ``src/repositories/__init__.py`` whichever
+    reload minted it; a fake a test installs (a lambda, a closure, a
+    ``Mock``) never carries that module and qualname.
+    """
+    import src.repositories as repos
+
+    real = {name: obj for name, obj in vars(repos).items() if name.endswith("_repo") and callable(obj)}
+    yield
+    swapped = {name for name, obj in real.items() if getattr(repos, name, obj) is not obj}
+    if not swapped:
+        return
+
+    def _is_genuine_factory(name: str, obj: Any) -> bool:
+        return getattr(obj, "__module__", None) == repos.__name__ and getattr(obj, "__qualname__", None) == name
+
+    captured: List[str] = []
+    for mod_name, mod in list(sys.modules.items()):
+        if mod is repos or mod is None or not mod_name.startswith(_FACTORY_HOST_PREFIXES):
+            continue
+        namespace = getattr(mod, "__dict__", None)
+        if not namespace:
+            continue
+        for name in swapped & namespace.keys():
+            bound = namespace[name]
+            if bound is not real[name] and not _is_genuine_factory(name, bound):
+                captured.append(f"{mod_name}.{name}")
+    assert not captured, (
+        f"a src.repositories factory swapped by this test was captured by a module imported "
+        f"during it and would leak into every later test on this worker: {sorted(captured)} — "
+        "the production code that imported that module lazily from inside the code under "
+        "test must import from a lower layer instead (see facts_extraction_readiness)"
+    )
 
 
 class FakeIngestor:
@@ -61,15 +138,22 @@ class FakeIngestor:
 
     instances: List["FakeIngestor"] = []
     _collection_of: Dict[str, str] = {}
+    #: stable_id -> (collection_id, path, filename) as last recorded by
+    #: `ingest()` — what `rename()` compares an "already unchanged" item's
+    #: CURRENT path/filename against, mirroring the real `_Ingestor.rename`'s
+    #: read of the persisted `corpus_files` row.
+    _location_of: Dict[str, tuple] = {}
 
     @classmethod
     def reset(cls) -> None:
         cls.instances.clear()
         cls._collection_of.clear()
+        cls._location_of.clear()
 
     def __init__(self) -> None:
         self.ingested: List[Dict[str, Any]] = []
         self.deleted: List[str] = []
+        self.renamed: List[Dict[str, Any]] = []
         FakeIngestor.instances.append(self)
 
     def ingest(
@@ -94,13 +178,30 @@ class FakeIngestor:
         )
         was_new = stable_id not in FakeIngestor._collection_of
         FakeIngestor._collection_of[stable_id] = collection_id
+        FakeIngestor._location_of[stable_id] = (collection_id, path, filename)
         return f"file-{len(FakeIngestor._collection_of)}", was_new
 
     def delete(self, collection_id: str, stable_id: str) -> bool:
         if FakeIngestor._collection_of.get(stable_id) != collection_id:
             return False
         del FakeIngestor._collection_of[stable_id]
+        FakeIngestor._location_of.pop(stable_id, None)
         self.deleted.append(stable_id)
+        return True
+
+    def rename(self, *, collection_id: str, stable_id: str, path: str, filename: str) -> bool:
+        """Stands in for the real ``_Ingestor.rename`` — same contract:
+        False when nothing is resolved yet or the stored location already
+        matches, True (and the stored location updated) otherwise."""
+        current = FakeIngestor._location_of.get(stable_id)
+        if current is None or current[0] != collection_id:
+            return False
+        if current[1] == path and current[2] == filename:
+            return False
+        FakeIngestor._location_of[stable_id] = (collection_id, path, filename)
+        self.renamed.append(
+            {"collection_id": collection_id, "stable_id": stable_id, "path": path, "filename": filename}
+        )
         return True
 
 
@@ -163,8 +264,9 @@ def _file_item(
     ctag: str = "ctag-1",
     size: int = 1024,
     parent_path: str = "/drives/b!drive1/root:/Reports",
+    modified: Optional[str] = None,
 ) -> Dict[str, Any]:
-    return {
+    item: Dict[str, Any] = {
         "id": item_id,
         "name": name,
         "cTag": ctag,
@@ -172,6 +274,9 @@ def _file_item(
         "file": {"mimeType": "application/vnd.openxmlformats-officedocument.wordprocessingml.document"},
         "parentReference": {"path": parent_path},
     }
+    if modified is not None:
+        item["lastModifiedDateTime"] = modified
+    return item
 
 
 @pytest.fixture
@@ -185,7 +290,7 @@ def crawl_env(tmp_path, monkeypatch):
 
     monkeypatch.setattr(gc, "get_app_token", _token)
     monkeypatch.setattr(crawler, "_Ingestor", FakeIngestor)
-    monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime: ConvertResult("# converted"))
+    monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime, **_kw: ConvertResult("# converted"))
     monkeypatch.setattr(crawler, "_max_file_mb", lambda: 50)
     # Certificate resolution is `connectors.sharepoint.settings`' contract,
     # covered by its own tests — stubbed here so no crawl test needs a real
@@ -261,6 +366,11 @@ def _run(
     monkeypatch,
     scopes: Optional[List[str]] = None,
     force_reprocess: bool = False,
+    retry_failed: bool = False,
+    retry_empty: bool = False,
+    resync: bool = False,
+    force_replan: bool = False,
+    job_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     monkeypatch.setattr(
         "src.repositories.source_connections_repo",
@@ -271,6 +381,16 @@ def _run(
         payload["scopes"] = scopes
     if force_reprocess:
         payload["force_reprocess"] = True
+    if retry_failed:
+        payload["retry_failed"] = True
+    if retry_empty:
+        payload["retry_empty"] = True
+    if resync:
+        payload["resync"] = True
+    if force_replan:
+        payload["force_replan"] = True
+    if job_id is not None:
+        payload["job_id"] = job_id
     return crawler.run_builtin_crawl(payload)
 
 
@@ -446,6 +566,76 @@ class TestResume:
         assert FakeIngestor.instances[-1].ingested == []
         assert sum(1 for url in seen if url.endswith("/content")) == downloads_after_first
 
+    def test_a_renamed_item_with_unchanged_ctag_updates_the_path_without_downloading(self, crawl_env, monkeypatch):
+        """D.18: a rename/move keeps Graph's cTag stable, so the item still
+        counts as `already` — but its `name`/`parentReference.path` no
+        longer match the stored `corpus_files` row. The crawl must update
+        the row's path in place, count it as `renamed` (not `unchanged`),
+        and never re-download/re-convert/re-ingest it."""
+        item = {"name": "brief.docx", "parent_path": "/drives/b!drive1/root:/Reports"}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(
+                200,
+                json={
+                    "value": [_file_item(name=item["name"], parent_path=item["parent_path"])],
+                    "@odata.deltaLink": f"{DRIVE_DELTA}?t=1",
+                },
+            )
+
+        connection = _connection([_drive_scope()])
+        seen = _install_graph(monkeypatch, handler)
+        first = _run(connection, monkeypatch)
+        assert first["new"] == 1
+        downloads_after_first = sum(1 for url in seen if url.endswith("/content"))
+
+        # Same cTag (unchanged content), but moved to a new folder AND
+        # renamed — both `name` and `parentReference.path` differ.
+        item["name"] = "brief-renamed.docx"
+        item["parent_path"] = "/drives/b!drive1/root:/Reports/Archive"
+        second = _run(connection, monkeypatch)
+
+        assert second.get("renamed") == 1
+        assert second["unchanged"] == 0
+        assert second["new"] == 0 and second["changed"] == 0
+        # Never re-downloaded, converted, or re-ingested.
+        assert FakeIngestor.instances[-1].ingested == []
+        assert sum(1 for url in seen if url.endswith("/content")) == downloads_after_first
+        # `filename` is the SAME `<stem>.md` shape a fresh ingest would have
+        # stored (see `_prepare_document`'s "ok" branch) — never the raw
+        # source extension.
+        assert FakeIngestor.instances[-1].renamed == [
+            {
+                "collection_id": "col1",
+                "stable_id": "graph:item1",
+                "path": "Reports/Archive/brief-renamed.docx",
+                "filename": "brief-renamed.md",
+            }
+        ]
+
+    def test_an_unrenamed_item_with_unchanged_ctag_writes_nothing(self, crawl_env, monkeypatch):
+        """The counterpart to the rename test above: an item whose cTag AND
+        path/name are both unchanged must stay a plain `unchanged` — no
+        rename write, no download."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        connection = _connection([_drive_scope()])
+        _install_graph(monkeypatch, handler)
+        first = _run(connection, monkeypatch)
+        assert first["new"] == 1
+
+        second = _run(connection, monkeypatch)
+
+        assert second.get("renamed") == 0
+        assert second["unchanged"] == 1
+        assert FakeIngestor.instances[-1].renamed == []
+
     def test_a_changed_ctag_re_ingests_the_same_stable_id(self, crawl_env, monkeypatch):
         ctag = {"value": "ctag-1"}
 
@@ -524,6 +714,210 @@ class TestResume:
         messages = [r.message for r in caplog.records if "ingest failed" in r.message]
         assert messages
         assert "ingest exploded" in messages[0]
+
+
+class TestIngestorRejectedRaisesInsteadOfStranding:
+    """`_Ingestor.ingest()` — the seam between `ingest_file`'s own
+    catch-and-mark-rejected contract and the crawl's retry queue.
+
+    `ingest_file` never raises: it catches its own failures and marks the
+    `corpus_files` row `rejected` so an admin reading Collections can see
+    why. If `_Ingestor.ingest` stayed equally silent, the crawl would treat
+    a rejected document as an ordinary success — the item's cTag is
+    persisted right after `ingest()` returns, and Graph's delta feed only
+    re-offers an item once it CHANGES upstream, so it would never come back
+    around on a normal re-crawl (live finding, 2026-09: 261 documents
+    rejected on a NUL byte in their converted markdown, now itself fixed at
+    the ingest boundary — but the ALREADY-rejected rows still need this to
+    recover on their next crawl). No Graph/Postgres plumbing needed here —
+    every collaborator `_Ingestor.ingest` calls is stubbed, isolating just
+    this one contract.
+    """
+
+    def test_a_rejected_ingest_file_result_raises_instead_of_returning(self, monkeypatch):
+        import app.api.collections as collections_mod
+        import src.file_storage as file_storage_mod
+        import src.ingest.runner as runner_mod
+
+        monkeypatch.setattr(collections_mod, "_upsert_corpus_file", lambda *a, **kw: ("cf_1", True, 0))
+        stored = type("Stored", (), {"sha256": "abc", "ext": ".md", "size_bytes": 3, "storage_path": "p"})()
+        monkeypatch.setattr(file_storage_mod, "store_corpus_bytes", lambda *a, **kw: stored)
+        monkeypatch.setattr(runner_mod, "ingest_file", lambda *a, **kw: "rejected")
+
+        class _FakeCfRepo:
+            def get(self, file_id: str) -> Dict[str, Any]:
+                return {"processing_detail": {"reason": "ingest_error: NUL byte"}}
+
+        monkeypatch.setattr("src.repositories.corpus_files_repo", lambda: _FakeCfRepo())
+
+        ingestor = crawler._Ingestor.__new__(crawler._Ingestor)
+        ingestor._sources_repo = type("R", (), {"resolve": staticmethod(lambda *a, **kw: None)})()
+
+        with pytest.raises(RuntimeError, match="ingest_error: NUL byte"):
+            ingestor.ingest(
+                collection_id="col1",
+                stable_id="graph:item1",
+                path="Reports/doc.md",
+                filename="doc.md",
+                markdown="body",
+                source_sha256="deadbeef",
+            )
+
+    def test_an_indexed_ingest_file_result_returns_normally(self, monkeypatch):
+        """The success path is unaffected — no raise, no extra repo call."""
+        import app.api.collections as collections_mod
+        import src.file_storage as file_storage_mod
+        import src.ingest.runner as runner_mod
+
+        monkeypatch.setattr(collections_mod, "_upsert_corpus_file", lambda *a, **kw: ("cf_1", True, 0))
+        stored = type("Stored", (), {"sha256": "abc", "ext": ".md", "size_bytes": 3, "storage_path": "p"})()
+        monkeypatch.setattr(file_storage_mod, "store_corpus_bytes", lambda *a, **kw: stored)
+        monkeypatch.setattr(runner_mod, "ingest_file", lambda *a, **kw: "indexed")
+
+        def _boom():
+            raise AssertionError("corpus_files_repo() must not be called on a successful ingest")
+
+        monkeypatch.setattr("src.repositories.corpus_files_repo", _boom)
+
+        ingestor = crawler._Ingestor.__new__(crawler._Ingestor)
+        ingestor._sources_repo = type("R", (), {"resolve": staticmethod(lambda *a, **kw: None)})()
+
+        file_id, was_new = ingestor.ingest(
+            collection_id="col1",
+            stable_id="graph:item1",
+            path="Reports/doc.md",
+            filename="doc.md",
+            markdown="body",
+            source_sha256="deadbeef",
+        )
+        assert file_id == "cf_1"
+        assert was_new is True
+
+
+class TestIngestTransientRetry:
+    """``_ingest_with_retry`` (TCRD-296 C.11) — a bounded retry around
+    ``_Ingestor.ingest`` for a TRANSIENT infrastructure fault (a
+    connection-pool timeout, a dropped connection, a deadlock) only. Every
+    test here monkeypatches ``crawler._ingest_retry_sleep`` to a no-op so
+    the retry BOUNDS are asserted without spending real seconds.
+    """
+
+    def test_a_transient_error_is_retried_then_succeeds(self, monkeypatch):
+        import sqlalchemy as sa
+
+        calls = {"n": 0}
+
+        class FlakyIngestor(FakeIngestor):
+            def ingest(self, **kwargs):
+                calls["n"] += 1
+                if calls["n"] < 3:
+                    raise sa.exc.TimeoutError("QueuePool limit of size 5 reached, connection timed out")
+                return super().ingest(**kwargs)
+
+        sleeps: List[float] = []
+        monkeypatch.setattr(crawler, "_ingest_retry_sleep", sleeps.append)
+
+        ingestor = FlakyIngestor()
+        file_id, was_new = crawler._ingest_with_retry(
+            ingestor,
+            collection_id="col1",
+            stable_id="graph:item1",
+            path="Reports/doc.md",
+            filename="doc.md",
+            markdown="body",
+            source_sha256="deadbeef",
+        )
+
+        assert calls["n"] == 3
+        assert was_new is True
+        assert file_id
+        # Two retries before the third (successful) attempt — bounded
+        # backoff, never a fixed sleep.
+        assert len(sleeps) == 2
+        assert all(0 <= s <= crawler._INGEST_RETRY_MAX_S + 1 for s in sleeps)
+
+    def test_a_non_transient_error_raises_on_the_first_attempt(self, monkeypatch):
+        calls = {"n": 0}
+
+        class BrokenIngestor(FakeIngestor):
+            def ingest(self, **kwargs):
+                calls["n"] += 1
+                raise RuntimeError("ingest_file rejected doc.docx: NUL byte")
+
+        sleeps: List[float] = []
+        monkeypatch.setattr(crawler, "_ingest_retry_sleep", sleeps.append)
+
+        with pytest.raises(RuntimeError, match="NUL byte"):
+            crawler._ingest_with_retry(
+                BrokenIngestor(),
+                collection_id="col1",
+                stable_id="graph:item1",
+                path="Reports/doc.md",
+                filename="doc.md",
+                markdown="body",
+                source_sha256="deadbeef",
+            )
+
+        assert calls["n"] == 1
+        assert sleeps == []
+
+    def test_a_transient_error_that_never_clears_is_raised_after_exhausting_attempts(self, monkeypatch):
+        import sqlalchemy as sa
+
+        calls = {"n": 0}
+
+        class AlwaysFlakyIngestor(FakeIngestor):
+            def ingest(self, **kwargs):
+                calls["n"] += 1
+                raise sa.exc.TimeoutError("QueuePool limit of size 5 reached, connection timed out")
+
+        sleeps: List[float] = []
+        monkeypatch.setattr(crawler, "_ingest_retry_sleep", sleeps.append)
+
+        with pytest.raises(sa.exc.TimeoutError):
+            crawler._ingest_with_retry(
+                AlwaysFlakyIngestor(),
+                collection_id="col1",
+                stable_id="graph:item1",
+                path="Reports/doc.md",
+                filename="doc.md",
+                markdown="body",
+                source_sha256="deadbeef",
+            )
+
+        assert calls["n"] == crawler._INGEST_RETRY_ATTEMPTS
+        assert len(sleeps) == crawler._INGEST_RETRY_ATTEMPTS - 1
+
+    def test_full_crawl_survives_a_transient_pool_hiccup(self, crawl_env, monkeypatch):
+        """End-to-end: a crawl whose ingest step hits a transient error
+        TWICE still lands the document as ``new`` — never `ingest_failed` —
+        because the retry absorbs it before `_process_item`'s own
+        exception handler ever sees it."""
+        import sqlalchemy as sa
+
+        calls = {"n": 0}
+
+        class FlakyIngestor(FakeIngestor):
+            def ingest(self, **kwargs):
+                calls["n"] += 1
+                if calls["n"] <= 2:
+                    raise sa.exc.TimeoutError("QueuePool limit of size 5 reached, connection timed out")
+                return super().ingest(**kwargs)
+
+        monkeypatch.setattr(crawler, "_Ingestor", FlakyIngestor)
+        monkeypatch.setattr(crawler, "_ingest_retry_sleep", lambda seconds: None)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        _install_graph(monkeypatch, handler)
+        report = _run(_connection([_drive_scope()]), monkeypatch)
+
+        assert report["new"] == 1
+        assert report["errors"] == 0
+        assert calls["n"] == 3
 
 
 # --------------------------------------------------------------------------
@@ -753,6 +1147,619 @@ class TestFailureRetryQueue:
         assert third["item_retry_given_up"] == 0
         assert third["retry_backlog"]["given_up"] == 1
 
+    def test_retry_failed_gives_a_given_up_item_one_more_chance_without_a_full_resync(self, crawl_env, monkeypatch):
+        """The admin-facing ``retry_failed`` run option (``POST …/extract``
+        ``{"retry_failed": true}``): the cheap alternative to ``resync`` for
+        a connection with a handful of permanently-stuck items — no full
+        re-enumeration, just one more pass over this drive's own backlog,
+        including entries already ``given_up``."""
+        monkeypatch.setattr(crawler, "_MAX_ITEM_RETRY_ATTEMPTS", 2)
+        recovered = {"value": False}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if url.endswith("/content"):
+                return _content_response() if recovered["value"] else httpx.Response(404, json={})
+            if "t=1" in url:
+                return httpx.Response(200, json={"value": [], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        _install_graph(monkeypatch, handler)
+        connection = _connection([_drive_scope()])
+
+        _run(connection, monkeypatch)
+        second = _run(connection, monkeypatch)
+        assert _state(crawl_env)["failed_items"]["graph:item1"]["given_up"] is True
+
+        # An ORDINARY run (no `retry_failed`) leaves a given-up item alone —
+        # baseline confirming the flag is what makes the difference below.
+        plain = _run(connection, monkeypatch)
+        assert plain["item_retry_recovered"] == 0
+        assert "graph:item1" in _state(crawl_env)["failed_items"]
+
+        recovered["value"] = True
+        retried = _run(connection, monkeypatch, retry_failed=True)
+
+        assert retried["item_retry_recovered"] == 1
+        assert FakeIngestor.instances[-1].ingested[0]["stable_id"] == "graph:item1"
+        assert "graph:item1" not in _state(crawl_env)["failed_items"]
+        assert second["retry_backlog"]["given_up"] == 1  # sanity: it really was stuck before the retry
+
+    def test_retry_failed_extra_replay_is_consumed_once_per_job(self, crawl_env, monkeypatch):
+        """2026-09-04 finding #66 item 4: a crash-recovery RECLAIM of the
+        SAME ``retry_failed`` job must not redo the EXTRA given-up replay a
+        second time — only the ordinary pending backlog (which a
+        permanently-failing, given-up item is no longer part of) runs
+        again. A genuinely fresh trigger (a different ``job_id``) fires the
+        extra replay again."""
+        monkeypatch.setattr(crawler, "_MAX_ITEM_RETRY_ATTEMPTS", 2)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if url.endswith("/content"):
+                return httpx.Response(404, json={})
+            if "t=1" in url:
+                return httpx.Response(200, json={"value": [], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        _install_graph(monkeypatch, handler)
+        connection = _connection([_drive_scope()])
+
+        _run(connection, monkeypatch)
+        _run(connection, monkeypatch)
+        assert _state(crawl_env)["failed_items"]["graph:item1"]["given_up"] is True
+        assert _state(crawl_env)["failed_items"]["graph:item1"]["attempts"] == 2
+
+        _run(connection, monkeypatch, retry_failed=True, job_id="job-A")
+        assert _state(crawl_env)["failed_items"]["graph:item1"]["attempts"] == 3
+
+        # Reclaim — same job_id.
+        _run(connection, monkeypatch, retry_failed=True, job_id="job-A")
+        assert _state(crawl_env)["failed_items"]["graph:item1"]["attempts"] == 3
+
+        # A fresh trigger (a different job_id) fires the extra replay again.
+        _run(connection, monkeypatch, retry_failed=True, job_id="job-B")
+        assert _state(crawl_env)["failed_items"]["graph:item1"]["attempts"] == 4
+
+
+class TestConsumeReplayFlagOnce:
+    """Unit coverage for ``_consume_replay_flag_once`` — the primitive
+    behind the ``retry_failed``/``retry_empty`` "consume once per job"
+    contract (2026-09-04 finding #66 item 4)."""
+
+    def test_a_false_flag_never_consumes(self):
+        state: Dict[str, Any] = {}
+        target = crawler.DriveTarget(drive_id="b!drive1", drive_name="Drive")
+        assert (
+            crawler._consume_replay_flag_once(state, target=target, job_id="job-A", flag=False, marker_key="m") is False
+        )
+        assert "m" not in state
+
+    def test_no_job_id_always_consumes(self):
+        state: Dict[str, Any] = {}
+        target = crawler.DriveTarget(drive_id="b!drive1", drive_name="Drive")
+        assert crawler._consume_replay_flag_once(state, target=target, job_id=None, flag=True, marker_key="m") is True
+        assert crawler._consume_replay_flag_once(state, target=target, job_id=None, flag=True, marker_key="m") is True
+
+    def test_the_same_job_id_consumes_exactly_once(self):
+        state: Dict[str, Any] = {}
+        target = crawler.DriveTarget(drive_id="b!drive1", drive_name="Drive")
+        assert (
+            crawler._consume_replay_flag_once(state, target=target, job_id="job-A", flag=True, marker_key="m") is True
+        )
+        assert (
+            crawler._consume_replay_flag_once(state, target=target, job_id="job-A", flag=True, marker_key="m") is False
+        )
+
+    def test_two_drives_in_the_same_job_each_get_their_own_first_pass(self):
+        """A scalar marker would wrongly suppress the SECOND drive's own
+        first pass in the same job — this must not happen."""
+        state: Dict[str, Any] = {}
+        t1 = crawler.DriveTarget(drive_id="b!drive1", drive_name="Drive1")
+        t2 = crawler.DriveTarget(drive_id="b!drive2", drive_name="Drive2")
+        assert crawler._consume_replay_flag_once(state, target=t1, job_id="job-A", flag=True, marker_key="m") is True
+        assert crawler._consume_replay_flag_once(state, target=t2, job_id="job-A", flag=True, marker_key="m") is True
+
+    def test_a_different_job_id_consumes_again(self):
+        state: Dict[str, Any] = {}
+        target = crawler.DriveTarget(drive_id="b!drive1", drive_name="Drive")
+        assert (
+            crawler._consume_replay_flag_once(state, target=target, job_id="job-A", flag=True, marker_key="m") is True
+        )
+        assert (
+            crawler._consume_replay_flag_once(state, target=target, job_id="job-B", flag=True, marker_key="m") is True
+        )
+
+
+# --------------------------------------------------------------------------
+# Doomed items — a document whose recorded failure is DETERMINISTIC is
+# skipped WITHOUT a download once it has failed enough times (2026-09-04
+# finding #66 item 2).
+# --------------------------------------------------------------------------
+
+
+class TestDoomedItemSkip:
+    @staticmethod
+    def _handler(recovered: Dict[str, bool]):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            if "t=1" in str(request.url):
+                return httpx.Response(200, json={"value": [], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        return handler
+
+    def test_a_deterministic_failure_is_skipped_without_download_after_two_attempts(self, crawl_env, monkeypatch):
+        from src.ingest.convert import ConversionError
+
+        def _boom(path, mime, **_kw):
+            raise ConversionError("f1.docx", "could not convert", engine="markitdown", error_class="markitdown_reject")
+
+        monkeypatch.setattr(crawler, "convert_to_markdown", _boom)
+        seen = _install_graph(monkeypatch, self._handler({}))
+        connection = _connection([_drive_scope()])
+
+        first = _run(connection, monkeypatch)
+        assert first["convert_failed"] == 1
+        assert first.get("skipped_doomed", 0) == 0
+        entry = _state(crawl_env)["failed_items"]["graph:item1"]
+        assert entry["attempts"] == 1
+        assert entry["error_class"] == "markitdown_reject"
+        downloads_after_first = sum(1 for u in seen if u.endswith("/content"))
+
+        # Second attempt (via the ordinary pending-backlog replay) — still
+        # below the doomed-skip threshold, still attempted normally.
+        second = _run(connection, monkeypatch)
+        assert second["convert_failed"] == 1
+        assert second.get("skipped_doomed", 0) == 0
+        assert _state(crawl_env)["failed_items"]["graph:item1"]["attempts"] == 2
+        assert sum(1 for u in seen if u.endswith("/content")) > downloads_after_first
+        downloads_after_second = sum(1 for u in seen if u.endswith("/content"))
+
+        # Third attempt — deterministic, 2 attempts, same cTag: doomed.
+        third = _run(connection, monkeypatch)
+        assert third["skipped_doomed"] == 1
+        assert third["convert_failed"] == 0
+        assert third["errors"] == 0
+        assert sum(1 for u in seen if u.endswith("/content")) == downloads_after_second, (
+            "a doomed item must not be downloaded again"
+        )
+        assert third["skipped_doomed_items"][0]["error_class"] == "markitdown_reject"
+        # The attempt count is unchanged by a doomed skip — nothing was tried.
+        assert _state(crawl_env)["failed_items"]["graph:item1"]["attempts"] == 2
+
+    def test_force_reprocess_still_attempts_a_doomed_item(self, crawl_env, monkeypatch):
+        from src.ingest.convert import ConversionError
+
+        def _boom(path, mime, **_kw):
+            raise ConversionError("f1.docx", "could not convert", engine="markitdown", error_class="markitdown_reject")
+
+        monkeypatch.setattr(crawler, "convert_to_markdown", _boom)
+        seen = _install_graph(monkeypatch, self._handler({}))
+        connection = _connection([_drive_scope()])
+
+        _run(connection, monkeypatch)
+        _run(connection, monkeypatch)
+        assert _state(crawl_env)["failed_items"]["graph:item1"]["attempts"] == 2
+        downloads_before = sum(1 for u in seen if u.endswith("/content"))
+
+        forced = _run(connection, monkeypatch, force_reprocess=True)
+
+        # `force_reprocess` restarts the WHOLE drive from a bare delta base,
+        # so item1 is offered twice this run — once via the backlog replay
+        # (now un-skipped) and once via the ordinary page walk — and BOTH
+        # attempt it rather than skip it.
+        assert forced.get("skipped_doomed", 0) == 0
+        assert forced["convert_failed"] == 2
+        assert sum(1 for u in seen if u.endswith("/content")) > downloads_before
+
+    def test_a_new_ctag_gets_fresh_attempts_even_after_it_was_doomed(self, crawl_env, monkeypatch):
+        from src.ingest.convert import ConversionError
+
+        def _boom(path, mime, **_kw):
+            raise ConversionError("f1.docx", "could not convert", engine="markitdown", error_class="markitdown_reject")
+
+        monkeypatch.setattr(crawler, "convert_to_markdown", _boom)
+
+        state_box = {"ctag": "ctag-1"}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            if "t=1" in str(request.url):
+                return httpx.Response(200, json={"value": [], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+            return httpx.Response(
+                200,
+                json={"value": [_file_item(ctag=state_box["ctag"])], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"},
+            )
+
+        seen = _install_graph(monkeypatch, handler)
+        connection = _connection([_drive_scope()])
+
+        _run(connection, monkeypatch)
+        _run(connection, monkeypatch)
+        third = _run(connection, monkeypatch)
+        assert third["skipped_doomed"] == 1
+        downloads_before = sum(1 for u in seen if u.endswith("/content"))
+
+        # New content (a different cTag). Reset the delta cursor so the next
+        # run re-walks the page instead of finding nothing new via its
+        # resumed (empty) deltaLink.
+        state_box["ctag"] = "ctag-2"
+        state = _state(crawl_env)
+        state["delta_links"] = {}
+        crawler.save_state(connection["id"], state)
+
+        fourth = _run(connection, monkeypatch)
+
+        # The BACKLOG replay runs first, still holding the STALE recorded
+        # cTag (ctag-1) from the last real attempt — it is skipped as
+        # doomed against that stale record, cheaply (no download). The
+        # ORDINARY delta walk that follows in the SAME run then offers the
+        # item with its NEW cTag (ctag-2), which does not match what is
+        # recorded, so it is attempted fresh — proving a content change
+        # still reaches the pipeline even though the backlog entry has not
+        # caught up to it yet.
+        assert fourth["skipped_doomed"] == 1
+        assert fourth["convert_failed"] == 1
+        assert sum(1 for u in seen if u.endswith("/content")) > downloads_before
+        assert _state(crawl_env)["failed_items"]["graph:item1"]["item"]["cTag"] == "ctag-2"
+
+    def test_an_environmental_failure_stays_retryable_forever(self, crawl_env, monkeypatch):
+        """A download failure (``download_error`` — never in the
+        deterministic set) must still be attempted every run, however many
+        times it has already failed — it is not a property of the file."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return httpx.Response(404, json={})
+            if "t=1" in str(request.url):
+                return httpx.Response(200, json={"value": [], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        seen = _install_graph(monkeypatch, handler)
+        connection = _connection([_drive_scope()])
+
+        for _ in range(4):
+            report = _run(connection, monkeypatch)
+            assert report.get("skipped_doomed", 0) == 0
+
+        assert _state(crawl_env)["failed_items"]["graph:item1"]["error_class"] == "download_error"
+        assert _state(crawl_env)["failed_items"]["graph:item1"]["attempts"] == 4
+        # A download attempt (a hit against `/content`) happened on EVERY run.
+        assert sum(1 for u in seen if u.endswith("/content")) == 4
+
+
+# --------------------------------------------------------------------------
+# Doomed after a REPEATED crash/timeout — a document whose most recent
+# failure is environmental (`timeout`/`memory_kill`/`worker_crash`, never
+# deterministic) is skipped WITHOUT a download once it has failed the SAME
+# environmental way, on UNCHANGED content, three times running (TCRD-296
+# gap #74; see `crawler._DOOMED_SKIP_MIN_ATTEMPTS_REPEATED`'s docstring for
+# the live finding this fixes).
+# --------------------------------------------------------------------------
+
+
+class TestDoomedAfterRepeatedFailure:
+    @staticmethod
+    def _handler():
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            if "t=1" in str(request.url):
+                return httpx.Response(200, json={"value": [], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        return handler
+
+    @staticmethod
+    def _crash(path, mime, **_kw):
+        # The child dies from a real signal — the ONE failure mode a plain
+        # `except Exception` inside the child can never catch (see
+        # `_ConvertCrashed`'s own docstring) — instant, no sleep needed.
+        os.kill(os.getpid(), signal.SIGABRT)
+
+    def test_a_repeated_worker_crash_is_skipped_without_download_after_three_attempts(self, crawl_env, monkeypatch):
+        """Covers both scenario (a) — three failures, then doomed — and
+        scenario (b) — two failures alone are still attempted normally,
+        unlike a deterministic reject which is already doomed at two."""
+        monkeypatch.setattr(crawler, "convert_to_markdown", self._crash)
+        seen = _install_graph(monkeypatch, self._handler())
+        connection = _connection([_drive_scope()])
+
+        first = _run(connection, monkeypatch)
+        assert first["convert_failed"] == 1
+        assert first.get("skipped_doomed", 0) == 0
+        entry = _state(crawl_env)["failed_items"]["graph:item1"]
+        assert entry["attempts"] == 1
+        assert entry["error_class"] == "worker_crash"
+
+        # Two failures — below the REPEATED-failure threshold (3): still
+        # attempted normally.
+        second = _run(connection, monkeypatch)
+        assert second["convert_failed"] == 1
+        assert second.get("skipped_doomed", 0) == 0
+        assert _state(crawl_env)["failed_items"]["graph:item1"]["attempts"] == 2
+
+        # Third attempt — still below the threshold going in (2 < 3), so
+        # still attempted; this is the failure that crosses it.
+        third = _run(connection, monkeypatch)
+        assert third["convert_failed"] == 1
+        assert third.get("skipped_doomed", 0) == 0
+        assert _state(crawl_env)["failed_items"]["graph:item1"]["attempts"] == 3
+        downloads_after_third = sum(1 for u in seen if u.endswith("/content"))
+
+        # Fourth attempt — 3 repeated worker_crash failures, same cTag:
+        # doomed, no download.
+        fourth = _run(connection, monkeypatch)
+        assert fourth["skipped_doomed"] == 1
+        assert fourth["convert_failed"] == 0
+        assert fourth["errors"] == 0
+        assert sum(1 for u in seen if u.endswith("/content")) == downloads_after_third, (
+            "a doomed item must not be downloaded again"
+        )
+        item = fourth["skipped_doomed_items"][0]
+        assert item["error_class"] == "worker_crash"
+        assert item["reason_type"] == "doomed_after_repeated_worker_crash"
+        # The attempt count is unchanged by a doomed skip — nothing was tried.
+        assert _state(crawl_env)["failed_items"]["graph:item1"]["attempts"] == 3
+
+    def test_force_reprocess_still_attempts_a_repeatedly_crashing_item(self, crawl_env, monkeypatch):
+        monkeypatch.setattr(crawler, "convert_to_markdown", self._crash)
+        seen = _install_graph(monkeypatch, self._handler())
+        connection = _connection([_drive_scope()])
+
+        _run(connection, monkeypatch)
+        _run(connection, monkeypatch)
+        _run(connection, monkeypatch)
+        assert _state(crawl_env)["failed_items"]["graph:item1"]["attempts"] == 3
+        downloads_before = sum(1 for u in seen if u.endswith("/content"))
+
+        forced = _run(connection, monkeypatch, force_reprocess=True)
+
+        # Same double-offer shape as the deterministic case (backlog replay
+        # un-skipped + the ordinary page walk, both attempting it).
+        assert forced.get("skipped_doomed", 0) == 0
+        assert forced["convert_failed"] == 2
+        assert sum(1 for u in seen if u.endswith("/content")) > downloads_before
+
+    def test_a_new_ctag_gets_fresh_attempts_even_after_a_repeated_crash_was_doomed(self, crawl_env, monkeypatch):
+        monkeypatch.setattr(crawler, "convert_to_markdown", self._crash)
+
+        state_box = {"ctag": "ctag-1"}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            if "t=1" in str(request.url):
+                return httpx.Response(200, json={"value": [], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+            return httpx.Response(
+                200,
+                json={"value": [_file_item(ctag=state_box["ctag"])], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"},
+            )
+
+        seen = _install_graph(monkeypatch, handler)
+        connection = _connection([_drive_scope()])
+
+        _run(connection, monkeypatch)
+        _run(connection, monkeypatch)
+        _run(connection, monkeypatch)
+        fourth = _run(connection, monkeypatch)
+        assert fourth["skipped_doomed"] == 1
+        downloads_before = sum(1 for u in seen if u.endswith("/content"))
+
+        # New content (a different cTag). Reset the delta cursor so the next
+        # run re-walks the page instead of finding nothing new via its
+        # resumed (empty) deltaLink.
+        state_box["ctag"] = "ctag-2"
+        state = _state(crawl_env)
+        state["delta_links"] = {}
+        crawler.save_state(connection["id"], state)
+
+        fifth = _run(connection, monkeypatch)
+
+        # The BACKLOG replay runs first, still holding the STALE recorded
+        # cTag (ctag-1) — skipped as doomed against that stale record,
+        # cheaply. The ORDINARY delta walk that follows in the SAME run then
+        # offers the item with its NEW cTag (ctag-2), attempted fresh.
+        assert fifth["skipped_doomed"] == 1
+        assert fifth["convert_failed"] == 1
+        assert sum(1 for u in seen if u.endswith("/content")) > downloads_before
+        assert _state(crawl_env)["failed_items"]["graph:item1"]["item"]["cTag"] == "ctag-2"
+
+    def test_a_repeated_timeout_is_also_doomed_after_three_attempts(self, crawl_env, monkeypatch):
+        """The rule applies to `timeout`, not just `worker_crash` — a real,
+        bounded per-item timeout via a tiny configured budget, not a mock."""
+        monkeypatch.setattr(crawler, "_item_timeout_seconds", lambda: 0.3)
+
+        def _hang(path, mime, **_kw):
+            time.sleep(2)  # far longer than the tiny budget above
+            return ConvertResult("# never reached")
+
+        monkeypatch.setattr(crawler, "convert_to_markdown", _hang)
+        seen = _install_graph(monkeypatch, self._handler())
+        connection = _connection([_drive_scope()])
+
+        for _ in range(3):
+            report = _run(connection, monkeypatch)
+            assert report.get("skipped_doomed", 0) == 0
+        assert _state(crawl_env)["failed_items"]["graph:item1"]["error_class"] == "timeout"
+        assert _state(crawl_env)["failed_items"]["graph:item1"]["attempts"] == 3
+        downloads_after_third = sum(1 for u in seen if u.endswith("/content"))
+
+        fourth = _run(connection, monkeypatch)
+        assert fourth["skipped_doomed"] == 1
+        assert sum(1 for u in seen if u.endswith("/content")) == downloads_after_third
+        assert fourth["skipped_doomed_items"][0]["reason_type"] == "doomed_after_repeated_timeout"
+
+
+class TestDoomedClassificationHelper:
+    """Direct, no-crawl coverage of `_doomed_classification` — the single
+    place `_doomed_skip_reason` (live skip) and `_retry_backlog_snapshot`
+    (standing count) both read, so they can never silently disagree."""
+
+    @pytest.mark.parametrize("error_class", ["timeout", "memory_kill", "worker_crash"])
+    def test_a_repeated_failure_class_becomes_doomed_at_the_repeated_threshold(self, error_class):
+        assert crawler._doomed_classification(error_class, 2) is None
+        assert crawler._doomed_classification(error_class, 3) == f"doomed_after_repeated_{error_class}"
+
+    def test_deterministic_classes_are_unaffected_by_the_repeated_rule(self):
+        assert crawler._doomed_classification("markitdown_reject", 2) == "doomed"
+        assert crawler._doomed_classification("markitdown_reject", 1) is None
+
+    def test_download_error_and_other_never_become_doomed(self):
+        assert crawler._doomed_classification("download_error", 10) is None
+        assert crawler._doomed_classification("other", 10) is None
+
+
+class TestNoteRetryAttemptsForEnvironmentalFailures:
+    """`_note_retry` bumps `failed_items[...]['attempts']` for EVERY
+    `error_class`, including `timeout`/`memory_kill`/`worker_crash` — never
+    only the deterministic ones — because the doomed-after-repeat rule
+    (TCRD-296 gap #74) depends on counting these attempts exactly the same
+    way a deterministic failure's are counted."""
+
+    @pytest.mark.parametrize("error_class", ["timeout", "memory_kill", "worker_crash"])
+    def test_attempts_increments_across_repeated_calls(self, error_class):
+        state: Dict[str, Any] = {}
+        stats = crawler.CrawlStats()
+        target = crawler.DriveTarget(drive_id="b!drive1", drive_name="Drive")
+        item = _file_item()
+
+        for expected in (1, 2, 3):
+            crawler._note_retry(
+                state,
+                stats,
+                "graph:item1",
+                target=target,
+                item=item,
+                path="Reports/brief.docx",
+                error_class=error_class,
+            )
+            entry = state["failed_items"]["graph:item1"]
+            assert entry["attempts"] == expected
+            assert entry["error_class"] == error_class
+
+
+class TestEmptyItemBacklog:
+    """``state["empty_items"]`` — the persisted backlog of documents that
+    converted to ``convert_empty``, and the admin-requested ``retry_empty``
+    run option that replays it. See ``_note_empty``/``_clear_empty``/
+    ``_retry_empty_items``."""
+
+    def test_a_convert_empty_outcome_is_recorded_in_the_persisted_backlog(self, crawl_env, monkeypatch):
+        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime, **_kw: ConvertResult("   \n "))
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        _install_graph(monkeypatch, handler)
+        _run(_connection([_drive_scope()]), monkeypatch)
+
+        entry = _state(crawl_env)["empty_items"]["graph:item1"]
+        assert entry["path"].endswith("brief.docx")
+        assert entry["item"]["id"] == "item1"
+        assert entry["state_key"] == "b!drive1"
+        assert entry["first_seen_at"]
+        assert "graph:item1" not in _state(crawl_env)["failed_items"], "convert_empty is not a retry-queue failure"
+
+    def test_an_ordinary_run_never_replays_the_empty_items_backlog(self, crawl_env, monkeypatch):
+        """The whole reason this is a SEPARATE backlog from `failed_items`:
+        replaying thousands of known-empty documents on every ordinary crawl
+        would be pure waste while scan OCR stays off."""
+        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime, **_kw: ConvertResult("   \n "))
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if url.endswith("/content"):
+                return _content_response()
+            if "t=1" in url:
+                # Item1 was never re-touched — Graph has nothing new to offer.
+                return httpx.Response(200, json={"value": [], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        seen = _install_graph(monkeypatch, handler)
+        connection = _connection([_drive_scope()])
+
+        _run(connection, monkeypatch)
+        downloads_after_first = sum(1 for u in seen if u.endswith("/content"))
+
+        second = _run(connection, monkeypatch)  # no retry_empty
+        assert sum(1 for u in seen if u.endswith("/content")) == downloads_after_first
+        assert second.get("scan_ocr") is None or second["scan_ocr"].get("previewed") in (None, 0)
+        assert "graph:item1" in _state(crawl_env)["empty_items"]
+
+    def test_retry_empty_replays_the_backlog_and_clears_an_item_that_now_converts(self, crawl_env, monkeypatch):
+        """The admin-facing `retry_empty` run option (`POST …/extraction/
+        retry-empty`): once a document that used to convert empty produces
+        real text (e.g. scan OCR just got turned on), it is ingested and
+        drops out of the backlog — mirrors `retry_failed`'s own test."""
+        converts_empty = {"value": True}
+        monkeypatch.setattr(
+            crawler,
+            "convert_to_markdown",
+            lambda path, mime, **_kw: (
+                ConvertResult("   \n ") if converts_empty["value"] else ConvertResult("# real text")
+            ),
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if url.endswith("/content"):
+                return _content_response()
+            if "t=1" in url:
+                return httpx.Response(200, json={"value": [], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        _install_graph(monkeypatch, handler)
+        connection = _connection([_drive_scope()])
+
+        _run(connection, monkeypatch)
+        assert "graph:item1" in _state(crawl_env)["empty_items"]
+
+        converts_empty["value"] = False
+        retried = _run(connection, monkeypatch, retry_empty=True)
+
+        assert FakeIngestor.instances[-1].ingested[0]["stable_id"] == "graph:item1"
+        assert FakeIngestor.instances[-1].ingested[0]["markdown"] == "# real text"
+        assert "graph:item1" not in _state(crawl_env)["empty_items"]
+        # `convert_empty` never records a cTag (see the docstring on the
+        # `convert_empty` branch), so this ingest lands as `new`, not `changed`.
+        assert retried["new"] == 1
+
+    def test_retry_empty_true_but_an_empty_backlog_is_a_clean_no_op(self, crawl_env, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        _install_graph(monkeypatch, handler)
+        report = _run(_connection([_drive_scope()]), monkeypatch, retry_empty=True)
+
+        assert report["new"] == 1
+        assert report["errors"] == 0
+
+    def test_the_empty_items_backlog_is_bounded_fifo(self, crawl_env, monkeypatch):
+        state: Dict[str, Any] = {"empty_items": {}}
+        target = crawler.DriveTarget(drive_id="b!drive1", drive_name="Drive")
+        monkeypatch.setattr(crawler, "_FAILED_ITEMS_CAP", 3)
+
+        for i in range(4):
+            crawler._note_empty(
+                state,
+                f"graph:item{i}",
+                target=target,
+                item={"id": f"item{i}"},
+                path=f"Reports/f{i}.docx",
+            )
+
+        assert len(state["empty_items"]) == 3
+        assert "graph:item0" not in state["empty_items"], "the OLDEST entry is evicted to make room"
+        assert set(state["empty_items"]) == {"graph:item1", "graph:item2", "graph:item3"}
+
 
 class TestForcedResync:
     def test_resync_flag_re_enumerates_from_scratch_but_keeps_ctags(self, crawl_env, monkeypatch):
@@ -802,6 +1809,82 @@ class TestForcedResync:
         assert state["delta_links"]["b!drive1"] == f"{DRIVE_DELTA}?t=fresh"
         assert state["failed_items"] == {}
         assert state["ctags"]["graph:item1"] == "ctag-1"
+
+    def test_resync_is_not_reapplied_on_a_reclaimed_attempt_of_the_same_job(self, crawl_env):
+        """2026-09-04 finding #66 item 4 (live finding: a worker recreated
+        mid-run reclaimed the job, which called ``run_builtin_crawl`` again
+        with the identical ``resync: true`` payload — dropping the delta
+        links and failure queue the interrupted first attempt had already
+        progressed past, restarting the whole enumeration from zero). A
+        SECOND ``_apply_resync`` call naming the SAME ``job_id`` must be a
+        no-op — the interrupted attempt's own progress (recorded here as a
+        ``failed_items`` entry and an advanced ``delta_links`` cursor) must
+        survive."""
+        crawler.save_state(
+            "conn1",
+            {
+                "delta_links": {"b!drive1": f"{DRIVE_DELTA}?t=partway"},
+                "ctags": {},
+                "failed_items": {
+                    "graph:item2": {
+                        "attempts": 1,
+                        "state_key": "b!drive1",
+                        "item": {"id": "item2"},
+                        "path": "x",
+                    }
+                },
+            },
+        )
+
+        crawler._apply_resync("conn1", job_id="job-A")
+        assert _state(crawl_env)["delta_links"] == {}
+        assert _state(crawl_env)["failed_items"] == {}
+        assert _state(crawl_env)["resync_applied_for_job"] == "job-A"
+
+        # Simulate the interrupted first attempt's OWN progress after the
+        # resync it already applied — a fresh delta cursor and a new
+        # failure, exactly what a checkpoint mid-crawl would persist.
+        progressed = _state(crawl_env)
+        progressed["delta_links"] = {"b!drive1": f"{DRIVE_DELTA}?t=progressed"}
+        progressed["failed_items"] = {"graph:item3": {"attempts": 1, "state_key": "b!drive1"}}
+        crawler.save_state("conn1", progressed)
+
+        # The RECLAIM — same job_id, called again.
+        crawler._apply_resync("conn1", job_id="job-A")
+
+        state = _state(crawl_env)
+        assert state["delta_links"] == {"b!drive1": f"{DRIVE_DELTA}?t=progressed"}, (
+            "a reclaim of the SAME job must not drop the interrupted attempt's own progress"
+        )
+        assert state["failed_items"] == {"graph:item3": {"attempts": 1, "state_key": "b!drive1"}}
+
+    def test_resync_reapplies_on_a_fresh_job_id(self, crawl_env):
+        """A genuinely NEW trigger (a different ``job_id``) always
+        re-applies — only a reclaim of the SAME job is suppressed."""
+        crawler.save_state(
+            "conn1",
+            {
+                "delta_links": {"b!drive1": f"{DRIVE_DELTA}?t=stale"},
+                "ctags": {},
+                "failed_items": {"graph:item1": {"attempts": 1, "state_key": "b!drive1"}},
+            },
+        )
+
+        crawler._apply_resync("conn1", job_id="job-A")
+        assert _state(crawl_env)["resync_applied_for_job"] == "job-A"
+
+        # A later, independent trigger — put something back to drop.
+        state = _state(crawl_env)
+        state["delta_links"] = {"b!drive1": f"{DRIVE_DELTA}?t=later"}
+        state["failed_items"] = {"graph:item9": {"attempts": 1, "state_key": "b!drive1"}}
+        crawler.save_state("conn1", state)
+
+        crawler._apply_resync("conn1", job_id="job-B")
+
+        state = _state(crawl_env)
+        assert state["delta_links"] == {}
+        assert state["failed_items"] == {}
+        assert state["resync_applied_for_job"] == "job-B"
 
 
 # --------------------------------------------------------------------------
@@ -885,6 +1968,56 @@ class TestAnonymizeFailClosed:
             "REDACTED[Client Files]/REDACTED[Northwind Deal]/REDACTED[Northwind Logistics Merger Brief].docx"
         )
         assert row["filename"] == "REDACTED[Northwind Logistics Merger Brief].md"
+
+    def test_a_renamed_item_on_an_anonymized_scope_updates_the_redacted_path_too(self, crawl_env, monkeypatch):
+        """D.18's rename gate runs `_anonymize_identity` on an anonymize-
+        marked scope's unchanged item — same deterministic stub as the test
+        above, so a real rename (new raw name/path) produces a DIFFERENT
+        redacted identity, proving the gate re-derives it rather than
+        reusing whatever was stored the first time (which would leave the
+        OLD redacted path stale, defeating the whole point of D.18 on an
+        anonymized scope)."""
+        monkeypatch.setattr(
+            crawler,
+            "anonymize_markdown",
+            lambda text, *, key, detector=None: AnonymizeResult(f"REDACTED[{text}]"),
+        )
+        item = {"name": "brief.docx", "parent_path": "/drives/b!drive1/root:/Reports"}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(
+                200,
+                json={
+                    "value": [_file_item(name=item["name"], parent_path=item["parent_path"])],
+                    "@odata.deltaLink": f"{DRIVE_DELTA}?t=1",
+                },
+            )
+
+        connection = _connection([_drive_scope(anonymize=True)])
+        seen = _install_graph(monkeypatch, handler)
+        first = _run(connection, monkeypatch)
+        assert first["new"] == 1
+        downloads_after_first = sum(1 for url in seen if url.endswith("/content"))
+        first_row = FakeIngestor.instances[-1].ingested[0]
+        assert first_row["path"] == "REDACTED[Reports]/REDACTED[brief].docx"
+
+        item["name"] = "brief-renamed.docx"
+        second = _run(connection, monkeypatch)
+
+        assert second.get("renamed") == 1
+        assert second["unchanged"] == 0
+        assert FakeIngestor.instances[-1].ingested == []  # no re-download/re-convert/re-ingest
+        assert sum(1 for url in seen if url.endswith("/content")) == downloads_after_first
+        assert FakeIngestor.instances[-1].renamed == [
+            {
+                "collection_id": "col1",
+                "stable_id": "graph:item1",
+                "path": "REDACTED[Reports]/REDACTED[brief-renamed].docx",
+                "filename": "REDACTED[brief-renamed].md",
+            }
+        ]
 
     def test_an_anonymized_scope_leaks_no_fragment_of_the_real_name_through_the_real_anonymizer(
         self, crawl_env, monkeypatch
@@ -1023,7 +2156,7 @@ class TestAnonymizeFailClosed:
 
 class TestConversion:
     def test_an_unconvertible_file_is_counted_and_skipped_not_fatal(self, crawl_env, monkeypatch):
-        def _boom(path, mime):
+        def _boom(path, mime, **_kw):
             raise RuntimeError("markitdown said no")
 
         monkeypatch.setattr(crawler, "convert_to_markdown", _boom)
@@ -1057,7 +2190,7 @@ class TestConversion:
         exactly as before), never an `errors` count and never itemized in
         `errors_detail` — it never reached `errors` before this change and
         must not gain a row just because a neighbouring reason did."""
-        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime: ConvertResult("   \n "))
+        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime, **_kw: ConvertResult("   \n "))
 
         def handler(request: httpx.Request) -> httpx.Response:
             if str(request.url).endswith("/content"):
@@ -1072,7 +2205,7 @@ class TestConversion:
         assert report["errors_detail"] == {"items": [], "listed": 0, "total": 0, "truncated": False}
 
     def test_an_empty_conversion_is_not_ingested(self, crawl_env, monkeypatch):
-        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime: ConvertResult("   \n "))
+        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime, **_kw: ConvertResult("   \n "))
 
         def handler(request: httpx.Request) -> httpx.Response:
             if str(request.url).endswith("/content"):
@@ -1083,6 +2216,212 @@ class TestConversion:
         report = _run(_connection([_drive_scope()]), monkeypatch)
 
         assert report["convert_failed"] == 1
+        assert FakeIngestor.instances[-1].ingested == []
+
+
+# --------------------------------------------------------------------------
+# Failed/skipped item visibility (owner decision 2026-09-02, live whole-site
+# crawl finding: a conversion failure was invisible outside the worker log
+# and the delta cursor moved past it for good).
+# --------------------------------------------------------------------------
+
+
+class TestFailedAndSkippedItemVisibility:
+    def test_a_convert_failure_is_recorded_with_item_id_drive_id_and_suffix(self, crawl_env, monkeypatch):
+        monkeypatch.setattr(
+            crawler, "convert_to_markdown", lambda path, mime, **_kw: (_ for _ in ()).throw(RuntimeError("nope"))
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        _install_graph(monkeypatch, handler)
+        report = _run(_connection([_drive_scope()]), monkeypatch)
+
+        assert report["convert_failed"] == 1
+        assert report["failed_items_truncated"] is False
+        row = report["failed_items"][0]
+        assert row["item_id"] == "item1"
+        assert row["drive_id"] == "b!drive1"
+        assert row["reason_type"] == "convert_failed"
+        assert row["suffix"] == ".docx"
+        assert row["path"].endswith("brief.docx")
+        assert "nope" in row["reason"]
+
+    def test_convert_empty_is_recorded_in_failed_items_but_never_counted_an_error(self, crawl_env, monkeypatch):
+        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime, **_kw: ConvertResult("   \n "))
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        _install_graph(monkeypatch, handler)
+        report = _run(_connection([_drive_scope()]), monkeypatch)
+
+        assert report["errors"] == 0
+        assert len(report["failed_items"]) == 1
+        assert report["failed_items"][0]["reason_type"] == "convert_empty"
+
+    def test_an_anonymized_scope_records_no_raw_path_for_a_failed_item(self, crawl_env, monkeypatch):
+        monkeypatch.setenv("AGNES_ANONYMIZATION_HMAC_KEY", "unit-test-key")
+        monkeypatch.setattr(
+            crawler, "convert_to_markdown", lambda path, mime, **_kw: (_ for _ in ()).throw(RuntimeError("nope"))
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        _install_graph(monkeypatch, handler)
+        report = _run(_connection([_drive_scope(anonymize=True)]), monkeypatch)
+
+        row = report["failed_items"][0]
+        assert row["path"] is None
+        # Never redacted away — these are opaque Graph identifiers, not
+        # document content, and `retry_failed` needs them.
+        assert row["item_id"] == "item1"
+        assert row["drive_id"] == "b!drive1"
+
+    def test_a_format_with_no_conversion_backend_is_skipped_never_an_error(self, crawl_env, monkeypatch):
+        """Exercises the MID-CONVERSION discovery path — markitdown itself
+        reporting no `accepts()`-ing backend for a format that was NOT known
+        in advance (unlike `.pbix`/`.vsdx`, which `_DEFAULT_UNSUPPORTED_
+        EXTENSIONS` now classifies before any download at all — see
+        `TestUnsupportedExtensionsResolution` and `TestFailedAndSkippedItem
+        Visibility`'s own pre-download tests). `.one` (OneNote) is a real
+        example named in `UnsupportedConversionFormat`'s own docstring and,
+        deliberately, not in that pre-download set, so this test still
+        reaches `_prepare_document`/`convert_to_markdown`."""
+        from src.ingest.convert import UnsupportedConversionFormat
+
+        def _boom(path, mime, **_kw):
+            raise UnsupportedConversionFormat("notes.one", "no conversion backend recognizes this file type")
+
+        monkeypatch.setattr(crawler, "convert_to_markdown", _boom)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(
+                200,
+                json={"value": [_file_item(name="notes.one")], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"},
+            )
+
+        _install_graph(monkeypatch, handler)
+        report = _run(_connection([_drive_scope()]), monkeypatch)
+
+        assert report["errors"] == 0
+        assert report["convert_failed"] == 0
+        assert report["skipped_unsupported"] == 1
+        assert report["skipped_items_truncated"] is False
+        row = report["skipped_items"][0]
+        assert row["item_id"] == "item1"
+        assert row["drive_id"] == "b!drive1"
+        assert row["reason_type"] == "unsupported_type"
+        assert row["suffix"] == ".one"
+        assert row["path"].endswith("notes.one")
+        assert FakeIngestor.instances[-1].ingested == []
+
+    def test_failed_items_is_bounded_with_an_honest_truncated_flag(self):
+        stats = crawler.CrawlStats()
+        for i in range(crawler._FAILED_ITEMS_CAP + 50):
+            stats.note_failed_item(
+                path=f"Reports/f{i}.docx",
+                item_id=f"item{i}",
+                drive_id="b!drive1",
+                reason_type="convert_failed",
+                reason="boom",
+                suffix=".docx",
+            )
+
+        report = stats.report(max_file_mb=50)
+        assert len(report["failed_items"]) == crawler._FAILED_ITEMS_CAP
+        assert report["failed_items_truncated"] is True
+
+    def test_skipped_items_is_bounded_with_an_honest_truncated_flag(self):
+        stats = crawler.CrawlStats()
+        for i in range(crawler._FAILED_ITEMS_CAP + 50):
+            stats.note_skipped_unsupported(
+                path=f"Reports/f{i}.pbix",
+                item_id=f"item{i}",
+                drive_id="b!drive1",
+                reason="no backend",
+                suffix=".pbix",
+            )
+
+        report = stats.report(max_file_mb=50)
+        assert len(report["skipped_items"]) == crawler._FAILED_ITEMS_CAP
+        assert report["skipped_items_truncated"] is True
+        assert report["skipped_unsupported"] == crawler._FAILED_ITEMS_CAP + 50
+
+    def test_a_run_with_nothing_wrong_reports_empty_lists(self, crawl_env, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        _install_graph(monkeypatch, handler)
+        report = _run(_connection([_drive_scope()]), monkeypatch)
+
+        assert report["failed_items"] == []
+        assert report["failed_items_truncated"] is False
+        assert report["skipped_items"] == []
+        assert report["skipped_items_truncated"] is False
+        assert report["skipped_unsupported"] == 0
+
+    def test_a_default_unsupported_extension_is_skipped_before_any_download(self, crawl_env, monkeypatch):
+        """mp4 (and the rest of `_DEFAULT_UNSUPPORTED_EXTENSIONS`) must never
+        reach `download_to_temp` — that is the whole point of classifying it
+        up front (live finding: 868 persisted retry-queue entries, all
+        formats markitdown fails on identically every time)."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert not str(request.url).endswith("/content"), "a pre-classified unsupported file must not be downloaded"
+            return httpx.Response(
+                200,
+                json={"value": [_file_item(name="training.mp4")], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"},
+            )
+
+        _install_graph(monkeypatch, handler)
+        report = _run(_connection([_drive_scope()]), monkeypatch)
+
+        assert report["errors"] == 0
+        assert report["convert_failed"] == 0
+        assert report["skipped_unsupported"] == 1
+        assert report["skipped_unsupported_by_extension"] == {"mp4": 1}
+        assert report["failed_items"] == []
+        row = report["skipped_items"][0]
+        assert row["reason_type"] == "unsupported_type"
+        assert row["suffix"] == ".mp4"
+        assert row["path"].endswith("training.mp4")
+        assert FakeIngestor.instances[-1].ingested == []
+
+    def test_unsupported_extensions_config_override_is_additive(self, crawl_env, monkeypatch):
+        """The configured list widens the pre-download skip set — a format
+        that is NOT one of the built-in defaults is still skipped once
+        configured, and the base set keeps working alongside it."""
+        monkeypatch.setattr(
+            crawler,
+            "_unsupported_extensions",
+            lambda: crawler._DEFAULT_UNSUPPORTED_EXTENSIONS | {"foo"},
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert not str(request.url).endswith("/content")
+            return httpx.Response(
+                200,
+                json={"value": [_file_item(name="custom.foo")], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"},
+            )
+
+        _install_graph(monkeypatch, handler)
+        report = _run(_connection([_drive_scope()]), monkeypatch)
+
+        assert report["skipped_unsupported"] == 1
+        assert report["skipped_unsupported_by_extension"] == {"foo": 1}
         assert FakeIngestor.instances[-1].ingested == []
 
 
@@ -1105,7 +2444,7 @@ class TestConversionCrashIsolation:
 
     @staticmethod
     def _crash_on_marker(marker: bytes) -> Callable[[Path, str], Any]:
-        def _convert(path: Path, mime: str) -> Any:
+        def _convert(path: Path, mime: str, **_kw: Any) -> Any:
             if Path(path).read_bytes() == marker:
                 os.kill(os.getpid(), signal.SIGABRT)
             return ConvertResult("# converted fine")
@@ -1176,7 +2515,7 @@ class TestConversionCrashIsolation:
     ):
         _at_concurrency(monkeypatch, 1)
 
-        def _convert(path: Path, mime: str) -> Any:
+        def _convert(path: Path, mime: str, **_kw: Any) -> Any:
             content = Path(path).read_bytes()
             if content == b"CRASH-ME":
                 os.kill(os.getpid(), signal.SIGABRT)
@@ -1230,7 +2569,7 @@ class TestItemProcessingTimeoutEndToEnd:
         _at_concurrency(monkeypatch, 1)
         monkeypatch.setattr(crawler, "_item_timeout_seconds", lambda: 0.3)
 
-        def _convert(path: Path, mime: str) -> Any:
+        def _convert(path: Path, mime: str, **_kw: Any) -> Any:
             if Path(path).read_bytes() == b"HANG-ME":
                 time.sleep(30)
             return ConvertResult("# converted fine")
@@ -1295,7 +2634,7 @@ class TestConvertProcessPoolRecycling:
         return p
 
     def test_a_slot_is_recycled_after_its_document_budget(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime: ConvertResult("# ok"))
+        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime, **_kw: ConvertResult("# ok"))
         pool = crawler._ConvertProcessPool(1, recycle_after_docs=3, recycle_rss_bytes=0)
         pool.start()
         try:
@@ -1317,7 +2656,7 @@ class TestConvertProcessPoolRecycling:
             pool.shutdown()
 
     def test_a_slot_is_recycled_when_its_rss_crosses_the_ceiling(self, tmp_path, monkeypatch):
-        def _convert(path: Path, mime: str) -> Any:
+        def _convert(path: Path, mime: str, **_kw: Any) -> Any:
             # Inflate THIS (child) process's RSS on purpose, deterministically
             # — the point of testing the trigger in isolation, rather than
             # waiting on a real multi-hundred-document crawl to grow one
@@ -1340,7 +2679,7 @@ class TestConvertProcessPoolRecycling:
             pool.shutdown()
 
     def test_recycling_does_not_regress_crash_isolation(self, tmp_path, monkeypatch):
-        def _convert(path: Path, mime: str) -> Any:
+        def _convert(path: Path, mime: str, **_kw: Any) -> Any:
             if Path(path).read_bytes() == b"CRASH-ME":
                 os.kill(os.getpid(), signal.SIGABRT)
             return ConvertResult("# ok")
@@ -1372,6 +2711,177 @@ class TestConvertProcessPoolRecycling:
         finally:
             pool.shutdown()
 
+    def test_two_spares_survive_two_consecutive_recycles_without_a_repair(self, tmp_path, monkeypatch):
+        """`convert_spares_per_slot` (default 2, see
+        `crawler._DEFAULT_CONVERT_SPARES_PER_SLOT`) — the live-deployment
+        gap a single spare per slot left open: a slot that recycles TWICE
+        in the same (up to 200-item) page, before the next `repair()` ever
+        runs, used to have nothing left to swap in after the first recycle
+        and just kept running past its budget for the rest of the page. Two
+        spares survive exactly two such recycles with no `repair()` call in
+        between."""
+        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime, **_kw: ConvertResult("# ok"))
+        pool = crawler._ConvertProcessPool(1, recycle_after_docs=1, recycle_rss_bytes=0, spares_per_slot=2)
+        pool.start()
+        try:
+            assert len(pool._spare_procs[0]) == 2
+            f = self._write(tmp_path, "doc.txt", b"fine")
+
+            first_pid = pool._procs[0].pid
+            assert pool.convert(0, f, "text/plain").ok  # budget 1 -> recycles onto spare #1
+            second_pid = pool._procs[0].pid
+            assert second_pid != first_pid
+            assert len(pool._spare_procs[0]) == 1, "one spare consumed, one left — no repair() ran yet"
+
+            assert pool.convert(0, f, "text/plain").ok  # budget 1 again -> recycles onto spare #2
+            third_pid = pool._procs[0].pid
+            assert third_pid not in (first_pid, second_pid)
+            assert len(pool._spare_procs[0]) == 0, "both spares now consumed"
+
+            # A THIRD recycle with no spare left simply keeps running past
+            # its budget — the pre-spares behaviour, exactly (see the class
+            # docstring's "N SPARES PER SLOT" section) — never a correctness
+            # issue.
+            assert pool.convert(0, f, "text/plain").ok
+            assert pool._procs[0].pid == third_pid
+        finally:
+            pool.shutdown()
+
+    def test_repair_tops_the_spare_queue_back_up_to_the_configured_count(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime, **_kw: ConvertResult("# ok"))
+        pool = crawler._ConvertProcessPool(1, recycle_after_docs=1, recycle_rss_bytes=0, spares_per_slot=2)
+        pool.start()
+        try:
+            f = self._write(tmp_path, "doc.txt", b"fine")
+            assert pool.convert(0, f, "text/plain").ok  # consumes spare #1
+            assert pool.convert(0, f, "text/plain").ok  # consumes spare #2
+            assert len(pool._spare_procs[0]) == 0
+
+            pool.repair()
+            assert len(pool._spare_procs[0]) == 2, "repair() must top the queue back up to spares_per_slot"
+            # ...and the refilled spares are genuinely usable, not stubs.
+            assert pool.convert(0, f, "text/plain").ok
+        finally:
+            pool.shutdown()
+
+    def test_convert_spares_per_slot_zero_disables_spares_the_pre_spares_behaviour(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime, **_kw: ConvertResult("# ok"))
+        pool = crawler._ConvertProcessPool(1, recycle_after_docs=1, recycle_rss_bytes=0, spares_per_slot=0)
+        pool.start()
+        try:
+            assert pool._spare_procs[0] == []
+            f = self._write(tmp_path, "doc.txt", b"fine")
+            first_pid = pool._procs[0].pid
+            assert pool.convert(0, f, "text/plain").ok  # crosses the budget, no spare to swap in
+            assert pool._procs[0].pid == first_pid, "no spare configured — the slot just keeps running"
+        finally:
+            pool.shutdown()
+
+
+class TestConvertProcessPoolRetirement:
+    """Retiring a slot (recycle, crash recovery, shutdown) must actually END
+    the retiree — see `crawler._CHILD_DEFAULT_SIGNALS` for the live finding:
+    under uvicorn every forked child inherited a Python SIGTERM handler that
+    is a no-op outside the server loop, so `terminate()` was ignored, the
+    join timed out, and each recycle leaked one ~0.8 GB process until the
+    worker was OOM-killed.
+    """
+
+    def test_a_recycled_child_dies_even_when_the_parent_traps_sigterm(self, tmp_path, monkeypatch):
+        # Reproduce the uvicorn situation: the FORKING process has a
+        # Python-level SIGTERM handler that does nothing useful in a child.
+        previous = signal.signal(signal.SIGTERM, lambda signum, frame: None)
+        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime, **_kw: ConvertResult("# ok"))
+        pool = crawler._ConvertProcessPool(1, recycle_after_docs=1, recycle_rss_bytes=0)
+        try:
+            pool.start()
+            retiree = pool._procs[0]
+            # Sibling forked AFTER the retiree — holds an inherited copy of
+            # the retiree's pipe fd, so closing the parent's end alone can
+            # never deliver EOF to the retiree (the second half of the leak).
+            assert pool._spare_procs[0] and pool._spare_procs[0][0].is_alive()
+            f = tmp_path / "doc.txt"
+            f.write_bytes(b"x")
+            assert pool.convert(0, f, "text/plain").ok  # budget 1 -> recycles
+            assert pool._procs[0] is not retiree
+            deadline = time.monotonic() + 10
+            while retiree.is_alive() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert not retiree.is_alive(), "the retired conversion child must not outlive its slot"
+            assert retiree.exitcode is not None, "and it must be REAPED, not left a zombie"
+        finally:
+            pool.shutdown()
+            signal.signal(signal.SIGTERM, previous)
+
+    def test_retire_escalates_to_sigkill_when_sigterm_is_ignored(self):
+        class _StubbornProc:
+            def __init__(self) -> None:
+                self.calls: List[str] = []
+                self._alive = True
+
+            def is_alive(self) -> bool:
+                return self._alive
+
+            def terminate(self) -> None:
+                self.calls.append("terminate")  # ignored, like an inherited no-op handler
+
+            def kill(self) -> None:
+                self.calls.append("kill")
+                self._alive = False
+
+            def join(self, timeout: Optional[float] = None) -> None:
+                self.calls.append(f"join({timeout})")
+
+        proc = _StubbornProc()
+        crawler._retire_process(proc, grace_s=0.01)
+        assert proc.calls == ["terminate", "join(0.01)", "kill", "join(0.01)"]
+        assert not proc.is_alive()
+
+    def test_retire_stops_at_sigterm_for_a_cooperative_child(self):
+        class _PoliteProc:
+            def __init__(self) -> None:
+                self.calls: List[str] = []
+                self._alive = True
+
+            def is_alive(self) -> bool:
+                return self._alive
+
+            def terminate(self) -> None:
+                self.calls.append("terminate")
+                self._alive = False
+
+            def kill(self) -> None:
+                self.calls.append("kill")
+
+            def join(self, timeout: Optional[float] = None) -> None:
+                self.calls.append("join")
+
+        proc = _PoliteProc()
+        crawler._retire_process(proc)
+        assert proc.calls == ["terminate", "join"], "no SIGKILL for a child that honoured SIGTERM"
+
+    def test_child_resets_inherited_sigterm_to_default(self):
+        previous = signal.signal(signal.SIGTERM, lambda signum, frame: None)
+        try:
+            ctx = crawler.multiprocessing.get_context("fork")
+            parent_conn, child_conn = ctx.Pipe(duplex=True)
+
+            def _report(conn):
+                crawler._reset_inherited_signal_handlers()
+                conn.send(signal.getsignal(signal.SIGTERM) is signal.SIG_DFL)
+
+            proc = ctx.Process(target=_report, args=(child_conn,))
+            proc.start()
+            child_conn.close()
+            assert parent_conn.poll(5), "child never reported"
+            assert parent_conn.recv() is True
+            proc.join(5)
+            # ...while the PARENT keeps the handler it had (a child must never
+            # reach back and change the forking process's dispositions).
+            assert signal.getsignal(signal.SIGTERM) is not signal.SIG_DFL
+        finally:
+            signal.signal(signal.SIGTERM, previous)
+
 
 class TestConvertProcessPoolItemTimeout:
     """`_ConvertProcessPool`'s per-item TIME bound — the fix for a real,
@@ -1397,7 +2907,7 @@ class TestConvertProcessPoolItemTimeout:
         return p
 
     def test_a_hung_worker_is_killed_after_the_timeout_and_counted_as_a_timeout(self, tmp_path, monkeypatch):
-        def _convert(path: Path, mime: str) -> Any:
+        def _convert(path: Path, mime: str, **_kw: Any) -> Any:
             time.sleep(30)  # far longer than the pool's own timeout below
             return ConvertResult("# never reached")
 
@@ -1423,7 +2933,7 @@ class TestConvertProcessPoolItemTimeout:
         assert first_pid != pool._procs[0].pid if pool._procs[0] else True
 
     def test_the_slot_recovers_via_the_pre_forked_spare_and_keeps_converting(self, tmp_path, monkeypatch):
-        def _convert(path: Path, mime: str) -> Any:
+        def _convert(path: Path, mime: str, **_kw: Any) -> Any:
             # Keyed off the FILE's own content, not a shared counter: each
             # forked child (the active worker AND its pre-forked spare) gets
             # an independent copy of any closure state at fork time, so a
@@ -1450,13 +2960,38 @@ class TestConvertProcessPoolItemTimeout:
             pool.shutdown()
 
     def test_zero_disables_the_bound_the_pre_fix_behaviour_exactly(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime: ConvertResult("# ok"))
+        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime, **_kw: ConvertResult("# ok"))
         pool = crawler._ConvertProcessPool(1, timeout_s=0)
         pool.start()
         try:
             f = self._write(tmp_path, "doc.txt", b"fine")
             outcome = pool.convert(0, f, "text/plain")
             assert outcome.ok
+        finally:
+            pool.shutdown()
+
+    def test_the_shorter_of_timeout_and_the_rss_guard_fires(self, tmp_path, monkeypatch):
+        """Both bounds share one polling loop (`_ConvertProcessPool._await_reply`)
+        — whichever crosses first raises its OWN exception type, never the
+        other's. A per-item timeout well under the RSS watchdog's own poll
+        cadence (`_RSS_WATCHDOG_POLL_INTERVAL_S`) must fire as a plain
+        timeout, not be masked by an RSS check that would only run AFTER a
+        poll interval elapses."""
+
+        def _convert(path: Path, mime: str, **_kw: Any) -> Any:
+            time.sleep(30)
+            return ConvertResult("# never reached")
+
+        monkeypatch.setattr(crawler, "convert_to_markdown", _convert)
+        # A cap high enough that a real forked child's RSS could never
+        # cross it in the short time this test runs — if the guard fired
+        # here it would prove the two bounds are wired together wrong.
+        pool = crawler._ConvertProcessPool(1, timeout_s=0.1, max_rss_bytes=10 * 1024 * 1024 * 1024)
+        pool.start()
+        try:
+            f = self._write(tmp_path, "doc.txt", b"fine")
+            with pytest.raises(crawler._ConvertTimedOut):
+                pool.convert(0, f, "application/octet-stream")
         finally:
             pool.shutdown()
 
@@ -1480,7 +3015,9 @@ class TestConvertChildMemoryLimit:
         that names the cause plainly and attributes it to THIS file, never
         a bare `MemoryError` a reader has to already know the mechanism to
         interpret."""
-        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime: (_ for _ in ()).throw(MemoryError()))
+        monkeypatch.setattr(
+            crawler, "convert_to_markdown", lambda path, mime, **_kw: (_ for _ in ()).throw(MemoryError())
+        )
 
         def handler(request: httpx.Request) -> httpx.Response:
             if str(request.url).endswith("/content"):
@@ -1509,7 +3046,7 @@ class TestConvertChildMemoryLimit:
         convert normally, not lose the whole child to an unhandled
         exception raised while merely trying to install its own safety
         net."""
-        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime: ConvertResult("# ok"))
+        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime, **_kw: ConvertResult("# ok"))
         # 1 MiB: far below what even a bare Python interpreter maps, so on
         # a platform that DOES enforce this it would fail every real
         # conversion too -- the point here is only that installing it does
@@ -1523,20 +3060,16 @@ class TestConvertChildMemoryLimit:
 
     @staticmethod
     def _current_vsz_bytes() -> int:
-        """This (the TEST) process's own current virtual memory size, from
-        /proc/self/status -- Linux only, which is fine since every caller
-        is itself gated to Linux. A freshly forked child's own baseline
-        starts at approximately this, so it calibrates the test below
-        against whatever THIS runner's actual baseline happens to be,
-        rather than a guessed constant that could be a false positive (too
-        tight, tripped by ordinary interpreter overhead on a heavier CI
-        image) or a false negative (too loose to ever exercise the
-        ceiling) on a machine this test has never seen."""
-        with open("/proc/self/status") as f:
-            for line in f:
-                if line.startswith("VmSize:"):
-                    return int(line.split()[1]) * 1024  # kB -> bytes
-        raise RuntimeError("VmSize not found in /proc/self/status")
+        """This (the TEST) process's own current virtual memory size —
+        delegates to the production reader (`_own_vsize_bytes`) rather than
+        re-parsing `/proc/self/status` a second time, so the test's own
+        calibration and the code path it is testing can never silently
+        drift apart. Linux only, which is fine since every caller is
+        itself gated to Linux."""
+        vsz = crawler._own_vsize_bytes()
+        if vsz <= 0:
+            raise RuntimeError("VmSize not found in /proc/self/status")
+        return vsz
 
     @pytest.mark.skipif(sys.platform != "linux", reason="RLIMIT_AS is not reliably settable outside Linux")
     def test_a_runaway_allocation_is_capped_on_linux(self, tmp_path, monkeypatch):
@@ -1545,18 +3078,22 @@ class TestConvertChildMemoryLimit:
         memory pressure this guards against was observed. A conversion
         that tries to allocate well past a tight, real RLIMIT_AS ceiling
         gets a genuine MemoryError, attributed to the file that caused it,
-        not a SIGKILL that could be blamed on an innocent sibling."""
-        baseline = self._current_vsz_bytes()
-        limit = baseline + 100 * 1024 * 1024  # headroom over THIS runner's own baseline
+        not a SIGKILL that could be blamed on an innocent sibling.
+
+        `memory_limit_bytes` is HEADROOM above this (forked child's own,
+        inherited) process's VmSize now, not an absolute number — no need
+        to add this runner's own baseline by hand any more, the production
+        code does that."""
+        headroom = 100 * 1024 * 1024
         over_allocation = 400 * 1024 * 1024  # comfortably past that headroom either way
 
-        def _convert(path, mime):
+        def _convert(path, mime, **_kw):
             data = bytearray(over_allocation)
             data[0] = 1
             return ConvertResult("# ok")
 
         monkeypatch.setattr(crawler, "convert_to_markdown", _convert)
-        pool = crawler._ConvertProcessPool(1, memory_limit_bytes=limit)
+        pool = crawler._ConvertProcessPool(1, memory_limit_bytes=headroom)
         pool.start()
         try:
             f = tmp_path / "doc.txt"
@@ -1564,6 +3101,278 @@ class TestConvertChildMemoryLimit:
             outcome = pool.convert(0, f, "text/plain")
             assert not outcome.ok
             assert outcome.detail_type == "MemoryError"
+        finally:
+            pool.shutdown()
+
+    @pytest.mark.skipif(sys.platform != "linux", reason="RLIMIT_AS is not reliably settable outside Linux")
+    def test_the_cap_is_headroom_above_this_workers_own_footprint_not_an_absolute_ceiling(self, tmp_path, monkeypatch):
+        """The exact live-deployment bug this fixes: on a 64-vCPU worker
+        whose OWN VmSize was already ~2.2 GB at fork time, the OLD
+        absolute-ceiling reading treated a 1536 MB
+        `convert_child_memory_limit_mb` as already exceeded before any
+        document was even touched — every child died on import, reading
+        as "not installed". HALF of this runner's own actual baseline is
+        by construction smaller than the baseline itself on any real
+        process — never a guessed absolute constant that could be a false
+        positive on a leaner CI image or a false negative on a heavier
+        one, the exact trap `_current_vsz_bytes` was written to avoid. A
+        modest, ordinary allocation must still succeed under it, proving
+        the cap is no longer read as absolute."""
+        own_baseline = self._current_vsz_bytes()
+        small_headroom = own_baseline // 2
+        modest_allocation = 1024 * 1024  # 1 MiB: far smaller than any real process's own footprint
+
+        def _convert(path, mime, **_kw):
+            data = bytearray(modest_allocation)
+            data[0] = 1
+            return ConvertResult("# ok")
+
+        monkeypatch.setattr(crawler, "convert_to_markdown", _convert)
+        pool = crawler._ConvertProcessPool(1, memory_limit_bytes=small_headroom)
+        pool.start()
+        try:
+            f = tmp_path / "doc.txt"
+            f.write_bytes(b"x")
+            outcome = pool.convert(0, f, "text/plain")
+            assert outcome.ok, outcome.detail
+        finally:
+            pool.shutdown()
+
+    @pytest.mark.skipif(sys.platform != "linux", reason="/proc/self/status is Linux-only")
+    def test_effective_limit_adds_headroom_to_this_processs_own_vsize(self):
+        own_vsize = self._current_vsz_bytes()
+        headroom = 100 * 1024 * 1024
+        effective = crawler._effective_memory_limit_bytes(headroom)
+        # A small tolerance for whatever this process allocated between the
+        # two /proc reads (this method's own and the production call's).
+        assert own_vsize + headroom <= effective <= own_vsize + headroom + 8 * 1024 * 1024
+
+    def test_effective_limit_falls_back_to_the_bare_value_when_vsize_is_unreadable(self, monkeypatch):
+        """Non-Linux (no `/proc`), or a malformed/inaccessible
+        `/proc/self/status`: `_own_vsize_bytes` returns 0, and the
+        effective limit falls back to `limit_bytes` alone — the pre-fix
+        behaviour, never a crash."""
+        monkeypatch.setattr(crawler, "_own_vsize_bytes", lambda: 0)
+        assert crawler._effective_memory_limit_bytes(123) == 123
+
+    def test_pool_start_logs_the_effective_ceiling_once(self, monkeypatch, caplog):
+        monkeypatch.setattr(crawler, "_effective_memory_limit_bytes", lambda limit_bytes: limit_bytes + 999)
+        pool = crawler._ConvertProcessPool(2, memory_limit_bytes=1024 * 1024)
+        with caplog.at_level(logging.INFO):
+            pool.start()
+        try:
+            info_records = [r for r in caplog.records if r.levelno == logging.INFO and "RLIMIT_AS ceiling" in r.message]
+            assert len(info_records) == 1, "expected exactly one ceiling log line, not one per slot"
+        finally:
+            pool.shutdown()
+
+    def test_pool_start_logs_nothing_when_the_cap_is_disabled(self, monkeypatch, caplog):
+        pool = crawler._ConvertProcessPool(1, memory_limit_bytes=0)
+        with caplog.at_level(logging.INFO):
+            pool.start()
+        try:
+            assert not any("RLIMIT_AS ceiling" in r.message for r in caplog.records)
+        finally:
+            pool.shutdown()
+
+    # ------------------------------------------------------------------
+    # The per-child RSS watchdog (`convert_child_max_rss_mb`,
+    # `_ConvertProcessPool._await_reply`/`_child_rss_bytes`) — a live
+    # deployment finding DISTINCT from the RLIMIT_AS tests above: that
+    # ceiling is HEADROOM above the worker's own VmSize *at fork time*, so
+    # on a crawl parent that has grown for hours (VmSize 6-15 GB), a single
+    # child converting one huge document still reached 10-17 GB RSS before
+    # RLIMIT_AS ever fired; with ~80 concurrent children a replica climbed
+    # to 115 GB and had to be SIGKILLed by a host-level watchdog OUTSIDE
+    # this pool's own accounting, which then attributed the loss to
+    # whatever file happened to be in flight AND left the slot dead until
+    # the next page boundary. This watchdog polls the CHILD's own real RSS
+    # from the PARENT and kills it directly — bounding how much THIS
+    # conversion GREW the child over the baseline read at the start of the
+    # call, never its absolute RSS: a forked child's VmRSS begins as every
+    # copy-on-write page shared with the parent (9-15 GB on a parent that
+    # has crawled for hours), and an absolute ceiling killed every child at
+    # its first poll (live finding, 2026-09) — reusing the exact
+    # `_reclaim_timed_out_slot` recovery a per-item timeout already has.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _rss_sequence(*readings_mb: int):
+        """A `_child_rss_bytes` stub that answers the given readings in order
+        (the first one is the watchdog's BASELINE) and repeats the last."""
+        values = [mb * 1024 * 1024 for mb in readings_mb]
+        calls = {"n": 0}
+
+        def _fake(pid):
+            i = min(calls["n"], len(values) - 1)
+            calls["n"] += 1
+            return values[i]
+
+        return _fake
+
+    @staticmethod
+    def _write(tmp_path: Path, name: str, content: bytes) -> Path:
+        p = tmp_path / name
+        p.write_bytes(content)
+        return p
+
+    def test_the_watchdog_is_disabled_when_max_rss_bytes_is_zero(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime, **_kw: ConvertResult("# ok"))
+        polled = {"n": 0}
+
+        def _fake_rss(pid):
+            polled["n"] += 1
+            return 999 * 1024 * 1024
+
+        monkeypatch.setattr(crawler, "_child_rss_bytes", _fake_rss)
+        pool = crawler._ConvertProcessPool(1, max_rss_bytes=0)
+        pool.start()
+        try:
+            f = self._write(tmp_path, "doc.txt", b"fine")
+            outcome = pool.convert(0, f, "text/plain")
+            assert outcome.ok
+        finally:
+            pool.shutdown()
+        assert polled["n"] == 0, "the watchdog must never poll RSS at all when its knob is 0"
+
+    def test_watchdog_kills_a_child_whose_rss_crosses_the_ceiling(self, tmp_path, monkeypatch):
+        """Portable: `_child_rss_bytes` is `/proc`-based (Linux-only — see
+        its own docstring), so this drives the watchdog's DECISION through
+        a stub rather than a real allocation, the same way
+        `_effective_memory_limit_bytes`'s own tests stub `_own_vsize_bytes`
+        — see `test_a_runaway_childs_rss_is_caught_by_the_real_watchdog_on_linux`
+        below for the real, Linux-only enforcement."""
+
+        def _convert(path: Path, mime: str, **_kw: Any) -> Any:
+            time.sleep(30)  # never reached — the watchdog kills this child first
+            return ConvertResult("# never reached")
+
+        monkeypatch.setattr(crawler, "convert_to_markdown", _convert)
+        # Baseline 9 000 MB (a child born from a big parent), then 9 999 MB:
+        # the guard must fire on the 999 MB of GROWTH, and report exactly it.
+        monkeypatch.setattr(crawler, "_child_rss_bytes", self._rss_sequence(9000, 9999))
+        pool = crawler._ConvertProcessPool(1, max_rss_bytes=100 * 1024 * 1024)
+        pool.start()
+        try:
+            first_pid = pool._procs[0].pid
+            f = self._write(tmp_path, "doc.txt", b"fine")
+            started = time.monotonic()
+            with pytest.raises(crawler._ConvertMemoryGuard) as exc_info:
+                pool.convert(0, f, "application/octet-stream")
+            elapsed = time.monotonic() - started
+            # Bounded near the poll interval, not the 30s sleep — the whole
+            # point of killing rather than waiting it out.
+            assert elapsed < 5
+            assert exc_info.value.rss_bytes == 999 * 1024 * 1024
+            assert exc_info.value.limit_bytes == 100 * 1024 * 1024
+        finally:
+            pool.shutdown()
+        # The offending worker was actually killed.
+        assert first_pid != pool._procs[0].pid if pool._procs[0] else True
+
+    def test_the_slot_recovers_via_the_spare_after_a_memory_guard_kill(self, tmp_path, monkeypatch):
+        def _convert(path: Path, mime: str, **_kw: Any) -> Any:
+            if Path(path).read_bytes() == b"HOG-ME":
+                time.sleep(30)
+            return ConvertResult("# ok")
+
+        monkeypatch.setattr(crawler, "convert_to_markdown", _convert)
+        monkeypatch.setattr(crawler, "_child_rss_bytes", self._rss_sequence(9000, 9999))
+        pool = crawler._ConvertProcessPool(1, max_rss_bytes=100 * 1024 * 1024)
+        pool.start()
+        try:
+            f_hog = self._write(tmp_path, "hog.xlsx", b"HOG-ME")
+            f_ok = self._write(tmp_path, "ok.txt", b"fine")
+            with pytest.raises(crawler._ConvertMemoryGuard):
+                pool.convert(0, f_hog, "application/octet-stream")
+            # The SAME slot, on the promoted spare, answers the next file —
+            # no crawl-level repair() needed, exactly like a timeout.
+            outcome = pool.convert(0, f_ok, "text/plain")
+            assert outcome.ok
+        finally:
+            pool.shutdown()
+
+    def test_the_watchdog_never_fires_when_rss_cannot_be_read(self, tmp_path, monkeypatch):
+        """No `/proc` (this repo's own macOS test run, or any non-Linux
+        deployment target) must turn the watchdog into a pure no-op —
+        never a raised `_ConvertMemoryGuard` — see `_child_rss_bytes`'s own
+        `None` sentinel. Bounded here by ALSO enabling the per-item
+        timeout, so a platform where the watchdog silently does nothing
+        still eventually reclaims a hung worker through the OTHER bound,
+        exactly as before the RSS watchdog existed."""
+
+        def _convert(path: Path, mime: str, **_kw: Any) -> Any:
+            time.sleep(30)
+            return ConvertResult("# never reached")
+
+        monkeypatch.setattr(crawler, "convert_to_markdown", _convert)
+        monkeypatch.setattr(crawler, "_child_rss_bytes", lambda pid: None)
+        # An absurdly low cap that would fire instantly if `_child_rss_bytes`
+        # ever returned a real number — proving the `None` path truly never
+        # raises the guard, rather than merely being unlikely to trigger.
+        pool = crawler._ConvertProcessPool(1, max_rss_bytes=1, timeout_s=0.3)
+        pool.start()
+        try:
+            f = self._write(tmp_path, "doc.txt", b"fine")
+            with pytest.raises(crawler._ConvertTimedOut):
+                pool.convert(0, f, "application/octet-stream")
+        finally:
+            pool.shutdown()
+
+    def test_prepare_document_words_a_memory_guard_failure_attributably(self, tmp_path):
+        """`_prepare_document` must never reuse `_convert_crash_detail`'s
+        "may not be this file's fault" wording for a guard THIS pool fired
+        itself — see `_convert_memory_guard_detail`."""
+
+        class _FakePool:
+            def convert(self, slot: int, tmp_path: Path, mime: str, **_kw: Any) -> Any:
+                raise crawler._ConvertMemoryGuard(rss_bytes=999 * 1024 * 1024, limit_bytes=512 * 1024 * 1024)
+
+        f = self._write(tmp_path, "doc.txt", b"x")
+        prepared = crawler._prepare_document(
+            f,
+            mime="text/plain",
+            path="doc.txt",
+            name="doc.txt",
+            anonymize=False,
+            anonymization_key=None,
+            detector=None,
+            convert_pool=_FakePool(),
+            convert_slot=0,
+        )
+        assert prepared.outcome == "convert_failed"
+        assert "exceeded the conversion memory guard" in prepared.detail
+        assert "999" in prepared.detail
+        assert "may not be this file's fault" not in prepared.detail
+
+    def test_convert_memory_guard_detail_wording(self):
+        detail = crawler._convert_memory_guard_detail(1234 * 1024 * 1024)
+        assert "exceeded the conversion memory guard" in detail
+        assert "1234 MB RSS" in detail
+
+    @pytest.mark.skipif(sys.platform != "linux", reason="/proc/<pid>/status is Linux-only")
+    def test_a_runaway_childs_rss_is_caught_by_the_real_watchdog_on_linux(self, tmp_path, monkeypatch):
+        """The REAL enforcement, not a simulation — only meaningful (and
+        only run) on Linux, this module's deployment target and where the
+        memory pressure this guards against was observed."""
+
+        def _convert(path, mime, **_kw):
+            _hog = bytearray(200 * 1024 * 1024)  # noqa: F841 — zero-fills, forcing real RSS growth
+            time.sleep(10)  # long enough for the parent's watchdog to notice and kill
+            return ConvertResult("# never reached")
+
+        monkeypatch.setattr(crawler, "convert_to_markdown", _convert)
+        # RLIMIT_AS disabled here — this test is about the RSS watchdog
+        # specifically, not about the two mechanisms racing each other.
+        pool = crawler._ConvertProcessPool(1, max_rss_bytes=50 * 1024 * 1024, memory_limit_bytes=0)
+        pool.start()
+        try:
+            f = self._write(tmp_path, "doc.txt", b"x")
+            started = time.monotonic()
+            with pytest.raises(crawler._ConvertMemoryGuard) as exc_info:
+                pool.convert(0, f, "application/octet-stream")
+            assert time.monotonic() - started < 8
+            assert exc_info.value.rss_bytes >= 50 * 1024 * 1024
         finally:
             pool.shutdown()
 
@@ -1591,7 +3400,7 @@ class TestConvertedOutputSizeCap:
     """
 
     def test_a_converted_output_over_the_cap_is_refused_before_it_crosses_the_pipe(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime: ConvertResult("x" * 2000))
+        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime, **_kw: ConvertResult("x" * 2000))
         pool = crawler._ConvertProcessPool(1, max_output_bytes=1000)
         pool.start()
         try:
@@ -1607,7 +3416,7 @@ class TestConvertedOutputSizeCap:
             pool.shutdown()
 
     def test_a_converted_output_within_the_cap_is_returned_normally(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime: ConvertResult("small"))
+        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime, **_kw: ConvertResult("small"))
         pool = crawler._ConvertProcessPool(1, max_output_bytes=1_000_000)
         pool.start()
         try:
@@ -1620,7 +3429,7 @@ class TestConvertedOutputSizeCap:
             pool.shutdown()
 
     def test_zero_disables_the_cap(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime: ConvertResult("x" * 5000))
+        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime, **_kw: ConvertResult("x" * 5000))
         pool = crawler._ConvertProcessPool(1, max_output_bytes=0)
         pool.start()
         try:
@@ -1638,7 +3447,7 @@ class TestConvertedOutputSizeCap:
         this cap's message never carries document content — only byte
         counts — so it is safe to show verbatim on BOTH kinds of scope, the
         same way a `MemoryError` outcome already is."""
-        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime: ConvertResult("x" * 2000))
+        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime, **_kw: ConvertResult("x" * 2000))
         pool = crawler._ConvertProcessPool(1, max_output_bytes=1000)
         pool.start()
         try:
@@ -1662,7 +3471,7 @@ class TestConvertedOutputSizeCap:
             pool.shutdown()
 
     def test_a_crawl_end_to_end_counts_an_oversized_conversion_as_convert_failed(self, crawl_env, monkeypatch):
-        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime: ConvertResult("x" * 5000))
+        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime, **_kw: ConvertResult("x" * 5000))
         monkeypatch.setattr(crawler, "_max_converted_output_bytes", lambda: 1000)
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -2143,6 +3952,473 @@ class TestScopes:
 
 
 # --------------------------------------------------------------------------
+# min_modified age filter (connection.config.extraction.crawl.min_modified)
+# --------------------------------------------------------------------------
+
+
+def _with_min_modified(scope: Dict[str, Any], cutoff: str) -> Dict[str, Any]:
+    conn = _connection([scope])
+    conn["config"]["extraction"] = {"crawl": {"min_modified": cutoff}}
+    return conn
+
+
+class TestResolveMinModified:
+    """``crawler.resolve_min_modified`` — a SCOPE's own override first
+    (TCRD-296 gap #80), the connection-wide default second, absent means no
+    filter, mirroring the ``(value, source)`` shape of
+    ``facts_extraction.resolve_retry_mode``. Every pre-gap-#80 call site
+    passes no ``scope`` at all and is covered unchanged by the first block
+    below; ``TestScopeMinModifiedFilter`` covers the resolution end-to-end
+    through an actual crawl."""
+
+    def test_no_connection_is_unfiltered(self):
+        assert crawler.resolve_min_modified(None) == (None, "none")
+
+    def test_a_connection_that_sets_nothing_is_unfiltered(self):
+        connection = {"id": "conn1", "config": {}}
+        assert crawler.resolve_min_modified(connection) == (None, "none")
+
+    def test_a_connection_override_sets_the_cutoff(self):
+        connection = {"id": "conn1", "config": {"extraction": {"crawl": {"min_modified": "2023-12-31"}}}}
+        assert crawler.resolve_min_modified(connection) == (date(2023, 12, 31), "connection")
+
+    def test_an_invalid_connection_override_is_ignored_and_logged(self, caplog):
+        connection = {"id": "conn1", "config": {"extraction": {"crawl": {"min_modified": "not-a-date"}}}}
+        with caplog.at_level(logging.WARNING):
+            assert crawler.resolve_min_modified(connection) == (None, "none")
+        assert "min_modified" in caplog.text
+
+    def test_a_blank_connection_override_is_unfiltered(self):
+        connection = {"id": "conn1", "config": {"extraction": {"crawl": {"min_modified": ""}}}}
+        assert crawler.resolve_min_modified(connection) == (None, "none")
+
+    # -- scope= (TCRD-296 gap #80) -----------------------------------------
+
+    def test_no_scope_falls_back_to_the_connection_default(self):
+        connection = {"id": "conn1", "config": {"extraction": {"crawl": {"min_modified": "2023-12-31"}}}}
+        assert crawler.resolve_min_modified(connection, scope=None) == (date(2023, 12, 31), "connection")
+
+    def test_a_scope_with_no_own_override_falls_back_to_the_connection_default(self):
+        connection = {"id": "conn1", "config": {"extraction": {"crawl": {"min_modified": "2023-12-31"}}}}
+        scope = {"source_scope_id": "s1"}
+        assert crawler.resolve_min_modified(connection, scope=scope) == (date(2023, 12, 31), "connection")
+
+    def test_a_scopes_own_override_wins_over_the_connection_default(self):
+        connection = {"id": "conn1", "config": {"extraction": {"crawl": {"min_modified": "2023-01-01"}}}}
+        scope = {"source_scope_id": "s1", "min_modified": "2024-06-01"}
+        assert crawler.resolve_min_modified(connection, scope=scope) == (date(2024, 6, 1), "scope")
+
+    def test_a_scopes_own_override_applies_even_with_no_connection_default(self):
+        connection = {"id": "conn1", "config": {}}
+        scope = {"source_scope_id": "s1", "min_modified": "2024-06-01"}
+        assert crawler.resolve_min_modified(connection, scope=scope) == (date(2024, 6, 1), "scope")
+
+    def test_an_invalid_scope_override_falls_back_to_the_connection_default_and_logs(self, caplog):
+        connection = {"id": "conn1", "config": {"extraction": {"crawl": {"min_modified": "2023-12-31"}}}}
+        scope = {"source_scope_id": "s1", "min_modified": "not-a-date"}
+        with caplog.at_level(logging.WARNING):
+            assert crawler.resolve_min_modified(connection, scope=scope) == (date(2023, 12, 31), "connection")
+        assert "min_modified" in caplog.text
+
+    def test_a_blank_scope_override_falls_back_to_the_connection_default(self):
+        connection = {"id": "conn1", "config": {"extraction": {"crawl": {"min_modified": "2023-12-31"}}}}
+        scope = {"source_scope_id": "s1", "min_modified": ""}
+        assert crawler.resolve_min_modified(connection, scope=scope) == (date(2023, 12, 31), "connection")
+
+    def test_neither_scope_nor_connection_set_is_unfiltered(self):
+        connection = {"id": "conn1", "config": {}}
+        scope = {"source_scope_id": "s1"}
+        assert crawler.resolve_min_modified(connection, scope=scope) == (None, "none")
+
+
+class TestIsValidCrawlSchedule:
+    """``crawler.is_valid_crawl_schedule`` — D.16's per-connection sweep
+    cadence, sharing its grammar with ``src.scheduler.is_valid_schedule``
+    (the SAME syntax ``extraction.schedule`` uses instance-wide) plus the
+    two sentinels ``off``/``instance``."""
+
+    @pytest.mark.parametrize(
+        "value",
+        ["off", "instance", "every 15m", "every 6h", "daily 03:00", "daily 07:00,13:00", "cron 0 3 * * *"],
+    )
+    def test_accepts_the_sentinels_and_every_scheduler_grammar_form(self, value):
+        assert crawler.is_valid_crawl_schedule(value) is True
+
+    @pytest.mark.parametrize("value", [None, "", "  ", "sometimes", "every 6 hours", "daily 25:00", "OFF"])
+    def test_rejects_anything_else(self, value):
+        assert crawler.is_valid_crawl_schedule(value) is False
+
+
+class TestResolveCrawlSchedule:
+    """``crawler.resolve_crawl_schedule`` — unlike ``resolve_min_modified``
+    this ALWAYS resolves to something usable: absent/invalid falls back to
+    ``CRAWL_SCHEDULE_INSTANCE``, the "follow the instance-wide sweep" default,
+    never to "no schedule at all"."""
+
+    def test_no_connection_follows_the_instance_default(self):
+        assert crawler.resolve_crawl_schedule(None) == ("instance", "default")
+
+    def test_a_connection_that_sets_nothing_follows_the_instance_default(self):
+        connection = {"id": "conn1", "config": {}}
+        assert crawler.resolve_crawl_schedule(connection) == ("instance", "default")
+
+    def test_a_connection_override_off_is_honored(self):
+        connection = {"id": "conn1", "config": {"extraction": {"crawl": {"schedule": "off"}}}}
+        assert crawler.resolve_crawl_schedule(connection) == ("off", "connection")
+
+    def test_a_connection_override_interval_is_honored(self):
+        connection = {"id": "conn1", "config": {"extraction": {"crawl": {"schedule": "every 6h"}}}}
+        assert crawler.resolve_crawl_schedule(connection) == ("every 6h", "connection")
+
+    def test_an_invalid_connection_override_falls_back_to_instance_default_and_is_logged(self, caplog):
+        connection = {"id": "conn1", "config": {"extraction": {"crawl": {"schedule": "sometimes"}}}}
+        with caplog.at_level(logging.WARNING):
+            assert crawler.resolve_crawl_schedule(connection) == ("instance", "default")
+        assert "schedule" in caplog.text
+
+    def test_a_blank_connection_override_follows_the_instance_default(self):
+        connection = {"id": "conn1", "config": {"extraction": {"crawl": {"schedule": ""}}}}
+        assert crawler.resolve_crawl_schedule(connection) == ("instance", "default")
+
+
+class TestMinModifiedFilter:
+    """Boundary rule: a cutoff of ``2023-12-31`` keeps items modified on
+    2023-12-31T00:00:00Z or later — strictly-before is filtered. An item
+    whose age cannot be determined is always kept (never silently dropped)
+    and counted separately as ``age_unknown``."""
+
+    def test_item_modified_before_the_cutoff_is_filtered_and_not_ingested(self, crawl_env, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(
+                200,
+                json={
+                    "value": [_file_item(modified="2023-12-30T23:59:59Z")],
+                    "@odata.deltaLink": f"{DRIVE_DELTA}?t=1",
+                },
+            )
+
+        _install_graph(monkeypatch, handler)
+        conn = _with_min_modified(_drive_scope(drive_id="b!drive1"), "2023-12-31")
+        report = _run(conn, monkeypatch)
+
+        assert report["filtered_by_age"] == 1
+        assert FakeIngestor.instances[-1].ingested == []
+
+    def test_item_modified_exactly_at_cutoff_midnight_utc_is_kept(self, crawl_env, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(
+                200,
+                json={
+                    "value": [_file_item(modified="2023-12-31T00:00:00Z")],
+                    "@odata.deltaLink": f"{DRIVE_DELTA}?t=1",
+                },
+            )
+
+        _install_graph(monkeypatch, handler)
+        conn = _with_min_modified(_drive_scope(drive_id="b!drive1"), "2023-12-31")
+        report = _run(conn, monkeypatch)
+
+        assert report["filtered_by_age"] == 0
+        assert [row["stable_id"] for row in FakeIngestor.instances[-1].ingested] == ["graph:item1"]
+
+    def test_item_modified_after_the_cutoff_is_kept(self, crawl_env, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(
+                200,
+                json={
+                    "value": [_file_item(modified="2024-01-15T09:00:00Z")],
+                    "@odata.deltaLink": f"{DRIVE_DELTA}?t=1",
+                },
+            )
+
+        _install_graph(monkeypatch, handler)
+        conn = _with_min_modified(_drive_scope(drive_id="b!drive1"), "2023-12-31")
+        report = _run(conn, monkeypatch)
+
+        assert report["filtered_by_age"] == 0
+        assert [row["stable_id"] for row in FakeIngestor.instances[-1].ingested] == ["graph:item1"]
+
+    def test_an_item_with_no_modified_timestamp_is_kept_and_counted_as_age_unknown(self, crawl_env, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        _install_graph(monkeypatch, handler)
+        conn = _with_min_modified(_drive_scope(drive_id="b!drive1"), "2023-12-31")
+        report = _run(conn, monkeypatch)
+
+        assert report["filtered_by_age"] == 0
+        assert report["age_unknown"] == 1
+        assert [row["stable_id"] for row in FakeIngestor.instances[-1].ingested] == ["graph:item1"]
+
+    def test_file_system_info_timestamp_is_used_when_the_top_level_field_is_absent(self, crawl_env, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            item = _file_item()
+            item["fileSystemInfo"] = {"lastModifiedDateTime": "2023-01-01T00:00:00Z"}
+            return httpx.Response(200, json={"value": [item], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        _install_graph(monkeypatch, handler)
+        conn = _with_min_modified(_drive_scope(drive_id="b!drive1"), "2023-12-31")
+        report = _run(conn, monkeypatch)
+
+        assert report["filtered_by_age"] == 1
+        assert report["age_unknown"] == 0
+        assert FakeIngestor.instances[-1].ingested == []
+
+    def test_no_min_modified_configured_applies_no_filter(self, crawl_env, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(
+                200,
+                json={
+                    "value": [_file_item(modified="2001-01-01T00:00:00Z")],
+                    "@odata.deltaLink": f"{DRIVE_DELTA}?t=1",
+                },
+            )
+
+        _install_graph(monkeypatch, handler)
+        report = _run(_connection([_drive_scope(drive_id="b!drive1")]), monkeypatch)
+
+        assert report["filtered_by_age"] == 0
+        assert [row["stable_id"] for row in FakeIngestor.instances[-1].ingested] == ["graph:item1"]
+
+    def test_a_filtered_item_leaves_no_ctag_behind(self, crawl_env, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(
+                200,
+                json={
+                    "value": [_file_item(modified="2001-01-01T00:00:00Z")],
+                    "@odata.deltaLink": f"{DRIVE_DELTA}?t=1",
+                },
+            )
+
+        _install_graph(monkeypatch, handler)
+        conn = _with_min_modified(_drive_scope(drive_id="b!drive1"), "2023-12-31")
+        _run(conn, monkeypatch)
+
+        assert "graph:item1" not in _state(crawl_env)["ctags"]
+
+    def test_a_deleted_item_is_processed_for_deletion_regardless_of_the_filter(self, crawl_env, monkeypatch):
+        def handler_ingest(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(
+                200,
+                json={
+                    "value": [_file_item(modified="2001-01-01T00:00:00Z")],
+                    "@odata.deltaLink": f"{DRIVE_DELTA}?t=1",
+                },
+            )
+
+        _install_graph(monkeypatch, handler_ingest)
+        connection = _connection([_drive_scope(drive_id="b!drive1")])
+        _run(connection, monkeypatch)
+        assert FakeIngestor.instances[-1].ingested
+
+        def handler_delete(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "value": [{"id": "item1", "name": "brief.docx", "deleted": {"state": "deleted"}}],
+                    "@odata.deltaLink": f"{DRIVE_DELTA}?t=2",
+                },
+            )
+
+        _install_graph(monkeypatch, handler_delete)
+        connection["config"]["extraction"] = {"crawl": {"min_modified": "2023-12-31"}}
+        report = _run(connection, monkeypatch)
+
+        assert report["deleted"] == 1
+        assert FakeIngestor.instances[-1].deleted == ["graph:item1"]
+        assert "graph:item1" not in _state(crawl_env)["ctags"]
+
+
+# --------------------------------------------------------------------------
+# Per-SCOPE min_modified override (TCRD-296 gap #80) — the filter belongs to
+# the scope's own definition, not just the connection's extraction-config
+# drawer. `resolve_min_modified`'s own unit tests (`TestResolveMinModified`)
+# cover the resolution rule in isolation; these drive it end-to-end through
+# an actual inline crawl (`_run_crawl_async`'s per-scope loop).
+# --------------------------------------------------------------------------
+
+
+class TestScopeMinModifiedFilter:
+    def test_a_scopes_own_filter_applies_even_with_no_connection_default(self, crawl_env, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(
+                200,
+                json={
+                    "value": [_file_item(modified="2023-01-01T00:00:00Z")],
+                    "@odata.deltaLink": f"{DRIVE_DELTA}?t=1",
+                },
+            )
+
+        _install_graph(monkeypatch, handler)
+        scope = _drive_scope(drive_id="b!drive1", min_modified="2024-01-01")
+        report = _run(_connection([scope]), monkeypatch)
+
+        assert report["filtered_by_age"] == 1
+        assert FakeIngestor.instances[-1].ingested == []
+
+    def test_a_scopes_own_filter_wins_over_a_wider_connection_default(self, crawl_env, monkeypatch):
+        """The connection default alone would KEEP this item (it is after
+        2020-01-01) — the scope's own, later cutoff must still filter it."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(
+                200,
+                json={
+                    "value": [_file_item(modified="2023-01-01T00:00:00Z")],
+                    "@odata.deltaLink": f"{DRIVE_DELTA}?t=1",
+                },
+            )
+
+        _install_graph(monkeypatch, handler)
+        scope = _drive_scope(drive_id="b!drive1", min_modified="2024-01-01")
+        conn = _connection([scope])
+        conn["config"]["extraction"] = {"crawl": {"min_modified": "2020-01-01"}}
+        report = _run(conn, monkeypatch)
+
+        assert report["filtered_by_age"] == 1
+        assert FakeIngestor.instances[-1].ingested == []
+
+    def test_a_scope_without_its_own_filter_still_inherits_the_connection_default(self, crawl_env, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(
+                200,
+                json={
+                    "value": [_file_item(modified="2019-01-01T00:00:00Z")],
+                    "@odata.deltaLink": f"{DRIVE_DELTA}?t=1",
+                },
+            )
+
+        _install_graph(monkeypatch, handler)
+        scope = _drive_scope(drive_id="b!drive1")  # no scope-level override
+        conn = _connection([scope])
+        conn["config"]["extraction"] = {"crawl": {"min_modified": "2020-01-01"}}
+        report = _run(conn, monkeypatch)
+
+        assert report["filtered_by_age"] == 1
+        assert FakeIngestor.instances[-1].ingested == []
+
+    def test_two_scopes_on_one_connection_apply_their_own_filters_independently(self, crawl_env, monkeypatch):
+        """Scope A has its own (later) cutoff; scope B has none and follows
+        the connection default — a run touching both must not let one
+        scope's resolved cutoff leak onto the other's items."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if url.endswith("/content"):
+                return _content_response()
+            if "b!drive1" in url and "/delta" in url:
+                return httpx.Response(
+                    200,
+                    json={
+                        "value": [_file_item("itemA", modified="2023-06-01T00:00:00Z")],
+                        "@odata.deltaLink": f"{DRIVE_DELTA}?scope=A&t=1",
+                    },
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "value": [_file_item("itemB", modified="2019-01-01T00:00:00Z")],
+                    "@odata.deltaLink": f"{DRIVE_DELTA}?scope=B&t=1",
+                },
+            )
+
+        _install_graph(monkeypatch, handler)
+        scope_a = _drive_scope(drive_id="b!drive1", min_modified="2024-01-01")  # filters itemA
+        scope_b = _drive_scope(source_scope_id="b!drive2", collection_id="col2", drive_id="b!drive2")
+        conn = _connection([scope_a, scope_b])
+        conn["config"]["extraction"] = {"crawl": {"min_modified": "2015-01-01"}}  # keeps itemB
+        report = _run(conn, monkeypatch)
+
+        assert report["filtered_by_age"] == 1
+        ingested_ids = {row["stable_id"] for row in FakeIngestor.instances[-1].ingested}
+        assert ingested_ids == {"graph:itemB"}
+
+    def test_an_invalid_scope_filter_falls_back_to_the_connection_default(self, crawl_env, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(
+                200,
+                json={
+                    "value": [_file_item(modified="2019-01-01T00:00:00Z")],
+                    "@odata.deltaLink": f"{DRIVE_DELTA}?t=1",
+                },
+            )
+
+        _install_graph(monkeypatch, handler)
+        scope = _drive_scope(drive_id="b!drive1", min_modified="not-a-date")
+        conn = _connection([scope])
+        conn["config"]["extraction"] = {"crawl": {"min_modified": "2020-01-01"}}
+        report = _run(conn, monkeypatch)
+
+        assert report["filtered_by_age"] == 1
+        assert FakeIngestor.instances[-1].ingested == []
+
+
+class TestShardChildScopeMinModifiedFilter:
+    """The shard child crawl path (`run_shard_crawl` ->
+    `_run_shard_crawl_async`) resolves the SAME per-scope filter as the
+    inline path above — a shard crawls exactly one scope, so this pins that
+    it is not left reading only the connection-wide default."""
+
+    def test_the_shard_childs_scope_applies_its_own_filter(self, crawl_env, monkeypatch):
+        _install_fake_state_store(monkeypatch, FakeStateStore())
+        _install_runs_repo(monkeypatch)
+        scope = _drive_scope(drive_id="b!drive1", min_modified="2024-01-01")
+        connection = _connection([scope])
+        monkeypatch.setattr("src.repositories.source_connections_repo", lambda: FakeSourceConnectionsRepo(connection))
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(
+                200,
+                json={
+                    "value": [_file_item(modified="2023-01-01T00:00:00Z")],
+                    "@odata.deltaLink": f"{DRIVE_DELTA}?t=1",
+                },
+            )
+
+        _install_graph(monkeypatch, handler)
+
+        shard = {
+            "scope_id": "b!drive1",
+            "label": "A",
+            "expected": 1,
+            "exclude_prefixes": [],
+            "targets": [{"drive_id": "b!drive1", "root_item_id": None, "state_key": "b!drive1", "path": "A"}],
+        }
+        report = crawler.run_shard_crawl(
+            {"connection_id": "conn1", "parent_run_id": "er_parent1", "shard_index": 1, "shard": shard}
+        )
+
+        assert report["filtered_by_age"] == 1
+        assert FakeIngestor.instances[-1].ingested == []
+
+
+# --------------------------------------------------------------------------
 # Permission-zone routing (TCRD-284)
 # --------------------------------------------------------------------------
 
@@ -2266,6 +4542,110 @@ class TestZoneRouting:
         assert report["deleted"] == 1
         assert FakeIngestor.instances[-1].deleted == ["graph:in-zone"]
         assert "graph:in-zone" not in _state(crawl_env)["ctags"]
+
+
+# --------------------------------------------------------------------------
+# Shared scope collection (bulk-add's `collection_id`/`collection` option,
+# or a post-consolidation re-point): several DIFFERENT scopes on ONE
+# connection can route to the SAME collection.
+# --------------------------------------------------------------------------
+
+
+class TestSharedScopeCollection:
+    """``_route_collection`` picks the deepest matching zone, else the
+    scope's own collection — nothing about that logic cares whether two
+    scopes happen to share the same ``collection_id``, but this is the
+    scenario a per-scope collection was never tested against before bulk-add
+    grew the option to point several scopes at one target. Two invariants
+    matter: every file from either scope lands in the shared collection, and
+    a delete driven by one scope's stable id never disturbs the other
+    scope's file — ``_Ingestor.delete`` is scoped by ``(collection_id,
+    stable_id)``, not by scope, so this only holds if the crawler always
+    passes the RIGHT collection id per file, never "whichever scope ran
+    last"."""
+
+    def test_two_scopes_sharing_a_collection_both_land_their_files_there(self, crawl_env, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if url.endswith("/content"):
+                return _content_response()
+            if "/drives/b!drive1/root/delta" in url:
+                return httpx.Response(
+                    200,
+                    json={
+                        "value": [_file_item("from-a", name="a.docx", parent_path="/drives/b!drive1/root:/Reports")],
+                        "@odata.deltaLink": f"{GRAPH}/drives/b!drive1/root/delta?t=1",
+                    },
+                )
+            if "/drives/b!drive2/root/delta" in url:
+                return httpx.Response(
+                    200,
+                    json={
+                        "value": [_file_item("from-b", name="b.docx", parent_path="/drives/b!drive2/root:/Reports")],
+                        "@odata.deltaLink": f"{GRAPH}/drives/b!drive2/root/delta?t=1",
+                    },
+                )
+            return httpx.Response(200, json={"value": [], "@odata.deltaLink": url})
+
+        _install_graph(monkeypatch, handler)
+        scopes = [
+            _drive_scope(source_scope_id="b!drive1", collection_id="shared_col"),
+            _drive_scope(source_scope_id="b!drive2", collection_id="shared_col"),
+        ]
+        _run(_connection(scopes), monkeypatch)
+
+        by_stable = {row["stable_id"]: row["collection_id"] for row in FakeIngestor.instances[-1].ingested}
+        assert by_stable == {"graph:from-a": "shared_col", "graph:from-b": "shared_col"}
+
+    def test_deleting_one_scopes_file_never_touches_the_other_scopes_file_in_the_shared_collection(
+        self, crawl_env, monkeypatch
+    ):
+        pages_a = iter(
+            [
+                {
+                    "value": [_file_item("from-a", name="a.docx", parent_path="/drives/b!drive1/root:/Reports")],
+                    "@odata.deltaLink": f"{GRAPH}/drives/b!drive1/root/delta?t=1",
+                },
+                {
+                    "value": [{"id": "from-a", "name": "a.docx", "deleted": {"state": "deleted"}}],
+                    "@odata.deltaLink": f"{GRAPH}/drives/b!drive1/root/delta?t=2",
+                },
+            ]
+        )
+        page_b = {
+            "value": [_file_item("from-b", name="b.docx", parent_path="/drives/b!drive2/root:/Reports")],
+            "@odata.deltaLink": f"{GRAPH}/drives/b!drive2/root/delta?t=1",
+        }
+        page_holder = {"a": next(pages_a)}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if url.endswith("/content"):
+                return _content_response()
+            if "/drives/b!drive1/root/delta" in url:
+                return httpx.Response(200, json=page_holder["a"])
+            if "/drives/b!drive2/root/delta" in url:
+                return httpx.Response(200, json=page_b)
+            return httpx.Response(200, json={"value": [], "@odata.deltaLink": url})
+
+        _install_graph(monkeypatch, handler)
+        scopes = [
+            _drive_scope(source_scope_id="b!drive1", collection_id="shared_col"),
+            _drive_scope(source_scope_id="b!drive2", collection_id="shared_col"),
+        ]
+        connection = _connection(scopes)
+
+        _run(connection, monkeypatch)
+        assert {row["stable_id"] for row in FakeIngestor.instances[-1].ingested} == {"graph:from-a", "graph:from-b"}
+
+        page_holder["a"] = next(pages_a)
+        report = _run(connection, monkeypatch)
+
+        assert report["deleted"] == 1
+        assert FakeIngestor.instances[-1].deleted == ["graph:from-a"]
+        # The OTHER scope's file, ingested into the SAME shared collection,
+        # is untouched by the delete driven by THIS scope's stable id.
+        assert FakeIngestor._collection_of.get("graph:from-b") == "shared_col"
 
 
 # --------------------------------------------------------------------------
@@ -2406,7 +4786,7 @@ class TestState:
         path = crawler.state_path("conn1")
         path.write_text("{not json")
         state = crawler.load_state("conn1")
-        assert state == {"delta_links": {}, "ctags": {}, "failed_items": {}}
+        assert state == {"delta_links": {}, "ctags": {}, "failed_items": {}, "empty_items": {}}
 
     def test_an_unsafe_connection_id_cannot_escape_the_state_directory(self, crawl_env):
         for bad in ("../../etc/passwd", "a/b", "..", ""):
@@ -2416,6 +4796,108 @@ class TestState:
     def test_state_survives_a_round_trip(self, crawl_env):
         crawler.save_state("conn1", {"delta_links": {"d": "u"}, "ctags": {"graph:1": "c"}})
         assert crawler.load_state("conn1")["ctags"] == {"graph:1": "c"}
+
+    def test_load_state_and_save_state_go_through_the_shared_state_store(self, crawl_env, monkeypatch):
+        """The crawler no longer owns state I/O directly — it delegates
+        through ``connectors.sharepoint.state_store``, which is what makes
+        ANY extraction worker resolvable to a connection's Postgres row
+        (horizontal-scale extraction workers). Proven here at the dispatch
+        level (kind="crawl", exact payload) rather than the filesystem
+        level the other tests in this class already cover."""
+        from connectors.sharepoint import state_store
+
+        calls = []
+        monkeypatch.setattr(state_store, "get", lambda kind, cid: calls.append(("get", kind, cid)) or None)
+        monkeypatch.setattr(state_store, "put", lambda kind, cid, payload: calls.append(("put", kind, cid, payload)))
+
+        state = crawler.load_state("conn1")
+        assert ("get", "crawl", "conn1") in calls
+        assert state == {"delta_links": {}, "ctags": {}, "failed_items": {}, "empty_items": {}}
+
+        crawler.save_state("conn1", {"delta_links": {"d": "u"}})
+        assert ("put", "crawl", "conn1", {"delta_links": {"d": "u"}}) in calls
+
+    def test_a_shard_key_is_encoded_as_a_crawl_colon_kind(self, crawl_env, monkeypatch):
+        """The write-side half of Task 1's ``save_for``: a shard child's
+        checkpoint must land in ITS OWN row, never the connection-level
+        one (2026-09-03 auto-parallel-crawl design §4.2)."""
+        from connectors.sharepoint import state_store
+
+        calls = []
+        monkeypatch.setattr(state_store, "get", lambda kind, cid: calls.append(("get", kind, cid)) or None)
+        monkeypatch.setattr(state_store, "put", lambda kind, cid, payload: calls.append(("put", kind, cid, payload)))
+
+        crawler.load_state("conn1", shard_key="b!drive1")
+        assert ("get", "crawl:b!drive1", "conn1") in calls
+
+        crawler.save_state("conn1", {"delta_links": {}}, shard_key="b!drive1")
+        assert ("put", "crawl:b!drive1", "conn1", {"delta_links": {}}) in calls
+
+        # The connection-level row (no shard_key) is untouched by either call.
+        assert not any(call[1] == "crawl" for call in calls)
+
+    def test_state_store_refuses_a_shard_kind_on_the_duckdb_fallback(self, crawl_env):
+        """A DuckDB-backed instance never shards (design §4.2) — asking the
+        state store to read/write a per-delta-unit row on that backend must
+        fail clean, not silently write somewhere unexpected."""
+        from connectors.sharepoint import state_store
+
+        with pytest.raises(state_store.StateStoreError):
+            state_store.get("crawl:b!drive1", "conn1")
+        with pytest.raises(state_store.StateStoreError):
+            state_store.put("crawl:b!drive1", "conn1", {})
+
+    def test_crawler_load_state_with_a_shard_key_refuses_on_duckdb(self, crawl_env):
+        from connectors.sharepoint.state_store import StateStoreError
+
+        with pytest.raises(StateStoreError):
+            crawler.load_state("conn1", shard_key="b!drive1")
+
+
+class TestRehomeLegacyBacklog:
+    """``crawler.rehome_legacy_backlog`` — the pure planner helper that
+    splits a legacy (connection-level) ``failed_items``/``empty_items`` dict
+    into per-shard groups by path prefix (2026-09-03 auto-parallel-crawl
+    design §4.2). No fixture needed: pure function, no I/O."""
+
+    def test_each_entry_lands_in_the_shard_whose_prefix_it_falls_under(self):
+        legacy = {
+            "graph:1": {"path": "Reports/Q1/a.docx"},
+            "graph:2": {"path": "Reports/Q2/b.docx"},
+            "graph:3": {"path": "Reports/Q1/nested/c.docx"},
+        }
+        shard_prefixes = [("shard-q1", "Reports/Q1"), ("shard-q2", "Reports/Q2")]
+
+        grouped = crawler.rehome_legacy_backlog(legacy, shard_prefixes)
+
+        assert set(grouped["shard-q1"]) == {"graph:1", "graph:3"}
+        assert set(grouped["shard-q2"]) == {"graph:2"}
+
+    def test_an_unmatched_entry_falls_back_to_the_last_pair(self):
+        """The last pair is, by convention, the remainder shard — its own
+        prefix is `""`, matching everything a more specific shard did not
+        claim, but this helper never assumes that; it just uses whatever
+        the caller put last."""
+        legacy = {"graph:1": {"path": "loose-file.docx"}}
+        shard_prefixes = [("shard-q1", "Reports/Q1"), ("remainder", "")]
+
+        grouped = crawler.rehome_legacy_backlog(legacy, shard_prefixes)
+
+        assert grouped == {"remainder": {"graph:1": {"path": "loose-file.docx"}}}
+
+    def test_more_specific_prefix_wins_over_a_shorter_one_when_ordered_first(self):
+        legacy = {"graph:1": {"path": "Reports/Q1/Nested/deep.docx"}}
+        shard_prefixes = [("nested-shard", "Reports/Q1/Nested"), ("q1-shard", "Reports/Q1")]
+
+        grouped = crawler.rehome_legacy_backlog(legacy, shard_prefixes)
+
+        assert grouped == {"nested-shard": {"graph:1": {"path": "Reports/Q1/Nested/deep.docx"}}}
+
+    def test_empty_shard_prefixes_returns_nothing(self):
+        assert crawler.rehome_legacy_backlog({"graph:1": {"path": "a.docx"}}, []) == {}
+
+    def test_empty_legacy_backlog_returns_nothing(self):
+        assert crawler.rehome_legacy_backlog({}, [("shard-a", "")]) == {}
 
 
 # --------------------------------------------------------------------------
@@ -2693,10 +5175,52 @@ class FakeRunsRepo:
         #: Connection ids `abandon_stale_running` should report as having
         #: closed something, for tests that want to see the log line fire.
         self.abandon_returns: List[str] = []
+        self.bump_parent_calls: List[str] = []
+        #: parent_run_id -> {"shards_done": int, "shards_total": int|None}
+        #: — mirrors `ExtractionRunsPgRepository.finish_shard`'s return.
+        self.shards: Dict[str, Dict[str, Any]] = {}
+        self.finalize_claims: List[str] = []
+        #: `mark_planned` calls — 2026-09-04 finding #65 item 3: the parent
+        #: row opens BEFORE `shards_total` is known, so it is set later,
+        #: separately from `start`.
+        self.marked_planned: List[Dict[str, Any]] = []
 
-    def start(self, *, connection_id, job_id=None, phase="crawl"):
-        self.started.append({"connection_id": connection_id, "job_id": job_id, "phase": phase})
-        return f"er_fake{len(self.started)}"
+    def start(
+        self,
+        *,
+        connection_id,
+        job_id=None,
+        phase="crawl",
+        parent_run_id=None,
+        shard_key=None,
+        shard_label=None,
+        shards_total=None,
+    ):
+        run_id = f"er_fake{len(self.started) + 1}"
+        self.started.append(
+            {
+                "run_id": run_id,
+                "connection_id": connection_id,
+                "job_id": job_id,
+                "phase": phase,
+                "parent_run_id": parent_run_id,
+                "shard_key": shard_key,
+                "shard_label": shard_label,
+                "shards_total": shards_total,
+            }
+        )
+        if shards_total is not None:
+            self.shards[run_id] = {"shards_done": 0, "shards_total": shards_total}
+        return run_id
+
+    def mark_planned(self, run_id, *, shards_total):
+        self.marked_planned.append({"run_id": run_id, "shards_total": shards_total})
+        for row in self.started:
+            if row.get("run_id") == run_id:
+                row["shards_total"] = shards_total
+                row["phase"] = "plan"
+                break
+        self.shards[run_id] = {"shards_done": 0, "shards_total": shards_total}
 
     def checkpoint(self, run_id, **kwargs):
         self.checkpoints.append({"run_id": run_id, **kwargs})
@@ -2707,6 +5231,23 @@ class FakeRunsRepo:
     def abandon_stale_running(self, connection_id):
         self.abandon_calls.append(connection_id)
         return list(self.abandon_returns)
+
+    def bump_parent_checkpoint(self, parent_run_id):
+        self.bump_parent_calls.append(parent_run_id)
+
+    def finish_shard(self, parent_run_id):
+        entry = self.shards.setdefault(parent_run_id, {"shards_done": 0, "shards_total": None})
+        entry["shards_done"] += 1
+        return dict(entry)
+
+    def claim_finalize(self, parent_run_id):
+        if parent_run_id in self.finalize_claims:
+            return False
+        self.finalize_claims.append(parent_run_id)
+        return True
+
+    def children_for(self, parent_run_ids):
+        return {pid: [] for pid in parent_run_ids}
 
 
 def _install_runs_repo(monkeypatch, repo=None):
@@ -2727,7 +5268,18 @@ class TestRunRecording:
         _install_graph(monkeypatch, handler)
         report = _run(_connection([_drive_scope()]), monkeypatch)
 
-        assert runs.started == [{"connection_id": "conn1", "job_id": None, "phase": "crawl"}]
+        assert runs.started == [
+            {
+                "run_id": "er_fake1",
+                "connection_id": "conn1",
+                "job_id": None,
+                "phase": "crawl",
+                "parent_run_id": None,
+                "shard_key": None,
+                "shard_label": None,
+                "shards_total": None,
+            }
+        ]
         assert runs.checkpoints, "the crawl's existing checkpoint must also write the run row"
         assert runs.checkpoints[-1]["files_done"] == 1
         # Enumeration is never claimed complete mid-run: the delta feed can
@@ -2802,6 +5354,31 @@ class TestRunRecording:
         assert "elapsed_s" in progress
         for forbidden in ("percent", "progress_pct", "eta_s", "eta", "files_per_s"):
             assert forbidden not in progress
+
+    def test_progress_surfaces_the_age_filter_counters(self, crawl_env, monkeypatch):
+        """An operator watching a LIVE run must be able to tell whether
+        `extraction.crawl.min_modified` is doing anything mid-run — not only
+        after the run finishes and `report()` becomes readable."""
+        runs = _install_runs_repo(monkeypatch)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(
+                200,
+                json={
+                    "value": [_file_item(modified="2023-12-30T23:59:59Z")],
+                    "@odata.deltaLink": f"{DRIVE_DELTA}?t=1",
+                },
+            )
+
+        _install_graph(monkeypatch, handler)
+        conn = _with_min_modified(_drive_scope(drive_id="b!drive1"), "2023-12-31")
+        _run(conn, monkeypatch)
+
+        progress = runs.checkpoints[-1]["progress"]
+        assert progress["filtered_by_age"] == 1
+        assert progress["age_unknown"] == 0
 
     def test_a_crashed_crawl_records_failed_not_interrupted(self, crawl_env, monkeypatch):
         """Severity-first: a crash is both "did not finish" and "broke". The
@@ -2985,7 +5562,7 @@ class TestRunRecording:
 
         from src.repositories.extraction_runs_pg import ExtractionRunsPgRepository
 
-        for name in ("start", "checkpoint", "finish", "abandon_stale_running"):
+        for name in ("start", "checkpoint", "finish", "abandon_stale_running", "mark_planned"):
             real = set(inspect.signature(getattr(ExtractionRunsPgRepository, name)).parameters)
             fake = set(inspect.signature(getattr(FakeRunsRepo, name)).parameters)
             # The fake absorbs the rest through **kwargs; what must match is
@@ -3397,6 +5974,94 @@ class TestConcurrencyResolution:
         assert report["new"] == 3
 
 
+_GIB = 1024**3
+
+
+class TestMemoryBudgetConcurrencyClamp:
+    """``_resolve_concurrency`` clamped DOWNWARD by the container's own
+    cgroup memory limit (TCRD-296 C.10) — never a new knob, never raises a
+    configured/payload cap, only lowers it."""
+
+    def test_a_v2_max_limit_means_unlimited_and_is_not_a_clamp(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sys, "platform", "linux")
+        v2 = tmp_path / "memory.max"
+        v2.write_text("max\n")
+        monkeypatch.setattr(crawler, "_CGROUP_V2_MEMORY_MAX_PATH", v2)
+        monkeypatch.setattr(crawler, "_CGROUP_V1_MEMORY_LIMIT_PATH", tmp_path / "no-v1-here")
+
+        assert crawler._cgroup_memory_limit_bytes() is None
+
+    def test_v2_limit_and_four_lanes_derive_a_cap_of_three(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sys, "platform", "linux")
+        v2 = tmp_path / "memory.max"
+        v2.write_text(str(32 * _GIB))
+        monkeypatch.setattr(crawler, "_CGROUP_V2_MEMORY_MAX_PATH", v2)
+
+        limit = crawler._cgroup_memory_limit_bytes()
+        assert limit == 32 * _GIB
+        # floor(32 GiB * 0.8 / (4 * 2 GiB)) = floor(3.2) = 3
+        assert crawler._memory_budget_cap(limit, lanes=4) == 3
+
+    def test_v1_fallback_and_one_lane_derive_a_cap_of_three(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sys, "platform", "linux")
+        # No v2 file — falls back to v1.
+        monkeypatch.setattr(crawler, "_CGROUP_V2_MEMORY_MAX_PATH", tmp_path / "no-v2-here")
+        v1 = tmp_path / "memory.limit_in_bytes"
+        v1.write_text(str(8 * _GIB))
+        monkeypatch.setattr(crawler, "_CGROUP_V1_MEMORY_LIMIT_PATH", v1)
+
+        limit = crawler._cgroup_memory_limit_bytes()
+        assert limit == 8 * _GIB
+        # floor(8 GiB * 0.8 / (1 * 2 GiB)) = floor(3.2) = 3
+        assert crawler._memory_budget_cap(limit, lanes=1) == 3
+
+    def test_the_clamp_never_raises_a_lower_configured_cap(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sys, "platform", "linux")
+        v2 = tmp_path / "memory.max"
+        v2.write_text(str(32 * _GIB))
+        monkeypatch.setattr(crawler, "_CGROUP_V2_MEMORY_MAX_PATH", v2)
+        monkeypatch.setattr("app.worker.runtime._extraction_concurrency", lambda: 4)
+
+        # The budget cap here is 3 (previous test) — a configured cap of 2
+        # must stay 2, never be raised to it.
+        cap, source = crawler._apply_memory_budget_cap(2, "config")
+        assert (cap, source) == (2, "config")
+
+    def test_the_run_report_names_memory_budget_as_the_source_when_it_clamps(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sys, "platform", "linux")
+        v2 = tmp_path / "memory.max"
+        v2.write_text(str(4 * _GIB))
+        monkeypatch.setattr(crawler, "_CGROUP_V2_MEMORY_MAX_PATH", v2)
+        monkeypatch.setattr("app.worker.runtime._extraction_concurrency", lambda: 1)
+        monkeypatch.setattr(crawler, "_crawl_concurrency", lambda: 6)
+
+        # floor(4 GiB * 0.8 / (1 * 2 GiB)) = floor(1.6) = 1, below the
+        # configured cap of 6 — the clamp fires and names itself.
+        cap, configured, source = crawler._resolve_concurrency(None)
+        assert (cap, configured, source) == (1, 6, "memory_budget")
+
+    def test_a_non_linux_platform_is_a_no_op(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sys, "platform", "darwin")
+        v2 = tmp_path / "memory.max"
+        v2.write_text(str(4 * _GIB))
+        monkeypatch.setattr(crawler, "_CGROUP_V2_MEMORY_MAX_PATH", v2)
+
+        assert crawler._cgroup_memory_limit_bytes() is None
+
+    def test_a_configured_cap_already_below_the_budget_keeps_its_own_source(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sys, "platform", "linux")
+        v2 = tmp_path / "memory.max"
+        v2.write_text(str(32 * _GIB))
+        monkeypatch.setattr(crawler, "_CGROUP_V2_MEMORY_MAX_PATH", v2)
+        monkeypatch.setattr("app.worker.runtime._extraction_concurrency", lambda: 4)
+        monkeypatch.setattr(crawler, "_crawl_concurrency", lambda: 2)
+
+        # Budget cap is 3 (same math as above); the configured cap of 2 is
+        # already below it, so the clamp is a no-op and "config" survives.
+        cap, configured, source = crawler._resolve_concurrency(None)
+        assert (cap, configured, source) == (2, 2, "config")
+
+
 class TestItemTimeoutResolution:
     """The knob itself — ``extraction.crawler.item_timeout_s``."""
 
@@ -3429,7 +6094,7 @@ class TestItemTimeoutResolution:
                 super().__init__(*args, **kwargs)
 
         monkeypatch.setattr(crawler, "_ConvertProcessPool", _Spy)
-        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime: ConvertResult("# ok"))
+        monkeypatch.setattr(crawler, "convert_to_markdown", lambda path, mime, **_kw: ConvertResult("# ok"))
 
         async def _token(tenant_id: str, client_id: str, private_key: str) -> str:
             return "tok"
@@ -3447,6 +6112,34 @@ class TestItemTimeoutResolution:
         crawler.run_builtin_crawl({"connection_id": "conn1"})
 
         assert seen["timeout_s"] == 42
+
+
+class TestUnsupportedExtensionsResolution:
+    """The knob itself — ``extraction.crawler.unsupported_extensions``."""
+
+    def test_an_unset_value_is_just_the_built_in_default_set(self, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", lambda *k, default=None: default)
+        exts = crawler._unsupported_extensions()
+        assert exts == crawler._DEFAULT_UNSUPPORTED_EXTENSIONS
+        assert "mp4" in exts and "zip" not in exts
+
+    def test_a_configured_list_is_additive_never_a_replacement(self, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", lambda *k, default=None: [".foo", "BAR", "  baz  "])
+        exts = crawler._unsupported_extensions()
+        assert {"foo", "bar", "baz"} <= exts
+        # The built-in defaults survive a configured list — this widens,
+        # it never narrows.
+        assert crawler._DEFAULT_UNSUPPORTED_EXTENSIONS <= exts
+
+    def test_a_non_list_value_is_ignored_not_a_crash(self, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", lambda *k, default=None: "mp4")
+        assert crawler._unsupported_extensions() == crawler._DEFAULT_UNSUPPORTED_EXTENSIONS
+
+    def test_non_string_entries_in_the_list_are_ignored(self, monkeypatch):
+        monkeypatch.setattr("app.instance_config.get_value", lambda *k, default=None: [123, None, "ok"])
+        exts = crawler._unsupported_extensions()
+        assert "ok" in exts
+        assert crawler._DEFAULT_UNSUPPORTED_EXTENSIONS <= exts
 
 
 class TestConcurrencyGovernor:
@@ -3550,7 +6243,7 @@ class TestParallelCounters:
         _at_concurrency(monkeypatch, 8)
         monkeypatch.setattr(crawler, "_max_file_mb", lambda: 1)
 
-        def _convert(path: Path, mime: str) -> ConvertResult:
+        def _convert(path: Path, mime: str, **_kw: Any) -> ConvertResult:
             if path.suffix == ".bad":
                 raise RuntimeError("markitdown said no")
             if path.suffix == ".empty":
@@ -3766,7 +6459,7 @@ class TestParallelOrdering:
         monkeypatch.setattr(
             crawler,
             "convert_to_markdown",
-            lambda path, mime: ConvertResult("UNREDACTABLE" if path.suffix == ".pii" else "# converted"),
+            lambda path, mime, **_kw: ConvertResult("UNREDACTABLE" if path.suffix == ".pii" else "# converted"),
         )
 
         items = [
@@ -3898,7 +6591,7 @@ class TestConcurrencyOneIsTheOldPath:
         _at_concurrency(monkeypatch, n)
         monkeypatch.setattr(crawler, "_max_file_mb", lambda: 1)
 
-        def _convert(path: Path, mime: str) -> ConvertResult:
+        def _convert(path: Path, mime: str, **_kw: Any) -> ConvertResult:
             if path.suffix == ".bad":
                 raise RuntimeError("nope")
             return ConvertResult("# converted")
@@ -4163,6 +6856,166 @@ class TestFactsExtractionSeam:
         crawler.maybe_run_facts_extraction({"id": "conn1"}, stats=stats, recorder=FakeRecorder())
 
         assert calls == [{"stats": stats, "docs_done": 7, "docs_total": 9, "path": "c.docx"}]
+
+
+class TestFactsStreaming:
+    """``extraction.facts.stream_every`` — let fact extraction run WHILE a
+    crawl is still going, by enqueueing a standalone
+    ``sharepoint-facts-extraction`` job (the same job kind, enqueue call and
+    idempotency key ``POST …/connections/{id}/facts-extract`` uses) every N
+    successfully ingested files, plus once more when enumeration finishes.
+    The chained tail pass (:func:`crawler.maybe_run_facts_extraction`) skips
+    whenever a standalone pass for the connection is already queued or
+    running, so the two never interleave on the same per-document ledger.
+    """
+
+    def _enable_facts_switches(self, monkeypatch) -> None:
+        """Both gates ``_facts_extraction_readiness`` (and the chained
+        pass) check — enabled here so a streamed enqueue actually fires
+        rather than silently skipping at the readiness check."""
+        monkeypatch.setattr("connectors.sharepoint.facts_extraction.facts_extraction_enabled", lambda: True)
+        monkeypatch.setattr("connectors.sharepoint.facts_extraction.facts_surface_enabled", lambda: True)
+
+    def _two_page_two_file_crawl(self, monkeypatch) -> None:
+        """Two delta pages, one new file each — two page boundaries for
+        ``_maybe_stream_facts_extraction`` to fire at, plus the run's final
+        flush after enumeration."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if url.endswith("/content"):
+                return _content_response()
+            if "nextpage" in url:
+                return httpx.Response(
+                    200,
+                    json={
+                        "value": [_file_item("item2", name="b.pdf", ctag="ctag-2")],
+                        "@odata.deltaLink": f"{DRIVE_DELTA}?token=NEW",
+                    },
+                )
+            return httpx.Response(
+                200,
+                json={"value": [_file_item("item1")], "@odata.nextLink": f"{DRIVE_DELTA}?nextpage=1"},
+            )
+
+        _install_graph(monkeypatch, handler)
+
+    def test_enqueues_a_job_with_the_right_key_and_payload_after_stream_every_files(self, crawl_env, monkeypatch):
+        self._enable_facts_switches(monkeypatch)
+        monkeypatch.setattr(crawler, "_facts_stream_every", lambda: 1)
+        self._two_page_two_file_crawl(monkeypatch)
+
+        report = _run(_connection([_drive_scope()]), monkeypatch)
+        assert report["new"] == 2  # both pages' files were ingested
+
+        from src.repositories import jobs_repo
+
+        jobs = jobs_repo().list(kind="sharepoint-facts-extraction")
+        # Three trigger points fired (page 1, page 2, the final flush) but
+        # idempotency dedup collapses them onto ONE row.
+        assert len(jobs) == 1
+        job = jobs[0]
+        assert job["payload_json"] == {"connection_id": "conn1"}
+        assert job["idempotency_key"] == "sharepoint-facts-extraction:conn1"
+        assert job["status"] == "queued"
+
+    def test_stream_every_zero_never_enqueues_a_job(self, crawl_env, monkeypatch):
+        """Default (0, off) — the crawl's behaviour is unchanged: no
+        streamed job is ever enqueued, whatever the crawl ingests."""
+        assert crawler._facts_stream_every() == 0
+        self._two_page_two_file_crawl(monkeypatch)
+
+        report = _run(_connection([_drive_scope()]), monkeypatch)
+        assert report["new"] == 2
+
+        from src.repositories import jobs_repo
+
+        assert jobs_repo().list(kind="sharepoint-facts-extraction") == []
+
+    def test_dedupe_path_does_not_raise_and_does_not_pile_up(self, crawl_env, monkeypatch, caplog):
+        self._enable_facts_switches(monkeypatch)
+
+        from src.repositories import jobs_repo
+
+        existing = jobs_repo().enqueue(
+            "sharepoint-facts-extraction",
+            {"connection_id": "conn1"},
+            idempotency_key="sharepoint-facts-extraction:conn1",
+        )
+
+        with caplog.at_level(logging.DEBUG, logger="connectors.sharepoint.crawler"):
+            crawler._enqueue_streamed_facts_pass("conn1")  # must not raise
+
+        jobs = jobs_repo().list(kind="sharepoint-facts-extraction")
+        assert len(jobs) == 1
+        assert jobs[0]["id"] == existing["id"]
+        assert any("not piling up" in r.getMessage() for r in caplog.records)
+
+    def test_an_active_provider_limit_condition_suppresses_the_streamed_enqueue(self, crawl_env, monkeypatch, caplog):
+        """TCRD-296 synthesis F.25, gaps #25/#48: before this check, a long
+        crawl crossing many ``stream_every`` thresholds while the provider
+        refuses every call kept enqueueing a fresh (doomed) pass at every
+        threshold — 161 failed job rows overnight in the live incident this
+        closes."""
+        self._enable_facts_switches(monkeypatch)
+        monkeypatch.setattr(
+            "connectors.sharepoint.facts_extraction.streamed_pass_suppressed_by_provider_limit",
+            lambda: {"reason": "workspace_limit", "provider": "anthropic"},
+        )
+
+        with caplog.at_level(logging.INFO, logger="connectors.sharepoint.crawler"):
+            crawler._enqueue_streamed_facts_pass("conn1")  # must not raise
+
+        from src.repositories import jobs_repo
+
+        assert jobs_repo().list(kind="sharepoint-facts-extraction") == []
+        assert any("provider_limit condition" in r.getMessage() for r in caplog.records)
+
+    def test_a_cleared_provider_limit_condition_lets_the_streamed_enqueue_through_again(self, crawl_env, monkeypatch):
+        self._enable_facts_switches(monkeypatch)
+        monkeypatch.setattr(
+            "connectors.sharepoint.facts_extraction.streamed_pass_suppressed_by_provider_limit", lambda: None
+        )
+
+        crawler._enqueue_streamed_facts_pass("conn1")
+
+        from src.repositories import jobs_repo
+
+        assert len(jobs_repo().list(kind="sharepoint-facts-extraction")) == 1
+
+    def test_chained_tail_pass_skips_when_a_standalone_job_is_in_flight(self, crawl_env, monkeypatch, caplog):
+        """Independent of ``stream_every``: an ALREADY in-flight standalone
+        pass (a streamed enqueue or a manual trigger) makes the crawl's own
+        chained tail pass skip, so the two never race the same per-document
+        ledger."""
+        self._enable_facts_switches(monkeypatch)
+
+        def boom(connection, *, deadline=None, on_progress=None):
+            raise AssertionError("the chained pass must not run while a standalone pass is in flight")
+
+        monkeypatch.setattr("connectors.sharepoint.facts_extraction.maybe_run_after_crawl", boom)
+
+        from src.repositories import jobs_repo
+
+        jobs_repo().enqueue(
+            "sharepoint-facts-extraction",
+            {"connection_id": "conn1"},
+            idempotency_key="sharepoint-facts-extraction:conn1",
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        _install_graph(monkeypatch, handler)
+
+        with caplog.at_level(logging.INFO, logger="connectors.sharepoint.crawler"):
+            report = _run(_connection([_drive_scope()]), monkeypatch)
+
+        assert "facts" not in report
+        assert "facts_usage" not in report
+        assert any("standalone pass in flight — skipping chained pass" in r.getMessage() for r in caplog.records)
 
 
 # --------------------------------------------------------------------------
@@ -4497,7 +7350,7 @@ class TestActivityBookkeeping:
         stats.exit_item_activity(token, "Reports/a.docx", "new")
         snap = stats.activity_snapshot(phase="crawl")
         assert snap["current_path"] is None
-        assert snap["recent"] == [{"path": "Reports/a.docx", "outcome": "new"}]
+        assert snap["recent"] == [{"path": "Reports/a.docx", "outcome": "new", "rescue": ""}]
 
     def test_recent_is_capped_and_newest_first(self):
         stats = crawler.CrawlStats()
@@ -4560,8 +7413,7 @@ class TestRetryUsesTheConversionPool:
         )
         assert "convert_pool=convert_pool" in body, "the pool must reach _process_item"
         assert "convert_slot=0" in body, (
-            "the retry loop is sequential, so it owns slot 0 — the same slot "
-            "the sequential page path uses"
+            "the retry loop is sequential, so it owns slot 0 — the same slot the sequential page path uses"
         )
 
     def test_the_retry_loop_repairs_the_pool_before_each_item(self):
@@ -4572,8 +7424,7 @@ class TestRetryUsesTheConversionPool:
         can hold a lock a fork would copy."""
         body = self._retry_source()
         assert "convert_pool.repair()" in body, (
-            "a crashed conversion worker would otherwise carry into the next "
-            "retried item"
+            "a crashed conversion worker would otherwise carry into the next retried item"
         )
 
     def test_the_caller_threads_the_pool_in(self):
@@ -4583,9 +7434,999 @@ class TestRetryUsesTheConversionPool:
         src = Path("connectors/sharepoint/crawler.py").read_text(encoding="utf-8")
         i = src.index("await _retry_failed_items(")
         call = src[i : src.index("\n    )", i)]
-        assert "convert_pool=convert_pool" in call, (
-            "_crawl_drive must pass its run's pool into the backlog replay"
+        assert "convert_pool=convert_pool" in call, "_crawl_drive must pass its run's pool into the backlog replay"
+
+
+class TestCrawlTargetsShardSeam:
+    """``_crawl_targets`` / ``_ScopeContext.legacy_ctags`` / the shard
+    exclude-prefix merge (2026-09-03 auto-parallel-crawl design, Task 1) —
+    the seam a shard child's own crawl (Task 4) reuses. Exercised directly
+    here since ``run_builtin_crawl``'s payload has no way to hand in a
+    shard's own exclude prefixes or a legacy-ctag seed; ``_crawl_targets``
+    itself is exercised end-to-end by every OTHER test in this module
+    through `_run_crawl_async`'s inline call (`state_for`/`save_for`
+    ignoring their target)."""
+
+    @staticmethod
+    def _minimal_state() -> Dict[str, Any]:
+        return {"delta_links": {}, "ctags": {}, "failed_items": {}, "empty_items": {}}
+
+    def _transport(self, stats: "crawler.CrawlStats") -> "crawler.GraphTransport":
+        auth = crawler.GraphAuth(acquire=lambda: gc.get_app_token("t1", "c1", "pem"), stats=stats)
+        return crawler.GraphTransport(auth, stats)
+
+    def _crawl(self, ctx, target, state, **overrides: Any) -> "crawler.CrawlStats":
+        stats = overrides.pop("stats", None) or crawler.CrawlStats()
+        ingestor = overrides.pop("ingestor")
+        kwargs: Dict[str, Any] = dict(
+            targets_by_scope=[(ctx, [target])],
+            transport=self._transport(stats),
+            ingestor=ingestor,
+            stats=stats,
+            max_file_mb=50,
+            anonymization_key=None,
+            recorder=None,
+            detector=None,
+            deadline=None,
+            governor=crawler._ConcurrencyGovernor(1),
+            stop_watcher=None,
+            convert_pool=None,
+            force_reprocess=False,
+            retry_failed=False,
+            retry_empty=False,
+            state_for=lambda _t: state,
+            save_for=lambda _t, _s: None,
         )
+        kwargs.update(overrides)
+        asyncio.run(crawler._crawl_targets("conn1", **kwargs))
+        return stats
+
+    def test_shard_exclude_prefixes_skip_the_subtree_and_persist_only_that_key(self, crawl_env, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(
+                200,
+                json={
+                    "value": [
+                        _file_item(
+                            "excluded1",
+                            name="secret.docx",
+                            parent_path="/drives/b!drive1/root:/Reports/Excluded",
+                        ),
+                        _file_item("kept1", name="keep.docx", parent_path="/drives/b!drive1/root:/Reports"),
+                    ],
+                    "@odata.deltaLink": f"{DRIVE_DELTA}?t=1",
+                },
+            )
+
+        _install_graph(monkeypatch, handler)
+        target = crawler.DriveTarget(drive_id="b!drive1", drive_name="Drive")
+        exclusions = crawler._exclusion_index_with_extra_prefixes(crawler._ExclusionIndex(), ["Reports/Excluded"])
+        ctx = crawler._ScopeContext(
+            source_scope_id="b!drive1", collection_id="col1", anonymize=False, exclusions=exclusions
+        )
+        ingestor = FakeIngestor()
+        state = self._minimal_state()
+
+        stats = self._crawl(ctx, target, state, ingestor=ingestor)
+
+        assert [row["stable_id"] for row in ingestor.ingested] == ["graph:kept1"]
+        assert stats.excluded_subtree_skips == 1
+        # ONE state-row key, for THIS target's own state_key — the shard
+        # never touches a sibling's cursor.
+        assert set(state["delta_links"]) == {"b!drive1"}
+
+    def test_legacy_ctag_fallback_counts_unchanged_without_downloading(self, crawl_env, monkeypatch):
+        seen = _install_graph(
+            monkeypatch,
+            lambda request: httpx.Response(
+                200,
+                json={"value": [_file_item("item1", ctag="ctag-1")], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"},
+            ),
+        )
+        target = crawler.DriveTarget(drive_id="b!drive1", drive_name="Drive")
+        ctx = crawler._ScopeContext(
+            source_scope_id="b!drive1",
+            collection_id="col1",
+            anonymize=False,
+            exclusions=crawler._ExclusionIndex(),
+            legacy_ctags={"graph:item1": "ctag-1"},
+        )
+        ingestor = FakeIngestor()
+        # THIS shard's own row has never seen the item — only the legacy
+        # connection-level seed knows its cTag.
+        state = self._minimal_state()
+
+        stats = self._crawl(ctx, target, state, ingestor=ingestor)
+
+        assert ingestor.ingested == []
+        assert stats.unchanged == 1
+        assert not any(url.endswith("/content") for url in seen)
+        # A cache hit never writes the seed back into the active state.
+        assert state["ctags"] == {}
+
+
+class TestFolderShardDeleteGuard:
+    """``_process_item``'s ``deleted`` branch, folder-shard case (2026-09-03
+    auto-parallel-crawl design §6): a delete observed by a shard whose OWN
+    state row never saw an add/change for that item must not touch the
+    collection — it may be a sibling shard's item that simply moved."""
+
+    def _delete_item(self) -> Dict[str, Any]:
+        return {"id": "item1", "name": "brief.docx", "deleted": {"state": "deleted"}}
+
+    def test_skips_the_delete_when_this_shards_own_ctags_never_saw_it(self, crawl_env, monkeypatch):
+        target = crawler.DriveTarget(drive_id="b!drive1", drive_name="Drive", root_item_id="folder1")
+        ctx = crawler._ScopeContext(
+            source_scope_id="folder1", collection_id="col1", anonymize=False, exclusions=crawler._ExclusionIndex()
+        )
+        stats = crawler.CrawlStats()
+        ingestor = FakeIngestor()
+        FakeIngestor._collection_of["graph:item1"] = "col1"  # ingested by a sibling shard
+        state = {"delta_links": {}, "ctags": {}, "failed_items": {}, "empty_items": {}}
+
+        asyncio.run(
+            crawler._process_item(
+                self._delete_item(),
+                target=target,
+                ctx=ctx,
+                transport=None,
+                ingestor=ingestor,
+                state=state,
+                stats=stats,
+                max_file_mb=50,
+                anonymization_key=None,
+            )
+        )
+
+        assert ingestor.deleted == []
+        assert stats.deleted == 0
+
+    def test_applies_the_delete_when_this_shards_own_ctags_has_it(self, crawl_env, monkeypatch):
+        target = crawler.DriveTarget(drive_id="b!drive1", drive_name="Drive", root_item_id="folder1")
+        ctx = crawler._ScopeContext(
+            source_scope_id="folder1", collection_id="col1", anonymize=False, exclusions=crawler._ExclusionIndex()
+        )
+        stats = crawler.CrawlStats()
+        ingestor = FakeIngestor()
+        FakeIngestor._collection_of["graph:item1"] = "col1"
+        state = {"delta_links": {}, "ctags": {"graph:item1": "ctag-1"}, "failed_items": {}, "empty_items": {}}
+
+        asyncio.run(
+            crawler._process_item(
+                self._delete_item(),
+                target=target,
+                ctx=ctx,
+                transport=None,
+                ingestor=ingestor,
+                state=state,
+                stats=stats,
+                max_file_mb=50,
+                anonymization_key=None,
+            )
+        )
+
+        assert ingestor.deleted == ["graph:item1"]
+        assert stats.deleted == 1
+
+    def test_whole_drive_target_keeps_todays_unconditional_delete(self, crawl_env, monkeypatch):
+        """A whole-drive target (no ``root_item_id``) is never split into
+        shards this way — the guard must not change its behaviour."""
+        target = crawler.DriveTarget(drive_id="b!drive1", drive_name="Drive")
+        ctx = crawler._ScopeContext(
+            source_scope_id="b!drive1", collection_id="col1", anonymize=False, exclusions=crawler._ExclusionIndex()
+        )
+        stats = crawler.CrawlStats()
+        ingestor = FakeIngestor()
+        FakeIngestor._collection_of["graph:item1"] = "col1"
+        state = {"delta_links": {}, "ctags": {}, "failed_items": {}, "empty_items": {}}
+
+        asyncio.run(
+            crawler._process_item(
+                self._delete_item(),
+                target=target,
+                ctx=ctx,
+                transport=None,
+                ingestor=ingestor,
+                state=state,
+                stats=stats,
+                max_file_mb=50,
+                anonymization_key=None,
+            )
+        )
+
+        assert ingestor.deleted == ["graph:item1"]
+        assert stats.deleted == 1
+
+
+# --------------------------------------------------------------------------
+# Automatic parallel site crawl — Task 4: the planner, the shard child, the
+# finalizer (2026-09-03 design §4.3). Fakes throughout: `jobs_repo()` and
+# `sharepoint_state_repo()` are PG-only (A3), so these exercise the
+# orchestration logic against recording fakes rather than a real Postgres —
+# the repo methods themselves already have their own PG contract tests
+# (tests/db_pg/test_extraction_runs_pg.py, tests/db_pg/
+# test_sharepoint_state_store_pg.py).
+# --------------------------------------------------------------------------
+
+
+class FakeJobsRepo:
+    """Records every ``enqueue()`` call — stands in for ``jobs_repo()``."""
+
+    def __init__(self) -> None:
+        self.enqueued: List[Dict[str, Any]] = []
+
+    def enqueue(
+        self,
+        kind: str,
+        payload: Dict[str, Any],
+        *,
+        priority: int = 0,
+        run_after: Any = None,
+        max_attempts: int = 3,
+        idempotency_key: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        row = {
+            "id": f"job-{len(self.enqueued) + 1}",
+            "kind": kind,
+            "payload_json": payload,
+            "priority": priority,
+            "max_attempts": max_attempts,
+            "idempotency_key": idempotency_key,
+            "deduped": False,
+        }
+        self.enqueued.append(row)
+        return row
+
+    def list(self, *, kind: str, status: str, limit: int = 200) -> List[Dict[str, Any]]:
+        """Empty — ``maybe_run_facts_extraction``'s ``_standalone_facts_
+        pass_in_flight`` check calls this on the inline path's own tail;
+        these planner tests never enqueue a facts pass of their own."""
+        return []
+
+
+class FakeStateStore:
+    """In-memory stand-in for ``connectors.sharepoint.state_store`` — the
+    same ``(kind, connection_id) -> payload`` keying, no Postgres/DuckDB
+    needed. Accepts ANY kind (including ``crawl:<key>``) — this fake
+    doesn't enforce the backend-selection rules ``state_store`` itself
+    already has its own tests for."""
+
+    def __init__(self) -> None:
+        self.data: Dict[Any, Dict[str, Any]] = {}
+
+    def get(self, kind: str, connection_id: str) -> Optional[Dict[str, Any]]:
+        stored = self.data.get((kind, connection_id))
+        return dict(stored) if stored is not None else None
+
+    def put(self, kind: str, connection_id: str, payload: Dict[str, Any]) -> None:
+        self.data[(kind, connection_id)] = dict(payload)
+
+    def list_kinds(self, connection_id: str, prefix: str) -> List[str]:
+        return [k for (k, cid) in self.data if cid == connection_id and k.startswith(prefix)]
+
+
+def _install_fake_state_store(monkeypatch, store: "FakeStateStore") -> None:
+    from connectors.sharepoint import state_store
+
+    monkeypatch.setattr(state_store, "get", store.get)
+    monkeypatch.setattr(state_store, "put", store.put)
+    monkeypatch.setattr(state_store, "list_kinds", store.list_kinds)
+
+
+class TestAutoParallelCrawlPlanner:
+    def _install_env(self, monkeypatch, *, target_docs: int = 10):
+        monkeypatch.setattr("src.repositories.use_pg", lambda: True)
+        runs = _install_runs_repo(monkeypatch)
+        jobs = FakeJobsRepo()
+        monkeypatch.setattr("src.repositories.jobs_repo", lambda: jobs)
+        store = FakeStateStore()
+        _install_fake_state_store(monkeypatch, store)
+        monkeypatch.setattr(crawler, "_shard_target_docs", lambda: target_docs)
+        return runs, jobs, store
+
+    def _handler(self) -> Callable[[httpx.Request], httpx.Response]:
+        def handler(request: httpx.Request) -> httpx.Response:
+            path = request.url.path
+            if path.endswith("/content"):
+                raise AssertionError("the planner must never download a file")
+            if path.endswith("/root") and request.method == "GET":
+                return httpx.Response(200, json={"webUrl": "https://x/root"})
+            if path.endswith("/search/query"):
+                body = json.loads(request.content.decode())
+                query = body["requests"][0]["query"]["queryString"]
+                if '"https://x/root"' in query:
+                    return httpx.Response(200, json={"value": [{"hitsContainers": [{"total": 1000}]}]})
+                return httpx.Response(200, json={"value": [{"hitsContainers": [{"total": 5}]}]})
+            if path.endswith("/root/children"):
+                return httpx.Response(
+                    200,
+                    json={
+                        "value": [
+                            {"id": "f1", "name": "A", "folder": {"childCount": 5}, "webUrl": "https://x/root/A"},
+                            {"id": "f2", "name": "B", "folder": {"childCount": 5}, "webUrl": "https://x/root/B"},
+                        ]
+                    },
+                )
+            raise AssertionError(f"unexpected request: {path}")
+
+        return handler
+
+    def test_planner_path_enqueues_k_jobs_and_returns_without_crawling(self, crawl_env, monkeypatch):
+        runs, jobs, store = self._install_env(monkeypatch)
+        seen = _install_graph(monkeypatch, self._handler())
+
+        report = _run(_connection([_drive_scope()]), monkeypatch)
+
+        assert report["mode"] == "sharded"
+        assert report["shards_total"] >= 1
+        assert len(jobs.enqueued) == report["shards_total"]
+        assert all(j["kind"] == "corpus-extraction-shard" for j in jobs.enqueued)
+        assert all(j["priority"] == -1 for j in jobs.enqueued)
+        assert [j["idempotency_key"] for j in jobs.enqueued] == [
+            f"corpus-extraction-shard:conn1:{i}" for i in range(1, report["shards_total"] + 1)
+        ]
+        assert not any(url.endswith("/content") for url in seen)
+        # One parent row opened, with shards_total set — no inline crawl row.
+        assert len(runs.started) == 1
+        assert runs.started[0]["shards_total"] == report["shards_total"]
+        assert store.get("crawl", "conn1")["shard_plan"]["shards_total"] == report["shards_total"]
+
+    def test_shard_target_docs_zero_stays_inline(self, crawl_env, monkeypatch):
+        runs, jobs, _store = self._install_env(monkeypatch, target_docs=0)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        _install_graph(monkeypatch, handler)
+        report = _run(_connection([_drive_scope()]), monkeypatch)
+
+        assert report["mode"] == "builtin"  # the ordinary inline crawl report shape, not "sharded"
+        assert jobs.enqueued == []
+
+    def test_a_small_site_stays_inline_even_with_sharding_enabled(self, crawl_env, monkeypatch):
+        runs, jobs, _store = self._install_env(monkeypatch, target_docs=5000)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            path = request.url.path
+            if path.endswith("/content"):
+                return _content_response()
+            if path.endswith("/root") and request.method == "GET":
+                return httpx.Response(200, json={"webUrl": "https://x/root"})
+            if path.endswith("/search/query"):
+                return httpx.Response(200, json={"value": [{"hitsContainers": [{"total": 10}]}]})
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        _install_graph(monkeypatch, handler)
+        report = _run(_connection([_drive_scope()]), monkeypatch)
+
+        assert report["mode"] == "builtin"
+        assert jobs.enqueued == []
+
+
+class TestShardPlannerVisibilityAndReuse(TestAutoParallelCrawlPlanner):
+    """2026-09-04 finding #65 — visibility (item 3) and plan persistence /
+    reuse (item 2)."""
+
+    def test_parent_row_opens_as_planning_before_the_first_graph_call(self, crawl_env, monkeypatch):
+        runs, _jobs, _store = self._install_env(monkeypatch)
+        phase_at_first_call: Dict[str, Any] = {}
+        inner = self._handler()
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if "phase" not in phase_at_first_call:
+                phase_at_first_call["phase"] = runs.started[0]["phase"] if runs.started else None
+            return inner(request)
+
+        _install_graph(monkeypatch, handler)
+        report = _run(_connection([_drive_scope()]), monkeypatch)
+
+        assert report["mode"] == "sharded"
+        assert phase_at_first_call["phase"] == "planning"
+        # By the time planning finished, the SAME row moved on to "plan".
+        assert runs.started[0]["phase"] == "plan"
+
+    def test_plan_is_persisted_and_reused_on_the_next_trigger_with_no_new_graph_calls(self, crawl_env, monkeypatch):
+        runs, jobs, store = self._install_env(monkeypatch)
+        seen = _install_graph(monkeypatch, self._handler())
+
+        first = _run(_connection([_drive_scope()]), monkeypatch)
+        assert first["mode"] == "sharded"
+        graph_calls_after_first = len(seen)
+        assert graph_calls_after_first > 0
+
+        second = _run(_connection([_drive_scope()]), monkeypatch)
+
+        assert second["mode"] == "sharded"
+        assert second["shards_total"] == first["shards_total"]
+        assert second["parent_run_id"] != first["parent_run_id"]
+        # The reused trigger made NO new Graph calls at all.
+        assert len(seen) == graph_calls_after_first
+        assert len(runs.started) == 2
+        assert len(jobs.enqueued) == first["shards_total"] + second["shards_total"]
+        assert store.get("crawl", "conn1")["shard_plan"]["parent_run_id"] == second["parent_run_id"]
+
+        # A THIRD trigger must ALSO reuse — re-persisting the reused plan
+        # must carry its own fingerprint forward, not just fast-path the
+        # ONE trigger right after the plan was originally built.
+        third = _run(_connection([_drive_scope()]), monkeypatch)
+
+        assert third["mode"] == "sharded"
+        assert len(seen) == graph_calls_after_first
+        assert len(runs.started) == 3
+
+    def test_resync_forces_a_fresh_plan(self, crawl_env, monkeypatch):
+        _runs, _jobs, _store = self._install_env(monkeypatch)
+        seen = _install_graph(monkeypatch, self._handler())
+
+        _run(_connection([_drive_scope()]), monkeypatch)
+        graph_calls_after_first = len(seen)
+
+        _run(_connection([_drive_scope()]), monkeypatch, resync=True)
+
+        assert len(seen) > graph_calls_after_first, "resync must trigger a fresh plan, not reuse the persisted one"
+
+    def test_force_replan_forces_a_fresh_plan_without_resync(self, crawl_env, monkeypatch):
+        _runs, _jobs, store = self._install_env(monkeypatch)
+        seen = _install_graph(monkeypatch, self._handler())
+
+        _run(_connection([_drive_scope()]), monkeypatch)
+        graph_calls_after_first = len(seen)
+        state_before = store.get("crawl", "conn1")
+
+        _run(_connection([_drive_scope()]), monkeypatch, force_replan=True)
+
+        assert len(seen) > graph_calls_after_first, "force_replan must trigger a fresh plan"
+        # Unlike resync, force_replan never touches delta cursors.
+        assert state_before.get("delta_links") == store.get("crawl", "conn1").get("delta_links")
+
+    def test_a_scope_set_change_invalidates_the_persisted_plan(self, crawl_env, monkeypatch):
+        _runs, _jobs, _store = self._install_env(monkeypatch)
+        seen = _install_graph(monkeypatch, self._handler())
+
+        _run(_connection([_drive_scope()]), monkeypatch)
+        graph_calls_after_first = len(seen)
+
+        # A second, differently-identified drive scope — the connection's
+        # confirmed scope SET changed since the plan was built.
+        _run(
+            _connection([_drive_scope(), _drive_scope(source_scope_id="b!drive2", collection_id="col2")]),
+            monkeypatch,
+        )
+
+        assert len(seen) > graph_calls_after_first, "a changed scope set must invalidate the persisted plan"
+
+    def test_a_planning_budget_exhaustion_falls_back_to_inline_and_closes_the_planning_row(
+        self, crawl_env, monkeypatch
+    ):
+        """Finding #65 item 4: a plan balanced on nothing but a 429 storm is
+        worse than no plan — the planner must fall back to the inline crawl
+        cleanly, never leave the job silent or the parent row stuck
+        ``running``."""
+        runs, jobs, _store = self._install_env(monkeypatch)
+
+        async def _raise_budget_exhausted(*args: Any, **kwargs: Any) -> Any:
+            raise crawler.PlanningBudgetExhausted("search budget (120s) exhausted with no usable signal")
+
+        monkeypatch.setattr(crawler, "compute_shard_plan", _raise_budget_exhausted)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        _install_graph(monkeypatch, handler)
+        report = _run(_connection([_drive_scope()]), monkeypatch)
+
+        assert report["mode"] == "builtin"  # fell back to the ordinary inline crawl
+        assert jobs.enqueued == []
+        # TWO rows: the planning row this fell back FROM (closed, done, names
+        # the fallback), and the inline crawl's own fresh row.
+        assert len(runs.started) == 2
+        assert runs.started[0]["phase"] == "planning"
+        planning_run_id = runs.started[0]["run_id"]
+        closed = [f for f in runs.finished if f["run_id"] == planning_run_id]
+        assert len(closed) == 1
+        assert closed[0]["status"] == "done"
+        assert closed[0]["report"]["mode"] == "inline (planner fallback)"
+
+
+class TestShardPlanPreview(TestAutoParallelCrawlPlanner):
+    """``connectors.sharepoint.crawler.preview_shard_plan`` — the read-only
+    computation behind ``GET …/connections/{id}/shard-plan`` (2026-09-03
+    auto-parallel-crawl design §4.7, plan Task 9). Reuses
+    ``TestAutoParallelCrawlPlanner``'s own ``_install_env``/``_handler`` —
+    the SAME two-pass Graph read the planner itself makes — so a preview
+    and the plan an actual trigger would build from are exercised against
+    the identical fixture, never a second copy of it.
+    """
+
+    def _preview(self, connection: Dict[str, Any], **kwargs: Any) -> Dict[str, Any]:
+        return asyncio.run(crawler.preview_shard_plan(connection, **kwargs))
+
+    def test_never_enqueues_or_opens_a_run_row(self, crawl_env, monkeypatch):
+        runs, jobs, _store = self._install_env(monkeypatch)
+        _install_graph(monkeypatch, self._handler())
+
+        out = self._preview(_connection([_drive_scope()]))
+
+        assert out["mode"] == "sharded"
+        assert jobs.enqueued == []
+        assert runs.started == []
+
+    def test_sharded_preview_reports_target_docs_signal_and_expected_per_shard(self, crawl_env, monkeypatch):
+        self._install_env(monkeypatch, target_docs=10)
+        _install_graph(monkeypatch, self._handler())
+
+        out = self._preview(_connection([_drive_scope()]))
+
+        assert out["target_docs"] == 10
+        assert out["signal"] in ("search", "child_count")
+        assert out["shards"]
+        assert all(s["expected"] is not None for s in out["shards"])
+        assert all("index" in s and "label" in s and "drive_id" in s and "targets_count" in s for s in out["shards"])
+
+    def test_shard_target_docs_zero_previews_inline(self, crawl_env, monkeypatch):
+        self._install_env(monkeypatch, target_docs=0)
+        _install_graph(monkeypatch, self._handler())
+
+        out = self._preview(_connection([_drive_scope()]))
+
+        assert out["mode"] == "inline"
+        assert out["shards"] == []
+
+    def test_a_small_site_previews_inline_even_with_sharding_enabled(self, crawl_env, monkeypatch):
+        self._install_env(monkeypatch, target_docs=5000)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            path = request.url.path
+            if path.endswith("/root") and request.method == "GET":
+                return httpx.Response(200, json={"webUrl": "https://x/root"})
+            if path.endswith("/search/query"):
+                return httpx.Response(200, json={"value": [{"hitsContainers": [{"total": 10}]}]})
+            raise AssertionError(f"unexpected request: {path}")
+
+        _install_graph(monkeypatch, handler)
+        out = self._preview(_connection([_drive_scope()]))
+
+        assert out["mode"] == "inline"
+        assert out["shards"] == []
+
+    def test_duckdb_backend_previews_inline_without_any_graph_call(self, crawl_env, monkeypatch):
+        monkeypatch.setattr("src.repositories.use_pg", lambda: False)
+        seen = _install_graph(monkeypatch, lambda request: (_ for _ in ()).throw(AssertionError("no Graph call")))
+
+        out = self._preview(_connection([_drive_scope()]))
+
+        assert out["mode"] == "inline"
+        assert seen == []
+
+    def test_no_confirmed_scopes_previews_inline(self, crawl_env, monkeypatch):
+        self._install_env(monkeypatch)
+        _install_graph(monkeypatch, lambda request: (_ for _ in ()).throw(AssertionError("no Graph call")))
+
+        connection = _connection([])  # nothing confirmed to plan against
+        out = self._preview(connection)
+
+        assert out["mode"] == "inline"
+        assert out["shards"] == []
+
+
+class TestShardChildStateIsolation:
+    def test_disjoint_shards_write_only_their_own_state_row(self, crawl_env, monkeypatch):
+        store = FakeStateStore()
+        _install_fake_state_store(monkeypatch, store)
+        runs = _install_runs_repo(monkeypatch)
+        connection = _connection([_drive_scope()])
+        monkeypatch.setattr("src.repositories.source_connections_repo", lambda: FakeSourceConnectionsRepo(connection))
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if url.endswith("/content"):
+                return _content_response()
+            if "folderA" in url:
+                return httpx.Response(
+                    200,
+                    json={"value": [_file_item("itemA", name="a.docx")], "@odata.deltaLink": f"{DRIVE_DELTA}?t=A"},
+                )
+            return httpx.Response(
+                200, json={"value": [_file_item("itemB", name="b.docx")], "@odata.deltaLink": f"{DRIVE_DELTA}?t=B"}
+            )
+
+        _install_graph(monkeypatch, handler)
+
+        def _shard(root_item_id: str, label: str) -> Dict[str, Any]:
+            state_key = f"b!drive1:{root_item_id}"
+            return {
+                "scope_id": "b!drive1",
+                "label": label,
+                "expected": 1,
+                "exclude_prefixes": [],
+                "targets": [
+                    {"drive_id": "b!drive1", "root_item_id": root_item_id, "state_key": state_key, "path": label}
+                ],
+            }
+
+        base_payload = {"connection_id": "conn1", "parent_run_id": "er_parent1"}
+        crawler.run_shard_crawl({**base_payload, "shard_index": 1, "shard": _shard("folderA", "A")})
+        crawler.run_shard_crawl({**base_payload, "shard_index": 2, "shard": _shard("folderB", "B")})
+
+        state_a = store.get("crawl:b!drive1:folderA", "conn1")
+        state_b = store.get("crawl:b!drive1:folderB", "conn1")
+        assert state_a is not None and set(state_a["delta_links"]) == {"b!drive1:folderA"}
+        assert state_b is not None and set(state_b["delta_links"]) == {"b!drive1:folderB"}
+        # Neither wrote the connection-level row nor the other's row.
+        assert store.get("crawl", "conn1") is None
+        assert "graph:itemB" not in state_a["ctags"]
+        assert "graph:itemA" not in state_b["ctags"]
+
+        # Both children rolled into the SAME parent's shards_done tally.
+        assert runs.shards["er_parent1"]["shards_done"] == 2
+
+
+class TestShardStopBeforeClaim:
+    def test_stop_flag_set_before_claim_records_the_shard_as_stopped(self, crawl_env, monkeypatch):
+        _install_fake_state_store(monkeypatch, FakeStateStore())
+        runs = _install_runs_repo(monkeypatch)
+        connection = _connection([_drive_scope()])
+        monkeypatch.setattr("src.repositories.source_connections_repo", lambda: FakeSourceConnectionsRepo(connection))
+        monkeypatch.setattr(crawler, "_stop_requested", lambda connection_id: "2026-09-03T00:00:00+00:00")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise AssertionError("must never reach Graph once a stop is already flagged")
+
+        _install_graph(monkeypatch, handler)
+
+        shard = {
+            "scope_id": "b!drive1",
+            "label": "whole drive",
+            "expected": 0,
+            "exclude_prefixes": [],
+            "targets": [{"drive_id": "b!drive1", "root_item_id": None, "state_key": "b!drive1", "path": ""}],
+        }
+        payload = {"connection_id": "conn1", "parent_run_id": "er_parent1", "shard_index": 1, "shard": shard}
+
+        with pytest.raises(crawler.CrawlStopped):
+            crawler.run_shard_crawl(payload)
+
+        final = runs.finished[-1]
+        assert final["status"] == "interrupted"
+        assert final["report"]["interrupted_reason"] == "stopped"
+        # The shard still counts as finished for the parent's own tally,
+        # even though the job itself re-raises and fails.
+        assert runs.shards["er_parent1"]["shards_done"] == 1
+
+
+class TestFinalizeRaceAndAggregation:
+    def test_last_child_finalize_runs_exactly_once_under_a_simulated_race(self, monkeypatch):
+        runs = _install_runs_repo(monkeypatch)
+        runs.shards["er_parent1"] = {"shards_done": 1, "shards_total": 2}  # one child already finished
+        finalize_calls: List[str] = []
+        monkeypatch.setattr(
+            crawler, "_finalize_site_run", lambda connection, parent_run_id: finalize_calls.append(parent_run_id)
+        )
+        connection = {"id": "conn1", "source_type": "sharepoint"}
+
+        # Two children racing to be "the last one" both call this.
+        crawler._finish_shard_and_maybe_finalize(connection, "er_parent1")
+        crawler._finish_shard_and_maybe_finalize(connection, "er_parent1")
+
+        assert finalize_calls == ["er_parent1"]
+
+    def test_finish_shard_and_maybe_finalize_is_a_noop_before_the_last_child(self, monkeypatch):
+        runs = _install_runs_repo(monkeypatch)
+        runs.shards["er_parent1"] = {"shards_done": 0, "shards_total": 3}
+        finalize_calls: List[str] = []
+        monkeypatch.setattr(
+            crawler, "_finalize_site_run", lambda connection, parent_run_id: finalize_calls.append(parent_run_id)
+        )
+
+        crawler._finish_shard_and_maybe_finalize({"id": "conn1"}, "er_parent1")
+
+        assert finalize_calls == []
+        assert runs.shards["er_parent1"]["shards_done"] == 1
+
+    def test_finish_shard_and_maybe_finalize_never_raises_on_a_coordination_failure(self, monkeypatch):
+        class BoomRepo:
+            def finish_shard(self, parent_run_id):
+                raise RuntimeError("boom")
+
+        monkeypatch.setattr("src.repositories.extraction_runs_repo", lambda: BoomRepo())
+
+        crawler._finish_shard_and_maybe_finalize({"id": "conn1"}, "er_parent1")  # must not raise
+
+    def test_any_failed_child_makes_the_aggregate_status_failed_and_names_the_shard(self):
+        children = [
+            {
+                "id": "er_1",
+                "shard_key": "d1",
+                "shard_label": "A",
+                "status": "done",
+                "report": {"new": 3},
+                "files_seen": 3,
+                "files_done": 3,
+                "error": None,
+            },
+            {
+                "id": "er_2",
+                "shard_key": "d2",
+                "shard_label": "B",
+                "status": "failed",
+                "report": {"errors": 2},
+                "files_seen": 2,
+                "files_done": 0,
+                "error": "boom",
+            },
+        ]
+
+        aggregated = crawler._aggregate_child_reports(children)
+
+        assert aggregated["status"] == "failed"
+        assert aggregated["new"] == 3
+        assert aggregated["errors"] == 2
+        assert aggregated["files_seen"] == 5
+        assert aggregated["files_done"] == 3
+        by_key = {s["shard_key"]: s for s in aggregated["shards"]}
+        assert by_key["d2"]["status"] == "failed"
+        assert by_key["d2"]["error"] == "boom"
+
+    def test_interrupted_beats_done_but_loses_to_failed(self):
+        done_and_interrupted = crawler._aggregate_child_reports(
+            [
+                {"id": "er_1", "status": "done", "report": {}, "files_seen": 0, "files_done": 0},
+                {"id": "er_2", "status": "interrupted", "report": {}, "files_seen": 0, "files_done": 0},
+            ]
+        )
+        assert done_and_interrupted["status"] == "interrupted"
+
+        all_three = crawler._aggregate_child_reports(
+            [
+                {"id": "er_1", "status": "done", "report": {}, "files_seen": 0, "files_done": 0},
+                {"id": "er_2", "status": "interrupted", "report": {}, "files_seen": 0, "files_done": 0},
+                {"id": "er_3", "status": "failed", "report": {}, "files_seen": 0, "files_done": 0},
+            ]
+        )
+        assert all_three["status"] == "failed"
+
+    def test_lists_concatenate_and_stay_capped(self):
+        children = [
+            {
+                "id": "er_1",
+                "status": "done",
+                "report": {"failed_items": [{"path": f"/a{i}"} for i in range(3)]},
+                "files_seen": 0,
+                "files_done": 0,
+            },
+            {
+                "id": "er_2",
+                "status": "done",
+                "report": {"failed_items": [{"path": f"/b{i}"} for i in range(3)]},
+                "files_seen": 0,
+                "files_done": 0,
+            },
+        ]
+        aggregated = crawler._aggregate_child_reports(children)
+        assert len(aggregated["failed_items"]) == 6
+
+    def test_all_done_children_aggregate_to_done(self):
+        aggregated = crawler._aggregate_child_reports(
+            [
+                {"id": "er_1", "status": "done", "report": {"new": 1}, "files_seen": 1, "files_done": 1},
+                {"id": "er_2", "status": "done", "report": {"new": 2}, "files_seen": 2, "files_done": 2},
+            ]
+        )
+        assert aggregated["status"] == "done"
+        assert aggregated["new"] == 3
+        assert aggregated["shards_total"] == 2
+
+
+class TestParentCheckpointBump:
+    def test_a_shard_childs_checkpoint_bumps_its_parent(self, monkeypatch):
+        runs = _install_runs_repo(monkeypatch)
+        recorder = crawler._RunRecorder(
+            "conn1", sweep_stale=False, parent_run_id="er_parent1", shard_key="d1", shard_label="A"
+        )
+        recorder.start()
+
+        recorder.checkpoint(crawler.CrawlStats())
+
+        assert runs.bump_parent_calls == ["er_parent1"]
+
+    def test_an_inline_runs_checkpoint_never_bumps_anything(self, monkeypatch):
+        runs = _install_runs_repo(monkeypatch)
+        recorder = crawler._RunRecorder("conn1")
+        recorder.start()
+
+        recorder.checkpoint(crawler.CrawlStats())
+
+        assert runs.bump_parent_calls == []
+
+
+# --------------------------------------------------------------------------
+# Automatic parallel site crawl — Task 7: lane priority + facts interplay
+# (2026-09-03 design §4.6). The priority constant itself and its use at the
+# enqueue call site landed in Task 4 (`_SHARD_JOB_PRIORITY`,
+# `_enqueue_shard_plan`); the `claim_next` ordering guarantee is proven at
+# the repo level in `tests/db_pg/test_jobs_contract.py::
+# test_claim_next_prefers_a_queued_facts_pass_over_a_queued_shard`. This
+# class covers the two remaining properties: K shard children's streamed
+# triggers collapse onto ONE facts job, and the finalizer's chained pass
+# runs exactly once, with its own fresh deadline.
+# --------------------------------------------------------------------------
+
+
+class TestShardFactsStreamingCollapse:
+    def _enable_facts_switches(self, monkeypatch) -> None:
+        monkeypatch.setattr("connectors.sharepoint.facts_extraction.facts_extraction_enabled", lambda: True)
+        monkeypatch.setattr("connectors.sharepoint.facts_extraction.facts_surface_enabled", lambda: True)
+
+    def test_k_children_streaming_collapse_onto_one_deduped_facts_job(self, crawl_env, monkeypatch):
+        """Each shard child streams on its OWN counters
+        (``_maybe_stream_facts_extraction`` called from
+        ``_run_shard_crawl_async``), but the idempotency key is
+        CONNECTION-keyed, not shard-keyed — the same
+        ``sharepoint-facts-extraction:{connection_id}`` key a manual
+        trigger uses — so two children's own triggers collapse onto one
+        queued row via ``jobs_repo().enqueue()``'s own dedup, the REAL
+        (DuckDB-backed, this test app) repo, not a fake."""
+        self._enable_facts_switches(monkeypatch)
+        monkeypatch.setattr(crawler, "_facts_stream_every", lambda: 1)
+        store = FakeStateStore()
+        _install_fake_state_store(monkeypatch, store)
+        _install_runs_repo(monkeypatch)
+        connection = _connection([_drive_scope()])
+        monkeypatch.setattr("src.repositories.source_connections_repo", lambda: FakeSourceConnectionsRepo(connection))
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if url.endswith("/content"):
+                return _content_response()
+            if "folderA" in url:
+                return httpx.Response(
+                    200,
+                    json={"value": [_file_item("itemA", name="a.docx")], "@odata.deltaLink": f"{DRIVE_DELTA}?t=A"},
+                )
+            return httpx.Response(
+                200, json={"value": [_file_item("itemB", name="b.docx")], "@odata.deltaLink": f"{DRIVE_DELTA}?t=B"}
+            )
+
+        _install_graph(monkeypatch, handler)
+
+        def _shard(root_item_id: str, label: str) -> Dict[str, Any]:
+            state_key = f"b!drive1:{root_item_id}"
+            return {
+                "scope_id": "b!drive1",
+                "label": label,
+                "expected": 1,
+                "exclude_prefixes": [],
+                "targets": [
+                    {"drive_id": "b!drive1", "root_item_id": root_item_id, "state_key": state_key, "path": label}
+                ],
+            }
+
+        base_payload = {"connection_id": "conn1", "parent_run_id": "er_parent1"}
+        crawler.run_shard_crawl({**base_payload, "shard_index": 1, "shard": _shard("folderA", "A")})
+        crawler.run_shard_crawl({**base_payload, "shard_index": 2, "shard": _shard("folderB", "B")})
+
+        from src.repositories import jobs_repo
+
+        jobs = jobs_repo().list(kind="sharepoint-facts-extraction")
+        assert len(jobs) == 1
+        assert jobs[0]["idempotency_key"] == "sharepoint-facts-extraction:conn1"
+        assert jobs[0]["payload_json"] == {"connection_id": "conn1"}
+
+
+class TestFinalizerFactsPass:
+    def test_the_chained_pass_runs_exactly_once_with_its_own_fresh_deadline(self, monkeypatch):
+        runs = _install_runs_repo(monkeypatch)
+        store = FakeStateStore()
+        _install_fake_state_store(monkeypatch, store)
+        connection = {"id": "conn1", "source_type": "sharepoint"}
+
+        runs.children_for = lambda parent_ids: {
+            parent_ids[0]: [
+                {
+                    "id": "er_1",
+                    "shard_key": "d1",
+                    "shard_label": "A",
+                    "status": "done",
+                    "report": {"new": 3},
+                    "files_seen": 3,
+                    "files_done": 3,
+                    "error": None,
+                }
+            ]
+        }
+
+        calls: List[Any] = []
+
+        def fake_maybe_run_facts_extraction(connection, *, deadline, stats, recorder):
+            calls.append(deadline)
+            return None
+
+        monkeypatch.setattr(crawler, "maybe_run_facts_extraction", fake_maybe_run_facts_extraction)
+
+        crawler._finalize_site_run(connection, "er_parent1")
+
+        assert len(calls) == 1
+        assert isinstance(calls[0], crawler._Deadline)
+
+    def test_a_facts_hard_stop_still_finalizes_the_parent_as_failed(self, monkeypatch):
+        """A hard stop inside the chained pass must not leave the parent
+        stuck `running` forever — it finalizes `failed`, honestly, same
+        severity-first posture the inline crawl's own tail already has."""
+        runs = _install_runs_repo(monkeypatch)
+        store = FakeStateStore()
+        _install_fake_state_store(monkeypatch, store)
+        connection = {"id": "conn1", "source_type": "sharepoint"}
+
+        runs.children_for = lambda parent_ids: {
+            parent_ids[0]: [
+                {
+                    "id": "er_1",
+                    "shard_key": "d1",
+                    "shard_label": "A",
+                    "status": "done",
+                    "report": {"new": 3},
+                    "files_seen": 3,
+                    "files_done": 3,
+                    "error": None,
+                }
+            ]
+        }
+
+        def _raise_facts_stop(connection, *, deadline, stats, recorder):
+            raise RuntimeError("facts model unreachable")
+
+        monkeypatch.setattr(crawler, "maybe_run_facts_extraction", _raise_facts_stop)
+
+        crawler._finalize_site_run(connection, "er_parent1")
+
+        final = runs.finished[-1]
+        assert final["status"] == "failed"
+        assert "facts model unreachable" in final["error"]
+
+    def test_facts_pass_is_skipped_when_every_shard_already_failed(self, monkeypatch):
+        """The finalizer never even attempts the chained pass over a site
+        that already came back `failed` — matching the inline crawl's own
+        posture (a facts pass only ever runs over documents this crawl
+        actually ingested and indexed)."""
+        runs = _install_runs_repo(monkeypatch)
+        store = FakeStateStore()
+        _install_fake_state_store(monkeypatch, store)
+        connection = {"id": "conn1", "source_type": "sharepoint"}
+
+        runs.children_for = lambda parent_ids: {
+            parent_ids[0]: [
+                {
+                    "id": "er_1",
+                    "shard_key": "d1",
+                    "shard_label": "A",
+                    "status": "failed",
+                    "report": {"errors": 5},
+                    "files_seen": 5,
+                    "files_done": 0,
+                    "error": "boom",
+                }
+            ]
+        }
+
+        calls: List[Any] = []
+        monkeypatch.setattr(
+            crawler,
+            "maybe_run_facts_extraction",
+            lambda connection, *, deadline, stats, recorder: calls.append(deadline) or None,
+        )
+
+        crawler._finalize_site_run(connection, "er_parent1")
+
+        assert calls == []
+        assert runs.finished[-1]["status"] == "failed"
+
+
 def test_the_converted_size_cap_is_reachable_by_the_converter():
     """A byte ceiling above what the converter can emit guards nothing.
 
@@ -4600,7 +8441,7 @@ def test_the_converted_size_cap_is_reachable_by_the_converter():
     has to stay reachable, and it has to stay above an ordinary single-byte
     document so the common case is never refused.
     """
-    from connectors.sharepoint.convert import DEFAULT_MAX_CHARS
+    from src.ingest.convert import DEFAULT_MAX_CHARS
     from connectors.sharepoint.crawler import _DEFAULT_MAX_CONVERTED_MB
 
     cap_bytes = _DEFAULT_MAX_CONVERTED_MB * 1024 * 1024
@@ -4616,3 +8457,28 @@ def test_the_converted_size_cap_is_reachable_by_the_converter():
         f"max_converted_mb={_DEFAULT_MAX_CONVERTED_MB} would refuse an ordinary "
         f"single-byte document at the character cap ({single_byte_bytes} bytes)"
     )
+
+
+def test_the_crawl_never_imports_the_admin_api():
+    """A connector must not import ``app.api.admin_sharepoint`` — not even
+    lazily inside a function.
+
+    Beyond the layering (the API sits above the connector), that module
+    binds ``source_connections_repo`` at import time, so the first import
+    of it from inside a crawl freezes whatever factory is installed at that
+    moment into the API for the rest of the process. That is how
+    ``_enqueue_streamed_facts_pass`` leaked this file's fake connections
+    repo into ``tests/test_admin_sharepoint.py`` / ``tests/
+    test_admin_extraction.py`` (52 order-dependent failures). What the
+    crawl needs from that module — the facts readiness gate and the job's
+    idempotency key — lives in ``connectors.sharepoint.facts_extraction``.
+    """
+    import inspect
+    import re
+
+    offending = [
+        line.strip()
+        for line in inspect.getsource(crawler).splitlines()
+        if re.match(r"\s*(from|import)\s+app\.api\.admin_sharepoint\b", line)
+    ]
+    assert offending == [], offending

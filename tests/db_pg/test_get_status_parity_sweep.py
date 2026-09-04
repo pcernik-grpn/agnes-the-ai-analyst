@@ -57,6 +57,9 @@ _SKIP_SUBSTR = ("throw", "stream", "sse", "/events")
 # from `facts_repo()` (see src/repositories/facts_ingest_runs_pg.py) so it
 # needs its own exemption entry even though the reason reads similarly.
 _PG_ONLY_ROUTE_EXEMPTIONS: dict[str, str] = {
+    "GET /api/admin/sharepoint/extraction/runs": (
+        "the extraction fleet feed reads `extraction_runs`, a PG-only table (fleet view, 2026-09-02)"
+    ),
     "GET /api/admin/semantic-model/coverage": (
         "cross-domain coverage reads `resource_source_tags`, a PG-only table (F4.1)"
     ),
@@ -71,6 +74,11 @@ _PG_ONLY_ROUTE_EXEMPTIONS: dict[str, str] = {
     "GET /api/facts/corrections": (
         "facts_repo() is PG-only (A3 ratchet) -- DuckDB has no implementation "
         "to resolve; see src/repositories/facts_pg.py"
+    ),
+    "GET /api/admin/service-accounts": (
+        "list_service_accounts() reads users.kind, a PG-only column (issue "
+        "#1534, A3 ratchet) -- DuckDB has no implementation; see "
+        "src/repositories/users_pg.py"
     ),
     # Ontology builder draft persistence (spec §13.2) — genuinely
     # parameter-free and reaches ontology_drafts_repo() -- DuckDB -> typed

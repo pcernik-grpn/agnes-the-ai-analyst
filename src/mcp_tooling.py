@@ -397,12 +397,13 @@ TITLE_OVERRIDES: dict[str, str] = {
     "tool_docs": "Get Tool Documentation",
     "documentation_api": "Get API Documentation",
     "pull": "Sync Data To This Machine",
-    "stack_artefacts_candidates": "List Artefact Candidates",
+    "stack_artefacts_candidates": "List Artifact Candidates",
     "admin_config_surface": "Get Config Surface",
     "admin_register_table": "Register Source Table",
     "store_compose_plugin": "Publish A Plugin Bundling Existing Items",
     "store_edit_markdown": "Update A Published Skill Or Agent From Markdown",
     "admin_semantic_layer_coverage": "Get Semantic Layer Coverage",
+    "admin_knowledge_packaging_status": "Get Knowledge Packaging Status",
     "admin_semantic_coverage": "List Uncovered Semantic Tables",
     "semantic_model_coverage": "Get Cross-Domain Coverage",
     "semantic_model_coverage_tag": "Add Resource Source Tag",
@@ -426,6 +427,7 @@ TITLE_OVERRIDES: dict[str, str] = {
     "fact_edges": "List Fact Edges Of One Type",
     "fact_claims": "Get Fact Claims",
     "activity": "Get Activity Timeline",
+    "effective_access": "Check Table Access Policy",
 }
 
 

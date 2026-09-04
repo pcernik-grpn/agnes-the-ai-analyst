@@ -121,7 +121,11 @@ def test_the_agent_key_is_granted_as_its_own_secret_and_never_through_dot_env():
     assert "google_secret_manager_secret_iam_member.vm_datadog" in depends
     # The secret NAME may be forwarded to the template; the VALUE may not be
     # resolved in Terraform at all.
-    assert "datadog_api_key_secret       = var.datadog_api_key_secret" in MAIN_TF
+    # Whitespace-tolerant: `terraform fmt` re-aligns the whole assignment
+    # block whenever a longer key joins it, so an exact-spacing assertion
+    # fails on an unrelated addition rather than on the thing it guards —
+    # that the secret NAME is forwarded and the value never resolved.
+    assert re.search(r"datadog_api_key_secret\s+= var\.datadog_api_key_secret", MAIN_TF)
     assert "google_secret_manager_secret_version.datadog" not in MAIN_TF
     assert 'data "google_secret_manager_secret_version"' not in MAIN_TF
 
@@ -161,7 +165,7 @@ def test_the_check_configs_are_rendered_per_instance_not_once_per_module():
     # datadog.yaml carries the instance's own role/name tags and the HTTP+TLS
     # checks its own hostnames, so a flat module-wide map would give a dev VM
     # the prod VM's identity.
-    assert "datadog_files_b64            = local.datadog_files_b64[each.value.name]" in MAIN_TF
+    assert re.search(r"datadog_files_b64\s+= local\.datadog_files_b64\[each\.value\.name\]", MAIN_TF)
     assert "for inst in local.all_instances : inst.name => var.enable_datadog" in MAIN_TF
 
 
@@ -188,7 +192,6 @@ def test_every_static_check_config_is_valid_yaml_with_instances():
 HARDENING = (
     "remote_configuration",
     "apm_config",
-    "logs_enabled: false",
     "use_dogstatsd: false",
     "process_collection",
     "container_collection",
@@ -207,16 +210,29 @@ HARDENING = (
 )
 
 
-def test_datadog_yaml_is_hardened_because_dd_agent_is_in_the_docker_group():
+def _datadog_yaml(*, enable_logs: bool) -> dict:
     rendered = _render(
         "datadog.yaml.tpl",
         site="datadoghq.com",
         env="example-project",
         tags=["customer:acme", "app:agnes", "role:prod"],
+        enable_logs=enable_logs,
     )
     for key in HARDENING:
         assert key in rendered, key
-    doc = yaml.safe_load(rendered.replace("@@DD_API_KEY@@", "x"))
+    return yaml.safe_load(rendered.replace("@@DD_API_KEY@@", "x"))
+
+
+@pytest.mark.parametrize("enable_logs", [False, True])
+def test_datadog_yaml_is_hardened_because_dd_agent_is_in_the_docker_group(enable_logs: bool):
+    """The docker-group compensating controls hold in BOTH states.
+
+    Log collection deliberately left this list (it is an egress decision, not
+    a privilege one — see the template's header), so it is asserted separately
+    below. Everything that could turn docker-group membership into an inbound
+    or remote-controlled capability must stay off either way.
+    """
+    doc = _datadog_yaml(enable_logs=enable_logs)
     assert doc["env"] == "example-project" and doc["site"] == "datadoghq.com"
     assert doc["tags"] == ["customer:acme", "app:agnes", "role:prod"]
     assert doc["remote_configuration"]["enabled"] is False, (
@@ -224,13 +240,62 @@ def test_datadog_yaml_is_hardened_because_dd_agent_is_in_the_docker_group():
         "Datadog org reach back into a host where dd-agent is docker-group"
     )
     assert doc["apm_config"]["enabled"] is False
-    assert doc["logs_enabled"] is False
     assert doc["container_env_as_tags"] == {}, "this stack passes secrets in the environment"
     assert doc["container_labels_as_tags"]["com.docker.compose.service"] == "compose_service"
     # docker_labels_as_tags is the deprecated spelling and is silently ignored;
     # the assertion is on the parsed config, not the text, because the template
     # names the deprecated key in a comment on purpose.
     assert "docker_labels_as_tags" not in doc
+
+
+def test_logs_off_renders_no_logs_configuration_at_all():
+    """An off render must leave no dangling keys — a `logs_config:` with no
+    `logs_enabled` would be a config the agent reads and silently ignores."""
+    doc = _datadog_yaml(enable_logs=False)
+    assert doc["logs_enabled"] is False
+    for key in ("logs_config", "listeners", "config_providers", "container_exclude_logs"):
+        assert key not in doc, f"{key} must not appear when logs are off"
+
+
+def test_logs_on_collects_every_container_through_the_docker_api():
+    doc = _datadog_yaml(enable_logs=True)
+    assert doc["logs_enabled"] is True
+    # logs_enabled alone only collects the agent's own files; the listener and
+    # the config provider are what turn running containers into log sources.
+    assert doc["listeners"] == [{"name": "docker"}]
+    assert doc["config_providers"] == [{"name": "docker", "polling": True}]
+    assert doc["logs_config"]["container_collect_all"] is True, (
+        "an allowlist drifts from the compose file — the exact failure docker-compose.gcp-logging.yml's header records"
+    )
+    assert doc["logs_config"]["docker_container_use_file"] is False, (
+        "dd-agent cannot open /var/lib/docker/containers (root-owned, 0700; "
+        "docker-group grants the socket, not the filesystem), and a default "
+        "ACL cannot inherit onto a 0700 directory because the mode's group "
+        "bits clamp the mask — so read through the Docker API deliberately "
+        "rather than failing the open once per container"
+    )
+
+
+def test_the_oneshot_exclusion_is_metrics_only_so_a_failed_migration_still_logs():
+    """`container_exclude` filters logs as well as metrics, and there is no
+    interaction between the global list and the scoped ones — a container
+    excluded globally cannot be brought back with container_include_logs."""
+    for enable_logs in (False, True):
+        doc = _datadog_yaml(enable_logs=enable_logs)
+        assert "container_exclude" not in doc, (
+            "the global list would silently drop the migrate/extract "
+            "containers' LOGS, which is what an operator reads when a "
+            "migration fails"
+        )
+        assert doc["container_exclude_metrics"], "the metric-side intent must survive the rename"
+    assert _datadog_yaml(enable_logs=True)["container_exclude_logs"] == []
+
+
+def test_main_tf_renders_the_logs_flag_from_the_resolved_destination():
+    assert "enable_logs = local.datadog_logs_active" in MAIN_TF, (
+        "datadog.yaml's logs switch must follow the resolved destination, not "
+        "var.enable_datadog — a VM can run the agent for metrics only"
+    )
 
 
 def test_datadog_yaml_carries_a_placeholder_not_a_key():
@@ -292,8 +357,7 @@ def test_directory_check_watches_the_same_marker_dir_the_watchdog_writes():
 
 
 def test_postgres_check_is_autodiscovery_on_the_image_and_not_billed_dbm():
-    tpl = (FILES / "postgres.yaml.tpl").read_text()
-    doc = yaml.safe_load(tpl)
+    doc = yaml.safe_load(_render("postgres.yaml.tpl", env="example-project", tags=[]))
     assert doc["ad_identifiers"] == ["postgres"], (
         "one template must cover every postgres side-car; the module does not know how many there are"
     )
@@ -302,6 +366,60 @@ def test_postgres_check_is_autodiscovery_on_the_image_and_not_billed_dbm():
     assert inst["password"] == "@@DD_PG_PASSWORD@@", "rendered on the host, not by Terraform"
     assert inst["dbm"] is False, "Database Monitoring is a separate billed product"
     assert inst["ssl"] == "disable", "loopback-only compose network"
+
+
+def test_postgres_check_carries_the_deployment_identity_on_every_series():
+    """The postgres check attributes everything it emits — `postgresql.*` and
+    `postgres.can_connect` alike — to the hostname it RESOLVES for the
+    instance. Under Autodiscovery that is the side-car's container IP: a
+    phantom host nothing else reports for, which agent-level `env`/host tags
+    never join (spec trap #15, found live). The deployment identity must
+    therefore ride on the instance itself, or every env-scoped pg monitor in
+    the consumer catalogue is permanent no-data."""
+    tags = ["customer:acme", "app:agnes", "service:agnes", "role:prod"]
+    doc = yaml.safe_load(_render("postgres.yaml.tpl", env="example-project", tags=tags))
+    inst = doc["instances"][0]
+    assert inst["tags"][0] == "env:example-project", "env is the one dimension every consumer-side monitor scopes on"
+    for t in tags:
+        assert t in inst["tags"], t
+    # Identity is Terraform's job, the credential stays the role script's: the
+    # placeholder must survive the Terraform render for agnes-datadog-pg-role.sh
+    # to substitute on the host.
+    assert inst["password"] == "@@DD_PG_PASSWORD@@"
+
+
+def test_postgres_template_is_terraform_rendered_from_the_same_tags_as_datadog_yaml():
+    """Two render mechanisms split this file's identity from the agent's —
+    Terraform templated datadog.yaml while the on-host role script owned this
+    template whole — and that split is how the check shipped with no identity
+    tags at all. One mechanism now: Terraform renders identity into BOTH from
+    one tag local; the host script substitutes only the credential."""
+    static_block = MAIN_TF[MAIN_TF.index("datadog_static_files = [") : MAIN_TF.index("datadog_files_b64 =")]
+    assert "postgres.yaml.tpl" not in static_block, (
+        "shipped raw it would collide with the rendered entry in the merge()"
+    )
+    assert '"postgres.yaml.tpl" = base64encode(templatefile(' in MAIN_TF
+    assert MAIN_TF.count("local.datadog_tags[inst.name]") == 2, (
+        "datadog.yaml and the postgres check must share ONE identity tag list"
+    )
+
+
+def test_rendering_the_pg_check_puts_the_password_only_in_the_password_field():
+    """agnes-datadog-pg-role.sh renders the template with bash's GLOBAL
+    `${rendered//placeholder/$PW}`, so every occurrence of the placeholder
+    becomes the real credential — a comment that names the literal token ships
+    the password into the rendered file's comments, which is exactly where a
+    `grep -v password` redaction pass does not look before the file is shared.
+    The substitution runs on the file the VM actually holds, which is the
+    Terraform-rendered template — so render first, exactly like the boot does."""
+    pw = "s3cr3t-rendered-password"
+    tpl = _render("postgres.yaml.tpl", env="example-project", tags=["customer:acme"])
+    rendered = tpl.replace("@@DD_PG_PASSWORD@@", pw)
+    carrying = [line for line in rendered.splitlines() if pw in line]
+    assert len(carrying) == 1 and carrying[0].strip().startswith("password:"), (
+        f"the rendered check config must carry the password exactly once, in the password: field; got {carrying!r}"
+    )
+    assert yaml.safe_load(rendered)["instances"][0]["password"] == pw
 
 
 def test_pg_role_bootstrap_keeps_the_password_off_argv_and_never_fails_its_unit():

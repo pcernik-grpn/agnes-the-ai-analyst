@@ -91,8 +91,11 @@ def test_open_session_writes_the_url_from_session_has_turns():
     js = _chat_js()
     body = _slice(
         js,
-        "async function openSession(chatId, wsUrlOverride, { restoring = false } = {}) {",
-        "function chatErrorCopy(raw, kind) {",
+        "async function openSession(chatId, wsUrlOverride, { restoring = false, reconnecting = false, turnInFlight: turnInFlightHint = null } = {}) {",
+        # The copy helpers that used to sit here moved to chat_errors.js
+        # (one home for the sentences, shared with /_debug/error-surfaces),
+        # so handleFrame is openSession's neighbour now.
+        "function handleFrame(frame) {",
     )
     assert "if (_switchingSession) _sessionHasTurns = false;" in body
     # #1973: a RESTORE (deep link / refresh) keeps the param it was opened
@@ -121,13 +124,28 @@ def test_delete_session_clears_the_url_when_deleting_the_open_conversation():
 
 
 def test_new_chat_failure_path_clears_the_url():
-    """``#new-chat``'s click handler resets every session pointer on a failed
+    """The new-conversation gesture resets every session pointer on a failed
     ``newChat()`` — the URL is one of them, or a refresh after a failed "New
-    chat" click could re-open a stale prior session id."""
+    chat" click could re-open a stale prior session id.
+
+    The recovery moved out of ``#new-chat``'s click handler into
+    ``startNewChatFromGesture`` so the ``n`` shortcut shares it; the shortcut
+    used to call ``newChat()`` bare, so a refused create was an unhandled
+    rejection and the keypress silently did nothing."""
     js = _chat_js()
-    body = _slice(js, '$("new-chat")?.addEventListener("click"', '$("chat-form").onsubmit')
+    body = _slice(js, "async function startNewChatFromGesture()", '$("new-chat")?.addEventListener("click"')
     assert "currentChatId = null;" in body
     assert "_syncSessionUrl(null);" in body
+
+
+def test_both_new_chat_gestures_share_the_recovery():
+    """A second entry point that calls ``newChat()`` directly would reintroduce
+    the silent-failure path this function exists to close."""
+    js = _chat_js()
+    assert js.count("startNewChatFromGesture()") >= 2, "the keyboard shortcut no longer shares the recovery"
+    shortcut = _slice(js, 'if (e.key === "n" || e.key === "N")', 'else if (e.key === "/")')
+    assert "startNewChatFromGesture()" in shortcut
+    assert "newChat()" not in shortcut, "the shortcut calls newChat() bare again — rejections vanish"
 
 
 def test_no_popstate_handling_was_added():

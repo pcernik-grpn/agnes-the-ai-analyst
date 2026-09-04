@@ -11,7 +11,7 @@ user sees there, and when to send them.
   rename, pin, bulk cleanup. "Where did our conversation from last week go?"
   → here.
 - `/library` — the one browse surface for everything the user can have or
-  already has: uploaded files & artefacts, data packages, corporate-memory
+  already has: uploaded files & artifacts, data packages, corporate-memory
   domains, marketplace plugins, recipes, skills, agents, and items shared
   with them. An *In stack only* toggle narrows the list to what they
   subscribed to, the *Not in stack yet* filter (in the Filter menu) shows
@@ -46,6 +46,15 @@ user sees there, and when to send them.
   each object at `/semantic-layer/{slug}/{object_id}`.
   "What is our canonical MRR?" → the metrics view (or
   `agnes catalog --metrics` in chat).
+- `/semantic-layer/new` — author a semantic model: tell a conversation which
+  tables it should describe and it drafts datasets, columns and metrics for
+  you, grounded in what is actually registered here — it never invents a
+  table path or a column name. The panel on the right is the real
+  configuration, always hand-editable. Reached from the **+ New model** card
+  on Definitions. An admin's model publishes straight away; anyone else's is
+  submitted for an admin to review, and the button says which before you
+  press it. Available to non-admins only while the Studio surface is on —
+  the page says so when it is not.
 
 ## Skills, plugins & the store
 

@@ -292,7 +292,7 @@ def _prompt(
     lines: List[str] = []
     lines.append("## Knowledge sources this owner can ground the agent in")
     lines.append(
-        _candidate_block(knowledge, "(none — this owner has no data packages, memory domains or artefact collections)")
+        _candidate_block(knowledge, "(none — this owner has no data packages, memory domains or artifact collections)")
     )
     lines.append("")
     lines.append("## Capabilities this owner can give the agent")
@@ -400,9 +400,9 @@ def _stub_turn(message: str, config: Dict[str, Any], knowledge: List[Dict[str, A
         first = still_open[0].label if still_open else None
         return {
             "reply": (
-                f"[stub] Let's build an agent. First thing I need: {first}."
+                f"Let's build an agent. First thing I need: {first}."
                 if first
-                else "[stub] Let's build an agent. Tell me what it should do."
+                else "Let's build an agent. Tell me what it should do."
             ),
             "patch": {},
             "suggestions": [],

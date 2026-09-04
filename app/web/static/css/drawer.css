@@ -425,6 +425,17 @@ button.ds-drawer__step:not([disabled]):hover { background: var(--ds-surface-sunk
 .ds-drawer__mode-card input { margin-right: 6px; }
 .ds-drawer__mode-card .ds-drawer__mode-title { font-weight: 700; font-size: 13px; color: var(--ds-text-primary); }
 .ds-drawer__mode-card .ds-drawer__mode-desc { font-size: 11.5px; color: var(--ds-text-muted); margin-top: 3px; }
+/* The outcome line — the `query_mode` the option actually persists (#1979).
+   Monospaced because it names a stored value the operator will meet again in
+   `agnes catalog`, not prose. Rendered by `renderModeCards` for the register
+   wizard AND the /admin/tables Keboola Edit modal, which is why it lives in
+   this shared sheet rather than a page's own <style>. */
+.ds-drawer__mode-card .ds-drawer__mode-outcome {
+  margin-top: 4px;
+  font-family: var(--ds-font-mono);
+  font-size: 11px;
+  color: var(--ds-text-secondary);
+}
 .ds-drawer__mode-card[hidden] { display: none; }
 
 /* ── Browse pane — the multi-select table list ──────────────────────── */

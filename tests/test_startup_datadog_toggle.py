@@ -80,7 +80,7 @@ BASE_VARS: dict = {
     "data_apps_subdomain_base": "",
     "data_apps_runtime_image": "example/runtime:1",
     "enable_watchdog": True,
-    "enable_gcp_logging": True,
+    "cloud_logging_logs_active": True,
     "alert_webhook_url": "",
     "watchdog_files_b64": {"agnes-watchdog.sh": _b64("#!/bin/bash\n")},
     "ops_agent_config_b64": _b64("logging: {}\n"),
@@ -94,6 +94,11 @@ BASE_VARS: dict = {
     "kai_agent_cpus": "1.0",
     "kai_agent_pg_mem_limit": "1g",
     "kai_agent_broker_mcp_enabled": False,
+    "kai_agent_broker_otlp_enabled": False,
+    "otlp_endpoint": "",
+    "otlp_headers_secret": "",
+    "otlp_capture_content": "0",
+    "deployment_env": "agnes-test",
     "kai_agent_image": "",
     "kai_agent_jwt_secret": "",
     "kai_agent_e2b_key_secret": "",
@@ -101,6 +106,7 @@ BASE_VARS: dict = {
     "extraction_worker_image": "",
     "extraction_worker_mem_limit": "1g",
     "extraction_worker_cpus": "0.5",
+    "extraction_worker_replicas": 1,
     "kai_agent_env_b64": "",
 }
 
@@ -199,7 +205,7 @@ def test_the_key_never_reaches_argv_or_the_startup_log(on: str):
     assert "set -x" not in on, "a trace would print the key"
     # Substitution is bash parameter expansion on a variable, never sed/argv.
     assert "${_dd_content//@@DD_API_KEY@@/$DD_API_KEY_VALUE}" in on
-    block = on[on.index("--- DATADOG AGENT") : on.index("# Boot-time gcplogs driver probe")]
+    block = on[on.index("--- DATADOG AGENT") : on.index("# Boot-time collector probe")]
     assert not re.search(r"\bsed\b[^\n]*DD_API_KEY", block), (
         "a sed substitution would put the key on argv, and from there into /proc "
         "and into this script's own log on any error"
@@ -230,6 +236,29 @@ def test_the_agent_version_is_pinned_and_held(on: str):
     assert f'!= "1:{AGENT_VERSION}-1"' in on
 
 
+def test_the_artifacts_install_after_the_deb_postinst_that_chowns_the_config_dir(on: str):
+    """The order of the apt step and the artifact loop is load-bearing.
+
+    The agent deb's postinst (the embedded fleet installer,
+    `installFilesystem` -> `agentConfigPermissions`, verified on 7.82.3)
+    enforces dd-agent:dd-agent RECURSIVELY on /etc/datadog-agent — on first
+    install and again on every version change. datadog.yaml stays
+    root:dd-agent only because the artifact loop runs AFTER that postinst and
+    re-installs the file with explicit ownership. Swapping the two — say, to
+    have the config in place so the postinst starts the agent already
+    configured — would silently hand the agent user ownership of its own
+    config file, undoing the root-owned-config property the rendered
+    datadog.yaml documents.
+    """
+    apt_at = on.index('apt-get install -y -qq --allow-downgrades "datadog-agent=')
+    first_artifact_at = on.index('_dd_install_artifact "')
+    assert apt_at < first_artifact_at, (
+        "the artifact loop must stay after the apt step — the deb postinst "
+        "recursively chowns /etc/datadog-agent to dd-agent, so artifacts "
+        "installed before it would lose their root ownership"
+    )
+
+
 def test_the_agent_joins_the_docker_group_and_the_service_is_enabled(on: str):
     assert "usermod -aG docker dd-agent" in on
     assert "systemctl enable datadog-agent" in on
@@ -237,6 +266,41 @@ def test_the_agent_joins_the_docker_group_and_the_service_is_enabled(on: str):
     assert "id dd-agent >/dev/null 2>&1" in on, (
         "every ownership flag below needs the group to exist; a failed apt step must not turn into a failed boot"
     )
+
+
+def test_the_fleet_installer_unit_is_masked_before_the_agent_can_start(on: str):
+    """The mask has to beat the apt step, not merely the `systemctl enable`.
+
+    datadog-agent-installer.service is a soft dependency of
+    datadog-agent.service and exits 255 without remote configuration, which
+    this module deliberately disables (DataDog/datadog-agent#43052). The deb's
+    postinst STARTS the agent — see the artifact-ordering test above, whose
+    whole subject is what that postinst does — so the first pull-in happens
+    during `apt-get install`, long before anything here enables the service.
+    A mask applied after that point arrives one failure too late, and masking
+    does not clear a failed state that is already recorded.
+    """
+    mask_cmd = "ln -sf /dev/null /etc/systemd/system/datadog-agent-installer.service"
+    assert mask_cmd in on
+
+    mask = on.index(mask_cmd)
+    apt = on.index('apt-get install -y -qq --allow-downgrades "datadog-agent=')
+    assert mask < apt, (
+        "mask before the package install: its postinst starts the agent, which is what pulls the installer unit in"
+    )
+
+    # `systemctl mask` is not used on purpose: it can refuse a unit whose file
+    # does not exist yet, which is precisely the state before apt runs.
+    assert "systemctl mask datadog-agent-installer.service" not in on
+
+    # A failure a previous boot recorded outlives the mask, so it is cleared too.
+    reset = on.index("systemctl reset-failed datadog-agent-installer.service")
+    assert reset > apt, "reset-failed only helps after the install that could have failed it"
+
+    # Guarded, like every other step in this block — and asserted on the mask's
+    # OWN line, so an unguarded mask cannot be excused by a neighbour's `|| true`.
+    mask_line = on[mask : on.index("\n", on.index("|| echo", mask))]
+    assert '|| echo "WARNING: could not mask' in mask_line, "the mask step is unguarded"
 
 
 def test_every_artifact_is_installed_and_an_empty_payload_removes_its_target(on: str):
@@ -278,7 +342,7 @@ def test_the_artifact_installer_cannot_abort_the_boot(on: str):
 
 
 def test_no_step_of_the_agent_block_can_fail_the_boot(on: str):
-    block = on[on.index("--- DATADOG AGENT") : on.index("# Boot-time gcplogs driver probe")]
+    block = on[on.index("--- DATADOG AGENT") : on.index("# Boot-time collector probe")]
     # Code, not comments — the block explains WHY errexit matters here, which is
     # not the same as re-arming it.
     code = "\n".join(ln for ln in block.splitlines() if not ln.lstrip().startswith("#"))
@@ -390,6 +454,40 @@ def test_the_applier_uid_is_reserved_before_docker_and_datadog(on: str, off: str
         "the applier's uid reservation must run before the Datadog agent "
         "block, or the agent's own dd-agent user can steal the pinned uid first"
     )
+
+
+def test_nothing_executable_precedes_the_uid_reservation(on: str, off: str):
+    """The reservation's guarantee is "before ANY package activity", and the
+    relative anchors above cannot carry it alone: a future `apt-get install`
+    (or a `curl | sh`, or another useradd) inserted ABOVE section 0 would
+    leave every before-Docker / before-Datadog comparison true while
+    re-opening the exact race the reservation exists to close — any
+    package's postinst can allocate a system uid, and the top free one is
+    the uid the applier pins. So pin the invariant itself: between the top
+    of the script and the reservation's `if`, the only executable lines are
+    the fixed prelude — the shell options, the log redirect and its chmod,
+    plain variable assignments (no command substitution), and the banner.
+    """
+    prelude_allowed = (
+        re.compile(r"^#"),  # comments, including the shebang
+        re.compile(r"^\s*$"),  # blank lines
+        re.compile(r"^set -euo pipefail$"),
+        re.compile(r"^exec > /var/log/agnes-startup\.log 2>&1$"),
+        re.compile(r"^chmod 640 /var/log/agnes-startup\.log"),
+        # Plain assignments only — `$(` or a backtick would smuggle a
+        # command into what this whitelist treats as inert.
+        re.compile(r"^[A-Z_][A-Z_0-9]*=(?!.*\$\()(?!.*`).*$"),
+        re.compile(r'^echo "=== \[Agnes '),
+    )
+    for label, body in (("on", on), ("off", off)):
+        reservation_at = body.index("if ! id -u agnes-applier")
+        offenders = [
+            line for line in body[:reservation_at].splitlines() if not any(rx.match(line) for rx in prelude_allowed)
+        ]
+        assert not offenders, (
+            f"[{label}] executable statement(s) before the uid reservation — anything "
+            f"running earlier can allocate the pinned uid first: {offenders!r}"
+        )
 
 
 def test_datadog_pre_creates_dd_agent_at_its_own_pinned_uid(on: str, off: str):

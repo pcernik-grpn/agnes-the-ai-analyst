@@ -23,7 +23,7 @@ from app.chat import agent_profile, inbound, routing, runner
 from app.chat.audit import hash_args, write_audit
 from app.chat.config import ChatConfig
 from app.chat.frame_seq import stamp_frame
-from app.chat.message_parts import build_message_parts, parts_to_tool_calls
+from app.chat.message_parts import build_message_parts, parts_to_tool_calls, parts_to_tool_results
 from app.chat.persistence import ChatRepository
 from app.chat.profiles import get_profile
 from app.chat.provider import SandboxCapacityError, SandboxHandle, SandboxProvider
@@ -492,6 +492,40 @@ class LiveSession:
     # trades that for a narrow at-most-once window across an ownership
     # change — see _inbound_consumer_loop's seeding comment.
     inbound_last_seq: int = 0
+
+
+#: ``approval_resolved`` decisions worth keeping on the tool row. ``cancelled``
+#: is not one: it means the turn ended before anyone answered, which the
+#: card's own retirement already says and the tool row has nothing to add to.
+_RECORDED_APPROVAL_DECISIONS = frozenset({"allow", "allow_session", "deny", "timeout", runner.UNATTENDED})
+
+
+def _record_approval_on_tool_call(turn_buffer: list, frame: dict) -> None:
+    """Stamp a resolved approval's decision onto the buffered ``tool_call`` it
+    was about, so the transcript keeps a trace of it.
+
+    Approval cards are deliberately NOT persisted (they live outside the turn
+    buffer — see ``LiveSession.pending_approvals``), so until now a reload
+    showed a turn's tool rows with no sign that a human had approved or denied
+    any of them; only the audit log knew (issue #2161). The engine provider's
+    ``request_id`` IS the tool call's id, so the pairing is exact: the buffered
+    ``tool_call`` frame gains ``approval``, ``build_message_parts`` copies it
+    onto the persisted part, and the web client draws the same
+    "approved by you" note live and on reload. A call the provider let through
+    on an earlier "Allow for session" arrives the same way (its resolution is
+    marked ``remembered``), so those rows say so too instead of looking
+    ungated. A ``request_id`` that matches no buffered call (the native
+    runner's ``appr-…`` ids are unrelated to tool ids) records nothing — the
+    row cannot claim a decision it cannot pair.
+    """
+    request_id = str(frame.get("request_id") or "")
+    decision = frame.get("decision")
+    if not request_id or decision not in _RECORDED_APPROVAL_DECISIONS:
+        return
+    for buffered in reversed(turn_buffer):
+        if buffered.get("type") == "tool_call" and str(buffered.get("tool_use_id") or "") == request_id:
+            buffered["approval"] = decision
+            return
 
 
 def _approval_attended(live: "LiveSession") -> bool:
@@ -2548,7 +2582,16 @@ class ChatManager:
                 # haystack) and for rows written before schema v123.
                 frame["parts"] = build_message_parts(live.turn_buffer)
                 frame["tool_calls"] = parts_to_tool_calls(frame["parts"])
-                frame["sources"] = sources_verdict(frame.get("content", "") or "", frame.get("tool_calls")).to_dict()
+                # Results as well as calls: a document's name only ever
+                # appears in what a tool RETURNED (see `verify`), so a
+                # citation judged on `tool_calls` alone could never verify.
+                # They ride the verdict, not the row — `parts` already
+                # persists them once.
+                frame["sources"] = sources_verdict(
+                    frame.get("content", "") or "",
+                    frame.get("tool_calls"),
+                    parts_to_tool_results(frame.get("parts")),
+                ).to_dict()
             await self._broadcast(live, frame)
             ftype = frame.get("type")
             # Accumulate in-flight turn frames for mid-turn replay and partial
@@ -2566,6 +2609,7 @@ class ChatManager:
                     live.pending_approvals[rid] = frame
             elif ftype == "approval_resolved":
                 live.pending_approvals.pop(frame.get("request_id"), None)
+                _record_approval_on_tool_call(live.turn_buffer, frame)
             elif ftype == "question_request":
                 rid = frame.get("request_id")
                 if rid:

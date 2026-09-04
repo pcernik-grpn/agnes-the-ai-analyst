@@ -209,6 +209,8 @@ writes that field, there is no drift to reconcile and no need to cross-check
   `Release`-pipeline, Devin Review) are advisory — green/red doesn't gate merge.
 - **`enforce_admins: true`** in branch protection means `--admin` flag on
   `gh pr merge` does NOT bypass. Don't try; just fix the underlying block.
+- **A cut PR's CI needs one click before it can merge.** See § A cut PR
+  arrives with its CI unapproved below.
 - **`lint-workflows.yml` is advisory.** Triggered on changes to
   `.github/workflows/**` or `scripts/ops/**.sh`. Runs `actionlint` on
   workflow YAMLs + `shellcheck --severity=warning` on freestanding ops
@@ -217,6 +219,68 @@ writes that field, there is no drift to reconcile and no need to cross-check
   once the repo is actionlint-clean. The `shellcheck` step IS blocking at
   warning+ severity — info/style findings ride through, real bugs break
   CI.
+
+### A cut PR arrives with its CI unapproved
+
+`daily-cut.yml` opens the cut PR as `github-actions[bot]`, and GitHub queues
+the `pull_request` workflow run for a bot-opened PR in **`action_required`**
+— created, but not started. Until someone clicks **Approve and run
+workflows** on it, `test` and `docker-build` never report, so `gh pr merge`
+answers:
+
+    405  Repository rule violations found
+         2 of 2 required status checks are expected
+
+That is the whole thing: one click, then merge normally. Nothing is broken
+and no special privilege is involved — the run exists and is waiting.
+
+**If you are not a human, you cannot give that click.** The REST equivalent,
+`POST /repos/{owner}/{repo}/actions/runs/{run_id}/approve`, answers
+
+    403  Resource not accessible by integration
+
+to an integration token — the `actions: write` permission an app can be
+granted does not cover approving a queued-for-approval run. There is no
+token scope to add and no retry that helps. So a non-human release driver
+should not open a cut through `daily-cut.yml` at all and then get stuck one
+click short of merging; take the § Emergency path when Actions dispatch
+isn't available above instead. Cutting by hand with `scripts/release_cut.py`
+and opening the PR under your own identity produces the *same* diff, and its
+`pull_request` run starts immediately — the queue-for-approval rule keys on
+who opened the PR, not on what the branch contains. 0.97.0 shipped this way.
+
+**The same 405 has a second, unrelated cause: a branch that is behind.**
+Required status checks are evaluated against the CURRENT base, so a PR whose
+`test` and `docker-build` are green — but whose head predates the latest
+`main` — is refused with that identical message, with nothing waiting for
+approval. Tell the two apart by `mergeable_state`, which reads `behind` here
+and `blocked` in the unapproved-run case, and by the checks themselves:
+green-but-stale versus never reported. The fix is to update the branch (merge
+`main` in, or *Update branch*) and let CI re-run against the new base. Worth
+stating because the message names neither cause, so the one that comes to
+mind is whichever you debugged last.
+
+**Do not reach for `gh workflow run ci.yml` instead.** It looks like the
+obvious workaround and it is not one. A `workflow_dispatch` run does put
+green check-runs on the PR's head SHA — 18 of them on the 0.97.0 cut,
+`test` and `docker-build` among them — and the merge is refused anyway with
+that same message. Tested on two separate cut PRs (#2144, #2159). The
+required contexts want the run from the `pull_request` event; the dispatched
+one does not stand in for it. The dispatch is still useful for *checking* a
+cut's content before approving, but it does not open the gate.
+
+Two things that make this easy to misdiagnose:
+
+- `mergeable_state` reads **`blocked`** in this state. Everywhere else in
+  this repo that means "review required", and here it does not — nothing
+  about approving the PR will clear it.
+- The check tab looks *empty* rather than red, so it reads as "CI never ran"
+  rather than "CI is waiting for you".
+
+For the record of what a healthy cut looks like: on 0.96.0's cut the
+`pull_request` run was created at `06:15:52`, the same minute the bot pushed
+the branch, and shows `run_attempt: 2` — the attempt bump is the approve/
+re-run click, not a second push.
 
 ### Recovery when something derails
 

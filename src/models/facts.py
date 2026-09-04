@@ -34,6 +34,16 @@ class Fact(Base):
 
     id: Mapped[str] = mapped_column(String, primary_key=True)
     type: Mapped[str] = mapped_column(String, nullable=False)
+    # Grace-period anchor for `FactsPgRepository.sweep_orphans` (live
+    # finding, 2026-09: several concurrent facts-extraction passes racing
+    # their own end-of-batch sweeps against one shared fact graph deleted a
+    # sibling pass's just-minted, not-yet-evidenced subject). A row older
+    # than the sweep's grace window is swept as before; NULL (a row that
+    # predates this column) reads as "old enough" — see migration
+    # 0100_facts_created_at.
+    created_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), server_default=sa.text("now()"), nullable=True
+    )
 
 
 class FactAlias(Base):
@@ -46,7 +56,14 @@ class FactAlias(Base):
     """
 
     __tablename__ = "fact_aliases"
-    __table_args__ = (sa.Index("idx_fact_aliases_fact_id", "fact_id"),)
+    __table_args__ = (
+        sa.Index("idx_fact_aliases_fact_id", "fact_id"),
+        # Ingest resolution looks up by natural_key alone, but the primary
+        # key (type, natural_key) doesn't lead with it — hand-built on a
+        # live instance before this shipped — migration
+        # ``0106_hot_path_indexes``, TCRD-296 gap #44.
+        sa.Index("idx_fact_aliases_natural_key", "natural_key"),
+    )
 
     type: Mapped[str] = mapped_column(String, primary_key=True)
     natural_key: Mapped[str] = mapped_column(String, primary_key=True)
@@ -213,3 +230,10 @@ class IngestRun(Base):
     #: a fabricated `{}`/zero — see
     #: ``migrations/versions/0088_ingest_runs_llm_usage.py``.
     llm_usage: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    #: Edges `ingest_batch` skipped because their `src`/`dst` fact was gone
+    #: by the time the edge INSERT ran — a race with a concurrent pass's
+    #: own `sweep_orphans()` or a merge/dedup, never a producer mistake
+    #: (`EdgeEndpointMissing` in `src/repositories/facts_pg.py`). No
+    #: itemized detail list, unlike `claims_rejected` — see
+    #: ``migrations/versions/0099_ingest_runs_edges_skipped.py``.
+    edges_skipped_missing_endpoint: Mapped[int] = mapped_column(sa.Integer, server_default="0", nullable=False)

@@ -36,7 +36,7 @@
   .drop__sub { font-size: 0.78rem; color: var(--ds-text-secondary); }
   .drop input[type="file"] { display: none; }
   .drop__actions { display: flex; gap: var(--space-2); align-items: center; margin-top: var(--space-2); }
-  /* The promotion note under the drop zone (single-file artefacts only). */
+  /* The promotion note under the drop zone (single-file artifacts only). */
   .drop__note { margin: var(--space-3) 0 0; font-size: 0.8rem; color: var(--ds-text-secondary); }
   .drop__note strong { color: var(--ds-text-primary); font-weight: var(--font-semibold); }
 
@@ -205,7 +205,7 @@
    back to instead of one per layout. #}
 {% set _back = '/library' %}
 {% set _back_label = 'Library' %}
-{# Presentation adapts to file count: a one-file artefact reads AS the file
+{# Presentation adapts to file count: a one-file artifact reads AS the file
    (single-document glyph, filename title, TYPE · size), two-or-more (or zero)
    as a collection (two-sheet glyph, N files). Adding a second file promotes a
    file into a collection. The noun follows the same rule so the copy never
@@ -216,7 +216,7 @@
    and NEVER from `files` (the current page/search slice): a 26-file
    collection whose Files section happens to be on page 2 (1 row left) or
    whose search box narrows the visible rows to 1 must still read as a
-   collection, not silently promote into looking like a single-file artefact.
+   collection, not silently promote into looking like a single-file artifact.
    `single_file` is the one true row the route fetches directly (unfiltered,
    unpaginated) whenever `files_total_all == 1`, so this identity never
    depends on the page slice containing that row. #}
@@ -224,13 +224,13 @@
 {% set _single = _n == 1 %}
 {% set _f0 = single_file if (_single and single_file) else none %}
 {% set _noun = 'file' if _single else 'collection' %}
-{# Title is the artefact's NAME (what the caller typed), for both shapes — a
-   single-file artefact keeps the file glyph + filename-in-meta, but its name
+{# Title is the artifact's NAME (what the caller typed), for both shapes — a
+   single-file artifact keeps the file glyph + filename-in-meta, but its name
    is honored rather than overwritten by the filename. #}
 {% set _title = collection.name or (_f0.filename if _f0 else '') %}
 {% set _hero_glyph = 'doc' if _single else 'library' %}
 {# The resource type follows the same count rule as the noun and the glyph: a
-   one-file artefact IS a file (amber), two-or-more is a collection (coral).
+   one-file artifact IS a file (amber), two-or-more is a collection (coral).
    Three signals, one source of truth. #}
 {% set _kind = 'file' if _single else 'library' %}
 {% if _f0 %}
@@ -583,8 +583,8 @@
 
 {# Uploading targets a COLLECTION, so it is this page's affordance and never
    the individual file page's — and it comes AFTER the file list: the page
-   leads with what is in the artefact, then offers to grow it. On a one-file
-   artefact growing it is a real change of shape (file → collection), so the
+   leads with what is in the artifact, then offers to grow it. On a one-file
+   artifact growing it is a real change of shape (file → collection), so the
    drop zone says so before the reader acts, instead of surprising them with
    a promoted "collection" afterwards.
 
@@ -600,6 +600,19 @@
     upload. To hand-manage this collection, unselect its scope in the
     connect wizard first.
   </p>
+  {# SharePoint permissions captured as METADATA (TCRD-296 gap #79) —
+     admin-only, informational: this is what SharePoint's own permission
+     list says, independent of Agnes access (the Sharing card in the aside
+     is the authority for that unless this scope's access mode is
+     'mirrored'). Server-side computed (app/web/router.py::library_detail)
+     so it degrades to nothing rather than an error when no snapshot has
+     been captured yet, or the instance runs the DuckDB app-state backend. #}
+  {% if sharepoint_permissions_visible_to %}
+  <p class="drop__note" title="From SharePoint's own permissions, captured periodically by the sharepoint-acl-sync job. Agnes's own access for this collection may differ (see Sharing) unless this scope's access mode is mirrored.">
+    In SharePoint, this folder is visible to:
+    {%- for n in sharepoint_permissions_visible_to %} <strong>{{ n }}</strong>{% if not loop.last %},{% endif %}{% endfor -%}.
+  </p>
+  {% endif %}
 {{ detail.section_close() }}
 {% else %}
 {{ detail.section_open('Add files', icon='file') }}
@@ -680,7 +693,7 @@
    as it is on the file page — the two used to disagree about whether a
    collection even had a visibility worth stating. #}
 {# Count-aware, like the noun itself: "sharing the file shares every file in
-   it" is what the blind noun-swap used to say about a one-file artefact. #}
+   it" is what the blind noun-swap used to say about a one-file artifact. #}
 {% set _share_note %}
   {% if _single %}
     Sharing covers this file. If it grows into a collection, the same sharing

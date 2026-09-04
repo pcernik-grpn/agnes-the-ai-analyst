@@ -410,6 +410,194 @@ async def list_root_children(access_token: str, drive_id: str) -> List[Dict[str,
     return _map_child_rows(rows)
 
 
+async def list_root_children_with_url(access_token: str, drive_id: str) -> List[Dict[str, Any]]:
+    """Root-level items of one drive, carrying each item's ``webUrl`` AND
+    ``child_count`` — a thin sibling of :func:`list_root_children` for the
+    site-split planner (``app.api.admin_sharepoint``'s ``GET …/split-plan`` /
+    ``POST …/splits``) and the automatic shard planner
+    (``connectors.sharepoint.shard_plan``): a folder's ``webUrl`` is what
+    lets :func:`search_document_count` scope a Graph Search query to it via a
+    KQL ``path:`` filter, and its ``child_count`` is the cheap, already-
+    fetched balancing signal the shard planner prefers over a Search call
+    (2026-09-04 finding #65: a large multi-scope connection drove Graph
+    Search into a sustained 429 storm at planning time; ``child_count``
+    riding this SAME listing call is what lets most folders skip Search
+    entirely). Both were previously TWO separate calls (this one for
+    ``webUrl``, :func:`list_root_children` for ``child_count``) — folded into
+    one ``$select`` so a caller needing both pays for one listing, not two.
+
+    Not folded into :func:`list_root_children` itself: that function's own
+    tests pin an exact ``{id, name, is_folder, child_count}`` dict shaped for
+    its OWN callers (the ACL subtree sweep, the wizard tree), and adding
+    ``web_url`` there would be a payload no caller of that function wants.
+    Pages the full ``@odata.nextLink`` chain, same as :func:`list_root_children`.
+    """
+    rows = await _graph_get_all_pages(
+        access_token,
+        f"/drives/{drive_id}/root/children",
+        params={"$select": "id,name,folder,file,webUrl", "$top": "200"},
+    )
+    return [
+        {
+            "id": item["id"],
+            "name": item.get("name") or item["id"],
+            "is_folder": "folder" in item,
+            "web_url": item.get("webUrl"),
+            "child_count": (item.get("folder") or {}).get("childCount"),
+        }
+        for item in rows
+    ]
+
+
+async def get_item_web_url(access_token: str, drive_id: str, item_id: Optional[str] = None) -> Optional[str]:
+    """``webUrl`` of one drive item — the drive ROOT when ``item_id`` is
+    ``None``, else that specific item. Used by the completeness check
+    (``app.api.admin_extraction``'s ``…/extraction/completeness``) to turn a
+    confirmed scope's ``(drive_id, source_scope_id)`` into the ``web_url``
+    :func:`search_document_count` needs — the same identity
+    :func:`list_root_children_with_url` already resolves for drive-ROOT
+    children, extended to one arbitrary item.
+
+    **Never raises** — same contract as :func:`search_document_count`: a
+    failed lookup (network error, non-200, missing field) returns ``None``,
+    and the caller treats a scope whose ``web_url`` could not be resolved as
+    "expected unknown", never as zero.
+    """
+    path = f"/drives/{drive_id}/root" if not item_id else f"/drives/{drive_id}/items/{item_id}"
+    try:
+        body = await _graph_get(access_token, path, params={"$select": "webUrl"})
+    except Exception:  # noqa: BLE001 — best-effort lookup, never fails the caller
+        logger.warning("sharepoint get_item_web_url failed for drive %s item %s", drive_id, item_id, exc_info=True)
+        return None
+    web_url = body.get("webUrl")
+    return str(web_url) if web_url else None
+
+
+async def get_root_web_url(access_token: str, drive_id: str) -> Optional[str]:
+    """This drive's OWN ``webUrl`` — the shard planner's site-total signal
+    (2026-09-03 auto-parallel-crawl design §4.1 point 2): a single
+    :func:`search_document_count` scoped to the drive root, before ever
+    listing a folder, is what lets the planner take the inline (no-shard)
+    path for a drive that turns out to be small without an extra round trip.
+
+    Best-effort: any failure (403 on this app registration, a malformed
+    body) returns ``None`` rather than raising — the caller treats a missing
+    ``webUrl`` the same way :func:`search_document_count` treats an empty
+    ``web_url`` string, i.e. the search falls back to the next signal.
+    """
+    try:
+        body = await _graph_get(access_token, f"/drives/{drive_id}/root", params={"$select": "webUrl"})
+    except SharePointGraphError:
+        return None
+    web_url = body.get("webUrl")
+    return str(web_url) if web_url else None
+
+
+async def list_item_children_with_url(access_token: str, drive_id: str, item_id: str) -> List[Dict[str, Any]]:
+    """Children of an arbitrary folder, carrying each item's ``webUrl`` AND
+    ``child_count`` — the shard planner's "fold a folder still over target
+    one level deeper" step (2026-09-03 auto-parallel-crawl design §4.1
+    point 3): the same ``webUrl``/``child_count`` pair
+    :func:`list_root_children_with_url` exposes for a top-level folder,
+    generalized past the drive root the same way :func:`list_item_children`
+    generalizes :func:`list_root_children`.
+
+    Pages the full ``@odata.nextLink`` chain, same as every other listing
+    helper in this module.
+    """
+    rows = await _graph_get_all_pages(
+        access_token,
+        f"/drives/{drive_id}/items/{item_id}/children",
+        params={"$select": "id,name,folder,file,webUrl", "$top": "200"},
+    )
+    return [
+        {
+            "id": item["id"],
+            "name": item.get("name") or item["id"],
+            "is_folder": "folder" in item,
+            "web_url": item.get("webUrl"),
+            "child_count": (item.get("folder") or {}).get("childCount"),
+        }
+        for item in rows
+    ]
+
+
+async def search_document_count(
+    access_token: str,
+    web_url: str,
+    *,
+    min_modified: Optional[str] = None,
+    exclude_extensions: Optional[frozenset] = None,
+) -> int:
+    """Best-effort document count under one drive-item path, via Graph
+    Search (``POST /search/query``, ``entityTypes: ["driveItem"]``) — the
+    site-split planner's own balancing signal, and the completeness check's
+    "expected" count (``app.api.admin_extraction``'s ``…/extraction/
+    completeness``). Deliberately NEVER a delta walk: a delta walk gets
+    throttled under repetition and its first pages are biased, which would
+    skew which folders look "big" (module docstring of
+    ``app.api.admin_sharepoint``'s split-plan endpoint has the full
+    reasoning). ``region: "NAM"`` is required by Graph Search and pinned the
+    same way everywhere it is used in this codebase.
+
+    Query: ``path:"<web_url>" AND IsDocument:1``, optionally narrowed by
+    ``AND LastModifiedTime>=<min_modified>`` (an admin-supplied
+    ``YYYY-MM-DD``, validated by the caller before it ever reaches here) and
+    by ``AND NOT (fileextension:ext1 OR fileextension:ext2 ...)`` when
+    ``exclude_extensions`` is given — the completeness check's caller passes
+    the crawler's own ``_unsupported_extensions()`` so "expected" only
+    counts documents the crawl would actually attempt to convert, matching
+    what a full run could ever land in the corpus. ``exclude_extensions``
+    entries are a closed, internally-defined set (never user text spliced
+    into the query), same trust boundary as ``min_modified``.
+
+    **Never raises** — a failed count (network error, non-200, a malformed
+    or empty ``hitsContainers``) returns ``0``. A folder whose count could
+    not be read must still be assignable to a group; the caller (the
+    packing algorithm) treats ``0`` as "balances like an empty folder", not
+    as "drop this folder" — see :func:`connectors.sharepoint.site_split.
+    pack_folders_into_groups`.
+    """
+    query = f'path:"{web_url}" AND IsDocument:1'
+    if min_modified:
+        query += f" AND LastModifiedTime>={min_modified}"
+    if exclude_extensions:
+        excluded = " OR ".join(f"fileextension:{ext}" for ext in sorted(exclude_extensions))
+        query += f" AND NOT ({excluded})"
+    request_body = {
+        "requests": [
+            {
+                "entityTypes": ["driveItem"],
+                "query": {"queryString": query},
+                "region": "NAM",
+                "from": 0,
+                "size": 1,
+            }
+        ]
+    }
+    try:
+        async with _http_client() as client:
+            resp = await client.post(
+                f"{GRAPH_BASE}/search/query",
+                json=request_body,
+                headers={"Authorization": f"Bearer {access_token}"},
+                timeout=_GRAPH_TIMEOUT_S,
+            )
+        if resp.status_code != 200:
+            logger.warning("sharepoint search document-count failed: HTTP %s %s", resp.status_code, resp.text[:500])
+            return 0
+        data = resp.json()
+    except Exception:  # noqa: BLE001 — best-effort balancing signal, must never fail the planner
+        logger.warning("sharepoint search document-count raised", exc_info=True)
+        return 0
+    try:
+        containers = data["value"][0]["hitsContainers"]
+        total = containers[0].get("total")
+        return int(total) if isinstance(total, (int, float)) else 0
+    except (KeyError, IndexError, TypeError, ValueError):
+        return 0
+
+
 async def list_item_children(access_token: str, drive_id: str, item_id: str) -> List[Dict[str, Any]]:
     """Children of an arbitrary folder within one drive (TCRD-240) — the same
     item shape as :func:`list_root_children`, generalized past the drive root
@@ -430,6 +618,38 @@ async def list_item_children(access_token: str, drive_id: str, item_id: str) -> 
         params={"$select": "id,name,folder,file", "$top": "999"},
     )
     return _map_child_rows(rows)
+
+
+async def get_item_by_path(access_token: str, drive_id: str, item_path: str) -> Dict[str, Any]:
+    """Resolve one folder (or file) path within a drive straight to its
+    item metadata, via Graph's by-path addressing (``/drives/{drive_id}/
+    root:/{path}`` — bare ``/drives/{drive_id}/root`` for the drive root
+    itself when ``item_path`` is empty). The drive-item-level complement to
+    :func:`get_site_by_path`: the bulk scope-add endpoint (``POST
+    …/scopes/bulk``, admin_sharepoint.py) uses this to turn an admin-typed
+    folder path directly into a Graph item id, without an interactive
+    tree walk first. Same normalized shape as :func:`list_item_children`'s
+    rows, so a caller can splice a resolved item straight into a listing.
+
+    ``drive_id`` is sent as an opaque Graph path segment only — callers must
+    structurally validate it first (see
+    ``app.api.admin_sharepoint._validate_graph_id``), same rule as
+    :func:`list_item_children`. Each ``item_path`` segment is percent-encoded
+    before it reaches the Graph URL — the path is admin-typed, and quoting is
+    what makes it structurally inert regardless of what the caller validated
+    (security playbook: never build a request path from an unchecked value).
+
+    Raises :class:`SharePointGraphError` (``status_code=404``) when the path
+    does not exist in this drive — callers distinguish that from a genuine
+    outage the same way :func:`search_folders` already does.
+    """
+    segments = [seg for seg in item_path.split("/") if seg]
+    if segments:
+        path = f"/drives/{drive_id}/root:/" + "/".join(quote(seg, safe="") for seg in segments)
+    else:
+        path = f"/drives/{drive_id}/root"
+    body = await _graph_get(access_token, path, params={"$select": "id,name,folder,file"})
+    return _map_child_rows([body])[0]
 
 
 async def _list_children(access_token: str, drive_id: str, item_id: Optional[str]) -> List[Dict[str, Any]]:

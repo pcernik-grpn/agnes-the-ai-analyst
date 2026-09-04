@@ -20,15 +20,23 @@ physical-source-catalog reference, a distributable registry twin, clearing
 
 Group names double as the ``cost_center`` values the policy compares
 against (``list_contains($user_groups, cost_center)`` requires the two
-namespaces to coincide) — they are spelled WITHOUT ``_``/``%`` on purpose:
-``$user_groups`` binds the caller's ENTIRE live group list (not merely the
-group relevant to this table), and ``policied_relation`` (§6.3) raises
-``PolicyError`` for the whole request the moment ANY of those group names
-contains a LIKE/SIMILAR-TO metacharacter — so ``CC_A``/``CC_B`` (the
-design doc's own example values, which contain ``_``) would 500 every
-request from a member of them. That guard is real, working, security
-behaviour; using group names that trip it here would break the fixture,
-not exercise the feature.
+namespaces to coincide). The main ``sweep`` fixture's own ``CCA``/``CCB``
+are spelled without ``_``/``%`` for purely historical reasons:
+``policied_relation`` used to raise ``PolicyError`` for the whole request
+the moment ANY live group name of the caller contained a LIKE/SIMILAR-TO
+metacharacter, so ``CC_A``/``CC_B`` (the design doc's own example values)
+500-ed every read by a member of them. That refusal is now scoped to a
+policy body that actually MATCHES an identity variable as a pattern
+(#1979) — this policy compares it as a value, so a metacharacter-spelled
+group name works here too. Issue #2147 backlog item 5 adds the dedicated
+coverage that claim wants: ``TestMetacharacterGroupNamePersona`` below
+seeds ``finance_eu``/``10%_club`` group members against a
+``list_contains($user_groups, ...)`` policy and drives every row-returning
+surface this file already sweeps, asserting a filtered 200 rather than the
+old 500 — plus a save-time check that a policy whose BODY (not merely a
+caller's group name) puts an identity variable in a LIKE PATTERN position
+is still refused (``policy_var_in_pattern_position``), which is the one
+metacharacter-adjacent case that must still deny.
 
 Two things this file deliberately does NOT try to be:
 
@@ -548,6 +556,194 @@ class TestEffectiveAccess:
         entry = next((t for t in r.json()["tables"] if t["table_id"] == "invoices"), None)
         assert entry is not None
         assert entry["policy"]["rows_visible"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Issue #2147 backlog item 5 — the metacharacter-group-name persona the
+# module docstring's own history section talks about, actually exercised
+# rather than merely explained away. A dedicated fixture (not the ``sweep``
+# fixture above) so its own row/persona counts stay independent of every
+# other class's assertions in this file.
+# ---------------------------------------------------------------------------
+
+METACHAR_POLICY_SQL = "SELECT * FROM invoices_metachar WHERE list_contains($user_groups, cost_center)"
+
+METACHAR_ROWS = [
+    {"id": "1", "cost_center": "finance_eu", "amount": "10"},
+    {"id": "2", "cost_center": "finance_eu", "amount": "20"},
+    {"id": "3", "cost_center": "10%_club", "amount": "30"},
+    {"id": "4", "cost_center": "10%_club", "amount": "40"},
+]
+FINANCE_EU_IDS = {"1", "2"}
+TEN_PCT_CLUB_IDS = {"3", "4"}
+
+
+@pytest.fixture
+def metachar_sweep(seeded_app, mock_extract_factory, monkeypatch):
+    """One ``server_only`` local table, policied on ``$user_groups`` alone,
+    and two personas whose only LIVE group is spelled with a LIKE/SIMILAR-TO
+    metacharacter (``finance_eu`` has an underscore, ``10%_club`` has both a
+    percent sign and an underscore) — the exact shape #1979 used to 500 for
+    every read, and the shape the pattern-position guard now leaves alone
+    because this policy compares ``$user_groups`` as a VALUE
+    (``list_contains``), never as a pattern.
+    """
+    from app.auth.jwt import create_access_token
+    from src.db import get_system_db
+    from src.orchestrator import SyncOrchestrator
+    from src.repositories.table_registry import TableRegistryRepository
+    from src.repositories.users import UserRepository
+    from tests.conftest import grant_table_via_package
+
+    monkeypatch.setenv("AGNES_ACCESS_POLICIES_ENABLED", "true")
+
+    env = seeded_app["env"]
+    mock_extract_factory("keboola", [{"name": "invoices_metachar", "data": METACHAR_ROWS}])
+    SyncOrchestrator(analytics_db_path=env["analytics_db"]).rebuild()
+
+    conn = get_system_db()
+    try:
+        registry = TableRegistryRepository(conn)
+        registry.register(
+            id="invoices_metachar",
+            name="invoices_metachar",
+            source_type="keboola",
+            query_mode="local",
+            server_only=True,
+            bucket="in.c-finance",
+            source_table="invoices_metachar",
+        )
+        registry.set_access_policy(
+            "invoices_metachar", sql=METACHAR_POLICY_SQL, note="metacharacter-group cost-centre filter", updated_by="admin"
+        )
+
+        users = UserRepository(conn)
+        users.create(id="u_finance_eu", email="finance_eu@example.com", name="Finance EU")
+        users.create(id="u_10pct_club", email="tenpct@example.com", name="Ten Pct Club")
+
+        grant_table_via_package(conn, "invoices_metachar", "u_finance_eu", group_name="finance_eu")
+        grant_table_via_package(conn, "invoices_metachar", "u_10pct_club", group_name="10%_club")
+    finally:
+        conn.close()
+
+    return {
+        **seeded_app,
+        "finance_eu_token": create_access_token("u_finance_eu", "finance_eu@example.com"),
+        "ten_pct_club_token": create_access_token("u_10pct_club", "tenpct@example.com"),
+    }
+
+
+class TestMetacharacterGroupNamePersona:
+    """Every row-returning surface this file already sweeps, driven by a
+    caller whose only live group name carries a LIKE/SIMILAR-TO
+    metacharacter — a correctly filtered 200, never the old fail-closed 500
+    (which would itself have been a DIFFERENT bug: refusing a legitimate
+    caller is not equivalent to the leak this file otherwise hunts, but it
+    is exactly the regression #1979 fixed, and it must stay fixed)."""
+
+    def test_api_query_filters_by_the_metacharacter_group(self, metachar_sweep):
+        c = metachar_sweep["client"]
+        r = c.post(
+            "/api/query",
+            json={"sql": "SELECT * FROM invoices_metachar"},
+            headers=_auth(metachar_sweep["finance_eu_token"]),
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["row_count"] == 2, body
+        id_idx = body["columns"].index("id")
+        assert {row[id_idx] for row in body["rows"]} == FINANCE_EU_IDS
+
+    def test_api_query_filters_by_the_percent_and_underscore_group(self, metachar_sweep):
+        c = metachar_sweep["client"]
+        r = c.post(
+            "/api/query",
+            json={"sql": "SELECT * FROM invoices_metachar"},
+            headers=_auth(metachar_sweep["ten_pct_club_token"]),
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["row_count"] == 2, body
+        id_idx = body["columns"].index("id")
+        assert {row[id_idx] for row in body["rows"]} == TEN_PCT_CLUB_IDS
+
+    def test_v2_sample_filters_by_the_metacharacter_group(self, metachar_sweep):
+        c = metachar_sweep["client"]
+        r = c.get("/api/v2/sample/invoices_metachar?n=10", headers=_auth(metachar_sweep["finance_eu_token"]))
+        assert r.status_code == 200, r.text
+        rows = r.json()["rows"]
+        assert {row["id"] for row in rows} == FINANCE_EU_IDS
+
+    def test_v2_scan_filters_by_the_percent_and_underscore_group(self, metachar_sweep):
+        from app.api.v2_arrow import parse_ipc_bytes
+
+        c = metachar_sweep["client"]
+        r = c.post(
+            "/api/v2/scan", json={"table_id": "invoices_metachar"}, headers=_auth(metachar_sweep["ten_pct_club_token"])
+        )
+        assert r.status_code == 200, r.text
+        table = parse_ipc_bytes(r.content)
+        assert set(table.column("id").to_pylist()) == TEN_PCT_CLUB_IDS
+
+    def test_mcp_query_table_filters_by_the_metacharacter_group(self, metachar_sweep):
+        c = metachar_sweep["client"]
+        r = c.post(
+            "/api/mcp/query-table/invoices_metachar",
+            json={"filter": {}, "limit": 10},
+            headers=_auth(metachar_sweep["finance_eu_token"]),
+        )
+        assert r.status_code == 200, r.text
+        rows = r.json()["rows"]
+        assert {row["id"] for row in rows} == FINANCE_EU_IDS
+
+    def test_effective_access_reports_the_metacharacter_persona_own_row_count(self, metachar_sweep):
+        c = metachar_sweep["client"]
+        r = c.get("/api/me/effective-access", headers=_auth(metachar_sweep["ten_pct_club_token"]))
+        assert r.status_code == 200, r.text
+        entry = next(
+            (t for t in r.json()["tables"] if t["table_id"] == "invoices_metachar"),
+            None,
+        )
+        assert entry is not None
+        assert entry["policy"]["applies"] is True
+        assert entry["policy"]["reason"] == "ok"
+        assert entry["policy"]["rows_visible"] == 2
+
+
+class TestPolicyBodyPatternPositionStillRefusedAtSave:
+    """The one refusal that DOES remain, and the one #1979 never touched:
+    save-time validation still rejects a policy whose BODY (never a
+    caller's own group name) puts an identity variable in LIKE/SIMILAR-TO
+    PATTERN position -- ``policy_var_in_pattern_position``. Distinguishing
+    "a caller's group name happens to contain a metacharacter" (fine, bound
+    as a value) from "the policy text itself matches a variable as a
+    pattern" (never fine, for any caller) is the entire point of the fix
+    this class's sibling above exercises the other half of.
+    """
+
+    def test_save_time_rejects_a_body_matching_an_identity_variable_as_a_pattern(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("AGNES_ACCESS_POLICIES_ENABLED", "true")
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        table_id = _register(c, token, name="pattern_position_tbl", server_only=True).json()["id"]
+
+        resp = c.put(
+            f"/api/admin/registry/{table_id}",
+            json={
+                "access_policy_sql": f"SELECT * FROM {table_id} WHERE unit LIKE $user_email",
+                "access_policy_note": "hand-authored, should be refused before it ever saves",
+            },
+            headers=_auth(token),
+        )
+        assert resp.status_code == 422, resp.text
+        assert "policy_var_in_pattern_position" in resp.text
+
+        # The row must stay UNPOLICIED after the rejected save -- a partial
+        # write here would be its own leak (an unreadable/half-applied
+        # policy silently attached despite the 422).
+        from src.repositories import table_registry_repo
+
+        assert not table_registry_repo().get(table_id).get("access_policy_sql")
 
 
 # ---------------------------------------------------------------------------

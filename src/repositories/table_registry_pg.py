@@ -19,6 +19,7 @@ from src.repositories.table_registry import (
     _decode_where_filters,
     _encode_primary_key,
     _encode_where_filters,
+    _policy_guarded_server_only,
 )
 
 
@@ -52,7 +53,11 @@ class TableRegistryPgRepository:
         initial_load_chunk_days: Optional[int] = None,
         bq_fqn: Optional[str] = None,
         # v74 (#607) — distribution flag decoupled from query_mode.
-        server_only: bool = False,
+        # `None` = "caller has no opinion": a fresh insert lands False, an
+        # upsert onto a POLICIED row preserves the stored value instead of
+        # resetting it (see `_policy_guarded_server_only`, shared with the
+        # DuckDB repo so the two backends cannot drift on the rule).
+        server_only: Optional[bool] = None,
         # v79 — nullable FK to source_connections.id (spec 2026-06-12).
         connection_id: Optional[str] = None,
     ) -> None:
@@ -61,6 +66,22 @@ class TableRegistryPgRepository:
         encoded_filters = _encode_where_filters(where_filters)
         effective_strategy = sync_strategy or "full_refresh"
         with self._engine.begin() as conn:
+            # Read the row this upsert may overwrite BEFORE writing, inside
+            # the same transaction — the ON CONFLICT clause below cannot
+            # express "keep server_only when the stored row is policied"
+            # without also swallowing the refusal case. Mirrors the DuckDB
+            # repo statement for statement.
+            prior = conn.execute(
+                sa.text("SELECT access_policy_sql, server_only FROM table_registry WHERE id = :id"),
+                {"id": id},
+            ).fetchone()
+            effective_server_only = _policy_guarded_server_only(
+                table_id=id,
+                query_mode=query_mode,
+                requested_server_only=server_only,
+                existing_policy_sql=prior[0] if prior else None,
+                existing_server_only=prior[1] if prior else None,
+            )
             conn.execute(
                 sa.text(
                     """INSERT INTO table_registry (id, name, folder, sync_strategy,
@@ -125,7 +146,7 @@ class TableRegistryPgRepository:
                     "pgr": partition_granularity,
                     "ilcd": initial_load_chunk_days,
                     "bq_fqn": bq_fqn,
-                    "server_only": bool(server_only),
+                    "server_only": effective_server_only,
                     "connection_id": connection_id,
                 },
             )
@@ -316,7 +337,7 @@ class TableRegistryPgRepository:
 
         Rows are identified by ``source_type='collection'`` and
         ``bucket=corpus_id``.  Returns the list of deleted table ids so the
-        caller can clean up derived artefacts (parquet files, extract.duckdb
+        caller can clean up derived artifacts (parquet files, extract.duckdb
         views) before calling ``orchestrator.rebuild_source``.
 
         Dependant cleanup included, mirroring the DuckDB sibling — without

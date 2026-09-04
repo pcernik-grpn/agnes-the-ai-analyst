@@ -596,6 +596,29 @@ def test_materialize_query_invalid_source_query_json_raises(tmp_path, fake_stora
         )
 
 
+def test_materialize_query_unknown_filter_key_fails_instead_of_exporting_everything(
+    tmp_path, fake_storage_client_parquet
+):
+    """A registry row carrying a misspelled filter key must make the sync
+    FAIL, never fall back to a full-table export (#1979). Before the guard,
+    `where_filter` parsed into a default ExportFilter and the whole table
+    was exported and distributed."""
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    with pytest.raises(ValueError, match="unknown key"):
+        kbe.materialize_query(
+            table_id="typo_filter",
+            bucket="in.c-sales",
+            source_table="orders",
+            source_query='{"where_filter": [{"column": "status", "operator": "eq", "values": ["open"]}]}',
+            storage_client=fake_storage_client_parquet,
+            output_dir=output_dir,
+        )
+    # Loud, and BEFORE the export — nothing was asked of the Storage API.
+    fake_storage_client_parquet.prepare_export.assert_not_called()
+    assert not list(output_dir.iterdir())
+
+
 def test_materialize_query_passes_filter_spec_to_export(tmp_path, fake_storage_client_parquet):
     """source_query JSON is parsed into ExportFilter and forwarded to the
     Storage API client. Verifies the dispatch shape — the actual

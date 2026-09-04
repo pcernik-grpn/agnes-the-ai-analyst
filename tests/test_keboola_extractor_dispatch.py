@@ -1,10 +1,7 @@
 """extractor.run() dispatches on sync_strategy."""
-from datetime import date
-from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
-import pytest
 
 
 def _stub_extension(monkeypatch):
@@ -27,7 +24,7 @@ def test_full_refresh_uses_extension_path(tmp_path, monkeypatch):
 
     called = {"extension": 0, "incremental": 0, "partitioned": 0}
 
-    def fake_via_extension(conn, tc, pq_path):
+    def fake_via_extension(conn, tc, pq_path, *a, **kw):
         called["extension"] += 1
         pa_t = pa.table({"id": pa.array([1, 2])})
         pq.write_table(pa_t, pq_path)
@@ -44,11 +41,16 @@ def test_full_refresh_uses_extension_path(tmp_path, monkeypatch):
     monkeypatch.setattr("connectors.keboola.incremental.extract_incremental", fake_incremental)
     monkeypatch.setattr("connectors.keboola.partitioned.extract_partitioned", fake_partitioned)
 
-    tcs = [{
-        "id": "in.c-crm.company", "name": "company",
-        "bucket": "in.c-crm", "source_table": "company",
-        "sync_strategy": "full_refresh", "query_mode": "local",
-    }]
+    tcs = [
+        {
+            "id": "in.c-crm.company",
+            "name": "company",
+            "bucket": "in.c-crm",
+            "source_table": "company",
+            "sync_strategy": "full_refresh",
+            "query_mode": "local",
+        }
+    ]
     extractor.run(str(tmp_path), tcs, "https://kbc.example", "tok")
     assert called == {"extension": 1, "incremental": 0, "partitioned": 0}
 
@@ -75,12 +77,17 @@ def test_incremental_calls_extract_incremental(tmp_path, monkeypatch):
     # last_sync read returns None (clean state)
     monkeypatch.setattr(extractor, "_read_last_sync", lambda tid: None)
 
-    tcs = [{
-        "id": "in.c-crm.activity", "name": "activity",
-        "bucket": "in.c-crm", "source_table": "activity",
-        "sync_strategy": "incremental", "query_mode": "local",
-        "primary_key": ["activity_id"],
-    }]
+    tcs = [
+        {
+            "id": "in.c-crm.activity",
+            "name": "activity",
+            "bucket": "in.c-crm",
+            "source_table": "activity",
+            "sync_strategy": "incremental",
+            "query_mode": "local",
+            "primary_key": ["activity_id"],
+        }
+    ]
     result = extractor.run(str(tmp_path), tcs, "https://kbc.example", "tok")
     assert called == {"extension": 0, "incremental": 1, "partitioned": 0}
     assert result["tables_extracted"] == 1
@@ -104,7 +111,9 @@ def test_partitioned_calls_extract_partitioned(tmp_path, monkeypatch):
         pa_t = pa.table({"id": pa.array([1])})
         pq.write_table(pa_t, out / "2026_05.parquet")
         return {
-            "rows": 1, "delta_rows": 1, "partitions_touched": 1,
+            "rows": 1,
+            "delta_rows": 1,
+            "partitions_touched": 1,
             "changed_since_used": None,
         }
 
@@ -112,13 +121,19 @@ def test_partitioned_calls_extract_partitioned(tmp_path, monkeypatch):
     monkeypatch.setattr("connectors.keboola.partitioned.extract_partitioned", fake_partitioned)
     monkeypatch.setattr(extractor, "_read_last_sync", lambda tid: None)
 
-    tcs = [{
-        "id": "in.c-sales.orders", "name": "orders",
-        "bucket": "in.c-sales", "source_table": "orders",
-        "sync_strategy": "partitioned", "query_mode": "local",
-        "partition_by": "date", "partition_granularity": "month",
-        "primary_key": ["id"],
-    }]
+    tcs = [
+        {
+            "id": "in.c-sales.orders",
+            "name": "orders",
+            "bucket": "in.c-sales",
+            "source_table": "orders",
+            "sync_strategy": "partitioned",
+            "query_mode": "local",
+            "partition_by": "date",
+            "partition_granularity": "month",
+            "primary_key": ["id"],
+        }
+    ]
     result = extractor.run(str(tmp_path), tcs, "https://kbc.example", "tok")
     assert called == {"extension": 0, "incremental": 0, "partitioned": 1}
     assert result["tables_extracted"] == 1
@@ -146,14 +161,19 @@ def test_where_filters_force_legacy_path(tmp_path, monkeypatch):
     monkeypatch.setattr(extractor, "_extract_via_extension", fake_via_extension)
     monkeypatch.setattr(extractor, "_extract_via_legacy", fake_legacy)
 
-    tcs = [{
-        "id": "in.c-crm.opp", "name": "opp",
-        "bucket": "in.c-crm", "source_table": "opp",
-        "sync_strategy": "full_refresh", "query_mode": "local",
-        "where_filters": [
-            {"column": "snapshot_date", "operator": "ge", "values": ["{{last_6_months}}"]},
-        ],
-    }]
+    tcs = [
+        {
+            "id": "in.c-crm.opp",
+            "name": "opp",
+            "bucket": "in.c-crm",
+            "source_table": "opp",
+            "sync_strategy": "full_refresh",
+            "query_mode": "local",
+            "where_filters": [
+                {"column": "snapshot_date", "operator": "ge", "values": ["{{last_6_months}}"]},
+            ],
+        }
+    ]
     extractor.run(str(tmp_path), tcs, "https://kbc.example", "tok")
     assert called == {"extension": 0, "legacy": 1}
     assert captured_filters["v"] is not None

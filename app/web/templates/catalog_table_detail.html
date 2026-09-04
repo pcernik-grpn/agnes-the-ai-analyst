@@ -22,6 +22,11 @@
   .td-columns code { font-family: var(--ds-font-mono); font-size: 12px; color: var(--kind); }
   .td-columns .td-type { color: var(--ds-text-secondary); font-family: var(--ds-font-mono); font-size: 12px; }
   .td-columns .td-null { color: var(--ds-text-muted); font-size: 11px; }
+  .td-masked-badge {
+    display: inline-block; margin-left: 6px; padding: 1px 6px; border-radius: 999px;
+    font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.03em;
+    background: var(--ds-surface-dim); color: var(--ds-text-secondary); border: 1px solid var(--ds-border-light);
+  }
   .td-pairs { display: flex; gap: 8px; flex-wrap: wrap; }
   .td-pairs a {
     display: inline-flex; align-items: center; gap: 6px; padding: 6px 12px;
@@ -113,7 +118,7 @@
     <tbody>
       {% for c in columns %}
       <tr>
-        <td><code>{{ c.name }}</code></td>
+        <td><code>{{ c.name }}</code>{% if c.masked %}<span class="td-masked-badge" title="masked by an access policy">masked</span>{% endif %}</td>
         <td class="td-type">{{ c.type or '—' }}</td>
         <td class="td-null">{{ 'nullable' if c.nullable else 'not null' }}</td>
       </tr>

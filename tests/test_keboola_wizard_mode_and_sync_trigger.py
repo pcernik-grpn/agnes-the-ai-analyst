@@ -17,12 +17,13 @@ used by `tests/test_admin_data_sources_page.py::TestWizardRegisterPayloadContrac
 
 from __future__ import annotations
 
-from pathlib import Path
+from tests._admin_data_sources_source import read_admin_data_sources_source
 
 
 def _template_text() -> str:
-    tpl = Path(__file__).resolve().parents[1] / "app" / "web" / "templates" / "admin_data_sources.html"
-    return tpl.read_text(encoding="utf-8")
+    # Perf follow-up (2026-09-03): most of this page's JS moved into
+    # extracted static files, see tests/_admin_data_sources_source.py.
+    return read_admin_data_sources_source()
 
 
 def _picker_row(tpl: str) -> str:

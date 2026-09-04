@@ -1,19 +1,29 @@
-"""Serve uploaded cover images with immutable cache headers and ?w= variants.
+"""Serve uploaded cover images and /static assets with tuned cache headers.
 
 Project: Agnes — platform for analyzing structured data with extraction,
   facts, and semantic search; operates offline, in-app.
 Module: app/web/cover_files.py
 Deps:   starlette, fastapi, src.images.variants
-Tested: tests/test_cover_files.py, tests/test_cover_image_perf_contract.py
+Tested: tests/test_cover_files.py, tests/test_cover_image_perf_contract.py,
+  tests/test_html_cache_control.py (VersionedStaticFiles cases)
 
 Key responsibilities:
 - Override Starlette StaticFiles to inject Cache-Control headers for covers.
 - Serve a resized WebP variant when the request carries ``?w=480`` or
   ``?w=960``; any other value (or none) serves the original, unchanged.
+- ``VersionedStaticFiles`` does the same for the ``/static`` mount: immutable
+  only when the request carries the ``?v=`` cache-buster.
 
 Design constraints:
 - Filenames are content-addressed (SHA256 of bytes), so immutable is safe.
 - 200 and 304 responses get the cache header; other statuses pass through.
+- ``VersionedStaticFiles`` immutability is keyed on the ``?v=`` query param.
+  Most template references get it from ``_static_url`` (app/web/router.py);
+  the few that can't run Jinja (an external ``<script src>``, a JS-side
+  fetch/import) get it from a ``window._ag*`` URL stamped once in
+  app/web/templates/_app_scripts.html — a bare unversioned ``/static/...``
+  URL must stay revalidate-only, nothing guarantees a changed file got a
+  changed URL.
 - The width branch re-derives containment from ``lookup_path`` even though
   Starlette's own lookup already enforces it — defense-in-depth, matching
   the pattern in src/marketplace_asset_mirror.py's ``_write_body``.
@@ -110,4 +120,37 @@ class CoverFiles(StaticFiles):
         if self.is_not_modified(response.headers, Headers(scope=scope)):
             response = NotModifiedResponse(response.headers)
         response.headers["cache-control"] = COVER_CACHE_CONTROL
+        return response
+
+
+STATIC_VERSIONED_CACHE_CONTROL: Final = "public, max-age=31536000, immutable"
+STATIC_UNVERSIONED_CACHE_CONTROL: Final = "no-cache"
+
+
+def _has_version_param(query_string: bytes) -> bool:
+    """True if the raw ASGI query string carries a ``v`` param (any value)."""
+    return "v" in parse_qs(query_string.decode("latin-1"))
+
+
+class VersionedStaticFiles(StaticFiles):
+    """Serve /static with a 1-year immutable cache, gated on ``?v=``.
+
+    Most references build their URL through ``_static_url`` (app/web/router.py),
+    which appends ``?v=<file_mtime_int>``; a handful that can't run Jinja get
+    the same cache-buster from a ``window._ag*`` URL stamped once in
+    app/web/templates/_app_scripts.html instead. A URL that carries that
+    cache-buster is safe to cache forever -- a changed file gets a new URL,
+    so the old cached response is never reused for new bytes. A request
+    without ``?v=`` (a stale bookmark, a manual curl) gets only ``no-cache``
+    -- it must revalidate every time, since nothing here guarantees the file
+    behind that exact URL hasn't changed.
+    """
+
+    async def get_response(self, path: str, scope: Scope) -> Response:
+        response = await super().get_response(path, scope)
+        if response.status_code in (200, 304):
+            versioned = _has_version_param(scope.get("query_string", b""))
+            response.headers["cache-control"] = (
+                STATIC_VERSIONED_CACHE_CONTROL if versioned else STATIC_UNVERSIONED_CACHE_CONTROL
+            )
         return response

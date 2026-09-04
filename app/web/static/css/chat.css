@@ -991,15 +991,121 @@ a.msg-source-chip.is-link:focus-visible {
 /* Mermaid output. Inserted WITHOUT the markdown sanitizer (its <style> block
    carries every colour it has — see renderMermaidBlocks), so the container is
    what bounds it: a diagram sizes itself from its content and would otherwise
-   push the bubble wider than the column. */
+   push the bubble wider than the column.
+
+   makeResponsiveSvg has already replaced the root <svg>'s fixed width with
+   100% + a max-width from the viewBox, so a diagram now SHRINKS to the column
+   instead of being clipped and scrolled. overflow-x stays as the backstop for
+   a diagram whose natural minimum still exceeds the width. */
 .msg-mermaid {
   margin: 10px 0;
+  position: relative;
+}
+.msg-mermaid-stage {
   overflow-x: auto;
 }
 .msg-mermaid svg {
   max-width: 100%;
   height: auto;
 }
+
+/* Toolbar. Quiet until the diagram is hovered or something inside it has
+   focus — the diagram is the content, the controls are not. Kept visible
+   whenever focus is inside so it stays reachable from the keyboard. */
+.msg-mermaid-bar {
+  display: flex;
+  gap: 4px;
+  justify-content: flex-end;
+  margin-top: 4px;
+  opacity: 0;
+  transition: opacity .12s ease;
+}
+.msg-mermaid:hover .msg-mermaid-bar,
+.msg-mermaid:focus-within .msg-mermaid-bar {
+  opacity: 1;
+}
+.msg-mermaid-btn {
+  font-family: var(--ds-font);
+  font-size: var(--text-xs);
+  color: var(--ds-text-secondary);
+  background: var(--ds-surface);
+  border: 1px solid var(--ds-border);
+  border-radius: 6px;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+.msg-mermaid-btn:hover {
+  color: var(--ds-text-primary);
+  background: var(--ds-surface-dim);
+}
+.msg-mermaid-btn:focus-visible {
+  outline: 2px solid var(--ds-primary);
+  outline-offset: 1px;
+}
+@media (prefers-reduced-motion: reduce) {
+  .msg-mermaid-bar { transition: none; }
+}
+
+/* Full-screen view. The point of the whole toolbar: a diagram worth drawing
+   usually has more structure than a chat column can show. */
+.msg-mermaid-lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 3000;
+  /* A fixed dark scrim, matching .cloud-chat-upload-overlay. NOT the
+     color-mix-on-`--ds-text-primary` scrim used elsewhere: that token inverts
+     with the theme, so on a dark instance it mixes a near-WHITE wash and the
+     page reads straight through the dialog. */
+  background: rgba(0, 0, 0, 0.66);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  touch-action: none;
+  cursor: grab;
+}
+.msg-mermaid-lightbox:active { cursor: grabbing; }
+/* The diagram's own ground. Fixed: pan/zoom transforms the canvas INSIDE it,
+   so the surface stays put and clips rather than sliding away with the
+   diagram. */
+.msg-mermaid-panel {
+  width: 88vw;
+  height: 84vh;
+  overflow: hidden;
+  background: var(--ds-surface);
+  border: 1px solid var(--ds-border);
+  border-radius: 12px;
+  box-shadow: var(--ds-shadow-lg);
+}
+.msg-mermaid-canvas {
+  width: 100%;
+  height: 100%;
+  transform-origin: center center;
+  pointer-events: none;
+}
+.msg-mermaid-canvas svg {
+  width: 100%;
+  height: 100%;
+  max-width: none;
+}
+.msg-mermaid-close {
+  position: absolute;
+  top: 16px;
+  right: 18px;
+  font-family: var(--ds-font);
+  font-size: var(--text-sm);
+  color: var(--ds-text-primary);
+  background: var(--ds-surface);
+  border: 1px solid var(--ds-border);
+  border-radius: 8px;
+  padding: 6px 14px;
+  cursor: pointer;
+}
+.msg-mermaid-close:focus-visible {
+  outline: 2px solid var(--ds-primary);
+  outline-offset: 2px;
+}
+
 .msg-mermaid-error {
   font-size: var(--text-xs);
   color: var(--ds-accent-warn-ink);
@@ -1716,6 +1822,24 @@ summary.cloud-chat-tool-head::-webkit-details-marker { display: none; }
   color: var(--ds-text-muted);
   font-variant-numeric: tabular-nums;
 }
+/* The human decision that gated this call, kept on the row after the
+   approval card is retired (and restored on reload from the persisted
+   part). Same outcome palette as the approval card's own badge. */
+.cloud-chat-tool-approval {
+  flex: 0 0 auto;
+  font-size: var(--text-xs);
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--ds-accent-success-line);
+  background: var(--ds-accent-success-bg);
+  color: var(--ds-accent-success-ink);
+  white-space: nowrap;
+}
+.cloud-chat-tool-approval.is-deny {
+  border-color: var(--ds-accent-danger-line);
+  background: var(--ds-accent-danger-bg);
+  color: var(--ds-accent-danger-ink);
+}
 .cloud-chat-tool-chevron {
   flex: 0 0 auto;
   color: var(--ds-text-muted);
@@ -2087,6 +2211,35 @@ summary.cloud-chat-tool-head::-webkit-details-marker { display: none; }
   outline-offset: var(--ds-focus-outline-offset);
 }
 
+/* The turn is still running, and this reader scrolled up and so cannot see the
+   indicator at the foot of the transcript (#2156). A pulsing dot on the way
+   back is the whole signal: the button's job and its label do not change, and
+   the dot is generated content so the accessible name stays "Jump to latest".
+   Toggled from setTurnInFlight off the same `_turnInFlight` the Stop button
+   reads, which is what keeps the two from ever disagreeing — and toggled
+   there rather than in syncJumpToLatest, so the class rides the element even
+   while the button is hidden and scrolling up mid-turn reveals one already
+   carrying it. */
+.cloud-chat-jump.is-working::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  flex: 0 0 auto;
+  border-radius: var(--ds-radius-pill);
+  background: var(--ds-primary);
+  animation: cloudchat-jump-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes cloudchat-jump-pulse {
+  50% { opacity: 0.25; }
+}
+
+/* Reduced motion keeps the DOT (it is the signal) and drops only the pulse —
+   the same trade the thinking dots and the "Finishing…" pill already make. */
+@media (prefers-reduced-motion: reduce) {
+  .cloud-chat-jump.is-working::before { animation: none; }
+}
+
 /* ============================================================ slash menu
    Filterable "/" catalog (GET /api/chat/skills) — pops up above the
    composer, anchored to .cloud-chat-form's position: relative. Visual
@@ -2271,24 +2424,13 @@ summary.cloud-chat-tool-head::-webkit-details-marker { display: none; }
 
 /* System notes — turn-stopping events (budget stop, error, cancel) rendered
    IN the transcript, where the reader scrolls back, not only the status bar. */
+/* Look and tone live on `.notice` (style-custom.css) — this class now only
+   sizes the note inside the message column. It used to be a fully tinted
+   pill with centred, coloured text, which is what made a "come back in a
+   minute" read like a crash; see the .notice block for the whole argument. */
 .cloud-chat-system-note {
-  margin: 8px auto;
-  padding: 6px 14px;
-  /* --radius-md (style-custom.css), like the toast sibling below:
-     --ds-radius-md does not exist in the token set, and a var() to an
-     undefined property with no fallback voids the declaration (radius 0). */
-  border-radius: var(--radius-md);
-  font-size: 0.85rem;
-  text-align: center;
   max-width: 70%;
-  border: 1px solid var(--ds-accent-warn-line);
-  background: var(--ds-accent-warn-bg);
-  color: var(--ds-accent-warn-ink);
-}
-.cloud-chat-system-note.is-error {
-  border-color: var(--ds-accent-danger-line);
-  background: var(--ds-accent-danger-bg);
-  color: var(--ds-accent-danger-ink);
+  margin-inline: auto;
 }
 
 /* Next-action chips — the model's suggested follow-ups, lifted out of the
@@ -2366,36 +2508,18 @@ summary.cloud-chat-tool-head::-webkit-details-marker { display: none; }
   gap: var(--space-2);
   pointer-events: none;
 }
+/* Surface, border, radius and tone come from `.notice--floating`; what is
+   left here is what makes it a TOAST — it can be clicked away, it animates
+   in, and it is capped so a long receipt wraps instead of spanning the
+   window. The three per-tone tint blocks that used to live here are gone: a
+   toast is a receipt, and repainting the whole chip per outcome is what made
+   every one of them shout. */
 .cloud-chat-toast {
   pointer-events: auto;
-  display: inline-flex;
-  align-items: center;
-  gap: var(--space-2);
-  padding: 7px var(--space-3);
-  background: var(--ds-surface);
-  color: var(--ds-text-primary);
-  border: 1px solid var(--ds-border);
-  border-radius: var(--radius-md);
-  box-shadow: var(--shadow-md);
-  font-size: var(--text-sm);
   max-width: 360px;
+  margin: 0;
   cursor: pointer;
   animation: cloudchat-toast-in 140ms ease-out;
-}
-.cloud-chat-toast.is-ok {
-  background: var(--ds-accent-success-bg);
-  border-color: var(--ds-accent-success-line);
-  color: var(--ds-accent-success-ink);
-}
-.cloud-chat-toast.is-warn {
-  background: var(--ds-accent-warn-bg);
-  border-color: var(--ds-accent-warn-line);
-  color: var(--ds-accent-warn-ink);
-}
-.cloud-chat-toast.is-error {
-  background: var(--ds-accent-danger-bg);
-  border-color: var(--ds-accent-danger-line);
-  color: var(--ds-accent-danger-ink);
 }
 .cloud-chat-toast.is-leaving {
   animation: cloudchat-toast-out 120ms ease-in forwards;
@@ -3357,15 +3481,11 @@ html[data-ui-layout="rail"] .cloud-chat-main:has(#chat-capabilities:not([hidden]
 }
 
 /* Error + success inline banners in dialogs. */
-.cloud-chat-upload-error {
-  padding: var(--space-3);
-  border-radius: var(--ds-radius-sm, 4px);
-  background: var(--ds-accent-danger-bg);
-  border: 1px solid var(--ds-accent-danger-line);
-  color: var(--ds-accent-danger-ink);
-  font-size: var(--text-sm);
-  line-height: 1.5;
-}
+/* A HOST for the shared `.notice`, not a box of its own — showDialogError
+   appends one. Was a tinted danger panel with coloured ink, which said
+   "something is broken" for every refusal including the ones that clear by
+   themselves. */
+.cloud-chat-upload-error > .notice { margin: 0; }
 .cloud-chat-upload-error[hidden] { display: none; }
 
 /* Dialog action row */
@@ -4538,6 +4658,21 @@ html[data-ui-layout="rail"] .cloud-chat-shell.has-thread .cloud-chat-main::after
   background: var(--ds-code-bg);
   color: var(--ds-code-ink);
   overflow-x: auto;
+}
+/* The args preview is one <code> inside the dark <pre>. The inline-code
+   chip rule (light background, 1px border, 1px 4px padding) that every
+   bare `code` inherits turned each JSON line into a light chip on the dark
+   block; `pre.code-block-wrap code` resets it for tool-arg blocks, and the
+   approval block needs the same reset (issue #2161). */
+.cloud-chat-approval-cmd code {
+  display: block;
+  background: transparent;
+  color: inherit;
+  padding: 0;
+  border: none;
+  border-radius: 0;
+  font-size: inherit;
+  white-space: pre;
 }
 
 .cloud-chat-approval-actions {

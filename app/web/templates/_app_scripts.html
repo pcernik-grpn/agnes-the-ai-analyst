@@ -1,3 +1,15 @@
+    <!-- Cache-buster URLs for /static assets that a plain <script src> or
+         hardcoded fetch() can't run through static_url() (external file, or
+         a lazy runtime fetch/import) — so VersionedStaticFiles' immutable
+         cache still applies to them instead of falling back to no-cache on
+         every load. Non-deferred: must run before icon_sprite.js (deferred)
+         fetches the sprite below. Included from both base.html and
+         base_ds.html, so every page gets these regardless of layout. -->
+    <script>
+      window._agLucideSpriteUrl = "{{ static_url('vendor/lucide-sprite.svg') }}";
+      window._agMermaidUrl = "{{ static_url('vendor/mermaid.min.js') }}";
+      window._agTourUrl = "{{ static_url('js/tour.js') }}";
+    </script>
     <!-- Lucide sprite loader (#1503) — injects vendor/lucide-sprite.svg inline
          so `ds.icon()` / `iconEl()` can use SAME-DOCUMENT <use href="#name">
          references (external-document <use> only works in Safari 17.1+).
@@ -17,6 +29,11 @@
          the user circle renders identically across /admin/users, /admin/adoption,
          etc. See app/web/static/js/identity.js. -->
     <script src="{{ static_url('js/identity.js') }}" defer></script>
+    <!-- window.AgnesPeopleSearch — the one "find an account by name or
+         email" client lookup, so the group drawer's People field and the
+         group detail pane's "add someone" search can never drift onto two
+         different endpoints again. See app/web/static/js/people_search.js. -->
+    <script src="{{ static_url('js/people_search.js') }}" defer></script>
     <!-- Fast `[data-tip]` tooltip (v113). Shared because the trust markers are
          icon-only, so the tooltip IS their label, and the native `title` delay
          (600ms+, OS-controlled) is far too slow for that. Delegated on document,
@@ -384,6 +401,10 @@
           { label: 'Telemetry',                   hint: 'admin',        href: '/admin/telemetry' },
           { label: 'Sessions',                    hint: 'admin',        href: '/admin/sessions' },
           { label: 'Curated marketplaces',        hint: 'admin · g c',  href: '/admin/marketplaces' },
+          {# Ungated: this list only renders for an admin (`#adminMenu`), and an
+             admin's authoring always succeeds — the apply endpoint's admin
+             branch is a plain admin write, not Studio-gated. #}
+          { label: 'New semantic model',           hint: 'authoring',    href: '/semantic-layer/new' },
           {% if can_studio %}
           { label: 'Studio',                       hint: 'authoring',    href: '/admin/studio' },
           { label: 'Studio · Data package',       hint: 'authoring',    href: '/admin/studio/data-package' },

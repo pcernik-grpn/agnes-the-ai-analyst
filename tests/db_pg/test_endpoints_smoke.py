@@ -376,6 +376,41 @@ class TestUsersSmoke:
 
 
 # ---------------------------------------------------------------------------
+# Service accounts (issue #1534) — PG-only (A3 ratchet).
+# ---------------------------------------------------------------------------
+
+
+class TestServiceAccountsSmoke:
+    COVERED_ROUTES = {
+        "POST /api/admin/service-accounts",
+        "GET /api/admin/service-accounts",
+        "POST /api/admin/service-accounts/{service_account_id}/tokens",
+        "PATCH /api/admin/service-accounts/{service_account_id}",
+    }
+
+    def test_create_and_list(self, seeded_app_both):
+        r = seeded_app_both["client"].post(
+            "/api/admin/service-accounts",
+            json={"name": "Smoke Bot", "slug": "smoke-bot"},
+            headers=_admin_headers(seeded_app_both),
+        )
+        assert r.status_code in (201, 501)
+
+        r2 = seeded_app_both["client"].get("/api/admin/service-accounts", headers=_admin_headers(seeded_app_both))
+        assert r2.status_code in (200, 501)
+
+    def test_mint_and_lifecycle_update_are_reachable(self, seeded_app_both):
+        """Path-param routes: 404 (no such account) on Postgres, 501
+        (RequiresPostgresBackend) on DuckDB — never a raw 500 either way."""
+        client = seeded_app_both["client"]
+        headers = _admin_headers(seeded_app_both)
+        r = client.post("/api/admin/service-accounts/does-not-exist/tokens", json={"name": "x"}, headers=headers)
+        assert r.status_code in (404, 501), r.status_code
+        r = client.patch("/api/admin/service-accounts/does-not-exist", json={"active": False}, headers=headers)
+        assert r.status_code in (404, 501), r.status_code
+
+
+# ---------------------------------------------------------------------------
 # RBAC (groups + grants + access-overview)
 # ---------------------------------------------------------------------------
 
@@ -395,6 +430,7 @@ class TestRBACSmoke:
         "PUT /api/admin/grants/{grant_id}",
         "DELETE /api/admin/grants/{grant_id}",
         "GET /api/admin/access-overview",
+        "GET /api/admin/access/resources/{resource_type}/search",
         "GET /api/admin/resource-types",
         "GET /api/admin/activity",
         "GET /api/admin/activity/health",
@@ -417,6 +453,14 @@ class TestRBACSmoke:
     def test_resource_types(self, seeded_app_both):
         r = seeded_app_both["client"].get("/api/admin/resource-types", headers=_admin_headers(seeded_app_both))
         assert r.status_code == 200
+
+    def test_corpus_file_search(self, seeded_app_both):
+        r = seeded_app_both["client"].get(
+            "/api/admin/access/resources/corpus_file/search?q=xx",
+            headers=_admin_headers(seeded_app_both),
+        )
+        assert r.status_code == 200
+        assert isinstance(r.json(), list)
 
     def test_activity(self, seeded_app_both):
         r = seeded_app_both["client"].get("/api/admin/activity", headers=_admin_headers(seeded_app_both))
@@ -964,6 +1008,8 @@ class TestAdminRegistrySmoke:
         "PUT /api/admin/registry/{table_id}",
         "DELETE /api/admin/registry/{table_id}",
         "POST /api/admin/registry/{table_id}/policy/preview",
+        "POST /api/admin/registry/{table_id}/policy/preview-groups",
+        "POST /api/admin/registry/{table_id}/policy/preview-matrix",
         "GET /api/admin/discover-tables",
         "POST /api/admin/configure",
         "GET /api/admin/metadata/{table_id}",
@@ -1066,6 +1112,65 @@ class TestAdminRegistrySmoke:
         r = seeded_app_both["client"].post(
             f"/api/admin/registry/{table_id}/policy/preview",
             json={"sql": "SELECT * FROM policy_preview_smoke", "as_groups": ["Everyone"]},
+            headers=h,
+        )
+        assert r.status_code in (200, 422), r.text
+
+    def test_registry_policy_preview_groups(self, seeded_app_both):
+        """review plan P1.4 -- same tolerance as `test_registry_policy_preview`
+        right above: the table is never synced, so the route's own live
+        analytics-DB reads legitimately fail; the smoke assertion only cares
+        that the route is reachable and behaves identically on DuckDB and
+        Postgres, since it reads through the same factory-backed repos
+        (table_registry_repo/user_groups_repo/audit_repo)."""
+        h = _admin_headers(seeded_app_both)
+        rc = seeded_app_both["client"].post(
+            "/api/admin/register-table",
+            json={
+                "name": "policy_preview_groups_smoke",
+                "source_type": "keboola",
+                "bucket": "in.c-smoke",
+                "source_table": "orders",
+                "query_mode": "local",
+            },
+            headers=h,
+        )
+        assert rc.status_code == 201
+        table_id = rc.json()["id"]
+
+        r = seeded_app_both["client"].post(
+            f"/api/admin/registry/{table_id}/policy/preview-groups",
+            json={"sql": "SELECT * FROM policy_preview_groups_smoke"},
+            headers=h,
+        )
+        assert r.status_code in (200, 422), r.text
+
+    def test_registry_policy_preview_matrix(self, seeded_app_both):
+        """issue #2147 (design doc §13.1) -- the persona-matrix preview reads
+        through the same factory-backed repos as the single-persona preview
+        and the all-groups sweep above (table_registry_repo / user_groups_repo /
+        user_group_members_repo / audit_repo), so the smoke assertion is the
+        same: reachable, and identical on DuckDB and Postgres. The table is
+        never synced, so a 422 from its own live analytics-DB read is a
+        legitimate outcome here."""
+        h = _admin_headers(seeded_app_both)
+        rc = seeded_app_both["client"].post(
+            "/api/admin/register-table",
+            json={
+                "name": "policy_preview_matrix_smoke",
+                "source_type": "keboola",
+                "bucket": "in.c-smoke",
+                "source_table": "orders",
+                "query_mode": "local",
+            },
+            headers=h,
+        )
+        assert rc.status_code == 201
+        table_id = rc.json()["id"]
+
+        r = seeded_app_both["client"].post(
+            f"/api/admin/registry/{table_id}/policy/preview-matrix",
+            json={"sql": "SELECT * FROM policy_preview_matrix_smoke", "personas": "policy_groups"},
             headers=h,
         )
         assert r.status_code in (200, 422), r.text
@@ -2333,6 +2438,14 @@ KNOWN_UNTESTED = {
     # Sandboxed data-apps authoring replay (Task 7, wave 3B) — same
     # ticket-authed, never parameter-free shape as the broker routes above.
     "POST /api/broker/data-apps",
+    # Telemetry egress for the embedded engine's sandbox — the same
+    # ticket-authed, never parameter-free shape: it needs a `kai_otlp` ticket
+    # and an OTLP protobuf body, and forwards to an operator-configured
+    # collector. Behaviour covered in tests/test_broker_otlp.py (scope
+    # enforcement, signal allowlist, credential injection, size cap,
+    # collector-error containment) and tests/test_kai_host.py (the ticket is
+    # minted exactly when a collector is configured).
+    "POST /api/broker/otlp/v1/{signal}",
     # apps-runner audit report-back: shared-secret (X-Runner-Token) header
     # auth, not a user session, so this parameter-free sweep can only ever
     # 401 here uninformatively. Behaviour — token floor, constant-time
@@ -2440,6 +2553,13 @@ KNOWN_UNTESTED = {
     # rejections); not a parameter-free route for this smoke sweep.
     "POST /api/chat/uploads",
     "GET /library",
+    # The "search facets" typeahead (round 3 of the 2026-09-03 incident fix)
+    # — needs a real facet key (`client`/`industry`/`service_offering`/
+    # `doc_type`) to answer anything; an unknown one 404s, which this sweep
+    # would misread as the route being broken. Behaviour covered in
+    # tests/db_pg/test_library_index_perf.py (bounded results, RBAC scoping,
+    # unknown-facet 404, statement count).
+    "GET /library/facets/{facet}",
     "GET /library/{slug}",
     # The HTML fragment the Library's live search fetches for the files a
     # folder's inline peek did not render (#2141 item 2). Same exclusion and
@@ -2453,6 +2573,14 @@ KNOWN_UNTESTED = {
     # than the file page's wider per-file rule (a per-file grant must not
     # enumerate siblings).
     "GET /library/{slug}/matching-files",
+    # The HTML fragment a folder row's twisty fetches on first expand (round
+    # 2 of the 2026-09-03 incident fix — a folder's files are no longer read
+    # at index-render time at all, however small the folder). Same exclusion
+    # reason as the row above: needs a real slug AND a collection with files.
+    # Behaviour covered in tests/test_web_library_artefacts_reading.py (the
+    # peek rows, the cap, 404 for unknown AND for no-access) and
+    # tests/test_web_library_files_folders.py (the child-row markup itself).
+    "GET /library/{slug}/peek",
     # Authoring studio + suggestion queue + memory-mining consent — covered by
     # dedicated suites (tests/test_authoring_suggestions_api.py, tests/test_web_studio.py);
     # web-form / admin-moderation flows, not part of the parameter-free smoke sweep.
@@ -2737,7 +2865,7 @@ KNOWN_UNTESTED = {
     # Agent builder (rail-layout WIP surface) — rendering covered by
     # tests/test_ui_layout_theme.py::TestRailOptIn.
     "GET /agents",
-    # Personal artefacts page (rail-layout IA) — rendering covered by
+    # Personal artifacts page (rail-layout IA) — rendering covered by
     # tests/test_ui_layout_theme.py::TestRailOptIn.
     "GET /artefacts",
     # Knowledge-search chat landing (#896) — rendering covered by
@@ -2809,6 +2937,13 @@ KNOWN_UNTESTED = {
     "GET /semantic-layer",
     "GET /semantic-layer/{slug}",
     "GET /semantic-layer/{slug}/{object_id}",
+    # The authoring page reached from Definitions' "+ New model" card. Same
+    # reason as the three above: rendering + authority-gating covered by
+    # tests/test_web_semantic_model_builder.py, outside the scanned modules.
+    # It is declared separately because it is a DIFFERENT route registered
+    # BEFORE /semantic-layer/{slug} so the static segment is not swallowed —
+    # if that ordering is ever reversed this entry stops matching a real route.
+    "GET /semantic-layer/new",
     "GET /setup",
     "GET /setup-advanced",
     "GET /slack/bind",
@@ -3041,6 +3176,14 @@ KNOWN_UNTESTED = {
     # duplicated in this parameter-free smoke sweep.
     "GET /api/admin/registry/{table_id}/policy/columns",
     "POST /api/admin/registry/{table_id}/policy/compile",
+    # Access-policy revision history (#1979) — backed by the PG-only
+    # `access_policy_revisions` table, so its per-backend behaviour IS the
+    # point and is asserted directly (200 + shape and the write/restore
+    # round-trip on PG by tests/db_pg/test_access_policy_revisions_api_pg.py;
+    # typed 501, 403 for a non-admin, and 404-before-any-repo-work on DuckDB
+    # by tests/test_admin_access_policy_revisions_api.py). Takes a path
+    # param, so it is out of this parameter-free sweep either way.
+    "GET /api/admin/registry/{table_id}/policy/revisions",
     "PATCH /api/admin/registry/{table_id}/docs",
     "POST /api/admin/bigquery/test-connection",
     "POST /api/admin/discover-and-register",
@@ -3076,11 +3219,22 @@ KNOWN_UNTESTED = {
     # upstream call for an `upload`-kind source, which makes it exactly the
     # sweep worth smoking on both backends — see
     # TestSemanticLayerSmoke.test_scheduled_sweep_syncs_a_registered_source.)
-    # K3 local knowledge packaging (#798) — scheduler-driven admin maintenance
-    # op, mirrors run-corporate-memory. No dual-backend contract test needed
-    # (no new repo methods/migration; state.json lives on disk). Behaviour
-    # covered in tests/test_admin_run_endpoints.py::TestRunKnowledgePackaging.
+    # K3 local knowledge packaging (#798). TCRD-296 synthesis C.15: this is
+    # now a thin enqueue of the `knowledge-packaging` worker job kind (was:
+    # ran synchronously, mirroring run-corporate-memory) — the only repo
+    # call is `jobs_repo().enqueue(...)`, and `jobs`/`jobs_pg` is an
+    # already dual-backend-proven frozen pair
+    # (tests/db_pg/test_jobs_contract.py); the pass itself
+    # (src.knowledge_packaging, corpus_chunks/corpus_chunks_pg) has its own
+    # dual-backend coverage in tests/db_pg/test_corpus_chunks_contract.py.
+    # Endpoint behaviour (202/409/501, audit row) covered single-backend in
+    # tests/test_admin_run_endpoints.py::TestRunKnowledgePackaging.
     "POST /api/admin/run-knowledge-packaging",
+    # Status sibling of the row above — a read over the same dual-backend-
+    # proven `jobs` repo pair (`jobs_repo().list(...)`), no new repo surface.
+    # Endpoint behaviour covered single-backend in
+    # tests/test_admin_run_endpoints.py::TestKnowledgePackagingStatus.
+    "GET /api/admin/knowledge-packaging/status",
     # K4 maintained digests (#799) — scheduler-driven admin maintenance op,
     # mirrors run-knowledge-packaging / run-corporate-memory. No new repo
     # methods/migration beyond the existing knowledge_digests contract test
@@ -3117,10 +3271,10 @@ KNOWN_UNTESTED = {
     "DELETE /api/chat/sessions/{chat_id}/permanent",
     # Session-workspace file delivery (#1611) — owner-scoped reads over the
     # caller's own session dir plus the save-to-Library bridge. No new repo
-    # methods/migration (ownership rides chat_repo.get_session, the artefact
+    # methods/migration (ownership rides chat_repo.get_session, the artifact
     # path reuses create_single_file_artefact — both already parity-proven);
     # behaviour (ownership 404s, traversal/symlink containment, download
-    # headers, artefact creation) covered in tests/test_chat_session_files.py.
+    # headers, artifact creation) covered in tests/test_chat_session_files.py.
     # The preview pair joins them on the same grounds: `…/preview` reads the
     # caller's own session file and describes it, `…/raw` streams the closed
     # image/PDF allowlist inline for the modal to draw — same ownership and
@@ -3253,6 +3407,12 @@ KNOWN_UNTESTED = {
     # and the metric definitions (all symmetric pairs) to build its candidate
     # sets; writes nothing.
     "POST /api/admin/data-packages/builder/turn",
+    # One semantic-model builder turn. Behaviourally covered by
+    # tests/test_semantic_model_builder_turn.py. Stateless like the entity
+    # builder above — a model has no row until Save (POST /api/semantic-
+    # models/apply, already exercised elsewhere) — and its grounding reads
+    # (table_registry, RBAC, build_schema) are all symmetric pairs.
+    "POST /api/semantic-models/builder/turn",
     "GET /api/sharing/groups",
     "GET /api/sharing/{resource_type}/{resource_id}",
     "PUT /api/sharing/{resource_type}/{resource_id}",
@@ -3269,7 +3429,7 @@ KNOWN_UNTESTED = {
     # component in page mode. No PG-specific behaviour of its own; the
     # package writes it performs are the /api/admin/data-packages routes.
     "GET /admin/data-packages/new",
-    # Add artefacts to My Stack — covered by tests/test_web_stack_artefacts.py
+    # Add artifacts to My Stack — covered by tests/test_web_stack_artefacts.py
     # (DuckDB) + tests/test_cli_api_parity.py (add/remove parity); no
     # dedicated PG smoke class yet, same convention as the stack rows above.
     "DELETE /api/stack/artefacts/{corpus_id}",
@@ -3405,6 +3565,27 @@ KNOWN_UNTESTED = {
     # warning are all covered by
     # tests/test_admin_sharepoint.py; not duplicated in this PG smoke sweep.
     "GET /api/admin/sharepoint/connections/{connection_id}/tree",
+    # Site-split planner (preview + apply) — greedy-packs a connection's
+    # drive-root folders into N groups (live Graph root-children listing +
+    # per-folder Graph Search document counts, both mocked via
+    # httpx.MockTransport) and, on apply, creates N sibling connections with
+    # their own scopes. Same "no new schema surface" reasoning as clone/
+    # scopes-bulk right above (all state lives in existing
+    # `source_connections.config` / `file_corpora` / `resource_grants`
+    # rows) — auth matrix, packing balance, idempotent 409, and the
+    # `start` enqueue are all covered by
+    # tests/test_admin_sharepoint.py::TestSplitPlan /
+    # tests/test_admin_sharepoint.py::TestSplitApply; not duplicated here.
+    "GET /api/admin/sharepoint/connections/{connection_id}/split-plan",
+    "POST /api/admin/sharepoint/connections/{connection_id}/splits",
+    # Shard-plan (2026-09-03 auto-parallel-crawl design §4.7) — the
+    # automatic successor to split-plan right above, same "needs a mocked
+    # Graph transport" reasoning. The real sharded-plan happy path (PG-only
+    # by construction) is
+    # tests/db_pg/test_sharepoint_shard_plan_route_pg.py; the
+    # backend-independent auth/404/validation/DuckDB-fail-clean contract is
+    # tests/test_admin_sharepoint.py::TestShardPlan.
+    "GET /api/admin/sharepoint/connections/{connection_id}/shard-plan",
     # Bounded BFS folder search (TCRD-240) over the same live tree — never
     # Graph's own `/search`. Same "no new schema surface" reasoning as the
     # sibling `/tree` route above; auth matrix, query-length/mode/glob
@@ -3438,6 +3619,17 @@ KNOWN_UNTESTED = {
     # tests/test_admin_sharepoint.py::TestExtractionTrigger /
     # TestExtractionRunDue; not duplicated in this PG smoke sweep.
     "POST /api/admin/sharepoint/connections/{connection_id}/extract",
+    # Targeted `convert_empty` backlog replay (scan-OCR triage task) — same
+    # "enqueues into the EXISTING jobs table, reads the connector's own
+    # crawl state via connectors.sharepoint.state_store (Postgres row or
+    # DuckDB-fallback file, itself already dual-backend by construction, not
+    # a `_REGISTRY` pair)" reasoning as `extract` right above: no NEW schema
+    # surface to verify per-backend. Auth matrix, 404-before-work, the
+    # feature-usable gate, duplicate-run dedup (sharing `extract`'s own
+    # idempotency key), and `queued_count` reflecting the persisted backlog
+    # are covered by tests/test_admin_sharepoint.py::TestRetryEmptyExtraction;
+    # not duplicated in this PG smoke sweep.
+    "POST /api/admin/sharepoint/connections/{connection_id}/extraction/retry-empty",
     "POST /api/admin/sharepoint/extraction/run-due",
     # Graph change-notification receiver (webhook-triggered extraction) — the
     # admin secret-rotation endpoint writes only into the EXISTING
@@ -3478,6 +3670,13 @@ KNOWN_UNTESTED = {
     # realistic upload/update/rename/delete fixture, pagination, and the
     # DuckDB typed-501 are all in tests/db_pg/test_sharepoint_changes_pg.py.
     "GET /api/admin/sharepoint/connections/{connection_id}/changes",
+    # ACL-permissions snapshot (TCRD-296 gap #79) — reads the SAME PG-only
+    # `sharepoint_connection_state` table as the crawl/facts state store.
+    # Storage, run-wiring, the aggregate/`?scopes=true` shapes, auth matrix,
+    # 404-before-work, and the audit row are all in
+    # tests/db_pg/test_sharepoint_acl_snapshot_pg.py; the DuckDB typed-501
+    # is in tests/test_admin_sharepoint.py::TestAclSnapshotFailsCleanOnDuckDB.
+    "GET /api/admin/sharepoint/connections/{connection_id}/acl-snapshot",
     # SharePoint ACL mirroring (2026-08-30 plan, Task 5) — admin "sync now"
     # trigger for the `sharepoint-acl-sync` job. Same "enqueues into the
     # EXISTING jobs table, no new schema surface" reasoning as the
@@ -3515,6 +3714,13 @@ KNOWN_UNTESTED = {
     # answers identically on both backends by construction; covered by
     # tests/test_admin_extraction.py::TestExtractionConfig.
     "GET /api/admin/sharepoint/connections/{connection_id}/extraction/config",
+    # Completeness check (TCRD-296 B.9) reads crawl state
+    # (sharepoint_connection_state), corpus_files and the job queue — none
+    # of them extraction_runs — so it answers identically on both backends
+    # by construction; covered by
+    # tests/test_admin_extraction.py::TestCompleteness (200/409/400,
+    # cache/refresh, provisional).
+    "GET /api/admin/sharepoint/connections/{connection_id}/extraction/completeness",
     # Cooperative stop (owner-frustration fix, 2026-09-01) writes to
     # `source_connections`/`config_patch`, a frozen pre-A3 pair present on
     # BOTH backends — unlike its `extraction/status|runs|config` siblings
@@ -3523,6 +3729,13 @@ KNOWN_UNTESTED = {
     # the 202 shape, the connection-row write, and the audit row are covered
     # by tests/test_extraction_stop.py.
     "POST /api/admin/sharepoint/connections/{connection_id}/extraction/stop",
+    # Per-connection crawl age filter (extraction.crawl.min_modified) — same
+    # reasoning as `extraction/stop` and `extraction/facts-config` right
+    # above/below: writes to `source_connections`/`config_patch`, a frozen
+    # pre-A3 pair present on BOTH backends, so its per-backend behaviour is
+    # not the point of a PG-only smoke sweep. RBAC, the write, validation,
+    # and the audit row are covered by tests/test_extraction_crawl_config.py.
+    "PATCH /api/admin/sharepoint/connections/{connection_id}/extraction/crawl-config",
     # SharePoint subtree sweep (2026-08-31 plan, Task 8) — admin "re-check
     # subtrees now" trigger for the `sharepoint-subtree-sweep` job. Same
     # "enqueues into the EXISTING jobs table, no new schema surface"
@@ -3539,6 +3752,79 @@ KNOWN_UNTESTED = {
     # tests/test_admin_sharepoint.py::TestFactsExtractionTrigger; not
     # duplicated in this PG smoke sweep.
     "POST /api/admin/sharepoint/connections/{connection_id}/facts-extract",
+    # Fact-graph collection-stats summary rebuild (TCRD-296 synthesis
+    # E.21) — NEW schema surface (fact_collection_stats/*_membership,
+    # PG-only, A3 ratchet), so unlike the "no new schema" admin/ops
+    # triggers above it IS covered per-backend, just not in this file:
+    # maintenance on ingest/purge/reassign/merge/split/consolidation,
+    # rebuild idempotence, and reader parity between the fallback and
+    # summary paths are in tests/db_pg/test_fact_collection_stats_pg.py;
+    # auth matrix and the DuckDB typed-501 are in tests/test_admin_facts.py.
+    "POST /api/admin/facts/stats/rebuild",
+    # Split-a-large-site pair (bulk scope-add from folder paths + connection
+    # clone): both write only `source_connections` (config_patch / insert), a
+    # frozen pre-A3 pair present on BOTH backends, and both need a body — not
+    # parameter-free shaped. Auth matrix, path validation, drive_id reuse,
+    # the clone's config-key carry-over/exclusions and idempotency are
+    # covered by tests/test_admin_sharepoint.py (bulk-scopes + clone classes);
+    # not duplicated here.
+    "POST /api/admin/sharepoint/connections/{connection_id}/scopes/bulk",
+    "POST /api/admin/sharepoint/connections/{connection_id}/clone",
+    # Bulk access_mode flip on existing scopes + the site-group ACL map
+    # (2026-09 fix): both write only `source_connections.config` — the
+    # same frozen pre-A3 pair, both need a body. Auth matrix, selection
+    # validation, the missing_drive_id per-scope failure, and the sentinel
+    # grant deletion on mirrored->manual are covered by
+    # tests/test_admin_sharepoint.py (TestSetScopesMode / TestAclSiteGroupMap);
+    # not duplicated here.
+    "PATCH /api/admin/sharepoint/connections/{connection_id}/scopes/bulk",
+    "PATCH /api/admin/sharepoint/connections/{connection_id}/acl-site-group-map",
+    # Collection consolidation — PG-only by construction (it touches
+    # corpus_file_sources/corpus_file_events/claims/fact_alias_sources,
+    # themselves PG-only, A3 ratchet): the DuckDB side answers the typed
+    # 501 the ratchet requires (asserted by
+    # assert_pg_only_exemptions_fail_clean in the mutation-status parity
+    # sweep — see that sweep's own `_PG_ONLY_ROUTE_EXEMPTIONS`). Repo-level
+    # behaviour (preview counts, the per-table move, grants union, the
+    # path/stable-id conflict refusal) is covered directly by
+    # tests/db_pg/test_sharepoint_collection_consolidation_pg.py; the route
+    # itself (auth matrix, dry-run vs real, the cross-connection 409) by
+    # tests/test_admin_sharepoint.py::TestCollectionsConsolidate. Not
+    # duplicated here.
+    "POST /api/admin/sharepoint/connections/{connection_id}/collections/consolidate",
+    # The reverse of `splits` above — folds several sibling connections'
+    # scopes, crawl/facts state (`sharepoint_connection_state`, PG-only,
+    # no DuckDB sibling to even smoke-test against), collections and run
+    # history back into one. State-union algorithm coverage (collision
+    # tie-breaks) lives in tests/db_pg/test_sharepoint_connection_merge_pg.py;
+    # the route itself (auth matrix, every precondition refusal, dry-run
+    # vs real, end-to-end fold, idempotent repeat) by
+    # tests/db_pg/test_sharepoint_connection_split_merge_route_pg.py; the
+    # DuckDB typed-501 by
+    # tests/test_admin_sharepoint.py::TestSplitMergeFailsCleanOnDuckDB. Not
+    # duplicated here.
+    "POST /api/admin/sharepoint/connections/{connection_id}/splits/merge",
+    # Per-connection facts policy override (retry_mode + transport) — writes
+    # `source_connections.config`, the same frozen pair, needs a body; 200/
+    # 422/clear semantics and the audit row are covered by
+    # tests/test_extraction_facts_config.py (both backends by construction).
+    "PATCH /api/admin/sharepoint/connections/{connection_id}/extraction/facts-config",
+    # Extraction fleet view (page + its JSON feed) reads `extraction_runs`,
+    # a PG-only table: the DuckDB side answers the typed 501 the A3 ratchet
+    # requires (asserted by assert_pg_only_exemptions_fail_clean in the
+    # GET-status parity sweep); the page/feed behaviour is covered by
+    # tests/test_admin_extraction.py and tests/test_admin_extraction_page.py.
+    # Not duplicated here.
+    "GET /admin/extraction",
+    "GET /api/admin/sharepoint/extraction/runs",
+    # Force-cancel a run (2026-09-03, TCRD-296 gap 32) — reads/writes
+    # `extraction_runs`, the same PG-only table the fleet route right above
+    # does: the DuckDB side answers the typed 501 the A3 ratchet requires
+    # (`tests/test_admin_extraction.py::TestCancelRoute::test_typed_501_on_
+    # duckdb`). Auth matrix, the happy path (job + run finalized, lease
+    # cleared, audit row), and the 404/409 edges are covered directly by
+    # tests/db_pg/test_extraction_api_pg.py. Not duplicated here.
+    "POST /api/admin/sharepoint/extraction/runs/{run_id}/cancel",
     # Ontology builder (spec §13.2) — the admin builder-shell page and its
     # draft CRUD + state-machine actions + dry-run are covered directly by
     # tests/test_api_ontology.py, tests/test_web_admin_ontology_page.py and

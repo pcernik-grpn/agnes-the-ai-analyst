@@ -108,13 +108,18 @@ variable "prod_instance" {
     # `classic` is RETIRED and rejected below — same reasoning as ui_layout.
     experience = optional(string, "")
     # Container memory caps written to /opt/agnes/.env and read by
-    # docker-compose.yml (mem_limit: $${AGNES_APP_MEM_LIMIT:-4g}). Defaults
-    # match the compose defaults; raise on a larger VM together with the
-    # app's per-connection DuckDB budgets (DuckDB sizes a fresh connection
-    # to ~80% of the cgroup limit, so an under-sized cap OOM-kills uvicorn
-    # mid-WAL-write).
-    app_mem_limit       = optional(string, "4g")
-    scheduler_mem_limit = optional(string, "2g")
+    # docker-compose.yml (mem_limit: $${AGNES_APP_MEM_LIMIT:-4g}). "auto"
+    # (the default, TCRD-296) defers sizing to the box the startup script
+    # actually boots on: app = clamp(RAM/8, 4 GiB, 32 GiB), scheduler =
+    # 2 GiB fixed — re-derived from /proc/meminfo on EVERY boot, so a VM
+    # recreate never regresses to a laptop-sized literal. A live 64-vCPU/
+    # 251GB VM ran a fixed 4g app cap and was OOM-killed four times serving
+    # DuckDB queries before this existed. Set an explicit value ("8g") to
+    # override "auto" outright; do so together with the app's per-connection
+    # DuckDB budgets (DuckDB sizes a fresh connection to ~80% of the cgroup
+    # limit, so an under-sized cap OOM-kills uvicorn mid-WAL-write).
+    app_mem_limit       = optional(string, "auto")
+    scheduler_mem_limit = optional(string, "auto")
     # Container CPU caps written to /opt/agnes/.env and read by
     # docker-compose.yml (cpus: $${AGNES_APP_CPUS:-2.0}). Raise app_cpus on
     # hosts with more cores (e.g. "3.0" on a 4-core VM) for headroom under
@@ -177,6 +182,40 @@ variable "prod_instance" {
     # without the URL simply never registers the tool server. Inert unless
     # kai_agent_enabled is also true on this VM.
     kai_agent_broker_mcp_enabled = optional(bool, false)
+    # Opt-in: let the engine's sandbox export its OWN spans (turn → step →
+    # tool) through this instance's OTLP broker route. Derives
+    # HOST_BROKER_OTLP_URL=<origin>/api/broker/otlp into the engine env, the
+    # same way kai_agent_broker_mcp_enabled derives the MCP URL. A deliberate
+    # flag rather than a side effect of otlp_endpoint, because the URL is a
+    # two-sided switch on the engine: its presence makes the sandbox
+    # initialize OTel AND makes `otlp` an active relay scope every turn needs
+    # a ticket for — set against an app older than the route that mints it
+    # (app >= 0.100, `POST /api/broker/otlp/v1/{signal}`) every turn fails
+    # before the prompt is sent. So: app first, then this flag. Requires
+    # kai_agent_enabled and otlp_endpoint on the same VM (validated below);
+    # startup-script-owned, lands on VM recreate.
+    kai_agent_broker_otlp_enabled = optional(bool, false)
+    # Opt-in OpenTelemetry (OTLP/HTTP) export of this VM's LLM completions
+    # (docs/observability.md → "OpenTelemetry export"; app >= 0.98).
+    # `otlp_endpoint` is the collector's BASE URL — the SDK appends
+    # /v1/traces — and is not a secret. `otlp_headers_secret` names a Secret
+    # Manager secret whose value is the ENTIRE `OTEL_EXPORTER_OTLP_HEADERS`
+    # string (e.g. `Authorization=Bearer%20<token>`, W3C-baggage encoded);
+    # the module grants secretAccessor and the startup script fetches it at
+    # boot into /opt/agnes/.env with the runtime_secret_env escape set, so
+    # the credential never sits in Terraform state, VM metadata or a command
+    # line. `otlp_capture_content` also exports prompt and completion text
+    # (customer data — off by default; turn it on only where the collector
+    # may hold it). Per-VM so a dev pilot never reaches prod. All three are
+    # startup-script-owned: they land on VM recreate, not on apply.
+    otlp_endpoint        = optional(string, "")
+    otlp_headers_secret  = optional(string, "")
+    otlp_capture_content = optional(bool, false)
+    # The instance label every log line (`env`) and every exported span
+    # (`deployment.environment`) carries — written as AGNES_DEPLOYMENT_ENV.
+    # Empty = this VM's name, which is what an operator filters on anyway
+    # (until now the line was absent and the logs said `unknown`).
+    deployment_env = optional(string, "")
     # Opt-in extraction lane on this VM: a Redis coordination backend + the
     # `extraction-worker` compose service (AGNES_ROLE=worker), which makes the
     # deployment role-split. Per-VM (like dispatcher_enabled) and OFF by
@@ -206,15 +245,51 @@ variable "prod_instance" {
     # already run the Postgres app-state backend and boots refuse loudly on a
     # DuckDB instance — deliberate: migrate the backend first, then flip this.
     extraction_worker_enabled = optional(bool, false)
-    # Worker container resource ceilings, written to /opt/agnes/.env like
-    # kai_agent_mem_limit above (TF fields, not .env hand-edits — the startup
-    # script rewrites .env from scratch on every boot). Defaults mirror the
-    # base compose's own AGNES_EXTRACTION_WORKER_MEM_LIMIT/_CPUS fallbacks
-    # (docker-compose.yml) — the worker runs the extraction pipeline
-    # in-process (document download + conversion + LLM calls), hence beefier
-    # than the kai engine's.
-    extraction_worker_mem_limit = optional(string, "4g")
+    # Worker container resource ceiling, written to /opt/agnes/.env like
+    # kai_agent_mem_limit above (TF field, not a .env hand-edit — the startup
+    # script rewrites .env from scratch on every boot). "auto" (the default,
+    # TCRD-296) derives RAM * 0.6, capped so app + worker + an 8 GiB
+    # headroom (Postgres + host) never exceeds the VM's actual RAM, floored
+    # at 4 GiB — the worker runs the extraction pipeline in-process (document
+    # download + conversion + LLM calls), hence beefier than the kai
+    # engine's. Set an explicit value ("8g") to override outright.
+    extraction_worker_mem_limit = optional(string, "auto")
     extraction_worker_cpus      = optional(string, "2.0")
+    # Number of `extraction-worker` compose replicas on this VM
+    # (`docker compose up -d --scale extraction-worker=N`). 1 (the default)
+    # reproduces today's behaviour byte-for-byte: the startup script renders
+    # `--scale extraction-worker=1`, a no-op next to a plain `up -d`, and
+    # writes no Postgres pool override — the extraction-worker process keeps
+    # sizing its own connection pool from `extraction.concurrency` /
+    # `extraction.facts.concurrency` (src/db_pg.py's per-process hint, which
+    # assumes exactly ONE replica).
+    #
+    # TCRD-296 gap #76: an operator ran SIX replicas by hand
+    # (`docker compose up -d --scale extraction-worker=6`) to keep up with a
+    # facts-extraction backlog on a 64-vCPU/252 GiB VM. Nothing here
+    # remembered that scale — the next recreate silently dropped back to
+    # one — and six replicas each sizing a pool from the SAME per-process
+    # hint exhausted the Postgres side-car's stock 100-connection cap
+    # ("FATAL: sorry, too many clients already"), worked around by hand with
+    # `AGNES_PG_POOL_SIZE`/`AGNES_PG_MAX_OVERFLOW` in `.env` (which — set
+    # there — also shrank app's and scheduler's pools, not just the
+    # worker's) and a manual `ALTER SYSTEM SET max_connections`.
+    #
+    # Setting this > 1 makes the startup script (a) thread `--scale
+    # extraction-worker=N` through every `docker compose up` that would
+    # otherwise recreate the stack at N=1 (the boot sequence AND the
+    # recurring agnes-auto-upgrade tick — see
+    # docs/DEPLOYMENT.md#sizing-an-extraction-instance), (b) pin
+    # `AGNES_PG_POOL_SIZE`/`AGNES_PG_MAX_OVERFLOW` on the extraction-worker
+    # service ONLY (app/scheduler keep their own defaults), and (c) size the
+    # Postgres side-car's `max_connections` to hold app + scheduler + every
+    # replica's pool, plus headroom — see the `agnes_pg_max_connections`
+    # sizing note next to `agnes_pg_shared_buffers_mb` in
+    # startup-script.sh.tpl. Raising this without also raising the host's
+    # RAM (or lowering `extraction_worker_mem_limit`) can overcommit memory —
+    # each replica gets the SAME per-replica ceiling, not a shrunk share of
+    # it.
+    extraction_worker_replicas = optional(number, 1)
     # Web-chat provider pin, written as AGNES_CHAT_PROVIDER into the app .env
     # (app >= 0.85: env > instance.yaml > default; "kai-agent" since 0.88).
     # Codifies which engine runs
@@ -353,6 +428,27 @@ variable "prod_instance" {
     condition     = contains(["", "redesign"], var.prod_instance.experience)
     error_message = "prod_instance.experience must be \"\" or \"redesign\". The \"classic\" experience was retired (Wave 0, 2026-08) — remove the line."
   }
+
+  validation {
+    condition     = var.prod_instance.otlp_headers_secret == "" || var.prod_instance.otlp_endpoint != ""
+    error_message = "prod_instance.otlp_headers_secret is set but otlp_endpoint is empty — the headers are the collector's credential and mean nothing without a collector to send to."
+  }
+
+  validation {
+    condition     = var.prod_instance.otlp_endpoint == "" || can(regex("^https?://", var.prod_instance.otlp_endpoint))
+    error_message = "prod_instance.otlp_endpoint must be an http(s) URL — the collector's BASE URL, without the /v1/traces suffix the SDK appends itself."
+  }
+
+  validation {
+    condition     = var.prod_instance.extraction_worker_replicas >= 1 && var.prod_instance.extraction_worker_replicas <= 32
+    error_message = "prod_instance.extraction_worker_replicas must be between 1 and 32."
+  }
+
+  validation {
+    condition     = !var.prod_instance.kai_agent_broker_otlp_enabled || (var.prod_instance.kai_agent_enabled && var.prod_instance.otlp_endpoint != "")
+    error_message = "prod_instance.kai_agent_broker_otlp_enabled requires kai_agent_enabled = true and a non-empty otlp_endpoint on the same VM — the engine would arm an otlp relay scope against a broker route with no collector to forward to."
+  }
+
 }
 
 variable "dev_instances" {
@@ -369,6 +465,16 @@ variable "dev_instances" {
   type = list(object({
     name         = string
     machine_type = optional(string, "e2-small")
+    # Disk sizes, per dev VM. MUST be declared on the object type — Terraform
+    # silently drops attributes absent from the type during conversion, so a
+    # caller's `data_disk_gb = 60` never reached the merge with dev_defaults
+    # and every dev VM was stuck at the default. Same defaults as
+    # dev_defaults in main.tf. Growing `data_disk_gb` is an in-place GCE
+    # resize (no VM change); the filesystem still needs an online
+    # `resize2fs` on the VM afterwards — the startup script only formats a
+    # fresh disk. Shrinking is refused by GCE.
+    disk_size_gb = optional(number, 30)
+    data_disk_gb = optional(number, 20)
     image_tag    = optional(string, "dev")
     tls_mode     = optional(string, "none")
     domain       = optional(string, "")
@@ -403,9 +509,9 @@ variable "dev_instances" {
     # caller-supplied `role = "stage"` would never reach the merge() below
     # if the type omits it.
     role = optional(string, "dev")
-    # See prod_instance for the rationale; same defaults.
-    app_mem_limit       = optional(string, "4g")
-    scheduler_mem_limit = optional(string, "2g")
+    # See prod_instance for the rationale; same defaults ("auto").
+    app_mem_limit       = optional(string, "auto")
+    scheduler_mem_limit = optional(string, "auto")
     app_cpus            = optional(string, "2.0")
     scheduler_cpus      = optional(string, "1.0")
     dispatcher_enabled  = optional(bool, false)
@@ -425,12 +531,26 @@ variable "dev_instances" {
     # Engine → instance MCP tool surface — see prod_instance for the
     # rationale; same default, inert without kai_agent_enabled.
     kai_agent_broker_mcp_enabled = optional(bool, false)
+    # Engine sandbox → this instance's OTLP broker route — see prod_instance
+    # for the ordering contract; same default, inert without kai_agent_enabled
+    # and otlp_endpoint.
+    kai_agent_broker_otlp_enabled = optional(bool, false)
+    # Per-VM opt-in OTLP export + deployment label — see prod_instance for
+    # the contract; same defaults, same "must be on the type" rule.
+    otlp_endpoint        = optional(string, "")
+    otlp_headers_secret  = optional(string, "")
+    otlp_capture_content = optional(bool, false)
+    deployment_env       = optional(string, "")
     # Opt-in extraction lane (Redis coordination + extraction-worker) — see
-    # prod_instance for the full contract; same defaults, OFF by default so
-    # a module bump alone never moves existing VMs.
+    # prod_instance for the full contract; same defaults ("auto" mem limit),
+    # OFF by default so a module bump alone never moves existing VMs.
     extraction_worker_enabled   = optional(bool, false)
-    extraction_worker_mem_limit = optional(string, "4g")
+    extraction_worker_mem_limit = optional(string, "auto")
     extraction_worker_cpus      = optional(string, "2.0")
+    # Per-VM extraction-worker replica count — see prod_instance for the full
+    # rationale (TCRD-296 gap #76); same default (1, byte-identical to
+    # today), same "must be on the type" rule as the fields above.
+    extraction_worker_replicas = optional(number, 1)
     # Web-chat provider pin (AGNES_CHAT_PROVIDER) — see prod_instance for the
     # rationale; same default (empty = no env line), same validations below.
     chat_provider = optional(string, "")
@@ -523,6 +643,29 @@ variable "dev_instances" {
     ])
     error_message = "dev_instances[].chat_provider = \"kai-agent\" requires kai_agent_enabled = true on the same VM — web chat pinned onto an engine the VM does not run refuses every session."
   }
+
+  validation {
+    condition     = alltrue([for d in var.dev_instances : try(d.otlp_headers_secret, "") == "" || try(d.otlp_endpoint, "") != ""])
+    error_message = "dev_instances[*].otlp_headers_secret is set but otlp_endpoint is empty — the headers are the collector's credential and mean nothing without a collector to send to."
+  }
+
+  validation {
+    condition     = alltrue([for d in var.dev_instances : try(d.otlp_endpoint, "") == "" || can(regex("^https?://", d.otlp_endpoint))])
+    error_message = "dev_instances[*].otlp_endpoint must be an http(s) URL — the collector's BASE URL, without the /v1/traces suffix the SDK appends itself."
+  }
+
+  validation {
+    condition = alltrue([
+      for i in var.dev_instances : i.extraction_worker_replicas >= 1 && i.extraction_worker_replicas <= 32
+    ])
+    error_message = "each dev_instances[].extraction_worker_replicas must be between 1 and 32."
+  }
+
+  validation {
+    condition     = alltrue([for d in var.dev_instances : !try(d.kai_agent_broker_otlp_enabled, false) || (try(d.kai_agent_enabled, false) && try(d.otlp_endpoint, "") != "")])
+    error_message = "dev_instances[*].kai_agent_broker_otlp_enabled requires kai_agent_enabled = true and a non-empty otlp_endpoint on the same VM — the engine would arm an otlp relay scope against a broker route with no collector to forward to."
+  }
+
 }
 
 variable "oauth_secret_name_template" {
@@ -715,32 +858,111 @@ variable "enable_watchdog" {
 
 variable "enable_gcp_logging" {
   description = <<-EOT
-    Ship every container's stdout/stderr to Google Cloud Logging via Docker's
-    built-in gcplogs driver, in addition to the local dual-logging cache
-    `docker logs` reads from. On: the module grants roles/logging.logWriter
-    on the project to the VM service account (the gcplogs driver
-    authenticates as that account, and Docker refuses to START a container
-    whose log driver cannot initialize — without the role, any container
-    recreate takes the instance down), and the startup script extracts
+    Permit and provision the Cloud Logging pipeline: every container's
+    stdout/stderr forwarded over Docker's `fluentd` driver to a
+    Google Cloud Ops Agent on loopback, which parses the JSON line back into
+    fields and writes it to Cloud Logging (docs/gcp-logging.md). The local
+    dual-logging cache `docker logs` reads from is unaffected.
+
+    PERMIT, not select: which collector actually gets the logs is
+    container_logs_destination below. This variable grants
+    roles/logging.logWriter and roles/monitoring.metricWriter on the project
+    to the VM service account, and makes Cloud Logging an eligible
+    destination; leaving it true while the destination resolves to `datadog`
+    keeps the grants in place and installs no Ops Agent, so flipping back is
+    a recreate and not an IAM change.
+
+    When Cloud Logging IS the destination, the startup script extracts
     docker-compose.gcp-logging.yml (baked into the image) into the app
-    directory, probes that the driver actually initializes, and only then
-    arms the overlay for the COMPOSE_FILE resolver
+    directory, probes that something is listening on the Ops Agent's forward
+    port, and only then arms the overlay for the COMPOSE_FILE resolver
     (scripts/ops/agnes-compose-file.sh) to include on every `docker compose`
-    invocation — so logs survive the routine container recreates the
-    auto-upgrade cron performs every 5 minutes, which otherwise destroy the
-    Docker json-file log history. The IAM grant means the identity running
-    `terraform apply` must be allowed to modify project IAM policy (e.g.
-    roles/resourcemanager.projectIamAdmin); if yours cannot, grant
-    roles/logging.logWriter to the VM service account out-of-band or set
-    this to false — a VM without the role stays up either way (the probe
-    disables the overlay with a warning) but ships no logs. Off: the script
-    removes the file instead, keeping the instance on the default json-file
-    driver (rotated by /etc/docker/daemon.json) — the only supported choice
-    for a non-GCE / non-GCP deployment, since gcplogs needs GCE
-    metadata-server credentials.
+    invocation — so logs survive the container recreates the auto-upgrade
+    cron performs when an image digest or a config file moves, which
+    otherwise destroy the Docker json-file log history. The driver is
+    ASYNC (`fluentd-async: true`), so a collector that is down costs log
+    lines and cannot keep a container in `created` (#1557).
+
+    The metric role is not about metrics this module wants: the Ops Agent
+    that collects the logs runs an OpenTelemetry sub-agent which cannot be
+    switched off, and it exports the agent's own free
+    agent.googleapis.com/agent/* self-metrics whatever its config says. The
+    host metrics Cloud Monitoring charges for are turned off in
+    files/ops-agent-config.yaml, since enable_datadog is the path that
+    collects those; without the role, though, every export cycle fails and
+    floods the serial console with monitoring.timeSeries.create
+    PermissionDenied. Order matters when upgrading an already-provisioned VM:
+    the grant lands on `terraform apply`, while the agent config only reaches
+    the VM on instance replacement, so until you recreate it that VM keeps
+    the built-in hostmetrics receiver and now exports it successfully, billed
+    by ingested bytes. Recreating closes the window and is the same step
+    every other startup-script change from this module needs anyway.
+
+    The IAM grants mean the identity running `terraform apply` must be
+    allowed to modify project IAM policy (e.g.
+    roles/resourcemanager.projectIamAdmin); if yours cannot, grant both
+    roles to the VM service account out-of-band or set this to false — a VM
+    without the logging role stays up either way (the probe disables the
+    overlay with a warning) but ships no logs. Off: the script removes the
+    file instead, keeping the instance on the default json-file driver
+    (rotated by /etc/docker/daemon.json) — the only supported choice for a
+    non-GCE / non-GCP deployment, since the Ops Agent authenticates with
+    Google ADC from the GCE metadata server and there is nothing to receive
+    the logs without it.
   EOT
   type        = bool
   default     = true
+}
+
+variable "container_logs_destination" {
+  description = <<-EOT
+    Which collector receives the containers' stdout/stderr. Empty (default)
+    resolves automatically: `datadog` when enable_datadog is on, else
+    `cloud_logging` when enable_gcp_logging is on, else `none`. Explicit
+    values are `cloud_logging`, `datadog` and `none`.
+
+    ONE destination per VM, because Docker allows exactly one log driver per
+    container and the two collectors want different ones. Cloud Logging needs
+    the `fluentd` driver (the Ops Agent is what parses the JSON line back into
+    fields; Docker's own gcplogs driver parses nothing). Datadog needs the
+    default `json-file` driver: it reads containers through the Docker API,
+    and under a remote driver that API serves Docker's dual-logging cache —
+    which happens to work but is not a path Datadog documents or supports.
+    On json-file the same API serves the driver's own logs and the path is
+    supported. So `datadog` leaves docker-compose.gcp-logging.yml off the
+    disk, which disarms the COMPOSE_FILE resolver's gate for free.
+
+    Running both is therefore not offered. It is not physically impossible —
+    it would just mean building a production pipeline on undocumented
+    behaviour, which this module does not do.
+
+    ** BEHAVIOUR CHANGE ON A MODULE BUMP. ** A VM that already has
+    enable_datadog = true resolves to `datadog` the next time it is recreated,
+    and that has two halves — state both when reviewing a bump:
+
+      * it STOPS shipping to Cloud Logging, so any log-based alert, dashboard
+        or saved query pointed there goes quiet rather than red; and
+      * it STARTS exporting every container log line to a third-party SaaS in
+        whatever region datadog_site names. On a VM with enable_gcp_logging =
+        false this is not a redirect at all: nothing left the host before, and
+        now everything does. Data residency is a decision to make before the
+        redaction rules, which bound only WHAT is sent, never WHERE.
+
+    That is the intended default — metrics, monitors and logs belong in one
+    console — but it is the one diff a bump alone carries. Set
+    container_logs_destination = "cloud_logging" (or "none") to keep the old
+    behaviour explicitly. See docs/datadog-logging.md.
+
+    Startup-script-owned like every other setting here: it reaches a running
+    VM only through `terraform apply -replace` of the instance.
+  EOT
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = contains(["", "auto", "cloud_logging", "datadog", "none"], var.container_logs_destination)
+    error_message = "container_logs_destination must be \"\" (auto), \"auto\", \"cloud_logging\", \"datadog\" or \"none\"."
+  }
 }
 
 variable "dispatcher_image" {
@@ -1002,10 +1224,14 @@ variable "enable_datadog" {
       * `dd-agent` joins the `docker` group so the agent can read the daemon's
         container metrics. That is root-equivalent on this host — the same
         posture the module already accepts for `agnes-applier`. The rendered
-        `datadog.yaml` compensates: remote configuration, APM, logs, DogStatsD,
+        `datadog.yaml` compensates: remote configuration, APM, DogStatsD,
         process/container/discovery collection, runtime security, compliance,
         SBOM, image and lifecycle collection and both inventory uploads are all
-        off, and the IPC endpoint binds to loopback.
+        off, and the IPC endpoint binds to loopback. Log collection is NOT on
+        that list any more — it is off unless container_logs_destination
+        resolves to `datadog`, which it does by default whenever this variable
+        is true. That is an egress decision rather than a privilege one; see
+        that variable and docs/datadog-logging.md.
 
       * No thresholds live on the VM. The checks report; the caller's monitors
         decide what is an incident.

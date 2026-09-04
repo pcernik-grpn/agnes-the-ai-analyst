@@ -138,6 +138,42 @@ def _strip_bot_mention(text: str, bot_user_id: str | None) -> str:
     return text.strip()
 
 
+async def _notify_policied_scope(channel: str, thread_ts: str, bound_agent: dict, owner: dict) -> None:
+    """Channel-visible, one-time notice (design doc §12) that a freshly
+    routed thread's agent holds an access-policied table in its scope.
+
+    A routed thread runs entirely AS THE OWNER (see the module's own
+    routing comment above): every mention here answers with the OWNER's
+    row slice through that policy, never the mentioner's — unlike this same
+    agent's API/chat/delegated-turn callers, which are filtered by their
+    OWN identity instead (``src/access_policy.py::_resolve_identity``).
+    That asymmetry is invisible from inside the channel unless someone says
+    so, so this does.
+
+    Best-effort and silent on failure, mirroring ``add_reaction``: a lookup
+    or post failure here must never block or fail the turn it decorates.
+    """
+    try:
+        from app.api.agents_builder_shared import _decode
+        from app.services.agent_ingredients import policy_disclosure_for_knowledge
+
+        knowledge = _decode(bound_agent.get("knowledge"), [])
+        if not knowledge:
+            return
+        policied = policy_disclosure_for_knowledge(knowledge, owner)
+        if not policied:
+            return
+        names = ", ".join(t.get("name") or t["table_id"] for t in policied)
+        await send_thread_reply(
+            channel,
+            thread_ts,
+            f"Note: this agent's data includes an access policy on {names} — "
+            "answers here use the agent owner's data access, not yours.",
+        )
+    except Exception:
+        logger.exception("slack: could not post the policied-scope notice for channel %s", channel)
+
+
 def _is_attached(mgr, chat_id: str) -> bool:
     """True iff `chat_id` already has a live attach (sink pumping)."""
     return any(live.chat_id == chat_id for live in mgr.list_live())
@@ -586,6 +622,22 @@ async def _handle_mention(app, event: dict) -> None:
         # an answer that never comes. Fire-and-forget; add_reaction swallows
         # its own failures.
         _schedule(add_reaction(channel, event["ts"], "eyes"))
+
+    # 6b. Design doc §12 — a channel-visible, one-time notice when a FRESH
+    # routing binds this thread to an agent whose scope holds an
+    # access-policied table: every mention here runs as the OWNER
+    # (`owner_row`, resolved above), so it answers with the owner's row
+    # slice, never the mentioner's — unlike this same agent's API/chat/
+    # delegated-turn callers, who are filtered by their OWN identity
+    # instead. Same "no message ever delivered" gate as the context header
+    # below, for the same reason (a timed-out retry on a zero-message
+    # session still counts as the first real turn). `service_thread`-only
+    # continuations (a re-bound or unbound channel resuming a stored
+    # session) are deliberately out of scope here — `bound_agent` is None on
+    # that path, and the notice already fired on the thread's actual first
+    # turn.
+    if bound_agent is not None and (existing is None or (existing.message_count or 0) == 0):
+        _schedule(_notify_policied_scope(channel, thread_ts, bound_agent, owner_row))
 
     # 7. Strip our own mention token. (Before session creation so the
     # api-role thin-producer branch below can forward the cleaned text.)

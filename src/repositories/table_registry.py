@@ -6,6 +6,8 @@ from typing import Any, Optional, List, Dict, Union
 
 import duckdb
 
+from src.repository_errors import PoliciedRowDistributionError
+
 
 def _encode_primary_key(pk: Union[None, str, List[str]]) -> Optional[str]:
     """Serialize primary_key (list-or-string) to a canonical VARCHAR form.
@@ -98,6 +100,47 @@ def _decode_primary_key(stored: Any) -> Optional[List[str]]:
     return [s]
 
 
+def _policy_guarded_server_only(
+    table_id: str,
+    query_mode: str,
+    requested_server_only: Optional[bool],
+    existing_policy_sql: Any,
+    existing_server_only: Any,
+) -> bool:
+    """Resolve the ``server_only`` an upsert may actually write, refusing one
+    that would leave a POLICIED row distributable.
+
+    ``register()`` is a blind ``ON CONFLICT (id) DO UPDATE`` that never touches
+    ``access_policy_*``, so without this every caller re-registering an
+    existing id (a connector's auto-discovery, the boot-time internal-table
+    refresh, a collection file re-ingest) silently reset ``server_only`` to
+    its default and left the row policied AND distributable — the exact state
+    ``app/api/admin.py``'s ``access_policy_requires_undistributed`` interlock
+    forbids, reached by writing through the repository instead of the API.
+
+    Backend-agnostic on purpose: both ``TableRegistryRepository`` and
+    ``TableRegistryPgRepository`` read the two existing values with their own
+    SQL and hand them here, so DuckDB and Postgres cannot drift on the rule
+    itself. Unpolicied rows are returned untouched (``None`` -> ``False``),
+    i.e. bit-identical to the pre-invariant behaviour.
+    """
+    policied = bool((existing_policy_sql or "").strip()) if isinstance(existing_policy_sql, str) else False
+    if not policied:
+        return bool(requested_server_only)
+
+    stored_server_only = bool(existing_server_only)
+    if requested_server_only is None:
+        # "No opinion" — never a licence to distribute. Preserve what is
+        # stored; this is the path every non-admin writer takes.
+        effective = stored_server_only
+    else:
+        effective = bool(requested_server_only)
+    # `remote` is the other undistributed shape, so it needs no server_only.
+    if query_mode != "remote" and not effective:
+        raise PoliciedRowDistributionError(table_id=table_id, query_mode=query_mode)
+    return effective
+
+
 class TableRegistryRepository:
     def __init__(self, conn: duckdb.DuckDBPyConnection):
         self.conn = conn
@@ -140,7 +183,13 @@ class TableRegistryRepository:
         # the row is kept server-side & queryable via `agnes query --remote`,
         # but `agnes pull` skips its parquet. API-layer validator rejects
         # True paired with query_mode='remote'.
-        server_only: bool = False,
+        #
+        # `None` (the default) means "the caller has no opinion": a fresh
+        # insert lands False (the column default, unchanged), and an upsert
+        # onto a POLICIED row preserves the stored value instead of resetting
+        # it — see `_policy_guarded_server_only`. Explicit True/False keep
+        # their pre-existing last-writer-wins meaning on every unpolicied row.
+        server_only: Optional[bool] = None,
         # v79 — nullable FK to source_connections.id. NULL = use the default
         # connection for the row's source_type (spec 2026-06-12).
         connection_id: Optional[str] = None,
@@ -152,6 +201,21 @@ class TableRegistryRepository:
         ts = registered_at or datetime.now(timezone.utc)
         encoded_pk = _encode_primary_key(primary_key)
         encoded_filters = _encode_where_filters(where_filters)
+        # Read the two policy-relevant columns of the row this upsert may be
+        # overwriting BEFORE writing: the statement below cannot express
+        # "keep server_only when the stored row is policied" in one ON
+        # CONFLICT clause without also silently swallowing the refusal case.
+        prior = self.conn.execute(
+            "SELECT access_policy_sql, server_only FROM table_registry WHERE id = ?",
+            [id],
+        ).fetchone()
+        effective_server_only = _policy_guarded_server_only(
+            table_id=id,
+            query_mode=query_mode,
+            requested_server_only=server_only,
+            existing_policy_sql=prior[0] if prior else None,
+            existing_server_only=prior[1] if prior else None,
+        )
         # Mirror the column DEFAULT — explicit None in the INSERT would
         # override the schema default, leaving NULL in the column. Callers
         # that don't pass a strategy expect 'full_refresh' semantics.
@@ -208,7 +272,7 @@ class TableRegistryRepository:
                 partition_granularity,
                 initial_load_chunk_days,
                 bq_fqn,
-                bool(server_only),
+                effective_server_only,
                 connection_id,
             ],
         )
@@ -447,7 +511,7 @@ class TableRegistryRepository:
 
         Rows are identified by ``source_type='collection'`` and
         ``bucket=corpus_id``.  Returns the list of deleted table ids so the
-        caller can clean up derived artefacts (parquet files, extract.duckdb
+        caller can clean up derived artifacts (parquet files, extract.duckdb
         views) before calling ``orchestrator.rebuild_source``.
 
         Clears each dropped row's dependants first (see
@@ -455,7 +519,7 @@ class TableRegistryRepository:
         data package hit the same DuckDB foreign key ``unregister`` does —
         and this path is called from ``DELETE /api/collections/{id}``, which
         unlinks the parquet files right after, so the 500 landed with the
-        durable artefacts already half gone.
+        durable artifacts already half gone.
         """
         rows = self.conn.execute(
             "SELECT id FROM table_registry WHERE source_type = 'collection' AND bucket = ?",

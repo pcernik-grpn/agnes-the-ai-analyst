@@ -10,7 +10,7 @@ from typing import Optional
 
 import typer
 
-from cli.query_hints import missing_table, remote_table_hint
+from cli.query_hints import missing_table, remote_table_hint, row_scope_note
 
 # Default TTL for auto-snapshots created by the --auto-snapshot fallback
 # (#616). Reused if still fresh, rebuilt once elapsed.
@@ -454,8 +454,9 @@ def _query_remote(sql: str, fmt: str, limit: int, *, auto_snapshot: bool = False
     # is forbidden" (command-ux.md) applies to row filtering as much as to
     # source scope, so this is unconditional, not opt-in. Written to STDERR
     # so json/csv stdout stays pure, same convention as the notices below.
-    if data.get("row_scope"):
-        typer.echo(f"[scope] {data['row_scope']['note']}", err=True)
+    scope_note = row_scope_note(data.get("row_scope"))
+    if scope_note:
+        typer.echo(scope_note, err=True)
     # Soft-enforce semantic advisory: present only when the server's semantic
     # layer had something to say about this statement (an error-severity
     # constraint violation, or a used metric with no expression for the engine

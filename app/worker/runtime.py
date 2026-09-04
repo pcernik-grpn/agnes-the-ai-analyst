@@ -149,6 +149,30 @@ from app.observability import metrics as obs_metrics
 from app.worker import wakeup
 from app.worker.kinds import dispatch_job
 from app.worker.registry import EXTRACTION_LANE, HEAVY_LANE, JOB_KINDS, LIGHT_LANE, JobKind
+from src.db_transient import is_transient_db_error
+
+#: Live finding (64-vCPU extraction-worker host, 2026-09): numpy's OpenBLAS
+#: backend sizes its per-thread scratch buffers by the HOST's CPU count at
+#: import time — not by anything this process asks for. Document conversion
+#: (``connectors/sharepoint/crawler.py``) runs each file inside a FORKED
+#: child capped at ~1.5 GiB of virtual address space
+#: (``_DEFAULT_CONVERT_CHILD_MEMORY_LIMIT_MB``); on 64 cores, OpenBLAS tried
+#: to size 64 threads' worth of buffers inside that child and blew through
+#: the RLIMIT_AS ceiling — ``import markitdown`` / ``import pypdfium2`` died
+#: with "OpenBLAS error: Memory allocation still failed after 10 retries",
+#: which (before ``MissingConversionDependency`` learned to carry its cause)
+#: surfaced as a plain "markitdown is not installed". A single-document
+#: child converts exactly one file at a time and never benefits from more
+#: than one BLAS thread, on any host size. ``setdefault`` so an operator's
+#: own explicit env value always wins; this module is the extraction
+#: worker's own process entry point (imported once, at worker startup, by
+#: ``app/main.py``'s ``Role.WORKER`` branch) — it runs long before a crawl
+#: forks its first conversion child, which is what actually matters: a
+#: forked child inherits the parent's ``os.environ`` as it stood at fork
+#: time, not at process-start time.
+for _blas_env_var in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    os.environ.setdefault(_blas_env_var, "1")
+del _blas_env_var
 
 logger = logging.getLogger(__name__)
 
@@ -174,11 +198,17 @@ _DEFAULT_EXTRACTION_CONCURRENCY = 1
 #: 4g/2cpu envelope which assumes exactly ONE concurrent producer run —
 #: raising this without also raising `AGNES_EXTRACTION_WORKER_MEM_LIMIT`/
 #: `AGNES_EXTRACTION_WORKER_CPUS` on that service risks OOM/CPU starvation
-#: under the resulting concurrent producer load. 8 is a sanity ceiling, not
+#: under the resulting concurrent producer load. 24 is a sanity ceiling, not
 #: a tuned number — an operator sizing for more should raise the compose
-#: limits well before approaching it.
+#: limits well before approaching it. It was 8 until a live whole-site
+#: backfill split one site into 7 parallel crawl connections: 7 crawls held
+#: 7 of the 8 lanes, and every streamed `sharepoint-facts-extraction` pass —
+#: which HOLDS its lane for as long as its Batches-API batches take to
+#: complete — serialized onto the one lane left, so facts fell hours behind
+#: the crawl. A lane count of (crawls + one facts pass per crawl) is the
+#: natural sizing for that shape; 24 leaves room for it on a large box.
 _MIN_EXTRACTION_CONCURRENCY = 1
-_MAX_EXTRACTION_CONCURRENCY = 8
+_MAX_EXTRACTION_CONCURRENCY = 24
 
 #: Every lane this build knows about, in spawn order — the valid-token set
 #: ``selected_lanes()`` checks an ``AGNES_WORKER_LANES`` token against.
@@ -383,6 +413,136 @@ def _notify_agent_response_webhooks(job: dict, status: str) -> None:
         logger.warning("worker: agent_response webhook notify failed for job %s (non-fatal)", job["id"], exc_info=True)
 
 
+#: Job kinds that open an ``extraction_runs`` row (``connectors.sharepoint.
+#: crawler._RunRecorder``) — mirrors ``app/worker/kinds.py::
+#: _INJECT_JOB_ID_KINDS``, which is what makes that row's ``job_id``
+#: resolvable back to a claimed job in the first place. ``corpus-extraction``
+#: (the inline crawl OR the planner — either way it opens a row: the inline
+#: crawl its own, the planner the PARENT) and ``corpus-extraction-shard``
+#: (2026-09-03 auto-parallel-crawl design §4.3 — each child opens its own
+#: row) both qualify. The standalone ``sharepoint-facts-extraction`` job
+#: never opens a row of its own (it reads already-indexed documents under a
+#: self-releasing advisory lock, ``connectors.sharepoint.state_store.
+#: facts_pass_lock`` — a killed worker leaves nothing "running" behind for
+#: that kind to close), so a lookup for it would only ever cost a wasted
+#: query.
+_EXTRACTION_RUN_OWNING_KINDS = frozenset({"corpus-extraction", "corpus-extraction-shard"})
+
+
+def _finalize_extraction_run_for_job(job_id: str, kind: str, error: str) -> None:
+    """When a job that OWNS an ``extraction_runs`` row (see
+    :data:`_EXTRACTION_RUN_OWNING_KINDS`) reaches a terminal ``failed``
+    state, close that row too — in the SAME code path as the job's own
+    finalize, so the fleet view / source card can never keep showing a
+    run whose owning job died without a trace (2026-09 incident: a
+    reclaim-exhausted ``corpus-extraction`` job flipped to ``failed``
+    while its ``extraction_runs`` row stayed ``running`` forever).
+
+    Best-effort and raise-free, mirroring
+    ``connectors.sharepoint.crawler._RunRecorder``'s own posture for every
+    write to this table: closing out a run's bookkeeping is observability,
+    never load-bearing, and must never turn a job's own (already
+    committed) finalize into a worker crash. This also swallows the typed
+    ``RequiresPostgresBackend`` a DuckDB-backed instance raises resolving
+    ``extraction_runs_repo()`` — that table is post-A3 Postgres-only, and a
+    crawl on the frozen DuckDB app-state backend must keep failing exactly
+    as it always has, with no new exception from this cleanup step.
+    """
+    if kind not in _EXTRACTION_RUN_OWNING_KINDS:
+        return
+    try:
+        from src.repositories import extraction_runs_repo
+
+        closed = extraction_runs_repo().fail_for_job(job_id, error=error)
+    except Exception:
+        logger.debug(
+            "worker: could not close extraction_runs row for exhausted job %s (non-fatal)", job_id, exc_info=True
+        )
+        return
+    if closed:
+        logger.info(
+            "worker: job %s (kind=%s) exhausted — closed extraction_runs row %s as failed", job_id, kind, closed
+        )
+        if kind == "corpus-extraction-shard":
+            _bump_parent_after_shard_job_exhausted(closed)
+
+
+def _bump_parent_after_shard_job_exhausted(shard_run_id: str) -> None:
+    """A ``corpus-extraction-shard`` job just exhausted its reclaim budget
+    and its own ``extraction_runs`` row was closed ``failed`` by
+    :func:`_finalize_extraction_run_for_job` above — the PARENT run still
+    needs to hear about it (2026-09-03 auto-parallel-crawl design §4.3:
+    "a dead child's job fails through the existing reclaim budget and
+    ``fail_for_job`` closes its row; the parent then finalizes as ``failed``
+    on the last live child, naming the shard").
+
+    Reuses ``connectors.sharepoint.crawler._finish_shard_and_maybe_finalize``
+    — the SAME bump-and-maybe-finalize a live child calls on its own normal
+    exit — so an exhausted-reclaim death and a clean shard failure roll up
+    into the parent identically. Best-effort and raise-free, same posture
+    as the caller above: a coordination hiccup here must never turn an
+    already-committed job finalize into a worker crash.
+    """
+    try:
+        from src.repositories import extraction_runs_repo, source_connections_repo
+
+        row = extraction_runs_repo().get(shard_run_id)
+        if not row or not row.get("parent_run_id"):
+            return
+        connection = source_connections_repo().get(row["connection_id"])
+        if not connection:
+            return
+        from connectors.sharepoint.crawler import _finish_shard_and_maybe_finalize
+
+        _finish_shard_and_maybe_finalize(connection, str(row["parent_run_id"]))
+    except Exception:
+        logger.debug(
+            "worker: could not roll exhausted shard run %s into its parent (non-fatal)", shard_run_id, exc_info=True
+        )
+
+
+def _maybe_continue_facts_extraction(job: dict, result: dict | None) -> None:
+    """When a ``sharepoint-facts-extraction`` job completes having stopped
+    only on its own time budget with documents still pending, chain the
+    next pass onto it (TCRD-296 gap #61) — delegates entirely to
+    ``connectors.sharepoint.facts_extraction.maybe_continue_pass``; see
+    that function's docstring for the decision rules and for why this
+    MUST run only after ``complete()`` has already flipped the job out of
+    ``'running'`` (the continuation reuses this job's own idempotency
+    key, and enqueuing it while this row is still live would either
+    collide with or dedupe onto that same row instead of creating a
+    genuinely new one).
+
+    A plain no-op for every other kind (mirrors
+    ``_notify_agent_response_webhooks``'s / ``_finalize_extraction_run_for_job``'s
+    own kind-gated shape) and best-effort in its own right — a failure
+    inside ``maybe_continue_pass`` is already caught and logged there,
+    but this wrapper's own lookup (kind check, payload read) is guarded
+    again here so a malformed payload can never turn an already-persisted
+    success into a worker crash.
+    """
+    if job.get("kind") != "sharepoint-facts-extraction":
+        return
+    try:
+        from connectors.sharepoint.facts_extraction import maybe_continue_pass
+
+        payload = job.get("payload_json") or {}
+        connection_id = str(payload.get("connection_id") or "")
+        if not connection_id:
+            return
+        maybe_continue_pass(
+            connection_id,
+            payload=payload,
+            report=result or {},
+            original_job_id=job.get("id"),
+        )
+    except Exception:
+        logger.exception(
+            "worker: sharepoint-facts-extraction auto-continuation check failed for job %s (non-fatal)",
+            job.get("id"),
+        )
+
+
 def _sweep_stale_scratch() -> None:
     """Best-effort orphaned-scratch sweep, run before each HEAVY job.
 
@@ -525,6 +685,29 @@ async def _run_one(job: dict, kind: JobKind, worker_id: str, in_flight: dict[str
             raise
         except Exception as exc:
             logger.exception("worker %s: job %s (kind=%s) failed", worker_id, job["id"], job["kind"])
+            # TCRD-296 C.11: a job kind that opted in
+            # (`kind.transient_retry_in_seconds` — extraction kinds do) gets
+            # its OWN raised exception reclassified when it names a
+            # transient infrastructure fault (a connection-pool timeout, a
+            # dropped connection, a deadlock) rather than the ordinary
+            # "handler raised, an operator must look at it" policy
+            # `kind.retry_in_seconds` encodes — a multi-hour crawl must
+            # survive a 30-second connection-pool hiccup, not turn it into a
+            # terminal `'failed'` run. The requeue this triggers shares the
+            # kind's own `max_attempts` budget (`JOB_MAX_ATTEMPTS_BY_KIND`)
+            # with every other retry/reclaim — no separate counter.
+            retry_in_seconds = kind.retry_in_seconds
+            if kind.transient_retry_in_seconds is not None and is_transient_db_error(exc):
+                retry_in_seconds = kind.transient_retry_in_seconds
+                logger.warning(
+                    "worker %s: job %s (kind=%s) failed on a TRANSIENT infra fault (%s) — "
+                    "retrying in %ds instead of finalizing",
+                    worker_id,
+                    job["id"],
+                    job["kind"],
+                    type(exc).__name__,
+                    retry_in_seconds,
+                )
             # Persist the outcome before recording it in metrics — if `.fail()`
             # itself raises, this propagates without ever having reported an
             # outcome that was never actually persisted.
@@ -534,7 +717,7 @@ async def _run_one(job: dict, kind: JobKind, worker_id: str, in_flight: dict[str
                 worker_id,
                 lease_token,
                 str(exc),
-                retry_in_seconds=kind.retry_in_seconds,
+                retry_in_seconds=retry_in_seconds,
             )
             obs_metrics.record_job_duration(job["kind"], "failed", time.monotonic() - started_at)
             obs_metrics.record_job_failure(job["kind"], type(exc).__name__)
@@ -551,6 +734,11 @@ async def _run_one(job: dict, kind: JobKind, worker_id: str, in_flight: dict[str
                 # a *retrying* kind's attempts are actually exhausted — see
                 # `JobsRepository.fail`'s docstring.
                 _notify_agent_response_webhooks(job, "failed")
+                # Same `finalized` gate as the webhook notify above: only a
+                # job that ACTUALLY reached `'failed'` (not a requeue, not a
+                # stale-lease no-op) should close out its own run row — see
+                # `_finalize_extraction_run_for_job`'s docstring.
+                _finalize_extraction_run_for_job(job["id"], job["kind"], str(exc))
         else:
             # Same ordering rationale as the failure branch above.
             # `handler_result` is the handler's return value — `None` for
@@ -566,6 +754,10 @@ async def _run_one(job: dict, kind: JobKind, worker_id: str, in_flight: dict[str
                 # `complete()` must not fire a notification for an outcome
                 # another slot already owns.
                 _notify_agent_response_webhooks(job, "completed")
+                # Same `mutated` gate — a stale-lease no-op must not chain
+                # a duplicate facts-extraction continuation onto a job
+                # another slot already owns.
+                _maybe_continue_facts_extraction(job, handler_result)
         finally:
             if not handed_off:
                 obs_metrics.end_job_running(job["kind"], kind.lane)
@@ -679,6 +871,11 @@ async def _reap_loop(poll_interval_s: float) -> None:
     `job.failed` that never comes after a worker crash on a job's last
     attempt. Mirrors ``_notify_agent_response_webhooks``'s no-op-for-other-
     kinds behavior; a non-``agent_response`` reaped job is a silent no-op.
+
+    For the same reason, this is also the ONLY place a reaped job's own
+    ``extraction_runs`` row can be closed — ``reap_exhausted()`` finalizes
+    every returned row unconditionally, so every one of them is a genuine
+    terminal ``'failed'`` (see :func:`_finalize_extraction_run_for_job`).
     """
     while True:
         try:
@@ -687,6 +884,9 @@ async def _reap_loop(poll_interval_s: float) -> None:
                 logger.info("worker: reaped %d stuck job(s) (lease expired at max attempts)", len(reaped))
                 for job in reaped:
                     _notify_agent_response_webhooks(job, "failed")
+                    _finalize_extraction_run_for_job(
+                        job["id"], job["kind"], job.get("error") or "lease expired after max attempts"
+                    )
         except Exception:
             logger.exception("worker: reap_exhausted sweep failed (non-fatal)")
         await asyncio.sleep(poll_interval_s)
@@ -711,6 +911,23 @@ async def _notify_in_flight_agent_response(job_id: str, status: str) -> None:
     except Exception:
         logger.warning(
             "worker: agent_response webhook notify (shutdown drain) failed for job %s", job_id, exc_info=True
+        )
+
+
+async def _maybe_continue_facts_extraction_in_flight(job_id: str, result: dict | None) -> None:
+    """`_drain_in_flight`'s counterpart to `_maybe_continue_facts_extraction`
+    — same re-fetch rationale as `_notify_in_flight_agent_response` above
+    (`_InFlightJob` carries no `payload_json`), and best-effort in its own
+    right for the same reason."""
+    try:
+        job_row = await to_thread_drain_on_cancel(_jobs_repo().get, job_id)
+        if job_row is not None:
+            _maybe_continue_facts_extraction(job_row, result)
+    except Exception:
+        logger.warning(
+            "worker: sharepoint-facts-extraction auto-continuation check (shutdown drain) failed for job %s",
+            job_id,
+            exc_info=True,
         )
 
 
@@ -802,6 +1019,8 @@ async def _drain_in_flight(
                     # comment / `JobsRepository.fail`'s docstring.
                     if entry.kind_name == "agent_response" and finalized:
                         await _notify_in_flight_agent_response(job_id, "failed")
+                    if finalized:
+                        _finalize_extraction_run_for_job(job_id, entry.kind_name, str(exc))
                 else:
                     handler_result = fut.result()
                     mutated = await to_thread_drain_on_cancel(
@@ -810,6 +1029,8 @@ async def _drain_in_flight(
                     obs_metrics.record_job_duration(entry.kind_name, "done", duration)
                     if entry.kind_name == "agent_response" and mutated:
                         await _notify_in_flight_agent_response(job_id, "completed")
+                    if entry.kind_name == "sharepoint-facts-extraction" and mutated:
+                        await _maybe_continue_facts_extraction_in_flight(job_id, handler_result)
             except asyncio.CancelledError:
                 raise
             except Exception:

@@ -122,6 +122,20 @@ VERIFIABLE_KINDS = frozenset({"table", "metric", "document"})
 #: likelier to appear inside unrelated JSON than to be the document's name.
 _MIN_DERIVED_NEEDLE = 4
 
+#: The separator a model puts between a document's name and its own gloss on
+#: it — ``document: Foo.pptx — 4-week assessment, week 1``. The prompt asks
+#: for the filename alone and this is not that, but the WHOLE line arrives as
+#: the ref, so the citation matched nothing and the reader was told a real
+#: document was unverified for the sin of being described. The head is peeled
+#: like a directory prefix: same latitude, same floor, same direction of
+#: error. Spaces on both sides are required, so the hyphen inside `4-week` or
+#: `Week-2-Deliverable.pdf` is not a separator; a pipe is not one either,
+#: because `Q3 | Q4 review.pdf` is a filename this parser already accepts.
+_DESCRIPTION_SEP_RE = re.compile(r"\s+[—–-]{1,2}\s+")
+
+#: Runs of anything that is not a letter or a digit, for :func:`_normalize`.
+_NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
+
 #: Where an assumption came from — the closed vocabulary the workspace prompt
 #: asks for on an ``assumption:`` line's ``origin:`` segment. Closed on
 #: purpose: the UI turns each value into a badge with fixed copy
@@ -410,8 +424,82 @@ def _tool_call_haystack(tool_calls: Optional[Iterable[Any]]) -> str:
     return "\n".join(parts).lower()
 
 
-def verify(claims: list[SourceClaim], tool_calls: Optional[Iterable[Any]]) -> list[SourceClaim]:
+def _normalize(text: str) -> str:
+    """Lowercased, with every run of non-alphanumerics collapsed to one ``_``.
+
+    A filename reaches the model twice, spelled differently each time. The web
+    client REWRITES a dropped file's name before uploading it
+    (``safeUploadName`` in ``chat.js``: spaces and accents to underscores, a
+    stamp before the extension) because the server's filename rule is a
+    rejection, not a sanitizer — while the chat bubble, and therefore the
+    answer, keeps saying the name the user dropped. Matching
+    ``AI Opportunity Assessment.pptx`` against the stored
+    ``AI_Opportunity_Assessment-20260904T151500-1.pptx`` is not latitude
+    toward a sloppy citation; the rewrite between them is ours.
+
+    Collapsing rather than deleting keeps the separator that stops two words
+    running together into a third, and every needle built this way still goes
+    through :data:`_MIN_DERIVED_NEEDLE` — punctuation-insensitivity must not
+    hand back the rubber stamp the floor exists to refuse.
+    """
+    return _NON_ALNUM_RE.sub("_", text.lower())
+
+
+def _document_needles(ref: str) -> list[str]:
+    """Every spelling of ``ref`` we accept as naming the same document.
+
+    A document is cited by whatever the agent saw it called, and the tools do
+    not agree with each other on that: `fact_claims` names the file, a
+    collections listing carries a path in front of it, a distillate may drop
+    the extension, and the model may append a description of its own. So a
+    directory prefix, a trailing extension and a description tail are peeled
+    in turn — same latitude, and the same direction of error, as the metric
+    case. Peeling is order-dependent (head first, then basename, then its
+    stem) so ``collections/x/a.pdf — the roadmap`` reaches ``a``.
+
+    Every DERIVED needle goes through :data:`_MIN_DERIVED_NEEDLE`; the ref the
+    answer actually wrote is returned whatever its length.
+    """
+    cands = {ref}
+    head = _DESCRIPTION_SEP_RE.split(ref, 1)[0].strip()
+    if head:
+        cands.add(head)
+    for cand in list(cands):
+        base = cand.rsplit("/", 1)[-1]
+        cands.update((base, base.rsplit(".", 1)[0]))
+    return [c for c in cands if c == ref or len(c) >= _MIN_DERIVED_NEEDLE]
+
+
+def verify(
+    claims: list[SourceClaim],
+    tool_calls: Optional[Iterable[Any]],
+    tool_results: Optional[Iterable[Any]] = None,
+) -> list[SourceClaim]:
+    """Judge each checkable claim against the record of what the turn ran.
+
+    Two records, not one, and which claim gets which is the substance here.
+
+    A `table:` or a `metric:` names an INPUT — the agent wrote that name into
+    the SQL or the catalog lookup — so the arguments are the whole record, and
+    widening them would break the check: ``agnes catalog`` RETURNS every table
+    id the caller can see, which would verify any table an answer cared to
+    name off the back of one listing call.
+
+    A `document:` names an OUTPUT. No document tool takes a filename argument
+    (`fact_search` takes a query, `fact_claims` a subject id, a collections
+    listing nothing at all), so the file is named for the first time in the
+    tool's own result. Checked against arguments alone — which is what
+    shipped — a document cited by filename could not verify on any turn, at
+    any peeling: six correct citations under six amber badges, teaching the
+    reader that the badge means nothing. So the results reach this check too,
+    for `document:` alone, and only where the name could not be anywhere else.
+    """
     haystack = _tool_call_haystack(tool_calls)
+    # Built once, and only if something asks for it: a result is the whole of
+    # a tool's output (a query's rows, a fact dump), this runs on every
+    # assistant message of every history read, and a turn with no document
+    # claim never needs it.
+    document_haystack: Optional[tuple[str, str]] = None
     out: list[SourceClaim] = []
     for c in claims:
         if c.kind not in VERIFIABLE_KINDS:
@@ -424,27 +512,27 @@ def verify(claims: list[SourceClaim], tool_calls: Optional[Iterable[Any]]) -> li
         needles = [ref]
         if c.kind == "metric" and "/" in ref:
             needles.append(ref.rsplit("/", 1)[-1])
-        # A document is cited by whatever the agent saw it called, and the
-        # fact tools do not agree with each other on that: `fact_claims`
-        # names the file, a collections listing carries a path in front of
-        # it, and a distillate may drop the extension. All three are the same
-        # citation, so a directory prefix and a trailing extension are peeled
-        # in turn — same latitude, and the same direction of error, as the
-        # metric case above. Peeling is order-dependent (basename first, then
-        # its stem) so `collections/x/a.pdf` reaches `a`.
+        hay = haystack
         if c.kind == "document":
-            base = ref.rsplit("/", 1)[-1]
-            stem = base.rsplit(".", 1)[0]
-            # Every derived needle goes through the floor (see
-            # _MIN_DERIVED_NEEDLE) — a trailing slash peels to "" and a
-            # one-letter stem to "a", and either would verify every claim
-            # against every turn.
-            needles.extend(n for n in (base, stem) if n != ref and len(n) >= _MIN_DERIVED_NEEDLE)
-        out.append(SourceClaim(kind=c.kind, ref=c.ref, verified=any(n in haystack for n in needles)))
+            needles = _document_needles(ref)
+            if document_haystack is None:
+                widened = "\n".join(p for p in (haystack, _tool_call_haystack(tool_results)) if p)
+                document_haystack = (widened, _normalize(widened))
+            hay, normalized_hay = document_haystack
+            verified = any(n in hay for n in needles) or any(
+                len(n) >= _MIN_DERIVED_NEEDLE and n in normalized_hay for n in map(_normalize, needles)
+            )
+        else:
+            verified = any(n in hay for n in needles)
+        out.append(SourceClaim(kind=c.kind, ref=c.ref, verified=verified))
     return out
 
 
-def verdict(content: str, tool_calls: Optional[Iterable[Any]] = None) -> SourcesVerdict:
+def verdict(
+    content: str,
+    tool_calls: Optional[Iterable[Any]] = None,
+    tool_results: Optional[Iterable[Any]] = None,
+) -> SourcesVerdict:
     """The whole pass: parse the block, check what can be checked.
 
     An answer with no block yields `declared=False` and no claims — which the
@@ -454,4 +542,4 @@ def verdict(content: str, tool_calls: Optional[Iterable[Any]] = None) -> Sources
     body = extract_block(content)
     if body is None:
         return SourcesVerdict(declared=False)
-    return SourcesVerdict(declared=True, claims=verify(parse_claims(body), tool_calls))
+    return SourcesVerdict(declared=True, claims=verify(parse_claims(body), tool_calls, tool_results))

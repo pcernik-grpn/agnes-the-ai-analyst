@@ -33,8 +33,11 @@ RemainAfterExit=yes
 # Falls back to an unpinned useradd if 999 is already taken by a different
 # account, same as the startup-script: a hard failure here would brick
 # provisioning to protect a file (instance.yaml) nobody could read anyway.
-# The readback ExecStart= below reports the mismatch loudly instead.
-ExecStart=/bin/bash -c 'id -u agnes-applier >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin --uid 999 --user-group agnes-applier 2>/dev/null || useradd --system --no-create-home --shell /usr/sbin/nologin --user-group agnes-applier'
+# The readback ExecStart= below reports the mismatch loudly instead. The
+# group is ensured separately (`--gid`, not `--user-group`) so an orphaned
+# agnes-applier group — e.g. after a userdel that kept it — cannot fail
+# both useradd attempts and mark this unit failed.
+ExecStart=/bin/bash -c 'id -u agnes-applier >/dev/null 2>&1 || { getent group agnes-applier >/dev/null 2>&1 || groupadd --system agnes-applier; useradd --system --no-create-home --shell /usr/sbin/nologin --uid 999 --gid agnes-applier agnes-applier 2>/dev/null || useradd --system --no-create-home --shell /usr/sbin/nologin --gid agnes-applier agnes-applier; }'
 # Loud, non-fatal readback — covers both non-happy paths from #1217: the pin
 # above falling through to an allocated uid (999 taken at THIS boot), and an
 # agnes-applier that already existed from before this unit pinned anything

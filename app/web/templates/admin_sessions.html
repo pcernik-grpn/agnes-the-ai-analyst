@@ -77,8 +77,6 @@
 .obs-table tbody td { padding: 8px 12px; border-bottom: 1px solid var(--border-light, #f3f4f6); vertical-align: top; }
 .obs-table tbody tr { cursor: pointer; }
 .obs-table tbody tr:hover { background: var(--border-light, #f3f4f6); }
-.obs-table tbody tr.has-errors { background: var(--ds-accent-danger-bg); }
-.obs-table tbody tr.has-errors:hover { background: color-mix(in srgb, var(--ds-accent-danger-bg) 85%, transparent); }
 .obs-num { text-align: right; font-variant-numeric: tabular-nums; }
 .obs-empty { padding: 40px 16px; text-align: center; color: var(--text-secondary, #6b7280); font-size: 13px; }
 .obs-table-footer { display: flex; justify-content: space-between; align-items: center;
@@ -405,16 +403,34 @@
     tbody.innerHTML = '';
     d.rows.forEach(r => {
       const tr = document.createElement('tr');
-      if (r.tool_errors > 0) tr.classList.add('has-errors');
+      // NO row tint. This used to be `if (r.tool_errors > 0)` → paint the
+      // whole row with the danger background, which said "this session
+      // failed" about a session that merely retried a tool call. One bad path
+      // in a 300-call run is ordinary agent behaviour, so most long sessions
+      // came up red and the strongest signal on the page stopped carrying
+      // information. It was redundant as well as alarming: the Errors column
+      // beside it already shows the exact count as a chip, and that column is
+      // sortable and has its own "errors only" filter.
+      //
+      // TODO(future): red is now free to mean something, and the thing worth
+      // spending it on is SESSION OUTCOME — "did this session end badly" —
+      // which is a different question from "did any tool call error" and one
+      // the listing row cannot currently answer. It needs an outcome field
+      // from the collector/UsageProcessor first (see `_session_tool_stats` in
+      // app/api/admin_sessions.py, which counts calls and errors and nothing
+      // about how the run ended). Deliberately NOT approximated with an error
+      // RATE in the meantime: both `tool_calls` and `tool_errors` are on the
+      // row so a ratio is computable, but any threshold would be picked by eye
+      // and would still be a guess wearing the clothes of a measurement.
       const errCell = r.tool_errors > 0
         ? '<span class="obs-err-chip">' + fmtN(r.tool_errors) + '</span>'
         : '<span style="color:var(--text-secondary, #6b7280)">0</span>';
       // URL `{username}` segment is the on-disk directory name (UUID for
       // upload-API sessions, OS-username for the legacy collector), NOT
-      // r.username — that's now the display email (v60 collapse, #458)
-      // which the `_safe_session_path` regex on the server rejects. The
-      // listing API returns `session_dir` derived from `session_file`
-      // explicitly so the UI doesn't have to re-derive it.
+      // r.username — that's the display email (v60 collapse, #458). The
+      // server accepts the email too since #2266, but resolving it costs a
+      // user lookup per request; the listing API returns `session_dir`
+      // derived from `session_file` so the UI can address the file directly.
       const sessionDir = r.session_dir || '_';
       const viewerHref = '/admin/sessions/' + encodeURIComponent(sessionDir)
                        + '/' + encodeURIComponent(r.session_file.split('/').pop());

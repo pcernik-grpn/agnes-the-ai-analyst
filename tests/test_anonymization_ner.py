@@ -560,3 +560,190 @@ def test_model_accepts_a_tier_name_from_config(monkeypatch):
 
     monkeypatch.setattr(instance_config, "get_value", fake_get_value)
     assert default_model().startswith("claude-haiku")
+
+
+# ---------------------------------------------------------------------------
+# Provider resolution (`resolve_llm_provider`, `build_client`) — TCRD-296
+# gap #68. Scan OCR and the NER detector must resolve WHICH provider
+# (Anthropic direct vs. Google Vertex AI) the same way facts extraction
+# does: an explicit per-stage setting, else `extraction.facts.provider`,
+# else `ai.provider`, and ONLY once none of those resolve to Vertex does a
+# static `ANTHROPIC_API_KEY`/`LLM_API_KEY` apply. The live incident this
+# closes: a stale key in the environment (an exhausted workspace) kept
+# outranking an instance that had migrated everything else to Vertex.
+# ---------------------------------------------------------------------------
+
+
+def _config(monkeypatch, mapping: dict):
+    def fake_get_value(*keys, default=None):
+        return mapping.get(keys, default)
+
+    monkeypatch.setattr("app.instance_config.get_value", fake_get_value)
+
+
+class TestResolveLlmProvider:
+    def test_nothing_configured_resolves_anthropic(self, monkeypatch):
+        from src.anonymization_ner import resolve_llm_provider
+
+        _config(monkeypatch, {})
+        monkeypatch.setattr("src.anonymization_ner._vertex_config", lambda: None)
+        assert resolve_llm_provider() == ("anthropic", "ai.provider")
+
+    def test_ai_provider_vertex_wins_with_nothing_else_configured(self, monkeypatch):
+        from src.anonymization_ner import resolve_llm_provider
+
+        _config(monkeypatch, {})
+        monkeypatch.setattr("src.anonymization_ner._vertex_config", lambda: ("proj", "us-central1"))
+        assert resolve_llm_provider() == ("vertex", "ai.provider")
+
+    def test_facts_provider_setting_wins_over_ai_provider(self, monkeypatch):
+        from src.anonymization_ner import resolve_llm_provider
+
+        _config(monkeypatch, {("extraction", "facts", "provider"): "anthropic"})
+        monkeypatch.setattr("src.anonymization_ner._vertex_config", lambda: ("proj", "us-central1"))
+        assert resolve_llm_provider() == ("anthropic", "facts")
+
+    def test_facts_provider_inherit_falls_through_to_ai_provider(self, monkeypatch):
+        from src.anonymization_ner import resolve_llm_provider
+
+        _config(monkeypatch, {("extraction", "facts", "provider"): "inherit"})
+        monkeypatch.setattr("src.anonymization_ner._vertex_config", lambda: ("proj", "us-central1"))
+        assert resolve_llm_provider() == ("vertex", "ai.provider")
+
+    def test_own_setting_wins_over_facts_provider(self, monkeypatch):
+        from src.anonymization_ner import resolve_llm_provider
+
+        _config(
+            monkeypatch,
+            {
+                ("extraction", "scan_ocr", "provider"): "vertex",
+                ("extraction", "facts", "provider"): "anthropic",
+            },
+        )
+        monkeypatch.setattr("src.anonymization_ner._vertex_config", lambda: None)
+        assert resolve_llm_provider("extraction", "scan_ocr", "provider") == ("vertex", "own")
+
+    def test_own_setting_inherit_falls_through_to_facts_provider(self, monkeypatch):
+        from src.anonymization_ner import resolve_llm_provider
+
+        _config(
+            monkeypatch,
+            {
+                ("extraction", "scan_ocr", "provider"): "inherit",
+                ("extraction", "facts", "provider"): "vertex",
+            },
+        )
+        assert resolve_llm_provider("extraction", "scan_ocr", "provider") == ("vertex", "facts")
+
+    def test_an_invalid_own_setting_is_ignored(self, monkeypatch):
+        from src.anonymization_ner import resolve_llm_provider
+
+        _config(monkeypatch, {("extraction", "scan_ocr", "provider"): "openai"})
+        monkeypatch.setattr("src.anonymization_ner._vertex_config", lambda: None)
+        assert resolve_llm_provider("extraction", "scan_ocr", "provider") == ("anthropic", "ai.provider")
+
+    def test_no_own_path_skips_straight_to_facts_then_ai_provider(self, monkeypatch):
+        """The Batches-API client's own call shape (`_ensure_batch_client`,
+        no per-stage knob of its own) must never pick up an unrelated
+        stage's `extraction.scan_ocr.provider` override."""
+        from src.anonymization_ner import resolve_llm_provider
+
+        _config(monkeypatch, {("extraction", "scan_ocr", "provider"): "vertex"})
+        monkeypatch.setattr("src.anonymization_ner._vertex_config", lambda: None)
+        assert resolve_llm_provider() == ("anthropic", "ai.provider")
+
+
+class TestBuildClientFollowsTheConfiguredProvider:
+    """The live incident, verbatim (TCRD-296 gap #68): a stale
+    ANTHROPIC_API_KEY in the environment (an exhausted workspace) must
+    never outrank an instance configured for Vertex."""
+
+    def test_a_static_key_in_the_environment_never_overrides_ai_provider_vertex(self, monkeypatch):
+        from src.anonymization_ner import build_client
+
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-workspace-cap-hit")
+        _config(monkeypatch, {})
+        monkeypatch.setattr(
+            "connectors.llm.factory.vertex_config_or_none", lambda *a, **k: ("my-project", "us-central1")
+        )
+        captured = {}
+
+        def fake_create_vertex_client(*, project_id, region, timeout=None):
+            captured.update(project_id=project_id, region=region, timeout=timeout)
+            return object()
+
+        monkeypatch.setattr("connectors.llm.vertex_provider.create_vertex_client", fake_create_vertex_client)
+
+        client, model = build_client("claude-haiku-4-5", 30.0)
+
+        assert captured == {"project_id": "my-project", "region": "us-central1", "timeout": 30.0}
+        assert model == "claude-haiku-4-5"
+        assert client is not None
+
+    def test_an_explicit_scan_ocr_provider_wins_over_facts_and_ai_provider(self, monkeypatch):
+        from src.anonymization_ner import build_client
+
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-still-here")
+        _config(
+            monkeypatch,
+            {
+                ("extraction", "scan_ocr", "provider"): "anthropic",
+                ("extraction", "facts", "provider"): "vertex",
+            },
+        )
+        monkeypatch.setattr("connectors.llm.factory.vertex_config_or_none", lambda *a, **k: ("proj", "us-central1"))
+
+        def must_not_be_called(**kwargs):  # pragma: no cover - asserted by not firing
+            raise AssertionError("create_vertex_client must not run when scan_ocr.provider pins anthropic")
+
+        monkeypatch.setattr("connectors.llm.vertex_provider.create_vertex_client", must_not_be_called)
+
+        client, model = build_client("claude-haiku-4-5", 30.0, own_setting_path=("extraction", "scan_ocr", "provider"))
+        assert model == "claude-haiku-4-5"
+        assert client.api_key == "sk-ant-still-here"
+
+    def test_nothing_configured_still_uses_the_static_key(self, monkeypatch):
+        from src.anonymization_ner import build_client
+
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-key")
+        _config(monkeypatch, {})
+        monkeypatch.setattr("src.anonymization_ner._vertex_config", lambda: None)
+
+        client, model = build_client("claude-haiku-4-5", 30.0)
+        assert model == "claude-haiku-4-5"
+        assert client.api_key == "sk-ant-key"
+
+    def test_vertex_resolved_but_unconfigured_raises_naming_the_setting(self, monkeypatch):
+        from src.anonymization_ner import build_client
+
+        _config(monkeypatch, {("extraction", "facts", "provider"): "vertex"})
+        monkeypatch.setattr("src.anonymization_ner._vertex_config", lambda: None)
+
+        with pytest.raises(DetectionUnavailable) as excinfo:
+            build_client("claude-haiku-4-5", 30.0)
+        assert "vertex" in str(excinfo.value).lower()
+
+    def test_build_detector_client_uses_the_anonymization_provider_knob(self, monkeypatch):
+        """The NER detector's own call site (`build_detector_client`) must
+        pass `extraction.anonymization.provider` — not `extraction.
+        scan_ocr.provider` — as its own-setting path."""
+        from src.anonymization_ner import build_detector_client
+
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-still-here")
+        _config(
+            monkeypatch,
+            {
+                ("extraction", "anonymization", "provider"): "anthropic",
+                ("extraction", "facts", "provider"): "vertex",
+            },
+        )
+        monkeypatch.setattr("connectors.llm.factory.vertex_config_or_none", lambda *a, **k: ("proj", "us-central1"))
+
+        def must_not_be_called(**kwargs):  # pragma: no cover - asserted by not firing
+            raise AssertionError("create_vertex_client must not run when anonymization.provider pins anthropic")
+
+        monkeypatch.setattr("connectors.llm.vertex_provider.create_vertex_client", must_not_be_called)
+
+        client, model = build_detector_client("claude-haiku-4-5", 30.0)
+        assert model == "claude-haiku-4-5"
+        assert client.api_key == "sk-ant-still-here"

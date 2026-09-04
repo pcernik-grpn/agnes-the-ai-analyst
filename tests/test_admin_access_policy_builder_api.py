@@ -166,6 +166,43 @@ class TestPolicyBuilderColumns:
         assert "mapping_tables" in body
         assert body["eligible"] is True
 
+    def test_columns_endpoint_writes_an_audit_row_without_the_sample_values(self, policy_builder_table_with_profile):
+        """RBAC-reviewer finding on #1979: `samples` are real (potentially
+        PII) row values, the same class of content `catalog.sample` is
+        audited for -- this route must leave a real audit row, and that
+        row's params must carry metadata only, never the sample values or
+        column names themselves."""
+        c = policy_builder_table_with_profile["client"]
+        token = policy_builder_table_with_profile["admin_token"]
+
+        resp = c.get(
+            "/api/admin/registry/policy_builder_invoices/policy/columns",
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+
+        from src.repositories import audit_repo
+
+        rows, _ = audit_repo().query(action="access_policy.columns_view", resource="policy_builder_invoices")
+        rows = list(rows)
+        assert rows, "the columns read left no audit trail"
+
+        import json as _json
+
+        raw_params = rows[0]["params"]
+        params = _json.loads(raw_params) if isinstance(raw_params, str) else raw_params
+        assert params["table_id"] == "policy_builder_invoices"
+        assert params["column_count"] == len(body["columns"])
+        assert params["samples_included"] is True
+        assert set(params.keys()) == {"table_id", "column_count", "samples_included"}
+
+        # None of the real sample values leak into the audit params, neither
+        # under a known key nor smuggled anywhere else.
+        for col in body["columns"]:
+            for sample in col["samples"]:
+                assert sample not in (raw_params if isinstance(raw_params, str) else _json.dumps(params))
+
     def test_columns_endpoint_without_a_profile_returns_empty_samples(self, policy_builder_table):
         """No profile has been saved yet — the endpoint must still answer
         200 with real column names/types, just no samples (never 500)."""
@@ -288,6 +325,95 @@ class TestPolicyBuilderColumns:
             headers=_auth(token),
         )
         assert resp.status_code == 404, resp.text
+
+    def test_columns_endpoint_reads_bigquery_schema_for_a_never_synced_remote_table(self, seeded_app, monkeypatch):
+        """A `query_mode='remote'` BigQuery table has no view in the shared
+        analytics connection until something queries through it -- the old
+        bare `DESCRIBE` returned `[]` for exactly this shape, rendering "No
+        columns found" indistinguishable from a table that genuinely has
+        none. The columns endpoint must reach BigQuery's own schema
+        instead, the same way `agnes schema` already does via
+        `build_schema_uncached`."""
+        from app.api import v2_schema
+        from src.db import get_system_db
+        from src.repositories.table_registry import TableRegistryRepository
+
+        monkeypatch.setattr(
+            v2_schema,
+            "_fetch_bq_schema",
+            lambda bq, dataset, table: [
+                {"name": "revenue", "type": "FLOAT64", "nullable": True, "description": ""},
+                {"name": "cost_center", "type": "STRING", "nullable": True, "description": ""},
+            ],
+        )
+        monkeypatch.setattr(v2_schema, "_fetch_bq_table_options", lambda bq, dataset, table: {})
+
+        conn = get_system_db()
+        try:
+            TableRegistryRepository(conn).register(
+                id="mgmt_pl_remote",
+                name="mgmt_pl_remote",
+                source_type="bigquery",
+                bucket="finance",
+                source_table="mgmt_pl_remote",
+                query_mode="remote",
+            )
+        finally:
+            conn.close()
+
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        resp = c.get(
+            "/api/admin/registry/mgmt_pl_remote/policy/columns",
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert [col["name"] for col in body["columns"]] == ["revenue", "cost_center"]
+        assert body["columns_error"] is None
+        assert body["eligible"] is True
+
+    def test_columns_endpoint_reports_a_schema_lookup_error_instead_of_a_silent_empty_list(
+        self, seeded_app, monkeypatch
+    ):
+        """When the schema lookup itself fails (an expired token, an
+        unreachable warehouse), the builder must say so -- `columns: []`
+        with a `columns_error` explaining why -- rather than rendering the
+        same "No columns found" a table with a genuinely empty schema
+        would."""
+        from app.api import v2_schema
+        from src.db import get_system_db
+        from src.repositories.table_registry import TableRegistryRepository
+
+        def _boom(bq, dataset, table):
+            raise RuntimeError("BQ token expired")
+
+        monkeypatch.setattr(v2_schema, "_fetch_bq_schema", _boom)
+
+        conn = get_system_db()
+        try:
+            TableRegistryRepository(conn).register(
+                id="mgmt_pl_broken",
+                name="mgmt_pl_broken",
+                source_type="bigquery",
+                bucket="finance",
+                source_table="mgmt_pl_broken",
+                query_mode="remote",
+            )
+        finally:
+            conn.close()
+
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+        resp = c.get(
+            "/api/admin/registry/mgmt_pl_broken/policy/columns",
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["columns"] == []
+        assert body["columns_error"]
+        assert "BQ token expired" in body["columns_error"]
 
 
 # ── Task 3: POST /registry/{table_id}/policy/compile ────────────────────
@@ -476,3 +602,135 @@ class TestPolicyBuilderCompile:
         )
         assert resp.status_code == 422, resp.text
         assert "select no columns" in resp.json()["detail"], resp.text
+
+    def test_compile_endpoint_refuses_an_unknown_row_rule_column(self, policy_builder_table):
+        """A row rule naming a column the table does not have used to be
+        DROPPED with a warning — so a spec whose only rule referenced a
+        since-renamed column compiled to a WHERE-less policy handing the whole
+        table to everyone, at authoring time, behind a 200 and a warning nobody
+        had to read. It is a refused compile now."""
+        c = policy_builder_table["client"]
+        token = policy_builder_table["admin_token"]
+
+        resp = c.post(
+            "/api/admin/registry/policy_builder_invoices/policy/compile",
+            json={
+                "row_rules": [{"column": "renamed_away", "op": "in_caller_groups"}],
+                "column_masks": {},
+            },
+            headers=_auth(token),
+        )
+        assert resp.status_code == 422, resp.text
+        detail = resp.json()["detail"]
+        assert detail.startswith("policy_compile_invalid_spec:"), resp.text
+        assert "renamed_away" in detail, resp.text
+
+    def test_compile_endpoint_supports_the_partial_masks(self, policy_builder_table):
+        c = policy_builder_table["client"]
+        token = policy_builder_table["admin_token"]
+
+        resp = c.post(
+            "/api/admin/registry/policy_builder_invoices/policy/compile",
+            json={
+                "row_rules": [],
+                "column_masks": {"email": "email_partial", "national_id": "last4"},
+            },
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200, resp.text
+        sql = resp.json()["sql"]
+        assert "SELECT *" not in sql
+        assert "EXCLUDE" not in sql
+        # Each masked column is projected exactly once — never beside a
+        # plaintext sibling under the same output name.
+        assert sql.count('AS "email"') == 1
+        assert sql.count('AS "national_id"') == 1
+        assert "REGEXP_REPLACE(\"email\", '^[^@]*', '')" in sql
+        assert "CONCAT('****', SUBSTRING(\"national_id\", -4))" in sql
+        # The compiled body must survive the gate every save runs, remote
+        # transpiles included — the builder may not hand an admin SQL the PUT
+        # would then refuse.
+        from src.access_policy_validate import validate_policy_sql
+
+        validate_policy_sql(
+            sql,
+            table_id="policy_builder_invoices",
+            table_name="policy_builder_invoices",
+            mapping_table_names=set(),
+            for_remote=True,
+        )
+
+    def test_compile_endpoint_refuses_a_partial_mask_on_a_non_text_column(self, policy_builder_table):
+        """`last4`/`email_partial` are string surgery; on a DOUBLE column the
+        only options are silently changing the output column's type or emitting
+        nonsense, so the compiler refuses and the endpoint 422s."""
+        c = policy_builder_table["client"]
+        token = policy_builder_table["admin_token"]
+
+        resp = c.post(
+            "/api/admin/registry/policy_builder_invoices/policy/compile",
+            json={"row_rules": [], "column_masks": {"amount_eur": "last4"}},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 422, resp.text
+        detail = resp.json()["detail"]
+        assert detail.startswith("policy_compile_invalid_spec:"), resp.text
+        assert "amount_eur" in detail, resp.text
+
+    def test_compile_endpoint_builds_a_tiered_mask_chain(self, policy_builder_table):
+        """A multi-tier spec is compiled server-side into ONE ordered CASE
+        chain -- the endpoint stays a pure generator, so the stored artifact
+        is still SQL, never the tier structure."""
+        c = policy_builder_table["client"]
+        token = policy_builder_table["admin_token"]
+
+        resp = c.post(
+            "/api/admin/registry/policy_builder_invoices/policy/compile",
+            json={
+                "row_rules": [],
+                "column_masks": {
+                    "national_id": {
+                        "choice": "tiered",
+                        "tiers": [
+                            {"groups": ["Compliance"], "reveal": "show"},
+                            {"groups": ["Finance"], "reveal": "last4"},
+                        ],
+                        "default": "nullify",
+                    }
+                },
+            },
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200, resp.text
+        sql = resp.json()["sql"]
+        assert "SELECT *" not in sql
+        # One output column for the masked column, in tier order.
+        assert sql.count('AS "national_id"') == 1
+        assert sql.index("'Compliance'") < sql.index("'Finance'")
+        assert "list_contains($user_groups, 'Compliance')" in sql
+        assert "CAST(NULL AS VARCHAR) END" in sql
+
+    def test_compile_endpoint_rejects_a_tiered_spec_that_masks_nothing(self, policy_builder_table):
+        """A tier chain whose default is ``show`` reveals the column to
+        everyone the tiers do not name -- a no-op policy that reads like a
+        restriction. ``compile_policy`` refuses it; the endpoint must surface
+        that as a 4xx the builder can render, never a 500."""
+        c = policy_builder_table["client"]
+        token = policy_builder_table["admin_token"]
+
+        resp = c.post(
+            "/api/admin/registry/policy_builder_invoices/policy/compile",
+            json={
+                "row_rules": [],
+                "column_masks": {
+                    "national_id": {
+                        "choice": "tiered",
+                        "tiers": [{"groups": ["Compliance"], "reveal": "show"}],
+                        "default": "show",
+                    }
+                },
+            },
+            headers=_auth(token),
+        )
+        assert resp.status_code == 422, resp.text
+        assert "default" in resp.json()["detail"]

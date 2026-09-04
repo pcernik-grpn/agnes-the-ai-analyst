@@ -2,15 +2,27 @@
 relation into a caller's SQL on every read surface that has a SQL tree to
 walk (table access policies design doc §5.2, §16, §19).
 
-Pure unit tests against a FAKE ``resolve`` callable -- deliberately not the
-real ``policied_relation`` (Task 5's own contract test,
+Most of this file is pure unit tests against a FAKE ``resolve`` callable --
+deliberately not the real ``policied_relation`` (Task 5's own contract test,
 ``tests/test_access_policy_resolver.py``, already covers that end) -- so
 this module does not depend on live registry rows, per the plan's Task 6
 instruction.
+
+``TestRewriteAgainstTheRealResolver`` at the bottom is the one exception
+(issue #2147 backlog item 5): the fake resolver above folds case itself
+(see its own docstring), which is exactly how the #1979 case-folding leak
+survived a green suite here while ``rewrite_sql``'s REAL default resolve --
+``policied_relation``, whose registry lookup used to be exact-equality --
+did not fold at all. That class drives ``rewrite_sql`` with NO ``resolve=``
+override against a registry seeded through the repository factory (the
+same pattern ``tests/test_access_policy_resolver.py``'s ``policy_env``
+fixture uses), so a regression in the real wiring -- not merely in this
+file's own double -- fails here too.
 """
 
 from __future__ import annotations
 
+import functools
 import inspect
 
 import pytest
@@ -19,6 +31,7 @@ from src.access_policy import (
     PoliciedRelation,
     PolicyError,
     PolicyNameCollision,
+    PolicyUnknownTable,
     policied_relation,
     rewrite_sql,
 )
@@ -34,10 +47,21 @@ POLICY_SQL = "SELECT id, amount FROM invoices WHERE list_contains($user_groups, 
 def fake_resolver_policying(target_name: str, *, relation_sql: str = POLICY_SQL, table_id: str | None = None):
     """A ``resolve=`` double good enough to exercise ``rewrite_sql`` without
     a registry: ``policied=True`` for exactly ``target_name`` (matched
-    case-insensitively, mirroring DuckDB folding unquoted identifiers),
+    case-insensitively, mirroring DuckDB folding identifiers),
     ``policied=False`` passthrough for every other name -- the same two
     outcomes ``policied_relation`` itself returns for "policy attached" vs.
     "registered but no policy".
+
+    A DOUBLE, and it once flattered the real thing: this fake always folded
+    case while ``policied_relation``'s registry lookup compared names with
+    ``=`` on both backends, so ``FROM INVOICES`` resolved to nothing, landed
+    in ``rewrite_sql``'s swallowed ``PolicyUnknownTable`` arm, and served the
+    raw view -- with this file green throughout (#1979, security review).
+    The case contract is therefore pinned against the REAL resolver in
+    ``tests/test_access_policy_resolver.py`` (``TestCaseInsensitiveName
+    Resolution`` / ``TestRewriteThroughTheRealResolver``); keep this fake in
+    step with it, and never treat a green run here as evidence about
+    resolution.
     """
     resolved_id = table_id or target_name
 
@@ -56,7 +80,7 @@ def fake_resolver_policying(target_name: str, *, relation_sql: str = POLICY_SQL,
 
 def resolver_raising_for_unknown(target_name: str):
     """Like :func:`fake_resolver_policying`, but any OTHER name raises
-    ``PolicyError`` instead of a passthrough -- the shape a REAL
+    ``PolicyUnknownTable`` instead of a passthrough -- the shape a REAL
     ``policied_relation`` call takes for a name that is not a registered
     table id or name at all (``_resolve_table_row``'s "neither resolving").
     """
@@ -66,7 +90,7 @@ def resolver_raising_for_unknown(target_name: str):
             return PoliciedRelation(
                 relation_sql=POLICY_SQL, params={"user_groups": ["Finance"]}, policied=True, table_id=target_name
             )
-        raise PolicyError(name)
+        raise PolicyUnknownTable(name)
 
     return _resolve
 
@@ -283,3 +307,164 @@ class TestDefaultResolverIsPoliciedRelation:
 
     def test_default_resolve_parameter_is_policied_relation(self):
         assert inspect.signature(rewrite_sql).parameters["resolve"].default is policied_relation
+
+
+class TestSecurityRefusalIsNeverSwallowed:
+    """#1979's fail-OPEN bug: ``resolve`` has TWO failure modes and only one
+    of them is "not this function's concern".
+
+    ``policied_relation`` signals "no registered table answers to this name"
+    with ``PolicyUnknownTable`` -- a CTE alias, an ``information_schema``
+    view -- and every OTHER resolution failure (a transpile error, an
+    identity variable in pattern position, a policy body that no longer
+    parses) with a plain ``PolicyError``. Swallowing the second kind leaves
+    the table reference UNSUBSTITUTED, so the caller reads the raw base view
+    with a 200: a policy refusal turned into a policy bypass, on the primary
+    query surface. Only the ``PolicyUnknownTable`` arm may be swallowed.
+    """
+
+    @staticmethod
+    def _refusing_resolver(name: str, principal) -> PoliciedRelation:
+        """``invoices`` is registered and policied but REFUSED; every other
+        name is genuinely unregistered."""
+        if name.lower() == "invoices":
+            raise PolicyError("tbl_invoices")
+        raise PolicyUnknownTable(name)
+
+    def test_unknown_table_is_a_policy_error_subclass(self):
+        # So every existing `except PolicyError` handler (which maps to a
+        # structured, fail-closed response) keeps behaving exactly as before.
+        assert issubclass(PolicyUnknownTable, PolicyError)
+
+    def test_a_refusal_on_a_policied_table_propagates(self):
+        with pytest.raises(PolicyError) as exc_info:
+            rewrite_sql("SELECT * FROM invoices, dim", SOLO_USER, resolve=self._refusing_resolver)
+        assert not isinstance(exc_info.value, PolicyUnknownTable)
+        assert exc_info.value.table_id == "tbl_invoices"
+
+    def test_a_refusal_propagates_from_the_unparseable_scan_too(self):
+        # Rule 3's best-effort token scan swallowed the same conflated type,
+        # so an unparseable statement naming a REFUSED table returned
+        # unchanged -- and then ran, unfiltered.
+        with pytest.raises(PolicyError) as exc_info:
+            rewrite_sql("SELECT * FROM invoices SAMPLE 50%", SOLO_USER, resolve=self._refusing_resolver)
+        assert exc_info.value.table_id == "tbl_invoices"
+
+    def test_an_unknown_name_is_still_swallowed(self):
+        sql = "SELECT * FROM information_schema.tables t"
+        out, params, ids = rewrite_sql(sql, SOLO_USER, resolve=self._refusing_resolver)
+        assert out == sql
+        assert params == {}
+        assert ids == []
+
+    def test_a_cte_alias_that_is_not_a_registered_table_still_resolves_benignly(self):
+        # The commonest analyst idiom: every name in it -- the CTE alias and
+        # the real table -- goes through `resolve`, and only the unregistered
+        # one may be swallowed.
+        sql = "WITH recent AS (SELECT * FROM dim) SELECT * FROM recent"
+        out, params, ids = rewrite_sql(sql, SOLO_USER, resolve=resolver_raising_for_unknown("invoices"))
+        assert out == sql
+        assert ids == []
+
+
+class TestRewriteAgainstTheRealResolver:
+    """Issue #2147 backlog item 5: every fixture above proves the DOUBLE --
+    a fake resolver that folds case itself. This class proves the SYSTEM:
+    ``rewrite_sql(sql, principal)`` called with no ``resolve=`` override (its
+    real production shape on every caller in ``app/api/query.py``) against a
+    registry row seeded through the repository factory, exactly as
+    ``tests/test_access_policy_resolver.py``'s ``policy_env`` fixture seeds
+    one.
+    """
+
+    @pytest.fixture
+    def real_env(self, e2e_env):
+        """One policied table (``invoices``, referencing only
+        ``$user_groups``) and a solo, non-admin analyst in its group --
+        seeded directly through the repositories, no HTTP client needed."""
+        from src.db import get_system_db
+        from src.repositories.table_registry import TableRegistryRepository
+        from src.repositories.user_group_members import UserGroupMembersRepository
+        from src.repositories.user_groups import UserGroupsRepository
+        from src.repositories.users import UserRepository
+
+        conn = get_system_db()
+        try:
+            UserRepository(conn).create(id="u_real", email="real@example.com", name="Real")
+            finance_gid = UserGroupsRepository(conn).create(name="Finance")["id"]
+            UserGroupMembersRepository(conn).add_member("u_real", finance_gid, source="admin")
+
+            registry = TableRegistryRepository(conn)
+            registry.register(
+                id="tbl_invoices",
+                name="invoices",
+                source_type="keboola",
+                query_mode="local",
+                server_only=True,
+            )
+            registry.set_access_policy(
+                "tbl_invoices",
+                sql=POLICY_SQL,
+                note="cost-centre filter",
+                updated_by="admin",
+            )
+        finally:
+            conn.close()
+
+        return {"id": "u_real", "email": "real@example.com"}
+
+    def test_uppercase_name_is_rewritten_by_the_real_resolver(self, real_env):
+        out, params, ids = rewrite_sql("SELECT * FROM INVOICES", real_env)
+        assert ids == ["tbl_invoices"]
+        assert "list_contains" in out
+        assert params["user_groups"] == ["Finance"]
+
+    def test_quoted_mixed_case_reference_to_a_lowercase_name(self, real_env):
+        # DuckDB folds a QUOTED identifier onto an existing view regardless
+        # of case (verified: see tests/test_access_policy_resolver.py's
+        # TestCaseInsensitiveNameResolution docstring) -- the registry
+        # lookup must fold the same way.
+        out, params, ids = rewrite_sql('SELECT * FROM "Invoices"', real_env)
+        assert ids == ["tbl_invoices"]
+        assert "list_contains" in out
+        assert params["user_groups"] == ["Finance"]
+
+    def test_main_qualified_name_is_rewritten_by_the_real_resolver(self, real_env):
+        out, params, ids = rewrite_sql("SELECT * FROM main.invoices", real_env)
+        assert ids == ["tbl_invoices"]
+        assert "list_contains" in out
+        assert params["user_groups"] == ["Finance"]
+
+    def test_a_resolution_refusal_through_the_real_resolver_is_never_swallowed(self, real_env):
+        """The #1979 shape, driven end to end: a policied, REGISTERED table
+        whose stored body cannot be carried to a remote dialect (here,
+        because it calls the DuckDB-only ``agnes_hmac`` pseudonym function,
+        refused by ``_reject_duckdb_only_functions`` before any transpile is
+        even attempted) must REFUSE the read -- never fall back to the raw,
+        unfiltered base view with a 200. Exercises the exact production
+        wiring ``app/api/query.py``'s BigQuery remote path uses:
+        ``resolve=functools.partial(policied_relation, dialect="bigquery")``.
+        """
+        from src.db import get_system_db
+        from src.repositories.table_registry import TableRegistryRepository
+
+        conn = get_system_db()
+        try:
+            TableRegistryRepository(conn).set_access_policy(
+                "tbl_invoices",
+                sql="SELECT id, agnes_hmac(email) AS email FROM invoices "
+                "WHERE list_contains($user_groups, cost_center)",
+                note="duckdb-only pseudonym, unsafe to transpile",
+                updated_by="admin",
+            )
+        finally:
+            conn.close()
+
+        with pytest.raises(PolicyError) as exc_info:
+            rewrite_sql(
+                "SELECT * FROM invoices",
+                real_env,
+                resolve=functools.partial(policied_relation, dialect="bigquery"),
+            )
+        assert exc_info.value.table_id == "tbl_invoices"
+        assert not isinstance(exc_info.value, PolicyUnknownTable)

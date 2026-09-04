@@ -208,6 +208,46 @@ def test_get_by_source_doc_id_round_trips(pg_engine, monkeypatch):
     assert row["corpus_id"] == CORPUS_ID
 
 
+def test_resolve_doc_labels_empty_ids_returns_empty_dict(pg_engine, monkeypatch):
+    repo, _cf = _make_repo(pg_engine, monkeypatch)
+    assert repo.resolve_doc_labels([]) == {}
+
+
+def test_resolve_doc_labels_batches_the_same_answer_as_get_by_source_doc_id(pg_engine, monkeypatch):
+    """The batched sibling of ``get_by_source_doc_id`` + a corpus_files/
+    file_corpora lookup per id — same shape, one round trip for every id."""
+    repo, cf_repo = _make_repo(pg_engine, monkeypatch)
+    file_id = _add_file(cf_repo, sha256="s1")
+    repo.upsert(
+        corpus_file_id=file_id,
+        corpus_id=CORPUS_ID,
+        source_stable_id="graph:abc123",
+        source_doc_id="doc-a",
+    )
+    labels = repo.resolve_doc_labels(["doc-a", "doc-unmapped"])
+    assert labels["doc-a"] == {"name": "a.md", "collection": "Test"}
+    assert "doc-unmapped" not in labels
+
+
+def test_resolve_doc_labels_covers_many_ids_in_one_call(pg_engine, monkeypatch):
+    repo, cf_repo = _make_repo(pg_engine, monkeypatch)
+    doc_ids = []
+    for i in range(5):
+        file_id = _add_file(cf_repo, sha256=f"s{i}")
+        doc_id = f"doc-{i}"
+        repo.upsert(
+            corpus_file_id=file_id,
+            corpus_id=CORPUS_ID,
+            source_stable_id=f"graph:{i}",
+            source_doc_id=doc_id,
+        )
+        doc_ids.append(doc_id)
+    labels = repo.resolve_doc_labels(doc_ids)
+    assert set(labels) == set(doc_ids)
+    for doc_id in doc_ids:
+        assert labels[doc_id]["collection"] == "Test"
+
+
 def test_cascade_delete_removes_mapping(pg_engine, monkeypatch):
     """corpus_file_id FK ON DELETE CASCADE: deleting the corpus_files row
     removes its source mapping too."""

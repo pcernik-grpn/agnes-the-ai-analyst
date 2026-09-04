@@ -249,6 +249,20 @@ def _load_ai_config_or_none() -> dict | None:
     Lazy import so this module stays importable without the config package
     (precedent: connectors/keboola/extractor.py). Never raises.
     """
+    # The MERGED view first (static instance.yaml + the admin-writable
+    # overlay under the data dir): an instance whose whole configuration
+    # lives in the overlay has NO static file at all, and reading only the
+    # static loader made a correctly configured `ai.provider: vertex`
+    # instance answer "no usable Vertex configuration" (live finding,
+    # 2026-09 — fact extraction could not switch providers).
+    try:
+        from app.instance_config import get_value
+
+        ai = get_value("ai", default=None)
+        if isinstance(ai, dict):
+            return ai
+    except Exception:  # noqa: BLE001 — fall through to the static loader
+        pass
     try:
         from config.loader import load_instance_config
 

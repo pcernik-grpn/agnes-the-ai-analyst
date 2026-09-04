@@ -8,6 +8,7 @@ by `agnes facts neighbors|claims` for the fact-graph query surface (spec
 
 from __future__ import annotations
 
+import json
 import re
 
 _TABLE_MISS_RE = re.compile(r"Table with name ([A-Za-z_][A-Za-z0-9_]*) does not exist")
@@ -67,3 +68,44 @@ def facts_not_found_hint(subject_id: str, *, surface: str = "cli") -> str:
     if surface == "mcp":
         return base + " Use the `fact_search` tool to find a valid id, or ask an admin about the `facts` feature flag."
     return base + " Check the id with `agnes facts search <type>`, or ask an admin whether `facts` is enabled here."
+
+
+def row_scope_note(row_scope: "dict | None") -> "str | None":
+    """Render the `[scope]` disclosure line (table access policies §10) for
+    an already-parsed ``row_scope`` envelope
+    (``src/access_policy.py::row_scope_payload``), or ``None`` if absent.
+
+    The single wording source every CLI surface that can read a policied
+    table's rows shares -- `agnes query` (``row_scope`` in the JSON body),
+    `agnes describe` (``sample.row_scope``), `agnes snapshot create`/`refresh`
+    (parsed from the ``X-Agnes-Row-Scope`` header via
+    :func:`row_scope_note_from_header`) -- so the note never drifts between
+    them. Always render to stderr at the call site: "silent partial scope
+    is forbidden" (command-ux.md) applies to row filtering exactly like it
+    does to source scope, so json/csv stdout must stay clean.
+    """
+    if not isinstance(row_scope, dict):
+        return None
+    note = row_scope.get("note")
+    if not note:
+        return None
+    return f"[scope] {note}"
+
+
+def row_scope_note_from_header(header_value: "str | None") -> "str | None":
+    """Same disclosure line as :func:`row_scope_note`, for a caller that only
+    has the raw ``X-Agnes-Row-Scope`` response header.
+
+    ``POST /api/v2/scan`` (what `agnes snapshot create`/`refresh` call) has
+    no JSON body to carry ``row_scope`` in, so it ships the same envelope as
+    a JSON-encoded header instead (see ``app/api/v2_scan.py``). A missing or
+    malformed header returns ``None`` rather than raising -- a disclosure
+    header must never crash a snapshot fetch.
+    """
+    if not header_value:
+        return None
+    try:
+        row_scope = json.loads(header_value)
+    except (ValueError, TypeError):
+        return None
+    return row_scope_note(row_scope)

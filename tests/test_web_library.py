@@ -8,7 +8,7 @@ import pytest
 import io
 
 # Glyph path fragments (mirror macros/_catalog_card.html kind_glyph).
-_DOC_GLYPH = "M7 4h7l4 4v12H7z"  # single document — a one-file artefact
+_DOC_GLYPH = "M7 4h7l4 4v12H7z"  # single document — a one-file artifact
 _LIB_GLYPH = "M9 7h6l4 4v9"  # two overlapping sheets — a collection (detail hero)
 # In the Library's Files TABLE a collection wears a folder glyph instead: there
 # it sits beside loose files and takes drops, so it reads as the container it is.
@@ -293,7 +293,7 @@ def test_library_definitions_are_not_at_the_tail_of_an_unbounded_list(seeded_app
     Two fixes since, and this asserts the property both were after rather
     than either mechanism: first a Semantic models section at a fixed slot in
     `_SECTION_ORDER`, now a strip above the toolbar with the whole layer off
-    the table. Either way the definitions precede the unbounded artefact
+    the table. Either way the definitions precede the unbounded artifact
     sections rather than trailing them. Position is asserted rather than mere
     presence, because presence is exactly what the old bug had.
     """
@@ -399,10 +399,92 @@ def test_library_lists_only_accessible(seeded_app):
     assert "Hidden From Analyst" not in r.text
 
 
+def _group_with_member(user_id: str, group_name: str) -> str:
+    """Create ``group_name`` (if absent) and put ``user_id`` in it."""
+    from src.db import get_system_db
+    from src.repositories.user_group_members import UserGroupMembersRepository
+    from src.repositories.user_groups import UserGroupsRepository
+
+    conn = get_system_db()
+    groups = UserGroupsRepository(conn)
+    grp = groups.get_by_name(group_name) or groups.create(name=group_name, description="test", created_by="test")
+    members = UserGroupMembersRepository(conn)
+    if not members.has_membership(user_id, grp["id"]):
+        members.add_member(user_id, grp["id"], source="admin", added_by="test")
+    return grp["id"]
+
+
+def test_library_admin_sees_every_collection_labeling_the_ungranted_ones(seeded_app):
+    """Admin god-mode on the artefacts section (see ``library_page``'s
+    docstring): the index used to apply the SAME owned-or-granted filter to
+    an admin as to anyone else, so a live instance where an admin owned or
+    was granted only a handful of hundreds of collections rendered a Library
+    that looked nearly empty even though ``/library/{slug}`` already opened
+    any of them for that admin (``can_access_collection`` bypasses for admin
+    there). The index now matches: every live collection renders for an
+    admin, and the ones reached purely through admin authority — no
+    ownership, no grant to one of the admin's own groups — carry a "Not
+    shared with you" note so the difference from an ordinary grant stays
+    visible on the card, not just in an audit log.
+
+    A non-admin's own view is unaffected — this is admin-specific, not a
+    widened default: with grants to 2 of 5 collections, a non-admin still
+    sees exactly those 2.
+    """
+    c = seeded_app["client"]
+    viewer_tok = seeded_app["viewer_token"]
+
+    # 2 collections shared to a group both admin1 and analyst1 belong to —
+    # reachable by EITHER through an ordinary grant, so neither is
+    # admin-only-visible for admin1.
+    shared_group = _group_with_member("analyst1", "lib-admin-visibility-grp")
+    _group_with_member("admin1", "lib-admin-visibility-grp")
+    shared_cols = [
+        c.post("/api/collections", json={"name": f"Team Deck {i}"}, headers=_auth(viewer_tok)).json() for i in range(2)
+    ]
+    # The owner (viewer1) isn't in that group, so the grant is set by an
+    # admin — admins may share into any group, not just their own.
+    for col in shared_cols:
+        r = c.put(
+            f"/api/sharing/collection/{col['id']}",
+            json={"group_ids": [shared_group]},
+            headers=_auth(seeded_app["admin_token"]),
+        )
+        assert r.status_code == 200, r.text
+
+    # 3 more, granted to no one at all — reachable only by their owner and
+    # by admin god-mode.
+    private_cols = [
+        c.post("/api/collections", json={"name": f"Ungranted Deck {i}"}, headers=_auth(viewer_tok)).json()
+        for i in range(3)
+    ]
+
+    # A non-admin with the shared grant sees exactly the 2 they were
+    # granted — never the 3 truly-ungranted ones.
+    analyst_body = c.get("/library", headers=_auth(seeded_app["analyst_token"])).text
+    for col in shared_cols:
+        assert col["name"] in analyst_body
+    for col in private_cols:
+        assert col["name"] not in analyst_body
+    assert "Not shared with you" not in analyst_body
+
+    # An admin sees all 5 — the 2 reached through the shared group like any
+    # other grant (unlabeled), and the 3 reached only via admin authority
+    # (labeled).
+    admin_body = c.get("/library", headers=_auth(seeded_app["admin_token"])).text
+    for col in shared_cols + private_cols:
+        assert col["name"] in admin_body
+    # Twice per row (the `data-meta` attribute and the visible name-desc
+    # line share the same meta text) — 3 admin-only rows, never on the 2
+    # shared ones.
+    assert admin_body.count("Not shared with you") == 6
+    assert admin_body.count('data-ownership="admin_visible"') == 3
+
+
 def test_single_file_artefact_presents_as_file(seeded_app, monkeypatch):
-    """One file in an artefact reads AS the file — single-document glyph,
+    """One file in an artifact reads AS the file — single-document glyph,
     filename + size in the meta, "File" framing, never "a collection with 1
-    file" — but the title is the artefact's NAME (what the caller typed), not
+    file" — but the title is the artifact's NAME (what the caller typed), not
     the filename, so distinct names stay distinct (they previously all
     rendered as the same filename)."""
     monkeypatch.setenv("AGNES_UI_LAYOUT", "rail")
@@ -424,8 +506,8 @@ def test_single_file_artefact_presents_as_file(seeded_app, monkeypatch):
 
 
 def test_upload_box_follows_the_file_list_and_explains_promotion(seeded_app):
-    """The page leads with what is IN the artefact; adding to it comes after
-    (Files section above the Add-files drop zone). On a one-file artefact the
+    """The page leads with what is IN the artifact; adding to it comes after
+    (Files section above the Add-files drop zone). On a one-file artifact the
     drop zone also says what uploading does — it turns the file into a
     collection — so the change of shape never surprises. A real collection
     needs no such warning."""
@@ -443,7 +525,7 @@ def test_upload_box_follows_the_file_list_and_explains_promotion(seeded_app):
 
 
 def test_multi_file_artefact_presents_as_collection(seeded_app, monkeypatch):
-    """A second file promotes the artefact to a Collection: the list shows
+    """A second file promotes the artifact to a Collection: the list shows
     ``N files`` + a folder glyph (it's a container among loose files there), and
     the detail page reads as a collection again — under the two-sheet hero."""
     monkeypatch.setenv("AGNES_UI_LAYOUT", "rail")
@@ -462,8 +544,8 @@ def test_multi_file_artefact_presents_as_collection(seeded_app, monkeypatch):
 
 
 def test_single_file_artefacts_with_same_filename_keep_distinct_names(seeded_app, monkeypatch):
-    """Regression: two single-file artefacts holding the *same* filename but
-    given different names must render under their own names on the Artefacts
+    """Regression: two single-file artifacts holding the *same* filename but
+    given different names must render under their own names on the Artifacts
     list — the title is the name, not the filename, so they don't collapse
     into two identical rows."""
     monkeypatch.setenv("AGNES_UI_LAYOUT", "rail")
@@ -491,7 +573,7 @@ def test_single_file_artefacts_with_same_filename_keep_distinct_names(seeded_app
 #   Available grant  → "In stack", plain checkmark. Auto-membership
 #                      (StackResolver's browse() sets in_stack
 #                      unconditionally) — no "add" to offer, the grant did it.
-#   Own artefact     → "In stack" ⇄ "Add to stack", a real toggle. A personal
+#   Own artifact     → "In stack" ⇄ "Add to stack", a real toggle. A personal
 #                      upload has no admin grant tier, so the subscription row
 #                      IS the membership.
 
@@ -857,19 +939,19 @@ def test_library_plugin_stack_state_agrees_with_marketplace_items(seeded_app):
 
 
 def test_library_own_artefact_keeps_a_real_stack_toggle(seeded_app):
-    """The contrast case: an artefact's membership IS the caller's, so its
+    """The contrast case: an artifact's membership IS the caller's, so its
     pill stays an actionable button rather than a status."""
     c = seeded_app["client"]
-    col = _create(seeded_app, "Toggleable Artefact")
+    col = _create(seeded_app, "Toggleable Artifact")
 
-    row = _row_for(c.get("/library", headers=_auth(seeded_app["admin_token"])).text, "Toggleable Artefact")
+    row = _row_for(c.get("/library", headers=_auth(seeded_app["admin_token"])).text, "Toggleable Artifact")
     assert "data-add-to-stack" in row  # not yet added
     assert "lib-instack--locked" not in row
 
     r = c.post(f"/api/stack/artefacts/{col['id']}", headers=_auth(seeded_app["admin_token"]))
     assert r.status_code in (200, 201), r.text
 
-    row = _row_for(c.get("/library", headers=_auth(seeded_app["admin_token"])).text, "Toggleable Artefact")
+    row = _row_for(c.get("/library", headers=_auth(seeded_app["admin_token"])).text, "Toggleable Artifact")
     assert "data-remove-from-stack" in row  # …and removable once added
     assert "lib-instack--fixed" not in row
     assert "lib-instack--locked" not in row
@@ -1322,9 +1404,7 @@ def test_one_unreadable_count_does_not_erase_the_definitions_row(seeded_app, mon
     c = seeded_app["client"]
     r = c.get("/library", headers=_auth(seeded_app["admin_token"]))
     assert r.status_code == 200
-    assert "glossary term" in r.text, (
-        "a failed metric read must not take the glossary count down with it"
-    )
+    assert "glossary term" in r.text, "a failed metric read must not take the glossary count down with it"
     assert "3 glossary term" in r.text
 
 

@@ -19,6 +19,7 @@ transports.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from pathlib import Path
 from typing import Annotated, Any, Callable, Literal
@@ -162,6 +163,13 @@ FOUNDATION_TOOL_NAMES: tuple[str, ...] = (
     "schema",
     "describe",
     "query",
+    # Self-service policy diagnosis (issue #2147, backlog item 12: "MCP:
+    # read-only policy observability") — "why does this table look empty/
+    # masked to me". Triple-surface with GET /api/me/effective-access; no
+    # CLI verb (that endpoint is grandfathered REST-only, see
+    # tests/test_documentation_api_triple_surface.py) and no admin variant
+    # (see the tool's own docstring for why).
+    "effective_access",
     "skills",
     "chat_skills",
     "stack_browse",
@@ -283,6 +291,13 @@ FOUNDATION_TOOL_NAMES: tuple[str, ...] = (
     # DuckLake analytics-backend migration (wave-2G Task 6), triple-surface
     # with /api/admin/analytics/migrate + `agnes admin analytics migrate`.
     "admin_analytics_migrate",
+    # Knowledge-artifact packaging (K3, #798; TCRD-296 synthesis C.15),
+    # triple-surface with /api/admin/run-knowledge-packaging +
+    # `agnes admin knowledge packaging run` and
+    # /api/admin/knowledge-packaging/status + `agnes admin knowledge
+    # packaging status`.
+    "admin_knowledge_packaging_run",
+    "admin_knowledge_packaging_status",
     # Agent profiles (agent-api V1a, Task 12) — triple-surface with
     # /api/v1/agents + `agnes agent list` (management, session-token only)
     # and /api/v1/agents/{slug}/responses + `agnes agent ask` (runtime,
@@ -299,7 +314,7 @@ FOUNDATION_TOOL_NAMES: tuple[str, ...] = (
     "data_app_get",
     "data_app_deploy",
     "data_app_logs",
-    # "Add artefacts to My Stack" — triple-surface with
+    # "Add artifacts to My Stack" — triple-surface with
     # /api/stack/artefacts* + `agnes stack artefacts list/add/remove`. Adds
     # Stack MEMBERSHIP data only (see the module note on stack_subscribe) —
     # NOT a retrieval gate: knowledge_search/collections_search below still
@@ -378,6 +393,19 @@ _FACTS_NOT_FOUND_HINT = (
     "admin about the `facts` feature flag."
 )
 
+# Registry 404 (command-ux.md's "not found" convention) — mirrors `schema` /
+# `describe`'s hint at `agnes catalog` on the CLI side by pointing at this
+# transport's own `catalog` tool instead. Deliberately indistinguishable
+# between "no such table" and "not RBAC-visible to you" — `effective_access`
+# already only ever lists what the caller can see (§10.2), so there is
+# nothing narrower to report without turning a diagnostic tool into an
+# existence oracle for tables the caller cannot reach.
+_EFFECTIVE_ACCESS_NOT_FOUND_HINT = (
+    "No effective-access entry for table {table!r}. This means one of: the id "
+    "(or name) is wrong, or you cannot access this table at all. Use the "
+    "`catalog` tool to list tables you can see, then retry with its `id`."
+)
+
 
 def _facts_caller(headers_fn: Callable[[], dict[str, str]]) -> Any:
     """Resolve the MCP session's caller into the SAME user/Principal object
@@ -420,6 +448,31 @@ def _facts_caller(headers_fn: Callable[[], dict[str, str]]) -> Any:
     if caller is None:
         raise PermissionError(f"facts: could not authenticate this MCP session ({reason})")
     return caller
+
+
+#: The fact-graph query tools — every one of them 404s (``facts_disabled``)
+#: while the ``facts`` feature switch is off, so ``tools/list`` must not offer
+#: them then: each tool's own description tells the agent to reach for it
+#: FIRST on who/what questions, and an instance with the switch off saw the
+#: first tool call of a turn fail with ``404: facts_disabled`` (issue #2161).
+FACT_TOOL_NAMES: frozenset[str] = frozenset(
+    {"fact_search", "fact_type_map", "fact_facets", "fact_neighbors", "fact_claims", "fact_edges"}
+)
+
+
+def feature_hidden_tool_names() -> frozenset[str]:
+    """Foundation tools ``tools/list`` must hide on THIS instance right now.
+
+    Evaluated per listing, not at registration — the switches live in the
+    ``/admin/server-config`` overlay and can flip without a restart. Hidden
+    only, never unregistered: a call to a hidden tool still runs its own
+    gate (``require_facts_enabled``), so the two cannot disagree.
+    """
+    from app.instance_config import feature_enabled
+
+    if feature_enabled("facts", "enabled", env_var="AGNES_FACTS_ENABLED", default=False):
+        return frozenset()
+    return FACT_TOOL_NAMES
 
 
 def register_foundation_tools(
@@ -584,7 +637,7 @@ def register_foundation_tools(
         case you are in; read them before concluding anything about
         permissions.
 
-        NOTE (deferred follow-up, "Add artefacts to My Stack" spec): this
+        NOTE (deferred follow-up, "Add artifacts to My Stack" spec): this
         fans out over every RBAC-accessible collection — it does NOT gate by
         the caller's Stack membership (``user_stack_subscriptions``,
         ``stack_artefacts_candidates``/``stack_artefact_add``). Wiring that
@@ -599,6 +652,16 @@ def register_foundation_tools(
         in full with ``collection_file_read(collection_id=<corpus_id>,
         file_id=<file_id>)`` (a chunk hit carries both), or narrow the query /
         lower ``k``; ``truncated_note`` says exactly what was cut.
+
+        A large collection set (#2151) can ALSO set ``truncated: true`` for a
+        different reason: the server ranked over a bounded, query-matched
+        subset of the corpus rather than every accessible chunk. That case
+        carries its own ``truncated_cap`` (the chunk limit applied) alongside
+        ``truncated_note`` — narrow with ``collection_id`` or a more specific
+        query to reach what was excluded. A query too generic to narrow the
+        corpus by (e.g. only common words) is refused outright rather than
+        silently ranking an arbitrary slice; the tool call raises with the
+        server's ``search_query_too_broad`` detail in that case.
 
         Args:
             query: Natural-language or keyword query.
@@ -634,7 +697,7 @@ def register_foundation_tools(
         ``hybrid`` (lexical + semantic) or ``lexical_only`` — the degraded
         mode when the server has no embedding model installed.
 
-        NOTE (deferred follow-up, "Add artefacts to My Stack" spec): the
+        NOTE (deferred follow-up, "Add artifacts to My Stack" spec): the
         Collections leg of this fan-out is not gated by Stack membership
         either — see ``collections_search``'s note.
 
@@ -722,6 +785,17 @@ def register_foundation_tools(
         not admin-only. Use `semantic_model_search` first if you don't
         already know the slug.
 
+        The response also carries `content_hash` — sha256 of `document`,
+        the same value every other semantic-layer surface calls
+        `content_hash` — so a caller that must pin *which* revision it read
+        (a skill citing provenance, an agent comparing against a cached
+        copy) doesn't need to hash the document itself. Read from the
+        export endpoint's `ETag` response header (issue #2153); falls back
+        to hashing the response body when an older server sends no `ETag`
+        (export is byte-for-byte, so the two are always equal). `updated_at`
+        (ISO-8601) is included only when the server's `X-Semantic-Model-
+        Updated-At` header is present.
+
         Args:
             slug: Model slug, e.g. from a `semantic_model_search` result.
         """
@@ -732,7 +806,18 @@ def register_foundation_tools(
                 timeout=30,
             )
             _raise_for_status_with_detail(r)
-            return {"slug": slug, "document": r.text}
+            result: dict[str, Any] = {"slug": slug, "document": r.text}
+            etag = r.headers.get("etag")
+            if etag:
+                # Strip the RFC 7232 quoting, tolerating a weak validator
+                # (`W/"..."`) even though the export endpoint never emits one.
+                result["content_hash"] = etag.removeprefix("W/").strip('"')
+            else:
+                result["content_hash"] = hashlib.sha256(r.content).hexdigest()
+            updated_at = r.headers.get("x-semantic-model-updated-at")
+            if updated_at:
+                result["updated_at"] = updated_at
+            return result
 
     @tool(read_only=True)
     async def validate_semantic_query(
@@ -1473,6 +1558,92 @@ def register_foundation_tools(
             )
             _raise_for_status_with_detail(r)
             return ensure_query_output_size(r.json())
+
+    @tool(read_only=True, idempotent=True)
+    async def effective_access(table: str = "") -> dict:
+        """Diagnose YOUR OWN table-access-policy visibility — "why does this
+        table look empty, small, or masked to me". Read-only self-service;
+        no admin variant is exposed here (see below).
+
+        Call this BEFORE reporting an unexpectedly empty or suspiciously
+        small result from a table, and before stating any aggregate (count,
+        sum, average) computed from one — a filtered table can make a real
+        number look wrong, or a genuinely empty answer look like a bug.
+
+        Mirrors ``GET /api/me/effective-access``. Returns the full payload
+        (``is_admin``, ``items`` — legacy per-resource grants, mostly empty
+        for stack-based access — and ``tables``, one entry per table you can
+        actually read) when ``table`` is omitted.
+
+        Args:
+            table: Optional registered table id or name. When given, returns
+                ONLY that table's ``{"table_id": ..., "policy": {...}}``
+                entry instead of the full list.
+
+        Each table's ``policy`` block:
+        - ``applies``: true means an access policy is attached to this
+          table's REGISTRATION — independent of whether it currently
+          narrows what you see (an admin-bypass identity still reports
+          ``applies=true`` with the unfiltered count). false means no
+          policy exists at all; ``rows_visible``/``reason``/``note`` are
+          meaningless in that case.
+        - ``rows_visible``: the row count YOU would see through the policy
+          right now, or null when not computed (see ``reason``).
+        - ``reason`` — act on it:
+          - ``ok``: the policy resolved and the count above is trustworthy.
+          - ``empty_slice``: the policy resolved to ZERO rows for you. This
+            is the single most common cause of "the table looks empty" —
+            report it as a scoping fact, not as missing data.
+          - ``mapping_empty``: the policy depends on a mapping table that
+            has never synced or is currently empty, so nobody sees any rows
+            through it yet — a data-freshness problem, not your access.
+          - ``policy_error``: the policy SQL itself failed to resolve or
+            execute. Never silently falls back to the unfiltered table —
+            tell the caller the count is unavailable, not zero.
+          - ``identity_unresolvable``: no single identity to bind the policy
+            to (e.g. a shared/co-drive session) — a solo session would
+            resolve it.
+        - ``note``: extra human-readable context for the ``reason`` above
+          (e.g. the mapping table's name and last-sync time).
+
+        Never present a count or aggregate over a policied table's sample or
+        query result as an organisation-wide figure — qualify it as YOUR
+        visible slice whenever ``policy.applies`` is true.
+
+        No admin variant: ``GET /api/admin/users/{id}/effective-access``
+        (auditing SOMEONE ELSE's access) is deliberately not exposed as a
+        tool here — an agent has no legitimate reason to probe another
+        person's grant graph.
+        """
+        async with httpx.AsyncClient() as c:
+            r = await c.get(f"{base_url}/api/me/effective-access", headers=headers_fn(), timeout=30)
+            _raise_for_status_with_detail(r)
+            payload = r.json()
+
+        if not table:
+            return payload
+
+        tables = payload.get("tables") or []
+        for entry in tables:
+            if entry.get("table_id") == table:
+                return entry
+
+        # Not a direct id match — the caller may have passed a human name
+        # (`catalog`'s ``name`` field) instead of the registry ``id`` this
+        # endpoint keys tables by. Resolve it through the same RBAC-filtered
+        # catalog an agent would already have called, then retry by id.
+        async with httpx.AsyncClient() as c:
+            cr = await c.get(f"{base_url}/api/v2/catalog", headers=headers_fn(), timeout=30)
+        if cr.status_code < 400:
+            for row in cr.json().get("tables") or []:
+                if (row.get("name") or "").lower() == table.lower():
+                    resolved_id = row.get("id")
+                    for entry in tables:
+                        if entry.get("table_id") == resolved_id:
+                            return entry
+                    break
+
+        raise ValueError(_EFFECTIVE_ACCESS_NOT_FOUND_HINT.format(table=table))
 
     @tool(read_only=True)
     async def skills() -> dict:
@@ -3403,6 +3574,56 @@ def register_foundation_tools(
             params["q"] = q
         async with httpx.AsyncClient() as c:
             r = await c.get(f"{base_url}/api/admin/activity", headers=headers_fn(), params=params, timeout=30)
+            _raise_for_status_with_detail(r)
+            return r.json()
+
+    @tool(read_only=False)
+    async def admin_knowledge_packaging_run() -> dict:
+        """Enqueue a knowledge-packaging run (admin only) — rebuilds any
+        Collection's ``knowledge.duckdb`` artifact whose chunk content
+        changed since the last pass (K3, #798; TCRD-296 synthesis C.15).
+
+        Runs as a worker job, not synchronously — poll ``admin_job_get``
+        with the returned ``job_id`` for the result, or call
+        ``admin_knowledge_packaging_status`` for a summary of the last run.
+
+        Returns ``{"status": "queued", "job_id": ...}`` on a fresh enqueue.
+        Mirrors ``POST /api/admin/run-knowledge-packaging`` and
+        ``agnes admin knowledge packaging run``. Requires an admin PAT.
+        Raises on a 409 (a run is already in flight — the error body
+        carries the in-flight ``job_id``) or a 501 (this process/instance
+        has no worker role, so nothing would ever claim the job).
+        """
+        async with httpx.AsyncClient() as c:
+            r = await c.post(
+                f"{base_url}/api/admin/run-knowledge-packaging",
+                headers=headers_fn(),
+                timeout=30,
+            )
+            _raise_for_status_with_detail(r)
+            return r.json()
+
+    @tool(read_only=True)
+    async def admin_knowledge_packaging_status() -> dict:
+        """Observability summary for knowledge-artifact packaging (admin
+        only): the last run's outcome, whether one is running right now,
+        and a best-effort estimate of when the next scheduled run is due.
+
+        Returns ``{"last_run": {"job_id", "status", "created_at",
+        "finished_at", "result"} | null, "running": bool,
+        "next_due": iso-timestamp | null}`` where ``result`` (once the run
+        completes) carries ``built``/``skipped``/``pruned``/``errors``/
+        ``interrupted_reason``/``duration_s``/``collections_total``/
+        ``collections_processed``. Mirrors
+        ``GET /api/admin/knowledge-packaging/status`` and
+        ``agnes admin knowledge packaging status``. Requires an admin PAT.
+        """
+        async with httpx.AsyncClient() as c:
+            r = await c.get(
+                f"{base_url}/api/admin/knowledge-packaging/status",
+                headers=headers_fn(),
+                timeout=30,
+            )
             _raise_for_status_with_detail(r)
             return r.json()
 
