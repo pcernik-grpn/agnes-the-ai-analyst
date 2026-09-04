@@ -22,6 +22,23 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
 - **A `.docx` or `.pptx` uploaded to a collection is indexed on the default image.** The upload path only knew Docling — the `[docling]` extra no shipped image carries — so an office document was stored and then rejected with "needs the 'docling' extra", while the SharePoint crawl next to it converted the very same file type through markitdown from the `[extraction]` extra the default image already ships. The converter (`convert.py`, `pdf_structure.py`, `scan_ocr.py`) moved from `connectors/sharepoint/` to `src/ingest/` and is now the one office reader for both paths: Docling first when it is installed, markitdown otherwise, and a rejection that names both extras only when neither is present. A `.docx`/`.pptx`/`.xlsx` that is not a zip archive is refused as the file's problem instead of being sniffed and indexed as mojibake. PDFs uploaded to a collection still go through pypdf; folding them into the shared structure pass is a separate step.
 - **The rail's bottom rows no longer jump on every page load.** Clicking between rail pages made Library · Agents · Admin paint about 60px too high and drop into place a moment later. The onboarding card in the rail foot was rendered visible on every page and hidden by `chat_onboarding.js` only once `/api/chat/journey` resolved, so a caller who had finished onboarding got the card for one paint per page and every row above it moved with it; mid-way through, the empty "N of 6 steps complete" line filling in grew the row by 6px the same way. The server already knows the caller's journey and now renders the card in its resolved state — retired at 6/6, otherwise with the real title, count and arc — exactly as the admin setup chain beside it always was. The script keeps owning every later change (a step landing, "Start over onboarding"); on load it has nothing left to change. A failed read still renders the blank card for the script to resolve, never a card retired on a guess.
 
+- **Linked apps: "Read the app list" no longer calls a tool that writes.** The
+  lister was picked by one substring test — a name carrying both `data` and
+  `app`, first match wins — which on the Keboola MCP server selects
+  `create_python_js_data_app_git_credential` and never reaches the real
+  `get_data_apps`. Reading the list therefore put a mutating tool into
+  materialize mode and invoked it with no arguments. Candidates are now ranked,
+  and two things remove a tool from the running outright rather than ranking it
+  low: a write-shaped verb in front of its name, and a schema with required
+  arguments (the lister is called with none). Where several survive, the panel
+  names them and the choice is the admin's. `POST
+  /api/admin/mcp-sources/{id}/materialize` applies the same two rules to
+  `lister: true` and refuses with `400 not_a_lister_tool` before dialling the
+  upstream, so the guard does not depend on the client. `readOnlyHint`
+  deliberately does not gate any of this — it is a tri-state most servers leave
+  unset, and requiring it would make linked apps impossible on exactly the
+  servers the feature exists for. (#2154)
+
 ### Removed
 
 ### Internal
