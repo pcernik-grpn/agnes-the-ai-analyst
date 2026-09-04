@@ -188,7 +188,6 @@ def test_every_static_check_config_is_valid_yaml_with_instances():
 HARDENING = (
     "remote_configuration",
     "apm_config",
-    "logs_enabled: false",
     "use_dogstatsd: false",
     "process_collection",
     "container_collection",
@@ -207,16 +206,29 @@ HARDENING = (
 )
 
 
-def test_datadog_yaml_is_hardened_because_dd_agent_is_in_the_docker_group():
+def _datadog_yaml(*, enable_logs: bool) -> dict:
     rendered = _render(
         "datadog.yaml.tpl",
         site="datadoghq.com",
         env="example-project",
         tags=["customer:acme", "app:agnes", "role:prod"],
+        enable_logs=enable_logs,
     )
     for key in HARDENING:
         assert key in rendered, key
-    doc = yaml.safe_load(rendered.replace("@@DD_API_KEY@@", "x"))
+    return yaml.safe_load(rendered.replace("@@DD_API_KEY@@", "x"))
+
+
+@pytest.mark.parametrize("enable_logs", [False, True])
+def test_datadog_yaml_is_hardened_because_dd_agent_is_in_the_docker_group(enable_logs: bool):
+    """The docker-group compensating controls hold in BOTH states.
+
+    Log collection deliberately left this list (it is an egress decision, not
+    a privilege one — see the template's header), so it is asserted separately
+    below. Everything that could turn docker-group membership into an inbound
+    or remote-controlled capability must stay off either way.
+    """
+    doc = _datadog_yaml(enable_logs=enable_logs)
     assert doc["env"] == "example-project" and doc["site"] == "datadoghq.com"
     assert doc["tags"] == ["customer:acme", "app:agnes", "role:prod"]
     assert doc["remote_configuration"]["enabled"] is False, (
@@ -224,13 +236,62 @@ def test_datadog_yaml_is_hardened_because_dd_agent_is_in_the_docker_group():
         "Datadog org reach back into a host where dd-agent is docker-group"
     )
     assert doc["apm_config"]["enabled"] is False
-    assert doc["logs_enabled"] is False
     assert doc["container_env_as_tags"] == {}, "this stack passes secrets in the environment"
     assert doc["container_labels_as_tags"]["com.docker.compose.service"] == "compose_service"
     # docker_labels_as_tags is the deprecated spelling and is silently ignored;
     # the assertion is on the parsed config, not the text, because the template
     # names the deprecated key in a comment on purpose.
     assert "docker_labels_as_tags" not in doc
+
+
+def test_logs_off_renders_no_logs_configuration_at_all():
+    """An off render must leave no dangling keys — a `logs_config:` with no
+    `logs_enabled` would be a config the agent reads and silently ignores."""
+    doc = _datadog_yaml(enable_logs=False)
+    assert doc["logs_enabled"] is False
+    for key in ("logs_config", "listeners", "config_providers", "container_exclude_logs"):
+        assert key not in doc, f"{key} must not appear when logs are off"
+
+
+def test_logs_on_collects_every_container_through_the_docker_api():
+    doc = _datadog_yaml(enable_logs=True)
+    assert doc["logs_enabled"] is True
+    # logs_enabled alone only collects the agent's own files; the listener and
+    # the config provider are what turn running containers into log sources.
+    assert doc["listeners"] == [{"name": "docker"}]
+    assert doc["config_providers"] == [{"name": "docker", "polling": True}]
+    assert doc["logs_config"]["container_collect_all"] is True, (
+        "an allowlist drifts from the compose file — the exact failure docker-compose.gcp-logging.yml's header records"
+    )
+    assert doc["logs_config"]["docker_container_use_file"] is False, (
+        "dd-agent cannot open /var/lib/docker/containers (root-owned, 0700; "
+        "docker-group grants the socket, not the filesystem), and a default "
+        "ACL cannot inherit onto a 0700 directory because the mode's group "
+        "bits clamp the mask — so read through the Docker API deliberately "
+        "rather than failing the open once per container"
+    )
+
+
+def test_the_oneshot_exclusion_is_metrics_only_so_a_failed_migration_still_logs():
+    """`container_exclude` filters logs as well as metrics, and there is no
+    interaction between the global list and the scoped ones — a container
+    excluded globally cannot be brought back with container_include_logs."""
+    for enable_logs in (False, True):
+        doc = _datadog_yaml(enable_logs=enable_logs)
+        assert "container_exclude" not in doc, (
+            "the global list would silently drop the migrate/extract "
+            "containers' LOGS, which is what an operator reads when a "
+            "migration fails"
+        )
+        assert doc["container_exclude_metrics"], "the metric-side intent must survive the rename"
+    assert _datadog_yaml(enable_logs=True)["container_exclude_logs"] == []
+
+
+def test_main_tf_renders_the_logs_flag_from_the_resolved_destination():
+    assert "enable_logs = local.datadog_logs_active" in MAIN_TF, (
+        "datadog.yaml's logs switch must follow the resolved destination, not "
+        "var.enable_datadog — a VM can run the agent for metrics only"
+    )
 
 
 def test_datadog_yaml_carries_a_placeholder_not_a_key():
