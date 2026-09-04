@@ -30,13 +30,14 @@ _PER_TYPE_COLUMN: Dict[str, str] = {
 
 class ResourceGrantsPgRepository:
     # `source` rides every read so the Access page can say WHERE a grant came
-    # from, not just who wrote it. PG-only (migration 0095) — the DuckDB
-    # sibling has no such column and its rows simply carry no key.
+    # from, not just who wrote it. PG-only (migration
+    # 0096_resource_grants_source) — the DuckDB sibling has no such column
+    # and its rows simply carry no key.
     #
     # `scope` rides them for the same reason and one more: a caller that does
     # not read it cannot tell an everyone-grant from a grant on the carrier
     # group, and would answer "who can see this" with the carrier's member
-    # list. PG-only too (migration 0097).
+    # list. PG-only too (migration 0097_resource_grants_scope).
     _SELECT_COLS = (
         "id, group_id, resource_type, resource_id, assigned_at, assigned_by, "
         "requirement, source, scope"
@@ -260,8 +261,9 @@ class ResourceGrantsPgRepository:
         ``source`` names the SURFACE that wrote this grant
         (``src.grant_sources``) — ``assigned_by`` answers who, which is a
         different question when a fanout stamps every row with the admin who
-        clicked on another page. Postgres-only (migration 0095); the DuckDB
-        sibling accepts it and drops it, because that ladder is frozen (A3).
+        clicked on another page. Postgres-only (migration
+        0096_resource_grants_source); the DuckDB sibling accepts it and drops
+        it, because that ladder is frozen (A3).
         ``None`` is stored as NULL, which the API reports as no provenance.
 
         ``scope`` names WHO the grant reaches (``src.grant_scopes``): ``None``
@@ -349,8 +351,9 @@ class ResourceGrantsPgRepository:
         ``source`` names the SURFACE that wrote this grant
         (``src.grant_sources``) — ``assigned_by`` answers who, which is a
         different question when a fanout stamps every row with the admin who
-        clicked on another page. Postgres-only (migration 0095); the DuckDB
-        sibling accepts it and drops it, because that ladder is frozen (A3).
+        clicked on another page. Postgres-only (migration
+        0096_resource_grants_source); the DuckDB sibling accepts it and drops
+        it, because that ladder is frozen (A3).
         ``None`` is stored as NULL, which the API reports as no provenance.
 
         ``scope`` — see :meth:`create`. The ON CONFLICT target is
