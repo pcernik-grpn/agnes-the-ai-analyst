@@ -414,6 +414,15 @@ EXEMPT: frozenset[str] = frozenset(
         # real money on a BQ-backed table" -- so a bare count here is the
         # designed behavior, not a gap. ─────────────────────────────────
         "app/api/catalog.py::list_catalog_tables",
+        # Semantic-model builder conversation: grounding candidates for a
+        # dataset's `source`, same table-card shape as catalog's own list
+        # above (id, name, description[:160], source_type, query_mode, plus
+        # the table's own metric NAMES) -- never a row and never a column
+        # list. Column-level grounding is a separate, narrower read
+        # (`_column_candidates` -> `app/api/v2_schema.py::build_schema`,
+        # already COVERED below) triggered only for a table a draft already
+        # names.
+        "app/api/semantic_model_builder.py::_table_candidates",
         "app/api/sync.py::_build_manifest_for_user",
         "app/web/router.py::_chat_capability_snapshot",
         "app/web/router.py::library_page",

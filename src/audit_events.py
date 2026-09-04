@@ -597,6 +597,12 @@ CATALOG: dict[str, AuditEvent] = {
         "mutation",
         "An admin unlinked a semantic model from a Data Package.",
     ),
+    "semantic_model.builder_turn": AuditEvent(
+        "semantic_model.builder_turn",
+        "mutation",
+        "A caller exchanged one turn with the semantic-model builder assistant. Writes nothing itself — "
+        "the draft lives in the browser until Save (semantic_model.create / authoring_suggestion.submit).",
+    ),
     # The coverage-tag pair writes no row of its own; these two exist so the
     # fallback middleware emits a real domain action for it, since Wave 2 —
     # Task 1 retired the "fallback" posture literal this branch declared.

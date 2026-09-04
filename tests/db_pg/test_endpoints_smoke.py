@@ -2874,6 +2874,13 @@ KNOWN_UNTESTED = {
     "GET /semantic-layer",
     "GET /semantic-layer/{slug}",
     "GET /semantic-layer/{slug}/{object_id}",
+    # The authoring page reached from Definitions' "+ New model" card. Same
+    # reason as the three above: rendering + authority-gating covered by
+    # tests/test_web_semantic_model_builder.py, outside the scanned modules.
+    # It is declared separately because it is a DIFFERENT route registered
+    # BEFORE /semantic-layer/{slug} so the static segment is not swallowed —
+    # if that ordering is ever reversed this entry stops matching a real route.
+    "GET /semantic-layer/new",
     "GET /setup",
     "GET /setup-advanced",
     "GET /slack/bind",
@@ -3326,6 +3333,12 @@ KNOWN_UNTESTED = {
     # and the metric definitions (all symmetric pairs) to build its candidate
     # sets; writes nothing.
     "POST /api/admin/data-packages/builder/turn",
+    # One semantic-model builder turn. Behaviourally covered by
+    # tests/test_semantic_model_builder_turn.py. Stateless like the entity
+    # builder above — a model has no row until Save (POST /api/semantic-
+    # models/apply, already exercised elsewhere) — and its grounding reads
+    # (table_registry, RBAC, build_schema) are all symmetric pairs.
+    "POST /api/semantic-models/builder/turn",
     "GET /api/sharing/groups",
     "GET /api/sharing/{resource_type}/{resource_id}",
     "PUT /api/sharing/{resource_type}/{resource_id}",
