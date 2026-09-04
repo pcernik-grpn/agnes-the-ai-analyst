@@ -827,6 +827,21 @@ _KEBOOLA_LOGIN_PROJECTS_REASON = (
 )
 
 _EXEMPT: dict[str, str] = {
+    "/api/admin/grants/reconcile-everyone-scope": (
+        "the operator action that finishes migration 0098's deferred "
+        "scope='everyone' conversion. It HAS a CLI (`agnes admin grant "
+        "reconcile-everyone`) — the exemption is from the MCP surface "
+        "specifically, and deliberately. The conversion is guarded precisely "
+        "because it changes WHO CAN SEE WHAT: 0098 refuses it when a person "
+        "sits outside the Everyone group (they would gain everything it "
+        "holds) or a non-person sits inside it (it would lose grants it holds "
+        "today). Handing an agent a tool that flips grant scopes gives it a "
+        "lever on access control whose whole design is that a human decides, "
+        "after tidying the membership the guard named. The read half of the "
+        "question — who does an everyone-scoped grant reach — is already on "
+        "the agent surface through the ordinary grant/group tools; what is "
+        "withheld is the write"
+    ),
     "/api/admin/groups/reach": (
         "/admin/access's share picker asking how many distinct people the set "
         "of audiences it currently has ticked would reach — web UI only. Its "
