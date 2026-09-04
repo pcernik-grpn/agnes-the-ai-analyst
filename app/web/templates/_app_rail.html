@@ -714,14 +714,15 @@
        is also a user, those steps become true, and the row goes back to the
        analyst journey on its own.
 
-       The admin variant is fully SERVER-rendered — count, arc and steps — and
-       carries its own ids on purpose. The analyst row renders its count empty
-       and its arc at zero length because /api/chat/journey has not resolved
-       yet, and chat_onboarding.js fills them in; the chain needs no fetch, so
-       rendering it blank first would invent a flash that has no cause. The
-       distinct ids are what keep that script off it: every lookup there is
-       guarded (`if (count)`, `if (ringFill)`), so it finds nothing and leaves
-       this row alone rather than writing analyst numbers over admin ones. #}
+       Both variants are SERVER-rendered — count, arc, and for the chain its
+       steps — and the chain carries its own ids on purpose. The analyst row
+       used to render its count empty and its arc at zero length, waiting on
+       /api/chat/journey; rendering it blank first was itself a flash (see the
+       note on `journey_rail` at the card), so it now paints resolved too and
+       chat_onboarding.js only re-writes it on a change. The distinct ids are
+       what keep that script off the chain: every lookup there is guarded
+       (`if (count)`, `if (ringFill)`), so it finds nothing and leaves this
+       row alone rather than writing analyst numbers over admin ones. #}
     {% set _setup_chain = admin_setup_rail() if session.user.is_admin and dev_preview != 'member' else None %}
     {% if _setup_chain and not _setup_chain.complete %}
     {% set _pct = (_setup_chain.done / _setup_chain.total * 94.248) if _setup_chain.total else 0 %}
@@ -898,13 +899,38 @@
        standby treatment rather than to absence. #}
     {% set _chain_alternate = (_setup_chain and not _setup_chain.complete)
                               or (admin_setup and not admin_setup.complete) %}
-    <div class="rail-getstarted" id="railGetStarted"
+    {# The card paints in its RESOLVED state, like the chain above ──────────
+       `journey_rail` (app/web/router.py → app/services/journey.py) reads the
+       caller's checklist here, so the class, title, count and arc below are
+       right on the first paint. They used to be left for chat_onboarding.js
+       to write once /api/chat/journey resolved — on the reasoning that a
+       server-side guess would flash a wrong number — but the server does not
+       have to guess, and the blank it rendered instead was the flash: this
+       card sits in the foot, whose height positions every row above it, so a
+       caller who had finished onboarding watched Library · Agents · Admin
+       paint 62px too high and drop on EVERY page load while the script got
+       round to hiding the card (`.is-complete`), and a caller mid-way saw the
+       row grow 6px when the empty count line filled in.
+
+       The script still owns every later change — a step landing, "Start over
+       onboarding" — through the same `updateGetStartedIndicator`; on load it
+       now writes the values that are already there. None (a failed read)
+       renders the blank card for it to resolve, the honest direction.
+       tests/test_rail_onboarding_first_paint.py pins all of this, and that
+       the step list here and in the script are one list. #}
+    {% set _journey = journey_rail(session.user.id) %}
+    {% set _jpct = (_journey.done / _journey.total * 94.248) if _journey and _journey.total else 0 %}
+    <div class="rail-getstarted{% if _journey and _journey.complete %} is-complete{% endif %}" id="railGetStarted"
          {% if _chain_alternate %}data-chain-alternate{% endif %}
          data-brand-short="{{ instance_brand_short or 'Agnes' }}">
         <button type="button" class="rail-i rail-getstarted-btn"
                 id="rail-getstarted-toggle"
                 aria-expanded="false"
-                aria-controls="rail-getstarted-panel">
+                aria-controls="rail-getstarted-panel"
+                {# The same sentence updateGetStartedIndicator writes; absent
+                   when the journey could not be read, as everything else
+                   here is then. #}
+                {% if _journey %}aria-label="{% if _journey.done %}Continue setup{% else %}Set up {{ instance_brand_short or 'Agnes' }}{% endif %} — {{ _journey.done }} of {{ _journey.total }} steps complete"{% endif %}>
             {# A circular progress meter: grey track for the whole journey,
                one primary-coloured arc for the part that's done, and
                NOTHING inside it. An icon in the middle was tried and
@@ -913,12 +939,14 @@
                checklist icon" rather than "you are N of M done".
 
                The arc is the only moving part: `stroke-dasharray` is
-               written by chat_onboarding.js's `updateGetStartedIndicator`
-               once /api/chat/journey resolves. It renders at zero length
-               here rather than guessing a fraction server-side — the same
-               reason the sub-line's count text renders empty — so a user
-               at 4/5 never sees a wrong arc flash first; the track alone
-               is the honest pre-resolve state.
+               rendered here at the caller's real fraction (same 2πr the
+               script computes, r=15) and re-written by chat_onboarding.js's
+               `updateGetStartedIndicator` whenever the journey changes. It
+               used to render at zero length, so as not to guess — but the
+               server reads the journey now (see the card's note above), and
+               a zero arc for someone at 4/6 was itself the wrong frame.
+               Only a FAILED read leaves it at zero, the track alone being
+               the honest could-not-check state.
 
                aria-hidden because the button's accessible name is the
                row's own sentence, written to `aria-label`/`title` by that
@@ -929,15 +957,17 @@
                 <svg viewBox="0 0 36 36" class="rail-getstarted-ring-svg" id="rail-getstarted-ring-svg">
                     <circle class="rail-getstarted-ring-track" cx="18" cy="18" r="15"></circle>
                     <circle class="rail-getstarted-ring-fill" id="rail-getstarted-ring-fill"
-                            cx="18" cy="18" r="15"></circle>
+                            cx="18" cy="18" r="15"{% if _journey %} style="stroke-dasharray: {{ '%.2f'|format(_jpct) }} 94.248"{% endif %}></circle>
                 </svg>
             </span>
             <span class="rail-getstarted-body">
-                <span class="rail-getstarted-title" id="rail-getstarted-title">Set up {{ instance_brand_short or 'Agnes' }}</span>
-                {# Rendered EMPTY and written whole ("3 of 5 steps complete") by
-                   chat_onboarding.js once /api/chat/journey resolves — a static
-                   "0 of 5" would flash the wrong number at anyone mid-way. #}
-                <span class="rail-getstarted-sub" id="rail-getstarted-count"></span>
+                <span class="rail-getstarted-title" id="rail-getstarted-title">{% if _journey and _journey.done %}Continue setup{% else %}Set up {{ instance_brand_short or 'Agnes' }}{% endif %}</span>
+                {# The caller's real count ("3 of 6 steps complete"), the
+                   sentence chat_onboarding.js writes — rendered here so the
+                   line is there on the first paint rather than appearing a
+                   beat later and growing the row (`.rail-getstarted-sub:empty`
+                   is `display: none`). Empty only when the read failed. #}
+                <span class="rail-getstarted-sub" id="rail-getstarted-count">{% if _journey %}{{ _journey.done }} of {{ _journey.total }} steps complete{% endif %}</span>
             </span>
         </button>
         <div class="rail-getstarted-panel" id="rail-getstarted-panel"
