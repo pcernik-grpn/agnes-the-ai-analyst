@@ -330,15 +330,38 @@ spot-check shows pseudonyms, not names.
   credentials are left untouched; remove a merged-away sibling later with
   the ordinary `DELETE /api/admin/source-connections/{id}` if it is no
   longer needed. Dry-run by default. PG-only (A3 ratchet).
-- `extraction.crawl.min_modified` — a per-connection age filter for a
-  backfill run: crawl only files modified on/after a cutoff date instead of
-  re-walking a whole multi-year corpus. `PATCH …/extraction/crawl-config`
-  (`agnes admin sharepoint crawl-config <connection_id> --min-modified
-  YYYY-MM-DD` / `--clear`) sets or clears it; an item with no modified
-  timestamp is always kept. On the source card, the same control ("Crawl
-  schedule & filter", next to "Facts policy") sets it directly — widening
-  the date later needs a "Re-enumerate from scratch" run afterwards, since
-  the delta cursor has already moved past whatever the old cutoff skipped.
+- **"Modified since" age filter — a SCOPE's own setting (TCRD-296 gap
+  #80), with a connection-wide default.** A backfill run only needs files
+  modified on/after a cutoff date instead of re-walking a whole
+  multi-year corpus, and different scopes on the same connection
+  routinely need different cutoffs (a fresh site vs. a decade-old
+  archive) — so `min_modified` lives on the scope itself, not only on the
+  connection:
+  - **Set it where the scope is defined**: the connect wizard's Share
+    step (a date input per scope row, pre-filled from the scope's own
+    current value), `POST …/scopes` (`ConfirmScopeBody.min_modified`) for
+    one scope, or `POST …/scopes/bulk`
+    (`agnes admin sharepoint scope bulk-add <connection_id> --path <p>
+    --min-modified YYYY-MM-DD`) as a bulk default for every scope that
+    call creates. `agnes admin sharepoint scope list <connection_id>`
+    shows each scope's EFFECTIVE filter — its own override, or
+    `(default)` when it is inheriting the connection's.
+  - **A scope with no override of its own inherits the connection-wide
+    default** — `extraction.crawl.min_modified`, set (or cleared) via
+    `PATCH …/extraction/crawl-config` (`agnes admin sharepoint
+    crawl-config <connection_id> --min-modified YYYY-MM-DD` / `--clear`)
+    or the "Crawl filter (default)" control on the source card, next to
+    "Facts policy". This is exactly what every scope did before the
+    per-scope field existed — an instance that never sets a per-scope
+    override sees no behavior change at all.
+  - An item with no modified timestamp is always kept (never silently
+    dropped), regardless of which level the effective cutoff came from.
+  - **Widening a scope's filter (its own, or the connection default it
+    inherits) after that scope has already been crawled needs a
+    "Re-enumerate from scratch" run afterwards** — the delta cursor has
+    already moved past whatever the old, narrower cutoff skipped, and a
+    plain re-crawl only walks changes since the last cursor, not the
+    files the old filter excluded.
 - Webhooks for near-real-time updates: mint the secret
   (`POST …/webhook`), then `POST …/subscriptions/ensure` — Agnes owns the
   Graph subscription lifecycle including renewals
@@ -888,6 +911,15 @@ queue are all backend-agnostic — unlike run history above, this does NOT
 need Postgres). See `connectors/sharepoint/completeness.py`'s module
 docstring for the exact attribution rules behind each reason count on a
 multi-scope connection.
+
+**Known gap:** `expected`'s `min_modified` narrowing uses the connection's
+own resolved cutoff (or the `--min-modified`/`?min_modified=` override)
+uniformly across every scope's row — it does not yet read a scope's OWN
+filter (TCRD-296 gap #80) the way an actual triggered crawl does. A scope
+with its own, DIFFERENT cutoff can show an `expected` count that does not
+match what that scope's next crawl will actually attempt; the crawl itself
+still applies the correct, scope-resolved filter regardless of what this
+report estimated.
 
 ## Watching several connections at once
 

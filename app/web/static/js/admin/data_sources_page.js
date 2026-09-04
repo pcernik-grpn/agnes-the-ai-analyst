@@ -478,9 +478,13 @@ function _extToggleVertexRegionInput(id) {
 function _extRenderCrawlFilter(row) {
   const crawl = ((row.config || {}).extraction || {}).crawl || {};
   const value = typeof crawl.min_modified === "string" ? crawl.min_modified : "";
+  // TCRD-296 gap #80: this is now the DEFAULT — a scope's OWN filter (set
+  // in the connect wizard, `agnes admin sharepoint scope bulk-add
+  // --min-modified`, or shown per-row in the "Scope collections" drawer,
+  // `_spScopeRowHtml` below) wins over this one when it has one.
   const statusText = value
-    ? `Currently: files modified on/after ${value} (connection).`
-    : "Currently: no filter — every file is crawled.";
+    ? `Currently: files modified on/after ${value} (default — applies to scopes without their own filter).`
+    : "Currently: no default filter — a scope without its own filter is crawled unfiltered.";
   const label = _esc(row.name || row.id || "");
 
   // D.16 — this connection's own scheduled-sweep cadence: "off" | "instance"
@@ -521,7 +525,7 @@ function _extRenderCrawlFilter(row) {
     <span class="ds-src__fact-a"><button type="button" class="btn btn-secondary" onclick="crawlScheduleSave('${row.id}')">Save schedule</button></span>
   </div>
   <div class="ds-src__fact">
-    <span class="ds-src__fact-k" title="Crawl only files modified on or after a date instead of the whole corpus — useful for a backfill. Sets extraction.crawl.min_modified for this connection; clearing it removes the filter, there is no instance-level default to fall back to.">Crawl filter</span>
+    <span class="ds-src__fact-k" title="The DEFAULT crawl filter for scopes that don't set their own — applies only to files modified on or after a date instead of the whole corpus, useful for a backfill. Sets extraction.crawl.min_modified for this connection; clearing it removes the default, there is no instance-level fallback beyond it. Set a scope's own filter in the connect wizard's Share step, or per-row below.">Crawl filter (default)</span>
     <span class="ds-src__fact-v">
       <input type="date" class="ds-dropdown-native" id="ds-sp-crawlfilter-date-${row.id}"
              value="${_esc(value)}" aria-label="Crawl only files modified on/after this date for ${label}">
@@ -1020,12 +1024,33 @@ function toggleFileSourceDrawer(connId, category) {
 
 /* One scope row, in the SAME shape the wizard's step-3 "Share" preview
    renders (server shape: `admin_sharepoint._scope_out`) — clicking it opens
-   that wizard bound to this connection with the row highlighted. */
+   that wizard bound to this connection with the row highlighted.
+
+   `_spScopeMinModifiedBadge` (TCRD-296 gap #80) reads `s.min_modified`
+   (`{value, source, own_value}` — `_scope_out`'s own projection): a badge
+   ONLY when there is an effective filter at all (`value` truthy) — "since
+   DATE" when it's this scope's OWN override (`source: "scope"`, bold-ish
+   via a distinct badge class so it reads differently from an inherited
+   one), "since DATE (default)" when it's inheriting the connection-wide
+   one. No badge at all when neither is set — the common case, unfiltered. */
+function _spScopeMinModifiedBadge(s) {
+  const mm = s.min_modified || {};
+  if (!mm.value) return "";
+  const title =
+    mm.source === "scope"
+      ? "This scope's own crawl filter — set in the connect wizard or `scope bulk-add --min-modified`."
+      : "Inherited from the connection's default crawl filter (“Crawl filter (default)” on the source card).";
+  const cls = mm.source === "scope" ? "badge-env" : "badge-unset";
+  const label = mm.source === "scope" ? `since ${_esc(mm.value)}` : `since ${_esc(mm.value)} (default)`;
+  return `<span class="ds-badge ${cls}" title="${title}">${label}</span>`;
+}
+
 function _spScopeRowHtml(connId, s) {
   return `<li>
     <button type="button" class="ds-sp-scope-row" onclick="openSpWizardForConnection('${connId}', { highlightScopeId: '${_esc(s.source_scope_id)}' })">
       <span class="ds-sp-scope-row__path">${_esc(s.display_path || s.source_scope_id || "")}</span>
       ${s.collection ? `<span class="ds-badge badge-env">${_esc(s.collection.name)}</span>` : `<span class="ds-badge badge-unset">no collection yet</span>`}
+      ${_spScopeMinModifiedBadge(s)}
       ${s.no_group_warning ? `<span class="ds-badge badge-warn">no group</span>` : ""}
     </button>
   </li>`;
@@ -2166,8 +2191,8 @@ async function _crawlConfigPatch(id, { minModified, schedule } = {}) {
       const sched = respBody.schedule || {};
       if (filterStatusEl) {
         filterStatusEl.textContent = mm.value
-          ? `Currently: files modified on/after ${mm.value} (${mm.source}).`
-          : "Currently: no filter — every file is crawled.";
+          ? `Currently: files modified on/after ${mm.value} (default — applies to scopes without their own filter).`
+          : "Currently: no default filter — a scope without its own filter is crawled unfiltered.";
       }
       if (scheduleStatusEl) {
         scheduleStatusEl.textContent = sched.value && sched.value !== "instance"

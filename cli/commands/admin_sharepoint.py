@@ -20,16 +20,21 @@ Thirteen surfaces:
     claims in the fact graph is reset so the next pass re-extracts it. CLI
     counterpart to ``POST /api/admin/sharepoint/connections/{connection_id}
     /facts/reset-no-claims``.
-  - ``scope bulk-add`` / ``connection clone`` — the CLI counterparts to
-    ``POST /api/admin/sharepoint/connections/{connection_id}/scopes/bulk``
-    and ``POST /api/admin/sharepoint/connections/{connection_id}/clone`` —
+  - ``scope bulk-add`` / ``scope list`` / ``connection clone`` — the CLI
+    counterparts to
+    ``POST /api/admin/sharepoint/connections/{connection_id}/scopes/bulk``,
+    ``GET /api/admin/sharepoint/connections/{connection_id}/scopes``, and
+    ``POST /api/admin/sharepoint/connections/{connection_id}/clone`` —
     the fast path for splitting one large SharePoint site across several
     connections, each with its own crawl and facts jobs, so they run in
     parallel: clone the source connection (same credential material, zero
     scopes), then bulk-add the split's folder paths onto each clone.
     ``scope bulk-add`` also takes ``--collection-id``/``--collection-name``
     to route every path it confirms to ONE shared collection instead of
-    minting one per path.
+    minting one per path, and ``--min-modified`` (TCRD-296 gap #80) to give
+    every scope it creates its OWN "modified since" crawl filter. ``scope
+    list`` shows each confirmed scope's effective filter — its own override,
+    or the connection default it inherits.
   - ``collections consolidate`` — the after-the-fact fix when a site
     ALREADY ended up split across many per-scope collections: fold them
     into one target (dry-run preview by default, ``--execute`` for the
@@ -466,6 +471,15 @@ def scope_bulk_add(
             "it — mutually exclusive with --collection-id."
         ),
     ),
+    min_modified: Optional[str] = typer.Option(
+        None,
+        "--min-modified",
+        help=(
+            "Only crawl documents modified on/after this date (YYYY-MM-DD), stored as every scope "
+            "THIS call creates' OWN filter — a bulk default (TCRD-296 gap #80). Omit to have each "
+            "new scope inherit the connection-wide `crawl-config` default."
+        ),
+    ),
     as_json: bool = typer.Option(False, "--json"),
 ):
     """Confirm many folder paths as scopes in one call — the fast path for
@@ -490,6 +504,13 @@ def scope_bulk_add(
     if collection_id and collection_name:
         typer.echo("Error: --collection-id and --collection-name are mutually exclusive", err=True)
         raise typer.Exit(1)
+
+    if min_modified is not None:
+        try:
+            date.fromisoformat(min_modified)
+        except ValueError:
+            typer.echo(f"Error: --min-modified must be an ISO YYYY-MM-DD date, got {min_modified!r}", err=True)
+            raise typer.Exit(1) from None
 
     paths: List[str] = list(path)
     if paths_file is not None:
@@ -516,6 +537,8 @@ def scope_bulk_add(
         body["collection_id"] = collection_id
     if collection_name:
         body["collection"] = {"name": collection_name}
+    if min_modified:
+        body["min_modified"] = min_modified
 
     resp = api_post(f"/api/admin/sharepoint/connections/{connection_id}/scopes/bulk", json=body)
     if resp.status_code != 200:
@@ -529,6 +552,51 @@ def scope_bulk_add(
         typer.echo(f"  failed: {entry['path']} ({entry['reason']})")
     for entry in result["skipped"]:
         typer.echo(f"  skipped: {entry['path']} (already present as {entry['source_scope_id']})")
+
+
+@scope_app.command("list")
+def scope_list(
+    connection_id: str = typer.Argument(..., help="SharePoint source_connections id"),
+    as_json: bool = typer.Option(False, "--json"),
+):
+    """Every confirmed scope on this connection — path, collection, and its
+    "modified since" crawl filter (TCRD-296 gap #80): the scope's OWN
+    override when it has one, else the connection-wide default it inherits
+    (``(default)``), else ``-`` for no filter at all. CLI counterpart to
+    ``GET /api/admin/sharepoint/connections/{connection_id}/scopes``.
+    """
+    resp = api_get(f"/api/admin/sharepoint/connections/{connection_id}/scopes")
+    if resp.status_code != 200:
+        _fail(resp)
+    result = resp.json()
+    if as_json:
+        typer.echo(json.dumps(result, indent=2))
+        return
+
+    items = result.get("items") or []
+    table = Table(title=f"SharePoint scopes ({len(items)})")
+    table.add_column("source_scope_id")
+    table.add_column("display_path")
+    table.add_column("collection")
+    table.add_column("min_modified")
+    for item in items:
+        mm = item.get("min_modified") or {}
+        value = mm.get("value")
+        source = mm.get("source")
+        if not value:
+            mm_cell = "-"
+        elif source == "scope":
+            mm_cell = f"since {value}"
+        else:
+            mm_cell = f"since {value} (default)"
+        collection = item.get("collection") or {}
+        table.add_row(
+            str(item.get("source_scope_id")),
+            str(item.get("display_path")),
+            str(collection.get("name") or "-"),
+            mm_cell,
+        )
+    _console.print(table)
 
 
 @connection_app.command("clone")
@@ -1747,9 +1815,10 @@ def crawl_config(
     min_modified: Optional[str] = typer.Option(
         None,
         "--min-modified",
-        help="Crawl only files modified on/after this UTC date (YYYY-MM-DD) — e.g. a backfill that only "
-        "needs everything changed since a given cutoff. Items modified before it are skipped and counted; "
-        "an item with no modified timestamp is always kept.",
+        help="The connection-wide DEFAULT: crawl only files modified on/after this UTC date "
+        "(YYYY-MM-DD) — applies to every scope that does not set its OWN filter via "
+        "`agnes admin sharepoint scope bulk-add --min-modified` (TCRD-296 gap #80). Items modified "
+        "before it are skipped and counted; an item with no modified timestamp is always kept.",
     ),
     clear: bool = typer.Option(False, "--clear", help="Remove the override — the connection crawls unfiltered."),
     schedule: Optional[str] = typer.Option(
@@ -1765,7 +1834,9 @@ def crawl_config(
     as_json: bool = typer.Option(False, "--json"),
 ):
     """Set (or clear) this connection's own ``extraction.crawl.min_modified``
-    age filter and/or its own ``extraction.crawl.schedule`` cadence (D.16).
+    age filter — the DEFAULT for any scope that does not set its own
+    (TCRD-296 gap #80; see ``agnes admin sharepoint scope list``) — and/or
+    its own ``extraction.crawl.schedule`` cadence (D.16).
 
     Exactly one of ``--min-modified`` / ``--clear`` is required UNLESS
     ``--schedule`` is given on its own. ``--schedule`` keeps its OWN value

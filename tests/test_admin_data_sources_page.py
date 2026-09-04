@@ -2344,7 +2344,12 @@ const row = {{ id: "sp-conn-1", source_type: "sharepoint" }};
 
         tpl = read_admin_data_sources_source()
         fns = "\n".join(
-            self._extract_function(tpl, sig) for sig in ("function _esc(s) {", "function _spScopeRowHtml(connId, s) {")
+            self._extract_function(tpl, sig)
+            for sig in (
+                "function _esc(s) {",
+                "function _spScopeMinModifiedBadge(s) {",
+                "function _spScopeRowHtml(connId, s) {",
+            )
         )
         script = f"""
 {fns}
@@ -3037,7 +3042,7 @@ class TestOpenSpWizardPreselectsSingleExistingConnection:
 {fns}
 
 const SP_CONN_API = "/api/admin/source-connections";
-let spConnId, spCertChoice, spLevel, spCrumbs, spItems, spScopes, spGroups, spPendingGroups, spTreeFilterQuery, spLastSearchMatches, spUniquePerms, spManualSites, spBoundToExisting, spConnListPromise;
+let spConnId, spCertChoice, spLevel, spCrumbs, spItems, spScopes, spGroups, spPendingGroups, spPendingMinModified, spTreeFilterQuery, spLastSearchMatches, spUniquePerms, spManualSites, spBoundToExisting, spConnListPromise;
 function spSetCertChoice(c) {{}}
 function spGoStep(n) {{}}
 function _syncDropdownRebuild(sel) {{}}
@@ -3120,6 +3125,7 @@ class TestSharePointWizardShareBadgeRendering:
 const _host = {{ innerHTML: "", querySelectorAll: () => [] }};
 const document = {{ getElementById: (id) => (id === "spw-share-rows" ? _host : null) }};
 let spPendingGroups = {{}};
+let spPendingMinModified = {{}};
 let spGroups = [];
 // `spRenderShare` reads `spUniquePerms[source_scope_id]` for its advisory
 // summary line — an empty map here means "nothing flagged", which is

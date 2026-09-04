@@ -1105,6 +1105,12 @@
   .sp-share-row__badges { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
   .sp-share-row__groups { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
   .sp-share-row__groups label { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--ds-text-secondary); }
+  /* TCRD-296 gap #80 — this scope's own "modified since" crawl filter,
+     step-3 Share & finish. Same `field-hint` class the connection-level
+     "Crawl filter (default)" panel on the source card uses for its own
+     status/caveat lines, so the two controls read as one family. */
+  .sp-share-row__minmod { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 8px; }
+  .sp-share-row__minmod label { font-size: 12px; color: var(--ds-text-secondary); }
   .sp-warn {
     display: inline-flex; align-items: center; gap: 5px; font-size: 11px; font-weight: 600;
     padding: 2px 8px; border-radius: var(--ds-radius-pill);
