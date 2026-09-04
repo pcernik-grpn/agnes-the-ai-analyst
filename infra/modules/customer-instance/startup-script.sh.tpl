@@ -1032,6 +1032,23 @@ ${env_name}_QUOTED=$(printf '%s' "$${${env_name}}" | sed -e 's/[\\"$`]/\\&/g' ||
 ${env_name}=$(gcloud secrets versions access latest --secret=${secret_name} 2>/dev/null | base64 -w0 || echo "")
 %{ endfor ~}
 
+# Opt-in OTLP export (per-VM otlp_* fields): the headers value is the
+# collector's credential, fetched here exactly like a runtime_secret_env
+# value and written double-quoted with the same escape set. Missing/403 →
+# empty string: the exporter then sends no auth header and the collector's
+# refusal shows up in the app log, never in a broken boot.
+# --- otlp-headers begin (rendered + executed by tests/test_infra_otlp_export.py) ---
+%{ if otlp_headers_secret != "" ~}
+OTLP_HEADERS=$(gcloud secrets versions access latest --secret=${otlp_headers_secret} 2>/dev/null || echo "")
+case "$OTLP_HEADERS" in *$'\n'*)
+    echo "WARNING: secret '${otlp_headers_secret}' has a multiline value; refusing to write OTEL_EXPORTER_OTLP_HEADERS into .env" >&2
+    OTLP_HEADERS=""
+    ;;
+esac
+OTLP_HEADERS_QUOTED=$(printf '%s' "$OTLP_HEADERS" | sed -e 's/[\\"$`]/\\&/g' || true)
+%{ endif ~}
+# --- otlp-headers end ---
+
 # AGNES_VERSION, RELEASE_CHANNEL, AGNES_COMMIT_SHA are baked into the image
 # itself as ENV (see Dockerfile ARG/ENV + release.yml build-args). We do NOT
 # set them here — doing so would override the image-level values with the
@@ -1768,6 +1785,14 @@ SEED_ADMIN_PASSWORD=$SEED_ADMIN_PASSWORD
 SCHEDULER_API_TOKEN=$SCHEDULER_API_TOKEN
 AGNES_VAULT_KEY=$AGNES_VAULT_KEY
 LOG_LEVEL=info
+AGNES_DEPLOYMENT_ENV=${deployment_env}
+%{ if otlp_endpoint != "" ~}
+OTEL_EXPORTER_OTLP_ENDPOINT=${otlp_endpoint}
+%{ if otlp_headers_secret != "" ~}
+OTEL_EXPORTER_OTLP_HEADERS="$OTLP_HEADERS_QUOTED"
+%{ endif ~}
+AGNES_OTEL_CAPTURE_CONTENT=${otlp_capture_content}
+%{ endif ~}
 DOMAIN=$DOMAIN
 AGNES_TAG=$EFFECTIVE_AGNES_TAG
 AGNES_IMAGE_REPO=$IMAGE_REPO
