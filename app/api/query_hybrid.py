@@ -1,4 +1,17 @@
-"""Hybrid query endpoint — two-phase BQ registration + DuckDB execution."""
+"""Hybrid query endpoint — two-phase BQ registration + DuckDB execution.
+
+This endpoint executes the caller's raw SQL directly against the analytics
+connection — no registered-table-name resolution, so no per-table grant
+check and no access-policy rewrite ever runs on it (unlike ``POST
+/api/query``). Its entire SQL surface is therefore a "direct path" in the
+sense ``app/api/query.py``'s ``_bq_guardrail_inputs`` et al. use that term,
+so the guardrail here is the ``require_admin_all_surface`` gate below: only
+an admin credential with the full (``'all'``) data-read surface may reach
+the handler at all (finding K2, RLS review #1979) —
+``docs/table-access-policies.md``'s "The admin bypass" is the same rule
+applied to this endpoint's whole body instead of to one direct-path
+reference inside a larger, otherwise-policied query.
+"""
 
 import logging
 import time
@@ -7,7 +20,7 @@ from typing import Dict
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from app.auth.access import require_admin
+from app.auth.access import require_admin_all_surface
 from app.auth.dependencies import _get_db
 from connectors.bigquery.labels import job_labels_for
 from src.audit_helpers import client_kind_from_user
@@ -30,7 +43,7 @@ class HybridQueryRequest(BaseModel):
 @router.post("/hybrid")
 async def hybrid_query(
     request: HybridQueryRequest,
-    user: dict = Depends(require_admin),
+    user: dict = Depends(require_admin_all_surface),
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
 ):
     t0 = time.monotonic()

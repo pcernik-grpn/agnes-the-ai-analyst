@@ -40,7 +40,9 @@ def test_register_keboola_materialized_accepts_json_filter_spec(seeded_app):
             "name": "orders_recent",
             "source_type": "keboola",
             "query_mode": "materialized",
-            "source_query": '{"columns": ["order_id", "date"], "changedSince": "-7 days"}',
+            # snake_case keys — `changedSince` (the Storage API wire name)
+            # is NOT a spec key and is refused since #1979.
+            "source_query": '{"columns": ["order_id", "date"], "changed_since": "-7 days"}',
             "sync_schedule": "daily 03:00",
         },
     )
@@ -172,3 +174,100 @@ def test_update_keboola_to_materialized_without_source_query_allowed(seeded_app)
         json={"description": "updated description"},
     )
     assert r.status_code == 200, r.text
+
+
+# ── a filter spec with an unknown key is refused, not ignored (#1979) ──────
+#
+# `ExportFilter.from_dict` used to drop keys it did not recognise, so a
+# misspelled row filter (`where_filter`, `whereFilters`, …) parsed into an
+# empty filter — the admin saw a saved filter and every sync distributed the
+# FULL table. Registration and update now refuse the spec outright.
+
+
+def _register_keboola_materialized(client, auth, name, source_query=None):
+    payload = {
+        "name": name,
+        "source_type": "keboola",
+        "query_mode": "materialized",
+        "bucket": "in.c-sales",
+        "source_table": "orders",
+    }
+    if source_query is not None:
+        payload["source_query"] = source_query
+    return client.post("/api/admin/register-table", headers=auth, json=payload)
+
+
+def test_register_keboola_materialized_rejects_unknown_filter_key(seeded_app):
+    c = seeded_app["client"]
+    auth = {"Authorization": f"Bearer {seeded_app['admin_token']}"}
+    r = _register_keboola_materialized(
+        c,
+        auth,
+        "orders_typo",
+        '{"where_filter": [{"column": "status", "operator": "eq", "values": ["open"]}]}',
+    )
+    assert r.status_code == 422, r.text
+    detail = str(r.json()["detail"])
+    assert "unknown key" in detail
+    assert "where_filter" in detail
+    assert "full table" in detail
+
+
+def test_register_keboola_materialized_rejects_camel_case_where_filters(seeded_app):
+    c = seeded_app["client"]
+    auth = {"Authorization": f"Bearer {seeded_app['admin_token']}"}
+    r = _register_keboola_materialized(
+        c,
+        auth,
+        "orders_camel",
+        '{"whereFilters": [{"column": "status", "operator": "eq", "values": ["open"]}]}',
+    )
+    assert r.status_code == 422, r.text
+    assert "unknown key" in str(r.json()["detail"])
+
+
+def test_update_keboola_materialized_rejects_unknown_filter_key(seeded_app):
+    """The PUT path builds its own RegisterTableRequest over the merged row,
+    so the same guard must fire there — an admin editing an existing row is
+    exactly who reaches the advanced JSON editor."""
+    c = seeded_app["client"]
+    auth = {"Authorization": f"Bearer {seeded_app['admin_token']}"}
+    assert _register_keboola_materialized(c, auth, "orders_edit").status_code == 201
+
+    r = c.put(
+        "/api/admin/registry/orders_edit",
+        headers=auth,
+        json={
+            "query_mode": "materialized",
+            "source_query": '{"where_filters": [{"colum": "status", "operator": "eq", "values": ["open"]}]}',
+        },
+    )
+    assert r.status_code == 422, r.text
+    assert "colum" in str(r.json()["detail"])
+
+    r = c.put(
+        "/api/admin/registry/orders_edit",
+        headers=auth,
+        json={"query_mode": "materialized", "source_query": '{"whereFilters": []}'},
+    )
+    assert r.status_code == 422, r.text
+    assert "unknown key" in str(r.json()["detail"])
+
+    # …and the row is untouched: a refused edit must not have persisted.
+    rows = c.get("/api/admin/registry", headers=auth).json()["tables"]
+    row = next(t for t in rows if t["id"] == "orders_edit")
+    assert row.get("source_query") in (None, "")
+
+
+def test_a_well_formed_filter_spec_is_still_accepted_on_both_paths(seeded_app):
+    c = seeded_app["client"]
+    auth = {"Authorization": f"Bearer {seeded_app['admin_token']}"}
+    good = '{"where_filters": [{"column": "status", "operator": "eq", "values": ["open"]}], "columns": ["id"]}'
+    assert _register_keboola_materialized(c, auth, "orders_ok", good).status_code == 201
+
+    r = c.put(
+        "/api/admin/registry/orders_ok",
+        headers=auth,
+        json={"query_mode": "materialized", "source_query": '{"fileType": "parquet"}'},
+    )
+    assert r.status_code == 200, r.text  # the fileType alias stays accepted

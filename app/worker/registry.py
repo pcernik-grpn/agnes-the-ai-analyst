@@ -54,12 +54,78 @@ class JobKind:
     lane: str
     lease_seconds: int = 120
     retry_in_seconds: int | None = 300
+    #: Per-kind opt-in retry delay for a TRANSIENT infrastructure fault
+    #: RECLASSIFIED out of a raised handler exception (TCRD-296 C.11 — see
+    #: ``app/worker/runtime.py::_run_one``'s exception branch and
+    #: ``src/db_transient.py::is_transient_db_error``). Independent of
+    #: ``retry_in_seconds`` above: a kind that sets THAT to ``None`` (any
+    #: raised exception always finalizes on the first attempt — "an
+    #: operator must look at it") can still opt into an automatic retry for
+    #: JUST a connection-pool timeout/deadlock/dropped-connection — a
+    #: genuinely different fault class from a broken handler — by setting
+    #: this instead. ``None`` (the default) means no reclassification: even
+    #: a transient exception follows ``retry_in_seconds``'s plain policy,
+    #: unchanged from before this field existed. A requeue triggered by
+    #: this field consumes the SAME per-kind ``max_attempts`` budget as any
+    #: other retry (``JOB_MAX_ATTEMPTS_BY_KIND`` — no separate counter).
+    transient_retry_in_seconds: int | None = None
 
 
 #: Process-wide registry: ``kind name -> JobKind``. Populated by
 #: ``register_kind()`` calls made before the worker loop starts (see
 #: ``app/main.py`` lifespan ordering).
 JOB_KINDS: dict[str, JobKind] = {}
+
+#: ``JobsRepository``/``JobsPgRepository.enqueue()``'s own default
+#: ``max_attempts`` — named here so a call site never repeats the literal
+#: ``3`` it actually means. See :func:`job_max_attempts`.
+DEFAULT_JOB_MAX_ATTEMPTS = 3
+
+#: Per-kind ``max_attempts`` override for job kinds whose ``claim_next()``
+#: reclaim path (a lease expiring because the worker that held it is gone —
+#: an OOM kill, an image-swap recreate, any other lost worker) must not
+#: compete for the SAME small budget every other kind uses to detect a
+#: genuinely broken handler.
+#:
+#: ``corpus-extraction`` and ``sharepoint-facts-extraction`` are both
+#: registered with ``retry_in_seconds=None`` (``app/worker/kinds.py``) — a
+#: raised exception inside the handler always finalizes to ``'failed'`` on
+#: its FIRST attempt (``JobsRepository.fail``'s requeue branch requires
+#: ``retry_in_seconds is not None``), never consuming a second one. So for
+#: these two kinds specifically, every attempt past the first can ONLY be
+#: a crash-recovery reclaim of an expired lease — never a second try at a
+#: handler that already raised. Raising their budget therefore only ever
+#: widens how many worker restarts a long crawl survives; it cannot mask an
+#: actually-broken handler, which still fails on attempt 1 regardless of
+#: this value.
+#:
+#: 2026-09 incident: a live multi-hour SharePoint crawl lost 6 of 7
+#: `corpus-extraction` jobs to `"lease expired after max attempts"` after
+#: one OOM kill and two planned worker recreates on the same host — three
+#: reclaims exhausted the shared default of 3 attempts. 25 is generous
+#: headroom for a run spanning many hours and several restarts without
+#: being unbounded.
+#: ``corpus-extraction-shard`` (2026-09-03 auto-parallel-crawl design §4.3)
+#: joins the same override for the same reason: it too registers with
+#: ``retry_in_seconds=None``, so any attempt past the first can only be a
+#: crash-recovery reclaim, never a second try at a handler that already
+#: raised — and a shard child can live just as long as its parent's own
+#: multi-hour run.
+JOB_MAX_ATTEMPTS_BY_KIND: dict[str, int] = {
+    "corpus-extraction": 25,
+    "corpus-extraction-shard": 25,
+    "sharepoint-facts-extraction": 25,
+}
+
+
+def job_max_attempts(kind: str) -> int:
+    """The ``max_attempts`` an ``enqueue()`` call for ``kind`` should pass —
+    :data:`JOB_MAX_ATTEMPTS_BY_KIND`'s override when one exists, otherwise
+    :data:`DEFAULT_JOB_MAX_ATTEMPTS`. ONE shared helper so every enqueue
+    call site reads the same number instead of repeating (and inevitably
+    drifting) a per-call literal.
+    """
+    return JOB_MAX_ATTEMPTS_BY_KIND.get(kind, DEFAULT_JOB_MAX_ATTEMPTS)
 
 
 def register_kind(kind: JobKind) -> None:

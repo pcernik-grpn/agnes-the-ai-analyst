@@ -30,7 +30,10 @@ from src.db_pg import Base
 
 class ExtractionRun(Base):
     __tablename__ = "extraction_runs"
-    __table_args__ = (sa.Index("idx_extraction_runs_connection_started", "connection_id", "started_at"),)
+    __table_args__ = (
+        sa.Index("idx_extraction_runs_connection_started", "connection_id", "started_at"),
+        sa.Index("idx_extraction_runs_parent", "parent_run_id"),
+    )
 
     id: Mapped[str] = mapped_column(String, primary_key=True)
     connection_id: Mapped[str] = mapped_column(String, nullable=False)
@@ -66,3 +69,25 @@ class ExtractionRun(Base):
     #: truncated list is visibly truncated.
     skips: Mapped[dict] = mapped_column(JSONB, server_default=sa.text("'{}'::jsonb"), nullable=False)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # -- shard-crawl columns (2026-09-03 auto-parallel-crawl design §4.2) ---
+    #: The PLANNER run this row was enqueued from — ``NULL`` for a run that
+    #: is not a shard (every run before this feature, and the inline path
+    #: forever). A shard child never sets its own row's ``shards_total``/
+    #: ``shards_done`` — those belong to the PARENT (this column's target).
+    parent_run_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    #: This shard's own delta-unit key (``DriveTarget.state_key`` — a drive
+    #: id, or ``"<drive_id>:<item_id>"`` for a folder shard), or ``NULL`` on
+    #: a non-shard run. Joins this row to its own
+    #: ``sharepoint_connection_state`` row (``kind='crawl:<shard_key>'``).
+    shard_key: Mapped[str | None] = mapped_column(String, nullable=True)
+    #: The human-facing folder path for this shard — what the fleet view's
+    #: shard disclosure renders instead of the opaque key.
+    shard_label: Mapped[str | None] = mapped_column(String, nullable=True)
+    #: PARENT-only: how many children the plan enqueued. ``NULL`` on a
+    #: non-parent run.
+    shards_total: Mapped[int | None] = mapped_column(sa.Integer, nullable=True)
+    #: PARENT-only: how many children have finished (success or failure) —
+    #: advanced atomically by ``finish_shard`` (Task 4). ``0`` on every row,
+    #: including a non-parent one, where it is simply unused.
+    shards_done: Mapped[int] = mapped_column(sa.Integer, server_default="0", nullable=False)

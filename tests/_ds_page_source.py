@@ -14,10 +14,10 @@ the page keep being split up — the wizard had to come out of here so the
 data-package builder could open the same drawer, and it could not come out
 while every test was pinned to its address.
 
-Only classic (non-deferred, non-module) scripts belong in `_LOADED`: those
-share one global scope with the inline block, which is why moving a function
-into one is behaviour-preserving. A module or a deferred component
-(`js/components/*.js`) has its own scope and its own tests.
+Only classic (non-module) scripts belong in `_LOADED`: those share one
+global scope with the inline block — `defer`red or not — which is why moving
+a function into one is behaviour-preserving. A module or a component with
+its own scope (`js/components/*.js`) has its own tests.
 """
 
 from __future__ import annotations
@@ -33,6 +33,12 @@ TEMPLATE = _WEB / "templates" / "admin_data_sources.html"
 _LOADED = (
     _WEB / "static" / "js" / "ds_helpers.js",
     _WEB / "static" / "js" / "ds_add_data_wizard.js",
+    # The page's own script, then the three subsystems split out of it (perf
+    # follow-up, 2026-09-03) — all `defer`, all classic, one global scope.
+    _WEB / "static" / "js" / "admin" / "data_sources_page.js",
+    _WEB / "static" / "js" / "admin" / "data_sources_sharepoint_wizard.js",
+    _WEB / "static" / "js" / "admin" / "data_sources_extraction_observability.js",
+    _WEB / "static" / "js" / "admin" / "data_sources_anon_preview.js",
 )
 
 #: Markup the page pulls in with `{% include %}`. Tests assert on the wizard's

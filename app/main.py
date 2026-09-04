@@ -519,6 +519,7 @@ from app.api.admin_datasource_secrets import router as admin_datasource_secrets_
 from app.api.admin_sharepoint import router as admin_sharepoint_router
 from app.api.sharepoint_webhooks import router as sharepoint_webhooks_router
 from app.api.admin_extraction import router as admin_extraction_router
+from app.api.admin_facts import router as admin_facts_router
 from app.api.admin_slack_secrets import router as admin_slack_secrets_router
 from app.api.admin_sso import router as admin_sso_router
 from app.api.admin_source_connections import router as source_connections_admin_router
@@ -2999,6 +3000,7 @@ def create_app() -> FastAPI:
     app.include_router(admin_sharepoint_router)
     app.include_router(sharepoint_webhooks_router)
     app.include_router(admin_extraction_router)
+    app.include_router(admin_facts_router)
     app.include_router(source_discovery_admin_router)
     app.include_router(mcp_passthrough_router)
     app.include_router(mcp_user_secrets_router)

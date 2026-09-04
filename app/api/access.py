@@ -20,7 +20,7 @@ from datetime import datetime
 from typing import List, Optional
 
 import duckdb
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy import exc as sa_exc
 
@@ -79,6 +79,11 @@ def _audit(
 _SYNC_MANAGED_SENTINELS: dict = {
     "system:google-sync": ("google_managed_readonly", "Google Workspace", "admin.google.com"),
     "system:sharepoint-acl-sync": ("sharepoint_managed_readonly", "SharePoint ACL sync", "the source system"),
+    "system:microsoft-sync": (
+        "microsoft_managed_readonly",
+        "Microsoft Entra ID group sync",
+        "the Entra admin center",
+    ),
 }
 
 
@@ -94,7 +99,10 @@ def _sync_managed_reason(g: dict) -> Optional[tuple]:
        — auto-created/reconciled by that writer (Google: the OAuth
        callback for a prefix-matching Workspace group, ``name`` is the
        full Workspace email; SharePoint: ``entra:<oid>``/``sp-direct:
-       <scope>`` groups the ``sharepoint-acl-sync`` job creates).
+       <scope>`` groups the ``sharepoint-acl-sync`` job creates; Microsoft:
+       ``entra:<oid>`` groups the login-time Entra group sync creates — the
+       SAME naming as SharePoint's, since both key the same Entra group
+       identically, see ``src.entra_identity.entra_group_name``).
     2. Google only: ``is_system=TRUE`` AND the group's name matches the
        env-configured admin/everyone Workspace email — the OAuth callback
        routes memberships from those Workspace groups into the seeded
@@ -180,6 +188,96 @@ async def get_resource_types(
     placeholder hint for the ``resource_id`` input.
     """
     return list_resource_types()
+
+
+# ---------------------------------------------------------------------------
+# Bounded resource search — the picker's counterpart to the (capped)
+# overview projection above
+# ---------------------------------------------------------------------------
+
+
+def _search_corpus_files(q: str, limit: int) -> List[dict]:
+    """``corpus_file`` search: a real query, not a filter over
+    ``_corpus_file_blocks()`` — that projection is now capped per
+    collection (see its docstring) and would miss most files."""
+    from app.resource_types import _file_meta_line, _owner_emails
+    from src.repositories import corpus_files_repo, file_corpora_repo
+
+    files = corpus_files_repo().search_across_corpora(q, limit=limit)
+    if not files:
+        return []
+    corpora_repo = file_corpora_repo()
+    cols: dict = {}
+    for cid in {f["corpus_id"] for f in files}:
+        try:
+            cols[cid] = corpora_repo.get(cid)
+        except Exception:
+            cols[cid] = None
+    owners = _owner_emails((c or {}).get("created_by") for c in cols.values())
+    out = []
+    for f in files:
+        col = cols.get(f["corpus_id"]) or {}
+        owner = owners.get(col.get("created_by") or "")
+        col_name = col.get("name") or col.get("slug") or ""
+        out.append(
+            {
+                "resource_id": f["id"],
+                "name": f.get("filename") or f["id"],
+                "slug": None,
+                "description": _file_meta_line(f),
+                "owner_email": owner,
+                "block_name": f"{col_name} · {owner}" if owner else col_name,
+            }
+        )
+    return out
+
+
+@router.get("/access/resources/{resource_type}/search", response_model=List[dict])
+async def search_grantable_resources(
+    resource_type: str,
+    q: str = Query(..., min_length=2, max_length=200),
+    limit: int = Query(50, ge=1, le=200),
+    user: dict = Depends(require_admin),
+):
+    """Bounded, on-demand search over one resource type's grantable items.
+
+    ``/api/admin/access-overview`` intentionally stopped enumerating every
+    ``corpus_file`` item — an instance with hundreds of thousands of files
+    made that payload tens of megabytes and froze the admin's browser tab
+    rendering it (see ``app.resource_types._corpus_file_blocks``). This is
+    how the per-file grant picker finds a file the overview no longer
+    lists, without reloading a multi-megabyte snapshot.
+
+    Every other resource type's projection is already small (dozens to low
+    hundreds of items, admin-curated), so the same endpoint just filters
+    its existing ``list_blocks()`` output in Python rather than growing a
+    second search path per type.
+    """
+    rtype = _validate_resource_type(resource_type)
+    q_norm = q.strip()
+    if len(q_norm) < 2:
+        return []
+
+    if rtype == ResourceType.CORPUS_FILE:
+        return _search_corpus_files(q_norm, limit)
+
+    from app.resource_types import RESOURCE_TYPES
+
+    spec = RESOURCE_TYPES[rtype]
+    q_low = q_norm.lower()
+    out: List[dict] = []
+    for block in spec.list_blocks():
+        for item in block.get("items", []):
+            hay = " ".join(
+                str(item.get(k) or "") for k in ("name", "slug", "resource_id", "description", "owner_email")
+            ).lower()
+            hay += f" {block.get('name') or ''}".lower()
+            if q_low not in hay:
+                continue
+            out.append({**item, "block_name": block.get("name")})
+            if len(out) >= limit:
+                return out
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1414,7 +1512,7 @@ def _resource_display_index(types_needed: set) -> dict:
             logger.exception("effective-access: list_blocks failed for %s", raw)
             continue
         for block in blocks or []:
-            for item in (block.get("items") or []):
+            for item in block.get("items") or []:
                 rid = item.get("resource_id")
                 if not rid:
                     continue
@@ -1505,7 +1603,13 @@ def _table_policy_diagnosis(row: dict, principal: dict) -> dict:
     if not policy_sql:
         return {"applies": False, "rows_visible": None, "reason": "ok", "note": None}
 
-    from src.access_policy import PolicyError, PolicyIdentityUnresolvable, PolicyMappingEmpty, policied_relation
+    from src.access_policy import (
+        PolicyError,
+        PolicyIdentityUnresolvable,
+        PolicyMappingEmpty,
+        policied_relation,
+        raise_if_policy_mapping_empty,
+    )
 
     table_id = row["id"]
     try:
@@ -1518,9 +1622,14 @@ def _table_policy_diagnosis(row: dict, principal: dict) -> dict:
     # §15.1 — an empty (or never-synced) policy_mapping dependency only
     # matters for a persona actually reading THROUGH the policy; the admin
     # bypass (§12) reads unfiltered, so it is irrelevant to what they see.
+    # The protected table is named to the shared helper so its policy's own
+    # mandatory ``FROM <itself>`` is not read as an empty mapping dependency
+    # when this table is ALSO marked ``policy_mapping=True`` and merely has
+    # no rows yet -- that is an ``empty_slice``, not a broken mapping
+    # (#1979, review follow-up).
     if relation.policied:
         try:
-            _raise_if_policy_mapping_empty(policy_sql)
+            raise_if_policy_mapping_empty(policy_sql, table_id=table_id, table_name=row.get("name"))
         except PolicyMappingEmpty as exc:
             return {"applies": True, "rows_visible": None, "reason": "mapping_empty", "note": str(exc)}
 
@@ -1554,46 +1663,6 @@ def _policy_error_diagnosis(table_id: str, *, stage: str) -> dict:
         "reason": "policy_error",
         "note": f"access policy for table {table_id!r} failed to {stage}",
     }
-
-
-def _raise_if_policy_mapping_empty(policy_sql: str) -> None:
-    """§15.1 — fail closed with a NAMED reason when a ``policy_mapping``
-    table this policy body references currently has zero (or never-synced)
-    rows, rather than let a broken upstream sync read as "you legitimately
-    have no data" via a bare zero count.
-
-    Cheap by design: reads ``sync_state`` — the row count already recorded
-    by the last successful sync — rather than a live ``COUNT(*)`` against
-    every mapping dependency. This runs for every policied+accessible table
-    on every effective-access call, and "the last sync landed empty (or
-    never ran)" is exactly what ``sync_state`` already tracks (and gives
-    ``last_sync`` for free, per §16's "must say" column).
-    """
-    import sqlglot
-    from sqlglot import exp
-
-    from src.access_policy import PolicyMappingEmpty
-    from src.repositories import sync_state_repo, table_registry_repo
-
-    try:
-        statement = sqlglot.parse_one(policy_sql, read="duckdb")
-    except Exception:
-        # policied_relation() already parsed this SQL successfully to reach
-        # this point (or raised PolicyError, handled by the caller before
-        # this runs) — defensive no-op only, never a NEW failure mode.
-        return
-    referenced_names = {t.name for t in statement.find_all(exp.Table) if t.name}
-    if not referenced_names:
-        return
-
-    mapping_rows = [
-        r for r in table_registry_repo().list_all() if r.get("policy_mapping") and r.get("name") in referenced_names
-    ]
-    for mapping_row in mapping_rows:
-        state = sync_state_repo().get_table_state(mapping_row["id"])
-        rows = state.get("rows") if state else None
-        if not rows:
-            raise PolicyMappingEmpty(mapping_row["name"], state.get("last_sync") if state else None)
 
 
 def _count_through_relation(relation) -> int:
@@ -1670,8 +1739,7 @@ async def user_effective_access(
         grants_rows,
         key=lambda r: (
             r["resource_type"],
-            (display.get((r["resource_type"], r["resource_id"])) or {}).get("name")
-            or r["resource_id"],
+            (display.get((r["resource_type"], r["resource_id"])) or {}).get("name") or r["resource_id"],
             by_gid.get(r["group_id"], ""),
         ),
     ):

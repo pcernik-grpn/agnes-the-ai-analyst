@@ -389,3 +389,61 @@ def test_submit_takes_settles_and_restores_attachments():
     # The composed text is what renders and what is sent — not a hidden
     # instruction the reader cannot see.
     assert body.index("ChatAttachments.settle") < body.index('renderMessage({ role: "user"')
+
+
+# ---------------------------------------------------------------------------
+# The "+" menu dialogs share the paste path's filename derivation (#2184)
+# ---------------------------------------------------------------------------
+
+
+def test_dialog_upload_name_survives_the_server_filename_rule():
+    """The reported file: a 2.8 MB PDF called "AI Value Backlog_Report_v1.pdf".
+
+    Pasting it worked; picking it in *Add Image/Document* was refused with
+    "contains disallowed characters", because the dialog forwarded the OS's
+    name while the paste path rebuilt it. ``uploadName`` is that derivation,
+    made reachable from outside the paste path.
+    """
+    out = _run("""
+      const f = { name: "AI Value Backlog_Report_v1.pdf", type: "application/pdf" };
+      const d = new Date(2026, 8, 1, 10, 15, 30);
+      console.log(JSON.stringify({
+        reported: ChatAttachments.uploadName(f, d),
+        czech_doc: ChatAttachments.uploadName(
+          { name: "Výroční zpráva 2026.pdf", type: "application/pdf" }, d),
+        again: ChatAttachments.uploadName(f, d),
+      }));
+    """)
+    import re
+
+    server_re = r"^[A-Za-z0-9][A-Za-z0-9._\-]{0,199}$"
+    for label, name in out.items():
+        assert re.match(server_re, name), f"{label}={name!r} would be rejected by the endpoint"
+    assert out["reported"].startswith("AI_Value_Backlog_Report_v1-")
+    assert out["reported"].endswith(".pdf")
+    # Same file picked twice in one second must not overwrite itself, and the
+    # counter is shared with the paste path rather than a second one.
+    assert out["reported"] != out["again"]
+
+
+def test_chat_upload_dialogs_bind_the_sanitized_name():
+    """A static guard, because the failure mode is a silent omission.
+
+    ``fd.append("file", f)`` and ``fd.append("file", f, name)`` are both valid
+    JavaScript; the first one sends the OS's filename and re-opens #2184. Only
+    the two dialogs that POST to /api/chat/uploads are covered — the store
+    dialog posts to /api/store/entities, which takes ``Path(filename).name``
+    without an ASCII rule and re-sends the same original name for its preview
+    and create steps (app/api/store.py), so renaming there would break a
+    pairing for no gain.
+    """
+    import re
+
+    js = _read(CHAT_JS)
+    appends = re.findall(r'\.append\("file", (_\w+)((?:, [^)]+)?)\)', js)
+    bound = {var: extra for var, extra in appends}
+    assert "_dataFile" in bound and "_mediaFile" in bound, f"upload call sites moved: {bound}"
+    for var in ("_dataFile", "_mediaFile"):
+        assert "ChatAttachments.uploadName" in bound[var], (
+            f'fd.append("file", {var}) sends the OS filename — a space in it is a 400 (#2184)'
+        )

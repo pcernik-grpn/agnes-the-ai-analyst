@@ -5,6 +5,7 @@ which checks Admin user_group membership for both OAuth session and PAT
 callers via the same ``_user_group_ids`` lookup.
 """
 
+import contextlib
 import glob
 import json
 import logging
@@ -12,6 +13,7 @@ import math
 import os
 import re
 import threading
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, NamedTuple, Optional
 
@@ -19,9 +21,10 @@ import duckdb
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
-from app.auth.access import require_admin
+from app.auth.access import require_admin, require_admin_all_surface
 from app.auth.dependencies import _get_db
 from app.switches import SWITCHES
+from connectors.bigquery.access import BqAccess, get_bq_access
 from connectors.databricks.client import validate_workspace_host
 from connectors.snowflake.settings import (
     SF_PRIVATE_KEY_ENV,
@@ -36,6 +39,8 @@ from src.identifier_validation import (
     is_safe_quoted_identifier as _is_safe_quoted_identifier,
 )
 from src.repositories import (
+    RequiresPostgresBackend,
+    access_policy_revisions_repo,
     audit_repo,
     knowledge_repo,
     profile_repo,
@@ -520,12 +525,59 @@ _EXTRACTION_ENV_LOCKS: tuple[tuple[tuple[str, ...], str], ...] = ()
 
 _EXTRACTION_TIMEOUT_MIN = 60
 _EXTRACTION_TIMEOUT_MAX = 86400  # 24h
+# `extraction.stall_after_s` — how stale a `running` run's checkpoint may
+# get before `app/api/admin_extraction.py`'s `_derived_outcome` reports
+# `stalled` instead of `running`. Same range as `timeout_s` above (a stall
+# threshold shorter than a minute would flag a run that is merely between
+# checkpoints; longer than 24h defeats the point of the signal).
+_EXTRACTION_STALL_AFTER_MIN = 60
+_EXTRACTION_STALL_AFTER_MAX = 86400  # 24h
 # `extraction.crawler.concurrency` bounds — the SAME clamp the crawler applies
 # (`connectors.sharepoint.crawler._MAX_CONCURRENCY`), pinned by
 # `tests/test_admin_server_config_extraction_section.py` rather than imported:
 # this module must not carry an import-time dependency on the crawler stack.
 _CRAWLER_CONCURRENCY_MIN = 1
-_CRAWLER_CONCURRENCY_MAX = 32
+# Same posture for the worker's extraction LANE slots and the facts stage's
+# per-pass document concurrency — the cap each stage clamps to itself, pinned
+# by tests rather than imported (no import-time dependency on the worker/
+# connector stacks from this module).
+# `_LANE_CONCURRENCY_MAX` MUST equal `app.worker.runtime._MAX_EXTRACTION_
+# CONCURRENCY` (currently 24) — a live run posted `extraction.concurrency=12`
+# through this endpoint (which accepted it, the cap here was 64), and the
+# worker runtime silently re-clamped it back down to the then-8 on its own,
+# logging a warning nobody saw until after the fact. Pinned equal by
+# `tests/test_admin_server_config_extraction_section.py::
+# test_caps_match_the_stages_own_clamps` rather than imported here.
+_LANE_CONCURRENCY_MAX = 24
+_FACTS_CONCURRENCY_MAX = 64
+_CRAWLER_CONCURRENCY_MAX = 64
+# `extraction.crawler.convert_child_memory_limit_mb` — the RLIMIT_AS
+# HEADROOM a conversion child gets above this worker's own memory
+# footprint at fork time (`connectors.sharepoint.crawler
+# ._DEFAULT_CONVERT_CHILD_MEMORY_LIMIT_MB`/`_install_memory_limit`), 0 =
+# off. 65536 (64 GiB) is a sanity ceiling, not a tuned number — an
+# operator sizing for more should raise the container's own memory limit
+# well before approaching it. Min is 0 (not 1): unlike the concurrency
+# knobs above, 0 is a legitimate, meaningful value here.
+_CONVERT_CHILD_MEMORY_LIMIT_MIN_MB = 0
+_CONVERT_CHILD_MEMORY_LIMIT_MAX_MB = 65536
+# `extraction.crawler.convert_child_max_rss_mb` — the ABSOLUTE per-child RSS
+# ceiling the PARENT itself polls for (`connectors.sharepoint.crawler
+# ._DEFAULT_CONVERT_CHILD_MAX_RSS_MB`/`_ConvertProcessPool._await_reply`),
+# 0 = off. A SEPARATE knob from `convert_child_memory_limit_mb` above (which
+# is HEADROOM above the worker's own VmSize at fork time, not an absolute
+# number) — see that knob's own live-deployment follow-up finding for why
+# an absolute, parent-polled ceiling was still needed on top of it. Same
+# sanity ceiling and same "0 is legitimate" reasoning as its sibling.
+_CONVERT_CHILD_MAX_RSS_MIN_MB = 0
+_CONVERT_CHILD_MAX_RSS_MAX_MB = 65536
+# `extraction.crawler.convert_spares_per_slot` — how many pre-forked standby
+# conversion children `_ConvertProcessPool` keeps ready per slot
+# (`connectors.sharepoint.crawler._DEFAULT_CONVERT_SPARES_PER_SLOT`). 0 = no
+# spares (the pre-spares behaviour). 8 is a cost ceiling (one idle process
+# per spare per slot), not a tuned number.
+_CONVERT_SPARES_PER_SLOT_MIN = 0
+_CONVERT_SPARES_PER_SLOT_MAX = 8
 
 
 def _leaf_touched(patch: Any, path: tuple[str, ...]) -> bool:
@@ -542,6 +594,49 @@ def _leaf_touched(patch: Any, path: tuple[str, ...]) -> bool:
             return False
         node = node[key]
     return True
+
+
+def _validate_vertex_region_model_matrix(region: str, model_in_patch: Any) -> None:
+    """Refuse a ``vertex_region`` this save would pair with a model that has
+    NO documented Claude-on-Vertex quota bucket for it (live finding (b),
+    TCRD-296 synthesis F.25) — a project running Sonnet outside ``global``
+    answers 429 on every call, even a 5-token one, because it has no
+    regional bucket at all; a saturated Haiku region-bucket at peak is the
+    OTHER shape (a real, if temporary, capacity limit — not this guard's
+    job to refuse). Better a ``422`` naming the mismatch here than an
+    operator discovering it one paused pass at a time.
+
+    ``model_in_patch`` is the SAME save's own ``extraction.facts.model``
+    leaf when set (resolved through the same tier table a pass itself
+    would use); otherwise this instance's CURRENTLY configured model
+    (:func:`connectors.sharepoint.facts_extraction._model`) — the model
+    ``vertex_region`` would actually be paired with if this save touches
+    only the region.
+    """
+    from connectors.sharepoint.facts_extraction import VERTEX_REGION_MODEL_MATRIX, vertex_region_supports_model
+
+    if isinstance(model_in_patch, str) and model_in_patch.strip():
+        from connectors.llm.factory import resolve_model_tier
+
+        try:
+            model = resolve_model_tier(model_in_patch.strip())
+        except ValueError:
+            return  # an invalid model tier is a different validator's job
+    else:
+        from connectors.sharepoint.facts_extraction import _model
+
+        model = _model()
+
+    if vertex_region_supports_model(region, model):
+        return
+    matrix_hint = "; ".join(f"{tier}: {', '.join(regions)}" for tier, regions in VERTEX_REGION_MODEL_MATRIX.items())
+    raise HTTPException(
+        status_code=422,
+        detail=(
+            f"extraction.facts.vertex_region={region!r} has no documented Claude-on-Vertex quota bucket for "
+            f"model {model!r} — every call would answer 429. Supported region×model matrix: {matrix_hint}."
+        ),
+    )
 
 
 def _validate_extraction_section(sections: Dict[str, Dict[str, Any]]) -> None:
@@ -606,6 +701,81 @@ def _validate_extraction_section(sections: Dict[str, Dict[str, Any]]) -> None:
                 ),
             )
 
+    stall_after_s = patch.get("stall_after_s")
+    if stall_after_s is not None:
+        if not isinstance(stall_after_s, int) or isinstance(stall_after_s, bool):
+            raise HTTPException(status_code=422, detail="extraction.stall_after_s must be an integer")
+        if stall_after_s < _EXTRACTION_STALL_AFTER_MIN or stall_after_s > _EXTRACTION_STALL_AFTER_MAX:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"extraction.stall_after_s must be between {_EXTRACTION_STALL_AFTER_MIN} and "
+                    f"{_EXTRACTION_STALL_AFTER_MAX} (got {stall_after_s})"
+                ),
+            )
+
+    lane = patch.get("concurrency")
+    if lane is not None:
+        if not isinstance(lane, int) or isinstance(lane, bool):
+            raise HTTPException(status_code=422, detail="extraction.concurrency must be an integer")
+        if lane < 1 or lane > _LANE_CONCURRENCY_MAX:
+            raise HTTPException(
+                status_code=422,
+                detail=f"extraction.concurrency must be between 1 and {_LANE_CONCURRENCY_MAX} (got {lane})",
+            )
+
+    facts = patch.get("facts")
+    if facts is not None:
+        if not isinstance(facts, dict):
+            raise HTTPException(status_code=422, detail="extraction.facts must be a mapping")
+        for key, lo, hi in (
+            ("concurrency", 1, _FACTS_CONCURRENCY_MAX),
+            ("stream_every", 0, 1_000_000),
+            ("run_timeout_s", _EXTRACTION_TIMEOUT_MIN, _EXTRACTION_TIMEOUT_MAX),
+            # TCRD-296 gap #67 — the ceiling on how many partitions a facts
+            # fan-out (connectors.sharepoint.facts_extraction
+            # .enqueue_facts_extraction_passes) ever enqueues at once; same
+            # clamp as `concurrency` above.
+            ("concurrency_passes", 1, _FACTS_CONCURRENCY_MAX),
+        ):
+            value = facts.get(key)
+            if value is None:
+                continue
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise HTTPException(status_code=422, detail=f"extraction.facts.{key} must be an integer")
+            if value < lo or value > hi:
+                raise HTTPException(
+                    status_code=422, detail=f"extraction.facts.{key} must be between {lo} and {hi} (got {value})"
+                )
+        for key, allowed in (
+            ("transport", ("sync", "batch")),
+            ("retry_mode", ("off", "on_gate_fail", "always")),
+            ("provider", ("inherit", "anthropic", "vertex")),
+        ):
+            value = facts.get(key)
+            if value is not None and value not in allowed:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"extraction.facts.{key} must be one of {list(allowed)} (got {value!r})",
+                )
+        vertex_region = facts.get("vertex_region")
+        if vertex_region is not None:
+            if not isinstance(vertex_region, str):
+                raise HTTPException(status_code=422, detail="extraction.facts.vertex_region must be a string")
+            if vertex_region.strip():
+                from connectors.sharepoint.facts_extraction import _region_looks_valid
+
+                region_norm = vertex_region.strip().lower()
+                if not _region_looks_valid(region_norm):
+                    raise HTTPException(
+                        status_code=422,
+                        detail=(
+                            "extraction.facts.vertex_region must be lowercase letters, digits and dash "
+                            f"('global' allowed), or empty (got {vertex_region!r})"
+                        ),
+                    )
+                _validate_vertex_region_model_matrix(region_norm, facts.get("model"))
+
     crawler = patch.get("crawler")
     if crawler is not None:
         if not isinstance(crawler, dict):
@@ -622,6 +792,51 @@ def _validate_extraction_section(sections: Dict[str, Dict[str, Any]]) -> None:
                     detail=(
                         f"extraction.crawler.concurrency must be between {_CRAWLER_CONCURRENCY_MIN} and "
                         f"{_CRAWLER_CONCURRENCY_MAX} (got {concurrency})"
+                    ),
+                )
+        mem_limit_mb = crawler.get("convert_child_memory_limit_mb")
+        if mem_limit_mb is not None:
+            if not isinstance(mem_limit_mb, int) or isinstance(mem_limit_mb, bool):
+                raise HTTPException(
+                    status_code=422, detail="extraction.crawler.convert_child_memory_limit_mb must be an integer"
+                )
+            if mem_limit_mb < _CONVERT_CHILD_MEMORY_LIMIT_MIN_MB or mem_limit_mb > _CONVERT_CHILD_MEMORY_LIMIT_MAX_MB:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "extraction.crawler.convert_child_memory_limit_mb must be between "
+                        f"{_CONVERT_CHILD_MEMORY_LIMIT_MIN_MB} and {_CONVERT_CHILD_MEMORY_LIMIT_MAX_MB} "
+                        f"(got {mem_limit_mb}); 0 disables the cap"
+                    ),
+                )
+        max_rss_mb = crawler.get("convert_child_max_rss_mb")
+        if max_rss_mb is not None:
+            if not isinstance(max_rss_mb, int) or isinstance(max_rss_mb, bool):
+                raise HTTPException(
+                    status_code=422, detail="extraction.crawler.convert_child_max_rss_mb must be an integer"
+                )
+            if max_rss_mb < _CONVERT_CHILD_MAX_RSS_MIN_MB or max_rss_mb > _CONVERT_CHILD_MAX_RSS_MAX_MB:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "extraction.crawler.convert_child_max_rss_mb must be between "
+                        f"{_CONVERT_CHILD_MAX_RSS_MIN_MB} and {_CONVERT_CHILD_MAX_RSS_MAX_MB} "
+                        f"(got {max_rss_mb}); 0 disables the watchdog"
+                    ),
+                )
+        spares_per_slot = crawler.get("convert_spares_per_slot")
+        if spares_per_slot is not None:
+            if not isinstance(spares_per_slot, int) or isinstance(spares_per_slot, bool):
+                raise HTTPException(
+                    status_code=422, detail="extraction.crawler.convert_spares_per_slot must be an integer"
+                )
+            if spares_per_slot < _CONVERT_SPARES_PER_SLOT_MIN or spares_per_slot > _CONVERT_SPARES_PER_SLOT_MAX:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "extraction.crawler.convert_spares_per_slot must be between "
+                        f"{_CONVERT_SPARES_PER_SLOT_MIN} and {_CONVERT_SPARES_PER_SLOT_MAX} "
+                        f"(got {spares_per_slot}); 0 disables spares"
                     ),
                 )
 
@@ -1125,6 +1340,18 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
                 "than accepted and silently disabling the sweep later."
             ),
         },
+        "concurrency": {
+            "kind": "int",
+            "default": 1,
+            "hint": (
+                "Extraction LANE slots on the worker — how many extraction jobs (crawls and "
+                "fact passes, across all connections) run at the same time. 1 serialises "
+                "everything; raise it so a streamed facts pass can overlap a crawl still "
+                "running, or so several connections crawl in parallel. Clamped to [1, 8] — "
+                "same ceiling the worker runtime itself clamps to, so a value accepted here "
+                "is never silently re-clamped on the worker."
+            ),
+        },
         "timeout_s": {
             "kind": "int",
             "default": 3600,
@@ -1133,6 +1360,20 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
                 "stops between files/pages, persists its state and the job fails; the next "
                 "run resumes from the persisted deltaLinks/cTags. 0 = unbounded. Must be "
                 "between 60 and 86400 (24h)."
+            ),
+        },
+        "stall_after_s": {
+            "kind": "int",
+            "default": 900,
+            "hint": (
+                "How stale a `running` run's last checkpoint may get before the fleet view "
+                "(/admin/extraction) and the source card report it as `stalled` instead of "
+                "`running` — the SAME rule both surfaces use, so the fleet's 'Stuck?' badge "
+                "and the run's own outcome word can never disagree. Being late to say "
+                "'stalled' costs an operator a little patience; being early costs them trust "
+                "in every other number this dashboard shows. Must be between 60 and 86400 "
+                "(24h). A `stalled` run can be force-cancelled from either surface — see "
+                "POST /api/admin/sharepoint/extraction/runs/{run_id}/cancel."
             ),
         },
         "crawler": {
@@ -1147,7 +1388,7 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
                     "default": 6,
                     "hint": (
                         "How many files of one delta page a crawl holds in flight at once "
-                        "(download → convert → anonymize → ingest); clamped to [1, 32]. This is "
+                        "(download → convert → anonymize → ingest); clamped to [1, 64]. This is "
                         "the extraction worker's MEMORY lever: every file in flight is a converter "
                         "child process holding that document, so the worker's peak memory scales "
                         "with it — six in flight has exceeded a 12 GiB container on large decks "
@@ -1156,6 +1397,51 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
                         "Multiplies with extraction.concurrency (crawls at once). A per-run "
                         "override lives in the source card's Run-now options. Read by the worker "
                         "at the start of each run — effective on the next run, no restart."
+                    ),
+                },
+                "convert_child_memory_limit_mb": {
+                    "kind": "int",
+                    "default": 1536,
+                    "hint": (
+                        "Per-document HEADROOM above this worker process's own memory footprint "
+                        "at fork time (RLIMIT_AS on the conversion child), NOT an absolute ceiling — "
+                        "a live 64-vCPU worker's own footprint alone was already ~2.2 GB, so reading "
+                        "this knob as an absolute number capped every child before it converted a "
+                        "single document. Raise it for documents that legitimately need more headroom "
+                        "(a large spreadsheet openpyxl loads whole into memory, in one observed "
+                        "case); lower it to make a runaway document fail faster and more "
+                        "attributably. 0 disables the cap outright. Read by the worker at the start "
+                        "of each run — effective on the next run, no restart."
+                    ),
+                },
+                "convert_child_max_rss_mb": {
+                    "kind": "int",
+                    "default": 4096,
+                    "hint": (
+                        "Absolute per-child RSS ceiling the PARENT itself polls for every ~0.5s while a "
+                        "conversion is in flight — SEPARATE from convert_child_memory_limit_mb above, "
+                        "which is HEADROOM above the worker's own memory footprint at fork time and "
+                        "does not bound RSS once the crawl parent itself has grown over a long run "
+                        "(observed reaching 10-17 GB RSS on one child before that headroom-based cap "
+                        "ever fired). Crossing this ceiling kills the child directly and counts THAT "
+                        "file convert_failed, attributably — never the vaguer wording a kernel- or "
+                        "host-level OOM kill gets. 0 disables the watchdog outright. Linux only (reads "
+                        "/proc/<pid>/status) — a no-op on any other platform. Read by the worker at the "
+                        "start of each run — effective on the next run, no restart."
+                    ),
+                },
+                "convert_spares_per_slot": {
+                    "kind": "int",
+                    "default": 2,
+                    "hint": (
+                        "How many pre-forked standby conversion children each concurrency slot keeps "
+                        "ready, so a slot that recycles or crashes mid-page has somewhere to fail over "
+                        "to WITHOUT waiting for the next page's repair() — a single spare (the original "
+                        "design) could be exhausted by two recycles/crashes on the same slot inside one "
+                        "delta page, leaving it down (or over its RSS budget) for the rest of that page. "
+                        "Costs one idle, import-only process per spare per slot. 0 disables spares "
+                        "outright. Read by the worker at the start of each run — effective on the next "
+                        "run, no restart."
                     ),
                 },
             },
@@ -1186,7 +1472,7 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
                     "kind": "int",
                     "default": 3,
                     "hint": (
-                        "How many documents are extracted in parallel; clamped to [1, 16]. "
+                        "How many documents are extracted in parallel; clamped to [1, 64]. "
                         "1 is exactly sequential — the knob buys wall clock, never a different "
                         "result. Raise it to spend a large corpus's time budget on more "
                         "concurrent calls; lower it when the model account's rate limit is the "
@@ -1200,6 +1486,90 @@ _KNOWN_FIELDS: dict[str, dict[str, dict]] = {
                         "Optional model override for this stage only — a tier name "
                         "(haiku/sonnet/opus) or a concrete model id. Empty falls back to "
                         "extraction.model, then Haiku."
+                    ),
+                },
+                "stream_every": {
+                    "kind": "int",
+                    "default": 0,
+                    "hint": (
+                        "Run a facts pass WHILE a crawl is still going: after every N "
+                        "successfully ingested files the crawler enqueues a standalone pass "
+                        "for the connection (and one more when it finishes). 0 = off, only "
+                        "the tail pass after the crawl. Needs extraction.concurrency ≥ 2 to "
+                        "actually overlap."
+                    ),
+                },
+                "run_timeout_s": {
+                    "kind": "int",
+                    "default": 3600,
+                    "hint": (
+                        "Time budget of ONE standalone facts pass, seconds. A pass that hits "
+                        "it stops between documents, keeps everything already shipped, and "
+                        "the next pass resumes — a small budget just means more passes."
+                    ),
+                },
+                "concurrency_passes": {
+                    "kind": "int",
+                    "default": 4,
+                    "hint": (
+                        "Ceiling on how many PARTITIONS one facts-extraction trigger fans out "
+                        "into at most — each partition is its own worker-lane job over a "
+                        "disjoint slice of the connection's pending documents, run in "
+                        "parallel. Also capped by the backlog itself (never more than "
+                        "ceil(pending / 2000) partitions). A live finding measured 7 "
+                        "connections running facts extraction in parallel at ~11,800 "
+                        "documents/hour, versus ~1,400/hour once merged into one connection "
+                        "(one lock, one job) — throughput scales with concurrent passes, not "
+                        "corpus size. 1 disables fan-out entirely."
+                    ),
+                },
+                "transport": {
+                    "kind": "string",
+                    "default": "sync",
+                    "hint": (
+                        "Instance default for which API carries the extraction calls: 'sync' "
+                        "(immediate, bound by the model account's per-minute token limit) or "
+                        "'batch' (Anthropic Batches API: no per-minute ceiling, half the price, "
+                        "hours of latency — the right choice for a bulk pass over a large "
+                        "corpus). A connection can override it on its source card."
+                    ),
+                },
+                "retry_mode": {
+                    "kind": "string",
+                    "default": "on_gate_fail",
+                    "hint": (
+                        "Instance default for the ONE corrective retry after the verbatim gate: "
+                        "'on_gate_fail' (retry only when a quote still fails after the free "
+                        "deterministic repair), 'off' (never retry — cheapest, lowest recall), "
+                        "'always' (retry whenever the first pass had any failure). A connection "
+                        "can override it on its source card."
+                    ),
+                },
+                "provider": {
+                    "kind": "string",
+                    "default": "inherit",
+                    "hint": (
+                        "Instance default for which LLM provider carries this stage's calls: "
+                        "'inherit' (default) follows this instance's ai.provider (vertex when "
+                        "chat/LLM traffic already runs through Google Vertex AI, anthropic "
+                        "otherwise); 'anthropic'/'vertex' pin this stage regardless of ai.provider "
+                        "— e.g. keep facts extraction on a still-working Anthropic key while chat "
+                        "has moved to Vertex, or the reverse. The Anthropic Batches API has no "
+                        "Vertex equivalent: a vertex-resolved provider always runs the sync "
+                        "transport, regardless of extraction.facts.transport. A connection can "
+                        "override it on its source card."
+                    ),
+                },
+                "vertex_region": {
+                    "kind": "string",
+                    "default": "",
+                    "hint": (
+                        "Instance default for WHICH Vertex AI region a provider: vertex pass's client "
+                        "talks to, on top of ai.vertex.region. Google enforces Claude-on-Vertex quotas "
+                        "PER REGION, so pinning different connections to different regions raises the "
+                        "account's effective throughput at the same per-call price. Empty falls back to "
+                        "ai.vertex.region. Lowercase letters, digits and dash ('global' allowed). A "
+                        "connection can override it on its source card."
                     ),
                 },
             },
@@ -3598,9 +3968,11 @@ async def update_server_config(
 # table_registry (where it would later confuse the orchestrator scan).
 _VALID_SOURCE_TYPES: tuple[str, ...] = ("keboola", "bigquery", "jira", "local", "databricks", "snowflake")
 
-# Explicit allowlist of audit-payload keys whose values are credentials and
-# must be masked. Substring-scan + ad-hoc whitelist (the previous shape) is
-# fragile in two ways:
+# Explicit allowlist of audit-payload keys whose values must be masked
+# before they reach `audit_log.params` — credentials AND, per the audit
+# playbook's "content never enters params" rule, opaque content bodies
+# such as a table access policy's SQL text (#1979). Substring-scan +
+# ad-hoc whitelist (the previous shape) is fragile in two ways:
 #   1. False positive: legit fields like `primary_key` get masked because
 #      they contain "key" — we then need a whitelist exception, which has
 #      to be kept in sync as new fields are added.
@@ -3609,13 +3981,17 @@ _VALID_SOURCE_TYPES: tuple[str, ...] = ("keboola", "bigquery", "jira", "local", 
 #      and gets masked unnecessarily; conversely, a brand-new credential
 #      field that doesn't contain one of the patterns (`auth_material`,
 #      `bearer`) silently leaks.
-# Allowlist puts the burden on the developer adding a new secret-bearing
-# field: they must add the literal key name here, which forces a code-
-# review touch on the audit path. Audit the current Pydantic models
-# (RegisterTableRequest / UpdateTableRequest / ConfigureRequest /
-# ServerConfigUpdateRequest) when extending — the registry payloads don't
-# currently carry credentials, but ConfigureRequest does (`keboola_token`)
-# and could be routed through this sanitizer in the future.
+# Allowlist puts the burden on the developer adding a new secret- or
+# content-bearing field: they must add the literal key name here, which
+# forces a code-review touch on the audit path. Audit the current Pydantic
+# models (RegisterTableRequest / UpdateTableRequest / ConfigureRequest /
+# ServerConfigUpdateRequest / PolicyPreviewRequest) when extending —
+# ConfigureRequest carries Keboola creds (`keboola_token`), and
+# `access_policy_sql` / `candidate_sql` / `source_query` carry SQL (or
+# extraction-filter) bodies that are already durably persisted on
+# `table_registry` (or, for a preview candidate, never persisted at all)
+# — the audit row only needs to say THAT it changed/was previewed, never
+# the body itself.
 _SECRET_FIELDS: frozenset = frozenset(
     {
         # ConfigureRequest — POST /api/admin/configure carries Keboola creds.
@@ -3635,6 +4011,26 @@ _SECRET_FIELDS: frozenset = frozenset(
         # Marketplace PATs (private repos) — see src/marketplace.py.
         "marketplace_token",
         "marketplace_pat",
+        # #1979 — table access policy SQL bodies are content, not metadata.
+        # The full text is already on `table_registry.access_policy_sql`
+        # (`access_policy_updated_at`/`_by` cover who/when); `updated_fields`
+        # already tells the audit row THAT it changed. `access_policy_note`
+        # deliberately stays OUT of this set — it's the admin's own "why",
+        # documentation like `description`, not the policy body.
+        "access_policy_sql",
+        # PolicyPreviewRequest.sql — a candidate policy body previewed
+        # before (or instead of) ever being saved. Same rationale, and it
+        # never even reaches persistent storage, so redacting it here is
+        # the ONLY place it would otherwise be recoverable from.
+        "candidate_sql",
+        # #1979 — RegisterTableRequest.source_query / UpdateTableRequest.
+        # source_query is the extraction SQL (or, for Keboola materialized,
+        # a JSON filter spec) that defines the table body itself. It is
+        # already durably persisted on `table_registry.source_query`;
+        # `updated_fields` (update_table) already tells the audit row THAT
+        # it changed, and register_table's `resource` names the table. Same
+        # "content never enters params" rationale as access_policy_sql.
+        "source_query",
     }
 )
 
@@ -3675,6 +4071,45 @@ _BACKTICK_REJECTION_MESSAGE = (
     "table). The instance is configured with the data project, so you "
     "don't need to repeat it in the FROM clause."
 )
+
+
+# A Keboola materialized row exports through the Storage API, whose filter is
+# a JSON spec (`connectors.keboola.storage_api.ExportFilter`) — never SQL.
+# ONE validator for it, called from the RegisterTableRequest model validator
+# (POST /register-table) AND the merged-record path in `update_table` (PUT),
+# so the two routes cannot disagree about what a filter spec is.
+_KEBOOLA_FILTER_NOT_SQL_MESSAGE = (
+    "Keboola materialized source_query must be a JSON filter spec "
+    "(columns/whereFilters/changedSince), not SQL. "
+    "Use null for full-table export, or set query_mode='local' "
+    "for DuckDB-based Keboola pulls."
+)
+
+
+def _validate_keboola_filter_spec(sq: str) -> None:
+    """Raise ValueError unless ``sq`` is a filter spec the exporter honors.
+
+    Three refusals, in order: SQL (the Storage API takes no SQL), invalid
+    JSON, and — since #1979 — a spec carrying a key nobody reads.
+    `ExportFilter.from_dict` used to drop unknown keys, so a misspelled row
+    filter (`where_filter`, `whereFilters`, …) was accepted here and the next
+    sync exported and distributed the FULL table. The parser is the same one
+    the sync runs, so registration cannot accept what sync will refuse.
+    """
+    if sq.upper().startswith(("SELECT", "WITH")):
+        raise ValueError(_KEBOOLA_FILTER_NOT_SQL_MESSAGE)
+    try:
+        parsed = json.loads(sq)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Keboola materialized source_query must be valid JSON: {e}") from e
+    # Imported locally: `app.api.admin` must not pull a connector module in at
+    # import time.
+    from connectors.keboola.storage_api import ExportFilter
+
+    try:
+        ExportFilter.from_dict(parsed)
+    except ValueError as e:
+        raise ValueError(str(e)) from e
 
 
 class RegisterTableRequest(BaseModel):
@@ -3853,17 +4288,7 @@ class RegisterTableRequest(BaseModel):
         # The extractor uses the Storage API with structured filters (columns,
         # whereFilters, changedSince) — DuckDB SQL belongs on BigQuery rows.
         if self.query_mode == "materialized" and self.source_type == "keboola" and sq:
-            if sq.upper().startswith(("SELECT", "WITH")):
-                raise ValueError(
-                    "Keboola materialized source_query must be a JSON filter spec "
-                    "(columns/whereFilters/changedSince), not SQL. "
-                    "Use null for full-table export, or set query_mode='local' "
-                    "for DuckDB-based Keboola pulls."
-                )
-            try:
-                json.loads(sq)
-            except json.JSONDecodeError as e:
-                raise ValueError(f"Keboola materialized source_query must be valid JSON: {e}") from e
+            _validate_keboola_filter_spec(sq)
         # Normalise: stash the trimmed-or-None form so the persisted column
         # never carries surrounding whitespace or empty-string sentinels.
         self.source_query = sq
@@ -5511,33 +5936,79 @@ def register_table(
         exclude_id=None,
     )
 
-    repo.register(
-        id=table_id,
-        name=request.name,
-        folder=request.folder,
-        sync_strategy=request.sync_strategy,
-        primary_key=request.primary_key,
-        description=request.description,
-        registered_by=user.get("email"),
-        source_type=request.source_type,
-        bucket=request.bucket,
-        source_table=request.source_table,
-        source_query=request.source_query,
-        query_mode=request.query_mode,
-        sync_schedule=request.sync_schedule,
-        # v26 sync-strategy support fields. None for non-Keboola or
-        # full_refresh tables; persisted as NULL.
-        incremental_window_days=request.incremental_window_days,
-        max_history_days=request.max_history_days,
-        incremental_column=request.incremental_column,
-        where_filters=request.where_filters,
-        partition_by=request.partition_by,
-        partition_granularity=request.partition_granularity,
-        initial_load_chunk_days=request.initial_load_chunk_days,
-        bq_fqn=request.bq_fqn,
-        server_only=request.server_only,
-        connection_id=request.connection_id,
-    )
+    # #1979 (PR #2023 review, finding 3; hardened per finding A of the
+    # follow-up review) — defense in depth, purge-BEFORE-insert, symmetric
+    # with `unregister_table`. Table ids are derived from names (see
+    # `table_id` above), so a table unregistered and then re-registered
+    # under the same name reuses the same id. This row is confirmed
+    # brand-new here (the 409 check above proved no registry row existed
+    # for `table_id`) regardless of how it got here — so any revision still
+    # sitting under this id is, by construction, an orphan from before this
+    # registration and must not be offered as this table's restorable
+    # history. Purging before the registry insert (rather than after) means
+    # a genuine purge failure aborts the registration cleanly instead of
+    # committing a row whose "history" can resurrect a previous table's
+    # policy bodies. `RequiresPostgresBackend` is the one exception
+    # swallowed (the frozen DuckDB backend has no store to purge at all);
+    # everything else is a structured 500, matching unregister_table.
+    #
+    # R17-1 (review follow-up) — purge and insert together under the
+    # per-table registry write lock, so a save, a delete and a
+    # re-registration of ONE table id are mutually exclusive: an in-flight
+    # policy save holding the lock can no longer land a revision between
+    # this purge and the row it is clearing the way for.
+    with _access_policy_write_lock(table_id):
+        try:
+            _orphaned = access_policy_revisions_repo().delete_for_table(table_id)
+            if _orphaned:
+                logger.warning(
+                    "register_table: purged %d orphaned access-policy revision(s) for reused table id %s",
+                    _orphaned,
+                    table_id,
+                )
+        except RequiresPostgresBackend:
+            pass
+        except Exception as e:
+            logger.error(
+                "Could not purge pre-existing access-policy revisions for newly "
+                "registered table %s before inserting the registry row -- "
+                "aborting the registration rather than risk offering a previous "
+                "table's history as this one's: %s",
+                table_id,
+                e,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail={"reason": "access_policy_revision_purge_failed", "table": table_id},
+            )
+
+        repo.register(
+            id=table_id,
+            name=request.name,
+            folder=request.folder,
+            sync_strategy=request.sync_strategy,
+            primary_key=request.primary_key,
+            description=request.description,
+            registered_by=user.get("email"),
+            source_type=request.source_type,
+            bucket=request.bucket,
+            source_table=request.source_table,
+            source_query=request.source_query,
+            query_mode=request.query_mode,
+            sync_schedule=request.sync_schedule,
+            # v26 sync-strategy support fields. None for non-Keboola or
+            # full_refresh tables; persisted as NULL.
+            incremental_window_days=request.incremental_window_days,
+            max_history_days=request.max_history_days,
+            incremental_column=request.incremental_column,
+            where_filters=request.where_filters,
+            partition_by=request.partition_by,
+            partition_granularity=request.partition_granularity,
+            initial_load_chunk_days=request.initial_load_chunk_days,
+            bq_fqn=request.bq_fqn,
+            server_only=request.server_only,
+            connection_id=request.connection_id,
+        )
 
     # Audit entry — masked params; description kept raw (it's documentation).
     audit_repo().log(
@@ -5936,7 +6407,10 @@ def _policy_physical_source_signals(row: Dict[str, Any]) -> set:
     same underlying data (table access policies design doc §3.2, "the
     physical-source twin"). A row may carry more than one signal at once
     (e.g. a BigQuery row with both ``bq_fqn`` and ``bucket``/``source_table``
-    set); two rows collide when their signal sets intersect at all.
+    set); two rows collide when their signal sets intersect at all — through
+    ``_physical_signals_conflict`` below, never a bare ``&``, because the
+    ``bucket_table`` signal's ``connection_id`` component needs wildcard
+    matching that a plain set intersection can't express (see there).
     """
     signals: set = set()
     bq_fqn = (row.get("bq_fqn") or "").strip().lower()
@@ -5971,6 +6445,52 @@ def _policy_physical_source_signals(row: Dict[str, Any]) -> set:
     return signals
 
 
+def _bucket_table_signals_conflict(a: tuple, b: tuple) -> bool:
+    """Whether two ``("bucket_table", source_type, connection_id, bucket,
+    source_table)`` signals point at the same physical source, for the
+    physical-source-twin check ONLY.
+
+    An unpinned ``connection_id`` (``""`` — the default a registration that
+    never mentions ``connection_id`` gets) means "any connection of that
+    source type" here: a real repro showed a second registry row over the
+    same Keboola bucket/table with ``connection_id`` omitted sailing past
+    the twin check, because ``(keboola, "", b, t)`` does not literally equal
+    ``(keboola, <uuid>, b, t)``. Matching wildcards both ways (either side
+    blank) closes that gap regardless of which row -- the policied one or
+    the twin -- happens to carry the pin. Two rows that both pin DIFFERENT
+    non-empty connection_ids are still genuinely different projects and do
+    NOT conflict; this does not change how ``connection_id`` is stored or
+    resolved anywhere else, only how this one check reads it.
+    """
+    _, a_type, a_conn, a_bucket, a_table = a
+    _, b_type, b_conn, b_bucket, b_table = b
+    if a_type != b_type or a_bucket != b_bucket or a_table != b_table:
+        return False
+    return a_conn == b_conn or not a_conn or not b_conn
+
+
+def _physical_signals_conflict(signals_a: set, signals_b: set) -> bool:
+    """Whether two physical-source signal sets (``_policy_physical_source_
+    signals``) resolve to the same underlying data. Exact-match for
+    ``bq_fqn``/``source_query`` signals; ``bucket_table`` signals go
+    through ``_bucket_table_signals_conflict``'s wildcard ``connection_id``
+    rule. Every twin-check call site MUST go through this — a bare ``&``
+    only catches the exact-pin and both-unpinned cases, missing the
+    pinned/unpinned mix a live instance actually hit.
+    """
+    for sig_a in signals_a:
+        for sig_b in signals_b:
+            if sig_a == sig_b:
+                return True
+            if (
+                sig_a[0] == "bucket_table"
+                and sig_b[0] == "bucket_table"
+                and _bucket_table_signals_conflict(sig_a, sig_b)
+            ):
+                return True
+    return False
+
+
 def _is_distributable_registry_row(row: Dict[str, Any]) -> bool:
     """Whether ``row`` is the shape ``agnes pull`` downloads —
     ``query_mode in ('local', 'materialized')`` and not ``server_only``.
@@ -5998,7 +6518,7 @@ def _find_policied_physical_source_twin(
     for other in table_registry_repo().list_all():
         if other.get("id") == exclude_id or not other.get("access_policy_sql"):
             continue
-        if my_signals & _policy_physical_source_signals(other):
+        if _physical_signals_conflict(my_signals, _policy_physical_source_signals(other)):
             return other
     return None
 
@@ -6030,7 +6550,7 @@ def _find_unpolicied_physical_source_twin(
     for other in table_registry_repo().list_all():
         if other.get("id") == exclude_id or other.get("access_policy_sql"):
             continue
-        if my_signals & _policy_physical_source_signals(other):
+        if _physical_signals_conflict(my_signals, _policy_physical_source_signals(other)):
             return other
     return None
 
@@ -6137,7 +6657,11 @@ def _check_access_policy_physical_source_conflict(
                 "source returns the unfiltered rows to anyone granted it, "
                 "so attach a policy to this row too, point it at a "
                 "different physical source, unregister one of the two rows, "
-                "or read the policied table by its own name"
+                "or read the policied table by its own name. If this is "
+                "genuinely a different source connection reusing the same "
+                "bucket/table label, pin connection_id on both rows to "
+                "disambiguate -- an unpinned connection_id matches any "
+                "connection of that source type for this check"
             ),
         )
 
@@ -6197,8 +6721,186 @@ def _check_policied_row_has_no_unpolicied_twin(merged: Dict[str, Any], *, table_
                 f"(query_mode={str(other.get('query_mode') or 'local')!r}, "
                 f"server_only={bool(other.get('server_only'))}), so {reach} "
                 "-- attach a policy to that row, unregister it, or point it "
-                "at a different physical source, then attach this policy"
+                "at a different physical source, then attach this policy. "
+                "If this is genuinely a different source connection reusing "
+                "the same bucket/table label, pin connection_id on both rows "
+                "to disambiguate -- an unpinned connection_id matches any "
+                "connection of that source type for this check"
             ),
+        )
+
+
+def _coerce_policy_timestamp(value: Any) -> Optional[datetime]:
+    """``table_registry.access_policy_updated_at`` as an aware datetime.
+
+    The column round-trips as a datetime on both backends, but a row read
+    back through a JSON-ish path can arrive as an ISO string — and this
+    value only ever feeds the BACKFILLED baseline revision's ``saved_at``,
+    where "unparseable" must degrade to "stamp it now" rather than to a
+    lost revision.
+    """
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    return None
+
+
+def _access_policy_write_lock(table_id: str):
+    """The per-table REGISTRY WRITE lock — every write to one table id.
+
+    Named for the policy write it was introduced for (#1979), but its scope
+    is wider since the R17 review follow-up: a policy save, an ordinary
+    registry PUT, a DELETE and a re-registration of ONE table id are now all
+    mutually exclusive. The mechanism is the revision store's
+    ``policy_write_lock`` — a transaction-scoped Postgres advisory lock keyed
+    on the table id — and it is what makes each of these safe:
+
+    * ``update_table`` reads the row, merges this PUT's fields onto it and
+      upserts EVERY column back, so two concurrent PUTs touching disjoint
+      fields each wrote the other's stale value back (R17-2). Holding the
+      lock across the whole read -> validate -> write makes the second PUT
+      merge onto the first one's committed row.
+    * ``unregister_table`` purges the table's revision bodies and drops its
+      row; ``register_table`` purges any orphan under a reused id and
+      inserts. Unserialized, a save already past the lock could append a
+      revision after either purge, stranding history under a dead id (R17-1).
+    * the policy write and its history append stay ORDERED, the original
+      reason: without it two savers could commit policy A, commit policy B,
+      record B, then record A — a history whose newest revision (A) is not
+      the stored policy (B).
+
+    **Ordering, not coupling.** The lock does not put the policy write and
+    the history append into one transaction: each keeps its own, exactly as
+    before. So the interaction between best-effort history and atomicity is
+    that there is none — a revision that cannot be written is still just a
+    missing history row (``_record_access_policy_revision`` swallows it), and
+    the policy save it belongs to has already landed. What the lock buys is
+    only that concurrent writers of ONE table cannot interleave their steps
+    into a contradictory order.
+
+    **What it costs.** Writes to the SAME table id serialize; writes to
+    DIFFERENT tables never wait on each other, because the advisory lock is
+    keyed on the table id. Two admins editing one table were already racing
+    — one of them was silently losing their edit — so the serialization
+    replaces a lost write, not a concurrent one. The other cost is a pooled
+    Postgres connection held for the duration of the guarded section (the
+    lock lives in a transaction), which is why the DELETE releases it before
+    its filesystem and ``sync_state`` cleanup: no other writer of that id
+    contends for those.
+
+    When there is no revision store — a DuckDB-backed instance, where
+    resolving the PG-only repo raises ``RequiresPostgresBackend`` — this
+    returns ``nullcontext()`` and every one of those writes runs exactly as
+    it did before the lock existed. That is deliberate: the frozen DuckDB
+    app-state backend is single-process/single-writer by contract, so there
+    is no cross-process race to close there, and the A3 ratchet says not to
+    extend it. The ability to narrow access to a table must also never
+    depend on the history feature being available.
+    """
+    try:
+        return access_policy_revisions_repo().policy_write_lock(table_id)
+    except RequiresPostgresBackend:
+        return contextlib.nullcontext()
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning(
+            "Could not take the access-policy write lock for %s: %s -- saving unserialized",
+            table_id,
+            e,
+        )
+        return contextlib.nullcontext()
+
+
+def _norm_policy_text(value: Optional[str]) -> Optional[str]:
+    """Fold the two ways "no value" arrives for an access-policy text field
+    into one, so a comparison against the stored row does not read a
+    round-tripped empty string as an edit.
+
+    The Edit modal serializes an untouched empty textarea as ``""`` while
+    the registry stores ``NULL``; whitespace-only is the same nothing. A
+    genuine clear (a real body -> ``None``/``""``) still compares as a
+    change, because the OTHER side is a real body.
+    """
+    if value is None:
+        return None
+    stripped = value.strip()
+    return stripped or None
+
+
+def _record_access_policy_revision(
+    table_id: str,
+    *,
+    existing: Dict[str, Any],
+    policy_sql: Optional[str],
+    policy_note: Optional[str],
+    policy_mapping: bool,
+    saved_by: Optional[str],
+) -> None:
+    """Append the state a table's access policy was just saved in (#1979).
+
+    Called from ``update_table`` right after the state was persisted, i.e.
+    on exactly the writes the history panel is about: a write through
+    ``set_access_policy`` (attach, edit, clear), and a write through
+    ``set_policy_mapping`` that actually FLIPPED the "referenceable from
+    other policies" switch — a revision carries ``policy_mapping`` and the
+    panel's diff calls a mapping toggle out by name, so a mapping-only edit
+    that recorded nothing would leave the panel diffing against a state
+    nothing ever recorded. Never called for a PUT that merely carried the
+    policy fields through untouched, mapping included: a no-op resend (the
+    Edit modal round-trips every field) must not manufacture a revision.
+
+    **Never load-bearing.** ``access_policy_revisions`` is a post-A3 PG-only
+    table, so on a DuckDB-backed instance resolving it raises
+    ``RequiresPostgresBackend``; that (and any other failure) is swallowed
+    here. An admin narrowing access to a table must never be blocked
+    because the history of that change could not be written — and the modal
+    already degrades to the audit-derived, read-only history when this
+    store is absent.
+
+    **The baseline backfill.** A table whose policy was attached before this
+    store existed has no revision for it, so the first write after that
+    would overwrite a body nothing ever recorded — precisely the loss this
+    feature exists to prevent. When the table has no revisions yet and IS
+    carrying a policy, the state being replaced is recorded first, dated
+    with its own ``access_policy_updated_at`` and attributed to its own
+    ``access_policy_updated_by``: a history that re-dates or re-attributes
+    the past is worse than one that is short.
+    """
+    try:
+        repo = access_policy_revisions_repo()
+    except RequiresPostgresBackend:
+        return
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning("Could not resolve the access-policy revision store for %s: %s", table_id, e)
+        return
+
+    try:
+        if not repo.count_for_table(table_id) and existing.get("access_policy_sql"):
+            repo.record(
+                table_id=table_id,
+                policy_sql=existing.get("access_policy_sql"),
+                policy_note=existing.get("access_policy_note"),
+                policy_mapping=bool(existing.get("policy_mapping")),
+                saved_by=existing.get("access_policy_updated_by"),
+                saved_at=_coerce_policy_timestamp(existing.get("access_policy_updated_at")),
+            )
+        repo.record(
+            table_id=table_id,
+            policy_sql=policy_sql,
+            policy_note=policy_note,
+            policy_mapping=bool(policy_mapping),
+            saved_by=saved_by,
+        )
+    except Exception as e:
+        logger.warning(
+            "Access policy for %s was saved, but its revision could not be recorded: %s "
+            "-- the policy itself is persisted; only its history entry is missing",
+            table_id,
+            e,
         )
 
 
@@ -6216,485 +6918,605 @@ async def update_table(
     up changes (e.g. a renamed dataset) without waiting for the next
     scheduled sync.
     """
-    repo = table_registry_repo()
-    existing = repo.get(table_id)
-    if not existing:
-        raise HTTPException(status_code=404, detail="Table not found")
-
-    # v79 — validate connection_id FK before persisting, mirroring
-    # register_table. Checked directly against the request field (not
-    # `updates`) so an explicit `connection_id: null` (meaning "use the
-    # default connection") is treated the same as omission -- both skip
-    # the FK lookup, and an omitted field never clobbers the stored value
-    # once `updates`/`merged` below apply exclude_unset=True.
-    if request.connection_id is not None:
-        from src.repositories import source_connections_repo
-
-        if source_connections_repo().get(request.connection_id) is None:
-            raise HTTPException(
-                status_code=400,
-                detail=f"connection_id '{request.connection_id}' not found in source_connections",
-            )
-
-    # `exclude_unset=True` honors the PUT-shape distinction between
-    # "field omitted from body" (keep existing) vs "field sent as null"
-    # (clear to NULL). Pre-v26 the handler used `model_dump()` filtered by
-    # `if v is not None`, which collapsed both cases to "omitted" — meaning
-    # an admin couldn't clear a field via PUT. v26 needs the clear path so
-    # the Edit modal can switch a partitioned row back to full_refresh and
-    # have the stale partition_by / partition_granularity / max_history_days
-    # actually go away (without this fix, those fields linger and either
-    # confuse the dispatcher or trip the v26 conflict-policy validator on
-    # the next edit).
+    # R17-2 (review follow-up on PR #2023) — the WHOLE read -> validate ->
+    # write sequence below runs under the per-table registry write lock, not
+    # just the policy setters the lock was introduced for. This handler
+    # upserts EVERY column of the row (``merged`` = the row it read on the
+    # way in, plus this PUT's fields), so two concurrent PUTs touching
+    # disjoint fields each wrote the other's stale value back: a
+    # ``description`` edit silently reverted a ``sync_schedule`` edit saved a
+    # moment earlier, last writer wins, no error anywhere. Reading INSIDE the
+    # lock is what makes the second PUT merge onto the first one's COMMITTED
+    # row instead of onto a pre-lock snapshot of it.
     #
-    # Contract change (Devin Review finding 0001): callers that previously
-    # sent explicit `null` to mean "no-op, keep existing" will now have the
-    # field cleared. In practice this is fine — the only known caller is
-    # the Edit modal, which pre-populates form fields from the existing row
-    # and JSON-encodes the populated (non-null) value back. CLI register-table
-    # only POSTs new rows, never PUTs nulls. If a future client needs the
-    # old "null = no-op" semantics for some field, it should omit the field
-    # from the body instead of sending null — that's the canonical PUT shape.
-    updates = request.model_dump(exclude_unset=True)
-    # View-name / id collision guard, mirrored from register_table's
-    # `existing_by_name` check. `table_registry.name` has no DB-level
-    # uniqueness constraint and register_table only pre-checks it against
-    # OTHER names on the way in (a duplicate matching another row's ID is
-    # already caught there, indirectly, by the derived-id collision check —
-    # PUT never re-derives an id, so that protection doesn't carry over
-    # here). Left unchecked, a rename could collide with another table's
-    # `name` (the original register_table concern: a silent view overwrite
-    # at next rebuild) OR — since B1 — with another table's `id`: every
-    # id-first sync_state/manifest resolver (`app/api/sync.py::_reg_for`,
-    # the distribution mirror job in `app/worker/kinds.py`, this module's
-    # own `list_registry`) tries a raw key against the registry BY ID
-    # before falling back to name, so a legacy name-keyed sync_state row
-    # sharing that string would resolve to the WRONG registry entry.
-    if "name" in updates and updates["name"] != existing.get("name"):
-        new_name = updates["name"]
-        collision = next(
-            (
-                r
-                for r in repo.list_all()
-                if r.get("id") != table_id and ((r.get("name") or "") == new_name or r.get("id") == new_name)
-            ),
-            None,
-        )
-        if collision is not None:
-            raise HTTPException(
-                status_code=409,
-                detail=f"View name '{new_name}' is already in use by table id '{collision.get('id')}'",
-            )
-    # Run BQ-shape validation BEFORE persisting whenever the merged record
-    # would be a bigquery row (existing was BQ, or the patch flips it to BQ,
-    # or the patch touches BQ-relevant fields on an already-BQ row). Without
-    # this gate, an admin could PUT `bucket="evil\"; DROP --"` onto a BQ
-    # row and the next rebuild would silently fail at view-create time —
-    # surface the bad shape at PUT time instead.
-    if updates:
-        # Preserve the original `registered_at` across PUTs — `repo.register`
-        # now accepts it as an optional kwarg; without this the upsert would
-        # stamp a fresh `now()` on every edit (issue #130).
-        merged = dict(existing)
-        merged.update(updates)
-        merged.pop("id", None)  # avoid duplicate id kwarg
+    # The cost is bounded, and was already being paid the hard way: PUTs to
+    # the SAME table id serialize (they were racing before — one of them was
+    # losing its write), while PUTs to DIFFERENT tables never wait on each
+    # other, since the advisory lock is keyed on the table id. On a
+    # DuckDB-backed instance the lock is a ``nullcontext``; that is not a gap
+    # deliberately left open but the frozen app-state backend's own contract
+    # — it is single-process/single-writer — and the A3 ratchet says not to
+    # extend it.
+    with _access_policy_write_lock(table_id):
+        repo = table_registry_repo()
+        existing = repo.get(table_id)
+        if not existing:
+            raise HTTPException(status_code=404, detail="Table not found")
 
-        # v52 + v56: per-table docs fields (sample_questions /
-        # things_to_know / pairs_well_with + grain / platforms /
-        # partition_col / history / gotchas) live on table_registry
-        # but have their own PATCH /registry/{id}/docs endpoint.
-        # ``repo.register()`` doesn't know them; stripping here keeps
-        # the read-modify-write loop the PUT handler relies on
-        # (existing → merged → register) from blowing up with
-        # TypeError when the docs columns are populated.
-        for _docs_key in (
-            "sample_questions",
-            "things_to_know",
-            "pairs_well_with",
-            "grain",
-            "platforms",
-            "partition_col",
-            "history",
-            "gotchas",
-        ):
-            merged.pop(_docs_key, None)
+        # v79 — validate connection_id FK before persisting, mirroring
+        # register_table. Checked directly against the request field (not
+        # `updates`) so an explicit `connection_id: null` (meaning "use the
+        # default connection") is treated the same as omission -- both skip
+        # the FK lookup, and an omitted field never clobbers the stored value
+        # once `updates`/`merged` below apply exclude_unset=True.
+        if request.connection_id is not None:
+            from src.repositories import source_connections_repo
 
-        # v116 — table access policies (access_policy_sql/_note/_updated_at/
-        # _updated_by + policy_mapping) live on table_registry but, like the
-        # docs fields above, are written through their own dedicated setters
-        # (``table_registry_repo().set_access_policy`` / ``.set_policy_mapping``),
-        # not ``register()``. Unlike the docs fields, the interlock below needs
-        # to read these values off ``merged`` first (a PUT that only touches
-        # server_only/query_mode must still be judged against a policy that's
-        # already persisted and simply carried over from ``existing`` here) —
-        # so the strip that keeps ``register()`` from TypeErroring on them runs
-        # much later, immediately before the ``register()`` call itself.
+            if source_connections_repo().get(request.connection_id) is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"connection_id '{request.connection_id}' not found in source_connections",
+                )
 
-        # v74 (#607) — validate the server_only ↔ query_mode invariant
-        # against the *merged* record (the PUT body may toggle either field
-        # independently). server_only=true is only coherent for a row with a
-        # server-stored parquet (local / materialized); a 'remote' row has
-        # none. Mirror the RegisterTableRequest validator at PUT time.
-        if merged.get("server_only") and merged.get("query_mode") == "remote":
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    "server_only=true is only valid for query_mode='local' or "
-                    "'materialized' (a 'remote' table has no server-stored "
-                    "parquet to suppress from agnes pull)"
+        # `exclude_unset=True` honors the PUT-shape distinction between
+        # "field omitted from body" (keep existing) vs "field sent as null"
+        # (clear to NULL). Pre-v26 the handler used `model_dump()` filtered by
+        # `if v is not None`, which collapsed both cases to "omitted" — meaning
+        # an admin couldn't clear a field via PUT. v26 needs the clear path so
+        # the Edit modal can switch a partitioned row back to full_refresh and
+        # have the stale partition_by / partition_granularity / max_history_days
+        # actually go away (without this fix, those fields linger and either
+        # confuse the dispatcher or trip the v26 conflict-policy validator on
+        # the next edit).
+        #
+        # Contract change (Devin Review finding 0001): callers that previously
+        # sent explicit `null` to mean "no-op, keep existing" will now have the
+        # field cleared. In practice this is fine — the only known caller is
+        # the Edit modal, which pre-populates form fields from the existing row
+        # and JSON-encodes the populated (non-null) value back. CLI register-table
+        # only POSTs new rows, never PUTs nulls. If a future client needs the
+        # old "null = no-op" semantics for some field, it should omit the field
+        # from the body instead of sending null — that's the canonical PUT shape.
+        updates = request.model_dump(exclude_unset=True)
+        # Whether this PUT actually CHANGED the stored access policy, and the
+        # values it left behind. Computed inside the `if updates:` block below;
+        # pre-seeded here because the dedicated `access_policy.set`/`.clear`
+        # audit row keys off them AFTER that block, and an empty PUT body never
+        # reaches it.
+        _policy_body_written = False
+        _final_access_policy_sql = existing.get("access_policy_sql")
+        _final_access_policy_note = existing.get("access_policy_note")
+        # View-name / id collision guard, mirrored from register_table's
+        # `existing_by_name` check. `table_registry.name` has no DB-level
+        # uniqueness constraint and register_table only pre-checks it against
+        # OTHER names on the way in (a duplicate matching another row's ID is
+        # already caught there, indirectly, by the derived-id collision check —
+        # PUT never re-derives an id, so that protection doesn't carry over
+        # here). Left unchecked, a rename could collide with another table's
+        # `name` (the original register_table concern: a silent view overwrite
+        # at next rebuild) OR — since B1 — with another table's `id`: every
+        # id-first sync_state/manifest resolver (`app/api/sync.py::_reg_for`,
+        # the distribution mirror job in `app/worker/kinds.py`, this module's
+        # own `list_registry`) tries a raw key against the registry BY ID
+        # before falling back to name, so a legacy name-keyed sync_state row
+        # sharing that string would resolve to the WRONG registry entry.
+        if "name" in updates and updates["name"] != existing.get("name"):
+            new_name = updates["name"]
+            collision = next(
+                (
+                    r
+                    for r in repo.list_all()
+                    if r.get("id") != table_id and ((r.get("name") or "") == new_name or r.get("id") == new_name)
                 ),
+                None,
             )
-
-        # When switching the merged record away from materialized mode, drop
-        # the stale source_query — the request validator can't clear it via
-        # the `if v is not None` filter above. Without this, a remote/local
-        # row would carry an orphan source_query in the registry.
-        if merged.get("query_mode") != "materialized":
-            merged["source_query"] = None
-
-        # Cross-source coherence: query_mode='materialized' + source_query rules:
-        # - bigquery: null OK — server-generates source_query from bucket+source_table.
-        # - keboola:  null OK — null means full-table export (valid at registration too;
-        #             see RegisterTableRequest validator which guards only non-empty sq).
-        # - all others: require an explicit non-empty source_query.
-        if merged.get("query_mode") == "materialized":
-            sq = merged.get("source_query")
-            if not sq or not str(sq).strip():
-                # BQ, Keboola and Snowflake all allow null/empty source_query —
-                # the server generates it from bucket+source_table. All other
-                # source types require an explicit source_query; raise 422.
-                if merged.get("source_type") not in ("bigquery", "keboola", "snowflake"):
-                    raise HTTPException(
-                        status_code=422,
-                        detail=(
-                            "query_mode='materialized' requires a non-empty "
-                            "source_query. To revert to a non-materialized mode, "
-                            "PATCH query_mode='local' (Keboola) or 'remote' "
-                            "(BigQuery) and the stale source_query is cleared "
-                            "automatically."
-                        ),
-                    )
-            # Backtick guard removed for materialized rows: the Task 2 wrapping
-            # path (connectors.bigquery.extractor.materialize_query) now runs
-            # admin SQL through the BQ jobs API using BQ-native syntax, which
-            # requires backticks for dashed project/dataset identifiers.
-            # Non-materialized rows still reject backticks in the model validator.
-
-            # Keboola materialized: source_query must be a JSON filter spec,
-            # not SQL. Validate after the non-empty check above so we know sq
-            # is a non-empty string here.
-            if merged.get("source_type") == "keboola":
-                _sq = str(merged.get("source_query", "") or "").strip()
-                if _sq.upper().startswith(("SELECT", "WITH")):
-                    raise HTTPException(
-                        status_code=422,
-                        detail=(
-                            "Keboola materialized source_query must be a JSON "
-                            "filter spec (columns/whereFilters/changedSince), "
-                            "not SQL. Use null for full-table export, or set "
-                            "query_mode='local' for DuckDB-based Keboola pulls."
-                        ),
-                    )
-                if _sq:
-                    try:
-                        json.loads(_sq)
-                    except json.JSONDecodeError as _e:
-                        raise HTTPException(
-                            status_code=422,
-                            detail=f"Keboola materialized source_query must be valid JSON: {_e}",
-                        ) from _e
-
-        if merged.get("source_type") == "databricks":
-            # Reuse the register-time contract on updates too: the synthetic
-            # runs the model validator (materialized-only gate) and the
-            # payload validator (server-generated source_query), so a PUT
-            # can neither flip a Databricks row out of 'materialized' nor
-            # strand it without runnable SQL.
-            try:
-                synthetic = RegisterTableRequest(
-                    name=merged.get("name") or table_id,
-                    bucket=merged.get("bucket"),
-                    source_table=merged.get("source_table"),
-                    source_query=merged.get("source_query"),
-                    source_type="databricks",
-                    query_mode=merged.get("query_mode") or "materialized",
-                    primary_key=merged.get("primary_key"),
-                    description=merged.get("description"),
-                    folder=merged.get("folder"),
-                    sync_strategy=merged.get("sync_strategy") or "full_refresh",
-                    sync_schedule=merged.get("sync_schedule"),
-                    server_only=bool(merged.get("server_only") or False),
+            if collision is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"View name '{new_name}' is already in use by table id '{collision.get('id')}'",
                 )
-            except ValidationError as e:
-                raise HTTPException(status_code=422, detail=str(e)) from e
-            _validate_databricks_register_payload(synthetic)
-            merged["query_mode"] = synthetic.query_mode
-            merged["source_query"] = synthetic.source_query
+        # Run BQ-shape validation BEFORE persisting whenever the merged record
+        # would be a bigquery row (existing was BQ, or the patch flips it to BQ,
+        # or the patch touches BQ-relevant fields on an already-BQ row). Without
+        # this gate, an admin could PUT `bucket="evil\"; DROP --"` onto a BQ
+        # row and the next rebuild would silently fail at view-create time —
+        # surface the bad shape at PUT time instead.
+        if updates:
+            # Preserve the original `registered_at` across PUTs — `repo.register`
+            # now accepts it as an optional kwarg; without this the upsert would
+            # stamp a fresh `now()` on every edit (issue #130).
+            merged = dict(existing)
+            merged.update(updates)
+            merged.pop("id", None)  # avoid duplicate id kwarg
 
-        if merged.get("source_type") == "snowflake":
-            # Reuse the register-time contract on updates too: validate the
-            # Snowflake shape and server-generate source_query when omitted.
-            try:
-                synthetic = RegisterTableRequest(
-                    name=merged.get("name") or table_id,
-                    bucket=merged.get("bucket"),
-                    source_table=merged.get("source_table"),
-                    source_query=merged.get("source_query"),
-                    source_type="snowflake",
-                    query_mode=merged.get("query_mode") or "materialized",
-                    primary_key=merged.get("primary_key"),
-                    description=merged.get("description"),
-                    folder=merged.get("folder"),
-                    sync_strategy=merged.get("sync_strategy") or "full_refresh",
-                    sync_schedule=merged.get("sync_schedule"),
-                    server_only=bool(merged.get("server_only") or False),
-                )
-            except ValidationError as e:
-                raise HTTPException(status_code=422, detail=str(e)) from e
-            _validate_snowflake_register_payload(synthetic)
-            merged["query_mode"] = synthetic.query_mode
-            merged["source_query"] = synthetic.source_query
+            # v52 + v56: per-table docs fields (sample_questions /
+            # things_to_know / pairs_well_with + grain / platforms /
+            # partition_col / history / gotchas) live on table_registry
+            # but have their own PATCH /registry/{id}/docs endpoint.
+            # ``repo.register()`` doesn't know them; stripping here keeps
+            # the read-modify-write loop the PUT handler relies on
+            # (existing → merged → register) from blowing up with
+            # TypeError when the docs columns are populated.
+            for _docs_key in (
+                "sample_questions",
+                "things_to_know",
+                "pairs_well_with",
+                "grain",
+                "platforms",
+                "partition_col",
+                "history",
+                "gotchas",
+            ):
+                merged.pop(_docs_key, None)
 
-        if merged.get("source_type") == "bigquery":
-            # Reuse the register-time validator. It mutates the request to
-            # force query_mode='remote' / profile_after_sync=False (or to
-            # leave a materialized row alone) — apply the same coercion to
-            # `merged` so the persisted row matches.
-            synthetic = RegisterTableRequest(
-                name=merged.get("name") or table_id,
-                bucket=merged.get("bucket"),
-                source_table=merged.get("source_table"),
-                source_query=merged.get("source_query"),
-                source_type="bigquery",
-                query_mode=merged.get("query_mode") or "remote",
-                profile_after_sync=bool(merged.get("profile_after_sync") or False),
-                primary_key=merged.get("primary_key"),
-                description=merged.get("description"),
-                folder=merged.get("folder"),
-                sync_strategy=merged.get("sync_strategy") or "full_refresh",
-                sync_schedule=merged.get("sync_schedule"),
-                # v74 (#607) — carry server_only into the synthetic so the
-                # validator's post-coercion check fires when this PUT lands
-                # the row in 'remote' mode; the merged-record check above
-                # only saw the pre-coercion query_mode.
-                server_only=bool(merged.get("server_only") or False),
-            )
-            _validate_bigquery_register_payload(synthetic)
-            merged["query_mode"] = synthetic.query_mode
-            merged["profile_after_sync"] = synthetic.profile_after_sync
-            merged["source_query"] = synthetic.source_query
-            # FQN normalization mutates source_table the same way the
-            # validator coerces query_mode — copy it back so the persisted
-            # row carries the bare table name, not the pasted path.
-            merged["source_table"] = synthetic.source_table
+            # v116 — table access policies (access_policy_sql/_note/_updated_at/
+            # _updated_by + policy_mapping) live on table_registry but, like the
+            # docs fields above, are written through their own dedicated setters
+            # (``table_registry_repo().set_access_policy`` / ``.set_policy_mapping``),
+            # not ``register()``. Unlike the docs fields, the interlock below needs
+            # to read these values off ``merged`` first (a PUT that only touches
+            # server_only/query_mode must still be judged against a policy that's
+            # already persisted and simply carried over from ``existing`` here) —
+            # so the strip that keeps ``register()`` from TypeErroring on them runs
+            # much later, immediately before the ``register()`` call itself.
 
-            # v51 — same bq_fqn validation as register-table. PUT can both
-            # add a fresh bq_fqn or update an existing one; in either case
-            # malformed values should reject at PUT time, not silently
-            # land in the DB and break the next rebuild.
-            if merged.get("bq_fqn"):
-                from connectors.bigquery.extractor import parse_bq_fqn
-
-                try:
-                    parse_bq_fqn(merged["bq_fqn"])
-                except ValueError as e:
-                    raise HTTPException(status_code=422, detail=str(e))
-        else:
-            # Non-BQ row carrying bq_fqn is nonsensical — reject the same
-            # way register-table does.
-            if merged.get("bq_fqn"):
+            # v74 (#607) — validate the server_only ↔ query_mode invariant
+            # against the *merged* record (the PUT body may toggle either field
+            # independently). server_only=true is only coherent for a row with a
+            # server-stored parquet (local / materialized); a 'remote' row has
+            # none. Mirror the RegisterTableRequest validator at PUT time.
+            if merged.get("server_only") and merged.get("query_mode") == "remote":
                 raise HTTPException(
                     status_code=422,
-                    detail="bq_fqn only applies to source_type='bigquery'",
+                    detail=(
+                        "server_only=true is only valid for query_mode='local' or "
+                        "'materialized' (a 'remote' table has no server-stored "
+                        "parquet to suppress from agnes pull)"
+                    ),
                 )
 
-        # v116 (table access policies design doc §3.1/§3.2) — evaluated
-        # against the FINAL, fully-normalized ``merged`` record, i.e. AFTER
-        # the BQ coercion above: a PUT that flips query_mode via BQ
-        # coercion must be judged on the post-coercion value, the same
-        # reason the server_only re-check on the BQ synthetic exists
-        # (Devin Review, #630).
-        if "access_policy_sql" in updates and updates["access_policy_sql"] is not None:
-            # Attaching or replacing a policy in THIS request. Clearing
-            # (explicit null, handled by the interlock below via
-            # ``merged``) always stays possible regardless of the flag —
-            # it is a safety valve, not a new grant — so only an actual
-            # non-null SQL body is flag-gated and SQL-validated here.
-            from app.instance_config import feature_enabled
+            # When switching the merged record away from materialized mode, drop
+            # the stale source_query — the request validator can't clear it via
+            # the `if v is not None` filter above. Without this, a remote/local
+            # row would carry an orphan source_query in the registry.
+            if merged.get("query_mode") != "materialized":
+                merged["source_query"] = None
 
-            if not feature_enabled(
-                "access_policies", "enabled", env_var="AGNES_ACCESS_POLICIES_ENABLED", default=False
+            # Cross-source coherence: query_mode='materialized' + source_query rules:
+            # - bigquery: null OK — server-generates source_query from bucket+source_table.
+            # - keboola:  null OK — null means full-table export (valid at registration too;
+            #             see RegisterTableRequest validator which guards only non-empty sq).
+            # - all others: require an explicit non-empty source_query.
+            if merged.get("query_mode") == "materialized":
+                sq = merged.get("source_query")
+                if not sq or not str(sq).strip():
+                    # BQ, Keboola and Snowflake all allow null/empty source_query —
+                    # the server generates it from bucket+source_table. All other
+                    # source types require an explicit source_query; raise 422.
+                    if merged.get("source_type") not in ("bigquery", "keboola", "snowflake"):
+                        raise HTTPException(
+                            status_code=422,
+                            detail=(
+                                "query_mode='materialized' requires a non-empty "
+                                "source_query. To revert to a non-materialized mode, "
+                                "PATCH query_mode='local' (Keboola) or 'remote' "
+                                "(BigQuery) and the stale source_query is cleared "
+                                "automatically."
+                            ),
+                        )
+                # Backtick guard removed for materialized rows: the Task 2 wrapping
+                # path (connectors.bigquery.extractor.materialize_query) now runs
+                # admin SQL through the BQ jobs API using BQ-native syntax, which
+                # requires backticks for dashed project/dataset identifiers.
+                # Non-materialized rows still reject backticks in the model validator.
+
+                # Keboola materialized: source_query must be a JSON filter spec,
+                # not SQL. Validate after the non-empty check above so we know sq
+                # is a non-empty string here.
+                if merged.get("source_type") == "keboola":
+                    _sq = str(merged.get("source_query", "") or "").strip()
+                    if _sq:
+                        # Same validator the register route runs — SQL, invalid
+                        # JSON, and (since #1979) any unknown key are refused
+                        # identically on both paths. The Edit modal's advanced
+                        # JSON editor lands here.
+                        try:
+                            _validate_keboola_filter_spec(_sq)
+                        except ValueError as _e:
+                            raise HTTPException(status_code=422, detail=str(_e)) from _e
+
+            if merged.get("source_type") == "databricks":
+                # Reuse the register-time contract on updates too: the synthetic
+                # runs the model validator (materialized-only gate) and the
+                # payload validator (server-generated source_query), so a PUT
+                # can neither flip a Databricks row out of 'materialized' nor
+                # strand it without runnable SQL.
+                try:
+                    synthetic = RegisterTableRequest(
+                        name=merged.get("name") or table_id,
+                        bucket=merged.get("bucket"),
+                        source_table=merged.get("source_table"),
+                        source_query=merged.get("source_query"),
+                        source_type="databricks",
+                        query_mode=merged.get("query_mode") or "materialized",
+                        primary_key=merged.get("primary_key"),
+                        description=merged.get("description"),
+                        folder=merged.get("folder"),
+                        sync_strategy=merged.get("sync_strategy") or "full_refresh",
+                        sync_schedule=merged.get("sync_schedule"),
+                        server_only=bool(merged.get("server_only") or False),
+                    )
+                except ValidationError as e:
+                    raise HTTPException(status_code=422, detail=str(e)) from e
+                _validate_databricks_register_payload(synthetic)
+                merged["query_mode"] = synthetic.query_mode
+                merged["source_query"] = synthetic.source_query
+
+            if merged.get("source_type") == "snowflake":
+                # Reuse the register-time contract on updates too: validate the
+                # Snowflake shape and server-generate source_query when omitted.
+                try:
+                    synthetic = RegisterTableRequest(
+                        name=merged.get("name") or table_id,
+                        bucket=merged.get("bucket"),
+                        source_table=merged.get("source_table"),
+                        source_query=merged.get("source_query"),
+                        source_type="snowflake",
+                        query_mode=merged.get("query_mode") or "materialized",
+                        primary_key=merged.get("primary_key"),
+                        description=merged.get("description"),
+                        folder=merged.get("folder"),
+                        sync_strategy=merged.get("sync_strategy") or "full_refresh",
+                        sync_schedule=merged.get("sync_schedule"),
+                        server_only=bool(merged.get("server_only") or False),
+                    )
+                except ValidationError as e:
+                    raise HTTPException(status_code=422, detail=str(e)) from e
+                _validate_snowflake_register_payload(synthetic)
+                merged["query_mode"] = synthetic.query_mode
+                merged["source_query"] = synthetic.source_query
+
+            if merged.get("source_type") == "bigquery":
+                # Reuse the register-time validator. It mutates the request to
+                # force query_mode='remote' / profile_after_sync=False (or to
+                # leave a materialized row alone) — apply the same coercion to
+                # `merged` so the persisted row matches.
+                synthetic = RegisterTableRequest(
+                    name=merged.get("name") or table_id,
+                    bucket=merged.get("bucket"),
+                    source_table=merged.get("source_table"),
+                    source_query=merged.get("source_query"),
+                    source_type="bigquery",
+                    query_mode=merged.get("query_mode") or "remote",
+                    profile_after_sync=bool(merged.get("profile_after_sync") or False),
+                    primary_key=merged.get("primary_key"),
+                    description=merged.get("description"),
+                    folder=merged.get("folder"),
+                    sync_strategy=merged.get("sync_strategy") or "full_refresh",
+                    sync_schedule=merged.get("sync_schedule"),
+                    # v74 (#607) — carry server_only into the synthetic so the
+                    # validator's post-coercion check fires when this PUT lands
+                    # the row in 'remote' mode; the merged-record check above
+                    # only saw the pre-coercion query_mode.
+                    server_only=bool(merged.get("server_only") or False),
+                )
+                _validate_bigquery_register_payload(synthetic)
+                merged["query_mode"] = synthetic.query_mode
+                merged["profile_after_sync"] = synthetic.profile_after_sync
+                merged["source_query"] = synthetic.source_query
+                # FQN normalization mutates source_table the same way the
+                # validator coerces query_mode — copy it back so the persisted
+                # row carries the bare table name, not the pasted path.
+                merged["source_table"] = synthetic.source_table
+
+                # v51 — same bq_fqn validation as register-table. PUT can both
+                # add a fresh bq_fqn or update an existing one; in either case
+                # malformed values should reject at PUT time, not silently
+                # land in the DB and break the next rebuild.
+                if merged.get("bq_fqn"):
+                    from connectors.bigquery.extractor import parse_bq_fqn
+
+                    try:
+                        parse_bq_fqn(merged["bq_fqn"])
+                    except ValueError as e:
+                        raise HTTPException(status_code=422, detail=str(e))
+            else:
+                # Non-BQ row carrying bq_fqn is nonsensical — reject the same
+                # way register-table does.
+                if merged.get("bq_fqn"):
+                    raise HTTPException(
+                        status_code=422,
+                        detail="bq_fqn only applies to source_type='bigquery'",
+                    )
+
+            # v116 (table access policies design doc §3.1/§3.2) — evaluated
+            # against the FINAL, fully-normalized ``merged`` record, i.e. AFTER
+            # the BQ coercion above: a PUT that flips query_mode via BQ
+            # coercion must be judged on the post-coercion value, the same
+            # reason the server_only re-check on the BQ synthetic exists
+            # (Devin Review, #630).
+            if "access_policy_sql" in updates and updates["access_policy_sql"] is not None:
+                # Attaching or replacing a policy in THIS request. Clearing
+                # (explicit null, handled by the interlock below via
+                # ``merged``) always stays possible regardless of the flag —
+                # it is a safety valve, not a new grant — so only an actual
+                # non-null SQL body is flag-gated and SQL-validated here.
+                from app.instance_config import feature_enabled
+
+                if not feature_enabled(
+                    "access_policies", "enabled", env_var="AGNES_ACCESS_POLICIES_ENABLED", default=False
+                ):
+                    raise HTTPException(
+                        status_code=422,
+                        detail=(
+                            "access_policies_disabled: table access policies are not "
+                            "enabled on this instance -- set access_policies.enabled=true "
+                            "(or AGNES_ACCESS_POLICIES_ENABLED=1) before attaching one"
+                        ),
+                    )
+
+                from src.access_policy_validate import PolicyValidationError, validate_policy_sql
+
+                _mapping_table_names = {
+                    r["name"] for r in table_registry_repo().list_all() if r.get("policy_mapping") and r.get("name")
+                }
+                try:
+                    validate_policy_sql(
+                        updates["access_policy_sql"],
+                        table_id=table_id,
+                        table_name=merged.get("name") or table_id,
+                        mapping_table_names=_mapping_table_names,
+                        for_remote=(merged.get("query_mode") == "remote"),
+                    )
+                except PolicyValidationError as e:
+                    raise HTTPException(status_code=422, detail=f"{e.reason}: {e.detail}") from e
+
+            # §4 (Task 14) — access_policy_note is MANDATORY whenever a non-null
+            # access_policy_sql is attached or replaced. Tasks 2/4 deliberately
+            # left this to the API layer: the repository setter accepts sql and
+            # note independently (a future non-HTTP caller may have its own
+            # reason to write without one), but every write through THIS
+            # endpoint must explain why the policy exists — the inheriting
+            # admin who finds forty lines of SQL joining `user_access` otherwise
+            # has no way to tell "legal requirement" from "hunch", and the safe
+            # move is always "leave it alone", so an unexplained policy
+            # calcifies (§4's own reasoning).
+            #
+            # Evaluated against the MERGED/final record, like the §3.1/§3.2
+            # interlocks below — not merely "did THIS PUT's body include a
+            # note" — so a SEPARATE PUT that blanks only access_policy_note
+            # while access_policy_sql stays attached is caught too (a naive
+            # "only check when this PUT touches sql" rule would miss exactly
+            # that "one toggle away" shape). Clearing the policy itself
+            # (access_policy_sql explicit null) short-circuits this — merged
+            # carries no sql, so nothing to explain — the same safety-valve
+            # carve-out the flag gate above already gives clearing.
+            if merged.get("access_policy_sql") and not (merged.get("access_policy_note") or "").strip():
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "policy_note_required: access_policy_note is required whenever "
+                        "access_policy_sql is set -- explain why this policy exists so the "
+                        "next admin to find it knows whether it's safe to change"
+                    ),
+                )
+
+            # §3.1 — the interlock itself: a policy (attached by this PUT, or
+            # already persisted and simply left untouched by it) may only
+            # survive on a merged record that is 'remote' or server_only=true.
+            # One check catches both directions the design doc names —
+            # attaching a policy to a distributed table, AND clearing
+            # server_only / moving query_mode to 'local' on an already-policied
+            # one — because both leave the SAME incoherent shape: a policy on a
+            # row `agnes pull` would otherwise download unfiltered.
+            if (
+                merged.get("access_policy_sql")
+                and merged.get("query_mode") != "remote"
+                and not merged.get("server_only")
             ):
                 raise HTTPException(
                     status_code=422,
                     detail=(
-                        "access_policies_disabled: table access policies are not "
-                        "enabled on this instance -- set access_policies.enabled=true "
-                        "(or AGNES_ACCESS_POLICIES_ENABLED=1) before attaching one"
+                        "access_policy_requires_undistributed: a table carrying an access "
+                        "policy must stay undistributed (query_mode='remote' or "
+                        "server_only=true), so the policy can't be routed around via agnes "
+                        "pull -- set server_only=true first, attach the policy to a "
+                        "query_mode='remote' table instead, or clear access_policy_sql "
+                        "before making this table distributable"
                     ),
                 )
 
-            from src.access_policy_validate import PolicyValidationError, validate_policy_sql
+            # §3.2 — the physical-source twin: a DIFFERENT row with no policy of
+            # its own, pointing at the exact same physical source as an existing
+            # policied table, hands every granted analyst the raw rows the policy
+            # exists to withhold — through `agnes pull` when it is distributable,
+            # and through `/api/query` resolving its name server-side when it is
+            # not. Runs on every write that leaves the merged row UNPOLICIED (the
+            # earlier draft keyed on distributability, which a live instance
+            # disproved), independent of which fields this particular PUT changed —
+            # the danger is the merged row's current shape, not the delta. Shared
+            # with register_table's own call to the same helper, so a brand-new twin
+            # is caught at registration too, not only here.
+            _check_access_policy_physical_source_conflict(
+                source_type=merged.get("source_type"),
+                connection_id=merged.get("connection_id"),
+                bucket=merged.get("bucket"),
+                source_table=merged.get("source_table"),
+                bq_fqn=merged.get("bq_fqn"),
+                source_query=merged.get("source_query"),
+                query_mode=merged.get("query_mode"),
+                server_only=bool(merged.get("server_only")),
+                has_access_policy=bool(merged.get("access_policy_sql")),
+                # Wording only — see the helper. A PUT that REMOVES a policy is
+                # still refused while another policied row covers the same source
+                # (that is the disclosure), but the default message tells the admin
+                # to attach a policy they are in the middle of removing.
+                clearing_policy=bool(existing.get("access_policy_sql")) and not merged.get("access_policy_sql"),
+                exclude_id=table_id,
+            )
 
-            _mapping_table_names = {
-                r["name"] for r in table_registry_repo().list_all() if r.get("policy_mapping") and r.get("name")
-            }
-            try:
-                validate_policy_sql(
-                    updates["access_policy_sql"],
-                    table_id=table_id,
-                    table_name=merged.get("name") or table_id,
-                    mapping_table_names=_mapping_table_names,
-                    for_remote=(merged.get("query_mode") == "remote"),
+            # §3.2, the OTHER direction — the check just above is structurally
+            # blind to it. It returns early whenever the row it is called for
+            # carries a policy of its own, which on the attach path is always the
+            # case, so it can only ever reject the TWIN's own write. A twin
+            # registered BEFORE the policy existed is never PUT again, so nothing
+            # would ever run that check for it: scan for one here instead.
+            _check_policied_row_has_no_unpolicied_twin(merged, table_id=table_id)
+
+            # §14.6 — the live LIMIT 0 execution probe. Runs LAST among the
+            # policy-write checks: after static validation (rule 1-5, above)
+            # AND after the §3.1/§3.2 interlocks, so a table this PUT would be
+            # rejected for on distribution grounds gets that specific, cheaper
+            # rejection instead of a probe failure — and never pays for a live
+            # DuckDB execution it was always going to reject anyway. Static
+            # analysis alone cannot catch a policy that references a column
+            # the underlying table has since dropped (or never had) — this
+            # turns that failure into a rejected write here, instead of the
+            # first analyst's request.
+            if "access_policy_sql" in updates and updates["access_policy_sql"] is not None:
+                from src.access_policy_validate import PolicyValidationError, probe_policy
+                from src.db import get_analytics_db_readonly
+
+                probe_conn = get_analytics_db_readonly()
+                try:
+                    probe_policy(updates["access_policy_sql"], table_id, probe_conn)
+                except PolicyValidationError as e:
+                    raise HTTPException(status_code=422, detail=f"{e.reason}: {e.detail}") from e
+                finally:
+                    probe_conn.close()
+
+            # Strip the policy fields out of ``merged`` now that every check
+            # above has been evaluated against them (register() doesn't accept
+            # them — see the v116 comment above). What gets PERSISTED for those
+            # fields is re-derived under the write lock below, against the
+            # registry row as it is THERE rather than against this pre-lock
+            # snapshot.
+            for _policy_key in (
+                "access_policy_sql",
+                "access_policy_note",
+                "access_policy_updated_at",
+                "access_policy_updated_by",
+                "policy_mapping",
+                # semantic-phase5 wave 1/2 — system-managed auto-draft dedup
+                # bookkeeping, not a human-editable PUT field. register() doesn't
+                # accept it; it has its own setters
+                # (mark_semantic_draft_pending / clear_semantic_draft_pending).
+                "semantic_draft_pending_at",
+            ):
+                merged.pop(_policy_key, None)
+
+            repo.register(id=table_id, **merged)
+
+            # finding 1 (follow-up review of PR #2023) — the policy write and its
+            # history append are ordered by the SAME per-table lock this whole
+            # handler holds (see the top of the function). Without it, two
+            # concurrent PUTs on this table could commit policy A, commit policy
+            # B, record B, then record A: a history whose newest revision is not
+            # the stored policy. Ordering, not coupling — the two steps keep
+            # their own transactions, so a history append that fails still leaves
+            # the policy saved (see ``_access_policy_write_lock`` and
+            # ``_record_access_policy_revision``).
+            # finding 3 (third follow-up review of PR #2023) — this PUT's
+            # policy fields merge onto the registry row as it is INSIDE the
+            # lock, never onto a snapshot taken before it. Otherwise: request
+            # A edits the body and commits under the lock; request B (a
+            # mapping-only flip) computed its finals from the pre-A row,
+            # takes the lock, and writes back — and records — A's PREDECESSOR
+            # body, so the newest revision holds a policy nobody saved and
+            # "restore this version" restores the wrong one.
+            #
+            # ``existing`` IS that under-lock row since R17-2 widened the
+            # lock over the whole handler, so the separate re-read this block
+            # used to do is gone: one read, and nothing can write the policy
+            # columns between it and the setters below. The only intervening
+            # write is ``repo.register()`` above, whose upsert names every
+            # column EXCEPT ``access_policy_*``/``policy_mapping`` (those
+            # have their own setters, which is why they were stripped out of
+            # ``merged``) — so it provably cannot move what is read here.
+            _final_access_policy_sql = (
+                updates["access_policy_sql"] if "access_policy_sql" in updates else existing.get("access_policy_sql")
+            )
+            _final_access_policy_note = (
+                updates["access_policy_note"] if "access_policy_note" in updates else existing.get("access_policy_note")
+            )
+            # finding 1 (second follow-up review of PR #2023) -- keyed on an
+            # ACTUAL change, not on the mere presence of the keys. The Edit
+            # modal round-trips every field, so a save that touched something
+            # else entirely re-sends the identical policy body + note;
+            # treating that as a write re-stamped ``access_policy_updated_at``
+            # /``_updated_by``, emitted a dedicated ``access_policy.set``
+            # audit row, and appended a history revision that changed nothing
+            # -- three lies about a policy nobody edited. Compares the FINAL
+            # value against the stored one, exactly like the
+            # ``policy_mapping`` sibling just below. ``_norm_policy_text``
+            # folds ``None`` and ``""`` together so a cleared note reads as
+            # cleared on both sides, while a genuine clear (a real body ->
+            # ``None``) still counts as a change.
+            _policy_body_written = ("access_policy_sql" in updates or "access_policy_note" in updates) and (
+                _norm_policy_text(_final_access_policy_sql) != _norm_policy_text(existing.get("access_policy_sql"))
+                or _norm_policy_text(_final_access_policy_note) != _norm_policy_text(existing.get("access_policy_note"))
+            )
+            _final_policy_mapping = bool(
+                updates["policy_mapping"] if "policy_mapping" in updates else existing.get("policy_mapping")
+            )
+            # finding 2 (follow-up review of PR #2023) — a mapping-only edit
+            # is a policy edit as far as the history is concerned: a revision
+            # stores ``policy_mapping`` and the panel's diff names a mapping
+            # toggle explicitly. Only an ACTUAL flip counts, though — the Edit
+            # modal round-trips every field, so `"policy_mapping" in updates`
+            # alone would fill the history with rows that changed nothing.
+            _policy_mapping_flipped = "policy_mapping" in updates and _final_policy_mapping != bool(
+                existing.get("policy_mapping")
+            )
+
+            # Persist the access-policy fields through their dedicated setters
+            # (Task 2's set_access_policy/set_policy_mapping) — only called when
+            # this PUT actually touched one of them, so an unrelated edit never
+            # re-stamps access_policy_updated_at.
+            if _policy_body_written:
+                repo.set_access_policy(
+                    table_id,
+                    sql=_final_access_policy_sql,
+                    note=_final_access_policy_note,
+                    updated_by=user.get("email"),
                 )
-            except PolicyValidationError as e:
-                raise HTTPException(status_code=422, detail=f"{e.reason}: {e.detail}") from e
+            if _policy_mapping_flipped:
+                repo.set_policy_mapping(table_id, _final_policy_mapping)
 
-        # §4 (Task 14) — access_policy_note is MANDATORY whenever a non-null
-        # access_policy_sql is attached or replaced. Tasks 2/4 deliberately
-        # left this to the API layer: the repository setter accepts sql and
-        # note independently (a future non-HTTP caller may have its own
-        # reason to write without one), but every write through THIS
-        # endpoint must explain why the policy exists — the inheriting
-        # admin who finds forty lines of SQL joining `user_access` otherwise
-        # has no way to tell "legal requirement" from "hunch", and the safe
-        # move is always "leave it alone", so an unexplained policy
-        # calcifies (§4's own reasoning).
-        #
-        # Evaluated against the MERGED/final record, like the §3.1/§3.2
-        # interlocks below — not merely "did THIS PUT's body include a
-        # note" — so a SEPARATE PUT that blanks only access_policy_note
-        # while access_policy_sql stays attached is caught too (a naive
-        # "only check when this PUT touches sql" rule would miss exactly
-        # that "one toggle away" shape). Clearing the policy itself
-        # (access_policy_sql explicit null) short-circuits this — merged
-        # carries no sql, so nothing to explain — the same safety-valve
-        # carve-out the flag gate above already gives clearing.
-        if merged.get("access_policy_sql") and not (merged.get("access_policy_note") or "").strip():
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    "policy_note_required: access_policy_note is required whenever "
-                    "access_policy_sql is set -- explain why this policy exists so the "
-                    "next admin to find it knows whether it's safe to change"
-                ),
-            )
-
-        # §3.1 — the interlock itself: a policy (attached by this PUT, or
-        # already persisted and simply left untouched by it) may only
-        # survive on a merged record that is 'remote' or server_only=true.
-        # One check catches both directions the design doc names —
-        # attaching a policy to a distributed table, AND clearing
-        # server_only / moving query_mode to 'local' on an already-policied
-        # one — because both leave the SAME incoherent shape: a policy on a
-        # row `agnes pull` would otherwise download unfiltered.
-        if merged.get("access_policy_sql") and merged.get("query_mode") != "remote" and not merged.get("server_only"):
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    "access_policy_requires_undistributed: a table carrying an access "
-                    "policy must stay undistributed (query_mode='remote' or "
-                    "server_only=true), so the policy can't be routed around via agnes "
-                    "pull -- set server_only=true first, attach the policy to a "
-                    "query_mode='remote' table instead, or clear access_policy_sql "
-                    "before making this table distributable"
-                ),
-            )
-
-        # §3.2 — the physical-source twin: a DIFFERENT row with no policy of
-        # its own, pointing at the exact same physical source as an existing
-        # policied table, hands every granted analyst the raw rows the policy
-        # exists to withhold — through `agnes pull` when it is distributable,
-        # and through `/api/query` resolving its name server-side when it is
-        # not. Runs on every write that leaves the merged row UNPOLICIED (the
-        # earlier draft keyed on distributability, which a live instance
-        # disproved), independent of which fields this particular PUT changed —
-        # the danger is the merged row's current shape, not the delta. Shared
-        # with register_table's own call to the same helper, so a brand-new twin
-        # is caught at registration too, not only here.
-        _check_access_policy_physical_source_conflict(
-            source_type=merged.get("source_type"),
-            connection_id=merged.get("connection_id"),
-            bucket=merged.get("bucket"),
-            source_table=merged.get("source_table"),
-            bq_fqn=merged.get("bq_fqn"),
-            source_query=merged.get("source_query"),
-            query_mode=merged.get("query_mode"),
-            server_only=bool(merged.get("server_only")),
-            has_access_policy=bool(merged.get("access_policy_sql")),
-            # Wording only — see the helper. A PUT that REMOVES a policy is
-            # still refused while another policied row covers the same source
-            # (that is the disclosure), but the default message tells the admin
-            # to attach a policy they are in the middle of removing.
-            clearing_policy=bool(existing.get("access_policy_sql")) and not merged.get("access_policy_sql"),
-            exclude_id=table_id,
-        )
-
-        # §3.2, the OTHER direction — the check just above is structurally
-        # blind to it. It returns early whenever the row it is called for
-        # carries a policy of its own, which on the attach path is always the
-        # case, so it can only ever reject the TWIN's own write. A twin
-        # registered BEFORE the policy existed is never PUT again, so nothing
-        # would ever run that check for it: scan for one here instead.
-        _check_policied_row_has_no_unpolicied_twin(merged, table_id=table_id)
-
-        # §14.6 — the live LIMIT 0 execution probe. Runs LAST among the
-        # policy-write checks: after static validation (rule 1-5, above)
-        # AND after the §3.1/§3.2 interlocks, so a table this PUT would be
-        # rejected for on distribution grounds gets that specific, cheaper
-        # rejection instead of a probe failure — and never pays for a live
-        # DuckDB execution it was always going to reject anyway. Static
-        # analysis alone cannot catch a policy that references a column
-        # the underlying table has since dropped (or never had) — this
-        # turns that failure into a rejected write here, instead of the
-        # first analyst's request.
-        if "access_policy_sql" in updates and updates["access_policy_sql"] is not None:
-            from src.access_policy_validate import PolicyValidationError, probe_policy
-            from src.db import get_analytics_db_readonly
-
-            probe_conn = get_analytics_db_readonly()
-            try:
-                probe_policy(updates["access_policy_sql"], table_id, probe_conn)
-            except PolicyValidationError as e:
-                raise HTTPException(status_code=422, detail=f"{e.reason}: {e.detail}") from e
-            finally:
-                probe_conn.close()
-
-        # Capture the fully-validated policy fields before stripping them
-        # out of ``merged`` (register() doesn't accept them — see the v116
-        # comment above) so the setter calls after register() below persist
-        # exactly what was just validated.
-        _final_access_policy_sql = merged.get("access_policy_sql")
-        _final_access_policy_note = merged.get("access_policy_note")
-        for _policy_key in (
-            "access_policy_sql",
-            "access_policy_note",
-            "access_policy_updated_at",
-            "access_policy_updated_by",
-            "policy_mapping",
-            # semantic-phase5 wave 1/2 — system-managed auto-draft dedup
-            # bookkeeping, not a human-editable PUT field. register() doesn't
-            # accept it; it has its own setters
-            # (mark_semantic_draft_pending / clear_semantic_draft_pending).
-            "semantic_draft_pending_at",
-        ):
-            merged.pop(_policy_key, None)
-
-        repo.register(id=table_id, **merged)
-
-        # Persist the access-policy fields through their dedicated setters
-        # (Task 2's set_access_policy/set_policy_mapping) — only called when
-        # this PUT actually touched one of them, so an unrelated edit never
-        # re-stamps access_policy_updated_at.
-        if "access_policy_sql" in updates or "access_policy_note" in updates:
-            repo.set_access_policy(
-                table_id,
-                sql=_final_access_policy_sql,
-                note=_final_access_policy_note,
-                updated_by=user.get("email"),
-            )
-        if "policy_mapping" in updates:
-            repo.set_policy_mapping(table_id, bool(updates["policy_mapping"]))
+            # #1979 — record the state the policy was just saved in, so the
+            # editor's history panel can offer "restore this version". Keyed on
+            # the writes that CHANGED something: a write through
+            # ``set_access_policy``, or a ``policy_mapping`` flip. Either gets
+            # exactly one revision, carrying the table's final policy body —
+            # and a PUT that merely carried the policy fields through
+            # untouched gets none.
+            #
+            # Deliberately NOT derived from the audit row this handler writes
+            # below: ``audit_log.params`` redacts ``access_policy_sql`` (content
+            # never enters the trail), so the trail records THAT a policy changed
+            # but never what it was — and restoring needs the body.
+            if _policy_body_written or _policy_mapping_flipped:
+                # Snapshot the row as PERSISTED, re-read after the setters,
+                # rather than the computed finals: a mapping-only flip leaves
+                # the body untouched, so its "final" body is whatever is
+                # stored — and only a read can say what that is. Nothing can
+                # slip between the setters and this read, because we hold the
+                # per-table write lock; so unlike the computed finals, this
+                # snapshot cannot disagree with the database. (Falls back to
+                # the computed values only if the row vanished underneath us.)
+                _persisted = repo.get(table_id) or {
+                    "access_policy_sql": _final_access_policy_sql,
+                    "access_policy_note": _final_access_policy_note,
+                    "policy_mapping": _final_policy_mapping,
+                }
+                _record_access_policy_revision(
+                    table_id,
+                    existing=existing,
+                    policy_sql=_persisted.get("access_policy_sql"),
+                    policy_note=_persisted.get("access_policy_note"),
+                    policy_mapping=bool(_persisted.get("policy_mapping")),
+                    saved_by=user.get("email"),
+                )
 
     audit_repo().log(
         user_id=user.get("id"),
@@ -6702,6 +7524,31 @@ async def update_table(
         resource=table_id,
         params=_sanitize_for_audit({"updated_fields": sorted(updates.keys()), **updates}),
     )
+
+    # A dedicated action name, alongside the generic `update_table` above --
+    # so "every access-policy change in the last N days" is a direct
+    # `action_prefix=access_policy.` query instead of grepping `update_table`
+    # rows for `access_policy_sql` inside `updated_fields`. Mirrors why
+    # `.../policy/preview` already logs its own `access_policy.preview`
+    # action: this feature's own docs call "who looked at whose data, when"
+    # the first question after an incident, and that applies just as much to
+    # who CHANGED a policy as to who previewed one.
+    if _policy_body_written:
+        # `log_safe`, not a bare `audit_repo().log`: this is a SECOND write
+        # for one event, so a failure here must not fail a policy save that
+        # already landed (and is already recorded by the `update_table` row
+        # above).
+        log_safe(
+            user_id=user.get("id"),
+            action="access_policy.clear" if _final_access_policy_sql is None else "access_policy.set",
+            resource=table_id,
+            params=_sanitize_for_audit(
+                {
+                    "access_policy_sql": _final_access_policy_sql,
+                    "access_policy_note": _final_access_policy_note,
+                }
+            ),
+        )
 
     # If we updated a BQ row (or one that's now BQ), refresh the extract in
     # the background so the view picks up renames / column-list changes.
@@ -6745,15 +7592,6 @@ class PolicyPreviewRequest(BaseModel):
     as_user: Optional[str] = None
     as_groups: Optional[List[str]] = None
 
-
-# Mirrors ``src.access_policy._PATTERN_METACHARACTERS`` (§6.3) — group names
-# are not validated against any character class elsewhere in the system, so
-# a wildcard-named ad-hoc group here would silently widen a LIKE-adjacent
-# policy the same way a Workspace-synced one would at live-enforcement time.
-# Duplicated rather than imported: that constant is private to the resolver
-# module, and this is the one OTHER place a caller-supplied string is bound
-# as a ``$user_groups`` value instead of being read live from the DB.
-_POLICY_PREVIEW_PATTERN_METACHARACTERS = ("%", "_")
 
 # The only three identity values a policy may reference (§6.2) — mirrors the
 # same closed set ``src/access_policy.py`` and
@@ -6904,32 +7742,195 @@ def _sanitize_for_json(obj):
     return obj
 
 
-def _policy_preview_referenced_variables(sql: str) -> set:
-    """Which of the three known ``$name`` variables ``sql`` actually
-    references, so the bind dict only ever carries the keys the policy text
-    uses — DuckDB rejects a named parameter bound but never referenced
-    (§7.1 documents this exact failure mode for the BigQuery push-down; the
-    same strictness applies to a plain parameterized DuckDB query). Mirrors
-    the identical walk already duplicated in ``probe_policy``
-    (``src/access_policy_validate.py``) and ``_referenced_variables``
-    (``src/access_policy.py``) — each module computes its own because the
-    VALUES bound differ per caller (probe: throwaway sentinels; the live
-    resolver: the real caller's identity; here: the admin-chosen preview
-    persona).
+def _policy_preview_variable_usage(sql: str) -> tuple[set, set]:
+    """``(referenced, pattern_positioned)`` for a policy body about to be
+    previewed — the preview's own copy of what the live resolver computes
+    (``src/access_policy.py::_policy_variable_usage``).
+
+    ``referenced``: which of the three known ``$name`` variables ``sql``
+    actually references, so the bind dict only ever carries the keys the
+    policy text uses — DuckDB rejects a named parameter bound but never
+    referenced (§7.1 documents this exact failure mode for the BigQuery
+    push-down; the same strictness applies to a plain parameterized DuckDB
+    query). Mirrors the identical walk already duplicated in ``probe_policy``
+    (``src/access_policy_validate.py``) — each module computes its own
+    because the VALUES bound differ per caller (probe: throwaway sentinels;
+    the live resolver: the real caller's identity; here: the admin-chosen
+    preview persona).
+
+    ``pattern_positioned``: which of them are matched AS A PATTERN (§6.3),
+    the one shape the resolver refuses outright — delegated to
+    ``variables_in_pattern_position`` rather than re-implemented, so a
+    preview can never report a slice a live read would deny (or vice versa).
     """
     import sqlglot
     from sqlglot import exp
 
+    from src.access_policy_validate import variables_in_pattern_position
+
     statement = sqlglot.parse_one(sql, read="duckdb")
-    return {p.name for p in statement.find_all(exp.Placeholder) if p.name in _POLICY_PREVIEW_KNOWN_VARIABLES}
+    referenced = {p.name for p in statement.find_all(exp.Placeholder) if p.name in _POLICY_PREVIEW_KNOWN_VARIABLES}
+    return referenced, variables_in_pattern_position(statement)
+
+
+def _policy_preview_dialect(row: dict) -> Optional[str]:
+    """Which transpile dialect (if any) a LIVE read of this table's policy
+    actually executes in -- so the preview's "Transpiled for <dialect>"
+    block never shows SQL that is not what would run (K1-sweep finding 3,
+    issue #1979).
+
+    Mirrors the live query path's own engine dispatch: only a
+    ``query_mode='remote'`` row on ``bigquery`` or ``databricks``
+    transpiles at read time (``app/api/query.py``'s
+    ``_bq_policied_execution_sql`` / ``_databricks_policy_resolver``, both
+    calling ``policied_relation(..., dialect=...)``). A remote Snowflake
+    row is deliberately excluded: per ``_transpile_policy_to_snowflake``'s
+    own docstring, a registered Snowflake ``query_mode='remote'`` row is a
+    plain DuckDB VIEW over the ATTACHed ``sf`` catalog, so its live reads
+    run through the ordinary ``dialect="duckdb"`` arm, not the Snowflake
+    transpile -- showing that arm's output here would preview a body that
+    never actually executes. A ``local``/``materialized`` row (or any other
+    ``query_mode``) always runs the verbatim DuckDB body -- ``None``.
+    """
+    if row.get("query_mode") != "remote":
+        return None
+    source_type = row.get("source_type")
+    return source_type if source_type in ("bigquery", "databricks") else None
+
+
+# §16 -- a failing policy's raw engine message can quote literal values and
+# identifiers straight out of the policy body, which is why ``PolicyError``
+# deliberately carries no engine detail. The two admin previews were the one
+# place that detail still reached a response (``f"policy_preview_failed:
+# {exc}"``, and ``str(exc)`` per failing group). It goes to the server log
+# instead; the caller gets a table-scoped message and a coarse reason class
+# (#1979, security review).
+_POLICY_PREVIEW_REASONS = {
+    "CatalogException": "catalog_error",
+    "BinderException": "binder_error",
+    "ConversionException": "conversion_error",
+    "InvalidInputException": "invalid_input",
+    "ParserException": "parse_error",
+    "ParseError": "parse_error",
+    "OutOfMemoryException": "resource_error",
+    "PermissionException": "permission_error",
+}
+
+
+def _policy_preview_failure_reason(exc: Exception) -> str:
+    """A coarse class for WHY the preview failed, drawn from a closed
+    vocabulary keyed on the exception TYPE -- never on its message, so no
+    policy-body text can ride along."""
+    return _POLICY_PREVIEW_REASONS.get(type(exc).__name__, "execution_error")
+
+
+def _policy_preview_failed_detail(exc: Exception, *, table_id: str, group: Optional[str] = None) -> str:
+    """The one message both previews return when executing a policy body
+    fails -- table-scoped, engine-text-free, and logged in full server-side
+    so an operator loses nothing."""
+    reason = _policy_preview_failure_reason(exc)
+    logger.warning(
+        "access-policy preview failed for table %s (%s)%s: %s",
+        table_id,
+        reason,
+        f" as group {group!r}" if group else "",
+        exc,
+    )
+    return (
+        f"policy_preview_failed: the access policy for table {table_id!r} could not be "
+        f"evaluated ({reason}); the engine's own message is in the server log, not in "
+        "this response, because it can quote values out of the policy body"
+    )
+
+
+def _policy_preview_local_view_unavailable(row: dict) -> Optional[str]:
+    """Why an admin preview cannot run against this table at all, or ``None``.
+
+    Both previews below execute the policy body on the server's LOCAL
+    read-only analytics connection (``get_analytics_db_readonly``). A
+    ``query_mode='remote'`` Databricks row only has a local view there when
+    the experimental Unity Catalog ATTACH is enabled -- otherwise
+    ``connectors/databricks/extract_init.py::rebuild_from_registry`` writes
+    no view at all and the first ``SELECT COUNT(*)`` fails with an opaque
+    "Table with name ... does not exist" catalog error that says nothing
+    about the actual cause.
+
+    A typed refusal rather than dispatching the preview to the SQL
+    warehouse: both previews would have to grow that path to stay
+    consistent with each other, and the all-groups sweep would turn one
+    warehouse round trip per group into the preview's cost model -- native
+    warehouse execution of previews is a separate feature, not a bugfix.
+    Live analyst reads are untouched either way; they never come through
+    here.
+    """
+    if row.get("query_mode") != "remote" or row.get("source_type") != "databricks":
+        return None
+
+    from connectors.databricks.attach import attach_enabled
+
+    if attach_enabled():
+        return None
+    return (
+        "the admin preview executes the policy on the server's local analytics view, and a "
+        "Databricks `remote` table only has one when `data_source.databricks.attach_enabled` "
+        "(the experimental Unity Catalog attach) is on. Live analyst reads are unaffected -- "
+        "they run natively on the SQL warehouse through the same transpiled policy; enable the "
+        "attach to preview here, or preview the policy against a `materialized` copy of the table"
+    )
+
+
+def _policy_preview_mapping_warning(
+    policy_sql: str,
+    *,
+    table_id: Optional[str] = None,
+    table_name: Optional[str] = None,
+) -> Optional[str]:
+    """review plan P2.6 -- an empty/never-synced ``policy_mapping`` table
+    behind a ``JOIN`` reads, from a live query, as an ordinary empty
+    result: indistinguishable from "you legitimately have no data"
+    (``docs/table-access-policies.md``, "The empty-mapping trap").
+    ``GET /api/me/effective-access`` already names this explicitly via
+    ``reason: mapping_empty`` and ``POST /api/query`` via
+    ``policy_mapping_empty``, but neither is a surface an admin authoring a
+    policy has open. This calls the SAME shared check both of those use
+    (``src.access_policy.raise_if_policy_mapping_empty``) rather than
+    re-deriving the condition, so the three surfaces cannot drift apart.
+    Surfacing it here means a suspiciously-low ``rows_visible`` in THIS
+    preview carries its own explanation inline, rather than sending the
+    admin to check effective-access by hand. Best-effort: any failure other
+    than the named condition is swallowed -- this is a hint, not a new
+    failure mode for the preview itself.
+
+    ``table_id``/``table_name`` name the PROTECTED table and are passed
+    straight through, so the policy's own mandatory ``FROM <itself>`` is
+    never warned about when that table is also marked
+    ``policy_mapping=True`` and simply has no rows yet -- the same
+    exclusion the live-query and effective-access surfaces apply, because
+    all three call this one helper (#1979, review follow-up).
+    """
+    from src.access_policy import PolicyMappingEmpty, raise_if_policy_mapping_empty
+
+    try:
+        raise_if_policy_mapping_empty(policy_sql, table_id=table_id, table_name=table_name)
+    except PolicyMappingEmpty as exc:
+        return str(exc)
+    except Exception:
+        return None
+    return None
 
 
 @router.post("/registry/{table_id}/policy/preview")
-async def preview_table_policy(
+# Both preview handlers are plain `def` on purpose: they run synchronous
+# DuckDB (and, for a remote table, engine-attached) COUNT/sample queries --
+# the all-groups sweep once per group -- so as `async def` they would block
+# the event loop for every other request until the sweep finished. FastAPI
+# runs a sync route in its threadpool instead (#1979, review follow-up).
+def preview_table_policy(
     table_id: str,
     request: PolicyPreviewRequest,
-    user: dict = Depends(require_admin),
+    user: dict = Depends(require_admin_all_surface),
     conn: duckdb.DuckDBPyConnection = Depends(_get_db),
+    bq: BqAccess = Depends(get_bq_access),
 ):
     """Run a stored or candidate access policy as a chosen persona and
     report what it does (design doc §13.1) — the single-persona primitive
@@ -6945,6 +7946,15 @@ async def preview_table_policy(
     it — so identity/groups are resolved directly from the request (or, for
     ``as_user``, from that user's own live membership), never from the
     calling admin's principal.
+
+    Gated by ``require_admin_all_surface``, not plain ``require_admin``
+    (#1979, security review): this route hands back policy CONTENT with no
+    per-table grant check and no policy rewrite standing behind it, so its
+    admin gate is the ONLY thing between the caller and unpolicied data --
+    the same shape K2 fixed on ``POST /api/query/hybrid``. A
+    ``surface='stack'`` admin PAT (the ``agnes init`` default, deliberately
+    filtered like an analyst everywhere else) is refused here; a browser
+    session or a full-surface PAT is not.
 
     Every preview is audited (§13.1: "it shows one person another person's
     slice, and 'who looked at whose data, when' is the first question asked
@@ -7001,8 +8011,49 @@ async def preview_table_policy(
         except PolicyValidationError as e:
             raise HTTPException(status_code=422, detail=f"{e.reason}: {e.detail}") from e
 
+    # K1-sweep finding 3 (#1979): a `query_mode='remote'` table on a
+    # transpiling engine does NOT execute the DuckDB-dialect text above on a
+    # live read -- it executes that body TRANSPILED to the engine's own SQL
+    # (`_bq_policied_execution_sql` for BigQuery, `_databricks_policy_resolver`
+    # for Databricks; see `app/api/query.py`). Showing the DuckDB text alone
+    # here would preview SQL that never actually runs for these two engines.
+    # `_policy_preview_dialect` decides which (if any) -- `None` for
+    # local/materialized tables and for remote Snowflake, whose live reads
+    # stay on the `dialect="duckdb"` arm (`_transpile_policy_to_snowflake`'s
+    # own docstring), so a Snowflake-transpiled block here would show a body
+    # that likewise never executes.
+    transpiled = None
+    preview_dialect = _policy_preview_dialect(row)
+    if preview_dialect is not None:
+        from src.access_policy import PolicyError, transpile_policy_sql
+
+        try:
+            transpiled_sql = transpile_policy_sql(policy_sql, table_id=table_id, dialect=preview_dialect)
+        except PolicyError:
+            # Fail-soft (§16: no engine detail leaked): a CANDIDATE body on
+            # a currently-remote table is already caught earlier by
+            # `validate_policy_sql`'s `for_remote` transpile check above, so
+            # this branch is mainly the STORED-policy case -- a body saved
+            # while the table was still local/server_only (never checked
+            # against `for_remote=True`) whose table was later switched to
+            # `query_mode='remote'` without the SQL itself being re-saved.
+            # Surfacing it here, inline, beats discovering it as the first
+            # live analyst's `500 policy_error`.
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"policy_preview_transpile_failed: this policy body does not transpile to "
+                    f"{preview_dialect} SQL, which is what a live read of this remote table actually runs"
+                ),
+            )
+        transpiled = {"dialect": preview_dialect, "relation_sql": transpiled_sql}
+
     # Persona resolution -- exactly one of as_user / as_groups was required
-    # above, so exactly one branch below runs.
+    # above, so exactly one branch below runs. This MUST run before the
+    # mapping-empty short-circuit below: an `as_user` that does not resolve
+    # to a real user is a 404 regardless of the table's mapping state, and
+    # the previous ordering let an empty mapping table mask that 404 behind
+    # a 200 `mapping_warning` response for a persona that was never valid.
     if request.as_user:
         from src.repositories import user_group_members_repo, users_repo
 
@@ -7012,17 +8063,54 @@ async def preview_table_policy(
         persona_user_id, persona_user_email = target["id"], target["email"]
         persona_groups = user_group_members_repo().list_group_names_for_user(persona_user_id)
     else:
-        for group_name in request.as_groups:
-            if any(ch in group_name for ch in _POLICY_PREVIEW_PATTERN_METACHARACTERS):
-                raise HTTPException(
-                    status_code=422,
-                    detail=(
-                        f"policy_preview_unsafe_group_name: {group_name!r} contains a "
-                        "pattern metacharacter (%, _) and cannot be bound as a group name"
-                    ),
-                )
         persona_user_id, persona_user_email = None, None
         persona_groups = list(request.as_groups)
+
+    # P2.6 -- checked BEFORE execution, not just added to the response: a
+    # mapping table that never synced at all has no view in the analytics
+    # connection, so the live queries below would crash on "table does not
+    # exist" instead of explaining why. Mirrors GET /api/me/effective-access's
+    # mapping_empty short-circuit (§15.1) for the same condition. Persona
+    # resolution above already ran, so this is only reached for a persona
+    # that resolves cleanly (an existing `as_user`, or any `as_groups`).
+    mapping_warning = _policy_preview_mapping_warning(policy_sql, table_id=table_id, table_name=row.get("name"))
+    if mapping_warning:
+        # Finding B (follow-up review of PR #2023) -- this early return skips
+        # every live query below, but it is still a preview that shows one
+        # persona's (attempted) slice, so it owes the same audit row the
+        # success path writes further down. `log_safe` (never raises) rather
+        # than `audit_repo().log` directly: an audit-write failure here must
+        # not turn an otherwise-clean 200 into a 500.
+        log_safe(
+            user_id=user.get("id"),
+            action="access_policy.preview",
+            resource=table_id,
+            params=_sanitize_for_audit(
+                {
+                    "as_user": request.as_user,
+                    "as_groups": request.as_groups,
+                    "candidate_sql": request.sql,
+                    "mapping_warning": True,
+                }
+            ),
+        )
+        return {
+            "columns": [],
+            "sample_rows": [],
+            "base_sample_rows": [],
+            "base_sample_comparable": True,
+            "rows_visible": None,
+            "rows_total": None,
+            "transpiled": transpiled,
+            "mapping_warning": mapping_warning,
+        }
+
+    preview_unavailable = _policy_preview_local_view_unavailable(row)
+    if preview_unavailable:
+        raise HTTPException(
+            status_code=422,
+            detail=f"policy_preview_remote_unsupported: {preview_unavailable}",
+        )
 
     from src.access_policy_validate import PolicyValidationError, probe_policy
     from src.db import get_analytics_db_readonly
@@ -7034,11 +8122,14 @@ async def preview_table_policy(
         except PolicyValidationError as e:
             raise HTTPException(status_code=422, detail=f"{e.reason}: {e.detail}") from e
 
-        try:
-            base_rows = analytics_conn.execute(f"DESCRIBE {quote_ident(row['name'])}").fetchall()
-        except Exception:
-            base_rows = []
-        base_names = [r[0] for r in base_rows]
+        # Same schema source as the builder's column picker
+        # (`_policy_builder_schema_columns`) — a bare local DESCRIBE only
+        # resolves for a table with a view already built in the shared
+        # analytics connection, so a genuinely remote/never-synced table
+        # used to report zero base columns here, which made every probed
+        # column look "hidden" instead of simply new.
+        base_columns, _base_columns_error = _policy_builder_schema_columns(table_id, row, conn, bq)
+        base_names = [c["name"] for c in base_columns]
         probed_names = {c["name"] for c in probed_columns}
         columns = [{"name": name, "hidden": name not in probed_names} for name in base_names]
         for probed_col in probed_columns:
@@ -7046,12 +8137,33 @@ async def preview_table_policy(
                 columns.append({"name": probed_col["name"], "hidden": False})
 
         try:
-            referenced = _policy_preview_referenced_variables(policy_sql)
+            referenced, pattern_positioned = _policy_preview_variable_usage(policy_sql)
         except Exception as exc:
             raise HTTPException(
                 status_code=422,
-                detail=f"policy_preview_failed: could not parse policy SQL: {exc}",
+                detail=_policy_preview_failed_detail(exc, table_id=table_id),
             ) from exc
+
+        # §6.3, mirrored from the LIVE resolver (`src/access_policy.py::
+        # policied_relation`) so the preview never renders a slice the
+        # product cannot actually serve: a body that MATCHES an identity
+        # variable as a LIKE/regex PATTERN is refused there for every
+        # caller, because no character class validates group or user names.
+        # A candidate `sql` was already rejected by `validate_policy_sql`
+        # above (rule 5) — this catches the STORED body nothing re-validates.
+        # The bound VALUES are deliberately not screened for `%`/`_`: in
+        # every other position a bound parameter is a value, so a group
+        # named `sales_cz` previews exactly as it reads.
+        if pattern_positioned & referenced:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "policy_var_in_pattern_position: this table's stored policy matches an "
+                    "identity variable as a LIKE/ILIKE/SIMILAR TO or regex pattern, which the "
+                    "policy resolver refuses to bind -- it can never be served to any caller; "
+                    "rewrite the policy to compare the variable as a value"
+                ),
+            )
 
         params: Dict[str, Any] = {}
         if "user_email" in referenced:
@@ -7059,29 +8171,6 @@ async def preview_table_policy(
         if "user_id" in referenced:
             params["user_id"] = persona_user_id
         if "user_groups" in referenced:
-            # An `as_groups` persona was already screened for pattern
-            # metacharacters up in the persona branch. An `as_user`
-            # persona's groups come from the DB, so nothing screened them
-            # — yet the LIVE resolver (`src/access_policy.py::
-            # policied_relation`) raises `PolicyError` for ANY bound group
-            # name carrying one. Without this check, a preview of a user
-            # in a group named e.g. `R&D%` renders a slice the product can
-            # never serve that user: the preview succeeds, every real read
-            # by them fails. Mirrored here exactly as the resolver does it
-            # — only when the policy actually binds `$user_groups`, since
-            # a policy that never references them serves that user fine.
-            for group_name in persona_groups:
-                if any(ch in group_name for ch in _POLICY_PREVIEW_PATTERN_METACHARACTERS):
-                    raise HTTPException(
-                        status_code=422,
-                        detail=(
-                            f"policy_preview_unsafe_live_group_name: {group_name!r} is a live "
-                            "group of this user and contains a pattern metacharacter (%, _), "
-                            "which the policy resolver refuses to bind -- this policy can "
-                            "never be served to this user as things stand; rename the group "
-                            "before relying on the preview"
-                        ),
-                    )
             params["user_groups"] = persona_groups
 
         try:
@@ -7102,7 +8191,7 @@ async def preview_table_policy(
                 analytics_conn, row["name"], policy_sql, params
             )
         except Exception as exc:
-            raise HTTPException(status_code=422, detail=f"policy_preview_failed: {exc}") from exc
+            raise HTTPException(status_code=422, detail=_policy_preview_failed_detail(exc, table_id=table_id)) from exc
     finally:
         analytics_conn.close()
 
@@ -7134,16 +8223,205 @@ async def preview_table_policy(
         "base_sample_comparable": bool(base_sample_comparable),
         "rows_visible": int(rows_visible),
         "rows_total": int(rows_total),
+        # `None` for local/materialized tables and for remote Snowflake
+        # (§ K1-sweep finding 3 above) -- present only for a remote
+        # BigQuery/Databricks table, where it is what the live read
+        # actually executes. `relation_sql` never carries a bound VALUE --
+        # only the SAME `$name`/`@name`/`:name` markers the live resolver
+        # sends, so this is safe to render verbatim.
+        "transpiled": transpiled,
+        # Always None here -- the check above already returned early when it
+        # was set, before any of these live queries ran.
+        "mapping_warning": mapping_warning,
+    }
+
+
+class PolicyPreviewGroupsRequest(BaseModel):
+    """Body for ``POST /registry/{table_id}/policy/preview-groups`` (review
+    plan P1.4). ``sql`` is optional, same meaning as
+    :class:`PolicyPreviewRequest` -- omitted previews the stored policy,
+    given previews a candidate body first.
+    """
+
+    sql: Optional[str] = None
+
+
+@router.post("/registry/{table_id}/policy/preview-groups")
+def preview_table_policy_all_groups(
+    table_id: str,
+    request: PolicyPreviewGroupsRequest,
+    user: dict = Depends(require_admin_all_surface),
+):
+    """Batch single-group preview across every real group in the instance.
+
+    ``preview_table_policy`` above already lets an admin check one persona
+    at a time; a policy that branches on ``$user_groups`` with a ``CASE``
+    (the documented "missing ``ELSE``" bug class -- see
+    ``docs/table-access-policies.md``'s "Row filtering" section) needs every
+    group checked before anyone trusts it, and doing that one API call per
+    group by hand is exactly the friction that lets the bug slip through.
+    This runs the SAME policy once per real ``user_groups`` row and reports
+    ``rows_visible``/``rows_total`` for each in one response.
+
+    Deliberately cheaper than the full persona-matrix TODO left in
+    ``preview_table_policy``'s docstring (union coverage + pairwise overlap
+    across every distinct group-set real users actually hold, which needs a
+    "list the distinct group-sets of users with access to this table"
+    primitive that does not exist yet): this previews one group at a time,
+    never a combination, and only counts rows -- no sample-row
+    materialization -- so it stays a single cheap ``COUNT(*)`` per group.
+
+    Gated by ``require_admin_all_surface``, not plain ``require_admin``
+    (#1979, security review): it reports per-group visibility over the table's real rows with no per-table grant check and no
+    policy rewrite standing behind it, so its admin gate is the ONLY thing
+    between the caller and unpolicied data -- the same shape K2 fixed on
+    ``POST /api/query/hybrid``. A ``surface='stack'`` admin PAT (the
+    ``agnes init`` default, deliberately filtered like an analyst everywhere
+    else) is refused here; a browser session or a full-surface PAT is not.
+    """
+    from src.access_policy_validate import PolicyValidationError, validate_policy_sql
+    from src.db import get_analytics_db_readonly
+    from src.repositories import user_groups_repo
+    from src.sql_ident import quote_ident
+
+    row = table_registry_repo().get(table_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Table not found")
+
+    is_candidate = request.sql is not None
+    policy_sql = request.sql if is_candidate else row.get("access_policy_sql")
+    if not policy_sql:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "policy_preview_no_policy: this table has no stored access policy, and "
+                "no candidate `sql` was given to preview"
+            ),
+        )
+
+    mapping_table_names = {
+        r["name"] for r in table_registry_repo().list_all() if r.get("policy_mapping") and r.get("name")
+    }
+    try:
+        validate_policy_sql(
+            policy_sql,
+            table_id=table_id,
+            table_name=row.get("name") or table_id,
+            mapping_table_names=mapping_table_names,
+            for_remote=(row.get("query_mode") == "remote"),
+        )
+    except PolicyValidationError as e:
+        raise HTTPException(status_code=422, detail=f"{e.reason}: {e.detail}") from e
+
+    # P2.6 -- checked before running a COUNT per group: a mapping table
+    # that never synced at all has no view to query, so every group would
+    # otherwise report the same "table does not exist" error individually
+    # instead of one explanation up front.
+    mapping_warning = _policy_preview_mapping_warning(policy_sql, table_id=table_id, table_name=row.get("name"))
+    if mapping_warning:
+        # Finding B (follow-up review of PR #2023) -- same reasoning as the
+        # single-persona preview's early return above: still audited, just
+        # without the per-group results the live sweep below would produce.
+        log_safe(
+            user_id=user.get("id"),
+            action="access_policy.preview_groups",
+            resource=table_id,
+            params=_sanitize_for_audit({"candidate_sql": request.sql, "mapping_warning": True}),
+        )
+        return {"rows_total": None, "groups": [], "mapping_warning": mapping_warning}
+
+    try:
+        referenced, pattern_positioned = _policy_preview_variable_usage(policy_sql)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=_policy_preview_failed_detail(exc, table_id=table_id),
+        ) from exc
+
+    # §6.3, the same screen `preview_table_policy` applies to a stored body:
+    # a policy that matches an identity variable as a LIKE/regex PATTERN is
+    # refused by the live resolver for EVERY caller, so sweeping it per
+    # group would report a slice no group can actually be served.
+    if pattern_positioned & referenced:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "policy_var_in_pattern_position: this table's stored policy matches an "
+                "identity variable as a LIKE/ILIKE/SIMILAR TO or regex pattern, which the "
+                "policy resolver refuses to bind -- it can never be served to any caller; "
+                "rewrite the policy to compare the variable as a value"
+            ),
+        )
+
+    preview_unavailable = _policy_preview_local_view_unavailable(row)
+    if preview_unavailable:
+        raise HTTPException(
+            status_code=422,
+            detail=f"policy_preview_remote_unsupported: {preview_unavailable}",
+        )
+
+    group_names = [g["name"] for g in user_groups_repo().list_all()]
+
+    analytics_conn = get_analytics_db_readonly()
+    try:
+        try:
+            rows_total = analytics_conn.execute(f"SELECT COUNT(*) FROM {quote_ident(row['name'])}").fetchone()[0]
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=_policy_preview_failed_detail(exc, table_id=table_id)) from exc
+
+        results = []
+        for group_name in group_names:
+            # No screen on the group NAME itself: a bound parameter is a
+            # value in every position the pattern check above leaves
+            # standing, so a group called `sales_cz` previews exactly as it
+            # reads (#1979 -- the live resolver stopped refusing those too).
+            params: Dict[str, Any] = {}
+            if "user_email" in referenced:
+                params["user_email"] = None
+            if "user_id" in referenced:
+                params["user_id"] = None
+            if "user_groups" in referenced:
+                params["user_groups"] = [group_name]
+            try:
+                rows_visible = analytics_conn.execute(
+                    f"SELECT COUNT(*) FROM ({policy_sql}) AS __agnes_policy_preview__",
+                    params,
+                ).fetchone()[0]
+            except Exception as exc:
+                results.append(
+                    {
+                        "group": group_name,
+                        "rows_visible": None,
+                        "error": _policy_preview_failed_detail(exc, table_id=table_id, group=group_name),
+                    }
+                )
+                continue
+            results.append({"group": group_name, "rows_visible": int(rows_visible), "error": None})
+    finally:
+        analytics_conn.close()
+
+    log_safe(
+        user_id=user.get("id"),
+        action="access_policy.preview_groups",
+        resource=table_id,
+        params=_sanitize_for_audit({"candidate_sql": request.sql, "groups": group_names}),
+    )
+
+    return {
+        "rows_total": int(rows_total),
+        "groups": results,
+        # Always None here -- the check above already returned early when it
+        # was set, before any of these live queries ran.
+        "mapping_warning": mapping_warning,
     }
 
 
 def _policy_builder_describe(name: str) -> Optional[list]:
     """``DESCRIBE {name}`` on the read-only analytics connection -- the
-    same query ``preview_table_policy`` already runs (line ~5054),
-    factored out here because both new builder endpoints below need it:
-    Task 2's columns list wants types too, Task 3's compile just wants the
-    names. Never trusts a caller-supplied name -- every caller resolves
-    ``name`` from the registry row first, never from the URL/body.
+    last-resort fallback for a name ``_policy_builder_schema_columns``
+    below could not resolve any other way. Never trusts a caller-supplied
+    name -- every caller resolves ``name`` from the registry row first,
+    never from the URL/body.
 
     ``None`` when the DESCRIBE itself failed, which is NOT the same as a table
     with no columns: this runs on a fresh read-only analytics connection where a
@@ -7164,6 +8442,60 @@ def _policy_builder_describe(name: str) -> Optional[list]:
             return None
     finally:
         analytics_conn.close()
+
+
+def _policy_builder_schema_columns(
+    table_id: str,
+    row: dict,
+    conn: duckdb.DuckDBPyConnection,
+    bq,
+) -> tuple:
+    """Real column list for the policy builder, sourced the same way
+    ``GET /api/v2/schema/{table_id}`` (``agnes schema``) already is --
+    ``build_schema_uncached`` reads BigQuery's own INFORMATION_SCHEMA for a
+    ``query_mode='remote'`` BQ row, Unity Catalog for a remote Databricks
+    row, and the table's own parquet directly for everything else
+    (local/materialized, any source_type) -- instead of a bare ``DESCRIBE``
+    against the shared analytics connection, which only resolves for a
+    table with a view already built there and fails silently (into an
+    empty list, previously) for anything else, most commonly a genuinely
+    remote table that has never been locally synced.
+
+    Returns ``(columns, error)`` -- ``columns`` is a list of
+    ``{"name", "type"}`` dicts, empty ONLY when the table genuinely has
+    none; ``error`` is a short, caller-facing string set (with ``columns``
+    empty) when the lookup itself failed, so ``GET .../policy/columns`` can
+    tell an admin "this table has never synced" apart from "this table has
+    no columns" instead of both rendering as the same silent "No columns
+    found."  Falls back to the raw local ``DESCRIBE`` only as a last
+    resort, for any source/query_mode shape ``build_schema_uncached``
+    itself does not recognize.
+    """
+    from app.api.v2_schema import NotFound as SchemaNotFound
+    from app.api.v2_schema import build_schema_uncached
+
+    try:
+        payload = build_schema_uncached(conn, table_id, bq=bq, row=row)
+        # `type` is normalized to a non-empty string here: `compile_policy`
+        # builds `CAST(NULL AS <type>)` from it for a `nullify` mask, so a
+        # missing type has to land on a real default rather than on `None`.
+        return [{"name": c["name"], "type": c.get("type") or "VARCHAR"} for c in payload.get("columns") or []], None
+    except SchemaNotFound:
+        pass
+    except Exception as exc:
+        logger.warning("policy builder: schema lookup failed for table %s: %s", table_id, exc)
+        fallback = _policy_builder_describe(row.get("name") or table_id)
+        if fallback:
+            return [{"name": c[0], "type": c[1]} for c in fallback], None
+        return [], (
+            f"could not read this table's schema ({exc}) -- it may not have synced yet, "
+            "or the connection it depends on may be unavailable right now"
+        )
+
+    fallback = _policy_builder_describe(row.get("name") or table_id)
+    if fallback:
+        return [{"name": c[0], "type": c[1]} for c in fallback], None
+    return [], "this table has not synced yet -- no data found to read a schema from"
 
 
 # Best-effort name hints for the builder's `pii` flag (plan Task 2) -- never
@@ -7203,10 +8535,91 @@ def _policy_builder_looks_like_pii(col_name: str, profile_col: dict) -> bool:
     )
 
 
+@router.get("/registry/{table_id}/policy/revisions")
+async def list_access_policy_revisions(
+    table_id: str,
+    limit: int = Query(10, ge=1, le=50),
+    user: dict = Depends(require_admin_all_surface),
+):
+    """The saved states of this table's access policy, newest first (#1979).
+
+    What the policy editor's history panel lists, and what its "Restore"
+    button prefills the editor from. Each revision carries the full
+    ``policy_sql`` body: restoring means putting that body back in the
+    textarea, and a truncated preview cannot be restored from.
+
+    **There is no restore endpoint, on purpose.** The client re-submits a
+    revision's body through the ordinary ``PUT /registry/{id}``, so a
+    restore pays for every interlock a fresh save pays for — the §3.1
+    undistributed check, the mandatory note, the static validator, the live
+    LIMIT 0 probe — and lands in the audit trail as the ordinary policy
+    write that it is. A dedicated restore route would either duplicate that
+    validation chain (and drift from it) or quietly skip it, which is
+    exactly the shape "reattach yesterday's policy" must not have.
+
+    **PG-only** (post-A3 ``access_policy_revisions``): a DuckDB-backed
+    instance gets the typed ``501 requires_postgres_backend`` the factory
+    raises, and the modal falls back to its audit-derived, read-only
+    history. The registry lookup runs FIRST, so a typo'd table id is a 404
+    on every backend rather than advice to migrate a database.
+
+    Gated by ``require_admin_all_surface``, not plain ``require_admin``
+    (#1979, security review): every listed revision carries a full historical policy body with no per-table grant check and no
+    policy rewrite standing behind it, so its admin gate is the ONLY thing
+    between the caller and unpolicied data -- the same shape K2 fixed on
+    ``POST /api/query/hybrid``. A ``surface='stack'`` admin PAT (the
+    ``agnes init`` default, deliberately filtered like an analyst everywhere
+    else) is refused here; a browser session or a full-surface PAT is not.
+    """
+    if not table_registry_repo().get(table_id):
+        raise HTTPException(status_code=404, detail="Table not found")
+
+    repo = access_policy_revisions_repo()
+    revisions = repo.list_for_table(table_id, limit=limit)
+    total_count = repo.count_for_table(table_id)
+
+    # RBAC-reviewer finding on #1979: each listed revision carries the full
+    # historical `policy_sql` body, the same content `.../policy/preview`
+    # and `.../preview-groups` are already audited for -- this must be a
+    # real, cataloged read, not `exempt:ui_support` (src/audit_posture.py).
+    # Metadata only: never the SQL bodies, notes, or mapping names.
+    log_safe(
+        user_id=user.get("id"),
+        action="access_policy.revisions_view",
+        resource=table_id,
+        params={"table_id": table_id, "count": total_count, "limit": limit},
+    )
+
+    return {
+        "table_id": table_id,
+        # `count` is the UNTRUNCATED total, so a panel showing ten of
+        # thirty-four can say so instead of rendering a silent prefix that
+        # reads as the whole history.
+        "count": total_count,
+        "limit": limit,
+        "revisions": [
+            {
+                "id": r["id"],
+                "saved_at": r["saved_at"],
+                "saved_by": r["saved_by"],
+                "policy_sql": r["policy_sql"],
+                "policy_note": r["policy_note"],
+                "policy_mapping": r["policy_mapping"],
+                # Derived in the repository so the API and the modal cannot
+                # disagree about what "the policy was removed here" means.
+                "cleared": r["cleared"],
+            }
+            for r in revisions
+        ],
+    }
+
+
 @router.get("/registry/{table_id}/policy/columns")
 async def policy_builder_columns(
     table_id: str,
-    user: dict = Depends(require_admin),
+    user: dict = Depends(require_admin_all_surface),
+    conn: duckdb.DuckDBPyConnection = Depends(_get_db),
+    bq: BqAccess = Depends(get_bq_access),
 ):
     """Real schema + sample values for the no-SQL policy builder (plan
     Task 2, access-policy-builder-ux) -- the column list a
@@ -7219,6 +8632,14 @@ async def policy_builder_columns(
     (``PUT /registry/{id}`` writing a non-null ``access_policy_sql``, per
     that flag's own hint text in ``_flag_default("access_policies", ...)``
     above).
+
+    Gated by ``require_admin_all_surface``, not plain ``require_admin``
+    (#1979, security review): it returns the table's real schema plus profiler SAMPLE VALUES with no per-table grant check and no
+    policy rewrite standing behind it, so its admin gate is the ONLY thing
+    between the caller and unpolicied data -- the same shape K2 fixed on
+    ``POST /api/query/hybrid``. A ``surface='stack'`` admin PAT (the
+    ``agnes init`` default, deliberately filtered like an analyst everywhere
+    else) is refused here; a browser session or a full-surface PAT is not.
     """
     row = table_registry_repo().get(table_id)
     if not row:
@@ -7227,12 +8648,14 @@ async def policy_builder_columns(
     name = row.get("name") or table_id
     eligible = row.get("query_mode") == "remote" or bool(row.get("server_only"))
 
-    # `None` = the DESCRIBE failed (see the helper): the builder needs that
-    # distinction to explain an empty list, instead of showing "No columns
-    # found" for a table whose schema simply cannot be read from here and only
-    # surfacing the real reason once a compile is attempted.
-    described = _policy_builder_describe(name)
-    base_rows = described or []
+    # Sourced like `agnes schema`, not a bare local DESCRIBE (see the
+    # helper): a `query_mode='remote'` table that never synced locally has
+    # no view to describe here, and reporting that as zero columns is
+    # indistinguishable from a table whose schema is genuinely empty.
+    # `columns_error` carries the reason when the lookup itself failed, so
+    # the builder can explain an empty list instead of showing "No columns
+    # found" and only surfacing the real reason once a compile is attempted.
+    base_rows, columns_error = _policy_builder_schema_columns(table_id, row, conn, bq)
 
     # A profile may be keyed by the registry id or the table name depending
     # on when/how it was saved (mirrors `catalog.py::get_table_profile`'s own
@@ -7243,7 +8666,7 @@ async def policy_builder_columns(
 
     columns = []
     for col_row in base_rows:
-        col_name, col_type = col_row[0], col_row[1]
+        col_name, col_type = col_row["name"], col_row["type"]
         prof_col = profile_by_col.get(col_name, {})
         columns.append(
             {
@@ -7257,11 +8680,32 @@ async def policy_builder_columns(
 
     mapping_tables = [r["name"] for r in table_registry_repo().list_all() if r.get("policy_mapping") and r.get("name")]
 
+    # RBAC-reviewer finding on #1979: `samples` are profiler-derived REAL row
+    # values (potentially PII -- the `pii` flag right above is why), the
+    # same class of content `GET /api/v2/sample/{table_id}` is audited for
+    # as `catalog.sample` -- this must be a real, cataloged read, not
+    # `exempt:ui_support` (src/audit_posture.py). Metadata only: never the
+    # sample values themselves.
+    log_safe(
+        user_id=user.get("id"),
+        action="access_policy.columns_view",
+        resource=table_id,
+        params={
+            "table_id": table_id,
+            "column_count": len(columns),
+            "samples_included": any(col["samples"] for col in columns),
+        },
+    )
+
     return {
         "columns": columns,
         "mapping_tables": mapping_tables,
         "eligible": eligible,
-        "schema_available": described is not None,
+        # Two views of the same fact, both consumed by the modal:
+        # `schema_available` is the boolean the builder branches on,
+        # `columns_error` the human sentence it renders when it is false.
+        "schema_available": columns_error is None,
+        "columns_error": columns_error,
     }
 
 
@@ -7284,6 +8728,8 @@ async def policy_builder_compile(
     table_id: str,
     request: PolicyCompileRequest,
     user: dict = Depends(require_admin),
+    conn: duckdb.DuckDBPyConnection = Depends(_get_db),
+    bq: BqAccess = Depends(get_bq_access),
 ):
     """Turn a structured builder spec into the canonical policy SQL (plan
     Task 3) via ``src.access_policy_compile.compile_policy`` -- the ONLY
@@ -7303,14 +8749,21 @@ async def policy_builder_compile(
         raise HTTPException(status_code=404, detail="Table not found")
 
     name = row.get("name") or table_id
-    describe_rows = _policy_builder_describe(name)
-    if not describe_rows:
+    # Same schema source as `.../policy/columns` above -- the builder
+    # compiles against exactly the column list it offered the admin.
+    # Still a hard 422 when it is unreadable: compiling against an empty
+    # column list would silently emit a policy that masks nothing.
+    columns, columns_error = _policy_builder_schema_columns(table_id, row, conn, bq)
+    if not columns:
         raise HTTPException(
             status_code=422,
-            detail="policy_builder_schema_unavailable: the table schema could not be read; "
-            "ensure the table is materialized or remote before building a policy.",
+            detail="policy_builder_schema_unavailable: "
+            + (
+                columns_error
+                or "the table schema could not be read; ensure the table is materialized "
+                "or remote before building a policy."
+            ),
         )
-    columns = [{"name": c[0], "type": c[1]} for c in describe_rows]
 
     from src.access_policy_compile import compile_policy
 
@@ -7472,16 +8925,57 @@ async def unregister_table(
     access to what" for the event that caused it.
     """
     repo = table_registry_repo()
-    existing = repo.get(table_id)
-    if not existing:
-        raise HTTPException(status_code=404, detail="Table not found")
 
-    was_bigquery = existing.get("source_type") == "bigquery"
-    was_materialized = existing.get("query_mode") == "materialized"
-    source_type = existing.get("source_type") or ""
-    name = existing.get("name") or table_id
+    # R17-1 (review follow-up on PR #2023) — the revision purge and the
+    # registry drop run under the per-table registry write lock, which this
+    # handler previously did not take at all. An in-flight policy save
+    # holding that lock could otherwise append its revision AFTER the purge
+    # had run, stranding history under a table id that no longer exists —
+    # and, since ids are derived from names, handing it to whatever is
+    # registered at that reused id next. Reading the row inside the lock too
+    # means the 404 and the drop cannot disagree with a concurrent
+    # re-registration. Released before the filesystem/sync_state cleanup
+    # below, which no other writer of this id contends for.
+    with _access_policy_write_lock(table_id):
+        existing = repo.get(table_id)
+        if not existing:
+            raise HTTPException(status_code=404, detail="Table not found")
 
-    cascade = repo.unregister(table_id)
+        was_bigquery = existing.get("source_type") == "bigquery"
+        was_materialized = existing.get("query_mode") == "materialized"
+        source_type = existing.get("source_type") or ""
+        name = existing.get("name") or table_id
+
+        # #1979 (PR #2023 review, finding 3) — purge the table's access-policy
+        # revision bodies BEFORE dropping the registry row, not after. Table ids
+        # are derived from names, so re-registering the same name yields the same
+        # id; without this purge-first ordering, a Postgres failure here after the
+        # registry row was already deleted would leave the old revisions orphaned
+        # but reachable the moment an identically named table is registered again
+        # (its policy history would show the PREVIOUS table's bodies). Purging
+        # first means a genuine failure aborts the whole unregistration cleanly
+        # instead of orphaning. Still PG-only and still not load-bearing in that
+        # narrow sense: `RequiresPostgresBackend` (the frozen DuckDB backend has no
+        # store to purge at all) is the ONE exception this swallows — everything
+        # else denies the unregistration rather than risk stranding history.
+        try:
+            access_policy_revisions_repo().delete_for_table(table_id)
+        except RequiresPostgresBackend:
+            pass
+        except Exception as e:
+            logger.error(
+                "Could not drop access-policy revisions for table %s before "
+                "unregistering it -- aborting the unregistration rather than risk "
+                "orphaning them: %s",
+                table_id,
+                e,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail={"reason": "access_policy_revision_purge_failed", "table": table_id},
+            )
+
+        cascade = repo.unregister(table_id)
 
     # Drop the canonical parquet for materialized rows. Path layout:
     # `${DATA_DIR}/extracts/<source_type>/data/<name>.parquet` — the
@@ -7877,13 +9371,24 @@ def _build_keboola_discovery_plan(
     # check below is an O(1) dict hit per discovered entry rather than a
     # fresh `list_all()` scan each time (discovery routinely walks
     # hundreds of tables). Same signal vocabulary as the register/update
-    # interlocks, via `_policy_physical_source_signals`.
+    # interlocks, via `_policy_physical_source_signals`. A discovered
+    # entry never carries a `connection_id` (Keboola discovery is
+    # single-connection by construction here), so its `bucket_table`
+    # signal is always the wildcard case (`_bucket_table_signals_conflict`)
+    # -- `policied_by_bucket_table` drops the connection component so that
+    # lookup still catches a policied row that pins one, matching the
+    # register/update interlocks' wildcard semantics rather than requiring
+    # an exact, unreachable `connection_id` match.
     policied_by_signal: dict = {}
+    policied_by_bucket_table: dict = {}
     for row in registry_rows:
         if not row.get("access_policy_sql"):
             continue
         for signal in _policy_physical_source_signals(row):
             policied_by_signal.setdefault(signal, row)
+            if signal[0] == "bucket_table":
+                _, sig_type, _sig_conn, sig_bucket, sig_table = signal
+                policied_by_bucket_table.setdefault((sig_type, sig_bucket, sig_table), row)
 
     plan = {"new": [], "existing_match": [], "existing_drift": [], "invalid": []}
     for table in discovered:
@@ -7975,6 +9480,19 @@ def _build_keboola_discovery_plan(
             (policied_by_signal[s] for s in my_signals if s in policied_by_signal),
             None,
         )
+        if policied_twin is None:
+            # Wildcard direction: this discovered entry carries no
+            # `connection_id`, so fall back to the connection-agnostic
+            # index for a policied row over the same bucket/table pinned
+            # to a specific connection.
+            policied_twin = next(
+                (
+                    policied_by_bucket_table[(s[1], s[3], s[4])]
+                    for s in my_signals
+                    if s[0] == "bucket_table" and (s[1], s[3], s[4]) in policied_by_bucket_table
+                ),
+                None,
+            )
         if policied_twin is not None:
             plan["invalid"].append(
                 {
@@ -8394,50 +9912,146 @@ def run_corporate_memory(
     }
 
 
-@router.post("/run-knowledge-packaging")
+@router.post("/run-knowledge-packaging", status_code=202)
 def run_knowledge_packaging(
     user: dict = Depends(require_admin),
 ):
-    """Rebuild per-collection knowledge.duckdb artifacts whose content changed.
+    """Enqueue a ``knowledge-packaging`` worker job (K3, #798).
 
-    Scheduler-driven (K3, #798): fingerprints each corpus's chunks, rebuilds
-    stale artifacts, prunes artifacts for deleted corpora. Idempotent and
-    cheap when nothing changed (fingerprint check only). Mirrors
-    run_corporate_memory's audit + error posture.
+    TCRD-296 synthesis C.15: this used to run the packaging pass INLINE,
+    synchronously, inside the request — the scheduler's own 600s client
+    timeout was the only bound on it, and a pass slower than that left the
+    NEXT scheduler tick free to fire a second, overlapping call. Two
+    overlapping in-process runs raced each other hard enough to OOM the
+    app (see ``src.knowledge_packaging``'s module docstring for the exact
+    collision). This endpoint is now a thin enqueue: the actual pass runs
+    as the ``knowledge-packaging`` worker job kind
+    (``app/worker/kinds.py::_run_knowledge_packaging``), which supplies the
+    single-run guarantee (idempotency-keyed enqueue below, plus a
+    belt-and-braces PG advisory lock inside the handler) and a wall-clock
+    time budget — a scheduler tick can no longer overlap a still-running
+    pass. Poll ``GET /api/jobs/{job_id}`` (or ``agnes admin jobs show
+    <job_id>``) for the result, or use
+    ``GET /api/admin/knowledge-packaging/status`` for a summary of the
+    last run.
+
+    Returns 202 with ``{"status": "queued", "job_id": ...}`` on a fresh
+    enqueue. Returns 409 with the in-flight ``job_id`` when a run is
+    already ``'queued'``/``'running'`` (the scheduler's own cadence can
+    legitimately outpace a slow pass — this is expected, not an error to
+    page on). Returns 501 (typed ``requires_worker_role``) when this
+    process has no worker role: enqueueing here would leave the job
+    ``'queued'`` forever with nothing to claim it — see
+    ``docs/observability.md`` -> "Knowledge packaging" for the operator
+    fix (give a process ``AGNES_ROLE`` including ``worker`` — the default
+    ``all`` role already does).
     """
-    from src.knowledge_packaging import run_packaging_pass
+    from app.roles import Role, role_enabled
+    from src.repositories import jobs_repo
 
-    job_error: Optional[Exception] = None
-    summary: dict = {}
-    try:
-        summary = run_packaging_pass()
-    except Exception as e:
-        # Mirror run_corporate_memory / run_verification_detector: capture
-        # any unhandled error so audit_log + /admin/scheduler-runs reflect
-        # the failure. Re-raised below after audit.
-        job_error = e
+    if not role_enabled(Role.WORKER):
+        raise HTTPException(
+            status_code=501,
+            detail={
+                "error": "requires_worker_role",
+                "message": (
+                    "knowledge packaging needs the worker role — this process has no "
+                    "worker loop to claim the job. Run it on (or add) a process whose "
+                    "AGNES_ROLE includes 'worker' (the default 'all' role already does)."
+                ),
+            },
+        )
 
-    audit_params: dict = {
-        "built": len(summary.get("built", [])),
-        "skipped": len(summary.get("skipped", [])),
-        "pruned": len(summary.get("pruned", [])),
-        "errors": len(summary.get("errors", [])),
-    }
-    if job_error is not None:
-        audit_params["unhandled_error"] = f"{type(job_error).__name__}: {job_error}"
+    job = jobs_repo().enqueue("knowledge-packaging", {}, idempotency_key="knowledge-packaging")
+    already_in_progress = job["deduped"]
 
-    audit_repo().log(
+    log_safe(
         user_id=user.get("id"),
         client_kind=client_kind_from_user(user),
         action="run_knowledge_packaging",
         resource="job:knowledge-packaging",
-        params=audit_params,
+        params={"job_id": job["id"], "deduped": already_in_progress},
+        result="error.in_progress" if already_in_progress else "success",
     )
 
-    if job_error is not None:
-        raise HTTPException(status_code=500, detail=audit_params["unhandled_error"])
+    if already_in_progress:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "knowledge_packaging_already_in_progress", "job_id": job["id"]},
+        )
 
-    return {"ok": not summary.get("errors"), "details": summary}
+    return {"status": "queued", "job_id": job["id"]}
+
+
+@router.get("/knowledge-packaging/status")
+def knowledge_packaging_status(
+    _user: dict = Depends(require_admin),
+):
+    """Observability summary for the ``knowledge-packaging`` worker job
+    kind (TCRD-296 synthesis C.15): the most recent run's outcome, whether
+    one is running right now, and (best-effort) when the next scheduled
+    run is due.
+
+    ``last_run``: the most recent ``knowledge-packaging`` job row
+    (regardless of status), or ``null`` if the kind has never run on this
+    instance — ``{"job_id", "status", "created_at", "finished_at",
+    "result"}`` where ``result`` is the pass summary (built/skipped/
+    pruned/errors/interrupted_reason/duration_s/collections_total/
+    collections_processed) when the job completed.
+    ``running``: whether a ``knowledge-packaging`` job is currently
+    ``'queued'`` or ``'running'``.
+    ``next_due``: an ISO timestamp estimate (last completed run's
+    ``created_at`` + ``SCHEDULER_KNOWLEDGE_PACKAGING_INTERVAL``), or
+    ``null`` when no run has completed yet or the scheduler's durable
+    last-run marker can't be read — this is an ESTIMATE (the scheduler
+    process's own last-run/interval state is the authority; see
+    ``services/scheduler/__main__.py``), not a guaranteed next-fire time.
+    """
+    from src.repositories import jobs_repo
+
+    rows = jobs_repo().list(kind="knowledge-packaging", limit=1)
+    last_run = None
+    running = False
+    if rows:
+        row = rows[0]
+        running = row.get("status") in ("queued", "running")
+        last_run = {
+            "job_id": row.get("id"),
+            "status": row.get("status"),
+            "created_at": row.get("created_at"),
+            "finished_at": row.get("finished_at"),
+            "result": (row.get("payload_json") or {}).get("result"),
+        }
+
+    return {"last_run": last_run, "running": running, "next_due": _knowledge_packaging_next_due()}
+
+
+def _knowledge_packaging_next_due() -> Optional[str]:
+    """Best-effort estimate of the next ``knowledge-packaging`` scheduler
+    tick, read from the scheduler's durable last-run marker
+    (``services/scheduler/__main__.py``'s ``scheduler_last_run.json``, on
+    the ``DATA_DIR`` volume the app and scheduler containers share).
+
+    Never raises — this is observability, not a correctness dependency: a
+    missing/unreadable marker file, an unset entry, or a malformed
+    timestamp all resolve to ``None`` (unknown) rather than failing the
+    status endpoint.
+    """
+    try:
+        data_dir = Path(os.environ.get("DATA_DIR", "/data"))
+        marker_path = data_dir / "state" / "scheduler_last_run.json"
+        if not marker_path.exists():
+            return None
+        marker = json.loads(marker_path.read_text())
+        last_run_iso = marker.get("knowledge-packaging")
+        if not last_run_iso:
+            return None
+        last_run_dt = datetime.fromisoformat(last_run_iso)
+        interval_s = int(os.environ.get("SCHEDULER_KNOWLEDGE_PACKAGING_INTERVAL", 15 * 60))
+        return (last_run_dt + timedelta(seconds=interval_s)).isoformat()
+    except Exception:
+        logger.warning("knowledge-packaging status: could not estimate next_due", exc_info=True)
+        return None
 
 
 @router.post("/run-knowledge-digests")

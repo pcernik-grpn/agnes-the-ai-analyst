@@ -1060,7 +1060,6 @@ def test_the_admin_page_renders_a_structured_error_detail():
     away the one thing the admin needs — which is what the chat-tools toast
     did with the partial-teardown report. (Devin Review on this PR.)
     """
-    import pathlib
 
     src = _ds_page_source.page_source()
     assert "function detailMessage(" in src

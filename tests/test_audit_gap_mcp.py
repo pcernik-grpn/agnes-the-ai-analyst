@@ -377,7 +377,7 @@ def test_facts_ingest_logs_audit_row(seeded_app, monkeypatch):
     import app.api.facts as facts_mod
 
     class _FakeRepo:
-        def ingest_batch(self, documents, full_documents, nodes, edges):
+        def ingest_batch(self, documents, full_documents, nodes, edges, run_orphan_sweep=True):
             return {
                 "claims_written": 3,
                 "claims_rejected": [],

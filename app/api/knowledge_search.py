@@ -29,7 +29,7 @@ from app.auth.dependencies import _get_db, get_current_user
 from app.auth.session_principal import PRINCIPAL_TYPES
 from app.resource_types import ResourceType
 from src.audit_helpers import client_kind_from_user
-from src.ingest.retrieval import SearchQueryTooBroad, retrieval_mode, search_with_meta
+from src.ingest.retrieval import SearchQueryTooBroad, SearchResults, retrieval_mode, search_with_meta
 from src.rbac import get_accessible_tables
 from src.repositories import audit_repo, resource_grants_repo, table_registry_repo, user_group_members_repo
 from src.search.unified import unified_search
@@ -203,9 +203,11 @@ async def knowledge_search(
     judgement on purpose: it has no RBAC, so it runs for everyone and its
     presence would make every caller look like they had access.
 
-    The chunk leg (#2151) is bounded the same way ``/api/collections/search``
-    is (``collections.search_max_chunks``), but a failure or an over-broad
-    query there degrades that ONE leg to empty rather than failing this
+    The chunk leg is bounded the same way ``/api/collections/search`` is
+    (``min(knowledge.retrieval.max_candidate_chunks, collections.
+    search_max_chunks)``; a hit bound surfaces as the additive
+    ``candidates_capped: true``), but a failure or an over-broad query
+    there (#2151) degrades that ONE leg to empty rather than failing this
     combined endpoint outright: the response then carries ``degraded:
     {"chunk": "search_unavailable"}`` and a ``degraded_note``, while
     knowledge/table/metric/glossary hits still answer normally.
@@ -226,7 +228,11 @@ async def knowledge_search(
     if corpus_ids:
         try:
             chunk_meta = await asyncio.to_thread(search_with_meta, corpus_ids, q, k=k)
-            chunk_hits = chunk_meta["results"]
+            # Carry the "bounded scan filled its cap" signal along as
+            # `SearchResults.capped` (a list subclass — unified_search reads
+            # it off whatever chunk list it is handed and re-emits it on its
+            # own return value, which the payload below reads).
+            chunk_hits = SearchResults(chunk_meta["results"], capped=bool(chunk_meta["truncated"]))
         except SearchQueryTooBroad:
             # A stopword-only query over an oversized corpus is refused
             # OUTRIGHT by collections_search (a dedicated, chunk-only
@@ -289,6 +295,14 @@ async def knowledge_search(
         k=k,
     )
     payload: dict = {"query": q, "results": results, "retrieval": retrieval_mode()}
+    # P0 OOM fix, 2026-09: the chunk leg's candidate scan is bounded
+    # (`min(knowledge.retrieval.max_candidate_chunks, collections.
+    # search_max_chunks)`) — additive, present only when the bound was
+    # actually hit, so a caller with a huge grant set knows the chunk
+    # results may not be exhaustive. `chunk_hits` is the `SearchResults`
+    # built above, so the flag survives unified_search's merge.
+    if getattr(results, "capped", False):
+        payload["candidates_capped"] = True
     if chunk_degraded:
         payload["degraded"] = {"chunk": "search_unavailable"}
         payload["degraded_note"] = _CHUNK_LEG_DEGRADED_NOTE

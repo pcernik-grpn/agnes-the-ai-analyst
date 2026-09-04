@@ -89,6 +89,11 @@ CATALOG: dict[str, AuditEvent] = {
     "access_policy.preview": AuditEvent(
         "access_policy.preview", "read", "An admin previewed a table access policy's effect."
     ),
+    "access_policy.preview_groups": AuditEvent(
+        "access_policy.preview_groups",
+        "read",
+        "An admin previewed a table access policy's effect across every group.",
+    ),
     "attachment.download": AuditEvent("attachment.download", "read", "A chat attachment was downloaded."),
     "catalog.list": AuditEvent("catalog.list", "read", "The table/dataset catalog was listed."),
     "catalog.sample": AuditEvent("catalog.sample", "read", "A table sample was fetched via the catalog."),
@@ -140,6 +145,9 @@ CATALOG: dict[str, AuditEvent] = {
     ),
     "broker_llm_auth_failure": AuditEvent(
         "broker_llm_auth_failure", "system", "The secret broker's LLM credential auth failed."
+    ),
+    "broker_llm_unreachable": AuditEvent(
+        "broker_llm_unreachable", "system", "The secret broker could not reach the LLM upstream at all."
     ),
     "broker_path_rejected": AuditEvent("broker_path_rejected", "system", "The secret broker rejected a path."),
     "broker_ticket_scope_mismatch": AuditEvent(
@@ -223,6 +231,9 @@ CATALOG: dict[str, AuditEvent] = {
     ),
     "facts.merge": AuditEvent("facts.merge", "mutation", "Two fact-graph nodes were merged."),
     "facts.split": AuditEvent("facts.split", "mutation", "A fact-graph node was split."),
+    "facts.stats.rebuild": AuditEvent(
+        "facts.stats.rebuild", "mutation", "The fact-graph collection-stats summary was rebuilt."
+    ),
     "initial_workspace.applied": AuditEvent(
         "initial_workspace.applied", "mutation", "An initial-workspace override was applied to a client."
     ),
@@ -648,6 +659,14 @@ CATALOG: dict[str, AuditEvent] = {
     "access_policy.compile": AuditEvent(
         "access_policy.compile", "mutation", "An admin compiled a table access policy's SQL from its builder form."
     ),
+    # `PUT /api/admin/registry/{id}` writes its generic `update_table` row
+    # too; these two name the policy change itself, so "every access-policy
+    # change in the last N days" is a direct `action_prefix=access_policy.`
+    # query rather than a grep through `update_table` params.
+    "access_policy.set": AuditEvent(
+        "access_policy.set", "mutation", "An admin attached or edited a table access policy."
+    ),
+    "access_policy.clear": AuditEvent("access_policy.clear", "mutation", "An admin cleared a table's access policy."),
     "data_source.bigquery_connection_test": AuditEvent(
         "data_source.bigquery_connection_test",
         "read",
@@ -710,6 +729,49 @@ CATALOG: dict[str, AuditEvent] = {
         "sharepoint_connection.manual_site_remove",
         "mutation",
         "An admin removed a SharePoint site previously added by URL.",
+    ),
+    "sharepoint_connection.scope_bulk_add": AuditEvent(
+        "sharepoint_connection.scope_bulk_add",
+        "mutation",
+        "An admin confirmed many SharePoint folder paths as scopes in one bulk call.",
+    ),
+    "sharepoint_connection.scope_bulk_mode_set": AuditEvent(
+        "sharepoint_connection.scope_bulk_mode_set",
+        "mutation",
+        "An admin flipped access_mode (manual/mirrored) on many of a SharePoint connection's "
+        "existing scopes in one call.",
+    ),
+    "sharepoint_connection.acl_site_group_map_set": AuditEvent(
+        "sharepoint_connection.acl_site_group_map_set",
+        "mutation",
+        "An admin set a SharePoint connection's site-group -> Agnes-group ACL mirroring map.",
+    ),
+    "sharepoint_connection.clone": AuditEvent(
+        "sharepoint_connection.clone",
+        "mutation",
+        "An admin cloned a SharePoint connection into a sibling wired to the same credential "
+        "material, including a copied vault secret when the source's certificate was uploaded "
+        "rather than sourced from a deployment env var.",
+    ),
+    "sharepoint_connection.collections_consolidate": AuditEvent(
+        "sharepoint_connection.collections_consolidate",
+        "mutation",
+        "An admin folded several of a SharePoint connection's per-scope collections into one "
+        "target, re-pointing every scope and moving the source collections' files/chunks/claims "
+        "and resource grants onto it.",
+    ),
+    "sharepoint_connection.split_apply": AuditEvent(
+        "sharepoint_connection.split_apply",
+        "mutation",
+        "An admin split a SharePoint connection's site into several sibling connections, each with its own "
+        "slice of the top-level folders.",
+    ),
+    "sharepoint_connection.split_merge": AuditEvent(
+        "sharepoint_connection.split_merge",
+        "mutation",
+        "An admin folded several sibling SharePoint connections (a manually split site) back into one, "
+        "carrying over each sibling's crawl/facts progress and re-pointing its scopes, collections and "
+        "run history onto the target.",
     ),
     "source_connection.chat_tools_disable": AuditEvent(
         "source_connection.chat_tools_disable",
@@ -1075,6 +1137,25 @@ CATALOG: dict[str, AuditEvent] = {
     "sharepoint_connection.tree_search": AuditEvent(
         "sharepoint_connection.tree_search", "read", "An admin searched a SharePoint connection's folder tree."
     ),
+    "sharepoint_connection.split_plan_read": AuditEvent(
+        "sharepoint_connection.split_plan_read",
+        "read",
+        "An admin previewed how a SharePoint connection's site would split into several sibling connections.",
+    ),
+    "sharepoint_connection.shard_plan_read": AuditEvent(
+        "sharepoint_connection.shard_plan_read",
+        "read",
+        "An admin previewed how the automatic parallel crawl would shard a SharePoint connection's site "
+        "(2026-09-03 auto-parallel-crawl design). Same disclosure class as split_plan_read: folder counts, "
+        "never document content.",
+    ),
+    "sharepoint_connection.completeness_read": AuditEvent(
+        "sharepoint_connection.completeness_read",
+        "read",
+        "An admin ran a SharePoint connection's completeness check (expected vs. indexed document counts "
+        "per scope/folder). Same disclosure class as split_plan_read: folder names and document counts, "
+        "never document content.",
+    ),
     "source_connection.tables_discover": AuditEvent(
         "source_connection.tables_discover",
         "read",
@@ -1152,11 +1233,41 @@ CATALOG: dict[str, AuditEvent] = {
         "mutation",
         "A document extraction was started for one SharePoint connection.",
     ),
+    "sharepoint_connection.retry_empty": AuditEvent(
+        "sharepoint_connection.retry_empty",
+        "mutation",
+        "An admin re-queued a SharePoint connection's convert_empty document backlog for conversion.",
+    ),
+    "sharepoint_connection.facts_reset_no_claims": AuditEvent(
+        "sharepoint_connection.facts_reset_no_claims",
+        "mutation",
+        "An admin reset a SharePoint connection's facts ledger entries that carry no claims, "
+        "so the next pass re-extracts them (TCRD-296 gap #62).",
+    ),
     # -- Cooperative stop (owner-frustration fix, 2026-09-01) -----------------
     "extraction.stop_requested": AuditEvent(
         "extraction.stop_requested",
         "mutation",
         "An admin requested a running (or about-to-run) extraction crawl stop at its next quiescent point.",
+    ),
+    # -- Force-cancel a stuck run (owner-frustration fix, 2026-09-03) --------
+    "sharepoint_extraction_run.cancel": AuditEvent(
+        "sharepoint_extraction_run.cancel",
+        "mutation",
+        "An admin force-cancelled a running (or stalled) SharePoint extraction run — the job was "
+        "finalized failed and the run row closed interrupted, whether or not the crawl itself ever noticed.",
+    ),
+    # -- Per-connection retry-policy override (cost-levers task, lever A) ----
+    "extraction.facts_retry_mode_set": AuditEvent(
+        "extraction.facts_retry_mode_set",
+        "mutation",
+        "An admin set (or cleared) a SharePoint connection's per-connection extraction.facts.retry_mode override.",
+    ),
+    # -- Per-connection age filter for a crawl backfill --------------------
+    "extraction.min_modified_set": AuditEvent(
+        "extraction.min_modified_set",
+        "mutation",
+        "An admin set (or cleared) a SharePoint connection's per-connection extraction.crawl.min_modified filter.",
     ),
     "run_sharepoint_extraction": AuditEvent(
         "run_sharepoint_extraction",
@@ -1358,6 +1469,24 @@ CATALOG: dict[str, AuditEvent] = {
         "read",
         "An admin previewed what the anonymizer would redact in a pasted sample "
         "(length and counts recorded; the sample text itself is never stored).",
+    ),
+    # -- RBAC-reviewer finding on #1979: two policy-editor reads were
+    # declared `exempt:ui_support` despite returning content, the same class
+    # `access_policy.preview` / `access_policy.preview_groups` above are
+    # audited for. `GET .../policy/revisions` returns the full historical
+    # `policy_sql` body of every saved revision; `GET .../policy/columns`
+    # returns profiler-derived `samples` (real row values, cf.
+    # `catalog.sample`). Reclassified to real, cataloged reads — see
+    # `src/audit_posture.py` READ_POSTURE for the route mapping.
+    "access_policy.revisions_view": AuditEvent(
+        "access_policy.revisions_view",
+        "read",
+        "An admin read a table access policy's saved revision history.",
+    ),
+    "access_policy.columns_view": AuditEvent(
+        "access_policy.columns_view",
+        "read",
+        "An admin read a table's schema + sample values for the no-SQL policy builder.",
     ),
 }
 

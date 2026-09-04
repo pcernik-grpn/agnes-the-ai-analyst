@@ -906,9 +906,24 @@ def build_jobs() -> list[JobRow | EnqueueJobRow]:
             "POST",
             1800,
         ),
-        # K3 (#798): per-collection knowledge.duckdb artifact rebuild.
-        # Fingerprint-only when nothing changed since the last pass.
-        ("knowledge-packaging", _seconds_to_schedule(kpkg), "/api/admin/run-knowledge-packaging", "POST", 600),
+        # K3 (#798); TCRD-296 synthesis C.15: per-collection knowledge.duckdb
+        # artifact rebuild. `/api/admin/run-knowledge-packaging` is now a
+        # thin enqueue of the `knowledge-packaging` worker job kind (was:
+        # ran the pass INLINE on this HTTP call, with only this scheduler
+        # client timeout bounding it — the live incident that fix closes,
+        # see src.knowledge_packaging's module docstring). Short
+        # _ENQUEUE_TIMEOUT_SEC, same as every other enqueue-only row below,
+        # since the call now just inserts a job row and returns. A 409
+        # (idempotency-key dedupe — a previous run is still `queued`/
+        # `running`) is expected, not an error: `_run_job` logs it as a
+        # warning and moves on, exactly like every other dedupe-guarded row.
+        (
+            "knowledge-packaging",
+            _seconds_to_schedule(kpkg),
+            "/api/admin/run-knowledge-packaging",
+            "POST",
+            _ENQUEUE_TIMEOUT_SEC,
+        ),
         # K4 (#799): maintained-digest regeneration. Fingerprint-only when
         # idle; LLM call only when a digest's sources or instructions
         # changed. Longer 900s timeout — same job class as corporate-memory

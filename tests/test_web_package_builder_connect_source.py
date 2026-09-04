@@ -30,6 +30,8 @@ it was:
 
 from __future__ import annotations
 
+from tests import _ds_page_source
+
 import re
 from pathlib import Path
 
@@ -38,7 +40,6 @@ STATIC = Path("app/web/static")
 
 COMPONENT = STATIC / "js" / "components" / "package_drawer.js"
 COMPONENT_CSS = STATIC / "css" / "package_drawer.css"
-SOURCES_PAGE = TEMPLATES / "admin_data_sources.html"
 
 
 def _auth(token: str) -> dict:
@@ -294,12 +295,12 @@ class TestTheSourcesPageHoldsTheOtherEndOfTheTrip:
         """`from` is untrusted request input. It is compared against a literal
         and the destination is hard-coded, so it cannot steer a navigation the
         way an interpolated value could."""
-        page = SOURCES_PAGE.read_text(encoding="utf-8")
+        page = _ds_page_source.page_source()
         assert '_params.get("from") === "package-builder"' in page
         assert '"/admin/data-packages/new"' in page
 
     def test_the_wizard_stops_after_choosing_tables_on_that_entry(self) -> None:
-        page = SOURCES_PAGE.read_text(encoding="utf-8")
+        page = _ds_page_source.page_source()
         assert "let _fromPackageBuilder = false;" in page
         assert "_fromPackageBuilder = true;" in page
         # Bundle and Share BUILD a package; they are not offered to someone

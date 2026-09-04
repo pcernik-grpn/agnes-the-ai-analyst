@@ -34,12 +34,27 @@ Three properties are load-bearing, in descending order of importance:
 
 Which LLM path this reuses
 --------------------------
-Credential resolution follows the established server-side convention exactly
-— ``ANTHROPIC_API_KEY`` → ``LLM_API_KEY`` → Vertex ADC — as implemented by
-``src/store_guardrails/runner.py::default_api_key_loader`` and
-``src/ingest/vision.py``, with the Vertex client built by
-``connectors.llm.vertex_provider.create_vertex_client`` and the model id
-translated by ``to_vertex_model_id``. The model default comes from the same
+:func:`build_client` resolves WHICH PROVIDER (Anthropic direct, or Google
+Vertex AI) builds the client via :func:`resolve_llm_provider` — the SAME
+ladder ``connectors.sharepoint.facts_extraction.resolve_effective_provider``
+uses for its own default: an explicit per-stage setting
+(``extraction.anonymization.provider`` for this module, ``extraction.
+scan_ocr.provider`` for :mod:`src.ingest.scan_ocr`) wins outright;
+otherwise ``extraction.facts.provider`` (when it itself names a concrete
+provider rather than its own default ``inherit``); otherwise this instance's
+own ``ai.provider`` (``connectors.llm.factory.vertex_config_or_none``); and
+only once none of those resolve to Vertex does a static
+``ANTHROPIC_API_KEY``/``LLM_API_KEY`` apply. This fixes a live incident
+(TCRD-296 gap #68): scan OCR and NER previously resolved "static key wins,
+Vertex ADC is the keyless fallback" — the OPPOSITE precedence — so a stale
+``ANTHROPIC_API_KEY`` left in the environment (an exhausted workspace) kept
+winning over an instance that had migrated everything else to Vertex. A
+Vertex resolution builds the client through
+``connectors.llm.vertex_provider.create_vertex_client`` with the model id
+translated by ``to_vertex_model_id``, using this instance's own
+``ai.vertex.project_id``/``ai.vertex.region``
+(``connectors.llm.factory.vertex_config_or_none``) — neither module adds a
+region override of its own. The model default comes from the same
 ``extraction.model`` knob corporate-memory extraction uses, resolved through
 ``connectors.llm.factory.resolve_model_tier`` so ``haiku``/``sonnet``/``opus``
 also work.
@@ -612,8 +627,7 @@ def configured_max_output_tokens() -> int:
         # as unexplained `anonymize_failed` counts with nothing pointing at
         # the config that caused them.
         logger.warning(
-            "extraction.anonymization.llm.max_output_tokens=%r is outside [%d, %d]; "
-            "using the default %d instead",
+            "extraction.anonymization.llm.max_output_tokens=%r is outside [%d, %d]; using the default %d instead",
             raw,
             _MIN_OUTPUT_TOKENS,
             _MAX_OUTPUT_TOKENS,
@@ -642,17 +656,108 @@ def _vertex_config() -> tuple[str, str] | None:
         return None
 
 
-def build_client(model: str, timeout_s: float) -> tuple[Any, str]:
-    """Build the Anthropic client for ``model``; returns ``(client, model)``.
+#: The closed vocabulary a provider-selection knob accepts — mirrors
+#: ``connectors.sharepoint.facts_extraction._VALID_PROVIDERS`` exactly (this
+#: module intentionally does not import that one: it is a private name in a
+#: different module, and the vocabulary is small and stable enough that a
+#: copy pinned by :func:`resolve_llm_provider`'s own tests is preferable to a
+#: cross-module private dependency).
+_VALID_PROVIDER_SETTINGS = frozenset({"inherit", "anthropic", "vertex"})
 
-    Static key wins; Vertex ADC is the keyless fallback (and rewrites the
-    model id to the Vertex spelling) — the same precedence every other
-    server-side call-site in this repo uses. Raises
-    :class:`DetectionUnavailable` when neither credential path is configured,
+
+def _provider_config_value(*path: str) -> str:
+    """One provider-selection knob from ``instance.yaml``, normalized and
+    validated against :data:`_VALID_PROVIDER_SETTINGS` — ``""`` when unset,
+    unreadable (no config package / no ``instance.yaml`` at all), or not one
+    of the closed set. A recognized-but-wrong value is warned about and
+    still treated as unset (the same loudly-named, quietly-corrected posture
+    ``connectors.sharepoint.facts_extraction._provider_setting`` takes for
+    its own knob) — a typo in config must not crash a crawl.
+    """
+    try:
+        from app.instance_config import get_value
+
+        raw = get_value(*path, default="")
+    except Exception:  # noqa: BLE001 — no config package / no instance.yaml is fine
+        return ""
+    value = str(raw or "").strip().lower()
+    if value in _VALID_PROVIDER_SETTINGS:
+        return value
+    if value:
+        logger.warning(
+            "%s=%r is not one of %s — ignoring",
+            ".".join(path),
+            raw,
+            sorted(_VALID_PROVIDER_SETTINGS),
+        )
+    return ""
+
+
+def resolve_llm_provider(*own_setting_path: str) -> tuple[str, str]:
+    """``(provider, source)`` — ALWAYS a concrete ``"anthropic"``/``"vertex"``,
+    the provider :func:`build_client` builds its client against.
+
+    The SAME ladder ``connectors.sharepoint.facts_extraction.
+    resolve_effective_provider`` uses for its own ``inherit`` default,
+    generalized so a caller can name its own provider-selection knob:
+
+    1. ``own_setting_path`` (this STAGE's own knob — e.g.
+       ``extraction.scan_ocr.provider`` for scan OCR,
+       ``extraction.anonymization.provider`` for the NER detector). An
+       explicit ``anthropic``/``vertex`` there wins outright; ``inherit`` (or
+       absent) falls through. Pass ``()`` (no path) to skip this level
+       entirely — the shared batches-API client
+       (``connectors.sharepoint.facts_extraction._ensure_batch_client``) has
+       no per-stage knob of its own and relies on levels 2/3 alone.
+    2. ``extraction.facts.provider`` — an explicit value there wins next, so
+       a stage with no override of its own follows whatever the facts pass
+       is pinned to (a single operator decision, "this instance's LLM
+       traffic goes through Vertex", should not need restating per stage).
+    3. This instance's own ``ai.provider`` — read the SAME way every other
+       server-side call site does (:func:`connectors.llm.factory.
+       vertex_config_or_none`): ``"vertex"`` when configured, else
+       ``"anthropic"``.
+
+    Never "a static ``ANTHROPIC_API_KEY``/``LLM_API_KEY`` wins over Vertex" —
+    that was this ladder's PREVIOUS precedence and is the live incident this
+    function exists to fix (TCRD-296 gap #68): a stale key left in the
+    environment (an exhausted workspace, or used by something unrelated)
+    kept outranking an instance that had migrated everything else to
+    Vertex. The static key is consulted only by :func:`build_client` itself,
+    once this function has already said the resolved provider is
+    ``"anthropic"``.
+
+    ``source`` is ``"own"``, ``"facts"``, or ``"ai.provider"`` — which level
+    decided, for the one-line startup log a caller may want to emit.
+    """
+    if own_setting_path:
+        own = _provider_config_value(*own_setting_path)
+        if own and own != "inherit":
+            return own, "own"
+    facts = _provider_config_value("extraction", "facts", "provider")
+    if facts and facts != "inherit":
+        return facts, "facts"
+    if _vertex_config() is not None:
+        return "vertex", "ai.provider"
+    return "anthropic", "ai.provider"
+
+
+def build_client(model: str, timeout_s: float, *, own_setting_path: tuple[str, ...] = ()) -> tuple[Any, str]:
+    """Build the Anthropic (direct or Vertex) client for ``model``; returns
+    ``(client, model)``.
+
+    Provider selection goes through :func:`resolve_llm_provider` —
+    ``own_setting_path`` names this CALLER's own provider knob (see that
+    function's docstring); the default ``()`` skips straight to
+    ``extraction.facts.provider``/``ai.provider``, which is what a caller
+    with no per-stage knob of its own (the Batches-API client) wants.
+    Raises :class:`DetectionUnavailable` when the resolved provider has no
+    usable credential — a missing Vertex configuration when resolved to
+    ``"vertex"``, or no static key when resolved to ``"anthropic"`` —
     because "no credential" must fail the document, not empty it.
 
     **This is the shared ladder, and it stays model-transparent.** Scan OCR
-    (`connectors/sharepoint/scan_ocr.py`) and fact extraction
+    (`src/ingest/scan_ocr.py`) and fact extraction
     (`connectors/sharepoint/facts_extraction.py`) both delegate here and both
     rely on getting a client for the model THEY asked for — a vision model and
     `extraction.facts.model` respectively. The anonymization detector's
@@ -662,9 +767,28 @@ def build_client(model: str, timeout_s: float) -> tuple[Any, str]:
     somewhere that cannot read them and silently override an operator's
     explicit per-stage model choice.
     """
+    provider, _source = resolve_llm_provider(*own_setting_path)
+
+    if provider == "vertex":
+        vertex = _vertex_config()
+        if vertex is None:
+            raise DetectionUnavailable(
+                "the LLM provider resolved to 'vertex' but this instance has no usable Vertex "
+                "configuration — set ai.provider: vertex and ai.vertex.project_id (optionally "
+                "ai.vertex.region) in instance.yaml, or the ANTHROPIC_VERTEX_PROJECT_ID env var"
+            )
+        try:
+            import anthropic  # noqa: F401 — presence probe, same posture as the anthropic branch below
+        except ImportError as exc:  # pragma: no cover - SDK is a server dependency
+            raise DetectionUnavailable("the anthropic SDK is not installed") from exc
+        from connectors.llm.vertex_provider import create_vertex_client, to_vertex_model_id
+
+        return create_vertex_client(project_id=vertex[0], region=vertex[1], timeout=timeout_s), to_vertex_model_id(
+            model
+        )
+
     key = _static_key()
-    vertex = _vertex_config() if not key else None
-    if not key and vertex is None:
+    if not key:
         raise DetectionUnavailable(
             "LLM entity detection requires ANTHROPIC_API_KEY (or LLM_API_KEY) in the "
             "environment, or ai.provider: vertex in instance.yaml"
@@ -673,19 +797,13 @@ def build_client(model: str, timeout_s: float) -> tuple[Any, str]:
         import anthropic
     except ImportError as exc:  # pragma: no cover - SDK is a server dependency
         raise DetectionUnavailable("the anthropic SDK is not installed") from exc
-
-    if vertex is not None:
-        from connectors.llm.vertex_provider import create_vertex_client, to_vertex_model_id
-
-        return create_vertex_client(project_id=vertex[0], region=vertex[1], timeout=timeout_s), to_vertex_model_id(
-            model
-        )
     return anthropic.Anthropic(api_key=key, timeout=timeout_s), model
 
 
 def build_detector_client(model: str, timeout_s: float) -> tuple[Any, str]:
     """The entity detector's client — a self-hosted endpoint if one is
-    configured, otherwise exactly :func:`build_client`.
+    configured, otherwise :func:`build_client` resolved through THIS
+    detector's own ``extraction.anonymization.provider`` knob.
 
     Deliberately a separate entry point rather than a branch inside the shared
     ladder: `extraction.anonymization.llm.*` configures THIS tier, and two
@@ -707,7 +825,7 @@ def build_detector_client(model: str, timeout_s: float) -> tuple[Any, str]:
     """
     endpoint = self_hosted_endpoint()
     if endpoint is None:
-        return build_client(model, timeout_s)
+        return build_client(model, timeout_s, own_setting_path=("extraction", "anonymization", "provider"))
     try:
         import anthropic
     except ImportError as exc:  # pragma: no cover - SDK is a server dependency

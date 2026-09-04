@@ -44,3 +44,33 @@ def test_large_element_is_windowed():
     assert len(chunks) > 1
     assert all(c.section_path == "Big" for c in chunks)
     assert isinstance(chunks[0], Chunk)
+
+
+def test_nul_byte_mid_word_is_stripped_from_a_plain_string_source():
+    """PostgreSQL `text` columns reject NUL outright — see
+    `src.ingest.chunking._sanitize_control_chars`'s docstring for the live
+    finding (261 rejected documents) this closes."""
+    chunks = chunk_text("in.c_keboola_ex_db_or\x00acle_ap_suppliers")
+    assert len(chunks) == 1
+    assert "\x00" not in chunks[0].text
+    assert chunks[0].text == "in.c_keboola_ex_db_oracle_ap_suppliers"
+
+
+def test_other_c0_control_chars_are_stripped_but_tab_newline_cr_survive():
+    # Trailing whitespace-like characters are stripped by `chunk_text`
+    # itself (unrelated to sanitization), so `\r` sits mid-string here to
+    # isolate what this test is actually asserting.
+    text = "before\x01\x02\x1fafter\tmid\rline\nend"
+    chunks = chunk_text(text)
+    assert chunks[0].text == "beforeafter\tmid\rline\nend"
+
+
+def test_nul_bytes_are_stripped_from_extract_result_full_text_and_elements():
+    res = ExtractResult(
+        full_text="ignored\x00",
+        elements=[("Sec\x00tion", "first \x00section text"), ("Body", "second section text")],
+    )
+    chunks = chunk_text(res)
+    assert chunks[0].section_path == "Section"
+    assert chunks[0].text == "first section text"
+    assert "\x00" not in chunks[1].text

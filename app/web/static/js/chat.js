@@ -194,8 +194,9 @@ let _initialRestorePromise = null;
  *  pre-conversation hero — "Ask Agnes anything" — with the `?session=` param
  *  already stripped from the URL by `openSession`. That is indistinguishable
  *  from being dropped into a new chat, and it is what the reporter saw. So:
- *  the hero comes down synchronously here, the status line says what is
- *  happening, and the fetches start now instead of after the sidebar.
+ *  the hero comes down synchronously here and the fetches start now instead
+ *  of after the sidebar. No status line for the wait itself — connecting is
+ *  not an event the reader has to be told about.
  *
  *  The session id is deliberately NOT consumed: `_hadInitialSession` (the
  *  `?agent=` race guard) is captured later in boot and must still see it. */
@@ -204,7 +205,6 @@ function _restoreInitialSessionEarly() {
   // A deep link names a conversation that exists — never show the
   // pre-conversation dashboard for it, not even for one frame.
   hideCapabilities();
-  setStatus("Restoring conversation…", "info");
   _initialRestorePromise = openSession(_initialSessionId, undefined, { restoring: true }).catch((err) => {
     console.error("chat: deep-link restore failed", err);
   });
@@ -251,15 +251,167 @@ function _resyncOpenSessionMeta() {
 // handshake) does NOT mean the server-side ``ChatManager.attach`` has finished
 // spawning the runner and populated ``live[chat_id]`` — that takes ~5 s for
 // sandbox creation. If we send ``user_msg`` during that window the server
-// raises ``SessionNotFound``, closes the WS with 4404, and the user sees
-// "Disconnected — click the conversation again to resume." with no idea why.
-// All ``user_msg`` sends now ``await`` this promise first.
+// raises ``SessionNotFound`` and closes the WS with 4404, with the turn the
+// user just sent silently lost. All ``user_msg`` sends now ``await`` this
+// promise first.
 let serverReadyPromise = null;
 let resolveServerReady = null;
-function resetServerReady() {
+// Which conversation's attach the current promise is waiting on, and whether
+// it has already been resolved. The pair is what lets a same-conversation
+// re-arm BRIDGE rather than cut.
+let _serverReadyChatId = null;
+let _serverReadySettled = false;
+/** Arm the ready gate for ``chatId``'s attach.
+ *
+ *  A submit can already be awaiting this promise when the socket drops — the
+ *  close handler re-arms, and the reconnect's ``openSession`` re-arms again.
+ *  Replacing the promise there strands that waiter: the reconnect's ``ready``
+ *  frame resolves only the newest promise, so the submit sits out its whole
+ *  30 s timeout even though recovery succeeded. An UNRESOLVED promise for the
+ *  same conversation is therefore kept, and the next ``ready`` frame releases
+ *  whoever is already on it.
+ *
+ *  A different conversation always gets a fresh promise: bridging across a
+ *  switch would let session B's ``ready`` release a submit aimed at session A,
+ *  which would then send into B's socket. */
+function resetServerReady(chatId = null) {
+  if (serverReadyPromise && !_serverReadySettled && chatId !== null && chatId === _serverReadyChatId) return;
+  _serverReadyChatId = chatId;
+  _serverReadySettled = false;
   serverReadyPromise = new Promise((r) => { resolveServerReady = r; });
 }
 resetServerReady();
+
+// --- background reconnect ----------------------------------------
+// A dropped socket is OUR problem, not the reader's: while the sandbox is
+// alive, losing the stream and getting it back is backend bookkeeping and must
+// be invisible. So a close of the live socket re-opens the same conversation
+// on its own — ``openSession`` re-mints a per-conversation ticket — silently,
+// and only a recovery that ran out of attempts says anything.
+//
+// Mirrors keboola/ui's kai-chat reconnect (``packages/kai-chat/src/
+// useStreamReconnect.ts`` + ``constants.ts``, rendered by
+// ``apps/kbc-ui/.../SheetChatContent.tsx``): three attempts, exponential
+// ``2^n × 1000 ms``, nothing shown while a retry is pending (that host passes
+// ``errorMessage: isReconnecting ? null : …`` — the error is suppressed
+// outright, there is no "reconnecting…" copy), the error surfacing only once
+// the budget is spent, and the counter resetting on a turn that COMPLETED
+// rather than on one that merely started — a network bad enough to burn the
+// budget stops retrying behind the user's back.
+const WS_RECONNECT_MAX_ATTEMPTS = 3;
+// The one line a connection failure earns: what the reader can do, not what
+// broke. Sockets, tickets and runners are not their vocabulary.
+const WS_RECONNECT_FAILED_COPY =
+  "Could not get back to this conversation. Send your message again, or reload the page.";
+// Close codes a browser can actually observe on THIS route and that a fresh
+// socket would be refused identically for, so they skip the retries.
+//
+// Only 4404 qualifies. ``ws_stream`` sends 4401 (bad/expired ticket) and 4503
+// (coordination unavailable) BEFORE ``ws.accept()`` (``app/api/chat.py``), and
+// a pre-accept close is an HTTP handshake rejection — the browser reports an
+// abnormal 1006, never the code (``tests/e2e/test_adversarial.py`` asserts on
+// exactly that handshake rejection). Listing them would be dead code. It also
+// would not be the behavior we want: every attempt below mints its OWN ticket,
+// so a stale one cannot be what the next attempt presents, and the ticket
+// failures that a retry genuinely cannot cure are caught at the HTTP mint,
+// where the status IS legible. 4403 belongs to the co-drive ``join`` route,
+// which this handler never opens.
+const WS_CLOSE_REJECTED = new Set([4404]);
+// Mint failures no retry can cure: the conversation is gone, or not this
+// caller's. Anything else — 408/429, a 5xx, a refused connection — is the
+// transient case retrying exists for.
+const WS_MINT_FATAL_STATUS = new Set([401, 403, 404]);
+let _wsReconnectAttempts = 0;
+let _wsReconnectTimer = null;
+// Invalidates a recovery already past its `setTimeout`. Clearing the timer
+// cannot cancel a ticket request in flight, and by the time that request
+// resolves the reader may have re-opened or submitted — ``currentChatId`` can
+// match again — so the stale callback would close the replacement socket and
+// spend the freshly reset budget. Same idiom as ``_openGeneration``.
+let _wsReconnectGen = 0;
+
+/** Drop a pending retry, invalidate one already awaiting, and restore the
+ *  budget. This is the manual escape hatch from a spent budget — the user
+ *  sending a message is the gesture kai-chat's ``resetReconnect`` button is. */
+function _resetWsReconnect() {
+  if (_wsReconnectTimer !== null) {
+    clearTimeout(_wsReconnectTimer);
+    _wsReconnectTimer = null;
+  }
+  _wsReconnectGen++;
+  _wsReconnectAttempts = 0;
+}
+
+/** Re-open ``chatId`` after an unexpected drop — silently — or, with the
+ *  budget spent, tell the reader what to do about it. */
+function _scheduleWsReconnect(chatId) {
+  if (_wsReconnectAttempts >= WS_RECONNECT_MAX_ATTEMPTS) {
+    setStatus(WS_RECONNECT_FAILED_COPY, "error");
+    // A turn nobody can reach any more has stopped, whatever the server is
+    // still doing with it: no frame can arrive on a socket we have given up
+    // re-opening, so no terminal frame is coming to take the signal down.
+    // Before #2156 this left a stale Stop button, which was already wrong;
+    // deriving the indicator from the same state would have upgraded it to a
+    // spinner running forever under an abandoned answer. The copy above is
+    // what the reader acts on, and it says to send the message again.
+    setTurnInFlight(false);
+    return;
+  }
+  const delay = 2 ** _wsReconnectAttempts * 1000;
+  _wsReconnectAttempts++;
+  const gen = _wsReconnectGen;
+  if (_wsReconnectTimer !== null) clearTimeout(_wsReconnectTimer);
+  _wsReconnectTimer = setTimeout(async () => {
+    _wsReconnectTimer = null;
+    if (gen !== _wsReconnectGen) return;
+    // Both checks mean the drop already resolved itself: the reader moved to
+    // another conversation (or out of one), or a submit's ``ensureWsReady``
+    // beat this timer to the reconnect.
+    if (currentChatId !== chatId) return;
+    if (ws && ws.readyState === 1) return;
+    try {
+      // Minted HERE, and handed to ``openSession`` through the override it
+      // already takes, so a failed mint is one more silent attempt instead of
+      // the reader-facing resume-failure block: that block is the right answer
+      // when THEY asked to open the conversation, not for a recovery they
+      // never saw start. A server coming back up usually refuses the first
+      // ticket and serves the second.
+      const t = await api(`/api/chat/sessions/${chatId}/ticket`, { method: "POST" });
+      if (gen !== _wsReconnectGen) return;
+      if (currentChatId !== chatId) return;
+      // History and replay are one source or the other, never both. The
+      // reload below re-renders every PERSISTED message, and a REST row
+      // carries no seq to advance the watermark with — so asking for a
+      // gap replay from the pre-drop watermark hands us the same
+      // ``assistant_message`` a second time for any turn that completed
+      // during the outage, and ``finalizeAssistantMessage`` (no streaming
+      // bubble to finalize after the reload) appends a duplicate answer.
+      // Dropping the watermark is what the ``full_refresh`` handler already
+      // does for the identical reason. Nothing is lost: an in-flight turn is
+      // re-sent from ``attach``'s own turn buffer regardless of last_seq,
+      // and unanswered approval cards are replayed explicitly.
+      lastSeenSeqByChat.delete(chatId);
+      await openSession(chatId, t.ws_url, {
+        reconnecting: true,
+        // #1973's working state, which the ticket alone knows before the
+        // socket exists. Dropped, it left a mid-answer recovery with no
+        // spinner and no Stop button until the new socket said `ready`.
+        turnInFlight: !!(t && t.turn_in_flight),
+      });
+    } catch (err) {
+      console.error("chat: background reconnect attempt failed", err);
+      if (gen !== _wsReconnectGen) return;
+      if (err && WS_MINT_FATAL_STATUS.has(err.status)) {
+        // Not a dropped connection: this conversation is gone or was never
+        // this caller's, and a fourth try changes neither.
+        setStatus(WS_RECONNECT_FAILED_COPY, "error");
+        return;
+      }
+      // One more attempt if the budget allows; the line above if it does not.
+      _scheduleWsReconnect(chatId);
+    }
+  }, delay);
+}
 
 // --- capability empty-state panel ---------------------------------
 // Populated from a server-embedded JSON blob
@@ -501,6 +653,187 @@ function setThreadTitle(title) {
 //    appears in a thread — a user who never sees one never pays for it, which
 //    is the only reason a dependency this size is tolerable here.
 const _MERMAID_URL = "/static/vendor/mermaid.min.js";
+
+// ── pure helpers ─────────────────────────────────────────────────────────
+// Self-contained on purpose: tests/test_chat_mermaid_ui.py slices this block
+// out of the file and runs it under node, so it must not reach for the DOM.
+
+// The root <svg> open tag, anchored to the start of the string.
+const _ROOT_SVG_TAG = /^(\s*<svg\b)([^>]*)(>)/i;
+const _SVG_STYLE_ATTR = /\s+style="([^"]*)"/i;
+
+/** Make a diagram fluid: drop the root <svg>'s fixed width/height and give it
+ *  `width="100%"` plus a `max-width` taken from the viewBox, so it shrinks to
+ *  fit a narrow chat column and never stretches past its natural size on a
+ *  wide one. Mermaid sizes its output for the 900px sandbox it lays out in,
+ *  which in a ~700px bubble meant a diagram was clipped and scrolled sideways
+ *  rather than simply being smaller.
+ *
+ *  Only the ROOT tag is rewritten — the regex is anchored to the start of the
+ *  string. Mermaid embeds inner <svg> icons whose fixed width/height IS their
+ *  layout; an unanchored match strips the first of THOSE whenever the root tag
+ *  carries no height of its own, detaching the icon instead of sizing the
+ *  diagram.
+ *
+ *  An existing `style` is preserved apart from its own max-width: mermaid puts
+ *  theme custom properties there that its inner <style> block derives colours
+ *  from, so dropping the attribute wholesale resolves those to black.
+ *
+ *  A root tag with NO viewBox is left exactly as it is. The viewBox is the only
+ *  thing that says what the diagram's proportions are; without it, width and
+ *  height ARE the sizing (`hasDrawnContent` documents the same case), and
+ *  stripping them while having no max-width to put back leaves an <svg> with no
+ *  intrinsic height — which collapses to the CSS default rather than scaling.
+ *  The `.msg-mermaid-stage` overflow rule is the fallback for that case. */
+function makeResponsiveSvg(svg) {
+  if (typeof svg !== "string" || !svg) return svg;
+  const viewBox = svg.match(/viewBox="[^"]*\s([\d.]+)\s+[\d.]+"/);
+  const vbWidth = viewBox ? Math.round(Number(viewBox[1])) : 0;
+  if (!vbWidth) return svg;
+  return svg.replace(_ROOT_SVG_TAG, (_m, open, attrs, close) => {
+    const existing = (attrs.match(_SVG_STYLE_ATTR) || [])[1] || "";
+    const decls = existing
+      .replace(/max-width:\s*[^;"]*;?\s*/gi, "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .replace(/;$/, "");
+    let next = attrs
+      .replace(/\s+width="[^"]*"/i, "")
+      .replace(/\s+height="[^"]*"/i, "")
+      .replace(_SVG_STYLE_ATTR, "");
+    next += ' width="100%"';
+    const style = [decls, `max-width: ${vbWidth}px`].filter(Boolean).join("; ");
+    if (style) next += ` style="${style}"`;
+    return `${open}${next}${close}`;
+  });
+}
+
+/** Whether a mermaid parse failure means "ran out of input" rather than "this
+ *  is wrong". Mermaid's jison parsers report end-of-input as token `1`, so a
+ *  fence that is still arriving — a turn sealed by a tool card while the
+ *  diagram is half-written — fails that way, where genuinely broken syntax
+ *  fails on a real token.
+ *
+ *  The two deserve different treatment: a truncated diagram is not yet wrong,
+ *  and finalize re-renders the completed text a moment later. Telling the
+ *  reader it "could not be drawn" in between is a lie that corrects itself,
+ *  which is worse than saying nothing. Only a lower bound — some truncations
+ *  do land on a real token and read as invalid, which is the pre-existing
+ *  behaviour, not a regression. */
+function isTruncatedDiagram(err) {
+  const token = err && err.hash && err.hash.token;
+  return token === 1;
+}
+
+/** Whether mermaid actually drew something. A degenerate `viewBox="0 0 0 0"`
+ *  is a silent layout failure that would otherwise be cached and shown as an
+ *  empty box; a MISSING viewBox counts as drawn, since some diagram types are
+ *  sized by width/height attributes instead. Root tag only, for the same
+ *  reason makeResponsiveSvg is anchored. */
+const _ROOT_VIEWBOX = /^\s*<svg\b[^>]*\sviewBox\s*=\s*(["'])\s*[\d.eE+-]+\s+[\d.eE+-]+\s+([\d.eE+-]+)\s+([\d.eE+-]+)\s*\1/i;
+function hasDrawnContent(svg) {
+  const m = String(svg || "").match(_ROOT_VIEWBOX);
+  if (!m) return true;
+  return Number(m[2]) > 0 && Number(m[3]) > 0;
+}
+
+// ── theme ────────────────────────────────────────────────────────────────
+
+/** The attribute _theme_resolve.html actually writes. An earlier read of
+ *  `dataset.colorScheme` matched nothing on any instance, so every diagram
+ *  drew in mermaid's light palette even on a dark page — dark text on a dark
+ *  ground. Doubles as the render-cache key: the palette is baked into the
+ *  markup, so the same source under a different theme is a different SVG. */
+function _mermaidThemeKey() {
+  return document.documentElement.dataset.theme || "blue";
+}
+
+function _dsToken(name, fallback) {
+  try {
+    const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+    return v || fallback;
+  } catch (e) {
+    return fallback;
+  }
+}
+
+/** Mermaid's own light/dark themes are two fixed palettes that match none of
+ *  Agnes's four (paper, blue, navy, dark). Building on `base` and mapping
+ *  every colour to a `--ds-*` token instead makes a diagram read as part of
+ *  the page in all of them — and a future brand re-skin carries the diagrams
+ *  with it for free, since the tokens are what changes. */
+function _mermaidConfig() {
+  const surface = _dsToken("--ds-surface", "#ffffff");
+  const sunken = _dsToken("--ds-surface-dim", "#f0f2f6");
+  const line = _dsToken("--ds-border", "#e4e7ee");
+  const stroke = _dsToken("--ds-primary", "#2ea877");
+  const text = _dsToken("--ds-text-primary", "#0e1525");
+  const muted = _dsToken("--ds-text-secondary", "#4a5168");
+  const warnBg = _dsToken("--ds-warn-bg", "#fff8e6");
+  const warnLine = _dsToken("--ds-warn-line", "#f5c84b");
+  // Paired with warnBg by the design system. A highlight box must take its
+  // ink from that pair, never from --ds-text-primary: on a dark instance
+  // that token is near-white, and near-white on a yellow tint measured
+  // 1.47:1 — the ER relationship labels were unreadable.
+  const warnInk = _dsToken("--ds-warn-ink", "#6e4d00");
+  return {
+    startOnLoad: false,
+    securityLevel: "strict",
+    theme: "base",
+    fontFamily: _dsToken("--ds-font", "inherit"),
+    themeVariables: {
+      darkMode: _mermaidThemeKey() === "dark",
+      background: surface,
+      primaryColor: sunken,
+      primaryTextColor: text,
+      primaryBorderColor: stroke,
+      secondaryColor: surface,
+      secondaryTextColor: text,
+      secondaryBorderColor: line,
+      // An ER relationship label is a LABEL, not a warning: it takes the page
+      // surface, like every other label background here.
+      tertiaryColor: surface,
+      tertiaryTextColor: text,
+      tertiaryBorderColor: line,
+      lineColor: muted,
+      textColor: text,
+      mainBkg: sunken,
+      nodeBorder: stroke,
+      nodeTextColor: text,
+      clusterBkg: surface,
+      clusterBorder: line,
+      titleColor: text,
+      edgeLabelBackground: surface,
+      actorBkg: sunken,
+      actorBorder: stroke,
+      actorTextColor: text,
+      actorLineColor: line,
+      signalColor: text,
+      signalTextColor: text,
+      labelBoxBkgColor: sunken,
+      labelBoxBorderColor: stroke,
+      labelTextColor: text,
+      loopTextColor: text,
+      noteBkgColor: warnBg,
+      noteBorderColor: warnLine,
+      noteTextColor: warnInk,
+      sectionBkgColor: sunken,
+      sectionBkgColor2: surface,
+      altSectionBkgColor: surface,
+      taskBkgColor: sunken,
+      taskBorderColor: stroke,
+      taskTextColor: text,
+      taskTextDarkColor: text,
+      taskTextLightColor: text,
+      activeTaskBkgColor: surface,
+      activeTaskBorderColor: stroke,
+      fontSize: "14px",
+    },
+  };
+}
+
+// ── loading + rendering ──────────────────────────────────────────────────
+
 let _mermaidReady = null;
 
 function loadMermaid() {
@@ -511,53 +844,373 @@ function loadMermaid() {
     s.onload = () => (window.mermaid ? resolve(window.mermaid) : reject(new Error("mermaid absent after load")));
     s.onerror = () => reject(new Error("mermaid failed to load"));
     document.head.appendChild(s);
-  }).then((m) => {
-    m.initialize({
-      startOnLoad: false,
-      securityLevel: "strict",
-      theme: document.documentElement.dataset.colorScheme === "dark" ? "dark" : "default",
-      fontFamily: getComputedStyle(document.documentElement).getPropertyValue("--ds-font") || "inherit",
-    });
-    return m;
   });
   return _mermaidReady;
 }
 
 let _mermaidSeq = 0;
 
+// `mermaid.initialize()` sets a GLOBAL config, and the render paths here do not
+// want the same one — a live diagram takes the page palette, an export takes
+// that palette plus `htmlLabels: false`. Since `render` is awaited, an
+// `initialize` from one path can land between another's `initialize` and its
+// render, and the second draws with the first's settings: an export with
+// `<foreignObject>` labels back in it, or a live diagram drawn with the
+// export's. Both paths also run several times per turn (seal, finalize,
+// history reload, theme switch), so the overlap is ordinary, not exotic.
+//
+// So every initialize+render pair runs as one critical section, and each sets
+// the config it is about to use immediately before using it. Nothing depends
+// on "the config mermaid currently has", which is what makes the export need
+// no restore step.
+let _mermaidLock = Promise.resolve();
+
+/** Render one diagram under its own config, serialized against every other
+ *  render.
+ *
+ *  Returns the theme it was ACTUALLY drawn in, read inside the lock. The caller
+ *  keys its cache on that rather than on a value sampled before the await:
+ *  a theme switch while a render is in flight would otherwise file a
+ *  new-palette SVG under the old theme's key, and serve it back the next time
+ *  the user returned to that theme. */
+function _renderMermaid(source, tweak) {
+  const run = _mermaidLock.then(() =>
+    loadMermaid().then(async (mermaid) => {
+      const themeKey = _mermaidThemeKey();
+      const cfg = _mermaidConfig();
+      if (tweak) tweak(cfg);
+      mermaid.initialize(cfg);
+      const out = await mermaid.render(`ag-mmd-${++_mermaidSeq}`, source);
+      return { svg: makeResponsiveSvg(out.svg), themeKey };
+    }),
+  );
+  // The chain must survive a rejection, or one bad diagram stops every render
+  // queued behind it. Callers see the real error through `run`.
+  _mermaidLock = run.then(
+    () => {},
+    () => {},
+  );
+  return run;
+}
+
+// Rendered SVG, keyed by theme + source. Survives the re-render passes a turn
+// makes over the same bubble (seal, finalize, history reload) and the redraw a
+// theme switch triggers, so a diagram is laid out once per appearance rather
+// than once per pass — mermaid's layout is the expensive part, and on a long
+// thread it was being paid repeatedly for diagrams that had not changed.
+const _mermaidCache = new Map();
+const _MERMAID_CACHE_MAX = 60;
+
+function _mermaidCacheGet(key) {
+  return _mermaidCache.get(key);
+}
+
+function _mermaidCacheSet(key, svg) {
+  // Bounded, oldest-first: a long-lived tab must not accumulate every diagram
+  // it has ever shown. Map preserves insertion order, so the first key is the
+  // least recently added.
+  if (_mermaidCache.size >= _MERMAID_CACHE_MAX) {
+    const oldest = _mermaidCache.keys().next().value;
+    if (oldest !== undefined) _mermaidCache.delete(oldest);
+  }
+  _mermaidCache.set(key, svg);
+}
+
+/** Build the rendered-diagram figure: the SVG, plus the small toolbar that
+ *  makes a diagram usable rather than merely present. A flowchart wide enough
+ *  to be worth drawing does not fit a chat column, and before this the only
+ *  recourse was a sideways scrollbar. */
+function _buildMermaidFigure(svg, source) {
+  const fig = document.createElement("div");
+  fig.className = "msg-mermaid";
+  // The source rides along on the node so a theme switch can redraw it
+  // without re-parsing the message markdown, and so "copy" hands back the
+  // fence the agent wrote rather than a wall of generated SVG.
+  fig.dataset.mermaidSrc = source;
+
+  const stage = document.createElement("div");
+  stage.className = "msg-mermaid-stage";
+  // Deliberately not renderMarkdownSafe — see the note at the top of this
+  // section. mermaid's securityLevel:'strict' is what sanitizes the source.
+  stage.innerHTML = svg;
+  fig.appendChild(stage);
+
+  const bar = document.createElement("div");
+  bar.className = "msg-mermaid-bar";
+
+  const mkBtn = (label, title, onClick) => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "msg-mermaid-btn";
+    b.textContent = label;
+    b.title = title;
+    b.setAttribute("aria-label", title);
+    b.addEventListener("click", onClick);
+    return b;
+  };
+
+  bar.appendChild(
+    mkBtn("Expand", "Open the diagram full-screen", () => openMermaidLightbox(fig)),
+  );
+  bar.appendChild(
+    mkBtn("Copy", "Copy the diagram source", (ev) => {
+      const btn = ev.currentTarget;
+      const fence = "```mermaid\n" + source + "\n```";
+      const done = () => {
+        btn.textContent = "Copied";
+        setTimeout(() => (btn.textContent = "Copy"), 1200);
+      };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(fence).then(done, () => {});
+      }
+    }),
+  );
+  bar.appendChild(
+    mkBtn("SVG", "Download the diagram as an SVG file", () => downloadMermaidSvg(fig)),
+  );
+  fig.appendChild(bar);
+  return fig;
+}
+
+function _saveSvgFile(markup) {
+  const blob = new Blob(['<?xml version="1.0" encoding="UTF-8"?>\n' + markup], {
+    type: "image/svg+xml;charset=utf-8",
+  });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "diagram.svg";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+/** Hand the diagram over as a file. An SVG, not a PNG: it is what mermaid
+ *  already produced, and it stays sharp in a deck at any size.
+ *
+ *  The file is NOT the SVG on screen. Mermaid draws every label as HTML inside
+ *  a `<foreignObject>` — 101 of them in a mid-sized ER diagram — and
+ *  `<foreignObject>` is an OPTIONAL part of the SVG spec: engines built on a
+ *  browser render it, and the standalone consumers a saved diagram tends to
+ *  end up in (design tools, server-side rasterizers like librsvg/resvg)
+ *  commonly do not, which draws the boxes and drops every label. Rather than
+ *  bet the file on that, the source is re-rendered with `htmlLabels: false`,
+ *  which lays the same diagram out with real `<text>`/`<tspan>` — core SVG
+ *  that every consumer implements — and THAT is what gets saved. Colours are
+ *  already literals by this point (mermaid resolves the tokens at render
+ *  time), so the file needs nothing from the page.
+ *
+ *  If the re-render fails for any reason, the on-screen markup is saved rather
+ *  than nothing: a file with blank labels still beats a button that silently
+ *  does nothing. */
+function downloadMermaidSvg(fig) {
+  const onScreen = fig.querySelector("svg");
+  if (!onScreen) return;
+  const source = fig.dataset.mermaidSrc || "";
+  const fallback = () => _saveSvgFile(onScreen.outerHTML);
+  if (!source.trim()) return fallback();
+  // No restore step: `_renderMermaid` serializes this against the live render
+  // paths and each of them sets its own config immediately before rendering,
+  // so the export's `htmlLabels: false` cannot outlive its own render.
+  _renderMermaid(source, (cfg) => {
+    cfg.htmlLabels = false;
+    cfg.flowchart = Object.assign({}, cfg.flowchart, { htmlLabels: false });
+  })
+    .then((out) => _saveSvgFile(out.svg))
+    .catch(fallback);
+}
+
+/** Full-screen the diagram with pan and zoom. The reason this exists at all:
+ *  a diagram earns its place by showing structure, and structure is exactly
+ *  what a 700px column takes away from anything with more than a handful of
+ *  nodes. */
+function openMermaidLightbox(fig) {
+  const svg = fig.querySelector("svg");
+  if (!svg) return;
+  const back = document.createElement("div");
+  back.className = "msg-mermaid-lightbox";
+  back.setAttribute("role", "dialog");
+  back.setAttribute("aria-modal", "true");
+  back.setAttribute("aria-label", "Diagram");
+
+  // The panel is the diagram's own ground and does NOT move: pan and zoom
+  // transform the canvas inside it, so the surface stays put and clips
+  // instead of sliding off with the diagram.
+  const panel = document.createElement("div");
+  panel.className = "msg-mermaid-panel";
+  const canvas = document.createElement("div");
+  canvas.className = "msg-mermaid-canvas";
+  // Cloned, not moved: closing the lightbox must leave the message intact.
+  const copy = svg.cloneNode(true);
+  copy.removeAttribute("style");
+  copy.setAttribute("width", "100%");
+  copy.setAttribute("height", "100%");
+  canvas.appendChild(copy);
+  panel.appendChild(canvas);
+  back.appendChild(panel);
+
+  const close = document.createElement("button");
+  close.type = "button";
+  close.className = "msg-mermaid-close";
+  close.textContent = "Close";
+  close.setAttribute("aria-label", "Close the diagram");
+  back.appendChild(close);
+
+  let scale = 1;
+  let tx = 0;
+  let ty = 0;
+  const apply = () => {
+    canvas.style.transform = `translate(${tx}px, ${ty}px) scale(${scale})`;
+  };
+  back.addEventListener(
+    "wheel",
+    (e) => {
+      e.preventDefault();
+      const factor = e.deltaY < 0 ? 1.12 : 1 / 1.12;
+      scale = Math.min(8, Math.max(0.2, scale * factor));
+      apply();
+    },
+    { passive: false },
+  );
+  let dragging = false;
+  let px = 0;
+  let py = 0;
+  back.addEventListener("pointerdown", (e) => {
+    if (e.target === close) return;
+    dragging = true;
+    px = e.clientX;
+    py = e.clientY;
+    back.setPointerCapture && back.setPointerCapture(e.pointerId);
+  });
+  back.addEventListener("pointermove", (e) => {
+    if (!dragging) return;
+    tx += e.clientX - px;
+    ty += e.clientY - py;
+    px = e.clientX;
+    py = e.clientY;
+    apply();
+  });
+  const endDrag = () => (dragging = false);
+  back.addEventListener("pointerup", endDrag);
+  back.addEventListener("pointercancel", endDrag);
+
+  const dismiss = () => {
+    document.removeEventListener("keydown", onKey);
+    back.remove();
+  };
+  const onKey = (e) => {
+    if (e.key === "Escape") dismiss();
+  };
+  document.addEventListener("keydown", onKey);
+  close.addEventListener("click", dismiss);
+  // Only a click on the backdrop itself closes — a click that ends a drag
+  // across the diagram must not dismiss the thing being read.
+  back.addEventListener("click", (e) => {
+    if (e.target === back) dismiss();
+  });
+
+  document.body.appendChild(back);
+  close.focus();
+}
+
 /** Swap every ```mermaid code block inside `root` for its rendered diagram.
  *  A block that fails to render KEEPS its source on screen with a short note:
  *  a diagram the agent got syntactically wrong is still information, and a
  *  silently blank space would read as a product fault rather than a bad
- *  diagram. */
+ *  diagram. A block that is merely INCOMPLETE — the turn sealed mid-fence —
+ *  is left alone without a note, because finalize renders it properly a
+ *  moment later and a self-correcting error message is worse than silence. */
 function renderMermaidBlocks(root) {
   if (!root) return;
   const blocks = root.querySelectorAll("code.language-mermaid");
   if (!blocks.length) return;
-  loadMermaid()
-    .then(async (mermaid) => {
-      for (const code of blocks) {
-        const host = code.closest("pre") || code;
-        const source = code.textContent || "";
-        try {
-          const { svg } = await mermaid.render(`ag-mmd-${++_mermaidSeq}`, source);
-          const fig = document.createElement("div");
-          fig.className = "msg-mermaid";
-          // Deliberately not renderMarkdownSafe — see the note above.
-          fig.innerHTML = svg;
-          host.replaceWith(fig);
-        } catch (err) {
-          const note = document.createElement("div");
-          note.className = "msg-mermaid-error";
-          note.textContent = "This diagram could not be drawn; its source is below.";
-          host.parentNode && host.parentNode.insertBefore(note, host);
+  (async () => {
+    // The theme is read per diagram, not once for the batch: a switch part-way
+    // through a long turn must not file the rest of it under the old palette.
+    let lastTheme = _mermaidThemeKey();
+    for (const code of blocks) {
+      const host = code.closest("pre") || code;
+      if (!host.isConnected) continue;
+      const source = code.textContent || "";
+      if (!source.trim()) continue;
+      try {
+        const cached = _mermaidCacheGet(_mermaidThemeKey() + "\n" + source);
+        let svg = cached;
+        if (svg === undefined) {
+          const out = await _renderMermaid(source);
+          svg = out.svg;
+          lastTheme = out.themeKey;
+          if (!hasDrawnContent(svg)) throw new Error("mermaid produced an empty diagram");
+          _mermaidCacheSet(out.themeKey + "\n" + source, svg);
         }
+        if (!host.isConnected) continue;
+        host.replaceWith(_buildMermaidFigure(svg, source));
+      } catch (err) {
+        if (isTruncatedDiagram(err)) continue;
+        if (!host.isConnected) continue;
+        if (host.previousElementSibling && host.previousElementSibling.classList.contains("msg-mermaid-error")) {
+          continue;
+        }
+        const note = document.createElement("div");
+        note.className = "msg-mermaid-error";
+        note.textContent = "This diagram could not be drawn; its source is below.";
+        host.parentNode && host.parentNode.insertBefore(note, host);
       }
-      maybeScrollToBottom();
-    })
-    .catch(() => {
-      /* Diagrams are additive: the fenced source stays readable. */
-    });
+    }
+    // A theme switch that fired while these were still rendering ran its
+    // redraw over the figures that were in the DOM at the time — which is not
+    // these. Catch them up rather than leaving an island until the next switch.
+    if (_mermaidThemeKey() !== lastTheme) rerenderMermaidForTheme();
+    maybeScrollToBottom();
+  })().catch(() => {
+    /* Diagrams are additive: the fenced source stays readable. */
+  });
+}
+
+/** Redraw every diagram on screen in the current palette. Mermaid bakes its
+ *  colours into the markup, so a theme switch leaves an already-rendered
+ *  diagram as a light island on a dark page (or the reverse) until the thread
+ *  is reloaded. `data-mermaid-src` is what makes this cheap: the source is on
+ *  the node, so nothing has to go back through the markdown pipeline. */
+function rerenderMermaidForTheme() {
+  const figs = document.querySelectorAll(".msg-mermaid[data-mermaid-src]");
+  if (!figs.length) return;
+  (async () => {
+    for (const fig of figs) {
+      const source = fig.dataset.mermaidSrc || "";
+      if (!source.trim()) continue;
+      try {
+        const cached = _mermaidCacheGet(_mermaidThemeKey() + "\n" + source);
+        let svg = cached;
+        if (svg === undefined) {
+          const out = await _renderMermaid(source);
+          if (!hasDrawnContent(out.svg)) continue;
+          _mermaidCacheSet(out.themeKey + "\n" + source, out.svg);
+          svg = out.svg;
+        }
+        const stage = fig.querySelector(".msg-mermaid-stage");
+        if (stage) stage.innerHTML = svg;
+      } catch (err) {
+        /* Keep the diagram that is already on screen — a palette that no
+           longer matches beats an empty space. */
+      }
+    }
+  })().catch(() => {});
+}
+
+// The theme is switched by mutating <html data-theme> (see
+// _theme_resolve.html), from the user menu AND from an OS-level change while
+// the tab is open. Watching the attribute catches both without the toggle
+// having to know diagrams exist.
+if (typeof MutationObserver !== "undefined") {
+  let _lastMermaidTheme = _mermaidThemeKey();
+  new MutationObserver(() => {
+    const now = _mermaidThemeKey();
+    if (now === _lastMermaidTheme) return;
+    _lastMermaidTheme = now;
+    rerenderMermaidForTheme();
+  }).observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
 }
 
 // ---------- Sources block -------------------------------------------------
@@ -685,7 +1338,11 @@ function _claimHref(claim) {
  *  derived from less information would be worse than none. */
 /** Did this answer render something a reader would want a source for?
  *  Checked in the DOM after rendering — mermaid may still be its `<pre>` at
- *  this point (rendering is async), so both forms count. */
+ *  this point (rendering is async), so both forms count. Both names are
+ *  load-bearing and neither is `mermaid`: the fence sanitizes to
+ *  `<pre><code class="language-mermaid">`, and the rendered figure is
+ *  `.msg-mermaid`. The earlier `pre.mermaid, .mermaid` pair matched neither,
+ *  so a diagram-only answer was read as having no figure at all. */
 function _bubbleHasFigure(bubble) {
   const body = bubble && bubble.querySelector(".msg-body");
   if (!body) return false;
@@ -694,7 +1351,7 @@ function _bubbleHasFigure(bubble) {
   // answer that merely contained a snippet — including greetings — and hung
   // "Sources — none declared" under it. Only marks that came from the
   // answer's own markdown count. (Devin Review.)
-  const candidates = body.querySelectorAll("table, svg, img, pre.mermaid, .mermaid");
+  const candidates = body.querySelectorAll("table, svg, img, code.language-mermaid, .msg-mermaid");
   for (const el of candidates) {
     if (el.closest("button, .msg-actions, .code-actions, .tool-block")) continue;
     return true;
@@ -2358,6 +3015,14 @@ async function loadAndRenderHistory(chatId) {
   $("chat-messages").innerHTML = "";
   _endToolGroup();
   clearThinkingPlaceholder();
+  // The wipe above detached every card, so the per-turn maps are now holding
+  // nodes that are no longer on screen. That was already harmless for the
+  // result frames (renderToolCallEnd would update a detached node nobody can
+  // see), but #2156 made `inFlightToolCalls` load-bearing for what the reader
+  // sees: left stale, a mid-turn `full_refresh` would suppress the activity
+  // indicator for the rest of that turn.
+  inFlightToolCalls.clear();
+  _currentTurnToolCards = [];
   // Reset recall state for the chat being loaded up front, not after a
   // successful fetch — a failed fetch must not leave ArrowUp/ArrowDown
   // browsing the PREVIOUS conversation's prompts under the new chatId.
@@ -2492,9 +3157,7 @@ function _renderRestoreFailure(detail) {
   _syncSessionUrl(null);
   markActiveSidebar(null);
   _markConversationNotStarted();
-  clearThinkingPlaceholder();
-  const cancelBtn = $("cancel-btn");
-  if (cancelBtn) cancelBtn.hidden = true;
+  setTurnInFlight(false);
   const host = $("chat-messages");
   if (host) host.innerHTML = "";
   showCapabilities();
@@ -2522,9 +3185,7 @@ function _renderRestoreFailure(detail) {
  *  retry: both routes back (send a message, or reload this same URL) re-mint a
  *  ticket for this same session. */
 function _renderResumeFailure(detail) {
-  clearThinkingPlaceholder();
-  const cancelBtn = $("cancel-btn");
-  if (cancelBtn) cancelBtn.hidden = true;
+  setTurnInFlight(false);
   renderSystemNote(
     "Could not reconnect to this conversation just now. Nothing is lost — " +
       "send a message or reload the page to try again." + (detail ? ` (${detail})` : ""),
@@ -2550,7 +3211,7 @@ function _renderResumeFailure(detail) {
  * FAILS says so in the transcript instead of silently leaving the caller on
  * the pre-conversation hero with a dead id in hand.
  */
-async function openSession(chatId, wsUrlOverride, { restoring = false } = {}) {
+async function openSession(chatId, wsUrlOverride, { restoring = false, reconnecting = false, turnInFlight: turnInFlightHint = null } = {}) {
   // Claim this open. Every await below is followed by a check that we are
   // still the newest one; a superseded call returns without touching the
   // transcript, `currentChatId` or `ws`.
@@ -2577,6 +3238,11 @@ async function openSession(chatId, wsUrlOverride, { restoring = false } = {}) {
   // open as a fresh conversation re-showed the empty-state hero one tick
   // after the first message replaced it.
   const _switchingSession = currentChatId !== chatId;
+  // The retry budget belongs to a conversation, the way kai-chat's lives in
+  // one chat instance's hook state: a different conversation starts fresh,
+  // and a reconnect of THIS one (currentChatId already equals chatId) keeps
+  // spending the budget it is on.
+  if (_switchingSession) _resetWsReconnect();
   currentChatId = chatId;
   markActiveSidebar(chatId);
   // The session-files drawer keeps per-conversation state — the count badge,
@@ -2638,13 +3304,23 @@ async function openSession(chatId, wsUrlOverride, { restoring = false } = {}) {
     _renderRestoreFailure(hydrated.error);
     return;
   }
-  // The restore got its transcript — drop the "Restoring conversation…" line.
-  // (The in-flight-turn branch below sets its own, truer line.)
+  // A recovery nobody asked for must not cost the reader their transcript.
+  // The wipe already happened inside loadAndRenderHistory, so attaching a
+  // socket now would leave a healthy-looking session over an empty panel;
+  // failing the attempt hands it back to the retry, which re-fetches.
+  if (reconnecting && !hydrated.ok) {
+    throw new Error(hydrated.error || "history reload failed");
+  }
+  // The restore got its transcript — nothing about the load is worth a line
+  // any more, so make sure none is left over from before it.
   if (restoring) setStatus("");
 
   // Mint a fresh WS ticket for THIS chat_id (unless caller already has one).
   let wsUrl = wsUrlOverride;
-  let turnInFlight = false;
+  // A caller that brought its own ws_url skipped the mint, so it has to bring
+  // the ticket's `turn_in_flight` too — there is nothing else to read it from
+  // before the socket exists.
+  let turnInFlight = turnInFlightHint === true;
   if (!wsUrl) {
     try {
       const t = await api(`/api/chat/sessions/${chatId}/ticket`, { method: "POST" });
@@ -2667,18 +3343,18 @@ async function openSession(chatId, wsUrlOverride, { restoring = false } = {}) {
       return;
     }
   }
-  // Paint the working state BEFORE the socket: attaching can take seconds
-  // (a paused sandbox has to resume), and for that whole window a reload
-  // mid-answer used to show no spinner, no Stop button and no status — the
-  // silence that invited the second reload behind the duplicated questions
-  // in #1973. The replayed turn frames land in this same bubble.
-  if (turnInFlight) {
-    setStatus("Reattaching to the answer in progress…", "info");
-    showThinkingPlaceholder();
-    _reattachPlaceholder = true;
-    const cancelBtn = $("cancel-btn");
-    if (cancelBtn) cancelBtn.hidden = false;
-  }
+  // Set the working state BEFORE the socket: attaching can take seconds (a
+  // paused sandbox has to resume), and for that whole window a reload
+  // mid-answer used to show no spinner and no Stop button — the silence that
+  // invited the second reload behind the duplicated questions in #1973. The
+  // signal is about the ANSWER, not the socket: the reattach itself gets no
+  // status line. The replayed turn frames land in this same bubble.
+  // Unconditional, both ways: attaching to a conversation whose turn has
+  // already finished has to take DOWN a Stop button left over from the
+  // conversation being switched away from, which the old `if (turnInFlight)`
+  // guard could not do (#2156).
+  _reattachGuessedTurn = !!turnInFlight;
+  setTurnInFlight(!!turnInFlight, { immediate: true });
 
   // Reconnect replay (wave-2F task 3): tell the server the highest seq we
   // already saw for this chat so it can resend anything we missed (or
@@ -2692,26 +3368,52 @@ async function openSession(chatId, wsUrlOverride, { restoring = false } = {}) {
   }
 
   const proto = location.protocol === "https:" ? "wss" : "ws";
-  resetServerReady();
-  // Show a "Resuming session…" status immediately after the TCP handshake and
-  // before the ready frame arrives. For a fresh spawn this reads as a brief
-  // connecting state; for a paused session (~1–2 s resume) it tells the user
-  // something is happening. The ready frame handler clears it — connected is
-  // the normal state and gets no pill.
-  // Not while reattaching to a live answer — "Reattaching to the answer in
-  // progress…" is the truer line and it is already up (#1973).
-  if (!turnInFlight) setStatus("Resuming session…", "info");
+  resetServerReady(chatId);
+  // No "Resuming session…" line, and no pill of any kind for the connect: a
+  // fresh spawn, a paused sandbox resuming (~1–2 s) and a reconnect after a
+  // drop are all the same thing to the reader — the answer is coming. The
+  // status bar is for what they can act on. Cleared rather than left as-is so
+  // a line from the state being left cannot linger.
+  // Not while reattaching to a live answer: the spinner and Stop button
+  // painted above are that turn's signal and must not be disturbed (#1973).
+  if (!turnInFlight) setStatus("");
   if (openGen !== _openGeneration) return;   // last check before claiming `ws`
   ws = new WebSocket(`${proto}://${location.host}${wsUrl}`);
-  ws.onmessage = (ev) => handleFrame(JSON.parse(ev.data));
-  ws.onclose = () => {
-    setStatus("Disconnected — click the conversation again to resume.", "warn");
-    // Re-arm so the next openSession starts with an unresolved promise;
-    // resolveServerReady is replaced fresh in resetServerReady().
-    resetServerReady();
+  // THIS socket, captured for the handlers below: `ws` is a module global that
+  // the next open — or any deliberate close — reassigns out from under them.
+  const sock = ws;
+  sock.onmessage = (ev) => handleFrame(JSON.parse(ev.data));
+  sock.onclose = (ev) => {
+    // Only the socket that is STILL the current one may act here. `close()`
+    // fires its event a task later, so every deliberate drop — openSession
+    // switching conversations, _renderRestoreFailure, deleteChat,
+    // startNewChatFromGesture's catch — runs this handler after the caller
+    // has already set its own status and possibly armed a replacement
+    // socket. A superseded socket acting then would erase that caller's
+    // error line, re-arm serverReadyPromise behind a live socket (so the next
+    // submit waits out its 30 s timeout for a `ready` frame that already
+    // arrived), and reconnect a conversation nobody is looking at.
+    if (ws !== sock) return;
+    // Re-arm so the next openSession starts with an unresolved promise —
+    // and, for a reconnect of this same conversation, so that whoever is
+    // already awaiting the current one is bridged onto the new attach rather
+    // than left to time out (see resetServerReady).
+    resetServerReady(chatId);
+    // A rejection is not a dropped connection — a new socket would be turned
+    // away identically, so skip the retries and say so now.
+    if (WS_CLOSE_REJECTED.has(ev.code)) {
+      setStatus(WS_RECONNECT_FAILED_COPY, "error");
+      return;
+    }
+    // Everything below is connection state, which the reader is not asked to
+    // care about: clear the line rather than leave stale text behind.
+    setStatus("");
+    // A clean 1000 is this page or the server ending the stream on purpose.
+    // Nothing to recover, nothing to say.
+    if (ev.code === 1000) return;
+    _scheduleWsReconnect(chatId);
   };
 }
-
 
 function handleFrame(frame) {
   // Track last-seen seq per session (wave-2F task 2/3 — see
@@ -2745,30 +3447,32 @@ function handleFrame(frame) {
   switch (frame.type) {
     case "ready":
     case "runner_ready":
-      // Connected is the NORMAL state — showing a permanent "Connected."
-      // pill told the user about infrastructure they never asked about
-      // (and reconnection is automatic anyway). Clear the transient
-      // "Resuming session…" line instead; the status surfaces only when
-      // something is wrong (warn/error) or in progress (info).
+      // Connected is the NORMAL state, and so is having reconnected — the
+      // permanent "Connected." pill, the "Disconnected" one and the transient
+      // "Resuming session…" line all told the reader about infrastructure
+      // they never asked about. Clear whatever is up instead; the status
+      // surfaces only when there is something for them to do about it.
       setStatus("");
       // #1973: the attach's own verdict on whether a turn is running. The
       // ticket's flag is a pre-socket guess (and is always false on a replica
       // with no ChatManager) — this corrects it, in both directions, but only
-      // for a placeholder the REATTACH painted: a submit's own placeholder is
-      // waiting for a message the server has not received yet.
-      if (_reattachPlaceholder && frame.turn_in_flight === false) {
-        clearThinkingPlaceholder();
-        $("cancel-btn").hidden = true;
-      } else if (frame.turn_in_flight === true && !thinkingEl) {
-        showThinkingPlaceholder();
-        _reattachPlaceholder = true;
-        $("cancel-btn").hidden = false;
+      // for a turn the REATTACH guessed at: a submit's own turn is waiting on
+      // a message the server has not received yet.
+      if (_reattachGuessedTurn && frame.turn_in_flight === false) {
+        setTurnInFlight(false);
+      } else if (frame.turn_in_flight === true && !_turnInFlight) {
+        _reattachGuessedTurn = true;
+        setTurnInFlight(true, { immediate: true });
       }
       // Unblock any in-flight ``submitUserMessage`` that's awaiting the
       // server's confirmation that the runner is alive. Two frames fire
       // (``ready`` once after WS open, ``runner_ready`` after subprocess
       // boot) but the first one is enough — manager.attach has populated
       // self._live by the time ``ready`` goes out.
+      // Settled BEFORE the call, so a resetServerReady() reached from
+      // anything this unblocks cannot mistake a resolved promise for a
+      // pending one and keep waiters on a gate that will never re-open.
+      _serverReadySettled = true;
       if (resolveServerReady) resolveServerReady();
       break;
     case "token":
@@ -2834,6 +3538,12 @@ function handleFrame(frame) {
       break;
     }
     case "assistant_message":
+      // A turn that COMPLETED proves the connection, so the next drop starts
+      // with a full retry budget again. Deliberately not the `ready` frame: a
+      // socket that merely opened proves nothing, and refilling on it would
+      // let a flapping connection retry forever (kai-chat resets on the same
+      // completed-turn signal, for the same reason).
+      _wsReconnectAttempts = 0;
       finalizeAssistantMessage(frame);
       break;
     case "session_renamed":
@@ -2858,8 +3568,7 @@ function handleFrame(frame) {
       _flushStreamingTail();
       renderSystemNote("Turn cancelled.", "warn");
       setStatus(`Cancelled tool: ${frame.tool || ""}`, "warn");
-      $("cancel-btn").hidden = true;
-      clearThinkingPlaceholder();
+      setTurnInFlight(false);
       onboardingNoteTurnEnded();
       _collapseFinishedToolCalls();
       break;
@@ -2873,8 +3582,7 @@ function handleFrame(frame) {
         "warn",
       );
       setStatus("Tool budget reached.", "warn");
-      $("cancel-btn").hidden = true;
-      clearThinkingPlaceholder();
+      setTurnInFlight(false);
       onboardingNoteTurnEnded();
       _collapseFinishedToolCalls();
       break;
@@ -2885,8 +3593,7 @@ function handleFrame(frame) {
       // or an admin reading over a shoulder can still see `frame.kind`, and
       // it is not the sentence the user is being asked to act on.
       setStatus(`Error: ${frame.kind} (${frame.message || ""})`, "error");
-      $("cancel-btn").hidden = true;
-      clearThinkingPlaceholder();
+      setTurnInFlight(false);
       onboardingNoteTurnEnded();
       _collapseFinishedToolCalls();
       break;
@@ -2895,7 +3602,7 @@ function handleFrame(frame) {
       // an exception — no trailing assistant_message) must not leave the
       // stream pointers armed, or the next turn appends into this bubble.
       _resetStreamingState();
-      $("cancel-btn").hidden = true;
+      setTurnInFlight(false);
       onboardingNoteTurnEnded();
       _collapseFinishedToolCalls();
       // The session-files block listens for this to refresh its count and to
@@ -2930,6 +3637,13 @@ function handleFrame(frame) {
       if (currentChatId) loadAndRenderHistory(currentChatId);
       break;
   }
+  // Every state the indicator derives from changes on a frame, so re-deriving
+  // once here — after the case has done its work, never inside it — is what
+  // makes the signal outlive the first frame (#2156). Doing it per-case is
+  // what the old code effectively did, and it is how the eight clears and one
+  // show drifted apart. Placed after the switch so no half-applied state (a
+  // segment sealed, its tool card not yet appended) is ever painted.
+  syncActivityIndicator();
 }
 
 /** Apply a server-pushed title update for a session — fires when the
@@ -3750,18 +4464,111 @@ function syncJumpToLatest() {
   }
 })();
 
-// ---------- "Agnes is thinking…" placeholder -----------------------------
-// Rendered the moment the user submits, removed as soon as the first
-// server frame (token / tool_call / assistant_message) arrives. Bridges
-// the gap between "I sent a message" and "the agent has started".
+// ---------- Turn activity: one state, two surfaces -----------------------
+// The dots used to be a SUBMIT-only affordance: painted on send, removed by
+// the first server frame, never rendered again. The Stop button meanwhile
+// lived until a terminal frame, off twelve separate `hidden` assignments. So
+// for the whole body of a multi-tool turn — which on a research question is
+// the whole turn — the only thing on screen disagreeing with "this answer is
+// finished" was a button down in the composer that nobody watches while they
+// read (#2156). A partial answer read as final is the text people quote
+// onward, so this is a correctness problem, not a comfort one.
+//
+// Both surfaces now DERIVE from `_turnInFlight`, whose only writer is
+// `setTurnInFlight`, called where a turn starts and where one stops. They
+// cannot contradict each other by construction.
 
 let thinkingEl = null;
-/** True while the placeholder on screen was painted by a REATTACH (#1973 —
- *  openSession found `turn_in_flight` on the ticket) rather than by a submit.
- *  Only such a placeholder may be taken down by the `ready` frame's own
- *  verdict; a submit's placeholder must survive a `ready` that arrives before
- *  the server has even received the message. */
-let _reattachPlaceholder = false;
+/** True while the in-flight turn is one a REATTACH guessed at (#1973 —
+ *  openSession found `turn_in_flight` on the ticket) rather than one this tab
+ *  submitted. Only such a turn may be called off by the `ready` frame's own
+ *  verdict; a submit's turn must survive a `ready` that arrives before the
+ *  server has even received the message. */
+let _reattachGuessedTurn = false;
+let _turnInFlight = false;
+
+/** The turn's running/stopped state, and the ONLY writer of it.
+ *
+ *  `immediate` skips the settle delay on the way up: a submit has to
+ *  acknowledge the keypress on the same tick, and so does a reattach that
+ *  already knows a turn is running. Taking the signal down is never delayed.
+ */
+function setTurnInFlight(on, { immediate = false } = {}) {
+  _turnInFlight = !!on;
+  const cancelBtn = $("cancel-btn");
+  if (cancelBtn) cancelBtn.hidden = !_turnInFlight;
+  // A turn that has stopped is no longer a turn a reattach is guessing about
+  // (#1973). This reset lived in `clearThinkingPlaceholder`, which is exactly
+  // where it stopped being correct once the placeholder became a thing that
+  // comes and goes many times inside one live turn: clearing the flag on any
+  // of those would let a late `ready` frame call off a running turn.
+  if (!_turnInFlight) _reattachGuessedTurn = false;
+  syncActivityIndicator({ immediate });
+  // Complaint 2 on #2156: the indicator at the foot of the transcript is
+  // invisible to the one reader who most needs it — whoever scrolled up to
+  // read the partial answer. The way back is already on their screen, so it
+  // carries a pulse for as long as the turn runs. Marked here rather than in
+  // `syncJumpToLatest`, which stays a pure function of scroll position: the
+  // class rides the element whether or not the button is currently shown, so
+  // scrolling up mid-turn reveals a button already carrying it.
+  const jumpBtn = $("chat-jump-latest");
+  if (jumpBtn) jumpBtn.classList.toggle("is-working", _turnInFlight);
+}
+
+//: How long the transcript may sit still before it owes the reader a signal.
+//: Most of the gaps this bridges are short — a settled tool result to the
+//: next token is often tens of ms — and painting a bubble into the foot of
+//: the transcript for that long is a flicker that also nudges the scroll.
+//: Long enough to swallow those hops, short enough that a reader waiting on a
+//: thinking agent is never the one waiting on this.
+const _ACTIVITY_SETTLE_MS = 400;
+let _activitySettleTimer = null;
+
+/** Is something OTHER than the dots already telling the reader the turn is
+ *  moving — or that it is waiting on them?
+ *
+ *  Ordered cheapest-first on purpose: a `token` frame arrives many times a
+ *  second and must settle on the first term without touching the DOM.
+ */
+function _turnShowsItsOwnActivity() {
+  if (currentAssistantArticle) return true;     // its own caret, or "Finishing…"
+  if (inFlightToolCalls.size > 0) return true;  // a card animating in place
+  // An open approval or question card is the turn waiting on THIS READER,
+  // which must never be dressed up as the agent making progress. Read off the
+  // DOM rather than pendingApprovalFrames/pendingQuestionFrames: a turn that
+  // died with a card still open leaves those maps holding an entry nobody will
+  // ever resolve, and would suppress the indicator for every later turn in the
+  // conversation. The class is on the card actually on screen, so this
+  // self-heals where the maps do not.
+  return !!document.querySelector(".cloud-chat-approval.is-running, .cloud-chat-question.is-running");
+}
+
+/** Re-derive the activity indicator from the turn state.
+ *
+ *  Idempotent, and cheap enough to call after every frame — which is how it
+ *  is driven (see the tail of `handleFrame`), so no state transition can
+ *  leave the screen claiming the turn ended when it has not, or the reverse.
+ */
+function syncActivityIndicator({ immediate = false } = {}) {
+  if (_activitySettleTimer) {
+    clearTimeout(_activitySettleTimer);
+    _activitySettleTimer = null;
+  }
+  if (!_turnInFlight || _turnShowsItsOwnActivity()) {
+    clearThinkingPlaceholder();
+    return;
+  }
+  if (immediate) {
+    showThinkingPlaceholder();
+    return;
+  }
+  _activitySettleTimer = setTimeout(() => {
+    _activitySettleTimer = null;
+    // Re-ask rather than trust the reading that armed the timer: 400 ms is
+    // long enough for the very frame that makes this wrong to have landed.
+    if (_turnInFlight && !_turnShowsItsOwnActivity()) showThinkingPlaceholder();
+  }, _ACTIVITY_SETTLE_MS);
+}
 
 function showThinkingPlaceholder() {
   if (thinkingEl) return;
@@ -3777,9 +4584,6 @@ function showThinkingPlaceholder() {
 }
 
 function clearThinkingPlaceholder() {
-  // Whatever the placeholder was for, it is gone — so is any claim that a
-  // reattach owns it (#1973). Every terminal frame routes through here.
-  _reattachPlaceholder = false;
   if (!thinkingEl) return;
   thinkingEl.remove();
   thinkingEl = null;
@@ -5175,7 +5979,9 @@ function renderToolCallStart(frame) {
   inFlightToolCalls.set(_toolCallId(frame), wrap);
   _currentTurnToolCards.push(wrap);
   maybeScrollToBottom();
-  $("cancel-btn").hidden = false;
+  // A running tool proves a running turn — belt and braces for a reattach
+  // whose `ready` verdict was wrong, or arrived before the turn restarted.
+  setTurnInFlight(true);
 }
 
 //: Where a duration stops being noise and starts being the reason the reader
@@ -5286,6 +6092,43 @@ function _collapseFinishedToolCalls() {
   for (const group of groups) {
     group.open = false;
     _updateToolGroupSummary(group);
+  }
+  // A call that never got its result frame — the turn was cancelled, errored
+  // or hit its budget while the tool was still out. Both the card and the
+  // in-flight map went on claiming it was running for the rest of the
+  // session: the card kept "running…" under a finished transcript, and the
+  // map kept an entry nobody would ever delete. The second one is what made
+  // this belong to #2156 — `_turnShowsItsOwnActivity` reads that map and that
+  // class, so one interrupted call would have suppressed the activity
+  // indicator for every later turn in the conversation. Per-turn bookkeeping,
+  // reset where the turn ends.
+  for (const wrap of inFlightToolCalls.values()) {
+    wrap.classList.remove("is-running");
+    const icon = wrap.querySelector(".cloud-chat-tool-icon");
+    if (icon) icon.replaceChildren(iconEl("ban"));
+    const meta = wrap.querySelector(".cloud-chat-tool-meta");
+    // Not an error: the call did not fail, the turn stopped around it. Same
+    // distinction the group summary already draws for absorbed failures.
+    if (meta) meta.textContent = "did not finish";
+    _updateToolGroupSummary(wrap.closest(".cloud-chat-tool-group"));
+  }
+  inFlightToolCalls.clear();
+  // Same rule for a decision card the turn died under. The server normally
+  // resolves these itself (`approval_resolved` with decision "cancelled"
+  // arrives before the terminal frame, and resolveApprovalCard/
+  // resolveQuestionCard settle the card), so this is usually a no-op — but
+  // `_turnShowsItsOwnActivity` reads that same `is-running` class, so a
+  // resolution that never comes would silence the activity indicator for the
+  // rest of the conversation. Stop claiming a pending decision, and disable
+  // controls that answer a turn nobody is listening to any more. Deliberately
+  // no outcome badge: what the decision WAS is resolveApprovalCard's to say,
+  // from the server's own frame, and inventing one here would be a worse lie
+  // than the one being fixed.
+  for (const card of document.querySelectorAll(
+    ".cloud-chat-approval.is-running, .cloud-chat-question.is-running",
+  )) {
+    card.classList.remove("is-running");
+    card.querySelectorAll("button, input").forEach((x) => { x.disabled = true; });
   }
   _endToolGroup();
   _currentTurnToolCards = [];
@@ -6219,7 +7062,12 @@ async function submitUserMessage(text) {
   //    must not leave the card hanging over the input they just used.
   onboardingNoteComposerSubmitted();
 
-  // 2. Make sure we have an open WS. For a brand-new chat this calls
+  // 2. Make sure we have an open WS. Sending is the gesture that says "I am
+  //    still here, try again" — it refills the reconnect budget the way
+  //    kai-chat's Retry button does, so a conversation that gave up in the
+  //    background gets its automatic recovery back the moment the reader
+  //    reaches for it.
+  //    For a brand-new chat this calls
   //    newChat() -> openSession(), and openSession wipes
   //    ``#chat-messages`` ``innerHTML`` on entry — so we deliberately
   //    DO NOT render the user bubble or the thinking placeholder yet,
@@ -6228,6 +7076,7 @@ async function submitUserMessage(text) {
   //    hide it again after ensureWsReady so that side effect doesn't
   //    undo step 1.
   try {
+    _resetWsReconnect();
     await ensureWsReady();
     hideCapabilities();
     // Re-asserted for exactly the reason hideCapabilities() is, one line up.
@@ -6307,16 +7156,15 @@ async function submitUserMessage(text) {
     // user typed ("add sales"), and an appended attachment line is not part
     // of that sentence.
     if (await onboardingOnUserMessage(rawText, {})) {
-      $("cancel-btn").hidden = true;
+      setTurnInFlight(false);
       return;
     }
   } catch (_) {
     /* onboarding is best-effort — never block the chat on it */
   }
 
-  showThinkingPlaceholder();
-  _reattachPlaceholder = false;   // this one belongs to the submit, not a reattach
-  $("cancel-btn").hidden = false;
+  _reattachGuessedTurn = false;   // this turn is the submit's, not a reattach's guess
+  setTurnInFlight(true, { immediate: true });
   // Arm the long-run nudge here — AFTER the onboarding takeover check, so a
   // turn that never reaches the model (gap resolver, "add X") doesn't start a
   // clock, and BEFORE the runner-ready wait, because a slow runner is exactly
@@ -6335,7 +7183,11 @@ async function submitUserMessage(text) {
     ]);
   } catch (err) {
     setStatus(`Runner did not become ready: ${err.message}`, "error");
-    clearThinkingPlaceholder();
+    // The turn never started, so it must not keep reading as one: before
+    // #2156 these two paths cleared the dots and left the Stop button up for
+    // the rest of the session — the same lie as the bug this fixes, told the
+    // other way round.
+    setTurnInFlight(false);
     // These two bail out before any frame is ever received, so the terminal-frame
     // handlers above never fire — disarm the nudge here or it would fire 45 s
     // later against a turn that died at the door.
@@ -6344,7 +7196,7 @@ async function submitUserMessage(text) {
   }
   if (!ws || ws.readyState !== 1) {
     setStatus("WebSocket dropped before runner became ready.", "error");
-    clearThinkingPlaceholder();
+    setTurnInFlight(false);
     onboardingNoteTurnEnded();
     return;
   }
@@ -7413,6 +8265,24 @@ const ChatAttachments = (() => {
     _coDrive = !!on;
   }
 
+  /** The filename a §6 DIALOG upload should bind, sanitized the same way a
+   *  pasted one is.
+   *
+   *  The paste path gets this for free inside add(); the "+" menu dialogs
+   *  build their own FormData and would otherwise send the name the OS gave
+   *  the file. ``_SAFE_FILENAME_RE`` in app/api/chat_uploads.py rejects that
+   *  name for a single space, so picking a document called "AI Value
+   *  Backlog_Report_v1.pdf" in Add Image/Document failed with a message about
+   *  "disallowed characters" while pasting the very same file worked (#2184).
+   *  Sharing ``_seq`` with the paste path is deliberate: it keeps two uploads
+   *  of the browser's generic "image.png" from colliding no matter which of
+   *  the two routes they arrive by.
+   */
+  function uploadName(file, now = new Date()) {
+    _seq += 1;
+    return safeUploadName(file && file.name, file && file.type, now, _seq);
+  }
+
   return {
     add,
     count,
@@ -7421,6 +8291,7 @@ const ChatAttachments = (() => {
     settle,
     setCoDrive,
     composeText,
+    uploadName,
     // Exposed for tests (tests/test_chat_paste_attachments_ui.py runs these
     // under node against the shipped source).
     _pure: { safeUploadName, kindFor, composeText, filesFromTransfer, stampFor },
@@ -7717,7 +8588,9 @@ const ChatAttachments = (() => {
 
       try {
         const fd = new FormData();
-        fd.append("file", _dataFile);
+        // Third argument = the filename the server sees. Without it the OS's
+        // own name goes up and a space in it is a 400 (#2184).
+        fd.append("file", _dataFile, ChatAttachments.uploadName(_dataFile));
         fd.append("kind", "data");
         if (dataRegisterCb && dataRegisterCb.checked) {
           fd.append("register_as_table", "true");
@@ -8015,7 +8888,9 @@ const ChatAttachments = (() => {
       try {
         const kind = _mediaKind(_mediaFile);
         const fd = new FormData();
-        fd.append("file", _mediaFile);
+        // Third argument = the filename the server sees. Without it the OS's
+        // own name goes up and a space in it is a 400 (#2184).
+        fd.append("file", _mediaFile, ChatAttachments.uploadName(_mediaFile));
         fd.append("kind", kind);
 
         const res = await fetch("/api/chat/uploads", {

@@ -16,9 +16,46 @@ in ``tests/db_pg/test_extraction_api_pg.py``.
 
 from __future__ import annotations
 
+import datetime as dt
 from datetime import datetime, timedelta, timezone
 
+import httpx
+import pytest
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.x509.oid import NameOID
+
 BASE = "/api/admin/sharepoint/connections"
+
+
+def _self_signed_pem() -> str:
+    """A throwaway self-signed certificate + its private key, concatenated —
+    same idiom as ``tests/test_admin_sharepoint.py``'s helper of the same
+    name (kept local rather than shared: each test module in this codebase
+    owns its own fixtures)."""
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    subject = issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "agnes-test")])
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(issuer)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=1))
+        .not_valid_after(dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=1))
+        .sign(key, hashes.SHA256())
+    )
+    cert_pem = cert.public_bytes(serialization.Encoding.PEM).decode()
+    key_pem = key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode()
+    return cert_pem + key_pem
+
+
+PEM = _self_signed_pem()
 
 
 def _auth(token: str) -> dict:
@@ -44,6 +81,7 @@ _ROUTES = (
     "extraction/runs",
     "extraction/runs/er_whatever",
     "extraction/config",
+    "extraction/completeness",
 )
 
 
@@ -152,6 +190,51 @@ class TestExtractionConfig:
         cap = by_key["extraction.crawler.max_file_mb"]
         assert cap["origin"] == "default"
         assert cap["value"] == 50
+
+    def test_min_modified_reads_unset_by_default(self, seeded_app):
+        """The config drawer's Crawl filter panel needs the CURRENT
+        per-connection ``extraction.crawl.min_modified`` override to
+        pre-fill its date input — the same resolved shape the crawl-config
+        PATCH endpoint itself returns."""
+        client, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = _create_connection(client, token, name="sp-config-min-modified")
+        body = client.get(f"{BASE}/{conn_id}/extraction/config", headers=_auth(token)).json()
+        assert body["min_modified"] == {"value": None, "source": "none"}
+
+    def test_min_modified_reflects_a_set_override(self, seeded_app):
+        client, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = _create_connection(client, token, name="sp-config-min-modified-set")
+        client.patch(
+            f"{BASE}/{conn_id}/extraction/crawl-config", json={"min_modified": "2023-12-31"}, headers=_auth(token)
+        )
+        body = client.get(f"{BASE}/{conn_id}/extraction/config", headers=_auth(token)).json()
+        assert body["min_modified"] == {"value": "2023-12-31", "source": "connection"}
+
+    def test_vertex_region_row_falls_back_to_ai_vertex_region_when_no_override(self, seeded_app, monkeypatch):
+        monkeypatch.setattr(
+            "connectors.llm.factory.vertex_config_or_none", lambda *a, **k: ("my-project", "us-central1")
+        )
+        client, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = _create_connection(client, token, name="sp-config-vertex-region")
+        rows = client.get(f"{BASE}/{conn_id}/extraction/config", headers=_auth(token)).json()["effective"]
+        by_key = {r["key"]: r for r in rows if r["key"]}
+        region = by_key["extraction.facts.vertex_region"]
+        assert region["value"] == "us-central1"
+        assert "instance:ai.vertex" in (region["note"] or "")
+
+    def test_vertex_region_row_reflects_a_connection_override(self, seeded_app):
+        client, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = _create_connection(client, token, name="sp-config-vertex-region-override")
+        # A documented bucket for the instance's default (Haiku) model —
+        # see VERTEX_REGION_MODEL_MATRIX (TCRD-296 synthesis F.25).
+        patch_resp = client.patch(
+            f"{BASE}/{conn_id}/extraction/facts-config", json={"vertex_region": "europe-west1"}, headers=_auth(token)
+        )
+        assert patch_resp.status_code == 200, patch_resp.text
+        rows = client.get(f"{BASE}/{conn_id}/extraction/config", headers=_auth(token)).json()["effective"]
+        by_key = {r["key"]: r for r in rows if r["key"]}
+        region = by_key["extraction.facts.vertex_region"]
+        assert region["value"] == "europe-west1"
 
     def test_detector_defaults_to_regex_and_says_no_tokens_are_spent(self, seeded_app):
         client, token = seeded_app["client"], seeded_app["admin_token"]
@@ -278,6 +361,173 @@ class TestExtractionConfig:
         assert "sk-do-not-leak-me" not in raw
 
 
+def _confirm_drive_scope(client, token, conn_id, *, source_scope_id="b!drive1", drive_id="drv1", display_path="Docs"):
+    r = client.post(
+        f"{BASE}/{conn_id}/scopes",
+        json={"source_scope_id": source_scope_id, "display_path": display_path, "drive_id": drive_id},
+        headers=_auth(token),
+    )
+    assert r.status_code == 201, r.text
+    return r.json()
+
+
+def _install_completeness_mock(monkeypatch, *, drive_id="drv1", web_url, count):
+    """Graph token exchange + drive-root webUrl lookup + an empty
+    root/children listing (a whole-drive scope also fetches a per-folder
+    breakdown) + a single Search count — enough for one confirmed drive
+    scope with no sub-folders."""
+    from connectors.sharepoint import graph_client as gc
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/oauth2/v2.0/token"):
+            return httpx.Response(200, json={"access_token": "tok-completeness"})
+        if path == f"/v1.0/drives/{drive_id}/root":
+            return httpx.Response(200, json={"webUrl": web_url})
+        if path == f"/v1.0/drives/{drive_id}/root/children":
+            return httpx.Response(200, json={"value": []})
+        if path == "/v1.0/search/query":
+            return httpx.Response(200, json={"value": [{"hitsContainers": [{"total": count}]}]})
+        raise AssertionError(f"unexpected sharepoint completeness mock path {path}")
+
+    monkeypatch.setattr(
+        gc, "_http_client", lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler), timeout=10)
+    )
+
+
+class TestCompleteness:
+    """``GET …/extraction/completeness`` — A6, "did we really get
+    everything?" (TCRD-296 B.9). Answers on BOTH backends (no
+    ``extraction_runs`` read), unlike A1/A2/A3."""
+
+    def test_no_scopes_never_needs_a_cert(self, seeded_app):
+        """No confirmed scope means nothing to count against — the endpoint
+        must answer 200, never a 409 about a certificate that would only
+        matter once there's a scope to count."""
+        client, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = _create_connection(client, token, name="sp-completeness-nocert-noscope")
+        r = client.get(f"{BASE}/{conn_id}/extraction/completeness", headers=_auth(token))
+        assert r.status_code == 200, r.text
+
+    def test_no_cert_with_a_confirmed_scope_is_409(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("AGNES_SHAREPOINT_ENABLED", "true")
+        client, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = _create_connection(client, token, name="sp-completeness-nocert")
+        _confirm_drive_scope(client, token, conn_id)
+        r = client.get(f"{BASE}/{conn_id}/extraction/completeness", headers=_auth(token))
+        assert r.status_code == 409
+        assert r.json()["detail"]["error"] == "sharepoint_cert_unresolved"
+
+    def test_invalid_min_modified_is_400(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        client, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = _create_connection(client, token, name="sp-completeness-baddate")
+        r = client.get(f"{BASE}/{conn_id}/extraction/completeness?min_modified=not-a-date", headers=_auth(token))
+        assert r.status_code == 400
+        assert r.json()["detail"]["error"] == "invalid_min_modified"
+
+    def test_no_scopes_answers_200_with_an_unknown_total(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        client, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = _create_connection(client, token, name="sp-completeness-noscopes")
+        r = client.get(f"{BASE}/{conn_id}/extraction/completeness", headers=_auth(token))
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["rows"] == []
+        assert body["total"]["status"] == "unknown"
+        assert body["provisional"] is False
+
+    def test_single_drive_scope_answers_200_on_duckdb(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        monkeypatch.setenv("AGNES_SHAREPOINT_ENABLED", "true")
+        client, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = _create_connection(client, token, name="sp-completeness-happy")
+        _confirm_drive_scope(client, token, conn_id)
+        _install_completeness_mock(monkeypatch, web_url="https://example.sharepoint.com/sites/s/Docs", count=3)
+
+        r = client.get(f"{BASE}/{conn_id}/extraction/completeness", headers=_auth(token))
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["connection_id"] == conn_id
+        scope_row = next(row for row in body["rows"] if row["kind"] == "scope")
+        assert scope_row["expected"] == 3
+        assert scope_row["indexed"] == 0
+        assert scope_row["gap"] == 3
+        assert scope_row["status"] == "missing"
+        assert body["total"]["expected"] == 3
+        assert body["cached"] is False
+        assert body["provisional"] is False
+        assert body["min_modified"] == {"value": None, "source": "none"}
+
+        from src.repositories import audit_repo
+
+        rows, _ = audit_repo().query(action="sharepoint_connection.completeness_read", limit=10)
+        assert len(rows) == 1
+
+    def test_repeat_call_is_cached_and_refresh_bypasses_it(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        monkeypatch.setenv("AGNES_SHAREPOINT_ENABLED", "true")
+        client, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = _create_connection(client, token, name="sp-completeness-cache")
+        _confirm_drive_scope(client, token, conn_id)
+
+        calls = {"n": 0}
+        from connectors.sharepoint import graph_client as gc
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            path = request.url.path
+            if path.endswith("/oauth2/v2.0/token"):
+                return httpx.Response(200, json={"access_token": "tok"})
+            if path == "/v1.0/drives/drv1/root":
+                return httpx.Response(200, json={"webUrl": "https://example.sharepoint.com/sites/s/Docs"})
+            if path == "/v1.0/drives/drv1/root/children":
+                return httpx.Response(200, json={"value": []})
+            if path == "/v1.0/search/query":
+                calls["n"] += 1
+                return httpx.Response(200, json={"value": [{"hitsContainers": [{"total": 1}]}]})
+            raise AssertionError(path)
+
+        monkeypatch.setattr(
+            gc, "_http_client", lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler), timeout=10)
+        )
+
+        first = client.get(f"{BASE}/{conn_id}/extraction/completeness", headers=_auth(token))
+        assert first.status_code == 200
+        assert first.json()["cached"] is False
+        first_calls = calls["n"]
+
+        second = client.get(f"{BASE}/{conn_id}/extraction/completeness", headers=_auth(token))
+        assert second.status_code == 200
+        assert second.json()["cached"] is True
+        assert calls["n"] == first_calls  # no new Graph Search calls — served from cache
+
+        refreshed = client.get(f"{BASE}/{conn_id}/extraction/completeness?refresh=true", headers=_auth(token))
+        assert refreshed.status_code == 200
+        assert refreshed.json()["cached"] is False
+        assert calls["n"] > first_calls  # refresh recomputed for real
+
+    def test_provisional_true_while_a_crawl_job_is_in_flight(self, seeded_app, monkeypatch):
+        monkeypatch.setenv("SHAREPOINT_CERT_PRIVATE_KEY", PEM)
+        monkeypatch.setenv("AGNES_SHAREPOINT_ENABLED", "true")
+        client, token = seeded_app["client"], seeded_app["admin_token"]
+        conn_id = _create_connection(client, token, name="sp-completeness-provisional")
+        _confirm_drive_scope(client, token, conn_id)
+        _install_completeness_mock(monkeypatch, web_url="https://example.sharepoint.com/sites/s/Docs", count=1)
+
+        from app.api.admin_sharepoint import _extraction_idempotency_key
+        from src.repositories import jobs_repo
+
+        jobs_repo().enqueue(
+            kind="corpus-extraction",
+            payload={"connection_id": conn_id},
+            idempotency_key=_extraction_idempotency_key(conn_id),
+        )
+
+        r = client.get(f"{BASE}/{conn_id}/extraction/completeness", headers=_auth(token))
+        assert r.status_code == 200, r.text
+        assert r.json()["provisional"] is True
+
+
 class TestDerivedOutcome:
     """Liveness is DERIVED, never trusted, and outcome precedence is
     severity-first — the two rules that stop a card from rendering a crashed
@@ -360,6 +610,35 @@ class TestRunProjection:
         for forbidden in ("percent", "progress_pct", "eta_s", "eta"):
             assert forbidden not in out
 
+    def test_run_out_surfaces_the_age_filter_counters_from_a_running_checkpoint(self):
+        """An operator watching a LIVE run must be able to tell whether
+        `min_modified` is doing anything mid-run, not only after `report()`
+        becomes readable."""
+        from app.api.admin_extraction import _run_out
+
+        out = _run_out(
+            {
+                "id": "er_1",
+                "status": "running",
+                "progress": {"filtered_by_age": 40, "age_unknown": 3},
+            }
+        )
+        assert out["filtered_by_age"] == 40
+        assert out["age_unknown"] == 3
+
+    def test_run_out_surfaces_the_age_filter_counters_from_a_finished_report(self):
+        from app.api.admin_extraction import _run_out
+
+        out = _run_out(
+            {
+                "id": "er_1",
+                "status": "done",
+                "report": {"filtered_by_age": 12, "age_unknown": 0},
+            }
+        )
+        assert out["filtered_by_age"] == 12
+        assert out["age_unknown"] == 0
+
     def test_run_out_never_restamps_freshness(self):
         """`checkpoint_at` is when the numbers were last TRUE — a read must
         not quietly refresh it to now."""
@@ -368,6 +647,22 @@ class TestRunProjection:
         stamp = "2026-08-31T14:08:41+00:00"
         out = _run_out({"id": "er_1", "status": "done", "checkpoint_at": stamp, "report": {}})
         assert out["checkpoint_at"] == stamp
+
+    def test_run_out_surfaces_skipped_unsupported_never_folded_into_errors(self):
+        """A file no conversion backend even attempts is a separate counter
+        from `errors` — the fleet view and the source card must be able to
+        show BOTH without one masking the other."""
+        from app.api.admin_extraction import _run_out
+
+        out = _run_out(
+            {
+                "id": "er_1",
+                "status": "done",
+                "report": {"errors": 3, "skipped_unsupported": 7},
+            }
+        )
+        assert out["errors"] == 3
+        assert out["skipped_unsupported"] == 7
 
     def test_usage_empty_dict_survives_the_projection(self):
         from app.api.admin_extraction import _run_out
@@ -515,6 +810,470 @@ class TestRunProjection:
         out = _run_out({"id": "er_1", "status": "done", "report": {"duration_s": 12.0}})
         assert out["facts_progress"] is None
 
+    def test_scan_ocr_is_absent_when_the_crawl_never_reported_one(self):
+        from app.api.admin_extraction import _run_out
+
+        out = _run_out({"id": "er_1", "status": "running", "phase": "crawl", "progress": {"new": 5}})
+        assert out["scan_ocr"] is None
+
+    def test_scan_ocr_carries_the_disabled_reason_once_the_crawl_reports_it(self):
+        """`src.ingest.scan_ocr.triage_run_usage` — the crawl's
+        own `report["scan_ocr"]` block — rides straight through, same
+        "layered onto report/progress" contract as `facts_progress`."""
+        from app.api.admin_extraction import _run_out
+
+        out = _run_out(
+            {
+                "id": "er_1",
+                "status": "done",
+                "report": {
+                    "scan_ocr": {
+                        "disabled_reason": "http_400",
+                        "provider_error": "Your workspace has hit the API usage limits ...",
+                    }
+                },
+            }
+        )
+        assert out["scan_ocr"] == {
+            "disabled_reason": "http_400",
+            "provider_error": "Your workspace has hit the API usage limits ...",
+        }
+
+
+# ---------------------------------------------------------------------------
+# Shard roll-up (2026-09-03 auto-parallel-crawl design §4.7, plan Task 8) —
+# pure unit tests over `_run_out`'s additive keys and `_rollup_children`; the
+# PG happy path (real child rows joined through the API) lives in
+# `tests/db_pg/test_extraction_api_pg.py`.
+# ---------------------------------------------------------------------------
+
+
+class TestShardModeProjection:
+    def test_a_plain_run_reports_inline_mode_and_no_shard_counters(self):
+        from app.api.admin_extraction import _run_out
+
+        out = _run_out({"id": "er_1", "status": "done", "report": {"new": 3}})
+        assert out["mode"] == "inline"
+        assert out["shards_total"] is None
+        assert out["shards_done"] is None
+        assert out["expected_documents"] is None
+        assert out["seen_documents"] is None
+        assert out["shards"] is None
+
+    def test_a_parent_row_reports_sharded_mode_from_its_own_columns_alone(self):
+        """`shards_total`/`shards_done` come straight off the row — no
+        children needed for the mode/counter fields, only for `shards[]`."""
+        from app.api.admin_extraction import _run_out
+
+        out = _run_out({"id": "er_parent", "status": "running", "shards_total": 3, "shards_done": 1})
+        assert out["mode"] == "sharded"
+        assert out["shards_total"] == 3
+        assert out["shards_done"] == 1
+        # No `children=` given — the per-shard rollup is simply not computed.
+        assert out["shards"] is None
+
+    def test_children_none_vs_empty_list_both_render_shards_as_a_list(self):
+        from app.api.admin_extraction import _run_out
+
+        out = _run_out({"id": "er_parent", "status": "running", "shards_total": 2}, children=[])
+        assert out["shards"] == []
+
+
+class TestRollupChildren:
+    def _child(self, **overrides):
+        base = {
+            "id": "er_child",
+            "connection_id": "conn-1",
+            "status": "done",
+            "shard_key": "drive-1:item-1",
+            "shard_label": "part 1/2",
+            "checkpoint_at": "2026-09-03T00:00:00+00:00",
+            "files_done": 40,
+            "files_seen": 40,
+            "report": {"new": 10, "changed": 5, "unchanged": 25, "filtered_by_age": 2},
+            "error": None,
+        }
+        base.update(overrides)
+        return base
+
+    def test_sums_counters_and_carries_one_row_per_child(self):
+        from app.api.admin_extraction import _rollup_children
+
+        children = [
+            self._child(shard_key="k1", shard_label="part 1/2", report={"new": 10, "changed": 0, "unchanged": 10}),
+            self._child(shard_key="k2", shard_label="part 2/2", report={"new": 3, "changed": 1, "unchanged": 1}),
+        ]
+        out = _rollup_children({"connection_id": "conn-1"}, children, expected_by_key={"k1": 20, "k2": 5})
+        assert len(out["shards"]) == 2
+        assert out["shards"][0]["label"] == "part 1/2"
+        assert out["shards"][0]["expected"] == 20
+        assert out["shards"][1]["expected"] == 5
+        # new+changed+unchanged summed across both children.
+        assert out["seen_documents"] == (10 + 0 + 10) + (3 + 1 + 1)
+        assert out["expected_documents"] == 25
+
+    def test_expected_documents_is_none_when_any_shard_has_no_known_plan(self):
+        """A partial sum would silently understate the site's real target —
+        worse than admitting the total is unknown."""
+        from app.api.admin_extraction import _rollup_children
+
+        children = [self._child(shard_key="k1"), self._child(shard_key="k2")]
+        out = _rollup_children({"connection_id": "conn-1"}, children, expected_by_key={"k1": 20})
+        assert out["expected_documents"] is None
+        assert out["shards"][0]["expected"] == 20
+        assert out["shards"][1]["expected"] is None
+
+    def test_no_children_reports_none_not_zero(self):
+        from app.api.admin_extraction import _rollup_children
+
+        out = _rollup_children({"connection_id": "conn-1"}, [], expected_by_key={})
+        assert out["shards"] == []
+        assert out["expected_documents"] is None
+        assert out["seen_documents"] is None
+
+    def test_a_stalled_child_is_flagged_stuck_on_its_own_row(self):
+        from datetime import datetime, timedelta, timezone
+
+        from app.api.admin_extraction import _STALL_AFTER_S, _rollup_children
+
+        now = datetime.now(timezone.utc)
+        stale = (now - timedelta(seconds=_STALL_AFTER_S + 600)).isoformat()
+        children = [
+            self._child(shard_key="k1", status="running", checkpoint_at=stale),
+            self._child(shard_key="k2", status="running", checkpoint_at=now.isoformat()),
+        ]
+        out = _rollup_children({"connection_id": "conn-1"}, children, expected_by_key={}, now=now)
+        assert out["shards"][0]["outcome"] == "stalled"
+        assert out["shards"][0]["stuck"] is True
+        assert out["shards"][1]["outcome"] == "running"
+        assert out["shards"][1]["stuck"] is False
+
+    def test_a_failed_childs_error_rides_its_own_shard_row(self):
+        from app.api.admin_extraction import _rollup_children
+
+        children = [self._child(shard_key="k1", status="failed", error="CrawlError: boom")]
+        out = _rollup_children({"connection_id": "conn-1"}, children, expected_by_key={})
+        assert out["shards"][0]["outcome"] == "failed"
+        assert out["shards"][0]["error"] == "CrawlError: boom"
+
+
+# ---------------------------------------------------------------------------
+# Fleet view (`GET /extraction/runs`, `/admin/extraction`, 2026-09-02) — the
+# pure helper functions first, no database required; the PG happy path (a
+# fleet row actually surfacing through the API) lives in
+# `tests/db_pg/test_extraction_api_pg.py`.
+# ---------------------------------------------------------------------------
+
+
+class TestFilesPerMin:
+    def test_falls_back_to_the_since_started_average_on_first_observation(self):
+        from app.api.admin_extraction import _files_per_min
+
+        started = datetime.now(timezone.utc) - timedelta(minutes=10)
+        checkpoint = started + timedelta(minutes=5)
+        run = {
+            "id": "er_rate_first_observation",
+            "started_at": started.isoformat(),
+            "checkpoint_at": checkpoint.isoformat(),
+            "files_done": 50,
+        }
+        assert _files_per_min(run) == pytest.approx(10.0, rel=0.05)
+
+    def test_derives_the_windowed_rate_from_two_consecutive_polls(self):
+        """Two calls with the SAME run id, spaced 5 minutes apart in
+        `checkpoint_at` — the windowed rate, not the since-start average
+        (which would read ~2.9/min over the same 21-minute span)."""
+        from app.api.admin_extraction import _files_per_min
+
+        started = datetime.now(timezone.utc) - timedelta(minutes=20)
+        first_checkpoint = started + timedelta(minutes=1)
+        _files_per_min(
+            {
+                "id": "er_rate_two_polls",
+                "started_at": started.isoformat(),
+                "checkpoint_at": first_checkpoint.isoformat(),
+                "files_done": 10,
+            }
+        )
+        second_checkpoint = first_checkpoint + timedelta(minutes=5)
+        rate = _files_per_min(
+            {
+                "id": "er_rate_two_polls",
+                "started_at": started.isoformat(),
+                "checkpoint_at": second_checkpoint.isoformat(),
+                "files_done": 60,
+            }
+        )
+        assert rate == pytest.approx(10.0, rel=0.05)
+
+    def test_none_with_no_files_done_and_no_history(self):
+        from app.api.admin_extraction import _files_per_min
+
+        now = datetime.now(timezone.utc)
+        run = {
+            "id": "er_rate_no_files",
+            "started_at": now.isoformat(),
+            "checkpoint_at": now.isoformat(),
+            "files_done": 0,
+        }
+        assert _files_per_min(run) is None
+
+    def test_none_without_a_checkpoint(self):
+        from app.api.admin_extraction import _files_per_min
+
+        assert _files_per_min({"id": "er_rate_no_checkpoint", "files_done": 5}) is None
+
+    def test_none_without_a_run_id(self):
+        from app.api.admin_extraction import _files_per_min
+
+        now = datetime.now(timezone.utc)
+        assert _files_per_min({"checkpoint_at": now.isoformat(), "files_done": 5}) is None
+
+
+class TestRunTotalCostUsd:
+    def test_sums_estimated_cost_across_every_stage(self):
+        from app.api.admin_extraction import _run_total_cost_usd
+
+        run = {
+            "usage": {
+                "ner": {"estimated_cost_usd": 0.5},
+                "ocr": {"estimated_cost_usd": 0.25},
+                "facts": {"estimated_cost_usd": 1.25},
+            }
+        }
+        assert _run_total_cost_usd(run) == pytest.approx(2.0)
+
+    def test_a_stage_with_no_priced_cost_contributes_nothing(self):
+        """`{}` (no tokens spent) and a stage that never priced itself both
+        contribute 0 — never an invented estimate."""
+        from app.api.admin_extraction import _run_total_cost_usd
+
+        assert _run_total_cost_usd({"usage": {"ner": {}}}) == 0.0
+
+    def test_missing_run_or_empty_usage_is_zero(self):
+        from app.api.admin_extraction import _run_total_cost_usd
+
+        assert _run_total_cost_usd(None) == 0.0
+        assert _run_total_cost_usd({}) == 0.0
+        assert _run_total_cost_usd({"usage": {}}) == 0.0
+
+
+class TestFleetFacts:
+    """`_fleet_facts(run, connection_id)` — `connection_id` drives
+    `facts_pending_documents`/`facts_pass_running` (TCRD-296 gap #61),
+    connection-level facts independent of `run`; every test here needs a
+    working repo context (``seeded_app``) for those two lookups even
+    though the connection itself is never seeded — an unknown connection
+    reads as "0 pending, nothing running", never an error."""
+
+    def test_no_run_is_the_empty_shape_with_every_count_none(self, seeded_app):
+        from app.api.admin_extraction import _EMPTY_FLEET_FACTS, _fleet_facts
+
+        out = _fleet_facts(None, "conn-none")
+        assert out["docs_done"] is None
+        assert out["usage"] == {}
+        assert out["facts_pending_documents"] == 0
+        assert out["facts_pass_running"] is False
+        # Every OTHER field still matches the run-keyed empty shape.
+        for key, value in _EMPTY_FLEET_FACTS.items():
+            if key in ("facts_pending_documents", "facts_pass_running"):
+                continue
+            assert out[key] == value
+
+    def test_mutating_the_result_never_corrupts_the_shared_empty_constant(self, seeded_app):
+        from app.api.admin_extraction import _EMPTY_FLEET_FACTS, _fleet_facts
+
+        out = _fleet_facts(None, "conn-none")
+        out["docs_done"] = 999
+        assert _EMPTY_FLEET_FACTS["docs_done"] is None
+
+    def test_live_progress_while_the_facts_phase_is_running(self, seeded_app):
+        from app.api.admin_extraction import _fleet_facts
+
+        run = {
+            "status": "running",
+            "phase": "facts",
+            "progress": {"facts": {"docs_done": 12, "docs_total": 340}},
+        }
+        out = _fleet_facts(run, "conn-live")
+        assert out["phase_active"] is True
+        assert out["docs_done"] == 12
+        assert out["docs_total"] == 340
+        # Not known until `finish()` — a live pass has no outcome breakdown yet.
+        assert out["docs_extracted"] is None
+
+    def test_final_report_once_the_pass_has_finished(self, seeded_app):
+        from app.api.admin_extraction import _fleet_facts
+
+        run = {
+            "status": "done",
+            "phase": "facts",
+            "report": {
+                "facts": {
+                    "docs_extracted": 300,
+                    "docs_unchanged": 20,
+                    "docs_skipped_tabular": 5,
+                    "docs_skipped_no_text": 1,
+                    "docs_skipped_not_indexed": 2,
+                    "facts_failed": 3,
+                }
+            },
+            "usage": {"facts": {"estimated_cost_usd": 4.5, "input_tokens": 1000}},
+        }
+        out = _fleet_facts(run, "conn-final")
+        assert out["phase_active"] is False  # the row is `done`, not `running`
+        assert out["docs_done"] == 300  # falls back to docs_extracted
+        assert out["docs_extracted"] == 300
+        assert out["docs_skipped_tabular"] == 5
+        assert out["docs_skipped_no_text"] == 1
+        assert out["docs_skipped_not_indexed"] == 2
+        assert out["facts_failed"] == 3
+        assert out["usage"]["estimated_cost_usd"] == 4.5
+
+    def test_phase_active_is_false_outside_the_facts_phase(self, seeded_app):
+        from app.api.admin_extraction import _fleet_facts
+
+        run = {"status": "running", "phase": "crawl", "progress": {}}
+        assert _fleet_facts(run, "conn-crawl")["phase_active"] is False
+
+    def test_pending_documents_and_pass_running_reflect_the_connection(self, seeded_app, monkeypatch):
+        """Connection-level, not read off `run` — proven by mocking the two
+        underlying lookups (already covered elsewhere: `count_pending_
+        documents` in `tests/db_pg/test_facts_extraction_pg.py`,
+        `_facts_job_in_flight` in `TestFactsJobInFlight` below) and
+        checking `_fleet_facts` threads `connection_id` through to both,
+        regardless of `run`."""
+        from app.api import admin_extraction as mod
+
+        monkeypatch.setattr(mod, "_facts_pending_documents", lambda cid: 7 if cid == "conn-x" else 0)
+        monkeypatch.setattr(
+            mod, "_facts_job_in_flight", lambda cid: {"id": "job-1", "status": "running"} if cid == "conn-x" else None
+        )
+
+        out = mod._fleet_facts(None, "conn-x")
+        assert out["facts_pending_documents"] == 7
+        assert out["facts_pass_running"] is True
+
+        out_other = mod._fleet_facts(None, "conn-y")
+        assert out_other["facts_pending_documents"] == 0
+        assert out_other["facts_pass_running"] is False
+
+
+FLEET_URL = "/api/admin/sharepoint/extraction/runs"
+
+
+class TestFleetRoute:
+    def test_requires_auth(self, seeded_app):
+        r = seeded_app["client"].get(FLEET_URL)
+        assert r.status_code == 401
+
+    def test_requires_admin(self, seeded_app):
+        token = seeded_app["analyst_token"]
+        r = seeded_app["client"].get(FLEET_URL, headers=_auth(token))
+        assert r.status_code == 403
+
+    def test_typed_501_on_duckdb(self, seeded_app):
+        client, token = seeded_app["client"], seeded_app["admin_token"]
+        _create_connection(client, token, name="sp-fleet-501")
+        r = client.get(FLEET_URL, headers=_auth(token))
+        assert r.status_code == 501
+        assert r.json()["error"] == "requires_postgres_backend"
+
+    def test_typed_501_even_with_no_sharepoint_connections_at_all(self, seeded_app):
+        """The repo factory raises before any connection list is even
+        walked — a DuckDB instance with zero SharePoint connections still
+        owes the typed 501, not a hollow 200 with an empty list."""
+        client, token = seeded_app["client"], seeded_app["admin_token"]
+        r = client.get(FLEET_URL, headers=_auth(token))
+        assert r.status_code == 501
+        assert r.json()["error"] == "requires_postgres_backend"
+
+
+CANCEL_URL = f"{FLEET_URL}/er_whatever/cancel"
+
+
+class TestCancelRoute:
+    def test_requires_auth(self, seeded_app):
+        r = seeded_app["client"].post(CANCEL_URL)
+        assert r.status_code == 401
+
+    def test_requires_admin(self, seeded_app):
+        token = seeded_app["analyst_token"]
+        r = seeded_app["client"].post(CANCEL_URL, headers=_auth(token))
+        assert r.status_code == 403
+
+    def test_typed_501_on_duckdb(self, seeded_app):
+        client, token = seeded_app["client"], seeded_app["admin_token"]
+        r = client.post(CANCEL_URL, headers=_auth(token))
+        assert r.status_code == 501
+        assert r.json()["error"] == "requires_postgres_backend"
+
+
+class TestFactsPendingDocumentsCache:
+    """``_facts_pending_documents``'s TTL cache (TCRD-296 gap #72) — the
+    source card polls ``…/extraction/status`` every few seconds and the
+    fleet view polls it once per row, so this collapses repeat polls onto
+    one real ``count_pending_documents`` call within the TTL window."""
+
+    CONN_ID = "sp-pending-cache-ttl"
+
+    def setup_method(self):
+        from app.api import admin_extraction as mod
+
+        mod._facts_pending_cache.pop(self.CONN_ID, None)
+
+    teardown_method = setup_method
+
+    def test_a_repeat_call_within_the_ttl_reuses_the_cached_value(self, monkeypatch):
+        from app.api import admin_extraction as mod
+
+        calls = {"n": 0}
+
+        def fake_count(connection_id: str) -> int:
+            calls["n"] += 1
+            return calls["n"]
+
+        monkeypatch.setattr("connectors.sharepoint.facts_extraction.count_pending_documents", fake_count)
+
+        first = mod._facts_pending_documents(self.CONN_ID)
+        second = mod._facts_pending_documents(self.CONN_ID)
+        assert (first, second) == (1, 1)
+        assert calls["n"] == 1, "a call within the TTL must not recompute"
+
+    def test_a_call_past_the_ttl_recomputes(self, monkeypatch):
+        from app.api import admin_extraction as mod
+
+        calls = {"n": 0}
+
+        def fake_count(connection_id: str) -> int:
+            calls["n"] += 1
+            return calls["n"]
+
+        monkeypatch.setattr("connectors.sharepoint.facts_extraction.count_pending_documents", fake_count)
+
+        assert mod._facts_pending_documents(self.CONN_ID) == 1
+        # Backdate the cache entry past the TTL rather than sleeping or
+        # monkeypatching the global `time` module — same value, an earlier
+        # timestamp, exactly what "the TTL elapsed" looks like to the cache.
+        computed_at, value = mod._facts_pending_cache[self.CONN_ID]
+        mod._facts_pending_cache[self.CONN_ID] = (computed_at - mod._FACTS_PENDING_CACHE_TTL_S - 1, value)
+
+        assert mod._facts_pending_documents(self.CONN_ID) == 2
+        assert calls["n"] == 2, "a call past the TTL must recompute"
+
+    def test_different_connections_do_not_share_a_cache_entry(self, monkeypatch):
+        from app.api import admin_extraction as mod
+
+        monkeypatch.setattr(
+            "connectors.sharepoint.facts_extraction.count_pending_documents",
+            lambda cid: 5 if cid == self.CONN_ID else 9,
+        )
+        try:
+            assert mod._facts_pending_documents(self.CONN_ID) == 5
+            assert mod._facts_pending_documents("sp-pending-cache-other") == 9
+        finally:
+            mod._facts_pending_cache.pop("sp-pending-cache-other", None)
+
 
 class TestFactsJobInFlight:
     """The standalone facts pass (``sharepoint-facts-extraction``) writes no
@@ -604,3 +1363,60 @@ class TestFactsJobInFlight:
             "idempotency key + kind — the two surfaces have drifted apart"
         )
         assert found["id"] == job["id"]
+
+
+class TestFactsJobsInFlight:
+    """``_facts_jobs_in_flight`` (TCRD-296 gap #67) — the PLURAL,
+    payload-scanning sibling of ``_facts_job_in_flight`` that finds every
+    partition of a fanned-out pass, not just the one matching a single
+    idempotency key."""
+
+    KIND = "sharepoint-facts-extraction"
+
+    @staticmethod
+    def _enqueue(connection_id: str, *, index: int, count: int):
+        from src.repositories import jobs_repo
+
+        return jobs_repo().enqueue(
+            "sharepoint-facts-extraction",
+            {"connection_id": connection_id, "partition": {"index": index, "count": count}},
+            idempotency_key=f"sharepoint-facts-extraction:{connection_id}:{index}/{count}",
+        )
+
+    def test_no_jobs_is_an_empty_list(self, seeded_app):
+        from app.api.admin_extraction import _facts_jobs_in_flight
+
+        assert _facts_jobs_in_flight("sp-empty") == []
+
+    def test_every_partition_is_found_and_sorted_by_index(self, seeded_app):
+        from app.api.admin_extraction import _facts_jobs_in_flight
+
+        self._enqueue("sp-fanout", index=2, count=3)
+        self._enqueue("sp-fanout", index=0, count=3)
+        self._enqueue("sp-fanout", index=1, count=3)
+
+        found = _facts_jobs_in_flight("sp-fanout")
+        assert [j["partition_index"] for j in found] == [0, 1, 2]
+        assert all(j["partition_count"] == 3 for j in found)
+        assert all(j["status"] == "queued" for j in found)
+
+    def test_a_legacy_un_partitioned_job_has_null_partition_fields(self, seeded_app):
+        from app.api.admin_extraction import _facts_jobs_in_flight
+        from src.repositories import jobs_repo
+
+        jobs_repo().enqueue(
+            "sharepoint-facts-extraction",
+            {"connection_id": "sp-legacy"},
+            idempotency_key="sharepoint-facts-extraction:sp-legacy",
+        )
+        found = _facts_jobs_in_flight("sp-legacy")
+        assert len(found) == 1
+        assert found[0]["partition_index"] is None
+        assert found[0]["partition_count"] is None
+
+    def test_another_connections_partitions_are_not_this_ones(self, seeded_app):
+        from app.api.admin_extraction import _facts_jobs_in_flight
+
+        self._enqueue("sp-other", index=0, count=2)
+        self._enqueue("sp-other", index=1, count=2)
+        assert _facts_jobs_in_flight("sp-mine") == []

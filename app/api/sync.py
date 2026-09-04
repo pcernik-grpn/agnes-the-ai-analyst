@@ -1930,7 +1930,7 @@ def _compute_manifest_policy_fingerprint(reg: dict, principal) -> "str | None":
     (table access policies §3.4, §10.3; plan Task 18) — what a local
     ``agnes pull`` compares a snapshot's stored ``SnapshotMeta.
     policy_fingerprint`` against to detect that the policy (or the
-    puller's own group membership) drifted since ``agnes snapshot
+    puller's own email / group membership) drifted since ``agnes snapshot
     create``/``refresh`` ran, and withhold that snapshot's view via the
     same ``snapshot_views_blocked`` mechanism #1129 already built for a
     de-authorized or newly-``server_only`` table.
