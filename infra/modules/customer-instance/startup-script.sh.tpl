@@ -1780,6 +1780,9 @@ HOST_WORKSPACE_URL=http://app:8000/api/kai/workspace
 %{ if kai_agent_broker_mcp_enabled ~}
 HOST_BROKER_MCP_URL=$SERVER_URL/api/kai/mcp
 %{ endif ~}
+%{ if kai_agent_broker_otlp_enabled ~}
+HOST_BROKER_OTLP_URL=$SERVER_URL/api/broker/otlp
+%{ endif ~}
 POSTGRES_URL=postgresql://kai:$KAI_AGENT_PG_PASSWORD@kai-agent-pg:5432/kai_agent
 E2B_API_KEY=$KAI_E2B_API_KEY
 KAIENVEOF

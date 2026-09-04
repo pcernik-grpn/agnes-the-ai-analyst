@@ -94,6 +94,7 @@ BASE_VARS: dict = {
     "kai_agent_cpus": "1.0",
     "kai_agent_pg_mem_limit": "1g",
     "kai_agent_broker_mcp_enabled": False,
+    "kai_agent_broker_otlp_enabled": False,
     "otlp_endpoint": "",
     "otlp_headers_secret": "",
     "otlp_capture_content": "0",
