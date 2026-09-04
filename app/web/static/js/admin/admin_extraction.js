@@ -91,7 +91,16 @@ function factsCell(facts) {
     // pending FROM THIS PASS. Skipped/failed documents are their own
     // counts, not represented as "pending" (they were looked at, not
     // deferred).
-    return `${done} <span class="ext-sub">(0 pending)</span>`;
+    // `orphans_swept` (TCRD-296 C.12) — the pass's own single end-of-pass
+    // sweep count. Shown only when non-null and non-zero, so an ordinary
+    // finished pass with nothing to sweep reads exactly as it did before
+    // this field existed.
+    const swept = facts.orphans_swept;
+    const sweptNote =
+      swept != null && swept > 0
+        ? ` <span class="ext-sub">(${swept} orphan${swept === 1 ? "" : "s"} swept)</span>`
+        : "";
+    return `${done} <span class="ext-sub">(0 pending)</span>${sweptNote}`;
   }
   return "—";
 }

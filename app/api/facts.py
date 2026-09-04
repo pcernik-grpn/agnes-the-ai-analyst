@@ -637,6 +637,14 @@ def _validate_evidence_audience(body: "FactsIngestRequest") -> None:
 def facts_ingest(body: FactsIngestRequest, user=Depends(require_admin)) -> Dict[str, Any]:
     """Ingest one facts batch (spec §7.2) — scheduler token or admin PAT.
 
+    Thin wrapper over :func:`_facts_ingest_core`, kept separate so this
+    route's signature (and OpenAPI contract) never grows an internal-only
+    parameter: :func:`connectors.sharepoint.facts_extraction._BatchShipper.
+    flush` calls :func:`_facts_ingest_core` directly, in-process, with
+    ``run_orphan_sweep=False`` (TCRD-296 C.12 — a multi-batch pass sweeps
+    ONCE, at the end, rather than once per batch) — never through this HTTP
+    surface, and never with the ability to suppress the sweep from outside.
+
     Batch caps (≤500 documents, ≤5000 claims/request) 413; a single
     document's evidence alone exceeding the claim cap is a distinct 422
     protocol error (never split across requests, per §7.2). ``documents``
@@ -747,6 +755,14 @@ def facts_ingest(body: FactsIngestRequest, user=Depends(require_admin)) -> Dict[
     honored the crawl-time exclusion list. See
     :func:`_refuse_source_acl_excluded_documents`.
     """
+    return _facts_ingest_core(body, user)
+
+
+def _facts_ingest_core(body: FactsIngestRequest, user, *, run_orphan_sweep: bool = True) -> Dict[str, Any]:
+    """The implementation :func:`facts_ingest` (the HTTP route) wraps —
+    see ITS docstring for the full producer contract (batch caps, gates,
+    response shape). The ONLY behavior this adds is ``run_orphan_sweep``
+    (TCRD-296 C.12), never reachable from the route itself."""
     _validate_evidence_audience(body)
     _refuse_undeclared_anonymize_marked_corpora(body)
     _refuse_source_acl_excluded_documents(body)
@@ -756,6 +772,7 @@ def facts_ingest(body: FactsIngestRequest, user=Depends(require_admin)) -> Dict[
             full_documents=body.full_documents,
             nodes=body.nodes,
             edges=body.edges,
+            run_orphan_sweep=run_orphan_sweep,
         )
     except IngestBatchTooLarge as exc:
         raise HTTPException(status_code=413, detail=exc.detail)

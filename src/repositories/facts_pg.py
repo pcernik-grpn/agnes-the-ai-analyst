@@ -3968,6 +3968,7 @@ class FactsPgRepository:
         nodes: Optional[List[Dict[str, Any]]] = None,
         edges: Optional[List[Dict[str, Any]]] = None,
         orphan_sweep_grace_seconds: int = _ORPHAN_SWEEP_GRACE_S,
+        run_orphan_sweep: bool = True,
     ) -> Dict[str, Any]:
         """``orphan_sweep_grace_seconds`` — passed straight through to the
         end-of-batch :meth:`sweep_orphans` call (see its docstring's
@@ -3975,7 +3976,23 @@ class FactsPgRepository:
         exists so a test that depends on THIS SAME batch's sweep deleting a
         subject it just orphaned (e.g. `full_documents` replace mode
         dropping a stale claim) can request the pre-existing immediate-
-        delete behavior with ``orphan_sweep_grace_seconds=0``."""
+        delete behavior with ``orphan_sweep_grace_seconds=0``.
+
+        ``run_orphan_sweep`` (TCRD-296 C.12 — live finding, 2026-09: with
+        every batch of a multi-batch pass ending in its OWN sweep, 7
+        parallel SharePoint facts-extraction passes deleted 75,447 subjects
+        against 10,784 created in 30 minutes — one pass's per-batch sweep
+        kept catching a SIBLING pass's just-created, not-yet-evidenced
+        subject before that pass's own later batch could attach its claim).
+        A multi-batch caller (:func:`connectors.sharepoint.facts_extraction
+        .run_facts_extraction`) sets this ``False`` for every batch and
+        calls :meth:`sweep_orphans` itself exactly ONCE, after the whole
+        pass has shipped — cutting the sweep's own contribution to that
+        race by the batch count, on top of the grace period and advisory
+        lock :meth:`sweep_orphans` already enforces. ``True`` (the default)
+        preserves the pre-existing per-call sweep for every other caller —
+        the HTTP route (:func:`app.api.facts.facts_ingest`, external
+        producers included) and every existing test."""
         documents = documents or []
         full_documents = full_documents or []
         nodes = nodes or []
@@ -4836,7 +4853,15 @@ class FactsPgRepository:
                     }
                 )
 
-        sweep_result = self.sweep_orphans(grace_seconds=orphan_sweep_grace_seconds)
+        # C.12 (see `run_orphan_sweep`'s docstring above): a multi-batch
+        # caller opts OUT of this per-batch sweep and runs its own single
+        # end-of-pass sweep instead. `sweep_skipped: False` here is honest
+        # either way — it never claims a lock-contention skip that didn't
+        # happen, and the real (deferred) count is never double-reported.
+        if run_orphan_sweep:
+            sweep_result = self.sweep_orphans(grace_seconds=orphan_sweep_grace_seconds)
+        else:
+            sweep_result = {"deleted": 0, "skipped": False}
         subjects_deleted = sweep_result["deleted"]
 
         # TCRD-241 / RBAC review (PR #1736): a doc_id that would only have

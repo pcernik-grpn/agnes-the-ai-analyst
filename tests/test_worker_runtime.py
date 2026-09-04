@@ -517,6 +517,76 @@ def test_handler_exception_at_max_attempts_finalizes_failed(worker_db):
     assert row["finished_at"] is not None
 
 
+def test_transient_db_error_is_reclassified_and_requeued_when_kind_opts_in(worker_db):
+    """TCRD-296 C.11: a kind with ``retry_in_seconds=None`` (a raised
+    exception normally finalizes on the FIRST attempt) still requeues when
+    the exception is a TRANSIENT infra fault AND the kind opted in via
+    ``transient_retry_in_seconds`` — extraction kinds do."""
+    import sqlalchemy as sa
+
+    from app.worker.registry import LIGHT_LANE, JobKind, register_kind
+    from app.worker.runtime import worker_loop
+    from src.repositories import jobs_repo
+
+    def boom_handler(payload: dict) -> None:
+        raise sa.exc.TimeoutError("QueuePool limit of size 5 reached, connection timed out")
+
+    register_kind(
+        JobKind(
+            name="transient_test",
+            handler=boom_handler,
+            lane=LIGHT_LANE,
+            lease_seconds=30,
+            retry_in_seconds=None,
+            transient_retry_in_seconds=60,
+        )
+    )
+
+    repo = jobs_repo()
+    job = repo.enqueue("transient_test", {}, max_attempts=5)
+
+    asyncio.run(_run_and_cancel(worker_loop(worker_id="test-worker", poll_interval_s=0.05), 0.4))
+
+    row = repo.get(job["id"])
+    assert row["status"] == "queued", "a transient failure on an opted-in kind must requeue, not finalize"
+    assert row["run_after"] is not None
+    assert row["attempts"] == 1
+    assert row["leased_by"] is None
+
+
+def test_non_transient_error_still_finalizes_even_when_kind_opts_in(worker_db):
+    """The SAME opted-in kind still finalizes a NON-transient exception on
+    its first attempt — reclassification never widens `retry_in_seconds`'s
+    plain policy for a handler bug."""
+    from app.worker.registry import LIGHT_LANE, JobKind, register_kind
+    from app.worker.runtime import worker_loop
+    from src.repositories import jobs_repo
+
+    def boom_handler(payload: dict) -> None:
+        raise ValueError("a genuine handler bug")
+
+    register_kind(
+        JobKind(
+            name="transient_test",
+            handler=boom_handler,
+            lane=LIGHT_LANE,
+            lease_seconds=30,
+            retry_in_seconds=None,
+            transient_retry_in_seconds=60,
+        )
+    )
+
+    repo = jobs_repo()
+    job = repo.enqueue("transient_test", {}, max_attempts=5)
+
+    asyncio.run(_run_and_cancel(worker_loop(worker_id="test-worker", poll_interval_s=0.05), 0.4))
+
+    row = repo.get(job["id"])
+    assert row["status"] == "failed"
+    assert row["error"] == "a genuine handler bug"
+    assert row["finished_at"] is not None
+
+
 def test_graceful_cancel_mid_poll_returns_promptly(worker_db):
     """No kinds registered => every lane sits idle in its poll sleep.
     Cancelling must not wait out the (long) poll interval."""

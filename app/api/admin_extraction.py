@@ -654,6 +654,13 @@ _EMPTY_FLEET_FACTS: Dict[str, Any] = {
     "docs_skipped_too_large_tabular": None,
     "facts_failed": None,
     "facts_failed_reasons": None,
+    # TCRD-296 C.12 — the pass's own single end-of-pass orphan sweep (see
+    # `connectors.sharepoint.facts_extraction._Report.orphans_swept`'s
+    # docstring for the live finding). `None` (not `0`) for a run that
+    # never reached facts, same "unstarted vs genuinely zero" rule every
+    # other field in this shape follows.
+    "orphans_swept": None,
+    "orphans_sweep_skipped": None,
     "usage": {},
     # TCRD-296 gap #61 — see `_fleet_facts`'s docstring for why these two
     # are connection-level, not read off the run row like everything else
@@ -678,8 +685,10 @@ def _fleet_facts(run: Optional[Dict[str, Any]], connection_id: str) -> Dict[str,
     a lower bound, not a corpus size). Once the pass FINISHES,
     ``report.facts`` carries its outcome breakdown
     (``docs_extracted``/``docs_unchanged``/the ``skipped-*`` reasons/
-    ``facts_failed``) and ``docs_done`` falls back to ``docs_extracted`` so
-    a finished run still answers "how many did it do".
+    ``facts_failed``/``orphans_swept``/``orphans_sweep_skipped`` — the
+    pass's own single end-of-pass sweep, TCRD-296 C.12) and ``docs_done``
+    falls back to ``docs_extracted`` so a finished run still answers "how
+    many did it do".
 
     ``facts_pending_documents``/``facts_pass_running`` are NOT read off
     ``run`` at all — a connection's outstanding backlog and whether a job
@@ -710,6 +719,8 @@ def _fleet_facts(run: Optional[Dict[str, Any]], connection_id: str) -> Dict[str,
             out["docs_skipped_too_large_tabular"] = final_facts.get("docs_skipped_too_large_tabular")
             out["facts_failed"] = final_facts.get("facts_failed")
             out["facts_failed_reasons"] = final_facts.get("facts_failed_reasons")
+            out["orphans_swept"] = final_facts.get("orphans_swept")
+            out["orphans_sweep_skipped"] = final_facts.get("orphans_sweep_skipped")
             if out["docs_done"] is None:
                 out["docs_done"] = final_facts.get("docs_extracted")
         # The priced usage for JUST this stage — see `_run_total_cost_usd`

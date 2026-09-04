@@ -105,6 +105,16 @@ class FakeEl {
     return out["html"]
 
 
+def _run_facts_cell_js(facts: dict) -> str:
+    out = _run_node(
+        f"""
+const facts = {json.dumps(facts)};
+console.log(JSON.stringify({{ html: factsCell(facts) }}));
+"""
+    )
+    return out["html"]
+
+
 _ROW = {
     "connection_id": "sp1",
     "connection_name": "Legal SharePoint",
@@ -147,6 +157,42 @@ def test_no_run_at_all_renders_no_age_filter_note():
     row["run"] = None
     html = _run_row_js(row)
     assert "filtered by age" not in html
+
+
+# ---------------------------------------------------------------------------
+# factsCell — orphans_swept (TCRD-296 C.12): the pass's own single
+# end-of-pass sweep count, surfaced only for a FINISHED pass and only when
+# there was something to report.
+# ---------------------------------------------------------------------------
+
+
+def test_facts_cell_shows_orphans_swept_for_a_finished_pass():
+    html = _run_facts_cell_js({"docs_done": 40, "docs_total": 40, "phase_active": False, "orphans_swept": 3})
+    assert "3 orphans swept" in html
+
+
+def test_facts_cell_uses_singular_for_one_orphan_swept():
+    html = _run_facts_cell_js({"docs_done": 40, "docs_total": 40, "phase_active": False, "orphans_swept": 1})
+    assert "1 orphan swept" in html
+    assert "1 orphans swept" not in html
+
+
+def test_facts_cell_omits_the_swept_note_when_nothing_was_swept():
+    html = _run_facts_cell_js({"docs_done": 40, "docs_total": 40, "phase_active": False, "orphans_swept": 0})
+    assert "swept" not in html
+
+
+def test_facts_cell_omits_the_swept_note_when_the_field_is_unset():
+    """A run report from BEFORE this field existed (or a connection that
+    never reached facts) must render exactly as it did before — no
+    `undefined`/`null` leaking into the cell."""
+    html = _run_facts_cell_js({"docs_done": 40, "docs_total": 40, "phase_active": False})
+    assert "swept" not in html
+
+
+def test_facts_cell_omits_the_swept_note_while_the_pass_is_still_running():
+    html = _run_facts_cell_js({"docs_done": 10, "docs_total": 40, "phase_active": True, "orphans_swept": 5})
+    assert "swept" not in html
 
 
 # ---------------------------------------------------------------------------

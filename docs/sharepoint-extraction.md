@@ -347,6 +347,18 @@ is a thin wrapper over the routes documented here and in
 [`api-reference.md`](api-reference.md) — nothing new is introduced at the
 protocol level, only a door that does not require a terminal.
 
+**A transient database hiccup mid-crawl no longer costs the whole run
+(TCRD-296 C.11).** The ingest step (storing the converted document and
+handing it to the chunker) retries a closed family of infrastructure
+faults — a connection-pool wait timeout, a dropped/reset connection, a
+deadlock, a serialization failure — up to 5 times with a jittered
+exponential backoff (1s → 16s) before counting the document as failed.
+Anything else (a bad row, a bad statement, a genuine `ingest_file`
+rejection) still fails on the first attempt, exactly as before; the retry
+is scoped to infrastructure noise, never a document-content problem.
+Should every retry be exhausted, the document lands in the same
+`failed_items` backlog `--retry-failed` above replays.
+
 All three can run against a self-hosted OpenAI-compatible endpoint instead
 of the Anthropic API — globally (`extraction.llm`) or per stage, e.g. the
 NER detector local while facts stay hosted:
@@ -433,6 +445,26 @@ an already-`"done"` entry. Two things now keep this honest:
   deterministic winner-pick) — is the one legitimate zero-claims case: it
   stays `"done"`, with a `claims_on_file_id` marker pointing at the winner,
   so a coverage report can tell "duplicate" from "genuinely missing".
+
+**The orphan sweep runs once per pass, not once per batch (TCRD-296
+C.12).** A pass ships its extracted facts in several batches, and each
+batch's ingest call ends by sweeping subjects (facts/edges) left with zero
+claims — normal hygiene after a replace-mode re-extraction drops a stale
+claim. With several passes running in parallel (e.g. a whole-site crawl
+split into per-scope connections), sweeping after every BATCH let one
+pass's sweep catch a SIBLING pass's just-created, not-yet-evidenced
+subject before that pass's own later batch attached its claim — a live
+30-minute window saw 75,447 subjects deleted against 10,784 created, ~13%
+of documents failing to ingest on a foreign-key violation. A pass's
+batches now all skip their own sweep and the pass runs it itself exactly
+ONCE at the end, under the same 15-minute grace period (a subject younger
+than that is never swept, however orphaned it looks) and the same
+serializing advisory lock (at most one pass's sweep touches the database
+at a time; a pass that cannot acquire it skips its own sweep for a sibling
+pass's to cover) the per-batch sweep already used. The run report's
+`orphans_swept` (and `orphans_sweep_skipped`, true when a concurrent
+pass held the lock) shows the count; the fleet view at `/admin/extraction`
+notes it next to a finished pass's facts count when non-zero.
 
 **Recovering the historical backlog.** The two fixes above only prevent
 this from happening on a FRESH pass. A document whose ledger entry an

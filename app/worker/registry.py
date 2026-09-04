@@ -54,6 +54,21 @@ class JobKind:
     lane: str
     lease_seconds: int = 120
     retry_in_seconds: int | None = 300
+    #: Per-kind opt-in retry delay for a TRANSIENT infrastructure fault
+    #: RECLASSIFIED out of a raised handler exception (TCRD-296 C.11 — see
+    #: ``app/worker/runtime.py::_run_one``'s exception branch and
+    #: ``src/db_transient.py::is_transient_db_error``). Independent of
+    #: ``retry_in_seconds`` above: a kind that sets THAT to ``None`` (any
+    #: raised exception always finalizes on the first attempt — "an
+    #: operator must look at it") can still opt into an automatic retry for
+    #: JUST a connection-pool timeout/deadlock/dropped-connection — a
+    #: genuinely different fault class from a broken handler — by setting
+    #: this instead. ``None`` (the default) means no reclassification: even
+    #: a transient exception follows ``retry_in_seconds``'s plain policy,
+    #: unchanged from before this field existed. A requeue triggered by
+    #: this field consumes the SAME per-kind ``max_attempts`` budget as any
+    #: other retry (``JOB_MAX_ATTEMPTS_BY_KIND`` — no separate counter).
+    transient_retry_in_seconds: int | None = None
 
 
 #: Process-wide registry: ``kind name -> JobKind``. Populated by

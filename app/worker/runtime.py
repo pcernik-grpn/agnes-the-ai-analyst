@@ -149,6 +149,7 @@ from app.observability import metrics as obs_metrics
 from app.worker import wakeup
 from app.worker.kinds import dispatch_job
 from app.worker.registry import EXTRACTION_LANE, HEAVY_LANE, JOB_KINDS, LIGHT_LANE, JobKind
+from src.db_transient import is_transient_db_error
 
 #: Live finding (64-vCPU extraction-worker host, 2026-09): numpy's OpenBLAS
 #: backend sizes its per-thread scratch buffers by the HOST's CPU count at
@@ -684,6 +685,29 @@ async def _run_one(job: dict, kind: JobKind, worker_id: str, in_flight: dict[str
             raise
         except Exception as exc:
             logger.exception("worker %s: job %s (kind=%s) failed", worker_id, job["id"], job["kind"])
+            # TCRD-296 C.11: a job kind that opted in
+            # (`kind.transient_retry_in_seconds` — extraction kinds do) gets
+            # its OWN raised exception reclassified when it names a
+            # transient infrastructure fault (a connection-pool timeout, a
+            # dropped connection, a deadlock) rather than the ordinary
+            # "handler raised, an operator must look at it" policy
+            # `kind.retry_in_seconds` encodes — a multi-hour crawl must
+            # survive a 30-second connection-pool hiccup, not turn it into a
+            # terminal `'failed'` run. The requeue this triggers shares the
+            # kind's own `max_attempts` budget (`JOB_MAX_ATTEMPTS_BY_KIND`)
+            # with every other retry/reclaim — no separate counter.
+            retry_in_seconds = kind.retry_in_seconds
+            if kind.transient_retry_in_seconds is not None and is_transient_db_error(exc):
+                retry_in_seconds = kind.transient_retry_in_seconds
+                logger.warning(
+                    "worker %s: job %s (kind=%s) failed on a TRANSIENT infra fault (%s) — "
+                    "retrying in %ds instead of finalizing",
+                    worker_id,
+                    job["id"],
+                    job["kind"],
+                    type(exc).__name__,
+                    retry_in_seconds,
+                )
             # Persist the outcome before recording it in metrics — if `.fail()`
             # itself raises, this propagates without ever having reported an
             # outcome that was never actually persisted.
@@ -693,7 +717,7 @@ async def _run_one(job: dict, kind: JobKind, worker_id: str, in_flight: dict[str
                 worker_id,
                 lease_token,
                 str(exc),
-                retry_in_seconds=kind.retry_in_seconds,
+                retry_in_seconds=retry_in_seconds,
             )
             obs_metrics.record_job_duration(job["kind"], "failed", time.monotonic() - started_at)
             obs_metrics.record_job_failure(job["kind"], type(exc).__name__)

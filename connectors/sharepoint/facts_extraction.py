@@ -42,13 +42,16 @@ What one pass does, per connection:
    COUNTED (``facts_quotes_dropped``), never quietly shipped for the
    server to reject.
 5. Ship accepted facts in batches through
-   ``app.api.facts.facts_ingest`` — the function the HTTP route calls, in
-   process, not over HTTP. That is deliberate: the verbatim gate (§8), the
-   anonymization declaration (§9.2), the audience validation and the
-   producer scope rules are all enforced there, so an in-process producer
-   is held to exactly the same contract as an external one. Every batch
-   uses ``full_documents`` replace mode, so a re-extraction replaces a
-   document's claims instead of duplicating them.
+   ``app.api.facts._facts_ingest_core`` — the SAME function the HTTP
+   route's ``facts_ingest`` thinly wraps, called in process, not over HTTP.
+   That is deliberate: the verbatim gate (§8), the anonymization
+   declaration (§9.2), the audience validation and the producer scope rules
+   are all enforced there, so an in-process producer is held to exactly the
+   same contract as an external one. Every batch uses ``full_documents``
+   replace mode, so a re-extraction replaces a document's claims instead of
+   duplicating them. ``run_orphan_sweep=False`` (TCRD-296 C.12) on every
+   batch — a whole PASS's own end-of-pass sweep runs once, not once per
+   batch; see :func:`run_facts_extraction`'s own end-of-pass sweep call.
 
 Failure posture, in the two flavours this module keeps strictly apart:
 
@@ -2340,6 +2343,22 @@ class _Report:
         #: Sync-mode passes leave `docs_via_batch` at 0.
         self.docs_via_batch = 0
         self.docs_via_sync = 0
+        #: Subjects (facts/edges) removed by THIS PASS's own end-of-pass
+        #: orphan sweep (TCRD-296 C.12 — live finding, 2026-09: with
+        #: `sweep_orphans()` running per BATCH, 7 parallel passes deleted
+        #: 75,447 subjects against 10,784 created in 30 minutes — one
+        #: pass's sweep kept catching a SIBLING pass's just-created,
+        #: not-yet-evidenced subject before that pass's own later batch
+        #: could attach its claim). Running it once per pass instead of
+        #: once per batch cuts the sweep's OWN contribution to that race
+        #: by the batch count; see `run_facts_extraction`'s end-of-pass
+        #: `sweep_orphans()` call.
+        self.orphans_swept = 0
+        #: True when this pass's end-of-pass sweep backed off because a
+        #: CONCURRENT pass already held `sweep_orphans()`'s serializing
+        #: advisory lock — never an error, just visibility: the sibling
+        #: pass's own sweep covers whatever this one skipped.
+        self.orphans_sweep_skipped = False
 
     def record_failure_reason(self, reason: str) -> None:
         """Bump ``facts_failed_reasons[reason]`` — the shared bookkeeping
@@ -2453,6 +2472,8 @@ class _Report:
             "ingest_failures": self.ingest_failures,
             "docs_via_batch": self.docs_via_batch,
             "docs_via_sync": self.docs_via_sync,
+            "orphans_swept": self.orphans_swept,
+            "orphans_sweep_skipped": self.orphans_sweep_skipped,
             "facts_usage": priced,
         }
 
@@ -2460,12 +2481,16 @@ class _Report:
 class _BatchShipper:
     """Accumulates rows and ships them through the ingest chokepoint.
 
-    ``app.api.facts.facts_ingest`` — the function the HTTP route calls —
-    is used deliberately instead of ``facts_repo().ingest_batch``: the
-    audience validation, the anonymize-fail-closed declaration gate and the
-    producer scope rules live in the handler, and an in-process producer
-    that skipped them would be held to a weaker contract than an external
-    one for no reason other than sharing a process.
+    ``app.api.facts._facts_ingest_core`` — the SAME function the HTTP
+    route's ``facts_ingest`` thinly wraps — is used deliberately instead of
+    ``facts_repo().ingest_batch`` directly: the audience validation, the
+    anonymize-fail-closed declaration gate and the producer scope rules
+    live in that handler, and an in-process producer that skipped them
+    would be held to a weaker contract than an external one for no reason
+    other than sharing a process. ``run_orphan_sweep=False`` on every call
+    (TCRD-296 C.12) — this class ships MANY batches per pass, and the
+    orphan sweep runs once at the end of the whole pass instead (see
+    :func:`run_facts_extraction`), not once per batch.
 
     **No ``evidence[].audience`` is emitted**, deliberately. The tag is an
     optional index-time variant marker, and the crawl that produced these
@@ -2556,7 +2581,7 @@ class _BatchShipper:
             FactsIngestAnonymizationScope,
             FactsIngestLlmUsage,
             FactsIngestRequest,
-            facts_ingest,
+            _facts_ingest_core,
         )
 
         anonymization = None
@@ -2588,7 +2613,9 @@ class _BatchShipper:
         )
         pending_file_ids = list(self._file_ids)
         try:
-            result = facts_ingest(body, user=self._user)
+            # `run_orphan_sweep=False` (TCRD-296 C.12) — see the class
+            # docstring's own note.
+            result = _facts_ingest_core(body, user=self._user, run_orphan_sweep=False)
         except HTTPException as exc:
             self._report.ingest_failures.append(
                 {"documents": len(self._documents), "status": exc.status_code, "detail": exc.detail}
@@ -3612,6 +3639,37 @@ def _resolve_run_transport(
     return mode
 
 
+def _run_end_of_pass_orphan_sweep(report: "_Report") -> None:
+    """Run ``sweep_orphans()`` exactly ONCE, after a pass's every batch has
+    already flushed with ``run_orphan_sweep=False`` (TCRD-296 C.12 — see
+    :attr:`_Report.orphans_swept`'s docstring for the live finding this
+    replaces the per-batch sweep for).
+
+    The DEFAULT grace period (``FactsPgRepository.sweep_orphans``'s own
+    ``_ORPHAN_SWEEP_GRACE_S``), not an immediate delete: this pass's fact
+    graph is SHARED with any sibling pass running concurrently, exactly the
+    condition that grace period exists for — unlike
+    ``app.api.collections._sweep_facts_orphans_after_delete``'s
+    ``grace_seconds=0``, where deleting one file is known to be the only
+    possible source of a fresh orphan.
+
+    Never raises: a sweep failure must not turn a pass that otherwise
+    finished cleanly into a `failed` run — logged and left at the report's
+    default (``orphans_swept=0``), same posture
+    ``_sweep_facts_orphans_after_delete`` already takes for the identical
+    call on the file-delete path.
+    """
+    from src.repositories import facts_repo
+
+    try:
+        result = facts_repo().sweep_orphans()
+    except Exception:
+        logger.warning("facts extraction: end-of-pass orphan sweep failed (non-fatal)", exc_info=True)
+        return
+    report.orphans_swept = result["deleted"]
+    report.orphans_sweep_skipped = result["skipped"]
+
+
 def run_facts_extraction(
     connection_id: str,
     *,
@@ -4008,6 +4066,11 @@ def run_facts_extraction(
         # Ship (and persist) whatever is pending, on every exit path —
         # including a hard stop. Work already paid for is never thrown away.
         _flush()
+        # TCRD-296 C.12 — the pass's OWN single sweep, now that every batch
+        # it shipped has flushed with `run_orphan_sweep=False`. Runs on
+        # every exit path (including a hard stop), same "always finish
+        # this pass's own bookkeeping" reasoning as the `_flush()` above.
+        _run_end_of_pass_orphan_sweep(report)
 
     if hard_stop is not None:
         # Loud, after the drain: the pass cannot be trusted, and "0 facts"
@@ -4527,6 +4590,10 @@ def _run_batch_pass(
             queue.append(retry_batch_id)
 
     _flush()
+    # TCRD-296 C.12 — same single end-of-pass sweep as the sync transport's
+    # own `run_facts_extraction`, now that every batch this pass shipped
+    # flushed with `run_orphan_sweep=False`.
+    _run_end_of_pass_orphan_sweep(report)
 
     usage["documents"] = report.docs_extracted
     # Concurrency governs request FAN-OUT, which the batch transport has no

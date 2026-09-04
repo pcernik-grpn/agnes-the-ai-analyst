@@ -672,6 +672,132 @@ class TestIngestorRejectedRaisesInsteadOfStranding:
         assert was_new is True
 
 
+class TestIngestTransientRetry:
+    """``_ingest_with_retry`` (TCRD-296 C.11) — a bounded retry around
+    ``_Ingestor.ingest`` for a TRANSIENT infrastructure fault (a
+    connection-pool timeout, a dropped connection, a deadlock) only. Every
+    test here monkeypatches ``crawler._ingest_retry_sleep`` to a no-op so
+    the retry BOUNDS are asserted without spending real seconds.
+    """
+
+    def test_a_transient_error_is_retried_then_succeeds(self, monkeypatch):
+        import sqlalchemy as sa
+
+        calls = {"n": 0}
+
+        class FlakyIngestor(FakeIngestor):
+            def ingest(self, **kwargs):
+                calls["n"] += 1
+                if calls["n"] < 3:
+                    raise sa.exc.TimeoutError("QueuePool limit of size 5 reached, connection timed out")
+                return super().ingest(**kwargs)
+
+        sleeps: List[float] = []
+        monkeypatch.setattr(crawler, "_ingest_retry_sleep", sleeps.append)
+
+        ingestor = FlakyIngestor()
+        file_id, was_new = crawler._ingest_with_retry(
+            ingestor,
+            collection_id="col1",
+            stable_id="graph:item1",
+            path="Reports/doc.md",
+            filename="doc.md",
+            markdown="body",
+            source_sha256="deadbeef",
+        )
+
+        assert calls["n"] == 3
+        assert was_new is True
+        assert file_id
+        # Two retries before the third (successful) attempt — bounded
+        # backoff, never a fixed sleep.
+        assert len(sleeps) == 2
+        assert all(0 <= s <= crawler._INGEST_RETRY_MAX_S + 1 for s in sleeps)
+
+    def test_a_non_transient_error_raises_on_the_first_attempt(self, monkeypatch):
+        calls = {"n": 0}
+
+        class BrokenIngestor(FakeIngestor):
+            def ingest(self, **kwargs):
+                calls["n"] += 1
+                raise RuntimeError("ingest_file rejected doc.docx: NUL byte")
+
+        sleeps: List[float] = []
+        monkeypatch.setattr(crawler, "_ingest_retry_sleep", sleeps.append)
+
+        with pytest.raises(RuntimeError, match="NUL byte"):
+            crawler._ingest_with_retry(
+                BrokenIngestor(),
+                collection_id="col1",
+                stable_id="graph:item1",
+                path="Reports/doc.md",
+                filename="doc.md",
+                markdown="body",
+                source_sha256="deadbeef",
+            )
+
+        assert calls["n"] == 1
+        assert sleeps == []
+
+    def test_a_transient_error_that_never_clears_is_raised_after_exhausting_attempts(self, monkeypatch):
+        import sqlalchemy as sa
+
+        calls = {"n": 0}
+
+        class AlwaysFlakyIngestor(FakeIngestor):
+            def ingest(self, **kwargs):
+                calls["n"] += 1
+                raise sa.exc.TimeoutError("QueuePool limit of size 5 reached, connection timed out")
+
+        sleeps: List[float] = []
+        monkeypatch.setattr(crawler, "_ingest_retry_sleep", sleeps.append)
+
+        with pytest.raises(sa.exc.TimeoutError):
+            crawler._ingest_with_retry(
+                AlwaysFlakyIngestor(),
+                collection_id="col1",
+                stable_id="graph:item1",
+                path="Reports/doc.md",
+                filename="doc.md",
+                markdown="body",
+                source_sha256="deadbeef",
+            )
+
+        assert calls["n"] == crawler._INGEST_RETRY_ATTEMPTS
+        assert len(sleeps) == crawler._INGEST_RETRY_ATTEMPTS - 1
+
+    def test_full_crawl_survives_a_transient_pool_hiccup(self, crawl_env, monkeypatch):
+        """End-to-end: a crawl whose ingest step hits a transient error
+        TWICE still lands the document as ``new`` — never `ingest_failed` —
+        because the retry absorbs it before `_process_item`'s own
+        exception handler ever sees it."""
+        import sqlalchemy as sa
+
+        calls = {"n": 0}
+
+        class FlakyIngestor(FakeIngestor):
+            def ingest(self, **kwargs):
+                calls["n"] += 1
+                if calls["n"] <= 2:
+                    raise sa.exc.TimeoutError("QueuePool limit of size 5 reached, connection timed out")
+                return super().ingest(**kwargs)
+
+        monkeypatch.setattr(crawler, "_Ingestor", FlakyIngestor)
+        monkeypatch.setattr(crawler, "_ingest_retry_sleep", lambda seconds: None)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url).endswith("/content"):
+                return _content_response()
+            return httpx.Response(200, json={"value": [_file_item()], "@odata.deltaLink": f"{DRIVE_DELTA}?t=1"})
+
+        _install_graph(monkeypatch, handler)
+        report = _run(_connection([_drive_scope()]), monkeypatch)
+
+        assert report["new"] == 1
+        assert report["errors"] == 0
+        assert calls["n"] == 3
+
+
 # --------------------------------------------------------------------------
 # force_reprocess: the operator control that ignores the delta cursor
 # (admin_data_sources.html's "Re-process everything" checkbox, wired through
