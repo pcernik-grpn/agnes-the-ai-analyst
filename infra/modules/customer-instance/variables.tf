@@ -442,6 +442,7 @@ variable "prod_instance" {
   validation {
     condition     = var.prod_instance.extraction_worker_replicas >= 1 && var.prod_instance.extraction_worker_replicas <= 32
     error_message = "prod_instance.extraction_worker_replicas must be between 1 and 32."
+  }
 
   validation {
     condition     = !var.prod_instance.kai_agent_broker_otlp_enabled || (var.prod_instance.kai_agent_enabled && var.prod_instance.otlp_endpoint != "")
@@ -658,6 +659,7 @@ variable "dev_instances" {
       for i in var.dev_instances : i.extraction_worker_replicas >= 1 && i.extraction_worker_replicas <= 32
     ])
     error_message = "each dev_instances[].extraction_worker_replicas must be between 1 and 32."
+  }
 
   validation {
     condition     = alltrue([for d in var.dev_instances : !try(d.kai_agent_broker_otlp_enabled, false) || (try(d.kai_agent_enabled, false) && try(d.otlp_endpoint, "") != "")])
