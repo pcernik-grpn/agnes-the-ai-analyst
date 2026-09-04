@@ -33,7 +33,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 import uuid
 from typing import Any, Dict, List, Optional
 
@@ -76,6 +75,7 @@ from src.repositories.mcp_sources import (  # noqa: F401  # MCPSourceRepository 
     validate_oauth_scope_coupling,
     validate_source_fields,
 )
+from src.mcp_tool_shape import is_write_shaped, required_arguments, tool_name
 from src.repositories.tool_registry import (
     MATERIALIZE,
     PASSTHROUGH,
@@ -225,18 +225,6 @@ class UpdateMCPSourceRequest(BaseModel):
         return _validate_auth_method(v)
 
 
-#: Verbs that rule a tool out as the data-app lister whatever the rest of its
-#: name says. Deliberately kept in step with `WRITE_VERB` in
-#: app/web/static/js/components/linked_apps_panel.js: the client ranks with
-#: these and this refuses with them, so the UI never nominates what the
-#: endpoint would then reject.
-_LISTER_WRITE_VERB = re.compile(
-    r"^(create|delete|remove|drop|deploy|modify|update|patch|set|add|put|post|write|"
-    r"rename|move|copy|start|stop|restart|enable|disable|install|uninstall|run|"
-    r"execute|trigger|publish|unpublish|share|revoke|grant|import|upload)(_|$)"
-)
-
-
 def _lister_refusal(tool: Optional[Dict[str, Any]]) -> Optional[str]:
     """Why ``tool`` cannot be the data-app lister — ``None`` when it can.
 
@@ -251,6 +239,10 @@ def _lister_refusal(tool: Optional[Dict[str, Any]]) -> Optional[str]:
         schema demanding one cannot answer that call. The one hard fact
         available here; the rest is a name.
 
+    Both live in ``src/mcp_tool_shape.py`` rather than here, because the repair
+    script for the rows the old heuristic already wrote (#2251) has to
+    recognise exactly what this refuses.
+
     ``readOnlyHint`` is deliberately absent. It is a tri-state, most servers
     send nothing, and registration stores that as ``mutating=True`` — refusing
     an undeclared tool would make linked apps impossible on exactly the servers
@@ -262,15 +254,14 @@ def _lister_refusal(tool: Optional[Dict[str, Any]]) -> Optional[str]:
     """
     if not tool:
         return None  # unknown id — the extractor answers for it, as before
-    name = str(tool.get("original_name") or tool.get("exposed_name") or "")
-    if _LISTER_WRITE_VERB.match(name.lower()):
+    name = tool_name(tool)
+    if is_write_shaped(name):
         return f"'{name}' is named as a tool that changes data, so it cannot be the app lister."
-    schema = tool.get("input_schema") or {}
-    required = schema.get("required") if isinstance(schema, dict) else None
+    required = required_arguments(tool.get("input_schema"))
     if required:
         return (
             f"'{name}' requires the argument{'s' if len(required) > 1 else ''} "
-            f"{', '.join(str(r) for r in required)}. The app lister is called with none, "
+            f"{', '.join(required)}. The app lister is called with none, "
             "so this tool cannot answer it."
         )
     return None

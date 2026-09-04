@@ -169,6 +169,23 @@ CalVer image tags (`stable-YYYY.MM.N`, `dev-YYYY.MM.N`) are produced for every C
   unset, and requiring it would make linked apps impossible on exactly the
   servers the feature exists for. (#2154)
 
+- **Linked apps: the write tool the old guess left in materialize mode is no
+  longer invoked by a full-source run.** The fix above closes the route that
+  creates that state; it does not clear what already exists. On an instance
+  where "Read the app list" was clicked before it, the wrongly chosen tool is
+  still sitting in `materialize` mode, and a source-level "Materialize now"
+  runs every materialize-mode tool without consulting `read_only` — so the
+  same call is reachable by a different door. `scripts/repair_mcp_materialize_
+  debris.py` finds those rows and returns them to `passthrough`, clearing the
+  inert `daily 03:00` schedule with the mode. It reports and changes nothing by
+  default: materializing a write-shaped tool is a legitimate thing to have
+  chosen on purpose, and a name is a guess, so `--apply` is a deliberate second
+  run. Teaching the run path to skip write-shaped tools was considered and not
+  taken — it would break that legitimate setup, and with the lister guard in
+  place there is no remaining bug route into the state for it to defend. The
+  write-verb list now lives once, in `src/mcp_tool_shape.py`, with a test
+  pinning it to the copy `linked_apps_panel.js` has to carry. (#2251)
+
 ### Removed
 - **`/skills` no longer opens on a type picker nothing linked to.** Every route into the builder names a type — the Library's "+ New" menu and its draft rows all go to `?type=skill|plugin|agent` — and once you are inside, switching goes through the title menu, which sets another type directly rather than returning to a picker. There is no rail item. The three-card "What are you building?" step was reachable only by typing the URL. Bare `/skills` now goes to the Library, which offers the same three options next to the drafts you already have — and is the right answer for the two-or-more-drafts case, since only the author can say which one they meant. The redirect is CLIENT-side deliberately: drafts live in localStorage, so a server-side redirect on a missing `?type=` could not see the existing "exactly one draft in flight resumes it" path and would strand it. `?type=` and `?edit=` are untouched. Removed with the picker: `typeSectionHtml`, `typeCardsHtml`, the `.sk-type*` card rules, and the answered step's one-line summary and **Change** control (`.sk-sec--done`, `.sk-sec-collapsed*`, `.sk-sec-change`) — the last hand-rolled copy of the section component on the page, so its guard in `tests/test_skills_builder_shell.py` loses its exemption and becomes unconditional. The cards' one piece of unique copy, `Takes: …` (what the type wants from you), moves onto the type lede in the configuration panel so it is not lost with them.
 
