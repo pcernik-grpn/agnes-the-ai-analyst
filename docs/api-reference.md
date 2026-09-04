@@ -2397,12 +2397,21 @@ permission_skips + excluded_subtree_skips + oversize_files`, and reports
 `unexplained` as their difference — positive, negative, or zero, never
 suppressed.
 
-`404` for an unknown/non-SharePoint connection. Exempt (`ui_support`),
-same disclosure class as A2/A3 above: unlike `extraction/runs/{run_id}`,
-this never carries a `path`/`item_id`/`drive_id` at all, only extensions,
-normalized reason strings and counts. Deliberately not MCP-exposed — an
-admin display primitive, no analyst CLI/MCP analogue, same reasoning as
-`…/extraction/config`.
+`404` for an unknown/non-SharePoint connection. Exempt (`ui_support`), same
+disclosure class as A2/A3 above: unlike `extraction/runs/{run_id}` (A3),
+this never carries a `path`/`item_id`/`drive_id`, only extensions,
+normalized reason strings and counts — with one exception on "reason
+strings": a `convert_failed` reason can itself quote a short fragment of the
+document the converter just failed on (`_convert_failure_detail`,
+`connectors/sharepoint/crawler.py`) when the owning scope is not
+anonymize-marked, the same exposure A3's own `report.failed_items`/
+`errors_detail` already carry (A3 additionally names the real path/item_id,
+which this endpoint never does — so this sits at or below A3's own
+disclosure level). CLI: `agnes admin sharepoint breakdown <connection_id>
+[--since <iso>] [--until <iso>] [--limit <n>] [--json]`, same reasoning as
+`completeness` above. Deliberately not MCP-exposed — an
+aggregate operational diagnostic, not a bounded analyst query, same
+reasoning as `…/extraction/config`.
 
 ### `/api/admin/ontology` — Ontology builder (spec 2026-08-27 §13.2)
 

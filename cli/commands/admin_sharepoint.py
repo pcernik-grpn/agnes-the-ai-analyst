@@ -128,6 +128,7 @@ from rich.console import Console
 from rich.table import Table
 
 from cli.client import api_get, api_patch, api_post
+from cli.query_hints import sharepoint_connection_not_found_hint
 
 admin_sharepoint_app = typer.Typer(help="Admin: SharePoint connector maintenance triggers")
 scope_app = typer.Typer(help="SharePoint connect wizard scope management")
@@ -1184,6 +1185,171 @@ def completeness_cmd(
         typer.echo(json.dumps(body, indent=2))
         return
     _print_completeness_table(body)
+
+
+# ---------------------------------------------------------------------------
+# `breakdown` — "how many documents did we get, how many did we not, by file
+# type and by reason" (2026-09-04). CLI counterpart to `GET …/extraction/
+# breakdown`. Same operator-over-SSH reasoning as `completeness` above and
+# `runs` below: the endpoint's own docstring says this answers what an
+# operator finishing a large crawl could previously only get by hand-writing
+# SQL against Postgres on the box.
+# ---------------------------------------------------------------------------
+
+
+def _fmt_bytes(n: Any) -> str:
+    value = float(n or 0)
+    if value <= 0:
+        return "0 B"
+    units = ("B", "KB", "MB", "GB", "TB")
+    i = 0
+    while value >= 1024 and i < len(units) - 1:
+        value /= 1024
+        i += 1
+    return f"{value:.0f} {units[i]}" if i == 0 else f"{value:.1f} {units[i]}"
+
+
+def _fmt_count_bytes(cell: Optional[Dict[str, Any]]) -> str:
+    cell = cell or {}
+    count = cell.get("count") or 0
+    if not count:
+        return "—"
+    byte_count = cell.get("bytes") or 0
+    return f"{count:,} ({_fmt_bytes(byte_count)})" if byte_count else f"{count:,}"
+
+
+def _capped_by_reason(
+    by_reason: List[Dict[str, Any]], *, limit: int
+) -> "tuple[List[Dict[str, Any]], Optional[Dict[str, int]]]":
+    """``by_reason`` sliced to ``limit`` rows (0 = no cap), plus a
+    ``{limit, total}`` marker when the slice actually dropped rows — never
+    silent (command-UX standard: a partial result must say so), and applied
+    identically to the table AND ``--json`` output rather than only to what
+    prints on screen."""
+    total = len(by_reason)
+    if limit and total > limit:
+        return by_reason[:limit], {"limit": limit, "total": total}
+    return by_reason, None
+
+
+def _print_breakdown(
+    body: Dict[str, Any], *, shown_reasons: List[Dict[str, Any]], cap: Optional[Dict[str, int]]
+) -> None:
+    runs = body.get("runs") or {}
+    rec = body.get("reconciliation") or {}
+    failures = body.get("failures") or {}
+
+    _console.print(f"[bold]SharePoint extraction breakdown — connection {body.get('connection_id')}[/bold]")
+    _console.print(
+        f"{runs.get('considered', 0)} run(s) considered — {runs.get('with_report', 0)} finished with a full "
+        f"report, {runs.get('progress_only', 0)} interrupted (progress-only; a few counters undercount for those)."
+    )
+    unexplained = rec.get("unexplained", 0)
+    style = "bold red" if unexplained else "green"
+    _console.print(
+        f"Seen: {_fmt_count(rec.get('seen'))}  Indexed: {_fmt_count(rec.get('indexed'))}  "
+        f"Accounted for: {_fmt_count(rec.get('accounted_for'))}  "
+        f"Unexplained: [{style}]{_fmt_count(unexplained)}[/{style}]"
+    )
+
+    empty_text = failures.get("empty_text") or {}
+    if empty_text.get("count"):
+        _console.print(
+            f"[yellow]{empty_text['count']} converted fine but produced no extractable text "
+            "— usually needs OCR, not a broken pipeline.[/yellow]"
+        )
+    if failures.get("truncated"):
+        _console.print(
+            f"[yellow]Showing at least {failures.get('listed', 0)} failure(s) — a contributing run's own "
+            "failure list hit its cap, so the true count is higher.[/yellow]"
+        )
+
+    ext_table = Table(title="By file extension")
+    ext_table.add_column("EXTENSION", style="bold")
+    ext_table.add_column("INDEXED", justify="right")
+    ext_table.add_column("REJECTED", justify="right")
+    ext_table.add_column("PROCESSING", justify="right")
+    ext_table.add_column("PENDING", justify="right")
+    ext_table.add_column("NEEDS REVIEW", justify="right")
+    ext_table.add_column("FAILED", justify="right")
+    ext_table.add_column("EMPTY TEXT", justify="right")
+    for row in body.get("by_extension") or []:
+        ext_table.add_row(
+            row.get("extension") or "(none)",
+            _fmt_count_bytes(row.get("indexed")),
+            _fmt_count_bytes(row.get("rejected")),
+            _fmt_count_bytes(row.get("processing")),
+            _fmt_count_bytes(row.get("pending")),
+            _fmt_count_bytes(row.get("needs_review")),
+            _fmt_count(row.get("failed")),
+            _fmt_count(row.get("empty_text")),
+        )
+    _console.print(ext_table)
+
+    reason_title = "By failure reason"
+    if cap:
+        reason_title += f" (showing {cap['limit']} of {cap['total']} — raise --limit for more)"
+    reason_table = Table(title=reason_title)
+    reason_table.add_column("REASON", style="bold")
+    reason_table.add_column("COUNT", justify="right")
+    reason_table.add_column("BY EXTENSION")
+    for row in shown_reasons:
+        exts = ", ".join(
+            f"{ext or '(none)'}: {n}"
+            for ext, n in sorted((row.get("by_extension") or {}).items(), key=lambda kv: -kv[1])
+        )
+        reason_table.add_row(row.get("reason") or "", _fmt_count(row.get("count")), exts)
+    _console.print(reason_table)
+
+
+@admin_sharepoint_app.command("breakdown")
+def breakdown_cmd(
+    connection_id: str = typer.Argument(..., help="SharePoint source_connections id"),
+    since: Optional[str] = typer.Option(None, "--since", help="Only runs started on/after this ISO date/datetime"),
+    until: Optional[str] = typer.Option(None, "--until", help="Only runs started before this ISO date/datetime"),
+    limit: int = typer.Option(20, "--limit", min=0, help="Cap failure-reason rows shown (0 = no cap)"),
+    as_json: bool = typer.Option(False, "--json"),
+):
+    """ "How many documents did we get, how many did we not, broken down by
+    file type and by reason" — documents grouped by REAL file extension
+    (parsed from ``corpus_files.path``, never ``filename``/``file_type``)
+    against the crawl's own recorded failures (grouped by NORMALIZED reason,
+    one row per underlying fault rather than one per file), reconciled into
+    a ``seen``/``indexed``/``accounted_for``/``unexplained`` summary. CLI
+    counterpart to ``GET /api/admin/sharepoint/connections/{connection_id}/
+    extraction/breakdown`` — read entirely from persisted run/corpus data,
+    no Graph calls, unlike ``completeness`` above.
+
+    ``since``/``until`` scope which runs contribute (default: every run on
+    record for this connection). ``--limit`` caps how many failure-reason
+    rows print (0 = no cap) and applies to ``--json`` output the same way,
+    disclosed via a ``by_reason_truncated`` marker rather than silently
+    dropped — the ``by_extension`` table is never capped, since it is one
+    row per distinct extension.
+    """
+    params: Dict[str, Any] = {}
+    if since:
+        params["since"] = since
+    if until:
+        params["until"] = until
+    resp = api_get(f"/api/admin/sharepoint/connections/{connection_id}/extraction/breakdown", params=params)
+    if resp.status_code == 404:
+        typer.echo(sharepoint_connection_not_found_hint(connection_id), err=True)
+        raise typer.Exit(1)
+    if resp.status_code != 200:
+        _fail(resp)
+    body = resp.json()
+    shown_reasons, cap = _capped_by_reason((body.get("failures") or {}).get("by_reason") or [], limit=limit)
+    if as_json:
+        out = dict(body)
+        failures_out = dict(out.get("failures") or {})
+        failures_out["by_reason"] = shown_reasons
+        if cap:
+            failures_out["by_reason_truncated"] = cap
+        out["failures"] = failures_out
+        typer.echo(json.dumps(out, indent=2))
+        return
+    _print_breakdown(body, shown_reasons=shown_reasons, cap=cap)
 
 
 # ---------------------------------------------------------------------------

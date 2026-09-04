@@ -1036,6 +1036,132 @@ class TestCompletenessCmd:
         assert "no certificate configured" in result.output
 
 
+class TestBreakdownCmd:
+    """`agnes admin sharepoint breakdown` — CLI counterpart to
+    `GET …/extraction/breakdown`."""
+
+    def _body(self):
+        return {
+            "connection_id": "conn1",
+            "window": {"since": None, "until": None},
+            "runs": {
+                "considered": 5,
+                "with_report": 4,
+                "progress_only": 1,
+                "note": "counters below use each run's REPORT when it finished normally...",
+            },
+            "scalars": {"new": 10, "changed": 2, "unchanged": 90, "contributed_runs": {"new": 5}},
+            "failures": {
+                "empty_text": {"count": 3, "by_extension": {"pdf": 3}, "note": "conversion succeeded..."},
+                "failed": {"count": 2, "by_extension": {"docx": 1, "pptx": 1}},
+                "by_reason": [
+                    {
+                        "reason_type": "convert_failed",
+                        "reason": "markitdown could not convert this file",
+                        "count": 1,
+                        "by_extension": {"docx": 1},
+                    },
+                    {
+                        "reason_type": "convert_failed",
+                        "reason": "unsupported format",
+                        "count": 1,
+                        "by_extension": {"pptx": 1},
+                    },
+                ],
+                "listed": 2,
+                "truncated": False,
+            },
+            "skips": {"oversize": {"files": 0, "bytes": 0}},
+            "by_extension": [
+                {
+                    "extension": "pdf",
+                    "indexed": {"count": 40, "bytes": 1000},
+                    "rejected": {"count": 0, "bytes": 0},
+                    "processing": {"count": 0, "bytes": 0},
+                    "pending": {"count": 0, "bytes": 0},
+                    "needs_review": {"count": 0, "bytes": 0},
+                    "failed": 0,
+                    "empty_text": 3,
+                },
+                {
+                    "extension": "docx",
+                    "indexed": {"count": 10, "bytes": 200},
+                    "rejected": {"count": 0, "bytes": 0},
+                    "processing": {"count": 0, "bytes": 0},
+                    "pending": {"count": 0, "bytes": 0},
+                    "needs_review": {"count": 0, "bytes": 0},
+                    "failed": 1,
+                    "empty_text": 0,
+                },
+            ],
+            "reconciliation": {
+                "seen": 102,
+                "indexed": 50,
+                "accounted_for": 55,
+                "unexplained": 47,
+                "note": "seen = new + changed + unchanged + filtered_by_age, summed across the window's runs.",
+            },
+            "as_of": "2026-09-04T00:00:00+00:00",
+        }
+
+    def test_happy_path_prints_a_summary_and_tables(self):
+        with patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(200, self._body())) as mock_get:
+            result = runner.invoke(app, ["admin", "sharepoint", "breakdown", "conn1"])
+        assert result.exit_code == 0, result.output
+        assert "conn1" in result.output
+        assert "pdf" in result.output
+        assert "docx" in result.output
+        assert "markitdown could not convert this file" in result.output
+        assert "47" in result.output  # unexplained
+        args, kwargs = mock_get.call_args
+        assert args[0] == "/api/admin/sharepoint/connections/conn1/extraction/breakdown"
+        assert kwargs["params"] == {}
+
+    def test_since_and_until_ride_the_query(self):
+        with patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(200, self._body())) as mock_get:
+            result = runner.invoke(
+                app,
+                ["admin", "sharepoint", "breakdown", "conn1", "--since", "2026-08-01", "--until", "2026-09-01"],
+            )
+        assert result.exit_code == 0, result.output
+        _, kwargs = mock_get.call_args
+        assert kwargs["params"] == {"since": "2026-08-01", "until": "2026-09-01"}
+
+    def test_json_output_is_the_raw_body_when_unlimited(self):
+        body = self._body()
+        with patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(200, body)):
+            result = runner.invoke(app, ["admin", "sharepoint", "breakdown", "conn1", "--json"])
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.output) == body
+
+    def test_limit_caps_by_reason_rows_and_discloses_the_cap_in_json(self):
+        body = self._body()
+        with patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(200, body)):
+            result = runner.invoke(app, ["admin", "sharepoint", "breakdown", "conn1", "--limit", "1", "--json"])
+        assert result.exit_code == 0, result.output
+        out = json.loads(result.output)
+        assert len(out["failures"]["by_reason"]) == 1
+        assert out["failures"]["by_reason_truncated"] == {"limit": 1, "total": 2}
+        # The other sections are untouched by --limit.
+        assert len(out["by_extension"]) == 2
+
+    def test_not_found_hints_the_next_step(self):
+        with patch(
+            "cli.commands.admin_sharepoint.api_get", return_value=_resp(404, {"detail": "connection_not_found"})
+        ):
+            result = runner.invoke(app, ["admin", "sharepoint", "breakdown", "does-not-exist"])
+        assert result.exit_code == 1
+        assert "does-not-exist" in result.output
+        assert "agnes admin connection list" in result.output
+
+    def test_a_typed_error_is_reported(self):
+        detail = {"error": "requires_postgres_backend", "message": "extraction breakdown needs Postgres"}
+        with patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(501, {"detail": detail})):
+            result = runner.invoke(app, ["admin", "sharepoint", "breakdown", "conn1"])
+        assert result.exit_code == 1
+        assert "extraction breakdown needs Postgres" in result.output
+
+
 class TestSplitCmd:
     """`agnes admin sharepoint split` — CLI counterpart to
     `POST /api/admin/sharepoint/connections/{connection_id}/splits`."""
