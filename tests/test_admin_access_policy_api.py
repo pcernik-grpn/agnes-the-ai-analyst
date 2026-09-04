@@ -2070,6 +2070,69 @@ class TestPolicyPreviewMatrix:
         for persona in resp.json()["personas"]:
             assert "Admin" not in persona["groups"]
 
+    def test_matrix_excludes_a_group_set_held_only_by_an_inactive_user(
+        self, policied_invoices_with_granted_groups
+    ):
+        """``_policy_preview_group_set_personas`` skips ``active is False``
+        users (app/api/admin.py's ``if u.get("active") is False: continue``)
+        -- a deactivated account's own, otherwise table-accessible group must
+        never seed a persona, even though ``can_access_table`` itself does
+        not check ``active`` (only stack/package membership). The fixture's
+        already-active Finance/Ops personas must be unaffected."""
+        from src.db import get_system_db
+        from src.repositories.data_packages import DataPackagesRepository
+        from src.repositories.resource_grants import ResourceGrantsRepository
+        from src.repositories.user_group_members import UserGroupMembersRepository
+        from src.repositories.user_groups import UserGroupsRepository
+        from src.repositories.users import UserRepository
+
+        conn = get_system_db()
+        try:
+            groups = UserGroupsRepository(conn)
+            legal_gid = groups.create(name="Legal", created_by="test")["id"]
+
+            users = UserRepository(conn)
+            users.create(id="u_matrix_legal", email="matrix-legal@example.com", name="Legal")
+            users.update(id="u_matrix_legal", active=False)
+
+            members = UserGroupMembersRepository(conn)
+            members.add_member("u_matrix_legal", legal_gid, source="admin")
+
+            pkgs = DataPackagesRepository(conn)
+            pkg_id = pkgs.create(
+                name="Matrix legal pkg",
+                slug="_test-pkg-matrix-legal",
+                description=None,
+                icon=None,
+                color=None,
+                created_by="test",
+            )
+            pkgs.add_table(pkg_id, "matrix_invoices", added_by="test")
+
+            grants = ResourceGrantsRepository(conn)
+            grants.create(
+                group_id=legal_gid,
+                resource_type="data_package",
+                resource_id=pkg_id,
+                requirement="required",
+            )
+        finally:
+            conn.close()
+
+        c = policied_invoices_with_granted_groups["client"]
+        token = policied_invoices_with_granted_groups["admin_token"]
+
+        resp = c.post(
+            "/api/admin/registry/matrix_invoices/policy/preview-matrix",
+            json={"personas": "group_sets"},
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200, resp.text
+        group_sets = {tuple(p["groups"]) for p in resp.json()["personas"]}
+        assert ("Legal",) not in group_sets, "an inactive user's own group must never seed a persona"
+        assert ("Finance",) in group_sets
+        assert ("Ops",) in group_sets
+
     def test_matrix_flags_a_no_op_policy(self, policied_invoices_with_granted_groups):
         """A policy every persona sees 100% of, with a 100% union, is a
         no-op (§13.1) -- the case a single-persona preview cannot itself
@@ -2167,6 +2230,37 @@ class TestPolicyPreviewMatrix:
         assert by_label["Finance"]["rows_visible"] == 2
         assert by_label["Ops"]["rows_visible"] == 1
         assert by_label["(no groups)"]["rows_visible"] == 0
+
+    def test_matrix_extracts_the_unnest_in_form_and_ignores_an_unrelated_in_list(
+        self, policied_invoices_with_granted_groups
+    ):
+        """``_policy_preview_referenced_group_literals`` covers the
+        ``'x' IN (SELECT unnest($user_groups))`` idiom the docs name
+        alongside plain ``list_contains($user_groups, 'x')`` in the SAME
+        policy body, and must NOT mistake an unrelated ``col IN (...)``
+        literal list (no ``$user_groups`` anywhere on its right-hand side)
+        for a group-membership check."""
+        c = policied_invoices_with_granted_groups["client"]
+        token = policied_invoices_with_granted_groups["admin_token"]
+
+        resp = c.post(
+            "/api/admin/registry/matrix_invoices/policy/preview-matrix",
+            json={
+                "sql": (
+                    "SELECT * FROM matrix_invoices WHERE ("
+                    "'finance' IN (SELECT unnest($user_groups)) "
+                    "OR list_contains($user_groups, 'ops') "
+                    "OR id IN ('a', 'b'))"
+                ),
+                "personas": "policy_groups",
+            },
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200, resp.text
+        labels = {p["label"] for p in resp.json()["personas"]}
+        assert {"finance", "ops", "(no groups)"} <= labels
+        assert "a" not in labels
+        assert "b" not in labels
 
     def test_matrix_truncates_at_the_configured_group_set_cap(self, policied_invoices_with_granted_groups):
         from src.db import get_system_db

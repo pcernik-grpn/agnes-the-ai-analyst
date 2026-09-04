@@ -1421,6 +1421,86 @@ class TestUnparseableMaterializedSql:
 
         assert table_registry_repo().get("unparse_mat") is None
 
+    def test_unparseable_row_registered_first_blocks_a_later_policy_attach_on_the_same_engine(
+        self, seeded_app, monkeypatch, stub_bq_extractor
+    ):
+        """The fail-closed ``phys_unknown`` signal is not a registration-time-
+        only trap. An UNPOLICIED materialized row with unparseable
+        ``source_query`` registered FIRST, with no policied row anywhere yet,
+        must still block a LATER policy ATTACH (``PUT
+        .../policy``-equivalent) on an unrelated, already-registered table of
+        the SAME engine — the twin scan re-derives signals from the full
+        registry on every write, so the order the two rows were created in
+        does not matter (``_check_policied_row_has_no_unpolicied_twin``
+        scans every unpolicied row, ``phys_unknown`` included, exactly like
+        ``_check_access_policy_physical_source_conflict`` does on the other
+        direction). A table on a DIFFERENT engine is unaffected — unlike
+        ``bq_instance``, this instance also carries a non-empty
+        ``data_source.keboola`` block so a Keboola registration is allowed
+        alongside the BigQuery primary (§ ``_validate_source_type_
+        configured``'s legacy-secondary-block fallback)."""
+        monkeypatch.setenv("AGNES_ACCESS_POLICIES_ENABLED", "1")
+        fake_cfg = {
+            "data_source": {
+                "type": "bigquery",
+                "bigquery": {"project": "my-test-project", "location": "us"},
+                "keboola": {"url": "https://connection.keboola.com", "token": "dummy-token"},
+            },
+        }
+        monkeypatch.setattr("app.instance_config.load_instance_config", lambda: fake_cfg, raising=False)
+        from app.instance_config import reset_cache
+
+        reset_cache()
+        c = seeded_app["client"]
+        token = seeded_app["admin_token"]
+
+        unparse = _register_bq(
+            c,
+            token,
+            name="unparse_leader",
+            query_mode="materialized",
+            source_query="SELECT * FROM ((( not really sql",
+        )
+        assert unparse.status_code in (200, 201, 202), unparse.text
+
+        bq_target = _register_bq(c, token, name="bq_target", bucket="analytics", source_table="orders")
+        assert bq_target.status_code in (200, 201, 202), bq_target.text
+        attach_bq = c.put(
+            "/api/admin/registry/bq_target",
+            json={"access_policy_sql": _policy_sql("bq_target"), "access_policy_note": "pii masking"},
+            headers=_auth(token),
+        )
+        assert attach_bq.status_code == 422, attach_bq.text
+        assert "access_policy_physical_source_conflict" in attach_bq.text
+        assert "unparse_leader" in attach_bq.text
+        assert "could not be parsed" in attach_bq.text
+
+        from src.repositories import table_registry_repo
+
+        assert table_registry_repo().get("bq_target")["access_policy_sql"] is None
+
+        # A different engine (Keboola, not BigQuery) is untouched by the
+        # BigQuery-engine `phys_unknown` signal above.
+        kbc = c.post(
+            "/api/admin/register-table",
+            json={
+                "name": "kbc_target",
+                "source_type": "keboola",
+                "query_mode": "local",
+                "server_only": True,
+                "bucket": "analytics",
+                "source_table": "orders",
+            },
+            headers=_auth(token),
+        )
+        assert kbc.status_code == 201, kbc.text
+        attach_kbc = c.put(
+            "/api/admin/registry/kbc_target",
+            json={"access_policy_sql": _policy_sql("kbc_target"), "access_policy_note": "pii masking"},
+            headers=_auth(token),
+        )
+        assert attach_kbc.status_code == 200, attach_kbc.text
+
     def test_unparseable_sql_with_no_policied_row_anywhere_is_accepted(
         self, seeded_app, monkeypatch, bq_instance, stub_bq_extractor
     ):
@@ -1511,3 +1591,21 @@ class TestCanonicalSignalsLeaveUnrelatedRowsAlone:
             headers=_auth(token),
         )
         assert resp.status_code == 201, resp.text
+
+
+@pytest.mark.journey
+class TestBigQueryTableValuedFunctionParserLimitation:
+    def test_a_table_valued_function_call_yields_no_physical_table_refs(self):
+        """Known parser limitation, not a fix: sqlglot's BigQuery dialect
+        parses a table-valued-function call (``proj.ds.fn()``) successfully
+        — ``_parse_sql_table_refs`` returns an EMPTY tuple, never ``None`` —
+        but resolves zero ``exp.Table`` references. A materialized row whose
+        ``source_query`` reads only a TVF therefore emits no `phys` signal at
+        all, not even the fail-closed `phys_unknown` one, and is invisible to
+        the twin check either way. Documented here (a plain assertion of
+        current behaviour, no ``xfail``) so a future sqlglot upgrade that
+        starts resolving TVF arguments as table refs is noticed rather than
+        silently changing this."""
+        from app.api.admin import _parse_sql_table_refs
+
+        assert _parse_sql_table_refs("SELECT * FROM proj.ds.fn()", "bigquery") == ()

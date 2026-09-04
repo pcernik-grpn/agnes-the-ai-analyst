@@ -11,9 +11,10 @@ that actually EXECUTES a policied relation returns, so the four call sites
 below can never drift on the reason code, the field names, or the datetime
 serialization:
 
-- ``POST /api/query`` (``app/api/query.py::execute_query``) and its
-  ``--from-query`` snapshot-materialize sibling
-  (``run_remote_select_to_arrow``) — the original S3 wiring (#2023).
+- ``POST /api/query`` (``app/api/query.py::execute_query``) — the original
+  S3 wiring (#2023). Its ``--from-query`` snapshot-materialize sibling
+  (``run_remote_select_to_arrow``) did NOT get the same guard at the time;
+  it was added later, alongside the three surfaces below, by #2147.
 - ``GET /api/v2/sample/{table_id}`` (``app/api/v2_sample.py::build_sample``)
   — the local-parquet branch, the only one that resolves a POLICIED
   relation and actually reads it (the BigQuery and non-BQ-remote branches
