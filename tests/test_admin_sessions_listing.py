@@ -1,14 +1,18 @@
 """Contract test for /api/admin/sessions/list — the listing response
 must surface a `session_dir` field derived from `session_file.split('/')[0]`
 so the UI can build transcript / download URLs that target the on-disk
-directory, NOT the display `username` (which v60 collapses to email and
-which `_safe_session_path._USERNAME_RE` rejects).
+directory, NOT the display `username` (which v60 collapses to email).
 
 Regression guard for the cross-file integration break that landed with
 v60 (PR #458 admin telemetry rewrite): every test below seeds rows with
 the post-v60 shape (username = email; session_file = `<dir>/<file>`) and
-asserts the listing API exposes `session_dir` so the UI URL builder
-doesn't try to put `@` into `_safe_session_path._USERNAME_RE`.
+asserts the listing API exposes `session_dir` so the UI URL builder has
+the directory to point at.
+
+`_safe_session_path` also accepts the display email now and resolves it
+(#2266, tests/test_admin_sessions_download_username.py) — but that costs a
+user lookup per request and cannot disambiguate a deleted user's orphaned
+directory, so `session_dir` stays the field the UI builds URLs from.
 """
 
 from __future__ import annotations
@@ -48,7 +52,8 @@ class TestSessionDirInListing:
         token = seeded_app["admin_token"]
         conn = get_system_db()
         try:
-            _seed_session(conn,
+            _seed_session(
+                conn,
                 "b00f5e3e-aaaa-bbbb-cccc-dddddddddddd/session-001.jsonl",
                 "alice@example.com",
             )
@@ -77,7 +82,8 @@ class TestSessionDirInListing:
         token = seeded_app["admin_token"]
         conn = get_system_db()
         try:
-            _seed_session(conn,
+            _seed_session(
+                conn,
                 "bob/session-legacy.jsonl",
                 "bob@example.com",
             )
@@ -107,7 +113,8 @@ class TestSessionDirInListing:
         token = seeded_app["admin_token"]
         conn = get_system_db()
         try:
-            _seed_session(conn,
+            _seed_session(
+                conn,
                 "orphandir/session-orph.jsonl",
                 "orphandir",  # username still the dir-name (orphan, untouched by v60)
             )
