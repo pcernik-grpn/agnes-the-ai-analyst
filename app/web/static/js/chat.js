@@ -525,11 +525,19 @@ const _SVG_STYLE_ATTR = /\s+style="([^"]*)"/i;
  *
  *  An existing `style` is preserved apart from its own max-width: mermaid puts
  *  theme custom properties there that its inner <style> block derives colours
- *  from, so dropping the attribute wholesale resolves those to black. */
+ *  from, so dropping the attribute wholesale resolves those to black.
+ *
+ *  A root tag with NO viewBox is left exactly as it is. The viewBox is the only
+ *  thing that says what the diagram's proportions are; without it, width and
+ *  height ARE the sizing (`hasDrawnContent` documents the same case), and
+ *  stripping them while having no max-width to put back leaves an <svg> with no
+ *  intrinsic height — which collapses to the CSS default rather than scaling.
+ *  The `.msg-mermaid-stage` overflow rule is the fallback for that case. */
 function makeResponsiveSvg(svg) {
   if (typeof svg !== "string" || !svg) return svg;
   const viewBox = svg.match(/viewBox="[^"]*\s([\d.]+)\s+[\d.]+"/);
   const vbWidth = viewBox ? Math.round(Number(viewBox[1])) : 0;
+  if (!vbWidth) return svg;
   return svg.replace(_ROOT_SVG_TAG, (_m, open, attrs, close) => {
     const existing = (attrs.match(_SVG_STYLE_ATTR) || [])[1] || "";
     const decls = existing
@@ -542,7 +550,7 @@ function makeResponsiveSvg(svg) {
       .replace(/\s+height="[^"]*"/i, "")
       .replace(_SVG_STYLE_ATTR, "");
     next += ' width="100%"';
-    const style = [decls, vbWidth > 0 ? `max-width: ${vbWidth}px` : ""].filter(Boolean).join("; ");
+    const style = [decls, `max-width: ${vbWidth}px`].filter(Boolean).join("; ");
     if (style) next += ` style="${style}"`;
     return `${open}${next}${close}`;
   });

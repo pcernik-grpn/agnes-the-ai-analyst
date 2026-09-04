@@ -114,8 +114,13 @@ def test_make_responsive_svg_executable():
         "only the ROOT tag is rewritten; an inner icon's fixed size IS its layout"
     )
 
-    assert 'width="100%"' in res["no_viewbox"]
-    assert "max-width" not in res["no_viewbox"], "no viewBox means no natural width to cap at"
+    # No viewBox: the tag is returned untouched. Width and height ARE the sizing
+    # in that case (`hasDrawnContent` documents the same case), and there is no
+    # max-width to put back — stripping them would leave an <svg> with no
+    # intrinsic height, which collapses to the CSS default instead of scaling.
+    assert res["no_viewbox"] == '<svg width="300" height="100"><g/></svg>', (
+        "a diagram sized by width/height must keep them; .msg-mermaid-stage overflow is the fallback"
+    )
 
 
 def test_the_root_svg_regex_is_anchored():
@@ -344,7 +349,7 @@ def test_the_prompt_names_the_types_that_fail_here():
     for path in (WORKSPACE_CLAUDE_MD, CLAUDE_MD_TEMPLATE):
         md = re.sub(r"\s+", " ", _read(path))
         # Backticked, so a bare "pie" elsewhere in the prompt cannot pass this.
-        for bad in ("`C4Context`", "`pie`", "`mindmap`", "`gitGraph`"):
+        for bad in ("`C4Context`", "`pie`", "`mindmap`", "`gitGraph`", "`architecture-beta`"):
             assert bad in md, f"{bad} not warned against in {path}"
         assert "dateFormat YYYY-MM-DD" in md, f"gantt time-only formats fail silently ({path})"
         assert 'icon: "lucide:name"' in md and "fa:fa-*" in md, (
