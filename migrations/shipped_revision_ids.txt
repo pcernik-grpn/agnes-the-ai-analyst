@@ -141,4 +141,5 @@
 0094_usage_turns
 0094_extraction_runs
 0095_memory_detection_runs
+0096_users_kind
 0096_resource_grants_source

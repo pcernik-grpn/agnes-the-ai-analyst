@@ -408,6 +408,24 @@ same `supports_approvals` sink capability, same pending-card replay to a
 late-attaching browser, same Slack Continue-on-web nudge, and the same
 immediate actionable deny on `Surface.API`.
 
+On the **`kai-agent` provider** there is no in-sandbox runner to hold a
+`can_use_tool` callback, so the same round-trip rides the engine's own
+approval channel: the engine parks the `AskUserQuestion` call and merges
+whatever `answers` the approval decision carries into the SDK's
+`updatedInput`. The provider translates that request into the identical
+`question_request` card and posts the picked `{question: label}` map back
+as the decision's `answers` (`_raise_question` in
+`app/chat/kai_engine_provider.py`) — so an approval answered `allow` with
+no answers is not "the user let the agent ask", it is "the user was asked
+and said nothing", and the tool returns *The user did not answer the
+questions.* The four outcomes carry the gate's own wording, shared from
+`app/chat/runner.py` so both runtimes read identically to the model. The
+timeout is enforced Agnes-side here because the engine never auto-denies an
+interactive approval (its sandbox waits ~24 h), and the
+`chat.approvals_enabled` kill-switch does not reach a question on either
+provider: it exists so tool calls do not wait on a human who is not there,
+and this one waits on the person the answer is for.
+
 **Warehouse data is sent to Anthropic by design** — do not store data
 the operator does not want Anthropic to process.
 
@@ -669,10 +687,28 @@ Requirements and semantics:
   new conversation.
 - **Tool approvals round-trip.** The engine raises approval-requiring tool
   calls as events; they render as the normal web approval card, and the
-  decision is delivered to the engine's approval endpoint. `allow_session`
-  collapses to a plain allow (the engine has no per-session grant), and
-  `chat.approvals_enabled: false` auto-denies each request instantly — the
-  same kill-switch semantics as the native gate.
+  decision is delivered to the engine's approval endpoint. Which calls ask is
+  the engine's rule: its sandbox auto-approves an MCP tool whose `tools/list`
+  entry carries `annotations.readOnlyHint: true` and asks for everything
+  else. Foundation tools get the hint from `@tool(read_only=…)`; passthrough
+  tools (admin-registered MCP sources) get it from `tool_registry.mutating` —
+  a read-only row runs unasked, a mutating one asks — so an admin who wants a
+  passthrough tool gated marks it mutating (which also puts it behind the
+  `allow_mutating` grant). The card's reason line says exactly that ("not
+  marked read-only"), so a reader can tell a search from a write.
+  `allow_session` is honoured by the provider, not the engine (whose
+  endpoint knows only allow/deny per call): the handle remembers the approved
+  call — tool **and** arguments, the same key the native gate uses — for the
+  life of the live session on this gateway and answers the engine's next
+  request for that identical call itself, with no card; a pause/resume or a
+  respawn starts over. The decision (allowed, allowed for the session,
+  denied, timed out) is also recorded on the tool line it gated and
+  persisted with the message — including on the later calls the session
+  grant let through, which would otherwise look ungated — so a reloaded
+  transcript still shows which calls a human let through; the approval card
+  itself is never persisted. `chat.approvals_enabled: false`
+  auto-denies each request instantly — the same kill-switch semantics as the
+  native gate.
 - **Pause/resume is bookkeeping only.** There is no Agnes-side sandbox to
   snapshot; a paused session simply drops its engine connection and a resume
   re-attaches by chat id — the transcript and agent state live in the engine.

@@ -196,7 +196,7 @@ def test_system_prompt_says_the_message_is_not_addressed_to_the_model():
     assert "never answer" in prompt
 
 
-def test_generate_title_sync_sends_the_framed_request_at_temperature_zero(monkeypatch):
+def test_generate_title_sync_sends_the_framed_request_without_sampling_knobs(monkeypatch):
     import anthropic
 
     captured = {}
@@ -215,7 +215,9 @@ def test_generate_title_sync_sends_the_framed_request_at_temperature_zero(monkey
     out = auto_title._generate_title_sync("Search SharePoint for our engagement letters", api_key="k")
     assert out == "Engagement letters"
     assert captured["ctor"]["api_key"] == "k"
-    assert captured["temperature"] == 0.0
+    # anthropic SDK >= 1.x has no `temperature` kwarg; passing one is a TypeError
+    # that took every title down (seen live: 8 failures in 48 h, no successes).
+    assert "temperature" not in captured
     assert captured["system"] == auto_title._SYSTEM_PROMPT
     content = captured["messages"][0]["content"]
     assert content != "Search SharePoint for our engagement letters", "bare message must never be the user turn"
@@ -1272,6 +1274,7 @@ def test_generate_title_sync_vertex_builds_vertex_client(monkeypatch):
     assert captured["ctor"]["project_id"] == "proj-1"
     assert captured["ctor"]["region"] == "europe-west1"
     assert captured["model"] == "claude-haiku-4-5@20251001"
-    # Same framed request + pinned sampling as the first-party path (TCRD-290).
-    assert captured["temperature"] == 0.0
+    # Same framed request as the first-party path (TCRD-290), and the same
+    # absence of sampling knobs the SDK no longer accepts.
+    assert "temperature" not in captured
     assert "<first_message>\nShow me revenue\n</first_message>" in captured["messages"][0]["content"]

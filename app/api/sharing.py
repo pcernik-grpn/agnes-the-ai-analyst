@@ -17,7 +17,7 @@ Fail-closed: a resource the caller doesn't own returns 404 (not 403), matching
 the collections contract, so callers cannot probe for the existence of items
 they have no rights over.
 
-Shareable types are ``collection`` (artefacts: files, images, documents),
+Shareable types are ``collection`` (artifacts: files, images, documents),
 ``corpus_file``, ``agent`` and ``data_app`` (hosted apps; the resource id is
 the app's SLUG — grants on that type are slug-keyed, see
 ``app.api.data_apps._can_view``). Skills are excluded on purpose — an

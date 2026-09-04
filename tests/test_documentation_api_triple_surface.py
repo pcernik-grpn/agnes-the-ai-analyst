@@ -264,7 +264,7 @@ _COHORT: dict[str, tuple[str, str]] = {
     "/api/data-apps/{slug}": ("app show", "data_app_get"),
     "/api/data-apps/{slug}/deploy": ("app deploy", "data_app_deploy"),
     "/api/data-apps/{slug}/logs": ("app logs", "data_app_logs"),
-    # "Add artefacts to My Stack" — Stack membership for personal file
+    # "Add artifacts to My Stack" — Stack membership for personal file
     # Collections (permission = ownership/sharing, not admin-RBAC grants).
     # POST (add) → stack_artefact_add; DELETE (remove) → stack_artefact_remove
     # — one cohort row per path, mirrors the /api/store/entities/{entity_id}
@@ -838,6 +838,30 @@ _EXEMPT: dict[str, str] = {
         "state disk, and the human who sets it is the operator already in "
         "/admin before a demo — an `agnes admin` verb would be a third way "
         "to write one file, with no analyst workflow behind it"
+    ),
+    "/api/admin/service-accounts": (
+        "service-account identity CRUD (issue #1534) — CLI-reachable via "
+        "`agnes admin service-account create|list`, deliberately never "
+        "MCP-exposed per the 'admin credential-provisioning writes' standing "
+        "exemption in CONTRIBUTING.md: an agent-invokable tool that can "
+        "mint a new headless identity is the same privilege-provisioning "
+        "seam that paragraph names, one level up from minting a credential "
+        "for an existing one"
+    ),
+    "/api/admin/service-accounts/{service_account_id}/tokens": (
+        "mints a durable PAT for a service account (issue #1534) — "
+        "CLI-reachable via `agnes admin service-account token`, deliberately "
+        "never MCP-exposed per the 'admin credential-provisioning writes' "
+        "standing exemption in CONTRIBUTING.md: an agent-invokable tool that "
+        "can mint a fresh, independently-usable credential is exactly the "
+        "privilege-escalation seam that paragraph names"
+    ),
+    "/api/admin/service-accounts/{service_account_id}": (
+        'PATCH `{"active": bool}` flips a service account\'s `users.active` '
+        "(issue #1534) — CLI-reachable via `agnes admin service-account "
+        "deactivate|activate`, deliberately never MCP-exposed: same class as "
+        "the credential-provisioning writes above, since deactivating is what "
+        "makes the account's already-minted PATs stop authenticating"
     ),
     "/api/admin/sso/config": (
         "external SSO login config (design 2026-08-28) — CLI-reachable via "
@@ -1561,7 +1585,7 @@ _EXEMPT: dict[str, str] = {
     ),
     "/api/chat/sessions/{chat_id}/files/save-artefact": (
         "web chat affordance — saves one session-workspace file as the "
-        "caller's private Library artefact (same bridge the chat composer "
+        "caller's private Library artifact (same bridge the chat composer "
         "upload uses); CLI sessions already have the files locally, no MCP "
         "analogue"
     ),

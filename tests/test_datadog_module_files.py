@@ -304,6 +304,21 @@ def test_postgres_check_is_autodiscovery_on_the_image_and_not_billed_dbm():
     assert inst["ssl"] == "disable", "loopback-only compose network"
 
 
+def test_rendering_the_pg_check_puts_the_password_only_in_the_password_field():
+    """agnes-datadog-pg-role.sh renders the template with bash's GLOBAL
+    `${rendered//placeholder/$PW}`, so every occurrence of the placeholder
+    becomes the real credential — a comment that names the literal token ships
+    the password into the rendered file's comments, which is exactly where a
+    `grep -v password` redaction pass does not look before the file is shared."""
+    pw = "s3cr3t-rendered-password"
+    rendered = (FILES / "postgres.yaml.tpl").read_text().replace("@@DD_PG_PASSWORD@@", pw)
+    carrying = [line for line in rendered.splitlines() if pw in line]
+    assert len(carrying) == 1 and carrying[0].strip().startswith("password:"), (
+        f"the rendered check config must carry the password exactly once, in the password: field; got {carrying!r}"
+    )
+    assert yaml.safe_load(rendered)["instances"][0]["password"] == pw
+
+
 def test_pg_role_bootstrap_keeps_the_password_off_argv_and_never_fails_its_unit():
     sh = (FILES / "agnes-datadog-pg-role.sh").read_text()
     assert "PGPASSWORD=" not in sh, "an env var is inherited by children"

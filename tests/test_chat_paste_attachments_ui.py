@@ -319,12 +319,18 @@ def test_restore_puts_the_attachments_back_when_the_send_never_started():
 
 
 def test_oversized_paste_never_reaches_the_wire():
+    """The substantive claim is `calls == 0` — nothing is uploaded.
+
+    The toast is a `warn`, not an `error`: a file over the limit is a stated
+    cap with an obvious next step, not a fault. Every such message used to be
+    red, which is what taught readers to distrust the product over things it
+    handled correctly (see tests/test_notice_component_contract.py)."""
     out = _run("""
       paste([{ name: "huge.png", type: "image/png", size: 21 * 1024 * 1024 }]);
       console.log(JSON.stringify({ calls: calls.length, toasts: toasts.map((t) => t[1]) }));
     """)
     assert out["calls"] == 0
-    assert out["toasts"] == ["error"]
+    assert out["toasts"] == ["warn"], "the reader must still be told, just not alarmed"
 
 
 def test_a_co_drive_session_refuses_the_paste_instead_of_half_doing_it():

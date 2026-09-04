@@ -149,7 +149,7 @@ _OWNER_RESOLVERS[ResourceType.STORE_ENTITY.value] = _store_entity_owner
 
 #: Human labels for the shareable types, used in error messages.
 SHAREABLE_TYPES: Dict[str, str] = {
-    ResourceType.COLLECTION.value: "artefact",
+    ResourceType.COLLECTION.value: "artifact",
     ResourceType.AGENT.value: "agent",
     ResourceType.CORPUS_FILE.value: "file",
     ResourceType.DATA_APP.value: "app",

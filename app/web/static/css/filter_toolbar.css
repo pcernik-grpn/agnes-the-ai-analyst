@@ -79,7 +79,7 @@
 /* Nothing to filter (every facet needs two values to exist, so a new instance
    has none) — the control stays in the bar and stops being a door. Muted ink
    rather than a low opacity: at .5 the border and the glyph fade too, and the
-   button reads as a rendering artefact instead of an unavailable control. The
+   button reads as a rendering artifact instead of an unavailable control. The
    `title` on it carries the reason (see library.html). */
 .fbar-filter__btn:disabled { color: var(--ds-text-muted); cursor: default; }
 .fbar-filter__btn:disabled svg { color: var(--ds-text-muted); }

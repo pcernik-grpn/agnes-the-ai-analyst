@@ -703,7 +703,7 @@
     if (!list.length) {
       return '<p class="ag-emptyrows">' + (KNOWLEDGE.length
         ? 'No data, memory, or files match “' + esc(q) + '”.'
-        : 'Nothing you can access yet — add data or memory from the <a href="/catalog">Catalog</a>, or upload files in <a href="/artefacts">Artefacts</a>.') + '</p>';
+        : 'Nothing you can access yet — add data or memory from the <a href="/catalog">Catalog</a>, or upload files in <a href="/artefacts">Artifacts</a>.') + '</p>';
     }
     return list.map(function (k) { return knowledgeRow(a, k, 'pick'); }).join('');
   }
@@ -802,7 +802,7 @@
       title: 'Add data, memory or files',
       sub: 'Everything you can reach. Grounding an agent never widens what the person talking to it may see.',
       search: 'Search data, memory & files…',
-      foot: 'Discover more in the <a href="/catalog">Catalog</a>, or upload files in <a href="/artefacts">Artefacts</a>.'
+      foot: 'Discover more in the <a href="/catalog">Catalog</a>, or upload files in <a href="/artefacts">Artifacts</a>.'
     },
     capabilities: {
       title: 'Add a plugin or skill',

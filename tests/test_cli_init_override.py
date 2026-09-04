@@ -458,7 +458,7 @@ def test_init_override_extracts_and_writes_extended_sentinel(tmp_path, monkeypat
     Result: admin's CLAUDE.md content lands (not the /api/welcome default).
     Agnes OWNS hooks/statusLine/commands in BOTH modes, so it (re)writes
     settings.json with its hook entries ON TOP of the template; the
-    DEFAULT-only artefacts (AGNES_WORKSPACE.md, CLAUDE.local.md, the
+    DEFAULT-only artifacts (AGNES_WORKSPACE.md, CLAUDE.local.md, the
     model/permissions seed) are NOT written in override mode. Sentinel has
     override:true.
     """
@@ -494,7 +494,7 @@ def test_init_override_extracts_and_writes_extended_sentinel(tmp_path, monkeypat
     # Agnes OWNS hooks/statusLine/commands in BOTH modes → settings.json is
     # (re)written with the Agnes hook entries on top of the template.
     assert "SessionStart" in (tmp_path / ".claude" / "settings.json").read_text()
-    # DEFAULT-only artefacts are still NOT created by Agnes in override mode:
+    # DEFAULT-only artifacts are still NOT created by Agnes in override mode:
     assert not (tmp_path / ".claude" / "CLAUDE.local.md").exists()
     assert not (tmp_path / "AGNES_WORKSPACE.md").exists()
     # Sentinel carries override metadata

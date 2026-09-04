@@ -17,6 +17,10 @@ from src.repositories import (
     user_groups_repo,
     users_repo,
 )
+from src.service_accounts import (
+    ServiceAccountAdminGroupForbidden,
+    ServiceAccountInteractiveLoginError,
+)
 
 try:
     from authlib.deprecate import AuthlibDeprecationWarning as _AuthlibDepr
@@ -494,6 +498,7 @@ from app.api.query_hybrid import router as query_hybrid_router
 from app.api.cli_artifacts import router as cli_artifacts_router
 from app.api.cli_auth import router as cli_auth_router
 from app.api.tokens import router as tokens_router, admin_router as tokens_admin_router
+from app.api.admin_service_accounts import router as admin_service_accounts_router
 from app.api.agents_admin import router as agents_admin_router
 from app.api.agent_runtime import router as agent_runtime_router  # noqa: E402
 from app.api.agent_sessions import router as agent_sessions_router  # noqa: E402
@@ -959,6 +964,13 @@ async def lifespan(app):
 
     validate_deployment()
 
+    # Opt-in OTLP trace export (docs/observability.md → "OpenTelemetry
+    # export"). Idempotent: setup_logging already tried at import; this
+    # repeat catches an endpoint that only reached the environment later.
+    from src.observability.otel import configure_otel
+
+    configure_otel(role=os.environ.get("AGNES_ROLE") or "app")
+
     # Surface an unsafe/no-op data-apps posture at startup: enabled, but
     # same-origin serving off and no isolated origin configured, so no hosted
     # app can actually be served (see data_apps_proxy._same_origin_serving_refused).
@@ -1235,7 +1247,7 @@ async def lifespan(app):
     # BG-task / scheduler paths that bypass the per-mutation hook.
     # Soft-failure — logs WARNING and the repo falls back to ILIKE.
     #
-    # DuckDB-only: the BM25 index is a DuckDB FTS-extension artefact built on
+    # DuckDB-only: the BM25 index is a DuckDB FTS-extension artifact built on
     # the system DuckDB. On Postgres there is no system DuckDB (and opening one
     # is forbidden), so skip entirely — memory search there uses the PG path.
     from src.repositories import use_pg as _use_pg
@@ -2159,6 +2171,15 @@ async def lifespan(app):
             await close_mcp_sessions()
         except Exception:
             logger.exception("MCP session pool close failed during shutdown (non-fatal)")
+        # Flush buffered OTLP spans while the loop is still up (no-op when
+        # export is off) — a BatchSpanProcessor's own atexit hook would run
+        # too late for a graceful compose stop.
+        try:
+            from src.observability.otel import shutdown_otel
+
+            shutdown_otel()
+        except Exception:
+            logger.exception("otel shutdown failed (non-fatal)")
         from src.db import close_analytics_db, close_operational_db, close_system_db
 
         close_system_db()
@@ -2955,6 +2976,7 @@ def create_app() -> FastAPI:
     app.include_router(cli_auth_router)
     app.include_router(tokens_router)
     app.include_router(tokens_admin_router)
+    app.include_router(admin_service_accounts_router)
     app.include_router(agents_admin_router)
     app.include_router(agent_runtime_router)
     app.include_router(agent_sessions_router)
@@ -3213,21 +3235,77 @@ def create_app() -> FastAPI:
         "/admin/chat",
     )
 
-    _ERROR_TITLES = {
-        400: "Bad request",
-        401: "Sign-in required",
-        403: "Forbidden",
-        404: "Page not found",
-        405: "Method not allowed",
-        408: "Request timeout",
-        413: "Payload too large",
-        422: "Unprocessable entity",
-        429: "Too many requests",
-        500: "Server error",
-        502: "Bad gateway",
-        503: "Service unavailable",
-        504: "Gateway timeout",
+    # Reader-facing copy for every status the error page can render, keyed by
+    # code: (headline, explanation, tone).
+    #
+    # The headline is a sentence about the situation, not the RFC's name for
+    # the status — "Forbidden" and "Too many requests" are protocol vocabulary,
+    # and a reader who hits one needs to know what to do, not what the spec
+    # calls it. The explanation is written HERE rather than taken from the
+    # raise site's ``detail``: half the raise sites pass a machine token
+    # (``access_denied``, ``csrf_check_failed``) and the page printed it
+    # verbatim, so the reader got the same fact twice in two vocabularies,
+    # neither of them theirs.
+    #
+    # `tone` drives the mark and the one colour decision. Only ``broken``
+    # (5xx — we failed) is coloured; ``wait``, ``locked`` and ``gone`` render
+    # in muted ink, because "come back in a minute", "ask your admin" and
+    # "that link is stale" are ordinary situations, and painting them like
+    # emergencies is what made a rate limit read as a crash.
+    _ERROR_COPY: dict[int, tuple[str, str, str]] = {
+        400: (
+            "That link isn’t valid",
+            "Part of the address is malformed. Check it, or start again from the Library.",
+            "gone",
+        ),
+        # Never rendered in practice — a 401 GET redirects to /login below —
+        # but a HEAD/POST can still land here, so it gets real copy too.
+        401: ("You need to sign in", "Sign in to continue where you left off.", "locked"),
+        403: (
+            "You don’t have access to this",
+            "It’s limited to a group you’re not in. Your workspace admins can add you — it takes one grant.",
+            "locked",
+        ),
+        404: (
+            "This page doesn’t exist",
+            "The link may be old, or whatever it pointed to was renamed or deleted.",
+            "gone",
+        ),
+        405: (
+            "That isn’t how this page opens",
+            "The address is right but the action isn’t. Start from the Library instead.",
+            "gone",
+        ),
+        408: ("That took too long", "The request timed out before it finished. Try again.", "wait"),
+        413: (
+            "That’s too large to accept",
+            "The upload is bigger than this instance allows. Try a smaller file.",
+            "gone",
+        ),
+        422: (
+            "Agnes couldn’t read that request",
+            "Something in it wasn’t in the expected shape. Check the address, or start again from the Library.",
+            "gone",
+        ),
+        429: (
+            "Too many requests in a row",
+            "You’ve hit a rate limit. It clears on its own in about a minute — nothing is broken.",
+            "wait",
+        ),
+        500: (
+            "Something broke on our side",
+            "This one isn’t you. It’s already been logged — quote the reference below if you report it.",
+            "broken",
+        ),
+        502: ("Agnes is briefly unavailable", "A service is restarting. Try again in a minute.", "wait"),
+        503: ("Agnes is briefly unavailable", "A service is restarting. Try again in a minute.", "wait"),
+        504: ("That took too long", "The request timed out upstream. Try again in a moment.", "wait"),
     }
+    _ERROR_COPY_FALLBACK = (
+        "Something went wrong",
+        "Try again, or quote the reference below if it keeps happening.",
+        "broken",
+    )
 
     def _wants_html(request) -> bool:
         """True when the client looks like a browser (non-API path, explicit html).
@@ -3291,9 +3369,9 @@ def create_app() -> FastAPI:
         ``url_for`` helpers — without these, base.html + _app_rail.html
         silently render empty header/stylesheets."""
         from app.logging_config import request_id_var
-        from app.web.router import templates as _web_templates, _build_context
+        from app.web.router import templates as _web_templates, _build_context, _is_debug
 
-        title = _ERROR_TITLES.get(code, "Error")
+        title, explain, tone = _ERROR_COPY.get(code, _ERROR_COPY_FALLBACK)
         user = await _resolve_error_user(request)
         # A non-admin opening an admin entity URL (a teammate copied their
         # own address bar) used to dead-end on a generic 403 — but the
@@ -3324,6 +3402,19 @@ def create_app() -> FastAPI:
             user=user,
             code=code,
             title=title,
+            # `explain` is what the page PRINTS; `message` is the raise site's
+            # own detail, kept in the context because several branches in the
+            # template switch on the token it carries (`not_shared:…`,
+            # `admin_elevation_paused`, `view_as_self`) — but it is never
+            # rendered, which is what stopped `access_denied` reaching readers.
+            explain=explain,
+            tone=tone,
+            # Same source as the /_debug/* route guard, so the developer
+            # disclosure on this page appears exactly when those routes are
+            # mounted. `config.DEBUG` does not exist on ConfigProxy — reading
+            # it would silently render Undefined (falsy) and hide the path
+            # from developers too.
+            debug=_is_debug(),
             message=message,
             path=request.url.path,
             bridge=bridge,
@@ -3382,6 +3473,33 @@ def create_app() -> FastAPI:
                 "detail": str(exc),
                 "error": "requires_postgres_backend",
                 "feature": exc.feature,
+            },
+        )
+
+    @app.exception_handler(ServiceAccountAdminGroupForbidden)
+    async def _service_account_admin_group_forbidden_handler(request, exc: ServiceAccountAdminGroupForbidden):
+        """Guard 2 (issue #1534): a kind='service' user may never join the
+        system Admin group — same translate-a-typed-exception-to-a-clean-
+        response pattern as RequiresPostgresBackend -> 501 above."""
+        return JSONResponse(
+            status_code=409,
+            content={
+                "detail": str(exc),
+                "error": "service_account_admin_forbidden",
+            },
+        )
+
+    @app.exception_handler(ServiceAccountInteractiveLoginError)
+    async def _service_account_interactive_login_handler(request, exc: ServiceAccountInteractiveLoginError):
+        """Guard 1 (issue #1534): a kind='service' user may never hold an
+        interactive (typ="session") credential — refused once, at the
+        single JWT-mint choke point every login provider shares
+        (app.auth.jwt.create_access_token)."""
+        return JSONResponse(
+            status_code=403,
+            content={
+                "detail": str(exc),
+                "error": "service_account_no_interactive_session",
             },
         )
 
