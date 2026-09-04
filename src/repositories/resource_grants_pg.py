@@ -562,3 +562,128 @@ class ResourceGrantsPgRepository:
         with self._engine.connect() as conn:
             rows = conn.execute(sa.text(sql), params).mappings().all()
         return [dict(r) for r in rows]
+
+    # ── Finishing what migration 0098 declined to do ─────────────────────
+    #
+    # `0098_everyone_becomes_a_scope` converts grants on the seeded `Everyone`
+    # group to `scope='everyone'`, but its step 3 is GUARDED and refuses in two
+    # directions, because converting would change who can see what:
+    #
+    #   widening  — a PERSON outside the group would GAIN everything it holds
+    #   narrowing — a non-person INSIDE it holds these grants today and would
+    #               LOSE them, since the scope reaches people only (#2256)
+    #
+    # Both refusals log "a later release converts the rows once …". That
+    # release is this method: the revision is stamped and never runs again, so
+    # without a re-runnable path the instance stays half-converted forever —
+    # new writes use the column, the pre-0098 rows stay group-shaped, and
+    # nothing ever closes the gap. Observed on two instances the day 0098
+    # shipped, each tripping a different arm.
+    #
+    # The guards are re-implemented rather than imported: a migration must
+    # stay frozen against code drift, so it cannot import from `src/`, and
+    # this cannot import from a migration either. `tests/db_pg/
+    # test_everyone_scope_reconcile.py` pins the two to the same meaning, which
+    # is the check that matters — a reconciler with a LOOSER guard than the
+    # migration would hand out access the migration refused to.
+    def reconcile_everyone_scope(self, *, dry_run: bool = False) -> Dict[str, Any]:
+        """Convert the grants 0098 left on the ``Everyone`` group, if it is now
+        safe to. Returns a report; never raises on a blocked instance.
+
+        ``status`` is one of:
+
+        - ``converted``     — the guards passed; ``converted`` rows were written
+                              (zero when ``dry_run``, with ``would_convert`` set)
+        - ``nothing_to_do`` — no convertible rows remain
+        - ``blocked``       — a guard fired; ``blocked_by`` says which, and
+                              nothing was written
+        """
+        from src.db import SYSTEM_EVERYONE_GROUP
+        from src.grant_scopes import SCOPE_WITHHELD_TYPES
+        from src.service_accounts import HUMAN_KIND
+
+        withheld = sorted(SCOPE_WITHHELD_TYPES)
+        report: Dict[str, Any] = {
+            "status": "nothing_to_do",
+            "converted": 0,
+            "would_convert": 0,
+            "blocked_by": None,
+            "people_outside_group": 0,
+            "non_people_inside_group": 0,
+            "withheld_types": withheld,
+            "dry_run": dry_run,
+        }
+
+        with self._engine.begin() as conn:
+            row = conn.execute(
+                sa.text("SELECT id FROM user_groups WHERE name = :n"),
+                {"n": SYSTEM_EVERYONE_GROUP},
+            ).first()
+            if row is None:
+                return report
+            everyone_id = row[0]
+
+            convertible = conn.execute(
+                sa.text(
+                    "SELECT COUNT(*) FROM resource_grants "
+                    "WHERE group_id = :g AND scope IS NULL "
+                    "  AND resource_type NOT IN :withheld"
+                ).bindparams(sa.bindparam("withheld", expanding=True)),
+                {"g": everyone_id, "withheld": withheld},
+            ).scalar_one()
+            if not convertible:
+                return report
+
+            # Widening arm. Only people count: a service account and a seeded
+            # system identity are not in the everyone audience at all, so their
+            # absence from the group is the normal state, never a refusal.
+            outside = conn.execute(
+                sa.text(
+                    "SELECT COUNT(*) FROM users u WHERE u.kind = :human AND NOT EXISTS ("
+                    "  SELECT 1 FROM user_group_members m "
+                    "  WHERE m.user_id = u.id AND m.group_id = :g)"
+                ),
+                {"g": everyone_id, "human": HUMAN_KIND},
+            ).scalar_one()
+            report["people_outside_group"] = int(outside)
+
+            # Narrowing arm.
+            non_people_inside = conn.execute(
+                sa.text(
+                    "SELECT COUNT(*) FROM users u "
+                    "JOIN user_group_members m ON m.user_id = u.id AND m.group_id = :g "
+                    "WHERE u.kind <> :human"
+                ),
+                {"g": everyone_id, "human": HUMAN_KIND},
+            ).scalar_one()
+            report["non_people_inside_group"] = int(non_people_inside)
+
+            # Both arms are reported, so an operator fixing one is not
+            # surprised by the other on the next run.
+            if outside or non_people_inside:
+                report["status"] = "blocked"
+                report["blocked_by"] = (
+                    "people_outside_group"
+                    if outside and not non_people_inside
+                    else "non_people_inside_group"
+                    if non_people_inside and not outside
+                    else "both"
+                )
+                return report
+
+            if dry_run:
+                report["status"] = "converted"
+                report["would_convert"] = int(convertible)
+                return report
+
+            conn.execute(
+                sa.text(
+                    "UPDATE resource_grants SET scope = :s "
+                    "WHERE group_id = :g AND scope IS NULL "
+                    "  AND resource_type NOT IN :withheld"
+                ).bindparams(sa.bindparam("withheld", expanding=True)),
+                {"s": SCOPE_EVERYONE, "g": everyone_id, "withheld": withheld},
+            )
+            report["status"] = "converted"
+            report["converted"] = int(convertible)
+        return report

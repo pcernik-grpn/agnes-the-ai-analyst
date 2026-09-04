@@ -62,6 +62,7 @@ POSTURE: dict[str, str] = {
     "DELETE /api/admin/users/{user_id}/memberships/{group_id}": "user_group.member_removed",
     "PATCH /api/admin/groups/{group_id}": "user_group.updated",
     "POST /api/admin/grants": "resource_grant.created",
+    "POST /api/admin/grants/reconcile-everyone-scope": "resource_grant.everyone_scope_reconciled",
     "POST /api/admin/groups": "user_group.created",
     "POST /api/admin/groups/{group_id}/members": "user_group.member_added",
     "POST /api/admin/users/{user_id}/memberships": "user_group.member_added",

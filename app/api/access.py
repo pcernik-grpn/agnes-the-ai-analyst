@@ -34,6 +34,7 @@ from src.grant_scopes import takes_everyone_scope
 from src.grant_sources import ACCESS_PAGE, describe as describe_grant_source
 from src.grant_sources import section_for as grant_section
 from src.grant_sources import resolve_source
+from src.audit_helpers import log_safe
 from src.repositories.user_groups import SystemGroupProtected
 
 from src.repositories import (
@@ -1230,6 +1231,52 @@ async def list_grants(
         group_id=group_id,
     )
     return [_grant_to_response(r) for r in rows]
+
+
+@router.post("/grants/reconcile-everyone-scope")
+async def reconcile_everyone_scope(
+    dry_run: bool = False,
+    user: dict = Depends(require_admin),
+):
+    """Finish the ``scope='everyone'`` conversion migration 0098 declined.
+
+    0098's step 3 is guarded in two directions and refuses rather than change
+    who can see what: a PERSON outside the seeded ``Everyone`` group would gain
+    everything it holds, and a non-person INSIDE it would lose grants it holds
+    today (the scope reaches people only, #2256). Both refusals log "a later
+    release converts the rows once …" — and nothing implemented that release,
+    so an instance that tripped a guard stayed half-converted permanently: new
+    writes use the column, the pre-0098 rows stay group-shaped, and the
+    revision is stamped and never runs again.
+
+    This is that release, as an operation an admin can re-run after tidying the
+    membership the guard named. It applies the SAME two guards (pinned against
+    the migration by ``tests/db_pg/test_everyone_scope_reconcile.py``) and
+    writes nothing when either fires, so calling it on a still-inconsistent
+    instance is safe and merely reports.
+
+    Postgres-only: the frozen DuckDB ladder has no ``scope`` column, so there
+    is no half-converted state to close there. The repository raises the typed
+    ``RequiresPostgresBackend`` and the app-wide handler renders a ``501``.
+    """
+    report = resource_grants_repo().reconcile_everyone_scope(dry_run=dry_run)
+    # Audited even on a blocked or no-op run: "an admin asked whether the
+    # conversion could complete, and the answer was no" is exactly the trail
+    # an operator needs while working the membership down.
+    log_safe(
+        user_id=user.get("id"),
+        action="resource_grant.everyone_scope_reconciled",
+        details={
+            "status": report["status"],
+            "converted": report["converted"],
+            "would_convert": report["would_convert"],
+            "blocked_by": report["blocked_by"],
+            "people_outside_group": report["people_outside_group"],
+            "non_people_inside_group": report["non_people_inside_group"],
+            "dry_run": report["dry_run"],
+        },
+    )
+    return report
 
 
 @router.post("/grants", response_model=GrantResponse, status_code=201)
