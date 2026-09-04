@@ -720,9 +720,6 @@
   }
 
   /* Picker rows — the full RBAC-scoped pool, filtered by the modal's search. */
-  /* The kind strip, in the picker's `controls` slot — the same slot the
-     package builder uses to slice its own pool. A kind with nothing in it is
-     not offered: a filter that can only ever return zero is a dead control. */
   /* The Library's Filter button + faceted menu + chip row, verbatim markup —
      `.fbar-filter`, `.fbar-menu`, `.fbar-chips` (filter_toolbar.css) — so the
      picker filters the way the Library does rather than with a bespoke strip
@@ -770,7 +767,7 @@
   function knowledgeRows(a) {
     if (!KNOWLEDGE.length) {
       return '<p class="ag-emptyrows">Nothing you can access yet — add data or memory from the ' +
-        '<a href="/catalog">Catalog</a>, or upload files in <a href="/artefacts">Artefacts</a>.</p>';
+        '<a href="/catalog">Catalog</a>, or upload files in <a href="/artefacts">Artifacts</a>.</p>';
     }
     return KNOWLEDGE.map(function (k) { return knowledgeRow(a, k, 'pick'); }).join('') +
       '<p class="ag-emptyrows" id="ag-kn-noresults" hidden>Nothing here matches that.</p>';
@@ -870,7 +867,7 @@
       title: 'Add data, memory or files',
       sub: 'Everything you can reach. Adding it here never widens what the person talking to the agent may see.',
       search: 'Search data, memory & files…',
-      foot: 'Discover more in the <a href="/catalog">Catalog</a>, or upload files in <a href="/artefacts">Artefacts</a>.'
+      foot: 'Discover more in the <a href="/catalog">Catalog</a>, or upload files in <a href="/artefacts">Artifacts</a>.'
     },
     capabilities: {
       title: 'Add a plugin or skill',

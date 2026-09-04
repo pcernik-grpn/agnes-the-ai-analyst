@@ -68,7 +68,7 @@
     <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M6 3h9l4 4v14a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1Z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M14 3v4h4M8.5 12h7M8.5 16h7" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
   {%- elif kind == 'library' -%}
     {# A Collection is a CONTAINER of files — draw two overlapping sheets, not a
-       single document, so it never reads as one file (see #896 Artefacts). #}
+       single document, so it never reads as one file (see #896 Artifacts). #}
     <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M9 7h6l4 4v9a1 1 0 0 1-1 1H9a1 1 0 0 1-1-1V8a1 1 0 0 1 1-1Z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M15 7v4h4" stroke="currentColor" stroke-width="1.6"/><path d="M6 16H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h6l1 1" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
   {%- elif kind == 'app' -%}
     {# A hosted data app — a browser window with a title bar. Deliberately not
@@ -79,7 +79,7 @@
        "a data app" and "switch layout". #}
     <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="3.5" y="4.5" width="17" height="15" rx="2.5" stroke="currentColor" stroke-width="1.6"/><path d="M3.5 9h17" stroke="currentColor" stroke-width="1.6"/><circle cx="6.6" cy="6.8" r="0.9" fill="currentColor"/></svg>
   {%- elif kind == 'doc' -%}
-    {# Single document — a one-file artefact presented AS the file (see the
+    {# Single document — a one-file artifact presented AS the file (see the
        adaptive `_catalog_card_upload`); distinct from the two-sheet library. #}
     <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M7 4h7l4 4v12H7z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M13 4v4h4" stroke="currentColor" stroke-width="1.6"/></svg>
   {%- elif kind == 'folder' -%}

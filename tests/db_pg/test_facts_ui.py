@@ -532,7 +532,7 @@ def test_library_card_omits_fact_count_when_zero(seeded_app_both, state_backend,
     _new_corpus("No Facts Card", "no-facts-card")
     r = s["client"].get("/library", headers=_admin_headers(s))
     assert r.status_code == 200
-    # "fact" alone is a substring of unrelated nav copy ("Artefacts") — the
+    # "fact" alone is a substring of unrelated nav copy ("Artifacts") — the
     # meta-line suffix this surface adds always pairs a digit with the word.
     assert not _re.search(r"\d+\s+facts?\b", r.text)
 

@@ -177,6 +177,27 @@ variable "prod_instance" {
     # without the URL simply never registers the tool server. Inert unless
     # kai_agent_enabled is also true on this VM.
     kai_agent_broker_mcp_enabled = optional(bool, false)
+    # Opt-in OpenTelemetry (OTLP/HTTP) export of this VM's LLM completions
+    # (docs/observability.md → "OpenTelemetry export"; app >= 0.98).
+    # `otlp_endpoint` is the collector's BASE URL — the SDK appends
+    # /v1/traces — and is not a secret. `otlp_headers_secret` names a Secret
+    # Manager secret whose value is the ENTIRE `OTEL_EXPORTER_OTLP_HEADERS`
+    # string (e.g. `Authorization=Bearer%20<token>`, W3C-baggage encoded);
+    # the module grants secretAccessor and the startup script fetches it at
+    # boot into /opt/agnes/.env with the runtime_secret_env escape set, so
+    # the credential never sits in Terraform state, VM metadata or a command
+    # line. `otlp_capture_content` also exports prompt and completion text
+    # (customer data — off by default; turn it on only where the collector
+    # may hold it). Per-VM so a dev pilot never reaches prod. All three are
+    # startup-script-owned: they land on VM recreate, not on apply.
+    otlp_endpoint        = optional(string, "")
+    otlp_headers_secret  = optional(string, "")
+    otlp_capture_content = optional(bool, false)
+    # The instance label every log line (`env`) and every exported span
+    # (`deployment.environment`) carries — written as AGNES_DEPLOYMENT_ENV.
+    # Empty = this VM's name, which is what an operator filters on anyway
+    # (until now the line was absent and the logs said `unknown`).
+    deployment_env = optional(string, "")
     # Opt-in extraction lane on this VM: a Redis coordination backend + the
     # `extraction-worker` compose service (AGNES_ROLE=worker), which makes the
     # deployment role-split. Per-VM (like dispatcher_enabled) and OFF by
@@ -353,6 +374,17 @@ variable "prod_instance" {
     condition     = contains(["", "redesign"], var.prod_instance.experience)
     error_message = "prod_instance.experience must be \"\" or \"redesign\". The \"classic\" experience was retired (Wave 0, 2026-08) — remove the line."
   }
+
+  validation {
+    condition     = var.prod_instance.otlp_headers_secret == "" || var.prod_instance.otlp_endpoint != ""
+    error_message = "prod_instance.otlp_headers_secret is set but otlp_endpoint is empty — the headers are the collector's credential and mean nothing without a collector to send to."
+  }
+
+  validation {
+    condition     = var.prod_instance.otlp_endpoint == "" || can(regex("^https?://", var.prod_instance.otlp_endpoint))
+    error_message = "prod_instance.otlp_endpoint must be an http(s) URL — the collector's BASE URL, without the /v1/traces suffix the SDK appends itself."
+  }
+
 }
 
 variable "dev_instances" {
@@ -425,6 +457,12 @@ variable "dev_instances" {
     # Engine → instance MCP tool surface — see prod_instance for the
     # rationale; same default, inert without kai_agent_enabled.
     kai_agent_broker_mcp_enabled = optional(bool, false)
+    # Per-VM opt-in OTLP export + deployment label — see prod_instance for
+    # the contract; same defaults, same "must be on the type" rule.
+    otlp_endpoint        = optional(string, "")
+    otlp_headers_secret  = optional(string, "")
+    otlp_capture_content = optional(bool, false)
+    deployment_env       = optional(string, "")
     # Opt-in extraction lane (Redis coordination + extraction-worker) — see
     # prod_instance for the full contract; same defaults, OFF by default so
     # a module bump alone never moves existing VMs.
@@ -523,6 +561,17 @@ variable "dev_instances" {
     ])
     error_message = "dev_instances[].chat_provider = \"kai-agent\" requires kai_agent_enabled = true on the same VM — web chat pinned onto an engine the VM does not run refuses every session."
   }
+
+  validation {
+    condition     = alltrue([for d in var.dev_instances : try(d.otlp_headers_secret, "") == "" || try(d.otlp_endpoint, "") != ""])
+    error_message = "dev_instances[*].otlp_headers_secret is set but otlp_endpoint is empty — the headers are the collector's credential and mean nothing without a collector to send to."
+  }
+
+  validation {
+    condition     = alltrue([for d in var.dev_instances : try(d.otlp_endpoint, "") == "" || can(regex("^https?://", d.otlp_endpoint))])
+    error_message = "dev_instances[*].otlp_endpoint must be an http(s) URL — the collector's BASE URL, without the /v1/traces suffix the SDK appends itself."
+  }
+
 }
 
 variable "oauth_secret_name_template" {
@@ -718,26 +767,43 @@ variable "enable_gcp_logging" {
     Ship every container's stdout/stderr to Google Cloud Logging via Docker's
     built-in gcplogs driver, in addition to the local dual-logging cache
     `docker logs` reads from. On: the module grants roles/logging.logWriter
-    on the project to the VM service account (the gcplogs driver
-    authenticates as that account, and Docker refuses to START a container
-    whose log driver cannot initialize — without the role, any container
-    recreate takes the instance down), and the startup script extracts
-    docker-compose.gcp-logging.yml (baked into the image) into the app
-    directory, probes that the driver actually initializes, and only then
-    arms the overlay for the COMPOSE_FILE resolver
-    (scripts/ops/agnes-compose-file.sh) to include on every `docker compose`
-    invocation — so logs survive the routine container recreates the
-    auto-upgrade cron performs every 5 minutes, which otherwise destroy the
-    Docker json-file log history. The IAM grant means the identity running
-    `terraform apply` must be allowed to modify project IAM policy (e.g.
-    roles/resourcemanager.projectIamAdmin); if yours cannot, grant
-    roles/logging.logWriter to the VM service account out-of-band or set
-    this to false — a VM without the role stays up either way (the probe
-    disables the overlay with a warning) but ships no logs. Off: the script
-    removes the file instead, keeping the instance on the default json-file
-    driver (rotated by /etc/docker/daemon.json) — the only supported choice
-    for a non-GCE / non-GCP deployment, since gcplogs needs GCE
-    metadata-server credentials.
+    and roles/monitoring.metricWriter on the project to the VM service
+    account (the gcplogs driver authenticates as that account, and Docker
+    refuses to START a container whose log driver cannot initialize —
+    without the logging role, any container recreate takes the instance
+    down), and the startup script extracts docker-compose.gcp-logging.yml
+    (baked into the image) into the app directory, probes that the driver
+    actually initializes, and only then arms the overlay for the
+    COMPOSE_FILE resolver (scripts/ops/agnes-compose-file.sh) to include on
+    every `docker compose` invocation — so logs survive the routine
+    container recreates the auto-upgrade cron performs every 5 minutes,
+    which otherwise destroy the Docker json-file log history.
+
+    The metric role is not about metrics this module wants: the Ops Agent
+    that collects the logs runs an OpenTelemetry sub-agent which cannot be
+    switched off, and it exports the agent's own free
+    agent.googleapis.com/agent/* self-metrics whatever its config says. The
+    host metrics Cloud Monitoring charges for are turned off in
+    files/ops-agent-config.yaml, since enable_datadog is the path that
+    collects those; without the role, though, every export cycle fails and
+    floods the serial console with monitoring.timeSeries.create
+    PermissionDenied. Order matters when upgrading an already-provisioned VM:
+    the grant lands on `terraform apply`, while the agent config only reaches
+    the VM on instance replacement, so until you recreate it that VM keeps
+    the built-in hostmetrics receiver and now exports it successfully, billed
+    by ingested bytes. Recreating closes the window and is the same step
+    every other startup-script change from this module needs anyway.
+
+    The IAM grants mean the identity running `terraform apply` must be
+    allowed to modify project IAM policy (e.g.
+    roles/resourcemanager.projectIamAdmin); if yours cannot, grant both
+    roles to the VM service account out-of-band or set this to false — a VM
+    without the logging role stays up either way (the probe disables the
+    overlay with a warning) but ships no logs. Off: the script removes the
+    file instead, keeping the instance on the default json-file driver
+    (rotated by /etc/docker/daemon.json) — the only supported choice for a
+    non-GCE / non-GCP deployment, since gcplogs needs GCE metadata-server
+    credentials.
   EOT
   type        = bool
   default     = true

@@ -100,7 +100,10 @@ The Postgres side-car check needs a monitoring role inside each container. A
 root-owned timer (`agnes-datadog-pg-role.timer`, every 15 min) creates a
 `datadog` role with `pg_monitor`, renders the check config with its password,
 and re-converges after a side-car volume is recreated. Verify a VM with
-`sudo datadog-agent status`.
+`sudo datadog-agent status`. The check attributes its series to the side-car's
+container IP rather than the VM host, so the module renders `env:` and the
+VM's tag list into the check's instance tags — scope Postgres monitors by
+`env` and `compose_service`, never by `host`.
 
 ## 2. Docker Compose — OSS self-host
 
@@ -618,7 +621,7 @@ torch and together they add gigabytes to the image:
 
 | Extra | Without it | With it |
 |---|---|---|
-| `docling` | `.docx` / `.pptx` uploads are accepted and then **rejected** — there is no lightweight parser for them | office documents are parsed and indexed |
+| `docling` | `.docx` / `.pptx` are read by markitdown from the `extraction` extra the default image ships — text and headings, tables flattened | Docling's layout-aware parsing takes precedence for office documents: tables and reading order survive |
 | `embeddings` | retrieval is `lexical_only` — whole-word matching, weak on slide decks and prose | retrieval is `hybrid` (semantic + lexical) |
 
 The default image deliberately ships **without** them: every VM in a fleet
@@ -651,9 +654,10 @@ from src.ingest.text_extract import docling_capability; \
 print(retrieval_mode(), docling_capability())"
 ```
 
-`hybrid True` is the rich image; `lexical_only False` is the default one. On
-the default image a rejected office upload says so in its rejection reason
-rather than leaving the operator to guess.
+`hybrid True` is the rich image; `lexical_only False` is the default one. An
+office upload is rejected only on a build with neither parser — no
+`extraction` extra and no `docling` — and the rejection reason then names
+both rather than leaving the operator to guess.
 
 Every other allowlisted format is readable on **both** images: `.eml` and
 `.epub` are parsed by the standard library, with no extra. `.msg` (Outlook's

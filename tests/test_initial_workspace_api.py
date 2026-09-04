@@ -925,16 +925,32 @@ def test_nav_has_initial_workspace_link():
     carries ONE ``/admin`` destination and every ``/admin/*`` page renders the
     admin sidebar off this single inventory, so the inventory is the only
     place the link can be missing from.
+    The repo no longer has a row of its OWN: it merged into /admin/prompts as
+    that page's "Template repository" tab, because the prompts and the repo
+    they bind to were one job split across two pages. So what this guard now
+    asserts is the same property one level up — the surface that owns the repo
+    is in the inventory, and the retired URL is claimed by it rather than
+    orphaned (it 308s onto the repo tab).
     """
-    from app.web.admin_nav import ADMIN_NAV_OFFNAV, ADMIN_NAV_SECTIONS, _section_entries
+    from app.web.admin_nav import (
+        ADMIN_NAV_OFFNAV,
+        ADMIN_NAV_SECTIONS,
+        _section_entries,
+        resolve_active_section_key,
+    )
 
     hrefs = {e["href"] for s in ADMIN_NAV_SECTIONS for e in _section_entries(s)}
     hrefs |= {s["href"] for s in ADMIN_NAV_SECTIONS if s.get("href")}
     hrefs |= {e["href"] for e in ADMIN_NAV_OFFNAV}
-    assert "/admin/initial-workspace" in hrefs, (
-        "/admin/initial-workspace is not in the admin nav inventory — the page would be "
-        "reachable only by typing the URL"
+    assert "/admin/prompts" in hrefs, (
+        "/admin/prompts is not in the admin nav inventory — the Initial Workspace "
+        "Template repo lives on its Template repository tab, so losing that row "
+        "makes the repo reachable only by typing a URL"
     )
+    # The retired path still has to place a caller somewhere: a 308 is followed
+    # by the browser, and anything resolving a section from a path mid-redirect
+    # must light Instance rather than nothing.
+    assert resolve_active_section_key("/admin/initial-workspace") == "instance"
 
 
 # ---------------------------------------------------------------------------

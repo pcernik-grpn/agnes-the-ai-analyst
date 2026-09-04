@@ -292,7 +292,7 @@ def _prompt(
     lines: List[str] = []
     lines.append("## Knowledge sources this owner can ground the agent in")
     lines.append(
-        _candidate_block(knowledge, "(none — this owner has no data packages, memory domains or artefact collections)")
+        _candidate_block(knowledge, "(none — this owner has no data packages, memory domains or artifact collections)")
     )
     lines.append("")
     lines.append("## Capabilities this owner can give the agent")

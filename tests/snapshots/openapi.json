@@ -8480,6 +8480,24 @@
         "title": "PolicyCompileRequest",
         "type": "object"
       },
+      "PolicyPreviewGroupsRequest": {
+        "description": "Body for ``POST /registry/{table_id}/policy/preview-groups`` (review\nplan P1.4). ``sql`` is optional, same meaning as\n:class:`PolicyPreviewRequest` -- omitted previews the stored policy,\ngiven previews a candidate body first.",
+        "properties": {
+          "sql": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sql"
+          }
+        },
+        "title": "PolicyPreviewGroupsRequest",
+        "type": "object"
+      },
       "PolicyPreviewRequest": {
         "description": "Body for ``POST /registry/{table_id}/policy/preview`` (design doc\n\u00a713.1). ``sql`` is optional \u2014 omitted previews the table's currently\nstored ``access_policy_sql``; given, it previews a CANDIDATE body\nbefore it is ever saved. Exactly one of ``as_user`` / ``as_groups``\nselects the persona to run the policy as: ``as_user`` binds a real,\nexisting user's identity (id/email) AND their LIVE group membership;\n``as_groups`` is an ad-hoc group set with no real user behind it \u2014 the\nshape Task 15's persona matrix repeatedly calls this endpoint with, one\ndistinct group-set at a time, per \u00a713.1's \"enumerates the distinct\ngroup-sets\" (an ad-hoc set never needs a real account to exist).",
         "properties": {
@@ -11481,6 +11499,18 @@
           "row_count": {
             "title": "Row Count",
             "type": "integer"
+          },
+          "row_scope": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Row Scope"
           },
           "rows": {
             "items": {
@@ -15462,7 +15492,7 @@
     },
     "/admin/initial-workspace": {
       "get": {
-        "description": "Admin page for the Initial Workspace Template repo (register / sync /\ndelete + per-file prompt provenance). Relocated from /admin/server-config\n(#622 Slice 3 PR-B).",
+        "description": "Merged into /admin/prompts as its \"Template repository\" tab.\n\nThe repo and the prompts that bind to it were one job split across two\npages: this page's provenance table sent you to /admin/prompts to change a\nbinding, and that page could not offer git mode at all until this one had\nregistered a repo. 308 keeps every bookmark and in-page link alive \u2014 same\ntreatment /admin/agent-prompt and /admin/workspace-prompt got when #622\nfolded them into the same page.\n\nKEEPS ``require_admin`` even though it only redirects \u2014 the two sibling\nredirects below carry no gate, and a merge is the wrong moment to copy\nthat: this route answered 403 to a non-admin yesterday, and a refactor\nthat quietly turns a 403 into a 308 has changed who the endpoint answers,\nnot where it points. The target is admin-gated too, so the gate here is\nbelt-and-braces rather than the only check.",
         "operationId": "admin_initial_workspace_page_admin_initial_workspace_get",
         "parameters": [
           {
@@ -16103,7 +16133,7 @@
     },
     "/admin/prompts": {
       "get": {
-        "description": "Unified admin page for managed prompts (#622): two cards (install +\nworkspace), each with a Git\u21c4Editor source toggle, a CodeMirror editor for\neditor mode, and a repo-path bind field for git mode. All dynamic state is\nfetched client-side from /api/admin/prompts/{kind}; the route only needs to\nknow whether an IWT repo is registered so the git toggle can be disabled\nwhen there's nothing to bind to.",
+        "description": "Unified admin page for managed prompts (#622): two cards (install +\nworkspace), each with a Git\u21c4Editor source toggle, a CodeMirror editor for\neditor mode, and a repo-path bind field for git mode. All dynamic state is\nfetched client-side from /api/admin/prompts/{kind}; the route only needs to\nknow whether an IWT repo is registered so the git toggle can be disabled\nwhen there's nothing to bind to.\n\n``tab`` picks which of the two panes renders \u2014 the prompt cards, or the\nInitial Workspace Template repo that used to be /admin/initial-workspace.\nResolved here rather than in the browser so each tab is a real URL and\nonly the active pane's markup and script reach the page (see the template's\n`block page` comment). Anything other than ``repo`` is the prompt cards,\nso a stale or hand-typed ``?tab=`` lands on the default rather than an\nempty page.",
         "operationId": "admin_prompts_page_admin_prompts_get",
         "parameters": [
           {
@@ -17443,7 +17473,7 @@
     },
     "/agents": {
       "get": {
-        "description": "Agents \u2014 build a focused assistant out of the caller's own stack.\n\nTwo panes: a conversation that fills the configuration in\n(``POST /api/agents/{id}/builder/turn``) and the configuration itself,\nhand-editable throughout. Agents persist server-side in the ``agents``\nregistry behind ``/api/agents``.\n\nThe builder's ingredient lists are REAL and RBAC-scoped:\n``knowledge_sources_for`` resolves the caller's own data packages, memory\ndomains and artefact collections \u2014 the same list the builder assistant is\ngiven as its candidate set, so it can never offer access the picker does\nnot \u2014 and capabilities hydrate client-side from\n``/api/marketplace/items?tab=my`` (the caller's subscribed plugins).",
+        "description": "Agents \u2014 build a focused assistant out of the caller's own stack.\n\nTwo panes: a conversation that fills the configuration in\n(``POST /api/agents/{id}/builder/turn``) and the configuration itself,\nhand-editable throughout. Agents persist server-side in the ``agents``\nregistry behind ``/api/agents``.\n\nThe builder's ingredient lists are REAL and RBAC-scoped:\n``knowledge_sources_for`` resolves the caller's own data packages, memory\ndomains and artifact collections \u2014 the same list the builder assistant is\ngiven as its candidate set, so it can never offer access the picker does\nnot \u2014 and capabilities hydrate client-side from\n``/api/marketplace/items?tab=my`` (the caller's subscribed plugins).",
         "operationId": "agents_page_agents_get",
         "parameters": [
           {
@@ -28168,7 +28198,7 @@
     },
     "/api/admin/registry/{table_id}/policy/columns": {
       "get": {
-        "description": "Real schema + sample values for the no-SQL policy builder (plan\nTask 2, access-policy-builder-ux) -- the column list a\n``policy/compile`` spec (Task 3) is built from, so the builder UI\nnever has to know a table's structure up front.\n\nRead-only and never gated on ``access_policies.enabled``: like\n``preview_table_policy`` right above, this is an admin-authoring\nread/compute surface, not the ATTACH action that flag actually gates\n(``PUT /registry/{id}`` writing a non-null ``access_policy_sql``, per\nthat flag's own hint text in ``_flag_default(\"access_policies\", ...)``\nabove).",
+        "description": "Real schema + sample values for the no-SQL policy builder (plan\nTask 2, access-policy-builder-ux) -- the column list a\n``policy/compile`` spec (Task 3) is built from, so the builder UI\nnever has to know a table's structure up front.\n\nRead-only and never gated on ``access_policies.enabled``: like\n``preview_table_policy`` right above, this is an admin-authoring\nread/compute surface, not the ATTACH action that flag actually gates\n(``PUT /registry/{id}`` writing a non-null ``access_policy_sql``, per\nthat flag's own hint text in ``_flag_default(\"access_policies\", ...)``\nabove).\n\nGated by ``require_admin_all_surface``, not plain ``require_admin``\n(#1979, security review): it returns the table's real schema plus profiler SAMPLE VALUES with no per-table grant check and no\npolicy rewrite standing behind it, so its admin gate is the ONLY thing\nbetween the caller and unpolicied data -- the same shape K2 fixed on\n``POST /api/query/hybrid``. A ``surface='stack'`` admin PAT (the\n``agnes init`` default, deliberately filtered like an analyst everywhere\nelse) is refused here; a browser session or a full-surface PAT is not.",
         "operationId": "policy_builder_columns_api_admin_registry__table_id__policy_columns_get",
         "parameters": [
           {
@@ -28304,7 +28334,7 @@
     },
     "/api/admin/registry/{table_id}/policy/preview": {
       "post": {
-        "description": "Run a stored or candidate access policy as a chosen persona and\nreport what it does (design doc \u00a713.1) \u2014 the single-persona primitive\nadmins use to check a policy before trusting it, and that Task 15's\nadmin-UI matrix (multiple personas, union/overlap) is built from\nrepeated calls to.\n\nDeliberately does NOT route through ``policied_relation``'s admin-bypass\npath (\u00a712): that bypass exists for LIVE reads, where \"is this caller\nexempt from filtering\" is a real authorization decision keyed off the\nCALLING admin's own credential surface. A preview's entire point is\n\"what would THIS CHOSEN persona see\", independent of who is asking for\nit \u2014 so identity/groups are resolved directly from the request (or, for\n``as_user``, from that user's own live membership), never from the\ncalling admin's principal.\n\nEvery preview is audited (\u00a713.1: \"it shows one person another person's\nslice, and 'who looked at whose data, when' is the first question asked\nafter an incident\").",
+        "description": "Run a stored or candidate access policy as a chosen persona and\nreport what it does (design doc \u00a713.1) \u2014 the single-persona primitive\nadmins use to check a policy before trusting it, and that Task 15's\nadmin-UI matrix (multiple personas, union/overlap) is built from\nrepeated calls to.\n\nDeliberately does NOT route through ``policied_relation``'s admin-bypass\npath (\u00a712): that bypass exists for LIVE reads, where \"is this caller\nexempt from filtering\" is a real authorization decision keyed off the\nCALLING admin's own credential surface. A preview's entire point is\n\"what would THIS CHOSEN persona see\", independent of who is asking for\nit \u2014 so identity/groups are resolved directly from the request (or, for\n``as_user``, from that user's own live membership), never from the\ncalling admin's principal.\n\nGated by ``require_admin_all_surface``, not plain ``require_admin``\n(#1979, security review): this route hands back policy CONTENT with no\nper-table grant check and no policy rewrite standing behind it, so its\nadmin gate is the ONLY thing between the caller and unpolicied data --\nthe same shape K2 fixed on ``POST /api/query/hybrid``. A\n``surface='stack'`` admin PAT (the ``agnes init`` default, deliberately\nfiltered like an analyst everywhere else) is refused here; a browser\nsession or a full-surface PAT is not.\n\nEvery preview is audited (\u00a713.1: \"it shows one person another person's\nslice, and 'who looked at whose data, when' is the first question asked\nafter an incident\").",
         "operationId": "preview_table_policy_api_admin_registry__table_id__policy_preview_post",
         "parameters": [
           {
@@ -28370,6 +28400,154 @@
           }
         },
         "summary": "Preview Table Policy",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/api/admin/registry/{table_id}/policy/preview-groups": {
+      "post": {
+        "description": "Batch single-group preview across every real group in the instance.\n\n``preview_table_policy`` above already lets an admin check one persona\nat a time; a policy that branches on ``$user_groups`` with a ``CASE``\n(the documented \"missing ``ELSE``\" bug class -- see\n``docs/table-access-policies.md``'s \"Row filtering\" section) needs every\ngroup checked before anyone trusts it, and doing that one API call per\ngroup by hand is exactly the friction that lets the bug slip through.\nThis runs the SAME policy once per real ``user_groups`` row and reports\n``rows_visible``/``rows_total`` for each in one response.\n\nDeliberately cheaper than the full persona-matrix TODO left in\n``preview_table_policy``'s docstring (union coverage + pairwise overlap\nacross every distinct group-set real users actually hold, which needs a\n\"list the distinct group-sets of users with access to this table\"\nprimitive that does not exist yet): this previews one group at a time,\nnever a combination, and only counts rows -- no sample-row\nmaterialization -- so it stays a single cheap ``COUNT(*)`` per group.\n\nGated by ``require_admin_all_surface``, not plain ``require_admin``\n(#1979, security review): it reports per-group visibility over the table's real rows with no per-table grant check and no\npolicy rewrite standing behind it, so its admin gate is the ONLY thing\nbetween the caller and unpolicied data -- the same shape K2 fixed on\n``POST /api/query/hybrid``. A ``surface='stack'`` admin PAT (the\n``agnes init`` default, deliberately filtered like an analyst everywhere\nelse) is refused here; a browser session or a full-surface PAT is not.",
+        "operationId": "preview_table_policy_all_groups_api_admin_registry__table_id__policy_preview_groups_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "table_id",
+            "required": true,
+            "schema": {
+              "title": "Table Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PolicyPreviewGroupsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Preview Table Policy All Groups",
+        "tags": [
+          "admin"
+        ]
+      }
+    },
+    "/api/admin/registry/{table_id}/policy/revisions": {
+      "get": {
+        "description": "The saved states of this table's access policy, newest first (#1979).\n\nWhat the policy editor's history panel lists, and what its \"Restore\"\nbutton prefills the editor from. Each revision carries the full\n``policy_sql`` body: restoring means putting that body back in the\ntextarea, and a truncated preview cannot be restored from.\n\n**There is no restore endpoint, on purpose.** The client re-submits a\nrevision's body through the ordinary ``PUT /registry/{id}``, so a\nrestore pays for every interlock a fresh save pays for \u2014 the \u00a73.1\nundistributed check, the mandatory note, the static validator, the live\nLIMIT 0 probe \u2014 and lands in the audit trail as the ordinary policy\nwrite that it is. A dedicated restore route would either duplicate that\nvalidation chain (and drift from it) or quietly skip it, which is\nexactly the shape \"reattach yesterday's policy\" must not have.\n\n**PG-only** (post-A3 ``access_policy_revisions``): a DuckDB-backed\ninstance gets the typed ``501 requires_postgres_backend`` the factory\nraises, and the modal falls back to its audit-derived, read-only\nhistory. The registry lookup runs FIRST, so a typo'd table id is a 404\non every backend rather than advice to migrate a database.\n\nGated by ``require_admin_all_surface``, not plain ``require_admin``\n(#1979, security review): every listed revision carries a full historical policy body with no per-table grant check and no\npolicy rewrite standing behind it, so its admin gate is the ONLY thing\nbetween the caller and unpolicied data -- the same shape K2 fixed on\n``POST /api/query/hybrid``. A ``surface='stack'`` admin PAT (the\n``agnes init`` default, deliberately filtered like an analyst everywhere\nelse) is refused here; a browser session or a full-surface PAT is not.",
+        "operationId": "list_access_policy_revisions_api_admin_registry__table_id__policy_revisions_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "table_id",
+            "required": true,
+            "schema": {
+              "title": "Table Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 10,
+              "maximum": 50,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Access Policy Revisions",
         "tags": [
           "admin"
         ]
@@ -38566,7 +38744,7 @@
     },
     "/api/attachments/{source}/{attachment_id}/download": {
       "get": {
-        "description": "Stream one connector-catalogued attachment binary.\n\nOutcomes a client can tell apart:\n\n- 404 ``unknown_attachment_source`` \u2014 ``{source}`` has no declaration\n  (decided before any catalogue or filesystem work).\n- 403 \u2014 caller lacks read access to the source's catalogue table.\n- 404 ``attachment_not_found`` \u2014 no catalogue row with this id.\n- 404 ``attachment_not_stored`` \u2014 the row exists but the server holds\n  no bytes (over-size skip, transform-time miss, or removed since);\n  fall back to the upstream system's own API for these.\n- 503 ``attachment_unreadable`` \u2014 the row exists and points at a file\n  the server cannot OPEN (permissions/I/O) \u2014 a malfunction, logged,\n  never disguised as a miss.\n- 200 \u2014 the bytes, with the original filename in Content-Disposition.",
+        "description": "Stream one connector-catalogued attachment binary.\n\nOutcomes a client can tell apart:\n\n- 404 ``unknown_attachment_source`` \u2014 ``{source}`` has no declaration\n  (decided before any catalogue or filesystem work).\n- 403 \u2014 caller lacks read access to the source's catalogue table.\n- 404 ``attachment_not_found`` \u2014 no catalogue row with this id, OR the\n  row exists but the caller's table access policy hides it (K3):\n  deliberately the SAME code/shape as the miss so a policy-hidden row\n  is indistinguishable from an absent one.\n- 404 ``attachment_not_stored`` \u2014 the row exists but the server holds\n  no bytes (over-size skip, transform-time miss, or removed since);\n  fall back to the upstream system's own API for these.\n- 503 ``attachment_unreadable`` \u2014 the row exists and points at a file\n  the server cannot OPEN (permissions/I/O) \u2014 a malfunction, logged,\n  never disguised as a miss.\n- 200 \u2014 the bytes, with the original filename in Content-Disposition.",
         "operationId": "download_attachment_api_attachments__source___attachment_id__download_get",
         "parameters": [
           {
@@ -39944,7 +40122,7 @@
     },
     "/api/chat/sessions/{chat_id}/files/save-artefact": {
       "post": {
-        "description": "Save one session-workspace file as a private single-file artefact.\n\nThe copy outlives the session and shows up in your Library\n(``/library/{slug}``), exactly like a document dropped into the chat\ncomposer. 415 for file types the corpus cannot ingest; 413 above the\ncorpus's per-file ceiling.",
+        "description": "Save one session-workspace file as a private single-file artifact.\n\nThe copy outlives the session and shows up in your Library\n(``/library/{slug}``), exactly like a document dropped into the chat\ncomposer. 415 for file types the corpus cannot ingest; 413 above the\ncorpus's per-file ceiling.",
         "operationId": "save_session_file_as_artefact_api_chat_sessions__chat_id__files_save_artefact_post",
         "parameters": [
           {
@@ -41467,7 +41645,7 @@
     },
     "/api/collections/{collection_id}/files/{file_id}/move": {
       "post": {
-        "description": "Move a file into another collection \u2014 the Library's drag-and-drop.\n\nGated on BOTH ends: the path dependency proves access to the source, and\nthe target is re-checked here (otherwise a caller could push a file into\nsomeone else's collection).\n\nWhen the source collection is left empty it is soft-deleted: a single-file\nartefact IS its file in the Library, so dragging that file into a folder\nmust not strand an empty husk in the listing.",
+        "description": "Move a file into another collection \u2014 the Library's drag-and-drop.\n\nGated on BOTH ends: the path dependency proves access to the source, and\nthe target is re-checked here (otherwise a caller could push a file into\nsomeone else's collection).\n\nWhen the source collection is left empty it is soft-deleted: a single-file\nartifact IS its file in the Library, so dragging that file into a folder\nmust not strand an empty husk in the listing.",
         "operationId": "move_file_api_collections__collection_id__files__file_id__move_post",
         "parameters": [
           {
@@ -52718,7 +52896,7 @@
     },
     "/api/semantic-models/{slug}.yaml": {
       "get": {
-        "description": "Export the stored document byte-for-byte \u2014 never re-serialized, so\ncomments and key order survive.",
+        "description": "Export the stored document byte-for-byte \u2014 never re-serialized, so\ncomments and key order survive.\n\nProvenance rides response HEADERS, never the body (issue #2153): ``ETag``\nis the row's own ``content_hash`` (sha256 of the document), quoted per\nRFC 7232, and ``X-Semantic-Model-Updated-At`` is ``updated_at`` in\nISO-8601 \u2014 the only two fields the row actually carries that identify\n*which* revision this is. A caller that must pin provenance (a skill,\nan agent) reads these instead of re-hashing the body itself; the MCP\ntool `semantic_model_get` folds both into its response. No\nIf-None-Match / conditional GET \u2014 the ETag is informational only, not\na caching contract.",
         "operationId": "export_semantic_model_api_semantic_models__slug__yaml_get",
         "parameters": [
           {
@@ -53316,7 +53494,7 @@
     },
     "/api/stack/artefacts/candidates": {
       "get": {
-        "description": "List every artefact eligible for the \"Add artefacts to Stack\" picker:\ncollections accessible to the caller (owned, or shared with them/their\nteam, or workspace-published) that are NOT already in their Stack.\n\n``total_accessible`` counts every accessible artefact regardless of\nStack membership, distinguishing \"no artefacts exist at all\" from \"all\naccessible artefacts are already in your Stack\" for the picker's empty\nstates. Small dataset per caller in practice (mirrors /artefacts, which\nalso fetches everything server-side) \u2014 the caller's search/visibility\nfilter runs client-side over this list, no server-side ``q`` param.",
+        "description": "List every artifact eligible for the \"Add artifacts to Stack\" picker:\ncollections accessible to the caller (owned, or shared with them/their\nteam, or workspace-published) that are NOT already in their Stack.\n\n``total_accessible`` counts every accessible artifact regardless of\nStack membership, distinguishing \"no artifacts exist at all\" from \"all\naccessible artifacts are already in your Stack\" for the picker's empty\nstates. Small dataset per caller in practice (mirrors /artefacts, which\nalso fetches everything server-side) \u2014 the caller's search/visibility\nfilter runs client-side over this list, no server-side ``q`` param.",
         "operationId": "stack_artefact_candidates_api_stack_artefacts_candidates_get",
         "parameters": [
           {
@@ -53370,7 +53548,7 @@
     },
     "/api/stack/artefacts/{corpus_id}": {
       "delete": {
-        "description": "Remove an artefact from the caller's Stack \u2014 drops agent access only.\n\nThe artefact itself, its files, ownership and sharing are untouched;\nthis only deletes the ``user_stack_subscriptions`` membership row. No\n\"required\" concept exists for artefacts, so there is no 400 case (unlike\nthe data_package/memory_domain unsubscribe endpoint) \u2014 always 204.",
+        "description": "Remove an artifact from the caller's Stack \u2014 drops agent access only.\n\nThe artifact itself, its files, ownership and sharing are untouched;\nthis only deletes the ``user_stack_subscriptions`` membership row. No\n\"required\" concept exists for artifacts, so there is no 400 case (unlike\nthe data_package/memory_domain unsubscribe endpoint) \u2014 always 204.",
         "operationId": "remove_artefact_from_stack_api_stack_artefacts__corpus_id__delete",
         "parameters": [
           {
@@ -53426,7 +53604,7 @@
         ]
       },
       "post": {
-        "description": "Add an artefact (a ``file_corpora`` collection) to the caller's Stack\nso the default agent can use it. 404 if the collection doesn't exist\n(or is soft-deleted); 403 if the caller cannot access it (not owned, not\nshared with one of their groups, not workspace-published). Idempotent \u2014\nadding an already-in-stack artefact just re-confirms membership.\n\nReturns the same catalog-card shape My Stack renders (``card``), so the\npicker/Artefacts-page JS can insert the new row live without a reload.",
+        "description": "Add an artifact (a ``file_corpora`` collection) to the caller's Stack\nso the default agent can use it. 404 if the collection doesn't exist\n(or is soft-deleted); 403 if the caller cannot access it (not owned, not\nshared with one of their groups, not workspace-published). Idempotent \u2014\nadding an already-in-stack artifact just re-confirms membership.\n\nReturns the same catalog-card shape My Stack renders (``card``), so the\npicker/Artefacts-page JS can insert the new row live without a reload.",
         "operationId": "add_artefact_to_stack_api_stack_artefacts__corpus_id__post",
         "parameters": [
           {
@@ -63093,7 +63271,7 @@
     },
     "/library": {
       "get": {
-        "description": "Library \u2014 everything the caller has: artefacts, skills, and agents.\n\nThis is the renamed and widened former ``/artefacts`` surface. It answers\n\"what do I have?\" across every kind Agnes governs \u2014 the caller's own things\nplus everything shared with them:\n\n  - **Artefacts** \u2014 ``file_corpora`` uploads: images, documents, data\n    files, and multi-file collections, whether *uploaded* by a person or\n    *generated* by an agent (the Source facet).\n  - **Skills** \u2014 the caller's own store entities of type ``skill``, i.e.\n    what the Skill builder (/skills) publishes.\n  - **Granted resources** \u2014 governed **data packages**, **memory\n    domains**, **recipes** and curated **marketplace plugins** granted to\n    one of the caller's groups, plus the community-store items they have\n    **installed**. These are not the caller's to re-share, so they carry no\n    Share action; the grant belongs to an admin.\n\nAgents are deliberately NOT here \u2014 they have their own home at ``/agents``\n(they are still real server-side rows in the v103 ``agents`` registry, and\n``/api/v1/agents`` reads honour agent grants; the Library just isn't their\nlisting surface).\n\nScope is grant-aware: items you OWN plus anything shared into a group you\nbelong to, tagged ``mine`` / ``shared_with_me`` / ``shared_by_me`` so the\ntoolbar can slice by ownership. Deliberately NOT admin god-mode \u2014 an admin\nstill sees their own Library, not every item in the instance (the audit\nview is /admin/access).\n\nEvery row carries its real visibility (Private / Shared / Workspace) and,\nfor the grant-backed kinds, a Share action writing through\n``PUT /api/sharing/{resource_type}/{resource_id}``. Skills are the\nexception: an approved store entity is already readable by every\nauthenticated user, so the row reports that state rather than offering a\ngroup grant nothing would read.\n\nRendering is server-side; the toolbar (search, ownership segments, Type +\nSource facets, sort, and the table \u21c4 grid switch) is client-side over\nthose rows.",
+        "description": "Library \u2014 everything the caller has: artifacts, skills, and agents.\n\nThis is the renamed and widened former ``/artefacts`` surface. It answers\n\"what do I have?\" across every kind Agnes governs \u2014 the caller's own things\nplus everything shared with them:\n\n  - **Artifacts** \u2014 ``file_corpora`` uploads: images, documents, data\n    files, and multi-file collections, whether *uploaded* by a person or\n    *generated* by an agent (the Source facet).\n  - **Skills** \u2014 the caller's own store entities of type ``skill``, i.e.\n    what the Skill builder (/skills) publishes.\n  - **Granted resources** \u2014 governed **data packages**, **memory\n    domains**, **recipes** and curated **marketplace plugins** granted to\n    one of the caller's groups, plus the community-store items they have\n    **installed**. These are not the caller's to re-share, so they carry no\n    Share action; the grant belongs to an admin.\n\nAgents are deliberately NOT here \u2014 they have their own home at ``/agents``\n(they are still real server-side rows in the v103 ``agents`` registry, and\n``/api/v1/agents`` reads honour agent grants; the Library just isn't their\nlisting surface).\n\nScope is grant-aware: items you OWN plus anything shared into a group you\nbelong to, tagged ``mine`` / ``shared_with_me`` / ``shared_by_me`` so the\ntoolbar can slice by ownership. Deliberately NOT admin god-mode \u2014 an admin\nstill sees their own Library, not every item in the instance (the audit\nview is /admin/access).\n\nEvery row carries its real visibility (Private / Shared / Workspace) and,\nfor the grant-backed kinds, a Share action writing through\n``PUT /api/sharing/{resource_type}/{resource_id}``. Skills are the\nexception: an approved store entity is already readable by every\nauthenticated user, so the row reports that state rather than offering a\ngroup grant nothing would read.\n\nRendering is server-side; the toolbar (search, ownership segments, Type +\nSource facets, sort, and the table \u21c4 grid switch) is client-side over\nthose rows.",
         "operationId": "library_page_library_get",
         "parameters": [
           {
@@ -63254,7 +63432,7 @@
     },
     "/library/{slug}/f/{file_id}": {
       "get": {
-        "description": "One file inside a collection \u2014 its own detail page.\n\nA single-file artefact IS its collection, so it keeps using\n``/library/{slug}``; this route serves the files *inside* a folder, which\npreviously had no page of their own. Reachable by anyone who can reach the\nparent collection OR who holds a grant on the file itself (per-file\nsharing), so a file shared out of a folder is actually openable.\n\n404 for missing AND for no-access, matching the collection contract, so the\nURL space can't be probed.",
+        "description": "One file inside a collection \u2014 its own detail page.\n\nA single-file artifact IS its collection, so it keeps using\n``/library/{slug}``; this route serves the files *inside* a folder, which\npreviously had no page of their own. Reachable by anyone who can reach the\nparent collection OR who holds a grant on the file itself (per-file\nsharing), so a file shared out of a folder is actually openable.\n\n404 for missing AND for no-access, matching the collection contract, so the\nURL space can't be probed.",
         "operationId": "library_file_detail_library__slug__f__file_id__get",
         "parameters": [
           {

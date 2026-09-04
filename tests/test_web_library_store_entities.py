@@ -16,7 +16,7 @@ Visibility and Stack membership are separate properties. Visibility decides who
 can discover the entity; an install row decides whether the default agent
 actually uses it. So authoring an entity does not put it in your Stack, and
 Add/Remove from stack writes ``POST``/``DELETE
-/api/store/entities/{id}/install`` — a different API from an artefact's, which
+/api/store/entities/{id}/install`` — a different API from an artifact's, which
 is why each row carries its own ``data-stack-endpoint``.
 
 AGENTS are deliberately not swept — they keep their own surface at /agents — but
@@ -186,7 +186,7 @@ def test_stack_membership_is_separate_from_visibility(seeded_app):
     """Sharing controls discovery; the Stack controls whether the agent uses it.
     A skill shared with everyone but not installed is therefore visible AND
     out-of-stack, offering Add — wired to the store's install endpoint, not an
-    artefact's stack endpoint."""
+    artifact's stack endpoint."""
     eid = _entity(owner="admin", owner_name="admin", etype="skill", name="Discoverable Only", status="approved")
 
     text = seeded_app["client"].get("/library", headers=_auth(seeded_app["analyst_token"])).text

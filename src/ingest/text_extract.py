@@ -1,11 +1,18 @@
-"""Text extraction for prose documents.
+"""Text extraction for prose documents uploaded to a collection.
 
-Docling is an OPTIONAL extra (``agnes[docling]``) — it pulls heavy ML deps, so
-it is never imported at module top. When importable it gives richer element
-structure (and tables); otherwise a lightweight per-format fallback handles the
-common text formats with no extra dependencies. Formats that need a parser we
-don't have raise :class:`UnsupportedDocument` so the caller can mark the file
-``rejected`` rather than indexing garbage.
+Office documents (``.docx``/``.pptx``) go through the shared converter in
+:mod:`src.ingest.convert` — the same one the SharePoint crawl uses — which
+prefers Docling (``agnes[docling]``, heavy, opt-in) and otherwise reads them
+with markitdown from the ``[extraction]`` extra the default image ships. So a
+format the crawl can read, an upload can read too, on the same image.
+
+Everything else still takes this module's own readers: Docling first when it
+is importable (never imported at module top — it pulls torch), otherwise a
+lightweight per-format fallback with no extra dependencies (plain text, HTML,
+``.eml``, ``.epub``, and PDF through pypdf). Folding the PDF route into the
+shared converter's structure pass is the deliberately separate next step.
+Formats no reader can take raise :class:`UnsupportedDocument` so the caller
+can mark the file ``rejected`` rather than indexing garbage.
 """
 
 from __future__ import annotations
@@ -16,25 +23,35 @@ import posixpath
 import re
 import zipfile
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import List, Optional, Tuple
 from urllib.parse import unquote
 
+from src.ingest.convert import (
+    ConversionError,
+    MissingConversionDependency,
+    convert_to_markdown,
+    docling_capability,
+    docling_markdown,
+)
+
 logger = logging.getLogger(__name__)
+
+__all__ = ["ExtractResult", "UnsupportedDocument", "docling_capability", "extract_text"]
 
 # Plain-text formats handled by a direct read (no dependency).
 _PLAIN_EXTS = {"txt", "md", "markdown", "rtf", "text", "log"}
 _HTML_EXTS = {"html", "htm"}
 
 # Formats the upload allowlist accepts (``src/corpus_allowlist.py``
-# TIER1_EXTENSIONS) that ONLY Docling can read — there is no lightweight
-# fallback for them. On an image built without the extra these are accepted at
-# upload and then rejected by the background task, so the rejection has to say
+# TIER1_EXTENSIONS) that this module hands to the shared converter
+# (``src/ingest/convert.py``): Docling when installed, markitdown otherwise.
+# Neither ships with the bare package — markitdown rides the ``[extraction]``
+# extra (part of the default image), Docling the ``[docling]`` extra (the
+# ``-rich`` image) — so on a build with NEITHER these are accepted at upload
+# and then rejected by the background task, and the rejection has to say
 # which of the two ends is missing: the file is fine, the image lacks a parser.
-#
-# Kept to the formats Docling actually reads. Naming one it does NOT read
-# would be worse than the generic message: it would send an operator to
-# rebuild the image for a capability the rebuild does not add.
-_DOCLING_ONLY_EXTS = {"docx", "pptx"}
+_OFFICE_EXTS = {"docx", "pptx"}
 
 # Allowlisted, and readable by NO build. EMPTY on purpose: every tier-1
 # extension now has a reader somewhere. It stays as the third option the drift
@@ -143,34 +160,46 @@ def _strip_html(raw: str) -> str:
     return parser.text()
 
 
-def docling_capability() -> bool:
-    """Whether the ``docling`` extra is importable in this deployment.
-
-    An import-spec probe, never an import: Docling pulls torch, and a
-    capability question asked while composing an error message (or a
-    readiness payload) must not pay that cost. Mirrors
-    ``src/ingest/embeddings.py::embedding_capability``, which separates a
-    hybrid deployment from a lexical-only one the same way.
-    """
-    import importlib.util
-
-    return importlib.util.find_spec("docling") is not None
-
-
 def _try_docling(path: str) -> Optional[ExtractResult]:
-    """Use Docling if installed. Returns None when the extra is absent."""
-    try:
-        from docling.document_converter import DocumentConverter  # type: ignore
-    except Exception:
+    """Docling for the formats this module still reads itself.
+
+    Returns ``None`` when the extra is absent or Docling refuses the file, so
+    the per-format fallback below takes over rather than crashing ingestion.
+    Office formats never reach this: they go to the shared converter first,
+    which runs the same engine (``src.ingest.convert.docling_markdown``).
+    """
+    md = docling_markdown(Path(path))
+    if md is None or not md.strip():
         return None
+    return ExtractResult(full_text=md, elements=[(None, md)])
+
+
+def _extract_office(path: str, ext: str) -> ExtractResult:
+    """``.docx``/``.pptx`` through the shared converter.
+
+    Two failure shapes, two different messages, because the operator's next
+    move differs: no parser installed at all names BOTH extras that would
+    read the file and where each ships; a parser that refused the document
+    says the archive is the problem and that no image variant changes that.
+    Uploading the file again — the obvious next move — helps in neither case,
+    and the message must not invite it.
+    """
     try:
-        result = DocumentConverter().convert(path)
-        md = result.document.export_to_markdown()
-        return ExtractResult(full_text=md, elements=[(None, md)])
-    except Exception:
-        # Docling is present but failed on this doc — fall through to the
-        # lightweight path rather than crashing ingestion.
-        return None
+        converted = convert_to_markdown(Path(path), "", suffix=f".{ext}")
+    except MissingConversionDependency as exc:
+        raise UnsupportedDocument(
+            f"'.{ext}' needs an office-document parser and this deployment was built without one — "
+            "the file was stored but cannot be indexed here. Either the 'extraction' extra "
+            "(markitdown; part of the default image) or the 'docling' extra reads it: an operator "
+            "can install agnes[extraction] on this instance or switch it to the '-rich' image "
+            "(see docs/DEPLOYMENT.md → 'The -rich image variant')."
+        ) from exc
+    except ConversionError as exc:
+        raise UnsupportedDocument(
+            f"this '.{ext}' could not be read ({exc}). The file was stored; the archive itself is "
+            "the problem, and no extra or image variant changes this."
+        ) from exc
+    return ExtractResult(full_text=converted.markdown)
 
 
 def _read_email(path: str) -> str:
@@ -344,10 +373,15 @@ def _try_pdf(path: str) -> Optional[str]:
 def extract_text(path: str, file_type: Optional[str] = None) -> ExtractResult:
     """Extract text from a prose document.
 
-    Order: Docling (if installed) → per-format lightweight fallback. Raises
-    :class:`UnsupportedDocument` when nothing can read the file.
+    Office formats go to the shared converter (Docling → markitdown). For the
+    rest the order is Docling (if installed) → per-format lightweight
+    fallback. Raises :class:`UnsupportedDocument` when nothing can read the
+    file.
     """
     ext = _ext_of(path, file_type)
+
+    if ext in _OFFICE_EXTS:
+        return _extract_office(path, ext)
 
     doc = _try_docling(path)
     if doc is not None and doc.full_text.strip():
@@ -373,16 +407,5 @@ def extract_text(path: str, file_type: Optional[str] = None) -> ExtractResult:
         if text is not None and text.strip():
             return ExtractResult(full_text=text)
         raise UnsupportedDocument("PDF text extraction needs the 'docling' extra or pypdf; neither is available")
-
-    if ext in _DOCLING_ONLY_EXTS and not docling_capability():
-        # Deliberately names the cause and the fix: this file type is on the
-        # upload allowlist, so "no text extractor" reads as "your file is
-        # broken" when the truth is that this image was built without the
-        # parser. Uploading it again — the obvious next move — cannot help.
-        raise UnsupportedDocument(
-            f"'.{ext}' needs the 'docling' extra, which this deployment was built without — "
-            "the file was stored but cannot be indexed here. An operator can switch this "
-            "instance to the '-rich' image (see docs/DEPLOYMENT.md → 'The -rich image variant')."
-        )
 
     raise UnsupportedDocument(f"no text extractor for '.{ext}'")

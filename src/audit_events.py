@@ -89,6 +89,11 @@ CATALOG: dict[str, AuditEvent] = {
     "access_policy.preview": AuditEvent(
         "access_policy.preview", "read", "An admin previewed a table access policy's effect."
     ),
+    "access_policy.preview_groups": AuditEvent(
+        "access_policy.preview_groups",
+        "read",
+        "An admin previewed a table access policy's effect across every group.",
+    ),
     "attachment.download": AuditEvent("attachment.download", "read", "A chat attachment was downloaded."),
     "catalog.list": AuditEvent("catalog.list", "read", "The table/dataset catalog was listed."),
     "catalog.sample": AuditEvent("catalog.sample", "read", "A table sample was fetched via the catalog."),
@@ -648,6 +653,14 @@ CATALOG: dict[str, AuditEvent] = {
     "access_policy.compile": AuditEvent(
         "access_policy.compile", "mutation", "An admin compiled a table access policy's SQL from its builder form."
     ),
+    # `PUT /api/admin/registry/{id}` writes its generic `update_table` row
+    # too; these two name the policy change itself, so "every access-policy
+    # change in the last N days" is a direct `action_prefix=access_policy.`
+    # query rather than a grep through `update_table` params.
+    "access_policy.set": AuditEvent(
+        "access_policy.set", "mutation", "An admin attached or edited a table access policy."
+    ),
+    "access_policy.clear": AuditEvent("access_policy.clear", "mutation", "An admin cleared a table's access policy."),
     "data_source.bigquery_connection_test": AuditEvent(
         "data_source.bigquery_connection_test",
         "read",
@@ -772,7 +785,7 @@ CATALOG: dict[str, AuditEvent] = {
     "chat.session_file.save_artefact": AuditEvent(
         "chat.session_file.save_artefact",
         "mutation",
-        "A chat session's engine-side file was saved as a permanent chat artefact.",
+        "A chat session's engine-side file was saved as a permanent chat artifact.",
     ),
     "chat.upload": AuditEvent(
         "chat.upload", "mutation", "A file was uploaded to chat and registered as a workspace table."
@@ -968,13 +981,13 @@ CATALOG: dict[str, AuditEvent] = {
         "slack.event_received", "system", "A Slack Events API callback was received and dispatched."
     ),
     "stack.artefact_remove": AuditEvent(
-        "stack.artefact_remove", "mutation", "A knowledge artefact was removed from a caller's stack."
+        "stack.artefact_remove", "mutation", "A knowledge artifact was removed from a caller's stack."
     ),
     "stack.unsubscribe": AuditEvent(
         "stack.unsubscribe", "mutation", "A caller unsubscribed from a resource in their stack."
     ),
     "stack.artefact_add": AuditEvent(
-        "stack.artefact_add", "mutation", "A knowledge artefact was added to a caller's stack."
+        "stack.artefact_add", "mutation", "A knowledge artifact was added to a caller's stack."
     ),
     "stack.subscribe": AuditEvent(
         "stack.subscribe", "mutation", "A caller subscribed to a resource (e.g. a data package) in their stack."
@@ -1358,6 +1371,24 @@ CATALOG: dict[str, AuditEvent] = {
         "read",
         "An admin previewed what the anonymizer would redact in a pasted sample "
         "(length and counts recorded; the sample text itself is never stored).",
+    ),
+    # -- RBAC-reviewer finding on #1979: two policy-editor reads were
+    # declared `exempt:ui_support` despite returning content, the same class
+    # `access_policy.preview` / `access_policy.preview_groups` above are
+    # audited for. `GET .../policy/revisions` returns the full historical
+    # `policy_sql` body of every saved revision; `GET .../policy/columns`
+    # returns profiler-derived `samples` (real row values, cf.
+    # `catalog.sample`). Reclassified to real, cataloged reads — see
+    # `src/audit_posture.py` READ_POSTURE for the route mapping.
+    "access_policy.revisions_view": AuditEvent(
+        "access_policy.revisions_view",
+        "read",
+        "An admin read a table access policy's saved revision history.",
+    ),
+    "access_policy.columns_view": AuditEvent(
+        "access_policy.columns_view",
+        "read",
+        "An admin read a table's schema + sample values for the no-SQL policy builder.",
     ),
 }
 
