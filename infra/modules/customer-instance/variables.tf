@@ -242,6 +242,41 @@ variable "prod_instance" {
     # engine's. Set an explicit value ("8g") to override outright.
     extraction_worker_mem_limit = optional(string, "auto")
     extraction_worker_cpus      = optional(string, "2.0")
+    # Number of `extraction-worker` compose replicas on this VM
+    # (`docker compose up -d --scale extraction-worker=N`). 1 (the default)
+    # reproduces today's behaviour byte-for-byte: the startup script renders
+    # `--scale extraction-worker=1`, a no-op next to a plain `up -d`, and
+    # writes no Postgres pool override — the extraction-worker process keeps
+    # sizing its own connection pool from `extraction.concurrency` /
+    # `extraction.facts.concurrency` (src/db_pg.py's per-process hint, which
+    # assumes exactly ONE replica).
+    #
+    # TCRD-296 gap #76: an operator ran SIX replicas by hand
+    # (`docker compose up -d --scale extraction-worker=6`) to keep up with a
+    # facts-extraction backlog on a 64-vCPU/252 GiB VM. Nothing here
+    # remembered that scale — the next recreate silently dropped back to
+    # one — and six replicas each sizing a pool from the SAME per-process
+    # hint exhausted the Postgres side-car's stock 100-connection cap
+    # ("FATAL: sorry, too many clients already"), worked around by hand with
+    # `AGNES_PG_POOL_SIZE`/`AGNES_PG_MAX_OVERFLOW` in `.env` (which — set
+    # there — also shrank app's and scheduler's pools, not just the
+    # worker's) and a manual `ALTER SYSTEM SET max_connections`.
+    #
+    # Setting this > 1 makes the startup script (a) thread `--scale
+    # extraction-worker=N` through every `docker compose up` that would
+    # otherwise recreate the stack at N=1 (the boot sequence AND the
+    # recurring agnes-auto-upgrade tick — see
+    # docs/DEPLOYMENT.md#sizing-an-extraction-instance), (b) pin
+    # `AGNES_PG_POOL_SIZE`/`AGNES_PG_MAX_OVERFLOW` on the extraction-worker
+    # service ONLY (app/scheduler keep their own defaults), and (c) size the
+    # Postgres side-car's `max_connections` to hold app + scheduler + every
+    # replica's pool, plus headroom — see the `agnes_pg_max_connections`
+    # sizing note next to `agnes_pg_shared_buffers_mb` in
+    # startup-script.sh.tpl. Raising this without also raising the host's
+    # RAM (or lowering `extraction_worker_mem_limit`) can overcommit memory —
+    # each replica gets the SAME per-replica ceiling, not a shrunk share of
+    # it.
+    extraction_worker_replicas = optional(number, 1)
     # Web-chat provider pin, written as AGNES_CHAT_PROVIDER into the app .env
     # (app >= 0.85: env > instance.yaml > default; "kai-agent" since 0.88).
     # Codifies which engine runs
@@ -391,6 +426,11 @@ variable "prod_instance" {
     error_message = "prod_instance.otlp_endpoint must be an http(s) URL — the collector's BASE URL, without the /v1/traces suffix the SDK appends itself."
   }
 
+  validation {
+    condition     = var.prod_instance.extraction_worker_replicas >= 1 && var.prod_instance.extraction_worker_replicas <= 32
+    error_message = "prod_instance.extraction_worker_replicas must be between 1 and 32."
+  }
+
 }
 
 variable "dev_instances" {
@@ -485,6 +525,10 @@ variable "dev_instances" {
     extraction_worker_enabled   = optional(bool, false)
     extraction_worker_mem_limit = optional(string, "auto")
     extraction_worker_cpus      = optional(string, "2.0")
+    # Per-VM extraction-worker replica count — see prod_instance for the full
+    # rationale (TCRD-296 gap #76); same default (1, byte-identical to
+    # today), same "must be on the type" rule as the fields above.
+    extraction_worker_replicas = optional(number, 1)
     # Web-chat provider pin (AGNES_CHAT_PROVIDER) — see prod_instance for the
     # rationale; same default (empty = no env line), same validations below.
     chat_provider = optional(string, "")
@@ -586,6 +630,13 @@ variable "dev_instances" {
   validation {
     condition     = alltrue([for d in var.dev_instances : try(d.otlp_endpoint, "") == "" || can(regex("^https?://", d.otlp_endpoint))])
     error_message = "dev_instances[*].otlp_endpoint must be an http(s) URL — the collector's BASE URL, without the /v1/traces suffix the SDK appends itself."
+  }
+
+  validation {
+    condition = alltrue([
+      for i in var.dev_instances : i.extraction_worker_replicas >= 1 && i.extraction_worker_replicas <= 32
+    ])
+    error_message = "each dev_instances[].extraction_worker_replicas must be between 1 and 32."
   }
 
 }

@@ -105,6 +105,7 @@ BASE_VARS: dict = {
     "extraction_worker_image": "",
     "extraction_worker_mem_limit": "1g",
     "extraction_worker_cpus": "0.5",
+    "extraction_worker_replicas": 1,
     "kai_agent_env_b64": "",
 }
 
