@@ -66,6 +66,7 @@ def ensure_semantic_drafter_user(conn: Optional[object] = None) -> dict:
             name=SEMANTIC_DRAFTER_USER_NAME,
             password_hash=None,
         )
+        users.mark_system_identity(user_id)
         user = users.get_by_email(SEMANTIC_DRAFTER_USER_EMAIL)
         logger.info("Seeded semantic-drafter service user: %s", SEMANTIC_DRAFTER_USER_EMAIL)
 
@@ -102,6 +103,7 @@ def ensure_memory_curator_user(conn: Optional[object] = None) -> dict:
             name=MEMORY_CURATOR_USER_NAME,
             password_hash=None,
         )
+        users.mark_system_identity(user_id)
         user = users.get_by_email(MEMORY_CURATOR_USER_EMAIL)
         logger.info("Seeded memory-curator service user: %s", MEMORY_CURATOR_USER_EMAIL)
 

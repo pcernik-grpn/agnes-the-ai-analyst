@@ -99,6 +99,7 @@ def ensure_scheduler_user(conn: Optional[duckdb.DuckDBPyConnection] = None) -> d
             name=SCHEDULER_USER_NAME,
             password_hash=None,
         )
+        users.mark_system_identity(user_id)
         user = users.get_by_email(SCHEDULER_USER_EMAIL)
         logger.info("Seeded scheduler service user: %s", SCHEDULER_USER_EMAIL)
 

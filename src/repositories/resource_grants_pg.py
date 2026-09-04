@@ -38,10 +38,7 @@ class ResourceGrantsPgRepository:
     # not read it cannot tell an everyone-grant from a grant on the carrier
     # group, and would answer "who can see this" with the carrier's member
     # list. PG-only too (migration 0097_resource_grants_scope).
-    _SELECT_COLS = (
-        "id, group_id, resource_type, resource_id, assigned_at, assigned_by, "
-        "requirement, source, scope"
-    )
+    _SELECT_COLS = "id, group_id, resource_type, resource_id, assigned_at, assigned_by, requirement, source, scope"
 
     def __init__(self, engine: Engine):
         self._engine = engine
@@ -192,15 +189,25 @@ class ResourceGrantsPgRepository:
                  WHERE m.user_id = :u
                    AND rg.resource_type = :rtype"""
         if include_everyone:
+            # The audience is people, not every row in `users` (#2256): a
+            # service account holds exactly the grants an admin gave its
+            # groups, and the identities Agnes seeds for itself hold none.
+            # Checked here rather than left to the caller because this is
+            # the one grant read that takes a user instead of a group set.
             sql += """
                  UNION
                  SELECT DISTINCT rg.resource_id
                  FROM resource_grants rg
                  WHERE rg.scope = :everyone_scope
-                   AND rg.resource_type = :rtype"""
+                   AND rg.resource_type = :rtype
+                   AND EXISTS (SELECT 1 FROM users u
+                               WHERE u.id = :u AND u.kind = :human_kind)"""
         params: Dict[str, Any] = {"u": user_id, "rtype": resource_type}
         if include_everyone:
+            from src.service_accounts import HUMAN_KIND
+
             params["everyone_scope"] = SCOPE_EVERYONE
+            params["human_kind"] = HUMAN_KIND
         with self._engine.connect() as conn:
             rows = conn.execute(sa.text(sql), params).all()
         return [r[0] for r in rows]
@@ -453,10 +460,7 @@ class ResourceGrantsPgRepository:
                 params,
             )
             res = conn.execute(
-                sa.text(
-                    f"UPDATE resource_grants SET group_id = :tgt "
-                    f"WHERE group_id = :src AND {notin}"
-                ),
+                sa.text(f"UPDATE resource_grants SET group_id = :tgt WHERE group_id = :src AND {notin}"),
                 params,
             )
         return int(res.rowcount or 0)
@@ -522,10 +526,7 @@ class ResourceGrantsPgRepository:
         """
         with self._engine.connect() as conn:
             row = conn.execute(
-                sa.text(
-                    "SELECT COUNT(*) FROM resource_grants "
-                    "WHERE group_id = :gid AND scope IS NULL"
-                ),
+                sa.text("SELECT COUNT(*) FROM resource_grants WHERE group_id = :gid AND scope IS NULL"),
                 {"gid": group_id},
             ).first()
         return int(row[0]) if row else 0

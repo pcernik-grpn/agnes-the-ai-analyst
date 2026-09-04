@@ -520,7 +520,7 @@ async def access_overview(
         # Everyone's reach, at O(1) — see the `member_ids` note above. Also
         # the ceiling for any reach figure the UI prints: no set of groups
         # can reach more people than there are accounts.
-        "account_total": users_repo().count_all(),
+        "account_total": users_repo().count_people(),
     }
 
 
@@ -1659,7 +1659,7 @@ def _resource_display_index(types_needed: set) -> dict:
             logger.exception("effective-access: list_blocks failed for %s", raw)
             continue
         for block in blocks or []:
-            for item in (block.get("items") or []):
+            for item in block.get("items") or []:
                 rid = item.get("resource_id")
                 if not rid:
                     continue
@@ -1915,8 +1915,7 @@ async def user_effective_access(
         grants_rows,
         key=lambda r: (
             r["resource_type"],
-            (display.get((r["resource_type"], r["resource_id"])) or {}).get("name")
-            or r["resource_id"],
+            (display.get((r["resource_type"], r["resource_id"])) or {}).get("name") or r["resource_id"],
             by_gid.get(r["group_id"], ""),
         ),
     ):
