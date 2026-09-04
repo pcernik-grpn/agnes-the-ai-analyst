@@ -7934,6 +7934,173 @@ class TestShardPlannerVisibilityAndReuse(TestAutoParallelCrawlPlanner):
         assert closed[0]["report"]["mode"] == "inline (planner fallback)"
 
 
+class TestShardScopeAttribution(TestAutoParallelCrawlPlanner):
+    """2026-09-05 regression: a packed folder shard's DERIVED ``state_key``
+    (``f"{drive_id}:{unit['item_id']}"``, built by ``shard_plan.
+    plan_shards`` from a top-level folder Graph discovers INSIDE a drive)
+    is never a key ``scope_of_state_key`` holds — that map only ever holds
+    a whole drive's own key or a folder scope's OWN root key. Every packed
+    folder shard was silently dropped the moment a drive needed splitting;
+    for a FOLDER scope, whose own remainder shard's derived key (bare
+    ``drive_id``) also never matches, the whole plan collapsed to
+    ``shard_defs == []`` and fell all the way back to an inline,
+    single-worker crawl — exactly the case auto-parallel crawling exists
+    to avoid on a large site."""
+
+    def _multi_folder_handler(
+        self, *, num_folders: int = 6, per_folder: int = 300, site_total: int = 5000, drive: str = "b!drive1"
+    ) -> Callable[[httpx.Request], httpx.Response]:
+        """Like the base class's own ``_handler`` but with enough folders
+        (and enough documents per folder) that ``target_docs=100`` packs
+        MULTIPLE non-empty folder shards, not just one — the shape that
+        exposes the bug (a single packed shard's own key coincidentally
+        never mattered before, since only the remainder needed to survive)."""
+        folders = [
+            {
+                "id": f"f{i}",
+                "name": f"Folder{i}",
+                "folder": {"childCount": per_folder},
+                "webUrl": f"https://x/{drive}/root/Folder{i}",
+            }
+            for i in range(num_folders)
+        ]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            path = request.url.path
+            if path.endswith("/content"):
+                raise AssertionError("the planner must never download a file")
+            if path.endswith("/root") and request.method == "GET" and f"/drives/{drive}/" in path:
+                return httpx.Response(200, json={"webUrl": f"https://x/{drive}/root"})
+            if path.endswith("/search/query"):
+                body = json.loads(request.content.decode())
+                query = body["requests"][0]["query"]["queryString"]
+                if f'"https://x/{drive}/root"' in query:
+                    return httpx.Response(200, json={"value": [{"hitsContainers": [{"total": site_total}]}]})
+                return httpx.Response(200, json={"value": [{"hitsContainers": [{"total": 5}]}]})
+            if path.endswith("/root/children") and f"/drives/{drive}/" in path:
+                return httpx.Response(200, json={"value": folders})
+            if "/items/" in path and path.endswith("/children"):
+                # A still-over-target folder gets folded one level deeper —
+                # no subfolders here, so it comes back unchanged.
+                return httpx.Response(200, json={"value": []})
+            raise AssertionError(f"unexpected request: {path}")
+
+        return handler
+
+    def test_a_whole_drive_scope_that_splits_enqueues_every_folder_shard(self, crawl_env, monkeypatch):
+        """A drive big enough to split into several folder shards, owned by
+        ONE whole-drive scope, must enqueue every one of them, not just the
+        single unsplit remainder that happened to survive the old bug."""
+        _runs, jobs, _store = self._install_env(monkeypatch, target_docs=100)
+        _install_graph(monkeypatch, self._multi_folder_handler())
+
+        report = _run(_connection([_drive_scope()]), monkeypatch)
+
+        assert report["mode"] == "sharded"
+        # 6 packed folder shards + 1 remainder — before the fix every
+        # packed folder shard was silently dropped, leaving only the
+        # remainder (``shards_total == 1``).
+        assert report["shards_total"] > 1
+        assert len(jobs.enqueued) == report["shards_total"]
+        labels = [j["payload_json"]["shard"]["label"] for j in jobs.enqueued]
+        assert any(label != "remainder" for label in labels)
+        assert all(j["payload_json"]["shard"]["scope_id"] == "b!drive1" for j in jobs.enqueued)
+
+    def test_a_folder_scope_that_splits_enqueues_shards_instead_of_falling_back_inline(self, crawl_env, monkeypatch):
+        """The same for a FOLDER scope: before the fix its own remainder
+        shard also failed to match (derived key is the bare ``drive_id``,
+        the scope's own key is ``drive_id:root_item_id``), so EVERY shard
+        was dropped and the run fell back to a fully inline, single-worker
+        crawl (``mode == "builtin"``, reason ``"plan produced no non-empty
+        shard"``)."""
+        runs, jobs, _store = self._install_env(monkeypatch, target_docs=100)
+        _install_graph(monkeypatch, self._multi_folder_handler())
+        scope = _drive_scope(source_scope_id="01FOLDERID", drive_id="b!drive1", display_path="Corp / Documents / HR")
+
+        report = _run(_connection([scope]), monkeypatch)
+
+        assert report["mode"] == "sharded"
+        assert report["shards_total"] > 1
+        assert len(jobs.enqueued) == report["shards_total"]
+        assert all(j["payload_json"]["shard"]["scope_id"] == "01FOLDERID" for j in jobs.enqueued)
+        assert not any(f.get("report", {}).get("mode") == "inline (planner fallback)" for f in runs.finished)
+
+    def test_a_drive_that_stays_whole_gets_its_single_shard_while_a_sibling_drive_splits(self, crawl_env, monkeypatch):
+        """No regression: within a real sharded run, a drive small enough
+        on its OWN still produces exactly its one 'whole drive' shard
+        (``shard_plan.plan_shards``'s own empty-units case) — unchanged by
+        this fix, which only widens how a shard's owning scope resolves."""
+        _runs, jobs, _store = self._install_env(monkeypatch, target_docs=100)
+        big = self._multi_folder_handler(drive="b!drive1", site_total=5000)
+        small = self._multi_folder_handler(drive="b!drive2", site_total=10)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            for candidate in (big, small):
+                try:
+                    return candidate(request)
+                except AssertionError:
+                    continue
+            raise AssertionError(f"unexpected request: {request.url.path}")
+
+        _install_graph(monkeypatch, handler)
+        scope1 = _drive_scope()
+        scope2 = _drive_scope(source_scope_id="b!drive2", collection_id="col2", display_path="Corp / Docs2")
+
+        report = _run(_connection([scope1, scope2]), monkeypatch)
+
+        assert report["mode"] == "sharded"
+        by_scope: Dict[str, List[Dict[str, Any]]] = {}
+        for j in jobs.enqueued:
+            shard = j["payload_json"]["shard"]
+            by_scope.setdefault(shard["scope_id"], []).append(shard)
+
+        assert [s["label"] for s in by_scope["b!drive2"]] == ["whole drive"]
+        assert len(by_scope["b!drive1"]) > 1
+
+    def test_two_scopes_sharing_one_drive_never_cross_attribute_a_shard(self, crawl_env, monkeypatch):
+        """A whole-drive scope and a folder scope on the SAME physical
+        drive: ``compute_shard_plan`` is unaware of scopes and returns the
+        identical (cached) per-drive plan for both targets that share it.
+        Every shard must still land under its OWN confirmed scope — never
+        the other one's, and never silently dropped.
+
+        Before the fix: the folder scope's own shards ALWAYS mismatched
+        (dropped), the whole-drive scope's remainder shard matched TWICE
+        (once per target sharing the drive) so it was double-enqueued, and
+        the folder scope never got any coverage at all — a wrong,
+        silently-swapped ``scope_id`` is worse than the old inline
+        fallback, since it decides the crawled files' ``min_modified``
+        filter and permission zone.
+        """
+        _runs, jobs, _store = self._install_env(monkeypatch, target_docs=100)
+        _install_graph(monkeypatch, self._multi_folder_handler())
+        whole_drive = _drive_scope()
+        folder = _drive_scope(
+            source_scope_id="01FOLDERID",
+            drive_id="b!drive1",
+            collection_id="col2",
+            display_path="Corp / Documents / HR",
+        )
+
+        report = _run(_connection([whole_drive, folder]), monkeypatch)
+
+        assert report["mode"] == "sharded"
+        by_scope: Dict[str, int] = {}
+        for j in jobs.enqueued:
+            sid = j["payload_json"]["shard"]["scope_id"]
+            assert sid in ("b!drive1", "01FOLDERID"), f"shard attributed to an unconfirmed scope {sid!r}"
+            by_scope[sid] = by_scope.get(sid, 0) + 1
+
+        # Before the fix the folder scope got ZERO shards (every one of
+        # its own targets' derived keys mismatched) — this is the
+        # assertion that actually catches the regression.
+        assert by_scope.get("01FOLDERID", 0) > 0
+        # The two scopes cover the identical physical drive, so they must
+        # get the SAME shard count — never merged, never lost, never
+        # doubled onto just one of the two.
+        assert by_scope["b!drive1"] == by_scope["01FOLDERID"]
+
+
 class TestShardPlanPreview(TestAutoParallelCrawlPlanner):
     """``connectors.sharepoint.crawler.preview_shard_plan`` — the read-only
     computation behind ``GET …/connections/{id}/shard-plan`` (2026-09-03

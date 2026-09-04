@@ -7372,19 +7372,35 @@ async def _plan_or_run_inline(connection: Dict[str, Any], payload: dict) -> Dict
         return await _inline()
 
     shard_defs: List[Dict[str, Any]] = []
-    for drive_plan in plan["drives"]:
+    unresolved_shards = 0
+    # `compute_shard_plan` returns exactly one drive-plan entry PER TARGET,
+    # in `all_targets` order — its own documented contract ("duplicated
+    # verbatim across every target sharing a drive"). Pairing `all_targets`
+    # with `plan["drives"]` POSITIONALLY therefore gives the exact scope
+    # each drive-plan belongs to, even when two confirmed scopes share one
+    # physical drive (a folder scope nested inside a whole-drive scope, or
+    # two folder scopes on the same drive) — never an ambiguous choice.
+    # Deliberately NOT keyed off a packed folder shard's own DERIVED
+    # `state_key` (`f"{drive_id}:{unit['item_id']}"` from `shard_plan.
+    # plan_shards`): that key is never a key `scope_of_state_key` holds
+    # (only a whole drive's or a folder scope's OWN root key are), which
+    # used to silently drop every folder shard the moment a drive was big
+    # enough to split.
+    for target, drive_plan in zip(all_targets, plan["drives"]):
+        owning_scope = scope_of_state_key.get(target.state_key)
+        if owning_scope is None:
+            # Structurally unreachable — `target` comes from the SAME
+            # `all_targets` list `scope_of_state_key` was built from above
+            # — but `scope_id` decides a shard's `min_modified` filter and
+            # permission zone, so a shard this code cannot confidently
+            # attribute is dropped, never guessed at.
+            unresolved_shards += len(drive_plan["shards"])
+            continue
         for shard in drive_plan["shards"]:
             if not shard["targets"]:
                 # A `pack_folders_into_groups` group that landed empty
                 # (K > the number of folders) — nothing to crawl, nothing
                 # to enqueue.
-                continue
-            # Every target in one plan_shards() shard shares the same
-            # drive, and a drive belongs to exactly one confirmed scope in
-            # any sane configuration — the first target's scope stands in
-            # for the whole shard.
-            owning_scope = scope_of_state_key.get(shard["targets"][0]["state_key"])
-            if owning_scope is None:
                 continue
             shard_defs.append(
                 {
@@ -7398,7 +7414,10 @@ async def _plan_or_run_inline(connection: Dict[str, Any], payload: dict) -> Dict
             )
 
     if not shard_defs:
-        recorder.finish_planning_as_inline_fallback(reason="plan produced no non-empty shard")
+        reason = "plan produced no non-empty shard"
+        if unresolved_shards:
+            reason += f" ({unresolved_shards} shard(s) had no resolvable owning scope)"
+        recorder.finish_planning_as_inline_fallback(reason=reason)
         return await _inline()
 
     try:
