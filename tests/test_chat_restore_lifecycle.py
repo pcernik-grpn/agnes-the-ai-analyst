@@ -628,7 +628,7 @@ class TestDeepLinkRestoreIsNotSilent:
     def test_a_restore_keeps_the_session_param(self):
         body = _slice(
             _chat_js(),
-            "async function openSession(chatId, wsUrlOverride, { restoring = false } = {}) {",
+            "async function openSession(chatId, wsUrlOverride, { restoring = false, reconnecting = false, turnInFlight: turnInFlightHint = null } = {}) {",
             "function handleFrame(frame) {",
         )
         assert "if (!restoring) _syncSessionUrl(_sessionHasTurns ? chatId : null);" in body
@@ -636,7 +636,7 @@ class TestDeepLinkRestoreIsNotSilent:
     def test_a_failed_restore_renders_an_error_instead_of_a_new_chat(self):
         body = _slice(
             _chat_js(),
-            "async function openSession(chatId, wsUrlOverride, { restoring = false } = {}) {",
+            "async function openSession(chatId, wsUrlOverride, { restoring = false, reconnecting = false, turnInFlight: turnInFlightHint = null } = {}) {",
             "function handleFrame(frame) {",
         )
         assert "if (restoring && !hydrated.ok) {" in body
@@ -651,7 +651,7 @@ class TestDeepLinkRestoreIsNotSilent:
         every count."""
         body = _slice(
             _chat_js(),
-            "async function openSession(chatId, wsUrlOverride, { restoring = false } = {}) {",
+            "async function openSession(chatId, wsUrlOverride, { restoring = false, reconnecting = false, turnInFlight: turnInFlightHint = null } = {}) {",
             "function handleFrame(frame) {",
         )
         ticket_catch = body[body.index("const t = await api(`/api/chat/sessions/${chatId}/ticket`") :]
@@ -705,7 +705,7 @@ class TestConcurrentOpensCannotClobberEachOther:
     def test_every_await_in_open_session_is_followed_by_a_generation_check(self):
         body = _slice(
             _chat_js(),
-            "async function openSession(chatId, wsUrlOverride, { restoring = false } = {}) {",
+            "async function openSession(chatId, wsUrlOverride, { restoring = false, reconnecting = false, turnInFlight: turnInFlightHint = null } = {}) {",
             "function handleFrame(frame) {",
         )
         assert "const openGen = ++_openGeneration;" in body
@@ -716,7 +716,7 @@ class TestConcurrentOpensCannotClobberEachOther:
     def test_the_socket_is_claimed_only_by_the_newest_open(self):
         body = _slice(
             _chat_js(),
-            "async function openSession(chatId, wsUrlOverride, { restoring = false } = {}) {",
+            "async function openSession(chatId, wsUrlOverride, { restoring = false, reconnecting = false, turnInFlight: turnInFlightHint = null } = {}) {",
             "function handleFrame(frame) {",
         )
         ws_claim = body.index("ws = new WebSocket(")
@@ -763,7 +763,7 @@ class TestReattachShowsThatSomethingIsRunning:
     def test_ticket_flag_paints_the_working_state_before_the_socket(self):
         body = _slice(
             _chat_js(),
-            "async function openSession(chatId, wsUrlOverride, { restoring = false } = {}) {",
+            "async function openSession(chatId, wsUrlOverride, { restoring = false, reconnecting = false, turnInFlight: turnInFlightHint = null } = {}) {",
             "function handleFrame(frame) {",
         )
         assert "turnInFlight = !!(t && t.turn_in_flight);" in body

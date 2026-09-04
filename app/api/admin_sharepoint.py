@@ -757,7 +757,7 @@ def _extraction_readiness() -> Tuple[bool, Optional[Dict[str, str]]]:
     pipeline became the only pipeline (owner decision 2026-08-31) the crawl
     runs IN-PROCESS, so on a server without the converter backends installed
     every document of a run would fail with the same
-    ``MissingConversionDependency``. ``connectors.sharepoint.convert`` is
+    ``MissingConversionDependency``. ``src.ingest.convert`` is
     deliberately importable WITHOUT the extra (its backends are imported
     lazily), so the probe has to reach past it to the backends themselves.
 
@@ -782,7 +782,7 @@ def _extraction_readiness() -> Tuple[bool, Optional[Dict[str, str]]]:
         import markitdown  # noqa: F401
         import pypdfium2  # noqa: F401
 
-        import connectors.sharepoint.convert  # noqa: F401
+        import src.ingest.convert  # noqa: F401
     except ImportError:
         return False, {
             "error": "extraction_dependencies_missing",

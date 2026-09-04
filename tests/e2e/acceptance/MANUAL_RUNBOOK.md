@@ -98,7 +98,8 @@
             `detach_linger_seconds` (use 65 s with the test-config `idle_ttl_seconds: 60`
             value), then reopens `/chat` and clicks the same conversation. Expected: the
             sidebar shows a "paused" chip on that row before clicking; after clicking the
-            status bar reads "Resuming session…" briefly then "Connected."; a follow-up
+            status bar stays EMPTY throughout (connection state is deliberately not
+            reported — a resume that works has nothing to say); a follow-up
             question ("what did we just discuss?") receives a context-aware answer, proving
             agent memory survived the pause.
       - [ ] **(7c) Slack DM to a paused session.** While the session is paused, Sarah DMs

@@ -344,6 +344,30 @@ def _admin_setup_rail() -> object:
 
 
 templates.env.globals["admin_setup_rail"] = _admin_setup_rail
+
+
+def _journey_rail(user_id: object) -> object:
+    """The caller's onboarding-checklist progress for the rail's card, or None.
+
+    A Jinja global for the same reason `admin_setup_rail` above is: the card
+    renders on every rail page from a partial both context builders share,
+    and it has to paint in its RESOLVED state — retired at 6/6, otherwise the
+    real count — or the rows above it jump on every navigation while
+    chat_onboarding.js catches up (see `resolve_journey_rail`). Called from
+    the template only where the card renders (`can_chat and not
+    _admin_page`), so an admin page never spends the read. None on any
+    failure leaves the card blank for the script to resolve.
+    """
+    try:
+        from app.services.journey import resolve_journey_rail
+
+        return resolve_journey_rail(str(user_id) if user_id else None)
+    except Exception:
+        logger.warning("rail: onboarding journey unavailable", exc_info=True)
+        return None
+
+
+templates.env.globals["journey_rail"] = _journey_rail
 templates.env.globals["data_apps_enabled"] = _data_apps_nav_enabled
 
 
