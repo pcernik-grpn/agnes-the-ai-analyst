@@ -764,20 +764,30 @@ variable "enable_watchdog" {
 
 variable "enable_gcp_logging" {
   description = <<-EOT
-    Ship every container's stdout/stderr to Google Cloud Logging via Docker's
-    built-in gcplogs driver, in addition to the local dual-logging cache
-    `docker logs` reads from. On: the module grants roles/logging.logWriter
-    and roles/monitoring.metricWriter on the project to the VM service
-    account (the gcplogs driver authenticates as that account, and Docker
-    refuses to START a container whose log driver cannot initialize —
-    without the logging role, any container recreate takes the instance
-    down), and the startup script extracts docker-compose.gcp-logging.yml
-    (baked into the image) into the app directory, probes that the driver
-    actually initializes, and only then arms the overlay for the
-    COMPOSE_FILE resolver (scripts/ops/agnes-compose-file.sh) to include on
-    every `docker compose` invocation — so logs survive the routine
-    container recreates the auto-upgrade cron performs every 5 minutes,
-    which otherwise destroy the Docker json-file log history.
+    Permit and provision the Cloud Logging pipeline: every container's
+    stdout/stderr forwarded over Docker's `fluentd` driver to a
+    Google Cloud Ops Agent on loopback, which parses the JSON line back into
+    fields and writes it to Cloud Logging (docs/gcp-logging.md). The local
+    dual-logging cache `docker logs` reads from is unaffected.
+
+    PERMIT, not select: which collector actually gets the logs is
+    container_logs_destination below. This variable grants
+    roles/logging.logWriter and roles/monitoring.metricWriter on the project
+    to the VM service account, and makes Cloud Logging an eligible
+    destination; leaving it true while the destination resolves to `datadog`
+    keeps the grants in place and installs no Ops Agent, so flipping back is
+    a recreate and not an IAM change.
+
+    When Cloud Logging IS the destination, the startup script extracts
+    docker-compose.gcp-logging.yml (baked into the image) into the app
+    directory, probes that something is listening on the Ops Agent's forward
+    port, and only then arms the overlay for the COMPOSE_FILE resolver
+    (scripts/ops/agnes-compose-file.sh) to include on every `docker compose`
+    invocation — so logs survive the container recreates the auto-upgrade
+    cron performs when an image digest or a config file moves, which
+    otherwise destroy the Docker json-file log history. The driver is
+    ASYNC (`fluentd-async: true`), so a collector that is down costs log
+    lines and cannot keep a container in `created` (#1557).
 
     The metric role is not about metrics this module wants: the Ops Agent
     that collects the logs runs an OpenTelemetry sub-agent which cannot be
@@ -802,11 +812,53 @@ variable "enable_gcp_logging" {
     overlay with a warning) but ships no logs. Off: the script removes the
     file instead, keeping the instance on the default json-file driver
     (rotated by /etc/docker/daemon.json) — the only supported choice for a
-    non-GCE / non-GCP deployment, since gcplogs needs GCE metadata-server
-    credentials.
+    non-GCE / non-GCP deployment, since the Ops Agent authenticates with
+    Google ADC from the GCE metadata server and there is nothing to receive
+    the logs without it.
   EOT
   type        = bool
   default     = true
+}
+
+variable "container_logs_destination" {
+  description = <<-EOT
+    Which collector receives the containers' stdout/stderr. Empty (default)
+    resolves automatically: `datadog` when enable_datadog is on, else
+    `cloud_logging` when enable_gcp_logging is on, else `none`. Explicit
+    values are `cloud_logging`, `datadog` and `none`.
+
+    ONE destination per VM, because Docker allows exactly one log driver per
+    container and the two collectors want different ones. Cloud Logging needs
+    the `fluentd` driver (the Ops Agent is what parses the JSON line back into
+    fields; Docker's own gcplogs driver parses nothing). Datadog needs the
+    default `json-file` driver: it reads containers through the Docker API,
+    and under a remote driver that API serves Docker's dual-logging cache —
+    which happens to work but is not a path Datadog documents or supports.
+    On json-file the same API serves the driver's own logs and the path is
+    supported. So `datadog` leaves docker-compose.gcp-logging.yml off the
+    disk, which disarms the COMPOSE_FILE resolver's gate for free.
+
+    Running both is therefore not offered. It is not physically impossible —
+    it would just mean building a production pipeline on undocumented
+    behaviour, which this module does not do.
+
+    ** BEHAVIOUR CHANGE ON A MODULE BUMP. ** A VM that already has
+    enable_datadog = true resolves to `datadog` and STOPS shipping to Cloud
+    Logging the next time it is recreated. That is the intended default —
+    metrics, monitors and logs belong in one console — but it is the one
+    diff a bump alone carries. Set container_logs_destination =
+    "cloud_logging" to keep the old behaviour explicitly.
+
+    Startup-script-owned like every other setting here: it reaches a running
+    VM only through `terraform apply -replace` of the instance.
+  EOT
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = contains(["", "auto", "cloud_logging", "datadog", "none"], var.container_logs_destination)
+    error_message = "container_logs_destination must be \"\" (auto), \"auto\", \"cloud_logging\", \"datadog\" or \"none\"."
+  }
 }
 
 variable "dispatcher_image" {
