@@ -94,6 +94,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 import duckdb
 
+from src.access_policy_udf import register_policy_udfs
 from src.analytics_backend import ducklake_catalog_dsn, ducklake_data_path, is_postgres_dsn
 from src.db import (
     _apply_memory_caps,
@@ -503,6 +504,12 @@ def get_ducklake_read() -> duckdb.DuckDBPyConnection:
             # time. A registry scan is fine here (once per open); it must
             # NOT happen per-request (see below).
             _attach_remote_read_sources(_read_conn)
+            # ONE-TIME as well: the access-policy scalar UDFs (``agnes_hmac``)
+            # are catalog-scoped on this shared physical connection, so they
+            # are registered here, under ``_read_lock`` at session open --
+            # never per request, where two concurrent first callers could
+            # race the same ``CREATE FUNCTION`` on one catalog.
+            register_policy_udfs(_read_conn)
         # Per-request: refresh ONLY the BQ ACCESS_TOKEN secret. The reader
         # issues NO ``CREATE VIEW`` / lake DDL and commits NO catalog
         # snapshot — the writer owns the wrapper views now. ``CREATE OR

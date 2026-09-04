@@ -31,6 +31,7 @@ BUILDERS = {
     "agents": ROOT / "app" / "web" / "templates" / "agents.html",
     "mcp": ROOT / "app" / "web" / "static" / "js" / "components" / "mcp_builder.js",
     "package": ROOT / "app" / "web" / "static" / "js" / "components" / "package_drawer.js",
+    "semantic_model": ROOT / "app" / "web" / "templates" / "semantic_model_builder.html",
 }
 
 

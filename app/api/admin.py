@@ -14,8 +14,9 @@ import os
 import re
 import threading
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, List, NamedTuple, Optional
+from typing import Any, Dict, List, Literal, NamedTuple, Optional
 
 import duckdb
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
@@ -49,7 +50,9 @@ from src.repositories import (
     sync_state_repo,
     table_registry_repo,
     usage_repo,
+    user_group_members_repo,
     user_store_installs_repo,
+    users_repo,
 )
 from src.scheduler import is_valid_schedule
 from src.sql_safe import is_safe_project_id as _is_safe_project_id
@@ -5522,6 +5525,17 @@ async def list_registry(
         like the sync_state join above; False for every row if that read
         fails, since a filter that silently claims everything is unpackaged
         is worse than one that offers nothing.
+      - `policy_mapping_status` (#2147): present only on a row with a
+        policy attached (`access_policy_sql`). A list of
+        `{"mapping_table": <id>, "state": "ok"|"empty"|"never_synced"|
+        "remote_unknown", "last_sync": ...}`, one entry per
+        `policy_mapping=true` table the policy body joins (excluding the
+        row's own mandatory self-reference) — the same read-only,
+        `sync_state`-derived state `src.access_policy.policy_mapping_
+        statuses` computes for the live-read fail-closed check
+        (`raise_if_policy_mapping_empty`), never a live `COUNT(*)`, so this
+        never disagrees with (or is more expensive than) what a real query
+        through the policy would do. Absent entirely on an unpolicied row.
     """
     repo = table_registry_repo()
     tables = repo.list_all()
@@ -5570,6 +5584,29 @@ async def list_registry(
         logger.exception("Failed to read data-package membership for registry")
     for t in tables:
         t["packaged"] = t.get("id") in packaged
+
+    # #2147: `policy_mapping_status` — read-only, sync_state-derived
+    # observability for a policied row's `policy_mapping` dependencies (see
+    # docstring above). Absent entirely on an unpolicied row rather than an
+    # empty list, matching this endpoint's own field-presence convention
+    # elsewhere (e.g. `row_scope` on the query surfaces).
+    if any(t.get("access_policy_sql") for t in tables):
+        from src.access_policy import policy_mapping_statuses
+
+        for t in tables:
+            if not t.get("access_policy_sql"):
+                continue
+            try:
+                statuses = policy_mapping_statuses(
+                    t["access_policy_sql"], table_id=t.get("id"), table_name=t.get("name")
+                )
+            except Exception:
+                logger.exception("Failed to compute policy_mapping_status for %s", t.get("id"))
+                continue
+            for s in statuses:
+                ls = s.get("last_sync")
+                s["last_sync"] = ls.isoformat() if hasattr(ls, "isoformat") else ls
+            t["policy_mapping_status"] = statuses
 
     return {"tables": tables, "count": len(tables)}
 
@@ -6401,6 +6438,215 @@ def register_table_precheck(
     }
 
 
+# Which query engine a registry ``source_type`` speaks — the namespace every
+# canonical physical identifier below is scoped by, so two engines that
+# coincidentally reuse a schema/bucket label never collide.
+_TWIN_ENGINE_BY_SOURCE_TYPE = {
+    "bigquery": "bq",
+    "databricks": "dbx",
+    "keboola": "kbc",
+    "snowflake": "sf",
+}
+
+# The sqlglot dialect a materialized row's ``source_query`` is written in, per
+# engine. Keboola is deliberately absent: its ``source_query`` is a JSON filter
+# spec layered on bucket/source_table, not SQL, and the row's own
+# bucket/source_table already give the identifier.
+_TWIN_SQL_DIALECT_BY_ENGINE = {
+    "bq": "bigquery",
+    "dbx": "databricks",
+    "sf": "snowflake",
+}
+
+# The DuckDB alias the Snowflake extractor ATTACHes the account under, which is
+# what a generated Snowflake ``source_query`` names instead of the database.
+_SF_ATTACH_ALIAS = "sf"
+
+
+@lru_cache(maxsize=512)
+def _parse_sql_table_refs(sql: str, dialect: str) -> Optional[tuple]:
+    """Every PHYSICAL table ``sql`` reads, as ``(catalog, db, name)`` triples
+    lowercased — or ``None`` when ``sql`` does not parse as ``dialect``.
+
+    Parsing, never substring matching: the whole point of this signal is that
+    an alias, a comment, a column list, a backtick or a project qualifier must
+    not change the answer. CTE names are dropped (``WITH s AS (…) SELECT * FROM
+    s`` reads whatever the CTE body reads, not a table called ``s``), and so is
+    any reference the dialect resolves to something other than ``exp.Table``.
+
+    ``None`` (unparseable) is a distinct, load-bearing answer, not an error to
+    swallow — see the ``phys_unknown`` signal in
+    ``_policy_physical_source_signal_provenance``.
+
+    Cached because the twin scan re-derives signals for every registry row on
+    every registry write, and the same handful of statements repeat.
+    """
+    import sqlglot
+    from sqlglot import exp
+
+    try:
+        statements = sqlglot.parse(sql, read=dialect)
+    except Exception:
+        return None
+    refs: list = []
+    for statement in statements:
+        if statement is None:
+            continue
+        cte_names = {(cte.alias_or_name or "").lower() for cte in statement.find_all(exp.CTE)}
+        for table in statement.find_all(exp.Table):
+            name = (table.name or "").strip().lower()
+            if not name:
+                continue
+            db = (table.text("db") or "").strip().lower()
+            catalog = (table.text("catalog") or "").strip().lower()
+            if not db and not catalog and name in cte_names:
+                continue
+            refs.append((catalog, db, name))
+    return tuple(dict.fromkeys(refs))
+
+
+def _canonical_physical_identifiers(row: Dict[str, Any]) -> tuple:
+    """``({identifier: provenance}, unknown_signal_or_None)`` for ``row``.
+
+    An identifier is ``(engine, connection_id, namespace, container, table)``,
+    all lowercased — the CANONICAL name of a physical table, derived from
+    whichever representation the row happens to use:
+
+    * BigQuery — ``bq_fqn`` gives ``(project, dataset, table)`` directly;
+      ``bucket``+``source_table`` gives ``(<configured project>, bucket,
+      source_table)``. That is what makes the two representations of ONE table
+      intersect (they were disjoint signals before). When the project cannot be
+      resolved at all (no ``data_source.bigquery.project``) the namespace stays
+      blank, which matches ANY project for this check — a deliberately weaker,
+      fail-closed match.
+    * Databricks — ``split_bucket`` resolves ``bucket`` to ``(catalog,
+      schema)`` exactly as the extractor does, so ``sales`` (schema in the
+      configured default catalog) and ``main.sales`` are one identifier.
+    * Snowflake — ``split_bucket`` against the configured database.
+    * Keboola — ``("", bucket, source_table)``; the connection is the only
+      namespace Keboola has, and it is already the identifier's own component.
+
+    For a ``query_mode='materialized'`` row the SAME identifiers are ALSO
+    derived from every table its ``source_query`` reads, parsed in the engine's
+    dialect. That is the difference between "these two rows spell the same
+    pointer" and "this row's SQL reads that row's table" — the second is how a
+    materialization writes a policied table's unfiltered rows to a parquet
+    ``agnes pull`` distributes.
+
+    The second element is the ``("phys_unknown", engine, connection_id)``
+    signal, emitted when a materialized ``source_query`` did not parse AND the
+    row carries no policy of its own. Unknown means "could read anything", so
+    it collides with every identifier of the same engine — fail closed. It is
+    emitted only for the UNPOLICIED side on purpose: a policied row's own reads
+    go through its policy, and emitting it there would turn one unparseable
+    policied row into a blanket refusal of every later registration on that
+    engine.
+    """
+    from app.instance_config import get_value
+
+    source_type = (row.get("source_type") or "").strip().lower()
+    engine = _TWIN_ENGINE_BY_SOURCE_TYPE.get(source_type)
+    if not engine:
+        return {}, None
+    connection_id = (row.get("connection_id") or "").strip().lower()
+    identifiers: Dict[tuple, str] = {}
+
+    def _add(namespace: str, container: str, table: str, provenance: str) -> None:
+        table_l = (table or "").strip().lower()
+        if not table_l:
+            return
+        identifiers.setdefault(
+            (
+                engine,
+                connection_id,
+                (namespace or "").strip().lower(),
+                (container or "").strip().lower(),
+                table_l,
+            ),
+            provenance,
+        )
+
+    bucket = (row.get("bucket") or "").strip()
+    source_table = (row.get("source_table") or "").strip()
+    default_namespace = ""
+
+    if engine == "bq":
+        default_namespace = (get_value("data_source", "bigquery", "project", default="") or "").strip()
+        bq_fqn = (row.get("bq_fqn") or "").strip()
+        if bq_fqn:
+            parts = bq_fqn.split(".")
+            if len(parts) == 3 and all(part.strip() for part in parts):
+                _add(parts[0], parts[1], parts[2], "bq_fqn")
+        if bucket and source_table:
+            _add(default_namespace, bucket, source_table, "bucket/source_table")
+    elif engine == "dbx":
+        from connectors.databricks.extractor import split_bucket as _dbx_split_bucket
+
+        default_namespace = (get_value("data_source", "databricks", "catalog", default="") or "").strip()
+        if bucket and source_table:
+            catalog, schema = _dbx_split_bucket(bucket, default_namespace)
+            _add(catalog, schema, source_table, "bucket/source_table")
+    elif engine == "sf":
+        from connectors.snowflake.extractor import split_bucket as _sf_split_bucket
+
+        default_namespace = (get_value("data_source", "snowflake", "database", default="") or "").strip()
+        if bucket and source_table:
+            try:
+                database, schema = _sf_split_bucket(bucket, default_namespace)
+            except ValueError:
+                # An unsafe/unresolvable bucket never reaches the registry
+                # through the validator; if one is already there, fall back to
+                # the raw bucket as the container with a blank (wildcard)
+                # database rather than dropping the row's identifier entirely.
+                database, schema = "", bucket
+            _add(database, schema, source_table, "bucket/source_table")
+    else:  # kbc
+        if bucket and source_table:
+            _add("", bucket, source_table, "bucket/source_table")
+
+    unknown = None
+    dialect = _TWIN_SQL_DIALECT_BY_ENGINE.get(engine)
+    source_query = (row.get("source_query") or "").strip()
+    is_materialized = (str(row.get("query_mode") or "").strip().lower()) == "materialized"
+    if dialect and source_query and is_materialized:
+        # Parsed RAW, never whitespace-collapsed: a leading `-- comment` line
+        # swallows the whole statement once its newline is gone, which is the
+        # opposite of what this signal is for.
+        refs = _parse_sql_table_refs(source_query, dialect)
+        if refs is None:
+            if not row.get("access_policy_sql"):
+                unknown = ("phys_unknown", engine, connection_id)
+        else:
+            for catalog, db, name in refs:
+                namespace = catalog
+                if engine == "sf" and (not namespace or namespace == _SF_ATTACH_ALIAS):
+                    namespace = default_namespace
+                elif not namespace:
+                    namespace = default_namespace
+                _add(namespace, db, name, "source_query")
+    return identifiers, unknown
+
+
+def _policy_physical_source_signal_provenance(row: Dict[str, Any]) -> Dict[tuple, str]:
+    """``_policy_physical_source_signals`` plus, per signal, the field it came
+    from — the one extra fact the rejection message needs to name WHY two rows
+    were judged the same physical source ("bq_fqn", "bucket/source_table",
+    "source_query", "unparseable source_query")."""
+    signals: Dict[tuple, str] = {}
+    for signal in _policy_physical_source_signals_legacy(row):
+        signals[signal] = {
+            "bq_fqn": "bq_fqn",
+            "bucket_table": "bucket/source_table",
+            "source_query": "source_query",
+        }.get(signal[0], "registry fields")
+    identifiers, unknown = _canonical_physical_identifiers(row)
+    for identifier, provenance in identifiers.items():
+        signals.setdefault(("phys",) + identifier, provenance)
+    if unknown is not None:
+        signals[unknown] = "unparseable source_query"
+    return signals
+
+
 def _policy_physical_source_signals(row: Dict[str, Any]) -> set:
     """Every physical-source signal ``row`` (a ``table_registry`` record)
     carries — the ways a DIFFERENT registry row could resolve to the exact
@@ -6409,9 +6655,27 @@ def _policy_physical_source_signals(row: Dict[str, Any]) -> set:
     (e.g. a BigQuery row with both ``bq_fqn`` and ``bucket``/``source_table``
     set); two rows collide when their signal sets intersect at all — through
     ``_physical_signals_conflict`` below, never a bare ``&``, because the
-    ``bucket_table`` signal's ``connection_id`` component needs wildcard
-    matching that a plain set intersection can't express (see there).
+    ``bucket_table`` and ``phys`` signals have wildcard components that a
+    plain set intersection can't express (see there).
+
+    Four signal kinds. The first three are REPRESENTATIONS — the literal
+    strings a row spells its pointer with — and are kept because they still
+    catch exactly what they always caught. The fourth, ``phys``, is the
+    CANONICAL physical identifier the row resolves to
+    (``_canonical_physical_identifiers``), which is what makes two rows naming
+    one table in two different representations — a ``bq_fqn`` beside a
+    ``bucket``+``source_table``, a Databricks ``sales`` beside ``main.sales``,
+    a materialized ``SELECT`` beside the table it reads — intersect at all.
     """
+    return set(_policy_physical_source_signal_provenance(row))
+
+
+def _policy_physical_source_signals_legacy(row: Dict[str, Any]) -> set:
+    """The three representation signals (``bq_fqn``, ``bucket_table``,
+    verbatim ``source_query``) this check shipped with. Still emitted: they
+    cost nothing and cover shapes the canonical identifier deliberately does
+    not model (an unrecognized ``source_type``, two rows with byte-identical
+    custom SQL that no dialect parses)."""
     signals: set = set()
     bq_fqn = (row.get("bq_fqn") or "").strip().lower()
     if bq_fqn:
@@ -6469,26 +6733,126 @@ def _bucket_table_signals_conflict(a: tuple, b: tuple) -> bool:
     return a_conn == b_conn or not a_conn or not b_conn
 
 
-def _physical_signals_conflict(signals_a: set, signals_b: set) -> bool:
-    """Whether two physical-source signal sets (``_policy_physical_source_
-    signals``) resolve to the same underlying data. Exact-match for
-    ``bq_fqn``/``source_query`` signals; ``bucket_table`` signals go
-    through ``_bucket_table_signals_conflict``'s wildcard ``connection_id``
-    rule. Every twin-check call site MUST go through this — a bare ``&``
-    only catches the exact-pin and both-unpinned cases, missing the
-    pinned/unpinned mix a live instance actually hit.
+def _wildcard_component_match(a: str, b: str) -> bool:
+    """Two components of a canonical identifier match when they are equal or
+    either is blank. Blank means "not resolvable from this row" (an
+    unconfigured BigQuery project, a Databricks bucket with no default
+    catalog, an unpinned connection), and an unresolved component must not be
+    what lets a twin through — the same wildcard rule
+    ``_bucket_table_signals_conflict`` already applies to ``connection_id``."""
+    return a == b or not a or not b
+
+
+def _phys_signals_conflict(a: tuple, b: tuple) -> bool:
+    """Whether two canonical-identifier signals (``phys`` /
+    ``phys_unknown``) name the same physical table.
+
+    ``phys`` ↔ ``phys``: same engine and table name, with namespace
+    (project / catalog / database), container (dataset / schema / bucket) and
+    ``connection_id`` each matched through ``_wildcard_component_match``.
+
+    ``phys_unknown`` ↔ anything of the same engine: an unparseable
+    materialized ``source_query`` could read any table on that engine, so it
+    collides with all of them. Fail closed — the admin's escapes (clear the
+    policy, make the row ``server_only`` with a policy of its own, or spell
+    the SQL so it parses) are named in the rejection.
+    """
+    if a[0] == "phys_unknown" or b[0] == "phys_unknown":
+        unknown, other = (a, b) if a[0] == "phys_unknown" else (b, a)
+        if other[0] not in ("phys", "phys_unknown"):
+            return False
+        return unknown[1] == other[1] and _wildcard_component_match(unknown[2], other[2])
+    _, a_engine, a_conn, a_ns, a_container, a_table = a
+    _, b_engine, b_conn, b_ns, b_container, b_table = b
+    if a_engine != b_engine or a_table != b_table:
+        return False
+    return (
+        _wildcard_component_match(a_container, b_container)
+        and _wildcard_component_match(a_ns, b_ns)
+        and _wildcard_component_match(a_conn, b_conn)
+    )
+
+
+def _physical_signal_match(signals_a, signals_b) -> Optional[tuple]:
+    """The first ``(signal_a, signal_b)`` pair from the two sets that resolves
+    to the same underlying data, or ``None``. Exact-match for
+    ``bq_fqn``/``source_query`` signals; ``bucket_table`` signals go through
+    ``_bucket_table_signals_conflict``'s wildcard ``connection_id`` rule;
+    ``phys``/``phys_unknown`` through ``_phys_signals_conflict``. Every
+    twin-check call site MUST go through this — a bare ``&`` only catches the
+    exact-pin and both-unpinned cases, missing the pinned/unpinned mix a live
+    instance actually hit, and misses every cross-representation match
+    outright.
+
+    Returning the matching PAIR rather than a bool is what lets the rejection
+    name the physical table (or the parse failure) that matched, instead of
+    telling the admin only that "something" did.
     """
     for sig_a in signals_a:
         for sig_b in signals_b:
             if sig_a == sig_b:
-                return True
+                return (sig_a, sig_b)
             if (
                 sig_a[0] == "bucket_table"
                 and sig_b[0] == "bucket_table"
                 and _bucket_table_signals_conflict(sig_a, sig_b)
             ):
-                return True
-    return False
+                return (sig_a, sig_b)
+            if sig_a[0] in ("phys", "phys_unknown") and sig_b[0] in ("phys", "phys_unknown"):
+                if _phys_signals_conflict(sig_a, sig_b):
+                    return (sig_a, sig_b)
+    return None
+
+
+def _physical_signals_conflict(signals_a: set, signals_b: set) -> bool:
+    """Whether two physical-source signal sets (``_policy_physical_source_
+    signals``) resolve to the same underlying data — the boolean face of
+    ``_physical_signal_match``."""
+    return _physical_signal_match(signals_a, signals_b) is not None
+
+
+def _format_physical_signal(signal: tuple) -> str:
+    """One matched signal, as an admin-readable pointer for the rejection."""
+    kind = signal[0]
+    if kind == "phys":
+        _, engine, _conn, namespace, container, table = signal
+        path = ".".join(part for part in (namespace, container, table) if part)
+        return f"{engine}:{path}"
+    if kind == "phys_unknown":
+        return f"a materialized source_query that could not be parsed as {signal[1]} SQL"
+    if kind == "bq_fqn":
+        return f"bq_fqn {signal[1]}"
+    if kind == "bucket_table":
+        return f"{signal[1]}:{signal[3]}.{signal[4]}"
+    if kind == "source_query":
+        return "an identical source_query"
+    return str(signal)
+
+
+def _describe_physical_match(
+    match: tuple,
+    mine: Dict[tuple, str],
+    theirs: Dict[tuple, str],
+    *,
+    other_id: Any,
+) -> str:
+    """Why these two rows were judged the same physical source — the matched
+    pointer plus, on each side, the field it came from."""
+    sig_mine, sig_theirs = match
+    if sig_mine[0] == "phys_unknown" or sig_theirs[0] == "phys_unknown":
+        unparsed_is_mine = sig_mine[0] == "phys_unknown"
+        which = "this row" if unparsed_is_mine else f"table {other_id!r}"
+        engine = sig_mine[1] if unparsed_is_mine else sig_theirs[1]
+        return (
+            f"matched because {which} carries a materialized source_query that "
+            f"could not be parsed as {engine} SQL, so Agnes cannot prove it does "
+            "not read the other row's physical source (this check fails closed)"
+        )
+    return (
+        f"matched on physical source {_format_physical_signal(sig_mine)} "
+        f"(this row: {mine.get(sig_mine, 'registry fields')}; "
+        f"table {other_id!r}: {theirs.get(sig_theirs, 'registry fields')})"
+    )
 
 
 def _is_distributable_registry_row(row: Dict[str, Any]) -> bool:
@@ -6504,34 +6868,41 @@ def _is_distributable_registry_row(row: Dict[str, Any]) -> bool:
 
 
 def _find_policied_physical_source_twin(
-    my_signals: set,
+    my_signals: Dict[tuple, str],
     *,
     exclude_id: Optional[str],
-) -> Optional[Dict[str, Any]]:
-    """The first existing registry row that carries ``access_policy_sql``
-    and whose physical-source signals intersect ``my_signals`` — i.e. the
-    policied table a row with these signals would be a distributable twin
-    of. ``None`` when there is no such row.
+) -> tuple:
+    """``(row, note)`` for the first existing registry row that carries
+    ``access_policy_sql`` and whose physical-source signals intersect
+    ``my_signals`` — i.e. the policied table a row with these signals would be
+    a twin of. ``(None, None)`` when there is no such row.
+
+    ``my_signals`` is the signal→provenance mapping from
+    ``_policy_physical_source_signal_provenance``; ``note`` is the
+    human-readable reason the two were judged the same source, which the
+    caller splices into the rejection.
     """
     if not my_signals:
-        return None
+        return None, None
     for other in table_registry_repo().list_all():
         if other.get("id") == exclude_id or not other.get("access_policy_sql"):
             continue
-        if _physical_signals_conflict(my_signals, _policy_physical_source_signals(other)):
-            return other
-    return None
+        theirs = _policy_physical_source_signal_provenance(other)
+        match = _physical_signal_match(my_signals, theirs)
+        if match is not None:
+            return other, _describe_physical_match(match, my_signals, theirs, other_id=other.get("id"))
+    return None, None
 
 
 def _find_unpolicied_physical_source_twin(
-    my_signals: set,
+    my_signals: Dict[tuple, str],
     *,
     exclude_id: Optional[str],
-) -> Optional[Dict[str, Any]]:
-    """The first existing registry row that carries NO policy and whose
-    physical-source signals intersect ``my_signals`` — the row a caller
-    granted it reads the raw data through, no matter what policy protects
-    the other name.
+) -> tuple:
+    """``(row, note)`` for the first existing registry row that carries NO
+    policy and whose physical-source signals intersect ``my_signals`` — the
+    row a caller granted it reads the raw data through, no matter what policy
+    protects the other name. ``(None, None)`` when there is no such row.
 
     Supersedes the distributable-only scan this file shipped first. That
     one keyed on ``agnes pull``: a twin that never leaves the server was
@@ -6546,13 +6917,15 @@ def _find_unpolicied_physical_source_twin(
     wants where is their call.
     """
     if not my_signals:
-        return None
+        return None, None
     for other in table_registry_repo().list_all():
         if other.get("id") == exclude_id or other.get("access_policy_sql"):
             continue
-        if _physical_signals_conflict(my_signals, _policy_physical_source_signals(other)):
-            return other
-    return None
+        theirs = _policy_physical_source_signal_provenance(other)
+        match = _physical_signal_match(my_signals, theirs)
+        if match is not None:
+            return other, _describe_physical_match(match, my_signals, theirs, other_id=other.get("id"))
+    return None, None
 
 
 def _check_access_policy_physical_source_conflict(
@@ -6620,7 +6993,7 @@ def _check_access_policy_physical_source_conflict(
     """
     if has_access_policy:
         return
-    my_signals = _policy_physical_source_signals(
+    my_signals = _policy_physical_source_signal_provenance(
         {
             "source_type": source_type,
             "connection_id": connection_id,
@@ -6628,9 +7001,10 @@ def _check_access_policy_physical_source_conflict(
             "source_table": source_table,
             "bq_fqn": bq_fqn,
             "source_query": source_query,
+            "query_mode": query_mode,
         }
     )
-    other = _find_policied_physical_source_twin(my_signals, exclude_id=exclude_id)
+    other, note = _find_policied_physical_source_twin(my_signals, exclude_id=exclude_id)
     if other is not None:
         if clearing_policy:
             raise HTTPException(
@@ -6641,10 +7015,10 @@ def _check_access_policy_physical_source_conflict(
                     "over the same physical source as table "
                     f"{other.get('id')!r} ({other.get('name')!r}), which still "
                     "carries one -- and an unpolicied name returns the "
-                    "unfiltered rows to anyone granted it. Point this row at a "
-                    "different physical source first (its policy travels with "
-                    "it, so the clear then succeeds), or unregister one of the "
-                    "two rows"
+                    f"unfiltered rows to anyone granted it ({note}). Point this "
+                    "row at a different physical source first (its policy "
+                    "travels with it, so the clear then succeeds), or "
+                    "unregister one of the two rows"
                 ),
             )
         raise HTTPException(
@@ -6653,7 +7027,7 @@ def _check_access_policy_physical_source_conflict(
                 "access_policy_physical_source_conflict: this table's "
                 f"physical source matches table {other.get('id')!r} "
                 f"({other.get('name')!r}), which has an access policy "
-                "attached -- a second, unpolicied name over the same "
+                f"attached ({note}) -- a second, unpolicied name over the same "
                 "source returns the unfiltered rows to anyone granted it, "
                 "so attach a policy to this row too, point it at a "
                 "different physical source, unregister one of the two rows, "
@@ -6701,8 +7075,8 @@ def _check_policied_row_has_no_unpolicied_twin(merged: Dict[str, Any], *, table_
     """
     if not merged.get("access_policy_sql"):
         return
-    my_signals = _policy_physical_source_signals(merged)
-    other = _find_unpolicied_physical_source_twin(my_signals, exclude_id=table_id)
+    my_signals = _policy_physical_source_signal_provenance(merged)
+    other, note = _find_unpolicied_physical_source_twin(my_signals, exclude_id=table_id)
     if other is not None:
         distributable = _is_distributable_registry_row(other)
         reach = (
@@ -6719,7 +7093,8 @@ def _check_policied_row_has_no_unpolicied_twin(merged: Dict[str, Any], *, table_
                 f"{other.get('id')!r} ({other.get('name')!r}) points at this "
                 "table's physical source and carries no policy of its own "
                 f"(query_mode={str(other.get('query_mode') or 'local')!r}, "
-                f"server_only={bool(other.get('server_only'))}), so {reach} "
+                f"server_only={bool(other.get('server_only'))}; {note}), so "
+                f"{reach} "
                 "-- attach a policy to that row, unregister it, or point it "
                 "at a different physical source, then attach this policy. "
                 "If this is genuinely a different source connection reusing "
@@ -7405,8 +7780,6 @@ async def update_table(
             ):
                 merged.pop(_policy_key, None)
 
-            repo.register(id=table_id, **merged)
-
             # finding 1 (follow-up review of PR #2023) — the policy write and its
             # history append are ordered by the SAME per-table lock this whole
             # handler holds (see the top of the function). Without it, two
@@ -7469,11 +7842,28 @@ async def update_table(
                 existing.get("policy_mapping")
             )
 
+            # A PUT that CLEARS the policy is allowed to make the table
+            # distributable in the SAME request ("clear the policy first" is one
+            # request, not two). The repo-level invariant (#2147) reads the row as
+            # it stands ON DISK, not as this handler intends to leave it, so the
+            # clear has to land BEFORE register() — otherwise the upsert below
+            # looks like "distribute a still-policied row" and is refused. Every
+            # policy-write check above has already passed at this point, and both
+            # writes are on the same row under the same per-table lock, so
+            # ordering is the only thing that moves. register() names every
+            # column EXCEPT the access_policy_*/policy_mapping ones, so running
+            # it here cannot move what the finals above were read from.
+            _clearing_policy = _policy_body_written and not _final_access_policy_sql
+            if _clearing_policy:
+                repo.set_access_policy(table_id, sql=None, note=None, updated_by=user.get("email"))
+
+            repo.register(id=table_id, **merged)
+
             # Persist the access-policy fields through their dedicated setters
             # (Task 2's set_access_policy/set_policy_mapping) — only called when
             # this PUT actually touched one of them, so an unrelated edit never
             # re-stamps access_policy_updated_at.
-            if _policy_body_written:
+            if _policy_body_written and not _clearing_policy:
                 repo.set_access_policy(
                     table_id,
                     sql=_final_access_policy_sql,
@@ -7919,6 +8309,56 @@ def _policy_preview_mapping_warning(
     return None
 
 
+def _policy_preview_run_persona(
+    analytics_conn,
+    policy_sql: str,
+    table_name: str,
+    referenced: set,
+    *,
+    persona_user_id: Optional[str],
+    persona_user_email: Optional[str],
+    persona_groups: List[str],
+) -> Dict[str, Any]:
+    """One persona's slice of a policy body -- the COUNT and the before/
+    after bounded sample -- factored out of ``preview_table_policy`` so the
+    persona-matrix endpoint (design doc §13.1, issue #2147) can run the
+    exact same primitive once per persona instead of duplicating the
+    CTE-redirect/sampling logic (``_policy_preview_samples``) a second time.
+
+    Every caller has already: resolved ``policy_sql``, run the
+    mapping-empty and pattern-position refusals, and computed ``referenced``
+    (``_policy_preview_variable_usage``) -- this only binds ONE persona's
+    values and runs the live queries.
+    """
+    params: Dict[str, Any] = {}
+    if "user_email" in referenced:
+        params["user_email"] = persona_user_email
+    if "user_id" in referenced:
+        params["user_id"] = persona_user_id
+    if "user_groups" in referenced:
+        params["user_groups"] = persona_groups
+
+    rows_visible = analytics_conn.execute(
+        f"SELECT COUNT(*) FROM ({policy_sql}) AS __agnes_policy_preview__",
+        params,
+    ).fetchone()[0]
+    # Slice 2 (§13.1 before/after): the policied slice AND the RAW sample
+    # the authoring admin (god-mode) may see, so the UI can diff them --
+    # struck-through dropped rows, real->masked cells. Both must cover the
+    # SAME bounded rows or the diff pairs unrelated rows; `_policy_preview_
+    # samples` arranges that (and says so via `comparable`) on ONE bounded
+    # read.
+    sample_rows, base_sample_rows, base_sample_comparable = _policy_preview_samples(
+        analytics_conn, table_name, policy_sql, params
+    )
+    return {
+        "rows_visible": int(rows_visible),
+        "sample_rows": _sanitize_for_json(sample_rows),
+        "base_sample_rows": _sanitize_for_json(base_sample_rows),
+        "base_sample_comparable": bool(base_sample_comparable),
+    }
+
+
 @router.post("/registry/{table_id}/policy/preview")
 # Both preview handlers are plain `def` on purpose: they run synchronous
 # DuckDB (and, for a remote table, engine-attached) COUNT/sample queries --
@@ -8165,38 +8605,26 @@ def preview_table_policy(
                 ),
             )
 
-        params: Dict[str, Any] = {}
-        if "user_email" in referenced:
-            params["user_email"] = persona_user_email
-        if "user_id" in referenced:
-            params["user_id"] = persona_user_id
-        if "user_groups" in referenced:
-            params["user_groups"] = persona_groups
-
         try:
             rows_total = analytics_conn.execute(f"SELECT COUNT(*) FROM {quote_ident(row['name'])}").fetchone()[0]
-            rows_visible = analytics_conn.execute(
-                f"SELECT COUNT(*) FROM ({policy_sql}) AS __agnes_policy_preview__",
-                params,
-            ).fetchone()[0]
-            # Slice 2 (§13.1 before/after): the policied slice AND the RAW
-            # sample the authoring admin (god-mode) may see, so the UI can
-            # diff them — struck-through dropped rows, real->masked cells.
-            # Both must cover the SAME bounded rows or the diff pairs
-            # unrelated rows; `_policy_preview_samples` arranges that (and
-            # says so via `comparable`) on ONE bounded read, so it never adds
-            # to the two full COUNT(*) scans above, which are the pre-existing
-            # per-call cost on a remote/BQ-backed table.
-            sample_rows, base_sample_rows, base_sample_comparable = _policy_preview_samples(
-                analytics_conn, row["name"], policy_sql, params
+            persona_result = _policy_preview_run_persona(
+                analytics_conn,
+                policy_sql,
+                row["name"],
+                referenced,
+                persona_user_id=persona_user_id,
+                persona_user_email=persona_user_email,
+                persona_groups=persona_groups,
             )
         except Exception as exc:
             raise HTTPException(status_code=422, detail=_policy_preview_failed_detail(exc, table_id=table_id)) from exc
     finally:
         analytics_conn.close()
 
-    sample_rows = _sanitize_for_json(sample_rows)
-    base_sample_rows = _sanitize_for_json(base_sample_rows)
+    rows_visible = persona_result["rows_visible"]
+    sample_rows = persona_result["sample_rows"]
+    base_sample_rows = persona_result["base_sample_rows"]
+    base_sample_comparable = persona_result["base_sample_comparable"]
 
     audit_repo().log(
         user_id=user.get("id"),
@@ -8410,6 +8838,460 @@ def preview_table_policy_all_groups(
     return {
         "rows_total": int(rows_total),
         "groups": results,
+        # Always None here -- the check above already returned early when it
+        # was set, before any of these live queries ran.
+        "mapping_warning": mapping_warning,
+    }
+
+
+class PolicyPreviewMatrixRequest(BaseModel):
+    """Body for ``POST /registry/{table_id}/policy/preview-matrix`` (design
+    doc §13.1 "The preview is a matrix, not a run"; issue #2147, backlog
+    item 18). ``sql`` is optional, same meaning as :class:`PolicyPreviewRequest`
+    -- omitted previews the stored policy, given previews a candidate body
+    first.
+
+    ``personas`` picks which persona families populate the matrix:
+    ``group_sets`` (the distinct group-sets real users who can reach this
+    table actually hold), ``policy_groups`` (each group literal the policy
+    body itself names, plus the empty group set), or ``both`` (default).
+
+    ``limit`` bounds how many distinct ``group_sets`` personas are
+    enumerated -- see ``_POLICY_PREVIEW_MATRIX_MAX_GROUP_SETS`` for the
+    absolute ceiling a caller can never raise past.
+    """
+
+    sql: Optional[str] = None
+    personas: Literal["group_sets", "policy_groups", "both"] = "both"
+    limit: Optional[int] = None
+
+
+# §13.1: "enumerates the distinct group-sets among users who can access the
+# table (bounded by group-sets, not users)". Bounding by SETS rather than by
+# how many users are scanned means an instance with many users but few real
+# group combinations pays no penalty, while one with many ad-hoc per-user
+# combinations cannot turn a single preview into an unbounded response --
+# enumeration keeps scanning past the cap only long enough to notice a
+# DIFFERENT set exists (`truncated`), never to grow the returned list.
+_POLICY_PREVIEW_MATRIX_MAX_GROUP_SETS = 50
+
+
+def _policy_preview_group_set_personas(table_id: str, *, max_group_sets: int) -> tuple[list[list[str]], bool]:
+    """``(group_sets, truncated)`` -- the missing primitive
+    ``preview_table_policy_all_groups``'s own docstring names: "list the
+    distinct group-sets of users with access to this table".
+
+    One entry per DISTINCT sorted tuple of live group names held by an
+    active, non-admin user for whom ``can_access_table`` is true. Never an
+    admin persona (§13.1 task instructions) -- an admin's live read bypasses
+    the policy entirely (§12), so previewing "as" one would show a slice the
+    admin bypass makes irrelevant to check; excluded even though this
+    preview never itself routes through the bypass, same reasoning
+    ``preview_table_policy``/``preview_table_policy_all_groups`` document for
+    not using ``policied_relation``'s admin path.
+    """
+    from app.auth.access import is_user_admin
+    from src.rbac import can_access_table
+
+    seen: "dict[tuple[str, ...], list[str]]" = {}
+    truncated = False
+    for u in users_repo().list_all():
+        if u.get("active") is False:
+            continue
+        if is_user_admin(u["id"]):
+            continue
+        if not can_access_table(u, table_id):
+            continue
+        groups = tuple(sorted(user_group_members_repo().list_group_names_for_user(u["id"])))
+        if groups in seen:
+            continue
+        if len(seen) >= max_group_sets:
+            truncated = True
+            continue
+        seen[groups] = list(groups)
+    return list(seen.values()), truncated
+
+
+def _policy_preview_referenced_group_literals(policy_sql: str) -> list[str]:
+    """Group-name literals the policy body itself compares ``$user_groups``
+    against -- an sqlglot AST walk, never regex (a policy body is untrusted-
+    ish admin-authored SQL, and matching structure rather than substrings is
+    the same discipline the rest of this module already applies to it).
+
+    Covers the three shapes ``docs/table-access-policies.md``'s
+    "group-membership idiom" documents: ``list_contains($user_groups, 'x')``
+    and ``ARRAY_CONTAINS($user_groups, 'x')`` both parse to the same
+    ``exp.ArrayContains`` node under sqlglot's duckdb dialect (verified
+    empirically -- there is no separate ``ARRAY_CONTAINS`` node), and an
+    ``IN`` comparison naming ``$user_groups`` on either side (``$user_groups
+    IN ('a', 'b')`` or the reverse, ``'a' IN (SELECT unnest($user_groups))``
+    the "not rejected but no reason to use it" unnest form documents).
+    """
+    import sqlglot
+    from sqlglot import exp
+
+    try:
+        statement = sqlglot.parse_one(policy_sql, read="duckdb")
+    except Exception:
+        return []
+    if statement is None:
+        return []
+
+    def _is_user_groups_placeholder(node: Optional[exp.Expression]) -> bool:
+        return isinstance(node, exp.Placeholder) and node.name == "user_groups"
+
+    def _string_literal(node: Optional[exp.Expression]) -> Optional[str]:
+        return node.this if isinstance(node, exp.Literal) and node.is_string else None
+
+    names: set = set()
+
+    for call in statement.find_all(exp.ArrayContains):
+        a, b = call.this, call.expression
+        lit = _string_literal(b) if _is_user_groups_placeholder(a) else (_string_literal(a) if _is_user_groups_placeholder(b) else None)
+        if lit:
+            names.add(lit)
+
+    for in_expr in statement.find_all(exp.In):
+        this = in_expr.this
+        candidates = in_expr.expressions or []
+        if _is_user_groups_placeholder(this):
+            # `$user_groups IN ('a', 'b')`
+            for c in candidates:
+                lit = _string_literal(c)
+                if lit:
+                    names.add(lit)
+            continue
+        lit = _string_literal(this)
+        if lit is None:
+            continue
+        # `'a' IN (...)` -- only a group-membership check if `$user_groups`
+        # appears somewhere on the right-hand side, either as a sibling
+        # literal-list member or (the "unnest" idiom the docs name) nested
+        # inside the `query`/`expressions` subtree via UNNEST/EXPLODE.
+        if any(_is_user_groups_placeholder(c) for c in candidates) or any(
+            _is_user_groups_placeholder(p) for p in in_expr.find_all(exp.Placeholder)
+        ):
+            names.add(lit)
+
+    return sorted(names)
+
+
+@router.post("/registry/{table_id}/policy/preview-matrix")
+# Same threadpool reasoning as the two preview handlers above: this fans out
+# into several synchronous DuckDB queries (one persona at a time) plus, for
+# `group_sets` personas, a `can_access_table` check per active user, so it
+# stays a plain `def` route.
+def preview_table_policy_matrix(
+    table_id: str,
+    request: PolicyPreviewMatrixRequest,
+    user: dict = Depends(require_admin_all_surface),
+    conn: duckdb.DuckDBPyConnection = Depends(_get_db),
+    bq: BqAccess = Depends(get_bq_access),
+):
+    """The persona MATRIX (design doc §13.1 "The preview is a matrix, not a
+    run"; issue #2147, backlog item 18) -- built from the SAME single-
+    persona primitive ``preview_table_policy`` uses (``_policy_preview_run_
+    persona``), run once per persona in the matrix instead of once for a
+    single admin-chosen persona.
+
+    A single-persona preview with a row count against the unfiltered total
+    catches only the extremes -- 0 rows and all rows. The dangerous middle
+    is invisible, and the permissive bug that actually happens (a ``CASE``
+    on ``$user_groups`` with a missing branch falling through to the open
+    arm) cannot be seen by previewing one persona. This enumerates the
+    distinct group-sets among users who can actually reach the table
+    (``_policy_preview_group_set_personas``) plus every group literal the
+    policy body itself names (``_policy_preview_referenced_group_literals``,
+    plus the empty group set) and reports, per persona, rows/columns, then
+    two derived numbers: ``union_coverage`` (rows visible to >=1 persona vs
+    the bounded sample -- 100% for every persona AND the union means the
+    policy is a no-op) and ``pairwise_overlap`` (a non-zero overlap where a
+    partitioning policy should show zero is the permissive bug, rendered).
+
+    Row identity for both is BEST-EFFORT: no stable row key exists on this
+    codebase's server side (the modal-side row-matcher §13.1 names is not
+    implemented yet), so identity is the full tuple of a row's UNMASKED,
+    UNHIDDEN ("visible") column values -- two rows with identical values in
+    every visible column are indistinguishable here, and a column whose mask
+    itself varies by persona (rare, but the allowlist does not forbid it)
+    can under-count overlap for a row that is genuinely the same one. This
+    never affects the row FILTERING result (``rows_visible``), only the
+    union/overlap math layered on top of the bounded sample.
+
+    Gated by ``require_admin_all_surface`` and audited
+    (``access_policy.preview_matrix``), same reasoning as
+    ``preview_table_policy``/``preview_table_policy_all_groups`` above: this
+    hands back real row content for every enumerated persona with no
+    per-table grant check and no policy rewrite standing behind it.
+    """
+    from src.sql_ident import quote_ident
+
+    row = table_registry_repo().get(table_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Table not found")
+
+    if request.limit is not None and not (1 <= request.limit <= _POLICY_PREVIEW_MATRIX_MAX_GROUP_SETS):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "policy_preview_matrix_limit_out_of_range: `limit` must be between 1 and "
+                f"{_POLICY_PREVIEW_MATRIX_MAX_GROUP_SETS}"
+            ),
+        )
+    max_group_sets = request.limit or _POLICY_PREVIEW_MATRIX_MAX_GROUP_SETS
+
+    is_candidate = request.sql is not None
+    policy_sql = request.sql if is_candidate else row.get("access_policy_sql")
+    if not policy_sql:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "policy_preview_no_policy: this table has no stored access policy, and "
+                "no candidate `sql` was given to preview"
+            ),
+        )
+
+    if is_candidate:
+        from src.access_policy_validate import PolicyValidationError, validate_policy_sql
+
+        mapping_table_names = {
+            r["name"] for r in table_registry_repo().list_all() if r.get("policy_mapping") and r.get("name")
+        }
+        try:
+            validate_policy_sql(
+                policy_sql,
+                table_id=table_id,
+                table_name=row.get("name") or table_id,
+                mapping_table_names=mapping_table_names,
+                for_remote=(row.get("query_mode") == "remote"),
+            )
+        except PolicyValidationError as e:
+            raise HTTPException(status_code=422, detail=f"{e.reason}: {e.detail}") from e
+
+    # K1-sweep finding 3 (#1979), same as `preview_table_policy` above: a
+    # `query_mode='remote'` table on a transpiling engine does not execute
+    # the DuckDB text below on a live read.
+    transpiled = None
+    preview_dialect = _policy_preview_dialect(row)
+    if preview_dialect is not None:
+        from src.access_policy import PolicyError, transpile_policy_sql
+
+        try:
+            transpiled_sql = transpile_policy_sql(policy_sql, table_id=table_id, dialect=preview_dialect)
+        except PolicyError:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"policy_preview_transpile_failed: this policy body does not transpile to "
+                    f"{preview_dialect} SQL, which is what a live read of this remote table actually runs"
+                ),
+            )
+        transpiled = {"dialect": preview_dialect, "relation_sql": transpiled_sql}
+
+    mapping_warning = _policy_preview_mapping_warning(policy_sql, table_id=table_id, table_name=row.get("name"))
+    if mapping_warning:
+        log_safe(
+            user_id=user.get("id"),
+            action="access_policy.preview_matrix",
+            resource=table_id,
+            params=_sanitize_for_audit(
+                {"personas": request.personas, "candidate_sql": request.sql, "mapping_warning": True}
+            ),
+        )
+        return {
+            "rows_total": None,
+            "personas": [],
+            "union_coverage": None,
+            "no_op": None,
+            "pairwise_overlap": [],
+            "identity_columns": [],
+            "truncated": False,
+            "transpiled": transpiled,
+            "mapping_warning": mapping_warning,
+        }
+
+    preview_unavailable = _policy_preview_local_view_unavailable(row)
+    if preview_unavailable:
+        raise HTTPException(
+            status_code=422,
+            detail=f"policy_preview_remote_unsupported: {preview_unavailable}",
+        )
+
+    from src.access_policy_schema import masked_output_columns
+    from src.access_policy_validate import PolicyValidationError, probe_policy
+    from src.db import get_analytics_db_readonly
+
+    analytics_conn = get_analytics_db_readonly()
+    try:
+        try:
+            probed_columns = probe_policy(policy_sql, table_id, analytics_conn)
+        except PolicyValidationError as e:
+            raise HTTPException(status_code=422, detail=f"{e.reason}: {e.detail}") from e
+
+        base_columns, _base_columns_error = _policy_builder_schema_columns(table_id, row, conn, bq)
+        base_names = [c["name"] for c in base_columns]
+        probed_names = {c["name"] for c in probed_columns}
+        hidden_columns = sorted(name for name in base_names if name not in probed_names)
+        masked_lower = masked_output_columns(policy_sql)
+        masked_columns = sorted(name for name in probed_names if name.lower() in masked_lower)
+        # Row identity for union/overlap (docstring above): columns that
+        # survive from base to policied output UNCHANGED -- never hidden,
+        # never masked. A column absent from this list is one this preview
+        # cannot use to recognize "the same underlying row" across personas.
+        identity_columns = [n for n in base_names if n not in hidden_columns and n not in masked_columns]
+
+        try:
+            referenced, pattern_positioned = _policy_preview_variable_usage(policy_sql)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=_policy_preview_failed_detail(exc, table_id=table_id),
+            ) from exc
+
+        if pattern_positioned & referenced:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "policy_var_in_pattern_position: this table's stored policy matches an "
+                    "identity variable as a LIKE/ILIKE/SIMILAR TO or regex pattern, which the "
+                    "policy resolver refuses to bind -- it can never be served to any caller; "
+                    "rewrite the policy to compare the variable as a value"
+                ),
+            )
+
+        try:
+            rows_total = analytics_conn.execute(f"SELECT COUNT(*) FROM {quote_ident(row['name'])}").fetchone()[0]
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=_policy_preview_failed_detail(exc, table_id=table_id)) from exc
+
+        # The fixed universe union coverage is measured against -- read ONCE
+        # here rather than trusting N independent per-persona base samples
+        # (each `_policy_preview_run_persona` call below creates its own
+        # per-request temp table) to happen to read the identical LIMIT
+        # window every time.
+        universe_cursor = analytics_conn.execute(
+            f"SELECT * FROM {quote_ident(row['name'])} LIMIT {_POLICY_PREVIEW_SAMPLE_LIMIT}"
+        )
+        universe_names = [d[0] for d in universe_cursor.description]
+        universe_rows = [dict(zip(universe_names, r)) for r in universe_cursor.fetchall()]
+
+        def _row_key(d: dict) -> tuple:
+            return tuple(d.get(c) for c in identity_columns)
+
+        universe_keys = {_row_key(r) for r in universe_rows}
+
+        # Persona enumeration (§13.1) ------------------------------------
+        personas: List[Dict[str, Any]] = []
+        seen_group_tuples: set = set()
+        truncated = False
+
+        if request.personas in ("group_sets", "both"):
+            group_sets, truncated = _policy_preview_group_set_personas(table_id, max_group_sets=max_group_sets)
+            for groups in group_sets:
+                key = tuple(groups)
+                if key in seen_group_tuples:
+                    continue
+                seen_group_tuples.add(key)
+                personas.append(
+                    {
+                        "kind": "group_set",
+                        "label": ", ".join(groups) if groups else "(no groups)",
+                        "groups": list(groups),
+                    }
+                )
+
+        if request.personas in ("policy_groups", "both"):
+            for literal_group in _policy_preview_referenced_group_literals(policy_sql):
+                key = (literal_group,)
+                if key in seen_group_tuples:
+                    continue
+                seen_group_tuples.add(key)
+                personas.append({"kind": "policy_group", "label": literal_group, "groups": [literal_group]})
+            if () not in seen_group_tuples:
+                seen_group_tuples.add(())
+                personas.append({"kind": "policy_group", "label": "(no groups)", "groups": []})
+
+        entries: List[Dict[str, Any]] = []
+        persona_visible_keys: List[set] = []
+        for persona in personas:
+            try:
+                result = _policy_preview_run_persona(
+                    analytics_conn,
+                    policy_sql,
+                    row["name"],
+                    referenced,
+                    persona_user_id=None,
+                    persona_user_email=None,
+                    persona_groups=persona["groups"],
+                )
+            except Exception as exc:
+                raise HTTPException(status_code=422, detail=_policy_preview_failed_detail(exc, table_id=table_id)) from exc
+            visible_keys = {_row_key(r) for r in result["sample_rows"]} & universe_keys
+            persona_visible_keys.append(visible_keys)
+            entries.append(
+                {
+                    "kind": persona["kind"],
+                    "label": persona["label"],
+                    "groups": persona["groups"],
+                    "rows_visible": result["rows_visible"],
+                    "rows_total": int(rows_total),
+                    "hidden_columns": hidden_columns,
+                    "masked_columns": masked_columns,
+                    "sample_rows": result["sample_rows"],
+                }
+            )
+    finally:
+        analytics_conn.close()
+
+    # Derived numbers (§13.1) --------------------------------------------
+    union_coverage = None
+    no_op = None
+    if universe_keys:
+        union_visible: set = set()
+        for keys in persona_visible_keys:
+            union_visible |= keys
+        union_coverage = len(union_visible) / len(universe_keys)
+        per_persona_coverage = [len(keys) / len(universe_keys) for keys in persona_visible_keys]
+        no_op = bool(entries) and union_coverage == 1.0 and all(c == 1.0 for c in per_persona_coverage)
+
+    pairwise_overlap = []
+    for i in range(len(entries)):
+        for j in range(i + 1, len(entries)):
+            a_keys, b_keys = persona_visible_keys[i], persona_visible_keys[j]
+            intersection = a_keys & b_keys
+            denom = min(len(a_keys), len(b_keys))
+            pairwise_overlap.append(
+                {
+                    "persona_a": entries[i]["label"],
+                    "persona_b": entries[j]["label"],
+                    "overlap_rows": len(intersection),
+                    "overlap_fraction": (len(intersection) / denom) if denom else 0.0,
+                }
+            )
+
+    log_safe(
+        user_id=user.get("id"),
+        action="access_policy.preview_matrix",
+        resource=table_id,
+        params=_sanitize_for_audit(
+            {
+                "personas": request.personas,
+                "persona_count": len(entries),
+                "candidate_sql": request.sql,
+                "truncated": truncated,
+            }
+        ),
+    )
+
+    return {
+        "rows_total": int(rows_total),
+        "personas": entries,
+        "union_coverage": union_coverage,
+        "no_op": no_op,
+        "pairwise_overlap": pairwise_overlap,
+        "identity_columns": identity_columns,
+        "truncated": truncated,
+        "transpiled": transpiled,
         # Always None here -- the check above already returned early when it
         # was set, before any of these live queries ran.
         "mapping_warning": mapping_warning,
@@ -9379,8 +10261,17 @@ def _build_keboola_discovery_plan(
     # lookup still catches a policied row that pins one, matching the
     # register/update interlocks' wildcard semantics rather than requiring
     # an exact, unreachable `connection_id` match.
+    #
+    # `policied_by_physical` is the same idea over the CANONICAL identifier
+    # (`_canonical_physical_identifiers`), keyed on (engine, container, table)
+    # with the connection and namespace components dropped for the same
+    # wildcard reason. For Keboola the two indexes agree by construction, but
+    # keying discovery on the canonical identifier is what keeps this plan and
+    # the register/update interlocks from drifting apart as new
+    # representations are added.
     policied_by_signal: dict = {}
     policied_by_bucket_table: dict = {}
+    policied_by_physical: dict = {}
     for row in registry_rows:
         if not row.get("access_policy_sql"):
             continue
@@ -9389,6 +10280,9 @@ def _build_keboola_discovery_plan(
             if signal[0] == "bucket_table":
                 _, sig_type, _sig_conn, sig_bucket, sig_table = signal
                 policied_by_bucket_table.setdefault((sig_type, sig_bucket, sig_table), row)
+            elif signal[0] == "phys":
+                _, sig_engine, _sig_conn, _sig_ns, sig_container, sig_table = signal
+                policied_by_physical.setdefault((sig_engine, sig_container, sig_table), row)
 
     plan = {"new": [], "existing_match": [], "existing_drift": [], "invalid": []}
     for table in discovered:
@@ -9490,6 +10384,20 @@ def _build_keboola_discovery_plan(
                     policied_by_bucket_table[(s[1], s[3], s[4])]
                     for s in my_signals
                     if s[0] == "bucket_table" and (s[1], s[3], s[4]) in policied_by_bucket_table
+                ),
+                None,
+            )
+        if policied_twin is None:
+            # Canonical-identifier direction — the index the register/update
+            # interlocks resolve a twin through, so a policied row that spells
+            # its pointer differently (today: nothing extra for Keboola;
+            # tomorrow: whatever representation is added next) is caught here
+            # too rather than only on the hand-registration path.
+            policied_twin = next(
+                (
+                    policied_by_physical[(s[1], s[4], s[5])]
+                    for s in my_signals
+                    if s[0] == "phys" and (s[1], s[4], s[5]) in policied_by_physical
                 ),
                 None,
             )

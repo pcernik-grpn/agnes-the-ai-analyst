@@ -9,8 +9,7 @@ import os
 import re
 import threading
 import time
-from datetime import UTC, datetime
-from typing import Any, Optional
+from typing import Optional
 
 import duckdb
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -40,20 +39,20 @@ from connectors.internal.access import (
     find_internal_refs,
     is_internal_table,
 )
+from app.api.access_policy_http import assert_no_empty_policy_mapping
 from src.access_policy import (
     PolicyError,
     PolicyIdentityUnresolvable,
-    PolicyMappingEmpty,
     PolicyNameCollision,
     assert_policied_reads_unique,
     assert_unique_output_columns,
     find_registry_row,
     policied_relation,
-    raise_if_policy_mapping_empty,
     rewrite_sql,
     row_scope_payload,
 )
 from src.audit_helpers import client_kind_from_user
+from src.access_policy_udf import POLICY_UDF_NAMES
 from src.db import _open_duckdb, get_analytics_db_readonly
 from src.rbac import get_accessible_tables, require_table_access
 from src.remote_engines import (
@@ -1641,6 +1640,23 @@ def _assert_select_only(sql_lower: str) -> None:
             status_code=400,
             detail="File-path table sources are not allowed; query registered views by name",
         )
+    # Agnes's own access-policy functions (`agnes_hmac`) are registered on the
+    # very connection this statement runs on, so a caller could otherwise call
+    # them directly — and `agnes_hmac('alice@example.com')` next to a column
+    # masked with `pseudonymize_keyed` is exactly the dictionary attack the
+    # instance key was bought to prevent. Reserved for policy bodies, which are
+    # spliced in AFTER this guard (see `rewrite_sql` below) and are therefore
+    # unaffected. Substring scan over the guard-masked body — a literal that
+    # merely mentions the name must not 400 — same shape as the blocklist above.
+    for _reserved in sorted(POLICY_UDF_NAMES):
+        if _reserved in masked_body:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"{_reserved}() is reserved for access-policy bodies and cannot be "
+                    "called from a query"
+                ),
+            )
     # SQL-as-a-string table functions (query/query_table/…): their target never
     # appears as a matchable token, so the RBAC name denylist cannot see it.
     if _has_sql_string_table_function(body):
@@ -1662,11 +1678,11 @@ def _assert_select_only(sql_lower: str) -> None:
 
 
 def _assert_no_empty_policy_mapping(policied_table_ids) -> None:
-    """S3 (RLS review, #1979): refuse a live read through a policy whose
-    ``policy_mapping`` dependency is empty or never synced, rather than let
-    it silently return `row_count: 0` for everyone -- indistinguishable
-    from "you legitimately have no data" (docs/table-access-policies.md
-    v1 limitation #3 / §15.1).
+    """S3 (RLS review, #1979; shared across surfaces since #2147): refuse a
+    live read through a policy whose ``policy_mapping`` dependency is empty
+    or never synced, rather than let it silently return `row_count: 0` for
+    everyone -- indistinguishable from "you legitimately have no data"
+    (docs/table-access-policies.md's "empty-mapping trap" / §15.1).
 
     ``policied_table_ids`` is `rewrite_sql`'s own output: it already
     excludes the admin-bypass case (`relation.policied is False` never
@@ -1677,59 +1693,18 @@ def _assert_no_empty_policy_mapping(policied_table_ids) -> None:
     `if relation.policied:` gate on this same check (§15.1's admin-bypass
     note).
 
-    Delegates the actual "is the mapping table empty" question to
-    ``src.access_policy.raise_if_policy_mapping_empty`` -- the SAME
-    function ``GET /api/me/effective-access``
-    (`app/api/access.py::_table_policy_diagnosis`) calls for its
-    ``reason: mapping_empty`` diagnosis, so the two surfaces can never
-    disagree about which tables trip this check. The protected table is
-    named to that helper (``table_id=``) so its policy's own mandatory
-    ``FROM <itself>`` is not mistaken for an empty mapping dependency when
-    the table is ALSO marked ``policy_mapping=True`` and simply has no rows
-    yet (#1979, review follow-up).
+    A thin per-table loop over
+    ``app.api.access_policy_http.assert_no_empty_policy_mapping`` -- the ONE
+    HTTP-shaping implementation every read surface that actually executes a
+    policied relation calls (`GET /api/v2/sample`, `POST /api/v2/scan`,
+    `POST /api/mcp/query-table/{id}` besides this one), so the reason code,
+    field names and datetime serialization can never drift between them.
     """
     if not policied_table_ids:
         return
     repo = table_registry_repo()
     for table_id in policied_table_ids:
-        row = repo.get(table_id)
-        policy_sql = row.get("access_policy_sql") if row else None
-        if not policy_sql:
-            continue
-        try:
-            raise_if_policy_mapping_empty(policy_sql, table_id=table_id, table_name=(row or {}).get("name"))
-        except PolicyMappingEmpty as exc:
-            raise HTTPException(
-                status_code=500,
-                detail={
-                    "reason": "policy_mapping_empty",
-                    "table": table_id,
-                    "mapping_table": exc.mapping_table,
-                    "note": str(exc),
-                    "last_sync": _jsonable_last_sync(exc.last_sync),
-                },
-            )
-
-
-def _jsonable_last_sync(last_sync: Any) -> str | None:
-    """Serialize ``PolicyMappingEmpty.last_sync`` for an ``HTTPException``
-    detail (PR #2023 review, finding 2).
-
-    ``fastapi.exception_handlers.http_exception_handler`` builds a plain
-    Starlette ``JSONResponse`` from ``exc.detail`` -- unlike a
-    ``response_model`` return value, it never runs through
-    ``jsonable_encoder``, so a raw ``datetime`` here would blow up
-    ``json.dumps`` inside the response instead of reaching the caller as
-    the structured error this whole check exists to produce. Naive inputs
-    are assumed UTC (DuckDB's ``SET GLOBAL TimeZone='UTC'`` pin, see
-    ``app/serialization.py``), matching how every other datetime this app
-    returns is labeled.
-    """
-    if not isinstance(last_sync, datetime):
-        return last_sync
-    if last_sync.tzinfo is None:
-        last_sync = last_sync.replace(tzinfo=UTC)
-    return last_sync.isoformat()
+        assert_no_empty_policy_mapping(table_id=table_id, row=repo.get(table_id))
 
 
 @router.post("", response_model=QueryResponse)
@@ -2828,10 +2803,12 @@ def _policied_row_over_physical_source(
     already resolve a path with. A BigQuery row registered with ONLY
     ``bq_fqn`` and no bucket/source_table is invisible here — but also to
     ``find_by_bq_path``, so such a path is refused one step earlier as
-    unregistered. The uncovered shape is a policied ``bq_fqn``-only row
-    beside an unpolicied bucket/source_table row for the same table; that
-    pair already escapes ``_policy_physical_source_signals`` (the two
-    signals never intersect), so closing it belongs there, not here.
+    unregistered. The shape this cannot see — a policied ``bq_fqn``-only row
+    beside an unpolicied bucket/source_table row for the same table — is now
+    refused where it is created rather than where it is read: the twin check
+    resolves both rows to one canonical physical identifier (issue #2147,
+    ``admin._canonical_physical_identifiers``), so the pair can no longer be
+    registered.
     """
     bucket_l = (bucket or "").lower()
     table_l = (source_table or "").lower()
@@ -4565,6 +4542,14 @@ def run_remote_select_to_arrow(conn, user, sql, bq, quota, *, policy_info: dict 
             raise HTTPException(status_code=403, detail={"reason": "policy_identity_unresolvable"})
         except PolicyError as exc:
             raise HTTPException(status_code=500, detail={"reason": "policy_error", "table": exc.table_id})
+
+        # S3 (RLS review, #1979; extended here for #2147): the same
+        # empty/never-synced `policy_mapping` guard `execute_query` applies,
+        # placed the same way -- right after `policied_table_ids` is known
+        # and before any engine executes anything -- so a `--from-query`
+        # snapshot can't bypass a check `/api/query` itself would have
+        # enforced on the identical SQL.
+        _assert_no_empty_policy_mapping(policied_table_ids)
 
         # Which engine materializes this snapshot. Both registered remote
         # engines can; anything else is refused up front with the command that

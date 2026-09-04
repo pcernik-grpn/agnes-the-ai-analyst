@@ -79,6 +79,7 @@ are the unit of curation and user-facing discovery.
 | `DELETE` | `/api/admin/registry/{table_id}` | — | Unregister |
 | `POST` | `/api/admin/registry/{table_id}/policy/preview` | see §3.7 | Preview a stored or candidate access policy as a chosen persona |
 | `POST` | `/api/admin/registry/{table_id}/policy/preview-groups` | see §3.7 | Preview a stored or candidate access policy across every real group in one call |
+| `POST` | `/api/admin/registry/{table_id}/policy/preview-matrix` | see §3.7 | Preview a stored or candidate access policy across a persona matrix (union coverage, pairwise overlap) |
 | `GET` | `/api/admin/registry/{table_id}/policy/columns` | — | No-SQL policy builder: real column schema + sample values (see §3.8) |
 | `POST` | `/api/admin/registry/{table_id}/policy/compile` | see §3.8 | No-SQL policy builder: structured spec → validated SQL (never persisted) |
 | `GET` | `/api/admin/registry/{table_id}/policy/revisions` | — | Saved states of a table's access policy, newest first (see §3.9) |
@@ -255,8 +256,9 @@ attached/replaced/cleared via `PUT /api/admin/registry/{table_id}` (`access_poli
 Every call is recorded to the audit log (`access_policy.preview`) — it shows one admin
 another person's data slice.
 
-These four policy-content routes (`.../policy/preview`, `.../policy/preview-groups`,
-`.../policy/columns`, `.../policy/revisions`) need an admin credential whose data-read
+These five policy-content routes (`.../policy/preview`, `.../policy/preview-groups`,
+`.../policy/preview-matrix`, `.../policy/columns`, `.../policy/revisions`) need an
+admin credential whose data-read
 **surface** is `all` — a browser session, a regular PAT, or `agnes init --as-admin`.
 A `surface='stack'` PAT (the `agnes init` default, filtered like an analyst everywhere
 else) gets `403` with a detail naming the fix: they return real table content with no
@@ -322,6 +324,54 @@ curl -s -X POST \
 #  "mapping_warning": null}
 ```
 
+#### `POST /api/admin/registry/{table_id}/policy/preview-matrix`
+
+The persona **matrix** (design doc §13.1 "The preview is a matrix, not a run";
+issue #2147) — runs the SAME single-persona primitive `.../policy/preview` uses
+once per enumerated persona, instead of once for a single admin-chosen one, and
+derives two numbers a single-persona run cannot show: whether the policy is a
+no-op, and whether two personas meant to partition the table actually overlap.
+
+| Field | Type | Notes |
+|---|---|---|
+| `sql` | string, optional | Same meaning as `.../policy/preview` — omit to preview the stored policy. |
+| `personas` | string, optional | `"group_sets"` \| `"policy_groups"` \| `"both"` (default). `group_sets` enumerates the distinct sets of live group names held by real users who can reach the table; `policy_groups` enumerates every group literal the policy body itself compares `$user_groups` against, plus the empty group set. An admin persona never appears. |
+| `limit` | integer, optional | Bounds how many distinct `group_sets` personas are enumerated — `1..50`; `422 policy_preview_matrix_limit_out_of_range` outside that range. |
+
+```bash
+curl -s -X POST \
+  "https://{your-instance}/api/admin/registry/orders_daily/policy/preview-matrix" \
+  -H "Authorization: Bearer $PAT" \
+  -H "Content-Type: application/json" \
+  -d '{"personas": "group_sets"}'
+# {"rows_total": 4200,
+#  "personas": [
+#    {"kind": "group_set", "label": "Finance", "groups": ["Finance"],
+#     "rows_visible": 1200, "rows_total": 4200,
+#     "hidden_columns": ["secret"], "masked_columns": []},
+#    {"kind": "group_set", "label": "Ops", "groups": ["Ops"],
+#     "rows_visible": 900, "rows_total": 4200,
+#     "hidden_columns": ["secret"], "masked_columns": []}
+#  ],
+#  "union_coverage": 0.7, "no_op": false,
+#  "pairwise_overlap": [{"persona_a": "Finance", "persona_b": "Ops",
+#                        "overlap_rows": 0, "overlap_fraction": 0.0}],
+#  "identity_columns": ["id"], "truncated": false,
+#  "transpiled": null, "mapping_warning": null}
+```
+
+`union_coverage` is the fraction of the SAME bounded sample `.../policy/preview`
+uses that is visible to at least one persona — `1.0` together with every
+persona individually at `1.0` sets `no_op: true`. `pairwise_overlap` reports,
+for every pair of personas, how many of their visible sampled rows coincide —
+a non-zero overlap between two personas a partitioning policy should keep
+disjoint is the permissive `CASE`-with-a-missing-branch bug, rendered
+directly. Row identity across personas (`identity_columns`) is best-effort:
+the columns that survive from base to policied output unchanged (never
+hidden, never masked). With no stored policy at all and no candidate `sql`
+given, this 422s the same way `.../policy/preview` does
+(`policy_preview_no_policy`).
+
 ### 3.8 No-SQL policy builder — `GET .../policy/columns`, `POST .../policy/compile`
 
 Lets an admin author a policy by picking columns and masks instead of writing SQL by
@@ -360,7 +410,35 @@ duplicated here:
 |---|---|---|
 | `row_rules` | array, optional | `[{"column", "op", "value"}]` — `op` is one of `in_caller_groups`, `eq_caller_email`, `eq_caller_id`, `eq`, `in` |
 | `row_combine` | string, optional | `"and"` (default) or `"or"` |
-| `column_masks` | object, optional | `{column: "show"\|"hide"\|"nullify"\|"hash"\|"unmask"}` — `"unmask"` takes `{"choice": "unmask", "groups": ["..."]}` (single-group `"group"` is still accepted) |
+| `column_masks` | object, optional | `{column: "show"\|"hide"\|"nullify"\|"hash"\|"unmask"\|"last4"\|"email_partial"\|"pseudonymize_keyed"}` — any of them may be written as `{"choice": <mask>, "groups": ["..."]}`, which reveals the column verbatim to those groups and applies the mask to everyone else (`"unmask"` is that shape with the built-in `'*****'`/`NULL` fallback; single-group `"group"` is still accepted). `{"choice": "tiered", "tiers": [{"groups": ["..."], "reveal": "show"\|<mask>}, ...], "default": <mask>}` is the ordered form |
+
+A `groups` list is a modifier, not a mask of its own: an empty or missing list falls back
+to the plain mask, never to "everyone sees it". `hide` cannot take one (a column cannot be
+conditionally absent from a fixed projection, so the output schema would depend on the
+caller) and neither can `show`; both are refused with `422 policy_compile_invalid_spec`.
+
+`tiered` compiles the tiers into **one ordered `CASE` chain** — evaluated top-down, first
+matching tier wins, `default` for everyone else — so what a caller in several groups sees
+is decided by the admin's order. At least one tier is required, every tier needs at least
+one group, `reveal` is `show` or any non-`hide` mask, and `default` must be a mask that
+actually masks (`show` would make the chain a no-op; `hide` cannot be conditional). Each
+of those is a refusal, not a silent normalization.
+
+`pseudonymize_keyed` compiles to `agnes_hmac(col) AS col` — a hex HMAC-SHA256 of the value
+under this instance's own anonymization key, so the pseudonym still joins across tables here
+but cannot be reversed by dictionary the way `hash`'s unsalted md5 can. Text-only, and
+DuckDB-only: attaching a policy that calls it to a `query_mode='remote'` table is rejected
+with `422 policy_function_duckdb_only`. See
+[`table-access-policies.md`](table-access-policies.md#column-masking) — key rotation is
+deliberately not supported.
+
+`last4` (`****6789`) and `email_partial` (`j*****@example.com`) are **text-only** partial
+masks: same output column name, same `VARCHAR` type, a fixed-width asterisk run (one that
+tracked the value's length would publish that length). Both fail closed at the edges — a
+value of four characters or fewer, or an address with no `@`, is redacted whole rather
+than half-revealed, and `NULL` stays `NULL`. On a non-text column the compile is refused
+(`422 policy_compile_invalid_spec`) rather than silently casting the output to text; use
+`nullify`, `hash` or `hide` there.
 
 ```bash
 curl -s -X POST \
@@ -375,9 +453,12 @@ curl -s -X POST \
 #  "warnings": []}
 ```
 
-`warnings` carries what the compiler had to say about the spec — a column it did not
-recognize and dropped, or a spec that filters and masks nothing at all. A spec it cannot
-understand (an unknown `op` or mask) returns `422 policy_compile_invalid_spec`.
+`warnings` carries what the compiler had to say about the spec — a **mask** on a column it
+did not recognize and dropped, or a spec that filters and masks nothing at all. A spec it
+cannot understand (an unknown `op` or mask) returns `422 policy_compile_invalid_spec`, and
+so does a **row rule** on an unrecognized column: dropping that one is fail-open (the
+policy would lose its `WHERE` clause, or quietly widen beside a surviving rule) where
+dropping a mask is not, so it is refused with the column and operator named.
 
 This endpoint never persists anything — it only returns SQL text. Save it the same way
 as any hand-written policy: `PUT /api/admin/registry/{table_id}` with the returned `sql`
@@ -817,6 +898,7 @@ checks against.
 - /api/admin/registry/{table_id}/docs
 - /api/admin/registry/{table_id}/policy/preview
 - /api/admin/registry/{table_id}/policy/preview-groups
+- /api/admin/registry/{table_id}/policy/preview-matrix
 - /api/admin/registry/{table_id}/policy/columns
 - /api/admin/registry/{table_id}/policy/compile
 - /api/admin/registry/{table_id}/policy/revisions
@@ -2701,6 +2783,7 @@ so comments and key order survive.
 - /api/semantic-models/context
 - /api/semantic-models/schema
 - /api/semantic-models/apply
+- /api/semantic-models/builder/turn
 - /api/semantic-models/bundle
 
 `POST /api/admin/semantic-models` validates the pasted document against the
@@ -2780,6 +2863,24 @@ non-admin branch also 409s `duplicate_pending` while an earlier proposal for
 the same slug awaits review, and 403s `studio_disabled` when the Studio
 toggle is off. CLI: `agnes semantic-model apply`. MCP:
 `apply_semantic_model`.
+
+`POST /api/semantic-models/builder/turn` runs one turn of the `/semantic-
+layer/new` builder's conversation — the fifth adapter on the shared
+`app/api/builder_core.py` turn contract, alongside the agent, `/skills`,
+data-package and MCP-source builders above. It takes `{message, history,
+draft}` and returns `{reply, patch, suggestions}`, writing **nothing**: a
+model has no row until Save (`POST /api/semantic-models/apply` above), so
+the draft lives in the author's browser and the patch is merged there for
+review. Grounding is server-side and RBAC-filtered rather than trusted from
+the caller: a proposed dataset `source` must resolve to a registered table
+the caller can actually read, and once a dataset names one, its proposed
+`fields` are checked against that table's real columns (the same
+RBAC-enforcing `build_schema` `GET /api/v2/schema/{table_id}` uses) — the
+model can never invent a table path or a column name. Open to any
+authenticated caller, matching `apply`'s own asymmetry: drafting is not
+itself gated on Studio, only Save's non-admin branch is. With no AI
+credential configured it answers `503 builder_llm_unavailable` and the panel
+stays fully usable by hand.
 
 `POST /api/semantic-models/validate-query` validates a SQL statement against
 the caller's accessible `status='valid'` models (same RBAC tier as

@@ -13,11 +13,13 @@ from fastapi.responses import Response
 from pydantic import BaseModel, Field
 import duckdb
 
+from app.api.access_policy_http import assert_no_empty_policy_mapping
 from app.auth.dependencies import get_current_user, _get_db
 from src.db import _open_duckdb
 from app.instance_config import get_value
 from src.audit_helpers import identity_for_audit, client_kind_from_user
 from src.rbac import can_access_table
+from src.access_policy_udf import register_policy_udfs
 from src.access_policy import (
     PolicyError,
     PolicyIdentityUnresolvable,
@@ -936,6 +938,11 @@ def run_scan(
                 raise HTTPException(status_code=403, detail={"reason": "policy_identity_unresolvable"})
             except PolicyError as exc:
                 raise HTTPException(status_code=500, detail={"reason": "policy_error", "table": exc.table_id})
+            # #2147: an empty/never-synced `policy_mapping` dependency
+            # (§15.1) must fail closed here too -- before the parquet is
+            # even read -- the same guard `POST /api/query` applies.
+            if relation.policied:
+                assert_no_empty_policy_mapping(table_id=relation.table_id, row=row)
             # Task 11 (§10): report through job_info, the same out-param
             # _run_bq_scan already uses for BQ job metadata, so scan_endpoint
             # builds the X-Agnes-Row-Scope header from one place regardless
@@ -947,6 +954,13 @@ def run_scan(
             try:
                 projection = ", ".join(quote_ident(c) for c in req.select) if req.select else "*"
                 if relation.policied:
+                    # `agnes_hmac` (the `pseudonymize_keyed` mask) is registered
+                    # by Agnes on the connection a policy body runs on. This
+                    # throwaway :memory: DB is one of them -- it is NOT
+                    # `get_analytics_db_readonly()`, whose registration covers
+                    # /api/query -- so without this the mask would 500 here (fail
+                    # closed, but broken) on a table it serves correctly elsewhere.
+                    register_policy_udfs(local)
                     # The parquet path is server-resolved, never user
                     # input, so it is safe to splice as an escaped literal
                     # — it must NOT be a `?` placeholder: the policy binds

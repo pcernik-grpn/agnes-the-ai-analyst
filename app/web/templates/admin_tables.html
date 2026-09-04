@@ -1026,9 +1026,69 @@
             padding: 3px 6px;
         }
 
-        .ap-unmask-group {
+        .ap-mask-groups-label {
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+            margin: 0;
+        }
+
+        .ap-mask-groups {
             min-height: 28px;
             padding: 3px 6px;
+        }
+
+        /* issue #2147: the tiered-mask editor -- an ordered chain of
+           (groups, reveal) rows plus a default. Placed on its own line via
+           flex-basis so it never squeezes into the name/type/mask row above
+           it, which is exactly the flex-wrap the column row already has. */
+        .ap-tier-editor {
+            flex-basis: 100%;
+            border-top: 1px dashed var(--ds-border);
+            margin-top: 8px;
+            padding-top: 8px;
+        }
+
+        .ap-tier-list {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            margin-bottom: 8px;
+        }
+
+        .ap-tier-row {
+            display: flex;
+            gap: 6px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+
+        .ap-tier-groups {
+            flex: 1 1 40%;
+            min-width: 160px;
+            min-height: 28px;
+            padding: 3px 6px;
+        }
+
+        .ap-tier-reveal {
+            flex: 1 1 26%;
+            min-width: 150px;
+            min-height: 28px;
+            padding: 3px 6px;
+        }
+
+        .ap-tier-move,
+        .ap-tier-remove {
+            flex: 0 0 auto;
+            padding: 2px 8px;
+            line-height: 1;
+        }
+
+        .ap-tier-default {
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+            max-width: 260px;
         }
 
         /* Task A (access-policy-builder-ux Slice 2): row-rule repeater —
@@ -6234,7 +6294,38 @@
         }
     }
 
-    var _AP_MASK_LABELS = { show: 'Show', hide: 'Hide', nullify: 'Nullify', hash: 'Pseudonymize', unmask: 'Unmask for groups' };
+    // issue #2147: the four masks `src/access_policy_compile.py` grew
+    // beyond the original five (`last4`, `email_partial`,
+    // `pseudonymize_keyed`, `tiered`) plus the `groups` modifier any
+    // value-producing mask can now carry -- see that module's own docstring
+    // for the spec shape this picker has to emit.
+    var _AP_MASK_LABELS = {
+        show: 'Show', hide: 'Hide', nullify: 'Nullify', hash: 'Pseudonymize (hash)',
+        unmask: 'Unmask for groups', last4: 'Last 4', email_partial: 'Email (partial)',
+        pseudonymize_keyed: 'Pseudonymize (keyed)', tiered: 'Tiered by group',
+    };
+    // One-line help, shown as the <option>'s title on hover -- overridden by
+    // a disabled-reason string (below) when the option cannot be picked for
+    // this column.
+    var _AP_MASK_HELP = {
+        show: 'No masking — the column is returned as-is.',
+        hide: 'The column is omitted from the result entirely.',
+        nullify: 'The value is replaced with NULL; the column stays in the schema.',
+        hash: 'md5, unsalted — prefer keyed pseudonym on a server-only table.',
+        unmask: 'Verbatim for the listed groups, redacted/NULL for everyone else.',
+        last4: 'Keeps the last 4 characters, masks the rest with a fixed-width run. Text columns only.',
+        email_partial: 'Keeps the domain, redacts the local part (j*****@example.com). Text columns only.',
+        pseudonymize_keyed: "Keyed HMAC pseudonym under this instance's own key — stable and joinable, "
+            + "DuckDB-only (not on a query_mode='remote' table).",
+        tiered: 'Reveals a different value per group, in order, with a default for everyone else.',
+    };
+    // Mirrors `_TEXT_ONLY_MASKS` in src/access_policy_compile.py -- string
+    // surgery / a VARCHAR -> VARCHAR function, so only valid on a text column.
+    var _AP_TEXT_ONLY_MASKS = ['last4', 'email_partial', 'pseudonymize_keyed'];
+    // The masks a tiered chain's tier/default can reveal -- everything
+    // `_mask_value_expr` accepts (`hide` and `unmask` are refused server-side:
+    // a column cannot be conditionally absent, and unmask IS the modifier).
+    var _AP_TIER_REVEAL_MASKS = ['nullify', 'hash', 'last4', 'email_partial', 'pseudonymize_keyed'];
     let _apColumns = [];
     let _apMaskState = {};
     let _apCompileTimer = null;
@@ -6242,6 +6333,68 @@
     let _apCompileError = null;
     let _apSchemaAvailable = true;
     let _apCompileSeq = 0;
+
+    // Mirrors `_is_text_type` in src/access_policy_compile.py: anchor on the
+    // whole base type name (stripping a `(255)`-style size suffix) so
+    // `VARCHAR[]`/`STRUCT(...)`/`MAP(...)`/`LIST(...)` -- which merely mention
+    // a text keyword -- are never treated as scalar text.
+    function _apIsTextColumnType(colType) {
+        var upper = String(colType || '').trim().toUpperCase();
+        if (!upper) return false;
+        if (upper.indexOf('[') !== -1 || upper.indexOf('<') !== -1
+            || upper.indexOf('STRUCT') === 0 || upper.indexOf('MAP') === 0
+            || upper.indexOf('LIST') === 0 || upper.indexOf('ARRAY') === 0) {
+            return false;
+        }
+        var base = upper.split('(')[0].trim();
+        return base === 'VARCHAR' || base === 'TEXT' || base === 'STRING';
+    }
+
+    // `pseudonymize_keyed` calls `agnes_hmac()`, which only exists on this
+    // instance's own DuckDB connection -- the save-time validator refuses it
+    // on a query_mode='remote' table (`policy_function_duckdb_only`). Disabled
+    // here up front rather than only after a 422 on Save.
+    function _apIsRemoteTable(t) {
+        return !!t && String(t.query_mode || '').toLowerCase() === 'remote';
+    }
+
+    // One {value, label, disabled, title} per mask option for a given column
+    // -- shared by the main per-column picker and the tiered editor's own
+    // reveal/default selects, so the two never disagree about which choice is
+    // legal for a column.
+    function _apMaskOptionMeta(choice, isText, isRemote) {
+        var help = _AP_MASK_HELP[choice] || '';
+        var reason = '';
+        if (_AP_TEXT_ONLY_MASKS.indexOf(choice) !== -1 && !isText) {
+            reason = 'Text columns only — this column is not text.';
+        } else if (choice === 'pseudonymize_keyed' && isRemote) {
+            reason = "Not available on a query_mode='remote' table — pseudonymize_keyed runs only "
+                + "on this instance's own DuckDB connection (policy_function_duckdb_only).";
+        }
+        return { disabled: !!reason, title: reason || help };
+    }
+
+    function _apMaskOptionHtml(opt, selected) {
+        return '<option value="' + opt.value + '"'
+            + (opt.value === selected ? ' selected' : '')
+            + (opt.disabled ? ' disabled' : '')
+            + (opt.title ? ' title="' + escapeHtmlAttr(opt.title) + '"' : '')
+            + '>' + escapeHtml(opt.label) + '</option>';
+    }
+
+    // The `groups` modifier (design doc: any value-producing mask, never
+    // `show`/`hide`/`tiered` -- a tiered chain has its own per-tier groups).
+    function _apGroupsCapableMask(choice) {
+        return choice !== 'show' && choice !== 'hide' && choice !== 'tiered';
+    }
+
+    function _apExtractGroups(entry) {
+        if (entry && typeof entry === 'object') {
+            if (Array.isArray(entry.groups)) return entry.groups;
+            if (entry.group) return [entry.group];
+        }
+        return [];
+    }
 
     // Task A (access-policy-builder-ux Slice 2) — the row-rule repeater's
     // state. Every op here is one the compiler (src/access_policy_compile.py)
@@ -6335,9 +6488,11 @@
             return;
         }
         var disabled = !_apTable || !_apIsEligible(_apTable);
+        var isRemoteTable = _apIsRemoteTable(_apTable);
         list.innerHTML = visibleColumns.map(function(col, i) {
             var maskEntry = _apMaskState[col.name];
             var maskChoice = (maskEntry && typeof maskEntry === 'object') ? maskEntry.choice : (maskEntry || 'show');
+            var isText = _apIsTextColumnType(col.type);
             var samples = (col.samples || []).slice(0, 3).map(function(s) {
                 return '<span class="ap-sample-chip">' + escapeHtml(s) + '</span>';
             }).join('');
@@ -6345,17 +6500,35 @@
             var pii = col.pii ? '<span class="ap-col-pii">PII</span>' : '';
             var colArg = escapeHtmlAttr(JSON.stringify(col.name));
             var maskId = 'ap-col-mask-' + i;
-            var maskDropdownOptions = ['show', 'hide', 'nullify', 'hash', 'unmask'].map(function(m) {
-                return { value: m, label: _AP_MASK_LABELS[m] };
+            var maskChoices = ['show', 'hide', 'nullify', 'hash', 'unmask', 'last4', 'email_partial', 'pseudonymize_keyed', 'tiered'];
+            var maskDropdownOptions = maskChoices.map(function(m) {
+                var meta = _apMaskOptionMeta(m, isText, isRemoteTable);
+                return { value: m, label: _AP_MASK_LABELS[m], disabled: meta.disabled, title: meta.title };
             });
             var options = maskDropdownOptions.map(function(o) {
-                return '<option value="' + o.value + '"' + (o.value === maskChoice ? ' selected' : '') + '>' + o.label + '</option>';
+                return _apMaskOptionHtml(o, maskChoice);
             }).join('');
-            var groupInput = (maskChoice === 'unmask')
-                ? '<input type="text" class="form-input ap-unmask-group" placeholder="group names, comma-separated" '
+            // The custom `.ds-dropdown` widget (ds_dropdown.js) has no concept
+            // of a disabled menu item -- pairing it with a `<select>` that DOES
+            // carry disabled options here would let the admin pick a mask
+            // through the pretty widget that the native control (and the
+            // server) both refuse. Falling back to the plain native select
+            // when any option is disabled keeps the refusal real; most
+            // text/PII columns carry no disabled option and keep the
+            // enhanced widget unchanged.
+            var anyOptionDisabled = maskDropdownOptions.some(function(o) { return o.disabled; });
+            var useEnhancedDropdown = !disabled && !anyOptionDisabled;
+            var groupsCapable = _apGroupsCapableMask(maskChoice);
+            var currentGroups = _apExtractGroups(maskEntry);
+            var groupInput = groupsCapable
+                ? '<label class="ap-mask-groups-label form-hint" style="margin:0;">Reveal to groups'
+                  + '<input type="text" class="form-input ap-mask-groups" placeholder="group names, comma-separated" '
                   + (disabled ? 'disabled ' : '')
-                  + 'value="' + escapeHtmlAttr((maskEntry && Array.isArray(maskEntry.groups) ? maskEntry.groups.join(', ') : '')) + '" '
-                  + 'oninput="_apOnUnmaskGroupChange(' + colArg + ', this.value)">'
+                  + 'value="' + escapeHtmlAttr(currentGroups.join(', ')) + '" '
+                  + 'oninput="_apOnMaskGroupsChange(' + colArg + ', this.value)"></label>'
+                : '';
+            var tierEditor = (maskChoice === 'tiered')
+                ? _apRenderTierEditor(col.name, colArg, _apTierEntry(col.name), isText, isRemoteTable, disabled)
                 : '';
             return ''
                 + '<div class="ap-col-row">'
@@ -6372,12 +6545,13 @@
                 // none} in paper-skin.css doesn't check `disabled`, so adding
                 // the class without a paired dropdown would hide the control
                 // with nothing to replace it.
-                +       '<select id="' + maskId + '" class="form-input' + (disabled ? '' : ' ds-dropdown-native') + '" ' + (disabled ? 'disabled ' : '')
+                +       '<select id="' + maskId + '" class="form-input' + (useEnhancedDropdown ? ' ds-dropdown-native' : '') + '" ' + (disabled ? 'disabled ' : '')
                 +         'onchange="_apOnMaskChange(' + colArg + ', this.value)">' + options + '</select>'
-                +       (disabled ? '' : _dropdownMarkupHtml(maskId + '-dd', maskId, col.name + ' mask', maskDropdownOptions, maskChoice))
+                +       (useEnhancedDropdown ? _dropdownMarkupHtml(maskId + '-dd', maskId, col.name + ' mask', maskDropdownOptions, maskChoice) : '')
                 +     '</span>'
                 +     groupInput
                 +   '</div>'
+                +   tierEditor
                 + '</div>';
         }).join('');
         if (window.dsDropdownInit) list.querySelectorAll('.ds-dropdown').forEach(window.dsDropdownInit);
@@ -6386,29 +6560,154 @@
     function _apOnMaskChange(colName, maskValue) {
         if (maskValue === 'show') {
             delete _apMaskState[colName];
-        } else if (maskValue === 'unmask') {
-            var prev = _apMaskState[colName];
-            var prevGroups = [];
-            if (prev && typeof prev === 'object') {
-                if (Array.isArray(prev.groups)) {
-                    prevGroups = prev.groups;
-                } else if (prev.group) {
-                    prevGroups = [prev.group];
-                }
-            }
-            _apMaskState[colName] = { choice: 'unmask', groups: prevGroups };
+        } else if (maskValue === 'tiered') {
+            var prevTiered = _apTierEntry(colName);
+            _apMaskState[colName] = prevTiered || {
+                choice: 'tiered',
+                tiers: [{ groups: [], reveal: 'show' }],
+                default: 'nullify',
+            };
         } else {
-            _apMaskState[colName] = maskValue;
+            var prevGroups = _apExtractGroups(_apMaskState[colName]);
+            _apMaskState[colName] = prevGroups.length ? { choice: maskValue, groups: prevGroups } : maskValue;
         }
         _apRenderColList();
         _apScheduleCompile();
     }
 
-    function _apOnUnmaskGroupChange(colName, groupValue) {
+    // The `groups` modifier -- any value-producing mask, `unmask` included
+    // (kept as its own spelling server-side, same shape here).
+    function _apOnMaskGroupsChange(colName, groupValue) {
+        var groups = groupValue.split(',').map(function(g) { return g.trim(); }).filter(Boolean);
         var entry = _apMaskState[colName];
-        if (entry && typeof entry === 'object') {
-            entry.groups = groupValue.split(',').map(function(g) { return g.trim(); }).filter(Boolean);
+        var choice = (entry && typeof entry === 'object') ? entry.choice : (entry || 'show');
+        _apMaskState[colName] = { choice: choice, groups: groups };
+        _apScheduleCompile();
+    }
+
+    // ── Tiered mask editor ── an ordered chain of (groups, reveal) tiers plus
+    // a default, compiled server-side into one CASE chain
+    // (src/access_policy_compile.py::_tiered_expr). Validation messages below
+    // mirror that compiler's own refusals, so the admin sees them before the
+    // 422 a save-time compile would otherwise be the first to report.
+    function _apTierEntry(colName) {
+        var e = _apMaskState[colName];
+        return (e && typeof e === 'object' && e.choice === 'tiered') ? e : null;
+    }
+
+    function _apTierValidationMessage(entry) {
+        if (!entry || entry.choice !== 'tiered') return '';
+        if (!entry.tiers || !entry.tiers.length) {
+            return 'Add at least one tier — a tiered mask needs at least one group/reveal pair.';
         }
+        for (var i = 0; i < entry.tiers.length; i++) {
+            if (!entry.tiers[i].groups || !entry.tiers[i].groups.length) {
+                return 'Every tier needs at least one group — an empty group list matches nobody.';
+            }
+        }
+        if (!entry.default || entry.default === 'show' || entry.default === 'hide') {
+            return "Choose a default mask other than 'Show'/'Hide' — the default is what everyone "
+                + 'outside the tiers sees, and a no-op or an absent column cannot be conditional.';
+        }
+        return '';
+    }
+
+    function _apRenderTierEditor(colName, colArg, entry, isText, isRemoteTable, disabled) {
+        var tiers = (entry && entry.tiers) || [];
+        var revealOptions = ['show'].concat(_AP_TIER_REVEAL_MASKS).map(function(m) {
+            var meta = _apMaskOptionMeta(m, isText, isRemoteTable);
+            return { value: m, label: m === 'show' ? 'Show (verbatim)' : _AP_MASK_LABELS[m], disabled: meta.disabled, title: meta.title };
+        });
+        var defaultOptions = _AP_TIER_REVEAL_MASKS.map(function(m) {
+            var meta = _apMaskOptionMeta(m, isText, isRemoteTable);
+            return { value: m, label: _AP_MASK_LABELS[m], disabled: meta.disabled, title: meta.title };
+        });
+        var rows = tiers.map(function(tier, idx) {
+            var revealSelect = revealOptions.map(function(o) { return _apMaskOptionHtml(o, tier.reveal || 'show'); }).join('');
+            return ''
+                + '<div class="ap-tier-row">'
+                +   '<input type="text" class="form-input ap-tier-groups" placeholder="group names, comma-separated" '
+                +     (disabled ? 'disabled ' : '')
+                +     'value="' + escapeHtmlAttr((tier.groups || []).join(', ')) + '" '
+                +     'oninput="_apOnTierGroupsChange(' + colArg + ', ' + idx + ', this.value)">'
+                +   '<select class="form-input ap-tier-reveal" ' + (disabled ? 'disabled ' : '')
+                +     'onchange="_apOnTierRevealChange(' + colArg + ', ' + idx + ', this.value)">' + revealSelect + '</select>'
+                +   '<button type="button" class="btn btn-secondary btn-sm ap-tier-move" ' + (disabled ? 'disabled ' : '')
+                +     'onclick="_apMoveTier(' + colArg + ', ' + idx + ', -1)" aria-label="Move tier up">&uarr;</button>'
+                +   '<button type="button" class="btn btn-secondary btn-sm ap-tier-move" ' + (disabled ? 'disabled ' : '')
+                +     'onclick="_apMoveTier(' + colArg + ', ' + idx + ', 1)" aria-label="Move tier down">&darr;</button>'
+                +   '<button type="button" class="btn btn-secondary btn-sm ap-tier-remove" ' + (disabled ? 'disabled ' : '')
+                +     'onclick="_apRemoveTier(' + colArg + ', ' + idx + ')" aria-label="Remove tier">&times;</button>'
+                + '</div>';
+        }).join('');
+        var defaultSelect = defaultOptions.map(function(o) { return _apMaskOptionHtml(o, (entry && entry.default) || ''); }).join('');
+        var message = _apTierValidationMessage(entry);
+        return ''
+            + '<div class="ap-tier-editor">'
+            +   '<div class="form-hint" style="margin:4px 0;">Tiered reveal -- first matching tier wins, top to bottom.</div>'
+            +   '<div class="ap-tier-list">' + rows + '</div>'
+            +   '<button type="button" class="btn btn-secondary btn-sm" ' + (disabled ? 'disabled ' : '')
+            +     'onclick="_apAddTier(' + colArg + ')">Add tier</button>'
+            +   '<label class="ap-tier-default form-hint" style="margin:8px 0 0;">Default (everyone else)'
+            +     '<select class="form-input" ' + (disabled ? 'disabled ' : '')
+            +       'onchange="_apOnTierDefaultChange(' + colArg + ', this.value)">'
+            +       '<option value="" disabled' + (!entry || !entry.default ? ' selected' : '') + '>Choose a default…</option>'
+            +       defaultSelect
+            +     '</select>'
+            +   '</label>'
+            +   '<div class="form-hint form-hint--warn ap-tier-validation"' + (message ? '' : ' style="display:none;"') + '>'
+            +     escapeHtml(message) + '</div>'
+            + '</div>';
+    }
+
+    function _apAddTier(colName) {
+        var e = _apTierEntry(colName);
+        if (!e) return;
+        e.tiers.push({ groups: [], reveal: 'show' });
+        _apRenderColList();
+        _apScheduleCompile();
+    }
+
+    function _apRemoveTier(colName, idx) {
+        var e = _apTierEntry(colName);
+        if (!e) return;
+        e.tiers.splice(idx, 1);
+        _apRenderColList();
+        _apScheduleCompile();
+    }
+
+    function _apMoveTier(colName, idx, dir) {
+        var e = _apTierEntry(colName);
+        if (!e) return;
+        var j = idx + dir;
+        if (j < 0 || j >= e.tiers.length) return;
+        var tmp = e.tiers[idx];
+        e.tiers[idx] = e.tiers[j];
+        e.tiers[j] = tmp;
+        _apRenderColList();
+        _apScheduleCompile();
+    }
+
+    function _apOnTierGroupsChange(colName, idx, value) {
+        var e = _apTierEntry(colName);
+        if (!e || !e.tiers[idx]) return;
+        e.tiers[idx].groups = value.split(',').map(function(g) { return g.trim(); }).filter(Boolean);
+        _apScheduleCompile();
+    }
+
+    function _apOnTierRevealChange(colName, idx, value) {
+        var e = _apTierEntry(colName);
+        if (!e || !e.tiers[idx]) return;
+        e.tiers[idx].reveal = value;
+        _apRenderColList();
+        _apScheduleCompile();
+    }
+
+    function _apOnTierDefaultChange(colName, value) {
+        var e = _apTierEntry(colName);
+        if (!e) return;
+        e.default = value;
+        _apRenderColList();
         _apScheduleCompile();
     }
 
