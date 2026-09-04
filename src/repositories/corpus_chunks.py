@@ -151,6 +151,43 @@ class CorpusChunksRepository:
         ).fetchall()
         return [dict(zip(_COLS, r)) for r in rows]
 
+    def list_for_corpus_batch(
+        self, corpus_id: str, *, after_id: Optional[str] = None, limit: int
+    ) -> List[Dict[str, Any]]:
+        """One bounded, keyset-paginated page of a corpus's chunks, ordered
+        by ``id`` ascending (TCRD-296 synthesis C.15 — knowledge-packaging
+        memory bound).
+
+        ``list_for_corpus`` materializes an ENTIRE corpus's chunk rows
+        (including every ``embedding FLOAT[384]``) in one call — the same
+        unbounded-fetch shape ``search_candidates``'s docstring documents an
+        OOM incident from on the PG side. This is the bounded alternative a
+        caller that must walk a whole corpus (e.g.
+        ``src.knowledge_packaging.build_artifact``) uses instead: call
+        repeatedly with ``after_id`` set to the previous page's last row's
+        ``id`` until a page comes back shorter than ``limit`` (or empty) —
+        the caller never holds more than ``limit`` chunk rows in memory at
+        once, regardless of corpus size.
+
+        Ordered by ``id`` (not ``file_id, ordinal`` like ``list_for_corpus``)
+        because keyset pagination needs a monotonic, unique cursor column —
+        ``id`` is the primary key here. Callers that need file/ordinal order
+        get it implicitly for free where it matters
+        (``src.knowledge_packaging.corpus_fingerprint`` hashes by id already;
+        an artifact's insertion order is cosmetic).
+        """
+        if after_id is None:
+            rows = self.conn.execute(
+                f"SELECT {_SELECT} FROM corpus_chunks WHERE corpus_id = ? ORDER BY id LIMIT ?",
+                [corpus_id, limit],
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                f"SELECT {_SELECT} FROM corpus_chunks WHERE corpus_id = ? AND id > ? ORDER BY id LIMIT ?",
+                [corpus_id, after_id, limit],
+            ).fetchall()
+        return [dict(zip(_COLS, r)) for r in rows]
+
     def list_for_corpora(
         self,
         corpus_ids: List[str],

@@ -88,6 +88,7 @@ class TestRegisterAllKinds:
         "analytics-rebuild",
         "collections-purge",
         "webhook-deliver",
+        "knowledge-packaging",
         "corpus-extraction",
         "corpus-extraction-shard",
         "sharepoint-acl-sync",
@@ -697,6 +698,66 @@ class TestWebhookDeliverHandler:
         assert delivered == [
             ({"id": "w1", "active": True, "url": "https://h/x", "secret": "s"}, {"event": "job.completed"})
         ]
+
+
+class TestKnowledgePackagingHandler:
+    """``knowledge-packaging`` (TCRD-296 synthesis C.15) — a thin adapter
+    over ``src.knowledge_packaging.run_packaging_pass``, gated by the
+    non-blocking PG advisory lock (``src.db_pg.knowledge_packaging_lease``).
+    ``run_packaging_pass``'s own behavior (bounded reads, checkpointing,
+    the deadline contract) is covered in ``tests/test_knowledge_packaging.py``."""
+
+    def test_registered_in_light_lane(self):
+        from app.worker.kinds import register_all_kinds
+        from app.worker.registry import JOB_KINDS, LIGHT_LANE
+
+        register_all_kinds()
+
+        assert "knowledge-packaging" in JOB_KINDS
+        assert JOB_KINDS["knowledge-packaging"].lane == LIGHT_LANE
+
+    def test_delegates_to_run_packaging_pass_with_a_deadline(self, monkeypatch):
+        from app.worker.kinds import register_all_kinds
+        from app.worker.registry import JOB_KINDS
+
+        register_all_kinds()
+
+        captured = {}
+
+        def fake_pass(*, deadline=None, **kwargs):
+            captured["deadline"] = deadline
+            return {"built": ["col_a"], "skipped": [], "pruned": [], "errors": [], "interrupted_reason": None}
+
+        monkeypatch.setattr("src.knowledge_packaging.run_packaging_pass", fake_pass)
+
+        result = JOB_KINDS["knowledge-packaging"].handler({})
+
+        assert result["built"] == ["col_a"]
+        assert captured["deadline"] is not None  # a real time budget was passed through
+
+    def test_skips_when_advisory_lock_already_held(self, monkeypatch):
+        """Belt-and-braces on top of the jobs-repo idempotency-key dedupe:
+        a concurrent holder of the advisory lock means this call must skip,
+        never re-run the pass or block waiting."""
+        import contextlib
+
+        from app.worker.kinds import register_all_kinds
+        from app.worker.registry import JOB_KINDS
+
+        register_all_kinds()
+
+        @contextlib.contextmanager
+        def fake_lease():
+            yield False
+
+        monkeypatch.setattr("src.db_pg.knowledge_packaging_lease", fake_lease)
+        called = []
+        monkeypatch.setattr("src.knowledge_packaging.run_packaging_pass", lambda **kwargs: called.append(1) or {})
+
+        result = JOB_KINDS["knowledge-packaging"].handler({})
+
+        assert called == []
+        assert result == {"skipped": "lock_held"}
 
 
 class _FakeAgentWebhooksRepo:

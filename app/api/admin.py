@@ -12,6 +12,7 @@ import math
 import os
 import re
 import threading
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, NamedTuple, Optional
 
@@ -8694,50 +8695,146 @@ def run_corporate_memory(
     }
 
 
-@router.post("/run-knowledge-packaging")
+@router.post("/run-knowledge-packaging", status_code=202)
 def run_knowledge_packaging(
     user: dict = Depends(require_admin),
 ):
-    """Rebuild per-collection knowledge.duckdb artifacts whose content changed.
+    """Enqueue a ``knowledge-packaging`` worker job (K3, #798).
 
-    Scheduler-driven (K3, #798): fingerprints each corpus's chunks, rebuilds
-    stale artifacts, prunes artifacts for deleted corpora. Idempotent and
-    cheap when nothing changed (fingerprint check only). Mirrors
-    run_corporate_memory's audit + error posture.
+    TCRD-296 synthesis C.15: this used to run the packaging pass INLINE,
+    synchronously, inside the request — the scheduler's own 600s client
+    timeout was the only bound on it, and a pass slower than that left the
+    NEXT scheduler tick free to fire a second, overlapping call. Two
+    overlapping in-process runs raced each other hard enough to OOM the
+    app (see ``src.knowledge_packaging``'s module docstring for the exact
+    collision). This endpoint is now a thin enqueue: the actual pass runs
+    as the ``knowledge-packaging`` worker job kind
+    (``app/worker/kinds.py::_run_knowledge_packaging``), which supplies the
+    single-run guarantee (idempotency-keyed enqueue below, plus a
+    belt-and-braces PG advisory lock inside the handler) and a wall-clock
+    time budget — a scheduler tick can no longer overlap a still-running
+    pass. Poll ``GET /api/jobs/{job_id}`` (or ``agnes admin jobs show
+    <job_id>``) for the result, or use
+    ``GET /api/admin/knowledge-packaging/status`` for a summary of the
+    last run.
+
+    Returns 202 with ``{"status": "queued", "job_id": ...}`` on a fresh
+    enqueue. Returns 409 with the in-flight ``job_id`` when a run is
+    already ``'queued'``/``'running'`` (the scheduler's own cadence can
+    legitimately outpace a slow pass — this is expected, not an error to
+    page on). Returns 501 (typed ``requires_worker_role``) when this
+    process has no worker role: enqueueing here would leave the job
+    ``'queued'`` forever with nothing to claim it — see
+    ``docs/observability.md`` -> "Knowledge packaging" for the operator
+    fix (give a process ``AGNES_ROLE`` including ``worker`` — the default
+    ``all`` role already does).
     """
-    from src.knowledge_packaging import run_packaging_pass
+    from app.roles import Role, role_enabled
+    from src.repositories import jobs_repo
 
-    job_error: Optional[Exception] = None
-    summary: dict = {}
-    try:
-        summary = run_packaging_pass()
-    except Exception as e:
-        # Mirror run_corporate_memory / run_verification_detector: capture
-        # any unhandled error so audit_log + /admin/scheduler-runs reflect
-        # the failure. Re-raised below after audit.
-        job_error = e
+    if not role_enabled(Role.WORKER):
+        raise HTTPException(
+            status_code=501,
+            detail={
+                "error": "requires_worker_role",
+                "message": (
+                    "knowledge packaging needs the worker role — this process has no "
+                    "worker loop to claim the job. Run it on (or add) a process whose "
+                    "AGNES_ROLE includes 'worker' (the default 'all' role already does)."
+                ),
+            },
+        )
 
-    audit_params: dict = {
-        "built": len(summary.get("built", [])),
-        "skipped": len(summary.get("skipped", [])),
-        "pruned": len(summary.get("pruned", [])),
-        "errors": len(summary.get("errors", [])),
-    }
-    if job_error is not None:
-        audit_params["unhandled_error"] = f"{type(job_error).__name__}: {job_error}"
+    job = jobs_repo().enqueue("knowledge-packaging", {}, idempotency_key="knowledge-packaging")
+    already_in_progress = job["deduped"]
 
-    audit_repo().log(
+    log_safe(
         user_id=user.get("id"),
         client_kind=client_kind_from_user(user),
         action="run_knowledge_packaging",
         resource="job:knowledge-packaging",
-        params=audit_params,
+        params={"job_id": job["id"], "deduped": already_in_progress},
+        result="error.in_progress" if already_in_progress else "success",
     )
 
-    if job_error is not None:
-        raise HTTPException(status_code=500, detail=audit_params["unhandled_error"])
+    if already_in_progress:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "knowledge_packaging_already_in_progress", "job_id": job["id"]},
+        )
 
-    return {"ok": not summary.get("errors"), "details": summary}
+    return {"status": "queued", "job_id": job["id"]}
+
+
+@router.get("/knowledge-packaging/status")
+def knowledge_packaging_status(
+    _user: dict = Depends(require_admin),
+):
+    """Observability summary for the ``knowledge-packaging`` worker job
+    kind (TCRD-296 synthesis C.15): the most recent run's outcome, whether
+    one is running right now, and (best-effort) when the next scheduled
+    run is due.
+
+    ``last_run``: the most recent ``knowledge-packaging`` job row
+    (regardless of status), or ``null`` if the kind has never run on this
+    instance — ``{"job_id", "status", "created_at", "finished_at",
+    "result"}`` where ``result`` is the pass summary (built/skipped/
+    pruned/errors/interrupted_reason/duration_s/collections_total/
+    collections_processed) when the job completed.
+    ``running``: whether a ``knowledge-packaging`` job is currently
+    ``'queued'`` or ``'running'``.
+    ``next_due``: an ISO timestamp estimate (last completed run's
+    ``created_at`` + ``SCHEDULER_KNOWLEDGE_PACKAGING_INTERVAL``), or
+    ``null`` when no run has completed yet or the scheduler's durable
+    last-run marker can't be read — this is an ESTIMATE (the scheduler
+    process's own last-run/interval state is the authority; see
+    ``services/scheduler/__main__.py``), not a guaranteed next-fire time.
+    """
+    from src.repositories import jobs_repo
+
+    rows = jobs_repo().list(kind="knowledge-packaging", limit=1)
+    last_run = None
+    running = False
+    if rows:
+        row = rows[0]
+        running = row.get("status") in ("queued", "running")
+        last_run = {
+            "job_id": row.get("id"),
+            "status": row.get("status"),
+            "created_at": row.get("created_at"),
+            "finished_at": row.get("finished_at"),
+            "result": (row.get("payload_json") or {}).get("result"),
+        }
+
+    return {"last_run": last_run, "running": running, "next_due": _knowledge_packaging_next_due()}
+
+
+def _knowledge_packaging_next_due() -> Optional[str]:
+    """Best-effort estimate of the next ``knowledge-packaging`` scheduler
+    tick, read from the scheduler's durable last-run marker
+    (``services/scheduler/__main__.py``'s ``scheduler_last_run.json``, on
+    the ``DATA_DIR`` volume the app and scheduler containers share).
+
+    Never raises — this is observability, not a correctness dependency: a
+    missing/unreadable marker file, an unset entry, or a malformed
+    timestamp all resolve to ``None`` (unknown) rather than failing the
+    status endpoint.
+    """
+    try:
+        data_dir = Path(os.environ.get("DATA_DIR", "/data"))
+        marker_path = data_dir / "state" / "scheduler_last_run.json"
+        if not marker_path.exists():
+            return None
+        marker = json.loads(marker_path.read_text())
+        last_run_iso = marker.get("knowledge-packaging")
+        if not last_run_iso:
+            return None
+        last_run_dt = datetime.fromisoformat(last_run_iso)
+        interval_s = int(os.environ.get("SCHEDULER_KNOWLEDGE_PACKAGING_INTERVAL", 15 * 60))
+        return (last_run_dt + timedelta(seconds=interval_s)).isoformat()
+    except Exception:
+        logger.warning("knowledge-packaging status: could not estimate next_due", exc_info=True)
+        return None
 
 
 @router.post("/run-knowledge-digests")

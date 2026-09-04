@@ -3135,11 +3135,22 @@ KNOWN_UNTESTED = {
     # upstream call for an `upload`-kind source, which makes it exactly the
     # sweep worth smoking on both backends — see
     # TestSemanticLayerSmoke.test_scheduled_sweep_syncs_a_registered_source.)
-    # K3 local knowledge packaging (#798) — scheduler-driven admin maintenance
-    # op, mirrors run-corporate-memory. No dual-backend contract test needed
-    # (no new repo methods/migration; state.json lives on disk). Behaviour
-    # covered in tests/test_admin_run_endpoints.py::TestRunKnowledgePackaging.
+    # K3 local knowledge packaging (#798). TCRD-296 synthesis C.15: this is
+    # now a thin enqueue of the `knowledge-packaging` worker job kind (was:
+    # ran synchronously, mirroring run-corporate-memory) — the only repo
+    # call is `jobs_repo().enqueue(...)`, and `jobs`/`jobs_pg` is an
+    # already dual-backend-proven frozen pair
+    # (tests/db_pg/test_jobs_contract.py); the pass itself
+    # (src.knowledge_packaging, corpus_chunks/corpus_chunks_pg) has its own
+    # dual-backend coverage in tests/db_pg/test_corpus_chunks_contract.py.
+    # Endpoint behaviour (202/409/501, audit row) covered single-backend in
+    # tests/test_admin_run_endpoints.py::TestRunKnowledgePackaging.
     "POST /api/admin/run-knowledge-packaging",
+    # Status sibling of the row above — a read over the same dual-backend-
+    # proven `jobs` repo pair (`jobs_repo().list(...)`), no new repo surface.
+    # Endpoint behaviour covered single-backend in
+    # tests/test_admin_run_endpoints.py::TestKnowledgePackagingStatus.
+    "GET /api/admin/knowledge-packaging/status",
     # K4 maintained digests (#799) — scheduler-driven admin maintenance op,
     # mirrors run-knowledge-packaging / run-corporate-memory. No new repo
     # methods/migration beyond the existing knowledge_digests contract test

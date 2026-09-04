@@ -2691,13 +2691,45 @@ delivery channels; an agent's live read path is `get_semantic_context`/
 - /api/admin/run-jira-sla-poll
 - /api/admin/run-knowledge-digests
 - /api/admin/run-knowledge-migration
-- /api/admin/run-knowledge-packaging
+- /api/admin/run-knowledge-packaging — see the dedicated section below (thin enqueue, not synchronous)
 - /api/admin/run-reap-stuck-reviews
 - /api/admin/run-retention-prune
 - /api/admin/run-semantic-sources-refresh
 - /api/admin/upgrade-freeze — per-instance auto-upgrade freeze (GET status, POST set for 1–72 h, DELETE lift); writes the state-disk marker the VM's upgrade tick honors
 - /api/admin/run-session-collector
 - /api/admin/run-session-processor
+
+### `/api/admin/run-knowledge-packaging` + `/api/admin/knowledge-packaging/status` — Knowledge-artifact packaging (K3, #798)
+
+- /api/admin/run-knowledge-packaging
+- /api/admin/knowledge-packaging/status
+
+TCRD-296 synthesis C.15: `POST /api/admin/run-knowledge-packaging` used to
+run the packaging pass (rebuild any Collection's `knowledge.duckdb`
+artifact whose chunk content changed) INLINE, synchronously, inside the
+request — the scheduler's own 600s client timeout was the only bound on
+it, and a slower pass let the next scheduler tick fire a second,
+overlapping call that raced the first hard enough to OOM the app. It is
+now a thin enqueue of the `knowledge-packaging` worker job kind (LIGHT
+lane, `app/worker/kinds.py::_run_knowledge_packaging`), which supplies a
+belt-and-braces Postgres advisory lock and a 20-minute wall-clock budget
+(checkpointed per collection, so an interrupted run resumes cleanly on the
+next tick rather than losing its progress). Returns 202 with `{"status":
+"queued", "job_id"}` on a fresh enqueue, 409 with the in-flight `job_id`
+when a run is already `queued`/`running` (the idempotency-keyed dedupe —
+expected under a fast scheduler cadence, not an error), and 501 (typed
+`requires_worker_role`) when this process/instance has no worker role, so
+enqueueing would leave the job unclaimed forever.
+
+`GET /api/admin/knowledge-packaging/status` reports the last run's outcome
+(`{"job_id", "status", "created_at", "finished_at", "result"}`, where
+`result` carries `built`/`skipped`/`pruned`/`errors`/`interrupted_reason`/
+`duration_s`/`collections_total`/`collections_processed`), whether a run
+is currently `queued`/`running`, and a best-effort `next_due` estimate
+read from the scheduler's durable last-run marker.
+
+CLI: `agnes admin knowledge packaging run|status`. MCP:
+`admin_knowledge_packaging_run`, `admin_knowledge_packaging_status`.
 
 ### `/api/auth` — Authentication
 

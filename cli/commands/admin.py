@@ -15,6 +15,7 @@ from cli.commands.admin_data_package import admin_data_package_app
 from cli.commands.admin_digest import admin_digest_app
 from cli.commands.admin_doctor import doctor_app as admin_doctor_app
 from cli.commands.admin_jobs import admin_jobs_app
+from cli.commands.admin_knowledge_packaging import packaging_app as admin_knowledge_packaging_app
 from cli.commands.admin_marketplace import admin_marketplace_app
 from cli.commands.admin_mcp import mcp_app as admin_mcp_app
 from cli.commands.admin_memory_domain import admin_memory_domain_app
@@ -59,6 +60,11 @@ admin_app.add_typer(admin_usage_app, name="usage", help="(deprecated alias of `t
 admin_app.add_typer(admin_data_package_app, name="data-package", help="Data Package CRUD (v49)")
 admin_app.add_typer(admin_memory_domain_app, name="memory-domain", help="Memory Domain CRUD (v49)")
 admin_app.add_typer(admin_digest_app, name="digest", help="Maintained digest CRUD (K4)")
+knowledge_app = typer.Typer(help="Knowledge-artifact packaging + digests (K3/K4)")
+knowledge_app.add_typer(
+    admin_knowledge_packaging_app, name="packaging", help="Per-collection knowledge.duckdb artifact packaging (K3)"
+)
+admin_app.add_typer(knowledge_app, name="knowledge")
 admin_app.add_typer(admin_db_app, name="db", help="Manage app-state DB backend (DuckDB / Postgres)")
 admin_app.add_typer(admin_sso_app, name="sso", help="External SSO login (Entra ID OIDC) runtime config")
 admin_app.add_typer(

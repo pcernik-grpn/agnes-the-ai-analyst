@@ -181,6 +181,60 @@ def test_list_for_corpus_empty_when_no_chunks(repo):
     assert repo.list_for_corpus("col_nonexistent") == []
 
 
+# ---------------------------------------------------------------------------
+# list_for_corpus_batch (TCRD-296 synthesis C.15 — bounded reads)
+# ---------------------------------------------------------------------------
+
+
+def test_list_for_corpus_batch_pages_through_in_id_order(repo):
+    repo.add_many([{"corpus_id": CORPUS_ID, "file_id": FILE_ID, "ordinal": i, "text": f"row {i}"} for i in range(5)])
+    all_ids = {r["id"] for r in repo.list_for_corpus(CORPUS_ID)}
+
+    seen: list[str] = []
+    after_id = None
+    while True:
+        page = repo.list_for_corpus_batch(CORPUS_ID, after_id=after_id, limit=2)
+        if not page:
+            break
+        seen.extend(r["id"] for r in page)
+        after_id = page[-1]["id"]
+        if len(page) < 2:
+            break
+
+    assert set(seen) == all_ids
+    assert len(seen) == len(all_ids)  # no duplicate/missed row across pages
+    assert seen == sorted(seen)  # ascending id order, the pagination cursor
+
+
+def test_list_for_corpus_batch_respects_limit(repo):
+    repo.add_many([{"corpus_id": CORPUS_ID, "file_id": FILE_ID, "ordinal": i, "text": f"row {i}"} for i in range(5)])
+    page = repo.list_for_corpus_batch(CORPUS_ID, limit=2)
+    assert len(page) == 2
+
+
+def test_list_for_corpus_batch_empty_when_no_chunks(repo):
+    assert repo.list_for_corpus_batch("col_nonexistent", limit=10) == []
+
+
+def test_list_for_corpus_batch_scoped_to_given_corpus(repo):
+    repo.add_many([{"corpus_id": CORPUS_ID, "file_id": FILE_ID, "ordinal": 0, "text": "in"}])
+    repo.add_many([{"corpus_id": "col_other", "file_id": "cf_other", "ordinal": 0, "text": "out"}])
+    page = repo.list_for_corpus_batch(CORPUS_ID, limit=10)
+    assert len(page) == 1
+    assert page[0]["text"] == "in"
+
+
+def test_list_for_corpus_batch_carries_embedding(repo):
+    """Unlike the column-pruned candidate fetches, a full-corpus batch read
+    (used by knowledge packaging to build the artifact's own chunks table)
+    carries the embedding, matching ``list_for_corpus``."""
+    vec = [0.02 * i for i in range(384)]
+    repo.add_many([{"corpus_id": CORPUS_ID, "file_id": FILE_ID, "ordinal": 0, "text": "v", "embedding": vec}])
+    page = repo.list_for_corpus_batch(CORPUS_ID, limit=10)
+    assert len(page) == 1
+    assert len(page[0]["embedding"]) == 384
+
+
 def test_delete_for_file_removes_chunks(repo):
     repo.add_many(
         [
