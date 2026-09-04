@@ -987,7 +987,11 @@ def test_a_byte_identical_document_is_served_from_cache_not_a_second_model_call(
     # clamps its index), so the call COUNT below is what actually proves
     # the cache, not merely "the pass didn't crash".
     extractor = StubExtractor([_stream(node)])
-    report = _run(extractor)
+    # concurrency=1 is load-bearing (see the next test): the pass extracts
+    # documents in parallel by default, so doc 2 can start before doc 1 has
+    # written its cache row — a legitimate miss that shows up as a second
+    # model call and made this test flaky in CI.
+    report = _run(extractor, concurrency=1)
 
     assert report["docs_extracted"] == 2
     assert len(extractor.seen) == 1, "the second, byte-identical document must cost zero model calls"
