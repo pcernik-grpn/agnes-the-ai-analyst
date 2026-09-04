@@ -418,3 +418,58 @@ class TestSubscribeHonoursStatus:
         subscribe as before rather than trip a lookup that does not apply."""
         _grant(conn, "g_sales", "collection", "col_1", "available")
         StackResolver(conn).add_to_stack("u1", ResourceType.COLLECTION, "col_1")
+
+
+class TestEveryoneScopeReachesAGrouplessAccount:
+    """`_grants` must not short-circuit on an empty group set.
+
+    It returned `({}, {})` before consulting the repository, which was right
+    while "everyone" was a group nobody could be outside of. Since 0098 an
+    everyone-scoped grant reaches an account regardless of membership — and
+    `list_for_groups`' own docstring promises it answers an empty list — so
+    the short-circuit discarded exactly the audience the scope exists to
+    express, for `data_package` among other non-withheld types.
+
+    Pinned as the CALL rather than as SQL, deliberately: the scope column is
+    Postgres-only and this suite runs DuckDB in-memory, so a data-level
+    assertion here would pass for the wrong reason. What went wrong was that
+    the repository never got asked.
+    """
+
+    def _resolver_with_stub(self, monkeypatch, rows):
+        calls = []
+
+        class _StubGrants:
+            def list_for_groups(self, group_ids, resource_type=None, include_everyone=True):
+                calls.append((list(group_ids), resource_type))
+                return rows
+
+        r = StackResolver(conn=None)
+        monkeypatch.setattr(r, "_grants_repo", lambda: _StubGrants())
+        return r, calls
+
+    def test_grants_consults_the_repository_with_no_groups(self, monkeypatch):
+        rows = [{"resource_id": "pkg_everyone", "requirement": "required"}]
+        r, calls = self._resolver_with_stub(monkeypatch, rows)
+
+        required, available = r._grants([], ResourceType.DATA_PACKAGE)
+
+        assert calls, (
+            "_grants short-circuited on an empty group set and never asked the "
+            "repository — an everyone-scoped grant can only be seen by asking"
+        )
+        assert calls[0][0] == []
+        assert required == {"pkg_everyone"}
+        assert available == set()
+
+    def test_grants_still_splits_the_tiers_for_a_real_group(self, monkeypatch):
+        rows = [
+            {"resource_id": "pkg_req", "requirement": "required"},
+            {"resource_id": "pkg_avail", "requirement": "available"},
+        ]
+        r, _calls = self._resolver_with_stub(monkeypatch, rows)
+
+        required, available = r._grants(["g_sales"], ResourceType.DATA_PACKAGE)
+
+        assert required == {"pkg_req"}
+        assert available == {"pkg_avail"}

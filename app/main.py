@@ -1439,6 +1439,27 @@ async def lifespan(app):
         except Exception as e:
             logger.warning("Could not seed memory-curator agent profile: %s", e)
 
+        # The DuckDB half of migration 0098 — "everyone" becoming a scope on
+        # the grant instead of a group, and `marketplace_plugins.is_system`
+        # becoming an ordinary required grant. Alembic runs on Postgres only
+        # (`src/db_pg.py::ensure_pg_at_head`) and the DuckDB ladder is frozen
+        # (A3), so without this a DuckDB instance takes the new reader code
+        # while its data still says `is_system` — and every plugin an admin
+        # made automatic silently reaches nobody. Idempotent, no-op on
+        # Postgres, and the ORDER of its steps is load-bearing: see
+        # src/system_plugin_reconcile.py.
+        #
+        # BEFORE the built-in marketplace seed below, which writes an
+        # everyone-reaching grant of its own: on a previously-narrowed
+        # instance that grant must land on a group that already means every
+        # account, and this is what makes it mean that.
+        try:
+            from src.system_plugin_reconcile import reconcile_system_plugin_flags
+
+            reconcile_system_plugin_flags()
+        except Exception as e:
+            logger.warning("Could not reconcile system-plugin flags: %s", e)
+
         # Seed (or re-bake) the built-in marketplace from the wheel bundle. Runs
         # after system-groups are ensured so the RBAC seed can look up Admin/Everyone.
         # Non-fatal: a missing bundle dir only means the plugin cache is empty.

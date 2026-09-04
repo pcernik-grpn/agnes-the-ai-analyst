@@ -428,6 +428,51 @@
       </div>
     </details>
 
+    {# ── What they share ────────────────────────────────────────────────
+       The person's side of a fact /admin/access shows from the group's side.
+       Server-rendered from the same repositories — no API round-trip, and a
+       reload picks up a sibling tab's change the same way. #}
+    <details class="dsec" id="shares" aria-label="What this person owns and shares">
+      <summary>
+        <div class="dsec-head">
+          <span class="dsec-ico">{{ ico.icon('share', 14) }}</span>
+          <div class="dsec-grow">
+            <h3>Shares</h3>
+            <div class="dsec-sub">What this person owns, and which groups can use it. Change a share on <a href="/admin/access">Access</a>.</div>
+          </div>
+          <span class="dsec-sum">{% if shares.owned %}{{ shares.shared }} of {{ shares.owned|length }} shared{% else %}nothing owned{% endif %}</span>
+          <span class="dsec-chev">{{ ico.icon('chevron', 16) }}</span>
+        </div>
+      </summary>
+      <div class="dsec-body">
+        {% if not shares.owned %}
+        <div class="dsec-empty"><strong>Owns nothing that can be shared</strong>
+          No agents or collections belong to this account.</div>
+        {% else %}
+        <div class="ud-tablewrap data-table-wrap">
+          <table class="data-table">
+            <thead><tr><th>What</th><th>Shared with</th><th class="ud-end">Manage</th></tr></thead>
+            <tbody>
+            {% for it in shares.owned %}
+              <tr>
+                <td><span class="ds-kindtag ds-kindtag--sm">{{ it.kind }}</span>
+                  {% if it.href %}<a href="{{ it.href }}">{{ it.name }}</a>{% else %}{{ it.name }}{% endif %}</td>
+                <td>
+                  {% if not it.grants %}<span class="ud-note">nobody — not shared</span>
+                  {% else %}{% for g in it.grants %}<span class="ud-share">{{ g.group }}
+                    <span class="ud-note">· {% if g.by_owner %}shared by them{% else %}granted by {{ g.by }}{% endif %}</span></span>{% if not loop.last %}<br>{% endif %}{% endfor %}{% endif %}
+                </td>
+                <td class="ud-end">{% for g in it.grants %}<a class="ud-manage" href="/admin/access?group={{ g.group_id|urlencode }}">{{ g.group }} on Access →</a>{% if not loop.last %}<br>{% endif %}{% endfor %}</td>
+              </tr>
+            {% endfor %}
+            </tbody>
+          </table>
+        </div>
+        <p class="ud-note">Covers {{ shares.kinds_covered|join(' and ') }}. {{ shares.kinds_missing|join(' and ')|capitalize }} are not listed yet — their records do not carry an owner the page can read.</p>
+        {% endif %}
+      </div>
+    </details>
+
     {# ── Effective access ───────────────────────────────────────────── #}
     <details class="dsec" id="effective-access" aria-label="Effective access">
       <summary>

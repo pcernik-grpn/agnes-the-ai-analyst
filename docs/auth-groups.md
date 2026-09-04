@@ -53,17 +53,23 @@ What the OAuth callback does with the list returned by `fetch_user_groups`:
    `grp_acme_`), only emails whose local part starts with the prefix
    survive into Agnes; the rest are discarded. If unset, every fetched
    group is mirrored (legacy behavior).
-2. **System-group mapping.** Two optional env vars route specific
-   Workspace emails into the seeded system rows instead of creating fresh
-   `user_groups` entries:
+2. **System-group mapping.** One optional env var routes a specific
+   Workspace email into a seeded system row instead of creating a fresh
+   `user_groups` entry:
    - `AGNES_GROUP_ADMIN_EMAIL` — when set, membership in the matching
      Workspace group adds the user to the seeded `Admin` row.
-   - `AGNES_GROUP_EVERYONE_EMAIL` — same, for `Everyone`.
 
    This lets operators have a Workspace group like
    `grp_acme_admin@example.com` show up in Agnes as the canonical
    `Admin` system group (with the same `is_system=TRUE` semantics, the
    same membership-table id) — no parallel "near-Admin" row.
+
+   `AGNES_GROUP_EVERYONE_EMAIL` did the same for `Everyone` and is
+   **retired** (migration `0098`) — see [Everyone membership](#everyone-membership-single-mode-since-migration-0098)
+   below for why, and for what an upgrade does to an instance that has it
+   set. `Admin` keeps its mapping because it is a capability, not an
+   audience: narrowing it to a Workspace group takes nothing away from
+   anybody.
 3. **Login gate.** If `AGNES_GOOGLE_GROUP_PREFIX` is set AND the fetch
    returned a non-empty list AND none of those groups match the prefix →
    the callback redirects to `/login?error=not_in_allowed_group`. The
@@ -99,30 +105,37 @@ same rule: PATCH / DELETE / add-member / remove-member return
 an operator changes Workspace membership at admin.google.com and the user
 signs in again to Agnes.
 
-**Everyone membership: dual-mode (issue #748).** Two mutually exclusive
-modes, selected by whether `AGNES_GROUP_EVERYONE_EMAIL` is set:
+**Everyone membership: single-mode since migration `0098`.** Every new user
+is auto-granted `Everyone` at creation time (`source='system_seed'`), across
+all creation paths (Google OAuth first sign-in, `POST /auth/bootstrap`, admin
+`POST /api/users`, marketplace import stubs). The grant happens once, at
+creation — it is **not** re-asserted at login or on boot. Schema v86
+backfills users created before this behavior existed.
 
-- **Env unset (default)** — every new user is auto-granted `Everyone`
-  at creation time (`source='system_seed'`), across all creation paths
-  (Google OAuth first sign-in, `POST /auth/bootstrap`, admin
-  `POST /api/users`, marketplace import stubs). The grant happens once,
-  at creation — it is **not** re-asserted at login or on boot, so an
-  admin who manually removes a user from `Everyone` later stays removed.
-  Schema v86 backfills users created before this behavior existed.
-- **Env set** — `Everyone` is mirrored from the mapped Workspace group
-  exclusively via `google_sync` (as described above); the auto-grant
-  helper (`app.auth.group_sync.ensure_everyone_membership`) becomes a
-  no-op so it never fights the Workspace-authoritative membership set
-  with a stray local row.
+**`AGNES_GROUP_EVERYONE_EMAIL` is retired and inert.** It used to mirror the
+seeded `Everyone` row from a Workspace group, which meant "everyone" named a
+SUBSET of the accounts on such an instance — while
+`marketplace_plugins.is_system` meant all of them, so the two disagreed about
+who "everyone" was. That is the ambiguity the `scope` model removes.
 
-**Late enablement edge case.** Setting `AGNES_GROUP_EVERYONE_EMAIL` on an
-instance that already has v86 `system_seed` Everyone rows does not retroactively
-clean them up — the migration ran once, at the schema-version step, not on
-every env-var change. Those local rows sit alongside the new `google_sync`
-rows going forward; `_is_sso_user` already treats them as locally-owned (not
-IdP-managed), so this is cosmetic rather than a security issue, but an
-operator who wants a clean cutover should prune the stale `system_seed`
-rows via the admin group-members UI/CLI.
+Migration `0098` converts it: an instance with the variable set gets an
+ordinary group **named after the Workspace email**, holding the same members
+with their `source` preserved (so this sync keeps writing them) and holding
+the grants that were written against the pseudo-group. Nobody gains or loses
+access. Afterwards the address takes the ordinary path above — a group whose
+`name` IS the email, `created_by='system:google-sync'` — and the seeded
+`Everyone` row goes back to meaning every account, reporting
+`origin='system'` with `mapped_email: null` on `GET /api/admin/groups`.
+
+Leaving the variable set does nothing; nothing reads it at runtime. It is
+safe to remove from the environment at any point after upgrading.
+
+`AGNES_GROUP_ADMIN_EMAIL` is **unaffected** and still maps the seeded `Admin`
+row: `Admin` is a capability, not an audience, so mapping it narrows nothing.
+
+One irreversibility to know about: the conversion is one-way. A downgrade
+restores the columns `0098` dropped but cannot tell which of the converted
+group's members were originally the seeded row's.
 
 The `user_group_members` table is the single source of truth for group
 memberships, used by:
@@ -177,13 +190,14 @@ SDK even with DWD in place.
 ```env
 AGNES_GOOGLE_GROUP_PREFIX=grp_acme_
 AGNES_GROUP_ADMIN_EMAIL=grp_acme_admin@example.com
-AGNES_GROUP_EVERYONE_EMAIL=grp_acme_everyone@example.com
 GOOGLE_ADMIN_SDK_SA_EMAIL=explicit-sa@project.iam.gserviceaccount.com
 ```
 
-- `AGNES_GOOGLE_GROUP_PREFIX` / `AGNES_GROUP_ADMIN_EMAIL` /
-  `AGNES_GROUP_EVERYONE_EMAIL` — see [Filtering and storage](#filtering-and-storage).
-  Empty / unset = legacy "mirror all groups, no gate, no system mapping".
+- `AGNES_GOOGLE_GROUP_PREFIX` / `AGNES_GROUP_ADMIN_EMAIL` — see
+  [Filtering and storage](#filtering-and-storage). Empty / unset = legacy
+  "mirror all groups, no gate, no system mapping".
+- `AGNES_GROUP_EVERYONE_EMAIL` is retired and inert — nothing reads it.
+  Safe to delete from the environment once the instance has run `0098`.
 - `GOOGLE_ADMIN_SDK_SA_EMAIL` — when unset, the SA email is auto-detected
   from the GCE metadata server. Set this only when running off-VM (CI /
   local dev with explicit ADC) or when impersonating a different SA than

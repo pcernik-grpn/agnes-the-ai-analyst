@@ -308,15 +308,3 @@ def test_resource_grants_list_for_groups_filters_by_groups(rbac_engine):
     assert rids == {"r1", "r2"}
 
 
-def test_resource_grants_fanout_soft_fails_without_marketplace_plugins(rbac_engine):
-    """During Phase F mid-rollout, marketplace_plugins isn't migrated yet —
-    fanout must return 0 without raising."""
-    from src.repositories.resource_grants_pg import ResourceGrantsPgRepository
-    from src.repositories.user_groups_pg import UserGroupsPgRepository
-
-    groups = UserGroupsPgRepository(rbac_engine)
-    grants = ResourceGrantsPgRepository(rbac_engine)
-
-    g = groups.create(name="g1")
-    n = grants.fanout_system_for_group(g["id"], assigned_by="admin")
-    assert n == 0  # marketplace_plugins absent → 0 grants written

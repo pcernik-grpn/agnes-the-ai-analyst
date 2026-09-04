@@ -39,6 +39,9 @@ from app.utils import get_marketplaces_dir
 from src.marketplace import _lock, _refresh_plugin_cache, is_valid_slug
 from src.marketplace_listing import _parse_frontmatter
 
+#: What this module is, to `resource_grants.source` (src/grant_sources.py).
+GRANT_SOURCE = "skill_contribution"
+
 logger = logging.getLogger(__name__)
 
 #: Slug for the local marketplace that receives externally-contributed skills.
@@ -150,6 +153,7 @@ def _grant_to_group(group_name: str, plugin_name: str) -> bool:
         group_id=group["id"],
         resource_type="marketplace_plugin",
         resource_id=f"{CONTRIBUTED_MARKETPLACE_SLUG}/{plugin_name}",
+        source=GRANT_SOURCE,
     )
     return True
 

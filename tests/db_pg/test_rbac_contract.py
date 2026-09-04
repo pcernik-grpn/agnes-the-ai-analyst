@@ -272,6 +272,177 @@ def test_ensure_grant_creates_then_idempotent(rbac_repos):
     assert grants.has_grant([grp["id"]], "marketplace_plugin", "agnes-builtin/agnes-analyst") is True
 
 
+def test_grant_source_accepted_by_both_backends_and_surfaced_by_pg(rbac_repos):
+    """`source` records WHICH surface wrote a grant, so /admin/access can say
+    where a grant is managed instead of re-deriving it (only the Required-plugin
+    case was ever derivable).
+
+    The column is Postgres-only — the DuckDB app-state backend is frozen under
+    A3 and takes no new schema — so the contract is deliberately asymmetric and
+    this test pins BOTH halves of it:
+
+      - every backend ACCEPTS the keyword on `create` and `ensure_grant`
+        without raising, so a writer passing `source=` is portable;
+      - Postgres READS it back through `list_all`, the projection
+        `/api/admin/access-overview` actually consumes;
+      - DuckDB drops it and reports no source, which is what makes an
+        unlabelled row on a frozen instance correct rather than a bug.
+
+    `list_all` is named explicitly because it has its own inline SELECT (it
+    joins the group name) rather than the shared `_SELECT_COLS`, so adding the
+    column to the repo is not enough to make the page see it.
+    """
+    repos, _, backend = rbac_repos
+    groups = repos["groups"]
+    grants = repos["grants"]
+
+    grp = groups.create(name="provenance", created_by="admin@x.com")
+    grants.create(
+        group_id=grp["id"],
+        resource_type="marketplace_plugin",
+        resource_id="acme/from-wizard",
+        assigned_by="admin@x.com",
+        source="sharepoint_wizard",
+    )
+    assert (
+        grants.ensure_grant(
+            grp["id"],
+            "marketplace_plugin",
+            "acme/from-sync",
+            "system",
+            source="marketplace_sync",
+        )
+        is True
+    )
+
+    by_rid = {g["resource_id"]: g for g in grants.list_all(resource_type="marketplace_plugin")}
+    assert {"acme/from-wizard", "acme/from-sync"} <= set(by_rid)
+
+    if backend == "duckdb":
+        # Frozen backend: the argument is accepted and dropped, never stored.
+        assert by_rid["acme/from-wizard"].get("source") is None
+        assert by_rid["acme/from-sync"].get("source") is None
+    else:
+        assert by_rid["acme/from-wizard"]["source"] == "sharepoint_wizard"
+        assert by_rid["acme/from-sync"]["source"] == "marketplace_sync"
+
+
+def test_grant_scope_accepted_by_both_backends_and_surfaced_by_pg(rbac_repos):
+    """``scope`` says WHO a grant reaches — the members of its group, or every
+    account. The asymmetry is deliberate and both halves are pinned here.
+
+    ``Everyone`` used to be a group that normally held every account but was
+    mirrored from a Workspace group when ``AGNES_GROUP_EVERYONE_EMAIL`` was
+    set, so the word named two different sets of people on two instances. A
+    scope always means every account.
+
+    Postgres-only (migration 0097), like ``source``, because the DuckDB
+    app-state ladder is frozen under A3. So:
+
+      - every backend ACCEPTS ``scope=`` on ``create`` and ``ensure_grant``
+        without raising, so a writer is portable;
+      - Postgres READS it back through ``list_all`` AND ``get`` — two column
+        lists, both of which have to carry it;
+      - DuckDB drops it, and the grant is an ordinary one on the carrier
+        group. That is not a silent loss of reach: every account is
+        auto-joined to that group at creation, so the same people are
+        reached. The one case the two answer differently is an account an
+        admin has REMOVED from it.
+
+    Reads that are ABOUT the column rather than merely carrying it raise
+    ``RequiresPostgresBackend`` on DuckDB instead of answering ``0`` — see
+    the last assertion.
+    """
+    from src.repository_errors import RequiresPostgresBackend
+
+    repos, _, backend = rbac_repos
+    groups = repos["groups"]
+    grants = repos["grants"]
+
+    carrier = groups.get_by_name("Everyone")
+    assert carrier, "the seeded carrier group is missing from the fixture baseline"
+    narrow = groups.create(name="one-team", created_by="admin@x.com")
+
+    everyone_id = grants.create(
+        group_id=carrier["id"],
+        resource_type="marketplace_plugin",
+        resource_id="acme/for-everyone",
+        requirement="required",
+        scope="everyone",
+    )
+    grants.create(
+        group_id=narrow["id"],
+        resource_type="marketplace_plugin",
+        resource_id="acme/for-one-team",
+    )
+    assert (
+        grants.ensure_grant(
+            carrier["id"],
+            "marketplace_plugin",
+            "acme/seeded-for-everyone",
+            "system",
+            scope="everyone",
+        )
+        is True
+    )
+
+    by_rid = {g["resource_id"]: g for g in grants.list_all(resource_type="marketplace_plugin")}
+    assert {"acme/for-everyone", "acme/for-one-team", "acme/seeded-for-everyone"} <= set(by_rid)
+    fetched = grants.get(everyone_id)
+    assert fetched is not None
+
+    if backend == "duckdb":
+        # Frozen backend: accepted and dropped, never stored.
+        assert by_rid["acme/for-everyone"].get("scope") is None
+        assert by_rid["acme/seeded-for-everyone"].get("scope") is None
+        assert fetched.get("scope") is None
+        # And a read ABOUT the column refuses rather than answering wrongly.
+        with pytest.raises(RequiresPostgresBackend):
+            grants.count_everyone_scoped()
+        with pytest.raises(RequiresPostgresBackend):
+            grants.list_everyone_scoped()
+        return
+
+    assert by_rid["acme/for-everyone"]["scope"] == "everyone"
+    assert by_rid["acme/seeded-for-everyone"]["scope"] == "everyone"
+    assert by_rid["acme/for-one-team"]["scope"] is None
+    assert fetched["scope"] == "everyone"
+
+    # An everyone-grant reaches an account in NO group — the case the group
+    # model could not express, and the reason this cannot be an extra id in
+    # the group IN-list.
+    assert grants.has_grant([], "marketplace_plugin", "acme/for-everyone") is True
+    assert grants.has_grant([], "marketplace_plugin", "acme/for-one-team") is False
+    reached = {r["resource_id"] for r in grants.list_for_groups([])}
+    assert {"acme/for-everyone", "acme/seeded-for-everyone"} == reached
+
+    # And a caller CAN ask the narrower question, for the admin surfaces that
+    # attribute a row to a group.
+    assert grants.has_grant(
+        [carrier["id"]],
+        "marketplace_plugin",
+        "acme/for-everyone",
+        include_everyone=False,
+    ) is True
+    assert grants.has_grant(
+        [narrow["id"]],
+        "marketplace_plugin",
+        "acme/for-everyone",
+        include_everyone=False,
+    ) is False
+
+    # The carrier does not OWN what it carries: revoking one of these must
+    # not read as revoking one of the group's own grants, so they are not
+    # counted as such.
+    assert grants.count_for_group(carrier["id"]) == 0
+    assert grants.count_for_group(narrow["id"]) == 1
+    assert grants.count_everyone_scoped() == 2
+    assert {r["resource_id"] for r in grants.list_everyone_scoped()} == {
+        "acme/for-everyone",
+        "acme/seeded-for-everyone",
+    }
+
+
 def test_list_groups_for_user_returns_joined_groups(rbac_repos):
     repos, _, _ = rbac_repos
     users = repos["users"]
@@ -460,3 +631,182 @@ def test_list_for_groups_returns_same_ids_both_backends(rbac_repos):
 
     # Empty group_ids list — no query, empty result, on both engines.
     assert grants.list_for_groups([], "marketplace_plugin") == []
+
+
+def test_an_everyone_scope_survives_the_authorization_path_for_a_groupless_account(
+    pg_engine, monkeypatch
+):
+    """The scope is only real if the AUTHORIZATION path honours it.
+
+    Not a repository test — the repositories were already correct. Four
+    functions in ``app.auth.access`` short-circuited on an empty group set
+    (``if not group_ids: return False``) and never reached them, and two more
+    in ``src.marketplace_filter`` did the same on the serve path. Every one of
+    those was right while "everyone" was a group nobody could be outside of;
+    each became a silent denial the moment it became a scope.
+
+    Postgres-only, because the scope is: on DuckDB an everyone-grant is a
+    grant on the carrier group and reaching it does require membership, which
+    is the documented divergence.
+
+    A groupless account is the whole point of this test. It is rare — no API
+    path can remove the auto-membership (``remove_member`` takes
+    ``require_source='admin'``) — which is exactly why no existing test
+    covered it, and why the bug was invisible until the model changed.
+    """
+    import uuid as _uuid
+    from pathlib import Path
+
+    import sqlalchemy as sa
+    from alembic import command
+    from alembic.config import Config
+
+    repo_root = Path(__file__).resolve().parents[2]
+    cfg = Config(str(repo_root / "alembic.ini"))
+    cfg.set_main_option("script_location", str(repo_root / "migrations"))
+    cfg.attributes["sqlalchemy.url"] = str(pg_engine.url)
+    command.upgrade(cfg, "head")
+
+    carrier_id = _uuid.uuid4().hex
+    user_id = "u-" + _uuid.uuid4().hex[:8]
+    with pg_engine.begin() as conn:
+        conn.execute(
+            sa.text(
+                "INSERT INTO user_groups (id, name, description, is_system, created_by) "
+                "VALUES (:id, 'Everyone', 'System', TRUE, 'system:seed') "
+                "ON CONFLICT (name) DO NOTHING"
+            ),
+            {"id": carrier_id},
+        )
+        carrier_id = conn.execute(
+            sa.text("SELECT id FROM user_groups WHERE name = 'Everyone'")
+        ).scalar_one()
+        conn.execute(
+            sa.text("INSERT INTO users (id, email, name) VALUES (:id, :e, 'Groupless')"),
+            {"id": user_id, "e": f"{user_id}@example.com"},
+        )
+        # No membership row at all — deliberately.
+        conn.execute(
+            sa.text(
+                "INSERT INTO resource_grants "
+                "(id, group_id, resource_type, resource_id, requirement, scope) "
+                "VALUES (:id, :g, 'chat', 'chat', 'available', 'everyone')"
+            ),
+            {"id": _uuid.uuid4().hex, "g": carrier_id},
+        )
+
+    monkeypatch.setenv("AGNES_DB_URL", str(pg_engine.url))
+    import src.db_pg as db_pg
+
+    db_pg.dispose()
+    db_pg.get_engine()
+
+    import importlib
+
+    import src.repositories as repositories
+
+    importlib.reload(repositories)
+    try:
+        from app.auth.access import can_access, has_explicit_grant
+
+        assert can_access(user_id, "chat", "chat") is True, (
+            "the authorization gate denied access an everyone-scoped grant gives"
+        )
+        assert has_explicit_grant(user_id, "chat", "chat") is True, (
+            "the nav-affordance read missed it, so chat would be granted but hidden"
+        )
+        assert can_access(user_id, "chat", "some-other-chat") is False
+    finally:
+        importlib.reload(repositories)
+        db_pg.dispose()
+
+
+def test_repoint_group_moves_grants_except_the_marker_types(rbac_repos):
+    """`repoint_group` is the frozen DuckDB ladder's half of 0098's step 2 —
+    an instance that pointed `Everyone` at a Workspace group gives that
+    subset its own group, and the grants move with the members.
+
+    Three behaviours, and the middle one is the reason the parameter exists:
+
+    - audience grants move;
+    - `exclude_types` rows stay put. A `slack_channel` grant on the seeded
+      group is not an audience grant — it marks a channel open, and the
+      allowlist check reads it off THAT group id — so moving it switches
+      Agnes off in every channel an admin enabled;
+    - a collision keeps the STRONGER tier. Where the target already holds
+      the resource, the source row is dropped, but Required wins first — or
+      a Required grant silently becomes Optional and stops landing in those
+      people's workspaces.
+    """
+    repos, _, _ = rbac_repos
+    groups, grants = repos["groups"], repos["grants"]
+
+    src = groups.create(name="mirrored-subset", created_by="test")
+    tgt = groups.create(name="real-group", created_by="test")
+
+    grants.create(group_id=src["id"], resource_type="chat", resource_id="chat")
+    grants.create(group_id=src["id"], resource_type="slack_channel", resource_id="C0MARKER")
+    grants.create(
+        group_id=src["id"],
+        resource_type="marketplace_plugin",
+        resource_id="acme/collides",
+        requirement="required",
+    )
+    # The collision: the target already holds it, at the weaker tier.
+    grants.create(
+        group_id=tgt["id"],
+        resource_type="marketplace_plugin",
+        resource_id="acme/collides",
+        requirement="available",
+    )
+
+    moved = grants.repoint_group(src["id"], tgt["id"], exclude_types=["slack_channel"])
+    assert moved == 1, "only the chat grant had anywhere to move to"
+
+    left = {g["resource_type"] for g in grants.list_all(group_id=src["id"])}
+    assert left == {"slack_channel"}, f"marker did not stay behind: {left}"
+
+    on_target = {g["resource_type"]: g for g in grants.list_all(group_id=tgt["id"])}
+    assert "chat" in on_target
+    assert on_target["marketplace_plugin"]["requirement"] == "required", (
+        "the collision downgraded a Required grant to Optional"
+    )
+
+
+def test_move_all_members_preserves_source_and_add_all_users_backfills(rbac_repos):
+    """The membership half of the same step.
+
+    `source` survives the move, which is what leaves the nightly sync owning
+    its own rows. `add_all_users` then makes the emptied group mean every
+    account — the only way the frozen backend can say "everyone", since it
+    has no `scope` column.
+    """
+    repos, _, _ = rbac_repos
+    groups, members, users = repos["groups"], repos["members"], repos["users"]
+
+    src = groups.create(name="mirrored-members", created_by="test")
+    tgt = groups.create(name="named-after-the-email", created_by="test")
+    for uid in ("m1", "m2", "m3"):
+        users.create(id=uid, email=f"{uid}@example.com", name=uid)
+    members.add_member("m1", src["id"], source="google_sync", added_by="sync")
+    members.add_member("m2", src["id"], source="admin", added_by="admin@x")
+    # m3 is in neither — the account a backfill has to reach.
+
+    moved = members.move_all_members(src["id"], tgt["id"])
+    assert moved == 2
+    assert members.list_members_for_group(src["id"]) == []
+
+    by_user = {
+        r["group_id"]: r
+        for r in members.list_groups_with_meta_for_user("m1")
+    }
+    assert tgt["id"] in by_user
+    assert by_user[tgt["id"]]["source"] == "google_sync", (
+        "the move rewrote `source`, so the sync no longer owns its own row"
+    )
+
+    added = members.add_all_users(src["id"], source="system_seed", added_by="test")
+    assert added == 3, "every account should now be in the emptied group"
+    assert added == len(users.list_all())
+    # Idempotent — a second pass adds nobody.
+    assert members.add_all_users(src["id"], source="system_seed", added_by="test") == 0

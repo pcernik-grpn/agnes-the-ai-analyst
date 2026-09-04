@@ -711,13 +711,13 @@ CREATE TABLE IF NOT EXISTS marketplace_plugins (
     cover_photo_url VARCHAR,
     video_url       VARCHAR,
     doc_links       JSON,
-    -- v39: admin-managed mandatory tier. When TRUE, the plugin is
-    -- materialized into resource_grants (for every group) and
-    -- user_plugin_optouts (for every user) by the mark_system endpoint
-    -- + creation hooks; UI then locks the controls so users cannot
-    -- unsubscribe and admins cannot revoke per-group grants for it. The
-    -- resolver itself is unchanged — system semantics are emergent from
-    -- the materialized rows, not a new filter layer.
+    -- v39: admin-managed mandatory tier. DEAD SINCE 0098 — nothing reads
+    -- or writes it. "Every account gets this plugin automatically" is a
+    -- resource_grants row at scope='everyone', requirement='required',
+    -- which is one idea with one name instead of a flag on this table and
+    -- a tier on that one disagreeing about who "everyone" was. The column
+    -- stays because this ladder is FROZEN (A3) and every DuckDB file that
+    -- went through v39 has it anyway; Postgres dropped its copy in 0098.
     is_system       BOOLEAN DEFAULT FALSE,
     -- v78: per-plugin admin disable flag for built-in plugins. When TRUE,
     -- the plugin is excluded from the served feed for all callers even
@@ -768,8 +768,12 @@ CREATE TABLE IF NOT EXISTS user_group_members (
 -- ``user_stack_subscriptions``. ``required`` — auto-included in the
 -- effective stack, opt-out blocked at the API. Applies to
 -- ``data_package`` / ``memory_domain`` / ``memory_item`` grants;
--- ``marketplace_plugin`` Required-tier stays on
--- ``marketplace_plugins.is_system`` per D1.
+-- ``marketplace_plugin`` Required-tier used to live on
+-- ``marketplace_plugins.is_system`` per D1; since 0098 it is this column
+-- like every other type's, with ``scope`` saying whether the audience is
+-- the group or every account (Postgres only — this ladder is frozen, so a
+-- DuckDB everyone-grant is an ordinary grant on the seeded ``Everyone``
+-- carrier, which holds every account).
 CREATE TABLE IF NOT EXISTS resource_grants (
     id            VARCHAR PRIMARY KEY,
     group_id      VARCHAR NOT NULL REFERENCES user_groups(id),
@@ -4880,6 +4884,20 @@ def _v37_to_v38_migrate(conn: duckdb.DuckDBPyConnection) -> None:
 # kept defensive — DEFAULT FALSE on the column already covers fresh rows
 # but the explicit UPDATE catches any pre-existing nullable column from
 # partial-state DBs.
+#
+# DEAD SINCE 0098. Nothing reads or writes this column any more: "every
+# account gets this plugin automatically" is a ``resource_grants`` row at
+# ``scope='everyone'``, ``requirement='required'``. The step stays exactly as
+# it shipped because this ladder is FROZEN (A3) and a DuckDB file that has
+# been through v39 has the column regardless — rewriting history here would
+# only make old files disagree with the code that migrated them.
+#
+# The column is still PRESENT on both backends: dropping it is the contract
+# half of an expand/contract pair and ships in a later release (see 0098's
+# MID-FLIGHT note). A DuckDB instance's `is_system=TRUE` rows are converted
+# into the equivalent grant by
+# `src.system_plugin_reconcile.reconcile_system_plugin_flags`, which is the
+# frozen ladder's stand-in for 0098's step 4 — Alembic never runs here.
 _V38_TO_V39_MIGRATIONS = [
     "ALTER TABLE marketplace_plugins ADD COLUMN IF NOT EXISTS is_system BOOLEAN DEFAULT FALSE",
     "UPDATE marketplace_plugins SET is_system = FALSE WHERE is_system IS NULL",

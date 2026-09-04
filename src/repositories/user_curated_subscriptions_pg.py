@@ -124,49 +124,7 @@ class UserCuratedSubscriptionsPgRepository:
             )
         return max(0, int(after) - int(before))
 
-    def fanout_system_for_plugin(
-        self,
-        marketplace_id: str,
-        plugin_name: str,
-    ) -> int:
-        with self._engine.begin() as conn:
-            before = (
-                conn.execute(
-                    sa.text("SELECT COUNT(*) FROM user_plugin_optouts WHERE marketplace_id = :m AND plugin_name = :p"),
-                    {"m": marketplace_id, "p": plugin_name},
-                ).scalar()
-                or 0
-            )
-            conn.execute(
-                sa.text(
-                    """INSERT INTO user_plugin_optouts
-                       (user_id, marketplace_id, plugin_name)
-                       SELECT id, :m, :p FROM users
-                       ON CONFLICT (user_id, marketplace_id, plugin_name) DO NOTHING"""
-                ),
-                {"m": marketplace_id, "p": plugin_name},
-            )
-            after = (
-                conn.execute(
-                    sa.text("SELECT COUNT(*) FROM user_plugin_optouts WHERE marketplace_id = :m AND plugin_name = :p"),
-                    {"m": marketplace_id, "p": plugin_name},
-                ).scalar()
-                or 0
-            )
-        return max(0, int(after) - int(before))
 
-    def fanout_system_for_user(self, user_id: str) -> None:
-        with self._engine.begin() as conn:
-            conn.execute(
-                sa.text(
-                    """INSERT INTO user_plugin_optouts
-                       (user_id, marketplace_id, plugin_name)
-                       SELECT :u, marketplace_id, name
-                       FROM marketplace_plugins WHERE is_system = TRUE AND admin_disabled = FALSE
-                       ON CONFLICT (user_id, marketplace_id, plugin_name) DO NOTHING"""
-                ),
-                {"u": user_id},
-            )
 
     def stack_counts(self) -> Dict[Tuple[str, str], int]:
         """Mirrors ``UserCuratedSubscriptionsRepository.stack_counts``."""
