@@ -13,6 +13,8 @@ is the worse of the two because nothing ever reports it.
 from __future__ import annotations
 
 import re
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -53,18 +55,133 @@ def test_the_destination_variable_is_declared_and_defaults_to_auto():
         assert f'"{value}"' in block, f"the validation must accept {value!r}"
 
 
-def test_the_resolver_prefers_datadog_when_the_agent_is_installed():
-    """Empty resolves to Datadog when it is on, else Cloud Logging when it is,
-    else nothing — an operator with the metrics and the monitors in Datadog
-    wants the logs beside them."""
-    start = MAIN_TF.index("container_logs_destination = (")
-    expr = MAIN_TF[start : MAIN_TF.index("cloud_logging_logs_active", start)]
-    assert "var.container_logs_destination" in expr
-    assert 'var.enable_datadog ? "datadog"' in expr
-    assert 'var.enable_gcp_logging ? "cloud_logging" : "none"' in expr
-    # An explicit value must win over the derivation, so it has to be tested
-    # for membership BEFORE the ternary chain.
-    assert expr.index("contains(") < expr.index("var.enable_datadog")
+def _resolver_locals() -> str:
+    """The three resolver locals, verbatim from main.tf."""
+    start = MAIN_TF.index("  container_logs_destination = (")
+    end = MAIN_TF.index("\n\n", MAIN_TF.index("datadog_logs_active", start))
+    return MAIN_TF[start:end]
+
+
+def test_the_resolver_expression_is_pinned_exactly():
+    """Pinned as a whole, not probed for substrings.
+
+    Substring assertions cannot see ORDER, and order is the entire semantics
+    of a ternary chain: a resolver with the `enable_gcp_logging` branch moved
+    in front of the `enable_datadog` one contains every fragment a membership
+    check would look for and resolves the headline case backwards. Pinning the
+    normalised expression means any reordering has to be a deliberate edit to
+    this test as well.
+    """
+    normalised = re.sub(r"[ \t]+", " ", _resolver_locals()).strip()
+    assert normalised == (
+        "container_logs_destination = (\n"
+        ' contains(["cloud_logging", "datadog", "none"], var.container_logs_destination)\n'
+        " ? var.container_logs_destination\n"
+        ' : var.enable_datadog ? "datadog" : var.enable_gcp_logging ? "cloud_logging" : "none"\n'
+        " )\n"
+        ' cloud_logging_logs_active = local.container_logs_destination == "cloud_logging"\n'
+        ' datadog_logs_active = local.container_logs_destination == "datadog"'
+    )
+
+
+_TERRAFORM = shutil.which("terraform") or shutil.which("tofu")
+
+# destination, enable_datadog, enable_gcp_logging -> resolved
+_TRUTH_TABLE = [
+    # The auto branch. "auto" must behave exactly like "" — it is only an
+    # explicit spelling, and it is deliberately absent from the contains()
+    # list, which is subtle enough to be worth proving rather than reading.
+    *[
+        (dest, dd, gl, expected)
+        for dest in ("", "auto")
+        for dd, gl, expected in [
+            (True, True, "datadog"),
+            (True, False, "datadog"),
+            (False, True, "cloud_logging"),
+            (False, False, "none"),
+        ]
+    ],
+    # An explicit value wins over the derivation in every combination.
+    *[
+        (dest, dd, gl, dest)
+        for dest in ("cloud_logging", "datadog", "none")
+        for dd in (True, False)
+        for gl in (True, False)
+    ],
+]
+
+
+@pytest.fixture(scope="module")
+def evaluate_resolver(tmp_path_factory):
+    """Evaluate the REAL locals with the REAL Terraform.
+
+    Every other assertion in this file about the resolver reads `.tf` source
+    text, which cannot distinguish a correct expression from a wrong one that
+    happens to contain the same fragments. This lifts the locals verbatim into
+    a standalone provider-less module — so `init` is instant and offline — and
+    asks Terraform itself what they evaluate to.
+    """
+    if _TERRAFORM is None:
+        pytest.skip("neither terraform nor tofu is on PATH")
+    d = tmp_path_factory.mktemp("resolver")
+    (d / "main.tf").write_text(
+        'variable "container_logs_destination" { type = string }\n'
+        'variable "enable_datadog" { type = bool }\n'
+        'variable "enable_gcp_logging" { type = bool }\n\n'
+        "locals {\n" + _resolver_locals() + "\n}\n"
+    )
+    subprocess.run(
+        [_TERRAFORM, "init", "-input=false", "-no-color"],
+        cwd=d,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    def _evaluate(destination: str, enable_datadog: bool, enable_gcp_logging: bool) -> tuple[str, bool, bool]:
+        # One expression, not three lines: with a piped (non-TTY) stdin
+        # `terraform console` evaluates only the first thing it is given.
+        proc = subprocess.run(
+            [
+                _TERRAFORM,
+                "console",
+                "-no-color",
+                f"-var=container_logs_destination={destination}",
+                f"-var=enable_datadog={str(enable_datadog).lower()}",
+                f"-var=enable_gcp_logging={str(enable_gcp_logging).lower()}",
+            ],
+            cwd=d,
+            input=("[local.container_logs_destination, local.cloud_logging_logs_active, local.datadog_logs_active]\n"),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        values = [
+            line.strip().rstrip(",").strip('"')
+            for line in proc.stdout.splitlines()
+            if line.strip() not in ("", "[", "]")
+        ]
+        assert len(values) == 3, f"unexpected console output: {proc.stdout!r}"
+        return values[0], values[1] == "true", values[2] == "true"
+
+    return _evaluate
+
+
+@pytest.mark.parametrize(
+    "destination, enable_datadog, enable_gcp_logging, expected",
+    _TRUTH_TABLE,
+    ids=lambda v: str(v),
+)
+def test_the_resolver_truth_table(
+    evaluate_resolver, destination: str, enable_datadog: bool, enable_gcp_logging: bool, expected: str
+):
+    resolved, cloud_logging_active, datadog_active = evaluate_resolver(destination, enable_datadog, enable_gcp_logging)
+    assert resolved == expected
+    # Exactly one destination is ever active — the invariant the whole design
+    # rests on, since Docker allows one log driver per container.
+    assert cloud_logging_active == (expected == "cloud_logging")
+    assert datadog_active == (expected == "datadog")
+    assert not (cloud_logging_active and datadog_active)
 
 
 @pytest.mark.parametrize(
@@ -117,8 +234,9 @@ def test_enable_gcp_logging_is_documented_as_a_permit_not_a_selector():
         "an operator reading the permit switch must be told what actually selects the destination"
     )
     assert "gcplogs" not in block, (
-        "the pipeline has been fluentd + Ops Agent since #679; the gcplogs "
-        "wording described a driver this module no longer uses"
+        "the pipeline has been fluentd + Ops Agent since c99803936; the "
+        "gcplogs wording described the original overlay (#679) and a driver "
+        "this module no longer uses"
     )
 
 
