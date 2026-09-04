@@ -307,6 +307,81 @@ class TestScopeBulkAdd:
         assert result.exit_code == 1
         assert "drive_id was not supplied" in result.output
 
+    def test_min_modified_rides_the_payload(self):
+        """TCRD-296 gap #80 — a bulk default: every scope this call creates
+        gets its OWN `min_modified` filter, stored via the SAME PATCH-like
+        `POST .../scopes/bulk` confirm this command already sends."""
+        body = {"created": [{"path": "A"}], "skipped": [], "failed": []}
+        with patch("cli.commands.admin_sharepoint.api_post", return_value=_resp(200, body)) as mock_post:
+            result = runner.invoke(
+                app,
+                ["admin", "sharepoint", "scope", "bulk-add", "conn1", "--path", "A", "--min-modified", "2024-03-01"],
+            )
+        assert result.exit_code == 0, result.output
+        _, kwargs = mock_post.call_args
+        assert kwargs["json"] == {"paths": ["A"], "min_modified": "2024-03-01"}
+
+    def test_an_invalid_min_modified_is_a_clean_local_error(self):
+        result = runner.invoke(
+            app,
+            ["admin", "sharepoint", "scope", "bulk-add", "conn1", "--path", "A", "--min-modified", "not-a-date"],
+        )
+        assert result.exit_code == 1
+        assert "ISO YYYY-MM-DD date" in result.output
+
+
+class TestScopeList:
+    """`agnes admin sharepoint scope list` — CLI counterpart to
+    `GET /api/admin/sharepoint/connections/{connection_id}/scopes` (TCRD-296
+    gap #80: shows each scope's effective "modified since" crawl filter)."""
+
+    def test_prints_a_table_with_the_effective_filter_per_scope(self):
+        body = {
+            "items": [
+                {
+                    "source_scope_id": "drv:a",
+                    "display_path": "Site / Docs",
+                    "collection": {"id": "c1", "slug": "docs", "name": "Docs"},
+                    "min_modified": {"value": "2024-01-01", "source": "scope", "own_value": "2024-01-01"},
+                },
+                {
+                    "source_scope_id": "drv:b",
+                    "display_path": "Site / Reports",
+                    "collection": {"id": "c2", "slug": "reports", "name": "Reports"},
+                    "min_modified": {"value": "2023-01-01", "source": "connection", "own_value": None},
+                },
+                {
+                    "source_scope_id": "drv:c",
+                    "display_path": "Site / Misc",
+                    "collection": None,
+                    "min_modified": {"value": None, "source": "none", "own_value": None},
+                },
+            ],
+            "zones": [],
+        }
+        with patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(200, body)) as mock_get:
+            result = runner.invoke(app, ["admin", "sharepoint", "scope", "list", "conn1"])
+        assert result.exit_code == 0, result.output
+        mock_get.assert_called_once_with("/api/admin/sharepoint/connections/conn1/scopes")
+        assert "since 2024-01-01" in result.output
+        assert "since 2023-01-01 (default)" in result.output
+        assert "drv:a" in result.output and "drv:b" in result.output and "drv:c" in result.output
+
+    def test_json_output_is_the_raw_response(self):
+        body = {"items": [{"source_scope_id": "drv:a"}], "zones": []}
+        with patch("cli.commands.admin_sharepoint.api_get", return_value=_resp(200, body)):
+            result = runner.invoke(app, ["admin", "sharepoint", "scope", "list", "conn1", "--json"])
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.output) == body
+
+    def test_404_is_reported_and_exits_nonzero(self):
+        with patch(
+            "cli.commands.admin_sharepoint.api_get",
+            return_value=_resp(404, {"detail": {"error": "connection_not_found"}}),
+        ):
+            result = runner.invoke(app, ["admin", "sharepoint", "scope", "list", "does-not-exist"])
+        assert result.exit_code == 1
+
 
 class TestConnectionClone:
     """`agnes admin sharepoint connection clone` — CLI counterpart to

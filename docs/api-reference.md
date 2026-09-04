@@ -1415,15 +1415,30 @@ search to a site or folder, or narrow the pattern") when `truncated` is
 
 `GET/POST/DELETE …/scopes` manage the wizard's scope rows — each a selected
 site/library/folder, stored as `{source_scope_id, display_path, anonymize,
-access_mode, drive_id, collection_id}` inside the connection's own
-`config.scopes` (no new table). `POST` confirms a scope: creates its
+access_mode, drive_id, collection_id, min_modified}` inside the connection's
+own `config.scopes` (no new table). `POST` confirms a scope: creates its
 collection on first confirmation and reuses the same collection on every
 re-confirmation of the same `source_scope_id` (idempotent — a rename/move in
 the source updates `display_path` in place rather than forking a second
 collection), and optionally applies group grants (ordinary `resource_grants`
 rows on the collection — never duplicated onto the scope row itself). The
 response's `no_group_warning` flags a collection with no granted group
-("indexed but invisible"). `DELETE` (`?source_scope_id=`) unselects a scope —
+("indexed but invisible").
+
+`min_modified` (TCRD-296 gap #80) is this scope's OWN "modified since" crawl
+filter — an ISO `YYYY-MM-DD` date, or `null` (the default, "not omitted
+means unchanged" like `access_mode`/`anonymize`/`include_excluded_subtrees`:
+a re-confirm that leaves it out CLEARS a previously-set override) to inherit
+`extraction.crawl.min_modified`, the connection-wide default set via `PATCH
+…/extraction/crawl-config` below. `400 invalid_min_modified` for anything
+that is not a parseable ISO date. Every scope row in a `GET`/`POST` response
+projects it as `{value, source, own_value}` — `value`/`source` are the
+EFFECTIVE, resolved filter this scope's next crawl would apply (`source` one
+of `"scope"`, `"connection"`, `"none"`), `own_value` is this scope's raw
+stored override (`null` when it has none). `POST …/scopes/bulk`'s own
+`min_modified`, when given, is stored as a BULK DEFAULT on every scope that
+call creates (one value for the whole batch, not a per-path choice — same
+validation). `DELETE` (`?source_scope_id=`) unselects a scope —
 an explicit exclusion — without touching its already-created collection, but
 DOES delete any `sharepoint-acl-sync`-owned (sentinel-assigned) grants on
 that collection (2026-08-31 plan, Task 8) — with the scope row gone, the
@@ -1580,8 +1595,11 @@ to plan against, or the site's summed document count stays at or under the
 target. `expected` is a live Graph Search count per shard — `≈`, never
 exact (index lag). `min_modified` narrows every count to that date or later
 for THIS preview call only; omitted, the plan resolves the connection's own
-configured `extraction.crawl.min_modified` (the same cutoff an actual
-triggered run would use). `409 sharepoint_cert_unresolved` /
+configured `extraction.crawl.min_modified` uniformly across every scope in
+the plan — a scope with its OWN filter (TCRD-296 gap #80) is not yet
+reflected in this estimate, only in what its actual crawl applies (see
+`docs/sharepoint-extraction.md`'s completeness "known gap" note for the
+same caveat on `…/extraction/completeness`). `409 sharepoint_cert_unresolved` /
 `502 sharepoint_graph_error` on a credential/Graph failure — unlike
 `split-plan` below, a shard-plan failure is surfaced rather than silently
 degrading to a small-looking site. See `docs/sharepoint-extraction.md` for
@@ -2215,7 +2233,9 @@ card on `/admin/data-sources`, for an admin with no server or CLI access.
 
 `PATCH …/extraction/crawl-config` sets or clears TWO independent
 per-connection levers on the same JSON column — `config.extraction.crawl.
-min_modified` (a backfill age filter) and, since D.16,
+min_modified` (a backfill age filter, and since TCRD-296 gap #80 the
+DEFAULT for any confirmed scope that does not set its own — see `POST
+…/scopes`'s `min_modified` above) and, since D.16,
 `config.extraction.crawl.schedule` (this connection's own scheduled-sweep
 cadence — see `docs/sharepoint-extraction.md` → *Keeping a site current*
 for the full interplay with the instance-wide `extraction.schedule`
